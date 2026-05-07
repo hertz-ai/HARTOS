@@ -341,3 +341,97 @@ def persist_and_publish_async(
             _run()
         except Exception:  # noqa: BLE001
             pass
+
+
+def persist_external_room_event(
+    user_id: str,
+    platform: str,
+    room_id: str,
+    sender_id: str,
+    text: str,
+    *,
+    kind: str = 'external_room_msg',
+    timestamp: float | None = None,
+    role: str | None = None,
+    msg_id: str | None = None,
+    lang: str | None = None,
+    extra: dict | None = None,
+) -> None:
+    """Canonical SINGLE-WRITER for cross-channel external-room events
+    (UNIF-G3).  Channel adapters and the agent_voice_bridge worker MUST
+    call this when an inbound message arrives from an external room
+    (Discord channel msg, Slack channel msg, voice transcript segment,
+    Matrix room post, Telegram super-group msg, WhatsApp group msg, etc.).
+
+    Why a thin wrapper around ``persist_and_publish_async`` rather than
+    each adapter calling that directly: this is the ONE place that
+    encodes the canonical (platform, room_id, sender, ts, kind) shape
+    into the existing ``ConversationEntry`` columns
+    (``channel_type``, ``request_id``, ``device_id``, ``attachments``).
+    A new adapter wires up cross-channel ingest by importing this one
+    helper — no per-adapter copy of the field-mapping logic.
+
+    Field mapping into the canonical ``ConversationEntry``:
+      - ``channel_type`` ← ``f"{platform}:{room_id}"`` (composite — both
+        platform AND room are addressable in the recall surface)
+      - ``request_id``   ← ``room_id`` (groups all events from the same
+        room for thread-style recall)
+      - ``device_id``    ← ``f"adapter:{platform}"`` (tells the chat-sync
+        consumer this came from an external adapter, not a local device)
+      - ``role``         ← caller-specified or auto-derived from sender
+                            (matches the agent's own user_id → role='assistant',
+                            else role='user')
+      - ``content``      ← the raw text of the external event
+      - ``attachments``  ← ``[{kind, platform, room_id, author, t}]``
+                            for full provenance recall
+
+    Voice transcript segments use ``kind='transcript_segment'`` (with
+    ``extra={'t0', 't1', 'speaker'}``) — the agent_voice_bridge worker
+    pipes whisper_tool's streaming WebSocket output through here.
+
+    Per ``feedback_test_what_we_ship.md`` — this helper has unit tests
+    in ``tests/unit/test_chat_messages_external.py``.
+
+    Best-effort: never raises out of the hot path.
+    """
+    if not user_id or not platform or not room_id or not text:
+        logger.debug(
+            "chat_messages.persist_external_room_event: skipping "
+            "(missing required field): platform=%r room=%r sender=%r",
+            platform, room_id, sender_id)
+        return
+
+    # Auto-derive role: anything from "the agent itself" is 'assistant';
+    # everything else is 'user'.  Caller can override.
+    if role is None:
+        # Heuristic: sender id of the form "agent:..." or matching the
+        # owner's agent identity → assistant.  Default to 'user'.
+        role = 'assistant' if str(sender_id or '').startswith('agent:') else 'user'
+
+    attachment = {
+        'kind': kind,
+        'platform': platform,
+        'room_id': room_id,
+        'author': sender_id,
+    }
+    if timestamp is not None:
+        attachment['t'] = timestamp
+    if extra:
+        # Merge caller-supplied per-kind metadata (e.g. transcript
+        # segment t0/t1/speaker) — keep adapter-specific keys out of
+        # the canonical attachment shape.
+        for k, v in extra.items():
+            if k not in attachment:
+                attachment[k] = v
+
+    persist_and_publish_async(
+        user_id,
+        role,
+        text,
+        msg_id=msg_id,
+        request_id=room_id,
+        device_id=f'adapter:{platform}',
+        lang=lang,
+        attachments=[attachment],
+        channel_type=f'{platform}:{room_id}',
+    )
