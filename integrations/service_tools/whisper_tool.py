@@ -843,6 +843,87 @@ STREAM_CHUNK_BYTES = STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE * STREAM_CHANN
 STREAM_MAX_BUFFER_BYTES = STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE * STREAM_CHANNELS * 30
 
 
+def _ws_path(websocket) -> str:
+    """Best-effort URL-path extractor across websockets lib versions.
+
+    websockets 11+ moved the request to ``websocket.request.path``;
+    earlier versions exposed ``websocket.path`` directly.  We probe
+    both and fall back to empty string when neither is available.
+    Never raises.
+    """
+    for getter in (
+        lambda ws: ws.request.path,
+        lambda ws: ws.path,
+    ):
+        try:
+            val = getter(websocket)
+            if isinstance(val, str):
+                return val
+        except Exception:
+            continue
+    return ''
+
+
+def _parse_call_context(ws_path: str) -> tuple:
+    """Parse ``?call_id=<id>&user_id=<u>`` from a WS request path.
+
+    UNIF-G7 / W1.7 Producer C — the RN mic stream (and any other
+    browser/mobile audio source) opens the streaming-STT WebSocket
+    with these query params attached when the audio belongs to a
+    voice room.  Without the params, behavior is unchanged (today's
+    one-shot transcription clients still work).
+
+    Returns ``(call_id, user_id)`` — either may be ``None``.  Never
+    raises.
+    """
+    if not ws_path:
+        return (None, None)
+    from urllib.parse import urlparse, parse_qs
+    try:
+        parsed = urlparse(ws_path)
+        qs = parse_qs(parsed.query or '')
+        call_id = (qs.get('call_id') or [None])[0]
+        user_id = (qs.get('user_id') or [None])[0]
+        return (call_id or None, user_id or None)
+    except Exception:
+        return (None, None)
+
+
+def _maybe_enqueue_call_segment(
+    call_id: Optional[str],
+    user_id: Optional[str],
+    text: str,
+    lang: str,
+    is_final: bool,
+) -> None:
+    """If the WS client opted in via ``?call_id=`` AND this is a final
+    segment, land it in the canonical per-call queue so the
+    AgentBridgeWorker can drain it (UNIF-G3 / W1.2 consumer).
+
+    Single canonical writer for browser/mobile-mic-driven transcripts —
+    same sink as the future Discord-voice-recv (Producer A) and
+    LiveKit-RTC (Producer B) audio paths.  No parallel queue.
+
+    Best-effort: never raises out of the WS handler hot path.
+    """
+    if not call_id or not is_final or not text:
+        return
+    try:
+        enqueue_stt_segment(call_id, {
+            'text': text,
+            'lang': lang,
+            'author_id': user_id or 'unknown',
+            'is_final': True,
+            # t0/t1/speaker stay None — RN mic stream is single-speaker
+            # by definition (the user typing into the SPA); future
+            # multi-speaker producers will set speaker.
+        })
+    except Exception as e:
+        logger.debug(
+            "whisper_tool._maybe_enqueue_call_segment failed "
+            "(call=%s): %s", call_id, e)
+
+
 async def _stt_stream_handler(websocket):
     """Handle a single streaming STT WebSocket connection.
 
@@ -855,6 +936,14 @@ async def _stt_stream_handler(websocket):
     Sends back:
       - {"text": "...", "language": "en", "is_final": false} for interim
       - {"text": "...", "language": "en", "is_final": true} for final (pause detected)
+
+    Optional UNIF-G7 hook (Producer C):
+      The connection URL MAY include ``?call_id=<id>&user_id=<u>``.
+      When present, every final segment is ALSO landed in the per-call
+      STT queue (whisper_tool.enqueue_stt_segment) so the
+      AgentBridgeWorker can drain it and emit the meet_copilot card.
+      Absence of the params preserves today's behavior exactly — RN
+      one-shot transcription clients are unaffected.
 
     CRASH ISOLATION:
       - Model crashes are isolated: _transcribe_buffer routes through
@@ -874,6 +963,11 @@ async def _stt_stream_handler(websocket):
 
     audio_buffer = io.BytesIO()
     last_transcribe_size = 0
+    # UNIF-G7 Producer C: extract optional call context from the
+    # WS request path.  When absent (call_id is None), the
+    # _maybe_enqueue_call_segment helper degrades to a no-op so plain
+    # transcription clients see ZERO behavior change.
+    call_id, user_id = _parse_call_context(_ws_path(websocket))
 
     try:
         async for message in websocket:
@@ -892,6 +986,8 @@ async def _stt_stream_handler(websocket):
                             await websocket.send(json.dumps({
                                 'text': text, 'language': lang, 'is_final': True,
                             }))
+                            _maybe_enqueue_call_segment(
+                                call_id, user_id, text, lang, True)
                         audio_buffer = io.BytesIO()
                         last_transcribe_size = 0
                         continue
@@ -929,6 +1025,8 @@ async def _stt_stream_handler(websocket):
                     await websocket.send(json.dumps({
                         'text': text, 'language': lang, 'is_final': True,
                     }))
+                    _maybe_enqueue_call_segment(
+                        call_id, user_id, text, lang, True)
                 audio_buffer = io.BytesIO()
                 last_transcribe_size = 0
                 continue
