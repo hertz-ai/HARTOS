@@ -22,6 +22,7 @@ the requires_flag decorator pattern from api.py):
 from __future__ import annotations
 
 import logging
+import os
 
 from flask import Blueprint, request, g, jsonify
 
@@ -87,6 +88,51 @@ def get_call(call_id):
     return _ok(sess)
 
 
+# ── Mesh-first media-mode decision (PeerLink ↔ LiveKit complement) ──
+# By design HARTOS keeps voice/video on a P2P WebRTC mesh signaled
+# over PeerLink DISPATCH for small calls (cheap, low-latency, no SFU
+# round-trip).  LiveKit only takes over when:
+#   - participant count exceeds the mesh threshold (default 4 — N×N
+#     mesh fanout becomes inefficient past that), OR
+#   - any participant is an agent_bridge (the bridge needs a stable
+#     SFU rendezvous URL to publish TTS / subscribe STT), OR
+#   - the call kind is 'screen_share' or 'mixed' (multi-track → SFU
+#     simpler than re-negotiating mesh tracks).
+# Override via `LIVEKIT_MESH_THRESHOLD` env var (e.g. set to 0 to
+# always promote, or to 999 to disable promotion entirely for testing).
+
+
+def _mesh_threshold() -> int:
+    try:
+        return max(1, int(os.environ.get('LIVEKIT_MESH_THRESHOLD', '4')))
+    except (TypeError, ValueError):
+        return 4
+
+
+def _decide_media_mode(sess, participants, *, is_agent: bool) -> str:
+    """Return either 'p2p_mesh' or 'livekit'.
+
+    The endpoint uses this to choose between a LiveKit token (forwarded
+    to LiveKitService) or a {mode: 'p2p_mesh', signaling: 'peerlink'}
+    response telling the client to do its own WebRTC handshake over
+    the existing PeerLink DISPATCH channel.
+    """
+    if is_agent:
+        return 'livekit'
+    kind = (sess or {}).get('kind') or 'voice'
+    if kind in ('screen_share', 'mixed'):
+        return 'livekit'
+    # Count *active* participants — left_at IS NULL.
+    active = [p for p in (participants or []) if not p.get('left_at')]
+    # +1 for the caller about to join, if not already in the list.
+    caller_id = getattr(g.user, 'id', None)
+    if caller_id and not any(p.get('user_id') == caller_id for p in active):
+        active_count = len(active) + 1
+    else:
+        active_count = len(active)
+    return 'livekit' if active_count > _mesh_threshold() else 'p2p_mesh'
+
+
 @calls_bp.route('/calls/<call_id>/token', methods=['POST'])
 @require_auth
 @requires_flag('calls_v1')
@@ -98,11 +144,28 @@ def issue_token(call_id):
     if sess.get('ended_at'):
         return _err('call has ended', 410)
     data = _get_json()
+    is_agent = bool(data.get('is_agent', False))
+    participants = CallService.list_participants(g.db, call_id)
+
+    # Mesh-first: keep small calls on PeerLink-signaled WebRTC mesh.
+    # The client receives {mode: 'p2p_mesh'} and uses its existing
+    # PeerLink DISPATCH-channel signaling path — no LiveKit involved.
+    mode = _decide_media_mode(sess, participants, is_agent=is_agent)
+    if mode == 'p2p_mesh':
+        return _ok({
+            'mode': 'p2p_mesh',
+            'call_id': call_id,
+            'signaling': 'peerlink',
+            'participant_count': len(
+                [p for p in participants if not p.get('left_at')]),
+            'mesh_threshold': _mesh_threshold(),
+        })
+
     token = LiveKitService.issue_token(
         call_id, g.user.id,
         can_publish=bool(data.get('can_publish', True)),
         can_publish_screen=bool(data.get('can_publish_screen', False)),
-        is_agent=bool(data.get('is_agent', False)),
+        is_agent=is_agent,
         agent_bridge_node_id=data.get('agent_bridge_node_id'))
     return _ok(token)
 

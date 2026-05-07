@@ -56,15 +56,48 @@ except Exception:
     _HAS_LIVEKIT_SDK = False
 
 
-def _has_livekit_config() -> bool:
-    """True iff the central LiveKit env vars are set.  Flat / regional
-    / Nunba bundled deploys leave these unset, so this returns False
-    and clients route to P2P mesh.
+def _resolved_config():
+    """Return (url, api_key, api_secret) — env-vars override; else fall
+    back to the supervisor's auto-generated dev keys + localhost URL.
+
+    Flat/regional installs that haven't been provisioned with central-
+    issued keys still get a working signer because livekit_supervisor
+    auto-generates a dev key/secret pair on first start.  Central
+    deploys (which don't host an SFU) leave LIVEKIT_DISABLE=1; that
+    short-circuits supervisor_should_run() so no dev keys exist and
+    we fall back to the {mode: 'p2p_mesh'} response.
     """
-    return bool(
-        os.environ.get('LIVEKIT_URL')
-        and os.environ.get('LIVEKIT_API_KEY')
-        and os.environ.get('LIVEKIT_API_SECRET'))
+    env_url = os.environ.get('LIVEKIT_URL')
+    env_key = os.environ.get('LIVEKIT_API_KEY')
+    env_secret = os.environ.get('LIVEKIT_API_SECRET')
+    if env_url and env_key and env_secret:
+        return env_url, env_key, env_secret
+
+    # Lazy import to avoid a circular dep during module init.
+    try:
+        from .livekit_supervisor import (
+            ensure_dev_keys,
+            get_livekit_url,
+            supervisor_should_run,
+        )
+    except Exception:  # pragma: no cover — defensive
+        return None, None, None
+
+    if not supervisor_should_run():
+        return None, None, None
+
+    keys = ensure_dev_keys()
+    url = env_url or get_livekit_url()
+    return url, keys.get('api_key'), keys.get('api_secret')
+
+
+def _has_livekit_config() -> bool:
+    """True iff we have a complete (url, api_key, api_secret) triple
+    — either from operator-set env vars OR from the supervisor's auto-
+    generated dev keys when running in flat/regional mode.
+    """
+    url, key, secret = _resolved_config()
+    return bool(url and key and secret)
 
 
 class LiveKitService:
@@ -90,16 +123,14 @@ class LiveKitService:
         When mode='p2p_mesh', the result is just {mode, call_id} and
         the client does its own WebRTC handshake via PeerLink.
         """
-        if not _has_livekit_config():
+        url, api_key, api_secret = _resolved_config()
+        if not (url and api_key and api_secret):
             return {
                 'mode': 'p2p_mesh',
                 'call_id': call_id,
-                'reason': 'no LIVEKIT_URL configured (flat/regional/bundled deploy)',
+                'reason': 'no LIVEKIT config; central/embedded deploy or '
+                          'LIVEKIT_DISABLE=1 set',
             }
-
-        url = os.environ['LIVEKIT_URL']
-        api_key = os.environ['LIVEKIT_API_KEY']
-        api_secret = os.environ['LIVEKIT_API_SECRET']
 
         metadata = {
             'agent_kind': 'agent' if is_agent else 'human',
@@ -163,7 +194,8 @@ class LiveKitService:
     @staticmethod
     def end_room(call_id: str) -> Dict[str, Any]:
         """Tear down a LiveKit room.  No-op when no LiveKit configured."""
-        if not _has_livekit_config():
+        url, _key, _secret = _resolved_config()
+        if not url:
             return {'mode': 'p2p_mesh', 'ended': True}
         # SDK delete_room is async (asyncio coroutine) — for now we
         # just signal end-of-call; the actual API call lands in a

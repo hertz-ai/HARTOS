@@ -427,14 +427,19 @@ def test_attach_agent_without_grant_refused(fresh_db):
 
 # ── LiveKit token issuance ─────────────────────────────────────────
 
-def test_token_falls_back_to_p2p_when_no_livekit_config(monkeypatch):
-    """Flat / regional / Nunba bundled have LIVEKIT_URL unset.
-    issue_token must return mode='p2p_mesh' so clients run a WebRTC
-    P2P mesh signaled over PeerLink instead of trying to connect to
-    a non-existent LiveKit instance."""
+def test_token_falls_back_to_p2p_when_supervisor_disabled(monkeypatch):
+    """Central / embedded deploys (LIVEKIT_DISABLE=1 or
+    HEVOLVE_DEPLOY_MODE=central) do NOT host an SFU.  When env vars
+    are unset AND the supervisor is disabled, issue_token returns
+    mode='p2p_mesh' so clients run a WebRTC P2P mesh signaled over
+    PeerLink instead of trying to connect to a non-existent SFU.
+
+    (Flat/regional deploys auto-provision dev keys via the supervisor
+    — see test_token_uses_supervisor_dev_keys_on_flat below.)"""
     monkeypatch.delenv('LIVEKIT_URL', raising=False)
     monkeypatch.delenv('LIVEKIT_API_KEY', raising=False)
     monkeypatch.delenv('LIVEKIT_API_SECRET', raising=False)
+    monkeypatch.setenv('LIVEKIT_DISABLE', '1')
     from integrations.social.livekit_service import LiveKitService
     r = LiveKitService.issue_token('call-1', 'user-1')
     assert r['mode'] == 'p2p_mesh'
@@ -455,6 +460,28 @@ def test_token_uses_livekit_when_configured(monkeypatch):
     assert r['mode'] in ('livekit', 'livekit_pending')
     assert r['url'] == 'wss://livekit.example'
     assert r['metadata']['agent_kind'] == 'agent'
+
+
+def test_token_uses_supervisor_dev_keys_on_flat(monkeypatch, tmp_path):
+    """Flat/regional deploys auto-provision LiveKit dev keys via the
+    supervisor.  With env vars unset, issue_token must reach a working
+    config from the supervisor's auto-generated keys (no manual setup
+    needed) — mode is 'livekit' (real JWT) or 'livekit_pending' (SDK
+    not installed).  Dev keys + URL come from livekit_supervisor."""
+    monkeypatch.delenv('LIVEKIT_URL', raising=False)
+    monkeypatch.delenv('LIVEKIT_API_KEY', raising=False)
+    monkeypatch.delenv('LIVEKIT_API_SECRET', raising=False)
+    monkeypatch.delenv('LIVEKIT_DISABLE', raising=False)
+    monkeypatch.delenv('LIVEKIT_AUTOSTART', raising=False)
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')
+    monkeypatch.setenv('HEVOLVE_HOME', str(tmp_path))
+    from integrations.social.livekit_service import LiveKitService
+    r = LiveKitService.issue_token('call-1', 'user-1')
+    # Either signed JWT (SDK installed) or pending shape (SDK absent)
+    # — both confirm the supervisor's config flowed through.
+    assert r['mode'] in ('livekit', 'livekit_pending')
+    assert r.get('url', '').startswith('ws://localhost:')
+    assert 'metadata' in r
 
 
 # ── REST surface ──────────────────────────────────────────────────
@@ -588,3 +615,177 @@ def test_create_agent_grant_endpoint(app_client):
     body = r.get_json()
     assert body['data']['agent_id'] == agent.id
     assert body['data']['scope']['can_voice'] is True
+
+
+# ── _decide_media_mode mesh-first promotion (Task #275) ─────────────
+# Validates the "PeerLink ↔ LiveKit complement" branches.  Empirical
+# threshold benchmarking is queued under #276; these tests just lock
+# in the current contract so #276 can compare against a baseline.
+
+class _FakeUser:
+    def __init__(self, uid):
+        self.id = uid
+
+
+def _patch_g_user(monkeypatch, uid='caller-1'):
+    """Stub flask.g.user for _decide_media_mode caller-id resolution."""
+    from integrations.social import api_calls
+    class _G:
+        user = _FakeUser(uid)
+    monkeypatch.setattr(api_calls, 'g', _G)
+
+
+def test_decide_media_mode_voice_under_threshold(monkeypatch):
+    """≤4 active voice participants → p2p_mesh (PeerLink-signaled)."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    sess = {'kind': 'voice'}
+    parts = [{'user_id': 'u1', 'left_at': None},
+             {'user_id': 'u2', 'left_at': None}]
+    assert _decide_media_mode(sess, parts, is_agent=False) == 'p2p_mesh'
+
+
+def test_decide_media_mode_voice_over_threshold(monkeypatch):
+    """>4 active participants → livekit (mesh fanout becomes inefficient)."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    sess = {'kind': 'voice'}
+    # 4 already in + caller about to join = 5 active → over threshold(=4)
+    parts = [{'user_id': f'u{i}', 'left_at': None} for i in range(4)]
+    assert _decide_media_mode(sess, parts, is_agent=False) == 'livekit'
+
+
+def test_decide_media_mode_agent_always_livekit(monkeypatch):
+    """Any agent participant → livekit (AgentVoiceBridge needs SFU)."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    sess = {'kind': 'voice'}
+    assert _decide_media_mode(sess, [], is_agent=True) == 'livekit'
+
+
+def test_decide_media_mode_screen_share_always_livekit(monkeypatch):
+    """screen_share / mixed kinds → livekit regardless of count."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    assert _decide_media_mode({'kind': 'screen_share'}, [],
+                              is_agent=False) == 'livekit'
+    assert _decide_media_mode({'kind': 'mixed'}, [],
+                              is_agent=False) == 'livekit'
+
+
+def test_decide_media_mode_threshold_override(monkeypatch):
+    """LIVEKIT_MESH_THRESHOLD=999 keeps everything on mesh; =0 forces SFU."""
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    sess = {'kind': 'voice'}
+    parts = [{'user_id': f'u{i}', 'left_at': None} for i in range(20)]
+    monkeypatch.setenv('LIVEKIT_MESH_THRESHOLD', '999')
+    assert _decide_media_mode(sess, parts, is_agent=False) == 'p2p_mesh'
+    monkeypatch.setenv('LIVEKIT_MESH_THRESHOLD', '0')
+    # Threshold clamped to min 1, so 1 person mesh; 2 → livekit.
+    parts2 = [{'user_id': 'u1', 'left_at': None}]
+    assert _decide_media_mode(sess, parts2, is_agent=False) == 'livekit'
+
+
+def test_decide_media_mode_excludes_left_participants(monkeypatch):
+    """Active count uses left_at IS NULL — left rows don't count."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    sess = {'kind': 'voice'}
+    # 5 entries but 3 left → 2 active + 1 caller = 3 → mesh
+    parts = [{'user_id': 'u1', 'left_at': None},
+             {'user_id': 'u2', 'left_at': None},
+             {'user_id': 'u3', 'left_at': '2026-05-07T10:00:00Z'},
+             {'user_id': 'u4', 'left_at': '2026-05-07T10:01:00Z'},
+             {'user_id': 'u5', 'left_at': '2026-05-07T10:02:00Z'}]
+    assert _decide_media_mode(sess, parts, is_agent=False) == 'p2p_mesh'
+
+
+def test_decide_media_mode_caller_already_active_no_double_count(monkeypatch):
+    """If caller is already in the participant list, don't add +1."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch, uid='caller-1')
+    from integrations.social.api_calls import _decide_media_mode
+    sess = {'kind': 'voice'}
+    # 4 active including caller → at threshold (4), not over
+    parts = [{'user_id': 'caller-1', 'left_at': None},
+             {'user_id': 'u2', 'left_at': None},
+             {'user_id': 'u3', 'left_at': None},
+             {'user_id': 'u4', 'left_at': None}]
+    assert _decide_media_mode(sess, parts, is_agent=False) == 'p2p_mesh'
+
+
+# ── Supervisor branch tests (Task #275) ─────────────────────────────
+
+def test_supervisor_should_run_central_returns_false(monkeypatch):
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'central')
+    monkeypatch.delenv('LIVEKIT_AUTOSTART', raising=False)
+    monkeypatch.delenv('LIVEKIT_DISABLE', raising=False)
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor.supervisor_should_run() is False
+
+
+def test_supervisor_should_run_flat_returns_true(monkeypatch):
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')
+    monkeypatch.delenv('LIVEKIT_AUTOSTART', raising=False)
+    monkeypatch.delenv('LIVEKIT_DISABLE', raising=False)
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor.supervisor_should_run() is True
+
+
+def test_supervisor_disable_env_overrides_mode(monkeypatch):
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')
+    monkeypatch.setenv('LIVEKIT_DISABLE', '1')
+    monkeypatch.delenv('LIVEKIT_AUTOSTART', raising=False)
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor.supervisor_should_run() is False
+
+
+def test_supervisor_autostart_env_overrides_mode(monkeypatch):
+    """LIVEKIT_AUTOSTART=1 forces supervisor on regardless of deploy mode."""
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'central')
+    monkeypatch.setenv('LIVEKIT_AUTOSTART', '1')
+    monkeypatch.delenv('LIVEKIT_DISABLE', raising=False)
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor.supervisor_should_run() is True
+
+
+def test_supervisor_autostart_zero_overrides_mode(monkeypatch):
+    """LIVEKIT_AUTOSTART=0 forces supervisor off regardless of deploy mode."""
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')
+    monkeypatch.setenv('LIVEKIT_AUTOSTART', '0')
+    monkeypatch.delenv('LIVEKIT_DISABLE', raising=False)
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor.supervisor_should_run() is False
+
+
+def test_ensure_dev_keys_idempotent(monkeypatch, tmp_path):
+    """Same keys returned across two calls."""
+    monkeypatch.delenv('LIVEKIT_API_KEY', raising=False)
+    monkeypatch.delenv('LIVEKIT_API_SECRET', raising=False)
+    monkeypatch.setenv('HEVOLVE_HOME', str(tmp_path))
+    from integrations.social import livekit_supervisor
+    a = livekit_supervisor.ensure_dev_keys()
+    b = livekit_supervisor.ensure_dev_keys()
+    assert a['api_key'] == b['api_key']
+    assert a['api_secret'] == b['api_secret']
+    assert a['api_key'].startswith('API')
+    assert len(a['api_secret']) >= 32
+
+
+def test_ensure_dev_keys_env_override_wins(monkeypatch, tmp_path):
+    """Env-var keys take priority — no dev_keys.json written."""
+    monkeypatch.setenv('LIVEKIT_API_KEY', 'OPERATOR_KEY')
+    monkeypatch.setenv('LIVEKIT_API_SECRET', 'OPERATOR_SECRET')
+    monkeypatch.setenv('HEVOLVE_HOME', str(tmp_path))
+    from integrations.social import livekit_supervisor
+    keys = livekit_supervisor.ensure_dev_keys()
+    assert keys['api_key'] == 'OPERATOR_KEY'
+    assert keys['api_secret'] == 'OPERATOR_SECRET'
+    # No file written — env path bypasses persistence.
+    assert not (tmp_path / 'livekit' / 'dev_keys.json').exists()

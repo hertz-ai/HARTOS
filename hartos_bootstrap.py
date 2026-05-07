@@ -199,6 +199,7 @@ def _run_bootstrap(app, cfg: dict) -> None:
             _init_database(cfg)
             _init_channel_adapters(app, cfg)
             _init_agent_engine_subsystem(app)
+            _init_livekit_supervisor(cfg)
             _run_on_bootstrap_complete(cfg)
         finally:
             if bypass_active:
@@ -490,6 +491,39 @@ def _init_agent_engine_subsystem(app) -> None:
         logger.info("Agent engine initialised")
     except Exception as e:
         logger.warning(f"Agent engine init failed: {e}")
+
+
+# ─── Step 8b: LiveKit SFU supervisor (regional/flat only) ────────────
+
+
+def _init_livekit_supervisor(cfg: dict) -> None:
+    """Spawn the embedded LiveKit SFU on regional/flat HARTOS nodes.
+
+    Architecture intent: PeerLink + WebRTC mesh handle ≤4-participant
+    calls (P2P, no SFU).  LiveKit is the FALLBACK SFU for >4-participant
+    calls and AgentVoiceBridge rendezvous, hosted by regional nodes for
+    their tenants.  Central HARTOS does NOT run an SFU (sync /
+    federation / backup-restore only) — the supervisor short-circuits
+    when ``HEVOLVE_DEPLOY_MODE=central`` or ``LIVEKIT_DISABLE=1``.
+
+    Idempotent: subsequent calls return the same supervisor instance.
+    Failure to start logs a warning but never aborts bootstrap; clients
+    fall back to P2P mesh until the SFU is reachable.
+    """
+    try:
+        from integrations.social.livekit_supervisor import start_supervisor
+        info = start_supervisor()
+        if info.get('should_run'):
+            logger.info(
+                "LiveKit supervisor: %s (running=%s, url=%s, binary=%s)",
+                info.get('mode'), info.get('running'),
+                info.get('url'), info.get('binary_path'))
+        else:
+            logger.info(
+                "LiveKit supervisor: skipped (%s) — calls use P2P mesh",
+                info.get('reason') or info.get('mode'))
+    except Exception as e:
+        logger.warning(f"LiveKit supervisor init failed: {e}")
 
 
 # ─── Step 9: on_bootstrap_complete consumer callback ─────────────────

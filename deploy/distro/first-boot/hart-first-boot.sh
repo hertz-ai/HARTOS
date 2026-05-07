@@ -219,6 +219,31 @@ for i in $(seq 1 20); do
     sleep 2
 done
 
+# ─── Step 5b: LiveKit SFU binary pre-stage (regional / flat) ───
+# HART OS distros are SFU hosts for their tenants (regional) or
+# single-user device (flat).  The LiveKit supervisor lazy-downloads
+# the binary on first call, but doing it during first-boot means
+# the first call is instant.  Skip on edge variants and OBSERVER tier
+# (constrained hardware — fall back to PeerLink-only signaling).
+if [[ "$VARIANT" != "edge" && "$TIER" != "OBSERVER" ]]; then
+    echo "[5b/5] Pre-staging LiveKit SFU binary..."
+    "$INSTALL_DIR/venv/bin/python" -c "
+import logging, sys
+logging.basicConfig(level=logging.INFO, format='  %(message)s')
+try:
+    from integrations.social.livekit_supervisor import ensure_binary
+    path = ensure_binary()
+    if path:
+        print(f'  LiveKit binary ready: {path}')
+    else:
+        print('  LiveKit binary unavailable — calls will use PeerLink mesh only')
+except Exception as e:
+    print(f'  LiveKit pre-stage skipped: {e}')
+    # Non-fatal — supervisor will retry on first call.
+    sys.exit(0)
+" 2>&1 || echo "  (non-fatal; supervisor will retry on demand)"
+fi
+
 # ─── Boot Audit ───
 if [[ -x "$INSTALL_DIR/deploy/distro/first-boot/hart-boot-audit.sh" ]]; then
     bash "$INSTALL_DIR/deploy/distro/first-boot/hart-boot-audit.sh" "$NODE_ID" "$TIER"
