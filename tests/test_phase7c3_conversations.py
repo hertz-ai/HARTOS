@@ -604,3 +604,123 @@ def test_endpoint_get_conversation_non_member_404(app_client, monkeypatch):
     r = client.get(f'/api/social/conversations/{conv_id}',
                    headers={'Authorization': f'Bearer {tok_eve}'})
     assert r.status_code == 404
+
+
+# ── Phase 7e moderation wiring on conversation messages ─────────────
+
+def _decision_count_for_message(db, message_id: str) -> int:
+    from sqlalchemy import text
+    return db.execute(text(
+        "SELECT COUNT(*) FROM content_moderation_decisions "
+        "WHERE source_kind = 'message' AND source_id = :mid"),
+        {'mid': message_id}
+    ).scalar()
+
+
+def test_send_message_classifier_skipped_when_flag_off(app_client,
+                                                       monkeypatch):
+    """moderation_v2 flag off → POST /messages writes NO decision row."""
+    _silence_realtime(monkeypatch)
+    monkeypatch.delenv('HEVOLVE_FLAG_MODERATION_V2', raising=False)
+    client, db = app_client
+    a, b, _ = _seed(db)
+    from integrations.social import auth
+    tok_a = auth.generate_jwt(a.id, a.username, 'flat')
+    r = client.post('/api/social/conversations',
+                    json={'kind': 'dm', 'member_ids': [b.id]},
+                    headers={'Authorization': f'Bearer {tok_a}'})
+    conv_id = r.get_json()['data']['id']
+    # Borderline content (matches keyword classifier) — but flag off so
+    # the message ships without a decision row.
+    r = client.post(f'/api/social/conversations/{conv_id}/messages',
+                    json={'content': 'porn is cool'},
+                    headers={'Authorization': f'Bearer {tok_a}'})
+    assert r.status_code == 201
+    msg_id = r.get_json()['data']['id']
+    assert _decision_count_for_message(db, msg_id) == 0
+
+
+def test_send_message_classifier_quarantines_when_flag_on(app_client,
+                                                           monkeypatch):
+    """moderation_v2 flag on + borderline content → decision row exists
+    with source_kind='message'.  Mod queue can review."""
+    _silence_realtime(monkeypatch)
+    monkeypatch.setenv('HEVOLVE_FLAG_MODERATION_V2', 'true')
+    client, db = app_client
+    a, b, _ = _seed(db)
+    from integrations.social import auth
+    tok_a = auth.generate_jwt(a.id, a.username, 'flat')
+    r = client.post('/api/social/conversations',
+                    json={'kind': 'dm', 'member_ids': [b.id]},
+                    headers={'Authorization': f'Bearer {tok_a}'})
+    conv_id = r.get_json()['data']['id']
+    # Keyword bank flags 'porn' → category=sexual, decision='quarantine'.
+    r = client.post(f'/api/social/conversations/{conv_id}/messages',
+                    json={'content': 'check this porn link'},
+                    headers={'Authorization': f'Bearer {tok_a}'})
+    assert r.status_code == 201
+    msg_id = r.get_json()['data']['id']
+    # Decision row exists.
+    assert _decision_count_for_message(db, msg_id) == 1
+    from sqlalchemy import text
+    decision = db.execute(text(
+        "SELECT decision FROM content_moderation_decisions "
+        "WHERE source_kind = 'message' AND source_id = :mid"),
+        {'mid': msg_id}
+    ).scalar()
+    # Either 'quarantine' or 'block' is acceptable depending on
+    # confidence — but must NOT be 'allow'.
+    assert decision in ('quarantine', 'block')
+
+
+def test_send_clean_message_records_allow_decision(app_client, monkeypatch):
+    """Clean text → decision row records 'allow'."""
+    _silence_realtime(monkeypatch)
+    monkeypatch.setenv('HEVOLVE_FLAG_MODERATION_V2', 'true')
+    client, db = app_client
+    a, b, _ = _seed(db)
+    from integrations.social import auth
+    tok_a = auth.generate_jwt(a.id, a.username, 'flat')
+    r = client.post('/api/social/conversations',
+                    json={'kind': 'dm', 'member_ids': [b.id]},
+                    headers={'Authorization': f'Bearer {tok_a}'})
+    conv_id = r.get_json()['data']['id']
+    r = client.post(f'/api/social/conversations/{conv_id}/messages',
+                    json={'content': 'hi how are you today'},
+                    headers={'Authorization': f'Bearer {tok_a}'})
+    msg_id = r.get_json()['data']['id']
+    from sqlalchemy import text
+    decision = db.execute(text(
+        "SELECT decision FROM content_moderation_decisions "
+        "WHERE source_id = :mid"),
+        {'mid': msg_id}
+    ).scalar()
+    assert decision == 'allow'
+
+
+def test_edit_message_re_classifies(app_client, monkeypatch):
+    """Edit can change content from clean to flagged — re-classify on
+    edit so the mod queue catches edits-into-violation."""
+    _silence_realtime(monkeypatch)
+    monkeypatch.setenv('HEVOLVE_FLAG_MODERATION_V2', 'true')
+    client, db = app_client
+    a, b, _ = _seed(db)
+    from integrations.social import auth
+    tok_a = auth.generate_jwt(a.id, a.username, 'flat')
+    r = client.post('/api/social/conversations',
+                    json={'kind': 'dm', 'member_ids': [b.id]},
+                    headers={'Authorization': f'Bearer {tok_a}'})
+    conv_id = r.get_json()['data']['id']
+    r = client.post(f'/api/social/conversations/{conv_id}/messages',
+                    json={'content': 'clean message'},
+                    headers={'Authorization': f'Bearer {tok_a}'})
+    msg_id = r.get_json()['data']['id']
+    # Initial classify → 'allow'
+    assert _decision_count_for_message(db, msg_id) == 1
+    # Edit to flagged content → second decision row appears.
+    r = client.patch(
+        f'/api/social/conversations/{conv_id}/messages/{msg_id}',
+        json={'content': 'now mentioning porn'},
+        headers={'Authorization': f'Bearer {tok_a}'})
+    assert r.status_code == 200
+    assert _decision_count_for_message(db, msg_id) == 2
