@@ -493,9 +493,36 @@ class DiscordAdapter(ChannelAdapter, RoomCapableAdapter):
             if existing is not None and existing.is_connected():
                 return True
             try:
-                voice_client = await channel.connect(reconnect=True,
-                                                    self_deaf=False)
+                # UNIF-G7 Producer A: prefer VoiceRecvClient when the
+                # discord-ext-voice-recv lib is installed, so the
+                # HevolveStreamingSink can pipe per-speaker PCM through
+                # the canonical streaming-STT WS server.  When the lib
+                # is absent, fall back to the bare connect() call —
+                # voice room PRESENCE behavior is unchanged.
+                connect_kwargs = {'reconnect': True, 'self_deaf': False}
+                try:
+                    from .discord_voice_recv_sink import (
+                        HAS_VOICE_RECV, VoiceRecvClient,
+                    )
+                    if HAS_VOICE_RECV and VoiceRecvClient is not None:
+                        connect_kwargs['cls'] = VoiceRecvClient
+                except Exception:
+                    pass
+                voice_client = await channel.connect(**connect_kwargs)
                 self._voice_clients[cid] = voice_client
+                # Best-effort attach the streaming sink.  Returns
+                # False (silent) when the recv lib isn't installed or
+                # the connected client doesn't support listen().
+                try:
+                    from .discord_voice_recv_sink import (
+                        maybe_attach_recv_sink,
+                    )
+                    maybe_attach_recv_sink(
+                        voice_client, call_id=str(cid),
+                        bot_user_id=self._bot_user_id)
+                except Exception as e:
+                    logger.debug(
+                        "Discord.join_room: sink attach skipped (%s)", e)
                 logger.info(
                     "Discord.join_room: voice channel %s connected (role=%s)",
                     cid, role)
