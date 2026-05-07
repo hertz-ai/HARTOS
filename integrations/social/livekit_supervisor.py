@@ -68,22 +68,27 @@ logger = logging.getLogger('hevolve_social')
 
 
 # ── Pinned binary version ──────────────────────────────────────────────
-# Bump together: VERSION, SHA-256 per platform.  When upgrading, run:
-#   curl -sL https://github.com/livekit/livekit/releases/download/v$VERSION/livekit_${VERSION}_linux_amd64.tar.gz | sha256sum
-# and update the table below.
+# Bump together: VERSION + SHA-256 table.  When upgrading:
+#   curl -sL https://github.com/livekit/livekit/releases/download/v$VERSION/checksums.txt
+# and copy the hashes for the platforms we ship.
 LIVEKIT_VERSION = '1.7.2'
 
-# SHA-256 of the official tarballs from
-# https://github.com/livekit/livekit/releases/tag/v1.7.2
-# Empty string → checksum verification skipped (when not yet pinned).
-# CI / hardening can pin these later; for now we accept the binary as-is
-# but log the actual checksum so a follow-up PR can fill the table.
+# SHA-256 of the official release artifacts from
+# https://github.com/livekit/livekit/releases/download/v1.7.2/checksums.txt
+# These are pinned for supply-chain integrity — a download whose hash
+# doesn't match is rejected by ensure_binary().
+#
+# Note: LiveKit does NOT ship darwin (macOS) builds in this release
+# series.  Operators on Apple Silicon must either install via Homebrew
+# (`brew install livekit-server`) and let the supervisor's PATH lookup
+# find it, or set LIVEKIT_BINARY_PATH explicitly.
 _LIVEKIT_SHA256 = {
-    'linux-amd64':  '',
-    'linux-arm64':  '',
-    'darwin-amd64': '',
-    'darwin-arm64': '',
-    'windows-amd64': '',
+    'linux-amd64':   '7669b1a112449e71ff80cb82460dae7e526e92b3d81e15c70f66a030fac62f4a',
+    'linux-arm64':   '482ced7026cbf4c661ab262d04e2d1ba4a723a478bd87028cd27a8a4bcf38035',
+    'linux-armv7':   '68a48cf10b2641aaca449ec61018922a2e3294b2682ce0eb9d40ad7fb5e14c2e',
+    'windows-amd64': '9589bd307b4a908beaf65c6887f675090a8299f47979447e49a3b2a78d07a1d8',
+    'windows-arm64': '746adc54325d82e080c32501e17f66cd1830e937bc496026eb155c06cc6fd257',
+    'windows-armv7': '855007017fd5c2043ada6d43d21eb74e1cad8d496a74476be8af9e33bce296bc',
 }
 
 
@@ -230,15 +235,22 @@ def _platform_tag() -> str:
 
 def _binary_url() -> str:
     """Resolve the binary archive URL.  `LIVEKIT_BINARY_URL` lets ISO /
-    air-gapped builds point at a local mirror or cached file://."""
+    air-gapped builds point at a local mirror or cached file://.
+
+    LiveKit's release filenames use underscore between os and arch
+    (`livekit_1.7.2_linux_amd64.tar.gz`), but our internal platform
+    tag uses hyphen (`linux-amd64`) since it doubles as a dict key in
+    _LIVEKIT_SHA256.  The translation happens here.
+    """
     override = os.environ.get('LIVEKIT_BINARY_URL')
     if override:
         return override
-    tag = _platform_tag()
+    tag = _platform_tag()                  # e.g. 'linux-amd64'
+    url_tag = tag.replace('-', '_')        # e.g. 'linux_amd64'
     ext = 'zip' if tag.startswith('windows-') else 'tar.gz'
     return (
         f'https://github.com/livekit/livekit/releases/download/'
-        f'v{LIVEKIT_VERSION}/livekit_{LIVEKIT_VERSION}_{tag}.{ext}'
+        f'v{LIVEKIT_VERSION}/livekit_{LIVEKIT_VERSION}_{url_tag}.{ext}'
     )
 
 

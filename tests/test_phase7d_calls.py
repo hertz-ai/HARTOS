@@ -796,6 +796,58 @@ def test_operational_thresholds_match_api_calls_defaults():
     assert OPERATIONAL_THRESHOLDS == _DEFAULT_KIND_THRESHOLDS
 
 
+def test_supervisor_binary_url_uses_underscore_separator(monkeypatch):
+    """LiveKit's release filenames use `linux_amd64`, not `linux-amd64`.
+    Our internal platform tag uses hyphen (doubles as dict key) — the
+    URL builder must translate hyphen → underscore."""
+    monkeypatch.delenv('LIVEKIT_BINARY_URL', raising=False)
+    from integrations.social import livekit_supervisor
+    # Pin platform.system / machine for deterministic URL.
+    monkeypatch.setattr(livekit_supervisor.platform, 'system',
+                        lambda: 'Linux')
+    monkeypatch.setattr(livekit_supervisor.platform, 'machine',
+                        lambda: 'x86_64')
+    url = livekit_supervisor._binary_url()
+    assert 'livekit_1.7.2_linux_amd64.tar.gz' in url
+    assert 'linux-amd64' not in url
+
+
+def test_supervisor_binary_url_windows_uses_zip(monkeypatch):
+    monkeypatch.delenv('LIVEKIT_BINARY_URL', raising=False)
+    from integrations.social import livekit_supervisor
+    monkeypatch.setattr(livekit_supervisor.platform, 'system',
+                        lambda: 'Windows')
+    monkeypatch.setattr(livekit_supervisor.platform, 'machine',
+                        lambda: 'AMD64')
+    url = livekit_supervisor._binary_url()
+    assert url.endswith('windows_amd64.zip')
+
+
+def test_supervisor_binary_url_override_env(monkeypatch):
+    """LIVEKIT_BINARY_URL bypasses URL construction (air-gapped /
+    mirror / file:// builds)."""
+    monkeypatch.setenv('LIVEKIT_BINARY_URL',
+                       'file:///cache/livekit-1.7.2.tar.gz')
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor._binary_url() == 'file:///cache/livekit-1.7.2.tar.gz'
+
+
+def test_supervisor_sha256_pinned_for_supported_platforms():
+    """Supply-chain integrity: every platform we build a download URL
+    for must have a non-empty SHA-256 pin.  Adding a new platform tag
+    without pinning its hash is a CI-breaking mistake."""
+    from integrations.social.livekit_supervisor import _LIVEKIT_SHA256
+    expected_keys = {
+        'linux-amd64', 'linux-arm64', 'linux-armv7',
+        'windows-amd64', 'windows-arm64', 'windows-armv7',
+    }
+    for key in expected_keys:
+        assert key in _LIVEKIT_SHA256, f'missing SHA-256 pin for {key}'
+        # Real SHA-256 hex is 64 chars; empty would skip verification.
+        assert len(_LIVEKIT_SHA256[key]) == 64, (
+            f'SHA-256 pin for {key} is empty or wrong length')
+
+
 def test_decide_media_mode_excludes_left_participants(monkeypatch):
     """Active count uses left_at IS NULL — left rows don't count."""
     monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
