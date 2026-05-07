@@ -75,50 +75,84 @@ def probe_agent_daemon() -> Dict[str, Any]:
     return out
 
 
-def probe_llm() -> Dict[str, Any]:
-    """Return live LLM server state via the canonical URL resolver.
+def probe_llm(include_models: bool = False) -> Dict[str, Any]:
+    """Return live LLM server state via an HTTP-fidelity probe.
 
-    Uses ``core.port_registry.get_local_llm_url()`` which walks 7
-    candidate sources (env vars, ``~/.nunba/llama_config.json``, the
-    port-registry default) and ``_probe_llm_endpoint`` for the actual
-    reachability check.  Always returns the URL we tried so debugging
-    is one log line instead of "down" with no clue.
+    Issues an actual HTTP GET to ``<url>/models`` and checks for a 200
+    response.  Distinct from the TCP-only ``_probe_llm_endpoint`` in
+    ``core.port_registry`` which is the cheap candidate-filter for
+    ``get_local_llm_url`` — that one stays TCP-only on purpose
+    (sub-1ms per candidate).  This probe upgrades to HTTP fidelity
+    so a half-loaded llama-server (port bound but model not ready)
+    is correctly reported as ``down`` (#459).
+
+    SRP (#458): the default response is a single HTTP request — no
+    second-call side effect.  Pass ``include_models=True`` when you
+    actually need the model-list payload; otherwise the response body
+    is discarded.
+
+    Always returns the URL we tried so debugging is one log line
+    instead of "down" with no clue.
     """
     out: Dict[str, Any] = {}
     try:
-        from core.port_registry import get_local_llm_url, _probe_llm_endpoint
+        from core.port_registry import get_local_llm_url
         url = get_local_llm_url()
         out['url'] = url
-        if _probe_llm_endpoint(url):
-            out['status'] = 'up'
-            # Best-effort model list — no failure if it 404s.
-            try:
-                from core.http_pool import pooled_get
-                # get_local_llm_url returns ".../v1" suffix; models endpoint is /v1/models
-                models_url = url.rstrip('/') + '/models'
-                resp = pooled_get(models_url, timeout=2)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    out['models'] = [
-                        m.get('id', 'unknown') for m in data.get('data', [])
-                    ]
-            except Exception:
-                pass
-        else:
-            out['status'] = 'down'
     except Exception as e:
         out['status'] = 'probe_error'
+        out['error'] = str(e)
+        return out
+    try:
+        from core.http_pool import pooled_get
+        # ``get_local_llm_url`` returns the ".../v1" suffix so /models
+        # is the OpenAI-compatible models endpoint.  A 200 here proves
+        # the LLM is actually serving — port-bound-but-stuck processes
+        # return 5xx / connection-error / timeout.
+        models_url = url.rstrip('/') + '/models'
+        resp = pooled_get(models_url, timeout=2)
+        if resp.status_code == 200:
+            out['status'] = 'up'
+            if include_models:
+                try:
+                    data = resp.json()
+                    out['models'] = [
+                        m.get('id', 'unknown')
+                        for m in data.get('data', [])
+                    ]
+                except Exception:
+                    pass
+        else:
+            out['status'] = 'down'
+            out['code'] = resp.status_code
+    except Exception as e:
+        out['status'] = 'down'
         out['error'] = str(e)
     return out
 
 
 def probe_nunba_flask() -> Dict[str, Any]:
-    """Return Nunba Flask server state (the in-process app at :5000)."""
+    """Return Nunba Flask server state.
+
+    Resolves the port via the canonical ``core.port_registry.get_port
+    ('flask')`` resolver instead of the previously-hardcoded :5000
+    literal (#460) — env override ``HART_FLASK_PORT`` is honored
+    automatically.
+    """
     out: Dict[str, Any] = {}
     try:
+        from core.port_registry import get_port
+        port = get_port('flask')
+        out['port'] = port
+    except Exception as e:
+        out['status'] = 'probe_error'
+        out['error'] = str(e)
+        return out
+    try:
         from core.http_pool import pooled_get
-        resp = pooled_get('http://localhost:5000/health', timeout=2)
-        out['status'] = 'up' if resp.status_code == 200 else f'status_{resp.status_code}'
+        resp = pooled_get(f'http://localhost:{port}/health', timeout=2)
+        out['status'] = ('up' if resp.status_code == 200
+                         else f'status_{resp.status_code}')
         out['code'] = resp.status_code
     except Exception as e:
         out['status'] = 'down'
@@ -127,11 +161,25 @@ def probe_nunba_flask() -> Dict[str, Any]:
 
 
 def probe_langchain() -> Dict[str, Any]:
-    """Return langchain GPT API sidecar state (port 6778)."""
+    """Return langchain GPT API sidecar state.
+
+    Resolves the port via the canonical ``core.port_registry.get_port
+    ('langchain')`` resolver instead of the previously-hardcoded :6778
+    literal (#460) — env override ``HART_LANGCHAIN_PORT`` is honored
+    automatically.
+    """
     out: Dict[str, Any] = {}
     try:
+        from core.port_registry import get_port
+        port = get_port('langchain')
+        out['port'] = port
+    except Exception as e:
+        out['status'] = 'probe_error'
+        out['error'] = str(e)
+        return out
+    try:
         from core.http_pool import pooled_get
-        resp = pooled_get('http://localhost:6778/health', timeout=2)
+        resp = pooled_get(f'http://localhost:{port}/health', timeout=2)
         out['status'] = 'up' if resp.status_code == 200 else 'error'
         out['code'] = resp.status_code
     except Exception:

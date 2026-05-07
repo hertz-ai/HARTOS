@@ -42,6 +42,12 @@ APP_PORTS = {
     'model_bus':    6790,
     'mcp':          6791,
     'vlm_caption':  8081,
+    # Nunba Flask (the user-facing app server) + langchain GPT-API
+    # sidecar.  Previously hardcoded in core/health_probe.py — moved
+    # here per #460 so the probes (and any future caller) walks the
+    # canonical resolver instead of duplicating the literal port.
+    'flask':        5000,
+    'langchain':    6778,
 }
 
 # OS mode: privileged ports (HART OS is the operating system)
@@ -59,6 +65,9 @@ OS_PORTS = {
     'model_bus':    681,
     'mcp':          682,
     'vlm_caption':  809,
+    'flask':        500,
+    # 778 (not 677) to avoid colliding with backend=677 in OS mode.
+    'langchain':    778,
 }
 
 # Environment variable overrides (takes precedence over both modes)
@@ -76,6 +85,8 @@ ENV_OVERRIDES = {
     'model_bus':    'HART_MODEL_BUS_PORT',
     'mcp':          'HART_MCP_PORT',
     'vlm_caption':  'HEVOLVE_VLM_CAPTION_PORT',
+    'flask':        'HART_FLASK_PORT',
+    'langchain':    'HART_LANGCHAIN_PORT',
 }
 
 
