@@ -432,6 +432,43 @@ class SpeculativeDispatcher:
             )
             delegate = 'local'
 
+        # ACTIONABLE-INTENT GUARD: when the draft's own classifier
+        # surfaces an actionable intent flag (channel_connect,
+        # is_create_agent, language_change), answering in-band would
+        # orphan the action — there is no way to invoke the matching
+        # tool (Connect_Channel / Create_Agent) from the casual draft
+        # path because casual_conv=True skips the full tool registry
+        # in hart_intelligence_entry.get_ans (see the is_first=True
+        # branch).  Promote delegate=none → 'local' so the expert
+        # turn binds the full registry — Connect_Channel for
+        # channel-add intents, Create_Agent for agent-build intents —
+        # and actually fires the tool the LLM would otherwise have
+        # described in free-form text.
+        #
+        # The draft's reply is also replaced with the standby (same
+        # rationale as REFUSAL GUARD above): the draft on the
+        # casual path has no tool access, so any in-band reply on
+        # an actionable-intent turn is a verified-signal anti-pattern
+        # — it claims action while taking none.  The expert reply
+        # replaces the standby via the existing speculation_id
+        # bubble-replacement path (#204 already shipped).
+        if delegate == 'none' and (
+            (parsed.get('channel_connect') or '').strip()
+            or parsed.get('is_create_agent')
+            or (parsed.get('language_change') or '').strip()
+        ):
+            logger.info(
+                "draft-first: actionable intent flag set "
+                "(channel_connect=%r, is_create_agent=%r, "
+                "language_change=%r) — escalating delegate=none → "
+                "'local' so the expert tool registry handles the turn.",
+                parsed.get('channel_connect'),
+                parsed.get('is_create_agent'),
+                parsed.get('language_change'),
+            )
+            draft_reply = _REFUSAL_STANDBY_REPLY
+            delegate = 'local'
+
         # Non-Latin languages skip draft entirely (hart_intelligence_entry.py)
         # so this code path is only reached for English/Latin-script languages.
 

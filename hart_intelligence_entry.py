@@ -2877,7 +2877,53 @@ def _handle_connect_channel_tool(input_text: str) -> str:
         )
         if register_fn is None:
             return "Channel registration is not available on this node."
-        return register_fn(channel_type, config_json)
+        result = register_fn(channel_type, config_json)
+        # Liquid UI co-pilot: when the tool reports missing-credential
+        # fields, surface a floating form via agent_ui_update so the
+        # existing AgentOverlay FormOverlay (case 'form' renderer)
+        # collects the credentials inline in chat instead of forcing
+        # the user to navigate to the admin Channels page.  The text
+        # return is preserved unchanged so the LangChain agent can
+        # summarize it to the user — the form is the IMPERATIVE next
+        # step, the text is context.  Best-effort: never raise, never
+        # block the tool return.  Same emit pattern model_orchestrator
+        # already uses (see notify_loaded line ~872).
+        try:
+            if isinstance(result, str) and 'Missing:' in result:
+                from integrations.channels.metadata import get_channel_metadata
+                meta = get_channel_metadata(channel_type) or {}
+                setup_fields = meta.get('setup_fields') or []
+                if setup_fields:
+                    from core.platform.service_registry import ServiceRegistry
+                    _lui = ServiceRegistry.get('LiquidUIService')
+                    if _lui:
+                        _lui.agent_ui_update(
+                            thread_local_data.get_user_id() or 'system',
+                            {
+                                'type': 'form',
+                                'title': f"Connect {meta.get('display_name') or channel_type}",
+                                'channel': channel_type,
+                                'fields': [
+                                    {
+                                        'name': f.get('key'),
+                                        'label': f.get('label') or f.get('key'),
+                                        'placeholder': f.get('placeholder') or '',
+                                        'secret': bool(
+                                            f.get('secret')
+                                            or (f.get('key') or '').endswith(
+                                                ('_token', '_secret', '_key'))
+                                        ),
+                                        'help': f.get('help') or '',
+                                    }
+                                    for f in setup_fields
+                                ],
+                                'submit_label': 'Connect',
+                                'submit_action': 'register_channel',
+                            },
+                        )
+        except Exception as e:
+            logger.debug("Connect_Channel: liquid UI emit skipped: %s", e)
+        return result
     except Exception as e:
         return f"Channel connect error: {str(e)[:200]}"
 
