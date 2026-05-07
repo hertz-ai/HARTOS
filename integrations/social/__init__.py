@@ -435,9 +435,15 @@ def init_social(app):
         except Exception as e:
             logger.debug(f"HevolveSocial sync engine start skipped: {e}")
 
-    # Start distributed coding agent if enabled
+    # Start distributed coding agent if enabled.  Default flipped to
+    # 'true' on 2026-05-07 — the daemon consumes self_heal goals
+    # produced by error_advice (#102) and SelfHealingDispatcher; with
+    # default 'false' the queue piled up indefinitely (15 stale goals
+    # back to 2026-04-27 in the live DB at audit time).  Safety is in
+    # the daemon itself (no idle agents → early return; budget gate;
+    # 30s poll cadence).  Servers that don't want it set explicitly.
     import os as _os2
-    if _os2.environ.get('HEVOLVE_CODING_AGENT_ENABLED', 'false').lower() == 'true':
+    if _os2.environ.get('HEVOLVE_CODING_AGENT_ENABLED', 'true').lower() == 'true':
         try:
             from integrations.coding_agent import init_coding_agent
             init_coding_agent(app)

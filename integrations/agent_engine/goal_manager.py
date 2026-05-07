@@ -857,20 +857,68 @@ def _build_revenue_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) 
     )
 
 
-def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
-    """Build a self-healing code agent prompt from an exception pattern."""
-    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+_BACKEND_REPAIR_CATEGORIES = frozenset({
+    'tts.probe',
+    'tts.install',
+    'tts.install.self_heal_exhausted',
+    'subprocess.tool_load',
+})
 
-    return (
+
+def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    """Build a self-healing code agent prompt from an exception pattern.
+
+    Branches on the goal's ``config.category`` so a venv-install failure
+    (``tts.probe`` / ``subprocess.tool_load`` / ``tts.install*``) is
+    routed to the ``repair_backend_venv`` tool instead of the generic
+    "read source, write fix" path.  Source edits alone never repair a
+    live broken venv — the user has to rebuild — and that's exactly
+    the loophole the producer side already documented (see
+    ``core/error_advice.py:_try_agent_remediation``).
+    """
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    category = config.get('category', '') or ''
+    ctx = config.get('context', {}) or {}
+    backend = ctx.get('backend') if isinstance(ctx, dict) else None
+
+    base = (
         f"YOU ARE A SELF-HEALING CODE AGENT.\n\n"
         f"An exception pattern has been detected that needs fixing:\n"
         f"  Exception: {config.get('exc_type', 'Unknown')}\n"
         f"  Module: {config.get('source_module', 'unknown')}\n"
         f"  Function: {config.get('source_function', 'unknown')}\n"
+        f"  Category: {category or 'unknown'}\n"
         f"  Occurrences: {config.get('occurrence_count', 0)}\n"
         f"  Sample traceback:\n{config.get('sample_traceback', 'N/A')}\n\n"
         f"Goal: {goal_dict['title']}\n"
         f"Description: {goal_dict.get('description', '')}\n\n"
+    )
+
+    if category in _BACKEND_REPAIR_CATEGORIES and backend:
+        return base + (
+            f"FAILURE SHAPE: backend venv install / probe failure\n"
+            f"  Backend: {backend!r}\n\n"
+            f"PREFERRED REMEDIATION — call the repair tool FIRST:\n"
+            f"  repair_backend_venv(backend_name={backend!r})\n"
+            f"  → idempotent reinstall via Nunba's install_backend_full.\n"
+            f"\n"
+            f"If that returns success=False with a corruption / "
+            f"transitive-conflict message, retry with wipe_first=True:\n"
+            f"  repair_backend_venv(backend_name={backend!r}, "
+            f"wipe_first=True)\n"
+            f"  → wipes the venv directory then reruns the canonical "
+            f"pip_install_plan.\n\n"
+            f"If the repair tool itself reports the bundled environment "
+            f"is unreachable (source-mode HARTOS), fall back to source "
+            f"inspection: read the failing source module, identify the "
+            f"root cause, and propose a minimal patch to the canonical "
+            f"pip_install_plan in integrations/channels/media/tts_router.py "
+            f"so the next user-side rebuild fixes the venv.\n\n"
+            f"Always check the log_path returned by repair_backend_venv "
+            f"to inspect actual pip output before drawing conclusions.\n"
+        )
+
+    return base + (
         f"Instructions:\n"
         f"1. Read the source file and understand the exception context\n"
         f"2. Identify the root cause (not just the symptom)\n"

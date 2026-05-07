@@ -584,10 +584,60 @@ class TestRepoValidation:
 
 class TestPackageInit:
 
-    def test_disabled_by_default(self):
+    def test_explicit_false_disables(self):
+        """When HEVOLVE_CODING_AGENT_ENABLED is explicitly set to 'false',
+        init_coding_agent must skip blueprint registration AND daemon
+        start.  Server deployments that don't want the daemon use this
+        explicit override.
+
+        Default (2026-05-07+) is 'true' — see test_enabled_by_default
+        for that semantic.  This test pins the explicit-disable path."""
         from flask import Flask
         app = Flask(__name__)
         with patch.dict(os.environ, {'HEVOLVE_CODING_AGENT_ENABLED': 'false'}):
             from integrations.coding_agent import init_coding_agent
             init_coding_agent(app)
             assert 'coding_agent' not in [bp.name for bp in app.blueprints.values()]
+
+    def test_enabled_by_default_when_env_unset(self):
+        """When HEVOLVE_CODING_AGENT_ENABLED is NOT set in the env,
+        init_coding_agent must default to enabled.  Pre-2026-05-07
+        this defaulted to 'false' which caused 15 self_heal goals to
+        pile up (oldest 2026-04-27, none completed) because the
+        daemon never ran.  Default flipped to 'true' since the daemon
+        is the canonical consumer for goals that error_advice +
+        SelfHealingDispatcher fill — having a producer with no
+        consumer is worse than the original opt-in design intent.
+
+        Safety relies on the daemon itself: _tick() early-returns
+        when no idle agents are opted in, so users with empty agent
+        rosters see zero behavioral change.
+        """
+        from flask import Flask
+        app = Flask(__name__)
+        # Remove the env var if it happens to be set in the test runner
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('HEVOLVE_CODING_AGENT_ENABLED', None)
+            # Mock the blueprint+daemon import to avoid spinning a real
+            # daemon thread in the test.  We only verify the CONTROL
+            # FLOW reaches the registration path; the daemon's own
+            # behavior is covered by test_coding_daemon.py.
+            with patch('integrations.coding_agent.get_coding_blueprint') as mock_bp, \
+                 patch('integrations.coding_agent.coding_daemon.coding_daemon') as mock_daemon:
+                mock_bp.return_value = MagicMock(name='coding_agent_bp')
+                mock_bp.return_value.name = 'coding_agent'
+                mock_daemon.start = MagicMock()
+
+                from integrations.coding_agent import init_coding_agent
+                init_coding_agent(app)
+
+                # The control flow must reach blueprint registration
+                # (which means it passed the env gate).  Either the
+                # blueprint actually registered OR get_coding_blueprint
+                # was at least called — we accept either since the
+                # blueprint was already registered in a prior test run
+                # (Flask raises on duplicate register).
+                assert mock_bp.called or app.blueprints, (
+                    "Default-enabled path must reach blueprint "
+                    "registration — env gate must default 'true'"
+                )

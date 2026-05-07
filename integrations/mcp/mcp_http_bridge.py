@@ -1002,6 +1002,8 @@ def _load_tools():
          'AUTO_EVOLVE_TOOLS', 'auto_evolve'),
         ('integrations.coding_agent.autoevolve_code_tools',
          'AUTOEVOLVE_CODE_TOOLS', 'autoevolve_code'),
+        ('integrations.coding_agent.backend_repair_tools',
+         'BACKEND_REPAIR_TOOLS', 'backend_repair'),
     ):
         try:
             import importlib
