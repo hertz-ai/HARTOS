@@ -2928,6 +2928,85 @@ def _handle_connect_channel_tool(input_text: str) -> str:
         return f"Channel connect error: {str(e)[:200]}"
 
 
+def _handle_invite_friend_tool(input_text: str) -> str:
+    """Generate a shareable Nunba invite link the user can send to a friend.
+
+    Mirrors the _handle_connect_channel_tool pattern (G1, plan
+    elegant-spinning-avalanche).  Reuses the canonical referral primitive
+    ``DistributionService.get_or_create_referral_code`` (idempotent —
+    same user → same code) and the canonical URL builder
+    ``invite_share_url`` so the link format stays a single-writer.
+
+    Input formats:
+      - "" (empty) — generic "share with anyone" link
+      - "<context, e.g. 'work friend' or 'family'>" — same link, just
+        echoed back in the friendly reply for the LLM to weave in
+
+    Returns text including the share URL so the LangChain agent can
+    summarize for the user.  Also fires a Liquid UI ``form`` card via
+    ``agent_ui_update`` (same emit pattern as Connect_Channel) so the
+    AgentOverlay renders an inline floating share-card with copy +
+    "share via channel" actions.
+    """
+    try:
+        uid = thread_local_data.get_user_id()
+        if not uid:
+            return "Cannot generate invite — no signed-in user in this session."
+        from integrations.social.distribution_service import (
+            DistributionService, invite_share_url,
+        )
+        from integrations.social.models import get_db
+        db = get_db()
+        try:
+            ref = DistributionService.get_or_create_referral_code(db, str(uid))
+            db.commit()
+        finally:
+            db.close()
+        code = ref.get('code') or ''
+        if not code:
+            return "Failed to generate invite code — please try again."
+        url = invite_share_url(code)
+
+        # Liquid UI co-pilot: emit a share card so the user can copy /
+        # send the link with one click.  Same pattern Connect_Channel
+        # uses (line 2891-2925), same canonical AgentOverlay 'form'
+        # renderer.  Best-effort — never blocks the tool return.
+        try:
+            from core.platform.service_registry import ServiceRegistry
+            _lui = ServiceRegistry.get('LiquidUIService')
+            if _lui:
+                _lui.agent_ui_update(
+                    str(uid),
+                    {
+                        'type': 'form',
+                        'title': 'Share invite',
+                        'channel': 'invite',
+                        'fields': [
+                            {
+                                'name': 'invite_url',
+                                'label': 'Your invite link',
+                                'value': url,
+                                'readonly': True,
+                            },
+                        ],
+                        'submit_label': 'Copy link',
+                        'submit_action': 'copy_invite_url',
+                    },
+                )
+        except Exception as e:
+            logger.debug("Invite_Friend: liquid UI emit skipped: %s", e)
+
+        context_hint = (input_text or '').strip()
+        suffix = f" (context: {context_hint})" if context_hint else ""
+        return (
+            f"Here is your shareable invite link: {url}{suffix}. "
+            f"Send it via any channel — anyone who joins via this link "
+            f"is credited as your referral."
+        )
+    except Exception as e:
+        return f"Invite_Friend error: {str(e)[:200]}"
+
+
 def _handle_agentic_router_tool(input_text):
     """Tool handler: LLM detected a multi-step agentic task.
 
@@ -3345,6 +3424,23 @@ def get_tools(req_tool, is_first: bool = False):
                     "authentication flow. Do NOT ask the user for credentials first — "
                     "call this tool with just the channel name and it will tell you "
                     "what's needed."
+                ),
+            ),
+            Tool(
+                name="Invite_Friend",
+                func=_handle_invite_friend_tool,
+                description=(
+                    "Generate a shareable Nunba invite link the user can send to a "
+                    "friend, colleague, or family member so they can join Nunba "
+                    "and (optionally) credit the inviter as their referrer. Use "
+                    "whenever the user says things like 'invite a friend', 'share "
+                    "Nunba with my colleague', 'give me an invite link', 'how do "
+                    "I refer people', 'send my friend an invite', or similar. "
+                    "Input: optional short context describing who the invite is "
+                    "for (e.g. 'work friend', 'family'), or empty string for a "
+                    "generic shareable link. The tool returns a URL the user can "
+                    "paste into any channel; a floating share-card also appears "
+                    "in chat with a one-click Copy button."
                 ),
             ),
             Tool(

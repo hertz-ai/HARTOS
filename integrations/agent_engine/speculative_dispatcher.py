@@ -456,15 +456,18 @@ class SpeculativeDispatcher:
             (parsed.get('channel_connect') or '').strip()
             or parsed.get('is_create_agent')
             or (parsed.get('language_change') or '').strip()
+            or (parsed.get('invite_intent') or '').strip()
         ):
             logger.info(
                 "draft-first: actionable intent flag set "
                 "(channel_connect=%r, is_create_agent=%r, "
-                "language_change=%r) — escalating delegate=none → "
-                "'local' so the expert tool registry handles the turn.",
+                "language_change=%r, invite_intent=%r) — escalating "
+                "delegate=none → 'local' so the expert tool registry "
+                "handles the turn.",
                 parsed.get('channel_connect'),
                 parsed.get('is_create_agent'),
                 parsed.get('language_change'),
+                parsed.get('invite_intent'),
             )
             draft_reply = _REFUSAL_STANDBY_REPLY
             delegate = 'local'
@@ -793,6 +796,7 @@ class SpeculativeDispatcher:
             '"is_create_agent": true OR false, '
             '"channel_connect": "<channel name or empty string>", '
             '"language_change": "<ISO 639-1 code or empty string>", '
+            '"invite_intent": "<short context if user wants invite link, or empty>", '
             '"reason": "<why you chose this delegate value>"}\n\n'
             # ── delegate ────────────────────────────────────────────────
             "delegate: Use \"none\" for greetings, small-talk, factual "
@@ -839,7 +843,16 @@ class SpeculativeDispatcher:
             "Otherwise use an empty string \"\". This overrides the "
             "session's preferred_lang so the main LLM responds in "
             "the requested language and TTS routes to an engine that "
-            "supports it."
+            "supports it.\n\n"
+            # ── invite_intent ───────────────────────────────────────────
+            "invite_intent: if the user is asking to invite, share, or "
+            "refer a friend / colleague / family member to Nunba (e.g. "
+            "\"invite a friend\", \"give me an invite link\", \"share "
+            "Nunba with my colleague\", \"how do I refer people\"), put "
+            "a short freeform context here (e.g. \"work friend\" or "
+            "\"family\") — empty string is fine for a generic shareable "
+            "link. Otherwise use an empty string \"\". This routes the "
+            "turn to the Invite_Friend tool."
         )
 
     def _track_call_telemetry(
