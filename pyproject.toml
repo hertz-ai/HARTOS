@@ -133,7 +133,7 @@ dependencies = [
     # work without manual provisioning.  External SFU (LiveKit
     # Cloud or self-hosted livekit-server binary) is a separate
     # piece of infra; HARTOS only ships the token issuer.
-    "livekit-api>=0.7.0,<2.0.0",
+    "livekit-api>=1.0.0,<2.0.0",
 ]
 
 [project.optional-dependencies]

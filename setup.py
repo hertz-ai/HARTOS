@@ -94,7 +94,7 @@ install_requires = [
     # Hard dep so every build target (pip / ISO / Docker / PEX) gets
     # the JWT signer.  Dev-key bootstrap in livekit_service handles the
     # config side automatically — see ~/.hevolve/livekit_dev.json.
-    "livekit-api>=0.7.0,<2.0.0",
+    "livekit-api>=1.0.0,<2.0.0",
 ]
 
 # Optional dependencies for specific features
