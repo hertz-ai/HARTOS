@@ -848,6 +848,80 @@ def test_supervisor_sha256_pinned_for_supported_platforms():
             f'SHA-256 pin for {key} is empty or wrong length')
 
 
+# ── Bind-address policy: silent install on flat / no firewall prompt ─
+
+def test_bind_addresses_flat_mode_loopback(monkeypatch):
+    """Flat / embedded → loopback only so first start doesn't trigger
+    the Windows / macOS firewall prompt."""
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')
+    monkeypatch.delenv('LIVEKIT_BIND_HOST', raising=False)
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor._bind_addresses_for_mode() == ['127.0.0.1']
+    # External IP advertisement is meaningless on loopback — must be off.
+    assert livekit_supervisor._use_external_ip_for_mode() is False
+
+
+def test_bind_addresses_regional_mode_all_interfaces(monkeypatch):
+    """Regional hosts SFU for LAN peers — bind all interfaces.  The
+    one-time firewall prompt is acceptable; the operator chose regional."""
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'regional')
+    monkeypatch.delenv('LIVEKIT_BIND_HOST', raising=False)
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor._bind_addresses_for_mode() == ['']
+    assert livekit_supervisor._use_external_ip_for_mode() is True
+
+
+def test_bind_addresses_env_override_specific_nic(monkeypatch):
+    """LIVEKIT_BIND_HOST=<addr> wins over the mode-aware default."""
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')  # would be loopback
+    monkeypatch.setenv('LIVEKIT_BIND_HOST', '192.168.1.50')
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor._bind_addresses_for_mode() == ['192.168.1.50']
+    # Non-loopback bind → advertise external IP.
+    assert livekit_supervisor._use_external_ip_for_mode() is True
+
+
+def test_bind_addresses_env_override_zero_host_means_all_interfaces(
+        monkeypatch):
+    """0.0.0.0 is the conventional 'all interfaces' literal — translate
+    to LiveKit's empty-string sentinel."""
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')
+    monkeypatch.setenv('LIVEKIT_BIND_HOST', '0.0.0.0')
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor._bind_addresses_for_mode() == ['']
+    assert livekit_supervisor._use_external_ip_for_mode() is True
+
+
+def test_generated_config_writes_loopback_for_flat(monkeypatch, tmp_path):
+    """End-to-end: _generate_config emits 'bind_addresses: - 127.0.0.1'
+    for flat mode so the first start is silent."""
+    monkeypatch.setenv('HEVOLVE_HOME', str(tmp_path))
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')
+    monkeypatch.delenv('LIVEKIT_BIND_HOST', raising=False)
+    from integrations.social import livekit_supervisor
+    cfg_path = livekit_supervisor._generate_config(
+        {'api_key': 'KFLAT', 'api_secret': 'SFLAT' * 8})
+    body = cfg_path.read_text(encoding='utf-8')
+    assert "bind_addresses:" in body
+    assert "  - '127.0.0.1'" in body
+    # 0.0.0.0 / empty must NOT be present on a flat deploy.
+    assert "  - ''" not in body
+    assert "use_external_ip: false" in body
+
+
+def test_generated_config_writes_all_interfaces_for_regional(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv('HEVOLVE_HOME', str(tmp_path))
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'regional')
+    monkeypatch.delenv('LIVEKIT_BIND_HOST', raising=False)
+    from integrations.social import livekit_supervisor
+    cfg_path = livekit_supervisor._generate_config(
+        {'api_key': 'KREG', 'api_secret': 'SREG' * 8})
+    body = cfg_path.read_text(encoding='utf-8')
+    assert "  - ''" in body
+    assert "use_external_ip: true" in body
+
+
 # ── AgentVoiceBridge TTS outbox (Task #219 magic loop) ──────────────
 
 @pytest.fixture
