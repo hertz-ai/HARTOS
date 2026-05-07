@@ -267,3 +267,69 @@ def group_link(platform: str, group_id: str,
     if s not in DEEPLINK_SCHEMES:
         raise ValueError(f"unsupported scheme {scheme!r}")
     return f"{s}://group/{platform.lower()}/{group_id}"
+
+
+# ─── Public OG / share URL builder ────────────────────────────────
+#
+# F1 of memory/feedback_unification_reuse_contract.md — the SINGLE
+# canonical builder for HTTPS share URLs that crawlers (Discord /
+# Slack / WhatsApp Web / Twitter / Telegram / LinkedIn / FB) fetch
+# to render unfurl previews.  Every emit site (InviteService,
+# DistributionService, adapter share-card builders, OG endpoint)
+# must call ``og_url`` — never inline a string.
+#
+# Distinct from the custom-scheme deep-links above:
+#   * ``invite_link / meet_link / group_link`` → ``hevolveai://...`` —
+#     consumed by the OS protocol handler, opens Nunba app directly.
+#   * ``og_url`` → ``https://...`` — consumed by web bots for OG
+#     preview rendering; redirects to SPA / app from the resulting
+#     OG endpoint.
+#
+# These are NOT parallel paths: they serve different consumers
+# (protocol handler vs HTTP bot fetcher).  A single emit site
+# typically uses BOTH (custom-scheme as the click-through CTA inside
+# an HTTPS preview card).
+
+OG_RESOURCE_TYPES: Tuple[str, ...] = ('i', 'c', 'p', 'u')
+
+
+def og_url(resource_type: str, identifier: str,
+           base_url: Optional[str] = None) -> str:
+    """Build canonical public share URL for a resource.
+
+    Args:
+        resource_type: one of OG_RESOURCE_TYPES — ``i`` (invite),
+            ``c`` (community), ``p`` (post), ``u`` (user/agent).
+            Future expansion: ``m`` (meet), ``g`` (group), ``ch``
+            (channel) — these require canonical Meet / Group /
+            ChannelBinding models first (F8 in the contract).
+        identifier: the canonical ID for the resource (UUID, slug,
+            invite_code, or handle).  Must be non-empty.
+        base_url: override.  Defaults to
+            ``HEVOLVE_PUBLIC_BASE_URL`` env or
+            ``https://hevolve.ai``.
+
+    Returns:
+        ``<base>/<resource_type>/<identifier>``.  Example:
+        ``https://hevolve.ai/i/A1B2C3``.
+
+    Raises:
+        ValueError on unknown ``resource_type`` or empty
+        ``identifier``.
+
+    Single-writer contract: every share-URL emit site in HARTOS +
+    Nunba calls this function.  No parallel implementations.  See
+    ``memory/feedback_unification_reuse_contract.md``.
+    """
+    if resource_type not in OG_RESOURCE_TYPES:
+        raise ValueError(
+            f"unsupported resource_type {resource_type!r}; "
+            f"known: {OG_RESOURCE_TYPES}"
+        )
+    if not identifier:
+        raise ValueError("og_url requires non-empty identifier")
+    import os as _os
+    base = base_url or _os.environ.get(
+        'HEVOLVE_PUBLIC_BASE_URL', 'https://hevolve.ai'
+    )
+    return f"{base.rstrip('/')}/{resource_type}/{identifier}"

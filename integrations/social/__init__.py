@@ -178,7 +178,13 @@ def init_social(app):
     except Exception as e:
         logger.warning(f"HevolveSocial marketplace+MCP blueprint skipped: {e}")
 
-    # Register sharing blueprint (short URLs, OG metadata, consent-gated links)
+    # Register sharing blueprint — canonical OG / share / embed home per
+    # memory/feedback_unification_reuse_contract.md.  Already serves
+    # /api/social/share/<token>, /api/social/og-image/<type>/<id>,
+    # /api/social/embed/<type>/<id>.  F1.5 wave will EXTEND this same
+    # blueprint with canonical short URLs (/i/, /c/, /u/, /p/) by
+    # promoting ``_get_og_metadata`` to public + adding `invite` resource
+    # type — NOT a parallel og_bp.
     try:
         from .api_sharing import sharing_bp
         app.register_blueprint(sharing_bp)

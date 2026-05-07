@@ -129,6 +129,21 @@ def persist(
     existing row is returned without a second insert.  Across users a
     msg_id collision (astronomically unlikely with 64 bits of entropy)
     is refused — we do not return another user's data.
+
+    Identity provenance (per
+    ``memory/feedback_unification_reuse_contract.md`` F1):
+        For agent-authored entries (``role='assistant'``), populate:
+          * ``agent_id``      → the agent's prompt_id (top-level column,
+                                already supported)
+          * ``attachments``   → include
+                                ``{'kind': 'agent_provenance',
+                                   'agent_id': '<prompt_id>',
+                                   'bound_to': '<owner_user_id>'}``
+        This lets receiving platforms render trust badges
+        ("verified by Alice") and audit logs attribute agent actions
+        to the human who owns the agent — without any new column,
+        new transport, or new persist call.  Single canonical writer
+        contract: every agent-authored persist goes through here.
     """
     if not user_id or not role or not content:
         return None
