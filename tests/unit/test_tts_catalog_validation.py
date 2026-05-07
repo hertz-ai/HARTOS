@@ -1,4 +1,5 @@
-"""Contract tests for #58 Scope-1: catalog-canonical TTS + ingest validation.
+"""Contract tests for #58 Scope-1 + Scope-2: catalog-canonical TTS,
+ingest validation, and reflection-dispatch path.
 
 Pins what the ingest path must do:
   * `_validate_engine_caps` accepts the two valid shapes (tool_module
@@ -6,13 +7,21 @@ Pins what the ingest path must do:
     malformed combination.
   * `populate_tts_catalog` removes invalid entries from the catalog at
     boot with a logged WARNING — fail-fast at ingest, not at synth time.
-  * Reflection-only entries are explicitly rejected in Scope-1 because
-    the dispatcher (#58 Scope-2) hasn't landed yet; admin sees the
-    error immediately, not silence at first synth.
+  * Reflection-only entries SURVIVE ingest after #58 Scope-2 (2026-05-07
+    — `gpu_worker._dispatch_catalog_id` provides the runtime path).
+    They are excluded from the ENGINE_REGISTRY snapshot because
+    TTSEngineSpec carries `tool_module` as a non-optional dispatch
+    handle for the existing call sites; the catalog dispatches them
+    via `--catalog-id` directly.
   * `_refresh_engine_registry_from_catalog` rebuilds ENGINE_REGISTRY in
     place after populate runs, snapshotting post-upsert catalog state.
   * Existing tool_module-shaped entries continue to round-trip through
     `_catalog_entry_to_spec` exactly as before.
+
+Cross-reference: the reflection dispatcher's runtime contract has its
+own test file at `tests/unit/test_gpu_worker_reflection_dispatch.py`
+covering `_normalize_to_wav_file` + `_build_reflection_callbacks` +
+`--catalog-id` exit codes.
 """
 import logging
 import sys
