@@ -30,6 +30,14 @@ from .auth import require_auth
 from .api import requires_flag  # canonical flag-gate decorator
 from .call_service import CallService, CallError, ALLOWED_CALL_KINDS
 from .livekit_service import LiveKitService
+# Single canonical source of per-kind mesh thresholds.  The bandwidth
+# model module documents the math (mesh vs SFU per-peer cost crossover
+# under residential uplink ceilings) AND owns the dict; we import it
+# here under a local alias so existing internal references keep working
+# without forcing every caller through the model module's namespace.
+from ._mesh_bandwidth_model import (
+    OPERATIONAL_THRESHOLDS as _DEFAULT_KIND_THRESHOLDS,
+)
 
 logger = logging.getLogger('hevolve_social')
 
@@ -103,20 +111,11 @@ def get_call(call_id):
 # `LIVEKIT_MESH_THRESHOLD_VIDEO`.  Set to 0 to always promote; 999 to
 # disable promotion entirely for testing.
 #
-# Default per-kind thresholds are derived from the bandwidth model in
-# integrations/social/_mesh_bandwidth_model.py — voice (audio-only,
-# 32 kbps Opus) stays cheap on mesh through N=4 (4× upload at N=4 is
-# 128 kbps — well within mobile uplinks).  Video (500 kbps default
-# VP8) crosses the per-peer upload pain point at N=3 (1 Mbps upload
-# for one person is asymmetric for residential ADSL / shared 4G), so
-# video calls promote to SFU one participant earlier.
-
-_DEFAULT_KIND_THRESHOLDS = {
-    'voice': 4,         # audio-only — cheap; mesh through 4
-    'video': 3,         # 500 kbps VP8 — SFU at N=3 saves uplink
-    'screen_share': 1,  # always SFU (handled by kind branch above)
-    'mixed': 1,         # always SFU (handled by kind branch above)
-}
+# The actual per-kind defaults live in _mesh_bandwidth_model.py
+# (imported above as _DEFAULT_KIND_THRESHOLDS).  Voice (audio-only,
+# 32 kbps Opus) stays cheap on mesh through N=4; video (500 kbps VP8)
+# crosses the per-peer upload pain point at N=3; screen_share / mixed
+# always go SFU.  See that module for the full bandwidth math.
 
 
 def _mesh_threshold(kind: str = 'voice') -> int:
@@ -126,18 +125,17 @@ def _mesh_threshold(kind: str = 'voice') -> int:
       1. `LIVEKIT_MESH_THRESHOLD_<KIND>` env (per-kind override)
       2. `LIVEKIT_MESH_THRESHOLD` env (uniform override across kinds)
       3. _DEFAULT_KIND_THRESHOLDS[kind] (bandwidth-model default)
-      4. 4 (conservative fallback)
+      4. 4 (conservative fallback for unknown kinds)
     """
-    kind_env = f'LIVEKIT_MESH_THRESHOLD_{kind.upper()}'
-    val = os.environ.get(kind_env)
+    default = _DEFAULT_KIND_THRESHOLDS.get(kind, 4)
+    val = (os.environ.get(f'LIVEKIT_MESH_THRESHOLD_{kind.upper()}')
+           or os.environ.get('LIVEKIT_MESH_THRESHOLD'))
     if val is None:
-        val = os.environ.get('LIVEKIT_MESH_THRESHOLD')
-    if val is None:
-        val = _DEFAULT_KIND_THRESHOLDS.get(kind, 4)
+        return max(1, default)
     try:
         return max(1, int(val))
     except (TypeError, ValueError):
-        return _DEFAULT_KIND_THRESHOLDS.get(kind, 4)
+        return default
 
 
 def _decide_media_mode(sess, participants, *, is_agent: bool) -> str:
@@ -183,13 +181,14 @@ def issue_token(call_id):
     # PeerLink DISPATCH-channel signaling path — no LiveKit involved.
     mode = _decide_media_mode(sess, participants, is_agent=is_agent)
     if mode == 'p2p_mesh':
+        kind = (sess or {}).get('kind') or 'voice'
         return _ok({
             'mode': 'p2p_mesh',
             'call_id': call_id,
             'signaling': 'peerlink',
             'participant_count': len(
                 [p for p in participants if not p.get('left_at')]),
-            'mesh_threshold': _mesh_threshold(),
+            'mesh_threshold': _mesh_threshold(kind),
         })
 
     token = LiveKitService.issue_token(

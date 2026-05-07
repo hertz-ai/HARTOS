@@ -1,6 +1,9 @@
 """Bandwidth model — mesh vs SFU per-peer cost crossover by call kind.
 
-Used to justify the per-kind defaults in api_calls._DEFAULT_KIND_THRESHOLDS.
+This module is the SINGLE SOURCE OF TRUTH for per-kind mesh thresholds.
+``api_calls._DEFAULT_KIND_THRESHOLDS`` is an import-alias of
+``OPERATIONAL_THRESHOLDS`` defined here — there is no duplicate dict.
+
 Real-world measurement (Task #276 live phase) is expected to validate
 or refine these constants — until then they are the *theoretical*
 crossover from first principles, not an arbitrary choice of 4.
@@ -135,7 +138,9 @@ MOBILE_4G_UPLINK_KBPS = 5000     # decent 4G — comfortable video uplink
 #      audio sources without any active speaker detection.
 #
 # So the *operationally-chosen* defaults are tighter than the pure
-# bandwidth crossover.  Encoded in api_calls._DEFAULT_KIND_THRESHOLDS:
+# bandwidth crossover.  Encoded in OPERATIONAL_THRESHOLDS below — this
+# is the canonical home; api_calls imports it as
+# _DEFAULT_KIND_THRESHOLDS:
 #
 #   voice → 4   (mesh mode for ≤ 4 participants; SFU at 5+)
 #   video → 3   (mesh for ≤ 3; SFU at 4+ to leave headroom under 1500)
@@ -143,7 +148,8 @@ MOBILE_4G_UPLINK_KBPS = 5000     # decent 4G — comfortable video uplink
 #   mixed → 1         (always SFU — same reason)
 #
 # Live measurement (Task #276) is expected to validate these.  When it
-# does, OPERATIONAL_THRESHOLDS gets updated below + tests pinned.
+# does, update OPERATIONAL_THRESHOLDS below — api_calls picks it up
+# automatically via the import alias.
 
 OPERATIONAL_THRESHOLDS = {
     'voice': 4,

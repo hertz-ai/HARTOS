@@ -786,14 +786,18 @@ def test_bandwidth_model_first_n_above_ceiling():
     assert first_n_where_mesh_upload_exceeds('voice', 1500) == 48
 
 
-def test_operational_thresholds_match_api_calls_defaults():
-    """The model's documented operational thresholds must equal the
-    constants in api_calls.  If you change one, change the other."""
+def test_operational_thresholds_is_single_source():
+    """The bandwidth-model module owns OPERATIONAL_THRESHOLDS;
+    api_calls imports it as _DEFAULT_KIND_THRESHOLDS.  This test
+    asserts the SAME-OBJECT identity, which guards against someone
+    re-introducing a parallel literal in api_calls.py."""
     from integrations.social._mesh_bandwidth_model import (
         OPERATIONAL_THRESHOLDS,
     )
     from integrations.social.api_calls import _DEFAULT_KIND_THRESHOLDS
-    assert OPERATIONAL_THRESHOLDS == _DEFAULT_KIND_THRESHOLDS
+    # `is` check — equality would still pass with two parallel dicts
+    # that happen to match.  Identity ensures one source of truth.
+    assert _DEFAULT_KIND_THRESHOLDS is OPERATIONAL_THRESHOLDS
 
 
 def test_supervisor_binary_url_uses_underscore_separator(monkeypatch):
