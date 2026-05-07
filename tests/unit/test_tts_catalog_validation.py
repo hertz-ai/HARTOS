@@ -228,7 +228,7 @@ def fresh_catalog():
 
 class TestPopulateRejectsInvalidEntries:
     def test_invalid_entry_seeded_pre_boot_is_rejected_with_log(
-        self, fresh_catalog, caplog,
+        self, fresh_catalog, caplog, restore_engine_registry,
     ):
         # Simulate an admin or hive-federated entry that landed in the
         # catalog BEFORE populate_tts_catalog runs (e.g. malformed JSON
@@ -254,7 +254,7 @@ class TestPopulateRejectsInvalidEntries:
         )
 
     def test_reflection_only_entry_survives_ingest_in_scope_2(
-        self, fresh_catalog, caplog,
+        self, fresh_catalog, caplog, restore_engine_registry,
     ):
         # #58 Scope-2 landed — reflection-only entries (no tool_module
         # but full 5-field contract) are now dispatchable via
@@ -291,7 +291,8 @@ class TestPopulateRejectsInvalidEntries:
             f'after #58 Scope-2; got {rejection_lines!r}'
         )
 
-    def test_valid_tool_module_entry_survives_ingest(self, fresh_catalog):
+    def test_valid_tool_module_entry_survives_ingest(self, fresh_catalog,
+                                                       restore_engine_registry):
         # An admin-customised entry with a valid tool_module must NOT
         # be touched by the validation pre-pass.
         good = _make_entry('tts-custom-engine', {
@@ -308,8 +309,27 @@ class TestPopulateRejectsInvalidEntries:
         )
 
 
+@pytest.fixture
+def restore_engine_registry():
+    """Snapshot ENGINE_REGISTRY entering the test, restore on exit.
+
+    `populate_tts_catalog` and `_refresh_engine_registry_from_catalog`
+    BOTH mutate the module-global ENGINE_REGISTRY in place via
+    `clear() + update()` — that's the documented post-upsert
+    semantics (#58 acceptance #5).  Tests that exercise these
+    primitives against a sparsely-populated `fresh_catalog` would
+    leave ENGINE_REGISTRY missing canonical engines, breaking
+    downstream test_tts_router tests in the same pytest run.
+    """
+    snapshot = dict(ENGINE_REGISTRY)
+    yield
+    ENGINE_REGISTRY.clear()
+    ENGINE_REGISTRY.update(snapshot)
+
+
 class TestEngineRegistrySnapshot:
-    def test_engine_registry_is_post_upsert_snapshot(self, fresh_catalog):
+    def test_engine_registry_is_post_upsert_snapshot(self, fresh_catalog,
+                                                     restore_engine_registry):
         """After populate_tts_catalog, ENGINE_REGISTRY contains exactly
         the spec-shaped catalog entries (post-upsert)."""
         populate_tts_catalog(fresh_catalog)
@@ -326,7 +346,8 @@ class TestEngineRegistrySnapshot:
                 f'reflection-only entry slipped through'
             )
 
-    def test_refresh_excludes_reflection_only_entries(self, fresh_catalog):
+    def test_refresh_excludes_reflection_only_entries(self, fresh_catalog,
+                                                       restore_engine_registry):
         """Reflection-only entries are valid in the catalog but excluded
         from the ENGINE_REGISTRY snapshot (they need #58 Scope-2's
         --catalog-id dispatch path)."""
