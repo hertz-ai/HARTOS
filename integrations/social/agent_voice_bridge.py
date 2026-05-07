@@ -77,10 +77,84 @@ _ACTIVE_WORKERS: Dict[tuple, 'AgentBridgeWorker'] = {}
 _WORKERS_LOCK = threading.Lock()
 
 
+# ── TTS outbox: agent reply text → audio publisher ──────────────────
+#
+# This is the symmetric counterpart of whisper_tool's STT-segment
+# queue.  agentic_router._post_agent_reply for source_kind='call'
+# enqueues the agent's reply text here; the audio publisher (the
+# bridge worker's TTS half OR an external adapter — LiveKit-rtc
+# producer / Discord voice client) drains it, synthesizes via
+# PocketTTS, and publishes audio frames into the room.
+#
+# Single canonical home for outbound agent-text-on-calls.  No parallel
+# queues elsewhere — every producer pushes here, every consumer reads
+# here, just like the STT side in whisper_tool.
+#
+# Bounded per (call, agent) so a stalled audio adapter can't grow
+# unbounded.  Drops oldest with WARN if cap exceeded.
+_TTS_OUTBOX: Dict[tuple, deque] = {}
+_TTS_LOCK = threading.Lock()
+_TTS_OUTBOX_CAP = 64  # chunks per (call, agent)
+
+
 # Polling cadence inside the worker loop.  250ms balances STT
 # latency against CPU cost; lowered to 50ms for tests via the
 # `_WORKER_TICK_S` module override.
 _WORKER_TICK_S = 0.25
+
+
+def enqueue_tts_text(call_id: str, agent_id: str, text: str) -> bool:
+    """Append agent reply text to the (call, agent) TTS outbox.
+
+    Producer-side: agentic_router._post_agent_reply for source_kind
+    ='call' calls this with the LLM reply text after GuardrailEnforcer
+    .after_response has already approved it.
+
+    Returns True iff enqueued (False on empty text or invalid keys).
+    Best-effort: never raises.
+    """
+    if not call_id or not agent_id:
+        return False
+    if not text or not text.strip():
+        return False
+    key = (call_id, agent_id)
+    with _TTS_LOCK:
+        q = _TTS_OUTBOX.setdefault(key, deque())
+        q.append({'text': text.strip(), 'enqueued_at': time.time()})
+        while len(q) > _TTS_OUTBOX_CAP:
+            evicted = q.popleft()
+            logger.warning(
+                "AgentVoiceBridge.enqueue_tts_text: cap %d exceeded "
+                "for call=%s agent=%s; evicted text=%r",
+                _TTS_OUTBOX_CAP, call_id, agent_id,
+                evicted['text'][:80])
+    return True
+
+
+def dequeue_tts_text(call_id: str, agent_id: str,
+                     limit: int = 4) -> List[Dict[str, Any]]:
+    """Drain up to `limit` reply chunks for (call, agent).  Destructive
+    — once popped, gone.  Bridge worker calls per tick."""
+    if not call_id or not agent_id:
+        return []
+    key = (call_id, agent_id)
+    out: List[Dict[str, Any]] = []
+    with _TTS_LOCK:
+        q = _TTS_OUTBOX.get(key)
+        if not q:
+            return []
+        while q and len(out) < limit:
+            out.append(q.popleft())
+        if not q:
+            _TTS_OUTBOX.pop(key, None)
+    return out
+
+
+def tts_outbox_depth(call_id: str, agent_id: str) -> int:
+    """For /health + tests."""
+    with _TTS_LOCK:
+        q = _TTS_OUTBOX.get((call_id, agent_id))
+        return len(q) if q else 0
 
 
 class AgentBridgeError(Exception):
@@ -344,6 +418,58 @@ class AgentBridgeWorker:
             if seg_id is not None:
                 self._last_stt_segment_id = seg_id
 
+        # ── Half B: TTS outbox → audio publisher ────────────────────
+        # Drain any reply text that agentic_router._post_agent_reply
+        # enqueued for this (call, agent) and hand it to the audio
+        # publisher.  When livekit-rtc is absent (flat / Nunba bundled)
+        # we log the reply text so the call audit trail still reflects
+        # the agent's contribution; the audio side stays no-op.
+        try:
+            replies = dequeue_tts_text(self.call_id, self.agent_id,
+                                       limit=2)
+        except Exception as e:
+            replies = []
+            logger.warning(
+                "AgentBridgeWorker._tick: dequeue_tts_text failed "
+                "(call=%s, agent=%s): %s",
+                self.call_id, self.agent_id, e)
+        for r in replies:
+            text = r.get('text', '')
+            if not text:
+                continue
+            try:
+                self._publish_audio_for(text)
+            except Exception as e:
+                logger.warning(
+                    "AgentBridgeWorker._tick: _publish_audio_for "
+                    "failed (call=%s, agent=%s): %s",
+                    self.call_id, self.agent_id, e)
+
+    def _publish_audio_for(self, text: str) -> None:
+        """Synthesize `text` via PocketTTS + publish frames into the
+        LiveKit room.  Producer-adapter integration lands separately
+        (livekit-rtc room handle wiring is async-heavy, kept out of
+        this control-plane module so it can be reviewed in isolation).
+
+        Today: logs the reply at INFO so call audit trails record the
+        agent's spoken contribution even before audio is published.
+        """
+        if not text:
+            return
+        if not _HAS_LIVEKIT_RTC:
+            logger.info(
+                "AgentBridgeWorker._publish_audio_for: livekit-rtc "
+                "absent; reply queued but not synthesized — "
+                "call=%s agent=%s text=%r",
+                self.call_id, self.agent_id, text[:120])
+            return
+        # SDK present — synthesize via PocketTTS + publish frames.
+        # Filled in alongside the livekit-rtc room handle integration.
+        logger.info(
+            "AgentBridgeWorker._publish_audio_for: stub synthesize+"
+            "publish — call=%s agent=%s text=%r",
+            self.call_id, self.agent_id, text[:120])
+
     def _emit_meet_copilot(self, state: str = 'live') -> None:
         """Push the rolling meet_copilot card state to the user's Liquid UI
         surface (UNIF-G5).
@@ -433,6 +559,10 @@ class AgentVoiceBridge:
         key = (call_id, agent_id)
         with _WORKERS_LOCK:
             worker = _ACTIVE_WORKERS.pop(key, None)
+        # Drop any pending TTS chunks for this (call, agent) so a
+        # later same-key attach doesn't replay stale audio.
+        with _TTS_LOCK:
+            _TTS_OUTBOX.pop(key, None)
         if worker is None:
             return False
         worker.stop()
@@ -455,9 +585,18 @@ class AgentVoiceBridge:
         with _WORKERS_LOCK:
             workers = list(_ACTIVE_WORKERS.values())
             _ACTIVE_WORKERS.clear()
+        with _TTS_LOCK:
+            _TTS_OUTBOX.clear()
         for w in workers:
             w.stop()
         return len(workers)
 
 
-__all__ = ['AgentVoiceBridge', 'AgentBridgeError', 'AgentBridgeWorker']
+__all__ = [
+    'AgentVoiceBridge',
+    'AgentBridgeError',
+    'AgentBridgeWorker',
+    'enqueue_tts_text',
+    'dequeue_tts_text',
+    'tts_outbox_depth',
+]

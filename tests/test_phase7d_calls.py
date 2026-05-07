@@ -848,6 +848,152 @@ def test_supervisor_sha256_pinned_for_supported_platforms():
             f'SHA-256 pin for {key} is empty or wrong length')
 
 
+# ── AgentVoiceBridge TTS outbox (Task #219 magic loop) ──────────────
+
+@pytest.fixture
+def clean_bridge_outbox():
+    """Reset module-level TTS outbox between tests so they don't see
+    stale state from prior tests."""
+    from integrations.social import agent_voice_bridge as avb
+    with avb._TTS_LOCK:
+        avb._TTS_OUTBOX.clear()
+    yield
+    with avb._TTS_LOCK:
+        avb._TTS_OUTBOX.clear()
+
+
+def test_tts_outbox_enqueue_dequeue_roundtrip(clean_bridge_outbox):
+    """Push then pop returns the same text in FIFO order."""
+    from integrations.social.agent_voice_bridge import (
+        enqueue_tts_text, dequeue_tts_text)
+    assert enqueue_tts_text('call-1', 'agent-1', 'hello there') is True
+    assert enqueue_tts_text('call-1', 'agent-1', 'second line') is True
+    out = dequeue_tts_text('call-1', 'agent-1')
+    assert [r['text'] for r in out] == ['hello there', 'second line']
+    # All consumed — second drain returns empty.
+    assert dequeue_tts_text('call-1', 'agent-1') == []
+
+
+def test_tts_outbox_enqueue_rejects_empty(clean_bridge_outbox):
+    """Empty / whitespace text is silently dropped (False return)."""
+    from integrations.social.agent_voice_bridge import (
+        enqueue_tts_text, tts_outbox_depth)
+    assert enqueue_tts_text('call-1', 'agent-1', '') is False
+    assert enqueue_tts_text('call-1', 'agent-1', '   ') is False
+    assert enqueue_tts_text('', 'agent-1', 'hi') is False
+    assert enqueue_tts_text('call-1', '', 'hi') is False
+    assert tts_outbox_depth('call-1', 'agent-1') == 0
+
+
+def test_tts_outbox_per_agent_isolation(clean_bridge_outbox):
+    """Multiple agents in the same call have independent queues."""
+    from integrations.social.agent_voice_bridge import (
+        enqueue_tts_text, dequeue_tts_text, tts_outbox_depth)
+    enqueue_tts_text('call-1', 'agent-A', 'A says hi')
+    enqueue_tts_text('call-1', 'agent-B', 'B says hello')
+    assert tts_outbox_depth('call-1', 'agent-A') == 1
+    assert tts_outbox_depth('call-1', 'agent-B') == 1
+    out_a = dequeue_tts_text('call-1', 'agent-A')
+    assert [r['text'] for r in out_a] == ['A says hi']
+    # agent-B's queue is untouched
+    assert tts_outbox_depth('call-1', 'agent-B') == 1
+
+
+def test_tts_outbox_cap_evicts_oldest(clean_bridge_outbox, monkeypatch):
+    """Cap at _TTS_OUTBOX_CAP — oldest dropped with WARN."""
+    from integrations.social import agent_voice_bridge as avb
+    monkeypatch.setattr(avb, '_TTS_OUTBOX_CAP', 3)
+    for i in range(5):
+        avb.enqueue_tts_text('call-1', 'agent-1', f'line {i}')
+    out = avb.dequeue_tts_text('call-1', 'agent-1', limit=10)
+    # Cap is 3 — oldest 2 dropped.  Remaining is FIFO of last 3.
+    assert [r['text'] for r in out] == ['line 2', 'line 3', 'line 4']
+
+
+def test_tts_outbox_dequeue_limit(clean_bridge_outbox):
+    """dequeue with limit=N returns at most N items, leaves rest."""
+    from integrations.social.agent_voice_bridge import (
+        enqueue_tts_text, dequeue_tts_text, tts_outbox_depth)
+    for i in range(5):
+        enqueue_tts_text('call-1', 'agent-1', f'line {i}')
+    out = dequeue_tts_text('call-1', 'agent-1', limit=2)
+    assert [r['text'] for r in out] == ['line 0', 'line 1']
+    assert tts_outbox_depth('call-1', 'agent-1') == 3
+
+
+def test_detach_agent_clears_tts_outbox(clean_bridge_outbox):
+    """detach_agent must drop pending TTS chunks so a later same-key
+    attach doesn't replay stale audio."""
+    from integrations.social.agent_voice_bridge import (
+        enqueue_tts_text, dequeue_tts_text, AgentVoiceBridge)
+    enqueue_tts_text('call-1', 'agent-1', 'pending audio')
+    # No worker actually exists for this test — detach returns False
+    # but should still scrub the outbox.
+    AgentVoiceBridge.detach_agent('call-1', 'agent-1')
+    assert dequeue_tts_text('call-1', 'agent-1') == []
+
+
+def test_router_source_kind_call_enqueues_tts(clean_bridge_outbox,
+                                               monkeypatch):
+    """The new branch in agentic_router._post_agent_reply must push
+    the agent's reply onto the TTS outbox so the bridge worker can
+    drain it on its next tick.
+
+    We monkeypatch the DB session lookup so we don't need a real
+    SQLAlchemy session for this branch test."""
+    from integrations.social.agent_voice_bridge import (
+        dequeue_tts_text, tts_outbox_depth)
+    from integrations import agentic_router
+
+    # Stub the DB context manager + User/Post/Comment lookups — only
+    # the agent lookup needs to succeed for the 'call' branch.
+    class _StubDB:
+        class _Q:
+            def __init__(self, agent):
+                self.agent = agent
+            def filter(self, *args, **kw):
+                return self
+            def first(self):
+                return self.agent
+        def query(self, model):
+            from integrations.social.models import User
+            if model is User:
+                stub_agent = type('A', (), {'id': 'agent-99'})()
+                return _StubDB._Q(stub_agent)
+            return _StubDB._Q(None)
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def execute(self, *a, **kw):
+            class _R:
+                def fetchone(self_):
+                    return None
+            return _R()
+
+    def _stub_db_session():
+        return _StubDB()
+
+    # Patch where the symbol is looked up — agentic_router does
+    # `from integrations.social.models import db_session, User, ...`
+    # inside the function, so we patch the source module.
+    from integrations.social import models as _models
+    monkeypatch.setattr(_models, 'db_session', _stub_db_session)
+
+    agentic_router._post_agent_reply(
+        agent_id='agent-99',
+        context={'source_kind': 'call', 'source_id': 'call-X',
+                 'platform': 'livekit', 'owner_id': 'owner-1'},
+        reply_text='hello from the agent',
+    )
+
+    out = dequeue_tts_text('call-X', 'agent-99')
+    assert len(out) == 1
+    assert out[0]['text'] == 'hello from the agent'
+    # outbox is now drained
+    assert tts_outbox_depth('call-X', 'agent-99') == 0
+
+
 def test_decide_media_mode_excludes_left_participants(monkeypatch):
     """Active count uses left_at IS NULL — left rows don't count."""
     monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)

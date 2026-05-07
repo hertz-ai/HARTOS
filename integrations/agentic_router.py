@@ -428,6 +428,71 @@ def _post_agent_reply(agent_id: str, context: Dict, reply_text: str):
                     db, conv_id=conv_id, author_id=agent.id,
                     content=reply_text,
                     tenant_id=context.get('tenant_id'))
+            elif source_kind == 'call':
+                # Live voice/video call — the agent's reply text is
+                # destined for an audio publisher (PocketTTS → LiveKit
+                # frames).  Three deliveries:
+                #
+                #   1. TTS outbox enqueue → bridge worker drains, hands
+                #      to audio publisher (canonical reply path for the
+                #      magic loop: speaker → STT → router → TTS → speaker).
+                #   2. Cross-channel transcript persist → the call
+                #      transcript reads chronologically alongside any
+                #      adapter-channel chat (UNIF-G3).  Best-effort.
+                #   3. Liquid UI meet_copilot card emit → the user sees
+                #      the agent's reply in the UI overlay even before
+                #      audio arrives (UNIF-G5).  Best-effort.
+                #
+                # source_id == call_id (CallSession).  The agent must
+                # already be attached as a CallParticipant; any
+                # AgentJoinGrant + scope.can_voice gating happens at
+                # CallService.attach_agent before the bridge spins up.
+                call_id = source_id
+                try:
+                    from integrations.social.agent_voice_bridge import (
+                        enqueue_tts_text)
+                    enqueue_tts_text(call_id, agent.id, reply_text)
+                except Exception as e:
+                    logger.warning(
+                        "dispatch_to_agent: TTS outbox enqueue failed "
+                        "(call=%s, agent=%s): %s",
+                        call_id, agent.id, e)
+                try:
+                    from integrations.social.chat_messages import (
+                        persist_external_room_event)
+                    persist_external_room_event(
+                        user_id=str(context.get('owner_id') or agent.id),
+                        platform=str(context.get('platform') or 'livekit'),
+                        room_id=str(call_id),
+                        sender_id=str(agent.id),
+                        text=reply_text,
+                        kind='agent_reply',
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "dispatch_to_agent: cross-channel persist "
+                        "skipped (%s)", e)
+                try:
+                    from core.platform.service_registry import (
+                        ServiceRegistry)
+                    svc = ServiceRegistry.get('LiquidUIService')
+                    if svc is not None:
+                        svc.agent_ui_update(
+                            str(agent.id),
+                            {
+                                'type': 'meet_copilot',
+                                'call_id': str(call_id),
+                                'platform': str(
+                                    context.get('platform') or 'livekit'),
+                                'room_id': str(call_id),
+                                'state': 'live',
+                                'agent_reply': reply_text,
+                            },
+                        )
+                except Exception as e:
+                    logger.debug(
+                        "dispatch_to_agent: meet_copilot emit "
+                        "skipped (%s)", e)
             else:
                 logger.info("dispatch_to_agent: source_kind=%s not yet "
                             "supported", source_kind)
