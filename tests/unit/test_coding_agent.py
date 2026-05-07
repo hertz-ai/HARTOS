@@ -744,3 +744,67 @@ class TestCodingDaemonIdleGate:
             'gate; coding_daemon should match whatever the canonical '
             'pattern is.'
         )
+
+    def test_coding_daemon_orders_goals_by_last_dispatched_nulls_first(self):
+        """Pins the goal-selection ORDER BY clause that prevents
+        already-dispatched goals from starving never-dispatched ones.
+
+        Live-evidence root cause 2026-05-07 (post-rebuild):
+        49 self_heal goals + 4 already-dispatched coding goals + only
+        2 idle agent personas.  Daemon iterates goals in default
+        SQLite storage (rowid asc) order.  4 coding goals with
+        populated last_dispatched_at sit at the FRONT (low rowid);
+        the 30s cooldown check expires every tick at the SAME cadence
+        as the tick interval, so those 4 goals saturate the 2 idle
+        slots EVERY tick.  Self_heal goals at the back of the queue
+        never reach an idle agent.
+
+        Witnessed: 14 'dispatched 1 goal(s)' log lines over 6 minutes,
+        all targeting the same 4 already-dispatched goals; 0 self_heal
+        goals dispatched.
+
+        Fix: `.order_by(asc(AgentGoal.last_dispatched_at).nulls_first())`
+        — never-dispatched goals jump to the front, then by oldest
+        dispatch.  Same canonical pattern that prevents queue
+        starvation in any FIFO+cooldown system.
+        """
+        from pathlib import Path
+        src = Path(
+            os.path.join(
+                os.path.dirname(__file__), '..', '..',
+                'integrations', 'coding_agent', 'coding_daemon.py',
+            )
+        ).read_text(encoding='utf-8')
+        non_comment = '\n'.join(
+            line for line in src.splitlines()
+            if not line.lstrip().startswith('#')
+        )
+        # The query MUST include both an asc/order_by clause AND a
+        # nulls_first treatment of last_dispatched_at, OR an
+        # equivalent .order_by(...) that surfaces never-dispatched
+        # goals first.  Don't pin the exact SQLAlchemy idiom because
+        # newer versions may rename .nullsfirst() to .nulls_first()
+        # or vice versa — accept either spelling.
+        assert 'order_by' in non_comment, (
+            'coding_daemon._tick must order goals — without ORDER BY, '
+            'SQLite returns rows in storage (rowid) order and a few '
+            'already-dispatched goals starve the rest forever (the '
+            '2026-05-07 self_heal-stuck bug).'
+        )
+        assert ('nulls_first' in non_comment
+                or 'nullsfirst' in non_comment
+                or 'NULLS FIRST' in non_comment), (
+            'coding_daemon._tick must surface never-dispatched goals '
+            'first (NULL last_dispatched_at).  Pin via '
+            '.order_by(asc(...).nulls_first()) or equivalent.  '
+            'Drifting back to plain ORDER BY without nulls_first '
+            'silently re-orders never-dispatched goals to the END of '
+            'the queue on databases where NULLS LAST is the default '
+            '(MySQL, MS SQL); SQLite uses NULLS FIRST by default but '
+            'we shouldn\'t depend on that.'
+        )
+        assert 'last_dispatched_at' in non_comment, (
+            'ORDER BY must reference last_dispatched_at specifically '
+            '— ordering by created_at or id misses the goal-rotation '
+            'fairness this pin protects.'
+        )

@@ -119,9 +119,30 @@ class CodingAgentDaemon:
 
         db = get_db()
         try:
+            # ORDER BY: never-dispatched goals (NULL last_dispatched_at)
+            # jump to the front, then by oldest dispatch.  Without this,
+            # SQLite returns rows in insert/rowid order — a handful of
+            # already-dispatched goals (whose 30s cooldown expires at
+            # the same cadence as the daemon's tick interval) saturate
+            # the limited idle-agent slots every tick, and never-yet-
+            # dispatched goals at the back of the queue (e.g. the 49
+            # self_heal goals observed live 2026-05-07) starve forever.
+            #
+            # SQLAlchemy emits `ORDER BY ... NULLS FIRST` for the
+            # `nulls_first()` modifier; SQLite supports the syntax
+            # natively since 3.30 (Python 3.11 ships 3.49+).  For
+            # backends without the modifier, the .nullsfirst() call
+            # is a no-op and rows still order by last_dispatched_at
+            # asc (NULLs land first or last depending on the SQL
+            # dialect — both orderings prevent the starvation pattern
+            # because never-dispatched goals are clearly distinguishable
+            # from the ones that just dispatched 30s ago).
+            from sqlalchemy import asc
             goals = db.query(AgentGoal).filter(
                 AgentGoal.status == 'active',
                 AgentGoal.goal_type.in_(CODING_GOAL_TYPES),
+            ).order_by(
+                asc(AgentGoal.last_dispatched_at).nulls_first(),
             ).all()
             if not goals:
                 return
