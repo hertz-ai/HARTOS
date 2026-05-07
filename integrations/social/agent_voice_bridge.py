@@ -53,7 +53,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional
 
 logger = logging.getLogger('hevolve_social')
 
@@ -108,6 +109,16 @@ class AgentBridgeWorker:
         # Passed back as the ``since`` watermark next tick to avoid
         # re-processing the same segment twice if a producer re-emits.
         self._last_stt_segment_id: Optional[int] = None
+        # Rolling state for the Liquid UI meet_copilot card (UNIF-G5).
+        # Capped to keep the card lightweight on every emit; the card
+        # only shows the most-recent N lines anyway.  Decisions and
+        # action items are appended by future LLM-driven extraction
+        # (out of W1.3 scope); kept here so the card is forward-
+        # compatible.  Participants list is populated by adapter
+        # ``list_room_members`` calls in a follow-up.
+        self._transcript_lines: Deque[Dict[str, Any]] = deque(maxlen=10)
+        self._decisions: List[str] = []
+        self._action_items: List[str] = []
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -150,6 +161,10 @@ class AgentBridgeWorker:
         """
         logger.info("AgentBridgeWorker starting: call=%s agent=%s",
                     self.call_id, self.agent_id)
+        # Emit the initial meet_copilot card so the user sees the
+        # presence indicator immediately on attach (UNIF-G5) — empty
+        # transcript_lines is fine; subsequent ticks fill it.
+        self._emit_meet_copilot(state='live')
         try:
             while not self._stop.is_set():
                 try:
@@ -164,6 +179,13 @@ class AgentBridgeWorker:
             logger.info(
                 "AgentBridgeWorker stopped: call=%s agent=%s",
                 self.call_id, self.agent_id)
+            # Flip state to 'ended' so the renderer can dismiss /
+            # collapse the card.  Idempotent overwrite — same canonical
+            # emit path.
+            try:
+                self._emit_meet_copilot(state='ended')
+            except Exception:
+                pass
 
     def _tick(self) -> None:
         """One worker iteration — lazy-importing the integrations so
@@ -273,6 +295,20 @@ class AgentBridgeWorker:
                     "(call=%s, seg=%s): %s",
                     self.call_id, seg_id, e)
 
+            # Append to rolling transcript and emit the meet_copilot
+            # Liquid UI card update (UNIF-G5).  Idempotent overwrite —
+            # the renderer (web AgentOverlay.jsx + RN LiquidOverlay.js +
+            # iOS shared JS) treats each emit as the canonical full
+            # state, so stragglers / re-orders self-correct on the
+            # next tick.  Best-effort: emit failures don't block.
+            self._transcript_lines.append({
+                'speaker': seg.get('speaker') or author_id,
+                'text': text,
+                't0': seg.get('t0'),
+                't1': seg.get('t1'),
+            })
+            self._emit_meet_copilot(state='live')
+
             # Skip self-authored — the agent shouldn't dispatch on its
             # own previous TTS-back-into-the-room.
             if author_id and str(author_id) == str(self.agent_id):
@@ -307,6 +343,57 @@ class AgentBridgeWorker:
 
             if seg_id is not None:
                 self._last_stt_segment_id = seg_id
+
+    def _emit_meet_copilot(self, state: str = 'live') -> None:
+        """Push the rolling meet_copilot card state to the user's Liquid UI
+        surface (UNIF-G5).
+
+        Single canonical emit site for the meet_copilot component-type
+        defined in ``liquid_ui_service.py:COMPONENT_TYPES`` and rendered
+        by web ``AgentOverlay.jsx`` + RN ``LiquidOverlay.js`` + iOS
+        shared JS.  Idempotent overwrite — every emit is the full state
+        the renderer should display, so dropped / re-ordered events
+        self-correct on the next tick.
+
+        Best-effort: never raises out of the bridge loop.  If the
+        LiquidUIService isn't registered (Nunba bundled mode without
+        the agent engine), the emit is a logged no-op.
+        """
+        try:
+            from core.platform.service_registry import ServiceRegistry
+            svc = ServiceRegistry.get('LiquidUIService')
+        except Exception as e:
+            logger.debug(
+                "AgentBridgeWorker._emit_meet_copilot: ServiceRegistry "
+                "unavailable (%s) — skipping emit", e)
+            return
+        if svc is None:
+            return
+        try:
+            svc.agent_ui_update(
+                str(self.agent_id),
+                {
+                    'type': 'meet_copilot',
+                    'call_id': str(self.call_id),
+                    'platform': str(
+                        self.scope.get('platform') or 'livekit'),
+                    'room_id': str(
+                        self.scope.get('room_id') or self.call_id),
+                    'state': state,
+                    'transcript_lines': list(self._transcript_lines),
+                    'decisions': list(self._decisions),
+                    'action_items': list(self._action_items),
+                    'participants': list(
+                        self.scope.get('participants') or []),
+                    'agent_role': str(
+                        self.scope.get('role') or 'co_pilot'),
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                "AgentBridgeWorker._emit_meet_copilot: agent_ui_update "
+                "failed (call=%s, agent=%s): %s",
+                self.call_id, self.agent_id, e)
 
 
 class AgentVoiceBridge:

@@ -296,5 +296,134 @@ class WhisperSegmentQueueTest(unittest.TestCase):
         self.assertTrue(out[0]['is_final'])
 
 
+class MeetCopilotEmitTest(unittest.TestCase):
+    """UNIF-G5 / W1.3 — meet_copilot emit alongside transcript drain."""
+
+    def _make_worker(self, agent_id='agent-A', owner_id='owner-1',
+                     call_id='call-XYZ', scope=None):
+        from integrations.social.agent_voice_bridge import AgentBridgeWorker
+        return AgentBridgeWorker(
+            call_id=call_id,
+            agent_id=agent_id,
+            owner_id=owner_id,
+            scope=scope or {
+                'platform': 'discord',
+                'room_id': 'discord:room:42',
+                'role': 'note_taker',
+                'tenant_id': 't1',
+            },
+        )
+
+    def _patch_lazy(self, segments, persist_mock, dispatch_mock,
+                    liquid_ui_service):
+        whisper_mod = MagicMock()
+        whisper_mod.dequeue_segments = MagicMock(side_effect=[segments, []])
+        chat_messages_mod = MagicMock()
+        chat_messages_mod.persist_external_room_event = persist_mock
+        agentic_router_mod = MagicMock()
+        agentic_router_mod.dispatch_to_agent = dispatch_mock
+        service_registry_mod = MagicMock()
+        # ServiceRegistry.get('LiquidUIService') → liquid_ui_service mock
+        registry_class = MagicMock()
+        registry_class.get = MagicMock(return_value=liquid_ui_service)
+        service_registry_mod.ServiceRegistry = registry_class
+        return patch.dict(sys.modules, {
+            'integrations.service_tools.whisper_tool': whisper_mod,
+            'integrations.social.chat_messages': chat_messages_mod,
+            'integrations.agentic_router': agentic_router_mod,
+            'core.platform.service_registry': service_registry_mod,
+        })
+
+    def test_emit_after_segment_includes_full_state(self):
+        seg = {
+            'segment_id': 1,
+            'is_final': True,
+            'text': 'hello room',
+            'lang': 'en',
+            't0': 1.0,
+            't1': 2.5,
+            'speaker': 'alice',
+            'author_id': 'user-bob',
+        }
+        persist = MagicMock()
+        dispatch = MagicMock()
+        lui_svc = MagicMock()
+        w = self._make_worker()
+        with self._patch_lazy([seg], persist, dispatch, lui_svc):
+            w._tick()
+        lui_svc.agent_ui_update.assert_called_once()
+        agent_id_arg, payload = lui_svc.agent_ui_update.call_args.args
+        self.assertEqual(agent_id_arg, 'agent-A')
+        self.assertEqual(payload['type'], 'meet_copilot')
+        self.assertEqual(payload['call_id'], 'call-XYZ')
+        self.assertEqual(payload['platform'], 'discord')
+        self.assertEqual(payload['room_id'], 'discord:room:42')
+        self.assertEqual(payload['state'], 'live')
+        self.assertEqual(payload['agent_role'], 'note_taker')
+        self.assertEqual(len(payload['transcript_lines']), 1)
+        self.assertEqual(payload['transcript_lines'][0]['text'], 'hello room')
+        self.assertEqual(payload['transcript_lines'][0]['speaker'], 'alice')
+        # Empty lists for not-yet-extracted fields.
+        self.assertEqual(payload['decisions'], [])
+        self.assertEqual(payload['action_items'], [])
+
+    def test_emit_caps_transcript_lines_at_10(self):
+        # Fill the rolling buffer with 12 segments — only the last 10
+        # should appear in the emitted state (deque maxlen=10).
+        segs = [
+            {'segment_id': i, 'is_final': True,
+             'text': f'line {i}', 'author_id': 'user-bob'}
+            for i in range(1, 13)
+        ]
+        persist = MagicMock()
+        dispatch = MagicMock()
+        lui_svc = MagicMock()
+        w = self._make_worker()
+        with self._patch_lazy(segs, persist, dispatch, lui_svc):
+            w._tick()
+        # Last call's payload reflects the full 10-line cap.
+        last_payload = lui_svc.agent_ui_update.call_args.args[1]
+        self.assertEqual(len(last_payload['transcript_lines']), 10)
+        self.assertEqual(last_payload['transcript_lines'][0]['text'],
+                         'line 3')  # lines 1+2 evicted
+        self.assertEqual(last_payload['transcript_lines'][-1]['text'],
+                         'line 12')
+
+    def test_emit_failure_does_not_break_tick(self):
+        seg = {
+            'segment_id': 5,
+            'is_final': True,
+            'text': 'breaks ui',
+            'author_id': 'user-bob',
+        }
+        persist = MagicMock()
+        dispatch = MagicMock()
+        lui_svc = MagicMock()
+        lui_svc.agent_ui_update = MagicMock(
+            side_effect=RuntimeError('liquid ui down'))
+        w = self._make_worker()
+        with self._patch_lazy([seg], persist, dispatch, lui_svc):
+            w._tick()  # must not raise
+        persist.assert_called_once()
+        dispatch.assert_called_once()
+        self.assertEqual(w._last_stt_segment_id, 5)
+
+    def test_emit_skipped_when_service_registry_missing(self):
+        seg = {
+            'segment_id': 7,
+            'is_final': True,
+            'text': 'no ui service',
+            'author_id': 'user-bob',
+        }
+        persist = MagicMock()
+        dispatch = MagicMock()
+        # liquid_ui_service is None → ServiceRegistry.get returns None
+        w = self._make_worker()
+        with self._patch_lazy([seg], persist, dispatch, None):
+            w._tick()  # must not raise
+        persist.assert_called_once()
+        dispatch.assert_called_once()
+
+
 if __name__ == '__main__':
     unittest.main()
