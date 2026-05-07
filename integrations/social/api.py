@@ -652,6 +652,104 @@ def invite_resolve(code):
 
 
 # ─────────────────────────────────────────────────────────────────
+# UNIF-G4 — Deep-link dispatcher.
+#
+# Single canonical writer for OS-protocol-handler intents from every
+# Nunba client (Windows/macOS/Linux desktop, iOS, Android).  Each
+# client receives a `nunba://` or `hevolveai://` URI from the OS,
+# parses the verb + args, and POSTs to this endpoint.  Server-side
+# dispatch keeps the routing logic DRY across all 3 platforms — no
+# parallel client-side switch statements.
+#
+# Verbs:
+#   invite/<code>            → InviteService.accept (canonical)
+#   meet/<platform>/<room>   → Join_External_Room agent tool (UNIF-G2)
+#   group/<platform>/<id>    → Join_External_Room agent tool with
+#                              role='participant' (UNIF-G2)
+# ─────────────────────────────────────────────────────────────────
+
+@social_bp.route('/deeplink', methods=['POST'])
+@require_auth
+def deeplink_dispatch():
+    """Route a parsed custom-scheme deep link to the right handler."""
+    data = _get_json()
+    kind = (data.get('kind') or '').lower()
+    segments = data.get('segments') or []
+    if not isinstance(segments, list):
+        segments = []
+    scheme = (data.get('scheme') or 'hevolveai').lower()
+
+    # Reuse the canonical validator from core.install_links rather
+    # than re-implementing scheme/verb checks here (DRY).
+    try:
+        from core.install_links import (
+            DEEPLINK_SCHEMES, DEEPLINK_VERBS, is_allowed_deeplink_uri,
+        )
+    except Exception:
+        DEEPLINK_SCHEMES = ('hevolveai', 'nunba')
+        DEEPLINK_VERBS = ('invite', 'meet', 'group')
+        is_allowed_deeplink_uri = lambda u: True  # noqa: E731
+
+    if scheme not in DEEPLINK_SCHEMES:
+        return _err(f"unsupported scheme {scheme!r}", 400)
+    if kind not in DEEPLINK_VERBS:
+        return _err(f"unsupported verb {kind!r}", 400)
+    if not segments:
+        return _err("empty deeplink path", 400)
+
+    # Reconstruct the canonical URI form for the allowlist guard.
+    candidate = f"{scheme}://{kind}/{'/'.join(str(s) for s in segments)}"
+    if not is_allowed_deeplink_uri(candidate):
+        return _err(f"deep link rejected: {candidate}", 400)
+
+    if kind == 'invite':
+        # segments = [<code>] — InviteService.accept handles both
+        # invite_id and code via invite_id_or_code parameter.
+        code = str(segments[0])
+        try:
+            from .invite_service import InviteService, InviteError
+            result = InviteService.accept(
+                g.db, invite_id_or_code=code,
+                accepter_id=g.user.id,
+                tenant_id=getattr(g, 'tenant_id', None))
+            return _ok({'kind': 'invite', 'accepted': True,
+                        'invite': result})
+        except InviteError as e:
+            return _err(str(e), 400)
+
+    # meet / group → ask the agent to route via Join_External_Room.
+    # Same canonical agent tool already used for natural-language
+    # "join my Discord audio room <url>" — no parallel path.
+    if len(segments) < 2:
+        return _err(f"{kind} requires <platform>/<id>", 400)
+    platform_name = str(segments[0]).lower()
+    target = str(segments[1])
+    role = 'note_taker' if kind == 'meet' else 'participant'
+
+    try:
+        # Synthesize a Join_External_Room tool input — the canonical
+        # handler at hart_intelligence_entry._handle_join_external_room_tool
+        # validates consent, joins the room, and emits the meet_copilot
+        # Liquid UI card.
+        from hart_intelligence_entry import (
+            _handle_join_external_room_tool,
+        )
+        import json as _json
+        tool_input = _json.dumps({
+            'platform': platform_name,
+            'room': target,
+            'role': role,
+            'source': 'deeplink',
+        })
+        out = _handle_join_external_room_tool(tool_input)
+        return _ok({'kind': kind, 'platform': platform_name,
+                    'target': target, 'role': role,
+                    'tool_response': out})
+    except Exception as e:
+        return _err(f"deeplink dispatch failed: {e}", 500)
+
+
+# ─────────────────────────────────────────────────────────────────
 # Phase 7c.4 — Emoji reactions on posts / comments / messages.
 # Plan reference: sunny-gliding-eich.md, Part E.6.
 # Polymorphic source_kind so a single set of routes serves all three

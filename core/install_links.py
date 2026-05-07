@@ -167,3 +167,94 @@ def is_supported_device(device: str) -> bool:
 def is_supported_install_channel(channel_type: str) -> bool:
     """True iff `channel_type` is one of SUPPORTED_INSTALL_CHANNELS."""
     return (channel_type or '').lower().strip() in SUPPORTED_INSTALL_CHANNELS
+
+
+# ─── Custom-scheme deep links (UNIF-G4) ─────────────────────────────
+#
+# Distinct from `is_allowed_install_link` (HTTPS-only) above — these
+# helpers cover the OS-registered custom schemes used by the Nunba
+# desktop / Android / iOS protocol handlers to receive invite-accept,
+# meet-join, and group-join intents from external apps (browser,
+# Telegram, Discord, OS file manager, etc.).
+#
+# Schemes:
+#   - hevolveai://   (legacy; Nunba desktop registers this since 2024)
+#   - nunba://       (UNIF-G4; brand-canon scheme alongside hevolveai://)
+#
+# Verbs (path[0]):
+#   - invite   → /invite/<invite_code>
+#   - meet     → /meet/<platform>/<room_id>
+#   - group    → /group/<platform>/<group_id>
+#
+# Mobile clients use these deep links to route an inbound share-link
+# tap straight into the matching agent tool (Invite_Friend.accept or
+# Join_External_Room) without going through a web redirect first.
+
+DEEPLINK_SCHEMES: Tuple[str, ...] = ('hevolveai', 'nunba')
+DEEPLINK_VERBS: Tuple[str, ...] = ('invite', 'meet', 'group')
+
+
+def is_allowed_deeplink_uri(uri: str) -> bool:
+    """Validate a custom-scheme deep-link URI.
+
+    True iff scheme ∈ DEEPLINK_SCHEMES and the leading path segment is
+    one of DEEPLINK_VERBS with at least one trailing segment.
+    """
+    if not isinstance(uri, str) or not uri:
+        return False
+    try:
+        parsed = urlparse(uri)
+    except Exception:
+        return False
+    scheme = (parsed.scheme or '').lower()
+    if scheme not in DEEPLINK_SCHEMES:
+        return False
+    # urlparse treats `nunba://invite/X` netloc='invite', path='/X'
+    # and `nunba:invite/X` path='invite/X'.  Normalize.
+    raw = (parsed.netloc + parsed.path) if parsed.netloc else parsed.path
+    segments = [s for s in (raw or '').split('/') if s]
+    if not segments:
+        return False
+    verb = segments[0].lower()
+    if verb not in DEEPLINK_VERBS:
+        return False
+    # Per-verb arity:
+    #   invite needs 1 trailing segment (code)        → total ≥ 2
+    #   meet / group need 2 trailing segments
+    #   (platform + room/group_id)                    → total ≥ 3
+    required_total = 2 if verb == 'invite' else 3
+    if len(segments) < required_total:
+        return False
+    return True
+
+
+def invite_link(invite_code: str, scheme: str = 'hevolveai') -> str:
+    """Build a custom-scheme deep link for accepting a friend invite."""
+    if not invite_code:
+        raise ValueError("invite_link requires a non-empty invite_code")
+    s = (scheme or 'hevolveai').lower()
+    if s not in DEEPLINK_SCHEMES:
+        raise ValueError(f"unsupported scheme {scheme!r}")
+    return f"{s}://invite/{invite_code}"
+
+
+def meet_link(platform: str, room_id: str,
+              scheme: str = 'hevolveai') -> str:
+    """Build a custom-scheme deep link for joining an external meet."""
+    if not platform or not room_id:
+        raise ValueError("meet_link requires platform + room_id")
+    s = (scheme or 'hevolveai').lower()
+    if s not in DEEPLINK_SCHEMES:
+        raise ValueError(f"unsupported scheme {scheme!r}")
+    return f"{s}://meet/{platform.lower()}/{room_id}"
+
+
+def group_link(platform: str, group_id: str,
+               scheme: str = 'hevolveai') -> str:
+    """Build a custom-scheme deep link for joining an external group."""
+    if not platform or not group_id:
+        raise ValueError("group_link requires platform + group_id")
+    s = (scheme or 'hevolveai').lower()
+    if s not in DEEPLINK_SCHEMES:
+        raise ValueError(f"unsupported scheme {scheme!r}")
+    return f"{s}://group/{platform.lower()}/{group_id}"
