@@ -71,9 +71,9 @@ always `main`.  HARTOS follows the same rule for the same reason.
 
 ### Setup
 ```bash
-# Requires Python 3.10 (pydantic 1.10.9 incompatible with 3.12+)
-python3.10 -m venv venv310
-source venv310/Scripts/activate  # Windows: venv310\Scripts\activate.bat
+# Requires Python 3.9+ (test env runs on 3.11; pydantic 2.9.2 supports 3.9-3.13).
+python3.11 -m venv venv311
+source venv311/Scripts/activate  # Windows: venv311\Scripts\activate.bat
 pip install -r requirements.txt
 ```
 
@@ -116,7 +116,7 @@ REUSE Mode:  User Input → Load Recipe → Execute Steps → Output (90% faster
 ### Key Files
 | File | Purpose |
 |------|---------|
-| `hart_intelligence_entry.py` | Flask entry point (port 6777, Waitress server) |
+| `hart_intelligence_entry.py` | Flask entry point (port 6777, Hypercorn ASGI primary; Waitress WSGI fallback on ImportError) |
 | `create_recipe.py` | Agent creation, action execution, recipe generation |
 | `reuse_recipe.py` | Recipe reuse, trained agent execution |
 | `helper.py` | Action class, JSON utilities, tool handlers |
@@ -192,11 +192,12 @@ User Prompt
 
 ## Dependencies
 
-Critical pinned versions:
-- `langchain==0.0.230`
-- `pydantic==1.10.9` (requires Python 3.10)
+Critical pinned versions (post Apr/May 2026 split-package migration):
+- `langchain-classic==1.0.1` + `langchain-community==0.4.1` + `langchain-core==1.2.15` + `langchain-anthropic==1.0.0` + `langchain-text-splitters==1.1.1` + `langchain-google-genai==4.2.1` + `langchain-groq==1.1.2` (split packages — imports use `from langchain_classic.X` / `from langchain_community.X`)
+- `pydantic==2.9.2`
 - `autogen` (multi-agent framework)
 - `chromadb==0.3.23` (vector store)
+- `hypercorn` (primary ASGI server) + `waitress==2.1.2` (WSGI fallback)
 
 ---
 
