@@ -177,9 +177,18 @@ def is_supported_install_channel(channel_type: str) -> bool:
 # meet-join, and group-join intents from external apps (browser,
 # Telegram, Discord, OS file manager, etc.).
 #
-# Schemes:
-#   - hevolveai://   (legacy; Nunba desktop registers this since 2024)
-#   - nunba://       (UNIF-G4; brand-canon scheme alongside hevolveai://)
+# Schemes (all three accepted on the receive side; builders default
+# to ``hevolveai`` for the canonical cross-platform link):
+#   - hevolveai://   Nunba desktop registers this since 2024;
+#                    canonical for agent-emitted links.
+#   - nunba://       UNIF-G4 brand-canon scheme; iOS + desktop accept.
+#   - hevolve://     Legacy mobile scheme; Android + iOS Info.plist
+#                    have registered it since the early Hevolve_RN
+#                    builds (referrals, share, campaign, channel).
+#                    Recognized here so a single ``invite_link()`` URL
+#                    can be valid on every surface — the desktop
+#                    protocol handler, Android intent filter, and iOS
+#                    URL types all accept the same input.
 #
 # Verbs (path[0]):
 #   - invite   → /invite/<invite_code>
@@ -190,7 +199,7 @@ def is_supported_install_channel(channel_type: str) -> bool:
 # tap straight into the matching agent tool (Invite_Friend.accept or
 # Join_External_Room) without going through a web redirect first.
 
-DEEPLINK_SCHEMES: Tuple[str, ...] = ('hevolveai', 'nunba')
+DEEPLINK_SCHEMES: Tuple[str, ...] = ('hevolveai', 'nunba', 'hevolve')
 DEEPLINK_VERBS: Tuple[str, ...] = ('invite', 'meet', 'group')
 
 
