@@ -98,15 +98,46 @@ def get_call(call_id):
 #     SFU rendezvous URL to publish TTS / subscribe STT), OR
 #   - the call kind is 'screen_share' or 'mixed' (multi-track → SFU
 #     simpler than re-negotiating mesh tracks).
-# Override via `LIVEKIT_MESH_THRESHOLD` env var (e.g. set to 0 to
-# always promote, or to 999 to disable promotion entirely for testing).
+# Override via `LIVEKIT_MESH_THRESHOLD` (single int, applies to all
+# kinds) OR per-kind: `LIVEKIT_MESH_THRESHOLD_VOICE`,
+# `LIVEKIT_MESH_THRESHOLD_VIDEO`.  Set to 0 to always promote; 999 to
+# disable promotion entirely for testing.
+#
+# Default per-kind thresholds are derived from the bandwidth model in
+# integrations/social/_mesh_bandwidth_model.py — voice (audio-only,
+# 32 kbps Opus) stays cheap on mesh through N=4 (4× upload at N=4 is
+# 128 kbps — well within mobile uplinks).  Video (500 kbps default
+# VP8) crosses the per-peer upload pain point at N=3 (1 Mbps upload
+# for one person is asymmetric for residential ADSL / shared 4G), so
+# video calls promote to SFU one participant earlier.
+
+_DEFAULT_KIND_THRESHOLDS = {
+    'voice': 4,         # audio-only — cheap; mesh through 4
+    'video': 3,         # 500 kbps VP8 — SFU at N=3 saves uplink
+    'screen_share': 1,  # always SFU (handled by kind branch above)
+    'mixed': 1,         # always SFU (handled by kind branch above)
+}
 
 
-def _mesh_threshold() -> int:
+def _mesh_threshold(kind: str = 'voice') -> int:
+    """Resolve the mesh threshold for a given call kind.
+
+    Resolution order (highest priority first):
+      1. `LIVEKIT_MESH_THRESHOLD_<KIND>` env (per-kind override)
+      2. `LIVEKIT_MESH_THRESHOLD` env (uniform override across kinds)
+      3. _DEFAULT_KIND_THRESHOLDS[kind] (bandwidth-model default)
+      4. 4 (conservative fallback)
+    """
+    kind_env = f'LIVEKIT_MESH_THRESHOLD_{kind.upper()}'
+    val = os.environ.get(kind_env)
+    if val is None:
+        val = os.environ.get('LIVEKIT_MESH_THRESHOLD')
+    if val is None:
+        val = _DEFAULT_KIND_THRESHOLDS.get(kind, 4)
     try:
-        return max(1, int(os.environ.get('LIVEKIT_MESH_THRESHOLD', '4')))
+        return max(1, int(val))
     except (TypeError, ValueError):
-        return 4
+        return _DEFAULT_KIND_THRESHOLDS.get(kind, 4)
 
 
 def _decide_media_mode(sess, participants, *, is_agent: bool) -> str:
@@ -130,7 +161,7 @@ def _decide_media_mode(sess, participants, *, is_agent: bool) -> str:
         active_count = len(active) + 1
     else:
         active_count = len(active)
-    return 'livekit' if active_count > _mesh_threshold() else 'p2p_mesh'
+    return 'livekit' if active_count > _mesh_threshold(kind) else 'p2p_mesh'
 
 
 @calls_bp.route('/calls/<call_id>/token', methods=['POST'])

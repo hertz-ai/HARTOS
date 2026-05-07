@@ -691,6 +691,111 @@ def test_decide_media_mode_threshold_override(monkeypatch):
     assert _decide_media_mode(sess, parts2, is_agent=False) == 'livekit'
 
 
+def test_decide_media_mode_video_uses_tighter_default(monkeypatch):
+    """Video crosses to SFU at N=4 (default 3) — one peer earlier than
+    voice (default 4).  The bandwidth model justifies this: 500 kbps ×
+    3 = 1.5 Mbps mesh upload at N=4, which saturates a typical
+    residential uplink."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD_VIDEO', raising=False)
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD_VOICE', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    # 3 participants total (caller + 2 others) → at video threshold
+    parts = [{'user_id': 'u1', 'left_at': None},
+             {'user_id': 'u2', 'left_at': None}]
+    assert _decide_media_mode({'kind': 'video'}, parts,
+                              is_agent=False) == 'p2p_mesh'
+    # 4 participants → over video threshold (3)
+    parts4 = parts + [{'user_id': 'u3', 'left_at': None}]
+    assert _decide_media_mode({'kind': 'video'}, parts4,
+                              is_agent=False) == 'livekit'
+    # Same N=4 on a voice call still mesh (voice threshold = 4)
+    assert _decide_media_mode({'kind': 'voice'}, parts4,
+                              is_agent=False) == 'p2p_mesh'
+
+
+def test_decide_media_mode_per_kind_env_override(monkeypatch):
+    """LIVEKIT_MESH_THRESHOLD_VOICE / _VIDEO override per-kind."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    monkeypatch.setenv('LIVEKIT_MESH_THRESHOLD_VIDEO', '6')
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    # 5 video participants — would default to SFU (>3), but per-kind
+    # override allows mesh up to 6.
+    parts = [{'user_id': f'u{i}', 'left_at': None} for i in range(4)]
+    assert _decide_media_mode({'kind': 'video'}, parts,
+                              is_agent=False) == 'p2p_mesh'
+
+
+def test_decide_media_mode_uniform_env_overrides_per_kind(monkeypatch):
+    """LIVEKIT_MESH_THRESHOLD (uniform) takes precedence over the
+    per-kind default but loses to the per-kind override."""
+    monkeypatch.setenv('LIVEKIT_MESH_THRESHOLD', '2')
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD_VOICE', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    # 3 voice participants (caller + 2) — over uniform threshold of 2
+    parts = [{'user_id': 'u1', 'left_at': None},
+             {'user_id': 'u2', 'left_at': None}]
+    assert _decide_media_mode({'kind': 'voice'}, parts,
+                              is_agent=False) == 'livekit'
+
+
+def test_mesh_threshold_unknown_kind_falls_back(monkeypatch):
+    """An unknown kind (not in _DEFAULT_KIND_THRESHOLDS) falls back to
+    the conservative 4 — no KeyError, no NaN."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    from integrations.social.api_calls import _mesh_threshold
+    assert _mesh_threshold('weird_unknown_kind') == 4
+
+
+def test_mesh_threshold_garbage_env_falls_back(monkeypatch):
+    """Non-numeric env values fall back to the default per-kind."""
+    monkeypatch.setenv('LIVEKIT_MESH_THRESHOLD', 'not-a-number')
+    from integrations.social.api_calls import _mesh_threshold
+    # voice default is 4 from _DEFAULT_KIND_THRESHOLDS
+    assert _mesh_threshold('voice') == 4
+
+
+def test_bandwidth_model_crossover_table():
+    """Sanity-check the bandwidth model: mesh upload grows linearly,
+    SFU upload stays flat."""
+    from integrations.social._mesh_bandwidth_model import crossover_table
+    table = crossover_table('video', max_n=5)
+    assert table[2].mesh_up_kbps == 500   # 1 peer × 500 kbps
+    assert table[3].mesh_up_kbps == 1000
+    assert table[4].mesh_up_kbps == 1500
+    assert table[5].mesh_up_kbps == 2000
+    # SFU upload stays flat at one stream regardless of N
+    for n in range(2, 6):
+        assert table[n].sfu_up_kbps == 500
+
+
+def test_bandwidth_model_first_n_above_ceiling():
+    """1500 kbps uplink with VP8 video — mesh fits through N=4
+    (1500 kbps mesh upload), exceeds at N=5."""
+    from integrations.social._mesh_bandwidth_model import (
+        first_n_where_mesh_upload_exceeds,
+    )
+    # video at N=4 = 1500 kbps == ceiling (not >), so first exceeding N
+    # is 5.
+    assert first_n_where_mesh_upload_exceeds('video', 1500) == 5
+    # voice is so cheap it never exceeds even at N=46 (45 × 32 = 1440)
+    # but at N=47 it's 1472, still under.  At N=48: 1504 — exceeds.
+    assert first_n_where_mesh_upload_exceeds('voice', 1500) == 48
+
+
+def test_operational_thresholds_match_api_calls_defaults():
+    """The model's documented operational thresholds must equal the
+    constants in api_calls.  If you change one, change the other."""
+    from integrations.social._mesh_bandwidth_model import (
+        OPERATIONAL_THRESHOLDS,
+    )
+    from integrations.social.api_calls import _DEFAULT_KIND_THRESHOLDS
+    assert OPERATIONAL_THRESHOLDS == _DEFAULT_KIND_THRESHOLDS
+
+
 def test_decide_media_mode_excludes_left_participants(monkeypatch):
     """Active count uses left_at IS NULL — left rows don't count."""
     monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
