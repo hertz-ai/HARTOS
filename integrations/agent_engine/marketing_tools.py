@@ -185,11 +185,20 @@ def register_marketing_tools(helper, assistant, user_id: str):
                     target_communities=targets,
                     budget_spark=budget,
                 )
-                # Store referral mechanics in strategy
+                # Store referral mechanics in strategy.  Use the canonical
+                # ``invite_share_url`` builder (single source of truth) so
+                # G1's Invite_Friend tool, this referral campaign, and any
+                # future invite surface all emit the same shape.  Honors
+                # ``HEVOLVE_INVITE_BASE_URL`` env override automatically.
                 if result and isinstance(result, dict):
+                    from integrations.social.distribution_service import (
+                        invite_share_url,
+                    )
                     result['referral_code'] = ref_code
                     result['referral_message'] = referral_message
-                    result['referral_link'] = f"https://hevolve.ai/join?ref={ref_code}"
+                    result['referral_link'] = (
+                        invite_share_url(ref_code) if ref_code else ''
+                    )
 
                 db.commit()
                 return json.dumps({'success': True, 'campaign': result})
