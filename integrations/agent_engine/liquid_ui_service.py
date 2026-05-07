@@ -66,6 +66,15 @@ COMPONENT_TYPES = {
     'agent_action': {'props': ['agent_id', 'action_type', 'description',
                                'status', 'result', 'timestamp']},
     'navigate': {'props': ['target', 'params', 'transition']},
+    # ── External-room copilot (UNIF-G5) ──
+    # Live transcript + decisions + action items for an external Discord
+    # audio room / Teams meet / WhatsApp group voice / Reddit voice room
+    # joined via UNIF-G2 Join_External_Room.  Idempotent overwrite — backend
+    # emits the FULL state on every transcript chunk; frontend replaces.
+    'meet_copilot': {'props': ['call_id', 'platform', 'room_id', 'state',
+                               'transcript_lines', 'decisions',
+                               'action_items', 'participants',
+                               'agent_role']},
 }
 
 # ═══════════════════════════════════════════════════════════════
