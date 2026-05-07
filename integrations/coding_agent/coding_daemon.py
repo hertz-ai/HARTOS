@@ -126,7 +126,20 @@ class CodingAgentDaemon:
             if not goals:
                 return
 
-            idle_agents = IdleDetectionService.get_idle_opted_in_agents(db)
+            # Use ``get_idle_agent_personas`` — same canonical gate the
+            # agent_daemon uses (agent_daemon.py:555-563).  CODING_GOAL_TYPES
+            # are LOCAL maintenance goals (self_heal of THIS node's broken
+            # venvs, autoresearch on THIS repo, code_evolution against THIS
+            # codebase) — they fix this node, never need human-consent
+            # routing.  Do NOT use ``get_idle_opted_in_agents``: that's the
+            # distributed-compute privacy gate for peer-share workloads,
+            # which is gated downstream by ``dispatch_goal_distributed``
+            # already.  Mismatch silently returned [] on installs where no
+            # human had opted-in → daemon stalled with self_heal goals
+            # piling up (live-evidence 2026-05-07: 42 self_heal goals,
+            # 0 with last_dispatched_at populated).  Same root cause +
+            # same fix as the agent_daemon's 2026-05-01 switch.
+            idle_agents = IdleDetectionService.get_idle_agent_personas(db)
             if not idle_agents:
                 return
 

@@ -15,12 +15,16 @@ the daemon isn't running.
 Enabled via HEVOLVE_CODING_AGENT_ENABLED (default: TRUE — flipped
 2026-05-07 since the daemon is the consumer for self_heal goals
 that error_advice + #102 producers fill).  Safety: the daemon's
-_tick() at coding_daemon.py:129-131 early-returns when
-IdleDetectionService.get_idle_opted_in_agents is empty, so users
-with no opted-in agents see zero side effects.  Budget gate at
-line 110-117 blocks dispatches if platform isn't affordable.
-Server deployments that explicitly don't want the daemon set
-HEVOLVE_CODING_AGENT_ENABLED=false.
+_tick() early-returns when there are no idle agent personas
+(IdleDetectionService.get_idle_agent_personas — the same canonical
+gate agent_daemon uses for local goal dispatch; previously
+get_idle_opted_in_agents, which silently returned [] on installs
+where no human had opted into distributed compute → daemon stalled
+with self_heal goals piling up.  Live-evidence 2026-05-07: 42
+goals, 0 dispatched.  Same root-cause + fix as agent_daemon's
+2026-05-01 switch).  Budget gate at line 110-117 blocks dispatches
+if platform isn't affordable.  Server deployments that explicitly
+don't want the daemon set HEVOLVE_CODING_AGENT_ENABLED=false.
 """
 import os
 import logging

@@ -641,3 +641,106 @@ class TestPackageInit:
                     "Default-enabled path must reach blueprint "
                     "registration — env gate must default 'true'"
                 )
+
+
+class TestCodingDaemonIdleGate:
+    """Pins coding_daemon to ``get_idle_agent_personas`` (the local-agent
+    gate) instead of ``get_idle_opted_in_agents`` (the human-consent gate
+    for distributed-compute sharing).
+
+    Live-evidence root-cause 2026-05-07: 42 self_heal goals, 0 with
+    last_dispatched_at populated.  coding_daemon was using the
+    human-consent gate which silently returned [] on installs where no
+    user had toggled idle_compute_opt_in=True — daemon stalled,
+    self_heal queue piled up indefinitely.
+
+    Same pattern + same fix as agent_daemon's 2026-05-01 switch
+    (agent_daemon.py:555-563).  CODING_GOAL_TYPES are LOCAL maintenance
+    goals — they fix this node, never need human-consent routing.
+
+    These tests source-grep coding_daemon.py to PREVENT drift back to
+    the wrong gate.  An AST-level guard would also work but the source
+    pattern catches the regression at the same point a human reviewer
+    would notice it.
+    """
+
+    def test_coding_daemon_uses_local_agent_gate(self):
+        """coding_daemon._tick must call get_idle_agent_personas."""
+        from pathlib import Path
+        src = Path(
+            os.path.join(
+                os.path.dirname(__file__), '..', '..',
+                'integrations', 'coding_agent', 'coding_daemon.py',
+            )
+        ).read_text(encoding='utf-8')
+        assert 'get_idle_agent_personas' in src, (
+            'coding_daemon.py must call IdleDetectionService.'
+            'get_idle_agent_personas (the same canonical local-agent '
+            'gate agent_daemon uses).  See agent_daemon.py:555-563 for '
+            'the rationale block this fix mirrors.'
+        )
+
+    def test_coding_daemon_does_not_use_human_consent_gate(self):
+        """Regression guard: coding_daemon must NEVER drift back to
+        get_idle_opted_in_agents.  That gate silently returns [] when
+        no human has opted into distributed-compute sharing — the
+        2026-05-07 stall (42 goals, 0 dispatched) recurs."""
+        from pathlib import Path
+        src = Path(
+            os.path.join(
+                os.path.dirname(__file__), '..', '..',
+                'integrations', 'coding_agent', 'coding_daemon.py',
+            )
+        ).read_text(encoding='utf-8')
+        # The string 'get_idle_opted_in_agents' MAY appear inside a
+        # comment block (we explain the wrong-gate history).  But it
+        # must NOT appear in a line that is a function CALL.  Filter
+        # comment lines out before the assertion.
+        non_comment_lines = [
+            line for line in src.splitlines()
+            if not line.lstrip().startswith('#')
+        ]
+        non_comment_src = '\n'.join(non_comment_lines)
+        assert 'get_idle_opted_in_agents' not in non_comment_src, (
+            'coding_daemon.py must NOT call get_idle_opted_in_agents '
+            'in non-comment code.  That gate is only correct for '
+            'distributed-compute sharing routes (peer share); for '
+            'LOCAL goal dispatch (CODING_GOAL_TYPES) the canonical '
+            'gate is get_idle_agent_personas.  Mismatch caused the '
+            'self_heal queue stall on 2026-05-07.'
+        )
+
+    def test_idle_detection_service_exposes_both_gates(self):
+        """Sanity: both methods exist on IdleDetectionService.  If
+        one is renamed/removed, the daemon's source-pin breaks loudly
+        instead of silently routing to the other."""
+        from integrations.coding_agent.idle_detection import (
+            IdleDetectionService,
+        )
+        assert hasattr(IdleDetectionService, 'get_idle_agent_personas'), (
+            'IdleDetectionService.get_idle_agent_personas missing — '
+            'coding_daemon depends on it'
+        )
+        assert hasattr(IdleDetectionService, 'get_idle_opted_in_agents'), (
+            'IdleDetectionService.get_idle_opted_in_agents missing — '
+            'kept as the distributed-compute privacy gate; do not '
+            'remove without auditing get_idle_stats + peer_discovery'
+        )
+
+    def test_agent_daemon_pattern_unchanged(self):
+        """The fix mirrors agent_daemon.py:555-563.  If agent_daemon
+        ever reverts, this test surfaces the drift so coding_daemon
+        can be re-aligned in the same pass."""
+        from pathlib import Path
+        src = Path(
+            os.path.join(
+                os.path.dirname(__file__), '..', '..',
+                'integrations', 'agent_engine', 'agent_daemon.py',
+            )
+        ).read_text(encoding='utf-8')
+        assert 'get_idle_agent_personas' in src, (
+            'agent_daemon.py also uses get_idle_agent_personas — if '
+            'this fails, agent_daemon drifted back to the human-consent '
+            'gate; coding_daemon should match whatever the canonical '
+            'pattern is.'
+        )
