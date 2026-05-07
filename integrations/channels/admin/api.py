@@ -2288,8 +2288,11 @@ def reset_config():
 # lock-step with `GET /api/social/users/<id>/agents` (no parallel data path,
 # Gate 4).  Pause state is persisted in the agent's `settings.paused` JSON
 # field and is honoured by
-# ``IdleDetectionService.get_idle_opted_in_agents`` so the agent daemon
-# immediately stops dispatching work to paused agents on its next tick.
+# ``IdleDetectionService._check_user_dispatchable`` (the shared dispatchability
+# check both ``get_idle_agent_personas`` — used by agent_daemon + coding_daemon
+# for local goal dispatch — AND ``get_idle_opted_in_agents`` — used by
+# peer_discovery for distributed-compute sharing — call into).  Pausing the
+# agent immediately stops dispatching on the next tick of either daemon.
 
 def _require_admin_user():
     """Raise PermissionError unless the authenticated caller is an admin.
