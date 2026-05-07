@@ -103,9 +103,11 @@ class AgentBridgeWorker:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.started_at = time.time()
-        # Last STT segment we forwarded to the agent — used for
-        # de-dup if the LiveKit subscriber re-emits.
-        self._last_stt_segment_id: Optional[str] = None
+        # Last STT segment id we drained from
+        # ``whisper_tool.dequeue_segments`` — monotonic int per call.
+        # Passed back as the ``since`` watermark next tick to avoid
+        # re-processing the same segment twice if a producer re-emits.
+        self._last_stt_segment_id: Optional[int] = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -166,45 +168,145 @@ class AgentBridgeWorker:
     def _tick(self) -> None:
         """One worker iteration — lazy-importing the integrations so
         unit tests don't drag in livekit/whisper/PocketTTS modules
-        that may not be installed."""
-        if not _HAS_LIVEKIT_RTC:
-            # No-op tick: bridge is "registered" but isn't actually
-            # bridging audio.  This is the flat / Nunba bundled
-            # mode — agent participation is bookkeeping only.
+        that may not be installed.
+
+        Drains finalized STT segments from
+        ``whisper_tool.dequeue_segments`` (the canonical per-call queue
+        that audio-adapter producers fill — LiveKit subscriber, Discord
+        voice receiver, RN mic stream, etc.).  For each segment whose
+        author is NOT this agent:
+          (a) Persists it as a ``ConversationEntry`` row via
+              ``chat_messages.persist_external_room_event`` with
+              ``kind='transcript_segment'`` so cross-channel recall
+              sees the call transcript chronologically alongside
+              external-room messages (UNIF-G3).
+          (b) Dispatches the transcript text through
+              ``agentic_router.dispatch_to_agent`` so the agent can
+              respond (existing canonical agent dispatch path).
+
+        Self-authored segments are skipped — the agent should not
+        talk to itself.  Interim (non-final) segments never enter the
+        queue (producers should only enqueue ``is_final=True``); a
+        defensive ``is_final`` check stays here as belt-and-braces.
+
+        TTS publish-back to the room is the producer-adapter's
+        concern (LiveKit publish track / Discord voice client send),
+        not the bridge's.  This loop is one-way: room → agent.
+
+        Whichever audio source isn't installed (LiveKit RTC, discord.py
+        voice receive lib, etc.) just means the producer never enqueues
+        for this call_id — the worker tick is then a no-op drain.
+        Always safe to run; never raises out of the loop.
+        """
+        # Lazy imports — avoids hard dependency on whisper / agentic_router
+        # at module-import time (unit tests of attach/detach don't need
+        # to drag in the LLM dispatch graph or audio toolchain).
+        try:
+            from integrations.service_tools.whisper_tool import (
+                dequeue_segments,
+            )
+            from integrations.social.chat_messages import (
+                persist_external_room_event,
+            )
+        except Exception as e:  # pragma: no cover — import-only failure
+            logger.debug(
+                "AgentBridgeWorker._tick: lazy imports unavailable "
+                "(%s) — skipping drain", e)
             return
 
-        # The actual integration shape:
-        #
-        #   1. Pull queued STT segments from the LiveKit subscriber
-        #      stream that whisper_tool wrote to.
-        #
-        #      segments = whisper_tool.dequeue_segments(
-        #          call_id=self.call_id, since=self._last_stt_segment_id)
-        #
-        #   2. For each segment whose author is NOT this agent:
-        #      dispatch through agentic_router.
-        #
-        #      for seg in segments:
-        #          if seg.author_id == self.agent_id:
-        #              continue  # don't talk to ourselves
-        #          dispatch_to_agent(
-        #              agent_id=self.agent_id,
-        #              prompt=seg.text,
-        #              context={'source_kind': 'call',
-        #                       'source_id': self.call_id,
-        #                       'author_id': seg.author_id,
-        #                       'tenant_id': self.tenant_id},
-        #              synchronous=False)
-        #          self._last_stt_segment_id = seg.id
-        #
-        #   3. Pull queued TTS chunks the dispatch worker emitted
-        #      and publish them as a LiveKit audio track.
-        #
-        #      chunks = pocket_tts.dequeue_chunks(
-        #          target=self.call_id, voice='alba')
-        #      for chunk in chunks:
-        #          self._livekit_publish_audio(chunk)
-        pass
+        # Drain the queue since our last watermark.  whisper_tool returns
+        # only segments with id > since AND prunes them from the queue;
+        # no double-processing.
+        try:
+            segments = dequeue_segments(
+                call_id=self.call_id,
+                since=self._last_stt_segment_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "AgentBridgeWorker._tick: dequeue_segments failed "
+                "(call=%s): %s", self.call_id, e)
+            return
+
+        if not segments:
+            return
+
+        for seg in segments:
+            seg_id = seg.get('segment_id')
+            if not seg.get('is_final', True):
+                # Defensive: producers should not enqueue interim, but
+                # if they do, we just skip + keep advancing the watermark.
+                if seg_id is not None:
+                    self._last_stt_segment_id = seg_id
+                continue
+
+            author_id = seg.get('author_id')
+            text = (seg.get('text') or '').strip()
+            if not text:
+                if seg_id is not None:
+                    self._last_stt_segment_id = seg_id
+                continue
+
+            # Persist for cross-channel recall (UNIF-G3) — same canonical
+            # writer used by adapter message handlers.  Voice transcripts
+            # carry kind='transcript_segment' + extra={t0, t1, speaker}
+            # per the persist_external_room_event contract.
+            try:
+                persist_external_room_event(
+                    user_id=str(self.owner_id),
+                    platform=str(self.scope.get('platform') or 'livekit'),
+                    room_id=str(self.call_id),
+                    sender_id=str(author_id or 'unknown'),
+                    text=text,
+                    kind='transcript_segment',
+                    timestamp=seg.get('t1') or seg.get('t0'),
+                    lang=seg.get('lang'),
+                    extra={
+                        't0': seg.get('t0'),
+                        't1': seg.get('t1'),
+                        'speaker': seg.get('speaker'),
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    "AgentBridgeWorker._tick: persist failed "
+                    "(call=%s, seg=%s): %s",
+                    self.call_id, seg_id, e)
+
+            # Skip self-authored — the agent shouldn't dispatch on its
+            # own previous TTS-back-into-the-room.
+            if author_id and str(author_id) == str(self.agent_id):
+                if seg_id is not None:
+                    self._last_stt_segment_id = seg_id
+                continue
+
+            # Dispatch through the canonical agent router so existing
+            # GuardrailEnforcer.before_dispatch / .after_response gates
+            # apply identically to call-driven prompts as to chat-driven.
+            try:
+                from integrations.agentic_router import dispatch_to_agent
+                dispatch_to_agent(
+                    agent_id=self.agent_id,
+                    prompt=text,
+                    context={
+                        'source_kind': 'call',
+                        'source_id': self.call_id,
+                        'author_id': author_id,
+                        'owner_id': self.owner_id,
+                        'tenant_id': self.scope.get('tenant_id'),
+                        'platform': self.scope.get('platform') or 'livekit',
+                        'lang': seg.get('lang'),
+                    },
+                    synchronous=False,
+                )
+            except Exception as e:
+                logger.warning(
+                    "AgentBridgeWorker._tick: dispatch_to_agent failed "
+                    "(call=%s, agent=%s, seg=%s): %s",
+                    self.call_id, self.agent_id, seg_id, e)
+
+            if seg_id is not None:
+                self._last_stt_segment_id = seg_id
 
 
 class AgentVoiceBridge:
