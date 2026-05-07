@@ -244,13 +244,15 @@ class TestPopulateRejectsInvalidEntries:
             f'{[r.message for r in caplog.records]!r}'
         )
 
-    def test_reflection_only_entry_is_rejected_in_scope_1(
+    def test_reflection_only_entry_survives_ingest_in_scope_2(
         self, fresh_catalog, caplog,
     ):
-        # Pure-config entry passes _validate_engine_caps but the dispatcher
-        # for it (--catalog-id path) hasn't landed yet (#58 Scope-2).  In
-        # the meantime, we reject at ingest so the admin sees the error
-        # immediately rather than silence at synth.
+        # #58 Scope-2 landed — reflection-only entries (no tool_module
+        # but full 5-field contract) are now dispatchable via
+        # `gpu_worker --catalog-id <id>`.  They must SURVIVE ingest;
+        # the post-upsert ENGINE_REGISTRY snapshot still excludes
+        # them (TTSEngineSpec needs tool_module — see the separate
+        # _refresh_excludes_reflection_only_entries test below).
         ref_only = _make_entry('tts-reflection', {
             'import_path': 'flex:Flex',
             'init_args': {},
@@ -264,12 +266,20 @@ class TestPopulateRejectsInvalidEntries:
                              logger='integrations.channels.media.tts_router'):
             populate_tts_catalog(fresh_catalog)
 
-        assert fresh_catalog.get('tts-reflection') is None
-        assert any('tts-reflection' in rec.message and
-                   'reflection-only' in rec.message
-                   for rec in caplog.records), (
-            'reflection-only entry must be rejected with a clear log line '
-            f'pointing at #58 Scope-2; got {[r.message for r in caplog.records]!r}'
+        assert fresh_catalog.get('tts-reflection') is not None, (
+            '#58 Scope-2: reflection-only entries must survive ingest; '
+            'they are dispatched via --catalog-id, not ENGINE_REGISTRY'
+        )
+        # No "rejected" warning for the reflection-only entry — only
+        # malformed entries (which fail _validate_engine_caps) trip the
+        # rejection log path.
+        rejection_lines = [
+            r.message for r in caplog.records
+            if 'tts-reflection' in r.message and 'reject' in r.message
+        ]
+        assert not rejection_lines, (
+            f'reflection-only entries should NOT be rejected at ingest '
+            f'after #58 Scope-2; got {rejection_lines!r}'
         )
 
     def test_valid_tool_module_entry_survives_ingest(self, fresh_catalog):

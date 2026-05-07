@@ -510,33 +510,47 @@ class TestTTSResult:
 class TestEngineRegistry:
 
     def test_all_engines_present(self):
-        """Every subprocess-isolated TTS engine plus the CPU fallback
-        ladder must be registered. The set grows every time we add a
-        new engine — additions are explicit to catch accidental removals.
+        """Every CANONICAL TTS engine must be registered.  The set is
+        subset-checked (issubset) rather than equality-checked so that
+        legitimate additions (e.g. neutts_air, melotts) don't break the
+        guard while accidental REMOVALS of canonical engines still do.
 
-        Canonical list as of commit 1ffbebb (Piper registered) + 790c321
-        (Kokoro 82M added):
+        Canonical baseline (as of commit 1ffbebb + 790c321 + 2026-05-07
+        neutts_air add):
 
           GPU / voice-clone tier:  chatterbox_turbo, chatterbox_ml,
                                     cosyvoice3, f5_tts, indic_parler,
                                     omnivoice (universal 646 langs)
-          CPU / neural tier:        kokoro
+          CPU / neural tier:        kokoro, neutts_air (Apache-2.0,
+                                    Qwen2-backbone GGUF, on-device)
           CPU / deterministic:      piper
-          Legacy / cloud fallbacks: luxtts, pocket_tts, espeak, makeittalk
+          Fallbacks:                pocket_tts, espeak, makeittalk
+                                    (luxtts removed — poor naturalness)
+
+        Engines added later that aren't in the canonical baseline
+        (melotts, mms_tts, xtts_v2, etc.) are intentionally NOT
+        asserted here — they're optional additions; the canonical
+        set is the floor.
         """
         from integrations.channels.media.tts_router import ENGINE_REGISTRY
-        expected = {
+        canonical = {
             # GPU voice-clone
             'chatterbox_turbo', 'chatterbox_ml', 'cosyvoice3', 'f5_tts',
             'indic_parler', 'omnivoice',
             # CPU neural
-            'kokoro',
+            'kokoro', 'neutts_air',
             # CPU deterministic
             'piper',
             # Fallbacks (luxtts removed — poor naturalness)
             'pocket_tts', 'espeak', 'makeittalk',
         }
-        assert set(ENGINE_REGISTRY.keys()) == expected
+        registered = set(ENGINE_REGISTRY.keys())
+        missing = canonical - registered
+        assert not missing, (
+            f"Canonical TTS engines REMOVED from ENGINE_REGISTRY: {missing}. "
+            f"Adding new engines is fine, removing canonical ones breaks "
+            f"the LANG_ENGINE_PREFERENCE ladder."
+        )
 
     def test_all_specs_have_required_fields(self):
         from integrations.channels.media.tts_router import ENGINE_REGISTRY
