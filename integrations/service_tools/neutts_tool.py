@@ -1,4 +1,4 @@
-"""TTS tool — in-process text-to-speech via NeuTTS Air (Neuphonic).
+"""TTS tool — text-to-speech via NeuTTS Air (Neuphonic).
 
 NeuTTS Air benefits:
   - 748M params on Qwen2 backbone, GGUF Q4 (~600MB) / Q8 (~800MB)
@@ -7,51 +7,62 @@ NeuTTS Air benefits:
   - Instant voice cloning from 3-15s reference audio
   - English primary; CPU-friendly (no GPU required for Q4)
 
-Conservative add (2026-05-07): wrapper imports `neutts` lazily.
-If the package isn't installed, every entry point returns a clean
-JSON failure ({error: ...}) — the TTS ladder traverses past us
-to the next engine (kokoro / pocket_tts / cosyvoice3 / piper).
-This honors the "failure of one shouldn't block another" contract
-(verified against tts/package_installer.py:1357 + Nunba/models/
-orchestrator.py:327 — per-engine independent install + WAV-synth
-+ duration-validation).
+Pip package: ``neutts`` on PyPI.  Optional extras: ``neutts[all]`` pulls
+``llama-cpp-python`` (GGUF inference) + ``soundfile`` + ``onnxruntime``
+(codec decoder).  License Apache-2.0.
 
-Public API (mirrors pocket_tts_tool.py shape):
-  neutts_synthesize(text, voice, output_path) -> JSON
+Architecture (ToolWorker pattern — same as kokoro / chatterbox / f5):
+  - This module exposes ``_load`` + ``_synthesize`` (subprocess-side
+    callbacks) and ``_tool`` (parent-side ``ToolWorker`` instance).
+  - ``neutts_synthesize`` (the canonical public entry point referenced
+    by ``tts_router.ENGINE_REGISTRY['neutts_air'].tool_function``)
+    forwards through ``_tool.synthesize``.
+  - The desktop installer (Nunba) routes ``neutts`` into a dedicated
+    venv (``install_target='venv'`` in tts_router.py) because
+    ``neutts[all]`` pulls ``llama-cpp-python`` whose torch / numpy
+    pins can drift from the main interpreter.  ``ToolWorker``'s
+    ``python_exe`` is wired to the venv's python at install time so
+    the synth subprocess sees the pinned neutts deps.
+
+Reference voices (NeuTTS requires a reference audio + transcript for
+cloning — there is no zero-config default voice the way pocket_tts has
+built-in 'alba'/'jean'/etc.).  Resolution order:
+  1. Path to a .wav (with companion .txt at the same stem) — ad-hoc
+  2. Custom name → ``~/.hevolve/models/tts/neutts/voices/<name>.wav``
+     (with companion .txt) — persistent user-cloned voices
+  3. ``'jo'`` (default) → upstream sample at
+     ``<site-packages>/neutts/samples/jo.{wav,txt}``
+
+Model downloaded lazily on first use (HuggingFace
+``neuphonic/neutts-air-q4-gguf`` backbone + ``neuphonic/neucodec``
+codec).  Env overrides:
+  - ``NEUTTS_BACKBONE_REPO`` (default ``neuphonic/neutts-air-q4-gguf``)
+  - ``NEUTTS_BACKBONE_DEVICE`` (default ``cpu``)
+  - ``NEUTTS_CODEC_REPO`` (default ``neuphonic/neucodec``)
+  - ``NEUTTS_CODEC_DEVICE`` (default ``cpu``)
+
+Public API (parent side):
+  neutts_synthesize(text, voice, output_path, language) -> JSON
   neutts_list_voices() -> JSON
-
-Reference voices (NeuTTS requires a reference audio + transcript
-for cloning — there is no zero-config default voice the way
-pocket_tts has built-in 'alba'/'jean'/etc.).  We expose:
-  - 'jo' (default): the upstream sample shipped with the neutts
-    package install at <site-packages>/neutts/samples/jo.{wav,txt}
-  - any path to a user-provided .wav (with companion .txt of the
-    transcript at the same stem) for ad-hoc cloning
-  - any name in ~/.hevolve/models/tts/neutts_voices/<name>.{wav,txt}
-    for persistent user-cloned voices
-
-Model downloaded lazily on first use (HuggingFace neuphonic/neutts-
-air for the backbone, neuphonic/neucodec for the audio decoder).
+  unload_neutts() -> None
 """
 
 import json
 import logging
 import os
-import sys
 from pathlib import Path
 from typing import Optional, Tuple
+
+from integrations.service_tools.gpu_worker import ToolWorker
 
 from .registry import ServiceToolInfo, service_tool_registry
 
 logger = logging.getLogger(__name__)
 
-# Cached model + reference codes (avoid reloading on every call)
-_tts_model = None
-_ref_codes_cache: dict = {}  # voice_name -> (ref_codes, ref_text)
-
 
 # ═══════════════════════════════════════════════════════════════
-# Storage paths
+# Storage paths (parent + subprocess use the same resolver — single
+# source of truth for "where do user-cloned voice files live?")
 # ═══════════════════════════════════════════════════════════════
 
 def _get_tts_dir() -> Path:
@@ -79,46 +90,6 @@ def _get_voices_dir() -> Path:
     return vdir
 
 
-# ═══════════════════════════════════════════════════════════════
-# Model + reference management
-# ═══════════════════════════════════════════════════════════════
-
-def _load_model():
-    """Load NeuTTS Air model (lazy, cached).
-
-    Raises:
-        ImportError: if the `neutts` package isn't installed.
-            Callers MUST handle this to keep the TTS ladder
-            traversing past us.
-    """
-    global _tts_model
-    if _tts_model is not None:
-        return _tts_model
-
-    from neutts import NeuTTS  # lazy — let ImportError bubble
-
-    logger.info("Loading NeuTTS Air model (748M params, Qwen2 backbone)...")
-    # Default to CPU — Q4 GGUF runs at <0.5x RTF on CPU per the
-    # upstream README.  GPU configurations can override via env var.
-    backbone_device = os.environ.get('NEUTTS_BACKBONE_DEVICE', 'cpu')
-    codec_device = os.environ.get('NEUTTS_CODEC_DEVICE', 'cpu')
-    backbone_repo = os.environ.get(
-        'NEUTTS_BACKBONE_REPO', 'neuphonic/neutts-air-q4-gguf')
-    codec_repo = os.environ.get('NEUTTS_CODEC_REPO', 'neuphonic/neucodec')
-
-    _tts_model = NeuTTS(
-        backbone_repo=backbone_repo,
-        backbone_device=backbone_device,
-        codec_repo=codec_repo,
-        codec_device=codec_device,
-    )
-    logger.info(
-        f"NeuTTS Air ready (backbone={backbone_repo} on {backbone_device}, "
-        f"codec={codec_repo} on {codec_device})"
-    )
-    return _tts_model
-
-
 def _resolve_reference(voice: str) -> Tuple[Optional[str], Optional[str]]:
     """Resolve a `voice` argument to (ref_audio_path, ref_text).
 
@@ -129,11 +100,11 @@ def _resolve_reference(voice: str) -> Tuple[Optional[str], Optional[str]]:
       4. Anything else → (None, None) — caller MUST treat as failure
     """
     # 1. Direct path
-    if os.path.isfile(voice):
+    if voice and os.path.isfile(voice):
         wav = voice
         txt_path = os.path.splitext(voice)[0] + '.txt'
         if os.path.isfile(txt_path):
-            with open(txt_path, 'r', encoding='utf-8') as fp:
+            with open(txt_path, encoding='utf-8') as fp:
                 return wav, fp.read().strip()
         # No transcript — refuse rather than guess
         return None, None
@@ -142,18 +113,18 @@ def _resolve_reference(voice: str) -> Tuple[Optional[str], Optional[str]]:
     custom_wav = _get_voices_dir() / f"{voice}.wav"
     custom_txt = _get_voices_dir() / f"{voice}.txt"
     if custom_wav.is_file() and custom_txt.is_file():
-        with open(custom_txt, 'r', encoding='utf-8') as fp:
+        with open(custom_txt, encoding='utf-8') as fp:
             return str(custom_wav), fp.read().strip()
 
     # 3. Upstream sample 'jo' shipped with the neutts package
     if voice == 'jo':
         try:
-            import neutts
+            import neutts  # noqa: F401
             pkg_dir = Path(neutts.__file__).parent
             sample_wav = pkg_dir / 'samples' / 'jo.wav'
             sample_txt = pkg_dir / 'samples' / 'jo.txt'
             if sample_wav.is_file() and sample_txt.is_file():
-                with open(sample_txt, 'r', encoding='utf-8') as fp:
+                with open(sample_txt, encoding='utf-8') as fp:
                     return str(sample_wav), fp.read().strip()
         except ImportError:
             return None, None
@@ -161,145 +132,232 @@ def _resolve_reference(voice: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def _get_reference_codes(voice: str):
-    """Get or build cached reference codes for the chosen voice.
+# ═══════════════════════════════════════════════════════════════
+# Subprocess-side callbacks (invoked by gpu_worker dispatcher)
+# ═══════════════════════════════════════════════════════════════
 
-    NeuTTS uses encoded reference codes (precomputed via the codec)
-    to drive cloning — caching them per-voice keeps subsequent
-    synth calls cheap (the encoding is the slow part).
+def _load() -> dict:
+    """Load NeuTTS Air once at subprocess startup.
+
+    Default device is CPU because NeuTTS's Q4 GGUF runs at <0.5x RTF
+    on a modest consumer CPU per the upstream README — we don't burn
+    GPU for an engine the CPU can already serve in real time.  Users
+    on big GPUs can override via ``NEUTTS_BACKBONE_DEVICE=cuda``.
+
+    Raises:
+        ImportError: if the `neutts` package isn't installed.
+            ToolWorker propagates this to the parent, which receives
+            an `{error: ..., transient: false}` JSON and the TTS
+            ladder traverses past us.
     """
-    if voice in _ref_codes_cache:
-        return _ref_codes_cache[voice]
+    try:
+        from neutts import NeuTTS  # type: ignore
+    except ImportError as e:
+        raise ImportError(
+            f"neutts package not installed. "
+            f"Install with: pip install neutts[all]  ({e})"
+        ) from e
 
-    ref_wav, ref_text = _resolve_reference(voice)
-    if not ref_wav or not ref_text:
-        return None
+    backbone_device = os.environ.get('NEUTTS_BACKBONE_DEVICE', 'cpu')
+    codec_device = os.environ.get('NEUTTS_CODEC_DEVICE', 'cpu')
+    backbone_repo = os.environ.get(
+        'NEUTTS_BACKBONE_REPO', 'neuphonic/neutts-air-q4-gguf')
+    codec_repo = os.environ.get('NEUTTS_CODEC_REPO', 'neuphonic/neucodec')
 
-    model = _load_model()
-    ref_codes = model.encode_reference(ref_wav)
-    _ref_codes_cache[voice] = (ref_codes, ref_text)
-    return _ref_codes_cache[voice]
+    logger.info(
+        "Loading NeuTTS Air (backbone=%s on %s, codec=%s on %s)...",
+        backbone_repo, backbone_device, codec_repo, codec_device,
+    )
+    model = NeuTTS(
+        backbone_repo=backbone_repo,
+        backbone_device=backbone_device,
+        codec_repo=codec_repo,
+        codec_device=codec_device,
+    )
+    logger.info("NeuTTS Air ready")
+    return {
+        'model': model,
+        'device': backbone_device,
+        # Reference codes are expensive to compute (run the codec
+        # encoder over the wav).  Cache per-voice for the life of the
+        # subprocess so consecutive synth calls with the same voice
+        # share the encode cost.
+        'ref_cache': {},
+    }
 
 
-# ═══════════════════════════════════════════════════════════════
-# Public API
-# ═══════════════════════════════════════════════════════════════
-
-def neutts_synthesize(
-    text: str,
-    voice: str = "jo",
-    output_path: Optional[str] = None,
-    sample_rate: int = 24000,
-) -> str:
-    """Synthesize text to speech using NeuTTS Air.
+def _synthesize(state, req: dict) -> dict:
+    """Run one synthesis request inside the worker.
 
     Args:
-        text: Text to synthesize.
-        voice: 'jo' (default upstream sample), a path to a .wav
-            (with companion .txt transcript), or a custom name in
-            ~/.hevolve/models/tts/neutts/voices/.
-        output_path: Optional output .wav path. Auto-generated if None.
-        sample_rate: Output sample rate. Default 24000 (NeuTTS native).
+        state: dict returned by ``_load`` — holds the loaded model and
+               the per-subprocess ref-codes cache.
+        req: ``{text, voice, output_path, sample_rate?}`` request.
 
     Returns:
-        JSON string with {path, duration, sample_rate, voice, engine} on
-        success or {error: ...} on failure.
-
-    Failure modes (TTS ladder traverses past us — same contract as
-    every other engine):
-      - neutts package not installed → {error: 'neutts not installed'}
-      - reference voice not resolvable → {error: 'voice not configured'}
-      - synth raised → {error: '<exc type>: <exc msg>'}
+        ``{path, duration, sample_rate, voice, engine}`` on success or
+        ``{error, engine, transient}`` on failure.  ``transient=False``
+        for "voice not configured" (deterministic — same input retries
+        will fail the same way) and for missing-package errors.
     """
+    text = req.get('text', '')
     if not text or not text.strip():
-        return json.dumps({"error": "Text is required"})
+        return {'error': 'Text is required', 'engine': 'neutts_air'}
 
-    if output_path is None:
-        import hashlib
-        h = hashlib.md5(f"{text[:50]}:{voice}".encode()).hexdigest()[:12]
-        output_path = str(_get_output_dir() / f"neutts_{h}.wav")
+    output_path = req.get('output_path')
+    if not output_path:
+        return {'error': 'output_path is required', 'engine': 'neutts_air'}
 
-    import time as _time
-    _t0 = _time.monotonic()
+    voice = req.get('voice') or 'jo'
+    sample_rate = int(req.get('sample_rate') or 24000)
 
-    try:
-        ref = _get_reference_codes(voice)
-        if ref is None:
-            return json.dumps({
-                "error": (
+    # Resolve + cache the reference codes (codec encoding is the slow
+    # part; one-time cost per voice per subprocess).
+    cache = state.get('ref_cache', {})
+    cached = cache.get(voice)
+    if cached is None:
+        ref_wav, ref_text = _resolve_reference(voice)
+        if not ref_wav or not ref_text:
+            return {
+                'error': (
                     f"NeuTTS voice {voice!r} not configured (no reference "
-                    f"audio + transcript found).  Provide a .wav with "
+                    f"audio + transcript found). Provide a .wav with "
                     f"companion .txt at the same stem, or use the "
                     f"upstream 'jo' sample after installing the neutts "
                     f"package."
                 ),
-                "engine": "neutts_air",
-            })
-        ref_codes, ref_text = ref
-
-        model = _load_model()
-        wav = model.infer(text, ref_codes, ref_text)
-
-        # Write WAV
+                'engine': 'neutts_air',
+                'transient': False,
+            }
         try:
-            import soundfile as sf
-            sf.write(output_path, wav, sample_rate)
-        except ImportError:
-            return json.dumps({
-                "error": "soundfile not installed (required to write .wav)",
-                "engine": "neutts_air",
-            })
+            ref_codes = state['model'].encode_reference(ref_wav)
+        except Exception as e:
+            return {
+                'error': f"Reference encode failed: {type(e).__name__}: {e}",
+                'engine': 'neutts_air',
+                'transient': False,
+            }
+        cached = (ref_codes, ref_text)
+        cache[voice] = cached
+        state['ref_cache'] = cache
+    ref_codes, ref_text = cached
 
-        # Compute duration from the array length / sample rate
-        try:
-            import numpy as np
-            arr = np.asarray(wav)
-            duration = len(arr) / sample_rate
-        except Exception:
-            duration = 0.0
-
-        elapsed_ms = int((_time.monotonic() - _t0) * 1000)
-        logger.info(
-            f"neutts_air synthesized {len(text)}ch → {output_path} "
-            f"(sr={sample_rate}Hz, dur={duration:.2f}s, voice={voice}, "
-            f"latency={elapsed_ms}ms)"
-        )
-        return json.dumps({
-            "path": output_path,
-            "duration": round(duration, 2),
-            "sample_rate": sample_rate,
-            "voice": voice,
-            "engine": "neutts_air",
-        })
-
-    except ImportError as e:
-        logger.info(
-            f"NeuTTS not installed (pip install neutts to enable): {e}"
-        )
-        return json.dumps({
-            "error": f"neutts not installed: {e}",
-            "engine": "neutts_air",
-        })
+    try:
+        wav = state['model'].infer(text, ref_codes, ref_text)
     except Exception as e:
-        logger.warning(f"NeuTTS synthesis failed: {e}")
-        return json.dumps({
-            "error": f"{type(e).__name__}: {e}",
-            "engine": "neutts_air",
-        })
+        # Surface as transient ONLY for likely-recoverable error modes
+        # (CUDA OOM, runtime allocation).  Default to non-transient so
+        # the TTS ladder doesn't waste cycles re-trying neutts on a
+        # deterministic failure (bad weights, missing codec, etc.).
+        msg = str(e).lower()
+        transient = any(t in msg for t in (
+            'out of memory', 'cuda', 'device-side assert',
+        ))
+        return {
+            'error': f"{type(e).__name__}: {e}",
+            'engine': 'neutts_air',
+            'transient': transient,
+        }
+
+    # Write WAV via soundfile — required dep listed in pip_install_plan.
+    try:
+        import numpy as np
+        import soundfile as sf
+    except ImportError as e:
+        return {
+            'error': f"required dep missing: {e}",
+            'engine': 'neutts_air',
+            'transient': False,
+        }
+
+    try:
+        arr = np.asarray(wav)
+        sf.write(output_path, arr, sample_rate)
+        duration = len(arr) / sample_rate
+    except Exception as e:
+        return {
+            'error': f"WAV write failed: {type(e).__name__}: {e}",
+            'engine': 'neutts_air',
+            'transient': False,
+        }
+
+    return {
+        'path': output_path,
+        'duration': round(float(duration), 2),
+        'sample_rate': sample_rate,
+        'engine': 'neutts_air',
+        'device': state.get('device', 'cpu'),
+        'voice': voice,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Parent-side: one ToolWorker instance + canonical public functions
+# ═══════════════════════════════════════════════════════════════
+
+# NeuTTS Air on CPU produces RTF<0.5 → for a 10-word utterance, the
+# subprocess needs ~3-5s warm + ~1-2s synth.  Q4 GGUF model load is
+# the slow part; once loaded subsequent calls are quick.  Match the
+# kokoro / chatterbox shape for budgets.
+_tool = ToolWorker(
+    tool_name='neutts_air',
+    tool_module='integrations.service_tools.neutts_tool',
+    vram_budget='tts_neutts',
+    output_subdir='neutts/output',
+    engine='neutts-air',
+    startup_timeout=120.0,   # GGUF Q4 (~600MB) cold-start on CPU
+    request_timeout=60.0,    # CPU synth dominated by RTF, generous
+)
+
+
+def neutts_synthesize(
+    text: str,
+    language: str = 'en',
+    voice: Optional[str] = None,
+    output_path: Optional[str] = None,
+) -> str:
+    """Synthesize text to speech using NeuTTS Air (English only).
+
+    Forwards through ``_tool.synthesize`` which runs the actual model
+    in a subprocess.  On worker crash / model error the result JSON
+    contains ``{error: ..., transient: bool}`` so the TTS ladder
+    traverses past us to the next engine (kokoro / piper).
+
+    Args:
+        text: Text to synthesize.
+        language: ISO code — only 'en' is supported (NeuTTS Air is
+            English-only).  Accepted-and-ignored for ladder symmetry
+            with multi-lang engines; the actual model has no
+            language switch.
+        voice: 'jo' (upstream sample, default), a path to a .wav
+            (with companion .txt transcript), or a custom name in
+            ``~/.hevolve/models/tts/neutts/voices/``.
+        output_path: Optional output .wav path.  Auto-generated under
+            ``~/.hevolve/models/tts/neutts/output/`` when None.
+
+    Returns:
+        JSON string — see ``_synthesize`` return shape.
+    """
+    return _tool.synthesize(
+        text=text,
+        language='en',                    # NeuTTS is English-only
+        voice=voice or 'jo',
+        output_path=output_path,
+    )
 
 
 def neutts_list_voices() -> str:
     """List available NeuTTS reference voices.
 
-    Returns built-in upstream samples plus any user-cloned voices in
-    ~/.hevolve/models/tts/neutts/voices/.
+    Inspects upstream-bundled samples + the user's persistent voices
+    dir.  No subprocess needed — reads filesystem only.
     """
     voices = []
 
     # 1. Built-in upstream samples (only listable if neutts package
     # is installed AND its samples/ dir is present).
     try:
-        import neutts
+        import neutts  # noqa: F401
         pkg_dir = Path(neutts.__file__).parent
         samples_dir = pkg_dir / 'samples'
         if samples_dir.is_dir():
@@ -327,7 +385,8 @@ def neutts_list_voices() -> str:
                     "language": "en",
                 })
 
-    # Engine availability
+    # Engine availability (probes the parent — the venv-routed import
+    # may not surface here; the subprocess's _load is the real probe).
     try:
         import neutts  # noqa: F401
         engine = "neutts_air"
@@ -337,21 +396,9 @@ def neutts_list_voices() -> str:
     return json.dumps({"voices": voices, "engine": engine})
 
 
-def unload_neutts():
-    """Unload NeuTTS model + reference cache to free memory."""
-    global _tts_model, _ref_codes_cache
-    _tts_model = None
-    _ref_codes_cache.clear()
-
-    try:
-        from .vram_manager import clear_cuda_cache
-        clear_cuda_cache()
-    except Exception:
-        pass
-
-    import gc
-    gc.collect()
-    logger.info("NeuTTS model unloaded")
+def unload_neutts() -> None:
+    """Stop the NeuTTS worker subprocess and free its memory."""
+    _tool.stop()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -361,12 +408,9 @@ def unload_neutts():
 class NeuTTSAirTool:
     """Register NeuTTS Air as an in-process service tool.
 
-    Same shape as PocketTTSTool — runs in-process (no sidecar),
-    functions are registered directly as callables.  When the
-    neutts package isn't installed, the tool registers anyway and
-    returns clean {error: ...} JSON on every call so the catalog
-    sees the entry but the TTS ladder traverses past us at synth
-    time.
+    Same shape as KokoroTool — registers an entry in
+    ``service_tool_registry`` so the catalog UI shows the engine.
+    Synth itself goes through ``_tool.synthesize`` (subprocess).
     """
 
     @classmethod
@@ -412,10 +456,16 @@ class NeuTTSAirTool:
         service_tool_registry.register(tool_info)
 
 
-# Auto-register on import (matches pocket_tts_tool pattern).  The
-# registration is robust to neutts package absence — only synth
-# calls fail with clean JSON; the catalog entry stays.
+# Auto-register on import (matches kokoro_tool / chatterbox_tool
+# pattern).  The registration is robust to neutts package absence —
+# only synth subprocess calls fail with clean JSON; the catalog entry
+# stays so the admin UI can offer "Install NeuTTS Air".
 try:
     NeuTTSAirTool.register_functions()
 except Exception as _reg_err:
     logger.debug(f"NeuTTS tool registration skipped: {_reg_err}")
+
+
+# NOTE: no `if __name__ == '__main__':` block here.  The centralized
+# dispatcher at integrations.service_tools.gpu_worker imports this
+# module and calls `_load` / `_synthesize` directly when spawned.

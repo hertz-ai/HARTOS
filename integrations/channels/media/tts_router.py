@@ -378,6 +378,16 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         latency_cloud_ms=0,
         tool_module='integrations.service_tools.neutts_tool',
         tool_function='neutts_synthesize',
+        # Worker attribute — Nunba's `_SubprocessTTSBackend` needs this
+        # to drive the subprocess.  Without it the spec falls into the
+        # `_InProcessTTSBackend` path (line ~2408 of Nunba's tts_engine
+        # .py) which in turn does `import neutts` from the MAIN
+        # interpreter — a guaranteed ImportError because `install_target
+        # ='venv'` lands the package in the per-engine venv, not the
+        # main python-embed.  Setting `_tool` here pairs cleanly with
+        # the ToolWorker singleton in integrations.service_tools.neutts
+        # _tool, mirroring kokoro / chatterbox / f5 / indic_parler.
+        tool_worker_attr='_tool',
         required_package='neutts',
         # `neutts[all]` pulls llama-cpp-python (for GGUF inference)
         # plus soundfile + onnxruntime.  The base `neutts` package
