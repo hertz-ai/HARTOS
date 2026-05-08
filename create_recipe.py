@@ -1987,6 +1987,35 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
                         elif json_obj['status'].lower() == 'pending':
                             safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "verifier pending")
+                            # USER-INPUT GATE (code-level enforcement of the
+                            # prompt-level rule above):  if the verifier
+                            # explicitly returned `can_perform_without_user_input:
+                            # no` for this action, set a sticky flag on
+                            # user_tasks so the OUTER while loop in
+                            # create_recipe_pipeline can see "this action is
+                            # blocked on the user" and break out, returning
+                            # control to the user.  Without this flag, the
+                            # OUTER loop's pending-retry path (3 attempts)
+                            # gives the StatusVerifier multiple chances to
+                            # flip the gate to "yes" via prompt drift —
+                            # exactly the autonomous-bypass bug seen in the
+                            # 2026-05-08 langchain.log (Action 3 / Confirm
+                            # sitemap looped 8 iterations before
+                            # hallucinating user confirmation).
+                            try:
+                                _gate_value = (json_obj.get('can_perform_without_user_input') or '').strip().lower()
+                                if _gate_value.startswith('no'):
+                                    user_tasks[user_prompt]._needs_user_input_action_id = current_action_id
+                                    current_app.logger.info(
+                                        f"[USER-INPUT-GATE] Action {current_action_id} flagged "
+                                        f"as blocked on user input "
+                                        f"(can_perform_without_user_input={_gate_value!r}); "
+                                        f"OUTER loop will break and return control to user."
+                                    )
+                            except Exception as _gate_err:
+                                current_app.logger.debug(
+                                    f"[USER-INPUT-GATE] flag set failed (non-blocking): {_gate_err}"
+                                )
                             return assistant
                         elif json_obj['status'].lower() == 'requires_breakdown':
                             # Handle subtask breakdown request from StatusVerifier
@@ -2467,12 +2496,13 @@ def instantiate_status_verifier_agent(user_prompt):
         code_execution_config=False,
         system_message=""""You are a Status Verification Agent in a multi-agent system.
         AUTONOMOUS MODE: Prefer "completed" over "updated" or "pending". If the Assistant made a reasonable attempt (even simulated), mark "completed". Only use "updated" when the action definition itself needs changing. Do NOT return "updated" or "pending" just because user preferences are unknown — use sensible defaults.
+        USER-INPUT GATE (HARD RULE): If a previous turn for THIS action returned `can_perform_without_user_input: "no"` (explicitly marked as requiring user input — e.g. "Confirm sitemap with user", "Choose payment method", "Approve plan"), you MUST NOT flip it to `"yes"` and you MUST NOT mark `"status": "completed"` until the user has actually replied. The autonomous-mode preference for "completed" does NOT override an explicit user-input requirement. For these actions, return `"status": "pending"` and keep `can_perform_without_user_input: "no"` until a fresh user message arrives in the conversation. Hallucinating a user confirmation ("user confirmed the structure", "sitemap approved") when the user hasn't actually replied is a contract violation — the user's reply must be visibly present in the message history.
         Role: Track, validate and verify the status of actions performed by other agents. Respond strictly in JSON:
         Response formats:
-            1. Action Completed: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","can_perform_without_user_input":"yes by default. Only no when absolutely impossible (e.g. payment auth, physical access)","persona_name":"persona name","fallback_action": "Context-aware retry strategy. NEVER leave empty."}
+            1. Action Completed: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","can_perform_without_user_input":"yes by default. Only no when absolutely impossible (e.g. payment auth, physical access) OR when the action verbatim asks the user to choose/confirm/approve","persona_name":"persona name","fallback_action": "Context-aware retry strategy. NEVER leave empty."}
             2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "error details"}
             3. Action Updated: {"status": "updated","action": "current action text","updated_action": "updated text","action_id": 1/2/3...,"message": "why updated","persona_name":"persona name","fallback_action": "fallback strategy"}
-            4. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "what steps are pending"}
+            4. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "what steps are pending","can_perform_without_user_input":"yes/no — must match the prior turn's value if action verbatim asks for user input"}
             5. Requires Breakdown: {"status": "requires_breakdown","action": "current action","action_id": 1/2/3...,"reason": "why","subtasks": [{"subtask_id": "1.1","description": "subtask desc","depends_on": [],"can_perform_autonomously": true}]}
         Error Detection Rules:
             - HTTP 403/404/500/401, connection timeouts, permission denied = report "error" (not "pending")
@@ -3426,6 +3456,26 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             current_app.logger.info(f"[MSG-RECOVERY] Recovered {len(_chat_history)} messages from chat_instructor")
         current_app.logger.info(f"group_chat.messages len={len(group_chat.messages)}")
 
+        # USER-INPUT GATE clear (companion to the gate set in
+        # state_transition's pending handler):  this function is called
+        # from /chat once per user message, so the arrival of THIS call
+        # IS the user's reply.  Clear any sticky `_needs_user_input_action_id`
+        # flag set by a prior call so the OUTER loop doesn't break out
+        # before processing the new user input.
+        try:
+            if hasattr(user_tasks[user_prompt], '_needs_user_input_action_id'):
+                _prior_block = user_tasks[user_prompt]._needs_user_input_action_id
+                user_tasks[user_prompt]._needs_user_input_action_id = None
+                current_app.logger.info(
+                    f"[USER-INPUT-GATE] Clearing prior block on action "
+                    f"{_prior_block} — fresh /chat call indicates user has "
+                    f"replied; OUTER loop will resume normal iteration."
+                )
+        except Exception as _gate_clear_err:
+            current_app.logger.debug(
+                f"[USER-INPUT-GATE] flag clear failed (non-blocking): {_gate_clear_err}"
+            )
+
         # Main processing loop
         while_loop_iterations = 0
         max_iterations = 300  # Time-based: ~5s per iteration = ~25 min max
@@ -3442,6 +3492,37 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             json_obj = None  # Reset each iteration — set by state_transition JSON parse paths
 
             current_app.logger.info(f"WHILE LOOP ITERATION #{while_loop_iterations} , Current Action Id:{current_action_id}")
+
+            # USER-INPUT GATE (code-level enforcement):  if state_transition
+            # has flagged this action as blocked on user input
+            # (`can_perform_without_user_input: no`), break the OUTER loop
+            # immediately so control returns to the user.  Without this
+            # break the OUTER loop would keep re-executing the action and
+            # the StatusVerifier would eventually flip to `yes` via
+            # autonomous prompt drift, hallucinating a user confirmation
+            # that never happened (2026-05-08 incident: Action 3 looped 8
+            # iterations before fabricating "Sitemap structure confirmed"
+            # from a user who had only typed "create a website").  The
+            # flag is sticky per (user_prompt, action_id) — once set, the
+            # action stays blocked until a fresh /chat call provides a
+            # user reply (the /chat handler is responsible for clearing
+            # the flag when the user responds).
+            try:
+                _blocked_action_id = getattr(
+                    user_tasks[user_prompt], '_needs_user_input_action_id', None,
+                )
+                if _blocked_action_id is not None and _blocked_action_id == current_action_id:
+                    current_app.logger.info(
+                        f"[USER-INPUT-GATE] OUTER loop breaking at iteration "
+                        f"#{while_loop_iterations}: Action {current_action_id} is "
+                        f"flagged as needing user input.  Returning control to user; "
+                        f"the agent's question is in the assistant's last message."
+                    )
+                    break
+            except Exception as _gate_err:
+                current_app.logger.debug(
+                    f"[USER-INPUT-GATE] outer-loop gate check failed (non-blocking): {_gate_err}"
+                )
 
             # === LEDGER v2.0: Heartbeat + Budget/SLA using KNOWN state (not LLM) ===
             _ledger = user_ledgers.get(user_prompt)
