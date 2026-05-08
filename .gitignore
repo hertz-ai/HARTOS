@@ -37,6 +37,7 @@ test_stderr.txt
 
 # Build artifacts (setuptools / pip)
 *.egg-info/
+.eggs/
 dist/
 build/
 _site/
@@ -44,6 +45,10 @@ _site_test/
 site/
 hevolve_version.py
 hart_version.py
+
+# Test/benchmark runtime output dumps (regenerated on every run)
+tests/agent_test_results.json
+tests/vlm_benchmark_results.json
 
 # Root junk artifacts
 nul
