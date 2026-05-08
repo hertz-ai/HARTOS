@@ -628,6 +628,81 @@ class ToolMessageHandler:
                 messages[i]['content'] = ""
                 current_app.logger.info(f"FIXED: Replaced null content with empty string in message {i}")
 
+        # OPENAI API ROLE-ORDER GUARD (added 2026-05-08 after live evidence
+        # of chat 400 errors: "Cannot have 2 or more assistant messages
+        # at the end of the list").  Llama-server's OpenAI-compatible
+        # endpoint requires alternating user/assistant messages with no
+        # consecutive same-role pairs (especially at the tail).  Autogen's
+        # multi-agent loop emits empty assistant placeholders + back-to-back
+        # Assistant→Assistant chains during speaker selection (the
+        # 2026-05-08 langchain.log showed Message[7]=Assistant,
+        # Message[8]={"content":"","role":"assistant"}, Message[10]=Assistant
+        # — three consecutive assistants causing the 400).
+        #
+        # Fix:
+        #   1. Drop empty-content assistant messages that have no tool_calls
+        #      / function_call (they're autogen placeholders, not real
+        #      replies).
+        #   2. Coalesce consecutive same-role messages by joining their
+        #      content with two newlines, so a {Assistant, Assistant} pair
+        #      becomes a single Assistant with merged text.  Tool-call /
+        #      function-call carrying messages are preserved as-is so
+        #      they don't get silently dropped.
+        #
+        # This is purely defensive — if the upstream loop emits clean
+        # alternating messages, this is a no-op.  Surfaces dropped /
+        # merged events at INFO so future diagnoses are visible.
+        try:
+            cleaned: List[Dict] = []
+            for i, msg in enumerate(messages):
+                role = (msg.get('role') or '').lower()
+                content = msg.get('content')
+                has_calls = bool(msg.get('tool_calls') or msg.get('function_call'))
+                # Drop empty assistant placeholders (no content + no tool calls)
+                if role == 'assistant' and not has_calls:
+                    if content is None or (isinstance(content, str) and content.strip() == ''):
+                        current_app.logger.info(
+                            f"[ROLE-ORDER-GUARD] Dropping empty assistant "
+                            f"placeholder at index {i} (name="
+                            f"{msg.get('name','unknown')!r}) — autogen "
+                            f"speaker-selection artifact, would cause OpenAI "
+                            f"400 'Cannot have 2 or more assistant messages'."
+                        )
+                        continue
+                # Coalesce consecutive same-role messages
+                if cleaned:
+                    prev = cleaned[-1]
+                    prev_role = (prev.get('role') or '').lower()
+                    prev_has_calls = bool(prev.get('tool_calls') or prev.get('function_call'))
+                    if (prev_role == role
+                            and not prev_has_calls
+                            and not has_calls
+                            and isinstance(prev.get('content'), str)
+                            and isinstance(content, str)):
+                        merged = prev['content']
+                        if content.strip():
+                            merged = (merged + '\n\n' + content
+                                      if merged.strip() else content)
+                        prev['content'] = merged
+                        current_app.logger.info(
+                            f"[ROLE-ORDER-GUARD] Coalesced consecutive "
+                            f"role={role!r} messages at indices "
+                            f"{i-1}+{i} (would cause OpenAI 400 "
+                            f"alternation rule); merged content kept "
+                            f"in earlier slot."
+                        )
+                        continue
+                cleaned.append(msg)
+            messages = cleaned
+        except Exception as _guard_err:
+            # Never break the upstream pipeline — if the guard itself
+            # crashes, fall through with the original messages and let
+            # the API-level error (if any) surface as before.
+            current_app.logger.exception(
+                f"[ROLE-ORDER-GUARD] guard raised {type(_guard_err).__name__}: "
+                f"{_guard_err!s} — using messages as-is"
+            )
+
         return messages
 
     def remove_orphan_tool_messages(self, messages):
