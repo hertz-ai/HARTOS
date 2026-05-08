@@ -1198,7 +1198,7 @@ class ModelLifecycleManager:
                         self._models['llm'] = ModelState(
                             name='llm',
                             device=ModelDevice.GPU,  # Best-effort default
-                            priority=ModelPriority.PINNED,
+                            priority=ModelPriority.ACTIVE,
                             vram_gb=0.0,
                             ram_gb=0.0,
                             last_access_time=time.time(),
