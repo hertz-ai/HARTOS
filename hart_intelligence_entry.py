@@ -267,6 +267,7 @@ import pytz
 import hashlib
 from security.node_integrity import compute_code_hash, compute_file_manifest, verify_json_signature
 from security import master_key
+from core.platform_paths import get_coding_workspace_dir
 
 
 # --- Hevolve Boot Integrity Verification ---
@@ -5567,7 +5568,7 @@ if autogen is not None:
             name=f"user_proxy_{user_id}",
             human_input_mode="NEVER",
             is_termination_msg=_is_terminate_msg,
-            code_execution_config={"work_dir": "coding", "use_docker": False}
+            code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False}
         )
 
         return assistant, user_proxy

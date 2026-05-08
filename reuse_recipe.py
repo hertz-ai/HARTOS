@@ -191,6 +191,7 @@ user_simplemem = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_simpl
 # Mode-aware config_list: cloud/regional use external LLM, flat uses local
 # (user's wizard-configured endpoint via HEVOLVE_LOCAL_LLM_URL)
 from core.autogen_config import get_autogen_config_list
+from core.platform_paths import get_coding_workspace_dir
 config_list = get_autogen_config_list()
 
 # Per-request model config override (speculative execution, hive compute routing)
@@ -676,7 +677,7 @@ def create_agents_for_role(user_id: str, prompt_id):
             llm_config=llm_config,
             max_consecutive_auto_reply=10,
             is_termination_msg=_is_terminate_msg,
-            code_execution_config={"work_dir": "coding", "use_docker": False},
+            code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
             system_message=agent_prompt
         )
         user_proxy = autogen.UserProxyAgent(
@@ -690,7 +691,7 @@ def create_agents_for_role(user_id: str, prompt_id):
         helper = autogen.AssistantAgent(
             name="Helper",
             llm_config=llm_config,
-            code_execution_config={"work_dir": "coding", "use_docker": False},
+            code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
             system_message="""You Help the assistant agent to complete the task, you are helper agent not user/n
             if you get any request related you user redicrect that conversation to user don't asumer anything or answer anything on your own""",
             is_termination_msg=_is_terminate_msg,
@@ -1051,7 +1052,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
         is_termination_msg=_is_terminate_msg,
-        code_execution_config={"work_dir": "coding", "use_docker": False},
+        code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=agent_prompt
     )
 
@@ -1108,7 +1109,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     executor = autogen.AssistantAgent(
         name="Executor",
         llm_config=llm_config,
-        code_execution_config={"last_n_messages": 2, "work_dir": "coding", "use_docker": False},
+        code_execution_config={"last_n_messages": 2, "work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f'''You are a executor agent. focused solely on creating, running & debugging code.
             Your responsibilities:
             1. Follow the steps below to achieve the goal: {goal}.
@@ -2081,7 +2082,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
         is_termination_msg=_is_terminate_msg,
-        code_execution_config={"work_dir": "coding", "use_docker": False},
+        code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message="You are an helpful AI assistant used to perform time based tasks given to you. "
                        f"""You can refer below details to perform task:
             Actions: <actionsStart>{role_actions}<actionEnd>
@@ -2107,7 +2108,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     helper1 = autogen.AssistantAgent(
         name="Helper",
         llm_config=llm_config,
-        code_execution_config={"work_dir": "coding", "use_docker": False},
+        code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
             1. Follow the steps below to achieve the goal: {goal}.
             2. Use the provided Recipe for more details related to the actions.
@@ -2129,7 +2130,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     executor1 = autogen.AssistantAgent(
         name="Executor",
         llm_config=llm_config,
-        code_execution_config={"last_n_messages": 2, "work_dir": "coding", "use_docker": False},
+        code_execution_config={"last_n_messages": 2, "work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f'''You are a executor agent. focused solely on creating, running & debugging code.
             Your responsibilities:
             1. Follow the steps below to achieve the goal: {goal}.

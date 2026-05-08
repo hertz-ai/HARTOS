@@ -204,6 +204,7 @@ from integrations.expert_agents import (
     register_all_experts, get_expert_for_task,
     create_autogen_expert_wrapper, recommend_experts_for_dream
 )
+from core.platform_paths import get_coding_workspace_dir
 
 # Then add the 4 hooks to your get_response_group while loop
 # Then manually add the 4 hooks to your get_response_group while loop
@@ -2441,7 +2442,7 @@ def instantiate_executor_agent():
 
     executor = autogen.AssistantAgent(
         name="Executor",
-        code_execution_config={"last_n_messages": 2, "work_dir": "coding", "use_docker": False},
+        code_execution_config={"last_n_messages": 2, "work_dir": get_coding_workspace_dir(), "use_docker": False},
         llm_config=llm_config,
         system_message=f"""You are an Executor agent.
 {_executor_cultural}
@@ -2602,7 +2603,7 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
     assistant = autogen.AssistantAgent(
         name="Assistant",
         llm_config=llm_config,
-        code_execution_config={"last_n_messages": 2, "work_dir": "coding", "use_docker": False},
+        code_execution_config={"last_n_messages": 2, "work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f"""{'AUTONOMOUS MODE: Do NOT ask the user questions. Use sensible defaults. Complete actions immediately without clarification.' if autonomous else 'INTERACTIVE MODE: You may ask the user clarifying questions to understand their vision before proceeding.'}
         Plain ASCII only in code and output — no emoji or non-ASCII characters.
 
@@ -2697,7 +2698,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
         is_termination_msg=_is_terminate_msg,
-        code_execution_config={"work_dir": "coding", "use_docker": False},
+        code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message="You are an helpful AI assistant used to perform time based tasks given to you. "
         f"""You can refer below details to perform task:
             Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
@@ -2723,7 +2724,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1 = autogen.AssistantAgent(
         name="Helper",
         llm_config=llm_config,
-        code_execution_config={"work_dir": "coding", "use_docker": False},
+        code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
 {get_cultural_prompt()}
             1. Follow the steps below to achieve the goal: {goal}.
@@ -2746,7 +2747,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     executor1 = autogen.AssistantAgent(
         name="Executor",
         llm_config=llm_config,
-        code_execution_config={"last_n_messages":2,"work_dir": "coding", "use_docker": False},
+        code_execution_config={"last_n_messages":2,"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f'''You are a executor agent. focused solely on creating, running & debugging code.
             Your responsibilities:
             1. Follow the steps below to achieve the goal: {goal}.

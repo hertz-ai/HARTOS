@@ -9,6 +9,7 @@ except ImportError:
 
 from helper import retrieve_json, retrieve_json, _is_terminate_msg
 from cultural_wisdom import get_cultural_prompt
+from core.platform_paths import get_coding_workspace_dir
 # Store user-specific agents & their chat history
 user_agents: Dict[str, Tuple[Any, Any]] = {}
 
@@ -109,7 +110,7 @@ Your response must start with {{ and end with }}. Nothing else.
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
         is_termination_msg=_is_terminate_msg,
-        code_execution_config={"work_dir": "coding", "use_docker": False},
+        code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=system_message
     )
 

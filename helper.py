@@ -47,6 +47,7 @@ from core.config_cache import get_config as _get_config, get_visual_context_api
 from core.http_pool import get_http_session, pooled_post, pooled_get, pooled_request
 # Performance: singleton event loop
 from core.event_loop import get_or_create_event_loop
+from core.platform_paths import get_coding_workspace_dir
 
 config = _get_config()
 
@@ -1960,7 +1961,7 @@ def create_visual_agent(user_id,prompt_id):
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
         is_termination_msg=_is_terminate_msg,
-        code_execution_config={"work_dir": "coding", "use_docker": False},
+        code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message="You are an helpful AI assistant used to perform visual based tasks given to you. "
     )
 
@@ -1975,7 +1976,7 @@ def create_visual_agent(user_id,prompt_id):
     helper2 = autogen.AssistantAgent(
         name="Helper",
         llm_config=llm_config,
-        code_execution_config={"work_dir": "coding", "use_docker": False},
+        code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f"""You are Helper Agent. Help the visual_agent to complete the task:
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than ,Executor,multi_role_agent.
@@ -1993,7 +1994,7 @@ def create_visual_agent(user_id,prompt_id):
     executor2 = autogen.AssistantAgent(
         name="Executor",
         llm_config=llm_config,
-        code_execution_config={"last_n_messages":2,"work_dir": "coding", "use_docker": False},
+        code_execution_config={"last_n_messages":2,"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f'''You are a executor agent. focused solely on creating, running & debugging code.
             Your responsibilities:
             2. Use the provided Recipe for more details related to the actions.
