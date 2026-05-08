@@ -1098,11 +1098,24 @@ class ModelLifecycleManager:
         # Check LLM (llama.cpp) process — not managed by RTM
         try:
             self._check_llm_health(dead_models)
-        except Exception:
-            pass
+        except Exception as e:
+            # CRITICAL: previous code was `except Exception: pass` which
+            # silently masked LLM watchdog failures.  The user's "main LLM
+            # cannot die" rule requires every health-check failure to be
+            # visible in the log.  Log + traceback so the next iteration
+            # of root-cause work has signal instead of silence.
+            logger.exception(
+                f"[LLM-WATCHDOG] _check_llm_health raised {type(e).__name__}: "
+                f"{e!s} — main LLM health is now UNKNOWN; "
+                f"watchdog will retry on next tick"
+            )
 
         # Process each dead model
         for tool_name, exit_code, proc_type in dead_models:
+            logger.warning(
+                f"[LLM-WATCHDOG] Dead model queued for handling: "
+                f"tool={tool_name} exit_code={exit_code} proc_type={proc_type}"
+            )
             self._handle_dead_process(tool_name, exit_code, proc_type)
 
     def _check_llm_health(self, dead_models: list):
@@ -1119,8 +1132,34 @@ class ModelLifecycleManager:
         """
         with self._lock:
             state = self._models.get('llm')
-            if not state or state.device == ModelDevice.UNLOADED:
-                return
+        # The MAIN LLM is the system's primary engine — per the user's
+        # explicit "main LLM cannot die" invariant we MUST keep checking
+        # whether it is alive even when our local state thinks it is
+        # UNLOADED.  An UNLOADED state can come from:
+        #   (a) crash_count exceeded max → _handle_dead_process bailed out
+        #   (b) eviction under VRAM pressure
+        #   (c) a stale state from a prior boot where Nunba "adopted" an
+        #       externally-running server (server_process=None) and never
+        #       refreshed device when that adopted server died
+        # In every one of those cases, the previous early-return left the
+        # main engine permanently dead.  We instead log + continue, so
+        # the HTTP probe below can decide.
+        if not state:
+            logger.debug(
+                "[LLM-WATCHDOG] No 'llm' state registered yet — first boot? "
+                "Skipping this tick (lifecycle.start() will register state "
+                "once the catalog populates)."
+            )
+            return
+        if state.device == ModelDevice.UNLOADED:
+            logger.warning(
+                f"[LLM-WATCHDOG] state.device=UNLOADED — investigating "
+                f"whether the main engine should be re-loaded "
+                f"(crash_count={state.crash_count}, "
+                f"last_exit_code={state.last_exit_code}). "
+                f"Continuing health check despite UNLOADED — "
+                f"main LLM cannot stay dead."
+            )
 
         nunba_handled = False
         try:
@@ -1130,15 +1169,62 @@ class ModelLifecycleManager:
                 nunba_handled = True
                 exit_code = config.server_process.poll()
                 if exit_code is not None:
+                    logger.warning(
+                        f"[LLM-WATCHDOG] Nunba-spawned llama-server died: "
+                        f"PID={config.server_process.pid} "
+                        f"exit_code={exit_code}"
+                    )
                     dead_models.append(('llm', exit_code, 'llm_server'))
-            elif state.device != ModelDevice.UNLOADED:
-                # No process object but we think it's loaded — verify via HTTP
-                if not config.check_server_running():
+                else:
+                    logger.debug(
+                        f"[LLM-WATCHDOG] Nunba-spawned llama-server alive "
+                        f"PID={config.server_process.pid}"
+                    )
+            else:
+                # No Popen handle — either we adopted an external server, OR
+                # state thinks it's loaded but the spawning Python process
+                # already exited (handle gone with it).  Either way, an
+                # HTTP probe is the only authoritative signal.  We do NOT
+                # gate on `state.device != UNLOADED` here — the main LLM
+                # must be probed even when state is stale (see Bug B in
+                # the 2026-05-08 incident: adopt-then-die left the system
+                # half-alive because the watchdog stopped probing once
+                # state went UNLOADED).
+                alive = config.check_server_running()
+                if not alive:
+                    logger.warning(
+                        f"[LLM-WATCHDOG] Adopted/stateless llama-server is "
+                        f"UNREACHABLE via HTTP probe — queueing restart. "
+                        f"state.device={state.device.value} "
+                        f"server_port={config.config.get('server_port')}"
+                    )
                     dead_models.append(('llm', None, 'llm_server'))
+                    nunba_handled = True
                 else:
                     nunba_handled = True
-        except ImportError:
-            pass
+                    logger.debug(
+                        "[LLM-WATCHDOG] Adopted llama-server alive (HTTP 200)"
+                    )
+        except ImportError as e:
+            # Previous code: `except ImportError: pass` — silent.  Surface
+            # this as a log line so when Nunba is bundled-without-supervisor
+            # we can see the LlamaConfig path is unavailable and the G3
+            # direct-launch path below is being used by design.
+            logger.info(
+                f"[LLM-WATCHDOG] LlamaConfig import unavailable "
+                f"({e!s}) — falling through to G3 direct-launch supervision"
+            )
+        except Exception as e:
+            # Previous code only caught ImportError — a real LlamaConfig()
+            # instantiation error (e.g. corrupted llama_config.json,
+            # filesystem permission error) would propagate up and be
+            # swallowed by the outer except in _check_process_health.
+            # Log + re-raise so caller's CRITICAL log fires.
+            logger.exception(
+                f"[LLM-WATCHDOG] LlamaConfig health-check raised "
+                f"{type(e).__name__}: {e!s}"
+            )
+            raise
 
         # G3: Direct-launch supervision (fires when Nunba not in charge).
         if nunba_handled:
@@ -1213,7 +1299,32 @@ class ModelLifecycleManager:
                 self._max_backoff_s
             )
 
-            should_restart = state.crash_count <= self._max_crash_restarts
+            # MAIN LLM EXEMPTION (user invariant 2026-05-08):
+            # "the LLM is the main engine, it cannot die — we observe with
+            # watchdogs etc."  For every other tool we honor max_crash_restarts
+            # so a permanently-broken sidecar doesn't loop forever.  For 'llm'
+            # specifically, we keep retrying — but at the capped backoff
+            # interval (300s) so we don't burn CPU on a hopeless box.  The
+            # alternative (give up) leaves the system permanently degraded
+            # and was the root cause of the 2026-05-08 11:40 → 13:56+ silent
+            # outage.
+            if tool_name == 'llm':
+                should_restart = True
+                if state.crash_count > self._max_crash_restarts:
+                    # Past the configured ceiling — log loudly so on-call
+                    # sees the persistent failure, but keep trying at the
+                    # max backoff.  Reset crash_count to the ceiling so
+                    # restart_backoff_s stays clamped at _max_backoff_s.
+                    logger.error(
+                        f"[LLM-WATCHDOG] LLM has crashed {state.crash_count} "
+                        f"times (> max_crash_restarts={self._max_crash_restarts})"
+                        f" — continuing to retry every {self._max_backoff_s}s "
+                        f"because the main engine cannot stay dead. "
+                        f"Investigate llama-server log for repeated crash "
+                        f"cause."
+                    )
+            else:
+                should_restart = state.crash_count <= self._max_crash_restarts
 
         # Release VRAM allocation
         try:
@@ -1328,18 +1439,51 @@ class ModelLifecycleManager:
         Primary path: Nunba's LlamaConfig (reads ~/.nunba/llama_config.json).
         Fallback: direct subprocess launch (Docker/standalone without Nunba).
         """
+        logger.info(
+            f"[LLM-WATCHDOG] _restart_llm starting: mode={mode!r} "
+            f"(primary path: Nunba LlamaConfig.start_server)"
+        )
         # Primary: Nunba manages the server
         try:
             from llama.llama_config import LlamaConfig
             config = LlamaConfig()
+            logger.info(
+                f"[LLM-WATCHDOG] Calling LlamaConfig.stop_server() to clean "
+                f"up any half-alive server state before restart"
+            )
             config.stop_server()
             config.config['use_gpu'] = (mode == 'gpu')
             config._save_config()
-            return config.start_server()
+            logger.info(
+                f"[LLM-WATCHDOG] Calling LlamaConfig.start_server() "
+                f"(use_gpu={config.config['use_gpu']}, "
+                f"port={config.config.get('server_port')})"
+            )
+            ok = config.start_server()
+            if ok:
+                logger.info(
+                    f"[LLM-WATCHDOG] Nunba LLM restart SUCCEEDED on port "
+                    f"{config.config.get('server_port')}"
+                )
+            else:
+                logger.error(
+                    f"[LLM-WATCHDOG] Nunba LLM restart RETURNED FALSE "
+                    f"from start_server() — caller will re-queue with "
+                    f"backoff.  Check llama_server_<port>.log for the "
+                    f"underlying spawn failure."
+                )
+            return ok
         except ImportError:
-            logger.info("Nunba not available, using direct llama-server launch")
+            logger.info(
+                "[LLM-WATCHDOG] Nunba LlamaConfig not importable — "
+                "falling through to direct llama-server launch (G3 path)"
+            )
         except Exception as e:
-            logger.error(f"Nunba LLM restart failed: {e}")
+            logger.exception(
+                f"[LLM-WATCHDOG] Nunba LLM restart raised "
+                f"{type(e).__name__}: {e!s} — caller will re-queue with "
+                f"backoff"
+            )
             return False
 
         # Fallback: direct launch (Docker/standalone)
