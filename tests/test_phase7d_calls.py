@@ -1011,6 +1011,198 @@ def test_detach_agent_clears_tts_outbox(clean_bridge_outbox):
     assert dequeue_tts_text('call-1', 'agent-1') == []
 
 
+class _StubDBOnlyAgent:
+    """Minimal `db_session()` stub: User.query→agent succeeds; everything
+    else returns empty.  Reused by source_kind branch tests that only
+    need the agent lookup to succeed before exercising side-effect
+    delegation.  Mirrors the inline class in
+    test_router_source_kind_call_enqueues_tts (which kept it inline for
+    historical reasons; this top-level version is the single canonical
+    home for new callers)."""
+
+    def __init__(self, agent_id='agent-99'):
+        self._agent_id = agent_id
+
+    class _Q:
+        def __init__(self, agent):
+            self.agent = agent
+
+        def filter(self, *args, **kw):
+            return self
+
+        def first(self):
+            return self.agent
+
+    def query(self, model):
+        from integrations.social.models import User
+        if model is User:
+            agent = type('A', (), {'id': self._agent_id})()
+            return _StubDBOnlyAgent._Q(agent)
+        return _StubDBOnlyAgent._Q(None)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, *a, **kw):
+        class _R:
+            def fetchone(self_):
+                return None
+        return _R()
+
+
+def test_router_source_kind_external_room_delegates_to_response_router(
+        monkeypatch):
+    """source_kind='external_room' must hand off to the canonical
+    ChannelResponseRouter.route_response — no parallel outbound path
+    invented; just the one branch that delegates.  Verifies:
+      - the canonical router is called
+      - channel_context flows through unchanged (channel + chat_id)
+      - agent_id is forwarded so logging attributes the assistant turn
+      - default fan_out=False so the reply lands in the originating
+        room only (caller can flip via context['fan_out_external'])
+    """
+    from integrations import agentic_router
+    from integrations.channels.response import router as response_router_mod
+    from integrations.social import models as _models
+
+    monkeypatch.setattr(
+        _models, 'db_session',
+        lambda: _StubDBOnlyAgent(agent_id='agent-ext-1'))
+
+    captured = {}
+
+    class _StubResponseRouter:
+        def route_response(self, user_id, response_text,
+                           channel_context=None, agent_id=None,
+                           fan_out=True):
+            captured.update({
+                'user_id': user_id,
+                'response_text': response_text,
+                'channel_context': channel_context,
+                'agent_id': agent_id,
+                'fan_out': fan_out,
+            })
+
+    monkeypatch.setattr(
+        response_router_mod, 'get_response_router',
+        lambda registry=None: _StubResponseRouter())
+
+    agentic_router._post_agent_reply(
+        agent_id='agent-ext-1',
+        context={
+            'source_kind': 'external_room',
+            'source_id': 'conversation-entry-id-42',
+            'owner_id': 'user-7',
+            'channel_context': {
+                'channel': 'discord',
+                'chat_id': '987654321',
+                'sender_id': 'discord:user-99',
+                'sender_name': 'Aru',
+                'is_group': True,
+                'message_id': 'discord-msg-555',
+            },
+        },
+        reply_text='Hi from the agent — answering on Discord.',
+    )
+
+    assert captured, (
+        "ChannelResponseRouter.route_response was never called — the "
+        "external_room branch did not delegate to the canonical "
+        "outbound surface"
+    )
+    assert captured['response_text'].startswith('Hi from the agent')
+    assert captured['user_id'] == 'user-7'
+    assert captured['agent_id'] == 'agent-ext-1'
+    assert captured['channel_context']['channel'] == 'discord'
+    assert captured['channel_context']['chat_id'] == '987654321'
+    # Default fan_out is False — agent reply stays in the originating
+    # room unless the caller explicitly opts in.
+    assert captured['fan_out'] is False
+
+
+def test_router_source_kind_external_room_skips_when_context_missing(
+        monkeypatch):
+    """Defensive: if channel_context is empty / missing channel + chat_id,
+    the branch logs and returns rather than calling the router with bad
+    args.  Prevents adapter-misconfiguration from cascading into
+    ChannelRegistry exceptions."""
+    from integrations import agentic_router
+    from integrations.channels.response import router as response_router_mod
+    from integrations.social import models as _models
+
+    monkeypatch.setattr(
+        _models, 'db_session',
+        lambda: _StubDBOnlyAgent(agent_id='agent-ext-2'))
+
+    called = {'count': 0}
+
+    class _StubResponseRouter:
+        def route_response(self, **kwargs):
+            called['count'] += 1
+
+    monkeypatch.setattr(
+        response_router_mod, 'get_response_router',
+        lambda registry=None: _StubResponseRouter())
+
+    # No channel_context at all
+    agentic_router._post_agent_reply(
+        agent_id='agent-ext-2',
+        context={'source_kind': 'external_room',
+                 'source_id': 'ce-id'},
+        reply_text='should not be sent',
+    )
+    assert called['count'] == 0
+
+    # channel_context missing chat_id
+    agentic_router._post_agent_reply(
+        agent_id='agent-ext-2',
+        context={'source_kind': 'external_room',
+                 'source_id': 'ce-id',
+                 'channel_context': {'channel': 'discord'}},
+        reply_text='should not be sent either',
+    )
+    assert called['count'] == 0
+
+
+def test_router_source_kind_external_room_fan_out_opt_in(monkeypatch):
+    """Caller opts into bound-channel fan-out via
+    context['fan_out_external']=True — passes through to route_response
+    so the same reply goes to every bound channel for the user."""
+    from integrations import agentic_router
+    from integrations.channels.response import router as response_router_mod
+    from integrations.social import models as _models
+
+    monkeypatch.setattr(
+        _models, 'db_session',
+        lambda: _StubDBOnlyAgent(agent_id='agent-ext-3'))
+
+    captured = {}
+
+    class _StubResponseRouter:
+        def route_response(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        response_router_mod, 'get_response_router',
+        lambda registry=None: _StubResponseRouter())
+
+    agentic_router._post_agent_reply(
+        agent_id='agent-ext-3',
+        context={
+            'source_kind': 'external_room',
+            'source_id': 'ce-id',
+            'channel_context': {'channel': 'whatsapp', 'chat_id': '+1555'},
+            'fan_out_external': True,
+        },
+        reply_text='broadcast me everywhere',
+    )
+
+    assert captured.get('fan_out') is True
+
+
 def test_router_source_kind_call_enqueues_tts(clean_bridge_outbox,
                                                monkeypatch):
     """The new branch in agentic_router._post_agent_reply must push

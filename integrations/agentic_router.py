@@ -493,6 +493,53 @@ def _post_agent_reply(agent_id: str, context: Dict, reply_text: str):
                     logger.debug(
                         "dispatch_to_agent: meet_copilot emit "
                         "skipped (%s)", e)
+            elif source_kind == 'external_room':
+                # Adapter-bound rooms (Discord channel / WhatsApp group /
+                # Slack channel / Matrix room / Teams channel / etc.).
+                # The agent's reply text is destined for the SAME room
+                # the user wrote in.  Delegate to the canonical
+                # ``ChannelResponseRouter.route_response`` — it:
+                #   1. Logs the assistant turn to ConversationEntry.
+                #   2. Sends back to the originating channel via the
+                #      ChannelRegistry (each adapter's send_message).
+                #   3. Optionally fans out to other bound channels.
+                #   4. WAMP-notifies the user's desktop.
+                #
+                # Caller's ``context['channel_context']`` MUST carry
+                # ``{channel, chat_id, sender_id}`` — the same dict
+                # ``flask_integration._handle_message`` already builds
+                # for the legacy /chat path.  Reusing the same shape
+                # means a future migration can swap the legacy path
+                # over by changing one call site.
+                ch_ctx = context.get('channel_context') or {}
+                if not ch_ctx.get('channel') or not ch_ctx.get('chat_id'):
+                    logger.info(
+                        "dispatch_to_agent: source_kind='external_room' "
+                        "needs context['channel_context'] with "
+                        "{channel, chat_id}; got %r — skipping reply",
+                        ch_ctx)
+                    return
+                try:
+                    from integrations.channels.response.router import (
+                        get_response_router)
+                    get_response_router().route_response(
+                        user_id=context.get('owner_id') or agent.id,
+                        response_text=reply_text,
+                        channel_context=ch_ctx,
+                        agent_id=agent.id,
+                        # Fan-out is a caller decision — default False
+                        # so the agent reply lands in the originating
+                        # room only.  Callers that want bound-channel
+                        # broadcast can pass `fan_out_external=True` in
+                        # context.
+                        fan_out=bool(context.get('fan_out_external')),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "dispatch_to_agent: external_room reply via "
+                        "ChannelResponseRouter failed (channel=%s "
+                        "chat_id=%s): %s",
+                        ch_ctx.get('channel'), ch_ctx.get('chat_id'), e)
             else:
                 logger.info("dispatch_to_agent: source_kind=%s not yet "
                             "supported", source_kind)
