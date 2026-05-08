@@ -1145,13 +1145,81 @@ class ModelLifecycleManager:
         # main engine permanently dead.  We instead log + continue, so
         # the HTTP probe below can decide.
         if not state:
-            logger.debug(
-                "[LLM-WATCHDOG] No 'llm' state registered yet — first boot? "
-                "Skipping this tick (lifecycle.start() will register state "
-                "once the catalog populates)."
-            )
-            return
-        if state.device == ModelDevice.UNLOADED:
+            # STATELESS PROBE PATH (added 2026-05-08 after live evidence
+            # showed llama-server died at 18:47 and the watchdog was blind
+            # because Nunba's LlamaConfig.start_server() spawns the server
+            # outside RuntimeToolManager — so RTM's `_on_tool_started('llm')`
+            # callback never fires and `self._models['llm']` stays absent).
+            # Even without a registered state we MUST keep the main engine
+            # alive: probe llama-server via Nunba's LlamaConfig directly,
+            # and if it's down, queue a restart via the existing
+            # `_handle_dead_process` path (which will re-spawn via
+            # `LlamaConfig.start_server`).  The fake state we synthesize
+            # here lives only inside `_handle_dead_process` (it reads
+            # state.crash_count etc.), so we register a minimal one
+            # before queueing.
+            try:
+                from llama.llama_config import LlamaConfig
+                _cfg = LlamaConfig()
+                if not _cfg.check_server_running():
+                    logger.warning(
+                        f"[LLM-WATCHDOG] STATELESS-PROBE: llama-server "
+                        f"unreachable on port "
+                        f"{_cfg.config.get('server_port')!r} and no 'llm' "
+                        f"state registered with lifecycle.  Registering a "
+                        f"minimal state and queueing restart so the main "
+                        f"engine cannot stay dead silently."
+                    )
+                    # Register a minimal state so _handle_dead_process can
+                    # update crash_count + restart_backoff etc.
+                    with self._lock:
+                        self._models['llm'] = ModelState(
+                            name='llm',
+                            device=ModelDevice.UNLOADED,
+                            priority=ModelPriority.IDLE,
+                            vram_gb=0.0,
+                            ram_gb=0.0,
+                            last_access_time=time.time(),
+                            crash_count=0,
+                            pressure_evict_only=True,
+                        )
+                    dead_models.append(('llm', None, 'stateless_probe'))
+                    return
+                else:
+                    # Healthy but unregistered — register state lazily so
+                    # subsequent ticks take the fast path with full info.
+                    logger.info(
+                        f"[LLM-WATCHDOG] STATELESS-PROBE: llama-server is "
+                        f"alive on port {_cfg.config.get('server_port')!r} "
+                        f"but had no registered state — registering now so "
+                        f"future ticks can supervise it."
+                    )
+                    with self._lock:
+                        self._models['llm'] = ModelState(
+                            name='llm',
+                            device=ModelDevice.GPU,  # Best-effort default
+                            priority=ModelPriority.PINNED,
+                            vram_gb=0.0,
+                            ram_gb=0.0,
+                            last_access_time=time.time(),
+                            crash_count=0,
+                            pressure_evict_only=True,
+                        )
+                    return
+            except ImportError:
+                logger.debug(
+                    "[LLM-WATCHDOG] No 'llm' state and LlamaConfig not "
+                    "importable (Docker / standalone mode) — relying on "
+                    "G3 direct-launch supervision below."
+                )
+            except Exception as e:
+                logger.exception(
+                    f"[LLM-WATCHDOG] STATELESS-PROBE raised "
+                    f"{type(e).__name__}: {e!s} — main engine health is "
+                    f"now UNKNOWN; will retry on next tick"
+                )
+                return
+        if state and state.device == ModelDevice.UNLOADED:
             logger.warning(
                 f"[LLM-WATCHDOG] state.device=UNLOADED — investigating "
                 f"whether the main engine should be re-loaded "
