@@ -3325,23 +3325,54 @@ def _handle_request_resource(input_text: str) -> str:
     )
 
 
+# Module-level cache for the google-search tool list.  Process-wide
+# memoization captured 2026-05-08 after observing
+# ``get_tools(is_first=True)`` taking 33.4s in casual_conv hot path —
+# the slow step is ``load_tools(["google-search"])`` which triggers
+# the LangChain GoogleSearchAPIWrapper import chain + env-var probe
+# for ``GOOGLE_API_KEY`` / ``GOOGLE_CSE_ID`` on every call.  The
+# return value is invariant per-process (env doesn't change at
+# runtime, the wrapper class doesn't reload), so caching collapses
+# the cost from 33s+ to ~zero on the second call onward.  Design
+# intent ("casual_conv → minimal tool set in ~2.5s") preserved —
+# we just stop rebuilding the same answer on every chat turn.
+_GOOGLE_SEARCH_TOOLS_CACHE: list | None = None
+_GOOGLE_SEARCH_CACHE_LOCK = threading.Lock()
+
+
 def _safe_load_google_search():
     """Load google-search tool, returning empty list if package is missing.
+
+    Memoized per-process — see ``_GOOGLE_SEARCH_TOOLS_CACHE`` above
+    for the full rationale.  Result is invariant under runtime env
+    changes (env vars are read once at LangChain wrapper init); a
+    config change requires a process restart anyway.
 
     In bundled/flat mode (NUNBA_BUNDLED=1 or HEVOLVE_NODE_TIER=flat),
     the Google API key is expected to be missing — log at DEBUG instead
     of WARNING so the log doesn't fill with noise every request. On
     cloud/regional tiers, a missing key IS a warning worth surfacing.
     """
-    try:
-        return load_tools(["google-search"])
-    except (ImportError, Exception) as e:
-        _bundled = os.environ.get('NUNBA_BUNDLED') or os.environ.get('HEVOLVE_NODE_TIER', 'flat') == 'flat'
-        if _bundled:
-            logging.debug(f"Google Search tool unavailable (expected in local mode): {e}")
-        else:
-            logging.warning(f"Google Search tool unavailable: {e}")
-        return []
+    global _GOOGLE_SEARCH_TOOLS_CACHE
+    # Fast path — uncontended read after the first call.
+    if _GOOGLE_SEARCH_TOOLS_CACHE is not None:
+        return _GOOGLE_SEARCH_TOOLS_CACHE
+    with _GOOGLE_SEARCH_CACHE_LOCK:
+        # Double-check inside the lock so concurrent first-callers
+        # don't both pay the load_tools cost.
+        if _GOOGLE_SEARCH_TOOLS_CACHE is not None:
+            return _GOOGLE_SEARCH_TOOLS_CACHE
+        try:
+            result = load_tools(["google-search"])
+        except (ImportError, Exception) as e:
+            _bundled = os.environ.get('NUNBA_BUNDLED') or os.environ.get('HEVOLVE_NODE_TIER', 'flat') == 'flat'
+            if _bundled:
+                logging.debug(f"Google Search tool unavailable (expected in local mode): {e}")
+            else:
+                logging.warning(f"Google Search tool unavailable: {e}")
+            result = []
+        _GOOGLE_SEARCH_TOOLS_CACHE = result
+        return result
 
 
 def _with_tool_logging(func, tool_name):
