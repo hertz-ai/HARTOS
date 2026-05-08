@@ -2950,7 +2950,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         max_round=10,
         select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition1,  # using an LLM to decide
-        allow_repeat_speaker=True,  # Prevent same agent speaking twice
+        allow_repeat_speaker=False,  # Prevent same agent speaking twice (back-to-back assistant messages cause llama-server 400)
         send_introductions=False,
         role_for_select_speaker_messages='user',
     )
