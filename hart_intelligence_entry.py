@@ -3398,9 +3398,45 @@ def _with_tool_logging(func, tool_name):
     return wrapper
 
 
+# Per-(user, prompt) cache for the casual_conv `is_first=True` tool
+# list.  Captured 2026-05-08 after observing 33.4s on every casual
+# chat turn in the bundled env — the heavy steps inside this branch
+# (LangChain ``load_tools(['google-search'])`` wrapper init + 30
+# hardcoded Tool() objects + service_tool_registry +
+# system_introspect + skill_registry + provider_gateway) have NO
+# per-call variation once the process is up.  Per-user memory tools
+# bind to the live MemoryGraph object, so caching the tool function
+# is safe: the function queries the graph at CALL time, not at
+# build time, so newly added memories are still visible.
+#
+# Bounded to 32 entries (typical max sessions per Nunba install) +
+# FIFO eviction so a long-running instance never grows unbounded.
+# Design-intent preserved per
+# `tts_engine.py:5722-5729` comment: casual_conv still gets the
+# minimal tool set, just memoized so the build cost is paid ONCE
+# per (user, prompt) pair instead of every chat turn.
+_FIRST_TOOLS_CACHE: dict[str, list] = {}
+_FIRST_TOOLS_CACHE_MAX = 32
+_FIRST_TOOLS_CACHE_LOCK = threading.Lock()
+
+
 def get_tools(req_tool, is_first: bool = False):
 
     if is_first:
+        # Per-(user, prompt) memoization — see _FIRST_TOOLS_CACHE
+        # docstring above.  thread_local_data may be unset in
+        # degraded/test contexts; fall through to a non-cached
+        # build in that case.
+        _cache_key = None
+        try:
+            _uid = thread_local_data.get_user_id()
+            _pid = thread_local_data.get_prompt_id()
+            _cache_key = f"{_uid}:{_pid}"
+        except Exception:
+            _cache_key = None
+        if _cache_key and _cache_key in _FIRST_TOOLS_CACHE:
+            return _FIRST_TOOLS_CACHE[_cache_key]
+
         tools = _safe_load_google_search()
         tool = [
 
@@ -3776,6 +3812,22 @@ def get_tools(req_tool, is_first: bool = False):
                 t.func = _with_tool_logging(t.func, t.name)
             elif hasattr(t, '_run') and callable(t._run):
                 t._run = _with_tool_logging(t._run, t.name)
+
+        # Memoize the wrapped result for this (user, prompt) so the
+        # next casual_conv chat turn returns in micro-seconds instead
+        # of re-burning the 30s registry/skills/provider build.
+        # Bounded FIFO eviction keeps memory flat under heavy
+        # multi-session usage; the per-user MemoryGraph queried by
+        # cached memory-tool functions stays live (lookups happen at
+        # call time, not build time).
+        if _cache_key:
+            with _FIRST_TOOLS_CACHE_LOCK:
+                if (
+                    len(_FIRST_TOOLS_CACHE) >= _FIRST_TOOLS_CACHE_MAX
+                    and _cache_key not in _FIRST_TOOLS_CACHE
+                ):
+                    _FIRST_TOOLS_CACHE.pop(next(iter(_FIRST_TOOLS_CACHE)))
+                _FIRST_TOOLS_CACHE[_cache_key] = tools
         return tools
 
     else:
