@@ -940,10 +940,17 @@ Hidden=false
             r = _run(['which', engine], timeout=2)
             if r and r.returncode == 0:
                 try:
-                    proc = subprocess.Popen(
-                        [engine, '--', path],
+                    # Hide Windows console window on cross-platform engines
+                    # (mpv/vlc on Windows pop a cmd window for stdout
+                    # otherwise).  No-op on macOS/Linux.  Same idiom used
+                    # by livekit_supervisor and diarization_service.
+                    _popen_kw = dict(
                         stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL)
+                        stderr=subprocess.DEVNULL,
+                    )
+                    if os.name == 'nt':
+                        _popen_kw['creationflags'] = subprocess.CREATE_NO_WINDOW
+                    proc = subprocess.Popen([engine, '--', path], **_popen_kw)
                     with _player_lock:
                         _player_proc['pid'] = proc.pid
                         _player_proc['path'] = path

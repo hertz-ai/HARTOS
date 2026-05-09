@@ -583,13 +583,22 @@ class _Supervisor:
             try:
                 cmd = [str(self.binary), '--config', str(self.config)]
                 logger.info("livekit_supervisor: spawning %s", ' '.join(cmd))
+                # Windows: hide the cmd console window — the supervisor
+                # already streams stdout to logger.info above, so the
+                # native console adds no value but pops a visible window
+                # for every supervised tick.  CREATE_NO_WINDOW (0x08000000)
+                # is the same flag used by Nunba's cx_Freeze launchers and
+                # model_lifecycle._launch_llama_server_direct (see
+                # _popen_kwargs there).  No-op on non-Windows.
+                _popen_kwargs = dict(
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    cwd=str(_livekit_home()),
+                )
+                if os.name == 'nt':
+                    _popen_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
                 with self.lock:
-                    self.proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        cwd=str(_livekit_home()),
-                    )
+                    self.proc = subprocess.Popen(cmd, **_popen_kwargs)
                     self.last_started = time.time()
                 # Stream output to logger so operators see what's happening
                 # without needing to tail the binary's own log file.
