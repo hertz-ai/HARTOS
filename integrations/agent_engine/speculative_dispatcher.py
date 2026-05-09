@@ -28,7 +28,7 @@ from collections import deque
 
 from core.port_registry import get_port
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger('hevolve_social')
 
@@ -351,9 +351,36 @@ class SpeculativeDispatcher:
                 'delegate': 'none', 'error': gate_error, 'expert_pending': False,
             }
 
-        # ── 2. Dispatch the draft with the classifier prompt ──
+        # ── 2. Load recent conversation history (best-effort, non-fatal) ──
+        # Single source of truth — same seed_autogen_from_shared_history the
+        # autogen GroupChat uses.  Without this the draft sees each turn as
+        # first-contact and emits generic greetings for follow-ups (witnessed
+        # 2026-05-09 09:35 — user asked about WhatsApp at 09:34 then "what's
+        # happening?" at 09:35; draft replied with a generic "Nothing
+        # unusual…" because it had no memory of the WhatsApp turn 60s prior).
+        # Cap at 4 messages — the 0.8B context budget can't fit more without
+        # crowding out the answering rules + JSON schema.
+        recent_turns: List[Dict] = []
+        try:
+            from integrations.channels.memory.shared_history import (
+                seed_autogen_from_shared_history)
+            recent_turns = seed_autogen_from_shared_history(
+                user_id, max_messages=4) or []
+            # Drop the most recent turn if it duplicates the current prompt
+            # (the writer hook in get_response_group / chatbot_routes may
+            # have persisted this turn before the draft dispatch starts).
+            if (recent_turns
+                    and (recent_turns[-1].get('content') or '').strip()
+                        == prompt.strip()):
+                recent_turns = recent_turns[:-1]
+        except Exception as _hist_err:
+            logger.debug(f"draft history load failed: {_hist_err}")
+            recent_turns = []
+
+        # ── 3. Dispatch the draft with the classifier prompt ──
         draft_prompt = self._build_draft_classifier_prompt(
-            prompt, agent_persona=agent_persona, preferred_lang=preferred_lang)
+            prompt, agent_persona=agent_persona, preferred_lang=preferred_lang,
+            recent_turns=recent_turns)
         start = time.time()
         draft_raw = self._dispatch_to_model(
             draft_model, draft_prompt, user_id, prompt_id, goal_type, goal_id)
@@ -655,6 +682,7 @@ class SpeculativeDispatcher:
     def _build_draft_classifier_prompt(
         self, user_prompt: str, agent_persona: Optional[str] = None,
         preferred_lang: str = 'en',
+        recent_turns: Optional[List[Dict]] = None,
     ) -> str:
         """Wrap the user prompt with the draft-first classifier instruction.
 
@@ -666,6 +694,14 @@ class SpeculativeDispatcher:
         so the draft's reply is in the voice of the custom / system agent
         the user is talking to instead of a generic first-responder. Used
         for the Path-2 system-agent case (e.g. Nunba personality agent).
+
+        If ``recent_turns`` is provided, prior conversation context is
+        rendered as a "Recent conversation" block before the current user
+        prompt so the draft can answer follow-ups in context (e.g. user
+        asks "what's happening?" 60s after asking about WhatsApp — without
+        history the draft would treat each turn as first-contact and emit
+        a generic greeting).  Capped at 4 turns to fit the 0.8B context
+        budget; oldest first; long messages are truncated to 400 chars.
 
         Owns ONLY prompt construction — no I/O, no side effects.
         """
@@ -729,6 +765,35 @@ class SpeculativeDispatcher:
             if cap_summary else ""
         )
 
+        # Recent conversation context — single source via
+        # seed_autogen_from_shared_history (the autogen path uses the same
+        # call), formatted into a flat User:/Assistant: transcript so the
+        # 0.8B can read follow-ups in context.  Capped at 4 turns + 400
+        # chars/turn to fit the draft's context budget.
+        history_block = ""
+        if recent_turns:
+            _hist_lines = []
+            for _turn in recent_turns[-4:]:
+                _role = _turn.get('role') or ''
+                _content = (_turn.get('content') or '').strip()
+                if not _content:
+                    continue
+                if len(_content) > 400:
+                    _content = _content[:400] + '…'
+                if _role == 'user':
+                    _hist_lines.append(f"User: {_content}")
+                elif _role == 'assistant':
+                    _hist_lines.append(f"Assistant: {_content}")
+            if _hist_lines:
+                history_block = (
+                    "Recent conversation (oldest first; use this to "
+                    "interpret the user's current message in context — "
+                    "follow-ups like 'what's happening?' or 'why?' refer "
+                    "back to these turns):\n"
+                    + "\n".join(_hist_lines)
+                    + "\n\n"
+                )
+
         return (
             persona_block
             + lang_block
@@ -788,7 +853,8 @@ class SpeculativeDispatcher:
             "runs.\n"
             "- Refusals are not your call.  If you ever feel the urge to "
             "refuse: pick a standby instead and delegate.\n\n"
-            f"User: {user_prompt}\n\n"
+            + history_block
+            + f"User: {user_prompt}\n\n"
             "Respond with ONE JSON object on a single line and NOTHING else:\n"
             '{"reply": "<your short reply to the user, 1-3 sentences>", '
             '"delegate": "none" OR "local" OR "hive", '
