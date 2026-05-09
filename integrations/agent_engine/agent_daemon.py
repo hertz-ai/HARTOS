@@ -665,7 +665,18 @@ class AgentDaemon:
                 # Build prompt using registered builder (guardrail: togetherness rewrite)
                 prompt = GoalManager.build_prompt(goal.to_dict(), product_dict)
                 if prompt is None:
-                    logger.warning(f"Goal {goal.id}: build_prompt returned None (guardrails unavailable?), skipping")
+                    # build_prompt returns None when EITHER:
+                    #   (a) the registered builder declined the goal (e.g.,
+                    #       robot goal on a non-robot host) — the builder
+                    #       logs its own reason at INFO; OR
+                    #   (b) hive_guardrails import failed in 'hard' mode —
+                    #       build_prompt logs CRITICAL itself.
+                    # In both cases the meaningful signal is upstream; this
+                    # is just dispatch-loop bookkeeping.  DEBUG avoids the
+                    # 28-per-8h chronic WARNING noise observed in production
+                    # (seeded robot goals on hardware-less hosts) and the
+                    # historical misattribution to "guardrails unavailable".
+                    logger.debug(f"Goal {goal.id}: build_prompt returned None, skipping")
                     continue
 
                 # BUDGET PRE-CHECK: read-only check before dispatch.
