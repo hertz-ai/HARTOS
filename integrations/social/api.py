@@ -872,6 +872,39 @@ def sync_deltas():
         tenant_id=getattr(g, 'tenant_id', None)))
 
 
+@social_bp.route('/sync/inbox', methods=['GET'])
+@require_auth
+@requires_flag('sync_v1', else_value={'cursor': '0', 'has_more': False, 'rows': []})
+def sync_inbox():
+    """Flattened unified-inbox view layered on top of /sync.
+
+    Same cursor + flag-gate as /sync.  Returns a single chronologically-
+    sorted list of InboxRow dicts (messages, mentions, invites, friend
+    requests, notifications) — what every client renders directly.
+
+    Pure additive — calls SyncService.deltas internally; no new SQL
+    path, no behavior change for /sync callers.
+
+    Query params:
+      since   opaque cursor from previous response (default = full
+              backfill from epoch).
+      limit   per-kind row cap (1..200, default 50).
+
+    Response shape:
+      { cursor: '<next>', has_more: bool, rows: [InboxRow, ...] }
+    """
+    since = request.args.get('since')
+    try:
+        limit = max(1, min(int(request.args.get('limit', 50)), 200))
+    except (TypeError, ValueError):
+        limit = 50
+    from .sync_service import SyncService
+    return _ok(SyncService.inbox_rows(
+        g.db, user_id=g.user.id, since=since,
+        limit_per_kind=limit,
+        tenant_id=getattr(g, 'tenant_id', None)))
+
+
 @social_bp.route('/users/autocomplete', methods=['GET'])
 @require_auth
 def autocomplete_users():
