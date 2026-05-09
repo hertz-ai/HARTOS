@@ -220,7 +220,12 @@ def run_install(cmd):
     # First ensure pip is available
     ensurepip_cmd = [sys.executable, "-m", "ensurepip", "--upgrade"]
     try:
-        subprocess.run(ensurepip_cmd, capture_output=True, check=False)
+        from core.subprocess_safe import hidden_popen_kwargs
+        _hide = hidden_popen_kwargs()
+    except Exception:
+        _hide = {}
+    try:
+        subprocess.run(ensurepip_cmd, capture_output=True, check=False, **_hide)
     except Exception:
         pass  # Continue even if ensurepip fails
 
@@ -235,6 +240,7 @@ def run_install(cmd):
             universal_newlines=True,
             encoding=sys.stdout.encoding,
             errors="replace",
+            **_hide,
         )
         spinner = Spinner("Installing...")
 

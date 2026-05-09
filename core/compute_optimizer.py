@@ -712,9 +712,11 @@ class ComputeOptimizer:
             guid = schemes.get(profile, schemes['balanced'])
             try:
                 import subprocess
+                from core.subprocess_safe import hidden_popen_kwargs
                 subprocess.run(
                     ['powercfg', '/setactive', guid],
                     capture_output=True, timeout=10,
+                    **hidden_popen_kwargs(),
                 )
                 return f'set power scheme to {profile}'
             except Exception as e:

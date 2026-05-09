@@ -269,9 +269,13 @@ class Qwen3VLBackend:
         """Get OS window list with foreground/z-index info for grounding context."""
         try:
             import subprocess, platform
+            from core.subprocess_safe import hidden_popen_kwargs
+            _hide = hidden_popen_kwargs()
             _os = platform.system()
             if _os == 'Windows':
                 # Get foreground window title via PowerShell
+                # _hide adds CREATE_NO_WINDOW so the powershell child does
+                # not flicker a console window on every VLM probe.
                 _fg = subprocess.run(
                     ['powershell', '-NoProfile', '-Command',
                      'Add-Type @"\nusing System;\nusing System.Runtime.InteropServices;\n'
@@ -279,7 +283,7 @@ class Qwen3VLBackend:
                      '[DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder t, int c); }\n"@; '
                      '$h=[FG]::GetForegroundWindow(); $sb=New-Object System.Text.StringBuilder 256; '
                      '[void][FG]::GetWindowText($h,$sb,256); $sb.ToString()'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **_hide)
                 fg_title = _fg.stdout.strip() if _fg.returncode == 0 else ''
 
                 # Get all windows
@@ -287,7 +291,7 @@ class Qwen3VLBackend:
                     ['powershell', '-NoProfile', '-Command',
                      'Get-Process | Where-Object {$_.MainWindowTitle -ne ""} | '
                      'Select-Object ProcessName, MainWindowTitle | ConvertTo-Json'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **_hide)
                 if _r.returncode == 0:
                     _wins = json.loads(_r.stdout)
                     if isinstance(_wins, dict):
