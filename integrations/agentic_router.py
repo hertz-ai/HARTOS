@@ -299,6 +299,115 @@ def dispatch_to_agent(agent_id: str, prompt: str,
     ).start()
 
 
+def _dispatch_via_chat(agent_id: str, rewritten_prompt: str,
+                       context: Dict) -> Optional[str]:
+    """Reuse the canonical /chat endpoint instead of doing a raw
+    ``llm.invoke``.
+
+    /chat already runs the full agent runtime (autogen / langchain /
+    draft-first routing, persona via
+    ``agent_identity.build_identity_prompt``, dynamic per-agent tools,
+    multi-turn history) that ``flask_integration._handle_message`` has
+    used for 31-channel adapter inbound since 2026-01-31.  Social-
+    platform mention dispatch should use the same runtime — this
+    helper lets it.
+
+    Body shape mirrors what ``flask_integration._handle_message``
+    builds at line 150 so /chat sees the same payload regardless of
+    which caller dispatched.  Missing ``agent_id``/``prompt_id``/recipe
+    is the existing /chat fallback signal that routes to LangChain.
+
+    Transport is HTTP loopback to localhost via ``pooled_post`` — the
+    same connection-pooled transport ``flask_integration`` uses, so we
+    don't open a parallel HTTP client.  In every HARTOS deploy mode
+    (flat / regional / central / Docker / ISO / pip-installed server)
+    the HARTOS Flask app is reachable on its configured backend port,
+    so loopback is universally available.
+
+    Returns the agent reply text on success, or ``None`` on any failure
+    (chat unreachable, non-200, malformed response, missing
+    ``response`` field).  Caller falls back to raw ``llm.invoke`` so
+    agents still respond rather than going silent.
+
+    Behind the ``HEVOLVE_FLAG_DISPATCH_VIA_CHAT`` env flag — default
+    off, dormant until production verifies the /chat path for social-
+    platform agent dispatches.
+    """
+    try:
+        from core.http_pool import pooled_post
+    except Exception as e:
+        logger.warning("dispatch_via_chat: core.http_pool unavailable (%s)", e)
+        return None
+
+    try:
+        from core.constants import DEFAULT_USER_ID, DEFAULT_PROMPT_ID
+    except Exception:
+        DEFAULT_USER_ID, DEFAULT_PROMPT_ID = 10077, 8888
+
+    try:
+        from core.port_registry import get_port
+        port = get_port('backend')
+    except Exception:
+        port = int(os.environ.get('FLASK_PORT')
+                   or os.environ.get('HEVOLVE_BACKEND_PORT')
+                   or '5000')
+
+    body = {
+        'user_id': context.get('owner_id') or DEFAULT_USER_ID,
+        # /chat early-validation requires prompt_id key to exist —
+        # DEFAULT_PROMPT_ID is the social-platform fallback.  /chat's
+        # own logic resolves the actual recipe / persona for this
+        # dispatch from agent_id (when set) before falling back to the
+        # prompt_id default; this field is just the validation
+        # placeholder.
+        'prompt_id': context.get('prompt_id') or DEFAULT_PROMPT_ID,
+        'prompt': rewritten_prompt,
+        # agent_id is the social-platform agent's User.id — /chat uses
+        # this to load the persona via agent_identity, register tools,
+        # and route to the autogen runtime.  When absent /chat
+        # gracefully falls back to LangChain (per the existing check).
+        'agent_id': agent_id,
+        # Don't auto-create — social agents are pre-registered via
+        # UserService.register_agent at signup / onboarding time.
+        'create_agent': False,
+        # Forward the originating room context so /chat's response
+        # router can fan out to the right surface.
+        'channel_context': dict({
+            'source_kind': context.get('source_kind'),
+            'source_id': context.get('source_id'),
+        }, **(context.get('channel_context') or {})),
+    }
+
+    url = f"http://localhost:{port}/chat"
+    try:
+        resp = pooled_post(url, json=body, timeout=120)
+    except Exception as e:
+        logger.warning(
+            "dispatch_via_chat: pooled_post to %s failed: %s", url, e)
+        return None
+
+    if getattr(resp, 'status_code', 0) != 200:
+        logger.warning(
+            "dispatch_via_chat: /chat returned %s for agent=%s — body=%s",
+            getattr(resp, 'status_code', '?'),
+            agent_id,
+            (getattr(resp, 'text', '') or '')[:200])
+        return None
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        logger.warning(
+            "dispatch_via_chat: response not JSON for agent=%s: %s",
+            agent_id, e)
+        return None
+
+    reply = data.get('response') if isinstance(data, dict) else None
+    if not isinstance(reply, str) or not reply.strip():
+        return None
+    return reply.strip()
+
+
 def _dispatch_to_agent_worker(agent_id: str, prompt: str, context: Dict):
     """Worker body: guardrails → LLM → guardrails → post as Comment.
 
@@ -325,22 +434,61 @@ def _dispatch_to_agent_worker(agent_id: str, prompt: str, context: Dict):
         logger.warning("dispatch_to_agent: guardrails unavailable; "
                        "proceeding without pre-dispatch check (%s)", e)
 
-    # 2. Run prompt through the canonical LLM resolver.
-    try:
-        from core.safe_hartos_attr import safe_hartos_attr
-        get_llm = safe_hartos_attr('get_llm')
-        if get_llm is None:
-            logger.info("dispatch_to_agent: get_llm unresolved; "
-                        "agent=%s — runtime will pick up", agent_id)
+    # 2. Run prompt through the canonical agent runtime.
+    #
+    # Two paths, gated by HEVOLVE_FLAG_DISPATCH_VIA_CHAT:
+    #
+    #   ON (target state) — delegate to the canonical /chat HTTP
+    #     endpoint flask_integration._handle_message has used for
+    #     31-channel adapter inbound since 2026-01-31.  /chat brings:
+    #       - autogen / langchain / draft-first routing (chooses the
+    #         right runtime per request, with the existing
+    #         "no agent_id/prompt_id/recipe → langchain" fallback)
+    #       - per-agent persona via build_identity_prompt(agent_config)
+    #       - dynamic tool registration per agent
+    #       - multi-turn conversation history
+    #     This is the unification the social-platform dispatch was
+    #     missing — without it, social agents make raw single-shot
+    #     llm.invoke calls and have NO tools / persona / history.
+    #
+    #   OFF (default — preserves existing behavior) — raw `llm.invoke`
+    #     via safe_hartos_attr('get_llm').  Same code path social
+    #     agents have used since the 2026-05-04 Phase-7+8+9 mega-commit.
+    #     Flag stays off until the /chat path is validated for social-
+    #     platform dispatches; flipping the flag is the rollout switch.
+    #
+    # On flag-on `_dispatch_via_chat` returning None (chat endpoint
+    # unreachable, non-200, malformed response), we fall back to raw
+    # llm.invoke so agents still respond rather than going silent.
+    reply_text: Optional[str] = None
+    use_chat = (
+        os.environ.get('HEVOLVE_FLAG_DISPATCH_VIA_CHAT', '').strip().lower()
+        in ('1', 'true', 'yes', 'on')
+    )
+    if use_chat:
+        reply_text = _dispatch_via_chat(agent_id, rewritten, context)
+        if reply_text is None:
+            logger.info(
+                "dispatch_to_agent: /chat path failed; falling back to "
+                "raw LLM for agent=%s", agent_id)
+
+    if not reply_text:
+        try:
+            from core.safe_hartos_attr import safe_hartos_attr
+            get_llm = safe_hartos_attr('get_llm')
+            if get_llm is None:
+                logger.info("dispatch_to_agent: get_llm unresolved; "
+                            "agent=%s — runtime will pick up", agent_id)
+                return
+            llm = get_llm(temperature=0.7, max_tokens=600)
+            result = llm.invoke(rewritten)
+            reply_text = (result.content if hasattr(result, 'content')
+                          else str(result)).strip()
+        except Exception as e:
+            logger.warning(
+                "dispatch_to_agent: LLM call failed for agent=%s: %s",
+                agent_id, e)
             return
-        llm = get_llm(temperature=0.7, max_tokens=600)
-        result = llm.invoke(rewritten)
-        reply_text = (result.content if hasattr(result, 'content')
-                      else str(result)).strip()
-    except Exception as e:
-        logger.warning("dispatch_to_agent: LLM call failed for agent=%s: %s",
-                       agent_id, e)
-        return
 
     if not reply_text:
         return
