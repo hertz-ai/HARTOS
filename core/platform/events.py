@@ -151,26 +151,20 @@ class EventBus:
             _from_wamp: Internal flag — True when event originated from WAMP
                         (prevents echo loop back to Crossbar).
 
-        Cross-transport dedup: when ``data`` is a dict, an ``_event_id``
-        UUID is injected if the caller didn't already supply one
-        (existing IDs like ``request_id`` / ``speculation_id`` are NOT
-        replaced — clients should prefer those for domain dedup, and use
-        ``_event_id`` only as a generic per-emit fingerprint).  When the
-        same event reaches a client via WAMP and SSE, the client uses
-        this id to drop the duplicate.
+        Cross-transport dedup: callers MUST set a stable id on the data
+        dict (chat events use ``request_id`` / ``speculation_id``;
+        platform events should set ``_id`` or similar).  All clients
+        (Nunba realtimeService._seenIds, crossbarWorker.processedMessages,
+        Android PeerLinkConnectionBridge.processedRequestIds) already
+        dedup on request_id with a 10s window.  This bus does NOT inject
+        a synthetic id — that would create a parallel dedup key alongside
+        the existing one and confuse clients.
 
         Returns:
             Number of listeners that were called.
         """
         self._emit_count += 1
         called = 0
-
-        # Inject cross-transport dedup id (no-op for non-dict payloads —
-        # those callers can't be deduped reliably and are typically
-        # internal local-only events anyway).
-        if isinstance(data, dict) and '_event_id' not in data:
-            import uuid as _uuid
-            data['_event_id'] = _uuid.uuid4().hex
 
         # Exact match listeners
         with self._lock:
