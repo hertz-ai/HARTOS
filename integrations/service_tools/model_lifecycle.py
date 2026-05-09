@@ -1428,12 +1428,38 @@ class ModelLifecycleManager:
 
         # Queue restart with backoff (if under max retries)
         if should_restart:
+            # IDEMPOTENCE GUARD (2026-05-09 starvation fix):
+            # If a restart is already queued or in progress, do NOT
+            # overwrite it.  Re-queuing every dead-detection tick was
+            # the 2026-05-09 starvation bug — retry_after kept getting
+            # pushed forward by the latest tick's `now + backoff_s`,
+            # so _process_restart_queue's `now >= retry_after` check
+            # never succeeded.  Live evidence: 220 `Queued restart for
+            # llm` lines, 0 `_restart_llm starting` lines over 7.5h.
+            # Keep the original retry_after so the spawn fires.
+            with self._lock:
+                existing = self._restart_pending.get(tool_name)
+            if existing and isinstance(existing, dict):
+                if existing.get('in_progress'):
+                    logger.debug(
+                        f"[LIFECYCLE] {tool_name} restart IN PROGRESS — "
+                        f"suppressing re-queue from dead-detection tick"
+                    )
+                else:
+                    eta = max(0, existing.get('retry_after', 0) - time.time())
+                    logger.debug(
+                        f"[LIFECYCLE] {tool_name} restart already queued "
+                        f"(fires in {eta:.0f}s) — keeping original schedule, "
+                        f"not re-queuing"
+                    )
+                return
             retry_after = time.time() + state.restart_backoff_s
             downgrade = is_oom  # OOM → restart on lower resource tier
             self._restart_pending[tool_name] = {
                 'retry_after': retry_after,
                 'downgrade': downgrade,
                 'old_device': old_device.value if old_device else 'gpu',
+                'in_progress': False,
             }
             logger.info(
                 f"Queued restart for {tool_name} in {state.restart_backoff_s:.0f}s"
@@ -1455,11 +1481,53 @@ class ModelLifecycleManager:
         ready = []
         with self._lock:
             for name, info in list(self._restart_pending.items()):
-                if isinstance(info, dict) and now >= info.get('retry_after', 0):
+                if not isinstance(info, dict):
+                    continue
+                if info.get('in_progress'):
+                    # Already being spawned by a prior tick — skip.  Without
+                    # this check, two ticks could pull the same entry and
+                    # double-spawn (race that motivated the IDEMPOTENCE
+                    # GUARD in _handle_dead_process — both halves needed).
+                    continue
+                if now >= info.get('retry_after', 0):
+                    # Mark in_progress instead of deleting.  Retain the
+                    # entry so concurrent ticks see in_progress=True and
+                    # skip.  We pop the entry only AFTER spawn completes
+                    # (success or exception), in the finally block below.
+                    info['in_progress'] = True
+                    self._restart_pending[name] = info
                     ready.append((name, info))
-                    del self._restart_pending[name]
 
         for name, info in ready:
+            # IDEMPOTENCE: pre-spawn HTTP probe.  If the server came up
+            # via an external respawn (user restarted llama-server in a
+            # different terminal) between when this restart was queued
+            # and now, skip the spawn — don't kill the user's process
+            # via stop_server() and re-spawn our own.  Same probe also
+            # protects against the race where an earlier _restart_llm
+            # already succeeded but a stale queue entry survived.
+            if name == 'llm':
+                try:
+                    from llama.llama_config import LlamaConfig
+                    if LlamaConfig().check_server_running():
+                        logger.info(
+                            f"[LIFECYCLE] {name} already healthy on HTTP "
+                            f"probe — skipping queued spawn (idempotent "
+                            f"no-op; likely came up via external respawn "
+                            f"or earlier _restart_llm)"
+                        )
+                        with self._lock:
+                            self._restart_pending.pop(name, None)
+                            # Sync watchdog state so STATELESS-PROBE doesn't
+                            # immediately re-detect "dead" and re-queue.
+                            st = self._models.get(name)
+                            if st:
+                                st.device = ModelDevice.GPU
+                                st.priority = ModelPriority.ACTIVE
+                                st.last_access_time = time.time()
+                        continue
+                except Exception:
+                    pass  # Probe failed — proceed with spawn
             downgrade = info.get('downgrade', False)
             old_device = info.get('old_device', 'gpu')
 
@@ -1475,10 +1543,23 @@ class ModelLifecycleManager:
                         f" (was {old_device}, downgrade={downgrade})")
 
             success = False
-            if name == 'llm':
-                success = self._restart_llm(restart_mode)
-            else:
-                success = self._restart_rtm_tool(name, restart_mode)
+            try:
+                if name == 'llm':
+                    success = self._restart_llm(restart_mode)
+                else:
+                    success = self._restart_rtm_tool(name, restart_mode)
+            finally:
+                # ALWAYS clear the in_progress entry after spawn returns.
+                # If we succeeded, no further pending needed.  If we failed
+                # and the LLM-EXEMPTION + dead-detection wants another
+                # attempt, the next _check_process_health tick re-queues
+                # via _handle_dead_process — and that path's IDEMPOTENCE
+                # GUARD already prevents starvation by NOT overwriting
+                # pending if one already exists.  So pop here is safe.
+                # Without this pop, in_progress=True would persist and
+                # the entry would be skipped forever by future ticks.
+                with self._lock:
+                    self._restart_pending.pop(name, None)
 
             if success:
                 with self._lock:
@@ -1488,10 +1569,15 @@ class ModelLifecycleManager:
                 self._emit_event('model.restarted', {
                     'model': name, 'mode': restart_mode, 'downgraded': downgrade})
             else:
-                # Re-queue with increased backoff
+                # Failure path: bump crash_count + backoff, then re-queue
+                # ONLY if no entry is currently pending (other ticks may
+                # have re-queued via _handle_dead_process while we were
+                # spawning).  Same idempotence rule as _handle_dead_process.
                 with self._lock:
                     state = self._models.get(name)
-                    if state and state.crash_count <= self._max_crash_restarts:
+                    already_pending = name in self._restart_pending
+                    if (state and not already_pending
+                            and state.crash_count <= self._max_crash_restarts):
                         state.crash_count += 1
                         state.restart_backoff_s = min(
                             state.restart_backoff_s * 2, self._max_backoff_s)
@@ -1499,6 +1585,7 @@ class ModelLifecycleManager:
                             'retry_after': now + state.restart_backoff_s,
                             'downgrade': downgrade,
                             'old_device': restart_mode,
+                            'in_progress': False,
                         }
 
     def _restart_llm(self, mode: str) -> bool:
