@@ -4773,7 +4773,7 @@ def initialize_with_resume(prompt_id, user_prompt, user_id):
 
     current_app.logger.info(f"[RESUME] RESUME SUMMARY:")
     current_app.logger.info(f"   - Resumed at Flow {current_flow}, Action {current_action}")
-    current_app.logger.info(f"   - Scheduler Check: {scheduler_check[user_prompt]}")
+    current_app.logger.info(f"   - Scheduler Check: {scheduler_check.get(user_prompt)}")
     current_app.logger.info(f"   - Completed Flows: {len(completed_flows)}/{len(config['flows'])}")
 
     return current_flow, current_action, completed_flows
@@ -4829,8 +4829,9 @@ def recipe(user_id, text, prompt_id, file_id, request_id):
         #  ENHANCED: Resume from existing progress instead of starting fresh
         current_flow, current_action, completed_flows = initialize_with_resume(prompt_id, user_prompt, user_id)
 
-        # Check if all flows are already complete
-        if scheduler_check[user_prompt]:
+        # Check if all flows are already complete (SessionCache evicts on TTL/LRU →
+        # use .get() to avoid KeyError after eviction; missing key == 'not complete')
+        if scheduler_check.get(user_prompt):
             current_app.logger.info(" All flows already completed - Agent already created")
             return 'Agent Already Created Successfully'
 
@@ -4847,7 +4848,7 @@ def recipe(user_id, text, prompt_id, file_id, request_id):
         last_response = get_response_group(user_id, text, prompt_id, True, e)
 
     # Rest of the function remains the same...
-    if scheduler_check[user_prompt] == True:
+    if scheduler_check.get(user_prompt) is True:
         current_app.logger.info('WORKING on TIMER AGENTS')
         config = get_prompt_config_json(prompt_id)
         number_of_flows = len(config['flows'])
