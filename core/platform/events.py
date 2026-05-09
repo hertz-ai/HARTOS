@@ -58,6 +58,21 @@ def _wamp_to_local(uri: str) -> Optional[str]:
     return None
 
 
+# Topic prefixes EXCLUDED from SSE fan-out.  Default empty: every emit
+# reaches local + WAMP + SSE.  Add a prefix here ONLY when a topic
+# proves too noisy / internal for end-clients (high-frequency tick
+# events, per-token streaming, debug probes).  Most platform topics
+# (theme.*, resonance.*, federation.*, inference.*, memory.*,
+# action_state.*) are valid SSE traffic for admin dashboards / telemetry
+# views, so they stay on by default.
+_SSE_DENYLIST_PREFIXES: tuple = ()
+
+
+def _topic_targets_sse(topic: str) -> bool:
+    """True unless the topic is on the SSE denylist."""
+    return not any(topic.startswith(prefix) for prefix in _SSE_DENYLIST_PREFIXES)
+
+
 class EventBus:
     """Topic-based pub/sub event bus with optional Crossbar WAMP bridge.
 
@@ -136,11 +151,26 @@ class EventBus:
             _from_wamp: Internal flag — True when event originated from WAMP
                         (prevents echo loop back to Crossbar).
 
+        Cross-transport dedup: when ``data`` is a dict, an ``_event_id``
+        UUID is injected if the caller didn't already supply one
+        (existing IDs like ``request_id`` / ``speculation_id`` are NOT
+        replaced — clients should prefer those for domain dedup, and use
+        ``_event_id`` only as a generic per-emit fingerprint).  When the
+        same event reaches a client via WAMP and SSE, the client uses
+        this id to drop the duplicate.
+
         Returns:
             Number of listeners that were called.
         """
         self._emit_count += 1
         called = 0
+
+        # Inject cross-transport dedup id (no-op for non-dict payloads —
+        # those callers can't be deduped reliably and are typically
+        # internal local-only events anyway).
+        if isinstance(data, dict) and '_event_id' not in data:
+            import uuid as _uuid
+            data['_event_id'] = _uuid.uuid4().hex
 
         # Exact match listeners
         with self._lock:
@@ -167,6 +197,21 @@ class EventBus:
         # Bridge to WAMP (skip if event already came from WAMP → no echo)
         if not _from_wamp and self._wamp_connected and self._wamp_session:
             self._publish_to_wamp(topic, data)
+
+        # Bridge to SSE (Nunba desktop / Android — whitelisted topics only).
+        # The TODO at line 393's broadcast_sse_safe docstring said "Until
+        # EventBus grows a proper SSE transport adapter…" — this is that
+        # adapter.  Allowlist keeps platform-internal events (theme.*,
+        # federation.*, memory.*, resonance.*, action_state.*, inference.*)
+        # off the chat UI; only user-facing topics (chat.*, notification.*,
+        # task.*) reach SSE clients.  Echo guard: SSE is one-way (server →
+        # client) so there's no loop risk like WAMP, but we still skip if
+        # the event came from WAMP so a WAMP→local→SSE round trip doesn't
+        # duplicate a chat message that the WAMP bridge already delivered
+        # to clients on its own connection.
+        if not _from_wamp and _topic_targets_sse(topic):
+            _user_id = data.get('user_id') if isinstance(data, dict) else None
+            broadcast_sse_safe(topic, data, user_id=_user_id)
 
         return called
 

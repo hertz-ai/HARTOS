@@ -99,13 +99,24 @@ def publish_agent_thought(last_speaker, messages, user_id):
         if ('Message already sent successfully to user with request_id' in content
                 or 'Message sent successfully to user with request_id' in content):
             return
-        # request_id="123456" placeholder preserved on the wire — see
-        # crossbar_publish docstring; fixing propagation is tracked
-        # separately so this commit stays a pure refactor.
+        # Pull the real request_id from threadlocal — the /chat handler
+        # set it via thread_local_data.set_request_id (hart_intelligence_
+        # entry.py:6898 / 7962).  Without this the wire envelope carries
+        # the placeholder "123456", which:
+        #   - chatbot_routes.drain_thinking_traces(<real_uuid>) misses
+        #     because the buffer is keyed under "123456" → empty list →
+        #     no thinking_steps embedded in the /chat response;
+        #   - the React handler at Demopage.js:1434 drops the trace as
+        #     "daemon stale" because traceRequestId !== currentReqId;
+        #   - the Android consumer at AbstractChatActivity.java:2127
+        #     groups it under "123456" → orphan bucket, never displayed.
+        # Fix breaks all three failure modes for both transports.
+        from threadlocal import thread_local_data
         from core.peer_link.crossbar_publish import publish_thinking_trace
         publish_thinking_trace(
             text=content, user_id=user_id,
-            request_id="123456", bot_type='Agent',
+            request_id=thread_local_data.get_request_id() or '',
+            bot_type='Agent',
             full_schema=True,
         )
     except Exception as e:
@@ -4358,12 +4369,15 @@ def publish_to_crossbar_new_action_start(message, user_id):
     text = (
         "Working on " + message
         + ".\n please evaluate the response i am giving to check if it meets the current action")
-    # request_id="123456" placeholder preserved on the wire — see
-    # crossbar_publish docstring.
+    # Pull real request_id from threadlocal — see publish_agent_thought
+    # for the full failure-mode analysis (drain key miss, React daemon
+    # filter, Android orphan bucket).  Single source via thread_local_data.
+    from threadlocal import thread_local_data
     from core.peer_link.crossbar_publish import publish_thinking_trace
     publish_thinking_trace(
         text=text, user_id=user_id,
-        request_id="123456", bot_type='Agent',
+        request_id=thread_local_data.get_request_id() or '',
+        bot_type='Agent',
         full_schema=True,
     )
 
