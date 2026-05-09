@@ -80,6 +80,15 @@ def publish_thinking_trace(
 
     text_str = text if isinstance(text, str) else str(text)
 
+    # Per-event dedup id — uuid4 hex.  Each thinking emit gets a unique
+    # msg_id so multiple events sharing the same request_id (the typical
+    # case — N thinking steps within one chat turn) are NOT collapsed by
+    # client dedup (crossbarWorker.processedMessages, realtimeService.
+    # _seenIds, Android processedRequestIds).  request_id stays the
+    # GROUPING / filtering key; msg_id is the dedup key.
+    import uuid as _uuid
+    _msg_id = _uuid.uuid4().hex
+
     if full_schema:
         envelope = {
             'text': [text_str],
@@ -93,6 +102,7 @@ def publish_thinking_trace(
             'page_image_url': '',
             'analogy_image_url': '',
             'request_id': request_id,
+            'msg_id': _msg_id,
             'zoom_bounding_box': _ZOOM_STUB,
         }
     else:
@@ -102,6 +112,7 @@ def publish_thinking_trace(
             'action': 'Thinking',
             'bot_type': bot_type,
             'request_id': request_id,
+            'msg_id': _msg_id,
             'historical_request_id': [],
             'options': [],
             'newoptions': [],

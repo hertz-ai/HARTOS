@@ -151,20 +151,31 @@ class EventBus:
             _from_wamp: Internal flag — True when event originated from WAMP
                         (prevents echo loop back to Crossbar).
 
-        Cross-transport dedup: callers MUST set a stable id on the data
-        dict (chat events use ``request_id`` / ``speculation_id``;
-        platform events should set ``_id`` or similar).  All clients
-        (Nunba realtimeService._seenIds, crossbarWorker.processedMessages,
-        Android PeerLinkConnectionBridge.processedRequestIds) already
-        dedup on request_id with a 10s window.  This bus does NOT inject
-        a synthetic id — that would create a parallel dedup key alongside
-        the existing one and confuse clients.
+        Cross-transport dedup contract:
+          - Each emit() injects a unique ``msg_id`` (uuid4 hex) into the
+            data dict if the caller didn't set one.  This is the
+            per-event dedup key clients use to suppress duplicates that
+            arrive via multiple transports (WAMP + SSE).
+          - ``request_id`` is the per-request GROUPING key (multiple
+            thinking events share one request_id but each has its own
+            msg_id).  Clients use request_id for filtering daemon traces
+            and grouping into thinking containers, NOT for dedup.
+          - For proactive emits with no request_id (agent self-initiated
+            thinking, telemetry pushes), msg_id is the ONLY id needed.
+            Each event renders independently because msg_ids are unique.
 
         Returns:
             Number of listeners that were called.
         """
         self._emit_count += 1
         called = 0
+
+        # Inject per-event dedup id (uuid4 hex).  Skipped if caller
+        # already supplied msg_id — they may want to use a domain-
+        # specific stable id for replay-on-reconnect scenarios.
+        if isinstance(data, dict) and 'msg_id' not in data:
+            import uuid as _uuid
+            data['msg_id'] = _uuid.uuid4().hex
 
         # Exact match listeners
         with self._lock:
