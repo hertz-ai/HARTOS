@@ -47,6 +47,32 @@ from concurrent.futures import ThreadPoolExecutor
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 from autogen.cache.in_memory_cache import InMemoryCache
 from json_repair import repair_json
+
+# ─── State-transition stuck-loop detector (#485) ────────────────────
+# Tracks the most-recent (last_speaker_name, content_hash) signature per
+# user_prompt across consecutive state_transition invocations.  When the
+# SAME signature repeats for >= _STATE_TRANSITION_LOOP_THRESHOLD calls in
+# a row, we declare the GroupChat stuck and break out cleanly with a
+# fallback assistant message + ActionState.TERMINATED.
+#
+# Live evidence (2026-05-10 22:35-22:38, request 776d9fb0): a Tamil-
+# language-switch turn entered a 28+-iteration loop where the LLM
+# regurgitated the 137-char ChatInstructor prompt verbatim as Assistant
+# content on every turn.  state_transition's routing was correct (Assistant
+# → verify, verify → chat_instructor) but autogen's internal speaker
+# scheduling kept calling state_transition with last_speaker=Assistant —
+# never propagating verify/chat_instructor.  Without a backstop the loop
+# runs to autogen's default max_consecutive_auto_reply (50+) and the user
+# gets nothing for ~5+ minutes.
+#
+# This guard is purely defensive — happy-path behaviour is unchanged.  The
+# threshold is deliberately conservative (5 identical signatures) to leave
+# headroom for legitimate same-speaker sequences (e.g. tool-call chains
+# where Assistant emits multiple consecutive messages with different
+# content but same name).  The signature includes content hash so genuine
+# progress (Assistant emits NEW content) resets the counter.
+_STATE_TRANSITION_LOOP_STATE: dict = {}
+_STATE_TRANSITION_LOOP_THRESHOLD: int = 5
 def publish_async(topic, message, timeout=2.0):
     """Delegate to the canonical publish_async in hart_intelligence.
 
@@ -1818,6 +1844,111 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             )
         except Exception as _probe_err:
             current_app.logger.error(f"[STATE-TRANSITION-PROBE] log failed: {_probe_err}")
+
+        # ─── STUCK-LOOP GUARD (#485) ───────────────────────────────────
+        # Detects when the same (last_speaker, last_message_content) pair
+        # has repeated >= _STATE_TRANSITION_LOOP_THRESHOLD times and breaks
+        # out of the GroupChat with a clean fallback assistant message.
+        #
+        # Trigger pattern (live evidence 2026-05-10 22:35 request 776d9fb0):
+        #   Tamil-language-switch turn → ChatInstructor sends "Execute Action 1
+        #   ... Latest User message: I want to talk to you in tamil" (137 chars)
+        #   → Assistant LLM regurgitates the prompt verbatim (137 chars) →
+        #   state_transition routes Assistant → verify, but autogen's internal
+        #   speaker scheduling keeps invoking state_transition with
+        #   last_speaker=Assistant for 28+ iterations.  No state advancement,
+        #   no progress, user gets nothing for 5+ minutes until autogen's
+        #   default max_consecutive_auto_reply (50) kicks in.
+        #
+        # The guard is signature-based (last_speaker.name + first-500-char
+        # content hash).  Any genuine progress — Assistant emits NEW content,
+        # OR a different agent speaks — resets the counter to 1.  Tool-call
+        # chains where the same agent emits multiple turns with DIFFERENT
+        # content also reset, so legitimate sequences are unaffected.
+        #
+        # On break:
+        #   1. Loud diagnostic log + last-10-message trace dump for postmortem.
+        #   2. Inject a clean fallback assistant message into groupchat.messages
+        #      so the outer initiate_chat wrapper has a coherent reply to send.
+        #   3. Mark the action TERMINATED so the recipe pipeline doesn't retry
+        #      this stuck turn.
+        #   4. Return None to terminate the GroupChat round.
+        #   5. Reset _STATE_TRANSITION_LOOP_STATE for this user_prompt so the
+        #      next chat turn starts fresh.
+        try:
+            _last_msg_for_loop = groupchat.messages[-1] if groupchat.messages else {}
+            _last_content_for_loop = (_last_msg_for_loop.get('content') or '')
+            import hashlib
+            _content_hash = hashlib.sha1(
+                _last_content_for_loop[:500].encode('utf-8', errors='replace')
+            ).hexdigest()[:12]
+            _sig = f"{last_speaker.name}:{_content_hash}"
+            _ls = _STATE_TRANSITION_LOOP_STATE.get(user_prompt) or {}
+            if _ls.get('sig') == _sig:
+                _ls['count'] = _ls.get('count', 1) + 1
+            else:
+                _ls = {
+                    'sig': _sig,
+                    'count': 1,
+                    'first_msg_idx': len(groupchat.messages),
+                }
+            _STATE_TRANSITION_LOOP_STATE[user_prompt] = _ls
+
+            if _ls['count'] >= _STATE_TRANSITION_LOOP_THRESHOLD:
+                current_app.logger.error(
+                    f"[STATE-TRANSITION-LOOP-BREAK] STUCK LOOP DETECTED — "
+                    f"user_prompt={user_prompt!r} speaker={last_speaker.name!r} "
+                    f"content_hash={_content_hash} repeated {_ls['count']} times "
+                    f"across {len(groupchat.messages) - _ls.get('first_msg_idx', 0)} "
+                    f"groupchat-message increments.  Breaking out with fallback "
+                    f"reply so the user gets a response instead of hanging."
+                )
+                # Trace dump — last 10 messages
+                _msgs = groupchat.messages[-10:]
+                _start_idx = max(0, len(groupchat.messages) - 10)
+                for _i, _m in enumerate(_msgs):
+                    _r = (_m.get('role') or '?')
+                    _n = (_m.get('name') or '?')
+                    _c = str(_m.get('content') or '')
+                    current_app.logger.error(
+                        f"  [LOOP-TRACE msg #{_start_idx + _i}] role={_r!r} "
+                        f"name={_n!r} content_len={len(_c)} "
+                        f"preview={_c[:120]!r}"
+                    )
+                # Inject clean fallback so wrapper has a coherent response
+                _fallback_text = (
+                    "I had trouble producing a response — the agent pipeline "
+                    "got stuck in a loop on this request.  Could you rephrase "
+                    "or break it into a simpler step?"
+                )
+                try:
+                    groupchat.messages.append({
+                        'role': 'assistant',
+                        'name': 'Assistant',
+                        'content': _fallback_text,
+                    })
+                except Exception as _inject_err:
+                    current_app.logger.warning(
+                        f"[LOOP-BREAK] fallback inject failed: {_inject_err}")
+                # Mark action TERMINATED so recipe pipeline doesn't re-enter
+                try:
+                    force_state_through_valid_path(
+                        user_prompt, current_action_id,
+                        ActionState.TERMINATED,
+                        "Loop-break: state_transition stuck-loop guard fired (#485)",
+                    )
+                except Exception as _stb_err:
+                    current_app.logger.warning(
+                        f"[LOOP-BREAK] state-set failed: {_stb_err}")
+                # Reset loop-state for this user — next turn starts fresh
+                _STATE_TRANSITION_LOOP_STATE.pop(user_prompt, None)
+                return None  # terminate GroupChat round
+        except Exception as _loop_guard_err:
+            current_app.logger.exception(
+                f"[STATE-TRANSITION-LOOP] guard raised "
+                f"{type(_loop_guard_err).__name__}: {_loop_guard_err!s} — "
+                "falling through to normal routing"
+            )
 
         # Preempt: if user started chatting, abort daemon-initiated recipes
         # so the LLM is free for the user's request immediately.
