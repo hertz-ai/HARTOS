@@ -107,6 +107,25 @@ class CodingAgentDaemon:
 
         self._tick_count += 1
 
+        # USER-YIELD GATE — single canonical primitive that every
+        # background daemon consults before burning CPU/GIL/LLM/GPU.
+        # ``should_yield_to_user()`` covers BOTH user-activity (chat in
+        # last 10 min OR live CREATE pipeline) AND system-pressure
+        # (model_lifecycle.get_system_pressure().throttle_factor < 0.1)
+        # in one call.  agent_daemon._tick, agent_daemon._proactive_hive_tick,
+        # and hive_benchmark_prover._continuous_loop already consult it
+        # — coding_daemon was the only background loop missing it,
+        # which is why py-spy showed full autogen turns running on the
+        # daemon thread while the user was actively chatting.  No new
+        # throttle, no parallel resource-aware system — just plug into
+        # the existing gate.
+        try:
+            from integrations.agent_engine.dispatch import should_yield_to_user
+            if should_yield_to_user():
+                return
+        except Exception:
+            pass  # gate import unavailable — fall through (fail-open)
+
         # BUDGET GATE: platform affordability check before dispatching coding tasks
         try:
             from integrations.agent_engine.budget_gate import check_platform_affordability
