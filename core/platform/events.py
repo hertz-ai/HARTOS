@@ -203,17 +203,18 @@ class EventBus:
         if not _from_wamp and self._wamp_connected and self._wamp_session:
             self._publish_to_wamp(topic, data)
 
-        # Bridge to SSE (Nunba desktop / Android — whitelisted topics only).
-        # The TODO at line 393's broadcast_sse_safe docstring said "Until
-        # EventBus grows a proper SSE transport adapter…" — this is that
-        # adapter.  Allowlist keeps platform-internal events (theme.*,
-        # federation.*, memory.*, resonance.*, action_state.*, inference.*)
-        # off the chat UI; only user-facing topics (chat.*, notification.*,
-        # task.*) reach SSE clients.  Echo guard: SSE is one-way (server →
-        # client) so there's no loop risk like WAMP, but we still skip if
-        # the event came from WAMP so a WAMP→local→SSE round trip doesn't
-        # duplicate a chat message that the WAMP bridge already delivered
-        # to clients on its own connection.
+        # Bridge to SSE (Nunba desktop / Android web view).  This grew the
+        # SSE transport adapter the broadcast_sse_safe docstring asked for
+        # (line 393 of this file).  Topic policy is a DENYLIST (see
+        # _SSE_DENYLIST_PREFIXES at module top, default empty) — every
+        # topic fans out to SSE by default; add a prefix to the denylist
+        # only when a topic proves too noisy / internal for end-clients.
+        # Per-event dedup happens client-side via msg_id (auto-injected
+        # below for dict payloads), so the same event arriving via WAMP
+        # and SSE renders once.  Echo guard: skip when the event came
+        # from WAMP so a WAMP→local→SSE round trip doesn't double-deliver
+        # a message that the WAMP bridge already shipped on its own
+        # connection.
         if not _from_wamp and _topic_targets_sse(topic):
             _user_id = data.get('user_id') if isinstance(data, dict) else None
             broadcast_sse_safe(topic, data, user_id=_user_id)
