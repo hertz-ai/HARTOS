@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -86,8 +87,7 @@ def publish_thinking_trace(
     # client dedup (crossbarWorker.processedMessages, realtimeService.
     # _seenIds, Android processedRequestIds).  request_id stays the
     # GROUPING / filtering key; msg_id is the dedup key.
-    import uuid as _uuid
-    _msg_id = _uuid.uuid4().hex
+    _msg_id = uuid.uuid4().hex
 
     if full_schema:
         envelope = {

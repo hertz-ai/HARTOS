@@ -30,7 +30,20 @@ from core.port_registry import get_port
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
+# Eager-import the history loader so the per-call inline import in
+# dispatch_draft_first doesn't hit Python's import lock on every chat
+# (sys.modules cache makes subsequent calls fast, but the FIRST call
+# of a freshly-warm process still pays the lock cost).  Imported via
+# try/except to keep the module load tolerant of test environments
+# that mock out the social subtree.
+try:
+    from integrations.channels.memory.shared_history import (
+        seed_autogen_from_shared_history)
+except ImportError:
+    seed_autogen_from_shared_history = None  # type: ignore[assignment]
+
 logger = logging.getLogger('hevolve_social')
+
 
 # Similarity threshold — below this, expert response is considered
 # a meaningful improvement over fast response
@@ -362,17 +375,22 @@ class SpeculativeDispatcher:
         # crowding out the answering rules + JSON schema.
         recent_turns: List[Dict] = []
         try:
-            from integrations.channels.memory.shared_history import (
-                seed_autogen_from_shared_history)
+            if seed_autogen_from_shared_history is None:
+                raise ImportError(
+                    "shared_history.seed_autogen_from_shared_history "
+                    "not importable in this environment")
             recent_turns = seed_autogen_from_shared_history(
                 user_id, max_messages=4) or []
-            # Drop the most recent turn if it duplicates the current prompt
-            # (the writer hook in get_response_group / chatbot_routes may
-            # have persisted this turn before the draft dispatch starts).
-            if (recent_turns
-                    and (recent_turns[-1].get('content') or '').strip()
-                        == prompt.strip()):
-                recent_turns = recent_turns[:-1]
+            # NO dedup against the current prompt — users genuinely
+            # repeat themselves (rephrasing, asking again, "hi" / "hi"
+            # in casual back-and-forth).  Dropping a recent turn just
+            # because its text matches the current prompt would silently
+            # lose legitimate conversation history.  If the writer hook
+            # in get_response_group / chatbot_routes persisted the
+            # current turn before this dispatch ran, the prompt may
+            # appear twice in the LLM's input — that's the correct
+            # natural-language signal ("user said X, then said X again")
+            # and the model should treat it as such.
         except Exception as _hist_err:
             logger.debug(f"draft history load failed: {_hist_err}")
             recent_turns = []
