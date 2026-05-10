@@ -1516,13 +1516,35 @@ class ModelLifecycleManager:
                             f"no-op; likely came up via external respawn "
                             f"or earlier _restart_llm)"
                         )
+                        # Detect ACTUAL device — Nunba defaults to GPU but
+                        # an externally-respawned server (or a Nunba retry
+                        # after a CUDA-context loss from sleep/hibernate)
+                        # may be on CPU.  Self-review caught the v1 of this
+                        # code unconditionally stamping GPU, which would
+                        # mislead the catalog/dispatcher.  vram_manager has
+                        # an internal cache so this is sub-millisecond after
+                        # first call (no nvidia-smi cost per tick).
+                        try:
+                            from integrations.service_tools.vram_manager import (
+                                vram_manager as _vmm,
+                            )
+                            _gpu_info = _vmm.detect_gpu() or {}
+                            _device = (ModelDevice.GPU
+                                       if _gpu_info.get('cuda_available')
+                                       else ModelDevice.CPU)
+                        except Exception:
+                            # If vram_manager can't be reached, prefer GPU
+                            # since that's the default Nunba launch mode —
+                            # next full _check_llm_health tick will resync
+                            # if wrong.
+                            _device = ModelDevice.GPU
                         with self._lock:
                             self._restart_pending.pop(name, None)
                             # Sync watchdog state so STATELESS-PROBE doesn't
                             # immediately re-detect "dead" and re-queue.
                             st = self._models.get(name)
                             if st:
-                                st.device = ModelDevice.GPU
+                                st.device = _device
                                 st.priority = ModelPriority.ACTIVE
                                 st.last_access_time = time.time()
                         continue

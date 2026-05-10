@@ -942,15 +942,15 @@ Hidden=false
                 try:
                     # Hide Windows console window on cross-platform engines
                     # (mpv/vlc on Windows pop a cmd window for stdout
-                    # otherwise).  No-op on macOS/Linux.  Same idiom used
-                    # by livekit_supervisor and diarization_service.
-                    _popen_kw = dict(
+                    # otherwise).  Routes through canonical helper for
+                    # consistency with livekit_supervisor / vlm probes.
+                    from core.subprocess_safe import hidden_popen_kwargs
+                    proc = subprocess.Popen(
+                        [engine, '--', path],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
+                        **hidden_popen_kwargs(),
                     )
-                    if os.name == 'nt':
-                        _popen_kw['creationflags'] = subprocess.CREATE_NO_WINDOW
-                    proc = subprocess.Popen([engine, '--', path], **_popen_kw)
                     with _player_lock:
                         _player_proc['pid'] = proc.pid
                         _player_proc['path'] = path
