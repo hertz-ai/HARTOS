@@ -1996,7 +1996,39 @@ def publish_async(topic, message, timeout=2.0):
         except Exception as e:
             app.logger.debug(f"MessageBus publish failed (offline OK): {e}")
 
-    # 2. HTTP Crossbar for cloud telemetry + legacy mobile (when internet available)
+    # 2. SSE / local-WAMP fan-out for the Nunba desktop SPA.
+    #
+    # MessageBus (above) is the in-process EventBus + PeerLink path —
+    # it does NOT reach the SPA's EventSource subscribers nor the
+    # embedded wamp_router :8088 that crossbarWorker.js connects to.
+    # Nunba's main.py exposes ``broadcast_sse_event`` which fans out to
+    # BOTH legs (publish_local → embedded WAMP topic, plus the SSE
+    # queue), so calling the canonical helper here gives every publish
+    # site real-time delivery to the desktop UI without per-call wiring.
+    #
+    # Before this leg existed, only TTS bridged to SSE explicitly
+    # (see TTS publish below); thinking traces, channel events, and
+    # every other publish_async caller silently dropped on the desktop.
+    # The publisher abstraction is the canonical home — no parallel
+    # path at each call site.
+    if isinstance(data, dict) and data.get('user_id'):
+        try:
+            from core.platform.events import broadcast_sse_safe
+            # event_type mirrors the canonical chatbot_routes.publish_to_crossbar
+            # contract (Nunba routes/chatbot_routes.py:733): use payload['type']
+            # when present, otherwise default to 'message'.  The SPA's SSE
+            # consumer only registers listeners for 'message' (onmessage),
+            # 'notification', and 'setup_progress'; everything else is routed
+            # via the local-WAMP leg of broadcast_sse_event (which keys off
+            # data.get('action') for TTS pupit / chat / social).  Using
+            # 'action' as the SSE event_type would silently drop on SSE
+            # clients — keep this aligned with the chatbot_routes default.
+            _evt = data.get('type') if data.get('type') else 'message'
+            broadcast_sse_safe(_evt, data, user_id=data.get('user_id'))
+        except Exception as _sse_err:
+            app.logger.debug(f"SSE fan-out skipped: {_sse_err}")
+
+    # 3. HTTP Crossbar for cloud telemetry + legacy mobile (when internet available)
     if client is None:
         return
 
@@ -2958,8 +2990,58 @@ def _handle_connect_channel_tool(input_text: str) -> str:
         # already uses (see notify_loaded line ~872).
         try:
             if isinstance(result, str) and 'Missing:' in result:
-                from integrations.channels.metadata import get_channel_metadata
+                from integrations.channels.metadata import (
+                    get_channel_metadata, is_oauth_configured,
+                )
                 meta = get_channel_metadata(channel_type) or {}
+
+                # ── OAuth click-through fork (PR O) ────────────────
+                # When the operator has set HARTOS_OAUTH_CLIENT_<TYPE>
+                # env, prefer click-through over paste-form.  Calls the
+                # SAME ``build_authorize_url`` helper /api/oauth/start
+                # uses (oauth_api.build_authorize_url) — single source
+                # of URL truth.  Emits a Liquid UI ``oauth_link``
+                # payload that AgentOverlay's case 'oauth_link' renders.
+                # Falls through to the paste-form on any failure.
+                if is_oauth_configured(channel_type):
+                    try:
+                        from integrations.channels.oauth_api import (
+                            build_authorize_url,
+                        )
+                        authorize_url, _state = build_authorize_url(
+                            user_id=int(thread_local_data.get_user_id() or 0),
+                            channel_type=channel_type,
+                        )
+                        from core.platform.service_registry import ServiceRegistry
+                        _lui = ServiceRegistry.get('LiquidUIService')
+                        if _lui:
+                            _lui.agent_ui_update(
+                                thread_local_data.get_user_id() or 'system',
+                                {
+                                    'type': 'oauth_link',
+                                    'channel': channel_type,
+                                    'channel_type': channel_type,
+                                    'display_name': meta.get('display_name') or channel_type,
+                                    'color': meta.get('color') or '#6c63ff',
+                                    'icon': meta.get('icon') or 'link',
+                                    'url': authorize_url,
+                                    'external_url': meta.get('external_url'),
+                                    'cta_label': f"Connect with {meta.get('display_name') or channel_type}",
+                                },
+                            )
+                            return (
+                                f"To connect {meta.get('display_name') or channel_type}, "
+                                f"click the button I just sent — it will open the provider's "
+                                f"sign-in page in your browser.  After you authorize, the "
+                                f"channel will be connected automatically."
+                            )
+                    except Exception as oauth_err:
+                        logger.debug(
+                            "Connect_Channel: OAuth fork failed, falling back to form: %s",
+                            oauth_err,
+                        )
+                        # Fall through to the paste-form path below.
+
                 setup_fields = meta.get('setup_fields') or []
                 # Skip auto:True fields (WAHA api_url, access_token, etc)
                 # — these are server-provisioned via env-var defaults in
@@ -6715,13 +6797,12 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
                     'request_id': str(request_id),
                     'action': 'TTS',
                 }
+                # publish_async fans out to MessageBus + SSE/local-WAMP +
+                # cloud-crossbar telemetry in one call (see publish_async at
+                # line 1929 for the leg ordering).  user_id is read from the
+                # payload by the SSE leg, so include it on the dict.
+                _tts_payload['user_id'] = user_id
                 publish_async(f'com.hertzai.pupit.{user_id}', json.dumps(_tts_payload))
-                # Also push via SSE directly — publish_async → MessageBus/WAMP doesn't
-                # reach SSE clients, so the unified helper fans out to the Nunba
-                # main.py SSE broker. See core/platform/events.broadcast_sse_safe.
-                from core.platform.events import broadcast_sse_safe
-                if not broadcast_sse_safe('message', _tts_payload, user_id=user_id):
-                    app.logger.debug("TTS SSE: broadcast_sse_event unavailable (Nunba main not loaded)")
                 app.logger.info(f"TTS async: published successfully")
             else:
                 app.logger.warning(f"TTS async: no audio file — path={audio_path}, exists={os.path.isfile(audio_path) if audio_path else False}")
