@@ -1608,31 +1608,51 @@ def _init_learning_pipeline():
         _trace_recorder = get_trace_recorder(recordings_dir)
 
         # Learning provider (wraps llama.cpp on port 8080 or cloud endpoint)
-        _domain = 'general'
-        _wizard_key = os.environ.get('HEVOLVE_LLM_API_KEY', '') or None
-        llm_config = create_learning_llm_config(
-            domain=_domain, fallback_api_key=_wizard_key)
-        if '_provider' in llm_config:
-            _learning_provider = llm_config['_provider']
-            register_learning_provider(_domain, _learning_provider)
-            _logger.info(
-                "[EmbodiedAI] Learning provider ready (RL-EF + episodic memory)")
-        else:
+        #
+        # rl_ef/__init__.py uses a graceful-degradation pattern: when an
+        # optional sibling import (torch/cuda/transformers stack) fails,
+        # it binds create_learning_llm_config = register_learning_provider
+        # = None instead of raising. So a `from … import X` succeeds with
+        # X bound to None. Calling None(...) is a TypeError that crashes
+        # the *whole* pipeline (HiveMind included) — guard explicitly so
+        # only the learning-provider step is skipped.
+        if create_learning_llm_config is None or register_learning_provider is None:
             _logger.warning(
-                "[EmbodiedAI] Learning provider init returned no provider")
+                "[EmbodiedAI] rl_ef symbols are None — an optional dep "
+                "(likely torch/cuda) failed to load inside hevolveai. "
+                "Trace recording + HiveMind continue; learning provider "
+                "skipped.")
+        else:
+            _domain = 'general'
+            _wizard_key = os.environ.get('HEVOLVE_LLM_API_KEY', '') or None
+            llm_config = create_learning_llm_config(
+                domain=_domain, fallback_api_key=_wizard_key)
+            if '_provider' in llm_config:
+                _learning_provider = llm_config['_provider']
+                register_learning_provider(_domain, _learning_provider)
+                _logger.info(
+                    "[EmbodiedAI] Learning provider ready (RL-EF + episodic memory)")
+            else:
+                _logger.warning(
+                    "[EmbodiedAI] Learning provider init returned no provider")
 
         # HiveMind
-        import uuid
-        instance_id = f"hevolve_{uuid.uuid4().hex[:8]}"
-        _hive_mind = HiveMind(max_agents=100)
-        _hive_mind.register_agent(
-            agent_id=instance_id,
-            agent_type='hevolve_orchestrator',
-            latent_dim=2048,
-            capabilities=[
-                AgentCapability.TEXT_GENERATION, AgentCapability.REASONING],
-        )
-        _logger.info(f"[EmbodiedAI] HiveMind registered as {instance_id}")
+        if HiveMind is None or AgentCapability is None:
+            _logger.warning(
+                "[EmbodiedAI] HiveMind/AgentCapability symbols are None — "
+                "skipping HiveMind registration.")
+        else:
+            import uuid
+            instance_id = f"hevolve_{uuid.uuid4().hex[:8]}"
+            _hive_mind = HiveMind(max_agents=100)
+            _hive_mind.register_agent(
+                agent_id=instance_id,
+                agent_type='hevolve_orchestrator',
+                latent_dim=2048,
+                capabilities=[
+                    AgentCapability.TEXT_GENERATION, AgentCapability.REASONING],
+            )
+            _logger.info(f"[EmbodiedAI] HiveMind registered as {instance_id}")
 
     except ImportError as e:
         logging.getLogger(__name__).warning(
