@@ -200,6 +200,7 @@ def _run_bootstrap(app, cfg: dict) -> None:
             _init_channel_adapters(app, cfg)
             _init_agent_engine_subsystem(app)
             _init_livekit_supervisor(cfg)
+            _init_whatsapp_supervisor(cfg)
             _run_on_bootstrap_complete(cfg)
         finally:
             if bypass_active:
@@ -524,6 +525,33 @@ def _init_livekit_supervisor(cfg: dict) -> None:
                 info.get('reason') or info.get('mode'))
     except Exception as e:
         logger.warning(f"LiveKit supervisor init failed: {e}")
+
+
+def _init_whatsapp_supervisor(cfg: dict) -> None:
+    """Spawn the embedded Baileys gateway so WhatsApp works without
+    a separate WAHA Docker install on the user's machine.
+
+    Sister of _init_livekit_supervisor — same pattern, same lifecycle:
+      - Idempotent
+      - Deploy-mode gated (skips on central; runs on flat/regional)
+      - Operator override via WHATSAPP_API_URL / WHATSAPP_AUTOSTART
+      - Failure logs a warning but never aborts bootstrap; the existing
+        adapter falls back to the operator's WHATSAPP_API_URL when the
+        local gateway isn't running.
+    """
+    try:
+        from integrations.social.whatsapp_supervisor import start_supervisor
+        info = start_supervisor()
+        if info.get('running'):
+            logger.info(
+                "WhatsApp supervisor: running (port=%s, pid=%s)",
+                info.get('port'), info.get('pid'))
+        else:
+            logger.info(
+                "WhatsApp supervisor: skipped (%s)",
+                info.get('reason') or info.get('last_error') or 'unknown')
+    except Exception as e:
+        logger.warning(f"WhatsApp supervisor init failed: {e}")
 
 
 # ─── Step 9: on_bootstrap_complete consumer callback ─────────────────
