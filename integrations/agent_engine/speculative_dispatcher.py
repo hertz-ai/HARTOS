@@ -503,18 +503,21 @@ class SpeculativeDispatcher:
             or (parsed.get('language_change') or '').strip()
             or (parsed.get('invite_intent') or '').strip()
             or (parsed.get('join_room_intent') or '').strip()
+            or (parsed.get('memory_query') or '').strip()
         ):
             logger.info(
                 "draft-first: actionable intent flag set "
                 "(channel_connect=%r, is_create_agent=%r, "
                 "language_change=%r, invite_intent=%r, "
-                "join_room_intent=%r) — escalating delegate=none → "
-                "'local' so the expert tool registry handles the turn.",
+                "join_room_intent=%r, memory_query=%r) — escalating "
+                "delegate=none → 'local' so the expert tool registry "
+                "handles the turn.",
                 parsed.get('channel_connect'),
                 parsed.get('is_create_agent'),
                 parsed.get('language_change'),
                 parsed.get('invite_intent'),
                 parsed.get('join_room_intent'),
+                parsed.get('memory_query'),
             )
             draft_reply = _REFUSAL_STANDBY_REPLY
             delegate = 'local'
@@ -884,6 +887,7 @@ class SpeculativeDispatcher:
             '"language_change": "<ISO 639-1 code or empty string>", '
             '"invite_intent": "<short context if user wants invite link, or empty>", '
             '"join_room_intent": "<platform + room/url if user wants agent to join, or empty>", '
+            '"memory_query": "<short context if user asks about past conversations, or empty>", '
             '"reason": "<why you chose this delegate value>"}\n\n'
             # ── delegate ────────────────────────────────────────────────
             "delegate: Use \"none\" for greetings, small-talk, factual "
@@ -950,7 +954,20 @@ class SpeculativeDispatcher:
             "(e.g. \"discord https://discord.com/channels/123/456\"). "
             "Otherwise use an empty string \"\". This routes the turn "
             "to the Join_External_Room tool, which always gates on "
-            "consent and announces the agent's presence in the room."
+            "consent and announces the agent's presence in the room.\n\n"
+            # ── memory_query ────────────────────────────────────────────
+            "memory_query: if the user is asking about something they "
+            "discussed previously, what was said in past conversations, "
+            "or asking the assistant to recall earlier context (e.g. "
+            "\"what did we speak 2 days back\", \"do you remember when "
+            "I asked about X\", \"what was that thing we discussed last "
+            "week\", \"recall my previous question on Y\", \"what did I "
+            "tell you about my project\"), put a short freeform context "
+            "string here describing the topic / time window (e.g. "
+            "\"conversations from last 2 days\", \"earlier project "
+            "discussion\"). Otherwise use an empty string \"\". This "
+            "routes the turn to the recall_memory tool which searches "
+            "the memory graph with optional time filters."
         )
 
     def _track_call_telemetry(
