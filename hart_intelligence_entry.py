@@ -773,10 +773,9 @@ app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES
 def _json_endpoint(f):
     """Wrap a Flask view so unhandled exceptions return ``{'error': ...}, 500``.
 
-    Defined here (early) so route registration blocks below this point can
-    use ``@_json_endpoint`` as a decorator at module-load time. Previously
-    lived near line 9200 — Kong gateway init at line ~1217 NameError'd because
-    the decorator name didn't exist yet when its def-statement was parsed.
+    Must be defined before any module-level route registration block uses it
+    as a decorator — Python resolves decorator names at function-definition
+    time, not at call time.
     """
     @wraps(f)
     def _wrapped(*args, **kwargs):
@@ -785,6 +784,7 @@ def _json_endpoint(f):
         except Exception as e:
             return jsonify({'error': str(e)}), 500
     return _wrapped
+
 
 if _is_bundled:
     # Bundled: root owns the handlers; let app.logger propagate to root
