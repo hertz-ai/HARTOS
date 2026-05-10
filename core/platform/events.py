@@ -65,7 +65,22 @@ def _wamp_to_local(uri: str) -> Optional[str]:
 # (theme.*, resonance.*, federation.*, inference.*, memory.*,
 # action_state.*) are valid SSE traffic for admin dashboards / telemetry
 # views, so they stay on by default.
-_SSE_DENYLIST_PREFIXES: tuple = ()
+#
+# 'bus.': MessageBus.publish auto-emits a `bus.<topic>` echo of every
+# publish (core/peer_link/message_bus.py:367) for HARTOS-internal
+# cross-subsystem subscribers.  These are NOT meant for the SPA — the
+# canonical SSE delivery is the SEPARATE `_route_sse` leg in the same
+# publish() call (line 373) which calls broadcast_sse_safe with the
+# RAW topic.  Without this denylist entry the EventBus auto-bridge at
+# line 218 fires broadcast_sse_safe AGAIN with `bus.<topic>` — two
+# SSE events for one publish, with different `type=` keys, defeating
+# the SPA's msg_id||request_id dedup keys (which diverge across the
+# two envelope shapes).  Live evidence 2026-05-10 20:28:29 showed
+# TTS audio playing twice on the same chat turn caused by exactly
+# this dual-bridge race (bus.chat.pupit + chat.pupit + message all
+# fired in 10ms).  Adding the denylist entry keeps `bus.*` events
+# HARTOS-internal while preserving the canonical SSE leg.
+_SSE_DENYLIST_PREFIXES: tuple = ('bus.',)
 
 
 def _topic_targets_sse(topic: str) -> bool:
