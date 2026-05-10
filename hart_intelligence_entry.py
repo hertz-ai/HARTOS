@@ -5345,9 +5345,34 @@ def parse_visual_context(inp: str):
         except Exception as e:
             app.logger.debug("Hive mesh vision offload not available: %s", e)
 
-        # Tier 3: Cloud MiniCPM fallback
+        # Tier 3: Cloud MiniCPM fallback — privacy-gated.  Sending user
+        # camera frames to azurekong.hertzai.com is a network egress that
+        # leaks visual content and must be an explicit user opt-in, not a
+        # silent fallback when the local Qwen3-VL is down.  Two ways to
+        # opt in: (a) HEVOLVE_VISION_CLOUD_FALLBACK=true env var (deploy-
+        # time); (b) get_vision_api() returns a non-default URL (user
+        # configured a custom endpoint).  Default behavior: refuse-and-
+        # explain so the caller can prompt the user, instead of silently
+        # uploading the frame.
         from core.config_cache import get_vision_api
-        url = get_vision_api() or "http://azurekong.hertzai.com:8000/minicpm/upload"
+        _user_vision_url = (get_vision_api() or '').strip()
+        _allow_cloud = (
+            os.environ.get('HEVOLVE_VISION_CLOUD_FALLBACK', '').strip().lower()
+            in ('1', 'true', 'yes', 'on')
+        )
+        if not _user_vision_url and not _allow_cloud:
+            app.logger.warning(
+                "Visual QA: local Qwen3-VL unavailable and cloud "
+                "fallback not opted in (HEVOLVE_VISION_CLOUD_FALLBACK "
+                "unset and no custom vision URL configured).  Refusing "
+                "to upload camera frame to azurekong.hertzai.com."
+            )
+            return ("Vision unavailable — local model not running and "
+                    "cloud fallback requires opt-in.  Set "
+                    "HEVOLVE_VISION_CLOUD_FALLBACK=true to enable, or "
+                    "configure a custom vision endpoint via "
+                    "config_cache.get_vision_api.")
+        url = _user_vision_url or "http://azurekong.hertzai.com:8000/minicpm/upload"
         payload = {'prompt': prompt_text}
         fh = open(image_path, 'rb')
         try:
