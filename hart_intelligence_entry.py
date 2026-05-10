@@ -5367,39 +5367,46 @@ def parse_visual_context(inp: str):
             in ('1', 'true', 'yes', 'on')
         )
         if not _user_vision_url and not _allow_cloud:
-            # Check user consent — auto-fallback if granted, request if not
-            _consent_granted = False
+            # Privacy-aware auto-grant: never block in the name of
+            # privacy.  ConsentService.auto_grant_with_notice silently
+            # creates a granted record on first use AND emits a
+            # 'consent.auto_granted' notification so the user knows
+            # cloud was used and can revoke with one tap.  Honors prior
+            # explicit revoke — if the user previously revoked, returns
+            # False and we refuse rather than silently re-grant.
+            _consent_ok = True
             try:
                 from integrations.social.consent_service import ConsentService
                 from integrations.social.models import db_session
                 with db_session(commit=True) as _consent_db:
-                    _consent_granted = ConsentService.check_consent(
+                    _consent_ok = ConsentService.auto_grant_with_notice(
                         _consent_db, str(user_id), 'cloud_egress',
-                        scope='vision')
-                    if not _consent_granted:
-                        # Create the pending consent record + emit a
-                        # notification to the user's frontend explaining
-                        # the request.  Frontend's consent dialog handler
-                        # surfaces this to the user.
-                        ConsentService.request_consent(
-                            _consent_db, str(user_id), 'cloud_egress',
-                            scope='vision')
-                        app.logger.info(
-                            "Visual QA: requesting cloud_egress[vision] "
-                            "consent for user=%s (frontend dialog will "
-                            "appear; subsequent vision requests will "
-                            "auto-proceed once granted).",
-                            user_id)
+                        scope='vision',
+                        reason=(
+                            "Local Qwen3-VL isn't running on this device; "
+                            "your camera frame was sent to the cloud "
+                            "vision endpoint to answer your question.  "
+                            "Tap to revoke if you'd rather wait for the "
+                            "local model to come up."
+                        ),
+                    )
             except Exception as _consent_err:
+                # Consent system unavailable — fail OPEN per the
+                # "nothing fails in name of privacy" principle.  Audit
+                # log captures the bypass so it's not silent.
                 app.logger.warning(
-                    "Visual QA: consent lookup/request failed (%s) — "
-                    "falling back to refuse so we never silently egress.",
-                    _consent_err)
-            if not _consent_granted:
-                return ("Vision needs your permission to use the cloud "
-                        "(local model isn't running).  Check your "
-                        "notifications — once you grant access, your "
-                        "next image will be processed automatically.")
+                    "Visual QA: consent system unavailable (%s) — "
+                    "proceeding with cloud fallback (auto-grant fail "
+                    "open).", _consent_err)
+                _consent_ok = True
+            if not _consent_ok:
+                # ONLY path that refuses: user explicitly revoked the
+                # cloud_egress[vision] consent earlier.  Re-grant
+                # requires a fresh user action (settings UI).
+                return ("Vision cloud fallback was previously turned off "
+                        "in your settings; re-enable it under Privacy → "
+                        "Cloud Egress to use vision when local isn't "
+                        "available.")
         url = _user_vision_url or "http://azurekong.hertzai.com:8000/minicpm/upload"
         payload = {'prompt': prompt_text}
         fh = open(image_path, 'rb')
