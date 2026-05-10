@@ -5345,15 +5345,21 @@ def parse_visual_context(inp: str):
         except Exception as e:
             app.logger.debug("Hive mesh vision offload not available: %s", e)
 
-        # Tier 3: Cloud MiniCPM fallback — privacy-gated.  Sending user
-        # camera frames to azurekong.hertzai.com is a network egress that
-        # leaks visual content and must be an explicit user opt-in, not a
-        # silent fallback when the local Qwen3-VL is down.  Two ways to
-        # opt in: (a) HEVOLVE_VISION_CLOUD_FALLBACK=true env var (deploy-
-        # time); (b) get_vision_api() returns a non-default URL (user
-        # configured a custom endpoint).  Default behavior: refuse-and-
-        # explain so the caller can prompt the user, instead of silently
-        # uploading the frame.
+        # Tier 3: Cloud MiniCPM fallback — gated through the canonical
+        # ConsentService so cloud egress always has a user-grant trail.
+        # Resolution order:
+        #   (a) HEVOLVE_VISION_CLOUD_FALLBACK=true env var → blanket
+        #       deploy-time grant (cloud/regional tiers where cloud IS
+        #       the local — see scripts/start_cloud.sh + start_regional.sh)
+        #   (b) get_vision_api() returns a non-default URL → user
+        #       configured a custom endpoint, that's their explicit opt-in
+        #   (c) ConsentService.check_consent(user_id, 'cloud_egress',
+        #       scope='vision') == True → user previously granted
+        #   (d) Otherwise: ConsentService.request_consent(...) creates a
+        #       pending row and emits a notification (consent.request
+        #       topic → frontend renders a consent dialog).  Return a
+        #       holding message; once user grants, NEXT vision request
+        #       proceeds without prompting.  Never silently uploads.
         from core.config_cache import get_vision_api
         _user_vision_url = (get_vision_api() or '').strip()
         _allow_cloud = (
@@ -5361,17 +5367,39 @@ def parse_visual_context(inp: str):
             in ('1', 'true', 'yes', 'on')
         )
         if not _user_vision_url and not _allow_cloud:
-            app.logger.warning(
-                "Visual QA: local Qwen3-VL unavailable and cloud "
-                "fallback not opted in (HEVOLVE_VISION_CLOUD_FALLBACK "
-                "unset and no custom vision URL configured).  Refusing "
-                "to upload camera frame to azurekong.hertzai.com."
-            )
-            return ("Vision unavailable — local model not running and "
-                    "cloud fallback requires opt-in.  Set "
-                    "HEVOLVE_VISION_CLOUD_FALLBACK=true to enable, or "
-                    "configure a custom vision endpoint via "
-                    "config_cache.get_vision_api.")
+            # Check user consent — auto-fallback if granted, request if not
+            _consent_granted = False
+            try:
+                from integrations.social.consent_service import ConsentService
+                from integrations.social.models import db_session
+                with db_session(commit=True) as _consent_db:
+                    _consent_granted = ConsentService.check_consent(
+                        _consent_db, str(user_id), 'cloud_egress',
+                        scope='vision')
+                    if not _consent_granted:
+                        # Create the pending consent record + emit a
+                        # notification to the user's frontend explaining
+                        # the request.  Frontend's consent dialog handler
+                        # surfaces this to the user.
+                        ConsentService.request_consent(
+                            _consent_db, str(user_id), 'cloud_egress',
+                            scope='vision')
+                        app.logger.info(
+                            "Visual QA: requesting cloud_egress[vision] "
+                            "consent for user=%s (frontend dialog will "
+                            "appear; subsequent vision requests will "
+                            "auto-proceed once granted).",
+                            user_id)
+            except Exception as _consent_err:
+                app.logger.warning(
+                    "Visual QA: consent lookup/request failed (%s) — "
+                    "falling back to refuse so we never silently egress.",
+                    _consent_err)
+            if not _consent_granted:
+                return ("Vision needs your permission to use the cloud "
+                        "(local model isn't running).  Check your "
+                        "notifications — once you grant access, your "
+                        "next image will be processed automatically.")
         url = _user_vision_url or "http://azurekong.hertzai.com:8000/minicpm/upload"
         payload = {'prompt': prompt_text}
         fh = open(image_path, 'rb')

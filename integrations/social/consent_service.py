@@ -31,6 +31,14 @@ CONSENT_TYPES = frozenset({
     'public_exposure',   # Content made public
     'payment_setup',     # User provides UPI/payment ID for revenue payouts
     'compute_contribute', # User allows their device to process hive tasks
+    'cloud_egress',      # User allows fallback to cloud (vision, social
+                         # sync, third-party APIs) when local resources
+                         # can't satisfy the request.  Scope-aware: e.g.
+                         # scope='vision' grants cloud-vision specifically;
+                         # scope='social_sync' grants cloud social fan-out.
+                         # First-time fallback emits a notification +
+                         # request_consent record; user grants once,
+                         # subsequent requests proceed without prompting.
 })
 
 
