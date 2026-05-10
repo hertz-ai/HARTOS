@@ -71,15 +71,34 @@ CHANNEL_CATALOG = {
         'icon': 'whatsapp',
         'color': '#25d366',
         'category': 'core',
-        'auth_method': 'credentials',
+        # auth_method=qr_session — same vocabulary already used by
+        # telegram_user / discord_user.  Pairs the user's existing
+        # WhatsApp account on their phone with a Nunba-side WAHA
+        # gateway by displaying a QR they scan from WhatsApp's own
+        # "Linked devices" UI.  No API keys, no developer portal.
+        'auth_method': 'qr_session',
         'setup_fields': [
+            # phone_number is the only user-visible field on the
+            # default path — everything else is provisioned by the
+            # WAHA gateway running on this Nunba install.
+            {'key': 'phone_number', 'label': 'Your WhatsApp Number', 'type': 'tel',
+             'help': 'Your own E.164 number (e.g. +<country><number>). '
+                     'Each Nunba install binds its owner.'},
+            # auto: True — register_channel pre-fills these from env
+            # defaults (`WHATSAPP_API_URL`, `WHATSAPP_API_KEY`) so the
+            # user never has to know about WAHA's existence on the
+            # happy path.  Connect_Channel's form-builder skips fields
+            # with auto:True; admin Channels page still shows them so
+            # operators can override for non-localhost WAHA.
             {'key': 'api_url', 'label': 'WAHA Base URL', 'type': 'text',
-             'help': 'WAHA HTTP API endpoint (e.g. http://localhost:3000).'},
+             'auto': True, 'default': 'http://localhost:3000',
+             'help': 'WAHA HTTP API endpoint.  Defaults to localhost:3000; '
+                     'override via WHATSAPP_API_URL env or admin page.'},
             {'key': 'access_token', 'label': 'API Key', 'type': 'password',
-             'help': 'WAHA API key (from scripts/setup_whatsapp_waha.py).'},
-            {'key': 'phone_number', 'label': 'Your WhatsApp Number', 'type': 'text',
-             'help': 'Your own E.164 number (e.g. +<country><number>). This is '
-                     'YOUR number — each Nunba install binds its owner.'},
+             'auto': True, 'default': '',
+             'help': 'WAHA API key.  Empty for localhost WAHA in no-auth '
+                     'mode (default); set via WHATSAPP_API_KEY env when '
+                     'fronting WAHA with auth.'},
             {'key': 'enable_self_chat_agent', 'label': 'Self-chat → Nunba',
              'type': 'toggle', 'default': True,
              'help': 'When you tap your own contact in WhatsApp ("Message '

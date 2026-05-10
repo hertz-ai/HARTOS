@@ -2825,6 +2825,73 @@ def _handle_list_pending_actions_tool(input_text: str) -> str:
         return f"List_Pending_Actions error: {str(e)[:200]}"
 
 
+def _wire_qr_pair_emitter(channel_type: str, meta: dict) -> None:
+    """Hook the live adapter's existing `set_qr_callback` to the
+    Liquid UI `agent_ui_update` pipe so the user sees a QR right
+    where they typed "connect <channel>" — no admin-page navigation.
+
+    Single helper for every auth_method='qr_session' channel
+    (whatsapp, telegram_user, discord_user) — the per-channel adapter
+    already exposes the callback hook, this just bridges it to the
+    Liquid UI emitter that the form-based flows already use.
+
+    Best-effort: if the adapter isn't registered yet (e.g. fresh
+    bind before bootstrap), the QR will surface on next adapter
+    spawn via the same callback.
+    """
+    try:
+        from core.platform.service_registry import ServiceRegistry
+        from integrations.channels.registry import get_registry
+        _lui = ServiceRegistry.get('LiquidUIService')
+        if _lui is None:
+            return
+        adapter = get_registry().get(channel_type)
+        if adapter is None or not hasattr(adapter, 'set_qr_callback'):
+            return
+        user_id = thread_local_data.get_user_id() or 'system'
+        display_name = meta.get('display_name') or channel_type
+
+        def _emit_qr(qr: str) -> None:
+            try:
+                _lui.agent_ui_update(user_id, {
+                    'type': 'qr_pair',
+                    'channel': channel_type,
+                    'title': f"Scan to connect {display_name}",
+                    'help': (
+                        f"Open {display_name} on your phone → Linked "
+                        "devices → Link a device → scan this code."
+                    ),
+                    'qr': qr,
+                })
+            except Exception as e:
+                logger.debug("qr_pair emit failed: %s", e)
+
+        adapter.set_qr_callback(_emit_qr)
+
+        # Trigger an immediate (re)connect so the adapter spins up its
+        # WAHA / MTProto session and pushes the first QR via the
+        # callback.  Reuses the same loop pattern the admin
+        # /reconnect endpoint uses — single source of truth.
+        try:
+            import asyncio as _asyncio
+            loop = _asyncio.new_event_loop()
+            try:
+                try:
+                    loop.run_until_complete(adapter.disconnect())
+                except Exception:
+                    pass
+                loop.run_until_complete(adapter.connect())
+            finally:
+                loop.close()
+        except Exception as e:
+            logger.debug(
+                "qr_pair reconnect deferred (adapter spawns on bootstrap): %s",
+                e,
+            )
+    except Exception as e:
+        logger.debug("Connect_Channel: _wire_qr_pair_emitter failed: %s", e)
+
+
 def _handle_connect_channel_tool(input_text: str) -> str:
     """Register / connect a messaging channel (WhatsApp, Telegram, Discord,
     Slack, etc.) from natural-language chat. Delegates to the existing
@@ -2894,7 +2961,14 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                 from integrations.channels.metadata import get_channel_metadata
                 meta = get_channel_metadata(channel_type) or {}
                 setup_fields = meta.get('setup_fields') or []
-                if setup_fields:
+                # Skip auto:True fields (WAHA api_url, access_token, etc)
+                # — these are server-provisioned via env-var defaults in
+                # register_channel; surfacing them in the chat form would
+                # ask the user about gateway infrastructure they shouldn't
+                # need to know about.  Operator override stays available
+                # via the admin Channels page (which shows ALL fields).
+                visible_fields = [f for f in setup_fields if not f.get('auto')]
+                if visible_fields:
                     from core.platform.service_registry import ServiceRegistry
                     _lui = ServiceRegistry.get('LiquidUIService')
                     if _lui:
@@ -2915,15 +2989,41 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                                                 ('_token', '_secret', '_key'))
                                         ),
                                         'help': f.get('help') or '',
+                                        'type': f.get('type') or 'text',
+                                        'default': f.get('default'),
                                     }
-                                    for f in setup_fields
+                                    for f in visible_fields
                                 ],
+                                # external_url surfaces a "Open <Provider>"
+                                # button at the top of the form so users
+                                # can launch BotFather / Discord dev portal
+                                # / Slack app installer in their browser
+                                # before pasting the resulting token.
+                                'external_url': meta.get('external_url'),
                                 'submit_label': 'Connect',
                                 'submit_action': 'register_channel',
                             },
                         )
         except Exception as e:
             logger.debug("Connect_Channel: liquid UI emit skipped: %s", e)
+
+        # ── QR-session post-success hookup ────────────────────────
+        # For channels with auth_method='qr_session' (whatsapp,
+        # telegram_user, discord_user) the binding alone isn't enough —
+        # the user also needs to scan a QR with their existing client
+        # to authorize the session.  Reuse the existing
+        # `set_qr_callback` on each adapter and the existing
+        # `agent_ui_update` Liquid UI emit pipe (same emitter the
+        # form uses, just a new payload kind).  Single hook for all
+        # three channels — DRY.
+        try:
+            if isinstance(result, str) and 'registered and enabled' in result:
+                from integrations.channels.metadata import get_channel_metadata
+                meta = get_channel_metadata(channel_type) or {}
+                if meta.get('auth_method') == 'qr_session':
+                    _wire_qr_pair_emitter(channel_type, meta)
+        except Exception as e:
+            logger.debug("Connect_Channel: qr_pair wire skipped: %s", e)
         return result
     except Exception as e:
         return f"Channel connect error: {str(e)[:200]}"

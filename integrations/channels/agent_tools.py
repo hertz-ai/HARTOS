@@ -142,12 +142,42 @@ def build_channel_tool_closures(ctx):
             try:
                 config = json.loads(config_json)
             except json.JSONDecodeError:
-                # If user just pasted a token, try to assign it to the first field
-                fields = meta.get('setup_fields', [])
+                # If user just pasted a token, try to assign it to the first
+                # USER-VISIBLE field (skip auto:True infrastructure fields
+                # like WhatsApp's api_url/access_token — the user wouldn't
+                # paste a WAHA URL when prompted for "WhatsApp number").
+                fields = [f for f in meta.get('setup_fields', [])
+                          if not f.get('auto')]
                 if fields:
                     config = {fields[0]['key']: config_json.strip()}
                 else:
                     return f"Could not parse config. Expected JSON. Required fields: {[f['key'] for f in meta.get('setup_fields', [])]}"
+
+            # Auto-fill auto:True fields from env-var defaults so the
+            # user doesn't have to know about gateway infrastructure
+            # (WAHA api_url for WhatsApp, etc).  Order:
+            #   1. config[key] explicitly supplied by caller — wins
+            #   2. WHATSAPP_<KEY_UPPER> env var — operator override
+            #      (e.g. WHATSAPP_API_URL=https://my-waha.example.com)
+            #   3. setup_fields[].default — schema default
+            #   4. '' if no default
+            # Single helper inside this closure — DRY across all
+            # auto-fill paths in register_channel.
+            import os
+            env_prefix = f"{channel_type.upper()}_"
+            for f in meta.get('setup_fields', []) or []:
+                if not f.get('auto'):
+                    continue
+                key = f.get('key')
+                if not key or config.get(key) not in (None, ''):
+                    continue
+                env_val = os.getenv(env_prefix + key.upper())
+                if env_val is not None:
+                    config[key] = env_val
+                elif 'default' in f:
+                    config[key] = f['default']
+                else:
+                    config[key] = ''
 
             # Save via admin API singleton
             from integrations.channels.admin.api import get_api
