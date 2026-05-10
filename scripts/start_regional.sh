@@ -51,6 +51,10 @@ export HEVOLVE_LLM_ENDPOINT_URL="${LLM_HOST}"
 export HEVOLVE_LLM_MODEL_NAME="${LLM_MODEL}"
 export HEVOLVE_LLM_API_KEY="${LLM_KEY}"
 export HEVOLVE_AGENT_ENGINE_ENABLED=true
+# Regional tier IS the local — vision cloud-fallback is the canonical
+# vision path here, not a third-party egress.  (Flat/desktop tier
+# leaves this unset so user images never silently leave the device.)
+export HEVOLVE_VISION_CLOUD_FALLBACK=true
 # Diarization: auto-started as sidecar. Set URL only to override with external service.
 # export HEVOLVE_DIARIZATION_URL="ws://external-host:8004"
 
