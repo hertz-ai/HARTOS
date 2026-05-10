@@ -2011,7 +2011,14 @@ def publish_async(topic, message, timeout=2.0):
     # every other publish_async caller silently dropped on the desktop.
     # The publisher abstraction is the canonical home — no parallel
     # path at each call site.
-    if isinstance(data, dict) and data.get('user_id'):
+    # TTS skips this leg — TTS owns its own broadcast_sse_safe call at the
+    # TTS publish site (search "TTS async: published" below).  Routing TTS
+    # through here in addition was producing two audio playbacks per turn
+    # (the SPA's request_id-keyed dedup didn't catch them when envelope
+    # shapes diverged across transports) and racing with the typewriter
+    # animation.  Keep TTS on its dedicated path; this leg covers
+    # everything else (thinking traces, channel events, capability updates).
+    if isinstance(data, dict) and data.get('user_id') and data.get('action') != 'TTS':
         try:
             from core.platform.events import broadcast_sse_safe
             # event_type mirrors the canonical chatbot_routes.publish_to_crossbar
@@ -6797,12 +6804,19 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
                     'request_id': str(request_id),
                     'action': 'TTS',
                 }
-                # publish_async fans out to MessageBus + SSE/local-WAMP +
-                # cloud-crossbar telemetry in one call (see publish_async at
-                # line 1929 for the leg ordering).  user_id is read from the
-                # payload by the SSE leg, so include it on the dict.
-                _tts_payload['user_id'] = user_id
                 publish_async(f'com.hertzai.pupit.{user_id}', json.dumps(_tts_payload))
+                # Also push via SSE directly — publish_async → MessageBus/WAMP doesn't
+                # reach SSE clients, so the unified helper fans out to the Nunba
+                # main.py SSE broker. See core/platform/events.broadcast_sse_safe.
+                # NOTE: publish_async's generic SSE fan-out at line ~2014 SKIPS
+                # action='TTS' specifically because routing TTS through both
+                # paths produced double-audio (the SPA's request_id-keyed dedup
+                # missed cross-transport duplicates).  TTS owns this explicit
+                # call; everything else (thinking traces, channel events) is
+                # auto-handled inside publish_async.
+                from core.platform.events import broadcast_sse_safe
+                if not broadcast_sse_safe('message', _tts_payload, user_id=user_id):
+                    app.logger.debug("TTS SSE: broadcast_sse_event unavailable (Nunba main not loaded)")
                 app.logger.info(f"TTS async: published successfully")
             else:
                 app.logger.warning(f"TTS async: no audio file — path={audio_path}, exists={os.path.isfile(audio_path) if audio_path else False}")
