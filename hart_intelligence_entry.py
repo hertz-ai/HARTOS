@@ -769,6 +769,23 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 1024))  # 2MB default
 
+
+def _json_endpoint(f):
+    """Wrap a Flask view so unhandled exceptions return ``{'error': ...}, 500``.
+
+    Defined here (early) so route registration blocks below this point can
+    use ``@_json_endpoint`` as a decorator at module-load time. Previously
+    lived near line 9200 — Kong gateway init at line ~1217 NameError'd because
+    the decorator name didn't exist yet when its def-statement was parsed.
+    """
+    @wraps(f)
+    def _wrapped(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    return _wrapped
+
 if _is_bundled:
     # Bundled: root owns the handlers; let app.logger propagate to root
     # so ALL module loggers (hevolveai, langchain, etc.) are captured.
@@ -1622,7 +1639,8 @@ def _init_learning_pipeline():
             f"[EmbodiedAI] HevolveAI not installed — learning disabled: {e}")
     except Exception as e:
         logging.getLogger(__name__).error(
-            f"[EmbodiedAI] Learning pipeline init failed: {e}")
+            f"[EmbodiedAI] Learning pipeline init failed: {e}",
+            exc_info=True)
 
 
 def get_learning_provider():
@@ -9200,19 +9218,6 @@ Example response format:
     except Exception as e:
         app.logger.error(f"Error in /zeroshot/ endpoint: {str(e)}")
         return jsonify({"error": str(e)}), 500
-
-# ─── Shared error-handling decorator (DRY: replaces 12+ identical try/except blocks) ──
-
-def _json_endpoint(f):
-    """Wrap a Flask view so unhandled exceptions return ``{'error': ...}, 500``."""
-    @wraps(f)
-    def _wrapped(*args, **kwargs):
-        try:
-            return f(*args, **kwargs)
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    return _wrapped
-
 
 # ─── Runtime Media Tools API ──────────────────────────────────────────
 # Endpoints for managing runtime media tools (Wan2GP, TTS-Audio-Suite,

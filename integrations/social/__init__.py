@@ -216,6 +216,16 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"HevolveSocial admin blueprint skipped: {e}")
 
+    # Register OAuth click-through blueprint (PR O).  /start needs auth,
+    # /callback is public (state-token authenticated) — separate blueprint
+    # so admin_bp's before_request gate doesn't 401 the provider redirect.
+    try:
+        from integrations.channels.oauth_api import oauth_bp
+        app.register_blueprint(oauth_bp)
+        logger.info("HevolveSocial OAuth API registered at /api/oauth")
+    except Exception as e:
+        logger.debug(f"HevolveSocial OAuth blueprint skipped: {e}")
+
     # Register user-facing channel bindings API (catalog, bindings, pairing, presence)
     try:
         from .api_channels import channel_user_bp

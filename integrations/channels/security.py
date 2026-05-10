@@ -515,3 +515,138 @@ def get_pairing_manager() -> PairingManager:
     if _pairing_manager is None:
         _pairing_manager = PairingManager()
     return _pairing_manager
+
+
+# ────────────────────────────────────────────────────────────────────
+# OAuth click-through state manager (PR O)
+# ────────────────────────────────────────────────────────────────────
+#
+# CSRF + binding identity for the /oauth/<channel_type>/start →
+# /oauth/<channel_type>/callback round-trip.  The provider redirects
+# back to us with a `state` query param; we use that to recover:
+#   - the user_id (so we can write the binding to the right account)
+#   - the channel_type (so we know which adapter to call)
+#   - the PKCE code_verifier (for providers that require PKCE)
+#
+# Stays in-process — fine for single-instance flat/regional deploys.
+# Multi-instance central deploys would need Redis-backed state, but
+# central isn't an OAuth callback target by architecture (#275).
+
+
+@dataclass
+class _OAuthState:
+    """Pending OAuth state record, expires after STATE_TTL_MIN."""
+    state: str
+    user_id: int
+    channel_type: str
+    code_verifier: Optional[str] = None  # PKCE
+    extra: Dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.now)
+
+    @property
+    def is_expired(self) -> bool:
+        return datetime.now() > self.created_at + timedelta(
+            minutes=OAuthStateManager.STATE_TTL_MIN
+        )
+
+
+class OAuthStateManager:
+    """Issues + verifies the ``state`` parameter for OAuth click-through.
+
+    Mirrors PairingManager's lifecycle: in-memory dict, periodic eviction,
+    one-shot verification (verify consumes the state — replay-protected).
+    """
+
+    STATE_TTL_MIN = 10  # OAuth round-trip should complete in seconds
+
+    def __init__(self):
+        self._states: Dict[str, _OAuthState] = {}
+
+    def generate_state(
+        self,
+        user_id: int,
+        channel_type: str,
+        code_verifier: Optional[str] = None,
+        **extra: Any,
+    ) -> str:
+        """Generate a fresh state token.  Use return value as the
+        ``state`` param in the authorize URL.  ``code_verifier`` is the
+        PKCE secret for providers that require it; pass None otherwise.
+        """
+        self._evict_expired()
+        # 32 random bytes → 43 url-safe chars.  Wide enough that
+        # birthday-collision is irrelevant inside a 10-minute window.
+        state = secrets.token_urlsafe(32)
+        self._states[state] = _OAuthState(
+            state=state,
+            user_id=user_id,
+            channel_type=channel_type,
+            code_verifier=code_verifier,
+            extra=dict(extra),
+        )
+        logger.info(
+            "Generated OAuth state for user_id=%s channel=%s (pending=%d)",
+            user_id, channel_type, len(self._states),
+        )
+        return state
+
+    def verify_state(self, state: str) -> Optional[Dict[str, Any]]:
+        """Verify + consume a state token.  Returns the stored context
+        dict on success, None if the state is missing / expired / already
+        consumed.  Single-use: a verified state cannot be re-used.
+        """
+        if not state or not isinstance(state, str):
+            return None
+        record = self._states.pop(state, None)
+        if record is None:
+            logger.warning("OAuth state verify failed: unknown / replayed token")
+            return None
+        if record.is_expired:
+            logger.warning(
+                "OAuth state verify failed: expired (created %s)",
+                record.created_at.isoformat(),
+            )
+            return None
+        return {
+            'user_id': record.user_id,
+            'channel_type': record.channel_type,
+            'code_verifier': record.code_verifier,
+            'extra': record.extra,
+        }
+
+    def _evict_expired(self) -> None:
+        """Remove expired records.  O(N) but N is tiny (≤ active OAuth
+        flows ≤ active users * 1).  No need for a background task.
+        """
+        expired = [s for s, r in self._states.items() if r.is_expired]
+        for s in expired:
+            del self._states[s]
+        if expired:
+            logger.debug("Evicted %d expired OAuth states", len(expired))
+
+
+_oauth_state_manager: Optional[OAuthStateManager] = None
+
+
+def get_oauth_state_manager() -> OAuthStateManager:
+    """Get or create the global OAuth state manager."""
+    global _oauth_state_manager
+    if _oauth_state_manager is None:
+        _oauth_state_manager = OAuthStateManager()
+    return _oauth_state_manager
+
+
+def generate_pkce_pair() -> Tuple[str, str]:
+    """Generate a PKCE (code_verifier, code_challenge) pair.
+
+    code_verifier: 43-char url-safe random string (RFC 7636 §4.1).
+    code_challenge: BASE64URL(SHA256(code_verifier)) without padding (S256).
+
+    Used by providers that set ``oauth_uses_pkce: True`` in metadata —
+    Google, Microsoft, Twitter X v2.
+    """
+    import base64
+    code_verifier = secrets.token_urlsafe(32)  # ≥43 chars
+    digest = hashlib.sha256(code_verifier.encode('ascii')).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b'=').decode('ascii')
+    return code_verifier, code_challenge
