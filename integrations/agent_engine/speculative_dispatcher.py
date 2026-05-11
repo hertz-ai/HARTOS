@@ -42,6 +42,8 @@ try:
 except ImportError:
     seed_autogen_from_shared_history = None  # type: ignore[assignment]
 
+from integrations.agent_engine.escalation_reasons import EscalationReason
+
 logger = logging.getLogger('hevolve_social')
 
 
@@ -408,8 +410,22 @@ class SpeculativeDispatcher:
         # ── 3. Parse envelope + record draft interaction ──
         parsed = self._parse_draft_envelope(draft_raw)
         draft_reply = parsed.get('reply') or draft_raw.strip()[:500]
+        # Track whether the envelope parsed at all — an empty parsed dict
+        # means we fell through to the delegate='local' default below,
+        # which is materially different from the model emitting an
+        # explicit 'local' decision.  Stamp the reason for downstream
+        # telemetry / continual-learning before any guard runs.
+        parse_failed = not parsed
         delegate = parsed.get('delegate', 'local')  # default on parse fail
         confidence = float(parsed.get('confidence') or 0.0)
+        # Canonical reason value — refined by each guard below.  Starts
+        # at PARSE_FAILURE when the envelope didn't parse, otherwise the
+        # baseline CLASSIFIER_DELEGATE.  Only meaningful when we end up
+        # in the delegate in ('local', 'hive') branch — None otherwise.
+        escalation_reason: Optional[EscalationReason] = (
+            EscalationReason.PARSE_FAILURE if parse_failed
+            else EscalationReason.CLASSIFIER_DELEGATE
+        )
 
         # REFUSAL GUARD: the draft is the first-responder role, NOT the
         # authority on system capability. Any reply that asserts the
@@ -437,6 +453,7 @@ class SpeculativeDispatcher:
             draft_reply = _REFUSAL_STANDBY_REPLY
             delegate = 'local'
             refusal_overridden = True
+            escalation_reason = EscalationReason.REFUSAL_OVERRIDE
 
         # REASONING-QUALITY GUARD: an unsure "none" is not good enough to
         # ship as the final answer. Promote it to "local" so an expert
@@ -452,6 +469,7 @@ class SpeculativeDispatcher:
                 f"{_DRAFT_CONFIDENCE_FLOOR}) → escalating to local verifier"
             )
             delegate = 'local'
+            escalation_reason = EscalationReason.LOW_CONFIDENCE
 
         # AGENT-BINDING GUARD: when the caller bound this turn to a
         # specific agent (prompt_id resolves to a real agent on disk,
@@ -476,6 +494,7 @@ class SpeculativeDispatcher:
                 prompt_id,
             )
             delegate = 'local'
+            escalation_reason = EscalationReason.AGENT_BOUND
 
         # ACTIONABLE-INTENT GUARD: when the draft's own classifier
         # surfaces an actionable intent flag (channel_connect,
@@ -536,6 +555,7 @@ class SpeculativeDispatcher:
             )
             draft_reply = _REFUSAL_STANDBY_REPLY
             delegate = 'local'
+            escalation_reason = EscalationReason.ACTIONABLE_INTENT
 
         # Non-Latin languages skip draft entirely (hart_intelligence_entry.py)
         # so this code path is only reached for English/Latin-script languages.
@@ -571,10 +591,20 @@ class SpeculativeDispatcher:
         except Exception:
             pass  # telemetry must never break the hot path
 
+        # When the draft path's net effect is "draft answered, no
+        # escalation" (delegate=='none' and none of the guards fired),
+        # the escalation_reason is meaningless — clear it so the
+        # WorldModelBridge sees a clean "this draft was the final
+        # answer" record.
+        recorded_reason = (
+            escalation_reason.value if delegate in ('local', 'hive')
+            else None
+        )
         self._record_interaction_safely(
             user_id=user_id, prompt_id=prompt_id, prompt=prompt,
             response=draft_reply, model_id=draft_model.model_id,
             latency_ms=draft_latency_ms, node_id=node_id, goal_id=goal_id,
+            escalation_reason=recorded_reason,
         )
 
         # ── 4. Schedule expert if the draft self-delegated ──
@@ -593,6 +623,7 @@ class SpeculativeDispatcher:
                 origin_model_id=draft_model.model_id,
                 origin_model_role='draft_model',
                 delegate=delegate,
+                escalation_reason=escalation_reason,
             )
             # When the user explicitly asked for `hive_preferred` AND the
             # draft self-delegated to hive, also fire a best-effort MoE
@@ -649,6 +680,11 @@ class SpeculativeDispatcher:
             # tell a hive fusion consult was fired in background.  Legacy
             # callers that don't read this field are unaffected.
             'hive_consult_scheduled': hive_consult_scheduled,
+            # Additive field: which guard promoted this turn to expert
+            # (or ``None`` when the draft answered as final).  Canonical
+            # values come from ``EscalationReason`` (see
+            # ``integrations.agent_engine.escalation_reasons``).
+            'escalation_reason': recorded_reason,
             'latency_ms': round(draft_latency_ms, 1),
             'energy_kwh': round(
                 self._registry.get_total_energy_kwh(hours=0.01), 6),
@@ -1011,12 +1047,20 @@ class SpeculativeDispatcher:
         origin_model_id: str,
         origin_model_role: str = 'fast_model',
         delegate: Optional[str] = None,
+        escalation_reason: Optional['EscalationReason'] = None,
     ) -> bool:
         """Schedule the expert-improvement task in the background pool.
 
         Centralizes the registration into self._active + thread submit so
         both dispatch_draft_first and dispatch_speculative share one code
         path. Returns True if the expert was actually scheduled.
+
+        ``escalation_reason`` is purely observability metadata: it gets
+        stamped into ``self._active[speculation_id]`` so admin /diag and
+        telemetry can ask "why was this turn escalated?" without
+        re-deriving the heuristic.  Optional + defaults to None so the
+        legacy dispatch_speculative call site (which has no draft to
+        derive a reason from) needs no change.
 
         Guards:
         - no expert model → nothing to schedule
@@ -1041,6 +1085,14 @@ class SpeculativeDispatcher:
             }
             if delegate is not None:
                 entry['delegate'] = delegate
+            if escalation_reason is not None:
+                # Store the canonical string value (Enum's str inheritance
+                # makes this safe for JSON / SSE round-trip).
+                entry['escalation_reason'] = (
+                    escalation_reason.value
+                    if hasattr(escalation_reason, 'value')
+                    else str(escalation_reason)
+                )
             self._active[speculation_id] = entry
 
         self._expert_pool.submit(

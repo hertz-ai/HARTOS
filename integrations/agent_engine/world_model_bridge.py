@@ -342,13 +342,23 @@ class WorldModelBridge:
                            prompt: str, response: str,
                            model_id: str = None, latency_ms: float = 0,
                            node_id: str = None, goal_id: str = None,
-                           attribution_chain: dict = None):
+                           attribution_chain: dict = None,
+                           escalation_reason: str = None):
         """Record every agent interaction as training data for HevolveAI.
 
         Called after EVERY /chat response.  Batches experiences and flushes
         them to HevolveAI (in-process or HTTP).
         HevolveAI auto-learns from every completion (3-priority queue:
         expert > reality > distillation).
+
+        ``escalation_reason`` (optional) — when the speculative dispatcher
+        promoted this turn from draft to expert path, the canonical
+        reason value from
+        ``integrations.agent_engine.escalation_reasons.EscalationReason``.
+        Stored on the experience so HevolveAI's distillation can weight
+        refusal-overridden / parse-failure traces differently from
+        clean classifier-delegate traces.  ``None`` when the draft
+        answered as final (no escalation).
 
         GUARDRAIL: ConstitutionalFilter screens before storage.
         """
@@ -386,6 +396,8 @@ class WorldModelBridge:
         # receives only the primary experience fields.
         if attribution_chain is not None:
             experience['attribution_chain'] = attribution_chain
+        if escalation_reason:
+            experience['escalation_reason'] = escalation_reason
 
         # PRIVACY: Redact secrets + anonymize user before shared ingestion.
         # The hive must NEVER leak secrets from one user to another.
