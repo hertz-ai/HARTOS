@@ -18,6 +18,53 @@ from typing import Dict, List, Any, Optional, Callable
 
 logger = logging.getLogger(__name__)
 
+try:
+    from core.labeled_tool import labeled_tool
+except ImportError:  # cx_Freeze / degraded test env
+    def labeled_tool(name, func, description, *, ui_label):  # type: ignore
+        from langchain.agents import Tool as _Tool
+        return _Tool(name=name, func=func, description=description)
+
+
+# Friendly UI status labels per known service tool name fragment.
+# Used by `get_langchain_tools()` to register Tool() display strings.
+_SERVICE_TOOL_LABEL_HINTS = {
+    "crawl4ai": "Crawling web content…",
+    "acestep": "Generating music…",
+    "ace_step": "Generating music…",
+    "ace-step": "Generating music…",
+    "diffrhythm": "Generating song…",
+    "rembg": "Removing background…",
+    "omniparser": "Parsing screen UI…",
+    "wan2gp": "Generating video…",
+    "f5": "Speaking with F5 voice…",
+    "kokoro": "Speaking with Kokoro voice…",
+    "cosyvoice": "Speaking with CosyVoice…",
+    "chatterbox": "Speaking with Chatterbox…",
+    "indic_parler": "Speaking Indic voice…",
+    "indic-parler": "Speaking Indic voice…",
+    "melotts": "Speaking with MeloTTS…",
+    "mms_tts": "Speaking with MMS TTS…",
+    "mms-tts": "Speaking with MMS TTS…",
+    "neutts": "Speaking with NeuTTS…",
+    "luxtts": "Speaking with LuxTTS…",
+    "xtts": "Speaking with XTTS…",
+    "omnivoice": "Speaking with OmniVoice…",
+    "pocket_tts": "Speaking with PocketTTS…",
+    "pocket-tts": "Speaking with PocketTTS…",
+    "tts_audio_suite": "Synthesising speech…",
+    "whisper": "Transcribing audio…",
+}
+
+
+def _derive_service_tool_label(tool_name: str, ep_name: str) -> str:
+    """Resolve a ≤60-char human label for a service-tool endpoint."""
+    key = (tool_name or "").lower()
+    for hint, label in _SERVICE_TOOL_LABEL_HINTS.items():
+        if hint in key:
+            return label[:60]
+    return (f"Calling {tool_name} service…")[:60]
+
 
 @dataclass
 class ServiceToolInfo:
@@ -232,8 +279,6 @@ class ServiceToolRegistry:
         LangChain Tool func receives a single string — we route it to
         the first parameter defined in the endpoint's params_schema.
         """
-        from langchain.agents import Tool
-
         tools = []
         for tool_name, tool in self._tools.items():
             if not tool.is_healthy:
@@ -246,10 +291,11 @@ class ServiceToolRegistry:
                     params = ep.get("params_schema", {})
                     primary_param = next(iter(params), "query") if params else "query"
 
-                    tools.append(Tool(
+                    tools.append(labeled_tool(
                         name=func.__name__,
                         func=lambda query, _f=func, _p=primary_param: _f(**{_p: query}),
                         description=ep.get("description", f"{tool_name} {ep_name}"),
+                        ui_label=_derive_service_tool_label(tool_name, ep_name),
                     ))
         return tools
 

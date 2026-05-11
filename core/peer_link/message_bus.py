@@ -67,8 +67,10 @@ TOPIC_MAP = {
     'task.probe': 'com.hertzai.hevolve.probe',
     # Mobile / push
     'mobile.push': 'com.hertzai.hevolve.pupitpublish',
-    # Agent coordination
-    'agent.multichat': 'com.hertzai.hevolve.agent.multichat',
+    # Agent coordination — per-user suffix mirrors chat/action/vision/...
+    # convention so WAMP router ACL (#246) can gate this topic too.
+    # (#510 follow-up — was a global topic before.)
+    'agent.multichat': 'com.hertzai.hevolve.agent.multichat.{user_id}',
     # Game sessions
     'game.session': 'com.hertzai.hevolve.game.{session_id}',
     # Community

@@ -47,6 +47,16 @@ import txaio; txaio.use_asyncio()  # Must be before any autobahn import
 from autobahn.asyncio.component import Component
 
 from threadlocal import thread_local_data
+# #509: canonical tool-logging decorator — wraps each autogen tool with
+# entry/exit/error logs, structured JSON error envelope, str-coercion,
+# coroutine-accidental-return guard, AND per-tool publish_chat_stage UI
+# emit.  Applied below to every `@assistant.register_for_execution()` +
+# `@helper.register_for_llm(...)` decorator stack.  Module-level import
+# so each inner `def` inside create_agents_for_user(...) can decorate
+# with `@log_tool_execution` directly.
+from core.tool_logging import log_tool_execution
+# UI status labels for these inner tools live in the canonical static
+# dict at core/constants.py:TOOL_LABELS — no per-import registration.
 
 # MCP Integration
 from integrations.mcp import load_user_mcp_servers, get_mcp_tools_for_autogen, mcp_registry
@@ -168,12 +178,16 @@ scheduler.start()
 # Performance: TTL caches replace unbounded global dicts (auto-expire after 2 hours)
 user_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_agents')
 role_agents: Dict[str, Tuple[autogen.AssistantAgent, autogen.UserProxyAgent]] = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_role_agents')
-agents_session = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_agents_session')
 recipes = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_recipes', loader=load_recipe)
 user_journey = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_journey')
 temp_users = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_temp_users')
-chat_joinees = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_chat_joinees')
-agents_roles = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_agents_roles')
+# Persona/role TTLCaches now live in core.persona_registry (single-writer
+# invariant per #510).  Same module-level singletons — existing usage sites
+# at lines 352, 359, 723, 728, 740, 745, 802, 806 keep working unchanged.
+from core.persona_registry import (
+    agents_session, agents_roles, chat_joinees,
+    register_persona_for_session, _send_message_to_roles_impl,
+)
 llm_call_track = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_llm_call_track')
 
 _active_tools = {}
@@ -699,6 +713,7 @@ def create_agents_for_role(user_id: str, prompt_id):
 
         @helper.register_for_execution()
         @assistant.register_for_llm(api_style="function", description="update the role/persona in db")
+        @log_tool_execution
         def update_persona(name: Annotated[str, "The persona name user selected"],
                            description: Annotated[str, "The persona description user selected"],
                            new: Annotated[bool, "Wethere it is a new chat or no"],
@@ -1189,82 +1204,75 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     context_handling.add_to_agent(executor)
     context_handling.add_to_agent(verify)
 
-    # @executor.register_for_execution()
-    # @helper.register_for_llm(api_style="function", description="sends message/ask questions to different roles/personas")
-    # def send_message_to_roles(role: Annotated[str, "the role to which the message to send"],
-    #                         message: Annotated[str, "The question to ask or message to send"]) -> str:
-    #     current_app.logger.info('INSIDE send_message_to_roles')
-    #     if f"{user_id}_{prompt_id}" in agents_session.keys():
-    #         for i in agents_session[f"{user_id}_{prompt_id}"]:
-    #             if i['role'] == role:
-    #                 current_app.logger.info(f'got role: {i}')
-    #                 crossbar_message = i
-    #                 crossbar_message['message'] = message
-    #                 crossbar_message['caller_role'] = agents_roles[f"{user_id}_{prompt_id}"][user_id]
-    #                 crossbar_message['caller_user_id'] = user_id
-    #                 crossbar_message['caller_prompt_id'] = prompt_id
-    #                 result = client.publish(
-    #                     f"com.hertzai.hevolve.agent.multichat", crossbar_message)
-    #                 current_app.logger.info('Published to chat')
-    #                 return 'Message sent Successfully'
-    #         return 'Not able to send Message try again later'
-    #     elif user_id in chat_joinees.keys() and prompt_id in chat_joinees[user_id].keys():
-    #         current_app.logger.info('contacting user with chat_joinees')
-    #         current_app.logger.info(f'chat_joinees[user_id][prompt_id] {chat_joinees[user_id][prompt_id]}  prompt_id{prompt_id}')
-    #         chat_creator_user_id = f"{chat_joinees[user_id][prompt_id]}_{prompt_id}"
-    #         current_app.logger.info(f'chat_creator_user_id {chat_creator_user_id}')
-    #         for i in agents_session[f"{chat_creator_user_id}"]:
-    #             if i['role'] == role:
-    #                 current_app.logger.info(f'got role: {i}')
-    #                 crossbar_message = i
-    #                 crossbar_message['message'] = message
-    #                 crossbar_message['caller_role'] = agents_roles[chat_creator_user_id][user_id]
-    #                 crossbar_message['caller_user_id'] = user_id
-    #                 crossbar_message['caller_prompt_id'] = prompt_id
-    #                 result = client.publish(
-    #                     f"com.hertzai.hevolve.agent.multichat", crossbar_message)
-    #                 current_app.logger.info(result)
-    #                 current_app.logger.info('Published to chat')
-    #                 return 'Message sent Successfully'
-    #         return 'Not able to send Message try again later'
-    #
+    # #510: send_message_to_roles — multi-persona broadcast.  Canonical impl
+    # lives in core.persona_registry (single source of truth for the persona
+    # TTLCaches + the dispatch routine).  Same impl runs in both create + reuse
+    # flows.  Uses the canonical publish_async from this module.
+    @assistant.register_for_execution()
+    @helper.register_for_llm(
+        api_style="function",
+        description="Send a message to a specific persona/role within this multi-persona agent (e.g. student/parent/teacher).")
+    @log_tool_execution
+    def send_message_to_roles(
+        role: Annotated[str, "Target persona/role name to deliver the message to"],
+        message: Annotated[str, "The question to ask or message to send"],
+    ) -> str:
+        return _send_message_to_roles_impl(
+            user_id, prompt_id, role, message, publish_fn=publish_async)
+    # #510: txt2img delegates to canonical helper_fun.txt2img (same impl as
+    # core.agent_tools.text_2_image).  Was hitting cloud Rasa directly —
+    # sovereignty-violating + parallel-path with core_AT.  helper_fun
+    # routes local-first.
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function", description="Text to image Creator")
+    @log_tool_execution
     def txt2img(text: Annotated[str, "Text to create image"]) -> str:
-        current_app.logger.info('INSIDE txt2img')
-        url = f"http://aws_rasa.hertzai.com:5459/txt2img?prompt={text}"
+        return helper_fun.txt2img(text)
 
-        payload = ""
-        headers = {}
-
-        response = pooled_post(url, headers=headers, data=payload)
-        return response.json()['img_url']
-
+    # #510: img2txt delegates to the canonical core.agent_tools.get_text_from_image
+    # closure.  Was a parallel impl without SSRF validation; canonical has
+    # security.sanitize.validate_url + bundled-mode local Qwen Vision path.
+    # The canonical closure is built later in this function (register_core_tools
+    # at L2262); we reach into core_tools at call time to dispatch.
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function", description="Image to Text/Question Answering from image")
-    def img2txt(image_url: Annotated[str, "image url of which you want text"], text: Annotated[
-        str, "the details you want from image"] = 'Describe the Images & Text data in this image in detail') -> str:
-        current_app.logger.info('INSIDE img2txt')
-        from core.config_cache import get_vision_api
+    @log_tool_execution
+    def img2txt(
+        image_url: Annotated[str, "image url of which you want text"],
+        text: Annotated[str, "the details you want from image"] = 'Describe the Images & Text data in this image in detail',
+    ) -> str:
+        # Canonical impl was built by build_core_tool_closures at L2261 by the
+        # time this function fires (decoration registers the wrapper; the
+        # wrapper body resolves the canonical lazily on each call).
+        _canon = next(
+            (f for n, _, f in core_tools if n == 'get_text_from_image'),
+            None) if 'core_tools' in dir() else None
+        if _canon is not None:
+            return _canon(image_url, text)
+        # Pre-2261 / degraded-env fallback: same logic as the canonical body
+        # so behavior is consistent if the closure wasn't built yet.
+        from core.config_cache import get_vision_api, is_bundled
+        try:
+            from security.sanitize import validate_url
+            image_url = validate_url(image_url)
+        except (ImportError, ValueError) as e:
+            return f"Error: URL blocked by security filter: {e}"
         url = get_vision_api() or "http://azurekong.hertzai.com:8000/llava/image_inference"
-
-        payload = {
-            'url': image_url,
-            'prompt': text
-        }
-        files = []
-        headers = {}
-
-        response = pooled_request(
-            "POST", url, headers=headers, data=payload, files=files, timeout=300)
-        if response.status_code == 200:
-            return response.text
+        if is_bundled():
+            payload_str = json.dumps({'image_url': image_url, 'prompt': text})
+            response = pooled_post(
+                url, data=payload_str,
+                headers={'Content-Type': 'application/json'}, timeout=60)
         else:
-            return 'Not able to get this page details try later'
+            response = pooled_request(
+                "POST", url, headers={},
+                data={'url': image_url, 'prompt': text}, files=[], timeout=300)
+        return response.text if response.status_code == 200 else 'Not able to get this page details try later'
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Use this to Store and retrieve data using key-value storage system")
+    @log_tool_execution
     def save_data_in_memory(key: Annotated[str, "Key path for storing data now & retrieving data later. Use dot notation for nested keys (e.g., 'user.info.name')."],
                             value: Annotated[Optional[Any], "Value you want to store; strictly should be one of int, float, bool, json array or json object."] = None) -> str:
         """Store data with validation to prevent corruption."""
@@ -1340,12 +1348,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Returns the schema of the json from internal memory with all keys but without actual values.")
+    @log_tool_execution
     def get_saved_metadata() -> str:
         stripped_json = strip_json_values(agent_data[prompt_id])
         return f'{stripped_json}'
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function", description="Returns all data from the internal Memory using key")
+    @log_tool_execution
     def get_data_by_key(key: Annotated[
         str, "Key path for retrieving data. Use dot notation for nested keys (e.g., 'user.info.name')."]) -> str:
         keys = key.split('.')
@@ -1369,6 +1379,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Returns the unique identifier (user_id) of the current user.")
+    @log_tool_execution
     def get_user_id() -> str:
         current_app.logger.info('INSIDE get_user_id')
         return f'{user_id}'
@@ -1376,6 +1387,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Returns the unique identifier (prompt_id) associated with the current prompt or conversation.")
+    @log_tool_execution
     def get_prompt_id() -> str:
         current_app.logger.info('INSIDE get_prompt_id')
         return f'{prompt_id}'
@@ -1384,6 +1396,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function", description="Generate video with text and save it in database")
+    @log_tool_execution
     def Generate_video(text: Annotated[str, "Text to be used for video generation"],
                        avatar_id: Annotated[str, "Unique identifier for the avatar"],
                        realtime: Annotated[
@@ -1463,6 +1476,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function", description="get user's recent uploaded files")
+    @log_tool_execution
     def get_user_uploaded_file() -> str:
         current_app.logger.info('INSIDE get_user_uploaded_file')
         if recent_file_id[user_id]:
@@ -1472,6 +1486,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function", description="Get user's visual information to process somethings")
+    @log_tool_execution
     def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual context"]) -> str:
         request_id = 'Autogent_1234'
         current_app.logger.info('Using Vision to answer question')
@@ -1507,6 +1522,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function", description="Get Chat history based on text & start & end date")
+    @log_tool_execution
     def get_chat_history(text: Annotated[str, "Text related to which you want history"],
                          start: Annotated[str, "start date in format %Y-%m-%dT%H:%M:%S.%fZ"],
                          end: Annotated[str, "end date in format %Y-%m-%dT%H:%M:%S.%fZ"]) -> str:
@@ -1515,6 +1531,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function", description="Search past camera and screen descriptions by keyword and time range. Use for visual history queries.")
+    @log_tool_execution
     def search_visual_history(
         query: Annotated[str, "What to search for in visual/screen descriptions"],
         minutes_back: Annotated[int, "How many minutes back to search (default 30)"] = 30,
@@ -1537,6 +1554,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             "do> | TTL: <minutes>'. Example: 'CONDITION: user raises hand | ACTION: say "
             "hello | TTL: 30'."
         ))
+    @log_tool_execution
     def register_visual_watcher(
         input_text: Annotated[str, "CONDITION: ... | ACTION: ... | TTL: minutes"]
     ) -> str:
@@ -1551,6 +1569,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         @assistant.register_for_execution()
         @helper.register_for_llm(api_style="function",
                                  description="Search long-term memory for past conversations, facts, and context using natural language query. More powerful than get_chat_history for finding relevant information.")
+        @log_tool_execution
         def search_long_term_memory(
             query: Annotated[str, "Natural language query to search long-term memory"]
         ) -> str:
@@ -1568,6 +1587,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         @assistant.register_for_execution()
         @helper.register_for_llm(api_style="function",
                                  description="Save important facts or information to long-term memory for future retrieval across sessions.")
+        @log_tool_execution
         def save_to_long_term_memory(
             content: Annotated[str, "The information/fact to remember long-term"],
             speaker: Annotated[str, "Who said this (e.g. 'User', 'Assistant', 'System')"] = "System"
@@ -1607,6 +1627,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Creates time-based jobs using APScheduler to schedule jobs")
+    @log_tool_execution
     def create_scheduled_jobs(cron_expression: Annotated[
         str, "Cron expression for scheduling. Example: '0 9 * * 1-5' (Runs at 9:00 AM, Monday to Friday)."],
                               job_description: Annotated[str, "Description of the job to be performed"]) -> str:
@@ -1628,6 +1649,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Sends a message/information to user. You can use this if you want to ask a question")
+    @log_tool_execution
     def send_message_to_user(text: Annotated[str, "Text to send to the user"],
                              avatar_id: Annotated[Optional[str], "Unique identifier for the avatar"] = None,
                              response_type: Annotated[Optional[
@@ -1661,6 +1683,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Sends a presynthesized message/video/dialogue to user using conv_id from memory.")
+    @log_tool_execution
     def send_presynthesized_video_to_user(
             conv_id: Annotated[str, "Conversation ID associated with the text from memory"]) -> str:
         current_app.logger.info('INSIDE send_presynthesized_video_to_user')
@@ -1670,6 +1693,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Sends a presynthesized message/video/dialogue to user using conv_id with a timer.")
+    @log_tool_execution
     def send_message_in_seconds(text: Annotated[str, "text to send to user"],
                                 delay: Annotated[int, "time to wait in seconds before sending text"],
                                 conv_id: Annotated[
@@ -1684,6 +1708,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Consult a specialized domain expert for the current task")
+    @log_tool_execution
     def consult_expert(task_description: Annotated[str, "Describe what expertise you need"]) -> str:
         """Consult a domain expert agent for specialized guidance on the current task."""
         try:
@@ -1701,6 +1726,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Retrieve the user's visual camera input from the past specified minutes.")
+    @log_tool_execution
     def get_user_camera_inp_by_mins(minutes: Annotated[
         int, "Time range (in minutes) for fetching the camera visual data. for e.g. 5 will get you last 5 mins data"]) -> str:
         current_app.logger.info('INSIDE get user camera inp by mins')
@@ -1714,6 +1740,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function",
                              description="Processes user-defined commands on a personal Windows or Android system.")
+    @log_tool_execution
     async def execute_windows_or_android_command(
             instructions: Annotated[str, "Command in plain English to execute on the user's computer or mobile device"],
             os_to_control: Annotated[str, "The OS to control: 'windows', 'linux', 'macos', or 'android'"]) -> str:
@@ -2048,6 +2075,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     @assistant.register_for_execution()
     @helper.register_for_llm(api_style="function", description="Get google search response")
+    @log_tool_execution
     def google_search(text: Annotated[str, "Text which you want to search"]) -> str:
         current_app.logger.info('INSIDE google search')
         return helper_fun.top5_results(text)
@@ -2059,6 +2087,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                                          "or when the current agent's capabilities are insufficient for the task. "
                                          "Input should describe what the new agent should do. "
                                          "If the user wants autonomous creation, include 'autonomous' in the description.")
+    @log_tool_execution
     def create_new_agent(description: Annotated[str, "Description of the agent to create"]) -> str:
         """Signal that a new agent needs to be created. Sets a thread-local flag
         that the /chat handler checks after chat_agent() returns."""
@@ -2205,6 +2234,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     # --- Core tools for time_agent (defined once in core/agent_tools.py) ---
     from core.agent_tools import build_core_tool_closures, register_core_tools, register_dual
+    # #509: reuse canonical log_tool_execution from core.tool_logging
+    # (was passthrough no-op before — tools in reuse_recipe paths weren't
+    # emitting publish_chat_stage UI status, weren't getting structured
+    # error envelopes, weren't being str-coerced).
+    from core.tool_logging import log_tool_execution as _log_tool_execution
     _tool_ctx = {
         'user_id': user_id, 'prompt_id': prompt_id,
         'agent_data': agent_data, 'helper_fun': helper_fun,
@@ -2212,7 +2246,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         'recent_file_id': recent_file_id, 'scheduler': scheduler,
         'simplemem_store': simplemem_store,
         'memory_graph': memory_graph,
-        # log_tool_execution not defined in reuse_recipe — uses passthrough default
+        'log_tool_execution': _log_tool_execution,
         'send_message_to_user1': send_message_to_user1,
         'retrieve_json': retrieve_json,
         'strip_json_values': strip_json_values,
@@ -2250,9 +2284,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         send_message_to_user1(user_id, last_message, '', prompt_id)
         return 'Done'
 
+    # #510: name override now matches func.__name__ AND the LLM prompt at
+    # create_recipe.py:2823 ("connect_time_main").  Prior name override
+    # ("Connect_to_main_agent") caused LLM to emit the wrong name → 404.
     register_dual(helper1, time_agent, connect_time_main,
-                  "Connect_to_main_agent",
-                  "Connects time agent to main assistant agemt to perform actions which time agent cannot perform")
+                  "connect_time_main",
+                  "Connects time agent to main assistant agent to perform actions which time agent cannot perform")
 
     visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2 = helper_fun.create_visual_agent(
         user_id, prompt_id)
@@ -2361,6 +2398,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             current_app.logger.info(f"Registered {agent_name} with {len(skills)} skills")
 
         # Add A2A tools (similar to create_recipe.py)
+        @log_tool_execution
         def delegate_to_specialist(task: Annotated[str, "Description of the task to delegate"],
                                   required_skills: Annotated[List[str], "List of skills required"],
                                   context: Annotated[Optional[Dict], "Optional context"] = None) -> str:
@@ -2410,6 +2448,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                       "delegate_to_specialist",
                       "Delegate complex tasks to specialist agents based on required skills")
 
+        @log_tool_execution
         def share_context_with_agents(context_key: Annotated[str, "Context identifier"],
                                       context_value: Annotated[str, "Context data as string"]) -> str:
             """Share context information with other agents"""
@@ -2431,6 +2470,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                       "share_context_with_agents",
                       "Share context information with other agents")
 
+        @log_tool_execution
         def get_shared_context(context_key: Annotated[str, "Context identifier"]) -> str:
             """Retrieve context information shared by other agents"""
             retrieval_func = create_context_retrieval_function()

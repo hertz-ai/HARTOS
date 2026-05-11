@@ -3616,6 +3616,22 @@ def _with_tool_logging(func, tool_name):
     @wraps(func)
     def wrapper(*args, **kwargs):
         logging.info(f"[TOOL] {tool_name} called | input: {str(args)[:200]}")
+        # Per-tool UI stage emit (#508 extension — covers all ~50 tools via
+        # this single chokepoint, no per-tool plumbing).  Emit failures are
+        # LOGGED, not swallowed (user directive 2026-05-11: no silent gulps).
+        try:
+            from core.constants import TOOL_LABELS
+            from core.peer_link.crossbar_publish import publish_chat_stage
+            publish_chat_stage(
+                'tool_call',
+                user_id=str(thread_local_data.get_user_id() or ''),
+                request_id=str(thread_local_data.get_request_id() or ''),
+                text=TOOL_LABELS.get(tool_name, f'Running {tool_name}…'),
+            )
+        except Exception:
+            logging.warning(
+                f"[TOOL] {tool_name} UI emit failed", exc_info=True
+            )
         try:
             result = func(*args, **kwargs)
             logging.info(f"[TOOL] {tool_name} completed | output length: {len(str(result))}")
@@ -3668,16 +3684,17 @@ def get_tools(req_tool, is_first: bool = False):
         tools = _safe_load_google_search()
         tool = [
 
-            Tool(
+            labeled_tool(
                 name='Calculator',
                 func=llm_math.run,
-                description='Useful for when you need to answer questions about math.'
+                description='Useful for when you need to answer questions about math.',
+                ui_label='Calculating…',
             ),
         ]
 
         # Only add OpenAPI tool if chain is initialized
         if chain is not None:
-            tool.append(Tool(
+            tool.append(labeled_tool(
                 name="OpenAPI_Specification",
                 func=chain.run,
                 description="Use this feature only when the user's request specifically pertains to one of the following scenarios:\
@@ -3686,52 +3703,60 @@ def get_tools(req_tool, is_first: bool = False):
                 Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
                 Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
                 Don't use this to create a custom curriculum for user",
+                ui_label='Calling the OpenAPI service…',
             ))
 
         tool += [
-            Tool(
+            labeled_tool(
                 name="FULL_HISTORY",
                 func=parsing_string,
                 description=f"""Utilize this tool exclusively when the information required predates the current day & pertains to the ongoing user query or when there is a need to recall certain things we spoke earlier. The necessary input for this tool comprises a list of values separated by commas.
                 The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
                 In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what we discussed about the project, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be empty since it does not have any named entity for fuzzy search followed by start and end datetime.
                 Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. If Full history tool response is present, forget other histories, the inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for what is the response to my last comment?
-                Remember whatever user query is regarding search history understand what user is asking about and rephrase it properly then send to tool. Before framing the final tool response from this tool consult corresponding created_at date time to give more accurate response"""
+                Remember whatever user query is regarding search history understand what user is asking about and rephrase it properly then send to tool. Before framing the final tool response from this tool consult corresponding created_at date time to give more accurate response""",
+                ui_label='Searching your message history…',
             ),
-            Tool(
+            labeled_tool(
                 name="Text to image",
                 func=parse_text_to_image,
-                description="Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function"
+                description="Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function",
+                ui_label='Generating an image from text…',
             ),
-            Tool(
+            labeled_tool(
                 name="Animate_Character",
                 func=parse_character_animation,
-                description='''Use this tool exclusively for animating the selected character or teacher as requested by the user. The user should specify their animation request in a query, such as 'Show me in a spacesuit' or 'Animate yourself as a cartoon standing in front of the Taj Mahal.' This tool handles requests involving animating a pre-selected character and should not be used for general image generation tasks. For example, use it for 'Show me a picture of yourself dancing in the rain' but not for 'Generate an image of a sunset.' input'''
+                description='''Use this tool exclusively for animating the selected character or teacher as requested by the user. The user should specify their animation request in a query, such as 'Show me in a spacesuit' or 'Animate yourself as a cartoon standing in front of the Taj Mahal.' This tool handles requests involving animating a pre-selected character and should not be used for general image generation tasks. For example, use it for 'Show me a picture of yourself dancing in the rain' but not for 'Generate an image of a sunset.' input''',
+                ui_label='Animating your character…',
             ),
-            Tool(
+            labeled_tool(
                 name="Image_Inference_Tool",
                 func=parse_image_to_text,
                 description='''When a user provides a query containing an image download URL and a related question about that image, utilize this tool for support. Your objective is to extract both the image URL and the user's inquiry or prompt pertaining to that image from their query, and then convert these elements into comma seperated string. The format should be as follows: "image_url, user_query".
-                '''
+                ''',
+                ui_label='Analyzing the image…',
             ),
-            Tool(
+            labeled_tool(
                 name="Data_Extraction_From_URL",
                 func=parse_link_for_crwalab,
                 description='''
                 Your task is to extract a URL and its type (either 'pdf' or 'website') from a user's query. Upon receiving a query that contains a URL and a specified URL type, you are to use a tool designed for this purpose. The objective is to accurately identify both the URL and its type from the query. Once identified, these elements should be formatted into a comma-separated string, adhering to the format: "url, url_type".
-                '''
+                ''',
+                ui_label='Extracting data from URL…',
             ),
-            Tool(
+            labeled_tool(
                 name="User_details_tool",
                 func=parse_user_id,
-                description="If a request is made for information regarding students or users, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. Except current user id you should say you cannot have access other user's details."
+                description="If a request is made for information regarding students or users, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. Except current user id you should say you cannot have access other user's details.",
+                ui_label='Looking up user details…',
             ),
-            Tool(
+            labeled_tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
-                description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall from the other end. If there are more than 1 person try to give an identity to each across frames to track the subjects through time by framing the tool input accordingly."
+                description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall from the other end. If there are more than 1 person try to give an identity to each across frames to track the subjects through time by framing the tool input accordingly.",
+                ui_label='Looking through camera…',
             ),
-            Tool(
+            labeled_tool(
                 name="Visual_Context_Watcher",
                 func=_handle_visual_watcher_tool,
                 description=(
@@ -3744,8 +3769,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "The watcher runs in the background and fires the action whenever the condition "
                     "is detected. TTL auto-expires the watcher."
                 ),
+                ui_label='Setting up a visual watcher…',
             ),
-            Tool(
+            labeled_tool(
                 name="Create_Agent",
                 func=_handle_create_agent_tool,
                 description=(
@@ -3757,8 +3783,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "If the user also says words like 'automatically', 'autonomous', 'do it for me', "
                     "'handle it', 'just create it', include those keywords in your input."
                 ),
+                ui_label='Starting agent creation…',
             ),
-            Tool(
+            labeled_tool(
                 name="Request_Resource",
                 func=_handle_request_resource,
                 description=(
@@ -3772,8 +3799,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "If the resource is already configured, it returns immediately. "
                     "If not, the user will be prompted securely."
                 ),
+                ui_label='Requesting a resource…',
             ),
-            Tool(
+            labeled_tool(
                 name="Suggest_Share_Worthy_Content",
                 func=_suggest_share_worthy_content,
                 description=(
@@ -3783,8 +3811,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "comments) but low share count, and suggests them for sharing. "
                     "Input can be any text — it is not used for filtering."
                 ),
+                ui_label='Finding share-worthy content…',
             ),
-            Tool(
+            labeled_tool(
                 name="Observe_User_Experience",
                 func=_observe_user_experience,
                 description=(
@@ -3792,8 +3821,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "duration_ms, outcome. Used for self-improvement and understanding user "
                     "behavior patterns."
                 ),
+                ui_label='Recording an observation…',
             ),
-            Tool(
+            labeled_tool(
                 name="Self_Critique_And_Enhance",
                 func=_self_critique_and_enhance,
                 description=(
@@ -3801,8 +3831,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "future recommendations. Input: topic or area to critique. Helps the agent "
                     "learn from its own interactions."
                 ),
+                ui_label='Reflecting on past suggestions…',
             ),
-            Tool(
+            labeled_tool(
                 name="Agentic_Router",
                 func=_handle_agentic_router_tool,
                 description=(
@@ -3813,9 +3844,10 @@ def get_tools(req_tool, is_first: bool = False):
                     "Output: a structured plan with steps. Do NOT use for simple questions, "
                     "greetings, or tasks that can be answered directly."
                 ),
+                ui_label='Planning the next steps…',
             ),
 
-            Tool(
+            labeled_tool(
                 name="Shell_Command",
                 func=_handle_shell_command_tool,
                 description=(
@@ -3835,8 +3867,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "truncated to 4000 chars. For long-running coding work use "
                     "Execute_Coding_Task instead."
                 ),
+                ui_label='Running a command…',
             ),
-            Tool(
+            labeled_tool(
                 name="Computer_Action",
                 func=_handle_computer_action_tool,
                 description=(
@@ -3855,8 +3888,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "'click the Save button in the open document', 'select the "
                     "second item in the dropdown')."
                 ),
+                ui_label='Acting on your screen…',
             ),
-            Tool(
+            labeled_tool(
                 name="Computer_Screenshot",
                 func=_handle_screenshot_tool,
                 description=(
@@ -3864,8 +3898,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "Use when you need to understand what's on screen before acting. "
                     "Input: question about the screen (e.g. 'what apps are open?')."
                 ),
+                ui_label='Taking a screenshot…',
             ),
-            Tool(
+            labeled_tool(
                 name="Request_Camera_Access",
                 func=_request_capability_consent,
                 description=(
@@ -3873,8 +3908,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "understanding. Use when you need to see the user but camera is "
                     "not active. Input: reason for needing camera access."
                 ),
+                ui_label='Requesting camera access…',
             ),
-            Tool(
+            labeled_tool(
                 name="Request_Screen_Access",
                 func=_request_screen_consent,
                 description=(
@@ -3882,8 +3918,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "Use when you need to see the screen but screen sharing is not "
                     "active. Input: reason for needing screen access."
                 ),
+                ui_label='Requesting screen access…',
             ),
-            Tool(
+            labeled_tool(
                 name="Connect_Channel",
                 func=_handle_connect_channel_tool,
                 description=(
@@ -3909,8 +3946,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "call this tool with just the channel name and it will tell you "
                     "what's needed."
                 ),
+                ui_label='Connecting channel…',
             ),
-            Tool(
+            labeled_tool(
                 name="Invite_Friend",
                 func=_handle_invite_friend_tool,
                 description=(
@@ -3926,8 +3964,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "paste into any channel; a floating share-card also appears "
                     "in chat with a one-click Copy button."
                 ),
+                ui_label='Generating an invite link…',
             ),
-            Tool(
+            labeled_tool(
                 name="Join_External_Room",
                 func=_handle_join_external_room_tool,
                 description=(
@@ -3948,8 +3987,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "co_pilot (default), participant, note_taker, "
                     "silent_observer, writer."
                 ),
+                ui_label='Joining the room…',
             ),
-            Tool(
+            labeled_tool(
                 name="Navigate_App",
                 func=_handle_navigate_app_tool,
                 description=(
@@ -3963,8 +4003,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "need to give a URL, just say the page. After calling this tool, "
                     "tell the user you're opening that page in a single short sentence."
                 ),
+                ui_label='Opening the requested page…',
             ),
-            Tool(
+            labeled_tool(
                 name="List_Pending_Actions",
                 func=_handle_list_pending_actions_tool,
                 description=(
@@ -3979,6 +4020,7 @@ def get_tools(req_tool, is_first: bool = False):
                     "ScheduledMessageManager (reminders, channel messages) "
                     "and the live apscheduler job store (periodic tasks)."
                 ),
+                ui_label='Listing pending actions…',
             ),
         ]
 
@@ -4263,6 +4305,8 @@ def get_tools(req_tool, is_first: bool = False):
 
 # Language dict — canonical in core/constants.py
 from core.constants import SUPPORTED_LANG_DICT  # noqa: E402
+from core.labeled_tool import labeled_tool, generic_label  # noqa: E402  # #508
+from core.peer_link.crossbar_publish import publish_chat_stage  # noqa: E402  # #508
 
 
 # ---------------------------------------------------------------------------
@@ -4411,6 +4455,7 @@ class CustomGPT(LLM):
         app.logger.info(f"len---->{num_tokens}")
 
         app.logger.info(f"first time calling {len(prompt)}")
+        publish_chat_stage('generating', user_id=str(thread_local_data.get_user_id() or ''), request_id=str(thread_local_data.get_request_id() or ''))
 
         if self.count > 1 and thread_local_data.get_global_intent() != self.previous_intent:
             tools = get_tools(thread_local_data.get_global_intent())
@@ -6068,6 +6113,8 @@ else:
 # main function
 def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang):
     start_time = time.time()
+    _stage_req_id = str(thread_local_data.get_request_id() or '')
+    publish_chat_stage('loading_context', user_id=str(user_id), request_id=_stage_req_id)
     # casual_conv is the draft classifier's `is_casual` flag propagated
     # from the /chat handler — when True we skip the action+profile
     # fetch entirely because a casual acknowledgement doesn't consult
@@ -6085,11 +6132,13 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     llm = CustomGPT(casual_conv=casual_conv)
     app.logger.info(f"query------> {query}")
     memory_start_time = time.time()
+    publish_chat_stage('loading_memory', user_id=str(user_id), request_id=_stage_req_id)
     memory = get_memory(user_id=user_id)
     app.logger.info("time taken by get_memory %s seconds",
                     time.time() - memory_start_time)
 
     tools_start_time = time.time()
+    publish_chat_stage('loading_tools', user_id=str(user_id), request_id=_stage_req_id)
     # Skip tool loading for casual_conv=True — the 0.8B draft handles
     # casual chat without tools, saving ~2.5s of tool registry loading.
     if casual_conv:
@@ -6281,6 +6330,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
         metadata=metadata
     )
     agent_chain_start_time = time.time()
+    publish_chat_stage('thinking', user_id=str(user_id), request_id=_stage_req_id)
     # G10: Feed every intra-agent tool step into WorldModelBridge so the
     # inner reasoning loop (not just the final answer) becomes training data.
     _ingestor_callbacks = None
@@ -6371,6 +6421,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
         raise
     app.logger.info("time taken by chain agent run %s seconds",
                     time.time() - agent_chain_start_time)
+    publish_chat_stage('finalizing', user_id=str(user_id), request_id=_stage_req_id)
 
     # G13 (success-side): empty / trivial / fallback replies are ALSO weak
     # text outputs worth tagging for router adjustment.  We only flag truly
@@ -7223,16 +7274,23 @@ def chat():
             _record_lifecycle('Review Mode', user_id, new_prompt_id,
                               f'Agentic auto-creation: {prompt[:100]}')
             _push_workflow_flowchart(user_id, new_prompt_id, request_id)
-            return jsonify({
-                'response': auto_response,
-                'intent': ['FINAL_ANSWER'],
-                'Agent_status': 'Review Mode',
-                'autonomous_creation': True,
-                'prompt_id': new_prompt_id,
-                'req_token_count': 0,
-                'res_token_count': 0,
-                'history_request_id': [],
-            })
+            # Canonical reply path: _chat_reply fires TTS synth AND the
+            # chat_messages.persist_and_publish_async fan-out so the
+            # bubble renders on every Nunba surface subscribed to
+            # com.hertzai.hevolve.chat.new.<uid> (Demopage / Agent page
+            # / AgentChatPage / RN).  Before this fix the raw jsonify
+            # bypassed both legs, producing the audio-without-bubble
+            # asymmetry the user reported on the Agent creation page.
+            return _chat_reply(
+                user_id, request_id, auto_response,
+                intent=['FINAL_ANSWER'],
+                Agent_status='Review Mode',
+                autonomous_creation=True,
+                prompt_id=new_prompt_id,
+                req_token_count=0, res_token_count=0,
+                history_request_id=[],
+                user_prompt=prompt,
+            )
 
     if prompt_id:
         # Recipe pull-on-demand: when prompt_id has no local recipe
@@ -7302,11 +7360,21 @@ def chat():
                         _touch_agent_timestamp(_ak)
                 else:
                     app.logger.info('0 Recipe JSON doesnot EXISTS')
-                    create_agent = True
-                    _ak = f'{user_id}_{prompt_id}'
-                    review_agents[_ak] = True
-                    conversation_agent[_ak] = False
-                    _touch_agent_timestamp(_ak)
+                    # #485 — honor UI create_agent flag; don't force True from
+                    # file-state alone (broke chat-mode for finished agents).
+                    if create_agent or autonomous:
+                        _ak = f'{user_id}_{prompt_id}'
+                        review_agents[_ak] = True
+                        conversation_agent[_ak] = False
+                        _touch_agent_timestamp(_ak)
+                    else:
+                        try:
+                            with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'), 'r') as _gpf:
+                                _gate_meta = json.load(_gpf)
+                            if _gate_meta.get('flows') and _gate_meta['flows'][0].get('system_prompt'):
+                                custom_prompt = _gate_meta['flows'][0]['system_prompt']
+                        except Exception as _meta_err:
+                            app.logger.warning("L1 (#485): persona read failed for prompt_id=%r: %s", prompt_id, _meta_err)
 
             else:
                 app.logger.info('GATHER JSON doesnot EXISTS')

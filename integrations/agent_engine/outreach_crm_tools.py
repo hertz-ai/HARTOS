@@ -439,7 +439,13 @@ def register_outreach_tools(helper, assistant, user_id: str):
         return json.dumps({'success': True, 'emails': log, 'total': len(log)})
 
     # ── Register all tools ──
-    from autogen import register_function
+    # Routed through core.labeled_autogen_function so the UI spinner
+    # shows a tool-specific label (publish_chat_stage('tool_call', …))
+    # for autogen-invoked tools too.  Same shape as LangChain's
+    # _with_tool_logging chokepoint.  UI labels live in
+    # core/constants.py:TOOL_LABELS (single source of truth).
+    from core.labeled_autogen_function import register_labeled_function
+    from core.constants import TOOL_LABELS
 
     for func in [
         create_prospect,
@@ -450,11 +456,12 @@ def register_outreach_tools(helper, assistant, user_id: str):
         get_pipeline_status,
         list_sent_emails,
     ]:
-        register_function(
+        register_labeled_function(
             func,
             caller=helper,
             executor=assistant,
             description=func.__doc__,
+            ui_label=TOOL_LABELS.get(func.__name__, f'Running {func.__name__}…'),
         )
 
     logger.info(f"Registered 7 outreach CRM tools for user {user_id}")

@@ -133,3 +133,22 @@ def publish_thinking_trace(
     except Exception as e:
         logger.debug(f"publish_thinking_trace failed: {e}")
         return False
+
+
+def publish_chat_stage(stage: str, *, user_id: str, request_id: str = '', text: str = None) -> bool:
+    """Emit a chat-hot-path milestone (#508) via the canonical thinking-trace
+    publisher.  When `text` is provided, use it directly (per-tool calls);
+    otherwise look up CHAT_STAGE_TEXTS[stage].  Returns False if user_id
+    missing or stage/text unresolvable."""
+    if not user_id:
+        return False
+    if text is None:
+        from core.constants import CHAT_STAGE_TEXTS
+        text = CHAT_STAGE_TEXTS.get(stage)
+    if not text:
+        logger.warning("publish_chat_stage: unknown stage %r", stage)
+        return False
+    return publish_thinking_trace(
+        text=text, user_id=str(user_id), request_id=str(request_id or ''),
+        bot_type='Agent', full_schema=False,
+    )

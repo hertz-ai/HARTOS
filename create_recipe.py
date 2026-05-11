@@ -31,7 +31,6 @@ from datetime import datetime
 import time
 from autogen.coding import DockerCommandLineCodeExecutor
 import re
-from autogen import register_function
 import json
 from autogen import ConversableAgent
 from flask import current_app
@@ -73,6 +72,12 @@ from json_repair import repair_json
 # progress (Assistant emits NEW content) resets the counter.
 _STATE_TRANSITION_LOOP_STATE: dict = {}
 _STATE_TRANSITION_LOOP_THRESHOLD: int = 5
+
+# #485 L3 — consecutive-Assistant counter; at threshold redirect to Helper
+# to break attention-collapse loops where Assistant→verify can't escape
+# because verify shares the same backend LLM.
+_ASSISTANT_STREAK_STATE: dict = {}
+_ASSISTANT_STREAK_THRESHOLD: int = 3
 def publish_async(topic, message, timeout=2.0):
     """Delegate to the canonical publish_async in hart_intelligence.
 
@@ -317,77 +322,15 @@ def _record_exception(exc, module, function, user_prompt='', action_id=0, **ctx)
         pass
 tool_logger.propagate = False  # Prevent double logging
 
-# Decorator for logging tool execution
-
-
-
-def log_tool_execution(func):
-    if inspect.iscoroutinefunction(func):
-        # For async functions
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            tool_logger.info(f"TOOL EXECUTION START: {func.__name__}")
-            tool_logger.info(f"Arguments: {args}, Keyword Arguments: {kwargs}")
-            try:
-                result = await func(*args, **kwargs)
-                if not isinstance(result, str):
-                    tool_logger.warning(f"Tool function {func.__name__} returned non-string type: {type(result)}")
-                    result = str(result)
-                tool_logger.info(f"TOOL EXECUTION SUCCESS: {func.__name__}")
-                tool_logger.info(
-                    f"Result: {result[:100]}..." if len(result) > 100 else f"Result: {result}"
-                )
-                return result
-            except Exception as e:
-                tool_logger.error(f"TOOL EXECUTION ERROR: {func.__name__} - {e}")
-                tool_logger.exception("Exception details:")
-                error_response = {
-                    "status": "error",
-                    "tool_function": func.__name__,
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                    "suggestion": "Check logs for detailed traceback information"
-                }
-                # ... (add any special-case suggestions like NameError, KeyError here) ...
-                error_json = json.dumps(error_response)
-                tool_logger.info(f"Returning error response: {error_json}")
-                return f"Tool execution failed: {error_json}"
-        return wrapper
-    else:
-        # For regular (sync) functions
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            tool_logger.info(f"TOOL EXECUTION START: {func.__name__}")
-            tool_logger.info(f"Arguments: {args}, Keyword Arguments: {kwargs}")
-            try:
-                result = func(*args, **kwargs)
-                # If it returns a coroutine by accident, run it to completion
-                if asyncio.iscoroutine(result):
-                    tool_logger.info(f"Detected coroutine return from {func.__name__}, running it to completion")
-                    result = asyncio.get_event_loop().run_until_complete(result)
-                if not isinstance(result, str):
-                    tool_logger.warning(f"Tool function {func.__name__} returned non-string type: {type(result)}")
-                    result = str(result)
-                tool_logger.info(f"TOOL EXECUTION SUCCESS: {func.__name__}")
-                tool_logger.info(
-                    f"Result: {result[:100]}..." if len(result) > 100 else f"Result: {result}"
-                )
-                return result
-            except Exception as e:
-                tool_logger.error(f"TOOL EXECUTION ERROR: {func.__name__} - {e}")
-                tool_logger.exception("Exception details:")
-                error_response = {
-                    "status": "error",
-                    "tool_function": func.__name__,
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                    "suggestion": "Check logs for detailed traceback information"
-                }
-                # ... (add any special-case suggestions here) ...
-                error_json = json.dumps(error_response)
-                tool_logger.info(f"Returning error response: {error_json}")
-                return f"Tool execution failed: {error_json}"
-        return wrapper
+# Canonical `log_tool_execution` decorator (moved to core.tool_logging
+# in #509 so the autogen-registration chokepoint
+# `core.labeled_autogen_function.register_labeled_function` can reuse it
+# without dragging this heavy module in).  The 40+ existing
+# `@log_tool_execution` decorator sites in core/agent_tools.py and
+# integrations/channels/agent_tools.py resolve the name via
+# ctx['log_tool_execution'] sourced from THIS module's namespace, so the
+# re-import here preserves their wiring with zero behavior change.
+from core.tool_logging import log_tool_execution  # noqa: E402  (after logger config)
 
 
 from core.session_cache import TTLCache  # early import — needed before first TTLCache usage below
@@ -847,6 +790,23 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             list_of_persona = config['flows'][get_current_flow(user_prompt)]['persona']
             current_app.logger.info(f'WORKING persona as {list_of_persona}')
 
+    # #510: populate the canonical persona registry so that the
+    # `send_message_to_roles` tool (registered later) can resolve role→agent
+    # mappings during recipe authoring.  Single source of truth lives in
+    # core.persona_registry.
+    try:
+        from core.persona_registry import register_persona_for_session
+        _personas_for_registry = config.get('personas') or (
+            [{'name': p} if isinstance(p, str) else p
+             for p in (list_of_persona or [])]
+            if list_of_persona else []
+        )
+        register_persona_for_session(user_id, prompt_id, _personas_for_registry)
+    except Exception:
+        tool_logger.warning(
+            "persona registry populate failed (create_recipe flow)",
+            exc_info=True)
+
     # Generate or load agent personality
     _agent_personality = None
     try:
@@ -981,10 +941,22 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     except Exception as e:
         tool_logger.debug(f"Media tools registration skipped: {e}")
 
+    # #510: get_user_details — delegate to canonical core.agent_tools impl
+    # (DB lookup + cloud fallback) instead of the limited helper_fun fallback.
+    # register_core_tools above (L909) already registered the canonical on
+    # this agent pair; this inline registration was OVERWRITING it with the
+    # weaker parse_user_id-only impl.  Body now delegates to the canonical.
+    _gud_canonical = next(
+        (f for n, _, f in core_tools if n == 'get_user_details'), None)
+
     @log_tool_execution
-    def get_user_details()->str:
+    def get_user_details() -> str:
         tool_logger.info('INSIDE get user details')
+        if _gud_canonical is not None:
+            return _gud_canonical()
+        # Degraded-env fallback (core_AT closure unavailable)
         return helper_fun.parse_user_id(int(user_id))
+
     register_dual(helper, assistant, get_user_details,
                   "get_user_details", "Get User details like name, dob, gender")
 
@@ -1038,6 +1010,21 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     register_dual(helper, assistant, consult_expert,
                   "consult_expert",
                   "Consult a specialized domain expert for the current task")
+
+    # #510: send_message_to_roles — multi-persona broadcast.  Canonical impl
+    # lives in core.persona_registry.  Same impl runs in both create + reuse
+    # flows (registry TTLCaches are module-level singletons).
+    from core.persona_registry import _send_message_to_roles_impl as _smr_impl
+    @log_tool_execution
+    def send_message_to_roles(
+        role: Annotated[str, "Target persona/role name to deliver the message to"],
+        message: Annotated[str, "The question to ask or message to send"],
+    ) -> str:
+        return _smr_impl(user_id, prompt_id, role, message,
+                          publish_fn=publish_async)
+    register_dual(helper, assistant, send_message_to_roles,
+                  "send_message_to_roles",
+                  "Send a message to a specific persona/role within this multi-persona agent (e.g. student/parent/teacher).")
 
     @log_tool_execution
     async def execute_windows_or_android_command(
@@ -1717,13 +1704,30 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                       "delegate_to_specialist",
                       "Delegate complex tasks to specialist agents based on required skills")
 
-        # Add context sharing tool
+        # Add context sharing tool — #510 unification with reuse_recipe.
+        # reuse_recipe persists shared context to MemoryGraph for cross-session
+        # recall ("insight" memory_type); create-mode should do the same so
+        # behavior is consistent across both flows.
         @log_tool_execution
         def share_context_with_agents(context_key: Annotated[str, "Unique identifier for the context"],
                                       context_value: Annotated[str, "Context data to share (as JSON string)"]) -> str:
-            """Share context information with other agents"""
+            """Share context information with other agents."""
             sharing_func = create_context_sharing_function('assistant')
-            return sharing_func(context_key, context_value)
+            result = sharing_func(context_key, context_value)
+            # Persist to MemoryGraph (fire-and-forget) — same shape as reuse_recipe:2455-2464
+            if memory_graph is not None:
+                try:
+                    import threading as _t
+                    _t.Thread(target=lambda: memory_graph.register(
+                        f"[SHARED] {context_key}: {json.dumps(context_value)[:200]}",
+                        {'memory_type': 'insight', 'source_agent': 'assistant',
+                         'session_id': user_prompt, 'shared_key': context_key},
+                    ), daemon=True).start()
+                except Exception:
+                    tool_logger.warning(
+                        "share_context_with_agents: MemoryGraph persist failed",
+                        exc_info=True)
+            return result
 
         register_dual(helper, assistant, share_context_with_agents,
                       "share_context_with_agents",
@@ -2313,12 +2317,20 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             current_app.logger.info('Got last speaker as executor or helper or author or chat_instructor & reutrning next speaker as assistant')
             return assistant
 
-        # FIX: After Assistant speaks (no JSON, no @mention), route to StatusVerifier
-        # to evaluate the action result. Without this, 'auto' speaker selection may
-        # pick UserProxy (max_consecutive_auto_reply=0) which terminates the conversation.
+        # After Assistant speaks: route to StatusVerifier (or Helper if streak ≥3 — #485 L3).
         if last_speaker.name == 'Assistant':
-            current_app.logger.info('Assistant spoke, routing to StatusVerifier for action evaluation')
+            _streak = _ASSISTANT_STREAK_STATE.get(user_prompt, 0) + 1
+            _ASSISTANT_STREAK_STATE[user_prompt] = _streak
+            if _streak >= _ASSISTANT_STREAK_THRESHOLD:
+                current_app.logger.warning(
+                    "[ASSISTANT-STREAK-ESCALATE] user_prompt=%r streak=%d → Helper (#485)",
+                    user_prompt, _streak)
+                _ASSISTANT_STREAK_STATE[user_prompt] = 0
+                return helper
             return verify
+        # Non-Assistant speaker → reset streak (inverse-of-Assistant is
+        # future-proof for new agents added to GroupChat).
+        _ASSISTANT_STREAK_STATE.pop(user_prompt, None)
 
         json_obj = None
 
