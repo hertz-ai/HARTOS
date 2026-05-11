@@ -497,13 +497,28 @@ class SpeculativeDispatcher:
         # — it claims action while taking none.  The expert reply
         # replaces the standby via the existing speculation_id
         # bubble-replacement path (#204 already shipped).
+        # Helper: treat the sentinel string 'none' as "no intent", matching
+        # the classifier's own contract (it returns 'none' for *_intent /
+        # memory_query when there's no actionable intent).  Without this,
+        # the literal 'none'.strip() evaluates truthy and the guard fires
+        # on every casual turn → every reply gets replaced with the
+        # "Let me check that for you…" placeholder, and the user never
+        # receives the actual answer because the expert background task
+        # has nothing real to refine (live evidence 2026-05-11 22:36:41
+        # request 897fc534 — speculation_id 9a418ac4-1eb, message 'strange').
+        def _intent_set(value) -> bool:
+            if not value or value is False:
+                return False
+            v = str(value).strip().lower()
+            return bool(v) and v != 'none'
+
         if delegate == 'none' and (
-            (parsed.get('channel_connect') or '').strip()
+            _intent_set(parsed.get('channel_connect'))
             or parsed.get('is_create_agent')
-            or (parsed.get('language_change') or '').strip()
-            or (parsed.get('invite_intent') or '').strip()
-            or (parsed.get('join_room_intent') or '').strip()
-            or (parsed.get('memory_query') or '').strip()
+            or _intent_set(parsed.get('language_change'))
+            or _intent_set(parsed.get('invite_intent'))
+            or _intent_set(parsed.get('join_room_intent'))
+            or _intent_set(parsed.get('memory_query'))
         ):
             logger.info(
                 "draft-first: actionable intent flag set "
