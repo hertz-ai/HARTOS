@@ -30,7 +30,15 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from langchain_classic.agents import Tool
+# Note: `from langchain_classic.agents import Tool` is INTENTIONALLY deferred
+# to function-body — module-load eager import would drag langchain (and its
+# transformers dependency) into every entry path that touches `core.*`,
+# bypassing the import-graph ordering the transformers re-entry guard
+# (core/_transformers_lazy_guard.py + hart_intelligence_entry.py:80-209)
+# relies on.  By the time `labeled_tool()` is actually called, the
+# canonical loader has finished and `langchain_classic.agents` is cached
+# in sys.modules — the function-body import is then a dict hit, no
+# `_LazyModule.__getattr__` walk.
 
 from core.constants import register_tool_label
 
@@ -41,7 +49,7 @@ def labeled_tool(
     description: str,
     *,
     ui_label: str,
-) -> Tool:
+):
     """Construct a langchain Tool with a mandatory UI status label.
 
     Args:
@@ -65,6 +73,8 @@ def labeled_tool(
             f"labeled_tool({name!r}): ui_label must be a non-empty string; "
             f"pass generic_label({name!r}) to opt into the 'Running …' fallback")
     register_tool_label(name, ui_label)
+    # Lazy import: by the time we're here, langchain is already loaded.
+    from langchain_classic.agents import Tool  # noqa: PLC0415
     return Tool(name=name, func=func, description=description)
 
 
