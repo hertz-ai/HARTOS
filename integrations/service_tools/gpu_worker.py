@@ -373,12 +373,18 @@ class GPUWorker:
 
         # Propagate parent sys.path via PYTHONPATH so the child inherits
         # runtime-added package dirs (e.g. ~/.nunba/site-packages for CUDA
-        # torch + TTS deps). Filter to existing dirs only — empty / stale
-        # entries can mask imports. Preserve an existing PYTHONPATH in env
-        # by appending our paths to the front (caller-set overrides last).
+        # torch + TTS deps). Include real dirs AND zip / egg archives —
+        # cx_Freeze bundles application packages (HARTOS's ``integrations``
+        # tree) inside ``library.zip``; excluding files broke worker
+        # spawn under frozen Nunba.exe with ModuleNotFoundError on the
+        # central dispatcher itself. Preserve an existing PYTHONPATH by
+        # appending our paths to the front (caller-set overrides last).
         _extra_paths = [
             p for p in sys.path
-            if p and os.path.isdir(p)
+            if p and (
+                os.path.isdir(p)
+                or (os.path.isfile(p) and p.lower().endswith(('.zip', '.egg')))
+            )
         ]
         if _extra_paths:
             _existing = env.get('PYTHONPATH', '')
