@@ -250,12 +250,16 @@ class HiveCapabilityAdvertiser:
         """Stop the announce loop, emit a final revoke, shut the pool.
 
         Idempotent.  Safe to call from atexit + manual teardown +
-        signal handler.
+        signal handler.  Resets ``_attached`` so a second call (e.g.
+        atexit firing after a manual shutdown) is a no-op rather than
+        a duplicate revoke.
         """
         with self._lock:
             if not self._attached:
-                # Never started — nothing to revoke or shut.
+                # Never started, or already shut — nothing to revoke
+                # or close.
                 return
+            self._attached = False
         self._stop.set()
         try:
             self._emit_revoke()
