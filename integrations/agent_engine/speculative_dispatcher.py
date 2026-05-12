@@ -1,20 +1,75 @@
 """
 Unified Agent Goal Engine - Speculative Dispatcher
 
-Fast-first, expert-takeover speculative execution:
-1. Fast model (hive compute / cheap API) responds synchronously → user sees instantly
-2. Expert model (GPT-4 / Claude) runs in background thread
-3. Fast response conveyed to expert as context
-4. If expert meaningfully improves, delivered asynchronously
-5. Compute provider (hive node) earns ad revenue for serving fast response
+Draft-first + expert-takeover dispatcher.
 
-Guardrails enforced at EVERY layer:
-- ConstitutionalFilter.check_prompt() before ANY dispatch
-- HiveCircuitBreaker.is_halted() before ANY dispatch
-- EnergyAwareness tracked on EVERY model call
-- ComputeDemocracy.adjusted_reward() on EVERY contribution
-- HiveEthos.rewrite_prompt_for_togetherness() on EVERY prompt
-- Budget enforcement via ResonanceService.spend_spark()
+Two entry points, one delivery channel:
+
+  dispatch_draft_first(prompt, ...)
+    DRAFT tier (Qwen3.5-0.8B) replies SYNCHRONOUSLY in ~300ms with an
+    envelope ``{reply, delegate: none|local|hive, confidence, ...}``.
+    The reply is the user's standby answer; ``delegate`` is the draft's
+    self-assessment of whether a heavier model needs to take the turn.
+
+    Five guards can promote the turn to expert background regardless of
+    the draft's own decision:
+      * refusal pattern in the reply → REFUSAL_OVERRIDE
+      * delegate=none + confidence < floor → LOW_CONFIDENCE
+      * delegate=none + agent_bound prompt → AGENT_BOUND
+      * delegate=none + classifier surfaces actionable intent
+        (channel_connect / is_create_agent / language_change /
+         invite / join_room / memory_query) → ACTIONABLE_INTENT
+      * envelope parse failure → PARSE_FAILURE
+    The canonical taxonomy lives in
+    ``integrations.agent_engine.escalation_reasons.EscalationReason``;
+    callers / observers / WorldModelBridge see the reason in the
+    return dict and in ``self._active[speculation_id]``.
+
+  dispatch_speculative(prompt, ...)
+    Legacy entry. Fast tier replies synchronously, expert runs in
+    background. Same delivery channel.
+
+Expert background path
+----------------------
+
+When a turn escalates, ``_expert_background_task`` dispatches via
+``_dispatch_expert_langchain``:
+
+  - **Local expert** (``is_local=True``): routes through the full HARTOS
+    /chat pipeline — full tool registry, full system prompt, full agent
+    context. Bundled mode uses an in-process Flask test_client; HTTP
+    mode POSTs to the configured backend. Re-entry guarded by
+    ``speculative=False, draft_first=False`` in the payload.
+
+  - **Hive expert** (``is_local=False``): registered by
+    ``HiveExpertDiscovery`` from ``peer.capability.announce`` gossip,
+    routed via OpenAI-compatible POST to the peer's ``base_url`` with
+    bearer auth. The hive peer's 27B / fine-tuned model takes the turn
+    directly — no "review the draft" wrapper.
+
+When the expert returns, ``_deliver_expert_response`` bubble-replaces
+the standby via the existing ``speculation_id`` channel: SSE for the
+chat UI + TTS pupit topic for voice. The fast_response stays only when
+the expert returned empty or got guardrail-blocked.
+
+Guardrails at every layer
+-------------------------
+- ``ConstitutionalFilter.check_prompt`` before dispatch and on expert output
+- ``HiveCircuitBreaker.is_halted()`` before dispatch and again at task entry
+- ``HiveEthos.rewrite_prompt_for_togetherness`` on every prompt
+- Budget enforcement via ``_check_and_reserve_budget``
+- Energy + latency tracking on every model call
+- Per-peer install-validation gate via ``_pass_validation_gate``
+
+Hive expert wiring (subscriber-side complete; producer pending)
+---------------------------------------------------------------
+``HiveExpertDiscovery`` listens for ``peer.capability.announce`` /
+``peer.capability.revoke`` on the platform EventBus and auto-registers
+reachable, trust-verified peers as ``ModelTier.EXPERT`` backends.
+Until peers start emitting the announce gossip (producer daemon ships
+separately), ``_pick_expert_for_delegate('hive', ...)`` falls back to
+the local fast model and ``served_by`` in telemetry reads
+``local_langchain_bg`` 100% of the time.
 """
 import atexit
 import json
