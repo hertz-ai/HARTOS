@@ -1319,62 +1319,323 @@ class SpeculativeDispatcher:
             logger.debug(f"record_interaction skipped: {e}")
 
     # ─── Background expert task ───
+    #
+    # Two paths coexist behind a feature flag during the rollout window:
+    #   - flag OFF (default this commit): _run_legacy_expert_path runs the
+    #     historical "review and improve" wrapper.  Byte-for-byte preserved
+    #     so no live behavior changes when this commit lands.
+    #   - flag ON: _run_collapsed_expert_path dispatches the ORIGINAL turn
+    #     through the full langchain pipeline (local expert) or the hive
+    #     peer's OpenAI-compat endpoint (hive expert).  No "improve this
+    #     draft" meta-prompt; the expert's reply replaces the standby via
+    #     the existing speculation_id bubble-replacement path.
+    #
+    # PARALLEL-PATH NOTICE: this is a temporary, documented parallel path
+    # (CLAUDE.md Gate 4 explicitly allows it during migration).  Flag flip
+    # lands in the next commit; the legacy branch + its helpers
+    # (_build_expert_prompt, _is_meaningful_improvement,
+    # _RESPONSE_ADEQUATE, _SIMILARITY_THRESHOLD) get deleted in the commit
+    # after that.  Do NOT add new logic to _run_legacy_expert_path.
+
+    @staticmethod
+    def _langchain_bg_enabled() -> bool:
+        """Feature flag for the collapsed expert path.
+
+        Reads ``HEVOLVE_DISPATCH_LANGCHAIN_BG`` — default OFF this commit,
+        flipped ON in the next commit once tests are green.  Kept as a
+        single env-var helper so any future emergency-disable lands in one
+        place (no parallel flag-check sites).
+        """
+        return os.environ.get(
+            'HEVOLVE_DISPATCH_LANGCHAIN_BG', '',
+        ).strip().lower() in ('1', 'true', 'yes', 'on')
 
     def _expert_background_task(self, speculation_id: str, original_prompt: str,
                                 fast_response: str, expert_model, user_id: str,
                                 prompt_id: str, goal_id: str, goal_type: str):
-        """Background: budget check → expert dispatch → deliver if improved."""
+        """Background: budget check → expert dispatch → deliver.
+
+        Dispatches to legacy or collapsed path based on the
+        ``HEVOLVE_DISPATCH_LANGCHAIN_BG`` flag.  Shared error-handling +
+        ``_active`` cleanup live here so both paths converge on the same
+        finally-clause invariant.
+        """
         try:
             # GUARDRAIL: circuit breaker (check again — may have been halted)
             from security.hive_guardrails import HiveCircuitBreaker
             if HiveCircuitBreaker.is_halted():
                 return
 
-            expert_prompt = self._build_expert_prompt(original_prompt, fast_response)
-
-            start = time.time()
-            expert_response = self._dispatch_to_model(
-                expert_model, expert_prompt, user_id, prompt_id,
-                goal_type, goal_id)
-            elapsed_ms = (time.time() - start) * 1000
-
-            # GUARDRAIL: energy tracking
-            self._registry.record_energy(expert_model.model_id, elapsed_ms)
-            self._registry.record_latency(expert_model.model_id, elapsed_ms)
-
-            # Check if expert meaningfully improved
-            if self._is_meaningful_improvement(fast_response, expert_response):
-                # GUARDRAIL: constitutional check on expert output
-                from security.hive_guardrails import ConstitutionalFilter
-                passed, reason = ConstitutionalFilter.check_prompt(expert_response)
-                if passed:
-                    self._deliver_expert_response(
-                        user_id, prompt_id, speculation_id, expert_response)
-                    with self._lock:
-                        self._results[speculation_id] = {
-                            'response': expert_response,
-                            'model': expert_model.model_id,
-                            'latency_ms': round(elapsed_ms, 1),
-                            'improved': True,
-                        }
-                        self._evict_old_results()
-                else:
-                    logger.warning(f"Expert response blocked by guardrail: {reason}")
+            if self._langchain_bg_enabled():
+                self._run_collapsed_expert_path(
+                    speculation_id, original_prompt, fast_response,
+                    expert_model, user_id, prompt_id, goal_id, goal_type)
             else:
-                with self._lock:
-                    self._results[speculation_id] = {
-                        'response': fast_response,
-                        'model': expert_model.model_id,
-                        'latency_ms': round(elapsed_ms, 1),
-                        'improved': False,
-                    }
-                    self._evict_old_results()
+                self._run_legacy_expert_path(
+                    speculation_id, original_prompt, fast_response,
+                    expert_model, user_id, prompt_id, goal_id, goal_type)
 
         except Exception as e:
             logger.debug(f"Expert background task failed for {speculation_id}: {e}")
         finally:
             with self._lock:
                 self._active.pop(speculation_id, None)
+
+    def _run_legacy_expert_path(self, speculation_id: str,
+                                original_prompt: str, fast_response: str,
+                                expert_model, user_id: str, prompt_id: str,
+                                goal_id: str, goal_type: str):
+        """Pre-collapse behavior — preserved byte-for-byte for the
+        flag-OFF default so this commit ships with zero regression risk.
+        Deletion lands two commits after flag flip."""
+        expert_prompt = self._build_expert_prompt(original_prompt, fast_response)
+
+        start = time.time()
+        expert_response = self._dispatch_to_model(
+            expert_model, expert_prompt, user_id, prompt_id,
+            goal_type, goal_id)
+        elapsed_ms = (time.time() - start) * 1000
+
+        # GUARDRAIL: energy tracking
+        self._registry.record_energy(expert_model.model_id, elapsed_ms)
+        self._registry.record_latency(expert_model.model_id, elapsed_ms)
+
+        # Check if expert meaningfully improved
+        if self._is_meaningful_improvement(fast_response, expert_response):
+            # GUARDRAIL: constitutional check on expert output
+            from security.hive_guardrails import ConstitutionalFilter
+            passed, reason = ConstitutionalFilter.check_prompt(expert_response)
+            if passed:
+                self._deliver_expert_response(
+                    user_id, prompt_id, speculation_id, expert_response)
+                with self._lock:
+                    self._results[speculation_id] = {
+                        'response': expert_response,
+                        'model': expert_model.model_id,
+                        'latency_ms': round(elapsed_ms, 1),
+                        'improved': True,
+                    }
+                    self._evict_old_results()
+            else:
+                logger.warning(f"Expert response blocked by guardrail: {reason}")
+        else:
+            with self._lock:
+                self._results[speculation_id] = {
+                    'response': fast_response,
+                    'model': expert_model.model_id,
+                    'latency_ms': round(elapsed_ms, 1),
+                    'improved': False,
+                }
+                self._evict_old_results()
+
+    def _run_collapsed_expert_path(self, speculation_id: str,
+                                   original_prompt: str, fast_response: str,
+                                   expert_model, user_id: str, prompt_id: str,
+                                   goal_id: str, goal_type: str):
+        """Collapsed path: expert takes the ORIGINAL turn through the full
+        langchain pipeline (local) or the hive endpoint (remote).  No
+        'improve this draft' wrapper.  Reuses ``_dispatch_expert_langchain``
+        for routing + ``_deliver_expert_response`` for SSE/TTS fan-out.
+        """
+        start = time.time()
+        expert_response = self._dispatch_expert_langchain(
+            expert_model, original_prompt, user_id, prompt_id,
+            goal_type, goal_id)
+        elapsed_ms = (time.time() - start) * 1000
+
+        # GUARDRAIL: energy + latency telemetry (same instrumentation as
+        # the legacy path — the rollout flip must not lose these metrics).
+        self._registry.record_energy(expert_model.model_id, elapsed_ms)
+        self._registry.record_latency(expert_model.model_id, elapsed_ms)
+
+        # Empty response → the draft standby stays as the final reply.
+        # The user already saw it; nothing to deliver.  Record the
+        # _results entry so admin /diag can tell the expert ran and
+        # returned empty (vs never ran).
+        if not expert_response or not expert_response.strip():
+            logger.debug(
+                "collapsed expert returned empty for %s; "
+                "draft standby remains the final reply", speculation_id)
+            with self._lock:
+                self._results[speculation_id] = {
+                    'response': fast_response,
+                    'model': expert_model.model_id,
+                    'latency_ms': round(elapsed_ms, 1),
+                    'improved': False,
+                }
+                self._evict_old_results()
+            return
+
+        # GUARDRAIL: constitutional check on expert output before delivery
+        from security.hive_guardrails import ConstitutionalFilter
+        passed, reason = ConstitutionalFilter.check_prompt(expert_response)
+        if not passed:
+            logger.warning(
+                "collapsed expert response blocked by guardrail: %s",
+                reason)
+            return
+
+        # Unconditional delivery: the expert is THE expert here, not a
+        # "maybe improvement".  Bubble-replace the standby via the
+        # existing speculation_id channel (SSE + TTS — see
+        # _deliver_expert_response for the dual-channel contract).
+        self._deliver_expert_response(
+            user_id, prompt_id, speculation_id, expert_response)
+
+        # Feed continual learning.  Stamp escalation_reason from the
+        # _active entry so distillation can weight refusal-overridden
+        # turns differently from clean classifier-delegate turns.
+        with self._lock:
+            active_entry = dict(self._active.get(speculation_id, {}))
+        served_by = (
+            'hive_langchain_bg' if not expert_model.is_local
+            else 'local_langchain_bg'
+        )
+        self._record_interaction_safely(
+            user_id=user_id, prompt_id=prompt_id,
+            prompt=original_prompt, response=expert_response,
+            model_id=expert_model.model_id, latency_ms=elapsed_ms,
+            goal_id=goal_id,
+            escalation_reason=active_entry.get('escalation_reason'),
+        )
+
+        with self._lock:
+            self._results[speculation_id] = {
+                'response': expert_response,
+                'model': expert_model.model_id,
+                'latency_ms': round(elapsed_ms, 1),
+                'improved': True,
+                'served_by': served_by,
+            }
+            self._evict_old_results()
+
+    def _dispatch_expert_langchain(self, model, prompt: str, user_id: str,
+                                   prompt_id: str, goal_type: str,
+                                   goal_id: Optional[str]) -> str:
+        """Send the expert turn through the right transport for its tier.
+
+        - ``model.is_local=True``:  route through the FULL HARTOS /chat
+          pipeline (agent loading, autogen GroupChat, full tool registry)
+          so actionable-intent / agent-bound turns actually fire their
+          tools.
+            * Bundled mode (NUNBA_BUNDLED / sys.frozen): in-process Flask
+              ``test_client`` — port 6777 is not bound in bundled Nunba.
+            * Non-bundled: HTTP POST to ``HEVOLVE_BASE_URL`` (or the
+              port_registry-resolved backend).
+          Re-entry is prevented by ``speculative=False, draft_first=False``
+          in the payload — the inner /chat handler reads these and skips
+          the dispatcher.
+
+        - ``model.is_local=False`` (hive-served expert, registered by
+          ``HiveExpertDiscovery``):  OpenAI-compatible POST to
+          ``{base_url}/chat/completions`` with the registered auth token.
+          The hive peer's 27B / fine-tuned model takes the turn directly.
+
+        Returns the response string, or ``''`` on any failure — caller
+        falls back to ``fast_response`` so the user always sees the
+        draft's standby.
+        """
+        if model is None:
+            return ''
+
+        # ── Hive path: OpenAI-compatible POST to peer base_url ──
+        if not getattr(model, 'is_local', True):
+            cfg = getattr(model, 'config_list_entry', {}) or {}
+            base_url = (cfg.get('base_url') or '').rstrip('/')
+            api_key = cfg.get('api_key') or ''
+            inner_model_id = cfg.get('model') or model.model_id
+            if not base_url:
+                logger.debug(
+                    "hive expert %s missing base_url — cannot dispatch",
+                    model.model_id)
+                return ''
+            try:
+                import requests as _req
+                headers = (
+                    {'Authorization': f'Bearer {api_key}'} if api_key else {})
+                resp = _req.post(
+                    f'{base_url}/chat/completions',
+                    headers=headers,
+                    json={
+                        'model': inner_model_id,
+                        'messages': [{'role': 'user', 'content': prompt}],
+                        'max_tokens': 1500,
+                        'temperature': 0.7,
+                    },
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    data = resp.json() or {}
+                    choices = data.get('choices') or []
+                    if choices:
+                        msg = (choices[0] or {}).get('message') or {}
+                        return msg.get('content') or ''
+                else:
+                    logger.debug(
+                        "hive expert %s returned HTTP %s",
+                        model.model_id, resp.status_code)
+            except Exception as e:
+                logger.debug(
+                    "hive expert dispatch failed (%s): %s",
+                    model.model_id, e)
+            return ''
+
+        # ── Local path: full HARTOS /chat pipeline ──
+        payload = {
+            'user_id': user_id,
+            'prompt_id': (
+                f'{goal_type}_{goal_id[:8]}' if goal_id else prompt_id),
+            'prompt': prompt,
+            'create_agent': True,
+            'autonomous': True,
+            'casual_conv': False,
+            'model_config': model.to_config_list(),
+            # Hard no-reentry: inner /chat reads these and skips the
+            # dispatcher entirely so we never recursively re-enter.
+            'speculative': False,
+            'draft_first': False,
+        }
+
+        import sys as _sys
+        _bundled = bool(
+            os.environ.get('NUNBA_BUNDLED')
+            or getattr(_sys, 'frozen', False)
+        )
+        if _bundled:
+            try:
+                # Late import — keeps module-load time independent of
+                # hart_intelligence_entry's heavy boot graph.  In bundled
+                # Nunba this is cheap (already in sys.modules by the
+                # time a chat turn fires).
+                from hart_intelligence_entry import app as _app  # type: ignore
+                with _app.test_client() as client:
+                    resp = client.post('/chat', json=payload)
+                    if resp.status_code == 200:
+                        data = resp.get_json() or {}
+                        return data.get('response') or ''
+                    logger.debug(
+                        "local expert /chat returned %s in bundled mode",
+                        resp.status_code)
+            except Exception as e:
+                logger.debug(
+                    "local expert bundled dispatch failed: %s", e)
+            return ''
+
+        # Non-bundled: HTTP POST to the configured backend.
+        try:
+            import requests as _req
+            base = os.environ.get(
+                'HEVOLVE_BASE_URL',
+                f'http://localhost:{get_port("backend")}',
+            )
+            resp = _req.post(f'{base}/chat', json=payload, timeout=60)
+            if resp.status_code == 200:
+                return (resp.json() or {}).get('response') or ''
+            logger.debug(
+                "local expert /chat HTTP returned %s", resp.status_code)
+        except Exception as e:
+            logger.debug("local expert HTTP dispatch failed: %s", e)
+        return ''
 
     # ─── Helpers ───
 
