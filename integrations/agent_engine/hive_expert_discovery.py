@@ -273,6 +273,25 @@ class HiveExpertDiscovery:
                 "ignored")
             return 0
 
+        # Self-echo guard: when THIS node's HiveCapabilityAdvertiser
+        # emits an announce, EventBus fans it out locally before
+        # crossbar relays it.  Registering the local models as hive
+        # backends would create is_local=False duplicates of entries
+        # already present as is_local=True — wrong on every count
+        # (dispatcher's _dispatch_expert_langchain would treat them as
+        # remote and OpenAI-POST them to the local endpoint instead of
+        # using the in-process /chat pipeline).
+        # The check belongs here, not in the producer, because any
+        # consumer can apply it whether or not the local producer is
+        # running.
+        local_peer = (os.environ.get('HEVOLVE_NODE_ID') or '').strip()
+        if local_peer and local_peer.lower() != 'local' and (
+                peer_id == local_peer):
+            logger.debug(
+                "HiveExpertDiscovery: ignoring self-announce from "
+                "peer_id=%r (matches HEVOLVE_NODE_ID)", peer_id)
+            return 0
+
         if not self._verify_peer_trust(msg):
             logger.warning(
                 "HiveExpertDiscovery: peer %s trust check failed — "

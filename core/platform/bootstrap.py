@@ -83,6 +83,21 @@ def bootstrap_platform(extensions_dir: Optional[str] = None) -> ServiceRegistry:
     except Exception as e:
         logger.debug('hive_expert_discovery attach skipped: %s', e)
 
+    # HiveCapabilityAdvertiser — producer side.  Periodically emits
+    # peer.capability.announce so other nodes' HiveExpertDiscovery can
+    # register THIS node's expert-eligible models.  Opt-in via
+    # HEVOLVE_HIVE_ADVERTISE=1; the attach() helper is a no-op when the
+    # operator hasn't opted in or HEVOLVE_HIVE_PUBLIC_ENDPOINT is unset.
+    # Sibling of the discovery subscriber attached just above — same
+    # safety contract (degrades to debug log on any failure).
+    try:
+        from integrations.agent_engine.hive_capability_advertiser import (
+            get_hive_capability_advertiser,
+        )
+        get_hive_capability_advertiser().attach()
+    except Exception as e:
+        logger.debug('hive_capability_advertiser attach skipped: %s', e)
+
     # CacheService — unified in-memory + optional disk cache
     registry.register('cache', CacheService, singleton=True)
 
