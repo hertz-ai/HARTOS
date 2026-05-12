@@ -1,21 +1,21 @@
-"""Tests for the collapsed expert background path
-(``HEVOLVE_DISPATCH_LANGCHAIN_BG=true``).
+"""Tests for the collapsed expert background path.
+
+The dispatcher's expert turn runs the ORIGINAL prompt through the full
+langchain pipeline (local expert) or the hive peer's OpenAI-compat
+endpoint (hive expert).  No improve-this-draft wrapper, no similarity
+gate.
 
 Verifies that:
 
-  * flag OFF runs the legacy _build_expert_prompt + _is_meaningful_improvement
-    path byte-for-byte (zero regression).
-  * flag ON dispatches the ORIGINAL prompt (no improve-wrapper) via
-    _dispatch_expert_langchain.
-  * Hive expert (is_local=False) → OpenAI-compatible POST to base_url.
-  * Local expert (is_local=True) → HTTP POST to /chat with full payload.
+  * Hive expert (is_local=False) → OpenAI-compatible POST to base_url
+    with Bearer auth.
+  * Local expert (is_local=True) → HTTP POST to /chat with re-entry
+    guard flags set.
   * Empty response → no delivery, draft standby remains final.
   * Guardrail block → no delivery.
   * Successful response → _deliver_expert_response invoked exactly once.
   * served_by tag distinguishes hive_langchain_bg vs local_langchain_bg.
-
-The flag-flip lives in commit 6; these tests prove the path is safe to
-flip.
+  * Escalation reason flows from _active through to WorldModelBridge.
 """
 from __future__ import annotations
 
@@ -92,102 +92,50 @@ def _mock_guardrails(monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Feature flag predicate
+# _expert_background_task — delegates to the collapsed path
 # ─────────────────────────────────────────────────────────────────────
 
 
-class TestLangchainBgFlag:
-    """Default-ON, explicit-disable predicate (post-flip semantics).
+class TestBackgroundTaskDelegation:
 
-    Operators set ``HEVOLVE_DISPATCH_LANGCHAIN_BG=0`` (or
-    false/no/off) for emergency revert.  Unset / empty / any other
-    value → collapsed path runs."""
-
-    def test_default_on_when_unset(self, monkeypatch):
-        from integrations.agent_engine.speculative_dispatcher import (
-            SpeculativeDispatcher,
-        )
-        monkeypatch.delenv('HEVOLVE_DISPATCH_LANGCHAIN_BG', raising=False)
-        assert SpeculativeDispatcher._langchain_bg_enabled() is True
-
-    def test_default_on_when_empty(self, monkeypatch):
-        from integrations.agent_engine.speculative_dispatcher import (
-            SpeculativeDispatcher,
-        )
-        monkeypatch.setenv('HEVOLVE_DISPATCH_LANGCHAIN_BG', '')
-        assert SpeculativeDispatcher._langchain_bg_enabled() is True
-
-    @pytest.mark.parametrize(
-        'enabled', ['1', 'true', 'True', 'YES', 'on', 'whatever'])
-    def test_non_disable_values_enable(self, monkeypatch, enabled):
-        from integrations.agent_engine.speculative_dispatcher import (
-            SpeculativeDispatcher,
-        )
-        monkeypatch.setenv('HEVOLVE_DISPATCH_LANGCHAIN_BG', enabled)
-        assert SpeculativeDispatcher._langchain_bg_enabled() is True
-
-    @pytest.mark.parametrize(
-        'disable', ['0', 'false', 'False', 'no', 'NO', 'off', 'Off'])
-    def test_explicit_disable_values(self, monkeypatch, disable):
-        from integrations.agent_engine.speculative_dispatcher import (
-            SpeculativeDispatcher,
-        )
-        monkeypatch.setenv('HEVOLVE_DISPATCH_LANGCHAIN_BG', disable)
-        assert SpeculativeDispatcher._langchain_bg_enabled() is False
-
-
-# ─────────────────────────────────────────────────────────────────────
-# _expert_background_task — dispatch by flag
-# ─────────────────────────────────────────────────────────────────────
-
-
-class TestFlagGatedDispatch:
-
-    def test_flag_off_routes_to_legacy_path(
+    def test_routes_to_collapsed_path(
             self, dispatcher, monkeypatch):
         _mock_guardrails(monkeypatch)
-        # Post-flip default is ON; explicit disable knob is what
-        # routes to the legacy path.
-        monkeypatch.setenv('HEVOLVE_DISPATCH_LANGCHAIN_BG', '0')
         expert = dispatcher._registry.get_fast_model()
         with patch.object(dispatcher,
-                          '_run_legacy_expert_path') as legacy, \
-             patch.object(dispatcher,
                           '_run_collapsed_expert_path') as collapsed:
             dispatcher._expert_background_task(
                 'spec-1', 'original', 'fast', expert,
                 'u', 'pid', None, 'general')
-        legacy.assert_called_once()
-        collapsed.assert_not_called()
-
-    def test_flag_on_routes_to_collapsed_path(
-            self, dispatcher, monkeypatch):
-        _mock_guardrails(monkeypatch)
-        monkeypatch.setenv('HEVOLVE_DISPATCH_LANGCHAIN_BG', 'true')
-        expert = dispatcher._registry.get_fast_model()
-        with patch.object(dispatcher,
-                          '_run_legacy_expert_path') as legacy, \
-             patch.object(dispatcher,
-                          '_run_collapsed_expert_path') as collapsed:
-            dispatcher._expert_background_task(
-                'spec-1', 'original', 'fast', expert,
-                'u', 'pid', None, 'general')
-        legacy.assert_not_called()
         collapsed.assert_called_once()
 
-    def test_active_cleanup_runs_after_both_paths(
-            self, dispatcher, monkeypatch):
-        """Shared finally clause must clean _active regardless of which
-        path took the turn."""
+    def test_active_cleanup_runs(self, dispatcher, monkeypatch):
+        """Shared finally clause must clean _active even when the
+        helper raises."""
         _mock_guardrails(monkeypatch)
         expert = dispatcher._registry.get_fast_model()
         with dispatcher._lock:
             dispatcher._active['spec-cleanup'] = {'started_at': 0}
-        with patch.object(dispatcher, '_run_legacy_expert_path'):
+        with patch.object(dispatcher, '_run_collapsed_expert_path',
+                          side_effect=RuntimeError('boom')):
             dispatcher._expert_background_task(
                 'spec-cleanup', 'p', 'r', expert,
                 'u', 'pid', None, 'general')
         assert 'spec-cleanup' not in dispatcher._active
+
+    def test_circuit_breaker_short_circuits(
+            self, dispatcher, monkeypatch):
+        """Halted circuit breaker → no dispatch attempt."""
+        import security.hive_guardrails as hg
+        monkeypatch.setattr(
+            hg.HiveCircuitBreaker, 'is_halted', lambda: True)
+        expert = dispatcher._registry.get_fast_model()
+        with patch.object(dispatcher,
+                          '_run_collapsed_expert_path') as collapsed:
+            dispatcher._expert_background_task(
+                'spec-halted', 'p', 'r', expert,
+                'u', 'pid', None, 'general')
+        collapsed.assert_not_called()
 
 
 # ─────────────────────────────────────────────────────────────────────

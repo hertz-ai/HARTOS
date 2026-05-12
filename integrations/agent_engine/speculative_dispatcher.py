@@ -47,11 +47,6 @@ from integrations.agent_engine.escalation_reasons import EscalationReason
 logger = logging.getLogger('hevolve_social')
 
 
-# Similarity threshold — below this, expert response is considered
-# a meaningful improvement over fast response
-_SIMILARITY_THRESHOLD = 0.80
-_RESPONSE_ADEQUATE = 'RESPONSE_ADEQUATE'
-
 # Minimum draft confidence required to commit the draft's reply as the
 # FINAL answer (delegate="none" path). Below this we schedule an expert
 # verification in the background regardless of what the draft said —
@@ -1320,54 +1315,21 @@ class SpeculativeDispatcher:
 
     # ─── Background expert task ───
     #
-    # Two paths coexist behind a feature flag during the rollout window:
-    #   - flag OFF (default this commit): _run_legacy_expert_path runs the
-    #     historical "review and improve" wrapper.  Byte-for-byte preserved
-    #     so no live behavior changes when this commit lands.
-    #   - flag ON: _run_collapsed_expert_path dispatches the ORIGINAL turn
-    #     through the full langchain pipeline (local expert) or the hive
-    #     peer's OpenAI-compat endpoint (hive expert).  No "improve this
-    #     draft" meta-prompt; the expert's reply replaces the standby via
-    #     the existing speculation_id bubble-replacement path.
-    #
-    # PARALLEL-PATH NOTICE: this is a temporary, documented parallel path
-    # (CLAUDE.md Gate 4 explicitly allows it during migration).  Flag flip
-    # lands in the next commit; the legacy branch + its helpers
-    # (_build_expert_prompt, _is_meaningful_improvement,
-    # _RESPONSE_ADEQUATE, _SIMILARITY_THRESHOLD) get deleted in the commit
-    # after that.  Do NOT add new logic to _run_legacy_expert_path.
-
-    @staticmethod
-    def _langchain_bg_enabled() -> bool:
-        """Feature flag for the collapsed expert path.
-
-        DEFAULT: ON.  Reads ``HEVOLVE_DISPATCH_LANGCHAIN_BG`` —
-        operators can set it to ``0`` / ``false`` / ``no`` / ``off`` for
-        emergency revert to the legacy improve-the-draft path.
-        Otherwise (unset / empty / any truthy value) the collapsed path
-        runs.
-
-        The asymmetric "default-ON, explicit-disable" predicate makes
-        an unset env var the production behavior — clean rollout
-        without requiring every deployment to set a new flag.  The
-        legacy branch still exists in this commit so the disable knob
-        works; it gets deleted in the next commit once the flip is
-        verified safe in the field.
-        """
-        raw = os.environ.get(
-            'HEVOLVE_DISPATCH_LANGCHAIN_BG', '',
-        ).strip().lower()
-        return raw not in ('0', 'false', 'no', 'off')
+    # Single path: expert (local langchain pipeline or hive peer) takes
+    # the ORIGINAL turn directly.  No "improve this draft" wrapper, no
+    # similarity gate — when the expert is the actual expert (full tool
+    # registry locally, 27B or fine-tuned on hive), its reply IS the
+    # answer.  The standby (fast_response) was already delivered by the
+    # draft-first path; this task replaces it via the existing
+    # speculation_id bubble-replacement channel on _deliver_expert_response.
 
     def _expert_background_task(self, speculation_id: str, original_prompt: str,
                                 fast_response: str, expert_model, user_id: str,
                                 prompt_id: str, goal_id: str, goal_type: str):
-        """Background: budget check → expert dispatch → deliver.
-
-        Dispatches to legacy or collapsed path based on the
-        ``HEVOLVE_DISPATCH_LANGCHAIN_BG`` flag.  Shared error-handling +
-        ``_active`` cleanup live here so both paths converge on the same
-        finally-clause invariant.
+        """Background: dispatch expert → deliver (or fall through to draft
+        standby).  Outer try/finally owns the shared invariants —
+        circuit-breaker gate, exception swallowing, ``_active`` cleanup —
+        so the helper can focus on dispatch + delivery semantics.
         """
         try:
             # GUARDRAIL: circuit breaker (check again — may have been halted)
@@ -1375,67 +1337,15 @@ class SpeculativeDispatcher:
             if HiveCircuitBreaker.is_halted():
                 return
 
-            if self._langchain_bg_enabled():
-                self._run_collapsed_expert_path(
-                    speculation_id, original_prompt, fast_response,
-                    expert_model, user_id, prompt_id, goal_id, goal_type)
-            else:
-                self._run_legacy_expert_path(
-                    speculation_id, original_prompt, fast_response,
-                    expert_model, user_id, prompt_id, goal_id, goal_type)
+            self._run_collapsed_expert_path(
+                speculation_id, original_prompt, fast_response,
+                expert_model, user_id, prompt_id, goal_id, goal_type)
 
         except Exception as e:
             logger.debug(f"Expert background task failed for {speculation_id}: {e}")
         finally:
             with self._lock:
                 self._active.pop(speculation_id, None)
-
-    def _run_legacy_expert_path(self, speculation_id: str,
-                                original_prompt: str, fast_response: str,
-                                expert_model, user_id: str, prompt_id: str,
-                                goal_id: str, goal_type: str):
-        """Pre-collapse behavior — preserved byte-for-byte for the
-        flag-OFF default so this commit ships with zero regression risk.
-        Deletion lands two commits after flag flip."""
-        expert_prompt = self._build_expert_prompt(original_prompt, fast_response)
-
-        start = time.time()
-        expert_response = self._dispatch_to_model(
-            expert_model, expert_prompt, user_id, prompt_id,
-            goal_type, goal_id)
-        elapsed_ms = (time.time() - start) * 1000
-
-        # GUARDRAIL: energy tracking
-        self._registry.record_energy(expert_model.model_id, elapsed_ms)
-        self._registry.record_latency(expert_model.model_id, elapsed_ms)
-
-        # Check if expert meaningfully improved
-        if self._is_meaningful_improvement(fast_response, expert_response):
-            # GUARDRAIL: constitutional check on expert output
-            from security.hive_guardrails import ConstitutionalFilter
-            passed, reason = ConstitutionalFilter.check_prompt(expert_response)
-            if passed:
-                self._deliver_expert_response(
-                    user_id, prompt_id, speculation_id, expert_response)
-                with self._lock:
-                    self._results[speculation_id] = {
-                        'response': expert_response,
-                        'model': expert_model.model_id,
-                        'latency_ms': round(elapsed_ms, 1),
-                        'improved': True,
-                    }
-                    self._evict_old_results()
-            else:
-                logger.warning(f"Expert response blocked by guardrail: {reason}")
-        else:
-            with self._lock:
-                self._results[speculation_id] = {
-                    'response': fast_response,
-                    'model': expert_model.model_id,
-                    'latency_ms': round(elapsed_ms, 1),
-                    'improved': False,
-                }
-                self._evict_old_results()
 
     def _run_collapsed_expert_path(self, speculation_id: str,
                                    original_prompt: str, fast_response: str,
@@ -1647,35 +1557,6 @@ class SpeculativeDispatcher:
         return ''
 
     # ─── Helpers ───
-
-    def _build_expert_prompt(self, original_prompt: str, fast_response: str) -> str:
-        """Augment prompt: expert sees original task + fast agent's output."""
-        return (
-            f"You are an expert reviewer. A fast agent on a hive compute node "
-            f"has already responded. Review and improve if needed.\n\n"
-            f"## Original Request\n{original_prompt}\n\n"
-            f"## Fast Agent's Response\n{fast_response}\n\n"
-            f"## Your Task\n"
-            f"Improve the response: fix errors, add missing details, improve clarity.\n"
-            f"If the response is already excellent, respond with: {_RESPONSE_ADEQUATE}\n"
-            f"Every output must be constructive towards humanity's benefit."
-        )
-
-    def _is_meaningful_improvement(self, fast_response: str,
-                                    expert_response: str) -> bool:
-        """Check if expert actually improved on the fast response."""
-        if not expert_response:
-            return False
-        if _RESPONSE_ADEQUATE in expert_response:
-            return False
-        # Simple word-overlap similarity
-        fast_words = set(fast_response.lower().split())
-        expert_words = set(expert_response.lower().split())
-        if not fast_words or not expert_words:
-            return bool(expert_response.strip())
-        overlap = len(fast_words & expert_words)
-        similarity = overlap / max(len(fast_words | expert_words), 1)
-        return similarity < _SIMILARITY_THRESHOLD
 
     def _dispatch_to_model(self, model: 'ModelBackend', prompt: str,
                            user_id: str, prompt_id: str,
