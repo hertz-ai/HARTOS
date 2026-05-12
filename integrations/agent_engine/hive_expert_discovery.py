@@ -185,13 +185,38 @@ class HiveExpertDiscovery:
             return False
 
     def shutdown(self) -> None:
-        """Stop the health-check loop and the worker pool.
+        """Stop the health-check loop, unsubscribe from the EventBus,
+        and shut the worker pool down.
+
+        Unsubscribe matters for test isolation and hot-reload paths:
+        if a new instance gets constructed after a shutdown, the old
+        callbacks would otherwise remain bound to the bus and fire on
+        a dead executor (``ThreadPoolExecutor.submit`` raises
+        ``RuntimeError`` after ``shutdown()``).  ``bus.off`` removes
+        them cleanly so the bus only ever talks to the live instance.
 
         Does NOT unregister already-registered hive backends — leave
         them in place for graceful drain.  ``ModelRegistry.unregister``
         is still callable; callers that need a hard reset can iterate.
         """
         self._stop.set()
+        # Unsubscribe before pool shutdown so any in-flight callback
+        # finishes (or noops) without scheduling new work onto a dead
+        # executor.
+        if self._subscribed:
+            try:
+                from core.platform.registry import get_registry
+                registry = get_registry()
+                if registry.has('events'):
+                    bus = registry.get('events')
+                    bus.off(_TOPIC_ANNOUNCE, self._on_announce_event)
+                    bus.off(_TOPIC_REVOKE, self._on_revoke_event)
+            except Exception as e:
+                logger.debug(
+                    "HiveExpertDiscovery: unsubscribe during shutdown "
+                    "raised (%s); continuing", e)
+            with self._lock:
+                self._subscribed = False
         self._pool.shutdown(wait=False)
 
     # ── EventBus callbacks (bus passes (topic, data)) ───────────────

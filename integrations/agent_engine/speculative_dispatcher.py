@@ -264,11 +264,39 @@ class SpeculativeDispatcher:
                              goal_id: str = None, goal_type: str = 'general',
                              node_id: str = None) -> dict:
         """
+        Legacy entry point (pre-dates ``dispatch_draft_first``).
+
         1. Guardrail-check the prompt
-        2. Pick fast model → dispatch synchronously → user gets response
+        2. Pick FAST tier model → dispatch synchronously → user gets reply
         3. Record compute contribution for hive node (ad revenue)
-        4. Pick expert model → dispatch in background thread
+        4. Pick EXPERT tier model → schedule background task
         5. Return fast response immediately
+
+        **Post-refactor behavior** (commit cad43c3 onward): the expert
+        background task now runs the ORIGINAL prompt through the full
+        HARTOS ``/chat`` pipeline (local) or the registered hive peer's
+        OpenAI-compat endpoint (remote) via
+        ``_run_collapsed_expert_path``.  It NO LONGER wraps the fast
+        response as a "review and improve" meta-prompt, and there is
+        NO similarity gate — the expert's reply replaces the fast
+        response by default (modulo guardrail block / empty response)
+        via the ``speculation_id`` bubble-replacement on
+        ``_deliver_expert_response``.
+
+        Compared to the pre-refactor contract, callers see two
+        differences:
+          * The expert may now bind the full tool registry (Create_Agent,
+            Connect_Channel, etc.) — previously it could only emit text.
+          * The expert's reply is delivered unconditionally; previously
+            it was only delivered when the word-overlap similarity to
+            the fast response fell below 80%.
+
+        ``dispatch_draft_first`` is the preferred entry point — it
+        stamps ``escalation_reason`` on the background task and adds
+        five smart-routing guards (refusal override, low confidence,
+        agent-bound prompt, actionable intent, parse failure).
+        ``dispatch_speculative`` retains the legacy semantics for
+        callers that don't need draft-tier classification.
 
         Returns:
             {
