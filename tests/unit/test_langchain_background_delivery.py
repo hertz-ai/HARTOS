@@ -97,29 +97,42 @@ def _mock_guardrails(monkeypatch):
 
 
 class TestLangchainBgFlag:
+    """Default-ON, explicit-disable predicate (post-flip semantics).
 
-    def test_default_off(self, monkeypatch):
+    Operators set ``HEVOLVE_DISPATCH_LANGCHAIN_BG=0`` (or
+    false/no/off) for emergency revert.  Unset / empty / any other
+    value → collapsed path runs."""
+
+    def test_default_on_when_unset(self, monkeypatch):
         from integrations.agent_engine.speculative_dispatcher import (
             SpeculativeDispatcher,
         )
         monkeypatch.delenv('HEVOLVE_DISPATCH_LANGCHAIN_BG', raising=False)
-        assert SpeculativeDispatcher._langchain_bg_enabled() is False
+        assert SpeculativeDispatcher._langchain_bg_enabled() is True
 
-    @pytest.mark.parametrize('truthy', ['1', 'true', 'True', 'YES', 'on'])
-    def test_truthy_values_enable(self, monkeypatch, truthy):
+    def test_default_on_when_empty(self, monkeypatch):
         from integrations.agent_engine.speculative_dispatcher import (
             SpeculativeDispatcher,
         )
-        monkeypatch.setenv('HEVOLVE_DISPATCH_LANGCHAIN_BG', truthy)
+        monkeypatch.setenv('HEVOLVE_DISPATCH_LANGCHAIN_BG', '')
         assert SpeculativeDispatcher._langchain_bg_enabled() is True
 
     @pytest.mark.parametrize(
-        'falsy', ['0', 'false', '', 'no', 'off', 'whatever'])
-    def test_falsy_values_disable(self, monkeypatch, falsy):
+        'enabled', ['1', 'true', 'True', 'YES', 'on', 'whatever'])
+    def test_non_disable_values_enable(self, monkeypatch, enabled):
         from integrations.agent_engine.speculative_dispatcher import (
             SpeculativeDispatcher,
         )
-        monkeypatch.setenv('HEVOLVE_DISPATCH_LANGCHAIN_BG', falsy)
+        monkeypatch.setenv('HEVOLVE_DISPATCH_LANGCHAIN_BG', enabled)
+        assert SpeculativeDispatcher._langchain_bg_enabled() is True
+
+    @pytest.mark.parametrize(
+        'disable', ['0', 'false', 'False', 'no', 'NO', 'off', 'Off'])
+    def test_explicit_disable_values(self, monkeypatch, disable):
+        from integrations.agent_engine.speculative_dispatcher import (
+            SpeculativeDispatcher,
+        )
+        monkeypatch.setenv('HEVOLVE_DISPATCH_LANGCHAIN_BG', disable)
         assert SpeculativeDispatcher._langchain_bg_enabled() is False
 
 
@@ -133,7 +146,9 @@ class TestFlagGatedDispatch:
     def test_flag_off_routes_to_legacy_path(
             self, dispatcher, monkeypatch):
         _mock_guardrails(monkeypatch)
-        monkeypatch.delenv('HEVOLVE_DISPATCH_LANGCHAIN_BG', raising=False)
+        # Post-flip default is ON; explicit disable knob is what
+        # routes to the legacy path.
+        monkeypatch.setenv('HEVOLVE_DISPATCH_LANGCHAIN_BG', '0')
         expert = dispatcher._registry.get_fast_model()
         with patch.object(dispatcher,
                           '_run_legacy_expert_path') as legacy, \

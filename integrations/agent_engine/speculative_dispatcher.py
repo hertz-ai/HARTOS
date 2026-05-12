@@ -1341,14 +1341,23 @@ class SpeculativeDispatcher:
     def _langchain_bg_enabled() -> bool:
         """Feature flag for the collapsed expert path.
 
-        Reads ``HEVOLVE_DISPATCH_LANGCHAIN_BG`` — default OFF this commit,
-        flipped ON in the next commit once tests are green.  Kept as a
-        single env-var helper so any future emergency-disable lands in one
-        place (no parallel flag-check sites).
+        DEFAULT: ON.  Reads ``HEVOLVE_DISPATCH_LANGCHAIN_BG`` —
+        operators can set it to ``0`` / ``false`` / ``no`` / ``off`` for
+        emergency revert to the legacy improve-the-draft path.
+        Otherwise (unset / empty / any truthy value) the collapsed path
+        runs.
+
+        The asymmetric "default-ON, explicit-disable" predicate makes
+        an unset env var the production behavior — clean rollout
+        without requiring every deployment to set a new flag.  The
+        legacy branch still exists in this commit so the disable knob
+        works; it gets deleted in the next commit once the flip is
+        verified safe in the field.
         """
-        return os.environ.get(
+        raw = os.environ.get(
             'HEVOLVE_DISPATCH_LANGCHAIN_BG', '',
-        ).strip().lower() in ('1', 'true', 'yes', 'on')
+        ).strip().lower()
+        return raw not in ('0', 'false', 'no', 'off')
 
     def _expert_background_task(self, speculation_id: str, original_prompt: str,
                                 fast_response: str, expert_model, user_id: str,
