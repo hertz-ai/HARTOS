@@ -67,6 +67,22 @@ def bootstrap_platform(extensions_dir: Optional[str] = None) -> ServiceRegistry:
     except Exception as e:
         logger.debug('rsi_trigger bind skipped: %s', e)
 
+    # HiveExpertDiscovery — subscribes to peer.capability.announce /
+    # revoke and auto-registers reachable, trust-verified hive peers
+    # as ModelTier.EXPERT backends.  Idempotent attach; sits idle
+    # until a peer's capability advertiser daemon emits the gossip.
+    # No peer emits today, so this is a no-op-on-the-hot-path
+    # subscriber — once the producer ships, hive routing activates
+    # without any dispatcher-side change (the dispatcher already
+    # calls registry.get_expert_model()).
+    try:
+        from integrations.agent_engine.hive_expert_discovery import (
+            get_hive_expert_discovery,
+        )
+        get_hive_expert_discovery().attach_to_event_bus()
+    except Exception as e:
+        logger.debug('hive_expert_discovery attach skipped: %s', e)
+
     # CacheService — unified in-memory + optional disk cache
     registry.register('cache', CacheService, singleton=True)
 
