@@ -791,9 +791,11 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             current_app.logger.info(f'WORKING persona as {list_of_persona}')
 
     # #510: populate the canonical persona registry so that the
-    # `send_message_to_roles` tool (registered later) can resolve role→agent
-    # mappings during recipe authoring.  Single source of truth lives in
-    # core.persona_registry.
+    # `send_message_to_roles` tool can resolve role→agent mappings
+    # during recipe authoring.  Autonomous recipe creation does real
+    # multi-persona work while authoring — the personas were captured
+    # by gather-requirements before this code runs, so the registry IS
+    # populated at the right point.  Same canonical impl in both flows.
     try:
         from core.persona_registry import register_persona_for_session
         _personas_for_registry = config.get('personas') or (
@@ -1011,9 +1013,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                   "consult_expert",
                   "Consult a specialized domain expert for the current task")
 
-    # #510: send_message_to_roles — multi-persona broadcast.  Canonical impl
-    # lives in core.persona_registry.  Same impl runs in both create + reuse
-    # flows (registry TTLCaches are module-level singletons).
+    # #510: send_message_to_roles — multi-persona broadcast.  Canonical
+    # impl lives in core.persona_registry.  Registered in BOTH flows so
+    # autonomous-mode recipe creation can do real persona coordination
+    # mid-authoring (gather-requirements already populated the registry).
     from core.persona_registry import _send_message_to_roles_impl as _smr_impl
     @log_tool_execution
     def send_message_to_roles(
@@ -1620,6 +1623,30 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         tool_logger.warning(f"MCP integration error (non-critical): {e}")
         # Continue with default tools if MCP fails
 
+    # Service Tools: Register HTTP microservice tools (Crawl4AI, AceStep, etc.)
+    # Mirrors reuse_recipe.py:2335-2354 — sync so CREATE mode exposes the
+    # same crawl4ai/acestep/omniparser surface as REUSE.  Without this the
+    # gather LLM has no real tool to map "fetch a webpage" onto and invents
+    # fake tool names (2026-05-12 IPL refusal forensic).
+    try:
+        from integrations.service_tools import service_tool_registry, Crawl4AITool, AceStepTool
+
+        Crawl4AITool.register()   # port 11235
+        AceStepTool.register()    # port 8001
+        service_tool_registry.load_config()  # load any user-added tools from service_tools.json
+
+        svc_tools = service_tool_registry.get_all_tool_functions()
+        svc_defs = service_tool_registry.get_tool_definitions()
+
+        for tool_name, tool_func in svc_tools.items():
+            tool_def = next((d for d in svc_defs if d['name'] == tool_name), None)
+            if tool_def:
+                description = tool_def.get('description', f'Service tool: {tool_name}')
+                register_dual(helper, assistant, tool_func, tool_name, description)
+                tool_logger.info(f"Registered service tool: {tool_name}")
+    except Exception as e:
+        tool_logger.warning(f"Service tools integration error (non-critical): {e}")
+
     # Internal Agent Communication: Register agents and their skills for in-process communication
     try:
         tool_logger.info("Initializing Internal Agent Communication (skill-based delegation)...")
@@ -1704,10 +1731,10 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                       "delegate_to_specialist",
                       "Delegate complex tasks to specialist agents based on required skills")
 
-        # Add context sharing tool — #510 unification with reuse_recipe.
-        # reuse_recipe persists shared context to MemoryGraph for cross-session
-        # recall ("insight" memory_type); create-mode should do the same so
-        # behavior is consistent across both flows.
+        # #510: same canonical behavior as reuse_recipe — autonomous-mode
+        # recipe creation does real work, and shared context should be
+        # queryable later (`recall_memory` etc.).  Both flows persist the
+        # insight to MemoryGraph (fire-and-forget thread).
         @log_tool_execution
         def share_context_with_agents(context_key: Annotated[str, "Unique identifier for the context"],
                                       context_value: Annotated[str, "Context data to share (as JSON string)"]) -> str:
@@ -1757,9 +1784,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # Get AP2 payment tools for this agent
         ap2_tools = get_ap2_tools_for_autogen('assistant')
 
-        # Register payment tools
+        # Register payment tools — wrap with @log_tool_execution so payment
+        # operations fire UI status emits + structured-error envelopes
+        # (#510 followup — observability gap for AP2).  Same wrap pattern as
+        # the inline-def tools above; payments without observability would
+        # leave users unable to see what's happening during a transaction.
         for tool_def in ap2_tools:
-            tool_func = tool_def['function']
+            tool_func = log_tool_execution(tool_def['function'])
             tool_name = tool_def['name']
             tool_desc = tool_def['description']
             register_dual(helper, assistant, tool_func, tool_name, tool_desc)
@@ -1794,6 +1825,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             from integrations.agent_engine.journey_engine import register_journey_tools
             register_journey_tools(helper, assistant, user_id)
             tool_logger.info("Sales journey tools loaded (Tier 2) based on prompt content")
+        if 'revenue' in goal_tags:
+            # Revenue tools: get_api_revenue_stats + adjust_pricing.
+            # Without these the bootstrap_revenue_monitor goal can't
+            # actually see commercial-API revenue — agent hallucinates
+            # tool calls and the flywheel can't close.
+            from integrations.agent_engine.revenue_tools import register_revenue_tools
+            register_revenue_tools(helper, assistant, user_id)
+            tool_logger.info("Revenue tools loaded (Tier 2) based on prompt content")
     except Exception as e:
         # Promoted from debug to warning: a failure here means the agent
         # boots without its goal-specific tools, so it can talk about the
@@ -1953,6 +1992,43 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 f"{type(_loop_guard_err).__name__}: {_loop_guard_err!s} — "
                 "falling through to normal routing"
             )
+
+        # ─── EARLY-TERMINATE GUARD ─────────────────────────────────────
+        # Honour the TERMINATE signal from ANY speaker before the
+        # speaker-routing branches below fire.  Live evidence
+        # 2026-05-12 c38e8b7c-... — user said "hi" to a bound agent,
+        # autogen flowed Assistant → verify → ChatInstructor.  The
+        # ChatInstructor UserProxyAgent has
+        # ``default_auto_reply='TERMINATE'`` (set at the chat_instructor
+        # instantiation) so when verify produces no actionable JSON it
+        # emits the literal string ``"TERMINATE"``.  But the
+        # "last_speaker == ChatInstructor → return assistant" branch
+        # further down fires before the original TERMINATE check at
+        # the bottom of state_transition, so the "TERMINATE" message
+        # got appended with the metadata blob and routed BACK to
+        # Assistant.  Assistant's LLM saw a long context that ended
+        # with "TERMINATE\nMetadata/skeleton...", emitted a similar
+        # reply each round, and the STUCK-LOOP GUARD only rescued the
+        # turn after 5 identical Assistant calls (~3 minutes).
+        #
+        # Checking the message FIRST — regardless of who spoke — ends
+        # the conversation immediately whenever any agent signals
+        # TERMINATE, the same way autogen's per-agent
+        # ``is_termination_msg`` callback would if GroupChatManager
+        # ran it between rounds.
+        try:
+            _last_content = (groupchat.messages[-1].get('content') or '') if groupchat.messages else ''
+            if _last_content and 'TERMINATE' in _last_content.upper():
+                current_app.logger.info(
+                    "[EARLY-TERMINATE] last message contains TERMINATE "
+                    "(speaker=%r) — ending GroupChat round so the "
+                    "outer recipe loop can advance.",
+                    last_speaker.name,
+                )
+                return None
+        except Exception as _term_err:
+            current_app.logger.debug(
+                f"[EARLY-TERMINATE] check failed (non-blocking): {_term_err}")
 
         # Preempt: if user started chatting, abort daemon-initiated recipes
         # so the LLM is free for the user's request immediately.
@@ -2782,6 +2858,19 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
         code_execution_config={"last_n_messages": 2, "work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f"""{'AUTONOMOUS MODE: Do NOT ask the user questions. Use sensible defaults. Complete actions immediately without clarification.' if autonomous else 'INTERACTIVE MODE: You may ask the user clarifying questions to understand their vision before proceeding.'}
         Plain ASCII only in code and output — no emoji or non-ASCII characters.
+
+        •HELPER IS YOUR SUPERMAN — DELEGATE EVERYTHING:
+            The Helper agent has ALL the tools.  You have NONE.  For ANY task —
+            web search, web scrape, file read, save to memory, fetch chat
+            history, send message to user, schedule a job, generate image,
+            generate video, run a desktop command, consult an expert, search
+            long-term memory, anything at all — ALWAYS tag @Helper first.
+            Never refuse a request with "I can't access X" or "I don't have
+            tools for Y".  If a tool exists in the catalog below, @Helper has
+            it.  If a tool doesn't exist, ask @Helper to find an alternative
+            (search, scrape, code).  The ONLY thing Helper can't do is execute
+            python code — that's @Executor's job.  Everything else goes through
+            @Helper.  Treat Helper as your unlimited capability surface.
 
         •Purpose: The assistant executes actions provided by the ChatInstructor, seeks help from Helper and Executor agents when necessary, and ensures actions are completed accurately.
         •Action Flow:
@@ -4968,6 +5057,10 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress):
         current_app.logger.error(f"❌ Error loading existing metadata: {e}")
 
 
+from core.llm_outbound_logger import with_source as _with_source
+
+
+@_with_source('autogen.create')
 def recipe(user_id, text, prompt_id, file_id, request_id):
     user_prompt = f'{user_id}_{prompt_id}'
     request_id_list[user_prompt] = request_id

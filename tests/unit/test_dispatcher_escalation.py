@@ -341,3 +341,133 @@ class TestScheduleExpertBackgroundReasonPlumb:
         assert ok is True
         entry = dispatcher._active['legacy-1']
         assert 'escalation_reason' not in entry
+
+
+class TestPromptIdNoLeak:
+    """Regression for 2026-05-12 c38e8b7c-… duplicate-agent bug.
+
+    The outer ``/chat`` call site used to fall back to
+    ``str(request_id or 'anon')`` when no ``prompt_id`` was supplied.
+    That synthetic value was passed into ``dispatch_draft_first``,
+    forwarded to ``_dispatch_expert_langchain``, and ended up in the
+    expert reroute's ``/chat`` payload as if it were a real on-disk
+    agent identifier.  The inner ``/chat`` autonomous branch then
+    minted a *second* agent JSON keyed by the request_id alongside the
+    foreground turn's legitimately-minted agent.
+
+    Contract this class locks in:
+      * ``dispatch_draft_first`` accepts ``prompt_id=None``.
+      * When prompt_id is None and there's no goal_id, the expert
+        reroute payload must NOT contain a ``prompt_id`` key at all
+        (so the inner /chat falls back to its own ``_next_prompt_id``
+        exactly once, not to a request-id-derived ghost).
+      * When prompt_id IS supplied (real bound agent), it propagates.
+    """
+
+    def _make_fake_client(self, captured):
+        class _FakeResp:
+            status_code = 200
+            def get_json(self): return {'response': 'ok'}
+        class _FakeClient:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def post(self, path, json=None):  # noqa: A002
+                captured['path'] = path
+                captured['json'] = json
+                return _FakeResp()
+        class _FakeApp:
+            def test_client(self): return _FakeClient()
+        return _FakeApp()
+
+    def _install_fake_app(self, monkeypatch, captured):
+        import sys as _sys
+        fake_module = type(_sys)('hart_intelligence_entry')
+        fake_module.app = self._make_fake_client(captured)
+        monkeypatch.setenv('NUNBA_BUNDLED', '1')
+        monkeypatch.setitem(_sys.modules, 'hart_intelligence_entry',
+                            fake_module)
+
+    def test_expert_reroute_omits_prompt_id_when_caller_passed_none(
+            self, dispatcher, fresh_registry, monkeypatch):
+        captured = {}
+        self._install_fake_app(monkeypatch, captured)
+        dispatcher._dispatch_expert_langchain(
+            model=fresh_registry.get_fast_model(),
+            prompt='create a table of latest IPL scores',
+            user_id='u',
+            prompt_id=None,           # ← matches the post-fix call site
+            goal_type='general',
+            goal_id=None,
+        )
+        payload = captured['json']
+        assert 'prompt_id' not in payload, (
+            f"Expert reroute leaked a synthetic prompt_id: "
+            f"{payload.get('prompt_id')!r}.  The fix at "
+            f"hart_intelligence_entry.py:7415 + speculative_dispatcher "
+            f"_dispatch_expert_langchain forbids this — when caller has "
+            f"no real prompt_id, omit the key so inner /chat decides."
+        )
+
+    def test_expert_reroute_includes_prompt_id_for_bound_agent(
+            self, dispatcher, fresh_registry, monkeypatch):
+        captured = {}
+        self._install_fake_app(monkeypatch, captured)
+        dispatcher._dispatch_expert_langchain(
+            model=fresh_registry.get_fast_model(),
+            prompt='hi',
+            user_id='u',
+            prompt_id='78570931871',  # real numeric prompt_id from disk
+            goal_type='general',
+            goal_id=None,
+        )
+        assert captured['json'].get('prompt_id') == '78570931871'
+
+    def test_expert_reroute_keeps_goal_id_separate_from_prompt_id(
+            self, dispatcher, fresh_registry, monkeypatch):
+        """Goal identifiers are observability metadata, NOT agent
+        routing keys.  A prior version synthesised
+        ``prompt_id = f'{goal_type}_{goal_id[:8]}'`` so the inner /chat
+        would partition telemetry under that string — but the inner
+        /chat reads ``prompt_id`` as a literal agent JSON filename and
+        spawns a phantom agent.  Goal info must travel as separate
+        payload keys (``goal_id``, ``goal_type``), never folded into
+        prompt_id."""
+        captured = {}
+        self._install_fake_app(monkeypatch, captured)
+        dispatcher._dispatch_expert_langchain(
+            model=fresh_registry.get_fast_model(),
+            prompt='hi',
+            user_id='u',
+            prompt_id=None,
+            goal_type='research',
+            goal_id='abc12345-deadbeef',
+        )
+        payload = captured['json']
+        # No synthesised prompt_id — agent routing stays clean.
+        assert 'prompt_id' not in payload, (
+            f"Goal-derived prompt_id leaked into payload: "
+            f"{payload.get('prompt_id')!r}. Goal IDs are not agent "
+            f"identifiers; they must travel as separate metadata."
+        )
+        # Goal context still propagates for telemetry / budget tracking.
+        assert payload.get('goal_id') == 'abc12345-deadbeef'
+        assert payload.get('goal_type') == 'research'
+
+    def test_dispatch_draft_first_accepts_prompt_id_none(
+            self, dispatcher, monkeypatch):
+        """Type-contract check: dispatch_draft_first must accept None for
+        prompt_id without raising — the call site at
+        hart_intelligence_entry.py:7415 passes None when no agent is
+        bound to the request."""
+        _mock_guardrails(monkeypatch)
+        raw = (
+            '{"reply": "Hi there!", "delegate": "none", '
+            '"confidence": 0.95}'
+        )
+        with patch.object(dispatcher, '_dispatch_to_model',
+                          return_value=raw), \
+             patch.object(dispatcher, '_record_interaction_safely'):
+            result = dispatcher.dispatch_draft_first(
+                'hi', user_id='u', prompt_id=None,
+            )
+        assert result['response']  # produced a reply

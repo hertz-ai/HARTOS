@@ -137,6 +137,18 @@ _REFUSAL_NOUNS = (
     r"built-?in|external|the internet|web access|internet access|"
     r"means|way to"
 )
+# Knowledge / data / topic nouns for the "I don't have <intermediate> <NOUN>"
+# pattern — catches knowledge-cutoff refusals like
+# "I don't have the 2026 IPL table" / "I don't have current IPL data" /
+# "I don't have information about live matches" / "I don't have details about
+# next year's schedule".  Live evidence: 2026-05-13 09:55:34 IPL turn
+# (request 301eeed0) — the existing _REFUSAL_NOUNS list was capability-only
+# and did not catch this knowledge-cutoff family.
+_REFUSAL_DATA_NOUNS = (
+    r"data|info|information|details|knowledge|records?|results?|"
+    r"table|standings|schedule|listings?|stats|statistics|figures|"
+    r"scores?|rankings?|fixtures?|matches|games"
+)
 _REFUSAL_PATTERN = re.compile(
     r"\b(?:"
     # "I cannot/can't <optional softener> <verb>"
@@ -156,11 +168,42 @@ _REFUSAL_PATTERN = re.compile(
     r"I do(?:n'?t| not) have\s+"
     r"(?:" + _REFUSAL_NOUNS + r")"
     r"|"
+    # "I (don't|do not) have <the/any/access to> <up-to-40-chars> <data-noun>"
+    # — knowledge-cutoff refusals.  Limits intermediate-word span to 40 chars
+    # so we don't false-match "I don't have a brother — but I do have data on…"
+    # The data-noun must follow within the same clause.
+    r"I do(?:n'?t| not) have\s+"
+    r"(?:the\s+|any\s+|access to\s+(?:the\s+)?|current\s+|live\s+|real-?time\s+|recent\s+)?"
+    r"[\w\s\-'\d]{0,40}?"
+    r"\b(?:" + _REFUSAL_DATA_NOUNS + r")\b"
+    r"|"
     # "I lack <noun>"  e.g. "I lack access to GitHub"
     r"I lack\s+(?:" + _REFUSAL_NOUNS + r")"
     r"|"
     # "I have no <noun>"  e.g. "I have no tools to retrieve…"
-    r"I have no\s+(?:access|way|tools?|ability|means)"
+    r"I have no\s+(?:access|way|tools?|ability|means|"
+    r"data|info|information|knowledge|records?)"
+    r"|"
+    # "(future|upcoming) (data|events|matches|seasons)" — knowledge-cutoff
+    # phrasing where the model frames the absence as a temporal property.
+    # e.g. "seasons that far out are just rumors at this point" / "future
+    # events are not available yet" / "next year's data hasn't been released"
+    r"(?:future|upcoming|next year'?s?|next season'?s?)\s+"
+    r"(?:" + _REFUSAL_DATA_NOUNS + r"|events?|seasons?)"
+    r"|"
+    # "(haven't been|aren't|isn't) (released|published|available) yet"
+    # — e.g. "the 2026 schedule hasn't been released yet"
+    r"(?:haven'?t been|hasn'?t been|aren'?t|isn'?t|are not|is not)\s+"
+    r"(?:released|published|announced|available|out|determined|set|confirmed)"
+    r"(?:\s+yet)?"
+    r"|"
+    # "are just rumors at this point" — the IPL turn's exact phrasing.
+    r"(?:are|is)\s+(?:just\s+|only\s+)?rumors?"
+    r"|"
+    # "predates? my training" / "after my (knowledge|training) cutoff"
+    r"(?:predates?|outside of|beyond|after)\s+my\s+(?:training|knowledge)"
+    r"|"
+    r"my\s+(?:training|knowledge)\s+cut[\s\-]?off"
     r"|"
     # "I'm just/only a (large language model|LLM|AI|chatbot|…)"
     # — split for I'm vs I am as above.
@@ -260,7 +303,8 @@ class SpeculativeDispatcher:
 
     # ─── Main entry point ───
 
-    def dispatch_speculative(self, prompt: str, user_id: str, prompt_id: str,
+    def dispatch_speculative(self, prompt: str, user_id: str,
+                             prompt_id: Optional[str] = None,
                              goal_id: str = None, goal_type: str = 'general',
                              node_id: str = None) -> dict:
         """
@@ -364,7 +408,31 @@ class SpeculativeDispatcher:
 
     # ─── Draft-first dispatch (Qwen3.5-0.8B standby + delegate signal) ───
 
-    def dispatch_draft_first(self, prompt: str, user_id: str, prompt_id: str,
+    def dispatch_draft_first(self, prompt: str, user_id: str,
+                             prompt_id: Optional[str] = None,
+                             goal_id: str = None, goal_type: str = 'general',
+                             node_id: str = None,
+                             agent_persona: Optional[str] = None,
+                             preferred_lang: str = 'en',
+                             user_pref: str = 'auto',
+                             agent_bound: bool = False) -> dict:
+        # Tag every LLM call routed through this method (the draft
+        # classifier + any nested expert reroute) as ``draft.classify``
+        # in llm_outbound.jsonl.  The decorator can't be applied to a
+        # bound method's def line directly without import gymnastics
+        # at module-load time, so we use the context manager inline.
+        # See ``core.llm_outbound_logger.with_source`` rationale.
+        from core.llm_outbound_logger import source_context as _src
+        with _src('draft.classify'):
+            return self._dispatch_draft_first_impl(
+                prompt, user_id, prompt_id=prompt_id, goal_id=goal_id,
+                goal_type=goal_type, node_id=node_id,
+                agent_persona=agent_persona, preferred_lang=preferred_lang,
+                user_pref=user_pref, agent_bound=agent_bound,
+            )
+
+    def _dispatch_draft_first_impl(self, prompt: str, user_id: str,
+                             prompt_id: Optional[str] = None,
                              goal_id: str = None, goal_type: str = 'general',
                              node_id: str = None,
                              agent_persona: Optional[str] = None,
@@ -1583,10 +1651,24 @@ class SpeculativeDispatcher:
             return ''
 
         # ── Local path: full HARTOS /chat pipeline ──
+        # prompt_id: ONLY include when the caller gave a real on-disk
+        # agent identifier.  NEVER synthesise from request_id, goal_id,
+        # node_id, or speculation_id — the inner /chat handler treats
+        # any non-empty prompt_id as a literal filename
+        # (``prompts/{prompt_id}.json``) and ``_autonomous_gather_info``
+        # will mint a duplicate agent JSON keyed by whatever synthetic
+        # string it receives.  Live regressions both shapes have caused:
+        #   * 2026-05-12 request 66c63859-… spawned a phantom
+        #     ``prompts/66c63859-…json`` (request-id-derived).
+        #   * Goal-driven daemon dispatch with goal_id='abc-deadbeef'
+        #     used to send ``prompt_id='general_abc-dead'`` — the inner
+        #     /chat then tries to load ``prompts/general_abc-dead.json``,
+        #     fails, and mints yet another agent under that key.
+        # Goal/observability identifiers belong in ``goal_id``/
+        # ``goal_type`` payload fields (which the inner /chat reads as
+        # context metadata, not as a routing key), not in prompt_id.
         payload = {
             'user_id': user_id,
-            'prompt_id': (
-                f'{goal_type}_{goal_id[:8]}' if goal_id else prompt_id),
             'prompt': prompt,
             'create_agent': True,
             'autonomous': True,
@@ -1597,6 +1679,14 @@ class SpeculativeDispatcher:
             'speculative': False,
             'draft_first': False,
         }
+        if prompt_id:
+            payload['prompt_id'] = prompt_id
+        # goal_id / goal_type carry forward as metadata for telemetry +
+        # budget tracking — separate from prompt_id (routing).
+        if goal_id:
+            payload['goal_id'] = goal_id
+        if goal_type and goal_type != 'general':
+            payload['goal_type'] = goal_type
 
         import sys as _sys
         _bundled = bool(
@@ -1642,7 +1732,7 @@ class SpeculativeDispatcher:
     # ─── Helpers ───
 
     def _dispatch_to_model(self, model: 'ModelBackend', prompt: str,
-                           user_id: str, prompt_id: str,
+                           user_id: str, prompt_id: Optional[str],
                            goal_type: str, goal_id: str = None) -> str:
         """Send prompt to a specific model via /chat endpoint with config override.
 
@@ -1652,12 +1742,19 @@ class SpeculativeDispatcher:
         upstream. The outer chat route triggered us, and that's where the
         decision to speculate was made.
 
+        ``prompt_id`` is intentionally Optional and only included in the
+        payload when truthy — see ``_dispatch_expert_langchain`` for the
+        same invariant + the live regression that motivated it.
+
         In bundled/in-process mode (Nunba desktop), uses Flask test_client()
         instead of HTTP — port 6777 is never bound in bundled mode.
         """
+        # prompt_id: only forward when the caller gave a real one;
+        # goal_id / goal_type travel separately as observability metadata.
+        # See ``_dispatch_expert_langchain`` for the rationale + live
+        # regression that motivated this invariant.
         payload = {
             'user_id': user_id,
-            'prompt_id': f'{goal_type}_{goal_id[:8]}' if goal_id else prompt_id,
             'prompt': prompt,
             'create_agent': True,
             'autonomous': True,
@@ -1667,6 +1764,12 @@ class SpeculativeDispatcher:
             'speculative': False,
             'draft_first': False,
         }
+        if prompt_id:
+            payload['prompt_id'] = prompt_id
+        if goal_id:
+            payload['goal_id'] = goal_id
+        if goal_type and goal_type != 'general':
+            payload['goal_type'] = goal_type
 
         # Bundled mode: call the model's llama-server directly on its port.
         # Do NOT use Flask test_client('/chat') — that re-enters the full
@@ -1690,16 +1793,34 @@ class SpeculativeDispatcher:
                     except Exception:
                         _port = 8081  # draft default
                 import requests as _req
+                # Manual log_outbound call here because the
+                # ``requests`` library bypasses the global httpx hook
+                # installed in ``core.llm_outbound_logger.install()``.
+                # The draft port (typically :8081) isn't even in the
+                # httpx hook's scope, so this is the only place that
+                # draft-classifier prompts get a record.
+                _draft_body = {
+                    'model': 'llama',
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'max_tokens': 500,
+                    'temperature': 0.7,
+                }
+                _draft_start = time.time()
                 resp = _req.post(
                     f'http://127.0.0.1:{_port}/v1/chat/completions',
-                    json={
-                        'model': 'llama',
-                        'messages': [{'role': 'user', 'content': prompt}],
-                        'max_tokens': 500,
-                        'temperature': 0.7,
-                    },
+                    json=_draft_body,
                     timeout=15,
                 )
+                try:
+                    from core.llm_outbound_logger import log_outbound as _log_ob
+                    _log_ob(
+                        _draft_body,
+                        source='dispatcher.draft',
+                        response_status=resp.status_code,
+                        latency_ms=round((time.time() - _draft_start) * 1000, 1),
+                    )
+                except Exception:
+                    pass
                 if resp.status_code == 200:
                     data = resp.json()
                     if 'choices' in data:

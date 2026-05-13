@@ -351,15 +351,78 @@ def test_get_data_from_memory_resolves():
     assert 'get_data_from_memory' in names
 
 
-def test_send_message_to_roles_appears_in_prompts_and_resolves():
-    """`send_message_to_roles` is advertised in reuse_recipe.py
-    system prompts AND must be a registered function.  Pre-fix it
-    was advertised but the closure was commented out → 404."""
-    src = _read(os.path.join(REPO_ROOT, 'reuse_recipe.py'))
-    assert 'send_message_to_roles' in src
-    # And the canonical impl exists
+def test_send_message_to_roles_registered_in_both_flows():
+    """`send_message_to_roles` MUST be registered in BOTH create + reuse
+    flows.  Autonomous-mode recipe creation does real multi-persona work
+    while authoring (gather-requirements has already populated the
+    registry by the time create-mode autogen runs).  Same canonical impl
+    from core.persona_registry behind both registrations — capability
+    parity is the invariant."""
+    reuse_src = _read(os.path.join(REPO_ROOT, 'reuse_recipe.py'))
+    create_src = _read(os.path.join(REPO_ROOT, 'create_recipe.py'))
+
+    # Both files reference the tool name
+    assert 'def send_message_to_roles' in reuse_src, (
+        "send_message_to_roles missing from reuse_recipe.py")
+    assert 'def send_message_to_roles' in create_src, (
+        "send_message_to_roles missing from create_recipe.py — both flows "
+        "must register it for autonomous-mode parity.")
+
+    # Both files register via register_dual (or AH-stack in reuse)
+    assert 'register_dual(helper, assistant, send_message_to_roles' in create_src, (
+        "send_message_to_roles must be register_dual-registered in create_recipe.py")
+
+    # Canonical impl exists in core.persona_registry
     from core.persona_registry import _send_message_to_roles_impl
     assert callable(_send_message_to_roles_impl)
+
+
+def test_tier2_goal_detection_parity():
+    """Both create_recipe.py and reuse_recipe.py must use
+    detect_goal_tags() for Tier-2 progressive tool injection, with the
+    same 5 categories (marketing / ip_protection / self_build / outreach
+    / sales).  Earlier reuse used `prompt_id.startswith()` and only
+    handled 2 of 5 — recipes authored under semantic tags failed to
+    replay because the matching Tier-2 modules never loaded."""
+    EXPECTED_CATEGORIES = {
+        'marketing', 'ip_protection', 'self_build', 'outreach', 'sales',
+    }
+    EXPECTED_REGISTERS = {
+        'marketing': 'register_marketing_tools',
+        'ip_protection': 'register_ip_protection_tools',
+        'self_build': 'register_self_build_tools',
+        'outreach': 'register_outreach_tools',
+        'sales': 'register_journey_tools',
+    }
+    for filename in ('create_recipe.py', 'reuse_recipe.py'):
+        src = _read(os.path.join(REPO_ROOT, filename))
+
+        # Must use detect_goal_tags() — semantic method, not prefix string
+        assert 'detect_goal_tags(' in src, (
+            f"{filename} must use detect_goal_tags(...) for Tier-2 "
+            f"detection.  Mirrors progressive-injection design and "
+            f"makes both flows route the same tags to the same modules.")
+
+        # Old prefix-string method must be GONE from the Tier-2 block.
+        # (Keep narrow — `prompt_id.startswith` could legitimately be
+        # used elsewhere.  Just assert it's not in the marketing block.)
+        assert "prompt_id).startswith('marketing')" not in src, (
+            f"{filename}: legacy prompt_id.startswith('marketing') check "
+            f"present — Tier-2 detection must use detect_goal_tags()")
+
+        # All 5 categories must be present
+        for cat in EXPECTED_CATEGORIES:
+            assert f"'{cat}' in goal_tags" in src, (
+                f"{filename}: Tier-2 missing detection branch for tag "
+                f"`{cat}`. Categories must match between create + reuse "
+                f"or recipes authored under one tag won't replay under "
+                f"the other.")
+
+        # The registration calls must point at the right module
+        for cat, reg_fn in EXPECTED_REGISTERS.items():
+            assert reg_fn in src, (
+                f"{filename}: missing call to {reg_fn} for the "
+                f"`{cat}` Tier-2 branch")
 
 
 if __name__ == '__main__':

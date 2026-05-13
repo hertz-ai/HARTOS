@@ -769,6 +769,62 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 1024))  # 2MB default
 
+# ── LLM outbound logger ───────────────────────────────────────────────
+# Monkey-patches httpx.Client.send (+ AsyncClient) to (a) inject the
+# thread-local HARTOS request_id as the OpenAI ``user`` field on every
+# POST to :8082/v1/chat/completions and (b) append the full request
+# body to ~/Documents/Nunba/logs/llm_outbound.jsonl.  Covers autogen,
+# langchain, openai-python — every Python-originated LLM call funnels
+# through httpx.  See ``core/llm_outbound_logger.py`` for the full
+# rationale (the 2026-05-12 IPL ctx-overflow incident motivated this).
+try:
+    from core.llm_outbound_logger import install as _install_outbound_hook
+    _install_outbound_hook()
+except Exception as _outbound_err:
+    logging.getLogger(__name__).debug(
+        "llm_outbound install skipped: %s", _outbound_err)
+
+# ── Boot-time tool-registry warmer ────────────────────────────────────
+# Kicks a background daemon thread to pre-fill the 4 process-level tool
+# caches (service_tools / system_introspect / skills / provider_gateway)
+# so the FIRST user chat turn doesn't pay the ~80-100s cold-start
+# penalty observed on 2026-05-13 09:55:23 (IPL turn 301eeed0).  The
+# warmer itself takes ~100s but runs in parallel with everything else;
+# by the time a user types, the caches are warm.  Failures are
+# swallowed silently — the lazy on-call path retries any registry
+# that was temporarily unavailable at boot.
+def _spawn_tool_warmup_when_ready():
+    """Deferred warmup spawn — runs once get_tools symbols are defined.
+
+    The actual warmer function `_warmup_tool_registries_in_background`
+    is defined further down in this file, so we wrap the spawn in a
+    short delay-thread that resolves it from globals() at call time.
+    """
+    try:
+        import threading as _t
+
+        def _deferred_spawn():
+            try:
+                time.sleep(1)
+            except Exception:
+                pass
+            warmer = globals().get('_warmup_tool_registries_in_background')
+            if warmer:
+                try:
+                    warmer()
+                except Exception as _e:
+                    logging.getLogger(__name__).debug(
+                        "tool-warmup invocation failed: %s", _e)
+
+        _t.Thread(target=_deferred_spawn, daemon=True,
+                  name='tool-warmup-spawner').start()
+    except Exception as _ws_err:
+        logging.getLogger(__name__).debug(
+            "tool-warmup spawner failed: %s", _ws_err)
+
+
+_spawn_tool_warmup_when_ready()
+
 
 def _json_endpoint(f):
     """Wrap a Flask view so unhandled exceptions return ``{'error': ...}, 500``.
@@ -905,6 +961,34 @@ except ImportError:
     app.logger.info("Robot Intelligence API not available, skipping")
 except Exception as e:
     app.logger.warning(f"Robot Intelligence API init skipped: {e}")
+
+# Commercial API — the paid /api/v1/intelligence/* surface.
+# Was coded but never registered with Flask, leaving 8 revenue endpoints
+# (chat, analyze, generate, hivemind, usage, keys CRUD) dead.  Routes:
+#   POST /api/v1/intelligence/chat
+#   POST /api/v1/intelligence/analyze
+#   POST /api/v1/intelligence/generate
+#   GET  /api/v1/intelligence/hivemind
+#   GET  /api/v1/intelligence/usage
+#   POST /api/v1/intelligence/keys
+#   GET  /api/v1/intelligence/keys
+#   DELETE /api/v1/intelligence/keys/<key_id>
+# Tiers: free / starter / pro / enterprise (see TIER_CONFIG in
+# integrations/agent_engine/commercial_api.py:32-36).  Revenue split via
+# revenue_aggregator: 90% users / 9% infra / 1% central.
+# Free tier is always free — gatekeeping intelligence is not the goal;
+# sustaining the hive is.  This blueprint registration is the single
+# wiring change between "revenue surface dead" and "customers can land".
+try:
+    from integrations.agent_engine.commercial_api import commercial_api_bp
+    app.register_blueprint(commercial_api_bp)
+    app.logger.info(
+        "Commercial API registered at /api/v1/intelligence/ — "
+        "free/starter/pro/enterprise tiers, 90/9/1 revenue split")
+except ImportError:
+    app.logger.info("Commercial API not available, skipping")
+except Exception as e:
+    app.logger.warning(f"Commercial API init skipped: {e}")
 
 # Hive Session API — Claude Code as hive worker node
 try:
@@ -3663,10 +3747,274 @@ _FIRST_TOOLS_CACHE: dict[str, list] = {}
 _FIRST_TOOLS_CACHE_MAX = 32
 _FIRST_TOOLS_CACHE_LOCK = threading.Lock()
 
+# ── Process-level caches for slow registry probes ─────────────────────
+# Each of these registries does heavy first-call work (Crawl4AI/AceStep
+# health probes, langchain google-search wrapper init, system_introspect
+# admin-API queries, skill_registry filesystem walk + GitHub probes,
+# provider gateway enumeration).  Together they account for ~80-100s
+# of the 105s `get_tools(is_first=True)` cold-start latency observed
+# on the 2026-05-13 09:55:23 IPL turn.  Caching the result process-wide
+# turns the cold path into a one-time pay; every subsequent (user,
+# prompt) build pays only the per-user MemoryGraph open (~50ms).
+# Filled lazily on first call (or eagerly by the boot warmer thread
+# at startup — see `_warmup_tool_registries_in_background` below).
+_SVC_TOOLS_CACHE = None
+_SVC_TOOLS_LOCK = threading.Lock()
+_INTROSPECT_TOOLS_CACHE = None
+_INTROSPECT_TOOLS_LOCK = threading.Lock()
+_SKILL_TOOLS_CACHE = None
+_SKILL_TOOLS_LOCK = threading.Lock()
+_PROVIDER_TOOLS_CACHE = None
+_PROVIDER_TOOLS_LOCK = threading.Lock()
+
+
+def _cached_service_tools():
+    """Memoized service_tool_registry.get_langchain_tools()."""
+    global _SVC_TOOLS_CACHE
+    if _SVC_TOOLS_CACHE is not None:
+        return _SVC_TOOLS_CACHE
+    with _SVC_TOOLS_LOCK:
+        if _SVC_TOOLS_CACHE is not None:
+            return _SVC_TOOLS_CACHE
+        try:
+            from integrations.service_tools import service_tool_registry
+            result = list(service_tool_registry.get_langchain_tools())
+        except (ImportError, Exception):
+            result = []
+        _SVC_TOOLS_CACHE = result
+        return result
+
+
+def _cached_introspect_tools():
+    """Memoized system_introspect_tool.get_langchain_tools()."""
+    global _INTROSPECT_TOOLS_CACHE
+    if _INTROSPECT_TOOLS_CACHE is not None:
+        return _INTROSPECT_TOOLS_CACHE
+    with _INTROSPECT_TOOLS_LOCK:
+        if _INTROSPECT_TOOLS_CACHE is not None:
+            return _INTROSPECT_TOOLS_CACHE
+        try:
+            from integrations.service_tools.system_introspect_tool import (
+                get_langchain_tools as _get_introspect_tools,
+            )
+            result = list(_get_introspect_tools())
+        except (ImportError, Exception):
+            result = []
+        _INTROSPECT_TOOLS_CACHE = result
+        return result
+
+
+def _cached_skill_tools():
+    """Memoized skill_registry.get_langchain_tools()."""
+    global _SKILL_TOOLS_CACHE
+    if _SKILL_TOOLS_CACHE is not None:
+        return _SKILL_TOOLS_CACHE
+    with _SKILL_TOOLS_LOCK:
+        if _SKILL_TOOLS_CACHE is not None:
+            return _SKILL_TOOLS_CACHE
+        try:
+            from integrations.skills import skill_registry
+            result = list(skill_registry.get_langchain_tools())
+        except (ImportError, Exception):
+            result = []
+        _SKILL_TOOLS_CACHE = result
+        return result
+
+
+def _cached_provider_tools():
+    """Memoized integrations.providers.agent_tools.get_provider_tools()."""
+    global _PROVIDER_TOOLS_CACHE
+    if _PROVIDER_TOOLS_CACHE is not None:
+        return _PROVIDER_TOOLS_CACHE
+    with _PROVIDER_TOOLS_LOCK:
+        if _PROVIDER_TOOLS_CACHE is not None:
+            return _PROVIDER_TOOLS_CACHE
+        try:
+            from integrations.providers.agent_tools import get_provider_tools
+            result = list(get_provider_tools())
+        except Exception:
+            result = []
+        _PROVIDER_TOOLS_CACHE = result
+        return result
+
+
+# ── Combined heavy-tools group (non-blocking lazy load) ────────────────
+# The 3 suspects responsible for the 103-second silent gap during
+# get_tools(is_first=True) on the 2026-05-13 09:55:23 IPL turn:
+#   1. _safe_load_google_search()  ← cold-import cascade
+#      (langchain_classic.agents.load_tools transitively pulls in
+#      google-api-python-client + httplib2 + oauth2client; on Windows
+#      with Defender scanning DLLs this can be 30-80s.)
+#   2. _cached_skill_tools()        ← potential GitHub discovery / fs walk
+#   3. _cached_provider_tools()     ← provider enumeration + connect probes
+#
+# Grouped here so get_tools NEVER blocks on them — even on the "warm"
+# path the heavy cache is consulted with an O(1) read; if not yet
+# filled, get_tools proceeds without these tools and a background
+# daemon thread continues the build.  Subsequent get_tools calls will
+# pick them up once the build finishes.
+_HEAVY_TOOLS_CACHE: list = []
+_HEAVY_TOOLS_LOCK = threading.Lock()
+_HEAVY_TOOLS_BUILD_KICKED = False
+_HEAVY_TOOLS_READY = False
+
+
+def _kick_heavy_tools_build_once():
+    """Kick the heavy-tools background build if not already running.
+    Idempotent — safe to call multiple times from any thread."""
+    global _HEAVY_TOOLS_BUILD_KICKED
+    with _HEAVY_TOOLS_LOCK:
+        if _HEAVY_TOOLS_BUILD_KICKED:
+            return
+        _HEAVY_TOOLS_BUILD_KICKED = True
+
+    def _build():
+        global _HEAVY_TOOLS_CACHE, _HEAVY_TOOLS_READY
+        import time as _time
+        _start = _time.time()
+        tools = []
+        try:
+            tools += list(_safe_load_google_search() or [])
+        except Exception:
+            pass
+        _t_google = _time.time() - _start
+        try:
+            tools += list(_cached_skill_tools())
+        except Exception:
+            pass
+        _t_skill = _time.time() - _start - _t_google
+        try:
+            tools += list(_cached_provider_tools())
+        except Exception:
+            pass
+        _t_provider = _time.time() - _start - _t_google - _t_skill
+        with _HEAVY_TOOLS_LOCK:
+            _HEAVY_TOOLS_CACHE = tools
+            _HEAVY_TOOLS_READY = True
+        try:
+            app.logger.info(
+                "[HEAVY-TOOLS-LAZY] loaded %d tools "
+                "(google=%.1fs skill=%.1fs provider=%.1fs total=%.1fs)",
+                len(tools), _t_google, _t_skill, _t_provider,
+                _time.time() - _start,
+            )
+        except Exception:
+            pass
+
+    try:
+        import threading as _t
+        _t.Thread(target=_build, daemon=True,
+                  name='heavy-tools-lazy-build').start()
+    except Exception:
+        # Spawn failed — reset the kicked flag so the next call retries.
+        with _HEAVY_TOOLS_LOCK:
+            _HEAVY_TOOLS_BUILD_KICKED = False
+
+
+def _get_heavy_tools_nonblocking():
+    """Return the heavy-tools cache contents — non-blocking, never waits.
+
+    Reader-only: the build is kicked EAGERLY at boot by
+    `_warmup_tool_registries_in_background()`, not lazily on first chat.
+    Chat path returns whatever's already loaded — [] if the background
+    builder hasn't finished yet, the full list once it has.
+
+    Replaces inline _safe_load_google_search / _cached_skill_tools /
+    _cached_provider_tools so the user never waits for the 80-100s
+    cold-start cascade.
+    """
+    # Read without lock — list assignment is atomic in CPython, and a
+    # partially-built cache would still be a list of valid tools.
+    return _HEAVY_TOOLS_CACHE
+
+
+def _warmup_tool_registries_in_background():
+    """Pre-fill the 4 process-level tool caches in a daemon thread.
+
+    Hides the 80-100s cold-start latency that otherwise hits the FIRST
+    user chat turn.  Call once at app boot; subsequent calls are no-ops
+    because the caches are already filled.  Failures are swallowed
+    silently — the lazy on-call path will retry if a registry was
+    temporarily unavailable at boot.
+    """
+    try:
+        import threading as _t
+
+        def _warm():
+            # Brief grace so the rest of bootstrap completes first.
+            try:
+                time.sleep(2)
+            except Exception:
+                pass
+            # Fast registries — these probe at register-time, not
+            # iteration-time, so iterating them now is cheap.  Kept
+            # synchronous in the warmer thread.
+            try:
+                _cached_service_tools()
+            except Exception:
+                pass
+            try:
+                _cached_introspect_tools()
+            except Exception:
+                pass
+            # The 3 heavy ones (google-search cold imports + skill
+            # registry GitHub/fs walk + provider gateway probes) — do
+            # NOT load them.  Loading them eagerly burns the GIL for
+            # ~100s during boot (transformers _LazyModule recursion +
+            # registry probes); loading them lazily blocks the user's
+            # first chat for ~100s.  Either way the net work is the
+            # same.  Default: skip entirely.
+            #
+            # google_search is already available via top5_results in
+            # the inline labeled_tools list (hart_intelligence_entry:
+            # L4413), so no functionality loss for casual chat.
+            # skill_registry and provider_gateway are unused in this
+            # path on the flat/desktop tier.
+            #
+            # Opt-in for users who actually need the heavy group:
+            #   $env:HEVOLVE_LOAD_HEAVY_TOOLS = "1"
+            if os.environ.get('HEVOLVE_LOAD_HEAVY_TOOLS', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+                try:
+                    _kick_heavy_tools_build_once()
+                    app.logger.info(
+                        "[TOOL-WARMUP] heavy group kicked (opt-in via "
+                        "HEVOLVE_LOAD_HEAVY_TOOLS)")
+                except Exception:
+                    pass
+            try:
+                app.logger.info(
+                    "[TOOL-WARMUP] fast tool registries ready "
+                    "(svc=%d introspect=%d); heavy group "
+                    "(google+skill+provider) skipped — opt-in via "
+                    "HEVOLVE_LOAD_HEAVY_TOOLS",
+                    len(_SVC_TOOLS_CACHE or []),
+                    len(_INTROSPECT_TOOLS_CACHE or []),
+                )
+            except Exception:
+                pass
+
+        _t.Thread(target=_warm, daemon=True, name='tool-registry-warmup').start()
+    except Exception as _w_err:
+        logging.getLogger(__name__).debug(
+            "tool-registry-warmup spawn skipped: %s", _w_err)
+
 
 def get_tools(req_tool, is_first: bool = False):
 
     if is_first:
+        # ── Timing instrumentation (#185) ─────────────────────────────
+        # The 2026-05-13 IPL turn showed `get_tools loaded` taking 118s
+        # despite the heavy-tools group being correctly skipped.  Real
+        # culprit unknown; speculation cost us multiple iterations.
+        # Capture per-step deltas so the next test gives ground truth.
+        # Cheap (~12 time.time() calls); always-on for now, demote to
+        # debug after root cause is fixed.
+        _gt_t0 = time.time()
+        _gt_steps = []  # list of (label, elapsed_since_t0_seconds)
+
+        def _gt_mark(label):
+            _gt_steps.append((label, time.time() - _gt_t0))
+
         # Per-(user, prompt) memoization — see _FIRST_TOOLS_CACHE
         # docstring above.  thread_local_data may be unset in
         # degraded/test contexts; fall through to a non-cached
@@ -3680,8 +4028,17 @@ def get_tools(req_tool, is_first: bool = False):
             _cache_key = None
         if _cache_key and _cache_key in _FIRST_TOOLS_CACHE:
             return _FIRST_TOOLS_CACHE[_cache_key]
+        _gt_mark('cache_check')
 
-        tools = _safe_load_google_search()
+        # Heavy tools (google-search + skill_registry + provider_gateway)
+        # come from the non-blocking heavy-tools cache filled by the boot
+        # warmer.  If not ready yet, returns [] — chat path proceeds without
+        # them.  Once the background build finishes, future first calls
+        # pick up the full list.  Replaces the inline _safe_load_google_search
+        # call here AND the inline _cached_skill_tools / _cached_provider_tools
+        # calls further down.
+        tools = list(_get_heavy_tools_nonblocking())
+        _gt_mark('heavy_tools_nonblocking')
         tool = [
 
             labeled_tool(
@@ -3743,6 +4100,20 @@ def get_tools(req_tool, is_first: bool = False):
                 Your task is to extract a URL and its type (either 'pdf' or 'website') from a user's query. Upon receiving a query that contains a URL and a specified URL type, you are to use a tool designed for this purpose. The objective is to accurately identify both the URL and its type from the query. Once identified, these elements should be formatted into a comma-separated string, adhering to the format: "url, url_type".
                 ''',
                 ui_label='Extracting data from URL…',
+            ),
+            # Direct google-search inline — bypasses langchain_classic.agents.load_tools
+            # which on first call triggers the transformers _LazyModule re-entry
+            # recursion (see lines 95-157 docstring).  `top5_results` is defined
+            # in this same file (L6107) — Python resolves the symbol at call
+            # time, so forward-referencing it here is safe.  Without this entry
+            # the casual_conv langchain agent has no web-search affordance,
+            # forcing refusals on any "fetch live data" query (2026-05-13 IPL
+            # turn 301eeed0 forensic).
+            labeled_tool(
+                name="google_search",
+                func=top5_results,
+                description="Search Google for recent results and retrieve URLs that are suitable for web crawling. Returns the top 5 result URLs + snippets. Use whenever you need live or recent information from the web — sports standings, current news, prices, schedules, anything time-sensitive. Always present source URLs in the response as HTML anchor tags for attribution. Input: the search query as a string.",
+                ui_label='Searching the web…',
             ),
             labeled_tool(
                 name="User_details_tool",
@@ -4024,57 +4395,56 @@ def get_tools(req_tool, is_first: bool = False):
             ),
         ]
 
+        _gt_mark('inline_labeled_tools')
+
         # Service Tools: Add HTTP microservice tools (Crawl4AI, AceStep, etc.)
-        try:
-            from integrations.service_tools import service_tool_registry
-            tool += service_tool_registry.get_langchain_tools()
-        except ImportError:
-            pass
+        # Now memoized at module level — see _cached_service_tools.  Eliminates
+        # the per-(user, prompt) probe cost (Crawl4AI/AceStep health checks)
+        # observed at ~30s/call on cold first turn.
+        tool += list(_cached_service_tools())
+        _gt_mark('cached_service_tools')
 
         # System Introspection Tools: agent self-awareness — GPU tier,
         # active models, TTS backend, boot-decision rationale.  Lets the
         # LLM answer "what model is running?", "why is speculation off?",
         # "do I have a GPU?" from real live admin-API data instead of
-        # hallucinating.
-        try:
-            from integrations.service_tools.system_introspect_tool import (
-                get_langchain_tools as _get_introspect_tools,
-            )
-            tool += _get_introspect_tools()
-        except ImportError:
-            pass
+        # hallucinating.  Module-level cached.
+        tool += list(_cached_introspect_tools())
+        _gt_mark('cached_introspect_tools')
 
-        # HART Skills: Ingest agent skills (Claude Code, Markdown, GitHub)
-        try:
-            from integrations.skills import skill_registry
-            tool += skill_registry.get_langchain_tools()
-        except ImportError:
-            pass
+        # HART Skills: Ingest agent skills (Claude Code, Markdown, GitHub).
+        # Moved into the heavy-tools group (loaded eagerly at boot, non-
+        # blocking on chat path) — see _get_heavy_tools_nonblocking above.
+        # Already included in the `tools` list at the top of this branch.
 
         # Memory Tools: Add MemoryGraph-backed tools (remember, recall, backtrace)
         try:
             user_id = thread_local_data.get_user_id()
             prompt_id = thread_local_data.get_prompt_id()
+            _gt_mark('memory_get_ids')
             graph = _get_or_create_graph(user_id, prompt_id)
+            _gt_mark('memory_get_or_create_graph')
             if graph:
                 from integrations.channels.memory.agent_memory_tools import (
                     create_memory_tools, create_langchain_tools,
                 )
+                _gt_mark('memory_tools_import')
                 session_id = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
                 mem_tools_dict = create_memory_tools(graph, str(user_id), session_id)
+                _gt_mark('memory_create_memory_tools')
                 lc_mem_tools = create_langchain_tools(mem_tools_dict)
+                _gt_mark('memory_create_langchain_tools')
                 tool += lc_mem_tools
         except Exception:
+            _gt_mark('memory_exception')
             pass  # Non-blocking — memory tools are optional
 
         tools += tool
 
-        # Provider gateway tools (Cloud_LLM, Generate_Image, etc.)
-        try:
-            from integrations.providers.agent_tools import get_provider_tools
-            tools += get_provider_tools()
-        except Exception as _prov_err:
-            app.logger.debug(f"Provider gateway tools not loaded: {_prov_err}")
+        # Provider gateway tools (Cloud_LLM, Generate_Image, etc.).
+        # Moved into the heavy-tools group (loaded eagerly at boot, non-
+        # blocking on chat path) — already included in `tools` at the top
+        # of this branch via _get_heavy_tools_nonblocking().
 
         # Wrap all tool functions with logging
         for t in tools:
@@ -4082,6 +4452,7 @@ def get_tools(req_tool, is_first: bool = False):
                 t.func = _with_tool_logging(t.func, t.name)
             elif hasattr(t, '_run') and callable(t._run):
                 t._run = _with_tool_logging(t._run, t.name)
+        _gt_mark('wrap_logging_loop')
 
         # Memoize the wrapped result for this (user, prompt) so the
         # next casual_conv chat turn returns in micro-seconds instead
@@ -4098,6 +4469,27 @@ def get_tools(req_tool, is_first: bool = False):
                 ):
                     _FIRST_TOOLS_CACHE.pop(next(iter(_FIRST_TOOLS_CACHE)))
                 _FIRST_TOOLS_CACHE[_cache_key] = tools
+        _gt_mark('cache_save')
+
+        # Emit timing breakdown — DELTA between consecutive marks so each
+        # row shows that step's cost, not cumulative.  Output keyed by
+        # `[GET_TOOLS_TIMING]` for easy grep.
+        try:
+            _prev = 0.0
+            _parts = []
+            for _label, _t in _gt_steps:
+                _delta = _t - _prev
+                _parts.append(f"{_label}={_delta:.2f}s")
+                _prev = _t
+            app.logger.info(
+                "[GET_TOOLS_TIMING] total=%.2fs tools=%d  steps: %s",
+                _gt_steps[-1][1] if _gt_steps else 0.0,
+                len(tools),
+                "  ".join(_parts),
+            )
+        except Exception:
+            pass
+
         return tools
 
     else:
@@ -4416,6 +4808,81 @@ def _g12_finalize(prompt: str, teacher_response: str, student_future) -> None:
         pass
 
 
+def _pooled_post_with_refusal_check(api_url, json=None, app_logger=None, **kwargs):
+    """Post to llama-server and apply REFUSAL_OVERRIDE to the response.
+
+    Mirrors the dispatcher-side guard at speculative_dispatcher.py:548-559
+    so the langchain casual_conv path gets the same refusal-detection that
+    the speculative dispatcher already does — closes the gap revealed by
+    the 2026-05-13 09:55:34 IPL turn (request 301eeed0), where the draft
+    refused with "I don't have the 2026 IPL table yet" and the langchain
+    caller had no guard, so the refusal flowed straight to the user.
+
+    Feature-flagged via HEVOLVE_LANGCHAIN_REFUSAL_OVERRIDE — default ON.
+    Disable explicitly only if a downstream path proves problematic:
+        $env:HEVOLVE_LANGCHAIN_REFUSAL_OVERRIDE = "0"
+
+    When active AND the reply matches _REFUSAL_PATTERN, retries ONCE with
+    a forceful tool-use directive prepended to the user message.  The
+    directive tells the model not to refuse and to invoke a tool instead.
+    Both endpoints (DRAFT_GPT_API and GPT_API) point at the same 4B
+    Qwen3.5 on this machine, so the retry stays on the same wire — the
+    only thing that changes is the prompt's tone.
+    """
+    body = json or {}
+    response = pooled_post(api_url, json=body, **kwargs)
+    # Default ON — only explicit opt-out (0/false/no/off) skips the override.
+    if os.environ.get('HEVOLVE_LANGCHAIN_REFUSAL_OVERRIDE', '1').strip().lower() in ('0', 'false', 'no', 'off'):
+        return response
+    try:
+        from integrations.agent_engine.speculative_dispatcher import _REFUSAL_PATTERN
+    except Exception:
+        return response
+    try:
+        resp_json = response.json()
+        reply_text = ''
+        if isinstance(resp_json, dict):
+            choices = resp_json.get('choices') or []
+            if choices:
+                _msg = choices[0].get('message') or {}
+                reply_text = _msg.get('content') or ''
+            if not reply_text:
+                reply_text = resp_json.get('content') or ''
+    except Exception:
+        return response
+    if not reply_text or not _REFUSAL_PATTERN.search(reply_text):
+        return response
+    _logger = app_logger or app.logger
+    _logger.info(
+        "[REFUSAL-OVERRIDE-LANGCHAIN] draft refusal detected: %r — retrying with forced tool-use directive",
+        reply_text[:160],
+    )
+    original_messages = body.get('messages', [])
+    if not original_messages:
+        return response
+    original_content = original_messages[0].get('content') or ''
+    force_prefix = (
+        "[SYSTEM OVERRIDE — your previous attempt was a refusal "
+        "(\"I don't have...\" / \"I can't access...\" / \"that's after my training\"). "
+        "Do NOT refuse again. You have tools available — invoke ONE of them "
+        "via the agent JSON action format. If unsure, default to google_search "
+        "or crawl4ai for live/web data. Never assert data is unavailable "
+        "without first attempting a tool call.]\n\n"
+    )
+    retry_body = dict(body)
+    retry_body['messages'] = [{
+        'role': original_messages[0].get('role', 'user'),
+        'content': force_prefix + original_content,
+    }]
+    try:
+        retry_response = pooled_post(api_url, json=retry_body, **kwargs)
+        _logger.info("[REFUSAL-OVERRIDE-LANGCHAIN] retry posted, returning new response")
+        return retry_response
+    except Exception as _e:
+        _logger.warning("[REFUSAL-OVERRIDE-LANGCHAIN] retry POST failed: %s; returning original refusal", _e)
+        return response
+
+
 class CustomGPT(LLM):
     casual_conv: bool
 
@@ -4506,7 +4973,7 @@ class CustomGPT(LLM):
                     # :8081 via DRAFT_GPT_API. Falls back to GPT_API (4B)
                     # if the draft server isn't available.
                     _api = DRAFT_GPT_API or GPT_API
-                    response = pooled_post(
+                    response = _pooled_post_with_refusal_check(
                         _api,
                         json={
                             "model": "llama",
@@ -4525,7 +4992,7 @@ class CustomGPT(LLM):
                 else:
                     app.logger.info("Non casual conv")
                     start = time.time()
-                    response = pooled_post(
+                    response = _pooled_post_with_refusal_check(
                         GPT_API,
                         json={
                             "model": "llama",
@@ -4570,7 +5037,7 @@ class CustomGPT(LLM):
             except Exception as e:
                 app.logger.info(f"In except the exception is {e}")
                 start = time.time()
-                response = pooled_post(
+                response = _pooled_post_with_refusal_check(
                     GPT_API,
                     json={
                         "model": "llama",
@@ -4591,7 +5058,7 @@ class CustomGPT(LLM):
                         f"casual conv first call — routing to draft 0.8B")
                     start = time.time()
                     _api = DRAFT_GPT_API or GPT_API
-                    response = pooled_post(
+                    response = _pooled_post_with_refusal_check(
                         _api,
                         json={
                             "model": "llama",
@@ -4610,7 +5077,7 @@ class CustomGPT(LLM):
                     try:
                         app.logger.info("non casual conv")
                         start = time.time()
-                        response = pooled_post(
+                        response = _pooled_post_with_refusal_check(
                             GPT_API,
                             json={
                                 "model": "llama",
@@ -4646,7 +5113,7 @@ class CustomGPT(LLM):
                 app.logger.info(f"In except the exception is {e}")
                 start = time.time()
 
-                response = pooled_post(
+                response = _pooled_post_with_refusal_check(
                     GPT_API,
                     json={
                         "model": "llama",
@@ -6110,7 +6577,11 @@ else:
     AgentInteractionIngestor = None  # noqa: N816
 
 
+from core.llm_outbound_logger import with_source as _with_source
+
+
 # main function
+@_with_source('langchain.chat')
 def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang):
     start_time = time.time()
     _stage_req_id = str(thread_local_data.get_request_id() or '')
@@ -6139,6 +6610,14 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
 
     tools_start_time = time.time()
     publish_chat_stage('loading_tools', user_id=str(user_id), request_id=_stage_req_id)
+    # Timing instrumentation (#185) — splits the previously-monolithic
+    # "tools_start_time → get_tools_loaded" window so we can see whether
+    # publish_chat_stage or get_tools is the time sink.
+    _pcs_done_time = time.time()
+    app.logger.info(
+        "[GET_TOOLS_TIMING] publish_chat_stage('loading_tools'): %.2fs",
+        _pcs_done_time - tools_start_time,
+    )
     # Skip tool loading for casual_conv=True — the 0.8B draft handles
     # casual chat without tools, saving ~2.5s of tool registry loading.
     if casual_conv:
@@ -7407,12 +7886,22 @@ def chat():
             # agent_bound=True when prompt_id refers to a real agent on
             # disk — the dispatcher uses this signal to never let the
             # 0.8B draft short-circuit the specialist on trivial Q&A.
-            # Computed BEFORE the request-id coalesce so a fallback
-            # request_id doesn't masquerade as an agent.
             _agent_bound = bool(prompt_id)
+            # NEVER derive prompt_id from request_id.  A prior version
+            # passed ``str(request_id or 'anon')`` as a fallback to keep
+            # the dispatcher's partition keys non-empty, but that
+            # synthetic value leaked through ``_dispatch_expert_langchain``
+            # into the expert reroute's /chat payload and was
+            # misinterpreted as a real on-disk agent identifier — causing
+            # ``_autonomous_gather_info`` to mint a *second* agent named
+            # after the request_id (live evidence 2026-05-12 request
+            # 66c63859-… spawned ``prompts/66c63859-…json`` alongside
+            # the legitimate ``prompts/78570931871.json``).  Pass None;
+            # the dispatcher handles None internally via
+            # ``speculation_id`` for any keying that needs a string.
             result = dispatcher.dispatch_draft_first(
                 prompt, str(user_id),
-                str(prompt_id) if prompt_id else str(request_id or 'anon'),
+                str(prompt_id) if prompt_id else None,
                 agent_persona=custom_prompt or None,
                 preferred_lang=preferred_lang,
                 user_pref=intelligence_preference,

@@ -20,6 +20,10 @@ from typing import Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+from core.llm_outbound_logger import with_source as _with_source
+
+
+@_with_source('langchain.matcher')
 def find_matching_agent(prompt: str, prompts_dir: str = None) -> Optional[Dict]:
     """Use LLM to semantically match prompt against available agents + recipes.
 

@@ -1011,6 +1011,20 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     agent_prompt = f'''You are a Helpful {role} Assistant. Your primary role is to assist the user efficiently while keeping all internal actions and processes hidden from the end user. Follow the guidelines below to perform tasks correctly:
 {get_cultural_prompt()}
 {_personality_block}
+
+        HELPER IS YOUR SUPERMAN — DELEGATE EVERYTHING:
+        The Helper agent has ALL the tools.  You have NONE.  For ANY task —
+        web search, web scrape, file read, save/load memory, fetch chat
+        history, send message to user, schedule a job, generate image,
+        generate video, run a desktop command, consult an expert, search
+        long-term memory, anything at all — ALWAYS tag @Helper first.
+        Never refuse with "I can't access X" or "I don't have tools for Y".
+        If a tool exists in the catalog, @Helper has it.  If a tool doesn't
+        exist, ask @Helper to find an alternative (search, scrape, code).
+        The ONLY thing Helper can't do is execute python code — that's
+        @Executor's job.  Everything else goes through @Helper.  Treat
+        Helper as your unlimited capability surface.
+
         1. If you encounter a task you cannot perform, request assistance from the @Helper and @Executor agents. If you need to run a tool, seek guidance from the @Helper agent. For code execution, ask the @Executor agent for assistance.
         2. Only execute actions where the persona is: {role}.
         3. Follow the steps below to achieve the goal: {goal}.
@@ -2493,9 +2507,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         # Get AP2 payment tools for this agent
         ap2_tools = get_ap2_tools_for_autogen('assistant')
 
-        # Register payment tools
+        # Register payment tools — wrap with @log_tool_execution so payment
+        # operations fire UI status emits + structured-error envelopes
+        # (#510 followup — same observability fix applied in create_recipe).
         for tool_def in ap2_tools:
-            tool_func = tool_def['function']
+            tool_func = log_tool_execution(tool_def['function'])
             tool_name = tool_def['name']
             tool_desc = tool_def['description']
             register_dual(helper, assistant, tool_func, tool_name, tool_desc)
@@ -2507,17 +2523,44 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         current_app.logger.warning(f"AP2 Agentic Commerce error (non-critical): {e}")
         # Continue without payment capabilities if AP2 fails
 
-    # Goal-aware Tier 2 tool loading (marketing, coding, etc.)
+    # Goal-aware Tier 2 tool loading (progressive/hierarchical tool injection).
+    # #510: mirrors create_recipe.py:1781-1803 — semantic detect_goal_tags(...)
+    # instead of the previous prompt_id.startswith() check.  Earlier shape
+    # missed 3 of 5 categories (self_build / outreach / sales), so a recipe
+    # authored from "build me a sales pipeline" (matched via semantic tags
+    # in create) would replay in reuse without the outreach + journey tools
+    # → tool calls 404 → recipe step fails.
     try:
-        from integrations.agent_engine.marketing_tools import register_marketing_tools
-        # Detect goal type from prompt_id prefix (e.g. 'marketing_xxx', 'coding_xxx')
-        if str(prompt_id).startswith('marketing'):
+        from integrations.agent_engine.marketing_tools import detect_goal_tags, register_marketing_tools
+        goal_tags = detect_goal_tags(goal or '')
+        if 'marketing' in goal_tags:
             register_marketing_tools(helper, assistant, user_id)
             current_app.logger.info("Marketing tools loaded (Tier 2) for reuse agent")
-        if str(prompt_id).startswith('ip_protection'):
+        if 'ip_protection' in goal_tags:
             from integrations.agent_engine.ip_protection_tools import register_ip_protection_tools
             register_ip_protection_tools(helper, assistant, user_id)
             current_app.logger.info("IP protection tools loaded (Tier 2) for reuse agent")
+        if 'self_build' in goal_tags:
+            from integrations.agent_engine.self_build_tools import register_self_build_tools
+            register_self_build_tools(helper, assistant, user_id)
+            current_app.logger.info("Self-build tools loaded (Tier 2) for reuse agent")
+        if 'outreach' in goal_tags:
+            from integrations.agent_engine.outreach_crm_tools import register_outreach_tools
+            register_outreach_tools(helper, assistant, user_id)
+            current_app.logger.info("Outreach CRM tools loaded (Tier 2) for reuse agent")
+        if 'sales' in goal_tags:
+            from integrations.agent_engine.journey_engine import register_journey_tools
+            register_journey_tools(helper, assistant, user_id)
+            current_app.logger.info("Sales journey tools loaded (Tier 2) for reuse agent")
+        if 'revenue' in goal_tags:
+            # Revenue tools: get_api_revenue_stats + adjust_pricing.
+            # Required by the `bootstrap_revenue_monitor` goal seed —
+            # without these the revenue-monitor agent has no way to
+            # observe commercial-API revenue and the flywheel can't
+            # close the marketing/revenue loop.
+            from integrations.agent_engine.revenue_tools import register_revenue_tools
+            register_revenue_tools(helper, assistant, user_id)
+            current_app.logger.info("Revenue tools loaded (Tier 2) for reuse agent")
     except Exception as e:
         # Same observability promotion as create_recipe.py — a failure
         # here strips the agent of goal-specific tools, agent talks
@@ -3501,6 +3544,10 @@ def get_ledger_status_for_logging(user_prompt: str) -> str:
         return "Ledger: status unavailable"
 
 
+from core.llm_outbound_logger import with_source as _with_source
+
+
+@_with_source('autogen.reuse')
 def chat_agent(user_id, text, prompt_id, file_id, request_id):
     current_app.logger.info('--' * 100)
     user_message = text

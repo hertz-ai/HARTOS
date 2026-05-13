@@ -69,6 +69,15 @@ always `main`.  HARTOS follows the same rule for the same reason.
 
 ## Common Commands
 
+### Logs (where to look when debugging)
+| Path | Contents |
+|------|----------|
+| `~/Documents/Nunba/logs/frozen_debug.log` | Main Nunba + HARTOS log — timestamps, RequestIDs, httpx calls, SSE broadcasts, ToolMessageHandler's `=== FULL INPUT MESSAGES DEBUG ===` dumps (messages portion only — autogen attaches system_message + tools AFTER `transform_messages` runs, so this dump is the messages-only view) |
+| `~/Documents/Nunba/logs/llama_server_8082.log` | llama-server stdout/stderr — **with `--log-timestamps --verbose`** every request body, slot lifecycle, `task.n_tokens`, and `send_error` line (e.g. `Context size has been exceeded`, `request (N tokens) exceeds the available context size`) carries a `[HH:MM:SS.mmm]` prefix. Every HARTOS-side caller (autogen / langchain / dispatcher / probes) sets the OpenAI `user` field to the thread-local request_id, so each task line correlates 1:1 with the frozen_debug RequestID column. Authoritative for "what was sent + when + by whom + how big". |
+| `~/Documents/Nunba/logs/draft_decision.jsonl` | Per-request draft-model boot decisions (cohort, VRAM, active TTS, delegate verdict) |
+
+For ctx-overflow diagnosis: grep `llama_server_8082.log` for the `request (N tokens) exceeds` line, take the timestamp + `user=<request_id>`, find the same request_id in frozen_debug to trace back to the originating /chat turn.
+
 ### Setup
 ```bash
 # Requires Python 3.9+ (test env runs on 3.11; pydantic 2.9.2 supports 3.9-3.13).

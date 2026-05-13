@@ -566,6 +566,12 @@ TOOL_LABELS: dict = {
     'Generate_Video':              'Generating a video…',
     'List_AI_Providers':           'Listing AI providers…',
     'Provider_Leaderboard':        'Loading provider leaderboard…',
+    # ── AP2 (Agent Protocol 2) — agentic commerce payment tools.
+    #    Registered dynamically via get_ap2_tools_for_autogen() in
+    #    create_recipe.py:1761 + reuse_recipe.py:2494 in both flows.
+    'request_payment':             'Requesting payment authorization…',
+    'authorize_payment':           'Authorizing payment…',
+    'process_payment':             'Processing payment via gateway…',
 }
 
 

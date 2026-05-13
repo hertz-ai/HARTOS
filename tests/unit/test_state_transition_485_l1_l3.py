@@ -71,3 +71,48 @@ def test_l3_no_name_enumeration():
 def test_existing_loop_guard_unchanged():
     a = _module_assigns(_read('create_recipe.py'))
     assert a['_STATE_TRANSITION_LOOP_THRESHOLD'].value.value == 5
+
+
+# ─── EARLY-TERMINATE guard (2026-05-12 c38e8b7c-... regression) ───────
+#
+# When ChatInstructor (UserProxyAgent) emits its
+# ``default_auto_reply='TERMINATE'``, state_transition's speaker-routing
+# branch ("last_speaker.name == 'ChatInstructor' → return assistant")
+# fires before the original ``'TERMINATE' in messages[-1]['content']``
+# check at the bottom of the function.  The Assistant LLM then sees
+# "TERMINATE\nMetadata/skeleton..." as user input and emits ~5 identical
+# replies until the STUCK-LOOP guard rescues the turn ~3 minutes later.
+#
+# Fix: a TERMINATE early-exit BEFORE the speaker-routing branch ends
+# the GroupChat round whenever any agent's last content contains
+# TERMINATE — matching the per-agent ``is_termination_msg`` behaviour
+# autogen's GroupChatManager already honours between rounds.
+
+def test_early_terminate_guard_present():
+    src = _read('create_recipe.py')
+    assert '[EARLY-TERMINATE]' in src, (
+        "EARLY-TERMINATE guard missing — state_transition would loop "
+        "on ChatInstructor's default_auto_reply='TERMINATE' for ~3min"
+    )
+
+
+def test_early_terminate_runs_before_chat_instructor_routing():
+    """The TERMINATE check must POSITIONALLY precede the speaker-
+    routing branch that forwards ChatInstructor messages to Assistant.
+    If the order flips, the routing branch fires first and the
+    TERMINATE message gets ferried to Assistant — the exact regression
+    this guard exists to prevent."""
+    src = _read('create_recipe.py')
+    early_marker = src.find('[EARLY-TERMINATE]')
+    # The speaker-routing line is the long ``or last_speaker.name == 'ChatInstructor'``
+    # disjunction at ~line 2321.
+    chat_instructor_branch = src.find(
+        "last_speaker.name == 'ChatInstructor'"
+    )
+    assert early_marker > 0, "EARLY-TERMINATE marker not found"
+    assert chat_instructor_branch > 0, "ChatInstructor routing branch not found"
+    assert early_marker < chat_instructor_branch, (
+        "EARLY-TERMINATE check must precede the ChatInstructor → "
+        "Assistant routing branch.  Reversing the order re-introduces "
+        "the c38e8b7c-... 3-minute loop on trivial bound-agent input."
+    )
