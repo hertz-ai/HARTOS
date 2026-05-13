@@ -4,7 +4,8 @@ Unified Agent Goal Engine
 Generic framework for autonomous agent goals: marketing, coding, analytics, etc.
 Adding a new agent type = register a prompt builder + tool tags.
 
-Enabled via HEVOLVE_AGENT_ENGINE_ENABLED=true (default: false).
+Enabled by default (HEVOLVE_AGENT_ENGINE_ENABLED).  Set the env var to
+'false' to disable for dev/test isolation.
 """
 import os
 import logging
@@ -65,8 +66,16 @@ def init_agent_engine(app):
         # can't observe a half-initialised state).
         _agent_engine_initialized = True
 
-    if os.environ.get('HEVOLVE_AGENT_ENGINE_ENABLED', 'false').lower() != 'true':
-        logger.info("Agent engine disabled (HEVOLVE_AGENT_ENGINE_ENABLED != true)")
+    # Default ON.  Set HEVOLVE_AGENT_ENGINE_ENABLED=false to disable.
+    # The marketing flywheel needs the daemon ticking to do anything; defaulting
+    # off meant new installs sat idle forever unless the operator knew to flip
+    # the flag.  Defaulting on means the seeded marketing/outreach/revenue goals
+    # start executing on the 30s tick as soon as Nunba boots.  The 2026-04-19
+    # cold-boot stall that prompted the original opt-in gate was fixed by
+    # making the heavy imports lazy (see init_agent_engine docstring above) —
+    # the env var no longer controls boot perf, only feature enablement.
+    if os.environ.get('HEVOLVE_AGENT_ENGINE_ENABLED', 'true').lower() == 'false':
+        logger.info("Agent engine disabled (HEVOLVE_AGENT_ENGINE_ENABLED=false)")
         return
 
     # Register API blueprint

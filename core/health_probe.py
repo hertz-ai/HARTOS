@@ -67,8 +67,9 @@ def probe_agent_daemon() -> Dict[str, Any]:
         out['daemon_tick_count'] = int(getattr(agent_daemon, '_tick_count', 0))
     except Exception as e:
         # Degraded fallback — couldn't reach the daemon module at all.
+        # Default ON to match integrations.agent_engine.__init__ default.
         out['daemon_enabled'] = (
-            os.environ.get('HEVOLVE_AGENT_ENGINE_ENABLED', 'false').lower() == 'true'
+            os.environ.get('HEVOLVE_AGENT_ENGINE_ENABLED', 'true').lower() != 'false'
         )
         out['daemon_thread_alive'] = False
         out['daemon_probe_error'] = str(e)
