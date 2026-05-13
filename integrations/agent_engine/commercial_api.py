@@ -29,10 +29,14 @@ logger = logging.getLogger('hevolve_social')
 # ═══════════════════════════════════════════════════════════════
 
 TIER_CONFIG = {
-    'free':       {'rate_limit_per_day': 100,    'monthly_quota': 3000,     'priority': 'low'},
-    'starter':    {'rate_limit_per_day': 1000,   'monthly_quota': 30000,    'priority': 'normal'},
-    'pro':        {'rate_limit_per_day': 10000,  'monthly_quota': 300000,   'priority': 'high'},
-    'enterprise': {'rate_limit_per_day': 100000, 'monthly_quota': 10000000, 'priority': 'critical'},
+    'free':       {'rate_limit_per_day': 100,    'monthly_quota': 3000,     'priority': 'low',
+                   'monthly_price_usd': 0.0,      'description': 'Free forever — intelligence belongs to everyone.'},
+    'starter':    {'rate_limit_per_day': 1000,   'monthly_quota': 30000,    'priority': 'normal',
+                   'monthly_price_usd': 9.0,      'description': 'For solo builders. 10x daily / 10x monthly vs free.'},
+    'pro':        {'rate_limit_per_day': 10000,  'monthly_quota': 300000,   'priority': 'high',
+                   'monthly_price_usd': 49.0,     'description': 'For small teams. Priority queue + hive priority.'},
+    'enterprise': {'rate_limit_per_day': 100000, 'monthly_quota': 10000000, 'priority': 'critical',
+                   'monthly_price_usd': 499.0,    'description': 'For scale. Dedicated hive lane + SLA.'},
 }
 
 COST_PER_1K_TOKENS = {
@@ -661,3 +665,598 @@ def revoke_key(key_id):
         return jsonify({'success': True, 'key': result})
     finally:
         db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Public pricing + upgrade flow
+# ═══════════════════════════════════════════════════════════════
+# Goal: close the gap between "commercial_api blueprint exists" and
+# "customer can land $$".  The blueprint registration alone gives 8 routes
+# but doesn't surface PRICING (customers can create free keys, never know
+# what to pay for) and doesn't expose UPGRADE (no path from free→starter
+# →pro→enterprise).  Pricing is public (no auth) so the marketing
+# bootstrap goal in goal_seeding can advertise it.  Upgrade pipes through
+# AP2's PaymentLedger so we don't reinvent payment processing — same
+# primitives used by the autogen agent flow.
+
+@commercial_api_bp.route('/api/v1/intelligence/pricing', methods=['GET'])
+def pricing():
+    """Public pricing — no auth required.  Customers + marketing agents
+    use this to discover tiers and prices.  Returns the full TIER_CONFIG
+    plus the per-1K-token rates and the revenue split commitment."""
+    try:
+        from integrations.agent_engine.revenue_aggregator import (
+            REVENUE_SPLIT_USERS, REVENUE_SPLIT_INFRA, REVENUE_SPLIT_CENTRAL,
+        )
+        _split = {
+            'users_pool': REVENUE_SPLIT_USERS,    # 0.90
+            'infrastructure': REVENUE_SPLIT_INFRA,  # 0.09
+            'central': REVENUE_SPLIT_CENTRAL,      # 0.01
+        }
+    except Exception:
+        _split = {'users_pool': 0.90, 'infrastructure': 0.09, 'central': 0.01}
+
+    return jsonify({
+        'success': True,
+        'pricing_currency': 'USD',
+        'tiers': {
+            name: {
+                'tier': name,
+                'monthly_price_usd': cfg['monthly_price_usd'],
+                'description': cfg['description'],
+                'rate_limit_per_day': cfg['rate_limit_per_day'],
+                'monthly_quota_tokens': cfg['monthly_quota'],
+                'priority': cfg['priority'],
+                'cost_per_1k_tokens_usd': COST_PER_1K_TOKENS.get(name, 0.0),
+            }
+            for name, cfg in TIER_CONFIG.items()
+        },
+        'revenue_split': _split,
+        'principles': [
+            'Free tier is free forever — gatekeeping intelligence is not the goal.',
+            '90% of paid revenue flows to compute providers (the people who train the hive).',
+            'No vendor lock-in — local-first, your data stays on your device by default.',
+        ],
+        'endpoints': {
+            'chat': 'POST /api/v1/intelligence/chat',
+            'analyze': 'POST /api/v1/intelligence/analyze',
+            'generate': 'POST /api/v1/intelligence/generate',
+            'hivemind': 'GET  /api/v1/intelligence/hivemind',
+            'usage': 'GET  /api/v1/intelligence/usage',
+            'keys_create': 'POST   /api/v1/intelligence/keys',
+            'keys_list': 'GET    /api/v1/intelligence/keys',
+            'keys_revoke': 'DELETE /api/v1/intelligence/keys/<key_id>',
+            'upgrade': 'POST /api/v1/intelligence/keys/<key_id>/upgrade',
+        },
+    })
+
+
+@commercial_api_bp.route('/api/v1/intelligence/keys/<key_id>/upgrade', methods=['POST'])
+def upgrade_key(key_id):
+    """Upgrade an API key to a higher tier — routes payment through AP2.
+
+    Body: {"target_tier": "starter|pro|enterprise", "payment_method": "card_token_or_method_id"}
+
+    AP2's PaymentLedger handles the payment flow:
+      - Creates a PaymentRequest for the tier's monthly_price_usd
+      - Authorizes against the provided payment_method (mock gateway in
+        dev; real gateway in prod via PaymentGatewayConnector)
+      - On success, updates the API key's tier and limits
+
+    This is the single chokepoint between "free key created" and
+    "revenue lands in MeteredAPIUsage".
+    """
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return jsonify({'success': False, 'error': 'Authorization required'}), 401
+
+    from integrations.social.auth import _get_user_from_token
+    token = auth_header[7:]
+    user, db = _get_user_from_token(token)
+    if not user:
+        if db:
+            db.close()
+        return jsonify({'success': False, 'error': 'Invalid token'}), 401
+
+    try:
+        data = request.get_json() or {}
+        target_tier = (data.get('target_tier') or '').strip().lower()
+        payment_method = (data.get('payment_method') or '').strip()
+
+        if target_tier not in TIER_CONFIG:
+            return jsonify({
+                'success': False,
+                'error': f'Invalid target_tier: {target_tier!r}. Valid: {list(TIER_CONFIG.keys())}',
+            }), 400
+        if target_tier == 'free':
+            return jsonify({
+                'success': False,
+                'error': 'Cannot upgrade to free tier. Use DELETE to revoke instead.',
+            }), 400
+        if not payment_method:
+            return jsonify({
+                'success': False,
+                'error': 'payment_method required (card token, AP2 method id, or mock id)',
+            }), 400
+
+        # Look up the API key being upgraded — must belong to this user.
+        from integrations.social.models import CommercialAPIKey
+        api_key = db.query(CommercialAPIKey).filter_by(
+            id=key_id, user_id=str(user.id)).first()
+        if not api_key:
+            return jsonify({'success': False, 'error': 'API key not found'}), 404
+
+        target_cfg = TIER_CONFIG[target_tier]
+        amount_usd = float(target_cfg['monthly_price_usd'])
+
+        # Route through AP2's PaymentLedger.  Falls back to MockPaymentGateway
+        # by default (registered in PaymentLedger.__init__); real connectors
+        # can be added via payment_ledger.add_gateway() at app start.
+        try:
+            from decimal import Decimal as _Decimal
+            from integrations.ap2 import payment_ledger, PaymentMethod, PaymentStatus
+        except Exception as _imp_err:
+            return jsonify({
+                'success': False,
+                'error': f'AP2 payment surface unavailable: {_imp_err}',
+            }), 503
+
+        # Pick the live gateway for the SYNCHRONOUS upgrade flow.
+        # Preference order:
+        #   1. Caller-requested gateway via `data['gateway']` (when registered
+        #      AND known to be synchronous — currently Stripe and Mock).
+        #   2. Stripe (USD/international cards, synchronous capture).
+        #   3. MockPaymentGateway (dev/test fallback).
+        #
+        # PhonePe is intentionally NOT selected here even when registered —
+        # it is a redirect-then-webhook flow.  Selecting it synchronously
+        # would mark the tier upgraded before the user actually pays
+        # (revenue leak).  PhonePe surfaces as infrastructure (auto-
+        # registered, visible in /pricing) so the async upgrade endpoint
+        # — to be added when the webhook handler is wired — can use it
+        # without further code changes.  Until then, requests for
+        # `gateway: 'phonepe'` are rejected with 501.
+        try:
+            from integrations.ap2 import PaymentGateway as _PG
+            requested = (data.get('gateway') or '').strip().lower()
+
+            _SYNC_OK = {_PG.STRIPE, _PG.MOCK}
+
+            if requested == 'phonepe':
+                return jsonify({
+                    'success': False,
+                    'error': 'PhonePe upgrades require the async redirect '
+                             'flow — not yet exposed on /upgrade.  Use '
+                             'Stripe (set STRIPE_API_KEY) or the dev mock.',
+                }), 501
+
+            _gateway_choice = None
+            if requested:
+                try:
+                    pg = _PG(requested)
+                    if pg in payment_ledger.gateways and pg in _SYNC_OK:
+                        _gateway_choice = pg
+                except ValueError:
+                    pass
+            if _gateway_choice is None:
+                _gateway_choice = (
+                    _PG.STRIPE if _PG.STRIPE in payment_ledger.gateways
+                    else _PG.MOCK
+                )
+        except Exception:
+            _gateway_choice = None  # PaymentLedger will pick a default
+
+        # Three-step AP2 flow.  We do all synchronously here for the simple
+        # upgrade case; long-lived subscriptions would split across webhooks.
+        try:
+            _create_kwargs = dict(
+                amount=_Decimal(str(amount_usd)),
+                currency='USD',
+                description=f'API tier upgrade: {api_key.tier} → {target_tier}',
+                requester_agent_id=f'user:{user.id}',
+                metadata={
+                    'api_key_id': str(key_id),
+                    'current_tier': api_key.tier,
+                    'target_tier': target_tier,
+                    'kind': 'tier_upgrade',
+                    'payment_method_token': payment_method,
+                },
+            )
+            if _gateway_choice is not None:
+                _create_kwargs['gateway'] = _gateway_choice
+            payment_req = payment_ledger.create_payment_request(**_create_kwargs)
+            authorized = payment_ledger.authorize_payment(
+                payment_req.payment_id, approver_id=f'user:{user.id}')
+            if not authorized:
+                return jsonify({
+                    'success': False,
+                    'error': 'Payment authorization failed',
+                    'payment_request_id': payment_req.payment_id,
+                }), 402  # 402 Payment Required
+            result = payment_ledger.process_payment(payment_req.payment_id)
+            if not result.get('success'):
+                return jsonify({
+                    'success': False,
+                    'error': f'Payment processing failed: {result.get("error", "unknown")}',
+                    'payment_request_id': payment_req.payment_id,
+                }), 402
+        except Exception as pay_err:
+            return jsonify({
+                'success': False,
+                'error': f'Payment error: {pay_err}',
+            }), 502
+
+        # Payment succeeded — bump the key's tier and limits.
+        api_key.tier = target_tier
+        api_key.rate_limit_per_day = target_cfg['rate_limit_per_day']
+        api_key.monthly_quota = target_cfg['monthly_quota']
+        db.commit()
+
+        return jsonify({
+            'success': True,
+            'api_key': {
+                'id': str(api_key.id),
+                'tier': api_key.tier,
+                'rate_limit_per_day': api_key.rate_limit_per_day,
+                'monthly_quota': api_key.monthly_quota,
+            },
+            'payment': {
+                'request_id': payment_req.payment_id,
+                'amount_usd': amount_usd,
+                'status': 'completed',
+            },
+            'revenue_split': {
+                'users_pool_usd': round(amount_usd * 0.90, 2),
+                'infrastructure_usd': round(amount_usd * 0.09, 2),
+                'central_usd': round(amount_usd * 0.01, 2),
+            },
+        })
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════
+# PhonePe async upgrade flow (India market — UPI / cards / netbanking)
+#
+#   POST /keys/<id>/upgrade/phonepe   → 202 + redirect_url (caller redirects user)
+#   POST /phonepe/callback            → PhonePe S2S webhook, finalizes tier change
+#
+# The synchronous /upgrade endpoint cannot service PhonePe because PhonePe
+# is a redirect-then-webhook flow — at create_payment time the user has not
+# paid yet, only the checkout session exists.  Capturing immediately
+# (Stripe-style) would return PAYMENT_PENDING and the upgrade would fail.
+#
+# So PhonePe gets its own pair of routes: initiate (creates the checkout
+# session, returns the redirect URL, leaves the payment in PROCESSING
+# state) and the webhook (signature-verified, idempotent finalize that
+# bumps the API key tier when PhonePe confirms PAYMENT_SUCCESS).
+# ═══════════════════════════════════════════════════════════════
+
+@commercial_api_bp.route('/api/v1/intelligence/keys/<key_id>/upgrade/phonepe',
+                         methods=['POST'])
+def initiate_phonepe_upgrade(key_id: str):
+    """Initiate a PhonePe-rail upgrade for a paid tier.
+
+    Returns:
+        202 Accepted with `{redirect_url, payment_request_id,
+        gateway_transaction_id}` — the caller should redirect the user
+        to ``redirect_url`` to complete the checkout.
+
+    The tier is NOT yet bumped at this point.  PhonePe will POST to
+    ``/api/v1/intelligence/phonepe/callback`` when the user completes
+    payment; that's where the tier change lands.
+    """
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return jsonify({'success': False, 'error': 'Authorization required'}), 401
+
+    from integrations.social.auth import _get_user_from_token
+    token = auth_header[7:]
+    user, db = _get_user_from_token(token)
+    if not user:
+        if db:
+            db.close()
+        return jsonify({'success': False, 'error': 'Invalid token'}), 401
+
+    try:
+        data = request.get_json() or {}
+        target_tier = (data.get('target_tier') or '').strip().lower()
+
+        if target_tier not in TIER_CONFIG:
+            return jsonify({
+                'success': False,
+                'error': f'Invalid target_tier: {target_tier!r}. Valid: {list(TIER_CONFIG.keys())}',
+            }), 400
+        if target_tier == 'free':
+            return jsonify({
+                'success': False,
+                'error': 'Cannot upgrade to free tier. Use DELETE to revoke instead.',
+            }), 400
+
+        from integrations.social.models import CommercialAPIKey
+        api_key = db.query(CommercialAPIKey).filter_by(
+            id=key_id, user_id=str(user.id)).first()
+        if not api_key:
+            return jsonify({'success': False, 'error': 'API key not found'}), 404
+
+        target_cfg = TIER_CONFIG[target_tier]
+        amount_usd = float(target_cfg['monthly_price_usd'])
+
+        try:
+            from decimal import Decimal as _Decimal
+            from integrations.ap2 import (
+                payment_ledger, PaymentMethod, PaymentStatus, PaymentGateway,
+            )
+        except Exception as imp_err:
+            return jsonify({
+                'success': False,
+                'error': f'AP2 payment surface unavailable: {imp_err}',
+            }), 503
+
+        if PaymentGateway.PHONEPE not in payment_ledger.gateways:
+            return jsonify({
+                'success': False,
+                'error': 'PhonePe gateway is not registered on this node. '
+                         'Set PHONEPE_MERCHANT_ID + PHONEPE_SALT_KEY and restart.',
+            }), 503
+
+        # Build the payment request.  Metadata carries the bookkeeping
+        # the webhook needs to finalize the tier change without trusting
+        # any caller-supplied data.
+        try:
+            payment_req = payment_ledger.create_payment_request(
+                amount=_Decimal(str(amount_usd)),
+                currency='USD',  # PhonePe gateway converts to paise
+                description=f'API tier upgrade: {api_key.tier} → {target_tier}',
+                requester_agent_id=f'user:{user.id}',
+                payment_method=PaymentMethod.INTERNAL_CREDITS,
+                gateway=PaymentGateway.PHONEPE,
+                metadata={
+                    'api_key_id': str(key_id),
+                    'current_tier': api_key.tier,
+                    'target_tier': target_tier,
+                    'kind': 'tier_upgrade',
+                    'user_id': str(user.id),
+                    'redirect_url': data.get(
+                        'redirect_url',
+                        'https://hevolve.ai/api/v1/intelligence/keys',
+                    ),
+                    'callback_url': data.get(
+                        'callback_url',
+                        'https://hevolve.ai/api/v1/intelligence/phonepe/callback',
+                    ),
+                    'mobile_number': data.get('mobile_number'),
+                    'inr_amount': data.get('inr_amount'),  # optional override
+                },
+            )
+
+            authorized = payment_ledger.authorize_payment(
+                payment_req.payment_id, approver_id=f'user:{user.id}')
+            if not authorized:
+                return jsonify({
+                    'success': False,
+                    'error': 'Payment authorization failed',
+                    'payment_request_id': payment_req.payment_id,
+                }), 402
+
+            # Call PhonePe to mint the checkout session.  We bypass
+            # `process_payment` here because that would also try to
+            # capture immediately (which would return PAYMENT_PENDING).
+            gateway = payment_ledger.gateways[PaymentGateway.PHONEPE]
+            phonepe_result = gateway.create_payment(payment_req)
+            if not phonepe_result.get('success'):
+                payment_req.update_status(
+                    PaymentStatus.FAILED,
+                    phonepe_result.get('error', 'PhonePe create_payment failed'))
+                payment_ledger.save_ledger()
+                return jsonify({
+                    'success': False,
+                    'error': phonepe_result.get('error', 'PhonePe initiation failed'),
+                    'payment_request_id': payment_req.payment_id,
+                }), 502
+
+            payment_req.gateway_transaction_id = phonepe_result.get('transaction_id')
+            payment_req.update_status(PaymentStatus.PROCESSING,
+                                     'awaiting user payment on PhonePe checkout')
+            payment_ledger.save_ledger()
+
+            return jsonify({
+                'success': True,
+                'status': 'redirect_required',
+                'redirect_url': phonepe_result.get('redirect_url'),
+                'payment_request_id': payment_req.payment_id,
+                'gateway_transaction_id': payment_req.gateway_transaction_id,
+                'amount_usd': amount_usd,
+                'inr_amount_estimated_paise': gateway._to_paise(payment_req),
+                'message': 'Redirect the user to redirect_url to complete payment. '
+                           'The tier will be bumped once PhonePe confirms payment '
+                           'via the callback webhook.',
+            }), 202
+        except Exception as pay_err:
+            logger.exception("PhonePe upgrade initiation failed")
+            return jsonify({
+                'success': False,
+                'error': f'Payment error: {pay_err}',
+            }), 502
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+@commercial_api_bp.route('/api/v1/intelligence/phonepe/callback',
+                         methods=['POST'])
+def phonepe_callback():
+    """PhonePe server-to-server webhook: finalize a successful payment.
+
+    PhonePe POSTs `{"response": "<base64>"}` with header
+    `X-VERIFY: sha256(base64 + salt_key) + "###" + salt_index`.
+    We:
+      1. Verify the signature with the registered PhonePe gateway.
+      2. Decode the payload, recover our merchantTransactionId.
+      3. Look up the payment in the ledger.
+      4. Idempotency: if already COMPLETED, 200 immediately.
+      5. Defense in depth: re-query PhonePe status API via
+         gateway.capture_payment — never trust the webhook body alone.
+      6. On confirmed PAYMENT_SUCCESS, mark COMPLETED and bump the
+         API key's tier limits.  Returns 200 to PhonePe regardless of
+         tier-bump success so retries stop.
+    """
+    import base64 as _b64
+    import json as _json
+
+    try:
+        from integrations.ap2 import payment_ledger, PaymentStatus, PaymentGateway
+    except Exception as imp_err:
+        logger.error(f"PhonePe callback: AP2 import failed: {imp_err}")
+        return jsonify({'success': False, 'error': 'AP2 unavailable'}), 503
+
+    if PaymentGateway.PHONEPE not in payment_ledger.gateways:
+        # If PhonePe isn't registered we shouldn't be receiving callbacks.
+        # Log loudly so the operator notices.
+        logger.error("PhonePe callback received but gateway is not registered")
+        return jsonify({'success': False, 'error': 'PhonePe gateway unavailable'}), 503
+
+    gateway = payment_ledger.gateways[PaymentGateway.PHONEPE]
+    x_verify = request.headers.get('X-VERIFY', '')
+    body = request.get_json(silent=True) or {}
+    b64_response = body.get('response', '')
+
+    if not b64_response or not x_verify:
+        logger.warning("PhonePe callback: missing response body or X-VERIFY header")
+        return jsonify({'success': False, 'error': 'Missing signature payload'}), 400
+
+    # Reject any callback that fails signature verification.  Constant-time
+    # compare inside verify_callback prevents timing oracles.
+    if not gateway.verify_callback(b64_response, x_verify):
+        logger.warning("PhonePe callback: X-VERIFY signature mismatch — rejecting")
+        return jsonify({'success': False, 'error': 'Invalid signature'}), 401
+
+    # Decode the verified payload.
+    try:
+        decoded = _b64.b64decode(b64_response).decode('utf-8')
+        envelope = _json.loads(decoded)
+    except Exception as e:
+        logger.warning(f"PhonePe callback: failed to decode response payload: {e}")
+        return jsonify({'success': False, 'error': 'Invalid payload encoding'}), 400
+
+    code = envelope.get('code', '')
+    callback_data = envelope.get('data') or {}
+    merchant_txn_id = callback_data.get('merchantTransactionId', '')
+    if not merchant_txn_id:
+        logger.warning("PhonePe callback: payload missing merchantTransactionId")
+        return jsonify({'success': False, 'error': 'Missing merchantTransactionId'}), 400
+
+    # Recover our payment record by gateway_transaction_id.
+    payment_req = None
+    for p in payment_ledger.payments.values():
+        if p.gateway_transaction_id == merchant_txn_id:
+            payment_req = p
+            break
+    if payment_req is None:
+        logger.warning(f"PhonePe callback: no payment found for txn {merchant_txn_id}")
+        # Don't 5xx — PhonePe would retry forever.  Return 200 with success=False.
+        return jsonify({'success': False, 'error': 'Payment not found'}), 200
+
+    # Idempotency: if we've already completed (or failed) this payment,
+    # do nothing.  PhonePe retries the callback if it doesn't get 2xx
+    # within ~30s, so duplicates are normal.
+    if payment_req.status == PaymentStatus.COMPLETED:
+        return jsonify({
+            'success': True,
+            'status': 'already_completed',
+            'payment_request_id': payment_req.payment_id,
+        }), 200
+    if payment_req.status in (PaymentStatus.FAILED, PaymentStatus.CANCELLED,
+                              PaymentStatus.REFUNDED, PaymentStatus.EXPIRED):
+        return jsonify({
+            'success': False,
+            'status': payment_req.status.value,
+            'payment_request_id': payment_req.payment_id,
+        }), 200
+
+    # Defense in depth: re-query PhonePe status, never trust webhook body alone.
+    status_result = gateway.capture_payment(
+        payment_req.payment_id, payment_req.gateway_transaction_id)
+    if not status_result.get('success'):
+        payment_req.update_status(
+            PaymentStatus.FAILED,
+            status_result.get('error', f'PhonePe status check returned {code}'))
+        payment_ledger.save_ledger()
+        return jsonify({
+            'success': False,
+            'status': 'payment_failed',
+            'error': status_result.get('error', code),
+            'payment_request_id': payment_req.payment_id,
+        }), 200
+
+    # Status check confirmed PAYMENT_SUCCESS — finalize.
+    meta = payment_req.metadata or {}
+    api_key_id = meta.get('api_key_id')
+    target_tier = meta.get('target_tier')
+
+    if not api_key_id or target_tier not in TIER_CONFIG:
+        payment_req.update_status(
+            PaymentStatus.FAILED,
+            f'Callback received but metadata malformed (api_key_id={api_key_id!r}, '
+            f'target_tier={target_tier!r})')
+        payment_ledger.save_ledger()
+        return jsonify({
+            'success': False,
+            'error': 'Payment metadata malformed',
+            'payment_request_id': payment_req.payment_id,
+        }), 200
+
+    # Bump the API key tier.
+    try:
+        from integrations.social.models import get_db, CommercialAPIKey
+        db = get_db()
+        try:
+            api_key = db.query(CommercialAPIKey).filter_by(id=api_key_id).first()
+            if not api_key:
+                payment_req.update_status(
+                    PaymentStatus.FAILED,
+                    f'API key {api_key_id} not found at callback finalize')
+                payment_ledger.save_ledger()
+                return jsonify({
+                    'success': False,
+                    'error': 'API key not found',
+                    'payment_request_id': payment_req.payment_id,
+                }), 200
+            target_cfg = TIER_CONFIG[target_tier]
+            api_key.tier = target_tier
+            api_key.rate_limit_per_day = target_cfg['rate_limit_per_day']
+            api_key.monthly_quota = target_cfg['monthly_quota']
+            db.commit()
+        finally:
+            db.close()
+    except Exception as db_err:
+        logger.exception("PhonePe callback: tier bump failed")
+        # Don't fail the payment — money has changed hands.  Mark
+        # COMPLETED and emit a loud error so operator can manually
+        # reconcile.
+        logger.error(f"MANUAL RECONCILIATION NEEDED: payment "
+                     f"{payment_req.payment_id} succeeded but tier bump "
+                     f"failed for api_key {api_key_id}: {db_err}")
+
+    payment_req.update_status(PaymentStatus.COMPLETED,
+                              'PhonePe payment captured via callback')
+    payment_ledger.save_ledger()
+
+    amount_usd = float(payment_req.amount)
+    return jsonify({
+        'success': True,
+        'status': 'completed',
+        'payment_request_id': payment_req.payment_id,
+        'api_key_id': api_key_id,
+        'new_tier': target_tier,
+        'revenue_split': {
+            'users_pool_usd': round(amount_usd * 0.90, 2),
+            'infrastructure_usd': round(amount_usd * 0.09, 2),
+            'central_usd': round(amount_usd * 0.01, 2),
+        },
+    }), 200
