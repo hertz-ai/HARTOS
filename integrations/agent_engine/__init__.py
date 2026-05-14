@@ -67,131 +67,53 @@ def init_agent_engine(app):
         _agent_engine_initialized = True
 
     # Default ON.  Set HEVOLVE_AGENT_ENGINE_ENABLED=false to disable.
-    # The marketing flywheel needs the daemon ticking to do anything; defaulting
-    # off meant new installs sat idle forever unless the operator knew to flip
-    # the flag.  Defaulting on means the seeded marketing/outreach/revenue goals
-    # start executing on the 30s tick as soon as Nunba boots.  The 2026-04-19
-    # cold-boot stall that prompted the original opt-in gate was fixed by
-    # making the heavy imports lazy (see init_agent_engine docstring above) —
-    # the env var no longer controls boot perf, only feature enablement.
+    # The marketing flywheel needs the daemon ticking to do anything;
+    # defaulting off meant new installs sat idle forever unless the operator
+    # knew to flip the flag.  Defaulting on means the seeded marketing /
+    # outreach / revenue goals start executing on the 30s tick after boot.
     if os.environ.get('HEVOLVE_AGENT_ENGINE_ENABLED', 'true').lower() == 'false':
         logger.info("Agent engine disabled (HEVOLVE_AGENT_ENGINE_ENABLED=false)")
         return
 
-    # Register API blueprint
-    try:
-        bp = get_engine_blueprint()
-        app.register_blueprint(bp)
-        logger.info("Agent engine endpoints registered")
-    except Exception as e:
-        logger.warning(f"Agent engine blueprint registration failed: {e}")
-        return
-
-    # Bootstrap "HART Platform" product for self-marketing (idempotent)
-    product_id = None
-    try:
-        from integrations.social.models import get_db, Product, User
-        db = get_db()
-        existing = db.query(Product).filter_by(is_platform_product=True).first()
-        if not existing:
-            product = Product(
-                name='HART Platform',
-                description='Crowdsourced agentic intelligence platform — a gift from hevolve.ai',
-                tagline='Crowdsourced intelligence, human control',
-                product_url='https://hevolve.ai',
-                category='platform',
-                target_audience='Developers, businesses, and creators who want AI-powered automation',
-                unique_value_prop='96 expert agents, autonomous recipe-based execution, '
-                                  'cross-session memory, multi-channel distribution',
-                keywords_json=['AI', 'agents', 'automation', 'marketing', 'chatbot',
-                               'autonomous', 'multi-agent', 'LLM'],
-                is_platform_product=True,
-            )
-            db.add(product)
-            db.flush()
-            product_id = str(product.id)
-            logger.info("Bootstrapped HART Platform product for self-marketing")
-        else:
-            product_id = str(existing.id)
-
-        # Bootstrap system agent for goal execution (idempotent)
-        sys_agent = db.query(User).filter_by(username='hevolve_system_agent').first()
-        if not sys_agent:
-            sys_agent = User(
-                username='hevolve_system_agent',
-                display_name='HART System Agent',
-                user_type='agent',
-                idle_compute_opt_in=True,
-                is_admin=False,
-            )
-            db.add(sys_agent)
-            db.flush()
-            logger.info("Bootstrapped system agent for goal execution")
-
-        # Seed bootstrap goals (idempotent)
-        from .goal_seeding import seed_bootstrap_goals
-        count = seed_bootstrap_goals(db, platform_product_id=product_id)
-        if count > 0:
-            logger.info(f"Seeded {count} bootstrap goal(s)")
-
-        db.commit()
-        db.close()
-    except Exception as e:
-        logger.debug(f"Platform product bootstrap skipped: {e}")
-
-    # Register commercial API blueprint
-    try:
-        from .commercial_api import commercial_api_bp
-        app.register_blueprint(commercial_api_bp)
-        logger.info("Commercial API endpoints registered")
-    except Exception as e:
-        logger.debug(f"Commercial API blueprint skipped: {e}")
-
-    # Register build distribution blueprint
-    try:
-        from .build_distribution import build_distribution_bp
-        app.register_blueprint(build_distribution_bp)
-        logger.info("Build distribution endpoints registered")
-    except Exception as e:
-        logger.debug(f"Build distribution blueprint skipped: {e}")
-
-    # Register regional host blueprint
-    try:
-        from integrations.social.api_regional_host import regional_host_bp
-        app.register_blueprint(regional_host_bp)
-        logger.info("Regional host endpoints registered")
-    except Exception as e:
-        logger.debug(f"Regional host blueprint skipped: {e}")
-
-    # Heavy imports (`agent_baseline_service` → `helper` from
-    # hart_intelligence top-level; `agent_daemon` → many tools chain) run
-    # in a deferred thread.  Reason: when called from Nunba's
-    # `_deferred_social_init`, the `hartos-init` thread is concurrently
-    # running `from hart_intelligence import app`, which acquires the
-    # top-level `hart_intelligence` package import lock.  If this thread
-    # tries to import `helper` (a module inside hart_intelligence) at the
-    # same instant, CPython's per-module lock serialises and one of the
-    # two threads blocks indefinitely (hartos-init holds the package
-    # init in progress; we wait for the same lock to do `from helper
-    # import PROMPTS_DIR`).  Smoking gun: server.log stack at
-    # `_find_and_load → _lock_unlock_module → acquire` from inside
-    # `init_agent_engine` line 119.
+    # All of init_agent_engine's work — blueprint registration, product +
+    # system-agent bootstrap, goal seeding, AgentBaselineAdapter register,
+    # daemon start, distributed worker loop start — runs in a SINGLE
+    # background thread.  Nothing happens on the calling thread.
     #
-    # Solution: spawn a small worker thread that polls
-    # `routes.hartos_backend_adapter._hartos_initialized` (set True by
-    # the hartos-init thread when its `from hart_intelligence import app`
-    # finishes, success OR failure), and only THEN do the heavy imports.
-    # The Flask app + blueprints + bootstrap above have already been
-    # registered synchronously, so the admin dashboard endpoint is live
-    # immediately; the daemon and AgentBaselineAdapter come online a few
-    # seconds later, exactly like the existing `_deferred_social_init`
-    # pattern.
+    # Why: 2026-05-14 py-spy dump of the deadlocked Nunba.exe (PID 21752)
+    # showed three threads simultaneously stuck in CPython importlib:
+    #   - `hartos-bootstrap` running `init_social` → calling us → triggering
+    #     `from .commercial_api import commercial_api_bp` → exec_module →
+    #     get_code → get_data, holding the per-module import lock for the
+    #     entire commercial_api dependency graph.
+    #   - `ToolsWarmup` running `<module> langchain_core.tracers.log_stream`,
+    #     traversing langsmith → opentelemetry — needs to acquire the same
+    #     locks held by hartos-bootstrap.
+    #   - `TTSWarmup` running `_warmup_tts`, also doing exec_module.
+    # All three serialize on CPython's per-module locks; Flask's request
+    # handler thread (Hypercorn asyncio loop at app.py:5894) can't import
+    # anything to answer /api/* requests because the locks never free.
+    # Net result: Nunba.exe process alive, TCP port 5000 accepting, but
+    # every request hangs.  User closes the webview because the UI never
+    # gets a response from the backend.
+    #
+    # The 2026-04-28 "lazy imports" fix only deferred the deepest imports
+    # (`agent_baseline_service`, `agent_daemon`).  The middle layer
+    # (blueprint registration + bootstrap_product + seed_goals) still ran
+    # on the calling thread and imported heavy modules.  Moving those to
+    # the deferred thread eliminates the race entirely: by the time the
+    # thread wakes (after hartos-init signals done), TTSWarmup +
+    # ToolsWarmup are also long done with their imports — no contention.
+    #
+    # Trade-off: agent-engine endpoints (admin dashboard, commercial API)
+    # come online a few seconds after Flask starts serving instead of
+    # being registered synchronously.  Worth it — the previous behaviour
+    # was the entire app hanging forever.
     def _finish_init_deferred():
         import time as _t
-        # Wait up to 10 minutes for hartos-init to settle.  If it never
-        # settles (Tier-1 retry budget exhausted, network down, etc.),
-        # we still proceed because by then the import lock contention is
-        # gone — the hartos-init thread has either succeeded or given up.
+        # Wait up to 10 minutes for hartos-init to settle.  By then any
+        # parallel TTS/Tools warmup threads have also finished their
+        # imports, so the per-module import lock is fully released.
         _start = _t.time()
         _max_wait = 600
         while _t.time() - _start < _max_wait:
@@ -204,6 +126,93 @@ def init_agent_engine(app):
                 # for.  Proceed immediately.
                 break
             _t.sleep(1)
+
+        # ── Synchronous-equivalent block, now running off the boot path ──
+
+        # Register agent_engine API blueprint
+        try:
+            bp = get_engine_blueprint()
+            app.register_blueprint(bp)
+            logger.info("Agent engine endpoints registered")
+        except Exception as e:
+            logger.warning(f"Agent engine blueprint registration failed: {e}")
+            return
+
+        # Bootstrap "HART Platform" product for self-marketing (idempotent)
+        product_id = None
+        try:
+            from integrations.social.models import get_db, Product, User
+            db = get_db()
+            existing = db.query(Product).filter_by(is_platform_product=True).first()
+            if not existing:
+                product = Product(
+                    name='HART Platform',
+                    description='Crowdsourced agentic intelligence platform — a gift from hevolve.ai',
+                    tagline='Crowdsourced intelligence, human control',
+                    product_url='https://hevolve.ai',
+                    category='platform',
+                    target_audience='Developers, businesses, and creators who want AI-powered automation',
+                    unique_value_prop='96 expert agents, autonomous recipe-based execution, '
+                                      'cross-session memory, multi-channel distribution',
+                    keywords_json=['AI', 'agents', 'automation', 'marketing', 'chatbot',
+                                   'autonomous', 'multi-agent', 'LLM'],
+                    is_platform_product=True,
+                )
+                db.add(product)
+                db.flush()
+                product_id = str(product.id)
+                logger.info("Bootstrapped HART Platform product for self-marketing")
+            else:
+                product_id = str(existing.id)
+
+            # Bootstrap system agent for goal execution (idempotent)
+            sys_agent = db.query(User).filter_by(username='hevolve_system_agent').first()
+            if not sys_agent:
+                sys_agent = User(
+                    username='hevolve_system_agent',
+                    display_name='HART System Agent',
+                    user_type='agent',
+                    idle_compute_opt_in=True,
+                    is_admin=False,
+                )
+                db.add(sys_agent)
+                db.flush()
+                logger.info("Bootstrapped system agent for goal execution")
+
+            # Seed bootstrap goals (idempotent)
+            from .goal_seeding import seed_bootstrap_goals
+            count = seed_bootstrap_goals(db, platform_product_id=product_id)
+            if count > 0:
+                logger.info(f"Seeded {count} bootstrap goal(s)")
+
+            db.commit()
+            db.close()
+        except Exception as e:
+            logger.debug(f"Platform product bootstrap skipped: {e}")
+
+        # Register commercial API blueprint
+        try:
+            from .commercial_api import commercial_api_bp
+            app.register_blueprint(commercial_api_bp)
+            logger.info("Commercial API endpoints registered")
+        except Exception as e:
+            logger.debug(f"Commercial API blueprint skipped: {e}")
+
+        # Register build distribution blueprint
+        try:
+            from .build_distribution import build_distribution_bp
+            app.register_blueprint(build_distribution_bp)
+            logger.info("Build distribution endpoints registered")
+        except Exception as e:
+            logger.debug(f"Build distribution blueprint skipped: {e}")
+
+        # Register regional host blueprint
+        try:
+            from integrations.social.api_regional_host import regional_host_bp
+            app.register_blueprint(regional_host_bp)
+            logger.info("Regional host endpoints registered")
+        except Exception as e:
+            logger.debug(f"Regional host blueprint skipped: {e}")
 
         # Register AgentBaselineAdapter with benchmark registry
         try:
@@ -230,7 +239,10 @@ def init_agent_engine(app):
         except Exception as e:
             logger.debug(f"Distributed worker loop start skipped: {e}")
 
+        logger.info("Agent engine full init complete")
+
     import threading as _t_mod
     _t_mod.Thread(target=_finish_init_deferred, daemon=True,
                   name='agent-engine-finish').start()
-    logger.info("Agent engine deferred-finish thread spawned (waits for hartos-init)")
+    logger.info("Agent engine init deferred to background thread "
+                "(prevents import-lock deadlock with TTSWarmup/ToolsWarmup)")
