@@ -230,7 +230,8 @@ Three things I'd genuinely like critique on:
    rates are lower at higher tiers.  We refuse to do "Enterprise:
    Contact Sales".  Are we leaving money on the table?
 
-API: hevolve.ai/api/v1/intelligence/pricing
+Pricing page: hevolve.ai/pricing
+API endpoint (JSON): api.hevolve.ai/api/v1/intelligence/pricing
 Code: github.com/hertz-ai/HARTOS
 Local-first desktop: hevolve.ai/download
 
@@ -294,7 +295,7 @@ hi <name>,
 saw your post about building <thing> with an LLM.  if you haven't
 locked in your API yet, you might want this in your toolbox:
 
-hevolve.ai/api/v1/intelligence
+hevolve.ai/pricing
 - 100 req/day forever, no card, no expiration on the free tier
 - same intelligence runs on our open-source desktop app if you'd
   rather not depend on a hosted endpoint
@@ -305,7 +306,7 @@ docs: nunba.hevolve.ai/reference/commercial-api (3-minute read)
 code: github.com/hertz-ai/HARTOS
 
 if it's useful for <thing>, the chat endpoint is one curl away:
-  curl -X POST https://hevolve.ai/api/v1/intelligence/chat \
+  curl -X POST https://api.hevolve.ai/api/v1/intelligence/chat \
        -H "Authorization: Bearer $KEY" \
        -d '{"message": "..."}'
 
