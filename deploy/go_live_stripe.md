@@ -171,34 +171,55 @@ central_usd: 0.09}` for a $9 Starter upgrade.
 
 ## Step 6 — Wire the buyer-facing signup flow
 
-The signup → upgrade flow needs ONE of:
+The Checkout endpoint is already built and shipped — no extra code
+needed.  Two routes power the full $9-Starter purchase flow:
 
-**Option A — Stripe Checkout (recommended, lowest engineering effort):**
-Replace the existing `/upgrade` POST with a server-side Stripe
-Checkout session creator that redirects the buyer to Stripe's
-hosted page.  On success, Stripe redirects back to a success
-URL where you call our existing `/upgrade` with the Stripe
-`payment_method` from the completed session.
+```
+POST /api/v1/intelligence/keys/<key_id>/upgrade/checkout
+     body: {"target_tier": "starter"}
+     auth: Bearer JWT (the user that owns the key)
+     returns: {"checkout_url": "https://checkout.stripe.com/...",
+                "session_id": "cs_..."}
 
-**Option B — Stripe Elements in the React SPA:**
-More UX control, more code.  Defer until Option A converts enough
-revenue to justify the work.
-
-For the first $1K of revenue, Option A is enough.  Use Stripe's
-Checkout API to create a one-time payment session per tier:
-```python
-session = stripe.checkout.Session.create(
-    mode='subscription',  # or 'payment' for one-shot
-    line_items=[{'price': PRICE_ID_FOR_TIER, 'quantity': 1}],
-    success_url='https://hevolve.ai/upgrade-success?session_id={CHECKOUT_SESSION_ID}',
-    cancel_url='https://hevolve.ai/pricing',
-    customer_email=user.email,
-)
-return redirect(session.url)
+POST /api/v1/intelligence/upgrade/checkout/complete
+     body: {"session_id": "cs_..."}
+     auth: Bearer JWT (must match the session metadata.user_id)
+     returns: 200 with payment_request_id + new tier on success;
+              402 if Stripe says payment_status != 'paid'.
 ```
 
-You'll need to create Stripe Products + Prices for each tier
-($9 Starter, $49 Pro, $499 Enterprise) once via the dashboard.
+Source: `integrations/agent_engine/commercial_api.py:
+create_upgrade_checkout` and `complete_upgrade_checkout`.
+
+Buyer-side flow:
+1. User signs up at hevolve.ai/signup, gets a free API key.
+2. User opens hevolve.ai/pricing, clicks "Choose Starter".
+3. Frontend POSTs to /upgrade/checkout, receives `checkout_url`.
+4. Frontend redirects browser to `checkout_url` (Stripe-hosted).
+5. User pays on Stripe's hosted page.
+6. Stripe redirects to `success_url` (defaults to
+   `https://hevolve.ai/upgrade-success?session_id={CHECKOUT_SESSION_ID}`).
+7. Success page POSTs `{session_id}` to /upgrade/checkout/complete.
+8. Backend retrieves the Stripe session, verifies `payment_status=paid`,
+   inserts a COMPLETED PaymentRequest into the AP2 ledger (so
+   `get_api_revenue_stats` ticks up by $9), and bumps the API key's
+   tier + limits.
+
+You do NOT need to create Stripe Products + Prices in the dashboard
+ahead of time — the endpoint uses `price_data` with inline currency +
+unit_amount, so each Checkout Session is self-contained.  This avoids
+the operational tax of keeping Stripe Prices in sync with TIER_CONFIG.
+
+Idempotency: replaying the same `session_id` against
+`/upgrade/checkout/complete` returns the original payment_request_id
+with `already_completed: true`.  Safe to retry on transient network
+failures.
+
+Frontend hookup status: the React `/pricing` page in Nunba-HART-
+Companion currently routes the buyer to `/signup` for all tiers.
+Update the paid-tier buttons to call `/upgrade/checkout` and follow the
+returned URL once a buyer has signed up + has a key.  See
+`landing-page/src/pages/CommercialApiPricing.js:handleGetApiKey`.
 
 ## Step 7 — Watch the first $9 land
 

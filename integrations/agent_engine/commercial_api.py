@@ -727,6 +727,10 @@ def pricing():
             'keys_list': 'GET    /api/v1/intelligence/keys',
             'keys_revoke': 'DELETE /api/v1/intelligence/keys/<key_id>',
             'upgrade': 'POST /api/v1/intelligence/keys/<key_id>/upgrade',
+            'upgrade_checkout': 'POST /api/v1/intelligence/keys/<key_id>/upgrade/checkout',
+            'upgrade_checkout_complete': 'POST /api/v1/intelligence/upgrade/checkout/complete',
+            'upgrade_phonepe': 'POST /api/v1/intelligence/keys/<key_id>/upgrade/phonepe',
+            'phonepe_callback': 'POST /api/v1/intelligence/phonepe/callback',
         },
     })
 
@@ -1260,3 +1264,336 @@ def phonepe_callback():
             'central_usd': round(amount_usd * 0.01, 2),
         },
     }), 200
+
+
+# ═══════════════════════════════════════════════════════════════
+# Stripe Checkout flow (USD market — hosted card UI, lowest friction)
+#
+#   POST /keys/<id>/upgrade/checkout           → returns checkout_url
+#   POST /upgrade/checkout/complete            → completes upgrade post-pay
+#
+# Why a separate flow from /upgrade:
+#   /upgrade takes a Stripe PaymentMethod ID (`pm_...`) which only the
+#   client side (Stripe.js) can produce.  That requires the buyer to
+#   render Stripe Elements in our React app — meaningful eng work.
+#   Stripe Checkout is the hosted alternative: we create a Session,
+#   redirect the buyer to checkout.stripe.com, they pay, and Stripe
+#   redirects them back to a success URL we control.  Zero card UI
+#   in our stack.
+#
+# Revenue accounting: on completion the handler manually inserts a
+# COMPLETED PaymentRequest into payment_ledger so the existing
+# get_api_revenue_stats reads the $9 / $49 / $499 entry.  The Stripe
+# PaymentIntent ID is preserved in metadata for audit.
+# ═══════════════════════════════════════════════════════════════
+
+@commercial_api_bp.route('/api/v1/intelligence/keys/<key_id>/upgrade/checkout',
+                         methods=['POST'])
+def create_upgrade_checkout(key_id):
+    """Create a Stripe Checkout Session for a tier upgrade.
+
+    Body: {
+      "target_tier": "starter|pro|enterprise",
+      "success_url": "https://hevolve.ai/upgrade-success",   (optional)
+      "cancel_url":  "https://hevolve.ai/pricing"            (optional)
+    }
+
+    Returns 200 with {"checkout_url": "https://checkout.stripe.com/...",
+                       "session_id": "cs_..."} on success.
+
+    The buyer is then redirected client-side to checkout_url.  After
+    payment Stripe redirects to success_url with `?session_id=...`
+    appended; the React success page POSTs to /upgrade/checkout/complete
+    to finalize the tier bump.
+    """
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return jsonify({'success': False, 'error': 'Authorization required'}), 401
+
+    from integrations.social.auth import _get_user_from_token
+    user, db = _get_user_from_token(auth_header[7:])
+    if not user:
+        if db:
+            db.close()
+        return jsonify({'success': False, 'error': 'Invalid token'}), 401
+
+    try:
+        data = request.get_json() or {}
+        target_tier = (data.get('target_tier') or '').strip().lower()
+        if target_tier not in TIER_CONFIG:
+            return jsonify({
+                'success': False,
+                'error': f'Invalid target_tier: {target_tier!r}. Valid: {list(TIER_CONFIG.keys())}',
+            }), 400
+        if target_tier == 'free':
+            return jsonify({
+                'success': False,
+                'error': 'Cannot upgrade to free tier via Checkout.',
+            }), 400
+
+        from integrations.social.models import CommercialAPIKey
+        api_key = db.query(CommercialAPIKey).filter_by(
+            id=key_id, user_id=str(user.id)).first()
+        if not api_key:
+            return jsonify({'success': False, 'error': 'API key not found'}), 404
+
+        target_cfg = TIER_CONFIG[target_tier]
+        amount_usd = float(target_cfg['monthly_price_usd'])
+        success_url = data.get('success_url') or 'https://hevolve.ai/upgrade-success'
+        cancel_url = data.get('cancel_url') or 'https://hevolve.ai/pricing'
+
+        # success_url must contain `{CHECKOUT_SESSION_ID}` template so
+        # Stripe injects the real session_id on redirect.  Append if
+        # the caller didn't.
+        if '{CHECKOUT_SESSION_ID}' not in success_url:
+            sep = '&' if '?' in success_url else '?'
+            success_url = f"{success_url}{sep}session_id={{CHECKOUT_SESSION_ID}}"
+
+        # Locate the Stripe gateway.  Falls back to 503 if not registered
+        # — operators see a clear "STRIPE_API_KEY missing" hint rather
+        # than a generic 500.
+        try:
+            from integrations.ap2 import payment_ledger
+            from integrations.ap2.ap2_protocol import PaymentGateway
+            stripe_gw = payment_ledger.gateways.get(PaymentGateway.STRIPE)
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': f'AP2 payment surface unavailable: {e}',
+            }), 503
+        if stripe_gw is None or not getattr(stripe_gw, 'connected', False) \
+                or stripe_gw._stripe is None:
+            return jsonify({
+                'success': False,
+                'error': 'Stripe gateway not registered.  Set STRIPE_API_KEY '
+                         'on the central deploy and restart (see '
+                         'deploy/go_live_stripe.md Step 4).',
+            }), 503
+
+        try:
+            session = stripe_gw._stripe.checkout.Session.create(
+                mode='payment',
+                payment_method_types=['card'],
+                line_items=[{
+                    'price_data': {
+                        'currency': 'usd',
+                        'product_data': {
+                            'name': f"Hevolve API — {target_tier.title()} tier",
+                            'description': target_cfg['description'],
+                        },
+                        'unit_amount': int(round(amount_usd * 100)),
+                    },
+                    'quantity': 1,
+                }],
+                success_url=success_url,
+                cancel_url=cancel_url,
+                customer_email=getattr(user, 'email', None) or None,
+                # Metadata flows through to the PaymentIntent — used by
+                # /upgrade/checkout/complete to identify which key the
+                # session bought and verify the amount.
+                metadata={
+                    'api_key_id': str(key_id),
+                    'user_id': str(user.id),
+                    'current_tier': api_key.tier,
+                    'target_tier': target_tier,
+                    'kind': 'tier_upgrade_checkout',
+                },
+            )
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': f'Stripe Checkout Session creation failed: {e}',
+            }), 502
+
+        return jsonify({
+            'success': True,
+            'checkout_url': session.url,
+            'session_id': session.id,
+            'amount_usd': amount_usd,
+            'target_tier': target_tier,
+        }), 200
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+@commercial_api_bp.route('/api/v1/intelligence/upgrade/checkout/complete',
+                         methods=['POST'])
+def complete_upgrade_checkout():
+    """Finalize a tier upgrade after the buyer completed Stripe Checkout.
+
+    Body: {"session_id": "cs_..."}
+
+    Idempotent: replays with the same session_id are detected via the
+    payment_ledger metadata index and return 200 with the already-applied
+    state rather than double-charging or double-upgrading.
+
+    Auth: Bearer JWT.  The session metadata must contain `user_id`
+    matching the JWT user — prevents Alice from completing Bob's
+    checkout session.
+    """
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return jsonify({'success': False, 'error': 'Authorization required'}), 401
+
+    from integrations.social.auth import _get_user_from_token
+    user, db = _get_user_from_token(auth_header[7:])
+    if not user:
+        if db:
+            db.close()
+        return jsonify({'success': False, 'error': 'Invalid token'}), 401
+
+    try:
+        data = request.get_json() or {}
+        session_id = (data.get('session_id') or '').strip()
+        if not session_id or not session_id.startswith('cs_'):
+            return jsonify({
+                'success': False,
+                'error': 'session_id required (starts with cs_)',
+            }), 400
+
+        try:
+            from integrations.ap2 import payment_ledger
+            from integrations.ap2.ap2_protocol import (
+                PaymentGateway, PaymentMethod, PaymentRequest, PaymentStatus,
+            )
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': f'AP2 payment surface unavailable: {e}',
+            }), 503
+        stripe_gw = payment_ledger.gateways.get(PaymentGateway.STRIPE)
+        if stripe_gw is None or not getattr(stripe_gw, 'connected', False) \
+                or stripe_gw._stripe is None:
+            return jsonify({
+                'success': False,
+                'error': 'Stripe gateway not registered.',
+            }), 503
+
+        # Idempotency check: if we've already recorded this session,
+        # skip re-charging the buyer.
+        for existing in payment_ledger.payments.values():
+            if (existing.metadata or {}).get('stripe_session_id') == session_id:
+                return jsonify({
+                    'success': True,
+                    'already_completed': True,
+                    'payment_request_id': existing.payment_id,
+                    'status': existing.status.value if hasattr(existing.status, 'value') else str(existing.status),
+                }), 200
+
+        try:
+            session = stripe_gw._stripe.checkout.Session.retrieve(session_id)
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': f'Stripe session retrieve failed: {e}',
+            }), 502
+
+        if session.payment_status != 'paid':
+            return jsonify({
+                'success': False,
+                'error': f'Stripe session not paid (status={session.payment_status}).',
+                'session_id': session_id,
+            }), 402
+
+        meta = session.metadata or {}
+        if meta.get('kind') != 'tier_upgrade_checkout':
+            return jsonify({
+                'success': False,
+                'error': 'Session is not a tier upgrade.',
+            }), 400
+        if meta.get('user_id') != str(user.id):
+            return jsonify({
+                'success': False,
+                'error': 'Session belongs to a different user.',
+            }), 403
+        api_key_id = meta.get('api_key_id', '')
+        target_tier = (meta.get('target_tier') or '').lower()
+        if target_tier not in TIER_CONFIG or target_tier == 'free':
+            return jsonify({
+                'success': False,
+                'error': 'Session has invalid target_tier metadata.',
+            }), 400
+
+        from integrations.social.models import CommercialAPIKey
+        api_key = db.query(CommercialAPIKey).filter_by(
+            id=api_key_id, user_id=str(user.id)).first()
+        if not api_key:
+            return jsonify({'success': False, 'error': 'API key not found'}), 404
+
+        target_cfg = TIER_CONFIG[target_tier]
+        amount_usd = float(session.amount_total) / 100.0
+
+        # Record the revenue: insert a COMPLETED PaymentRequest into the
+        # ledger so settle_metered_api_costs + get_api_revenue_stats see it.
+        from decimal import Decimal as _Decimal
+        payment = PaymentRequest(
+            amount=_Decimal(str(amount_usd)),
+            currency=(session.currency or 'usd').upper(),
+            description=f'API tier upgrade via Checkout: {api_key.tier} → {target_tier}',
+            requester_agent_id=f'user:{user.id}',
+            payment_method=PaymentMethod.STRIPE,
+            metadata={
+                'kind': 'tier_upgrade',
+                'api_key_id': api_key_id,
+                'current_tier': api_key.tier,
+                'target_tier': target_tier,
+                'stripe_session_id': session_id,
+                'stripe_payment_intent': getattr(session, 'payment_intent', None),
+                'stripe_customer': getattr(session, 'customer', None),
+            },
+        )
+        payment.gateway = PaymentGateway.STRIPE
+        payment.update_status(PaymentStatus.AUTHORIZED, 'Stripe Checkout paid')
+        payment.gateway_transaction_id = getattr(session, 'payment_intent', None) or session_id
+        payment.update_status(PaymentStatus.COMPLETED, 'Stripe Checkout finalized')
+
+        with payment_ledger.lock:
+            payment_ledger.payments[payment.payment_id] = payment
+            payment_ledger.save_ledger()
+
+        # Apply the tier bump.
+        try:
+            api_key.tier = target_tier
+            api_key.rate_limit_per_day = target_cfg['rate_limit_per_day']
+            api_key.monthly_quota = target_cfg['monthly_quota']
+            db.commit()
+        except Exception as e:
+            logger.error(f"MANUAL RECONCILIATION NEEDED: Stripe session "
+                         f"{session_id} paid but tier bump failed for "
+                         f"api_key {api_key_id}: {e}")
+            return jsonify({
+                'success': False,
+                'error': f'Payment succeeded but tier bump failed: {e}',
+                'payment_request_id': payment.payment_id,
+                'session_id': session_id,
+            }), 500
+
+        return jsonify({
+            'success': True,
+            'payment_request_id': payment.payment_id,
+            'api_key': {
+                'id': str(api_key.id),
+                'tier': api_key.tier,
+                'rate_limit_per_day': api_key.rate_limit_per_day,
+                'monthly_quota': api_key.monthly_quota,
+            },
+            'payment': {
+                'amount_usd': amount_usd,
+                'stripe_session_id': session_id,
+                'stripe_payment_intent': getattr(session, 'payment_intent', None),
+                'status': 'completed',
+            },
+            'revenue_split': {
+                'users_pool_usd': round(amount_usd * 0.90, 2),
+                'infrastructure_usd': round(amount_usd * 0.09, 2),
+                'central_usd': round(amount_usd * 0.01, 2),
+            },
+        }), 200
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
