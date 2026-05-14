@@ -75,10 +75,63 @@ def init_agent_engine(app):
         logger.info("Agent engine disabled (HEVOLVE_AGENT_ENGINE_ENABLED=false)")
         return
 
-    # All of init_agent_engine's work — blueprint registration, product +
-    # system-agent bootstrap, goal seeding, AgentBaselineAdapter register,
-    # daemon start, distributed worker loop start — runs in a SINGLE
-    # background thread.  Nothing happens on the calling thread.
+    # Two-phase init:
+    #   Phase 1 (synchronous, here on the calling thread): register blueprints.
+    #     Their top-level imports are stdlib + Flask + SQLAlchemy + light
+    #     project modules — NO heavy chain (no autogen, no helper.py,
+    #     no marketing_tools/campaign_service).  Safe to do inline.
+    #     MUST happen synchronously because Flask refuses
+    #     register_blueprint() once it has handled its first request
+    #     (smoking gun: "The setup method 'register_blueprint' can no
+    #     longer be called on the application. It has already handled
+    #     its first request" — seen in c62a01a boot at 13:01:51).
+    #
+    #   Phase 2 (deferred thread, after hartos-init signals done):
+    #     DB bootstrap (Product + system agent + seed_bootstrap_goals),
+    #     AgentBaselineAdapter, agent_daemon.start(), worker_loop.start().
+    #     These ARE the heavy chain that caused the original deadlock
+    #     (py-spy: hartos-bootstrap, TTSWarmup, ToolsWarmup all serializing
+    #     on per-module import locks).  Deferred until hartos-init done
+    #     ⇒ no parallel-import contention.
+
+    # ── Phase 1: register blueprints synchronously ──────────────────────
+
+    # Register agent_engine API blueprint
+    try:
+        bp = get_engine_blueprint()
+        app.register_blueprint(bp)
+        logger.info("Agent engine endpoints registered")
+    except Exception as e:
+        logger.warning(f"Agent engine blueprint registration failed: {e}")
+
+    # Register commercial API blueprint — buyer-facing pricing + upgrade
+    # endpoints (/api/v1/intelligence/*).  Top-level imports are light
+    # (stdlib + flask + sqlalchemy + core.port_registry); route handlers
+    # do their AP2 imports lazily inside the function bodies.
+    try:
+        from .commercial_api import commercial_api_bp
+        app.register_blueprint(commercial_api_bp)
+        logger.info("Commercial API endpoints registered")
+    except Exception as e:
+        logger.warning(f"Commercial API blueprint skipped: {e}")
+
+    # Register build distribution blueprint
+    try:
+        from .build_distribution import build_distribution_bp
+        app.register_blueprint(build_distribution_bp)
+        logger.info("Build distribution endpoints registered")
+    except Exception as e:
+        logger.debug(f"Build distribution blueprint skipped: {e}")
+
+    # Register regional host blueprint
+    try:
+        from integrations.social.api_regional_host import regional_host_bp
+        app.register_blueprint(regional_host_bp)
+        logger.info("Regional host endpoints registered")
+    except Exception as e:
+        logger.debug(f"Regional host blueprint skipped: {e}")
+
+    # ── Phase 2: defer heavy work to background thread ──────────────────
     #
     # Why: 2026-05-14 py-spy dump of the deadlocked Nunba.exe (PID 21752)
     # showed three threads simultaneously stuck in CPython importlib:
@@ -127,16 +180,9 @@ def init_agent_engine(app):
                 break
             _t.sleep(1)
 
-        # ── Synchronous-equivalent block, now running off the boot path ──
-
-        # Register agent_engine API blueprint
-        try:
-            bp = get_engine_blueprint()
-            app.register_blueprint(bp)
-            logger.info("Agent engine endpoints registered")
-        except Exception as e:
-            logger.warning(f"Agent engine blueprint registration failed: {e}")
-            return
+        # Blueprints already registered synchronously in Phase 1.
+        # This thread does only the HEAVY work whose imports are the
+        # ones that caused the original 2026-05-14 import-lock deadlock.
 
         # Bootstrap "HART Platform" product for self-marketing (idempotent)
         product_id = None
@@ -189,30 +235,6 @@ def init_agent_engine(app):
             db.close()
         except Exception as e:
             logger.debug(f"Platform product bootstrap skipped: {e}")
-
-        # Register commercial API blueprint
-        try:
-            from .commercial_api import commercial_api_bp
-            app.register_blueprint(commercial_api_bp)
-            logger.info("Commercial API endpoints registered")
-        except Exception as e:
-            logger.debug(f"Commercial API blueprint skipped: {e}")
-
-        # Register build distribution blueprint
-        try:
-            from .build_distribution import build_distribution_bp
-            app.register_blueprint(build_distribution_bp)
-            logger.info("Build distribution endpoints registered")
-        except Exception as e:
-            logger.debug(f"Build distribution blueprint skipped: {e}")
-
-        # Register regional host blueprint
-        try:
-            from integrations.social.api_regional_host import regional_host_bp
-            app.register_blueprint(regional_host_bp)
-            logger.info("Regional host endpoints registered")
-        except Exception as e:
-            logger.debug(f"Regional host blueprint skipped: {e}")
 
         # Register AgentBaselineAdapter with benchmark registry
         try:
