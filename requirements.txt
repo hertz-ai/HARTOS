@@ -219,3 +219,11 @@ pyautogui>=0.9.54; sys_platform != "linux"
 # "Rs.200" or "12.5%" on their own).  Used by
 # integrations/channels/media/tts_text_normalizer.py
 num2words>=0.5.13
+
+# Stripe SDK — used by integrations/ap2/ap2_protocol.py:StripePaymentGateway
+# for live USD card charges on the commercial API /upgrade endpoint.
+# Lazy-imported inside the gateway's connect() so a missing install
+# falls back to MockPaymentGateway gracefully (revenue stays mocked in
+# dev; baked into the image so production rebuilds don't need a manual
+# `pip install stripe` on the central container).
+stripe>=7.0.0
