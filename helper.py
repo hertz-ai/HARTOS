@@ -2056,7 +2056,7 @@ def create_visual_agent(user_id,prompt_id):
     context_handling = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            transforms.MessageTokenLimiter(max_tokens=3500, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(),
         ]
     )
@@ -2065,6 +2065,10 @@ def create_visual_agent(user_id,prompt_id):
     context_handling.add_to_agent(executor2)
     context_handling.add_to_agent(multi_role_agent2)
     context_handling.add_to_agent(verify2)
+    # See chat_instructor rationale at create_recipe.py:903 — visual_agent
+    # path uses chat_instructor2 (UserProxyAgent line 2047) the same way;
+    # it needs the same buffer cap to avoid llama.cpp n_ctx overflow.
+    context_handling.add_to_agent(chat_instructor2)
 
     return visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2
 

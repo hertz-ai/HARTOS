@@ -1728,7 +1728,19 @@ def _init_learning_pipeline():
         else:
             import uuid
             instance_id = f"hevolve_{uuid.uuid4().hex[:8]}"
-            _hive_mind = HiveMind(max_agents=100)
+            # HiveMind signature changed: the old `max_agents=100` kwarg
+            # is no longer accepted (live evidence frozen_debug.log 7×
+            # 2026-05-13/14: `TypeError: __init__() got an unexpected
+            # keyword argument 'max_agents'`).  Today's HiveMind is a
+            # latent-space collaboration substrate (Procrustes-aligned)
+            # whose __init__ takes (common_dim=256, num_shards=4,
+            # fusion_method="attention", device="cpu") — no agent cap
+            # because cardinality is bounded by register_agent calls,
+            # not a constructor arg.  Verified against
+            # hevolveai/src/.../learning/hive_mind.py:583-589.  Defaults
+            # are sane for the desktop tier; device stays 'cpu' so we
+            # don't fight TTS for VRAM.  Drop the kwarg.
+            _hive_mind = HiveMind()
             _hive_mind.register_agent(
                 agent_id=instance_id,
                 agent_type='hevolve_orchestrator',

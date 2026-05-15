@@ -75,6 +75,22 @@ COMPONENT_TYPES = {
                                'transcript_lines', 'decisions',
                                'action_items', 'participants',
                                'agent_role']},
+    # ── Device pairing QR (used by hart_intelligence_entry) ──
+    # WAS missing from allowlist while the emit site + web QRPairOverlay
+    # renderer both existed — emits were silently rejected here.  Added
+    # 2026-05-14 after probe_liquid_ui_audit found the gap.
+    'qr_pair': {'props': ['url', 'caption', 'expires_in_seconds',
+                          'session_id']},
+    # ── OAuth deep-link prompt ──
+    # hart_intelligence_entry emits when a tool needs an OAuth handshake
+    # (e.g. Reddit/Discord/Google sign-in).  Frontend renders as a
+    # notification with a single navigate-to-external-URL action.
+    'oauth_link': {'props': ['title', 'provider', 'authorize_url',
+                             'description', 'scopes']},
+    # ── Transient toast (channels/agent_tools success/error feedback) ──
+    # Lightweight notification with short auto-dismiss; web maps to the
+    # same NotificationCard renderer with `severity` driving the colour.
+    'toast': {'props': ['title', 'message', 'severity']},
 }
 
 # ═══════════════════════════════════════════════════════════════

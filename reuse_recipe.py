@@ -173,6 +173,31 @@ def publish_async(topic, message, timeout=2.0):
 
 scheduler = BackgroundScheduler()
 scheduler.start()
+
+# Register an atexit shutdown so the scheduler stops queuing jobs BEFORE
+# the ThreadPoolExecutor it submits to gets torn down by the interpreter's
+# normal teardown chain.  Without this, every shutdown produced 800+
+# "RuntimeError: cannot schedule new futures after shutdown" tracebacks
+# (langchain.log live evidence 2026-05-15: 863 occurrences of
+# `call_visual_task` failing this way at the 2s interval).
+#
+# Why atexit (not runtime_manager): the scheduler is created at MODULE
+# IMPORT time before any runtime_manager exists, by both Nunba and the
+# cloud HARTOS service.  atexit is the only hook guaranteed to fire
+# before ThreadPoolExecutor.shutdown across every deployment topology.
+#
+# wait=False: do NOT block interpreter exit on in-flight visual tasks;
+# letting them die mid-flight is fine because the next launch will
+# re-create them from the recipe config.
+import atexit as _atexit
+def _shutdown_reuse_scheduler():
+    try:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+    except Exception:
+        # Late-teardown: logging may already be torn down; swallow.
+        pass
+_atexit.register(_shutdown_reuse_scheduler)
 # logging_session_id = runtime_logging.start(config={"dbname": "logs.db"})
 # Store user-specific agents & their chat history
 # Performance: TTL caches replace unbounded global dicts (auto-expire after 2 hours)
@@ -461,6 +486,15 @@ def execute_python_file(task_description: str, user_id: int, prompt_id: int, act
 
 
 def call_visual_task(task_description: str, user_id: int, prompt_id: int):
+    # NOTE on logging: this function runs inside the APScheduler
+    # BackgroundScheduler thread (created at line 174), which has NO Flask
+    # application context.  Using `current_app.logger` from this thread
+    # raises `RuntimeError: Working outside of application context.`
+    # (Werkzeug's LocalProxy resolution).  Live evidence 2026-05-15: the
+    # outer except below caught a backend connectivity failure, then the
+    # logger call itself re-raised the LocalProxy error.  Use the
+    # module-level `logger` (logging.getLogger(__name__)) — it works in
+    # any thread regardless of Flask context.
     headers = {'Content-Type': 'application/json'}
     url = f'http://localhost:{_get_llm_port("backend")}/visual_agent'
 
@@ -488,19 +522,19 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
 
                         # Check if within last 5 minutes
                         time_diff = now_utc - created_date
-                        current_app.logger.info(
+                        logger.info(
                             f"Found video Reasoning entry: {obj['action']} (created {time_diff} ago)")
                         if time_diff <= timedelta(minutes=5):
                             recent_video_reasoning_entries.append(obj)
-                            current_app.logger.info(
+                            logger.info(
                                 f"Found recent Video Reasoning entry: {obj['action']} (created {time_diff} ago)")
                     except (ValueError, KeyError) as e:
-                        current_app.logger.warning(f"Error parsing date for entry {obj.get('action_id')}: {e}")
+                        logger.warning(f"Error parsing date for entry {obj.get('action_id')}: {e}")
                         continue
 
             # Execute visual task if at least one recent Video Reasoning entry is found
             if recent_video_reasoning_entries:
-                current_app.logger.info(
+                logger.info(
                     f"Found {len(recent_video_reasoning_entries)} recent Video Reasoning entries (within last 5 minutes) - executing visual task")
 
                 data_to_send = json.dumps({
@@ -513,22 +547,22 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
                 try:
                     # Send the POST request to the visual agent
                     res = pooled_post(url, data=data_to_send, headers=headers)
-                    current_app.logger.info(f"Visual agent response: {res.status_code}")
+                    logger.info(f"Visual agent response: {res.status_code}")
                     return 'done'
                 except Exception as e:
-                    current_app.logger.error(f"Failed to call visual agent: {e}")
+                    logger.error(f"Failed to call visual agent: {e}")
                     return 'error'
             else:
-                current_app.logger.info(
+                logger.info(
                     "No recent Video Reasoning entries found (within last 5 minutes) - skipping visual task")
                 return None
 
         else:
-            current_app.logger.error(f"Failed to get user actions: {response.status_code}")
+            logger.error(f"Failed to get user actions: {response.status_code}")
             return 'error'
 
     except Exception as e:
-        current_app.logger.error(f"Error getting user action details: {e}")
+        logger.error(f"Error getting user action details: {e}")
         return 'error'
 
 
@@ -1208,7 +1242,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     context_handling = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50, keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            transforms.MessageTokenLimiter(max_tokens=3500, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -1217,6 +1251,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     context_handling.add_to_agent(helper)
     context_handling.add_to_agent(executor)
     context_handling.add_to_agent(verify)
+    # chat_instructor (UserProxyAgent line 1233) was previously NOT
+    # attached.  Same context-overflow root cause as create_recipe.py:903 —
+    # initiate_chat with clear_history=False kept growing chat_instructor's
+    # message buffer until llama.cpp's n_ctx ceiling fired 500.  Capped
+    # here.
+    context_handling.add_to_agent(chat_instructor)
 
     # #510: send_message_to_roles — multi-persona broadcast.  Canonical impl
     # lives in core.persona_registry (single source of truth for the persona
@@ -2236,7 +2276,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     context_handling = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50, keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            transforms.MessageTokenLimiter(max_tokens=3500, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -2245,6 +2285,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     context_handling.add_to_agent(executor1)
     context_handling.add_to_agent(multi_role_agent1)
     context_handling.add_to_agent(verify1)
+    # See chat_instructor rationale at the recipe context_handling block
+    # (line ~1255).  chat_instructor1 carries the same unbounded-buffer
+    # risk in the time-based path.
+    context_handling.add_to_agent(chat_instructor1)
 
     # --- Core tools for time_agent (defined once in core/agent_tools.py) ---
     from core.agent_tools import build_core_tool_closures, register_core_tools, register_dual
@@ -2849,7 +2893,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50, keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            transforms.MessageTokenLimiter(max_tokens=3500, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )

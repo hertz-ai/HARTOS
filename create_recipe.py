@@ -339,6 +339,20 @@ from core.cache_loaders import load_agent_data, load_user_ledger, load_user_simp
 scheduler = BackgroundScheduler()
 scheduler.start()
 
+# atexit shutdown — see reuse_recipe.py:174 for full rationale.  Both
+# modules independently instantiate a BackgroundScheduler at import time
+# and both share the same "RuntimeError: cannot schedule new futures
+# after shutdown" failure mode on interpreter teardown if the scheduler
+# thread is allowed to outlive the default ThreadPoolExecutor.
+import atexit as _atexit
+def _shutdown_create_scheduler():
+    try:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+_atexit.register(_shutdown_create_scheduler)
+
 user_agents: Dict[str, Tuple[Any, Any, Any, Any, Any, Any, Any]] = TTLCache(ttl_seconds=7200, max_size=500, name='create_user_agents')
 time_agents = TTLCache(ttl_seconds=7200, max_size=500, name='create_time_agents')
 # Mode-aware config_list: cloud/regional use external LLM, flat uses local
@@ -874,7 +888,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     context_handling = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            transforms.MessageTokenLimiter(max_tokens=3500, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -883,6 +897,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     context_handling.add_to_agent(helper)
     context_handling.add_to_agent(executor)
     context_handling.add_to_agent(verify)
+    # chat_instructor (UserProxyAgent line 871) was previously NOT attached
+    # to the transform.  Result: chat_instructor.initiate_chat(manager,
+    # clear_history=False) accumulated message history unboundedly across
+    # recipe-request retries within the same turn → llama.cpp 500
+    # "Context size has been exceeded" (32 firings/session per langchain.log
+    # 2026-05-14).  Attaching here caps chat_instructor's buffer at the
+    # same 3500-token / 50-message budget as the other agents.
+    context_handling.add_to_agent(chat_instructor)
 
     agents_object['assistant'] = assistant
     agents_object['helper'] = helper
@@ -2521,7 +2543,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            transforms.MessageTokenLimiter(max_tokens=3500, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -3100,7 +3122,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     context_handling = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            transforms.MessageTokenLimiter(max_tokens=3500, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -3109,6 +3131,10 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     context_handling.add_to_agent(executor1)
     context_handling.add_to_agent(multi_role_agent1)
     context_handling.add_to_agent(verify1)
+    # See chat_instructor rationale at the recipe-create context_handling
+    # block (line ~903).  Same unbounded-buffer risk applies in the
+    # time-based-execution path; chat_instructor1 needs the same cap.
+    context_handling.add_to_agent(chat_instructor1)
 
     time_agent_object = {}
     time_agent_object['time_agent'] = time_agent
@@ -3205,7 +3231,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            transforms.MessageTokenLimiter(max_tokens=3500, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )

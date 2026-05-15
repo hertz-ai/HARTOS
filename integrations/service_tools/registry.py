@@ -9,6 +9,7 @@ Design:
 - Uses core.http_pool for connection pooling (same as MCP)
 """
 
+import inspect
 import json
 import logging
 import os
@@ -17,6 +18,95 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional, Callable
 
 logger = logging.getLogger(__name__)
+
+
+# ── JSON-Schema → Python type map for autogen tool-schema synthesis ──
+# When an endpoint's params_schema specifies a JSON-Schema 'type', map it
+# to a real Python type so inspect.Signature.replace() can attach typed
+# parameters to endpoint_executor.  Autogen reads inspect.signature() to
+# generate the JSON tool schema given to the LLM — typed params produce
+# rich `{"properties": {"url": {"type": "string", ...}}, "required": [...]}`
+# instead of the empty `{}` that `**kwargs: Any` produces.  Unknown types
+# fall back to Any (graceful degradation — same behavior as today's
+# `**kwargs: Any` for that one param, never worse).
+_JSON_SCHEMA_TO_PY_TYPE: Dict[str, Any] = {
+    'string': str, 'str': str,
+    'integer': int, 'int': int,
+    'number': float, 'float': float,
+    'boolean': bool, 'bool': bool,
+    'object': dict, 'dict': dict,
+    'array': list, 'list': list,
+}
+
+
+def _synthesize_signature_from_schema(
+    schema: Any,
+    func_name: str = '<tool>',
+) -> Optional[inspect.Signature]:
+    """Build inspect.Signature from a JSON-Schema-style params dict.
+
+    Accepts either canonical JSON-Schema:
+        {'properties': {'url': {'type': 'string', ...}}, 'required': ['url']}
+    OR the flat params_schema style used by the registry's create_tool_info:
+        {'url': {'type': 'string', 'description': '...'}}
+
+    Returns None on ANY error so the caller falls back to `**kwargs: Any`
+    — strictly additive (Option A in 2026-05-15 design discussion):
+    successful synthesis is a win, failure is a no-op vs current state.
+    """
+    try:
+        if not isinstance(schema, dict) or not schema:
+            return None
+
+        # Normalize to (properties, required_set)
+        if 'properties' in schema and isinstance(schema['properties'], dict):
+            properties = schema['properties']
+            required = set(schema.get('required') or [])
+        else:
+            # Flat dict — treat each top-level key as a property.  No
+            # 'required' info available, so mark all optional (default=None)
+            # to match today's liberal **kwargs behavior — the LLM can omit
+            # them and the endpoint still runs.
+            properties = schema
+            required = set()
+
+        if not isinstance(properties, dict) or not properties:
+            return None
+
+        params = []
+        for prop_name, prop_spec in properties.items():
+            if not isinstance(prop_name, str) or not prop_name.isidentifier():
+                # Skip names that can't be valid Python parameters
+                # (autogen would also reject them).
+                continue
+            if isinstance(prop_spec, dict):
+                json_type = (prop_spec.get('type') or '').lower()
+                py_type = _JSON_SCHEMA_TO_PY_TYPE.get(json_type, Any)
+            else:
+                py_type = Any
+            if prop_name in required:
+                params.append(inspect.Parameter(
+                    prop_name,
+                    kind=inspect.Parameter.KEYWORD_ONLY,
+                    annotation=py_type,
+                ))
+            else:
+                params.append(inspect.Parameter(
+                    prop_name,
+                    kind=inspect.Parameter.KEYWORD_ONLY,
+                    default=None,
+                    annotation=Optional[py_type],
+                ))
+
+        if not params:
+            return None
+        return inspect.Signature(parameters=params, return_annotation=str)
+    except Exception as _sig_err:
+        logger.debug(
+            f"[tool-schema] could not synthesize signature for {func_name!r}: "
+            f"{type(_sig_err).__name__}: {_sig_err} — falling back to "
+            "**kwargs: Any (no regression vs prior state)")
+        return None
 
 try:
     from core.labeled_tool import labeled_tool
@@ -205,8 +295,20 @@ class ServiceToolRegistry:
         # If endpoint has a native handler, use it directly (no HTTP)
         native_handler = endpoint.get("native_handler")
 
-        def endpoint_executor(**kwargs) -> str:
-            """Execute the service tool endpoint."""
+        def endpoint_executor(**kwargs: Any) -> str:
+            """Execute the service tool endpoint.
+
+            NOTE: `**kwargs: Any` annotation is REQUIRED.  Autogen's
+            `register_for_llm` strict-mode rejects unannotated non-default
+            parameters with `TypeError: All parameters of the function
+            'crawl4ai_crawl' without default values must be annotated`.
+            Live evidence langchain.log 2026-05-13/14: 180×/session warnings
+            from create_recipe.py:1670 because the unannotated `**kwargs`
+            broke every service-tool registration after crawl4ai (Crawl4AI,
+            AceStep, omniparser, plus anything in service_tools.json all
+            silently dropped — confirmed real capability loss per the
+            source comment at create_recipe.py:1651-1652).
+            """
             try:
                 if native_handler is not None:
                     return native_handler(json.dumps(kwargs))
@@ -235,6 +337,38 @@ class ServiceToolRegistry:
         func_name = f"{tool_name}_{endpoint_name}"
         endpoint_executor.__name__ = func_name
         endpoint_executor.__doc__ = description
+
+        # ── Attach typed __signature__ derived from endpoint params_schema ──
+        # Autogen's register_for_llm reads inspect.signature(func) to build
+        # the JSON tool schema sent to the LLM.  By default our closure
+        # exposes `(**kwargs: Any)` (added in #541 to satisfy autogen's
+        # "all params must be annotated" rule) → JSON schema = empty
+        # properties → LLM has to guess param names from the docstring.
+        #
+        # When params_schema is present (e.g. crawl4ai_tool.py:54-56:
+        # {'url': {'type': 'string', 'description': 'URL to crawl'}}),
+        # _synthesize_signature_from_schema() builds a real Signature with
+        # named, typed parameters.  Autogen then emits a proper
+        # `{"properties": {"url": {"type": "string"}}, "required": [...]}`
+        # schema, the LLM picks correct param names, and llama.cpp's
+        # tool-call grammar can constrain output (companion structural
+        # fix for HIGH #5).
+        #
+        # Strictly additive: any failure path inside the helper returns
+        # None → the closure stays on `**kwargs: Any` (identical to
+        # today's behavior — no regression possible).
+        params_schema = endpoint.get("params_schema") if endpoint else None
+        if params_schema:
+            new_sig = _synthesize_signature_from_schema(
+                params_schema, func_name=func_name)
+            if new_sig is not None:
+                try:
+                    endpoint_executor.__signature__ = new_sig
+                except Exception as _attach_err:
+                    logger.debug(
+                        f"[tool-schema] could not attach __signature__ "
+                        f"to {func_name!r}: {type(_attach_err).__name__}: "
+                        f"{_attach_err} — keeping **kwargs: Any fallback")
 
         return endpoint_executor
 
