@@ -358,17 +358,29 @@ class TestVisionServiceTemporalMethods:
         assert hasattr(VisionService, '_emit_perception_event')
         assert callable(VisionService._emit_perception_event)
 
-    @pytest.mark.skip(reason="MemoryGraph.add path changed — needs new mock target")
     @patch('integrations.vision.vision_service.VisionService.__init__', return_value=None)
     def test_save_to_memory_graph_calls_graph(self, mock_init):
-        """Should call MemoryGraph.add with visual context metadata."""
-        from integrations.vision.vision_service import VisionService
+        """Should call MemoryGraph.add with visual context metadata.
 
+        The import site inside _save_to_memory_graph is
+        `from hart_intelligence import _get_or_create_graph` — the
+        thin re-export shim, NOT hart_intelligence_entry directly.
+        Patch the re-export so we don't pull in the 8 k-line entrypoint
+        module at test time."""
+        import sys
+        import types
+
+        from integrations.vision.vision_service import VisionService
         vs = VisionService.__new__(VisionService)
 
         mock_graph = MagicMock()
-        with patch('hart_intelligence_entry._get_or_create_graph', return_value=mock_graph):
-            vs._save_to_memory_graph('user_1', 'person sitting at desk', 'camera')
+        fake_hart_intelligence = types.SimpleNamespace(
+            _get_or_create_graph=lambda user_id, prompt_id=None: mock_graph,
+        )
+        with patch.dict(sys.modules,
+                        {'hart_intelligence': fake_hart_intelligence}):
+            vs._save_to_memory_graph('user_1', 'person sitting at desk',
+                                     'camera')
 
         mock_graph.add.assert_called_once()
         call_kwargs = mock_graph.add.call_args
@@ -453,21 +465,38 @@ class TestEventBusBootstrap:
     """Verify bootstrap_platform is called in Nunba main.py."""
 
     def test_main_py_bootstraps_eventbus(self):
-        """main.py source should call bootstrap_platform."""
-        main_path = os.path.join(
-            os.path.dirname(__file__), '..', '..', '..', 'Nunba', 'main.py'
-        )
-        if not os.path.isfile(main_path):
-            # Try absolute path
-            main_path = r'C:\Users\sathi\PycharmProjects\Nunba\main.py'
+        """main.py source should call bootstrap_platform.
 
-        if os.path.isfile(main_path):
-            with open(main_path) as f:
-                src = f.read()
-            assert 'bootstrap_platform' in src
-            assert 'from core.platform.bootstrap' in src
-        else:
-            pytest.skip('Nunba main.py not found at expected path')
+        Nunba lives in a sibling repo (renamed to
+        Nunba-HART-Companion on 2026-03-xx). Try both the old and
+        new repo names, relative first then absolute.  CI runners
+        don't have the sibling checked out, so the skip is
+        expected there — this test only exercises locally."""
+        candidates = []
+        here = os.path.dirname(__file__)
+        for sibling_name in ('Nunba-HART-Companion', 'Nunba'):
+            candidates.append(
+                os.path.join(here, '..', '..', '..', sibling_name, 'main.py')
+            )
+            candidates.append(
+                os.path.join(
+                    r'C:\Users\sathi\PycharmProjects', sibling_name, 'main.py'
+                )
+            )
+
+        main_path = next(
+            (p for p in candidates if os.path.isfile(p)), None
+        )
+        if main_path is None:
+            pytest.skip(
+                'Nunba main.py not found at any expected path — '
+                'sibling repo not checked out alongside HARTOS'
+            )
+
+        with open(main_path, encoding='utf-8') as f:
+            src = f.read()
+        assert 'bootstrap_platform' in src
+        assert 'from core.platform.bootstrap' in src
 
 
 # ══════════════════════════════════════════════════════════════════

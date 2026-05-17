@@ -48,9 +48,17 @@ from autogen.agentchat.contrib.capabilities import transform_messages, transform
 from autogen.cache.in_memory_cache import InMemoryCache
 from json_repair import repair_json
 def publish_async(topic, message, timeout=2.0):
-    """Delegate to the canonical publish_async in hart_intelligence."""
-    from hart_intelligence import publish_async as _publish
-    _publish(topic, message, timeout)
+    """Delegate to the canonical publish_async in hart_intelligence.
+
+    Workers must not eager-import hart_intelligence (deadlocks against
+    the canonical loader's import lock); resolve via the singleton
+    accessor instead.  No-op if HARTOS hasn't finished loading yet —
+    same fall-through the original ImportError branch had.
+    """
+    from core.safe_hartos_attr import safe_hartos_attr
+    _publish = safe_hartos_attr('publish_async')
+    if _publish is not None:
+        _publish(topic, message, timeout)
 
 
 def _push_thinking(user_id, text):
@@ -91,23 +99,14 @@ def publish_agent_thought(last_speaker, messages, user_id):
         if ('Message already sent successfully to user with request_id' in content
                 or 'Message sent successfully to user with request_id' in content):
             return
-        crossbar_message = {
-            "text": [f'{content}'], "priority": 49,
-            "action": 'Thinking', "historical_request_id": [],
-            "preffered_language": 'en-US',
-            "options": [], "newoptions": [], "bot_type": 'Agent',
-            "page_image_url": "", "analogy_image_url": '',
-            "request_id": "123456",
-            "zoom_bounding_box": {
-                'top_left': {'x': 0, 'y': 0},
-                'top_right': {'x': 0, 'y': 0},
-                'bottom_right': {'x': 0, 'y': 0},
-                'bottom_left': {'x': 0, 'y': 0},
-            },
-        }
-        publish_async(
-            f"com.hertzai.hevolve.chat.{user_id}",
-            json.dumps(crossbar_message),
+        # request_id="123456" placeholder preserved on the wire — see
+        # crossbar_publish docstring; fixing propagation is tracked
+        # separately so this commit stays a pure refactor.
+        from core.peer_link.crossbar_publish import publish_thinking_trace
+        publish_thinking_trace(
+            text=content, user_id=user_id,
+            request_id="123456", bot_type='Agent',
+            full_schema=True,
         )
     except Exception as e:
         try:
@@ -1754,7 +1753,12 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             register_journey_tools(helper, assistant, user_id)
             tool_logger.info("Sales journey tools loaded (Tier 2) based on prompt content")
     except Exception as e:
-        tool_logger.debug(f"Goal-aware tool loading skipped: {e}")
+        # Promoted from debug to warning: a failure here means the agent
+        # boots without its goal-specific tools, so it can talk about the
+        # task but not actually do it (LLM emits prose, no tool calls,
+        # goal "completes" with zero side-effects).  Silent for ~6 weeks
+        # before being caught.  Loud now so any future regression surfaces.
+        tool_logger.warning(f"Goal-aware tool loading FAILED: {e}")
 
     assistant.description = 'this is an assistant agent that coordinates & executes requested tasks & actions'
     executor.description = 'this is an executor agent that Specialized agent for code execution & response handling'
@@ -4247,15 +4251,17 @@ def set_fallback_flags_and_request_recipe(chat_instructor, current_action_id, ma
 
 
 def publish_to_crossbar_new_action_start(message, user_id):
-    crossbar_message = {"text": [
-        "Working on " + message + ".\n please evaluate the response i am giving to check if it meets the current action"],
-                        "priority": 49, "action": 'Thinking', "historical_request_id": [],
-                        "preffered_language": 'en-US', "options": [], "newoptions": [], "bot_type": 'Agent',
-                        "page_image_url": "", "analogy_image_url": '', "request_id": "123456", "zoom_bounding_box": {
-            'top_left': {'x': 0, 'y': 0}, 'top_right': {'x': 0, 'y': 0}, 'bottom_right': {'x': 0, 'y': 0},
-            'bottom_left': {'x': 0, 'y': 0}}}
-    publish_async(
-        f"com.hertzai.hevolve.chat.{user_id}", json.dumps(crossbar_message))
+    text = (
+        "Working on " + message
+        + ".\n please evaluate the response i am giving to check if it meets the current action")
+    # request_id="123456" placeholder preserved on the wire — see
+    # crossbar_publish docstring.
+    from core.peer_link.crossbar_publish import publish_thinking_trace
+    publish_thinking_trace(
+        text=text, user_id=user_id,
+        request_id="123456", bot_type='Agent',
+        full_schema=True,
+    )
 
 
 # Use lifecycle-aware increment:
@@ -4814,13 +4820,33 @@ def update_agent_creation_to_db(prompt_id):
     url = f'{database_url}/update_agent_prompt?prompt_id={prompt_id}'
     headers = {'Content-Type': 'application/json'}
     res = pooled_patch(url, headers=headers)
+    # Push the full recipe bundle to cloud after creation completes.
+    # This is the WRITE half of the cross-device sync introduced in
+    # core/recipe_sync.py - without it the agent is local-only and
+    # the user hits the silent-fallback bug when switching devices.
+    # Best-effort: never raises, never blocks the user.
+    try:
+        from core.recipe_sync import push_recipe
+        # user_id not in scope here; recipe_sync accepts '' as
+        # creator-unknown.  The {prompt_id}.json file itself carries
+        # creator_user_id so the cloud side can still attribute.
+        push_recipe(PROMPTS_DIR, prompt_id, user_id='')
+    except Exception as _push_err:
+        current_app.logger.debug(
+            f'recipe_sync push for prompt_id={prompt_id} failed: {_push_err}')
 
 
 def create_final_recipe_for_current_flow(flow, merged_dict, prompt_id):
     name = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_recipe.json')
-    with open(name, "w") as json_file:
+    # Atomic write (M3 in post-shipment review): write to temp + rename
+    # so concurrent prompts_backup.snapshot_prompts can never capture
+    # a half-written recipe file.  os.replace is atomic on the same
+    # filesystem on both Windows and POSIX.
+    tmp = name + '.tmp'
+    with open(tmp, "w") as json_file:
         json.dump(merged_dict, json_file)
-        current_app.logger.info(f"create_final_recipe_for_current_flow Dictionary saved to {name}")
+    os.replace(tmp, name)
+    current_app.logger.info(f"create_final_recipe_for_current_flow Dictionary saved to {name}")
 
 
 

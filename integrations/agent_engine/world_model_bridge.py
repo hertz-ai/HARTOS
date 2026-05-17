@@ -23,6 +23,7 @@ import atexit
 import json
 import logging
 import os
+import sys
 import time
 import threading
 from collections import deque
@@ -295,19 +296,43 @@ class WorldModelBridge:
         except Exception as e:
             logger.debug(f"[WorldModelBridge] Integrity check skipped: {e}")
 
-        try:
-            from hart_intelligence import get_learning_provider, get_hive_mind
-            provider = get_learning_provider()
-            hive = get_hive_mind()
-            if provider is not None:
-                self._provider = provider
-                self._hive_mind = hive
-                self._in_process = True
-                logger.info(
-                    "[WorldModelBridge] In-process mode: direct Python calls")
-                return
-        except ImportError:
-            pass
+        # Worker threads MUST NOT trigger a `from hart_intelligence import …`
+        # here.  The hart_intelligence import chain (langchain, transformers,
+        # autogen, multimodal stacks) can take 300+ seconds on first load,
+        # and Python's per-module import lock is held for the entire
+        # duration.  When the watchdog declares the worker FROZEN at 300s
+        # and "restarts" it, the original thread can't be killed (Python
+        # has no thread.kill); it stays alive holding the lock.  The new
+        # thread runs the same `from hart_intelligence import …` and blocks
+        # on the same lock.  After ~10 cycles you have 10 zombie daemon
+        # threads, zero goals dispatched, zero spark spent — exactly the
+        # 2026-04-29 dashboard incident (daemon restart_count=9).
+        #
+        # Only consult `sys.modules` to see whether hart_intelligence was
+        # already imported on the main thread (via the bootstrap pre-warm
+        # path that owns the heavyweight import).  If yes — use the
+        # resolved module's accessors directly, no import lock taken.
+        # If no — fall through to HTTP mode without forcing a worker-thread
+        # import; the bootstrap path will retry the in-process upgrade on
+        # the next record_interaction once it finishes the pre-warm.
+        mod = sys.modules.get('hart_intelligence')
+        if mod is not None:
+            try:
+                _get_provider = getattr(mod, 'get_learning_provider', None)
+                _get_hive = getattr(mod, 'get_hive_mind', None)
+                if _get_provider is not None:
+                    provider = _get_provider()
+                    hive = _get_hive() if _get_hive is not None else None
+                    if provider is not None:
+                        self._provider = provider
+                        self._hive_mind = hive
+                        self._in_process = True
+                        logger.info(
+                            "[WorldModelBridge] In-process mode: direct Python calls")
+                        return
+            except Exception as e:
+                logger.debug(
+                    f"[WorldModelBridge] in-process probe failed: {e}")
         logger.info(
             f"[WorldModelBridge] HTTP mode: {self._api_url}")
 
@@ -316,7 +341,8 @@ class WorldModelBridge:
     def record_interaction(self, user_id: str, prompt_id: str,
                            prompt: str, response: str,
                            model_id: str = None, latency_ms: float = 0,
-                           node_id: str = None, goal_id: str = None):
+                           node_id: str = None, goal_id: str = None,
+                           attribution_chain: dict = None):
         """Record every agent interaction as training data for HevolveAI.
 
         Called after EVERY /chat response.  Batches experiences and flushes
@@ -351,6 +377,15 @@ class WorldModelBridge:
             'timestamp': time.time(),
             'source': 'langchain_orchestration',
         }
+        # Structured attribution chain — preferred carrier for
+        # agent_attribution's step/observation/credit/parent_action_id
+        # payload.  Previously it was packed into the 'prompt' field
+        # as stringified JSON, which confused HevolveAI's prompt-text
+        # distillation path.  Leave the legacy path intact for callers
+        # that haven't migrated — they pass nothing, and HevolveAI
+        # receives only the primary experience fields.
+        if attribution_chain is not None:
+            experience['attribution_chain'] = attribution_chain
 
         # PRIVACY: Redact secrets + anonymize user before shared ingestion.
         # The hive must NEVER leak secrets from one user to another.

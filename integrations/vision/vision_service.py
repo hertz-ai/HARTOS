@@ -127,44 +127,34 @@ class VisionService:
             logger.info(f"Vision backend: {self._vision_backend.name} "
                         f"(RAM: {self._vision_backend.ram_mb}MB)")
         else:
-            # Full mode — MiniCPM sidecar
-            if not self._installer.is_installed():
-                if self._installer.detect_gpu():
-                    logger.info("MiniCPM not installed — downloading...")
-                    self._installer.install()
-                else:
-                    # Fall back to lightweight backend
-                    logger.info("No GPU — trying lightweight vision backend")
-                    self._vision_backend = get_vision_backend()
-                    if self._vision_backend.name != 'none':
-                        self._vision_backend.start()
-                        logger.info(f"Fell back to {self._vision_backend.name} backend")
-                    else:
-                        logger.warning("No vision backend available")
-                        self._vision_backend = None
-                        self._running = False
-                        return
-
-            if self._vision_backend is None:
-                # T8: ONE auto-start captioning path — get_vision_backend()
-                # which prefers the 0.8B Qwen already on :8081 (pinned,
-                # eager-booted, dual-purpose: draft classifier + captioner).
-                #
-                # MiniCPM sidecar (_start_minicpm) is NOT auto-started.
-                # It was a parallel captioning path that consumed 4GB VRAM
-                # and never booted healthy on 8GB cards (120s timeout every
-                # launch). The sidecar code stays for users who explicitly
-                # load MiniCPM via the admin model management page on
-                # COMPUTE_HOST machines with 12+ GB VRAM — but the default
-                # auto-start path is always get_vision_backend().
-                self._vision_backend = get_vision_backend()
-                if self._vision_backend.name != 'none':
-                    if hasattr(self._vision_backend, 'start'):
-                        self._vision_backend.start()
-                    logger.info(
-                        f"Vision: using {self._vision_backend.name} backend")
-                else:
-                    logger.warning("No vision backend available")
+            # T8 / vision-unification: ONE auto-start path = get_vision_backend().
+            # Earlier code branched into MiniCPMInstaller.install() here,
+            # which contradicted the comment below ("MiniCPM sidecar is NOT
+            # auto-started") and resulted in a parallel 4GB VRAM sidecar
+            # silently winning the fallback chain over the lightweight
+            # Qwen 0.8B path even on 8GB cards (witnessed 2026-04-22 in
+            # gui_app.log: "Vision: using minicpm backend" while catalog
+            # had selected vlm-qwen08b).
+            #
+            # Removed the `_installer.install()` branch entirely.  Users on
+            # 12+ GB COMPUTE_HOST machines who want MiniCPM still get it via
+            # the admin "Models" page (explicit load + lifecycle pinning);
+            # the auto-start path is now exclusively get_vision_backend(),
+            # which prefers Qwen 0.8B (the pinned dual-purpose draft +
+            # captioner already running on port 8081).
+            self._vision_backend = get_vision_backend()
+            if self._vision_backend.name != 'none':
+                if hasattr(self._vision_backend, 'start'):
+                    self._vision_backend.start()
+                logger.info(
+                    f"Vision: using {self._vision_backend.name} backend "
+                    f"(requires_gpu={self._vision_backend.requires_gpu}, "
+                    f"ram_mb={self._vision_backend.ram_mb})")
+            else:
+                logger.warning("No vision backend available — headless mode")
+                self._vision_backend = None
+                self._running = False
+                return
 
         self._ws_thread = threading.Thread(
             target=self._run_ws_server, daemon=True, name='vision-ws',
@@ -176,14 +166,27 @@ class VisionService:
         )
         self._desc_thread.start()
 
-        backend_name = self._vision_backend.name if self._vision_backend else 'minicpm'
+        backend_name = self._vision_backend.name if self._vision_backend else 'none'
         logger.info(f"VisionService started (backend={backend_name}, adaptive sampling)")
 
-        # Sync with orchestrator catalog so it knows VLM is loaded
+        # Sync with orchestrator catalog so it knows VLM is loaded.
+        # Device label was inverted pre-2026-04-22: `device = 'cpu' if
+        # self._vision_backend else 'gpu'` — when the MiniCPMBackend
+        # wrapper IS the live backend (a GPU sidecar) we logged 'cpu',
+        # and when no backend was set we logged 'gpu' (impossible: there
+        # is no live model to be on a GPU).  Drive device off the
+        # backend's own `requires_gpu` flag instead.
         try:
             from integrations.service_tools.model_orchestrator import get_orchestrator
-            device = 'cpu' if self._vision_backend else 'gpu'
-            get_orchestrator().notify_loaded('vlm', 'MiniCPM-V-2', device=device)
+            if self._vision_backend is not None:
+                device = 'gpu' if self._vision_backend.requires_gpu else 'cpu'
+                model_name_for_catalog = self._vision_backend.name
+            else:
+                device = 'none'
+                model_name_for_catalog = 'none'
+            get_orchestrator().notify_loaded(
+                'vlm', model_name_for_catalog, device=device,
+            )
         except Exception:
             pass
 
@@ -795,9 +798,22 @@ class VisionService:
     # ─── Temporal Perception ───
 
     def _save_to_memory_graph(self, user_id: str, description: str, channel: str):
-        """Auto-save visual description to MemoryGraph for long-term recall."""
+        """Auto-save visual description to MemoryGraph for long-term recall.
+
+        Singleton accessor for hart_intelligence — never eager-imports
+        from a worker thread (vision pipeline runs in background loops
+        that would deadlock on the canonical loader's import lock).
+        """
         try:
-            from hart_intelligence import _get_or_create_graph
+            from core.safe_hartos_attr import safe_hartos_attr
+            _get_or_create_graph = safe_hartos_attr('_get_or_create_graph')
+            if _get_or_create_graph is None:
+                logger.debug(
+                    "Memory graph save skipped: HARTOS "
+                    "_get_or_create_graph unresolvable — user=%s channel=%s",
+                    user_id, channel,
+                )
+                return
             graph = _get_or_create_graph(user_id)
             if graph:
                 graph.add(
@@ -805,8 +821,15 @@ class VisionService:
                     metadata={'channel': channel, 'type': 'visual_context'},
                     tags=['visual', channel],
                 )
-        except Exception:
-            pass
+                logger.debug(
+                    "Memory graph save: user=%s channel=%s desc_len=%d",
+                    user_id, channel, len(description or ''),
+                )
+        except Exception as e:
+            logger.debug(
+                "Memory graph save failed: user=%s channel=%s err=%s",
+                user_id, channel, e,
+            )
 
     def _emit_perception_event(self, user_id: str, description: str, channel: str):
         """Emit present-tense perception event on EventBus."""

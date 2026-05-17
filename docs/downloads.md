@@ -25,7 +25,7 @@ Boot from USB/SD card or run in a VM. Includes everything.
 | Variant | Best for | Download |
 |---------|----------|----------|
 | **Server** | Headless servers, Raspberry Pi, IoT hubs | [ISO](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-server-x86_64-linux.iso) · [torrent](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-server-x86_64-linux.iso.torrent) · [sha256](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-server-x86_64-linux.iso.sha256) |
-| **Desktop** | Workstations, dev machines (GNOME desktop) | [ISO](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-desktop-x86_64-linux.iso) · [torrent](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-desktop-x86_64-linux.iso.torrent) · [sha256](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-desktop-x86_64-linux.iso.sha256) |
+| **Desktop** | Workstations, dev machines (GNOME desktop) | [ISO](https://docs.hevolve.ai/binaries/hart-os-1.0.0-desktop-x86_64-linux.iso) · [torrent](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-desktop-x86_64-linux.iso.torrent) · [sha256](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-desktop-x86_64-linux.iso.sha256) · [parts on GitHub Releases](https://github.com/hertz-ai/HARTOS/releases/latest) (4 × 1.9 GiB + reassemble.sh, for users who can't reach docs.hevolve.ai) |
 | **Edge** | Minimal observer nodes, embedded | [ISO](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-edge-x86_64-linux.iso) · [torrent](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-edge-x86_64-linux.iso.torrent) · [sha256](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-edge-x86_64-linux.iso.sha256) |
 
 Each push to `main` publishes a new `nightly-{SHA}` release tagged as "latest" — the links above always resolve to the newest build. Older nightlies are auto-pruned (most recent 3 kept). Verify with the companion `.sha256`. For signed stable ISOs browse the [release archive](https://github.com/hertz-ai/HARTOS/releases).
@@ -41,10 +41,10 @@ Nunba is the HART agentic client — same experience on HART OS and as a native 
 | Target | Delivery | Notes |
 |--------|----------|-------|
 | **HART OS (native)** | Pre-installed | Systemd user service `hart-nunba` starts on boot (port 5000) and renders inside the LiquidUI Glass Shell. Enable via `hart.nunba.enable = true` in the desktop/phone configs (default). Registered in the HART AppRegistry (group: System) so launchers and the agentic runtime dispatch to it. |
-| **Windows** | [Nunba Installer](https://github.com/hertz-ai/Nunba/releases/latest) _(built by the [Nunba repo's `Build & Sign Installers`](https://github.com/hertz-ai/Nunba/actions) workflow)_ | Windows 10/11, x64. Azure Trusted Signing. |
-| **macOS** | [Nunba.dmg](https://github.com/hertz-ai/Nunba/releases/latest) | macOS 13+ (Apple Silicon native). Notarized. |
-| **Linux (AppImage)** | [AppImage](https://github.com/hertz-ai/Nunba/releases/latest) | Any distro, x86_64. `chmod +x` and run. |
-| **Linux (.deb)** | [.deb package](https://github.com/hertz-ai/Nunba/releases/latest) | Debian/Ubuntu. `sudo dpkg -i nunba_*.deb` |
+| **Windows** | [Nunba_Setup.exe](https://github.com/hertz-ai/Nunba/releases/latest/download/Nunba_Setup.exe) _(built by the [Nunba repo's `Build & Sign Installers`](https://github.com/hertz-ai/Nunba/actions) workflow)_ | Windows 10/11, x64. Azure Trusted Signing. |
+| **macOS** | [Nunba_Setup.dmg](https://github.com/hertz-ai/Nunba/releases/latest/download/Nunba_Setup.dmg) | macOS 13+ (Apple Silicon native). Notarized. |
+| **Linux (AppImage)** | [Nunba-x86_64.AppImage](https://github.com/hertz-ai/Nunba/releases/latest/download/Nunba-x86_64.AppImage) | Any distro, x86_64. `chmod +x` and run. |
+| **Linux (.deb)** | [.deb package (release page)](https://github.com/hertz-ai/Nunba/releases/latest) | Debian/Ubuntu. `sudo dpkg -i nunba_*.deb`. Filename is version-pinned (`nunba_<version>_amd64.deb`); browse the release page to grab the latest. |
 
 On HART OS Nunba binds to the local `hart_intelligence_entry.py` runtime (port 6777). On other OSes it bundles the same runtime or points at a remote HART node via `NUNBA_BACKEND_URL`.
 

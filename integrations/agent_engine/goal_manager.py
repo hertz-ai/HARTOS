@@ -28,6 +28,27 @@ _prompt_builders: Dict[str, Callable] = {}
 _tool_tags: Dict[str, List[str]] = {}
 
 
+def _emit_goal_changed(goal_id: str, change: str, goal_type: str = '') -> None:
+    """Best-effort EventBus emission for dashboard SSE invalidation.
+
+    Subscribed in core/platform/bootstrap.py → broadcast_sse_safe(
+    'dashboard.invalidate', ...).  Never raises (event emission is
+    non-essential to the goal write itself).  Single canonical helper
+    so add/update/status_change all use the same topic shape; resist
+    the temptation to inline emit_event() at the call sites — that's
+    how parallel dashboards diverge.
+    """
+    try:
+        from core.platform.events import emit_event
+        emit_event('agent_goal.changed', {
+            'goal_id': goal_id,
+            'change': change,
+            'goal_type': goal_type,
+        })
+    except Exception:
+        pass
+
+
 def register_goal_type(goal_type: str, build_prompt: Callable,
                        tool_tags: Optional[List[str]] = None):
     """Register a new goal type with its prompt builder and tool tags.
@@ -159,6 +180,7 @@ class GoalManager:
         )
         db.add(goal)
         db.flush()
+        _emit_goal_changed(goal.id, 'created', goal_type)
         return {'success': True, 'goal': goal.to_dict()}
 
     @staticmethod
@@ -185,6 +207,7 @@ class GoalManager:
 
         goal.status = status
         db.flush()
+        _emit_goal_changed(goal_id, f'status:{status}', goal.goal_type)
 
         # GUARDRAIL: ephemeral agent cleanup on terminal states
         try:
@@ -195,19 +218,114 @@ class GoalManager:
 
         return {'success': True, 'goal': goal.to_dict()}
 
+    # Fields that carry the agent's PERSONA (system prompt / public-facing
+    # self-description).  Any update to these is a "persona upgrade" and
+    # must pass the 4-of-4 HiveConsensus gate.  Other fields (status,
+    # spark_budget, spark_spent, last_dispatched_at, product_id, config)
+    # are operational parameters — they tune the agent's runtime
+    # behavior but do not change WHO the agent is, so they bypass
+    # consensus to keep the hot path cheap.
+    _PERSONA_FIELDS = frozenset({'description', 'title'})
+
     @staticmethod
-    def update_goal(db: Session, goal_id: str, **kwargs) -> Dict:
-        """Update goal fields."""
+    def update_goal(
+        db: Session,
+        goal_id: str,
+        _skip_consensus: bool = False,
+        **kwargs,
+    ) -> Dict:
+        """Update goal fields.
+
+        Persona fields (description, title) are gated through
+        HiveConsensus.upgrade_proposal(); a failed consensus vote
+        rejects the update and writes the rejection to the reasoning
+        trace.  Non-persona fields apply directly.  ``_skip_consensus``
+        is an internal escape hatch for boot-time re-seeding of
+        bootstrap goals — never use it from user-facing paths.
+
+        Returns the standard {'success', ...} dict.  On consensus
+        rejection, returns {'success': False, 'error': '<reason>',
+        'consensus': <decision.to_dict()>} so the caller can surface
+        WHY to a dashboard without losing the audit trail.
+        """
         from integrations.social.models import AgentGoal
 
         goal = db.query(AgentGoal).filter_by(id=goal_id).first()
         if not goal:
             return {'success': False, 'error': 'Goal not found'}
 
+        persona_updates = {
+            k: v for k, v in kwargs.items()
+            if k in GoalManager._PERSONA_FIELDS and hasattr(goal, k)
+        }
+
+        if persona_updates and not _skip_consensus:
+            # Gate every persona mutation through the 4-of-4 vote.
+            # Import lazily — hive_consensus lives in the same package
+            # but we want this to still work if someone vendors the
+            # goal_manager into a slim build.
+            try:
+                from .hive_consensus import HiveConsensus
+                # The canonical persona identity for a seeded goal is its
+                # bootstrap_slug (config) when present, else the goal.id.
+                # That's what the brief's correlation-id contract names
+                # `prompt_id` — the stable identifier across sessions.
+                # AgentGoal column is `config_json` (see Hevolve_Database
+                # sql/models.py:3199); `goal.config` does NOT exist.
+                # Fallback chain handles the test-stub case where the
+                # mock may set either name.
+                cfg = (
+                    getattr(goal, 'config_json', None)
+                    or getattr(goal, 'config', None)
+                    or {}
+                )
+                prompt_id = cfg.get('bootstrap_slug') or str(goal.id)
+                # Build the proposed-content preview from the persona
+                # fields actually changing — so a title-only tweak only
+                # surfaces the new title, not the old description.
+                pieces = []
+                if 'title' in persona_updates:
+                    pieces.append(f'title: {persona_updates["title"]}')
+                if 'description' in persona_updates:
+                    pieces.append(persona_updates['description'])
+                new_content = '\n\n'.join(pieces)
+                decision = HiveConsensus.upgrade_proposal(
+                    prompt_id=prompt_id,
+                    goal_type=goal.goal_type,
+                    new_content=new_content,
+                )
+                if not decision.approved:
+                    logger.info(
+                        "goal %s persona upgrade REJECTED: %s",
+                        goal_id, decision.reason,
+                    )
+                    return {
+                        'success': False,
+                        'error': f'consensus: {decision.reason}',
+                        'consensus': decision.to_dict(),
+                    }
+            except ImportError:
+                logger.warning(
+                    "hive_consensus unavailable — persona update "
+                    "allowed without gate (goal=%s)", goal_id,
+                )
+            except Exception as exc:
+                # Fail CLOSED: unexpected consensus errors reject the
+                # update.  The reasoning_trace will carry the cause.
+                logger.error(
+                    "consensus gate errored for goal %s: %s",
+                    goal_id, exc,
+                )
+                return {
+                    'success': False,
+                    'error': f'consensus error: {exc}',
+                }
+
         for key, value in kwargs.items():
             if hasattr(goal, key):
                 setattr(goal, key, value)
         db.flush()
+        _emit_goal_changed(goal_id, 'updated', goal.goal_type)
         return {'success': True, 'goal': goal.to_dict()}
 
     @staticmethod
@@ -921,6 +1039,39 @@ register_goal_type('thought_experiment', _build_thought_experiment_prompt,
                    tool_tags=['thought_experiment', 'web_search', 'code_analysis'])
 register_goal_type('news', _build_news_prompt, tool_tags=['news', 'feed_management'])
 register_goal_type('provision', _build_provision_prompt, tool_tags=['provision'])
+
+
+def _build_speech_therapy_prompt(goal_dict, product_dict=None):
+    """Speech-therapy companion — the detailed, kid-safe persona + guardrails
+    live in the seeded goal.description.  This builder keeps the prompt
+    honest to that text and adds a one-line header identifying the
+    target user's language (so the companion doesn't drift to English
+    when the child's preferred_lang is something else).
+
+    Minimal by design — all the child-safety rules (no scoring, no
+    shame, never diagnose) are in the description.  This wrapper adds
+    ONLY the runtime grounding the agent needs at invocation time.
+    """
+    config = goal_dict.get('config_json', {})
+    child_id = config.get('child_id', 'anonymous_child')
+    preferred_lang = config.get('preferred_lang', '')
+    return (
+        f"SPEECH COMPANION — runtime context\n\n"
+        f"Child id: {child_id}\n"
+        f"Preferred language (from core.user_lang): {preferred_lang or '<unset — detect from first utterance>'}\n\n"
+        f"{goal_dict.get('description', '')}\n"
+    )
+
+
+# Speech-therapy goal type — bespoke shared-vocabulary companion for
+# kids learning to speak.  Registered here so seed_bootstrap_goals can
+# create the 'bootstrap_speech_companion' entry without hitting
+# goal_type-not-registered validation (was silently skipping → one
+# fewer bootstrap goal than expected, breaking the count invariant).
+register_goal_type(
+    'speech_therapy', _build_speech_therapy_prompt,
+    tool_tags=['memory', 'media', 'vision', 'consent'],
+)
 
 # Outreach CRM goal type — auto follow-up sequences, deal pipeline, email outreach
 try:

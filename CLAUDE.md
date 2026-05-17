@@ -31,6 +31,42 @@ The master key is a kill switch for a distributed intelligence. It is not a deve
 
 You MAY read `security/master_key.py` to understand the public key verification flow. You MAY NOT interact with the private key in any way.
 
+## Branch Discipline — MAIN BRANCH ONLY (MANDATORY)
+
+**Work directly on `main` in the main clone.  Every session.  No exceptions.**
+
+- **Never** create, use, or resume a `claude/*` branch.
+- **Never** create or use a git worktree (`.claude/worktrees/*`).
+- **Never** operate inside a worktree directory — even if the Claude
+  Code harness boots you there.  Step out immediately and use
+  absolute paths to the main clone.
+- **All commits land on `main`.**  All pushes go to `origin/main`.
+
+Full protocol + session-start sanity check + violation log live in
+the user-memory file `memory/feedback_main_branch_only.md` (under
+`~/.claude/projects/.../memory/`).  Read it if you ever see a
+`claude/*` branch or `.claude/worktrees/` dir — that is a regression
+and must be reported to the user, not silently accepted.
+
+If the harness forces you into a worktree:
+1. Do NOT edit files inside the worktree.
+2. Use absolute paths in every `Edit`/`Write`/`Read` call so tools
+   act on the main clone (e.g.
+   `C:\Users\sathi\PycharmProjects\HARTOS\hart_intelligence_entry.py`).
+3. Prefix every `git` command with
+   `cd C:/Users/sathi/PycharmProjects/HARTOS && git …`
+   so git never defaults to the worktree's CWD.
+4. After session ends, the user deletes the filesystem leftovers:
+   `cmd /c "rd /s /q C:\Users\sathi\PycharmProjects\HARTOS\.claude\worktrees"`.
+
+Why this rule exists (2026-04-21 incident): the Nunba session was
+booted on `claude/determined-elbakyan-94a24c` in a worktree, leaving
+a stale branch and filesystem leftovers that polluted `git branch -a`
+and confused which copy of the code had the latest edits.  User
+called it out directly: parallel branches always drift, and the user
+should never need to ask "which one has my fix?" — the answer is
+always `main`.  HARTOS follows the same rule for the same reason.
+
 ## Common Commands
 
 ### Setup

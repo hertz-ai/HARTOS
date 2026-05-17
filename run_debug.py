@@ -19,8 +19,10 @@ stderr_handler = logging.StreamHandler(sys.stderr)
 stderr_handler.setLevel(logging.WARNING)
 root.addHandler(stderr_handler)
 
-# Now import app
-from hart_intelligence_entry import app
+# Now import app — TID251 noqa: this is the dev/debug entry point, the
+# only thread is main, no worker import-lock race possible.  See
+# core/safe_hartos_attr.py for the rule that bans this elsewhere.
+from hart_intelligence_entry import app  # noqa: TID251
 from core.port_registry import get_port
 from waitress import serve
 

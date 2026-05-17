@@ -291,6 +291,224 @@ def build_channel_tool_closures(ctx):
         get_channel_context,
     ))
 
+    # ------------------------------------------------------------------
+    # 5. send_install_link  (cross-device handoff — Phase 1)
+    # ------------------------------------------------------------------
+    #
+    # When a user says "send Nunba to my phone" / "I want this on my work
+    # laptop", the agent dispatches the install link to ONE of the user's
+    # PAIRED channels.  The tool enforces three guarantees:
+    #
+    #   1. No cross-user spam: the destination chat_id MUST belong to a
+    #      currently-active UserChannelBinding for the *caller's* user_id.
+    #      Alice cannot resolve / target Bob's bindings.
+    #   2. URL allowlist: if `install_link` is provided as an override,
+    #      it MUST resolve to a host in `core.install_links.ALLOWED_HOSTS`
+    #      (github.com / play.google.com / apps.apple.com / hevolve.ai /
+    #      testflight.apple.com).  Otherwise the canonical mapping is used.
+    #   3. Explicit consent: the tool description (read by the LLM) tells
+    #      it to confirm the channel choice with the user FIRST.  We don't
+    #      enforce this in code — the system prompt + this description do.
+    #
+    # See `core/install_links.py` for the canonical (device, locale) → URL
+    # table.  See `tests/unit/test_install_handoff.py` for the FT/NFT
+    # coverage.
+
+    @log_tool_execution
+    def send_install_link(
+        channel_type: Annotated[str, "Channel to dispatch through: telegram, discord, whatsapp, slack, signal, web, email"],
+        target_device: Annotated[str, "Device the user wants Nunba on: android, ios, windows, macos, linux"],
+        chat_id: Annotated[Optional[str], "Specific chat_id from one of the user's bindings; if omitted, uses the user's preferred binding for that channel"] = None,
+        install_link: Annotated[Optional[str], "Optional URL override; MUST be on the allowlist (github.com / play.google.com / apps.apple.com / hevolve.ai / testflight.apple.com).  If omitted, the canonical link for target_device is used."] = None,
+        locale: Annotated[str, "BCP-47 locale tag for localized install pages; 'default' falls back to the global URL"] = 'default',
+    ) -> str:
+        """Send a Nunba install link for `target_device` through `channel_type`.
+
+        Use ONLY when the user has explicitly asked to install / set up /
+        get / send Nunba on another device AND has confirmed which channel
+        to use.  Never auto-dispatch — always confirm first.
+        """
+        try:
+            from core.install_links import (
+                get_install_link,
+                is_allowed_install_link,
+                is_supported_device,
+                is_supported_install_channel,
+            )
+
+            channel_type_n = (channel_type or '').lower().strip()
+            target_n = (target_device or '').lower().strip()
+
+            if not is_supported_install_channel(channel_type_n):
+                return (
+                    f"Error: '{channel_type}' is not a supported install-handoff "
+                    f"channel.  Allowed: telegram, discord, whatsapp, slack, signal, "
+                    f"web, email."
+                )
+            if not is_supported_device(target_n):
+                return (
+                    f"Error: '{target_device}' is not a supported target device. "
+                    f"Allowed: android, ios, windows, macos, linux."
+                )
+
+            # Resolve the URL
+            if install_link:
+                if not is_allowed_install_link(install_link):
+                    return (
+                        "Error: install_link override is not on the allowlist. "
+                        "Allowed hosts: github.com, play.google.com, "
+                        "apps.apple.com, hevolve.ai, testflight.apple.com."
+                    )
+                url = install_link
+            else:
+                url = get_install_link(target_n, locale)
+                if not url:
+                    return (
+                        f"Error: no canonical install link configured for "
+                        f"target_device={target_n}, locale={locale}."
+                    )
+
+            # Resolve the destination chat_id from the caller's bindings
+            # only.  Cross-user lookups are impossible by construction:
+            # we filter by user_id == caller.
+            uid = user_id or _get_user_id_from_threadlocal()
+            if not uid:
+                return (
+                    "Error: cannot identify the requesting user; refusing "
+                    "to dispatch install link without an authenticated "
+                    "session."
+                )
+
+            resolved_chat_id = chat_id
+            if not resolved_chat_id:
+                try:
+                    from integrations.social.models import (
+                        get_db, UserChannelBinding,
+                    )
+                    db = get_db()
+                    try:
+                        q = db.query(UserChannelBinding).filter_by(
+                            user_id=str(uid),
+                            channel_type=channel_type_n,
+                            is_active=True,
+                        )
+                        # Prefer the explicitly-flagged preferred binding
+                        binding = q.filter_by(is_preferred=True).first() or q.first()
+                        if not binding:
+                            return (
+                                f"You don't have a paired {channel_type_n} "
+                                f"yet.  Open the Channels page to connect "
+                                f"one, then I can send the install link there."
+                            )
+                        resolved_chat_id = (
+                            binding.channel_chat_id
+                            or binding.channel_sender_id
+                        )
+                    finally:
+                        db.close()
+                except Exception as e:
+                    logger.error("send_install_link binding lookup error: %s", e)
+                    return (
+                        f"Error: could not resolve a {channel_type_n} "
+                        f"binding for the requesting user."
+                    )
+            else:
+                # Caller passed an explicit chat_id — verify it belongs to
+                # this user, NOT to someone else (no-spam guarantee).
+                try:
+                    from integrations.social.models import (
+                        get_db, UserChannelBinding,
+                    )
+                    db = get_db()
+                    try:
+                        owns = db.query(UserChannelBinding).filter_by(
+                            user_id=str(uid),
+                            channel_type=channel_type_n,
+                            is_active=True,
+                        ).filter(
+                            (UserChannelBinding.channel_chat_id == resolved_chat_id)
+                            | (UserChannelBinding.channel_sender_id == resolved_chat_id)
+                        ).first()
+                        if not owns:
+                            return (
+                                f"Refusing to send: chat_id {resolved_chat_id} "
+                                f"is not bound to your account on "
+                                f"{channel_type_n}."
+                            )
+                    finally:
+                        db.close()
+                except Exception as e:
+                    logger.error("send_install_link ownership check error: %s", e)
+                    return f"Error: could not verify chat_id ownership: {e}"
+
+            # Compose the message — short, friendly, links open natively
+            message = (
+                f"Here's the Nunba install link for your {target_n} device:\n"
+                f"{url}\n\n"
+                f"Open it on the {target_n} device and follow the prompts.  "
+                f"Reply here if you hit any issue during setup."
+            )
+
+            # Dispatch via the registry (re-uses the same plumbing as
+            # send_to_channel) so all channel adapters share one path.
+            from integrations.channels.registry import get_registry
+            import asyncio
+            registry = get_registry()
+            loop = getattr(registry, '_loop', None)
+
+            if loop and loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    registry.send_to_channel(
+                        channel_type_n, resolved_chat_id, message,
+                    ),
+                    loop,
+                )
+                result = future.result(timeout=30)
+                if getattr(result, 'success', False):
+                    msg_id = (
+                        getattr(result, 'message_id', None)
+                        or getattr(result, 'id', None)
+                        or ''
+                    )
+                    logger.info(
+                        "send_install_link OK uid=%s ch=%s dev=%s url=%s msg=%s",
+                        uid, channel_type_n, target_n, url, msg_id,
+                    )
+                    return (
+                        f"Install link for {target_n} sent via "
+                        f"{channel_type_n}."
+                    )
+                return (
+                    f"Failed to send via {channel_type_n}: "
+                    f"{getattr(result, 'error', 'unknown error')}"
+                )
+
+            # Adapter loop not running — return a graceful failure rather
+            # than silently dropping.  The user / agent can retry.
+            return (
+                f"Channel adapters are not running right now.  Try again "
+                f"in a moment, or pick another channel."
+            )
+        except Exception as e:
+            logger.error("send_install_link error: %s", e)
+            return f"Error sending install link: {e}"
+
+    tools.append((
+        "send_install_link",
+        "Send a Nunba install link to one of the user's PAIRED channels "
+        "(Telegram / Discord / WhatsApp / Slack / Signal / Web / Email). "
+        "Call this when the user explicitly asks to install / set up / get / "
+        "send Nunba on another device.  Always CONFIRM the channel and target "
+        "device with the user before calling — never auto-dispatch.  "
+        "target_device must be one of: android, ios, windows, macos, linux.  "
+        "Example: send_install_link('telegram', 'android') sends the Play "
+        "Store link via the user's preferred Telegram binding.  The tool "
+        "refuses to send to a chat_id that is not bound to the requesting "
+        "user (no cross-user spam) and refuses install_link overrides that "
+        "are not on the host allowlist (no phishing-URL injection).",
+        send_install_link,
+    ))
+
     return tools
 
 

@@ -109,6 +109,21 @@ PAGE_REGISTRY: tuple[PageEntry, ...] = (
         icon='precision_manufacturing',
         category='agents',
     ),
+    PageEntry(
+        id='hive_contest',
+        label='Hive Contest',
+        route='/hive_contest',
+        description=(
+            'Open hive contest — submit ideas, watch the live floating '
+            'ideas wall, plug Claude Code into HARTOS via MCP onramp. '
+            'Three tracks: digital, embodied, human-wellness.'
+        ),
+        keywords=_ks('contest', 'hive contest', 'hive_contest',
+                     'submit idea', 'hackathon', 'leaderboard',
+                     'claude code', 'mcp', 'onramp', 'spark', 'prize'),
+        icon='leaderboard',
+        category='discover',
+    ),
     # ── Admin ───────────────────────────────────────────────────────
     PageEntry(
         id='admin_models',

@@ -498,12 +498,28 @@ def test_ft16_observer_fires_on_spawn_crash_stop():
 
 import pytest
 
-@pytest.mark.skip(reason="try_free_vram internal logic changed — mock path needs rewrite")
 def test_ft19_try_free_vram_stops_lru_workers():
     """try_free_vram() should stop live workers oldest-idle-first until
-    the VRAM budget is met. Mocks vram_manager to avoid needing a GPU."""
-    from unittest.mock import patch
+    the VRAM budget is met.  Mocks the vram_manager singleton to avoid
+    needing a GPU.
+
+    Patch strategy: the function does
+        `from integrations.service_tools.vram_manager import vram_manager`
+    so we patch the attribute on the singleton instance that lives on
+    the submodule — not sys.modules (the package __init__ rebinds the
+    name so sys.modules patching is fragile).
+
+    CI resilience: echo-worker spawn is occasionally flaky on slow
+    runners — if fewer than 2 workers survive the initial call() we
+    skip rather than assert, since the eviction path requires at least
+    one evict-candidate + one exclude_tool to be meaningful.  The
+    vram_manager.try_free_vram unit logic itself is the same either
+    way; this test is the integration sanity check."""
+    import sys
     from integrations.service_tools import gpu_worker as gw
+
+    vm_mod = sys.modules['integrations.service_tools.vram_manager']
+    real_free_fn = vm_mod.vram_manager.get_free_vram
 
     # Spawn 3 workers with staggered _last_used timestamps (oldest first)
     workers = []
@@ -520,29 +536,55 @@ def test_ft19_try_free_vram_stops_lru_workers():
                 idle_timeout=0,
             )
             workers.append(w)
-            w.call({'op': 'echo', 'i': i})
+            try:
+                w.call({'op': 'echo', 'i': i})
+            except Exception as e:
+                # One worker died during startup — tear the rest down
+                # and skip; the happy-path 3-live-worker scenario is
+                # what this test covers.
+                import pytest
+                pytest.skip(f'echo worker {i} unreachable in this runner: {e}')
             # Stagger last_used so evict_test_0 is oldest
             w._last_used = time.monotonic() - (3 - i)
 
-        # Mock vram_manager.get_free_vram to start low, jump up each stop
+        # Precondition: at least 2 evictable workers (workers[0], [1])
+        # must be alive — otherwise the eviction loop has no material
+        # to work with and the fake vram sequence never advances past
+        # the first log read.
+        evictable_alive = sum(1 for w in workers[:2] if w.is_alive())
+        if evictable_alive < 2:
+            import pytest
+            pytest.skip(
+                f'only {evictable_alive}/2 evictable workers alive — '
+                f'runner too slow or echo worker flaked.  Eviction '
+                f'logic itself is covered by direct unit tests.'
+            )
+
+        # vram sequence: first read low → after 1 stop still low →
+        # after 2 stops free up → stays freed for final check.
         call_count = {'n': 0}
-        vram_sequence = [0.2, 0.5, 1.2, 2.5]  # 4 reads: low, after stop 1, 2, 3
+        vram_sequence = [0.2, 0.5, 1.2, 2.5]
 
-        class _FakeVM:
-            def get_free_vram(self):
-                idx = min(call_count['n'], len(vram_sequence) - 1)
-                call_count['n'] += 1
-                return vram_sequence[idx]
+        def fake_free():
+            idx = min(call_count['n'], len(vram_sequence) - 1)
+            call_count['n'] += 1
+            return vram_sequence[idx]
 
-        with patch.dict('sys.modules', {'integrations.service_tools.vram_manager':
-                type('M', (), {'vram_manager': _FakeVM()})()}):
+        vm_mod.vram_manager.get_free_vram = fake_free
+        try:
             freed = gw.try_free_vram(
                 needed_gb=1.0,
                 exclude_tool='evict_test_2',  # keep newest alive
             )
+        finally:
+            vm_mod.vram_manager.get_free_vram = real_free_fn
 
-        assert freed is True, f"should have freed enough VRAM, calls={call_count['n']}"
-        # evict_test_0 (oldest) and evict_test_1 should have been stopped
+        assert freed is True, (
+            f"should have freed enough VRAM, calls={call_count['n']}, "
+            f"alive={[w.is_alive() for w in workers]}"
+        )
+        # evict_test_0 (oldest) must have been stopped; _1 may or may
+        # not, depending on how quickly the budget was met.
         assert not workers[0].is_alive(), "oldest should be evicted first"
         # evict_test_2 must NOT be stopped (it's in exclude_tool)
         assert workers[2].is_alive(), "exclude_tool must stay running"
@@ -776,3 +818,103 @@ def test_ft21_pythonpath_preserves_caller_value():
     parent_dirs = [p for p in sys.path if p and os.path.isdir(p)]
     assert any(p in final for p in parent_dirs), \
         'parent sys.path not appended alongside caller override'
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FT 22: ToolWorker forwards python_exe to GPUWorker
+# ═══════════════════════════════════════════════════════════════════
+#
+# Regression guard for #53 (venv-aware spawn).  Before this change,
+# ToolWorker had no way to tell the spawned subprocess to use a
+# specific Python interpreter — every tool ran under the parent's
+# default (python-embed in frozen builds, sys.executable in dev).
+# That blocked engines whose deps clash with the parent (parler-tts
+# pins transformers==4.46.x while main has 5.x; chatterbox-tts wants
+# transformers==5.2.0; etc.) from running cleanly.
+#
+# The fix is one optional kwarg on ToolWorker.__init__ that flows
+# straight through to the GPUWorker the central dispatcher spawns.
+# This test pins the contract so a future refactor can't drop the
+# pass-through silently.
+
+def test_ft22_toolworker_python_exe_forwarded_to_gpu_worker():
+    """ToolWorker(python_exe=...) sets the field; _get_or_start passes
+    that field through to GPUWorker so the dispatch subprocess runs
+    under the chosen interpreter (e.g. a per-engine venv python)."""
+    from unittest.mock import patch, MagicMock
+    from integrations.service_tools import gpu_worker as gw
+
+    custom_python = r'C:\fake\venvs\indic_parler\Scripts\python.exe'
+
+    t = ToolWorker(
+        tool_name='py_exe_pin',
+        tool_module=ECHO_MODULE,
+        vram_budget='tts_f5',
+        output_subdir='py_exe_pin',
+        engine='test',
+        python_exe=custom_python,
+        startup_timeout=2.0,
+        request_timeout=2.0,
+        idle_timeout=0.0,
+    )
+
+    # Confirm the field landed on the instance.
+    assert t.python_exe == custom_python, (
+        f"python_exe not stored on ToolWorker: {t.python_exe!r}"
+    )
+
+    captured = {}
+
+    class _FakeWorker:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def start(self):
+            self._ready = True
+
+        def is_alive(self):
+            return True
+
+        def stop(self, timeout=None):
+            pass
+
+    # Skip VRAM bookkeeping so the test stays hermetic; it's verified
+    # elsewhere and isn't what this regression guards.
+    with patch.object(gw, 'GPUWorker', _FakeWorker), \
+         patch.object(t, '_allocate_vram', return_value=True), \
+         patch.object(t, '_ensure_vram_headroom'):
+        t._get_or_start()
+
+    assert captured.get('python_exe') == custom_python, (
+        f"GPUWorker was spawned without the ToolWorker's python_exe "
+        f"override; got {captured.get('python_exe')!r}, expected "
+        f"{custom_python!r}.  Without this pass-through, engines that "
+        f"need a per-engine venv (parler-tts transformers==4.46, "
+        f"chatterbox-tts transformers==5.2.0, etc.) cannot be "
+        f"isolated from the parent interpreter's pins."
+    )
+
+    # Default behavior (no python_exe) must still work — passing None
+    # through is what makes the change backward compatible.
+    captured.clear()
+    t2 = ToolWorker(
+        tool_name='py_exe_default',
+        tool_module=ECHO_MODULE,
+        vram_budget='tts_f5',
+        output_subdir='py_exe_default',
+        engine='test',
+        startup_timeout=2.0,
+        request_timeout=2.0,
+        idle_timeout=0.0,
+    )
+    assert t2.python_exe is None
+    with patch.object(gw, 'GPUWorker', _FakeWorker), \
+         patch.object(t2, '_allocate_vram', return_value=True), \
+         patch.object(t2, '_ensure_vram_headroom'):
+        t2._get_or_start()
+    assert captured.get('python_exe') is None, (
+        f"unexpected python_exe={captured.get('python_exe')!r} when "
+        f"caller did not set the override; default must remain None "
+        f"so GPUWorker._resolve_python_exe() picks python-embed/"
+        f"sys.executable as before."
+    )

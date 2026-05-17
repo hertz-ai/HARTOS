@@ -42,6 +42,77 @@ AUTO_EVOLVE_MAX_PARALLEL_DISPATCH = 4
 # addition to this ratio).
 AUTO_EVOLVE_SUPERMAJORITY_RATIO = 2.0 / 3.0
 
+# Active-learning bias for the VOTE stage.  When the world model
+# (HevolveAI side, queried via world_model_bridge.get_learning_feedback)
+# reports HIGH epistemic_uncertainty, the system has the most to learn
+# from running new experiments — so we boost approval scores slightly
+# before sort, biasing the SELECT phase toward the experiments that
+# would reduce uncertainty fastest.  Classic AL acquisition.
+#
+# Bounded multiplier: the bias never re-orders candidates that the
+# super-majority gate already rejected, and the boost is small enough
+# (≤ 1 + AL_MAX_BOOST) that a high-quality consensus pick still beats
+# a marginally-passing high-uncertainty pick.  The point is a NUDGE on
+# tie-breaking, not a coup.
+AUTO_EVOLVE_AL_MAX_BOOST = 0.25  # +25% upper bound on the AL multiplier
+
+# Trust gate for the AL signal itself.  Prediction-error estimates
+# from a half-trained world model are themselves unreliable — the
+# model can be over-confident on things it has never actually seen,
+# or under-confident on things it has seen but not yet generalized.
+# Using such an uncalibrated signal to bias selection would amplify
+# the model's own blind spots into the experiment queue.
+#
+# Maturity signal: HevolveAI's EmbodiedLearner exposes a
+# `learning_steps` counter via get_stats() — the actual count of
+# learning updates the provider has executed.  We require at least
+# AL_TRUST_MIN_STEPS before trusting avg_prediction_error as an AL
+# acquisition signal; below that, the multiplier is forced to 1.0
+# (pure democratic vote decides the rank).  Above the floor, the
+# boost ramps in linearly to its full AL_MAX_BOOST value at
+# AL_TRUST_FULL_STEPS.
+#
+# Step threshold tuning: 100 = "model has done enough updates to
+# have a non-trivial loss surface but isn't yet generalized";
+# 10_000 = "fully matured", at which point the prediction-error
+# signal is trusted at full weight.  Both tunable once we have
+# real-world calibration data — kept conservative so the bias
+# doesn't fire prematurely.
+AUTO_EVOLVE_AL_TRUST_MIN_STEPS = 100
+AUTO_EVOLVE_AL_TRUST_FULL_STEPS = 10_000
+
+
+def _is_sqlite_backend() -> bool:
+    """Return True when the active DB engine is SQLite (flat tier).
+
+    FIX-1.4a support: SQLite serializes writes at the file level, so
+    parallel dispatch that commits concurrently produces ``database is
+    locked`` errors.  Callers use this to fall back to a single worker
+    and preserve the DISPATCH contract without the race.
+
+    Detection order:
+      1. Ask SQLAlchemy directly via the shared ``engine`` (authoritative).
+      2. Sniff the ``HEVOLVE_DB_URL`` env var (covers first-boot path
+         where the engine hasn't been created yet).
+      3. Default to ``True`` — SQLite is the flat-tier default, so the
+         safer assumption on failure is "serialize."
+    """
+    try:
+        from integrations.social.models import engine as _engine
+        dialect = getattr(getattr(_engine, 'dialect', None), 'name', '') or ''
+        if dialect:
+            return dialect.lower() == 'sqlite'
+    except Exception:
+        pass
+    try:
+        import os
+        url = os.environ.get('HEVOLVE_DB_URL', '') or ''
+        if url:
+            return url.lower().startswith('sqlite')
+    except Exception:
+        pass
+    return True  # flat-tier default = SQLite
+
 
 @dataclass
 class EvolveSession:
@@ -245,6 +316,11 @@ class AutoEvolveOrchestrator:
         Both must hold for an experiment to qualify for dispatch.  The
         super-majority gate protects against a small but highly-weighted
         vocal minority flipping a low-participation tally into approval.
+
+        Once the gates pass, the rank is biased by an active-learning
+        signal pulled from the world model (HevolveAI) — see
+        _active_learning_multiplier docstring.  The bias only nudges
+        order; it never re-admits a candidate the gates rejected.
         """
         scored = []
         try:
@@ -280,9 +356,99 @@ class AutoEvolveOrchestrator:
             logger.warning(f"[{session.session_id}] Vote tally failed: {e}")
             return candidates  # Fall through unranked
 
-        # Sort by approval score descending
-        scored.sort(key=lambda e: e.get('_approval_score', 0), reverse=True)
+        # Active-learning bias: pull a global epistemic-uncertainty
+        # multiplier from the world model and apply it as a small
+        # boost to each gated-in candidate's approval score before
+        # sort.  No-op when the world model isn't reachable.
+        al_mult = self._active_learning_multiplier(session)
+        for exp in scored:
+            base = exp.get('_approval_score', 0) or 0
+            biased = base * al_mult
+            exp['_active_learning_multiplier'] = round(al_mult, 4)
+            exp['_biased_score'] = round(biased, 4)
+
+        # Sort by biased score (falls back to unbiased when al_mult=1.0)
+        scored.sort(
+            key=lambda e: e.get('_biased_score',
+                                e.get('_approval_score', 0)),
+            reverse=True,
+        )
         return scored
+
+    def _active_learning_multiplier(self, session: EvolveSession) -> float:
+        """Pull the world model's current avg_prediction_error +
+        learning_steps via agent_baseline_service._collect_world_model_metrics()
+        — the same normalized signals persisted into every baseline
+        snapshot — and project them into a [1.0, 1+AL_MAX_BOOST]
+        multiplier, gated on model maturity.
+
+        Why colocated with _rank_by_votes (not in baseline_service):
+        AL acquisition is a SELECTION concern (which candidates does
+        the system want to run NEXT), not a SNAPSHOT concern (what did
+        the system look like at this moment).  baseline_service owns
+        the COLLECTOR (single source for HevolveAI feedback shape);
+        this method owns the SELECTION USE of that signal.
+
+        Two-stage trust gate:
+          stage 1 — does the AL signal exist?
+                    No: return 1.0 (no bias).
+          stage 2 — has the world model done enough learning_steps to
+                    produce a CALIBRATED prediction-error estimate?
+                    < AL_TRUST_MIN_STEPS: return 1.0 (uncertainty about
+                    uncertainty — using the signal would amplify the
+                    model's own blind spots into the experiment queue).
+                    >= AL_TRUST_FULL_STEPS: full AL_MAX_BOOST.
+                    in between: linear ramp.
+
+        Returns 1.0 in any failure path so a missing / immature world
+        model falls back to pure democratic vote — preserves the
+        system's pre-wiring behavior.
+
+        HevolveAI field names verified against
+        embodied_learner.py::EmbodiedLearner.get_stats — do not
+        invent (`epistemic_uncertainty`, `learning_progress`, etc.
+        do NOT exist on get_stats; the real keys are
+        avg_prediction_error and learning_steps).
+        """
+        try:
+            from integrations.agent_engine.agent_baseline_service import (
+                AgentBaselineService)
+            wm = AgentBaselineService._collect_world_model_metrics()
+        except Exception:
+            return 1.0
+        if not wm:
+            return 1.0
+
+        # Stage 1: AL signal present?  Higher prediction error =
+        # more to learn from this domain = stronger acquisition
+        # value.  Already clamped to [0,1] by the collector.
+        err = wm.get('al_signal')
+        if not isinstance(err, (int, float)):
+            return 1.0
+
+        # Stage 2: has the model trained enough that its prediction-
+        # error estimate is calibrated?
+        steps = wm.get('learning_steps')
+        if not isinstance(steps, int) or steps < AUTO_EVOLVE_AL_TRUST_MIN_STEPS:
+            logger.debug(
+                f"[{session.session_id}] World model still in bootstrap "
+                f"(learning_steps={steps} < {AUTO_EVOLVE_AL_TRUST_MIN_STEPS}) "
+                f"— skipping AL bias (al_signal={err:.4f} considered uncalibrated)"
+            )
+            return 1.0
+
+        # Linear ramp from 0 at MIN_STEPS to 1 at FULL_STEPS
+        ramp_span = AUTO_EVOLVE_AL_TRUST_FULL_STEPS - AUTO_EVOLVE_AL_TRUST_MIN_STEPS
+        trust_factor = (steps - AUTO_EVOLVE_AL_TRUST_MIN_STEPS) / ramp_span
+        trust_factor = max(0.0, min(1.0, trust_factor))
+
+        mult = 1.0 + (err * AUTO_EVOLVE_AL_MAX_BOOST * trust_factor)
+        logger.debug(
+            f"[{session.session_id}] AL bias active: "
+            f"al_signal={err:.4f}, learning_steps={steps}, "
+            f"trust_factor={trust_factor:.4f} → mult={mult:.4f}"
+        )
+        return mult
 
     def _dispatch_winners_parallel(self, session: EvolveSession,
                                     winners: List[Dict], user_id: str) -> None:
@@ -296,11 +462,35 @@ class AutoEvolveOrchestrator:
 
         Mutations on `session` (dispatched/failed/experiments/errors) are
         serialized by acquiring self._lock around each bookkeeping update.
+
+        FIX-1.4a: On SQLite (flat tier), ``db.commit()`` serializes the
+        whole database file, and multiple concurrent commits produce
+        ``database is locked`` SQLALchemy errors.  Detect the engine URL
+        and drop ``max_workers`` to 1 when SQLite is the backend.  MySQL
+        (regional/central) keeps the bounded parallel dispatch.
+
+        FIX-1.4b: ``_dispatch_experiment`` returns ``{'success': False,
+        'reason': ...}`` on logical failure (e.g. already-dispatched
+        experiment, missing goal recipe) WITHOUT raising.  The earlier
+        code counted those as successful dispatches, so a session with
+        100 % logical-failure returns would sit at status='running' with
+        ``dispatched == N`` and ``failed == 0`` forever.  Branch on the
+        ``success`` flag: only count dispatched on True, else route to
+        the ``failed`` counter + errors list so the terminal-state rule
+        at line 192 (``running if dispatched > 0 else failed``) fires
+        correctly.
         """
         if not winners:
             return
 
-        max_workers = min(len(winners), AUTO_EVOLVE_MAX_PARALLEL_DISPATCH)
+        max_parallel = AUTO_EVOLVE_MAX_PARALLEL_DISPATCH
+        if _is_sqlite_backend():
+            max_parallel = 1  # FIX-1.4a: serialize on flat/SQLite
+            logger.debug(
+                f"[{session.session_id}] SQLite backend detected — "
+                f"serializing dispatch to avoid 'database is locked'")
+
+        max_workers = min(len(winners), max_parallel)
         with ThreadPoolExecutor(
                 max_workers=max_workers,
                 thread_name_prefix=f'auto-evolve-{session.session_id}') as pool:
@@ -312,18 +502,48 @@ class AutoEvolveOrchestrator:
                 exp = futures[future]
                 try:
                     goal_result = future.result()
+                    # FIX-1.4b: distinguish logical success from logical failure.
+                    # _dispatch_experiment returns dict — missing/falsy 'success'
+                    # key = logical failure, not dispatched.
+                    success = (
+                        isinstance(goal_result, dict)
+                        and bool(goal_result.get('success'))
+                    )
                     with self._lock:
-                        session.dispatched += 1
-                        session.experiments.append({
-                            'id': exp['id'],
-                            'title': exp.get('title', ''),
-                            'type': exp.get('experiment_type', 'traditional'),
-                            'approval_score': exp.get('_approval_score', 0),
-                            'super_majority': exp.get('_super_majority', 0),
-                            'goal_id': goal_result.get('goal_id')
-                            if isinstance(goal_result, dict) else None,
-                            'status': 'dispatched',
-                        })
+                        if success:
+                            session.dispatched += 1
+                            session.experiments.append({
+                                'id': exp['id'],
+                                'title': exp.get('title', ''),
+                                'type': exp.get('experiment_type', 'traditional'),
+                                'approval_score': exp.get('_approval_score', 0),
+                                'super_majority': exp.get('_super_majority', 0),
+                                'goal_id': goal_result.get('goal_id')
+                                if isinstance(goal_result, dict) else None,
+                                'status': 'dispatched',
+                            })
+                        else:
+                            session.failed += 1
+                            reason = (
+                                goal_result.get('reason')
+                                if isinstance(goal_result, dict)
+                                else 'non-dict result'
+                            ) or 'unknown'
+                            session.errors.append(
+                                f"Dispatch {exp['id']}: {reason}")
+                            session.experiments.append({
+                                'id': exp['id'],
+                                'title': exp.get('title', ''),
+                                'type': exp.get('experiment_type', 'traditional'),
+                                'approval_score': exp.get('_approval_score', 0),
+                                'super_majority': exp.get('_super_majority', 0),
+                                'goal_id': None,
+                                'status': 'failed',
+                                'reason': reason,
+                            })
+                            logger.info(
+                                f"[{session.session_id}] Dispatch declined "
+                                f"for {exp['id']}: {reason}")
                 except Exception as e:
                     with self._lock:
                         session.failed += 1

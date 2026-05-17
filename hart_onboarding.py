@@ -820,19 +820,11 @@ Example format: ["zanmizu", "hivaan", "kazeran", "uyiren", "tsukiron"]"""
 
     candidates = []
 
-    # Try direct HTTP call to llama-server first (fastest, no import chain)
+    # Direct HTTP call to llama-server. If it returns nothing (server down, URL
+    # not yet published), fall through to _fallback_names below — we NEVER import
+    # hart_intelligence here: in bundled Nunba mode that pulls langchain_classic
+    # + transformers into the onboarding hot path.
     text = _llm_generate_direct(generation_prompt)
-
-    # Fallback: LangChain get_llm (heavier import chain)
-    if not text:
-        try:
-            from hart_intelligence import get_llm
-            llm = get_llm(temperature=0.9, max_tokens=200)
-            result = llm.invoke(generation_prompt)
-            text = result.content if hasattr(result, 'content') else str(result)
-        except Exception as e:
-            logger.warning(f"LLM name generation failed: {e}")
-            text = None
 
     if text:
         # Parse JSON array from response
@@ -942,31 +934,64 @@ def _get_label(options: list, key: str, lang: str) -> str:
     return key
 
 
+_llm_unreachable_logged = False
+
+
 def _llm_generate_direct(prompt: str) -> Optional[str]:
-    """Direct HTTP call to llama-server — no import chain, lightweight."""
+    """Direct HTTP call to llama-server — no heavy import chain.
+
+    Resolves the endpoint through `core.port_registry.get_local_llm_url()`,
+    the single source of truth used by every other HARTOS consumer (helper,
+    hart_intelligence_entry, gather_agentdetails, vlm.local_loop,
+    autogen_config). That function's 4-tier resolution (HEVOLVE_LOCAL_LLM_URL
+    → CUSTOM_LLM_BASE_URL → LLAMA_CPP_PORT → port_registry default) always
+    returns a /v1-suffixed URL, so we just append /chat/completions.
+
+    In bundled Nunba this MUST NOT fall back to importing hart_intelligence —
+    that drags langchain_classic + transformers into the onboarding path
+    and can crash on venv metadata (KeyError: 'Name' from
+    importlib.metadata.packages_distributions)."""
     import urllib.request
     import urllib.error
 
-    for port in (8080, 8081):
-        try:
-            payload = json.dumps({
-                'model': 'default',
-                'messages': [{'role': 'user', 'content': prompt}],
-                'temperature': 0.9,
-                'max_tokens': 200,
-            }).encode()
-            req = urllib.request.Request(
-                f'http://127.0.0.1:{port}/v1/chat/completions',
-                data=payload,
-                headers={'Content-Type': 'application/json'},
-                method='POST',
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode())
-                return data['choices'][0]['message']['content']
-        except Exception:
-            continue
-    return None
+    global _llm_unreachable_logged
+
+    try:
+        from core.port_registry import get_local_llm_url
+        base = (get_local_llm_url() or '').strip().rstrip('/')
+    except Exception:
+        # Standalone-HARTOS safety: if port_registry isn't importable at all,
+        # fall through to the env var directly so this function still works.
+        base = (os.environ.get('HEVOLVE_LOCAL_LLM_URL') or '').strip().rstrip('/')
+
+    if not base:
+        if not _llm_unreachable_logged:
+            logger.info("LLM name gen: no local URL published yet — using curated fallback names")
+            _llm_unreachable_logged = True
+        return None
+
+    url = base + '/chat/completions'
+    try:
+        payload = json.dumps({
+            'model': 'default',
+            'messages': [{'role': 'user', 'content': prompt}],
+            'temperature': 0.9,
+            'max_tokens': 200,
+        }).encode()
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+            return data['choices'][0]['message']['content']
+    except Exception as e:
+        if not _llm_unreachable_logged:
+            logger.info(f"LLM name gen: local endpoint unreachable ({e}) — using curated fallback")
+            _llm_unreachable_logged = True
+        return None
 
 
 def _validate_names_cross_language(candidates: List[str], user_language: str) -> List[str]:
@@ -997,19 +1022,12 @@ Return ONLY a JSON array of the SAFE names (ones with no negative meaning in any
 If ALL names are unsafe, return an empty array: []
 Return ONLY the JSON array, nothing else."""
 
-    # Try direct HTTP first (no import chain)
+    # Direct HTTP call only — never import hart_intelligence here (see
+    # _llm_generate_direct docstring). If the llama-server URL isn't published
+    # yet or the call fails, we return all candidates unchanged below: a
+    # best-effort cross-language filter is not worth dragging the ML stack
+    # into the in-process Nunba onboarding path.
     text = _llm_generate_direct(prompt)
-
-    # Fallback: LangChain get_llm
-    if not text:
-        try:
-            from hart_intelligence import get_llm
-            llm = get_llm(temperature=0.0, max_tokens=300)
-            result = llm.invoke(prompt)
-            text = result.content if hasattr(result, 'content') else str(result)
-        except Exception as e:
-            logger.warning(f"Cross-language name validation failed: {e}")
-            text = None
 
     if text:
         try:

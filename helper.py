@@ -1424,8 +1424,9 @@ def get_frame(user_id, frame_store=None):
     # Go through the helper so there's one accessor for the store, not
     # `get_vision_service().store` reach-ins scattered across files.
     try:
-        from hart_intelligence import get_frame_store
-        fs = get_frame_store()
+        from core.safe_hartos_attr import safe_hartos_attr
+        get_frame_store = safe_hartos_attr('get_frame_store')
+        fs = get_frame_store() if get_frame_store is not None else None
         if fs is not None:
             frame_bytes = fs.get_frame(str(user_id))
             if frame_bytes is not None:

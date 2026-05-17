@@ -16,8 +16,13 @@ import sys
 import unittest
 from unittest.mock import patch, MagicMock
 
-# Pre-load a mock for hart_intelligence_entry to prevent slow import
-# during tests that trigger generate_hart_name -> get_llm
+# Legacy safety-net: generate_hart_name no longer imports
+# hart_intelligence_entry on the hot path (the heavy langchain_classic +
+# transformers chain is banned from onboarding — see hart_onboarding.py
+# ::_llm_generate_direct docstring). This mock is kept so the existing
+# `@patch.dict(sys.modules, {'hart_intelligence_entry': _mock_lgapi})`
+# decorators below don't break, and to guard against any future regression
+# that reintroduces the import.
 _mock_lgapi = MagicMock()
 _mock_lgapi.get_llm.side_effect = Exception("mocked — no LLM in tests")
 

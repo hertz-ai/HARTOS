@@ -93,6 +93,19 @@ class AutoResearchSession:
     benchmark_gain_enforced: bool = True  # BenchmarkTracker recorded iteration
     federation_export_enforced: bool = True  # Learning delta exported
 
+    # RSI gates — every promoted improvement must pass both.  If a gate
+    # layer is unavailable, the flag flips to False and a WARNING is
+    # emitted; if a gate layer is present and rejects, counters increment
+    # and last_rejection_reason records why.  Dashboards + tests read
+    # these via to_progress_dict() to verify the recursive self-improvement
+    # loop is actually closed.
+    constitutional_enforced: bool = True       # ConstitutionalFilter ran
+    baseline_delta_enforced: bool = True       # validate_against_baseline ran
+    federation_broadcast_enforced: bool = True  # broadcast_delta ran
+    constitutional_rejections: int = 0
+    baseline_rejections: int = 0
+    last_rejection_reason: str = ''
+
     # Last edit state (for decide step)
     _pending_edits: List[Dict] = field(default_factory=list)
     _pending_files: List[str] = field(default_factory=list)
@@ -126,6 +139,13 @@ class AutoResearchSession:
             'baseline_enforced': self.baseline_enforced,
             'benchmark_gain_enforced': self.benchmark_gain_enforced,
             'federation_export_enforced': self.federation_export_enforced,
+            # RSI gates — recursive self-improvement loop closure.
+            'constitutional_enforced': self.constitutional_enforced,
+            'baseline_delta_enforced': self.baseline_delta_enforced,
+            'federation_broadcast_enforced': self.federation_broadcast_enforced,
+            'constitutional_rejections': self.constitutional_rejections,
+            'baseline_rejections': self.baseline_rejections,
+            'last_rejection_reason': self.last_rejection_reason,
         }
 
 
@@ -185,6 +205,33 @@ class AutoResearchEngine:
             except Exception:
                 pass
 
+            # RSI-5: ε-greedy exploration arm.  When HEVOLVE_RSI_EXPLORE=1
+            # and the sampled coin lands in the explore bucket, swap the
+            # incremental-tuning prompt stance for a radical-mutation
+            # stance.  The LLM remains the code mutator (no parallel
+            # code-generator path), but the instruction distribution
+            # shifts — this is the cheapest honest wiring of the
+            # stochastic arm without inventing a second mutation backend.
+            # Safety: the candidate still passes RSI-1 + RSI-2 gates
+            # inside commit_improvement before promotion.
+            exploration_hint = ''
+            try:
+                from integrations.agent_engine.exploration_arm import (
+                    select_strategy,
+                )
+                if select_strategy() == 'explore':
+                    exploration_hint = (
+                        "\nEXPLORATION MODE: propose a RADICAL / "
+                        "ARCHITECTURAL change this iteration — not an "
+                        "incremental tweak.  Favor ideas that reshape "
+                        "the approach; safety gates still run before "
+                        "promotion, so a failed bold change costs "
+                        "nothing while a successful one opens the "
+                        "search space.\n"
+                    )
+            except Exception:
+                pass
+
             task = (
                 f"You are running an autonomous research loop.\n\n"
                 f"TARGET FILE: {session.target_file}\n"
@@ -195,6 +242,7 @@ class AutoResearchEngine:
                 f"ITERATION: {session.current_iteration}/{session.max_iterations}\n\n"
                 f"EXPERIMENT HISTORY:\n{history_summary}\n\n"
                 f"{benchmark_hint}"
+                f"{exploration_hint}"
                 f"RUN COMMAND: {session.run_command}\n\n"
                 f"YOUR TASK:\n"
                 f"1. Analyze what worked and what didn't from the history above\n"
@@ -366,9 +414,163 @@ class AutoResearchEngine:
         except Exception as e:
             logger.warning(f"[{session.session_id}] Revert failed: {e}")
 
+    # ── RSI gates ─────────────────────────────────────────────
+    # These two gates close the recursive self-improvement loop: no
+    # candidate becomes the new baseline unless ConstitutionalFilter
+    # allows it AND AgentBaselineService.validate_against_baseline
+    # reports no regression.  Both gates fail-open when the dependency
+    # is missing, but flip the corresponding *_enforced flag to False
+    # and log LOUDLY so the dashboard/test can see the bypass.
+
+    def _constitutional_gate(self, session: 'AutoResearchSession',
+                             result: 'ExperimentResult') -> Tuple[bool, str]:
+        """Check the hypothesis + edit summary against ConstitutionalFilter.
+
+        Returns (allowed, reason).  Fail-open on ImportError or hash
+        tamper, but flip session.constitutional_enforced=False in that
+        case so the dashboard can surface the missing gate.
+        """
+        try:
+            from security.hive_guardrails import ConstitutionalFilter
+        except ImportError as e:
+            session.constitutional_enforced = False
+            logger.warning(
+                "[%s] ConstitutionalFilter unavailable (ImportError: %s) — "
+                "iter %d promoted WITHOUT constitutional gate. "
+                "Set session.constitutional_enforced=False.",
+                session.session_id, e, result.iteration,
+            )
+            return True, 'gate_unavailable'
+
+        prompt_text = ' '.join(filter(None, [
+            result.hypothesis or '',
+            session.metric_name or '',
+            ' '.join(result.files_changed or []),
+        ]))
+        try:
+            allowed, reason = ConstitutionalFilter.check_prompt(prompt_text)
+        except RuntimeError as e:
+            # Guardrail tamper — fail-CLOSED.  This is the one case where
+            # the gate is authoritative: if the guardrail values were
+            # mutated in memory we must NOT promote.
+            session.constitutional_enforced = True
+            logger.critical(
+                "[%s] ConstitutionalFilter TAMPER on iter %d: %s — "
+                "refusing to promote.",
+                session.session_id, result.iteration, e,
+            )
+            return False, f'guardrail_tamper: {e}'
+        except Exception as e:
+            session.constitutional_enforced = False
+            logger.warning(
+                "[%s] ConstitutionalFilter.check_prompt failed "
+                "(%s: %s) — iter %d promoted WITHOUT gate.",
+                session.session_id, type(e).__name__, e, result.iteration,
+            )
+            return True, 'gate_errored'
+
+        return allowed, reason
+
+    def _baseline_delta_gate(self, session: 'AutoResearchSession'
+                              ) -> Tuple[bool, List[str], str]:
+        """Run AgentBaselineService.validate_against_baseline.
+
+        Returns (passed, regressions, reason).  Fail-open if service is
+        unavailable or no baseline exists yet (first-run case), but
+        flip session.baseline_delta_enforced=False on unavailable path.
+        """
+        try:
+            from integrations.agent_engine.agent_baseline_service import (
+                AgentBaselineService,
+            )
+        except ImportError as e:
+            session.baseline_delta_enforced = False
+            logger.warning(
+                "[%s] AgentBaselineService unavailable for delta gate "
+                "(ImportError: %s) — promoted WITHOUT baseline compare.",
+                session.session_id, e,
+            )
+            return True, [], 'gate_unavailable'
+
+        try:
+            prompt_id = session.experiment_id or session.session_id
+            result = AgentBaselineService.validate_against_baseline(
+                prompt_id=prompt_id, flow_id=0,
+            )
+        except Exception as e:
+            session.baseline_delta_enforced = False
+            logger.warning(
+                "[%s] validate_against_baseline errored (%s: %s) — "
+                "promoted WITHOUT baseline compare.",
+                session.session_id, type(e).__name__, e,
+            )
+            return True, [], 'gate_errored'
+
+        passed = bool(result.get('passed', True))
+        regressions = list(result.get('regressions', []) or [])
+        reason = result.get('reason', '') or (
+            'no_regressions' if passed else 'regressions_detected'
+        )
+        return passed, regressions, reason
+
     def commit_improvement(self, session: AutoResearchSession,
-                           result: ExperimentResult):
-        """Commit the improvement to git and save as recipe step."""
+                           result: ExperimentResult) -> bool:
+        """Commit the improvement to git and save as recipe step.
+
+        Returns True if the candidate was actually promoted (gates passed +
+        git commit attempted), False if a gate rejected it (pending edits
+        reverted, session rejection counters incremented).
+
+        RSI gate chain (both must pass to promote):
+            1. ConstitutionalFilter — hypothesis/edit summary free of
+               violation patterns.
+            2. AgentBaselineService.validate_against_baseline — no
+               cross-metric regression vs the latest live snapshot.
+
+        Fail-open on missing dependencies (flags flip loud), fail-closed
+        on guardrail tamper.
+        """
+        # ── RSI-1: constitutional gate ──
+        allowed, cons_reason = self._constitutional_gate(session, result)
+        if not allowed:
+            session.constitutional_rejections += 1
+            session.last_rejection_reason = f'constitutional: {cons_reason}'
+            logger.warning(
+                "[%s] Iter %d REJECTED by ConstitutionalFilter: %s — "
+                "reverting pending edits.",
+                session.session_id, result.iteration, cons_reason,
+            )
+            self.revert_changes(session)
+            self.emit_progress(session, 'autoresearch.rejected', {
+                'iteration': result.iteration,
+                'gate': 'constitutional',
+                'reason': cons_reason,
+            })
+            return False
+
+        # ── RSI-2: baseline delta gate ──
+        passed, regressions, base_reason = self._baseline_delta_gate(session)
+        if not passed:
+            session.baseline_rejections += 1
+            session.last_rejection_reason = (
+                f'baseline_regression: {"; ".join(regressions) or base_reason}'
+            )
+            logger.warning(
+                "[%s] Iter %d REJECTED by baseline delta: %s — "
+                "reverting pending edits.",
+                session.session_id, result.iteration,
+                regressions or base_reason,
+            )
+            self.revert_changes(session)
+            self.emit_progress(session, 'autoresearch.rejected', {
+                'iteration': result.iteration,
+                'gate': 'baseline_delta',
+                'regressions': regressions,
+                'reason': base_reason,
+            })
+            return False
+
+        # ── Gates passed — proceed with existing commit + recipe + snapshot ──
         try:
             from integrations.coding_agent.aider_core.run_cmd import run_cmd_subprocess
             msg = (f"autoresearch iter {result.iteration}: "
@@ -433,6 +635,13 @@ class AutoResearchEngine:
                 session.session_id, type(e).__name__, e, result.iteration,
             )
 
+        self.emit_progress(session, 'autoresearch.promoted', {
+            'iteration': result.iteration,
+            'metric_value': result.metric_value,
+            'baseline_value': result.baseline_value,
+        })
+        return True
+
     # ── History & Reporting ──────────────────────────────────
 
     def build_history_summary(self, session: AutoResearchSession) -> str:
@@ -483,16 +692,28 @@ class AutoResearchEngine:
         self.export_learning_delta(session)
 
     def export_learning_delta(self, session: AutoResearchSession):
-        """Export session results as a federated learning delta.
+        """Export session results as a federated learning delta AND
+        broadcast them to peer Hive nodes.
 
-        If BenchmarkTracker is unavailable the delta is NOT exported — the
-        hive won't learn from this session.  Mark the session flag + warn
-        so upstream (finalize report, dashboards) can surface the gap.
+        Two layers:
+            1. BenchmarkTracker.export_learning_delta — prepare the
+               delta payload.  If unavailable, federation_export_enforced
+               flips False and a WARNING is emitted.
+            2. FederatedAggregator.broadcast_delta — actually transmit
+               the delta to known peers.  If unavailable OR if the peer
+               POST leg errors, federation_broadcast_enforced flips False
+               and a WARNING is emitted.  ScopeGuard inside broadcast_delta
+               is the authoritative egress gate (PII / secrets blocked).
+
+        This closes RSI-3: promoted improvements actually propagate across
+        the Hive so "the most" user-owned nodes benefit, not just the
+        instance that ran the iteration.
         """
+        delta = None
         try:
             from integrations.coding_agent.benchmark_tracker import get_benchmark_tracker
             tracker = get_benchmark_tracker()
-            delta = tracker.export_learning_delta()
+            delta = tracker.export_learning_delta() or {}
             delta['autoresearch'] = {
                 'session_id': session.session_id,
                 'experiment_id': session.experiment_id,
@@ -501,8 +722,15 @@ class AutoResearchEngine:
                 'best': session.best_metric,
                 'total_improvements': session.total_improvements,
                 'iterations': session.current_iteration,
+                'constitutional_rejections': session.constitutional_rejections,
+                'baseline_rejections': session.baseline_rejections,
             }
-            logger.info(f"[{session.session_id}] Learning delta prepared for federation")
+            logger.info(
+                "[%s] Learning delta prepared for federation "
+                "(improvements=%d, rejections=c%d/b%d)",
+                session.session_id, session.total_improvements,
+                session.constitutional_rejections, session.baseline_rejections,
+            )
         except ImportError as e:
             session.federation_export_enforced = False
             logger.warning(
@@ -511,11 +739,43 @@ class AutoResearchEngine:
                 "this session.  Set session.federation_export_enforced=False.",
                 session.session_id, e,
             )
+            return
         except Exception as e:
             session.federation_export_enforced = False
             logger.warning(
                 "[%s] Learning delta export failed (%s: %s) — "
                 "hive will not learn from this session.",
+                session.session_id, type(e).__name__, e,
+            )
+            return
+
+        # ── RSI-3: broadcast to peer Hive nodes ──
+        # This is the "federate" leg.  Without it, improvements stay
+        # local and "the most" never benefits.  ScopeGuard inside
+        # broadcast_delta is the authoritative egress gate.
+        try:
+            from integrations.agent_engine.federated_aggregator import (
+                get_federated_aggregator,
+            )
+            aggregator = get_federated_aggregator()
+            aggregator.broadcast_delta(delta)
+            logger.info(
+                "[%s] Learning delta broadcast to hive peers via "
+                "FederatedAggregator", session.session_id,
+            )
+        except ImportError as e:
+            session.federation_broadcast_enforced = False
+            logger.warning(
+                "[%s] FederatedAggregator unavailable (ImportError: %s) — "
+                "delta NOT broadcast to peers; hive will not learn from "
+                "this session.  Set session.federation_broadcast_enforced=False.",
+                session.session_id, e,
+            )
+        except Exception as e:
+            session.federation_broadcast_enforced = False
+            logger.warning(
+                "[%s] FederatedAggregator.broadcast_delta failed "
+                "(%s: %s) — peers did not receive this session's delta.",
                 session.session_id, type(e).__name__, e,
             )
 
@@ -779,30 +1039,48 @@ def autoresearch_decide(session_id: str) -> str:
     error = last_result_dict.get('error', '')
 
     if error or not improved:
-        # Revert
+        # Revert — in-session metric failed to improve.
         engine.revert_changes(session)
         decision = 'reverted'
         logger.info(f"[{session.session_id}] Iter {session.current_iteration} "
                      f"reverted: {metric_value} vs best {session.best_metric}")
     else:
-        # Keep — commit + recipe + baseline snapshot
+        # Candidate passed the in-session metric check — hand it to
+        # commit_improvement which runs the RSI gates (constitutional +
+        # baseline delta) and returns False if either rejects.  On
+        # rejection it reverts the pending edits itself and bumps the
+        # appropriate rejection counter, so we only update best_metric /
+        # best_iteration / total_improvements when the promote actually
+        # landed.  This enforces the monotonic-vs-today's-baseline
+        # guarantee globally, not just on the metric being optimized.
+        prior_best = session.best_metric
         result = ExperimentResult(
             iteration=session.current_iteration,
             hypothesis=session._pending_hypothesis,
             metric_name=session.metric_name,
             metric_value=metric_value,
-            baseline_value=session.best_metric,
+            baseline_value=prior_best,
             improved=True,
             edits=session._pending_edits,
             files_changed=session._pending_files,
         )
-        session.best_metric = metric_value
-        session.best_iteration = session.current_iteration
-        session.total_improvements += 1
-        engine.commit_improvement(session, result)
-        decision = 'kept'
-        logger.info(f"[{session.session_id}] Iter {session.current_iteration} "
-                     f"IMPROVED: {metric_value} (was {result.baseline_value})")
+        committed = engine.commit_improvement(session, result)
+        if committed:
+            session.best_metric = metric_value
+            session.best_iteration = session.current_iteration
+            session.total_improvements += 1
+            decision = 'kept'
+            logger.info(
+                f"[{session.session_id}] Iter {session.current_iteration} "
+                f"IMPROVED: {metric_value} (was {prior_best})")
+        else:
+            # RSI gate rejected.  best_metric stays at prior_best and the
+            # pending edits were already reverted by commit_improvement.
+            decision = 'rejected_by_gate'
+            logger.info(
+                f"[{session.session_id}] Iter {session.current_iteration} "
+                f"gated (reason={session.last_rejection_reason}); "
+                f"best remains {prior_best}")
 
     # Clear pending state
     session._pending_hypothesis = ''

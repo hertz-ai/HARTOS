@@ -3,14 +3,26 @@ MessageBus — unified publish/subscribe across all transports.
 
 Every publish routes to ALL available transports simultaneously:
   1. LOCAL EventBus — always available, same-process delivery
-  2. PEERLINK — encrypted direct links to peers (when connected)
-  3. CROSSBAR — central telemetry + legacy mobile push (when internet available)
+  2. SSE          — same-machine cross-process (Flask → frontend), always available
+  3. PEERLINK     — encrypted direct links to peers (when connected)
+  4. CROSSBAR     — central telemetry + legacy mobile push (when internet available)
 
 Works at every level:
-  Single device offline     → LOCAL only
-  Multi-device LAN          → LOCAL + PEERLINK (plain, same-user)
-  Multi-device WAN          → LOCAL + PEERLINK (encrypted) + CROSSBAR
-  Full hive                 → LOCAL + PEERLINK (encrypted) + CROSSBAR
+  Single device offline     → LOCAL + SSE
+  Multi-device LAN          → LOCAL + SSE + PEERLINK (plain, same-user)
+  Multi-device WAN          → LOCAL + SSE + PEERLINK (encrypted) + CROSSBAR
+  Full hive                 → LOCAL + SSE + PEERLINK (encrypted) + CROSSBAR
+
+The SSE leg fan-outs to the same-machine frontend via the Flask SSE
+broker (see ``core.platform.events.broadcast_sse_safe``). It is the
+only delivery path that does NOT depend on Crossbar / WAMP being up
+— so any chat upgrade, dashboard invalidate, or capability event
+remains visible to the local UI even when the WAMP router refuses
+connection. Without the SSE leg every caller would have to bolt on
+``broadcast_sse_safe`` by hand and inevitably forget it (the
+``_deliver_expert_to_user_async`` regression is exactly that
+shape — expert reply published to WAMP only, lost when Crossbar
+was down).
 
 Dedup: message_id LRU set prevents double delivery when message
 arrives via multiple transports.
@@ -108,6 +120,22 @@ def resolve_legacy_topic(legacy_topic: str):
     return None, ''
 
 
+def chat_topic_for(user_id: str) -> str:
+    """Return the legacy WAMP chat topic for a given user.
+
+    Single source of truth for the per-user chat-bubble topic.
+    Replaces the inline ``f'com.hertzai.hevolve.chat.{user_id}'``
+    pattern that was duplicated at every publish call site.
+
+    Output is byte-identical to the inline f-string callers were
+    producing — every subscriber (Android RN, Web SPA, Nunba
+    adapter) sees zero wire change.  This is purely a refactor
+    seam so the legacy topic name lives in one place the day we
+    eventually retire it.
+    """
+    return f'com.hertzai.hevolve.chat.{user_id}'
+
+
 class _LRUDedup:
     """LRU set for message deduplication. O(1) check and insert."""
 
@@ -144,6 +172,7 @@ class MessageBus:
         self._stats = {
             'published': 0,
             'delivered_local': 0,
+            'delivered_sse': 0,
             'delivered_peerlink': 0,
             'delivered_crossbar': 0,
             'deduplicated': 0,
@@ -163,8 +192,34 @@ class MessageBus:
     def publish(self, topic: str, data: dict = None,
                 user_id: str = '', device_id: str = '',
                 skip_crossbar: bool = False,
-                skip_peerlink: bool = False) -> str:
+                skip_peerlink: bool = False,
+                skip_sse: bool = False) -> str:
         """Publish a message to all available transports.
+
+        Fan-out order (each leg is independent — failure in one never
+        blocks the others):
+
+          1. LOCAL    — same-process subscribers + EventBus       (always)
+          2. SSE      — same-machine Flask → frontend, no network (always)
+          3. PEERLINK — P2P device-to-device (BLE / local Wi-Fi)  (best-effort)
+          4. CROSSBAR — WAMP / cross-network                       (best-effort)
+
+        SSE is treated like LOCAL trust-wise (same-machine, loopback
+        only, MCP-token gated) so payloads pass through unredacted.
+        Outbound legs (PEERLINK + CROSSBAR) get the DLP scrub.
+
+        SUBTLE — Nunba's adapter does NOT see direct ``bus.publish``
+        calls.  Nunba's ``routes/hartos_backend_adapter.py``
+        monkey-patches ``hart_intelligence.publish_async``, not this
+        method.  Callers that go directly through the bus
+        (``bus.publish(...)``) bypass that monkey-patch — Nunba's
+        per-request thinking-trace buffer never sees those messages.
+        For chat-bubble publishes, prefer
+        ``hart_intelligence.publish_async(chat_topic_for(user_id),
+        json.dumps(payload))`` so the interceptor still fires.
+        Migration to a bus subscriber on ``chat.response`` is the
+        right long-term shape (tracked in
+        ``memory/project_publish_aop_migration.md``).
 
         Args:
             topic: Dot-notation topic (e.g., 'chat.response')
@@ -173,6 +228,10 @@ class MessageBus:
             device_id: For per-device topic routing
             skip_crossbar: Don't publish to Crossbar (for local-only events)
             skip_peerlink: Don't publish to PeerLink (for same-process events)
+            skip_sse: Don't publish to the same-machine SSE broker
+                (for events that should NEVER reach the local UI, e.g.
+                pure server-to-server telemetry).  Default False so
+                every existing caller automatically gains the SSE leg.
 
         Returns:
             Message ID (for dedup/tracking)
@@ -196,6 +255,14 @@ class MessageBus:
         # 1. LOCAL — always deliver (unredacted, same process)
         self._route_local(topic, data, msg_id)
 
+        # 2. SSE — same-machine cross-process, unredacted (same trust as LOCAL —
+        #    loopback only, MCP-token gated, same user).  Always attempted; the
+        #    helper no-ops gracefully if the SSE broker hasn't been set up yet
+        #    (e.g. tests, or pre-Flask boot).  This is the leg that keeps the
+        #    local UI working when Crossbar / WAMP is down.
+        if not skip_sse:
+            self._route_sse(topic, data, user_id, msg_id)
+
         # Redact secrets before outbound transmission (PeerLink + Crossbar)
         outbound_data = data
         if not skip_peerlink or not skip_crossbar:
@@ -209,11 +276,11 @@ class MessageBus:
             except (ImportError, Exception):
                 pass  # DLP not available — proceed unredacted
 
-        # 2. PEERLINK — if connected peers exist
+        # 3. PEERLINK — if connected peers exist
         if not skip_peerlink:
             self._route_peerlink(topic, outbound_data, msg_id)
 
-        # 3. CROSSBAR — if internet available (and not skipped)
+        # 4. CROSSBAR — if internet available (and not skipped)
         if not skip_crossbar:
             self._route_crossbar(topic, outbound_data, user_id, device_id, msg_id)
 
@@ -302,6 +369,40 @@ class MessageBus:
             pass
 
         self._stats['delivered_local'] += 1
+
+    def _route_sse(self, topic: str, data: dict, user_id: str, msg_id: str):
+        """Push to the same-machine SSE broker (Flask → frontend).
+
+        Uses ``core.platform.events.broadcast_sse_safe`` which encapsulates
+        the ``import __main__`` + ``sys.modules['main_module']`` fallback
+        chain (Nunba's SSE registry lives on ``__main__``).  The helper
+        returns ``False`` if the SSE broker hasn't been wired up yet —
+        we increment the stat only on confirmed delivery so test runs
+        and pre-Flask boot don't inflate the counter.
+
+        Event type is the bus topic itself (1:1 mapping).  Frontends
+        listening for legacy event names (``'notification'``,
+        ``'message'``, ``'capability_update'``, etc.) will keep working
+        because those callers continue to invoke ``broadcast_sse_safe``
+        directly with their legacy event_type — this bus leg is purely
+        additive for callers that didn't have an SSE leg before.
+
+        Best-effort — never raises.  An SSE failure must not block the
+        outbound legs (PEERLINK / CROSSBAR) or the LOCAL deliveries that
+        already happened.
+        """
+        try:
+            from core.platform.events import broadcast_sse_safe
+        except Exception:
+            return  # core.platform.events not importable — fail-closed silent
+        try:
+            delivered = broadcast_sse_safe(
+                topic, data, user_id=(user_id or None))
+        except Exception as e:
+            logger.debug(f"SSE route failed for {topic}: {e}")
+            return
+        if delivered:
+            self._stats['delivered_sse'] += 1
 
     def _route_peerlink(self, topic: str, data: dict, msg_id: str):
         """Send to connected peers via PeerLink 'events' channel."""

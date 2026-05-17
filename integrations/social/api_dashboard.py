@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import time
 
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request, make_response
 
 logger = logging.getLogger('hevolve_social')
 
@@ -25,14 +25,32 @@ def get_agent_dashboard():
 
     Priority-ordered: what matters most RIGHT NOW appears first.
     Status reflects reality, not cache.
+
+    Honors ``If-None-Match``: a fresh 304 short-circuits the 5 SQL
+    queries + 170-row serialization when the dashboard hasn't changed.
+    The React UI polls every 5s — without ETag, every poll re-runs the
+    full pipeline and queues waitress workers under throttle.  See
+    DashboardService.get_dashboard_version for the hash inputs.
     """
     from .dashboard_service import DashboardService
     from .models import get_db
 
     db = get_db()
     try:
+        version = DashboardService.get_dashboard_version(db)
+        etag = f'W/"dash-{version}"'
+        # Conditional GET — 304 with no body is the entire point.
+        if request.headers.get('If-None-Match') == etag:
+            resp = make_response('', 304)
+            resp.headers['ETag'] = etag
+            resp.headers['Cache-Control'] = 'private, max-age=2'
+            return resp
+
         data = DashboardService.get_dashboard(db)
-        return jsonify({'success': True, 'data': data}), 200
+        resp = make_response(jsonify({'success': True, 'data': data}), 200)
+        resp.headers['ETag'] = etag
+        resp.headers['Cache-Control'] = 'private, max-age=2'
+        return resp
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500

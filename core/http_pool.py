@@ -23,6 +23,47 @@ from urllib3.util.retry import Retry
 
 logger = logging.getLogger('hevolve_core')
 
+# urllib3.connectionpool emits a WARNING per retry attempt
+# ("Retrying ... after connection broken by 'NameResolutionError'")
+# which floods the log when central.hevolve.ai is unreachable
+# (offline laptop, DNS down, captive portal).  Real connection
+# failures still surface via caller try/except handlers (see
+# core.superadmin_report._post_report's logger.debug, peer_discovery's
+# PeerBackoff exponential backoff, etc.) - urllib3's per-retry
+# WARNING is pure noise on top of those.
+#
+# Downgrading to ERROR keeps genuine connection-pool issues visible
+# while silencing the per-retry retry chatter.
+logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
+
+# autobahn.asyncio.component emits a WARNING per connect-retry when a
+# Crossbar WAMP router isn't running ("Connection failed with OS
+# error: ConnectionRefusedError" + "trying transport 0 ws://localhost
+# :8088/ws using connect delay 300").  The component's own retry loop
+# already implements exponential backoff up to 300s; the per-attempt
+# WARNING is informational noise on flat-mode installs that don't run
+# Crossbar.  Real session failures still surface via core/platform/
+# events.py:_run's "WAMP component exited: %s" warning, which carries
+# context (which url, which realm) the autobahn line lacks.  Bumping
+# the autobahn logger to ERROR keeps genuine connect-attempt errors
+# (e.g. ssl handshake failure on a real Crossbar URL) visible.
+logging.getLogger('autobahn.asyncio.component').setLevel(logging.ERROR)
+# autobahn.wamp.component (parent module) ALSO emits the connect-error
+# traceback at handle_connect_error - separate logger from the
+# .asyncio.component child.  Plus txaio.aio formats the traceback at
+# its own level.  Without silencing both, the traceback still surfaces
+# even when .asyncio.component is at ERROR (the traceback reaches the
+# root logger via stderr emit).  Bumping all three keeps the log clean
+# on flat installs without Crossbar.
+logging.getLogger('autobahn.wamp.component').setLevel(logging.ERROR)
+logging.getLogger('autobahn').setLevel(logging.ERROR)
+logging.getLogger('txaio').setLevel(logging.ERROR)
+# Same logic for asyncio's "socket.send() raised exception" pairs that
+# fire alongside the failed Crossbar connect attempts - the underlying
+# transport-failure event is already covered by the autobahn warning
+# we just silenced; asyncio's transport-level chatter is redundant.
+logging.getLogger('asyncio').setLevel(logging.ERROR)
+
 _session = None
 _session_lock = threading.Lock()
 

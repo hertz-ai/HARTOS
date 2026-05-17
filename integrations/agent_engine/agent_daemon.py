@@ -233,6 +233,14 @@ class AgentDaemon:
 
         Feeds dense attribution chain to WorldModelBridge via agent_attribution.
         """
+        # Single canonical daemon yield gate (user activity + system
+        # pressure).  Without this the proactive tick saturates GIL with
+        # speculative dispatches (DB churn + LLM HTTP) while the user is
+        # actively chatting — py-spy showed 8s+ sampling lag.
+        from .dispatch import should_yield_to_user
+        if should_yield_to_user():
+            return
+
         now = time.time()
 
         # Attribution: track this tick as a long-horizon action
@@ -442,11 +450,15 @@ class AgentDaemon:
                 break
             self._wd_heartbeat()
 
-            # Proactive hive tick — exploration, self-promotion, compute optimization
-            try:
-                self._proactive_hive_tick()
-            except Exception as e:
-                logger.debug(f"Proactive hive tick error: {e}")
+            # Proactive hive tick — exploration, self-promotion, compute
+            # optimization.  RUN ASYNC: a stuck call inside the proactive
+            # path (WorldModelBridge.record_interaction was the culprit
+            # 2026-04-29 — daemon restarted 9 times by watchdog without
+            # ever reaching _tick() because complete_action blocked) must
+            # NOT block the goal-dispatch tick.  Fire-and-forget in a
+            # daemon thread; watchdog heartbeat stays fresh because
+            # _loop continues immediately to _tick.
+            self._spawn_proactive_hive_tick_async()
 
             try:
                 self._tick()
@@ -456,6 +468,36 @@ class AgentDaemon:
                 import traceback
                 logger.error(f"Agent daemon tick error (backoff={self._consecutive_failures}): "
                              f"{e}\n{traceback.format_exc()}")
+
+    def _spawn_proactive_hive_tick_async(self) -> None:
+        """Run _proactive_hive_tick in a daemon thread, never blocking _loop.
+
+        If the prior iteration's thread is still alive (sub-call stuck on
+        sync I/O), we SKIP this iteration rather than pile up threads.
+        That makes the proactive cadence "best-effort" while keeping the
+        main goal-dispatch tick on its 30s rhythm regardless.
+
+        Watchdog heartbeat is owned by _loop, not the proactive thread —
+        so a stuck sub-call no longer ages the daemon's heartbeat past
+        the 300s frozen threshold.
+        """
+        prior = getattr(self, '_proactive_thread', None)
+        if prior is not None and prior.is_alive():
+            logger.warning(
+                "proactive_hive_tick from prior iteration still running — "
+                "skipping this cycle (likely a sub-call is blocked on I/O)")
+            return
+
+        def _runner():
+            try:
+                self._proactive_hive_tick()
+            except Exception as e:
+                logger.debug(f"Proactive hive tick error: {e}")
+
+        t = threading.Thread(
+            target=_runner, daemon=True, name='proactive_hive_tick')
+        t.start()
+        self._proactive_thread = t
 
     def _tick(self):
         """Find active goals, find idle agents, dispatch via /chat.
@@ -478,25 +520,20 @@ class AgentDaemon:
         from integrations.social.models import get_db, AgentGoal, Product
         from integrations.coding_agent.idle_detection import IdleDetectionService
         from .goal_manager import GoalManager, CODING_GOAL_TYPES
-        from .dispatch import dispatch_goal, is_user_recently_active
+        from .dispatch import dispatch_goal, should_yield_to_user
 
-        # Yield LLM to user requests — don't compete for inference
-        if is_user_recently_active():
-            logger.debug("Agent daemon: user/CREATE active, yielding LLM")
+        # Single canonical yield gate — user activity + system pressure.
+        # See dispatch.should_yield_to_user() docstring for the contract.
+        if should_yield_to_user():
+            logger.debug("Agent daemon: yielding (user active or system pressure)")
             return
-
-        # RESOURCE GATE: throttle dispatch when system is under pressure
-        # Prevents machine slowness while Nunba/HARTOS is running
+        # _throttle is consumed lower down for soft scaling decisions —
+        # re-read after the hard yield gate so we still have a value.
         try:
             from integrations.service_tools.model_lifecycle import (
                 get_model_lifecycle_manager)
-            _pressure = get_model_lifecycle_manager().get_system_pressure()
-            _throttle = _pressure.get('throttle_factor', 1.0)
-            if _throttle < 0.1:
-                logger.debug(
-                    "Agent daemon: system under heavy pressure "
-                    f"(throttle={_throttle:.2f}), skipping dispatch")
-                return
+            _throttle = get_model_lifecycle_manager().get_system_pressure().get(
+                'throttle_factor', 1.0)
         except Exception:
             _throttle = 1.0
 
@@ -751,13 +788,57 @@ class AgentDaemon:
                     with _module_lock:
                         _dispatch_backoff.pop(goal_key, None)
 
-                    # COMPLETION: non-continuous goals complete after successful dispatch
+                    # COMPLETION: dispatch returning non-None means the chat was
+                    # handed off, NOT that the agent actually did the work — the
+                    # work runs async after dispatch_goal returns.  Auto-marking
+                    # `completed` on dispatch produced the dashboard lie where
+                    # ~280 goals showed 'Completed' with 0/N spark earned.
+                    #
+                    # Real completion gate: refresh from DB and require
+                    # spark_spent > 0 (some real tool/LLM cost was incurred).
+                    # Goals dispatched but doing zero work get a 'noop'
+                    # counter; after 5 consecutive noops the goal is
+                    # auto-paused so the daemon stops re-spinning it.
+                    try:
+                        db.refresh(goal)
+                    except Exception:
+                        pass  # refresh failure → fall through to attribute read
                     cfg = goal.config_json or {}
-                    if not cfg.get('continuous', False):
+                    is_continuous = cfg.get('continuous', False)
+                    spark_spent = goal.spark_spent or 0
+                    if is_continuous:
+                        # Continuous goals never auto-complete; cooldown gate
+                        # higher up already prevents re-dispatch storms.
+                        pass
+                    elif spark_spent > 0:
                         goal.status = 'completed'
                         cfg['completed_at'] = datetime.utcnow().isoformat()
+                        cfg.pop('noop_dispatch_count', None)
                         goal.config_json = cfg
-                        logger.info(f"Goal {goal_key} COMPLETED (one-shot dispatch succeeded)")
+                        logger.info(
+                            f"Goal {goal_key} COMPLETED "
+                            f"(spark_spent={spark_spent})")
+                    else:
+                        # Dispatched but zero real work — track and back off.
+                        noop_count = int(cfg.get('noop_dispatch_count', 0)) + 1
+                        cfg['noop_dispatch_count'] = noop_count
+                        cfg['last_noop_dispatch'] = datetime.utcnow().isoformat()
+                        if noop_count >= 5:
+                            goal.status = 'paused'
+                            cfg['pause_reason'] = (
+                                f'Auto-paused: {noop_count} consecutive '
+                                f'dispatches produced 0 spark — work is not '
+                                f'reaching tool execution.  Investigate '
+                                f'agent prompt or tool registration.')
+                            cfg['paused_at'] = datetime.utcnow().isoformat()
+                            logger.warning(
+                                f"Goal {goal_key} AUTO-PAUSED after "
+                                f"{noop_count} noop dispatches")
+                        else:
+                            logger.info(
+                                f"Goal {goal_key} dispatched but "
+                                f"spark_spent=0 (noop #{noop_count})")
+                        goal.config_json = cfg
 
             # ── HITL: notify owners of APPROVAL_REQUIRED tasks ──
             try:

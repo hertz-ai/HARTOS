@@ -109,6 +109,13 @@ class TestParallelDispatch(unittest.TestCase):
         _dispatch_experiment.  If dispatch is sequential, all calls run on
         the orchestrator thread (same name).  If parallel, the names are
         prefixed 'auto-evolve-<session>'.
+
+        FIX-1.4a patches the dispatcher down to max_workers=1 when the
+        DB backend is SQLite — which is the default in CI (no
+        HEVOLVE_DB_URL override).  This test is explicitly covering
+        the MySQL/Postgres path, so we patch _is_sqlite_backend to
+        False to keep the parallel branch active regardless of
+        whichever backend the test runner happens to see.
         """
         from integrations.agent_engine.auto_evolve import (
             AutoEvolveOrchestrator, EvolveSession,
@@ -127,14 +134,16 @@ class TestParallelDispatch(unittest.TestCase):
             except threading.BrokenBarrierError:
                 raise RuntimeError('parallel fan-out did not happen')
             recorded_threads.append(threading.current_thread().name)
-            return {'goal_id': f"g-{exp['id']}"}
+            return {'success': True, 'goal_id': f"g-{exp['id']}"}
 
         winners = [
             {'id': 'e1', 'title': 'a', '_approval_score': 0.9},
             {'id': 'e2', 'title': 'b', '_approval_score': 0.8},
             {'id': 'e3', 'title': 'c', '_approval_score': 0.7},
         ]
-        with patch.object(orch, '_dispatch_experiment',
+        with patch('integrations.agent_engine.auto_evolve._is_sqlite_backend',
+                   return_value=False), \
+             patch.object(orch, '_dispatch_experiment',
                           side_effect=_fake_dispatch):
             orch._dispatch_winners_parallel(session, winners, 'u1')
 
@@ -159,14 +168,19 @@ class TestParallelDispatch(unittest.TestCase):
         def _fake(session, exp, user_id):
             if exp['id'] == 'bad':
                 raise RuntimeError('boom')
-            return {'goal_id': f"g-{exp['id']}"}
+            return {'success': True, 'goal_id': f"g-{exp['id']}"}
 
         winners = [
             {'id': 'good1', 'title': 'g1'},
             {'id': 'bad', 'title': 'b'},
             {'id': 'good2', 'title': 'g2'},
         ]
-        with patch.object(orch, '_dispatch_experiment', side_effect=_fake):
+        # Same rationale as test_uses_threadpool: pin max_workers
+        # to the parallel path so the assertion doesn't drift when
+        # the runner picks up a SQLite backend.
+        with patch('integrations.agent_engine.auto_evolve._is_sqlite_backend',
+                   return_value=False), \
+             patch.object(orch, '_dispatch_experiment', side_effect=_fake):
             orch._dispatch_winners_parallel(session, winners, 'u1')
 
         self.assertEqual(session.dispatched, 2)

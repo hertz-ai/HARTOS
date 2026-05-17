@@ -475,6 +475,34 @@ def force_state_through_valid_path(user_prompt: str, action_id: int, target_stat
     if current_state == target_state:
         return True
 
+    # FIX-5.1 (2026-04-21): TERMINATED is the absorbing "post-completion"
+    # state — RECIPE_RECEIVED → TERMINATED is the canonical last edge
+    # (see line 472 above).  If a caller asks for any state that comes
+    # BEFORE terminated (COMPLETED, FALLBACK_*, RECIPE_*), it's a
+    # no-op "already past this" request from the auto-complete code path
+    # in hart_intelligence_entry, not a real transition.  Return True
+    # silently instead of logging an ERROR-level red herring that
+    # masquerades as a genuine state-machine failure in the logs.
+    #
+    # Witnessed 2026-04-21T14:06:21 during live UI sweep v6:
+    #   got status as:completed
+    #   CHECKING FOR FALLBACK current_action=5 action_id=5
+    #   Action 5 completed with auto-generated fallback: ...
+    #   [ERROR] No valid path from terminated to completed   <-- spam
+    _POST_TERMINATED_SYNONYMS = {
+        ActionState.COMPLETED,
+        ActionState.FALLBACK_REQUESTED,
+        ActionState.FALLBACK_RECEIVED,
+        ActionState.RECIPE_REQUESTED,
+        ActionState.RECIPE_RECEIVED,
+    }
+    if current_state == ActionState.TERMINATED and target_state in _POST_TERMINATED_SYNONYMS:
+        logger.info(
+            f"[NOOP] Action {action_id} already terminated; "
+            f"{target_state.value} is already satisfied (reason={reason!r})"
+        )
+        return True
+
     # Get the path to target state
     path_key = (current_state, target_state)
     if path_key in state_paths:

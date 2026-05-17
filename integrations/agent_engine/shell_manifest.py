@@ -113,6 +113,11 @@ PANEL_MANIFEST = {
         'route': '/social/challenges', 'group': 'Explore',
         'default_size': [700, 500],
     },
+    'hive_contest': {
+        'title': 'Hive Contest', 'icon': 'leaderboard',
+        'route': '/hive-contest', 'group': 'Explore',
+        'default_size': [1000, 760],
+    },
     'kids': {
         'title': 'Kids Learning', 'icon': 'child_care',
         'route': '/social/kids', 'group': 'Explore',

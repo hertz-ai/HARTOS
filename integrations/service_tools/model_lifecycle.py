@@ -1499,12 +1499,18 @@ class ModelLifecycleManager:
             if evict_target:
                 candidates = [evict_target]
             else:
+                # LLMs are owned by llama-server (separate process); evicting
+                # them from the registry doesn't free VRAM (see line 1562).
+                # Skip them as swap candidates so we never burn down the
+                # active LLM in exchange for a TTS that still won't fit.
                 gpu_models = sorted(
                     [s for s in self._models.values()
                      if s.device == ModelDevice.GPU
                      and s.priority != ModelPriority.ACTIVE
                      and s.active_inference_count == 0
-                     and s.name != needed_model],
+                     and s.name != needed_model
+                     and not s.name.startswith('llm-')
+                     and s.model_type != 'llm'],
                     key=lambda s: (
                         _PRIORITY_RANK.get(s.priority, 99),
                         s.last_access_time,

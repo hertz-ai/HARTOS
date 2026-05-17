@@ -751,14 +751,21 @@ def _tool_call_endpoint(method: str, path: str, body: Optional[str] = None) -> s
         from flask import current_app
         app = current_app._get_current_object()
     except RuntimeError:
-        # Not in request context — import app directly
-        try:
-            from hart_intelligence_entry import app
-        except ImportError:
-            try:
-                from hart_intelligence import app
-            except ImportError:
-                return json.dumps({"error": "HARTOS app not available"})
+        # Not in request context — resolve via singleton accessor.
+        # NEVER eager-import hart_intelligence here: this is a worker
+        # thread (MCP HTTP handler) and a direct import races the
+        # canonical loader's import lock.
+        from core.safe_hartos_attr import safe_hartos_attr
+        app = safe_hartos_attr('app')
+        if app is None:
+            logger.info(
+                "MCP call_endpoint: HARTOS app not yet loaded — "
+                "method=%s path=%s — returning 503-style error.",
+                method, path,
+            )
+            return json.dumps({
+                "error": "HARTOS app not available (loader still init)",
+            })
 
     if not path.startswith('/'):
         path = '/' + path
@@ -822,10 +829,17 @@ def _tool_list_routes() -> str:
         from flask import current_app
         app = current_app._get_current_object()
     except RuntimeError:
-        try:
-            from hart_intelligence_entry import app
-        except ImportError:
-            return json.dumps({"error": "HARTOS app not available"})
+        # Worker-thread safe — singleton accessor, no import lock race.
+        from core.safe_hartos_attr import safe_hartos_attr
+        app = safe_hartos_attr('app')
+        if app is None:
+            logger.info(
+                "MCP list_routes: HARTOS app not yet loaded — "
+                "returning empty 503 envelope.",
+            )
+            return json.dumps({
+                "error": "HARTOS app not available (loader still init)",
+            })
 
     routes = []
     for rule in app.url_map.iter_rules():

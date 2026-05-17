@@ -17,6 +17,40 @@ from core.http_pool import pooled_get, pooled_post
 logger = logging.getLogger('hevolve_social')
 
 
+def _load_or_create_node_id() -> str:
+    """Persist node_id under platform_paths.get_data_dir() / 'node_id.json'.
+
+    Returns existing id on subsequent boots so the central side can
+    dedupe joins by node_id.  Falls back to a fresh in-memory uuid if
+    the data dir is unwritable (degraded environments such as
+    cx_Freeze read-only mode).
+    """
+    import json
+    try:
+        from core.platform_paths import get_data_dir
+        data_dir = get_data_dir()
+        os.makedirs(data_dir, exist_ok=True)
+        path = os.path.join(data_dir, 'node_id.json')
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as fh:
+                    payload = json.load(fh)
+                nid = payload.get('node_id', '')
+                if nid:
+                    return nid
+            except Exception:
+                pass  # Corrupt file → regenerate
+        nid = str(uuid.uuid4())
+        try:
+            with open(path, 'w', encoding='utf-8') as fh:
+                json.dump({'node_id': nid, 'created_at': datetime.utcnow().isoformat()}, fh)
+        except Exception:
+            pass  # Best-effort persist; in-memory id is still valid for this boot
+        return nid
+    except Exception:
+        return str(uuid.uuid4())
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Bandwidth Profiles - auto-selected by tier, override via env
 # ═══════════════════════════════════════════════════════════════════════
@@ -80,8 +114,13 @@ class GossipProtocol:
     """Gossip-based peer discovery for HevolveBot network."""
 
     def __init__(self):
-        # Identity
-        self.node_id = str(uuid.uuid4())
+        # Identity — persisted across restarts so the central side can
+        # dedupe joins by node_id.  Without persistence, every watchdog
+        # restart of the gossip thread fabricates a fresh uuid and the
+        # central dashboard sees infinite "new node" rows for a single
+        # install (witnessed 2026-04-30: same install logged
+        # node=a7ba8cc9 then node=d016058b in one server.log).
+        self.node_id = _load_or_create_node_id()
         self.node_name = os.environ.get(
             'HEVOLVE_NODE_NAME', f'hevolve-{self.node_id[:8]}')
         from core.port_registry import get_port
@@ -129,12 +168,23 @@ class GossipProtocol:
         self.central_url = os.environ.get('HEVOLVE_CENTRAL_URL', '').rstrip('/')
         self.regional_url = os.environ.get('HEVOLVE_REGIONAL_URL', '').rstrip('/')
 
-        # Parse seed peers — env override + hardcoded genesis peers.
+        # Parse seed peers — env override + canonical genesis peers.
         # Genesis peers prevent bootstrap poisoning: even if env var is
         # compromised, the node always knows at least the real network.
-        _GENESIS_PEERS = [
-            'https://central.hevolve.ai',
-        ]
+        # Sourced from `core.superadmins.ALL_CENTRAL_URLS` (primary +
+        # fallback) so gossip can find EITHER the .hevolve.ai central
+        # OR the azurekong.hertzai.com fallback — single source of
+        # truth, no parallel literals that could drift (Gate 4 / DRY).
+        try:
+            from core.superadmins import ALL_CENTRAL_URLS
+            _GENESIS_PEERS = list(ALL_CENTRAL_URLS)
+        except Exception:
+            # Degraded environment fallback (cx_Freeze import chain race
+            # at very-early boot).  Mirror the canonical default.
+            _GENESIS_PEERS = [
+                'https://central.hevolve.ai',
+                'https://azurekong.hertzai.com',
+            ]
         seed_str = os.environ.get('HEVOLVE_SEED_PEERS', '')
         env_peers = [
             u.strip().rstrip('/') for u in seed_str.split(',')
@@ -240,6 +290,18 @@ class GossipProtocol:
                     f"name={self.node_name}, hart_tag={self._hart_tag}, "
                     f"seeds={len(self.seed_peers)}, "
                     f"bandwidth={self.bandwidth_profile}")
+
+        # Start the central report-in loop.  Every install — bundled,
+        # Docker, ISO — reports identity to the canonical superadmin
+        # allowlist (core.superadmins.SUPERADMIN_CENTRAL_URLS) so the
+        # superadmin dashboard sees every node that has ever joined.
+        # Offline-tolerant via outbox; cheap when centrals are
+        # unreachable (PeerBackoff handles DNS + connect timeouts).
+        try:
+            from core.superadmin_report import start_background_loop
+            start_background_loop(self._self_info)
+        except Exception as e:
+            logger.debug(f"Superadmin report-in loop not started: {e}")
 
     def _ensure_hart_identity(self):
         """Generate HART node identity on first startup. Like getting an IP address.
@@ -411,15 +473,16 @@ class GossipProtocol:
     def _announce_to_all(self):
         peers = self._load_peers_from_db(exclude_dead=False)
         urls = set(p['url'] for p in peers)
-        # Skip genesis/seed peers in flat mode — a single-user desktop
-        # has no reason to announce to central.hevolve.ai (which is
-        # unreachable offline anyway). Prevents the recurring
-        # 'NameResolutionError: Failed to resolve central.hevolve.ai'
-        # warnings that flood the logs every gossip interval. Regional
-        # and central tiers still announce to seeds for network bootstrap.
-        _tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
-        if _tier != 'flat':
-            urls.update(self.seed_peers)
+        # Always include seed peers — flat-mode installs MUST be allowed
+        # to talk to central.hevolve.ai for the universal peer-join +
+        # central report-in spec (memory:
+        # project_universal_peer_join_central_report.md).  The previous
+        # 2026-04 fix dropped seeds entirely in flat mode to suppress
+        # NameResolutionError noise, which silently broke central
+        # registration for every desktop install.  PeerBackoff (line ~429)
+        # already absorbs DNS failures with exponential backoff, so we
+        # get the announce attempt without the log spam.
+        urls.update(self.seed_peers)
         for url in urls:
             if not self._running:
                 return
@@ -789,11 +852,20 @@ class GossipProtocol:
         if not node_id or not url or node_id == self.node_id:
             return False
 
-        # Sybil protection: max 5 nodes per IP/hostname
+        # Sybil protection: max 5 nodes per IP/hostname.
+        # Loopback addresses are exempt - single-user dev installs
+        # naturally accumulate many node_ids on localhost (one per
+        # reboot / data-dir reset / clean-install), and rejecting
+        # them as Sybil is a false positive that floods WARNING logs
+        # AND blocks legitimate self-peer registration during testing.
+        # Real Sybil attacks come from distinct external IPs.
         try:
             from urllib.parse import urlparse
-            host = urlparse(url).hostname or ''
-            if host:
+            host = (urlparse(url).hostname or '').lower()
+            _is_loopback = host in (
+                'localhost', '127.0.0.1', '::1', '0.0.0.0',
+            ) or host.startswith('127.')
+            if host and not _is_loopback:
                 from .models import PeerNode
                 same_host_count = db.query(PeerNode).filter(
                     PeerNode.url.contains(host),
@@ -1251,6 +1323,13 @@ class AutoDiscovery:
         self._lock = threading.Lock()
         self._discovered_nodes: set = set()
         self._sock = None
+        # Cached list of broadcast addresses (one per usable IPv4 NIC).
+        # Refreshed on start; iterated each beacon send.  Replaces the
+        # naive `<broadcast>` (255.255.255.255) target which on multi-NIC
+        # Windows boxes (Wi-Fi + Hyper-V + VMware + Docker virtual NICs)
+        # leaves the box on a single OS-chosen interface — usually a
+        # virtual subnet, not the physical LAN where peers actually live.
+        self._broadcast_targets: list = []
 
     def start(self) -> None:
         """Start beacon sender and listener threads."""
@@ -1271,12 +1350,109 @@ class AutoDiscovery:
             self._running = False
             return
 
+        # Enumerate per-NIC broadcast addresses.  Always include the
+        # limited-broadcast 255.255.255.255 as a fallback.
+        self._broadcast_targets = self._enumerate_broadcast_targets()
+        logger.info(f"AutoDiscovery broadcast targets: "
+                    f"{', '.join(self._broadcast_targets) or '<broadcast>'}")
+
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._recv_thread.start()
         self._send_thread = threading.Thread(target=self._send_loop, daemon=True)
         self._send_thread.start()
         logger.info(f"AutoDiscovery started on UDP port {self._port} "
                     f"(interval={self._beacon_interval}s)")
+
+    # NIC name patterns that indicate a virtual/tunnel adapter we
+    # should NOT broadcast onto.  Case-insensitive substring match.
+    # Catches WSL/Hyper-V vSwitch, VMware/VirtualBox host-only adapters,
+    # Bluetooth PAN, Docker bridges, and Windows loopback.
+    _VIRTUAL_NIC_HINTS = (
+        'loopback', 'pseudo', 'bluetooth', 'vethernet', 'wsl',
+        'hyper-v', 'vmware', 'virtualbox', 'vbox', 'docker',
+        'tap-', 'tun', 'npcap',
+    )
+
+    @staticmethod
+    def _derive_broadcast(addr: str, netmask: str) -> str:
+        """Compute IPv4 broadcast = addr | ~netmask.  Returns '' on parse failure."""
+        try:
+            a = [int(x) for x in addr.split('.')]
+            m = [int(x) for x in netmask.split('.')]
+            if len(a) != 4 or len(m) != 4:
+                return ''
+            bcast = [(a[i] | (~m[i] & 0xFF)) for i in range(4)]
+            return '.'.join(str(b) for b in bcast)
+        except Exception:
+            return ''
+
+    def _enumerate_broadcast_targets(self) -> list:
+        """Return one broadcast address per usable IPv4 NIC.
+
+        On Windows, ``sock.sendto((b'…', '<broadcast>', port))`` only
+        traverses the OS-chosen default-route interface.  On boxes with
+        multiple physical/virtual NICs this is roulette — the beacon
+        often leaves on a virtual NIC the LAN peers aren't on.
+
+        Implementation notes:
+        - psutil returns ``snic.broadcast = None`` on Windows even for
+          NICs with valid IPv4 addresses, so we derive broadcast from
+          ``address | ~netmask`` ourselves.
+        - We skip virtual / tunnel NICs by name (Bluetooth, vEthernet,
+          WSL, Hyper-V, VMware, Docker, loopback) so a beacon never
+          leaks into a virtual subnet our LAN peers aren't on.
+        - Fallback: if no usable NIC is found, return the limited
+          broadcast so degraded environments still emit something.
+        """
+        try:
+            import psutil
+        except ImportError:
+            return ['255.255.255.255']
+        targets = []
+        try:
+            stats = {}
+            try:
+                stats = psutil.net_if_stats()
+            except Exception:
+                pass
+            for nic_name, addrs in psutil.net_if_addrs().items():
+                # Skip virtual/tunnel NICs by name pattern.
+                lower_name = nic_name.lower()
+                if any(hint in lower_name for hint in self._VIRTUAL_NIC_HINTS):
+                    continue
+                # Skip if the NIC is down (when stats are available).
+                nic_stat = stats.get(nic_name)
+                if nic_stat is not None and not nic_stat.isup:
+                    continue
+                for snic in addrs:
+                    if getattr(snic, 'family', None) is None:
+                        continue
+                    fam_val = int(snic.family) if hasattr(snic.family, 'value') else snic.family
+                    if fam_val != 2:  # AF_INET
+                        continue
+                    addr = snic.address or ''
+                    netmask = snic.netmask or ''
+                    bcast = snic.broadcast or ''
+                    # Skip loopback (127.x) and APIPA (169.254.x).
+                    if addr.startswith('127.') or addr.startswith('169.254.'):
+                        continue
+                    # Derive broadcast on Windows (psutil leaves it None).
+                    if not bcast and netmask:
+                        bcast = self._derive_broadcast(addr, netmask)
+                    if not bcast:
+                        continue
+                    if bcast in ('0.0.0.0', '255.255.255.255'):
+                        continue  # Treat as "no useful broadcast"
+                    if bcast not in targets:
+                        targets.append(bcast)
+        except Exception as e:
+            logger.debug(f"AutoDiscovery NIC enumeration error: {e}")
+        # Always keep limited broadcast as a final fallback so a host
+        # without psutil-readable NICs (rare degraded environments) still
+        # gets at least one outbound packet.
+        if '255.255.255.255' not in targets:
+            targets.append('255.255.255.255')
+        return targets
 
     def stop(self) -> None:
         """Stop discovery threads and close socket."""
@@ -1431,7 +1607,16 @@ class AutoDiscovery:
         while self._running:
             try:
                 beacon = self._build_beacon()
-                self._sock.sendto(beacon, ('<broadcast>', self._port))
+                # Send the beacon to every usable per-NIC broadcast
+                # address (Win11 multi-NIC: Wi-Fi + Hyper-V + VMware +
+                # Docker virtuals).  A failure on one NIC must not
+                # abort the round.
+                targets = self._broadcast_targets or ['255.255.255.255']
+                for tgt in targets:
+                    try:
+                        self._sock.sendto(beacon, (tgt, self._port))
+                    except Exception as e:
+                        logger.debug(f"AutoDiscovery send to {tgt} failed: {e}")
             except Exception as e:
                 logger.debug(f"AutoDiscovery send error: {e}")
             try:
@@ -1512,3 +1697,25 @@ class AutoDiscovery:
 # Module-level singletons
 gossip = GossipProtocol()
 auto_discovery = AutoDiscovery(gossip)
+
+
+def get_peer_discovery() -> GossipProtocol:
+    """Return the singleton GossipProtocol instance.
+
+    Canonical accessor for callers that want the gossip singleton
+    without importing the module-level binding directly (e.g.
+    `integrations.agent_engine.compute_borrowing` for compute-offer
+    broadcast).  Same object every call — gossip identity is stable.
+    """
+    return gossip
+
+
+def get_auto_discovery() -> AutoDiscovery:
+    """Return the singleton AutoDiscovery instance.
+
+    Canonical accessor used by standalone runners (systemd unit,
+    NixOS module) so they don't have to instantiate a new
+    AutoDiscovery with their own gossip — they pick up the same
+    singleton wired here.
+    """
+    return auto_discovery

@@ -115,7 +115,7 @@ Multiple stewards can hold copies of the same master private key. There is one m
 
 **Central-only resources:**
 
-- **Master key** (`/etc/hevolve/master_private_key.hex`) -- Ed25519 signing key for releases, certificates, and kill switch. Never in repo, never accessible to AI. Multiple stewards can hold copies.
+- **Master key** (`<master-key-path>`) -- Ed25519 signing key for releases, certificates, and kill switch. Never in repo, never accessible to AI. Multiple stewards can hold copies.
 - **Release manifest** (`release_manifest.json`) -- Signed file hash manifest from CI/CD. Boot integrity verification checks installed code against this.
 - **Cloud database** (`HEVOLVE_DB_URL`) -- MySQL for persistent state across restarts.
 
@@ -155,7 +155,7 @@ ENABLE_FEDERATION=true
 - `HEVOLVE_ENFORCEMENT_MODE=hard` is the default
 - TLS verification enforced on all outbound connections
 - Secret validation at startup
-- Master key stored outside repo at `/etc/hevolve/master_private_key.hex`
+- Master key stored outside repo at `<master-key-path>`
 
 ---
 

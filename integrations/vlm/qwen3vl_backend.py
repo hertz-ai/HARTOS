@@ -86,7 +86,11 @@ class Qwen3VLBackend:
         try:
             from core.port_registry import get_port
             _llm_port = get_port('llm')
-        except Exception:
+        except Exception as _port_err:
+            # Sensible fallback - port_registry unavailable means we
+            # are running outside the bundled Nunba context (test /
+            # standalone).  Honour HEVOLVE_LLM_PORT env or default 8080.
+            logger.debug(f"port_registry unavailable, using env/8080: {_port_err}")
             _llm_port = int(os.environ.get('HEVOLVE_LLM_PORT', 8080))
         self.base_url = base_url or os.environ.get(
             'HEVOLVE_VLM_ENDPOINT_URL',
@@ -315,8 +319,11 @@ class Qwen3VLBackend:
                 if _r.returncode == 0:
                     fg_info = f' FOREGROUND: "{fg_title}".' if fg_title else ''
                     return f'OS: macOS.{fg_info} Visible apps: [{_r.stdout.strip()}]\n'
-        except Exception:
-            pass
+        except Exception as e:
+            # OS-context probes are nice-to-have - the VLM still
+            # works without them.  Log so silent-fallback doesn't
+            # mask a broken probe (osascript/wmctrl/PowerShell missing).
+            logger.debug(f"_get_os_context probe failed: {e}")
         return ''
 
     def _detect_action_type(self, task, raw_response=''):
@@ -339,83 +346,40 @@ class Qwen3VLBackend:
         return 'left_click'
 
     def _parse_action_response(self, raw, img_w, img_h, task=''):
-        """Parse VLM response into action dict. Returns (result_dict, nx, ny) or (result_dict, None, None).
+        """Parse VLM response into action dict. Returns
+        ``(result_dict, nx, ny)`` or ``(result_dict, None, None)``.
 
-        NOTE: img_w/img_h are VLM image dimensions (e.g. 1024x576), but pyautogui
-        needs SCREEN coordinates. We use pyautogui.size() for the final scaling.
+        Phase 5: thin shim onto :func:`integrations.vlm.parser.parse_vlm_action`
+        with ``expected_shape='point_only'``.  The byte-equivalent
+        legacy fields are reproduced via
+        :meth:`ParsedAction.to_point_action_dict`.
+
+        ``img_w/img_h`` arg kept for back-compat — historically the
+        function fell back to image dims when pyautogui.size() failed.
+        Pyautogui screen size is the source of truth (we use it for
+        the actual click), so we pass it through to the parser as
+        the scaling target.
         """
-        raw = raw.strip()
-
-        # Get actual screen dimensions for coordinate scaling
+        from integrations.vlm.parser import parse_vlm_action
         try:
             import pyautogui as _pag
             _screen_w, _screen_h = _pag.size()
-        except Exception:
-            _screen_w, _screen_h = img_w, img_h  # fallback to image dims
-
-        if 'DONE' in raw.upper():
-            return {'action': 'done', 'screen_x': 0, 'screen_y': 0,
-                    'text': '', 'done': True, 'reasoning': raw, 'raw': raw}, None, None
-
-        # Detect TYPE: in response
-        if raw.upper().startswith('TYPE:'):
-            text = raw.split(':', 1)[1].strip()
-            return {'action': 'type', 'screen_x': 0, 'screen_y': 0,
-                    'text': text, 'done': False, 'reasoning': f'type "{text}"',
-                    'raw': raw}, None, None
-
-        # Also detect "type" action from VLM free-text responses
-        type_match = re.search(r'(?:type|enter|input)\s*[:\-"\']+\s*(.+?)(?:\s*<|$)', raw, re.IGNORECASE)
-        if type_match and '<point>' not in raw:
-            text = type_match.group(1).strip().strip('"\'')
-            return {'action': 'type', 'screen_x': 0, 'screen_y': 0,
-                    'text': text, 'done': False, 'reasoning': f'type "{text}"',
-                    'raw': raw}, None, None
-
-        # Detect scroll actions (no coords needed)
-        raw_lower = raw.lower()
-        task_lower = task.lower() if task else ''
-        if any(kw in task_lower or kw in raw_lower for kw in self._SCROLL_DOWN_KEYWORDS):
-            return {'action': 'scroll_down', 'screen_x': 0, 'screen_y': 0,
-                    'text': '', 'done': False, 'reasoning': 'scroll down',
-                    'raw': raw}, None, None
-        if any(kw in task_lower or kw in raw_lower for kw in self._SCROLL_UP_KEYWORDS):
-            return {'action': 'scroll_up', 'screen_x': 0, 'screen_y': 0,
-                    'text': '', 'done': False, 'reasoning': 'scroll up',
-                    'raw': raw}, None, None
-
-        # Detect action type from task context
-        action_type = self._detect_action_type(task, raw)
-
-        # Parse <point>x,y</point>
-        m = re.search(r'<point>\s*(\d+)\s*,\s*(\d+)\s*</point>', raw)
-        if m:
-            nx, ny = int(m.group(1)), int(m.group(2))
-            px = int(nx * _screen_w / 1000)
-            py = int(ny * _screen_h / 1000)
-            return {'action': action_type, 'screen_x': px, 'screen_y': py,
-                    'norm_x': nx, 'norm_y': ny,
-                    'text': '', 'done': False,
-                    'reasoning': f'{action_type} at ({nx},{ny}) normalized',
-                    'raw': raw}, nx, ny
-
-        # Fallback: extract number pairs in 0-1000 range
-        nums = re.findall(r'\d+', raw)
-        if len(nums) >= 2:
-            nx, ny = int(nums[0]), int(nums[1])
-            if 0 <= nx <= 1000 and 0 <= ny <= 1000:
-                px = int(nx * _screen_w / 1000)
-                py = int(ny * _screen_h / 1000)
-                return {'action': action_type, 'screen_x': px, 'screen_y': py,
-                        'norm_x': nx, 'norm_y': ny,
-                        'text': '', 'done': False,
-                        'reasoning': f'fallback {action_type} ({nx},{ny})',
-                        'raw': raw}, nx, ny
-
-        logger.warning(f"Could not parse point_and_act response: {raw[:100]}")
-        return {'action': 'none', 'screen_x': 0, 'screen_y': 0,
-                'text': '', 'done': False, 'reasoning': raw,
-                'raw': raw}, None, None
+        except Exception as _pag_err:
+            # Pyautogui can fail when no display is attached (CI /
+            # headless).  Fall back to image dims so the parser at
+            # least produces stable norm_x/norm_y; downstream callers
+            # that need true screen px will see them mismatch.
+            logger.debug(f"pyautogui.size() unavailable, using image dims: {_pag_err}")
+            _screen_w, _screen_h = img_w, img_h
+        pa = parse_vlm_action(
+            raw, expected_shape='point_only',
+            task=task,
+            screen_w=_screen_w, screen_h=_screen_h,
+            detect_action_type=self._detect_action_type,
+            scroll_down_keywords=self._SCROLL_DOWN_KEYWORDS,
+            scroll_up_keywords=self._SCROLL_UP_KEYWORDS,
+        )
+        return pa.to_point_action_dict(), pa.norm_x, pa.norm_y
 
     def _is_taskbar_task(self, task):
         """Check if task involves taskbar elements."""
@@ -489,6 +453,297 @@ class Qwen3VLBackend:
 
         return best_match, list_raw
 
+    # ─── Phase 10: P2P inference resolver ──────────────────────────────
+    # Mobile devices can't competitively run a 4B+ multimodal model;
+    # they capture, transmit to a paired peer (typically the user's
+    # desktop Nunba) for inference, then execute the action locally.
+    # This resolver picks where the VLM call goes based on
+    # intelligence_preference + reachability.  Plan §8 / §10.
+
+    def dispatch_inference(self, request: dict, *,
+                            peer_dispatch=None,
+                            intelligence_preference: str = 'hybrid'
+                            ) -> dict:
+        """Pick the right tier for a VLM inference request and run it.
+
+        Args:
+            request: dict with at least
+                ``{'method', 'screenshot_b64', 'task'}``.  Optional
+                keys: ``history``, ``window_rect``, ``platform``,
+                ``request_id``, ``prefer_local``.
+            peer_dispatch: optional callable
+                ``peer_dispatch(channel, payload, timeout)`` to route
+                to a paired peer over PeerLink.  When None, only
+                local + cloud tiers are considered.
+            intelligence_preference: ``'local_only'`` (default for
+                desktop) | ``'hybrid'`` (try local first, peer as
+                fallback) | ``'hive'`` (prefer peer/hive when local
+                is busy or unreachable).
+
+        Returns:
+            dict with grounding result + ``'tier'`` field set to
+            whichever path executed: ``'local'`` | ``'paired_peer'``
+            | ``'hive'`` | ``'cloud'`` | ``'no_route'``.
+        """
+        method = request.get('method', 'point_and_act')
+        screenshot_b64 = request.get('screenshot_b64', '')
+        task = request.get('task', '')
+        history = request.get('history')
+        prefer_local = request.get('prefer_local', True)
+
+        local_available = self._is_local_vlm_available()
+
+        # Tier orderings per plan §10:
+        #   local_only  → local (or no_route)
+        #   hybrid      → local → paired_peer → hive → cloud  (always all 4)
+        #   hive        → paired_peer → hive → local → cloud
+        # Reviewer flagged that the prior 'hybrid' order excluded
+        # 'cloud' when local was reachable, which contradicted the
+        # plan's "fall through all four tiers" wording.  Now matches.
+        if intelligence_preference == 'local_only':
+            tiers = ['local'] if local_available else []
+        elif intelligence_preference == 'hive':
+            tiers = ['paired_peer', 'hive']
+            if local_available:
+                tiers.append('local')
+            tiers.append('cloud')
+        else:  # 'hybrid' (default)
+            tiers = []
+            if local_available and prefer_local:
+                tiers.append('local')
+            tiers += ['paired_peer', 'hive']
+            if local_available and not prefer_local:
+                tiers.append('local')
+            tiers.append('cloud')
+
+        for tier in tiers:
+            try:
+                if tier == 'local':
+                    result = self._dispatch_local(method, screenshot_b64,
+                                                    task, history)
+                elif tier == 'paired_peer':
+                    if peer_dispatch is None:
+                        continue
+                    result = self._dispatch_paired_peer(
+                        request, peer_dispatch)
+                    if result is None:
+                        continue
+                elif tier == 'hive':
+                    if peer_dispatch is None:
+                        continue
+                    result = self._dispatch_hive(request, peer_dispatch)
+                    if result is None:
+                        continue
+                elif tier == 'cloud':
+                    result = self._dispatch_cloud(request)
+                    if result is None:
+                        continue
+                else:
+                    continue
+                result['tier'] = tier
+                return result
+            except Exception as e:
+                logger.debug(f'tier {tier} failed: {e}')
+                continue
+
+        return {'tier': 'no_route',
+                'error': f'no inference path available '
+                         f'(intelligence_preference={intelligence_preference})'}
+
+    def _is_local_vlm_available(self) -> bool:
+        """Quick reachability probe for the local VLM endpoint.
+
+        Uses ``self.base_url`` (constructor attribute) — earlier
+        version of this method referenced ``self.api_url`` which
+        doesn't exist; reviewer caught the typo before it shipped
+        to a real caller.  Llama-server's /health returns 200 OK
+        when ready, 503 when warming up, anything else when down.
+        """
+        try:
+            from core.http_pool import pooled_get
+            health_url = self.base_url.rstrip('/').replace('/v1', '') + '/health'
+            r = pooled_get(health_url, timeout=1)
+            return r.status_code == 200
+        except Exception as e:
+            logger.debug(f'_is_local_vlm_available probe failed: {e}')
+            return False
+
+    def _dispatch_local(self, method, screenshot_b64, task, history):
+        """Execute the requested method against the local VLM."""
+        if method == 'parse_and_reason':
+            return self.parse_and_reason(screenshot_b64, task,
+                                          history=history)
+        if method == 'point_and_act':
+            return self.point_and_act(screenshot_b64, task,
+                                       history=history)
+        # Default to point_and_act for unknown methods.
+        return self.point_and_act(screenshot_b64, task, history=history)
+
+    def _dispatch_paired_peer(self, request, peer_dispatch):
+        """Route to a paired peer over the PeerLink compute channel.
+        Same wire shape both sides agree on (see plan §8 for the
+        request/response schemas)."""
+        try:
+            payload = dict(request, type='vlm_grounding')
+            response = peer_dispatch('compute', payload, timeout=60)
+            if response and response.get('type') == 'vlm_grounding_result':
+                return response
+        except Exception as e:
+            logger.debug(f'paired peer dispatch failed: {e}')
+        return None
+
+    def _dispatch_hive(self, request, peer_dispatch):
+        """Same shape as paired_peer but routed via hivemind channel
+        for hive-grade VLM nodes (compute-host tier)."""
+        try:
+            payload = dict(request, type='vlm_grounding')
+            response = peer_dispatch('hivemind', payload, timeout=60)
+            if response and response.get('type') == 'vlm_grounding_result':
+                return response
+        except Exception as e:
+            logger.debug(f'hive dispatch failed: {e}')
+        return None
+
+    def _dispatch_cloud(self, request):
+        """Last resort — Hevolve.ai cloud VLM via WorldModelBridge."""
+        try:
+            from integrations.world_model_bridge import dispatch_to_cloud
+        except ImportError:
+            return None
+        try:
+            return dispatch_to_cloud('vlm_grounding', request)
+        except Exception as e:
+            logger.debug(f'cloud dispatch failed: {e}')
+            return None
+
+    # ─── Phase 3.5: Complementary path router ──────────────────────────
+    # The keystone of vlm_best_of_all_worlds_plan.md.  The three sibling
+    # methods (point_and_act / parse_and_reason / run_local_agentic_loop)
+    # aren't competitors — each has a real specialty.  route_task picks
+    # the right path per task class instead of always hitting the same
+    # primary first.  See plan §13 for the full design rationale.
+
+    # Compiled at module-import time.  Word-boundary anchored so 'list'
+    # inside 'specialist' doesn't trip the enumerate route.  Patterns
+    # ordered most-specific-first within each list.
+    _ENUMERATE_PATTERNS = [
+        re.compile(r'\blist (?:all|every|each)\b', re.I),
+        re.compile(r"\bwhat(?:\'s| is) on (?:the )?screen\b", re.I),
+        re.compile(r'\bshow me (?:all|every|each)\b', re.I),
+        re.compile(r'\bfind all\b', re.I),
+        re.compile(r'\benumerate\b', re.I),
+        re.compile(r'\bevery (?:clickable|button|icon|element|link|item)\b',
+                   re.I),
+        re.compile(r'\bhow many\b', re.I),
+    ]
+    _MULTI_STEP_PATTERNS = [
+        re.compile(r'\b(?:and then|after that|then click|then type)\b',
+                   re.I),
+        re.compile(r'\bnavigate to\b', re.I),
+        re.compile(r'\bfill (?:in|out)\b', re.I),
+        re.compile(
+            r'\b(?:open|launch|start|run)\b.+\band\b.+'
+            r'\b(?:click|type|select|press|enter|play|search)\b',
+            re.I,
+        ),
+        re.compile(r'\b(?:step \d+|first[,.]?\s+then|step-by-step)\b',
+                   re.I),
+    ]
+
+    def route_task(self, task: str, context: dict = None) -> str:
+        """Pick the best grounding path for *task*.
+
+        Returns one of:
+          ``'enumerate'``   — task asks about multiple/all UI elements
+                              → use :meth:`parse_and_reason` for SoM
+                              bbox view (revives the otherwise-dead path)
+          ``'multi_step'``  — task chains multiple actions
+                              → caller should drive
+                              :func:`integrations.vlm.local_loop.run_local_agentic_loop`
+          ``'single_shot'`` — one action on one target (default)
+                              → use :meth:`point_and_act`
+
+        Heuristic v1 (this implementation): keyword classifier on
+        the task string only.  Fast (microseconds), no VLM call.
+        Plan §13 v2: the draft 0.8B can self-classify in the same
+        prompt that produces the action — defer until v1 baseline
+        is established.
+
+        Empty / None task returns 'single_shot' (the safest default —
+        single VLM call, no over-commitment to a multi-iter loop).
+
+        ``context`` reserved for future use (re-dispatch hints from
+        prior iterations: e.g. the loop's body sees ``Status: DONE``
+        after one click and feeds back ``{'observed_done_after': 1}``
+        which would downgrade a multi_step verdict to single_shot).
+        Currently ignored.
+        """
+        if not task:
+            return 'single_shot'
+        for pat in self._ENUMERATE_PATTERNS:
+            if pat.search(task):
+                return 'enumerate'
+        for pat in self._MULTI_STEP_PATTERNS:
+            if pat.search(task):
+                return 'multi_step'
+        return 'single_shot'
+
+    def dispatch_grounding(self, screenshot_b64, task, *,
+                           history=None, prev_screenshot_b64=None,
+                           route: str = None):
+        """Route *task* to the best grounding method via :meth:`route_task`,
+        then call it.  Single entry point so callers don't have to know
+        which of the three siblings to invoke for which task class.
+
+        Behavior per route:
+          * ``'enumerate'``   → :meth:`parse_and_reason` (SoM result)
+          * ``'single_shot'`` → :meth:`point_and_act` (drop-in shape)
+          * ``'multi_step'``  → returns a sentinel
+            ``{'route': 'multi_step', 'recommend':
+            'run_local_agentic_loop', 'reasoning': '...'}``
+            so the caller can escalate to the loop dispatcher (which
+            lives in local_loop.py and would create a circular import
+            if called from inside the backend).
+
+        ``route`` may be passed explicitly to override the heuristic
+        (e.g. the loop dispatcher already decided multi_step and is
+        calling per-iteration with route='single_shot').
+
+        Every result has ``'route'`` set so the regression gate can
+        catch silent routing drift across runs.
+        """
+        if route is None:
+            route = self.route_task(task)
+
+        if route == 'enumerate':
+            result = self.parse_and_reason(
+                screenshot_b64, task, history=history)
+            result.setdefault('route', 'enumerate')
+            return result
+
+        if route == 'multi_step':
+            # Sentinel — local_loop owns the multi-iter dispatch.
+            # Returning instead of importing avoids backend → loop →
+            # backend circular dependency.
+            return {
+                'action': None,
+                'route': 'multi_step',
+                'recommend': 'run_local_agentic_loop',
+                'reasoning': (
+                    'task chains multiple actions; caller should '
+                    'dispatch to run_local_agentic_loop which calls '
+                    'this backend per-iteration with route=single_shot'
+                ),
+                'latency': 0.0,
+            }
+
+        # Default: single_shot via point_and_act.
+        result = self.point_and_act(
+            screenshot_b64, task,
+            history=history, prev_screenshot_b64=prev_screenshot_b64)
+        result.setdefault('route', 'single_shot')
+        return result
+
     def point_and_act(self, screenshot_b64, task, history=None, prev_screenshot_b64=None):
         """
         Optimized hybrid grounding strategy based on benchmark results.
@@ -516,25 +771,23 @@ class Qwen3VLBackend:
         try:
             import pyautogui as _pag
             screen_w, screen_h = _pag.size()
-        except Exception:
+        except Exception as _pag_err:
+            logger.debug(
+                f"pyautogui.size() unavailable, using image dims: {_pag_err}")
             screen_w, screen_h = img_w, img_h
 
-        # --- Strategy 1: Taskbar list for taskbar targets ---
-        if self._is_taskbar_task(task):
-            logger.info(f"Using taskbar_list strategy for: {task}")
-            match, list_raw = self._taskbar_list_lookup(screenshot_b64, task)
-            if match:
-                nx, ny, match_line = match
-                px = int(nx * screen_w / 1000)
-                py = int(ny * screen_h / 1000)
-                latency = time.time() - start
-                return {'action': 'left_click', 'screen_x': px, 'screen_y': py,
-                        'norm_x': nx, 'norm_y': ny,
-                        'text': '', 'done': False,
-                        'reasoning': f'taskbar_list: {match_line}',
-                        'raw': list_raw, 'latency': latency,
-                        'strategy': 'taskbar_list'}
-            logger.info("taskbar_list: no match found, falling through to describe_first")
+        # --- Strategy 1: Taskbar pre-check via shared helper ---
+        # Phase 3 of vlm_best_of_all_worlds_plan.md: replaced inline
+        # taskbar_list code with a call to try_taskbar_pre_check (the
+        # b7936bf helper).  Behavior is byte-identical to the prior
+        # inline implementation — same _is_taskbar_task gate, same
+        # _taskbar_list_lookup call, same return-dict shape, same
+        # fall-through when no match.  Verified by the existing
+        # TestPointAndActBottomEdgeRetry suite.
+        taskbar_action = self.try_taskbar_pre_check(
+            screenshot_b64, task, screen_w, screen_h, start)
+        if taskbar_action is not None:
+            return taskbar_action
 
         # --- Strategy 2: describe_first (primary, avg=78) ---
         state_hint = ''
@@ -589,87 +842,174 @@ class Qwen3VLBackend:
         raw = self._call_api(messages)
         result, nx, ny = self._parse_action_response(raw, img_w, img_h, task=task)
 
-        # --- Strategy 3: elimination retry if coords look suspicious ---
-        # Patterns the model commonly falls into when it isn't actually grounding:
-        #   • dead center (400-600, 400-600): "I don't know, so middle"
-        #   • bottom edge (y > 930): clicks taskbar when asked for in-screen UI
-        #     (observed pattern: model says "Notepad is in Start menu" but
-        #     grounds to y=975 which is the taskbar strip below the Start menu)
-        #   • top edge (y < 30): clicks window chrome / title bar
-        # Only trigger the retry when the task itself is NOT about the
-        # suspected region — clicking the Start button at y=990 is legitimate,
-        # clicking a "Notepad tile" at y=990 is not.
-        if nx is not None and ny is not None and result['action'] == 'left_click':
-            is_center_biased = (350 < nx < 650 and 350 < ny < 650)
-            task_lower = task.lower()
-            task_is_taskbar = self._is_taskbar_task(task) or any(
-                kw in task_lower for kw in ('taskbar', 'start button', 'system tray')
-            )
-            # Bottom edge hallucination: y > 930 on a task NOT about the
-            # taskbar means the model probably pointed into the taskbar strip
-            # while claiming it was pointing at in-app content.
-            is_bottom_edge_biased = (ny > 930 and not task_is_taskbar)
-            is_top_edge_biased = (ny < 30)
-            is_suspicious = is_center_biased or is_bottom_edge_biased or is_top_edge_biased
-            if is_suspicious:
-                bias_kind = (
-                    'center' if is_center_biased else
-                    'bottom-edge' if is_bottom_edge_biased else
-                    'top-edge'
-                )
-                logger.info(
-                    f"{bias_kind}-biased coords ({nx},{ny}) for non-taskbar task, "
-                    f"retrying with elimination strategy"
-                )
-                elim_prompt = (
-                    f'I need to find the target for: {task}\n'
-                    f'Describe its location precisely BEFORE giving coordinates:\n'
-                    f'  - Top half or bottom half?\n'
-                    f'  - Left third, middle third, or right third?\n'
-                    f'  - Is it inside a window, in a menu, or on the taskbar?\n'
-                    f'If the task asks to open an app and that app is not '
-                    f'already visible, the correct action is usually NOT a '
-                    f'click — respond with DONE and I will use a keyboard '
-                    f'shortcut instead.\n'
-                    f'Otherwise, give the precise <point>x,y</point> (0-1000 normalized) '
-                    f'and avoid the taskbar strip (y > 930) unless the target '
-                    f'is an actual taskbar icon.'
-                )
-                elim_raw = self._call_api([{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": elim_prompt},
-                        {"type": "image_url", "image_url": {
-                            "url": f"data:image/jpeg;base64,{screenshot_b64}"
-                        }},
-                    ]
-                }])
-                elim_result, enx, eny = self._parse_action_response(elim_raw, img_w, img_h, task=task)
-                # Only reject the retry if it reproduces the *same* bias we
-                # were retrying for. If we retried bottom-edge and the retry
-                # lands in the middle of the screen, that's a legitimate hit
-                # even if it happens to be near center — the whole point of
-                # the retry was to escape the bottom strip, not to verify the
-                # answer is off-center.
-                if enx is None or eny is None:
-                    reproduced_bias = True
-                elif is_bottom_edge_biased:
-                    reproduced_bias = (eny > 930 and not task_is_taskbar)
-                elif is_top_edge_biased:
-                    reproduced_bias = (eny < 30)
-                else:  # center-biased
-                    reproduced_bias = (350 < enx < 650 and 350 < eny < 650)
-
-                if not reproduced_bias:
-                    # Retry escaped the original bias — trust it
-                    result = elim_result
-                    result['strategy'] = 'elimination_retry'
-                    logger.info(f"Elimination retry gave ({enx},{eny}) — using it")
+        # --- Strategy 3: bias detection + elimination retry via helpers ---
+        # Phase 3 refactor: replaced inline center/bottom/top-edge bias
+        # checks + elimination prompt construction with detect_grounding_bias
+        # + retry_with_elimination (b7936bf helpers).  Same patterns
+        # detected, same retry prompt, same reproduced-bias rejection
+        # rule.  Verified by TestPointAndActBottomEdgeRetry.
+        bias_kind = self.detect_grounding_bias(nx, ny, result['action'], task)
+        if bias_kind is not None:
+            retry = self.retry_with_elimination(
+                screenshot_b64, task, img_w, img_h, bias_kind)
+            if retry is not None:
+                # Helper returns (result, nx, ny) — strategy already
+                # tagged 'elimination_retry' on the inner result.
+                result, nx, ny = retry
 
         latency = time.time() - start
         result['latency'] = latency
         result.setdefault('strategy', 'describe_first')
         return result
+
+    # ─── Shared grounding-strategy helpers ──────────────────────────────
+    # Extracted from point_and_act so the multi-iteration agentic loop
+    # (integrations/vlm/local_loop.py) can use them too.  point_and_act
+    # was refactored in Phase 3 of vlm_best_of_all_worlds_plan.md to
+    # call these helpers instead of maintaining inline copies, so
+    # there is now ONE source of truth for taskbar shortcut + bias
+    # detection + elimination retry — no parallel paths.
+    #
+    # Why it matters: commit 8fa6e97 (Apr 10, 2026 — "Single VLM call:
+    # plan + ground in one prompt — halves per-step latency") moved the
+    # loop OFF point_and_act onto its own inline prompt to halve
+    # latency.  That trade-off shipped the latency win but silently
+    # dropped point_and_act's smart grounding (taskbar_list shortcut +
+    # center/bottom/top-edge bias detection + elimination_retry).
+    # These helpers restore those strategies to the loop without
+    # paying point_and_act's two-phase latency cost.
+
+    def try_taskbar_pre_check(self, screenshot_b64, task,
+                              screen_w, screen_h, started_at):
+        """Pre-VLM-call taskbar shortcut.
+
+        When the task targets a taskbar item ("open Chrome", "click
+        Start button", etc.), skip the heavy describe_first VLM call
+        and use _taskbar_list_lookup directly.  Returns the click
+        action dict on a hit, None on a miss (caller falls through to
+        its normal VLM grounding path).
+
+        Args:
+            screenshot_b64: current screen as base64 (JPEG/PNG)
+            task: user instruction
+            screen_w, screen_h: physical screen pixel dimensions for
+                pyautogui coordinate scaling (norm 0-1000 → screen px)
+            started_at: time.time() value from the caller's start —
+                used to compute total latency for telemetry parity
+                with point_and_act.
+
+        Returns:
+            dict (point_and_act-compatible action shape) or None.
+        """
+        if not self._is_taskbar_task(task):
+            return None
+        logger.info(f"Using taskbar_list strategy for: {task}")
+        match, list_raw = self._taskbar_list_lookup(screenshot_b64, task)
+        if not match:
+            logger.info("taskbar_list: no match found, falling through")
+            return None
+        nx, ny, match_line = match
+        px = int(nx * screen_w / 1000)
+        py = int(ny * screen_h / 1000)
+        return {
+            'action': 'left_click',
+            'screen_x': px, 'screen_y': py,
+            'norm_x': nx, 'norm_y': ny,
+            'text': '', 'done': False,
+            'reasoning': f'taskbar_list: {match_line}',
+            'raw': list_raw,
+            'latency': time.time() - started_at,
+            'strategy': 'taskbar_list',
+        }
+
+    def detect_grounding_bias(self, nx, ny, action, task):
+        """Pure-function bias detector for VLM-grounded click coords.
+
+        Returns 'center' | 'bottom-edge' | 'top-edge' | None.  Mirrors
+        the inline checks in point_and_act so the loop can ask the
+        same question on its own grounded coords.  Coordinates are
+        in 0-1000 normalized space.
+        """
+        if nx is None or ny is None or action != 'left_click':
+            return None
+        is_center = (350 < nx < 650 and 350 < ny < 650)
+        task_lower = task.lower()
+        task_is_taskbar = self._is_taskbar_task(task) or any(
+            kw in task_lower for kw in
+            ('taskbar', 'start button', 'system tray')
+        )
+        is_bottom_edge = (ny > 930 and not task_is_taskbar)
+        is_top_edge = (ny < 30)
+        if is_bottom_edge:
+            return 'bottom-edge'
+        if is_top_edge:
+            return 'top-edge'
+        if is_center:
+            return 'center'
+        return None
+
+    def retry_with_elimination(self, screenshot_b64, task,
+                               img_w, img_h, bias_kind):
+        """Elimination-retry VLM call for biased coordinates.
+
+        When detect_grounding_bias flags a coord, this re-asks the VLM
+        with a more pointed prompt (top/bottom/left/right thirds,
+        avoid taskbar strip).  Returns (result, nx, ny) on a clean
+        re-grounding, None when the retry reproduces the same bias
+        (caller keeps the original coords).
+
+        bias_kind: one of 'center' | 'bottom-edge' | 'top-edge'.
+        """
+        logger.info(
+            f"{bias_kind}-biased coords for non-taskbar task, "
+            f"retrying with elimination strategy"
+        )
+        elim_prompt = (
+            f'I need to find the target for: {task}\n'
+            f'Describe its location precisely BEFORE giving coordinates:\n'
+            f'  - Top half or bottom half?\n'
+            f'  - Left third, middle third, or right third?\n'
+            f'  - Is it inside a window, in a menu, or on the taskbar?\n'
+            f'If the task asks to open an app and that app is not '
+            f'already visible, the correct action is usually NOT a '
+            f'click — respond with DONE and I will use a keyboard '
+            f'shortcut instead.\n'
+            f'Otherwise, give the precise <point>x,y</point> (0-1000 normalized) '
+            f'and avoid the taskbar strip (y > 930) unless the target '
+            f'is an actual taskbar icon.'
+        )
+        elim_raw = self._call_api([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": elim_prompt},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/jpeg;base64,{screenshot_b64}"
+                }},
+            ]
+        }])
+        elim_result, enx, eny = self._parse_action_response(
+            elim_raw, img_w, img_h, task=task,
+        )
+        # Reject only if the retry reproduced the original bias.
+        if enx is None or eny is None:
+            return None
+        if bias_kind == 'bottom-edge':
+            task_lower = task.lower()
+            task_is_taskbar = self._is_taskbar_task(task) or any(
+                kw in task_lower for kw in
+                ('taskbar', 'start button', 'system tray')
+            )
+            if eny > 930 and not task_is_taskbar:
+                return None
+        elif bias_kind == 'top-edge':
+            if eny < 30:
+                return None
+        elif bias_kind == 'center':
+            if 350 < enx < 650 and 350 < eny < 650:
+                return None
+        elim_result['strategy'] = 'elimination_retry'
+        logger.info(f"Elimination retry gave ({enx},{eny}) — using it")
+        return elim_result, enx, eny
 
     def verify_goal(self, screenshot_b64, goal):
         """Check if the goal is achieved by looking at the current screenshot.
@@ -734,46 +1074,21 @@ class Qwen3VLBackend:
             raise
 
     def _parse_unified_response(self, response_text):
-        """Parse Qwen3-VL JSON response, handling markdown blocks and partial JSON."""
-        # Try code block extraction first
-        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
-        if json_match:
-            try:
-                return json.loads(json_match.group(1))
-            except json.JSONDecodeError:
-                pass
+        """Parse Qwen3-VL JSON response, handling markdown blocks and partial JSON.
 
-        # Try raw JSON object
-        brace_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
-        if brace_match:
-            try:
-                return json.loads(brace_match.group(0))
-            except json.JSONDecodeError:
-                pass
-
-        # Try more aggressive nested JSON extraction
-        depth = 0
-        start_idx = None
-        for i, ch in enumerate(response_text):
-            if ch == '{':
-                if depth == 0:
-                    start_idx = i
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0 and start_idx is not None:
-                    try:
-                        return json.loads(response_text[start_idx:i + 1])
-                    except json.JSONDecodeError:
-                        start_idx = None
-
-        logger.warning(f"Could not parse Qwen3-VL response as JSON: {response_text[:200]}")
-        return {
-            'UI_Elements': [],
-            'Next Action': 'None',
-            'Status': 'DONE',
-            'Reasoning': response_text[:500],
-        }
+        Phase 5: thin shim onto :mod:`integrations.vlm.parser`.  Same
+        dict shape (UI_Elements + Next Action + Status + Reasoning)
+        as the historical inline implementation, but the JSON
+        extraction (code-block / raw-brace / depth-counted) lives in
+        one canonical place now.
+        """
+        from integrations.vlm.parser import parse_vlm_action
+        pa = parse_vlm_action(
+            response_text or '', expected_shape='som_bbox')
+        result = pa.to_action_json_dict()
+        # Legacy callers expect UI_Elements always present (default to []).
+        result.setdefault('UI_Elements', [])
+        return result
 
     @staticmethod
     def _get_image_dimensions(b64_data):
@@ -783,8 +1098,12 @@ class Qwen3VLBackend:
             img_bytes = base64.b64decode(b64_data)
             img = Image.open(io.BytesIO(img_bytes))
             return img.width, img.height
-        except Exception:
-            # Fallback to common resolution
+        except Exception as e:
+            # Fallback to common resolution.  Log because using the
+            # wrong resolution causes coord-scaling drift downstream;
+            # silent fallback would be diagnosable only via wrong-
+            # location-clicks symptoms in production.
+            logger.debug(f"_get_image_dimensions failed, using 1920x1080 fallback: {e}")
             return 1920, 1080
 
     @staticmethod

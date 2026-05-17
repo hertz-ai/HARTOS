@@ -8,6 +8,7 @@ import logging
 from flask import Blueprint, request, jsonify, g
 
 from integrations.social.auth import require_auth, require_admin
+from core.auth_local import require_local_or_token
 
 logger = logging.getLogger('hevolve_social')
 
@@ -220,55 +221,205 @@ def get_guardrail_status():
 
 
 # ─── Agent Ledger ───
+#
+# SmartLedger is per-(agent_id, session_id): each agent goal creates
+# its own ledger file at ``<get_agent_data_dir()>/ledger_<agent>_<session>.json``
+# (see ``agent_ledger.core.SmartLedger.__init__``).  The admin Task
+# Ledger view wants the UNION across all of them, so these handlers
+# walk the storage dir and aggregate in-memory.
+#
+# Original T18 commit (4e4554e) used ``SmartLedger.get_instance()`` /
+# ``ledger.list_tasks()`` / ``ledger.get_stats()`` — none of which
+# exist on SmartLedger; the route family never worked.  Rewritten to
+# use the actual public API: ``ledger.tasks``, ``ledger.get_task``,
+# ``ledger.get_progress_summary``.
+#
+# JSON-backend only.  When a deployment switches to RedisBackend, the
+# filesystem walk misses Redis-resident tasks; that path needs a
+# separate Redis SCAN-based aggregator (TODO).
+#
+# Filename pattern is strict UUID_UUID to reject path-traversal
+# attempts (``ledger_..%2F..%2Fetc.json``) and also to safely skip
+# sibling files like ``benchmark_ledger.json`` that share the
+# directory.
+
+import re as _re
+
+# Real on-disk session_id formats observed in production
+# (see ~/Documents/Nunba/data/agent_data/):
+#   ledger_<uuid>_<uuid>.json         — encounter / icebreaker agents
+#   ledger_<uuid>_<numeric>.json      — autoresearch / langchain sessions
+#   ledger_<uuid>_<arbitrary>.json    — possible future formats
+# So agent_id is anchored to strict UUID (every visible filename has one),
+# but session_id is any safe identifier — alphanumeric / hyphen /
+# underscore.  Anchored ^...$ + restricted charset prevents both
+# path traversal (no ``..%2F``, no ``/``) and matches against sibling
+# files like ``benchmark_ledger.json`` that share the directory.
+_LEDGER_UUID_RE = (r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}'
+                   r'-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+_LEDGER_FILENAME = _re.compile(
+    rf'^ledger_(?P<agent>{_LEDGER_UUID_RE})_(?P<session>[A-Za-z0-9_\-]+)\.json$'
+)
+
+
+def _iter_ledgers(agent_filter=None):
+    """Yield ``(agent_id, session_id, SmartLedger)`` for every JSON
+    ledger file in ``get_agent_data_dir()``.
+
+    Honours the per-(agent, session) cache from
+    ``agent_ledger.factory.get_or_create_ledger`` so repeat polls
+    don't re-parse JSON each time.  ``prefer_redis=False`` because
+    we are explicitly walking on-disk JSON files; a RedisBackend
+    instance would not surface them via ``Path.glob``.
+    """
+    from agent_ledger.factory import get_or_create_ledger
+    from core.platform_paths import get_agent_data_dir
+    from pathlib import Path
+
+    storage_dir = Path(get_agent_data_dir())
+    if not storage_dir.is_dir():
+        return
+    for ledger_file in storage_dir.glob('ledger_*.json'):
+        m = _LEDGER_FILENAME.match(ledger_file.name)
+        if not m:
+            # benchmark_ledger.json, malformed names, traversal attempts.
+            continue
+        agent_id, session_id = m.group('agent'), m.group('session')
+        if agent_filter and agent_id != agent_filter:
+            continue
+        try:
+            ledger = get_or_create_ledger(
+                agent_id=agent_id,
+                session_id=session_id,
+                use_cache=True,
+                storage_dir=str(storage_dir),
+                prefer_redis=False,
+            )
+            yield agent_id, session_id, ledger
+        except Exception as e:
+            logger.warning(f"Skipped ledger {ledger_file.name}: {e}")
+            continue
+
 
 @agent_engine_bp.route('/api/agent-engine/ledger/tasks', methods=['GET'])
-@require_auth
+@require_local_or_token
 def list_ledger_tasks():
-    """List tasks from the agent ledger with optional filters."""
+    """List tasks aggregated across all per-session SmartLedgers.
+
+    Query params:
+      ``status``    — TaskStatus value (e.g. ``in_progress``, ``completed``)
+      ``agent_id``  — filter to one agent's ledgers (UUID)
+      ``limit``     — max tasks returned (1..1000, default 50)
+    """
     try:
-        from agent_ledger import SmartLedger
-        ledger = SmartLedger.get_instance()
-        status = request.args.get('status')
-        agent_id = request.args.get('agent_id')
-        limit = int(request.args.get('limit', 50))
-        tasks = ledger.list_tasks(status=status, agent_id=agent_id, limit=limit)
+        from agent_ledger import TaskStatus
+    except ImportError:
+        return jsonify({'success': False,
+                        'error': 'agent_ledger not installed'}), 501
+    try:
+        status_filter = request.args.get('status')
+        agent_filter = request.args.get('agent_id')
+        try:
+            limit = max(1, min(int(request.args.get('limit', 50)), 1000))
+        except (TypeError, ValueError):
+            limit = 50
+
+        status_enum = None
+        if status_filter:
+            try:
+                status_enum = TaskStatus(status_filter)
+            except ValueError:
+                return jsonify({'success': False,
+                                'error': f'Unknown status: {status_filter}'}), 400
+
+        all_tasks = []
+        for agent_id, session_id, ledger in _iter_ledgers(agent_filter):
+            for task in ledger.tasks.values():
+                if status_enum is not None and task.status != status_enum:
+                    continue
+                all_tasks.append({
+                    **task.to_dict(),
+                    'agent_id': agent_id,
+                    'session_id': session_id,
+                })
+                if len(all_tasks) >= limit:
+                    break
+            if len(all_tasks) >= limit:
+                break
+
         return jsonify({
             'success': True,
-            'tasks': [t.to_dict() for t in tasks],
-            'total': len(tasks),
+            'tasks': all_tasks,
+            'total': len(all_tasks),
         })
-    except ImportError:
-        return jsonify({'success': False, 'error': 'agent_ledger not installed'}), 501
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+    except Exception:
+        logger.exception("list_ledger_tasks failed")
+        return jsonify({'success': False,
+                        'error': 'Internal server error'}), 500
 
 
 @agent_engine_bp.route('/api/agent-engine/ledger/tasks/<task_id>', methods=['GET'])
-@require_auth
+@require_local_or_token
 def get_ledger_task(task_id):
-    """Get a single task by ID with full history."""
+    """Get a single task by ID, searching across all per-session ledgers."""
     try:
-        from agent_ledger import SmartLedger
-        ledger = SmartLedger.get_instance()
-        task = ledger.get_task(task_id)
-        if not task:
-            return jsonify({'success': False, 'error': 'Task not found'}), 404
-        return jsonify({'success': True, 'task': task.to_dict()})
+        for agent_id, session_id, ledger in _iter_ledgers():
+            task = ledger.get_task(task_id)
+            if task is not None:
+                return jsonify({
+                    'success': True,
+                    'task': {
+                        **task.to_dict(),
+                        'agent_id': agent_id,
+                        'session_id': session_id,
+                    },
+                })
+        return jsonify({'success': False, 'error': 'Task not found'}), 404
     except ImportError:
-        return jsonify({'success': False, 'error': 'agent_ledger not installed'}), 501
+        return jsonify({'success': False,
+                        'error': 'agent_ledger not installed'}), 501
+    except Exception:
+        logger.exception("get_ledger_task failed")
+        return jsonify({'success': False,
+                        'error': 'Internal server error'}), 500
 
 
 @agent_engine_bp.route('/api/agent-engine/ledger/stats', methods=['GET'])
-@require_auth
+@require_local_or_token
 def get_ledger_stats():
-    """Get ledger summary stats."""
+    """Aggregate ledger stats across all per-session SmartLedgers.
+
+    Sums per-status counts and totals over every JSON ledger in
+    ``get_agent_data_dir()``.  ``by_status`` keys are TaskStatus
+    string values (``pending``, ``in_progress``, ...) — the dict
+    returned by ``SmartLedger.get_task_state_summary`` uses enum
+    keys, so we coerce to ``.value`` for JSON serialization.
+    """
     try:
-        from agent_ledger import SmartLedger
-        ledger = SmartLedger.get_instance()
-        stats = ledger.get_stats()
-        return jsonify({'success': True, 'stats': stats})
+        total = 0
+        sessions = 0
+        by_status = {}
+        for _agent_id, _session_id, ledger in _iter_ledgers():
+            sessions += 1
+            for task in ledger.tasks.values():
+                total += 1
+                key = task.status.value if hasattr(task.status, 'value') else str(task.status)
+                by_status[key] = by_status.get(key, 0) + 1
+        return jsonify({
+            'success': True,
+            'stats': {
+                'total': total,
+                'sessions': sessions,
+                'by_status': by_status,
+            },
+        })
     except ImportError:
-        return jsonify({'success': False, 'error': 'agent_ledger not installed'}), 501
+        return jsonify({'success': False,
+                        'error': 'agent_ledger not installed'}), 501
+    except Exception:
+        logger.exception("get_ledger_stats failed")
+        return jsonify({'success': False,
+                        'error': 'Internal server error'}), 500
 
 
 # ─── IP Protection ───

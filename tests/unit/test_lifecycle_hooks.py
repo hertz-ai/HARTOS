@@ -722,14 +722,23 @@ class TestAutoSyncToLedger:
         task.resume.assert_called_once()
         assert task.blocked_reason is None
 
-    @pytest.mark.skip(reason="ActionState→TaskStatus mapping changed; resume call path differs")
     def test_blocked_to_in_progress_resumes(self):
+        """BLOCKED → IN_PROGRESS goes via the validated 2-step
+        transition_to(PENDING) → transition_to(IN_PROGRESS) path, not
+        task.resume() — resume() is only valid from PAUSED/USER_STOPPED
+        in the SmartLedger state machine.  blocked_reason is cleared
+        and the ledger save is triggered."""
         task = self._make_task(_LedgerTaskStatus.BLOCKED)
         ledger = MagicMock()
         ledger.tasks = {"action_1": task}
         _ledger_registry[UP] = ledger
         _auto_sync_to_ledger(UP, 1, ActionState.FALLBACK_RECEIVED)
-        task.resume.assert_called_once()
+        # Two validated transitions: BLOCKED → PENDING → IN_PROGRESS
+        assert task.transition_to.call_count == 2
+        statuses = [c.args[0] for c in task.transition_to.call_args_list]
+        assert statuses == [_LedgerTaskStatus.PENDING, _LedgerTaskStatus.IN_PROGRESS]
+        assert task.blocked_reason is None
+        ledger.save.assert_called()
 
     def test_claims_ownership_on_in_progress(self):
         task = self._make_task(_LedgerTaskStatus.PENDING, is_owned=False)

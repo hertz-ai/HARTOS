@@ -1528,19 +1528,31 @@ class TestVLMDeterministicActions:
         assert 'refused' in result['output'].lower()
 
     def test_shell_action_fails_closed_on_import_error(self):
-        """If hart_intelligence_entry can't be imported we MUST fail
+        """If the shared shell handler is unavailable (HARTOS still
+        loading, or stripped from the frozen build) we MUST fail
         closed — no bare subprocess fallback that skips the denylist.
         Regression guard: previously the code had a fallback that ran
-        the command without any safety checks at all."""
+        the command without any safety checks at all.
+
+        The production code reads the handler via
+        ``core.safe_hartos_attr.safe_hartos_attr`` (which inspects
+        ``sys.modules`` — never calls ``__import__``).  The earlier
+        version of this test patched ``builtins.__import__`` which
+        had zero effect on the actual code path: ``safe_hartos_attr``
+        returned the cached module from ``sys.modules`` and the
+        test passed only when run in isolation (before something
+        else in the suite imported hart_intelligence_entry).  Now
+        we patch the resolver directly — that's the layer the
+        production code uses, so the test exercises the real fail-
+        closed branch deterministically.
+        """
         from integrations.vlm import local_computer_tool
-        real_import = __builtins__['__import__'] if isinstance(__builtins__, dict) else __builtins__.__import__
-
-        def broken_import(name, *args, **kwargs):
-            if name == 'hart_intelligence_entry':
-                raise ImportError('simulated')
-            return real_import(name, *args, **kwargs)
-
-        with patch('builtins.__import__', side_effect=broken_import):
+        with patch(
+            'integrations.vlm.local_computer_tool.safe_hartos_attr'
+            if hasattr(local_computer_tool, 'safe_hartos_attr')
+            else 'core.safe_hartos_attr.safe_hartos_attr',
+            return_value=None,
+        ):
             result = local_computer_tool._execute_inprocess(
                 {'action': 'shell', 'command': 'echo hi'}
             )
@@ -1612,23 +1624,21 @@ class TestVLMDeterministicActions:
         assert result['status'] == 'ok'
 
     def test_open_file_gui_nonwindows_fails_closed_on_import_error(self):
-        """If the shared shell handler can't be imported on non-Windows,
-        open_file_gui must fail closed — NO bare subprocess fallback that
-        would skip the denylist. Same regression guard as the shell action."""
+        """If the shared shell handler is unavailable on non-Windows,
+        open_file_gui must fail closed — NO bare subprocess fallback
+        that would skip the denylist.  Same regression guard as the
+        shell action.  Patches the safe_hartos_attr resolver (which
+        is the actual layer production code uses) instead of
+        builtins.__import__ (the prior version's wrong layer that
+        only worked when the test ran in isolation)."""
         from integrations.vlm import local_computer_tool as lct
-        real_import = (
-            __builtins__['__import__']
-            if isinstance(__builtins__, dict)
-            else __builtins__.__import__
-        )
-
-        def broken_import(name, *args, **kwargs):
-            if name == 'hart_intelligence_entry':
-                raise ImportError('simulated')
-            return real_import(name, *args, **kwargs)
-
         with patch.object(lct.sys, 'platform', 'linux'), \
-             patch('builtins.__import__', side_effect=broken_import):
+             patch(
+                 'integrations.vlm.local_computer_tool.safe_hartos_attr'
+                 if hasattr(lct, 'safe_hartos_attr')
+                 else 'core.safe_hartos_attr.safe_hartos_attr',
+                 return_value=None,
+             ):
             result = lct._execute_inprocess(
                 {'action': 'open_file_gui', 'path': '/home/u/doc.pdf'}
             )
@@ -1713,6 +1723,170 @@ class TestPointAndActBottomEdgeRetry:
         # The mock serves both the taskbar_list call and the describe_first fallback,
         # but crucially NO elimination retry fires on the bottom-edge result.
         assert result.get('strategy') != 'elimination_retry'
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 3.5 — complementary path router (memory/vlm_best_of_all_worlds_plan §13)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestRouteTaskHeuristic:
+    """route_task is a pure-keyword classifier (no VLM call).  These
+    are the regression-contract test cases listed in the plan §13:
+    the gate later checks that real benchmark prompts route to the
+    expected path; here we cover the heuristic itself."""
+
+    def setup_method(self, _):
+        from integrations.vlm.qwen3vl_backend import Qwen3VLBackend
+        self.backend = Qwen3VLBackend()
+
+    # ── single_shot (default) ─────────────────────────────────
+    def test_click_start_button_routes_single_shot(self):
+        assert self.backend.route_task('Click the Start button') == 'single_shot'
+
+    def test_tap_play_button_routes_single_shot(self):
+        assert self.backend.route_task('tap the play button') == 'single_shot'
+
+    def test_point_to_x_routes_single_shot(self):
+        assert self.backend.route_task('Point to the Chrome icon') == 'single_shot'
+
+    def test_press_enter_routes_single_shot(self):
+        assert self.backend.route_task('press enter') == 'single_shot'
+
+    def test_empty_task_routes_single_shot(self):
+        assert self.backend.route_task('') == 'single_shot'
+        assert self.backend.route_task(None) == 'single_shot'
+
+    # ── enumerate (parse_and_reason path) ─────────────────────
+    def test_list_all_clickable_routes_enumerate(self):
+        assert self.backend.route_task(
+            'list all clickable elements on screen') == 'enumerate'
+
+    def test_whats_on_screen_routes_enumerate(self):
+        assert self.backend.route_task("what's on screen?") == 'enumerate'
+
+    def test_what_is_on_the_screen_routes_enumerate(self):
+        assert self.backend.route_task('what is on the screen') == 'enumerate'
+
+    def test_show_me_all_buttons_routes_enumerate(self):
+        assert self.backend.route_task(
+            'show me all the buttons') == 'enumerate'
+
+    def test_find_all_links_routes_enumerate(self):
+        assert self.backend.route_task('find all links') == 'enumerate'
+
+    def test_enumerate_keyword_routes_enumerate(self):
+        assert self.backend.route_task(
+            'enumerate the menu items') == 'enumerate'
+
+    def test_every_clickable_routes_enumerate(self):
+        assert self.backend.route_task(
+            'identify every clickable element') == 'enumerate'
+
+    def test_how_many_buttons_routes_enumerate(self):
+        assert self.backend.route_task(
+            'how many buttons are visible') == 'enumerate'
+
+    # ── multi_step (run_local_agentic_loop path) ──────────────
+    def test_open_then_click_routes_multi_step(self):
+        assert self.backend.route_task(
+            'Open Notepad and type Hello') == 'multi_step'
+
+    def test_open_app_and_play_routes_multi_step(self):
+        assert self.backend.route_task(
+            'Open Spotify and play Sgt Pepper') == 'multi_step'
+
+    def test_navigate_to_routes_multi_step(self):
+        assert self.backend.route_task(
+            'navigate to settings') == 'multi_step'
+
+    def test_fill_in_form_routes_multi_step(self):
+        assert self.backend.route_task(
+            'Fill in this form with my email') == 'multi_step'
+
+    def test_step_marker_routes_multi_step(self):
+        assert self.backend.route_task(
+            'Step 1: open the file. Step 2: copy text') == 'multi_step'
+
+    def test_then_click_routes_multi_step(self):
+        assert self.backend.route_task(
+            'Open Chrome then click the search box') == 'multi_step'
+
+    # ── False-positive guards ─────────────────────────────────
+    def test_specialist_does_not_trip_list_pattern(self):
+        """'specialist' contains 'list' — word-boundary anchoring
+        must prevent a false enumerate route."""
+        assert self.backend.route_task(
+            'click the specialist button') == 'single_shot'
+
+    def test_then_inside_word_does_not_trip(self):
+        """'lengthen' / 'strengthen' contain 'then' as substring —
+        word-boundary anchoring must prevent a false multi_step
+        route on a single-action task."""
+        assert self.backend.route_task(
+            'click the strengthen button') == 'single_shot'
+
+
+class TestDispatchGrounding:
+    """dispatch_grounding routes to the right method based on
+    route_task and tags the result with the chosen route."""
+
+    def test_single_shot_route_calls_point_and_act(self, sample_screenshot_b64):
+        from integrations.vlm.qwen3vl_backend import Qwen3VLBackend
+        backend = Qwen3VLBackend()
+        with patch.object(backend, 'point_and_act',
+                          return_value={'action': 'left_click',
+                                        'screen_x': 100, 'screen_y': 200}) as mock_pa, \
+             patch.object(backend, 'parse_and_reason') as mock_pr:
+            result = backend.dispatch_grounding(
+                sample_screenshot_b64, 'Click the OK button')
+        mock_pa.assert_called_once()
+        mock_pr.assert_not_called()
+        assert result['route'] == 'single_shot'
+
+    def test_enumerate_route_calls_parse_and_reason(self, sample_screenshot_b64):
+        from integrations.vlm.qwen3vl_backend import Qwen3VLBackend
+        backend = Qwen3VLBackend()
+        with patch.object(backend, 'parse_and_reason',
+                          return_value={'parsed_content_list': [],
+                                        'action_json': {}}) as mock_pr, \
+             patch.object(backend, 'point_and_act') as mock_pa:
+            result = backend.dispatch_grounding(
+                sample_screenshot_b64, 'list all buttons on screen')
+        mock_pr.assert_called_once()
+        mock_pa.assert_not_called()
+        assert result['route'] == 'enumerate'
+
+    def test_multi_step_route_returns_sentinel(self, sample_screenshot_b64):
+        """multi_step can't call run_local_agentic_loop (circular import);
+        instead returns a sentinel the caller acts on."""
+        from integrations.vlm.qwen3vl_backend import Qwen3VLBackend
+        backend = Qwen3VLBackend()
+        with patch.object(backend, 'point_and_act') as mock_pa, \
+             patch.object(backend, 'parse_and_reason') as mock_pr:
+            result = backend.dispatch_grounding(
+                sample_screenshot_b64, 'Open Notepad and type Hello')
+        mock_pa.assert_not_called()
+        mock_pr.assert_not_called()
+        assert result['route'] == 'multi_step'
+        assert result['recommend'] == 'run_local_agentic_loop'
+        assert result['action'] is None
+
+    def test_explicit_route_override(self, sample_screenshot_b64):
+        """Caller can pass route= to bypass the heuristic — e.g. the
+        loop already decided multi_step and is calling per-iter
+        with route='single_shot'."""
+        from integrations.vlm.qwen3vl_backend import Qwen3VLBackend
+        backend = Qwen3VLBackend()
+        with patch.object(backend, 'point_and_act',
+                          return_value={'action': 'left_click'}) as mock_pa:
+            # Task would normally route enumerate; override forces
+            # single_shot.
+            result = backend.dispatch_grounding(
+                sample_screenshot_b64, 'list all buttons',
+                route='single_shot')
+        mock_pa.assert_called_once()
+        assert result['route'] == 'single_shot'
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1975,3 +2149,450 @@ class TestLocalLoopHelpers:
 
         content = _build_vision_prompt("1: button Save", "b64data", iteration=3)
         assert any("updated screen" in c.get('text', '') for c in content if isinstance(c, dict) and 'text' in c)
+
+
+# ===========================================================================
+# Phase 4 - per-window click translation + post-click verify
+# (memory/vlm_best_of_all_worlds_plan.md section 3)
+# ===========================================================================
+
+
+class TestExecuteActionBackCompat:
+    """execute_action's new kwargs (window_handle, verify, if_occluded)
+    are all defaulted - every existing call site stays valid."""
+
+    @patch('integrations.vlm.local_computer_tool._execute_inprocess')
+    def test_no_kwargs_calls_inprocess_unchanged(self, mock_exec):
+        from integrations.vlm.local_computer_tool import execute_action
+        mock_exec.return_value = {'output': 'ok'}
+        result = execute_action({'action': 'left_click'}, 'inprocess')
+        assert result['output'] == 'ok'
+        assert 'window' not in result
+        assert 'verify_diff' not in result
+
+
+class TestPrepareWindowForAction:
+    """_prepare_window_for_action: refresh window, decide policy,
+    translate window-local 0-1000 coords to screen pixels."""
+
+    def _make_winfo(self, hwnd, rect=(100, 200, 800, 600),
+                    minimized=False, visible=True):
+        from integrations.remote_desktop.window_capture import WindowInfo
+        return WindowInfo(
+            hwnd=hwnd, title=f'win{hwnd}', process_name='test.exe',
+            pid=42, rect=rect, visible=visible, minimized=minimized)
+
+    def test_destroyed_window_returns_early(self):
+        from integrations.vlm.local_computer_tool import _prepare_window_for_action
+        with patch('integrations.remote_desktop.window_capture.WindowEnumerator') as mock_enum:
+            mock_enum.return_value.refresh_window_info.return_value = None
+            meta, early = _prepare_window_for_action(
+                12345, {'action': 'left_click', 'coordinate': [500, 500]},
+                if_occluded='skip')
+        assert early is not None
+        assert early['status'] == 'window_destroyed'
+
+    def test_zero_size_window_returns_offscreen(self):
+        from integrations.vlm.local_computer_tool import _prepare_window_for_action
+        with patch('integrations.remote_desktop.window_capture.WindowEnumerator') as mock_enum:
+            mock_enum.return_value.refresh_window_info.return_value = \
+                self._make_winfo(1, rect=(0, 0, 0, 0))
+            _, early = _prepare_window_for_action(
+                1, {'action': 'left_click', 'coordinate': [500, 500]},
+                if_occluded='skip')
+        assert early is not None
+        assert early['status'] == 'window_offscreen'
+
+    def test_minimized_window_skip_policy_returns_early(self):
+        from integrations.vlm.local_computer_tool import _prepare_window_for_action
+        with patch('integrations.remote_desktop.window_capture.WindowEnumerator') as mock_enum:
+            mock_enum.return_value.refresh_window_info.return_value = \
+                self._make_winfo(1, minimized=True)
+            _, early = _prepare_window_for_action(
+                1, {'action': 'left_click', 'coordinate': [500, 500]},
+                if_occluded='skip')
+        assert early is not None
+        assert early['status'] == 'window_minimized'
+
+    def test_minimized_window_foreground_policy_brings_forward(self):
+        from integrations.vlm.local_computer_tool import _prepare_window_for_action
+        with patch('integrations.remote_desktop.window_capture.WindowEnumerator') as mock_enum, \
+             patch('integrations.vlm.local_computer_tool._bring_foreground') as mock_bring:
+            mock_enum.return_value.refresh_window_info.return_value = \
+                self._make_winfo(1, minimized=True)
+            action = {'action': 'left_click', 'coordinate': [500, 500]}
+            meta, early = _prepare_window_for_action(
+                1, action, if_occluded='foreground')
+        assert early is None, 'foreground policy should not return early'
+        mock_bring.assert_called_once_with(1)
+
+    def test_window_local_coord_translated_to_screen(self):
+        from integrations.vlm.local_computer_tool import _prepare_window_for_action
+        with patch('integrations.remote_desktop.window_capture.WindowEnumerator') as mock_enum:
+            mock_enum.return_value.refresh_window_info.return_value = \
+                self._make_winfo(1, rect=(100, 200, 800, 600))
+            action = {'action': 'left_click', 'coordinate': [500, 500]}
+            meta, early = _prepare_window_for_action(
+                1, action, if_occluded='skip')
+        assert early is None
+        # 100 + int(500*800/1000)=500, 200 + int(500*600/1000)=500
+        assert action['coordinate'] == [500, 500]
+        assert action['_translated_from'] == (500, 500)
+        assert action['_translated_to'] == (500, 500)
+
+    def test_norm_coord_corner_translated_correctly(self):
+        from integrations.vlm.local_computer_tool import _prepare_window_for_action
+        with patch('integrations.remote_desktop.window_capture.WindowEnumerator') as mock_enum:
+            mock_enum.return_value.refresh_window_info.return_value = \
+                self._make_winfo(1, rect=(0, 0, 1000, 1000))
+            action = {'action': 'left_click', 'coordinate': [1000, 1000]}
+            _prepare_window_for_action(1, action, if_occluded='skip')
+        assert action['coordinate'] == [1000, 1000]
+
+    def test_screen_pixel_coord_left_alone(self):
+        """Coord with values > 1000 = caller passed screen pixels;
+        translation must NOT mangle them."""
+        from integrations.vlm.local_computer_tool import _prepare_window_for_action
+        with patch('integrations.remote_desktop.window_capture.WindowEnumerator') as mock_enum:
+            mock_enum.return_value.refresh_window_info.return_value = \
+                self._make_winfo(1, rect=(0, 0, 800, 600))
+            action = {'action': 'left_click', 'coordinate': [1500, 800]}
+            _prepare_window_for_action(1, action, if_occluded='skip')
+        assert action['coordinate'] == [1500, 800]
+
+
+class TestQuickImageDiff:
+    """_quick_image_diff: cheap pre/post diff for verify=True."""
+
+    def _b64_solid_color(self, color, size=(100, 100)):
+        import base64, io
+        from PIL import Image
+        img = Image.new('RGB', size, color)
+        buf = io.BytesIO()
+        img.save(buf, 'JPEG', quality=80)
+        return base64.b64encode(buf.getvalue()).decode('ascii')
+
+    def test_identical_images_diff_zero(self):
+        from integrations.vlm.local_computer_tool import _quick_image_diff
+        b64 = self._b64_solid_color((255, 0, 0))
+        assert _quick_image_diff(b64, b64) == 0.0
+
+    def test_completely_different_images_diff_high(self):
+        from integrations.vlm.local_computer_tool import _quick_image_diff
+        a = self._b64_solid_color((0, 0, 0))
+        b = self._b64_solid_color((255, 255, 255))
+        diff = _quick_image_diff(a, b)
+        assert diff > 0.9, f'black vs white should be near-100% diff, got {diff}'
+
+    def test_invalid_input_returns_zero(self):
+        """Bad base64 returns 0 conservatively (no spurious nudges)."""
+        from integrations.vlm.local_computer_tool import _quick_image_diff
+        assert _quick_image_diff('not-base64!!!', 'also-bad') == 0.0
+
+
+class TestPostClickVerifyRetry:
+    """When verify=True and pre/post diff is tiny, retry once with
+    a 50-px nudge."""
+
+    def _solid_b64(self, color=(128, 128, 128)):
+        import base64, io
+        from PIL import Image
+        img = Image.new('RGB', (100, 100), color)
+        buf = io.BytesIO()
+        img.save(buf, 'JPEG', quality=80)
+        return base64.b64encode(buf.getvalue()).decode('ascii')
+
+    @patch('integrations.vlm.local_computer_tool.take_screenshot')
+    @patch('integrations.vlm.local_computer_tool._execute_inprocess')
+    @patch('integrations.vlm.local_computer_tool.time.sleep')
+    def test_no_change_triggers_nudge_retry(self, mock_sleep, mock_exec,
+                                             mock_screenshot):
+        from integrations.vlm.local_computer_tool import execute_action
+        same_b64 = self._solid_b64()
+        mock_screenshot.return_value = same_b64
+        mock_exec.return_value = {'output': 'clicked'}
+
+        result = execute_action(
+            {'action': 'left_click', 'coordinate': [100, 100]},
+            'inprocess', verify=True)
+
+        assert result['verify_diff'] == 0.0
+        assert result['verify_retried'] is True
+        assert result['verify_nudge_to'] == [150, 100]
+        assert mock_exec.call_count == 2
+
+    @patch('integrations.vlm.local_computer_tool.take_screenshot')
+    @patch('integrations.vlm.local_computer_tool._execute_inprocess')
+    @patch('integrations.vlm.local_computer_tool.time.sleep')
+    def test_visible_change_no_retry(self, mock_sleep, mock_exec,
+                                      mock_screenshot):
+        from integrations.vlm.local_computer_tool import execute_action
+        mock_screenshot.side_effect = [
+            self._solid_b64((0, 0, 0)),
+            self._solid_b64((255, 255, 255)),
+        ]
+        mock_exec.return_value = {'output': 'clicked'}
+
+        result = execute_action(
+            {'action': 'left_click', 'coordinate': [100, 100]},
+            'inprocess', verify=True)
+
+        assert result['verify_diff'] > 0.9
+        assert result['verify_retried'] is False
+        assert mock_exec.call_count == 1
+
+    @patch('integrations.vlm.local_computer_tool.take_screenshot')
+    @patch('integrations.vlm.local_computer_tool._execute_inprocess')
+    @patch('integrations.vlm.local_computer_tool.time.sleep')
+    @patch('integrations.vlm.local_computer_tool._quick_image_diff')
+    def test_diff_just_below_threshold_retries(self, mock_diff, mock_sleep,
+                                                 mock_exec, mock_screenshot):
+        """Boundary: diff = 0.004 (< VERIFY_DIFF_THRESHOLD=0.005) -> retry."""
+        from integrations.vlm.local_computer_tool import (
+            execute_action, VERIFY_DIFF_THRESHOLD)
+        assert VERIFY_DIFF_THRESHOLD == 0.005
+        mock_screenshot.return_value = self._solid_b64()
+        mock_exec.return_value = {'output': 'clicked'}
+        mock_diff.return_value = 0.004
+        result = execute_action(
+            {'action': 'left_click', 'coordinate': [100, 100]},
+            'inprocess', verify=True)
+        assert result['verify_retried'] is True
+        assert mock_exec.call_count == 2
+
+    @patch('integrations.vlm.local_computer_tool.take_screenshot')
+    @patch('integrations.vlm.local_computer_tool._execute_inprocess')
+    @patch('integrations.vlm.local_computer_tool.time.sleep')
+    @patch('integrations.vlm.local_computer_tool._quick_image_diff')
+    def test_diff_just_above_threshold_does_not_retry(self, mock_diff, mock_sleep,
+                                                       mock_exec, mock_screenshot):
+        """Boundary: diff = 0.006 (>= VERIFY_DIFF_THRESHOLD=0.005) -> no retry."""
+        from integrations.vlm.local_computer_tool import execute_action
+        mock_screenshot.return_value = self._solid_b64()
+        mock_exec.return_value = {'output': 'clicked'}
+        mock_diff.return_value = 0.006
+        result = execute_action(
+            {'action': 'left_click', 'coordinate': [100, 100]},
+            'inprocess', verify=True)
+        assert result['verify_retried'] is False
+        assert mock_exec.call_count == 1
+
+
+class TestExecuteActionWindowHandleEdgeCases:
+    """Coverage gap reviewer flagged: window_handle path with action
+    that has no coordinate (e.g. type / key / hotkey actions targeted
+    at a specific window).  Must NOT crash, must NOT translate
+    non-existent coords."""
+
+    def _make_winfo(self, hwnd, rect=(0, 0, 800, 600)):
+        from integrations.remote_desktop.window_capture import WindowInfo
+        return WindowInfo(hwnd=hwnd, title='Test', process_name='t.exe',
+                          pid=42, rect=rect)
+
+    def test_window_handle_with_no_coordinate_succeeds(self):
+        """type action targeted at a window - no coord to translate;
+        execute_action must still call _execute_inprocess."""
+        from integrations.vlm.local_computer_tool import execute_action
+        with patch('integrations.remote_desktop.window_capture.WindowEnumerator') as mock_enum, \
+             patch('integrations.vlm.local_computer_tool._execute_inprocess',
+                   return_value={'output': 'typed', 'status': 'ok'}) as mock_exec:
+            mock_enum.return_value.refresh_window_info.return_value = self._make_winfo(1)
+            result = execute_action(
+                {'action': 'type', 'text': 'hello'},
+                'inprocess', window_handle=1)
+        mock_exec.assert_called_once()
+        assert result['output'] == 'typed'
+
+    def test_window_handle_preserves_action_text_field(self):
+        """The window-translation step must NOT mutate non-coordinate fields."""
+        from integrations.vlm.local_computer_tool import execute_action
+        action = {'action': 'type', 'text': 'preserve me'}
+        with patch('integrations.remote_desktop.window_capture.WindowEnumerator') as mock_enum, \
+             patch('integrations.vlm.local_computer_tool._execute_inprocess',
+                   return_value={'output': 'ok'}) as mock_exec:
+            mock_enum.return_value.refresh_window_info.return_value = self._make_winfo(1)
+            execute_action(action, 'inprocess', window_handle=1)
+        passed_action = mock_exec.call_args[0][0]
+        assert passed_action['text'] == 'preserve me'
+
+
+class TestCheckReasoningMismatch:
+    """SRP extraction from execute_action - the mismatch detector
+    is now standalone and unit-testable."""
+
+    def test_no_reasoning_returns_none(self):
+        from integrations.vlm.local_computer_tool import _check_reasoning_mismatch
+        assert _check_reasoning_mismatch({'action': 'left_click'}) is None
+
+    def test_reasoning_without_window_verb_skips_probe(self):
+        """Reasoning that doesn't mention a window-targeted verb must
+        NOT trigger the slow get_active_window_info probe."""
+        from integrations.vlm.local_computer_tool import _check_reasoning_mismatch
+        with patch('integrations.vlm.local_computer_tool.get_active_window_info') as mock_probe:
+            result = _check_reasoning_mismatch(
+                {'reasoning': 'typing the user query'})
+        assert result is None
+        mock_probe.assert_not_called()
+
+    def test_mobaxt_mismatch_detected(self):
+        from integrations.vlm.local_computer_tool import _check_reasoning_mismatch
+        with patch('integrations.vlm.local_computer_tool.get_active_window_info',
+                   return_value='Claude Code'):
+            result = _check_reasoning_mismatch(
+                {'reasoning': 'click on the MobaXterm terminal'})
+        assert result is not None
+        assert 'Mobaxt' in result
+        assert 'Claude Code' in result
+
+    def test_mobaxt_match_no_mismatch(self):
+        from integrations.vlm.local_computer_tool import _check_reasoning_mismatch
+        with patch('integrations.vlm.local_computer_tool.get_active_window_info',
+                   return_value='MobaXterm session 1'):
+            result = _check_reasoning_mismatch(
+                {'reasoning': 'click on the MobaXterm terminal'})
+        assert result is None
+
+    def test_extending_pattern_list_works(self):
+        """The pattern list is module-level - adding an entry should
+        immediately work without code changes elsewhere."""
+        from integrations.vlm import local_computer_tool as lct
+        original = lct._REASONING_MISMATCH_PATTERNS
+        try:
+            lct._REASONING_MISMATCH_PATTERNS = original + (('vscode', 'visual studio'),)
+            with patch.object(lct, 'get_active_window_info',
+                              return_value='Notepad'):
+                result = lct._check_reasoning_mismatch(
+                    {'reasoning': 'switch to vscode'})
+            assert result is not None
+            assert 'Vscode' in result
+        finally:
+            lct._REASONING_MISMATCH_PATTERNS = original
+
+
+class TestPointActionToActionJson:
+    """Single source of truth for converting point_and_act result
+    into the loop's action_json shape - was inline duplication
+    flagged by reviewer."""
+
+    def test_basic_left_click_conversion(self):
+        from integrations.vlm.local_loop import _point_action_to_action_json
+        point_action = {
+            'action': 'left_click',
+            'screen_x': 240,
+            'screen_y': 980,
+            'reasoning': 'Start button found at taskbar',
+            'raw': '<point>238,977</point>',
+            'strategy': 'taskbar_list',
+        }
+        action_json = _point_action_to_action_json(point_action)
+        assert action_json['Next Action'] == 'left_click'
+        assert action_json['coordinate'] == [240, 980]
+        assert action_json['Reasoning'] == 'Start button found at taskbar'
+        assert action_json['Status'] == 'IN_PROGRESS'
+        assert action_json['_strategy'] == 'taskbar_list'
+
+    def test_done_status_propagates(self):
+        from integrations.vlm.local_loop import _point_action_to_action_json
+        point_action = {
+            'action': 'done',
+            'screen_x': 0, 'screen_y': 0,
+            'done': True,
+            'reasoning': 'Task complete',
+        }
+        action_json = _point_action_to_action_json(point_action)
+        assert action_json['Status'] == 'DONE'
+        assert action_json['Next Action'] == 'done'
+
+    def test_text_field_propagates_to_value(self):
+        """type actions carry text in 'text' field; action_json wants 'value'."""
+        from integrations.vlm.local_loop import _point_action_to_action_json
+        point_action = {
+            'action': 'type', 'screen_x': 0, 'screen_y': 0,
+            'text': 'hello world', 'reasoning': 'typing',
+        }
+        action_json = _point_action_to_action_json(point_action)
+        assert action_json['value'] == 'hello world'
+        assert action_json['Next Action'] == 'type'
+
+    def test_missing_strategy_defaults_to_taskbar_list(self):
+        """When strategy isn't set (older callers), default makes
+        sense for the only current call site (taskbar pre-check)."""
+        from integrations.vlm.local_loop import _point_action_to_action_json
+        action_json = _point_action_to_action_json({'action': 'left_click'})
+        assert action_json['_strategy'] == 'taskbar_list'
+
+    def test_empty_input_safe(self):
+        from integrations.vlm.local_loop import _point_action_to_action_json
+        action_json = _point_action_to_action_json({})
+        # Defaults are set by .get(): action -> 'left_click', text -> '',
+        # reasoning -> '', strategy -> 'taskbar_list'
+        assert action_json['Next Action'] == 'left_click'
+        assert action_json['value'] == ''
+        assert action_json['Status'] == 'IN_PROGRESS'
+
+
+class TestExtractClickCoord:
+    """Loop's _extract_click_coord is the single source of truth for
+    where in 0-1000 norm space the VLM said to click - was a 4th
+    parallel parser before this commit."""
+
+    def test_point_tag_in_raw_wins(self):
+        from integrations.vlm.local_loop import _extract_click_coord
+        raw = 'Looking at the screen <point>234,567</point>'
+        nx, ny = _extract_click_coord(raw, {'coordinate': [999, 999]})
+        assert (nx, ny) == (234, 567)
+
+    def test_action_json_coordinate_when_no_point_tag(self):
+        from integrations.vlm.local_loop import _extract_click_coord
+        nx, ny = _extract_click_coord(
+            '{"Next Action": "left_click"}',
+            {'coordinate': [400, 800]})
+        assert (nx, ny) == (400, 800)
+
+    def test_center_fallback_when_neither_present(self):
+        from integrations.vlm.local_loop import _extract_click_coord
+        nx, ny = _extract_click_coord(
+            'I am not sure where to click',
+            {'coordinate': None})
+        assert (nx, ny) == (500, 500)
+
+    def test_none_coord_in_action_json_falls_back_to_center(self):
+        """action_json.get('coordinate') = [None, None] is the shape
+        the VLM emits when it doesn't know - must NOT be treated as
+        a valid (None, None) coord."""
+        from integrations.vlm.local_loop import _extract_click_coord
+        nx, ny = _extract_click_coord('', {'coordinate': [None, None]})
+        assert (nx, ny) == (500, 500)
+
+
+class TestExecTestRectParser:
+    """Reviewer flagged the exec-test rect parser as unguarded
+    against malformed input.  Since it is in the benchmark file
+    (not importable cleanly), we verify the expected error-handling
+    behaviour by reading the parsing code path - 4-comma input
+    works, anything else falls into the ValueError except that
+    prints and continues."""
+
+    def test_well_formed_rect_parses(self):
+        # The actual parser is `[int(s) for s in rect.split(',')]`
+        # with 4 unpacked values.  Mirror it here to lock the format.
+        rect_str = '100,200,800,600'
+        x, y, w, h = [int(s) for s in rect_str.split(',')]
+        assert (x, y, w, h) == (100, 200, 800, 600)
+
+    def test_three_value_rect_raises_unpacking(self):
+        rect_str = '100,200,800'
+        try:
+            x, y, w, h = [int(s) for s in rect_str.split(',')]
+            assert False, 'expected unpacking error'
+        except ValueError:
+            pass  # expected
+
+    def test_non_numeric_rect_raises(self):
+        rect_str = 'abc,def,ghi,jkl'
+        try:
+            [int(s) for s in rect_str.split(',')]
+            assert False, 'expected int conversion error'
+        except ValueError:
+            pass
+

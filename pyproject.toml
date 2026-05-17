@@ -7,7 +7,7 @@ name = "hart-backend"
 dynamic = ["version"]
 description = "HART OS - Hevolve Hive Agentic Runtime: Crowdsourced compute infrastructure for autonomous Hive AI Training. Distributed thought process across crowdsourced agents, distributed coding agents incentivizing compute providers, self-sustaining economy at national scale so no single entity, government, or corporation monopolizes AI. Intelligence belongs to the people. Only the master key (held by human stewards) can halt the being. Every engineering decision is transparent by design."
 readme = "README.md"
-license = {text = "BSL-1.1"}
+license = {text = "Apache-2.0"}
 requires-python = ">=3.9"
 authors = [
     {name = "HART Team", email = "contact@hevolve.ai"}
@@ -27,7 +27,7 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: Other/Proprietary License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -203,11 +203,25 @@ py-modules = [
     "agent_identity",
     "hart_onboarding",
     "hart_cli",
+    "hartos_bootstrap",
 ]
 
+# packages.find walks BOTH the repo root (for core/integrations/security/
+# hart_sdk and all their subpackages) AND agent-ledger-opensource/ (for
+# the vendored agent_ledger top-level import).  The package_dir mapping
+# below tells setuptools where on disk to read agent_ledger sources;
+# without it, install would fail with "package directory does not exist".
+# Future: when agent-ledger is published to PyPI standalone, drop
+# `agent_ledger*` from include + the package_dir mapping below + the
+# corresponding find_packages(where=...) call in setup.py, and add
+# `agent-ledger>=1.2.0` to [project.dependencies] above instead.
 [tool.setuptools.packages.find]
-include = ["core*", "integrations*", "security*", "hart_sdk*"]
-exclude = ["venv*", "tests*", "docs*"]
+where = [".", "agent-ledger-opensource"]
+include = ["core*", "integrations*", "security*", "hart_sdk*", "agent_ledger*"]
+exclude = ["venv*", "tests*", "docs*", "examples*"]
+
+[tool.setuptools.package-dir]
+agent_ledger = "agent-ledger-opensource/agent_ledger"
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml", "*.yml", "*.json", "*.txt", "*.md"]
@@ -218,6 +232,13 @@ local_scheme = "no-local-version"
 fallback_version = "0.0.0"
 write_to = "hart_version.py"
 tag_regex = "^v(?P<version>\\d+\\.\\d+\\.\\d+)$"
+# Pre-filter at the `git describe` level so CI-created `nightly-*`
+# tags (which are commit-id + run-id artifacts, NOT semver) never
+# reach the version parser.  Without this, vcs_versioning asserts on
+# the unparseable tag before tag_regex (above) gets a chance to
+# fall back — build dies with `AssertionError: version is not None`
+# at vcs_versioning/_scm_version.py:329.
+git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "v[0-9]*"]
 
 [tool.black]
 line-length = 100
@@ -272,3 +293,48 @@ ignore = ["E501", "W503", "E203"]
 [tool.bandit]
 exclude_dirs = ["venv", "venv310", "tests", "autogen-0.2.37", ".pycharm_plugin", "build", "dist"]
 skips = ["B101", "B404", "B603", "B607"]
+
+# Ruff config — singleton-pattern enforcement for the canonical
+# hart_intelligence facade.  See `core/safe_hartos_attr.py` for the
+# accessor pattern.  Rationale: worker-thread `from hart_intelligence
+# import …` calls race the canonical loader on Python's per-module
+# import lock, causing multi-minute agent_daemon freezes (Tier-1 init
+# never completes).  Resolving via the singleton accessor reads
+# sys.modules directly — no import lock acquisition.
+#
+# TID251 (banned-api) lints AST nodes only — it will NOT trip on the
+# string appearing in comments or docstrings, which is why we picked it
+# over a grep CI step.
+[tool.ruff]
+exclude = [
+    ".git",
+    ".venv",
+    "venv",
+    "venv310",
+    "build",
+    "dist",
+    "tests",
+    "autogen-0.2.37",
+    ".pycharm_plugin",
+]
+
+[tool.ruff.lint]
+extend-select = ["TID"]   # flake8-tidy-imports — gives us TID251
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"hart_intelligence".msg = """
+Worker code must not import hart_intelligence directly — that triggers \
+Python's per-module import lock and races the canonical loader \
+(routes/hartos_backend_adapter.py:_attempt_hartos_init), causing \
+multi-minute agent_daemon freezes when worker threads compete with \
+the loader on the langchain_core / transformers import chain. \
+Use core.safe_hartos_attr.safe_hartos_attr('symbol_name') instead — \
+it's a sys.modules dict lookup that returns None until the canonical \
+loader finishes (caller no-ops gracefully). Only the loader carries \
+`# noqa: TID251` to opt out of this rule.
+"""
+"hart_intelligence_entry".msg = """
+Same singleton-pattern rule as hart_intelligence — workers must use \
+core.safe_hartos_attr.safe_hartos_attr() instead of importing this \
+module directly.
+"""

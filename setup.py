@@ -144,31 +144,41 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/hertz-ai/HARTOS",
-    license="BSL-1.1",
+    license="Apache-2.0",
 
-    # Package discovery
-    packages=find_packages(
-        include=[
-            "core",
-            "core.*",
-            "integrations",
-            "integrations.*",
-            "security",
-            "security.*",
-            "hart_sdk",
-            "hart_sdk.*",
-        ],
-        exclude=[
-            "venv",
-            "venv*",
-            "tests",
-            "tests.*",
-            "docs",
-            "*.tests",
-            "*.tests.*",
-            "__pycache__",
-        ],
+    # Package discovery.  agent_ledger lives in-tree at
+    # agent-ledger-opensource/agent_ledger/ and is callers' top-level
+    # import (`from agent_ledger import SmartLedger`).  We vendor it
+    # into hart-backend via package_dir so a clean
+    # `pip install hart-backend` ships it as
+    # ``<site-packages>/agent_ledger/`` alongside core/integrations/security.
+    # Future: when agent-ledger is published to PyPI standalone, replace
+    # this vendor mapping with a top-level dependency.
+    packages=(
+        find_packages(
+            include=[
+                "core", "core.*",
+                "integrations", "integrations.*",
+                "security", "security.*",
+                "hart_sdk", "hart_sdk.*",
+            ],
+            exclude=[
+                "venv", "venv*",
+                "tests", "tests.*",
+                "docs",
+                "*.tests", "*.tests.*",
+                "__pycache__",
+            ],
+        )
+        + find_packages(
+            where="agent-ledger-opensource",
+            include=["agent_ledger", "agent_ledger.*"],
+            exclude=["tests", "tests.*", "examples", "examples.*"],
+        )
     ),
+    package_dir={
+        "agent_ledger": "agent-ledger-opensource/agent_ledger",
+    },
 
     # Include main modules at root level
     py_modules=[
@@ -218,7 +228,7 @@ setup(
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
-        "License :: Other/Proprietary License",
+        "License :: OSI Approved :: Apache Software License",
         "Operating System :: OS Independent",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.10",

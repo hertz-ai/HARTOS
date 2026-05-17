@@ -373,11 +373,25 @@ class TestGoalManagerUpdate(unittest.TestCase):
         self.assertFalse(result['success'])
 
     def test_update_goal_fields(self):
-        """update_goal can update arbitrary fields on the goal."""
-        fake = FakeGoal(id='20', title='Old', description='Old desc')
+        """update_goal can update arbitrary persona fields once consensus approves."""
+        # goal_type is required by the consensus gate (it routes the
+        # local_probe vote per goal_type).  Mock both attrs so the
+        # gate sees a real-shaped goal.
+        fake = FakeGoal(
+            id='20', title='Old', description='Old desc',
+            goal_type='marketing', config_json={'bootstrap_slug': 'test_20'},
+        )
+        # Persona updates (title/description) go through HiveConsensus.
+        # Stub it to approved so this test covers the FIELD-WRITE logic,
+        # not the gate. A dedicated test below exercises the gate.
+        fake_decision = MagicMock(approved=True, reason='all 4 votes passed',
+                                  to_dict=lambda: {'approved': True})
         with patch.dict('sys.modules', {
             'integrations.social.models': MagicMock(AgentGoal=type(fake)),
-        }):
+        }), patch(
+            'integrations.agent_engine.hive_consensus.HiveConsensus.upgrade_proposal',
+            return_value=fake_decision,
+        ):
             self.db.query = lambda cls: FakeQuery([fake])
             result = self.gm.GoalManager.update_goal(
                 self.db, '20', title='New', description='New desc')
@@ -386,7 +400,12 @@ class TestGoalManagerUpdate(unittest.TestCase):
         self.assertEqual(result['goal']['description'], 'New desc')
 
     def test_update_goal_ignores_unknown_fields(self):
-        """update_goal silently ignores fields that don't exist on the model."""
+        """update_goal silently ignores fields that don't exist on the model.
+
+        Non-persona updates bypass HiveConsensus by design — this test
+        sends only an unknown field (never a persona field), so no
+        consensus call happens.
+        """
         fake = FakeGoal(id='30', title='Keep')
         with patch.dict('sys.modules', {
             'integrations.social.models': MagicMock(AgentGoal=type(fake)),
@@ -405,6 +424,86 @@ class TestGoalManagerUpdate(unittest.TestCase):
             self.db.query = lambda cls: FakeQuery([])
             result = self.gm.GoalManager.update_goal(self.db, 'ghost', title='X')
         self.assertFalse(result['success'])
+
+    def test_update_goal_persona_rejected_by_consensus(self):
+        """A persona (title/description) update that fails the 4-of-4
+        vote is rejected; the goal row is left unchanged and the
+        failure reason is returned to the caller so the dashboard can
+        show WHY."""
+        # goal_type + config_json present so the consensus gate can build
+        # its prompt_id correlation key (gate reads both per the brief
+        # correlation-id contract; absent attrs would error before the
+        # vote even runs).
+        fake = FakeGoal(
+            id='40', title='Original', description='Original desc',
+            goal_type='marketing', config_json={'bootstrap_slug': 'test_40'},
+        )
+        # HiveConsensus votes "no" — e.g. constitutional filter tripped
+        rejected_decision = MagicMock(
+            approved=False,
+            reason='constitutional: matches destructive pattern',
+            to_dict=lambda: {
+                'approved': False,
+                'reason': 'constitutional: matches destructive pattern',
+                'votes': [
+                    {'name': 'constitutional', 'passed': False,
+                     'reason': 'matches destructive pattern'},
+                ],
+            },
+        )
+        with patch.dict('sys.modules', {
+            'integrations.social.models': MagicMock(AgentGoal=type(fake)),
+        }), patch(
+            'integrations.agent_engine.hive_consensus.HiveConsensus.upgrade_proposal',
+            return_value=rejected_decision,
+        ):
+            self.db.query = lambda cls: FakeQuery([fake])
+            result = self.gm.GoalManager.update_goal(
+                self.db, '40', description='banned content')
+        self.assertFalse(result['success'])
+        self.assertIn('consensus', result['error'])
+        # Goal's in-memory copy must NOT reflect the rejected change
+        self.assertEqual(fake.description, 'Original desc')
+        self.assertIn('consensus', result)
+        self.assertFalse(result['consensus']['approved'])
+
+    def test_update_goal_non_persona_bypasses_consensus(self):
+        """Operational fields (spark_budget, status, config) update
+        without calling HiveConsensus — they're parameter tuning, not
+        persona change. This keeps the hot path cheap."""
+        fake = FakeGoal(id='50', title='Keep', spark_budget=100)
+        # If consensus is called, the test fails loudly (side_effect=AssertionError)
+        with patch.dict('sys.modules', {
+            'integrations.social.models': MagicMock(AgentGoal=type(fake)),
+        }), patch(
+            'integrations.agent_engine.hive_consensus.HiveConsensus.upgrade_proposal',
+            side_effect=AssertionError(
+                'consensus must NOT be invoked for non-persona fields'),
+        ):
+            self.db.query = lambda cls: FakeQuery([fake])
+            result = self.gm.GoalManager.update_goal(
+                self.db, '50', spark_budget=250)
+        self.assertTrue(result['success'])
+        self.assertEqual(fake.spark_budget, 250)
+
+    def test_update_goal_skip_consensus_flag(self):
+        """_skip_consensus=True bypasses the gate — intended ONLY for
+        boot-time re-seeding where the source of truth is the checked-in
+        SEED_BOOTSTRAP_GOALS table, not a user request."""
+        fake = FakeGoal(id='60', description='Old')
+        with patch.dict('sys.modules', {
+            'integrations.social.models': MagicMock(AgentGoal=type(fake)),
+        }), patch(
+            'integrations.agent_engine.hive_consensus.HiveConsensus.upgrade_proposal',
+            side_effect=AssertionError(
+                '_skip_consensus=True must NOT invoke consensus'),
+        ):
+            self.db.query = lambda cls: FakeQuery([fake])
+            result = self.gm.GoalManager.update_goal(
+                self.db, '60', _skip_consensus=True,
+                description='New from seed')
+        self.assertTrue(result['success'])
+        self.assertEqual(fake.description, 'New from seed')
 
 
 # ===========================================================================

@@ -118,14 +118,20 @@ class TestCommercialAPILifecycle:
         assert validated is not None
         assert validated['tier'] == 'starter'
 
-        # Step 3: Log usage - meter a real call
+        # Step 3: Reserve + log — production call path is
+        # reserve_quota() (atomic increment, gates over-quota) then
+        # log_usage() (writes the billing row). The earlier shape of
+        # this test called log_usage alone; that drifted when quota
+        # accounting was hoisted into reserve_quota for race safety.
+        assert CommercialAPIService.reserve_quota(db, key_id) is True
         log1 = CommercialAPIService.log_usage(
             db, key_id, '/v1/intelligence/chat',
             tokens_in=500, tokens_out=800, compute_ms=1200)
         assert log1['cost_credits'] > 0  # starter tier has cost
         assert log1['tokens_in'] == 500
 
-        # Step 4: Log more - verify accumulation
+        # Step 4: Reserve + log second call — verify accumulation
+        assert CommercialAPIService.reserve_quota(db, key_id) is True
         log2 = CommercialAPIService.log_usage(
             db, key_id, '/v1/intelligence/analyze',
             tokens_in=200, tokens_out=300, compute_ms=600)

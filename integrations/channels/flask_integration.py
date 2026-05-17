@@ -65,6 +65,22 @@ class FlaskChannelIntegration:
         from .response.router import get_response_router
         self._response_router = get_response_router(registry=self.registry)
 
+        # Self-chat handler — owner messaging their own WhatsApp number
+        # becomes a private notebook-to-agent flow (persist + dispatch +
+        # reply-in-thread, no fan-out). Feature gate on the adapter
+        # config: extra.enable_self_chat_agent (default True).
+        from .self_chat import SelfChatHandler
+        self._self_chat = SelfChatHandler(
+            agent_api_url=self.agent_api_url,
+            owner_user_id=self.default_user_id,
+            owner_prompt_id=self.default_prompt_id,
+            device_id=self._device_id,
+            session_manager=self._session_manager,
+            response_router=self._response_router,
+            registry=self.registry,
+            get_loop=lambda: self._loop,
+        )
+
     def _handle_message(self, message: Message) -> str:
         """
         Handle incoming message from any channel.
@@ -82,6 +98,14 @@ class FlaskChannelIntegration:
             session = self._session_manager.get_session(
                 message.channel, message.sender_id
             )
+
+            # ── Self-chat short-circuit ──────────────────────────
+            # Owner messaging their own number → private notebook-to-
+            # agent flow (persist + dispatch + reply-in-thread, no
+            # fan-out). Gated per-adapter via extra.enable_self_chat_agent.
+            if self._self_chat.is_self_message(message):
+                logger.debug("self-chat from %s", message.sender_id)
+                return self._self_chat.handle(message, session)
 
             # ── Resolve user_id ───────────────────────────────────
             # 1. UserChannelBinding (durable DB row written by

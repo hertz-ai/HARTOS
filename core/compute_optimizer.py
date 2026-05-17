@@ -334,22 +334,39 @@ class ComputeOptimizer:
             except Exception:
                 pass
 
-            # Top processes by CPU (fast: one-shot, no interval)
-            try:
-                procs = []
-                for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
-                    info = proc.info
-                    if info.get('cpu_percent', 0) > 0.1:
-                        procs.append({
-                            'pid': info['pid'],
-                            'name': info.get('name', ''),
-                            'cpu_percent': round(info.get('cpu_percent', 0), 1),
-                            'mem_percent': round(info.get('memory_percent', 0), 1),
-                        })
-                procs.sort(key=lambda p: p['cpu_percent'], reverse=True)
-                snap.top_processes = procs[:10]
-            except Exception:
-                pass
+            # Top processes — GATED on ANY resource breach.
+            #
+            # WHY GATED: psutil.process_iter(['memory_percent']) on Windows
+            # walks every PID and issues OpenProcess + GetProcessMemoryInfo
+            # per process, all under the GIL.  On a typical Windows box
+            # (~150-300 PIDs) that's 200ms-2s of GIL-held CPU per call —
+            # which, fired every MONITOR_INTERVAL seconds, periodically
+            # stalls WAMP heartbeats, the chat hot path, and daemon yield
+            # gates.  py-spy thread dumps caught exactly this loop active+gil.
+            # The data is only read by `_suggest_optimizations` when a
+            # threshold is breached; emitting an empty list when nothing
+            # is hot costs nothing downstream.  Gate covers cpu/ram/swap/
+            # disk so any breach (incl. 89.5% RAM situations) still gets
+            # the per-process detail it needs.
+            if (snap.cpu_percent > CPU_HIGH_THRESHOLD
+                    or snap.ram_percent > RAM_HIGH_THRESHOLD
+                    or snap.swap_percent > SWAP_HIGH_THRESHOLD
+                    or snap.disk_usage_percent > DISK_HIGH_THRESHOLD):
+                try:
+                    procs = []
+                    for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+                        info = proc.info
+                        if info.get('cpu_percent', 0) > 0.1:
+                            procs.append({
+                                'pid': info['pid'],
+                                'name': info.get('name', ''),
+                                'cpu_percent': round(info.get('cpu_percent', 0), 1),
+                                'mem_percent': round(info.get('memory_percent', 0), 1),
+                            })
+                    procs.sort(key=lambda p: p['cpu_percent'], reverse=True)
+                    snap.top_processes = procs[:10]
+                except Exception:
+                    pass
 
         # GPU (via vram_manager)
         gpu_info = _try_detect_gpu()

@@ -18,8 +18,14 @@ Usage:
 # file that's referenced in Docker, frozen builds, pyproject.toml, and 25+ import
 # sites requires a coordinated migration. This alias lets new code use the
 # canonical name while old code keeps working.
-from hart_intelligence_entry import *  # noqa: F401,F403
-import hart_intelligence_entry as _impl
+#
+# TID251 noqa: this file IS the canonical hart_intelligence facade — it must
+# eager-import hart_intelligence_entry to fulfil its facade contract.  The
+# singleton-pattern rule (see core/safe_hartos_attr.py + pyproject.toml
+# [tool.ruff.lint.flake8-tidy-imports.banned-api]) bans this elsewhere; this
+# file is the one allowed writer.
+from hart_intelligence_entry import *  # noqa: F401,F403,TID251
+import hart_intelligence_entry as _impl  # noqa: TID251
 import sys
 
 # Make `import hart_intelligence` and `from hart_intelligence import X` work

@@ -187,6 +187,141 @@ def get_mode_label() -> str:
 # ── LLM URL Resolution ──────────────────────────────────────
 
 _llm_url_cache: str = ''
+_llm_url_cache_ts: float = 0.0
+_LLM_URL_CACHE_TTL: float = 30.0   # seconds — re-resolve after this
+_LLM_PROBE_TIMEOUT: float = 1.0    # seconds per candidate probe
+_LLM_PROBE_NEG_TTL: float = 10.0   # seconds — cache "dead" verdicts
+_llm_probe_cache: dict = {}         # url → (is_healthy, ts)
+_llm_url_last_announced: str = ''  # for change-toast emission
+
+
+def _probe_llm_endpoint(url: str) -> bool:
+    """Cheap TCP-connect probe with short-lived result caching.
+
+    True if something is listening on the URL's host:port.  No HTTP,
+    no body — just confirms the port is open.  Result is cached for
+    ``_LLM_PROBE_NEG_TTL`` seconds so repeated resolver calls don't
+    re-probe dead candidates and burn 1s each time.
+
+    Used by ``get_local_llm_url`` to walk candidate URLs and pick the
+    first reachable one instead of returning the first non-empty config
+    field and discovering it's dead at synth time.  Exception path
+    returns False — we never raise from a probe.
+    """
+    import time
+    cached = _llm_probe_cache.get(url)
+    if cached is not None:
+        ok, ts = cached
+        if (time.time() - ts) < _LLM_PROBE_NEG_TTL:
+            return ok
+    try:
+        import socket
+        body = url.split('://', 1)[-1].split('/', 1)[0]
+        host, _, port_s = body.partition(':')
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(_LLM_PROBE_TIMEOUT)
+        try:
+            ok = s.connect_ex(
+                (host or '127.0.0.1', int(port_s or 0))) == 0
+        finally:
+            s.close()
+    except Exception:
+        ok = False
+    _llm_probe_cache[url] = (ok, time.time())
+    return ok
+
+
+def _is_loopback_url(url: str) -> bool:
+    """True iff the URL points at this machine.  Used to gate auto-
+    correct of stale config fields — never rewrite a non-loopback URL
+    (could be a real remote endpoint the user explicitly chose)."""
+    try:
+        body = url.split('://', 1)[-1].split('/', 1)[0]
+        host = body.partition(':')[0].lower()
+        return host in ('127.0.0.1', 'localhost', '0.0.0.0', '[::1]', '')
+    except Exception:
+        return False
+
+
+def _autocorrect_stale_loopback_config(healthy_url: str) -> None:
+    """Rewrite drifted loopback URLs in ``~/.nunba/llama_config.json``
+    so non-resolver readers (chat path's direct read of
+    ``external_llm_endpoint.base_url``) also see the live URL.
+
+    Safety rails:
+      * Only touches fields whose CURRENT value is loopback — a real
+        remote endpoint the user typed (e.g. a cloud OpenAI-compat URL)
+        is preserved verbatim.  The toast still fires; the user fixes
+        externally.
+      * Only writes if at least one field actually changed — no
+        timestamp churn on the config file otherwise.
+      * Never raises.
+
+    This is the auto-correct the user asked for: when the resolver
+    detects drift between two source-of-truth fields, the stale one
+    gets healed in place so the next boot reads cleanly without an
+    operator edit.
+    """
+    if not _is_loopback_url(healthy_url):
+        return
+    try:
+        import json as _json
+        cfg_path = os.path.join(
+            os.path.expanduser('~'), '.nunba', 'llama_config.json')
+        if not os.path.isfile(cfg_path):
+            return
+        with open(cfg_path) as _f:
+            cfg = _json.load(_f)
+        changed = False
+        # external_llm_endpoint — only auto-fix if its current value is
+        # loopback (i.e. it was *intended* to point at this machine).
+        ext = cfg.get('external_llm_endpoint') or {}
+        ext_base = ext.get('base_url') or ''
+        if ext_base and _is_loopback_url(ext_base) and ext_base != healthy_url:
+            ext['base_url'] = healthy_url
+            ext['completions'] = (
+                healthy_url.rstrip('/').removesuffix('/v1')
+                + '/v1/chat/completions'
+            )
+            cfg['external_llm_endpoint'] = ext
+            changed = True
+        # custom_api_base — same shape, host-portion of healthy URL.
+        cab = cfg.get('custom_api_base') or ''
+        healthy_host = healthy_url.rstrip('/').removesuffix('/v1')
+        if cab and _is_loopback_url(cab) and cab != healthy_host:
+            cfg['custom_api_base'] = healthy_host
+            changed = True
+        if changed:
+            with open(cfg_path, 'w') as _f:
+                _json.dump(cfg, _f, indent=2)
+            logger.info(
+                "[LLM URL] Auto-corrected stale loopback config to %s",
+                healthy_url)
+    except Exception as e:
+        logger.debug("[LLM URL] auto-correct skipped: %s", e)
+
+
+def _emit_llm_url_change_toast(new_url: str) -> None:
+    """Best-effort WAMP toast when the resolved LLM URL changes.
+
+    Fires once per actual transition; subsequent resolver calls that
+    return the same URL are silent.  Surfaces drift (config stale,
+    llama-server moved port, external endpoint went down → fell back to
+    bundled, etc.) to the user without log-spam.  Never raises.
+    """
+    global _llm_url_last_announced
+    if new_url == _llm_url_last_announced:
+        return
+    _llm_url_last_announced = new_url
+    try:
+        from core.realtime import publish_async as _wamp_pub
+        _wamp_pub(
+            'com.hertzai.hevolve.llm.endpoint_changed',
+            {'url': new_url, 'reason': 'resolver fall-through'},
+            timeout=0.3,
+        )
+    except Exception:
+        pass
 
 
 def get_local_draft_url() -> str:
@@ -245,68 +380,135 @@ def get_local_draft_url() -> str:
 def get_local_llm_url() -> str:
     """Single source of truth for the local LLM endpoint URL.
 
-    Resolution order (first non-empty wins):
-      1. HEVOLVE_LOCAL_LLM_URL  — canonical, full URL (set by Nunba/HARTOS)
-      2. CUSTOM_LLM_BASE_URL    — user-provided custom endpoint (backwards compat)
-      3. LLAMA_CPP_PORT          — deprecated port-only var (backwards compat)
-      4. port_registry default   — construct from get_port('llm')
+    Resolution order — every non-empty candidate is PROBED, and the
+    first reachable one wins.  Stale-but-configured URLs (e.g. wizard
+    wrote 8080, llama-server later moved to 8082) no longer cause silent
+    chat hangs.  Probe results are cached for a short TTL so the walk
+    is cheap on the chat hot path.
 
-    The result always includes /v1 suffix for OpenAI-compatible endpoints.
-    Caches the resolved URL; call invalidate_llm_url() to clear after
-    port changes (warm start, conflict reassignment).
+    Candidate order:
+      1. HEVOLVE_LOCAL_LLM_URL    — canonical env override
+      2. CUSTOM_LLM_BASE_URL      — user-provided custom endpoint
+      3. LLAMA_CPP_PORT           — deprecated port-only env var
+      4. ~/.nunba/llama_config.json: external_llm_endpoint.base_url
+                                  — wizard-recorded "external" (often
+                                    actually a loopback, see drift bug
+                                    2026-04-29)
+      5. ~/.nunba/llama_config.json: server_port
+                                  — Nunba's auto-managed bundled server
+      6. ~/.nunba/llama_config.json: custom_api_base
+                                  — wizard mirror of server_port
+      7. port_registry default    — get_port('llm')
+
+    On a successful resolve that DIFFERS from the previously-announced
+    URL, the resolver:
+      - Emits a WAMP toast so the user knows their LLM endpoint moved
+      - Auto-corrects stale loopback fields in llama_config.json so
+        non-resolver readers (chat path's raw external_llm_endpoint
+        consumer) also see the live URL on next read
+      - Updates HEVOLVE_LOCAL_LLM_URL env so other resolver-based
+        callers in the same process see the fresh value immediately
+
+    Cold-boot fallback: if no candidate is reachable (typical during
+    the first ~30s of boot before llama-server has finished spawning),
+    returns the highest-priority candidate URL anyway as a stable
+    placeholder.  Callers handle the "configured but not yet listening"
+    case via their existing connection-error paths; the placeholder is
+    correct *and* the call site doesn't need to special-case None.
 
     Returns:
-        Full URL string, e.g. 'http://127.0.0.1:8081/v1'
+        Full URL string, e.g. 'http://127.0.0.1:8082/v1'
     """
-    global _llm_url_cache
-    if _llm_url_cache:
+    import time
+    global _llm_url_cache, _llm_url_cache_ts
+
+    now = time.time()
+    if _llm_url_cache and (now - _llm_url_cache_ts) < _LLM_URL_CACHE_TTL:
         return _llm_url_cache
 
-    url = ''
+    # Build the ordered candidate list — same sources as before plus
+    # the wizard-recorded external_llm_endpoint.base_url (the field that
+    # caused the 2026-04-29 drift incident).  Empty strings are filtered
+    # at the probe step.
+    candidates: list = []
 
-    # 1. Canonical env var
-    url = os.environ.get('HEVOLVE_LOCAL_LLM_URL', '')
+    candidates.append(os.environ.get('HEVOLVE_LOCAL_LLM_URL', ''))
+    candidates.append(os.environ.get('CUSTOM_LLM_BASE_URL', ''))
 
-    # 2. Custom LLM base URL (user-provided via wizard)
-    if not url:
-        url = os.environ.get('CUSTOM_LLM_BASE_URL', '')
+    _port_env = os.environ.get('LLAMA_CPP_PORT', '')
+    if _port_env:
+        candidates.append(f'http://127.0.0.1:{_port_env}/v1')
 
-    # 3. Deprecated: reconstruct from port-only var
-    if not url:
-        port = os.environ.get('LLAMA_CPP_PORT', '')
-        if port:
-            url = f'http://127.0.0.1:{port}/v1'
+    try:
+        import json as _json
+        _cfg_path = os.path.join(
+            os.path.expanduser('~'), '.nunba', 'llama_config.json')
+        if os.path.isfile(_cfg_path):
+            with open(_cfg_path) as _f:
+                _cfg = _json.load(_f)
+            _ext = (_cfg.get('external_llm_endpoint') or {}).get('base_url') or ''
+            if _ext:
+                candidates.append(_ext)
+            _port = _cfg.get('server_port')
+            if _port:
+                candidates.append(f'http://127.0.0.1:{_port}/v1')
+            _cab = _cfg.get('custom_api_base') or ''
+            if _cab:
+                candidates.append(_cab)
+    except Exception:
+        pass
 
-    # 4. Read from Nunba's llama_config.json (wizard-configured port)
-    if not url:
+    candidates.append(f'http://127.0.0.1:{get_port("llm")}/v1')
+
+    # Normalize, dedupe (preserving order), filter invalids.
+    seen: set = set()
+    normalized: list = []
+    for raw in candidates:
+        if not raw:
+            continue
+        u = raw.rstrip('/')
+        if not u.endswith('/v1'):
+            u += '/v1'
+        if not _validate_llm_url(u):
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        normalized.append(u)
+
+    if not normalized:
+        # Should be unreachable — port_registry default is always present —
+        # but stay defensive.
+        normalized = [f'http://127.0.0.1:{get_port("llm")}/v1']
+
+    # First reachable candidate wins.  If none are reachable (cold boot
+    # before llama-server spawns), return the highest-priority candidate
+    # anyway as a stable placeholder.
+    chosen = None
+    for url in normalized:
+        if _probe_llm_endpoint(url):
+            chosen = url
+            break
+    if chosen is None:
+        chosen = normalized[0]
+
+    _llm_url_cache = chosen
+    _llm_url_cache_ts = now
+
+    # On a real transition (different URL than previously announced),
+    # heal the drift so non-resolver readers also pick up the live URL,
+    # surface the change to the user, and update env so any caller in
+    # this process that's still on `os.environ.get(HEVOLVE_LOCAL_LLM_URL)`
+    # sees the same answer.
+    if chosen != _llm_url_last_announced:
+        _emit_llm_url_change_toast(chosen)
+        _autocorrect_stale_loopback_config(chosen)
         try:
-            import json as _json
-            _cfg_path = os.path.join(os.path.expanduser('~'), '.nunba', 'llama_config.json')
-            if os.path.isfile(_cfg_path):
-                with open(_cfg_path) as _f:
-                    _cfg = _json.load(_f)
-                _port = _cfg.get('server_port')
-                if _port:
-                    url = f'http://127.0.0.1:{_port}/v1'
+            os.environ['HEVOLVE_LOCAL_LLM_URL'] = chosen
         except Exception:
             pass
 
-    # 5. Fallback: port registry default
-    if not url:
-        url = f'http://127.0.0.1:{get_port("llm")}/v1'
-
-    # Normalize: ensure /v1 suffix
-    url = url.rstrip('/')
-    if not url.endswith('/v1'):
-        url += '/v1'
-
-    # Validate URL format
-    if not _validate_llm_url(url):
-        logger.warning(f"Invalid LLM URL '{url}', falling back to port registry default")
-        url = f'http://127.0.0.1:{get_port("llm")}/v1'
-
-    _llm_url_cache = url
-    return url
+    return chosen
 
 
 def set_local_llm_url(url: str) -> None:

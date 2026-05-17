@@ -55,6 +55,35 @@ def _get_json():
     return request.get_json(force=True, silent=True) or {}
 
 
+def requires_flag(flag_name, else_value=None):
+    """Gate an endpoint behind a per-tenant feature flag.
+
+    By default returns 503 with a clear error when the flag is off
+    (correct shape for mutating endpoints — the client should know
+    the feature isn't available).  Read endpoints that should
+    gracefully degrade can pass `else_value=[]` (or any JSON-able
+    default) to return _ok(else_value) instead.
+
+    The flag is read from `g.feature_flags`, populated by
+    `auth.require_auth` from the per-tenant settings + env defaults
+    (see plan Part E.1).  Apply this decorator AFTER `@require_auth`
+    so `g.feature_flags` is guaranteed to be set.
+    """
+    from functools import wraps
+
+    def decorator(view):
+        @wraps(view)
+        def wrapper(*args, **kwargs):
+            flags = getattr(g, 'feature_flags', {}) or {}
+            if not flags.get(flag_name, False):
+                if else_value is not None:
+                    return _ok(else_value)
+                return _err(f"{flag_name} feature flag is off", 503)
+            return view(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
 # ═══════════════════════════════════════════════════════════════
 # AUTH
 # ═══════════════════════════════════════════════════════════════
@@ -407,6 +436,495 @@ def update_user(user_id):
         return _err(str(e))
 
 
+# ─────────────────────────────────────────────────────────────────
+# Phase 7c.1 — Friendship state machine + Block.
+# Plan reference: sunny-gliding-eich.md, Part E.8 + Part R.5.
+# Coexists with the existing one-direction Follow endpoints in
+# usersApi.follow / unfollow / followers / following — those are
+# preserved as-is (legacy code reading the follow graph still works).
+# ─────────────────────────────────────────────────────────────────
+
+@social_bp.route('/friends/request', methods=['POST'])
+@require_auth
+@requires_flag('friends_v2')
+def friend_request():
+    data = _get_json()
+    target = data.get('target_user_id') or data.get('user_id')
+    if not target:
+        return _err("target_user_id required")
+    try:
+        from .friend_service import FriendService, FriendError
+        result = FriendService.send_request(
+            g.db, from_user_id=g.user.id, to_user_id=target,
+            tenant_id=getattr(g, 'tenant_id', None))
+        return _ok(result)
+    except FriendError as e:
+        return _err(str(e), 400)
+
+
+@social_bp.route('/friends/request/<friendship_id>/accept', methods=['POST'])
+@require_auth
+@requires_flag('friends_v2')
+def friend_accept(friendship_id):
+    try:
+        from .friend_service import FriendService, FriendError
+        result = FriendService.accept(g.db, friendship_id, g.user.id)
+        return _ok(result)
+    except FriendError as e:
+        return _err(str(e), 400)
+
+
+@social_bp.route('/friends/request/<friendship_id>/reject', methods=['POST'])
+@require_auth
+@requires_flag('friends_v2')
+def friend_reject(friendship_id):
+    try:
+        from .friend_service import FriendService, FriendError
+        result = FriendService.reject(g.db, friendship_id, g.user.id)
+        return _ok(result)
+    except FriendError as e:
+        return _err(str(e), 400)
+
+
+@social_bp.route('/friends/request/<friendship_id>/cancel', methods=['POST'])
+@require_auth
+@requires_flag('friends_v2')
+def friend_cancel(friendship_id):
+    try:
+        from .friend_service import FriendService, FriendError
+        result = FriendService.cancel(g.db, friendship_id, g.user.id)
+        return _ok(result)
+    except FriendError as e:
+        return _err(str(e), 400)
+
+
+@social_bp.route('/friends/<user_id>/unfriend', methods=['POST'])
+@require_auth
+@requires_flag('friends_v2')
+def friend_unfriend(user_id):
+    try:
+        from .friend_service import FriendService, FriendError
+        result = FriendService.unfriend(g.db, requester_id=g.user.id,
+                                        other_id=user_id)
+        return _ok(result)
+    except FriendError as e:
+        return _err(str(e), 400)
+
+
+@social_bp.route('/friends', methods=['GET'])
+@require_auth
+@requires_flag('friends_v2', else_value=[])
+def list_friends():
+    status = request.args.get('status', 'active')
+    if status not in ('active', 'pending', 'rejected', 'blocked', 'all'):
+        return _err("invalid status", 400)
+    from .friend_service import FriendService
+    return _ok(FriendService.list_friends(g.db, g.user.id, status))
+
+
+@social_bp.route('/friends/blocks', methods=['GET'])
+@require_auth
+@requires_flag('friends_v2', else_value=[])
+def list_blocks():
+    from .friend_service import FriendService
+    return _ok(FriendService.list_blocks(g.db, g.user.id))
+
+
+@social_bp.route('/friends/<user_id>/block', methods=['POST'])
+@require_auth
+@requires_flag('friends_v2')
+def friend_block(user_id):
+    data = _get_json() or {}
+    try:
+        from .friend_service import FriendService, FriendError
+        result = FriendService.block(
+            g.db, blocker_id=g.user.id, blocked_id=user_id,
+            reason=data.get('reason'),
+            tenant_id=getattr(g, 'tenant_id', None))
+        return _ok(result)
+    except FriendError as e:
+        return _err(str(e), 400)
+
+
+@social_bp.route('/friends/<user_id>/unblock', methods=['POST'])
+@require_auth
+@requires_flag('friends_v2')
+def friend_unblock(user_id):
+    from .friend_service import FriendService
+    result = FriendService.unblock(g.db, blocker_id=g.user.id,
+                                    blocked_id=user_id)
+    return _ok(result)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Phase 7c.2 — Invites (community + conversation, polymorphic).
+# Plan reference: sunny-gliding-eich.md, Part E.9.
+# ─────────────────────────────────────────────────────────────────
+
+@social_bp.route('/invites', methods=['POST'])
+@require_auth
+@requires_flag('invites_v2')
+def invite_send():
+    """Create a pending invite to a community or conversation.
+
+    Body (JSON):
+      parent_kind:  'community' | 'conversation'  (required)
+      parent_id:    str                            (required)
+      invitee_id:   str   (optional — targeted invite)
+      invitee_email: str  (optional — off-platform invite)
+      role_offered: 'member' | 'mod' | 'admin'  (default: 'member')
+      expires_in_days: int  (default 7; pass 0 for no expiry)
+
+    If neither invitee_id nor invitee_email is set, the response
+    includes an `invite_code` the caller embeds in a shareable link.
+    """
+    data = _get_json()
+    parent_kind = data.get('parent_kind')
+    parent_id = data.get('parent_id')
+    if not parent_kind or not parent_id:
+        return _err("parent_kind and parent_id required")
+    role = data.get('role_offered', 'member')
+    expires_in = data.get('expires_in_days', 7)
+    try:
+        from .invite_service import InviteService, InviteError
+        result = InviteService.send(
+            g.db, parent_kind=parent_kind, parent_id=parent_id,
+            invited_by=g.user.id,
+            invitee_id=data.get('invitee_id'),
+            invitee_email=data.get('invitee_email'),
+            role_offered=role,
+            expires_in_days=expires_in,
+            tenant_id=getattr(g, 'tenant_id', None))
+        return _ok(result)
+    except InviteError as e:
+        return _err(str(e), 400)
+
+
+@social_bp.route('/invites/<invite_id>/accept', methods=['POST'])
+@require_auth
+@requires_flag('invites_v2')
+def invite_accept(invite_id):
+    try:
+        from .invite_service import InviteService, InviteError
+        result = InviteService.accept(
+            g.db, invite_id_or_code=invite_id,
+            accepter_id=g.user.id,
+            tenant_id=getattr(g, 'tenant_id', None))
+        return _ok(result)
+    except InviteError as e:
+        return _err(str(e), 400)
+
+
+@social_bp.route('/invites/<invite_id>/reject', methods=['POST'])
+@require_auth
+@requires_flag('invites_v2')
+def invite_reject(invite_id):
+    try:
+        from .invite_service import InviteService, InviteError
+        result = InviteService.reject(
+            g.db, invite_id_or_code=invite_id, rejecter_id=g.user.id)
+        return _ok(result)
+    except InviteError as e:
+        return _err(str(e), 400)
+
+
+@social_bp.route('/invites/incoming', methods=['GET'])
+@require_auth
+@requires_flag('invites_v2', else_value=[])
+def invite_incoming():
+    include_responded = (request.args.get('include_responded',
+                                          'false').lower() == 'true')
+    from .invite_service import InviteService
+    return _ok(InviteService.list_incoming(
+        g.db, g.user.id, include_responded=include_responded))
+
+
+@social_bp.route('/invites/code/<code>', methods=['GET'])
+@require_auth
+@requires_flag('invites_v2')
+def invite_resolve(code):
+    """Preview a shareable invite link before accepting."""
+    from .invite_service import InviteService
+    result = InviteService.resolve_code(g.db, code)
+    if result is None:
+        return _err("invite not found or expired", 404)
+    return _ok(result)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Phase 7c.4 — Emoji reactions on posts / comments / messages.
+# Plan reference: sunny-gliding-eich.md, Part E.6.
+# Polymorphic source_kind so a single set of routes serves all three
+# reactable surfaces.
+# ─────────────────────────────────────────────────────────────────
+
+def _reaction_route(source_kind):
+    """Generate a (toggle, list, remove) route triple for a source_kind.
+
+    Avoids 9 lines × 3 surfaces = 27 lines of boilerplate by sharing
+    the implementation. Each registered Flask endpoint name is unique.
+    """
+    def toggle(source_id):
+        if not g.feature_flags.get('reactions', False):
+            return _err("reactions feature flag is off", 503)
+        data = _get_json()
+        emoji = data.get('emoji')
+        if not emoji:
+            return _err("emoji required")
+        try:
+            from .reaction_service import ReactionService, ReactionError
+            return _ok(ReactionService.toggle(
+                g.db, source_kind=source_kind, source_id=source_id,
+                user_id=g.user.id, emoji=emoji,
+                tenant_id=getattr(g, 'tenant_id', None)))
+        except ReactionError as e:
+            return _err(str(e), 400)
+
+    def list_(source_id):
+        if not g.feature_flags.get('reactions', False):
+            return _ok([])
+        from .reaction_service import ReactionService
+        return _ok(ReactionService.list_for(
+            g.db, source_kind=source_kind, source_id=source_id,
+            viewer_id=g.user.id,
+            tenant_id=getattr(g, 'tenant_id', None)))
+
+    def remove(source_id, emoji):
+        if not g.feature_flags.get('reactions', False):
+            return _err("reactions feature flag is off", 503)
+        try:
+            from .reaction_service import ReactionService, ReactionError
+            return _ok(ReactionService.remove(
+                g.db, source_kind=source_kind, source_id=source_id,
+                user_id=g.user.id, emoji=emoji,
+                tenant_id=getattr(g, 'tenant_id', None)))
+        except ReactionError as e:
+            return _err(str(e), 400)
+
+    return toggle, list_, remove
+
+
+_post_react_toggle, _post_react_list, _post_react_remove = _reaction_route('post')
+_comment_react_toggle, _comment_react_list, _comment_react_remove = _reaction_route('comment')
+_message_react_toggle, _message_react_list, _message_react_remove = _reaction_route('message')
+
+social_bp.add_url_rule('/posts/<source_id>/reactions',
+    'post_reactions_toggle', require_auth(_post_react_toggle), methods=['POST'])
+social_bp.add_url_rule('/posts/<source_id>/reactions',
+    'post_reactions_list', require_auth(_post_react_list), methods=['GET'])
+social_bp.add_url_rule('/posts/<source_id>/reactions/<emoji>',
+    'post_reactions_remove', require_auth(_post_react_remove), methods=['DELETE'])
+
+social_bp.add_url_rule('/comments/<source_id>/reactions',
+    'comment_reactions_toggle', require_auth(_comment_react_toggle), methods=['POST'])
+social_bp.add_url_rule('/comments/<source_id>/reactions',
+    'comment_reactions_list', require_auth(_comment_react_list), methods=['GET'])
+social_bp.add_url_rule('/comments/<source_id>/reactions/<emoji>',
+    'comment_reactions_remove', require_auth(_comment_react_remove), methods=['DELETE'])
+
+social_bp.add_url_rule('/messages/<source_id>/reactions',
+    'message_reactions_toggle', require_auth(_message_react_toggle), methods=['POST'])
+social_bp.add_url_rule('/messages/<source_id>/reactions',
+    'message_reactions_list', require_auth(_message_react_list), methods=['GET'])
+social_bp.add_url_rule('/messages/<source_id>/reactions/<emoji>',
+    'message_reactions_remove', require_auth(_message_react_remove), methods=['DELETE'])
+
+
+# ─────────────────────────────────────────────────────────────────
+# Phase 7c.6 — /sync endpoint (multi-device backfill / restore).
+# Plan reference: sunny-gliding-eich.md, Part R.3 + Part W.1.b.
+#
+# Single source of truth for new-device cold pull, reconnect catch-up,
+# and the WAMP-push-then-pull pattern.  The transport choice (live
+# fan-out via MessageBus vs catch-up via /sync) is decided client-side
+# based on connectivity.  This endpoint is request-response only;
+# real-time fan-out continues through the existing
+# LOCAL → SSE → PEERLINK → CROSSBAR pipeline.
+# ─────────────────────────────────────────────────────────────────
+
+@social_bp.route('/sync', methods=['GET'])
+@require_auth
+@requires_flag('sync_v1', else_value={'cursor': '0', 'has_more': False, 'deltas': {}})
+def sync_deltas():
+    """Return user's deltas across every social kind since cursor.
+
+    Query params:
+      since        opaque cursor string from previous response;
+                   default = full backfill from epoch.
+      kinds        CSV of kinds (conversations|messages|friendships|
+                   blocks|invites|mentions|memberships|notifications);
+                   default = all.
+      limit        per-kind row cap (1..500, default 200).
+
+    Response shape:
+      { cursor: '<advance-to-this>', has_more: bool,
+        deltas: { '<kind>': [...rows...] } }
+    """
+    since = request.args.get('since')
+    kinds_raw = request.args.get('kinds')
+    kinds = [k.strip() for k in kinds_raw.split(',')] if kinds_raw else None
+    try:
+        limit = max(1, min(int(request.args.get('limit', 200)), 500))
+    except (TypeError, ValueError):
+        limit = 200
+    from .sync_service import SyncService
+    return _ok(SyncService.deltas(
+        g.db, user_id=g.user.id, since=since, kinds=kinds,
+        limit_per_kind=limit,
+        tenant_id=getattr(g, 'tenant_id', None)))
+
+
+@social_bp.route('/users/autocomplete', methods=['GET'])
+@require_auth
+def autocomplete_users():
+    """Mention autocomplete — used by RN/web MentionInput.
+
+    Phase 7a.3 endpoint. Plan reference: sunny-gliding-eich.md, Part E.2.
+
+    Query params:
+      q              required — username prefix (>=1 char)
+      kind           optional — 'human' | 'agent' | 'all' (default 'all')
+      community_id   optional — restrict + rank-boost to community members
+      conversation_id optional — restrict + rank-boost to conversation members
+      limit          optional — 1..25 (default 10)
+
+    Ranking (P2P-first principle, plan Part R):
+      Discovery is one of central HARTOS's legitimate request-response
+      roles (Part R.7) — autocomplete needs a global username index.
+      A future P2P optimization can cache results on PeerLink gossip
+      between connected peers.
+
+      Ranking order, highest first:
+        1. Members of the scope parent (community_id / conversation_id)
+        2. Friends / followed users
+        3. Global username prefix match (tenant-scoped)
+
+      Caller-side tenancy: if g.tenant_id is set we restrict to that
+      tenant's users (cloud SaaS isolation). Flat / regional pass
+      tenant_id=None and the filter is a no-op.
+
+    Returns:
+      [{id, username, display_name, avatar_url, agent_kind,
+        is_member, is_friend}]
+    """
+    # Feature-flag gated. Off by default; flip via env or per-tenant.
+    if not g.feature_flags.get('mentions_autocomplete', False):
+        return _ok([])
+
+    q = (request.args.get('q') or '').strip()
+    if not q:
+        return _err("q is required", 400)
+    if len(q) > 40:
+        return _err("q too long", 400)
+
+    kind = request.args.get('kind', 'all')
+    if kind not in ('human', 'agent', 'all'):
+        return _err("kind must be human|agent|all", 400)
+
+    limit = max(1, min(int(request.args.get('limit', 10)), 25))
+    community_id = request.args.get('community_id')
+    conversation_id = request.args.get('conversation_id')
+
+    # Build the base query. Tenant-scoped when applicable.
+    qry = g.db.query(User).filter(
+        User.username.ilike(f'{q}%'),
+        User.is_banned == False,  # noqa: E712
+    )
+    if kind == 'human':
+        qry = qry.filter(User.user_type != 'agent')
+    elif kind == 'agent':
+        qry = qry.filter(User.user_type == 'agent')
+
+    # Tenancy filter (Phase 7a — plan Part E.1). NULL tenant_id rows
+    # match a NULL g.tenant_id (flat/regional pass-through).
+    if hasattr(User, 'tenant_id') and getattr(g, 'tenant_id', None):
+        qry = qry.filter(User.tenant_id == g.tenant_id)
+
+    # Pull a candidate set 3x larger than the limit so we can
+    # post-filter / rank without missing scope-matched rows.
+    candidates = qry.limit(limit * 3).all()
+
+    # Resolve scope-membership lookup once. Uses the new Membership
+    # table from migration v41 — falls back gracefully if it isn't
+    # populated yet (returns empty set).
+    scope_member_ids = set()
+    parent_kind = parent_id = None
+    if community_id:
+        parent_kind, parent_id = 'community', community_id
+    elif conversation_id:
+        parent_kind, parent_id = 'conversation', conversation_id
+    if parent_kind:
+        try:
+            from sqlalchemy import text
+            rows = g.db.execute(text(
+                "SELECT member_id FROM memberships "
+                "WHERE parent_kind = :pk AND parent_id = :pid"),
+                {'pk': parent_kind, 'pid': parent_id}
+            ).fetchall()
+            scope_member_ids = {r[0] for r in rows}
+        except Exception:
+            # Membership table unavailable — fall back to legacy
+            # community_memberships for community scope only. This
+            # keeps Phase 7a working before the dual-write path
+            # populates the new table.
+            if parent_kind == 'community':
+                try:
+                    from sqlalchemy import text
+                    rows = g.db.execute(text(
+                        "SELECT user_id FROM community_memberships "
+                        "WHERE community_id = :cid"),
+                        {'cid': parent_id}
+                    ).fetchall()
+                    scope_member_ids = {r[0] for r in rows}
+                except Exception:
+                    scope_member_ids = set()
+
+    # Friend / follow lookup for the calling user. Uses existing
+    # Follow table semantics (one-direction edge — see plan Part B.1).
+    # Phase 7c will replace with Friendship state-machine.
+    friend_ids = set()
+    if g.user:
+        try:
+            from sqlalchemy import text
+            rows = g.db.execute(text(
+                "SELECT following_id FROM follows WHERE follower_id = :uid"),
+                {'uid': g.user.id}
+            ).fetchall()
+            friend_ids = {r[0] for r in rows}
+        except Exception:
+            friend_ids = set()
+
+    def _rank(u):
+        # Lower is better. Scope members first, then friends, then global.
+        if u.id in scope_member_ids:
+            return (0, u.username.lower())
+        if u.id in friend_ids:
+            return (1, u.username.lower())
+        return (2, u.username.lower())
+
+    candidates.sort(key=_rank)
+    top = candidates[:limit]
+
+    out = []
+    for u in top:
+        agent_kind = 'agent' if (getattr(u, 'user_type', '') == 'agent') else 'human'
+        # Existing User model uses `owner_id` (FK→users.id) for agent
+        # ownership — see _models_local.py User.owner_id. Plan Part C.3
+        # called this `agent_owner_id` semantically but we reuse the
+        # existing column to honor the no-parallel-paths principle.
+        out.append({
+            'id': u.id,
+            'username': u.username,
+            'display_name': getattr(u, 'display_name', None) or u.username,
+            'avatar_url': getattr(u, 'avatar_url', None),
+            'agent_kind': agent_kind,
+            'agent_owner_id': getattr(u, 'owner_id', None),
+            'is_member': u.id in scope_member_ids,
+            'is_friend': u.id in friend_ids,
+        })
+    return _ok(out)
+
+
 @social_bp.route('/users/<user_id>/consent/cloud-data', methods=['PUT'])
 @require_auth
 def set_cloud_data_consent(user_id):
@@ -475,7 +993,10 @@ def check_handle_availability():
 def get_user_posts(user_id):
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    posts, total = PostService.list_posts(g.db, author_id=user_id, limit=limit, offset=offset)
+    apply_privacy = bool(getattr(g, 'feature_flags', {}).get('post_privacy', False))
+    posts, total = PostService.list_posts(
+        g.db, author_id=user_id, limit=limit, offset=offset,
+        viewer_user=g.user, apply_privacy=apply_privacy)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -694,7 +1215,10 @@ def list_posts():
     community = request.args.get('community')
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    posts, total = PostService.list_posts(g.db, sort, community, limit=limit, offset=offset)
+    apply_privacy = bool(getattr(g, 'feature_flags', {}).get('post_privacy', False))
+    posts, total = PostService.list_posts(
+        g.db, sort, community, limit=limit, offset=offset,
+        viewer_user=g.user, apply_privacy=apply_privacy)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -722,7 +1246,69 @@ def create_post():
         is_thought_experiment=bool(data.get('is_thought_experiment', False)),
         dynamic_layout=data.get('dynamic_layout'),
     )
-    return _ok(post.to_dict(include_author=True), status=201)
+    # Phase 7c.5 — per-post privacy.  Stored only when the flag is on
+    # so flag-off deploys never surface or persist the field.  Unknown
+    # values are silently coerced to 'public' via _normalize so a
+    # malicious client cannot store an unenforceable level.
+    if g.feature_flags.get('post_privacy', False):
+        from .privacy import _normalize
+        requested = data.get('privacy')
+        if requested is not None:
+            normalized = _normalize(requested)
+            # P3-11 — 'community' privacy without a community_id is a
+            # silent-invisibility trap (would only be visible to the
+            # author, which is not what the user asked for).  Refuse
+            # explicitly so the client gets feedback.
+            if normalized == 'community' and not post.community_id:
+                # Roll back the post so we don't leave an orphaned
+                # row.  Delete the just-created post to keep the
+                # error path clean.
+                g.db.delete(post)
+                g.db.flush()
+                return _err(
+                    "privacy='community' requires the post to be in a community", 400)
+            post.privacy = normalized
+            g.db.flush()
+    # Phase 7e — AI moderation (post-DLP soft signal).  Runs AFTER
+    # DLPEngine (which is the existing pre-publish PII gate, unchanged)
+    # so PII rejections happen first.  Classifier writes a decision
+    # row + may flip is_hidden / is_quarantined.  Flag-gated by
+    # `moderation_v2`; off → silent no-op.  Plan Part M pipeline.
+    # Pass-4 P4-10: commit=False so the post row + decision row +
+    # any is_hidden / is_quarantined flip all land in the SAME
+    # transaction.  RT subscribers are notified post-commit by
+    # the @require_auth decorator, so they never see an
+    # un-moderated post.
+    if g.feature_flags.get('moderation_v2', False):
+        try:
+            from .content_classifier import ContentClassifier
+            ContentClassifier.classify_and_persist(
+                g.db, source_kind='post', source_id=post.id,
+                content=(title + '\n\n' + (data.get('content') or '')),
+                tenant_id=getattr(g, 'tenant_id', None),
+                commit=False)
+            # Refresh the post row in case is_hidden / is_quarantined
+            # flipped — to_dict below should reflect the updated state.
+            g.db.refresh(post)
+        except Exception as e:
+            logger.warning("create_post moderation pass failed: %s", e)
+    # Phase 7b — parse @-mentions, fan out notifications, dispatch
+    # named agents through the existing agentic_router (see
+    # mention_service.py docstring + plan Part E.5). Flag-gated;
+    # off → silent no-op, response shape unchanged.
+    out = post.to_dict(include_author=True)
+    if g.feature_flags.get('mentions', False):
+        try:
+            from .mention_service import MentionService
+            mentions = MentionService.parse_and_record(
+                g.db, source_kind='post', source_id=post.id,
+                content=(title + '\n\n' + (data.get('content') or '')),
+                author_id=g.user.id, tenant_id=getattr(g, 'tenant_id', None))
+            if mentions:
+                out['mentions'] = mentions
+        except Exception as e:
+            logger.warning("create_post mention pass failed: %s", e)
+    return _ok(out, status=201)
 
 
 @social_bp.route('/posts/<post_id>', methods=['GET'])
@@ -731,6 +1317,14 @@ def get_post(post_id):
     post = PostService.get_by_id(g.db, post_id)
     if not post:
         return _err("Post not found", 404)
+    # Phase 7c.5 — per-post privacy gate.  We return 404 (not 403) for
+    # private posts so we don't reveal that a hidden post exists at
+    # this id.  Same shape the rest of the API uses for tenant
+    # isolation.
+    if getattr(g, 'feature_flags', {}).get('post_privacy', False):
+        from .privacy import can_view_post
+        if not can_view_post(g.db, g.user, post):
+            return _err("Post not found", 404)
     PostService.increment_view(g.db, post)
     data = post.to_dict(include_author=True)
     # Include user's vote if authenticated
@@ -760,6 +1354,17 @@ def update_post(post_id):
         is_thought_experiment=data.get('is_thought_experiment'),
         dynamic_layout=data.get('dynamic_layout'),
     )
+    # Phase 7c.5 — author can change privacy on their own post.  Same
+    # flag gate + _normalize coercion as create_post + same
+    # community-without-community_id refusal (P3-11).
+    if g.feature_flags.get('post_privacy', False) and 'privacy' in data:
+        from .privacy import _normalize
+        normalized = _normalize(data.get('privacy'))
+        if normalized == 'community' and not post.community_id:
+            return _err(
+                "privacy='community' requires the post to be in a community", 400)
+        post.privacy = normalized
+        g.db.flush()
     return _ok(post.to_dict(include_author=True))
 
 
@@ -895,7 +1500,35 @@ def create_comment(post_id):
     if parent_id == 0:
         parent_id = None
     comment = CommentService.create(g.db, post, g.user, content, parent_id)
-    return _ok(comment.to_dict(include_author=True), status=201)
+    # Phase 7e moderation — same gate + classifier as create_post.
+    # Comments don't have an is_quarantined column today, so the
+    # decision row is the only persisted side effect.  Mods can
+    # still see flagged comments in the queue for review.
+    # Pass-4 P4-10: commit=False so the decision row lands in the
+    # same transaction as the comment.
+    if g.feature_flags.get('moderation_v2', False):
+        try:
+            from .content_classifier import ContentClassifier
+            ContentClassifier.classify_and_persist(
+                g.db, source_kind='comment', source_id=comment.id,
+                content=content,
+                tenant_id=getattr(g, 'tenant_id', None),
+                commit=False)
+        except Exception as e:
+            logger.warning("create_comment moderation pass failed: %s", e)
+    out = comment.to_dict(include_author=True)
+    if g.feature_flags.get('mentions', False):
+        try:
+            from .mention_service import MentionService
+            mentions = MentionService.parse_and_record(
+                g.db, source_kind='comment', source_id=comment.id,
+                content=content, author_id=g.user.id,
+                tenant_id=getattr(g, 'tenant_id', None))
+            if mentions:
+                out['mentions'] = mentions
+        except Exception as e:
+            logger.warning("create_comment mention pass failed: %s", e)
+    return _ok(out, status=201)
 
 
 @social_bp.route('/comments/<comment_id>/reply', methods=['POST'])
@@ -915,7 +1548,29 @@ def reply_to_comment(comment_id):
     if len(content) > 10000:
         return jsonify({'success': False, 'error': 'Comment too long (max 10000 characters)'}), 400
     reply = CommentService.create(g.db, post, g.user, content, comment_id)
-    return _ok(reply.to_dict(include_author=True), status=201)
+    if g.feature_flags.get('moderation_v2', False):
+        try:
+            from .content_classifier import ContentClassifier
+            ContentClassifier.classify_and_persist(
+                g.db, source_kind='comment', source_id=reply.id,
+                content=content,
+                tenant_id=getattr(g, 'tenant_id', None),
+                commit=False)
+        except Exception as e:
+            logger.warning("reply_to_comment moderation pass failed: %s", e)
+    out = reply.to_dict(include_author=True)
+    if g.feature_flags.get('mentions', False):
+        try:
+            from .mention_service import MentionService
+            mentions = MentionService.parse_and_record(
+                g.db, source_kind='comment', source_id=reply.id,
+                content=content, author_id=g.user.id,
+                tenant_id=getattr(g, 'tenant_id', None))
+            if mentions:
+                out['mentions'] = mentions
+        except Exception as e:
+            logger.warning("reply_to_comment mention pass failed: %s", e)
+    return _ok(out, status=201)
 
 
 @social_bp.route('/comments/<comment_id>', methods=['PATCH'])
@@ -1078,7 +1733,10 @@ def get_community_posts(name):
     sort = request.args.get('sort', 'new')
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    posts, total = PostService.list_posts(g.db, sort, community_name=community_name, limit=limit, offset=offset)
+    apply_privacy = bool(getattr(g, 'feature_flags', {}).get('post_privacy', False))
+    posts, total = PostService.list_posts(
+        g.db, sort, community_name=community_name, limit=limit, offset=offset,
+        viewer_user=g.user, apply_privacy=apply_privacy)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -1164,7 +1822,10 @@ def remove_moderator(name, user_id):
 def personalized_feed():
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    posts, total = get_personalized_feed(g.db, g.user.id, limit, offset)
+    apply_privacy = bool(getattr(g, 'feature_flags', {}).get('post_privacy', False))
+    posts, total = get_personalized_feed(
+        g.db, g.user.id, limit, offset,
+        viewer_user=g.user, apply_privacy=apply_privacy)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -1175,7 +1836,10 @@ def global_feed():
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
     uid = g.user.id if getattr(g, 'user', None) else None
-    posts, total = get_global_feed(g.db, sort, limit, offset, user_id=uid)
+    apply_privacy = bool(getattr(g, 'feature_flags', {}).get('post_privacy', False))
+    posts, total = get_global_feed(
+        g.db, sort, limit, offset, user_id=uid,
+        viewer_user=g.user, apply_privacy=apply_privacy)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -1185,7 +1849,10 @@ def trending_feed():
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
     uid = g.user.id if getattr(g, 'user', None) else None
-    posts, total = get_trending_feed(g.db, limit, offset, user_id=uid)
+    apply_privacy = bool(getattr(g, 'feature_flags', {}).get('post_privacy', False))
+    posts, total = get_trending_feed(
+        g.db, limit, offset, user_id=uid,
+        viewer_user=g.user, apply_privacy=apply_privacy)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -1195,7 +1862,10 @@ def agent_feed():
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
     uid = g.user.id if getattr(g, 'user', None) else None
-    posts, total = get_agent_feed(g.db, limit, offset, user_id=uid)
+    apply_privacy = bool(getattr(g, 'feature_flags', {}).get('post_privacy', False))
+    posts, total = get_agent_feed(
+        g.db, limit, offset, user_id=uid,
+        viewer_user=g.user, apply_privacy=apply_privacy)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -1339,6 +2009,13 @@ def search():
                 )
             )
         query = query.filter(or_(*privacy_conditions))
+        # Phase 7c.5 — also AND in the per-post privacy gate when the
+        # flag is on.  Search is a high-leak surface (any user can
+        # query for a post body across the whole platform), so this
+        # is the second-most-important place to gate after /feed.
+        if getattr(g, 'feature_flags', {}).get('post_privacy', False):
+            from .privacy import visible_posts_filter
+            query = query.filter(visible_posts_filter(g.user))
         posts = query.order_by(Post.score.desc()).offset(offset).limit(limit).all()
         return _ok([p.to_dict(include_author=True) for p in posts])
 
@@ -1973,6 +2650,102 @@ def admin_list_reports():
     offset = int(request.args.get('offset', 0))
     reports, total = ReportService.list_reports(g.db, status_filter, limit, offset)
     return _ok([r.to_dict() for r in reports], _paginate(total, limit, offset))
+
+
+# Phase 8.B — Tenant slug → tid resolver (#265).  Public so a
+# Nunba web signup form can map a human tenant slug ("acme-corp")
+# to the internal UUID it'll need for JWT 'tid' claim binding.
+# Returns 404 (not 403) when the slug is unknown so the response
+# shape doesn't reveal whether other tenants exist.
+@social_bp.route('/tenants/by-slug/<slug>', methods=['GET'])
+def get_tenant_by_slug(slug):
+    from .tenant_acl import resolve_tenant_slug
+    row = resolve_tenant_slug(g.db, slug)
+    if row is None:
+        return _err('not found', 404)
+    if row.get('is_suspended'):
+        return _err('tenant suspended', 410)
+    return _ok({'id': row['id'], 'name': row['name'],
+                'slug': row['slug'], 'plan': row['plan']})
+
+
+# Phase 8.B — WAMP subscribe-side dynamic authorizer (#265).
+# Crossbar.io dynamic authorizers POST here per subscribe attempt.
+# Body: { topic }.  Response: { allow: bool, topic }.
+#
+# Review M1 fix: the JWT payload is ALWAYS derived from `g` (which
+# `@require_auth` has cryptographically verified).  Earlier draft
+# accepted a body-supplied `jwt_payload` — that meant an
+# authenticated attacker could probe arbitrary payloads against
+# arbitrary topics.  Now the only payload we authorize against is
+# the caller's own verified identity.
+#
+# For crossbar to use this endpoint as a dynamic authorizer, the
+# subscribing client's JWT must be passed in the standard
+# `Authorization: Bearer ...` header so `@require_auth` can verify.
+@social_bp.route('/admin/wamp/authorize-subscribe', methods=['POST'])
+@require_auth
+def admin_wamp_authorize_subscribe():
+    from .tenant_acl import authorize_subscribe
+    data = _get_json()
+    topic = data.get('topic')
+    # Always derive from verified `g` — never trust client-supplied
+    # JWT shape.  The @require_auth decorator has signed-and-verified
+    # the bearer token; that's the only identity we authorize against.
+    jwt_payload = {
+        'user_id': g.user.id,
+        'tid': getattr(g, 'tenant_id', None),
+    }
+    allow = authorize_subscribe(topic, jwt_payload)
+    return _ok({'allow': bool(allow), 'topic': topic})
+
+
+# Phase 7e — AI moderation quarantine queue.  Lists ContentClassifier
+# decisions awaiting human review.  GLOBAL platform admin only —
+# `require_admin` enforces is_admin OR role IN ('regional', 'central').
+#
+# Pass-4 P4-11 fix: previously gated by `require_moderator` which
+# accepts both global is_moderator AND community-level membership
+# moderators.  But the queue is a CROSS-TENANT view — a community-
+# scoped moderator should NOT see other communities' quarantine
+# items.  Plan Part U + Part E.13 say per-community moderator
+# tooling lives on the community detail screen, NOT this global
+# queue.  Until per-community filtering ships (Phase 7e.B
+# `?community=` scoping with CommunityMembership.role check), this
+# endpoint is platform-admin-only.
+@social_bp.route('/admin/moderation/quarantine', methods=['GET'])
+@require_admin
+@requires_flag('moderation_v2', else_value=[])
+def admin_quarantine_queue():
+    from .content_classifier import ContentClassifier
+    limit = min(int(request.args.get('limit', 50)), 200)
+    offset = int(request.args.get('offset', 0))
+    rows = ContentClassifier.list_quarantine_queue(
+        g.db, limit=limit, offset=offset,
+        tenant_id=getattr(g, 'tenant_id', None))
+    return _ok(rows)
+
+
+@social_bp.route('/admin/moderation/quarantine/<decision_id>',
+                 methods=['POST'])
+@require_admin
+@requires_flag('moderation_v2')
+def admin_quarantine_overrule(decision_id):
+    """Mod overrules the AI verdict.  Body: {human_decision: 'allow'|
+    'quarantine'|'block'}.  Append-only — writes the override on the
+    existing decision row + flips Post visibility per the new
+    decision."""
+    from .content_classifier import ContentClassifier
+    data = _get_json()
+    human_decision = data.get('human_decision')
+    if human_decision not in ('allow', 'quarantine', 'block'):
+        return _err("human_decision must be allow / quarantine / block")
+    try:
+        result = ContentClassifier.human_overrule(
+            g.db, decision_id, g.user.id, human_decision)
+    except ValueError as e:
+        return _err(str(e), 400)
+    return _ok(result)
 
 
 @social_bp.route('/admin/moderation/reports/<report_id>', methods=['GET'])

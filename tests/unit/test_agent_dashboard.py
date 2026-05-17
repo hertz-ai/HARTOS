@@ -217,3 +217,56 @@ class TestDashboardPriority:
         # Verify by_type counts add up
         total_by_type = sum(data['summary']['by_type'].values())
         assert total_by_type == data['summary']['total']
+
+
+class TestDashboardETag:
+    """ETag short-circuit — keeps the React UI's 5s poll cheap.
+
+    These tests pin the contract so a future refactor of
+    get_dashboard_version cannot silently invalidate the SSE bridge or
+    re-introduce the worker-starvation regression that prompted this
+    machinery (see /c/Users/sathi/Documents/Nunba/logs/server.log
+    queue-depth growth at 22:20:11 → 32 by 22:47).
+    """
+
+    def test_version_is_stable_for_unchanged_state(self, db):
+        from integrations.social.dashboard_service import DashboardService
+        v1 = DashboardService.get_dashboard_version(db)
+        v2 = DashboardService.get_dashboard_version(db)
+        assert v1 == v2, "version must be deterministic for unchanged state"
+        assert isinstance(v1, str) and len(v1) == 16
+
+    def test_version_changes_on_new_agent_goal(self, db):
+        from integrations.social.dashboard_service import DashboardService
+        v1 = DashboardService.get_dashboard_version(db)
+        goal = AgentGoal(goal_type='marketing', title='Fresh goal',
+                         status='active', spark_budget=100)
+        db.add(goal)
+        db.flush()
+        v2 = DashboardService.get_dashboard_version(db)
+        assert v1 != v2, "adding a goal must bump the version"
+
+    def test_version_changes_on_status_update(self, db):
+        from integrations.social.dashboard_service import DashboardService
+        goal = AgentGoal(goal_type='marketing', title='Status flip',
+                         status='active', spark_budget=100)
+        db.add(goal)
+        db.flush()
+        v1 = DashboardService.get_dashboard_version(db)
+        # Force a definite updated_at bump (SQLite onupdate hits at
+        # commit-time; in-memory test session needs an explicit nudge).
+        goal.status = 'paused'
+        goal.updated_at = datetime.utcnow() + timedelta(seconds=1)
+        db.flush()
+        v2 = DashboardService.get_dashboard_version(db)
+        assert v1 != v2, "updating goal.status must bump the version"
+
+    def test_version_handles_missing_schema(self):
+        """Empty session / missing tables must not raise — return a stable hash."""
+        from integrations.social.dashboard_service import DashboardService
+        # MagicMock session that raises on query — exercises the
+        # 'schema-unavailable' fallback branch.
+        broken = MagicMock()
+        broken.query.side_effect = RuntimeError('no schema')
+        v = DashboardService.get_dashboard_version(broken)
+        assert isinstance(v, str) and len(v) == 16

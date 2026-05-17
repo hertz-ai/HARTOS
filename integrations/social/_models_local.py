@@ -178,6 +178,8 @@ class Post(Base):
     expected_outcome = Column(Text, nullable=True)          # Expected net positive
     is_thought_experiment = Column(Boolean, default=False)
     dynamic_layout = Column(JSON, nullable=True)            # Liquid UI layout JSON
+    # Phase 7c.5 — per-post privacy. Mirrors sql.models.SocialPost.
+    privacy = Column(String(16), nullable=True, index=True)
     created_at = Column(DateTime, default=func.now(), index=True)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -212,6 +214,10 @@ class Post(Base):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
+        # Phase 7c.5 — surface 'privacy' only when set; NULL stays absent
+        # so flag-off deploys retain pre-migration JSON shape.
+        if getattr(self, 'privacy', None):
+            d['privacy'] = self.privacy
         if include_author and self.author:
             d['author'] = self.author.to_dict()
         return d
@@ -942,7 +948,7 @@ class Encounter(Base):
     id = Column(String(64), primary_key=True, default=_uuid)
     user_a_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
     user_b_id = Column(String(64), ForeignKey('users.id'), nullable=False, index=True)
-    context_type = Column(String(20), nullable=False)  # community|post|region|challenge|task
+    context_type = Column(String(20), nullable=False)  # community|post|region|challenge|task|ble
     context_id = Column(String(64), nullable=True)
     location_label = Column(String(200), default='')
     encounter_count = Column(Integer, default=1)
@@ -950,6 +956,9 @@ class Encounter(Base):
     latest_at = Column(DateTime, default=func.now())
     bond_level = Column(Integer, default=0)  # 0–10
     is_mutual_aware = Column(Boolean, default=False)
+    lat = Column(Float, nullable=True)
+    lng = Column(Float, nullable=True)
+    payload = Column(JSON, nullable=True)
 
     user_a = relationship('User', foreign_keys=[user_a_id])
     user_b = relationship('User', foreign_keys=[user_b_id])
@@ -970,6 +979,95 @@ class Encounter(Base):
             'latest_at': self.latest_at.isoformat() if self.latest_at else None,
             'bond_level': self.bond_level,
             'is_mutual_aware': self.is_mutual_aware,
+            'lat': self.lat,
+            'lng': self.lng,
+            'payload': self.payload,
+        }
+
+
+# ─── TABLE 25.1: discoverable_prefs ───
+# BLE encounter consent + state.  Disjoint from `encounters` (which is
+# durable post-fact aggregated co-presence).  See canonical
+# Hevolve_Database/sql/models.py for full design rationale.
+
+class DiscoverablePref(Base):
+    __tablename__ = 'discoverable_prefs'
+
+    user_id = Column(String(64), ForeignKey('users.id'), primary_key=True)
+    enabled = Column(Boolean, default=False, nullable=False)
+    enabled_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True, index=True)
+    age_claim_18 = Column(Boolean, default=False, nullable=False)
+    face_visible = Column(Boolean, default=False, nullable=False)
+    avatar_style = Column(String(64), default='studio_ghibli')
+    vibe_tags = Column(JSON, default=list)
+    toggle_count_24h = Column(Integer, default=0)
+    toggle_window_start = Column(DateTime, default=func.now())
+    last_toggle_at = Column(DateTime, nullable=True)
+    current_pubkey = Column(String(128), nullable=True, index=True)
+    pubkey_registered_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    user = relationship('User', foreign_keys=[user_id])
+
+    def to_dict(self):
+        return {
+            'user_id': self.user_id,
+            'enabled': bool(self.enabled),
+            'enabled_at': self.enabled_at.isoformat() if self.enabled_at else None,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+            'age_claim_18': bool(self.age_claim_18),
+            'face_visible': bool(self.face_visible),
+            'avatar_style': self.avatar_style or 'studio_ghibli',
+            'vibe_tags': self.vibe_tags or [],
+            'toggle_count_24h': self.toggle_count_24h or 0,
+            'current_pubkey': self.current_pubkey,
+        }
+
+
+# ─── TABLE 25.2: encounter_sightings ───
+# BLE ephemeral pre-match state.  Auto-expires 24h post-sighting unless
+# a mutual-like upserts an `encounters` row with context_type='ble'.
+
+class EncounterSighting(Base):
+    __tablename__ = 'encounter_sightings'
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    owner_user_id = Column(String(64), ForeignKey('users.id'),
+                           nullable=False, index=True)
+    peer_user_id = Column(String(64), ForeignKey('users.id'),
+                          nullable=True, index=True)
+    peer_pubkey = Column(String(128), nullable=False)
+    rssi_peak = Column(Integer, nullable=True)
+    dwell_sec = Column(Integer, nullable=True)
+    lat = Column(Float, nullable=True)
+    lng = Column(Float, nullable=True)
+    sighted_at = Column(DateTime, default=func.now(), nullable=False)
+    swipe_decision = Column(String(10), default='pending')  # pending|like|dislike
+    expires_at = Column(DateTime, nullable=False)
+
+    owner = relationship('User', foreign_keys=[owner_user_id])
+    peer = relationship('User', foreign_keys=[peer_user_id])
+
+    __table_args__ = (
+        Index('ix_encounter_sightings_owner_sighted',
+              'owner_user_id', 'sighted_at'),
+        Index('ix_encounter_sightings_peer_pubkey', 'peer_pubkey'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'owner_user_id': self.owner_user_id,
+            'peer_user_id': self.peer_user_id,
+            'peer_pubkey': self.peer_pubkey,
+            'rssi_peak': self.rssi_peak,
+            'dwell_sec': self.dwell_sec,
+            'lat': self.lat,
+            'lng': self.lng,
+            'sighted_at': self.sighted_at.isoformat() if self.sighted_at else None,
+            'swipe_decision': self.swipe_decision or 'pending',
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
         }
 
 
@@ -3336,7 +3434,16 @@ class UserChannelBinding(Base):
 
 
 class ConversationEntry(Base):
-    """Unified conversation history across all channels."""
+    """Unified conversation history across all channels.
+
+    Also serves as the canonical row for cross-device chat mirroring
+    (U1-U9 workstream, task #389).  ``id`` is the monotonic cursor used
+    by ``/api/chat-sync/pull?since=<id>``; every device subscribes to
+    ``com.hertzai.hevolve.chat.new.<user_id>`` and dedups incoming
+    payloads by ``msg_id``.  New rows are appended here by the chat
+    hot path (`_chat_reply`, `world_model_bridge._persist_to_conversation_entry`)
+    and by channel adapters (`integrations/channels/response/router.py`).
+    """
     __tablename__ = 'conversation_entries'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -3347,6 +3454,15 @@ class ConversationEntry(Base):
     agent_id = Column(String(64), nullable=True, index=True)
     prompt_id = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=func.now(), index=True)
+
+    # U1 cross-device sync columns — all nullable for backward compat with
+    # rows written before the U-series migration.  Legacy rows pulled via
+    # cursor-pull get a synthesized msg_id on the fly (seq-based fallback).
+    msg_id = Column(String(32), nullable=True, unique=True, index=True)
+    request_id = Column(String(64), nullable=True, index=True)  # pairs user↔assistant
+    device_id = Column(String(64), nullable=True, index=True)   # origin device (U6)
+    lang = Column(String(10), nullable=True)                     # TTS replay hint
+    attachments = Column(JSON, nullable=True)                    # U9: [{file_id, sha256, name, mime, size}]
 
     user = relationship('User', backref='conversation_entries')
 
@@ -3359,6 +3475,11 @@ class ConversationEntry(Base):
             'content': self.content,
             'agent_id': self.agent_id,
             'prompt_id': self.prompt_id,
+            'msg_id': self.msg_id,
+            'request_id': self.request_id,
+            'device_id': self.device_id,
+            'lang': self.lang,
+            'attachments': self.attachments,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
 

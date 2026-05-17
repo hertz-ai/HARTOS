@@ -363,20 +363,34 @@ jobs:
             cp "$FILE" /tmp/release-artifacts/
           fi
 
+          # Stash the path to the unsplit ISO so the next step (large-
+          # asset SSH mirror) can find it after the loop variables fall
+          # out of scope.  Only emitted when the ISO actually got split
+          # (otherwise the GitHub Release upload covers it directly).
+          if [[ "$SIZE_BYTES" -gt "$SPLIT_THRESHOLD" ]]; then
+            {
+              echo "UNSPLIT_ISO=$FILE"
+              echo "UNSPLIT_BASENAME=$BASENAME"
+            } >> "$GITHUB_ENV"
+          fi
+
           # SHA-256 checksum (always computed against the uncut ISO)
           sha256sum "$FILE" | sed "s|.*/||" > "/tmp/release-artifacts/${BASENAME}.sha256"
 
-          # Create .torrent with web seed. On push-to-main we target
-          # the rolling `nightly` tag (release is mutable, v1.0.0 is
-          # immutable). On workflow_dispatch we use the user-supplied
-          # version so the signed release gets its own torrent.
+          # Create .torrent with web seed.  workflow_dispatch ships a
+          # pinned tag (v1.0.0 etc) so the seed points at that exact
+          # release.  push-to-main ships through publish-nightly with
+          # a per-sha tag (`nightly-<sha>-<runid>`) marked
+          # `--latest=true`, so the seed uses /releases/latest/download/
+          # — GitHub redirects that to whatever release currently
+          # carries the latest flag, keeping the torrent's HTTP
+          # fallback resolvable across rebuilds.
           sudo apt-get install -y -qq mktorrent
           if [[ "${{ github.event_name }}" == 'workflow_dispatch' ]]; then
-            RELEASE_TAG="v${{ github.event.inputs.version }}"
+            WEBSEED="https://github.com/${{ github.repository }}/releases/download/v${{ github.event.inputs.version }}/${BASENAME}"
           else
-            RELEASE_TAG="nightly"
+            WEBSEED="https://github.com/${{ github.repository }}/releases/latest/download/${BASENAME}"
           fi
-          WEBSEED="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/${BASENAME}"
           mktorrent -l 22 \
             -c "HART OS — Hevolve Hive Agentic Runtime. https://github.com/${{ github.repository }}" \
             -w "$WEBSEED" \
@@ -399,12 +413,82 @@ jobs:
           path: /tmp/release-artifacts/
           retention-days: 30
 
+      # ─── Large-asset bypass for split ISOs ──────────────────────────
+      # GitHub Release assets cap at 2 GB.  iso-desktop is ~6.5 GB so it
+      # ships to releases as four .part-* files + a reassemble.sh.  That
+      # forces every user to run a script before they can boot the ISO.
+      # Mirror the UNSPLIT ISO straight to docs.hevolve.ai so the docs
+      # page can link a single resolvable URL.
+      #
+      # Auth piggy-backs on the existing HEVOLVE_DOCS_SSH_* secrets that
+      # the docs deploy job already uses (release.yml SSH mirror block).
+      # Lands at <DOCS_SSH_PATH>/binaries/<basename>; the docs rsync
+      # excludes binaries/ so the next site deploy doesn't nuke it.
+      #
+      # Skipped silently when:
+      #   - ISO didn't get split (UNSPLIT_ISO env not set)
+      #   - SSH host/user not configured
+      #   - workflow_dispatch (use the release page; users can pin a vX
+      #     release without depending on docs server availability)
+      - name: Mirror unsplit large ISO to docs.hevolve.ai/binaries/
+        if: |
+          env.UNSPLIT_ISO != '' &&
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main'
+        env:
+          SSHPASS: ${{ secrets.HEVOLVE_DOCS_SSH_PASS }}
+        run: |
+          set -euo pipefail
+          host='${{ secrets.HEVOLVE_DOCS_SSH_HOST }}'
+          user='${{ secrets.HEVOLVE_DOCS_SSH_USER }}'
+          path='${{ secrets.HEVOLVE_DOCS_SSH_PATH }}'
+          key_set='${{ secrets.HEVOLVE_DOCS_SSH_KEY }}'
+          pass_set='${{ secrets.HEVOLVE_DOCS_SSH_PASS }}'
+          if [ -z "$host" ] || [ -z "$user" ] || [ -z "$path" ]; then
+            echo "::notice title=Large-ISO mirror::Skipped — HEVOLVE_DOCS_SSH_HOST/USER/PATH not configured"
+            exit 0
+          fi
+          if [ -z "$key_set" ] && [ -z "$pass_set" ]; then
+            echo "::notice title=Large-ISO mirror::Skipped — neither HEVOLVE_DOCS_SSH_KEY nor _PASS set"
+            exit 0
+          fi
+          PORT='${{ secrets.HEVOLVE_DOCS_SSH_PORT || '22' }}'
+          DEST="${path%/}/binaries"
+          if [ -n "$key_set" ]; then
+            mkdir -p ~/.ssh
+            echo "$key_set" > ~/.ssh/id_ed25519
+            chmod 600 ~/.ssh/id_ed25519
+            SSH_BASE="ssh -i ~/.ssh/id_ed25519 -p $PORT -o StrictHostKeyChecking=accept-new"
+            $SSH_BASE "$user@$host" "mkdir -p '$DEST'"
+            rsync -az --human-readable --stats \
+              -e "$SSH_BASE" \
+              "$UNSPLIT_ISO" "$user@$host:$DEST/"
+          else
+            sudo apt-get install -y -qq sshpass
+            SSH_BASE="ssh -p $PORT -o StrictHostKeyChecking=accept-new"
+            sshpass -e $SSH_BASE "$user@$host" "mkdir -p '$DEST'"
+            sshpass -e rsync -az --human-readable --stats \
+              -e "$SSH_BASE" \
+              "$UNSPLIT_ISO" "$user@$host:$DEST/"
+          fi
+          echo "::notice title=Large-ISO mirror::Pushed $UNSPLIT_BASENAME to $host:$DEST/"
+          echo "  URL: https://docs.hevolve.ai/binaries/$UNSPLIT_BASENAME"
+
       - name: Attach to GitHub Release (manual dispatch)
         if: github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "v${{ github.event.inputs.version }}"
           files: /tmp/release-artifacts/*
+
+      # NOTE: Push-to-main publishing of these ISOs is handled by the
+      # `publish-nightly` job below — it uploads the matrix artifacts
+      # to a unique-tagged release (`nightly-<sha>-<runid>`) and marks
+      # it `--latest=true`.  The previous "Attach to rolling 'nightly'
+      # release" step here tried to reuse the literal `nightly` tag,
+      # which the repo's release-immutability rule rejects with HTTP
+      # 422 ("tag_name was used by an immutable release").  Removed
+      # 2026-04-25 — see commit message for the failure log.
 
   # ═══════════════════════════════════════════════════════════
   # 3a. Build universal installers (fast Go cross-compile)
@@ -632,3 +716,109 @@ jobs:
             --field https_enforced=true || true
         env:
           GH_TOKEN: ${{ github.token }}
+
+      # ─────────────────────────────────────────────────────────────
+      # Optional SSH mirror — hevolve.ai/docs.hevolve.ai on own server
+      # ─────────────────────────────────────────────────────────────
+      # Accepts EITHER key-based OR password-based auth, whichever is
+      # configured.  Required secrets:
+      #   HEVOLVE_DOCS_SSH_HOST   server hostname
+      #   HEVOLVE_DOCS_SSH_USER   ssh user
+      #   HEVOLVE_DOCS_SSH_PATH   absolute web-root path on server
+      #
+      # Pick ONE of these auth methods:
+      #   HEVOLVE_DOCS_SSH_KEY    openssh-format PRIVATE key (ed25519
+      #                           recommended).  The matching public
+      #                           key must be in ~/.ssh/authorized_keys
+      #                           on the server.
+      #   HEVOLVE_DOCS_SSH_PASS   ssh password.  sshpass is installed
+      #                           at runtime.  Requires sshd config
+      #                           PasswordAuthentication yes.
+      #
+      # Optional:
+      #   HEVOLVE_DOCS_SSH_PORT   ssh port, defaults to 22
+      #   HEVOLVE_DOCS_KNOWN_HOSTS  seed known_hosts entries
+      #
+      # If both KEY and PASS are set, KEY wins (more secure).
+      - name: Check SSH mirror configuration
+        id: ssh_cfg
+        run: |
+          host='${{ secrets.HEVOLVE_DOCS_SSH_HOST }}'
+          user='${{ secrets.HEVOLVE_DOCS_SSH_USER }}'
+          path='${{ secrets.HEVOLVE_DOCS_SSH_PATH }}'
+          key_set='${{ secrets.HEVOLVE_DOCS_SSH_KEY }}'
+          pass_set='${{ secrets.HEVOLVE_DOCS_SSH_PASS }}'
+          auth=''
+          if [ -n "$key_set" ]; then
+            auth='key'
+          elif [ -n "$pass_set" ]; then
+            auth='pass'
+          fi
+          if [ -n "$host" ] && [ -n "$user" ] && [ -n "$path" ] && [ -n "$auth" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "auth=$auth" >> "$GITHUB_OUTPUT"
+            echo "::notice title=SSH mirror::Deploying _site/ to ${{ secrets.HEVOLVE_DOCS_SSH_USER }}@${{ secrets.HEVOLVE_DOCS_SSH_HOST }}:${{ secrets.HEVOLVE_DOCS_SSH_PATH }} (auth=$auth)"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "auth=none" >> "$GITHUB_OUTPUT"
+            echo "::notice title=SSH mirror::Skipped — need HEVOLVE_DOCS_SSH_HOST + USER + PATH + (KEY or PASS) secrets to enable."
+          fi
+
+      - name: Install SSH key
+        if: steps.ssh_cfg.outputs.enabled == 'true' && steps.ssh_cfg.outputs.auth == 'key'
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.HEVOLVE_DOCS_SSH_KEY }}
+          known_hosts: ${{ secrets.HEVOLVE_DOCS_KNOWN_HOSTS || '' }}
+          if_key_exists: replace
+          config: |
+            Host hevolve_docs_target
+              HostName ${{ secrets.HEVOLVE_DOCS_SSH_HOST }}
+              User ${{ secrets.HEVOLVE_DOCS_SSH_USER }}
+              Port ${{ secrets.HEVOLVE_DOCS_SSH_PORT || '22' }}
+              StrictHostKeyChecking accept-new
+
+      - name: Install sshpass (password auth)
+        if: steps.ssh_cfg.outputs.enabled == 'true' && steps.ssh_cfg.outputs.auth == 'pass'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          mkdir -p ~/.ssh
+          if [ -n "${{ secrets.HEVOLVE_DOCS_KNOWN_HOSTS }}" ]; then
+            echo "${{ secrets.HEVOLVE_DOCS_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+          fi
+          chmod 700 ~/.ssh
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Rsync _site via key
+        if: steps.ssh_cfg.outputs.enabled == 'true' && steps.ssh_cfg.outputs.auth == 'key'
+        run: |
+          set -euo pipefail
+          # Trailing slash on _site/ -> rsync copies contents, not the
+          # _site directory itself.  --exclude=binaries/ leaves the
+          # large-asset mirror dir alone (the build-iso step rsyncs the
+          # 6.5 GB unsplit desktop ISO there; without this exclude,
+          # --delete would nuke it on every docs push).
+          rsync -az --delete --exclude='binaries/' --human-readable --stats \
+            _site/ \
+            hevolve_docs_target:'${{ secrets.HEVOLVE_DOCS_SSH_PATH }}'
+          echo "::notice title=SSH mirror::Pushed via key to ${{ secrets.HEVOLVE_DOCS_SSH_HOST }}:${{ secrets.HEVOLVE_DOCS_SSH_PATH }}"
+
+      - name: Rsync _site via password
+        if: steps.ssh_cfg.outputs.enabled == 'true' && steps.ssh_cfg.outputs.auth == 'pass'
+        env:
+          SSHPASS: ${{ secrets.HEVOLVE_DOCS_SSH_PASS }}
+        run: |
+          set -euo pipefail
+          PORT='${{ secrets.HEVOLVE_DOCS_SSH_PORT || '22' }}'
+          # See the key-auth variant above for the --exclude rationale.
+          # sshpass reads the password from the SSHPASS env var (-e),
+          # so it never hits argv or the process listing.
+          # -o StrictHostKeyChecking=accept-new trusts first-seen keys
+          # (same posture as the key path's ssh-config above).
+          sshpass -e rsync -az --delete --exclude='binaries/' --human-readable --stats \
+            -e "ssh -p $PORT -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts" \
+            _site/ \
+            '${{ secrets.HEVOLVE_DOCS_SSH_USER }}@${{ secrets.HEVOLVE_DOCS_SSH_HOST }}:${{ secrets.HEVOLVE_DOCS_SSH_PATH }}'
+          echo "::notice title=SSH mirror::Pushed via password to ${{ secrets.HEVOLVE_DOCS_SSH_HOST }}:${{ secrets.HEVOLVE_DOCS_SSH_PATH }}"

@@ -15,7 +15,7 @@ from .resonance_engine import ResonanceService
 
 logger = logging.getLogger('hevolve_social')
 
-# ─── Constants ───
+# --- Constants ---
 
 SCORE_WEIGHTS = {
     'uptime_ratio': 100.0,    # uptime 0.0-1.0 * 100 = 0-100 points
@@ -42,10 +42,18 @@ try:
 except ImportError:
     HOSTER_REVENUE_SHARE = 0.90
 
+# Same canonical fallback discipline as REVENUE_SPLIT_USERS above --
+# import once at module load so estimate_weekly_spark() does not pay
+# the import cost on every call.
+try:
+    from integrations.agent_engine.revenue_aggregator import SPARK_PER_USD as _SPARK_PER_USD
+except ImportError:
+    _SPARK_PER_USD = 100.0
+
 
 class HostingRewardService:
 
-    # ─── Contribution Scoring ───
+    # --- Contribution Scoring ---
 
     @staticmethod
     def compute_contribution_score(db: Session, node_id: str,
@@ -128,7 +136,90 @@ class HostingRewardService:
                 results.append(result)
         return results
 
-    # ─── Reward Distribution ───
+    # --- Pre-opt-in Earnings Estimate (idle_compute_workstream G3) ---
+
+    # Tier-typical hardware profile keyed on `NodeTierLevel.value` from
+    # security.system_requirements (single source of truth for tier
+    # names -- no parallel ladder).  Numbers are pure-function over
+    # SCORE_WEIGHTS so any tweak there flows through automatically.
+    # Calibration: conservative top-quartile-of-observed estimates;
+    # bumped up at compute_host because that tier is explicitly built
+    # for serving regional inference traffic.
+    _TIER_PROFILE = {
+        'embedded':     {'gpu_factor': 0.0, 'agents': 0, 'inf_per_week': 50,     'kwh_per_week': 0.2},
+        'observer':     {'gpu_factor': 0.0, 'agents': 0, 'inf_per_week': 100,    'kwh_per_week': 0.5},
+        'lite':         {'gpu_factor': 0.0, 'agents': 1, 'inf_per_week': 200,    'kwh_per_week': 1.0},
+        'standard':     {'gpu_factor': 0.5, 'agents': 3, 'inf_per_week': 1000,   'kwh_per_week': 2.5},
+        'full':         {'gpu_factor': 1.0, 'agents': 5, 'inf_per_week': 5000,   'kwh_per_week': 6.0},
+        'compute_host': {'gpu_factor': 1.0, 'agents': 12,'inf_per_week': 50000,  'kwh_per_week': 25.0},
+    }
+
+    @staticmethod
+    def estimate_weekly_spark(
+        tier: str = 'standard',
+        has_gpu: bool = False,
+        weekly_hours: int = 168,
+    ) -> Dict:
+        """Pre-opt-in Spark estimate for the self-advertising banner.
+
+        Pure function over `SCORE_WEIGHTS` + tier profile -- no DB read,
+        no parallel scoring path.  The same weights drive realized
+        scoring in `compute_contribution_score`, so any retune flows
+        through both surfaces atomically.
+
+        Args:
+            tier: a `NodeTierLevel.value` -- embedded|observer|lite|
+                  standard|full|compute_host (from
+                  `security.system_requirements.get_capabilities`).
+            has_gpu: when True, multiplies the gpu_hours term by the
+                     tier's gpu_factor; embedded/observer/lite tiers
+                     default to 0 even with a GPU because the profile
+                     assumes they don't continuously serve GPU jobs.
+            weekly_hours: how many hours per week the node is online.
+                          168 = always-on; 40 = office-hours only.
+
+        Returns:
+            {'weekly_spark': int, 'weekly_usd': float,
+             'breakdown': {gpu_hours, inferences, energy_kwh, agents,
+                           uptime}, 'tier': tier, 'assumptions': dict}
+        """
+        profile = HostingRewardService._TIER_PROFILE.get(
+            tier, HostingRewardService._TIER_PROFILE['standard'])
+        # Uptime fraction over the week (168h)
+        uptime_ratio = max(0.0, min(1.0, weekly_hours / 168.0))
+        # GPU hours over the week -- only when has_gpu AND tier supports it
+        gpu_hours = weekly_hours * profile['gpu_factor'] if has_gpu else 0.0
+        breakdown = {
+            'uptime': round(uptime_ratio * SCORE_WEIGHTS['uptime_ratio'], 2),
+            'agents': profile['agents'] * SCORE_WEIGHTS['agent_count'],
+            'gpu_hours': round(gpu_hours * SCORE_WEIGHTS['gpu_hours'], 2),
+            'inferences': round(
+                profile['inf_per_week'] * SCORE_WEIGHTS['inferences'], 2),
+            'energy_kwh': round(
+                profile['kwh_per_week'] * SCORE_WEIGHTS['energy_kwh'], 2),
+        }
+        weekly_score = sum(breakdown.values())
+        # Score -> Spark: 1 score-point ~= 1 Spark in current calibration
+        # (revenue_aggregator's 90/9/1 split applies at distribution
+        # time, not here -- this is gross).  USD conversion uses the
+        # canonical SPARK_PER_USD constant imported at module load.
+        usd_per_spark = 1.0 / float(_SPARK_PER_USD or 100)
+        return {
+            'tier': tier,
+            'weekly_spark': int(round(weekly_score)),
+            'weekly_usd': round(weekly_score * usd_per_spark, 2),
+            'breakdown': breakdown,
+            'assumptions': {
+                'has_gpu': bool(has_gpu),
+                'weekly_hours': int(weekly_hours),
+                'gpu_factor': profile['gpu_factor'],
+                'inferences_per_week': profile['inf_per_week'],
+                'energy_kwh_per_week': profile['kwh_per_week'],
+                'spark_per_usd': float(_SPARK_PER_USD or 100),
+            },
+        }
+
+    # --- Reward Distribution ---
 
     @staticmethod
     def distribute_ad_revenue(db: Session, node_id: str,
@@ -327,9 +418,9 @@ class HostingRewardService:
             return awarded.to_dict()
         return None
 
-    # ─── Queries ───
+    # --- Queries ---
 
-    # ─── Compute Stats Aggregation ───
+    # --- Compute Stats Aggregation ---
 
     @staticmethod
     def aggregate_compute_stats(db: Session, node_id: str,
@@ -387,7 +478,7 @@ class HostingRewardService:
             logger.debug(f"Compute stats aggregation failed: {e}")
             return None
 
-    # ─── Queries ───
+    # --- Queries ---
 
     @staticmethod
     def get_rewards(db: Session, node_id: str = None,

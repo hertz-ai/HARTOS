@@ -161,23 +161,34 @@ class JWTManager:
         if len(self._secret_key) < 32:
             logger.warning("SOCIAL_SECRET_KEY is shorter than 32 characters. Consider using a longer key.")
 
-    def generate_access_token(self, user_id: str, username: str) -> str:
-        """Generate a short-lived LOCAL access token (1 hour)."""
+    def generate_access_token(self, user_id: str, username: str,
+                              tenant_id: str = None) -> str:
+        """Generate a short-lived LOCAL access token (1 hour).
+
+        Optional `tenant_id` adds a 'tid' claim — used by central
+        cloud deploys for tenant isolation. The claim flows through
+        the same hardened signing pipeline as every other claim;
+        callers MUST NOT bypass JWTManager when adding tenancy.
+        """
         return self._generate_token(
-            user_id, username, 'access', ACCESS_TOKEN_EXPIRY, scope='local'
+            user_id, username, 'access', ACCESS_TOKEN_EXPIRY, scope='local',
+            tenant_id=tenant_id
         )
 
-    def generate_refresh_token(self, user_id: str, username: str) -> str:
+    def generate_refresh_token(self, user_id: str, username: str,
+                               tenant_id: str = None) -> str:
         """Generate a LOCAL refresh token (7 days)."""
         return self._generate_token(
-            user_id, username, 'refresh', REFRESH_TOKEN_EXPIRY, scope='local'
+            user_id, username, 'refresh', REFRESH_TOKEN_EXPIRY, scope='local',
+            tenant_id=tenant_id
         )
 
-    def generate_token_pair(self, user_id: str, username: str) -> dict:
+    def generate_token_pair(self, user_id: str, username: str,
+                            tenant_id: str = None) -> dict:
         """Generate both access and refresh tokens (local scope)."""
         return {
-            'access_token': self.generate_access_token(user_id, username),
-            'refresh_token': self.generate_refresh_token(user_id, username),
+            'access_token': self.generate_access_token(user_id, username, tenant_id=tenant_id),
+            'refresh_token': self.generate_refresh_token(user_id, username, tenant_id=tenant_id),
             'token_type': 'bearer',
             'expires_in': ACCESS_TOKEN_EXPIRY,
             'scope': 'local',
@@ -185,8 +196,16 @@ class JWTManager:
 
     def _generate_token(self, user_id: str, username: str,
                         token_type: str, expiry: int,
-                        scope: str = 'local') -> str:
+                        scope: str = 'local',
+                        tenant_id: str = None) -> str:
         if not HAS_JWT:
+            # HMAC fallback cannot encode tenant_id (no JSON payload).
+            # In cloud mode this is a hard failure — refuse rather than
+            # silently issuing an untenanted token.
+            if tenant_id:
+                raise RuntimeError(
+                    "Cloud mode requires PyJWT to issue tenant-scoped tokens; "
+                    "HMAC fallback cannot carry the 'tid' claim safely.")
             return self._generate_hmac_token(user_id, username)
 
         node_id = _get_node_id()
@@ -201,6 +220,8 @@ class JWTManager:
             'node_id': node_id,
             'iss': f'node:{node_id}' if scope == 'local' else 'hive:hevolve',
         }
+        if tenant_id:
+            payload['tid'] = str(tenant_id)
         return pyjwt.encode(payload, self._secret_key, algorithm='HS256')
 
     def _generate_hmac_token(self, user_id: str, username: str) -> str:

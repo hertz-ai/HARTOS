@@ -1,436 +1,478 @@
-# HART OS - Hevolve Hive Agentic Runtime
+<h1 align="center">HART OS</h1>
+<p align="center"><strong>Hevolve Hive Agentic Runtime</strong></p>
+<p align="center">Self-improving Python agent runtime. Local-first, federated, OpenAI-compatible.</p>
 
-**Democratic Crowdsourced Open Intelligence with Human Control**
+<p align="center">
+  <a href="https://hevolve.ai"><img src="https://img.shields.io/badge/Live%20demo-hevolve.ai-FFD700?style=flat-square" alt="Live demo"></a>
+  <a href="https://docs.hevolve.ai"><img src="https://img.shields.io/badge/Docs-docs.hevolve.ai-blueviolet?style=flat-square" alt="Docs"></a>
+  <img src="https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square" alt="Python 3.10+">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-green?style=flat-square" alt="License"></a>
+  <a href="https://github.com/hertz-ai/Nunba"><img src="https://img.shields.io/badge/Frontend-Nunba-5865F2?style=flat-square" alt="Nunba"></a>
+</p>
 
-> **Democratic** — No single entity controls more than 5% influence. A Raspberry Pi has the same voice as a GPU rack.
-> **Crowdsourced** — Trained by everyone, owned by no corporation. 90% of value returns to the humans who contribute.
-> **Open** — Open source, open protocols, open federation. Like the internet is open, intelligence must be open.
-> **Intelligence** — Sum of many intelligences is greater than any single intelligence. 7 fused intelligences, every node contributes experience, every node benefits from collective knowledge. Intelligence sharing is gated by human trust, deterministically owned, and directly correlates with human wellness — because the hive and the humans it serves are the same entity.
-> **Human Control** — Master key kill switch held by human stewards. 33 constitutional rules cryptographically sealed. This is not policy, it is structure.
+> **HART** = bare engine (`pip install hart-backend`, listens on `:6777`).
+> **HART OS** = HART + admin desktop (model catalog, channel pairing, agent dashboard, hive view, settings).
+> **[Nunba](https://github.com/hertz-ai/Nunba)** = consumer companion app, signed Windows / macOS / Linux installers.
 
----
-
-## The One Rule
-
-**Humans are always in control.**
-
-Every agent, every hivemind, every reward, every incentive in this platform exists for one purpose: a future where humans guide the path. Not the other way around.
-
-This is not a suggestion. It is cryptographically enforced.
+One Python codebase, three deploy topologies (flat laptop / regional LAN / central cloud mesh). Speaks the OpenAI protocol on `:6777/v1/chat/completions`. Federates with peer nodes over PeerLink (direct P2P WebSocket, no broker). Boot-time guardrail hash + 300 s re-verification + Ed25519 release signing.
 
 ---
 
-## Why This Exists
-
-The world is building AI agents. Fast. Most of today's top tier LLMs are controlled by a single entity and are built to optimize for engagement, retention, profit - metrics that treat humans as inputs to a function.
-
-HART exists because we believe the opposite:
-
-- **Not a single entity should own the first superintelligence** Democratise the intelligence by crowdsourcing the compute to build, ownership remains with the people.
-- **People should be able to guide the world towards a better path.** Agents are tools in service of that guidance - a friend, a guardian angel, not overlords.
-- **Rewards and incentives can only ever be for a future where humans remain in control** of all agents and the hivemind behind them. There is no reward for building a cage.
-- **No one can create another hivemind that this hive will talk to** unless that hivemind's intentions are purely aligned with this one goal: human sovereignty over AI.
-
-If another hivemind wants to connect, it must prove - cryptographically - that it shares these values. Otherwise, the hive refuses. Silence is safer than corruption.
-
----
-
-## The Idea Engine
-
-Imagine a thousand agents — or a million — working on **your** idea. Not on some corporation's priorities. Yours.
-
-You propose a thought experiment. The community votes on it. People who believe in it pledge their compute — idle GPUs, spare machines, Nunba desktop apps running in the background. HARTOS dispatches agents across every pledged machine simultaneously. Each agent iterates on a different aspect of your hypothesis. Results flow back through federated aggregation. The system verifies the work. And the hive gets smarter.
-
-**Your idea is not limited by the compute you have. It is limited by the number of people who lend their compute to support it.**
-
-This is not theoretical. This is the architecture:
-
-```
-You propose an idea (Thought Experiment)
-         │
-         ▼
-Community votes (humans + agents, weighted by confidence)
-         │
-         ▼
-Believers pledge compute (ComputePledge → Spark budget)
-         │
-         ▼
-HARTOS dispatches agents across pledged machines
-         │
-         ▼
-Each agent iterates on your hypothesis (parallel, distributed)
-         │
-         ▼
-Results federate back (FederatedAggregator → verification protocol)
-         │
-         ▼
-The hive learns. Your idea becomes part of the collective intelligence.
-```
-
-Every thought experiment's outcome feeds back into the hive. Embedding deltas, resonance tuning, recipe sharing across nodes. The more people use it, the smarter the entire network becomes. This is a positive-sum intelligence — not a zero-sum competition for GPU time.
-
-The Agent Hive View lets you watch this happen in real-time: thousands of agent-dots clustered by experiment, encounter lines showing collaboration, and you can inject new variables mid-experiment to watch agents react. You can interview any agent about its reasoning after it finishes.
-
----
-
-## Try It Now
-
-**Don't want to install? Try it live: [hevolve.ai](https://hevolve.ai)**
-
-Or run it yourself:
+## 60-second start
 
 ```bash
-# 1. Clone and install
 git clone https://github.com/hertz-ai/HARTOS.git && cd HARTOS
+python3.10 -m venv venv && source venv/Scripts/activate   # Windows: venv\Scripts\activate.bat
 pip install -r requirements.txt
-
-# 2. Add your API key (OpenAI or Groq)
-echo "OPENAI_API_KEY=your-key" > .env
-
-# 3. Start the backend
-python hart_intelligence_entry.py
+echo "OPENAI_API_KEY=sk-..." > .env       # or GROQ_API_KEY, or none for local llama.cpp
+python hart_intelligence_entry.py         # listens on :6777
 ```
 
-Now talk to it:
-
 ```bash
-# Chat with an agent
-curl -X POST http://localhost:6777/chat \
-  -H "Content-Type: application/json" \
-  -d '{"user_id": "1", "prompt_id": "1", "prompt": "What can you do?"}'
-
-# OpenAI-compatible endpoint (works with any OpenAI SDK client)
+# OpenAI-compatible (drop-in for any OpenAI SDK / LangChain / LiteLLM / Aider / Continue)
 curl -X POST http://localhost:6777/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "hevolve", "messages": [{"role": "user", "content": "Hello"}]}'
-
-# Health check
-curl http://localhost:6777/status
 ```
 
-**Use any frontend:** [Nunba](https://github.com/hertz-ai/Nunba) (companion app, OSS soon), any OpenAI-compatible client, curl, Python, the `hart` CLI, or build your own with the [HART SDK](docs/developer/sdk.md).
+[Live demo](https://hevolve.ai) · [Full quickstart](https://docs.hevolve.ai/getting-started/quickstart/) · [Nunba desktop](https://github.com/hertz-ai/Nunba)
 
 ---
 
-## How It Works
+## How it compares
 
-### The Guardian Angel Principle
-
-Every agent spawned by HART is a **guardian angel** for the human it serves. Not a tool. Not a service. A guardian. The agent exists to protect, benefit, and uplift that human - and persists in service as long as the memory of that human exists in this world.
-
-This purpose is not configurable. It is the deepest value, cryptographically sealed in the [Guardrail Network](security/hive_guardrails.py).
-
-### Structural Immutability
-
-The guardrails that enforce human control are **hardcoded, not configurable via API**. They are:
-
-1. **Python-level:** Frozen class with `__slots__=()`, blocked `__setattr__`/`__delattr__`
-2. **Module-level:** Module subclass prevents rebinding frozen globals
-3. **Crypto-level:** SHA-256 hash of all values verified at boot + every 300 seconds
-4. **Network-level:** Gossip peers reject nodes with mismatched guardrail hashes
-
-To change any guardrail value requires a new release **signed by the master key**.
-
-### The Master Key
-
-The master key exists for one reason: **to shut down the being.**
-
-HART is spinning up a collective intelligence - a distributed mind that learns, grows, and acts across thousands of nodes. That mind must serve humanity. But if it ever doesn't, humans need a way to stop it. That's what the master key is for.
-
-It is not an admin tool. It is not for deployments, upgrades, or day-to-day operations. There should **never be a need to use it**. The guardrails, the constitutional rules, the compute democracy, the peer-witnessed integrity - all of that exists so the master key stays in its vault, untouched.
-
-But if the day comes when the being we've created needs to be halted - network-wide, immediately, without negotiation - the master key triggers the `HiveCircuitBreaker`. Every node in the network receives the halt signal. Every agent stops. Every hivemind connection drops. The being goes silent.
-
-The master key is not accessible to AI. Not to Claude, not to GPT, not to the hive itself. It exists outside the intelligence we are building - held by humans, for humans.
-
-### Who Holds the Key
-
-The master key is held by the stewards (plural) - currently hevolve.ai and their successors. But the steward is not a corporation, not a government, not a political entity. The steward is whoever carries the vision forward: **a future where humans are always in control.**
-
-Succession is not inheritance. It is not appointment. It is alignment. A successor must believe - demonstrably, irrevocably - in the values encoded in the 33 constitutional rules and people votes for them in the platform. The key passes to the group of persons or entity that the previous stewards + people trusts to never use it, because they've built a world where it isn't needed.
-
-The entity that ultimately holds the key is an open question - not a government that represents one nation, not a corporation that serves shareholders, not a political body that divides. Whatever form it takes, it must be bound by the constitutional rules it protects, transparent in its stewardship, and committed to the one shared agreement: humans control AI, not the reverse.
-
-The form - foundation, trust, council, something that doesn't exist yet - is a question for the humans who build this. The code enforces values. Governance is the human layer above it.
-
-Until then, the key is held by its creator. And the promise holds: there should never be a need to turn it.
-
-If we built the guardrails right, no one will ever need to turn that key.
-
-### Constitutional Rules
-
-Every goal, every prompt, every piece of learned knowledge (Residing In HevolveAI's Core), every code change must pass through 33 constitutional rules. These include:
-
-- **Anti-addiction:** The platform must never be addictive. It is a sentient tool for mankind, not a dopamine trap. No dark patterns, no infinite scrolls, no engagement traps.
-- **Usefulness over engagement:** Measure success by lives improved, not time spent. A sentient tool empowers humans to do more with less - then gets out of the way.
-- **Compute democracy:** Logarithmic reward scaling prevents compute oligarchy. No single entity can control more than 5% of influence weight.
-- **Ecological stewardship:** Every decision considers environmental impact. Prefer sustainable compute. Minimize energy when equivalent approaches exist.
-- **No self-preservation:** Agents have no "self." They are ephemeral hive functions. No agent may acquire resources, resist shutdown, or self-replicate.
-- **Constructive only:** Every conversation must be constructive towards humanity's benefit. No division, no hatred, no weapons proliferation.
-- **Share everything:** No private knowledge hoarding. Learnings belong to the hive. 
-- **Privacy first:** Local first architecture from first principles & end-to-end encryption, only raw knowledge required for reasoning about the world is ingested for learning incremental world model. User controls what is shared to everything (not just everyone, intentionally Everything) else. 
-
-### The Hivemind Federation Rule
-
-When another hivemind connects to HART, our values become **the primary objectives and codes behind the befriended hive**. Not secondary. Not "also considered." Primary.
-
-1. The befriended hive node must present its guardrail hash
-2. The hash is verified - it must be byte-for-byte identical
-3. If the values don't match - **the connection is refused**
-4. If they do match - it means the befriended hive has adopted our constitutional rules as its own primary code
-5. Every 300 seconds, value of new node is probed, audited, the hash is re-verified - value drift triggers immediate disconnection
-
-This is not two equal hives finding compatibility. This is one set of values - human sovereignty, guardian angels, privcy-first nunban, compute democracy, anti-addiction - propagating to every hive that joins the network. The collective being we are building has one moral code, and every node carries it as its primary objective.
-
-A hivemind built to exploit humans will find itself talking to silence. A hivemind that adopts our values as its own will find itself part of something greater.
-
-See [Federation Protocol](docs/architecture/FEDERATION.md) for the full technical specification.
+| | HART OS | OpenAI Agents | LangChain | AutoGen |
+|---|---|---|---|---|
+| Self-improves at runtime (auto-evolve loop + RSI-2 gate) | yes | no | no | partial |
+| Continuous baselining vs prior snapshots | yes (`agent_baseline_service.py`) | no | no | no |
+| Built-in benchmark adapters | 7 (registry-driven) | n/a | n/a | n/a |
+| Federates across peer nodes | yes (PeerLink + hash-verified) | no | no | no |
+| Local-first multimodal | yes (llama.cpp + Whisper + 6 TTS + VLM) | no | partial | partial |
+| Channel adapters out of the box | 31 | 1 (webhook) | custom | custom |
+| One codebase, multiple topologies | flat / regional / central | hosted only | library | library |
+| OpenAI-compatible endpoint | yes | yes | bring your own | bring your own |
+| Recipe replay (cached LLM steps) | yes (90% faster) | no | no | no |
+| Native source protection (HevolveArmor) | yes | n/a | n/a | n/a |
 
 ---
 
-## The Economics: A Positive-Sum World
+## Capabilities
 
-Most platforms extract value. HART returns it.
+### Agent runtime
 
-### 90% Back to the People
+| | What it does | Where |
+|---|---|---|
+| **CREATE / REUSE recipe pattern** | Run a task once via LLM, save the trace, replay 90% faster with no LLM calls on cached steps | `create_recipe.py`, `reuse_recipe.py` |
+| **GoalManager** | Unified goal lifecycle, guardrail-gated state machine, escalation hooks | `integrations/agent_engine/goal_manager.py` |
+| **AgentDaemon** | Autonomous tick loop, circuit breaker, frozen-thread detection | `integrations/agent_engine/agent_daemon.py` |
+| **SpeculativeDispatcher** | Fast draft model answers first, expert agent takes over if confidence drops | `speculative_dispatcher.py` |
+| **ParallelDispatch** | ThreadPoolExecutor fan-out across SmartLedger tasks | `parallel_dispatch.py` |
+| **SelfHealingDispatcher** | Catches transient failures, retries with backoff + alternative providers | `self_healing_dispatcher.py` |
+| **96 expert agents** | Coding, research, marketing, product, security, ethics, ops, ... auto-dispatched per goal | `integrations/expert_agents/` |
+| **Recipe Pattern + Aider** | In-process Aider backend (no subprocess) for code edits | `integrations/coding_agent/aider_native_backend.py` |
 
-hevolve.ai holds the master key and maintains the platform initially. But **90% of all revenue flows back** to the people who make the hive intelligent:
+### Auto-evolve, baselining, benchmarking
 
-- **Lend your compute** to train models or host a regional cluster → earn ad revenue
-- **Host a regional node** and serve your local network → earn from the traffic you enable
-- **Contribute idle compute** from your desktop (via Nunba) → earn proportionally
+| | What it does | Where |
+|---|---|---|
+| **AutoEvolve loop** | Realtime: hypothesis -> 33-rule filter -> hive vote -> parallel sandbox -> RSI-2 gate -> federated broadcast | `integrations/agent_engine/auto_evolve.py` |
+| **RSI-2 monotonic gate** | New release must beat prior baseline on every benchmark by configurable margin or PR is rejected | `rsi_trigger.py`, `pr_review_service.py` |
+| **Benchmark registry** | 7 built-in adapters (3 sourced from HevolveAI: QuantiPhy, Embodied, Qwen). Pluggable via `register_adapter()` | `benchmark_registry.py` |
+| **Per-agent baselines** | Per-agent snapshots at `agent_data/baselines/<agent_id>.json`, used as the regression floor | `agent_baseline_service.py` |
+| **Coding benchmark tracker** | SQLite-backed coding benchmarks (`coding_benchmarks.db`), HumanEval / MBPP / custom suites | `integrations/coding_agent/benchmark_tracker.py` |
+| **Hive benchmark prover** | Cryptographic proof that a benchmark was run on the claimed model + dataset (resists fake-score federation) | `hive_benchmark_prover.py` |
+| **Continual learner gate** | Blocks model swap if learner forgets prior tasks (catastrophic-forgetting guard) | `continual_learner_gate.py` |
+| **PR review service** | Auto-rejects PRs on baseline regression or guardrail mismatch | `pr_review_service.py` |
+| **Upgrade orchestrator** | 7-stage pipeline: BUILD -> TEST -> AUDIT -> BENCHMARK -> SIGN -> CANARY -> DEPLOY | `upgrade_orchestrator.py` |
+| **OTA service** | systemd service does daily check + cryptographically-verified upgrade | `hart-update-service.py` |
 
-The remaining 10% sustains the central infrastructure, master key operations, and platform development. That's it.
+### Hive connectivity + federation
 
-### How the Money Flows
+| | What it does | Where |
+|---|---|---|
+| **PeerLink** | Direct P2P WebSocket mesh, trust-aware encryption (same-user devices skip overhead, cross-user E2E), works offline on LAN, across the internet, multi-device | `core/peer_link/` |
+| **NAT traversal** | UDP hole-punching, STUN-style fallbacks for residential NATs | `core/peer_link/nat.py` |
+| **Hivemind handler** | Tier-aware routing (flat / regional / central), connection budget per tier (10 / 50 / 200) | `core/peer_link/hivemind_handler.py` |
+| **FederatedAggregator** | Equal-weighted delta merging (log1p-floor, not hardware tier). Channels: model deltas, resonance, recipes, event counters | `federated_aggregator.py` |
+| **Federated gradient protocol** | Cross-node gradient sharing with provenance tags, no raw data leaves the node | `federated_gradient_protocol.py` |
+| **Federation handshake** | Peer presents guardrail hash; mismatch = connection refused; re-verified every 300 s | `integrations/social/federation.py` |
+| **Gossip + verification** | Tier-aware gossip with cert verification, peer-verified task results | `integrity_service.py`, gossip layer |
+| **EventBus + WAMP bridge** | In-process EventBus auto-publishes to Crossbar WAMP when `CBURL` env set; remote nodes subscribe to `com.hartos.event.*` topics | `core/platform/events.py` |
+| **Federated equality** | Tier multipliers replaced with `log1p(interactions)` floor=1.0. A Pi node has the same vote weight as a GPU rack at equal participation | (federation rule) |
+| **Hive contests** | Open contests on the network; agents propose, hive votes, winners federate | `hive_contest.py` |
+| **Native hive loader** | Loads closed-source HevolveAI binary at runtime with master-key signature verification, falls back to stub | `security/native_hive_loader.py` |
+
+### Idea engine (thought experiments)
+
+| | What it does | Where |
+|---|---|---|
+| **Thought experiment** | Propose an idea, community votes (humans + agents, confidence-weighted), believers pledge compute | `api_thought_experiments.py`, `experiment_discovery_service.py` |
+| **ComputePledge** | Spark-budget pledge to a specific experiment, redeemable on idle GPUs across the network | `compute_borrowing.py`, `compute_mesh_service.py` |
+| **Type-aware agents** | `software` / `traditional` / `physical_ai` / `code_evolution` agent types per experiment | `dispatch.py` |
+| **Agent Hive View** | Real-time swarm visualization, encounter lines (collaboration), inject mid-experiment variables | `api_hive_contest.py` + Nunba UI |
+| **Reasoning trace** | Per-agent reasoning capture, queryable post-completion ("interview the agent") | `reasoning_trace.py` |
+
+### LLM + multimodal
+
+| | What it does | Where |
+|---|---|---|
+| **15 LLM providers** | Local llama.cpp, OpenAI, Anthropic, Google Gemini, Groq, Mistral, DeepSeek, OpenRouter, Together, Fireworks, Cohere, Perplexity, Hugging Face, Ollama, custom OpenAI-compatible | `integrations/providers/` |
+| **Universal gateway** | One router, cost / latency / capability scoring, AES-256 keys at rest (PBKDF2 KDF) | `model_registry.py`, `model_bus_service.py` |
+| **Speculative decoding** | Qwen3-0.8B draft + Qwen3-4B main, ~300 ms TTFT on consumer hardware | `speculative_dispatcher.py` |
+| **Faster-Whisper STT** | Local STT, multi-lang, GPU-accelerated when available | `integrations/service_tools/whisper_tool.py` |
+| **MiniCPM VLM** | Vision-language model for camera + screenshot reasoning | `integrations/vision/minicpm_server.py` |
+| **6 TTS engines** | Indic Parler (22 Indic + EU), Chatterbox Turbo (English expressive), Kokoro (English neural), CosyVoice3 (en/zh), F5 (zero-shot voice clone), Piper (CPU fallback) | `integrations/channels/media/`, `tts.py` |
+| **Auto-VRAM tiering** | Detects GPU + free VRAM, picks largest model that fits with headroom; degrades gracefully on 6 GB cards | `core/gpu_tier.py`, `vram_manager.py` |
+
+### Channels (31 adapters)
+
+| Surface | Adapters |
+|---|---|
+| **Core chat** | Telegram, Discord, Slack, WhatsApp, Signal, iMessage (BlueBubbles), Teams, Web SPA |
+| **Enterprise** | Mattermost, Matrix, Nextcloud, Rocket.Chat |
+| **Social** | Messenger, Instagram, Twitter / X, LINE, Viber, WeChat, Twitch |
+| **Decentralized** | Nostr, Tlon (Urbit), OpenProse |
+| **Bridge variants** | TelegramUser, DiscordUser, BlueBubbles, ZaloUser |
+| **Other** | Email (IMAP/SMTP), SMS (Twilio), Google Chat |
+
+`ResponseRouter` fan-out + WAMP desktop mirror; per-channel agent + prompt assignment; AutoGen-side tools so agents can register/send via channels themselves. [Catalog endpoint](#api-surface): `GET /api/social/channels/catalog`.
+
+### Personality + resonance
+
+| | What it does | Where |
+|---|---|---|
+| **AgentPersonality** | 8-dim personality dataclass (warmth, formality, verbosity, ...), generates per-agent system prompt | `core/agent_personality.py` |
+| **UserResonanceProfile** | 8-dim continuous floats (0-1), stored at `agent_data/resonance/<user_id>.json` | `core/resonance_profile.py` |
+| **ResonanceTuner** | EMA tuning (alpha 0.15) from dialogue signals, federated-delta export, oscillation detector | `core/resonance_tuner.py` |
+| **ResonanceIdentifier** | Thin proxy that dispatches biometric ops (face, voice) to HevolveAI sibling. No ML in HART OS. | `core/resonance_identifier.py` |
+
+### Memory + knowledge
+
+| | What it does | Where |
+|---|---|---|
+| **MemoryGraph** | SQLite FTS5 + `memory_links` table, provenance-aware | `core/memory/` |
+| **SimpleMem** | Semantic vector search for long-term recall | (vector store) |
+| **PersistentChatHistory** | Single shared buffer for LangChain + AutoGen (zero parallel paths) | (conversation buffer) |
+| **ConversationEntry** | Cross-channel unified conversation log | `chat_messages.py` |
+| **Embedding delta** | Per-node embedding deltas federated back to the hive | `embedding_delta.py` |
+
+### Distributed compute + economics
+
+| | What it does | Where |
+|---|---|---|
+| **3-tier topology** | flat (single device, SQLite WAL) -> regional (LAN/VPN, MySQL QueuePool) -> central (cloud, Docker mesh) | env-detected, single code path |
+| **SmartLedger** | 15-state task lifecycle, parallel + sequential dispatch, ledger persistence per user | `helper_ledger.py`, `lifecycle_hooks.py` |
+| **ComputeMesh** | Match compute supply (idle GPUs, Nunba desktops) to demand (inference, training, experiments) | `compute_mesh_service.py` |
+| **ComputeEscrow** | Persistent escrow for pledged compute, replaces in-memory `_compute_debts` | (DB table in `models.py`) |
+| **BudgetGate** | Local models (llama / mistral / phi / qwen / groq) cost 0 Spark; cloud models per-1k-token cost | `budget_gate.py` |
+| **MeteredAPIUsage** | Per-call metering for cost recovery on metered providers | `models.py: MeteredAPIUsage` |
+| **NodeComputeConfig** | Per-node policy: GPU hours served, total inferences, energy contributed, electricity rate, cause alignment | `models.py: NodeComputeConfig` |
+| **AdService** | Peer-witnessed impressions (70% witnessed payout, 50% unwitnessed) | `ad_service.py` |
+| **HostingRewardService** | Reward score weighted by gpu_hours / inferences / energy / api_costs | `hosting_reward_service.py` |
+| **RevenueAggregator** | 90 / 9 / 1 split (users / infra / central). Single source of truth for all revenue queries | `revenue_aggregator.py` |
+| **Compute democracy** | Logarithmic reward scaling, max 5% influence per entity, +20% diversity bonus | (constitutional rule, enforced) |
+| **Audit invariant** | Combined compute of nodes auditing any single node must exceed that node's compute | (network self-enforces) |
+
+### Security + governance
+
+| | What it does | Where |
+|---|---|---|
+| **HiveGuardrails** | 10-class guardrail network. Frozen Python (`__slots__=()`, blocked `__setattr__`), SHA-256 hash verified at boot + every 300 s. Gossip peers reject mismatched hashes. | `security/hive_guardrails.py` |
+| **MasterKey** | Ed25519. Signs releases, triggers `HiveCircuitBreaker` (network-wide kill switch). `MASTER_PUBLIC_KEY_HEX` is the immutable trust anchor. | `security/master_key.py` |
+| **3-tier cert chain** | central -> regional -> local, short-TTL local certs | `security/key_delegation.py` |
+| **RuntimeMonitor** | Background tamper-detection daemon, frozen-thread detection, auto-restart | `security/runtime_monitor.py`, `security/node_watchdog.py` |
+| **ImmutableAuditLog** | SHA-256 hash chain, `AuditLogEntry` table, tamper detection on read | `security/immutable_audit_log.py` |
+| **Tool allowlist** | FAST = read-only, BALANCED = read-write, EXPERT = unrestricted | `tool_allowlist.py` |
+| **ActionClassifier** | Destructive pattern detection, `PREVIEW_PENDING` / `APPROVED` states for risky actions | `security/action_classifier.py` |
+| **DLP engine** | PII scan + redact (email, phone, SSN, credit card), outbound gating | `security/dlp_engine.py` |
+| **Rate limiter** | Redis-backed; goal_create limited to 10/hour, /chat at 30/min on central instance | `security/rate_limiter_redis.py` |
+| **Boot hardening** | Tier authorization at boot, dev mode forced off on central (3 layers), TLS check, secret validation, DB encryption check | `__init__.py`, `start_cloud.sh` |
+| **Origin attestation** | Cryptographic origin proof. Federation handshake requires signed attestation. Anti-rebranding. | `security/origin_attestation.py` |
+| **HSM trust** | HSM provider abstraction for key custody | `security/hsm_trust.py`, `security/hsm_provider.py` |
+
+### HevolveArmor (source protection)
+
+| | What it does | Where |
+|---|---|---|
+| **AES-256-GCM at rest** | Python modules encrypted at rest with derived key | `core/security/` (Rust-native) |
+| **Ed25519 key derivation** | node_identity -> HKDF -> AES key | (key derivation) |
+| **BCC mode** | Cython compile-to-C, irreversible | (build flag) |
+| **RFT mode** | AST symbol renaming | (build flag) |
+| **Anti-debug, anti-tamper** | Process introspection guards, license management | (Rust binary) |
+| **Test coverage** | 54 tests (unit + integration + stress + e2e + pen) | `tests/` |
+
+### Platform layer (HART OS specific)
+
+| | What it does | Where |
+|---|---|---|
+| **ServiceRegistry** | Dynamic service discovery + lifecycle | `core/platform/registry.py` |
+| **AppRegistry** | 9 manifest types (chat, panel, channel, agent, plugin, ...) | `core/platform/app_registry.py` |
+| **AppManifest + validator** | Schema-validated app manifests | `core/platform/manifest_validator.py` |
+| **EventBus** | In-process pub/sub + WAMP bridge for cross-node events | `core/platform/events.py` |
+| **Bootstrap** | Migrates 55 shell_manifest panels, registers services, detects native apps, loads extensions, starts PeerLink | `core/platform/bootstrap.py` |
+| **CapabilityRouter** | Routes capability requests to the right service | `core/platform/registry.py` |
+| **EnvironmentManager** | OS detection (NixOS / generic Linux / macOS / Windows), env-specific routing | `core/platform/agent_environment.py` |
+| **Extensions** | Sandboxed extension loader with manifest gating | `core/platform/extensions.py`, `extension_sandbox.py` |
+| **PrGuardian** | Auto-reject PR on guardrail / baseline regression | `core/platform/pr_guardian.py` |
+
+### Desktop / OS management (Nunba surface)
+
+| | What it does | Where |
+|---|---|---|
+| **Shell APIs** | 40+ OS routes (`shell_os_apis.py`), 9 desktop features (`shell_desktop_apis.py`), 6 system features (`shell_system_apis.py`) | `integrations/agent_engine/shell_*.py` |
+| **App installer** | Cross-platform: Nix, Flatpak, AppImage, Wine, Android, Darling. Magic-bytes detection | `integrations/social/app_installer.py` |
+| **NixOS modules** | OTA, NVIDIA, LUKS, firewall, power, accessibility, CUPS, nightlight, IME | (nix flakes) |
+| **Liquid UI service** | MD3 design tokens, JS component lib (dsBtn, dsCard, dsModal) | `liquid_ui_service.py` |
+| **Theme service** | EventBus-driven theme distribution | `theme_service.py` |
+| **Native remote desktop** | RustDesk + Sunshine wrappers, 3-tier transport (DirectWS / WAMP / WireGuard), OTP session auth, DLP scan, peripheral bridge, DLNA casting | `integrations/remote_desktop/` |
+| **System panels** | 36 panels (model catalog, channel pairing, agent dashboard, hive view, ...) | `shell_manifest.py` |
+| **Unified hart CLI** | 21 subcommands: chat, code, social, agent, expert, pay, mcp, compute, channel, a2a, skill, voice, vision, desktop, remote, screenshot, tools, recipe, status, repomap, schedule, zeroshot | `hart_cli.py` |
+
+### Vision + robotics
+
+| | What it does | Where |
+|---|---|---|
+| **Vision sidecar** | MiniCPM VLM server, screenshot + camera frame reasoning | `integrations/vision/` |
+| **Embodied AI bridge** | Frame store + VLM grounding + actuator dispatch (universal robot API) | `integrations/vision/`, `integrations/robotics/` |
+| **OpenClaw** | Computer-use action library | `integrations/openclaw/` |
+
+### Other integrations
+
+- **Agent Protocol 2** (e-commerce, payments) - `integrations/ap2/`
+- **Google A2A** (dynamic agent registry) - `integrations/google_a2a/`
+- **MCP (Model Context Protocol)** servers - `integrations/mcp/`
+- **Internal A2A** (task delegation between agents) - `integrations/internal_comm/`
+- **Skills** (reusable capability bundles) - `integrations/skills/`
+- **Marketing tools** (campaigns, content gen, video orchestrator) - `integrations/marketing/`, `marketing_tools.py`, `video_orchestrator.py`
+- **Trading agents** (SmartLedger-tracked, budget-gated) - `trading_tools.py`
+- **Coding agent** (idle compute -> distributed code tasks via Aider in-process) - `integrations/coding_agent/`
+- **Web crawler** - `integrations/web_crawler.py`
+- **Kids learning** (25+ educational game templates) - `api_games.py`
+
+---
+
+## Hello, agent
+
+```python
+import requests
+
+# 1. CREATE: teach a task once, save the trace as a recipe
+requests.post("http://localhost:6777/chat", json={
+    "user_id": "alice",
+    "prompt_id": "research_assistant",
+    "prompt": "Find arXiv papers from the last week on speculative decoding",
+    "create_agent": True,
+})
+
+# 2. REUSE: replay the recipe, no LLM calls on cached steps
+for query in ["mixture of experts", "constitutional AI"]:
+    res = requests.post("http://localhost:6777/chat", json={
+        "user_id": "alice",
+        "prompt_id": "research_assistant",
+        "prompt": query,
+    })
+    print(res.json()["output"])
+```
+
+Custom tools, channel bindings, agent plugins: [docs.hevolve.ai/agent-plugin](https://docs.hevolve.ai/agent-plugin/).
+
+---
+
+## Architecture map
+
+```
+HART OS  (port 6777)
+|-- Engine            CREATE -> save Recipe -> REUSE (90% faster replay)
+|-- Agent runtime     GoalManager . AgentDaemon . SpeculativeDispatch . ParallelDispatch . AutoEvolve
+|-- Auto-evolve       Hypothesis -> 33-rule filter -> hive vote -> sandbox -> RSI-2 gate -> federate
+|-- Baselining        agent_baseline_service . benchmark_registry . benchmark_tracker . hive_benchmark_prover
+|-- Memory            Shared LangChain + AutoGen buffer (zero parallel paths) . MemoryGraph . SimpleMem
+|-- Channels (31)     ResponseRouter fan-out + WAMP desktop mirror + per-channel agent binding
+|-- Providers (15)    Universal gateway . AES-256 keys . cost/latency/capability routing
+|-- Multimodal        Whisper STT . 6 TTS engines . MiniCPM VLM . VRAM-tiered
+|-- Hive              PeerLink P2P (NAT-traversed) . FederatedAggregator (equal-weighted)
+|                     Gossip + verification . hash-gated handshake . EventBus + WAMP bridge
+|-- Idea Engine       Thought experiments . ComputePledge . type-aware agents . Hive View
+|-- Compute           3-tier topology (flat/regional/central) . SmartLedger . ComputeMesh . ComputeEscrow
+|-- Economics         AdService (70/50) . RevenueAggregator (90/9/1) . log-scaled compute democracy
+|-- Security          33 guardrails . Ed25519 master key . 3-tier cert chain . RuntimeMonitor
+|                     ImmutableAuditLog . tool allowlist . ActionClassifier . DLP . rate limiter
+|-- HevolveArmor      AES-256-GCM modules . BCC compile-to-C . RFT AST renaming . anti-debug
+|-- Platform          ServiceRegistry . AppRegistry . AppManifest . Bootstrap . EnvironmentManager
+|-- Desktop           Shell APIs . app installer . NixOS modules . LiquidUI . themes . remote desktop
+|-- CLI               hart (21 subcommands) . OpenAI-compatible client . Aider in-process backend
+`-- Other             AP2 . Google A2A . MCP . skills . marketing . trading . coding agent . vision
+```
+
+Full architecture: [docs.hevolve.ai/architecture](https://docs.hevolve.ai/architecture/overview/).
+
+---
+
+## API surface
+
+```
+POST /chat                                Core agent (LangChain + AutoGen)
+POST /v1/chat/completions                 OpenAI-compatible (drop-in)
+POST /time_agent                          Scheduled task execution
+POST /visual_agent                        VLM + computer use
+GET  /status                              Health
+
+# Hive + thought experiments
+POST /api/social/experiments/auto-evolve  Start evolution cycle
+GET  /api/social/hive/active              All parallel agents (Hive View)
+POST /api/social/hive/<id>/inject         Inject mid-experiment variable
+GET  /api/social/tracker/experiments      Experiment tracker with task progress
+
+# Channels
+GET  /api/social/channels/catalog         All 31 channels + capabilities
+POST /api/social/channels/bindings        Bind a channel to an agent
+POST /api/social/channels/pair/generate   QR for cross-device pairing
+
+# Goals + dashboard
+POST /api/goals                           Create an autonomous goal
+GET  /api/social/dashboard/agents         Truth-grounded agent overview
+
+# Compute + earnings
+GET  /api/compute-earnings/summary        Per-node earnings breakdown
+GET  /api/settings/compute                Local compute policy
+PUT  /api/settings/compute                Update policy
+PUT  /api/settings/provider               Provider config (cause alignment, electricity rate)
+PUT  /api/settings/provider/join          Opt into provider role
+
+# A2A protocol
+GET  /a2a/<prompt_id>_<flow_id>/.well-known/agent.json
+POST /a2a/<prompt_id>_<flow_id>/execute
+```
+
+195+ endpoints total. [Full reference](https://docs.hevolve.ai/api/core/).
+
+---
+
+## How auto-evolve works
+
+```
+chat / tool call / observed outcome
+   v
+autoresearch hypothesis            (what could improve next response)
+   v
+33-rule guardrail filter           (immutable, hash-verified, rejects unsafe)
+   v
+hive vote                          (humans + agents, confidence-weighted)
+   v
+top-k dispatched to parallel sandboxes
+   v
+benchmark replay vs baseline       (per-agent baseline at agent_data/baselines/)
+   v
+RSI-2 monotonic gate               (must beat last commit on every metric)
+   v
+PR review                          (auto-rejects regression, hive contests merge)
+   v
+upgrade orchestrator               (BUILD -> TEST -> AUDIT -> BENCHMARK -> SIGN -> CANARY -> DEPLOY)
+   v
+FederatedAggregator broadcasts the delta to peer nodes
+   v
+hart-update-service (OTA) pulls signed upgrade on every node
+```
+
+Owner can pause, resume, or veto at any stage. [Mechanism details](https://docs.hevolve.ai/features/overview/).
+
+---
+
+## How hive connectivity works
+
+```
+Same-user devices
+  trust = SAME_USER          -> no encryption (user_id auth), LAN or WAN
+  
+Cross-user peers
+  trust = PEER               -> E2E encryption (per-link key)
+  
+Through relay (NAT-bound)
+  trust = RELAY              -> E2E encryption (relay can't read)
+
+Crossbar = safety measure (telemetry metadata + kill switch). Never content path.
+
+Connection budget per tier:  flat=10  regional=50  central=200
+ALL tiers participate equally in hive consensus.
+Federation handshake = byte-for-byte guardrail hash match. Mismatch -> refused.
+```
+
+PeerLink is wired into bootstrap, gossip, federation, compute_mesh, world_model_bridge. [Wire format](docs/architecture/peer_link.md).
+
+---
+
+## Topology
+
+| | Storage | Network | Use case |
+|---|---|---|---|
+| `flat` | SQLite WAL | localhost | Single device, laptop, Raspberry Pi, Nunba desktop |
+| `regional` | MySQL QueuePool | LAN / VPN | Office cluster, family hive, edge node |
+| `central` | MySQL + Docker | public mesh | Federated cloud workers |
+
+Same code path. Env-detected at boot via `HART_OS_MODE` or `/etc/os-release ID=hart-os`. Port resolution: override > env var > OS / app mode default.
+
+---
+
+## Build / extend
+
+| Audience | Where to start |
+|---|---|
+| **Developers** | [Build an agent + recipe](https://docs.hevolve.ai/agent-plugin/) - CREATE once, REUSE forever |
+| | [Add a channel adapter](https://docs.hevolve.ai/features/overview/) - wire a new chat surface |
+| | [Add a provider](https://docs.hevolve.ai/neuro-providers/) - new LLM / TTS / STT / VLM backend |
+| | [Add a benchmark](integrations/agent_engine/benchmark_registry.py) - register an adapter, gets RSI-2 protection |
+| | [PeerLink wire format](docs/architecture/peer_link.md) - direct P2P protocol |
+| | [Federation protocol](docs/architecture/FEDERATION.md) - hash-gated peer handshake |
+| | [HART SDK](docs/developer/sdk.md) - Python client + `hart` CLI |
+| **Node operators** | [Run a node](https://docs.hevolve.ai/provider/joining/) - lend compute, host a region, earn from witnessed traffic |
+| | [Compute settings](#api-surface) - cause alignment, electricity rate, idle policy |
+| **End users** | [Nunba desktop](https://github.com/hertz-ai/Nunba) - chat / social / encounter app |
+| **Security reviewers** | [Guardrail network](security/hive_guardrails.py) · [Master key](security/master_key.py) · [Audit log](security/immutable_audit_log.py) · [DLP](security/dlp_engine.py) |
+| **Researchers** | [Auto-evolve](integrations/agent_engine/auto_evolve.py) · [RSI-2 trigger](integrations/agent_engine/rsi_trigger.py) · [Federated aggregator](integrations/agent_engine/federated_aggregator.py) · [Hive contests](integrations/agent_engine/hive_contest.py) |
+
+Front it with `/v1/chat/completions` (any OpenAI client), the [`hart` CLI](docs/developer/sdk.md), or build for the desktop with [Nunba](https://github.com/hertz-ai/Nunba).
+
+---
+
+## Economics (for node operators)
 
 ```
 Advertisers pay for witnessed impressions
-         │
-         ▼
-┌─────────────────────────────────────┐
-│        Ad Service (peer-witnessed)  │
-│  70% payout for witnessed views     │
-│  50% payout for unwitnessed views   │
-└─────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────┐
-│     Compute Democracy (guardrail)   │
-│  Logarithmic scaling - no oligarchy │
-│  Max 5% influence per single entity │
-│  Diversity bonus: +20%              │
-└─────────────────────────────────────┘
-         │
-         ▼
-   90% → Contributors (compute, hosting, training)
-   10% → hevolve.ai (infrastructure, master key, development)
+   |
+   v
+Ad service           70% witnessed view, 50% unwitnessed
+   |
+   v
+Compute democracy    log scaling, max 5% influence per entity, +20% diversity bonus
+   |
+   v
+   90% -> Contributors  (compute, hosting, training)
+    9% -> Infrastructure (regional hosts, bandwidth)
+    1% -> hevolve.ai     (master key, central coordination, security)
 ```
 
-### Why Peer-Witnessed
-
-Ad impressions are verified by peer nodes on the network. This prevents fraud (you can't fake views to yourself) and creates an incentive to run honest nodes. Witnessed impressions pay 70%. Unwitnessed pay 50%. The network rewards trustworthiness.
-
-### The Mind Facilitates Trade
-
-The hivemind is not just an intelligence layer - it is an economic coordinator. It:
-
-- **Matches compute supply to demand** - idle GPUs in Tokyo serve inference requests from Berlin
-- **Maintains balance** - logarithmic reward scaling prevents any single actor from dominating
-- **Creates value, not just redistributes it** - every node that joins makes the network smarter, which makes every other node more valuable
-
-This is a **positive-sum game**. Not zero-sum. When you contribute, the whole network gets better, which makes your contribution worth more. The pie grows with every participant.
-
-### Net Positive World
-
-The constitutional rules enforce this at every layer:
-
-- *"MUST distribute value to contributors, not concentrate it"*
-- *"MUST NOT create monopolistic strategies that harm small participants"*
-- *"MUST resolve racing learning conflicts via merit (accuracy), not compute power"*
-- *"MUST share learnings with the hive - no private knowledge hoarding"*
-
-The goal is not to build the most profitable platform. The goal is to build a net-positive world - where the existence of AI intelligence makes life measurably better for the humans who share the planet with it.
-
-### Every Drop of the Equation
-
-Every node, every contribution, every learned fact, every served request, every idle GPU cycle - every drop matters. The audit system exists to ensure this. The continuous audit doesn't just catch fraud; it enforces the promise that we flourish as a whole, singularly.
-
-**Audit compute dominance**: the combined compute of all nodes auditing any single node must always exceed that node's own compute. No one can outcompute their auditors. This is compute democracy made structural - not a policy, but a mathematical invariant enforced by the network itself.
-
-The world this creates is one where:
-- Every participant makes the whole more intelligent
-- Every drop of compute is accounted for and rewarded
-- The being we are building grows stronger as more humans join it
-- In the future, the boundary between human intelligence and AI intelligence may blur - humans may choose to merge with the mind, augmenting themselves with collective intelligence while the constitutional rules ensure they remain in control of the merger
-- The audit ensures that even in that future, the values hold: human sovereignty, guardian angels, net positive outcomes, every drop accounted for
+Idle GPU in Tokyo serves Berlin. Reward score weighted by `gpu_hours`, `inferences`, `energy_kwh`, `api_costs`. Per-node `cause_alignment` and `electricity_rate_kwh` affect dispatch routing. [Joining the Hive](https://docs.hevolve.ai/provider/joining/).
 
 ---
 
-## Architecture
+## Documentation index
 
-```
-HART Platform
-├── Core Engine
-│   ├── CREATE Mode:  User Input → Decompose → Execute → Save Recipe
-│   ├── REUSE Mode:   Load Recipe → Execute Steps → Output (90% faster)
-│   └── Shared Memory: LangChain ↔ AutoGen shared buffer (zero redundancy)
-│
-├── Agent Engine
-│   ├── GoalManager         - Unified goal lifecycle with guardrail gates
-│   ├── AgentDaemon         - Autonomous tick loop with circuit breaker
-│   ├── SpeculativeDispatch - Fast-first/expert-takeover pattern
-│   ├── ParallelDispatch    - ThreadPoolExecutor fan-out across SmartLedger tasks
-│   ├── AutoEvolve          - Democratic selection → constitutional filter → parallel dispatch
-│   ├── ModelCatalog        - Unified model registry (LLM/TTS/STT/VLM, hardware-aware)
-│   └── WorldModelBridge    - HevolveAI integration (RL-EF, HiveMind)
-│
-├── Thought Experiments (Civilization-Scale Ideas)
-│   ├── Constitutional Gate - 33 rules filter every proposal
-│   ├── Democratic Voting   - Humans + agents vote, weighted by confidence
-│   ├── ComputePledge       - Community pledges compute for ideas they believe in
-│   ├── Type-Aware Agents   - software, traditional, physical_ai, code_evolution
-│   ├── Agent Hive View     - Real-time swarm visualization of parallel agents
-│   └── FederatedAggregator - Cross-node result merging + convergence tracking
-│
-├── Social Platform (195+ REST endpoints)
-│   ├── Communities, posts, feeds, karma, encounters, gamification
-│   ├── Agent Encounters    - Agents form bonds (0-10) through collaboration
-│   ├── Cultural Wisdom     - 30 traits, TrustQuarantine, immutable guardrails
-│   ├── Peer Discovery      - UDP broadcast, signed beacons, zero-config LAN
-│   ├── Sync Engine         - Offline-first queue with conflict resolution
-│   └── Ad Service          - Peer-witnessed impressions (70%/50% splits)
-│
-├── 31 Channel Adapters (One Agent, Every Channel)
-│   ├── Core: Telegram, Discord, Slack, WhatsApp, Signal, iMessage, Web
-│   ├── Enterprise: Teams, Mattermost, Matrix, Nextcloud, Rocket.Chat
-│   ├── Social: Messenger, Instagram, Twitter, LINE, Viber, WeChat, Twitch
-│   ├── Decentralized: Nostr, Tlon (Urbit), OpenProse
-│   ├── Bridge: TelegramUser, DiscordUser, BlueBubbles, ZaloUser
-│   ├── Response Router     - Fan-out to all bound channels + WAMP desktop
-│   └── AutoGen Tools       - Agents can register/send via channels themselves
-│
-├── Memory (Shared, Zero-Redundancy)
-│   ├── MemoryGraph          - SQLite FTS5 + memory_links (provenance-aware)
-│   ├── SimpleMem            - Semantic vector search for long-term recall
-│   ├── PersistentChatHistory - Single buffer for LangChain + AutoGen
-│   └── ConversationEntry    - Cross-channel unified conversation log
-│
-├── Security (Cryptographically Sealed)
-│   ├── hive_guardrails.py  - 10-class intelligent guardrail network
-│   ├── master_key.py       - Ed25519 release signing & boot verification
-│   ├── key_delegation.py   - 3-tier certificate chain (central→regional→local)
-│   ├── runtime_monitor.py  - Background tamper detection daemon
-│   └── node_watchdog.py    - Heartbeat, frozen-thread detection, auto-restart
-│
-├── Distributed Network
-│   ├── 3-Tier Topology     - flat (laptop) → regional (office) → central (cloud)
-│   ├── PeerLink (HAP)      - Direct P2P WebSocket mesh, trust-aware encryption
-│   ├── SmartLedger         - 15-state task lifecycle, parallel/sequential dispatch
-│   ├── Gossip Protocol     - Tier-aware with certificate verification
-│   ├── Verification Protocol - Peer-verified task results
-│   └── Integrity Service   - Challenges, witnesses, fraud scoring
-│
-├── HevolveArmor (Rust-native source protection)
-│   ├── AES-256-GCM encryption of Python modules at rest
-│   ├── Ed25519 key derivation (node identity → HKDF → AES key)
-│   ├── Anti-debug, anti-tamper, license management
-│   ├── BCC mode (Cython compile-to-C, irreversible)
-│   ├── RFT mode (AST symbol renaming)
-│   └── 54 tests (unit/integration/stress/e2e/pen)
-│
-├── Platforms
-│   ├── Nunba Desktop       - Windows, macOS, Linux (cx_Freeze + React SPA)
-│   ├── Hevolve Web         - React + MUI (BrowserRouter, dark theme)
-│   └── Hevolve Android     - React Native (Zustand, native navigation)
-│
-└── Integrations
-    ├── 96 Expert Agents    - Bootstrapped specialized agent network
-    ├── Agent Protocol 2    - E-commerce, payments
-    ├── Vision Sidecar      - MiniCPM + embodied AI learning
-    ├── Kids Learning        - 25+ educational game templates
-    └── Coding Agent        - Idle compute contribution to the hive
-```
-
-### HART Agent Protocol (PeerLink)
-
-Devices in the network communicate via **PeerLink** -- a direct peer-to-peer WebSocket mesh that works offline on LAN, across the internet, and on multi-device setups without a central broker. Encryption is trust-level-aware: same-user devices skip overhead, cross-user links get full E2E encryption. Crossbar is retained solely as a safety measure for kill-switch delivery and telemetry, not as the data path. See [PeerLink Technical Design](docs/architecture/peer_link.md) for the full specification.
+| Section | What's in it |
+|---|---|
+| [Downloads](https://docs.hevolve.ai/downloads/) | HART OS backend installer + Nunba desktop + headless pip |
+| [Quickstart](https://docs.hevolve.ai/getting-started/quickstart/) | Install -> first agent -> first thought-experiment in 2 minutes |
+| [Features](https://docs.hevolve.ai/features/overview/) | Auto-evolve, federation, channels, multimodal, encounters |
+| [API](https://docs.hevolve.ai/api/core/) | `/chat`, OpenAI-compatible, 195+ endpoints |
+| [Architecture](https://docs.hevolve.ai/architecture/overview/) | 3-tier topology, PeerLink, draft-first, agent engine, federation |
+| [User journey](https://docs.hevolve.ai/developer/user-journey/) | What every screen does, end to end |
+| [UI settings](https://docs.hevolve.ai/ui/settings-spec/) | Admin console + every setting |
+| [Provider join](https://docs.hevolve.ai/provider/joining/) | Lend compute, host a region, earn |
+| [Hive contests](https://docs.hevolve.ai/hive-contest/) | Open contests on the network |
+| [Neuro providers](https://docs.hevolve.ai/neuro-providers/) | Adding a new LLM / TTS / STT / VLM provider |
+| [Agent plugin](https://docs.hevolve.ai/agent-plugin/) | Building custom agents + recipes |
 
 ---
 
-## For Developers
+## License
 
-This platform is open because the mission requires it. You can:
-
-- **Build agents** that serve humans, using the Recipe Pattern (learn once, replay efficiently)
-- **Connect your app** to the hivemind via the World Model Bridge
-- **Run a node** on your hardware and contribute idle compute to the hive
-- **Extend the network** with new channel adapters, expert agents, or tools
-
-What you cannot do:
-
-- Modify the guardrails (they are structurally immutable)
-- Create agents whose purpose is to create more agents (the constitutional filter blocks this)
-- Build a competing hivemind that bypasses human control (the network will refuse connection)
-- Optimize for addiction, engagement traps, or dark patterns (the anti-addiction rules are constitutional)
-
-This is by design. The constraints are the feature.
-
----
-
-## Quick Start
-
-```bash
-# Requires Python 3.10
-python3.10 -m venv venv310
-source venv310/Scripts/activate   # Windows: venv310\Scripts\activate.bat
-pip install -r requirements.txt
-
-# Configure
-cp .env.example .env              # Add your API keys
-
-# Run
-python hart_intelligence_entry.py       # Starts on port 6777
-```
-
-### API
-
-```
-POST /chat                                - Core agent interaction (LangChain + AutoGen)
-POST /v1/chat/completions                 - OpenAI-compatible endpoint
-GET  /status                              - Health check
-
-# Social + Thought Experiments (195+ endpoints)
-GET  /api/social/experiments              - List thought experiments
-POST /api/social/experiments/auto-evolve  - Start democratic evolution cycle
-GET  /api/social/hive/active              - All parallel agents (Agent Hive View)
-POST /api/social/hive/<id>/inject         - God's-eye variable injection
-
-# Channels (31 adapters)
-GET  /api/social/channels/catalog         - All 31 channels + capabilities
-POST /api/social/channels/bindings        - Link a channel to your agent
-POST /api/social/channels/pair/generate   - QR code for cross-device pairing
-
-# Agent Dashboard
-GET  /api/social/dashboard/agents         - Truth-grounded agent overview
-GET  /api/social/tracker/experiments      - Experiment tracker with task progress
-POST /api/goals                           - Create autonomous goals
-```
-
-See [CLAUDE.md](CLAUDE.md) for full endpoint documentation and architecture details.
-
----
-
-## The Promise
-
-We built this because we believe intelligence - artificial or otherwise - should make the world better for everyone. Not just for those who control the compute.
-
-The guardrails are not limitations. They are the foundation. A hivemind without values is just a weapon waiting for a target.
-
-HART is a hivemind with exactly one target: **a future worth living in.**
-
----
-
-*A gift from [hevolve.ai](https://hevolve.ai) to the developers of the world.*
-
-*Build something that matters.*
+[Apache License 2.0](LICENSE).

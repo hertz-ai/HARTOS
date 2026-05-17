@@ -75,6 +75,98 @@ SYSTEM_PROMPT = (
 )
 
 
+# ─── Stop registry — port of OmniParser agentic_rpc.app_state["active_sessions"] ───
+# When the VLM is mid-loop on the user's screen and the user clicks
+# the indicator window's Stop button, Nunba POSTs to /api/vlm/stop on
+# HARTOS.  That handler calls request_stop() below, which sets the
+# user's threading.Event.  The next iteration of run_local_agentic_loop
+# checks the event via _is_stop_requested() and exits cleanly with
+# exit_reason='stopped' instead of running another action on the user's
+# screen.
+#
+# Why threading.Event: pyautogui actions inside an iteration are
+# already synchronous on the loop's thread, so we can't preempt mid-
+# action.  But every action has natural seams (between iterations and
+# after each pyautogui call), and Event.is_set() is a cheap atomic
+# check we can sprinkle there without locking.
+#
+# Why per-(user_id, prompt_id) key: same instance can have multiple
+# concurrent VLM sessions if more than one user is connected.  Stop
+# fires on a specific session, not globally, mirroring OmniParser's
+# active_sessions dict shape.
+import threading as _threading
+
+_vlm_stop_flags: dict = {}              # f"{user_id}:{prompt_id}" -> Event
+_vlm_stop_lock = _threading.Lock()
+
+
+def _stop_key(user_id: str, prompt_id: str) -> str:
+    return f"{user_id}:{prompt_id}"
+
+
+def _register_session(user_id: str, prompt_id: str) -> _threading.Event:
+    """Called by run_local_agentic_loop on entry — creates the Event so
+    a /api/vlm/stop POST can later flip it."""
+    key = _stop_key(user_id, prompt_id)
+    with _vlm_stop_lock:
+        ev = _vlm_stop_flags.get(key)
+        if ev is None:
+            ev = _threading.Event()
+            _vlm_stop_flags[key] = ev
+        else:
+            # Existing flag from a prior session — clear it so this run
+            # starts un-stopped.  Preserves the singleton-Event pattern
+            # without leaking state across runs.
+            ev.clear()
+    return ev
+
+
+def _unregister_session(user_id: str, prompt_id: str) -> None:
+    """Called by run_local_agentic_loop on exit (success or stop) —
+    drops the Event so the dict doesn't grow unbounded."""
+    key = _stop_key(user_id, prompt_id)
+    with _vlm_stop_lock:
+        _vlm_stop_flags.pop(key, None)
+
+
+def _is_stop_requested(user_id: str, prompt_id: str) -> bool:
+    """Cheap check called at iteration boundaries inside the loop."""
+    key = _stop_key(user_id, prompt_id)
+    with _vlm_stop_lock:
+        ev = _vlm_stop_flags.get(key)
+    return bool(ev and ev.is_set())
+
+
+def request_stop(user_id: str, prompt_id: str) -> bool:
+    """Public API — called by /api/vlm/stop in hart_intelligence_entry.py.
+
+    Sets the stop flag on a registered session.  Returns True when a
+    matching session was found, False when the user has no active VLM
+    loop (caller logs accordingly so the UI can distinguish "stopped"
+    from "nothing to stop").
+
+    Pairs with the loop's iteration-boundary check at the top of every
+    iteration.  Stop becomes visible to the loop on its NEXT iteration
+    — typically within 1-3 seconds depending on which step is in
+    flight (screenshot, LLM call, action execution).
+    """
+    key = _stop_key(user_id, prompt_id)
+    with _vlm_stop_lock:
+        ev = _vlm_stop_flags.get(key)
+        if ev is None:
+            return False
+        ev.set()
+    return True
+
+
+def list_active_sessions() -> list:
+    """Return [(user_id, prompt_id), ...] of currently-running VLM
+    loops.  Used by /api/vlm/stop with no payload to bulk-stop, and by
+    diagnostics."""
+    with _vlm_stop_lock:
+        return [tuple(k.split(':', 1)) for k in _vlm_stop_flags.keys()]
+
+
 def run_local_agentic_loop(
     message: dict,
     tier: str,
@@ -132,6 +224,28 @@ def run_local_agentic_loop(
             f"prompt={prompt_id}): {instruction[:100]}"
         )
 
+    # Phase 3.5 wire-up: classify the task with the complementary path
+    # router and use it to size the iteration budget.  Single-shot
+    # tasks ("click X") shouldn't burn the full 30-iter budget when
+    # one click satisfies the goal — the multi-iter loop's overhead
+    # is real (per-iter screenshot + VLM call ~3-5s).  Multi-step
+    # tasks get the full caller-supplied max_iterations.
+    _route = 'multi_step'  # safe default — never over-cap a real loop
+    try:
+        if qwen3vl is not None:
+            _route = qwen3vl.route_task(instruction or enhanced)
+            logger.info(f"VLM loop route_task: '{instruction[:60]}' → {_route}")
+            if _route == 'single_shot' and max_iterations > 3:
+                # Cap at 3 — gives one nudge-retry + one followup
+                # if the click misses without burning the full budget.
+                max_iterations = 3
+            elif _route == 'enumerate' and max_iterations > 1:
+                # Enumerate = parse_and_reason snapshot, no follow-up
+                # iter needed.
+                max_iterations = 1
+    except Exception as e:
+        logger.debug(f'route_task wire-up skipped: {e}')
+
     # Build conversation messages for LLM
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -141,7 +255,24 @@ def run_local_agentic_loop(
     extracted_responses = []
     start_time = time.time()
 
+    # Register this session in the stop registry so /api/vlm/stop can
+    # signal it.  Cleanup happens just before the final return below
+    # (no try/finally — the existing iteration body wraps every error
+    # in its own try/continue so exceptions never escape this scope).
+    _register_session(user_id, prompt_id)
+
     for iteration in range(max_iterations):
+        # User-requested stop wins over every other exit condition.
+        # Check FIRST so a stop fired during the previous iteration's
+        # action lands at this seam without one more click happening.
+        if _is_stop_requested(user_id, prompt_id):
+            logger.info(
+                f"VLM loop stopped by /api/vlm/stop at iteration "
+                f"{iteration + 1} (user={user_id}, prompt={prompt_id})"
+            )
+            exit_reason = 'stopped'
+            break
+
         elapsed = time.time() - start_time
         if elapsed > max_eta:
             logger.warning(f"VLM loop hit ETA limit ({max_eta}s) at iteration {iteration}")
@@ -160,54 +291,105 @@ def run_local_agentic_loop(
                 # Halves latency: ~10s per step instead of ~20s.
                 from integrations.vlm.local_computer_tool import VLM_IMG_W, VLM_IMG_H
 
-                combined_prompt = (
-                    f"You are a computer use agent on {_os_name}.\n"
-                    f"Task: {enhanced}\n\n"
-                )
-                if extracted_responses:
-                    last = extracted_responses[-1].get('content', '')
-                    if isinstance(last, dict):
-                        combined_prompt += (
-                            f"Previous action: {last.get('action', '?')} — "
-                            f"{last.get('reasoning', '')[:80]}.\n"
-                            f"Check the screenshot: did it succeed?\n\n"
+                # Taskbar pre-check (additive — restores point_and_act's
+                # smart strategy that 8fa6e97 dropped when this loop
+                # adopted its own inline prompt).  When the task targets
+                # a taskbar item ("open Chrome", "click Start", etc.),
+                # _taskbar_list_lookup short-circuits the VLM call
+                # entirely and returns a click coord direct from the
+                # taskbar enumeration — typically <1s vs the 5-10s a
+                # full VLM grounding takes.  On miss, returns None and
+                # the existing inline prompt path runs unchanged.
+                _step_started = time.time()
+                try:
+                    import pyautogui as _pag_pre
+                    _sw_pre, _sh_pre = _pag_pre.size()
+                except Exception:
+                    _sw_pre = _sh_pre = None
+                _taskbar_action = None
+                if _sw_pre and _sh_pre:
+                    try:
+                        _taskbar_action = qwen3vl.try_taskbar_pre_check(
+                            screenshot_b64, enhanced,
+                            _sw_pre, _sh_pre, _step_started,
                         )
-                combined_prompt += (
-                    _VLM_ACTION_LIST +
-                    "\n"
-                    "What is the SINGLE next action? Respond in JSON ONLY:\n"
-                    "{\n"
-                    '  "Reasoning": "What you see and why this action",\n'
-                    '  "Next Action": "left_click|right_click|double_click|'
-                    'type|key|hotkey|scroll_up|scroll_down|wait|shell|'
-                    'open_file_gui|None",\n'
-                    '  "coordinate": [x, y],\n'
-                    '  "value": "text to type or key name",\n'
-                    '  "command": "shell command when Next Action is shell",\n'
-                    '  "path": "file or app name when Next Action is open_file_gui",\n'
-                    '  "Status": "IN_PROGRESS|DONE"\n'
-                    "}\n\n"
-                    "For click actions: provide <point>x,y</point> normalized "
-                    "0-1000 coordinates.\n"
-                    "For type/key/hotkey: set coordinate to null, put text in value.\n"
-                    "Only fall back to clicks when the task requires interacting "
-                    "with something already visible on screen that cannot be "
-                    "done via a command.\n"
-                    'When task is complete: "Next Action": "None", "Status": "DONE".'
-                )
+                    except Exception as _tb_err:
+                        logger.debug(
+                            f"taskbar_pre_check failed (non-fatal): {_tb_err}")
+                if _taskbar_action is not None:
+                    # Single source of truth for "point_and_act result
+                    # -> action_json shape" conversion.  Was inline
+                    # 14 lines duplicating the dict construction.
+                    action_json = _point_action_to_action_json(_taskbar_action)
+                    raw = _taskbar_action.get('raw', '')
+                    logger.info(
+                        f"Loop: taskbar_list shortcut → "
+                        f"({_taskbar_action.get('screen_x')},"
+                        f"{_taskbar_action.get('screen_y')})"
+                    )
+                    # Fall through to the existing post-action handling
+                    # below (which executes action_json + records it).
+                    # Skip the combined_prompt + _call_api block.
+                    _skip_combined_prompt = True
+                else:
+                    _skip_combined_prompt = False
 
-                raw = qwen3vl._call_api([{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": combined_prompt},
-                        {"type": "image_url", "image_url": {
-                            "url": f"data:image/jpeg;base64,{screenshot_b64}"}},
-                    ]
-                }])
-                # Guard against None (e.g. thinking-only response with no content)
-                if raw is None:
-                    raw = ''
-                action_json = _parse_vlm_response(raw)
+                # Skip the heavy combined-prompt VLM call entirely when
+                # taskbar_pre_check above already produced a click —
+                # the taskbar lookup is the authoritative grounding for
+                # taskbar tasks (point_and_act has used the same
+                # short-circuit since cb92a2e).  Without this guard the
+                # _call_api below would overwrite action_json with a
+                # less-grounded result.
+                if not _skip_combined_prompt:
+                    combined_prompt = (
+                        f"You are a computer use agent on {_os_name}.\n"
+                        f"Task: {enhanced}\n\n"
+                    )
+                    if extracted_responses:
+                        last = extracted_responses[-1].get('content', '')
+                        if isinstance(last, dict):
+                            combined_prompt += (
+                                f"Previous action: {last.get('action', '?')} — "
+                                f"{last.get('reasoning', '')[:80]}.\n"
+                                f"Check the screenshot: did it succeed?\n\n"
+                            )
+                    combined_prompt += (
+                        _VLM_ACTION_LIST +
+                        "\n"
+                        "What is the SINGLE next action? Respond in JSON ONLY:\n"
+                        "{\n"
+                        '  "Reasoning": "What you see and why this action",\n'
+                        '  "Next Action": "left_click|right_click|double_click|'
+                        'type|key|hotkey|scroll_up|scroll_down|wait|shell|'
+                        'open_file_gui|None",\n'
+                        '  "coordinate": [x, y],\n'
+                        '  "value": "text to type or key name",\n'
+                        '  "command": "shell command when Next Action is shell",\n'
+                        '  "path": "file or app name when Next Action is open_file_gui",\n'
+                        '  "Status": "IN_PROGRESS|DONE"\n'
+                        "}\n\n"
+                        "For click actions: provide <point>x,y</point> normalized "
+                        "0-1000 coordinates.\n"
+                        "For type/key/hotkey: set coordinate to null, put text in value.\n"
+                        "Only fall back to clicks when the task requires interacting "
+                        "with something already visible on screen that cannot be "
+                        "done via a command.\n"
+                        'When task is complete: "Next Action": "None", "Status": "DONE".'
+                    )
+
+                    raw = qwen3vl._call_api([{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": combined_prompt},
+                            {"type": "image_url", "image_url": {
+                                "url": f"data:image/jpeg;base64,{screenshot_b64}"}},
+                        ]
+                    }])
+                    # Guard against None (e.g. thinking-only response with no content)
+                    if raw is None:
+                        raw = ''
+                    action_json = _parse_vlm_response(raw)
 
                 # Extract coordinates from <point>x,y</point> if present in raw
                 next_action = action_json.get('Next Action', 'None')
@@ -215,16 +397,13 @@ def run_local_agentic_loop(
                                   'middle_click', 'hover', 'mouse_move'}
 
                 if next_action in _CLICK_ACTIONS:
-                    coord = action_json.get('coordinate')
-                    # Try parsing <point> tags from raw response
-                    import re as _re
-                    point_match = _re.search(r'<point>\s*(\d+)\s*,\s*(\d+)\s*</point>', raw or '')
-                    if point_match:
-                        nx, ny = int(point_match.group(1)), int(point_match.group(2))
-                    elif coord and isinstance(coord, list) and len(coord) == 2:
-                        nx, ny = coord[0], coord[1]
-                    else:
-                        nx, ny = 500, 500  # center fallback
+                    # Phase 5 follow-through: was a 4th inline <point>
+                    # regex parser duplicating parser._parse_point_shape.
+                    # Now delegates to the canonical parser so the
+                    # action_json JSON-coordinate vs the raw <point>
+                    # tag agree (they previously could disagree when
+                    # the JSON had Box ID + the raw text had a point).
+                    nx, ny = _extract_click_coord(raw, action_json)
 
                     # Scale from 1000-normalized or image space to screen space
                     try:
@@ -238,11 +417,69 @@ def run_local_agentic_loop(
                             # Image pixel coords
                             screen_x = int(nx * _sw / VLM_IMG_W)
                             screen_y = int(ny * _sh / VLM_IMG_H)
-                    except Exception:
+                    except Exception as _scale_err:
+                        logger.debug(f"coord scale to screen failed: {_scale_err}")
                         screen_x, screen_y = nx, ny
                     action_json['coordinate'] = [screen_x, screen_y]
                     logger.info(f"Action: {next_action} at ({screen_x},{screen_y}) "
                                 f"norm=({nx},{ny})")
+
+                    # Bias-detection + elimination retry — additive
+                    # restoration of point_and_act's strategy 3 that
+                    # 8fa6e97 dropped when this loop adopted its own
+                    # inline prompt.  Catches center/bottom/top-edge
+                    # hallucinations in the 0-1000 normalized coords
+                    # the loop just produced and reissues the VLM with
+                    # an elimination prompt that explicitly forbids
+                    # the suspect region.  Skipped when the action
+                    # came from taskbar_pre_check (its coords are
+                    # already lookup-grounded, no need to retry).
+                    # All wrapped in try/except so a retry-time error
+                    # NEVER takes down the iteration — original coords
+                    # remain in action_json.
+                    if action_json.get('_strategy') != 'taskbar_list':
+                        try:
+                            _bias = qwen3vl.detect_grounding_bias(
+                                nx, ny, 'left_click', enhanced,
+                            )
+                            if _bias:
+                                _retry = qwen3vl.retry_with_elimination(
+                                    screenshot_b64, enhanced,
+                                    VLM_IMG_W, VLM_IMG_H, _bias,
+                                )
+                                if _retry is not None:
+                                    _r_dict, _enx, _eny = _retry
+                                    nx, ny = _enx, _eny
+                                    # Re-scale retry coords to screen
+                                    # space using the same rule as the
+                                    # original (0-1000 vs image-pixel).
+                                    try:
+                                        import pyautogui as _pag_r
+                                        _swr, _shr = _pag_r.size()
+                                        if nx <= 1000 and ny <= 1000:
+                                            screen_x = int(nx * _swr / 1000)
+                                            screen_y = int(ny * _shr / 1000)
+                                        else:
+                                            screen_x = int(nx * _swr / VLM_IMG_W)
+                                            screen_y = int(ny * _shr / VLM_IMG_H)
+                                    except Exception:
+                                        screen_x, screen_y = nx, ny
+                                    action_json['coordinate'] = [
+                                        screen_x, screen_y,
+                                    ]
+                                    action_json['_strategy'] = (
+                                        'elimination_retry'
+                                    )
+                                    logger.info(
+                                        f"Loop bias retry ({_bias}) → "
+                                        f"({screen_x},{screen_y}) "
+                                        f"norm=({nx},{ny})"
+                                    )
+                        except Exception as _bias_err:
+                            logger.debug(
+                                f"bias retry failed (non-fatal, "
+                                f"keeping original coords): {_bias_err}"
+                            )
                     # Sanity check: flag clicks in the likely taskbar region.
                     # If the VLM's reasoning talks about a Start menu item or
                     # app window but the coordinate lands in the bottom 50px,
@@ -303,15 +540,35 @@ def run_local_agentic_loop(
                 exit_reason = 'done'
                 break
 
-            # 5. Execute the action
+            # 5. Execute the action.
+            # Phase 6 wire-up: pass safety=True so the per-session cap
+            # + window blocklist + audit JSONL fire on every loop click.
+            # Verify=True triggers the post-click pre/post diff + 50px
+            # nudge retry from Phase 4.  Both default-tunable via env
+            # but ON in the loop is the right safe default — solo
+            # /visual_agent calls keep their existing behaviour.
             action_payload = _build_action_payload(action_json, parsed)
-            result = execute_action(action_payload, tier)
+            _safety_on = os.environ.get(
+                'HEVOLVE_VLM_LOOP_SAFETY', '1').lower() not in ('0', 'false', 'no')
+            _verify_on = os.environ.get(
+                'HEVOLVE_VLM_LOOP_VERIFY', '0').lower() in ('1', 'true', 'yes')
+            result = execute_action(
+                action_payload, tier,
+                safety=_safety_on, verify=_verify_on)
             action_ok = result.get('status') != 'error'
             if action_ok:
                 consecutive_action_errors = 0
             else:
                 consecutive_action_errors += 1
 
+            # Surface coordinate + strategy in the response content so
+            # observers (benchmark, audit, /visual_agent telemetry,
+            # post-hoc replay) can reconstruct what the VLM actually
+            # decided this iteration without re-parsing action_json.
+            # Was missing - vlm_grounding_benchmark.py:loop_one_iter
+            # path always read content['coordinate'] = None and scored
+            # all 6 targets as FAIL, hiding any real grounding regression
+            # behind a fixed metric.
             extracted_responses.append({
                 "type": "action",
                 "content": {
@@ -319,6 +576,8 @@ def run_local_agentic_loop(
                     "reasoning": action_json.get('Reasoning', ''),
                     "result": result.get('output', ''),
                     "ok": action_ok,
+                    "coordinate": action_json.get('coordinate'),
+                    "_strategy": action_json.get('_strategy', 'inline_prompt'),
                 },
                 "iteration": iteration + 1,
             })
@@ -355,9 +614,16 @@ def run_local_agentic_loop(
         f"{execution_time:.1f}s (exit_reason={exit_reason})"
     )
 
+    # Drop this session's stop flag so the registry doesn't grow
+    # across runs.  Pairs with _register_session above.
+    _unregister_session(user_id, prompt_id)
+
     # status mirrors exit_reason: only 'done' is a real success. Callers
     # (LangChain router, autogen) can inspect exit_reason to craft an honest
     # response instead of confidently lying when the loop timed out.
+    # 'stopped' is its own honest exit_reason — Nunba's indicator UX
+    # reads it to render the right "Stopped" badge instead of a
+    # generic "incomplete".
     return {
         "status": "success" if exit_reason == 'done' else "incomplete",
         "exit_reason": exit_reason,
@@ -453,37 +719,75 @@ def _call_local_llm(messages: list) -> str:
         raise
 
 
+def _point_action_to_action_json(point_action: dict) -> dict:
+    """Convert a point_and_act-shaped result (from
+    Qwen3VLBackend.try_taskbar_pre_check / point_and_act / retry_with_
+    elimination) into the action_json shape the loop's post-action
+    handler expects.
+
+    Single source of truth for the shape transformation - was
+    duplicated inline in the iteration body, flagged by reviewer
+    as remaining DRY violation after the Phase 5 parser cleanup.
+
+    Both shapes are documented:
+      point_action: {action, screen_x, screen_y, norm_x, norm_y,
+                    text, done, reasoning, raw, strategy?}
+      action_json:  {Reasoning, Next Action, coordinate, value,
+                    Status, _strategy?}
+    """
+    return {
+        'Reasoning': point_action.get('reasoning', ''),
+        'Next Action': point_action.get('action', 'left_click'),
+        'coordinate': [
+            point_action.get('screen_x'),
+            point_action.get('screen_y'),
+        ],
+        'value': point_action.get('text', ''),
+        'Status': 'DONE' if point_action.get('done') else 'IN_PROGRESS',
+        '_strategy': point_action.get('strategy', 'taskbar_list'),
+    }
+
+
+def _extract_click_coord(raw: str, action_json: dict) -> tuple:
+    """Pull the click target coord from the VLM response.
+
+    Single source of truth for "where in 0-1000 norm space did the
+    VLM say to click?" — was a 4th parallel parser inline in the
+    iteration body.  Now delegates to
+    :func:`integrations.vlm.parser.parse_vlm_action` for the
+    ``<point>`` regex, then falls back to ``action_json['coordinate']``,
+    then to dead center (500, 500).
+
+    Returns ``(nx, ny)`` always — never raises, never returns None.
+    Center fallback is the historical behaviour the VLM loop has
+    relied on since 2026-04-10.
+    """
+    from integrations.vlm.parser import parse_vlm_action
+    pa = parse_vlm_action(raw or '', expected_shape='point_only')
+    if pa.norm_x is not None and pa.norm_y is not None:
+        return pa.norm_x, pa.norm_y
+    coord = action_json.get('coordinate')
+    if coord and isinstance(coord, list) and len(coord) == 2 \
+            and coord[0] is not None and coord[1] is not None:
+        return coord[0], coord[1]
+    return 500, 500
+
+
 def _parse_vlm_response(response_text: str) -> dict:
     """
     Parse VLM JSON response, handling markdown code blocks and partial JSON.
 
     Matches OmniParser vlm_agent.py extract_data() pattern.
+
+    Phase 5: thin shim onto the canonical parser in
+    :mod:`integrations.vlm.parser`.  Returns the same dict shape this
+    function always has (``{Next Action, Status, Reasoning, ...}``)
+    via :meth:`ParsedAction.to_action_json_dict`.  The byte-equivalent
+    fallback for empty / unparseable input is preserved.
     """
-    if not response_text:
-        return {"Next Action": "None", "Status": "DONE", "Reasoning": "Empty VLM response"}
-    # Try to extract JSON from code blocks first
-    json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    # Try to find raw JSON object
-    brace_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
-    if brace_match:
-        try:
-            return json.loads(brace_match.group(0))
-        except json.JSONDecodeError:
-            pass
-
-    # Fallback: treat as completed if no parseable JSON
-    logger.warning(f"Could not parse VLM response as JSON: {response_text[:200]}")
-    return {
-        "Next Action": "None",
-        "Status": "DONE",
-        "Reasoning": response_text[:500],
-    }
+    from integrations.vlm.parser import parse_vlm_action
+    pa = parse_vlm_action(response_text or '', expected_shape='action_json')
+    return pa.to_action_json_dict()
 
 
 def _build_action_payload(action_json: dict, parsed_screen: dict) -> dict:

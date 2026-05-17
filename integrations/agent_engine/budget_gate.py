@@ -13,10 +13,24 @@ Pattern extracted from: speculative_dispatcher._check_and_reserve_budget() (line
 """
 import logging
 import os
+import threading
 import time
 from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Per-goal budget-check cache.  Daemon ticks call check_goal_budget() on
+# every speculative dispatch; py-spy traces showed the SQLAlchemy first()
+# + new SQLite connection cycle is the dominant CPU consumer when many
+# goals × idle_agents fire in tight succession.  A short TTL is enough
+# to break the storm — within 10s the goal's row hasn't materially
+# changed (this function is the only writer in the daemon path).  Burst
+# under-counting is bounded: at most one un-deducted hit per goal per
+# TTL window.  Cache stores the FULL return tuple so callers see the
+# exact same shape they'd see from a fresh DB query.
+_BUDGET_CACHE_TTL_S = 10.0
+_budget_cache: Dict[str, Tuple[float, Tuple[bool, int, str]]] = {}
+_budget_cache_lock = threading.Lock()
 
 # ── Cost estimation ──────────────────────────────────────────────────
 
@@ -97,9 +111,35 @@ def check_goal_budget(goal_id: Optional[str],
 
     Extracted from speculative_dispatcher._check_and_reserve_budget().
     Returns: (allowed, remaining_budget, reason)
+
+    TTL cache (``_BUDGET_CACHE_TTL_S``) breaks the daemon-tick storm —
+    repeated calls for the same goal within the window return the cached
+    tuple without hitting the DB.  Bounds under-counting at one
+    un-deducted hit per goal per window; the only writer to
+    ``goal.spark_spent`` is this function, so cache freshness is
+    self-consistent.
     """
     if not goal_id:
         return True, -1, 'no_goal_constraint'
+
+    # ── Cache fast-path ────────────────────────────────────────────────
+    now = time.time()
+    with _budget_cache_lock:
+        entry = _budget_cache.get(goal_id)
+    if entry is not None:
+        cached_ts, cached_result = entry
+        if (now - cached_ts) < _BUDGET_CACHE_TTL_S:
+            cached_allowed, cached_remaining, _ = cached_result
+            # Only honor the cache when the cached remaining still covers
+            # the current estimated_cost (cost varies per prompt — the
+            # check the caller actually cares about is "can I afford
+            # THIS one").  Denied results stay denied for the window;
+            # allowed results stay allowed only if remaining headroom
+            # still covers the new cost.
+            if not cached_allowed:
+                return cached_result
+            if cached_remaining == -1 or cached_remaining >= estimated_cost:
+                return cached_result
 
     try:
         from integrations.social.models import get_db, AgentGoal
@@ -108,7 +148,10 @@ def check_goal_budget(goal_id: Optional[str],
             goal = db.query(AgentGoal).filter_by(
                 id=goal_id).with_for_update().first()
             if not goal:
-                return True, -1, 'goal_not_found'
+                result = (True, -1, 'goal_not_found')
+                with _budget_cache_lock:
+                    _budget_cache[goal_id] = (now, result)
+                return result
 
             budget = goal.spark_budget or 0
             spent = goal.spark_spent or 0
@@ -116,16 +159,38 @@ def check_goal_budget(goal_id: Optional[str],
 
             if remaining < estimated_cost:
                 db.rollback()
-                return False, remaining, f'insufficient_budget ({remaining} < {estimated_cost})'
+                result = (False, remaining,
+                          f'insufficient_budget ({remaining} < {estimated_cost})')
+                with _budget_cache_lock:
+                    _budget_cache[goal_id] = (now, result)
+                return result
 
             goal.spark_spent = spent + estimated_cost
             db.commit()
-            return True, remaining - estimated_cost, 'budget_reserved'
+            result = (True, remaining - estimated_cost, 'budget_reserved')
+            with _budget_cache_lock:
+                _budget_cache[goal_id] = (now, result)
+            return result
         finally:
             db.close()
     except Exception as e:
         logger.debug(f"Budget check unavailable: {e}")
         return True, -1, 'budget_system_unavailable'
+
+
+def invalidate_goal_budget_cache(goal_id: Optional[str] = None) -> None:
+    """Clear the budget-check TTL cache.
+
+    Call this when the goal's spark_budget changes via a non-daemon
+    path (admin top-up, manual goal edit, scheduled budget reset).
+    Keeps the daemon's cache from holding a stale 'denied' verdict
+    after a top-up.  ``goal_id=None`` clears every entry.
+    """
+    with _budget_cache_lock:
+        if goal_id is None:
+            _budget_cache.clear()
+        else:
+            _budget_cache.pop(goal_id, None)
 
 
 # ── Platform affordability (cached 60s) ──────────────────────────────

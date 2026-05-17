@@ -20,6 +20,7 @@ import atexit
 import json
 import logging
 import os
+import re
 import time
 import uuid
 import threading
@@ -43,6 +44,92 @@ _RESPONSE_ADEQUATE = 'RESPONSE_ADEQUATE'
 # it could handle the question. A confident "none" still takes the
 # fast path; an unsure "none" is treated as a quiet "local".
 _DRAFT_CONFIDENCE_FLOOR = 0.85
+
+# Refusal patterns the draft must NEVER emit.  See the role-contract
+# block in `_build_draft_classifier_prompt` — the draft is the
+# first-responder, NOT the authority on system capability.  Any reply
+# that asserts the system can't do something is a prompt-following
+# failure (or the model slipped a refusal through the system prompt)
+# and must be replaced with a standby + escalation to the expert.
+#
+# Targets HIGH-CONFIDENCE capability refusals only — not legitimate
+# negative phrasing like "I don't know the answer".  Match shape:
+# "I" + negation + (capability noun OR system-action verb).  Word
+# boundaries + IGNORECASE guard against false positives like
+# "I cannot wait to help".
+# Capability verbs the draft might falsely claim it can't perform.
+# Factored out so the refusal-pattern alternatives stay in sync.
+_REFUSAL_VERBS = (
+    r"access|fetch|reach|browse|connect|connect to|read|retrieve|"
+    r"download|verify|view|see|check|crawl|open|load|hit|resolve|"
+    r"directly|currently|presently"
+)
+# Capability nouns paired with "I do(n't| not) have <NOUN>" or
+# "I lack <NOUN>" / "I have no <NOUN>" — anything that frames an
+# absent capability rather than negative recall ("I don't know").
+_REFUSAL_NOUNS = (
+    r"access|tools?|the ability|the capability|permission|a way|any way|"
+    r"built-?in|external|the internet|web access|internet access|"
+    r"means|way to"
+)
+_REFUSAL_PATTERN = re.compile(
+    r"\b(?:"
+    # "I cannot/can't <optional softener> <verb>"
+    r"I (?:can'?t|cannot)\s+"
+    r"(?:directly\s+|currently\s+|presently\s+)?"
+    r"(?:" + _REFUSAL_VERBS + r")"
+    r"|"
+    # "I am unable/not able TO <optional softener> <verb>"
+    # and contraction "I'm unable/not able TO <verb>"
+    # (regex split because "I'm" has no space between I and m,
+    # while "I am" requires the space)
+    r"(?:I'?m|I am)\s+(?:unable|not able)\s+to\s+"
+    r"(?:directly\s+|currently\s+|presently\s+)?"
+    r"(?:" + _REFUSAL_VERBS + r")"
+    r"|"
+    # "I (don't|do not) have <noun>"  e.g. "I don't have built-in tools"
+    r"I do(?:n'?t| not) have\s+"
+    r"(?:" + _REFUSAL_NOUNS + r")"
+    r"|"
+    # "I lack <noun>"  e.g. "I lack access to GitHub"
+    r"I lack\s+(?:" + _REFUSAL_NOUNS + r")"
+    r"|"
+    # "I have no <noun>"  e.g. "I have no tools to retrieve…"
+    r"I have no\s+(?:access|way|tools?|ability|means)"
+    r"|"
+    # "I'm just/only a (large language model|LLM|AI|chatbot|…)"
+    # — split for I'm vs I am as above.
+    r"(?:I'?m|I am) (?:just|only) (?:a|an) "
+    r"(?:large language model|LLM|AI|language model|chatbot|"
+    r"text-based assistant)"
+    r")",
+    re.IGNORECASE,
+)
+
+# Generic standby reply substituted when the draft slips a refusal
+# through. Keeps the user comfortable while the expert path runs.
+# Intentionally short and capability-neutral — the expert's actual
+# answer will replace this within the latency budget.
+_REFUSAL_STANDBY_REPLY = "Let me check that for you…"
+
+
+def _capability_summary_safe() -> str:
+    """Return the runtime capability summary for the draft prompt, or
+    an empty string when the helper itself can't be imported.
+
+    Lazy import — tool_allowlist pulls model_registry / ModelCatalog /
+    MCP / channel subsystems on first call.  In bare unit-test envs
+    those aren't loaded, so we treat any failure as 'no summary' and
+    let the rest of the prompt carry on.  Empty string is the signal
+    the f-string in _build_draft_classifier_prompt skips the section.
+    """
+    try:
+        from integrations.agent_engine.tool_allowlist import (
+            get_capability_summary,
+        )
+        return get_capability_summary() or ""
+    except Exception:
+        return ""
 
 
 class SpeculativeDispatcher:
@@ -189,7 +276,8 @@ class SpeculativeDispatcher:
                              node_id: str = None,
                              agent_persona: Optional[str] = None,
                              preferred_lang: str = 'en',
-                             user_pref: str = 'auto') -> dict:
+                             user_pref: str = 'auto',
+                             agent_bound: bool = False) -> dict:
         """Draft-first dispatch: tiny model answers immediately, signals whether
         to delegate.
 
@@ -277,6 +365,34 @@ class SpeculativeDispatcher:
         draft_reply = parsed.get('reply') or draft_raw.strip()[:500]
         delegate = parsed.get('delegate', 'local')  # default on parse fail
         confidence = float(parsed.get('confidence') or 0.0)
+
+        # REFUSAL GUARD: the draft is the first-responder role, NOT the
+        # authority on system capability. Any reply that asserts the
+        # system can't do something is a prompt-following failure — the
+        # role contract in the classifier prompt explicitly forbids
+        # refusals of this shape.  When the model slips one through
+        # anyway (typically when the user asks for a tool-bound
+        # capability the draft can't see — URL fetch, file read,
+        # GitHub PR check, etc.), we replace the standby with a generic
+        # holding reply and force escalation to the local expert.  The
+        # user never sees the refusal; the expert (with full tool
+        # access) produces the real answer and the SSE/WAMP fan-out
+        # delivers it to replace the standby.
+        # Size-agnostic — same rule applies whether the draft slot
+        # holds a 0.8B, 4B, or 27B model.  None of them see the full
+        # tool registry the expert binds.
+        refusal_overridden = False
+        if draft_reply and _REFUSAL_PATTERN.search(draft_reply):
+            logger.info(
+                "draft-first: refusal detected in draft reply "
+                "(delegate=%r, conf=%.2f) — replacing with standby + "
+                "forcing delegate=local. Original reply prefix: %r",
+                delegate, confidence, draft_reply[:120],
+            )
+            draft_reply = _REFUSAL_STANDBY_REPLY
+            delegate = 'local'
+            refusal_overridden = True
+
         # REASONING-QUALITY GUARD: an unsure "none" is not good enough to
         # ship as the final answer. Promote it to "local" so an expert
         # verifier still runs in the background. Keeps the single
@@ -289,6 +405,30 @@ class SpeculativeDispatcher:
             logger.info(
                 f"draft-first: low-confidence 'none' ({confidence:.2f} < "
                 f"{_DRAFT_CONFIDENCE_FLOOR}) → escalating to local verifier"
+            )
+            delegate = 'local'
+
+        # AGENT-BINDING GUARD: when the caller bound this turn to a
+        # specific agent (prompt_id resolves to a real agent on disk,
+        # not the request-id fallback), the user has chosen a
+        # specialist and expects THAT specialist's voice — not the
+        # 0.8B draft answering in its generic voice.  Even a trivial
+        # greeting like "hi" should pass through the specialist so
+        # its persona / system prompt / tool registry shapes the
+        # reply.  Promote delegate=none → local so the expert path
+        # always takes the turn for agent-bound requests.
+        #
+        # When agent_bound=False (no specific agent in scope, e.g.
+        # default chat or guest free-floating), the draft's "none"
+        # decision stays — the 0.8B can handle trivial questions
+        # without paying the 4B cost.
+        if delegate == 'none' and agent_bound:
+            logger.info(
+                "draft-first: prompt_id=%r is bound to a specific "
+                "agent — escalating delegate=none → 'local' so the "
+                "agent's expert path takes the turn instead of the "
+                "0.8B draft's generic voice.",
+                prompt_id,
             )
             delegate = 'local'
 
@@ -313,6 +453,14 @@ class SpeculativeDispatcher:
                 'latency_ms': draft_latency_ms,
                 'reply_len': len(draft_reply) if draft_reply else 0,
                 'escalated': delegate != parsed.get('delegate', 'local'),
+                # refusal_overridden lets us calibrate per-model adherence
+                # to the role contract.  A draft model with the right
+                # prompt should hit this near-zero — sustained non-zero
+                # rate is a signal that either the prompt isn't being
+                # followed (model too small / fine-tune mismatch) or the
+                # model is the wrong fit for the draft slot on this
+                # hardware.
+                'refusal_overridden': refusal_overridden,
             }
             logger.info(f"draft-telemetry: {json.dumps(_telemetry)}")
         except Exception:
@@ -370,13 +518,16 @@ class SpeculativeDispatcher:
             _lang = ''
         _lang = _lang.strip().lower()[:5]
         if _lang:
-            try:
-                from hart_intelligence_entry import SUPPORTED_LANG_DICT
+            from core.safe_hartos_attr import safe_hartos_attr
+            SUPPORTED_LANG_DICT = safe_hartos_attr('SUPPORTED_LANG_DICT')
+            if SUPPORTED_LANG_DICT is not None:
                 if _lang not in SUPPORTED_LANG_DICT:
-                    logger.debug(f"draft: language_change '{_lang}' not in SUPPORTED_LANG_DICT — ignoring")
+                    logger.debug(
+                        "draft: language_change '%s' not in "
+                        "SUPPORTED_LANG_DICT — ignoring", _lang)
                     _lang = ''
-            except ImportError:
-                pass  # Can't validate — accept the code as-is
+            # else: HARTOS not yet loaded — accept the code as-is, same
+            # fall-through the original ImportError branch had.
         return {
             'response': draft_reply,
             'speculation_id': speculation_id,
@@ -476,7 +627,26 @@ class SpeculativeDispatcher:
 
         Owns ONLY prompt construction — no I/O, no side effects.
         """
-        persona_block = ''
+        # Default brand identity when no explicit persona is supplied.
+        # Without this fall-back, the user's "who are you?" turn drops
+        # through to the underlying model's training-default name
+        # ("I'm Qwen3.5...") because cf3e337 deliberately removed every
+        # "You are <internal-role>" sentence to fix an identity-leak
+        # where the draft echoed "first-responder" architecture jargon.
+        # That fix was correct in spirit but went one step too far —
+        # the BRAND identity (the user-facing product name "Nunba") is
+        # not architecture jargon and is exactly what the user expects
+        # to hear when no per-agent persona is selected.  The
+        # ``agent_persona`` branch below overrides this for any turn
+        # where a specific persona is in scope, so explicit personas
+        # are unaffected.
+        #
+        # Single source of truth — core.constants.NUNBA_BRAND_IDENTITY.
+        # Same constant is imported by Nunba's _fallback_chat in
+        # routes/hartos_backend_adapter.py so the two paths can never
+        # drift on brand wording.
+        from core.constants import NUNBA_BRAND_IDENTITY
+        persona_block = f"{NUNBA_BRAND_IDENTITY}\n\n"
         if agent_persona:
             # Cap the persona at ~800 chars so a long system prompt doesn't
             # blow the 0.8B model's context budget on a single-turn call.
@@ -507,13 +677,75 @@ class SpeculativeDispatcher:
                 f"{_tone}\n\n"
             )
 
+        # Compute the runtime capability summary ONCE per prompt build so
+        # the static-tools / ModelCatalog / MCP / channel walks don't run
+        # twice for the conditional injection below.
+        cap_summary = _capability_summary_safe()
+        cap_block = (
+            f"Available capabilities (the system can do these via the "
+            f"routing path below): {cap_summary}.\n\n"
+            if cap_summary else ""
+        )
+
         return (
             persona_block
             + lang_block
-            + "You are a fast local first-responder. Produce a short reply AND "
+            # ── Job + answering rules — size-agnostic, identity-free ─────
+            # Same wording works whether the draft is 0.8B, 4B, or 27B.
+            # The model in this slot does NOT see the full tool registry
+            # (web fetch, code exec, GitHub, filesystem, vision, computer
+            # control, MCP servers, channels), the user's loaded persona,
+            # multi-turn memory, or the ReAct loop — so it must never
+            # refuse on behalf of the system.
+            #
+            # The 3ea8648 prompt opened with "You are a fast local
+            # first-responder" and the model would echo it verbatim on
+            # "who are you?" → "I'm your fast local first-responder,
+            # ready to assist you right away."  cf3e337 fixed that by
+            # removing every internal-role identity sentence, but went
+            # one step too far — with NO identity at all the 0.8B fell
+            # through to its training-default name ("I'm Qwen…").  The
+            # default brand identity ("You are Nunba…") now lives in
+            # persona_block above, so this section deliberately does
+            # NOT add another "You are <X>" line — only the BRAND
+            # identity above is allowed; INTERNAL-ROLE jargon
+            # ("first-responder", "draft", "classifier") stays out.
+            # All instructions below are phrased as the *job* and
+            # *rules*, never as architecture identity.
+            + "Your job is to produce a short reply to the user AND "
             "classify the user's intent on several independent axes. The "
-            "classification flags are what route the message downstream — "
-            "be accurate.\n\n"
+            "classification flags route the message downstream — be "
+            "accurate.\n\n"
+            # Positive capability summary — primary teaching mechanism so
+            # the model knows what the system CAN do.  Auto-discovered:
+            # static tool list + ModelCatalog (TTS/STT/VLM/video/audio,
+            # rolled up by type) + MCP servers + channels + expert-agent
+            # categories.  Computed once into cap_block above.
+            + cap_block
+            + "ANSWERING RULES — READ BEFORE REPLYING:\n"
+            "You only see this single turn. The system's actual tool / "
+            "integration / capability set is dynamic and not visible from "
+            "here — so you don't get to decide what the system can or "
+            "can't do.  Therefore:\n"
+            "- NEVER write 'I cannot', 'I don't have access', 'I'm unable', "
+            "'I'm just a', 'I do not have the ability', or any phrase "
+            "asserting the system can't do something.\n"
+            "- NEVER claim no internet/tools/file access; you have no way "
+            "to verify what is or isn't reachable.\n"
+            "- You MAY answer directly ONLY for trivial recall, simple "
+            "math, greetings, or questions that need NO live data, NO "
+            "external system access, NO filesystem, NO code execution, "
+            "and NO per-user state beyond this single turn.\n"
+            "- For ANYTHING else (URLs, code, files, current state, "
+            "multi-step reasoning, capability questions): set "
+            "delegate=\"local\" (or \"hive\" for very large requests) "
+            "and write a brief standby reply such as \"Let me check that "
+            "for you…\", \"Looking that up…\", or \"One moment…\".  The "
+            "standby is replaced by the authoritative answer automatically "
+            "— your only job is to keep the user comfortable while that "
+            "runs.\n"
+            "- Refusals are not your call.  If you ever feel the urge to "
+            "refuse: pick a standby instead and delegate.\n\n"
             f"User: {user_prompt}\n\n"
             "Respond with ONE JSON object on a single line and NOTHING else:\n"
             '{"reply": "<your short reply to the user, 1-3 sentences>", '
@@ -1025,23 +1257,62 @@ class SpeculativeDispatcher:
 
     def _deliver_expert_response(self, user_id: str, prompt_id: str,
                                   speculation_id: str, response: str):
-        """Dual-channel async delivery: Crossbar chat topic + TTS pupit topic."""
+        """Dual-channel async delivery: Crossbar chat topic + TTS pupit topic.
+
+        Worker-thread safe — uses ``core.safe_hartos_attr`` to read
+        hart_intelligence symbols without triggering Python's per-module
+        import lock (worker threads racing the canonical loader on the
+        langchain_core / transformers import chain caused multi-minute
+        agent_daemon freezes; resolving via sys.modules avoids the lock).
+        """
+        from core.safe_hartos_attr import safe_hartos_attr
+        from core.peer_link.message_bus import chat_topic_for
+
         # 1. Publish text via canonical publish_async (MessageBus → Crossbar)
         try:
-            from hart_intelligence import publish_async
-            topic = f'com.hertzai.hevolve.chat.{user_id}'
-            publish_async(topic, response)
-        except Exception:
-            pass
+            publish_async = safe_hartos_attr('publish_async')
+            if publish_async is not None:
+                topic = chat_topic_for(user_id)
+                publish_async(topic, response)
+                logger.info(
+                    "Expert chat publish: spec=%s user=%s topic=%s len=%d",
+                    speculation_id, user_id, topic, len(response or ''),
+                )
+            else:
+                logger.info(
+                    "Expert chat publish skipped: spec=%s user=%s — "
+                    "HARTOS publish_async not yet resolvable (loader still "
+                    "initialising). Drop the speculative bubble; the main "
+                    "reply path will deliver when ready.",
+                    speculation_id, user_id,
+                )
+        except Exception as e:
+            logger.warning(
+                "Expert chat publish failed: spec=%s user=%s err=%s",
+                speculation_id, user_id, e,
+            )
 
         # 2. Synthesize TTS and publish to pupit audio topic — ensures speculative
         #    expert improvements get the SAME audio treatment as regular replies
         #    (users on TTS-enabled sessions hear the improved response).
         try:
-            from hart_intelligence_entry import _tts_synthesize_and_publish
-            _tts_synthesize_and_publish(response, str(user_id), speculation_id)
+            _tts_synthesize_and_publish = safe_hartos_attr(
+                '_tts_synthesize_and_publish')
+            if _tts_synthesize_and_publish is not None:
+                _tts_synthesize_and_publish(
+                    response, str(user_id), speculation_id)
+                logger.info(
+                    "Expert TTS publish: spec=%s user=%s",
+                    speculation_id, user_id,
+                )
+            else:
+                logger.info(
+                    "Expert TTS publish skipped: spec=%s user=%s — "
+                    "HARTOS _tts_synthesize_and_publish not yet resolvable.",
+                    speculation_id, user_id,
+                )
         except Exception as e:
-            logger.debug(f"Expert TTS publish skipped: {e}")
+            logger.debug(f"Expert TTS publish failed: spec={speculation_id} err={e}")
 
         logger.info(f"Expert enhancement delivered: spec={speculation_id}, "
                      f"user={user_id}")

@@ -99,8 +99,13 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install pytest
-        run: pip install pytest
+      - name: Install pytest + project deps
+        # tests/conftest.py imports lifecycle_hooks → core.session_cache →
+        # core/__init__.py → core.http_pool → requests, so pytest cannot
+        # collect the test file without the project's runtime deps installed.
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
 
       - name: Run NixOS config tests
         run: pytest tests/unit/test_nixos_configs.py -v

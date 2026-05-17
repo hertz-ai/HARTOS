@@ -1,0 +1,872 @@
+{
+  "screen": "2560x1440",
+  "image": "1024x576",
+  "results": [
+    {
+      "target": "Start button",
+      "strategy": "direct",
+      "got": [
+        968,
+        11
+      ],
+      "expected": [
+        238,
+        977
+      ],
+      "error": 1210.8079946878447,
+      "grade": "BAD",
+      "time": 31.127771854400635,
+      "raw": "<point>968,11</point>"
+    },
+    {
+      "target": "Start button",
+      "strategy": "describe_first",
+      "got": [
+        260,
+        976
+      ],
+      "expected": [
+        238,
+        977
+      ],
+      "error": 22.02271554554524,
+      "grade": "EXACT",
+      "time": 55.06510782241821,
+      "raw": "The Start button is located on the taskbar at the bottom-left corner of the screen.\n<point>260,976</point>"
+    },
+    {
+      "target": "Start button",
+      "strategy": "negative",
+      "got": [
+        974,
+        12
+      ],
+      "expected": [
+        238,
+        977
+      ],
+      "error": 1213.639567581743,
+      "grade": "BAD",
+      "time": 26.429314613342285,
+      "raw": "<point>974,12</point>"
+    },
+    {
+      "target": "Start button",
+      "strategy": "bbox",
+      "got": [
+        44,
+        975
+      ],
+      "expected": [
+        238,
+        977
+      ],
+      "error": 194.0103090044444,
+      "grade": "BAD",
+      "time": 6.355627059936523,
+      "raw": "<box>32,964,57,987</box>"
+    },
+    {
+      "target": "Start button",
+      "strategy": "cot_anchor",
+      "got": [
+        497,
+        973
+      ],
+      "expected": [
+        238,
+        977
+      ],
+      "error": 259.0308861892728,
+      "grade": "BAD",
+      "time": 43.145278453826904,
+      "raw": "Of course. Based on the provided image, here are the coordinates for the Start button.\n\nStep 1: The Start button is near the **bottom** of the screen.\nStep 2: The x position is approximately **49.7%**"
+    },
+    {
+      "target": "Start button",
+      "strategy": "region_then_point",
+      "got": [
+        971,
+        977
+      ],
+      "expected": [
+        238,
+        977
+      ],
+      "error": 733.0,
+      "grade": "BAD",
+      "time": 37.471466064453125,
+      "raw": "<point>971,977</point>"
+    },
+    {
+      "target": "Start button",
+      "strategy": "relative_anchor",
+      "got": [
+        88,
+        972
+      ],
+      "expected": [
+        238,
+        977
+      ],
+      "error": 150.08331019803634,
+      "grade": "BAD",
+      "time": 12.636044979095459,
+      "raw": "<point>88,972</point>"
+    },
+    {
+      "target": "Start button",
+      "strategy": "elimination",
+      "got": [
+        915,
+        613
+      ],
+      "expected": [
+        238,
+        977
+      ],
+      "error": 768.6514164431104,
+      "grade": "BAD",
+      "time": 8.758277893066406,
+      "raw": "<point>915,613</point>"
+    },
+    {
+      "target": "Start button",
+      "strategy": "pixel_hint",
+      "got": [
+        189,
+        10
+      ],
+      "expected": [
+        238,
+        977
+      ],
+      "error": 968.2406725602885,
+      "grade": "BAD",
+      "time": 26.75854206085205,
+      "raw": "<point>189,10</point>"
+    },
+    {
+      "target": "Search icon",
+      "strategy": "direct",
+      "got": [
+        400,
+        981
+      ],
+      "expected": [
+        267,
+        977
+      ],
+      "error": 133.06013678032951,
+      "grade": "OK",
+      "time": 13.343933582305908,
+      "raw": "<point>400,981</point>"
+    },
+    {
+      "target": "Search icon",
+      "strategy": "describe_first",
+      "got": [
+        329,
+        976
+      ],
+      "expected": [
+        267,
+        977
+      ],
+      "error": 62.00806399170998,
+      "grade": "GOOD",
+      "time": 39.99646711349487,
+      "raw": "The Search icon is located on the taskbar at the bottom of the screen, positioned between the Windows Start button and the Microsoft Edge browser icon.\n<point>329,976</point>"
+    },
+    {
+      "target": "Search icon",
+      "strategy": "negative",
+      "got": [
+        464,
+        977
+      ],
+      "expected": [
+        267,
+        977
+      ],
+      "error": 197.0,
+      "grade": "BAD",
+      "time": 29.272074699401855,
+      "raw": "<point>464,977</point>"
+    },
+    {
+      "target": "Search icon",
+      "strategy": "bbox",
+      "got": [
+        371,
+        985
+      ],
+      "expected": [
+        267,
+        977
+      ],
+      "error": 104.30723848324239,
+      "grade": "OK",
+      "time": 41.195271730422974,
+      "raw": "<box>353,971,390,999</box>"
+    },
+    {
+      "target": "Search icon",
+      "strategy": "cot_anchor",
+      "got": null,
+      "expected": [
+        267,
+        977
+      ],
+      "error": 9999,
+      "raw": "HTTPConnectionPool(host='127.0.0.1', port=8080): Read timed out. (read timeout=90)"
+    },
+    {
+      "target": "Search icon",
+      "strategy": "region_then_point",
+      "got": [
+        400,
+        983
+      ],
+      "expected": [
+        267,
+        977
+      ],
+      "error": 133.13526955694348,
+      "grade": "OK",
+      "time": 14.842100620269775,
+      "raw": "<point>400,983</point>"
+    },
+    {
+      "target": "Search icon",
+      "strategy": "relative_anchor",
+      "got": null,
+      "expected": [
+        267,
+        977
+      ],
+      "error": 9999,
+      "raw": "HTTPConnectionPool(host='127.0.0.1', port=8080): Read timed out. (read timeout=90)"
+    },
+    {
+      "target": "Search icon",
+      "strategy": "elimination",
+      "got": [
+        477,
+        977
+      ],
+      "expected": [
+        267,
+        977
+      ],
+      "error": 210.0,
+      "grade": "BAD",
+      "time": 14.675657749176025,
+      "raw": "<point>477,977</point>"
+    },
+    {
+      "target": "Search icon",
+      "strategy": "pixel_hint",
+      "got": [
+        254,
+        13
+      ],
+      "expected": [
+        267,
+        977
+      ],
+      "error": 964.0876516168018,
+      "grade": "BAD",
+      "time": 22.091853141784668,
+      "raw": "<point>254,13</point>"
+    },
+    {
+      "target": "Chrome icon",
+      "strategy": "direct",
+      "got": [
+        604,
+        980
+      ],
+      "expected": [
+        383,
+        977
+      ],
+      "error": 221.02036105300343,
+      "grade": "BAD",
+      "time": 7.600170850753784,
+      "raw": "<point>604,980</point>"
+    },
+    {
+      "target": "Chrome icon",
+      "strategy": "describe_first",
+      "got": [
+        512,
+        977
+      ],
+      "expected": [
+        383,
+        977
+      ],
+      "error": 129.0,
+      "grade": "OK",
+      "time": 28.49491596221924,
+      "raw": "The Chrome icon is located in the taskbar at the bottom of the screen, positioned between the Firefox and Edge icons.\n<point>512,977</point>"
+    },
+    {
+      "target": "Chrome icon",
+      "strategy": "negative",
+      "got": [
+        545,
+        977
+      ],
+      "expected": [
+        383,
+        977
+      ],
+      "error": 162.0,
+      "grade": "BAD",
+      "time": 27.12010669708252,
+      "raw": "<point>545,977</point>"
+    },
+    {
+      "target": "Chrome icon",
+      "strategy": "bbox",
+      "got": [
+        560,
+        930
+      ],
+      "expected": [
+        383,
+        977
+      ],
+      "error": 183.13383084509536,
+      "grade": "BAD",
+      "time": 6.972233533859253,
+      "raw": "<box>553,917,568,944</box>"
+    },
+    {
+      "target": "Chrome icon",
+      "strategy": "cot_anchor",
+      "got": [
+        562,
+        969
+      ],
+      "expected": [
+        383,
+        977
+      ],
+      "error": 179.17868176767013,
+      "grade": "BAD",
+      "time": 70.54189443588257,
+      "raw": "Of course. Based on the provided image, here are the coordinates for the Chrome icon.\n\nStep 1: The Chrome icon is near the **bottom** of the screen, located in the taskbar.\n\nStep 2: The x position is "
+    },
+    {
+      "target": "Chrome icon",
+      "strategy": "region_then_point",
+      "got": [
+        320,
+        977
+      ],
+      "expected": [
+        383,
+        977
+      ],
+      "error": 63.0,
+      "grade": "GOOD",
+      "time": 31.381192922592163,
+      "raw": "<point>320,977</point>"
+    },
+    {
+      "target": "Chrome icon",
+      "strategy": "relative_anchor",
+      "got": [
+        493,
+        977
+      ],
+      "expected": [
+        383,
+        977
+      ],
+      "error": 110.0,
+      "grade": "OK",
+      "time": 13.43588900566101,
+      "raw": "<point>493,977</point>"
+    },
+    {
+      "target": "Chrome icon",
+      "strategy": "elimination",
+      "got": [
+        375,
+        977
+      ],
+      "expected": [
+        383,
+        977
+      ],
+      "error": 8.0,
+      "grade": "EXACT",
+      "time": 27.96814775466919,
+      "raw": "<point>375,977</point>"
+    },
+    {
+      "target": "Chrome icon",
+      "strategy": "pixel_hint",
+      "got": [
+        496,
+        961
+      ],
+      "expected": [
+        383,
+        977
+      ],
+      "error": 114.12712210513327,
+      "grade": "OK",
+      "time": 21.277620553970337,
+      "raw": "<point>496,961</point>"
+    },
+    {
+      "target": "Close button (top-right)",
+      "strategy": "direct",
+      "got": [
+        986,
+        12
+      ],
+      "expected": [
+        985,
+        10
+      ],
+      "error": 2.23606797749979,
+      "grade": "EXACT",
+      "time": 19.963914394378662,
+      "raw": "<point>986,12\""
+    },
+    {
+      "target": "Close button (top-right)",
+      "strategy": "describe_first",
+      "got": [
+        986,
+        10
+      ],
+      "expected": [
+        985,
+        10
+      ],
+      "error": 1.0,
+      "grade": "EXACT",
+      "time": 12.457048892974854,
+      "raw": "The Close button is located in the top-right corner of the window, next to the minimize and maximize buttons.\n<point>986,10</point>"
+    },
+    {
+      "target": "Close button (top-right)",
+      "strategy": "negative",
+      "got": [
+        986,
+        10
+      ],
+      "expected": [
+        985,
+        10
+      ],
+      "error": 1.0,
+      "grade": "EXACT",
+      "time": 19.466776609420776,
+      "raw": "<point>986,10</point>"
+    },
+    {
+      "target": "Close button (top-right)",
+      "strategy": "bbox",
+      "got": [
+        994,
+        44
+      ],
+      "expected": [
+        985,
+        10
+      ],
+      "error": 35.17101079013795,
+      "grade": "GOOD",
+      "time": 24.93533968925476,
+      "raw": "<box>[[957, 11, 994, 44]]</box>"
+    },
+    {
+      "target": "Close button (top-right)",
+      "strategy": "cot_anchor",
+      "got": [
+        950,
+        20
+      ],
+      "expected": [
+        985,
+        10
+      ],
+      "error": 36.40054944640259,
+      "grade": "GOOD",
+      "time": 61.51026368141174,
+      "raw": "Of course. I can help you with that.\n\nBased on the provided image, here are the coordinates for the Close button in the top-right corner of the terminal window:\n\nStep 1: It is near the **top** and **r"
+    },
+    {
+      "target": "Close button (top-right)",
+      "strategy": "region_then_point",
+      "got": [
+        986,
+        12
+      ],
+      "expected": [
+        985,
+        10
+      ],
+      "error": 2.23606797749979,
+      "grade": "EXACT",
+      "time": 20.132824182510376,
+      "raw": "The Close button (top-right) is located in the **TR** region.\n\nIts exact position is:  \n**<point>986,12</point>**"
+    },
+    {
+      "target": "Close button (top-right)",
+      "strategy": "relative_anchor",
+      "got": [
+        972,
+        972
+      ],
+      "expected": [
+        985,
+        10
+      ],
+      "error": 962.0878338280762,
+      "grade": "BAD",
+      "time": 13.89798378944397,
+      "raw": "<point>972,972</point>"
+    },
+    {
+      "target": "Close button (top-right)",
+      "strategy": "elimination",
+      "got": null,
+      "expected": [
+        985,
+        10
+      ],
+      "error": 9999,
+      "grade": "FAIL",
+      "time": 16.727595806121826,
+      "raw": "top-right"
+    },
+    {
+      "target": "Close button (top-right)",
+      "strategy": "pixel_hint",
+      "got": [
+        976,
+        12
+      ],
+      "expected": [
+        985,
+        10
+      ],
+      "error": 9.219544457292887,
+      "grade": "EXACT",
+      "time": 21.173612356185913,
+      "raw": "<point>976,12</point>"
+    },
+    {
+      "target": "File Explorer icon",
+      "strategy": "direct",
+      "got": [
+        686,
+        980
+      ],
+      "expected": [
+        440,
+        977
+      ],
+      "error": 246.01829200285087,
+      "grade": "BAD",
+      "time": 6.907518625259399,
+      "raw": "<point>686,980</point>"
+    },
+    {
+      "target": "File Explorer icon",
+      "strategy": "describe_first",
+      "got": [
+        626,
+        977
+      ],
+      "expected": [
+        440,
+        977
+      ],
+      "error": 186.0,
+      "grade": "BAD",
+      "time": 11.413824796676636,
+      "raw": "The File Explorer icon is located in the taskbar at the bottom of the screen, positioned between the Google Chrome and Microsoft Edge icons.\n<point>626,977</point>"
+    },
+    {
+      "target": "File Explorer icon",
+      "strategy": "negative",
+      "got": [
+        475,
+        977
+      ],
+      "expected": [
+        440,
+        977
+      ],
+      "error": 35.0,
+      "grade": "GOOD",
+      "time": 27.456517219543457,
+      "raw": "<point>475,977</point>"
+    },
+    {
+      "target": "File Explorer icon",
+      "strategy": "bbox",
+      "got": [
+        383,
+        971
+      ],
+      "expected": [
+        440,
+        977
+      ],
+      "error": 57.3149195236284,
+      "grade": "GOOD",
+      "time": 16.43244743347168,
+      "raw": "<box>372,955,395,988</box>"
+    },
+    {
+      "target": "File Explorer icon",
+      "strategy": "cot_anchor",
+      "got": [
+        650,
+        970
+      ],
+      "expected": [
+        440,
+        977
+      ],
+      "error": 210.11663427725088,
+      "grade": "BAD",
+      "time": 60.045082092285156,
+      "raw": "Based on the provided image, here are the coordinates for the File Explorer icon:\n\nStep 1: It is near the **bottom** edge.\nStep 2: x position as % from left: **65%**\nStep 3: y position as % from top: "
+    },
+    {
+      "target": "File Explorer icon",
+      "strategy": "region_then_point",
+      "got": [
+        685,
+        977
+      ],
+      "expected": [
+        440,
+        977
+      ],
+      "error": 245.0,
+      "grade": "BAD",
+      "time": 33.88099241256714,
+      "raw": "<point>685,977</point>"
+    },
+    {
+      "target": "File Explorer icon",
+      "strategy": "relative_anchor",
+      "got": [
+        14,
+        975
+      ],
+      "expected": [
+        440,
+        977
+      ],
+      "error": 426.00469480981076,
+      "grade": "BAD",
+      "time": 6.043686151504517,
+      "raw": "<point>14,975</point>"
+    },
+    {
+      "target": "File Explorer icon",
+      "strategy": "elimination",
+      "got": [
+        441,
+        981
+      ],
+      "expected": [
+        440,
+        977
+      ],
+      "error": 4.123105625617661,
+      "grade": "EXACT",
+      "time": 24.21915364265442,
+      "raw": "<point>441,981</point>"
+    },
+    {
+      "target": "File Explorer icon",
+      "strategy": "pixel_hint",
+      "got": [
+        483,
+        12
+      ],
+      "expected": [
+        440,
+        977
+      ],
+      "error": 965.957556003368,
+      "grade": "BAD",
+      "time": 23.748494386672974,
+      "raw": "<point>483,12</point>"
+    },
+    {
+      "target": "Clock/time display",
+      "strategy": "direct",
+      "got": [
+        968,
+        980
+      ],
+      "expected": [
+        900,
+        977
+      ],
+      "error": 68.06614430096654,
+      "grade": "GOOD",
+      "time": 10.119368553161621,
+      "raw": "<point>968,980</point>"
+    },
+    {
+      "target": "Clock/time display",
+      "strategy": "describe_first",
+      "got": [
+        967,
+        973
+      ],
+      "expected": [
+        900,
+        977
+      ],
+      "error": 67.11929677819934,
+      "grade": "GOOD",
+      "time": 9.086342573165894,
+      "raw": "The clock is located in the bottom-right corner of the screen, within the Windows taskbar.\n<point>967,973</point>"
+    },
+    {
+      "target": "Clock/time display",
+      "strategy": "negative",
+      "got": [
+        974,
+        974
+      ],
+      "expected": [
+        900,
+        977
+      ],
+      "error": 74.06078584514209,
+      "grade": "GOOD",
+      "time": 20.485129356384277,
+      "raw": "<point>974,974</point>"
+    },
+    {
+      "target": "Clock/time display",
+      "strategy": "bbox",
+      "got": [
+        983,
+        947
+      ],
+      "expected": [
+        900,
+        977
+      ],
+      "error": 88.25531145489205,
+      "grade": "OK",
+      "time": 28.568607568740845,
+      "raw": "<box>[[927,924],[983,947]]</box>"
+    },
+    {
+      "target": "Clock/time display",
+      "strategy": "cot_anchor",
+      "got": [
+        960,
+        980
+      ],
+      "expected": [
+        900,
+        977
+      ],
+      "error": 60.07495318350236,
+      "grade": "GOOD",
+      "time": 79.0782790184021,
+      "raw": "Of course. I can help you with that.\n\nBased on the provided image, here are the coordinates for the clock/time display:\n\nStep 1: It is near the **bottom** edge.\nStep 2: The x position is approximately"
+    },
+    {
+      "target": "Clock/time display",
+      "strategy": "region_then_point",
+      "got": [
+        976,
+        976
+      ],
+      "expected": [
+        900,
+        977
+      ],
+      "error": 76.00657866263946,
+      "grade": "GOOD",
+      "time": 18.024513721466064,
+      "raw": "The clock/time display is located in the **Bottom Right (BR)** region.\n\nExact location:  \n<point>976,976</point>"
+    },
+    {
+      "target": "Clock/time display",
+      "strategy": "relative_anchor",
+      "got": [
+        973,
+        973
+      ],
+      "expected": [
+        900,
+        977
+      ],
+      "error": 73.10950690573696,
+      "grade": "GOOD",
+      "time": 8.39591360092163,
+      "raw": "<point>973,973</point>"
+    },
+    {
+      "target": "Clock/time display",
+      "strategy": "elimination",
+      "got": [
+        970,
+        975
+      ],
+      "expected": [
+        900,
+        977
+      ],
+      "error": 70.02856560004639,
+      "grade": "GOOD",
+      "time": 21.754406690597534,
+      "raw": "<point>970,975</point>"
+    },
+    {
+      "target": "Clock/time display",
+      "strategy": "pixel_hint",
+      "got": [
+        962,
+        966
+      ],
+      "expected": [
+        900,
+        977
+      ],
+      "error": 62.96824596572466,
+      "grade": "GOOD",
+      "time": 17.67751431465149,
+      "raw": "<point>962,966</point>"
+    },
+    {
+      "target": "Start button",
+      "strategy": "taskbar_list",
+      "got": [
+        287,
+        987
+      ],
+      "expected": [
+        238,
+        977
+      ],
+      "error": 50.00999900019995,
+      "grade": "GOOD",
+      "raw": "- [Start Menu] <point>287,987</point>"
+    }
+  ]
+}

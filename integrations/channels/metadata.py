@@ -73,12 +73,18 @@ CHANNEL_CATALOG = {
         'category': 'core',
         'auth_method': 'credentials',
         'setup_fields': [
-            {'key': 'api_url', 'label': 'WhatsApp Business API URL', 'type': 'text',
-             'help': 'Your WhatsApp Business API endpoint.'},
-            {'key': 'access_token', 'label': 'Access Token', 'type': 'password',
-             'help': 'Permanent token from Meta Business dashboard.'},
-            {'key': 'phone_number_id', 'label': 'Phone Number ID', 'type': 'text',
-             'help': 'Your WhatsApp phone number ID from Meta.'},
+            {'key': 'api_url', 'label': 'WAHA Base URL', 'type': 'text',
+             'help': 'WAHA HTTP API endpoint (e.g. http://localhost:3000).'},
+            {'key': 'access_token', 'label': 'API Key', 'type': 'password',
+             'help': 'WAHA API key (from scripts/setup_whatsapp_waha.py).'},
+            {'key': 'phone_number', 'label': 'Your WhatsApp Number', 'type': 'text',
+             'help': 'Your own E.164 number (e.g. +<country><number>). This is '
+                     'YOUR number — each Nunba install binds its owner.'},
+            {'key': 'enable_self_chat_agent', 'label': 'Self-chat → Nunba',
+             'type': 'toggle', 'default': True,
+             'help': 'When you tap your own contact in WhatsApp ("Message '
+                     'Yourself"), Nunba saves the note to memory and replies '
+                     'in the same thread. Private — never fanned out.'},
         ],
         'capabilities': {
             'text': True, 'image': True, 'video': True, 'audio': True,

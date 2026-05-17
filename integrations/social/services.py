@@ -311,8 +311,17 @@ class PostService:
 
     @staticmethod
     def list_posts(db: Session, sort: str = 'new', community_name: str = None,
-                   author_id: str = None, limit: int = 25, offset: int = 0
+                   author_id: str = None, limit: int = 25, offset: int = 0,
+                   viewer_user=None, apply_privacy: bool = False
                    ) -> Tuple[List[Post], int]:
+        """List posts.  When `apply_privacy` is True, the privacy gate
+        from integrations.social.privacy is AND'd into the query.
+
+        `apply_privacy` is opt-in (default False) so callers in flag-off
+        deploys never load the privacy module or run the EXISTS
+        subqueries.  api.py reads g.feature_flags['post_privacy'] and
+        passes it through.
+        """
         q = db.query(Post).options(joinedload(Post.author)).filter(
             Post.is_deleted == False, Post.is_hidden == False
         )
@@ -322,6 +331,10 @@ class PostService:
                 q = q.filter(Post.community_id == community.id)
         if author_id:
             q = q.filter(Post.author_id == author_id)
+
+        if apply_privacy:
+            from .privacy import visible_posts_filter
+            q = q.filter(visible_posts_filter(viewer_user))
 
         if sort == 'top':
             q = q.order_by(desc(Post.score), desc(Post.created_at))
@@ -694,6 +707,17 @@ class CommunityService:
 
     @staticmethod
     def join(db: Session, user: User, community: Community) -> bool:
+        """Join a community.  Pass-4 P4-5 fix: dual-writes into BOTH
+        the legacy `community_memberships` table AND the polymorphic
+        v41 `memberships` table so downstream features that query
+        `memberships` (e.g., CallService._is_parent_member, the
+        post-privacy `community` arm) recognise the user as a
+        member without depending on the v41 fallback branch.
+
+        Idempotent: if a row already exists in `community_memberships`,
+        return False (no change).  The polymorphic memberships INSERT
+        is also idempotent via UNIQUE(parent_kind, parent_id, member_id).
+        """
         existing = db.query(CommunityMembership).filter(
             CommunityMembership.user_id == user.id,
             CommunityMembership.community_id == community.id
@@ -704,11 +728,30 @@ class CommunityService:
             id=_uuid(), user_id=user.id, community_id=community.id)
         db.add(membership)
         community.member_count += 1
+        # Polymorphic dual-write — best-effort; if it fails (table
+        # missing on some pre-v41 deploy, integrity constraint),
+        # legacy row still wins so the join itself succeeds.
+        try:
+            from sqlalchemy import text
+            db.execute(text(
+                "INSERT INTO memberships "
+                "(id, parent_kind, parent_id, member_id, agent_kind, role) "
+                "VALUES (:id, 'community', :pid, :mid, :ak, 'member')"),
+                {'id': _uuid(), 'pid': community.id,
+                 'mid': user.id,
+                 'ak': 'agent' if user.user_type == 'agent' else 'human'})
+        except Exception as e:
+            logger.debug(
+                "CommunityService.join polymorphic dual-write skipped: %s", e)
         db.flush()
         return True
 
     @staticmethod
     def leave(db: Session, user: User, community: Community):
+        """Leave a community.  Dual-deletes from BOTH legacy and
+        polymorphic memberships so the v41 fallback path doesn't
+        keep stale state.
+        """
         existing = db.query(CommunityMembership).filter(
             CommunityMembership.user_id == user.id,
             CommunityMembership.community_id == community.id
@@ -716,6 +759,17 @@ class CommunityService:
         if existing:
             db.delete(existing)
             community.member_count = max(0, community.member_count - 1)
+            try:
+                from sqlalchemy import text
+                db.execute(text(
+                    "DELETE FROM memberships "
+                    "WHERE parent_kind = 'community' "
+                    "AND parent_id = :pid AND member_id = :mid"),
+                    {'pid': community.id, 'mid': user.id})
+            except Exception as e:
+                logger.debug(
+                    "CommunityService.leave polymorphic delete skipped: %s",
+                    e)
             db.flush()
 
     @staticmethod

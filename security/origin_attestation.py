@@ -36,7 +36,7 @@ logger = logging.getLogger('hevolve_security')
 
 # These values are the DNA of HART OS. A fork that changes them
 # fails attestation. A fork that keeps them admits it's HART OS
-# (and must comply with the BSL license).
+# (and must comply with the Apache-2.0 license).
 
 ORIGIN_IDENTITY = {
     'name': 'HART OS',
@@ -91,14 +91,44 @@ def verify_brand_markers(code_root: str = None) -> Tuple[bool, str]:
     A fork that strips branding fails this check.
     A fork that keeps branding admits it's HART OS (BSL license applies).
     """
-    root = code_root or os.environ.get(
-        'HEVOLVE_CODE_ROOT',
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    )
+    # Resolution order for code root - first existing wins:
+    #   1. explicit code_root arg
+    #   2. HEVOLVE_CODE_ROOT env var
+    #   3. parent of this file (repo / pip-installed package layout)
+    #   4. sys.prefix/share/hartos (system install layout)
+    #   5. sibling 'hart_intelligence' package dir (Nunba-bundled layout)
+    # The fallback list catches the case where Nunba pip-installs HARTOS
+    # to a venv but the LICENSE file lands at the venv share/ not next to
+    # the package - was producing "Origin attestation FAILED: Missing
+    # required file: LICENSE" WARNINGs every boot in the bundled install.
+    explicit = code_root or os.environ.get('HEVOLVE_CODE_ROOT')
+    candidate_roots = []
+    if explicit:
+        candidate_roots.append(explicit)
+    candidate_roots.append(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    try:
+        import sys as _sys
+        candidate_roots.append(os.path.join(_sys.prefix, 'share', 'hartos'))
+    except Exception:
+        pass
+    try:
+        import hart_intelligence as _hi
+        candidate_roots.append(os.path.dirname(_hi.__file__))
+    except Exception:
+        pass
 
     for rel_path, marker in BRAND_MARKER_FILES.items():
-        full_path = os.path.join(root, rel_path)
-        if not os.path.exists(full_path):
+        # Pick the first candidate root where this file actually exists.
+        full_path = None
+        for r in candidate_roots:
+            if not r:
+                continue
+            cand = os.path.join(r, rel_path)
+            if os.path.exists(cand):
+                full_path = cand
+                break
+        if full_path is None:
             return False, f'Missing required file: {rel_path}'
         try:
             with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:

@@ -724,3 +724,142 @@ def get_dispatcher() -> HiveTaskDispatcher:
             if _dispatcher is None:
                 _dispatcher = HiveTaskDispatcher()
     return _dispatcher
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Hive ledger reader (L5 acceptance contract)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# The Hive Test Ledger is a durable, append-only markdown file in the
+# user's Claude Code project memory dir.  Every Hive participant pulls
+# open items from the same file so we benchmark Claude Code, Nunba's
+# in-app coding agent, local Qwen, closed APIs, and HF models on the
+# identical task list.  This module is the canonical reader; ledger
+# spec lives inside the file itself (memory/project_hive_test_ledger.md).
+#
+# Parser assumes the ledger uses the standard 6-column markdown table
+# (# | Timestamp | Verbatim ask | Success criterion | Acceptance test |
+# Status) and that no cell contains an unescaped pipe — true by the
+# ledger's own append-only contract.
+
+@dataclass(frozen=True)
+class LedgerEntry:
+    """One row of the Hive Test Ledger."""
+    id: str
+    timestamp: str
+    ask: str
+    success_criterion: str
+    acceptance_test: str
+    status: str
+
+
+def _resolve_ledger_path(explicit: Optional[str] = None) -> Optional[str]:
+    """Find the active project_hive_test_ledger.md.
+
+    Resolution order:
+      1. explicit arg (when caller knows the path)
+      2. HIVE_LEDGER_PATH env var (cross-agent override)
+      3. Most-recently-modified ~/.claude/projects/*/memory/
+         project_hive_test_ledger.md  (Claude-Code default location)
+
+    Returns None if no candidate exists.  Pure read-only — no side
+    effects, no caching.
+    """
+    if explicit:
+        return explicit if os.path.isfile(explicit) else None
+    env = os.environ.get('HIVE_LEDGER_PATH')
+    if env and os.path.isfile(env):
+        return env
+    base = os.path.join(os.path.expanduser('~'), '.claude', 'projects')
+    if not os.path.isdir(base):
+        return None
+    candidates: List[tuple] = []
+    try:
+        projects = os.listdir(base)
+    except OSError:
+        return None
+    for project in projects:
+        path = os.path.join(
+            base, project, 'memory', 'project_hive_test_ledger.md',
+        )
+        if os.path.isfile(path):
+            try:
+                candidates.append((os.path.getmtime(path), path))
+            except OSError:
+                continue
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def _parse_ledger_row(line: str) -> Optional[LedgerEntry]:
+    """Parse one markdown table row into a LedgerEntry, or None if the
+    line is not a data row (header, separator, prose, blank).
+    """
+    line = line.strip()
+    if not line.startswith('|'):
+        return None
+    if line.startswith('|---') or line.startswith('| ---'):
+        return None
+    if line.startswith('| #'):
+        return None
+    # Strip leading + trailing pipes, split on pipe.
+    parts = [p.strip() for p in line.strip('|').split('|')]
+    if len(parts) != 6:
+        return None
+    entry_id, ts, ask, ok, atest, status = parts
+    if not entry_id or entry_id == '#':
+        return None
+    return LedgerEntry(
+        id=entry_id,
+        timestamp=ts,
+        ask=ask.strip('"'),
+        success_criterion=ok,
+        acceptance_test=atest,
+        status=status,
+    )
+
+
+def load_user_ledger(
+    path: Optional[str] = None,
+    include_closed: bool = False,
+) -> List[LedgerEntry]:
+    """Parse the Hive Test Ledger and return open items (default).
+
+    Args:
+        path: explicit ledger file location.  If None, resolves via
+              HIVE_LEDGER_PATH env or auto-discovery under
+              ~/.claude/projects/*/memory/.
+        include_closed: if True, include rows whose status begins
+              with `done_by_` or `claimed_by_`; default returns only
+              rows with status == 'open'.
+
+    Returns:
+        Ordered list of LedgerEntry in file order.  Empty list if the
+        ledger does not exist or contains no parseable rows.  Never
+        raises — read failures degrade to a warning + empty list so
+        agents that depend on this never crash on a missing memory
+        directory.
+    """
+    resolved = _resolve_ledger_path(path)
+    if resolved is None:
+        logger.info('hive_task_protocol.load_user_ledger: no ledger found')
+        return []
+    try:
+        with open(resolved, 'r', encoding='utf-8') as fh:
+            lines = fh.readlines()
+    except OSError as e:
+        logger.warning(
+            'hive_task_protocol.load_user_ledger: read failed %s: %s',
+            resolved, e,
+        )
+        return []
+    out: List[LedgerEntry] = []
+    for line in lines:
+        entry = _parse_ledger_row(line)
+        if entry is None:
+            continue
+        if include_closed or entry.status == 'open':
+            out.append(entry)
+    return out

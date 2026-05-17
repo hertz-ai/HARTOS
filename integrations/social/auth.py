@@ -112,11 +112,29 @@ def generate_api_token() -> str:
     return secrets.token_urlsafe(64)
 
 
-def generate_jwt(user_id: str, username: str, role: str = 'flat') -> str:
-    """Generate a LOCAL-scoped JWT (Layer 1). Works offline, survives kill switch."""
+def generate_jwt(user_id: str, username: str, role: str = 'flat',
+                 tenant_id: str = None) -> str:
+    """Generate a LOCAL-scoped JWT (Layer 1). Works offline, survives kill switch.
+
+    Optional `tenant_id` adds a 'tid' claim used by central-cloud
+    deploys to scope all subsequent queries to that tenant.
+    Flat / regional pass tenant_id=None — the claim is omitted and
+    every downstream query treats the request as untenanted (NULL
+    pass-through).  See plan Part E.1.
+
+    SECURITY: When the hardened JWTManager is available, ALL JWTs
+    are issued through it — including tenant-scoped tokens, which
+    are the most security-sensitive scope. Earlier revisions of
+    this function bypassed JWTManager when tenant_id was set; that
+    bypass is removed because it inverted the threat model
+    (cloud tokens getting weaker hardening than flat tokens).
+    JWTManager.generate_access_token now accepts tenant_id directly
+    (security/jwt_manager.py).
+    """
     mgr = _get_jwt_manager()
     if mgr:
-        return mgr.generate_access_token(str(user_id), username)
+        return mgr.generate_access_token(str(user_id), username,
+                                         tenant_id=tenant_id)
     if HAS_JWT:
         import uuid
         payload = {
@@ -129,8 +147,16 @@ def generate_jwt(user_id: str, username: str, role: str = 'flat') -> str:
             'type': 'access',
             'scope': 'local',
         }
+        if tenant_id:
+            payload['tid'] = str(tenant_id)
         return pyjwt.encode(payload, SECRET_KEY, algorithm='HS256')
     return generate_api_token()
+
+
+def generate_jwt_with_tenant(user_id: str, username: str, role: str,
+                             tenant_id: str) -> str:
+    """Convenience wrapper for cloud signups — signs JWT with tid claim."""
+    return generate_jwt(user_id, username, role, tenant_id=tenant_id)
 
 
 def generate_hive_jwt(user_id: str, username: str, role: str = 'flat') -> str:
@@ -212,6 +238,8 @@ def _get_user_from_token(token: str):
     verification should use verify_hive_jwt() explicitly in the endpoint.
 
     Sets Flask g.token_scope to 'local', 'hive', or 'api_token' for callers.
+    Also sets g.token_tenant_id to the JWT 'tid' claim (None for legacy
+    tokens or API-token auth — flat/regional pass-through).
     """
     from .models import get_db, User
 
@@ -225,6 +253,7 @@ def _get_user_from_token(token: str):
                 try:
                     g.token_scope = payload.get('scope', 'local')
                     g.token_node_id = payload.get('node_id', '')
+                    g.token_tenant_id = payload.get('tid')
                 except RuntimeError:
                     pass  # Outside request context (testing)
                 return user, db
@@ -239,6 +268,7 @@ def _get_user_from_token(token: str):
         try:
             g.token_scope = 'api_token'
             g.token_node_id = ''
+            g.token_tenant_id = None  # API tokens are pre-tenancy
         except RuntimeError:
             pass
         return user, db
@@ -246,7 +276,14 @@ def _get_user_from_token(token: str):
 
 
 def require_auth(f):
-    """Decorator: requires valid Bearer token. Sets g.user and g.db."""
+    """Decorator: requires valid Bearer token. Sets g.user and g.db.
+
+    Phase 7a: also sets g.tenant_id (from JWT 'tid' claim) and
+    g.feature_flags. Cloud deployments enforce that 'tid' is present
+    when HEVOLVE_CLOUD_MODE=true; flat/regional pass through with
+    g.tenant_id=None which downstream code treats as untenanted
+    (NULL match in tenant_id-scoped queries — see plan Part E.1).
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
         auth_header = request.headers.get('Authorization', '')
@@ -263,6 +300,22 @@ def require_auth(f):
         g.user = user
         g.user_id = str(user.id)
         g.db = db
+        # Tenant + feature flags. _get_user_from_token sets
+        # g.token_tenant_id; we promote it to g.tenant_id for
+        # downstream code. In cloud mode, missing tid is fatal.
+        tenant_id = getattr(g, 'token_tenant_id', None)
+        if os.environ.get('HEVOLVE_CLOUD_MODE', '').lower() == 'true' and not tenant_id:
+            db.close()
+            return jsonify({
+                'success': False,
+                'error': 'Tenant required (cloud mode)',
+            }), 403
+        g.tenant_id = tenant_id
+        try:
+            from .feature_flags import get_flags_for_tenant
+            g.feature_flags = get_flags_for_tenant(db, tenant_id)
+        except ImportError:
+            g.feature_flags = {}
         try:
             result = f(*args, **kwargs)
             db.commit()
@@ -278,7 +331,15 @@ def require_auth(f):
 
 
 def optional_auth(f):
-    """Decorator: attaches user if token present, but doesn't require it."""
+    """Decorator: attaches user if token present, but doesn't require it.
+
+    Phase 7a: sets g.tenant_id and g.feature_flags identically to
+    require_auth, with the addition that anonymous (no-token)
+    requests get tenant_id=None (untenanted) and flags from the
+    public default set — used by listing/discovery routes that
+    don't need a logged-in user but should still respect tenancy
+    when a JWT happens to be presented.
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
         auth_header = request.headers.get('Authorization', '')
@@ -293,6 +354,13 @@ def optional_auth(f):
             g.user = None
             g.user_id = None
             g.db = get_db()
+
+        g.tenant_id = getattr(g, 'token_tenant_id', None)
+        try:
+            from .feature_flags import get_flags_for_tenant
+            g.feature_flags = get_flags_for_tenant(g.db, g.tenant_id)
+        except ImportError:
+            g.feature_flags = {}
 
         try:
             result = f(*args, **kwargs)

@@ -151,9 +151,15 @@ def parse_date(date_str):
 
 
 def publish_async(topic, message, timeout=2.0):
-    """Delegate to the canonical publish_async in hart_intelligence."""
-    from hart_intelligence import publish_async as _publish
-    _publish(topic, message, timeout)
+    """Delegate to the canonical publish_async in hart_intelligence.
+
+    Singleton accessor — see core.safe_hartos_attr docstring for why
+    workers must not eager-import the heavy chain.
+    """
+    from core.safe_hartos_attr import safe_hartos_attr
+    _publish = safe_hartos_attr('publish_async')
+    if _publish is not None:
+        _publish(topic, message, timeout)
 
 scheduler = BackgroundScheduler()
 scheduler.start()
@@ -1533,8 +1539,11 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     def register_visual_watcher(
         input_text: Annotated[str, "CONDITION: ... | ACTION: ... | TTL: minutes"]
     ) -> str:
-        from hart_intelligence_entry import _handle_visual_watcher_tool
-        return _handle_visual_watcher_tool(input_text)
+        from core.safe_hartos_attr import safe_hartos_attr
+        _handle = safe_hartos_attr('_handle_visual_watcher_tool')
+        if _handle is None:
+            return "Visual watcher unavailable: HARTOS still initialising."
+        return _handle(input_text)
 
     # --- SimpleMem long-term memory tools ---
     if simplemem_store is not None:
@@ -2469,7 +2478,10 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             register_ip_protection_tools(helper, assistant, user_id)
             current_app.logger.info("IP protection tools loaded (Tier 2) for reuse agent")
     except Exception as e:
-        current_app.logger.debug(f"Goal-aware tool loading skipped: {e}")
+        # Same observability promotion as create_recipe.py — a failure
+        # here strips the agent of goal-specific tools, agent talks
+        # without acting.  Caught loud so future regressions surface.
+        current_app.logger.warning(f"Goal-aware tool loading FAILED: {e}")
 
     assistant.description = 'Designed to handle specific tasks by interacting directly with other agents or the user. It acts as the primary orchestrator for task management and ensures tasks are completed efficiently'
     user_proxy.description = 'Acts as a user, performing tasks assigned by the Assistant Agent. It simulates user actions and provides results or feedback as required.'

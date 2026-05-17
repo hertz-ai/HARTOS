@@ -116,6 +116,46 @@ def is_user_recently_active() -> bool:
     return (_time.time() - _last_user_chat_at) < _USER_CHAT_COOLDOWN
 
 
+def should_yield_to_user() -> bool:
+    """Single canonical gate every background daemon must call.
+
+    Returns True when the daemon must skip its tick / iteration
+    (yield CPU, GIL, LLM, GPU to the user-facing path).  Two
+    independent yield reasons:
+
+    1. ``is_user_recently_active()`` — user chatted in the last 10
+       minutes or a CREATE pipeline is running.
+    2. ``model_lifecycle.get_system_pressure().throttle_factor < 0.1``
+       — VRAM/CPU pressure is so high the throttle factor has
+       collapsed; running another LLM call would saturate the
+       system and starve the user.
+
+    Both checks are best-effort — failure to import / read either
+    signal returns False (don't block daemons on a missing module).
+    The function is the single source of truth for daemon yield
+    semantics: ``agent_daemon._tick``,
+    ``agent_daemon._proactive_hive_tick``, and
+    ``hive_benchmark_prover._continuous_loop`` all consult it,
+    so adding a third yield reason (e.g. CPU-overload from
+    psutil, or a future battery-saver mode) means editing exactly
+    this function — no per-daemon copy-paste.
+    """
+    try:
+        if is_user_recently_active():
+            return True
+    except Exception:
+        pass
+    try:
+        from integrations.service_tools.model_lifecycle import (
+            get_model_lifecycle_manager)
+        _pressure = get_model_lifecycle_manager().get_system_pressure()
+        if _pressure.get('throttle_factor', 1.0) < 0.1:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _notify_watchdog_llm_start():
     """Tell the watchdog the current thread is blocked on a legitimate LLM call.
 

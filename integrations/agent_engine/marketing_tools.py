@@ -281,12 +281,23 @@ def register_marketing_tools(helper, assistant, user_id: str):
         logger.debug(f"Marketing skill registration skipped: {e}")
 
 
-def detect_goal_tags(prompt: str) -> list:
+def detect_goal_tags(prompt) -> list:
     """Detect goal type tags from a prompt for category-based tool loading.
 
     Returns list of tags like ['marketing'], ['coding'], or [] for general.
+
+    Accepts any input — the autogen agent-creation path
+    (``create_recipe.py:1735``) sometimes hands HARTOS's own
+    ``helper.Action`` object (``helper.py:1363``, the multi-step task
+    tracker) instead of a raw string.  Without coercion,
+    ``prompt.lower()`` raises ``AttributeError: 'Action' object has no
+    attribute 'lower'`` and the surrounding ``except`` swallows it
+    silently — leaving the agent with NO goal-specific tools
+    registered, so the LLM produces prose instead of taking real
+    actions.  Root cause for ~6+ weeks of marketing goals "completing"
+    without any outreach side-effects.
     """
-    lower = prompt.lower()
+    lower = str(prompt).lower()
     tags = []
 
     marketing_keywords = [

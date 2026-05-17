@@ -421,11 +421,25 @@ def _publish_chunk_result(publish_id: str, chunk_data: dict):
     if not publish_id:
         return
     try:
-        from hart_intelligence import publish_async
+        from core.safe_hartos_attr import safe_hartos_attr
+        publish_async = safe_hartos_attr('publish_async')
+        if publish_async is None:
+            logger.debug(
+                "Video chunk publish skipped: HARTOS publish_async "
+                "unresolvable — publish_id=%s", publish_id,
+            )
+            return
         topic = f'com.hertzai.pupit.{publish_id}'
         publish_async(topic, json.dumps(chunk_data))
+        logger.debug(
+            "Video chunk published: publish_id=%s topic=%s",
+            publish_id, topic,
+        )
     except Exception as e:
-        logger.debug("Chunk publish failed: %s", e)
+        logger.debug(
+            "Video chunk publish failed: publish_id=%s err=%s",
+            publish_id, e,
+        )
 
 
 def _publish_status(user_id: str, message: str, request_id: str = ''):

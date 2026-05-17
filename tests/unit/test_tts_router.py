@@ -518,7 +518,8 @@ class TestEngineRegistry:
         (Kokoro 82M added):
 
           GPU / voice-clone tier:  chatterbox_turbo, chatterbox_ml,
-                                    cosyvoice3, f5_tts, indic_parler
+                                    cosyvoice3, f5_tts, indic_parler,
+                                    omnivoice (universal 646 langs)
           CPU / neural tier:        kokoro
           CPU / deterministic:      piper
           Legacy / cloud fallbacks: luxtts, pocket_tts, espeak, makeittalk
@@ -527,7 +528,7 @@ class TestEngineRegistry:
         expected = {
             # GPU voice-clone
             'chatterbox_turbo', 'chatterbox_ml', 'cosyvoice3', 'f5_tts',
-            'indic_parler',
+            'indic_parler', 'omnivoice',
             # CPU neural
             'kokoro',
             # CPU deterministic

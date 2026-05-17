@@ -414,10 +414,90 @@ class TestPersonaInjection:
     persona must be threaded through so the standby reply comes back
     in character instead of generic first-responder voice."""
 
-    def test_no_persona_no_persona_block(self, dispatcher):
+    def test_no_persona_uses_default_brand_identity(self, dispatcher):
+        """When no per-agent persona is passed, the prompt falls back
+        to the default brand identity ('You are Nunba…') instead of
+        the playing-a-persona wrapper.  Distinct from
+        test_persona_is_prepended which exercises the explicit-persona
+        path."""
         built = dispatcher._build_draft_classifier_prompt('hi there')
-        assert 'persona' not in built.lower()
-        assert 'You are a fast local first-responder' in built
+        # No "playing the following persona" wrapper — that's the
+        # explicit-persona path, this is the default-identity path.
+        assert 'playing the following persona' not in built
+        # Default brand identity is present so the 0.8B doesn't
+        # fall through to its training-default name ("I'm Qwen…").
+        assert 'You are Nunba' in built
+        # The job preamble + answering rules must both be present so
+        # the 0.8B knows what to do with the JSON schema below.
+        assert 'Your job is to produce a short reply' in built
+        assert 'ANSWERING RULES' in built
+
+    def test_prompt_carries_capability_summary(self, dispatcher):
+        """The draft must see a positive capability list so it knows
+        what the system CAN do — primary teaching mechanism that
+        replaces relying solely on negative 'never refuse' rules.
+
+        Auto-discovered from tool_allowlist + ModelCatalog + MCP +
+        channels + expert agents.  The test environment has at least
+        the static tool slice loaded (tool_allowlist is import-pure),
+        so 'web search' should appear regardless of which optional
+        subsystems are wired up at test time.
+        """
+        built = dispatcher._build_draft_classifier_prompt('hi there')
+        assert 'Available capabilities' in built, (
+            "draft prompt missing the positive capability summary"
+        )
+        # Static tool slice is always present; one canonical entry
+        # acts as the smoke check that summary plumbing is wired.
+        assert 'web search' in built
+
+    def test_every_static_tool_has_description(self):
+        """Drift guard: every name in _FAST_TOOLS|_BALANCED_TOOLS must
+        have an entry in _TOOL_DESCRIPTIONS, otherwise a new tool
+        added at the allowlist gets surfaced to the draft prompt by
+        its raw identifier ('post_content' instead of 'post content')
+        — workable but ugly.  Catches the drift on PR rather than in
+        prod.
+        """
+        from integrations.agent_engine.tool_allowlist import (
+            _FAST_TOOLS, _BALANCED_TOOLS, _TOOL_DESCRIPTIONS,
+        )
+        all_tools = _FAST_TOOLS | _BALANCED_TOOLS
+        missing = sorted(all_tools - set(_TOOL_DESCRIPTIONS))
+        assert not missing, (
+            f"_TOOL_DESCRIPTIONS is missing entries for: {missing}.  "
+            "Add a ≤3-word phrase per name so the draft prompt's "
+            "capability summary stays human-readable."
+        )
+
+    def test_prompt_has_no_identity_statement(self, dispatcher):
+        """Regression: the 3ea8648 prompt opened with 'You are a fast
+        local first-responder' and the role contract reinforced 'You
+        are the first-responder, NOT the authority' — the 0.8B then
+        echoed it verbatim on 'who are you?', producing 'I'm your fast
+        local first-responder, ready to assist you right away.'
+
+        Fix is structural: never tell the model what it IS, only what
+        its JOB is and what RULES to follow.  The model then falls
+        through to its own training-default generic-assistant identity
+        when asked, instead of reflecting an internal architecture
+        term.
+
+        Guard: no 'You are <internal-role-name>' positive identity
+        statement may appear in the built prompt.
+        """
+        built = dispatcher._build_draft_classifier_prompt('who are you?')
+        for forbidden in (
+            'You are a fast local first-responder',
+            'You are the first-responder',
+            'You are a draft',
+            'You are a classifier',
+            'You are a fast model',
+            'You are a local model',
+        ):
+            assert forbidden not in built, (
+                f"prompt leaked internal role identity: {forbidden!r}"
+            )
 
     def test_persona_is_prepended(self, dispatcher):
         persona = (
@@ -473,6 +553,88 @@ class TestPersonaInjection:
         # Both should omit the persona block
         assert 'persona' not in built_empty.lower()
         assert 'persona' not in built_none.lower()
+
+
+class TestAgentBindingGuard:
+    """When the user picked a specific agent (chat handler passes
+    agent_bound=True), the 0.8B draft must NOT short-circuit the
+    specialist by emitting delegate='none' on a trivial reply.
+
+    Even greetings/small-talk should pass through the agent's expert
+    path so its persona / system prompt / tool registry shape the
+    final reply.  Without this guard a Python coding agent answering
+    'hi' would silently emit the 0.8B's generic 'Hello! How can I
+    help?' instead of the agent's own voice — the user's complaint
+    that surfaced the issue.
+
+    When agent_bound=False (no agent in scope, default chat / guest
+    free-floating), the draft's 'none' decision stays — the 0.8B
+    can handle trivial questions without paying the 4B cost."""
+
+    def test_agent_bound_escalates_none_to_local(
+            self, dispatcher, monkeypatch):
+        _mock_guardrails(monkeypatch)
+        # Draft confidently says delegate=none on a trivial greeting
+        def fake_dispatch(model, prompt, *a, **kw):
+            return ('{"reply": "Hello!", "delegate": "none", '
+                    '"confidence": 0.95}')
+        with patch.object(dispatcher, '_dispatch_to_model',
+                          side_effect=fake_dispatch), \
+             patch.object(dispatcher, '_record_interaction_safely'):
+            result = dispatcher.dispatch_draft_first(
+                'hi', user_id='u1', prompt_id='42',
+                agent_bound=True,
+            )
+        # Guard kicked in — specialist gets the turn.
+        assert result['delegate'] == 'local', (
+            "agent-bound trivial greeting should escalate to local so "
+            "the agent's expert path runs, not short-circuit on the "
+            "0.8B draft's generic voice"
+        )
+        # Standby reply still surfaces for latency comfort.
+        assert result['response'] == 'Hello!'
+
+    def test_no_agent_binding_keeps_none(
+            self, dispatcher, monkeypatch):
+        """Regression: existing behaviour preserved when agent_bound is
+        False (the default).  Free-floating greetings stay short-
+        circuited on the 0.8B — no spurious 4B traffic."""
+        _mock_guardrails(monkeypatch)
+        def fake_dispatch(model, prompt, *a, **kw):
+            return ('{"reply": "Hello!", "delegate": "none", '
+                    '"confidence": 0.95}')
+        with patch.object(dispatcher, '_dispatch_to_model',
+                          side_effect=fake_dispatch), \
+             patch.object(dispatcher, '_record_interaction_safely'):
+            result = dispatcher.dispatch_draft_first(
+                'hi', user_id='u1', prompt_id='anon',
+                # agent_bound defaults to False
+            )
+        assert result['delegate'] == 'none'
+
+    def test_agent_bound_does_not_touch_local_or_hive(
+            self, dispatcher, monkeypatch):
+        """Guard is one-way: only escalates 'none' → 'local'.  Existing
+        'local' / 'hive' decisions pass through untouched so this
+        change can't accidentally re-route requests the draft already
+        decided to delegate."""
+        _mock_guardrails(monkeypatch)
+        for original in ('local', 'hive'):
+            def fake_dispatch(model, prompt, *a, _d=original, **kw):
+                return (
+                    f'{{"reply": "Looking…", "delegate": "{_d}", '
+                    '"confidence": 0.9}'
+                )
+            with patch.object(dispatcher, '_dispatch_to_model',
+                              side_effect=fake_dispatch), \
+                 patch.object(dispatcher, '_record_interaction_safely'):
+                result = dispatcher.dispatch_draft_first(
+                    'analyze this codebase', user_id='u1', prompt_id='42',
+                    agent_bound=True,
+                )
+            assert result['delegate'] == original, (
+                f"agent-bound delegate={original!r} must not be rewritten"
+            )
 
 
 class TestCorrectionIntentClassification:

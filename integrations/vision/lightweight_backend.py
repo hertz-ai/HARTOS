@@ -382,25 +382,43 @@ class Qwen08BBackend(VisionBackend):
         return 800
 
     def is_available(self) -> bool:
+        """True if the backend can answer — server running OR model files present.
+
+        get_vision_backend()'s fallback chain uses this to decide whether to
+        SELECT qwen08b (the preferred captioner) or skip down to the
+        MiniCPM fallback.  The old strict "server must already be listening
+        on port" check caused every boot to skip qwen08b and silently land
+        on MiniCPM (4GB VRAM) because the lazy-start path hadn't launched
+        the server yet.  Returning True when model files exist lets the
+        backend be selected at boot; describe() / start() preserve the
+        original lazy-launch contract — we don't burn VRAM until a frame
+        actually arrives.
+        """
         try:
             resp = pooled_get(f'http://127.0.0.1:{self._port}/health', timeout=2)
-            return resp.status_code == 200
+            if resp.status_code == 200:
+                return True
         except Exception:
-            return False
+            pass
+        home = os.path.expanduser('~')
+        for d in [os.path.join(home, '.nunba', 'models'),
+                  os.path.join(home, '.trueflow', 'models')]:
+            if os.path.isfile(os.path.join(d, 'Qwen3.5-0.8B-UD-Q4_K_XL.gguf')):
+                return True
+        return False
 
     def start(self) -> bool:
-        """Check if 0.8B is available. Does NOT auto-start at boot.
-
-        The 0.8B caption server is started lazily on first describe() call
-        (when actual frames arrive), not at VisionService.start().
-        This avoids wasting GPU memory when no camera/screen stream is active.
-        """
+        """Lazy: don't boot at VisionService.start(). describe() does the
+        launch on the first frame so we don't burn VRAM when the user has
+        no camera/screen stream active."""
         if self.is_available():
             logger.info(f"Qwen3.5-0.8B caption backend ready on port {self._port}")
-            return True
-        # Not running — that's OK. Will be started lazily in describe().
-        logger.info(f"Qwen3.5-0.8B not running — will start on first frame")
-        return True  # Return True so VisionService selects us as backend
+        else:
+            logger.info(
+                "Qwen3.5-0.8B not running — will start on first frame")
+        return True  # Stay selected; lazy start in describe().
+
+        # Find llama-server binary (reuse model_lifecycle's finder)
 
         # Find llama-server binary (reuse model_lifecycle's finder)
         try:

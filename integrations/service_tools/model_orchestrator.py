@@ -635,18 +635,34 @@ class ModelOrchestrator:
             costs ~550 MB + mmproj permanently, which is cheaper than
             paying cold-start cost per request.
 
-          * **Main chat LLMs** (``llm-qwen*-2b*``, ``llm-qwen*-4b*``) →
-            ``pressure_evict_only=True``. Can still evict when VRAM
-            pressure is detected (phase 3), but won't evict on
-            passive idle timeout (phase 7). Before this policy, the
-            2026-04-11 incident showed the 4B being killed every 5
-            minutes mid-session because its 340s idle exceeded the
-            300s timeout, even though nothing else needed the VRAM.
+          * **Main+VLM LLMs** (``llm-qwen*-vl*``, or ``purposes``
+            containing any of ``vision`` / ``caption`` / ``grounding``)
+            → ``pinned=True``. The same llama-server serves both
+            chat AND the VLM agentic loop; losing it kills both
+            surfaces and any in-flight agentic loop has no recovery
+            context.  See 2026-05-03 incident: the 4B-VL died
+            silently between 16:05 and 16:59, no event in any log
+            (Nunba uses ``subprocess.PIPE`` for the main server's
+            stdout and only drains it during startup, so any final
+            output was lost), VRAM freed back to 7.83 GB / 8 GB
+            despite the prior ``pressure_evict_only`` policy.  Pin
+            forces the model to survive every code path including
+            phase-3 pressure eviction.
 
-          * All other models (STT, TTS, vision) keep the default
-            passive idle eviction — their cold start is cheap and
-            the VRAM is better spent on the model the user's about
-            to use next.
+          * **Chat-only main LLMs** (``llm-qwen*-2b*`` /
+            ``llm-qwen*-4b*`` without VL) → ``pressure_evict_only=
+            True``.  Survive passive idle sweep (phase 7), yield
+            under real VRAM pressure (phase 3).  A brief reload
+            costs only chat continuity, no in-flight VLM loop.
+            Before this distinction, the 2026-04-11 incident showed
+            the 4B being killed every 5 minutes mid-session because
+            its 340s idle exceeded the 300s timeout, even though
+            nothing else needed the VRAM.
+
+          * All other models (STT, TTS, standalone vision sidecars)
+            keep the default passive idle eviction — their cold
+            start is cheap and the VRAM is better spent on the
+            model the user's about to use next.
         """
         try:
             from integrations.service_tools.model_lifecycle import (
@@ -670,15 +686,29 @@ class ModelOrchestrator:
                 # Use catalog purpose assignment (admin-configurable).
                 # Fallback: pattern match on ID for backward compat.
                 _purposes = getattr(entry, 'purposes', []) or []
-                if 'draft' in _purposes or (
+                _id_lower = entry.id.lower()
+                _is_draft = 'draft' in _purposes or (
                     not _purposes and any(
-                        t in entry.id.lower() for t in ('0.8b', 'draft', 'caption')
+                        t in _id_lower for t in ('0.8b', 'draft', 'caption')
                     )
-                ):
+                )
+                # Main LLM that ALSO serves VLM (one llama-server with
+                # mmproj loaded — chat + agentic-loop on the same model)
+                # gets pinned.  See the docstring above for the 2026-05-03
+                # silent-death incident.
+                _is_vlm_main = (
+                    not _is_draft and (
+                        any(p in _purposes for p in ('vision', 'caption', 'grounding'))
+                        or (not _purposes and any(
+                            t in _id_lower for t in ('-vl-', '-vlm-', 'mmproj')
+                        ))
+                    )
+                )
+                if _is_draft or _is_vlm_main:
                     _pinned = True
                 else:
-                    # Main chat tier — survive idle sweeps, yield under
-                    # real VRAM pressure.
+                    # Chat-only main tier — survive idle sweeps, yield
+                    # under real VRAM pressure.
                     _pressure_evict_only = True
 
             _priority = ModelPriority.ACTIVE if entry.model_type == 'llm' else ModelPriority.WARM
