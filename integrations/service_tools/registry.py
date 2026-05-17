@@ -11,6 +11,7 @@ Design:
 
 import inspect
 import json
+import keyword
 import logging
 import os
 from dataclasses import dataclass, field
@@ -78,6 +79,18 @@ def _synthesize_signature_from_schema(
             if not isinstance(prop_name, str) or not prop_name.isidentifier():
                 # Skip names that can't be valid Python parameters
                 # (autogen would also reject them).
+                continue
+            if keyword.iskeyword(prop_name):
+                # `'class'.isidentifier()` returns True but
+                # `inspect.Parameter('class', ...)` raises ValueError.
+                # Skip Python hard keywords so they fall back to **kwargs
+                # without poisoning the rest of the signature.  Self-
+                # review v1 (2026-05-15) caught this latent bug —
+                # without the skip, one keyword-named param would raise
+                # mid-loop, the outer try/except would catch it, and
+                # the ENTIRE tool would lose typed signature (degrading
+                # to `**kwargs: Any`).  Per-param skip is strictly
+                # better: kept params stay typed.
                 continue
             if isinstance(prop_spec, dict):
                 json_type = (prop_spec.get('type') or '').lower()
