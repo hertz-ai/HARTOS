@@ -339,6 +339,22 @@ from core.cache_loaders import load_agent_data, load_user_ledger, load_user_simp
 scheduler = BackgroundScheduler()
 scheduler.start()
 
+# Zombie task reaper — clears IN_PROGRESS ledger entries that have not
+# advanced in HEVOLVE_ZOMBIE_TASK_MAX_AGE_HOURS (default 2h).  The
+# reaper hooks the SAME scheduler instance above; no separate daemon
+# process.  Failure to register is non-fatal — the dashboard still
+# surfaces the staleness via status_reason, the reaper just won't
+# auto-clear.  See integrations/agent_engine/zombie_reaper.py for the
+# full rationale + reuse map.
+try:
+    from integrations.agent_engine.zombie_reaper import register_with_scheduler as _register_zombie_reaper
+    _register_zombie_reaper(scheduler)
+except Exception:
+    logging.getLogger(__name__).exception(
+        "zombie_reaper registration failed — dashboard will still surface "
+        "stalled tasks via status_reason but they will not be auto-reaped"
+    )
+
 # atexit shutdown — see reuse_recipe.py:174 for full rationale.  Both
 # modules independently instantiate a BackgroundScheduler at import time
 # and both share the same "RuntimeError: cannot schedule new futures
@@ -2614,6 +2630,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # captures this variable, so it must point to the real GroupChat.
     group_chat = manager._groupchat
 
+    # Agent Ops Console Phase B: register the canonical GroupChat reference
+    # for live drill-down access from /admin/agents drawer.  Uses the same
+    # user_prompt key the rest of the lifecycle uses (user_agents dict,
+    # _ledger_registry, etc.).  Idempotent + no-op safe.
+    try:
+        from lifecycle_hooks import register_groupchat_for_session as _reg_gc
+        _reg_gc(user_prompt, group_chat)
+    except Exception:
+        current_app.logger.debug("groupchat registry hook skipped", exc_info=True)
+
     # Auto-ingest group_chat messages into SimpleMem + shared LangChain buffer
     _original_append = group_chat.messages.append
     def _unified_ingest_hook(msg):
@@ -3253,6 +3279,18 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     time_agent_object['time_group_chat'] = time_group_chat
     time_agent_object['time_manager'] = time_manager
+
+    # Agent Ops Console Phase B: register the time-agent GroupChat for
+    # live drill-down. Same canonical user_prompt key the time_agents
+    # cache uses (caller does `time_agents[user_prompt] = create_time_
+    # agents(...)`); we derive it here from user_id+prompt_id.
+    try:
+        from lifecycle_hooks import register_groupchat_for_session as _reg_gc
+        _reg_gc(f'{user_id}_{prompt_id}', time_group_chat)
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "groupchat registry hook skipped for time_group_chat", exc_info=True)
+
     return time_agent_object
 
 

@@ -441,3 +441,567 @@ class DashboardService:
         base += min(remaining, 100)
 
         return base
+
+    # ─── Agent Ops Console (Phase B) ─────────────────────────────────────
+    # Drill-down endpoints reuse this class so /api/social/dashboard/...
+    # stays the canonical surface — no new blueprint, no new service.
+
+    @staticmethod
+    def get_agent_snapshot(db: Session, agent_id: str) -> Optional[Dict]:
+        """Return the drill-down payload for ONE agent's drawer.
+
+        Combines:
+          - The AgentGoal row (status, status_reason same logic as the
+            list endpoint at _get_agent_goals — single source of truth).
+          - The goal tree from the SmartLedger associated with this
+            agent (walks ledger.tasks for parent/child links).
+          - The most recent dispatcher decision (model + tier + ts)
+            extracted from the existing ImmutableAuditLog 'goal_dispatched'
+            events.  No new metrics table.
+
+        Returns ``None`` when agent_id is not found.  Frontend renders
+        a "agent not found" empty state in that case.
+
+        Phase D will extend this with ETA + p95 from ledger history; for
+        now ``eta`` is None and the drawer hides the row.
+        """
+        try:
+            from .models import AgentGoal
+        except ImportError:
+            return None
+
+        goal = db.query(AgentGoal).filter(AgentGoal.id == str(agent_id)).first()
+        if not goal:
+            return None
+
+        now = datetime.utcnow()
+
+        # Status + status_reason — replicates the per-row logic from
+        # _get_agent_goals so the drawer header matches the card header
+        # the user just clicked.  Defaults to the raw goal.status when
+        # nothing more specific applies.
+        real_status = goal.status
+        status_reason = None
+        try:
+            from .dashboard_service import _get_poll_interval_seconds  # not present; inline
+        except Exception:
+            pass
+        poll_interval = 60
+        if goal.status == 'active' and goal.last_dispatched_at:
+            age = (now - goal.last_dispatched_at).total_seconds()
+            if age > poll_interval * 2:
+                real_status = 'stalled'
+                status_reason = (
+                    f'No dispatch in {int(age)}s '
+                    f'(expected within {poll_interval * 2}s of last tick)'
+                )
+        elif goal.status == 'active' and not goal.last_dispatched_at:
+            real_status = 'idle'
+            status_reason = 'No dispatch recorded yet — awaiting first tick'
+        elif goal.status == 'paused':
+            status_reason = 'Goal paused by user or system'
+        elif goal.status == 'failed':
+            status_reason = 'Last execution returned failure status'
+
+        # Goal tree from the ledger.  Iterate any ledger whose agent_id
+        # matches and emit one node per task.  Parent/child structure
+        # surfaces via task.parent_task_id / task.subtask_ids when
+        # present; otherwise a flat ordered list.
+        tree_nodes: List[Dict] = []
+        try:
+            from integrations.agent_engine.api import _iter_ledgers
+            from agent_ledger import TaskStatus
+            for a_id, session_id, ledger in _iter_ledgers(agent_filter=str(agent_id)):
+                for task in ledger.tasks.values():
+                    try:
+                        tree_nodes.append({
+                            'task_id': getattr(task, 'id', None) or getattr(task, 'task_id', None),
+                            'title': getattr(task, 'title', None) or getattr(task, 'description', ''),
+                            'status': (
+                                task.status.value if hasattr(task.status, 'value')
+                                else str(task.status)
+                            ),
+                            'parent_task_id': getattr(task, 'parent_task_id', None),
+                            'created_at': _isoformat_safe(getattr(task, 'created_at', None)),
+                            'updated_at': _isoformat_safe(
+                                getattr(task, 'heartbeat_at', None)
+                                or getattr(task, 'updated_at', None)
+                            ),
+                            'blocked_reason': getattr(task, 'blocked_reason', None),
+                            'session_id': session_id,
+                        })
+                    except Exception:
+                        logger.debug("skipped malformed task in %s/%s",
+                                     a_id, session_id, exc_info=True)
+        except ImportError:
+            logger.debug("agent_ledger / api._iter_ledgers unavailable — tree omitted")
+
+        # Most recent dispatcher decision — read from ImmutableAuditLog
+        # 'goal_dispatched' events.  This is what dispatch.py:472 writes
+        # per call.  No new metrics surface.
+        last_dispatch: Optional[Dict] = None
+        try:
+            from security.immutable_audit_log import get_audit_log
+            audit = get_audit_log()
+            for entry in audit.query_recent(limit=200) if hasattr(audit, 'query_recent') else []:
+                if entry.get('event_type') != 'goal_dispatched':
+                    continue
+                if entry.get('target_id') != str(agent_id):
+                    continue
+                last_dispatch = {
+                    'timestamp': entry.get('timestamp'),
+                    'model': (entry.get('detail') or {}).get('model_config'),
+                    'tier': (entry.get('detail') or {}).get('model_tier'),
+                    'request_id': (entry.get('detail') or {}).get('request_id'),
+                }
+                break
+        except Exception:
+            logger.debug("audit-log dispatch lookup failed for %s",
+                         agent_id, exc_info=True)
+
+        return {
+            'agent': {
+                'id': str(goal.id),
+                'type': f'{goal.goal_type}_goal',
+                'name': goal.title,
+                'description': goal.description,
+                'status': real_status,
+                'status_reason': status_reason,
+                'priority': goal.priority,
+                'spark_budget': goal.spark_budget,
+                'spark_spent': goal.spark_spent,
+                'owner_id': goal.owner_id,
+                'prompt_id': goal.prompt_id,
+                'created_by': goal.created_by,
+                'last_dispatched_at': _isoformat_safe(goal.last_dispatched_at),
+            },
+            'tree': tree_nodes,
+            'last_dispatch': last_dispatch,
+            'eta': _compute_eta_from_tree(tree_nodes, now=now),
+            'snapshot_ts': now.isoformat() + 'Z',
+        }
+
+    @staticmethod
+    def get_agent_chat_tail(agent_id: str, since_index: int = 0,
+                            limit: int = 50) -> Dict:
+        """Return the latest autogen GroupChat turns for an agent's drawer.
+
+        Reads from the in-process ``_groupchat_registry`` populated by
+        ``create_recipe.py`` at GroupChat instantiation sites.  The
+        registry key is ``f'{owner_id}_{prompt_id}'`` — same convention
+        the rest of the lifecycle uses.
+
+        ``since_index`` is a cursor over the messages list; the drawer
+        polls with the index of the last message it rendered to get
+        only new turns.  This is cheaper + more accurate than time-
+        based polling against a moving messages list.
+
+        Returns ``{messages: [...], next_index: int, registered: bool}``.
+        ``registered=False`` means no GroupChat is in the cache yet —
+        either /chat hasn't run for this agent in this process or 8h
+        TTL evicted it.  Drawer renders "no live conversation captured".
+        """
+        out: Dict = {'messages': [], 'next_index': since_index,
+                     'registered': False}
+        try:
+            from .models import AgentGoal, get_db
+        except ImportError:
+            return out
+
+        # Need owner_id + prompt_id to build the user_prompt key.  One
+        # quick DB lookup; the route handler that calls us already has
+        # an open session but this method is convenient as a standalone.
+        db = get_db()
+        try:
+            goal = db.query(AgentGoal).filter(
+                AgentGoal.id == str(agent_id)).first()
+        finally:
+            db.close()
+        if not goal or not goal.prompt_id:
+            return out
+
+        user_prompt = f'{goal.owner_id or goal.created_by}_{goal.prompt_id}'
+
+        try:
+            from lifecycle_hooks import get_registered_groupchat
+        except ImportError:
+            return out
+        gc = get_registered_groupchat(user_prompt)
+        if gc is None:
+            return out
+        out['registered'] = True
+
+        try:
+            messages = list(gc.messages)
+        except Exception:
+            return out
+
+        total = len(messages)
+        start = max(0, int(since_index or 0))
+        # Cap tail at `limit` even on cold-fetch (since_index=0) so the
+        # drawer doesn't try to render thousands of turns at once.
+        if start == 0 and total > limit:
+            start = total - limit
+
+        slice_ = messages[start:start + limit]
+        out['messages'] = [_serialize_chat_message(m, idx + start)
+                           for idx, m in enumerate(slice_)]
+        out['next_index'] = start + len(slice_)
+        return out
+
+
+# ─── module-level helpers (used by snapshot + chat tail) ─────────────────
+
+def _isoformat_safe(value) -> Optional[str]:
+    """Best-effort ISO formatting that tolerates None / str / datetime."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat() + ('Z' if value.tzinfo is None else '')
+    return str(value)
+
+
+def _serialize_chat_message(msg, idx: int) -> Dict:
+    """Reduce an autogen message dict / object to the drawer's render shape.
+
+    Autogen messages are typically ``{'role': ..., 'content': ..., 'name': ...}``
+    dicts but some plugins yield richer shapes (tool calls, function
+    results).  We keep this defensive — anything we can't classify
+    becomes a generic ``{'index, role, content, raw}`` entry.
+    """
+    if isinstance(msg, dict):
+        role = msg.get('role') or 'assistant'
+        speaker = msg.get('name') or role
+        content = msg.get('content')
+        if isinstance(content, list):
+            # OpenAI vision-style multipart content — flatten to text.
+            content = ' '.join(
+                p.get('text', '') if isinstance(p, dict) else str(p)
+                for p in content
+            )
+        return {
+            'index': idx,
+            'role': role,
+            'speaker': speaker,
+            'content': content if isinstance(content, str) else str(content),
+            'tool_calls': msg.get('tool_calls'),
+        }
+    return {
+        'index': idx,
+        'role': 'unknown',
+        'speaker': getattr(msg, 'name', 'unknown'),
+        'content': str(msg),
+        'tool_calls': None,
+    }
+
+
+# ─── Agent Ops Console (Phase C) ─────────────────────────────────────────
+
+
+def get_a2a_graph(root_agent_id: str, depth: int = 2) -> Dict:
+    """Read the A2A delegation graph centred on ``root_agent_id``.
+
+    Walks the existing ``a2a_context.delegations`` singleton (the same
+    one ``internal_agent_communication.delegate_task`` writes to at
+    line 511).  No new graph store, no new schema.
+
+    Returns ``{nodes: [{id, label, role}], edges: [{from, to,
+    delegation_id, created_at, status}]}`` — drawer renders as a
+    flat 2-level tree (root + delegates).  ``depth`` is reserved for
+    Phase D when transitive delegation walks are needed.
+
+    Cache-miss / module-unavailable returns an empty graph, never
+    raises — the drawer renders "no delegations recorded".
+    """
+    nodes: Dict[str, Dict] = {}
+    edges: List[Dict] = []
+    try:
+        # The singleton lives at module-level inside
+        # internal_agent_communication; importing surfaces it.
+        from integrations.internal_comm import internal_agent_communication as _iac
+        a2a_ctx = getattr(_iac, 'a2a_context', None)
+        delegations = getattr(a2a_ctx, 'delegations', None) if a2a_ctx else None
+    except Exception:
+        delegations = None
+        a2a_ctx = None
+
+    if not delegations:
+        return {'nodes': [], 'edges': [],
+                'root_id': str(root_agent_id), 'depth': depth}
+
+    # Walk: for each delegation where from_agent or to_agent == root,
+    # add both endpoints as nodes and the edge between them.  Single
+    # hop for v1; transitive walking deferred to Phase D.
+    def _add_node(agent_id: str, role: str):
+        if not agent_id:
+            return
+        if agent_id not in nodes:
+            nodes[agent_id] = {
+                'id': agent_id,
+                'label': agent_id,
+                'role': role,  # 'root' | 'delegator' | 'delegate'
+            }
+
+    _add_node(str(root_agent_id), 'root')
+    root_str = str(root_agent_id)
+
+    try:
+        items = delegations.items() if hasattr(delegations, 'items') else []
+    except Exception:
+        items = []
+
+    for delegation_id, info in items:
+        try:
+            from_agent = str(info.get('from_agent', ''))
+            to_agent = str(info.get('to_agent', ''))
+        except Exception:
+            continue
+        if root_str not in (from_agent, to_agent):
+            continue
+        if from_agent == root_str:
+            _add_node(to_agent, 'delegate')
+        else:
+            _add_node(from_agent, 'delegator')
+        edges.append({
+            'from': from_agent,
+            'to': to_agent,
+            'delegation_id': str(delegation_id),
+            'status': info.get('status', 'unknown'),
+            'created_at': info.get('created_at'),
+        })
+
+    return {
+        'nodes': list(nodes.values()),
+        'edges': edges,
+        'root_id': root_str,
+        'depth': depth,
+    }
+
+
+def steer_agent(db, agent_id: str, verb: str, actor_id: str = 'system',
+                reason: Optional[str] = None) -> Dict:
+    """Apply a steering verb to an AgentGoal: pause / resume / cancel.
+
+    Uses the existing ``AgentGoal.status`` column (values: active |
+    paused | completed | archived) — no new state, no new transition.
+    Each call writes one ``ImmutableAuditLog`` event with type
+    ``agent_steered`` so the operator's intervention is permanently
+    attributable.
+
+    Verb mapping:
+      pause  -> status='paused'
+      resume -> status='active'  (only legal from 'paused')
+      cancel -> status='archived' (terminal; the goal is finished)
+
+    Returns ``{ok: bool, new_status: str, error: str|None}``.
+    Never raises; bad input returns ``{ok: False, error: ...}``.
+    """
+    out = {'ok': False, 'new_status': None, 'error': None}
+    if verb not in ('pause', 'resume', 'cancel'):
+        out['error'] = f'unknown verb {verb}'
+        return out
+
+    try:
+        from .models import AgentGoal
+    except ImportError:
+        out['error'] = 'AgentGoal model unavailable'
+        return out
+
+    goal = db.query(AgentGoal).filter(AgentGoal.id == str(agent_id)).first()
+    if not goal:
+        out['error'] = 'agent not found'
+        return out
+
+    prev_status = goal.status
+    target = {'pause': 'paused', 'resume': 'active', 'cancel': 'archived'}[verb]
+
+    if verb == 'resume' and prev_status != 'paused':
+        out['error'] = f'resume requires paused, got {prev_status}'
+        return out
+    if verb == 'cancel' and prev_status == 'archived':
+        out['error'] = 'already archived'
+        return out
+
+    try:
+        goal.status = target
+        db.commit()
+        out['ok'] = True
+        out['new_status'] = target
+    except Exception as e:
+        db.rollback()
+        out['error'] = f'commit failed: {e}'
+        return out
+
+    try:
+        from security.immutable_audit_log import get_audit_log
+        get_audit_log().log_event(
+            event_type='agent_steered',
+            actor_id=str(actor_id or 'system'),
+            action=f'{verb} ({prev_status} -> {target})',
+            detail={'agent_id': str(agent_id),
+                    'prev_status': prev_status,
+                    'new_status': target,
+                    'reason': reason},
+            target_id=str(agent_id),
+        )
+    except Exception:
+        logger.exception('agent_steered audit log write failed for %s',
+                         agent_id)
+    return out
+
+
+# ─── Agent Ops Console (Phase D) ─────────────────────────────────────────
+
+
+def _compute_eta_from_tree(tree_nodes: List[Dict],
+                           now: Optional[datetime] = None) -> Optional[Dict]:
+    """Derive ETA stats from the same tree the snapshot already built.
+
+    Reuses the ledger walk — no second I/O pass.  Looks at COMPLETED
+    tasks for avg + p95 duration; for any IN_PROGRESS task, reports
+    elapsed seconds so the drawer can flag "over avg".
+
+    Returns ``None`` when there are < 2 completed samples (not enough
+    signal).  ``{avg_seconds, p95_seconds, elapsed_seconds, samples}``
+    otherwise.  ``elapsed_seconds`` is the oldest currently-running
+    task — the one most likely to be the user's pain point.
+    """
+    if not tree_nodes:
+        return None
+    now = now or datetime.utcnow()
+    completed_durations: List[float] = []
+    elapsed_max: Optional[float] = None
+    for node in tree_nodes:
+        status = (node.get('status') or '').lower()
+        created = _parse_iso(node.get('created_at'))
+        if not created:
+            continue
+        if status in ('completed', 'done', 'success'):
+            updated = _parse_iso(node.get('updated_at')) or now
+            try:
+                d = (updated - created).total_seconds()
+                if d >= 0:
+                    completed_durations.append(d)
+            except Exception:
+                continue
+        elif status in ('in_progress', 'running'):
+            try:
+                e = (now - created).total_seconds()
+                if e >= 0 and (elapsed_max is None or e > elapsed_max):
+                    elapsed_max = e
+            except Exception:
+                continue
+
+    if len(completed_durations) < 2 and elapsed_max is None:
+        return None
+
+    out: Dict = {'samples': len(completed_durations)}
+    if completed_durations:
+        completed_durations.sort()
+        avg = sum(completed_durations) / len(completed_durations)
+        # p95 by nearest-rank — fine for the small N we see per agent.
+        idx95 = max(0, min(len(completed_durations) - 1,
+                           int(round(0.95 * (len(completed_durations) - 1)))))
+        out['avg_seconds'] = int(round(avg))
+        out['p95_seconds'] = int(round(completed_durations[idx95]))
+    if elapsed_max is not None:
+        out['elapsed_seconds'] = int(round(elapsed_max))
+    return out
+
+
+def _parse_iso(value) -> Optional[datetime]:
+    """Tolerant ISO parser for the snapshot tree's string timestamps."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        return None
+    s = value.rstrip('Z')
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def inject_instruction(db, agent_id: str, instruction: str,
+                       actor_id: str = 'admin-ui') -> Dict:
+    """Append an operator instruction to the live GroupChat.
+
+    Reuses the existing ``_groupchat_registry`` (populated by
+    ``create_recipe.py``) and the ``user_prompt`` key convention from
+    ``get_agent_chat_tail``.  The message is appended in autogen's
+    user-message shape so the next select_speaker tick picks it up
+    naturally — no separate "interrupt" path.
+
+    Every inject also writes one ``agent_steered`` audit-log entry
+    (verb=``inject``) so operator interventions stay attributable.
+
+    Returns ``{ok, message_index, error}``.  ``ok=False`` when the
+    GroupChat is not registered (process restarted, TTL expired, or
+    /chat never ran for this agent in this process).
+    """
+    out = {'ok': False, 'message_index': None, 'error': None}
+    if not (instruction or '').strip():
+        out['error'] = 'empty instruction'
+        return out
+
+    try:
+        from .models import AgentGoal
+    except ImportError:
+        out['error'] = 'AgentGoal unavailable'
+        return out
+
+    goal = db.query(AgentGoal).filter(AgentGoal.id == str(agent_id)).first()
+    if not goal or not goal.prompt_id:
+        out['error'] = 'agent not found or has no prompt_id'
+        return out
+
+    user_prompt = f'{goal.owner_id or goal.created_by}_{goal.prompt_id}'
+
+    try:
+        from lifecycle_hooks import get_registered_groupchat
+    except ImportError:
+        out['error'] = 'groupchat registry unavailable'
+        return out
+    gc = get_registered_groupchat(user_prompt)
+    if gc is None:
+        out['error'] = 'no live GroupChat registered for this agent'
+        return out
+
+    try:
+        messages = gc.messages
+    except Exception:
+        out['error'] = 'GroupChat has no messages attribute'
+        return out
+
+    msg = {
+        'role': 'user',
+        'name': f'OperatorInjection({actor_id})',
+        'content': instruction.strip(),
+    }
+    try:
+        messages.append(msg)
+        out['message_index'] = len(messages) - 1
+        out['ok'] = True
+    except Exception as e:
+        out['error'] = f'append failed: {e}'
+        return out
+
+    try:
+        from security.immutable_audit_log import get_audit_log
+        get_audit_log().log_event(
+            event_type='agent_steered',
+            actor_id=str(actor_id or 'admin-ui'),
+            action='inject',
+            detail={'agent_id': str(agent_id),
+                    'message_index': out['message_index'],
+                    'instruction_preview': instruction[:200]},
+            target_id=str(agent_id),
+        )
+    except Exception:
+        logger.exception('inject audit-log write failed for %s', agent_id)
+
+    return out
