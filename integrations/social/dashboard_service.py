@@ -166,20 +166,36 @@ class DashboardService:
         for goal in goals:
             gd = goal.to_dict()
 
-            # Truth-grounding: detect stalled or idle
+            # Truth-grounding: detect stalled or idle.  status_reason is
+            # additive (None when not derived) — frontend displays it
+            # below the status chip when present, giving operators a
+            # concrete "why" instead of an opaque label.  Strictly
+            # additive field; existing consumers ignoring it are
+            # unaffected.
             real_status = goal.status
+            status_reason = None
             if goal.status == 'active' and goal.last_dispatched_at:
                 age = (now - goal.last_dispatched_at).total_seconds()
                 if age > poll_interval * 2:
                     real_status = 'stalled'
+                    status_reason = (
+                        f'No dispatch in {int(age)}s '
+                        f'(expected within {poll_interval * 2}s of last tick)'
+                    )
             elif goal.status == 'active' and not goal.last_dispatched_at:
                 real_status = 'idle'
+                status_reason = 'No dispatch recorded yet — awaiting first tick'
+            elif goal.status == 'paused':
+                status_reason = 'Goal paused by user or system'
+            elif goal.status == 'failed':
+                status_reason = 'Last execution returned failure status'
 
             result.append({
                 'id': str(goal.id),
                 'type': f'{goal.goal_type}_goal',
                 'name': goal.title,
                 'status': real_status,
+                'status_reason': status_reason,
                 'current_task': f'{goal.goal_type}: {goal.title[:60]}',
                 'skills': [goal.goal_type],
                 'last_active': gd.get('last_dispatched_at'),
