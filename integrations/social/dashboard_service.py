@@ -186,7 +186,17 @@ class DashboardService:
                 real_status = 'idle'
                 status_reason = 'No dispatch recorded yet — awaiting first tick'
             elif goal.status == 'paused':
-                status_reason = 'Goal paused by user or system'
+                # Truthful pause-reason: coding_daemon auto-pauses after
+                # 5 consecutive dispatch failures and writes
+                # ``cfg['pause_reason']`` (coding_daemon.py:227).  Read
+                # it back so the UI doesn't lie with "user or system" —
+                # if the user never paused, this surfaces the actual
+                # auto-pause cause (e.g. "Auto-paused: 5 consecutive
+                # dispatch failures").  Falls through to a generic
+                # message when no recorded reason exists.
+                _cfg = getattr(goal, 'config_json', None) or {}
+                _pr = _cfg.get('pause_reason') if isinstance(_cfg, dict) else None
+                status_reason = _pr or 'Goal status=paused (no reason recorded)'
             elif goal.status == 'failed':
                 status_reason = 'Last execution returned failure status'
 
@@ -530,7 +540,14 @@ class DashboardService:
             real_status = 'idle'
             status_reason = 'No dispatch recorded yet — awaiting first tick'
         elif goal.status == 'paused':
-            status_reason = 'Goal paused by user or system'
+            # Same truthful pause-reason as _get_agent_goals — see
+            # there for context.  Reading config_json.pause_reason
+            # surfaces the actual auto-pause cause from
+            # coding_daemon.py:227 instead of the misleading
+            # "user or system" guess.
+            _cfg = getattr(goal, 'config_json', None) or {}
+            _pr = _cfg.get('pause_reason') if isinstance(_cfg, dict) else None
+            status_reason = _pr or 'Goal status=paused (no reason recorded)'
         elif goal.status == 'failed':
             status_reason = 'Last execution returned failure status'
 
