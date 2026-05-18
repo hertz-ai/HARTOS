@@ -287,6 +287,31 @@ def build_channel_tool_closures(ctx):
                                     "Probe-failure toast emit skipped: %s",
                                     toast_err,
                                 )
+                            # PR Q — also fan out a channel_unhealthy
+                            # fleet command so the user's OTHER devices
+                            # surface the same banner (toast above only
+                            # reaches the device currently in the chat).
+                            try:
+                                from integrations.social.fleet_command import (
+                                    emit_channel_unhealthy,
+                                )
+                                from integrations.social.models import get_db
+                                _db = get_db()
+                                try:
+                                    emit_channel_unhealthy(
+                                        _db,
+                                        user_id=_probe_uid,
+                                        channel_type=channel_type,
+                                        reason=str(probe_err)[:120],
+                                    )
+                                    _db.commit()
+                                finally:
+                                    _db.close()
+                            except Exception as fanout_err:
+                                logger.debug(
+                                    "Probe-failure fleet fan-out skipped: %s",
+                                    fanout_err,
+                                )
                         finally:
                             loop.close()
 
