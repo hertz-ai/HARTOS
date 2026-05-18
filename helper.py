@@ -30,14 +30,25 @@ import uuid
 from datetime import datetime, timedelta
 import time
 import redis
-from langchain_classic.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
+# Lazy-load langchain_classic.schema — every site of use is inside a
+# function (HumanMessage/AIMessage at lines 1827/1832; the other 4 names
+# are imported-but-unused, so they're dropped here entirely).  Module-
+# top import of langchain_classic transitively loads langchain_core
+# which uses ``__getattr__`` lazy attribute resolution that cx_Freeze
+# can't statically trace.  Result: every `import helper` (and hence
+# `import reuse_recipe / gather_agentdetails / create_recipe` which
+# import helper) blows up in the frozen-binary validate step with
+# `ImportError: cannot import name 'LanguageModelOutput' from
+# langchain_core.language_models` (live: build-windows runs
+# 25855122044, 26011572288, 26012388043, 26013613058).  Moving these
+# to lazy function-scoped imports is the canonical fix — same pattern
+# the rest of HARTOS uses for heavy/optional deps (e.g. torch, llama).
+# `GoogleSearchAPIWrapper` + `ZepMemory` are likewise lazy below.
 import pytz
-from langchain_classic.utilities import GoogleSearchAPIWrapper
 import aiohttp
 import asyncio
 import os
 from bs4 import BeautifulSoup
-from langchain_classic.memory import ZepMemory
 from json_repair import repair_json
 import traceback
 
@@ -64,6 +75,13 @@ ZEP_API_URL = config.get('ZEP_API_URL', '')
 ZEP_API_KEY = config.get('ZEP_API_KEY', '')
 
 try:
+    # Lazy-import keeps langchain_classic.utilities (→ langchain_core)
+    # out of helper's module-level chain so the frozen-binary validate
+    # step doesn't pull the broken langchain_core.language_models lazy
+    # __init__ at import time.  Search is optional + only used in a
+    # handful of search-tool call paths, so paying the import cost
+    # once on first instantiation is cheaper than always-load.
+    from langchain_classic.utilities import GoogleSearchAPIWrapper
     search = GoogleSearchAPIWrapper(k=4)
 except Exception as _search_err:
     logging.getLogger(__name__).info(f"Google Search unavailable (expected in local mode): {_search_err}")
@@ -1603,6 +1621,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
     '''
 
     start_time = time.time()
+    from langchain_classic.memory import ZepMemory  # lazy (see helper.py:32)
     memory = ZepMemory(
         session_id=session_id,
         url='http://azure_all_vms.hertzai.com:8000',
@@ -1805,6 +1824,7 @@ def get_memory(user_id: int):
     '''
         Get memory object from zep
     '''
+    from langchain_classic.memory import ZepMemory  # lazy (see helper.py:32)
     session_id = "user_"+str(user_id)
     memory = ZepMemory(
         session_id=session_id,
@@ -1817,6 +1837,8 @@ def get_memory(user_id: int):
     return memory
 
 def history(user_id,prompt_id,role,message):
+    # lazy import: langchain_classic.schema (see helper.py:32)
+    from langchain_classic.schema import HumanMessage, AIMessage
     try:
         memory = get_memory(user_id=int(user_id))
     except Exception:
