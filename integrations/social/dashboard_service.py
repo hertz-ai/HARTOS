@@ -451,8 +451,8 @@ class DashboardService:
         """Return the drill-down payload for ONE agent's drawer.
 
         Combines:
-          - The AgentGoal row (status, status_reason same logic as the
-            list endpoint at _get_agent_goals — single source of truth).
+          - The AgentGoal/CodingGoal row (status, status_reason same
+            logic as the list endpoint — single source of truth).
           - The goal tree from the SmartLedger associated with this
             agent (walks ledger.tasks for parent/child links).
           - The most recent dispatcher decision (model + tier + ts)
@@ -471,6 +471,37 @@ class DashboardService:
             return None
 
         goal = db.query(AgentGoal).filter(AgentGoal.id == str(agent_id)).first()
+
+        # Fallback to CodingGoal — the dashboard list at _get_coding_goals
+        # mixes both kinds of agent IDs into the same /agents response.
+        # Without this fallback, clicking any 'coding_goal' card in the
+        # admin UI returned 404 because the snapshot only knew AgentGoal.
+        # Adapter wraps the CodingGoal row in a goal-shaped namespace so
+        # the rest of the snapshot pipeline below (status logic, tree
+        # lookup, last_dispatch query, eta computation) needs no branch.
+        if not goal:
+            try:
+                from .models import CodingGoal
+                cg = db.query(CodingGoal).filter(
+                    CodingGoal.id == str(agent_id)).first()
+                if cg:
+                    from types import SimpleNamespace
+                    goal = SimpleNamespace(
+                        id=cg.id,
+                        owner_id=getattr(cg, 'owner_id', None) or getattr(cg, 'created_by', None),
+                        created_by=getattr(cg, 'created_by', None),
+                        goal_type='coding',
+                        title=cg.title,
+                        description=getattr(cg, 'description', None) or getattr(cg, 'title', ''),
+                        status=cg.status,
+                        priority=getattr(cg, 'priority', 0) or 0,
+                        spark_budget=getattr(cg, 'spark_budget', 0) or 0,
+                        spark_spent=getattr(cg, 'spark_spent', 0) or 0,
+                        prompt_id=getattr(cg, 'prompt_id', None),
+                        last_dispatched_at=getattr(cg, 'last_dispatched_at', None) or getattr(cg, 'updated_at', None),
+                    )
+            except Exception:
+                logger.debug("CodingGoal fallback lookup failed", exc_info=True)
         if not goal:
             return None
 
@@ -810,6 +841,16 @@ def steer_agent(db, agent_id: str, verb: str, actor_id: str = 'system',
         return out
 
     goal = db.query(AgentGoal).filter(AgentGoal.id == str(agent_id)).first()
+    # CodingGoal fallback — same lookup pattern as get_agent_snapshot.
+    # Without this, Pause/Resume/Cancel buttons on the drawer 404 for
+    # any coding-type card (about half the dashboard).
+    if not goal:
+        try:
+            from .models import CodingGoal
+            goal = db.query(CodingGoal).filter(
+                CodingGoal.id == str(agent_id)).first()
+        except Exception:
+            pass
     if not goal:
         out['error'] = 'agent not found'
         return out
@@ -955,7 +996,24 @@ def inject_instruction(db, agent_id: str, instruction: str,
         return out
 
     goal = db.query(AgentGoal).filter(AgentGoal.id == str(agent_id)).first()
-    if not goal or not goal.prompt_id:
+    if not goal:
+        # CodingGoal fallback (same pattern as get_agent_snapshot /
+        # steer_agent).  Without this the inject CTA on the drawer's
+        # Conversation tab silently 400s for any coding agent.
+        try:
+            from .models import CodingGoal
+            cg = db.query(CodingGoal).filter(
+                CodingGoal.id == str(agent_id)).first()
+            if cg:
+                from types import SimpleNamespace
+                goal = SimpleNamespace(
+                    prompt_id=getattr(cg, 'prompt_id', None),
+                    owner_id=getattr(cg, 'owner_id', None) or getattr(cg, 'created_by', None),
+                    created_by=getattr(cg, 'created_by', None),
+                )
+        except Exception:
+            pass
+    if not goal or not getattr(goal, 'prompt_id', None):
         out['error'] = 'agent not found or has no prompt_id'
         return out
 
