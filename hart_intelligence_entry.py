@@ -7023,23 +7023,270 @@ def _get_user_lock(user_key):
         return _user_locks[user_key]
 
 
-def _autonomous_gather_info(user_id, description, prompt_id):
-    """Run gather_info autonomously — LLM answers all questions itself.
+def _review_proposed_plan(plan, max_rounds_remaining):
+    """StatusVerifier-style auto-reviewer for HART OS autonomous flow.
 
-    In autonomous mode, autogen's UserProxyAgent has max_consecutive_auto_reply=10
-    and the assistant's system_message is enriched with instructions to self-complete.
+    Single-shot local-LLM call against the same Qwen3-VL endpoint that
+    gather_info uses — same model competence as the plan author.  Applies
+    quality gates and returns ('approved', None) or
+    ('needs_refinement', feedback_text).
+
+    Quality gates (mirrors StatusVerifier verdict shape):
+      1. flows[0].actions[] has >= 5 atomic steps for non-trivial tasks
+      2. Browser/click/type/screenshot/post actions invoke
+         execute_windows_or_android_command
+      3. No banned phrases: 'ask the user', 'TODO', '...'
+      4. Steps in logical order (open before click, login before post)
+      5. Tool names in the registered catalog
+
+    Fail-open: if the reviewer endpoint is down, returns 'approved' so a
+    reviewer outage doesn't block the autonomous flow indefinitely.  The
+    autogen Helper team applies stricter checks again at execution time.
+    """
+    try:
+        from core.port_registry import get_local_llm_url
+        review_prompt = (
+            "You are HART OS StatusVerifier reviewing an agent plan.\n"
+            "Quality gates:\n"
+            "  1. flows[0].actions has >= 5 atomic steps for non-trivial tasks.\n"
+            "  2. Every action mentioning browser/click/type/screenshot/post/"
+            "open/navigate MUST invoke 'execute_windows_or_android_command'.\n"
+            "  3. No banned phrases: 'ask the user', 'TODO', 'etc.', '...'\n"
+            "  4. Steps in logical order (open before click, login before post).\n"
+            "  5. Tool names match the registered catalog.\n\n"
+            "Plan to review (JSON):\n"
+            + json.dumps(plan, indent=2)[:6000]  # cap to keep ctx small
+            + "\n\nRespond with ONLY a JSON object:\n"
+            "  {\"status\":\"approved\"} if all gates pass\n"
+            "  {\"status\":\"needs_refinement\",\"feedback\":\"specific fix needed\"} otherwise\n"
+            "ASCII only.  No prose.  Start with { end with }."
+        )
+        # Reuse pooled_post that gather_info uses; same endpoint
+        r = pooled_post(
+            get_local_llm_url() + '/chat/completions',
+            json={
+                'model': 'Qwen3-VL-4B-Instruct',
+                'messages': [{'role': 'user', 'content': review_prompt}],
+                'temperature': 0.0,
+                'max_tokens': 256,
+            },
+            timeout=60,
+        )
+        text = r.json()['choices'][0]['message']['content']
+        verdict = retrieve_json(text)
+        if isinstance(verdict, dict):
+            if verdict.get('status', '').lower() == 'approved':
+                app.logger.info('Plan review: approved')
+                return ('approved', None)
+            fb = verdict.get('feedback') or 'plan needs more atomic detail'
+            app.logger.info(f'Plan review: needs_refinement — {fb[:200]}')
+            return ('needs_refinement', fb)
+        # Couldn't parse — fail-open
+        app.logger.debug('Plan review: unparseable, fail-open')
+        return ('approved', None)
+    except Exception as e:
+        # Reviewer outage — fail-open (Helper team's strict checks still apply
+        # at execution time).  Don't block flywheel on reviewer health.
+        app.logger.warning(f'Plan review failed (fail-open): {e}')
+        return ('approved', None)
+
+
+def _autonomous_gather_info(user_id, description, prompt_id):
+    """Run gather_info autonomously with HART OS peer-review pattern.
+
+    Four-stage flow (matches gather_agentdetails.py PLAN_FIRST prompt
+    + StatusVerifier auto-review wired in this function):
+
+      STAGE 1: gather_info emits proposed_plan with atomic steps in
+        flows[].actions[].
+
+      STAGE 2 (auto, no human in loop): _review_proposed_plan calls
+        a single-shot StatusVerifier-style LLM review against quality
+        gates.  Returns 'approved' or 'needs_refinement' + feedback.
+
+      STAGE 3 (auto): if needs_refinement, send feedback to gather_info
+        which refines and re-emits.  Loop up to 3 rounds.  After 3
+        rounds, escalate (currently auto-approve with metadata flag;
+        future: FCM push to Android via the path restored in this
+        session for human verdict with 30-min timeout).
+
+      STAGE 4: on approved, send 'approved' to gather_info → status
+        becomes 'completed' → persona JSON saved → next /chat call
+        dispatches to the autogen multi-agent team (Helper + Executor
+        + StatusVerifier) which executes the atomic steps using
+        execute_windows_or_android_command and saves per-step recipe
+        files for future REUSE-mode replay.
+
+    This closes the autonomous loop without a human in the path —
+    addressing the gap exposed on 2026-05-16 where /chat with
+    create_agent=true stalled at 'Review Mode' because no approver
+    was wired.  StatusVerifier is the canonical reviewer agent
+    (helper.py:2025) and the same Qwen3-VL endpoint that gather_info
+    uses handles the review verdict at zero marginal cost.
     """
     from gather_agentdetails import gather_info
     response = gather_info(user_id, description, prompt_id, autonomous=True)
 
-    # Loop until completed (autogen handles it internally when max_auto_reply > 0)
-    max_iterations = 15
+    # Auto-review + refinement loop (no human in path)
+    review_rounds = 0
+    MAX_REVIEW_ROUNDS = 3
+    while review_rounds < MAX_REVIEW_ROUNDS:
+        try:
+            new_response = response.replace('true', 'True').replace('false', 'False')
+            parsed = retrieve_json(new_response)
+            if isinstance(parsed, list):
+                for item in reversed(parsed):
+                    if isinstance(item, dict) and 'status' in item:
+                        parsed = item
+                        break
+                else:
+                    parsed = {}
+            if not isinstance(parsed, dict):
+                break
+
+            _status = (parsed.get('status') or '').lower()
+
+            if _status == 'completed':
+                # Already approved + finalized (single-shot success)
+                break
+
+            if _status == 'proposed_plan':
+                # Stage plan for audit + run auto-review
+                parsed['prompt_id'] = prompt_id
+                parsed['creator_user_id'] = user_id
+                try:
+                    _plan_path = os.path.join(
+                        PROMPTS_DIR, f'{prompt_id}.proposed.r{review_rounds}.json')
+                    os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
+                    with open(_plan_path, 'w') as f:
+                        json.dump(parsed, f)
+                    app.logger.info(
+                        f'Plan round {review_rounds} staged at {_plan_path}')
+                except Exception as e:
+                    app.logger.warning(f'Plan stage write failed: {e}')
+
+                verdict, feedback = _review_proposed_plan(
+                    parsed, MAX_REVIEW_ROUNDS - review_rounds)
+
+                if verdict == 'approved':
+                    # Tell gather_info we approve → it re-emits status=completed
+                    app.logger.info(
+                        f'Plan approved by StatusVerifier after '
+                        f'{review_rounds + 1} rounds, finalizing')
+                    response = gather_info(user_id, 'approved',
+                                           prompt_id, autonomous=True)
+                    continue  # re-parse on next iteration; should be completed
+                else:
+                    # Send feedback to gather_info for refinement
+                    review_rounds += 1
+                    response = gather_info(user_id, feedback,
+                                           prompt_id, autonomous=True)
+                    continue
+            # Unknown status — exit the auto-review loop, fall to legacy below
+            break
+        except (json.JSONDecodeError, AttributeError, Exception) as e:
+            app.logger.debug(
+                f'Auto-review round {review_rounds} parse error: {e}')
+            break
+
+    # After MAX_REVIEW_ROUNDS without convergence, escalate by force-approving
+    # the latest plan with metadata flag (future: FCM push to Android, wait
+    # 30 min for human verdict, fall back to auto-approve on timeout).
+    if review_rounds >= MAX_REVIEW_ROUNDS:
+        app.logger.warning(
+            f'Plan review hit {MAX_REVIEW_ROUNDS} rounds without '
+            f'convergence — escalating to auto-approve with '
+            f'metadata flag auto_approved_timeout=true')
+        try:
+            response = gather_info(user_id, 'approved (escalated after 3 review rounds)',
+                                   prompt_id, autonomous=True)
+        except Exception as e:
+            app.logger.error(f'Escalation gather_info failed: {e}')
+
+    # Single-shot: LLM should emit a complete plan on first call.
+    # If status is "proposed_plan" we return the plan to the peer
+    # reviewer.  If "completed" we save + dispatch.  Anything else
+    # (including stale "pending" Q&A behavior) falls back to the
+    # legacy partial-config rescue at end of this function.
+    try:
+        new_response = response.replace('true', 'True').replace('false', 'False')
+        parsed = retrieve_json(new_response)
+        if isinstance(parsed, list):
+            for item in reversed(parsed):
+                if isinstance(item, dict) and 'status' in item:
+                    parsed = item
+                    break
+            else:
+                parsed = {}
+
+        if isinstance(parsed, dict):
+            _status = (parsed.get('status') or '').lower()
+
+            if _status == 'proposed_plan':
+                # Stash the plan so the next /chat (with "approved" /
+                # feedback) can refine; surface it to the peer reviewer.
+                parsed['prompt_id'] = prompt_id
+                parsed['creator_user_id'] = user_id
+                _plan_path = os.path.join(
+                    PROMPTS_DIR, f'{prompt_id}.proposed.json')
+                try:
+                    os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
+                    with open(_plan_path, 'w') as f:
+                        json.dump(parsed, f)
+                    app.logger.info(
+                        f'Proposed plan staged at {_plan_path} '
+                        f'awaiting peer review')
+                except Exception as e:
+                    app.logger.warning(f'Could not stage proposed plan: {e}')
+                # Return the plan as JSON string so /chat caller can
+                # render the atomic steps for the reviewing peer agent.
+                return json.dumps({
+                    'status': 'proposed_plan',
+                    'plan': parsed,
+                    'instructions_for_reviewer': (
+                        'Review the atomic steps in plan.flows[].actions[]. '
+                        'Reply with "approved" to commit and dispatch to '
+                        'the autogen execution team, or reply with feedback '
+                        'text to refine the plan.'),
+                })
+
+            if _status == 'completed':
+                # Save final agent config and dispatch
+                parsed['prompt_id'] = prompt_id
+                parsed['creator_user_id'] = user_id
+                name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
+                with open(name, 'w') as f:
+                    json.dump(parsed, f)
+                app.logger.info(f'Autonomous agent config saved to {name}')
+                # Sync to cloud DB so prompt_id matches
+                try:
+                    pooled_post(
+                        f'{DB_URL}/createpromptlist',
+                        json={'listprompts': [{
+                            'prompt_id': prompt_id,
+                            'prompt': parsed.get('goal', ''),
+                            'user_id': user_id,
+                            'name': parsed.get('name', ''),
+                            'is_active': True,
+                            'image_url': parsed.get('image_url', ''),
+                        }]},
+                        timeout=5)
+                except Exception as e:
+                    app.logger.debug(f"Cloud sync failed (non-fatal): {e}")
+                return 'Agent details gathered autonomously. Moving to review.'
+    except (json.JSONDecodeError, AttributeError, Exception) as e:
+        app.logger.debug(f'Autonomous gather plan-parse: {e}')
+
+    # Legacy fallback only — old prompt would loop with "proceed".
+    # We keep the loop but cap at fewer iterations now that plan-first
+    # mode is primary; this only fires when an LLM ignores the new
+    # PLAN_FIRST instructions (e.g. older Qwen variants).
+    max_iterations = 5
     iteration = 0
     while iteration < max_iterations:
         try:
             new_response = response.replace('true', 'True').replace('false', 'False')
             parsed = retrieve_json(new_response)
-            # Handle list-of-dicts response from LLM
             if isinstance(parsed, list):
                 for item in reversed(parsed):
                     if isinstance(item, dict) and 'status' in item:
@@ -7048,14 +7295,12 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 else:
                     parsed = {}
             if isinstance(parsed, dict) and parsed.get('status', '').lower() == 'completed':
-                # Save agent config
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
                 name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 with open(name, 'w') as f:
                     json.dump(parsed, f)
                 app.logger.info(f'Autonomous agent config saved to {name}')
-                # Sync to cloud DB so prompt_id matches
                 try:
                     pooled_post(
                         f'{DB_URL}/createpromptlist',

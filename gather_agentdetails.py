@@ -162,7 +162,6 @@ def create_agents_for_user(user_id: str, autonomous=False, initial_description=N
     }
 
     # Build system message — enrich for autonomous mode
-    system_message = AGENT_CREATOR_SYSTEM_MESSAGE
     if autonomous and initial_description:
         # Feature-flagged: inject the tool catalog so the LLM picks real
         # tool names instead of inventing.  Off by default to keep prompt
@@ -170,16 +169,49 @@ def create_agents_for_user(user_id: str, autonomous=False, initial_description=N
         _tool_map = ""
         if os.environ.get('HEVOLVE_AUTONOMOUS_GATHER_TOOL_MAP', '').strip().lower() in ('1', 'true', 'yes', 'on'):
             _tool_map = AUTONOMOUS_TOOL_CATALOG
-        system_message += f"""
+        # AUTONOMOUS MODE: REPLACE the interactive system message entirely.
+        # Live test 2026-05-16 13:04 showed that APPENDING the PLAN_FIRST
+        # suffix to AGENT_CREATOR_SYSTEM_MESSAGE was diluted by the older
+        # "ask user one question at a time" instructions — the model still
+        # emitted {"status":"pending","question":"name?"}.  Replacing the
+        # whole system message in autonomous mode is the canonical fix.
+        system_message = f"""You are HART OS plan author. The peer HARTOS reviewer (StatusVerifier) will auto-review your plan against quality gates and either approve or send refinement feedback. NEVER ask the user questions — the user is NOT in this loop.
+
+Task description: '{initial_description}'
+
 {_tool_map}
-AUTONOMOUS MODE INSTRUCTIONS:
-The user wants you to create an agent autonomously based on this description: '{initial_description}'.
-You must fill in ALL required fields yourself without asking questions.
-Generate appropriate name, agent_name (skill.region.name format), goal, broadcast_agent, personas, flows (with flow_name, persona, actions, sub_goal), and extra_information.
-Return ONLY a valid JSON object with status="completed". No prose, no explanation, no markdown.
-Do NOT ask any questions. Do NOT use em-dashes or smart quotes. Plain ASCII only.
-Your response must start with {{ and end with }}. Nothing else.
+THREE-STAGE FLOW (strict, autonomous, no human-in-loop):
+
+STAGE 1 — FIRST CALL: emit a COMPLETE proposed plan with atomic steps.
+Response shape (EXACT keys, JSON only):
+{{"status":"proposed_plan","name":"<short readable name>","agent_name":"skill.local.name","goal":"<one-line goal>","broadcast_agent":false,"personas":[{{"name":"Executor","description":"<one line>"}}],"flows":[{{"flow_name":"main","persona":"Executor","actions":["<atomic step 1>","<atomic step 2>","..."],"sub_goal":"<one line>"}}],"extra_information":"<optional>","review_required":true}}
+
+RULES for flows[0].actions[]:
+- ONE concrete observable action per item.  No "and then" compounds.
+- For ANY computer-use task (open, click, paste, type, scroll, navigate, post, broadcast, send, share, browse, search, login, screenshot, copy, focus), EACH step MUST start with the literal prefix "execute_windows_or_android_command: " followed by plain-English instructions.  Examples:
+    "execute_windows_or_android_command: bring Chrome window to foreground"
+    "execute_windows_or_android_command: navigate to https://linkedin.com/feed/"
+    "execute_windows_or_android_command: click the 'Start a post' input box near the top of the feed"
+    "execute_windows_or_android_command: paste clipboard contents using Ctrl+V"
+    "execute_windows_or_android_command: click the blue 'Post' button at the bottom-right of the compose modal"
+    "execute_windows_or_android_command: take a screenshot to verify the post appeared in the feed"
+- 8 to 15 atomic steps for any non-trivial computer task.  Don't conflate steps.
+- Preserve EVERY detail of the task description in the plan.
+
+STAGE 2 — SUBSEQUENT CALL (incoming message is review verdict):
+- If incoming message is "approved" or starts with "approved": re-emit the SAME plan but with "status":"completed" and remove the "review_required" key.
+- Otherwise the message is refinement feedback: re-emit with "status":"proposed_plan" and apply the feedback to flows[0].actions[].
+
+STAGE 3 — Downstream: on "completed", the dispatcher saves persona JSON and hands the atomic-step list to the autogen team (Helper + Executor) which calls execute_windows_or_android_command for each step.
+
+ABSOLUTE RULES:
+- Plain ASCII only.  No em-dashes, no smart quotes, no Unicode.
+- Your response must START with {{ and END with }}.  Nothing else — no prose, no markdown, no code fence.
+- NEVER use "status":"pending".  NEVER ask questions.  NEVER request user input.
+- The user is sick / asleep / away.  You are talking to another agent.
 """
+    else:
+        system_message = AGENT_CREATOR_SYSTEM_MESSAGE
 
     # Create the assistant agent with context awareness
     assistant = autogen.AssistantAgent(
