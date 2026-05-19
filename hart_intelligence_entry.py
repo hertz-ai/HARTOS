@@ -2114,6 +2114,23 @@ def publish_async(topic, message, timeout=2.0):
             # Ensure user_id is in data for per-user routing
             if user_id and isinstance(data, dict):
                 data.setdefault('user_id', user_id)
+            # Stamp node_tier on every chat-topic envelope so the SPA's
+            # formatTier helper (task #146/#148) can render the badge
+            # without per-callsite plumbing. Closes #153. setdefault
+            # preserves any explicit value the caller already set —
+            # this is a strict additive safety net for the audit gap
+            # task #149 might have missed.
+            #
+            # served_by stays caller-set because it identifies WHICH
+            # backend served THIS reply, which the infrastructure here
+            # doesn't know (only the dispatch site does — see
+            # speculative_dispatcher.py:1578).
+            if (isinstance(data, dict)
+                    and bus_topic
+                    and bus_topic.startswith('chat.')):
+                data.setdefault(
+                    'node_tier',
+                    os.environ.get('HEVOLVE_NODE_TIER', 'flat'))
             msg_id = bus.publish(
                 bus_topic, data,
                 user_id=user_id,
