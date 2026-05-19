@@ -162,6 +162,48 @@ def init_agent_engine(app):
     # come online a few seconds after Flask starts serving instead of
     # being registered synchronously.  Worth it — the previous behaviour
     # was the entire app hanging forever.
+    # Spawn the daemon EARLY on its own dedicated thread — it does not
+    # depend on hartos-init or product/seed bootstrap.  Earlier flow
+    # waited up to 10 min for hartos-init before calling
+    # `agent_daemon.start()`; on any partial Nunba boot that signal
+    # never fired and the daemon silently sat dead forever (root cause
+    # of the 2502-pending-tasks accumulation seen on 2026-05-19).  The
+    # daemon's loop is itself lazy + idempotent, so starting it before
+    # the heavy bootstrap is safe.
+    def _start_daemon_with_self_heal():
+        """Start agent_daemon and re-spawn if its thread dies."""
+        import time as _td
+        while True:
+            try:
+                from .agent_daemon import agent_daemon
+                # If _running is True but the thread is dead, that's a
+                # zombie — clear the flag so start() will re-spawn the
+                # worker thread instead of returning early.
+                if getattr(agent_daemon, '_running', False) and not (
+                        getattr(agent_daemon, '_thread', None)
+                        and agent_daemon._thread.is_alive()):
+                    logger.warning(
+                        "Agent daemon zombie detected (_running=True but thread dead) — "
+                        "clearing flag to allow restart")
+                    agent_daemon._running = False
+                if not getattr(agent_daemon, '_running', False):
+                    agent_daemon.start()
+                    logger.info("Agent daemon started (early-spawn path)")
+                # Heartbeat watchdog: every 60s, check thread is alive
+                _td.sleep(60)
+            except Exception as e:
+                logger.warning(
+                    "Agent daemon start/heartbeat failed (will retry in 60s): %s", e)
+                _td.sleep(60)
+
+    import threading as _t_early
+    _t_early.Thread(
+        target=_start_daemon_with_self_heal,
+        daemon=True,
+        name='agent-daemon-supervisor',
+    ).start()
+    logger.info("Agent daemon supervisor thread spawned (independent of hartos-init)")
+
     def _finish_init_deferred():
         import time as _t
         # Wait up to 10 minutes for hartos-init to settle.  By then any
@@ -246,13 +288,22 @@ def init_agent_engine(app):
         except Exception as e:
             logger.debug(f"AgentBaselineAdapter registration skipped: {e}")
 
-        # Start background daemon
+        # Start background daemon.  Supervisor thread above
+        # (_start_daemon_with_self_heal) usually starts it before we
+        # arrive here; this is a fallback/no-op when supervisor already
+        # set _running=True.  Bump from debug to warning so any future
+        # regression (silent skip) is visible in logs — this exact path
+        # silently failed for weeks and caused 2502 pending tasks to pile
+        # up on 2026-05-19.
         try:
             from .agent_daemon import agent_daemon
-            agent_daemon.start()
-            logger.info("Agent engine daemon started")
+            if not getattr(agent_daemon, '_running', False):
+                agent_daemon.start()
+                logger.info("Agent engine daemon started (deferred-path fallback)")
+            else:
+                logger.info("Agent engine daemon already running (supervisor started it)")
         except Exception as e:
-            logger.debug(f"Agent engine daemon start skipped: {e}")
+            logger.warning(f"Agent engine daemon start skipped: {e}", exc_info=True)
 
         # Start distributed worker loop (claims tasks from shared Redis)
         try:
