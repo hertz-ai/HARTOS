@@ -288,22 +288,13 @@ def init_agent_engine(app):
         except Exception as e:
             logger.debug(f"AgentBaselineAdapter registration skipped: {e}")
 
-        # Start background daemon.  Supervisor thread above
-        # (_start_daemon_with_self_heal) usually starts it before we
-        # arrive here; this is a fallback/no-op when supervisor already
-        # set _running=True.  Bump from debug to warning so any future
-        # regression (silent skip) is visible in logs — this exact path
-        # silently failed for weeks and caused 2502 pending tasks to pile
-        # up on 2026-05-19.
-        try:
-            from .agent_daemon import agent_daemon
-            if not getattr(agent_daemon, '_running', False):
-                agent_daemon.start()
-                logger.info("Agent engine daemon started (deferred-path fallback)")
-            else:
-                logger.info("Agent engine daemon already running (supervisor started it)")
-        except Exception as e:
-            logger.warning(f"Agent engine daemon start skipped: {e}", exc_info=True)
+        # Daemon start is owned exclusively by the
+        # `agent-daemon-supervisor` thread spawned at the top of
+        # init_agent_engine (see `_start_daemon_with_self_heal` above).
+        # Single dispatch path — do NOT add a second agent_daemon.start()
+        # call here.  CLAUDE.md Gate 4 (parallel paths) requires one
+        # writer per verb; the supervisor also handles zombie-thread
+        # recovery, which a one-shot call here could not.
 
         # Start distributed worker loop (claims tasks from shared Redis)
         try:
