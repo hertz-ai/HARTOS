@@ -2458,6 +2458,35 @@ def track_marketing_event():
     return _ok({'tracked': True, 'code': code, 'event': event, 'ts': row['ts']})
 
 
+@social_bp.route('/marketing/intents', methods=['GET'])
+def marketing_intents():
+    """Per-platform canonical intent URLs for the marketing agent +
+    operator UI.  Closes #181.
+
+    Query: ?platform=twitter|linkedin|reddit|hackernews|whatsapp
+           omit platform to get all.
+
+    Returns {platforms: [str], intents: [MarketingIntent.to_dict]}.
+
+    Each intent carries platform, code (ref-tag), intent_url
+    (click-to-open composer), landing_url (where the post links to,
+    with ?ref=code), body_text (paste body where URL doesn't accept
+    long text), and notes.  Codes match the ones /marketing/track
+    expects, so a click → /marketing/track increment is a closed loop.
+    """
+    from integrations.marketing.intents import (
+        get_intents, list_platforms,
+    )
+    platform = (request.args.get('platform') or '').strip().lower() or None
+    intents = get_intents(platform)
+    return _ok({
+        'platforms': list_platforms(),
+        'platform_filter': platform,
+        'intents': [i.to_dict() for i in intents],
+        'count': len(intents),
+    })
+
+
 @social_bp.route('/marketing/stats', methods=['GET'])
 def marketing_stats():
     """Aggregate click counts by code + event from the JSONL log.
