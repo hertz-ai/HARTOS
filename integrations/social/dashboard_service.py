@@ -512,6 +512,63 @@ class DashboardService:
                     )
             except Exception:
                 logger.debug("CodingGoal fallback lookup failed", exc_info=True)
+
+        # Third fallback — daemon-type agents (id prefix 'daemon_').
+        # _get_daemon_status surfaces these from security.node_watchdog
+        # with synthesized IDs like `daemon_agent_daemon`,
+        # `daemon_distributed_worker`, `daemon_resource_governor_proactive`.
+        # Without this branch, clicking any daemon card returned 404
+        # because daemons are NOT in AgentGoal or CodingGoal — they're
+        # tracked in NodeWatchdog's in-memory thread registry.  Wrap the
+        # watchdog row in a goal-shaped namespace so the same downstream
+        # pipeline (status logic, tree lookup, last_dispatch, eta)
+        # works without branching.
+        if not goal and str(agent_id).startswith('daemon_'):
+            try:
+                from security.node_watchdog import get_watchdog
+                wd = get_watchdog()
+                daemon_name = str(agent_id)[len('daemon_'):]
+                health = wd.get_health() if wd else {}
+                info = (health.get('threads', {}) or {}).get(daemon_name) or {}
+                if info or daemon_name in (
+                        'gossip', 'runtime_monitor', 'sync_engine',
+                        'agent_daemon', 'coding_daemon',
+                        'distributed_worker', 'resource_governor_proactive',
+                        'resource_governor_monitor', 'tts_warmup'):
+                    from types import SimpleNamespace
+                    last_iso = info.get('last_heartbeat_iso')
+                    last_dt = None
+                    if last_iso:
+                        try:
+                            last_dt = datetime.fromisoformat(last_iso.replace('Z', '+00:00'))
+                            if last_dt.tzinfo:
+                                last_dt = last_dt.replace(tzinfo=None)
+                        except Exception:
+                            last_dt = None
+                    daemon_status = info.get('status', 'active')
+                    goal = SimpleNamespace(
+                        id=str(agent_id),
+                        owner_id=None,
+                        created_by='system_daemon',
+                        goal_type='daemon',
+                        title=daemon_name,
+                        description=(
+                            f'Background daemon thread `{daemon_name}` '
+                            f'tracked by NodeWatchdog.  '
+                            f'restart_count={info.get("restart_count", 0)}, '
+                            f'heartbeat_age_s={info.get("last_heartbeat_age_s", "n/a")}.'
+                        ),
+                        status=daemon_status if daemon_status != 'unknown' else 'active',
+                        priority=0,
+                        spark_budget=0,
+                        spark_spent=0,
+                        prompt_id=None,
+                        last_dispatched_at=last_dt,
+                        config_json={'pause_reason': info.get('error')} if info.get('error') else {},
+                    )
+            except Exception:
+                logger.debug("Daemon fallback lookup failed", exc_info=True)
+
         if not goal:
             return None
 
