@@ -2399,6 +2399,44 @@ def mark_all_notifications_read():
     return _ok({'marked_all': True})
 
 
+@social_bp.route('/notifications/unread_by_source', methods=['GET'])
+@require_auth
+def unread_by_source():
+    """Return per-source-user unread notification counts for the
+    current viewer.  Closes #199 backend half.
+
+    Returns ``{source_user_id: count}`` so the agent-list UI can
+    overlay an unread badge on each agent row by looking up the
+    agent's user_id in the map.  agents with no entry in the map
+    have zero unread notifications (UI renders no badge).
+
+    Why a sibling endpoint and not extending /dashboard/agents:
+    the dashboard endpoint is unauthed + ETag'd (server-wide cache).
+    Per-viewer unread state needs auth + can't share that cache,
+    so this lives separately.  Client joins the two payloads.
+    """
+    from sqlalchemy import func as _sqlfunc
+    # Lazy import — Notification isn't in the top-of-file model
+    # import set; keeps the endpoint a single localized addition.
+    from .models import Notification as _Notif
+    rows = (
+        g.db.query(
+            _Notif.source_user_id,
+            _sqlfunc.count(_Notif.id),
+        )
+        .filter(_Notif.user_id == g.user.id)
+        .filter(_Notif.is_read.is_(False))
+        .filter(_Notif.source_user_id.isnot(None))
+        .group_by(_Notif.source_user_id)
+        .all()
+    )
+    counts = {src: int(cnt) for src, cnt in rows if src}
+    return _ok({
+        'by_source': counts,
+        'total_unread': sum(counts.values()),
+    })
+
+
 # ═══════════════════════════════════════════════════════════════
 # MARKETING ATTRIBUTION (task #178 — flywheel download tracking)
 # ═══════════════════════════════════════════════════════════════
