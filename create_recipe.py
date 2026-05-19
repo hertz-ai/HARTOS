@@ -1904,28 +1904,6 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         user_prompt = f'{user_id}_{prompt_id}'
         current_action_id = user_tasks[user_prompt].current_action
 
-        # [STATE-TRANSITION-PROBE] Single-line invocation trace — validates
-        # whether autogen calls state_transition between every empty-Assistant
-        # turn (expected) or skips it during internal loops (would explain the
-        # 23:09:40 "Run a thought experiment" Assistant→Assistant×12 loop where
-        # ROLE-ORDER-GUARD silently dropped 13 empty placeholders).  Tag is
-        # grep-friendly; remove once root cause is confirmed.
-        try:
-            _last_msg = groupchat.messages[-1] if groupchat.messages else {}
-            _last_content = (_last_msg.get('content') or '')
-            _last_role = _last_msg.get('role', '?')
-            _last_name = _last_msg.get('name', '?')
-            current_app.logger.warning(
-                f"[STATE-TRANSITION-PROBE] called: last_speaker={last_speaker.name!r} "
-                f"last_msg_role={_last_role} last_msg_name={_last_name} "
-                f"content_len={len(_last_content)} "
-                f"empty={'YES' if not _last_content.strip() else 'no'} "
-                f"action_id={current_action_id} "
-                f"total_msgs={len(groupchat.messages)}"
-            )
-        except Exception as _probe_err:
-            current_app.logger.error(f"[STATE-TRANSITION-PROBE] log failed: {_probe_err}")
-
         # ─── STUCK-LOOP GUARD (#485) ───────────────────────────────────
         # Detects when the same (last_speaker, last_message_content) pair
         # has repeated >= _STATE_TRANSITION_LOOP_THRESHOLD times and breaks
