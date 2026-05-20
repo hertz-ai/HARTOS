@@ -28,6 +28,38 @@ DEFAULT_PROMPT_ID: int = 8888
 
 
 # ──────────────────────────────────────────────────────────────────────
+# AutoGen MessageTokenLimiter budget — single source of truth.
+#
+# Previously hardcoded as `max_tokens=3500` in 4 sites:
+#   create_recipe.py:907       — recipe-create context_handling
+#   reuse_recipe.py:1245       — reuse_recipe context_handling
+#   reuse_recipe.py:2279       — reuse_recipe alternate path
+#   reuse_recipe.py:2896       — reuse_recipe alternate path
+#
+# Why 2500 (was 3500): live evidence 2026-05-20, llama_server_8082.log
+# showed 477 "Context size has been exceeded" errors.  The autogen
+# transform clips messages to max_tokens, but the system prompt and
+# tool descriptions are appended AFTER the transform — typical
+# overhead ~3000-4000 tokens.  With max_tokens=3500 the total prompt
+# reaches ~7000+ tokens; under 4-slot concurrency on a 12288 n_ctx
+# llama-server, overlap of 2-3 active large prompts exhausts the
+# slot pool's effective context budget and llama returns the 400.
+# Lowering to 2500 leaves ~6000-7000 tokens total prompt size,
+# comfortable headroom for concurrent slots.  Quality impact is
+# negligible: 2500 tokens is still ~3-4 messages of dense history,
+# more than enough for the next-step reasoning autogen does.  If
+# quality regresses, raise back to 3000; never above 3500 without
+# a corresponding n_ctx bump on llama-server side.
+#
+# Tighter sites kept as-is:
+#   reuse_recipe.py:818  select_speaker (max_tokens=3000) — speaker-
+#       selection prompts are smaller by design.  Already tight.
+AUTOGEN_MESSAGE_TOKEN_BUDGET: int = 2500
+AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE: int = 1000  # individual message cap, unchanged
+AUTOGEN_HISTORY_LIMIT: int = 50                  # message-count limit, unchanged
+
+
+# ──────────────────────────────────────────────────────────────────────
 # HIVE_DEPTH — maximum hop count for any cross-host task / hivemind /
 # federation propagation.
 #
