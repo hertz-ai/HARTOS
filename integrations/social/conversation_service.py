@@ -347,6 +347,37 @@ class ConversationService:
         if len(content) > _MAX_MESSAGE_LEN:
             raise ConversationError(
                 f"message too long (>{_MAX_MESSAGE_LEN} chars)")
+
+        # R2 — Morphable Nunba agent.  Special-case the canonical
+        # 'nunba' conversation handle BEFORE the regular member check
+        # because the Nunba chat is virtual: no `conversations` row,
+        # no `memberships` rows.  The chat is per-user, identified by
+        # author_id, and the reply is generated server-side by the
+        # morphable orchestrator (see integrations/social/morphable_agent.py).
+        try:
+            from . import morphable_agent
+        except Exception:
+            morphable_agent = None
+        if morphable_agent and morphable_agent.is_nunba_conversation(conv_id):
+            reply_text, meta = morphable_agent.dispatch_morphable_turn(
+                str(author_id), content, conversation_id=conv_id, db=db)
+            # The morphable conversation is in-memory; the API returns
+            # the assistant reply directly without persisting either
+            # the user turn or the assistant turn.  Persistence is a
+            # follow-up (table needs migration).  Caller embeds the
+            # reply in the API response so the client renders it
+            # immediately.
+            return {
+                'id': None,
+                'parent_kind': 'conversation',
+                'parent_id': conv_id,
+                'author_id': 'nunba',
+                'content': reply_text,
+                'created_at': None,
+                'metadata_json': meta,
+                'is_morphable_reply': True,
+            }
+
         if not _is_member(db, conv_id, author_id):
             raise ConversationError("not a conversation member")
 
