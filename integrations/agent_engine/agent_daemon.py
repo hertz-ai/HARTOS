@@ -98,6 +98,34 @@ class AgentDaemon:
         # Proactive hive tick state
         self._next_hive_explore_time = time.time() + random.randint(300, 1800)
         self._base_interval = self._interval  # remember original for optimizer
+        # ── starvation override ──────────────────────────────────────
+        # When the canonical ``should_yield_to_user()`` gate returns True
+        # tick after tick (sustained system pressure: ResourceGovernor in
+        # ACTIVE mode → throttle=0.05, or IDLE mode with cpu>0.8 →
+        # throttle=0.2; either is below the gate's 0.3 threshold), every
+        # active goal stalls indefinitely and the self-heal pile-up grows
+        # exponentially.
+        #
+        # Production incident (2026-05-20, 140+ stalled goals, oldest
+        # since 2026-05-12): system CPU sustained ~90 % from a different
+        # daemon (compute_optimizer process_iter walk) → governor stayed
+        # in ACTIVE 60 % of the time → agent_daemon yielded every tick →
+        # zero dispatches in 8 days → ``tts.probe`` + ``subprocess.tool_load``
+        # error emitters each created a fresh self_heal goal every minute
+        # → 70+ duplicate self_heal entries piled up.
+        #
+        # Fix: track the wall-clock of the last successful tick (one that
+        # at least *queried* goals — not necessarily one that dispatched,
+        # so an idle system with no active goals doesn't trigger the
+        # override).  When the gate has been blocking longer than
+        # ``HEVOLVE_AGENT_STARVATION_S`` (default 600 s = 10 min), bypass
+        # ``should_yield_to_user()`` for ONE tick and log a WARNING so
+        # the operator sees the bypass.  Bounded blast radius — single
+        # tick of relief, then back to honoring the gate.  Matches the
+        # watchdog's ``mark_in_llm_call`` escalation pattern.
+        self._last_tick_completed_at = time.time()
+        self._starvation_s = int(os.environ.get(
+            'HEVOLVE_AGENT_STARVATION_S', '600'))
 
     def start(self):
         with self._lock:
@@ -524,9 +552,22 @@ class AgentDaemon:
 
         # Single canonical yield gate — user activity + system pressure.
         # See dispatch.should_yield_to_user() docstring for the contract.
+        #
+        # Starvation override: if the gate has been blocking for longer
+        # than ``self._starvation_s`` (default 600 s), force ONE tick so
+        # the goal queue doesn't stall indefinitely under sustained
+        # system pressure (see incident note in __init__ above).
         if should_yield_to_user():
-            logger.debug("Agent daemon: yielding (user active or system pressure)")
-            return
+            _starved_for = time.time() - self._last_tick_completed_at
+            if _starved_for < self._starvation_s:
+                logger.debug(
+                    "Agent daemon: yielding (user active or system pressure)")
+                return
+            logger.warning(
+                "Agent daemon: STARVATION OVERRIDE — yield gate has blocked "
+                "for %.0fs (>%ds threshold); forcing one tick to drain "
+                "queue.  Set HEVOLVE_AGENT_STARVATION_S to tune.",
+                _starved_for, self._starvation_s)
         # _throttle is consumed lower down for soft scaling decisions —
         # re-read after the hard yield gate so we still have a value.
         try:
@@ -875,6 +916,17 @@ class AgentDaemon:
 
             if dispatched > 0:
                 logger.info(f"Agent daemon: dispatched {dispatched} goal(s) to idle agents")
+
+            # Mark this tick as completed (passed the yield gate AND
+            # queried goals/agents).  Drives the starvation override in
+            # _tick() so persistent yield doesn't stall the queue.  We
+            # update this on EVERY tick that gets past the yield gate
+            # — even ticks that dispatched 0 — because reaching this
+            # point means the gate let work through; the absence of
+            # dispatches is a different signal (no idle agents, no
+            # active goals, all goals in cooldown) and is unrelated to
+            # the user-pressure stall the override is guarding against.
+            self._last_tick_completed_at = time.time()
 
             # Content gen monitor: check stuck games every 5 ticks (~2.5 min)
             if self._tick_count % 5 == 0:
