@@ -278,24 +278,17 @@ class WorldModelBridge:
         SECURITY: Integrity verification required before enabling in-process.
         If HevolveAI files don't match the signed manifest, fall back to HTTP.
         """
-        # Integrity gate: verify HevolveAI installation before in-process
-        try:
-            from security.source_protection import SourceProtectionService
-            integrity = SourceProtectionService.verify_hevolveai_integrity()
-            if not integrity.get('verified', False):
-                mismatched = integrity.get('mismatched_files', [])
-                if mismatched:
-                    logger.warning(
-                        f"[WorldModelBridge] HevolveAI integrity FAILED: "
-                        f"{len(mismatched)} mismatched files — forcing HTTP mode")
-                    logger.info(
-                        f"[WorldModelBridge] HTTP mode: {self._api_url}")
-                    return
-        except ImportError:
-            pass  # source_protection not available — skip check
-        except Exception as e:
-            logger.debug(f"[WorldModelBridge] Integrity check skipped: {e}")
-
+        # #224 — short-circuit BEFORE the integrity scan when in-process
+        # mode can't apply anyway.  Without this, the very first chat
+        # request on a fresh boot blocks for ~2 minutes:
+        # `verify_hevolveai_integrity` SHA-256-hashes every file in the
+        # `hevolveai` package (1000s of files via `pkg_root.rglob('*')`)
+        # — and that scan runs even when hart_intelligence isn't loaded
+        # so the path it gates (in-process mode) is unreachable.  Live
+        # evidence 2026-05-20 RequestID 5390c08e: 116s between draft
+        # ready (19:27:48) and "[WorldModelBridge] HTTP mode" log
+        # (19:29:44) — that whole window is this scan.
+        #
         # Worker threads MUST NOT trigger a `from hart_intelligence import …`
         # here.  The hart_intelligence import chain (langchain, transformers,
         # autogen, multimodal stacks) can take 300+ seconds on first load,
@@ -316,6 +309,33 @@ class WorldModelBridge:
         # import; the bootstrap path will retry the in-process upgrade on
         # the next record_interaction once it finishes the pre-warm.
         mod = sys.modules.get('hart_intelligence')
+        if mod is None:
+            # In-process is structurally impossible — no integrity scan.
+            logger.info(
+                f"[WorldModelBridge] HTTP mode: {self._api_url} "
+                f"(hart_intelligence not loaded; integrity scan skipped)")
+            return
+
+        # Integrity gate: verify HevolveAI installation before in-process.
+        # Only runs when in-process is actually reachable (see short-
+        # circuit above) so the SHA-256 scan never blocks a chat request
+        # that wasn't going to use in-process anyway.
+        try:
+            from security.source_protection import SourceProtectionService
+            integrity = SourceProtectionService.verify_hevolveai_integrity()
+            if not integrity.get('verified', False):
+                mismatched = integrity.get('mismatched_files', [])
+                if mismatched:
+                    logger.warning(
+                        f"[WorldModelBridge] HevolveAI integrity FAILED: "
+                        f"{len(mismatched)} mismatched files — forcing HTTP mode")
+                    logger.info(
+                        f"[WorldModelBridge] HTTP mode: {self._api_url}")
+                    return
+        except ImportError:
+            pass  # source_protection not available — skip check
+        except Exception as e:
+            logger.debug(f"[WorldModelBridge] Integrity check skipped: {e}")
         if mod is not None:
             try:
                 _get_provider = getattr(mod, 'get_learning_provider', None)

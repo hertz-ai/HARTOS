@@ -747,6 +747,7 @@ class SpeculativeDispatcher:
             else None
         )
         self._record_interaction_safely(
+            user_pref=user_pref,
             user_id=user_id, prompt_id=prompt_id, prompt=prompt,
             response=draft_reply, model_id=draft_model.model_id,
             latency_ms=draft_latency_ms, node_id=node_id, goal_id=goal_id,
@@ -770,6 +771,7 @@ class SpeculativeDispatcher:
                 origin_model_role='draft_model',
                 delegate=delegate,
                 escalation_reason=escalation_reason,
+                user_pref=user_pref,
             )
             # When the user explicitly asked for `hive_preferred` AND the
             # draft self-delegated to hive, also fire a best-effort MoE
@@ -1194,6 +1196,7 @@ class SpeculativeDispatcher:
         origin_model_role: str = 'fast_model',
         delegate: Optional[str] = None,
         escalation_reason: Optional['EscalationReason'] = None,
+        user_pref: str = 'auto',
     ) -> bool:
         """Schedule the expert-improvement task in the background pool.
 
@@ -1228,6 +1231,10 @@ class SpeculativeDispatcher:
                 'prompt_id': prompt_id,
                 'goal_id': goal_id,
                 'started_at': time.time(),
+                # #224 — propagate so _run_collapsed_expert_path can gate
+                # record_interaction on local_only without re-plumbing the
+                # parameter through 3 layers of background-task submission.
+                'user_pref': user_pref,
             }
             if delegate is not None:
                 entry['delegate'] = delegate
@@ -1451,12 +1458,29 @@ class SpeculativeDispatcher:
             logger.debug(f"[hive_consult] pool submit failed: {e}")
             return False
 
-    def _record_interaction_safely(self, **kwargs) -> None:
+    def _record_interaction_safely(self, user_pref: str = 'auto', **kwargs) -> None:
         """Feed an interaction into HevolveAI via WorldModelBridge. Never
         raises — continual learning is best-effort and the chat path must
         not break if HevolveAI is offline or the bridge is in circuit-open
         mode. WorldModelBridge already handles guardrail + secret redaction
-        internally."""
+        internally.
+
+        #224 mode gate: when the user is in `local_only` mode, do NOT
+        touch WorldModelBridge at all.  The bridge's lazy first-instantiation
+        triggers a SHA-256 scan of the hevolveai package (mitigated by
+        the world_model_bridge.py short-circuit, but still wasteful work
+        for a user who explicitly opted out of hive participation).
+        Treating mode as authoritative also matches the user's design
+        intent: HevolveAI is loaded on-demand for hive/hybrid modes,
+        and is structurally not a prerequisite for local-only operation.
+        """
+        # Local-only users have opted out of contributing to the hive's
+        # learning loop.  Skipping the call here keeps WorldModelBridge
+        # uninitialised for them — zero cost, zero side effects.  Mode
+        # switch (local→hive) is picked up on the very next chat turn
+        # because user_pref is per-request, not cached on the dispatcher.
+        if user_pref == 'local_only':
+            return
         try:
             from integrations.agent_engine.world_model_bridge import get_world_model_bridge
             bridge = get_world_model_bridge()
@@ -1562,6 +1586,12 @@ class SpeculativeDispatcher:
             else 'local_langchain_bg'
         )
         self._record_interaction_safely(
+            # #224 — honor user_pref stashed by _schedule_expert_background;
+            # local_only users skip WorldModelBridge entirely (no HevolveAI
+            # touch on the expert background path either).  Falling back
+            # to 'auto' preserves current behavior for any legacy active
+            # entry that pre-dated the field.
+            user_pref=active_entry.get('user_pref', 'auto'),
             user_id=user_id, prompt_id=prompt_id,
             prompt=original_prompt, response=expert_response,
             model_id=expert_model.model_id, latency_ms=elapsed_ms,
