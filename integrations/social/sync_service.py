@@ -364,11 +364,20 @@ class SyncService:
         if cursor_id:
             params['id'] = cursor_id
         params.update(tenant_params)
+        # #200 — P2P unread tracking.  v46 migration added
+        # memberships.last_read_at as the per-(user, conversation) read
+        # cursor.  Compute is_unread per message as
+        # (msg.created_at > membership.last_read_at) AND author != viewer.
+        # Self-authored messages are NEVER unread; legacy memberships
+        # without a last_read_at (pre-v46) treat everything as unread
+        # until the user opens the conversation and the mark-read
+        # endpoint fires.
         rows = db.execute(text(
             "SELECT msg.id, msg.parent_kind, msg.parent_id, "
             "       msg.thread_root_id, msg.author_id, msg.agent_kind, "
             "       msg.content, msg.depth, msg.edited_at, "
             "       msg.is_deleted, msg.metadata_json, msg.created_at, "
+            "       m.last_read_at, "
             "       COALESCE(msg.edited_at, msg.created_at) AS act_ts "
             "FROM messages msg "
             "JOIN memberships m ON m.parent_id = msg.parent_id "
@@ -385,8 +394,10 @@ class SyncService:
         rows = rows[:limit]
         out = []
         max_seen = _encode_cursor(cursor_ts, cursor_id)
+        # #200 — viewer id captured so _row_message can compare
+        # author_id and skip is_unread for self-authored messages.
         for row in rows:
-            ts = str(row[12] or '')
+            ts = str(row[13] or '')
             max_seen = _max_cursor(max_seen, _encode_cursor(ts, row[0]))
             out.append({
                 'id': row[0], 'parent_kind': row[1], 'parent_id': row[2],
@@ -397,6 +408,12 @@ class SyncService:
                 'is_deleted': bool(row[9]),
                 'metadata_json': row[10],
                 'created_at': str(row[11]) if row[11] else None,
+                # #200: read-cursor for the viewer's membership in
+                # this conversation.  None for legacy memberships.
+                'membership_last_read_at': str(row[12]) if row[12] else None,
+                # #200: viewer id, propagated so _row_message can
+                # compare against author_id without re-querying.
+                '_viewer_id': user_id,
             })
         return out, max_seen, capped
 
@@ -663,6 +680,31 @@ class SyncService:
 def _row_message(r: dict) -> dict:
     parent_kind = r.get('parent_kind') or 'conversation'
     parent_id = r.get('parent_id') or ''
+    # #200 — proper P2P unread tracking.
+    # Previous logic: `is_unread = not bool(is_deleted)` which meant
+    # every non-deleted message stayed forever unread.  Now: a message
+    # is unread iff (a) it was NOT authored by the viewer AND (b) its
+    # created_at is after the viewer's membership.last_read_at (or the
+    # viewer never set a read cursor).  Self-authored messages are
+    # never unread; deleted messages are never unread either.
+    viewer_id = r.get('_viewer_id')
+    author_id = r.get('author_id')
+    is_deleted = bool(r.get('is_deleted'))
+    is_self_authored = (
+        viewer_id is not None and author_id is not None
+        and str(viewer_id) == str(author_id)
+    )
+    if is_deleted or is_self_authored:
+        is_unread = False
+    else:
+        last_read = r.get('membership_last_read_at')
+        msg_ts = r.get('created_at')
+        if not last_read:
+            is_unread = True  # No read cursor yet — everything is unread
+        elif msg_ts and msg_ts > last_read:
+            is_unread = True
+        else:
+            is_unread = False
     return {
         'id': f"msg_{r.get('id')}",
         'kind': 'message',
@@ -671,7 +713,7 @@ def _row_message(r: dict) -> dict:
         'sender_id': r.get('author_id'),
         'sender_kind': r.get('agent_kind') or 'human',
         'content_preview': (r.get('content') or '')[:140],
-        'is_unread': not bool(r.get('is_deleted')),
+        'is_unread': is_unread,
         'last_activity_at': r.get('edited_at') or r.get('created_at'),
         'deep_link': f"hevolveai://{parent_kind}/{parent_id}",
     }
