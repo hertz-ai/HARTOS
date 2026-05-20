@@ -1,6 +1,6 @@
 # Trading Agent Demo — Polymarket Walk-Forward Backtest
 
-**Generated**: 2026-05-19T15:42:10.399730Z  
+**Generated**: 2026-05-20T08:40:19.830220Z  
 **Data source**: live Polymarket Gamma API (public, no wallet key)  
 **Tape**: 100 recently-resolved markets, starting bankroll $1000.00  
 
