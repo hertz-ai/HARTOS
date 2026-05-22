@@ -242,7 +242,13 @@ def get_or_create_ledger(
 
     with _ledger_cache_lock:
         if use_cache and cache_key in _ledger_cache:
-            logger.info(f"[LedgerFactory] Reusing cached ledger for {cache_key}")
+            # DEBUG, not INFO — this is the EXPECTED hot path on every
+            # task lookup.  Production traces 2026-05-23 02:09: zombie
+            # reaper tick examining 3,476 tasks produced ~6,952 INFO
+            # lines in <1 second (194 per millisecond bucket).  Indicator
+            # log tail unreadable; gui_app.log rotated 6× per hour from
+            # these alone.  Cache-hit is the success case — demote.
+            logger.debug(f"[LedgerFactory] Reusing cached ledger for {cache_key}")
             return _ledger_cache[cache_key]
 
     ledger = create_production_ledger(agent_id=agent_id, session_id=session_id, **kwargs)
