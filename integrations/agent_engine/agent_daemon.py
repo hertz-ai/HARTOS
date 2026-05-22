@@ -124,8 +124,14 @@ class AgentDaemon:
         # tick of relief, then back to honoring the gate.  Matches the
         # watchdog's ``mark_in_llm_call`` escalation pattern.
         self._last_tick_completed_at = time.time()
+        # 120s default — under sustained pressure the flywheel forces a
+        # tick every 2 min instead of every 10.  Combined with the
+        # override raising max_concurrent past the throttled floor, this
+        # gives ~30-60 growth-goal dispatches/hour even when the
+        # ResourceGovernor is in ACTIVE mode.  Tune up if it crowds the
+        # user-facing chat path; tune down if the flywheel is still slow.
         self._starvation_s = int(os.environ.get(
-            'HEVOLVE_AGENT_STARVATION_S', '600'))
+            'HEVOLVE_AGENT_STARVATION_S', '120'))
 
     def start(self):
         with self._lock:
@@ -554,15 +560,19 @@ class AgentDaemon:
         # See dispatch.should_yield_to_user() docstring for the contract.
         #
         # Starvation override: if the gate has been blocking for longer
-        # than ``self._starvation_s`` (default 600 s), force ONE tick so
-        # the goal queue doesn't stall indefinitely under sustained
-        # system pressure (see incident note in __init__ above).
+        # than ``self._starvation_s`` (default 120 s under sustained
+        # pressure → flywheel ticks every 2 min instead of stalling
+        # indefinitely), force one tick so the GROWTH-flywheel seed
+        # goals (Capital Distributor, Compute Recruiter, Open Source
+        # Evangelist, App Marketplace Auto-Promoter, …) actually fire.
+        _override_active = False
         if should_yield_to_user():
             _starved_for = time.time() - self._last_tick_completed_at
             if _starved_for < self._starvation_s:
                 logger.debug(
                     "Agent daemon: yielding (user active or system pressure)")
                 return
+            _override_active = True
             logger.warning(
                 "Agent daemon: STARVATION OVERRIDE — yield gate has blocked "
                 "for %.0fs (>%ds threshold); forcing one tick to drain "
@@ -570,6 +580,10 @@ class AgentDaemon:
                 _starved_for, self._starvation_s)
         # _throttle is consumed lower down for soft scaling decisions —
         # re-read after the hard yield gate so we still have a value.
+        # Under starvation override we ignore the throttle multiplier on
+        # ``max_concurrent`` (force-tick should drain a meaningful batch,
+        # not the throttle-reduced floor of 1) but keep the soft signal
+        # for downstream consumers that haven't opted into the override.
         try:
             from integrations.service_tools.model_lifecycle import (
                 get_model_lifecycle_manager)
@@ -623,8 +637,13 @@ class AgentDaemon:
             dispatched = 0
             used_agents = set()
             max_concurrent = int(os.environ.get('HEVOLVE_AGENT_MAX_CONCURRENT', '10'))
-            # Reduce concurrency proportional to system pressure
-            max_concurrent = max(1, int(max_concurrent * _throttle))
+            # Under normal tick: scale concurrency by system pressure.
+            # Under starvation override: drain a batch (up to the env
+            # cap) instead of being further restricted to the throttled
+            # floor of 1 — the whole point of the override is to make
+            # the flywheel actually move on these ticks.
+            if not _override_active:
+                max_concurrent = max(1, int(max_concurrent * _throttle))
 
             # Minimum interval between dispatches for continuous goals.
             # Without this, a continuous goal (e.g. autoresearch coordinator)
