@@ -117,6 +117,14 @@ def _task_age(task: Any) -> Optional[timedelta]:
                  'created_at'):
         ts = _coerce_dt(getattr(task, attr, None))
         if ts is not None:
+            # Defensive: ``_coerce_dt`` is supposed to always return
+            # an aware datetime, but production traces 2026-05-18 →
+            # 2026-05-23 show 25+ ``offset-naive and offset-aware``
+            # TypeErrors per scheduler tick — some task attr shapes
+            # bypass the normal path (e.g. datetime subclasses where
+            # isinstance() narrows incorrectly).  Hard guard here.
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
             return datetime.now(timezone.utc) - ts
     return None
 
