@@ -184,6 +184,199 @@ def _is_target_request(url, method: str) -> bool:
         return False
 
 
+# ─── Hard left-trim to fit n_ctx (zero-tolerance context overflow) ───
+# Architecture note (2026-05-23): autogen and langchain both build
+# their own OpenAI clients from config; we cannot route them through a
+# caller-side ``llm_client.llm_call`` because their internal call sites
+# live inside third-party code.  The httpx wire layer is the ONLY
+# place every framework's traffic converges (autogen → openai SDK →
+# httpx; langchain → openai/langchain-openai → httpx; raw requests.post
+# in the dispatcher draft path bypasses httpx but is the 5 % minority).
+# So the trim has to happen here too — it cannot live exclusively at
+# the caller-side interface.  When we later add ``llm_client.llm_call``
+# for our own code, the trim is idempotent (no-ops on already-fit
+# bodies) so applying it at both layers is safe.
+#
+# Production evidence motivating this fix (2026-05-20 22:22-22:28):
+# autogen's recipe-request retry path on ``initiate_chat`` with
+# ``clear_history=False`` accumulated chat_instructor history past
+# the 12288 / N_slots per-slot budget → llama-server 500 'Context
+# size has been exceeded' → cascading json_repair/ast.literal_eval
+# log spam + invalid FSM transitions.  Soft autogen-level token
+# limiters didn't help — they cap per-message, not aggregate.
+#
+# Reuses canonical primitives (zero parallel paths):
+#   * Token counting:   core.token_utils.count_tokens_for_messages
+#                       (single tiktoken-with-fallback impl shared with
+#                       budget_gate)
+#   * Constants:        core.constants.LLAMA_CTX_SIZE_DEFAULT,
+#                       LLAMA_SLOTS_DEFAULT,
+#                       WIRE_TRIM_SAFETY_MARGIN_TOKENS,
+#                       WIRE_TRIM_MARKER
+#   * Multimodal text:  core.token_utils._content_to_text
+
+
+def _get_budget_per_slot() -> int:
+    """Per-slot input token budget.  Honors:
+      * ``HEVOLVE_LLAMA_CTX_SIZE`` (default tracks
+        ``core.constants.LLAMA_CTX_SIZE_DEFAULT`` = 12288,
+        matches Nunba's ``llama_config.py:1527``).
+      * ``HEVOLVE_LLAMA_SLOTS`` (default 1 — single-user dev box).
+    """
+    from core.constants import LLAMA_CTX_SIZE_DEFAULT, LLAMA_SLOTS_DEFAULT
+    try:
+        ctx = int(os.environ.get('HEVOLVE_LLAMA_CTX_SIZE',
+                                  str(LLAMA_CTX_SIZE_DEFAULT)))
+        slots = max(1, int(os.environ.get('HEVOLVE_LLAMA_SLOTS',
+                                           str(LLAMA_SLOTS_DEFAULT))))
+        return ctx // slots
+    except Exception:
+        return LLAMA_CTX_SIZE_DEFAULT
+
+
+def _trim_to_budget(body: dict) -> tuple:
+    """Return ``(trimmed_body, n_dropped, n_truncated_chars, est_before,
+    est_after, budget)``.
+
+    Trim policy (always-succeeds, idempotent):
+      1. budget = per_slot - max_tokens - safety
+      2. If under budget → return unchanged.
+      3. Left-drop non-system messages (preserve index 0 if role=system)
+         until the remaining set fits.  Always keep at least the system
+         message + the most-recent user/assistant message.
+      4. If even [system, last_message] is over budget, left-truncate
+         the last message's content character-by-character until it
+         fits, prefixed with ``WIRE_TRIM_MARKER`` so the LLM sees the
+         truncation.
+
+    Idempotent: calling on an already-trimmed body returns it unchanged.
+    Multimodal-aware: rebuilds list-shaped content preserving image
+    parts.
+
+    Reuses ``core.token_utils`` for token counting (single source) and
+    ``core.constants`` for the safety margin + marker (single source).
+    """
+    from core.constants import WIRE_TRIM_SAFETY_MARGIN_TOKENS, WIRE_TRIM_MARKER
+    from core.token_utils import (
+        count_tokens_for_messages, count_tokens_for_text, _content_to_text,
+    )
+
+    messages = list(body.get('messages') or [])
+    if not messages:
+        return body, 0, 0, 0, 0, 0
+
+    model = body.get('model') or None
+    max_tokens = int(body.get('max_tokens') or body.get('max_completion_tokens') or 2048)
+    budget = _get_budget_per_slot() - max_tokens - WIRE_TRIM_SAFETY_MARGIN_TOKENS
+    if budget <= 0:
+        # max_tokens alone exceeds n_ctx — degrade gracefully so we
+        # still send SOMETHING instead of 500-failing.
+        budget = max(512, _get_budget_per_slot() // 4)
+
+    est_before = count_tokens_for_messages(messages, model)
+    if est_before <= budget:
+        return body, 0, 0, est_before, est_before, budget
+
+    has_system = bool(messages and isinstance(messages[0], dict)
+                      and messages[0].get('role') == 'system')
+    n_dropped = 0
+    while len(messages) > (2 if has_system else 1):
+        drop_idx = 1 if has_system else 0
+        messages.pop(drop_idx)
+        n_dropped += 1
+        if count_tokens_for_messages(messages, model) <= budget:
+            break
+
+    n_truncated_chars = 0
+    if count_tokens_for_messages(messages, model) > budget and messages:
+        last = dict(messages[-1])
+        last_text = _content_to_text(last.get('content'))
+        # Reserve room for: (a) overhead of remaining non-last messages,
+        # (b) the message-frame overhead of the last message itself,
+        # (c) the truncation marker we'll prepend.  Previous bug: didn't
+        # subtract (c), so the post-truncation message exceeded budget
+        # by the marker length (~7 tokens) and the wire request still
+        # tickled n_ctx.
+        _TOKENS_PER_MSG = 4  # OpenAI envelope overhead per message
+        marker_tokens = count_tokens_for_text(WIRE_TRIM_MARKER, model)
+        overhead_tokens = (count_tokens_for_messages(messages[:-1], model)
+                           + _TOKENS_PER_MSG
+                           + marker_tokens)
+        room_for_last = max(64, budget - overhead_tokens)
+        # Use the same chars/token ratio the fallback uses (3.5).  When
+        # tiktoken is available this is conservative; when it's the
+        # active path, it's exact.  Either way we're cutting from the
+        # left so over-cutting just means a slightly smaller payload.
+        target_chars = int(room_for_last * 3.5)
+        if len(last_text) > target_chars:
+            n_truncated_chars = len(last_text) - target_chars
+            new_text = WIRE_TRIM_MARKER + last_text[-target_chars:]
+            if isinstance(last.get('content'), list):
+                new_parts = []
+                replaced = False
+                for p in last['content']:
+                    if isinstance(p, dict) and p.get('type') == 'text' and not replaced:
+                        new_parts.append({**p, 'text': new_text})
+                        replaced = True
+                    else:
+                        new_parts.append(p)
+                if not replaced:
+                    new_parts.insert(0, {'type': 'text', 'text': new_text})
+                last['content'] = new_parts
+            else:
+                last['content'] = new_text
+            messages[-1] = last
+
+    new_body = dict(body)
+    new_body['messages'] = messages
+    return (new_body, n_dropped, n_truncated_chars,
+            est_before, count_tokens_for_messages(messages, model), budget)
+
+
+def _apply_trim_to_request(httpx_module, request, body: dict) -> tuple:
+    """Trim ``body`` if over budget and mutate ``request`` so the wire
+    bytes match.  Returns ``(maybe_new_body, was_trimmed)``.
+
+    We mutate in-place (``_content`` + ``stream`` + ``content-length``)
+    rather than rebuilding the Request — rebuilding would lose auth /
+    cookies / extensions state that the caller has already attached.
+    The 2026-05-12 ``LocalProtocolError`` incident (mentioned in the
+    ``_annotate_request`` docstring) was caused by mutating ONLY
+    ``_content`` and leaving ``stream`` pointing at the old buffer; we
+    update both here.
+    """
+    trimmed, n_dropped, n_truncated, est_before, est_after, budget = \
+        _trim_to_budget(body)
+    if n_dropped == 0 and n_truncated == 0:
+        return body, False
+
+    try:
+        new_bytes = json.dumps(trimmed).encode('utf-8')
+        request._content = new_bytes
+        try:
+            request.stream = httpx_module.ByteStream(new_bytes)
+        except Exception:
+            # Older httpx may not expose ByteStream at top level; fall back
+            # to the stream module path.  Either path covers httpx >=0.20.
+            from httpx._content import ByteStream as _BS  # type: ignore
+            request.stream = _BS(new_bytes)
+        try:
+            request.headers['content-length'] = str(len(new_bytes))
+        except Exception:
+            pass
+        logger.warning(
+            "[TRIM] left-trimmed %d msg(s) + %d char(s) — est tokens "
+            "%d→%d, budget %d (n_ctx/%s slots, max_tokens=%s)",
+            n_dropped, n_truncated, est_before, est_after, budget,
+            os.environ.get('HEVOLVE_LLAMA_SLOTS', '1'),
+            body.get('max_tokens') or body.get('max_completion_tokens') or 2048,
+        )
+        return trimmed, True
+    except Exception as e:
+        logger.warning("[TRIM] failed to apply trim, sending original: %s", e)
+        return body, False
+
+
 def _shape_body_for_log(body: dict) -> dict:
     """Apply the ``HEVOLVE_LLM_OUTBOUND_BODY`` policy."""
     mode = (os.environ.get('HEVOLVE_LLM_OUTBOUND_BODY', 'full')
@@ -287,6 +480,8 @@ def _install_sync_patch(httpx_module) -> None:
         except Exception:
             body = None
         if isinstance(body, dict):
+            # Trim BEFORE annotating headers so content-length matches.
+            body, _ = _apply_trim_to_request(httpx_module, request, body)
             _annotate_request(request, body)
         start = time.time()
         try:
@@ -322,6 +517,8 @@ def _install_async_patch(httpx_module) -> None:
         except Exception:
             body = None
         if isinstance(body, dict):
+            # Trim BEFORE annotating headers so content-length matches.
+            body, _ = _apply_trim_to_request(httpx_module, request, body)
             _annotate_request(request, body)
         start = time.time()
         try:

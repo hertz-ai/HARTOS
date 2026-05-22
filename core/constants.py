@@ -58,6 +58,26 @@ AUTOGEN_MESSAGE_TOKEN_BUDGET: int = 2500
 AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE: int = 1000  # individual message cap, unchanged
 AUTOGEN_HISTORY_LIMIT: int = 50                  # message-count limit, unchanged
 
+# ──────────────────────────────────────────────────────────────────────
+# Wire-layer trim budget (llm_outbound_logger.py hard left-trim).
+# Different scope from AUTOGEN_*: those soft-limit per-agent autogen
+# message history; THESE hard-clip the actual bytes sent to llama-server
+# so the request never exceeds (n_ctx / num_slots) - max_tokens - safety.
+# The wire layer catches autogen + langchain + raw openai SDK uniformly
+# (they all funnel through httpx) — the only place we can guarantee
+# zero context-overflow 500s across all frameworks.
+#
+# Env overrides:
+#   HEVOLVE_LLAMA_CTX_SIZE  — n_ctx on llama-server (must match the
+#                              --ctx-size cmdline; default tracks
+#                              Nunba/llama/llama_config.py:1527 = 12288)
+#   HEVOLVE_LLAMA_SLOTS     — concurrent slots (n_ctx is partitioned
+#                              across slots; default 1)
+LLAMA_CTX_SIZE_DEFAULT: int = 12288
+LLAMA_SLOTS_DEFAULT: int = 1
+WIRE_TRIM_SAFETY_MARGIN_TOKENS: int = 256       # headroom under the budget
+WIRE_TRIM_MARKER: str = '...[truncated head]...\n'
+
 
 # ──────────────────────────────────────────────────────────────────────
 # HIVE_DEPTH — maximum hop count for any cross-host task / hivemind /

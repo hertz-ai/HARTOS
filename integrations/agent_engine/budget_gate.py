@@ -89,15 +89,14 @@ def estimate_llm_cost_spark(prompt: str, model_name: str = 'gpt-4o') -> int:
     if cost_per_1k == 0:
         return 0
 
-    # Token count (only computed for paid models)
-    token_count = 0
-    try:
-        import tiktoken
-        enc = tiktoken.encoding_for_model(model_name)
-        token_count = len(enc.encode(prompt))
-    except Exception:
-        # Fallback: ~1.3 tokens per word on average
-        token_count = max(1, int(len(prompt.split()) * 1.3))
+    # Token count (only computed for paid models).  Single source of
+    # truth — see core.token_utils.count_tokens_for_text (tiktoken-with-
+    # fallback).  Previously this site had its own inline tiktoken
+    # try/except with a 1.3-tokens-per-word fallback; the canonical
+    # helper uses chars/3.5 which is slightly more accurate on mixed
+    # content but produces materially similar Spark cost estimates.
+    from core.token_utils import count_tokens_for_text
+    token_count = max(1, count_tokens_for_text(prompt, model_name))
 
     spark_cost = max(1, int((token_count / 1000) * cost_per_1k))
     return spark_cost

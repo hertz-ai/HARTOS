@@ -551,6 +551,16 @@ def retrieve_json(json_message):
         .replace("\u201c", '"').replace("\u201d", '"')
         .replace("\u2014", "-").replace("\u2013", "-"))
 
+    # Empty / whitespace-only input \u2192 return None immediately.  Without
+    # this guard, the downstream fallback chain (repair_json \u2192
+    # ast.literal_eval \u2192 regex) all fire on empty input and log
+    # `json_repair failed: Expecting value: line 1 column 1 (char 0)`
+    # + `ast.literal_eval failed: unmatched ')'` per call.  Production
+    # log evidence (2026-05-20 22:22-22:28): 70+ such pairs in a single
+    # minute when upstream LLM returned empty due to context overflow.
+    if not json_message or not json_message.strip():
+        return None
+
     try:
         return json.loads(repair_json(json_message))
     except Exception as e:
