@@ -54,10 +54,58 @@ def _whatsapp_home() -> Path:
     return _hevolve_home() / 'whatsapp'
 
 
-def _gateway_dir() -> Path:
-    """Repo path that holds gateway.js + package.json — installed-once
-    during ensure_baileys_deps()."""
+def _bundled_gateway_dir() -> Path:
+    """Where the cx_Freeze installer ships gateway.js + package.json
+    (read-only inside Program Files on Windows non-admin installs)."""
     return Path(__file__).resolve().parent.parent / 'channels' / 'whatsapp'
+
+
+def _gateway_dir() -> Path:
+    """User-writable directory holding the runtime gateway.js +
+    package.json + node_modules/ + per-account auth state.
+
+    Previously this returned the bundled path under Program Files
+    directly, which broke every non-admin Windows install — npm
+    install hit EPERM creating node_modules/ inside the read-only
+    install dir.  Logs at ~/Documents/Nunba/logs/frozen_debug.log
+    showed "npm install returned 4294963248" identically on every
+    boot for 6+ days (the unsigned wraparound of an EACCES exit).
+
+    New behaviour mirrors tts/backend_venv.py:venv_root() — all
+    mutable state lives under ~/.hevolve/whatsapp/gateway/.  On
+    first call we lazily copy gateway.js + package.json from the
+    bundled location.  Idempotent: a second call finds both files
+    already present and returns immediately.  Survives Nunba
+    uninstall/reinstall — the venv-shaped node_modules and the
+    paired Baileys auth state at ~/.hevolve/whatsapp/auth/ stay
+    intact across upgrades.
+    """
+    target = _whatsapp_home() / 'gateway'
+    target.mkdir(parents=True, exist_ok=True)
+    src = _bundled_gateway_dir()
+    for name in ('gateway.js', 'package.json'):
+        src_path = src / name
+        dst_path = target / name
+        if not src_path.exists():
+            # source-mode HARTOS with the bundle stripped: surface
+            # a clear error rather than silently shipping a half-
+            # populated user-writable dir.
+            continue
+        try:
+            needs_copy = (
+                not dst_path.exists()
+                or dst_path.stat().st_size != src_path.stat().st_size
+                or dst_path.stat().st_mtime < src_path.stat().st_mtime
+            )
+            if needs_copy:
+                shutil.copy2(str(src_path), str(dst_path))
+        except OSError as e:
+            logger.warning(
+                "whatsapp_supervisor: failed to stage %s into %s: %s "
+                "(falling back to bundled dir — install will likely "
+                "fail on non-admin Windows)", name, target, e)
+            return src  # last-ditch fallback
+    return target
 
 
 # ── Deploy-mode gating (mirrors livekit_supervisor pattern) ──────────
@@ -173,9 +221,16 @@ def ensure_baileys_deps() -> bool:
         logger.warning("whatsapp_supervisor: npm install failed (%s)", e)
         return False
     if result.returncode != 0:
+        # Expanded from 500 → 2000 chars + explicit cwd echo.  The
+        # 6-day production failure (2026-05-17→23) showed only the
+        # truncated rc with no stdout body because npm crashed
+        # before emitting output (EPERM creating node_modules under
+        # Program Files).  Surfacing cwd + a longer tail makes the
+        # next failure mode self-diagnosing.
         logger.warning(
-            "whatsapp_supervisor: npm install returned %d:\n%s",
-            result.returncode, (result.stdout or '')[:500])
+            "whatsapp_supervisor: npm install returned %d in cwd=%s:\n%s",
+            result.returncode, gateway_dir,
+            (result.stdout or '<no stdout>')[:2000])
         return False
     logger.info("whatsapp_supervisor: Baileys deps installed")
     return True
