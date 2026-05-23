@@ -273,6 +273,12 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         tool_worker_attr='_tool',
         required_package='f5_tts',
         pip_install_plan=('torchaudio', 'f5-tts'),
+        # install_target='venv' so f5-tts + its torchaudio pin land in
+        # their own venv at ~/Documents/Nunba/data/venvs/f5_tts/ rather
+        # than colliding with the bundled main-interpreter torch.
+        # f5-tts itself was task #85 (worker dies on startup); the
+        # quarantine here is what kept that fix stable.
+        install_target='venv',
     ),
     'indic_parler': TTSEngineSpec(
         engine_id='indic_parler',
@@ -439,6 +445,13 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
             'kokoro',     # pulls misaki phonemizer transitively
             'espeakng',   # espeak-ng Python bindings (ships binary on Windows)
         ),
+        # install_target='venv' so the kokoro + misaki phonemizer chain
+        # (incl. its pinned numpy/torch transitive set) lands in a
+        # private venv at ~/Documents/Nunba/data/venvs/kokoro/ instead
+        # of the bundled python-embed.  Closes the "ModuleNotFoundError:
+        # No module named 'kokoro'" probe-fallback path that left this
+        # engine permanently uninstalled on every Nunba install (#83).
+        install_target='venv',
     ),
     # OmniVoice — universal TTS.  Qwen3-0.6B backbone + diffusion head,
     # 646 languages (581k training hours spanning every Indic script,
@@ -471,6 +484,11 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         # See omnivoice_tool.py docstring: "Requires: pip install
         # omnivoice torch soundfile".  torch is bundled.
         pip_install_plan=('omnivoice', 'soundfile'),
+        # install_target='venv' — omnivoice pulls Qwen3-0.6B + diffusion
+        # head with their own torch/transformers transitives that conflict
+        # with the bundled main interpreter pins.  Quarantine in
+        # ~/Documents/Nunba/data/venvs/omnivoice/.
+        install_target='venv',
     ),
     'espeak': TTSEngineSpec(
         engine_id='espeak',
@@ -546,6 +564,12 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
             'melotts',                    # PyPI package; ships `melo` import root
             'soundfile',                  # used for duration probe
         ),
+        # install_target='venv' so the melotts wheel + its `melo`
+        # phonemizer chain (jieba, MeCab, mecab-ko) land in a private
+        # venv rather than the bundled python-embed.  Closes the
+        # "ModuleNotFoundError: No module named 'melo'" probe-fallback
+        # path that left this engine permanently uninstalled (#84).
+        install_target='venv',
     ),
     'xtts_v2': TTSEngineSpec(
         engine_id='xtts_v2',
@@ -571,6 +595,11 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
                                           # the import path is stable.
             'soundfile',
         ),
+        # install_target='venv' — coqui-tts pulls trainer/encodec/etc.
+        # with their own torch/transformers pins; quarantine in
+        # ~/Documents/Nunba/data/venvs/xtts_v2/ so the main interpreter
+        # transformers pin stays free for the chatterbox-family path.
+        install_target='venv',
     ),
     'mms_tts': TTSEngineSpec(
         engine_id='mms_tts',
