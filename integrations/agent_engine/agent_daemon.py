@@ -457,6 +457,127 @@ class AgentDaemon:
             except Exception:
                 pass
 
+    def _resume_state_once(self) -> None:
+        """Rehydrate in-memory caches from existing save/restore on
+        restart.  Generic resume — uses ONLY existing CRUDs.  No new
+        schema, no new tables, no new persistence layer.  Idempotent:
+        noop on second call.
+
+        Three existing save/restore surfaces are warmed in order:
+
+        1. ``SmartLedger`` (from ``agent_ledger`` package) — persists
+           per-(user, goal) task-graph state to JSON at
+           ``agent_data/ledger_<user>_<goal>.json``.  Restore happens via
+           ``self._get_goal_ledger(goal)`` which already calls
+           ``SmartLedger.load(ledger_path)`` (line 222).  Calling it
+           here warms ``self._ledger_cache`` so the first dispatch
+           inherits the full prior task graph instead of starting
+           fresh.  Tasks already in COMPLETED stay completed; tasks in
+           IN_PROGRESS resume from their saved checkpoint.
+
+        2. ``task_ledger.TaskLedger`` (morphable agent) — per-user state
+           machine slot keyed by ``(user_id, conversation_id)``.  Pure
+           in-memory today, but rebuilding the slot at boot keeps
+           thread coherence (next turn lands in the existing slot
+           rather than spawning a parallel ledger).
+
+        3. ``outreach_crm_tools.check_pending_followups_daemon()`` —
+           CRM follow-up scheduler with state in DB rows.  One call
+           flushes any sequences whose due-date elapsed while Nunba
+           was down.
+
+        What is NOT resumed here (rebuilt lazily on demand, by design):
+        - AutoGen ``GroupChat.messages`` — rebuilt from the Message
+          table when the next turn arrives.
+        - Speculative dispatcher ``active`` map — per-request, no
+          mid-flight resume needed (any in-flight request was already
+          aborted by process exit).
+
+        Called once per daemon-thread lifetime, after the boot grace
+        period and before the first tick.
+        """
+        if getattr(self, '_resume_done', False):
+            return
+        self._resume_done = True
+
+        try:
+            from integrations.social.models import get_db, AgentGoal
+            from integrations.social import task_ledger
+        except Exception as e:
+            logger.warning(
+                "Agent daemon: resume_state_once skipped — required imports "
+                "unavailable (%s)", e)
+            return
+
+        smart_ledgers_warmed = 0
+        task_ledgers_warmed = 0
+        try:
+            db = get_db()
+            try:
+                # All active goals — each carries the user_id and goal_id
+                # the existing SmartLedger save/restore is keyed by.
+                goals = (
+                    db.query(AgentGoal)
+                      .filter(AgentGoal.status == 'active')
+                      .all()
+                )
+                for goal in goals:
+                    # 1. SmartLedger restore via the existing
+                    # _get_goal_ledger() — internally calls
+                    # SmartLedger.load() if the JSON file exists.
+                    try:
+                        ledger = self._get_goal_ledger(goal)
+                        if ledger is not None:
+                            smart_ledgers_warmed += 1
+                    except Exception as inner:
+                        logger.debug(
+                            "resume_state_once: SmartLedger restore failed "
+                            "for goal %s: %s", getattr(goal, 'id', '?'), inner)
+
+                    # 2. TaskLedger morphable-agent slot rebuild.  Both
+                    # user_id and created_by appear in the schema; prefer
+                    # user_id when present.
+                    user_id = (
+                        getattr(goal, 'user_id', None)
+                        or getattr(goal, 'created_by', None)
+                    )
+                    if not user_id:
+                        continue
+                    conv_id = (
+                        str(goal.prompt_id) if getattr(goal, 'prompt_id', None)
+                        else 'nunba'
+                    )
+                    try:
+                        task_ledger.get_or_create(
+                            user_id=str(user_id),
+                            conversation_id=conv_id,
+                        )
+                        task_ledgers_warmed += 1
+                    except Exception as inner:
+                        logger.debug(
+                            "resume_state_once: TaskLedger rebuild failed "
+                            "for (%s,%s): %s", user_id, conv_id, inner)
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(
+                "Agent daemon: resume_state_once goal-scan failed: %s", e)
+
+        followups_fired = 0
+        try:
+            from .outreach_crm_tools import check_pending_followups_daemon
+            result = check_pending_followups_daemon()
+            if isinstance(result, dict):
+                followups_fired = int(result.get('processed', 0))
+        except Exception as e:
+            logger.debug(
+                "resume_state_once: pending-followup flush skipped: %s", e)
+
+        logger.info(
+            "Agent daemon: resume_state_once — warmed %d SmartLedger(s), "
+            "%d TaskLedger slot(s), flushed %d pending follow-up(s)",
+            smart_ledgers_warmed, task_ledgers_warmed, followups_fired)
+
     def _loop(self):
         # Boot grace period: let user chat have exclusive LLM access for 60s.
         # Without this, daemon goals consume all llama-server slots immediately
@@ -466,6 +587,12 @@ class AgentDaemon:
             logger.info(f"Agent daemon: boot grace period {_boot_grace}s — "
                         f"user chat gets priority. Set HEVOLVE_DAEMON_BOOT_DELAY=0 to disable.")
             self._wd_sleep(_boot_grace)
+
+        # Rehydrate caches from existing CRUDs BEFORE the first tick so
+        # the first dispatch sees the same in-memory state a long-running
+        # process would have built up.  Single point of resume — covers
+        # every conversation slot via task_ledger.get_or_create.
+        self._resume_state_once()
 
         while self._running:
             # Exponential backoff: sleep longer on consecutive failures.

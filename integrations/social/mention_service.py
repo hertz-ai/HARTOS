@@ -304,6 +304,89 @@ class MentionService:
             pass
 
     @staticmethod
+    def _load_thread_context(db, source_kind: str, source_id: str,
+                             requester_id: str,
+                             max_messages: int = 20) -> str:
+        """Return the prior thread as a plain-text transcript the LLM
+        can read before responding.  Uses ONLY existing tables
+        (messages, posts, comments) — no new CRUD, no new schema.
+
+        Returns '' on any error or when there is no prior context.
+        Caller falls back to the mention-only prompt in that case.
+
+        Format (chronological, oldest-first so the LLM reads top-down):
+            [2026-05-23 19:30] @alice: original post content
+            [2026-05-23 19:32] @bob: first reply
+            [2026-05-23 19:35] @alice: second reply
+            ...
+
+        Read access: we DELIBERATELY bypass the `_is_member` check on
+        the conversation read path because being @mentioned is itself
+        the authorisation signal — the same author who sent the
+        message granted the agent context by tagging it.  For posts /
+        comments, those tables are public-by-default.
+        """
+        from sqlalchemy import text
+        try:
+            if source_kind == 'message':
+                row = db.execute(text(
+                    "SELECT parent_id FROM messages WHERE id = :sid"),
+                    {'sid': source_id}).fetchone()
+                if not row or not row[0]:
+                    return ''
+                conv_id = row[0]
+                msgs = db.execute(text(
+                    "SELECT created_at, author_id, content "
+                    "FROM messages "
+                    "WHERE parent_kind='conversation' AND parent_id=:pid "
+                    "  AND is_deleted = 0 AND content != '[encrypted]' "
+                    "ORDER BY created_at DESC LIMIT :lim"),
+                    {'pid': conv_id, 'lim': max_messages}).fetchall()
+                # Reverse to chronological so the LLM reads top-down.
+                lines = [
+                    f"[{ts}] @{aid}: {content[:500]}"
+                    for ts, aid, content in reversed(msgs)
+                ]
+                return '\n'.join(lines)
+
+            if source_kind in ('post', 'comment'):
+                # Resolve to root post id.
+                if source_kind == 'comment':
+                    row = db.execute(text(
+                        "SELECT parent_id FROM comments WHERE id = :sid"),
+                        {'sid': source_id}).fetchone()
+                    if not row or not row[0]:
+                        return ''
+                    post_id = row[0]
+                else:
+                    post_id = source_id
+
+                post = db.execute(text(
+                    "SELECT created_at, author_id, title, content "
+                    "FROM posts WHERE id = :pid AND is_deleted = 0"),
+                    {'pid': post_id}).fetchone()
+                if not post:
+                    return ''
+                lines = [
+                    f"[{post[0]}] @{post[1]} (post): "
+                    f"{(post[2] + ' — ') if post[2] else ''}"
+                    f"{(post[3] or '')[:500]}"
+                ]
+                comments = db.execute(text(
+                    "SELECT created_at, author_id, content "
+                    "FROM comments "
+                    "WHERE parent_id=:pid AND is_deleted = 0 "
+                    "ORDER BY created_at ASC LIMIT :lim"),
+                    {'pid': post_id, 'lim': max_messages}).fetchall()
+                for ts, aid, c in comments:
+                    lines.append(f"[{ts}] @{aid}: {(c or '')[:500]}")
+                return '\n'.join(lines)
+        except Exception as e:
+            logger.debug(
+                "MentionService._load_thread_context: skipping (%s)", e)
+        return ''
+
+    @staticmethod
     def _dispatch_agent(db, agent, source_kind, source_id, content,
                         author_id, tenant_id):
         """Dispatch the mentioned agent through the existing
@@ -330,13 +413,34 @@ class MentionService:
                         "skipping agent dispatch for %s", agent.username)
             return
 
-        # Build the agent prompt context. Inline the surrounding text
-        # so the agent has enough to reason about.
-        prompt = (
-            f"You were mentioned in a {source_kind} (id={source_id}). "
-            f"The author wrote:\n\n{content}\n\n"
-            "Reply if appropriate; otherwise stay silent."
+        # Load the full thread the agent is being asked to join so it
+        # has real context, not just the mention snippet.  Uses ONLY
+        # existing CRUDs (no new schema): the same Message / Post /
+        # Comment rows the UI reads.  When the lookup fails (offline /
+        # source row missing / agent has no read access) we fall back
+        # silently to the mention-only prompt — the prior behaviour.
+        thread_context = MentionService._load_thread_context(
+            db, source_kind=source_kind, source_id=source_id,
+            requester_id=str(agent.id), max_messages=20,
         )
+
+        if thread_context:
+            prompt = (
+                f"You were mentioned in a {source_kind} (id={source_id}).\n\n"
+                f"## Prior thread (read this before responding):\n"
+                f"{thread_context}\n\n"
+                f"## New message (the one that mentioned you):\n"
+                f"{content}\n\n"
+                "Read the full prior thread above before drafting your "
+                "reply so you don't repeat what's already been said or "
+                "miss context.  Reply if appropriate; otherwise stay silent."
+            )
+        else:
+            prompt = (
+                f"You were mentioned in a {source_kind} (id={source_id}). "
+                f"The author wrote:\n\n{content}\n\n"
+                "Reply if appropriate; otherwise stay silent."
+            )
 
         try:
             # agentic_router.dispatch_to_agent is the canonical hook
