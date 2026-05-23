@@ -1618,6 +1618,86 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 100,
         'use_product': True,
     },
+    {
+        # TTS venv pre-warm — paced provisioning of every engine whose
+        # spec declares install_target='venv'.  Replaces the naive
+        # "create-all-venvs at boot in parallel" pattern which would
+        # spike disk I/O + network + RAM during dependency resolution
+        # at the exact moment the boot-grace gate is protecting user
+        # chat responsiveness.
+        #
+        # By routing through SEED_BOOTSTRAP_GOALS the work inherits
+        # every pacing primitive the agent_daemon already enforces:
+        #   - should_yield_to_user gate (skips ticks while user is
+        #     actively chatting)
+        #   - 30s poll interval (at most one engine starts per 30s)
+        #   - max_concurrent worker-slot cap (ONE install in flight)
+        #   - exponential backoff on consecutive_failures
+        #   - spark_budget hard cap (can't run away on bandwidth)
+        #
+        # Idempotency: is_venv_healthy() short-circuits warm boots —
+        # second tick after a successful install sees the venv healthy
+        # and moves to the next engine; final tick finds all healthy
+        # and the goal completes naturally.
+        #
+        # See also: tts/backend_venv.py:ensure_venv (idempotent venv
+        # creation), integrations/coding_agent/backend_repair_tools.py
+        # :repair_backend_venv (the tool the agent actually invokes).
+        'slug': 'bootstrap_provision_tts_venvs',
+        'goal_type': 'provision',
+        'title': 'TTS Engine Venv Provisioning — paced, one-at-a-time',
+        'description': (
+            'Ensure every TTS engine whose spec declares install_target='
+            "'venv' in integrations/channels/media/tts_router.py:"
+            'ENGINE_REGISTRY has a healthy private venv at '
+            '~/Documents/Nunba/data/venvs/<engine_id>/.\n\n'
+            'EXECUTION (do exactly this, no more):\n'
+            "1) Import ENGINE_REGISTRY and filter to specs where "
+            "spec.install_target == 'venv'.\n"
+            "2) For each such engine_id, call tts.backend_venv."
+            "is_venv_healthy(engine_id).\n"
+            "3) Pick the FIRST engine where is_venv_healthy returns "
+            "False.  If none are unhealthy, report 'all venvs healthy' "
+            "and stop — the goal is done for this tick.\n"
+            "4) Call repair_backend_venv(backend_name=<that engine>) "
+            "exactly ONCE per goal dispatch.  The tool wraps "
+            "tts.package_installer.install_backend_full which is "
+            "idempotent + creates the venv if missing + installs the "
+            "spec.pip_install_plan there + downloads model weights.\n"
+            "5) Return the tool's JSON result verbatim and stop.  "
+            "Do NOT loop over multiple engines in one dispatch — the "
+            "daemon's next tick will pick up the next unhealthy engine "
+            "after the current install completes.  Running multiple "
+            "pip installs in parallel would defeat the whole pacing "
+            "design.\n\n"
+            'STOP CONDITIONS (any one ends the dispatch):\n'
+            '- All venv-eligible engines pass is_venv_healthy → '
+            "report success and stop.\n"
+            '- repair_backend_venv returns success=False → report the '
+            'failure JSON and stop (the daemon will retry on the next '
+            'tick with exponential backoff already enforced by '
+            "consecutive_failures logic in agent_daemon).\n"
+            '- yield_to_user fires → daemon skips the dispatch '
+            'entirely (no work to undo).\n\n'
+            'CONSTRAINTS:\n'
+            '- One install per dispatch.  Never parallelise.\n'
+            '- Never wipe an existing healthy venv.  '
+            'wipe_first=False (the default).\n'
+            "- Do NOT touch piper, espeak, pocket_tts, mms_tts, or "
+            'any engine whose install_target is not "venv" — they '
+            'live in main interpreter or are bundled.\n'
+            '- Budget: 150 Spark for the whole loop.  Each install '
+            "typically costs 20-30 Spark; 5 engines fits well within."
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+            'priority': 2,           # below user-facing goals
+            'pace': 'one_per_tick',  # documented marker, not behaviour
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
 ]
 
 # ─── Loophole → Remediation Goal Map ───
