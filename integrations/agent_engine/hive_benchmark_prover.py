@@ -1836,14 +1836,50 @@ class HiveBenchmarkProver:
                     get_dispatcher)
                 dispatcher = get_dispatcher()
 
-                while time.time() < deadline:
+                # 2026-05-23 fix: short-circuit polling when no peer
+                # claims the task.  Before this guard, an unclaimed
+                # benchmark shard would spin the polling loop for the
+                # full `timeout` (300s default) waiting for a status
+                # transition that never came — because no peer was
+                # listening on the task queue — then fall through to
+                # local execution with zero remaining time budget,
+                # producing problems_solved=0 across the leaderboard.
+                # Evidence: 128/128 prior runs scored 0.0 in
+                # agent_data/benchmark_leaderboard.json.
+                #
+                # New behaviour: probe once for `claim_grace_seconds`.
+                # If the task stays at PENDING (nobody claimed), skip
+                # the long poll and let local execution use the full
+                # remaining time budget.  When a peer DOES claim, we
+                # poll until the deadline as before.
+                claim_grace_seconds = float(os.environ.get(
+                    'HEVOLVE_BENCHMARK_CLAIM_GRACE_SECONDS', '5'))
+                claim_deadline = time.time() + claim_grace_seconds
+                peer_claimed = False
+                while time.time() < claim_deadline:
                     task = dispatcher.get_task(task_id)
-                    if task and task.status in ('completed', 'validated'):
-                        result = task.result
+                    status = getattr(task, 'status', None) if task else None
+                    if status and status != 'pending':
+                        # 'assigned' / 'in_progress' / 'completed' /
+                        # 'validated' / 'failed' / 'cancelled' all
+                        # indicate the dispatcher routed it somewhere
+                        # (a peer or directly to a terminal state).
+                        peer_claimed = True
                         break
-                    if task and task.status == 'failed':
-                        break
-                    time.sleep(1)
+                    time.sleep(0.5)
+
+                if peer_claimed:
+                    while time.time() < deadline:
+                        task = dispatcher.get_task(task_id)
+                        if task and task.status in ('completed', 'validated'):
+                            result = task.result
+                            break
+                        if task and task.status == 'failed':
+                            break
+                        time.sleep(1)
+                # else: result stays None → falls through to
+                # _execute_shard_locally below, which is what we want
+                # when there's no peer listening.
             except Exception as exc:
                 logger.debug("Result polling failed for %s: %s",
                              task_id[:8], exc)
