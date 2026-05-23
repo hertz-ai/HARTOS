@@ -235,6 +235,71 @@ def test_reap_once_ignores_non_in_progress(monkeypatch):
     completed.fail.assert_not_called()
 
 
+class _RealSignatureTask:
+    """Stand-in for SmartLedger Task that enforces the REAL fail()
+    signature: ``fail(self, error: str, reason: str = "Task failed")``.
+
+    This class exists because the bare ``mock.Mock()`` used elsewhere in
+    this file accepts any arguments and therefore hid the 2026-05-23
+    production bug where zombie_reaper called ``task.fail(reason=...)``
+    without the required ``error`` positional.  The TypeError raised on
+    every zombie task crashed the reaper, leaving all 10 daemon worker
+    slots locked and silently blocking goal dispatch for hours.
+
+    DO NOT replace this with ``mock.Mock(spec=...)`` of the real Task —
+    that would couple this regression test to the full agent_ledger
+    import chain (cryptography, etc.) which isn't installed in CI.
+    """
+
+    def __init__(self, task_id='z1', age_hours=5):
+        self.id = task_id
+        self.status = _FakeTaskStatus.IN_PROGRESS
+        self.heartbeat_at = datetime.now(timezone.utc) - timedelta(hours=age_hours)
+        self.blocked_reason = None
+        self.fail_calls = []  # records (error, reason) actually passed
+
+    def fail(self, error: str, reason: str = "Task failed") -> bool:
+        # Mirror the real signature exactly — error is positional/keyword
+        # but REQUIRED.  Calling fail(reason=...) without error must
+        # raise TypeError here as it does in production.
+        self.fail_calls.append((error, reason))
+        self.status = _FakeTaskStatus.FAILED
+        return True
+
+
+def test_reap_once_uses_real_fail_signature(monkeypatch):
+    """Regression for the 2026-05-23 production bug: zombie_reaper called
+    ``task.fail(reason=...)`` without the required ``error`` positional.
+    The reaper crashed per-task; 0 zombies were reaped; daemon worker
+    slots stayed locked; 8 dispatched goals never claimed.
+
+    This test uses a fake Task that enforces the real fail() signature
+    so a future drift of the call site is caught immediately."""
+    zombie = _RealSignatureTask(task_id='z-real-sig', age_hours=5)
+    ledger = _FakeLedger([zombie])
+    audit_calls = []
+    _patch_imports(monkeypatch, [('agent-A', 'sess-1', ledger)], audit_calls)
+
+    out = zr.reap_once(dry_run=False)
+
+    # 1 task examined, 1 reaped, 0 errors — proves the call didn't crash
+    assert out['examined'] == 1, f"examined={out['examined']}, expected 1"
+    assert out['reaped'] == 1, f"reaped={out['reaped']}, expected 1 (was 0 before fix)"
+    assert out['errors'] == 0, (
+        f"errors={out['errors']}, expected 0.  Per-task crash means the "
+        f"production bug regressed: zombie_reaper called task.fail() with "
+        f"the wrong signature."
+    )
+    # And the error message recorded on the task is the zombie reason —
+    # not the default "Task failed".  Audit trail must explain WHY.
+    assert len(zombie.fail_calls) == 1
+    err, _reason = zombie.fail_calls[0]
+    assert 'zombie' in err.lower() and 'min' in err.lower(), (
+        f"error_message={err!r} — must contain 'zombie' + age suffix so "
+        f"operators can grep for reaper-caused failures vs real failures."
+    )
+
+
 def test_reap_once_one_failing_task_does_not_break_loop(monkeypatch):
     """Per-task exception is caught and counted, not raised."""
     bad = SimpleNamespace(

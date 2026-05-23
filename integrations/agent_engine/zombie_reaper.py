@@ -196,7 +196,13 @@ def reap_once(dry_run: bool = False) -> Dict[str, Any]:
 
                 if not dry_run:
                     if hasattr(task, 'fail') and callable(task.fail):
-                        task.fail(reason=reason)
+                        # Task.fail(error: str, reason: str = "Task failed")
+                        # — `error` is REQUIRED.  Passing only reason=...
+                        # raised TypeError per task and crashed the entire
+                        # reaper, leaving all 10 worker slots locked by
+                        # zombies and silently blocking goal dispatch.
+                        # See test_reap_once_uses_real_fail_signature.
+                        task.fail(error=reason, reason='zombie reaper')
                     else:
                         # Fallback: direct status assignment.  Legal
                         # IN_PROGRESS -> FAILED per STATE_MAP.
