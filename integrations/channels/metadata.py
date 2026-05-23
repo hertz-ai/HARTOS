@@ -105,34 +105,36 @@ CHANNEL_CATALOG = {
         'icon': 'whatsapp',
         'color': '#25d366',
         'category': 'core',
-        # auth_method=qr_session — same vocabulary already used by
-        # telegram_user / discord_user.  Pairs the user's existing
-        # WhatsApp account on their phone with a Nunba-side WAHA
-        # gateway by displaying a QR they scan from WhatsApp's own
-        # "Linked devices" UI.  No API keys, no developer portal.
-        'auth_method': 'qr_session',
+        # auth_method=gateway_qr — backed by the embedded Baileys gateway
+        # auto-spawned by integrations/social/whatsapp_supervisor.py.  The
+        # wizard fetches a real WhatsApp-Web QR from
+        # GET /api/social/channels/whatsapp/qr (which proxies to the
+        # gateway's GET /api/sessions/:id/qr) and the user scans it from
+        # WhatsApp → Linked Devices → Link a Device.  No Docker, no
+        # developer portal, no API keys.  Alternate path: "Link with
+        # phone number" — POST /whatsapp/pair-code returns the 8-char
+        # code that WhatsApp accepts under Link a Device → Link with
+        # phone number instead, no QR scan needed.
+        'auth_method': 'gateway_qr',
         'setup_fields': [
-            # phone_number is the only user-visible field on the
-            # default path — everything else is provisioned by the
-            # WAHA gateway running on this Nunba install.
             {'key': 'phone_number', 'label': 'Your WhatsApp Number', 'type': 'tel',
              'help': 'Your own E.164 number (e.g. +<country><number>). '
-                     'Each Nunba install binds its owner.'},
-            # auto: True — register_channel pre-fills these from env
-            # defaults (`WHATSAPP_API_URL`, `WHATSAPP_API_KEY`) so the
-            # user never has to know about WAHA's existence on the
-            # happy path.  Connect_Channel's form-builder skips fields
-            # with auto:True; admin Channels page still shows them so
-            # operators can override for non-localhost WAHA.
-            {'key': 'api_url', 'label': 'WAHA Base URL', 'type': 'text',
+                     'Required only for "Link with phone number"; QR scan '
+                     'works without it.'},
+            # auto:True — admin Channels page shows these so operators can
+            # point at a remote WAHA endpoint instead of the local Baileys
+            # gateway.  Connect_Channel's form-builder skips auto:True
+            # fields on the user-facing wizard.
+            {'key': 'api_url', 'label': 'Gateway Base URL', 'type': 'text',
              'auto': True, 'default': 'http://localhost:3000',
-             'help': 'WAHA HTTP API endpoint.  Defaults to localhost:3000; '
-                     'override via WHATSAPP_API_URL env or admin page.'},
+             'help': 'Defaults to the embedded Baileys gateway on '
+                     'localhost:3000.  Override via WHATSAPP_API_URL env '
+                     'to point at a remote WAHA endpoint instead.'},
             {'key': 'access_token', 'label': 'API Key', 'type': 'password',
              'auto': True, 'default': '',
-             'help': 'WAHA API key.  Empty for localhost WAHA in no-auth '
-                     'mode (default); set via WHATSAPP_API_KEY env when '
-                     'fronting WAHA with auth.'},
+             'help': 'Empty for the embedded gateway (no auth).  Set via '
+                     'WHATSAPP_API_KEY env when fronting a remote WAHA '
+                     'with auth.'},
             {'key': 'enable_self_chat_agent', 'label': 'Self-chat → Nunba',
              'type': 'toggle', 'default': True,
              'help': 'When you tap your own contact in WhatsApp ("Message '

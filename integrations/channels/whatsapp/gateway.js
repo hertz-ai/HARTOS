@@ -180,6 +180,31 @@ app.post('/api/sessions/:id/messages/send', async (req, res) => {
   }
 });
 
+// "Link with phone number" pairing — Baileys' requestPairingCode().
+// Phone must be a digits-only E.164 (e.g. "919003054371" — no '+'). Returns
+// the 8-char code the user types in WhatsApp → Linked Devices → Link with
+// phone number.  Code is valid for ~60s on WhatsApp's side; if it expires
+// the same endpoint can be called again to mint a new one.
+app.post('/api/sessions/:id/request-pair-code', async (req, res) => {
+  try {
+    const ctx = await ensureSession(req.params.id);
+    const phone = String((req.body && req.body.phone) || '').replace(/\D/g, '');
+    if (!phone) {
+      return res.status(400).json({ error: 'phone (digits only, E.164 without +) required' });
+    }
+    if (ctx.authenticated) {
+      return res.status(409).json({ error: 'already_authenticated' });
+    }
+    if (typeof ctx.sock.requestPairingCode !== 'function') {
+      return res.status(501).json({ error: 'pair-code not supported by this Baileys version' });
+    }
+    const code = await ctx.sock.requestPairingCode(phone);
+    res.json({ success: true, code });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message) });
+  }
+});
+
 app.post('/api/sessions/:id/stop', async (req, res) => {
   const ctx = getSession(req.params.id);
   if (ctx) {
