@@ -205,13 +205,7 @@ def dispatch_goal(goal_id: str, goal_type: str = 'marketing') -> str:
 
 @mcp.tool()
 def agent_status() -> str:
-    """Check agent daemon health, active dispatches, and system state."""
-    status = {
-        "daemon_enabled": os.environ.get('HEVOLVE_AGENT_ENGINE_ENABLED', 'false'),
-        "poll_interval": int(os.environ.get('HEVOLVE_AGENT_POLL_INTERVAL', '30')),
-        "max_concurrent": int(os.environ.get('HEVOLVE_AGENT_MAX_CONCURRENT', '10')),
-        "speculative_enabled": os.environ.get('HEVOLVE_SPECULATIVE_ENABLED', 'false'),
-    }
+    """Check agent daemon health, active dispatches, and system state.
 
     # Check running server
     try:
@@ -228,6 +222,19 @@ def agent_status() -> str:
         status['llm_server'] = 'not reachable'
 
     # Goal counts
+    All probes flow through ``core.health_probe`` (single canonical
+    source).  See that module's docstring for the root-cause notes
+    on why we route through it instead of reading env vars directly.
+    """
+    from core.health_probe import (
+        probe_agent_daemon, probe_llm, probe_nunba_flask,
+    )
+    status = probe_agent_daemon()
+    status['nunba_server'] = probe_nunba_flask()
+    status['llm_server'] = probe_llm()
+
+    # Goal counts (DB query — kept inline; not a "probe" in the
+    # health-check sense, this is a count-by-status aggregation).
     try:
         from integrations.agent_engine.goal_manager import GoalManager
         db = _get_db()
@@ -312,8 +319,7 @@ def list_recipes() -> str:
 
 @mcp.tool()
 def system_health() -> str:
-    """Full system health check: Flask server, LLM, DB, memory graph."""
-    health = {}
+    """Full system health check: Flask server, LLM, DB, memory graph.
 
     # Flask server
     try:
@@ -343,6 +349,16 @@ def system_health() -> str:
         health['langchain'] = {'status': 'up' if resp.status_code == 200 else 'error'}
     except Exception:
         health['langchain'] = {'status': 'down'}
+    All non-DB probes flow through ``core.health_probe`` (single
+    canonical source).  See that module for why we no longer hit
+    ``localhost:{get_port('llm')}/health`` directly.
+    """
+    from core.health_probe import probe_nunba_flask, probe_llm, probe_langchain
+    health = {
+        'flask': probe_nunba_flask(),
+        'llm': probe_llm(),
+        'langchain': probe_langchain(),
+    }
 
     # DB
     try:

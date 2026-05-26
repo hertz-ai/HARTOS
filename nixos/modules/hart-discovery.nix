@@ -31,7 +31,7 @@ in
         User = "hart";
         Group = "hart";
         WorkingDirectory = hartApp;
-        ExecStart = "${hartApp.python}/bin/python -c \"from integrations.social.peer_discovery import AutoDiscovery; d = AutoDiscovery(); d.start(); import time; time.sleep(999999)\"";
+        ExecStart = "${hartApp.python}/bin/python -c \"from integrations.social.peer_discovery import get_auto_discovery, get_peer_discovery; get_peer_discovery().start(); get_auto_discovery().start(); import time; time.sleep(999999)\"";
 
         EnvironmentFile = lib.mkIf (builtins.pathExists "/etc/hart/hart.env") "/etc/hart/hart.env";
 

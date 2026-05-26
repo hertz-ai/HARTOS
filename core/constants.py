@@ -28,6 +28,58 @@ DEFAULT_PROMPT_ID: int = 8888
 
 
 # ──────────────────────────────────────────────────────────────────────
+# AutoGen MessageTokenLimiter budget — single source of truth.
+#
+# Previously hardcoded as `max_tokens=3500` in 4 sites:
+#   create_recipe.py:907       — recipe-create context_handling
+#   reuse_recipe.py:1245       — reuse_recipe context_handling
+#   reuse_recipe.py:2279       — reuse_recipe alternate path
+#   reuse_recipe.py:2896       — reuse_recipe alternate path
+#
+# Why 2500 (was 3500): live evidence 2026-05-20, llama_server_8082.log
+# showed 477 "Context size has been exceeded" errors.  The autogen
+# transform clips messages to max_tokens, but the system prompt and
+# tool descriptions are appended AFTER the transform — typical
+# overhead ~3000-4000 tokens.  With max_tokens=3500 the total prompt
+# reaches ~7000+ tokens; under 4-slot concurrency on a 12288 n_ctx
+# llama-server, overlap of 2-3 active large prompts exhausts the
+# slot pool's effective context budget and llama returns the 400.
+# Lowering to 2500 leaves ~6000-7000 tokens total prompt size,
+# comfortable headroom for concurrent slots.  Quality impact is
+# negligible: 2500 tokens is still ~3-4 messages of dense history,
+# more than enough for the next-step reasoning autogen does.  If
+# quality regresses, raise back to 3000; never above 3500 without
+# a corresponding n_ctx bump on llama-server side.
+#
+# Tighter sites kept as-is:
+#   reuse_recipe.py:818  select_speaker (max_tokens=3000) — speaker-
+#       selection prompts are smaller by design.  Already tight.
+AUTOGEN_MESSAGE_TOKEN_BUDGET: int = 2500
+AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE: int = 1000  # individual message cap, unchanged
+AUTOGEN_HISTORY_LIMIT: int = 50                  # message-count limit, unchanged
+
+# ──────────────────────────────────────────────────────────────────────
+# Wire-layer trim budget (llm_outbound_logger.py hard left-trim).
+# Different scope from AUTOGEN_*: those soft-limit per-agent autogen
+# message history; THESE hard-clip the actual bytes sent to llama-server
+# so the request never exceeds (n_ctx / num_slots) - max_tokens - safety.
+# The wire layer catches autogen + langchain + raw openai SDK uniformly
+# (they all funnel through httpx) — the only place we can guarantee
+# zero context-overflow 500s across all frameworks.
+#
+# Env overrides:
+#   HEVOLVE_LLAMA_CTX_SIZE  — n_ctx on llama-server (must match the
+#                              --ctx-size cmdline; default tracks
+#                              Nunba/llama/llama_config.py:1527 = 12288)
+#   HEVOLVE_LLAMA_SLOTS     — concurrent slots (n_ctx is partitioned
+#                              across slots; default 1)
+LLAMA_CTX_SIZE_DEFAULT: int = 12288
+LLAMA_SLOTS_DEFAULT: int = 1
+WIRE_TRIM_SAFETY_MARGIN_TOKENS: int = 256       # headroom under the budget
+WIRE_TRIM_MARKER: str = '...[truncated head]...\n'
+
+
+# ──────────────────────────────────────────────────────────────────────
 # HIVE_DEPTH — maximum hop count for any cross-host task / hivemind /
 # federation propagation.
 #
@@ -65,6 +117,13 @@ SUPPORTED_LANG_DICT = {
     "cy": "Welsh", "hi": "Hindi", "bn": "Bengali", "ta": "Tamil",
     "pa": "Punjabi", "gu": "Gujarati", "kn": "Kannada", "te": "Telugu",
     "mr": "Marathi", "ml": "Malayalam", "en": "English",
+    # Indian English — Indic-accented variant.  Code preserved (NOT
+    # collapsed by `_normalize_lang` the way en-US is) because Nunba's
+    # TTS preference for en-IN routes to Indic Parler (ai4bharat,
+    # trained on All India Radio + Indic corpora) at position 1, while
+    # plain `en` keeps the chatterbox-first American/expressive ladder.
+    # See `Nunba/tts/tts_engine.py:_FALLBACK_LANG_ENGINE_PREFERENCE`.
+    "en-IN": "English (Indian)",
     "ja": "Japanese", "it": "Italian", "ne": "Nepali", "si": "Sinhala",
     "or": "Odia", "as": "Assamese", "sd": "Sindhi", "ks": "Kashmiri",
     "doi": "Dogri", "mni": "Manipuri", "sa": "Sanskrit", "kok": "Konkani",
@@ -183,6 +242,37 @@ GREETINGS = {
 GREETING_FALLBACK_LANG: str = "en"
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Brand identity — used as the assistant's "Who am I?" sentence in
+# every English chat path that doesn't already carry a per-agent
+# persona.  Single source of truth so HARTOS's draft prompt and Nunba's
+# fallback chat handler can never drift on the brand wording.
+#
+# Non-English paths get their identity through
+# core.agent_personality.get_regional_tone_prompt(lang) — which carries
+# the Nunba name natively in script (e.g. Tamil "நண்பா").  This
+# constant is for English (and any language with no regional-tone
+# entry).
+#
+# Call sites:
+#   - integrations/agent_engine/speculative_dispatcher.py
+#     (HARTOS draft prompt persona_block default)
+#   - Nunba/routes/hartos_backend_adapter.py
+#     (cold-boot fallback chat system prompt)
+#
+# Phrasing intentionally short — every byte costs draft-prompt tokens
+# and Nunba is also a TTS-spoken name (the brand identity reads
+# naturally aloud).  Per-site framing (privacy mention, language
+# directive, etc.) is added on top by the call site, not baked here.
+# ──────────────────────────────────────────────────────────────────────
+NUNBA_BRAND_IDENTITY: str = (
+    "You are Nunba, a friendly and helpful local AI assistant. "
+    "Hevolve.ai is the web cloud version of Nunba — same intelligence, "
+    "different deployment. With hive enabled, you crowdsource "
+    "intelligence from peer Nunba devices and Hevolve cloud nodes."
+)
+
+
 # Every GREETINGS key MUST be a registered language.  Mirrors the
 # NON_LATIN_SCRIPT_LANGS invariant above — a missing display name for
 # a greeting-supported lang is a build-time error, not a runtime
@@ -257,3 +347,298 @@ def prompt_needs_vision(prompt: str) -> bool:
         return bool(VISION_INTENT_PATTERN.search(prompt))
     except Exception:
         return False
+
+
+
+# ──────────────────────────────────────────────────────────────────────
+# ENCOUNTER_TOPICS — WAMP topic namespace for the P2P encounter feature
+# (BLE rotating-pubkey discovery → autonomous sighting correlation →
+# avatar-only mutual-like swipe → icebreaker agent → map overlay).
+#
+# Full design in Claude-memory: project_encounter_icebreaker.md.
+#
+# Single source of truth — consumed by:
+#   - integrations.social.encounter_api (publish on swipe/match)
+#   - integrations.agent_engine.goal_seeding (encounter_icebreaker_agent
+#     subscribes to 'match' topic)
+#   - Nunba desktop wamp_router + landing-page crossbarWorker
+#   - Hevolve_React_Native AutobahnConnectionManager (subscribes to
+#     per-user 'sighting' and 'icebreaker' private topics)
+#
+# Per-user privacy scoping: 'sighting', 'swipe', 'icebreaker' are
+# always prefixed with the user_id by the publisher; 'match' publishes
+# TWO events (one per participant) so one user's subscription never
+# leaks the other's pubkey outside the matched pair.
+#
+# Do NOT inline duplicate topic strings; import from here.
+# ──────────────────────────────────────────────────────────────────────
+ENCOUNTER_TOPIC_SIGHTING: str = 'com.hevolve.encounter.sighting'
+ENCOUNTER_TOPIC_SWIPE: str = 'com.hevolve.encounter.swipe'
+ENCOUNTER_TOPIC_MATCH: str = 'com.hevolve.encounter.match'
+ENCOUNTER_TOPIC_ICEBREAKER: str = 'com.hevolve.encounter.icebreaker'
+
+ENCOUNTER_TOPICS: tuple = (
+    ENCOUNTER_TOPIC_SIGHTING,
+    ENCOUNTER_TOPIC_SWIPE,
+    ENCOUNTER_TOPIC_MATCH,
+    ENCOUNTER_TOPIC_ICEBREAKER,
+)
+
+# Invariant: all encounter topics share the canonical 'com.hevolve.
+# encounter.' prefix so crossbar ACL rules + log grepping are uniform.
+# A topic outside this prefix would not be scoped by the existing
+# WAMP router authorization (wamp_router.py _handle_publish per-topic
+# authorization, Task #301), so drift here is a security regression.
+_ENCOUNTER_PREFIX = 'com.hevolve.encounter.'
+assert all(t.startswith(_ENCOUNTER_PREFIX) for t in ENCOUNTER_TOPICS), (
+    f"ENCOUNTER_TOPICS must all share prefix {_ENCOUNTER_PREFIX!r}: "
+    f"{[t for t in ENCOUNTER_TOPICS if not t.startswith(_ENCOUNTER_PREFIX)]}"
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# ENCOUNTER feature tunables — physical-world sighting correlation.
+# A beacon is treated as a SIGHTING (autonomous pairing of the real
+# person in front of the user with their rotating pubkey) only when
+# ALL three conditions hold together.  Loosening any one of these
+# degrades to random-pairs-in-a-crowd; tightening any one degrades to
+# never-fires.  Values tuned for phone-in-hand, face-to-face scenario.
+# Pocket-mode (low motion detected on both devices) relaxes compass
+# tolerance to ±90° per BleSightingDetector rules.
+#
+# Consumed by:
+#   - Hevolve_React_Native BleSightingDetector (Kotlin port of same)
+#   - integrations.social.encounter_api.ENCOUNTER_SIGHTING_RULES
+#   - tests.unit.test_sighting_correlation
+# ──────────────────────────────────────────────────────────────────────
+ENCOUNTER_SIGHTING_RSSI_PEAK_DBM: int = -55      # ~1.5m line-of-sight
+ENCOUNTER_SIGHTING_MIN_DWELL_SEC: int = 3        # both parties slowed/stopped
+ENCOUNTER_SIGHTING_COMPASS_TOL_DEG: int = 30     # devices facing within cone
+ENCOUNTER_PUBKEY_ROTATION_SEC: int = 15 * 60     # 15 min / relaunch / geo-shift
+ENCOUNTER_DISCOVERABLE_TTL_SEC: int = 4 * 60 * 60  # 4h auto-off
+ENCOUNTER_DISCOVERABLE_MAX_TOGGLES_24H: int = 6
+ENCOUNTER_SIGHTING_EXPIRES_SEC: int = 24 * 60 * 60  # swipe grace window
+ENCOUNTER_MATCH_WINDOW_SEC: int = 5 * 60         # both sightings must be
+                                                  # within this window to match
+ENCOUNTER_DRAFT_MAX_CHARS: int = 220             # icebreaker length cap
+
+
+# ──────────────────────────────────────────────────────────────────────
+# CHAT_TOPICS — WAMP topic namespace for cross-device chat mirroring
+# (U1-U8 workstream, task ledger #389).
+#
+# chat.new  — a new assistant or user message was persisted.  Payload
+#             carries the full ChatMessage row (seq, msg_id, user_id,
+#             agent_id, role, content, request_id, lang, device_id,
+#             attachments, created_at).  Every device subscribed to the
+#             per-user topic mirrors the row into its local view.
+# chat.ack  — a subscriber ACKs receipt up to seq=N.  Used by the server
+#             to decide when a message can be evicted from the hot cache
+#             (the durable row stays in the DB for cursor-pull replay).
+#
+# Per-user scoping: publisher MUST suffix the user_id so a subscriber
+# can ONLY see their own messages.  Enforced by Nunba's wamp_router
+# _handle_publish per-topic authorization (Task #301).
+#
+# Do NOT inline duplicate topic strings; import from here.
+# ──────────────────────────────────────────────────────────────────────
+CHAT_TOPIC_NEW: str = 'com.hertzai.hevolve.chat.new'
+CHAT_TOPIC_ACK: str = 'com.hertzai.hevolve.chat.ack'
+
+CHAT_TOPICS: tuple = (
+    CHAT_TOPIC_NEW,
+    CHAT_TOPIC_ACK,
+)
+
+# Invariant mirrors ENCOUNTER_TOPICS: shared prefix = uniform ACL.  The
+# existing chat-reply topic 'com.hertzai.hevolve.chat.{user_id}' at
+# hart_intelligence_entry.py:2174,4211 uses the same prefix — per-user
+# suffixing happens at publish-time, not at constant-definition time.
+_CHAT_PREFIX = 'com.hertzai.hevolve.chat.'
+assert all(t.startswith(_CHAT_PREFIX) for t in CHAT_TOPICS), (
+    f"CHAT_TOPICS must all share prefix {_CHAT_PREFIX!r}: "
+    f"{[t for t in CHAT_TOPICS if not t.startswith(_CHAT_PREFIX)]}"
+)
+
+# Cursor-pull tunables — bound the worst-case pull size so a freshly-
+# restored device doesn't stall on a 10k-message replay, and so a
+# malicious cursor=0 pull can't exfiltrate the whole table.
+CHAT_CURSOR_PULL_MAX_ROWS: int = 500
+CHAT_CURSOR_PULL_MAX_BYTES: int = 2 * 1024 * 1024  # 2 MB body cap
+
+
+# Chat-hot-path stage strings (#508) — single i18n site, consumed by
+# publish_chat_stage().  Keep values ≤ 60 chars (UI bubble truncates).
+CHAT_STAGE_TEXTS: dict = {
+    'loading_context':  'Loading your context…',
+    'loading_memory':   'Recalling our recent chat…',
+    'loading_tools':    'Preparing tools…',
+    'thinking':         'Thinking…',
+    'generating':       'Generating a response…',
+    'finalizing':       'Finalizing the answer…',
+    # Generic fallback used by _with_tool_logging — callers pass
+    # text=TOOL_LABELS.get(name, 'Running {name}…') for the real text.
+    'tool_call':        'Running a tool…',
+}
+CHAT_STAGES: frozenset = frozenset(CHAT_STAGE_TEXTS)
+
+
+# Per-tool human-readable labels for tool_call stage emits (#508).  Static
+# entries cover the hardcoded tools in get_tools(is_first=True) + canonical
+# provider/builtin tools.  Dynamic tool registries (skills, service_tools,
+# providers, Tier-2 goal-aware) should call register_tool_label() at the
+# point of Tool() construction so their tools also get a friendly label.
+# Unknown tools fall back to "Running {name}…" at the emit site.
+# Keep values <= 60 chars (UI bubble truncates).
+TOOL_LABELS: dict = {
+    # Memory + history
+    'FULL_HISTORY':                'Searching your message history…',
+    'recall_memory':               'Recalling memories…',
+    'remember_memory':             'Saving to memory…',
+    # Computation + web
+    'Calculator':                  'Calculating…',
+    'google-search':               'Searching the web…',
+    # Vision / camera
+    'Visual_Context_Camera':       'Looking through camera…',
+    'Visual_Context_Watcher':      'Setting up a visual watcher…',
+    'Request_Camera_Access':       'Requesting camera access…',
+    'Image_Inference_Tool':        'Analyzing the image…',
+    'Animate_Character':           'Animating your character…',
+    # Media generation
+    'Generate_Image':              'Generating an image…',
+    'Text to image':               'Generating an image from text…',
+    # Channels + invites + rooms
+    'Connect_Channel':             'Connecting channel…',
+    'Invite_Friend':               'Generating an invite link…',
+    'Join_External_Room':          'Joining the room…',
+    # Agent + planning
+    'Agentic_Router':              'Planning the next steps…',
+    'Create_Agent':                'Starting agent creation…',
+    # System / OS
+    'Shell_Command':               'Running a command…',
+    'Computer_Action':              'Acting on your screen…',
+    'Computer_Screenshot':         'Taking a screenshot…',
+    'Request_Screen_Access':       'Requesting screen access…',
+    # Cloud expert
+    'Cloud_LLM':                   'Consulting the cloud expert…',
+    # Navigation + UX
+    'Navigate_App':                'Opening the requested page…',
+    'List_Pending_Actions':        'Listing pending actions…',
+    # Data extraction + user lookup
+    'Data_Extraction_From_URL':    'Extracting data from URL…',
+    'User_details_tool':           'Looking up user details…',
+    'OpenAPI_Specification':       'Calling the OpenAPI service…',
+    # Resource requests + self-improvement
+    'Request_Resource':            'Requesting a resource…',
+    'Suggest_Share_Worthy_Content': 'Finding share-worthy content…',
+    'Observe_User_Experience':     'Recording an observation…',
+    'Self_Critique_And_Enhance':   'Reflecting on past suggestions…',
+    # ── reuse_recipe.py inner tools (autogen function_map names) ──
+    # #509 — added here (canonical static home) instead of being
+    # dynamically register_tool_label()-ed at reuse_recipe import time.
+    'txt2img':                     'Generating an image…',
+    'img2txt':                     'Reading the image…',
+    'save_data_in_memory':         'Saving to memory…',
+    'get_saved_metadata':          'Listing saved memory…',
+    'get_data_by_key':             'Recalling from memory…',
+    'get_user_id':                 'Looking up your user id…',
+    'get_prompt_id':               'Looking up your prompt id…',
+    'Generate_video':              'Generating a video…',
+    'get_user_uploaded_file':      'Fetching your uploaded file…',
+    'get_user_camera_inp':         'Reading from your camera…',
+    'get_chat_history':            'Reading recent chat history…',
+    'search_visual_history':       'Searching your visual history…',
+    'register_visual_watcher':     'Registering a visual watcher…',
+    'search_long_term_memory':     'Searching long-term memory…',
+    'save_to_long_term_memory':    'Saving to long-term memory…',
+    'create_scheduled_jobs':       'Scheduling a task…',
+    'send_message_to_user':        'Sending you a message…',
+    'send_presynthesized_video_to_user': 'Sending a video to you…',
+    'send_message_in_seconds':     'Scheduling a message…',
+    'consult_expert':              'Consulting the cloud expert…',
+    'get_user_camera_inp_by_mins': 'Reading camera history…',
+    'execute_windows_or_android_command': 'Running a system command…',
+    'google_search':               'Searching the web…',
+    'create_new_agent':            'Starting agent creation…',
+    'update_persona':              'Updating role/persona in DB…',
+    # ── journey_engine.py + outreach_crm_tools.py (autogen tools) ──
+    # #509 — moved from inline _journey_ui_labels / _outreach_ui_labels
+    # dicts at the call site so register_labeled_function picks them up
+    # via TOOL_LABELS.get(name, …) without per-site dups.
+    'view_journey_pipeline':       'Reviewing journey pipeline…',
+    'advance_prospect_stage':      'Advancing prospect stage…',
+    'run_journey_tick':            'Running journey tick…',
+    'send_prospect_message':       'Sending prospect message…',
+    'create_prospect':             'Creating CRM prospect…',
+    'send_outreach_email':         'Sending outreach email…',
+    'create_followup_sequence':    'Scheduling follow-up sequence…',
+    'check_pending_followups':     'Checking pending follow-ups…',
+    'move_prospect_stage':         'Moving prospect to next stage…',
+    'get_pipeline_status':         'Loading pipeline status…',
+    'list_sent_emails':            'Listing sent emails…',
+    # ── system_introspect_tool.py — duplicate-of-truth from
+    #    _INTROSPECT_LABELS pulled into the canonical dict so the
+    #    static names live in one place (the module still keeps its
+    #    own dict for the LangChain `labeled_tool` call sites). ──
+    'get_gpu_tier':                'Checking GPU tier…',
+    'list_running_models':         'Looking up active models…',
+    'get_tts_status':              'Checking TTS engine status…',
+    'get_tier_thresholds':         'Reading tier thresholds…',
+    'get_boot_decision':           'Reading boot rationale…',
+    'get_system_health':           'Checking system health…',
+    'list_decisions':              'Listing recorded decisions…',
+    'explain_decision':            'Explaining a system decision…',
+    # ── core/agent_tools.py @log_tool_execution-decorated functions
+    #    (the 28 "canonical" core tools shared by create_recipe +
+    #    reuse_recipe via register_core_tools).  These are *autogen
+    #    function_map* names — snake_case — and are SEPARATE names from
+    #    their similarly-named LangChain Tool() literals above (e.g.,
+    #    `text_2_image` (autogen) vs `Generate_Image` / `Text to image`
+    #    (LangChain).  Same verb, same UX, registered both ways.  A
+    #    follow-up task will canonicalize the names; for now we list
+    #    them all so the lookup never misses. ──
+    'text_2_image':                'Generating an image…',
+    'data_extraction_from_url':    'Extracting data from URL…',
+    'device_control':              'Acting on your device…',
+    'get_user_details':            'Looking up user details…',
+    'observe_user_experience':     'Recording an observation…',
+    'request_resource':            'Requesting a resource…',
+    'self_critique_and_enhance':   'Reflecting on past suggestions…',
+    'suggest_share_worthy_content': 'Finding share-worthy content…',
+    # ── integrations/channels/agent_tools.py @log_tool_execution funcs
+    #    (channel-adapter tools shared by both create + reuse). ──
+    'register_channel':            'Registering a channel…',
+    'send_to_channel':             'Sending to a channel…',
+    'send_install_link':           'Sending an install link…',
+    'list_channels':               'Listing your channels…',
+    'get_channel_context':         'Reading channel context…',
+    'reconnect_channel':           'Reconnecting channel…',
+    'disconnect_channel':          'Disconnecting channel…',
+    # ── integrations/providers/agent_tools.py labeled_tool() literals
+    #    that the prior pass missed (casing drift from Generate_video). ──
+    'Generate_Video':              'Generating a video…',
+    'List_AI_Providers':           'Listing AI providers…',
+    'Provider_Leaderboard':        'Loading provider leaderboard…',
+    # ── AP2 (Agent Protocol 2) — agentic commerce payment tools.
+    #    Registered dynamically via get_ap2_tools_for_autogen() in
+    #    create_recipe.py:1761 + reuse_recipe.py:2494 in both flows.
+    'request_payment':             'Requesting payment authorization…',
+    'authorize_payment':           'Authorizing payment…',
+    'process_payment':             'Processing payment via gateway…',
+}
+
+
+def register_tool_label(name: str, label: str) -> None:
+    """Register a UI label for a tool name.  Used by dynamic tool registries
+    (integrations.skills, integrations.service_tools, integrations.providers,
+    Tier-2 goal-aware tool packs) to supply human-readable status text next
+    to where they construct Tool() objects.  Idempotent — overwrites prior
+    entry for the same name so a registry can refine its labels over time.
+
+    Tools that don't register a label fall back to the generic
+    'Running {name}…' template at the emit site in
+    hart_intelligence_entry._with_tool_logging.
+    """
+    if not name or not label:
+        return
+    TOOL_LABELS[str(name)] = str(label)[:60]

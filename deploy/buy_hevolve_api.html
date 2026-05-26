@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Buy Hevolve API — Free tier forever + Starter from $9</title>
+<meta name="description"
+      content="Hosted hive-aggregated AI intelligence.  Free tier of 100 req/day, forever, no card.  Paid tiers from $9/mo.  90% of paid revenue flows to compute providers." />
+<style>
+  :root {
+    --bg: #0F0E17;
+    --card: #1E1E1E;
+    --accent: #00E89D;
+    --accent-2: #6C63FF;
+    --danger: #FF6B6B;
+    --text: #F5F4FF;
+    --muted: rgba(245, 244, 255, 0.6);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background-color: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.5;
+  }
+  .container { max-width: 980px; margin: 0 auto; padding: 3rem 1.5rem; }
+  h1 {
+    font-size: clamp(2rem, 5vw, 3rem);
+    margin: 0 0 1rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, var(--accent-2), var(--accent));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .lede { font-size: 1.15rem; max-width: 720px; color: rgba(245,244,255,0.88); margin-bottom: 0.5rem; }
+  .small { color: var(--muted); font-size: 0.95rem; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1.25rem;
+    margin: 2.5rem 0;
+  }
+  .tier {
+    background-color: var(--card);
+    border-radius: 10px;
+    padding: 1.5rem;
+    border: 1px solid rgba(255,255,255,0.08);
+    display: flex;
+    flex-direction: column;
+  }
+  .tier.popular { border: 2px solid var(--accent); position: relative; }
+  .badge {
+    position: absolute;
+    top: -12px; left: 16px;
+    background-color: var(--accent);
+    color: var(--bg);
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .tier h3 { margin: 0 0 0.25rem; text-transform: capitalize; font-size: 1.3rem; }
+  .tier .desc { font-size: 0.85rem; color: var(--muted); min-height: 56px; }
+  .price { font-size: 2.4rem; font-weight: 700; margin: 0.75rem 0 0; }
+  .price small { font-size: 0.9rem; opacity: 0.6; font-weight: 400; margin-left: 4px; }
+  .tier ul {
+    list-style: none; padding: 0; margin: 0.75rem 0 1.25rem;
+    font-size: 0.88rem;
+  }
+  .tier ul li { padding: 4px 0; opacity: 0.9; }
+  .btn {
+    display: inline-block;
+    text-align: center;
+    padding: 11px 16px;
+    border-radius: 8px;
+    border: none;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.95rem;
+    text-decoration: none;
+    color: var(--bg);
+    background-image: linear-gradient(to right, var(--accent), #0078FF);
+    transition: transform 0.15s ease;
+  }
+  .btn:hover { transform: translateY(-1px); }
+  .btn.outline {
+    background: transparent;
+    border: 1px solid rgba(255,255,255,0.2);
+    color: var(--text);
+    background-image: none;
+  }
+  .btn.disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    background-image: none;
+    background-color: rgba(255,255,255,0.04);
+    color: var(--muted);
+    border: 1px dashed rgba(255,255,255,0.15);
+  }
+  .split {
+    margin-top: 2.5rem;
+    padding: 1.75rem;
+    border-radius: 12px;
+    background-color: rgba(108, 99, 255, 0.08);
+    border: 1px solid rgba(108, 99, 255, 0.25);
+  }
+  .split h2 { margin-top: 0; }
+  .split-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 1rem;
+    margin-top: 1rem;
+  }
+  .split-cell .num {
+    font-size: 2rem;
+    font-weight: 700;
+  }
+  pre {
+    background-color: #15141C;
+    padding: 1rem;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    color: #C7C5DC;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+  a.link { color: var(--accent); }
+  footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid rgba(255,255,255,0.06); color: var(--muted); font-size: 0.85rem; }
+  .placeholder-warning {
+    margin: 1rem 0 0;
+    padding: 0.75rem 1rem;
+    background-color: rgba(255, 107, 107, 0.08);
+    border: 1px solid rgba(255, 107, 107, 0.3);
+    border-radius: 6px;
+    color: #FFB8B8;
+    font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <h1>Hevolve API</h1>
+  <p class="lede">
+    Hosted hive-aggregated AI intelligence. Free tier of 100 requests per day, forever, no credit card.
+    Paid tiers buy throughput — same intelligence, more bandwidth.
+  </p>
+  <p class="small">
+    Prefer to run it locally? Nunba does — same hive, offline, free.
+    <a class="link" href="https://hevolve.ai/download">Download Nunba</a>.
+    Open source: <a class="link" href="https://github.com/hertz-ai/HARTOS">github.com/hertz-ai/HARTOS</a>.
+  </p>
+
+  <div class="grid">
+
+    <div class="tier">
+      <h3>Free</h3>
+      <p class="desc">Free forever — intelligence belongs to everyone.</p>
+      <div class="price">$0<small>/mo</small></div>
+      <ul>
+        <li>100 requests/day</li>
+        <li>3,000 tokens/mo</li>
+        <li>No credit card, no expiry</li>
+        <li>Same hive intelligence</li>
+      </ul>
+      <a class="btn outline" href="https://hevolve.ai/signup">Get free API key</a>
+    </div>
+
+    <div class="tier popular">
+      <span class="badge">Most picked</span>
+      <h3>Starter</h3>
+      <p class="desc">For solo builders. 10× daily / 10× monthly vs free.</p>
+      <div class="price">$9<small>/mo</small></div>
+      <ul>
+        <li>1,000 requests/day</li>
+        <li>30,000 tokens/mo</li>
+        <li>$0.50 / 1K tokens overage</li>
+        <li>90% goes to compute providers</li>
+      </ul>
+      <a class="btn buy-link" data-tier="starter" href="#">Buy Starter $9</a>
+    </div>
+
+    <div class="tier">
+      <h3>Pro</h3>
+      <p class="desc">For small teams. Priority queue + hive priority.</p>
+      <div class="price">$49<small>/mo</small></div>
+      <ul>
+        <li>10,000 requests/day</li>
+        <li>300,000 tokens/mo</li>
+        <li>$0.30 / 1K tokens overage</li>
+        <li>Priority routing</li>
+      </ul>
+      <a class="btn buy-link" data-tier="pro" href="#">Buy Pro $49</a>
+    </div>
+
+    <div class="tier">
+      <h3>Enterprise</h3>
+      <p class="desc">For scale. Dedicated hive lane + SLA.</p>
+      <div class="price">$499<small>/mo</small></div>
+      <ul>
+        <li>100,000 requests/day</li>
+        <li>10M tokens/mo</li>
+        <li>$0.20 / 1K tokens overage</li>
+        <li>Dedicated hive lane + SLA</li>
+      </ul>
+      <a class="btn buy-link" data-tier="enterprise" href="#">Buy Enterprise $499</a>
+    </div>
+
+  </div>
+
+  <div id="placeholder-warning" class="placeholder-warning" style="display: none;">
+    <strong>Note to the operator:</strong>
+    <code>stripe_payment_links.json</code> was not found in this directory.
+    Run <code>python deploy/mint_stripe_payment_links.py</code> with
+    <code>STRIPE_API_KEY</code> set to populate the buy buttons.  Until
+    then the buttons are disabled.
+  </div>
+
+  <div class="split">
+    <h2>Where the money goes</h2>
+    <p class="small" style="margin-top: 0;">
+      The split is committed in code (<code>integrations/agent_engine/revenue_aggregator.py</code>),
+      not in a policy doc.  We can't quietly change it; the constants are
+      auditable in the public repo.
+    </p>
+    <div class="split-grid">
+      <div class="split-cell">
+        <div class="num" style="color: var(--accent);">90%</div>
+        <div class="small">Compute providers</div>
+      </div>
+      <div class="split-cell">
+        <div class="num" style="color: var(--accent-2);">9%</div>
+        <div class="small">Infrastructure</div>
+      </div>
+      <div class="split-cell">
+        <div class="num" style="color: var(--danger);">1%</div>
+        <div class="small">Central treasury</div>
+      </div>
+    </div>
+  </div>
+
+  <h2 style="margin-top: 2.5rem;">One curl away</h2>
+  <pre># 1. Sign up at hevolve.ai/signup, get a free API key (no card needed).
+
+# 2. Use it:
+curl -X POST https://api.hevolve.ai/api/v1/intelligence/chat \
+     -H "Authorization: Bearer hev_..." \
+     -H "Content-Type: application/json" \
+     -d '{"message": "Hello hive"}'</pre>
+
+  <footer>
+    <p>
+      Hevolve AI · open source · 90% to compute providers · 1% to us · free tier forever.
+      <br />
+      Docs: <a class="link" href="https://nunba.hevolve.ai/reference/commercial-api">nunba.hevolve.ai/reference/commercial-api</a>
+      &nbsp;·&nbsp;
+      Code: <a class="link" href="https://github.com/hertz-ai/HARTOS">github.com/hertz-ai/HARTOS</a>
+    </p>
+  </footer>
+</div>
+
+<script>
+(function () {
+  // Resolve the Payment Link URLs from stripe_payment_links.json
+  // (same directory as this HTML file).  Run
+  // `python deploy/mint_stripe_payment_links.py` with STRIPE_API_KEY
+  // set to generate it.
+  function disable(btn, reason) {
+    btn.classList.add('disabled');
+    btn.textContent = reason;
+    btn.removeAttribute('href');
+    btn.addEventListener('click', function (e) { e.preventDefault(); });
+  }
+
+  fetch('stripe_payment_links.json', {cache: 'no-store'})
+    .then(function (r) {
+      if (!r.ok) throw new Error('stripe_payment_links.json HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function (links) {
+      var byTier = {};
+      links.forEach(function (l) {
+        if (l.payment_link_url) byTier[l.tier] = l.payment_link_url;
+      });
+      document.querySelectorAll('a.buy-link').forEach(function (btn) {
+        var tier = btn.getAttribute('data-tier');
+        var url = byTier[tier];
+        if (url) {
+          btn.setAttribute('href', url);
+          btn.setAttribute('target', '_blank');
+          btn.setAttribute('rel', 'noopener noreferrer');
+        } else {
+          disable(btn, 'Link not configured');
+        }
+      });
+    })
+    .catch(function () {
+      document.getElementById('placeholder-warning').style.display = 'block';
+      document.querySelectorAll('a.buy-link').forEach(function (btn) {
+        disable(btn, 'Run mint script first');
+      });
+    });
+})();
+</script>
+</body>
+</html>

@@ -209,6 +209,11 @@ class GPUWorker:
 
     # Signal line the worker prints to stdout when ready to serve.
     READY_MARKER = '__WORKER_READY__'
+    # Emitted immediately after READY — carries the post-load GPU VRAM
+    # measurement in GB as a float.  Parent captures and forwards to
+    # vram_manager.record_actual_usage.  Workers that can't measure emit
+    # 0.0 and the parent ignores the reading.
+    VRAM_MARKER_PREFIX = '__WORKER_VRAM_GB__'
 
     def __init__(
         self,
@@ -374,6 +379,18 @@ class GPUWorker:
         _extra_paths = [
             p for p in sys.path
             if p and os.path.isdir(p)
+        # torch + TTS deps). Include real dirs AND zip / egg archives —
+        # cx_Freeze bundles application packages (HARTOS's ``integrations``
+        # tree) inside ``library.zip``; excluding files broke worker
+        # spawn under frozen Nunba.exe with ModuleNotFoundError on the
+        # central dispatcher itself. Preserve an existing PYTHONPATH by
+        # appending our paths to the front (caller-set overrides last).
+        _extra_paths = [
+            p for p in sys.path
+            if p and (
+                os.path.isdir(p)
+                or (os.path.isfile(p) and p.lower().endswith(('.zip', '.egg')))
+            )
         ]
         if _extra_paths:
             _existing = env.get('PYTHONPATH', '')
@@ -428,6 +445,36 @@ class GPUWorker:
         """Background thread: read worker stderr and log it."""
         if not self._proc or not self._proc.stderr:
             return
+        """Background thread: read worker stderr, log it, and surface
+        structured failure signals to the central error_advice system.
+
+        Specifically: when a worker subprocess dies because of a missing
+        Python package (``ModuleNotFoundError: No module named 'X'``),
+        we forward the event to:
+
+          1. ``core.error_advice.handle_exception(agent_remediation=True)``
+             — creates a ``goal_type='self_heal'`` AgentGoal so the
+             local coding agent can investigate WHY the package wasn't
+             pre-installed (improves the freeze pip plan over time).
+          2. Nunba's deterministic self-heal (``tts.package_installer
+             ._self_heal_missing_transitives`` if importable) — pip-
+             installs the missing package immediately, so the next
+             worker spawn succeeds without waiting for the agent loop.
+
+        Why here and not in the worker subprocess: the worker is a
+        sandboxed child with no DB session, no GoalManager, no agent
+        engine.  The parent has all of those, plus the ability to
+        kick off a deterministic pip install.  Single chokepoint per
+        worker instance, idempotent via ``_self_heal_seen_modules``.
+
+        See ``core/error_advice.py`` for the full advice fan-out
+        contract.  See ``tts/package_installer.py`` for the
+        deterministic-install sibling.
+        """
+        if not self._proc or not self._proc.stderr:
+            return
+        if not hasattr(self, '_self_heal_seen_modules'):
+            self._self_heal_seen_modules = set()
         try:
             for line in self._proc.stderr:
                 line = line.rstrip()
@@ -435,6 +482,126 @@ class GPUWorker:
                     logger.info(f"[{self.name}] {line}")
         except Exception:
             pass  # pipe closed, process dead
+
+                    self._maybe_self_heal_from_line(line)
+        except Exception:
+            pass  # pipe closed, process dead
+
+    def _maybe_self_heal_from_line(self, line: str) -> None:
+        """Pattern-match worker stderr for ``ModuleNotFoundError`` and
+        kick off agentic + deterministic remediation.  Idempotent per
+        ``(worker, package)`` so a flood of identical traceback frames
+        produces exactly one heal attempt."""
+        import re
+        match = re.search(
+            r"ModuleNotFoundError: No module named ['\"]([\w.\-]+)['\"]",
+            line,
+        )
+        if not match:
+            return
+        pkg = match.group(1)
+        if pkg in self._self_heal_seen_modules:
+            return
+        self._self_heal_seen_modules.add(pkg)
+
+        logger.warning(
+            f"{self.name}: subprocess missing Python package '{pkg}' — "
+            f"dispatching to error_advice + deterministic self-heal"
+        )
+
+        # 1) Agentic side: create a self_heal goal for the coding agent.
+        #    Throttled per-fingerprint inside error_advice; safe to call
+        #    on every detected event.
+        try:
+            from core.error_advice import handle_exception
+            synthetic = ModuleNotFoundError(f"No module named '{pkg}'")
+            synthetic.name = pkg  # type: ignore[attr-defined]
+            handle_exception(
+                synthetic,
+                category='subprocess.tool_load',
+                severity='high',
+                agent_remediation=True,
+                context={
+                    'worker_name': self.name,
+                    'worker_module': self.module,
+                    'missing_package': pkg,
+                    'remediation_hint': (
+                        f"Add '{pkg}' to the freeze pip plan (Nunba "
+                        f"scripts/setup_freeze_nunba.py _tts_deps or "
+                        f"the appropriate _<X>_deps tuple) so it's "
+                        f"bundled into python-embed/Lib/site-packages "
+                        f"on the next build, AND add it to "
+                        f"tts/package_installer.py legacy fallback "
+                        f"plan for runtime self-heal coverage."
+                    ),
+                },
+            )
+        except Exception as e:
+            logger.debug(f"{self.name}: error_advice dispatch skipped: {e}")
+
+        # 2) Deterministic fast-path: pip-install the missing package
+        #    directly so the next worker spawn picks it up without
+        #    waiting for the agentic loop.  Uses the same
+        #    ``self.python_exe`` the worker subprocess used (so the
+        #    package lands in the SAME interpreter's site-packages,
+        #    e.g. python-embed/Lib/site-packages on a frozen install,
+        #    or the dev .venv on a source run).  Spawned in a daemon
+        #    thread so we don't block the stderr drain loop.
+        def _install_async():
+            try:
+                # `--target` to user-site keeps it consistent with
+                # tts.package_installer's existing pattern: bundled
+                # python-embed is read-only on Program Files installs,
+                # so user-writable site-packages is required.  We rely
+                # on the user-site already being on sys.path (set by
+                # platform_paths.ensure_user_site_on_path at boot).
+                target = self._user_site_packages_dir()
+                pip_args = [
+                    self.python_exe, '-m', 'pip', 'install',
+                    '--no-build-isolation', '--progress-bar', 'off',
+                    '--disable-pip-version-check',
+                ]
+                if target:
+                    pip_args.extend(['--target', target])
+                pip_args.append(pkg)
+                logger.info(
+                    f"{self.name}: deterministic pip install: {pkg} → "
+                    f"{target or '<default site>'}"
+                )
+                rc = subprocess.run(
+                    pip_args, capture_output=True, text=True, timeout=180,
+                ).returncode
+                if rc == 0:
+                    logger.info(
+                        f"{self.name}: '{pkg}' installed; respawn worker to "
+                        f"retry tool load."
+                    )
+                else:
+                    logger.warning(
+                        f"{self.name}: pip install '{pkg}' rc={rc} — "
+                        f"agent self-heal goal will pick up from here."
+                    )
+            except Exception as e:
+                logger.debug(
+                    f"{self.name}: deterministic pip install for '{pkg}' "
+                    f"skipped: {e}"
+                )
+
+        threading.Thread(
+            target=_install_async, daemon=True,
+            name=f"self-heal-{self.name}-{pkg}",
+        ).start()
+
+    def _user_site_packages_dir(self) -> Optional[str]:
+        """Return the user-writable site-packages dir for runtime
+        installs, or None if Nunba's platform_paths helper isn't
+        importable (HARTOS-only deploys).
+        """
+        try:
+            from tts.package_installer import get_user_site_packages  # type: ignore
+            return get_user_site_packages()
+        except Exception:
+            return None
 
     def _drain_stdout(self) -> None:
         """Background thread: read worker stdout into the line queue.
@@ -469,10 +636,42 @@ class GPUWorker:
                 return
             # Ignore any other startup chatter
             logger.debug(f"[{self.name}] startup: {line}")
+            stripped = line.strip()
+            if stripped == self.READY_MARKER:
+                self._ready = True
+                logger.info(f"{self.name}: worker ready")
+                return
+            # VRAM-measurement marker — emitted by workers BEFORE READY.
+            # Forward the measurement and keep looping for READY.
+            if stripped.startswith(self.VRAM_MARKER_PREFIX):
+                self._handle_vram_marker(stripped)
+                continue
+            # Ignore any other startup chatter
+            logger.debug(f"[{self.name}] startup: {stripped}")
 
         # Timeout
         self._reap(force=True)
         raise WorkerTimeout(f"{self.name}: startup timeout ({self.startup_timeout}s)")
+
+    def _handle_vram_marker(self, stripped_line: str) -> None:
+        """Parse a '__WORKER_VRAM_GB__<n>' startup marker and forward the
+        measurement to vram_manager.record_actual_usage.
+
+        Non-fatal on parse error: older workers don't emit this marker;
+        a failed parse just means we fall back to the declared
+        VRAM_BUDGETS entry.
+        """
+        payload = stripped_line[len(self.VRAM_MARKER_PREFIX):].strip()
+        try:
+            gb = float(payload)
+        except ValueError:
+            logger.debug(f"{self.name}: unparseable VRAM marker '{payload}'")
+            return
+        try:
+            from integrations.service_tools.vram_manager import vram_manager
+            vram_manager.record_actual_usage(self.name, gb)
+        except Exception as e:
+            logger.debug(f"{self.name}: VRAM marker forward failed: {e}")
 
     def _write_line(self, line: str) -> None:
         if not self._proc or not self._proc.stdin:
@@ -586,6 +785,25 @@ def run_worker(
     _root_logger.setLevel(logging.INFO)
     worker_log = logging.getLogger(f'worker.{name}')
 
+    # Self-identify: which Python is running this worker, and which
+    # site-packages it can see.  Required for #92 — venv-spawn pickup
+    # confirmation.  Pre-2026-05-07 trace evidence (older
+    # tts_chatterbox_turbo.err showed C:\miniconda3\Lib\unittest\mock.py
+    # in the stack) suggested the worker was sometimes loaded from the
+    # WRONG Python interpreter (host miniconda) instead of the engine's
+    # quarantine venv (~/Documents/Nunba/data/venvs/<engine>/).
+    # Logging sys.executable + sys.prefix at startup makes this
+    # observable: every TTS engine's worker stderr should now show
+    # the venv path, NOT the main interpreter.
+    try:
+        worker_log.info(
+            f'startup: python={sys.executable} prefix={sys.prefix} '
+            f'site_packages_top3={sys.path[:3]!r}'
+        )
+    except Exception:
+        # Never let a logging blunder block model load
+        pass
+
     # ── Phase 1: load model ────────────────────────────────────────
     try:
         worker_log.info('loading model...')
@@ -597,6 +815,28 @@ def run_worker(
         sys.exit(2)
 
     # ── Phase 2: announce ready ────────────────────────────────────
+    # ── Phase 2a: self-report post-load VRAM ──────────────────────
+    # Emitted BEFORE READY so the parent's _wait_ready loop sees it
+    # in-order on the stdout queue.  (Placing it after READY races
+    # against the next call(): if 'ready' arrives first and the
+    # marker follows late, the marker ends up being consumed as a
+    # response payload → invalid-JSON error.)
+    #
+    # Best-effort: workers that can't measure (CPU-only, Metal,
+    # torch missing) emit 0.0 and the parent ignores the reading.
+    # Lets us stub conservative budgets (e.g. new OmniVoice at
+    # 3.0 GB) and auto-correct after the first real load.
+    try:
+        import torch as _torch_vram_probe
+        if _torch_vram_probe.cuda.is_available():
+            _measured = _torch_vram_probe.cuda.memory_allocated(0) / (1024 ** 3)
+        else:
+            _measured = 0.0
+    except Exception:
+        _measured = 0.0
+    _emit(f'{GPUWorker.VRAM_MARKER_PREFIX}{_measured:.3f}')
+
+    # ── Phase 2b: announce ready ───────────────────────────────────
     _emit(GPUWorker.READY_MARKER)
 
     # ── Phase 3: serve requests ────────────────────────────────────
@@ -670,6 +910,19 @@ def _resolve_python_exe() -> str:
     return sys.executable
 
 
+def _resolve_backend_venv_python(tool_name: Optional[str]) -> Optional[str]:
+    """Return the per-backend venv's python.exe if one exists.
+
+    Thin shim over ``core.venv_paths.venv_python_if_exists`` — kept as
+    a module-local name so the spawn-site call signature is stable.
+    The single source of truth lives in ``core.venv_paths`` and is
+    shared with ``tts.backend_venv`` so install + spawn paths can
+    never drift apart.
+    """
+    from core.venv_paths import venv_python_if_exists
+    return venv_python_if_exists(tool_name)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # High-level helper: one-call tool wrapper
 # ═══════════════════════════════════════════════════════════════════
@@ -716,6 +969,7 @@ class ToolWorker:
         startup_timeout: float = 90.0,
         request_timeout: float = 120.0,
         idle_timeout: float = 300.0,
+        python_exe: Optional[str] = None,
         # Back-compat aliases — callers on the old API still work
         worker_module: Optional[str] = None,
         worker_args: Optional[list] = None,
@@ -740,6 +994,17 @@ class ToolWorker:
             idle_timeout: Seconds of inactivity after which the worker is
                           auto-stopped to free VRAM. Default 5 min.
                           Set to 0 to disable auto-stop.
+            python_exe: Python interpreter to spawn the worker subprocess
+                        under. None (default) = `_resolve_python_exe()`,
+                        which picks python-embed when present else
+                        sys.executable. Use this to run the worker inside
+                        a per-engine venv (e.g. parler-tts needs
+                        transformers==4.46.x while main has 5.x; pass
+                        the venv's python.exe path here so the dispatch
+                        subprocess sees the pinned deps). Read at
+                        `_get_or_start` time, so callers may set
+                        `tool.python_exe = '...'` after construction
+                        before first synth.
 
             worker_module / worker_args: DEPRECATED — legacy aliases. If
                 `tool_module` is not given, we fall back to `worker_module`.
@@ -766,6 +1031,7 @@ class ToolWorker:
         self.startup_timeout = startup_timeout
         self.request_timeout = request_timeout
         self.idle_timeout = idle_timeout
+        self.python_exe = python_exe
 
         self._worker: Optional[GPUWorker] = None
         self._lock = threading.Lock()
@@ -1033,11 +1299,23 @@ class ToolWorker:
                 cli_args = [self.tool_module]
                 if self.variant:
                     cli_args.append(self.variant)
+                # Resolve the spawn interpreter at start time, not at
+                # ToolWorker.__init__ time: the per-backend venv is
+                # typically created lazily on first install, AFTER the
+                # ToolWorker singleton has been constructed.  Order:
+                #   1. Explicit self.python_exe (test override / caller-set)
+                #   2. Per-backend venv at <data>/venvs/<tool_name>/  ← venv-installed deps
+                #   3. GPUWorker default = _resolve_python_exe() (python-embed)
+                spawn_python = (
+                    self.python_exe
+                    or _resolve_backend_venv_python(self.tool_name)
+                )
                 self._worker = GPUWorker(
                     name=self.tool_name,
                     module=self._DISPATCHER,
                     startup_timeout=self.startup_timeout,
                     request_timeout=self.request_timeout,
+                    python_exe=spawn_python,
                     args=cli_args,
                 )
                 self._worker.start()
@@ -1178,3 +1456,320 @@ if __name__ == '__main__':
     _tool_module = sys.argv[1]
     _variant = sys.argv[2] if len(sys.argv) > 2 else None
     _dispatch_and_run(_tool_module, _variant)
+# ── #58 Scope-2: reflection dispatch via catalog id ────────────────
+#
+# The Python-tool path (above) covers every code-shipped engine —
+# each *_tool.py defines `_load[_<variant>]` + `_synthesize[_<variant>]`
+# by convention.  Adding a NEW engine that fits a homogeneous load+
+# synth API used to require writing a whole new *_tool.py just to wrap
+# the import + method call.  This was friction for engines whose synth
+# API is reflection-friendly (Kokoro, Pocket-TTS, etc.).
+#
+# Reflection path: a catalog entry with no `tool_module` but the full
+# 5-field contract (`import_path`, `init_args`, `synth_method`,
+# `params_map`, `output_format`) is dispatchable via the catalog
+# alone.  The 5-field contract lives in `tts_router._REFLECTION_FIELDS`
+# and the canonical output formats in `tts_router._OUTPUT_FORMATS`.
+# Validation fires at catalog-ingest (single source of truth in
+# `tts_router._validate_engine_caps`); the dispatcher trusts what
+# made it past the gate.
+
+def _normalize_to_wav_file(
+    raw: Any,
+    output_format: str,
+    output_path: str,
+    sample_rate: int = 24000,
+) -> tuple:
+    """Normalize a reflection-dispatched engine's raw output to a WAV
+    file on disk.  Returns ``(output_path, duration_seconds)``.
+
+    Canonical ``output_format`` values mirror
+    ``tts_router._OUTPUT_FORMATS``:
+
+    * ``'wav_bytes'`` — bytes object holding a WAV byte stream;
+      written verbatim.
+    * ``'numpy_24k'`` — 1-D float32 numpy array @ 24 kHz mono;
+      written via scipy.io.wavfile at 24000 Hz regardless of the
+      caller's ``sample_rate`` arg (the contract pins the rate).
+    * ``'file_path'`` — str path the engine already wrote to;
+      copied to ``output_path`` if different.
+    * ``'bytesio'`` — io.BytesIO containing wav bytes; written
+      verbatim.
+
+    Raises TypeError on shape mismatch (engine declared one format
+    but returned another) and ValueError on unknown ``output_format``
+    so the caller can surface a precise wire error rather than a
+    silent miswrite.
+    """
+    import shutil
+
+    if output_format == 'wav_bytes':
+        if not isinstance(raw, (bytes, bytearray)):
+            raise TypeError(
+                f"output_format='wav_bytes' but raw is "
+                f"{type(raw).__name__}"
+            )
+        with open(output_path, 'wb') as fh:
+            fh.write(raw)
+    elif output_format == 'bytesio':
+        import io as _io
+        if not isinstance(raw, _io.BytesIO):
+            raise TypeError(
+                f"output_format='bytesio' but raw is "
+                f"{type(raw).__name__}"
+            )
+        with open(output_path, 'wb') as fh:
+            fh.write(raw.getvalue())
+    elif output_format == 'file_path':
+        if not isinstance(raw, str) or not raw:
+            raise TypeError(
+                f"output_format='file_path' but raw is "
+                f"{type(raw).__name__!r}"
+            )
+        if raw != output_path:
+            shutil.copyfile(raw, output_path)
+    elif output_format == 'numpy_24k':
+        try:
+            import scipy.io.wavfile  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                f"output_format='numpy_24k' requires scipy: {e}"
+            )
+        if not hasattr(raw, 'dtype'):
+            raise TypeError(
+                f"output_format='numpy_24k' but raw is "
+                f"{type(raw).__name__}"
+            )
+        # Pin to 24 kHz per contract; cast to float32 (canonical type).
+        scipy.io.wavfile.write(output_path, 24000, raw.astype('float32'))
+    else:
+        raise ValueError(
+            f"unknown output_format {output_format!r}; canonical set is "
+            f"wav_bytes / numpy_24k / file_path / bytesio"
+        )
+
+    # Duration: try wave header (PCM only — stdlib's wave module
+    # rejects float WAV with `wave.Error: unknown format: 3`).  scipy
+    # writes float32 for numpy_24k, so fall back to scipy.io.wavfile
+    # for that format.  Either path lands on a real number; only when
+    # both fail does duration default to 0.0.
+    duration = 0.0
+    try:
+        import wave
+        with wave.open(output_path, 'rb') as wf:
+            n_frames = wf.getnframes()
+            sr = wf.getframerate()
+            duration = n_frames / sr if sr > 0 else 0.0
+    except Exception:
+        try:
+            import scipy.io.wavfile  # type: ignore
+            sr, data = scipy.io.wavfile.read(output_path)
+            duration = len(data) / sr if sr > 0 else 0.0
+        except Exception:
+            duration = 0.0
+
+    return output_path, duration
+
+
+def _build_reflection_callbacks(
+    catalog_id: str,
+    entry_capabilities: Dict[str, Any],
+    output_dir: Optional[str] = None,
+) -> tuple:
+    """Build ``(load, handle)`` callbacks for a reflection-only catalog
+    entry.  No on-disk *_tool.py needed.
+
+    Validation runs against `tts_router._validate_engine_caps` first;
+    raises RuntimeError on any contract violation so the caller can
+    exit cleanly via the shared error path (printing to stderr +
+    sys.exit(2) — same shape as `_dispatch_and_run`'s missing-callbacks
+    path).
+
+    The 5-field contract:
+
+    * ``import_path``    — ``'pkg.module:ClassName'``
+    * ``init_args``      — ``{}`` kwargs for ``ClassName(**init_args)``
+    * ``synth_method``   — instance method name on the loaded model
+    * ``params_map``     — ``{payload_key → method_kwarg}`` translation
+    * ``output_format``  — one of `tts_router._OUTPUT_FORMATS`
+
+    The handler accepts the same wire payload existing TTS workers do —
+    ``request['text']`` is required; optional ``output_path``,
+    ``sample_rate``, plus any keys named in ``params_map``.  Returns
+    the same shape (``{path, duration, sample_rate, engine}``) so any
+    caller routing through the reflection path is wire-compatible with
+    the on-disk *_tool.py path.
+    """
+    from integrations.channels.media.tts_router import _validate_engine_caps
+    err = _validate_engine_caps(entry_capabilities)
+    if err is not None:
+        raise RuntimeError(f'catalog entry {catalog_id!r}: {err}')
+
+    import_path = entry_capabilities['import_path']
+    init_args = entry_capabilities.get('init_args') or {}
+    synth_method = entry_capabilities['synth_method']
+    params_map = entry_capabilities.get('params_map') or {}
+    output_format = entry_capabilities['output_format']
+
+    if ':' not in import_path:
+        raise RuntimeError(
+            f"catalog entry {catalog_id!r}: import_path must be "
+            f"'pkg.module:ClassName', got {import_path!r}"
+        )
+    mod_name, cls_name = import_path.split(':', 1)
+
+    # Output dir resolution — mirrors pocket_tts_tool's fallback shape.
+    if output_dir is None:
+        try:
+            from core.platform_paths import get_data_dir  # type: ignore
+            output_dir = os.path.join(
+                get_data_dir(), 'tts_outputs', 'reflection'
+            )
+        except Exception:
+            output_dir = os.path.join(
+                os.path.expanduser('~'), '.hevolve', 'models',
+                'reflection_outputs',
+            )
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError:
+        # ENOSPC / read-only home — fall back to tempdir so the worker
+        # can still respond (a synth that can't write its WAV will fail
+        # later with a clearer ENOSPC error than os.makedirs would).
+        import tempfile as _tempfile
+        output_dir = _tempfile.gettempdir()
+
+    def _load_reflection() -> Any:
+        import importlib
+        mod = importlib.import_module(mod_name)
+        cls = getattr(mod, cls_name, None)
+        if cls is None:
+            raise RuntimeError(
+                f'catalog entry {catalog_id!r}: class {cls_name!r} not '
+                f'found in module {mod_name!r}'
+            )
+        return cls(**init_args)
+
+    def _handle_reflection(model: Any, request: Dict[str, Any]) -> Dict[str, Any]:
+        text = request.get('text', '')
+        if not text or not isinstance(text, str):
+            return {'error': 'text is required'}
+
+        # Translate request → method kwargs via params_map.  Keys NOT
+        # named in params_map are ignored (engines opt into what they
+        # see).  Plus 'text' under whatever name the engine declared.
+        kwargs: Dict[str, Any] = {}
+        for payload_key, method_arg in params_map.items():
+            if payload_key in request:
+                kwargs[method_arg] = request[payload_key]
+        # If the engine didn't declare 'text' in params_map, default to
+        # passing it as 'text' — most reflection-friendly engines name
+        # the arg that exact way.
+        if 'text' not in params_map:
+            kwargs.setdefault('text', text)
+
+        method = getattr(model, synth_method, None)
+        if method is None or not callable(method):
+            return {'error': f'method {synth_method!r} not found on model'}
+
+        # Output path: respect request override; else hash-derived under
+        # the resolved output_dir.
+        out_path = request.get('output_path')
+        if not out_path:
+            import hashlib as _h
+            digest = _h.md5(
+                f"{text[:50]}:{catalog_id}".encode()
+            ).hexdigest()[:12]
+            out_path = os.path.join(
+                output_dir, f'{catalog_id}_{digest}.wav'
+            )
+
+        try:
+            raw = method(**kwargs)
+            path, duration = _normalize_to_wav_file(
+                raw, output_format, out_path,
+                sample_rate=request.get('sample_rate', 24000),
+            )
+        except Exception as e:
+            import traceback as _tb
+            return {
+                'error': f'{type(e).__name__}: {e}',
+                'traceback': _tb.format_exc()[-2000:],
+            }
+
+        return {
+            'path': path,
+            'duration': round(duration, 3),
+            'sample_rate': request.get('sample_rate', 24000),
+            'engine': f'reflection:{catalog_id}',
+        }
+
+    return _load_reflection, _handle_reflection
+
+
+def _dispatch_catalog_id(catalog_id: str) -> None:
+    """Run a worker loop for a reflection-only catalog entry.
+
+    Spawned by the parent process via:
+        python -m integrations.service_tools.gpu_worker --catalog-id <id>
+
+    Exit codes mirror `_dispatch_and_run`:
+      2 — diagnostic on stderr (catalog unreachable, entry not found,
+          validation failed); parent sees WorkerCrash on next call.
+    """
+    try:
+        from integrations.service_tools.model_catalog import get_catalog
+    except Exception as e:
+        print(
+            f'[gpu_worker] cannot import model_catalog: {e}',
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    try:
+        catalog = get_catalog()
+        entry = catalog.get(catalog_id)
+    except Exception as e:
+        print(
+            f'[gpu_worker] catalog load failed for {catalog_id!r}: {e}',
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if entry is None:
+        print(
+            f'[gpu_worker] catalog has no entry {catalog_id!r}',
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    try:
+        load, handle = _build_reflection_callbacks(
+            catalog_id, entry.capabilities or {},
+        )
+    except RuntimeError as e:
+        print(f'[gpu_worker] {e}', file=sys.stderr)
+        sys.exit(2)
+
+    run_worker(name=f'reflection.{catalog_id}', load=load, handle=handle)
+
+
+if __name__ == '__main__':
+    # Usage:
+    #   python -m integrations.service_tools.gpu_worker <module> [variant]
+    #   python -m integrations.service_tools.gpu_worker --catalog-id <id>
+    if len(sys.argv) >= 3 and sys.argv[1] == '--catalog-id':
+        _dispatch_catalog_id(sys.argv[2])
+    elif len(sys.argv) >= 2 and not sys.argv[1].startswith('--'):
+        _tool_module = sys.argv[1]
+        _variant = sys.argv[2] if len(sys.argv) > 2 else None
+        _dispatch_and_run(_tool_module, _variant)
+    else:
+        print(
+            'usage: python -m integrations.service_tools.gpu_worker '
+            '<tool.module.path> [variant]\n'
+            '   or: python -m integrations.service_tools.gpu_worker '
+            '--catalog-id <id>',
+            file=sys.stderr,
+        )
+        sys.exit(2)

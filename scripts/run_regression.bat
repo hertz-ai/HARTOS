@@ -194,6 +194,13 @@ REM Group 15: E2E Realworld Resonance (12 scenarios)
 set REALWORLD_TESTS=^
     tests/realworld_resonance_test.py
 
+REM Group 16: Journey coverage — Bucket 3 (J250-J429).  Skip-as-gap
+REM marker suite.  Most SKIP with specific "infra X not built" reasons;
+REM each skip IS the living gap dashboard.  Zero fails expected; a
+REM failure means either a real regression or a formerly-skipped RED
+REM journey has infra now and the test needs real assertions wired.
+set JOURNEY_TESTS=tests/e2e/journey/
+
 REM ===== CI MODE =====
 if "%CI%"=="true" goto :ci_mode
 if "%CI%"=="1" goto :ci_mode
@@ -263,6 +270,10 @@ echo.
 
 echo --- E2E Realworld Resonance ---
 "%PYTHON_EXE%" -m pytest %REALWORLD_TESTS% --noconftest --tb=short --color=no -q --junitxml="%JUNIT_DIR%\realworld.xml"
+echo.
+
+echo --- Journey Coverage (J250-J429 gap dashboard) ---
+"%PYTHON_EXE%" -m pytest %JOURNEY_TESTS% --noconftest --tb=short --color=no -q --junitxml="%JUNIT_DIR%\journey.xml"
 echo.
 
 echo ========================================

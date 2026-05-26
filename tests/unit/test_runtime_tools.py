@@ -164,7 +164,8 @@ class TestVRAMManager:
             # Should return safe defaults
             assert 'cuda_available' in info
 
-    @patch('subprocess.run', side_effect=FileNotFoundError)
+    @patch('core.subprocess_safe.run_bounded',
+           side_effect=FileNotFoundError)
     @patch('torch.cuda.is_available', return_value=True)
     @patch('torch.cuda.get_device_name', return_value='RTX 3070')
     @patch('torch.cuda.get_device_properties')
@@ -173,6 +174,13 @@ class TestVRAMManager:
     def test_detect_gpu_with_cuda(self, mock_reserved, mock_alloc,
                                    mock_props, mock_name, mock_avail,
                                    mock_smi, vm):
+        # Patch core.subprocess_safe.run_bounded - vram_manager uses
+        # that, NOT subprocess.run directly.  The previous patch on
+        # subprocess.run was a no-op (run_bounded uses Popen) so the
+        # real nvidia-smi was running and the test only "passed" when
+        # nvidia-smi happened to time out at 5s; bumping the timeout
+        # to 15s in the post-shipment fix made nvidia-smi succeed
+        # and exposed the latent test bug.
         mock_props.return_value = MagicMock(total_memory=8 * 1024**3)
         vm._gpu_info = None
         info = vm.detect_gpu()

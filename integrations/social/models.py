@@ -151,13 +151,23 @@ def get_engine():
             # WAL allows concurrent reads + one writer without blocking readers.
             # busy_timeout=3000 (3s) — fail fast rather than blocking daemon threads
             # for 15-30s which triggers watchdog restarts.
+            #
+            # NullPool means every checkout creates a fresh connection, so
+            # this hook fires per-checkout, not per-engine.  Combining the
+            # three PRAGMAs into a single executescript call halves the
+            # per-checkout overhead vs. three separate cursor.execute
+            # round-trips (matters under daemon-tick storm — py-spy traces
+            # showed connection setup as a top-N consumer when the
+            # speculative dispatcher iterated goals × idle_agents).
             if _is_sqlite and not _is_memory:
                 @event.listens_for(_engine, "connect")
                 def _set_sqlite_wal(dbapi_connection, connection_record):
                     cursor = dbapi_connection.cursor()
-                    cursor.execute("PRAGMA journal_mode=WAL")
-                    cursor.execute("PRAGMA busy_timeout=3000")
-                    cursor.execute("PRAGMA synchronous=NORMAL")
+                    cursor.executescript(
+                        "PRAGMA journal_mode=WAL;"
+                        "PRAGMA busy_timeout=3000;"
+                        "PRAGMA synchronous=NORMAL;"
+                    )
                     cursor.close()
     return _engine
 
@@ -243,6 +253,7 @@ try:
         ShareableLink, ShareEvent, UserConsent, MarketplaceListing,
         ListingReview, MCPServer, MCPTool, ComputePledge, PledgeConsumption,
         UserChannelBinding, ConversationEntry, ChannelPresence,
+        DiscoverablePref, EncounterSighting,
     )
 except ImportError:
     # Standalone/Docker mode: sql package not installed, use local definitions
@@ -267,4 +278,5 @@ except ImportError:
         ShareableLink, ShareEvent, UserConsent, MarketplaceListing,
         ListingReview, MCPServer, MCPTool, ComputePledge, PledgeConsumption,
         UserChannelBinding, ConversationEntry, ChannelPresence,
+        DiscoverablePref, EncounterSighting,
     )

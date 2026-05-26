@@ -58,6 +58,36 @@ def _wamp_to_local(uri: str) -> Optional[str]:
     return None
 
 
+# Topic prefixes EXCLUDED from SSE fan-out.  Default empty: every emit
+# reaches local + WAMP + SSE.  Add a prefix here ONLY when a topic
+# proves too noisy / internal for end-clients (high-frequency tick
+# events, per-token streaming, debug probes).  Most platform topics
+# (theme.*, resonance.*, federation.*, inference.*, memory.*,
+# action_state.*) are valid SSE traffic for admin dashboards / telemetry
+# views, so they stay on by default.
+#
+# 'bus.': MessageBus.publish auto-emits a `bus.<topic>` echo of every
+# publish (core/peer_link/message_bus.py:367) for HARTOS-internal
+# cross-subsystem subscribers.  These are NOT meant for the SPA — the
+# canonical SSE delivery is the SEPARATE `_route_sse` leg in the same
+# publish() call (line 373) which calls broadcast_sse_safe with the
+# RAW topic.  Without this denylist entry the EventBus auto-bridge at
+# line 218 fires broadcast_sse_safe AGAIN with `bus.<topic>` — two
+# SSE events for one publish, with different `type=` keys, defeating
+# the SPA's msg_id||request_id dedup keys (which diverge across the
+# two envelope shapes).  Live evidence 2026-05-10 20:28:29 showed
+# TTS audio playing twice on the same chat turn caused by exactly
+# this dual-bridge race (bus.chat.pupit + chat.pupit + message all
+# fired in 10ms).  Adding the denylist entry keeps `bus.*` events
+# HARTOS-internal while preserving the canonical SSE leg.
+_SSE_DENYLIST_PREFIXES: tuple = ('bus.',)
+
+
+def _topic_targets_sse(topic: str) -> bool:
+    """True unless the topic is on the SSE denylist."""
+    return not any(topic.startswith(prefix) for prefix in _SSE_DENYLIST_PREFIXES)
+
+
 class EventBus:
     """Topic-based pub/sub event bus with optional Crossbar WAMP bridge.
 
@@ -136,11 +166,31 @@ class EventBus:
             _from_wamp: Internal flag — True when event originated from WAMP
                         (prevents echo loop back to Crossbar).
 
+        Cross-transport dedup contract:
+          - Each emit() injects a unique ``msg_id`` (uuid4 hex) into the
+            data dict if the caller didn't set one.  This is the
+            per-event dedup key clients use to suppress duplicates that
+            arrive via multiple transports (WAMP + SSE).
+          - ``request_id`` is the per-request GROUPING key (multiple
+            thinking events share one request_id but each has its own
+            msg_id).  Clients use request_id for filtering daemon traces
+            and grouping into thinking containers, NOT for dedup.
+          - For proactive emits with no request_id (agent self-initiated
+            thinking, telemetry pushes), msg_id is the ONLY id needed.
+            Each event renders independently because msg_ids are unique.
+
         Returns:
             Number of listeners that were called.
         """
         self._emit_count += 1
         called = 0
+
+        # Inject per-event dedup id (uuid4 hex).  Skipped if caller
+        # already supplied msg_id — they may want to use a domain-
+        # specific stable id for replay-on-reconnect scenarios.
+        if isinstance(data, dict) and 'msg_id' not in data:
+            import uuid as _uuid
+            data['msg_id'] = _uuid.uuid4().hex
 
         # Exact match listeners
         with self._lock:
@@ -167,6 +217,22 @@ class EventBus:
         # Bridge to WAMP (skip if event already came from WAMP → no echo)
         if not _from_wamp and self._wamp_connected and self._wamp_session:
             self._publish_to_wamp(topic, data)
+
+        # Bridge to SSE (Nunba desktop / Android web view).  This grew the
+        # SSE transport adapter the broadcast_sse_safe docstring asked for
+        # (line 393 of this file).  Topic policy is a DENYLIST (see
+        # _SSE_DENYLIST_PREFIXES at module top, default empty) — every
+        # topic fans out to SSE by default; add a prefix to the denylist
+        # only when a topic proves too noisy / internal for end-clients.
+        # Per-event dedup happens client-side via msg_id (auto-injected
+        # below for dict payloads), so the same event arriving via WAMP
+        # and SSE renders once.  Echo guard: skip when the event came
+        # from WAMP so a WAMP→local→SSE round trip doesn't double-deliver
+        # a message that the WAMP bridge already shipped on its own
+        # connection.
+        if not _from_wamp and _topic_targets_sse(topic):
+            _user_id = data.get('user_id') if isinstance(data, dict) else None
+            broadcast_sse_safe(topic, data, user_id=_user_id)
 
         return called
 

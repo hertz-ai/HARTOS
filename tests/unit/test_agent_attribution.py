@@ -24,6 +24,10 @@ from integrations.agent_engine.agent_attribution import (
     ActionStep,
     begin_action,
     record_step,
+    Observation,
+    begin_action,
+    record_step,
+    record_observation,
     complete_action,
     get_attribution,
     ACTION_TTL_SECONDS,
@@ -293,11 +297,18 @@ class TestWorldModelBridgeIntegration(unittest.TestCase):
         # prompt contains the attribution chain JSON
         import json
         chain = json.loads(call_kwargs['prompt'])
+        # Gap 5: structured attribution chain now lives in its own
+        # kwarg, not a JSON blob packed into 'prompt'.  'prompt'
+        # carries a compact human-readable summary for HevolveAI's
+        # text-distillation path.
+        chain = call_kwargs['attribution_chain']
         self.assertEqual(chain['agent_id'], 'benchmark_prover')
         self.assertEqual(chain['action_type'], 'benchmark_run')
         self.assertEqual(chain['step_count'], 2)
         self.assertIn('step_credits', chain)
         self.assertIn('success_score', chain)
+        self.assertIn('benchmark_prover', call_kwargs['prompt'])
+        self.assertIn('benchmark_run', call_kwargs['prompt'])
 
 
 class TestEventBusEmission(unittest.TestCase):
@@ -343,6 +354,167 @@ class TestSingleton(unittest.TestCase):
         a = get_attribution()
         b = get_attribution()
         self.assertIs(a, b)
+
+
+class TestCausalChain(unittest.TestCase):
+    """parent_action_id threads through begin_action → chain_summary so
+    WMB can reconstruct multi-hop causality."""
+
+    def setUp(self):
+        self.orch = AgentAttributionOrchestrator()
+
+    def test_parent_action_id_stored(self):
+        parent = self.orch.begin_action('root_agent', 'bootstrap')
+        child = self.orch.begin_action('child_agent', 'sub_task',
+                                       parent_action_id=parent)
+        action = self.orch.get_action(child)
+        self.assertEqual(action.parent_action_id, parent)
+
+    def test_root_actions_have_none_parent(self):
+        aid = self.orch.begin_action('a', 't')
+        self.assertIsNone(self.orch.get_action(aid).parent_action_id)
+
+    def test_parent_appears_in_chain_summary(self):
+        parent = self.orch.begin_action('root', 'orchestrate')
+        child = self.orch.begin_action('child', 'work',
+                                       parent_action_id=parent)
+
+        captured = {}
+
+        def fake_record(**kwargs):
+            captured.update(kwargs)
+
+        mock_bridge = MagicMock()
+        mock_bridge.record_interaction.side_effect = fake_record
+        with patch(
+            'integrations.agent_engine.world_model_bridge.get_world_model_bridge',
+            return_value=mock_bridge,
+        ), patch.object(self.orch, '_emit_completion_event'):
+            self.orch.complete_action(child, outcome={'ok': True})
+
+        # Structured field is now attribution_chain (was prompt JSON
+        # blob pre-gap-5).  prompt carries a human-readable summary.
+        chain = captured.get('attribution_chain', {})
+        self.assertEqual(chain.get('parent_action_id'), parent)
+        self.assertIn('child', captured.get('prompt', ''))
+
+
+class TestRecordObservation(unittest.TestCase):
+    """External observations are stored separately from steps and are
+    surfaced in the WMB payload."""
+
+    def setUp(self):
+        self.orch = AgentAttributionOrchestrator()
+
+    def test_observation_stored(self):
+        aid = self.orch.begin_action('a', 't')
+        ok = self.orch.record_observation(
+            aid, 'sensor', data={'temp': 72}, source='thermo', confidence=0.9,
+        )
+        self.assertTrue(ok)
+        action = self.orch.get_action(aid)
+        self.assertEqual(len(action.observations), 1)
+        self.assertEqual(action.observations[0].observation_type, 'sensor')
+        self.assertAlmostEqual(action.observations[0].confidence, 0.9)
+
+    def test_observation_on_unknown_action_returns_false(self):
+        self.assertFalse(
+            self.orch.record_observation('nonexistent', 'sensor')
+        )
+
+    def test_observation_on_completed_action_returns_false(self):
+        aid = self.orch.begin_action('a', 't')
+        with patch.object(self.orch, '_submit_to_world_model'), \
+             patch.object(self.orch, '_emit_completion_event'):
+            self.orch.complete_action(aid, outcome={})
+        self.assertFalse(self.orch.record_observation(aid, 'sensor'))
+
+    def test_convenience_function_routes_to_singleton(self):
+        import integrations.agent_engine.agent_attribution as aa
+        aa._orchestrator = None
+        aid = begin_action('a', 't')
+        self.assertTrue(
+            record_observation(aid, 'world_state', data={'state': 'ok'})
+        )
+
+    def test_ceiling_shared_with_steps(self):
+        aid = self.orch.begin_action('a', 't')
+        # Fill halfway with steps
+        for i in range(MAX_STEPS_PER_ACTION // 2):
+            self.orch.record_step(aid, f'step {i}')
+        # And halfway with observations
+        for i in range(MAX_STEPS_PER_ACTION // 2):
+            self.orch.record_observation(aid, 'sensor', data={'i': i})
+        # One more on either side should be rejected
+        self.assertFalse(
+            self.orch.record_step(aid, 'overflow')
+            and self.orch.record_observation(aid, 'sensor')
+        )
+
+    def test_observations_appear_in_chain_summary(self):
+        aid = self.orch.begin_action('a', 't')
+        self.orch.record_observation(aid, 'user_feedback',
+                                     data={'correct': True})
+
+        captured = {}
+
+        def fake_record(**kwargs):
+            captured.update(kwargs)
+
+        mock_bridge = MagicMock()
+        mock_bridge.record_interaction.side_effect = fake_record
+        with patch(
+            'integrations.agent_engine.world_model_bridge.get_world_model_bridge',
+            return_value=mock_bridge,
+        ), patch.object(self.orch, '_emit_completion_event'):
+            self.orch.complete_action(aid, outcome={'ok': True})
+
+        chain = captured['attribution_chain']
+        self.assertEqual(chain['observation_count'], 1)
+        self.assertEqual(chain['observations'][0]['observation_type'],
+                         'user_feedback')
+
+
+class TestConfidenceWeightedCredit(unittest.TestCase):
+    """Credit assignment multiplies temporal decay by a confidence
+    mix (0.5 + 0.5*conf).  High-confidence late steps dominate; low-
+    confidence late steps get reduced but not zero credit."""
+
+    def setUp(self):
+        self.orch = AgentAttributionOrchestrator()
+
+    def test_confident_step_outweighs_unconfident(self):
+        aid = self.orch.begin_action('a', 't')
+        # 3 steps at the same timestamp position, different confidence
+        self.orch.record_step(aid, 'filler', confidence=0.0)
+        self.orch.record_step(aid, 'maybe', confidence=0.5)
+        self.orch.record_step(aid, 'decisive', confidence=1.0)
+
+        credits = self.orch._compute_credit_assignment(
+            self.orch.get_action(aid)
+        )
+        self.assertLess(credits[0], credits[1])
+        self.assertLess(credits[1], credits[2])
+
+    def test_credits_still_sum_to_one(self):
+        aid = self.orch.begin_action('a', 't')
+        for conf in (0.1, 0.3, 0.5, 0.7, 0.9):
+            self.orch.record_step(aid, 'step', confidence=conf)
+        credits = self.orch._compute_credit_assignment(
+            self.orch.get_action(aid)
+        )
+        self.assertAlmostEqual(sum(credits.values()), 1.0, places=3)
+
+    def test_zero_confidence_not_zero_credit(self):
+        # We don't want agents to "hide" by under-reporting confidence
+        aid = self.orch.begin_action('a', 't')
+        self.orch.record_step(aid, 'a', confidence=0.0)
+        self.orch.record_step(aid, 'b', confidence=0.0)
+        credits = self.orch._compute_credit_assignment(
+            self.orch.get_action(aid)
+        )
+        for c in credits.values():
+            self.assertGreater(c, 0)
 
 
 if __name__ == '__main__':

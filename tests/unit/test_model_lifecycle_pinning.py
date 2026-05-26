@@ -255,5 +255,106 @@ class TestActiveInferenceGuardStillWins(unittest.TestCase):
         self.assertEqual(state.priority, ModelPriority.ACTIVE)
 
 
+class TestRegisterLifecycleAssignsCorrectPolicy(unittest.TestCase):
+    """ModelOrchestrator._register_lifecycle is the actual decision
+    site for which policy each catalog entry gets.  Regression guard
+    for the 2026-05-03 incident where the 4B-VL main died silently
+    (no log captured because Nunba's main llama-server uses
+    subprocess.PIPE drained only during startup) and was downgraded
+    from pinned to pressure_evict_only — letting phase-3 pressure
+    eventually unload it."""
+
+    def _entry(self, model_id, *, model_type='llm', purposes=None):
+        from integrations.service_tools.model_catalog import ModelEntry
+        return ModelEntry(
+            id=model_id,
+            name=model_id,
+            model_type=model_type,
+            purposes=list(purposes or []),
+        )
+
+    def _orchestrator(self):
+        from integrations.service_tools.model_orchestrator import ModelOrchestrator
+        return ModelOrchestrator()
+
+    def _register(self, entry):
+        """Drive _register_lifecycle and return the resulting ModelState
+        from the lifecycle manager.  Uses the orchestrator's id→key
+        mapping the same way runtime registration does."""
+        from integrations.service_tools.model_lifecycle import (
+            get_model_lifecycle_manager, CPU_OFFLOAD_TABLE)
+        orch = self._orchestrator()
+        # Fresh manager state for test isolation.
+        mlm = get_model_lifecycle_manager()
+        mlm._models.clear()
+        offload_name = entry.id.split('-')[1] if '-' in entry.id else entry.id
+        if offload_name not in CPU_OFFLOAD_TABLE:
+            offload_name = entry.id
+        orch._register_lifecycle(entry)
+        return mlm._models.get(offload_name)
+
+    def test_main_plus_vlm_via_purpose_is_pinned(self):
+        """purposes contains 'vision' / 'caption' / 'grounding' →
+        pinned (highest protection, never evicted)."""
+        for purpose in ('vision', 'caption', 'grounding'):
+            with self.subTest(purpose=purpose):
+                state = self._register(self._entry(
+                    'llm-qwen3.5-4b-vl-recommended',
+                    purposes=['main', purpose]))
+                self.assertIsNotNone(state, "registration failed")
+                self.assertTrue(
+                    state.pinned,
+                    f"main+{purpose} LLM must be pinned (1 model serves "
+                    f"chat AND VLM agentic loop) — losing it kills both",
+                )
+                self.assertFalse(
+                    state.pressure_evict_only,
+                    "pinned overrides pressure_evict_only",
+                )
+
+    def test_main_plus_vlm_via_id_is_pinned_when_purposes_empty(self):
+        """No purposes set → fallback id pattern match for ``-vl-`` /
+        ``-vlm-`` / ``mmproj`` triggers the same pin."""
+        for model_id in (
+            'llm-qwen3.5-4b-vl-recommended',
+            'llm-qwen-7b-vlm-base',
+            'llm-some-mmproj-build',
+        ):
+            with self.subTest(model_id=model_id):
+                state = self._register(self._entry(model_id, purposes=[]))
+                self.assertIsNotNone(state)
+                self.assertTrue(
+                    state.pinned,
+                    f"id={model_id} should match VLM-main fallback pattern",
+                )
+
+    def test_chat_only_main_keeps_pressure_evict_only(self):
+        """Main without any VLM purpose → pressure_evict_only (the
+        2026-04-11 fix).  Chat reload is cheap, no in-flight loop."""
+        state = self._register(self._entry(
+            'llm-qwen3.5-4b-base', purposes=['main']))
+        self.assertIsNotNone(state)
+        self.assertFalse(state.pinned, "chat-only main must NOT be pinned")
+        self.assertTrue(
+            state.pressure_evict_only,
+            "chat-only main should keep pressure_evict_only",
+        )
+
+    def test_draft_classifier_stays_pinned(self):
+        """The 0.8B draft was already pinned — must stay pinned."""
+        state = self._register(self._entry(
+            'llm-qwen3.5-0.8b', purposes=['draft']))
+        self.assertIsNotNone(state)
+        self.assertTrue(state.pinned, "draft must remain pinned")
+
+    def test_draft_via_id_fallback_stays_pinned(self):
+        for model_id in (
+            'llm-qwen3.5-0.8b-draft', 'llm-caption-mini'):
+            with self.subTest(model_id=model_id):
+                state = self._register(self._entry(model_id, purposes=[]))
+                self.assertIsNotNone(state)
+                self.assertTrue(state.pinned)
+
+
 if __name__ == '__main__':
     unittest.main()

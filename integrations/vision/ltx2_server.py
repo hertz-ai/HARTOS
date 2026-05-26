@@ -45,9 +45,19 @@ app = Flask(__name__)
 pipeline = None
 model_lock = Lock()
 
-# Paths
-BASE_DIR = os.path.dirname(__file__)
-OUTPUT_DIR = os.path.join(BASE_DIR, "coding", "ltx_outputs")
+# Paths — route off the install tree (sibling of fix 5b6b908a).
+# Installed Nunba runs from C:\Program Files (x86)\HevolveAI\Nunba\
+# which is read-only without admin elevation; writing LTX outputs
+# under BASE_DIR there hits [WinError 5].  Reuse the canonical
+# coding-workspace resolver in core.platform_paths.
+try:
+    from core.platform_paths import get_coding_workspace_dir
+    OUTPUT_DIR = os.path.join(get_coding_workspace_dir(), "ltx_outputs")
+except Exception:
+    # Last-resort fallback if core.platform_paths isn't importable
+    # (e.g. running this server standalone from a checkout).
+    OUTPUT_DIR = os.path.join(
+        os.path.expanduser("~"), ".hartos", "coding", "ltx_outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 

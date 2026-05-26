@@ -854,11 +854,48 @@ class ResourceGovernor:
 
     # ── CPU / Memory / Battery / GPU ──────────────────────────────
 
+    def _get_optimizer_snapshot(self):
+        """Read the latest cached SystemSnapshot from ComputeOptimizer.
+
+        Returns the snap or None when the optimizer module/singleton
+        isn't available (e.g. degraded boot, or a deployment that
+        explicitly disables it).  ``include_per_process=False`` is
+        critical here — Governor only needs cpu/ram aggregates, and
+        forcing the optimizer's process_iter walk on every Governor
+        tick under sustained pressure would actually INCREASE GIL
+        contention (the opposite of why this consolidation exists).
+
+        Single source of truth for system pressure data — eliminates
+        the 2026-05-01 parallel-psutil-poll between Governor and
+        Optimizer that py-spy caught with BOTH monitors active+gil
+        simultaneously.
+        """
+        try:
+            from core.compute_optimizer import get_optimizer
+            return get_optimizer().get_latest_snapshot(
+                max_age_s=10.0, include_per_process=False,
+            )
+        except Exception:
+            return None
+
     def _get_cpu_usage(self) -> float:
         """Get current CPU usage as a float 0.0 to 1.0.
 
-        Tries psutil, then platform fallbacks.
+        Read order:
+          1. ComputeOptimizer's cached snapshot (canonical psutil reader).
+          2. Direct psutil fallback when optimizer unavailable.
+          3. Linux ``os.getloadavg()`` when psutil itself is missing.
+          4. Constant 0.3 as a last-resort moderate-usage assumption.
+
+        The first path is the steady-state hot path post-2026-05-01
+        unification — Governor used to call psutil.cpu_percent itself
+        every 5s, duplicating ComputeOptimizer's 15s poll.  The cached
+        snap gives us the same data with one writer.
         """
+        snap = self._get_optimizer_snapshot()
+        if snap is not None:
+            return snap.cpu_percent / 100.0
+
         psutil = _try_import_psutil()
         if psutil is not None:
             try:
@@ -881,8 +918,16 @@ class ResourceGovernor:
     def _get_memory_pressure(self) -> float:
         """Get memory pressure as a float 0.0 to 1.0.
 
-        Tries psutil, then /proc/meminfo on Linux.
+        Read order (mirrors ``_get_cpu_usage`` for symmetry):
+          1. ComputeOptimizer's cached snapshot (canonical psutil reader).
+          2. Direct psutil fallback when optimizer unavailable.
+          3. Linux ``/proc/meminfo`` when psutil itself is missing.
+          4. Constant 0.4 as a last-resort moderate-usage assumption.
         """
+        snap = self._get_optimizer_snapshot()
+        if snap is not None:
+            return snap.ram_percent / 100.0
+
         psutil = _try_import_psutil()
         if psutil is not None:
             try:

@@ -60,6 +60,26 @@ def _publish_routing_status(user_id: str, message: str, request_id: str = ''):
         publish_async(f'com.hertzai.hevolve.chat.{user_id}', payload)
     except Exception:
         pass  # Never block inference on status publishing
+    from core.peer_link.crossbar_publish import publish_thinking_trace
+    ok = publish_thinking_trace(
+        text=message,
+        user_id=user_id,
+        request_id=request_id or '',
+        bot_type='ComputeRouter',
+    )
+    if ok:
+        logger.debug(
+            "ComputeRouter status published: user=%s msg=%r",
+            user_id, message[:60] if message else '',
+        )
+    elif user_id:
+        # Helper returned False: HARTOS publish_async not yet resolvable.
+        # Empty user_id is a clean no-op — don't log noise for that.
+        logger.debug(
+            "ComputeRouter status drop: user=%s msg=%r — "
+            "HARTOS publish_async unresolvable (loader still init).",
+            user_id, message[:60] if message else '',
+        )
 
 # ═══════════════════════════════════════════════════════════════
 # Model Bus Service

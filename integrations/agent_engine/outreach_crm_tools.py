@@ -423,6 +423,151 @@ def register_outreach_tools(helper, assistant, user_id: str):
             'erxes_pipeline': erxes_status,
         })
 
+    def bulk_import_prospects(
+        prospects_json: Annotated[str, "JSON array of prospect dicts: [{company, contact_name, email, title?, vertical?, notes?, tier?}, …]"],
+        dedupe_by_email: Annotated[bool, "Skip rows whose email already exists in the prospect store"] = True,
+        attach_sequence: Annotated[Optional[str], "Optional JSON array of follow-up sequence steps (delay_days, subject, body_html); attached to every imported prospect"] = None,
+    ) -> str:
+        """Bulk-import a batch of prospects in one shot.
+
+        Volume lever for the marketing flywheel: a single tool call seeds
+        the outreach daemon with dozens of leads + their follow-up
+        sequence.  Without this, the agent has to call create_prospect +
+        create_followup_sequence individually for each lead — too many
+        round-trips for any practical campaign.
+
+        Each row must have at least: company, contact_name, email.
+        Optional: title, vertical, notes, tier (1=top priority, 2=secondary).
+
+        When `attach_sequence` is provided, an identical follow-up
+        sequence is attached to every newly imported prospect (the
+        sequence runs independently per prospect).  Use this to set up
+        a 3-touch campaign (day 3 / day 7 / day 14) across the whole
+        batch in one tool call.
+
+        Returns counts of imported, skipped (deduped), and failed rows,
+        plus any sequence-ids that were created.
+        """
+        try:
+            rows = json.loads(prospects_json)
+            if not isinstance(rows, list):
+                return json.dumps({'success': False, 'error': 'prospects_json must be a JSON array'})
+        except json.JSONDecodeError as e:
+            return json.dumps({'success': False, 'error': f'Invalid JSON: {e}'})
+
+        seq_steps = None
+        if attach_sequence:
+            try:
+                seq_steps = json.loads(attach_sequence)
+                if not isinstance(seq_steps, list):
+                    return json.dumps({'success': False, 'error': 'attach_sequence must be a JSON array'})
+            except json.JSONDecodeError as e:
+                return json.dumps({'success': False, 'error': f'Invalid attach_sequence JSON: {e}'})
+
+        data = _load_prospects()
+        existing_emails = {
+            (p.get('email') or '').strip().lower()
+            for p in data.get('prospects', {}).values()
+        }
+
+        imported, skipped, failed = [], [], []
+        created_sequences = []
+
+        for idx, row in enumerate(rows):
+            try:
+                company = (row.get('company') or '').strip()
+                contact_name = (row.get('contact_name') or '').strip()
+                email = (row.get('email') or '').strip()
+                if not (company and contact_name and email):
+                    failed.append({'row': idx, 'reason': 'missing company/contact_name/email'})
+                    continue
+                if dedupe_by_email and email.lower() in existing_emails:
+                    skipped.append({'row': idx, 'email': email, 'reason': 'duplicate'})
+                    continue
+
+                prospect_id = f"{company.lower().replace(' ', '_')}_{int(time.time()*1000)}_{idx}"
+                prospect = {
+                    'id': prospect_id,
+                    'company': company,
+                    'contact_name': contact_name,
+                    'email': email,
+                    'title': (row.get('title') or '').strip(),
+                    'vertical': (row.get('vertical') or 'general').strip(),
+                    'notes': (row.get('notes') or '').strip(),
+                    'tier': int(row.get('tier', 1)),
+                    'stage': 'new',
+                    'created_at': datetime.utcnow().isoformat(),
+                    'updated_at': datetime.utcnow().isoformat(),
+                    'created_by': user_id,
+                    'emails_sent': 0,
+                    'last_email_at': None,
+                    'last_reply_at': None,
+                }
+                data['prospects'][prospect_id] = prospect
+                existing_emails.add(email.lower())
+                imported.append({'row': idx, 'id': prospect_id,
+                                 'company': company, 'email': email})
+
+                # Optional: attach the same follow-up sequence to every
+                # imported prospect.  The daemon's check_pending_followups
+                # walks all active sequences and fires the due steps.
+                if seq_steps:
+                    seq_id = f"seq_{prospect_id}_{int(time.time()*1000)}"
+                    base_time = datetime.utcnow()
+                    cumulative_days = 0
+                    scheduled = []
+                    for step_idx, step in enumerate(seq_steps):
+                        delay = int(step.get('delay_days', 3))
+                        cumulative_days += delay
+                        scheduled.append({
+                            'step_number': step_idx + 2,
+                            'delay_days': delay,
+                            'scheduled_at': (base_time + timedelta(days=cumulative_days)).isoformat(),
+                            'subject': step.get('subject', ''),
+                            'body_html': step.get('body_html', ''),
+                            'status': 'pending',
+                            'sent_at': None,
+                        })
+                    data['sequences'][seq_id] = {
+                        'id': seq_id,
+                        'prospect_id': prospect_id,
+                        'name': f'Bulk-import sequence for {company}',
+                        'steps': scheduled,
+                        'created_at': datetime.utcnow().isoformat(),
+                        'status': 'active',
+                        'exit_on_reply': True,
+                    }
+                    created_sequences.append(seq_id)
+            except Exception as row_err:
+                failed.append({'row': idx, 'reason': str(row_err)})
+
+        _save_prospects(data)
+
+        # Sync each newly imported prospect to Erxes CRM in background-
+        # safe sequence — failures here don't abort the import, just
+        # report sync state per row.
+        sync_results = []
+        for row in imported:
+            prospect = data['prospects'][row['id']]
+            sync = _sync_prospect_to_crm(prospect)
+            sync_results.append({'id': row['id'], 'synced': sync.get('synced', False)})
+            if sync.get('synced'):
+                prospect['erxes_customer_id'] = sync.get('erxes_customer_id')
+                prospect['erxes_deal_id'] = sync.get('erxes_deal_id')
+        _save_prospects(data)
+
+        return json.dumps({
+            'success': True,
+            'imported_count': len(imported),
+            'skipped_count': len(skipped),
+            'failed_count': len(failed),
+            'sequences_created': len(created_sequences),
+            'imported': imported,
+            'skipped': skipped,
+            'failed': failed,
+            'erxes_sync': sync_results,
+        })
+
     def list_sent_emails(
         prospect_id: Annotated[Optional[str], "Filter by prospect ID (optional)"] = None,
         limit: Annotated[int, "Max emails to return"] = 20,
@@ -443,6 +588,17 @@ def register_outreach_tools(helper, assistant, user_id: str):
 
     for func in [
         create_prospect,
+    # Routed through core.labeled_autogen_function so the UI spinner
+    # shows a tool-specific label (publish_chat_stage('tool_call', …))
+    # for autogen-invoked tools too.  Same shape as LangChain's
+    # _with_tool_logging chokepoint.  UI labels live in
+    # core/constants.py:TOOL_LABELS (single source of truth).
+    from core.labeled_autogen_function import register_labeled_function
+    from core.constants import TOOL_LABELS
+
+    for func in [
+        create_prospect,
+        bulk_import_prospects,
         send_outreach_email,
         create_followup_sequence,
         check_pending_followups,
@@ -451,6 +607,7 @@ def register_outreach_tools(helper, assistant, user_id: str):
         list_sent_emails,
     ]:
         register_function(
+        register_labeled_function(
             func,
             caller=helper,
             executor=assistant,
@@ -458,6 +615,10 @@ def register_outreach_tools(helper, assistant, user_id: str):
         )
 
     logger.info(f"Registered 7 outreach CRM tools for user {user_id}")
+            ui_label=TOOL_LABELS.get(func.__name__, f'Running {func.__name__}…'),
+        )
+
+    logger.info(f"Registered 8 outreach CRM tools for user {user_id}")
 
 
 def _check_pending_followups_impl() -> str:

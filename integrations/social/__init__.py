@@ -51,9 +51,37 @@ def init_social(app):
     from .models import init_db, DB_PATH
     try:
         init_db()
-        logger.info(f"HevolveSocial database initialized ({DB_PATH})")
+        # Apply pending schema migrations against the canonical DB so a
+        # daemon booting on a pre-existing v36/37/38 SQLite catches up
+        # to SCHEMA_VERSION (currently 39: users.voice_profile column).
+        # Idempotent — see tests/unit/test_voice_profile_migration.py.
+        # Brings HARTOS daemon parity with Nunba main.py per MEMORY.md.
+        from .migrations import run_migrations
+        run_migrations()
+        logger.info(f"HevolveSocial database initialized + migrated ({DB_PATH})")
     except Exception as e:
         logger.warning(f"HevolveSocial DB init failed (non-fatal): {e}")
+
+    # Phase 7a / Phase 8 — install global tenant filter on Session.
+    # Migration v40 added `tenant_id` columns to ~34 social tables;
+    # this teaches the ORM about them and filters every SELECT by
+    # the current request's tenant. No-op when g.tenant_id is None
+    # (flat/regional pass-through), so single-tenant deploys are
+    # unaffected. Plan reference: sunny-gliding-eich.md, Part E.1.
+    try:
+        from .tenant_filter import (
+            install_tenant_filter, register_tenant_aware,
+        )
+        install_tenant_filter()
+        from .models import (
+            User, Post, Comment, Community, Vote, Follow,
+            CommunityMembership, Notification, Report,
+        )
+        for _cls in (User, Post, Comment, Community, Vote, Follow,
+                     CommunityMembership, Notification, Report):
+            register_tenant_aware(_cls)
+    except Exception as e:
+        logger.warning(f"HevolveSocial tenant filter install skipped: {e}")
 
     # Seed default achievements
     try:
@@ -85,6 +113,28 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"HevolveSocial ad placement seeding skipped: {e}")
 
+    # Register conversations blueprint (Phase 7c.3 — DM/group chat).
+    # Distinct from api_channels (legacy 31-channel external adapter)
+    # — these blueprints have non-overlapping URL prefixes.
+    try:
+        from .api_conversations import conversations_bp
+        app.register_blueprint(conversations_bp)
+        logger.info("HevolveSocial conversations registered at "
+                    "/api/social/conversations/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial conversations blueprint skipped: {e}")
+
+    # Register calls blueprint (Phase 7d — voice/video/screen).
+    # Flag-gated by `calls_v1` server-side; off → 503 on every endpoint.
+    # The blueprint's URL prefix is /api/social so the routes live at
+    # /api/social/calls/* (no nesting under /conversations).
+    try:
+        from .api_calls import calls_bp
+        app.register_blueprint(calls_bp)
+        logger.info("HevolveSocial calls registered at /api/social/calls/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial calls blueprint skipped: {e}")
+
     # Register gamification blueprint
     try:
         from .api_gamification import gamification_bp
@@ -92,6 +142,33 @@ def init_social(app):
         logger.info("HevolveSocial gamification endpoints registered")
     except Exception as e:
         logger.warning(f"HevolveSocial gamification blueprint skipped: {e}")
+
+    # Register hive contest blueprint (Claude Code onramp + leaderboard)
+    try:
+        from .api_hive_contest import hive_contest_bp
+        app.register_blueprint(hive_contest_bp)
+        logger.info("HevolveSocial hive contest registered at /api/hive/contest/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial hive contest blueprint skipped: {e}")
+
+    # Register compute-earnings blueprint (idle-compute self-advertise +
+    # live drawer SSE + opted-in user wallet readback)
+    try:
+        from .api_compute_earnings import compute_earnings_bp
+        app.register_blueprint(compute_earnings_bp)
+        logger.info("HevolveSocial compute earnings registered at /api/compute/earnings/")
+    except Exception as e:
+        logger.warning(f"HevolveSocial compute earnings blueprint skipped: {e}")
+
+    # Register hive contest UI (single-page local view — reads the same
+    # /api/hive/contest/* endpoints, used by the HART shell panel and
+    # by a direct browser visit for operators).
+    try:
+        from .ui_hive_contest import hive_contest_ui_bp
+        app.register_blueprint(hive_contest_ui_bp)
+        logger.info("HevolveSocial hive contest UI registered at /hive-contest")
+    except Exception as e:
+        logger.warning(f"HevolveSocial hive contest UI blueprint skipped: {e}")
 
     # Register MCP tool registry blueprint (servers, tools, discover)
     try:
@@ -101,7 +178,13 @@ def init_social(app):
     except Exception as e:
         logger.warning(f"HevolveSocial marketplace+MCP blueprint skipped: {e}")
 
-    # Register sharing blueprint (short URLs, OG metadata, consent-gated links)
+    # Register sharing blueprint — canonical OG / share / embed home per
+    # memory/feedback_unification_reuse_contract.md.  Already serves
+    # /api/social/share/<token>, /api/social/og-image/<type>/<id>,
+    # /api/social/embed/<type>/<id>.  F1.5 wave will EXTEND this same
+    # blueprint with canonical short URLs (/i/, /c/, /u/, /p/) by
+    # promoting ``_get_og_metadata`` to public + adding `invite` resource
+    # type — NOT a parallel og_bp.
     try:
         from .api_sharing import sharing_bp
         app.register_blueprint(sharing_bp)
@@ -132,6 +215,16 @@ def init_social(app):
         logger.info("HevolveSocial admin API registered at /api/admin")
     except Exception as e:
         logger.debug(f"HevolveSocial admin blueprint skipped: {e}")
+
+    # Register OAuth click-through blueprint (PR O).  /start needs auth,
+    # /callback is public (state-token authenticated) — separate blueprint
+    # so admin_bp's before_request gate doesn't 401 the provider redirect.
+    try:
+        from integrations.channels.oauth_api import oauth_bp
+        app.register_blueprint(oauth_bp)
+        logger.info("HevolveSocial OAuth API registered at /api/oauth")
+    except Exception as e:
+        logger.debug(f"HevolveSocial OAuth blueprint skipped: {e}")
 
     # Register user-facing channel bindings API (catalog, bindings, pairing, presence)
     try:
@@ -220,6 +313,30 @@ def init_social(app):
         logger.info("Thought experiment endpoints registered at /api/social/experiments/")
     except Exception as e:
         logger.debug(f"Thought experiments blueprint skipped: {e}")
+
+    # Register encounter (P2P BLE meetup + mutual-like icebreaker) blueprint.
+    # PR-A alpha skeleton — in-memory state; DB migration v38 lands
+    # in PR-A beta.  Full design: project_encounter_icebreaker.md.
+    try:
+        from .encounter_api import encounter_bp
+        app.register_blueprint(encounter_bp)
+        logger.info("HevolveSocial encounter registered at /api/social/encounter/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial encounter blueprint skipped: {e}")
+
+    # Register UserConsent UI blueprint (W0c F3 prereq).  JWT-authed,
+    # append-only consent surface — the SINGLE HTTP write path for
+    # the user_consents table after the consent-surface consolidation
+    # (orchestrator review acd11f55, 2026-04-25).  consent_service.py
+    # retains the in-process ConsentService static-method API for
+    # internal callers; its legacy /api/consent/<user_id>/* HTTP
+    # route family was removed in the consolidation commit.
+    try:
+        from .consent_api import consent_bp
+        app.register_blueprint(consent_bp)
+        logger.info("HevolveSocial consent registered at /api/social/consent/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial consent blueprint skipped: {e}")
 
     # NOTE: compute_pledge_bp (api_compute_pledge.py) was consolidated into tracker_bp
     # and the stale file deleted 2026-04-15. All pledge endpoints live at
@@ -334,9 +451,15 @@ def init_social(app):
         except Exception as e:
             logger.debug(f"HevolveSocial sync engine start skipped: {e}")
 
-    # Start distributed coding agent if enabled
+    # Start distributed coding agent if enabled.  Default flipped to
+    # 'true' on 2026-05-07 — the daemon consumes self_heal goals
+    # produced by error_advice (#102) and SelfHealingDispatcher; with
+    # default 'false' the queue piled up indefinitely (15 stale goals
+    # back to 2026-04-27 in the live DB at audit time).  Safety is in
+    # the daemon itself (no idle agents → early return; budget gate;
+    # 30s poll cadence).  Servers that don't want it set explicitly.
     import os as _os2
-    if _os2.environ.get('HEVOLVE_CODING_AGENT_ENABLED', 'false').lower() == 'true':
+    if _os2.environ.get('HEVOLVE_CODING_AGENT_ENABLED', 'true').lower() == 'true':
         try:
             from integrations.coding_agent import init_coding_agent
             init_coding_agent(app)
@@ -365,6 +488,21 @@ def init_social(app):
             logger.warning(f"HevolveSocial agent engine init skipped: {e}")
     else:
         logger.debug("HevolveSocial agent engine: gated OFF (set HEVOLVE_AGENT_ENGINE_ENABLED=true to enable)")
+    # Agent engine init is the SINGLE responsibility of Nunba's
+    # `main.py:_deferred_social_init` (or any standalone HARTOS launcher
+    # that calls `init_agent_engine` directly).  Calling it from inside
+    # `init_social` produced a double-invocation in Nunba (main.py calls
+    # init_social → init_social calls init_agent_engine → main.py calls
+    # init_agent_engine again right after), and the deadlock smoking
+    # gun on 2026-04-28 was exactly this path: the second invocation
+    # fired while hartos-init's `from hart_intelligence import app` was
+    # still mid-import, deadlocking on the per-module import lock.
+    # Idempotency in init_agent_engine itself (added 2026-04-28) makes
+    # the second call a no-op, but the cleaner contract is: ONE caller,
+    # ONE call site.  init_social no longer initialises the agent engine
+    # — its caller does.
+    logger.debug("HevolveSocial: agent engine init delegated to caller "
+                 "(see Nunba main.py:_deferred_social_init or HARTOS launcher)")
 
     # Register with central registry if configured
     import os

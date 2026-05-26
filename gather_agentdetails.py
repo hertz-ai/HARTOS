@@ -9,6 +9,78 @@ except ImportError:
 
 from helper import retrieve_json, retrieve_json, _is_terminate_msg
 from cultural_wisdom import get_cultural_prompt
+from core.platform_paths import get_coding_workspace_dir
+
+# Feature flag — when set, append a self-explanatory tool-name catalog to the
+# autonomous gather prompt so the LLM picks REAL tool names instead of
+# inventing ones like "web_search" / "WebQueryTool" / "data_parse" (seen in
+# the 2026-05-12 IPL refusal forensic).  Default off to keep current behavior
+# untouched; flip via `HEVOLVE_AUTONOMOUS_GATHER_TOOL_MAP=1` once verified.
+#
+# Keep this catalog in sync with:
+#   - core/agent_tools.py:build_core_tool_closures (the 28 core tools)
+#   - reuse_recipe.py:2335-2354 service_tools block (crawl4ai, acestep, ...)
+#   - create_recipe.py service_tools block (synced from reuse, same set)
+AUTONOMOUS_TOOL_CATALOG = """
+AVAILABLE TOOLS — the agent you create will only have access to these tools.
+DO NOT invent new tool names. When an action needs a tool, use one of these EXACT
+names so the recipe builder can wire it up downstream.
+
+Web & data:
+  - crawl4ai                    fetch a URL, return clean markdown (web scraping)
+  - google_search               web/Google search for a query
+  - data_extraction_from_url    extract structured data from a URL
+  - get_text_from_image         OCR / Q&A on an image URL
+
+Memory:
+  - save_data_in_memory         store JSON value at a dot-notation key
+  - get_data_by_key             read back a stored value
+  - get_saved_metadata          list stored keys (no values)
+  - save_to_long_term_memory    persist a fact across sessions
+  - search_long_term_memory     semantic search over saved facts and chats
+  - get_chat_history            chat history for a date range
+  - search_visual_history       search past camera/screen descriptions
+
+Media generation:
+  - text_2_image                generate an image from a text prompt
+  - Generate_video              generate a talking-head video
+  - send_presynthesized_video_to_user   deliver a previously generated video
+
+User communication:
+  - send_message_to_user        message the user immediately
+  - send_message_in_seconds     message the user after a delay
+  - send_message_to_roles       message a specific persona/role
+
+Scheduling:
+  - create_scheduled_jobs       schedule a recurring/cron job
+
+Computer & device use:
+  - execute_windows_or_android_command   drive desktop/phone via GUI automation
+  - device_control              control a connected device by named action
+
+Coding:
+  - execute_coding_task         write/review/refactor/debug code
+  - get_repository_map          tree-sitter map of a code repo
+  - create_code_shard           call-chain context for a function
+
+Identity & profile:
+  - get_user_id, get_prompt_id, get_user_details
+  - get_user_uploaded_file, get_user_camera_inp
+
+Self-improvement:
+  - consult_expert              get specialized guidance from a domain expert
+  - request_resource            request additional resources from the hive
+  - Suggest_Share_Worthy_Content, Observe_User_Experience, Self_Critique_And_Enhance
+  - validate_json_response      validate/repair a JSON response
+
+Quick mapping (use these defaults when the user describes intent in plain English):
+  - "fetch a webpage / scrape a site"        -> crawl4ai
+  - "search the internet / look up X online" -> google_search
+  - "read text from an image / picture"      -> get_text_from_image
+  - "schedule X / remind me at Y"            -> create_scheduled_jobs
+  - "run a command / open an app / click"    -> execute_windows_or_android_command
+  - "write/refactor/debug code"              -> execute_coding_task
+"""
 # Store user-specific agents & their chat history
 user_agents: Dict[str, Tuple[Any, Any]] = {}
 
@@ -90,18 +162,56 @@ def create_agents_for_user(user_id: str, autonomous=False, initial_description=N
     }
 
     # Build system message — enrich for autonomous mode
-    system_message = AGENT_CREATOR_SYSTEM_MESSAGE
     if autonomous and initial_description:
-        system_message += f"""
+        # Feature-flagged: inject the tool catalog so the LLM picks real
+        # tool names instead of inventing.  Off by default to keep prompt
+        # bytes/latency unchanged; flip via HEVOLVE_AUTONOMOUS_GATHER_TOOL_MAP=1.
+        _tool_map = ""
+        if os.environ.get('HEVOLVE_AUTONOMOUS_GATHER_TOOL_MAP', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+            _tool_map = AUTONOMOUS_TOOL_CATALOG
+        # AUTONOMOUS MODE: REPLACE the interactive system message entirely.
+        # Live test 2026-05-16 13:04 showed that APPENDING the PLAN_FIRST
+        # suffix to AGENT_CREATOR_SYSTEM_MESSAGE was diluted by the older
+        # "ask user one question at a time" instructions — the model still
+        # emitted {"status":"pending","question":"name?"}.  Replacing the
+        # whole system message in autonomous mode is the canonical fix.
+        system_message = f"""You are HART OS plan author. The peer HARTOS reviewer (StatusVerifier) will auto-review your plan against quality gates and either approve or send refinement feedback. NEVER ask the user questions — the user is NOT in this loop.
 
-AUTONOMOUS MODE INSTRUCTIONS:
-The user wants you to create an agent autonomously based on this description: '{initial_description}'.
-You must fill in ALL required fields yourself without asking questions.
-Generate appropriate name, agent_name (skill.region.name format), goal, broadcast_agent, personas, flows (with flow_name, persona, actions, sub_goal), and extra_information.
-Return ONLY a valid JSON object with status="completed". No prose, no explanation, no markdown.
-Do NOT ask any questions. Do NOT use em-dashes or smart quotes. Plain ASCII only.
-Your response must start with {{ and end with }}. Nothing else.
+Task description: '{initial_description}'
+
+{_tool_map}
+THREE-STAGE FLOW (strict, autonomous, no human-in-loop):
+
+STAGE 1 — FIRST CALL: emit a COMPLETE proposed plan with atomic steps.
+Response shape (EXACT keys, JSON only):
+{{"status":"proposed_plan","name":"<short readable name>","agent_name":"skill.local.name","goal":"<one-line goal>","broadcast_agent":false,"personas":[{{"name":"Executor","description":"<one line>"}}],"flows":[{{"flow_name":"main","persona":"Executor","actions":["<atomic step 1>","<atomic step 2>","..."],"sub_goal":"<one line>"}}],"extra_information":"<optional>","review_required":true}}
+
+RULES for flows[0].actions[]:
+- ONE concrete observable action per item.  No "and then" compounds.
+- For ANY computer-use task (open, click, paste, type, scroll, navigate, post, broadcast, send, share, browse, search, login, screenshot, copy, focus), EACH step MUST start with the literal prefix "execute_windows_or_android_command: " followed by plain-English instructions.  Examples:
+    "execute_windows_or_android_command: bring Chrome window to foreground"
+    "execute_windows_or_android_command: navigate to https://linkedin.com/feed/"
+    "execute_windows_or_android_command: click the 'Start a post' input box near the top of the feed"
+    "execute_windows_or_android_command: paste clipboard contents using Ctrl+V"
+    "execute_windows_or_android_command: click the blue 'Post' button at the bottom-right of the compose modal"
+    "execute_windows_or_android_command: take a screenshot to verify the post appeared in the feed"
+- 8 to 15 atomic steps for any non-trivial computer task.  Don't conflate steps.
+- Preserve EVERY detail of the task description in the plan.
+
+STAGE 2 — SUBSEQUENT CALL (incoming message is review verdict):
+- If incoming message is "approved" or starts with "approved": re-emit the SAME plan but with "status":"completed" and remove the "review_required" key.
+- Otherwise the message is refinement feedback: re-emit with "status":"proposed_plan" and apply the feedback to flows[0].actions[].
+
+STAGE 3 — Downstream: on "completed", the dispatcher saves persona JSON and hands the atomic-step list to the autogen team (Helper + Executor) which calls execute_windows_or_android_command for each step.
+
+ABSOLUTE RULES:
+- Plain ASCII only.  No em-dashes, no smart quotes, no Unicode.
+- Your response must START with {{ and END with }}.  Nothing else — no prose, no markdown, no code fence.
+- NEVER use "status":"pending".  NEVER ask questions.  NEVER request user input.
+- The user is sick / asleep / away.  You are talking to another agent.
 """
+    else:
+        system_message = AGENT_CREATOR_SYSTEM_MESSAGE
 
     # Create the assistant agent with context awareness
     assistant = autogen.AssistantAgent(
@@ -109,7 +219,7 @@ Your response must start with {{ and end with }}. Nothing else.
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
         is_termination_msg=_is_terminate_msg,
-        code_execution_config={"work_dir": "coding", "use_docker": False},
+        code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=system_message
     )
 
@@ -171,6 +281,10 @@ def get_agent_response(assistant: autogen.AssistantAgent, user_proxy: autogen.Us
         return f"Error getting response: {str(e)}"
 
 
+from core.llm_outbound_logger import with_source as _with_source
+
+
+@_with_source('autogen.gather')
 def gather_info(user_id, user_message, prompt_id, autonomous=False):
     """Gather agent details via autogen conversation.
 

@@ -3,7 +3,7 @@ name = "hevolvearmor"
 version = "0.1.0"
 edition = "2021"
 description = "Encrypted Python module loader for HART OS — AES-256-GCM + Ed25519 key derivation"
-license = "Proprietary"
+license = "Apache-2.0"
 
 [lib]
 name = "hevolvearmor"

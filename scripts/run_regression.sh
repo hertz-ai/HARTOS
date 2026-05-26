@@ -87,6 +87,13 @@ RESONANCE_TESTS="tests/unit/test_resonance_profile.py tests/unit/test_resonance_
 # Group 15: E2E Realworld Resonance (12 scenarios)
 REALWORLD_TESTS="tests/realworld_resonance_test.py"
 
+# Group 16: Journey coverage — Bucket 3 (J250-J429) skip-as-gap-marker suite.
+# Most tests SKIP with specific "infra X not built" reasons; each skip IS
+# the living gap dashboard.  Zero fails expected; a failure means a real
+# regression, a formerly-skipped RED journey has infra now and needs
+# actual assertions wired.
+JOURNEY_TESTS="tests/e2e/journey/"
+
 # ===== CI MODE =====
 if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ] || [ "$1" = "--ci" ]; then
     echo "CI MODE: Running ALL test groups"
@@ -130,6 +137,7 @@ if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ] || [ "$1" = "--ci" ]; then
     run_group "Channel_e2e" $CHANNEL_E2E_TESTS
     run_group "Resonance" $RESONANCE_TESTS
     run_group "Realworld" $REALWORLD_TESTS
+    run_group "Journey" $JOURNEY_TESTS
 
     echo ""
     echo "========================================"

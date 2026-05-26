@@ -360,7 +360,7 @@ with open('/tmp/release_manifest.json', 'w') as f:
 print('Re-signed')
 \"
 docker cp $HARTOS_CONTAINER:/tmp/release_manifest.json /tmp/rm_new.json
-HOST_MANIFEST='/opt/hzai-LLM-Langchain-Chatbot-Agent/repo/LLM-langchain_Chatbot-Agent/release_manifest.json'
+HOST_MANIFEST='<deploy-repo-path>/release_manifest.json'
 echo '$ERXES_ADMIN_PASSWORD' | sudo -S cp /tmp/rm_new.json \"\$HOST_MANIFEST\" 2>/dev/null && echo 'Host manifest updated' || echo 'Could not update host manifest'
 "
         chg "Release manifest re-signed"

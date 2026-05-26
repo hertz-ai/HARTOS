@@ -1,0 +1,18 @@
+{
+  "name": "@hertzai/hartos-whatsapp-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Embedded Baileys gateway exposing the WAHA-compatible HTTP+WS subset that integrations/channels/whatsapp_adapter.py talks to. Spawned by integrations/social/whatsapp_supervisor.py — never run manually.",
+  "main": "gateway.js",
+  "scripts": {
+    "start": "node gateway.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.18",
+    "express": "^4.21.2",
+    "express-ws": "^5.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

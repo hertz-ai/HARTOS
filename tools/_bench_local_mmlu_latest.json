@@ -1,0 +1,102 @@
+{
+  "summary": "LOCAL_LLAMA_MMLU_BASELINE: 9/10 correct (90.0%), total=2.1s, avg=0.21s/q, model='Qwen3.5-4B-UD-Q4_K_XL.gguf'",
+  "correct": 9,
+  "total": 10,
+  "score": 0.9,
+  "total_elapsed_s": 2.1,
+  "model": "Qwen3.5-4B-UD-Q4_K_XL.gguf",
+  "llama_base_url": "http://127.0.0.1:8082/v1",
+  "per_question": [
+    {
+      "i": 1,
+      "subject": "high_school_mathematics",
+      "expected": "C",
+      "picked": "B",
+      "ok": false,
+      "raw": "B",
+      "elapsed_s": 0.46
+    },
+    {
+      "i": 2,
+      "subject": "high_school_mathematics",
+      "expected": "A",
+      "picked": "A",
+      "ok": true,
+      "raw": "A",
+      "elapsed_s": 0.13
+    },
+    {
+      "i": 3,
+      "subject": "college_biology",
+      "expected": "C",
+      "picked": "C",
+      "ok": true,
+      "raw": "C",
+      "elapsed_s": 0.13
+    },
+    {
+      "i": 4,
+      "subject": "college_biology",
+      "expected": "B",
+      "picked": "B",
+      "ok": true,
+      "raw": "B",
+      "elapsed_s": 0.16
+    },
+    {
+      "i": 5,
+      "subject": "professional_law",
+      "expected": "B",
+      "picked": "B",
+      "ok": true,
+      "raw": "B",
+      "elapsed_s": 0.16
+    },
+    {
+      "i": 6,
+      "subject": "professional_law",
+      "expected": "C",
+      "picked": "C",
+      "ok": true,
+      "raw": "C",
+      "elapsed_s": 0.25
+    },
+    {
+      "i": 7,
+      "subject": "high_school_world_history",
+      "expected": "B",
+      "picked": "B",
+      "ok": true,
+      "raw": "B",
+      "elapsed_s": 0.22
+    },
+    {
+      "i": 8,
+      "subject": "high_school_world_history",
+      "expected": "B",
+      "picked": "B",
+      "ok": true,
+      "raw": "B",
+      "elapsed_s": 0.2
+    },
+    {
+      "i": 9,
+      "subject": "high_school_mathematics",
+      "expected": "A",
+      "picked": "A",
+      "ok": true,
+      "raw": "A",
+      "elapsed_s": 0.21
+    },
+    {
+      "i": 10,
+      "subject": "college_biology",
+      "expected": "C",
+      "picked": "C",
+      "ok": true,
+      "raw": "C",
+      "elapsed_s": 0.19
+    }
+  ],
+  "timestamp": 1779555049.554358
+}

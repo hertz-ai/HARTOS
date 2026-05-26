@@ -9,7 +9,7 @@ Type=simple
 User=hart
 Group=hart
 WorkingDirectory=/opt/hart
-ExecStart=/opt/hart/venv/bin/python -c "from integrations.social.peer_discovery import AutoDiscovery; d = AutoDiscovery(); d.start(); import time; time.sleep(999999)"
+ExecStart=/opt/hart/venv/bin/python -c "from integrations.social.peer_discovery import get_auto_discovery, get_peer_discovery; get_peer_discovery().start(); get_auto_discovery().start(); import time; time.sleep(999999)"
 EnvironmentFile=/etc/hart/hart.env
 Restart=on-failure
 RestartSec=10

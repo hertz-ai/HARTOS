@@ -1,0 +1,142 @@
+name: Remote Deploy — HARTOS / Nunba / ISO
+
+# Workflow-driven server install.  SSHes to a target host (LAN or public IP)
+# and runs the published `hevolve-install` binary in non-interactive mode.
+# All artefacts come from the canonical release path
+# (docs.hevolve.ai/downloads → github.com/hertz-ai/HARTOS/releases/latest).
+#
+# Required repo secrets:
+#   REMOTE_SSH_KEY     — Ed25519 private key authorized on every target box
+#                        (`ssh-keygen -t ed25519` then add .pub to the
+#                         target's ~/.ssh/authorized_keys or
+#                         C:\ProgramData\ssh\administrators_authorized_keys)
+#
+# Manual trigger only — never runs on push.  Pick mode + tier + target,
+# click Run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_host:
+        description: 'Target IP or hostname (LAN or public)'
+        required: true
+        type: string
+      target_user:
+        description: 'SSH username on the target'
+        required: true
+        type: string
+        default: 'root'
+      target_os:
+        description: 'Target OS family (drives the installer binary picked)'
+        required: true
+        type: choice
+        default: 'linux'
+        options: [linux, macos, windows]
+      mode:
+        description: 'Deployment mode'
+        required: true
+        type: choice
+        default: 'docker'
+        options:
+          - docker      # HARTOS container from ghcr.io
+          - nunba       # Nunba desktop installer (downloads + runs)
+          - server      # HART OS Server ISO download
+          - desktop     # HART OS Desktop ISO download
+          - edge        # HART OS Edge ISO download
+          - pip         # pip install from source (developer)
+      tier:
+        description: 'HARTOS tier (only used when mode=docker)'
+        required: false
+        type: choice
+        default: 'flat'
+        options: [flat, regional, central]
+      port:
+        description: 'Backend port (mode=docker only)'
+        required: false
+        type: string
+        default: '6777'
+      ssh_port:
+        description: 'SSH port on the target (default 22)'
+        required: false
+        type: string
+        default: '22'
+
+permissions:
+  contents: read
+
+jobs:
+  remote-install:
+    name: Install ${{ inputs.mode }} on ${{ inputs.target_host }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Resolve installer binary URL
+        id: url
+        run: |
+          # Canonical release path — kept in sync with deploy/installer/build.sh
+          # asset names (hevolve-install-linux / hevolve-install-macos /
+          # hevolve-install.exe).
+          case "${{ inputs.target_os }}" in
+            linux)   bin="hevolve-install-linux"  ;;
+            macos)   bin="hevolve-install-macos"  ;;
+            windows) bin="hevolve-install.exe"    ;;
+          esac
+          url="https://github.com/hertz-ai/HARTOS/releases/latest/download/${bin}"
+          echo "binary=${bin}"  >> "$GITHUB_OUTPUT"
+          echo "url=${url}"     >> "$GITHUB_OUTPUT"
+          echo "Binary: ${url}"
+
+      - name: Run hevolve-install on remote target (Linux/macOS)
+        if: inputs.target_os != 'windows'
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ inputs.target_host }}
+          username: ${{ inputs.target_user }}
+          key:      ${{ secrets.REMOTE_SSH_KEY }}
+          port:     ${{ inputs.ssh_port }}
+          # Bash one-liner: download + chmod + exec with the chosen flags.
+          # /tmp survives across SSH sessions and is auto-cleaned on reboot.
+          # --yes makes the Go installer skip prompts; --mode/--tier/--port
+          # come from workflow inputs.
+          script: |
+            set -euo pipefail
+            curl -fsSL '${{ steps.url.outputs.url }}' -o /tmp/hevolve-install
+            chmod +x /tmp/hevolve-install
+            /tmp/hevolve-install \
+              --mode  '${{ inputs.mode }}' \
+              --tier  '${{ inputs.tier }}' \
+              --port  '${{ inputs.port }}' \
+              --yes
+
+      - name: Run hevolve-install on remote target (Windows)
+        if: inputs.target_os == 'windows'
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ inputs.target_host }}
+          username: ${{ inputs.target_user }}
+          key:      ${{ secrets.REMOTE_SSH_KEY }}
+          port:     ${{ inputs.ssh_port }}
+          # Windows OpenSSH Server defaults to powershell.exe.  Same logic as
+          # Linux above but with Invoke-WebRequest + .exe extension.  -UseBasicParsing
+          # avoids the IE-engine dependency that fails on Server Core.
+          script: |
+            $ErrorActionPreference = 'Stop'
+            $bin = "$env:TEMP\hevolve-install.exe"
+            Invoke-WebRequest -UseBasicParsing -Uri '${{ steps.url.outputs.url }}' -OutFile $bin
+            & $bin --mode '${{ inputs.mode }}' --tier '${{ inputs.tier }}' --port '${{ inputs.port }}' --yes
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Remote deploy result"                                         >> "$GITHUB_STEP_SUMMARY"
+          echo ""                                                                 >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field   | Value |"                                              >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-------|"                                              >> "$GITHUB_STEP_SUMMARY"
+          echo "| Target  | \`${{ inputs.target_user }}@${{ inputs.target_host }}:${{ inputs.ssh_port }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| OS      | \`${{ inputs.target_os }}\` |"                        >> "$GITHUB_STEP_SUMMARY"
+          echo "| Mode    | \`${{ inputs.mode }}\` |"                             >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tier    | \`${{ inputs.tier }}\` |"                             >> "$GITHUB_STEP_SUMMARY"
+          echo "| Port    | \`${{ inputs.port }}\` |"                             >> "$GITHUB_STEP_SUMMARY"
+          echo "| Binary  | \`${{ steps.url.outputs.url }}\` |"                   >> "$GITHUB_STEP_SUMMARY"

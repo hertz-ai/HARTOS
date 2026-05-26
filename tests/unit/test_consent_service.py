@@ -13,7 +13,6 @@ from datetime import datetime
 from integrations.social.models import Base, get_engine, get_db, db_session, UserConsent
 from integrations.social.consent_service import (
     ConsentService, CONSENT_TYPES, _validate_consent_type,
-    register_consent_routes,
 )
 
 
@@ -67,13 +66,22 @@ def test_grant_consent_new():
     assert c.revoked_at is None
 
 
-def test_grant_consent_updates_existing():
+def test_grant_after_pending_request_appends_row():
+    """Append-only: a grant after a pending request does NOT mutate
+    the request row — a NEW granted row is inserted instead.
+
+    This is the orchestrator-review acd11f55 semantic change.  The
+    pending request remains in place as audit history; the granted
+    row is the one returned.
+    """
     with db_session() as db:
-        ConsentService.request_consent(db, 'u1', 'data_access')
+        pending = ConsentService.request_consent(db, 'u1', 'data_access')
+        pending_id = pending.id
     with db_session() as db:
         c = ConsentService.grant_consent(db, 'u1', 'data_access')
     assert c.granted is True
     assert c.granted_at is not None
+    assert c.id != pending_id, 'grant must append a new row, not mutate the pending row'
 
 
 @patch('integrations.social.consent_service._emit')
@@ -240,79 +248,10 @@ def test_to_dict():
     assert d['revoked_at'] is None
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Flask route tests
-# ──────────────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def flask_client():
-    from flask import Flask
-    app = Flask(__name__)
-    app.config['TESTING'] = True
-    register_consent_routes(app)
-    return app.test_client()
-
-
-def test_route_get_list(flask_client):
-    # Seed data
-    with db_session() as db:
-        ConsentService.grant_consent(db, 'u1', 'data_access')
-    resp = flask_client.get('/api/consent/u1')
-    assert resp.status_code == 200
-    data = resp.get_json()
-    assert len(data) == 1
-    assert data[0]['consent_type'] == 'data_access'
-
-
-def test_route_post_grant(flask_client):
-    resp = flask_client.post('/api/consent/u1',
-                             json={'consent_type': 'revenue_share'})
-    assert resp.status_code == 201
-    data = resp.get_json()
-    assert data['granted'] is True
-    assert data['consent_type'] == 'revenue_share'
-
-
-def test_route_post_grant_missing_type(flask_client):
-    resp = flask_client.post('/api/consent/u1', json={})
-    assert resp.status_code == 400
-
-
-def test_route_post_grant_invalid_type(flask_client):
-    resp = flask_client.post('/api/consent/u1',
-                             json={'consent_type': 'bad'})
-    assert resp.status_code == 400
-
-
-def test_route_post_revoke(flask_client):
-    with db_session() as db:
-        ConsentService.grant_consent(db, 'u1', 'data_access')
-    resp = flask_client.post('/api/consent/u1/revoke',
-                             json={'consent_type': 'data_access'})
-    assert resp.status_code == 200
-    assert resp.get_json()['granted'] is False
-
-
-def test_route_post_revoke_not_found(flask_client):
-    resp = flask_client.post('/api/consent/u1/revoke',
-                             json={'consent_type': 'data_access'})
-    assert resp.status_code == 404
-
-
-def test_route_get_check(flask_client):
-    with db_session() as db:
-        ConsentService.grant_consent(db, 'u1', 'data_access')
-    resp = flask_client.get('/api/consent/u1/check?type=data_access')
-    assert resp.status_code == 200
-    assert resp.get_json()['granted'] is True
-
-
-def test_route_get_check_missing_type(flask_client):
-    resp = flask_client.get('/api/consent/u1/check')
-    assert resp.status_code == 400
-
-
-def test_route_get_check_not_granted(flask_client):
-    resp = flask_client.get('/api/consent/u1/check?type=data_access')
-    assert resp.status_code == 200
-    assert resp.get_json()['granted'] is False
+# Legacy Flask route tests removed in the consent-surface
+# consolidation (orchestrator review acd11f55, 2026-04-25).  The
+# /api/consent/<user_id>/* surface no longer exists.  Equivalent
+# coverage of the new /api/social/consent JWT surface lives in
+# tests/unit/test_consent_api.py; cross-surface invariants
+# (deletion, append-only, internal-caller compat) live in
+# tests/unit/test_consent_surface_consolidation.py.

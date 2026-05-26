@@ -51,6 +51,50 @@ def get_registered_ledger(user_prompt: str) -> Optional[Any]:
     with _state_lock:
         return _ledger_registry.get(user_prompt)
 
+
+# ─── GroupChat registry (Agent Ops Console Phase B) ──────────────────────
+# Mirrors _ledger_registry pattern exactly: same TTLCache module, same TTL
+# (28800s = 8h), same locking discipline.  Stores autogen GroupChat
+# instances per user_prompt so the dashboard's drill-down drawer can read
+# `group_chat.messages` live without needing a second SSE topic or a
+# parallel message store.
+#
+# Not loader-backed: GroupChat is in-process and ephemeral (autogen
+# rebuilds it per /chat round).  Cache miss returns None; the drawer
+# renders "no conversation captured" rather than fabricating a history.
+#
+# Populated by create_recipe.py at autogen GroupChat() instantiation
+# sites (lines 2611, 2620, 3254 as of 2026-05-17).  Read by
+# DashboardService.get_agent_chat_tail() in dashboard_service.py.
+_groupchat_registry = TTLCache(
+    ttl_seconds=28800, max_size=10000, name='groupchat_registry',
+)
+
+
+def register_groupchat_for_session(user_prompt: str, group_chat: Any) -> None:
+    """Register an autogen GroupChat for live drill-down access.
+
+    Idempotent: re-registering replaces the prior reference (the same
+    GroupChat object is mutated across turns, but a fresh /chat may spin
+    a new one — both cases want the latest reference).  No-op + debug
+    log if `group_chat` is None so call sites stay safe even when
+    autogen instantiation guards fail.
+    """
+    if group_chat is None:
+        logger.debug("register_groupchat_for_session: %s got None — skipping",
+                     user_prompt)
+        return
+    with _state_lock:
+        _groupchat_registry[user_prompt] = group_chat
+    logger.debug("Registered groupchat for %s", user_prompt)
+
+
+def get_registered_groupchat(user_prompt: str) -> Optional[Any]:
+    """Get the registered GroupChat for a session, or None on cache miss."""
+    with _state_lock:
+        return _groupchat_registry.get(user_prompt)
+
+
 def _extract_ownership_from_prompt(user_prompt: str):
     """Extract user_id and prompt_id from the user_prompt key (format: {user_id}_{prompt_id})."""
     parts = user_prompt.split('_', 1)
@@ -475,6 +519,34 @@ def force_state_through_valid_path(user_prompt: str, action_id: int, target_stat
     if current_state == target_state:
         return True
 
+    # FIX-5.1 (2026-04-21): TERMINATED is the absorbing "post-completion"
+    # state — RECIPE_RECEIVED → TERMINATED is the canonical last edge
+    # (see line 472 above).  If a caller asks for any state that comes
+    # BEFORE terminated (COMPLETED, FALLBACK_*, RECIPE_*), it's a
+    # no-op "already past this" request from the auto-complete code path
+    # in hart_intelligence_entry, not a real transition.  Return True
+    # silently instead of logging an ERROR-level red herring that
+    # masquerades as a genuine state-machine failure in the logs.
+    #
+    # Witnessed 2026-04-21T14:06:21 during live UI sweep v6:
+    #   got status as:completed
+    #   CHECKING FOR FALLBACK current_action=5 action_id=5
+    #   Action 5 completed with auto-generated fallback: ...
+    #   [ERROR] No valid path from terminated to completed   <-- spam
+    _POST_TERMINATED_SYNONYMS = {
+        ActionState.COMPLETED,
+        ActionState.FALLBACK_REQUESTED,
+        ActionState.FALLBACK_RECEIVED,
+        ActionState.RECIPE_REQUESTED,
+        ActionState.RECIPE_RECEIVED,
+    }
+    if current_state == ActionState.TERMINATED and target_state in _POST_TERMINATED_SYNONYMS:
+        logger.info(
+            f"[NOOP] Action {action_id} already terminated; "
+            f"{target_state.value} is already satisfied (reason={reason!r})"
+        )
+        return True
+
     # Get the path to target state
     path_key = (current_state, target_state)
     if path_key in state_paths:
@@ -510,7 +582,7 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
 
     valid_transitions = {
         ActionState.ASSIGNED: [ActionState.IN_PROGRESS, ActionState.ASSIGNED, ActionState.PREVIEW_PENDING],
-        ActionState.IN_PROGRESS: [ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.IN_PROGRESS],
+        ActionState.IN_PROGRESS: [ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.IN_PROGRESS, ActionState.ERROR, ActionState.PENDING],
         ActionState.STATUS_VERIFICATION_REQUESTED: [ActionState.COMPLETED, ActionState.PENDING, ActionState.ERROR, ActionState.STATUS_VERIFICATION_REQUESTED],
         ActionState.COMPLETED: [ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED, ActionState.COMPLETED],  # Allow direct recipe request (autonomous) or termination
         ActionState.PENDING: [ActionState.COMPLETED, ActionState.ERROR, ActionState.PENDING],

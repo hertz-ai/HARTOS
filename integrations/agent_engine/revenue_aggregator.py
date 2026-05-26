@@ -299,6 +299,24 @@ def settle_metered_api_costs(db, period_hours: int = 24) -> Dict:
             settled_count += 1
             total_spark += spark_amount
             total_usd += usage.actual_usd_cost
+            # Realtime fan-out for the live earnings drawer (idle-compute
+            # workstream G5).  Subscribers: hevolve.ai compute dashboard
+            # SSE, Nunba shell tile.  Best-effort — settlement must
+            # never block on event emit.
+            try:
+                from core.platform.events import emit_event
+                emit_event('compute.task_settled', {
+                    'usage_id': usage.id,
+                    'operator_id': usage.operator_id,
+                    'node_id': usage.node_id,
+                    'model_id': usage.model_id,
+                    'task_source': usage.task_source,
+                    'usd_cost': round(usage.actual_usd_cost, 6),
+                    'spark_awarded': spark_amount,
+                    'source_type': 'api_cost_recovery',
+                })
+            except Exception:
+                pass
         except Exception as e:
             logger.debug(f"Settlement failed for usage {usage.id}: {e}")
 

@@ -239,8 +239,46 @@ class ModelOrchestrator:
             return None
 
         if entry.loaded:
-            logger.info(f"Model already loaded: {model_id} ({entry.device})")
-            return entry
+            # Reconcile against the loader's live probe — entry.loaded
+            # is a CACHE that drifts when the underlying process dies
+            # externally (CUDA hang, OOM, manual kill, idle auto-stop
+            # outside our lifecycle).  Without this probe, the load()
+            # short-circuits with "Model already loaded" and the user
+            # sees a dead service ("Draft boot decision" loop on
+            # 2026-05-04 — task #80).  Loaders that override is_loaded()
+            # (LlamaLoader, TTSLoader, STTLoader, VLMLoader) return the
+            # actual liveness; the base class falls back to entry.loaded
+            # so loaders without an override preserve current behavior.
+            loader = self._loaders.get(entry.model_type)
+            try:
+                actually_loaded = (
+                    loader.is_loaded(entry) if loader else True
+                )
+            except Exception as _probe_err:
+                logger.warning(
+                    f"is_loaded probe failed for {model_id}: "
+                    f"{type(_probe_err).__name__}: {_probe_err} — "
+                    f"trusting cache flag"
+                )
+                actually_loaded = True
+            if actually_loaded:
+                logger.info(f"Model already loaded: {model_id} ({entry.device})")
+                return entry
+            # Cache lies — process is dead.  Reconcile state: release
+            # VRAM, clear the catalog flag, fall through to a fresh load.
+            logger.warning(
+                f"Stale cache for {model_id}: catalog says loaded but "
+                f"is_loaded() probe says dead — reconciling and "
+                f"respawning"
+            )
+            try:
+                self._release_vram(entry)
+            except Exception:
+                pass
+            try:
+                self._catalog.mark_unloaded(model_id)
+            except Exception:
+                pass
 
         cs = self._get_compute_state()
         fit = entry.matches_compute(
@@ -647,6 +685,34 @@ class ModelOrchestrator:
             passive idle eviction — their cold start is cheap and
             the VRAM is better spent on the model the user's about
             to use next.
+          * **Main+VLM LLMs** (``llm-qwen*-vl*``, or ``purposes``
+            containing any of ``vision`` / ``caption`` / ``grounding``)
+            → ``pinned=True``. The same llama-server serves both
+            chat AND the VLM agentic loop; losing it kills both
+            surfaces and any in-flight agentic loop has no recovery
+            context.  See 2026-05-03 incident: the 4B-VL died
+            silently between 16:05 and 16:59, no event in any log
+            (Nunba uses ``subprocess.PIPE`` for the main server's
+            stdout and only drains it during startup, so any final
+            output was lost), VRAM freed back to 7.83 GB / 8 GB
+            despite the prior ``pressure_evict_only`` policy.  Pin
+            forces the model to survive every code path including
+            phase-3 pressure eviction.
+
+          * **Chat-only main LLMs** (``llm-qwen*-2b*`` /
+            ``llm-qwen*-4b*`` without VL) → ``pressure_evict_only=
+            True``.  Survive passive idle sweep (phase 7), yield
+            under real VRAM pressure (phase 3).  A brief reload
+            costs only chat continuity, no in-flight VLM loop.
+            Before this distinction, the 2026-04-11 incident showed
+            the 4B being killed every 5 minutes mid-session because
+            its 340s idle exceeded the 300s timeout, even though
+            nothing else needed the VRAM.
+
+          * All other models (STT, TTS, standalone vision sidecars)
+            keep the default passive idle eviction — their cold
+            start is cheap and the VRAM is better spent on the
+            model the user's about to use next.
         """
         try:
             from integrations.service_tools.model_lifecycle import (
@@ -679,6 +745,29 @@ class ModelOrchestrator:
                 else:
                     # Main chat tier — survive idle sweeps, yield under
                     # real VRAM pressure.
+                _id_lower = entry.id.lower()
+                _is_draft = 'draft' in _purposes or (
+                    not _purposes and any(
+                        t in _id_lower for t in ('0.8b', 'draft', 'caption')
+                    )
+                )
+                # Main LLM that ALSO serves VLM (one llama-server with
+                # mmproj loaded — chat + agentic-loop on the same model)
+                # gets pinned.  See the docstring above for the 2026-05-03
+                # silent-death incident.
+                _is_vlm_main = (
+                    not _is_draft and (
+                        any(p in _purposes for p in ('vision', 'caption', 'grounding'))
+                        or (not _purposes and any(
+                            t in _id_lower for t in ('-vl-', '-vlm-', 'mmproj')
+                        ))
+                    )
+                )
+                if _is_draft or _is_vlm_main:
+                    _pinned = True
+                else:
+                    # Chat-only main tier — survive idle sweeps, yield
+                    # under real VRAM pressure.
                     _pressure_evict_only = True
 
             _priority = ModelPriority.ACTIVE if entry.model_type == 'llm' else ModelPriority.WARM

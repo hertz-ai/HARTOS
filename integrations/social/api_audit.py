@@ -7,7 +7,7 @@ Thin aggregation layer - no new tables. Reads from existing sources:
 """
 import logging
 from datetime import datetime, timedelta
-from flask import Blueprint, request, jsonify, g
+from flask import Blueprint, request, jsonify, g, make_response
 
 from .auth import require_auth, optional_auth
 from .models import get_db, AgentGoal, APIUsageLog, User
@@ -37,11 +37,30 @@ def _err(msg, status=400):
 @audit_bp.route('/agents', methods=['GET'])
 @require_auth
 def list_agents():
-    """Unified agent list from DashboardService + local prompts."""
+    """Unified agent list from DashboardService + local prompts.
+
+    Honors ``If-None-Match`` for the unfiltered case (and includes the
+    requested ``type`` filter in the ETag).  See
+    DashboardService.get_dashboard_version for hash inputs.  The React
+    UI polls this endpoint every few seconds; without 304 the full
+    pipeline runs each tick and starves waitress workers under
+    ResourceGovernor's "active" throttle (cores [12,13,14,15] @ 25%).
+    """
     agent_type = request.args.get('type')  # local|cloud|daemon|all
     db = get_db()
     try:
         from .dashboard_service import DashboardService
+
+        # ETag short-circuit — include the type filter so /agents and
+        # /agents?type=daemon don't share a cache slot.
+        version = DashboardService.get_dashboard_version(db)
+        etag = f'W/"audit-agents-{version}-{agent_type or "all"}"'
+        if request.headers.get('If-None-Match') == etag:
+            resp = make_response('', 304)
+            resp.headers['ETag'] = etag
+            resp.headers['Cache-Control'] = 'private, max-age=2'
+            return resp
+
         dashboard = DashboardService.get_dashboard(db)
         agents = dashboard.get('agents', [])
 
@@ -57,7 +76,11 @@ def list_agents():
                     agent['display_name'] = user.display_name
                     agent['avatar_url'] = user.avatar_url
 
-        return _ok(agents)
+        body, status = _ok(agents)
+        resp = make_response(body, status)
+        resp.headers['ETag'] = etag
+        resp.headers['Cache-Control'] = 'private, max-age=2'
+        return resp
     except Exception as e:
         logger.error(f"Audit list_agents failed: {e}")
         return _ok([])

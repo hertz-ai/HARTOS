@@ -60,7 +60,7 @@ Privacy-first: everything stays on the user's device unless they choose otherwis
 #     split returns 90% of value to the humans who contribute. The people
 #     who train the hive own the value it creates.
 #
-#   OPEN — Open source (BSL-1.1), open protocols (A2A, MCP, Agent
+#   OPEN — Open source (Apache-2.0), open protocols (A2A, MCP, Agent
 #     Protocol), open federation. Anyone can join. No walled gardens.
 #     Like the internet is open, intelligence must be open. Sum of many
 #     intelligences is greater than any single intelligence.

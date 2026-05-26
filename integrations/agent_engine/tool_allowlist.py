@@ -124,3 +124,118 @@ def check_tool_allowed(model_id: str, tool_name: str) -> Tuple[bool, str]:
         return True, f"Tool '{tool_name}' allowed for tier {tier.value}"
 
     return False, f"Tool '{tool_name}' not allowed for tier {tier.value}"
+
+
+# ─── Capability summary for prompt injection ───────────────────────────
+# Each static tool name → ≤3-word phrase the draft prompt can show the
+# user-facing model.  Drift guard:
+# tests/unit/test_draft_first_dispatch.py asserts every name in
+# _FAST_TOOLS|_BALANCED_TOOLS has an entry here, so a new tool added
+# without a description fails CI before shipping.
+_TOOL_DESCRIPTIONS: dict = {
+    # _FAST_TOOLS (read-only)
+    'web_search':       'web search',
+    'read_file':        'read files',
+    'list_files':       'browse files',
+    'memory_search':    'recall memory',
+    'embeddings_query': 'semantic search',
+    'get_time':         'current time',
+    'calculator':       'math',
+    'status_check':     'system status',
+    'get_weather':      'weather',
+    'search_docs':      'search docs',
+    'get_agent_info':   'agent info',
+    # _BALANCED_TOOLS adds (read-write)
+    'write_file':         'write files',
+    'send_message':       'send messages',
+    'create_task':        'create tasks',
+    'update_task':        'update tasks',
+    'post_content':       'post content',
+    'schedule_job':       'schedule jobs',
+    'send_notification':  'notifications',
+}
+
+
+def get_capability_summary() -> str:
+    """Comma-joined, ≤3-word capability list for the draft prompt.
+
+    Combines:
+      - Static tools (above), name → ≤3-word phrase
+      - ModelCatalog entries, rolled up by type (tts/stt/vlm/video/audio)
+        so 12 TTS voices show as one phrase, not 12 phrases
+      - MCP servers, by server name (auto-discovered via mcp_registry)
+      - Active channel adapters (auto-discovered via channels.admin.api)
+      - Expert-agent registry, rolled up by category
+
+    Every dynamic source is wrapped in try/except so a missing or not-
+    yet-loaded subsystem silently drops its slice rather than blocking
+    the prompt.  Result is intended to be ≤100 tokens at typical install.
+
+    Single source of truth for "what can this assistant do" surfaced to
+    the draft model — when a new MCP server / channel / video model is
+    registered at runtime, it appears in the next call without code
+    changes.
+    """
+    parts: list = []
+
+    # Static tools (sorted for stable output)
+    for name in sorted(_FAST_TOOLS | _BALANCED_TOOLS):
+        parts.append(_TOOL_DESCRIPTIONS.get(name, name))
+
+    # ModelCatalog — roll up by type, not per-entry
+    try:
+        from integrations.service_tools.model_catalog import get_catalog
+        cat = get_catalog()
+        type_counts: dict = {}
+        for entry in cat.list_all():
+            t = getattr(entry.model_type, 'value', str(entry.model_type))
+            type_counts[t] = type_counts.get(t, 0) + 1
+        _MODEL_TYPE_PHRASES = {
+            'tts':       lambda n: f'TTS ({n} voices)',
+            'stt':       lambda n: f'STT ({n} models)',
+            'vlm':       lambda n: f'vision ({n} VLMs)',
+            'video_gen': lambda _: 'video generation',
+            'audio_gen': lambda _: 'audio generation',
+            'llm':       lambda n: f'LLMs ({n})',
+        }
+        for t, n in type_counts.items():
+            phrase_fn = _MODEL_TYPE_PHRASES.get(t)
+            if phrase_fn:
+                parts.append(phrase_fn(n))
+    except Exception:
+        pass
+
+    # MCP servers (server names; tools-per-server would blow the budget)
+    try:
+        from integrations.mcp.mcp_integration import mcp_registry
+        for server_name in mcp_registry.servers:
+            parts.append(server_name)
+    except Exception:
+        pass
+
+    # Channel adapters
+    try:
+        from integrations.channels.admin.api import api as channel_api
+        for ch in channel_api._channels:
+            parts.append(ch)
+    except Exception:
+        pass
+
+    # Expert agents — category roll-up only (96 individual is too many)
+    try:
+        from integrations.expert_agents.registry import (
+            ExpertAgentRegistry, AgentCategory,
+        )
+        registry = ExpertAgentRegistry()
+        live_cats = [
+            cat.value for cat in AgentCategory
+            if registry.get_agents_by_category(cat)
+        ]
+        if live_cats:
+            shown = ', '.join(live_cats[:5])
+            ellipsis = '…' if len(live_cats) > 5 else ''
+            parts.append(f'domain experts ({shown}{ellipsis})')
+    except Exception:
+        pass
+
+    return ', '.join(parts)

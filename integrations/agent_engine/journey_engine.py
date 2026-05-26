@@ -654,6 +654,10 @@ def get_journey_engine() -> JourneyEngine:
 def register_journey_tools(helper, assistant, user_id: str):
     """Register journey tools for the marketing/sales agent."""
     from autogen import register_function
+    # Routed through core.labeled_autogen_function so each tool emits a
+    # publish_chat_stage('tool_call', text=…) before invocation — same UI
+    # status pipeline as LangChain's _with_tool_logging chokepoint.
+    from core.labeled_autogen_function import register_labeled_function
 
     engine = get_journey_engine()
 
@@ -733,6 +737,19 @@ def register_journey_tools(helper, assistant, user_id: str):
 
     for func in [view_journey_pipeline, advance_prospect_stage, run_journey_tick, send_prospect_message]:
         register_function(func, caller=helper, executor=assistant, description=func.__doc__)
+    # UI labels for these tool names live in core/constants.py:TOOL_LABELS
+    # (single source of truth) — looked up at registration time so the
+    # factory's mandatory ui_label kwarg is satisfied without duplicating
+    # the strings here.
+    from core.constants import TOOL_LABELS
+    for func in [view_journey_pipeline, advance_prospect_stage, run_journey_tick, send_prospect_message]:
+        register_labeled_function(
+            func,
+            caller=helper,
+            executor=assistant,
+            description=func.__doc__,
+            ui_label=TOOL_LABELS.get(func.__name__, f'Running {func.__name__}…'),
+        )
 
     logger.info('Registered 4 journey tools for user %s', user_id)
 

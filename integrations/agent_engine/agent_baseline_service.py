@@ -126,6 +126,7 @@ class AgentBaselineService:
                 'lightning_metrics': AgentBaselineService._collect_lightning_metrics(
                     prompt_id, user_prompt),
                 'benchmark_metrics': AgentBaselineService._collect_benchmark_metrics(),
+                'world_model_metrics': AgentBaselineService._collect_world_model_metrics(),
                 'trust_evolution_metrics': AgentBaselineService._collect_trust_evolution_metrics(
                     user_id),
             }
@@ -268,6 +269,74 @@ class AgentBaselineService:
             return flat
         except Exception as e:
             logger.debug(f'Benchmark metric collection failed: {e}')
+            return {}
+
+    @staticmethod
+    def _collect_world_model_metrics() -> Dict:
+        """Pull the latest provider stats from HevolveAI via the
+        world_model_bridge.  This is the closed-loop active-learning
+        signal — prediction error, learning step count, runtime —
+        emitted by the EmbodiedLearner provider as it consumes the
+        experience queue (record_interaction /
+        record_embodied_interaction / submit_output_feedback).
+
+        Field names verified against the sibling repo (do not invent):
+        hevolveai/embodied_ai/inference/embodied_learner.py::EmbodiedLearner.get_stats
+        returns this dict shape:
+
+            frames_processed:       int
+            learning_steps:         int      ← model maturity signal
+            passive_steps:          int
+            active_steps:           int
+            static_frames_skipped:  int
+            source_switches:        int
+            total_actions:          int
+            random_actions:         int
+            model_driven_actions:   int
+            avg_prediction_error:   float    ← AL acquisition signal
+                                              (lower = more confident,
+                                              higher = system has more
+                                              to learn from this domain)
+            total_runtime_seconds:  float
+            mode, is_running, is_paused, active_source,
+            last_learning_time, source_stats, self_state
+
+        EpistemicMetadata.uncertainty / confidence (in
+        epistemic_response.py) exist but are per-INFERENCE results;
+        get_stats() doesn't carry them.  If a per-call uncertainty is
+        needed later, it has to come through a separate surface.
+
+        Returns the raw stats dict in 'raw' plus two normalized
+        promoted keys (so consumers don't all need to know the
+        HevolveAI schema):
+
+          'al_signal'      — avg_prediction_error in [0, 1], or None
+          'learning_steps' — int count, or None
+
+        Empty dict on any failure (HARTOS-only deploy without
+        HevolveAI, circuit breaker open, network down) — never
+        raises, never blocks the snapshot.
+        """
+        try:
+            from integrations.agent_engine.world_model_bridge import (
+                get_world_model_bridge)
+            bridge = get_world_model_bridge()
+            if bridge is None:
+                return {}
+            feedback = bridge.get_learning_feedback()
+            if not feedback or not isinstance(feedback, dict):
+                return {}
+
+            normalized: Dict = {'raw': feedback}
+            err = feedback.get('avg_prediction_error')
+            if isinstance(err, (int, float)):
+                normalized['al_signal'] = max(0.0, min(1.0, float(err)))
+            steps = feedback.get('learning_steps')
+            if isinstance(steps, int):
+                normalized['learning_steps'] = steps
+            return normalized
+        except Exception as e:
+            logger.debug(f'World-model metric collection failed: {e}')
             return {}
 
     @staticmethod

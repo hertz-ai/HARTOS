@@ -120,46 +120,69 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged)
-    timeout-minutes: 10
+    # Feature-flag gate: the deploy step pushes to the central instance,
+    # so it stays OFF by default.  Repo variable DEPLOY_ENABLED='true'
+    # turns it on (no code change needed).  Toggle via:
+    #   gh variable set DEPLOY_ENABLED --body 'true'  --repo hertz-ai/HARTOS
+    #   gh variable set DEPLOY_ENABLED --body 'false' --repo hertz-ai/HARTOS
+    # Unset / any other value = skipped.  When skipped the job shows
+    # "skipped" (not "failure"), so the workflow status stays green.
+    if: |
+      vars.DEPLOY_ENABLED == 'true' &&
+      (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged))
+    timeout-minutes: 75
     environment:
       name: ${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
     steps:
-      - name: Deploy to cloud server
+      # All host-specific facts (hostname, port, user, password, repo
+      # path, master-key path, log/image volume paths) live in repo
+      # secrets so a public reader of this file learns only the
+      # generic shape of the deploy — not the attack surface.  Sudo
+      # runs without password (host sudoers config); workflow doesn't
+      # pipe DEPLOY_PASSWORD into sudo -S.
+      - name: Deploy to central instance
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          password: ${{ secrets.DEPLOY_PASSWORD }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          # --no-cache rebuild on the 8GB langchain_gpt image runs
+          # ~25-40 min; 60m headroom + health-check loop afterward.
+          command_timeout: 60m
+          envs: REPO_PATH,MASTER_KEY_PATH,LOGS_PATH,IMAGES_PATH
           script: |
-            cd /opt/hartos
-
-            # Pull latest image
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-
-            # Stop old container gracefully
-            docker stop hartos-langchain 2>/dev/null || true
-            docker rm hartos-langchain 2>/dev/null || true
-
-            # Start new container
-            docker run -d \
-              --name hartos-langchain \
-              --restart unless-stopped \
+            set -e
+            cd "$REPO_PATH"
+            # ff-only preserves the untracked files in the clone dir
+            # (.env, release_manifest.json, config.json) and aborts
+            # if a host hot-fix has diverged from origin/main.
+            git pull --ff-only origin main
+            docker build --no-cache -t langchain_gpt:main .
+            sudo docker stop langchain 2>/dev/null || true
+            sudo docker rm   langchain 2>/dev/null || true
+            sudo docker run -d --name langchain --restart unless-stopped \
               -p 6777:6777 \
-              -v /opt/hartos/data:/app/data \
-              -v /opt/hartos/prompts:/app/prompts \
-              -v /opt/hartos/logs:/app/logs \
-              -e HEVOLVE_DB_URL="${HEVOLVE_DB_URL}" \
-              -e OPENAI_API_KEY="${OPENAI_API_KEY}" \
-              -e HEVOLVE_MASTER_KEY="${HEVOLVE_MASTER_KEY}" \
-              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-
-            # Wait for health check
+              --env-file .env \
+              -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat "$MASTER_KEY_PATH")" \
+              -v "$(pwd)/config.json:/app/config.json:ro" \
+              -v "$(pwd)/release_manifest.json:/app/release_manifest.json:ro" \
+              -v "$LOGS_PATH:/app/logs" \
+              -v "$IMAGES_PATH:/app/output_images" \
+              langchain_gpt:main
             for i in $(seq 1 30); do
-              if curl -s http://localhost:6777/api/social/feed?limit=1 | grep -q 'data'; then
-                echo "HARTOS healthy on :6777"
+              if curl -fsS http://localhost:6777/status >/dev/null 2>&1; then
+                echo "[OK] central instance healthy on :6777"
+                docker ps --filter name=langchain --format '  Status: {{.Status}}'
                 exit 0
               fi
-              sleep 2
+              sleep 3
             done
-            echo "WARNING: Health check timed out"
+            echo "[FAIL] Health check timed out — dumping recent container logs"
+            docker logs --tail 100 langchain || true
+            exit 1
+        env:
+          REPO_PATH:       ${{ secrets.DEPLOY_REPO_PATH }}
+          MASTER_KEY_PATH: ${{ secrets.DEPLOY_MASTER_KEY_PATH }}
+          LOGS_PATH:       ${{ secrets.DEPLOY_LOGS_PATH }}
+          IMAGES_PATH:     ${{ secrets.DEPLOY_IMAGES_PATH }}

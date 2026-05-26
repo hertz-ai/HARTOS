@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import time
 
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request, make_response
 
 logger = logging.getLogger('hevolve_social')
 
@@ -25,14 +25,32 @@ def get_agent_dashboard():
 
     Priority-ordered: what matters most RIGHT NOW appears first.
     Status reflects reality, not cache.
+
+    Honors ``If-None-Match``: a fresh 304 short-circuits the 5 SQL
+    queries + 170-row serialization when the dashboard hasn't changed.
+    The React UI polls every 5s — without ETag, every poll re-runs the
+    full pipeline and queues waitress workers under throttle.  See
+    DashboardService.get_dashboard_version for the hash inputs.
     """
     from .dashboard_service import DashboardService
     from .models import get_db
 
     db = get_db()
     try:
+        version = DashboardService.get_dashboard_version(db)
+        etag = f'W/"dash-{version}"'
+        # Conditional GET — 304 with no body is the entire point.
+        if request.headers.get('If-None-Match') == etag:
+            resp = make_response('', 304)
+            resp.headers['ETag'] = etag
+            resp.headers['Cache-Control'] = 'private, max-age=2'
+            return resp
+
         data = DashboardService.get_dashboard(db)
-        return jsonify({'success': True, 'data': data}), 200
+        resp = make_response(jsonify({'success': True, 'data': data}), 200)
+        resp.headers['ETag'] = etag
+        resp.headers['Cache-Control'] = 'private, max-age=2'
+        return resp
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -338,6 +356,209 @@ def get_topology():
         }), 200
     except Exception as e:
         logger.error(f"Topology error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+# ─── Agent Ops Console (Phase B drill-down) ──────────────────────────────
+# Same blueprint, same ETag pattern, same auth posture as the agents
+# list endpoint above.  No new blueprint, no new auth system.
+
+@dashboard_bp.route(
+    '/api/social/dashboard/agents/<agent_id>/snapshot',
+    methods=['GET'],
+)
+def get_agent_snapshot(agent_id):
+    """Return the drill-down snapshot payload for ONE agent.
+
+    Combines the AgentGoal row (with truth-grounded status_reason),
+    the goal tree from SmartLedger, and the most-recent dispatcher
+    decision (model + tier) from ImmutableAuditLog.
+
+    No ETag — the snapshot reflects ledger state that changes per
+    autogen turn (seconds) and the polling interval from the drawer
+    is 2s anyway.  Short-circuit caching would only save the SQL,
+    which is one indexed primary-key lookup.
+    """
+    from .dashboard_service import DashboardService
+    from .models import get_db
+
+    db = get_db()
+    try:
+        snapshot = DashboardService.get_agent_snapshot(db, agent_id)
+        if snapshot is None:
+            return jsonify({'success': False, 'error': 'agent not found'}), 404
+        return jsonify({'success': True, 'data': snapshot}), 200
+    except Exception as e:
+        logger.exception(f"snapshot error for agent_id={agent_id}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@dashboard_bp.route(
+    '/api/social/dashboard/agents/<agent_id>/chat',
+    methods=['GET'],
+)
+def get_agent_chat(agent_id):
+    """Return the latest autogen GroupChat turns for ONE agent.
+
+    Query params:
+      ``since`` — int cursor; returns messages with index >= since.
+      ``limit`` — int, clamped to 1..200 (default 50).
+
+    Response shape:
+      {ok: True, data: {
+          messages: [{index, role, speaker, content, tool_calls}],
+          next_index: int,
+          registered: bool,
+      }}
+
+    ``registered=False`` means the in-process GroupChat cache has no
+    entry for this agent yet (the agent has not run /chat in this
+    Nunba process since boot, or the 8h TTL evicted it).  Frontend
+    shows "no live conversation captured" rather than fabricating.
+    """
+    from .dashboard_service import DashboardService
+
+    try:
+        since = max(0, int(request.args.get('since', 0) or 0))
+    except (TypeError, ValueError):
+        since = 0
+    try:
+        limit = max(1, min(int(request.args.get('limit', 50) or 50), 200))
+    except (TypeError, ValueError):
+        limit = 50
+
+    try:
+        data = DashboardService.get_agent_chat_tail(
+            agent_id, since_index=since, limit=limit)
+        return jsonify({'success': True, 'data': data}), 200
+    except Exception as e:
+        logger.exception(f"chat tail error for agent_id={agent_id}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ─── Agent Ops Console (Phase C: A2A graph + steering verbs) ─────────────
+
+@dashboard_bp.route(
+    '/api/social/dashboard/agents/<agent_id>/a2a',
+    methods=['GET'],
+)
+def get_agent_a2a(agent_id):
+    """Return A2A delegation graph centred on this agent.
+
+    Reads from the existing ``a2a_context.delegations`` singleton
+    populated by ``internal_agent_communication.delegate_task``.  No
+    new graph store.
+
+    Query params: ``depth`` (reserved for transitive walks; Phase D).
+    """
+    from .dashboard_service import get_a2a_graph
+    try:
+        depth = max(1, min(int(request.args.get('depth', 2) or 2), 5))
+    except (TypeError, ValueError):
+        depth = 2
+    try:
+        data = get_a2a_graph(agent_id, depth=depth)
+        return jsonify({'success': True, 'data': data}), 200
+    except Exception as e:
+        logger.exception(f"a2a error for agent_id={agent_id}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def _steer(agent_id, verb):
+    """Shared helper for the 3 steering verbs.
+
+    Each verb writes one ImmutableAuditLog ``agent_steered`` entry.
+    Body schema (optional): ``{reason: <str>}``.
+
+    Auth posture matches the rest of the dashboard blueprint — the
+    /agents list endpoint above is also unauthenticated for parity
+    with the existing operator console.  Phase C5 (owner-or-admin)
+    is gated until the dashboard moves behind @require_auth.
+    """
+    from .dashboard_service import steer_agent
+    from .models import get_db
+    body = request.get_json(force=True, silent=True) or {}
+    reason = body.get('reason')
+    actor_id = body.get('actor_id') or request.headers.get(
+        'X-Hartos-User') or 'admin-ui'
+    db = get_db()
+    try:
+        result = steer_agent(db, agent_id, verb,
+                             actor_id=actor_id, reason=reason)
+        status = 200 if result.get('ok') else 400
+        return jsonify({'success': result.get('ok'),
+                        'data': result}), status
+    except Exception as e:
+        logger.exception(f"steer {verb} error for agent_id={agent_id}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@dashboard_bp.route(
+    '/api/social/dashboard/agents/<agent_id>/pause',
+    methods=['POST'],
+)
+def steer_pause(agent_id):
+    """Pause an agent goal.  Idempotent on already-paused."""
+    return _steer(agent_id, 'pause')
+
+
+@dashboard_bp.route(
+    '/api/social/dashboard/agents/<agent_id>/resume',
+    methods=['POST'],
+)
+def steer_resume(agent_id):
+    """Resume a paused agent goal.  400 if not paused."""
+    return _steer(agent_id, 'resume')
+
+
+@dashboard_bp.route(
+    '/api/social/dashboard/agents/<agent_id>/cancel',
+    methods=['POST'],
+)
+def steer_cancel(agent_id):
+    """Cancel (archive) an agent goal.  Terminal — cannot resume."""
+    return _steer(agent_id, 'cancel')
+
+
+# ─── Agent Ops Console (Phase D: operator inject) ────────────────────────
+
+@dashboard_bp.route(
+    '/api/social/dashboard/agents/<agent_id>/inject',
+    methods=['POST'],
+)
+def inject_into_groupchat(agent_id):
+    """Inject an operator instruction into the agent's live GroupChat.
+
+    Body: ``{"instruction": <str>, "actor_id": <str>?}``.  Returns
+    ``{ok: bool, message_index: int|null, error: str|null}``.
+
+    Returns 400 when the GroupChat is not registered (process restart,
+    8h TTL eviction, or /chat never ran for this agent in this process).
+    """
+    from .dashboard_service import inject_instruction
+    from .models import get_db
+    body = request.get_json(force=True, silent=True) or {}
+    instruction = (body.get('instruction') or '').strip()
+    actor_id = body.get('actor_id') or request.headers.get(
+        'X-Hartos-User') or 'admin-ui'
+    if not instruction:
+        return jsonify({'success': False,
+                        'error': 'instruction is required'}), 400
+    db = get_db()
+    try:
+        result = inject_instruction(db, agent_id, instruction,
+                                    actor_id=actor_id)
+        status = 200 if result.get('ok') else 400
+        return jsonify({'success': result.get('ok'),
+                        'data': result}), status
+    except Exception as e:
+        logger.exception(f"inject error for agent_id={agent_id}: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
     finally:
         db.close()

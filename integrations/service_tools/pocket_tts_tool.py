@@ -170,6 +170,8 @@ def pocket_tts_synthesize(
         output_path = str(_get_output_dir() / f"tts_{h}.wav")
 
     # Try Pocket TTS (preferred)
+    import time as _time
+    _t0 = _time.monotonic()
     try:
         import numpy as np
         model = _load_model()
@@ -183,6 +185,16 @@ def pocket_tts_synthesize(
         scipy.io.wavfile.write(output_path, sr, audio_np)
 
         duration = len(audio_np) / sr
+        # Success log — required for #88: previously there was no
+        # runtime confirmation that pocket_tts was actually synthesizing
+        # (only failure paths logged).  Operators couldn't tell from
+        # langchain.log alone whether TTS was working or silently no-oping.
+        _elapsed_ms = int((_time.monotonic() - _t0) * 1000)
+        logger.info(
+            f"pocket_tts synthesized {len(text)}ch → {output_path} "
+            f"(sr={sr}Hz, dur={duration:.2f}s, voice={voice}, "
+            f"latency={_elapsed_ms}ms)"
+        )
         return json.dumps({
             "path": output_path,
             "duration": round(duration, 2),
@@ -197,6 +209,11 @@ def pocket_tts_synthesize(
 
     # Fallback: espeak-ng
     if _espeak_synthesize(text, output_path, voice="en"):
+        _elapsed_ms = int((_time.monotonic() - _t0) * 1000)
+        logger.info(
+            f"pocket_tts(espeak fallback) synthesized {len(text)}ch → "
+            f"{output_path} (latency={_elapsed_ms}ms)"
+        )
         return json.dumps({
             "path": output_path,
             "duration": 0,  # espeak doesn't report duration

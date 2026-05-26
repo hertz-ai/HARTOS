@@ -39,6 +39,22 @@ from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
+try:
+    from core.labeled_tool import labeled_tool
+except ImportError:  # cx_Freeze / degraded test env
+    def labeled_tool(name, func, description, *, ui_label):  # type: ignore
+        try:
+            from langchain_core.tools import Tool as _Tool
+        except ImportError:
+            from langchain.agents import Tool as _Tool
+        return _Tool(name=name, func=func, description=description)
+
+
+# Friendly UI status labels live in the canonical static dict at
+# core/constants.py:TOOL_LABELS (#509 — eliminates the prior duplicate
+# `_INTROSPECT_LABELS` table here).  Both `get_langchain_tools()` and
+# `register_autogen()` below look up `TOOL_LABELS.get(fn.__name__, …)`.
+
 logger = logging.getLogger(__name__)
 
 _NUNBA_BASE = os.environ.get(
@@ -578,6 +594,10 @@ def get_langchain_tools() -> List[Any]:
     except ImportError:
         try:
             from langchain.agents import Tool  # type: ignore
+        from langchain_core.tools import Tool  # noqa: F401 — feature-detection probe
+    except ImportError:
+        try:
+            from langchain.agents import Tool  # type: ignore  # noqa: F401
         except ImportError:
             logger.debug("langchain not importable — system_introspect tools unavailable")
             return []
@@ -608,6 +628,12 @@ def get_langchain_tools() -> List[Any]:
             name=fn.__name__,
             func=_make_runner(fn, _takes_arg),
             description=(fn.__doc__ or fn.__name__).strip().split('\n')[0],
+        from core.constants import TOOL_LABELS
+        tools.append(labeled_tool(
+            name=fn.__name__,
+            func=_make_runner(fn, _takes_arg),
+            description=(fn.__doc__ or fn.__name__).strip().split('\n')[0],
+            ui_label=TOOL_LABELS.get(fn.__name__, f"Checking {fn.__name__}…"),
         ))
     return tools
 
@@ -625,11 +651,29 @@ def register_autogen(assistant_agent: Any, user_proxy_agent: Any) -> int:
         from autogen import register_function
     except ImportError:
         logger.debug("autogen not importable — system_introspect tools unavailable")
+    Routed through `core.labeled_autogen_function.register_labeled_function`
+    so each invocation emits a `publish_chat_stage('tool_call', …)` UI
+    status — same chokepoint LangChain tools traverse via
+    `_with_tool_logging`.
+
+    Returns count registered.  Silent no-op if the wrapper isn't
+    importable (autogen missing or core not on sys.path).
+    """
+    try:
+        from core.labeled_autogen_function import register_labeled_function
+        from core.constants import TOOL_LABELS
+    except ImportError:
+        logger.warning(
+            "core.labeled_autogen_function unavailable — "
+            "system_introspect autogen tools NOT registered",
+            exc_info=True,
+        )
         return 0
     count = 0
     for fn in _TOOL_FUNCTIONS:
         try:
             register_function(
+            register_labeled_function(
                 fn,
                 caller=assistant_agent,
                 executor=user_proxy_agent,
@@ -639,6 +683,16 @@ def register_autogen(assistant_agent: Any, user_proxy_agent: Any) -> int:
             count += 1
         except Exception as e:
             logger.warning(f"autogen register_function failed for {fn.__name__}: {e}")
+                ui_label=TOOL_LABELS.get(
+                    fn.__name__, f"Checking {fn.__name__}…"
+                ),
+            )
+            count += 1
+        except Exception:
+            logger.warning(
+                "register_labeled_function failed for %s",
+                fn.__name__, exc_info=True,
+            )
     return count
 
 

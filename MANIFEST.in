@@ -1,0 +1,10 @@
+# Files outside any package that must ship in the sdist + wheel.
+#
+# LICENSE is required at runtime by security/origin_attestation.py
+# verify_brand_markers() - without it, every Nunba boot logs
+# "Origin attestation FAILED: Missing required file: LICENSE"
+# at WARNING level until attestation degrades silently.
+#
+# README.md is included for the wheel's long-description path.
+include LICENSE
+include README.md

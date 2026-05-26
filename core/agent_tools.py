@@ -110,6 +110,13 @@ def build_core_tool_closures(ctx):
         "Text to image Creator",
         text_2_image,
     ))
+    # Alias — reuse_recipe.py main flow LLM prompts advertise `txt2img` (#510).
+    # Same canonical closure (helper_fun.txt2img — local-first, sovereignty).
+    tools.append((
+        "txt2img",
+        "Text to image Creator (alias of text_2_image)",
+        text_2_image,
+    ))
 
     # ------------------------------------------------------------------
     # 2. get_user_camera_inp
@@ -228,6 +235,14 @@ def build_core_tool_closures(ctx):
     tools.append((
         "get_data_by_key",
         "Returns all data from the internal Memory using key",
+        get_data_by_key,
+    ))
+    # Alias — Helper system prompts in reuse_recipe.py advertise this name (#510).
+    # Same closure → identical behavior under both names.  Never remove a
+    # registered tool: phantom tool fixed by adding a real registration.
+    tools.append((
+        "get_data_from_memory",
+        "Returns all data from the internal Memory using key (alias of get_data_by_key)",
         get_data_by_key,
     ))
 
@@ -508,6 +523,13 @@ def build_core_tool_closures(ctx):
     tools.append((
         "get_text_from_image",
         "Image to Text/Question Answering from image",
+        img2txt,
+    ))
+    # Alias — reuse_recipe.py main flow LLM prompts advertise `img2txt` (#510).
+    # Same canonical closure (SSRF-validated, local Qwen Vision + cloud LLaVA fallback).
+    tools.append((
+        "img2txt",
+        "Image to Text/Question Answering from image (alias of get_text_from_image)",
         img2txt,
     ))
 

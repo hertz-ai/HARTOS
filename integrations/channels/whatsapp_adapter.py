@@ -40,11 +40,12 @@ from .base import (
     ChannelSendError,
     ChannelRateLimitError,
 )
+from .room_capable import RoomCapableAdapter
 
 logger = logging.getLogger(__name__)
 
 
-class WhatsAppAdapter(ChannelAdapter):
+class WhatsAppAdapter(ChannelAdapter, RoomCapableAdapter):
     """
     WhatsApp messaging adapter using whatsapp-web.js REST API.
 
@@ -456,6 +457,35 @@ class WhatsAppAdapter(ChannelAdapter):
             logger.error(f"Failed to download WhatsApp media: {e}")
 
         return False
+
+    # ─── UNIF-G2: RoomCapableAdapter — pending OAuth wiring ──────────
+    #
+    # WhatsApp groups via WAHA expose group_id-as-chat_id, but
+    # programmatic join / leave / member listing requires the WAHA
+    # session to be paired with the user's WA account AND the bot
+    # number to be already a member of the target group.  Marking the
+    # adapter ``RoomCapableAdapter`` keeps ``isinstance`` honest; real
+    # join_room implementation lands when the WAHA group-management
+    # endpoints are wired (separate task).
+
+    async def join_room(self, room_id: str,
+                        role: str = 'participant') -> bool:
+        logger.info(
+            "WhatsApp.join_room: platform support pending — WAHA group-"
+            "management endpoints not yet wired (room_id=%s, role=%s)",
+            room_id, role)
+        return False
+
+    async def leave_room(self, room_id: str) -> bool:
+        logger.info(
+            "WhatsApp.leave_room: platform support pending (room_id=%s)",
+            room_id)
+        return False
+
+    async def list_room_members(
+        self, room_id: str,
+    ) -> List[Dict[str, Any]]:
+        return []
 
 
 def create_whatsapp_adapter(

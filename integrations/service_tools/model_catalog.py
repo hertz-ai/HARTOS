@@ -242,6 +242,42 @@ class ModelCatalog:
             logger.info(f"Unregistered model: {model_id}")
         return removed is not None
 
+    def override(self, model_id: str, *, persist: bool = False, **fields) -> bool:
+        """Apply field-level overrides to an already-registered entry.
+
+        Use this when one populator needs to narrow another populator's
+        entry (e.g. Nunba's populate_media_gen amending HARTOS's fallback
+        audio_gen-acestep surface). Unlike direct ``entry.field = value``
+        mutation, override() takes the catalog lock, validates field names
+        against the ModelEntry dataclass, sets the dirty flag, and logs
+        the change — so the single-writer semantics of register/unregister
+        extend to cross-populator amendments.
+
+        Unknown fields raise ValueError. Returns False if model_id is not
+        registered (no-op). Defaults to persist=False because overrides
+        typically happen during populator boot (same convention as
+        register(persist=False)).
+        """
+        allowed = set(ModelEntry.__dataclass_fields__)
+        unknown = [k for k in fields if k not in allowed]
+        if unknown:
+            raise ValueError(
+                f"override(): unknown field(s) for ModelEntry: {sorted(unknown)}",
+            )
+        with self._lock:
+            entry = self._entries.get(model_id)
+            if entry is None:
+                return False
+            for key, value in fields.items():
+                setattr(entry, key, value)
+            self._dirty = True
+        if persist:
+            self._save()
+        logger.info(
+            f"Overrode model {model_id} fields: {sorted(fields.keys())}",
+        )
+        return True
+
     def get(self, model_id: str) -> Optional[ModelEntry]:
         """Get a model by ID."""
         return self._entries.get(model_id)

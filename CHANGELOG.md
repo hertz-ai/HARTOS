@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **Consolidated consent HTTP surfaces (orchestrator review acd11f55).**
+  Deleted the legacy `/api/consent/<user_id>/*` route family from
+  `integrations/social/consent_service.py` (no JWT, UPSERT semantics).
+  All HTTP writes to `user_consents` now flow through the JWT-authed,
+  append-only `/api/social/consent` surface in
+  `integrations/social/consent_api.py`.  `ConsentService.grant_consent`
+  switched from UPSERT (rewrote `granted_at` on re-grant) to APPEND-ONLY
+  (every grant inserts a new row) so internal callers share the same
+  audit-trail invariant.  Cross-surface guard test added at
+  `tests/unit/test_consent_surface_consolidation.py`.
+
 ## [0.1.0] - 2026-04-12
 
 ### Security

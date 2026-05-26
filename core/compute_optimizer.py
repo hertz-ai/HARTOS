@@ -282,76 +282,106 @@ class ComputeOptimizer:
 
     # ── Snapshot ──────────────────────────────────────────────────
 
-    def snapshot(self) -> SystemSnapshot:
-        """Capture current system state. Returns a SystemSnapshot.
+    # ── Snapshot collectors (extracted helpers — single source of truth
+    #     for cpu/ram/swap/disk/network reads + per-process walk + GPU
+    #     detection.  Both ``snapshot()`` (the canonical full-snapshot
+    #     entry, behavior preserved exactly) and ``get_latest_snapshot``
+    #     (the cached cross-module accessor) compose these helpers.
+    #     Splitting the collectors lets cross-module readers (e.g.
+    #     ResourceGovernor, which only needs aggregates) request just
+    #     the cheap path without paying the per-process walk's GIL cost.
+    # ──────────────────────────────────────────────────────────────────
 
-        Uses psutil if available; falls back to minimal OS-level data.
-        GPU info via vram_manager (single source of truth).
+    def _collect_aggregates(self, snap: SystemSnapshot) -> None:
+        """Populate cpu/ram/swap/disk/network on snap (cheap, GIL-light).
+
+        Always safe to call — has zero per-process / per-PID cost.  Lifted
+        verbatim from the original ``snapshot`` body, behavior preserved.
         """
-        snap = SystemSnapshot(
-            timestamp=time.time(),
-            platform_name=self._platform,
-        )
-
         psutil = _try_import_psutil()
-        if psutil is not None:
-            # CPU — non-blocking (interval=None returns since-last-call)
-            snap.cpu_percent = psutil.cpu_percent(interval=None)
+        if psutil is None:
+            return
+        # CPU — non-blocking (interval=None returns since-last-call)
+        snap.cpu_percent = psutil.cpu_percent(interval=None)
 
-            # RAM
-            mem = psutil.virtual_memory()
-            snap.ram_percent = mem.percent
-            snap.ram_used_gb = mem.used / (1024 ** 3)
-            snap.ram_total_gb = mem.total / (1024 ** 3)
+        # RAM
+        mem = psutil.virtual_memory()
+        snap.ram_percent = mem.percent
+        snap.ram_used_gb = mem.used / (1024 ** 3)
+        snap.ram_total_gb = mem.total / (1024 ** 3)
 
-            # Swap
-            swap = psutil.swap_memory()
-            snap.swap_percent = swap.percent if swap.total > 0 else 0.0
+        # Swap
+        swap = psutil.swap_memory()
+        snap.swap_percent = swap.percent if swap.total > 0 else 0.0
 
-            # Disk usage (root partition)
-            try:
-                root = 'C:\\' if self._platform == 'Windows' else '/'
-                disk = psutil.disk_usage(root)
-                snap.disk_usage_percent = disk.percent
-            except Exception:
-                pass
+        # Disk usage (root partition)
+        try:
+            root = 'C:\\' if self._platform == 'Windows' else '/'
+            disk = psutil.disk_usage(root)
+            snap.disk_usage_percent = disk.percent
+        except Exception:
+            pass
 
-            # Disk I/O
-            try:
-                dio = psutil.disk_io_counters()
-                if dio:
-                    snap.disk_io_read_mb = dio.read_bytes / (1024 ** 2)
-                    snap.disk_io_write_mb = dio.write_bytes / (1024 ** 2)
-            except Exception:
-                pass
+        # Disk I/O
+        try:
+            dio = psutil.disk_io_counters()
+            if dio:
+                snap.disk_io_read_mb = dio.read_bytes / (1024 ** 2)
+                snap.disk_io_write_mb = dio.write_bytes / (1024 ** 2)
+        except Exception:
+            pass
 
-            # Network I/O
-            try:
-                nio = psutil.net_io_counters()
-                if nio:
-                    snap.net_sent_mb = nio.bytes_sent / (1024 ** 2)
-                    snap.net_recv_mb = nio.bytes_recv / (1024 ** 2)
-            except Exception:
-                pass
+        # Network I/O
+        try:
+            nio = psutil.net_io_counters()
+            if nio:
+                snap.net_sent_mb = nio.bytes_sent / (1024 ** 2)
+                snap.net_recv_mb = nio.bytes_recv / (1024 ** 2)
+        except Exception:
+            pass
 
-            # Top processes by CPU (fast: one-shot, no interval)
-            try:
-                procs = []
-                for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
-                    info = proc.info
-                    if info.get('cpu_percent', 0) > 0.1:
-                        procs.append({
-                            'pid': info['pid'],
-                            'name': info.get('name', ''),
-                            'cpu_percent': round(info.get('cpu_percent', 0), 1),
-                            'mem_percent': round(info.get('memory_percent', 0), 1),
-                        })
-                procs.sort(key=lambda p: p['cpu_percent'], reverse=True)
-                snap.top_processes = procs[:10]
-            except Exception:
-                pass
+    def _collect_top_processes(self, snap: SystemSnapshot) -> None:
+        """Populate snap.top_processes via psutil.process_iter (expensive).
 
-        # GPU (via vram_manager)
+        WHY GATED: ``psutil.process_iter(['memory_percent'])`` on Windows
+        walks every PID and issues OpenProcess + GetProcessMemoryInfo
+        per process, all under the GIL.  On a typical Windows box
+        (~150-300 PIDs) that's 200ms-2s of GIL-held CPU per call — which,
+        fired every MONITOR_INTERVAL seconds, periodically stalls WAMP
+        heartbeats, the chat hot path, and daemon yield gates.  py-spy
+        thread dumps caught exactly this loop active+gil.  The data is
+        only read by ``_suggest_optimizations`` when a threshold is
+        breached; emitting an empty list when nothing is hot costs
+        nothing downstream.  Gate covers cpu/ram/swap/disk so any
+        breach (incl. 89.5% RAM situations) still gets the per-process
+        detail it needs.
+        """
+        psutil = _try_import_psutil()
+        if psutil is None:
+            return
+        if not (snap.cpu_percent > CPU_HIGH_THRESHOLD
+                or snap.ram_percent > RAM_HIGH_THRESHOLD
+                or snap.swap_percent > SWAP_HIGH_THRESHOLD
+                or snap.disk_usage_percent > DISK_HIGH_THRESHOLD):
+            return
+        try:
+            procs = []
+            for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+                info = proc.info
+                if info.get('cpu_percent', 0) > 0.1:
+                    procs.append({
+                        'pid': info['pid'],
+                        'name': info.get('name', ''),
+                        'cpu_percent': round(info.get('cpu_percent', 0), 1),
+                        'mem_percent': round(info.get('memory_percent', 0), 1),
+                    })
+            procs.sort(key=lambda p: p['cpu_percent'], reverse=True)
+            snap.top_processes = procs[:10]
+        except Exception:
+            pass
+
+    def _collect_gpu(self, snap: SystemSnapshot) -> None:
+        """Populate snap GPU fields via vram_manager (single source of truth)."""
         gpu_info = _try_detect_gpu()
         if gpu_info.get('cuda_available'):
             snap.gpu_mem_total_gb = gpu_info.get('total_gb', 0)
@@ -359,11 +389,90 @@ class ComputeOptimizer:
             if snap.gpu_mem_total_gb > 0:
                 snap.gpu_util_percent = (snap.gpu_mem_used_gb / snap.gpu_mem_total_gb) * 100
 
+    def _store_snapshot(self, snap: SystemSnapshot) -> None:
+        """Append to history deque + update _last_snapshot under lock."""
         with self._lock:
             self._snapshots.append(snap)
             self._last_snapshot = snap
 
+    def snapshot(self) -> SystemSnapshot:
+        """Capture current system state. Returns a SystemSnapshot.
+
+        Uses psutil if available; falls back to minimal OS-level data.
+        GPU info via vram_manager (single source of truth).
+
+        Behavior preserved from pre-refactor (2026-05-01 monitor
+        unification): aggregates + per-process top-N (when threshold
+        breached) + GPU + history append + _last_snapshot update +
+        return snap.  Body factored into ``_collect_*`` helpers so the
+        cross-module ``get_latest_snapshot`` accessor can reuse the
+        cheap aggregate path without paying the per-process GIL cost.
+        Existing callers (``_monitor_loop``, ``_emit_stats``, the
+        ``/optimizer/snapshot`` route, the test suite mocks) see the
+        identical SystemSnapshot they always have.
+        """
+        snap = SystemSnapshot(
+            timestamp=time.time(),
+            platform_name=self._platform,
+        )
+        self._collect_aggregates(snap)
+        self._collect_top_processes(snap)
+        self._collect_gpu(snap)
+        self._store_snapshot(snap)
         return snap
+
+    def get_latest_snapshot(self,
+                            max_age_s: float = 10.0,
+                            include_per_process: bool = False
+                            ) -> Optional[SystemSnapshot]:
+        """Cached system snapshot for cross-module readers.
+
+        Primary consumer: ``ResourceGovernor._monitor_loop`` (5s cadence)
+        which historically polled psutil itself, duplicating this
+        module's polls.  Returning a cached snapshot eliminates the
+        parallel psutil call site (root cause logged 2026-05-01:
+        py-spy caught both ``compute_optimizer_monitor`` AND
+        ``ResourceGovernor-Monitor`` active+gil simultaneously, both
+        in psutil cpu/memory paths).
+
+        Args:
+          max_age_s: return cached snap if it's younger than this.
+            Pass 0 to always force a fresh read.  Default 10s — well
+            under ResourceGovernor's IDLE_THRESHOLD_SECONDS (120s)
+            buffer for ACTIVE→IDLE transitions, so worst-case stale
+            data can't cause a perceptible mode-transition lag.
+          include_per_process: if True, run the expensive
+            ``process_iter`` walk during a refresh.  Default False —
+            cross-module readers like ResourceGovernor only need
+            aggregates and would otherwise force a per-process walk
+            on every 5s tick under sustained pressure.
+
+        Returns:
+          The most-recent SystemSnapshot.  Never None in steady state
+          (a fresh snapshot is built when cache is empty).  Returns
+          None only if snapshot construction itself raises (defensive
+          — caller should fall back to its own data source).
+        """
+        # Lock-free read of the atomic ref — fast path when cache hot.
+        last = self._last_snapshot
+        if last is not None and (time.time() - last.timestamp) < max_age_s:
+            return last
+        # Stale or missing — build a fresh snap.  Aggregates are
+        # always cheap; top-processes only if caller asked.
+        try:
+            snap = SystemSnapshot(
+                timestamp=time.time(),
+                platform_name=self._platform,
+            )
+            self._collect_aggregates(snap)
+            if include_per_process:
+                self._collect_top_processes(snap)
+            self._collect_gpu(snap)
+            self._store_snapshot(snap)
+            return snap
+        except Exception as e:
+            logger.debug("get_latest_snapshot refresh failed: %s", e)
+            return None
 
     # ── Threshold Detection ───────────────────────────────────────
 
@@ -603,9 +712,11 @@ class ComputeOptimizer:
             guid = schemes.get(profile, schemes['balanced'])
             try:
                 import subprocess
+                from core.subprocess_safe import hidden_popen_kwargs
                 subprocess.run(
                     ['powercfg', '/setactive', guid],
                     capture_output=True, timeout=10,
+                    **hidden_popen_kwargs(),
                 )
                 return f'set power scheme to {profile}'
             except Exception as e:

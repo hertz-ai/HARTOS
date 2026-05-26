@@ -71,6 +71,24 @@ class ActionStep:
 
 
 @dataclass
+class Observation:
+    """An external observation that grounds the action in reality.
+
+    Emitted by sensors / world-state probes / user feedback (NOT by the
+    agent itself).  Stored alongside steps so WMB can distinguish
+    agent-stated-state (ActionStep.state) from observed-state (this).
+    """
+    timestamp: float
+    observation_type: str  # 'sensor', 'world_state', 'user_feedback', ...
+    data: Dict[str, Any] = field(default_factory=dict)
+    source: str = ''       # who reported it
+    confidence: float = 1.0  # observation reliability
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
+@dataclass
 class AgentAction:
     """A long-horizon action with intermediate steps and expected outcome."""
     action_id: str
@@ -81,6 +99,15 @@ class AgentAction:
     expected_outcome: Dict[str, Any] = field(default_factory=dict)
     acceptance_criteria: List[str] = field(default_factory=list)
     steps: List[ActionStep] = field(default_factory=list)
+    # parent_action_id enables causal chains across the hive: a
+    # benchmark_run action begun inside a bootstrap_upgrade goal carries
+    # parent=<goal's action id>, so WMB can trace multi-hop attribution
+    # without reconstructing the graph from timestamps.
+    parent_action_id: Optional[str] = None
+    expected_outcome: Dict[str, Any] = field(default_factory=dict)
+    acceptance_criteria: List[str] = field(default_factory=list)
+    steps: List[ActionStep] = field(default_factory=list)
+    observations: List[Observation] = field(default_factory=list)
     completed: bool = False
     outcome: Optional[Dict[str, Any]] = None
     completed_at: Optional[float] = None
@@ -89,6 +116,7 @@ class AgentAction:
         return {
             **asdict(self),
             'steps': [s.to_dict() for s in self.steps],
+            'observations': [o.to_dict() for o in self.observations],
         }
 
 
@@ -117,6 +145,8 @@ class AgentAttributionOrchestrator:
                      goal_id: Optional[str] = None,
                      expected_outcome: Optional[Dict] = None,
                      acceptance_criteria: Optional[List[str]] = None) -> str:
+                     acceptance_criteria: Optional[List[str]] = None,
+                     parent_action_id: Optional[str] = None) -> str:
         """Start tracking a new action. Returns correlation action_id.
 
         Args:
@@ -125,6 +155,9 @@ class AgentAttributionOrchestrator:
             goal_id: Optional goal this action serves (for attribution)
             expected_outcome: Dict of {metric: expected_value} for comparison
             acceptance_criteria: List of string criteria for success
+            parent_action_id: When this action is spawned by another
+                action (sub-task, retry, cascade), pass the parent's
+                action_id so WMB can reconstruct the causal tree.
 
         Returns:
             action_id (UUID) — pass this to record_step and complete_action.
@@ -136,6 +169,7 @@ class AgentAttributionOrchestrator:
             agent_id=agent_id,
             action_type=action_type,
             started_at=time.time(),
+            parent_action_id=parent_action_id,
             expected_outcome=expected_outcome or {},
             acceptance_criteria=acceptance_criteria or [],
         )
@@ -192,6 +226,49 @@ class AgentAttributionOrchestrator:
             action.steps.append(step)
             self._stats['total_steps_recorded'] += 1
 
+        return True
+
+    def record_observation(self, action_id: str, observation_type: str,
+                           data: Optional[Dict] = None,
+                           source: str = '',
+                           confidence: float = 1.0) -> bool:
+        """Attach an EXTERNAL observation to an open action.
+
+        Distinguished from record_step() — steps are what the AGENT
+        decided/saw/computed; observations are what the WORLD reports
+        back (sensor reading, user correction, world-state probe).
+        Stored in a separate list so WMB can contrast intent vs
+        grounded reality when scoring credit.
+
+        Args:
+            action_id: correlation id from begin_action
+            observation_type: 'sensor' | 'world_state' |
+                'user_feedback' | 'external' | ...
+            data: payload (truncated to 1000 chars in str form)
+            source: which subsystem reported it
+            confidence: [0.0, 1.0]
+
+        Returns:
+            True if attached, False if action unknown/completed/full.
+        """
+        with self._lock:
+            action = self._open_actions.get(action_id)
+            if action is None or action.completed:
+                return False
+            # Reuse MAX_STEPS_PER_ACTION as a combined ceiling — both
+            # steps and observations count against the same DoS bound.
+            if (len(action.observations) + len(action.steps)
+                    >= MAX_STEPS_PER_ACTION):
+                return False
+
+            obs = Observation(
+                timestamp=time.time(),
+                observation_type=observation_type[:100],
+                data=self._truncate_dict(data or {}),
+                source=source[:100],
+                confidence=max(0.0, min(1.0, confidence)),
+            )
+            action.observations.append(obs)
         return True
 
     def complete_action(self, action_id: str,
@@ -290,6 +367,7 @@ class AgentAttributionOrchestrator:
         # Build structured experience — uses existing record_interaction schema
         chain_summary = {
             'action_id': action.action_id,
+            'parent_action_id': action.parent_action_id,
             'agent_id': action.agent_id,
             'action_type': action.action_type,
             'goal_id': action.goal_id,
@@ -298,6 +376,7 @@ class AgentAttributionOrchestrator:
             'duration_seconds': round(
                 (action.completed_at or time.time()) - action.started_at, 2),
             'step_count': len(action.steps),
+            'observation_count': len(action.observations),
             'outcome': action.outcome,
             'success_score': success_score,
             'step_credits': credits,
@@ -312,16 +391,51 @@ class AgentAttributionOrchestrator:
             ],
         }
 
+            # External observations separated from agent-stated steps —
+            # WMB uses these as the grounding signal vs the agent's
+            # self-reported state.
+            'observations': [o.to_dict() for o in action.observations[-50:]],
+        }
+
+        # Compact human-readable summary for the 'prompt' field — the
+        # structured chain goes in attribution_chain below.  This keeps
+        # HevolveAI's text-distillation path happy (it now sees a
+        # narrative sentence, not a JSON blob).
+        summary_text = (
+            f"{action.agent_id} ran {action.action_type} "
+            f"(goal={action.goal_id}, parent={action.parent_action_id}, "
+            f"steps={len(action.steps)}, observations={len(action.observations)}, "
+            f"success={round(success_score, 2)})"
+        )
+
         try:
             bridge.record_interaction(
                 user_id=action.agent_id,
                 prompt_id=action.action_id,
                 prompt=json.dumps(chain_summary, default=str)[:2000],
+                prompt=summary_text[:2000],
                 response=json.dumps(action.outcome or {}, default=str)[:5000],
                 model_id=f'{action.agent_id}:{action.action_type}',
                 latency_ms=(action.completed_at - action.started_at) * 1000 if action.completed_at else 0,
                 goal_id=action.goal_id,
             )
+                attribution_chain=chain_summary,
+            )
+        except TypeError:
+            # Older WMB without attribution_chain kwarg — fall back to
+            # packing JSON in prompt as before.
+            try:
+                bridge.record_interaction(
+                    user_id=action.agent_id,
+                    prompt_id=action.action_id,
+                    prompt=json.dumps(chain_summary, default=str)[:2000],
+                    response=json.dumps(action.outcome or {}, default=str)[:5000],
+                    model_id=f'{action.agent_id}:{action.action_type}',
+                    latency_ms=(action.completed_at - action.started_at) * 1000 if action.completed_at else 0,
+                    goal_id=action.goal_id,
+                )
+            except Exception as exc:
+                logger.debug("record_interaction fallback failed: %s", exc)
         except Exception as exc:
             logger.debug("record_interaction failed: %s", exc)
 
@@ -330,6 +444,22 @@ class AgentAttributionOrchestrator:
 
         Uses exponential decay: step at position i gets weight 0.9^(n-i).
         Later steps (closer to outcome) get more credit.
+        Combines two signals — temporal decay is a useful prior, but
+        pure temporal weighting gives late-but-low-confidence filler
+        steps equal credit with late-and-decisive ones.  Multiplying
+        by per-step confidence softens that, letting agents signal
+        'I wasn't sure here' vs 'this was the decisive moment'.
+
+        Formula per step i of n steps:
+            weight_raw(i) = 0.9 ^ (n - 1 - i)         # temporal decay
+                          * (0.5 + 0.5 * confidence)  # confidence mix
+            credit(i)     = weight_raw(i) / sum(weight_raw)
+
+        - Pure unconfident step (0.0) still gets 0.5x the temporal
+          weight (not zero — we don't want to reward agents who
+          under-report confidence to game the metric).
+        - Pure confident step (1.0) gets full temporal weight.
+        - Sum still normalizes to 1.0.
 
         Returns:
             Dict mapping step_index → credit weight (sum ≈ 1.0).
@@ -340,6 +470,12 @@ class AgentAttributionOrchestrator:
 
         decay = 0.9
         raw_weights = {i: decay ** (n - 1 - i) for i in range(n)}
+        raw_weights = {}
+        for i, step in enumerate(action.steps):
+            temporal = decay ** (n - 1 - i)
+            confidence_boost = 0.5 + 0.5 * max(0.0, min(1.0, step.confidence))
+            raw_weights[i] = temporal * confidence_boost
+
         total = sum(raw_weights.values())
         if total <= 0:
             return {i: 1.0 / n for i in range(n)}
@@ -461,6 +597,22 @@ def begin_action(agent_id: str, action_type: str,
     """Convenience: start tracking. See AgentAttributionOrchestrator.begin_action."""
     return get_attribution().begin_action(
         agent_id, action_type, goal_id, expected_outcome, acceptance_criteria,
+                 acceptance_criteria: Optional[List[str]] = None,
+                 parent_action_id: Optional[str] = None) -> str:
+    """Convenience: start tracking. See AgentAttributionOrchestrator.begin_action."""
+    return get_attribution().begin_action(
+        agent_id, action_type, goal_id, expected_outcome,
+        acceptance_criteria, parent_action_id,
+    )
+
+
+def record_observation(action_id: str, observation_type: str,
+                       data: Optional[Dict] = None,
+                       source: str = '',
+                       confidence: float = 1.0) -> bool:
+    """Convenience: attach external-world observation to an open action."""
+    return get_attribution().record_observation(
+        action_id, observation_type, data, source, confidence,
     )
 
 
