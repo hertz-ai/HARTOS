@@ -317,7 +317,15 @@ def list_ledger_tasks():
         return jsonify({'success': False,
                         'error': 'agent_ledger not installed'}), 501
     try:
-        status_filter = request.args.get('status')
+        # TaskStatus enum values are lowercase ('pending', 'in_progress',
+        # 'completed', 'blocked', 'failed').  Frontends commonly expose
+        # the enum NAMES (uppercase) in their UI — historically the
+        # TaskLedger admin page's `STATUS_COLORS` dict keys were
+        # uppercase and sent verbatim, producing "Unknown status: PENDING"
+        # 400s.  Lowercase here so curl, the admin page, and any future
+        # UI accept either case.  by_status keys in the stats response
+        # are already lowercase so the round-trip is consistent.
+        status_filter = (request.args.get('status') or '').strip().lower() or None
         agent_filter = request.args.get('agent_id')
         try:
             limit = max(1, min(int(request.args.get('limit', 50)), 1000))

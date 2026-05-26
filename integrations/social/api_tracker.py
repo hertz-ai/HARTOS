@@ -947,10 +947,21 @@ def interview_agent(post_id):
             f"Question: {question}"
         )
 
+        # P2-S4 (2026-05-26): tag the persist+publish with
+        # channel_type='interview' so cross-device subscribers can
+        # distinguish post-experiment interview Q&A from the user's
+        # main chat thread.  /chat → _chat_reply forwards this to
+        # chat_messages.persist via the existing
+        # persist_and_publish_async pipeline (single canonical
+        # writer — no parallel persist path).  request_id=post_id
+        # threads all interview turns about the same experiment
+        # together for replay.
         resp = pooled_post(chat_url, json={
             'user_id': goal.owner_id,
             'prompt_id': goal.prompt_id or 0,
             'prompt': interview_prompt,
+            'channel_type': 'interview',
+            'request_id': str(post_id),
         }, timeout=60)
 
         if resp.status_code == 200:

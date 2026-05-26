@@ -1,0 +1,38 @@
+{
+  "favorite_bias": {
+    "strategy": "favorite_bias",
+    "n_bets": 30,
+    "win_rate": 1.0,
+    "total_return_pct": 0.0681,
+    "sharpe_annualized": 49.7401,
+    "max_drawdown_pct": 0.0,
+    "final_bankroll": 1000.6811
+  },
+  "contrarian": {
+    "strategy": "contrarian",
+    "n_bets": 30,
+    "win_rate": 0.0,
+    "total_return_pct": -26.03,
+    "sharpe_annualized": -216.0955,
+    "max_drawdown_pct": 26.03,
+    "final_bankroll": 739.7004
+  },
+  "momentum": {
+    "strategy": "momentum",
+    "n_bets": 15,
+    "win_rate": 0.9333,
+    "total_return_pct": -1.4149,
+    "sharpe_annualized": -4.6329,
+    "max_drawdown_pct": 1.5,
+    "final_bankroll": 985.8508
+  },
+  "null_strategy": {
+    "strategy": "null_strategy",
+    "n_bets": 0,
+    "win_rate": 0.0,
+    "total_return_pct": 0.0,
+    "sharpe_annualized": 0.0,
+    "max_drawdown_pct": 0.0,
+    "final_bankroll": 1000.0
+  }
+}

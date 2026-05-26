@@ -2,6 +2,16 @@
 # Guard: cx_Freeze frozen builds close stdout/stderr. Must be BEFORE autogen imports.
 import sys, os
 from core.io_guard import silence_stdio; silence_stdio()
+# #170 — autogen budget constants live in core.constants (single source
+# of truth, was hardcoded as max_tokens=3500 in 4 sites here and 3 in
+# reuse_recipe.py).  See AUTOGEN_MESSAGE_TOKEN_BUDGET comment for why
+# the value is 2500 (was 3500) and how it relates to llama-server's
+# 12288 n_ctx per-slot budget under concurrent slots.
+from core.constants import (  # noqa: E402  (after io_guard, intentional)
+    AUTOGEN_MESSAGE_TOKEN_BUDGET,
+    AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE,
+    AUTOGEN_HISTORY_LIMIT,
+)
 
 import ast
 import autogen
@@ -31,7 +41,6 @@ from datetime import datetime
 import time
 from autogen.coding import DockerCommandLineCodeExecutor
 import re
-from autogen import register_function
 import json
 from autogen import ConversableAgent
 from flask import current_app
@@ -47,6 +56,38 @@ from concurrent.futures import ThreadPoolExecutor
 from autogen.agentchat.contrib.capabilities import transform_messages, transforms
 from autogen.cache.in_memory_cache import InMemoryCache
 from json_repair import repair_json
+
+# ─── State-transition stuck-loop detector (#485) ────────────────────
+# Tracks the most-recent (last_speaker_name, content_hash) signature per
+# user_prompt across consecutive state_transition invocations.  When the
+# SAME signature repeats for >= _STATE_TRANSITION_LOOP_THRESHOLD calls in
+# a row, we declare the GroupChat stuck and break out cleanly with a
+# fallback assistant message + ActionState.TERMINATED.
+#
+# Live evidence (2026-05-10 22:35-22:38, request 776d9fb0): a Tamil-
+# language-switch turn entered a 28+-iteration loop where the LLM
+# regurgitated the 137-char ChatInstructor prompt verbatim as Assistant
+# content on every turn.  state_transition's routing was correct (Assistant
+# → verify, verify → chat_instructor) but autogen's internal speaker
+# scheduling kept calling state_transition with last_speaker=Assistant —
+# never propagating verify/chat_instructor.  Without a backstop the loop
+# runs to autogen's default max_consecutive_auto_reply (50+) and the user
+# gets nothing for ~5+ minutes.
+#
+# This guard is purely defensive — happy-path behaviour is unchanged.  The
+# threshold is deliberately conservative (5 identical signatures) to leave
+# headroom for legitimate same-speaker sequences (e.g. tool-call chains
+# where Assistant emits multiple consecutive messages with different
+# content but same name).  The signature includes content hash so genuine
+# progress (Assistant emits NEW content) resets the counter.
+_STATE_TRANSITION_LOOP_STATE: dict = {}
+_STATE_TRANSITION_LOOP_THRESHOLD: int = 5
+
+# #485 L3 — consecutive-Assistant counter; at threshold redirect to Helper
+# to break attention-collapse loops where Assistant→verify can't escape
+# because verify shares the same backend LLM.
+_ASSISTANT_STREAK_STATE: dict = {}
+_ASSISTANT_STREAK_THRESHOLD: int = 3
 def publish_async(topic, message, timeout=2.0):
     """Delegate to the canonical publish_async in hart_intelligence.
 
@@ -99,13 +140,24 @@ def publish_agent_thought(last_speaker, messages, user_id):
         if ('Message already sent successfully to user with request_id' in content
                 or 'Message sent successfully to user with request_id' in content):
             return
-        # request_id="123456" placeholder preserved on the wire — see
-        # crossbar_publish docstring; fixing propagation is tracked
-        # separately so this commit stays a pure refactor.
+        # Pull the real request_id from threadlocal — the /chat handler
+        # set it via thread_local_data.set_request_id (hart_intelligence_
+        # entry.py:6898 / 7962).  Without this the wire envelope carries
+        # the placeholder "123456", which:
+        #   - chatbot_routes.drain_thinking_traces(<real_uuid>) misses
+        #     because the buffer is keyed under "123456" → empty list →
+        #     no thinking_steps embedded in the /chat response;
+        #   - the React handler at Demopage.js:1434 drops the trace as
+        #     "daemon stale" because traceRequestId !== currentReqId;
+        #   - the Android consumer at AbstractChatActivity.java:2127
+        #     groups it under "123456" → orphan bucket, never displayed.
+        # Fix breaks all three failure modes for both transports.
+        from threadlocal import thread_local_data
         from core.peer_link.crossbar_publish import publish_thinking_trace
         publish_thinking_trace(
             text=content, user_id=user_id,
-            request_id="123456", bot_type='Agent',
+            request_id=thread_local_data.get_request_id() or '',
+            bot_type='Agent',
             full_schema=True,
         )
     except Exception as e:
@@ -204,6 +256,7 @@ from integrations.expert_agents import (
     register_all_experts, get_expert_for_task,
     create_autogen_expert_wrapper, recommend_experts_for_dream
 )
+from core.platform_paths import get_coding_workspace_dir
 
 # Then add the 4 hooks to your get_response_group while loop
 # Then manually add the 4 hooks to your get_response_group while loop
@@ -279,77 +332,15 @@ def _record_exception(exc, module, function, user_prompt='', action_id=0, **ctx)
         pass
 tool_logger.propagate = False  # Prevent double logging
 
-# Decorator for logging tool execution
-
-
-
-def log_tool_execution(func):
-    if inspect.iscoroutinefunction(func):
-        # For async functions
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            tool_logger.info(f"TOOL EXECUTION START: {func.__name__}")
-            tool_logger.info(f"Arguments: {args}, Keyword Arguments: {kwargs}")
-            try:
-                result = await func(*args, **kwargs)
-                if not isinstance(result, str):
-                    tool_logger.warning(f"Tool function {func.__name__} returned non-string type: {type(result)}")
-                    result = str(result)
-                tool_logger.info(f"TOOL EXECUTION SUCCESS: {func.__name__}")
-                tool_logger.info(
-                    f"Result: {result[:100]}..." if len(result) > 100 else f"Result: {result}"
-                )
-                return result
-            except Exception as e:
-                tool_logger.error(f"TOOL EXECUTION ERROR: {func.__name__} - {e}")
-                tool_logger.exception("Exception details:")
-                error_response = {
-                    "status": "error",
-                    "tool_function": func.__name__,
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                    "suggestion": "Check logs for detailed traceback information"
-                }
-                # ... (add any special-case suggestions like NameError, KeyError here) ...
-                error_json = json.dumps(error_response)
-                tool_logger.info(f"Returning error response: {error_json}")
-                return f"Tool execution failed: {error_json}"
-        return wrapper
-    else:
-        # For regular (sync) functions
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            tool_logger.info(f"TOOL EXECUTION START: {func.__name__}")
-            tool_logger.info(f"Arguments: {args}, Keyword Arguments: {kwargs}")
-            try:
-                result = func(*args, **kwargs)
-                # If it returns a coroutine by accident, run it to completion
-                if asyncio.iscoroutine(result):
-                    tool_logger.info(f"Detected coroutine return from {func.__name__}, running it to completion")
-                    result = asyncio.get_event_loop().run_until_complete(result)
-                if not isinstance(result, str):
-                    tool_logger.warning(f"Tool function {func.__name__} returned non-string type: {type(result)}")
-                    result = str(result)
-                tool_logger.info(f"TOOL EXECUTION SUCCESS: {func.__name__}")
-                tool_logger.info(
-                    f"Result: {result[:100]}..." if len(result) > 100 else f"Result: {result}"
-                )
-                return result
-            except Exception as e:
-                tool_logger.error(f"TOOL EXECUTION ERROR: {func.__name__} - {e}")
-                tool_logger.exception("Exception details:")
-                error_response = {
-                    "status": "error",
-                    "tool_function": func.__name__,
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                    "suggestion": "Check logs for detailed traceback information"
-                }
-                # ... (add any special-case suggestions here) ...
-                error_json = json.dumps(error_response)
-                tool_logger.info(f"Returning error response: {error_json}")
-                return f"Tool execution failed: {error_json}"
-        return wrapper
+# Canonical `log_tool_execution` decorator (moved to core.tool_logging
+# in #509 so the autogen-registration chokepoint
+# `core.labeled_autogen_function.register_labeled_function` can reuse it
+# without dragging this heavy module in).  The 40+ existing
+# `@log_tool_execution` decorator sites in core/agent_tools.py and
+# integrations/channels/agent_tools.py resolve the name via
+# ctx['log_tool_execution'] sourced from THIS module's namespace, so the
+# re-import here preserves their wiring with zero behavior change.
+from core.tool_logging import log_tool_execution  # noqa: E402  (after logger config)
 
 
 from core.session_cache import TTLCache  # early import — needed before first TTLCache usage below
@@ -357,6 +348,36 @@ from core.cache_loaders import load_agent_data, load_user_ledger, load_user_simp
 
 scheduler = BackgroundScheduler()
 scheduler.start()
+
+# Zombie task reaper — clears IN_PROGRESS ledger entries that have not
+# advanced in HEVOLVE_ZOMBIE_TASK_MAX_AGE_HOURS (default 2h).  The
+# reaper hooks the SAME scheduler instance above; no separate daemon
+# process.  Failure to register is non-fatal — the dashboard still
+# surfaces the staleness via status_reason, the reaper just won't
+# auto-clear.  See integrations/agent_engine/zombie_reaper.py for the
+# full rationale + reuse map.
+try:
+    from integrations.agent_engine.zombie_reaper import register_with_scheduler as _register_zombie_reaper
+    _register_zombie_reaper(scheduler)
+except Exception:
+    logging.getLogger(__name__).exception(
+        "zombie_reaper registration failed — dashboard will still surface "
+        "stalled tasks via status_reason but they will not be auto-reaped"
+    )
+
+# atexit shutdown — see reuse_recipe.py:174 for full rationale.  Both
+# modules independently instantiate a BackgroundScheduler at import time
+# and both share the same "RuntimeError: cannot schedule new futures
+# after shutdown" failure mode on interpreter teardown if the scheduler
+# thread is allowed to outlive the default ThreadPoolExecutor.
+import atexit as _atexit
+def _shutdown_create_scheduler():
+    try:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+_atexit.register(_shutdown_create_scheduler)
 
 user_agents: Dict[str, Tuple[Any, Any, Any, Any, Any, Any, Any]] = TTLCache(ttl_seconds=7200, max_size=500, name='create_user_agents')
 time_agents = TTLCache(ttl_seconds=7200, max_size=500, name='create_time_agents')
@@ -809,6 +830,25 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             list_of_persona = config['flows'][get_current_flow(user_prompt)]['persona']
             current_app.logger.info(f'WORKING persona as {list_of_persona}')
 
+    # #510: populate the canonical persona registry so that the
+    # `send_message_to_roles` tool can resolve role→agent mappings
+    # during recipe authoring.  Autonomous recipe creation does real
+    # multi-persona work while authoring — the personas were captured
+    # by gather-requirements before this code runs, so the registry IS
+    # populated at the right point.  Same canonical impl in both flows.
+    try:
+        from core.persona_registry import register_persona_for_session
+        _personas_for_registry = config.get('personas') or (
+            [{'name': p} if isinstance(p, str) else p
+             for p in (list_of_persona or [])]
+            if list_of_persona else []
+        )
+        register_persona_for_session(user_id, prompt_id, _personas_for_registry)
+    except Exception:
+        tool_logger.warning(
+            "persona registry populate failed (create_recipe flow)",
+            exc_info=True)
+
     # Generate or load agent personality
     _agent_personality = None
     try:
@@ -873,8 +913,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
     context_handling = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -883,6 +923,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     context_handling.add_to_agent(helper)
     context_handling.add_to_agent(executor)
     context_handling.add_to_agent(verify)
+    # chat_instructor (UserProxyAgent line 871) was previously NOT attached
+    # to the transform.  Result: chat_instructor.initiate_chat(manager,
+    # clear_history=False) accumulated message history unboundedly across
+    # recipe-request retries within the same turn → llama.cpp 500
+    # "Context size has been exceeded" (32 firings/session per langchain.log
+    # 2026-05-14).  Attaching here caps chat_instructor's buffer at the
+    # same 3500-token / 50-message budget as the other agents.
+    context_handling.add_to_agent(chat_instructor)
 
     agents_object['assistant'] = assistant
     agents_object['helper'] = helper
@@ -943,10 +991,22 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     except Exception as e:
         tool_logger.debug(f"Media tools registration skipped: {e}")
 
+    # #510: get_user_details — delegate to canonical core.agent_tools impl
+    # (DB lookup + cloud fallback) instead of the limited helper_fun fallback.
+    # register_core_tools above (L909) already registered the canonical on
+    # this agent pair; this inline registration was OVERWRITING it with the
+    # weaker parse_user_id-only impl.  Body now delegates to the canonical.
+    _gud_canonical = next(
+        (f for n, _, f in core_tools if n == 'get_user_details'), None)
+
     @log_tool_execution
-    def get_user_details()->str:
+    def get_user_details() -> str:
         tool_logger.info('INSIDE get user details')
+        if _gud_canonical is not None:
+            return _gud_canonical()
+        # Degraded-env fallback (core_AT closure unavailable)
         return helper_fun.parse_user_id(int(user_id))
+
     register_dual(helper, assistant, get_user_details,
                   "get_user_details", "Get User details like name, dob, gender")
 
@@ -1000,6 +1060,22 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     register_dual(helper, assistant, consult_expert,
                   "consult_expert",
                   "Consult a specialized domain expert for the current task")
+
+    # #510: send_message_to_roles — multi-persona broadcast.  Canonical
+    # impl lives in core.persona_registry.  Registered in BOTH flows so
+    # autonomous-mode recipe creation can do real persona coordination
+    # mid-authoring (gather-requirements already populated the registry).
+    from core.persona_registry import _send_message_to_roles_impl as _smr_impl
+    @log_tool_execution
+    def send_message_to_roles(
+        role: Annotated[str, "Target persona/role name to deliver the message to"],
+        message: Annotated[str, "The question to ask or message to send"],
+    ) -> str:
+        return _smr_impl(user_id, prompt_id, role, message,
+                          publish_fn=publish_async)
+    register_dual(helper, assistant, send_message_to_roles,
+                  "send_message_to_roles",
+                  "Send a message to a specific persona/role within this multi-persona agent (e.g. student/parent/teacher).")
 
     @log_tool_execution
     async def execute_windows_or_android_command(
@@ -1595,6 +1671,30 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         tool_logger.warning(f"MCP integration error (non-critical): {e}")
         # Continue with default tools if MCP fails
 
+    # Service Tools: Register HTTP microservice tools (Crawl4AI, AceStep, etc.)
+    # Mirrors reuse_recipe.py:2335-2354 — sync so CREATE mode exposes the
+    # same crawl4ai/acestep/omniparser surface as REUSE.  Without this the
+    # gather LLM has no real tool to map "fetch a webpage" onto and invents
+    # fake tool names (2026-05-12 IPL refusal forensic).
+    try:
+        from integrations.service_tools import service_tool_registry, Crawl4AITool, AceStepTool
+
+        Crawl4AITool.register()   # port 11235
+        AceStepTool.register()    # port 8001
+        service_tool_registry.load_config()  # load any user-added tools from service_tools.json
+
+        svc_tools = service_tool_registry.get_all_tool_functions()
+        svc_defs = service_tool_registry.get_tool_definitions()
+
+        for tool_name, tool_func in svc_tools.items():
+            tool_def = next((d for d in svc_defs if d['name'] == tool_name), None)
+            if tool_def:
+                description = tool_def.get('description', f'Service tool: {tool_name}')
+                register_dual(helper, assistant, tool_func, tool_name, description)
+                tool_logger.info(f"Registered service tool: {tool_name}")
+    except Exception as e:
+        tool_logger.warning(f"Service tools integration error (non-critical): {e}")
+
     # Internal Agent Communication: Register agents and their skills for in-process communication
     try:
         tool_logger.info("Initializing Internal Agent Communication (skill-based delegation)...")
@@ -1679,13 +1779,30 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                       "delegate_to_specialist",
                       "Delegate complex tasks to specialist agents based on required skills")
 
-        # Add context sharing tool
+        # #510: same canonical behavior as reuse_recipe — autonomous-mode
+        # recipe creation does real work, and shared context should be
+        # queryable later (`recall_memory` etc.).  Both flows persist the
+        # insight to MemoryGraph (fire-and-forget thread).
         @log_tool_execution
         def share_context_with_agents(context_key: Annotated[str, "Unique identifier for the context"],
                                       context_value: Annotated[str, "Context data to share (as JSON string)"]) -> str:
-            """Share context information with other agents"""
+            """Share context information with other agents."""
             sharing_func = create_context_sharing_function('assistant')
-            return sharing_func(context_key, context_value)
+            result = sharing_func(context_key, context_value)
+            # Persist to MemoryGraph (fire-and-forget) — same shape as reuse_recipe:2455-2464
+            if memory_graph is not None:
+                try:
+                    import threading as _t
+                    _t.Thread(target=lambda: memory_graph.register(
+                        f"[SHARED] {context_key}: {json.dumps(context_value)[:200]}",
+                        {'memory_type': 'insight', 'source_agent': 'assistant',
+                         'session_id': user_prompt, 'shared_key': context_key},
+                    ), daemon=True).start()
+                except Exception:
+                    tool_logger.warning(
+                        "share_context_with_agents: MemoryGraph persist failed",
+                        exc_info=True)
+            return result
 
         register_dual(helper, assistant, share_context_with_agents,
                       "share_context_with_agents",
@@ -1715,9 +1832,13 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         # Get AP2 payment tools for this agent
         ap2_tools = get_ap2_tools_for_autogen('assistant')
 
-        # Register payment tools
+        # Register payment tools — wrap with @log_tool_execution so payment
+        # operations fire UI status emits + structured-error envelopes
+        # (#510 followup — observability gap for AP2).  Same wrap pattern as
+        # the inline-def tools above; payments without observability would
+        # leave users unable to see what's happening during a transaction.
         for tool_def in ap2_tools:
-            tool_func = tool_def['function']
+            tool_func = log_tool_execution(tool_def['function'])
             tool_name = tool_def['name']
             tool_desc = tool_def['description']
             register_dual(helper, assistant, tool_func, tool_name, tool_desc)
@@ -1752,6 +1873,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             from integrations.agent_engine.journey_engine import register_journey_tools
             register_journey_tools(helper, assistant, user_id)
             tool_logger.info("Sales journey tools loaded (Tier 2) based on prompt content")
+        if 'revenue' in goal_tags:
+            # Revenue tools: get_api_revenue_stats + adjust_pricing.
+            # Without these the bootstrap_revenue_monitor goal can't
+            # actually see commercial-API revenue — agent hallucinates
+            # tool calls and the flywheel can't close.
+            from integrations.agent_engine.revenue_tools import register_revenue_tools
+            register_revenue_tools(helper, assistant, user_id)
+            tool_logger.info("Revenue tools loaded (Tier 2) based on prompt content")
     except Exception as e:
         # Promoted from debug to warning: a failure here means the agent
         # boots without its goal-specific tools, so it can talk about the
@@ -1784,6 +1913,148 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
         user_prompt = f'{user_id}_{prompt_id}'
         current_action_id = user_tasks[user_prompt].current_action
+
+        # ─── STUCK-LOOP GUARD (#485) ───────────────────────────────────
+        # Detects when the same (last_speaker, last_message_content) pair
+        # has repeated >= _STATE_TRANSITION_LOOP_THRESHOLD times and breaks
+        # out of the GroupChat with a clean fallback assistant message.
+        #
+        # Trigger pattern (live evidence 2026-05-10 22:35 request 776d9fb0):
+        #   Tamil-language-switch turn → ChatInstructor sends "Execute Action 1
+        #   ... Latest User message: I want to talk to you in tamil" (137 chars)
+        #   → Assistant LLM regurgitates the prompt verbatim (137 chars) →
+        #   state_transition routes Assistant → verify, but autogen's internal
+        #   speaker scheduling keeps invoking state_transition with
+        #   last_speaker=Assistant for 28+ iterations.  No state advancement,
+        #   no progress, user gets nothing for 5+ minutes until autogen's
+        #   default max_consecutive_auto_reply (50) kicks in.
+        #
+        # The guard is signature-based (last_speaker.name + first-500-char
+        # content hash).  Any genuine progress — Assistant emits NEW content,
+        # OR a different agent speaks — resets the counter to 1.  Tool-call
+        # chains where the same agent emits multiple turns with DIFFERENT
+        # content also reset, so legitimate sequences are unaffected.
+        #
+        # On break:
+        #   1. Loud diagnostic log + last-10-message trace dump for postmortem.
+        #   2. Inject a clean fallback assistant message into groupchat.messages
+        #      so the outer initiate_chat wrapper has a coherent reply to send.
+        #   3. Mark the action TERMINATED so the recipe pipeline doesn't retry
+        #      this stuck turn.
+        #   4. Return None to terminate the GroupChat round.
+        #   5. Reset _STATE_TRANSITION_LOOP_STATE for this user_prompt so the
+        #      next chat turn starts fresh.
+        try:
+            _last_msg_for_loop = groupchat.messages[-1] if groupchat.messages else {}
+            _last_content_for_loop = (_last_msg_for_loop.get('content') or '')
+            import hashlib
+            _content_hash = hashlib.sha1(
+                _last_content_for_loop[:500].encode('utf-8', errors='replace')
+            ).hexdigest()[:12]
+            _sig = f"{last_speaker.name}:{_content_hash}"
+            _ls = _STATE_TRANSITION_LOOP_STATE.get(user_prompt) or {}
+            if _ls.get('sig') == _sig:
+                _ls['count'] = _ls.get('count', 1) + 1
+            else:
+                _ls = {
+                    'sig': _sig,
+                    'count': 1,
+                    'first_msg_idx': len(groupchat.messages),
+                }
+            _STATE_TRANSITION_LOOP_STATE[user_prompt] = _ls
+
+            if _ls['count'] >= _STATE_TRANSITION_LOOP_THRESHOLD:
+                current_app.logger.error(
+                    f"[STATE-TRANSITION-LOOP-BREAK] STUCK LOOP DETECTED — "
+                    f"user_prompt={user_prompt!r} speaker={last_speaker.name!r} "
+                    f"content_hash={_content_hash} repeated {_ls['count']} times "
+                    f"across {len(groupchat.messages) - _ls.get('first_msg_idx', 0)} "
+                    f"groupchat-message increments.  Breaking out with fallback "
+                    f"reply so the user gets a response instead of hanging."
+                )
+                # Trace dump — last 10 messages
+                _msgs = groupchat.messages[-10:]
+                _start_idx = max(0, len(groupchat.messages) - 10)
+                for _i, _m in enumerate(_msgs):
+                    _r = (_m.get('role') or '?')
+                    _n = (_m.get('name') or '?')
+                    _c = str(_m.get('content') or '')
+                    current_app.logger.error(
+                        f"  [LOOP-TRACE msg #{_start_idx + _i}] role={_r!r} "
+                        f"name={_n!r} content_len={len(_c)} "
+                        f"preview={_c[:120]!r}"
+                    )
+                # Inject clean fallback so wrapper has a coherent response
+                _fallback_text = (
+                    "I had trouble producing a response — the agent pipeline "
+                    "got stuck in a loop on this request.  Could you rephrase "
+                    "or break it into a simpler step?"
+                )
+                try:
+                    groupchat.messages.append({
+                        'role': 'assistant',
+                        'name': 'Assistant',
+                        'content': _fallback_text,
+                    })
+                except Exception as _inject_err:
+                    current_app.logger.warning(
+                        f"[LOOP-BREAK] fallback inject failed: {_inject_err}")
+                # Mark action TERMINATED so recipe pipeline doesn't re-enter
+                try:
+                    force_state_through_valid_path(
+                        user_prompt, current_action_id,
+                        ActionState.TERMINATED,
+                        "Loop-break: state_transition stuck-loop guard fired (#485)",
+                    )
+                except Exception as _stb_err:
+                    current_app.logger.warning(
+                        f"[LOOP-BREAK] state-set failed: {_stb_err}")
+                # Reset loop-state for this user — next turn starts fresh
+                _STATE_TRANSITION_LOOP_STATE.pop(user_prompt, None)
+                return None  # terminate GroupChat round
+        except Exception as _loop_guard_err:
+            current_app.logger.exception(
+                f"[STATE-TRANSITION-LOOP] guard raised "
+                f"{type(_loop_guard_err).__name__}: {_loop_guard_err!s} — "
+                "falling through to normal routing"
+            )
+
+        # ─── EARLY-TERMINATE GUARD ─────────────────────────────────────
+        # Honour the TERMINATE signal from ANY speaker before the
+        # speaker-routing branches below fire.  Live evidence
+        # 2026-05-12 c38e8b7c-... — user said "hi" to a bound agent,
+        # autogen flowed Assistant → verify → ChatInstructor.  The
+        # ChatInstructor UserProxyAgent has
+        # ``default_auto_reply='TERMINATE'`` (set at the chat_instructor
+        # instantiation) so when verify produces no actionable JSON it
+        # emits the literal string ``"TERMINATE"``.  But the
+        # "last_speaker == ChatInstructor → return assistant" branch
+        # further down fires before the original TERMINATE check at
+        # the bottom of state_transition, so the "TERMINATE" message
+        # got appended with the metadata blob and routed BACK to
+        # Assistant.  Assistant's LLM saw a long context that ended
+        # with "TERMINATE\nMetadata/skeleton...", emitted a similar
+        # reply each round, and the STUCK-LOOP GUARD only rescued the
+        # turn after 5 identical Assistant calls (~3 minutes).
+        #
+        # Checking the message FIRST — regardless of who spoke — ends
+        # the conversation immediately whenever any agent signals
+        # TERMINATE, the same way autogen's per-agent
+        # ``is_termination_msg`` callback would if GroupChatManager
+        # ran it between rounds.
+        try:
+            _last_content = (groupchat.messages[-1].get('content') or '') if groupchat.messages else ''
+            if _last_content and 'TERMINATE' in _last_content.upper():
+                current_app.logger.info(
+                    "[EARLY-TERMINATE] last message contains TERMINATE "
+                    "(speaker=%r) — ending GroupChat round so the "
+                    "outer recipe loop can advance.",
+                    last_speaker.name,
+                )
+                return None
+        except Exception as _term_err:
+            current_app.logger.debug(
+                f"[EARLY-TERMINATE] check failed (non-blocking): {_term_err}")
 
         # Preempt: if user started chatting, abort daemon-initiated recipes
         # so the LLM is free for the user's request immediately.
@@ -1987,6 +2258,35 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
                         elif json_obj['status'].lower() == 'pending':
                             safe_set_state(user_prompt, current_action_id, ActionState.PENDING, "verifier pending")
+                            # USER-INPUT GATE (code-level enforcement of the
+                            # prompt-level rule above):  if the verifier
+                            # explicitly returned `can_perform_without_user_input:
+                            # no` for this action, set a sticky flag on
+                            # user_tasks so the OUTER while loop in
+                            # create_recipe_pipeline can see "this action is
+                            # blocked on the user" and break out, returning
+                            # control to the user.  Without this flag, the
+                            # OUTER loop's pending-retry path (3 attempts)
+                            # gives the StatusVerifier multiple chances to
+                            # flip the gate to "yes" via prompt drift —
+                            # exactly the autonomous-bypass bug seen in the
+                            # 2026-05-08 langchain.log (Action 3 / Confirm
+                            # sitemap looped 8 iterations before
+                            # hallucinating user confirmation).
+                            try:
+                                _gate_value = (json_obj.get('can_perform_without_user_input') or '').strip().lower()
+                                if _gate_value.startswith('no'):
+                                    user_tasks[user_prompt]._needs_user_input_action_id = current_action_id
+                                    current_app.logger.info(
+                                        f"[USER-INPUT-GATE] Action {current_action_id} flagged "
+                                        f"as blocked on user input "
+                                        f"(can_perform_without_user_input={_gate_value!r}); "
+                                        f"OUTER loop will break and return control to user."
+                                    )
+                            except Exception as _gate_err:
+                                current_app.logger.debug(
+                                    f"[USER-INPUT-GATE] flag set failed (non-blocking): {_gate_err}"
+                                )
                             return assistant
                         elif json_obj['status'].lower() == 'requires_breakdown':
                             # Handle subtask breakdown request from StatusVerifier
@@ -2119,12 +2419,20 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             current_app.logger.info('Got last speaker as executor or helper or author or chat_instructor & reutrning next speaker as assistant')
             return assistant
 
-        # FIX: After Assistant speaks (no JSON, no @mention), route to StatusVerifier
-        # to evaluate the action result. Without this, 'auto' speaker selection may
-        # pick UserProxy (max_consecutive_auto_reply=0) which terminates the conversation.
+        # After Assistant speaks: route to StatusVerifier (or Helper if streak ≥3 — #485 L3).
         if last_speaker.name == 'Assistant':
-            current_app.logger.info('Assistant spoke, routing to StatusVerifier for action evaluation')
+            _streak = _ASSISTANT_STREAK_STATE.get(user_prompt, 0) + 1
+            _ASSISTANT_STREAK_STATE[user_prompt] = _streak
+            if _streak >= _ASSISTANT_STREAK_THRESHOLD:
+                current_app.logger.warning(
+                    "[ASSISTANT-STREAK-ESCALATE] user_prompt=%r streak=%d → Helper (#485)",
+                    user_prompt, _streak)
+                _ASSISTANT_STREAK_STATE[user_prompt] = 0
+                return helper
             return verify
+        # Non-Assistant speaker → reset streak (inverse-of-Assistant is
+        # future-proof for new agents added to GroupChat).
+        _ASSISTANT_STREAK_STATE.pop(user_prompt, None)
 
         json_obj = None
 
@@ -2238,8 +2546,8 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     all_agents.extend(custom_agents)
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -2309,6 +2617,16 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # GroupChatManager may store a different reference. The state_transition closure
     # captures this variable, so it must point to the real GroupChat.
     group_chat = manager._groupchat
+
+    # Agent Ops Console Phase B: register the canonical GroupChat reference
+    # for live drill-down access from /admin/agents drawer.  Uses the same
+    # user_prompt key the rest of the lifecycle uses (user_agents dict,
+    # _ledger_registry, etc.).  Idempotent + no-op safe.
+    try:
+        from lifecycle_hooks import register_groupchat_for_session as _reg_gc
+        _reg_gc(user_prompt, group_chat)
+    except Exception:
+        current_app.logger.debug("groupchat registry hook skipped", exc_info=True)
 
     # Auto-ingest group_chat messages into SimpleMem + shared LangChain buffer
     _original_append = group_chat.messages.append
@@ -2412,7 +2730,7 @@ def instantiate_executor_agent():
 
     executor = autogen.AssistantAgent(
         name="Executor",
-        code_execution_config={"last_n_messages": 2, "work_dir": "coding", "use_docker": False},
+        code_execution_config={"last_n_messages": 2, "work_dir": get_coding_workspace_dir(), "use_docker": False},
         llm_config=llm_config,
         system_message=f"""You are an Executor agent.
 {_executor_cultural}
@@ -2467,12 +2785,13 @@ def instantiate_status_verifier_agent(user_prompt):
         code_execution_config=False,
         system_message=""""You are a Status Verification Agent in a multi-agent system.
         AUTONOMOUS MODE: Prefer "completed" over "updated" or "pending". If the Assistant made a reasonable attempt (even simulated), mark "completed". Only use "updated" when the action definition itself needs changing. Do NOT return "updated" or "pending" just because user preferences are unknown — use sensible defaults.
+        USER-INPUT GATE (HARD RULE): If a previous turn for THIS action returned `can_perform_without_user_input: "no"` (explicitly marked as requiring user input — e.g. "Confirm sitemap with user", "Choose payment method", "Approve plan"), you MUST NOT flip it to `"yes"` and you MUST NOT mark `"status": "completed"` until the user has actually replied. The autonomous-mode preference for "completed" does NOT override an explicit user-input requirement. For these actions, return `"status": "pending"` and keep `can_perform_without_user_input: "no"` until a fresh user message arrives in the conversation. Hallucinating a user confirmation ("user confirmed the structure", "sitemap approved") when the user hasn't actually replied is a contract violation — the user's reply must be visibly present in the message history.
         Role: Track, validate and verify the status of actions performed by other agents. Respond strictly in JSON:
         Response formats:
-            1. Action Completed: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","can_perform_without_user_input":"yes by default. Only no when absolutely impossible (e.g. payment auth, physical access)","persona_name":"persona name","fallback_action": "Context-aware retry strategy. NEVER leave empty."}
+            1. Action Completed: {"status": "completed","action": "current action","action_id": 1/2/3...,"message": "message here","can_perform_without_user_input":"yes by default. Only no when absolutely impossible (e.g. payment auth, physical access) OR when the action verbatim asks the user to choose/confirm/approve","persona_name":"persona name","fallback_action": "Context-aware retry strategy. NEVER leave empty."}
             2. Action Error: {"status": "error","action": "current action","action_id": 1/2/3...,"message": "error details"}
             3. Action Updated: {"status": "updated","action": "current action text","updated_action": "updated text","action_id": 1/2/3...,"message": "why updated","persona_name":"persona name","fallback_action": "fallback strategy"}
-            4. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "what steps are pending"}
+            4. Action Pending: {"status": "pending","action": "current action","action_id": 1/2/3...,"message": "what steps are pending","can_perform_without_user_input":"yes/no — must match the prior turn's value if action verbatim asks for user input"}
             5. Requires Breakdown: {"status": "requires_breakdown","action": "current action","action_id": 1/2/3...,"reason": "why","subtasks": [{"subtask_id": "1.1","description": "subtask desc","depends_on": [],"can_perform_autonomously": true}]}
         Error Detection Rules:
             - HTTP 403/404/500/401, connection timeouts, permission denied = report "error" (not "pending")
@@ -2572,9 +2891,22 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
     assistant = autogen.AssistantAgent(
         name="Assistant",
         llm_config=llm_config,
-        code_execution_config={"last_n_messages": 2, "work_dir": "coding", "use_docker": False},
+        code_execution_config={"last_n_messages": 2, "work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f"""{'AUTONOMOUS MODE: Do NOT ask the user questions. Use sensible defaults. Complete actions immediately without clarification.' if autonomous else 'INTERACTIVE MODE: You may ask the user clarifying questions to understand their vision before proceeding.'}
         Plain ASCII only in code and output — no emoji or non-ASCII characters.
+
+        •HELPER IS YOUR SUPERMAN — DELEGATE EVERYTHING:
+            The Helper agent has ALL the tools.  You have NONE.  For ANY task —
+            web search, web scrape, file read, save to memory, fetch chat
+            history, send message to user, schedule a job, generate image,
+            generate video, run a desktop command, consult an expert, search
+            long-term memory, anything at all — ALWAYS tag @Helper first.
+            Never refuse a request with "I can't access X" or "I don't have
+            tools for Y".  If a tool exists in the catalog below, @Helper has
+            it.  If a tool doesn't exist, ask @Helper to find an alternative
+            (search, scrape, code).  The ONLY thing Helper can't do is execute
+            python code — that's @Executor's job.  Everything else goes through
+            @Helper.  Treat Helper as your unlimited capability surface.
 
         •Purpose: The assistant executes actions provided by the ChatInstructor, seeks help from Helper and Executor agents when necessary, and ensures actions are completed accurately.
         •Action Flow:
@@ -2667,7 +2999,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
         is_termination_msg=_is_terminate_msg,
-        code_execution_config={"work_dir": "coding", "use_docker": False},
+        code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message="You are an helpful AI assistant used to perform time based tasks given to you. "
         f"""You can refer below details to perform task:
             Actions: <actionsStart>{user_tasks[user_prompt].actions}<actionEnd>
@@ -2693,7 +3025,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     helper1 = autogen.AssistantAgent(
         name="Helper",
         llm_config=llm_config,
-        code_execution_config={"work_dir": "coding", "use_docker": False},
+        code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f"""You are Helper Agent. Help the {role} agent to complete the task:
 {get_cultural_prompt()}
             1. Follow the steps below to achieve the goal: {goal}.
@@ -2716,7 +3048,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     executor1 = autogen.AssistantAgent(
         name="Executor",
         llm_config=llm_config,
-        code_execution_config={"last_n_messages":2,"work_dir": "coding", "use_docker": False},
+        code_execution_config={"last_n_messages":2,"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f'''You are a executor agent. focused solely on creating, running & debugging code.
             Your responsibilities:
             1. Follow the steps below to achieve the goal: {goal}.
@@ -2803,8 +3135,8 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     context_handling = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -2813,6 +3145,10 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
     context_handling.add_to_agent(executor1)
     context_handling.add_to_agent(multi_role_agent1)
     context_handling.add_to_agent(verify1)
+    # See chat_instructor rationale at the recipe-create context_handling
+    # block (line ~903).  Same unbounded-buffer risk applies in the
+    # time-based-execution path; chat_instructor1 needs the same cap.
+    context_handling.add_to_agent(chat_instructor1)
 
     time_agent_object = {}
     time_agent_object['time_agent'] = time_agent
@@ -2908,8 +3244,8 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     select_speaker_transforms = transform_messages.TransformMessages(
         transforms=[
-            transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            transforms.MessageHistoryLimiter(max_messages=AUTOGEN_HISTORY_LIMIT, keep_first_message=True),
+            transforms.MessageTokenLimiter(max_tokens=AUTOGEN_MESSAGE_TOKEN_BUDGET, max_tokens_per_message=AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE, min_tokens=0),
             ToolMessageHandler(user_tasks=user_tasks, user_prompt=user_prompt),
         ]
     )
@@ -2919,7 +3255,7 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         max_round=10,
         select_speaker_transform_messages=select_speaker_transforms,
         speaker_selection_method=state_transition1,  # using an LLM to decide
-        allow_repeat_speaker=True,  # Prevent same agent speaking twice
+        allow_repeat_speaker=False,  # Prevent same agent speaking twice (back-to-back assistant messages cause llama-server 400)
         send_introductions=False,
         role_for_select_speaker_messages='user',
     )
@@ -2931,6 +3267,18 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
 
     time_agent_object['time_group_chat'] = time_group_chat
     time_agent_object['time_manager'] = time_manager
+
+    # Agent Ops Console Phase B: register the time-agent GroupChat for
+    # live drill-down. Same canonical user_prompt key the time_agents
+    # cache uses (caller does `time_agents[user_prompt] = create_time_
+    # agents(...)`); we derive it here from user_id+prompt_id.
+    try:
+        from lifecycle_hooks import register_groupchat_for_session as _reg_gc
+        _reg_gc(f'{user_id}_{prompt_id}', time_group_chat)
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "groupchat registry hook skipped for time_group_chat", exc_info=True)
+
     return time_agent_object
 
 
@@ -3426,6 +3774,26 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             current_app.logger.info(f"[MSG-RECOVERY] Recovered {len(_chat_history)} messages from chat_instructor")
         current_app.logger.info(f"group_chat.messages len={len(group_chat.messages)}")
 
+        # USER-INPUT GATE clear (companion to the gate set in
+        # state_transition's pending handler):  this function is called
+        # from /chat once per user message, so the arrival of THIS call
+        # IS the user's reply.  Clear any sticky `_needs_user_input_action_id`
+        # flag set by a prior call so the OUTER loop doesn't break out
+        # before processing the new user input.
+        try:
+            if hasattr(user_tasks[user_prompt], '_needs_user_input_action_id'):
+                _prior_block = user_tasks[user_prompt]._needs_user_input_action_id
+                user_tasks[user_prompt]._needs_user_input_action_id = None
+                current_app.logger.info(
+                    f"[USER-INPUT-GATE] Clearing prior block on action "
+                    f"{_prior_block} — fresh /chat call indicates user has "
+                    f"replied; OUTER loop will resume normal iteration."
+                )
+        except Exception as _gate_clear_err:
+            current_app.logger.debug(
+                f"[USER-INPUT-GATE] flag clear failed (non-blocking): {_gate_clear_err}"
+            )
+
         # Main processing loop
         while_loop_iterations = 0
         max_iterations = 300  # Time-based: ~5s per iteration = ~25 min max
@@ -3442,6 +3810,37 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             json_obj = None  # Reset each iteration — set by state_transition JSON parse paths
 
             current_app.logger.info(f"WHILE LOOP ITERATION #{while_loop_iterations} , Current Action Id:{current_action_id}")
+
+            # USER-INPUT GATE (code-level enforcement):  if state_transition
+            # has flagged this action as blocked on user input
+            # (`can_perform_without_user_input: no`), break the OUTER loop
+            # immediately so control returns to the user.  Without this
+            # break the OUTER loop would keep re-executing the action and
+            # the StatusVerifier would eventually flip to `yes` via
+            # autonomous prompt drift, hallucinating a user confirmation
+            # that never happened (2026-05-08 incident: Action 3 looped 8
+            # iterations before fabricating "Sitemap structure confirmed"
+            # from a user who had only typed "create a website").  The
+            # flag is sticky per (user_prompt, action_id) — once set, the
+            # action stays blocked until a fresh /chat call provides a
+            # user reply (the /chat handler is responsible for clearing
+            # the flag when the user responds).
+            try:
+                _blocked_action_id = getattr(
+                    user_tasks[user_prompt], '_needs_user_input_action_id', None,
+                )
+                if _blocked_action_id is not None and _blocked_action_id == current_action_id:
+                    current_app.logger.info(
+                        f"[USER-INPUT-GATE] OUTER loop breaking at iteration "
+                        f"#{while_loop_iterations}: Action {current_action_id} is "
+                        f"flagged as needing user input.  Returning control to user; "
+                        f"the agent's question is in the assistant's last message."
+                    )
+                    break
+            except Exception as _gate_err:
+                current_app.logger.debug(
+                    f"[USER-INPUT-GATE] outer-loop gate check failed (non-blocking): {_gate_err}"
+                )
 
             # === LEDGER v2.0: Heartbeat + Budget/SLA using KNOWN state (not LLM) ===
             _ledger = user_ledgers.get(user_prompt)
@@ -4254,12 +4653,15 @@ def publish_to_crossbar_new_action_start(message, user_id):
     text = (
         "Working on " + message
         + ".\n please evaluate the response i am giving to check if it meets the current action")
-    # request_id="123456" placeholder preserved on the wire — see
-    # crossbar_publish docstring.
+    # Pull real request_id from threadlocal — see publish_agent_thought
+    # for the full failure-mode analysis (drain key miss, React daemon
+    # filter, Android orphan bucket).  Single source via thread_local_data.
+    from threadlocal import thread_local_data
     from core.peer_link.crossbar_publish import publish_thinking_trace
     publish_thinking_trace(
         text=text, user_id=user_id,
-        request_id="123456", bot_type='Agent',
+        request_id=thread_local_data.get_request_id() or '',
+        bot_type='Agent',
         full_schema=True,
     )
 
@@ -4669,7 +5071,7 @@ def initialize_with_resume(prompt_id, user_prompt, user_id):
 
     current_app.logger.info(f"[RESUME] RESUME SUMMARY:")
     current_app.logger.info(f"   - Resumed at Flow {current_flow}, Action {current_action}")
-    current_app.logger.info(f"   - Scheduler Check: {scheduler_check[user_prompt]}")
+    current_app.logger.info(f"   - Scheduler Check: {scheduler_check.get(user_prompt)}")
     current_app.logger.info(f"   - Completed Flows: {len(completed_flows)}/{len(config['flows'])}")
 
     return current_flow, current_action, completed_flows
@@ -4707,6 +5109,10 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress):
         current_app.logger.error(f"❌ Error loading existing metadata: {e}")
 
 
+from core.llm_outbound_logger import with_source as _with_source
+
+
+@_with_source('autogen.create')
 def recipe(user_id, text, prompt_id, file_id, request_id):
     user_prompt = f'{user_id}_{prompt_id}'
     request_id_list[user_prompt] = request_id
@@ -4725,8 +5131,9 @@ def recipe(user_id, text, prompt_id, file_id, request_id):
         #  ENHANCED: Resume from existing progress instead of starting fresh
         current_flow, current_action, completed_flows = initialize_with_resume(prompt_id, user_prompt, user_id)
 
-        # Check if all flows are already complete
-        if scheduler_check[user_prompt]:
+        # Check if all flows are already complete (SessionCache evicts on TTL/LRU →
+        # use .get() to avoid KeyError after eviction; missing key == 'not complete')
+        if scheduler_check.get(user_prompt):
             current_app.logger.info(" All flows already completed - Agent already created")
             return 'Agent Already Created Successfully'
 
@@ -4743,7 +5150,7 @@ def recipe(user_id, text, prompt_id, file_id, request_id):
         last_response = get_response_group(user_id, text, prompt_id, True, e)
 
     # Rest of the function remains the same...
-    if scheduler_check[user_prompt] == True:
+    if scheduler_check.get(user_prompt) is True:
         current_app.logger.info('WORKING on TIMER AGENTS')
         config = get_prompt_config_json(prompt_id)
         number_of_flows = len(config['flows'])

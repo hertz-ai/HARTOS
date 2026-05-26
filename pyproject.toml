@@ -125,6 +125,15 @@ dependencies = [
     "tqdm>=4.65.0,<5.0.0",
     "coloredlogs>=15.0.0,<16.0.0",
     "PyYAML>=6.0,<7.0",
+
+    # LiveKit (Phase 7d.B) — voice/video/screen-share SFU.
+    # Hard dep so `pip install -e .` includes the JWT-signing SDK
+    # by default; the LiveKitService auto-generates dev keys when
+    # LIVEKIT_API_KEY/SECRET aren't set, so flat/regional installs
+    # work without manual provisioning.  External SFU (LiveKit
+    # Cloud or self-hosted livekit-server binary) is a separate
+    # piece of infra; HARTOS only ships the token issuer.
+    "livekit-api>=1.0.0,<2.0.0",
 ]
 
 [project.optional-dependencies]

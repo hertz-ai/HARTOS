@@ -52,6 +52,39 @@ from typing import List, Optional, Sequence
 logger = logging.getLogger(__name__)
 
 
+def hidden_popen_kwargs() -> dict:
+    """Return Popen kwargs that hide the cmd console window on Windows.
+
+    Use this for any subprocess.run / subprocess.Popen / subprocess.call
+    site that:
+      - runs a console binary (where, ping, nvidia-smi, git, npm, etc.); AND
+      - is invoked from the cx_Freeze Windows GUI (no parent console);
+    otherwise a brief cmd.exe window flickers per call.
+
+    Usage:
+        from core.subprocess_safe import hidden_popen_kwargs
+        kw = hidden_popen_kwargs()
+        proc = subprocess.run(cmd, capture_output=True, text=True, **kw)
+        # OR
+        proc = subprocess.Popen(cmd, stdout=..., stderr=..., **kw)
+
+    On macOS/Linux this returns {} so the call is a no-op cross-platform.
+
+    Mirrors Nunba's tts/_subprocess.py::hidden_startupinfo() but exposes
+    a kwargs dict (more ergonomic for **kw merging).  run_bounded() and
+    run_with_timeout() in this module already inline the same flags.
+    """
+    if sys.platform != "win32":
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    return {
+        "startupinfo": si,
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+    }
+
+
 class BoundedResult:
     """Minimal CompletedProcess-shaped result.
 

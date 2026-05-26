@@ -17,6 +17,16 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+try:
+    from core.labeled_tool import labeled_tool
+except ImportError:  # cx_Freeze / degraded test env
+    def labeled_tool(name, func, description, *, ui_label):  # type: ignore
+        try:
+            from langchain.tools import Tool as _Tool
+        except ImportError:
+            from langchain_core.tools import Tool as _Tool
+        return _Tool(name=name, func=func, description=description)
+
 
 def get_provider_tools():
     """Return LangChain-compatible tool definitions for the provider gateway.
@@ -26,10 +36,10 @@ def get_provider_tools():
     tools = []
 
     try:
-        from langchain.tools import Tool
+        from langchain.tools import Tool  # noqa: F401 — feature-detection probe
     except ImportError:
         try:
-            from langchain_core.tools import Tool
+            from langchain_core.tools import Tool  # noqa: F401
         except ImportError:
             logger.debug("LangChain not available — skipping provider tools")
             return []
@@ -136,8 +146,12 @@ def get_provider_tools():
         except Exception as e:
             return f"Error: {e}"
 
+    # Friendly UI status labels per #508 option C — labeled_tool() factory
+    # auto-registers each label at construction time (replaces the separate
+    # register_tool_label() calls that used to live here).
+
     tools.extend([
-        Tool(
+        labeled_tool(
             name='Cloud_LLM',
             func=_generate_text,
             description=(
@@ -145,38 +159,43 @@ def get_provider_tools():
                 'Automatically picks the fastest and cheapest provider. '
                 'Use this for tasks requiring powerful cloud models.'
             ),
+            ui_label='Consulting the cloud expert…',
         ),
-        Tool(
+        labeled_tool(
             name='Generate_Image',
             func=_generate_image,
             description=(
                 'Generate an image from a text prompt using cloud providers '
                 '(Replicate, fal.ai, etc.). Returns the image URL.'
             ),
+            ui_label='Generating an image…',
         ),
-        Tool(
+        labeled_tool(
             name='Generate_Video',
             func=_generate_video,
             description=(
                 'Generate a video from a text prompt using cloud providers. '
                 'Returns the video URL.'
             ),
+            ui_label='Generating a video…',
         ),
-        Tool(
+        labeled_tool(
             name='List_AI_Providers',
             func=_list_providers,
             description=(
                 'List all available AI providers, their capabilities, pricing, '
                 'and configuration status. Input: filter by category (llm, image, video) or "all".'
             ),
+            ui_label='Listing AI providers…',
         ),
-        Tool(
+        labeled_tool(
             name='Provider_Leaderboard',
             func=_provider_leaderboard,
             description=(
                 'Show the efficiency leaderboard ranking providers by speed, quality, '
                 'cost, and overall efficiency. Input: model type (llm, image_gen, etc.).'
             ),
+            ui_label='Ranking AI providers…',
         ),
     ])
 

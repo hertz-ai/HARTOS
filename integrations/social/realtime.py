@@ -227,3 +227,31 @@ def on_notification(user_id: str, notification_dict: dict):
         'user_id': user_id,
         **notification_dict,
     }, user_id=user_id)
+
+
+def on_notification_read(user_id: str, ids):
+    """Cross-device read-state fan-out (P1-S1, 2026-05-26).
+
+    When NotificationService.mark_read / mark_all_read flips one or
+    more rows, every device the user has open should see its unread
+    badge decrement within ~1s instead of waiting for the next 30s
+    poll cycle.  Uses the same chat.social WAMP topic and SSE pipe
+    on_notification() already uses — clients filter by the inner
+    `type` field ('notification.read' vs 'notification').
+
+    `ids` is an iterable of notification id strings; empty / None
+    is a silent no-op so callers don't need to guard.
+    """
+    if not ids:
+        return
+    id_list = list(ids)
+    publish_event('chat.social', {
+        'type': 'notification.read',
+        'user_id': user_id,
+        'ids': id_list,
+    }, user_id=user_id)
+    from core.platform.events import broadcast_sse_safe
+    broadcast_sse_safe('notification.read', {
+        'user_id': user_id,
+        'ids': id_list,
+    }, user_id=user_id)

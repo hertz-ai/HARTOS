@@ -1098,11 +1098,24 @@ class ModelLifecycleManager:
         # Check LLM (llama.cpp) process — not managed by RTM
         try:
             self._check_llm_health(dead_models)
-        except Exception:
-            pass
+        except Exception as e:
+            # CRITICAL: previous code was `except Exception: pass` which
+            # silently masked LLM watchdog failures.  The user's "main LLM
+            # cannot die" rule requires every health-check failure to be
+            # visible in the log.  Log + traceback so the next iteration
+            # of root-cause work has signal instead of silence.
+            logger.exception(
+                f"[LLM-WATCHDOG] _check_llm_health raised {type(e).__name__}: "
+                f"{e!s} — main LLM health is now UNKNOWN; "
+                f"watchdog will retry on next tick"
+            )
 
         # Process each dead model
         for tool_name, exit_code, proc_type in dead_models:
+            logger.warning(
+                f"[LLM-WATCHDOG] Dead model queued for handling: "
+                f"tool={tool_name} exit_code={exit_code} proc_type={proc_type}"
+            )
             self._handle_dead_process(tool_name, exit_code, proc_type)
 
     def _check_llm_health(self, dead_models: list):
@@ -1119,8 +1132,102 @@ class ModelLifecycleManager:
         """
         with self._lock:
             state = self._models.get('llm')
-            if not state or state.device == ModelDevice.UNLOADED:
+        # The MAIN LLM is the system's primary engine — per the user's
+        # explicit "main LLM cannot die" invariant we MUST keep checking
+        # whether it is alive even when our local state thinks it is
+        # UNLOADED.  An UNLOADED state can come from:
+        #   (a) crash_count exceeded max → _handle_dead_process bailed out
+        #   (b) eviction under VRAM pressure
+        #   (c) a stale state from a prior boot where Nunba "adopted" an
+        #       externally-running server (server_process=None) and never
+        #       refreshed device when that adopted server died
+        # In every one of those cases, the previous early-return left the
+        # main engine permanently dead.  We instead log + continue, so
+        # the HTTP probe below can decide.
+        if not state:
+            # STATELESS PROBE PATH (added 2026-05-08 after live evidence
+            # showed llama-server died at 18:47 and the watchdog was blind
+            # because Nunba's LlamaConfig.start_server() spawns the server
+            # outside RuntimeToolManager — so RTM's `_on_tool_started('llm')`
+            # callback never fires and `self._models['llm']` stays absent).
+            # Even without a registered state we MUST keep the main engine
+            # alive: probe llama-server via Nunba's LlamaConfig directly,
+            # and if it's down, queue a restart via the existing
+            # `_handle_dead_process` path (which will re-spawn via
+            # `LlamaConfig.start_server`).  The fake state we synthesize
+            # here lives only inside `_handle_dead_process` (it reads
+            # state.crash_count etc.), so we register a minimal one
+            # before queueing.
+            try:
+                from llama.llama_config import LlamaConfig
+                _cfg = LlamaConfig()
+                if not _cfg.check_server_running():
+                    logger.warning(
+                        f"[LLM-WATCHDOG] STATELESS-PROBE: llama-server "
+                        f"unreachable on port "
+                        f"{_cfg.config.get('server_port')!r} and no 'llm' "
+                        f"state registered with lifecycle.  Registering a "
+                        f"minimal state and queueing restart so the main "
+                        f"engine cannot stay dead silently."
+                    )
+                    # Register a minimal state so _handle_dead_process can
+                    # update crash_count + restart_backoff etc.
+                    with self._lock:
+                        self._models['llm'] = ModelState(
+                            name='llm',
+                            device=ModelDevice.UNLOADED,
+                            priority=ModelPriority.IDLE,
+                            vram_gb=0.0,
+                            ram_gb=0.0,
+                            last_access_time=time.time(),
+                            crash_count=0,
+                            pressure_evict_only=True,
+                        )
+                    dead_models.append(('llm', None, 'stateless_probe'))
+                    return
+                else:
+                    # Healthy but unregistered — register state lazily so
+                    # subsequent ticks take the fast path with full info.
+                    logger.info(
+                        f"[LLM-WATCHDOG] STATELESS-PROBE: llama-server is "
+                        f"alive on port {_cfg.config.get('server_port')!r} "
+                        f"but had no registered state — registering now so "
+                        f"future ticks can supervise it."
+                    )
+                    with self._lock:
+                        self._models['llm'] = ModelState(
+                            name='llm',
+                            device=ModelDevice.GPU,  # Best-effort default
+                            priority=ModelPriority.ACTIVE,
+                            vram_gb=0.0,
+                            ram_gb=0.0,
+                            last_access_time=time.time(),
+                            crash_count=0,
+                            pressure_evict_only=True,
+                        )
+                    return
+            except ImportError:
+                logger.debug(
+                    "[LLM-WATCHDOG] No 'llm' state and LlamaConfig not "
+                    "importable (Docker / standalone mode) — relying on "
+                    "G3 direct-launch supervision below."
+                )
+            except Exception as e:
+                logger.exception(
+                    f"[LLM-WATCHDOG] STATELESS-PROBE raised "
+                    f"{type(e).__name__}: {e!s} — main engine health is "
+                    f"now UNKNOWN; will retry on next tick"
+                )
                 return
+        if state and state.device == ModelDevice.UNLOADED:
+            logger.warning(
+                f"[LLM-WATCHDOG] state.device=UNLOADED — investigating "
+                f"whether the main engine should be re-loaded "
+                f"(crash_count={state.crash_count}, "
+                f"last_exit_code={state.last_exit_code}). "
+                f"Continuing health check despite UNLOADED — "
+                f"main LLM cannot stay dead."
+            )
 
         nunba_handled = False
         try:
@@ -1130,15 +1237,62 @@ class ModelLifecycleManager:
                 nunba_handled = True
                 exit_code = config.server_process.poll()
                 if exit_code is not None:
+                    logger.warning(
+                        f"[LLM-WATCHDOG] Nunba-spawned llama-server died: "
+                        f"PID={config.server_process.pid} "
+                        f"exit_code={exit_code}"
+                    )
                     dead_models.append(('llm', exit_code, 'llm_server'))
-            elif state.device != ModelDevice.UNLOADED:
-                # No process object but we think it's loaded — verify via HTTP
-                if not config.check_server_running():
+                else:
+                    logger.debug(
+                        f"[LLM-WATCHDOG] Nunba-spawned llama-server alive "
+                        f"PID={config.server_process.pid}"
+                    )
+            else:
+                # No Popen handle — either we adopted an external server, OR
+                # state thinks it's loaded but the spawning Python process
+                # already exited (handle gone with it).  Either way, an
+                # HTTP probe is the only authoritative signal.  We do NOT
+                # gate on `state.device != UNLOADED` here — the main LLM
+                # must be probed even when state is stale (see Bug B in
+                # the 2026-05-08 incident: adopt-then-die left the system
+                # half-alive because the watchdog stopped probing once
+                # state went UNLOADED).
+                alive = config.check_server_running()
+                if not alive:
+                    logger.warning(
+                        f"[LLM-WATCHDOG] Adopted/stateless llama-server is "
+                        f"UNREACHABLE via HTTP probe — queueing restart. "
+                        f"state.device={state.device.value} "
+                        f"server_port={config.config.get('server_port')}"
+                    )
                     dead_models.append(('llm', None, 'llm_server'))
+                    nunba_handled = True
                 else:
                     nunba_handled = True
-        except ImportError:
-            pass
+                    logger.debug(
+                        "[LLM-WATCHDOG] Adopted llama-server alive (HTTP 200)"
+                    )
+        except ImportError as e:
+            # Previous code: `except ImportError: pass` — silent.  Surface
+            # this as a log line so when Nunba is bundled-without-supervisor
+            # we can see the LlamaConfig path is unavailable and the G3
+            # direct-launch path below is being used by design.
+            logger.info(
+                f"[LLM-WATCHDOG] LlamaConfig import unavailable "
+                f"({e!s}) — falling through to G3 direct-launch supervision"
+            )
+        except Exception as e:
+            # Previous code only caught ImportError — a real LlamaConfig()
+            # instantiation error (e.g. corrupted llama_config.json,
+            # filesystem permission error) would propagate up and be
+            # swallowed by the outer except in _check_process_health.
+            # Log + re-raise so caller's CRITICAL log fires.
+            logger.exception(
+                f"[LLM-WATCHDOG] LlamaConfig health-check raised "
+                f"{type(e).__name__}: {e!s}"
+            )
+            raise
 
         # G3: Direct-launch supervision (fires when Nunba not in charge).
         if nunba_handled:
@@ -1213,7 +1367,32 @@ class ModelLifecycleManager:
                 self._max_backoff_s
             )
 
-            should_restart = state.crash_count <= self._max_crash_restarts
+            # MAIN LLM EXEMPTION (user invariant 2026-05-08):
+            # "the LLM is the main engine, it cannot die — we observe with
+            # watchdogs etc."  For every other tool we honor max_crash_restarts
+            # so a permanently-broken sidecar doesn't loop forever.  For 'llm'
+            # specifically, we keep retrying — but at the capped backoff
+            # interval (300s) so we don't burn CPU on a hopeless box.  The
+            # alternative (give up) leaves the system permanently degraded
+            # and was the root cause of the 2026-05-08 11:40 → 13:56+ silent
+            # outage.
+            if tool_name == 'llm':
+                should_restart = True
+                if state.crash_count > self._max_crash_restarts:
+                    # Past the configured ceiling — log loudly so on-call
+                    # sees the persistent failure, but keep trying at the
+                    # max backoff.  Reset crash_count to the ceiling so
+                    # restart_backoff_s stays clamped at _max_backoff_s.
+                    logger.error(
+                        f"[LLM-WATCHDOG] LLM has crashed {state.crash_count} "
+                        f"times (> max_crash_restarts={self._max_crash_restarts})"
+                        f" — continuing to retry every {self._max_backoff_s}s "
+                        f"because the main engine cannot stay dead. "
+                        f"Investigate llama-server log for repeated crash "
+                        f"cause."
+                    )
+            else:
+                should_restart = state.crash_count <= self._max_crash_restarts
 
         # Release VRAM allocation
         try:
@@ -1249,12 +1428,38 @@ class ModelLifecycleManager:
 
         # Queue restart with backoff (if under max retries)
         if should_restart:
+            # IDEMPOTENCE GUARD (2026-05-09 starvation fix):
+            # If a restart is already queued or in progress, do NOT
+            # overwrite it.  Re-queuing every dead-detection tick was
+            # the 2026-05-09 starvation bug — retry_after kept getting
+            # pushed forward by the latest tick's `now + backoff_s`,
+            # so _process_restart_queue's `now >= retry_after` check
+            # never succeeded.  Live evidence: 220 `Queued restart for
+            # llm` lines, 0 `_restart_llm starting` lines over 7.5h.
+            # Keep the original retry_after so the spawn fires.
+            with self._lock:
+                existing = self._restart_pending.get(tool_name)
+            if existing and isinstance(existing, dict):
+                if existing.get('in_progress'):
+                    logger.debug(
+                        f"[LIFECYCLE] {tool_name} restart IN PROGRESS — "
+                        f"suppressing re-queue from dead-detection tick"
+                    )
+                else:
+                    eta = max(0, existing.get('retry_after', 0) - time.time())
+                    logger.debug(
+                        f"[LIFECYCLE] {tool_name} restart already queued "
+                        f"(fires in {eta:.0f}s) — keeping original schedule, "
+                        f"not re-queuing"
+                    )
+                return
             retry_after = time.time() + state.restart_backoff_s
             downgrade = is_oom  # OOM → restart on lower resource tier
             self._restart_pending[tool_name] = {
                 'retry_after': retry_after,
                 'downgrade': downgrade,
                 'old_device': old_device.value if old_device else 'gpu',
+                'in_progress': False,
             }
             logger.info(
                 f"Queued restart for {tool_name} in {state.restart_backoff_s:.0f}s"
@@ -1276,11 +1481,75 @@ class ModelLifecycleManager:
         ready = []
         with self._lock:
             for name, info in list(self._restart_pending.items()):
-                if isinstance(info, dict) and now >= info.get('retry_after', 0):
+                if not isinstance(info, dict):
+                    continue
+                if info.get('in_progress'):
+                    # Already being spawned by a prior tick — skip.  Without
+                    # this check, two ticks could pull the same entry and
+                    # double-spawn (race that motivated the IDEMPOTENCE
+                    # GUARD in _handle_dead_process — both halves needed).
+                    continue
+                if now >= info.get('retry_after', 0):
+                    # Mark in_progress instead of deleting.  Retain the
+                    # entry so concurrent ticks see in_progress=True and
+                    # skip.  We pop the entry only AFTER spawn completes
+                    # (success or exception), in the finally block below.
+                    info['in_progress'] = True
+                    self._restart_pending[name] = info
                     ready.append((name, info))
-                    del self._restart_pending[name]
 
         for name, info in ready:
+            # IDEMPOTENCE: pre-spawn HTTP probe.  If the server came up
+            # via an external respawn (user restarted llama-server in a
+            # different terminal) between when this restart was queued
+            # and now, skip the spawn — don't kill the user's process
+            # via stop_server() and re-spawn our own.  Same probe also
+            # protects against the race where an earlier _restart_llm
+            # already succeeded but a stale queue entry survived.
+            if name == 'llm':
+                try:
+                    from llama.llama_config import LlamaConfig
+                    if LlamaConfig().check_server_running():
+                        logger.info(
+                            f"[LIFECYCLE] {name} already healthy on HTTP "
+                            f"probe — skipping queued spawn (idempotent "
+                            f"no-op; likely came up via external respawn "
+                            f"or earlier _restart_llm)"
+                        )
+                        # Detect ACTUAL device — Nunba defaults to GPU but
+                        # an externally-respawned server (or a Nunba retry
+                        # after a CUDA-context loss from sleep/hibernate)
+                        # may be on CPU.  Self-review caught the v1 of this
+                        # code unconditionally stamping GPU, which would
+                        # mislead the catalog/dispatcher.  vram_manager has
+                        # an internal cache so this is sub-millisecond after
+                        # first call (no nvidia-smi cost per tick).
+                        try:
+                            from integrations.service_tools.vram_manager import (
+                                vram_manager as _vmm,
+                            )
+                            _gpu_info = _vmm.detect_gpu() or {}
+                            _device = (ModelDevice.GPU
+                                       if _gpu_info.get('cuda_available')
+                                       else ModelDevice.CPU)
+                        except Exception:
+                            # If vram_manager can't be reached, prefer GPU
+                            # since that's the default Nunba launch mode —
+                            # next full _check_llm_health tick will resync
+                            # if wrong.
+                            _device = ModelDevice.GPU
+                        with self._lock:
+                            self._restart_pending.pop(name, None)
+                            # Sync watchdog state so STATELESS-PROBE doesn't
+                            # immediately re-detect "dead" and re-queue.
+                            st = self._models.get(name)
+                            if st:
+                                st.device = _device
+                                st.priority = ModelPriority.ACTIVE
+                                st.last_access_time = time.time()
+                        continue
+                except Exception:
+                    pass  # Probe failed — proceed with spawn
             downgrade = info.get('downgrade', False)
             old_device = info.get('old_device', 'gpu')
 
@@ -1296,10 +1565,23 @@ class ModelLifecycleManager:
                         f" (was {old_device}, downgrade={downgrade})")
 
             success = False
-            if name == 'llm':
-                success = self._restart_llm(restart_mode)
-            else:
-                success = self._restart_rtm_tool(name, restart_mode)
+            try:
+                if name == 'llm':
+                    success = self._restart_llm(restart_mode)
+                else:
+                    success = self._restart_rtm_tool(name, restart_mode)
+            finally:
+                # ALWAYS clear the in_progress entry after spawn returns.
+                # If we succeeded, no further pending needed.  If we failed
+                # and the LLM-EXEMPTION + dead-detection wants another
+                # attempt, the next _check_process_health tick re-queues
+                # via _handle_dead_process — and that path's IDEMPOTENCE
+                # GUARD already prevents starvation by NOT overwriting
+                # pending if one already exists.  So pop here is safe.
+                # Without this pop, in_progress=True would persist and
+                # the entry would be skipped forever by future ticks.
+                with self._lock:
+                    self._restart_pending.pop(name, None)
 
             if success:
                 with self._lock:
@@ -1309,10 +1591,15 @@ class ModelLifecycleManager:
                 self._emit_event('model.restarted', {
                     'model': name, 'mode': restart_mode, 'downgraded': downgrade})
             else:
-                # Re-queue with increased backoff
+                # Failure path: bump crash_count + backoff, then re-queue
+                # ONLY if no entry is currently pending (other ticks may
+                # have re-queued via _handle_dead_process while we were
+                # spawning).  Same idempotence rule as _handle_dead_process.
                 with self._lock:
                     state = self._models.get(name)
-                    if state and state.crash_count <= self._max_crash_restarts:
+                    already_pending = name in self._restart_pending
+                    if (state and not already_pending
+                            and state.crash_count <= self._max_crash_restarts):
                         state.crash_count += 1
                         state.restart_backoff_s = min(
                             state.restart_backoff_s * 2, self._max_backoff_s)
@@ -1320,6 +1607,7 @@ class ModelLifecycleManager:
                             'retry_after': now + state.restart_backoff_s,
                             'downgrade': downgrade,
                             'old_device': restart_mode,
+                            'in_progress': False,
                         }
 
     def _restart_llm(self, mode: str) -> bool:
@@ -1328,18 +1616,51 @@ class ModelLifecycleManager:
         Primary path: Nunba's LlamaConfig (reads ~/.nunba/llama_config.json).
         Fallback: direct subprocess launch (Docker/standalone without Nunba).
         """
+        logger.info(
+            f"[LLM-WATCHDOG] _restart_llm starting: mode={mode!r} "
+            f"(primary path: Nunba LlamaConfig.start_server)"
+        )
         # Primary: Nunba manages the server
         try:
             from llama.llama_config import LlamaConfig
             config = LlamaConfig()
+            logger.info(
+                f"[LLM-WATCHDOG] Calling LlamaConfig.stop_server() to clean "
+                f"up any half-alive server state before restart"
+            )
             config.stop_server()
             config.config['use_gpu'] = (mode == 'gpu')
             config._save_config()
-            return config.start_server()
+            logger.info(
+                f"[LLM-WATCHDOG] Calling LlamaConfig.start_server() "
+                f"(use_gpu={config.config['use_gpu']}, "
+                f"port={config.config.get('server_port')})"
+            )
+            ok = config.start_server()
+            if ok:
+                logger.info(
+                    f"[LLM-WATCHDOG] Nunba LLM restart SUCCEEDED on port "
+                    f"{config.config.get('server_port')}"
+                )
+            else:
+                logger.error(
+                    f"[LLM-WATCHDOG] Nunba LLM restart RETURNED FALSE "
+                    f"from start_server() — caller will re-queue with "
+                    f"backoff.  Check llama_server_<port>.log for the "
+                    f"underlying spawn failure."
+                )
+            return ok
         except ImportError:
-            logger.info("Nunba not available, using direct llama-server launch")
+            logger.info(
+                "[LLM-WATCHDOG] Nunba LlamaConfig not importable — "
+                "falling through to direct llama-server launch (G3 path)"
+            )
         except Exception as e:
-            logger.error(f"Nunba LLM restart failed: {e}")
+            logger.exception(
+                f"[LLM-WATCHDOG] Nunba LLM restart raised "
+                f"{type(e).__name__}: {e!s} — caller will re-queue with "
+                f"backoff"
+            )
             return False
 
         # Fallback: direct launch (Docker/standalone)

@@ -89,6 +89,12 @@ install_requires = [
     "tqdm>=4.65.0,<5.0.0",
     "coloredlogs>=15.0.0,<16.0.0",
     "PyYAML>=6.0,<7.0",
+
+    # LiveKit (Phase 7d.B) — voice/video/screen-share SFU token signer.
+    # Hard dep so every build target (pip / ISO / Docker / PEX) gets
+    # the JWT signer.  Dev-key bootstrap in livekit_service handles the
+    # config side automatically — see ~/.hevolve/livekit_dev.json.
+    "livekit-api>=1.0.0,<2.0.0",
 ]
 
 # Optional dependencies for specific features

@@ -584,10 +584,227 @@ class TestRepoValidation:
 
 class TestPackageInit:
 
-    def test_disabled_by_default(self):
+    def test_explicit_false_disables(self):
+        """When HEVOLVE_CODING_AGENT_ENABLED is explicitly set to 'false',
+        init_coding_agent must skip blueprint registration AND daemon
+        start.  Server deployments that don't want the daemon use this
+        explicit override.
+
+        Default (2026-05-07+) is 'true' — see test_enabled_by_default
+        for that semantic.  This test pins the explicit-disable path."""
         from flask import Flask
         app = Flask(__name__)
         with patch.dict(os.environ, {'HEVOLVE_CODING_AGENT_ENABLED': 'false'}):
             from integrations.coding_agent import init_coding_agent
             init_coding_agent(app)
             assert 'coding_agent' not in [bp.name for bp in app.blueprints.values()]
+
+    def test_enabled_by_default_when_env_unset(self):
+        """When HEVOLVE_CODING_AGENT_ENABLED is NOT set in the env,
+        init_coding_agent must default to enabled.  Pre-2026-05-07
+        this defaulted to 'false' which caused 15 self_heal goals to
+        pile up (oldest 2026-04-27, none completed) because the
+        daemon never ran.  Default flipped to 'true' since the daemon
+        is the canonical consumer for goals that error_advice +
+        SelfHealingDispatcher fill — having a producer with no
+        consumer is worse than the original opt-in design intent.
+
+        Safety relies on the daemon itself: _tick() early-returns
+        when no idle agents are opted in, so users with empty agent
+        rosters see zero behavioral change.
+        """
+        from flask import Flask
+        app = Flask(__name__)
+        # Remove the env var if it happens to be set in the test runner
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('HEVOLVE_CODING_AGENT_ENABLED', None)
+            # Mock the blueprint+daemon import to avoid spinning a real
+            # daemon thread in the test.  We only verify the CONTROL
+            # FLOW reaches the registration path; the daemon's own
+            # behavior is covered by test_coding_daemon.py.
+            with patch('integrations.coding_agent.get_coding_blueprint') as mock_bp, \
+                 patch('integrations.coding_agent.coding_daemon.coding_daemon') as mock_daemon:
+                mock_bp.return_value = MagicMock(name='coding_agent_bp')
+                mock_bp.return_value.name = 'coding_agent'
+                mock_daemon.start = MagicMock()
+
+                from integrations.coding_agent import init_coding_agent
+                init_coding_agent(app)
+
+                # The control flow must reach blueprint registration
+                # (which means it passed the env gate).  Either the
+                # blueprint actually registered OR get_coding_blueprint
+                # was at least called — we accept either since the
+                # blueprint was already registered in a prior test run
+                # (Flask raises on duplicate register).
+                assert mock_bp.called or app.blueprints, (
+                    "Default-enabled path must reach blueprint "
+                    "registration — env gate must default 'true'"
+                )
+
+
+class TestCodingDaemonIdleGate:
+    """Pins coding_daemon to ``get_idle_agent_personas`` (the local-agent
+    gate) instead of ``get_idle_opted_in_agents`` (the human-consent gate
+    for distributed-compute sharing).
+
+    Live-evidence root-cause 2026-05-07: 42 self_heal goals, 0 with
+    last_dispatched_at populated.  coding_daemon was using the
+    human-consent gate which silently returned [] on installs where no
+    user had toggled idle_compute_opt_in=True — daemon stalled,
+    self_heal queue piled up indefinitely.
+
+    Same pattern + same fix as agent_daemon's 2026-05-01 switch
+    (agent_daemon.py:555-563).  CODING_GOAL_TYPES are LOCAL maintenance
+    goals — they fix this node, never need human-consent routing.
+
+    These tests source-grep coding_daemon.py to PREVENT drift back to
+    the wrong gate.  An AST-level guard would also work but the source
+    pattern catches the regression at the same point a human reviewer
+    would notice it.
+    """
+
+    def test_coding_daemon_uses_local_agent_gate(self):
+        """coding_daemon._tick must call get_idle_agent_personas."""
+        from pathlib import Path
+        src = Path(
+            os.path.join(
+                os.path.dirname(__file__), '..', '..',
+                'integrations', 'coding_agent', 'coding_daemon.py',
+            )
+        ).read_text(encoding='utf-8')
+        assert 'get_idle_agent_personas' in src, (
+            'coding_daemon.py must call IdleDetectionService.'
+            'get_idle_agent_personas (the same canonical local-agent '
+            'gate agent_daemon uses).  See agent_daemon.py:555-563 for '
+            'the rationale block this fix mirrors.'
+        )
+
+    def test_coding_daemon_does_not_use_human_consent_gate(self):
+        """Regression guard: coding_daemon must NEVER drift back to
+        get_idle_opted_in_agents.  That gate silently returns [] when
+        no human has opted into distributed-compute sharing — the
+        2026-05-07 stall (42 goals, 0 dispatched) recurs."""
+        from pathlib import Path
+        src = Path(
+            os.path.join(
+                os.path.dirname(__file__), '..', '..',
+                'integrations', 'coding_agent', 'coding_daemon.py',
+            )
+        ).read_text(encoding='utf-8')
+        # The string 'get_idle_opted_in_agents' MAY appear inside a
+        # comment block (we explain the wrong-gate history).  But it
+        # must NOT appear in a line that is a function CALL.  Filter
+        # comment lines out before the assertion.
+        non_comment_lines = [
+            line for line in src.splitlines()
+            if not line.lstrip().startswith('#')
+        ]
+        non_comment_src = '\n'.join(non_comment_lines)
+        assert 'get_idle_opted_in_agents' not in non_comment_src, (
+            'coding_daemon.py must NOT call get_idle_opted_in_agents '
+            'in non-comment code.  That gate is only correct for '
+            'distributed-compute sharing routes (peer share); for '
+            'LOCAL goal dispatch (CODING_GOAL_TYPES) the canonical '
+            'gate is get_idle_agent_personas.  Mismatch caused the '
+            'self_heal queue stall on 2026-05-07.'
+        )
+
+    def test_idle_detection_service_exposes_both_gates(self):
+        """Sanity: both methods exist on IdleDetectionService.  If
+        one is renamed/removed, the daemon's source-pin breaks loudly
+        instead of silently routing to the other."""
+        from integrations.coding_agent.idle_detection import (
+            IdleDetectionService,
+        )
+        assert hasattr(IdleDetectionService, 'get_idle_agent_personas'), (
+            'IdleDetectionService.get_idle_agent_personas missing — '
+            'coding_daemon depends on it'
+        )
+        assert hasattr(IdleDetectionService, 'get_idle_opted_in_agents'), (
+            'IdleDetectionService.get_idle_opted_in_agents missing — '
+            'kept as the distributed-compute privacy gate; do not '
+            'remove without auditing get_idle_stats + peer_discovery'
+        )
+
+    def test_agent_daemon_pattern_unchanged(self):
+        """The fix mirrors agent_daemon.py:555-563.  If agent_daemon
+        ever reverts, this test surfaces the drift so coding_daemon
+        can be re-aligned in the same pass."""
+        from pathlib import Path
+        src = Path(
+            os.path.join(
+                os.path.dirname(__file__), '..', '..',
+                'integrations', 'agent_engine', 'agent_daemon.py',
+            )
+        ).read_text(encoding='utf-8')
+        assert 'get_idle_agent_personas' in src, (
+            'agent_daemon.py also uses get_idle_agent_personas — if '
+            'this fails, agent_daemon drifted back to the human-consent '
+            'gate; coding_daemon should match whatever the canonical '
+            'pattern is.'
+        )
+
+    def test_coding_daemon_orders_goals_by_last_dispatched_nulls_first(self):
+        """Pins the goal-selection ORDER BY clause that prevents
+        already-dispatched goals from starving never-dispatched ones.
+
+        Live-evidence root cause 2026-05-07 (post-rebuild):
+        49 self_heal goals + 4 already-dispatched coding goals + only
+        2 idle agent personas.  Daemon iterates goals in default
+        SQLite storage (rowid asc) order.  4 coding goals with
+        populated last_dispatched_at sit at the FRONT (low rowid);
+        the 30s cooldown check expires every tick at the SAME cadence
+        as the tick interval, so those 4 goals saturate the 2 idle
+        slots EVERY tick.  Self_heal goals at the back of the queue
+        never reach an idle agent.
+
+        Witnessed: 14 'dispatched 1 goal(s)' log lines over 6 minutes,
+        all targeting the same 4 already-dispatched goals; 0 self_heal
+        goals dispatched.
+
+        Fix: `.order_by(asc(AgentGoal.last_dispatched_at).nulls_first())`
+        — never-dispatched goals jump to the front, then by oldest
+        dispatch.  Same canonical pattern that prevents queue
+        starvation in any FIFO+cooldown system.
+        """
+        from pathlib import Path
+        src = Path(
+            os.path.join(
+                os.path.dirname(__file__), '..', '..',
+                'integrations', 'coding_agent', 'coding_daemon.py',
+            )
+        ).read_text(encoding='utf-8')
+        non_comment = '\n'.join(
+            line for line in src.splitlines()
+            if not line.lstrip().startswith('#')
+        )
+        # The query MUST include both an asc/order_by clause AND a
+        # nulls_first treatment of last_dispatched_at, OR an
+        # equivalent .order_by(...) that surfaces never-dispatched
+        # goals first.  Don't pin the exact SQLAlchemy idiom because
+        # newer versions may rename .nullsfirst() to .nulls_first()
+        # or vice versa — accept either spelling.
+        assert 'order_by' in non_comment, (
+            'coding_daemon._tick must order goals — without ORDER BY, '
+            'SQLite returns rows in storage (rowid) order and a few '
+            'already-dispatched goals starve the rest forever (the '
+            '2026-05-07 self_heal-stuck bug).'
+        )
+        assert ('nulls_first' in non_comment
+                or 'nullsfirst' in non_comment
+                or 'NULLS FIRST' in non_comment), (
+            'coding_daemon._tick must surface never-dispatched goals '
+            'first (NULL last_dispatched_at).  Pin via '
+            '.order_by(asc(...).nulls_first()) or equivalent.  '
+            'Drifting back to plain ORDER BY without nulls_first '
+            'silently re-orders never-dispatched goals to the END of '
+            'the queue on databases where NULLS LAST is the default '
+            '(MySQL, MS SQL); SQLite uses NULLS FIRST by default but '
+            'we shouldn\'t depend on that.'
+        )
+        assert 'last_dispatched_at' in non_comment, (
+            'ORDER BY must reference last_dispatched_at specifically '
+            '— ordering by created_at or id misses the goal-rotation '
+            'fairness this pin protects.'
+        )

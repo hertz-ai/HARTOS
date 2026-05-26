@@ -83,18 +83,28 @@ class Qwen3VLBackend:
     """Unified screen parsing + action reasoning via Qwen3-VL."""
 
     def __init__(self, base_url=None, model_name=None):
+        # Dynamic discovery via the canonical resolver — walks 7 candidate
+        # sources, PROBES each, auto-corrects drift, fires WAMP toast on
+        # detection (port_registry.py:391).  Replaces the prior static
+        # get_port('llm') lookup that returned the registry DEFAULT (8080)
+        # even after llama-server moved to 8082, causing Family A+B
+        # connection failures verified live 2026-05-16 13:25.
         try:
-            from core.port_registry import get_port
-            _llm_port = get_port('llm')
-        except Exception as _port_err:
-            # Sensible fallback - port_registry unavailable means we
-            # are running outside the bundled Nunba context (test /
-            # standalone).  Honour HEVOLVE_LLM_PORT env or default 8080.
-            logger.debug(f"port_registry unavailable, using env/8080: {_port_err}")
-            _llm_port = int(os.environ.get('HEVOLVE_LLM_PORT', 8080))
+            from core.port_registry import get_local_llm_url
+            _dynamic_url = get_local_llm_url()
+        except Exception as _resolve_err:
+            logger.debug(
+                f"get_local_llm_url unavailable, using env/registry fallback: "
+                f"{_resolve_err}")
+            try:
+                from core.port_registry import get_port
+                _llm_port = get_port('llm')
+            except Exception:
+                _llm_port = int(os.environ.get('HEVOLVE_LLM_PORT', 8080))
+            _dynamic_url = f'http://127.0.0.1:{_llm_port}/v1'
         self.base_url = base_url or os.environ.get(
             'HEVOLVE_VLM_ENDPOINT_URL',
-            os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', f'http://127.0.0.1:{_llm_port}/v1')
+            os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', _dynamic_url)
         )
         self.model_name = model_name or os.environ.get(
             'HEVOLVE_VLM_MODEL_NAME',
@@ -269,9 +279,13 @@ class Qwen3VLBackend:
         """Get OS window list with foreground/z-index info for grounding context."""
         try:
             import subprocess, platform
+            from core.subprocess_safe import hidden_popen_kwargs
+            _hide = hidden_popen_kwargs()
             _os = platform.system()
             if _os == 'Windows':
                 # Get foreground window title via PowerShell
+                # _hide adds CREATE_NO_WINDOW so the powershell child does
+                # not flicker a console window on every VLM probe.
                 _fg = subprocess.run(
                     ['powershell', '-NoProfile', '-Command',
                      'Add-Type @"\nusing System;\nusing System.Runtime.InteropServices;\n'
@@ -279,7 +293,7 @@ class Qwen3VLBackend:
                      '[DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder t, int c); }\n"@; '
                      '$h=[FG]::GetForegroundWindow(); $sb=New-Object System.Text.StringBuilder 256; '
                      '[void][FG]::GetWindowText($h,$sb,256); $sb.ToString()'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **_hide)
                 fg_title = _fg.stdout.strip() if _fg.returncode == 0 else ''
 
                 # Get all windows
@@ -287,7 +301,7 @@ class Qwen3VLBackend:
                     ['powershell', '-NoProfile', '-Command',
                      'Get-Process | Where-Object {$_.MainWindowTitle -ne ""} | '
                      'Select-Object ProcessName, MainWindowTitle | ConvertTo-Json'],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, timeout=5, **_hide)
                 if _r.returncode == 0:
                     _wins = json.loads(_r.stdout)
                     if isinstance(_wins, dict):

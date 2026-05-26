@@ -1,20 +1,75 @@
 """
 Unified Agent Goal Engine - Speculative Dispatcher
 
-Fast-first, expert-takeover speculative execution:
-1. Fast model (hive compute / cheap API) responds synchronously → user sees instantly
-2. Expert model (GPT-4 / Claude) runs in background thread
-3. Fast response conveyed to expert as context
-4. If expert meaningfully improves, delivered asynchronously
-5. Compute provider (hive node) earns ad revenue for serving fast response
+Draft-first + expert-takeover dispatcher.
 
-Guardrails enforced at EVERY layer:
-- ConstitutionalFilter.check_prompt() before ANY dispatch
-- HiveCircuitBreaker.is_halted() before ANY dispatch
-- EnergyAwareness tracked on EVERY model call
-- ComputeDemocracy.adjusted_reward() on EVERY contribution
-- HiveEthos.rewrite_prompt_for_togetherness() on EVERY prompt
-- Budget enforcement via ResonanceService.spend_spark()
+Two entry points, one delivery channel:
+
+  dispatch_draft_first(prompt, ...)
+    DRAFT tier (Qwen3.5-0.8B) replies SYNCHRONOUSLY in ~300ms with an
+    envelope ``{reply, delegate: none|local|hive, confidence, ...}``.
+    The reply is the user's standby answer; ``delegate`` is the draft's
+    self-assessment of whether a heavier model needs to take the turn.
+
+    Five guards can promote the turn to expert background regardless of
+    the draft's own decision:
+      * refusal pattern in the reply → REFUSAL_OVERRIDE
+      * delegate=none + confidence < floor → LOW_CONFIDENCE
+      * delegate=none + agent_bound prompt → AGENT_BOUND
+      * delegate=none + classifier surfaces actionable intent
+        (channel_connect / is_create_agent / language_change /
+         invite / join_room / memory_query) → ACTIONABLE_INTENT
+      * envelope parse failure → PARSE_FAILURE
+    The canonical taxonomy lives in
+    ``integrations.agent_engine.escalation_reasons.EscalationReason``;
+    callers / observers / WorldModelBridge see the reason in the
+    return dict and in ``self._active[speculation_id]``.
+
+  dispatch_speculative(prompt, ...)
+    Legacy entry. Fast tier replies synchronously, expert runs in
+    background. Same delivery channel.
+
+Expert background path
+----------------------
+
+When a turn escalates, ``_expert_background_task`` dispatches via
+``_dispatch_expert_langchain``:
+
+  - **Local expert** (``is_local=True``): routes through the full HARTOS
+    /chat pipeline — full tool registry, full system prompt, full agent
+    context. Bundled mode uses an in-process Flask test_client; HTTP
+    mode POSTs to the configured backend. Re-entry guarded by
+    ``speculative=False, draft_first=False`` in the payload.
+
+  - **Hive expert** (``is_local=False``): registered by
+    ``HiveExpertDiscovery`` from ``peer.capability.announce`` gossip,
+    routed via OpenAI-compatible POST to the peer's ``base_url`` with
+    bearer auth. The hive peer's 27B / fine-tuned model takes the turn
+    directly — no "review the draft" wrapper.
+
+When the expert returns, ``_deliver_expert_response`` bubble-replaces
+the standby via the existing ``speculation_id`` channel: SSE for the
+chat UI + TTS pupit topic for voice. The fast_response stays only when
+the expert returned empty or got guardrail-blocked.
+
+Guardrails at every layer
+-------------------------
+- ``ConstitutionalFilter.check_prompt`` before dispatch and on expert output
+- ``HiveCircuitBreaker.is_halted()`` before dispatch and again at task entry
+- ``HiveEthos.rewrite_prompt_for_togetherness`` on every prompt
+- Budget enforcement via ``_check_and_reserve_budget``
+- Energy + latency tracking on every model call
+- Per-peer install-validation gate via ``_pass_validation_gate``
+
+Hive expert wiring (subscriber-side complete; producer pending)
+---------------------------------------------------------------
+``HiveExpertDiscovery`` listens for ``peer.capability.announce`` /
+``peer.capability.revoke`` on the platform EventBus and auto-registers
+reachable, trust-verified peers as ``ModelTier.EXPERT`` backends.
+Until peers start emitting the announce gossip (producer daemon ships
+separately), ``_pick_expert_for_delegate('hive', ...)`` falls back to
+the local fast model and ``served_by`` in telemetry reads
+``local_langchain_bg`` 100% of the time.
 """
 import atexit
 import json
@@ -28,14 +83,24 @@ from collections import deque
 
 from core.port_registry import get_port
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Optional
+from typing import Dict, List, Optional
+
+# Eager-import the history loader so the per-call inline import in
+# dispatch_draft_first doesn't hit Python's import lock on every chat
+# (sys.modules cache makes subsequent calls fast, but the FIRST call
+# of a freshly-warm process still pays the lock cost).  Imported via
+# try/except to keep the module load tolerant of test environments
+# that mock out the social subtree.
+try:
+    from integrations.channels.memory.shared_history import (
+        seed_autogen_from_shared_history)
+except ImportError:
+    seed_autogen_from_shared_history = None  # type: ignore[assignment]
+
+from integrations.agent_engine.escalation_reasons import EscalationReason
 
 logger = logging.getLogger('hevolve_social')
 
-# Similarity threshold — below this, expert response is considered
-# a meaningful improvement over fast response
-_SIMILARITY_THRESHOLD = 0.80
-_RESPONSE_ADEQUATE = 'RESPONSE_ADEQUATE'
 
 # Minimum draft confidence required to commit the draft's reply as the
 # FINAL answer (delegate="none" path). Below this we schedule an expert
@@ -72,6 +137,18 @@ _REFUSAL_NOUNS = (
     r"built-?in|external|the internet|web access|internet access|"
     r"means|way to"
 )
+# Knowledge / data / topic nouns for the "I don't have <intermediate> <NOUN>"
+# pattern — catches knowledge-cutoff refusals like
+# "I don't have the 2026 IPL table" / "I don't have current IPL data" /
+# "I don't have information about live matches" / "I don't have details about
+# next year's schedule".  Live evidence: 2026-05-13 09:55:34 IPL turn
+# (request 301eeed0) — the existing _REFUSAL_NOUNS list was capability-only
+# and did not catch this knowledge-cutoff family.
+_REFUSAL_DATA_NOUNS = (
+    r"data|info|information|details|knowledge|records?|results?|"
+    r"table|standings|schedule|listings?|stats|statistics|figures|"
+    r"scores?|rankings?|fixtures?|matches|games"
+)
 _REFUSAL_PATTERN = re.compile(
     r"\b(?:"
     # "I cannot/can't <optional softener> <verb>"
@@ -91,11 +168,42 @@ _REFUSAL_PATTERN = re.compile(
     r"I do(?:n'?t| not) have\s+"
     r"(?:" + _REFUSAL_NOUNS + r")"
     r"|"
+    # "I (don't|do not) have <the/any/access to> <up-to-40-chars> <data-noun>"
+    # — knowledge-cutoff refusals.  Limits intermediate-word span to 40 chars
+    # so we don't false-match "I don't have a brother — but I do have data on…"
+    # The data-noun must follow within the same clause.
+    r"I do(?:n'?t| not) have\s+"
+    r"(?:the\s+|any\s+|access to\s+(?:the\s+)?|current\s+|live\s+|real-?time\s+|recent\s+)?"
+    r"[\w\s\-'\d]{0,40}?"
+    r"\b(?:" + _REFUSAL_DATA_NOUNS + r")\b"
+    r"|"
     # "I lack <noun>"  e.g. "I lack access to GitHub"
     r"I lack\s+(?:" + _REFUSAL_NOUNS + r")"
     r"|"
     # "I have no <noun>"  e.g. "I have no tools to retrieve…"
-    r"I have no\s+(?:access|way|tools?|ability|means)"
+    r"I have no\s+(?:access|way|tools?|ability|means|"
+    r"data|info|information|knowledge|records?)"
+    r"|"
+    # "(future|upcoming) (data|events|matches|seasons)" — knowledge-cutoff
+    # phrasing where the model frames the absence as a temporal property.
+    # e.g. "seasons that far out are just rumors at this point" / "future
+    # events are not available yet" / "next year's data hasn't been released"
+    r"(?:future|upcoming|next year'?s?|next season'?s?)\s+"
+    r"(?:" + _REFUSAL_DATA_NOUNS + r"|events?|seasons?)"
+    r"|"
+    # "(haven't been|aren't|isn't) (released|published|available) yet"
+    # — e.g. "the 2026 schedule hasn't been released yet"
+    r"(?:haven'?t been|hasn'?t been|aren'?t|isn'?t|are not|is not)\s+"
+    r"(?:released|published|announced|available|out|determined|set|confirmed)"
+    r"(?:\s+yet)?"
+    r"|"
+    # "are just rumors at this point" — the IPL turn's exact phrasing.
+    r"(?:are|is)\s+(?:just\s+|only\s+)?rumors?"
+    r"|"
+    # "predates? my training" / "after my (knowledge|training) cutoff"
+    r"(?:predates?|outside of|beyond|after)\s+my\s+(?:training|knowledge)"
+    r"|"
+    r"my\s+(?:training|knowledge)\s+cut[\s\-]?off"
     r"|"
     # "I'm just/only a (large language model|LLM|AI|chatbot|…)"
     # — split for I'm vs I am as above.
@@ -195,15 +303,44 @@ class SpeculativeDispatcher:
 
     # ─── Main entry point ───
 
-    def dispatch_speculative(self, prompt: str, user_id: str, prompt_id: str,
+    def dispatch_speculative(self, prompt: str, user_id: str,
+                             prompt_id: Optional[str] = None,
                              goal_id: str = None, goal_type: str = 'general',
                              node_id: str = None) -> dict:
         """
+        Legacy entry point (pre-dates ``dispatch_draft_first``).
+
         1. Guardrail-check the prompt
-        2. Pick fast model → dispatch synchronously → user gets response
+        2. Pick FAST tier model → dispatch synchronously → user gets reply
         3. Record compute contribution for hive node (ad revenue)
-        4. Pick expert model → dispatch in background thread
+        4. Pick EXPERT tier model → schedule background task
         5. Return fast response immediately
+
+        **Post-refactor behavior** (commit cad43c3 onward): the expert
+        background task now runs the ORIGINAL prompt through the full
+        HARTOS ``/chat`` pipeline (local) or the registered hive peer's
+        OpenAI-compat endpoint (remote) via
+        ``_run_collapsed_expert_path``.  It NO LONGER wraps the fast
+        response as a "review and improve" meta-prompt, and there is
+        NO similarity gate — the expert's reply replaces the fast
+        response by default (modulo guardrail block / empty response)
+        via the ``speculation_id`` bubble-replacement on
+        ``_deliver_expert_response``.
+
+        Compared to the pre-refactor contract, callers see two
+        differences:
+          * The expert may now bind the full tool registry (Create_Agent,
+            Connect_Channel, etc.) — previously it could only emit text.
+          * The expert's reply is delivered unconditionally; previously
+            it was only delivered when the word-overlap similarity to
+            the fast response fell below 80%.
+
+        ``dispatch_draft_first`` is the preferred entry point — it
+        stamps ``escalation_reason`` on the background task and adds
+        five smart-routing guards (refusal override, low confidence,
+        agent-bound prompt, actionable intent, parse failure).
+        ``dispatch_speculative`` retains the legacy semantics for
+        callers that don't need draft-tier classification.
 
         Returns:
             {
@@ -271,7 +408,31 @@ class SpeculativeDispatcher:
 
     # ─── Draft-first dispatch (Qwen3.5-0.8B standby + delegate signal) ───
 
-    def dispatch_draft_first(self, prompt: str, user_id: str, prompt_id: str,
+    def dispatch_draft_first(self, prompt: str, user_id: str,
+                             prompt_id: Optional[str] = None,
+                             goal_id: str = None, goal_type: str = 'general',
+                             node_id: str = None,
+                             agent_persona: Optional[str] = None,
+                             preferred_lang: str = 'en',
+                             user_pref: str = 'auto',
+                             agent_bound: bool = False) -> dict:
+        # Tag every LLM call routed through this method (the draft
+        # classifier + any nested expert reroute) as ``draft.classify``
+        # in llm_outbound.jsonl.  The decorator can't be applied to a
+        # bound method's def line directly without import gymnastics
+        # at module-load time, so we use the context manager inline.
+        # See ``core.llm_outbound_logger.with_source`` rationale.
+        from core.llm_outbound_logger import source_context as _src
+        with _src('draft.classify'):
+            return self._dispatch_draft_first_impl(
+                prompt, user_id, prompt_id=prompt_id, goal_id=goal_id,
+                goal_type=goal_type, node_id=node_id,
+                agent_persona=agent_persona, preferred_lang=preferred_lang,
+                user_pref=user_pref, agent_bound=agent_bound,
+            )
+
+    def _dispatch_draft_first_impl(self, prompt: str, user_id: str,
+                             prompt_id: Optional[str] = None,
                              goal_id: str = None, goal_type: str = 'general',
                              node_id: str = None,
                              agent_persona: Optional[str] = None,
@@ -351,9 +512,41 @@ class SpeculativeDispatcher:
                 'delegate': 'none', 'error': gate_error, 'expert_pending': False,
             }
 
-        # ── 2. Dispatch the draft with the classifier prompt ──
+        # ── 2. Load recent conversation history (best-effort, non-fatal) ──
+        # Single source of truth — same seed_autogen_from_shared_history the
+        # autogen GroupChat uses.  Without this the draft sees each turn as
+        # first-contact and emits generic greetings for follow-ups (witnessed
+        # 2026-05-09 09:35 — user asked about WhatsApp at 09:34 then "what's
+        # happening?" at 09:35; draft replied with a generic "Nothing
+        # unusual…" because it had no memory of the WhatsApp turn 60s prior).
+        # Cap at 4 messages — the 0.8B context budget can't fit more without
+        # crowding out the answering rules + JSON schema.
+        recent_turns: List[Dict] = []
+        try:
+            if seed_autogen_from_shared_history is None:
+                raise ImportError(
+                    "shared_history.seed_autogen_from_shared_history "
+                    "not importable in this environment")
+            recent_turns = seed_autogen_from_shared_history(
+                user_id, max_messages=4) or []
+            # NO dedup against the current prompt — users genuinely
+            # repeat themselves (rephrasing, asking again, "hi" / "hi"
+            # in casual back-and-forth).  Dropping a recent turn just
+            # because its text matches the current prompt would silently
+            # lose legitimate conversation history.  If the writer hook
+            # in get_response_group / chatbot_routes persisted the
+            # current turn before this dispatch ran, the prompt may
+            # appear twice in the LLM's input — that's the correct
+            # natural-language signal ("user said X, then said X again")
+            # and the model should treat it as such.
+        except Exception as _hist_err:
+            logger.debug(f"draft history load failed: {_hist_err}")
+            recent_turns = []
+
+        # ── 3. Dispatch the draft with the classifier prompt ──
         draft_prompt = self._build_draft_classifier_prompt(
-            prompt, agent_persona=agent_persona, preferred_lang=preferred_lang)
+            prompt, agent_persona=agent_persona, preferred_lang=preferred_lang,
+            recent_turns=recent_turns)
         start = time.time()
         draft_raw = self._dispatch_to_model(
             draft_model, draft_prompt, user_id, prompt_id, goal_type, goal_id)
@@ -363,8 +556,22 @@ class SpeculativeDispatcher:
         # ── 3. Parse envelope + record draft interaction ──
         parsed = self._parse_draft_envelope(draft_raw)
         draft_reply = parsed.get('reply') or draft_raw.strip()[:500]
+        # Track whether the envelope parsed at all — an empty parsed dict
+        # means we fell through to the delegate='local' default below,
+        # which is materially different from the model emitting an
+        # explicit 'local' decision.  Stamp the reason for downstream
+        # telemetry / continual-learning before any guard runs.
+        parse_failed = not parsed
         delegate = parsed.get('delegate', 'local')  # default on parse fail
         confidence = float(parsed.get('confidence') or 0.0)
+        # Canonical reason value — refined by each guard below.  Starts
+        # at PARSE_FAILURE when the envelope didn't parse, otherwise the
+        # baseline CLASSIFIER_DELEGATE.  Only meaningful when we end up
+        # in the delegate in ('local', 'hive') branch — None otherwise.
+        escalation_reason: Optional[EscalationReason] = (
+            EscalationReason.PARSE_FAILURE if parse_failed
+            else EscalationReason.CLASSIFIER_DELEGATE
+        )
 
         # REFUSAL GUARD: the draft is the first-responder role, NOT the
         # authority on system capability. Any reply that asserts the
@@ -392,6 +599,7 @@ class SpeculativeDispatcher:
             draft_reply = _REFUSAL_STANDBY_REPLY
             delegate = 'local'
             refusal_overridden = True
+            escalation_reason = EscalationReason.REFUSAL_OVERRIDE
 
         # REASONING-QUALITY GUARD: an unsure "none" is not good enough to
         # ship as the final answer. Promote it to "local" so an expert
@@ -407,6 +615,7 @@ class SpeculativeDispatcher:
                 f"{_DRAFT_CONFIDENCE_FLOOR}) → escalating to local verifier"
             )
             delegate = 'local'
+            escalation_reason = EscalationReason.LOW_CONFIDENCE
 
         # AGENT-BINDING GUARD: when the caller bound this turn to a
         # specific agent (prompt_id resolves to a real agent on disk,
@@ -431,6 +640,68 @@ class SpeculativeDispatcher:
                 prompt_id,
             )
             delegate = 'local'
+            escalation_reason = EscalationReason.AGENT_BOUND
+
+        # ACTIONABLE-INTENT GUARD: when the draft's own classifier
+        # surfaces an actionable intent flag (channel_connect,
+        # is_create_agent, language_change), answering in-band would
+        # orphan the action — there is no way to invoke the matching
+        # tool (Connect_Channel / Create_Agent) from the casual draft
+        # path because casual_conv=True skips the full tool registry
+        # in hart_intelligence_entry.get_ans (see the is_first=True
+        # branch).  Promote delegate=none → 'local' so the expert
+        # turn binds the full registry — Connect_Channel for
+        # channel-add intents, Create_Agent for agent-build intents —
+        # and actually fires the tool the LLM would otherwise have
+        # described in free-form text.
+        #
+        # The draft's reply is also replaced with the standby (same
+        # rationale as REFUSAL GUARD above): the draft on the
+        # casual path has no tool access, so any in-band reply on
+        # an actionable-intent turn is a verified-signal anti-pattern
+        # — it claims action while taking none.  The expert reply
+        # replaces the standby via the existing speculation_id
+        # bubble-replacement path (#204 already shipped).
+        # Helper: treat the sentinel string 'none' as "no intent", matching
+        # the classifier's own contract (it returns 'none' for *_intent /
+        # memory_query when there's no actionable intent).  Without this,
+        # the literal 'none'.strip() evaluates truthy and the guard fires
+        # on every casual turn → every reply gets replaced with the
+        # "Let me check that for you…" placeholder, and the user never
+        # receives the actual answer because the expert background task
+        # has nothing real to refine (live evidence 2026-05-11 22:36:41
+        # request 897fc534 — speculation_id 9a418ac4-1eb, message 'strange').
+        def _intent_set(value) -> bool:
+            if not value or value is False:
+                return False
+            v = str(value).strip().lower()
+            return bool(v) and v != 'none'
+
+        if delegate == 'none' and (
+            _intent_set(parsed.get('channel_connect'))
+            or parsed.get('is_create_agent')
+            or _intent_set(parsed.get('language_change'))
+            or _intent_set(parsed.get('invite_intent'))
+            or _intent_set(parsed.get('join_room_intent'))
+            or _intent_set(parsed.get('memory_query'))
+        ):
+            logger.info(
+                "draft-first: actionable intent flag set "
+                "(channel_connect=%r, is_create_agent=%r, "
+                "language_change=%r, invite_intent=%r, "
+                "join_room_intent=%r, memory_query=%r) — escalating "
+                "delegate=none → 'local' so the expert tool registry "
+                "handles the turn.",
+                parsed.get('channel_connect'),
+                parsed.get('is_create_agent'),
+                parsed.get('language_change'),
+                parsed.get('invite_intent'),
+                parsed.get('join_room_intent'),
+                parsed.get('memory_query'),
+            )
+            draft_reply = _REFUSAL_STANDBY_REPLY
+            delegate = 'local'
+            escalation_reason = EscalationReason.ACTIONABLE_INTENT
 
         # Non-Latin languages skip draft entirely (hart_intelligence_entry.py)
         # so this code path is only reached for English/Latin-script languages.
@@ -466,10 +737,21 @@ class SpeculativeDispatcher:
         except Exception:
             pass  # telemetry must never break the hot path
 
+        # When the draft path's net effect is "draft answered, no
+        # escalation" (delegate=='none' and none of the guards fired),
+        # the escalation_reason is meaningless — clear it so the
+        # WorldModelBridge sees a clean "this draft was the final
+        # answer" record.
+        recorded_reason = (
+            escalation_reason.value if delegate in ('local', 'hive')
+            else None
+        )
         self._record_interaction_safely(
+            user_pref=user_pref,
             user_id=user_id, prompt_id=prompt_id, prompt=prompt,
             response=draft_reply, model_id=draft_model.model_id,
             latency_ms=draft_latency_ms, node_id=node_id, goal_id=goal_id,
+            escalation_reason=recorded_reason,
         )
 
         # ── 4. Schedule expert if the draft self-delegated ──
@@ -488,6 +770,8 @@ class SpeculativeDispatcher:
                 origin_model_id=draft_model.model_id,
                 origin_model_role='draft_model',
                 delegate=delegate,
+                escalation_reason=escalation_reason,
+                user_pref=user_pref,
             )
             # When the user explicitly asked for `hive_preferred` AND the
             # draft self-delegated to hive, also fire a best-effort MoE
@@ -544,6 +828,11 @@ class SpeculativeDispatcher:
             # tell a hive fusion consult was fired in background.  Legacy
             # callers that don't read this field are unaffected.
             'hive_consult_scheduled': hive_consult_scheduled,
+            # Additive field: which guard promoted this turn to expert
+            # (or ``None`` when the draft answered as final).  Canonical
+            # values come from ``EscalationReason`` (see
+            # ``integrations.agent_engine.escalation_reasons``).
+            'escalation_reason': recorded_reason,
             'latency_ms': round(draft_latency_ms, 1),
             'energy_kwh': round(
                 self._registry.get_total_energy_kwh(hours=0.01), 6),
@@ -613,6 +902,7 @@ class SpeculativeDispatcher:
     def _build_draft_classifier_prompt(
         self, user_prompt: str, agent_persona: Optional[str] = None,
         preferred_lang: str = 'en',
+        recent_turns: Optional[List[Dict]] = None,
     ) -> str:
         """Wrap the user prompt with the draft-first classifier instruction.
 
@@ -624,6 +914,14 @@ class SpeculativeDispatcher:
         so the draft's reply is in the voice of the custom / system agent
         the user is talking to instead of a generic first-responder. Used
         for the Path-2 system-agent case (e.g. Nunba personality agent).
+
+        If ``recent_turns`` is provided, prior conversation context is
+        rendered as a "Recent conversation" block before the current user
+        prompt so the draft can answer follow-ups in context (e.g. user
+        asks "what's happening?" 60s after asking about WhatsApp — without
+        history the draft would treat each turn as first-contact and emit
+        a generic greeting).  Capped at 4 turns to fit the 0.8B context
+        budget; oldest first; long messages are truncated to 400 chars.
 
         Owns ONLY prompt construction — no I/O, no side effects.
         """
@@ -687,6 +985,35 @@ class SpeculativeDispatcher:
             if cap_summary else ""
         )
 
+        # Recent conversation context — single source via
+        # seed_autogen_from_shared_history (the autogen path uses the same
+        # call), formatted into a flat User:/Assistant: transcript so the
+        # 0.8B can read follow-ups in context.  Capped at 4 turns + 400
+        # chars/turn to fit the draft's context budget.
+        history_block = ""
+        if recent_turns:
+            _hist_lines = []
+            for _turn in recent_turns[-4:]:
+                _role = _turn.get('role') or ''
+                _content = (_turn.get('content') or '').strip()
+                if not _content:
+                    continue
+                if len(_content) > 400:
+                    _content = _content[:400] + '…'
+                if _role == 'user':
+                    _hist_lines.append(f"User: {_content}")
+                elif _role == 'assistant':
+                    _hist_lines.append(f"Assistant: {_content}")
+            if _hist_lines:
+                history_block = (
+                    "Recent conversation (oldest first; use this to "
+                    "interpret the user's current message in context — "
+                    "follow-ups like 'what's happening?' or 'why?' refer "
+                    "back to these turns):\n"
+                    + "\n".join(_hist_lines)
+                    + "\n\n"
+                )
+
         return (
             persona_block
             + lang_block
@@ -746,7 +1073,8 @@ class SpeculativeDispatcher:
             "runs.\n"
             "- Refusals are not your call.  If you ever feel the urge to "
             "refuse: pick a standby instead and delegate.\n\n"
-            f"User: {user_prompt}\n\n"
+            + history_block
+            + f"User: {user_prompt}\n\n"
             "Respond with ONE JSON object on a single line and NOTHING else:\n"
             '{"reply": "<your short reply to the user, 1-3 sentences>", '
             '"delegate": "none" OR "local" OR "hive", '
@@ -756,6 +1084,9 @@ class SpeculativeDispatcher:
             '"is_create_agent": true OR false, '
             '"channel_connect": "<channel name or empty string>", '
             '"language_change": "<ISO 639-1 code or empty string>", '
+            '"invite_intent": "<short context if user wants invite link, or empty>", '
+            '"join_room_intent": "<platform + room/url if user wants agent to join, or empty>", '
+            '"memory_query": "<short context if user asks about past conversations, or empty>", '
             '"reason": "<why you chose this delegate value>"}\n\n'
             # ── delegate ────────────────────────────────────────────────
             "delegate: Use \"none\" for greetings, small-talk, factual "
@@ -802,7 +1133,40 @@ class SpeculativeDispatcher:
             "Otherwise use an empty string \"\". This overrides the "
             "session's preferred_lang so the main LLM responds in "
             "the requested language and TTS routes to an engine that "
-            "supports it."
+            "supports it.\n\n"
+            # ── invite_intent ───────────────────────────────────────────
+            "invite_intent: if the user is asking to invite, share, or "
+            "refer a friend / colleague / family member to Nunba (e.g. "
+            "\"invite a friend\", \"give me an invite link\", \"share "
+            "Nunba with my colleague\", \"how do I refer people\"), put "
+            "a short freeform context here (e.g. \"work friend\" or "
+            "\"family\") — empty string is fine for a generic shareable "
+            "link. Otherwise use an empty string \"\". This routes the "
+            "turn to the Invite_Friend tool.\n\n"
+            # ── join_room_intent ────────────────────────────────────────
+            "join_room_intent: if the user is asking the AI to JOIN an "
+            "external room / channel / meeting / group as a co-pilot, "
+            "note-taker, or participant (e.g. \"join my Discord audio "
+            "room\", \"attend my Teams meet\", \"take notes in the "
+            "WhatsApp family group\", \"co-pilot my Slack channel\"), "
+            "put a short \"<platform> <room or url>\" string here "
+            "(e.g. \"discord https://discord.com/channels/123/456\"). "
+            "Otherwise use an empty string \"\". This routes the turn "
+            "to the Join_External_Room tool, which always gates on "
+            "consent and announces the agent's presence in the room.\n\n"
+            # ── memory_query ────────────────────────────────────────────
+            "memory_query: if the user is asking about something they "
+            "discussed previously, what was said in past conversations, "
+            "or asking the assistant to recall earlier context (e.g. "
+            "\"what did we speak 2 days back\", \"do you remember when "
+            "I asked about X\", \"what was that thing we discussed last "
+            "week\", \"recall my previous question on Y\", \"what did I "
+            "tell you about my project\"), put a short freeform context "
+            "string here describing the topic / time window (e.g. "
+            "\"conversations from last 2 days\", \"earlier project "
+            "discussion\"). Otherwise use an empty string \"\". This "
+            "routes the turn to the recall_memory tool which searches "
+            "the memory graph with optional time filters."
         )
 
     def _track_call_telemetry(
@@ -831,12 +1195,21 @@ class SpeculativeDispatcher:
         origin_model_id: str,
         origin_model_role: str = 'fast_model',
         delegate: Optional[str] = None,
+        escalation_reason: Optional['EscalationReason'] = None,
+        user_pref: str = 'auto',
     ) -> bool:
         """Schedule the expert-improvement task in the background pool.
 
         Centralizes the registration into self._active + thread submit so
         both dispatch_draft_first and dispatch_speculative share one code
         path. Returns True if the expert was actually scheduled.
+
+        ``escalation_reason`` is purely observability metadata: it gets
+        stamped into ``self._active[speculation_id]`` so admin /diag and
+        telemetry can ask "why was this turn escalated?" without
+        re-deriving the heuristic.  Optional + defaults to None so the
+        legacy dispatch_speculative call site (which has no draft to
+        derive a reason from) needs no change.
 
         Guards:
         - no expert model → nothing to schedule
@@ -858,9 +1231,21 @@ class SpeculativeDispatcher:
                 'prompt_id': prompt_id,
                 'goal_id': goal_id,
                 'started_at': time.time(),
+                # #224 — propagate so _run_collapsed_expert_path can gate
+                # record_interaction on local_only without re-plumbing the
+                # parameter through 3 layers of background-task submission.
+                'user_pref': user_pref,
             }
             if delegate is not None:
                 entry['delegate'] = delegate
+            if escalation_reason is not None:
+                # Store the canonical string value (Enum's str inheritance
+                # makes this safe for JSON / SSE round-trip).
+                entry['escalation_reason'] = (
+                    escalation_reason.value
+                    if hasattr(escalation_reason, 'value')
+                    else str(escalation_reason)
+                )
             self._active[speculation_id] = entry
 
         self._expert_pool.submit(
@@ -1073,12 +1458,29 @@ class SpeculativeDispatcher:
             logger.debug(f"[hive_consult] pool submit failed: {e}")
             return False
 
-    def _record_interaction_safely(self, **kwargs) -> None:
+    def _record_interaction_safely(self, user_pref: str = 'auto', **kwargs) -> None:
         """Feed an interaction into HevolveAI via WorldModelBridge. Never
         raises — continual learning is best-effort and the chat path must
         not break if HevolveAI is offline or the bridge is in circuit-open
         mode. WorldModelBridge already handles guardrail + secret redaction
-        internally."""
+        internally.
+
+        #224 mode gate: when the user is in `local_only` mode, do NOT
+        touch WorldModelBridge at all.  The bridge's lazy first-instantiation
+        triggers a SHA-256 scan of the hevolveai package (mitigated by
+        the world_model_bridge.py short-circuit, but still wasteful work
+        for a user who explicitly opted out of hive participation).
+        Treating mode as authoritative also matches the user's design
+        intent: HevolveAI is loaded on-demand for hive/hybrid modes,
+        and is structurally not a prerequisite for local-only operation.
+        """
+        # Local-only users have opted out of contributing to the hive's
+        # learning loop.  Skipping the call here keeps WorldModelBridge
+        # uninitialised for them — zero cost, zero side effects.  Mode
+        # switch (local→hive) is picked up on the very next chat turn
+        # because user_pref is per-request, not cached on the dispatcher.
+        if user_pref == 'local_only':
+            return
         try:
             from integrations.agent_engine.world_model_bridge import get_world_model_bridge
             bridge = get_world_model_bridge()
@@ -1087,56 +1489,32 @@ class SpeculativeDispatcher:
             logger.debug(f"record_interaction skipped: {e}")
 
     # ─── Background expert task ───
+    #
+    # Single path: expert (local langchain pipeline or hive peer) takes
+    # the ORIGINAL turn directly.  No "improve this draft" wrapper, no
+    # similarity gate — when the expert is the actual expert (full tool
+    # registry locally, 27B or fine-tuned on hive), its reply IS the
+    # answer.  The standby (fast_response) was already delivered by the
+    # draft-first path; this task replaces it via the existing
+    # speculation_id bubble-replacement channel on _deliver_expert_response.
 
     def _expert_background_task(self, speculation_id: str, original_prompt: str,
                                 fast_response: str, expert_model, user_id: str,
                                 prompt_id: str, goal_id: str, goal_type: str):
-        """Background: budget check → expert dispatch → deliver if improved."""
+        """Background: dispatch expert → deliver (or fall through to draft
+        standby).  Outer try/finally owns the shared invariants —
+        circuit-breaker gate, exception swallowing, ``_active`` cleanup —
+        so the helper can focus on dispatch + delivery semantics.
+        """
         try:
             # GUARDRAIL: circuit breaker (check again — may have been halted)
             from security.hive_guardrails import HiveCircuitBreaker
             if HiveCircuitBreaker.is_halted():
                 return
 
-            expert_prompt = self._build_expert_prompt(original_prompt, fast_response)
-
-            start = time.time()
-            expert_response = self._dispatch_to_model(
-                expert_model, expert_prompt, user_id, prompt_id,
-                goal_type, goal_id)
-            elapsed_ms = (time.time() - start) * 1000
-
-            # GUARDRAIL: energy tracking
-            self._registry.record_energy(expert_model.model_id, elapsed_ms)
-            self._registry.record_latency(expert_model.model_id, elapsed_ms)
-
-            # Check if expert meaningfully improved
-            if self._is_meaningful_improvement(fast_response, expert_response):
-                # GUARDRAIL: constitutional check on expert output
-                from security.hive_guardrails import ConstitutionalFilter
-                passed, reason = ConstitutionalFilter.check_prompt(expert_response)
-                if passed:
-                    self._deliver_expert_response(
-                        user_id, prompt_id, speculation_id, expert_response)
-                    with self._lock:
-                        self._results[speculation_id] = {
-                            'response': expert_response,
-                            'model': expert_model.model_id,
-                            'latency_ms': round(elapsed_ms, 1),
-                            'improved': True,
-                        }
-                        self._evict_old_results()
-                else:
-                    logger.warning(f"Expert response blocked by guardrail: {reason}")
-            else:
-                with self._lock:
-                    self._results[speculation_id] = {
-                        'response': fast_response,
-                        'model': expert_model.model_id,
-                        'latency_ms': round(elapsed_ms, 1),
-                        'improved': False,
-                    }
-                    self._evict_old_results()
+            self._run_collapsed_expert_path(
+                speculation_id, original_prompt, fast_response,
+                expert_model, user_id, prompt_id, goal_id, goal_type)
 
         except Exception as e:
             logger.debug(f"Expert background task failed for {speculation_id}: {e}")
@@ -1144,39 +1522,247 @@ class SpeculativeDispatcher:
             with self._lock:
                 self._active.pop(speculation_id, None)
 
-    # ─── Helpers ───
+    def _run_collapsed_expert_path(self, speculation_id: str,
+                                   original_prompt: str, fast_response: str,
+                                   expert_model, user_id: str, prompt_id: str,
+                                   goal_id: str, goal_type: str):
+        """Collapsed path: expert takes the ORIGINAL turn through the full
+        langchain pipeline (local) or the hive endpoint (remote).  No
+        'improve this draft' wrapper.  Reuses ``_dispatch_expert_langchain``
+        for routing + ``_deliver_expert_response`` for SSE/TTS fan-out.
+        """
+        start = time.time()
+        expert_response = self._dispatch_expert_langchain(
+            expert_model, original_prompt, user_id, prompt_id,
+            goal_type, goal_id)
+        elapsed_ms = (time.time() - start) * 1000
 
-    def _build_expert_prompt(self, original_prompt: str, fast_response: str) -> str:
-        """Augment prompt: expert sees original task + fast agent's output."""
-        return (
-            f"You are an expert reviewer. A fast agent on a hive compute node "
-            f"has already responded. Review and improve if needed.\n\n"
-            f"## Original Request\n{original_prompt}\n\n"
-            f"## Fast Agent's Response\n{fast_response}\n\n"
-            f"## Your Task\n"
-            f"Improve the response: fix errors, add missing details, improve clarity.\n"
-            f"If the response is already excellent, respond with: {_RESPONSE_ADEQUATE}\n"
-            f"Every output must be constructive towards humanity's benefit."
+        # GUARDRAIL: energy + latency telemetry (same instrumentation as
+        # the legacy path — the rollout flip must not lose these metrics).
+        self._registry.record_energy(expert_model.model_id, elapsed_ms)
+        self._registry.record_latency(expert_model.model_id, elapsed_ms)
+
+        # Empty response → the draft standby stays as the final reply.
+        # The user already saw it; nothing to deliver.  Record the
+        # _results entry so admin /diag can tell the expert ran and
+        # returned empty (vs never ran).
+        if not expert_response or not expert_response.strip():
+            logger.debug(
+                "collapsed expert returned empty for %s; "
+                "draft standby remains the final reply", speculation_id)
+            with self._lock:
+                self._results[speculation_id] = {
+                    'response': fast_response,
+                    'model': expert_model.model_id,
+                    'latency_ms': round(elapsed_ms, 1),
+                    'improved': False,
+                }
+                self._evict_old_results()
+            return
+
+        # GUARDRAIL: constitutional check on expert output before delivery
+        from security.hive_guardrails import ConstitutionalFilter
+        passed, reason = ConstitutionalFilter.check_prompt(expert_response)
+        if not passed:
+            logger.warning(
+                "collapsed expert response blocked by guardrail: %s",
+                reason)
+            return
+
+        # Unconditional delivery: the expert is THE expert here, not a
+        # "maybe improvement".  Bubble-replace the standby via the
+        # existing speculation_id channel (SSE + TTS — see
+        # _deliver_expert_response for the dual-channel contract).
+        self._deliver_expert_response(
+            user_id, prompt_id, speculation_id, expert_response)
+
+        # Feed continual learning.  Stamp escalation_reason from the
+        # _active entry so distillation can weight refusal-overridden
+        # turns differently from clean classifier-delegate turns.
+        with self._lock:
+            active_entry = dict(self._active.get(speculation_id, {}))
+        served_by = (
+            'hive_langchain_bg' if not expert_model.is_local
+            else 'local_langchain_bg'
+        )
+        self._record_interaction_safely(
+            # #224 — honor user_pref stashed by _schedule_expert_background;
+            # local_only users skip WorldModelBridge entirely (no HevolveAI
+            # touch on the expert background path either).  Falling back
+            # to 'auto' preserves current behavior for any legacy active
+            # entry that pre-dated the field.
+            user_pref=active_entry.get('user_pref', 'auto'),
+            user_id=user_id, prompt_id=prompt_id,
+            prompt=original_prompt, response=expert_response,
+            model_id=expert_model.model_id, latency_ms=elapsed_ms,
+            goal_id=goal_id,
+            escalation_reason=active_entry.get('escalation_reason'),
         )
 
-    def _is_meaningful_improvement(self, fast_response: str,
-                                    expert_response: str) -> bool:
-        """Check if expert actually improved on the fast response."""
-        if not expert_response:
-            return False
-        if _RESPONSE_ADEQUATE in expert_response:
-            return False
-        # Simple word-overlap similarity
-        fast_words = set(fast_response.lower().split())
-        expert_words = set(expert_response.lower().split())
-        if not fast_words or not expert_words:
-            return bool(expert_response.strip())
-        overlap = len(fast_words & expert_words)
-        similarity = overlap / max(len(fast_words | expert_words), 1)
-        return similarity < _SIMILARITY_THRESHOLD
+        with self._lock:
+            self._results[speculation_id] = {
+                'response': expert_response,
+                'model': expert_model.model_id,
+                'latency_ms': round(elapsed_ms, 1),
+                'improved': True,
+                'served_by': served_by,
+            }
+            self._evict_old_results()
+
+    def _dispatch_expert_langchain(self, model, prompt: str, user_id: str,
+                                   prompt_id: str, goal_type: str,
+                                   goal_id: Optional[str]) -> str:
+        """Send the expert turn through the right transport for its tier.
+
+        - ``model.is_local=True``:  route through the FULL HARTOS /chat
+          pipeline (agent loading, autogen GroupChat, full tool registry)
+          so actionable-intent / agent-bound turns actually fire their
+          tools.
+            * Bundled mode (NUNBA_BUNDLED / sys.frozen): in-process Flask
+              ``test_client`` — port 6777 is not bound in bundled Nunba.
+            * Non-bundled: HTTP POST to ``HEVOLVE_BASE_URL`` (or the
+              port_registry-resolved backend).
+          Re-entry is prevented by ``speculative=False, draft_first=False``
+          in the payload — the inner /chat handler reads these and skips
+          the dispatcher.
+
+        - ``model.is_local=False`` (hive-served expert, registered by
+          ``HiveExpertDiscovery``):  OpenAI-compatible POST to
+          ``{base_url}/chat/completions`` with the registered auth token.
+          The hive peer's 27B / fine-tuned model takes the turn directly.
+
+        Returns the response string, or ``''`` on any failure — caller
+        falls back to ``fast_response`` so the user always sees the
+        draft's standby.
+        """
+        if model is None:
+            return ''
+
+        # ── Hive path: OpenAI-compatible POST to peer base_url ──
+        if not getattr(model, 'is_local', True):
+            cfg = getattr(model, 'config_list_entry', {}) or {}
+            base_url = (cfg.get('base_url') or '').rstrip('/')
+            api_key = cfg.get('api_key') or ''
+            inner_model_id = cfg.get('model') or model.model_id
+            if not base_url:
+                logger.debug(
+                    "hive expert %s missing base_url — cannot dispatch",
+                    model.model_id)
+                return ''
+            try:
+                import requests as _req
+                headers = (
+                    {'Authorization': f'Bearer {api_key}'} if api_key else {})
+                resp = _req.post(
+                    f'{base_url}/chat/completions',
+                    headers=headers,
+                    json={
+                        'model': inner_model_id,
+                        'messages': [{'role': 'user', 'content': prompt}],
+                        'max_tokens': 1500,
+                        'temperature': 0.7,
+                    },
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    data = resp.json() or {}
+                    choices = data.get('choices') or []
+                    if choices:
+                        msg = (choices[0] or {}).get('message') or {}
+                        return msg.get('content') or ''
+                else:
+                    logger.debug(
+                        "hive expert %s returned HTTP %s",
+                        model.model_id, resp.status_code)
+            except Exception as e:
+                logger.debug(
+                    "hive expert dispatch failed (%s): %s",
+                    model.model_id, e)
+            return ''
+
+        # ── Local path: full HARTOS /chat pipeline ──
+        # prompt_id: ONLY include when the caller gave a real on-disk
+        # agent identifier.  NEVER synthesise from request_id, goal_id,
+        # node_id, or speculation_id — the inner /chat handler treats
+        # any non-empty prompt_id as a literal filename
+        # (``prompts/{prompt_id}.json``) and ``_autonomous_gather_info``
+        # will mint a duplicate agent JSON keyed by whatever synthetic
+        # string it receives.  Live regressions both shapes have caused:
+        #   * 2026-05-12 request 66c63859-… spawned a phantom
+        #     ``prompts/66c63859-…json`` (request-id-derived).
+        #   * Goal-driven daemon dispatch with goal_id='abc-deadbeef'
+        #     used to send ``prompt_id='general_abc-dead'`` — the inner
+        #     /chat then tries to load ``prompts/general_abc-dead.json``,
+        #     fails, and mints yet another agent under that key.
+        # Goal/observability identifiers belong in ``goal_id``/
+        # ``goal_type`` payload fields (which the inner /chat reads as
+        # context metadata, not as a routing key), not in prompt_id.
+        payload = {
+            'user_id': user_id,
+            'prompt': prompt,
+            'create_agent': True,
+            'autonomous': True,
+            'casual_conv': False,
+            'model_config': model.to_config_list(),
+            # Hard no-reentry: inner /chat reads these and skips the
+            # dispatcher entirely so we never recursively re-enter.
+            'speculative': False,
+            'draft_first': False,
+        }
+        if prompt_id:
+            payload['prompt_id'] = prompt_id
+        # goal_id / goal_type carry forward as metadata for telemetry +
+        # budget tracking — separate from prompt_id (routing).
+        if goal_id:
+            payload['goal_id'] = goal_id
+        if goal_type and goal_type != 'general':
+            payload['goal_type'] = goal_type
+
+        import sys as _sys
+        _bundled = bool(
+            os.environ.get('NUNBA_BUNDLED')
+            or getattr(_sys, 'frozen', False)
+        )
+        if _bundled:
+            try:
+                # Late import — keeps module-load time independent of
+                # hart_intelligence_entry's heavy boot graph.  In bundled
+                # Nunba this is cheap (already in sys.modules by the
+                # time a chat turn fires).
+                from hart_intelligence_entry import app as _app  # type: ignore
+                with _app.test_client() as client:
+                    resp = client.post('/chat', json=payload)
+                    if resp.status_code == 200:
+                        data = resp.get_json() or {}
+                        return data.get('response') or ''
+                    logger.debug(
+                        "local expert /chat returned %s in bundled mode",
+                        resp.status_code)
+            except Exception as e:
+                logger.debug(
+                    "local expert bundled dispatch failed: %s", e)
+            return ''
+
+        # Non-bundled: HTTP POST to the configured backend.
+        try:
+            import requests as _req
+            base = os.environ.get(
+                'HEVOLVE_BASE_URL',
+                f'http://localhost:{get_port("backend")}',
+            )
+            resp = _req.post(f'{base}/chat', json=payload, timeout=60)
+            if resp.status_code == 200:
+                return (resp.json() or {}).get('response') or ''
+            logger.debug(
+                "local expert /chat HTTP returned %s", resp.status_code)
+        except Exception as e:
+            logger.debug("local expert HTTP dispatch failed: %s", e)
+        return ''
+
+    # ─── Helpers ───
 
     def _dispatch_to_model(self, model: 'ModelBackend', prompt: str,
-                           user_id: str, prompt_id: str,
+                           user_id: str, prompt_id: Optional[str],
                            goal_type: str, goal_id: str = None) -> str:
         """Send prompt to a specific model via /chat endpoint with config override.
 
@@ -1186,12 +1772,19 @@ class SpeculativeDispatcher:
         upstream. The outer chat route triggered us, and that's where the
         decision to speculate was made.
 
+        ``prompt_id`` is intentionally Optional and only included in the
+        payload when truthy — see ``_dispatch_expert_langchain`` for the
+        same invariant + the live regression that motivated it.
+
         In bundled/in-process mode (Nunba desktop), uses Flask test_client()
         instead of HTTP — port 6777 is never bound in bundled mode.
         """
+        # prompt_id: only forward when the caller gave a real one;
+        # goal_id / goal_type travel separately as observability metadata.
+        # See ``_dispatch_expert_langchain`` for the rationale + live
+        # regression that motivated this invariant.
         payload = {
             'user_id': user_id,
-            'prompt_id': f'{goal_type}_{goal_id[:8]}' if goal_id else prompt_id,
             'prompt': prompt,
             'create_agent': True,
             'autonomous': True,
@@ -1201,6 +1794,12 @@ class SpeculativeDispatcher:
             'speculative': False,
             'draft_first': False,
         }
+        if prompt_id:
+            payload['prompt_id'] = prompt_id
+        if goal_id:
+            payload['goal_id'] = goal_id
+        if goal_type and goal_type != 'general':
+            payload['goal_type'] = goal_type
 
         # Bundled mode: call the model's llama-server directly on its port.
         # Do NOT use Flask test_client('/chat') — that re-enters the full
@@ -1224,16 +1823,34 @@ class SpeculativeDispatcher:
                     except Exception:
                         _port = 8081  # draft default
                 import requests as _req
+                # Manual log_outbound call here because the
+                # ``requests`` library bypasses the global httpx hook
+                # installed in ``core.llm_outbound_logger.install()``.
+                # The draft port (typically :8081) isn't even in the
+                # httpx hook's scope, so this is the only place that
+                # draft-classifier prompts get a record.
+                _draft_body = {
+                    'model': 'llama',
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'max_tokens': 500,
+                    'temperature': 0.7,
+                }
+                _draft_start = time.time()
                 resp = _req.post(
                     f'http://127.0.0.1:{_port}/v1/chat/completions',
-                    json={
-                        'model': 'llama',
-                        'messages': [{'role': 'user', 'content': prompt}],
-                        'max_tokens': 500,
-                        'temperature': 0.7,
-                    },
+                    json=_draft_body,
                     timeout=15,
                 )
+                try:
+                    from core.llm_outbound_logger import log_outbound as _log_ob
+                    _log_ob(
+                        _draft_body,
+                        source='dispatcher.draft',
+                        response_status=resp.status_code,
+                        latency_ms=round((time.time() - _draft_start) * 1000, 1),
+                    )
+                except Exception:
+                    pass
                 if resp.status_code == 200:
                     data = resp.json()
                     if 'choices' in data:

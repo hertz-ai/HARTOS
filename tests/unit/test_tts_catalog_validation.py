@@ -1,4 +1,5 @@
-"""Contract tests for #58 Scope-1: catalog-canonical TTS + ingest validation.
+"""Contract tests for #58 Scope-1 + Scope-2: catalog-canonical TTS,
+ingest validation, and reflection-dispatch path.
 
 Pins what the ingest path must do:
   * `_validate_engine_caps` accepts the two valid shapes (tool_module
@@ -6,13 +7,21 @@ Pins what the ingest path must do:
     malformed combination.
   * `populate_tts_catalog` removes invalid entries from the catalog at
     boot with a logged WARNING — fail-fast at ingest, not at synth time.
-  * Reflection-only entries are explicitly rejected in Scope-1 because
-    the dispatcher (#58 Scope-2) hasn't landed yet; admin sees the
-    error immediately, not silence at first synth.
+  * Reflection-only entries SURVIVE ingest after #58 Scope-2 (2026-05-07
+    — `gpu_worker._dispatch_catalog_id` provides the runtime path).
+    They are excluded from the ENGINE_REGISTRY snapshot because
+    TTSEngineSpec carries `tool_module` as a non-optional dispatch
+    handle for the existing call sites; the catalog dispatches them
+    via `--catalog-id` directly.
   * `_refresh_engine_registry_from_catalog` rebuilds ENGINE_REGISTRY in
     place after populate runs, snapshotting post-upsert catalog state.
   * Existing tool_module-shaped entries continue to round-trip through
     `_catalog_entry_to_spec` exactly as before.
+
+Cross-reference: the reflection dispatcher's runtime contract has its
+own test file at `tests/unit/test_gpu_worker_reflection_dispatch.py`
+covering `_normalize_to_wav_file` + `_build_reflection_callbacks` +
+`--catalog-id` exit codes.
 """
 import logging
 import sys
@@ -219,7 +228,7 @@ def fresh_catalog():
 
 class TestPopulateRejectsInvalidEntries:
     def test_invalid_entry_seeded_pre_boot_is_rejected_with_log(
-        self, fresh_catalog, caplog,
+        self, fresh_catalog, caplog, restore_engine_registry,
     ):
         # Simulate an admin or hive-federated entry that landed in the
         # catalog BEFORE populate_tts_catalog runs (e.g. malformed JSON
@@ -244,13 +253,15 @@ class TestPopulateRejectsInvalidEntries:
             f'{[r.message for r in caplog.records]!r}'
         )
 
-    def test_reflection_only_entry_is_rejected_in_scope_1(
-        self, fresh_catalog, caplog,
+    def test_reflection_only_entry_survives_ingest_in_scope_2(
+        self, fresh_catalog, caplog, restore_engine_registry,
     ):
-        # Pure-config entry passes _validate_engine_caps but the dispatcher
-        # for it (--catalog-id path) hasn't landed yet (#58 Scope-2).  In
-        # the meantime, we reject at ingest so the admin sees the error
-        # immediately rather than silence at synth.
+        # #58 Scope-2 landed — reflection-only entries (no tool_module
+        # but full 5-field contract) are now dispatchable via
+        # `gpu_worker --catalog-id <id>`.  They must SURVIVE ingest;
+        # the post-upsert ENGINE_REGISTRY snapshot still excludes
+        # them (TTSEngineSpec needs tool_module — see the separate
+        # _refresh_excludes_reflection_only_entries test below).
         ref_only = _make_entry('tts-reflection', {
             'import_path': 'flex:Flex',
             'init_args': {},
@@ -264,15 +275,24 @@ class TestPopulateRejectsInvalidEntries:
                              logger='integrations.channels.media.tts_router'):
             populate_tts_catalog(fresh_catalog)
 
-        assert fresh_catalog.get('tts-reflection') is None
-        assert any('tts-reflection' in rec.message and
-                   'reflection-only' in rec.message
-                   for rec in caplog.records), (
-            'reflection-only entry must be rejected with a clear log line '
-            f'pointing at #58 Scope-2; got {[r.message for r in caplog.records]!r}'
+        assert fresh_catalog.get('tts-reflection') is not None, (
+            '#58 Scope-2: reflection-only entries must survive ingest; '
+            'they are dispatched via --catalog-id, not ENGINE_REGISTRY'
+        )
+        # No "rejected" warning for the reflection-only entry — only
+        # malformed entries (which fail _validate_engine_caps) trip the
+        # rejection log path.
+        rejection_lines = [
+            r.message for r in caplog.records
+            if 'tts-reflection' in r.message and 'reject' in r.message
+        ]
+        assert not rejection_lines, (
+            f'reflection-only entries should NOT be rejected at ingest '
+            f'after #58 Scope-2; got {rejection_lines!r}'
         )
 
-    def test_valid_tool_module_entry_survives_ingest(self, fresh_catalog):
+    def test_valid_tool_module_entry_survives_ingest(self, fresh_catalog,
+                                                       restore_engine_registry):
         # An admin-customised entry with a valid tool_module must NOT
         # be touched by the validation pre-pass.
         good = _make_entry('tts-custom-engine', {
@@ -289,8 +309,27 @@ class TestPopulateRejectsInvalidEntries:
         )
 
 
+@pytest.fixture
+def restore_engine_registry():
+    """Snapshot ENGINE_REGISTRY entering the test, restore on exit.
+
+    `populate_tts_catalog` and `_refresh_engine_registry_from_catalog`
+    BOTH mutate the module-global ENGINE_REGISTRY in place via
+    `clear() + update()` — that's the documented post-upsert
+    semantics (#58 acceptance #5).  Tests that exercise these
+    primitives against a sparsely-populated `fresh_catalog` would
+    leave ENGINE_REGISTRY missing canonical engines, breaking
+    downstream test_tts_router tests in the same pytest run.
+    """
+    snapshot = dict(ENGINE_REGISTRY)
+    yield
+    ENGINE_REGISTRY.clear()
+    ENGINE_REGISTRY.update(snapshot)
+
+
 class TestEngineRegistrySnapshot:
-    def test_engine_registry_is_post_upsert_snapshot(self, fresh_catalog):
+    def test_engine_registry_is_post_upsert_snapshot(self, fresh_catalog,
+                                                     restore_engine_registry):
         """After populate_tts_catalog, ENGINE_REGISTRY contains exactly
         the spec-shaped catalog entries (post-upsert)."""
         populate_tts_catalog(fresh_catalog)
@@ -307,7 +346,8 @@ class TestEngineRegistrySnapshot:
                 f'reflection-only entry slipped through'
             )
 
-    def test_refresh_excludes_reflection_only_entries(self, fresh_catalog):
+    def test_refresh_excludes_reflection_only_entries(self, fresh_catalog,
+                                                       restore_engine_registry):
         """Reflection-only entries are valid in the catalog but excluded
         from the ENGINE_REGISTRY snapshot (they need #58 Scope-2's
         --catalog-id dispatch path)."""

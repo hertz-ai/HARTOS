@@ -29,12 +29,34 @@ SEED_BOOTSTRAP_GOALS = [
             '1) Create content showing real benchmark results — hive vs single models, '
             '2) Show the privacy story — your data never leaves your device, '
             '3) Show the economic story — 90% of value returns to contributors, '
-            '4) Post to all channels with authentic proof, not hype. '
+            '4) Promote the developer API: hevolve.ai/api/v1/intelligence/pricing '
+            'gives access to the hive at honest prices — free tier (100 req/day) is '
+            'always free, paid tiers (starter $9/mo, pro $49/mo, enterprise $499/mo) '
+            'go 90% to compute providers. Make developers aware the API exists; '
+            'every paid signup feeds the contributor pool, not a corporation. '
+            'Payments accepted via Stripe (USD / international cards) and PhonePe '
+            '(India: UPI / cards / netbanking). Mention the regional payment rail '
+            'when targeting Indian developers — PhonePe is the dominant rail there. '
+            '5) Post to all channels with authentic proof, not hype. '
+            '6) For B2B email outreach: use bulk_import_prospects with a JSON array '
+            "of leads + an attached 3-touch follow-up sequence (day 3 / 7 / 14) — "
+            'one tool call seeds a whole campaign instead of many round-trips. '
+            'Then the outreach daemon ticks the sequences daily; replies auto-pause. '
             'Let the results speak. People slowly realize this changes everything.'
         ),
         'config': {
             'goal_sub_type': 'awareness',
             'channels': ['platform', 'twitter', 'linkedin'],
+            'api_pricing_url': '/api/v1/intelligence/pricing',
+            'api_endpoints': [
+                '/api/v1/intelligence/chat',
+                '/api/v1/intelligence/analyze',
+                '/api/v1/intelligence/generate',
+                '/api/v1/intelligence/keys',
+                '/api/v1/intelligence/keys/<id>/upgrade',
+                '/api/v1/intelligence/keys/<id>/upgrade/phonepe',
+            ],
+            'payment_rails': ['stripe_usd', 'phonepe_inr'],
         },
         'spark_budget': 300,
         'use_product': True,
@@ -1596,6 +1618,86 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 100,
         'use_product': True,
     },
+    {
+        # TTS venv pre-warm — paced provisioning of every engine whose
+        # spec declares install_target='venv'.  Replaces the naive
+        # "create-all-venvs at boot in parallel" pattern which would
+        # spike disk I/O + network + RAM during dependency resolution
+        # at the exact moment the boot-grace gate is protecting user
+        # chat responsiveness.
+        #
+        # By routing through SEED_BOOTSTRAP_GOALS the work inherits
+        # every pacing primitive the agent_daemon already enforces:
+        #   - should_yield_to_user gate (skips ticks while user is
+        #     actively chatting)
+        #   - 30s poll interval (at most one engine starts per 30s)
+        #   - max_concurrent worker-slot cap (ONE install in flight)
+        #   - exponential backoff on consecutive_failures
+        #   - spark_budget hard cap (can't run away on bandwidth)
+        #
+        # Idempotency: is_venv_healthy() short-circuits warm boots —
+        # second tick after a successful install sees the venv healthy
+        # and moves to the next engine; final tick finds all healthy
+        # and the goal completes naturally.
+        #
+        # See also: tts/backend_venv.py:ensure_venv (idempotent venv
+        # creation), integrations/coding_agent/backend_repair_tools.py
+        # :repair_backend_venv (the tool the agent actually invokes).
+        'slug': 'bootstrap_provision_tts_venvs',
+        'goal_type': 'provision',
+        'title': 'TTS Engine Venv Provisioning — paced, one-at-a-time',
+        'description': (
+            'Ensure every TTS engine whose spec declares install_target='
+            "'venv' in integrations/channels/media/tts_router.py:"
+            'ENGINE_REGISTRY has a healthy private venv at '
+            '~/Documents/Nunba/data/venvs/<engine_id>/.\n\n'
+            'EXECUTION (do exactly this, no more):\n'
+            "1) Import ENGINE_REGISTRY and filter to specs where "
+            "spec.install_target == 'venv'.\n"
+            "2) For each such engine_id, call tts.backend_venv."
+            "is_venv_healthy(engine_id).\n"
+            "3) Pick the FIRST engine where is_venv_healthy returns "
+            "False.  If none are unhealthy, report 'all venvs healthy' "
+            "and stop — the goal is done for this tick.\n"
+            "4) Call repair_backend_venv(backend_name=<that engine>) "
+            "exactly ONCE per goal dispatch.  The tool wraps "
+            "tts.package_installer.install_backend_full which is "
+            "idempotent + creates the venv if missing + installs the "
+            "spec.pip_install_plan there + downloads model weights.\n"
+            "5) Return the tool's JSON result verbatim and stop.  "
+            "Do NOT loop over multiple engines in one dispatch — the "
+            "daemon's next tick will pick up the next unhealthy engine "
+            "after the current install completes.  Running multiple "
+            "pip installs in parallel would defeat the whole pacing "
+            "design.\n\n"
+            'STOP CONDITIONS (any one ends the dispatch):\n'
+            '- All venv-eligible engines pass is_venv_healthy → '
+            "report success and stop.\n"
+            '- repair_backend_venv returns success=False → report the '
+            'failure JSON and stop (the daemon will retry on the next '
+            'tick with exponential backoff already enforced by '
+            "consecutive_failures logic in agent_daemon).\n"
+            '- yield_to_user fires → daemon skips the dispatch '
+            'entirely (no work to undo).\n\n'
+            'CONSTRAINTS:\n'
+            '- One install per dispatch.  Never parallelise.\n'
+            '- Never wipe an existing healthy venv.  '
+            'wipe_first=False (the default).\n'
+            "- Do NOT touch piper, espeak, pocket_tts, mms_tts, or "
+            'any engine whose install_target is not "venv" — they '
+            'live in main interpreter or are bundled.\n'
+            '- Budget: 150 Spark for the whole loop.  Each install '
+            "typically costs 20-30 Spark; 5 engines fits well within."
+        ),
+        'config': {
+            'mode': 'monitor',
+            'continuous': True,
+            'priority': 2,           # below user-facing goals
+            'pace': 'one_per_tick',  # documented marker, not behaviour
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
 ]
 
 # ─── Loophole → Remediation Goal Map ───
@@ -1736,6 +1838,7 @@ def seed_bootstrap_goals(db, platform_product_id: Optional[str] = None) -> int:
 
     count = 0
     reactivated = 0
+    updated = 0
     for goal_data in SEED_BOOTSTRAP_GOALS:
         slug = goal_data['slug']
         existing = existing_by_slug.get(slug)
@@ -1749,6 +1852,28 @@ def seed_bootstrap_goals(db, platform_product_id: Optional[str] = None) -> int:
                 cfg.pop('noop_dispatch_count', None)
                 existing.config_json = cfg
                 reactivated += 1
+            # Sync description + non-runtime config keys IF the goal is
+            # still a pristine bootstrap (created_by=system_bootstrap and
+            # never hand-edited).  Lets seed-text edits (e.g. updating the
+            # marketing description to advertise a new API surface) reach
+            # already-seeded systems on next boot.  We deliberately do NOT
+            # overwrite runtime keys (status, completed_at, dispatch
+            # counters) — only the human-authored description + the
+            # config keys that came from the seed.
+            try:
+                if (existing.created_by == 'system_bootstrap'
+                        and existing.description != goal_data['description']):
+                    existing.description = goal_data['description']
+                    # Merge seed config keys without nuking runtime state.
+                    cfg = existing.config_json or {}
+                    for k, v in (goal_data.get('config') or {}).items():
+                        cfg[k] = v
+                    cfg['bootstrap_slug'] = slug  # preserve the marker
+                    existing.config_json = cfg
+                    updated += 1
+            except Exception as _sync_err:
+                logger.debug(
+                    f"Bootstrap goal '{slug}' description sync skipped: {_sync_err}")
             # Already-active / paused / archived rows: leave as-is.
             continue
 
@@ -1772,10 +1897,12 @@ def seed_bootstrap_goals(db, platform_product_id: Optional[str] = None) -> int:
         else:
             logger.debug(f"Bootstrap goal '{slug}' skipped: {result.get('error')}")
 
-    if count or reactivated:
+    if count or reactivated or updated:
         db.flush()
     if reactivated:
         logger.info(f"seed_bootstrap_goals: reactivated {reactivated} completed bootstrap goal(s)")
+    if updated:
+        logger.info(f"seed_bootstrap_goals: synced description/config on {updated} pristine bootstrap goal(s)")
     return count
 
 

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,14 @@ def publish_thinking_trace(
 
     text_str = text if isinstance(text, str) else str(text)
 
+    # Per-event dedup id — uuid4 hex.  Each thinking emit gets a unique
+    # msg_id so multiple events sharing the same request_id (the typical
+    # case — N thinking steps within one chat turn) are NOT collapsed by
+    # client dedup (crossbarWorker.processedMessages, realtimeService.
+    # _seenIds, Android processedRequestIds).  request_id stays the
+    # GROUPING / filtering key; msg_id is the dedup key.
+    _msg_id = uuid.uuid4().hex
+
     if full_schema:
         envelope = {
             'text': [text_str],
@@ -93,6 +102,7 @@ def publish_thinking_trace(
             'page_image_url': '',
             'analogy_image_url': '',
             'request_id': request_id,
+            'msg_id': _msg_id,
             'zoom_bounding_box': _ZOOM_STUB,
         }
     else:
@@ -102,6 +112,7 @@ def publish_thinking_trace(
             'action': 'Thinking',
             'bot_type': bot_type,
             'request_id': request_id,
+            'msg_id': _msg_id,
             'historical_request_id': [],
             'options': [],
             'newoptions': [],
@@ -122,3 +133,22 @@ def publish_thinking_trace(
     except Exception as e:
         logger.debug(f"publish_thinking_trace failed: {e}")
         return False
+
+
+def publish_chat_stage(stage: str, *, user_id: str, request_id: str = '', text: str = None) -> bool:
+    """Emit a chat-hot-path milestone (#508) via the canonical thinking-trace
+    publisher.  When `text` is provided, use it directly (per-tool calls);
+    otherwise look up CHAT_STAGE_TEXTS[stage].  Returns False if user_id
+    missing or stage/text unresolvable."""
+    if not user_id:
+        return False
+    if text is None:
+        from core.constants import CHAT_STAGE_TEXTS
+        text = CHAT_STAGE_TEXTS.get(stage)
+    if not text:
+        logger.warning("publish_chat_stage: unknown stage %r", stage)
+        return False
+    return publish_thinking_trace(
+        text=text, user_id=str(user_id), request_id=str(request_id or ''),
+        bot_type='Agent', full_schema=False,
+    )

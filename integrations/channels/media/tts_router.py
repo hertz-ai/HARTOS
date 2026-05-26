@@ -273,6 +273,12 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         tool_worker_attr='_tool',
         required_package='f5_tts',
         pip_install_plan=('torchaudio', 'f5-tts'),
+        # install_target='venv' so f5-tts + its torchaudio pin land in
+        # their own venv at ~/Documents/Nunba/data/venvs/f5_tts/ rather
+        # than colliding with the bundled main-interpreter torch.
+        # f5-tts itself was task #85 (worker dies on startup); the
+        # quarantine here is what kept that fix stable.
+        install_target='venv',
     ),
     'indic_parler': TTSEngineSpec(
         engine_id='indic_parler',
@@ -353,6 +359,59 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         tool_function='pocket_tts_synthesize',
         pip_install_plan=('pocket-tts',),
     ),
+    # NeuTTS Air — Neuphonic 748M-param Qwen2 backbone with NeuCodec
+    # decoder, Apache 2.0.  GGUF Q4 (~600MB) / Q8 (~800MB).  RTF<0.5
+    # on CPU (Intel i5 / RPi 5), 24kHz output, instant voice cloning
+    # from 3-15s reference audio.  English primary.  Slots between
+    # omnivoice and kokoro on the English ladder per quality
+    # (kokoro=0.88, neutts=0.91, omnivoice~0.93, chatterbox=0.95).
+    #
+    # Reference voice contract: NeuTTS requires a reference audio +
+    # transcript per call (no built-in 'alba'-style zero-config
+    # voices).  The wrapper resolves 'jo' (upstream sample shipped
+    # with the package), any path to a .wav with companion .txt,
+    # or a custom name from ~/.hevolve/models/tts/neutts/voices/.
+    # See integrations/service_tools/neutts_tool.py for resolution.
+    'neutts_air': TTSEngineSpec(
+        engine_id='neutts_air',
+        device=TTSDevice.GPU_PREFERRED,
+        vram_key='tts_neutts',
+        languages=('en',),
+        quality=0.91,
+        voice_clone=True,
+        latency_gpu_ms=150,
+        latency_cpu_ms=400,
+        latency_cloud_ms=0,
+        tool_module='integrations.service_tools.neutts_tool',
+        tool_function='neutts_synthesize',
+        # Worker attribute — Nunba's `_SubprocessTTSBackend` needs this
+        # to drive the subprocess.  Without it the spec falls into the
+        # `_InProcessTTSBackend` path (line ~2408 of Nunba's tts_engine
+        # .py) which in turn does `import neutts` from the MAIN
+        # interpreter — a guaranteed ImportError because `install_target
+        # ='venv'` lands the package in the per-engine venv, not the
+        # main python-embed.  Setting `_tool` here pairs cleanly with
+        # the ToolWorker singleton in integrations.service_tools.neutts
+        # _tool, mirroring kokoro / chatterbox / f5 / indic_parler.
+        tool_worker_attr='_tool',
+        required_package='neutts',
+        # `neutts[all]` pulls llama-cpp-python (for GGUF inference)
+        # plus soundfile + onnxruntime.  The base `neutts` package
+        # alone is not enough for synth — the codec decoder needs
+        # onnxruntime.  Pin huggingface_hub via _HF_HUB_PIN so the
+        # transformers chain stays consistent with the rest of the
+        # English ladder (chatterbox / kokoro use the same pin).
+        pip_install_plan=(
+            _HF_HUB_PIN,
+            'neutts[all]',
+            'soundfile',  # explicit — wrapper requires soundfile.write
+        ),
+        # Quarantine into its own venv on the desktop installer.
+        # NeuTTS pulls llama-cpp-python which can drift from the
+        # main interpreter's torch / numpy stack.  Same pattern as
+        # chatterbox_turbo and indic_parler.
+        install_target='venv',
+    ),
     # Kokoro 82M — tiny neural English TTS. Runs on CPU (≈1× real-time,
     # 200MB RAM) or GPU (≈0.1× real-time, 200MB VRAM). Quality sits
     # above Piper and below the big voice-clone engines, so it's the
@@ -386,6 +445,13 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
             'kokoro',     # pulls misaki phonemizer transitively
             'espeakng',   # espeak-ng Python bindings (ships binary on Windows)
         ),
+        # install_target='venv' so the kokoro + misaki phonemizer chain
+        # (incl. its pinned numpy/torch transitive set) lands in a
+        # private venv at ~/Documents/Nunba/data/venvs/kokoro/ instead
+        # of the bundled python-embed.  Closes the "ModuleNotFoundError:
+        # No module named 'kokoro'" probe-fallback path that left this
+        # engine permanently uninstalled on every Nunba install (#83).
+        install_target='venv',
     ),
     # OmniVoice — universal TTS.  Qwen3-0.6B backbone + diffusion head,
     # 646 languages (581k training hours spanning every Indic script,
@@ -418,6 +484,11 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         # See omnivoice_tool.py docstring: "Requires: pip install
         # omnivoice torch soundfile".  torch is bundled.
         pip_install_plan=('omnivoice', 'soundfile'),
+        # install_target='venv' — omnivoice pulls Qwen3-0.6B + diffusion
+        # head with their own torch/transformers transitives that conflict
+        # with the bundled main interpreter pins.  Quarantine in
+        # ~/Documents/Nunba/data/venvs/omnivoice/.
+        install_target='venv',
     ),
     'espeak': TTSEngineSpec(
         engine_id='espeak',
@@ -493,6 +564,12 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
             'melotts',                    # PyPI package; ships `melo` import root
             'soundfile',                  # used for duration probe
         ),
+        # install_target='venv' so the melotts wheel + its `melo`
+        # phonemizer chain (jieba, MeCab, mecab-ko) land in a private
+        # venv rather than the bundled python-embed.  Closes the
+        # "ModuleNotFoundError: No module named 'melo'" probe-fallback
+        # path that left this engine permanently uninstalled (#84).
+        install_target='venv',
     ),
     'xtts_v2': TTSEngineSpec(
         engine_id='xtts_v2',
@@ -518,6 +595,11 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
                                           # the import path is stable.
             'soundfile',
         ),
+        # install_target='venv' — coqui-tts pulls trainer/encodec/etc.
+        # with their own torch/transformers pins; quarantine in
+        # ~/Documents/Nunba/data/venvs/xtts_v2/ so the main interpreter
+        # transformers pin stays free for the chatterbox-family path.
+        install_target='venv',
     ),
     'mms_tts': TTSEngineSpec(
         engine_id='mms_tts',
@@ -579,7 +661,15 @@ LANG_ENGINE_PREFERENCE: Dict[str, List[str]] = {
     # kokoro/pocket/cosyvoice for cross-engine consistency when the
     # user also runs non-English traffic and we want to avoid swapping
     # engines on every language switch.
-    'en': ['chatterbox_turbo', 'omnivoice', 'melotts', 'xtts_v2', 'kokoro', 'pocket_tts', 'cosyvoice3', 'mms_tts', 'piper', 'espeak'],
+    # neutts_air slotted between omnivoice and melotts:
+    #   - quality:  chatterbox_turbo=0.95 > omnivoice~0.93 > neutts=0.91 > kokoro=0.88
+    #   - cpu RTF:  neutts <0.5 (acceptable on CPU for 8GB+ machines)
+    #   - install:  pip neutts[all] (GGUF Q4 ~600MB), Apache 2.0
+    # Behavior on missing package: wrapper returns clean {error: ...}
+    # JSON; ladder traverses to next engine — verified against
+    # tts/package_installer.py per-engine independent install
+    # contract + tts_engine._synthesize_with_fallback ladder walk.
+    'en': ['chatterbox_turbo', 'omnivoice', 'neutts_air', 'melotts', 'xtts_v2', 'kokoro', 'pocket_tts', 'cosyvoice3', 'mms_tts', 'piper', 'espeak'],
     # Indic languages — omnivoice replaces indic_parler as the primary
     # (parler kept as fallback for one release cycle).  OmniVoice has
     # 100-400 training hours per major Indic language vs parler's ~10,
@@ -1771,20 +1861,15 @@ def populate_tts_catalog(catalog) -> int:
                 'TTS catalog entry %r rejected at ingest: %s', entry.id, err,
             )
             _drop_ids.append(entry.id)
-        elif not (entry.capabilities or {}).get('tool_module'):
-            # Reflection-only entries are valid per the schema but not
-            # dispatchable until #58 Scope-2 ships the --catalog-id
-            # path in gpu_worker._dispatch_and_run.  Reject up front
-            # so the admin sees the error at boot, not silence at
-            # synth time.  Once Scope-2 lands, remove this branch and
-            # let reflection-only entries through.
-            logger.warning(
-                'TTS catalog entry %r is reflection-only (no tool_module); '
-                '#58 Scope-2 reflection dispatcher has not landed yet — '
-                'rejecting at ingest so the admin sees the error '
-                'immediately rather than at first synth call.', entry.id,
-            )
-            _drop_ids.append(entry.id)
+    # #58 Scope-2 (2026-05-07): reflection-only entries (caps lack
+    # tool_module but declare the full 5-field contract) are now
+    # dispatchable via `gpu_worker._dispatch_catalog_id` (`python -m
+    # gpu_worker --catalog-id <id>`).  They survive ingest as long as
+    # `_validate_engine_caps` passes; they are EXCLUDED from the
+    # ENGINE_REGISTRY snapshot by `_refresh_engine_registry_from_catalog`
+    # because TTSEngineSpec carries `tool_module` as a non-optional
+    # dispatch handle for the existing call sites.  The catalog reads
+    # them via the --catalog-id path instead.
     for _eid in _drop_ids:
         try:
             catalog.unregister(_eid, persist=False)

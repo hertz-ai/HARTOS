@@ -178,7 +178,13 @@ def init_social(app):
     except Exception as e:
         logger.warning(f"HevolveSocial marketplace+MCP blueprint skipped: {e}")
 
-    # Register sharing blueprint (short URLs, OG metadata, consent-gated links)
+    # Register sharing blueprint — canonical OG / share / embed home per
+    # memory/feedback_unification_reuse_contract.md.  Already serves
+    # /api/social/share/<token>, /api/social/og-image/<type>/<id>,
+    # /api/social/embed/<type>/<id>.  F1.5 wave will EXTEND this same
+    # blueprint with canonical short URLs (/i/, /c/, /u/, /p/) by
+    # promoting ``_get_og_metadata`` to public + adding `invite` resource
+    # type — NOT a parallel og_bp.
     try:
         from .api_sharing import sharing_bp
         app.register_blueprint(sharing_bp)
@@ -209,6 +215,16 @@ def init_social(app):
         logger.info("HevolveSocial admin API registered at /api/admin")
     except Exception as e:
         logger.debug(f"HevolveSocial admin blueprint skipped: {e}")
+
+    # Register OAuth click-through blueprint (PR O).  /start needs auth,
+    # /callback is public (state-token authenticated) — separate blueprint
+    # so admin_bp's before_request gate doesn't 401 the provider redirect.
+    try:
+        from integrations.channels.oauth_api import oauth_bp
+        app.register_blueprint(oauth_bp)
+        logger.info("HevolveSocial OAuth API registered at /api/oauth")
+    except Exception as e:
+        logger.debug(f"HevolveSocial OAuth blueprint skipped: {e}")
 
     # Register user-facing channel bindings API (catalog, bindings, pairing, presence)
     try:
@@ -435,9 +451,15 @@ def init_social(app):
         except Exception as e:
             logger.debug(f"HevolveSocial sync engine start skipped: {e}")
 
-    # Start distributed coding agent if enabled
+    # Start distributed coding agent if enabled.  Default flipped to
+    # 'true' on 2026-05-07 — the daemon consumes self_heal goals
+    # produced by error_advice (#102) and SelfHealingDispatcher; with
+    # default 'false' the queue piled up indefinitely (15 stale goals
+    # back to 2026-04-27 in the live DB at audit time).  Safety is in
+    # the daemon itself (no idle agents → early return; budget gate;
+    # 30s poll cadence).  Servers that don't want it set explicitly.
     import os as _os2
-    if _os2.environ.get('HEVOLVE_CODING_AGENT_ENABLED', 'false').lower() == 'true':
+    if _os2.environ.get('HEVOLVE_CODING_AGENT_ENABLED', 'true').lower() == 'true':
         try:
             from integrations.coding_agent import init_coding_agent
             init_coding_agent(app)

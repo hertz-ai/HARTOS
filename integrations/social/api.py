@@ -652,6 +652,104 @@ def invite_resolve(code):
 
 
 # ─────────────────────────────────────────────────────────────────
+# UNIF-G4 — Deep-link dispatcher.
+#
+# Single canonical writer for OS-protocol-handler intents from every
+# Nunba client (Windows/macOS/Linux desktop, iOS, Android).  Each
+# client receives a `nunba://` or `hevolveai://` URI from the OS,
+# parses the verb + args, and POSTs to this endpoint.  Server-side
+# dispatch keeps the routing logic DRY across all 3 platforms — no
+# parallel client-side switch statements.
+#
+# Verbs:
+#   invite/<code>            → InviteService.accept (canonical)
+#   meet/<platform>/<room>   → Join_External_Room agent tool (UNIF-G2)
+#   group/<platform>/<id>    → Join_External_Room agent tool with
+#                              role='participant' (UNIF-G2)
+# ─────────────────────────────────────────────────────────────────
+
+@social_bp.route('/deeplink', methods=['POST'])
+@require_auth
+def deeplink_dispatch():
+    """Route a parsed custom-scheme deep link to the right handler."""
+    data = _get_json()
+    kind = (data.get('kind') or '').lower()
+    segments = data.get('segments') or []
+    if not isinstance(segments, list):
+        segments = []
+    scheme = (data.get('scheme') or 'hevolveai').lower()
+
+    # Reuse the canonical validator from core.install_links rather
+    # than re-implementing scheme/verb checks here (DRY).
+    try:
+        from core.install_links import (
+            DEEPLINK_SCHEMES, DEEPLINK_VERBS, is_allowed_deeplink_uri,
+        )
+    except Exception:
+        DEEPLINK_SCHEMES = ('hevolveai', 'nunba')
+        DEEPLINK_VERBS = ('invite', 'meet', 'group')
+        is_allowed_deeplink_uri = lambda u: True  # noqa: E731
+
+    if scheme not in DEEPLINK_SCHEMES:
+        return _err(f"unsupported scheme {scheme!r}", 400)
+    if kind not in DEEPLINK_VERBS:
+        return _err(f"unsupported verb {kind!r}", 400)
+    if not segments:
+        return _err("empty deeplink path", 400)
+
+    # Reconstruct the canonical URI form for the allowlist guard.
+    candidate = f"{scheme}://{kind}/{'/'.join(str(s) for s in segments)}"
+    if not is_allowed_deeplink_uri(candidate):
+        return _err(f"deep link rejected: {candidate}", 400)
+
+    if kind == 'invite':
+        # segments = [<code>] — InviteService.accept handles both
+        # invite_id and code via invite_id_or_code parameter.
+        code = str(segments[0])
+        try:
+            from .invite_service import InviteService, InviteError
+            result = InviteService.accept(
+                g.db, invite_id_or_code=code,
+                accepter_id=g.user.id,
+                tenant_id=getattr(g, 'tenant_id', None))
+            return _ok({'kind': 'invite', 'accepted': True,
+                        'invite': result})
+        except InviteError as e:
+            return _err(str(e), 400)
+
+    # meet / group → ask the agent to route via Join_External_Room.
+    # Same canonical agent tool already used for natural-language
+    # "join my Discord audio room <url>" — no parallel path.
+    if len(segments) < 2:
+        return _err(f"{kind} requires <platform>/<id>", 400)
+    platform_name = str(segments[0]).lower()
+    target = str(segments[1])
+    role = 'note_taker' if kind == 'meet' else 'participant'
+
+    try:
+        # Synthesize a Join_External_Room tool input — the canonical
+        # handler at hart_intelligence_entry._handle_join_external_room_tool
+        # validates consent, joins the room, and emits the meet_copilot
+        # Liquid UI card.
+        from hart_intelligence_entry import (
+            _handle_join_external_room_tool,
+        )
+        import json as _json
+        tool_input = _json.dumps({
+            'platform': platform_name,
+            'room': target,
+            'role': role,
+            'source': 'deeplink',
+        })
+        out = _handle_join_external_room_tool(tool_input)
+        return _ok({'kind': kind, 'platform': platform_name,
+                    'target': target, 'role': role,
+                    'tool_response': out})
+    except Exception as e:
+        return _err(f"deeplink dispatch failed: {e}", 500)
+
+
+# ─────────────────────────────────────────────────────────────────
 # Phase 7c.4 — Emoji reactions on posts / comments / messages.
 # Plan reference: sunny-gliding-eich.md, Part E.6.
 # Polymorphic source_kind so a single set of routes serves all three
@@ -770,6 +868,39 @@ def sync_deltas():
     from .sync_service import SyncService
     return _ok(SyncService.deltas(
         g.db, user_id=g.user.id, since=since, kinds=kinds,
+        limit_per_kind=limit,
+        tenant_id=getattr(g, 'tenant_id', None)))
+
+
+@social_bp.route('/sync/inbox', methods=['GET'])
+@require_auth
+@requires_flag('sync_v1', else_value={'cursor': '0', 'has_more': False, 'rows': []})
+def sync_inbox():
+    """Flattened unified-inbox view layered on top of /sync.
+
+    Same cursor + flag-gate as /sync.  Returns a single chronologically-
+    sorted list of InboxRow dicts (messages, mentions, invites, friend
+    requests, notifications) — what every client renders directly.
+
+    Pure additive — calls SyncService.deltas internally; no new SQL
+    path, no behavior change for /sync callers.
+
+    Query params:
+      since   opaque cursor from previous response (default = full
+              backfill from epoch).
+      limit   per-kind row cap (1..200, default 50).
+
+    Response shape:
+      { cursor: '<next>', has_more: bool, rows: [InboxRow, ...] }
+    """
+    since = request.args.get('since')
+    try:
+        limit = max(1, min(int(request.args.get('limit', 50)), 200))
+    except (TypeError, ValueError):
+        limit = 50
+    from .sync_service import SyncService
+    return _ok(SyncService.inbox_rows(
+        g.db, user_id=g.user.id, since=since,
         limit_per_kind=limit,
         tenant_id=getattr(g, 'tenant_id', None)))
 
@@ -2266,6 +2397,177 @@ def mark_notifications_read():
 def mark_all_notifications_read():
     NotificationService.mark_all_read(g.db, g.user.id)
     return _ok({'marked_all': True})
+
+
+@social_bp.route('/notifications/unread_by_source', methods=['GET'])
+@require_auth
+def unread_by_source():
+    """Return per-source-user unread notification counts for the
+    current viewer.  Closes #199 backend half.
+
+    Returns ``{source_user_id: count}`` so the agent-list UI can
+    overlay an unread badge on each agent row by looking up the
+    agent's user_id in the map.  agents with no entry in the map
+    have zero unread notifications (UI renders no badge).
+
+    Why a sibling endpoint and not extending /dashboard/agents:
+    the dashboard endpoint is unauthed + ETag'd (server-wide cache).
+    Per-viewer unread state needs auth + can't share that cache,
+    so this lives separately.  Client joins the two payloads.
+    """
+    from sqlalchemy import func as _sqlfunc
+    # Lazy import — Notification isn't in the top-of-file model
+    # import set; keeps the endpoint a single localized addition.
+    from .models import Notification as _Notif
+    rows = (
+        g.db.query(
+            _Notif.source_user_id,
+            _sqlfunc.count(_Notif.id),
+        )
+        .filter(_Notif.user_id == g.user.id)
+        .filter(_Notif.is_read.is_(False))
+        .filter(_Notif.source_user_id.isnot(None))
+        .group_by(_Notif.source_user_id)
+        .all()
+    )
+    counts = {src: int(cnt) for src, cnt in rows if src}
+    return _ok({
+        'by_source': counts,
+        'total_unread': sum(counts.values()),
+    })
+
+
+# ═══════════════════════════════════════════════════════════════
+# MARKETING ATTRIBUTION (task #178 — flywheel download tracking)
+# ═══════════════════════════════════════════════════════════════
+
+@social_bp.route('/marketing/track', methods=['POST'])
+def track_marketing_event():
+    """Anonymous endpoint: record one click/install/signup attributed to
+    a channel code (e.g. 'li_a', 'tw1', 'wa_broadcast').
+
+    Body: {code: str, event: str, platform: str?, user_agent: str?}
+    event in {'click', 'download', 'install', 'signup'}.
+
+    Writes one JSONL row to ~/Documents/Nunba/data/marketing_clicks.jsonl
+    (or platform-equivalent via core.platform_paths). No auth — channel
+    codes are issued at post time, not user-bound.
+
+    Returns {tracked: true, code, event, ts}.
+    """
+    import hashlib as _hashlib
+    import json as _json
+    import os as _os
+    import re as _re
+    from datetime import datetime as _dt
+
+    data = _get_json()
+    code = (data.get('code') or '').strip()
+    event = (data.get('event') or 'click').strip().lower()
+    platform = (data.get('platform') or '').strip()[:32]
+
+    # Validate code shape — channel codes look like "li_a", "tw1", "wa_broadcast"
+    if not _re.match(r'^[a-z][a-z0-9_]{0,31}$', code):
+        return _err('invalid code', 400)
+    if event not in {'click', 'download', 'install', 'signup'}:
+        return _err('invalid event', 400)
+
+    ip = (request.remote_addr or '').encode()
+    ua = (request.headers.get('User-Agent') or '')[:200]
+    row = {
+        'ts': _dt.utcnow().isoformat() + 'Z',
+        'code': code,
+        'event': event,
+        'platform': platform,
+        'ip_hash': _hashlib.sha256(ip).hexdigest()[:16],
+        'ua_hash': _hashlib.sha256(ua.encode()).hexdigest()[:16],
+    }
+
+    try:
+        from core.platform_paths import get_data_dir
+        data_dir = get_data_dir()
+    except Exception:
+        data_dir = _os.path.expanduser('~/.hartos')
+    _os.makedirs(data_dir, exist_ok=True)
+    path = _os.path.join(data_dir, 'marketing_clicks.jsonl')
+    with open(path, 'a', encoding='utf-8') as f:
+        f.write(_json.dumps(row) + '\n')
+
+    return _ok({'tracked': True, 'code': code, 'event': event, 'ts': row['ts']})
+
+
+@social_bp.route('/marketing/intents', methods=['GET'])
+def marketing_intents():
+    """Per-platform canonical intent URLs for the marketing agent +
+    operator UI.  Closes #181.
+
+    Query: ?platform=twitter|linkedin|reddit|hackernews|whatsapp
+           omit platform to get all.
+
+    Returns {platforms: [str], intents: [MarketingIntent.to_dict]}.
+
+    Each intent carries platform, code (ref-tag), intent_url
+    (click-to-open composer), landing_url (where the post links to,
+    with ?ref=code), body_text (paste body where URL doesn't accept
+    long text), and notes.  Codes match the ones /marketing/track
+    expects, so a click → /marketing/track increment is a closed loop.
+    """
+    from integrations.marketing.intents import (
+        get_intents, list_platforms,
+    )
+    platform = (request.args.get('platform') or '').strip().lower() or None
+    intents = get_intents(platform)
+    return _ok({
+        'platforms': list_platforms(),
+        'platform_filter': platform,
+        'intents': [i.to_dict() for i in intents],
+        'count': len(intents),
+    })
+
+
+@social_bp.route('/marketing/stats', methods=['GET'])
+def marketing_stats():
+    """Aggregate click counts by code + event from the JSONL log.
+
+    Optional ?code=X filters to one channel. Returns
+    {by_code: {code: {click, download, install, signup}}, total}.
+    Reads the same file the /marketing/track endpoint writes.
+    """
+    import json as _json
+    import os as _os
+
+    code_filter = (request.args.get('code') or '').strip().lower() or None
+    try:
+        from core.platform_paths import get_data_dir
+        data_dir = get_data_dir()
+    except Exception:
+        data_dir = _os.path.expanduser('~/.hartos')
+    path = _os.path.join(data_dir, 'marketing_clicks.jsonl')
+
+    by_code = {}
+    total = 0
+    if _os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = _json.loads(line)
+                except Exception:
+                    continue
+                c = row.get('code')
+                e = row.get('event')
+                if not c or not e:
+                    continue
+                if code_filter and c != code_filter:
+                    continue
+                bucket = by_code.setdefault(
+                    c, {'click': 0, 'download': 0, 'install': 0, 'signup': 0})
+                if e in bucket:
+                    bucket[e] += 1
+                total += 1
+    return _ok({'by_code': by_code, 'total': total})
 
 
 # ═══════════════════════════════════════════════════════════════

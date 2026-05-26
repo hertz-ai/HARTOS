@@ -28,6 +28,58 @@ DEFAULT_PROMPT_ID: int = 8888
 
 
 # ──────────────────────────────────────────────────────────────────────
+# AutoGen MessageTokenLimiter budget — single source of truth.
+#
+# Previously hardcoded as `max_tokens=3500` in 4 sites:
+#   create_recipe.py:907       — recipe-create context_handling
+#   reuse_recipe.py:1245       — reuse_recipe context_handling
+#   reuse_recipe.py:2279       — reuse_recipe alternate path
+#   reuse_recipe.py:2896       — reuse_recipe alternate path
+#
+# Why 2500 (was 3500): live evidence 2026-05-20, llama_server_8082.log
+# showed 477 "Context size has been exceeded" errors.  The autogen
+# transform clips messages to max_tokens, but the system prompt and
+# tool descriptions are appended AFTER the transform — typical
+# overhead ~3000-4000 tokens.  With max_tokens=3500 the total prompt
+# reaches ~7000+ tokens; under 4-slot concurrency on a 12288 n_ctx
+# llama-server, overlap of 2-3 active large prompts exhausts the
+# slot pool's effective context budget and llama returns the 400.
+# Lowering to 2500 leaves ~6000-7000 tokens total prompt size,
+# comfortable headroom for concurrent slots.  Quality impact is
+# negligible: 2500 tokens is still ~3-4 messages of dense history,
+# more than enough for the next-step reasoning autogen does.  If
+# quality regresses, raise back to 3000; never above 3500 without
+# a corresponding n_ctx bump on llama-server side.
+#
+# Tighter sites kept as-is:
+#   reuse_recipe.py:818  select_speaker (max_tokens=3000) — speaker-
+#       selection prompts are smaller by design.  Already tight.
+AUTOGEN_MESSAGE_TOKEN_BUDGET: int = 2500
+AUTOGEN_MESSAGE_TOKENS_PER_MESSAGE: int = 1000  # individual message cap, unchanged
+AUTOGEN_HISTORY_LIMIT: int = 50                  # message-count limit, unchanged
+
+# ──────────────────────────────────────────────────────────────────────
+# Wire-layer trim budget (llm_outbound_logger.py hard left-trim).
+# Different scope from AUTOGEN_*: those soft-limit per-agent autogen
+# message history; THESE hard-clip the actual bytes sent to llama-server
+# so the request never exceeds (n_ctx / num_slots) - max_tokens - safety.
+# The wire layer catches autogen + langchain + raw openai SDK uniformly
+# (they all funnel through httpx) — the only place we can guarantee
+# zero context-overflow 500s across all frameworks.
+#
+# Env overrides:
+#   HEVOLVE_LLAMA_CTX_SIZE  — n_ctx on llama-server (must match the
+#                              --ctx-size cmdline; default tracks
+#                              Nunba/llama/llama_config.py:1527 = 12288)
+#   HEVOLVE_LLAMA_SLOTS     — concurrent slots (n_ctx is partitioned
+#                              across slots; default 1)
+LLAMA_CTX_SIZE_DEFAULT: int = 12288
+LLAMA_SLOTS_DEFAULT: int = 1
+WIRE_TRIM_SAFETY_MARGIN_TOKENS: int = 256       # headroom under the budget
+WIRE_TRIM_MARKER: str = '...[truncated head]...\n'
+
+
+# ──────────────────────────────────────────────────────────────────────
 # HIVE_DEPTH — maximum hop count for any cross-host task / hivemind /
 # federation propagation.
 #
@@ -412,3 +464,180 @@ assert all(t.startswith(_CHAT_PREFIX) for t in CHAT_TOPICS), (
 # malicious cursor=0 pull can't exfiltrate the whole table.
 CHAT_CURSOR_PULL_MAX_ROWS: int = 500
 CHAT_CURSOR_PULL_MAX_BYTES: int = 2 * 1024 * 1024  # 2 MB body cap
+
+
+# Chat-hot-path stage strings (#508) — single i18n site, consumed by
+# publish_chat_stage().  Keep values ≤ 60 chars (UI bubble truncates).
+CHAT_STAGE_TEXTS: dict = {
+    'loading_context':  'Loading your context…',
+    'loading_memory':   'Recalling our recent chat…',
+    'loading_tools':    'Preparing tools…',
+    'thinking':         'Thinking…',
+    'generating':       'Generating a response…',
+    'finalizing':       'Finalizing the answer…',
+    # Generic fallback used by _with_tool_logging — callers pass
+    # text=TOOL_LABELS.get(name, 'Running {name}…') for the real text.
+    'tool_call':        'Running a tool…',
+}
+CHAT_STAGES: frozenset = frozenset(CHAT_STAGE_TEXTS)
+
+
+# Per-tool human-readable labels for tool_call stage emits (#508).  Static
+# entries cover the hardcoded tools in get_tools(is_first=True) + canonical
+# provider/builtin tools.  Dynamic tool registries (skills, service_tools,
+# providers, Tier-2 goal-aware) should call register_tool_label() at the
+# point of Tool() construction so their tools also get a friendly label.
+# Unknown tools fall back to "Running {name}…" at the emit site.
+# Keep values <= 60 chars (UI bubble truncates).
+TOOL_LABELS: dict = {
+    # Memory + history
+    'FULL_HISTORY':                'Searching your message history…',
+    'recall_memory':               'Recalling memories…',
+    'remember_memory':             'Saving to memory…',
+    # Computation + web
+    'Calculator':                  'Calculating…',
+    'google-search':               'Searching the web…',
+    # Vision / camera
+    'Visual_Context_Camera':       'Looking through camera…',
+    'Visual_Context_Watcher':      'Setting up a visual watcher…',
+    'Request_Camera_Access':       'Requesting camera access…',
+    'Image_Inference_Tool':        'Analyzing the image…',
+    'Animate_Character':           'Animating your character…',
+    # Media generation
+    'Generate_Image':              'Generating an image…',
+    'Text to image':               'Generating an image from text…',
+    # Channels + invites + rooms
+    'Connect_Channel':             'Connecting channel…',
+    'Invite_Friend':               'Generating an invite link…',
+    'Join_External_Room':          'Joining the room…',
+    # Agent + planning
+    'Agentic_Router':              'Planning the next steps…',
+    'Create_Agent':                'Starting agent creation…',
+    # System / OS
+    'Shell_Command':               'Running a command…',
+    'Computer_Action':              'Acting on your screen…',
+    'Computer_Screenshot':         'Taking a screenshot…',
+    'Request_Screen_Access':       'Requesting screen access…',
+    # Cloud expert
+    'Cloud_LLM':                   'Consulting the cloud expert…',
+    # Navigation + UX
+    'Navigate_App':                'Opening the requested page…',
+    'List_Pending_Actions':        'Listing pending actions…',
+    # Data extraction + user lookup
+    'Data_Extraction_From_URL':    'Extracting data from URL…',
+    'User_details_tool':           'Looking up user details…',
+    'OpenAPI_Specification':       'Calling the OpenAPI service…',
+    # Resource requests + self-improvement
+    'Request_Resource':            'Requesting a resource…',
+    'Suggest_Share_Worthy_Content': 'Finding share-worthy content…',
+    'Observe_User_Experience':     'Recording an observation…',
+    'Self_Critique_And_Enhance':   'Reflecting on past suggestions…',
+    # ── reuse_recipe.py inner tools (autogen function_map names) ──
+    # #509 — added here (canonical static home) instead of being
+    # dynamically register_tool_label()-ed at reuse_recipe import time.
+    'txt2img':                     'Generating an image…',
+    'img2txt':                     'Reading the image…',
+    'save_data_in_memory':         'Saving to memory…',
+    'get_saved_metadata':          'Listing saved memory…',
+    'get_data_by_key':             'Recalling from memory…',
+    'get_user_id':                 'Looking up your user id…',
+    'get_prompt_id':               'Looking up your prompt id…',
+    'Generate_video':              'Generating a video…',
+    'get_user_uploaded_file':      'Fetching your uploaded file…',
+    'get_user_camera_inp':         'Reading from your camera…',
+    'get_chat_history':            'Reading recent chat history…',
+    'search_visual_history':       'Searching your visual history…',
+    'register_visual_watcher':     'Registering a visual watcher…',
+    'search_long_term_memory':     'Searching long-term memory…',
+    'save_to_long_term_memory':    'Saving to long-term memory…',
+    'create_scheduled_jobs':       'Scheduling a task…',
+    'send_message_to_user':        'Sending you a message…',
+    'send_presynthesized_video_to_user': 'Sending a video to you…',
+    'send_message_in_seconds':     'Scheduling a message…',
+    'consult_expert':              'Consulting the cloud expert…',
+    'get_user_camera_inp_by_mins': 'Reading camera history…',
+    'execute_windows_or_android_command': 'Running a system command…',
+    'google_search':               'Searching the web…',
+    'create_new_agent':            'Starting agent creation…',
+    'update_persona':              'Updating role/persona in DB…',
+    # ── journey_engine.py + outreach_crm_tools.py (autogen tools) ──
+    # #509 — moved from inline _journey_ui_labels / _outreach_ui_labels
+    # dicts at the call site so register_labeled_function picks them up
+    # via TOOL_LABELS.get(name, …) without per-site dups.
+    'view_journey_pipeline':       'Reviewing journey pipeline…',
+    'advance_prospect_stage':      'Advancing prospect stage…',
+    'run_journey_tick':            'Running journey tick…',
+    'send_prospect_message':       'Sending prospect message…',
+    'create_prospect':             'Creating CRM prospect…',
+    'send_outreach_email':         'Sending outreach email…',
+    'create_followup_sequence':    'Scheduling follow-up sequence…',
+    'check_pending_followups':     'Checking pending follow-ups…',
+    'move_prospect_stage':         'Moving prospect to next stage…',
+    'get_pipeline_status':         'Loading pipeline status…',
+    'list_sent_emails':            'Listing sent emails…',
+    # ── system_introspect_tool.py — duplicate-of-truth from
+    #    _INTROSPECT_LABELS pulled into the canonical dict so the
+    #    static names live in one place (the module still keeps its
+    #    own dict for the LangChain `labeled_tool` call sites). ──
+    'get_gpu_tier':                'Checking GPU tier…',
+    'list_running_models':         'Looking up active models…',
+    'get_tts_status':              'Checking TTS engine status…',
+    'get_tier_thresholds':         'Reading tier thresholds…',
+    'get_boot_decision':           'Reading boot rationale…',
+    'get_system_health':           'Checking system health…',
+    'list_decisions':              'Listing recorded decisions…',
+    'explain_decision':            'Explaining a system decision…',
+    # ── core/agent_tools.py @log_tool_execution-decorated functions
+    #    (the 28 "canonical" core tools shared by create_recipe +
+    #    reuse_recipe via register_core_tools).  These are *autogen
+    #    function_map* names — snake_case — and are SEPARATE names from
+    #    their similarly-named LangChain Tool() literals above (e.g.,
+    #    `text_2_image` (autogen) vs `Generate_Image` / `Text to image`
+    #    (LangChain).  Same verb, same UX, registered both ways.  A
+    #    follow-up task will canonicalize the names; for now we list
+    #    them all so the lookup never misses. ──
+    'text_2_image':                'Generating an image…',
+    'data_extraction_from_url':    'Extracting data from URL…',
+    'device_control':              'Acting on your device…',
+    'get_user_details':            'Looking up user details…',
+    'observe_user_experience':     'Recording an observation…',
+    'request_resource':            'Requesting a resource…',
+    'self_critique_and_enhance':   'Reflecting on past suggestions…',
+    'suggest_share_worthy_content': 'Finding share-worthy content…',
+    # ── integrations/channels/agent_tools.py @log_tool_execution funcs
+    #    (channel-adapter tools shared by both create + reuse). ──
+    'register_channel':            'Registering a channel…',
+    'send_to_channel':             'Sending to a channel…',
+    'send_install_link':           'Sending an install link…',
+    'list_channels':               'Listing your channels…',
+    'get_channel_context':         'Reading channel context…',
+    'reconnect_channel':           'Reconnecting channel…',
+    'disconnect_channel':          'Disconnecting channel…',
+    # ── integrations/providers/agent_tools.py labeled_tool() literals
+    #    that the prior pass missed (casing drift from Generate_video). ──
+    'Generate_Video':              'Generating a video…',
+    'List_AI_Providers':           'Listing AI providers…',
+    'Provider_Leaderboard':        'Loading provider leaderboard…',
+    # ── AP2 (Agent Protocol 2) — agentic commerce payment tools.
+    #    Registered dynamically via get_ap2_tools_for_autogen() in
+    #    create_recipe.py:1761 + reuse_recipe.py:2494 in both flows.
+    'request_payment':             'Requesting payment authorization…',
+    'authorize_payment':           'Authorizing payment…',
+    'process_payment':             'Processing payment via gateway…',
+}
+
+
+def register_tool_label(name: str, label: str) -> None:
+    """Register a UI label for a tool name.  Used by dynamic tool registries
+    (integrations.skills, integrations.service_tools, integrations.providers,
+    Tier-2 goal-aware tool packs) to supply human-readable status text next
+    to where they construct Tool() objects.  Idempotent — overwrites prior
+    entry for the same name so a registry can refine its labels over time.
+
+    Tools that don't register a label fall back to the generic
+    'Running {name}…' template at the emit site in
+    hart_intelligence_entry._with_tool_logging.
+    """
+    if not name or not label:
+        return
+    TOOL_LABELS[str(name)] = str(label)[:60]

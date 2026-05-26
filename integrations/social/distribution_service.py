@@ -24,6 +24,31 @@ def _generate_code(length: int = 8) -> str:
     return ''.join(secrets.choice(chars) for _ in range(length))
 
 
+def invite_share_url(code: str, base_url: Optional[str] = None) -> str:
+    """Build the canonical shareable invite URL for a referral code.
+
+    Single source of truth — replaces the hardcoded
+    ``f"https://hevolve.ai/join?ref={ref_code}"`` previously inlined at
+    ``marketing_tools.py:create_referral_campaign`` and any new G1
+    invite-friend tool.  Reads ``HEVOLVE_INVITE_BASE_URL`` env var first
+    (so dev / staging / on-prem deployments can override) and defaults
+    to the canonical ``https://hevolve.ai/join`` per the marketing
+    canon.
+
+    Returns a URL of the form ``<base>?ref=<CODE>``.  The path is
+    intentionally identical to the legacy hardcoded one so existing
+    inbound traffic that lands on ``hevolve.ai/join?ref=…`` continues
+    to work unchanged.
+    """
+    import os
+    if not code:
+        raise ValueError("invite_share_url requires a non-empty code")
+    base = base_url or os.environ.get(
+        'HEVOLVE_INVITE_BASE_URL', 'https://hevolve.ai/join')
+    sep = '&' if '?' in base else '?'
+    return f"{base}{sep}ref={code}"
+
+
 class DistributionService:
 
     # ─── Referrals ───

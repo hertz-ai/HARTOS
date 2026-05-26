@@ -207,6 +207,195 @@ def verify_pair_code():
         return jsonify({'success': False, 'error': 'Verification failed'}), 500
 
 
+# ── Gateway-backed channel pairing (Baileys-style) ─────────────
+#
+# Single seam between the wizard and any channel whose pairing is
+# served by an embedded subprocess gateway (currently WhatsApp via
+# integrations/social/whatsapp_supervisor.py).  The wizard fetches
+# the QR string + the optional 8-char "Link with phone number"
+# code from here; this file owns the env-driven base-URL resolution
+# so the frontend never has to know whether the gateway is local
+# (embedded Baileys) or remote (operator-managed WAHA).
+
+_GATEWAY_HTTP_TIMEOUT = 8.0
+
+
+def _whatsapp_gateway_base() -> str:
+    """Resolve the WhatsApp gateway base URL.  Single source of truth —
+    same env the adapter reads (integrations/channels/whatsapp_adapter
+    .py:509) so override behaviour stays consistent across surfaces."""
+    import os as _os
+    return (
+        _os.environ.get('WHATSAPP_API_URL')
+        or f'http://127.0.0.1:{_os.environ.get("WHATSAPP_GATEWAY_PORT", "3000")}'
+    )
+
+
+def _whatsapp_account_id() -> str:
+    """One Baileys session per authenticated user — the gateway stores
+    creds under ~/.hevolve/whatsapp/auth/<account_id>/ so this id is
+    also the persistence key (g.user_id is opaque enough)."""
+    return f'user_{g.user_id}'
+
+
+def _proxy_gateway(method: str, path: str, **kwargs):
+    """Thin HTTP proxy to the gateway.  Returns (json_or_none, status).
+    Never raises — connection / timeout errors map to (None, 503)."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+    url = _whatsapp_gateway_base().rstrip('/') + path
+    body = None
+    headers = {'Accept': 'application/json'}
+    if 'json' in kwargs and kwargs['json'] is not None:
+        body = _json.dumps(kwargs['json']).encode('utf-8')
+        headers['Content-Type'] = 'application/json'
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=_GATEWAY_HTTP_TIMEOUT) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+            try:
+                return _json.loads(raw), resp.status
+            except _json.JSONDecodeError:
+                return {'raw': raw}, resp.status
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode('utf-8', errors='replace') if e.fp else ''
+        try:
+            return _json.loads(raw), e.code
+        except _json.JSONDecodeError:
+            return {'error': raw or e.reason}, e.code
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        logger.warning("whatsapp gateway unreachable at %s: %s", url, e)
+        return None, 503
+
+
+@channel_user_bp.route('/whatsapp/qr', methods=['GET'])
+@require_auth
+def whatsapp_get_qr():
+    """Return the WhatsApp-Web QR string for the current user's session.
+
+    On first call this also starts the session (idempotent).  Frontend
+    polls this endpoint every ~2-3s and renders ``qr`` (a WhatsApp-Web
+    pairing string — feed it into any QR generator).  When the user
+    completes the scan, subsequent calls return ``{authenticated:true,
+    qr:null}``.
+    """
+    account_id = _whatsapp_account_id()
+    # Idempotent start — supervisor's session map short-circuits if
+    # already running for this account.
+    _proxy_gateway('POST', f'/api/sessions/{account_id}/start')
+    body, status = _proxy_gateway('GET', f'/api/sessions/{account_id}/status')
+    if body is None:
+        return jsonify({
+            'success': False,
+            'error': (
+                'WhatsApp gateway unreachable.  If you set WHATSAPP_API_URL '
+                'to a remote endpoint, verify it is reachable; otherwise the '
+                'embedded Baileys gateway is still starting (first run '
+                'installs Node deps, ~30s).'),
+        }), 503
+    return jsonify({
+        'success': True,
+        'data': {
+            'qr': body.get('qr'),
+            'authenticated': bool(body.get('authenticated')),
+            'state': body.get('state', 'unknown'),
+            'account_id': account_id,
+        },
+    }), 200 if status < 400 else status
+
+
+@channel_user_bp.route('/whatsapp/pair-code', methods=['POST'])
+@require_auth
+def whatsapp_request_pair_code():
+    """Mint an 8-char "Link with phone number" code via Baileys'
+    requestPairingCode().  User types this in WhatsApp → Linked Devices
+    → Link with phone number instead of scanning a QR.
+
+    Body: ``{"phone": "+91 90030 54371"}`` — accepts any phone format;
+    gateway strips non-digits."""
+    data = request.get_json(silent=True) or {}
+    phone = (data.get('phone') or '').strip()
+    if not phone:
+        return jsonify({'success': False, 'error': 'phone is required'}), 400
+    account_id = _whatsapp_account_id()
+    # Ensure session exists before requesting a pair code.
+    _proxy_gateway('POST', f'/api/sessions/{account_id}/start')
+    body, status = _proxy_gateway(
+        'POST',
+        f'/api/sessions/{account_id}/request-pair-code',
+        json={'phone': phone},
+    )
+    if body is None:
+        return jsonify({'success': False, 'error': 'WhatsApp gateway unreachable'}), 503
+    if status >= 400:
+        return jsonify({'success': False, 'error': body.get('error', 'pair-code failed')}), status
+    return jsonify({
+        'success': True,
+        'data': {'code': body.get('code'), 'account_id': account_id},
+    })
+
+
+# ── Conversational onboarding form-submit re-entry ─────────────
+#
+# Closes the loop on _start_gateway_qr_pair_push's phone-collection
+# form (hart_intelligence_entry.py).  When the agent's gateway_qr
+# branch can't find a phone in env / user profile, it emits a one-
+# field form whose action= points here.  This route receives the
+# submitted phone, sets the env var so the helper picks it up, and
+# re-enters _start_gateway_qr_pair_push synchronously — same code
+# path the chat agent would take if phone were known upfront.
+#
+# Auth required: only the authenticated user can connect their
+# own WhatsApp account.  Per-user binding gating happens inside
+# register_channel via thread_local_data.
+
+@channel_user_bp.route('/<channel_type>/connect-pair-code',
+                       methods=['POST'])
+@require_auth
+def channel_connect_pair_code_submit(channel_type: str):
+    """Re-enter gateway_qr pair-code flow with the submitted phone."""
+    import os as _os
+    data = request.get_json(silent=True) or {}
+    phone_raw = (data.get('phone') or '').strip()
+    if not phone_raw:
+        return jsonify({'success': False, 'error': 'phone required'}), 400
+    phone = ''.join(ch for ch in phone_raw if ch.isdigit())
+    if not phone:
+        return jsonify({
+            'success': False,
+            'error': 'phone must contain digits (E.164 without +).',
+        }), 400
+
+    # Env override is the same knob _start_gateway_qr_pair_push reads
+    # at line 1, so setting it here makes the helper find a value on
+    # re-entry.  Process-wide so subsequent users on the same node
+    # would inherit it — for multi-user nodes the proper fix is a
+    # per-user kv store, but the typical Nunba deploy is single-user
+    # and this matches the existing HEVOLVE_WHATSAPP_PHONE override
+    # discipline.
+    _os.environ['HEVOLVE_WHATSAPP_PHONE'] = phone
+
+    try:
+        from integrations.channels.metadata import get_channel_metadata
+        meta = get_channel_metadata(channel_type) or {}
+        # Local import to avoid circular at module load.
+        from hart_intelligence_entry import _start_gateway_qr_pair_push
+        _start_gateway_qr_pair_push(channel_type, meta)
+        return jsonify({
+            'success': True,
+            'message': (
+                f"Generating pair-code for {meta.get('display_name') or channel_type}. "
+                f"Watch chat for the code card."
+            ),
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f"connect-pair-code re-entry failed: {e}",
+        }), 500
+
+
 # ── Presence ───────────────────────────────────────────────────
 
 @channel_user_bp.route('/presence', methods=['GET'])

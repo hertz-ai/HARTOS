@@ -36,8 +36,12 @@ jobs:
             experimental-features = nix-command flakes
 
       - name: Run statix (antipattern detection)
+        # DeterminateSystems installer ships flakes-only — no `nixpkgs`
+        # channel attribute is registered, so `nix-env -iA nixpkgs.X`
+        # fails with `attribute 'nixpkgs' in selection path 'nixpkgs.X'
+        # not found`.  Use the flake form against the pinned input.
         run: |
-          nix-env -iA nixpkgs.statix
+          nix profile install nixpkgs#statix
           echo "::group::statix results"
           statix check nixos/ 2>&1 || true
           echo "::endgroup::"
@@ -46,7 +50,7 @@ jobs:
 
       - name: Run deadnix (unused code detection)
         run: |
-          nix-env -iA nixpkgs.deadnix
+          nix profile install nixpkgs#deadnix
           echo "::group::deadnix results"
           deadnix nixos/ 2>&1 || true
           echo "::endgroup::"

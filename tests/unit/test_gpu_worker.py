@@ -753,15 +753,25 @@ def test_ft20_pythonpath_propagates_parent_syspath():
     pathsep = os.pathsep
     child_paths = captured_env['PYTHONPATH'].split(pathsep)
 
-    # Every child entry must be a real directory (no empty / stale entries)
+    # Every child entry must be a real path (dir, or a zip/egg archive).
+    # Archives are allowed because cx_Freeze bundles application packages
+    # inside library.zip — excluding files broke worker spawn under
+    # frozen Nunba.exe (ModuleNotFoundError on the central dispatcher).
     for p in child_paths:
-        assert os.path.isdir(p), \
-            f'PYTHONPATH contains non-dir entry {p!r}'
+        is_archive = os.path.isfile(p) and p.lower().endswith(('.zip', '.egg'))
+        assert os.path.isdir(p) or is_archive, \
+            f'PYTHONPATH contains non-existent entry {p!r}'
 
     # At least one parent sys.path entry should appear in the child PYTHONPATH
-    parent_dirs = {p for p in sys.path if p and os.path.isdir(p)}
-    child_dirs = set(child_paths)
-    overlap = parent_dirs & child_dirs
+    parent_paths = {
+        p for p in sys.path
+        if p and (
+            os.path.isdir(p)
+            or (os.path.isfile(p) and p.lower().endswith(('.zip', '.egg')))
+        )
+    }
+    child_set = set(child_paths)
+    overlap = parent_paths & child_set
     assert overlap, (
         'No parent sys.path entries made it to the child PYTHONPATH. '
         'TTS engines (Indic Parler, Chatterbox, F5) will crash on '
@@ -918,3 +928,93 @@ def test_ft22_toolworker_python_exe_forwarded_to_gpu_worker():
         f"so GPUWorker._resolve_python_exe() picks python-embed/"
         f"sys.executable as before."
     )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FT 23: PYTHONPATH propagates library.zip / .egg entries
+# ═══════════════════════════════════════════════════════════════════
+#
+# In cx_Freeze frozen builds (Nunba.exe), the application's source tree
+# — HARTOS's ``integrations`` package included — is bundled inside
+# ``library.zip``.  The dispatcher module
+# ``integrations.service_tools.gpu_worker`` is imported by the spawned
+# subprocess; if library.zip is missing from the child's PYTHONPATH the
+# subprocess exits with ``ModuleNotFoundError: No module named
+# 'integrations'`` before the TTS engine ever loads.  Worker callers
+# observed this as "synthesize returned no path" with chatterbox_turbo /
+# f5_tts / indic_parler.
+#
+# Earlier propagation logic filtered sys.path with ``os.path.isdir``,
+# which excludes any .zip / .egg path because they are files, not
+# directories.  This test pins the contract: archive paths on the
+# parent's sys.path must reach the child's PYTHONPATH.
+
+def test_ft23_pythonpath_propagates_library_zip():
+    """library.zip / .egg entries from the parent's sys.path must flow
+    through to the child PYTHONPATH so frozen-build workers can import
+    application packages bundled inside the archive."""
+    from unittest.mock import patch, MagicMock
+    import tempfile, zipfile
+
+    # Build a real, openable zip file so os.path.isfile() returns True
+    tmp_zip = os.path.join(
+        tempfile.gettempdir(), 'gpu_worker_test_library.zip')
+    with zipfile.ZipFile(tmp_zip, 'w') as zf:
+        zf.writestr('marker.txt', 'sentinel for ft23')
+
+    w = GPUWorker(
+        name='zip_propagate',
+        module=DISPATCHER,
+        args=[ECHO_MODULE],
+        startup_timeout=2.0,
+        request_timeout=2.0,
+    )
+
+    captured_env = {}
+
+    class _FakeProc:
+        def __init__(self, *a, **kw):
+            captured_env.update(kw.get('env', {}))
+            self.stdin = MagicMock()
+            self.stdout = MagicMock()
+            self.stderr = MagicMock()
+            self.returncode = None
+        def poll(self):
+            return None
+        def kill(self):
+            pass
+        def wait(self, timeout=None):
+            return 0
+
+    # Patch sys.path inside the gpu_worker module to include our zip.
+    # Patching gw.sys.path directly is hostile (it's a shared list); we
+    # patch the gw module's sys reference with a thin shim that exposes
+    # an augmented path list, leaving the real sys untouched.
+    import integrations.service_tools.gpu_worker as gw_mod
+    augmented_path = list(sys.path) + [tmp_zip]
+    fake_sys = MagicMock()
+    fake_sys.path = augmented_path
+    fake_sys.platform = sys.platform
+    fake_sys.executable = sys.executable
+
+    try:
+        with patch.object(gw_mod, 'sys', fake_sys), \
+             patch('subprocess.Popen', side_effect=_FakeProc), \
+             patch.object(w, '_wait_ready'):
+            try:
+                w.start()
+            except Exception:
+                pass
+
+        child_paths = captured_env.get('PYTHONPATH', '').split(os.pathsep)
+        assert tmp_zip in child_paths, (
+            f'library.zip {tmp_zip!r} did not propagate to child '
+            f'PYTHONPATH. Frozen-build TTS workers will fail with '
+            f'ModuleNotFoundError on the central dispatcher. '
+            f'Got: {child_paths}'
+        )
+    finally:
+        try:
+            os.unlink(tmp_zip)
+        except OSError:
+            pass

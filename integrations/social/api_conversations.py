@@ -132,6 +132,46 @@ def list_messages(conv_id):
         return _err(str(e), 403)
 
 
+def _classify_message_if_enabled(message_id: str, content: str) -> None:
+    """Phase 7e — run ContentClassifier on a freshly sent / edited
+    conversation message when the moderation_v2 flag is on.
+
+    Same shape as create_post / create_comment in api.py: best-effort,
+    decision row lands in the audit trail, mod queue can review.  No
+    visibility flip today — the messages table doesn't have an
+    is_quarantined column, so soft-quarantine on a DM is purely an
+    auditable signal (the mod queue is the human review surface).
+
+    Encrypted DMs (e2e_enabled conversations) classify the plaintext
+    `content` from the request body — the same plaintext that
+    MentionService already parses for @-mentions on the same path.
+    The "encrypted at rest" property holds (server doesn't store
+    plaintext); this is consistent with the existing send-path that
+    sees plaintext during the request lifetime.
+
+    Guards:
+      - moderation_v2 flag off → no-op
+      - empty / missing message_id → no-op (defensive against weird
+        ConversationService.send_message return shapes)
+      - any classifier error → logged + swallowed (never breaks the
+        send / edit response shape)
+    """
+    if not g.feature_flags.get('moderation_v2', False):
+        return
+    if not message_id:
+        return
+    try:
+        from .content_classifier import ContentClassifier
+        ContentClassifier.classify_and_persist(
+            g.db, source_kind='message', source_id=message_id,
+            content=content,
+            tenant_id=getattr(g, 'tenant_id', None))
+    except Exception as e:
+        logger.warning(
+            "classify_message: classify_and_persist failed for "
+            "message=%s: %s", message_id, e)
+
+
 @conversations_bp.route('/<conv_id>/messages', methods=['POST'])
 @require_auth
 def send_message(conv_id):
@@ -151,6 +191,11 @@ def send_message(conv_id):
             content=content, thread_root_id=thread_root_id,
             metadata=metadata,
             tenant_id=getattr(g, 'tenant_id', None))
+        # Phase 7e moderation — same gate + classifier wiring used by
+        # create_post / create_comment in api.py.  Source_kind='message'
+        # so decisions land alongside post / comment rows in the mod
+        # queue (single canonical content_moderation_decisions table).
+        _classify_message_if_enabled(result.get('id'), content)
         return _ok(result, status=201)
     except ConversationError as e:
         return _err(str(e), 400)
@@ -169,9 +214,13 @@ def edit_message(conv_id, message_id):
     try:
         from .conversation_service import (
             ConversationService, ConversationError)
-        return _ok(ConversationService.edit_message(
+        result = ConversationService.edit_message(
             g.db, message_id=message_id, requester_id=g.user.id,
-            new_content=content))
+            new_content=content)
+        # Re-classify on edit — content can change between send and
+        # edit, so a previously-clean message might now be borderline.
+        _classify_message_if_enabled(message_id, content)
+        return _ok(result)
     except ConversationError as e:
         return _err(str(e), 400)
 

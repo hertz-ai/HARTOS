@@ -940,10 +940,17 @@ Hidden=false
             r = _run(['which', engine], timeout=2)
             if r and r.returncode == 0:
                 try:
+                    # Hide Windows console window on cross-platform engines
+                    # (mpv/vlc on Windows pop a cmd window for stdout
+                    # otherwise).  Routes through canonical helper for
+                    # consistency with livekit_supervisor / vlm probes.
+                    from core.subprocess_safe import hidden_popen_kwargs
                     proc = subprocess.Popen(
                         [engine, '--', path],
                         stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL)
+                        stderr=subprocess.DEVNULL,
+                        **hidden_popen_kwargs(),
+                    )
                     with _player_lock:
                         _player_proc['pid'] = proc.pid
                         _player_proc['path'] = path

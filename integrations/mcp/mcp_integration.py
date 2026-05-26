@@ -276,8 +276,18 @@ class MCPToolRegistry:
         server_name, tool_def = self.tools[tool_name]
         original_name = tool_def.get('name')
 
-        def tool_executor(**kwargs) -> str:
-            """Execute the MCP tool with given arguments"""
+        def tool_executor(**kwargs: Any) -> str:
+            """Execute the MCP tool with given arguments.
+
+            `**kwargs: Any` annotation is REQUIRED — autogen's
+            register_for_llm strict-mode rejects unannotated non-default
+            parameters.  Same fix pattern as
+            integrations/service_tools/registry.py:208.  Without this,
+            every MCP tool registration silently fails with the same
+            "All parameters ... must be annotated" warning and the
+            agent loses access to whichever MCP servers the user
+            configured.
+            """
             connector = self.servers.get(server_name)
             if not connector:
                 return json.dumps({
@@ -291,6 +301,44 @@ class MCPToolRegistry:
         # Set function metadata
         tool_executor.__name__ = tool_name
         tool_executor.__doc__ = tool_def.get('description', 'MCP tool')
+
+        # ── Attach typed __signature__ from MCP tool inputSchema ──
+        # Reuses the same JSON-Schema→Python-type synthesis helper as
+        # service_tools/registry.py.  MCP servers expose tool param shapes
+        # via the `inputSchema` field (MCP spec, JSON-RPC tools/list
+        # response) — same JSON-Schema dialect as service_tools'
+        # params_schema, so the same helper works for both.
+        #
+        # Fallback chain: inputSchema → parameters (autogen-translated
+        # field used at get_tool_definitions:254) → None.  Any error
+        # inside the helper returns None → closure stays on **kwargs: Any
+        # (today's behavior — strictly no regression).
+        try:
+            from integrations.service_tools.registry import (
+                _synthesize_signature_from_schema,
+            )
+            mcp_schema = (
+                tool_def.get('inputSchema')
+                or tool_def.get('parameters')
+                or None
+            )
+            if mcp_schema:
+                new_sig = _synthesize_signature_from_schema(
+                    mcp_schema, func_name=tool_name)
+                if new_sig is not None:
+                    try:
+                        tool_executor.__signature__ = new_sig
+                    except Exception as _attach_err:
+                        logger.debug(
+                            f"[mcp-schema] could not attach __signature__ "
+                            f"to {tool_name!r}: {type(_attach_err).__name__}: "
+                            f"{_attach_err} — keeping **kwargs: Any fallback")
+        except Exception as _import_err:
+            # service_tools may not be importable in degraded environments
+            # (cx_Freeze edge cases).  Stay on **kwargs: Any — no regression.
+            logger.debug(
+                f"[mcp-schema] helper unavailable for {tool_name!r}: "
+                f"{type(_import_err).__name__}: {_import_err}")
 
         return tool_executor
 

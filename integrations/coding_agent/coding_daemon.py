@@ -107,6 +107,25 @@ class CodingAgentDaemon:
 
         self._tick_count += 1
 
+        # USER-YIELD GATE — single canonical primitive that every
+        # background daemon consults before burning CPU/GIL/LLM/GPU.
+        # ``should_yield_to_user()`` covers BOTH user-activity (chat in
+        # last 10 min OR live CREATE pipeline) AND system-pressure
+        # (model_lifecycle.get_system_pressure().throttle_factor < 0.1)
+        # in one call.  agent_daemon._tick, agent_daemon._proactive_hive_tick,
+        # and hive_benchmark_prover._continuous_loop already consult it
+        # — coding_daemon was the only background loop missing it,
+        # which is why py-spy showed full autogen turns running on the
+        # daemon thread while the user was actively chatting.  No new
+        # throttle, no parallel resource-aware system — just plug into
+        # the existing gate.
+        try:
+            from integrations.agent_engine.dispatch import should_yield_to_user
+            if should_yield_to_user():
+                return
+        except Exception:
+            pass  # gate import unavailable — fall through (fail-open)
+
         # BUDGET GATE: platform affordability check before dispatching coding tasks
         try:
             from integrations.agent_engine.budget_gate import check_platform_affordability
@@ -119,14 +138,48 @@ class CodingAgentDaemon:
 
         db = get_db()
         try:
+            # ORDER BY: never-dispatched goals (NULL last_dispatched_at)
+            # jump to the front, then by oldest dispatch.  Without this,
+            # SQLite returns rows in insert/rowid order — a handful of
+            # already-dispatched goals (whose 30s cooldown expires at
+            # the same cadence as the daemon's tick interval) saturate
+            # the limited idle-agent slots every tick, and never-yet-
+            # dispatched goals at the back of the queue (e.g. the 49
+            # self_heal goals observed live 2026-05-07) starve forever.
+            #
+            # SQLAlchemy emits `ORDER BY ... NULLS FIRST` for the
+            # `nulls_first()` modifier; SQLite supports the syntax
+            # natively since 3.30 (Python 3.11 ships 3.49+).  For
+            # backends without the modifier, the .nullsfirst() call
+            # is a no-op and rows still order by last_dispatched_at
+            # asc (NULLs land first or last depending on the SQL
+            # dialect — both orderings prevent the starvation pattern
+            # because never-dispatched goals are clearly distinguishable
+            # from the ones that just dispatched 30s ago).
+            from sqlalchemy import asc
             goals = db.query(AgentGoal).filter(
                 AgentGoal.status == 'active',
                 AgentGoal.goal_type.in_(CODING_GOAL_TYPES),
+            ).order_by(
+                asc(AgentGoal.last_dispatched_at).nulls_first(),
             ).all()
             if not goals:
                 return
 
-            idle_agents = IdleDetectionService.get_idle_opted_in_agents(db)
+            # Use ``get_idle_agent_personas`` — same canonical gate the
+            # agent_daemon uses (agent_daemon.py:555-563).  CODING_GOAL_TYPES
+            # are LOCAL maintenance goals (self_heal of THIS node's broken
+            # venvs, autoresearch on THIS repo, code_evolution against THIS
+            # codebase) — they fix this node, never need human-consent
+            # routing.  Do NOT use ``get_idle_opted_in_agents``: that's the
+            # distributed-compute privacy gate for peer-share workloads,
+            # which is gated downstream by ``dispatch_goal_distributed``
+            # already.  Mismatch silently returned [] on installs where no
+            # human had opted-in → daemon stalled with self_heal goals
+            # piling up (live-evidence 2026-05-07: 42 self_heal goals,
+            # 0 with last_dispatched_at populated).  Same root cause +
+            # same fix as the agent_daemon's 2026-05-01 switch.
+            idle_agents = IdleDetectionService.get_idle_agent_personas(db)
             if not idle_agents:
                 return
 

@@ -434,3 +434,162 @@ def test_endpoint_round_trip(app_client, monkeypatch):
     data = r.get_json()['data']
     assert any(c['id'] == conv_id for c in data['deltas']['conversations'])
     assert any(m['content'] == 'hi via api' for m in data['deltas']['messages'])
+
+
+# ── Inbox aggregation (additive on top of /sync — zero break) ───────
+
+def test_inbox_rows_flattens_messages(fresh_db, monkeypatch):
+    """Messages bucket is shaped into InboxRow with kind='message',
+    parent linkage preserved, deep_link populated."""
+    _silence_realtime(monkeypatch)
+    db, _ = fresh_db
+    a, b = _seed(db)
+    from integrations.social.conversation_service import ConversationService
+    conv = ConversationService.create(
+        db, kind='dm', member_ids=[b.id], created_by=a.id)
+    ConversationService.send_message(
+        db, conv_id=conv['id'], author_id=a.id, content='hi via inbox')
+
+    from integrations.social.sync_service import SyncService
+    res = SyncService.inbox_rows(db, user_id=a.id)
+    assert 'rows' in res and isinstance(res['rows'], list)
+    msg_rows = [r for r in res['rows'] if r['kind'] == 'message']
+    assert len(msg_rows) == 1
+    row = msg_rows[0]
+    assert row['id'].startswith('msg_')
+    assert row['parent_kind'] == 'conversation'
+    assert row['parent_id'] == conv['id']
+    assert row['sender_id'] == a.id
+    assert row['content_preview'] == 'hi via inbox'
+    assert row['deep_link'] == f"hevolveai://conversation/{conv['id']}"
+    assert row['last_activity_at'] is not None
+
+
+def test_inbox_rows_chronological_merge(fresh_db, monkeypatch):
+    """Multiple kinds (message + friend_request) merge into one
+    flat list sorted by activity timestamp ASC.  Mirrors /sync's own
+    cursor sort so pagination semantics line up."""
+    _silence_realtime(monkeypatch)
+    db, _ = fresh_db
+    a, b = _seed(db)
+    from integrations.social.friend_service import FriendService
+    from integrations.social.conversation_service import ConversationService
+
+    # First: a friend request from b → a (older row)
+    FriendService.send_request(db, from_user_id=b.id, to_user_id=a.id)
+
+    # Then: a message in a DM
+    conv = ConversationService.create(
+        db, kind='dm', member_ids=[b.id], created_by=a.id)
+    ConversationService.send_message(
+        db, conv_id=conv['id'], author_id=b.id, content='ping')
+
+    from integrations.social.sync_service import SyncService
+    res = SyncService.inbox_rows(db, user_id=a.id)
+    rows = res['rows']
+    assert len(rows) >= 2
+    # Strictly non-decreasing by activity ts then id.
+    for prev, nxt in zip(rows, rows[1:]):
+        assert ((prev.get('last_activity_at') or '')
+                <= (nxt.get('last_activity_at') or '')
+                or prev.get('id', '') <= nxt.get('id', ''))
+
+
+def test_inbox_rows_pagination_via_cursor(fresh_db, monkeypatch):
+    """Cursor inherits /sync semantics — passing back the returned
+    cursor as `since` advances past consumed rows."""
+    _silence_realtime(monkeypatch)
+    db, _ = fresh_db
+    a, b = _seed(db)
+    from integrations.social.conversation_service import ConversationService
+    conv = ConversationService.create(
+        db, kind='dm', member_ids=[b.id], created_by=a.id)
+    for i in range(3):
+        ConversationService.send_message(
+            db, conv_id=conv['id'], author_id=a.id, content=f"m{i}")
+
+    from integrations.social.sync_service import SyncService
+    page1 = SyncService.inbox_rows(db, user_id=a.id, limit_per_kind=2)
+    assert len(page1['rows']) >= 1
+    page2 = SyncService.inbox_rows(
+        db, user_id=a.id, since=page1['cursor'], limit_per_kind=10)
+    # Same row never appears in both pages.
+    page1_ids = {r['id'] for r in page1['rows']}
+    page2_ids = {r['id'] for r in page2['rows']}
+    assert page1_ids.isdisjoint(page2_ids), (
+        f"row appeared in both pages: {page1_ids & page2_ids}")
+
+
+def test_inbox_endpoint_round_trip(app_client, monkeypatch):
+    """End-to-end: POST a message via the conversations API, GET
+    /api/social/sync/inbox, confirm the row is present in the
+    flattened response shape."""
+    _silence_realtime(monkeypatch)
+    client, db = app_client
+    a, b = _seed(db)
+    from integrations.social import auth
+    tok_a = auth.generate_jwt(a.id, a.username, 'flat')
+
+    r = client.post('/api/social/conversations',
+                    json={'kind': 'dm', 'member_ids': [b.id]},
+                    headers={'Authorization': f'Bearer {tok_a}'})
+    conv_id = r.get_json()['data']['id']
+    client.post(f'/api/social/conversations/{conv_id}/messages',
+                json={'content': 'inbox round-trip'},
+                headers={'Authorization': f'Bearer {tok_a}'})
+
+    r = client.get('/api/social/sync/inbox',
+                   headers={'Authorization': f'Bearer {tok_a}'})
+    assert r.status_code == 200
+    data = r.get_json()['data']
+    assert 'rows' in data and 'cursor' in data and 'has_more' in data
+    matches = [r for r in data['rows']
+               if r['kind'] == 'message'
+               and r['content_preview'] == 'inbox round-trip']
+    assert matches, f"message not in inbox rows: {data['rows']}"
+
+
+def test_inbox_endpoint_503_when_flag_off(app_client, monkeypatch):
+    """When sync_v1 flag is OFF the endpoint returns the safe empty
+    shape (mirrors /sync's else_value behavior — no 503/500)."""
+    _silence_realtime(monkeypatch)
+    monkeypatch.delenv('HEVOLVE_FLAG_SYNC_V1', raising=False)
+    client, db = app_client
+    a, _b = _seed(db)
+    from integrations.social import auth
+    tok_a = auth.generate_jwt(a.id, a.username, 'flat')
+    r = client.get('/api/social/sync/inbox',
+                   headers={'Authorization': f'Bearer {tok_a}'})
+    assert r.status_code == 200
+    data = r.get_json()['data']
+    assert data == {'cursor': '0', 'has_more': False, 'rows': []}
+
+
+def test_inbox_does_not_break_existing_sync(app_client, monkeypatch):
+    """Regression: /api/social/sync still returns the per-kind bucket
+    shape every existing client expects.  inbox_rows() additions must
+    not affect the deltas() route."""
+    _silence_realtime(monkeypatch)
+    client, db = app_client
+    a, b = _seed(db)
+    from integrations.social import auth
+    tok_a = auth.generate_jwt(a.id, a.username, 'flat')
+
+    r = client.post('/api/social/conversations',
+                    json={'kind': 'dm', 'member_ids': [b.id]},
+                    headers={'Authorization': f'Bearer {tok_a}'})
+    conv_id = r.get_json()['data']['id']
+    client.post(f'/api/social/conversations/{conv_id}/messages',
+                json={'content': 'still per-kind'},
+                headers={'Authorization': f'Bearer {tok_a}'})
+
+    r = client.get('/api/social/sync',
+                   headers={'Authorization': f'Bearer {tok_a}'})
+    assert r.status_code == 200
+    data = r.get_json()['data']
+    # Pre-existing /sync contract: per-kind buckets remain.
+    assert 'deltas' in data
+    assert 'conversations' in data['deltas']
+    assert 'messages' in data['deltas']
+    # 'rows' belongs to /sync/inbox; must NOT leak into /sync.
+    assert 'rows' not in data

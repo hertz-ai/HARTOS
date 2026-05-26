@@ -278,24 +278,17 @@ class WorldModelBridge:
         SECURITY: Integrity verification required before enabling in-process.
         If HevolveAI files don't match the signed manifest, fall back to HTTP.
         """
-        # Integrity gate: verify HevolveAI installation before in-process
-        try:
-            from security.source_protection import SourceProtectionService
-            integrity = SourceProtectionService.verify_hevolveai_integrity()
-            if not integrity.get('verified', False):
-                mismatched = integrity.get('mismatched_files', [])
-                if mismatched:
-                    logger.warning(
-                        f"[WorldModelBridge] HevolveAI integrity FAILED: "
-                        f"{len(mismatched)} mismatched files — forcing HTTP mode")
-                    logger.info(
-                        f"[WorldModelBridge] HTTP mode: {self._api_url}")
-                    return
-        except ImportError:
-            pass  # source_protection not available — skip check
-        except Exception as e:
-            logger.debug(f"[WorldModelBridge] Integrity check skipped: {e}")
-
+        # #224 — short-circuit BEFORE the integrity scan when in-process
+        # mode can't apply anyway.  Without this, the very first chat
+        # request on a fresh boot blocks for ~2 minutes:
+        # `verify_hevolveai_integrity` SHA-256-hashes every file in the
+        # `hevolveai` package (1000s of files via `pkg_root.rglob('*')`)
+        # — and that scan runs even when hart_intelligence isn't loaded
+        # so the path it gates (in-process mode) is unreachable.  Live
+        # evidence 2026-05-20 RequestID 5390c08e: 116s between draft
+        # ready (19:27:48) and "[WorldModelBridge] HTTP mode" log
+        # (19:29:44) — that whole window is this scan.
+        #
         # Worker threads MUST NOT trigger a `from hart_intelligence import …`
         # here.  The hart_intelligence import chain (langchain, transformers,
         # autogen, multimodal stacks) can take 300+ seconds on first load,
@@ -316,6 +309,33 @@ class WorldModelBridge:
         # import; the bootstrap path will retry the in-process upgrade on
         # the next record_interaction once it finishes the pre-warm.
         mod = sys.modules.get('hart_intelligence')
+        if mod is None:
+            # In-process is structurally impossible — no integrity scan.
+            logger.info(
+                f"[WorldModelBridge] HTTP mode: {self._api_url} "
+                f"(hart_intelligence not loaded; integrity scan skipped)")
+            return
+
+        # Integrity gate: verify HevolveAI installation before in-process.
+        # Only runs when in-process is actually reachable (see short-
+        # circuit above) so the SHA-256 scan never blocks a chat request
+        # that wasn't going to use in-process anyway.
+        try:
+            from security.source_protection import SourceProtectionService
+            integrity = SourceProtectionService.verify_hevolveai_integrity()
+            if not integrity.get('verified', False):
+                mismatched = integrity.get('mismatched_files', [])
+                if mismatched:
+                    logger.warning(
+                        f"[WorldModelBridge] HevolveAI integrity FAILED: "
+                        f"{len(mismatched)} mismatched files — forcing HTTP mode")
+                    logger.info(
+                        f"[WorldModelBridge] HTTP mode: {self._api_url}")
+                    return
+        except ImportError:
+            pass  # source_protection not available — skip check
+        except Exception as e:
+            logger.debug(f"[WorldModelBridge] Integrity check skipped: {e}")
         if mod is not None:
             try:
                 _get_provider = getattr(mod, 'get_learning_provider', None)
@@ -329,6 +349,26 @@ class WorldModelBridge:
                         self._in_process = True
                         logger.info(
                             "[WorldModelBridge] In-process mode: direct Python calls")
+                        # Direction B of HARTOS bridge: register an inbound
+                        # hook so WAMP-received skills (from other HevolveAI
+                        # nodes elsewhere on the hive) fan back into HARTOS
+                        # gossip. This is what makes the federation
+                        # hierarchical: a skill discovered by region A
+                        # propagates via WAMP to region B's HevolveAI, then
+                        # via this hook into region B's HARTOS gossip,
+                        # reaching HARTOS-only peers without an HevolveAI
+                        # instance.
+                        if hive is not None and hasattr(
+                                hive, 'set_inbound_skill_hook'):
+                            try:
+                                hive.set_inbound_skill_hook(
+                                    self._on_inbound_wamp_skill)
+                                logger.info(
+                                    "[WorldModelBridge] B: registered "
+                                    "inbound_skill_hook on local HiveMind")
+                            except Exception as e:
+                                logger.debug(
+                                    f"[WorldModelBridge] B: hook reg failed: {e}")
                         return
             except Exception as e:
                 logger.debug(
@@ -336,19 +376,131 @@ class WorldModelBridge:
         logger.info(
             f"[WorldModelBridge] HTTP mode: {self._api_url}")
 
+    def _on_inbound_wamp_skill(self, packet: Dict, source: str) -> None:
+        """Direction B handler — invoked by HevolveAI HiveMind for every
+        remote WAMP skill that passed echo-prevention.
+
+        Responsibilities:
+            1. Bookkeeping: bump inbound counter for dashboards.
+            2. Safety: re-run ConstructiveFilter + WorldModelSafetyBounds
+               on the inbound packet before forwarding. The remote node
+               applied its own gates before publishing, but we cannot
+               trust a remote node's gate decisions on a shared realm.
+            3. Fan-out: gossip a `ralt_skill_available` notification to
+               HARTOS peers so HARTOS-only nodes (no embedded HevolveAI
+               HiveMind, just the bridge) also learn about the skill.
+
+        Failure modes never propagate to the caller:
+            - Filter failures → log + drop, no gossip
+            - Gossip failures → log at debug, return silently
+            - Exceptions → caught by the HiveMind hook wrapper
+
+        Args:
+            packet: WAMP `hivemind.skill.share` payload as it arrives.
+                Expected keys: 'event', 'task_id', 'packet_wire' (when
+                event=='ralt'), or 'deltas'/'grads'/'x' for tensor events.
+            source: source_agent identifier from the WAMP message.
+                Pre-filtered by HiveMind echo-prev (won't match local agents).
+        """
+        # Bookkeeping
+        with self._lock:
+            self._stats.setdefault('total_wamp_skills_received', 0)
+            self._stats['total_wamp_skills_received'] += 1
+
+        # Only fan out RALT skill events to HARTOS gossip. Tensor-only
+        # events (consolidation/gradient/kernel/Hebbian) are already
+        # applied to the local HevolveAI weights by HiveMind's queue/drain
+        # path; HARTOS-side peers don't ingest raw tensors over gossip.
+        event_type = packet.get('event') if isinstance(packet, dict) else None
+        if event_type != 'ralt':
+            return
+
+        packet_wire = packet.get('packet_wire') or {}
+        if not isinstance(packet_wire, dict) or not packet_wire:
+            return
+
+        # Replay safety gates — we cannot trust remote node's filter run.
+        try:
+            from security.hive_guardrails import ConstructiveFilter
+            desc = packet_wire.get('description', '') or ''
+            passed, reason = ConstructiveFilter.check_output(desc)
+            if not passed:
+                logger.info(
+                    f"[WorldModelBridge] B: dropped inbound skill from "
+                    f"{source}: ConstructiveFilter rejected ({reason})")
+                with self._lock:
+                    self._stats.setdefault(
+                        'total_inbound_skills_filtered', 0)
+                    self._stats['total_inbound_skills_filtered'] += 1
+                return
+        except ImportError:
+            pass  # constructive_filter unavailable — skip check
+
+        try:
+            from security.hive_guardrails import WorldModelSafetyBounds
+            passed, reason = WorldModelSafetyBounds.gate_ralt_ingest(
+                packet_wire, source) if hasattr(
+                WorldModelSafetyBounds, 'gate_ralt_ingest') else (True, '')
+            if not passed:
+                logger.info(
+                    f"[WorldModelBridge] B: dropped inbound skill from "
+                    f"{source}: SafetyBounds rejected ({reason})")
+                with self._lock:
+                    self._stats.setdefault(
+                        'total_inbound_skills_filtered', 0)
+                    self._stats['total_inbound_skills_filtered'] += 1
+                return
+        except ImportError:
+            pass
+
+        # Fan out to HARTOS gossip so HARTOS-only peers learn.
+        try:
+            from integrations.social.peer_discovery import gossip
+            gossip.broadcast({
+                'type': 'ralt_skill_available',
+                'packet_summary': {
+                    'task_id': packet.get('task_id') or packet_wire.get('task_id'),
+                    'description': packet_wire.get('description', '')[:200],
+                    'complexity': packet_wire.get('complexity', 'unknown'),
+                },
+                'source_node': source,
+                'source_api_url': self._api_url,
+                'timestamp': time.time(),
+                'bridged_from_wamp': True,  # provenance — distinguishes from native gossip
+            })
+            with self._lock:
+                self._stats.setdefault('total_wamp_to_gossip_bridged', 0)
+                self._stats['total_wamp_to_gossip_bridged'] += 1
+            logger.info(
+                f"[WorldModelBridge] B: bridged WAMP skill from {source} "
+                f"to HARTOS gossip (task={packet.get('task_id')})")
+        except Exception as e:
+            logger.debug(
+                f"[WorldModelBridge] B: gossip fan-out failed: {e}")
+
     # ─── Record interactions (auto-learn) ────────────────────────────
 
     def record_interaction(self, user_id: str, prompt_id: str,
                            prompt: str, response: str,
                            model_id: str = None, latency_ms: float = 0,
                            node_id: str = None, goal_id: str = None,
-                           attribution_chain: dict = None):
+                           attribution_chain: dict = None,
+                           escalation_reason: str = None):
         """Record every agent interaction as training data for HevolveAI.
 
         Called after EVERY /chat response.  Batches experiences and flushes
         them to HevolveAI (in-process or HTTP).
         HevolveAI auto-learns from every completion (3-priority queue:
         expert > reality > distillation).
+
+        ``escalation_reason`` (optional) — when the speculative dispatcher
+        promoted this turn from draft to expert path, the canonical
+        reason value from
+        ``integrations.agent_engine.escalation_reasons.EscalationReason``.
+        Stored on the experience so HevolveAI's distillation can weight
+        refusal-overridden / parse-failure traces differently from
+        clean classifier-delegate traces.  ``None`` when the draft
+        answered as final (no escalation).
 
         GUARDRAIL: ConstitutionalFilter screens before storage.
         """
@@ -386,6 +538,8 @@ class WorldModelBridge:
         # receives only the primary experience fields.
         if attribution_chain is not None:
             experience['attribution_chain'] = attribution_chain
+        if escalation_reason:
+            experience['escalation_reason'] = escalation_reason
 
         # PRIVACY: Redact secrets + anonymize user before shared ingestion.
         # The hive must NEVER leak secrets from one user to another.
@@ -1179,10 +1333,53 @@ class WorldModelBridge:
             }, targets=target_nodes)
             with self._lock:
                 self._stats['total_skills_distributed'] += 1
-            return {'success': True}
         except Exception as e:
-            logger.debug(f"RALT distribution skipped: {e}")
-            return {'success': False, 'reason': str(e)}
+            logger.debug(f"RALT distribution skipped (gossip): {e}")
+            # Gossip failed; still try WAMP fan-out below before returning.
+
+        # Direction A of HARTOS ↔ HevolveAI bridge: publish the same skill
+        # to WAMP `hivemind.skill.share` so HevolveAI backend nodes on the
+        # hive bus (other tenants on the same realm, or peers in this
+        # tenant) ingest it via their HiveMind.on_remote_skill subscriber.
+        # This is the tensor-convergence path; gossip above is the
+        # skill-notification path. Both fire from the same caller so
+        # hierarchical federation is exercised over both transports.
+        #
+        # Safety: this fan-out runs ONLY AFTER the existing CCT +
+        # WorldModelSafetyBounds + ConstructiveFilter gates above have
+        # passed (we reach this line only on their success). source_agent
+        # is the LOCAL HevolveAI entity_id so the bundled HiveMind's
+        # `if source in self.agents` echo-prevention catches the WAMP
+        # loopback and we don't double-apply our own skill.
+        wamp_published = False
+        if self._in_process and self._hive_mind is not None and self._provider is not None:
+            try:
+                _local_entity = getattr(
+                    getattr(self._provider, 'reality_grounded_learner', None),
+                    'entity_id', None)
+                if _local_entity:
+                    self._hive_mind.publish_skill(
+                        skill_packet={
+                            'event': 'ralt',
+                            'task_id': ralt_packet.get('task_id'),
+                            'packet_wire': ralt_packet,
+                            'origin': 'world_model_bridge',
+                            'origin_node': node_id,
+                        },
+                        source_agent=_local_entity,
+                    )
+                    wamp_published = True
+                    with self._lock:
+                        self._stats.setdefault('total_skills_wamp_published', 0)
+                        self._stats['total_skills_wamp_published'] += 1
+                    logger.info(
+                        f"[WorldModelBridge] A: published skill to WAMP "
+                        f"hivemind.skill.share (task={ralt_packet.get('task_id')})")
+            except Exception as e:
+                logger.debug(
+                    f"[WorldModelBridge] A: WAMP fan-out failed: {e}")
+
+        return {'success': True, 'wamp_published': wamp_published}
 
     # ─── RALT skill ingestion (inbound, peer → local) ────────────────
     #

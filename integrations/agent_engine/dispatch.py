@@ -68,6 +68,38 @@ def _cb_is_open() -> bool:
         return True
 
 
+def _internal_auth_headers() -> Optional[Dict[str, str]]:
+    """Build auth headers for internal /chat dispatch.
+
+    Why: on central/regional tiers, security/middleware.py Gate 2 rejects
+    unauthenticated internal /chat dispatches with HTTP 401
+    "Authentication required (Bearer token)". Without this header the
+    autonomous outreach flywheel silently 401'd from 2026-03-14 onward.
+
+    Prefers HEVOLVE_API_KEY (X-API-Key) if set; otherwise mints a
+    short-lived system_daemon JWT via integrations.social.auth.
+    Returns None on flat-tier deployments where auth is unneeded
+    (caller passes None to pooled_post → no header attached).
+    """
+    headers: Dict[str, str] = {}
+    try:
+        api_key = os.environ.get('HEVOLVE_API_KEY', '').strip()
+        if api_key:
+            headers['X-API-Key'] = api_key
+        else:
+            from integrations.social.auth import generate_jwt as _mint_jwt
+            jwt = _mint_jwt(
+                user_id='system_daemon',
+                username='system_daemon',
+                role='admin',
+            )
+            if jwt:
+                headers['Authorization'] = f'Bearer {jwt}'
+    except Exception as e:
+        logger.debug(f"daemon-dispatch auth header mint failed (non-fatal): {e}")
+    return headers or None
+
+
 # ── LLM concurrency control ──────────────────────────────────────────────
 # Local llama-server degrades exponentially with concurrent requests
 # (KV cache thrashing). Allow only N concurrent local LLM calls.
@@ -120,25 +152,38 @@ def should_yield_to_user() -> bool:
     """Single canonical gate every background daemon must call.
 
     Returns True when the daemon must skip its tick / iteration
-    (yield CPU, GIL, LLM, GPU to the user-facing path).  Two
+    (yield CPU, GIL, LLM, GPU to the user-facing path).  Three
     independent yield reasons:
 
     1. ``is_user_recently_active()`` — user chatted in the last 10
        minutes or a CREATE pipeline is running.
     2. ``model_lifecycle.get_system_pressure().throttle_factor < 0.1``
-       — VRAM/CPU pressure is so high the throttle factor has
+       — VRAM/CPU pressure is so high the LLM throttle factor has
        collapsed; running another LLM call would saturate the
        system and starve the user.
+    3. ``ResourceGovernor.get_throttle() < 0.3`` — generic CPU/RAM
+       pressure that is NOT LLM-shaped (e.g., a runaway Python loop,
+       a hammering background daemon, OS-level memory pressure).
+       The governor combines its mode (ACTIVE/IDLE/SLEEP), the
+       model_lifecycle pressure, AND its own per-process pressure
+       calc into a single 0.0-1.0 throttle factor (see
+       ``core.resource_governor._calculate_throttle``).  Below 0.3
+       means "the system is hot enough that user-facing latency is
+       at risk" — daemons must yield even if the LLM-specific
+       throttle is fine.  Captures the case the user flagged
+       2026-05-10: coding_daemon's autogen turns burning CPU/GIL
+       while the user was actively chatting, model_lifecycle's
+       LLM-only pressure didn't see it, gate passed, system slowed.
 
-    Both checks are best-effort — failure to import / read either
+    All three checks are best-effort — failure to import / read any
     signal returns False (don't block daemons on a missing module).
     The function is the single source of truth for daemon yield
     semantics: ``agent_daemon._tick``,
-    ``agent_daemon._proactive_hive_tick``, and
-    ``hive_benchmark_prover._continuous_loop`` all consult it,
-    so adding a third yield reason (e.g. CPU-overload from
-    psutil, or a future battery-saver mode) means editing exactly
-    this function — no per-daemon copy-paste.
+    ``agent_daemon._proactive_hive_tick``,
+    ``hive_benchmark_prover._continuous_loop``, and
+    ``coding_daemon._tick`` all consult it, so adding a fourth
+    yield reason (e.g. battery-saver mode, network-pressure)
+    means editing exactly this function — no per-daemon copy-paste.
     """
     try:
         if is_user_recently_active():
@@ -150,6 +195,13 @@ def should_yield_to_user() -> bool:
             get_model_lifecycle_manager)
         _pressure = get_model_lifecycle_manager().get_system_pressure()
         if _pressure.get('throttle_factor', 1.0) < 0.1:
+            return True
+    except Exception:
+        pass
+    try:
+        from core.resource_governor import get_governor
+        _gov = get_governor()
+        if _gov is not None and _gov.get_throttle() < 0.3:
             return True
     except Exception:
         pass
@@ -530,7 +582,8 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
     base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
 
     try:
-        resp = pooled_post(f'{base_url}/chat', json=body, timeout=120)
+        resp = pooled_post(f'{base_url}/chat', json=body,
+                           headers=_internal_auth_headers(), timeout=120)
         if resp.status_code == 200:
             _cb_record_success()
             result = resp.get_json() if hasattr(resp, 'get_json') else resp.json()
@@ -638,7 +691,8 @@ def _dispatch_single_instruction(base_url: str, user_id: str, inst,
         'task_source': 'own',
     }
     try:
-        resp = pooled_post(f'{base_url}/chat', json=body, timeout=300)
+        resp = pooled_post(f'{base_url}/chat', json=body,
+                           headers=_internal_auth_headers(), timeout=300)
         if resp.status_code == 200:
             result_text = resp.json().get('response', '')
             return (inst.id, result_text[:500], None)

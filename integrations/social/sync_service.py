@@ -364,11 +364,20 @@ class SyncService:
         if cursor_id:
             params['id'] = cursor_id
         params.update(tenant_params)
+        # #200 — P2P unread tracking.  v46 migration added
+        # memberships.last_read_at as the per-(user, conversation) read
+        # cursor.  Compute is_unread per message as
+        # (msg.created_at > membership.last_read_at) AND author != viewer.
+        # Self-authored messages are NEVER unread; legacy memberships
+        # without a last_read_at (pre-v46) treat everything as unread
+        # until the user opens the conversation and the mark-read
+        # endpoint fires.
         rows = db.execute(text(
             "SELECT msg.id, msg.parent_kind, msg.parent_id, "
             "       msg.thread_root_id, msg.author_id, msg.agent_kind, "
             "       msg.content, msg.depth, msg.edited_at, "
             "       msg.is_deleted, msg.metadata_json, msg.created_at, "
+            "       m.last_read_at, "
             "       COALESCE(msg.edited_at, msg.created_at) AS act_ts "
             "FROM messages msg "
             "JOIN memberships m ON m.parent_id = msg.parent_id "
@@ -385,8 +394,10 @@ class SyncService:
         rows = rows[:limit]
         out = []
         max_seen = _encode_cursor(cursor_ts, cursor_id)
+        # #200 — viewer id captured so _row_message can compare
+        # author_id and skip is_unread for self-authored messages.
         for row in rows:
-            ts = str(row[12] or '')
+            ts = str(row[13] or '')
             max_seen = _max_cursor(max_seen, _encode_cursor(ts, row[0]))
             out.append({
                 'id': row[0], 'parent_kind': row[1], 'parent_id': row[2],
@@ -397,6 +408,12 @@ class SyncService:
                 'is_deleted': bool(row[9]),
                 'metadata_json': row[10],
                 'created_at': str(row[11]) if row[11] else None,
+                # #200: read-cursor for the viewer's membership in
+                # this conversation.  None for legacy memberships.
+                'membership_last_read_at': str(row[12]) if row[12] else None,
+                # #200: viewer id, propagated so _row_message can
+                # compare against author_id without re-querying.
+                '_viewer_id': user_id,
             })
         return out, max_seen, capped
 
@@ -624,6 +641,242 @@ class SyncService:
                 'created_at': str(row[7]) if row[7] else None,
             })
         return out, max_seen, capped
+
+
+# ── Unified inbox view (additive, layered on top of deltas) ──────────
+#
+# `SyncService.inbox_rows(...)` reshapes the per-kind buckets returned
+# by `deltas(...)` into a single chronological list of "InboxRow" dicts
+# the unified-inbox UI consumes directly.  No new SQL — calls deltas()
+# internally and maps each per-kind row through a thin shaper.
+#
+# This keeps the per-kind fetchers + the existing /sync route + every
+# existing client untouched.  /sync continues to return per-kind buckets
+# for callers that want them (multi-device replay, restore, etc.); the
+# new /sync/inbox route exposes the flattened view for the inbox UI
+# only.
+#
+# InboxRow shape (the contract every client renders directly):
+#   {
+#     'id':                 str,    # source-table id, kind-prefixed
+#                                   # for client-side dedup ('msg_', 'mnt_', ...)
+#     'kind':               str,    # 'message'|'mention'|'invite'
+#                                   # |'friend_request'|'notification'
+#     'parent_kind':        Optional[str],   # 'conversation'|'post'
+#                                   # |'comment'|'community'|'message'
+#     'parent_id':          Optional[str],
+#     'sender_id':          Optional[str],
+#     'sender_kind':        Optional[str],   # 'human'|'agent'
+#     'content_preview':    str,    # 140 char max
+#     'is_unread':          bool,
+#     'last_activity_at':   Optional[str],   # ISO ts, sortable
+#     'deep_link':          str,    # hevolveai://... for tap navigation
+#   }
+#
+# Sort: ASC by last_activity_at then id (matches /sync cursor semantics
+# so the same `since` cursor advances cleanly).
+
+
+def _row_message(r: dict) -> dict:
+    parent_kind = r.get('parent_kind') or 'conversation'
+    parent_id = r.get('parent_id') or ''
+    # #200 — proper P2P unread tracking.
+    # Previous logic: `is_unread = not bool(is_deleted)` which meant
+    # every non-deleted message stayed forever unread.  Now: a message
+    # is unread iff (a) it was NOT authored by the viewer AND (b) its
+    # created_at is after the viewer's membership.last_read_at (or the
+    # viewer never set a read cursor).  Self-authored messages are
+    # never unread; deleted messages are never unread either.
+    viewer_id = r.get('_viewer_id')
+    author_id = r.get('author_id')
+    is_deleted = bool(r.get('is_deleted'))
+    is_self_authored = (
+        viewer_id is not None and author_id is not None
+        and str(viewer_id) == str(author_id)
+    )
+    if is_deleted or is_self_authored:
+        is_unread = False
+    else:
+        last_read = r.get('membership_last_read_at')
+        msg_ts = r.get('created_at')
+        if not last_read:
+            is_unread = True  # No read cursor yet — everything is unread
+        elif msg_ts and msg_ts > last_read:
+            is_unread = True
+        else:
+            is_unread = False
+    return {
+        'id': f"msg_{r.get('id')}",
+        'kind': 'message',
+        'parent_kind': parent_kind,
+        'parent_id': parent_id,
+        'sender_id': r.get('author_id'),
+        'sender_kind': r.get('agent_kind') or 'human',
+        'content_preview': (r.get('content') or '')[:140],
+        'is_unread': is_unread,
+        'last_activity_at': r.get('edited_at') or r.get('created_at'),
+        'deep_link': f"hevolveai://{parent_kind}/{parent_id}",
+    }
+
+
+def _row_mention(r: dict) -> dict:
+    src_kind = r.get('source_kind') or ''
+    src_id = r.get('source_id') or ''
+    # @-mention: tap deep-links to wherever the user was mentioned
+    # (post / comment / message thread).  Source author isn't carried
+    # on the Mention row — the renderer fetches it lazily if it wants
+    # to show the name; the row itself is enough for inbox ordering
+    # + tap-to-navigate.
+    return {
+        'id': f"mnt_{r.get('id')}",
+        'kind': 'mention',
+        'parent_kind': src_kind or None,
+        'parent_id': src_id or None,
+        'sender_id': None,
+        'sender_kind': None,
+        'content_preview': f"You were mentioned in {src_kind or 'a thread'}",
+        'is_unread': not bool(r.get('notified_at')),
+        'last_activity_at': r.get('created_at'),
+        'deep_link': f"hevolveai://{src_kind}/{src_id}" if src_kind and src_id
+                     else "hevolveai://",
+    }
+
+
+def _row_invite(r: dict) -> dict:
+    pk = r.get('parent_kind') or ''
+    pid = r.get('parent_id') or ''
+    role = r.get('role_offered') or 'member'
+    code = r.get('invite_code') or ''
+    status = r.get('status') or 'pending'
+    return {
+        'id': f"inv_{r.get('id')}",
+        'kind': 'invite',
+        'parent_kind': pk or None,
+        'parent_id': pid or None,
+        'sender_id': r.get('invited_by'),
+        'sender_kind': 'human',
+        'content_preview': f"Invited as {role} ({status})",
+        'is_unread': status == 'pending',
+        'last_activity_at': r.get('responded_at') or r.get('created_at'),
+        'deep_link': (f"hevolveai://i/{code}" if code
+                      else f"hevolveai://{pk}/{pid}"),
+    }
+
+
+def _row_friendship(r: dict, viewer_id: str) -> dict:
+    status = r.get('status') or ''
+    initiator = r.get('initiator_id')
+    other = (r.get('user_b_id') if r.get('user_a_id') == viewer_id
+             else r.get('user_a_id'))
+    if status == 'pending':
+        kind = 'friend_request'
+        preview = ('Sent a friend request' if initiator == viewer_id
+                   else 'Wants to be friends')
+        is_unread = initiator != viewer_id
+    elif status == 'active':
+        kind = 'friend_request'  # surfaces in inbox as 'friend_active'
+        preview = 'Friendship accepted'
+        is_unread = False
+    elif status == 'blocked':
+        kind = 'friend_request'
+        preview = 'Blocked'
+        is_unread = False
+    else:
+        kind = 'friend_request'
+        preview = f"Friendship {status}"
+        is_unread = False
+    return {
+        'id': f"frn_{r.get('id')}",
+        'kind': kind,
+        'parent_kind': 'user',
+        'parent_id': other,
+        'sender_id': initiator,
+        'sender_kind': 'human',
+        'content_preview': preview,
+        'is_unread': is_unread,
+        'last_activity_at': (r.get('blocked_at') or r.get('accepted_at')
+                             or r.get('created_at')),
+        'deep_link': f"hevolveai://user/{other}" if other
+                     else "hevolveai://friends",
+    }
+
+
+def _row_notification(r: dict) -> dict:
+    target_type = r.get('target_type') or ''
+    target_id = r.get('target_id') or ''
+    return {
+        'id': f"ntf_{r.get('id')}",
+        'kind': 'notification',
+        'parent_kind': target_type or None,
+        'parent_id': target_id or None,
+        'sender_id': r.get('source_user_id'),
+        'sender_kind': None,
+        'content_preview': (r.get('message') or '')[:140],
+        'is_unread': not bool(r.get('is_read')),
+        'last_activity_at': r.get('created_at'),
+        'deep_link': (f"hevolveai://{target_type}/{target_id}"
+                      if target_type and target_id else "hevolveai://"),
+    }
+
+
+def _shape_to_inbox(deltas: Dict[str, list], viewer_id: str) -> list:
+    """Map per-kind buckets → flat InboxRow list, sorted ASC by
+    last_activity_at then id (matches /sync cursor sort)."""
+    rows: list = []
+    for r in deltas.get('messages') or []:
+        rows.append(_row_message(r))
+    for r in deltas.get('mentions') or []:
+        rows.append(_row_mention(r))
+    for r in deltas.get('invites') or []:
+        rows.append(_row_invite(r))
+    for r in deltas.get('friendships') or []:
+        rows.append(_row_friendship(r, viewer_id))
+    for r in deltas.get('notifications') or []:
+        rows.append(_row_notification(r))
+    # 'conversations', 'blocks', 'memberships' are state-tracking — not
+    # conversational content; they advance the /sync cursor for
+    # multi-device replay but are intentionally skipped from the inbox
+    # surface (the messages bucket already represents the user-visible
+    # conversation activity).
+    rows.sort(key=lambda r: ((r.get('last_activity_at') or ''),
+                             (r.get('id') or '')))
+    return rows
+
+
+# Patch SyncService with the additional inbox_rows() method.  Done as a
+# post-class assignment so the existing class body stays untouched —
+# any external caller doing `from .sync_service import SyncService`
+# picks up the new method automatically.
+def _inbox_rows(db, user_id: str,
+                since: Optional[str] = None,
+                limit_per_kind: int = 50,
+                tenant_id: Optional[str] = None) -> Dict[str, Any]:
+    """Flattened-inbox view of /sync deltas.  Calls SyncService.deltas
+    internally — no parallel SQL path.  Returns the same {cursor,
+    has_more, rows} shape every client renders directly.
+
+    Pagination semantics are inherited from /sync: pass back the
+    returned ``cursor`` as ``since`` to fetch the next page; the
+    underlying delta cursor is opaque to the client.
+    """
+    bundle = SyncService.deltas(
+        db, user_id=user_id, since=since,
+        # Subset of kinds that produce inbox rows.  conversations /
+        # blocks / memberships keep advancing /sync but don't
+        # surface here.
+        kinds=['messages', 'mentions', 'invites', 'friendships',
+               'notifications'],
+        limit_per_kind=limit_per_kind,
+        tenant_id=tenant_id,
+    )
+    return {
+        'cursor': bundle.get('cursor'),
+        'has_more': bool(bundle.get('has_more')),
+        'rows': _shape_to_inbox(bundle.get('deltas') or {}, user_id),
+    }
+
+
+SyncService.inbox_rows = staticmethod(_inbox_rows)
 
 
 __all__ = ['SyncService']

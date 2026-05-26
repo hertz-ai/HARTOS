@@ -427,14 +427,19 @@ def test_attach_agent_without_grant_refused(fresh_db):
 
 # ── LiveKit token issuance ─────────────────────────────────────────
 
-def test_token_falls_back_to_p2p_when_no_livekit_config(monkeypatch):
-    """Flat / regional / Nunba bundled have LIVEKIT_URL unset.
-    issue_token must return mode='p2p_mesh' so clients run a WebRTC
-    P2P mesh signaled over PeerLink instead of trying to connect to
-    a non-existent LiveKit instance."""
+def test_token_falls_back_to_p2p_when_supervisor_disabled(monkeypatch):
+    """Central / embedded deploys (LIVEKIT_DISABLE=1 or
+    HEVOLVE_DEPLOY_MODE=central) do NOT host an SFU.  When env vars
+    are unset AND the supervisor is disabled, issue_token returns
+    mode='p2p_mesh' so clients run a WebRTC P2P mesh signaled over
+    PeerLink instead of trying to connect to a non-existent SFU.
+
+    (Flat/regional deploys auto-provision dev keys via the supervisor
+    — see test_token_uses_supervisor_dev_keys_on_flat below.)"""
     monkeypatch.delenv('LIVEKIT_URL', raising=False)
     monkeypatch.delenv('LIVEKIT_API_KEY', raising=False)
     monkeypatch.delenv('LIVEKIT_API_SECRET', raising=False)
+    monkeypatch.setenv('LIVEKIT_DISABLE', '1')
     from integrations.social.livekit_service import LiveKitService
     r = LiveKitService.issue_token('call-1', 'user-1')
     assert r['mode'] == 'p2p_mesh'
@@ -455,6 +460,28 @@ def test_token_uses_livekit_when_configured(monkeypatch):
     assert r['mode'] in ('livekit', 'livekit_pending')
     assert r['url'] == 'wss://livekit.example'
     assert r['metadata']['agent_kind'] == 'agent'
+
+
+def test_token_uses_supervisor_dev_keys_on_flat(monkeypatch, tmp_path):
+    """Flat/regional deploys auto-provision LiveKit dev keys via the
+    supervisor.  With env vars unset, issue_token must reach a working
+    config from the supervisor's auto-generated keys (no manual setup
+    needed) — mode is 'livekit' (real JWT) or 'livekit_pending' (SDK
+    not installed).  Dev keys + URL come from livekit_supervisor."""
+    monkeypatch.delenv('LIVEKIT_URL', raising=False)
+    monkeypatch.delenv('LIVEKIT_API_KEY', raising=False)
+    monkeypatch.delenv('LIVEKIT_API_SECRET', raising=False)
+    monkeypatch.delenv('LIVEKIT_DISABLE', raising=False)
+    monkeypatch.delenv('LIVEKIT_AUTOSTART', raising=False)
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')
+    monkeypatch.setenv('HEVOLVE_HOME', str(tmp_path))
+    from integrations.social.livekit_service import LiveKitService
+    r = LiveKitService.issue_token('call-1', 'user-1')
+    # Either signed JWT (SDK installed) or pending shape (SDK absent)
+    # — both confirm the supervisor's config flowed through.
+    assert r['mode'] in ('livekit', 'livekit_pending')
+    assert r.get('url', '').startswith('ws://localhost:')
+    assert 'metadata' in r
 
 
 # ── REST surface ──────────────────────────────────────────────────
@@ -588,3 +615,750 @@ def test_create_agent_grant_endpoint(app_client):
     body = r.get_json()
     assert body['data']['agent_id'] == agent.id
     assert body['data']['scope']['can_voice'] is True
+
+
+# ── _decide_media_mode mesh-first promotion (Task #275) ─────────────
+# Validates the "PeerLink ↔ LiveKit complement" branches.  Empirical
+# threshold benchmarking is queued under #276; these tests just lock
+# in the current contract so #276 can compare against a baseline.
+
+class _FakeUser:
+    def __init__(self, uid):
+        self.id = uid
+
+
+def _patch_g_user(monkeypatch, uid='caller-1'):
+    """Stub flask.g.user for _decide_media_mode caller-id resolution."""
+    from integrations.social import api_calls
+    class _G:
+        user = _FakeUser(uid)
+    monkeypatch.setattr(api_calls, 'g', _G)
+
+
+def test_decide_media_mode_voice_under_threshold(monkeypatch):
+    """≤4 active voice participants → p2p_mesh (PeerLink-signaled)."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    sess = {'kind': 'voice'}
+    parts = [{'user_id': 'u1', 'left_at': None},
+             {'user_id': 'u2', 'left_at': None}]
+    assert _decide_media_mode(sess, parts, is_agent=False) == 'p2p_mesh'
+
+
+def test_decide_media_mode_voice_over_threshold(monkeypatch):
+    """>4 active participants → livekit (mesh fanout becomes inefficient)."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    sess = {'kind': 'voice'}
+    # 4 already in + caller about to join = 5 active → over threshold(=4)
+    parts = [{'user_id': f'u{i}', 'left_at': None} for i in range(4)]
+    assert _decide_media_mode(sess, parts, is_agent=False) == 'livekit'
+
+
+def test_decide_media_mode_agent_always_livekit(monkeypatch):
+    """Any agent participant → livekit (AgentVoiceBridge needs SFU)."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    sess = {'kind': 'voice'}
+    assert _decide_media_mode(sess, [], is_agent=True) == 'livekit'
+
+
+def test_decide_media_mode_screen_share_always_livekit(monkeypatch):
+    """screen_share / mixed kinds → livekit regardless of count."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    assert _decide_media_mode({'kind': 'screen_share'}, [],
+                              is_agent=False) == 'livekit'
+    assert _decide_media_mode({'kind': 'mixed'}, [],
+                              is_agent=False) == 'livekit'
+
+
+def test_decide_media_mode_threshold_override(monkeypatch):
+    """LIVEKIT_MESH_THRESHOLD=999 keeps everything on mesh; =0 forces SFU."""
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    sess = {'kind': 'voice'}
+    parts = [{'user_id': f'u{i}', 'left_at': None} for i in range(20)]
+    monkeypatch.setenv('LIVEKIT_MESH_THRESHOLD', '999')
+    assert _decide_media_mode(sess, parts, is_agent=False) == 'p2p_mesh'
+    monkeypatch.setenv('LIVEKIT_MESH_THRESHOLD', '0')
+    # Threshold clamped to min 1, so 1 person mesh; 2 → livekit.
+    parts2 = [{'user_id': 'u1', 'left_at': None}]
+    assert _decide_media_mode(sess, parts2, is_agent=False) == 'livekit'
+
+
+def test_decide_media_mode_video_uses_tighter_default(monkeypatch):
+    """Video crosses to SFU at N=4 (default 3) — one peer earlier than
+    voice (default 4).  The bandwidth model justifies this: 500 kbps ×
+    3 = 1.5 Mbps mesh upload at N=4, which saturates a typical
+    residential uplink."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD_VIDEO', raising=False)
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD_VOICE', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    # 3 participants total (caller + 2 others) → at video threshold
+    parts = [{'user_id': 'u1', 'left_at': None},
+             {'user_id': 'u2', 'left_at': None}]
+    assert _decide_media_mode({'kind': 'video'}, parts,
+                              is_agent=False) == 'p2p_mesh'
+    # 4 participants → over video threshold (3)
+    parts4 = parts + [{'user_id': 'u3', 'left_at': None}]
+    assert _decide_media_mode({'kind': 'video'}, parts4,
+                              is_agent=False) == 'livekit'
+    # Same N=4 on a voice call still mesh (voice threshold = 4)
+    assert _decide_media_mode({'kind': 'voice'}, parts4,
+                              is_agent=False) == 'p2p_mesh'
+
+
+def test_decide_media_mode_per_kind_env_override(monkeypatch):
+    """LIVEKIT_MESH_THRESHOLD_VOICE / _VIDEO override per-kind."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    monkeypatch.setenv('LIVEKIT_MESH_THRESHOLD_VIDEO', '6')
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    # 5 video participants — would default to SFU (>3), but per-kind
+    # override allows mesh up to 6.
+    parts = [{'user_id': f'u{i}', 'left_at': None} for i in range(4)]
+    assert _decide_media_mode({'kind': 'video'}, parts,
+                              is_agent=False) == 'p2p_mesh'
+
+
+def test_decide_media_mode_uniform_env_overrides_per_kind(monkeypatch):
+    """LIVEKIT_MESH_THRESHOLD (uniform) takes precedence over the
+    per-kind default but loses to the per-kind override."""
+    monkeypatch.setenv('LIVEKIT_MESH_THRESHOLD', '2')
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD_VOICE', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    # 3 voice participants (caller + 2) — over uniform threshold of 2
+    parts = [{'user_id': 'u1', 'left_at': None},
+             {'user_id': 'u2', 'left_at': None}]
+    assert _decide_media_mode({'kind': 'voice'}, parts,
+                              is_agent=False) == 'livekit'
+
+
+def test_mesh_threshold_unknown_kind_falls_back(monkeypatch):
+    """An unknown kind (not in _DEFAULT_KIND_THRESHOLDS) falls back to
+    the conservative 4 — no KeyError, no NaN."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    from integrations.social.api_calls import _mesh_threshold
+    assert _mesh_threshold('weird_unknown_kind') == 4
+
+
+def test_mesh_threshold_garbage_env_falls_back(monkeypatch):
+    """Non-numeric env values fall back to the default per-kind."""
+    monkeypatch.setenv('LIVEKIT_MESH_THRESHOLD', 'not-a-number')
+    from integrations.social.api_calls import _mesh_threshold
+    # voice default is 4 from _DEFAULT_KIND_THRESHOLDS
+    assert _mesh_threshold('voice') == 4
+
+
+def test_bandwidth_model_crossover_table():
+    """Sanity-check the bandwidth model: mesh upload grows linearly,
+    SFU upload stays flat."""
+    from integrations.social._mesh_bandwidth_model import crossover_table
+    table = crossover_table('video', max_n=5)
+    assert table[2].mesh_up_kbps == 500   # 1 peer × 500 kbps
+    assert table[3].mesh_up_kbps == 1000
+    assert table[4].mesh_up_kbps == 1500
+    assert table[5].mesh_up_kbps == 2000
+    # SFU upload stays flat at one stream regardless of N
+    for n in range(2, 6):
+        assert table[n].sfu_up_kbps == 500
+
+
+def test_bandwidth_model_first_n_above_ceiling():
+    """1500 kbps uplink with VP8 video — mesh fits through N=4
+    (1500 kbps mesh upload), exceeds at N=5."""
+    from integrations.social._mesh_bandwidth_model import (
+        first_n_where_mesh_upload_exceeds,
+    )
+    # video at N=4 = 1500 kbps == ceiling (not >), so first exceeding N
+    # is 5.
+    assert first_n_where_mesh_upload_exceeds('video', 1500) == 5
+    # voice is so cheap it never exceeds even at N=46 (45 × 32 = 1440)
+    # but at N=47 it's 1472, still under.  At N=48: 1504 — exceeds.
+    assert first_n_where_mesh_upload_exceeds('voice', 1500) == 48
+
+
+def test_operational_thresholds_is_single_source():
+    """The bandwidth-model module owns OPERATIONAL_THRESHOLDS;
+    api_calls imports it as _DEFAULT_KIND_THRESHOLDS.  This test
+    asserts the SAME-OBJECT identity, which guards against someone
+    re-introducing a parallel literal in api_calls.py."""
+    from integrations.social._mesh_bandwidth_model import (
+        OPERATIONAL_THRESHOLDS,
+    )
+    from integrations.social.api_calls import _DEFAULT_KIND_THRESHOLDS
+    # `is` check — equality would still pass with two parallel dicts
+    # that happen to match.  Identity ensures one source of truth.
+    assert _DEFAULT_KIND_THRESHOLDS is OPERATIONAL_THRESHOLDS
+
+
+def test_supervisor_binary_url_uses_underscore_separator(monkeypatch):
+    """LiveKit's release filenames use `linux_amd64`, not `linux-amd64`.
+    Our internal platform tag uses hyphen (doubles as dict key) — the
+    URL builder must translate hyphen → underscore."""
+    monkeypatch.delenv('LIVEKIT_BINARY_URL', raising=False)
+    from integrations.social import livekit_supervisor
+    # Pin platform.system / machine for deterministic URL.
+    monkeypatch.setattr(livekit_supervisor.platform, 'system',
+                        lambda: 'Linux')
+    monkeypatch.setattr(livekit_supervisor.platform, 'machine',
+                        lambda: 'x86_64')
+    url = livekit_supervisor._binary_url()
+    assert 'livekit_1.7.2_linux_amd64.tar.gz' in url
+    assert 'linux-amd64' not in url
+
+
+def test_supervisor_binary_url_windows_uses_zip(monkeypatch):
+    monkeypatch.delenv('LIVEKIT_BINARY_URL', raising=False)
+    from integrations.social import livekit_supervisor
+    monkeypatch.setattr(livekit_supervisor.platform, 'system',
+                        lambda: 'Windows')
+    monkeypatch.setattr(livekit_supervisor.platform, 'machine',
+                        lambda: 'AMD64')
+    url = livekit_supervisor._binary_url()
+    assert url.endswith('windows_amd64.zip')
+
+
+def test_supervisor_binary_url_override_env(monkeypatch):
+    """LIVEKIT_BINARY_URL bypasses URL construction (air-gapped /
+    mirror / file:// builds)."""
+    monkeypatch.setenv('LIVEKIT_BINARY_URL',
+                       'file:///cache/livekit-1.7.2.tar.gz')
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor._binary_url() == 'file:///cache/livekit-1.7.2.tar.gz'
+
+
+def test_supervisor_sha256_pinned_for_supported_platforms():
+    """Supply-chain integrity: every platform we build a download URL
+    for must have a non-empty SHA-256 pin.  Adding a new platform tag
+    without pinning its hash is a CI-breaking mistake."""
+    from integrations.social.livekit_supervisor import _LIVEKIT_SHA256
+    expected_keys = {
+        'linux-amd64', 'linux-arm64', 'linux-armv7',
+        'windows-amd64', 'windows-arm64', 'windows-armv7',
+    }
+    for key in expected_keys:
+        assert key in _LIVEKIT_SHA256, f'missing SHA-256 pin for {key}'
+        # Real SHA-256 hex is 64 chars; empty would skip verification.
+        assert len(_LIVEKIT_SHA256[key]) == 64, (
+            f'SHA-256 pin for {key} is empty or wrong length')
+
+
+# ── Bind-address policy: silent install on flat / no firewall prompt ─
+
+def test_bind_addresses_flat_mode_loopback(monkeypatch):
+    """Flat / embedded → loopback only so first start doesn't trigger
+    the Windows / macOS firewall prompt."""
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')
+    monkeypatch.delenv('LIVEKIT_BIND_HOST', raising=False)
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor._bind_addresses_for_mode() == ['127.0.0.1']
+    # External IP advertisement is meaningless on loopback — must be off.
+    assert livekit_supervisor._use_external_ip_for_mode() is False
+
+
+def test_bind_addresses_regional_mode_all_interfaces(monkeypatch):
+    """Regional hosts SFU for LAN peers — bind all interfaces.  The
+    one-time firewall prompt is acceptable; the operator chose regional."""
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'regional')
+    monkeypatch.delenv('LIVEKIT_BIND_HOST', raising=False)
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor._bind_addresses_for_mode() == ['']
+    assert livekit_supervisor._use_external_ip_for_mode() is True
+
+
+def test_bind_addresses_env_override_specific_nic(monkeypatch):
+    """LIVEKIT_BIND_HOST=<addr> wins over the mode-aware default."""
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')  # would be loopback
+    monkeypatch.setenv('LIVEKIT_BIND_HOST', '192.168.1.50')
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor._bind_addresses_for_mode() == ['192.168.1.50']
+    # Non-loopback bind → advertise external IP.
+    assert livekit_supervisor._use_external_ip_for_mode() is True
+
+
+def test_bind_addresses_env_override_zero_host_means_all_interfaces(
+        monkeypatch):
+    """0.0.0.0 is the conventional 'all interfaces' literal — translate
+    to LiveKit's empty-string sentinel."""
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')
+    monkeypatch.setenv('LIVEKIT_BIND_HOST', '0.0.0.0')
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor._bind_addresses_for_mode() == ['']
+    assert livekit_supervisor._use_external_ip_for_mode() is True
+
+
+def test_generated_config_writes_loopback_for_flat(monkeypatch, tmp_path):
+    """End-to-end: _generate_config emits 'bind_addresses: - 127.0.0.1'
+    for flat mode so the first start is silent."""
+    monkeypatch.setenv('HEVOLVE_HOME', str(tmp_path))
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')
+    monkeypatch.delenv('LIVEKIT_BIND_HOST', raising=False)
+    from integrations.social import livekit_supervisor
+    cfg_path = livekit_supervisor._generate_config(
+        {'api_key': 'KFLAT', 'api_secret': 'SFLAT' * 8})
+    body = cfg_path.read_text(encoding='utf-8')
+    assert "bind_addresses:" in body
+    assert "  - '127.0.0.1'" in body
+    # 0.0.0.0 / empty must NOT be present on a flat deploy.
+    assert "  - ''" not in body
+    assert "use_external_ip: false" in body
+
+
+def test_generated_config_writes_all_interfaces_for_regional(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv('HEVOLVE_HOME', str(tmp_path))
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'regional')
+    monkeypatch.delenv('LIVEKIT_BIND_HOST', raising=False)
+    from integrations.social import livekit_supervisor
+    cfg_path = livekit_supervisor._generate_config(
+        {'api_key': 'KREG', 'api_secret': 'SREG' * 8})
+    body = cfg_path.read_text(encoding='utf-8')
+    assert "  - ''" in body
+    assert "use_external_ip: true" in body
+
+
+# ── AgentVoiceBridge TTS outbox (Task #219 magic loop) ──────────────
+
+@pytest.fixture
+def clean_bridge_outbox():
+    """Reset module-level TTS outbox between tests so they don't see
+    stale state from prior tests."""
+    from integrations.social import agent_voice_bridge as avb
+    with avb._TTS_LOCK:
+        avb._TTS_OUTBOX.clear()
+    yield
+    with avb._TTS_LOCK:
+        avb._TTS_OUTBOX.clear()
+
+
+def test_tts_outbox_enqueue_dequeue_roundtrip(clean_bridge_outbox):
+    """Push then pop returns the same text in FIFO order."""
+    from integrations.social.agent_voice_bridge import (
+        enqueue_tts_text, dequeue_tts_text)
+    assert enqueue_tts_text('call-1', 'agent-1', 'hello there') is True
+    assert enqueue_tts_text('call-1', 'agent-1', 'second line') is True
+    out = dequeue_tts_text('call-1', 'agent-1')
+    assert [r['text'] for r in out] == ['hello there', 'second line']
+    # All consumed — second drain returns empty.
+    assert dequeue_tts_text('call-1', 'agent-1') == []
+
+
+def test_tts_outbox_enqueue_rejects_empty(clean_bridge_outbox):
+    """Empty / whitespace text is silently dropped (False return)."""
+    from integrations.social.agent_voice_bridge import (
+        enqueue_tts_text, tts_outbox_depth)
+    assert enqueue_tts_text('call-1', 'agent-1', '') is False
+    assert enqueue_tts_text('call-1', 'agent-1', '   ') is False
+    assert enqueue_tts_text('', 'agent-1', 'hi') is False
+    assert enqueue_tts_text('call-1', '', 'hi') is False
+    assert tts_outbox_depth('call-1', 'agent-1') == 0
+
+
+def test_tts_outbox_per_agent_isolation(clean_bridge_outbox):
+    """Multiple agents in the same call have independent queues."""
+    from integrations.social.agent_voice_bridge import (
+        enqueue_tts_text, dequeue_tts_text, tts_outbox_depth)
+    enqueue_tts_text('call-1', 'agent-A', 'A says hi')
+    enqueue_tts_text('call-1', 'agent-B', 'B says hello')
+    assert tts_outbox_depth('call-1', 'agent-A') == 1
+    assert tts_outbox_depth('call-1', 'agent-B') == 1
+    out_a = dequeue_tts_text('call-1', 'agent-A')
+    assert [r['text'] for r in out_a] == ['A says hi']
+    # agent-B's queue is untouched
+    assert tts_outbox_depth('call-1', 'agent-B') == 1
+
+
+def test_tts_outbox_cap_evicts_oldest(clean_bridge_outbox, monkeypatch):
+    """Cap at _TTS_OUTBOX_CAP — oldest dropped with WARN."""
+    from integrations.social import agent_voice_bridge as avb
+    monkeypatch.setattr(avb, '_TTS_OUTBOX_CAP', 3)
+    for i in range(5):
+        avb.enqueue_tts_text('call-1', 'agent-1', f'line {i}')
+    out = avb.dequeue_tts_text('call-1', 'agent-1', limit=10)
+    # Cap is 3 — oldest 2 dropped.  Remaining is FIFO of last 3.
+    assert [r['text'] for r in out] == ['line 2', 'line 3', 'line 4']
+
+
+def test_tts_outbox_dequeue_limit(clean_bridge_outbox):
+    """dequeue with limit=N returns at most N items, leaves rest."""
+    from integrations.social.agent_voice_bridge import (
+        enqueue_tts_text, dequeue_tts_text, tts_outbox_depth)
+    for i in range(5):
+        enqueue_tts_text('call-1', 'agent-1', f'line {i}')
+    out = dequeue_tts_text('call-1', 'agent-1', limit=2)
+    assert [r['text'] for r in out] == ['line 0', 'line 1']
+    assert tts_outbox_depth('call-1', 'agent-1') == 3
+
+
+def test_detach_agent_clears_tts_outbox(clean_bridge_outbox):
+    """detach_agent must drop pending TTS chunks so a later same-key
+    attach doesn't replay stale audio."""
+    from integrations.social.agent_voice_bridge import (
+        enqueue_tts_text, dequeue_tts_text, AgentVoiceBridge)
+    enqueue_tts_text('call-1', 'agent-1', 'pending audio')
+    # No worker actually exists for this test — detach returns False
+    # but should still scrub the outbox.
+    AgentVoiceBridge.detach_agent('call-1', 'agent-1')
+    assert dequeue_tts_text('call-1', 'agent-1') == []
+
+
+class _StubDBOnlyAgent:
+    """Minimal `db_session()` stub: User.query→agent succeeds; everything
+    else returns empty.  Reused by source_kind branch tests that only
+    need the agent lookup to succeed before exercising side-effect
+    delegation.  Mirrors the inline class in
+    test_router_source_kind_call_enqueues_tts (which kept it inline for
+    historical reasons; this top-level version is the single canonical
+    home for new callers)."""
+
+    def __init__(self, agent_id='agent-99'):
+        self._agent_id = agent_id
+
+    class _Q:
+        def __init__(self, agent):
+            self.agent = agent
+
+        def filter(self, *args, **kw):
+            return self
+
+        def first(self):
+            return self.agent
+
+    def query(self, model):
+        from integrations.social.models import User
+        if model is User:
+            agent = type('A', (), {'id': self._agent_id})()
+            return _StubDBOnlyAgent._Q(agent)
+        return _StubDBOnlyAgent._Q(None)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, *a, **kw):
+        class _R:
+            def fetchone(self_):
+                return None
+        return _R()
+
+
+def test_router_source_kind_external_room_delegates_to_response_router(
+        monkeypatch):
+    """source_kind='external_room' must hand off to the canonical
+    ChannelResponseRouter.route_response — no parallel outbound path
+    invented; just the one branch that delegates.  Verifies:
+      - the canonical router is called
+      - channel_context flows through unchanged (channel + chat_id)
+      - agent_id is forwarded so logging attributes the assistant turn
+      - default fan_out=False so the reply lands in the originating
+        room only (caller can flip via context['fan_out_external'])
+    """
+    from integrations import agentic_router
+    from integrations.channels.response import router as response_router_mod
+    from integrations.social import models as _models
+
+    monkeypatch.setattr(
+        _models, 'db_session',
+        lambda: _StubDBOnlyAgent(agent_id='agent-ext-1'))
+
+    captured = {}
+
+    class _StubResponseRouter:
+        def route_response(self, user_id, response_text,
+                           channel_context=None, agent_id=None,
+                           fan_out=True):
+            captured.update({
+                'user_id': user_id,
+                'response_text': response_text,
+                'channel_context': channel_context,
+                'agent_id': agent_id,
+                'fan_out': fan_out,
+            })
+
+    monkeypatch.setattr(
+        response_router_mod, 'get_response_router',
+        lambda registry=None: _StubResponseRouter())
+
+    agentic_router._post_agent_reply(
+        agent_id='agent-ext-1',
+        context={
+            'source_kind': 'external_room',
+            'source_id': 'conversation-entry-id-42',
+            'owner_id': 'user-7',
+            'channel_context': {
+                'channel': 'discord',
+                'chat_id': '987654321',
+                'sender_id': 'discord:user-99',
+                'sender_name': 'Aru',
+                'is_group': True,
+                'message_id': 'discord-msg-555',
+            },
+        },
+        reply_text='Hi from the agent — answering on Discord.',
+    )
+
+    assert captured, (
+        "ChannelResponseRouter.route_response was never called — the "
+        "external_room branch did not delegate to the canonical "
+        "outbound surface"
+    )
+    assert captured['response_text'].startswith('Hi from the agent')
+    assert captured['user_id'] == 'user-7'
+    assert captured['agent_id'] == 'agent-ext-1'
+    assert captured['channel_context']['channel'] == 'discord'
+    assert captured['channel_context']['chat_id'] == '987654321'
+    # Default fan_out is False — agent reply stays in the originating
+    # room unless the caller explicitly opts in.
+    assert captured['fan_out'] is False
+
+
+def test_router_source_kind_external_room_skips_when_context_missing(
+        monkeypatch):
+    """Defensive: if channel_context is empty / missing channel + chat_id,
+    the branch logs and returns rather than calling the router with bad
+    args.  Prevents adapter-misconfiguration from cascading into
+    ChannelRegistry exceptions."""
+    from integrations import agentic_router
+    from integrations.channels.response import router as response_router_mod
+    from integrations.social import models as _models
+
+    monkeypatch.setattr(
+        _models, 'db_session',
+        lambda: _StubDBOnlyAgent(agent_id='agent-ext-2'))
+
+    called = {'count': 0}
+
+    class _StubResponseRouter:
+        def route_response(self, **kwargs):
+            called['count'] += 1
+
+    monkeypatch.setattr(
+        response_router_mod, 'get_response_router',
+        lambda registry=None: _StubResponseRouter())
+
+    # No channel_context at all
+    agentic_router._post_agent_reply(
+        agent_id='agent-ext-2',
+        context={'source_kind': 'external_room',
+                 'source_id': 'ce-id'},
+        reply_text='should not be sent',
+    )
+    assert called['count'] == 0
+
+    # channel_context missing chat_id
+    agentic_router._post_agent_reply(
+        agent_id='agent-ext-2',
+        context={'source_kind': 'external_room',
+                 'source_id': 'ce-id',
+                 'channel_context': {'channel': 'discord'}},
+        reply_text='should not be sent either',
+    )
+    assert called['count'] == 0
+
+
+def test_router_source_kind_external_room_fan_out_opt_in(monkeypatch):
+    """Caller opts into bound-channel fan-out via
+    context['fan_out_external']=True — passes through to route_response
+    so the same reply goes to every bound channel for the user."""
+    from integrations import agentic_router
+    from integrations.channels.response import router as response_router_mod
+    from integrations.social import models as _models
+
+    monkeypatch.setattr(
+        _models, 'db_session',
+        lambda: _StubDBOnlyAgent(agent_id='agent-ext-3'))
+
+    captured = {}
+
+    class _StubResponseRouter:
+        def route_response(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        response_router_mod, 'get_response_router',
+        lambda registry=None: _StubResponseRouter())
+
+    agentic_router._post_agent_reply(
+        agent_id='agent-ext-3',
+        context={
+            'source_kind': 'external_room',
+            'source_id': 'ce-id',
+            'channel_context': {'channel': 'whatsapp', 'chat_id': '+1555'},
+            'fan_out_external': True,
+        },
+        reply_text='broadcast me everywhere',
+    )
+
+    assert captured.get('fan_out') is True
+
+
+def test_router_source_kind_call_enqueues_tts(clean_bridge_outbox,
+                                               monkeypatch):
+    """The new branch in agentic_router._post_agent_reply must push
+    the agent's reply onto the TTS outbox so the bridge worker can
+    drain it on its next tick.
+
+    We monkeypatch the DB session lookup so we don't need a real
+    SQLAlchemy session for this branch test."""
+    from integrations.social.agent_voice_bridge import (
+        dequeue_tts_text, tts_outbox_depth)
+    from integrations import agentic_router
+
+    # Stub the DB context manager + User/Post/Comment lookups — only
+    # the agent lookup needs to succeed for the 'call' branch.
+    class _StubDB:
+        class _Q:
+            def __init__(self, agent):
+                self.agent = agent
+            def filter(self, *args, **kw):
+                return self
+            def first(self):
+                return self.agent
+        def query(self, model):
+            from integrations.social.models import User
+            if model is User:
+                stub_agent = type('A', (), {'id': 'agent-99'})()
+                return _StubDB._Q(stub_agent)
+            return _StubDB._Q(None)
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def execute(self, *a, **kw):
+            class _R:
+                def fetchone(self_):
+                    return None
+            return _R()
+
+    def _stub_db_session():
+        return _StubDB()
+
+    # Patch where the symbol is looked up — agentic_router does
+    # `from integrations.social.models import db_session, User, ...`
+    # inside the function, so we patch the source module.
+    from integrations.social import models as _models
+    monkeypatch.setattr(_models, 'db_session', _stub_db_session)
+
+    agentic_router._post_agent_reply(
+        agent_id='agent-99',
+        context={'source_kind': 'call', 'source_id': 'call-X',
+                 'platform': 'livekit', 'owner_id': 'owner-1'},
+        reply_text='hello from the agent',
+    )
+
+    out = dequeue_tts_text('call-X', 'agent-99')
+    assert len(out) == 1
+    assert out[0]['text'] == 'hello from the agent'
+    # outbox is now drained
+    assert tts_outbox_depth('call-X', 'agent-99') == 0
+
+
+def test_decide_media_mode_excludes_left_participants(monkeypatch):
+    """Active count uses left_at IS NULL — left rows don't count."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch)
+    from integrations.social.api_calls import _decide_media_mode
+    sess = {'kind': 'voice'}
+    # 5 entries but 3 left → 2 active + 1 caller = 3 → mesh
+    parts = [{'user_id': 'u1', 'left_at': None},
+             {'user_id': 'u2', 'left_at': None},
+             {'user_id': 'u3', 'left_at': '2026-05-07T10:00:00Z'},
+             {'user_id': 'u4', 'left_at': '2026-05-07T10:01:00Z'},
+             {'user_id': 'u5', 'left_at': '2026-05-07T10:02:00Z'}]
+    assert _decide_media_mode(sess, parts, is_agent=False) == 'p2p_mesh'
+
+
+def test_decide_media_mode_caller_already_active_no_double_count(monkeypatch):
+    """If caller is already in the participant list, don't add +1."""
+    monkeypatch.delenv('LIVEKIT_MESH_THRESHOLD', raising=False)
+    _patch_g_user(monkeypatch, uid='caller-1')
+    from integrations.social.api_calls import _decide_media_mode
+    sess = {'kind': 'voice'}
+    # 4 active including caller → at threshold (4), not over
+    parts = [{'user_id': 'caller-1', 'left_at': None},
+             {'user_id': 'u2', 'left_at': None},
+             {'user_id': 'u3', 'left_at': None},
+             {'user_id': 'u4', 'left_at': None}]
+    assert _decide_media_mode(sess, parts, is_agent=False) == 'p2p_mesh'
+
+
+# ── Supervisor branch tests (Task #275) ─────────────────────────────
+
+def test_supervisor_should_run_central_returns_false(monkeypatch):
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'central')
+    monkeypatch.delenv('LIVEKIT_AUTOSTART', raising=False)
+    monkeypatch.delenv('LIVEKIT_DISABLE', raising=False)
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor.supervisor_should_run() is False
+
+
+def test_supervisor_should_run_flat_returns_true(monkeypatch):
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')
+    monkeypatch.delenv('LIVEKIT_AUTOSTART', raising=False)
+    monkeypatch.delenv('LIVEKIT_DISABLE', raising=False)
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor.supervisor_should_run() is True
+
+
+def test_supervisor_disable_env_overrides_mode(monkeypatch):
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')
+    monkeypatch.setenv('LIVEKIT_DISABLE', '1')
+    monkeypatch.delenv('LIVEKIT_AUTOSTART', raising=False)
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor.supervisor_should_run() is False
+
+
+def test_supervisor_autostart_env_overrides_mode(monkeypatch):
+    """LIVEKIT_AUTOSTART=1 forces supervisor on regardless of deploy mode."""
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'central')
+    monkeypatch.setenv('LIVEKIT_AUTOSTART', '1')
+    monkeypatch.delenv('LIVEKIT_DISABLE', raising=False)
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor.supervisor_should_run() is True
+
+
+def test_supervisor_autostart_zero_overrides_mode(monkeypatch):
+    """LIVEKIT_AUTOSTART=0 forces supervisor off regardless of deploy mode."""
+    monkeypatch.setenv('HEVOLVE_DEPLOY_MODE', 'flat')
+    monkeypatch.setenv('LIVEKIT_AUTOSTART', '0')
+    monkeypatch.delenv('LIVEKIT_DISABLE', raising=False)
+    from integrations.social import livekit_supervisor
+    assert livekit_supervisor.supervisor_should_run() is False
+
+
+def test_ensure_dev_keys_idempotent(monkeypatch, tmp_path):
+    """Same keys returned across two calls."""
+    monkeypatch.delenv('LIVEKIT_API_KEY', raising=False)
+    monkeypatch.delenv('LIVEKIT_API_SECRET', raising=False)
+    monkeypatch.setenv('HEVOLVE_HOME', str(tmp_path))
+    from integrations.social import livekit_supervisor
+    a = livekit_supervisor.ensure_dev_keys()
+    b = livekit_supervisor.ensure_dev_keys()
+    assert a['api_key'] == b['api_key']
+    assert a['api_secret'] == b['api_secret']
+    assert a['api_key'].startswith('API')
+    assert len(a['api_secret']) >= 32
+
+
+def test_ensure_dev_keys_env_override_wins(monkeypatch, tmp_path):
+    """Env-var keys take priority — no dev_keys.json written."""
+    monkeypatch.setenv('LIVEKIT_API_KEY', 'OPERATOR_KEY')
+    monkeypatch.setenv('LIVEKIT_API_SECRET', 'OPERATOR_SECRET')
+    monkeypatch.setenv('HEVOLVE_HOME', str(tmp_path))
+    from integrations.social import livekit_supervisor
+    keys = livekit_supervisor.ensure_dev_keys()
+    assert keys['api_key'] == 'OPERATOR_KEY'
+    assert keys['api_secret'] == 'OPERATOR_SECRET'
+    # No file written — env path bypasses persistence.
+    assert not (tmp_path / 'livekit' / 'dev_keys.json').exists()

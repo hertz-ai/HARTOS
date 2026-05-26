@@ -42,11 +42,12 @@ from .base import (
     ChannelSendError,
     ChannelRateLimitError,
 )
+from .room_capable import RoomCapableAdapter, UnsupportedRoomError
 
 logger = logging.getLogger(__name__)
 
 
-class DiscordAdapter(ChannelAdapter):
+class DiscordAdapter(ChannelAdapter, RoomCapableAdapter):
     """
     Discord messaging adapter.
 
@@ -55,6 +56,18 @@ class DiscordAdapter(ChannelAdapter):
         adapter = DiscordAdapter(config)
         adapter.on_message(my_handler)
         await adapter.start()
+
+    Room semantics (UNIF-G2 ``RoomCapableAdapter``):
+        Discord text channels — bot is auto-member of every channel
+        in the guilds it has been invited to; ``join_room`` validates
+        access + caches the room id for downstream filtering.
+
+        Discord voice channels — ``join_room`` opens a ``VoiceClient``
+        via ``voice_channel.connect()`` so the bot is visibly present.
+        The audio-receive path (frames → STT) is wired in
+        ``agent_voice_bridge._tick()`` (UNIF-G3 / W1.2).
+
+        DMs — raises ``UnsupportedRoomError`` (DMs aren't rooms).
     """
 
     def __init__(self, config: ChannelConfig):
@@ -72,12 +85,24 @@ class DiscordAdapter(ChannelAdapter):
         intents.members = True
         intents.dm_messages = True
         intents.guild_messages = True
+        intents.voice_states = True  # UNIF-G2: voice room presence + member listing
 
         self._bot = commands.Bot(
             command_prefix=config.extra.get("prefix", "!"),
             intents=intents,
         )
         self._bot_user_id: Optional[int] = None
+        # UNIF-G2: per-room voice-client registry.  Keyed by Discord
+        # voice-channel id (int).  Populated by ``join_room`` for voice
+        # channels, drained by ``leave_room``.  Only voice channels live
+        # here — text channels are presence-by-default.
+        self._voice_clients: Dict[int, Any] = {}
+        # UNIF-G2: text-room "presence" registry.  Discord doesn't have
+        # an explicit join handshake for text channels (the bot is a
+        # member of every guild text channel it can see), so we track
+        # the bot's deliberate-presence intent locally for downstream
+        # callers (e.g. message-filtering, leave_room semantics).
+        self._joined_text_rooms: set = set()
         self._setup_events()
 
     @property
@@ -408,6 +433,197 @@ class DiscordAdapter(ChannelAdapter):
         except Exception as e:
             logger.error(f"Failed to create thread: {e}")
             return None
+
+    # ─── UNIF-G2: RoomCapableAdapter implementation ──────────────────
+
+    async def _resolve_channel(self, room_id: str):
+        """Best-effort channel resolve — cache → REST fallback.
+
+        Returns the discord channel object or ``None`` if it can't be
+        found (deleted / wrong id / no access).  Centralized so
+        ``join_room``/``leave_room``/``list_room_members`` share the
+        same lookup path instead of duplicating ``get_channel``+fallback
+        ladder three times.
+        """
+        try:
+            cid = int(room_id)
+        except (TypeError, ValueError):
+            return None
+        channel = self._bot.get_channel(cid)
+        if channel is not None:
+            return channel
+        try:
+            return await self._bot.fetch_channel(cid)
+        except discord.NotFound:
+            return None
+        except discord.Forbidden:
+            return None
+        except Exception as e:
+            logger.error(f"Discord _resolve_channel({cid}) failed: {e}")
+            return None
+
+    async def join_room(self, room_id: str,
+                        role: str = 'participant') -> bool:
+        """Join a Discord channel/room as the agent's presence.
+
+        - Text channel → validate access, cache presence intent, return True.
+        - Voice channel → connect via ``VoiceClient`` so the bot is
+          visibly in the call.  Audio frames are picked up later by
+          ``agent_voice_bridge._tick()`` (UNIF-G3 / W1.2 wiring).
+        - DM (no guild) → raise ``UnsupportedRoomError``.
+        - Channel not found / forbidden → return False.
+
+        Idempotent on (room_id) — calling twice does NOT double-join
+        a voice channel; the cached client is returned.
+        """
+        channel = await self._resolve_channel(room_id)
+        if channel is None:
+            logger.warning(
+                "Discord.join_room: channel %s not found / forbidden",
+                room_id)
+            return False
+
+        if isinstance(channel, discord.DMChannel):
+            raise UnsupportedRoomError(
+                "Discord DMs are not rooms — use send_message for 1:1.")
+
+        if isinstance(channel, discord.VoiceChannel):
+            cid = int(room_id)
+            existing = self._voice_clients.get(cid)
+            if existing is not None and existing.is_connected():
+                return True
+            try:
+                # UNIF-G7 Producer A: prefer VoiceRecvClient when the
+                # discord-ext-voice-recv lib is installed, so the
+                # HevolveStreamingSink can pipe per-speaker PCM through
+                # the canonical streaming-STT WS server.  When the lib
+                # is absent, fall back to the bare connect() call —
+                # voice room PRESENCE behavior is unchanged.
+                connect_kwargs = {'reconnect': True, 'self_deaf': False}
+                try:
+                    from .discord_voice_recv_sink import (
+                        HAS_VOICE_RECV, VoiceRecvClient,
+                    )
+                    if HAS_VOICE_RECV and VoiceRecvClient is not None:
+                        connect_kwargs['cls'] = VoiceRecvClient
+                except Exception:
+                    pass
+                voice_client = await channel.connect(**connect_kwargs)
+                self._voice_clients[cid] = voice_client
+                # Best-effort attach the streaming sink.  Returns
+                # False (silent) when the recv lib isn't installed or
+                # the connected client doesn't support listen().
+                try:
+                    from .discord_voice_recv_sink import (
+                        maybe_attach_recv_sink,
+                    )
+                    maybe_attach_recv_sink(
+                        voice_client, call_id=str(cid),
+                        bot_user_id=self._bot_user_id)
+                except Exception as e:
+                    logger.debug(
+                        "Discord.join_room: sink attach skipped (%s)", e)
+                logger.info(
+                    "Discord.join_room: voice channel %s connected (role=%s)",
+                    cid, role)
+                return True
+            except discord.ClientException as e:
+                # Already connected from another path — treat as success.
+                logger.info(
+                    "Discord.join_room: voice %s already-connected (%s)",
+                    cid, e)
+                return True
+            except (discord.opus.OpusNotLoaded, AttributeError) as e:
+                logger.warning(
+                    "Discord.join_room: opus library unavailable for "
+                    "voice %s (%s); voice presence requires libopus on "
+                    "the host", cid, e)
+                return False
+            except Exception as e:
+                logger.error(
+                    "Discord.join_room: voice connect failed for %s: %s",
+                    cid, e)
+                return False
+
+        # Text channel / thread / news / forum / stage etc. — Discord
+        # doesn't expose an explicit "join" for non-voice channels, but
+        # we record presence-intent so leave_room is symmetric.
+        self._joined_text_rooms.add(int(room_id))
+        logger.info(
+            "Discord.join_room: text room %s presence cached (role=%s)",
+            room_id, role)
+        return True
+
+    async def leave_room(self, room_id: str) -> bool:
+        """Leave a Discord channel/room.
+
+        - Voice channel → disconnect the cached ``VoiceClient``.
+        - Text channel → drop the cached presence intent.
+        - Unknown / never-joined → return False (caller decides whether
+          that's a problem).
+        """
+        try:
+            cid = int(room_id)
+        except (TypeError, ValueError):
+            return False
+
+        # Voice path
+        voice_client = self._voice_clients.pop(cid, None)
+        if voice_client is not None:
+            try:
+                if voice_client.is_connected():
+                    await voice_client.disconnect(force=False)
+                logger.info("Discord.leave_room: voice %s disconnected", cid)
+                return True
+            except Exception as e:
+                logger.error(
+                    "Discord.leave_room: voice disconnect %s failed: %s",
+                    cid, e)
+                return False
+
+        # Text path
+        if cid in self._joined_text_rooms:
+            self._joined_text_rooms.discard(cid)
+            logger.info("Discord.leave_room: text %s presence cleared", cid)
+            return True
+
+        logger.debug("Discord.leave_room: %s not in joined registry", cid)
+        return False
+
+    async def list_room_members(self, room_id: str) -> List[Dict[str, Any]]:
+        """List members of a Discord channel/voice channel.
+
+        Text channels — uses ``channel.members`` (requires GUILD_MEMBERS
+        intent, which we declare).  Voice channels — uses
+        ``channel.members`` populated from voice-state cache.
+
+        Returns ``[]`` on any error / unknown channel; callers shouldn't
+        rely on member listing being authoritative.
+        """
+        channel = await self._resolve_channel(room_id)
+        if channel is None:
+            return []
+        members_attr = getattr(channel, 'members', None)
+        if not members_attr:
+            return []
+        result: List[Dict[str, Any]] = []
+        try:
+            for m in members_attr:
+                # Skip the bot itself in member listings — caller asked
+                # who else is here.
+                if m.id == self._bot_user_id:
+                    continue
+                result.append({
+                    'id': str(m.id),
+                    'display_name': getattr(m, 'display_name', None) or m.name,
+                    'is_bot': bool(getattr(m, 'bot', False)),
+                })
+        except Exception as e:
+            logger.error(
+                "Discord.list_room_members: iterating %s failed: %s",
+                room_id, e)
+            return []
+        return result
 
 
 def create_discord_adapter(token: str = None, **kwargs) -> DiscordAdapter:

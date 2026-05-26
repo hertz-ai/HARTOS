@@ -239,8 +239,46 @@ class ModelOrchestrator:
             return None
 
         if entry.loaded:
-            logger.info(f"Model already loaded: {model_id} ({entry.device})")
-            return entry
+            # Reconcile against the loader's live probe — entry.loaded
+            # is a CACHE that drifts when the underlying process dies
+            # externally (CUDA hang, OOM, manual kill, idle auto-stop
+            # outside our lifecycle).  Without this probe, the load()
+            # short-circuits with "Model already loaded" and the user
+            # sees a dead service ("Draft boot decision" loop on
+            # 2026-05-04 — task #80).  Loaders that override is_loaded()
+            # (LlamaLoader, TTSLoader, STTLoader, VLMLoader) return the
+            # actual liveness; the base class falls back to entry.loaded
+            # so loaders without an override preserve current behavior.
+            loader = self._loaders.get(entry.model_type)
+            try:
+                actually_loaded = (
+                    loader.is_loaded(entry) if loader else True
+                )
+            except Exception as _probe_err:
+                logger.warning(
+                    f"is_loaded probe failed for {model_id}: "
+                    f"{type(_probe_err).__name__}: {_probe_err} — "
+                    f"trusting cache flag"
+                )
+                actually_loaded = True
+            if actually_loaded:
+                logger.info(f"Model already loaded: {model_id} ({entry.device})")
+                return entry
+            # Cache lies — process is dead.  Reconcile state: release
+            # VRAM, clear the catalog flag, fall through to a fresh load.
+            logger.warning(
+                f"Stale cache for {model_id}: catalog says loaded but "
+                f"is_loaded() probe says dead — reconciling and "
+                f"respawning"
+            )
+            try:
+                self._release_vram(entry)
+            except Exception:
+                pass
+            try:
+                self._catalog.mark_unloaded(model_id)
+            except Exception:
+                pass
 
         cs = self._get_compute_state()
         fit = entry.matches_compute(

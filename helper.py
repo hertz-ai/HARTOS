@@ -30,14 +30,25 @@ import uuid
 from datetime import datetime, timedelta
 import time
 import redis
-from langchain_classic.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
+# Lazy-load langchain_classic.schema — every site of use is inside a
+# function (HumanMessage/AIMessage at lines 1827/1832; the other 4 names
+# are imported-but-unused, so they're dropped here entirely).  Module-
+# top import of langchain_classic transitively loads langchain_core
+# which uses ``__getattr__`` lazy attribute resolution that cx_Freeze
+# can't statically trace.  Result: every `import helper` (and hence
+# `import reuse_recipe / gather_agentdetails / create_recipe` which
+# import helper) blows up in the frozen-binary validate step with
+# `ImportError: cannot import name 'LanguageModelOutput' from
+# langchain_core.language_models` (live: build-windows runs
+# 25855122044, 26011572288, 26012388043, 26013613058).  Moving these
+# to lazy function-scoped imports is the canonical fix — same pattern
+# the rest of HARTOS uses for heavy/optional deps (e.g. torch, llama).
+# `GoogleSearchAPIWrapper` + `ZepMemory` are likewise lazy below.
 import pytz
-from langchain_classic.utilities import GoogleSearchAPIWrapper
 import aiohttp
 import asyncio
 import os
 from bs4 import BeautifulSoup
-from langchain_classic.memory import ZepMemory
 from json_repair import repair_json
 import traceback
 
@@ -47,6 +58,7 @@ from core.config_cache import get_config as _get_config, get_visual_context_api
 from core.http_pool import get_http_session, pooled_post, pooled_get, pooled_request
 # Performance: singleton event loop
 from core.event_loop import get_or_create_event_loop
+from core.platform_paths import get_coding_workspace_dir
 
 config = _get_config()
 
@@ -63,6 +75,13 @@ ZEP_API_URL = config.get('ZEP_API_URL', '')
 ZEP_API_KEY = config.get('ZEP_API_KEY', '')
 
 try:
+    # Lazy-import keeps langchain_classic.utilities (→ langchain_core)
+    # out of helper's module-level chain so the frozen-binary validate
+    # step doesn't pull the broken langchain_core.language_models lazy
+    # __init__ at import time.  Search is optional + only used in a
+    # handful of search-tool call paths, so paying the import cost
+    # once on first instantiation is cheaper than always-load.
+    from langchain_classic.utilities import GoogleSearchAPIWrapper
     search = GoogleSearchAPIWrapper(k=4)
 except Exception as _search_err:
     logging.getLogger(__name__).info(f"Google Search unavailable (expected in local mode): {_search_err}")
@@ -532,6 +551,16 @@ def retrieve_json(json_message):
         .replace("\u201c", '"').replace("\u201d", '"')
         .replace("\u2014", "-").replace("\u2013", "-"))
 
+    # Empty / whitespace-only input \u2192 return None immediately.  Without
+    # this guard, the downstream fallback chain (repair_json \u2192
+    # ast.literal_eval \u2192 regex) all fire on empty input and log
+    # `json_repair failed: Expecting value: line 1 column 1 (char 0)`
+    # + `ast.literal_eval failed: unmatched ')'` per call.  Production
+    # log evidence (2026-05-20 22:22-22:28): 70+ such pairs in a single
+    # minute when upstream LLM returned empty due to context overflow.
+    if not json_message or not json_message.strip():
+        return None
+
     try:
         return json.loads(repair_json(json_message))
     except Exception as e:
@@ -627,6 +656,81 @@ class ToolMessageHandler:
                 # Replace null with empty string
                 messages[i]['content'] = ""
                 current_app.logger.info(f"FIXED: Replaced null content with empty string in message {i}")
+
+        # OPENAI API ROLE-ORDER GUARD (added 2026-05-08 after live evidence
+        # of chat 400 errors: "Cannot have 2 or more assistant messages
+        # at the end of the list").  Llama-server's OpenAI-compatible
+        # endpoint requires alternating user/assistant messages with no
+        # consecutive same-role pairs (especially at the tail).  Autogen's
+        # multi-agent loop emits empty assistant placeholders + back-to-back
+        # Assistant→Assistant chains during speaker selection (the
+        # 2026-05-08 langchain.log showed Message[7]=Assistant,
+        # Message[8]={"content":"","role":"assistant"}, Message[10]=Assistant
+        # — three consecutive assistants causing the 400).
+        #
+        # Fix:
+        #   1. Drop empty-content assistant messages that have no tool_calls
+        #      / function_call (they're autogen placeholders, not real
+        #      replies).
+        #   2. Coalesce consecutive same-role messages by joining their
+        #      content with two newlines, so a {Assistant, Assistant} pair
+        #      becomes a single Assistant with merged text.  Tool-call /
+        #      function-call carrying messages are preserved as-is so
+        #      they don't get silently dropped.
+        #
+        # This is purely defensive — if the upstream loop emits clean
+        # alternating messages, this is a no-op.  Surfaces dropped /
+        # merged events at INFO so future diagnoses are visible.
+        try:
+            cleaned: List[Dict] = []
+            for i, msg in enumerate(messages):
+                role = (msg.get('role') or '').lower()
+                content = msg.get('content')
+                has_calls = bool(msg.get('tool_calls') or msg.get('function_call'))
+                # Drop empty assistant placeholders (no content + no tool calls)
+                if role == 'assistant' and not has_calls:
+                    if content is None or (isinstance(content, str) and content.strip() == ''):
+                        current_app.logger.info(
+                            f"[ROLE-ORDER-GUARD] Dropping empty assistant "
+                            f"placeholder at index {i} (name="
+                            f"{msg.get('name','unknown')!r}) — autogen "
+                            f"speaker-selection artifact, would cause OpenAI "
+                            f"400 'Cannot have 2 or more assistant messages'."
+                        )
+                        continue
+                # Coalesce consecutive same-role messages
+                if cleaned:
+                    prev = cleaned[-1]
+                    prev_role = (prev.get('role') or '').lower()
+                    prev_has_calls = bool(prev.get('tool_calls') or prev.get('function_call'))
+                    if (prev_role == role
+                            and not prev_has_calls
+                            and not has_calls
+                            and isinstance(prev.get('content'), str)
+                            and isinstance(content, str)):
+                        merged = prev['content']
+                        if content.strip():
+                            merged = (merged + '\n\n' + content
+                                      if merged.strip() else content)
+                        prev['content'] = merged
+                        current_app.logger.info(
+                            f"[ROLE-ORDER-GUARD] Coalesced consecutive "
+                            f"role={role!r} messages at indices "
+                            f"{i-1}+{i} (would cause OpenAI 400 "
+                            f"alternation rule); merged content kept "
+                            f"in earlier slot."
+                        )
+                        continue
+                cleaned.append(msg)
+            messages = cleaned
+        except Exception as _guard_err:
+            # Never break the upstream pipeline — if the guard itself
+            # crashes, fall through with the original messages and let
+            # the API-level error (if any) surface as before.
+            current_app.logger.exception(
+                f"[ROLE-ORDER-GUARD] guard raised {type(_guard_err).__name__}: "
+                f"{_guard_err!s} — using messages as-is"
+            )
 
         return messages
 
@@ -1527,6 +1631,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
     '''
 
     start_time = time.time()
+    from langchain_classic.memory import ZepMemory  # lazy (see helper.py:32)
     memory = ZepMemory(
         session_id=session_id,
         url='http://azure_all_vms.hertzai.com:8000',
@@ -1729,6 +1834,7 @@ def get_memory(user_id: int):
     '''
         Get memory object from zep
     '''
+    from langchain_classic.memory import ZepMemory  # lazy (see helper.py:32)
     session_id = "user_"+str(user_id)
     memory = ZepMemory(
         session_id=session_id,
@@ -1741,6 +1847,8 @@ def get_memory(user_id: int):
     return memory
 
 def history(user_id,prompt_id,role,message):
+    # lazy import: langchain_classic.schema (see helper.py:32)
+    from langchain_classic.schema import HumanMessage, AIMessage
     try:
         memory = get_memory(user_id=int(user_id))
     except Exception:
@@ -1885,7 +1993,7 @@ def create_visual_agent(user_id,prompt_id):
         llm_config=llm_config,
         max_consecutive_auto_reply=10,
         is_termination_msg=_is_terminate_msg,
-        code_execution_config={"work_dir": "coding", "use_docker": False},
+        code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message="You are an helpful AI assistant used to perform visual based tasks given to you. "
     )
 
@@ -1900,7 +2008,7 @@ def create_visual_agent(user_id,prompt_id):
     helper2 = autogen.AssistantAgent(
         name="Helper",
         llm_config=llm_config,
-        code_execution_config={"work_dir": "coding", "use_docker": False},
+        code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f"""You are Helper Agent. Help the visual_agent to complete the task:
             2. Use the provided Recipe for more details related to the actions.
             3. Only use the "send_message_to_roles" tool when contacting personas other than ,Executor,multi_role_agent.
@@ -1918,7 +2026,7 @@ def create_visual_agent(user_id,prompt_id):
     executor2 = autogen.AssistantAgent(
         name="Executor",
         llm_config=llm_config,
-        code_execution_config={"last_n_messages":2,"work_dir": "coding", "use_docker": False},
+        code_execution_config={"last_n_messages":2,"work_dir": get_coding_workspace_dir(), "use_docker": False},
         system_message=f'''You are a executor agent. focused solely on creating, running & debugging code.
             Your responsibilities:
             2. Use the provided Recipe for more details related to the actions.
@@ -1980,7 +2088,7 @@ def create_visual_agent(user_id,prompt_id):
     context_handling = transform_messages.TransformMessages(
         transforms=[
             transforms.MessageHistoryLimiter(max_messages=50,keep_first_message=True),
-            transforms.MessageTokenLimiter(max_tokens=4000, max_tokens_per_message=1000, min_tokens=0),
+            transforms.MessageTokenLimiter(max_tokens=3500, max_tokens_per_message=1000, min_tokens=0),
             ToolMessageHandler(),
         ]
     )
@@ -1989,6 +2097,10 @@ def create_visual_agent(user_id,prompt_id):
     context_handling.add_to_agent(executor2)
     context_handling.add_to_agent(multi_role_agent2)
     context_handling.add_to_agent(verify2)
+    # See chat_instructor rationale at create_recipe.py:903 — visual_agent
+    # path uses chat_instructor2 (UserProxyAgent line 2047) the same way;
+    # it needs the same buffer cap to avoid llama.cpp n_ctx overflow.
+    context_handling.add_to_agent(chat_instructor2)
 
     return visual_agent, visual_user, helper2, executor2, multi_role_agent2, verify2, chat_instructor2
 

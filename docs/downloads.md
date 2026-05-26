@@ -2,6 +2,21 @@
 
 All builds are automated, signed, and verified. Pick your platform.
 
+## What you're downloading
+
+There are two things, one name per role:
+
+- **Nunba** — the unified client. Same experience on Windows, macOS, Linux,
+  Android, web, watch, and inside HART OS itself. One identity, every device.
+- **HART OS** — the backend OS + agentic runtime.  The network backbone is a
+  Mixture-of-Experts (MoE) of open and closed models orchestrated by an
+  agentic hive mind that learns and infers simultaneously — not a static
+  inference endpoint.  Runs on your laptop (flat), your LAN (regional), or
+  in the cloud (central) and federates over PeerLink across deployments.
+
+You only need Nunba on each device you use; HART OS is the substrate Nunba
+talks to (locally bundled or remote).
+
 ## Quick Install (Any Platform)
 
 Download the installer for your OS — it auto-detects your platform and installs the right thing.
@@ -34,9 +49,12 @@ Torrents are web-seeded via GitHub CDN.
 
 **Desktop ISO is larger than GitHub's 2 GB per-asset limit** and therefore ships split into `…iso.part-00`, `…iso.part-01`, … Download every `part-*` alongside the `.sha256` and a companion `…iso.reassemble.sh`, then run the script (or `cat *.part-* > …iso`) to stitch them and verify the checksum.
 
-## Nunba — Native Agentic Client
+## Nunba — Unified Agentic Client (Desktop)
 
-Nunba is the HART agentic client — same experience on HART OS and as a native app on Windows, macOS, or Linux. Think of it as a cross-platform agentic shell: chat, agents, communities, and compute controls, backed by the HART runtime running locally or remotely.
+Nunba is the unified HART client — Windows, macOS, Linux desktop builds
+here; Android + web + iOS sections below; on HART OS itself Nunba is
+pre-installed.  One client identity across every device, backed by the
+HART runtime (the MoE-of-models hive mind) running locally or remotely.
 
 | Target | Delivery | Notes |
 |--------|----------|-------|
@@ -48,22 +66,33 @@ Nunba is the HART agentic client — same experience on HART OS and as a native 
 
 On HART OS Nunba binds to the local `hart_intelligence_entry.py` runtime (port 6777). On other OSes it bundles the same runtime or points at a remote HART node via `NUNBA_BACKEND_URL`.
 
-## Hevolve Droid (Android)
+## Nunba (Android)
 
-Your phone becomes a remote to your private AI mesh.
+Same Nunba client, on your phone — your phone becomes a remote to your
+private AI mesh.
 
 | Platform | Download |
 |----------|----------|
 | **Android (Play Store)** | [Google Play](https://play.google.com/store/apps/details?id=com.hertzai.hevolve) |
 | **Android (APK, team only)** | [Direct APK](https://github.com/hertz-ai/Hevolve_React_Native/releases/latest/download/Hevolve.apk) — _`hertz-ai/Hevolve_React_Native` is a private repo; the asset link requires a GitHub session. Public users should install via Play Store above._ |
 
-## Hevolve Web
+> The underlying Play Store package ID (`com.hertzai.hevolve`), the GitHub
+> repo (`Hevolve_React_Native`), and the APK filename (`Hevolve.apk`) still
+> reflect the project's prior internal name.  User-facing branding is
+> "Nunba" everywhere; the asset-rename across Play Store metadata + repo +
+> CI artifacts is a coordinated rollout that lands separately so existing
+> install URLs don't break for current users.
 
-Access from any browser — no install needed.
+## Nunba (Web)
+
+Same Nunba client, in the browser — no install needed.
 
 | Platform | Link |
 |----------|------|
 | **Web App** | [hevolve.ai](https://hevolve.ai/) |
+
+> The web client is hosted at `hevolve.ai` for legacy SEO continuity; the
+> in-app branding is "Nunba".
 
 ## pip install (Backend only)
 
@@ -99,6 +128,7 @@ print('VALID' if verify_release_manifest(m) else 'INVALID')
 
 | Project | Releases |
 |---------|----------|
-| **HART OS** | [GitHub Releases](https://github.com/hertz-ai/HARTOS/releases) |
-| **Nunba** | [GitHub Releases](https://github.com/hertz-ai/Nunba/releases) |
-| **Hevolve Droid** | [GitHub Releases](https://github.com/hertz-ai/Hevolve_React_Native/releases) |
+| **HART OS** (backend) | [GitHub Releases](https://github.com/hertz-ai/HARTOS/releases) |
+| **Nunba** (desktop / web client) | [GitHub Releases](https://github.com/hertz-ai/Nunba/releases) |
+| **Nunba (Android)** | [GitHub Releases](https://github.com/hertz-ai/Hevolve_React_Native/releases) — repo name still reflects the prior internal name |
+| **Nunba (iOS)** | TestFlight / App Store ([source](https://github.com/hertz-ai/nunba-ios)) |

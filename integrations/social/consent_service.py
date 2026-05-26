@@ -31,6 +31,14 @@ CONSENT_TYPES = frozenset({
     'public_exposure',   # Content made public
     'payment_setup',     # User provides UPI/payment ID for revenue payouts
     'compute_contribute', # User allows their device to process hive tasks
+    'cloud_egress',      # User allows fallback to cloud (vision, social
+                         # sync, third-party APIs) when local resources
+                         # can't satisfy the request.  Scope-aware: e.g.
+                         # scope='vision' grants cloud-vision specifically;
+                         # scope='social_sync' grants cloud social fan-out.
+                         # First-time fallback emits a notification +
+                         # request_consent record; user grants once,
+                         # subsequent requests proceed without prompting.
 })
 
 
@@ -179,6 +187,79 @@ class ConsentService:
             'agent_id': agent_id,
         })
         return consent
+
+    @staticmethod
+    def auto_grant_with_notice(db, user_id: str, consent_type: str,
+                               scope: str = '*', agent_id=None,
+                               reason: str = '') -> bool:
+        """Privacy-aware auto-grant: NEVER blocks the request, but informs
+        the user the FIRST time the cloud (or any consent-gated path) is
+        used and gives them a one-tap revoke action.
+
+        Pattern: "transparency + easy revoke" — privacy-first should not
+        cause functional failures.  If the user has actively REVOKED
+        this consent, this method returns False and the caller refuses.
+        Otherwise (no record OR previously granted) it ensures a granted
+        record exists, emits a one-time `consent.auto_granted` notice,
+        and returns True so the caller proceeds immediately.
+
+        Use this for cloud egress that's safe-by-default (vision
+        fallback, social cross-device sync, fleet API tool calls, etc.)
+        where blocking the request would degrade UX more than the
+        privacy gain justifies.  Use ``check_consent`` + ``request_consent``
+        directly when the gated action is high-stakes (payment_setup,
+        public_exposure of private content) and you genuinely want to
+        block until the user explicitly grants.
+
+        Returns:
+            True  — caller may proceed (consent is now granted, possibly
+                    silently auto-granted with notice).
+            False — caller MUST refuse: user has explicitly revoked this
+                    consent and re-granting requires a fresh user action.
+        """
+        _validate_consent_type(consent_type)
+
+        # 1. Active grant exists? Proceed silently.
+        if ConsentService.check_consent(db, user_id, consent_type,
+                                        scope=scope, agent_id=agent_id):
+            return True
+
+        # 2. Was there a PRIOR explicit revoke?  Honor it — refuse.
+        prior = db.query(UserConsent).filter(
+            UserConsent.user_id == user_id,
+            UserConsent.consent_type == consent_type,
+            UserConsent.scope == scope,
+            UserConsent.agent_id == agent_id,
+            UserConsent.revoked_at.isnot(None),
+        ).order_by(UserConsent.revoked_at.desc()).first()
+        if prior is not None and prior.revoked_at is not None:
+            _emit('consent.refused_after_revoke', {
+                'user_id': user_id,
+                'consent_type': consent_type,
+                'scope': scope,
+                'agent_id': agent_id,
+                'reason': reason or (
+                    f"Previously revoked {consent_type}/{scope}; "
+                    f"re-grant requires a fresh user action."
+                ),
+            })
+            return False
+
+        # 3. No record at all → auto-grant + emit one-time notice.
+        ConsentService.grant_consent(db, user_id, consent_type,
+                                     scope=scope, agent_id=agent_id)
+        _emit('consent.auto_granted', {
+            'user_id': user_id,
+            'consent_type': consent_type,
+            'scope': scope,
+            'agent_id': agent_id,
+            'reason': reason or (
+                f"Auto-granted {consent_type}/{scope} so your request "
+                f"could be served.  Tap to review or revoke in settings."
+            ),
+            'revoke_action': 'consent.revoke',
+        })
+        return True
 
     @staticmethod
     def revoke_consent(db, user_id: str, consent_type: str,

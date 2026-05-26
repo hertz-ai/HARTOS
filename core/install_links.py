@@ -167,3 +167,169 @@ def is_supported_device(device: str) -> bool:
 def is_supported_install_channel(channel_type: str) -> bool:
     """True iff `channel_type` is one of SUPPORTED_INSTALL_CHANNELS."""
     return (channel_type or '').lower().strip() in SUPPORTED_INSTALL_CHANNELS
+
+
+# ─── Custom-scheme deep links (UNIF-G4) ─────────────────────────────
+#
+# Distinct from `is_allowed_install_link` (HTTPS-only) above — these
+# helpers cover the OS-registered custom schemes used by the Nunba
+# desktop / Android / iOS protocol handlers to receive invite-accept,
+# meet-join, and group-join intents from external apps (browser,
+# Telegram, Discord, OS file manager, etc.).
+#
+# Schemes (all three accepted on the receive side; builders default
+# to ``hevolveai`` for the canonical cross-platform link):
+#   - hevolveai://   Nunba desktop registers this since 2024;
+#                    canonical for agent-emitted links.
+#   - nunba://       UNIF-G4 brand-canon scheme; iOS + desktop accept.
+#   - hevolve://     Legacy mobile scheme; Android + iOS Info.plist
+#                    have registered it since the early Hevolve_RN
+#                    builds (referrals, share, campaign, channel).
+#                    Recognized here so a single ``invite_link()`` URL
+#                    can be valid on every surface — the desktop
+#                    protocol handler, Android intent filter, and iOS
+#                    URL types all accept the same input.
+#
+# Verbs (path[0]):
+#   - invite   → /invite/<invite_code>
+#   - meet     → /meet/<platform>/<room_id>
+#   - group    → /group/<platform>/<group_id>
+#
+# Mobile clients use these deep links to route an inbound share-link
+# tap straight into the matching agent tool (Invite_Friend.accept or
+# Join_External_Room) without going through a web redirect first.
+
+DEEPLINK_SCHEMES: Tuple[str, ...] = ('hevolveai', 'nunba', 'hevolve')
+DEEPLINK_VERBS: Tuple[str, ...] = ('invite', 'meet', 'group')
+
+
+def is_allowed_deeplink_uri(uri: str) -> bool:
+    """Validate a custom-scheme deep-link URI.
+
+    True iff scheme ∈ DEEPLINK_SCHEMES and the leading path segment is
+    one of DEEPLINK_VERBS with at least one trailing segment.
+    """
+    if not isinstance(uri, str) or not uri:
+        return False
+    try:
+        parsed = urlparse(uri)
+    except Exception:
+        return False
+    scheme = (parsed.scheme or '').lower()
+    if scheme not in DEEPLINK_SCHEMES:
+        return False
+    # urlparse treats `nunba://invite/X` netloc='invite', path='/X'
+    # and `nunba:invite/X` path='invite/X'.  Normalize.
+    raw = (parsed.netloc + parsed.path) if parsed.netloc else parsed.path
+    segments = [s for s in (raw or '').split('/') if s]
+    if not segments:
+        return False
+    verb = segments[0].lower()
+    if verb not in DEEPLINK_VERBS:
+        return False
+    # Per-verb arity:
+    #   invite needs 1 trailing segment (code)        → total ≥ 2
+    #   meet / group need 2 trailing segments
+    #   (platform + room/group_id)                    → total ≥ 3
+    required_total = 2 if verb == 'invite' else 3
+    if len(segments) < required_total:
+        return False
+    return True
+
+
+def invite_link(invite_code: str, scheme: str = 'hevolveai') -> str:
+    """Build a custom-scheme deep link for accepting a friend invite."""
+    if not invite_code:
+        raise ValueError("invite_link requires a non-empty invite_code")
+    s = (scheme or 'hevolveai').lower()
+    if s not in DEEPLINK_SCHEMES:
+        raise ValueError(f"unsupported scheme {scheme!r}")
+    return f"{s}://invite/{invite_code}"
+
+
+def meet_link(platform: str, room_id: str,
+              scheme: str = 'hevolveai') -> str:
+    """Build a custom-scheme deep link for joining an external meet."""
+    if not platform or not room_id:
+        raise ValueError("meet_link requires platform + room_id")
+    s = (scheme or 'hevolveai').lower()
+    if s not in DEEPLINK_SCHEMES:
+        raise ValueError(f"unsupported scheme {scheme!r}")
+    return f"{s}://meet/{platform.lower()}/{room_id}"
+
+
+def group_link(platform: str, group_id: str,
+               scheme: str = 'hevolveai') -> str:
+    """Build a custom-scheme deep link for joining an external group."""
+    if not platform or not group_id:
+        raise ValueError("group_link requires platform + group_id")
+    s = (scheme or 'hevolveai').lower()
+    if s not in DEEPLINK_SCHEMES:
+        raise ValueError(f"unsupported scheme {scheme!r}")
+    return f"{s}://group/{platform.lower()}/{group_id}"
+
+
+# ─── Public OG / share URL builder ────────────────────────────────
+#
+# F1 of memory/feedback_unification_reuse_contract.md — the SINGLE
+# canonical builder for HTTPS share URLs that crawlers (Discord /
+# Slack / WhatsApp Web / Twitter / Telegram / LinkedIn / FB) fetch
+# to render unfurl previews.  Every emit site (InviteService,
+# DistributionService, adapter share-card builders, OG endpoint)
+# must call ``og_url`` — never inline a string.
+#
+# Distinct from the custom-scheme deep-links above:
+#   * ``invite_link / meet_link / group_link`` → ``hevolveai://...`` —
+#     consumed by the OS protocol handler, opens Nunba app directly.
+#   * ``og_url`` → ``https://...`` — consumed by web bots for OG
+#     preview rendering; redirects to SPA / app from the resulting
+#     OG endpoint.
+#
+# These are NOT parallel paths: they serve different consumers
+# (protocol handler vs HTTP bot fetcher).  A single emit site
+# typically uses BOTH (custom-scheme as the click-through CTA inside
+# an HTTPS preview card).
+
+OG_RESOURCE_TYPES: Tuple[str, ...] = ('i', 'c', 'p', 'u')
+
+
+def og_url(resource_type: str, identifier: str,
+           base_url: Optional[str] = None) -> str:
+    """Build canonical public share URL for a resource.
+
+    Args:
+        resource_type: one of OG_RESOURCE_TYPES — ``i`` (invite),
+            ``c`` (community), ``p`` (post), ``u`` (user/agent).
+            Future expansion: ``m`` (meet), ``g`` (group), ``ch``
+            (channel) — these require canonical Meet / Group /
+            ChannelBinding models first (F8 in the contract).
+        identifier: the canonical ID for the resource (UUID, slug,
+            invite_code, or handle).  Must be non-empty.
+        base_url: override.  Defaults to
+            ``HEVOLVE_PUBLIC_BASE_URL`` env or
+            ``https://hevolve.ai``.
+
+    Returns:
+        ``<base>/<resource_type>/<identifier>``.  Example:
+        ``https://hevolve.ai/i/A1B2C3``.
+
+    Raises:
+        ValueError on unknown ``resource_type`` or empty
+        ``identifier``.
+
+    Single-writer contract: every share-URL emit site in HARTOS +
+    Nunba calls this function.  No parallel implementations.  See
+    ``memory/feedback_unification_reuse_contract.md``.
+    """
+    if resource_type not in OG_RESOURCE_TYPES:
+        raise ValueError(
+            f"unsupported resource_type {resource_type!r}; "
+            f"known: {OG_RESOURCE_TYPES}"
+        )
+    if not identifier:
+        raise ValueError("og_url requires non-empty identifier")
+    import os as _os
+    base = base_url or _os.environ.get(
+        'HEVOLVE_PUBLIC_BASE_URL', 'https://hevolve.ai'
+    )
+    return f"{base.rstrip('/')}/{resource_type}/{identifier}"

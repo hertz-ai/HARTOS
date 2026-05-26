@@ -142,12 +142,42 @@ def build_channel_tool_closures(ctx):
             try:
                 config = json.loads(config_json)
             except json.JSONDecodeError:
-                # If user just pasted a token, try to assign it to the first field
-                fields = meta.get('setup_fields', [])
+                # If user just pasted a token, try to assign it to the first
+                # USER-VISIBLE field (skip auto:True infrastructure fields
+                # like WhatsApp's api_url/access_token — the user wouldn't
+                # paste a WAHA URL when prompted for "WhatsApp number").
+                fields = [f for f in meta.get('setup_fields', [])
+                          if not f.get('auto')]
                 if fields:
                     config = {fields[0]['key']: config_json.strip()}
                 else:
                     return f"Could not parse config. Expected JSON. Required fields: {[f['key'] for f in meta.get('setup_fields', [])]}"
+
+            # Auto-fill auto:True fields from env-var defaults so the
+            # user doesn't have to know about gateway infrastructure
+            # (WAHA api_url for WhatsApp, etc).  Order:
+            #   1. config[key] explicitly supplied by caller — wins
+            #   2. WHATSAPP_<KEY_UPPER> env var — operator override
+            #      (e.g. WHATSAPP_API_URL=https://my-waha.example.com)
+            #   3. setup_fields[].default — schema default
+            #   4. '' if no default
+            # Single helper inside this closure — DRY across all
+            # auto-fill paths in register_channel.
+            import os
+            env_prefix = f"{channel_type.upper()}_"
+            for f in meta.get('setup_fields', []) or []:
+                if not f.get('auto'):
+                    continue
+                key = f.get('key')
+                if not key or config.get(key) not in (None, ''):
+                    continue
+                env_val = os.getenv(env_prefix + key.upper())
+                if env_val is not None:
+                    config[key] = env_val
+                elif 'default' in f:
+                    config[key] = f['default']
+                else:
+                    config[key] = ''
 
             # Save via admin API singleton
             from integrations.channels.admin.api import get_api
@@ -195,6 +225,103 @@ def build_channel_tool_closures(ctx):
             if missing:
                 return (f"{meta['display_name']} registered with partial config. "
                         f"Missing: {missing}. Complete setup in the Channels page.")
+
+            # PR P.4 — best-effort adapter probe so we surface a toast
+            # the moment the credential turns out to be wrong.  Runs
+            # in a daemon thread with its own event loop so:
+            #   - the agent-tool return is not delayed by the probe
+            #     (some adapters open long-lived sockets — sub-second
+            #     to seconds depending on provider RTT);
+            #   - the loop we own is closed only after the connect()
+            #     coroutine actually exits, avoiding the dangling-
+            #     adapter / loop-closed-mid-task class of bug;
+            #   - on failure we emit a Liquid UI toast (handled by
+            #     AgentOverlay's case 'toast' renderer) so the user
+            #     sees actionable feedback in chat.
+            #
+            # The registration itself stays committed — the toast is
+            # advisory, not authoritative; operator can fix in admin.
+            try:
+                from integrations.channels.registry import get_registry
+                registry = get_registry()
+                adapter = registry.get(channel_type) if registry else None
+                if adapter is not None:
+                    import threading as _threading
+                    _probe_uid = (
+                        user_id or _get_user_id_from_threadlocal() or 'system'
+                    )
+                    _probe_meta = meta  # capture for the thread closure
+
+                    def _probe_in_thread():
+                        import asyncio as _asyncio
+                        loop = _asyncio.new_event_loop()
+                        _asyncio.set_event_loop(loop)
+                        try:
+                            loop.run_until_complete(
+                                _asyncio.wait_for(adapter.connect(), timeout=10),
+                            )
+                        except Exception as probe_err:
+                            logger.info(
+                                "register_channel: adapter probe failed "
+                                "for %s: %s", channel_type, probe_err,
+                            )
+                            try:
+                                from core.platform.service_registry import (
+                                    ServiceRegistry,
+                                )
+                                _lui = ServiceRegistry.get('LiquidUIService')
+                                if _lui:
+                                    _lui.agent_ui_update(_probe_uid, {
+                                        'type': 'toast',
+                                        'severity': 'error',
+                                        'channel': channel_type,
+                                        'channel_type': channel_type,
+                                        'text': (
+                                            f"{_probe_meta.get('display_name') or channel_type} "
+                                            f"couldn't connect: "
+                                            f"{str(probe_err)[:120]}"
+                                        ),
+                                    })
+                            except Exception as toast_err:
+                                logger.debug(
+                                    "Probe-failure toast emit skipped: %s",
+                                    toast_err,
+                                )
+                            # PR Q — also fan out a channel_unhealthy
+                            # fleet command so the user's OTHER devices
+                            # surface the same banner (toast above only
+                            # reaches the device currently in the chat).
+                            try:
+                                from integrations.social.fleet_command import (
+                                    emit_channel_unhealthy,
+                                )
+                                from integrations.social.models import get_db
+                                _db = get_db()
+                                try:
+                                    emit_channel_unhealthy(
+                                        _db,
+                                        user_id=_probe_uid,
+                                        channel_type=channel_type,
+                                        reason=str(probe_err)[:120],
+                                    )
+                                    _db.commit()
+                                finally:
+                                    _db.close()
+                            except Exception as fanout_err:
+                                logger.debug(
+                                    "Probe-failure fleet fan-out skipped: %s",
+                                    fanout_err,
+                                )
+                        finally:
+                            loop.close()
+
+                    _threading.Thread(
+                        target=_probe_in_thread,
+                        name=f'channel-probe-{channel_type}',
+                        daemon=True,
+                    ).start()
+            except Exception as e:
+                logger.debug("Probe thread spawn skipped: %s", e)
 
             return (f"{meta['display_name']} registered and enabled! "
                     f"Auth: {meta['auth_method']}. "
@@ -507,6 +634,134 @@ def build_channel_tool_closures(ctx):
         "user (no cross-user spam) and refuses install_link overrides that "
         "are not on the host allowlist (no phishing-URL injection).",
         send_install_link,
+    ))
+
+    # ------------------------------------------------------------------
+    # disconnect_channel (PR P.5)
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def disconnect_channel(
+        channel_type: Annotated[str, "Channel to disconnect (telegram, discord, slack, ...)"],
+    ) -> str:
+        """Disconnect the user's binding for a channel.  Marks the
+        UserChannelBinding row inactive (same row the register_channel
+        path created) — the adapter stops being used for this user but
+        the channel-wide config and other users' bindings stay intact.
+        Single owner of the binding lifecycle: register_channel writes,
+        disconnect_channel reverses.
+        """
+        try:
+            channel_type = channel_type.lower().strip()
+            from integrations.channels.metadata import get_channel_metadata
+            meta = get_channel_metadata(channel_type)
+            if not meta:
+                return f"Unknown channel '{channel_type}'."
+            uid = user_id or _get_user_id_from_threadlocal()
+            if not uid:
+                return "Could not determine the current user."
+            from integrations.social.models import get_db, UserChannelBinding
+            db = get_db()
+            try:
+                row = db.query(UserChannelBinding).filter_by(
+                    user_id=str(uid), channel_type=channel_type, is_active=True,
+                ).first()
+                if not row:
+                    return (
+                        f"No active {meta['display_name']} binding to disconnect."
+                    )
+                row.is_active = False
+                db.commit()
+            finally:
+                db.close()
+            # User-visible toast confirming the action.
+            try:
+                from core.platform.service_registry import ServiceRegistry
+                _lui = ServiceRegistry.get('LiquidUIService')
+                if _lui:
+                    _lui.agent_ui_update(uid, {
+                        'type': 'toast', 'severity': 'info',
+                        'channel': channel_type, 'channel_type': channel_type,
+                        'text': f"{meta['display_name']} disconnected.",
+                    })
+            except Exception as e:
+                logger.debug("disconnect toast emit skipped: %s", e)
+            return (
+                f"{meta['display_name']} disconnected.  Run "
+                f"reconnect_channel('{channel_type}') to bring it back."
+            )
+        except Exception as e:
+            logger.error("disconnect_channel error: %s", e)
+            return f"Error disconnecting channel: {e}"
+
+    tools.append((
+        "disconnect_channel",
+        "Disconnect the user's existing binding for a channel.  Use when "
+        "the user wants to stop using a previously connected channel "
+        "(Telegram, Discord, WhatsApp, etc.).  Reversible via "
+        "reconnect_channel.  Example: disconnect_channel('telegram').",
+        disconnect_channel,
+    ))
+
+    # ------------------------------------------------------------------
+    # reconnect_channel (PR P.6)
+    # ------------------------------------------------------------------
+    @log_tool_execution
+    def reconnect_channel(
+        channel_type: Annotated[str, "Channel to reconnect"],
+    ) -> str:
+        """Re-activate a previously disconnected binding (or trigger a
+        fresh connection flow if no inactive binding exists).  Single
+        flow: if an inactive binding exists, flip is_active back to True.
+        Otherwise re-emit the form / qr_pair / oauth_link prompt the
+        user originally went through — same Connect_Channel pipeline,
+        no parallel re-onboarding code path.
+        """
+        try:
+            channel_type = channel_type.lower().strip()
+            from integrations.channels.metadata import get_channel_metadata
+            meta = get_channel_metadata(channel_type)
+            if not meta:
+                return f"Unknown channel '{channel_type}'."
+            uid = user_id or _get_user_id_from_threadlocal()
+            if not uid:
+                return "Could not determine the current user."
+            from integrations.social.models import get_db, UserChannelBinding
+            db = get_db()
+            try:
+                row = db.query(UserChannelBinding).filter_by(
+                    user_id=str(uid), channel_type=channel_type,
+                ).first()
+                if row and not row.is_active:
+                    row.is_active = True
+                    db.commit()
+                    return (
+                        f"{meta['display_name']} reconnected (existing binding "
+                        f"reactivated).  The adapter will start using it on "
+                        f"the next message tick."
+                    )
+            finally:
+                db.close()
+            # No prior binding (or already active) — bounce the user
+            # through the standard Connect_Channel onboarding so they
+            # can re-paste a token / scan a QR / click OAuth, exactly
+            # like a first-time setup.  No parallel onboarding path.
+            return (
+                f"No inactive {meta['display_name']} binding found.  "
+                f"Run Connect_Channel('{channel_type}') to start a fresh setup."
+            )
+        except Exception as e:
+            logger.error("reconnect_channel error: %s", e)
+            return f"Error reconnecting channel: {e}"
+
+    tools.append((
+        "reconnect_channel",
+        "Re-enable a previously disconnected channel binding.  If the "
+        "binding row exists but is inactive, this flips it back on.  "
+        "Otherwise the user is bounced through the standard "
+        "Connect_Channel flow (form / QR / OAuth, depending on the "
+        "channel) to re-establish credentials.  Example: "
+        "reconnect_channel('discord').",
+        reconnect_channel,
     ))
 
     return tools

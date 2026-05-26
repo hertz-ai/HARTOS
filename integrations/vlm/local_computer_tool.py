@@ -107,8 +107,11 @@ def get_active_window_info():
     Used to prevent VLM misidentifying windows (e.g. Claude Code as MobaXterm)."""
     try:
         import platform, subprocess, json
+        from core.subprocess_safe import hidden_popen_kwargs
         _os = platform.system()
         if _os == 'Windows':
+            # CREATE_NO_WINDOW prevents the powershell child from popping a
+            # cmd console on every call (this fires per VLM probe).
             r = subprocess.run(
                 ['powershell', '-Command',
                  '(Get-Process | Where-Object {$_.MainWindowHandle -eq '
@@ -119,7 +122,8 @@ def get_active_window_info():
                  '(Add-Type -MemberDefinition \'[DllImport("user32.dll")] '
                  'public static extern IntPtr GetForegroundWindow();\' '
                  '-Name W2 -PassThru)::GetForegroundWindow()}).MainWindowTitle'],
-                capture_output=True, text=True, timeout=3)
+                capture_output=True, text=True, timeout=3,
+                **hidden_popen_kwargs())
             if r.returncode == 0 and r.stdout.strip():
                 return r.stdout.strip()
         elif _os == 'Linux':

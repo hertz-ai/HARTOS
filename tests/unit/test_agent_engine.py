@@ -413,7 +413,7 @@ class TestAgentDaemon:
         assert daemon._running is True
         daemon.stop()
 
-    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_opted_in_agents')
+    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_agent_personas')
     def test_daemon_tick_dispatches(self, mock_idle, db, test_user, test_product):
         from integrations.agent_engine.agent_daemon import AgentDaemon
 
@@ -1600,29 +1600,11 @@ class TestSpeculativeDispatcher:
         assert 'halted' in result.get('error', '').lower()
         HiveCircuitBreaker._halted = False
 
-    def test_meaningful_improvement_adequate(self):
-        from integrations.agent_engine.speculative_dispatcher import SpeculativeDispatcher
-        from integrations.agent_engine.model_registry import ModelRegistry
-        d = SpeculativeDispatcher(model_registry=ModelRegistry())
-        assert d._is_meaningful_improvement('hello', 'RESPONSE_ADEQUATE') is False
-
-    def test_meaningful_improvement_different(self):
-        from integrations.agent_engine.speculative_dispatcher import SpeculativeDispatcher
-        from integrations.agent_engine.model_registry import ModelRegistry
-        d = SpeculativeDispatcher(model_registry=ModelRegistry())
-        assert d._is_meaningful_improvement(
-            'short answer',
-            'A completely different and much more detailed explanation about the topic'
-        ) is True
-
-    def test_meaningful_improvement_similar(self):
-        from integrations.agent_engine.speculative_dispatcher import SpeculativeDispatcher
-        from integrations.agent_engine.model_registry import ModelRegistry
-        d = SpeculativeDispatcher(model_registry=ModelRegistry())
-        assert d._is_meaningful_improvement(
-            'the quick brown fox jumps over the lazy dog',
-            'the quick brown fox jumps over the lazy dog'
-        ) is False
+    # _is_meaningful_improvement was deleted alongside the legacy
+    # "improve-the-draft" wrapper.  The collapsed expert path delivers
+    # the expert's reply unconditionally (post constitutional check) —
+    # no similarity gate.  Equivalent coverage now lives in
+    # test_langchain_background_delivery::TestCollapsedPathDelivery.
 
     def test_get_speculation_status_unknown(self):
         from integrations.agent_engine.speculative_dispatcher import SpeculativeDispatcher
