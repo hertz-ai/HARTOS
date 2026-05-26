@@ -150,7 +150,6 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/hertz-ai/HARTOS",
-    license="BSL-1.1",
     license="Apache-2.0",
 
     # Package discovery.  agent_ledger lives in-tree at
