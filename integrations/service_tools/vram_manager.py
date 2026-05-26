@@ -34,23 +34,6 @@ VRAM_BUDGETS: Dict[str, Tuple[float, float]] = {
     "tts_cosyvoice3":       (4.0,  3.5),    # zh/ja/ko/de/es/fr/it/ru, zero-shot
     "tts_chatterbox_ml":    (14.0, 12.0),   # 23 languages, needs 16GB+
     "tts_kokoro":           (0.5,  0.2),    # 82M neural English, CPU or GPU
-    "tts_neutts":           (0.7,  0.4),    # NeuTTS Air 748M, Q4 GGUF ~600MB
-                                             # — CPU-friendly (RTF<0.5 on i5),
-                                             # GPU optional.  Budget covers
-                                             # GGUF-on-CPU + neucodec onnx
-                                             # workspace; auto-tightens via
-                                             # record_actual_usage on first
-                                             # successful load.
-    "tts_omnivoice":        (3.5,  3.0),    # 646 langs, Qwen3-0.6B+diffusion
-                                             # — stub budget, auto-tightens
-                                             # via record_actual_usage on
-                                             # first successful load.
-    # Mid-VRAM coverage tier (1–3 GB) — bridges the gap between F5/Indic
-    # Parler/Kokoro (≤2.5 GB) and the heavy clone engines so EVERY
-    # SUPPORTED_LANG_DICT code has at least one engine with vram_gb≤3.
-    "tts_melotts":          (1.5,  1.0),    # en/es/fr/zh/ja/ko, neural CPU/GPU
-    "tts_xtts_v2":          (2.5,  1.8),    # 17 langs, voice cloning (Coqui)
-    "tts_mms_tts":          (1.0,  0.7),    # ~50+ langs (per-lang VITS, Meta)
 }
 
 
@@ -75,138 +58,6 @@ class VRAMManager:
         import threading as _threading  # noqa: E402  (runtime deferred)
         self._alloc_lock = _threading.RLock()
 
-        # Measured VRAM usage telemetry: tool → actual model_size_gb seen
-        # after a successful load.  Populated via record_actual_usage() —
-        # worker subprocesses self-report post-load GPU usage, parent
-        # stores the value and uses it in preference to the VRAM_BUDGETS
-        # estimate the next time the tool is considered.  Enables
-        # conservative stub budgets (e.g. new OmniVoice at 3.0 GB) to
-        # auto-tighten after the first real load without a code change.
-        self._measured: Dict[str, float] = {}
-        self._measured_path = self._resolve_measured_path()
-        self._load_measured()
-
-    # ── Measured-usage telemetry ─────────────────────────────────
-
-    @staticmethod
-    def _resolve_measured_path():
-        from pathlib import Path
-        # Prefer the project agent_data dir, fall back to ~/.hevolve
-        cwd_path = Path.cwd() / 'agent_data' / 'vram_measured.json'
-        try:
-            cwd_path.parent.mkdir(parents=True, exist_ok=True)
-            return cwd_path
-        except Exception:
-            fallback = Path.home() / '.hevolve' / 'vram_measured.json'
-            fallback.parent.mkdir(parents=True, exist_ok=True)
-            return fallback
-
-    def _load_measured(self) -> None:
-        import json
-        try:
-            if self._measured_path.exists():
-                data = json.loads(
-                    self._measured_path.read_text(encoding='utf-8')
-                )
-                self._measured = {
-                    str(k): float(v)
-                    for k, v in data.items()
-                    if isinstance(v, (int, float)) and v > 0
-                }
-        except Exception as e:
-            logger.debug(f"VRAM measured load failed (ignoring): {e}")
-            self._measured = {}
-
-    def _persist_measured(self) -> None:
-        """Atomic JSON write — tmp-then-rename so we can't half-write."""
-        import json
-        try:
-            tmp = self._measured_path.with_suffix('.json.tmp')
-            tmp.write_text(
-                json.dumps(self._measured, indent=2),
-                encoding='utf-8',
-            )
-            tmp.replace(self._measured_path)
-        except Exception as e:
-            logger.debug(f"VRAM measured persist failed: {e}")
-
-    def record_actual_usage(self, tool_name: str, measured_gb: float) -> None:
-        """Worker-reported post-load GPU usage.
-
-        Called from ToolWorker._wait_ready after parsing the worker's
-        '__WORKER_VRAM_GB__ <n>' marker.  Values are persisted so the
-        measurement survives restarts and tightens the budget used by
-        can_fit() / allocate() on subsequent loads.
-
-        Safety rails:
-          - Ignore non-positive values (worker emits 0.0 when it can't
-            measure — e.g. CPU-only, Metal, broken nvidia-smi).
-          - Clamp to [0.1, 64.0] GB — protects against obviously bad
-            telemetry (negative deltas from concurrent workers, runaway
-            leaks).
-          - Compare vs VRAM_BUDGETS declared size — log a prominent
-            warning if measured > declared * 1.5 (the declared budget
-            is wrong and won't fit on the target GPU class).
-        """
-        with self._alloc_lock:
-            if not tool_name or measured_gb is None:
-                return
-            try:
-                gb = float(measured_gb)
-            except (TypeError, ValueError):
-                return
-            if gb <= 0 or gb > 64.0:
-                logger.debug(
-                    f"VRAM measurement for {tool_name} out of range ({gb}) — ignored"
-                )
-                return
-            prev = self._measured.get(tool_name)
-            self._measured[tool_name] = round(gb, 2)
-            self._persist_measured()
-
-            declared = VRAM_BUDGETS.get(tool_name)
-            if declared and gb > declared[1] * 1.5:
-                logger.warning(
-                    f"{tool_name} measured {gb:.1f} GB — 50%+ over declared "
-                    f"{declared[1]:.1f} GB.  Consider raising VRAM_BUDGETS.  "
-                    f"can_fit() will use the measurement from now on."
-                )
-            elif prev is None:
-                logger.info(
-                    f"{tool_name}: first measured VRAM = {gb:.2f} GB "
-                    f"(budget was {declared[1] if declared else '—'} GB)"
-                )
-
-    def get_effective_budget(
-        self,
-        tool_name: str,
-    ) -> Optional[Tuple[float, float]]:
-        """Return (min_vram_gb, model_size_gb) using measured value if any.
-
-        Measurement is tighter than the declared budget in the common case
-        (stub budget is conservative), so we swap in the measured
-        model_size.  When the measurement exceeds the declared model_size
-        we honor the measurement — the tool really does need that much.
-
-        min_vram (headroom) is never lowered below the declared minimum,
-        because overhead like activation buffers is not captured in the
-        static post-load measurement.
-        """
-        declared = VRAM_BUDGETS.get(tool_name)
-        if not declared:
-            return None
-        measured_size = self._measured.get(tool_name)
-        if measured_size is None:
-            return declared
-        min_vram, _declared_size = declared
-        # Require at least measured_size + 0.3 GB overhead headroom
-        effective_min = max(min_vram, measured_size + 0.3)
-        return (effective_min, measured_size)
-
-    def get_measured_usage(self) -> Dict[str, float]:
-        """Return a copy of current measured-usage telemetry (tool → GB)."""
-        return dict(self._measured)
-
     # ── GPU Detection ────────────────────────────────────────────
 
     def detect_gpu(self) -> Dict:
@@ -230,24 +81,12 @@ class VRAMManager:
         # for the failure mode (2026-04-15 wmic 27-min hang, same class).
         from core.subprocess_safe import run_bounded
 
-        # nvidia-smi can be slow when the GPU is under heavy compute load
-        # (driver call queues serialize behind kernel launches, NVML init
-        # contends with active CUDA contexts).  5s was too tight on
-        # 8GB systems running concurrent VLM benchmarks - hit the
-        # subprocess_safe kill-pipes path every cycle and flooded the
-        # log.  15s gives slow systems breathing room without leaving
-        # zombie nvidia-smi processes around.  Override via env for
-        # truly degraded systems.
-        _nvsmi_timeout = float(os.environ.get(
-            'HEVOLVE_NVIDIA_SMI_TIMEOUT', '15'))
-
         # 1) nvidia-smi — zero-dependency, works on any NVIDIA GPU system
         try:
             result = run_bounded(
                 ["nvidia-smi", "--query-gpu=name,memory.total,memory.free",
                  "--format=csv,noheader,nounits"],
                 timeout=5,
-                timeout=_nvsmi_timeout,
             )
             if result.returncode == 0 and result.stdout.strip():
                 line = result.stdout.strip().split("\n")[0]
@@ -277,12 +116,6 @@ class VRAMManager:
             result = run_bounded(
                 ["rocm-smi", "--showmeminfo", "vram", "--csv"],
                 timeout=5,
-        # 1b) rocm-smi — AMD GPUs via ROCm.  Same loaded-GPU rationale
-        # as nvidia-smi above; honour the same env override.
-        try:
-            result = run_bounded(
-                ["rocm-smi", "--showmeminfo", "vram", "--csv"],
-                timeout=_nvsmi_timeout,
             )
             if result.returncode == 0 and result.stdout.strip():
                 # Parse CSV output: header line then data lines
@@ -400,17 +233,13 @@ class VRAMManager:
     # ── Allocation ───────────────────────────────────────────────
 
     def can_fit(self, tool_name: str) -> bool:
-        """Check if a tool can fit in remaining VRAM.
-
-        Uses the measured budget (post first successful load) if present,
-        otherwise falls back to the VRAM_BUDGETS declared value.
-        """
+        """Check if a tool can fit in remaining VRAM."""
         if tool_name in self._allocations:
             return True  # already allocated
-        effective = self.get_effective_budget(tool_name)
-        if not effective:
+        budget = VRAM_BUDGETS.get(tool_name)
+        if not budget:
             return True  # unknown tool — assume it fits
-        min_vram, _model_size = effective
+        min_vram, model_size = budget
         gpu = self.detect_gpu()
         if not gpu["cuda_available"]:
             return False  # no GPU at all
@@ -433,8 +262,6 @@ class VRAMManager:
                 return False
             budget = VRAM_BUDGETS.get(tool_name)
             model_gb = budget[1] if budget else 0.0
-            effective = self.get_effective_budget(tool_name)
-            model_gb = effective[1] if effective else 0.0
             self._allocations[tool_name] = model_gb
             logger.info(f"Allocated {model_gb} GB VRAM for {tool_name}")
             return True

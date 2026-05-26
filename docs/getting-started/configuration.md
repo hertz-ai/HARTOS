@@ -81,7 +81,7 @@ The `ComputeEscrow` table in the database provides persistent tracking of comput
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HEVOLVE_AGENT_ENGINE_ENABLED` | Enable the unified agent goal engine | `true` |
-| `HEVOLVE_CODING_AGENT_ENABLED` | Enable the idle-compute coding agent (also drains self_heal goal queue from error_advice; safe to leave on — daemon early-returns when no idle agents opted in) | `true` |
+| `HEVOLVE_CODING_AGENT_ENABLED` | Enable the idle-compute coding agent | `false` |
 | `HEVOLVE_AUTO_DISCOVERY` | Enable automatic peer discovery via gossip | `true` |
 
 ---

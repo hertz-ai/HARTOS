@@ -56,15 +56,6 @@ _PUBLIC_TOPIC_PREFIXES = (
     'admin.',             # admin-console broadcasts
 )
 
-    'agent.',             # agent lifecycle (creation/review/complete/error) — scoped by agent_id
-)
-
-# Phase 7c.7+ tenant-scoped topic shapes — checked separately so we
-# can apply per-shape rules (per-conv membership at service layer,
-# per-user topics enforce .{user_id} suffix here as defense in depth).
-# Reviewer-flagged H3: blanket 'tenant.' prefix was too permissive.
-_TENANT_PUBLIC_PREFIX = 'tenant.'
-
 
 def _authorize_topic_for_user_id(topic: str, user_id: str) -> bool:
     """Validate that `topic` is publishable for `user_id`.
@@ -77,16 +68,6 @@ def _authorize_topic_for_user_id(topic: str, user_id: str) -> bool:
     is being attempted.  Callers log + refuse on False so the WAMP
     router's subscribe-side authorizer has a defense-in-depth pair
     enforcing the same invariant at the publish site.
-      - it is in the public prefix whitelist above, OR
-      - it ends with `.{user_id}` or `/{user_id}` (per-user fanout topic), OR
-      - it is a tenant.* topic shape that the per-shape rule below
-        accepts (conv-scoped requires service-layer membership check;
-        user-scoped requires the standard .{user_id} suffix match).
-
-    Returns True when the pair is OK, False otherwise.  Callers log +
-    refuse on False so the WAMP router's subscribe-side authorizer
-    has a defense-in-depth pair enforcing the same invariant at the
-    publish site.
     """
     if not topic:
         return False
@@ -94,68 +75,11 @@ def _authorize_topic_for_user_id(topic: str, user_id: str) -> bool:
     for pref in _PUBLIC_TOPIC_PREFIXES:
         if topic == pref or topic.startswith(pref):
             return True
-    # Tenant-scoped topics — split by shape:
-    #   tenant.<tid>.conv.<cid>.{typing|read|message}  → service-layer
-    #     membership check is the gate (ConversationService.emit_typing /
-    #     mark_read both call _is_member before publishing). We accept
-    #     here because the topic doesn't carry the publisher's user_id;
-    #     the second layer is the WAMP router's subscribe ACL (Phase 8).
-    #   tenant.<tid>.user.<uid>.<event>  → must end with .{user_id} so
-    #     a user can't forge events targeting another user's inbox.
-    if topic.startswith(_TENANT_PUBLIC_PREFIX):
-        # Pass-2 N-NEW-4 + Review M2 fix: parse via shared helper so
-        # publish-side and subscribe-side gates can never drift on
-        # topic-shape semantics (substring vs segment match).
-        from .realtime_acl import parse_topic
-        parsed = parse_topic(topic)
-        if not parsed.is_tenant_scoped:
-            return False
-        scope = parsed.scope
-        if scope == 'conv':
-            # Conversation-scoped: service layer is the gate.
-            return True
-        # User-scoped: enforce suffix match.
-        if scope == 'user' and user_id:
-            if topic.endswith(f'.{user_id}') or topic.endswith(f'/{user_id}'):
-                return True
-            # Allow .user.<uid>.<event> shape — strip event suffix and
-            # check.
-            head, _, _ = topic.rpartition('.')
-            if head.endswith(f'.{user_id}'):
-                return True
-            return False
-        # Unknown tenant shape — refuse.
-        return False
     # Per-user topic must end with the publisher's user_id.
     if user_id:
         if topic.endswith(f'.{user_id}') or topic.endswith(f'/{user_id}'):
             return True
     return False
-
-
-_PUBLISH_COUNTERS = {
-    'authorize_refused': 0,
-    'bus_ok': 0,
-    'bus_failed': 0,
-    'http_fallback_ok': 0,
-    'http_fallback_failed': 0,
-    'http_no_publisher': 0,
-}
-
-
-def get_publish_counters() -> dict:
-    """Pass-1 N3 instrumentation: returns a snapshot of the
-    publish-fan-out counters.  Used by ops dashboards + smoke tests
-    to detect partial-fan-out regressions (e.g., a deploy where the
-    bus path silently fails on every call but the HTTP fallback
-    masks it, leaving PEERLINK + LOCAL legs dark)."""
-    return dict(_PUBLISH_COUNTERS)
-
-
-def reset_publish_counters() -> None:
-    """Test helper — zero the counters between tests."""
-    for k in _PUBLISH_COUNTERS:
-        _PUBLISH_COUNTERS[k] = 0
 
 
 def publish_event(topic: str, data: dict, user_id: str = ''):
@@ -169,16 +93,6 @@ def publish_event(topic: str, data: dict, user_id: str = ''):
     receive side — defense in depth.
     """
     if not _authorize_topic_for_user_id(topic, user_id):
-
-    Pass-1 N3 instrumentation:
-      Each leg increments a counter so ops can spot partial fan-out:
-        - bus_ok / bus_failed
-        - http_fallback_ok / http_fallback_failed / http_no_publisher
-        - authorize_refused
-      Read via get_publish_counters().
-    """
-    if not _authorize_topic_for_user_id(topic, user_id):
-        _PUBLISH_COUNTERS['authorize_refused'] += 1
         logger.warning(
             f"WAMP publish refused: user_id={user_id!r} cannot publish "
             f"to topic={topic!r} (cross-user topic subscribe guard)"
@@ -188,21 +102,16 @@ def publish_event(topic: str, data: dict, user_id: str = ''):
         from core.peer_link.message_bus import get_message_bus
         bus = get_message_bus()
         bus.publish(topic, data, user_id=user_id)
-        _PUBLISH_COUNTERS['bus_ok'] += 1
         return
-    except Exception as e:
-        _PUBLISH_COUNTERS['bus_failed'] += 1
-        logger.debug("MessageBus publish failed for %s: %s", topic, e)
+    except Exception:
+        pass
     # Fallback: direct HTTP (original path)
     publisher = _get_publisher()
     if publisher is None:
-        _PUBLISH_COUNTERS['http_no_publisher'] += 1
         return
     try:
         publisher.publish(topic, json.dumps(data))
-        _PUBLISH_COUNTERS['http_fallback_ok'] += 1
     except Exception as e:
-        _PUBLISH_COUNTERS['http_fallback_failed'] += 1
         logger.debug(f"WAMP publish failed for {topic}: {e}")
 
 

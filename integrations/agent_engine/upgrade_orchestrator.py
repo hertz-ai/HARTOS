@@ -303,11 +303,9 @@ class UpgradeOrchestrator:
             return True, 'master_key unavailable — skipping'
 
         try:
-            from core.subprocess_safe import hidden_popen_kwargs
             result = subprocess.run(
                 [sys.executable, 'scripts/sign_release.py'],
-                capture_output=True, text=True, timeout=60,
-                **hidden_popen_kwargs())
+                capture_output=True, text=True, timeout=60)
             if result.returncode == 0:
                 return True, 'release signed'
             return False, f'sign_release.py failed: {result.stderr[:200]}'
@@ -480,11 +478,9 @@ class UpgradeOrchestrator:
     def _detect_version(self) -> str:
         """Detect version from git tags or pyproject.toml."""
         try:
-            from core.subprocess_safe import hidden_popen_kwargs
             result = subprocess.run(
                 ['git', 'describe', '--tags', '--always'],
-                capture_output=True, text=True, timeout=10,
-                **hidden_popen_kwargs())
+                capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
                 return result.stdout.strip()
         except Exception:

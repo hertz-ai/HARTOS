@@ -50,11 +50,6 @@ ENV TESTING=true
 ENV FLASK_ENV=testing
 ENV REDIS_HOST=redis
 ENV REDIS_PORT=6379
-# LiveKit supervisor stays off during tests — no binary fetch / no port
-# bind, no flake from unavailable network or port collisions.  Tests
-# that need to exercise supervisor branches set HEVOLVE_DEPLOY_MODE=flat
-# and HEVOLVE_HOME=<tmp> via monkeypatch (see test_phase7d_calls.py).
-ENV LIVEKIT_DISABLE=1
 
 # Create a non-root user for testing
 RUN useradd -m -u 1000 testuser && \

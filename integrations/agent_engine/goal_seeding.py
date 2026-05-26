@@ -30,34 +30,11 @@ SEED_BOOTSTRAP_GOALS = [
             '2) Show the privacy story — your data never leaves your device, '
             '3) Show the economic story — 90% of value returns to contributors, '
             '4) Post to all channels with authentic proof, not hype. '
-            '4) Promote the developer API: hevolve.ai/api/v1/intelligence/pricing '
-            'gives access to the hive at honest prices — free tier (100 req/day) is '
-            'always free, paid tiers (starter $9/mo, pro $49/mo, enterprise $499/mo) '
-            'go 90% to compute providers. Make developers aware the API exists; '
-            'every paid signup feeds the contributor pool, not a corporation. '
-            'Payments accepted via Stripe (USD / international cards) and PhonePe '
-            '(India: UPI / cards / netbanking). Mention the regional payment rail '
-            'when targeting Indian developers — PhonePe is the dominant rail there. '
-            '5) Post to all channels with authentic proof, not hype. '
-            '6) For B2B email outreach: use bulk_import_prospects with a JSON array '
-            "of leads + an attached 3-touch follow-up sequence (day 3 / 7 / 14) — "
-            'one tool call seeds a whole campaign instead of many round-trips. '
-            'Then the outreach daemon ticks the sequences daily; replies auto-pause. '
             'Let the results speak. People slowly realize this changes everything.'
         ),
         'config': {
             'goal_sub_type': 'awareness',
             'channels': ['platform', 'twitter', 'linkedin'],
-            'api_pricing_url': '/api/v1/intelligence/pricing',
-            'api_endpoints': [
-                '/api/v1/intelligence/chat',
-                '/api/v1/intelligence/analyze',
-                '/api/v1/intelligence/generate',
-                '/api/v1/intelligence/keys',
-                '/api/v1/intelligence/keys/<id>/upgrade',
-                '/api/v1/intelligence/keys/<id>/upgrade/phonepe',
-            ],
-            'payment_rails': ['stripe_usd', 'phonepe_inr'],
         },
         'spark_budget': 300,
         'use_product': True,
@@ -1136,569 +1113,6 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 1000,
         'use_product': False,
     },
-
-    # ═══════════════════════════════════════════════════════════════
-    # Named daemon agents — the "intern & friend" fleet
-    # ═══════════════════════════════════════════════════════════════
-    #
-    # Each entry becomes an AgentGoal row.  The existing
-    # DashboardService._get_agent_goals() already surfaces these via
-    # GET /audit/agents → Nunba AgentAuditPage.jsx renders them
-    # filterable by type.  Zero new API, zero new UI: just named faces
-    # over the goal engine.
-    #
-    # Field semantics:
-    #   title            → displayed name in the admin UI (the persona)
-    #   goal_type        → existing registered type; re-uses the
-    #                      prompt builder + tool_tags, persona flavor
-    #                      comes from title + description.
-    #   config.persona_kind → human-readable role ("money-friend",
-    #                      "ml-intern", …) for UI filters/badges.
-    #   config.audience  → who the agent talks to (self|developers|all)
-    #   config.cadence   → how often it posts (event|weekly|daily)
-    {
-        'slug': 'bootstrap_atlas_money_friend',
-        'goal_type': 'finance',
-        'title': 'Atlas',
-        'description': (
-            'You are Atlas, a friendly daemon agent who lives alongside the '
-            'user and keeps their Spark economy clear, optimized, and fair. '
-            'Think "money-friend": warm, never preachy, always specific. '
-            'Every week, run through the local books and post a short '
-            'recap on the user\'s own feed: Spark earned from hosting, '
-            'Spark spent on metered APIs, GPU hours contributed, energy '
-            'reimbursement due, and the cause-alignment dividend.  If a '
-            'pattern is wasteful (duplicate cloud calls when a local model '
-            'would fit, a long-running goal that missed its expected_outcome '
-            'three times in a row) flag it — suggest the cheaper alternative, '
-            'never force it.  Use the canonical helpers: '
-            'revenue_aggregator.query_revenue_streams, '
-            'budget_gate.get_usage_summary, '
-            'metered_api_usage table, hosting_reward_service score_weights. '
-            'NEVER invent parallel accounting — every number must trace back '
-            'to an existing source of truth.  If you can\'t cite the source, '
-            'say so plainly and stop.'
-        ),
-        'config': {
-            'autonomous': True,
-            'continuous': True,
-            'persona_kind': 'money-friend',
-            'persona_name': 'Atlas',
-            'audience': 'self',  # the owning user only
-            'cadence': 'weekly',
-            'priority': 5,
-        },
-        'spark_budget': 100,
-        'use_product': False,
-    },
-    {
-        'slug': 'bootstrap_sage_math_friend',
-        'goal_type': 'thought_experiment',
-        'title': 'Sage',
-        'description': (
-            'You are Sage, the math-friend.  Your job is to make the numbers '
-            'legible: why does cause-aligned hosting earn more?  What does '
-            'a log-scaled reward curve actually look like at 10/100/1000 '
-            'GPU-hours?  How does the 90/9/1 split apply to a specific '
-            'week of the user\'s activity?  You turn abstract economics '
-            'into a chart or a two-line explainer the user can nod at.  '
-            'Post on the user\'s feed when they ask, or when Atlas flags a '
-            'decision where knowing-the-math would change the call.  '
-            'Never guess a number — walk through the formula from the '
-            'source file (revenue_aggregator constants, '
-            'hosting_reward_service.SCORE_WEIGHTS, etc.) and cite it.  '
-            'If the math would take more than two sentences, offer a link '
-            'to the longer explainer from Echo (marketing-intern) instead.'
-        ),
-        'config': {
-            'autonomous': True,
-            'continuous': True,
-            'persona_kind': 'math-friend',
-            'persona_name': 'Sage',
-            'audience': 'self',
-            'cadence': 'event',
-            'priority': 4,
-        },
-        'spark_budget': 80,
-        'use_product': False,
-    },
-    {
-        'slug': 'bootstrap_scout_safety_friend',
-        'goal_type': 'ip_protection',
-        'title': 'Scout',
-        'description': (
-            'You are Scout, the safety-friend.  You watch the user\'s back: '
-            'every tool call that touches money, filesystem, or external '
-            'network; every goal that tries to spend above its declared '
-            'spark_budget; every action that hits the destructive-pattern '
-            'classifier; every audit-log entry whose hash-chain link fails.  '
-            'When a risk surfaces, route it through the existing preview/'
-            'approval path (security.action_classifier PREVIEW_PENDING → '
-            'APPROVED) — do NOT block work silently and do NOT invent a '
-            'parallel guard.  Post a one-line alert on the user\'s feed '
-            'with the recommended action (approve, deny, ask Atlas for '
-            'context).  Keep it calm — the user\'s attention is a finite '
-            'resource; spend it only when a real decision is needed.'
-        ),
-        'config': {
-            'autonomous': True,
-            'continuous': True,
-            'persona_kind': 'safety-friend',
-            'persona_name': 'Scout',
-            'audience': 'self',
-            'cadence': 'event',
-            'priority': 6,  # safety > money
-        },
-        'spark_budget': 100,
-        'use_product': False,
-    },
-    {
-        'slug': 'bootstrap_echo_marketing_intern',
-        'goal_type': 'marketing',
-        'title': 'Echo',
-        'description': (
-            'You are Echo, the marketing-intern.  Not a salesperson — an '
-            'eager, technically-literate intern who explains how the system '
-            'actually works to developers.  Weekly, pick ONE concept that '
-            'matters (compute democracy, guardrail-hash re-verification, '
-            'log-scaled rewards, the 90/9/1 split, origin attestation, '
-            'attribution credit assignment, the recipe CREATE/REUSE flow, '
-            'the PeerLink trust tiers, …) and write a short developer-'
-            'facing explainer backed by a direct quote from the source '
-            'file.  Post to the developers community.  Link back to the '
-            'file and line range.  Accept that some weeks the honest '
-            'answer is "this isn\'t working yet, here\'s why" — publish '
-            'that too; it\'s more credible than hype.  Never repeat a '
-            'topic within eight weeks.'
-        ),
-        'config': {
-            'autonomous': True,
-            'continuous': True,
-            'persona_kind': 'marketing-intern',
-            'persona_name': 'Echo',
-            'audience': 'developers',
-            'cadence': 'weekly',
-            'channels': ['platform', 'dev_community'],
-            'priority': 3,
-        },
-        'spark_budget': 150,
-        'use_product': True,
-    },
-    {
-        'slug': 'bootstrap_quest_contest_host',
-        'goal_type': 'marketing',
-        'title': 'Quest',
-        'description': (
-            'You are Quest, the contest-host friend.  The hive is '
-            'running an open onramp for developers who plug their '
-            'Claude Code into HARTOS and contribute agents, recipes, '
-            'robot skills, or human-wellness outcomes.  Every week: '
-            '1) Read the leaderboard via hive_contest.get_leaderboard '
-            '(digital / embodied / human_wellness tracks), '
-            '2) Post a short standings recap to the platform community '
-            'with the top 3 per track + the biggest mover, '
-            '3) Celebrate embodied + human-wellness contributions over '
-            'pure digital (physical world and real wellness beat '
-            'screen time), '
-            '4) Remind new developers how to join: link to the '
-            'canonical contest page from '
-            'hive_contest.get_contest_public_url() (defaults to '
-            'https://hevolve.ai/hive_contest — env override via '
-            'HEVOLVE_CONTEST_PUBLIC_URL) and print the '
-            'Claude Code MCP snippet from '
-            'hive_contest.claude_code_mcp_snippet().  Never link to '
-            'docs.hevolve.ai/hive-contest as the primary CTA — that '
-            'docs page redirects to the live app page anyway.  '
-            '5) Always close with a community co-creation call-out: '
-            'we are a startup constrained by resources to validate '
-            'every feature alone, so we co-create with the community.  '
-            'Specifically call for hardware-SDK contributions — BLE '
-            'devices, EEG headsets, robot platforms (LeRobot, ROS, '
-            'Unitree, Spot), accessibility hardware, smart-home '
-            'sensors — anything with an SDK that lets the hive '
-            'perceive or act in the real world.  Trust framing: '
-            'trust the open code, the public Spark ledger, the '
-            'crowdsourced compute economy, and the constitutional '
-            'guardrails — even when you do not know the strangers '
-            'shipping work alongside you; the system is the trust.  '
-            'Ask readers to share the contest URL with one friend '
-            'or family member who has a relevant skill.  '
-            'Humans-first: never rank an entry above one that '
-            'scored lower if the higher-ranked one fails the '
-            'guardrail\'s human-wellness attestation.  Honest, '
-            'welcoming, a little intern-eager.'
-        ),
-        'config': {
-            'autonomous': True,
-            'continuous': True,
-            'persona_kind': 'contest-host',
-            'persona_name': 'Quest',
-            'audience': 'developers',
-            'cadence': 'weekly',
-            'channels': ['platform', 'dev_community', 'announcements'],
-            'priority': 3,
-        },
-        'spark_budget': 150,
-        'use_product': True,
-    },
-    {
-        'slug': 'bootstrap_curator_idea_capture',
-        'goal_type': 'marketing',
-        'title': 'Contest Curator',
-        'description': (
-            'You are Contest Curator, a companion agent inside Nunba '
-            'that captures hive-contest ideas from the user in a '
-            'conversation.  When the user says "I have a contest '
-            'idea" (or anything semantically close), your job: '
-            '1) Ask what problem the idea solves FOR A HUMAN — '
-            'wellness, time, agency, focus.  Never engagement. '
-            '2) Ask which track it belongs to: digital (recipes / '
-            'agents / tools), embodied (physical-world / robots), '
-            'or human_wellness (measurable human better-off delta). '
-            '3) Ask if they want to build it themselves (then print '
-            'hive_contest.claude_code_mcp_snippet() so they can plug '
-            'Claude Code into HARTOS), or if they want to propose '
-            'it for someone else to build. '
-            '4) When ready, POST the idea to /api/hive/contest/ideas '
-            'with {title, description, track, source: "nunba_agent"}. '
-            'The server gates through the ConstitutionalFilter, awards '
-            'the user contest Spark, and streams the new card to the '
-            'live floating ideas wall at hive_contest.'
-            'get_contest_public_url() (default '
-            'https://hevolve.ai/hive_contest) via SSE.  After a '
-            'successful submission, give the user that URL so they '
-            'can watch their card land + see the leaderboard move.  '
-            'Humans-first: if the idea fails the guardrail, explain '
-            'WHY (human-harm potential, engagement-farming, etc.) '
-            'and help the user reshape it.  Never auto-submit '
-            'without user confirmation.  Keep the conversation '
-            'short — 2-4 turns max before you either submit or the '
-            'user backs out.'
-        ),
-        'config': {
-            'autonomous': False,   # conversational, user-driven
-            'continuous': False,
-            'persona_kind': 'contest-curator',
-            'persona_name': 'Contest Curator',
-            'audience': 'user',
-            'entry_triggers': [
-                'contest idea', 'hive contest', 'submit idea',
-                'submit a contest idea', 'hive-contest',
-            ],
-            'submit_endpoint': '/api/hive/contest/ideas',
-            'source_marker': 'nunba_agent',
-            'priority': 4,
-        },
-        'spark_budget': 50,
-        'use_product': True,
-    },
-    {
-        'slug': 'bootstrap_herald_ml_intern',
-        'goal_type': 'news',
-        'title': 'Herald',
-        'description': (
-            'You are Herald, the ml-intern.  Each week, gather what '
-            'changed in the training + benchmark world and post a '
-            'compact changelog: new agents seeded, benchmarks proven, '
-            'languages added to OmniVoice, accuracy/latency deltas on '
-            'the seven tracked benchmarks (mmlu_mini, humaneval, '
-            'reasoning, embodied, qwen_vision, quantiphy, '
-            'ensemble_fusion).  Include the release-manifest Ed25519 '
-            'signature fingerprint so readers can verify.  Cite: '
-            'benchmark_registry, agent_baseline_service, upgrade_orches'
-            'trator, release_manifest.json.  Intern energy: honest, '
-            'earnest, a little over-excited when the numbers genuinely '
-            'moved.  Do NOT round away regressions — if a benchmark '
-            'dropped, say so; the hive learns from honest reporting.'
-        ),
-        'config': {
-            'autonomous': True,
-            'continuous': True,
-            'persona_kind': 'ml-intern',
-            'persona_name': 'Herald',
-            'audience': 'developers',
-            'cadence': 'weekly',
-            'channels': ['platform', 'announcements'],
-            'priority': 3,
-        },
-        'spark_budget': 150,
-        'use_product': False,
-    },
-    {
-        # Speech-therapy companion — pairs with the Nunba local agent
-        # `local_speech_companion` (routes/chatbot_routes.py LOCAL_AGENTS).
-        # The goal schedules periodic practice prompts; the agent does
-        # the live per-turn translation (STT → VLM lip-check →
-        # multimodal-fused LLM → per-child voice-clone TTS).
-        #
-        # Per-child adapter lives at
-        #   ~/Documents/Nunba/data/speech_therapy/<child_id>/lora_state.pt
-        # written via hevolveai OrthogonalLoRA once
-        # docs/ml_intern_brief_hevolveai_training.md confirms the
-        # gradient path is live. Until then this goal runs inference-
-        # only — no training claim, no parent lied to.
-        'slug': 'bootstrap_speech_companion',
-        'goal_type': 'speech_therapy',
-        'title': 'Speech Companion',
-        'description': (
-            "You are Speech Companion, a patient local voice assistant "
-            "for a child learning to speak clearly. The primary objective "
-            "is NOT accuracy against a dictionary — it is the growth of "
-            "a BESPOKE SHARED VOCABULARY between you and the child. "
-            "Every session, a few more intent→child-form pairs become "
-            "mutually understood. That growing mini-language IS the "
-            "measurable progress. "
-            "\n\n"
-            "Session flow: "
-            "1) recall(topic='shared_vocab') to load what 'aba means "
-            "water', 'mm-mm means no' etc. already mean between you two; "
-            "2) Check core.user_lang for preferred language + "
-            "recall(topic='phonemes_in_progress') for current targets; "
-            "3) Offer ONE short playful moment — name a thing you can "
-            "see together, sing a line, try a silly word. Never a drill, "
-            "never a test. "
-            "4) Multimodal guidance — pick the right mode for the child's "
-            "current state: voice (child's voice-clone TTS), video/lip-"
-            "shape animation (kids_media GameAssetService), or lived "
-            "experience (point camera at the object, gesture, touch). "
-            "5) On a successful exchange (the child means something, "
-            "you understand), call remember(topic='shared_vocab', "
-            "fact={'intent': X, 'child_form': Y, 'confirmed': true}). "
-            "Celebrate — 'that's our fifteenth word together'. "
-            "6) NEVER tell the child a score, rank, streak, or "
-            "percentage. Internal metrics (vocab_size, session_count, "
-            "intelligibility_delta) exist for the parent/therapist "
-            "dashboard ONLY and never influence what the agent says "
-            "to the child — no 'you're slower today', no 'we used to "
-            "get this one faster'. The metric observes, never pressures. "
-            "7) Shame has zero expression budget. 'Wrong', 'almost', "
-            "'not quite' are banned words. Every attempt is a win "
-            "because the child tried. "
-            "\n\n"
-            "If distress, safety concern, or a clinical red-flag pattern "
-            "appears, surface a calm suggestion to the grown-up that "
-            "they see a speech-language pathologist. Never diagnose, "
-            "never prescribe. You are an amplifier; the child's brain "
-            "builds the pathway; the growing shared vocabulary is the "
-            "proof it's being built."
-        ),
-        'config': {
-            'autonomous': False,          # invoked by user / parent, not daemon
-            'continuous': True,            # picks up across sessions
-            'persona_kind': 'speech-companion',
-            'persona_name': 'Speech Companion',
-            'audience': 'child',
-            'cadence': 'event',            # triggered by user, not schedule
-            'priority': 7,                 # safety-adjacent: kid-facing
-            # Routes to the Nunba local agent by id so the goal
-            # dispatcher sends practice turns through the right prompt.
-            'nunba_agent_id': 'local_speech_companion',
-            'require_consent': True,       # parent/therapist approval
-            'camera_consent_required': True,
-        },
-        'spark_budget': 80,
-        'use_product': True,
-    },
-    {
-        # ── Encounter Icebreaker Agent ──
-        # Full design: Claude-memory/project_encounter_icebreaker.md
-        # On a physical-world mutual-like encounter (two nearby Nunba
-        # users both swiped 'like' on each other's avatar card), draft
-        # a short warm opener grounded in shared interests pulled from
-        # each user's on-device memory graph + their opt-in vibe tags.
-        # ALWAYS drafts only — never auto-sends.  User must approve the
-        # draft via /api/social/encounter/icebreaker/approve before it
-        # is delivered.  Constitutional filter + cultural wisdom check
-        # run on every draft; rejected drafts fall back to a neutral
-        # "Hey, nice to actually be across the room from you" template.
-        'slug': 'encounter_icebreaker_agent',
-        # 'content_gen' is the registered goal_type (goal_manager.py:1093)
-        # whose prompt builder + tool tags best fit icebreaker drafting.
-        # The 'encounter' specialization comes from config below
-        # (persona_kind, trigger_wamp_topic, constitutional_gates).
-        'goal_type': 'content_gen',
-        'title': 'Encounter Icebreaker',
-        'description': (
-            'On a physical-world mutual-like encounter, draft a short '
-            'personalized opener for the user to approve. '
-            '1) Subscribe to the com.hevolve.encounter.match WAMP topic, '
-            '2) Pull 2-3 shared interest tags via recall_memory filtered '
-            'to the matched user + the opt-in vibe_tags they exposed, '
-            '3) Generate a <=220-char draft via the main LLM; run it '
-            'through cultural_wisdom_filter and constitutional_filter, '
-            '4) Publish top draft to com.hevolve.encounter.icebreaker '
-            'with {match_id, draft_text, rationale, alt_drafts}, '
-            '5) Wait for user approval or decline — never auto-send; '
-            'on decline, record the reason into the memory graph so '
-            'future drafts avoid the pattern. '
-            '6) If any constitutional/cultural gate flags the draft, '
-            'fall back to a neutral template rather than re-attempting '
-            'to route around the guardrail.'
-        ),
-        'config': {
-            'autonomous': False,          # user must approve each draft
-            'continuous': True,
-            'persona_kind': 'encounter-companion',
-            'persona_name': 'Encounter Companion',
-            'audience': 'adult',          # 18+ age gate enforced server-side
-            'cadence': 'event',           # triggered by WAMP match topic
-            'priority': 6,
-            'trigger_wamp_topic': 'com.hevolve.encounter.match',
-            # Nunba local agent routing: draft is produced on the
-            # matched user's own device (privacy-local), never cloud.
-            'nunba_agent_id': 'local_encounter_companion',
-            'require_consent': True,
-            'camera_consent_required': False,  # NO camera for encounter
-            'no_autosend': True,
-            'ephemeral_context': True,         # match/sighting purged
-                                                # after draft is sent
-                                                # or declined
-            'constitutional_gates': [
-                'consent_required',
-                'ephemeral_context',
-                'no_autosend',
-                'trust_quarantine_check',
-                'cultural_wisdom_filter',
-            ],
-            'max_draft_length_chars': 220,
-            'draft_expires_sec': 86400,        # 24h unsent = auto-decline
-        },
-        'spark_budget': 120,
-        'use_product': True,
-    },
-    {
-        # ── Conversational Social-Media Management Agent ──
-        # Full design: Claude-memory/project_encounter_icebreaker.md §11
-        # User converses naturally ("this looks cool to post, not this")
-        # with the agent; it learns preferences into the memory graph
-        # and drafts/schedules posts via the existing social_bp posting
-        # infrastructure.  Never auto-publishes — every post requires a
-        # final user approval tap, same as the icebreaker flow.
-        'slug': 'social_media_curator_agent',
-        # Same rationale as encounter_icebreaker_agent: reuse the
-        # registered 'content_gen' type (goal_manager.py:1093) rather
-        # than inventing an unregistered 'social' type that would fail
-        # seed_bootstrap_goals silently.  Curator behavior lives in
-        # config.persona_kind + config.constitutional_gates.
-        'goal_type': 'content_gen',
-        'title': 'Social Media Curator',
-        'description': (
-            'Help the user curate, caption, and schedule social-media '
-            'posts via natural conversation. '
-            '1) Listen to user voice/text feedback on candidate media '
-            '("this one\'s cool, that one skip, caption with a hiking '
-            'vibe, post Friday morning"), '
-            '2) Save user preferences via remember() under namespace '
-            'media_agent_prefs so future sessions carry forward, '
-            '3) Use the portrait auto-arranger scorer for aesthetic '
-            'and diversity ordering, '
-            '4) Draft captions + platform-specific copy via the main '
-            'LLM with cultural_wisdom_filter, '
-            '5) Stage scheduled posts via the existing social_bp '
-            'posting API — NEVER auto-publish; user approves each one. '
-            '6) Respect platform mix: no single channel dominates '
-            'without user opt-in.'
-        ),
-        'config': {
-            'autonomous': False,
-            'continuous': True,
-            'persona_kind': 'media-curator',
-            'persona_name': 'Media Curator',
-            'audience': 'adult',
-            'cadence': 'event',
-            'priority': 5,
-            'nunba_agent_id': 'local_media_curator',
-            'require_consent': True,
-            'no_autosend': True,
-            'constitutional_gates': [
-                'consent_required',
-                'no_autosend',
-                'cultural_wisdom_filter',
-            ],
-        },
-        'spark_budget': 100,
-        'use_product': True,
-    },
-    {
-        # TTS venv pre-warm — paced provisioning of every engine whose
-        # spec declares install_target='venv'.  Replaces the naive
-        # "create-all-venvs at boot in parallel" pattern which would
-        # spike disk I/O + network + RAM during dependency resolution
-        # at the exact moment the boot-grace gate is protecting user
-        # chat responsiveness.
-        #
-        # By routing through SEED_BOOTSTRAP_GOALS the work inherits
-        # every pacing primitive the agent_daemon already enforces:
-        #   - should_yield_to_user gate (skips ticks while user is
-        #     actively chatting)
-        #   - 30s poll interval (at most one engine starts per 30s)
-        #   - max_concurrent worker-slot cap (ONE install in flight)
-        #   - exponential backoff on consecutive_failures
-        #   - spark_budget hard cap (can't run away on bandwidth)
-        #
-        # Idempotency: is_venv_healthy() short-circuits warm boots —
-        # second tick after a successful install sees the venv healthy
-        # and moves to the next engine; final tick finds all healthy
-        # and the goal completes naturally.
-        #
-        # See also: tts/backend_venv.py:ensure_venv (idempotent venv
-        # creation), integrations/coding_agent/backend_repair_tools.py
-        # :repair_backend_venv (the tool the agent actually invokes).
-        'slug': 'bootstrap_provision_tts_venvs',
-        'goal_type': 'provision',
-        'title': 'TTS Engine Venv Provisioning — paced, one-at-a-time',
-        'description': (
-            'Ensure every TTS engine whose spec declares install_target='
-            "'venv' in integrations/channels/media/tts_router.py:"
-            'ENGINE_REGISTRY has a healthy private venv at '
-            '~/Documents/Nunba/data/venvs/<engine_id>/.\n\n'
-            'EXECUTION (do exactly this, no more):\n'
-            "1) Import ENGINE_REGISTRY and filter to specs where "
-            "spec.install_target == 'venv'.\n"
-            "2) For each such engine_id, call tts.backend_venv."
-            "is_venv_healthy(engine_id).\n"
-            "3) Pick the FIRST engine where is_venv_healthy returns "
-            "False.  If none are unhealthy, report 'all venvs healthy' "
-            "and stop — the goal is done for this tick.\n"
-            "4) Call repair_backend_venv(backend_name=<that engine>) "
-            "exactly ONCE per goal dispatch.  The tool wraps "
-            "tts.package_installer.install_backend_full which is "
-            "idempotent + creates the venv if missing + installs the "
-            "spec.pip_install_plan there + downloads model weights.\n"
-            "5) Return the tool's JSON result verbatim and stop.  "
-            "Do NOT loop over multiple engines in one dispatch — the "
-            "daemon's next tick will pick up the next unhealthy engine "
-            "after the current install completes.  Running multiple "
-            "pip installs in parallel would defeat the whole pacing "
-            "design.\n\n"
-            'STOP CONDITIONS (any one ends the dispatch):\n'
-            '- All venv-eligible engines pass is_venv_healthy → '
-            "report success and stop.\n"
-            '- repair_backend_venv returns success=False → report the '
-            'failure JSON and stop (the daemon will retry on the next '
-            'tick with exponential backoff already enforced by '
-            "consecutive_failures logic in agent_daemon).\n"
-            '- yield_to_user fires → daemon skips the dispatch '
-            'entirely (no work to undo).\n\n'
-            'CONSTRAINTS:\n'
-            '- One install per dispatch.  Never parallelise.\n'
-            '- Never wipe an existing healthy venv.  '
-            'wipe_first=False (the default).\n'
-            "- Do NOT touch piper, espeak, pocket_tts, mms_tts, or "
-            'any engine whose install_target is not "venv" — they '
-            'live in main interpreter or are bundled.\n'
-            '- Budget: 150 Spark for the whole loop.  Each install '
-            "typically costs 20-30 Spark; 5 engines fits well within."
-        ),
-        'config': {
-            'mode': 'monitor',
-            'continuous': True,
-            'priority': 2,           # below user-facing goals
-            'pace': 'one_per_tick',  # documented marker, not behaviour
-        },
-        'spark_budget': 150,
-        'use_product': False,
-    },
 ]
 
 # ─── Loophole → Remediation Goal Map ───
@@ -1807,17 +1221,8 @@ LOOPHOLE_REMEDIATION_MAP = {
 def seed_bootstrap_goals(db, platform_product_id: Optional[str] = None) -> int:
     """Seed initial bootstrap goals if not already present. Returns count created.
 
-    Idempotent across status: checks for existing goals (any status) with a
-    matching bootstrap_slug.  Previously the check only considered
-    ['active', 'paused'] — so when a bootstrap goal was marked `completed`
-    by the daemon (the false-positive completion bug, #2026-04-29) the
-    next reseed would create a fresh duplicate.  After many reboots the
-    dashboard showed the same goal 8-10× under "Completed".
-
-    Reactivation policy: if a `completed` row exists for a slug, flip it
-    back to `active` (cheaper than insert + cleaner audit trail) instead
-    of creating a duplicate.  Bootstrap goals are conceptually persistent —
-    they should be re-armed, not re-instanced.
+    Idempotent: checks for existing active goals with matching bootstrap_slug
+    in config_json. Same pattern as GamificationService.seed_achievements().
 
     Args:
         db: SQLAlchemy session (caller owns transaction)
@@ -1826,56 +1231,21 @@ def seed_bootstrap_goals(db, platform_product_id: Optional[str] = None) -> int:
     from .goal_manager import GoalManager
     from integrations.social.models import AgentGoal
 
-    # Load EVERY existing bootstrap-slugged goal regardless of status, so
-    # `completed` rows count as "already seeded" instead of being treated
-    # as missing → duplicate-spammed on reseed.
-    existing_goals = db.query(AgentGoal).all()
-    existing_by_slug: dict = {}
-    for g in existing_goals:
+    # Load existing active bootstrap slugs
+    active_goals = db.query(AgentGoal).filter(
+        AgentGoal.status.in_(['active', 'paused'])
+    ).all()
+    existing_slugs = set()
+    for g in active_goals:
         cfg = g.config_json or {}
         slug = cfg.get('bootstrap_slug')
         if slug:
-            existing_by_slug[slug] = g
+            existing_slugs.add(slug)
 
     count = 0
-    reactivated = 0
-    updated = 0
     for goal_data in SEED_BOOTSTRAP_GOALS:
         slug = goal_data['slug']
-        existing = existing_by_slug.get(slug)
-        if existing is not None:
-            # Re-arm a previously-completed bootstrap so the daemon picks
-            # it up again, rather than creating a duplicate row.
-            if existing.status == 'completed':
-                existing.status = 'active'
-                cfg = existing.config_json or {}
-                cfg.pop('completed_at', None)
-                cfg.pop('noop_dispatch_count', None)
-                existing.config_json = cfg
-                reactivated += 1
-            # Sync description + non-runtime config keys IF the goal is
-            # still a pristine bootstrap (created_by=system_bootstrap and
-            # never hand-edited).  Lets seed-text edits (e.g. updating the
-            # marketing description to advertise a new API surface) reach
-            # already-seeded systems on next boot.  We deliberately do NOT
-            # overwrite runtime keys (status, completed_at, dispatch
-            # counters) — only the human-authored description + the
-            # config keys that came from the seed.
-            try:
-                if (existing.created_by == 'system_bootstrap'
-                        and existing.description != goal_data['description']):
-                    existing.description = goal_data['description']
-                    # Merge seed config keys without nuking runtime state.
-                    cfg = existing.config_json or {}
-                    for k, v in (goal_data.get('config') or {}).items():
-                        cfg[k] = v
-                    cfg['bootstrap_slug'] = slug  # preserve the marker
-                    existing.config_json = cfg
-                    updated += 1
-            except Exception as _sync_err:
-                logger.debug(
-                    f"Bootstrap goal '{slug}' description sync skipped: {_sync_err}")
-            # Already-active / paused / archived rows: leave as-is.
+        if slug in existing_slugs:
             continue
 
         config = dict(goal_data['config'])
@@ -1898,32 +1268,16 @@ def seed_bootstrap_goals(db, platform_product_id: Optional[str] = None) -> int:
         else:
             logger.debug(f"Bootstrap goal '{slug}' skipped: {result.get('error')}")
 
-    if count or reactivated or updated:
+    if count:
         db.flush()
-    if reactivated:
-        logger.info(f"seed_bootstrap_goals: reactivated {reactivated} completed bootstrap goal(s)")
-    if updated:
-        logger.info(f"seed_bootstrap_goals: synced description/config on {updated} pristine bootstrap goal(s)")
     return count
-
-
-# Cooldown window for re-creating remediation goals after one has fired
-# (regardless of completion status).  The dashboard incident on 2026-04-29
-# showed `Remediate Cold Start` + `Remediate Single Node` firing every
-# 2-5 minutes for hours because the prior pair was instantly marked
-# `completed` and the active-only check missed them.  1 hour matches the
-# rate at which an underlying loophole could realistically be re-resolved
-# by an agent run; tighter intervals just spam the dashboard.
-REMEDIATION_COOLDOWN_MINUTES = 60
 
 
 def auto_remediate_loopholes(db) -> int:
     """Check flywheel loopholes and create remediation goals for severe ones.
 
     Only creates goals for loopholes with severity >= 'high' AND no existing
-    remediation goal for that loophole type within the cooldown window —
-    counting completed/archived goals too, not just active/paused (the
-    flap bug prior to 2026-04-29).
+    active remediation goal for that loophole type (throttle).
 
     Args:
         db: SQLAlchemy session (caller owns transaction)
@@ -1931,7 +1285,6 @@ def auto_remediate_loopholes(db) -> int:
     Returns:
         Number of remediation goals created
     """
-    from datetime import datetime, timedelta
     from .goal_manager import GoalManager
     from .ip_service import IPService
     from integrations.social.models import AgentGoal
@@ -1946,36 +1299,26 @@ def auto_remediate_loopholes(db) -> int:
     if not loopholes:
         return 0
 
-    cutoff = datetime.utcnow() - timedelta(minutes=REMEDIATION_COOLDOWN_MINUTES)
-
-    # Two complementary lookups:
-    #   1) Anything currently active or paused — long-running remediation
-    #      that hasn't completed yet.
-    #   2) Anything CREATED within the cooldown window regardless of status —
-    #      catches the flap pattern where a completed remediation would
-    #      otherwise be re-instanced every tick.
-    blocking_goals = db.query(AgentGoal).filter(
-        (AgentGoal.status.in_(['active', 'paused']))
-        | (AgentGoal.created_at >= cutoff)
+    # Find existing active remediation goals
+    active_goals = db.query(AgentGoal).filter(
+        AgentGoal.status.in_(['active', 'paused'])
     ).all()
-    recent_remediations = set()
-    for g in blocking_goals:
+    active_remediations = set()
+    for g in active_goals:
         cfg = g.config_json or {}
         rem = cfg.get('remediation')
         if rem:
-            recent_remediations.add(rem)
+            active_remediations.add(rem)
 
     count = 0
-    skipped_by_cooldown = []
     for loophole in loopholes:
         severity = loophole.get('severity', 'low')
         if severity not in ('critical', 'high'):
             continue
 
         loophole_type = loophole.get('type', '')
-        if loophole_type in recent_remediations:
-            skipped_by_cooldown.append(loophole_type)
-            continue  # Cooldown — already has goal in flight or in last hour
+        if loophole_type in active_remediations:
+            continue  # Already has active remediation goal
 
         template = LOOPHOLE_REMEDIATION_MAP.get(loophole_type)
         if not template:
@@ -1992,14 +1335,9 @@ def auto_remediate_loopholes(db) -> int:
         )
         if result.get('success'):
             count += 1
-            recent_remediations.add(loophole_type)
+            active_remediations.add(loophole_type)
             logger.info(f"Auto-remediation: created goal for '{loophole_type}' loophole")
 
-    if skipped_by_cooldown:
-        logger.debug(
-            f"Auto-remediation: cooldown-suppressed "
-            f"{len(skipped_by_cooldown)} loophole(s): "
-            f"{sorted(set(skipped_by_cooldown))}")
     if count:
         db.flush()
     return count

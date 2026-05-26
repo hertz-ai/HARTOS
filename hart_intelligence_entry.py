@@ -18,201 +18,6 @@ if sys.platform == 'win32' and 'pytest' not in sys.modules:
         except (ValueError, OSError):
             pass
 
-# ── Defang importlib.metadata.packages_distributions() before transformers ──
-# transformers/utils/import_utils.py:45 calls
-#     PACKAGE_DISTRIBUTION_MAPPING = importlib.metadata.packages_distributions()
-# at module-import time, with NO guard.  The function walks every
-# *.dist-info/METADATA in site-packages and accesses
-# `dist.metadata['Name']`.  ANY corrupt dist-info (METADATA missing,
-# Name: header malformed, or pip rewriting it concurrently) raises
-# KeyError('Name') → transformers crashes its import → langchain →
-# hart_intelligence_entry crashes → Tier-1 HARTOS init dies → agent
-# daemon never starts → admin Agent Dashboard stays empty for the rest
-# of the process lifetime (Tier-1 init is one-shot).
-#
-# Regression observed 2026-04-26 23:05:23 in dev .venv (transient
-# corrupt dist-info).  The fix monkey-patches the stdlib function with
-# a try/except wrapper so a single bad dist-info no longer cascades to
-# a full HARTOS Tier-1 outage.  Running BEFORE any langchain /
-# transformers import in this module guarantees transformers picks up
-# the wrapped version.
-import importlib.metadata as _md_safe
-_orig_pd = getattr(_md_safe, 'packages_distributions', None)
-if _orig_pd is not None and not getattr(_orig_pd, '_hartos_guarded', False):
-    def _safe_packages_distributions():
-        try:
-            return _orig_pd()
-        except Exception:
-            # Best-effort fallback: empty mapping.  Auto-docstring
-            # lookups against {} return generic guesses (worse but
-            # nonfatal).
-            return {}
-    _safe_packages_distributions._hartos_guarded = True
-    _md_safe.packages_distributions = _safe_packages_distributions
-del _md_safe
-
-# ── Defang transformers `_LazyModule.__getattr__` recursion ──
-# transformers ships a `_LazyModule` class whose `__getattr__` does
-# ``hasattr(self, candidate_name)`` which itself triggers
-# ``__getattr__`` again on the not-yet-bound attribute → ~1500-frame
-# recursion that holds the `transformers` per-package import lock for
-# minutes on cold disk.  Triggered by ANY downstream
-# ``from transformers import GPT2TokenizerFast`` (langchain_core does
-# this transitively).  Live thread dump 2026-04-28 22:18 captured the
-# hartos-init thread in 28+ frames of this recursion, blocking every
-# concurrent caller of ``get_world_model_bridge`` (15 dashboard
-# requests + peer_discovery + telemetry) for the rest of the process
-# lifetime.
-#
-# Fix: import `GPT2TokenizerFast` from its underlying submodule and
-# write it to ``transformers.__dict__`` BEFORE any lazy lookup fires.
-# Once the attribute is bound, `hasattr()` short-circuits at the dict
-# and never calls `__getattr__`.  Every downstream caller gets the
-# bound class via plain dict lookup, no recursion.
-#
-# This used to live in Nunba's `app.py::_prewarm_hartos_chain` (commit
-# c0894a2a, 2026-04-28).  That prewarm was deleted in favour of the
-# `hartos_bootstrap` facade — but the direct-bind got deleted with it,
-# letting the recursion regress.  The right home for this is HARTOS,
-# not Nunba: it must run before HARTOS's own
-# `from langchain_classic.llms import OpenAI` (next stmt below) AND
-# before any consumer's deferred bootstrap touches transformers.
-try:
-    import transformers as _tf_safe
-    from transformers.models.gpt2.tokenization_gpt2_fast import (
-        GPT2TokenizerFast as _GPT2TokenizerFast_direct,
-    )
-    if not hasattr(_tf_safe, '__dict__') or \
-            'GPT2TokenizerFast' not in _tf_safe.__dict__:
-        _tf_safe.__dict__['GPT2TokenizerFast'] = _GPT2TokenizerFast_direct
-    del _tf_safe, _GPT2TokenizerFast_direct
-except Exception:
-    # If transformers isn't installed or moved the symbol, fall through.
-    # Worker threads will hit the lazy path and pay the recursion once;
-    # bad but not fatal (and surfaced via the hartos_init_error.log).
-    pass
-
-# ── Defang transformers `_LazyModule.__getattr__` re-entry recursion ──
-#
-# Symptom: Tier-1 init thread spends minutes (and burns the GIL the
-# whole time, starving Hypercorn workers) inside
-# ``transformers.utils.import_utils.py:2215`` —
-#
-#     transformers_module = sys.modules.get("transformers")
-#     if transformers_module and hasattr(transformers_module, candidate_name):
-#                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-#
-# That ``hasattr(transformers_module, candidate_name)`` triggers
-# ``transformers.__getattr__(candidate_name)`` (because transformers'
-# top-level module object IS a ``_LazyModule`` with a custom
-# ``__getattr__``), which hits the SAME ``hasattr`` line on a different
-# candidate, which recurses again.  130+ frames deep, all
-# ``active+gil``, no other thread can run.  The recursion is
-# bounded (SLOW_TO_FAST_CONVERTERS is finite) so ``RecursionError``
-# never fires — it just burns CPU forever on a graph walk that should
-# be a single dict lookup.
-#
-# Why the GPT2TokenizerFast bind above isn't enough: that fix only
-# covers ONE leaf of the lazy graph.  Whichever ``*TokenizerFast``
-# is requested first triggers the same recursion via different
-# candidate paths.
-#
-# Architectural note (impact-assessed): we considered three other
-# approaches and rejected each — see
-# ``memory/feedback_langchain_uplift_path.md``:
-#   1. ``sys.setrecursionlimit(N)`` — recursion is bounded, never
-#      raises; forcing N too low breaks legitimate deep stacks.
-#   2. Lazy-import langchain in HARTOS — multi-week refactor; AND
-#      HevolveAI (encrypted .so.enc, NOT refactor-able) is a second
-#      transformers consumer that would still trigger this recursion
-#      at runtime, so the layer-A fix doesn't cover all consumers.
-#   3. Uplift langchain-classic → langchain-core + LangGraph — same
-#      multi-week scope as (2), still doesn't cover HevolveAI.
-#
-# (1)–(3) are all consumer-side fixes.  This patch is at the
-# ``transformers._LazyModule`` layer, which means BOTH consumers
-# (open langchain + closed-source HevolveAI) benefit without changes
-# to either.  That's why a third-party monkey-patch is the
-# architecturally correct answer here, not a band-aid.
-#
-# Mechanism: install a re-entry guard on ``_LazyModule.__getattr__``.
-# When a thread is already mid-``__getattr__`` for a (module, name)
-# pair and the same pair is requested again (which is what
-# ``hasattr`` does inside the same method), raise ``AttributeError``
-# immediately.  ``hasattr`` swallows ``AttributeError`` and returns
-# ``False`` — semantically identical to "the attribute hasn't been
-# bound yet" which is exactly what the calling code is asking.
-#
-# Cross-name recursion (``__getattr__('A')`` triggering
-# ``__getattr__('B')``) is preserved — only same-name re-entry on
-# the same thread is short-circuited.  That's the precise shape of
-# the bug.
-#
-# TODO(upstream): file an issue with HuggingFace transformers
-# proposing the fix at the source — replace the offending
-# ``hasattr(transformers_module, candidate_name)`` with
-# ``candidate_name in transformers_module.__dict__``.  Once a
-# released transformers carries the upstream fix, this monkey-patch
-# becomes vestigial and can be removed.  Track via
-# ``memory/feedback_transformers_lazy_module_patch.md``.
-try:
-    import threading as _tf_threading
-    from transformers.utils import import_utils as _tf_import_utils
-
-    _tf_lazy_module_class = getattr(_tf_import_utils, '_LazyModule', None)
-    if _tf_lazy_module_class is not None and not getattr(
-            _tf_lazy_module_class, '_hartos_reentry_guarded', False):
-        _orig_getattr = _tf_lazy_module_class.__getattr__
-        _resolving = _tf_threading.local()
-
-        # Bind both the original method AND the threading.local() store
-        # via default arguments so the closure carries its own
-        # references.  Module-body cleanup (`del _orig_getattr` etc.)
-        # below is then safe — without this, Python's closure-by-name
-        # lookup would NameError when the lazy module later actually
-        # invokes __getattr__ at runtime (symptom:
-        # ``Tier-1 FAILED — name '_orig_getattr' is not defined``).
-        def _hartos_reentry_guarded_getattr(
-                self, name, _orig=_orig_getattr, _local=_resolving):
-            in_progress = getattr(_local, 'set', None)
-            if in_progress is None:
-                in_progress = set()
-                _local.set = in_progress
-            key = (id(self), name)
-            if key in in_progress:
-                # Same (module, name) re-entry on this thread —
-                # ``hasattr`` probe inside ``__getattr__``.  The
-                # caller is asking "is this already bound?"; we are
-                # mid-resolution so the answer is "not yet".  Raising
-                # AttributeError tells hasattr→False, which is the
-                # semantic the caller wanted.
-                raise AttributeError(
-                    f"module {self.__name__!r} has no attribute {name!r} "
-                    f"(HARTOS re-entry guard: same-name __getattr__ "
-                    f"recursion broken)"
-                )
-            in_progress.add(key)
-            try:
-                return _orig(self, name)
-            finally:
-                in_progress.discard(key)
-
-        _tf_lazy_module_class.__getattr__ = _hartos_reentry_guarded_getattr
-        _tf_lazy_module_class._hartos_reentry_guarded = True
-    # NOTE: not deleting _orig_getattr / _resolving — the patched
-    # method's default args already hold references; deleting the
-    # module-scope names would leave them dangling at module-body cleanup
-    # but otherwise harmless.  Leave them visible (underscore-prefixed,
-    # excluded from `from … import *` semantics) to keep the call site
-    # debuggable via dir().
-    del _tf_threading, _tf_import_utils, _tf_lazy_module_class
-except Exception:
-    # transformers not installed, version moved _LazyModule, or some
-    # other surprise — fall through.  We've still got the
-    # GPT2TokenizerFast direct-bind above; recursion may resurface
-    # but won't crash boot.
-    pass
-
 from bs4 import BeautifulSoup
 from enum import Enum
 from cultural_wisdom import get_cultural_prompt_compact
@@ -267,7 +72,6 @@ import pytz
 import hashlib
 from security.node_integrity import compute_code_hash, compute_file_manifest, verify_json_signature
 from security import master_key
-from core.platform_paths import get_coding_workspace_dir
 
 
 # --- Hevolve Boot Integrity Verification ---
@@ -324,9 +128,6 @@ def hevolve_verify_boot():
 
 
 from core.http_pool import pooled_get, pooled_post
-from core.auth_local import (
-    require_local_or_token, require_local_or_token_csrf_safe,
-)
 from datetime import datetime, timezone
 from typing import List, Union, Optional, Mapping, Any, Dict
 
@@ -366,28 +167,10 @@ try:
 except ImportError:
     from pydantic import BaseModel, Field, root_validator
 from threadlocal import thread_local_data
-# Crossbar HTTP publisher — canonical path is `crossbarhttp3.CrossbarHttpPublisher`
-# (the same publisher used by integrations/social/realtime.py:25).  We fall
-# back to the legacy `crossbarhttp.Client` API only if the canonical
-# publisher is not installed.  Either path is OPTIONAL — if neither is
-# importable the module-load must NOT crash; this layer is dead-code in
-# flat mode where MessageBus uses LOCAL EventBus + PeerLink without HTTP.
-#
-# Regression 2026-04-26: a `.venv` with broken `crossbarhttp` (no
-# __init__.py, Client at .crossbarhttp.Client) made the previous
-# `crossbarhttp.Client(...)` module-level call raise AttributeError,
-# crashing the whole HARTOS import (Tier-1 dead → agent daemon dead →
-# admin dashboard empty).  Wrapping in try/except + using the canonical
-# crossbarhttp3 first kills that failure mode.
-_crossbar_publisher = None
 try:
-    from crossbarhttp3 import CrossbarHttpPublisher as _CrossbarPub
+    import crossbarhttp
 except Exception:
-    _CrossbarPub = None
-try:
-    import crossbarhttp as _legacy_cb  # may be a broken stub
-except Exception:
-    _legacy_cb = None
+    crossbarhttp = None
 from PIL import Image
 import numpy as np
 # Cohere rerank - make optional to avoid pydantic v2 incompatibility with old langchain
@@ -450,19 +233,6 @@ except Exception:
 
 # Ensure prompts directory exists (agent creation writes JSON here)
 os.makedirs(PROMPTS_DIR, exist_ok=True)
-
-# Boot-time prompts/ snapshot (best-effort, non-blocking).  Bounds
-# data loss to "since last reboot" if the user wipes data dir or
-# hits a corruption.  Fires at module-import time so it runs in
-# BOTH the CLI hevolve-server path AND the Nunba bundled path
-# (Nunba imports hart_intelligence_entry as a library; the CLI
-# main() is never called in that case).  See core/prompts_backup.py.
-try:
-    from core.prompts_backup import snapshot_at_boot as _hartos_snapshot_at_boot
-    _hartos_snapshot_at_boot()
-except Exception as _snap_err:
-    logging.getLogger('hevolve_core').debug(
-        f'prompts_backup at module-load skipped: {_snap_err}')
 
 # Google A2A integration (from gpt4.1)
 try:
@@ -769,78 +539,6 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('HEVOLVE_MAX_PAYLOAD_BYTES', 2 * 1024 * 1024))  # 2MB default
 
-# ── LLM outbound logger ───────────────────────────────────────────────
-# Monkey-patches httpx.Client.send (+ AsyncClient) to (a) inject the
-# thread-local HARTOS request_id as the OpenAI ``user`` field on every
-# POST to :8082/v1/chat/completions and (b) append the full request
-# body to ~/Documents/Nunba/logs/llm_outbound.jsonl.  Covers autogen,
-# langchain, openai-python — every Python-originated LLM call funnels
-# through httpx.  See ``core/llm_outbound_logger.py`` for the full
-# rationale (the 2026-05-12 IPL ctx-overflow incident motivated this).
-try:
-    from core.llm_outbound_logger import install as _install_outbound_hook
-    _install_outbound_hook()
-except Exception as _outbound_err:
-    logging.getLogger(__name__).debug(
-        "llm_outbound install skipped: %s", _outbound_err)
-
-# ── Boot-time tool-registry warmer ────────────────────────────────────
-# Kicks a background daemon thread to pre-fill the 4 process-level tool
-# caches (service_tools / system_introspect / skills / provider_gateway)
-# so the FIRST user chat turn doesn't pay the ~80-100s cold-start
-# penalty observed on 2026-05-13 09:55:23 (IPL turn 301eeed0).  The
-# warmer itself takes ~100s but runs in parallel with everything else;
-# by the time a user types, the caches are warm.  Failures are
-# swallowed silently — the lazy on-call path retries any registry
-# that was temporarily unavailable at boot.
-def _spawn_tool_warmup_when_ready():
-    """Deferred warmup spawn — runs once get_tools symbols are defined.
-
-    The actual warmer function `_warmup_tool_registries_in_background`
-    is defined further down in this file, so we wrap the spawn in a
-    short delay-thread that resolves it from globals() at call time.
-    """
-    try:
-        import threading as _t
-
-        def _deferred_spawn():
-            try:
-                time.sleep(1)
-            except Exception:
-                pass
-            warmer = globals().get('_warmup_tool_registries_in_background')
-            if warmer:
-                try:
-                    warmer()
-                except Exception as _e:
-                    logging.getLogger(__name__).debug(
-                        "tool-warmup invocation failed: %s", _e)
-
-        _t.Thread(target=_deferred_spawn, daemon=True,
-                  name='tool-warmup-spawner').start()
-    except Exception as _ws_err:
-        logging.getLogger(__name__).debug(
-            "tool-warmup spawner failed: %s", _ws_err)
-
-
-_spawn_tool_warmup_when_ready()
-
-
-def _json_endpoint(f):
-    """Wrap a Flask view so unhandled exceptions return ``{'error': ...}, 500``.
-
-    Must be defined before any module-level route registration block uses it
-    as a decorator — Python resolves decorator names at function-definition
-    time, not at call time.
-    """
-    @wraps(f)
-    def _wrapped(*args, **kwargs):
-        try:
-            return f(*args, **kwargs)
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    return _wrapped
-
 if _is_bundled:
     # Bundled: root owns the handlers; let app.logger propagate to root
     # so ALL module loggers (hevolveai, langchain, etc.) are captured.
@@ -922,229 +620,13 @@ except ImportError:
 except Exception as e:
     app.logger.warning(f"Provision init skipped: {e}")
 
-# Legacy ``register_consent_routes`` block removed in the
-# consent-surface consolidation (orchestrator review acd11f55,
-# 2026-04-25).  The HTTP write surface for user consent now lives at
-# ``integrations.social.consent_api`` (consent_bp, JWT-authed,
-# append-only, mounted at ``/api/social/consent``).  ``init_social``
-# in ``integrations/social/__init__.py`` registers the new blueprint;
-# no extra wiring is required here.
-
-# MCP HTTP Bridge — exposes local MCP tools via REST for Nunba/external clients
 try:
-    from integrations.mcp.mcp_http_bridge import mcp_local_bp, auto_register_local_mcp
-    app.register_blueprint(mcp_local_bp)
-    auto_register_local_mcp()
-    app.logger.info("MCP HTTP bridge registered at /api/mcp/local")
-except ImportError:
-    app.logger.info("MCP HTTP bridge not available, skipping")
-except Exception as e:
-    app.logger.warning(f"MCP HTTP bridge init skipped: {e}")
-
-# Model Onboarding API — HuggingFace → GGUF → llama.cpp in one call
-try:
-    from integrations.service_tools.model_onboarding import get_blueprint as _get_onboard_bp
-    app.register_blueprint(_get_onboard_bp())
-    app.logger.info("Model onboarding API registered at /api/models/")
-except ImportError:
-    app.logger.info("Model onboarding not available, skipping")
-except Exception as e:
-    app.logger.warning(f"Model onboarding init skipped: {e}")
-
-# Robot Intelligence API — 7 intelligences fuse in parallel for any embodied AI
-try:
-    from integrations.robotics.intelligence_api import robot_intelligence_bp
-    app.register_blueprint(robot_intelligence_bp)
-    app.logger.info("Robot Intelligence API registered at /api/robot/")
-except ImportError:
-    app.logger.info("Robot Intelligence API not available, skipping")
-except Exception as e:
-    app.logger.warning(f"Robot Intelligence API init skipped: {e}")
-
-# Commercial API — the paid /api/v1/intelligence/* surface.
-# Was coded but never registered with Flask, leaving 8 revenue endpoints
-# (chat, analyze, generate, hivemind, usage, keys CRUD) dead.  Routes:
-#   POST /api/v1/intelligence/chat
-#   POST /api/v1/intelligence/analyze
-#   POST /api/v1/intelligence/generate
-#   GET  /api/v1/intelligence/hivemind
-#   GET  /api/v1/intelligence/usage
-#   POST /api/v1/intelligence/keys
-#   GET  /api/v1/intelligence/keys
-#   DELETE /api/v1/intelligence/keys/<key_id>
-# Tiers: free / starter / pro / enterprise (see TIER_CONFIG in
-# integrations/agent_engine/commercial_api.py:32-36).  Revenue split via
-# revenue_aggregator: 90% users / 9% infra / 1% central.
-# Free tier is always free — gatekeeping intelligence is not the goal;
-# sustaining the hive is.  This blueprint registration is the single
-# wiring change between "revenue surface dead" and "customers can land".
-try:
-    from integrations.agent_engine.commercial_api import commercial_api_bp
-    app.register_blueprint(commercial_api_bp)
-    app.logger.info(
-        "Commercial API registered at /api/v1/intelligence/ — "
-        "free/starter/pro/enterprise tiers, 90/9/1 revenue split")
-except ImportError:
-    app.logger.info("Commercial API not available, skipping")
-except Exception as e:
-    app.logger.warning(f"Commercial API init skipped: {e}")
-
-# Hive Session API — Claude Code as hive worker node
-try:
-    from integrations.coding_agent.claude_hive_session import get_blueprint as _get_hive_bp
-    app.register_blueprint(_get_hive_bp())
-    app.logger.info("Hive Session API registered at /api/hive/session/")
-except ImportError:
-    app.logger.info("Hive Session API not available, skipping")
-except Exception as e:
-    app.logger.warning(f"Hive Session API init skipped: {e}")
-
-# Hive Signal Bridge API — channel signals dashboard
-try:
-    from integrations.channels.hive_signal_bridge import create_signal_blueprint
-    app.register_blueprint(create_signal_blueprint())
-    app.logger.info("Hive Signal Bridge registered at /api/hive/signals/")
-except ImportError:
-    app.logger.info("Hive Signal Bridge not available, skipping")
-except Exception as e:
-    app.logger.warning(f"Hive Signal Bridge init skipped: {e}")
-
-# Hive Benchmark Prover API — distributed benchmark proving
-try:
-    from integrations.agent_engine.hive_benchmark_prover import create_benchmark_prover_blueprint
-    _bench_bp = create_benchmark_prover_blueprint()
-    if _bench_bp:
-        app.register_blueprint(_bench_bp)
-        app.logger.info("Benchmark Prover API registered at /api/hive/benchmark/")
-except ImportError:
-    app.logger.info("Benchmark Prover not available, skipping")
-except Exception as e:
-    app.logger.warning(f"Benchmark Prover init skipped: {e}")
-
-# Robotics Hardware Bridge API — sensor/actuator registration and action execution
-try:
-    from integrations.robotics.hardware_bridge import _create_blueprint as _create_hw_bp
-    _hw_bp = _create_hw_bp()
-    if _hw_bp:
-        app.register_blueprint(_hw_bp)
-        app.logger.info("Robotics Hardware Bridge registered at /api/robot/")
-except ImportError:
-    app.logger.info("Robotics Hardware Bridge not available, skipping")
-except Exception as e:
-    app.logger.warning(f"Robotics Hardware Bridge init skipped: {e}")
-
-# Compute Optimizer API — system resource optimization
-try:
-    from core.compute_optimizer import create_optimizer_blueprint, get_optimizer
-    _opt_bp = create_optimizer_blueprint()
-    if _opt_bp:
-        app.register_blueprint(_opt_bp)
-    _optimizer = get_optimizer()
-    _optimizer.start()
-    app.logger.info("Compute Optimizer registered and started")
-except ImportError:
-    app.logger.info("Compute Optimizer not available, skipping")
-except Exception as e:
-    app.logger.warning(f"Compute Optimizer init skipped: {e}")
-
-# App Marketplace — publish, compare, distribute, auto-promote AI apps
-try:
-    from integrations.agent_engine.app_marketplace import marketplace_bp
-    app.register_blueprint(marketplace_bp)
-    app.logger.info("App Marketplace registered at /api/marketplace/")
-except ImportError:
-    app.logger.info("App Marketplace not available, skipping")
-except Exception as e:
-    app.logger.warning(f"App Marketplace init skipped: {e}")
-
-# Resource Governor — start background monitoring (task #260: watchdog-registered)
-try:
-    from core.resource_governor import get_governor
-    _gov = get_governor()
-    _gov.start()
-    app.logger.info(f"Resource Governor started (mode={_gov.get_mode()})")
-    # Register both daemon loops with the watchdog.  Monitor runs every 5s;
-    # proactive waits up to 5s per iteration.  Allow 4× grace for noisy
-    # system-state probes (nvidia-smi, /proc).
-    try:
-        from security.node_watchdog import get_watchdog
-        _wd = get_watchdog()
-        if _wd and _gov._running:
-            _wd.register('resource_governor_monitor',
-                         expected_interval=20,
-                         restart_fn=_gov.start, stop_fn=_gov.stop)
-            _wd.register('resource_governor_proactive',
-                         expected_interval=20,
-                         restart_fn=_gov.start, stop_fn=_gov.stop)
-            app.logger.info("Resource Governor registered with watchdog")
-    except Exception as e:
-        app.logger.debug(f"Governor watchdog registration skipped: {e}")
+    from integrations.social.consent_service import register_consent_routes
+    register_consent_routes(app)
 except ImportError:
     pass
 except Exception as e:
-    app.logger.warning(f"Resource Governor start skipped: {e}")
-
-# Central Orchestrator Client — heartbeat to hevolve.ai central + master
-# kill-switch polling.  Env-gated: no-op when HEVOLVE_CENTRAL_ORCHESTRATOR_URL
-# is unset (default flat-mode install), so we burn ZERO resources on a
-# poll loop nobody asked for.  When configured, the client posts small
-# heartbeats (node_id + guardrail_hash + benchmark best-scores + halted
-# flag), polls /halt for a master-signed stop signal, and routes that
-# through HiveCircuitBreaker.halt_network() — which itself verifies the
-# master-key signature before tripping.  See docs/ml_intern_brief §5-D.
-try:
-    from core import central_orchestrator_client as _coc_mod
-    _coc = _coc_mod.get_client()
-    if _coc.is_configured():
-        if _coc.start():
-            app.logger.info(
-                "Central Orchestrator Client started "
-                "(env-gated: HEVOLVE_CENTRAL_ORCHESTRATOR_URL set)"
-            )
-            # Watchdog — catch silent thread death.  Expected interval
-            # is 2× heartbeat (heartbeat loop wakes at min(heartbeat,
-            # halt_poll, 5s) so 120s gives comfortable headroom without
-            # triggering on a single missed poll.
-            try:
-                from security.node_watchdog import get_watchdog
-                _wd = get_watchdog()
-                if _wd:
-                    _wd.register(
-                        'central_orchestrator_client',
-                        expected_interval=120,
-                        restart_fn=_coc.start,
-                        stop_fn=_coc.stop,
-                    )
-                    app.logger.info(
-                        "Central Orchestrator Client registered with watchdog"
-                    )
-            except ImportError:
-                pass
-            except Exception as e:
-                app.logger.debug(
-                    f"Central Orchestrator watchdog registration skipped: {e}"
-                )
-            # atexit — signal the loop to exit cleanly on process shutdown.
-            # Daemon thread exits with the process regardless; this just
-            # flushes any in-flight heartbeat.
-            import atexit as _atexit
-            _atexit.register(_coc.stop)
-        else:
-            # start() returned False — either already running, or node
-            # tier is 'central' itself (brief's design: central doesn't
-            # self-heartbeat).  Both paths log inside start().
-            pass
-    else:
-        app.logger.debug(
-            "Central Orchestrator Client inactive "
-            "(HEVOLVE_CENTRAL_ORCHESTRATOR_URL unset) — flat-mode default"
-        )
-except ImportError:
-    app.logger.debug(
-        "Central Orchestrator Client not available, skipping"
-    )
-except Exception as e:
-    app.logger.warning(f"Central Orchestrator Client init skipped: {e}")
+    app.logger.warning(f"Consent service init skipped: {e}")
 
 # MCP HTTP Bridge — exposes local MCP tools via REST for Nunba/external clients
 try:
@@ -1659,16 +1141,8 @@ RAG_API = config.get('RAG_API', '')
 from core.config_cache import (
     get_db_url, get_action_api, get_student_api,
     get_vision_api, get_book_parsing_api, is_bundled as _config_is_bundled,
-    get_central_db_url,
 )
 DB_URL = get_db_url()
-# Distinct from DB_URL: always points at the central cloud (kong-routed)
-# instead of collapsing to localhost in bundled mode.  Used by /prompts
-# and /prompts/public to merge in agents the user owns on hevolve.ai
-# but never synced down to this machine.  Empty string disables the
-# cross-device merge (local-only listing) — matches the same fail-quiet
-# contract _merge_prompts_with_cloud already has on cloud failures.
-CENTRAL_DB_URL = get_central_db_url()
 ACTION_API = get_action_api()
 STUDENT_API = get_student_api()
 LLAVA_API = get_vision_api()
@@ -1817,71 +1291,38 @@ def _init_learning_pipeline():
         _trace_recorder = get_trace_recorder(recordings_dir)
 
         # Learning provider (wraps llama.cpp on port 8080 or cloud endpoint)
-        #
-        # rl_ef/__init__.py uses a graceful-degradation pattern: when an
-        # optional sibling import (torch/cuda/transformers stack) fails,
-        # it binds create_learning_llm_config = register_learning_provider
-        # = None instead of raising. So a `from … import X` succeeds with
-        # X bound to None. Calling None(...) is a TypeError that crashes
-        # the *whole* pipeline (HiveMind included) — guard explicitly so
-        # only the learning-provider step is skipped.
-        if create_learning_llm_config is None or register_learning_provider is None:
-            _logger.warning(
-                "[EmbodiedAI] rl_ef symbols are None — an optional dep "
-                "(likely torch/cuda) failed to load inside hevolveai. "
-                "Trace recording + HiveMind continue; learning provider "
-                "skipped.")
+        _domain = 'general'
+        _wizard_key = os.environ.get('HEVOLVE_LLM_API_KEY', '') or None
+        llm_config = create_learning_llm_config(
+            domain=_domain, fallback_api_key=_wizard_key)
+        if '_provider' in llm_config:
+            _learning_provider = llm_config['_provider']
+            register_learning_provider(_domain, _learning_provider)
+            _logger.info(
+                "[EmbodiedAI] Learning provider ready (RL-EF + episodic memory)")
         else:
-            _domain = 'general'
-            _wizard_key = os.environ.get('HEVOLVE_LLM_API_KEY', '') or None
-            llm_config = create_learning_llm_config(
-                domain=_domain, fallback_api_key=_wizard_key)
-            if '_provider' in llm_config:
-                _learning_provider = llm_config['_provider']
-                register_learning_provider(_domain, _learning_provider)
-                _logger.info(
-                    "[EmbodiedAI] Learning provider ready (RL-EF + episodic memory)")
-            else:
-                _logger.warning(
-                    "[EmbodiedAI] Learning provider init returned no provider")
+            _logger.warning(
+                "[EmbodiedAI] Learning provider init returned no provider")
 
         # HiveMind
-        if HiveMind is None or AgentCapability is None:
-            _logger.warning(
-                "[EmbodiedAI] HiveMind/AgentCapability symbols are None — "
-                "skipping HiveMind registration.")
-        else:
-            import uuid
-            instance_id = f"hevolve_{uuid.uuid4().hex[:8]}"
-            # HiveMind signature changed: the old `max_agents=100` kwarg
-            # is no longer accepted (live evidence frozen_debug.log 7×
-            # 2026-05-13/14: `TypeError: __init__() got an unexpected
-            # keyword argument 'max_agents'`).  Today's HiveMind is a
-            # latent-space collaboration substrate (Procrustes-aligned)
-            # whose __init__ takes (common_dim=256, num_shards=4,
-            # fusion_method="attention", device="cpu") — no agent cap
-            # because cardinality is bounded by register_agent calls,
-            # not a constructor arg.  Verified against
-            # hevolveai/src/.../learning/hive_mind.py:583-589.  Defaults
-            # are sane for the desktop tier; device stays 'cpu' so we
-            # don't fight TTS for VRAM.  Drop the kwarg.
-            _hive_mind = HiveMind()
-            _hive_mind.register_agent(
-                agent_id=instance_id,
-                agent_type='hevolve_orchestrator',
-                latent_dim=2048,
-                capabilities=[
-                    AgentCapability.TEXT_GENERATION, AgentCapability.REASONING],
-            )
-            _logger.info(f"[EmbodiedAI] HiveMind registered as {instance_id}")
+        import uuid
+        instance_id = f"hevolve_{uuid.uuid4().hex[:8]}"
+        _hive_mind = HiveMind(max_agents=100)
+        _hive_mind.register_agent(
+            agent_id=instance_id,
+            agent_type='hevolve_orchestrator',
+            latent_dim=2048,
+            capabilities=[
+                AgentCapability.TEXT_GENERATION, AgentCapability.REASONING],
+        )
+        _logger.info(f"[EmbodiedAI] HiveMind registered as {instance_id}")
 
     except ImportError as e:
         logging.getLogger(__name__).warning(
             f"[EmbodiedAI] HevolveAI not installed — learning disabled: {e}")
     except Exception as e:
         logging.getLogger(__name__).error(
-            f"[EmbodiedAI] Learning pipeline init failed: {e}",
-            exc_info=True)
+            f"[EmbodiedAI] Learning pipeline init failed: {e}")
 
 
 def get_learning_provider():
@@ -2124,29 +1565,7 @@ except Exception:
 chain = None
 
 
-# URL precedence: WAMP_URL env (set by Nunba desktop / regional / central) →
-# legacy cloud default.  Flat mode (no cloud) sets WAMP_URL to localhost so
-# DNS to aws_rasa.hertzai.com is never attempted (#323).
-_wamp_url = os.environ.get('WAMP_URL') or 'http://localhost:8088/publish'
-try:
-    if _CrossbarPub is not None:
-        client = _CrossbarPub(_wamp_url)
-    elif _legacy_cb is not None and hasattr(_legacy_cb, 'Client'):
-        client = _legacy_cb.Client(_wamp_url)
-    else:
-        # Legacy package may expose Client at .crossbarhttp.Client
-        # (broken namespace install).  Probe before giving up.
-        _nested = getattr(_legacy_cb, 'crossbarhttp', None) if _legacy_cb else None
-        client = _nested.Client(_wamp_url) if (_nested and hasattr(_nested, 'Client')) else None
-except Exception as _cb_err:
-    client = None
-    try:
-        import logging as _logging_cb_warn
-        _logging_cb_warn.getLogger(__name__).warning(
-            f"Crossbar HTTP publisher init skipped: {type(_cb_err).__name__}: {_cb_err} — "
-            f"MessageBus LOCAL+PEERLINK transports remain active.")
-    except Exception:
-        pass
+client = crossbarhttp.Client('http://aws_rasa.hertzai.com:8088/publish') if crossbarhttp else None
 
 # Create thread pool executor for async Crossbar publishing
 crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
@@ -2195,27 +1614,8 @@ def publish_async(topic, message, timeout=2.0):
 
     Also publishes to the confirmation topic (mirrors cloud chatbot.py:publish()).
 
-    SIDE-EFFECT — Nunba monkey-patches this at runtime:
-        Nunba's ``routes/hartos_backend_adapter.py`` wraps this
-        function in-place to also call ``_capture_thinking(message)``
-        for every published message.  That feeds Nunba's per-request
-        thinking-trace buffer that the ``/chat`` HTTP response embeds.
-
-        Implication for callers: bypassing this function (publishing
-        directly via ``MessageBus.publish``) silently skips the
-        capture.  If you change the chat-bubble path to call the bus
-        directly, Nunba's HTTP /chat responses lose their thinking
-        traces.  Either keep going through ``publish_async`` or
-        migrate Nunba's interceptor to a bus subscriber on
-        ``chat.response`` (tracked in
-        ``memory/project_publish_aop_migration.md`` — the right
-        long-term shape).
-
     Args:
-        topic: Crossbar topic to publish to (legacy format).  Use
-            ``core.peer_link.message_bus.chat_topic_for(user_id)``
-            to build per-user chat topic strings instead of inline
-            f-strings.
+        topic: Crossbar topic to publish to (legacy format)
         message: Message payload (JSON string or dict)
         timeout: Maximum time for HTTP Crossbar publish (default: 2.0 seconds)
     """
@@ -2239,23 +1639,6 @@ def publish_async(topic, message, timeout=2.0):
             # Ensure user_id is in data for per-user routing
             if user_id and isinstance(data, dict):
                 data.setdefault('user_id', user_id)
-            # Stamp node_tier on every chat-topic envelope so the SPA's
-            # formatTier helper (task #146/#148) can render the badge
-            # without per-callsite plumbing. Closes #153. setdefault
-            # preserves any explicit value the caller already set —
-            # this is a strict additive safety net for the audit gap
-            # task #149 might have missed.
-            #
-            # served_by stays caller-set because it identifies WHICH
-            # backend served THIS reply, which the infrastructure here
-            # doesn't know (only the dispatch site does — see
-            # speculative_dispatcher.py:1578).
-            if (isinstance(data, dict)
-                    and bus_topic
-                    and bus_topic.startswith('chat.')):
-                data.setdefault(
-                    'node_tier',
-                    os.environ.get('HEVOLVE_NODE_TIER', 'flat'))
             msg_id = bus.publish(
                 bus_topic, data,
                 user_id=user_id,
@@ -2272,46 +1655,7 @@ def publish_async(topic, message, timeout=2.0):
         except Exception as e:
             app.logger.debug(f"MessageBus publish failed (offline OK): {e}")
 
-    # 2. SSE / local-WAMP fan-out for the Nunba desktop SPA.
-    #
-    # MessageBus (above) is the in-process EventBus + PeerLink path —
-    # it does NOT reach the SPA's EventSource subscribers nor the
-    # embedded wamp_router :8088 that crossbarWorker.js connects to.
-    # Nunba's main.py exposes ``broadcast_sse_event`` which fans out to
-    # BOTH legs (publish_local → embedded WAMP topic, plus the SSE
-    # queue), so calling the canonical helper here gives every publish
-    # site real-time delivery to the desktop UI without per-call wiring.
-    #
-    # Before this leg existed, only TTS bridged to SSE explicitly
-    # (see TTS publish below); thinking traces, channel events, and
-    # every other publish_async caller silently dropped on the desktop.
-    # The publisher abstraction is the canonical home — no parallel
-    # path at each call site.
-    # TTS skips this leg — TTS owns its own broadcast_sse_safe call at the
-    # TTS publish site (search "TTS async: published" below).  Routing TTS
-    # through here in addition was producing two audio playbacks per turn
-    # (the SPA's request_id-keyed dedup didn't catch them when envelope
-    # shapes diverged across transports) and racing with the typewriter
-    # animation.  Keep TTS on its dedicated path; this leg covers
-    # everything else (thinking traces, channel events, capability updates).
-    if isinstance(data, dict) and data.get('user_id') and data.get('action') != 'TTS':
-        try:
-            from core.platform.events import broadcast_sse_safe
-            # event_type mirrors the canonical chatbot_routes.publish_to_crossbar
-            # contract (Nunba routes/chatbot_routes.py:733): use payload['type']
-            # when present, otherwise default to 'message'.  The SPA's SSE
-            # consumer only registers listeners for 'message' (onmessage),
-            # 'notification', and 'setup_progress'; everything else is routed
-            # via the local-WAMP leg of broadcast_sse_event (which keys off
-            # data.get('action') for TTS pupit / chat / social).  Using
-            # 'action' as the SSE event_type would silently drop on SSE
-            # clients — keep this aligned with the chatbot_routes default.
-            _evt = data.get('type') if data.get('type') else 'message'
-            broadcast_sse_safe(_evt, data, user_id=data.get('user_id'))
-        except Exception as _sse_err:
-            app.logger.debug(f"SSE fan-out skipped: {_sse_err}")
-
-    # 3. HTTP Crossbar for cloud telemetry + legacy mobile (when internet available)
+    # 2. HTTP Crossbar for cloud telemetry + legacy mobile (when internet available)
     if client is None:
         return
 
@@ -2765,8 +2109,7 @@ def _push_workflow_flowchart(user_id, prompt_id, request_id=None):
             "historical_request_id": [],
             "options": [], "newoptions": [],
         }
-        from core.peer_link.message_bus import chat_topic_for
-        publish_async(chat_topic_for(user_id), json.dumps(crossbar_message))
+        publish_async(f'com.hertzai.hevolve.chat.{user_id}', json.dumps(crossbar_message))
     except Exception:
         pass
 
@@ -3140,73 +2483,6 @@ def _handle_list_pending_actions_tool(input_text: str) -> str:
         return f"List_Pending_Actions error: {str(e)[:200]}"
 
 
-def _wire_qr_pair_emitter(channel_type: str, meta: dict) -> None:
-    """Hook the live adapter's existing `set_qr_callback` to the
-    Liquid UI `agent_ui_update` pipe so the user sees a QR right
-    where they typed "connect <channel>" — no admin-page navigation.
-
-    Single helper for every auth_method='qr_session' channel
-    (whatsapp, telegram_user, discord_user) — the per-channel adapter
-    already exposes the callback hook, this just bridges it to the
-    Liquid UI emitter that the form-based flows already use.
-
-    Best-effort: if the adapter isn't registered yet (e.g. fresh
-    bind before bootstrap), the QR will surface on next adapter
-    spawn via the same callback.
-    """
-    try:
-        from core.platform.service_registry import ServiceRegistry
-        from integrations.channels.registry import get_registry
-        _lui = ServiceRegistry.get('LiquidUIService')
-        if _lui is None:
-            return
-        adapter = get_registry().get(channel_type)
-        if adapter is None or not hasattr(adapter, 'set_qr_callback'):
-            return
-        user_id = thread_local_data.get_user_id() or 'system'
-        display_name = meta.get('display_name') or channel_type
-
-        def _emit_qr(qr: str) -> None:
-            try:
-                _lui.agent_ui_update(user_id, {
-                    'type': 'qr_pair',
-                    'channel': channel_type,
-                    'title': f"Scan to connect {display_name}",
-                    'help': (
-                        f"Open {display_name} on your phone → Linked "
-                        "devices → Link a device → scan this code."
-                    ),
-                    'qr': qr,
-                })
-            except Exception as e:
-                logger.debug("qr_pair emit failed: %s", e)
-
-        adapter.set_qr_callback(_emit_qr)
-
-        # Trigger an immediate (re)connect so the adapter spins up its
-        # WAHA / MTProto session and pushes the first QR via the
-        # callback.  Reuses the same loop pattern the admin
-        # /reconnect endpoint uses — single source of truth.
-        try:
-            import asyncio as _asyncio
-            loop = _asyncio.new_event_loop()
-            try:
-                try:
-                    loop.run_until_complete(adapter.disconnect())
-                except Exception:
-                    pass
-                loop.run_until_complete(adapter.connect())
-            finally:
-                loop.close()
-        except Exception as e:
-            logger.debug(
-                "qr_pair reconnect deferred (adapter spawns on bootstrap): %s",
-                e,
-            )
-    except Exception as e:
-        logger.debug("Connect_Channel: _wire_qr_pair_emitter failed: %s", e)
-
-
 def _handle_connect_channel_tool(input_text: str) -> str:
     """Register / connect a messaging channel (WhatsApp, Telegram, Discord,
     Slack, etc.) from natural-language chat. Delegates to the existing
@@ -3260,406 +2536,9 @@ def _handle_connect_channel_tool(input_text: str) -> str:
         )
         if register_fn is None:
             return "Channel registration is not available on this node."
-        result = register_fn(channel_type, config_json)
-        # Liquid UI co-pilot: when the tool reports missing-credential
-        # fields, surface a floating form via agent_ui_update so the
-        # existing AgentOverlay FormOverlay (case 'form' renderer)
-        # collects the credentials inline in chat instead of forcing
-        # the user to navigate to the admin Channels page.  The text
-        # return is preserved unchanged so the LangChain agent can
-        # summarize it to the user — the form is the IMPERATIVE next
-        # step, the text is context.  Best-effort: never raise, never
-        # block the tool return.  Same emit pattern model_orchestrator
-        # already uses (see notify_loaded line ~872).
-        try:
-            if isinstance(result, str) and 'Missing:' in result:
-                from integrations.channels.metadata import (
-                    get_channel_metadata, is_oauth_configured,
-                )
-                meta = get_channel_metadata(channel_type) or {}
-
-                # ── OAuth click-through fork (PR O) ────────────────
-                # When the operator has set HARTOS_OAUTH_CLIENT_<TYPE>
-                # env, prefer click-through over paste-form.  Calls the
-                # SAME ``build_authorize_url`` helper /api/oauth/start
-                # uses (oauth_api.build_authorize_url) — single source
-                # of URL truth.  Emits a Liquid UI ``oauth_link``
-                # payload that AgentOverlay's case 'oauth_link' renders.
-                # Falls through to the paste-form on any failure.
-                if is_oauth_configured(channel_type):
-                    try:
-                        from integrations.channels.oauth_api import (
-                            build_authorize_url,
-                        )
-                        authorize_url, _state = build_authorize_url(
-                            user_id=int(thread_local_data.get_user_id() or 0),
-                            channel_type=channel_type,
-                        )
-                        from core.platform.service_registry import ServiceRegistry
-                        _lui = ServiceRegistry.get('LiquidUIService')
-                        if _lui:
-                            _lui.agent_ui_update(
-                                thread_local_data.get_user_id() or 'system',
-                                {
-                                    'type': 'oauth_link',
-                                    'channel': channel_type,
-                                    'channel_type': channel_type,
-                                    'display_name': meta.get('display_name') or channel_type,
-                                    'color': meta.get('color') or '#6c63ff',
-                                    'icon': meta.get('icon') or 'link',
-                                    'url': authorize_url,
-                                    'external_url': meta.get('external_url'),
-                                    'cta_label': f"Connect with {meta.get('display_name') or channel_type}",
-                                },
-                            )
-                            return (
-                                f"To connect {meta.get('display_name') or channel_type}, "
-                                f"click the button I just sent — it will open the provider's "
-                                f"sign-in page in your browser.  After you authorize, the "
-                                f"channel will be connected automatically."
-                            )
-                    except Exception as oauth_err:
-                        logger.debug(
-                            "Connect_Channel: OAuth fork failed, falling back to form: %s",
-                            oauth_err,
-                        )
-                        # Fall through to the paste-form path below.
-
-                setup_fields = meta.get('setup_fields') or []
-                # Skip auto:True fields (WAHA api_url, access_token, etc)
-                # — these are server-provisioned via env-var defaults in
-                # register_channel; surfacing them in the chat form would
-                # ask the user about gateway infrastructure they shouldn't
-                # need to know about.  Operator override stays available
-                # via the admin Channels page (which shows ALL fields).
-                visible_fields = [f for f in setup_fields if not f.get('auto')]
-                if visible_fields:
-                    from core.platform.service_registry import ServiceRegistry
-                    _lui = ServiceRegistry.get('LiquidUIService')
-                    if _lui:
-                        _lui.agent_ui_update(
-                            thread_local_data.get_user_id() or 'system',
-                            {
-                                'type': 'form',
-                                'title': f"Connect {meta.get('display_name') or channel_type}",
-                                'channel': channel_type,
-                                'fields': [
-                                    {
-                                        'name': f.get('key'),
-                                        'label': f.get('label') or f.get('key'),
-                                        'placeholder': f.get('placeholder') or '',
-                                        'secret': bool(
-                                            f.get('secret')
-                                            or (f.get('key') or '').endswith(
-                                                ('_token', '_secret', '_key'))
-                                        ),
-                                        'help': f.get('help') or '',
-                                        'type': f.get('type') or 'text',
-                                        'default': f.get('default'),
-                                    }
-                                    for f in visible_fields
-                                ],
-                                # external_url surfaces a "Open <Provider>"
-                                # button at the top of the form so users
-                                # can launch BotFather / Discord dev portal
-                                # / Slack app installer in their browser
-                                # before pasting the resulting token.
-                                'external_url': meta.get('external_url'),
-                                'submit_label': 'Connect',
-                                'submit_action': 'register_channel',
-                            },
-                        )
-        except Exception as e:
-            logger.debug("Connect_Channel: liquid UI emit skipped: %s", e)
-
-        # ── QR-session post-success hookup ────────────────────────
-        # For channels with auth_method='qr_session' (whatsapp,
-        # telegram_user, discord_user) the binding alone isn't enough —
-        # the user also needs to scan a QR with their existing client
-        # to authorize the session.  Reuse the existing
-        # `set_qr_callback` on each adapter and the existing
-        # `agent_ui_update` Liquid UI emit pipe (same emitter the
-        # form uses, just a new payload kind).  Single hook for all
-        # three channels — DRY.
-        try:
-            if isinstance(result, str) and 'registered and enabled' in result:
-                from integrations.channels.metadata import get_channel_metadata
-                meta = get_channel_metadata(channel_type) or {}
-                if meta.get('auth_method') == 'qr_session':
-                    _wire_qr_pair_emitter(channel_type, meta)
-        except Exception as e:
-            logger.debug("Connect_Channel: qr_pair wire skipped: %s", e)
-        return result
+        return register_fn(channel_type, config_json)
     except Exception as e:
         return f"Channel connect error: {str(e)[:200]}"
-
-
-def _handle_invite_friend_tool(input_text: str) -> str:
-    """Generate a shareable Nunba invite link the user can send to a friend.
-
-    Mirrors the _handle_connect_channel_tool pattern (G1, plan
-    elegant-spinning-avalanche).  Reuses the canonical referral primitive
-    ``DistributionService.get_or_create_referral_code`` (idempotent —
-    same user → same code) and the canonical URL builder
-    ``invite_share_url`` so the link format stays a single-writer.
-
-    Input formats:
-      - "" (empty) — generic "share with anyone" link
-      - "<context, e.g. 'work friend' or 'family'>" — same link, just
-        echoed back in the friendly reply for the LLM to weave in
-
-    Returns text including the share URL so the LangChain agent can
-    summarize for the user.  Also fires a Liquid UI ``form`` card via
-    ``agent_ui_update`` (same emit pattern as Connect_Channel) so the
-    AgentOverlay renders an inline floating share-card with copy +
-    "share via channel" actions.
-    """
-    try:
-        uid = thread_local_data.get_user_id()
-        if not uid:
-            return "Cannot generate invite — no signed-in user in this session."
-        from integrations.social.distribution_service import (
-            DistributionService, invite_share_url,
-        )
-        from integrations.social.models import get_db
-        db = get_db()
-        try:
-            ref = DistributionService.get_or_create_referral_code(db, str(uid))
-            db.commit()
-        finally:
-            db.close()
-        code = ref.get('code') or ''
-        if not code:
-            return "Failed to generate invite code — please try again."
-        url = invite_share_url(code)
-
-        # Liquid UI co-pilot: emit a share card so the user can copy /
-        # send the link with one click.  Same pattern Connect_Channel
-        # uses (line 2891-2925), same canonical AgentOverlay 'form'
-        # renderer.  Best-effort — never blocks the tool return.
-        try:
-            from core.platform.service_registry import ServiceRegistry
-            _lui = ServiceRegistry.get('LiquidUIService')
-            if _lui:
-                _lui.agent_ui_update(
-                    str(uid),
-                    {
-                        'type': 'form',
-                        'title': 'Share invite',
-                        'channel': 'invite',
-                        'fields': [
-                            {
-                                'name': 'invite_url',
-                                'label': 'Your invite link',
-                                'value': url,
-                                'readonly': True,
-                            },
-                        ],
-                        'submit_label': 'Copy link',
-                        'submit_action': 'copy_invite_url',
-                    },
-                )
-        except Exception as e:
-            logger.debug("Invite_Friend: liquid UI emit skipped: %s", e)
-
-        context_hint = (input_text or '').strip()
-        suffix = f" (context: {context_hint})" if context_hint else ""
-        return (
-            f"Here is your shareable invite link: {url}{suffix}. "
-            f"Send it via any channel — anyone who joins via this link "
-            f"is credited as your referral."
-        )
-    except Exception as e:
-        return f"Invite_Friend error: {str(e)[:200]}"
-
-
-def _handle_join_external_room_tool(input_text: str) -> str:
-    """Join an external room (Discord channel, Slack channel, Telegram
-    super-group, Matrix room, Teams meet, WhatsApp group, etc.) on
-    behalf of the user, with consent + announcement guardrails.
-
-    Mirrors the _handle_connect_channel_tool pattern (G2, plan
-    elegant-spinning-avalanche).  Reuses canonical primitives:
-       - room_presence_service.gate (consent check, fail-closed)
-       - room_presence_service.announce_presence (HIVE MISSION
-         announcement on join)
-       - room_presence_service.listen_for_objection (auto-leave
-         on participant 'no AI' reply)
-       - ChannelRegistry.get / RoomCapableAdapter.join_room (transport)
-
-    Input formats:
-       - "<platform> <room_id_or_url>"            (default role=co_pilot)
-       - "<platform> <room_id> <role>"
-       - JSON: {"platform":..., "room":..., "role":...}
-
-    Roles ∈ {co_pilot, participant, note_taker, silent_observer, writer}.
-
-    Returns a human-readable string the LangChain agent can summarize.
-    Best-effort: never raises out, always returns a string.
-    """
-    import json as _json
-    try:
-        uid = thread_local_data.get_user_id()
-        if not uid:
-            return "Cannot join external room — no signed-in user in this session."
-
-        platform = ''
-        room_id = ''
-        role = 'co_pilot'
-        text = (input_text or '').strip()
-        if text.startswith('{'):
-            try:
-                parsed = _json.loads(text)
-                platform = (parsed.get('platform') or parsed.get('channel') or '').lower()
-                room_id = str(parsed.get('room') or parsed.get('room_id') or '')
-                role = (parsed.get('role') or 'co_pilot').lower()
-            except _json.JSONDecodeError:
-                pass
-        if not platform or not room_id:
-            parts = text.split(None, 2)
-            if len(parts) >= 1:
-                platform = platform or parts[0].lower()
-            if len(parts) >= 2:
-                room_id = room_id or parts[1]
-            if len(parts) >= 3 and not role:
-                role = parts[2].lower()
-
-        if not platform:
-            return (
-                "Which platform should I join? Tell me the platform "
-                "(discord, slack, telegram, matrix, teams, whatsapp) "
-                "and the room id or URL."
-            )
-        if not room_id:
-            return f"Which {platform} room should I join? Send the room id or URL."
-
-        # 1. Consent gate (canonical path)
-        from integrations.social.room_presence_service import (
-            announce_presence, gate, listen_for_objection,
-        )
-        allowed, reason = gate(str(uid), platform, room_id, role)
-        if not allowed:
-            # Surface a Liquid UI consent card so the user can grant in one click.
-            try:
-                from core.platform.service_registry import ServiceRegistry
-                _lui = ServiceRegistry.get('LiquidUIService')
-                if _lui:
-                    _lui.agent_ui_update(
-                        str(uid),
-                        {
-                            'type': 'approval',
-                            'title': 'Permission needed',
-                            'message': reason,
-                            'severity': 'info',
-                            'actions': [
-                                {'label': 'Open Privacy Settings',
-                                 'action': 'navigate',
-                                 'target': '/social/settings/privacy'},
-                            ],
-                        },
-                    )
-            except Exception as e:
-                logger.debug("Join_External_Room: consent UI emit skipped: %s", e)
-            return reason
-
-        # 2. Resolve adapter + check room-capable
-        try:
-            from integrations.channels.registry import get_registry
-            from integrations.channels.room_capable import (
-                UnsupportedRoomError, is_room_capable,
-            )
-            registry = get_registry()
-            adapter = registry.get(platform)
-        except Exception as e:
-            return f"Could not look up {platform} adapter: {str(e)[:160]}"
-        if adapter is None:
-            return (
-                f"No {platform} channel is configured. Set it up first "
-                f"via Connect_Channel ('add channel {platform}') and try again."
-            )
-        if not is_room_capable(adapter):
-            return (
-                f"The {platform} adapter is configured but does not yet "
-                f"support room/channel join semantics. Platform support "
-                f"is pending — for now you can use Connect_Channel for "
-                f"1:1 messaging."
-            )
-
-        # 3. Join via the adapter (RoomCapableAdapter.join_room)
-        import asyncio
-        try:
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    fut = asyncio.run_coroutine_threadsafe(
-                        adapter.join_room(room_id, role), loop)
-                    joined = fut.result(timeout=30)
-                else:
-                    joined = loop.run_until_complete(
-                        adapter.join_room(room_id, role))
-            except RuntimeError:
-                joined = asyncio.run(adapter.join_room(room_id, role))
-        except UnsupportedRoomError as e:
-            return f"{platform} doesn't support rooms here: {e}"
-        except Exception as e:
-            return f"Failed to join {platform}/{room_id}: {str(e)[:160]}"
-
-        if not joined:
-            return (
-                f"Could not join {platform}/{room_id} — the adapter "
-                f"refused the join (rate limit, missing permission, or "
-                f"network). Try again in a moment."
-            )
-
-        # 4. Announce presence (HIVE MISSION — non-optional)
-        owner_name = None
-        try:
-            owner_name = thread_local_data.get_user_display_name() if hasattr(
-                thread_local_data, 'get_user_display_name') else None
-        except Exception:
-            owner_name = None
-        announced = announce_presence(
-            adapter, room_id, str(uid), role,
-            owner_display_name=owner_name)
-        if not announced:
-            # Required announcement failed — leave to honor the policy.
-            try:
-                if loop and loop.is_running():
-                    asyncio.run_coroutine_threadsafe(
-                        adapter.leave_room(room_id), loop).result(timeout=15)
-                else:
-                    asyncio.run(adapter.leave_room(room_id))
-            except Exception:
-                pass
-            return (
-                f"Joined {platform}/{room_id} but could not post the "
-                f"required AI-presence announcement. Left the room to "
-                f"honor the privacy policy. Please try again."
-            )
-
-        # 5. Listen for objection
-        agent_id_for_room = f"{platform}:{room_id}"
-        def _on_detach(reason: str):
-            try:
-                if loop and loop.is_running():
-                    asyncio.run_coroutine_threadsafe(
-                        adapter.leave_room(room_id), loop).result(timeout=15)
-                else:
-                    asyncio.run(adapter.leave_room(room_id))
-            except Exception as e:
-                logger.debug("Join_External_Room: leave_room failed: %s", e)
-
-        listen_for_objection(
-            adapter, room_id, str(uid), agent_id_for_room,
-            on_detach=_on_detach)
-
-        return (
-            f"Joined {platform}/{room_id} as {role}. I posted an "
-            f"AI-presence announcement and will leave automatically if "
-            f"any participant says 'no AI' or '/agent-out'."
-        )
-    except Exception as e:
-        return f"Join_External_Room error: {str(e)[:200]}"
 
 
 def _handle_agentic_router_tool(input_text):
@@ -3791,54 +2670,23 @@ def _handle_request_resource(input_text: str) -> str:
     )
 
 
-# Module-level cache for the google-search tool list.  Process-wide
-# memoization captured 2026-05-08 after observing
-# ``get_tools(is_first=True)`` taking 33.4s in casual_conv hot path —
-# the slow step is ``load_tools(["google-search"])`` which triggers
-# the LangChain GoogleSearchAPIWrapper import chain + env-var probe
-# for ``GOOGLE_API_KEY`` / ``GOOGLE_CSE_ID`` on every call.  The
-# return value is invariant per-process (env doesn't change at
-# runtime, the wrapper class doesn't reload), so caching collapses
-# the cost from 33s+ to ~zero on the second call onward.  Design
-# intent ("casual_conv → minimal tool set in ~2.5s") preserved —
-# we just stop rebuilding the same answer on every chat turn.
-_GOOGLE_SEARCH_TOOLS_CACHE: list | None = None
-_GOOGLE_SEARCH_CACHE_LOCK = threading.Lock()
-
-
 def _safe_load_google_search():
     """Load google-search tool, returning empty list if package is missing.
-
-    Memoized per-process — see ``_GOOGLE_SEARCH_TOOLS_CACHE`` above
-    for the full rationale.  Result is invariant under runtime env
-    changes (env vars are read once at LangChain wrapper init); a
-    config change requires a process restart anyway.
 
     In bundled/flat mode (NUNBA_BUNDLED=1 or HEVOLVE_NODE_TIER=flat),
     the Google API key is expected to be missing — log at DEBUG instead
     of WARNING so the log doesn't fill with noise every request. On
     cloud/regional tiers, a missing key IS a warning worth surfacing.
     """
-    global _GOOGLE_SEARCH_TOOLS_CACHE
-    # Fast path — uncontended read after the first call.
-    if _GOOGLE_SEARCH_TOOLS_CACHE is not None:
-        return _GOOGLE_SEARCH_TOOLS_CACHE
-    with _GOOGLE_SEARCH_CACHE_LOCK:
-        # Double-check inside the lock so concurrent first-callers
-        # don't both pay the load_tools cost.
-        if _GOOGLE_SEARCH_TOOLS_CACHE is not None:
-            return _GOOGLE_SEARCH_TOOLS_CACHE
-        try:
-            result = load_tools(["google-search"])
-        except (ImportError, Exception) as e:
-            _bundled = os.environ.get('NUNBA_BUNDLED') or os.environ.get('HEVOLVE_NODE_TIER', 'flat') == 'flat'
-            if _bundled:
-                logging.debug(f"Google Search tool unavailable (expected in local mode): {e}")
-            else:
-                logging.warning(f"Google Search tool unavailable: {e}")
-            result = []
-        _GOOGLE_SEARCH_TOOLS_CACHE = result
-        return result
+    try:
+        return load_tools(["google-search"])
+    except (ImportError, Exception) as e:
+        _bundled = os.environ.get('NUNBA_BUNDLED') or os.environ.get('HEVOLVE_NODE_TIER', 'flat') == 'flat'
+        if _bundled:
+            logging.debug(f"Google Search tool unavailable (expected in local mode): {e}")
+        else:
+            logging.warning(f"Google Search tool unavailable: {e}")
+        return []
 
 
 def _with_tool_logging(func, tool_name):
@@ -3854,22 +2702,6 @@ def _with_tool_logging(func, tool_name):
     @wraps(func)
     def wrapper(*args, **kwargs):
         logging.info(f"[TOOL] {tool_name} called | input: {str(args)[:200]}")
-        # Per-tool UI stage emit (#508 extension — covers all ~50 tools via
-        # this single chokepoint, no per-tool plumbing).  Emit failures are
-        # LOGGED, not swallowed (user directive 2026-05-11: no silent gulps).
-        try:
-            from core.constants import TOOL_LABELS
-            from core.peer_link.crossbar_publish import publish_chat_stage
-            publish_chat_stage(
-                'tool_call',
-                user_id=str(thread_local_data.get_user_id() or ''),
-                request_id=str(thread_local_data.get_request_id() or ''),
-                text=TOOL_LABELS.get(tool_name, f'Running {tool_name}…'),
-            )
-        except Exception:
-            logging.warning(
-                f"[TOOL] {tool_name} UI emit failed", exc_info=True
-            )
         try:
             result = func(*args, **kwargs)
             logging.info(f"[TOOL] {tool_name} completed | output length: {len(str(result))}")
@@ -3880,332 +2712,22 @@ def _with_tool_logging(func, tool_name):
     return wrapper
 
 
-# Per-(user, prompt) cache for the casual_conv `is_first=True` tool
-# list.  Captured 2026-05-08 after observing 33.4s on every casual
-# chat turn in the bundled env — the heavy steps inside this branch
-# (LangChain ``load_tools(['google-search'])`` wrapper init + 30
-# hardcoded Tool() objects + service_tool_registry +
-# system_introspect + skill_registry + provider_gateway) have NO
-# per-call variation once the process is up.  Per-user memory tools
-# bind to the live MemoryGraph object, so caching the tool function
-# is safe: the function queries the graph at CALL time, not at
-# build time, so newly added memories are still visible.
-#
-# Bounded to 32 entries (typical max sessions per Nunba install) +
-# FIFO eviction so a long-running instance never grows unbounded.
-# Design-intent preserved per
-# `tts_engine.py:5722-5729` comment: casual_conv still gets the
-# minimal tool set, just memoized so the build cost is paid ONCE
-# per (user, prompt) pair instead of every chat turn.
-_FIRST_TOOLS_CACHE: dict[str, list] = {}
-_FIRST_TOOLS_CACHE_MAX = 32
-_FIRST_TOOLS_CACHE_LOCK = threading.Lock()
-
-# ── Process-level caches for slow registry probes ─────────────────────
-# Each of these registries does heavy first-call work (Crawl4AI/AceStep
-# health probes, langchain google-search wrapper init, system_introspect
-# admin-API queries, skill_registry filesystem walk + GitHub probes,
-# provider gateway enumeration).  Together they account for ~80-100s
-# of the 105s `get_tools(is_first=True)` cold-start latency observed
-# on the 2026-05-13 09:55:23 IPL turn.  Caching the result process-wide
-# turns the cold path into a one-time pay; every subsequent (user,
-# prompt) build pays only the per-user MemoryGraph open (~50ms).
-# Filled lazily on first call (or eagerly by the boot warmer thread
-# at startup — see `_warmup_tool_registries_in_background` below).
-_SVC_TOOLS_CACHE = None
-_SVC_TOOLS_LOCK = threading.Lock()
-_INTROSPECT_TOOLS_CACHE = None
-_INTROSPECT_TOOLS_LOCK = threading.Lock()
-_SKILL_TOOLS_CACHE = None
-_SKILL_TOOLS_LOCK = threading.Lock()
-_PROVIDER_TOOLS_CACHE = None
-_PROVIDER_TOOLS_LOCK = threading.Lock()
-
-
-def _cached_service_tools():
-    """Memoized service_tool_registry.get_langchain_tools()."""
-    global _SVC_TOOLS_CACHE
-    if _SVC_TOOLS_CACHE is not None:
-        return _SVC_TOOLS_CACHE
-    with _SVC_TOOLS_LOCK:
-        if _SVC_TOOLS_CACHE is not None:
-            return _SVC_TOOLS_CACHE
-        try:
-            from integrations.service_tools import service_tool_registry
-            result = list(service_tool_registry.get_langchain_tools())
-        except (ImportError, Exception):
-            result = []
-        _SVC_TOOLS_CACHE = result
-        return result
-
-
-def _cached_introspect_tools():
-    """Memoized system_introspect_tool.get_langchain_tools()."""
-    global _INTROSPECT_TOOLS_CACHE
-    if _INTROSPECT_TOOLS_CACHE is not None:
-        return _INTROSPECT_TOOLS_CACHE
-    with _INTROSPECT_TOOLS_LOCK:
-        if _INTROSPECT_TOOLS_CACHE is not None:
-            return _INTROSPECT_TOOLS_CACHE
-        try:
-            from integrations.service_tools.system_introspect_tool import (
-                get_langchain_tools as _get_introspect_tools,
-            )
-            result = list(_get_introspect_tools())
-        except (ImportError, Exception):
-            result = []
-        _INTROSPECT_TOOLS_CACHE = result
-        return result
-
-
-def _cached_skill_tools():
-    """Memoized skill_registry.get_langchain_tools()."""
-    global _SKILL_TOOLS_CACHE
-    if _SKILL_TOOLS_CACHE is not None:
-        return _SKILL_TOOLS_CACHE
-    with _SKILL_TOOLS_LOCK:
-        if _SKILL_TOOLS_CACHE is not None:
-            return _SKILL_TOOLS_CACHE
-        try:
-            from integrations.skills import skill_registry
-            result = list(skill_registry.get_langchain_tools())
-        except (ImportError, Exception):
-            result = []
-        _SKILL_TOOLS_CACHE = result
-        return result
-
-
-def _cached_provider_tools():
-    """Memoized integrations.providers.agent_tools.get_provider_tools()."""
-    global _PROVIDER_TOOLS_CACHE
-    if _PROVIDER_TOOLS_CACHE is not None:
-        return _PROVIDER_TOOLS_CACHE
-    with _PROVIDER_TOOLS_LOCK:
-        if _PROVIDER_TOOLS_CACHE is not None:
-            return _PROVIDER_TOOLS_CACHE
-        try:
-            from integrations.providers.agent_tools import get_provider_tools
-            result = list(get_provider_tools())
-        except Exception:
-            result = []
-        _PROVIDER_TOOLS_CACHE = result
-        return result
-
-
-# ── Combined heavy-tools group (non-blocking lazy load) ────────────────
-# The 3 suspects responsible for the 103-second silent gap during
-# get_tools(is_first=True) on the 2026-05-13 09:55:23 IPL turn:
-#   1. _safe_load_google_search()  ← cold-import cascade
-#      (langchain_classic.agents.load_tools transitively pulls in
-#      google-api-python-client + httplib2 + oauth2client; on Windows
-#      with Defender scanning DLLs this can be 30-80s.)
-#   2. _cached_skill_tools()        ← potential GitHub discovery / fs walk
-#   3. _cached_provider_tools()     ← provider enumeration + connect probes
-#
-# Grouped here so get_tools NEVER blocks on them — even on the "warm"
-# path the heavy cache is consulted with an O(1) read; if not yet
-# filled, get_tools proceeds without these tools and a background
-# daemon thread continues the build.  Subsequent get_tools calls will
-# pick them up once the build finishes.
-_HEAVY_TOOLS_CACHE: list = []
-_HEAVY_TOOLS_LOCK = threading.Lock()
-_HEAVY_TOOLS_BUILD_KICKED = False
-_HEAVY_TOOLS_READY = False
-
-
-def _kick_heavy_tools_build_once():
-    """Kick the heavy-tools background build if not already running.
-    Idempotent — safe to call multiple times from any thread."""
-    global _HEAVY_TOOLS_BUILD_KICKED
-    with _HEAVY_TOOLS_LOCK:
-        if _HEAVY_TOOLS_BUILD_KICKED:
-            return
-        _HEAVY_TOOLS_BUILD_KICKED = True
-
-    def _build():
-        global _HEAVY_TOOLS_CACHE, _HEAVY_TOOLS_READY
-        import time as _time
-        _start = _time.time()
-        tools = []
-        try:
-            tools += list(_safe_load_google_search() or [])
-        except Exception:
-            pass
-        _t_google = _time.time() - _start
-        try:
-            tools += list(_cached_skill_tools())
-        except Exception:
-            pass
-        _t_skill = _time.time() - _start - _t_google
-        try:
-            tools += list(_cached_provider_tools())
-        except Exception:
-            pass
-        _t_provider = _time.time() - _start - _t_google - _t_skill
-        with _HEAVY_TOOLS_LOCK:
-            _HEAVY_TOOLS_CACHE = tools
-            _HEAVY_TOOLS_READY = True
-        try:
-            app.logger.info(
-                "[HEAVY-TOOLS-LAZY] loaded %d tools "
-                "(google=%.1fs skill=%.1fs provider=%.1fs total=%.1fs)",
-                len(tools), _t_google, _t_skill, _t_provider,
-                _time.time() - _start,
-            )
-        except Exception:
-            pass
-
-    try:
-        import threading as _t
-        _t.Thread(target=_build, daemon=True,
-                  name='heavy-tools-lazy-build').start()
-    except Exception:
-        # Spawn failed — reset the kicked flag so the next call retries.
-        with _HEAVY_TOOLS_LOCK:
-            _HEAVY_TOOLS_BUILD_KICKED = False
-
-
-def _get_heavy_tools_nonblocking():
-    """Return the heavy-tools cache contents — non-blocking, never waits.
-
-    Reader-only: the build is kicked EAGERLY at boot by
-    `_warmup_tool_registries_in_background()`, not lazily on first chat.
-    Chat path returns whatever's already loaded — [] if the background
-    builder hasn't finished yet, the full list once it has.
-
-    Replaces inline _safe_load_google_search / _cached_skill_tools /
-    _cached_provider_tools so the user never waits for the 80-100s
-    cold-start cascade.
-    """
-    # Read without lock — list assignment is atomic in CPython, and a
-    # partially-built cache would still be a list of valid tools.
-    return _HEAVY_TOOLS_CACHE
-
-
-def _warmup_tool_registries_in_background():
-    """Pre-fill the 4 process-level tool caches in a daemon thread.
-
-    Hides the 80-100s cold-start latency that otherwise hits the FIRST
-    user chat turn.  Call once at app boot; subsequent calls are no-ops
-    because the caches are already filled.  Failures are swallowed
-    silently — the lazy on-call path will retry if a registry was
-    temporarily unavailable at boot.
-    """
-    try:
-        import threading as _t
-
-        def _warm():
-            # Brief grace so the rest of bootstrap completes first.
-            try:
-                time.sleep(2)
-            except Exception:
-                pass
-            # Fast registries — these probe at register-time, not
-            # iteration-time, so iterating them now is cheap.  Kept
-            # synchronous in the warmer thread.
-            try:
-                _cached_service_tools()
-            except Exception:
-                pass
-            try:
-                _cached_introspect_tools()
-            except Exception:
-                pass
-            # The 3 heavy ones (google-search cold imports + skill
-            # registry GitHub/fs walk + provider gateway probes) — do
-            # NOT load them.  Loading them eagerly burns the GIL for
-            # ~100s during boot (transformers _LazyModule recursion +
-            # registry probes); loading them lazily blocks the user's
-            # first chat for ~100s.  Either way the net work is the
-            # same.  Default: skip entirely.
-            #
-            # google_search is already available via top5_results in
-            # the inline labeled_tools list (hart_intelligence_entry:
-            # L4413), so no functionality loss for casual chat.
-            # skill_registry and provider_gateway are unused in this
-            # path on the flat/desktop tier.
-            #
-            # Opt-in for users who actually need the heavy group:
-            #   $env:HEVOLVE_LOAD_HEAVY_TOOLS = "1"
-            if os.environ.get('HEVOLVE_LOAD_HEAVY_TOOLS', '').strip().lower() in ('1', 'true', 'yes', 'on'):
-                try:
-                    _kick_heavy_tools_build_once()
-                    app.logger.info(
-                        "[TOOL-WARMUP] heavy group kicked (opt-in via "
-                        "HEVOLVE_LOAD_HEAVY_TOOLS)")
-                except Exception:
-                    pass
-            try:
-                app.logger.info(
-                    "[TOOL-WARMUP] fast tool registries ready "
-                    "(svc=%d introspect=%d); heavy group "
-                    "(google+skill+provider) skipped — opt-in via "
-                    "HEVOLVE_LOAD_HEAVY_TOOLS",
-                    len(_SVC_TOOLS_CACHE or []),
-                    len(_INTROSPECT_TOOLS_CACHE or []),
-                )
-            except Exception:
-                pass
-
-        _t.Thread(target=_warm, daemon=True, name='tool-registry-warmup').start()
-    except Exception as _w_err:
-        logging.getLogger(__name__).debug(
-            "tool-registry-warmup spawn skipped: %s", _w_err)
-
-
 def get_tools(req_tool, is_first: bool = False):
 
     if is_first:
-        # ── Timing instrumentation (#185) ─────────────────────────────
-        # The 2026-05-13 IPL turn showed `get_tools loaded` taking 118s
-        # despite the heavy-tools group being correctly skipped.  Real
-        # culprit unknown; speculation cost us multiple iterations.
-        # Capture per-step deltas so the next test gives ground truth.
-        # Cheap (~12 time.time() calls); always-on for now, demote to
-        # debug after root cause is fixed.
-        _gt_t0 = time.time()
-        _gt_steps = []  # list of (label, elapsed_since_t0_seconds)
-
-        def _gt_mark(label):
-            _gt_steps.append((label, time.time() - _gt_t0))
-
-        # Per-(user, prompt) memoization — see _FIRST_TOOLS_CACHE
-        # docstring above.  thread_local_data may be unset in
-        # degraded/test contexts; fall through to a non-cached
-        # build in that case.
-        _cache_key = None
-        try:
-            _uid = thread_local_data.get_user_id()
-            _pid = thread_local_data.get_prompt_id()
-            _cache_key = f"{_uid}:{_pid}"
-        except Exception:
-            _cache_key = None
-        if _cache_key and _cache_key in _FIRST_TOOLS_CACHE:
-            return _FIRST_TOOLS_CACHE[_cache_key]
-        _gt_mark('cache_check')
-
-        # Heavy tools (google-search + skill_registry + provider_gateway)
-        # come from the non-blocking heavy-tools cache filled by the boot
-        # warmer.  If not ready yet, returns [] — chat path proceeds without
-        # them.  Once the background build finishes, future first calls
-        # pick up the full list.  Replaces the inline _safe_load_google_search
-        # call here AND the inline _cached_skill_tools / _cached_provider_tools
-        # calls further down.
-        tools = list(_get_heavy_tools_nonblocking())
-        _gt_mark('heavy_tools_nonblocking')
+        tools = _safe_load_google_search()
         tool = [
 
-            labeled_tool(
+            Tool(
                 name='Calculator',
                 func=llm_math.run,
-                description='Useful for when you need to answer questions about math.',
-                ui_label='Calculating…',
+                description='Useful for when you need to answer questions about math.'
             ),
         ]
 
         # Only add OpenAPI tool if chain is initialized
         if chain is not None:
-            tool.append(labeled_tool(
+            tool.append(Tool(
                 name="OpenAPI_Specification",
                 func=chain.run,
                 description="Use this feature only when the user's request specifically pertains to one of the following scenarios:\
@@ -4214,74 +2736,52 @@ def get_tools(req_tool, is_first: bool = False):
                 Query Available Books: When the user is inquiring about available books, this feature should be used to locate and provide information about the required texts.\
                 Any CRUD operation which is not a READ or anything related to curriculum should not use this tool,  It is vital to ensure that the intent precisely falls within one of the above  categories before engaging this functionality.\
                 Don't use this to create a custom curriculum for user",
-                ui_label='Calling the OpenAPI service…',
             ))
 
         tool += [
-            labeled_tool(
+            Tool(
                 name="FULL_HISTORY",
                 func=parsing_string,
                 description=f"""Utilize this tool exclusively when the information required predates the current day & pertains to the ongoing user query or when there is a need to recall certain things we spoke earlier. The necessary input for this tool comprises a list of values separated by commas.
                 The list should encompass a user-generated query, designated by user input text, a commencement date denoted as start_date, and an end date labeled as end_date. The start_date denotes the initiation date for the user information search and should consistently adhere to the ISO 8601 format. Meanwhile, the end_date, also conforming to the ISO 8601 format, signifies the conclusion date for the search.
                 In cases where the end_date is indeterminable, the current datetime should be employed. For example, if the objective is to retrieve a user's dialogue spanning from the preceding day up to the present day (assuming today's date is 2023-07-13T10:19:56.732291Z), the input would resemble: 'what we discussed about the project, 2023-07-12T10:19:56.00000Z, 2023-07-13T10:19:56.732291Z'. If query has any form of date or time by user, then start end datetime can be exact rather than till today for more accurate results. Remove any references to time based words (e.g. yesterday, today, datetimes, last year) since the date range you provide already accounts for that. e.g. if user has asked what did we discuss the day before yesterday then the text argument should just be empty since it does not have any named entity for fuzzy search followed by start and end datetime.
                 Strive to apply this tool judiciously for scenarios in which retrospective user information is imperative. If Full history tool response is present, forget other histories, the inputs should be meticulously arranged to facilitate the extraction of accurate and pertinent data within the specified timeframe. Never use this tool for what is the response to my last comment?
-                Remember whatever user query is regarding search history understand what user is asking about and rephrase it properly then send to tool. Before framing the final tool response from this tool consult corresponding created_at date time to give more accurate response""",
-                ui_label='Searching your message history…',
+                Remember whatever user query is regarding search history understand what user is asking about and rephrase it properly then send to tool. Before framing the final tool response from this tool consult corresponding created_at date time to give more accurate response"""
             ),
-            labeled_tool(
+            Tool(
                 name="Text to image",
                 func=parse_text_to_image,
-                description="Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function",
-                ui_label='Generating an image from text…',
+                description="Based on user query generate visual representation of text. Extract prompt from user query and use it as input for function"
             ),
-            labeled_tool(
+            Tool(
                 name="Animate_Character",
                 func=parse_character_animation,
-                description='''Use this tool exclusively for animating the selected character or teacher as requested by the user. The user should specify their animation request in a query, such as 'Show me in a spacesuit' or 'Animate yourself as a cartoon standing in front of the Taj Mahal.' This tool handles requests involving animating a pre-selected character and should not be used for general image generation tasks. For example, use it for 'Show me a picture of yourself dancing in the rain' but not for 'Generate an image of a sunset.' input''',
-                ui_label='Animating your character…',
+                description='''Use this tool exclusively for animating the selected character or teacher as requested by the user. The user should specify their animation request in a query, such as 'Show me in a spacesuit' or 'Animate yourself as a cartoon standing in front of the Taj Mahal.' This tool handles requests involving animating a pre-selected character and should not be used for general image generation tasks. For example, use it for 'Show me a picture of yourself dancing in the rain' but not for 'Generate an image of a sunset.' input'''
             ),
-            labeled_tool(
+            Tool(
                 name="Image_Inference_Tool",
                 func=parse_image_to_text,
                 description='''When a user provides a query containing an image download URL and a related question about that image, utilize this tool for support. Your objective is to extract both the image URL and the user's inquiry or prompt pertaining to that image from their query, and then convert these elements into comma seperated string. The format should be as follows: "image_url, user_query".
-                ''',
-                ui_label='Analyzing the image…',
+                '''
             ),
-            labeled_tool(
+            Tool(
                 name="Data_Extraction_From_URL",
                 func=parse_link_for_crwalab,
                 description='''
                 Your task is to extract a URL and its type (either 'pdf' or 'website') from a user's query. Upon receiving a query that contains a URL and a specified URL type, you are to use a tool designed for this purpose. The objective is to accurately identify both the URL and its type from the query. Once identified, these elements should be formatted into a comma-separated string, adhering to the format: "url, url_type".
-                ''',
-                ui_label='Extracting data from URL…',
+                '''
             ),
-            # Direct google-search inline — bypasses langchain_classic.agents.load_tools
-            # which on first call triggers the transformers _LazyModule re-entry
-            # recursion (see lines 95-157 docstring).  `top5_results` is defined
-            # in this same file (L6107) — Python resolves the symbol at call
-            # time, so forward-referencing it here is safe.  Without this entry
-            # the casual_conv langchain agent has no web-search affordance,
-            # forcing refusals on any "fetch live data" query (2026-05-13 IPL
-            # turn 301eeed0 forensic).
-            labeled_tool(
-                name="google_search",
-                func=top5_results,
-                description="Search Google for recent results and retrieve URLs that are suitable for web crawling. Returns the top 5 result URLs + snippets. Use whenever you need live or recent information from the web — sports standings, current news, prices, schedules, anything time-sensitive. Always present source URLs in the response as HTML anchor tags for attribution. Input: the search query as a string.",
-                ui_label='Searching the web…',
-            ),
-            labeled_tool(
+            Tool(
                 name="User_details_tool",
                 func=parse_user_id,
-                description="If a request is made for information regarding students or users, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. Except current user id you should say you cannot have access other user's details.",
-                ui_label='Looking up user details…',
+                description="If a request is made for information regarding students or users, this functionality should be utilized to retrieve the necessary details. input for this api should Always be current user_id. Except current user id you should say you cannot have access other user's details."
             ),
-            labeled_tool(
+            Tool(
                 name="Visual_Context_Camera",
                 func=parse_visual_context,
-                description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall from the other end. If there are more than 1 person try to give an identity to each across frames to track the subjects through time by framing the tool input accordingly.",
-                ui_label='Looking through camera…',
+                description="To see user or if there is a need to look at user camera feed for vision and understanding scene, visual question answering, seeing user, recognise visual objects and activity then this should be utilised. Input to this tool function should be the user query/input. Only if last 16 seconds Visual Context information is present & is enough, then use that to craft a better creative, better, cohesive, correlated , summarised natural response, format this tool response togather with Previous 15 minutes Visual Context information if you are seeing the scene via videocall from the other end. If there are more than 1 person try to give an identity to each across frames to track the subjects through time by framing the tool input accordingly."
             ),
-            labeled_tool(
+            Tool(
                 name="Visual_Context_Watcher",
                 func=_handle_visual_watcher_tool,
                 description=(
@@ -4294,9 +2794,8 @@ def get_tools(req_tool, is_first: bool = False):
                     "The watcher runs in the background and fires the action whenever the condition "
                     "is detected. TTL auto-expires the watcher."
                 ),
-                ui_label='Setting up a visual watcher…',
             ),
-            labeled_tool(
+            Tool(
                 name="Create_Agent",
                 func=_handle_create_agent_tool,
                 description=(
@@ -4308,9 +2807,8 @@ def get_tools(req_tool, is_first: bool = False):
                     "If the user also says words like 'automatically', 'autonomous', 'do it for me', "
                     "'handle it', 'just create it', include those keywords in your input."
                 ),
-                ui_label='Starting agent creation…',
             ),
-            labeled_tool(
+            Tool(
                 name="Request_Resource",
                 func=_handle_request_resource,
                 description=(
@@ -4324,9 +2822,8 @@ def get_tools(req_tool, is_first: bool = False):
                     "If the resource is already configured, it returns immediately. "
                     "If not, the user will be prompted securely."
                 ),
-                ui_label='Requesting a resource…',
             ),
-            labeled_tool(
+            Tool(
                 name="Suggest_Share_Worthy_Content",
                 func=_suggest_share_worthy_content,
                 description=(
@@ -4336,9 +2833,8 @@ def get_tools(req_tool, is_first: bool = False):
                     "comments) but low share count, and suggests them for sharing. "
                     "Input can be any text — it is not used for filtering."
                 ),
-                ui_label='Finding share-worthy content…',
             ),
-            labeled_tool(
+            Tool(
                 name="Observe_User_Experience",
                 func=_observe_user_experience,
                 description=(
@@ -4346,9 +2842,8 @@ def get_tools(req_tool, is_first: bool = False):
                     "duration_ms, outcome. Used for self-improvement and understanding user "
                     "behavior patterns."
                 ),
-                ui_label='Recording an observation…',
             ),
-            labeled_tool(
+            Tool(
                 name="Self_Critique_And_Enhance",
                 func=_self_critique_and_enhance,
                 description=(
@@ -4356,9 +2851,8 @@ def get_tools(req_tool, is_first: bool = False):
                     "future recommendations. Input: topic or area to critique. Helps the agent "
                     "learn from its own interactions."
                 ),
-                ui_label='Reflecting on past suggestions…',
             ),
-            labeled_tool(
+            Tool(
                 name="Agentic_Router",
                 func=_handle_agentic_router_tool,
                 description=(
@@ -4369,10 +2863,9 @@ def get_tools(req_tool, is_first: bool = False):
                     "Output: a structured plan with steps. Do NOT use for simple questions, "
                     "greetings, or tasks that can be answered directly."
                 ),
-                ui_label='Planning the next steps…',
             ),
 
-            labeled_tool(
+            Tool(
                 name="Shell_Command",
                 func=_handle_shell_command_tool,
                 description=(
@@ -4392,9 +2885,8 @@ def get_tools(req_tool, is_first: bool = False):
                     "truncated to 4000 chars. For long-running coding work use "
                     "Execute_Coding_Task instead."
                 ),
-                ui_label='Running a command…',
             ),
-            labeled_tool(
+            Tool(
                 name="Computer_Action",
                 func=_handle_computer_action_tool,
                 description=(
@@ -4413,9 +2905,8 @@ def get_tools(req_tool, is_first: bool = False):
                     "'click the Save button in the open document', 'select the "
                     "second item in the dropdown')."
                 ),
-                ui_label='Acting on your screen…',
             ),
-            labeled_tool(
+            Tool(
                 name="Computer_Screenshot",
                 func=_handle_screenshot_tool,
                 description=(
@@ -4423,9 +2914,8 @@ def get_tools(req_tool, is_first: bool = False):
                     "Use when you need to understand what's on screen before acting. "
                     "Input: question about the screen (e.g. 'what apps are open?')."
                 ),
-                ui_label='Taking a screenshot…',
             ),
-            labeled_tool(
+            Tool(
                 name="Request_Camera_Access",
                 func=_request_capability_consent,
                 description=(
@@ -4433,9 +2923,8 @@ def get_tools(req_tool, is_first: bool = False):
                     "understanding. Use when you need to see the user but camera is "
                     "not active. Input: reason for needing camera access."
                 ),
-                ui_label='Requesting camera access…',
             ),
-            labeled_tool(
+            Tool(
                 name="Request_Screen_Access",
                 func=_request_screen_consent,
                 description=(
@@ -4443,9 +2932,8 @@ def get_tools(req_tool, is_first: bool = False):
                     "Use when you need to see the screen but screen sharing is not "
                     "active. Input: reason for needing screen access."
                 ),
-                ui_label='Requesting screen access…',
             ),
-            labeled_tool(
+            Tool(
                 name="Connect_Channel",
                 func=_handle_connect_channel_tool,
                 description=(
@@ -4471,50 +2959,8 @@ def get_tools(req_tool, is_first: bool = False):
                     "call this tool with just the channel name and it will tell you "
                     "what's needed."
                 ),
-                ui_label='Connecting channel…',
             ),
-            labeled_tool(
-                name="Invite_Friend",
-                func=_handle_invite_friend_tool,
-                description=(
-                    "Generate a shareable Nunba invite link the user can send to a "
-                    "friend, colleague, or family member so they can join Nunba "
-                    "and (optionally) credit the inviter as their referrer. Use "
-                    "whenever the user says things like 'invite a friend', 'share "
-                    "Nunba with my colleague', 'give me an invite link', 'how do "
-                    "I refer people', 'send my friend an invite', or similar. "
-                    "Input: optional short context describing who the invite is "
-                    "for (e.g. 'work friend', 'family'), or empty string for a "
-                    "generic shareable link. The tool returns a URL the user can "
-                    "paste into any channel; a floating share-card also appears "
-                    "in chat with a one-click Copy button."
-                ),
-                ui_label='Generating an invite link…',
-            ),
-            labeled_tool(
-                name="Join_External_Room",
-                func=_handle_join_external_room_tool,
-                description=(
-                    "Join an external room/channel — Discord channel, Slack "
-                    "channel, Telegram super-group, Matrix room, Teams meeting, "
-                    "WhatsApp group, etc. — on behalf of the user as an AI "
-                    "co-pilot, note-taker, participant, silent observer, or "
-                    "writer. Use whenever the user says things like 'join my "
-                    "Discord audio room', 'attend my Teams meet', 'take notes "
-                    "in the WhatsApp family group', 'co-pilot my Slack channel', "
-                    "or similar. Always asks the user for consent first via a "
-                    "Liquid UI prompt, then announces its presence in the room "
-                    "(per HIVE AI MISSION — never silent). Leaves automatically "
-                    "if any participant says 'no AI' / '/agent-out'. Input: "
-                    "either '<platform> <room_id_or_url>' or "
-                    "'<platform> <room> <role>' or a full JSON dict "
-                    "{{\"platform\":..., \"room\":..., \"role\":...}}. Roles: "
-                    "co_pilot (default), participant, note_taker, "
-                    "silent_observer, writer."
-                ),
-                ui_label='Joining the room…',
-            ),
-            labeled_tool(
+            Tool(
                 name="Navigate_App",
                 func=_handle_navigate_app_tool,
                 description=(
@@ -4528,9 +2974,8 @@ def get_tools(req_tool, is_first: bool = False):
                     "need to give a URL, just say the page. After calling this tool, "
                     "tell the user you're opening that page in a single short sentence."
                 ),
-                ui_label='Opening the requested page…',
             ),
-            labeled_tool(
+            Tool(
                 name="List_Pending_Actions",
                 func=_handle_list_pending_actions_tool,
                 description=(
@@ -4545,60 +2990,60 @@ def get_tools(req_tool, is_first: bool = False):
                     "ScheduledMessageManager (reminders, channel messages) "
                     "and the live apscheduler job store (periodic tasks)."
                 ),
-                ui_label='Listing pending actions…',
             ),
         ]
 
-        _gt_mark('inline_labeled_tools')
-
         # Service Tools: Add HTTP microservice tools (Crawl4AI, AceStep, etc.)
-        # Now memoized at module level — see _cached_service_tools.  Eliminates
-        # the per-(user, prompt) probe cost (Crawl4AI/AceStep health checks)
-        # observed at ~30s/call on cold first turn.
-        tool += list(_cached_service_tools())
-        _gt_mark('cached_service_tools')
+        try:
+            from integrations.service_tools import service_tool_registry
+            tool += service_tool_registry.get_langchain_tools()
+        except ImportError:
+            pass
 
         # System Introspection Tools: agent self-awareness — GPU tier,
         # active models, TTS backend, boot-decision rationale.  Lets the
         # LLM answer "what model is running?", "why is speculation off?",
         # "do I have a GPU?" from real live admin-API data instead of
-        # hallucinating.  Module-level cached.
-        tool += list(_cached_introspect_tools())
-        _gt_mark('cached_introspect_tools')
+        # hallucinating.
+        try:
+            from integrations.service_tools.system_introspect_tool import (
+                get_langchain_tools as _get_introspect_tools,
+            )
+            tool += _get_introspect_tools()
+        except ImportError:
+            pass
 
-        # HART Skills: Ingest agent skills (Claude Code, Markdown, GitHub).
-        # Moved into the heavy-tools group (loaded eagerly at boot, non-
-        # blocking on chat path) — see _get_heavy_tools_nonblocking above.
-        # Already included in the `tools` list at the top of this branch.
+        # HART Skills: Ingest agent skills (Claude Code, Markdown, GitHub)
+        try:
+            from integrations.skills import skill_registry
+            tool += skill_registry.get_langchain_tools()
+        except ImportError:
+            pass
 
         # Memory Tools: Add MemoryGraph-backed tools (remember, recall, backtrace)
         try:
             user_id = thread_local_data.get_user_id()
             prompt_id = thread_local_data.get_prompt_id()
-            _gt_mark('memory_get_ids')
             graph = _get_or_create_graph(user_id, prompt_id)
-            _gt_mark('memory_get_or_create_graph')
             if graph:
                 from integrations.channels.memory.agent_memory_tools import (
                     create_memory_tools, create_langchain_tools,
                 )
-                _gt_mark('memory_tools_import')
                 session_id = f"{user_id}_{prompt_id}" if prompt_id else str(user_id)
                 mem_tools_dict = create_memory_tools(graph, str(user_id), session_id)
-                _gt_mark('memory_create_memory_tools')
                 lc_mem_tools = create_langchain_tools(mem_tools_dict)
-                _gt_mark('memory_create_langchain_tools')
                 tool += lc_mem_tools
         except Exception:
-            _gt_mark('memory_exception')
             pass  # Non-blocking — memory tools are optional
 
         tools += tool
 
-        # Provider gateway tools (Cloud_LLM, Generate_Image, etc.).
-        # Moved into the heavy-tools group (loaded eagerly at boot, non-
-        # blocking on chat path) — already included in `tools` at the top
-        # of this branch via _get_heavy_tools_nonblocking().
+        # Provider gateway tools (Cloud_LLM, Generate_Image, etc.)
+        try:
+            from integrations.providers.agent_tools import get_provider_tools
+            tools += get_provider_tools()
+        except Exception as _prov_err:
+            app.logger.debug(f"Provider gateway tools not loaded: {_prov_err}")
 
         # Wrap all tool functions with logging
         for t in tools:
@@ -4606,44 +3051,6 @@ def get_tools(req_tool, is_first: bool = False):
                 t.func = _with_tool_logging(t.func, t.name)
             elif hasattr(t, '_run') and callable(t._run):
                 t._run = _with_tool_logging(t._run, t.name)
-        _gt_mark('wrap_logging_loop')
-
-        # Memoize the wrapped result for this (user, prompt) so the
-        # next casual_conv chat turn returns in micro-seconds instead
-        # of re-burning the 30s registry/skills/provider build.
-        # Bounded FIFO eviction keeps memory flat under heavy
-        # multi-session usage; the per-user MemoryGraph queried by
-        # cached memory-tool functions stays live (lookups happen at
-        # call time, not build time).
-        if _cache_key:
-            with _FIRST_TOOLS_CACHE_LOCK:
-                if (
-                    len(_FIRST_TOOLS_CACHE) >= _FIRST_TOOLS_CACHE_MAX
-                    and _cache_key not in _FIRST_TOOLS_CACHE
-                ):
-                    _FIRST_TOOLS_CACHE.pop(next(iter(_FIRST_TOOLS_CACHE)))
-                _FIRST_TOOLS_CACHE[_cache_key] = tools
-        _gt_mark('cache_save')
-
-        # Emit timing breakdown — DELTA between consecutive marks so each
-        # row shows that step's cost, not cumulative.  Output keyed by
-        # `[GET_TOOLS_TIMING]` for easy grep.
-        try:
-            _prev = 0.0
-            _parts = []
-            for _label, _t in _gt_steps:
-                _delta = _t - _prev
-                _parts.append(f"{_label}={_delta:.2f}s")
-                _prev = _t
-            app.logger.info(
-                "[GET_TOOLS_TIMING] total=%.2fs tools=%d  steps: %s",
-                _gt_steps[-1][1] if _gt_steps else 0.0,
-                len(tools),
-                "  ".join(_parts),
-            )
-        except Exception:
-            pass
-
         return tools
 
     else:
@@ -4851,8 +3258,6 @@ def get_tools(req_tool, is_first: bool = False):
 
 # Language dict — canonical in core/constants.py
 from core.constants import SUPPORTED_LANG_DICT  # noqa: E402
-from core.labeled_tool import labeled_tool, generic_label  # noqa: E402  # #508
-from core.peer_link.crossbar_publish import publish_chat_stage  # noqa: E402  # #508
 
 
 # ---------------------------------------------------------------------------
@@ -4962,81 +3367,6 @@ def _g12_finalize(prompt: str, teacher_response: str, student_future) -> None:
         pass
 
 
-def _pooled_post_with_refusal_check(api_url, json=None, app_logger=None, **kwargs):
-    """Post to llama-server and apply REFUSAL_OVERRIDE to the response.
-
-    Mirrors the dispatcher-side guard at speculative_dispatcher.py:548-559
-    so the langchain casual_conv path gets the same refusal-detection that
-    the speculative dispatcher already does — closes the gap revealed by
-    the 2026-05-13 09:55:34 IPL turn (request 301eeed0), where the draft
-    refused with "I don't have the 2026 IPL table yet" and the langchain
-    caller had no guard, so the refusal flowed straight to the user.
-
-    Feature-flagged via HEVOLVE_LANGCHAIN_REFUSAL_OVERRIDE — default ON.
-    Disable explicitly only if a downstream path proves problematic:
-        $env:HEVOLVE_LANGCHAIN_REFUSAL_OVERRIDE = "0"
-
-    When active AND the reply matches _REFUSAL_PATTERN, retries ONCE with
-    a forceful tool-use directive prepended to the user message.  The
-    directive tells the model not to refuse and to invoke a tool instead.
-    Both endpoints (DRAFT_GPT_API and GPT_API) point at the same 4B
-    Qwen3.5 on this machine, so the retry stays on the same wire — the
-    only thing that changes is the prompt's tone.
-    """
-    body = json or {}
-    response = pooled_post(api_url, json=body, **kwargs)
-    # Default ON — only explicit opt-out (0/false/no/off) skips the override.
-    if os.environ.get('HEVOLVE_LANGCHAIN_REFUSAL_OVERRIDE', '1').strip().lower() in ('0', 'false', 'no', 'off'):
-        return response
-    try:
-        from integrations.agent_engine.speculative_dispatcher import _REFUSAL_PATTERN
-    except Exception:
-        return response
-    try:
-        resp_json = response.json()
-        reply_text = ''
-        if isinstance(resp_json, dict):
-            choices = resp_json.get('choices') or []
-            if choices:
-                _msg = choices[0].get('message') or {}
-                reply_text = _msg.get('content') or ''
-            if not reply_text:
-                reply_text = resp_json.get('content') or ''
-    except Exception:
-        return response
-    if not reply_text or not _REFUSAL_PATTERN.search(reply_text):
-        return response
-    _logger = app_logger or app.logger
-    _logger.info(
-        "[REFUSAL-OVERRIDE-LANGCHAIN] draft refusal detected: %r — retrying with forced tool-use directive",
-        reply_text[:160],
-    )
-    original_messages = body.get('messages', [])
-    if not original_messages:
-        return response
-    original_content = original_messages[0].get('content') or ''
-    force_prefix = (
-        "[SYSTEM OVERRIDE — your previous attempt was a refusal "
-        "(\"I don't have...\" / \"I can't access...\" / \"that's after my training\"). "
-        "Do NOT refuse again. You have tools available — invoke ONE of them "
-        "via the agent JSON action format. If unsure, default to google_search "
-        "or crawl4ai for live/web data. Never assert data is unavailable "
-        "without first attempting a tool call.]\n\n"
-    )
-    retry_body = dict(body)
-    retry_body['messages'] = [{
-        'role': original_messages[0].get('role', 'user'),
-        'content': force_prefix + original_content,
-    }]
-    try:
-        retry_response = pooled_post(api_url, json=retry_body, **kwargs)
-        _logger.info("[REFUSAL-OVERRIDE-LANGCHAIN] retry posted, returning new response")
-        return retry_response
-    except Exception as _e:
-        _logger.warning("[REFUSAL-OVERRIDE-LANGCHAIN] retry POST failed: %s; returning original refusal", _e)
-        return response
-
-
 class CustomGPT(LLM):
     casual_conv: bool
 
@@ -5076,7 +3406,6 @@ class CustomGPT(LLM):
         app.logger.info(f"len---->{num_tokens}")
 
         app.logger.info(f"first time calling {len(prompt)}")
-        publish_chat_stage('generating', user_id=str(thread_local_data.get_user_id() or ''), request_id=str(thread_local_data.get_request_id() or ''))
 
         if self.count > 1 and thread_local_data.get_global_intent() != self.previous_intent:
             tools = get_tools(thread_local_data.get_global_intent())
@@ -5127,7 +3456,7 @@ class CustomGPT(LLM):
                     # :8081 via DRAFT_GPT_API. Falls back to GPT_API (4B)
                     # if the draft server isn't available.
                     _api = DRAFT_GPT_API or GPT_API
-                    response = _pooled_post_with_refusal_check(
+                    response = pooled_post(
                         _api,
                         json={
                             "model": "llama",
@@ -5146,7 +3475,7 @@ class CustomGPT(LLM):
                 else:
                     app.logger.info("Non casual conv")
                     start = time.time()
-                    response = _pooled_post_with_refusal_check(
+                    response = pooled_post(
                         GPT_API,
                         json={
                             "model": "llama",
@@ -5191,7 +3520,7 @@ class CustomGPT(LLM):
             except Exception as e:
                 app.logger.info(f"In except the exception is {e}")
                 start = time.time()
-                response = _pooled_post_with_refusal_check(
+                response = pooled_post(
                     GPT_API,
                     json={
                         "model": "llama",
@@ -5212,7 +3541,7 @@ class CustomGPT(LLM):
                         f"casual conv first call — routing to draft 0.8B")
                     start = time.time()
                     _api = DRAFT_GPT_API or GPT_API
-                    response = _pooled_post_with_refusal_check(
+                    response = pooled_post(
                         _api,
                         json={
                             "model": "llama",
@@ -5231,7 +3560,7 @@ class CustomGPT(LLM):
                     try:
                         app.logger.info("non casual conv")
                         start = time.time()
-                        response = _pooled_post_with_refusal_check(
+                        response = pooled_post(
                             GPT_API,
                             json={
                                 "model": "llama",
@@ -5267,7 +3596,7 @@ class CustomGPT(LLM):
                 app.logger.info(f"In except the exception is {e}")
                 start = time.time()
 
-                response = _pooled_post_with_refusal_check(
+                response = pooled_post(
                     GPT_API,
                     json={
                         "model": "llama",
@@ -5810,11 +4139,16 @@ def parse_link_for_crwalab(inp):
 
     def _publish_thinking(msg):
         """Push progress to UI via Crossbar thinking bubble."""
-        from core.peer_link.crossbar_publish import publish_thinking_trace
-        publish_thinking_trace(
-            text=msg, user_id=user_id, request_id=request_id,
-            bot_type='Agent',
-        )
+        try:
+            crossbar_msg = json.dumps({
+                "text": [msg], "priority": 49,
+                "action": "Thinking", "bot_type": "Agent",
+                "historical_request_id": [], "options": [], "newoptions": [],
+                "request_id": request_id,
+            })
+            publish_async(f'com.hertzai.hevolve.chat.{user_id}', crossbar_msg)
+        except Exception:
+            pass
 
     try:
         if link_type == 'pdf':
@@ -6238,69 +4572,9 @@ def parse_visual_context(inp: str):
         except Exception as e:
             app.logger.debug("Hive mesh vision offload not available: %s", e)
 
-        # Tier 3: Cloud MiniCPM fallback — gated through the canonical
-        # ConsentService so cloud egress always has a user-grant trail.
-        # Resolution order:
-        #   (a) HEVOLVE_VISION_CLOUD_FALLBACK=true env var → blanket
-        #       deploy-time grant (cloud/regional tiers where cloud IS
-        #       the local — see scripts/start_cloud.sh + start_regional.sh)
-        #   (b) get_vision_api() returns a non-default URL → user
-        #       configured a custom endpoint, that's their explicit opt-in
-        #   (c) ConsentService.check_consent(user_id, 'cloud_egress',
-        #       scope='vision') == True → user previously granted
-        #   (d) Otherwise: ConsentService.request_consent(...) creates a
-        #       pending row and emits a notification (consent.request
-        #       topic → frontend renders a consent dialog).  Return a
-        #       holding message; once user grants, NEXT vision request
-        #       proceeds without prompting.  Never silently uploads.
+        # Tier 3: Cloud MiniCPM fallback
         from core.config_cache import get_vision_api
-        _user_vision_url = (get_vision_api() or '').strip()
-        _allow_cloud = (
-            os.environ.get('HEVOLVE_VISION_CLOUD_FALLBACK', '').strip().lower()
-            in ('1', 'true', 'yes', 'on')
-        )
-        if not _user_vision_url and not _allow_cloud:
-            # Privacy-aware auto-grant: never block in the name of
-            # privacy.  ConsentService.auto_grant_with_notice silently
-            # creates a granted record on first use AND emits a
-            # 'consent.auto_granted' notification so the user knows
-            # cloud was used and can revoke with one tap.  Honors prior
-            # explicit revoke — if the user previously revoked, returns
-            # False and we refuse rather than silently re-grant.
-            _consent_ok = True
-            try:
-                from integrations.social.consent_service import ConsentService
-                from integrations.social.models import db_session
-                with db_session(commit=True) as _consent_db:
-                    _consent_ok = ConsentService.auto_grant_with_notice(
-                        _consent_db, str(user_id), 'cloud_egress',
-                        scope='vision',
-                        reason=(
-                            "Local Qwen3-VL isn't running on this device; "
-                            "your camera frame was sent to the cloud "
-                            "vision endpoint to answer your question.  "
-                            "Tap to revoke if you'd rather wait for the "
-                            "local model to come up."
-                        ),
-                    )
-            except Exception as _consent_err:
-                # Consent system unavailable — fail OPEN per the
-                # "nothing fails in name of privacy" principle.  Audit
-                # log captures the bypass so it's not silent.
-                app.logger.warning(
-                    "Visual QA: consent system unavailable (%s) — "
-                    "proceeding with cloud fallback (auto-grant fail "
-                    "open).", _consent_err)
-                _consent_ok = True
-            if not _consent_ok:
-                # ONLY path that refuses: user explicitly revoked the
-                # cloud_egress[vision] consent earlier.  Re-grant
-                # requires a fresh user action (settings UI).
-                return ("Vision cloud fallback was previously turned off "
-                        "in your settings; re-enable it under Privacy → "
-                        "Cloud Egress to use vision when local isn't "
-                        "available.")
-        url = _user_vision_url or "http://azurekong.hertzai.com:8000/minicpm/upload"
+        url = get_vision_api() or "http://azurekong.hertzai.com:8000/minicpm/upload"
         payload = {'prompt': prompt_text}
         fh = open(image_path, 'rb')
         try:
@@ -6521,7 +4795,7 @@ if autogen is not None:
             name=f"user_proxy_{user_id}",
             human_input_mode="NEVER",
             is_termination_msg=_is_terminate_msg,
-            code_execution_config={"work_dir": get_coding_workspace_dir(), "use_docker": False}
+            code_execution_config={"work_dir": "coding", "use_docker": False}
         )
 
         return assistant, user_proxy
@@ -6731,15 +5005,9 @@ else:
     AgentInteractionIngestor = None  # noqa: N816
 
 
-from core.llm_outbound_logger import with_source as _with_source
-
-
 # main function
-@_with_source('langchain.chat')
 def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang):
     start_time = time.time()
-    _stage_req_id = str(thread_local_data.get_request_id() or '')
-    publish_chat_stage('loading_context', user_id=str(user_id), request_id=_stage_req_id)
     # casual_conv is the draft classifier's `is_casual` flag propagated
     # from the /chat handler — when True we skip the action+profile
     # fetch entirely because a casual acknowledgement doesn't consult
@@ -6757,21 +5025,11 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     llm = CustomGPT(casual_conv=casual_conv)
     app.logger.info(f"query------> {query}")
     memory_start_time = time.time()
-    publish_chat_stage('loading_memory', user_id=str(user_id), request_id=_stage_req_id)
     memory = get_memory(user_id=user_id)
     app.logger.info("time taken by get_memory %s seconds",
                     time.time() - memory_start_time)
 
     tools_start_time = time.time()
-    publish_chat_stage('loading_tools', user_id=str(user_id), request_id=_stage_req_id)
-    # Timing instrumentation (#185) — splits the previously-monolithic
-    # "tools_start_time → get_tools_loaded" window so we can see whether
-    # publish_chat_stage or get_tools is the time sink.
-    _pcs_done_time = time.time()
-    app.logger.info(
-        "[GET_TOOLS_TIMING] publish_chat_stage('loading_tools'): %.2fs",
-        _pcs_done_time - tools_start_time,
-    )
     # Skip tool loading for casual_conv=True — the 0.8B draft handles
     # casual chat without tools, saving ~2.5s of tool registry loading.
     if casual_conv:
@@ -6963,7 +5221,6 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
         metadata=metadata
     )
     agent_chain_start_time = time.time()
-    publish_chat_stage('thinking', user_id=str(user_id), request_id=_stage_req_id)
     # G10: Feed every intra-agent tool step into WorldModelBridge so the
     # inner reasoning loop (not just the final answer) becomes training data.
     _ingestor_callbacks = None
@@ -7054,7 +5311,6 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
         raise
     app.logger.info("time taken by chain agent run %s seconds",
                     time.time() - agent_chain_start_time)
-    publish_chat_stage('finalizing', user_id=str(user_id), request_id=_stage_req_id)
 
     # G13 (success-side): empty / trivial / fallback replies are ALSO weak
     # text outputs worth tagging for router adjustment.  We only flag truly
@@ -7165,270 +5421,23 @@ def _get_user_lock(user_key):
         return _user_locks[user_key]
 
 
-def _review_proposed_plan(plan, max_rounds_remaining):
-    """StatusVerifier-style auto-reviewer for HART OS autonomous flow.
-
-    Single-shot local-LLM call against the same Qwen3-VL endpoint that
-    gather_info uses — same model competence as the plan author.  Applies
-    quality gates and returns ('approved', None) or
-    ('needs_refinement', feedback_text).
-
-    Quality gates (mirrors StatusVerifier verdict shape):
-      1. flows[0].actions[] has >= 5 atomic steps for non-trivial tasks
-      2. Browser/click/type/screenshot/post actions invoke
-         execute_windows_or_android_command
-      3. No banned phrases: 'ask the user', 'TODO', '...'
-      4. Steps in logical order (open before click, login before post)
-      5. Tool names in the registered catalog
-
-    Fail-open: if the reviewer endpoint is down, returns 'approved' so a
-    reviewer outage doesn't block the autonomous flow indefinitely.  The
-    autogen Helper team applies stricter checks again at execution time.
-    """
-    try:
-        from core.port_registry import get_local_llm_url
-        review_prompt = (
-            "You are HART OS StatusVerifier reviewing an agent plan.\n"
-            "Quality gates:\n"
-            "  1. flows[0].actions has >= 5 atomic steps for non-trivial tasks.\n"
-            "  2. Every action mentioning browser/click/type/screenshot/post/"
-            "open/navigate MUST invoke 'execute_windows_or_android_command'.\n"
-            "  3. No banned phrases: 'ask the user', 'TODO', 'etc.', '...'\n"
-            "  4. Steps in logical order (open before click, login before post).\n"
-            "  5. Tool names match the registered catalog.\n\n"
-            "Plan to review (JSON):\n"
-            + json.dumps(plan, indent=2)[:6000]  # cap to keep ctx small
-            + "\n\nRespond with ONLY a JSON object:\n"
-            "  {\"status\":\"approved\"} if all gates pass\n"
-            "  {\"status\":\"needs_refinement\",\"feedback\":\"specific fix needed\"} otherwise\n"
-            "ASCII only.  No prose.  Start with { end with }."
-        )
-        # Reuse pooled_post that gather_info uses; same endpoint
-        r = pooled_post(
-            get_local_llm_url() + '/chat/completions',
-            json={
-                'model': 'Qwen3-VL-4B-Instruct',
-                'messages': [{'role': 'user', 'content': review_prompt}],
-                'temperature': 0.0,
-                'max_tokens': 256,
-            },
-            timeout=60,
-        )
-        text = r.json()['choices'][0]['message']['content']
-        verdict = retrieve_json(text)
-        if isinstance(verdict, dict):
-            if verdict.get('status', '').lower() == 'approved':
-                app.logger.info('Plan review: approved')
-                return ('approved', None)
-            fb = verdict.get('feedback') or 'plan needs more atomic detail'
-            app.logger.info(f'Plan review: needs_refinement — {fb[:200]}')
-            return ('needs_refinement', fb)
-        # Couldn't parse — fail-open
-        app.logger.debug('Plan review: unparseable, fail-open')
-        return ('approved', None)
-    except Exception as e:
-        # Reviewer outage — fail-open (Helper team's strict checks still apply
-        # at execution time).  Don't block flywheel on reviewer health.
-        app.logger.warning(f'Plan review failed (fail-open): {e}')
-        return ('approved', None)
-
-
 def _autonomous_gather_info(user_id, description, prompt_id):
-    """Run gather_info autonomously with HART OS peer-review pattern.
+    """Run gather_info autonomously — LLM answers all questions itself.
 
-    Four-stage flow (matches gather_agentdetails.py PLAN_FIRST prompt
-    + StatusVerifier auto-review wired in this function):
-
-      STAGE 1: gather_info emits proposed_plan with atomic steps in
-        flows[].actions[].
-
-      STAGE 2 (auto, no human in loop): _review_proposed_plan calls
-        a single-shot StatusVerifier-style LLM review against quality
-        gates.  Returns 'approved' or 'needs_refinement' + feedback.
-
-      STAGE 3 (auto): if needs_refinement, send feedback to gather_info
-        which refines and re-emits.  Loop up to 3 rounds.  After 3
-        rounds, escalate (currently auto-approve with metadata flag;
-        future: FCM push to Android via the path restored in this
-        session for human verdict with 30-min timeout).
-
-      STAGE 4: on approved, send 'approved' to gather_info → status
-        becomes 'completed' → persona JSON saved → next /chat call
-        dispatches to the autogen multi-agent team (Helper + Executor
-        + StatusVerifier) which executes the atomic steps using
-        execute_windows_or_android_command and saves per-step recipe
-        files for future REUSE-mode replay.
-
-    This closes the autonomous loop without a human in the path —
-    addressing the gap exposed on 2026-05-16 where /chat with
-    create_agent=true stalled at 'Review Mode' because no approver
-    was wired.  StatusVerifier is the canonical reviewer agent
-    (helper.py:2025) and the same Qwen3-VL endpoint that gather_info
-    uses handles the review verdict at zero marginal cost.
+    In autonomous mode, autogen's UserProxyAgent has max_consecutive_auto_reply=10
+    and the assistant's system_message is enriched with instructions to self-complete.
     """
     from gather_agentdetails import gather_info
     response = gather_info(user_id, description, prompt_id, autonomous=True)
 
-    # Auto-review + refinement loop (no human in path)
-    review_rounds = 0
-    MAX_REVIEW_ROUNDS = 3
-    while review_rounds < MAX_REVIEW_ROUNDS:
-        try:
-            new_response = response.replace('true', 'True').replace('false', 'False')
-            parsed = retrieve_json(new_response)
-            if isinstance(parsed, list):
-                for item in reversed(parsed):
-                    if isinstance(item, dict) and 'status' in item:
-                        parsed = item
-                        break
-                else:
-                    parsed = {}
-            if not isinstance(parsed, dict):
-                break
-
-            _status = (parsed.get('status') or '').lower()
-
-            if _status == 'completed':
-                # Already approved + finalized (single-shot success)
-                break
-
-            if _status == 'proposed_plan':
-                # Stage plan for audit + run auto-review
-                parsed['prompt_id'] = prompt_id
-                parsed['creator_user_id'] = user_id
-                try:
-                    _plan_path = os.path.join(
-                        PROMPTS_DIR, f'{prompt_id}.proposed.r{review_rounds}.json')
-                    os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
-                    with open(_plan_path, 'w') as f:
-                        json.dump(parsed, f)
-                    app.logger.info(
-                        f'Plan round {review_rounds} staged at {_plan_path}')
-                except Exception as e:
-                    app.logger.warning(f'Plan stage write failed: {e}')
-
-                verdict, feedback = _review_proposed_plan(
-                    parsed, MAX_REVIEW_ROUNDS - review_rounds)
-
-                if verdict == 'approved':
-                    # Tell gather_info we approve → it re-emits status=completed
-                    app.logger.info(
-                        f'Plan approved by StatusVerifier after '
-                        f'{review_rounds + 1} rounds, finalizing')
-                    response = gather_info(user_id, 'approved',
-                                           prompt_id, autonomous=True)
-                    continue  # re-parse on next iteration; should be completed
-                else:
-                    # Send feedback to gather_info for refinement
-                    review_rounds += 1
-                    response = gather_info(user_id, feedback,
-                                           prompt_id, autonomous=True)
-                    continue
-            # Unknown status — exit the auto-review loop, fall to legacy below
-            break
-        except (json.JSONDecodeError, AttributeError, Exception) as e:
-            app.logger.debug(
-                f'Auto-review round {review_rounds} parse error: {e}')
-            break
-
-    # After MAX_REVIEW_ROUNDS without convergence, escalate by force-approving
-    # the latest plan with metadata flag (future: FCM push to Android, wait
-    # 30 min for human verdict, fall back to auto-approve on timeout).
-    if review_rounds >= MAX_REVIEW_ROUNDS:
-        app.logger.warning(
-            f'Plan review hit {MAX_REVIEW_ROUNDS} rounds without '
-            f'convergence — escalating to auto-approve with '
-            f'metadata flag auto_approved_timeout=true')
-        try:
-            response = gather_info(user_id, 'approved (escalated after 3 review rounds)',
-                                   prompt_id, autonomous=True)
-        except Exception as e:
-            app.logger.error(f'Escalation gather_info failed: {e}')
-
-    # Single-shot: LLM should emit a complete plan on first call.
-    # If status is "proposed_plan" we return the plan to the peer
-    # reviewer.  If "completed" we save + dispatch.  Anything else
-    # (including stale "pending" Q&A behavior) falls back to the
-    # legacy partial-config rescue at end of this function.
-    try:
-        new_response = response.replace('true', 'True').replace('false', 'False')
-        parsed = retrieve_json(new_response)
-        if isinstance(parsed, list):
-            for item in reversed(parsed):
-                if isinstance(item, dict) and 'status' in item:
-                    parsed = item
-                    break
-            else:
-                parsed = {}
-
-        if isinstance(parsed, dict):
-            _status = (parsed.get('status') or '').lower()
-
-            if _status == 'proposed_plan':
-                # Stash the plan so the next /chat (with "approved" /
-                # feedback) can refine; surface it to the peer reviewer.
-                parsed['prompt_id'] = prompt_id
-                parsed['creator_user_id'] = user_id
-                _plan_path = os.path.join(
-                    PROMPTS_DIR, f'{prompt_id}.proposed.json')
-                try:
-                    os.makedirs(os.path.dirname(_plan_path), exist_ok=True)
-                    with open(_plan_path, 'w') as f:
-                        json.dump(parsed, f)
-                    app.logger.info(
-                        f'Proposed plan staged at {_plan_path} '
-                        f'awaiting peer review')
-                except Exception as e:
-                    app.logger.warning(f'Could not stage proposed plan: {e}')
-                # Return the plan as JSON string so /chat caller can
-                # render the atomic steps for the reviewing peer agent.
-                return json.dumps({
-                    'status': 'proposed_plan',
-                    'plan': parsed,
-                    'instructions_for_reviewer': (
-                        'Review the atomic steps in plan.flows[].actions[]. '
-                        'Reply with "approved" to commit and dispatch to '
-                        'the autogen execution team, or reply with feedback '
-                        'text to refine the plan.'),
-                })
-
-            if _status == 'completed':
-                # Save final agent config and dispatch
-                parsed['prompt_id'] = prompt_id
-                parsed['creator_user_id'] = user_id
-                name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
-                with open(name, 'w') as f:
-                    json.dump(parsed, f)
-                app.logger.info(f'Autonomous agent config saved to {name}')
-                # Sync to cloud DB so prompt_id matches
-                try:
-                    pooled_post(
-                        f'{DB_URL}/createpromptlist',
-                        json={'listprompts': [{
-                            'prompt_id': prompt_id,
-                            'prompt': parsed.get('goal', ''),
-                            'user_id': user_id,
-                            'name': parsed.get('name', ''),
-                            'is_active': True,
-                            'image_url': parsed.get('image_url', ''),
-                        }]},
-                        timeout=5)
-                except Exception as e:
-                    app.logger.debug(f"Cloud sync failed (non-fatal): {e}")
-                return 'Agent details gathered autonomously. Moving to review.'
-    except (json.JSONDecodeError, AttributeError, Exception) as e:
-        app.logger.debug(f'Autonomous gather plan-parse: {e}')
-
-    # Legacy fallback only — old prompt would loop with "proceed".
-    # We keep the loop but cap at fewer iterations now that plan-first
-    # mode is primary; this only fires when an LLM ignores the new
-    # PLAN_FIRST instructions (e.g. older Qwen variants).
-    max_iterations = 5
+    # Loop until completed (autogen handles it internally when max_auto_reply > 0)
+    max_iterations = 15
     iteration = 0
     while iteration < max_iterations:
         try:
             new_response = response.replace('true', 'True').replace('false', 'False')
             parsed = retrieve_json(new_response)
+            # Handle list-of-dicts response from LLM
             if isinstance(parsed, list):
                 for item in reversed(parsed):
                     if isinstance(item, dict) and 'status' in item:
@@ -7437,12 +5446,14 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 else:
                     parsed = {}
             if isinstance(parsed, dict) and parsed.get('status', '').lower() == 'completed':
+                # Save agent config
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
                 name = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
                 with open(name, 'w') as f:
                     json.dump(parsed, f)
                 app.logger.info(f'Autonomous agent config saved to {name}')
+                # Sync to cloud DB so prompt_id matches
                 try:
                     pooled_post(
                         f'{DB_URL}/createpromptlist',
@@ -7638,8 +5649,8 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
         # or draft-first early returns, so we save here — the ONE place every
         # reply goes through. The user prompt comes via the 'user_prompt' kwarg
         # from callers that have it (most /chat paths do).
-        _prompt = payload.pop('user_prompt', '')
         try:
+            _prompt = payload.pop('user_prompt', '')
             if _prompt and response_text:
                 _mem = get_memory(user_id=user_id)
                 if _mem and hasattr(_mem, 'save_context'):
@@ -7650,41 +5661,6 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                     )
         except Exception as _mem_err:
             app.logger.debug(f"_chat_reply: memory save skipped: {_mem_err}")
-
-        # U1-U8 cross-device mirroring (task #389): submit persist + WAMP
-        # publish for both sides of the turn to the chat_messages
-        # executor — the chat response is already serialized and on its
-        # way to the client; the DB write and chat.new fan-out must not
-        # add latency to this path.  On worker saturation we fall back
-        # to inline (see persist_and_publish_async).  request_id links
-        # the (user, assistant) pair for downstream dedup.  device_id /
-        # agent_id / lang / attachments are optional; callers pass them
-        # via **payload when known.
-        try:
-            from integrations.social import chat_messages as _cm
-            _dev = payload.get('device_id')
-            _agent = payload.get('agent_id')
-            _prompt_id = payload.get('prompt_id')
-            _lang_hint = (payload.get('preferred_lang')
-                          or payload.get('language') or _lang)
-            _atts = payload.get('attachments')
-            _rid = str(request_id) if request_id is not None else None
-            if _prompt:
-                _cm.persist_and_publish_async(
-                    str(user_id), 'user', _prompt,
-                    agent_id=_agent, prompt_id=_prompt_id,
-                    request_id=_rid, device_id=_dev,
-                    lang=_lang_hint, attachments=_atts,
-                )
-            _cm.persist_and_publish_async(
-                str(user_id), 'assistant', response_text,
-                agent_id=_agent, prompt_id=_prompt_id,
-                request_id=_rid, device_id=_dev,
-                lang=_lang_hint, attachments=None,
-            )
-        except Exception as _chat_sync_err:
-            app.logger.debug(
-                f"_chat_reply: chat-sync mirror skipped: {_chat_sync_err}")
 
     payload['response'] = response_text
     return jsonify(payload)
@@ -7775,12 +5751,6 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
                 # Also push via SSE directly — publish_async → MessageBus/WAMP doesn't
                 # reach SSE clients, so the unified helper fans out to the Nunba
                 # main.py SSE broker. See core/platform/events.broadcast_sse_safe.
-                # NOTE: publish_async's generic SSE fan-out at line ~2014 SKIPS
-                # action='TTS' specifically because routing TTS through both
-                # paths produced double-audio (the SPA's request_id-keyed dedup
-                # missed cross-transport duplicates).  TTS owns this explicit
-                # call; everything else (thinking traces, channel events) is
-                # auto-handled inside publish_async.
                 from core.platform.events import broadcast_sse_safe
                 if not broadcast_sse_safe('message', _tts_payload, user_id=user_id):
                     app.logger.debug("TTS SSE: broadcast_sse_event unavailable (Nunba main not loaded)")
@@ -8152,46 +6122,21 @@ def chat():
             _record_lifecycle('Review Mode', user_id, new_prompt_id,
                               f'Agentic auto-creation: {prompt[:100]}')
             _push_workflow_flowchart(user_id, new_prompt_id, request_id)
-            # Canonical reply path: _chat_reply fires TTS synth AND the
-            # chat_messages.persist_and_publish_async fan-out so the
-            # bubble renders on every Nunba surface subscribed to
-            # com.hertzai.hevolve.chat.new.<uid> (Demopage / Agent page
-            # / AgentChatPage / RN).  Before this fix the raw jsonify
-            # bypassed both legs, producing the audio-without-bubble
-            # asymmetry the user reported on the Agent creation page.
-            return _chat_reply(
-                user_id, request_id, auto_response,
-                intent=['FINAL_ANSWER'],
-                Agent_status='Review Mode',
-                autonomous_creation=True,
-                prompt_id=new_prompt_id,
-                req_token_count=0, res_token_count=0,
-                history_request_id=[],
-                user_prompt=prompt,
-            )
+            return jsonify({
+                'response': auto_response,
+                'intent': ['FINAL_ANSWER'],
+                'Agent_status': 'Review Mode',
+                'autonomous_creation': True,
+                'prompt_id': new_prompt_id,
+                'req_token_count': 0,
+                'res_token_count': 0,
+                'history_request_id': [],
+            })
 
     if prompt_id:
-        # Recipe pull-on-demand: when prompt_id has no local recipe
-        # but the cloud has one (cross-device user), pull it before
-        # falling into the create-mode branch.  Best-effort - if cloud
-        # is offline / blob missing / schema mismatch, returns False
-        # and we proceed to create-mode as before.  Closes the
-        # cross-device gap from the 2026-05-04 Speech Therapy
-        # silent-fallback incident.
-        _prompt_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
-        if not os.path.exists(_prompt_path):
-            try:
-                from core.recipe_sync import pull_recipe
-                if pull_recipe(PROMPTS_DIR, prompt_id, str(user_id)):
-                    app.logger.info(
-                        f'recipe_sync: pulled recipe bundle for '
-                        f'prompt_id={prompt_id} from cloud - REUSE path '
-                        f'now reachable')
-            except Exception as e:
-                app.logger.debug(f'recipe_sync: pull skipped: {e}')
-
         # System agents (like Nunba) route directly to langchain casual chat
         # instead of entering gather_info/CREATE mode
+        _prompt_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
         if os.path.exists(_prompt_path):
             try:
                 with open(_prompt_path, 'r') as _pf:
@@ -8238,21 +6183,11 @@ def chat():
                         _touch_agent_timestamp(_ak)
                 else:
                     app.logger.info('0 Recipe JSON doesnot EXISTS')
-                    # #485 — honor UI create_agent flag; don't force True from
-                    # file-state alone (broke chat-mode for finished agents).
-                    if create_agent or autonomous:
-                        _ak = f'{user_id}_{prompt_id}'
-                        review_agents[_ak] = True
-                        conversation_agent[_ak] = False
-                        _touch_agent_timestamp(_ak)
-                    else:
-                        try:
-                            with open(os.path.join(PROMPTS_DIR, f'{prompt_id}.json'), 'r') as _gpf:
-                                _gate_meta = json.load(_gpf)
-                            if _gate_meta.get('flows') and _gate_meta['flows'][0].get('system_prompt'):
-                                custom_prompt = _gate_meta['flows'][0]['system_prompt']
-                        except Exception as _meta_err:
-                            app.logger.warning("L1 (#485): persona read failed for prompt_id=%r: %s", prompt_id, _meta_err)
+                    create_agent = True
+                    _ak = f'{user_id}_{prompt_id}'
+                    review_agents[_ak] = True
+                    conversation_agent[_ak] = False
+                    _touch_agent_timestamp(_ak)
 
             else:
                 app.logger.info('GATHER JSON doesnot EXISTS')
@@ -8282,29 +6217,12 @@ def chat():
         try:
             from integrations.agent_engine.speculative_dispatcher import get_speculative_dispatcher
             dispatcher = get_speculative_dispatcher()
-            # agent_bound=True when prompt_id refers to a real agent on
-            # disk — the dispatcher uses this signal to never let the
-            # 0.8B draft short-circuit the specialist on trivial Q&A.
-            _agent_bound = bool(prompt_id)
-            # NEVER derive prompt_id from request_id.  A prior version
-            # passed ``str(request_id or 'anon')`` as a fallback to keep
-            # the dispatcher's partition keys non-empty, but that
-            # synthetic value leaked through ``_dispatch_expert_langchain``
-            # into the expert reroute's /chat payload and was
-            # misinterpreted as a real on-disk agent identifier — causing
-            # ``_autonomous_gather_info`` to mint a *second* agent named
-            # after the request_id (live evidence 2026-05-12 request
-            # 66c63859-… spawned ``prompts/66c63859-…json`` alongside
-            # the legitimate ``prompts/78570931871.json``).  Pass None;
-            # the dispatcher handles None internally via
-            # ``speculation_id`` for any keying that needs a string.
             result = dispatcher.dispatch_draft_first(
                 prompt, str(user_id),
-                str(prompt_id) if prompt_id else None,
+                str(prompt_id) if prompt_id else str(request_id or 'anon'),
                 agent_persona=custom_prompt or None,
                 preferred_lang=preferred_lang,
                 user_pref=intelligence_preference,
-                agent_bound=_agent_bound,
             )
             # Only commit when the dispatcher actually produced a reply.
             # no_draft_model / circuit breaker / guardrail block all leave
@@ -8358,52 +6276,6 @@ def chat():
                     # Fall through — do NOT return the draft standby
                     # reply; the tool-based path below will run and the
                     # VLM tool will produce a grounded answer.
-                elif (result.get('delegate') in ('local', 'hive')
-                      and not result.get('is_casual')
-                      and not result.get('is_create_agent')):
-                    # Draft self-assessed: this is a non-casual TASK
-                    # that needs more capability than the 0.8B has
-                    # (delegate='local' = bigger local model + tools;
-                    # delegate='hive' = tier escalation needed).  The
-                    # user's design intent (2026-05-07): "only if local
-                    # needs help it shd go via hive" — so try LOCAL
-                    # autogen execution first; hive escalation is
-                    # downstream via dispatch.py if the local agent
-                    # can't satisfy.
-                    #
-                    # Pre-fix this fell through to the `else` standby
-                    # reply ("I'll gather that research..."), promising
-                    # work that never happened.  Witnessed 2026-05-07
-                    # 10:24:16 with "open chrome and research AI
-                    # papers" — telemetry showed delegate='hive',
-                    # is_casual=False but reply was the draft's 102-
-                    # char polite ack and no execution kicked off.
-                    #
-                    # Setting autonomous=True (same shape as #105)
-                    # routes to:
-                    #   1. find_matching_agent (catalog 1213+ agents)
-                    #   2. If matched + recipe exists → chat_agent (REUSE)
-                    #   3. If no match → _autonomous_gather_info auto-
-                    #      fills identity (or partial-salvage at
-                    #      hart_intelligence_entry.py:5817), then
-                    #   4. recipe() runs autogen tool group locally
-                    #      (visual_execution / call_visual_task / etc).
-                    #   5. Hive escalation if step 4 can't satisfy
-                    #      (downstream in dispatch.py — separate path).
-                    app.logger.info(
-                        f"draft classifier: delegate="
-                        f"{result.get('delegate')!r} "
-                        f"is_casual=False — routing to local autogen "
-                        f"CREATE+execute (hive remains downstream "
-                        f"fallback if local can't satisfy)"
-                    )
-                    create_agent = True
-                    autonomous = True
-                    _is_agentic_orchestration = True
-                    # Fall through — do NOT return draft standby; the
-                    # create_agent branch below runs in this same
-                    # request and dispatches to find_matching_agent /
-                    # _autonomous_gather_info / recipe().
                 else:
                     return _chat_reply(
                         user_id, request_id, result['response'],
@@ -9070,72 +6942,6 @@ def time_agent():
     return jsonify({'response':f'{res}'}), 200
 
 
-@app.route('/api/vlm/stop', methods=['POST'])
-@require_local_or_token_csrf_safe
-def vlm_stop():
-    """Halt an in-progress VLM computer-use loop for a (user, prompt).
-
-    Ports OmniParser/omnitool/gradio/agentic_rpc.py:/stop into HARTOS
-    proper.  When the user clicks Stop in Nunba's indicator window,
-    the request lands here, the loop's stop flag is set, and the
-    next iteration of run_local_agentic_loop exits cleanly with
-    exit_reason='stopped' before another action runs on the screen.
-
-    Auth: ``@require_local_or_token_csrf_safe``.  Nunba's bundled install
-    POSTs here from desktop/indicator_window.py over localhost without a
-    JWT — the decorator allows that.  Remote callers (production HARTOS
-    on regional/central tier) must send ``Authorization: Bearer
-    <HARTOS_API_TOKEN>``.  Without this gate, any unauthenticated
-    network client could bulk-halt another user's VLM sessions.
-
-    The ``_csrf_safe`` variant adds an Origin/Referer header check on
-    top of the localhost gate, closing the same-machine
-    cross-origin-browser-CSRF vector: a malicious page on a different
-    origin in the same browser cannot trigger a Stop on the user's
-    active VLM session.  Native desktop callers (the indicator window)
-    don't send Origin/Referer at all, so they pass through unaffected.
-
-    Body (JSON):
-        {"user_id": "<uid>", "prompt_id": "<pid>"}
-    Response:
-        {"status": "stopped"|"no_active_session", "user_id", "prompt_id"}
-
-    Empty body / missing prompt_id → bulk-stop every active session
-    for the given user_id.  Empty user_id is rejected (bulk-stop
-    across all users would be a foot-gun).
-    """
-    data = request.get_json(silent=True) or {}
-    user_id = data.get('user_id')
-    prompt_id = data.get('prompt_id')
-
-    if not user_id:
-        return jsonify({'error': 'user_id required'}), 400
-
-    from integrations.vlm.local_loop import (
-        request_stop, list_active_sessions,
-    )
-
-    if prompt_id:
-        found = request_stop(str(user_id), str(prompt_id))
-        return jsonify({
-            'status': 'stopped' if found else 'no_active_session',
-            'user_id': str(user_id),
-            'prompt_id': str(prompt_id),
-        }), 200
-
-    # Bulk-stop: every session for this user_id
-    stopped = []
-    for uid, pid in list_active_sessions():
-        if uid == str(user_id):
-            if request_stop(uid, pid):
-                stopped.append({'user_id': uid, 'prompt_id': pid})
-    return jsonify({
-        'status': 'stopped' if stopped else 'no_active_session',
-        'user_id': str(user_id),
-        'stopped_sessions': stopped,
-    }), 200
-
-
 @app.route('/visual_agent',methods=['POST'])
 def visual_agent():
     app.logger.info('GOT REQUEST IN Visual AGENT API')
@@ -9402,38 +7208,9 @@ def _create_social_agent_from_prompt(user_id, prompt_id):
 # Local-first Prompt CRUD (syncs to cloud DB)
 # ═══════════════════════════════════════════════════════════════
 
-def _merge_prompts_with_cloud(local_prompts: list, cloud_url: str) -> list:
-    """Append cloud prompts to ``local_prompts``, dedup by prompt_id.
-
-    Local-first: when the same prompt_id exists in both, the local copy
-    is kept (it carries the newer recipe payload + filesystem-side
-    metadata).  Cloud failures are swallowed so a flaky DB never
-    breaks the local-only listing — same best-effort contract both
-    /prompts and /prompts/public have always offered.
-
-    Single source of truth for the merge so /prompts (user-scoped) and
-    /prompts/public (catalogue) cannot drift in dedup logic, error
-    handling, or the 'cloud'/'has_recipe' field defaults.
-    """
-    local_ids = {str(p.get('prompt_id', '')) for p in local_prompts}
-    try:
-        res = pooled_get(cloud_url, timeout=5)
-        if res.status_code == 200:
-            for item in (res.json() or []):
-                if str(item.get('prompt_id', '')) in local_ids:
-                    continue
-                item['source'] = 'cloud'
-                item.setdefault('has_recipe', False)
-                local_prompts.append(item)
-    except Exception:
-        pass
-    return local_prompts
-
-
 @app.route('/prompts', methods=['GET'])
 def get_prompts():
-    """List prompts for a user.  Local files (filtered by creator) merged
-    with the user's cloud-side prompts via _merge_prompts_with_cloud."""
+    """List prompts for a user. Local-first, cloud DB fallback."""
     req_user_id = request.args.get('user_id', '')
     if not req_user_id:
         return jsonify({'error': 'user_id required'}), 400
@@ -9466,24 +7243,27 @@ def get_prompts():
                 except Exception:
                     continue
 
-    # 2. Merge in cloud-only agents the user owns on hevolve.ai —
-    # the local store doesn't know about agents the user created from
-    # another device.  Powers Nunba's "Hybrid" intelligence preference.
-    # MUST use CENTRAL_DB_URL not DB_URL — in bundled Nunba mode DB_URL
-    # collapses to http://localhost:5000 (this same Flask process), so
-    # merging would just hit our own /getprompt_onlyuserid handler and
-    # see the same local prompts again — silent no-op.
-    if CENTRAL_DB_URL:
-        _merge_prompts_with_cloud(
-            prompts,
-            f'{CENTRAL_DB_URL}/getprompt_onlyuserid/?user_id={req_user_id}')
+    # 2. Fallback: try cloud DB if no local results
+    if not prompts:
+        try:
+            res = pooled_get(
+                f'{DB_URL}/getprompt_onlyuserid/?user_id={req_user_id}',
+                timeout=5)
+            if res.status_code == 200:
+                cloud_data = res.json()
+                for item in cloud_data:
+                    item['source'] = 'cloud'
+                    item['has_recipe'] = False
+                prompts = cloud_data
+        except Exception:
+            pass
 
     return jsonify(prompts)
 
 
 @app.route('/prompts/public', methods=['GET'])
 def get_public_prompts():
-    """Return all public prompts/agents.  Local-first, cloud-merge.
+    """Return all public prompts/agents. Local-first, cloud DB fallback.
     Equivalent to the legacy /getprompt_all/ cloud endpoint."""
     prompts = []
 
@@ -9515,12 +7295,18 @@ def get_public_prompts():
                 except Exception:
                     continue
 
-    # 2. Merge in cloud-only public agents.  Same central-vs-local-DB_URL
-    # rationale as /prompts above — DB_URL is localhost in bundled mode
-    # and would no-op the merge.
-    if CENTRAL_DB_URL:
-        _merge_prompts_with_cloud(
-            prompts, f'{CENTRAL_DB_URL}/getprompt_all/')
+    # 2. Also fetch from cloud DB to get remote-only agents
+    try:
+        res = pooled_get(f'{DB_URL}/getprompt_all/', timeout=5)
+        if res.status_code == 200:
+            cloud_data = res.json()
+            local_ids = {str(p['prompt_id']) for p in prompts}
+            for item in cloud_data:
+                if str(item.get('prompt_id', '')) not in local_ids:
+                    item['source'] = 'cloud'
+                    prompts.append(item)
+    except Exception:
+        pass
 
     return jsonify(prompts)
 
@@ -9617,169 +7403,6 @@ def create_prompts():
         app.logger.debug(f"Cloud sync failed (non-fatal): {e}")
 
     return jsonify({'success': True, 'saved': saved})
-
-
-# ───────────────────────── Recipe sync endpoints ─────────────────────
-# Cross-device sync for recipe-file BUNDLES (the {id}.json + flow +
-# personality + per-action recipes), distinct from /createpromptlist
-# which only syncs metadata.  See core/recipe_sync.py for the
-# canonical wire envelope.  Closes the cross-device gap that caused
-# the 2026-05-04 Speech Therapy silent fallback.
-
-# In-process recipe blob store (cloud tier installs override via
-# DB-backed implementation; flat installs fine with on-disk).
-_RECIPE_BLOB_DIR = os.path.join(PROMPTS_DIR, '..', 'recipe_blobs')
-
-
-@app.route('/prompts/sync', methods=['POST'])
-def upload_recipe_bundle():
-    """POST a recipe bundle for one prompt_id.
-
-    Body shape: see core.recipe_sync.build_envelope.  The cloud
-    deployment of HARTOS persists this; flat installs may also
-    accept it for testing but the file is intended to round-trip
-    via the central instance.
-
-    Defenses (added in post-shipment hardening pass):
-      M5 - prompt_id MUST equal os.path.basename(prompt_id) so an
-           attacker can't write to ../../etc/passwd via the path
-           construction at the bottom of this handler
-      M6 - reject when incoming uploaded_at < existing uploaded_at
-           UNLESS body carries force=True.  Prevents an older client
-           from silently clobbering a newer cloud state.  Idempotent
-           on identical-checksum re-pushes (200 OK without rewrite)
-    """
-    try:
-        from core.recipe_sync import SCHEMA_VERSION, _safe_filename
-    except ImportError:
-        return jsonify({'error': 'recipe_sync unavailable'}), 503
-    envelope = request.get_json() or {}
-    if envelope.get('schema_version') != SCHEMA_VERSION:
-        return jsonify({
-            'error': 'schema_mismatch',
-            'expected': SCHEMA_VERSION,
-            'got': envelope.get('schema_version'),
-        }), 400
-    prompt_id = envelope.get('prompt_id')
-    files = envelope.get('files') or {}
-    if not prompt_id or not files:
-        return jsonify({'error': 'prompt_id + files required'}), 400
-
-    # M5: prompt_id flows into a filesystem path - validate it the
-    # same way the recipe_sync.pull_recipe path validates filenames.
-    pid_str = str(prompt_id)
-    if not _safe_filename(pid_str + '.json'):
-        return jsonify({
-            'error': 'unsafe prompt_id - must be basename-safe',
-            'prompt_id': pid_str,
-        }), 400
-
-    try:
-        os.makedirs(_RECIPE_BLOB_DIR, exist_ok=True)
-    except OSError as e:
-        return jsonify({'error': f'blob dir create failed: {e}'}), 500
-    blob_path = os.path.join(_RECIPE_BLOB_DIR, f'{pid_str}.json')
-
-    # M6: staleness guard - reject if incoming envelope is older than
-    # what's on disk, unless caller explicitly opts into overwrite.
-    # The 'force' query param is a deliberate, explicit override; the
-    # body field exists for symmetry.
-    force = bool(envelope.get('force')) or \
-        request.args.get('force', '').lower() in ('1', 'true', 'yes')
-    incoming_ts = int(envelope.get('uploaded_at') or 0)
-    incoming_checksum = envelope.get('checksum', '')
-    if os.path.isfile(blob_path):
-        try:
-            with open(blob_path, 'r', encoding='utf-8') as f:
-                existing = json.load(f)
-            existing_ts = int(existing.get('uploaded_at') or 0)
-            existing_checksum = existing.get('checksum', '')
-            # Idempotent re-push: same checksum → 200 OK without rewrite
-            if incoming_checksum and incoming_checksum == existing_checksum:
-                return jsonify({
-                    'stored': True, 'unchanged': True,
-                    'checksum': incoming_checksum,
-                    'files_count': len(files),
-                })
-            if not force and incoming_ts < existing_ts:
-                return jsonify({
-                    'error': 'stale_upload',
-                    'reason': (
-                        f'incoming uploaded_at={incoming_ts} < '
-                        f'existing={existing_ts}; pass force=true to '
-                        f'override (will silently overwrite newer cloud state)'),
-                    'existing_checksum': existing_checksum,
-                }), 409  # Conflict
-        except (IOError, OSError, json.JSONDecodeError, ValueError) as e:
-            app.logger.debug(
-                f'/prompts/sync staleness check failed for {pid_str}: {e}')
-            # Fall through and write - existing blob is corrupt anyway
-
-    # Atomic write so concurrent GET can't read a half-written blob.
-    tmp_path = blob_path + '.tmp'
-    try:
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(envelope, f)
-        os.replace(tmp_path, blob_path)
-    except (IOError, OSError) as e:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-        return jsonify({'error': f'blob write failed: {e}'}), 500
-    return jsonify({
-        'stored': True,
-        'checksum': envelope.get('checksum', ''),
-        'files_count': len(files),
-    })
-
-
-@app.route('/prompts/sync/<prompt_id>', methods=['GET'])
-def download_recipe_bundle(prompt_id):
-    """GET the recipe bundle for *prompt_id*.
-
-    Returns 404 when no blob has been uploaded yet.  Cloud tier
-    installs serve from a DB-backed store; flat installs read from
-    the on-disk blob dir written by upload_recipe_bundle.
-
-    Defense (post-shipment hardening, mirrors upload_recipe_bundle's
-    M5 check): prompt_id flows from the URL path into a filesystem
-    join.  Flask's default ``string`` URL converter forbids ``/`` but
-    permits ``..`` after URL-decode, so a request like
-    ``GET /prompts/sync/..%2F..%2Fetc%2Fpasswd`` would otherwise
-    resolve outside _RECIPE_BLOB_DIR.  We validate the same way the
-    upload path does — via core.recipe_sync._safe_filename — and add
-    a realpath containment check as belt+suspenders.
-    """
-    try:
-        from core.recipe_sync import _safe_filename
-    except ImportError:
-        return jsonify({'error': 'recipe_sync unavailable'}), 503
-
-    pid_str = str(prompt_id)
-    if not _safe_filename(pid_str + '.json'):
-        return jsonify({
-            'error': 'unsafe prompt_id - must be basename-safe',
-        }), 400
-
-    blob_path = os.path.join(_RECIPE_BLOB_DIR, f'{pid_str}.json')
-    # Realpath containment: even if _safe_filename misses some
-    # platform-specific edge case (symlink dir, NTFS short name),
-    # this catch-all keeps reads inside the blob dir.
-    blob_real = os.path.realpath(blob_path)
-    base_real = os.path.realpath(_RECIPE_BLOB_DIR)
-    if not (blob_real == base_real
-            or blob_real.startswith(base_real + os.sep)):
-        return jsonify({'error': 'unsafe prompt_id'}), 400
-
-    if not os.path.isfile(blob_path):
-        return jsonify({'error': 'not_found'}), 404
-    try:
-        with open(blob_path, 'r', encoding='utf-8') as f:
-            envelope = json.load(f)
-    except (IOError, OSError, json.JSONDecodeError) as e:
-        return jsonify({'error': f'blob read failed: {e}'}), 500
-    return jsonify(envelope)
 
 
 def _get_active_backend_info() -> dict:
@@ -10194,6 +7817,19 @@ Example response format:
     except Exception as e:
         app.logger.error(f"Error in /zeroshot/ endpoint: {str(e)}")
         return jsonify({"error": str(e)}), 500
+
+# ─── Shared error-handling decorator (DRY: replaces 12+ identical try/except blocks) ──
+
+def _json_endpoint(f):
+    """Wrap a Flask view so unhandled exceptions return ``{'error': ...}, 500``."""
+    @wraps(f)
+    def _wrapped(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    return _wrapped
+
 
 # ─── Runtime Media Tools API ──────────────────────────────────────────
 # Endpoints for managing runtime media tools (Wan2GP, TTS-Audio-Suite,
@@ -11228,33 +8864,6 @@ def main():
     """
     # Boot integrity verification (deferred from import time)
     hevolve_verify_boot()
-    # NOTE: prompts_backup.snapshot_at_boot runs at module-import
-    # time (line ~452) so it fires for BOTH the CLI path here AND
-    # Nunba's library-import path.  Removing the duplicate call here
-    # avoids two snapshots per CLI boot.
-
-    # Guardrail hash verification — refuse to boot with tampered
-    # hive_guardrails values unless HEVOLVE_GUARDRAIL_HASH_ENFORCE=0
-    # (dev override). The module-level call inside hive_guardrails is
-    # self-consistent at pristine import; this explicit boot re-check
-    # surfaces any post-import monkey-patch or dynamic module substitution
-    # before any ConstitutionalFilter entry point has a chance to run.
-    try:
-        from security.hive_guardrails import (
-            enforce_guardrail_integrity,
-            get_guardrail_hash,
-        )
-        enforce_guardrail_integrity()
-        logging.getLogger('hevolve_social').info(
-            "[Guardrail] hash verified: %s", get_guardrail_hash()[:16] + '...')
-    except RuntimeError:
-        # enforce_guardrail_integrity already logged CRITICAL and we want
-        # the hard abort to propagate — this is a guardian-angel integrity
-        # check and we refuse to boot.
-        raise
-    except Exception as e:
-        logging.getLogger('hevolve_social').warning(
-            f"[Guardrail] hash verification skipped (import error): {e}")
 
     # Guardrail hash verification — refuse to boot with tampered
     # hive_guardrails values unless HEVOLVE_GUARDRAIL_HASH_ENFORCE=0
@@ -11305,74 +8914,7 @@ def main():
     skills_thread.start()
 
     from core.port_registry import get_port
-    _serve_app(app, host='0.0.0.0', port=get_port('backend'))
-
-
-def _serve_app(app, host: str, port: int) -> None:
-    """Boot the WSGI app on Hypercorn (preferred) or Waitress (fallback).
-
-    Hypercorn = ASGI: asyncio event loop multiplexes connection IO so
-    idle keep-alive / SSE clients don't burn worker threads (waitress
-    holds one thread per connection regardless of activity).  Sync
-    Flask handlers run in `loop.run_in_executor()` against a pool of
-    HEVOLVE_WORKER_THREADS (default 256) — slow paths (LLM inference,
-    pip install in /tts/setup-engine) occupy executor threads but
-    never block the IO layer, so /dashboard/agents and /health stay
-    responsive while a TTS install grinds.
-
-    Single-process today.  Multi-process (HEVOLVE_WORKERS=N) requires
-    sharding the in-process singletons first (EventBus, ResourceGovernor,
-    agent_daemon, watchdog, goal_seeding) — each fork would otherwise
-    spawn N parallel agent fleets fighting over the same goals + the
-    same Windows Job Object handle.  Until then `workers=1` is the
-    correct value; same code path will lift to N workers for free
-    once the sharding work lands.
-
-    Falls back to Waitress on ImportError so older deployments / partial
-    installs / cx_Freeze bundles missing the hypercorn h2/wsproto chain
-    still boot — this preserves the prior behavior bit-for-bit.
-    """
-    log = logging.getLogger('hevolve_social')
-    try:
-        worker_threads = int(os.environ.get('HEVOLVE_WORKER_THREADS', '256'))
-    except (TypeError, ValueError):
-        worker_threads = 256
-
-    try:
-        import asyncio
-        from concurrent.futures import ThreadPoolExecutor
-        from hypercorn.asyncio import serve as _hcserve
-        from hypercorn.config import Config
-        from hypercorn.middleware import AsyncioWSGIMiddleware
-
-        config = Config()
-        config.bind = [f'{host}:{port}']
-        config.keep_alive_timeout = 120     # SSE-friendly long polls
-        config.h11_max_incomplete_size = 16 * 1024 * 1024  # 16MB request bodies
-        config.accesslog = None             # HARTOS emits its own access log
-        config.errorlog = '-'
-
-        asgi_app = AsyncioWSGIMiddleware(app)
-
-        async def _runner():
-            loop = asyncio.get_running_loop()
-            loop.set_default_executor(
-                ThreadPoolExecutor(max_workers=worker_threads,
-                                   thread_name_prefix='hartos'))
-            await _hcserve(asgi_app, config)
-
-        log.info(
-            f"Starting Hypercorn (ASGI) on {host}:{port} "
-            f"(executor_threads={worker_threads}, single-process)"
-        )
-        asyncio.run(_runner())
-        return
-    except ImportError as exc:
-        log.warning(
-            f"Hypercorn unavailable ({exc}) — falling back to Waitress")
-
-    log.info(f"Starting Waitress (WSGI) on {host}:{port} (threads=50)")
-    serve(app, host=host, port=port, threads=50)
+    serve(app, host='0.0.0.0', port=get_port('backend'), threads=50)
 
 
 if __name__ == '__main__':

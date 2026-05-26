@@ -66,31 +66,6 @@ COMPONENT_TYPES = {
     'agent_action': {'props': ['agent_id', 'action_type', 'description',
                                'status', 'result', 'timestamp']},
     'navigate': {'props': ['target', 'params', 'transition']},
-    # ── External-room copilot (UNIF-G5) ──
-    # Live transcript + decisions + action items for an external Discord
-    # audio room / Teams meet / WhatsApp group voice / Reddit voice room
-    # joined via UNIF-G2 Join_External_Room.  Idempotent overwrite — backend
-    # emits the FULL state on every transcript chunk; frontend replaces.
-    'meet_copilot': {'props': ['call_id', 'platform', 'room_id', 'state',
-                               'transcript_lines', 'decisions',
-                               'action_items', 'participants',
-                               'agent_role']},
-    # ── Device pairing QR (used by hart_intelligence_entry) ──
-    # WAS missing from allowlist while the emit site + web QRPairOverlay
-    # renderer both existed — emits were silently rejected here.  Added
-    # 2026-05-14 after probe_liquid_ui_audit found the gap.
-    'qr_pair': {'props': ['url', 'caption', 'expires_in_seconds',
-                          'session_id']},
-    # ── OAuth deep-link prompt ──
-    # hart_intelligence_entry emits when a tool needs an OAuth handshake
-    # (e.g. Reddit/Discord/Google sign-in).  Frontend renders as a
-    # notification with a single navigate-to-external-URL action.
-    'oauth_link': {'props': ['title', 'provider', 'authorize_url',
-                             'description', 'scopes']},
-    # ── Transient toast (channels/agent_tools success/error feedback) ──
-    # Lightweight notification with short auto-dismiss; web maps to the
-    # same NotificationCard renderer with `severity` driving the colour.
-    'toast': {'props': ['title', 'message', 'severity']},
 }
 
 # ═══════════════════════════════════════════════════════════════

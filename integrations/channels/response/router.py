@@ -212,21 +212,6 @@ class ChannelResponseRouter:
         """Publish to WAMP for desktop/web notification."""
         try:
             from hart_intelligence import publish_async
-        """Publish to WAMP for desktop/web notification.
-
-        Singleton accessor — see core.safe_hartos_attr for why workers
-        must not eager-import hart_intelligence.
-        """
-        try:
-            from core.safe_hartos_attr import safe_hartos_attr
-            publish_async = safe_hartos_attr('publish_async')
-            if publish_async is None:
-                logger.debug(
-                    "Channel response WAMP notify skipped: HARTOS "
-                    "publish_async unresolvable — user=%s channel=%s",
-                    user_id, channel_type,
-                )
-                return
             notification = {
                 "text": [text[:200]],
                 "priority": 48,
@@ -242,8 +227,6 @@ class ChannelResponseRouter:
                 f'com.hertzai.hevolve.chat.{user_id}',
                 payload,
             )
-            from core.peer_link.message_bus import chat_topic_for
-            publish_async(chat_topic_for(user_id), payload)
             # Dedicated channel response topic (cross-device)
             publish_async(
                 f'com.hertzai.hevolve.channel.response.{user_id}',
@@ -251,15 +234,6 @@ class ChannelResponseRouter:
             )
         except Exception:
             pass  # WAMP is supplementary
-            logger.debug(
-                "Channel response WAMP notify published: user=%s channel=%s",
-                user_id, channel_type,
-            )
-        except Exception as e:
-            logger.debug(
-                "Channel response WAMP notify failed: user=%s err=%s",
-                user_id, e,
-            )
 
 
 def _get_running_loop():

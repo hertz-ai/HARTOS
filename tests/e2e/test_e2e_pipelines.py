@@ -118,20 +118,14 @@ class TestCommercialAPILifecycle:
         assert validated is not None
         assert validated['tier'] == 'starter'
 
-        # Step 3: Reserve + log — production call path is
-        # reserve_quota() (atomic increment, gates over-quota) then
-        # log_usage() (writes the billing row). The earlier shape of
-        # this test called log_usage alone; that drifted when quota
-        # accounting was hoisted into reserve_quota for race safety.
-        assert CommercialAPIService.reserve_quota(db, key_id) is True
+        # Step 3: Log usage - meter a real call
         log1 = CommercialAPIService.log_usage(
             db, key_id, '/v1/intelligence/chat',
             tokens_in=500, tokens_out=800, compute_ms=1200)
         assert log1['cost_credits'] > 0  # starter tier has cost
         assert log1['tokens_in'] == 500
 
-        # Step 4: Reserve + log second call — verify accumulation
-        assert CommercialAPIService.reserve_quota(db, key_id) is True
+        # Step 4: Log more - verify accumulation
         log2 = CommercialAPIService.log_usage(
             db, key_id, '/v1/intelligence/analyze',
             tokens_in=200, tokens_out=300, compute_ms=600)
@@ -348,7 +342,7 @@ class TestDaemonTickIntegration:
     """E2E: daemon _tick() with goals + idle agents + milestone + quota reset."""
 
     @patch('integrations.agent_engine.dispatch.dispatch_goal')
-    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_agent_personas')
+    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_opted_in_agents')
     def test_tick_dispatches_to_idle_agent(self, mock_idle, mock_dispatch, db, idle_agent):
         """Active goal + idle agent → dispatch_goal called."""
         from integrations.agent_engine.agent_daemon import AgentDaemon
@@ -379,7 +373,7 @@ class TestDaemonTickIntegration:
         assert str(idle_agent.id) in str(call_args)
 
     @patch('integrations.agent_engine.dispatch.dispatch_goal')
-    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_agent_personas')
+    @patch('integrations.coding_agent.idle_detection.IdleDetectionService.get_idle_opted_in_agents')
     def test_tick_no_goals_no_dispatch(self, mock_idle, mock_dispatch, db):
         """No active goals → no dispatch."""
         from integrations.agent_engine.agent_daemon import AgentDaemon

@@ -6,7 +6,7 @@
 # Deployment tiers:
 #   central   — Production server. Cloud LLM (GPT/Claude). Master key + signed manifest.
 #               Requires: .env with OPENAI_API_KEY, HEVOLVE_DB_URL (cloud MySQL)
-#               Optional: <master-key-path>, release_manifest.json
+#               Optional: /etc/hevolve/master_private_key.hex, release_manifest.json
 #
 #   regional  — Regional host. Connects to a regional LLM server (llama.cpp/vLLM).
 #               Requires: .env with HEVOLVE_LLM_ENDPOINT_URL
@@ -58,7 +58,7 @@ MANIFEST="${REPO_DIR}/release_manifest.json"
 DOCKERFILE="${REPO_DIR}/Dockerfile"
 
 # Master key location (central server only, never in repo)
-MASTER_KEY_FILE="<master-key-path>"
+MASTER_KEY_FILE="/etc/hevolve/master_private_key.hex"
 
 # Default tier — overridden by --tier flag or HEVOLVE_NODE_TIER in .env
 TIER=""

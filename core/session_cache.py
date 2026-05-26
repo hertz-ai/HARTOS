@@ -25,20 +25,6 @@ class TTLCache:
     - Automatic cleanup of expired entries
     - Max size cap to prevent unbounded growth
     - Drop-in replacement for dict (supports [] operator, .get(), etc.)
-    - **Touch-on-read**: every successful read via `[]` / `.get()` /
-      `.setdefault()` extends the entry's TTL.  This keeps actively-used
-      session state alive for the full duration of an active recipe
-      pipeline, while abandoned entries (no reads → no touch) still
-      auto-expire to prevent the original memory-leak class.
-      `__contains__` (`in` operator) is intentionally side-effect free
-      to keep Python idioms predictable.
-
-    Touch-on-read fixes the 2026-05-08 "TTS without text" incident:
-    `scheduler_check[user_prompt]` raised KeyError mid-recipe because
-    the 2h TTL elapsed during a long pipeline run, even though the
-    recipe was being read continuously.  After this change, a recipe
-    that's actively reading state stays warm; one that's been
-    abandoned for 2h still gets cleaned up.
     """
 
     def __init__(self, ttl_seconds: int = 7200, max_size: int = 1000, name: str = 'cache', loader=None):
@@ -74,14 +60,6 @@ class TTLCache:
     def __getitem__(self, key):
         with self._lock:
             if key in self._data and not self._is_expired(key):
-                # Touch-on-read: extend TTL for actively-used keys.  Active
-                # recipe pipelines continuously read state — without this,
-                # the 2h TTL would hard-evict mid-flow and produce KeyError
-                # (root cause of the 2026-05-08 TTS-without-text incident).
-                # Abandoned entries (no reads) still age out via the
-                # original timestamp + _cleanup_expired path, preserving
-                # the memory-leak-prevention guarantee.
-                self._timestamps[key] = time.monotonic()
                 return self._data[key]
             # Clean up expired entry if present
             if key in self._data:
@@ -138,10 +116,6 @@ class TTLCache:
     def setdefault(self, key, default=None):
         with self._lock:
             if key in self._data and not self._is_expired(key):
-                # Touch-on-read: same rationale as __getitem__.
-                # setdefault is a read-or-create operation; the read
-                # path should also extend TTL.
-                self._timestamps[key] = time.monotonic()
                 return self._data[key]
             # Clean up expired entry if present
             if key in self._data:

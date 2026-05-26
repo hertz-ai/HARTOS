@@ -88,18 +88,6 @@ def get_agent_data_dir() -> str:
     return os.path.join(get_db_dir(), 'agent_data')
 
 
-def get_coding_workspace_dir() -> str:
-    """Return the AutoGen UserProxyAgent code-execution workspace.
-
-    Routes off CWD to a writable user-data path so install-tree CWD
-    (e.g. C:\\Program Files (x86)\\HevolveAI\\Nunba) doesn't fail
-    `[WinError 5] Access is denied: 'coding'`.
-    """
-    path = os.path.join(get_db_dir(), 'coding')
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
 def get_prompts_dir() -> str:
     """Return the prompts/ subdirectory."""
     return os.path.join(get_db_dir(), 'prompts')

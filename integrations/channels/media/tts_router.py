@@ -70,138 +70,6 @@ class TTSEngineSpec:
     sample_rate: int = 24000
 
 
-    pip_install_plan: Tuple[str, ...] = ()   # canonical pip-spec list to make
-                                             # `required_package` actually
-                                             # importable + synth-functional —
-                                             # includes transitive deps the
-                                             # upstream package may forget to
-                                             # declare in its install_requires
-                                             # (e.g. chatterbox-tts ships
-                                             # `import librosa` in tts.py but
-                                             # doesn't list librosa as a hard
-                                             # dep, so a no-deps pip install
-                                             # leaves a broken package on disk
-                                             # that imports far enough for
-                                             # find_spec() but blows up on
-                                             # actual synthesize calls — see
-                                             # ~/Documents/Nunba/logs/probe_
-                                             # chatterbox_turbo.err).  Single
-                                             # source of truth for the desktop
-                                             # installer (Nunba) so it doesn't
-                                             # carry a parallel dict that
-                                             # drifts.  Empty tuple = nothing
-                                             # to install (bundled / CPU stub).
-    install_target: str = 'main'             # WHERE pip_install_plan should
-                                             # land on the desktop installer.
-                                             # Valid values:
-                                             #   'main'      — into the main
-                                             #                 python-embed
-                                             #                 site-packages
-                                             #                 (legacy default;
-                                             #                 risky, dep
-                                             #                 conflicts mask
-                                             #                 silent failures)
-                                             #   'venv'      — into a private
-                                             #                 venv at
-                                             #                 ~/Documents/
-                                             #                 Nunba/data/
-                                             #                 venvs/<engine>/.
-                                             #                 Requires a
-                                             #                 per-engine
-                                             #                 worker file
-                                             #                 (tts/<engine>_
-                                             #                 worker.py) that
-                                             #                 the parent
-                                             #                 dispatches into
-                                             #                 via backend_
-                                             #                 venv.invoke_in_
-                                             #                 venv().
-                                             #   'bundled'   — already on
-                                             #                 disk via the
-                                             #                 frozen build
-                                             #                 (piper voices,
-                                             #                 luxtts, espeak)
-                                             #   'cloud'     — HTTP-only,
-                                             #                 nothing to
-                                             #                 install
-                                             #                 (makeittalk)
-                                             #   'git_clone' — needs git clone
-                                             #                 of an upstream
-                                             #                 repo + pip
-                                             #                 install -e
-                                             #                 (cosyvoice3 →
-                                             #                 FunAudioLLM/
-                                             #                 CosyVoice)
-                                             # Default 'main' preserves
-                                             # current behavior; flipping a
-                                             # GPU engine to 'venv' requires
-                                             # the matching worker file in
-                                             # Nunba (or the dispatch falls
-                                             # back to in-process import,
-                                             # which only works if the engine
-                                             # is also installed in main).
-    sample_rate: int = 24000
-
-
-# Shared pip-spec constants — keep here so the install plans below stay
-# readable and so a single edit updates every engine that pins them.
-#
-# huggingface_hub 0.29+ removes is_offline_mode that transformers <5.x
-# still imports, so we cap below 0.29 for the chatterbox / kokoro chain.
-_HF_HUB_PIN = 'huggingface_hub>=0.27.0,<0.29.0'
-
-# Chatterbox plan — `chatterbox-tts` on PyPI omits MULTIPLE runtime
-# imports from its install_requires.  Each one only surfaces when the
-# install proceeds far enough for the next one to be reached:
-#
-#   chatterbox/__init__.py:9 → from .tts import ChatterboxTTS
-#   chatterbox/tts.py:4       → import librosa     (missing #1)
-#   chatterbox/tts.py:6       → import perth       (missing #2)
-#
-# Each was discovered from a real failed install at
-# ~/Documents/Nunba/logs/probe_chatterbox_turbo.err on the user's
-# desktop — first librosa, then once that was added, perth.  Listing
-# them all here means a fresh chatterbox install completes in one
-# pip pass instead of needing 2-3 self-heal iterations (each of
-# which downloads ~10 MB of pip metadata).  The Nunba self-heal
-# loop catches future un-declared transitives on the install screen
-# without surfacing a synth failure to the user.
-_CHATTERBOX_PIP_PLAN: Tuple[str, ...] = (
-    _HF_HUB_PIN,
-    'torchaudio',
-    'chatterbox-tts',
-    'librosa',     # missing transitive #1 — chatterbox/tts.py:4
-    'soundfile',   # librosa needs it on Windows for non-WAV outputs
-    'resemble-perth',  # missing transitive #2 — chatterbox/tts.py:6
-                       # `import perth`; PyPI pkg name = resemble-perth
-                       # (the watermark library Resemble AI uses to
-                       # tag synthesized audio).
-    # NOTE on the rest of chatterbox-tts==0.1.7's requires_dist
-    # (omegaconf, conformer, pyloudnorm, pykakasi, spacy-pkuseg,
-    # diffusers, einops, s3tokenizer, etc.):
-    # We deliberately do NOT pre-install them in one pip pass.
-    # When pip is asked to install many at once with
-    # `--no-build-isolation` (frozen build constraint, see
-    # package_installer._run_pip), and one of the transitives needs
-    # a source build (omegaconf → antlr4-python3-runtime==4.9.* is
-    # sdist-only on PyPI), pip's parallel-builds path races against
-    # the bundle's setuptools and surfaces as
-    #   BackendUnavailable: Cannot import 'setuptools.build_meta'
-    # (observed 2026-04-28 on the user's bundle f2d4567 — full pip
-    # invocation aborts rc=2, no transitive gets installed).
-    # _self_heal_missing_transitives in package_installer.py handles
-    # them one-at-a-time AFTER the chatterbox-tts top-level install
-    # — single-package mode never triggers the parallel-build race.
-    # Combined with the PYTHONNOUSERSITE=1 fix in tts/_torch_probe.py
-    # (probe no longer leaks system Python's site-packages), each
-    # heal cycle finds a REAL missing transitive, not a phantom one.
-    # The original 5-cycle trail (librosa → perth → einops →
-    # s3tokenizer → omegaconf) is fine because each cycle resolves
-    # in ~10-30s of single-package pip work, not 5 minutes of
-    # parallel-build resolver thrash.
-)
-
-
 # All known TTS engines
 ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
     'chatterbox_turbo': TTSEngineSpec(
@@ -218,22 +86,6 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         tool_function='chatterbox_synthesize',
         tool_worker_attr='_turbo',
         required_package='chatterbox',
-        pip_install_plan=_CHATTERBOX_PIP_PLAN,
-        # chatterbox-tts 0.1.7 hard-pins torch==2.6.0, transformers==5.2.0,
-        # numpy<2.0.0, diffusers==0.29.0, safetensors==0.5.3 — all in
-        # direct conflict with HARTOS's main interpreter (torch 2.11,
-        # transformers 5.1, numpy 2.4, diffusers 0.37, safetensors 0.7).
-        # Auto-heal can never satisfy these because main-interpreter
-        # downgrades would break llama-server, indic_parler, faster-whisper,
-        # and every other ML stack.  Quarantine into its own venv —
-        # same pattern indic_parler uses (parler-tts pinned
-        # transformers<4.47).  Nunba's tts/package_installer.py routes
-        # the install into ~/.nunba/venvs/chatterbox_turbo/, and the
-        # HARTOS ToolWorker's python_exe is set to the venv's python
-        # at runtime via desktop/_wire_venv_engines.py at boot, so the
-        # synth subprocess sees the pinned chatterbox-compatible deps
-        # instead of the main interpreter's incompatible newer ones.
-        install_target='venv',
     ),
     # luxtts REMOVED — poor audio quality, not suitable for any use case.
     'cosyvoice3': TTSEngineSpec(
@@ -250,16 +102,6 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         tool_function='cosyvoice_synthesize',
         tool_worker_attr='_tool',
         required_package='cosyvoice',
-        # cosyvoice is NOT pip-installable — needs a `git clone` of
-        # FunAudioLLM/CosyVoice plus model weight download via
-        # huggingface_hub.  Empty plan + install_target='git_clone'
-        # signals Nunba to skip the pip path entirely and route
-        # through its git-clone install handler instead.  The
-        # verify-synth probe must also short-circuit on git_clone
-        # engines when the package isn't importable (current Nunba
-        # bug: probe runs `import cosyvoice` blindly + always fails).
-        pip_install_plan=(),
-        install_target='git_clone',
     ),
     'f5_tts': TTSEngineSpec(
         engine_id='f5_tts',
@@ -275,13 +117,6 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         tool_function='f5_synthesize',
         tool_worker_attr='_tool',
         required_package='f5_tts',
-        pip_install_plan=('torchaudio', 'f5-tts'),
-        # install_target='venv' so f5-tts + its torchaudio pin land in
-        # their own venv at ~/Documents/Nunba/data/venvs/f5_tts/ rather
-        # than colliding with the bundled main-interpreter torch.
-        # f5-tts itself was task #85 (worker dies on startup); the
-        # quarantine here is what kept that fix stable.
-        install_target='venv',
     ),
     'indic_parler': TTSEngineSpec(
         engine_id='indic_parler',
@@ -300,33 +135,6 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         tool_function='indic_parler_synthesize',
         tool_worker_attr='_tool',
         required_package='parler_tts',
-        # Indic Parler quarantines into its own venv on the desktop —
-        # parler-tts 0.2.2 hard-pins transformers<4.47 which conflicts
-        # with the main interpreter's transformers 5.1.0.  The full
-        # pip plan lives here so it travels with the engine spec; the
-        # desktop installer routes the install into the venv when
-        # install_target='venv'.  Worker file:
-        # tts/indic_parler_worker.py (Nunba).  HARTOS server side runs
-        # Indic Parler in its own subprocess worker so the main
-        # interpreter pin doesn't apply there either.
-        pip_install_plan=(
-            # tqdm + colorama pinned FIRST to stop pip's resolver from
-            # backtracking through colorama 0.1.x (no setup.py, breaks
-            # install).  Witnessed user-facing failure:
-            #   "Indic Parler TTS unavailable — using fallback voice engine"
-            # Root-caused from ~/Documents/Nunba/logs/venv_indic_parler.log.
-            'colorama>=0.4.6',
-            'tqdm>=4.65',
-            'transformers==4.46.1',  # parler-tts 0.2.2 requires <4.47
-            'torch',                  # CPU-ish fallback; replaced by CUDA if GPU
-            'torchaudio',
-            'sentencepiece',
-            'descript-audio-codec',
-            'parler-tts==0.2.2',      # 0.2.3 has DacModel.decode() API mismatch
-            'soundfile',
-            _HF_HUB_PIN,
-        ),
-        install_target='venv',
     ),
     'chatterbox_ml': TTSEngineSpec(
         engine_id='chatterbox_ml',
@@ -346,7 +154,6 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         tool_function='chatterbox_ml_synthesize',
         tool_worker_attr='_ml',
         required_package='chatterbox',
-        pip_install_plan=_CHATTERBOX_PIP_PLAN,
     ),
     'pocket_tts': TTSEngineSpec(
         engine_id='pocket_tts',
@@ -360,60 +167,6 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         latency_cloud_ms=0,
         tool_module='integrations.service_tools.pocket_tts_tool',
         tool_function='pocket_tts_synthesize',
-        pip_install_plan=('pocket-tts',),
-    ),
-    # NeuTTS Air — Neuphonic 748M-param Qwen2 backbone with NeuCodec
-    # decoder, Apache 2.0.  GGUF Q4 (~600MB) / Q8 (~800MB).  RTF<0.5
-    # on CPU (Intel i5 / RPi 5), 24kHz output, instant voice cloning
-    # from 3-15s reference audio.  English primary.  Slots between
-    # omnivoice and kokoro on the English ladder per quality
-    # (kokoro=0.88, neutts=0.91, omnivoice~0.93, chatterbox=0.95).
-    #
-    # Reference voice contract: NeuTTS requires a reference audio +
-    # transcript per call (no built-in 'alba'-style zero-config
-    # voices).  The wrapper resolves 'jo' (upstream sample shipped
-    # with the package), any path to a .wav with companion .txt,
-    # or a custom name from ~/.hevolve/models/tts/neutts/voices/.
-    # See integrations/service_tools/neutts_tool.py for resolution.
-    'neutts_air': TTSEngineSpec(
-        engine_id='neutts_air',
-        device=TTSDevice.GPU_PREFERRED,
-        vram_key='tts_neutts',
-        languages=('en',),
-        quality=0.91,
-        voice_clone=True,
-        latency_gpu_ms=150,
-        latency_cpu_ms=400,
-        latency_cloud_ms=0,
-        tool_module='integrations.service_tools.neutts_tool',
-        tool_function='neutts_synthesize',
-        # Worker attribute — Nunba's `_SubprocessTTSBackend` needs this
-        # to drive the subprocess.  Without it the spec falls into the
-        # `_InProcessTTSBackend` path (line ~2408 of Nunba's tts_engine
-        # .py) which in turn does `import neutts` from the MAIN
-        # interpreter — a guaranteed ImportError because `install_target
-        # ='venv'` lands the package in the per-engine venv, not the
-        # main python-embed.  Setting `_tool` here pairs cleanly with
-        # the ToolWorker singleton in integrations.service_tools.neutts
-        # _tool, mirroring kokoro / chatterbox / f5 / indic_parler.
-        tool_worker_attr='_tool',
-        required_package='neutts',
-        # `neutts[all]` pulls llama-cpp-python (for GGUF inference)
-        # plus soundfile + onnxruntime.  The base `neutts` package
-        # alone is not enough for synth — the codec decoder needs
-        # onnxruntime.  Pin huggingface_hub via _HF_HUB_PIN so the
-        # transformers chain stays consistent with the rest of the
-        # English ladder (chatterbox / kokoro use the same pin).
-        pip_install_plan=(
-            _HF_HUB_PIN,
-            'neutts[all]',
-            'soundfile',  # explicit — wrapper requires soundfile.write
-        ),
-        # Quarantine into its own venv on the desktop installer.
-        # NeuTTS pulls llama-cpp-python which can drift from the
-        # main interpreter's torch / numpy stack.  Same pattern as
-        # chatterbox_turbo and indic_parler.
-        install_target='venv',
     ),
     # Kokoro 82M — tiny neural English TTS. Runs on CPU (≈1× real-time,
     # 200MB RAM) or GPU (≈0.1× real-time, 200MB VRAM). Quality sits
@@ -443,55 +196,6 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         tool_function='kokoro_synthesize',
         tool_worker_attr='_tool',
         required_package='kokoro',
-        pip_install_plan=(
-            _HF_HUB_PIN,
-            'kokoro',     # pulls misaki phonemizer transitively
-            'espeakng',   # espeak-ng Python bindings (ships binary on Windows)
-        ),
-        # install_target='venv' so the kokoro + misaki phonemizer chain
-        # (incl. its pinned numpy/torch transitive set) lands in a
-        # private venv at ~/Documents/Nunba/data/venvs/kokoro/ instead
-        # of the bundled python-embed.  Closes the "ModuleNotFoundError:
-        # No module named 'kokoro'" probe-fallback path that left this
-        # engine permanently uninstalled on every Nunba install (#83).
-        install_target='venv',
-    ),
-    # OmniVoice — universal TTS.  Qwen3-0.6B backbone + diffusion head,
-    # 646 languages (581k training hours spanning every Indic script,
-    # zh/ja/ko, European, Arabic, low-resource).  Zero-shot voice cloning
-    # from 3-10 s of reference audio.  Apache 2.0.
-    #
-    # Languages tuple is ('*',) — same wildcard convention as espeak —
-    # but select_engines() only considers engines explicitly listed in
-    # LANG_ENGINE_PREFERENCE for the resolved language.  We prepend
-    # 'omnivoice' to every Indic + non-English entry + _DEFAULT_PREFERENCE
-    # so it wins unless it's uninstalled or the GPU can't hold it.
-    #
-    # VRAM is stubbed at 3.0 GB in vram_manager.VRAM_BUDGETS; the worker
-    # self-reports actual usage on first load via '__WORKER_VRAM_GB__'
-    # and vram_manager.record_actual_usage tightens the budget.
-    'omnivoice': TTSEngineSpec(
-        engine_id='omnivoice',
-        device=TTSDevice.GPU_ONLY,
-        vram_key='tts_omnivoice',
-        languages=('*',),  # 646 languages
-        quality=0.93,
-        voice_clone=True,
-        latency_gpu_ms=250,
-        latency_cpu_ms=0,
-        latency_cloud_ms=0,
-        tool_module='integrations.service_tools.omnivoice_tool',
-        tool_function='omnivoice_synthesize',
-        tool_worker_attr='_tool',
-        required_package='omnivoice',
-        # See omnivoice_tool.py docstring: "Requires: pip install
-        # omnivoice torch soundfile".  torch is bundled.
-        pip_install_plan=('omnivoice', 'soundfile'),
-        # install_target='venv' — omnivoice pulls Qwen3-0.6B + diffusion
-        # head with their own torch/transformers transitives that conflict
-        # with the bundled main interpreter pins.  Quarantine in
-        # ~/Documents/Nunba/data/venvs/omnivoice/.
-        install_target='venv',
     ),
     'espeak': TTSEngineSpec(
         engine_id='espeak',
@@ -505,7 +209,6 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         latency_cloud_ms=0,
         tool_module='integrations.service_tools.pocket_tts_tool',
         tool_function='pocket_tts_synthesize',  # espeak is fallback inside pocket
-        install_target='bundled',
     ),
     'makeittalk': TTSEngineSpec(
         engine_id='makeittalk',
@@ -519,7 +222,6 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         latency_cloud_ms=5000,
         tool_module=None,  # Special cloud path in model_bus_service
         tool_function=None,
-        install_target='cloud',
     ),
     # Piper — bundled CPU engine, multilingual via downloadable voice
     # files. Uses ('*',) wildcard (same convention as espeak) so one
@@ -539,108 +241,6 @@ ENGINE_REGISTRY: Dict[str, TTSEngineSpec] = {
         tool_module=None,  # In-process via Nunba tts/piper_tts.py —
                            # no subprocess worker, no required_package.
         tool_function=None,
-        install_target='bundled',
-    ),
-    # ── Mid-VRAM coverage tier (1–3 GB) ───────────────────────────
-    # These three engines fill the gap so every SUPPORTED_LANG_DICT
-    # code has at least one engine with vram_gb≤3.0 in its preference
-    # ladder.  Indic Parler (2.0) + F5 (2.5) cover en/zh + 22 Indic;
-    # the trio below adds the rest of the major language families
-    # without forcing users onto the 12-14 GB Chatterbox-ML or the
-    # uninstallable git-clone CosyVoice path.
-    'melotts': TTSEngineSpec(
-        engine_id='melotts',
-        device=TTSDevice.GPU_PREFERRED,   # works on CPU at real-time too
-        vram_key='tts_melotts',
-        languages=('en', 'es', 'fr', 'zh', 'ja', 'ko'),
-        quality=0.86,
-        voice_clone=False,
-        latency_gpu_ms=180,
-        latency_cpu_ms=600,
-        latency_cloud_ms=0,
-        tool_module='integrations.service_tools.melotts_tool',
-        tool_function='melotts_synthesize',
-        tool_worker_attr='_tool',
-        required_package='melo',          # `from melo.api import TTS`
-        pip_install_plan=(
-            _HF_HUB_PIN,
-            'melotts',                    # PyPI package; ships `melo` import root
-            'soundfile',                  # used for duration probe
-        ),
-        # install_target='venv' so the melotts wheel + its `melo`
-        # phonemizer chain (jieba, MeCab, mecab-ko) land in a private
-        # venv rather than the bundled python-embed.  Closes the
-        # "ModuleNotFoundError: No module named 'melo'" probe-fallback
-        # path that left this engine permanently uninstalled (#84).
-        install_target='venv',
-    ),
-    'xtts_v2': TTSEngineSpec(
-        engine_id='xtts_v2',
-        device=TTSDevice.GPU_ONLY,
-        vram_key='tts_xtts_v2',
-        languages=(
-            'en', 'es', 'fr', 'de', 'it', 'pt', 'pl', 'tr', 'ru', 'nl',
-            'cs', 'ar', 'zh', 'hu', 'ko', 'ja', 'hi',
-        ),
-        quality=0.92,
-        voice_clone=True,
-        latency_gpu_ms=350,
-        latency_cpu_ms=0,
-        latency_cloud_ms=0,
-        tool_module='integrations.service_tools.xtts_tool',
-        tool_function='xtts_synthesize',
-        tool_worker_attr='_tool',
-        required_package='TTS',           # `from TTS.api import TTS`
-        pip_install_plan=(
-            _HF_HUB_PIN,
-            'coqui-tts',                  # idiap-maintained 2026 fork on PyPI;
-                                          # ships `from TTS.api import TTS` so
-                                          # the import path is stable.
-            'soundfile',
-        ),
-        # install_target='venv' — coqui-tts pulls trainer/encodec/etc.
-        # with their own torch/transformers pins; quarantine in
-        # ~/Documents/Nunba/data/venvs/xtts_v2/ so the main interpreter
-        # transformers pin stays free for the chatterbox-family path.
-        install_target='venv',
-    ),
-    'mms_tts': TTSEngineSpec(
-        engine_id='mms_tts',
-        device=TTSDevice.GPU_PREFERRED,   # CPU works, GPU faster
-        vram_key='tts_mms_tts',
-        languages=(
-            # Roman-script languages where mms_tts_tool routes without
-            # uroman.  Non-Roman scripts (ar/hi/zh/ko/ja/...) ALSO have
-            # mms-tts checkpoints but require uroman pre-processing —
-            # the tool gracefully fails when uroman isn't installed and
-            # the router falls through to the next preference.  We list
-            # the broader set here because the tool decides per-call
-            # whether it can serve; the router's job is to attempt.
-            'en', 'es', 'fr', 'de', 'it', 'pt', 'pl', 'tr', 'ru', 'nl',
-            'cs', 'hu', 'sv', 'fi', 'el', 'ro', 'bg', 'uk', 'cy', 'is',
-            'zh', 'ja', 'ko', 'vi', 'th', 'id', 'ms', 'km', 'lo', 'my',
-            'hi', 'bn', 'ta', 'te', 'mr', 'gu', 'kn', 'ml', 'pa', 'or',
-            'ne', 'as', 'sd', 'sa', 'ur', 'si',
-            'ar', 'fa', 'he', 'sw',
-        ),
-        quality=0.78,
-        voice_clone=False,
-        latency_gpu_ms=200,
-        latency_cpu_ms=500,
-        latency_cloud_ms=0,
-        tool_module='integrations.service_tools.mms_tts_tool',
-        tool_function='mms_tts_synthesize',
-        tool_worker_attr='_tool',
-        required_package='transformers',  # already bundled — no install plan
-        pip_install_plan=(
-            _HF_HUB_PIN,
-            'soundfile',                  # for WAV write
-            # uroman is OPTIONAL — only needed for non-Roman scripts.
-            # The tool falls through cleanly when missing, so we don't
-            # bundle the perl repo + extra pip dep into every install.
-            # Users who want broad Indic/Arabic/CJK coverage from MMS
-            # specifically can `pip install uroman` separately.
-        ),
     ),
 }
 
@@ -700,103 +300,6 @@ LANG_ENGINE_PREFERENCE: Dict[str, List[str]] = {
 
 # Fallback for unlisted languages
 _DEFAULT_PREFERENCE = ['chatterbox_ml', 'espeak']
-    # chatterbox_turbo wins on English quality; omnivoice sits above
-    # kokoro/pocket/cosyvoice for cross-engine consistency when the
-    # user also runs non-English traffic and we want to avoid swapping
-    # engines on every language switch.
-    # neutts_air slotted between omnivoice and melotts:
-    #   - quality:  chatterbox_turbo=0.95 > omnivoice~0.93 > neutts=0.91 > kokoro=0.88
-    #   - cpu RTF:  neutts <0.5 (acceptable on CPU for 8GB+ machines)
-    #   - install:  pip neutts[all] (GGUF Q4 ~600MB), Apache 2.0
-    # Behavior on missing package: wrapper returns clean {error: ...}
-    # JSON; ladder traverses to next engine — verified against
-    # tts/package_installer.py per-engine independent install
-    # contract + tts_engine._synthesize_with_fallback ladder walk.
-    'en': ['chatterbox_turbo', 'omnivoice', 'neutts_air', 'melotts', 'xtts_v2', 'kokoro', 'pocket_tts', 'cosyvoice3', 'mms_tts', 'piper', 'espeak'],
-    # Indic languages — omnivoice replaces indic_parler as the primary
-    # (parler kept as fallback for one release cycle).  OmniVoice has
-    # 100-400 training hours per major Indic language vs parler's ~10,
-    # and adds voice cloning which parler lacks entirely.  XTTS-v2
-    # adds Hindi (only); MMS-TTS adds the rest as 1 GB-tier coverage.
-    'hi': ['omnivoice', 'indic_parler', 'xtts_v2', 'chatterbox_ml', 'cosyvoice3', 'mms_tts', 'espeak'],
-    'ta': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'te': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'bn': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'gu': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'kn': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'ml': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'mr': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'or': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'pa': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'ur': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'as': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'ne': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'sa': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'si': ['omnivoice', 'chatterbox_ml', 'mms_tts', 'espeak'],  # Sinhala — mms-tts adds 1 GB-tier
-    'sd': ['omnivoice', 'indic_parler', 'chatterbox_ml', 'mms_tts', 'espeak'],  # Sindhi — Indic Parler + mms
-    # CJK — omnivoice has 500k+ hours of CJK in training; promote over cosyvoice.
-    # MeloTTS slots above the heavy Chatterbox-ML for the 1.5 GB tier.
-    'zh': ['omnivoice', 'melotts', 'cosyvoice3', 'f5_tts', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'ja': ['omnivoice', 'melotts', 'cosyvoice3', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'ko': ['omnivoice', 'melotts', 'cosyvoice3', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    # European — XTTS-v2 (2.5 GB, voice clone) and MeloTTS (1.5 GB)
-    # slot above the 12 GB Chatterbox-ML so users on 4-8 GB GPUs get
-    # quality TTS without the 14 GB allocation that pushes other
-    # workers off the GPU.
-    'de': ['omnivoice', 'xtts_v2', 'cosyvoice3', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'es': ['omnivoice', 'melotts', 'xtts_v2', 'cosyvoice3', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'fr': ['omnivoice', 'melotts', 'xtts_v2', 'cosyvoice3', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'it': ['omnivoice', 'xtts_v2', 'cosyvoice3', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'ru': ['omnivoice', 'xtts_v2', 'cosyvoice3', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'pt': ['omnivoice', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'ar': ['omnivoice', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'nl': ['omnivoice', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'pl': ['omnivoice', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'sv': ['omnivoice', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'tr': ['omnivoice', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'id': ['omnivoice', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'th': ['omnivoice', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'vi': ['omnivoice', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'cs': ['omnivoice', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    # Newly-covered SUPPORTED_LANG_DICT entries — these had no
-    # explicit ladder before and would have hit _DEFAULT_PREFERENCE
-    # (omnivoice → chatterbox_ml → espeak), where chatterbox_ml needs
-    # 14 GB.  MMS-TTS at 1 GB now provides the always-runnable fallback.
-    'hu': ['omnivoice', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
-    'el': ['omnivoice', 'mms_tts', 'chatterbox_ml', 'espeak'],
-    'fi': ['omnivoice', 'mms_tts', 'espeak'],
-    'ro': ['omnivoice', 'mms_tts', 'espeak'],
-    'bg': ['omnivoice', 'mms_tts', 'espeak'],
-    'uk': ['omnivoice', 'mms_tts', 'espeak'],
-    'cy': ['omnivoice', 'mms_tts', 'espeak'],          # Welsh
-    'is': ['omnivoice', 'mms_tts', 'espeak'],          # Icelandic
-    'ms': ['omnivoice', 'mms_tts', 'espeak'],          # Malay
-    'fa': ['omnivoice', 'mms_tts', 'espeak'],          # Persian (uroman)
-    'he': ['omnivoice', 'mms_tts', 'espeak'],          # Hebrew (uroman)
-    'sw': ['omnivoice', 'mms_tts', 'espeak'],          # Swahili
-    'km': ['omnivoice', 'mms_tts', 'espeak'],          # Khmer (uroman)
-    'lo': ['omnivoice', 'mms_tts', 'espeak'],          # Lao (uroman)
-    'my': ['omnivoice', 'mms_tts', 'espeak'],          # Burmese (uroman)
-    # Additional Indic codes that exist in SUPPORTED_LANG_DICT but
-    # weren't in the language preference table previously — these
-    # ride Indic Parler's 22-language coverage, then mms_tts.
-    'brx': ['omnivoice', 'indic_parler', 'mms_tts', 'espeak'],   # Bodo
-    'doi': ['omnivoice', 'indic_parler', 'mms_tts', 'espeak'],   # Dogri
-    'kok': ['omnivoice', 'indic_parler', 'mms_tts', 'espeak'],   # Konkani
-    'mai': ['omnivoice', 'indic_parler', 'mms_tts', 'espeak'],   # Maithili
-    'mni': ['omnivoice', 'indic_parler', 'mms_tts', 'espeak'],   # Manipuri
-    'sat': ['omnivoice', 'indic_parler', 'mms_tts', 'espeak'],   # Santali
-    'ks':  ['omnivoice', 'mms_tts', 'espeak'],                    # Kashmiri
-    # Misc that were previously routed via _DEFAULT_PREFERENCE only.
-    'lv': ['omnivoice', 'mms_tts', 'espeak'],          # Latvian
-    'sr': ['omnivoice', 'mms_tts', 'chatterbox_ml', 'espeak'],   # Serbian
-    'zh-cn': ['omnivoice', 'melotts', 'cosyvoice3', 'f5_tts', 'xtts_v2', 'chatterbox_ml', 'mms_tts', 'espeak'],
-}
-
-# Fallback for unlisted languages — omnivoice covers 646 + mms_tts covers
-# 1100+, so this is reached only when both are uninstalled / can't fit.
-# chatterbox_ml is the heaviest local clone, espeak is the absolute floor.
-_DEFAULT_PREFERENCE = ['omnivoice', 'mms_tts', 'chatterbox_ml', 'espeak']
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -969,19 +472,6 @@ def _is_engine_installed(engine_id: str) -> bool:
             available = True
         elif engine_id == 'kokoro':
             from integrations.service_tools.kokoro_tool import kokoro_synthesize  # noqa: F401
-            available = True
-        elif engine_id == 'melotts':
-            # `melotts` PyPI package ships the `melo` import root.
-            import importlib.util as _ils
-            available = _ils.find_spec('melo') is not None
-        elif engine_id == 'xtts_v2':
-            # `coqui-tts` PyPI package ships `from TTS.api import TTS`.
-            import importlib.util as _ils
-            available = _ils.find_spec('TTS') is not None
-        elif engine_id == 'mms_tts':
-            # transformers is bundled; check the VitsModel symbol so we
-            # detect outright-broken transformers installs early.
-            from transformers import VitsModel  # noqa: F401
             available = True
         elif engine_id == 'makeittalk':
             import os
@@ -1286,21 +776,6 @@ class TTSRouter:
             )
 
         lang = language or detect_language(text)
-
-        # Normalize numbers, currency, URLs, units to spoken form BEFORE
-        # engine selection — every TTS engine benefits (single converging
-        # path).  Latency-sensitive ('instant' urgency) skips the LLM
-        # fallback but keeps the fast rule pass.
-        try:
-            from integrations.channels.media.tts_text_normalizer import (
-                normalize_for_tts,
-            )
-            text = normalize_for_tts(
-                text, lang, use_llm=(urgency != 'instant'),
-            )
-        except Exception as _e:  # never let normalization block synthesis
-            logger.debug(f'tts normalization skipped: {_e}')
-
         require_clone = voice is not None and voice not in ('default', '', None)
 
         # Engine override
@@ -1420,24 +895,6 @@ class TTSRouter:
             return self._call_gpu_engine(
                 'integrations.service_tools.kokoro_tool',
                 'kokoro_synthesize',
-                text, language, voice, output_path,
-            )
-        elif engine_id == 'melotts':
-            return self._call_gpu_engine(
-                'integrations.service_tools.melotts_tool',
-                'melotts_synthesize',
-                text, language, voice, output_path,
-            )
-        elif engine_id == 'xtts_v2':
-            return self._call_gpu_engine(
-                'integrations.service_tools.xtts_tool',
-                'xtts_synthesize',
-                text, language, voice, output_path,
-            )
-        elif engine_id == 'mms_tts':
-            return self._call_gpu_engine(
-                'integrations.service_tools.mms_tts_tool',
-                'mms_tts_synthesize',
                 text, language, voice, output_path,
             )
         return {'error': f'Unknown engine: {engine_id}'}
@@ -1603,97 +1060,6 @@ def get_tts_router() -> TTSRouter:
 # ModelCatalog integration — populate_tts_catalog()
 # ═══════════════════════════════════════════════════════════════
 
-# Reflection-dispatch contract for catalog entries that have NO
-# `tool_module` (pure-JSON model registration via admin UI / hive
-# federation / model_catalog.json edit).  An entry without `tool_module`
-# MUST declare every field below in its `capabilities` dict — otherwise
-# the dispatcher has no way to know how to instantiate the class, marshal
-# the request, or normalize the return.  See task #58 for the full
-# rationale; the schema is finalized at 5 fields, no more.
-_REFLECTION_FIELDS: Tuple[str, ...] = (
-    'import_path',     # 'pkg.module:ClassName'
-    'init_args',       # dict — kwargs for ClassName(**init_args); {} OK
-    'synth_method',    # str — instance method name
-    'params_map',      # dict — {payload_key → method_kwarg}
-    'output_format',   # canonical id (see _OUTPUT_FORMATS below)
-)
-
-# Canonical return-shape identifiers the reflection dispatcher knows
-# how to normalize into a wire-format wav (or path).  Engines that
-# return shapes outside this set MUST use the `tool_module` escape
-# hatch instead — the dispatcher won't guess.
-_OUTPUT_FORMATS: Tuple[str, ...] = (
-    'wav_bytes',       # bytes object holding a WAV-formatted byte stream
-    'numpy_24k',       # 1-D float32 numpy array @ 24 kHz mono
-    'file_path',       # str path to a wav file the engine wrote
-    'bytesio',         # io.BytesIO containing wav bytes
-)
-
-
-def _validate_engine_caps(caps: Dict[str, Any]) -> Optional[str]:
-    """Validate a TTS catalog entry's capabilities dict.
-
-    Returns None when the entry is dispatchable, OR a human-readable
-    error string when it is not.  Two valid shapes:
-
-      1. Python-tool path (escape hatch):
-            caps['tool_module'] = 'pkg.module'  # required
-         The entry will be dispatched via the existing
-         `gpu_worker._dispatch_and_run` path: import the module, pick
-         up `_load[_<variant>]` / `_synthesize[_<variant>]` callbacks
-         by convention.  This is what every code-shipped engine in
-         ENGINE_REGISTRY uses today.
-
-      2. Pure-config / reflection path:
-            caps lacks tool_module BUT declares ALL of _REFLECTION_FIELDS.
-         The dispatcher will use reflection to instantiate the class
-         and call the synth method — no .py file needed for adding
-         new models that fit a homogeneous load+method API (Kokoro,
-         Pocket-TTS, etc., evaluated empirically per engine).
-
-    Validation fires at INGEST time (populate_tts_catalog upsert path
-    AND _catalog_entry_to_spec read path) so a malformed entry cannot
-    reach the dispatcher.  This guards against the "user discovers the
-    error only when they request the voice" failure mode.
-    """
-    if not isinstance(caps, dict):
-        return f'capabilities must be a dict, got {type(caps).__name__}'
-
-    if caps.get('tool_module'):
-        # Python-tool entry — tool_module on its own is sufficient.  The
-        # dispatcher will pick up _load / _synthesize via convention.
-        return None
-
-    # Reflection entry — every field is required.  No partial schemas.
-    missing = [f for f in _REFLECTION_FIELDS if f not in caps]
-    if missing:
-        return (
-            f'entry has no tool_module and is missing reflection fields '
-            f'{missing}; reflection dispatch needs the full 5-field '
-            f'contract: {list(_REFLECTION_FIELDS)}'
-        )
-
-    # Cheap shape sanity — early-fail with a precise message rather than
-    # let the dispatcher trip on a bad type at synth time.
-    if not isinstance(caps.get('init_args'), dict):
-        return f'init_args must be a dict, got {type(caps.get("init_args")).__name__}'
-    if not isinstance(caps.get('params_map'), dict):
-        return f'params_map must be a dict, got {type(caps.get("params_map")).__name__}'
-    if not isinstance(caps.get('synth_method'), str) or not caps['synth_method']:
-        return 'synth_method must be a non-empty str'
-    if not isinstance(caps.get('import_path'), str) or ':' not in caps['import_path']:
-        return (
-            f'import_path must be "pkg.module:ClassName", got '
-            f'{caps.get("import_path")!r}'
-        )
-    if caps.get('output_format') not in _OUTPUT_FORMATS:
-        return (
-            f'output_format must be one of {list(_OUTPUT_FORMATS)}, got '
-            f'{caps.get("output_format")!r}'
-        )
-    return None
-
-
 # Human-readable display names for each engine (used in admin UI)
 _ENGINE_DISPLAY_NAMES: Dict[str, str] = {
     'chatterbox_turbo': 'Chatterbox Turbo (GPU, English, voice-clone)',
@@ -1706,9 +1072,6 @@ _ENGINE_DISPLAY_NAMES: Dict[str, str] = {
     'kokoro':           'Kokoro 82M (CPU/GPU, English, neural)',
     'espeak':           'eSpeak-NG (CPU, 100+ languages, instant fallback)',
     'makeittalk':       'MakeItTalk (Cloud, English)',
-    'melotts':          'MeloTTS (CPU/GPU, 6 langs, neural)',
-    'xtts_v2':          'XTTS-v2 (GPU, 17 langs, voice-clone)',
-    'mms_tts':          'MMS-TTS (CPU/GPU, 50+ langs via VITS)',
 }
 
 # Extra capabilities per engine that don't map 1-to-1 onto TTSEngineSpec fields
@@ -1760,21 +1123,6 @@ _ENGINE_EXTRA_CAPS: Dict[str, Dict[str, Any]] = {
         'emotion_tags': False,
     },
     'makeittalk': {
-        'streaming': False,
-        'paralinguistic': [],
-        'emotion_tags': False,
-    },
-    'melotts': {
-        'streaming': False,
-        'paralinguistic': [],
-        'emotion_tags': False,
-    },
-    'xtts_v2': {
-        'streaming': False,
-        'paralinguistic': [],
-        'emotion_tags': False,
-    },
-    'mms_tts': {
         'streaming': False,
         'paralinguistic': [],
         'emotion_tags': False,
@@ -1844,9 +1192,6 @@ _ENGINE_DISK_GB: Dict[str, float] = {
     'pocket_tts':       0.1,
     'espeak':           0.05,
     'makeittalk':       0.0,
-    'melotts':          1.5,    # 6 per-lang checkpoints, ~250 MB each
-    'xtts_v2':          2.0,    # weights + speakers + config
-    'mms_tts':          0.2,    # ~150 MB per lang lazy-downloaded
 }
 
 # Approximate RAM needed for CPU-capable engines (GB)
@@ -1860,9 +1205,6 @@ _ENGINE_RAM_GB: Dict[str, float] = {
     'pocket_tts':       0.5,
     'espeak':           0.1,
     'makeittalk':       0.1,
-    'melotts':          2.0,
-    'xtts_v2':          3.0,
-    'mms_tts':          1.5,
 }
 
 
@@ -1873,14 +1215,6 @@ def populate_tts_catalog(catalog) -> int:
     plugin mechanism — keeps tts_router as the single source of truth for
     TTS engine capabilities.
 
-    Validation contract (#58): admin- or hive-supplied catalog entries
-    that exist BEFORE this populator runs are validated against
-    `_validate_engine_caps`.  Invalid entries are removed from the
-    catalog with a logged WARNING — they cannot reach the dispatcher.
-    This is the "fail-fast at catalog ingest, not synth time" half of
-    the contract; the other half (validation on every read) lives in
-    `_catalog_entry_to_spec`.
-
     Args:
         catalog: ModelCatalog instance (accepts Any to avoid a hard import
                  at module level — the catalog is passed in by the caller).
@@ -1890,35 +1224,6 @@ def populate_tts_catalog(catalog) -> int:
     """
     # Lazy import inside function body — avoids circular import at module load
     from integrations.service_tools.model_catalog import ModelEntry, ModelType
-
-    # Pre-pass: validate any existing TTS entries (admin/hive seeded the
-    # catalog before us).  Invalid entries are removed + logged so they
-    # don't poison `_refresh_engine_registry_from_catalog` below.  Code-
-    # shipped engines (ENGINE_REGISTRY) ALWAYS have tool_module so they
-    # never trip this; the gate exists for foreign manifests.
-    _drop_ids: List[str] = []
-    for entry in list(catalog.list_by_type('tts')):
-        err = _validate_engine_caps(entry.capabilities or {})
-        if err:
-            logger.warning(
-                'TTS catalog entry %r rejected at ingest: %s', entry.id, err,
-            )
-            _drop_ids.append(entry.id)
-    # #58 Scope-2 (2026-05-07): reflection-only entries (caps lack
-    # tool_module but declare the full 5-field contract) are now
-    # dispatchable via `gpu_worker._dispatch_catalog_id` (`python -m
-    # gpu_worker --catalog-id <id>`).  They survive ingest as long as
-    # `_validate_engine_caps` passes; they are EXCLUDED from the
-    # ENGINE_REGISTRY snapshot by `_refresh_engine_registry_from_catalog`
-    # because TTSEngineSpec carries `tool_module` as a non-optional
-    # dispatch handle for the existing call sites.  The catalog reads
-    # them via the --catalog-id path instead.
-    for _eid in _drop_ids:
-        try:
-            catalog.unregister(_eid, persist=False)
-        except Exception as _re:
-            logger.debug('failed to unregister invalid TTS entry %r: %s',
-                         _eid, _re)
 
     added = 0
     for engine_id, spec in ENGINE_REGISTRY.items():
@@ -2000,41 +1305,6 @@ def populate_tts_catalog(catalog) -> int:
     return added
 
 
-    # Post-upsert: rebuild ENGINE_REGISTRY in place so it reflects the
-    # current catalog state (admin/hive-edited entries become visible
-    # to existing call sites).  Snapshot semantics — runtime catalog
-    # mutations after this point do NOT auto-propagate; a re-bootstrap
-    # is required.  Matches the dict-iter assumption every existing
-    # ENGINE_REGISTRY caller relies on.  See task #58 acceptance #5.
-    _refresh_engine_registry_from_catalog(catalog)
-
-    return added
-
-
-def _refresh_engine_registry_from_catalog(catalog) -> int:
-    """Rebuild ENGINE_REGISTRY in place from the post-upsert catalog.
-
-    Reflection-only entries (no tool_module) are excluded — they live
-    only in the catalog and are dispatched via the `--catalog-id`
-    path.  TTSEngineSpec callers continue to see only spec-shaped
-    entries, exactly as before this refactor.
-
-    Returns the number of entries in the rebuilt registry.
-
-    Idempotent: calling twice with the same catalog state produces the
-    same registry contents.
-    """
-    new_entries: Dict[str, TTSEngineSpec] = {}
-    for entry in catalog.list_by_type('tts'):
-        spec = _catalog_entry_to_spec(entry)
-        if spec is None:
-            continue  # validation failed, or reflection-only entry
-        new_entries[spec.engine_id] = spec
-    ENGINE_REGISTRY.clear()
-    ENGINE_REGISTRY.update(new_entries)
-    return len(new_entries)
-
-
 def _catalog_entry_to_spec(entry) -> Optional[TTSEngineSpec]:
     """Convert a ModelCatalog ModelEntry back to a TTSEngineSpec.
 
@@ -2046,29 +1316,6 @@ def _catalog_entry_to_spec(entry) -> Optional[TTSEngineSpec]:
     """
     caps = entry.capabilities or {}
     tool_module = caps.get('tool_module')
-    Returns None if:
-      * the entry's capabilities fail validation (#58 contract — see
-        `_validate_engine_caps`); the caller should NOT see that entry
-        because the dispatcher cannot route to it.
-      * the entry uses the reflection-only dispatch path (no tool_module).
-        TTSEngineSpec carries `tool_module` as a non-optional dispatch
-        handle for the existing call sites; reflection-only entries are
-        dispatched directly from the catalog and are intentionally
-        excluded from the ENGINE_REGISTRY snapshot.
-    """
-    caps = entry.capabilities or {}
-    err = _validate_engine_caps(caps)
-    if err:
-        # Loud at ingest, silent on subsequent re-reads — the catalog
-        # populator/loader already logged this; don't spam every read.
-        return None
-    tool_module = caps.get('tool_module')
-    if not tool_module:
-        # Valid reflection-only entry, but TTSEngineSpec needs a
-        # tool_module.  Caller (`_refresh_engine_registry_from_catalog`)
-        # will skip None entries and dispatch reflection-only IDs via
-        # the catalog path instead.
-        return None
     tool_function = caps.get('tool_function')
 
     # Determine TTSDevice from backend + supports_* flags

@@ -43,12 +43,11 @@ from .base import (
     ChannelSendError,
     ChannelRateLimitError,
 )
-from .room_capable import RoomCapableAdapter, UnsupportedRoomError
 
 logger = logging.getLogger(__name__)
 
 
-class SlackAdapter(ChannelAdapter, RoomCapableAdapter):
+class SlackAdapter(ChannelAdapter):
     """
     Slack messaging adapter using Bolt framework with Socket Mode.
 
@@ -465,137 +464,6 @@ class SlackAdapter(ChannelAdapter, RoomCapableAdapter):
         except SlackApiError as e:
             logger.error(f"Failed to open Slack DM: {e}")
             return None
-
-    # ─── UNIF-G2: RoomCapableAdapter implementation ──────────────────
-
-    async def join_room(self, room_id: str,
-                        role: str = 'participant') -> bool:
-        """Join a Slack channel as the bot's presence.
-
-        Slack semantics: ``conversations.join`` works on PUBLIC channels
-        only.  For private channels, the bot must be invited by an admin
-        — there's no programmatic self-invite.  We treat
-        "already a member" as success.
-
-        IM (DM) channel ids → ``UnsupportedRoomError`` (DMs aren't
-        rooms — use ``send_message`` for 1:1).
-        """
-        if not self._client:
-            return False
-        if not room_id:
-            return False
-        # Slack channel ids: C* = public, G* = private/group, D* = DM,
-        # MP* = multi-party DM.  Reject DMs.
-        if room_id.startswith('D') or room_id.startswith('MP'):
-            raise UnsupportedRoomError(
-                "Slack DMs are not rooms — use send_message for 1:1.")
-        try:
-            await self._client.conversations_join(channel=room_id)
-            logger.info(
-                "Slack.join_room: channel %s joined (role=%s)",
-                room_id, role)
-            return True
-        except SlackApiError as e:
-            err = (e.response or {}).get('error', '') \
-                if hasattr(e, 'response') else ''
-            # already_in_channel: idempotent success.
-            if err == 'already_in_channel':
-                return True
-            # method_not_supported_for_channel_type: private channels
-            # can only be joined via invite; treat as graceful False so
-            # Join_External_Room can surface "ask an admin to invite the
-            # bot to this private channel" to the user.
-            if err in ('method_not_supported_for_channel_type',
-                       'channel_not_found',
-                       'is_archived',
-                       'missing_scope'):
-                logger.info(
-                    "Slack.join_room: refused for %s (%s)",
-                    room_id, err)
-                return False
-            logger.error(
-                "Slack.join_room: API error for %s: %s",
-                room_id, e)
-            return False
-        except Exception as e:
-            logger.error(
-                "Slack.join_room: unexpected error for %s: %s",
-                room_id, e)
-            return False
-
-    async def leave_room(self, room_id: str) -> bool:
-        """Leave a Slack channel.  Idempotent on already-absent."""
-        if not self._client:
-            return False
-        if not room_id:
-            return False
-        if room_id.startswith('D') or room_id.startswith('MP'):
-            # Can't "leave" a DM.  Caller should treat as no-op.
-            return False
-        try:
-            await self._client.conversations_leave(channel=room_id)
-            logger.info("Slack.leave_room: channel %s left", room_id)
-            return True
-        except SlackApiError as e:
-            err = (e.response or {}).get('error', '') \
-                if hasattr(e, 'response') else ''
-            if err in ('not_in_channel', 'channel_not_found'):
-                # Already absent — idempotent semantics.
-                return True
-            logger.error(
-                "Slack.leave_room: API error for %s: %s", room_id, e)
-            return False
-        except Exception as e:
-            logger.error(
-                "Slack.leave_room: unexpected error for %s: %s",
-                room_id, e)
-            return False
-
-    async def list_room_members(self, room_id: str) -> List[Dict[str, Any]]:
-        """List members of a Slack channel.
-
-        Uses ``conversations.members`` to get user-id list, then
-        ``users.info`` for display names.  Skips the bot itself.
-        Truncated to first page (~100) — full pagination is
-        platform-side overhead the agent doesn't typically need.
-        """
-        if not self._client or not room_id:
-            return []
-        try:
-            response = await self._client.conversations_members(
-                channel=room_id)
-            user_ids = response.get('members', []) or []
-        except SlackApiError as e:
-            logger.error(
-                "Slack.list_room_members: API error for %s: %s",
-                room_id, e)
-            return []
-        except Exception as e:
-            logger.error(
-                "Slack.list_room_members: unexpected error for %s: %s",
-                room_id, e)
-            return []
-
-        result: List[Dict[str, Any]] = []
-        for uid in user_ids:
-            if uid == self._bot_user_id:
-                continue
-            try:
-                info = await self._client.users_info(user=uid)
-                user = info.get('user', {}) or {}
-                result.append({
-                    'id': uid,
-                    'display_name': (user.get('profile', {}) or {}).get(
-                        'display_name') or user.get('real_name') or
-                        user.get('name') or uid,
-                    'is_bot': bool(user.get('is_bot', False)),
-                })
-            except Exception:
-                # Single-user info failure shouldn't drop the whole
-                # list — synthesize a minimal entry.
-                result.append({'id': uid, 'display_name': uid,
-                               'is_bot': False})
-        return result
 
 
 def create_slack_adapter(

@@ -36,12 +36,8 @@ jobs:
             experimental-features = nix-command flakes
 
       - name: Run statix (antipattern detection)
-        # DeterminateSystems installer ships flakes-only — no `nixpkgs`
-        # channel attribute is registered, so `nix-env -iA nixpkgs.X`
-        # fails with `attribute 'nixpkgs' in selection path 'nixpkgs.X'
-        # not found`.  Use the flake form against the pinned input.
         run: |
-          nix profile install nixpkgs#statix
+          nix-env -iA nixpkgs.statix
           echo "::group::statix results"
           statix check nixos/ 2>&1 || true
           echo "::endgroup::"
@@ -50,7 +46,7 @@ jobs:
 
       - name: Run deadnix (unused code detection)
         run: |
-          nix profile install nixpkgs#deadnix
+          nix-env -iA nixpkgs.deadnix
           echo "::group::deadnix results"
           deadnix nixos/ 2>&1 || true
           echo "::endgroup::"
@@ -103,13 +99,8 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install pytest + project deps
-        # tests/conftest.py imports lifecycle_hooks → core.session_cache →
-        # core/__init__.py → core.http_pool → requests, so pytest cannot
-        # collect the test file without the project's runtime deps installed.
-        run: |
-          pip install -r requirements.txt
-          pip install pytest
+      - name: Install pytest
+        run: pip install pytest
 
       - name: Run NixOS config tests
         run: pytest tests/unit/test_nixos_configs.py -v

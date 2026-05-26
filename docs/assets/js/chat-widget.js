@@ -88,17 +88,6 @@
   ].join('\n');
 
   // --- Logic ---
-  // Build iframe URL pointing at the agent route (not root, which requires
-  // login). plugin=1 triggers autoGuest + audio-only in Agent.js as a
-  // safety net; token/user_id let Agent.js pre-populate localStorage so
-  // the login screen is skipped entirely for authenticated embeds.
-  function buildAgentUrl(token, userId) {
-    var qs = '?plugin=1&embed=true&companionAppInstalled=true';
-    if (token) qs += '&token=' + encodeURIComponent(token);
-    if (userId) qs += '&user_id=' + encodeURIComponent(userId);
-    return BASE + '/agents/' + encodeURIComponent(AGENT) + qs;
-  }
-
   function toggle() {
     open = !open;
     if (open) {
@@ -109,11 +98,6 @@
         var guestToken = sessionStorage.getItem('hevolve_guest_token');
         if (guestToken) {
           iframe.src = BASE + '/?embed=true&companionAppInstalled=true&token=' + encodeURIComponent(guestToken);
-        // Guest register via existing API, then pass token + user_id to iframe
-        var cachedToken = sessionStorage.getItem('hevolve_guest_token');
-        var cachedUserId = sessionStorage.getItem('hevolve_guest_user_id');
-        if (cachedToken && cachedUserId) {
-          iframe.src = buildAgentUrl(cachedToken, cachedUserId);
         } else {
           fetch(BASE + '/api/social/auth/guest-register', {
             method: 'POST',
@@ -128,16 +112,6 @@
           })
           .catch(function() {
             iframe.src = BASE + '/?embed=true&companionAppInstalled=true';
-            var payload = (data && data.data) || data || {};
-            var token = payload.token || (data && data.token) || '';
-            var user = payload.user || (data && data.user) || {};
-            var userId = user.id || payload.user_id || '';
-            if (token) sessionStorage.setItem('hevolve_guest_token', token);
-            if (userId) sessionStorage.setItem('hevolve_guest_user_id', String(userId));
-            iframe.src = buildAgentUrl(token, userId);
-          })
-          .catch(function() {
-            iframe.src = buildAgentUrl('', '');
           });
         }
       }

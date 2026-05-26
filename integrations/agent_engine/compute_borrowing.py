@@ -42,7 +42,7 @@ class ComputeBorrowingService:
         try:
             from integrations.social.peer_discovery import get_peer_discovery
             pd = get_peer_discovery()
-            pd.broadcast({
+            pd.gossip_broadcast({
                 'type': 'compute_offer',
                 'payload': offer,
             })
@@ -79,7 +79,7 @@ class ComputeBorrowingService:
             try:
                 from integrations.social.peer_discovery import get_peer_discovery
                 pd = get_peer_discovery()
-                pd.broadcast({
+                pd.gossip_broadcast({
                     'type': 'compute_request',
                     'payload': {
                         'requester': node_id,

@@ -150,11 +150,6 @@ class Linter:
         text = f"## Running: {' '.join(flake8_cmd)}\n\n"
 
         try:
-            try:
-                from core.subprocess_safe import hidden_popen_kwargs
-                _hide = hidden_popen_kwargs()
-            except Exception:
-                _hide = {}
             result = subprocess.run(
                 flake8_cmd,
                 capture_output=True,
@@ -163,7 +158,6 @@ class Linter:
                 encoding=self.encoding,
                 errors="replace",
                 cwd=self.root,
-                **_hide,
             )
             errors = result.stdout + result.stderr
         except Exception as e:

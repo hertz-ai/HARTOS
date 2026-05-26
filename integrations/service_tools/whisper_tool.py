@@ -843,87 +843,6 @@ STREAM_CHUNK_BYTES = STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE * STREAM_CHANN
 STREAM_MAX_BUFFER_BYTES = STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE * STREAM_CHANNELS * 30
 
 
-def _ws_path(websocket) -> str:
-    """Best-effort URL-path extractor across websockets lib versions.
-
-    websockets 11+ moved the request to ``websocket.request.path``;
-    earlier versions exposed ``websocket.path`` directly.  We probe
-    both and fall back to empty string when neither is available.
-    Never raises.
-    """
-    for getter in (
-        lambda ws: ws.request.path,
-        lambda ws: ws.path,
-    ):
-        try:
-            val = getter(websocket)
-            if isinstance(val, str):
-                return val
-        except Exception:
-            continue
-    return ''
-
-
-def _parse_call_context(ws_path: str) -> tuple:
-    """Parse ``?call_id=<id>&user_id=<u>`` from a WS request path.
-
-    UNIF-G7 / W1.7 Producer C — the RN mic stream (and any other
-    browser/mobile audio source) opens the streaming-STT WebSocket
-    with these query params attached when the audio belongs to a
-    voice room.  Without the params, behavior is unchanged (today's
-    one-shot transcription clients still work).
-
-    Returns ``(call_id, user_id)`` — either may be ``None``.  Never
-    raises.
-    """
-    if not ws_path:
-        return (None, None)
-    from urllib.parse import urlparse, parse_qs
-    try:
-        parsed = urlparse(ws_path)
-        qs = parse_qs(parsed.query or '')
-        call_id = (qs.get('call_id') or [None])[0]
-        user_id = (qs.get('user_id') or [None])[0]
-        return (call_id or None, user_id or None)
-    except Exception:
-        return (None, None)
-
-
-def _maybe_enqueue_call_segment(
-    call_id: Optional[str],
-    user_id: Optional[str],
-    text: str,
-    lang: str,
-    is_final: bool,
-) -> None:
-    """If the WS client opted in via ``?call_id=`` AND this is a final
-    segment, land it in the canonical per-call queue so the
-    AgentBridgeWorker can drain it (UNIF-G3 / W1.2 consumer).
-
-    Single canonical writer for browser/mobile-mic-driven transcripts —
-    same sink as the future Discord-voice-recv (Producer A) and
-    LiveKit-RTC (Producer B) audio paths.  No parallel queue.
-
-    Best-effort: never raises out of the WS handler hot path.
-    """
-    if not call_id or not is_final or not text:
-        return
-    try:
-        enqueue_stt_segment(call_id, {
-            'text': text,
-            'lang': lang,
-            'author_id': user_id or 'unknown',
-            'is_final': True,
-            # t0/t1/speaker stay None — RN mic stream is single-speaker
-            # by definition (the user typing into the SPA); future
-            # multi-speaker producers will set speaker.
-        })
-    except Exception as e:
-        logger.debug(
-            "whisper_tool._maybe_enqueue_call_segment failed "
-            "(call=%s): %s", call_id, e)
-
-
 async def _stt_stream_handler(websocket):
     """Handle a single streaming STT WebSocket connection.
 
@@ -936,14 +855,6 @@ async def _stt_stream_handler(websocket):
     Sends back:
       - {"text": "...", "language": "en", "is_final": false} for interim
       - {"text": "...", "language": "en", "is_final": true} for final (pause detected)
-
-    Optional UNIF-G7 hook (Producer C):
-      The connection URL MAY include ``?call_id=<id>&user_id=<u>``.
-      When present, every final segment is ALSO landed in the per-call
-      STT queue (whisper_tool.enqueue_stt_segment) so the
-      AgentBridgeWorker can drain it and emit the meet_copilot card.
-      Absence of the params preserves today's behavior exactly — RN
-      one-shot transcription clients are unaffected.
 
     CRASH ISOLATION:
       - Model crashes are isolated: _transcribe_buffer routes through
@@ -963,11 +874,6 @@ async def _stt_stream_handler(websocket):
 
     audio_buffer = io.BytesIO()
     last_transcribe_size = 0
-    # UNIF-G7 Producer C: extract optional call context from the
-    # WS request path.  When absent (call_id is None), the
-    # _maybe_enqueue_call_segment helper degrades to a no-op so plain
-    # transcription clients see ZERO behavior change.
-    call_id, user_id = _parse_call_context(_ws_path(websocket))
 
     try:
         async for message in websocket:
@@ -986,8 +892,6 @@ async def _stt_stream_handler(websocket):
                             await websocket.send(json.dumps({
                                 'text': text, 'language': lang, 'is_final': True,
                             }))
-                            _maybe_enqueue_call_segment(
-                                call_id, user_id, text, lang, True)
                         audio_buffer = io.BytesIO()
                         last_transcribe_size = 0
                         continue
@@ -1025,8 +929,6 @@ async def _stt_stream_handler(websocket):
                     await websocket.send(json.dumps({
                         'text': text, 'language': lang, 'is_final': True,
                     }))
-                    _maybe_enqueue_call_segment(
-                        call_id, user_id, text, lang, True)
                 audio_buffer = io.BytesIO()
                 last_transcribe_size = 0
                 continue
@@ -1222,136 +1124,6 @@ def start_stt_stream_server(port: int = 0) -> Optional[int]:
 def get_stt_stream_port() -> Optional[int]:
     """Get the port of the running streaming STT WebSocket server."""
     return _stt_ws_port
-
-
-# ═══════════════════════════════════════════════════════════════
-# Per-call STT segment queue (UNIF-G3 / W1.2)
-# ═══════════════════════════════════════════════════════════════
-#
-# When a call has subscribers (LiveKit room, Discord voice channel,
-# Teams meet, etc.), an audio-frame producer feeds frames through the
-# streaming STT WebSocket above and receives ``{text, language,
-# is_final}`` events back.  ``enqueue_stt_segment`` is the canonical
-# place to land FINAL segments so the AgentBridgeWorker (which doesn't
-# care which adapter produced the audio) can drain them via
-# ``dequeue_segments`` from its tick loop.
-#
-# This is the single canonical home for STT-segment buffering — every
-# audio-source adapter (LiveKit subscriber, Discord voice receiver,
-# RN mic stream) lands segments here; every consumer (agent_voice_bridge
-# worker, transcript recorder) reads here.  No parallel queues.
-
-import threading
-from collections import deque
-from typing import Any, Dict, List, Tuple
-
-# Per-call queues of (segment_id, segment_dict) tuples.  Bounded by the
-# bridge worker drain cadence (~250ms) so unbounded growth is a bug
-# elsewhere; we still keep a soft cap to defend against producer leaks.
-_STT_SEGMENT_QUEUE: Dict[str, deque] = {}
-_STT_SEGMENT_NEXT_ID: Dict[str, int] = {}
-_STT_SEGMENT_LOCK = threading.Lock()
-_STT_SEGMENT_CAP_PER_CALL = 1024  # segments; older are evicted with WARN
-
-
-def enqueue_stt_segment(call_id: str, segment: Dict[str, Any]) -> int:
-    """Append a final STT segment for ``call_id``.
-
-    Producer-side: any audio-adapter that has decoded a final transcript
-    chunk calls this.  ``segment`` SHOULD include:
-      - ``text``    : transcript text
-      - ``lang``    : detected language (BCP-47-ish)
-      - ``t0``,``t1``: float seconds (segment span on the call timeline)
-      - ``speaker`` : optional speaker id / name (None ⇒ unknown)
-      - ``author_id``: caller-supplied participant identifier — used by
-                       the consumer to skip self-authored segments
-      - ``is_final``: optional, defaults True on enqueue (interim
-                       segments don't belong here)
-
-    Returns the assigned segment_id (monotonic int per call) so the
-    producer can correlate downstream events.
-
-    Best-effort: never raises.  Caller's ``call_id`` is required.
-    """
-    if not call_id:
-        return -1
-    seg = dict(segment or {})
-    seg.setdefault('is_final', True)
-    with _STT_SEGMENT_LOCK:
-        next_id = _STT_SEGMENT_NEXT_ID.get(call_id, 0) + 1
-        _STT_SEGMENT_NEXT_ID[call_id] = next_id
-        seg['segment_id'] = next_id
-        q = _STT_SEGMENT_QUEUE.setdefault(call_id, deque())
-        q.append((next_id, seg))
-        # Evict oldest if soft cap exceeded — defends against a leaked
-        # producer that never has its consumer attach.  Real flows
-        # drain at 250ms cadence so this should never fire.
-        while len(q) > _STT_SEGMENT_CAP_PER_CALL:
-            _evicted = q.popleft()
-            logger.warning(
-                "whisper_tool.enqueue_stt_segment: call=%s queue cap "
-                "%d exceeded; evicted seg_id=%s",
-                call_id, _STT_SEGMENT_CAP_PER_CALL, _evicted[0])
-    return next_id
-
-
-def dequeue_segments(
-    call_id: str,
-    since: int | None = None,
-) -> List[Dict[str, Any]]:
-    """Drain final STT segments for ``call_id`` newer than ``since``.
-
-    Consumer-side: the agent_voice_bridge worker calls this on each
-    tick.  Returns segments in arrival order (FIFO).  Each returned
-    dict carries the ``segment_id`` the producer was given so the
-    caller can update its ``since`` watermark for the next tick.
-
-    ``since=None`` returns all queued segments and resets the queue
-    for that call.  ``since=N`` returns only segments with id > N
-    AND prunes those segments from the queue.
-
-    Best-effort: missing call_id → ``[]``.
-    """
-    if not call_id:
-        return []
-    with _STT_SEGMENT_LOCK:
-        q = _STT_SEGMENT_QUEUE.get(call_id)
-        if not q:
-            return []
-        if since is None:
-            drained = [seg for (_sid, seg) in q]
-            q.clear()
-            return drained
-        # Prune everything ≤ since, return everything > since.
-        drained: List[Dict[str, Any]] = []
-        # Iterate from left; any item with id ≤ since is consumed but
-        # not returned (already-acked).  Items > since are returned
-        # AND removed (so the next dequeue with the same since is a
-        # no-op, but normally callers update their watermark).
-        keep: deque = deque()
-        for sid, seg in q:
-            if sid > since:
-                drained.append(seg)
-            # else: already acked; drop
-        # Replace the queue contents with whatever's still > since
-        # but un-drained (none currently — we drained ALL items > since).
-        # Future-proofing for partial drains: keep is empty here, but
-        # the structure makes the intent explicit.
-        q.clear()
-        q.extend(keep)
-        return drained
-
-
-def reset_stt_segment_queue(call_id: str) -> None:
-    """Drop all queued segments for a call (called on detach / hangup).
-
-    Best-effort: missing call_id is a no-op.
-    """
-    if not call_id:
-        return
-    with _STT_SEGMENT_LOCK:
-        _STT_SEGMENT_QUEUE.pop(call_id, None)
-        _STT_SEGMENT_NEXT_ID.pop(call_id, None)
 
 
 # ═══════════════════════════════════════════════════════════════

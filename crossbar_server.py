@@ -3,7 +3,6 @@ import os
 import asyncio
 from autobahn.asyncio.component import Component, run
 from autobahn.wamp.exception import ApplicationError
-from autobahn.wamp.types import SubscribeOptions
 from reuse_recipe import chat_agent, crossbar_multiagent, time_based_execution
 
 print('Inside crossbar_server')
@@ -180,33 +179,11 @@ async def joined(session, details):
     global wamp_session
     wamp_session = session  # Store session
 
-    # #510 follow-up: multichat topic is now per-user
-    # (com.hertzai.hevolve.agent.multichat.{user_id}) to match HARTOS's
-    # chat/action/vision/etc. convention so WAMP router ACL (#246) gates
-    # cross-tenant subscription.  Wildcard prefix match catches every
-    # per-user variant in one subscription on this process.
     try:
-        await session.subscribe(
-            on_event,
-            "com.hertzai.hevolve.agent.multichat",
-            options=SubscribeOptions(match='prefix'),
-        )
-        print("Subscribed to multichat prefix com.hertzai.hevolve.agent.multichat")
+        await session.subscribe(on_event, "com.hertzai.hevolve.agent.multichat")
+        print("Subscribed to topic")
     except Exception as e:
-        print(f"Could not subscribe to multichat prefix: {e}")
-
-    # Compute relay — same-user phone→HARTOS behind NAT
-    try:
-        from integrations.social.models import get_db, User
-        # Subscribe to all active user compute topics
-        # For now, use a wildcard-style approach: subscribe to the user who owns this node
-        owner_id = os.environ.get('HEVOLVE_OWNER_USER_ID', '')
-        if owner_id:
-            compute_topic = f"com.hertzai.hevolve.compute.request.{owner_id}"
-            await session.subscribe(on_compute_request, compute_topic)
-            print(f"Subscribed to compute relay: {compute_topic}")
-    except Exception as e:
-        print(f"Compute relay subscription skipped: {e}")
+        print(f"Could not subscribe to topic: {e}")
 
     # Compute relay — same-user phone→HARTOS behind NAT
     try:

@@ -40,9 +40,6 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Downloads: downloads.md
-  - Hive Contest: hive-contest.md
-  - Neuro & Biometric Providers: neuro-providers.md
-  - Agent Plugin (embed): agent-plugin.md
   - Getting Started:
     - Quick Start: getting-started/quickstart.md
     - Installation: getting-started/installation.md

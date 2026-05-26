@@ -59,12 +59,11 @@ from .base import (
     ChannelSendError,
     ChannelRateLimitError,
 )
-from .room_capable import RoomCapableAdapter, UnsupportedRoomError
 
 logger = logging.getLogger(__name__)
 
 
-class TelegramAdapter(ChannelAdapter, RoomCapableAdapter):
+class TelegramAdapter(ChannelAdapter):
     """
     Telegram messaging adapter.
 
@@ -509,121 +508,6 @@ class TelegramAdapter(ChannelAdapter, RoomCapableAdapter):
         except TelegramError as e:
             logger.error(f"Failed to download file: {e}")
             return False
-
-    # ─── UNIF-G2: RoomCapableAdapter implementation ──────────────────
-
-    async def join_room(self, room_id: str,
-                        role: str = 'participant') -> bool:
-        """Validate the bot's presence in a Telegram chat.
-
-        Telegram bots cannot self-join chats — bots are added by an
-        admin or via invite link.  ``join_room`` here probes whether
-        the bot is ALREADY a member of the chat: ``get_chat`` succeeds
-        ⇒ in the chat ⇒ True; raises ``Forbidden`` / ``BadRequest``
-        ⇒ not yet added ⇒ False (caller can prompt the user to add the
-        bot first).
-
-        Private chats (DMs) → raise ``UnsupportedRoomError`` per Mixin
-        contract.
-        """
-        if not self._bot or not room_id:
-            return False
-        try:
-            chat = await self._bot.get_chat(room_id)
-        except TelegramError as e:
-            logger.info(
-                "Telegram.join_room: bot not in chat %s (%s)",
-                room_id, e)
-            return False
-        except Exception as e:
-            logger.error(
-                "Telegram.join_room: unexpected error for %s: %s",
-                room_id, e)
-            return False
-        # Reject DMs.
-        chat_type = getattr(chat, 'type', None)
-        if str(chat_type).lower() == 'private':
-            raise UnsupportedRoomError(
-                "Telegram private chats are not rooms — use "
-                "send_message for 1:1.")
-        logger.info(
-            "Telegram.join_room: chat %s present (type=%s, role=%s)",
-            room_id, chat_type, role)
-        return True
-
-    async def leave_room(self, room_id: str) -> bool:
-        """Leave a Telegram group / supergroup / channel.
-
-        Telegram bots can call ``leave_chat`` for groups, supergroups,
-        and channels.  Private chats can't be "left" by the bot.
-        Idempotent on already-absent (returns True so the caller can
-        treat it as a no-op success).
-        """
-        if not self._bot or not room_id:
-            return False
-        try:
-            await self._bot.leave_chat(room_id)
-            logger.info("Telegram.leave_room: chat %s left", room_id)
-            return True
-        except TelegramError as e:
-            # Already absent / chat deleted / forbidden — treat as
-            # idempotent success so detach flows aren't blocked by a
-            # mismatch between bookkeeping and live state.
-            logger.info(
-                "Telegram.leave_room: %s already absent (%s)",
-                room_id, e)
-            return True
-        except Exception as e:
-            logger.error(
-                "Telegram.leave_room: unexpected error for %s: %s",
-                room_id, e)
-            return False
-
-    async def list_room_members(
-        self, room_id: str,
-    ) -> List[Dict[str, Any]]:
-        """List Telegram chat members.
-
-        Telegram restricts the bot API: regular bots cannot list ALL
-        members of a group / supergroup.  We return administrators +
-        creator from ``get_chat_administrators`` — that's the
-        observable subset the bot is allowed to enumerate.  Channels
-        and small groups behave the same way.
-        """
-        if not self._bot or not room_id:
-            return []
-        try:
-            admins = await self._bot.get_chat_administrators(room_id)
-        except TelegramError as e:
-            logger.info(
-                "Telegram.list_room_members: cannot list %s (%s)",
-                room_id, e)
-            return []
-        except Exception as e:
-            logger.error(
-                "Telegram.list_room_members: unexpected for %s: %s",
-                room_id, e)
-            return []
-        result: List[Dict[str, Any]] = []
-        for member in admins or []:
-            user = getattr(member, 'user', None)
-            if user is None:
-                continue
-            uid = getattr(user, 'id', None)
-            if uid is None:
-                continue
-            # Skip bot itself.
-            if (self._bot_user_id is not None and
-                    str(uid) == str(self._bot_user_id)):
-                continue
-            full_name = (getattr(user, 'full_name', None)
-                         or getattr(user, 'username', None) or str(uid))
-            result.append({
-                'id': str(uid),
-                'display_name': full_name,
-                'is_bot': bool(getattr(user, 'is_bot', False)),
-            })
-        return result
 
 
 def create_telegram_adapter(token: str = None, **kwargs) -> TelegramAdapter:

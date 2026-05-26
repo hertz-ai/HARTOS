@@ -63,7 +63,6 @@ from ..base import (
     ChannelSendError,
     ChannelRateLimitError,
 )
-from ..room_capable import RoomCapableAdapter, UnsupportedRoomError
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +100,7 @@ class ThreadInfo:
     reply_count: int = 0
 
 
-class MatrixAdapter(ChannelAdapter, RoomCapableAdapter):
+class MatrixAdapter(ChannelAdapter):
     """
     Matrix protocol messaging adapter with E2EE support.
 
@@ -636,74 +635,29 @@ class MatrixAdapter(ChannelAdapter, RoomCapableAdapter):
             logger.error(f"Failed to create room: {e}")
             return None
 
-    async def join_room(self, room_id: str,
-                        role: str = 'participant') -> bool:
-        """Join a Matrix room (UNIF-G2 RoomCapableAdapter contract).
-
-        Accepts both room ids (``!room:server``) and aliases
-        (``#alias:server``).  Role is informational only — Matrix
-        permissions are server-side via power levels and the bot's
-        send permissions are set by the room's existing ACL.
-        """
+    async def join_room(self, room_id_or_alias: str) -> bool:
+        """Join a Matrix room."""
         if not self._client:
             return False
-        if not room_id:
-            return False
+
         try:
-            response = await self._client.join(room_id)
-            ok = isinstance(response, JoinResponse)
-            if ok:
-                logger.info(
-                    "Matrix.join_room: %s joined (role=%s)",
-                    room_id, role)
-            return ok
+            response = await self._client.join(room_id_or_alias)
+            return isinstance(response, JoinResponse)
         except Exception as e:
-            logger.error(f"Matrix.join_room: failed for {room_id}: {e}")
+            logger.error(f"Failed to join room: {e}")
             return False
 
     async def leave_room(self, room_id: str) -> bool:
-        """Leave a Matrix room.  Idempotent on already-absent."""
-        if not self._client or not room_id:
+        """Leave a Matrix room."""
+        if not self._client:
             return False
+
         try:
             await self._client.room_leave(room_id)
             return True
         except Exception as e:
-            logger.error(f"Matrix.leave_room: failed for {room_id}: {e}")
+            logger.error(f"Failed to leave room: {e}")
             return False
-
-    async def list_room_members(self, room_id: str) -> List[Dict[str, Any]]:
-        """List Matrix room members.
-
-        Reads from the local sync state when available
-        (``client.rooms[room_id].users``); falls back to ``[]`` when the
-        client hasn't synced this room yet.  Skips the bot's own
-        user_id.
-        """
-        if not self._client or not room_id:
-            return []
-        try:
-            room = (self._client.rooms or {}).get(room_id)
-            if room is None:
-                return []
-            users = getattr(room, 'users', None) or {}
-            self_uid = getattr(self._client, 'user_id', None)
-            result: List[Dict[str, Any]] = []
-            for uid, user in users.items():
-                if uid == self_uid:
-                    continue
-                result.append({
-                    'id': str(uid),
-                    'display_name': (
-                        getattr(user, 'display_name', None)
-                        or getattr(user, 'name', None) or str(uid)),
-                    'is_bot': False,
-                })
-            return result
-        except Exception as e:
-            logger.error(
-                f"Matrix.list_room_members: failed for {room_id}: {e}")
-            return []
 
     async def invite_user(self, room_id: str, user_id: str) -> bool:
         """Invite a user to a Matrix room."""

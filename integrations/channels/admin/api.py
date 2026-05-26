@@ -2290,11 +2290,6 @@ def reset_config():
 # field and is honoured by
 # ``IdleDetectionService.get_idle_opted_in_agents`` so the agent daemon
 # immediately stops dispatching work to paused agents on its next tick.
-# ``IdleDetectionService._check_user_dispatchable`` (the shared dispatchability
-# check both ``get_idle_agent_personas`` — used by agent_daemon + coding_daemon
-# for local goal dispatch — AND ``get_idle_opted_in_agents`` — used by
-# peer_discovery for distributed-compute sharing — call into).  Pausing the
-# agent immediately stops dispatching on the next tick of either daemon.
 
 def _require_admin_user():
     """Raise PermissionError unless the authenticated caller is an admin.

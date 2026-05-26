@@ -40,14 +40,6 @@ VALID_COMMAND_TYPES = frozenset({
     'tier_promote',
     'tier_demote',
     'device_control',
-    # PR Q — channel-health notifications.  Fired when an adapter's
-    # auth check fails (token expired, 401, websocket closed by
-    # remote).  AgentInlineChatCard's case 'banner' renders it as a
-    # "Reconnect" CTA that kicks the existing reconnect_channel
-    # agent tool — no parallel reconnect path; the banner is just a
-    # UI nudge into Connect_Channel's standard flow.  Params:
-    # ``{channel_type, binding_id, reason}``.
-    'channel_unhealthy',
 })
 
 
@@ -749,65 +741,3 @@ def _sign_command(cmd_type: str, params: dict, target_node_id: str) -> str:
     except (ImportError, Exception) as e:
         logger.debug(f"Fleet: command signing unavailable: {e}")
         return ''
-
-
-# PR Q — convenience helpers for channel-health fan-out.
-#
-# Both register_channel's adapter-probe failure (agent_tools.py) and
-# any future per-channel health watchdog need to notify every device
-# the user has linked, not just the one that initiated the action.
-# Encapsulating the (device-lookup → per-device push_command) loop in
-# one place keeps the call sites slim — and means a future change to
-# the device-targeting policy (e.g. only push to currently-online
-# devices via DeviceBinding.last_active_at) lives in one function.
-
-def emit_channel_unhealthy(
-    db, user_id, channel_type: str, reason: str = '',
-    binding_id: Optional[int] = None,
-) -> int:
-    """Fan out a ``channel_unhealthy`` fleet command to every active
-    device the user has linked.  Returns the number of commands
-    successfully queued (0 if no devices, or if FleetCommand model is
-    unavailable in this build).  Safe to call from any path — never
-    raises on transient DB / signing errors, just logs and returns
-    the partial count so the caller's primary action (channel
-    registration, etc.) is never blocked by a UX-nudge failure.
-    """
-    try:
-        from .models import DeviceBinding
-        devices = db.query(DeviceBinding).filter_by(
-            user_id=str(user_id), is_active=True,
-        ).all()
-    except Exception as e:
-        logger.debug(f"Fleet/channel_unhealthy: device lookup failed: {e}")
-        return 0
-
-    if not devices:
-        return 0
-
-    params = {
-        'channel_type': channel_type,
-        'reason': reason or 'authentication expired',
-        'binding_id': binding_id,
-    }
-    queued = 0
-    for d in devices:
-        node_id = getattr(d, 'device_id', None) or getattr(d, 'node_id', None)
-        if not node_id:
-            continue
-        try:
-            cmd = FleetCommandService.push_command(
-                db, node_id=node_id, cmd_type='channel_unhealthy',
-                params=params,
-            )
-            if cmd is not None:
-                queued += 1
-        except Exception as e:
-            logger.debug(
-                f"Fleet/channel_unhealthy: push to {node_id[:8]}… failed: {e}"
-            )
-    logger.info(
-        f"Fleet/channel_unhealthy: queued {queued}/{len(devices)} commands "
-        f"for user={user_id} channel={channel_type}"
-    )
-    return queued

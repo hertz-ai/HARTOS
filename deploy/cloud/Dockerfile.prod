@@ -140,16 +140,6 @@ RUN chown -R appuser:appgroup /app
 # Switch to non-root user
 USER appuser
 
-# ── LiveKit SFU intentionally NOT staged in this image ──
-# This is the *central* HARTOS image — sync / federation / backup-restore
-# only.  Voice/video calls run on regional or flat HARTOS nodes that DO
-# host an SFU (their image is built from the top-level Dockerfile, which
-# pre-stages livekit-server in Layer 4).  HEVOLVE_DEPLOY_MODE=central
-# below makes integrations.social.livekit_supervisor.supervisor_should_run()
-# return False, so no one tries to spawn a missing binary at startup.
-# Operators that override this for a hybrid deployment must mount the
-# binary at /usr/local/bin/livekit-server or set LIVEKIT_BINARY_PATH.
-
 # Environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -159,9 +149,7 @@ ENV PYTHONUNBUFFERED=1 \
     WORKERS=4 \
     THREADS=2 \
     TIMEOUT=120 \
-    HEVOLVE_ENFORCEMENT_MODE=hard \
-    HEVOLVE_DEPLOY_MODE=central \
-    LIVEKIT_DISABLE=1
+    HEVOLVE_ENFORCEMENT_MODE=hard
 
 # Expose port
 EXPOSE 8000

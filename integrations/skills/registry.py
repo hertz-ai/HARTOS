@@ -22,13 +22,6 @@ from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger(__name__)
 
-try:
-    from core.labeled_tool import labeled_tool
-except ImportError:  # cx_Freeze / degraded test env
-    def labeled_tool(name, func, description, *, ui_label):  # type: ignore
-        from langchain.agents import Tool as _Tool
-        return _Tool(name=name, func=func, description=description)
-
 
 # ---------------------------------------------------------------------------
 # YAML frontmatter parser (no PyYAML dependency - keep it self-contained)
@@ -360,6 +353,8 @@ class SkillRegistry:
         Each skill becomes a tool that returns the skill's instructions with the
         user's query injected, letting the LLM execute the skill as a thought experiment.
         """
+        from langchain.agents import Tool
+
         tools = []
         for name, skill in self._skills.items():
             if not skill.user_invocable:
@@ -376,28 +371,13 @@ class SkillRegistry:
                 result += f"## User Request\n\n{query}\n"
                 return result
 
-            tool_name = f"hart_skill_{name}"
-            # Friendly UI status label per #508 option C — registry-driven labels.
-            # Source hints: github → "Running Claude Code skill…", local SKILL.md → "Markdown",
-            # builtin → use description fragment.  Keep ≤60 chars.
-            _src = (skill.source or "local").lower()
-            if _src == "github":
-                _label = f"Running {skill.name} (Claude Code skill)…"
-            elif _src == "http":
-                _label = f"Running {skill.name} skill from web…"
-            elif _src == "builtin":
-                _label = f"Running {skill.name} (built-in skill)…"
-            else:
-                _label = f"Running {skill.name} skill…"
-
-            tools.append(labeled_tool(
-                name=tool_name,
+            tools.append(Tool(
+                name=f"hart_skill_{name}",
                 func=execute_skill,
                 description=(
                     f"[HART Skill] {skill.description}. "
                     f"Use this skill to help with: {', '.join(skill.tags) if skill.tags else skill.name}"
                 ),
-                ui_label=_label[:60],
             ))
 
         return tools

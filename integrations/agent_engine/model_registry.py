@@ -106,25 +106,6 @@ class ModelRegistry:
                      f"(tier={backend.tier.value}, latency={backend.avg_latency_ms}ms, "
                      f"accuracy={backend.accuracy_score})")
 
-    def unregister(self, model_id: str) -> bool:
-        """Remove a registered backend.
-
-        Returns True if a backend was removed, False if no entry existed.
-        Idempotent — callers that don't track whether a backend is
-        currently registered (e.g. peer health-check loops) can call
-        this safely on every disconnect.
-
-        Used by HiveExpertDiscovery when a hive peer revokes its
-        capability advertisement or fails health checks repeatedly.
-        """
-        with self._lock:
-            existed = model_id in self._models
-            if existed:
-                del self._models[model_id]
-        if existed:
-            logger.info(f"ModelRegistry: unregistered {model_id}")
-        return existed
-
     def get_model(self, model_id: str) -> Optional[ModelBackend]:
         with self._lock:
             return self._models.get(model_id)

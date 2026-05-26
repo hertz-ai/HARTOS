@@ -31,58 +31,13 @@ The master key is a kill switch for a distributed intelligence. It is not a deve
 
 You MAY read `security/master_key.py` to understand the public key verification flow. You MAY NOT interact with the private key in any way.
 
-## Branch Discipline — MAIN BRANCH ONLY (MANDATORY)
-
-**Work directly on `main` in the main clone.  Every session.  No exceptions.**
-
-- **Never** create, use, or resume a `claude/*` branch.
-- **Never** create or use a git worktree (`.claude/worktrees/*`).
-- **Never** operate inside a worktree directory — even if the Claude
-  Code harness boots you there.  Step out immediately and use
-  absolute paths to the main clone.
-- **All commits land on `main`.**  All pushes go to `origin/main`.
-
-Full protocol + session-start sanity check + violation log live in
-the user-memory file `memory/feedback_main_branch_only.md` (under
-`~/.claude/projects/.../memory/`).  Read it if you ever see a
-`claude/*` branch or `.claude/worktrees/` dir — that is a regression
-and must be reported to the user, not silently accepted.
-
-If the harness forces you into a worktree:
-1. Do NOT edit files inside the worktree.
-2. Use absolute paths in every `Edit`/`Write`/`Read` call so tools
-   act on the main clone (e.g.
-   `C:\Users\sathi\PycharmProjects\HARTOS\hart_intelligence_entry.py`).
-3. Prefix every `git` command with
-   `cd C:/Users/sathi/PycharmProjects/HARTOS && git …`
-   so git never defaults to the worktree's CWD.
-4. After session ends, the user deletes the filesystem leftovers:
-   `cmd /c "rd /s /q C:\Users\sathi\PycharmProjects\HARTOS\.claude\worktrees"`.
-
-Why this rule exists (2026-04-21 incident): the Nunba session was
-booted on `claude/determined-elbakyan-94a24c` in a worktree, leaving
-a stale branch and filesystem leftovers that polluted `git branch -a`
-and confused which copy of the code had the latest edits.  User
-called it out directly: parallel branches always drift, and the user
-should never need to ask "which one has my fix?" — the answer is
-always `main`.  HARTOS follows the same rule for the same reason.
-
 ## Common Commands
-
-### Logs (where to look when debugging)
-| Path | Contents |
-|------|----------|
-| `~/Documents/Nunba/logs/frozen_debug.log` | Main Nunba + HARTOS log — timestamps, RequestIDs, httpx calls, SSE broadcasts, ToolMessageHandler's `=== FULL INPUT MESSAGES DEBUG ===` dumps (messages portion only — autogen attaches system_message + tools AFTER `transform_messages` runs, so this dump is the messages-only view) |
-| `~/Documents/Nunba/logs/llama_server_8082.log` | llama-server stdout/stderr — **with `--log-timestamps --verbose`** every request body, slot lifecycle, `task.n_tokens`, and `send_error` line (e.g. `Context size has been exceeded`, `request (N tokens) exceeds the available context size`) carries a `[HH:MM:SS.mmm]` prefix. Every HARTOS-side caller (autogen / langchain / dispatcher / probes) sets the OpenAI `user` field to the thread-local request_id, so each task line correlates 1:1 with the frozen_debug RequestID column. Authoritative for "what was sent + when + by whom + how big". |
-| `~/Documents/Nunba/logs/draft_decision.jsonl` | Per-request draft-model boot decisions (cohort, VRAM, active TTS, delegate verdict) |
-
-For ctx-overflow diagnosis: grep `llama_server_8082.log` for the `request (N tokens) exceeds` line, take the timestamp + `user=<request_id>`, find the same request_id in frozen_debug to trace back to the originating /chat turn.
 
 ### Setup
 ```bash
-# Requires Python 3.9+ (test env runs on 3.11; pydantic 2.9.2 supports 3.9-3.13).
-python3.11 -m venv venv311
-source venv311/Scripts/activate  # Windows: venv311\Scripts\activate.bat
+# Requires Python 3.10 (pydantic 1.10.9 incompatible with 3.12+)
+python3.10 -m venv venv310
+source venv310/Scripts/activate  # Windows: venv310\Scripts\activate.bat
 pip install -r requirements.txt
 ```
 
@@ -125,7 +80,7 @@ REUSE Mode:  User Input → Load Recipe → Execute Steps → Output (90% faster
 ### Key Files
 | File | Purpose |
 |------|---------|
-| `hart_intelligence_entry.py` | Flask entry point (port 6777, Hypercorn ASGI primary; Waitress WSGI fallback on ImportError) |
+| `hart_intelligence_entry.py` | Flask entry point (port 6777, Waitress server) |
 | `create_recipe.py` | Agent creation, action execution, recipe generation |
 | `reuse_recipe.py` | Recipe reuse, trained agent execution |
 | `helper.py` | Action class, JSON utilities, tool handlers |
@@ -201,12 +156,11 @@ User Prompt
 
 ## Dependencies
 
-Critical pinned versions (post Apr/May 2026 split-package migration):
-- `langchain-classic==1.0.1` + `langchain-community==0.4.1` + `langchain-core==1.2.15` + `langchain-anthropic==1.0.0` + `langchain-text-splitters==1.1.1` + `langchain-google-genai==4.2.1` + `langchain-groq==1.1.2` (split packages — imports use `from langchain_classic.X` / `from langchain_community.X`)
-- `pydantic==2.9.2`
+Critical pinned versions:
+- `langchain==0.0.230`
+- `pydantic==1.10.9` (requires Python 3.10)
 - `autogen` (multi-agent framework)
 - `chromadb==0.3.23` (vector store)
-- `hypercorn` (primary ASGI server) + `waitress==2.1.2` (WSGI fallback)
 
 ---
 

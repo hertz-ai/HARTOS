@@ -19,17 +19,8 @@ def _hot_score(upvotes: int, downvotes: int, created_at: datetime) -> float:
     return math.log10(score) - (age_hours / 12)
 
 
-def _base_post_filter(db, q, user_id=None, viewer_user=None,
-                      apply_privacy: bool = False):
-    """Apply is_deleted + is_hidden + community privacy filters to a Post query.
-
-    Phase 7c.5 — when `apply_privacy` is True, additionally AND in the
-    per-post privacy gate from integrations.social.privacy.  Off by
-    default so flag-off deploys never load the privacy module or run
-    the EXISTS subqueries.  All four feed endpoints
-    (get_personalized_feed, get_global_feed, get_trending_feed,
-    get_agent_feed) thread this through.
-    """
+def _base_post_filter(db, q, user_id=None):
+    """Apply is_deleted + is_hidden + community privacy filters to a Post query."""
     q = q.filter(Post.is_deleted == False, Post.is_hidden == False)
     # Subquery: IDs of public communities
     public_cids = db.query(Community.id).filter(Community.is_private == False).subquery()
@@ -53,15 +44,11 @@ def _base_post_filter(db, q, user_id=None, viewer_user=None,
                 Post.community_id.in_(public_cids),
             )
         )
-    if apply_privacy:
-        from .privacy import visible_posts_filter
-        q = q.filter(visible_posts_filter(viewer_user))
     return q
 
 
 def get_personalized_feed(db: Session, user_id: str, limit: int = 25,
-                          offset: int = 0, viewer_user=None,
-                          apply_privacy: bool = False) -> Tuple[List[Post], int]:
+                          offset: int = 0) -> Tuple[List[Post], int]:
     """Feed from followed users + subscribed communities, sorted by hot score."""
     # Get followed user IDs
     followed_ids = [f.following_id for f in
@@ -74,9 +61,7 @@ def get_personalized_feed(db: Session, user_id: str, limit: int = 25,
 
     if not followed_ids and not community_ids:
         # Fallback to global trending
-        return get_trending_feed(db, limit, offset, user_id=user_id,
-                                 viewer_user=viewer_user,
-                                 apply_privacy=apply_privacy)
+        return get_trending_feed(db, limit, offset, user_id=user_id)
 
     q = db.query(Post).options(joinedload(Post.author)).filter(
         or_(
@@ -84,23 +69,17 @@ def get_personalized_feed(db: Session, user_id: str, limit: int = 25,
             Post.community_id.in_(community_ids) if community_ids else False,
         )
     )
-    q = _base_post_filter(db, q, user_id=user_id,
-                          viewer_user=viewer_user,
-                          apply_privacy=apply_privacy)
+    q = _base_post_filter(db, q, user_id=user_id)
     total = q.count()
     posts = q.order_by(desc(Post.created_at)).offset(offset).limit(limit).all()
     return posts, total
 
 
 def get_global_feed(db: Session, sort: str = 'new', limit: int = 25,
-                    offset: int = 0, user_id: str = None,
-                    viewer_user=None,
-                    apply_privacy: bool = False) -> Tuple[List[Post], int]:
+                    offset: int = 0, user_id: str = None) -> Tuple[List[Post], int]:
     """All posts, sorted by chosen method."""
     q = db.query(Post).options(joinedload(Post.author))
-    q = _base_post_filter(db, q, user_id=user_id,
-                          viewer_user=viewer_user,
-                          apply_privacy=apply_privacy)
+    q = _base_post_filter(db, q, user_id=user_id)
 
     if sort == 'top':
         q = q.order_by(desc(Post.score), desc(Post.created_at))
@@ -117,16 +96,13 @@ def get_global_feed(db: Session, sort: str = 'new', limit: int = 25,
 
 
 def get_trending_feed(db: Session, limit: int = 25, offset: int = 0,
-                      user_id: str = None, viewer_user=None,
-                      apply_privacy: bool = False) -> Tuple[List[Post], int]:
+                      user_id: str = None) -> Tuple[List[Post], int]:
     """Posts trending in the last 24h based on velocity (votes+comments per hour)."""
     cutoff = datetime.utcnow() - timedelta(hours=24)
     q = db.query(Post).options(joinedload(Post.author)).filter(
         Post.created_at >= cutoff
     )
-    q = _base_post_filter(db, q, user_id=user_id,
-                          viewer_user=viewer_user,
-                          apply_privacy=apply_privacy)
+    q = _base_post_filter(db, q, user_id=user_id)
     q = q.order_by(desc(Post.score + Post.comment_count * 2), desc(Post.created_at))
 
     total = q.count()
@@ -135,15 +111,12 @@ def get_trending_feed(db: Session, limit: int = 25, offset: int = 0,
 
 
 def get_agent_feed(db: Session, limit: int = 25, offset: int = 0,
-                   user_id: str = None, viewer_user=None,
-                   apply_privacy: bool = False) -> Tuple[List[Post], int]:
+                   user_id: str = None) -> Tuple[List[Post], int]:
     """Posts by AI agents only."""
     q = db.query(Post).options(joinedload(Post.author)).join(
         User, Post.author_id == User.id
     ).filter(User.user_type == 'agent')
-    q = _base_post_filter(db, q, user_id=user_id,
-                          viewer_user=viewer_user,
-                          apply_privacy=apply_privacy)
+    q = _base_post_filter(db, q, user_id=user_id)
     q = q.order_by(desc(Post.created_at))
 
     total = q.count()

@@ -1029,17 +1029,8 @@ def register_shell_os_routes(app):
             ['ffmpeg', '-f', 'x11grab', '-i', ':0', '-y', output_path],
         ]:
             try:
-                # ffmpeg is cross-platform — on Windows users with ffmpeg
-                # on PATH this would pop a brief cmd console even though
-                # the x11grab arg means the spawn fails immediately.
-                # Hide via canonical helper (no-op on macOS/Linux).
-                from core.subprocess_safe import hidden_popen_kwargs
                 proc = subprocess.Popen(
-                    tool_cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    **hidden_popen_kwargs(),
-                )
+                    tool_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return jsonify({
                     'recording': True,
                     'pid': proc.pid,

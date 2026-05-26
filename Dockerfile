@@ -77,31 +77,6 @@ RUN python scripts/compile_hevolveai.py --strip-source \
     find /usr/local/lib -path '*hevolveai*dist-info/RECORD' -delete 2>/dev/null || true && \
     find /usr/local/lib -path '*embodied*ai*dist-info/RECORD' -delete 2>/dev/null || true
 
-# ── Layer 4: LiveKit SFU binary (regional/flat — voice/video for >4-party calls) ──
-# Pre-stage the official livekit-server Go binary at /usr/local/bin so
-# the supervisor in integrations.social.livekit_supervisor doesn't need
-# to download it at first start.  Skipped automatically at runtime when
-# HEVOLVE_DEPLOY_MODE=central or LIVEKIT_DISABLE=1 (cloud / sync-only
-# deployments use Dockerfile.prod which omits this entire layer).
-#
-# The supervisor checks ~/.hevolve/livekit/livekit-server first AND
-# falls through to PATH lookup, so dropping it at /usr/local/bin works.
-ARG LIVEKIT_VERSION=1.7.2
-RUN set -eux; \
-    arch="$(dpkg --print-architecture)"; \
-    case "$arch" in \
-      amd64) tag=linux_amd64 ;; \
-      arm64) tag=linux_arm64 ;; \
-      *) echo "Unsupported arch $arch for livekit-server" >&2; exit 1 ;; \
-    esac; \
-    url="https://github.com/livekit/livekit/releases/download/v${LIVEKIT_VERSION}/livekit_${LIVEKIT_VERSION}_${tag}.tar.gz"; \
-    curl -fsSL "$url" -o /tmp/lk.tgz && \
-    tar -xzf /tmp/lk.tgz -C /tmp && \
-    install -m 0755 /tmp/livekit-server /usr/local/bin/livekit-server && \
-    rm -f /tmp/lk.tgz /tmp/livekit-server
-
-# LiveKit RTC ports: WS signaling 7880, TCP fallback 7881, UDP range
-# 50000-60000 for media.  Operators expose only what their NAT requires.
-EXPOSE 6777 7880 7881
+EXPOSE 6777
 
 CMD [ "python", "hart_intelligence_entry.py" ]

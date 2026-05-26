@@ -16,23 +16,13 @@ from helper import Action
 
 
 def _agent_mocks():
-    """Context manager stack for the standard autogen agent mocks.
-
-    Uses ``MagicMock`` (not bare ``Mock``) because ``create_agents`` in
-    ``create_recipe.py`` iterates over the mocked GroupChat / etc. at
-    several points (e.g. agent-list assembly, tool-registration loops).
-    A bare ``Mock`` raises ``TypeError: 'Mock' object is not iterable``
-    on ``for x in <mock>``; ``MagicMock`` supports ``__iter__`` (returns
-    an empty iterator by default), which is the tests' intent: "the
-    constructor returned something agent-shaped, just don't actually
-    run the LLM".
-    """
+    """Context manager stack for the standard autogen agent mocks."""
     from contextlib import ExitStack
     stack = ExitStack()
     mocks = {}
     for name in ('AssistantAgent', 'UserProxyAgent', 'GroupChat', 'GroupChatManager'):
         m = stack.enter_context(patch(f'create_recipe.autogen.{name}'))
-        m.return_value = MagicMock()
+        m.return_value = Mock()
         mocks[name] = m
     return stack, mocks
 

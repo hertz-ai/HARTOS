@@ -3,18 +3,6 @@ Channel Metadata Catalog — Static registry of all 31 supported channels.
 
 Provides per-channel: display name, auth method, setup fields, capabilities, icon, color.
 Used by the setup wizard UI and the /api/social/channels/catalog endpoint.
-
-OAuth click-through (PR O):
-- Channels that publish an OAuth 2.0 authorize endpoint additionally declare
-  ``oauth_authorize_url`` / ``oauth_token_url`` / ``oauth_scopes`` /
-  ``oauth_extra_params`` / ``oauth_token_response_map`` / ``oauth_uses_pkce``.
-- The Connect_Channel agent tool consults these fields *only when* the
-  operator has set ``HARTOS_OAUTH_CLIENT_<TYPE>`` env (client id + secret).
-  When env is unset the channel falls back to the existing setup_fields
-  paste-token flow — zero regression for legacy operators.
-- ``external_url`` points at the provider's app-management portal
-  (BotFather, Discord dev portal, etc.) and is also used by the paste
-  fallback for a "Open <provider>" button.
 """
 
 CHANNEL_CATALOG = {
@@ -44,14 +32,6 @@ CHANNEL_CATALOG = {
         'color': '#5865f2',
         'category': 'core',
         'auth_method': 'api_key',
-        # OAuth bot-install URL (PR O).  274877990912 = Send Messages |
-        # Read Message History | View Channels — minimum bot perms.
-        'oauth_authorize_url': 'https://discord.com/api/oauth2/authorize',
-        'oauth_token_url': 'https://discord.com/api/oauth2/token',
-        'oauth_scopes': 'bot applications.commands',
-        'oauth_extra_params': {'permissions': '274877990912'},
-        'oauth_token_response_map': {'access_token': 'bot_token'},
-        'external_url': 'https://discord.com/developers/applications',
         'setup_fields': [
             {'key': 'bot_token', 'label': 'Bot Token', 'type': 'password',
              'help': 'Create an application at discord.com/developers, add a Bot, and copy the token.'},
@@ -71,20 +51,6 @@ CHANNEL_CATALOG = {
         'color': '#4a154b',
         'category': 'core',
         'auth_method': 'api_key',
-        # Slack v2 OAuth — bot scopes only (no user scopes by default).
-        # Returns access_token=xoxb-... in the bot section of v2 response;
-        # token-exchange endpoint maps the bot.access_token into bot_token.
-        'oauth_authorize_url': 'https://slack.com/oauth/v2/authorize',
-        'oauth_token_url': 'https://slack.com/api/oauth.v2.access',
-        'oauth_scopes': 'chat:write,channels:history,channels:read,im:history,im:read,im:write,users:read',
-        'oauth_token_response_map': {
-            # Slack's bot_user_id comes from auth.test at adapter
-            # connect time (slack_adapter.py:101), not from this map —
-            # that's why we only persist bot.access_token here.
-            # signing_secret is operator-paste-only (not in OAuth resp).
-            'bot.access_token': 'bot_token',
-        },
-        'external_url': 'https://api.slack.com/apps',
         'setup_fields': [
             {'key': 'bot_token', 'label': 'Bot Token (xoxb-...)', 'type': 'password',
              'help': 'Create a Slack App, install it to your workspace, and copy the Bot User OAuth Token.'},
@@ -113,41 +79,6 @@ CHANNEL_CATALOG = {
              'help': 'Permanent token from Meta Business dashboard.'},
             {'key': 'phone_number_id', 'label': 'Phone Number ID', 'type': 'text',
              'help': 'Your WhatsApp phone number ID from Meta.'},
-        # auth_method=gateway_qr — backed by the embedded Baileys gateway
-        # auto-spawned by integrations/social/whatsapp_supervisor.py.  The
-        # wizard fetches a real WhatsApp-Web QR from
-        # GET /api/social/channels/whatsapp/qr (which proxies to the
-        # gateway's GET /api/sessions/:id/qr) and the user scans it from
-        # WhatsApp → Linked Devices → Link a Device.  No Docker, no
-        # developer portal, no API keys.  Alternate path: "Link with
-        # phone number" — POST /whatsapp/pair-code returns the 8-char
-        # code that WhatsApp accepts under Link a Device → Link with
-        # phone number instead, no QR scan needed.
-        'auth_method': 'gateway_qr',
-        'setup_fields': [
-            {'key': 'phone_number', 'label': 'Your WhatsApp Number', 'type': 'tel',
-             'help': 'Your own E.164 number (e.g. +<country><number>). '
-                     'Required only for "Link with phone number"; QR scan '
-                     'works without it.'},
-            # auto:True — admin Channels page shows these so operators can
-            # point at a remote WAHA endpoint instead of the local Baileys
-            # gateway.  Connect_Channel's form-builder skips auto:True
-            # fields on the user-facing wizard.
-            {'key': 'api_url', 'label': 'Gateway Base URL', 'type': 'text',
-             'auto': True, 'default': 'http://localhost:3000',
-             'help': 'Defaults to the embedded Baileys gateway on '
-                     'localhost:3000.  Override via WHATSAPP_API_URL env '
-                     'to point at a remote WAHA endpoint instead.'},
-            {'key': 'access_token', 'label': 'API Key', 'type': 'password',
-             'auto': True, 'default': '',
-             'help': 'Empty for the embedded gateway (no auth).  Set via '
-                     'WHATSAPP_API_KEY env when fronting a remote WAHA '
-                     'with auth.'},
-            {'key': 'enable_self_chat_agent', 'label': 'Self-chat → Nunba',
-             'type': 'toggle', 'default': True,
-             'help': 'When you tap your own contact in WhatsApp ("Message '
-                     'Yourself"), Nunba saves the note to memory and replies '
-                     'in the same thread. Private — never fanned out.'},
         ],
         'capabilities': {
             'text': True, 'image': True, 'video': True, 'audio': True,
@@ -204,20 +135,6 @@ CHANNEL_CATALOG = {
         'color': '#00ac47',
         'category': 'core',
         'auth_method': 'oauth2',
-        # Google requires PKCE for installed-app flows + access_type=offline
-        # for refresh tokens.  prompt=consent forces the consent screen
-        # so the user always sees what scopes are being granted.
-        'oauth_authorize_url': 'https://accounts.google.com/o/oauth2/v2/auth',
-        'oauth_token_url': 'https://oauth2.googleapis.com/token',
-        'oauth_scopes': 'https://www.googleapis.com/auth/chat.messages '
-                        'https://www.googleapis.com/auth/chat.spaces',
-        'oauth_extra_params': {'access_type': 'offline', 'prompt': 'consent'},
-        'oauth_token_response_map': {
-            'access_token': 'access_token',
-            'refresh_token': 'refresh_token',
-        },
-        'oauth_uses_pkce': True,
-        'external_url': 'https://console.cloud.google.com/apis/credentials',
         'setup_fields': [
             {'key': 'client_id', 'label': 'OAuth Client ID', 'type': 'text',
              'help': 'From Google Cloud Console → APIs & Services → Credentials.'},
@@ -259,21 +176,6 @@ CHANNEL_CATALOG = {
         'color': '#6264a7',
         'category': 'enterprise',
         'auth_method': 'oauth2',
-        # Microsoft Identity v2.0 endpoint.  Tenant 'common' supports
-        # multi-tenant org sign-in; operator can override per-tenant via
-        # HARTOS_OAUTH_TENANT_TEAMS env if they registered a single-tenant
-        # app.  PKCE recommended for public clients; we always send it.
-        'oauth_authorize_url': 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
-        'oauth_token_url': 'https://login.microsoftonline.com/common/oauth2/v2.0/token',
-        'oauth_scopes': 'https://graph.microsoft.com/Chat.ReadWrite '
-                        'https://graph.microsoft.com/ChannelMessage.Send '
-                        'offline_access',
-        'oauth_token_response_map': {
-            'access_token': 'access_token',
-            'refresh_token': 'refresh_token',
-        },
-        'oauth_uses_pkce': True,
-        'external_url': 'https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade',
         'setup_fields': [
             {'key': 'app_id', 'label': 'Microsoft App ID', 'type': 'text',
              'help': 'From Azure Bot registration.'},
@@ -380,17 +282,6 @@ CHANNEL_CATALOG = {
         'color': '#0084ff',
         'category': 'social',
         'auth_method': 'api_key',
-        # Meta's Login Dialog → page access token.  pages_messaging is
-        # required to send DMs; pages_show_list lets the user pick which
-        # Page to bind.  After /oauth/callback, the access_token is a
-        # short-lived user token; we exchange it for a long-lived page
-        # token in api_channels._exchange_oauth_code (Meta-specific
-        # post-step) so what gets stored is page_access_token.
-        'oauth_authorize_url': 'https://www.facebook.com/v18.0/dialog/oauth',
-        'oauth_token_url': 'https://graph.facebook.com/v18.0/oauth/access_token',
-        'oauth_scopes': 'pages_messaging,pages_show_list,pages_manage_metadata',
-        'oauth_token_response_map': {'access_token': 'page_access_token'},
-        'external_url': 'https://developers.facebook.com/apps/',
         'setup_fields': [
             {'key': 'page_access_token', 'label': 'Page Access Token', 'type': 'password',
              'help': 'From Meta Developer Portal → Your App → Messenger → Settings.'},
@@ -412,13 +303,6 @@ CHANNEL_CATALOG = {
         'color': '#e4405f',
         'category': 'social',
         'auth_method': 'api_key',
-        # Instagram Graph API uses Meta's same OAuth machinery; instagram_basic
-        # + instagram_manage_messages = DM access on a Professional account.
-        'oauth_authorize_url': 'https://www.facebook.com/v18.0/dialog/oauth',
-        'oauth_token_url': 'https://graph.facebook.com/v18.0/oauth/access_token',
-        'oauth_scopes': 'instagram_basic,instagram_manage_messages,pages_show_list',
-        'oauth_token_response_map': {'access_token': 'page_access_token'},
-        'external_url': 'https://developers.facebook.com/apps/',
         'setup_fields': [
             {'key': 'page_access_token', 'label': 'Instagram Access Token', 'type': 'password',
              'help': 'Requires a connected Facebook Page with Instagram Professional account.'},
@@ -439,19 +323,6 @@ CHANNEL_CATALOG = {
         'color': '#1da1f2',
         'category': 'social',
         'auth_method': 'api_key',
-        # Twitter / X v2 OAuth 2.0 with PKCE (mandatory for OAuth 2.0).
-        # The legacy 5-token v1.1 form stays as the paste fallback for
-        # operators using the older API; OAuth 2.0 only returns
-        # access_token + refresh_token (no api_key/secret).
-        'oauth_authorize_url': 'https://twitter.com/i/oauth2/authorize',
-        'oauth_token_url': 'https://api.twitter.com/2/oauth2/token',
-        'oauth_scopes': 'tweet.read tweet.write users.read dm.read dm.write offline.access',
-        'oauth_token_response_map': {
-            'access_token': 'bearer_token',
-            'refresh_token': 'refresh_token',
-        },
-        'oauth_uses_pkce': True,
-        'external_url': 'https://developer.twitter.com/en/portal/dashboard',
         'setup_fields': [
             {'key': 'bearer_token', 'label': 'API v2 Bearer Token', 'type': 'password',
              'help': 'From developer.twitter.com → Projects → Keys & Tokens.'},
@@ -475,20 +346,6 @@ CHANNEL_CATALOG = {
         'color': '#00b900',
         'category': 'social',
         'auth_method': 'api_key',
-        # LINE Login OAuth 2.1 — issues a user access_token; for Messaging
-        # API channel binding the operator still needs a Channel Access
-        # Token (long-lived) which OAuth doesn't issue.  We therefore
-        # treat this as half-OAuth: the click-through performs identity
-        # verification + paste-token follow-up for the Channel Access
-        # Token.  oauth_token_response_map is intentionally empty so
-        # /oauth/callback does NOT auto-write a binding; instead it
-        # bounces back to the paste form pre-filled with the verified
-        # channel_id (api_channels handles this LINE-specific path).
-        'oauth_authorize_url': 'https://access.line.me/oauth2/v2.1/authorize',
-        'oauth_token_url': 'https://api.line.me/oauth2/v2.1/token',
-        'oauth_scopes': 'profile openid',
-        'oauth_token_response_map': {},
-        'external_url': 'https://developers.line.biz/console/',
         'setup_fields': [
             {'key': 'channel_access_token', 'label': 'Channel Access Token', 'type': 'password',
              'help': 'From LINE Developers Console → Messaging API → Channel access token.'},
@@ -568,18 +425,6 @@ CHANNEL_CATALOG = {
         'color': '#9146ff',
         'category': 'social',
         'auth_method': 'api_key',
-        # Twitch authorization code flow.  chat:read + chat:edit are the
-        # IRC scopes needed for the legacy chat bot; channel:bot is the
-        # newer EventSub scope for the Helix-based bot path.  We request
-        # both so the adapter can pick at runtime.
-        'oauth_authorize_url': 'https://id.twitch.tv/oauth2/authorize',
-        'oauth_token_url': 'https://id.twitch.tv/oauth2/token',
-        'oauth_scopes': 'chat:read chat:edit channel:bot user:bot',
-        'oauth_token_response_map': {
-            'access_token': 'oauth_token',
-            'refresh_token': 'refresh_token',
-        },
-        'external_url': 'https://dev.twitch.tv/console/apps',
         'setup_fields': [
             {'key': 'oauth_token', 'label': 'OAuth Token', 'type': 'password',
              'help': 'Generate at twitchapps.com/tmi or via Twitch Developer portal.'},
@@ -828,28 +673,3 @@ def get_channels_by_category(category: str):
 def get_channels_by_auth_method(method: str):
     """Filter channels by auth method."""
     return {k: v for k, v in CHANNEL_CATALOG.items() if v.get('auth_method') == method}
-
-
-def is_oauth_capable(channel_type: str) -> bool:
-    """True iff the channel's metadata declares an OAuth authorize URL."""
-    meta = CHANNEL_CATALOG.get(channel_type)
-    return bool(meta and meta.get('oauth_authorize_url'))
-
-
-def is_oauth_configured(channel_type: str, env_lookup=None) -> bool:
-    """True iff the channel is OAuth-capable AND the operator has set
-    HARTOS_OAUTH_CLIENT_<TYPE> + HARTOS_OAUTH_SECRET_<TYPE> env vars.
-
-    When False, Connect_Channel falls back to the paste-token form
-    so legacy operators with pre-registered tokens stay unaffected.
-    """
-    if not is_oauth_capable(channel_type):
-        return False
-    if env_lookup is None:
-        import os
-        env_lookup = os.environ.get
-    upper = channel_type.upper()
-    return bool(
-        env_lookup(f'HARTOS_OAUTH_CLIENT_{upper}')
-        and env_lookup(f'HARTOS_OAUTH_SECRET_{upper}')
-    )

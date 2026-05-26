@@ -167,50 +167,6 @@ class AgentLightningWrapper:
                     if self.tracer and span_id:
                         self.tracer.emit_reward(span_id, reward)
 
-                # ── HIGH #5: llama.cpp tool-call JSON parse 500 graceful fallback ──
-                # When the model emits a tool-call whose `arguments` field
-                # contains unescaped quotes / emojis / truncated strings,
-                # llama.cpp rejects the response with HTTP 500 and the
-                # signature `Failed to parse tool call arguments as JSON`
-                # (live evidence langchain.log 2026-05-14: 22 occurrences).
-                # Today the exception propagates up → get_response_group
-                # transitions the action to `error` → lifecycle FSM rejects
-                # the transition repeatedly (600+ "Invalid transition"
-                # lines) → the STUCK-LOOP guard at create_recipe.py:1954
-                # eventually fires after 5 stuck iterations and emits a
-                # generic fallback.  Net cost: ~20-30 wasted llama.cpp
-                # completions before recovery.
-                #
-                # Short-circuit here instead: detect the parse-500 by its
-                # canonical error-message signature, return a coherent
-                # fallback string immediately, and let autogen treat it as
-                # a normal reply.  No lifecycle churn, no extra LLM
-                # completions, user gets a single clean reply within the
-                # same turn.  Same fallback pattern as the loop-break
-                # guard so the user-visible UX is consistent across both
-                # failure modes.
-                _err_str = str(e)
-                _is_toolcall_parse_500 = (
-                    '500' in _err_str
-                    and 'Failed to parse tool call arguments' in _err_str
-                )
-                if _is_toolcall_parse_500:
-                    logger.error(
-                        "[TOOLCALL-PARSE-500] llama.cpp rejected the "
-                        "model's tool-call output (malformed JSON in "
-                        "arguments field — likely unescaped quotes / "
-                        "emojis / mid-string truncation).  Returning "
-                        "graceful fallback string instead of propagating "
-                        "the 500, to avoid lifecycle FSM churn.  Error: "
-                        f"{_err_str[:300]}"
-                    )
-                    return (
-                        "I had trouble producing the structured response "
-                        "for that — the underlying model emitted output "
-                        "that couldn't be parsed.  Could you rephrase the "
-                        "request, or try breaking it into smaller steps?"
-                    )
-
                 raise
 
         return wrapped

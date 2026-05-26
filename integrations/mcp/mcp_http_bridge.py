@@ -559,15 +559,6 @@ def _tool_agent_status() -> str:
         status['llm_server'] = 'running' if resp.status_code == 200 else f'status {resp.status_code}'
     except Exception:
         status['llm_server'] = 'not reachable'
-    """Check agent daemon health, active dispatches, and system state.
-
-    Uses ``core.health_probe`` canonical probes — never reads env-var
-    snapshots or hardcoded ports.  See module docstring there for the
-    root-cause notes from the 2026-05-01 false-negative incident.
-    """
-    from core.health_probe import probe_agent_daemon, probe_llm
-    status = probe_agent_daemon()
-    status['llm_server'] = probe_llm()
     try:
         reg = _get_registry()
         status['expert_agents'] = len(reg.agents)
@@ -640,11 +631,6 @@ def _tool_system_health() -> str:
         health['llm'] = {'status': 'up', 'code': resp.status_code}
     except Exception:
         health['llm'] = {'status': 'down'}
-    from core.health_probe import probe_nunba_flask, probe_llm
-    health = {
-        'backend': probe_nunba_flask(),
-        'llm': probe_llm(),
-    }
     try:
         db = _get_db()
         try:
@@ -773,21 +759,6 @@ def _tool_call_endpoint(method: str, path: str, body: Optional[str] = None) -> s
                 from hart_intelligence import app
             except ImportError:
                 return json.dumps({"error": "HARTOS app not available"})
-        # Not in request context — resolve via singleton accessor.
-        # NEVER eager-import hart_intelligence here: this is a worker
-        # thread (MCP HTTP handler) and a direct import races the
-        # canonical loader's import lock.
-        from core.safe_hartos_attr import safe_hartos_attr
-        app = safe_hartos_attr('app')
-        if app is None:
-            logger.info(
-                "MCP call_endpoint: HARTOS app not yet loaded — "
-                "method=%s path=%s — returning 503-style error.",
-                method, path,
-            )
-            return json.dumps({
-                "error": "HARTOS app not available (loader still init)",
-            })
 
     if not path.startswith('/'):
         path = '/' + path
@@ -855,17 +826,6 @@ def _tool_list_routes() -> str:
             from hart_intelligence_entry import app
         except ImportError:
             return json.dumps({"error": "HARTOS app not available"})
-        # Worker-thread safe — singleton accessor, no import lock race.
-        from core.safe_hartos_attr import safe_hartos_attr
-        app = safe_hartos_attr('app')
-        if app is None:
-            logger.info(
-                "MCP list_routes: HARTOS app not yet loaded — "
-                "returning empty 503 envelope.",
-            )
-            return json.dumps({
-                "error": "HARTOS app not available (loader still init)",
-            })
 
     routes = []
     for rule in app.url_map.iter_rules():
@@ -1039,8 +999,6 @@ def _load_tools():
          'AUTO_EVOLVE_TOOLS', 'auto_evolve'),
         ('integrations.coding_agent.autoevolve_code_tools',
          'AUTOEVOLVE_CODE_TOOLS', 'autoevolve_code'),
-        ('integrations.coding_agent.backend_repair_tools',
-         'BACKEND_REPAIR_TOOLS', 'backend_repair'),
     ):
         try:
             import importlib

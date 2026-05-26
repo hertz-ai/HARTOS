@@ -69,7 +69,6 @@ from ..base import (
     ChannelSendError,
     ChannelRateLimitError,
 )
-from ..room_capable import RoomCapableAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +176,7 @@ class ConversationRef:
     is_group: bool = False
 
 
-class TeamsAdapter(ChannelAdapter, RoomCapableAdapter):
+class TeamsAdapter(ChannelAdapter):
     """
     Microsoft Teams messaging adapter using Bot Framework.
 
@@ -746,37 +745,6 @@ class TeamsAdapter(ChannelAdapter, RoomCapableAdapter):
         except Exception as e:
             logger.error(f"Failed to send mention: {e}")
             return SendResult(success=False, error=str(e))
-
-    # ─── UNIF-G2: RoomCapableAdapter — pending OAuth wiring ──────────
-    #
-    # Teams join semantics require Bot Framework + Graph API
-    # ``conversations`` and ``meetings`` flows that aren't fully wired
-    # in this adapter.  We mark the adapter ``RoomCapableAdapter`` so
-    # ``isinstance(adapter, RoomCapableAdapter)`` is honest, but the
-    # methods return False / [] (NOT ``NotImplementedError`` —
-    # ``Join_External_Room`` distinguishes refusal from unsupported via
-    # the ``is_room_capable`` flag and the boolean return).  Real
-    # join_room implementation lands in a follow-up alongside Bot
-    # Framework conversation auth + Graph meeting attendee APIs.
-
-    async def join_room(self, room_id: str,
-                        role: str = 'participant') -> bool:
-        logger.info(
-            "Teams.join_room: platform support pending — bot_framework "
-            "+ graph meeting attendee APIs not yet wired (room_id=%s, "
-            "role=%s)", room_id, role)
-        return False
-
-    async def leave_room(self, room_id: str) -> bool:
-        logger.info(
-            "Teams.leave_room: platform support pending (room_id=%s)",
-            room_id)
-        return False
-
-    async def list_room_members(
-        self, room_id: str,
-    ) -> List[Dict[str, Any]]:
-        return []
 
 
 def create_teams_adapter(
