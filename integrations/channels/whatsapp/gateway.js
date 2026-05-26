@@ -34,19 +34,15 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
+// Baileys is published as an ES Module (since v6.x).  CommonJS `require()`
+// of an ESM module throws ERR_REQUIRE_ESM, which is exactly what was
+// killing the supervisor in a respawn loop ("rc=78; respawning in 60s").
+// Node tells you the remedy in its own error text: use dynamic import().
+// The function-scoped `let`s below are populated by the async bootstrap
+// at the bottom of the file BEFORE app.listen() — every handler that
+// references them runs only after a session is started, which can't
+// happen until the server is listening.
 let makeWASocket, useMultiFileAuthState;
-try {
-  const baileys = require('@whiskeysockets/baileys');
-  makeWASocket = baileys.default || baileys.makeWASocket;
-  useMultiFileAuthState = baileys.useMultiFileAuthState;
-} catch (e) {
-  console.error(JSON.stringify({
-    event: 'startup_error',
-    error: 'baileys not installed — run `npm install` in this directory',
-    detail: String(e && e.message),
-  }));
-  process.exit(78);  // EX_CONFIG
-}
 
 let express, expressWs;
 try {
@@ -235,22 +231,43 @@ app.ws('/ws/:id', (ws, req) => {
   ws.on('error', () => ctx.wsClients.delete(ws));
 });
 
-const server = app.listen(PORT, '127.0.0.1', () => {
-  console.log(JSON.stringify({
-    event: 'gateway_started',
-    port: PORT,
-    auth_base: AUTH_BASE,
-    pid: process.pid,
-  }));
-});
-
-function shutdown(signal) {
-  console.log(JSON.stringify({ event: 'gateway_shutdown', signal }));
-  for (const [id, ctx] of sessions) {
-    try { ctx.sock.end(); } catch (_) {}
+// Async bootstrap: load baileys via dynamic import() (ESM-only), then
+// start listening.  Routes are wired above synchronously and only
+// dereference makeWASocket / useMultiFileAuthState inside ensureSession(),
+// which can't run until a /api/sessions/:id/start request arrives —
+// which can't arrive until app.listen() returns — which we don't call
+// until the baileys import resolves.  So the timing is safe.
+(async () => {
+  try {
+    const baileys = await import('@whiskeysockets/baileys');
+    makeWASocket = baileys.default || baileys.makeWASocket;
+    useMultiFileAuthState = baileys.useMultiFileAuthState;
+  } catch (e) {
+    console.error(JSON.stringify({
+      event: 'startup_error',
+      error: 'baileys not installed — run `npm install` in this directory',
+      detail: String(e && e.message),
+    }));
+    process.exit(78);  // EX_CONFIG
   }
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000).unref();
-}
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+
+  const server = app.listen(PORT, '127.0.0.1', () => {
+    console.log(JSON.stringify({
+      event: 'gateway_started',
+      port: PORT,
+      auth_base: AUTH_BASE,
+      pid: process.pid,
+    }));
+  });
+
+  function shutdown(signal) {
+    console.log(JSON.stringify({ event: 'gateway_shutdown', signal }));
+    for (const [id, ctx] of sessions) {
+      try { ctx.sock.end(); } catch (_) {}
+    }
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 5000).unref();
+  }
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+})();

@@ -83,9 +83,25 @@ def _wamp_to_local(uri: str) -> Optional[str]:
 _SSE_DENYLIST_PREFIXES: tuple = ('bus.',)
 
 
+# P3a (2026-05-26) — topics that are INTENTIONALLY broadcast to every
+# SSE client (no per-user scoping).  Anything not matching this
+# allowlist must carry a user_id; otherwise the EventBus refuses the
+# SSE broadcast.  Without this guard, an emit_event that forgot to
+# include user_id leaks the payload (e.g. a personal pair-code card)
+# to every connected client.  Add a prefix here only when the topic
+# is genuinely public to the whole org.
+_SSE_GLOBAL_PREFIXES: tuple = ('community.', 'hive.', 'public.')
+
+
 def _topic_targets_sse(topic: str) -> bool:
     """True unless the topic is on the SSE denylist."""
     return not any(topic.startswith(prefix) for prefix in _SSE_DENYLIST_PREFIXES)
+
+
+def _is_sse_global(topic: str) -> bool:
+    """True if the topic is in the SSE global allowlist — safe to
+    broadcast without a user_id."""
+    return any(topic.startswith(prefix) for prefix in _SSE_GLOBAL_PREFIXES)
 
 
 class EventBus:
@@ -232,7 +248,23 @@ class EventBus:
         # connection.
         if not _from_wamp and _topic_targets_sse(topic):
             _user_id = data.get('user_id') if isinstance(data, dict) else None
-            broadcast_sse_safe(topic, data, user_id=_user_id)
+            # P3a (2026-05-26) privacy guard: refuse SSE broadcasts
+            # that have no user_id UNLESS the topic is explicitly
+            # globally-scoped (community.*, hive.*, public.*).  This
+            # prevents an emit_event that forgot user_id from leaking
+            # a personal payload (e.g. pair-code, notification) to
+            # every connected SSE client.  Add the prefix to
+            # _SSE_GLOBAL_PREFIXES if the topic is genuinely public.
+            if _user_id is None and not _is_sse_global(topic):
+                logger.warning(
+                    "SSE broadcast refused (P3a privacy guard): "
+                    "topic=%r has no user_id in payload and is not "
+                    "in _SSE_GLOBAL_PREFIXES.  Pass user_id in data, "
+                    "or whitelist the topic prefix if it's truly "
+                    "public.", topic,
+                )
+            else:
+                broadcast_sse_safe(topic, data, user_id=_user_id)
 
         return called
 

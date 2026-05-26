@@ -387,6 +387,16 @@ class Notification(Base):
     target_id = Column(String(64), nullable=True)
     message = Column(Text, default='')
     is_read = Column(Boolean, default=False)
+    # P3b (2026-05-26): when the row was marked read (set by
+    # NotificationService.mark_read).  Null until the user explicitly
+    # marks read.  Enables "unread since X" analytics without a
+    # separate audit log.
+    read_at = Column(DateTime, nullable=True)
+    # P3b: when the row was dismissed (overlay timed out, swipe-away,
+    # etc.) rather than explicitly read.  Null until dismissed.  Lets
+    # the UI distinguish "user read it" from "user ignored it" without
+    # adding a third state to is_read.
+    dismissed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=func.now())
 
     user = relationship('User', back_populates='notifications')
@@ -397,6 +407,8 @@ class Notification(Base):
             'source_user_id': self.source_user_id,
             'target_type': self.target_type, 'target_id': self.target_id,
             'message': self.message, 'is_read': self.is_read,
+            'read_at': self.read_at.isoformat() if self.read_at else None,
+            'dismissed_at': self.dismissed_at.isoformat() if self.dismissed_at else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
 

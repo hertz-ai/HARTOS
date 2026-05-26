@@ -830,17 +830,84 @@ class NotificationService:
 
     @staticmethod
     def mark_read(db: Session, notification_ids: List[str], user_id: str):
+        # P3b (2026-05-26): also set read_at so "unread since X"
+        # analytics and the dismissed-vs-read distinction work.  Uses
+        # func.now() so the timestamp is computed at the database
+        # (matches created_at's server-default convention).
         db.query(Notification).filter(
             Notification.id.in_(notification_ids), Notification.user_id == user_id
-        ).update({Notification.is_read: True}, synchronize_session=False)
+        ).update({
+            Notification.is_read: True,
+            Notification.read_at: func.now(),
+        }, synchronize_session=False)
         db.flush()
+        # P1-S1 (2026-05-26): cross-device fan-out after commit so every
+        # other open client decrements its badge in real-time instead of
+        # discovering the change on its next 30s poll.  Same WAMP/SSE
+        # pipe on_notification() already uses; the type discriminator
+        # ('notification.read') is what clients filter on.
+        _ids = list(notification_ids or [])
+        if _ids:
+            def _push_read_after_commit(_session):
+                try:
+                    from .realtime import on_notification_read
+                    on_notification_read(user_id, _ids)
+                except Exception:
+                    pass
+            event.listen(db, 'after_commit', _push_read_after_commit, once=True)
 
     @staticmethod
     def mark_all_read(db: Session, user_id: str):
+        # Collect ids BEFORE the bulk update so we can fan them out for
+        # cross-device sync (P1-S1).  Two-step query is cheap because
+        # the same is_read=False filter applies to both.
+        ids_to_flip = [
+            row.id for row in db.query(Notification.id).filter(
+                Notification.user_id == user_id,
+                Notification.is_read == False,
+            ).all()
+        ]
+        # P3b: stamp read_at alongside is_read flip.
         db.query(Notification).filter(
             Notification.user_id == user_id, Notification.is_read == False
-        ).update({Notification.is_read: True}, synchronize_session=False)
+        ).update({
+            Notification.is_read: True,
+            Notification.read_at: func.now(),
+        }, synchronize_session=False)
         db.flush()
+        if ids_to_flip:
+            def _push_read_all_after_commit(_session):
+                try:
+                    from .realtime import on_notification_read
+                    on_notification_read(user_id, ids_to_flip)
+                except Exception:
+                    pass
+            event.listen(db, 'after_commit', _push_read_all_after_commit, once=True)
+
+    @staticmethod
+    def mark_dismissed(db: Session, notification_ids: List[str], user_id: str):
+        """P3b (2026-05-26): mark notifications as dismissed without
+        flipping is_read.  Used when an overlay times out or the user
+        swipes a row away without engaging.  Distinct from mark_read
+        so analytics can answer "did the user actually read it, or
+        just dismiss it?"  Still fires the same cross-device fan-out
+        as mark_read so other devices remove the row from view."""
+        if not notification_ids:
+            return
+        db.query(Notification).filter(
+            Notification.id.in_(notification_ids), Notification.user_id == user_id
+        ).update({
+            Notification.dismissed_at: func.now(),
+        }, synchronize_session=False)
+        db.flush()
+        _ids = list(notification_ids)
+        def _push_dismissed_after_commit(_session):
+            try:
+                from .realtime import on_notification_read
+                on_notification_read(user_id, _ids)
+            except Exception:
+                pass
+        event.listen(db, 'after_commit', _push_dismissed_after_commit, once=True)
 
 
 # ─── Report Service ───

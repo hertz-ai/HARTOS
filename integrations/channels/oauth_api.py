@@ -455,6 +455,35 @@ def oauth_callback(channel_type: str):
         import json as _json
         result = register_fn(channel_type, _json.dumps(config))
         ok = isinstance(result, str) and 'registered and enabled' in result
+        # On success emit a `channel_connected` card to the user's chat
+        # so the Demopage AgentOverlay shows the success without the
+        # user refreshing.  Same payload shape as the gateway_qr polling
+        # thread's success branch — single canonical kind.  The close-
+        # page also fires postMessage back to the opener for the popup
+        # auto-close, but THIS is what populates the chat status.
+        if ok:
+            try:
+                from core.platform.registry import get_registry
+                _lui = get_registry().get('LiquidUIService')
+                if _lui:
+                    display_name = meta.get('display_name') or channel_type
+                    _lui.agent_ui_update(
+                        str(ctx['user_id']),
+                        {
+                            'type': 'channel_connected',
+                            'channel': channel_type,
+                            'channel_type': channel_type,
+                            'display_name': display_name,
+                            'color': meta.get('color') or '#00e89d',
+                            'icon': meta.get('icon') or channel_type,
+                            'message': f"✅ {display_name} connected.",
+                        },
+                    )
+            except Exception as _emit_err:
+                logger.debug(
+                    "oauth_callback: channel_connected emit skipped: %s",
+                    _emit_err,
+                )
         return Response(
             _close_page_html(channel_type, ok, result if isinstance(result, str) else 'Connected.'),
             mimetype='text/html',

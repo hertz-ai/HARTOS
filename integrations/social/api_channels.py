@@ -336,6 +336,66 @@ def whatsapp_request_pair_code():
     })
 
 
+# ── Conversational onboarding form-submit re-entry ─────────────
+#
+# Closes the loop on _start_gateway_qr_pair_push's phone-collection
+# form (hart_intelligence_entry.py).  When the agent's gateway_qr
+# branch can't find a phone in env / user profile, it emits a one-
+# field form whose action= points here.  This route receives the
+# submitted phone, sets the env var so the helper picks it up, and
+# re-enters _start_gateway_qr_pair_push synchronously — same code
+# path the chat agent would take if phone were known upfront.
+#
+# Auth required: only the authenticated user can connect their
+# own WhatsApp account.  Per-user binding gating happens inside
+# register_channel via thread_local_data.
+
+@channel_user_bp.route('/<channel_type>/connect-pair-code',
+                       methods=['POST'])
+@require_auth
+def channel_connect_pair_code_submit(channel_type: str):
+    """Re-enter gateway_qr pair-code flow with the submitted phone."""
+    import os as _os
+    data = request.get_json(silent=True) or {}
+    phone_raw = (data.get('phone') or '').strip()
+    if not phone_raw:
+        return jsonify({'success': False, 'error': 'phone required'}), 400
+    phone = ''.join(ch for ch in phone_raw if ch.isdigit())
+    if not phone:
+        return jsonify({
+            'success': False,
+            'error': 'phone must contain digits (E.164 without +).',
+        }), 400
+
+    # Env override is the same knob _start_gateway_qr_pair_push reads
+    # at line 1, so setting it here makes the helper find a value on
+    # re-entry.  Process-wide so subsequent users on the same node
+    # would inherit it — for multi-user nodes the proper fix is a
+    # per-user kv store, but the typical Nunba deploy is single-user
+    # and this matches the existing HEVOLVE_WHATSAPP_PHONE override
+    # discipline.
+    _os.environ['HEVOLVE_WHATSAPP_PHONE'] = phone
+
+    try:
+        from integrations.channels.metadata import get_channel_metadata
+        meta = get_channel_metadata(channel_type) or {}
+        # Local import to avoid circular at module load.
+        from hart_intelligence_entry import _start_gateway_qr_pair_push
+        _start_gateway_qr_pair_push(channel_type, meta)
+        return jsonify({
+            'success': True,
+            'message': (
+                f"Generating pair-code for {meta.get('display_name') or channel_type}. "
+                f"Watch chat for the code card."
+            ),
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f"connect-pair-code re-entry failed: {e}",
+        }), 500
+
+
 # ── Presence ───────────────────────────────────────────────────
 
 @channel_user_bp.route('/presence', methods=['GET'])

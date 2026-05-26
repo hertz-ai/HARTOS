@@ -91,6 +91,23 @@ COMPONENT_TYPES = {
     # Lightweight notification with short auto-dismiss; web maps to the
     # same NotificationCard renderer with `severity` driving the colour.
     'toast': {'props': ['title', 'message', 'severity']},
+    # ── Channel pair-code consent card (gateway_qr auth_method) ──
+    # Emitted by hart_intelligence_entry._start_gateway_qr_pair_push
+    # while a user is conversationally connecting WhatsApp / Telegram /
+    # etc.  AgentOverlay.jsx already has the PairCodeOverlay renderer
+    # (auto-clipboard + countdown + Copy/Open).  Allowlisted here so
+    # the LiquidUI validator stops silently dropping the card on the
+    # desktop shell.  Added 2026-05-26 after the consent-fanout audit
+    # (memory/consent_fanout_p0_p3_plan.md, P0-A).
+    'pair_code': {'props': ['channel', 'channel_type', 'display_name',
+                            'color', 'icon', 'code', 'expires_in',
+                            'clipboard_payload', 'deeplink',
+                            'instructions']},
+    # ── Channel connected success card ──
+    # Sibling of pair_code; rendered as a brief success toast once the
+    # gateway confirms authentication.  Self-dismisses after 6s on web.
+    'channel_connected': {'props': ['channel', 'display_name', 'color',
+                                    'message']},
 }
 
 # ═══════════════════════════════════════════════════════════════

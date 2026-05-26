@@ -67,6 +67,49 @@ called it out directly: parallel branches always drift, and the user
 should never need to ask "which one has my fix?" — the answer is
 always `main`.  HARTOS follows the same rule for the same reason.
 
+## Sibling Repos — Canonical Filesystem Paths
+
+These paths are load-bearing. Use them verbatim — guessing the
+wrong directory burns a turn (the user has called this out).
+Mobile lives under `StudioProjects/`, server/desktop under
+`PycharmProjects/`.
+
+### PycharmProjects/
+| Path | Role |
+|------|------|
+| `C:\Users\sathi\PycharmProjects\HARTOS` | **HART OS** — agentic runtime (Flask :6777), recipe pipeline, channels, social, security, peer_link. Branch: `main` only. |
+| `C:\Users\sathi\PycharmProjects\Nunba-HART-Companion` | **Nunba** — Windows/macOS/Linux desktop wrapper (cx_Freeze). Also hosts the **landing-page React web app** at `landing-page/` (same React tree for browser + desktop Liquid Glass Shell). |
+| `C:\Users\sathi\PycharmProjects\Hevolve_Database` | **Hevolve_Database** — canonical user/account store. Owns `User.FCMtoken`, capture endpoint `POST /update_fcm_token`, retrieval `GET /get_fcm_token/{user_id}`. |
+| `C:\Users\sathi\PycharmProjects\Hevolve` | **Hevolve web** — the hevolve.ai web product. |
+| `C:\Users\sathi\PycharmProjects\hevolveai` | **HevolveAI** — closed-source intelligence layer (Cython-compiled `.pyd`). All ML lives here; **HARTOS has no ML code**. |
+
+### StudioProjects/
+| Path | Role |
+|------|------|
+| `C:\Users\sathi\StudioProjects\Hevolve_React_Native` | **Hevolve_React_Native** — React Native shared by Android + iOS. ConsentOverlayService + native bridges (`android/app/src/main/java/...`, `ios/...`). |
+| `C:\Users\sathi\StudioProjects\Nunba-Companion-iOS` | **Nunba-Companion-iOS** — native iOS companion (Swift/ObjC). Pairs with Nunba desktop; separate from the RN app. |
+
+### Topology (messaging fan-out at a glance)
+```
+HARTOS publish_event('chat.social', …, user_id=X)
+  → WAMP topic com.hertzai.hevolve.social.{X}
+  → broadcast_sse_safe('notification', …, user_id=X)
+
+  Web (Nunba/landing-page)         ── SSE primary, WAMP fallback
+  Desktop (Nunba)                  ── same React tree, SSE
+  Android (Hevolve_React_Native)   ── WAMP (autobahn-js)
+  iOS    (Hevolve_React_Native)    ── WAMP
+  iOS    (Nunba-Companion-iOS)     ── separate native, pairs with desktop
+
+  Hevolve_Database                 ── token store only; no outbound push helper yet
+```
+
+### Gotchas (record so I stop repeating)
+- **Mindstory ≠ Hevolve mobile.** Mindstory (`PycharmProjects/Mindstory`) is the video-generation Android app. The actual mobile is `StudioProjects/Hevolve_React_Native`.
+- **Nunba ≠ Nunba-Companion-iOS.** Nunba is desktop (Win/macOS/Linux). Nunba-Companion-iOS is the iOS sidekick.
+- **landing-page is INSIDE Nunba-HART-Companion**, not a separate repo. Web changes → `Nunba-HART-Companion/landing-page/src/`.
+- Cross-repo grep template lives in `memory/reference_repo_layout.md`.
+
 ## Common Commands
 
 ### Logs (where to look when debugging)
@@ -348,6 +391,24 @@ Tests that belong in every refactor:
 - Behavioral test for the change's intent
 - Boundary test (ENOSPC, empty input, malformed input)
 - Regression test for any bug the change is fixing
+
+**NO GREP-BASED TESTS.**  A test must `import` the actual code,
+mock the boundary (DB, publisher, network, registry), call the
+real function, and assert observable side-effects (mock call args,
+return values, state mutations).  Tests like
+`assert "topic_name" in open(file).read()` or
+`assert idx_of_a < idx_of_b` for ordering checks are NOT tests —
+they only prove a string survived the commit.
+
+Source-shape guards (clearly-labelled `test_source_guard_*`) are
+acceptable ONLY for DRY enforcement across many files where a
+behavioural test for a single call site cannot catch the
+regression.  They must NEVER be the only test for an edit.
+
+Full rule + acceptable-vs-not table + JS / Java / Swift guidance:
+`memory/feedback_no_grep_tests.md` (auto-loaded via the index).
+The user surfaced this on 2026-05-26 — incident: 21 grep-tests
+passed while proving nothing about behaviour.
 
 ### Gate 6 — cx_Freeze Bundle Accounting (BLOCKING for new modules)
 

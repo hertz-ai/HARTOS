@@ -1652,7 +1652,14 @@ def _init_learning_pipeline():
             # security package missing — fall through to the raw import path
             pass
 
-        from hevolveai.embodied_ai.rl_ef import (
+        # Bypass rl_ef/__init__.py's graceful-degradation swallow
+        # (which binds every symbol to None on any ImportError /
+        # AttributeError / OSError / RuntimeError, then leaves us with
+        # the unhelpful "rl_ef symbols are None" warning that the guard
+        # at L1703 emits).  Direct-module import surfaces the real
+        # import-time failure so it lands in the `except Exception as e`
+        # at L1757 with exc_info=True.
+        from hevolveai.embodied_ai.rl_ef.learning_llm_provider import (
             create_learning_llm_config,
             register_learning_provider,
         )
@@ -1746,7 +1753,10 @@ def _init_learning_pipeline():
                 agent_type='hevolve_orchestrator',
                 latent_dim=2048,
                 capabilities=[
-                    AgentCapability.TEXT_GENERATION, AgentCapability.REASONING],
+                    AgentCapability.ENCODE,
+                    AgentCapability.DECODE,
+                    AgentCapability.REASON,
+                ],
             )
             _logger.info(f"[EmbodiedAI] HiveMind registered as {instance_id}")
 
@@ -2561,7 +2571,7 @@ def _handle_visual_watcher_tool(input_text):
     if modality in ('visual', 'both'):
         try:
             from integrations.vision.vision_service import VisionService
-            from core.platform.service_registry import ServiceRegistry
+            from core.platform.registry import ServiceRegistry
             vs = ServiceRegistry.get('VisionService')
             if vs:
                 condition_words = [w for w in condition.lower().split() if len(w) > 3]
@@ -2652,7 +2662,7 @@ def _request_consent(agent_id: str, action: str, label: str, input_text: str) ->
     description = f'{label} access needed: {input_text}'
     # Primary: Liquid UI (reaches Android/web/desktop)
     try:
-        from core.platform.service_registry import ServiceRegistry
+        from core.platform.registry import ServiceRegistry
         svc = ServiceRegistry.get('LiquidUIService')
         if svc:
             svc.agent_request_approval(agent_id=agent_id, action=action, description=description)
@@ -3030,7 +3040,7 @@ def _wire_qr_pair_emitter(channel_type: str, meta: dict) -> None:
     spawn via the same callback.
     """
     try:
-        from core.platform.service_registry import ServiceRegistry
+        from core.platform.registry import ServiceRegistry
         from integrations.channels.registry import get_registry
         _lui = ServiceRegistry.get('LiquidUIService')
         if _lui is None:
@@ -3080,6 +3090,368 @@ def _wire_qr_pair_emitter(channel_type: str, meta: dict) -> None:
             )
     except Exception as e:
         logger.debug("Connect_Channel: _wire_qr_pair_emitter failed: %s", e)
+
+
+def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
+    """Conversational pair-code OTP flow for gateway_qr channels (WhatsApp).
+
+    Orchestrates the steps the steward proved manually on 2026-05-25:
+      1. Ensure the embedded gateway session is started (idempotent —
+         Baileys gateway short-circuits if session already exists for
+         this user under ~/.hevolve/whatsapp/auth/<sid>/).
+      2. Mint an 8-char pair code at the gateway.
+      3. Emit agent_ui_update kind='pair_code' for the in-chat copy
+         card (LiquidUIService routes via WAMP to the user's Demopage).
+      4. Persist a Notification of type='consent.channel_pair_code'
+         with the payload as JSON in the message field.  The
+         consent.* prefix is the canonical route — NotificationBell
+         resolveTargetPath catches it on web/desktop, and Android
+         AutobahnConnectionManager onEventSocial dispatches consent.*
+         events to ConsentOverlayService.  RN ConsentOverlayService
+         (Hevolve_React_Native) reads kind/code/clipboard_payload/
+         deeplink from there, does Clipboard.setString(code), and shows
+         the "Open WhatsApp" banner.  When user taps it, WhatsApp opens
+         to Linked Devices and the code is already on the system
+         clipboard ready to paste.
+      5. Spawn a daemon thread polling /api/sessions/<sid>/status.
+         When WhatsApp confirms pairing (state=connected, authenticated
+         =true — happens after baileys auto-reconnects on code 515
+         restart-required), emit agent_ui_update kind='channel_connected'
+         so chat shows the success card with no further user action.
+
+    Fail-safe at every step: any branch logs at debug and returns.
+    The agent's text reply (composed by _handle_connect_channel_tool)
+    is the only guaranteed surface — UI cards and mobile push are
+    additive.
+    """
+    import os
+    import json as _json
+    import logging as _logging
+    import threading
+    import time
+
+    import requests as _req
+
+    # Self-contained logger so the helper works whether the module's
+    # global `logger` is initialised yet or not (helps in standalone
+    # probes that load this helper before full HARTOS bootstrap).
+    _log = _logging.getLogger(__name__)
+
+    user_id = thread_local_data.get_user_id() or 'system'
+    sid = user_id if str(user_id).startswith('user_') else f"user_{user_id}"
+    display_name = meta.get('display_name') or channel_type
+    icon = meta.get('icon') or channel_type
+    color = meta.get('color') or '#25D366'
+    deeplink = (
+        'whatsapp://settings/linked-devices'
+        if channel_type == 'whatsapp'
+        else meta.get('mobile_deeplink')
+    )
+
+    # Phone resolution: env override > stored user profile > ask in chat.
+    # WhatsApp's pair-code endpoint REQUIRES E.164 digits-only.
+    phone = (os.environ.get('HEVOLVE_WHATSAPP_PHONE', '') or '').strip()
+    phone = ''.join(ch for ch in phone if ch.isdigit())
+    if not phone:
+        try:
+            from integrations.social.models import db_session, User as _SocialUser
+            with db_session(commit=False) as db:
+                u = db.query(_SocialUser).filter_by(
+                    id=str(user_id)).first()
+                _p = (
+                    ((u and getattr(u, 'phone', '') or '') or '').strip()
+                    if u else ''
+                )
+                phone = ''.join(ch for ch in _p if ch.isdigit())
+        except Exception:
+            pass
+    if not phone:
+        # Fall through to the existing form path — surface a one-field
+        # form asking for the phone number.  Re-running connect with
+        # HEVOLVE_WHATSAPP_PHONE set, or after the user submits the
+        # form, will land in this branch with phone populated.
+        try:
+            from core.platform.registry import get_registry
+            _lui = get_registry().get('LiquidUIService')
+            if _lui:
+                _lui.agent_ui_update(
+                    user_id,
+                    {
+                        'type': 'form',
+                        'title': f"Connect {display_name}",
+                        'channel': channel_type,
+                        'fields': [{
+                            'name': 'phone',
+                            'label': 'WhatsApp phone (E.164, e.g. +91 90030 54371)',
+                            'placeholder': '+91...',
+                            'help': (
+                                'Used once to mint the linked-device '
+                                'pair-code.  Not stored on our servers.'
+                            ),
+                            'type': 'text',
+                            'secret': False,
+                        }],
+                        'submit_label': 'Send pair code',
+                        # FormOverlay (AgentOverlay.jsx:362) reads `data.action`,
+                        # not `submit_action` — the latter was a stale name used
+                        # by the pre-existing register_channel form that no
+                        # caller wires.  This URL re-enters
+                        # _start_gateway_qr_pair_push with phone bound in
+                        # request body.
+                        'action': f'/api/social/channels/{channel_type}/connect-pair-code',
+                    },
+                )
+        except Exception:
+            pass
+        return
+
+    base = (os.environ.get('WHATSAPP_GATEWAY_URL', '') or 'http://localhost:3000').rstrip('/')
+    try:
+        _req.post(f"{base}/api/sessions/{sid}/start", timeout=5)
+    except Exception as e:
+        _log.warning("gateway_qr: session start failed: %s", e)
+        return
+    # Baileys needs ~3s for the WA noise handshake before
+    # requestPairingCode succeeds — manual probe earlier today (the
+    # FA9K4NHK code) verified this timing.
+    time.sleep(3)
+    try:
+        r = _req.post(
+            f"{base}/api/sessions/{sid}/request-pair-code",
+            json={'phone': phone},
+            timeout=10,
+        )
+        body = r.json() if r.ok else {}
+        code = body.get('code')
+    except Exception as e:
+        _log.warning("gateway_qr: pair-code request error: %s", e)
+        return
+    if not code:
+        _log.warning(
+            "gateway_qr: gateway did not return a pair-code: %s", body)
+        return
+
+    push_payload = {
+        'kind': 'channel_pair_code',
+        'channel': channel_type,
+        'display_name': display_name,
+        'color': color,
+        'icon': icon,
+        'code': code,
+        'clipboard_payload': code,
+        'deeplink': deeplink,
+        'expires_in': 60,
+    }
+
+    # Mobile push via existing NotificationService.  Type uses the
+    # canonical 'consent.*' prefix so the existing NotificationBell
+    # resolveTargetPath route (consent.* → /admin/consent/{ref}) and
+    # AutobahnConnectionManager 'consent.*' Intent dispatch (P0-D)
+    # catch it without per-type bell code.  target_id carries the
+    # channel name so /admin/consent/{whatsapp} lands on the right
+    # channel admin context.  Message JSON keeps the deeplink so the
+    # generic P0-C deeplink override in resolveTargetPath wins on
+    # click — that takes the user to the channel pair page directly.
+    #
+    # Order matters: NotificationService.create runs BEFORE the
+    # LiquidUI emit so we can pass notif.id into the chat-card
+    # payload.  PairCodeOverlay (P1-S3) calls notificationsApi.markRead
+    # with that id on countdown expiry so the bell doesn't carry an
+    # orphan unread row for an expired pair code.
+    notif_id = None
+    try:
+        from integrations.social.services import NotificationService
+        from integrations.social.models import db_session
+        with db_session() as db:
+            notif = NotificationService.create(
+                db,
+                user_id=str(user_id),
+                type='consent.channel_pair_code',
+                target_id=channel_type,
+                target_type='channel',
+                message=_json.dumps(push_payload),
+            )
+            notif_id = getattr(notif, 'id', None)
+    except Exception as e:
+        _log.debug("gateway_qr: mobile push skipped: %s", e)
+
+    # In-chat card via the existing LiquidUI emit pipe.
+    try:
+        from core.platform.registry import get_registry
+        _lui = get_registry().get('LiquidUIService')
+        if _lui:
+            _lui.agent_ui_update(
+                user_id,
+                {
+                    'type': 'pair_code',
+                    'channel': channel_type,
+                    'channel_type': channel_type,
+                    'display_name': display_name,
+                    'color': color,
+                    'icon': icon,
+                    'code': code,
+                    'expires_in': 60,
+                    'clipboard_payload': code,
+                    'deeplink': deeplink,
+                    'notification_id': notif_id,
+                    'instructions': (
+                        f"Open {display_name} on your phone → "
+                        f"Settings → Linked Devices → Link a Device → "
+                        f"Link with phone number → enter {code} "
+                        f"(60-second window).  I've also pushed it "
+                        f"to your phone with auto-copy to clipboard."
+                    ),
+                },
+            )
+    except Exception as e:
+        _log.debug("gateway_qr: chat card emit failed: %s", e)
+
+    # ── 2026-05-26 P0-E ──────────────────────────────────────────────
+    # Fleet fanout for iOS native (Nunba-Companion-iOS) which
+    # subscribes to com.hertzai.hevolve.fleet.user.{user_id} and routes
+    # the existing 'agent_consent' cmd_type via FleetCommandReceiver
+    # allowlist — no iOS code change required.  Per
+    # core/peer_link/ui_commands.py module docstring: consent flows
+    # MUST use cmd_type='agent_consent' (NOT ui_overlay_show); the
+    # helper is "future work" per that docstring, so we publish via
+    # message_bus directly with the documented shape.  Web/desktop
+    # already get this card via the agent_ui_update + Notification
+    # emits above; Android gets it via the consent.* WAMP dispatcher
+    # (P0-D); this closes the iOS gap with one canonical route.
+    try:
+        from core.peer_link.message_bus import get_message_bus
+        get_message_bus().publish(
+            'fleet.command.user',
+            {
+                'cmd_type': 'agent_consent',
+                'id': f"consent-{channel_type}-{int(time.time())}",
+                'title': f"Connect {display_name}",
+                'body': (
+                    f"Code {code} auto-copied to clipboard.  Open "
+                    f"{display_name} → Linked Devices and enter the "
+                    f"code within 60s."
+                ),
+                'code': code,
+                'clipboard_payload': code,
+                'deeplink': deeplink,
+                'expires_in_seconds': 60,
+                'channel': channel_type,
+                'display_name': display_name,
+            },
+            user_id=str(user_id),
+        )
+    except Exception as e:
+        _log.debug("gateway_qr: iOS fleet publish skipped: %s", e)
+
+    # Polling thread — emits the success card to chat AND registers
+    # the channel binding in HARTOS DB when WhatsApp confirms pairing.
+    # Window covers 4 pair-code retries (each WA expires after ~60s).
+    # Daemon so the server can shut down at any time without joining
+    # this thread.
+    #
+    # Why the binding-register call inside the thread (not before):
+    # the user's manual pair on 2026-05-25 (FA9K4NHK) bypassed
+    # register_channel entirely — gateway state was 'connected' but
+    # HARTOS had no UserChannelBinding row, so neither the
+    # whatsapp_adapter daemon nor the admin Channels page nor any
+    # agent tool could see WhatsApp as a usable channel.  Registering
+    # in the success branch retroactively closes that loop for ANY
+    # path (chat conversational OR manual-via-curl) — single canonical
+    # success handler.  Idempotent: register_channel's UserChannelBinding
+    # query at agent_tools.py:204 short-circuits on existing rows.
+    def _poll():
+        deadline = time.time() + 240
+        while time.time() < deadline:
+            try:
+                rr = _req.get(
+                    f"{base}/api/sessions/{sid}/status", timeout=5)
+                if rr.ok and rr.json().get('authenticated'):
+                    # Register binding so Hevolve/Nunba see channel as
+                    # connected.  Re-uses the SAME register_channel
+                    # closure Connect_Channel calls — single code path.
+                    try:
+                        from integrations.channels.agent_tools import (
+                            build_channel_tool_closures,
+                        )
+                        _tools = build_channel_tool_closures(
+                            {'user_id': str(user_id),
+                             'prompt_id': thread_local_data.get_prompt_id()},
+                        ) or []
+                        _reg = next(
+                            (t[2] for t in _tools
+                             if isinstance(t, tuple) and len(t) >= 3
+                             and t[0] == 'register_channel'),
+                            None,
+                        )
+                        if _reg is not None:
+                            reg_out = _reg(channel_type, '{}')
+                            _log.info(
+                                "gateway_qr: register_channel after "
+                                "pair: %s", str(reg_out)[:200])
+                    except Exception as reg_err:
+                        _log.warning(
+                            "gateway_qr: register_channel after pair "
+                            "failed: %s", reg_err)
+                    # Chat success card.
+                    try:
+                        from core.platform.registry import get_registry
+                        _lui = get_registry().get('LiquidUIService')
+                        if _lui:
+                            _lui.agent_ui_update(
+                                user_id,
+                                {
+                                    'type': 'channel_connected',
+                                    'channel': channel_type,
+                                    'channel_type': channel_type,
+                                    'display_name': display_name,
+                                    'color': color,
+                                    'icon': icon,
+                                    'message': (
+                                        f"✅ {display_name} connected."
+                                    ),
+                                },
+                            )
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+            time.sleep(3)
+    threading.Thread(
+        target=_poll, daemon=True,
+        name=f'connect_channel_poll_{channel_type}',
+    ).start()
+
+
+def _backfill_channel_binding_post_pair(
+    channel_type: str, user_id: str,
+) -> dict:
+    """One-shot reconciliation: gateway says authenticated:true but
+    HARTOS has no UserChannelBinding for this channel/user.  Calls
+    register_channel('whatsapp', '{}') to close the gap.
+
+    Use this after any out-of-band pair (manual curl, prior session)
+    where the polling thread didn't get to run.  Idempotent.
+    """
+    try:
+        from integrations.channels.agent_tools import (
+            build_channel_tool_closures,
+        )
+        tools = build_channel_tool_closures(
+            {'user_id': str(user_id), 'prompt_id': None},
+        ) or []
+        reg = next(
+            (t[2] for t in tools
+             if isinstance(t, tuple) and len(t) >= 3
+             and t[0] == 'register_channel'),
+            None,
+        )
+        if reg is None:
+            return {'success': False, 'error': 'register_channel unavailable'}
+        out = reg(channel_type, '{}')
+        return {'success': True, 'message': str(out)[:400]}
+    except Exception as e:
+        return {'success': False, 'error': repr(e)[:300]}
 
 
 def _handle_connect_channel_tool(input_text: str) -> str:
@@ -3170,7 +3542,7 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                             user_id=int(thread_local_data.get_user_id() or 0),
                             channel_type=channel_type,
                         )
-                        from core.platform.service_registry import ServiceRegistry
+                        from core.platform.registry import ServiceRegistry
                         _lui = ServiceRegistry.get('LiquidUIService')
                         if _lui:
                             _lui.agent_ui_update(
@@ -3209,7 +3581,7 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                 # via the admin Channels page (which shows ALL fields).
                 visible_fields = [f for f in setup_fields if not f.get('auto')]
                 if visible_fields:
-                    from core.platform.service_registry import ServiceRegistry
+                    from core.platform.registry import ServiceRegistry
                     _lui = ServiceRegistry.get('LiquidUIService')
                     if _lui:
                         _lui.agent_ui_update(
@@ -3264,6 +3636,39 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                     _wire_qr_pair_emitter(channel_type, meta)
         except Exception as e:
             logger.debug("Connect_Channel: qr_pair wire skipped: %s", e)
+
+        # ── gateway_qr conversational pair-code push ───────────────
+        # NEW (2026-05-25): for channels with auth_method='gateway_qr'
+        # (WhatsApp via the embedded Baileys gateway) the canonical
+        # onboarding is an 8-char pair-code OTP rather than scanning
+        # a QR.  Rather than dumping the code into the React UI and
+        # making the user retype, we:
+        #   1. mint the code at the local gateway,
+        #   2. emit an agent_ui_update kind='pair_code' so the chat
+        #      panel renders a copy-button card,
+        #   3. persist a Notification of type='consent.channel_pair_code'
+        #      with the payload as JSON in the message field (the
+        #      consent.* prefix is what every surface's existing route
+        #      catches — bell, Android overlay dispatcher, iOS fleet
+        #      handler).  RN
+        #      ConsentOverlayService consumes that, does
+        #      Clipboard.setString(code), and shows an "Open WhatsApp"
+        #      banner whose tap navigates to the deeplink with the
+        #      code already on the clipboard for paste,
+        #   4. spawn a daemon thread polling the gateway session;
+        #      on authenticated:true emit kind='channel_connected' so
+        #      chat shows the success card automatically.
+        # The full chain (gateway require()→import() patch,
+        # baileys 7.0.0-rc13 upgrade, auto-reconnect on code 515
+        # restart-required) lands the user in state='connected' with
+        # zero technical detail surfaced to them.
+        try:
+            from integrations.channels.metadata import get_channel_metadata
+            meta = get_channel_metadata(channel_type) or {}
+            if meta.get('auth_method') == 'gateway_qr':
+                _start_gateway_qr_pair_push(channel_type, meta)
+        except Exception as e:
+            logger.debug("Connect_Channel: gateway_qr push skipped: %s", e)
         return result
     except Exception as e:
         return f"Channel connect error: {str(e)[:200]}"
@@ -3313,8 +3718,8 @@ def _handle_invite_friend_tool(input_text: str) -> str:
         # uses (line 2891-2925), same canonical AgentOverlay 'form'
         # renderer.  Best-effort — never blocks the tool return.
         try:
-            from core.platform.service_registry import ServiceRegistry
-            _lui = ServiceRegistry.get('LiquidUIService')
+            from core.platform.registry import get_registry
+            _lui = get_registry().get('LiquidUIService')
             if _lui:
                 _lui.agent_ui_update(
                     str(uid),
@@ -3416,7 +3821,7 @@ def _handle_join_external_room_tool(input_text: str) -> str:
         if not allowed:
             # Surface a Liquid UI consent card so the user can grant in one click.
             try:
-                from core.platform.service_registry import ServiceRegistry
+                from core.platform.registry import ServiceRegistry
                 _lui = ServiceRegistry.get('LiquidUIService')
                 if _lui:
                     _lui.agent_ui_update(
@@ -7544,18 +7949,39 @@ def _chat_reply(user_id, request_id, response_text: str, **payload):
                           or payload.get('language') or _lang)
             _atts = payload.get('attachments')
             _rid = str(request_id) if request_id is not None else None
+            # P2-S4 (2026-05-26): thread channel_type through to
+            # chat_messages.persist so interview / external-room Q&A
+            # land in a separate logical thread from regular chat
+            # without forking the persist pipeline.  Default 'chat'
+            # preserves existing behaviour for every other caller.
+            # Order of precedence: explicit payload kwarg → request
+            # body → 'chat' default.
+            _chan_type = payload.get('channel_type')
+            if not _chan_type:
+                try:
+                    from flask import has_request_context
+                    from flask import request as _flask_req
+                    if has_request_context():
+                        _body = _flask_req.get_json(silent=True) or {}
+                        _chan_type = _body.get('channel_type') or 'chat'
+                    else:
+                        _chan_type = 'chat'
+                except Exception:
+                    _chan_type = 'chat'
             if _prompt:
                 _cm.persist_and_publish_async(
                     str(user_id), 'user', _prompt,
                     agent_id=_agent, prompt_id=_prompt_id,
                     request_id=_rid, device_id=_dev,
                     lang=_lang_hint, attachments=_atts,
+                    channel_type=_chan_type,
                 )
             _cm.persist_and_publish_async(
                 str(user_id), 'assistant', response_text,
                 agent_id=_agent, prompt_id=_prompt_id,
                 request_id=_rid, device_id=_dev,
                 lang=_lang_hint, attachments=None,
+                channel_type=_chan_type,
             )
         except Exception as _chat_sync_err:
             app.logger.debug(

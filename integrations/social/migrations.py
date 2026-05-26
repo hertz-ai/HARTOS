@@ -8,7 +8,7 @@ from .models import get_engine, Base
 
 logger = logging.getLogger('hevolve_social')
 
-SCHEMA_VERSION = 51
+SCHEMA_VERSION = 53
 
 
 # Tables that hold tenant-scoped user content. v40 adds a nullable
@@ -1845,3 +1845,36 @@ def run_migrations():
                     "v52 migration: %s skipped (may already exist): %s",
                     label, e)
         set_schema_version(engine, 52)
+
+    if current < 53:
+        # v53 (2026-05-26, P3b): add read_at + dismissed_at columns
+        # to notifications so we can distinguish "user explicitly
+        # marked it read in the bell" (read_at set) from "overlay
+        # timed out + auto-dismissed" (dismissed_at set), and so
+        # analytics can answer "unread for how long?" without a
+        # separate audit log.  Existing rows get NULL — backwards
+        # compatible.  is_read stays as the boolean discriminator
+        # used by /notifications?unread=true queries.
+        logger.info(
+            "HevolveSocial: migrating to v53 "
+            "(notifications.read_at + dismissed_at)")
+        _v53_stmts = [
+            ("ALTER TABLE notifications ADD COLUMN read_at DATETIME",
+             "ADD COLUMN notifications.read_at"),
+            ("ALTER TABLE notifications ADD COLUMN dismissed_at DATETIME",
+             "ADD COLUMN notifications.dismissed_at"),
+        ]
+        for sql, label in _v53_stmts:
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text(sql))
+                    conn.commit()
+            except Exception as e:
+                if _is_already_exists_error(e):
+                    logger.info(
+                        "v53 migration: %s skipped (already exists)",
+                        label)
+                else:
+                    logger.warning(
+                        "v53 migration: %s failed: %s", label, e)
+        set_schema_version(engine, 53)
