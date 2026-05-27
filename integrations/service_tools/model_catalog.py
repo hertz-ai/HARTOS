@@ -305,6 +305,7 @@ class ModelCatalog:
                     budget_ram_gb: float = 4, gpu_available: bool = False,
                     language: Optional[str] = None,
                     require_capability: Optional[Dict[str, Any]] = None,
+                    exclude: Optional[List[str]] = None,
                     ) -> Optional[ModelEntry]:
         """Select the best model of a given type for current compute.
 
@@ -313,8 +314,20 @@ class ModelCatalog:
           2. If language specified, prefer models that serve it
           3. Sort by quality_score * speed_score * priority
           4. Return top pick
+
+        ``exclude`` — set of model_ids to skip (used by fallback walks
+        when a previously-selected entry just failed synth/load).  None
+        or empty list means "no exclusions" (default).
         """
         candidates = self.list_by_type(model_type)
+
+        # Fallback exclusion — caller-supplied IDs are filtered before
+        # any scoring so the second-best engine surfaces cleanly when
+        # the primary fails at runtime (e.g. TTS engine raised, walk
+        # to the next entry in language_priority order).
+        if exclude:
+            _exclude_set = set(exclude)
+            candidates = [e for e in candidates if e.id not in _exclude_set]
 
         # Get current capability tier to enforce min_capability_tier
         current_tier = self._get_capability_tier()
