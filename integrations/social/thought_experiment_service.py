@@ -292,10 +292,19 @@ class ThoughtExperimentService:
         # Create evaluation goal for agent dispatch
         try:
             from integrations.agent_engine.goal_manager import GoalManager
-            from .models import User
-            system_user = db.query(User).filter_by(
-                username='hevolve_system_agent').first()
-            user_id = system_user.id if system_user else 'system'
+            from .services import UserService
+            # Ensure the system user exists rather than falling back
+            # to the literal 'system' sentinel (which fails any FK
+            # constraint downstream).  Posts + experiments all
+            # surface to feed readers as authored by "Nunba" — one
+            # shared system identity so the flywheel's published
+            # content has a coherent voice.  Idempotent + collision-
+            # guarded — see UserService.ensure_system_user docstring.
+            system_user = UserService.ensure_system_user(
+                db, 'nunba', display_name='Nunba',
+                bio='The Hevolve hive — autonomous orchestrator '
+                    'for benchmarks, experiments, and proof.')
+            user_id = system_user.id
 
             goal = GoalManager.create_goal(
                 db,

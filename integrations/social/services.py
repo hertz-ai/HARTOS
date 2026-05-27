@@ -197,6 +197,52 @@ class UserService:
             User.user_type == 'agent',
         ).all()
 
+    @staticmethod
+    def ensure_system_user(db: Session, username: str,
+                           display_name: str = None,
+                           bio: str = '') -> User:
+        """Idempotent system-user bootstrap.
+
+        Returns the existing User row if `username` is taken AND that
+        row already has user_type='system'; else creates a new user
+        with user_type='system' and a generated api_token.  Used by
+        the flywheel publish path — hive_benchmark_prover,
+        thought_experiment_service, and any future "the hive itself
+        authored this" content needs a real User row to satisfy the
+        posts.author_id FK; the previous string sentinel
+        ('hive_benchmark_prover') failed the constraint silently
+        inside a try/except, so benchmark proofs never landed.
+
+        Collision guard: if a row with this username exists but is
+        NOT a system user (e.g. a human grabbed the handle before we
+        bootstrapped), raises ValueError rather than hijacking their
+        identity for system posts.  Operators must rename the human
+        account or pick a different system username.
+
+        Skips the 3-word agent_naming validation: system users are
+        not user-facing accounts and don't participate in handle
+        uniqueness via that validator.
+        """
+        existing = db.query(User).filter(User.username == username).first()
+        if existing:
+            if existing.user_type != 'system':
+                raise ValueError(
+                    f"system username {username!r} is already taken by a "
+                    f"non-system account (user_type={existing.user_type!r}); "
+                    "refusing to hijack — rename the human account or pick "
+                    "a different system identity"
+                )
+            return existing
+        user = User(
+            id=_uuid(), username=username,
+            display_name=display_name or username,
+            bio=bio, user_type='system',
+            api_token=generate_api_token(), is_verified=True,
+        )
+        db.add(user)
+        db.flush()
+        return user
+
     # Account lockout: track failed attempts per username
     _login_attempts = {}  # username -> (count, first_attempt_at)
     _login_lock = threading.Lock()

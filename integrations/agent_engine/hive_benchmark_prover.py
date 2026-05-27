@@ -1169,22 +1169,35 @@ class HiveBenchmarkProver:
         except Exception:
             pass
 
-        # 2. Create social post
+        # 2. Create social post via the canonical PostService — this
+        # fires on_new_post fan-out (#49/#51) so web + Android + iOS
+        # + desktop subscribers see the proof in real-time.  Prior
+        # implementation `db.add(Post(author_id='hive_benchmark_prover'))`
+        # bypassed PostService AND failed the posts.author_id FK
+        # constraint (the literal string is not a User.id UUID) — so
+        # benchmark proofs never persisted and the self-advertising
+        # leg of the flywheel was dead.  Switch to the canonical path:
+        # ensure a real system user exists, then PostService.create.
         try:
-            from integrations.social.models import db_session, Post
+            from integrations.social.models import db_session
+            from integrations.social.services import (
+                UserService, PostService)
             with db_session() as db:
-                post = Post(
-                    author_id='hive_benchmark_prover',
+                prover_user = UserService.ensure_system_user(
+                    db, 'nunba',
+                    display_name='Nunba',
+                    bio='Autonomous publisher of distributed-hive '
+                        'benchmark results.')
+                post = PostService.create(
+                    db, prover_user,
                     title=f"Benchmark Proof: {benchmark_name} "
                           f"— {score:.1%} ({num_nodes} nodes)",
                     content=comparison_text,
                     content_type='text',
                 )
-                db.add(post)
-                db.flush()
                 publish_info['post_id'] = post.id
         except Exception as exc:
-            logger.debug("Social post creation failed: %s", exc)
+            logger.warning("Benchmark social post creation failed: %s", exc)
 
         # 3. Dispatch to all channels via signal bridge
         try:
@@ -1206,15 +1219,23 @@ class HiveBenchmarkProver:
         except Exception as exc:
             logger.debug("Signal bridge dispatch failed: %s", exc)
 
-        # 4. Create thought experiment for community input
+        # 4. Create thought experiment for community input.  Same
+        # FK-constraint problem as the social post above — creator_id
+        # must be a real User.id; the prior 'hive_benchmark_prover'
+        # sentinel failed silently.  Reuse the system user we
+        # bootstrapped for the post so both surfaces are owned by the
+        # same identity.
         try:
             from integrations.social.thought_experiment_service import (
                 ThoughtExperimentService)
             from integrations.social.models import db_session
+            from integrations.social.services import UserService
             with db_session() as db:
+                prover_user = UserService.ensure_system_user(
+                    db, 'nunba', display_name='Nunba')
                 experiment = ThoughtExperimentService.create_experiment(
                     db=db,
-                    creator_id='hive_benchmark_prover',
+                    creator_id=prover_user.id,
                     title=f"Should we optimize for {benchmark_name} next?",
                     hypothesis=(
                         f"The hive scored {score:.1%} on {benchmark_name} "
@@ -2587,10 +2608,13 @@ class HiveBenchmarkProver:
             from integrations.social.thought_experiment_service import (
                 ThoughtExperimentService)
             from integrations.social.models import db_session
+            from integrations.social.services import UserService
             with db_session() as db:
+                prover_user = UserService.ensure_system_user(
+                    db, 'nunba', display_name='Nunba')
                 ThoughtExperimentService.create_experiment(
                     db=db,
-                    creator_id='hive_benchmark_prover',
+                    creator_id=prover_user.id,
                     title=(
                         f"Benchmark priority: focus on {worst_bench}?"),
                     hypothesis=(
