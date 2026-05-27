@@ -266,12 +266,88 @@ def version():
 @admin_bp.route("/channels", methods=["GET"])
 @api_response
 def list_channels():
-    """List all configured channels."""
+    """List all configured channels — both admin-configured bot configs
+    and the calling user's active channel bindings.
+
+    Historical gap (2026-05-27 user report — "whatsapp is already
+    authorized but Channel Integrations page shows No Channels
+    Configured"): this endpoint used to return only
+    ``AdminAPI._channels`` (an in-memory dict populated by the
+    create_channel POST below).  The Channel Setup Wizard's WhatsApp
+    pair-code flow writes to a DIFFERENT store —
+    ``UserChannelBinding`` rows in the social DB — so authorised
+    WhatsApp / Telegram / Slack bindings never appeared in the admin
+    Channel Integrations UI even though the bot was actually paired.
+
+    Fix: read BOTH sources and union them, tagging each entry with a
+    ``source`` field so the UI can render visual differentiation if it
+    wants.  No new write path is introduced — both stores keep their
+    canonical writers.  Eliminates the parallel-path read, not the
+    parallel store (deleting ``AdminAPI._channels`` is a larger
+    refactor; this fix is the minimum-viable cure for the symptom).
+
+    Response items shape (uniform across both sources):
+        channel_type, name, enabled, config, source, …binding-only fields
+    """
     api = get_api()
     page = request.args.get("page", 1, type=int)
     page_size = request.args.get("page_size", 20, type=int)
 
-    channels = list(api._channels.values())
+    # ── Source 1: admin-configured bot integrations ────────────────
+    admin_items = []
+    for ch in api._channels.values():
+        # Defensive copy so we don't mutate the in-memory dict the
+        # CRUD endpoints below also read.
+        entry = dict(ch) if isinstance(ch, dict) else {"channel_type": str(ch)}
+        entry["source"] = "admin_config"
+        admin_items.append(entry)
+
+    # ── Source 2: the calling user's UserChannelBinding rows ───────
+    # The Channel Setup Wizard's pair-code + OAuth flows write here;
+    # without surfacing these, an authorised channel is invisible to
+    # the admin UI.  Errors are swallowed at warning so the admin
+    # endpoint still works on nodes where the social DB is offline.
+    binding_items: List[Dict[str, Any]] = []
+    db = getattr(g, "db", None)
+    user_id = getattr(g, "user_id", None)
+    if db is not None and user_id is not None:
+        try:
+            from integrations.social.models import UserChannelBinding
+            rows = (
+                db.query(UserChannelBinding)
+                .filter_by(user_id=user_id, is_active=True)
+                .order_by(UserChannelBinding.created_at.desc())
+                .all()
+            )
+            for binding in rows:
+                d = binding.to_dict()
+                meta = d.get("metadata_json") or {}
+                binding_items.append({
+                    "channel_type": d.get("channel_type"),
+                    "name": (
+                        meta.get("display_name")
+                        or (d.get("channel_type") or "").title()
+                        or "Channel"
+                    ),
+                    "enabled": bool(d.get("is_active")),
+                    "config": {
+                        "channel_sender_id": d.get("channel_sender_id"),
+                        "channel_chat_id": d.get("channel_chat_id"),
+                        "auth_method": d.get("auth_method"),
+                    },
+                    "source": "user_binding",
+                    "binding_id": d.get("id"),
+                    "is_preferred": bool(d.get("is_preferred")),
+                    "last_message_at": d.get("last_message_at"),
+                    "created_at": d.get("created_at"),
+                })
+        except Exception as e:
+            logger.warning(
+                "list_channels: failed to load UserChannelBinding rows "
+                "for user_id=%s: %s", user_id, e,
+            )
+
+    channels = admin_items + binding_items
     total = len(channels)
     start = (page - 1) * page_size
     end = start + page_size
