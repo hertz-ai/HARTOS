@@ -25,6 +25,35 @@ def _uuid():
     return str(uuid.uuid4())
 
 
+def _community_name_for(db: Session, post: Post) -> Optional[str]:
+    """Look up the canonical community NAME for a post's community_id.
+    Used by lifecycle fan-out so post/comment events land on the right
+    community.message.{name} WAMP topic (TOPIC_MAP at
+    core/peer_link/message_bus.py:77 fills {community_id} from
+    data['community_id'], which by convention carries the name not the
+    UUID — see PostService.create's call to on_new_post).  Returns None
+    if the post has no community or the community row is missing."""
+    if not getattr(post, 'community_id', None):
+        return None
+    community = db.query(Community).filter_by(id=post.community_id).first()
+    return community.name if community else None
+
+
+def _publish_realtime(fn_name: str, *args, **kwargs) -> None:
+    """Best-effort thin wrapper for realtime.* publish calls from
+    service methods.  Fan-out availability must NEVER block the
+    user-visible mutation; transport errors land in the log and the
+    DB row still commits.  All calls go through ONE shim so adding
+    metrics / circuit-breaker / topic-blacklist later touches one
+    place."""
+    try:
+        from . import realtime
+        getattr(realtime, fn_name)(*args, **kwargs)
+    except Exception as e:
+        logger.warning(
+            "realtime.%s fan-out failed: %s", fn_name, e)
+
+
 # ─── Audit trail (Reddit-style accountability) ─────────────────
 #
 # Post edits + soft-deletes used to overwrite content silently with no
@@ -383,6 +412,16 @@ class PostService:
         except Exception:
             pass
 
+        # Fan-out the post.new event so every consumer (web SSE,
+        # WAMP-subscribed Android/iOS/desktop) learns about it without
+        # polling.  Previously only external_bot_bridge fired this —
+        # human-authored posts via /api/social/posts POST never made
+        # it to live subscribers (#49-sibling for posts).
+        _publish_realtime(
+            'on_new_post',
+            post.to_dict(include_author=True),
+            community_name=community_name)
+
         return post
 
     @staticmethod
@@ -480,14 +519,36 @@ class PostService:
                     'fields': changed,
                 })
         db.flush()
+
+        # Fan out the update so cached clients can patch the post
+        # in place (post.update event) instead of waiting for the
+        # next /api/social/posts refresh.  Only fire if something
+        # actually changed — no-op edits stay silent.
+        if changed:
+            _publish_realtime(
+                'on_post_update',
+                post.to_dict(include_author=True),
+                community_name=_community_name_for(db, post))
+
         return post
 
     @staticmethod
     def delete(db: Session, post: Post, actor_id: str = None):
-        # Snapshot before mutation so the audit detail has the original
-        # title + content.  We log BEFORE flipping is_deleted so a DB
-        # commit error doesn't leave an orphaned audit entry referring
-        # to a state that never persisted.
+        # Snapshot before mutation so both the audit detail AND the
+        # post.delete fan-out payload have the pre-delete state
+        # (post.is_deleted=True hides the row from subsequent queries
+        # so we can't reconstruct it after the flip).  Audit log is
+        # written BEFORE the flip so a DB commit error doesn't leave
+        # an orphaned audit entry referring to state that never
+        # persisted.
+        community_name = _community_name_for(db, post)
+        delete_payload = {
+            'id': post.id,
+            'author_id': post.author_id,
+            'community_id': post.community_id,
+            'title': post.title,
+            'is_deleted': True,
+        }
         _audit_post_event(
             'post.delete', actor_id=actor_id, post=post, detail={
                 'title': post.title,
@@ -501,6 +562,13 @@ class PostService:
             if community:
                 community.post_count = max(0, (community.post_count or 0) - 1)
         db.flush()
+
+        # Fan out the post.delete event so cached clients drop the
+        # entry from their feed instead of showing stale content
+        # until the next refresh.
+        _publish_realtime(
+            'on_post_delete', delete_payload,
+            community_name=community_name)
 
     @staticmethod
     def increment_view(db: Session, post: Post):
@@ -574,6 +642,16 @@ class CommentService:
         except Exception:
             pass
 
+        # Fan-out the new comment so every active subscriber on the
+        # post's community sees it without polling.  Previously the
+        # only caller of on_new_comment was external_bot_bridge —
+        # human-authored comments via /api/social/comments POST
+        # missed the realtime path entirely (#49).
+        _publish_realtime(
+            'on_new_comment',
+            comment.to_dict(include_author=True),
+            community_name=_community_name_for(db, post))
+
         return comment
 
     @staticmethod
@@ -591,6 +669,18 @@ class CommentService:
 
     @staticmethod
     def delete(db: Session, comment: Comment, actor_id: str = None):
+        # Snapshot before mutation so the audit detail AND the
+        # comment.delete fan-out both see the original state.  After
+        # the flip, comment.content == '[deleted]' so we'd lose the
+        # original for both purposes.
+        post = db.query(Post).filter_by(id=comment.post_id).first()
+        community_name = _community_name_for(db, post) if post else None
+        delete_payload = {
+            'id': comment.id,
+            'post_id': comment.post_id,
+            'author_id': comment.author_id,
+            'is_deleted': True,
+        }
         # Reddit-style: original content goes into the audit log
         # detail BEFORE we overwrite with '[deleted]', so moderators
         # / appeals can still see what was removed (the hash-chain
@@ -603,6 +693,12 @@ class CommentService:
         comment.is_deleted = True
         comment.content = '[deleted]'
         db.flush()
+
+        # Fan out so cached clients drop the comment from the thread
+        # view instead of showing stale content until refresh.
+        _publish_realtime(
+            'on_comment_delete', delete_payload,
+            community_name=community_name)
 
 
 # ─── Vote Service ───

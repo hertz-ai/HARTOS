@@ -14,8 +14,12 @@ from integrations.social.realtime import (
     _AUTHOR_PUBLIC_BLOCKLIST,
     _sanitize_author_for_public,
     _sanitize_for_public_broadcast,
+    on_comment_delete,
     on_new_comment,
     on_new_post,
+    on_notification,
+    on_post_delete,
+    on_post_update,
 )
 
 
@@ -171,21 +175,133 @@ def test_on_new_post_does_not_mutate_caller_dict():
     # Caller's post dict is unchanged.
     assert post['author']['email'] == 'alice@example.com'
     assert post['author']['voice_profile'] == 'voiceprint-blob'
+    # And the caller's dict didn't acquire the wire-only fields.
+    assert 'event' not in post
+    assert 'msg_id' not in post
+
+
+def test_on_new_post_stamps_event_and_msg_id():
+    # Subscribers discriminate lifecycle by `event` field; `msg_id`
+    # gives them an idempotency key for SSE+WAMP race dedup.
+    post = {'id': 'p-1', 'author': _full_author()}
+    calls = []
+    with patch.object(realtime, 'publish_event',
+                      side_effect=lambda topic, data, **kw: calls.append((topic, data))):
+        on_new_post(post)
+    _, data = calls[0]
+    assert data['event'] == 'post.new'
+    assert 'msg_id' in data
+    # ULID-like 16 hex chars (chat_messages._generate_msg_id format).
+    assert len(data['msg_id']) >= 16
+
+
+def test_on_post_update_event_discriminator():
+    post = {'id': 'p-1', 'title': 'edited', 'author': _full_author()}
+    calls = []
+    with patch.object(realtime, 'publish_event',
+                      side_effect=lambda topic, data, **kw: calls.append((topic, data))):
+        on_post_update(post, community_name='general')
+    # community.feed + community.message both fire (same routing as
+    # post.new — the canonical _publish_post_event handles both).
+    events = [d['event'] for _, d in calls]
+    assert events == ['post.update', 'post.update']
+    for _, data in calls:
+        assert 'msg_id' in data
+        for field in _AUTHOR_PUBLIC_BLOCKLIST:
+            assert field not in data['author']
+
+
+def test_on_post_delete_event_discriminator():
+    snapshot = {'id': 'p-1', 'author_id': 'u-42', 'is_deleted': True}
+    calls = []
+    with patch.object(realtime, 'publish_event',
+                      side_effect=lambda topic, data, **kw: calls.append((topic, data))):
+        on_post_delete(snapshot, community_name='general')
+    events = [d['event'] for _, d in calls]
+    assert events == ['post.delete', 'post.delete']
+    # is_deleted=True propagates so subscribers know to drop the entry.
+    assert all(d['is_deleted'] is True for _, d in calls)
+
+
+def test_on_comment_delete_event_discriminator():
+    snapshot = {'id': 'c-1', 'post_id': 'p-1', 'author_id': 'u-42',
+                'is_deleted': True}
+    calls = []
+    with patch.object(realtime, 'publish_event',
+                      side_effect=lambda topic, data, **kw: calls.append((topic, data))):
+        on_comment_delete(snapshot, community_name='general')
+    assert len(calls) == 1
+    topic, data = calls[0]
+    assert topic == 'community.message'
+    assert data['event'] == 'comment.delete'
+    assert data['is_deleted'] is True
+    assert 'msg_id' in data
+
+
+def test_on_notification_stamps_msg_id_consistently_across_transports():
+    # WAMP + SSE both carry the SAME msg_id so a multidevice race that
+    # delivers both transports doesn't double-render the notification.
+    wamp_calls = []
+    sse_calls = []
+    from core.platform import events as platform_events
+    with patch.object(realtime, 'publish_event',
+                      side_effect=lambda topic, data, **kw: wamp_calls.append(data)):
+        with patch.object(platform_events, 'broadcast_sse_safe',
+                          side_effect=lambda evt, data, **kw: sse_calls.append(data)):
+            on_notification('u-42', {'id': 'notif-1', 'message': 'hi'})
+    assert len(wamp_calls) == 1 and len(sse_calls) == 1
+    assert wamp_calls[0]['msg_id'] == sse_calls[0]['msg_id']
+    assert len(wamp_calls[0]['msg_id']) >= 16
+
+
+def test_on_notification_respects_caller_supplied_msg_id():
+    # If a caller already has a msg_id (e.g. NotificationService
+    # generating one at create-time), the helper must NOT clobber it.
+    wamp_calls = []
+    with patch.object(realtime, 'publish_event',
+                      side_effect=lambda topic, data, **kw: wamp_calls.append(data)):
+        from core.platform import events as platform_events
+        with patch.object(platform_events, 'broadcast_sse_safe'):
+            on_notification('u-42', {
+                'id': 'notif-1', 'msg_id': 'caller-supplied-key',
+                'message': 'hi'})
+    assert wamp_calls[0]['msg_id'] == 'caller-supplied-key'
 
 
 # ─── 4. on_new_comment — same guarantee ─────────────────────────
 
-def test_on_new_comment_sanitizes_payload():
-    comment = {'id': 'c-1', 'content': 'reply', 'author': _full_author()}
+def test_on_new_comment_sanitizes_payload_when_routed_to_community():
+    # New canonical routing: comment.new now flows via
+    # community.message.{community_name} — the topic web/Android/iOS
+    # already subscribe to.  Old social.post.{id}.new_comment had no
+    # subscribers (was dead code).
+    comment = {'id': 'c-1', 'post_id': 'p-1', 'content': 'reply',
+               'author': _full_author()}
     calls = []
     with patch.object(realtime, 'publish_event',
                       side_effect=lambda topic, data, **kw: calls.append((topic, data))):
-        on_new_comment(comment, post_id='p-1')
+        on_new_comment(comment, community_name='general')
     assert len(calls) == 1
     topic, data = calls[0]
-    assert topic == 'social.post.p-1.new_comment'
+    assert topic == 'community.message'
+    assert data['community_id'] == 'general'
+    assert data['event'] == 'comment.new'
+    assert 'msg_id' in data and len(data['msg_id']) >= 16
     for field in _AUTHOR_PUBLIC_BLOCKLIST:
         assert field not in data['author']
+
+
+def test_on_new_comment_without_community_publishes_nothing():
+    # Comments on community-less posts have no canonical fan-out
+    # topic.  The per-user NotificationService path (NotificationService.
+    # create → on_notification) is the only live channel for these.
+    comment = {'id': 'c-1', 'post_id': 'p-1', 'content': 'reply',
+               'author': _full_author()}
+    calls = []
+    with patch.object(realtime, 'publish_event',
+                      side_effect=lambda topic, data, **kw: calls.append((topic, data))):
+        on_new_comment(comment)
+    assert calls == []
 
 
 # ─── 5. Sanity: blocklist covers the User.to_dict surface ──────

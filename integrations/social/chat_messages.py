@@ -101,6 +101,12 @@ def _generate_msg_id() -> str:
     return f"{ms:012x}{rnd:04x}"
 
 
+# Public alias so other fan-out paths (realtime.py post/comment/
+# notification events) can stamp the same shape of idempotency key
+# without re-implementing the generator.  Single source of truth.
+make_msg_id = _generate_msg_id
+
+
 def _payload_bytes(obj: Any) -> int:
     """Cheap JSON-encoded size estimate for the byte cap in pull_since."""
     try:

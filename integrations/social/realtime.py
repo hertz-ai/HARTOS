@@ -235,23 +235,85 @@ def _sanitize_for_public_broadcast(payload: dict) -> dict:
     return cleaned
 
 
-def on_new_post(post_dict: dict, community_name: str = None):
-    # Strip PII / private profile fields before public broadcast.
-    safe = _sanitize_for_public_broadcast(post_dict)
-    # Broadcast to global community feed (RN subscribes to com.hertzai.community.feed)
+# ─── Canonical lifecycle fan-out (#49-#52, #54) ─────────────────
+#
+# Every post/comment lifecycle event (new / update / delete) shares
+# the same topic shape: community.feed (global) + community.message.{id}
+# (per-community).  Single helper enforces:
+#   - PII sanitizer applied once
+#   - msg_id stamped once (idempotency key, same generator as chat.new)
+#   - event discriminator field so subscribers can patch / append /
+#     remove a cached entry without guessing from payload shape
+#
+# This replaces the prior parallel paths where on_new_comment published
+# to social.post.{id}.new_comment (no subscribers — the payload died
+# on the wire).  All comment events now route through community.message
+# which web/desktop/Android already subscribe to.
+
+
+def _stamp_event(safe: dict, event: str) -> dict:
+    """Add the event discriminator + idempotency key.  Mutates and
+    returns `safe` (which is already a shallow copy from the
+    sanitizer)."""
+    from .chat_messages import make_msg_id
+    safe['event'] = event
+    # Don't clobber a msg_id the caller already supplied (e.g. chat
+    # turns embedding their own ULID).
+    safe.setdefault('msg_id', make_msg_id())
+    return safe
+
+
+def _publish_post_event(event: str, post_dict: dict,
+                        community_name: str = None) -> None:
+    """One fan-out for every post lifecycle event.
+    `event` ∈ {'post.new', 'post.update', 'post.delete'}."""
+    safe = _stamp_event(_sanitize_for_public_broadcast(post_dict), event)
     publish_event('community.feed', safe)
-    # Also per-community (web subscribes to com.hertzai.hevolve.community.{id})
     if community_name:
         data = dict(safe)
         data['community_id'] = community_name
         publish_event('community.message', data)
 
 
-def on_new_comment(comment_dict: dict, post_id: str):
-    # Strip PII / private profile fields before public broadcast.
-    safe = _sanitize_for_public_broadcast(comment_dict)
-    # Local-only (no frontend subscribes to per-post WAMP topics)
-    publish_event(f'social.post.{post_id}.new_comment', safe)
+def _publish_comment_event(event: str, comment_dict: dict,
+                           community_name: str = None) -> None:
+    """One fan-out for every comment lifecycle event.
+    `event` ∈ {'comment.new', 'comment.delete'}.
+    Routes via community.message.{id} so it lands on the same topic
+    web/desktop/Android subscribe to.  If the comment's post has no
+    community, the per-user NotificationService path is the only live
+    channel — that fires from CommentService.create independently."""
+    safe = _stamp_event(_sanitize_for_public_broadcast(comment_dict), event)
+    if community_name:
+        data = dict(safe)
+        data['community_id'] = community_name
+        publish_event('community.message', data)
+
+
+def on_new_post(post_dict: dict, community_name: str = None):
+    _publish_post_event('post.new', post_dict, community_name)
+
+
+def on_post_update(post_dict: dict, community_name: str = None):
+    _publish_post_event('post.update', post_dict, community_name)
+
+
+def on_post_delete(post_dict: dict, community_name: str = None):
+    """post_dict is the PRE-delete snapshot (id + author_id + community).
+    Subscribers locate the cached entry by id and remove it."""
+    _publish_post_event('post.delete', post_dict, community_name)
+
+
+def on_new_comment(comment_dict: dict, community_name: str = None,
+                   post_id: str = None):
+    """Compat: legacy signature accepted `post_id` positionally; new
+    callers should pass `community_name`.  `post_id` is ignored — the
+    comment_dict already carries it as comment_dict['post_id']."""
+    _publish_comment_event('comment.new', comment_dict, community_name)
+
+
+def on_comment_delete(comment_dict: dict, community_name: str = None):
+    _publish_comment_event('comment.delete', comment_dict, community_name)
 
 
 def on_vote_update(target_type: str, target_id: str, score: int):
@@ -260,15 +322,22 @@ def on_vote_update(target_type: str, target_id: str, score: int):
 
 
 def on_notification(user_id: str, notification_dict: dict):
-    # Route to per-user social topic (RN + web subscribe to com.hertzai.hevolve.social.{user_id})
-    publish_event('chat.social', {
+    # Stamp idempotency key once so the same payload lands on WAMP
+    # and SSE with the same msg_id — clients dedupe transport races.
+    from .chat_messages import make_msg_id
+    msg_id = notification_dict.get('msg_id') or make_msg_id()
+    payload = {
         'type': 'notification',
+        'msg_id': msg_id,
         **notification_dict,
-    }, user_id=user_id)
+    }
+    # Route to per-user social topic (RN + web subscribe to com.hertzai.hevolve.social.{user_id})
+    publish_event('chat.social', payload, user_id=user_id)
     # Also broadcast to SSE clients (Nunba desktop) — scoped to the target user
     from core.platform.events import broadcast_sse_safe
     broadcast_sse_safe('notification', {
         'user_id': user_id,
+        'msg_id': msg_id,
         **notification_dict,
     }, user_id=user_id)
 
