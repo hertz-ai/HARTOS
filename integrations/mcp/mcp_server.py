@@ -172,9 +172,18 @@ def create_goal(
 
 @mcp.tool()
 def dispatch_goal(goal_id: str, goal_type: str = 'marketing') -> str:
-    """Dispatch a goal to an idle agent for execution. The daemon does this automatically every 30s, but this forces immediate dispatch."""
+    """Dispatch a goal to an idle agent for execution. The daemon does this automatically every 30s, but this forces immediate dispatch.
+
+    Persists ``last_dispatched_at`` on the Goal row so that flywheel
+    progress is observable in subsequent ``list_goals`` queries —
+    without this, repeated MCP dispatches looked identical to "stuck"
+    goals because the agent_daemon was the only writer of that field
+    (and the daemon has been silent for days on this install).
+    """
     try:
         from integrations.agent_engine.goal_manager import GoalManager
+        from integrations.social.models import AgentGoal as _GoalModel
+        from datetime import datetime as _dt
         db = _get_db()
         try:
             goal_result = GoalManager.get_goal(db, goal_id)
@@ -184,10 +193,22 @@ def dispatch_goal(goal_id: str, goal_type: str = 'marketing') -> str:
             goal = goal_result['goal']
             prompt = goal.get('description', goal.get('title', ''))
 
-            # Get system agent user_id
-            from integrations.social.models import User
-            sys_agent = db.query(User).filter_by(username='hevolve_system_agent').first()
-            user_id = sys_agent.id if sys_agent else 'system'
+            # Resolve the canonical system user (Nunba).  Falls back to
+            # ensure_system_user so the row is auto-created on first
+            # call — the prior `db.query(...).first() or 'system'`
+            # pattern returned the literal string 'system' when the
+            # User row didn't exist, which failed downstream FK checks
+            # on posts.author_id / goals.created_by.
+            from integrations.social.services import UserService
+            sys_user = UserService.ensure_system_user(
+                db, 'nunba', display_name='Nunba',
+                bio='The Hevolve hive — autonomous orchestrator '
+                    'for benchmarks, experiments, and dispatch.')
+            user_id = sys_user.id
+            # ensure_system_user may have inserted a new row — commit so
+            # subsequent queries (incl. the persistence write below)
+            # see it, instead of losing it on db.close().
+            db.commit()
         finally:
             db.close()
 
@@ -198,6 +219,25 @@ def dispatch_goal(goal_id: str, goal_type: str = 'marketing') -> str:
             goal_id=goal_id,
             goal_type=goal_type,
         )
+
+        # Stamp last_dispatched_at so the goal row shows progress.
+        # Best-effort — a write failure here must not mask a successful
+        # dispatch (the response is what callers act on).
+        try:
+            db = _get_db()
+            try:
+                row = db.query(_GoalModel).filter_by(id=goal_id).first()
+                if row is not None:
+                    row.last_dispatched_at = _dt.utcnow()
+                    db.flush()
+                    db.commit()
+            finally:
+                db.close()
+        except Exception as _persist_err:
+            logger.warning(
+                "mcp.dispatch_goal: persist last_dispatched_at "
+                "failed for %s: %s", goal_id, _persist_err)
+
         return json.dumps({"dispatched": True, "goal_id": goal_id, "response_preview": str(response)[:500]}, default=str)
     except Exception as e:
         return json.dumps({"error": str(e)})
