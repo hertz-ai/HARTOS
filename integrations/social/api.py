@@ -1484,6 +1484,7 @@ def update_post(post_id):
         expected_outcome=data.get('expected_outcome'),
         is_thought_experiment=data.get('is_thought_experiment'),
         dynamic_layout=data.get('dynamic_layout'),
+        actor_id=g.user.id,
     )
     # Phase 7c.5 — author can change privacy on their own post.  Same
     # flag gate + _normalize coercion as create_post + same
@@ -1507,7 +1508,7 @@ def delete_post(post_id):
         return _err("Post not found", 404)
     if post.author_id != g.user.id and not g.user.is_admin:
         return _err("Cannot delete another user's post", 403)
-    PostService.delete(g.db, post)
+    PostService.delete(g.db, post, actor_id=g.user.id)
     return _ok({'deleted': True})
 
 
@@ -1728,7 +1729,7 @@ def delete_comment(comment_id):
         return _err("Comment not found", 404)
     if comment.author_id != g.user.id and not g.user.is_admin:
         return _err("Cannot delete another user's comment", 403)
-    CommentService.delete(g.db, comment)
+    CommentService.delete(g.db, comment, actor_id=g.user.id)
     return _ok({'deleted': True})
 
 

@@ -25,6 +25,88 @@ def _uuid():
     return str(uuid.uuid4())
 
 
+# ─── Audit trail (Reddit-style accountability) ─────────────────
+#
+# Post edits + soft-deletes used to overwrite content silently with no
+# actor record.  ImmutableAuditLog gives us a hash-chained, append-only
+# trail so a deleted post's original title/body remains recoverable
+# (and the chain itself is tamper-evident).  Audit failure must NEVER
+# block the user action — best-effort try/except.
+#
+# Truncation budget: 4096 chars per content field keeps the audit
+# table from growing pathologically while still preserving enough of
+# the original for moderation / appeals.
+
+_AUDIT_CONTENT_TRUNCATE = 4096
+
+
+def _truncate_for_audit(s) -> Optional[str]:
+    """Cap large text fields to keep the audit table compact.
+    Returns None unchanged so the JSON detail stays sparse."""
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        s = str(s)
+    if len(s) <= _AUDIT_CONTENT_TRUNCATE:
+        return s
+    return s[:_AUDIT_CONTENT_TRUNCATE] + f'...[truncated {len(s) - _AUDIT_CONTENT_TRUNCATE} chars]'
+
+
+def _audit_post_event(event_type: str, *, actor_id: Optional[str],
+                      post, detail: dict) -> None:
+    """Best-effort append to ImmutableAuditLog for post mutations.
+    Swallows ALL exceptions — audit availability must not gate the
+    user action.  Operators monitor audit-chain integrity separately
+    via verify_chain()."""
+    try:
+        from security.immutable_audit_log import get_audit_log
+        actor = actor_id or 'unknown'
+        author_id = getattr(post, 'author_id', None)
+        action = (
+            f'edit post {post.id}' if event_type == 'post.update'
+            else f'delete post {post.id}'
+        )
+        full_detail = dict(detail or {})
+        full_detail['post_id'] = post.id
+        full_detail['author_id'] = author_id
+        get_audit_log().log_event(
+            event_type=event_type,
+            actor_id=actor,
+            action=action,
+            detail=full_detail,
+            target_id=post.id,
+        )
+    except Exception as e:
+        logger.warning(
+            "audit log append failed for %s on post=%s: %s",
+            event_type, getattr(post, 'id', '?'), e)
+
+
+def _audit_comment_event(event_type: str, *, actor_id: Optional[str],
+                         comment, detail: dict) -> None:
+    """Best-effort audit-log append for comment mutations.  Same
+    failure-mode contract as _audit_post_event."""
+    try:
+        from security.immutable_audit_log import get_audit_log
+        actor = actor_id or 'unknown'
+        author_id = getattr(comment, 'author_id', None)
+        action = f'delete comment {comment.id}'
+        full_detail = dict(detail or {})
+        full_detail['comment_id'] = comment.id
+        full_detail['author_id'] = author_id
+        get_audit_log().log_event(
+            event_type=event_type,
+            actor_id=actor,
+            action=action,
+            detail=full_detail,
+            target_id=comment.id,
+        )
+    except Exception as e:
+        logger.warning(
+            "audit log append failed for %s on comment=%s: %s",
+            event_type, getattr(comment, 'id', '?'), e)
+
+
 # ─── User Service ───
 
 class UserService:
@@ -354,27 +436,64 @@ class PostService:
     def update(db: Session, post: Post, title: str = None, content: str = None,
                intent_category: str = None, hypothesis: str = None,
                expected_outcome: str = None, is_thought_experiment: bool = None,
-               dynamic_layout: dict = None) -> Post:
-        if title is not None:
+               dynamic_layout: dict = None,
+               actor_id: str = None) -> Post:
+        # Snapshot fields about to change so the audit detail can show
+        # the pre-edit state.  Reddit-style: deleted/edited content is
+        # still recoverable from the hash-chained audit log.
+        changed = {}
+        if title is not None and title != post.title:
+            changed['title'] = {'before': post.title, 'after': title}
             post.title = title
-        if content is not None:
+        if content is not None and content != post.content:
+            changed['content'] = {
+                'before': _truncate_for_audit(post.content),
+                'after': _truncate_for_audit(content),
+            }
             post.content = content
-        if intent_category is not None:
+        if intent_category is not None and intent_category != post.intent_category:
+            changed['intent_category'] = {
+                'before': post.intent_category, 'after': intent_category}
             post.intent_category = intent_category
-        if hypothesis is not None:
+        if hypothesis is not None and hypothesis != post.hypothesis:
+            changed['hypothesis'] = {
+                'before': _truncate_for_audit(post.hypothesis),
+                'after': _truncate_for_audit(hypothesis)}
             post.hypothesis = hypothesis
-        if expected_outcome is not None:
+        if expected_outcome is not None and expected_outcome != post.expected_outcome:
+            changed['expected_outcome'] = {
+                'before': _truncate_for_audit(post.expected_outcome),
+                'after': _truncate_for_audit(expected_outcome)}
             post.expected_outcome = expected_outcome
-        if is_thought_experiment is not None:
+        if is_thought_experiment is not None and is_thought_experiment != post.is_thought_experiment:
+            changed['is_thought_experiment'] = {
+                'before': bool(post.is_thought_experiment),
+                'after': bool(is_thought_experiment)}
             post.is_thought_experiment = is_thought_experiment
         if dynamic_layout is not None:
             post.dynamic_layout = dynamic_layout
+            changed['dynamic_layout'] = True  # opaque blob, just note it changed
         post.updated_at = datetime.utcnow()
+        if changed:
+            _audit_post_event(
+                'post.update', actor_id=actor_id, post=post, detail={
+                    'fields': changed,
+                })
         db.flush()
         return post
 
     @staticmethod
-    def delete(db: Session, post: Post):
+    def delete(db: Session, post: Post, actor_id: str = None):
+        # Snapshot before mutation so the audit detail has the original
+        # title + content.  We log BEFORE flipping is_deleted so a DB
+        # commit error doesn't leave an orphaned audit entry referring
+        # to a state that never persisted.
+        _audit_post_event(
+            'post.delete', actor_id=actor_id, post=post, detail={
+                'title': post.title,
+                'content': _truncate_for_audit(post.content),
+                'community_id': post.community_id,
+            })
         post.is_deleted = True
         post.author.post_count = max(0, post.author.post_count - 1)
         if post.community_id:
@@ -471,7 +590,16 @@ class CommentService:
         return q.all()
 
     @staticmethod
-    def delete(db: Session, comment: Comment):
+    def delete(db: Session, comment: Comment, actor_id: str = None):
+        # Reddit-style: original content goes into the audit log
+        # detail BEFORE we overwrite with '[deleted]', so moderators
+        # / appeals can still see what was removed (the hash-chain
+        # makes the trail tamper-evident).
+        _audit_comment_event(
+            'comment.delete', actor_id=actor_id, comment=comment, detail={
+                'content': _truncate_for_audit(comment.content),
+                'post_id': comment.post_id,
+            })
         comment.is_deleted = True
         comment.content = '[deleted]'
         db.flush()
