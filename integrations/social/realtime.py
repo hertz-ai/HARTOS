@@ -195,19 +195,63 @@ def publish_event(topic: str, data: dict, user_id: str = ''):
         logger.debug(f"WAMP publish failed for {topic}: {e}")
 
 
+# Fields that must NEVER reach a public WAMP topic (community.feed,
+# community.message, social.post.*).  User.to_dict() does not currently
+# include email/phone — but any future schema addition would silently
+# leak through every broadcast site below.  Strip defensively at the
+# boundary so the leak surface is one helper, not every call site.
+#
+# Why each field:
+#   email, phone, phone_number, password_hash, api_token  → PII / creds
+#   voice_profile                                          → biometric pointer
+#   idle_compute_opt_in                                    → infra disclosure
+#   location_sharing_enabled                               → privacy preference
+#   referral_code                                          → cross-tracking risk
+#   last_active_at                                         → presence/inference leak
+_AUTHOR_PUBLIC_BLOCKLIST = (
+    'email', 'phone', 'phone_number', 'password_hash', 'api_token',
+    'voice_profile', 'idle_compute_opt_in', 'location_sharing_enabled',
+    'referral_code', 'last_active_at',
+)
+
+
+def _sanitize_author_for_public(author: dict) -> dict:
+    """Return a shallow copy of `author` with sensitive fields removed.
+    Idempotent — safe to call on already-sanitized dicts."""
+    if not isinstance(author, dict):
+        return author
+    return {k: v for k, v in author.items() if k not in _AUTHOR_PUBLIC_BLOCKLIST}
+
+
+def _sanitize_for_public_broadcast(payload: dict) -> dict:
+    """Shallow-copy `payload` with `author` (if present) sanitized.
+    Used for post/comment dicts bound for community.feed / social.post.*.
+    Returns a new dict; original is not mutated."""
+    if not isinstance(payload, dict):
+        return payload
+    cleaned = dict(payload)
+    if isinstance(cleaned.get('author'), dict):
+        cleaned['author'] = _sanitize_author_for_public(cleaned['author'])
+    return cleaned
+
+
 def on_new_post(post_dict: dict, community_name: str = None):
+    # Strip PII / private profile fields before public broadcast.
+    safe = _sanitize_for_public_broadcast(post_dict)
     # Broadcast to global community feed (RN subscribes to com.hertzai.community.feed)
-    publish_event('community.feed', post_dict)
+    publish_event('community.feed', safe)
     # Also per-community (web subscribes to com.hertzai.hevolve.community.{id})
     if community_name:
-        data = dict(post_dict)
+        data = dict(safe)
         data['community_id'] = community_name
         publish_event('community.message', data)
 
 
 def on_new_comment(comment_dict: dict, post_id: str):
+    # Strip PII / private profile fields before public broadcast.
+    safe = _sanitize_for_public_broadcast(comment_dict)
     # Local-only (no frontend subscribes to per-post WAMP topics)
-    publish_event(f'social.post.{post_id}.new_comment', comment_dict)
+    publish_event(f'social.post.{post_id}.new_comment', safe)
 
 
 def on_vote_update(target_type: str, target_id: str, score: int):
