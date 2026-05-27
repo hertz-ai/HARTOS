@@ -960,7 +960,15 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     if user_prompt not in user_ledgers:
         current_app.logger.info(f"Creating new Smart Ledger for {user_prompt} in reuse mode")
         backend = get_production_backend()  # Tries Redis, falls back to JSON (already imported from agent_ledger)
-        ledger = create_ledger_from_actions(user_id, prompt_id, role_actions, backend=backend)
+        # ``role_number`` is the recipe flow index selected for this
+        # session by ``get_flow_number(user_id, prompt_id)`` at L903.
+        # Threading it as ``flow_id`` stamps every recipe-derived task
+        # with the correct flow so the dashboard can group:
+        #   prompt_id → session_id → flow_id → action_id.
+        # Recipe filename ``{prompt_id}_{role_number}_recipe.json``
+        # carries the same number; the two stay in lockstep.
+        ledger = create_ledger_from_actions(user_id, prompt_id, role_actions,
+                                            backend=backend, flow_id=role_number)
         user_ledgers[user_prompt] = ledger
 
         # Best-effort: when the Redis backend is live, enable ledger

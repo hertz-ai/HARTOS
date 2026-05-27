@@ -344,7 +344,12 @@ from core.tool_logging import log_tool_execution  # noqa: E402  (after logger co
 
 
 from core.session_cache import TTLCache  # early import — needed before first TTLCache usage below
-from core.cache_loaders import load_agent_data, load_user_ledger, load_user_simplemem
+from core.cache_loaders import (
+    load_agent_data,
+    load_user_ledger,
+    load_user_simplemem,
+    load_current_flow,
+)
 
 scheduler = BackgroundScheduler()
 scheduler.start()
@@ -3535,7 +3540,8 @@ def should_continue_autonomously(user_prompt: str) -> bool:
 
     return False
 
-def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int, user_prompt: str) -> Action:
+def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int, user_prompt: str,
+                              flow_id: Optional[int] = None) -> Action:
     """
     Create an Action instance with Smart Ledger attached.
 
@@ -3548,17 +3554,35 @@ def create_action_with_ledger(actions: List[Dict], user_id: int, prompt_id: int,
         user_id: User ID
         prompt_id: Prompt ID
         user_prompt: Combined user_prompt string (user_id_prompt_id)
+        flow_id: Recipe flow index this batch of actions belongs to.  Each
+            call site here passes the CURRENT flow being executed.  When
+            None, defaults to ``get_current_flow(user_prompt)`` so callers
+            that don't know they should care still get correct stamping —
+            the dashboard hierarchy (prompt → session → flow → action)
+            depends on this being non-None.  See
+            ``docs/architecture/TASK_LEDGER_GROUPING_FIX_PLAN.md`` for the
+            grouping contract.
 
     Returns:
         Action instance with Smart Ledger attached
     """
     action_instance = Action(actions)
 
+    # Resolve the active flow for this ledger.  Caller can override; if
+    # they don't, fall back to the runtime flow tracker so 7+ existing
+    # call sites here keep working without forced signature updates.
+    if flow_id is None:
+        try:
+            flow_id = int(get_current_flow(user_prompt))
+        except Exception:
+            flow_id = 0
+
     # Create or load ledger with production backend (Redis with JSON fallback)
     if user_prompt not in user_ledgers:
         current_app.logger.info(f"Creating new Smart Ledger for {user_prompt}")
         backend = get_production_backend()  # Tries Redis, falls back to JSON (already imported from agent_ledger)
-        ledger = create_ledger_from_actions(user_id, prompt_id, actions, backend=backend)
+        ledger = create_ledger_from_actions(user_id, prompt_id, actions,
+                                            backend=backend, flow_id=flow_id)
         user_ledgers[user_prompt] = ledger
 
         # Best-effort: when the Redis backend is live, enable ledger
@@ -4841,7 +4865,15 @@ def track_lifecycle_hooks(current_action_id, group_chat, user_prompt):
 messages = TTLCache(ttl_seconds=7200, max_size=500, name='create_messages')
 recent_file_id = TTLCache(ttl_seconds=7200, max_size=500, name='create_recent_file_id')
 request_id_list = TTLCache(ttl_seconds=7200, max_size=500, name='create_request_id_list')
-recipe_for_persona = TTLCache(ttl_seconds=7200, max_size=500, name='create_recipe_for_persona')
+recipe_for_persona = TTLCache(
+    ttl_seconds=7200, max_size=500,
+    name='create_recipe_for_persona',
+    # Restore the active flow from the latest non-terminal ledger
+    # session on cache miss — without this, Nunba restart drops a
+    # mid-execution agent back to flow 0 and re-runs completed flows.
+    # See TASK_LEDGER_PERSISTENCE_PLAN.md §3 Phase 3.
+    loader=load_current_flow,
+)
 total_persona_actions = TTLCache(ttl_seconds=7200, max_size=500, name='create_total_persona_actions')
 
 

@@ -138,6 +138,90 @@ def load_recipe(user_prompt):
     return None
 
 
+# Terminal task statuses — duplicated from agent_ledger.core's
+# _TERMINAL_TASK_STATUSES because importing core triggers a heavy
+# dependency chain at cache-loader-import time (this module is imported
+# during TTLCache construction in create_recipe.py).  The set is small
+# and stable; sync any addition with agent_ledger.core's copy.
+_TERMINAL_LEDGER_STATUSES = frozenset({
+    "completed", "failed", "terminated", "user_stopped", "rolled_back",
+})
+
+
+def load_current_flow(user_prompt):
+    """Restore the active flow index for ``user_prompt`` from the latest
+    non-terminal ledger session — the canonical TTLCache loader pattern
+    for ``recipe_for_persona`` (``create_recipe.py:4863``).
+
+    Before this loader existed, ``recipe_for_persona`` was a bare
+    ``TTLCache`` with no restoration callback; on Nunba restart (or
+    2-hour idle eviction) the cache would miss and
+    ``get_current_flow(user_prompt)`` would call
+    ``initialise_current_flow_to_zero``, dropping a mid-execution agent
+    back to flow 0 and re-running already-completed flows.  See
+    ``docs/architecture/TASK_LEDGER_PERSISTENCE_PLAN.md`` §3 Phase 3
+    for the rationale; mirrors ``load_user_ledger``'s pattern so the
+    cache restoration story is uniform across all per-session caches.
+
+    Resolution:
+      1. Parse ``user_prompt = "{user_id}_{prompt_id}"``.
+      2. Reuse ``SmartLedger.list_grouped_by_recipe_hierarchy`` (the
+         Phase 1 canonical reader) — no parallel directory walk.
+      3. Pick the newest session_id for this user (lexicographic
+         descending — works for both legacy ``f"{user}_{prompt}"`` and
+         new ``f"{user}_{prompt}_{ts_ms}"`` formats because the ms
+         suffix collates after the bare form, and even within new
+         sessions higher ts_ms sorts later).
+      4. Within that session, return the highest flow_id with any
+         non-terminal task (active flow); if every flow in that
+         session is fully terminal, return the highest flow_id seen
+         (the session's final state — keeps follow-up logic monotonic).
+      5. If no ledger or no recognisable session exists, return 0 (a
+         fresh user_prompt, same as ``initialise_current_flow_to_zero``).
+
+    Returns:
+        int flow_id, or None on parse failure (TTLCache treats None as
+        a cache miss and falls through to the default-zero path).
+    """
+    parts = str(user_prompt).split('_', 1)
+    if len(parts) != 2:
+        return None
+    user_id, prompt_id = parts
+
+    try:
+        from agent_ledger.core import SmartLedger
+        groups = SmartLedger.list_grouped_by_recipe_hierarchy(AGENT_DATA_DIR)
+    except Exception as e:
+        logger.debug(f"load_current_flow: helper unavailable ({e})")
+        return None
+
+    sessions = groups.get(str(prompt_id), {})
+    if not sessions:
+        return 0
+
+    user_prefix = f"{user_id}_"
+    # Newest-first by session_id (works for both legacy and timestamped
+    # forms because ts_ms suffix collates lexicographically after the
+    # bare form for the same prefix).
+    for session_id in sorted(sessions.keys(), reverse=True):
+        if not session_id.startswith(user_prefix):
+            continue
+        flows_in_session = sessions[session_id]
+        if not flows_in_session:
+            continue
+        flow_ids_sorted_desc = sorted(flows_in_session.keys(), reverse=True)
+        for fid in flow_ids_sorted_desc:
+            tasks = flows_in_session[fid]
+            for _aid, task_dict in tasks:
+                status = str(task_dict.get('status') or '').lower()
+                if status and status not in _TERMINAL_LEDGER_STATUSES:
+                    return fid
+        # Every flow terminal — return the highest flow_id seen.
+        return flow_ids_sorted_desc[0]
+
+    return 0
+
+
 def load_user_simplemem(user_prompt):
     """Load SimpleMem store. Key is user_prompt (e.g. '123_456')."""
     try:

@@ -310,6 +310,15 @@ def list_ledger_tasks():
       ``status``    — TaskStatus value (e.g. ``in_progress``, ``completed``)
       ``agent_id``  — filter to one agent's ledgers (UUID)
       ``limit``     — max tasks returned (1..1000, default 50)
+      ``group``     — when ``hierarchy``, return tasks grouped as
+                       prompt → session → flow → [actions] via
+                       ``SmartLedger.list_grouped_by_recipe_hierarchy``
+                       (Phase 1 helper).  Used by the admin
+                       ``TaskLedgerPage`` 4-level expand tree.  When
+                       omitted, returns the flat task list (existing
+                       behaviour, every existing caller still works).
+                       See ``docs/architecture/TASK_LEDGER_PERSISTENCE_PLAN.md``
+                       §3 Phase 4 for the rationale.
     """
     try:
         from agent_ledger import TaskStatus
@@ -317,6 +326,16 @@ def list_ledger_tasks():
         return jsonify({'success': False,
                         'error': 'agent_ledger not installed'}), 501
     try:
+        # ── Opt-in hierarchical shape ──────────────────────────────
+        # When ?group=hierarchy is passed, delegate to the single
+        # canonical reader (the Phase 1 helper) and return the nested
+        # dict directly.  No parallel directory walker; flat path
+        # below remains the default for every existing caller
+        # (zombie_reaper, the curl-based ops scripts, any operator who
+        # didn't ask for the new shape).
+        if (request.args.get('group') or '').strip().lower() == 'hierarchy':
+            return _list_ledger_tasks_grouped()
+
         # TaskStatus enum values are lowercase ('pending', 'in_progress',
         # 'completed', 'blocked', 'failed').  Frontends commonly expose
         # the enum NAMES (uppercase) in their UI — historically the
@@ -364,6 +383,60 @@ def list_ledger_tasks():
         logger.exception("list_ledger_tasks failed")
         return jsonify({'success': False,
                         'error': 'Internal server error'}), 500
+
+
+def _list_ledger_tasks_grouped():
+    """Handler for ``?group=hierarchy`` — returns
+    ``{prompt_id: {session_id: {flow_id_str: [{action_id, task}, ...]}}}``.
+
+    JSON cannot use int dict keys, so flow_id ints are stringified at
+    the wire boundary.  Task dicts inside each flow keep their full
+    ``to_dict`` shape (status, state_history, recipe_*, etc.) so the
+    dashboard renderer has everything it needs without a second call.
+    """
+    try:
+        from agent_ledger.core import SmartLedger
+    except ImportError:
+        return jsonify({'success': False,
+                        'error': 'agent_ledger not installed'}), 501
+    try:
+        ledger_dir = _agent_data_dir()  # existing helper, same dir
+                                         # _iter_ledgers walks
+        raw_groups = SmartLedger.list_grouped_by_recipe_hierarchy(ledger_dir)
+
+        # Wire-format conversion:
+        #   * stringify flow_id (JSON dict keys must be strings)
+        #   * shape inner list as [{action_id, task: {...}}, ...] so the
+        #     consumer doesn't have to know we used a tuple internally
+        wire = {}
+        for prompt_id, sessions in raw_groups.items():
+            wire_sessions = {}
+            for session_id, flows in sessions.items():
+                wire_flows = {}
+                for flow_id, action_tuples in flows.items():
+                    wire_flows[str(flow_id)] = [
+                        {'action_id': action_id, 'task': task_dict}
+                        for action_id, task_dict in action_tuples
+                    ]
+                wire_sessions[session_id] = wire_flows
+            wire[prompt_id] = wire_sessions
+
+        return jsonify({
+            'success': True,
+            'groups': wire,
+        })
+    except Exception:
+        logger.exception("list_ledger_tasks (grouped) failed")
+        return jsonify({'success': False,
+                        'error': 'Internal server error'}), 500
+
+
+def _agent_data_dir():
+    """Return the directory ``_iter_ledgers`` walks.  Single source of
+    truth: ``core.platform_paths.get_agent_data_dir`` — the same helper
+    the flat handler uses via ``_iter_ledgers``."""
+    from core.platform_paths import get_agent_data_dir
+    return get_agent_data_dir()
 
 
 @agent_engine_bp.route('/api/agent-engine/ledger/tasks/<task_id>', methods=['GET'])

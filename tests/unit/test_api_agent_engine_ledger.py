@@ -278,6 +278,110 @@ class TestListLedgerTasks:
         # Falls back to default (50), still 200
         assert resp.status_code == 200
 
+    # ─── Phase 4 — ?group=hierarchy opt-in ─────────────────────────
+
+    def test_group_hierarchy_returns_nested_prompt_session_flow_actions(
+            self, client, storage_dir):
+        """When ?group=hierarchy is passed, the endpoint returns
+        ``{groups: {prompt_id: {session_id: {flow_id_str: [{action_id,
+        task}, ...]}}}}`` via SmartLedger.list_grouped_by_recipe_hierarchy.
+
+        Tasks stamped with ``recipe_prompt_id``/``_flow_id``/``_action_id``
+        from Phase 1 land in their explicit coordinates; flow_id is
+        stringified at the wire boundary (JSON dict keys must be strings).
+        """
+        agent = '42'   # int-as-string prompt_id (canonical for human prompts)
+        # Two sessions for the same prompt — proves Phase 2 minting +
+        # Phase 4 grouping work together.
+        for session, flow, action in [
+                ('10202_42_1716000000000', 0, 1),
+                ('10202_42_1716000000000', 0, 2),
+                ('10202_42_1716000999999', 1, 1),  # second session, flow 1
+        ]:
+            task = _make_task(f'action_{action}', f'flow={flow} action={action}')
+            task['recipe_prompt_id'] = '42'
+            task['recipe_flow_id'] = flow
+            task['recipe_action_id'] = action
+            ledger_file = storage_dir / f'ledger_{agent}_{session}.json'
+            if ledger_file.exists():
+                existing = json.loads(ledger_file.read_text())
+                existing['tasks'][task['task_id']] = task
+                existing['task_order'].append(task['task_id'])
+                ledger_file.write_text(json.dumps(existing))
+            else:
+                _write_ledger_file(storage_dir, agent, session, [task])
+
+        resp = client.get('/api/agent-engine/ledger/tasks?group=hierarchy')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['success'] is True
+        assert 'groups' in data and 'tasks' not in data, (
+            'group=hierarchy must return groups shape, not flat tasks'
+        )
+        groups = data['groups']
+        assert '42' in groups, f"got prompt keys: {list(groups.keys())}"
+
+        sessions = groups['42']
+        assert '10202_42_1716000000000' in sessions
+        assert '10202_42_1716000999999' in sessions, (
+            'second session should appear as its own bucket'
+        )
+
+        # Flow ids stringified at the wire boundary.
+        s1 = sessions['10202_42_1716000000000']
+        assert '0' in s1, f"flow_id 0 should be a stringified key: {list(s1.keys())}"
+        s1_flow0 = s1['0']
+        action_ids = sorted(entry['action_id'] for entry in s1_flow0)
+        assert action_ids == [1, 2], f"got: {action_ids}"
+        # Inner shape: each entry has action_id + task dict
+        assert all('task' in e and 'action_id' in e for e in s1_flow0)
+        # Tasks still carry recipe_* (verifies the helper didn't strip them)
+        assert s1_flow0[0]['task']['recipe_prompt_id'] == '42'
+
+    def test_group_hierarchy_legacy_ledger_uses_filename_fallback(
+            self, client, storage_dir):
+        """Pre-Phase-1 ledgers carry no recipe_* fields.  The grouping
+        helper falls back to (filename agent_id, filename session_id,
+        flow=0, task_id-parsed action_id).  Verify the endpoint surfaces
+        these via the same wire shape — no separate legacy endpoint."""
+        agent = '77'
+        legacy_session = '10202_77'   # deterministic pre-Phase-2 form
+        # Plain status-string task, NO recipe_* fields
+        task = _make_task('action_3', 'legacy task', status='in_progress')
+        _write_ledger_file(storage_dir, agent, legacy_session, [task])
+
+        resp = client.get('/api/agent-engine/ledger/tasks?group=hierarchy')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        groups = data['groups']
+        assert '77' in groups
+        assert legacy_session in groups['77']
+        # Fallback: flow_id defaults to 0
+        assert '0' in groups['77'][legacy_session]
+        entries = groups['77'][legacy_session]['0']
+        # action_id parsed from "action_3" → 3
+        assert entries[0]['action_id'] == 3
+
+    def test_flat_path_unchanged_when_group_param_absent(
+            self, client, storage_dir):
+        """Existing callers without ?group= must see the EXACT flat
+        response shape they always saw — Phase 4 is opt-in only."""
+        agent = '6c2dc0fc-7c93-4fe0-973e-f7466ff63f29'
+        _write_ledger_file(storage_dir, agent, 's1',
+                           [_make_task('t1', 'one')])
+
+        resp = client.get('/api/agent-engine/ledger/tasks')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        # Flat shape: tasks list + total, NO groups
+        assert 'tasks' in data and 'groups' not in data
+        assert data['total'] == 1
+        assert data['tasks'][0]['task_id'] == 't1'
+        # And the legacy filter params still work
+        resp2 = client.get('/api/agent-engine/ledger/tasks?status=pending&limit=10')
+        assert resp2.status_code == 200
+        assert 'tasks' in resp2.get_json()
+
 
 # ─── /api/agent-engine/ledger/tasks/<id> ──────────────────────────
 

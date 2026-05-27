@@ -17,10 +17,11 @@ Features:
 
 import json
 import os
+import re
 import threading
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Tuple
 from pathlib import Path
 import logging
 
@@ -283,6 +284,25 @@ class Task:
         self.owned_at: Optional[str] = None            # When ownership was claimed
         self.ownership_history: List[Dict[str, Any]] = []  # Audit trail of ownership changes
 
+        # Recipe hierarchy — explicit coordinates so dashboards/admin UIs
+        # can group tasks as: prompt_id → session_id → flow_id → action.
+        # Until this block existed, the hierarchy was implicit in the
+        # ledger filename (``ledger_{agent_id}_{session_id}.json``) and
+        # the task_id convention (``action_N``), forcing every reader to
+        # do ad-hoc string parsing.  Stamping these at task creation
+        # lets the grouping helper return a clean nested dict — see
+        # ``SmartLedger.list_grouped_by_recipe_hierarchy`` and
+        # ``docs/architecture/TASK_LEDGER_GROUPING_FIX_PLAN.md``.
+        #
+        # ``recipe_action_id`` stays None for dynamically-discovered
+        # tasks (``add_dynamic_task``) since they are not from the
+        # static recipe file; the dashboard renders them under the
+        # owning flow as "ad-hoc" rather than mis-ordered with the
+        # recipe actions.
+        self.recipe_prompt_id: Optional[str] = None    # Agent identity (recipe filename prefix)
+        self.recipe_flow_id: Optional[int] = None      # Flow index inside that recipe
+        self.recipe_action_id: Optional[int] = None    # Action_id within the flow
+
         # Budget and compute tracking
         self.time_budget_s: Optional[float] = None     # Max seconds allowed
         self.spark_budget: Optional[float] = None      # Max Spark tokens to spend
@@ -371,6 +391,13 @@ class Task:
             "owner_prompt_id": self.owner_prompt_id,
             "owned_at": self.owned_at,
             "ownership_history": self.ownership_history,
+            # Recipe hierarchy (see __init__ block + dashboard grouping
+            # helper for full rationale).  Always serialized — None for
+            # legacy tasks created before this field existed; the reader
+            # falls back to filename / task_id parsing in that case.
+            "recipe_prompt_id": self.recipe_prompt_id,
+            "recipe_flow_id": self.recipe_flow_id,
+            "recipe_action_id": self.recipe_action_id,
             # Budget and compute
             "time_budget_s": self.time_budget_s,
             "spark_budget": self.spark_budget,
@@ -458,6 +485,11 @@ class Task:
         task.owner_prompt_id = data.get("owner_prompt_id")
         task.owned_at = data.get("owned_at")
         task.ownership_history = data.get("ownership_history", [])
+        # Recipe hierarchy — None for legacy ledgers; reader falls back
+        # to filename/task_id parsing when these are missing.
+        task.recipe_prompt_id = data.get("recipe_prompt_id")
+        task.recipe_flow_id = data.get("recipe_flow_id")
+        task.recipe_action_id = data.get("recipe_action_id")
         # Budget and compute
         task.time_budget_s = data.get("time_budget_s")
         task.spark_budget = data.get("spark_budget")
@@ -2267,6 +2299,113 @@ class SmartLedger:
 
         return tree
 
+    @classmethod
+    def list_grouped_by_recipe_hierarchy(
+        cls,
+        ledger_dir: str = "agent_data",
+    ) -> Dict[str, Dict[str, Dict[int, List[Tuple[int, Dict[str, Any]]]]]]:
+        """Walk ``ledger_dir`` and return tasks grouped by recipe hierarchy.
+
+        Returns a nested dict shaped:
+        ``prompt_id → session_id → flow_id → [(action_id, task_dict)]``
+        where the inner list is sorted by ``action_id`` so the dashboard
+        can render the actions in execution order.
+
+        Designed to be tolerant of legacy ledger files that pre-date the
+        ``recipe_*`` schema (any of the 431 ledger files in production
+        on 2026-05-26):
+
+          * ``recipe_prompt_id`` falls back to the ``agent_id`` slug
+            parsed from the ledger filename
+            (``ledger_{agent_id}_{session_id}.json``).
+          * ``recipe_flow_id`` falls back to 0 (single-flow invariant
+            until multi-flow ledgers ship).
+          * ``recipe_action_id`` falls back to the integer at the end
+            of the legacy task_id string (``action_N`` → ``N``).  When
+            the task_id doesn't parse (e.g. ``dynamic_3``), the action
+            is bucketed under -1 so it sorts ABOVE the recipe actions
+            and the dashboard renders it as "ad-hoc, no ordinal".
+
+        This is a read-only directory scan — no ledgers are mutated and
+        no backend is contacted.  Use it from the dashboard renderer,
+        the admin API, or any reporting tool that needs the full
+        cross-session view in one call.
+
+        Args:
+            ledger_dir: Directory containing ``ledger_*_*.json`` files.
+                Defaults to ``"agent_data"`` to match the SmartLedger
+                default; pass an absolute path when reading from a
+                non-CWD location.
+
+        Returns:
+            The nested grouping described above.  Empty dict when the
+            directory doesn't exist or contains no matching files.
+        """
+        groups: Dict[str, Dict[str, Dict[int, List[Tuple[int, Dict[str, Any]]]]]] = {}
+        ledger_path = Path(ledger_dir)
+        if not ledger_path.exists():
+            return groups
+
+        # Filename pattern: ledger_{agent_id}_{session_id}.json
+        # HARTOS convention (verified against agent_data/ledger_*.json
+        # on 2026-05-27):
+        #   * agent_id is either a pure int prompt_id ("42", "12345")
+        #     or a UUID ("177bdda1-c710-4a47-9c89-56808a13fc84").
+        #     Never contains an underscore.
+        #   * session_id is created by ``create_ledger_from_actions``
+        #     as f"{user_id}_{prompt_id}", so it CAN contain
+        #     underscores (e.g. "12345_88888", "goal_abc").
+        # Non-greedy first group is correct: it grabs the shortest
+        # underscore-free agent, leaving the rest for session.  A
+        # greedy ".+" would mis-attribute session underscores to the
+        # agent — verified failing case:
+        #   ledger_123_goal_abc.json → greedy: agent=123_goal,session=abc (WRONG)
+        #                              non-greedy: agent=123,session=goal_abc (RIGHT)
+        fname_re = re.compile(r'^ledger_(.+?)_(.+?)\.json$')
+
+        for f in ledger_path.glob('ledger_*_*.json'):
+            m = fname_re.match(f.name)
+            if not m:
+                continue
+            fname_agent = m.group(1)
+            fname_session = m.group(2)
+            try:
+                with open(f, 'r', encoding='utf-8') as fh:
+                    data = json.load(fh)
+            except Exception as e:
+                logger.warning(f"Skipping unreadable ledger {f.name}: {e}")
+                continue
+
+            for tid, td in (data.get('tasks') or {}).items():
+                # New ledgers carry these explicitly; legacy ones fall
+                # back to filename + task_id parsing.
+                prompt = td.get('recipe_prompt_id') or fname_agent
+                flow = td.get('recipe_flow_id')
+                if flow is None:
+                    flow = 0
+                action = td.get('recipe_action_id')
+                if action is None:
+                    # Legacy task_id="action_N"; ignore non-conforming
+                    # ids (e.g. dynamic_*) by bucketing under -1.
+                    try:
+                        action = int(tid.rsplit('_', 1)[-1])
+                    except (ValueError, IndexError):
+                        action = -1
+
+                groups.setdefault(prompt, {}) \
+                      .setdefault(fname_session, {}) \
+                      .setdefault(flow, []) \
+                      .append((action, td))
+
+        # Sort actions within each flow so the dashboard renders them
+        # in execution order without re-sorting.
+        for sessions in groups.values():
+            for flows in sessions.values():
+                for fl in flows:
+                    flows[fl] = sorted(flows[fl], key=lambda x: x[0])
+
+        return groups
+
     def get_all_descendants(self, task_id: str) -> List[Task]:
         """Get all descendant tasks recursively."""
         task = self.get_task(task_id)
@@ -2415,6 +2554,39 @@ class SmartLedger:
             priority=classification.get('priority', 50),
             parent_task_id=parent_task_id
         )
+
+        # Recipe hierarchy — central stamping so every call site
+        # (reuse_recipe.detect_and_add_dynamic_tasks,
+        # create_recipe.detect_and_add_dynamic_tasks, future callers)
+        # gets correct grouping without threading args.  Pulled from the
+        # ledger's own state:
+        #   * prompt_id ← self.agent_id (convention from
+        #                 create_ledger_from_actions:
+        #                 agent_id == prompt_id == recipe filename prefix).
+        #   * flow_id   ← inherited from any sibling task in this ledger
+        #                 (one ledger = one flow, enforced upstream in
+        #                 reuse_recipe.py:944's persona filter and
+        #                 create_recipe.py:5006's per-flow ledger reset).
+        #                 An explicit context['recipe_flow_id'] override
+        #                 still wins for callers that know better.
+        #                 Falls back to 0 when no recipe tasks exist yet
+        #                 (e.g. a ledger that only contains autonomous
+        #                 tasks).
+        #   * action_id stays None — dynamic tasks aren't from the
+        #                 static recipe, so they have no recipe-level
+        #                 ordinal; the dashboard renders them as ad-hoc
+        #                 children of the flow.
+        task.recipe_prompt_id = str(self.agent_id) if self.agent_id is not None else None
+        _explicit_flow = context.get('recipe_flow_id')
+        if _explicit_flow is not None:
+            task.recipe_flow_id = _explicit_flow
+        else:
+            task.recipe_flow_id = next(
+                (t.recipe_flow_id for t in self.tasks.values()
+                 if t.recipe_flow_id is not None),
+                0,
+            )
+        task.recipe_action_id = None
 
         # === WIRE ALL FIELDS BASED ON CLASSIFICATION ===
 
@@ -3504,6 +3676,68 @@ def get_production_backend():
         return None
 
 
+_TERMINAL_TASK_STATUSES = frozenset({
+    "completed", "failed", "terminated", "user_stopped",
+    "rolled_back",
+})
+
+
+def _find_resumable_session(
+    agent_id: str,
+    user_id: Optional[int],
+    ledger_dir: str = "agent_data",
+) -> Optional[str]:
+    """Return session_id of an in-flight ledger for this (agent_id, user_id),
+    or ``None`` if every prior session is fully terminal / no priors exist.
+
+    Delegates to ``SmartLedger.list_grouped_by_recipe_hierarchy`` so there
+    is exactly ONE ledger-directory reader in the codebase — see
+    ``docs/architecture/TASK_LEDGER_PERSISTENCE_PLAN.md`` §5 for the
+    parallel-path-audit promise this honours.
+
+    "Unfinished" = at least one Task whose serialised ``status`` is NOT
+    in ``_TERMINAL_TASK_STATUSES`` (covers both new-format
+    ``Task.recipe_*`` ledgers and legacy ledgers that only carry
+    ``status`` strings).  When a user_id is provided, only sessions whose
+    session_id starts with ``f"{user_id}_"`` are considered — the
+    convention from ``create_ledger_from_actions``' deterministic
+    fallback (``f"{user_id}_{prompt_id}"``) AND the new timestamped form
+    (``f"{user_id}_{prompt_id}_{ts_ms}"``) both share this prefix, so
+    legacy + new sessions are both recognised.
+
+    Newest-first ordering: when multiple unfinished sessions exist for
+    the same (agent, user) — possible only if a legacy deterministic
+    file coexists with new timestamped ones — attach to the lexically
+    largest session_id, which by construction is the most recent
+    timestamped session.
+
+    Returns:
+        session_id string of the resumable session, or None.
+    """
+    try:
+        groups = SmartLedger.list_grouped_by_recipe_hierarchy(ledger_dir)
+    except Exception as e:
+        logger.debug(f"_find_resumable_session: helper unavailable ({e})")
+        return None
+
+    prompt_sessions = groups.get(str(agent_id), {})
+    if not prompt_sessions:
+        return None
+
+    user_prefix = f"{user_id}_" if user_id is not None else None
+
+    for session_id in sorted(prompt_sessions.keys(), reverse=True):
+        if user_prefix is not None and not session_id.startswith(user_prefix):
+            continue
+        # Walk every flow's actions; any non-terminal task → resumable.
+        for flow_tasks in prompt_sessions[session_id].values():
+            for _action_id, task_dict in flow_tasks:
+                status = str(task_dict.get("status") or "").lower()
+                if status and status not in _TERMINAL_TASK_STATUSES:
+                    return session_id
+    return None
+
+
 def create_ledger_from_actions(
     agent_id: str = None,
     session_id: str = None,
@@ -3511,7 +3745,22 @@ def create_ledger_from_actions(
     backend: Optional[Any] = None,
     # Backwards compatibility with old API
     user_id: int = None,
-    prompt_id: int = None
+    prompt_id: int = None,
+    # Recipe hierarchy — explicit coordinates so the dashboard can group
+    # tasks as prompt_id → session_id → flow_id → action without
+    # ad-hoc string parsing.  See docs/architecture/
+    # TASK_LEDGER_GROUPING_FIX_PLAN.md §4b for the design.
+    flow_id: int = 0,
+    recipe_prompt_id: Optional[str] = None,
+    # Session lifecycle: when True (default) and session_id is not
+    # explicitly supplied, scan agent_data/ for an in-flight ledger
+    # belonging to this (user_id, prompt_id) and attach to it; mint a
+    # fresh timestamped session_id only when no resumable session
+    # exists.  When False, the legacy deterministic
+    # f"{user_id}_{prompt_id}" session_id is used (preserves the
+    # pre-2026-05-27 behaviour for any caller that explicitly opts out).
+    # See TASK_LEDGER_PERSISTENCE_PLAN.md §3 Phase 2.
+    resume_if_unfinished: bool = True,
 ) -> SmartLedger:
     """
     Create a ledger from pre-assigned actions.
@@ -3523,20 +3772,63 @@ def create_ledger_from_actions(
         backend: Optional storage backend
         user_id: (DEPRECATED) Use agent_id/session_id instead
         prompt_id: (DEPRECATED) Use agent_id/session_id instead
+        flow_id: Recipe flow index this batch belongs to (default 0 —
+            today every recipe on disk is ``{prompt}_0_recipe.json``; the
+            kwarg reserves the slot so the day a multi-flow recipe ships
+            no code path has to ambiguously infer it from the filename).
+        recipe_prompt_id: Override for the recipe's prompt-id stamp.
+            Defaults to ``agent_id`` because the convention is
+            ``agent_id == prompt_id`` (recipe filename prefix matches
+            ledger filename's first slug).  Override only when a caller
+            constructs a ledger whose agent_id deliberately diverges
+            from its source recipe.
+        resume_if_unfinished: When True and session_id is None and
+            (user_id, prompt_id) are provided, scans ``agent_data/`` for
+            an in-flight ledger to resume.  When no resumable session
+            exists, mints a fresh ``f"{user_id}_{prompt_id}_{ts_ms}"``.
+            When False, falls back to the deterministic
+            ``f"{user_id}_{prompt_id}"`` of the pre-2026-05-27 behaviour.
 
     Returns:
         SmartLedger instance with tasks created from actions
     """
-    # Handle backwards compatibility with old user_id/prompt_id API
+    # Handle backwards compatibility with old user_id/prompt_id API.
+    # session_id resolution happens AFTER this block — if a caller
+    # already passed a non-None session_id, we respect it as-is.
     if user_id is not None and prompt_id is not None:
         agent_id = str(prompt_id)
-        session_id = f"{user_id}_{prompt_id}"
+        if session_id is None:
+            if resume_if_unfinished:
+                _resumable = _find_resumable_session(agent_id, user_id)
+                if _resumable is not None:
+                    session_id = _resumable
+                    logger.info(
+                        f"create_ledger_from_actions: resuming in-flight "
+                        f"session {session_id} for prompt={agent_id}, "
+                        f"user={user_id}",
+                    )
+            if session_id is None:
+                # Mint a fresh session — millisecond timestamp suffix
+                # gives ordered, unique-enough session ids per the
+                # plan's accepted concurrency tradeoff (Python GIL +
+                # single-machine HARTOS).  No PID/counter overhead.
+                import time as _time
+                session_id = f"{user_id}_{prompt_id}_{int(_time.time() * 1000)}"
+                logger.info(
+                    f"create_ledger_from_actions: fresh session "
+                    f"{session_id} for prompt={agent_id}, user={user_id}",
+                )
 
     if agent_id is None or session_id is None:
         raise ValueError("Must provide either (agent_id, session_id) or (user_id, prompt_id)")
 
     if actions is None:
         actions = []
+
+    # Resolve the recipe prompt-id stamp once, outside the loop, so every
+    # task in this ledger carries the same value (one ledger = one flow
+    # of one prompt by construction).
+    _recipe_prompt = recipe_prompt_id if recipe_prompt_id is not None else str(agent_id)
 
     ledger = SmartLedger(agent_id, session_id, backend=backend)
 
@@ -3563,6 +3855,13 @@ def create_ledger_from_actions(
             },
             priority=100 - action.get('action_id', 0)
         )
+
+        # Recipe-hierarchy stamping — must happen BEFORE seal_integrity()
+        # so the data hash covers these fields too.  The dashboard reads
+        # exactly these three to build prompt → session → flow → action.
+        task.recipe_prompt_id = _recipe_prompt
+        task.recipe_flow_id = flow_id
+        task.recipe_action_id = action.get('action_id')
 
         # Seal integrity hash so we can detect corruption later
         task.seal_integrity()

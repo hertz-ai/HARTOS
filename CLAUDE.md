@@ -188,6 +188,18 @@ prompts/{prompt_id}_{flow_id}_recipe.json   # Trained recipe
 prompts/{prompt_id}_{flow_id}_{action_id}.json  # Action recipes
 ```
 
+### Canonical Identifier Types — read once, never guess again
+
+| ID | Logical type | Wire / on-disk | Notes |
+|---|---|---|---|
+| `prompt_id` | **integer** (DB primary key) for human-created agents; **UUID string** for autonomous agents (coding agent, hive agents) | normalized to **string** when stamped on tasks / used as a dict key | one field, two real domains — typing it `int` would break autonomous agents |
+| `flow_id` | **integer**, monotonic from 0 per `prompt_id` | int | Sourced by `get_flow_number(user_id, prompt_id)` in reuse, `get_current_flow(user_prompt)` in create. Recipe filename `{prompt_id}_{flow_id}_recipe.json` keeps the two in lockstep. |
+| `action_id` | **integer**, restarts from 1 every flow | int | Flow-scoped — the `(flow_id, action_id)` tuple is the unique recipe coordinate within a session. Encoded in `task_id = f"action_{action_id}"`. |
+| `session_id` (execution instance id) | **string**, free-shaped by caller; canonical pattern `"{user_id}_{prompt_id}"`, also `"goal_abc"`, also full UUID for autonomous | stored verbatim, no coercion | **A new session_id is minted for every execution instance**: CREATE mode = first execution, REUSE mode = each subsequent execution. Same agent, many sessions over time. |
+| `agent_id` | mirrors `prompt_id`'s domain | always string (`str(prompt_id)` coercion in `create_ledger_from_actions`) | "agent_id == prompt_id" convention is load-bearing for dashboard grouping. |
+
+Dashboard hierarchy: `prompt_id → [session_id list, newest first] → flow_id → [action_id sorted ascending]`. Schema fields that encode this are `Task.recipe_prompt_id`, `Task.recipe_flow_id`, `Task.recipe_action_id`, stamped by `create_ledger_from_actions` and inherited by `add_dynamic_task` from sibling tasks. See `docs/architecture/TASK_LEDGER_GROUPING_FIX_PLAN.md` for the full design + helper API (`SmartLedger.list_grouped_by_recipe_hierarchy`).
+
 ### Integrations
 - `integrations/agent_engine/` - Unified agent goal engine, daemon, speculative dispatch
 - `integrations/social/` - 82-endpoint social platform (communities, feeds, karma, encounters)
