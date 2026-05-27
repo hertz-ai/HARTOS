@@ -23,9 +23,10 @@ def test_p1s1_on_notification_read_publishes_chat_social_and_sse():
     assert both publish_event and broadcast_sse_safe were called with
     the canonical topic/event name + the expected payload shape."""
     stub_events = MagicMock()
-    with patch.dict(sys.modules, {'core.platform.events': stub_events}):
+    with _snapshot_modules(
+            'integrations.social.realtime', 'core.platform.events'), \
+         patch.dict(sys.modules, {'core.platform.events': stub_events}):
         # Fresh import so the mocked events module wins.
-        import importlib
         if 'integrations.social.realtime' in sys.modules:
             del sys.modules['integrations.social.realtime']
         from integrations.social import realtime  # noqa: WPS433
@@ -61,7 +62,9 @@ def test_p1s1_on_notification_read_silent_noop_on_empty():
     """Edge case: empty ids should not publish anything — clients
     shouldn't see a phantom 'mark zero rows' event."""
     stub_events = MagicMock()
-    with patch.dict(sys.modules, {'core.platform.events': stub_events}):
+    with _snapshot_modules(
+            'integrations.social.realtime', 'core.platform.events'), \
+         patch.dict(sys.modules, {'core.platform.events': stub_events}):
         if 'integrations.social.realtime' in sys.modules:
             del sys.modules['integrations.social.realtime']
         from integrations.social import realtime
@@ -73,6 +76,40 @@ def test_p1s1_on_notification_read_silent_noop_on_empty():
 
 
 # ─── P1-S1: mark_read / mark_all_read call on_notification_read ──────
+def _snapshot_modules(*names):
+    """Snapshot the named sys.modules entries on enter; restore on
+    exit.  Use around any test that does `del sys.modules[X] +
+    from X import Y` so the reloaded module doesn't leak past the
+    test boundary.  Without this helper, every later test that does
+    `from X import Y` gets the stub-bound version (the symptom seen
+    when test_phase7c7_typing_read was run after our P1 tests:
+    SQLAlchemy 'Unknown column' / broken refs through services).
+
+    Module-level helper (not nested in another fn) so other test
+    files can import it if needed."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _cm():
+        saved = {n: sys.modules.get(n) for n in names}
+        try:
+            yield
+        finally:
+            for n, original in saved.items():
+                if original is not None:
+                    sys.modules[n] = original
+                else:
+                    sys.modules.pop(n, None)
+    return _cm()
+
+
+# Back-compat alias for the existing test functions that still
+# reference _snapshot_and_restore_services().  Wraps the generic
+# helper with the single most-common module name.
+def _snapshot_and_restore_services():
+    return _snapshot_modules('integrations.social.services')
+
+
 def test_p1s1_mark_read_registers_after_commit_callback():
     """mark_read must register an after_commit hook that fires
     on_notification_read.  Behavioural: patch the SQLAlchemy event
@@ -80,7 +117,7 @@ def test_p1s1_mark_read_registers_after_commit_callback():
     stub_models = MagicMock()
     stub_models.Notification = MagicMock()
     stub_auth = MagicMock()
-    with patch.dict(sys.modules, {
+    with _snapshot_and_restore_services(), patch.dict(sys.modules, {
         'integrations.social.models': stub_models,
         'integrations.social.auth': stub_auth,
     }):
@@ -125,7 +162,7 @@ def test_p1s1_mark_all_read_collects_ids_before_flipping():
     update (otherwise the after_commit hook can't tell who to notify)."""
     stub_models = MagicMock()
     stub_auth = MagicMock()
-    with patch.dict(sys.modules, {
+    with _snapshot_and_restore_services(), patch.dict(sys.modules, {
         'integrations.social.models': stub_models,
         'integrations.social.auth': stub_auth,
     }):
