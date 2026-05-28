@@ -9,11 +9,33 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from functools import wraps
 from typing import Callable, Optional, List, Dict, Any, Union
 import asyncio
+import inspect
 import logging
+import traceback
 
 logger = logging.getLogger(__name__)
+
+
+# Methods on a ChannelAdapter subclass that should have their escaping
+# exceptions auto-recorded to the metrics counter + dashboard log +
+# (for critical classes) the setup_progress SSE card.  Adding a name
+# here picks it up for every adapter on next class-load — no per-
+# adapter wiring needed.  Methods not on this list pass through
+# untouched (so internal helpers can raise without triggering the
+# sink).
+_AUTO_RECORD_METHODS = (
+    'connect', 'disconnect',
+    'send_message', 'edit_message', 'delete_message', 'send_typing',
+    'get_chat_info', 'download_file',
+)
+
+# Sentinel marking a method as already-wrapped — keeps the wrap
+# idempotent if __init_subclass__ runs more than once (test reloads,
+# decorator stacks, etc.).
+_AUTO_RECORD_WRAPPED_ATTR = '__channel_error_wrapped__'
 
 
 class MessageType(Enum):
@@ -239,6 +261,180 @@ class ChannelAdapter(ABC):
         """Check if adapter is running."""
         return self._running and self.status == ChannelStatus.CONNECTED
 
+    # ─── Canonical channel-error sink (auto-wired via __init_subclass__) ──
+    #
+    # Every method in ``_AUTO_RECORD_METHODS`` defined on a concrete
+    # adapter gets transparently wrapped at class-load time so an
+    # escaping exception:
+    #   (a) increments the per-(channel, error_type) Prometheus counter
+    #       in ``admin.metrics.MetricsCollector`` — ops time-series signal
+    #   (b) appends a structured row to ``admin.dashboard.AdminDashboard``
+    #       — admin UI's recent-errors panel
+    #   (c) when severity is critical (auth / sdk_missing / persistent
+    #       connect failure), publishes a ``setup_progress`` SSE event
+    #       with ``status='needs_user_action'`` + ``action_hint`` so
+    #       the demopage renders a one-click fix card
+    #   (d) is re-raised unchanged — wrapping must not change the
+    #       caller-visible contract of any method
+    #
+    # Existing in-adapter try/except blocks that catch + return a
+    # ``SendResult(success=False, error=...)`` keep working as before;
+    # they short-circuit the wrapper.  Those call sites can OPT IN to
+    # finer-grained reporting by calling ``self._record_channel_error(...)``
+    # explicitly from inside the except.
+
+    @staticmethod
+    def _classify_exception(exc: BaseException,
+                            fallback: str = 'send_failed') -> str:
+        """Map an exception instance to a low-cardinality error_type
+        suitable for the (channel, error_type) → count counter.
+        Subclasses may override for platform-specific classification
+        (e.g. mapping ``telegram.error.RetryAfter`` → ``rate_limit``)
+        but the default covers the common HARTOS-internal taxonomy."""
+        if isinstance(exc, ChannelRateLimitError):
+            return 'rate_limit'
+        if isinstance(exc, ChannelAuthError):
+            return 'auth'
+        if isinstance(exc, ChannelSDKMissingError):
+            return 'sdk_missing'
+        if isinstance(exc, ChannelConnectionError):
+            return 'connect_failed'
+        if isinstance(exc, ChannelSendError):
+            return 'send_failed'
+        # Non-channel exception types that adapters commonly let escape.
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            return 'timeout'
+        if isinstance(exc, ImportError):
+            return 'sdk_missing'
+        if isinstance(exc, (ConnectionError, OSError)):
+            return 'network'
+        return fallback
+
+    @staticmethod
+    def _severity_for(error_type: str) -> str:
+        """Map error_type to severity for the dashboard log + the
+        setup_progress critical gate.  Centralised so a future tweak
+        (e.g. promoting persistent 'network' to critical after N
+        consecutive failures) lives in one place."""
+        if error_type in ('auth', 'sdk_missing'):
+            return 'critical'
+        if error_type == 'rate_limit':
+            return 'warning'
+        return 'error'
+
+    @staticmethod
+    def _action_hint_for(channel: str, error_type: str) -> str:
+        """User-facing action hint shipped with the setup_progress SSE
+        card.  Frontend renders these as clickable affordances."""
+        hints = {
+            'auth':        f'reconfigure_{channel}_token',
+            'sdk_missing': f'install_{channel}_sdk',
+            'rate_limit':  'wait_and_retry',
+            'connect_failed': f'retry_{channel}_connect',
+            'send_failed': 'retry_last_message',
+            'timeout':     'retry_or_check_network',
+            'network':     'check_network',
+        }
+        return hints.get(error_type, 'investigate')
+
+    def _record_channel_error(self,
+                              error_type: str,
+                              exc: Optional[BaseException] = None,
+                              severity: Optional[str] = None,
+                              context: Optional[Dict[str, Any]] = None) -> None:
+        """Single canonical channel-error sink.  Called automatically
+        by the ``__init_subclass__`` wrapper for any escaping exception
+        from a method in ``_AUTO_RECORD_METHODS``.  Adapters may ALSO
+        call this directly from internal try/except blocks where they
+        currently catch + log + return ``SendResult(success=False)`` —
+        otherwise those swallowed exceptions don't reach the counter.
+
+        Side-effects (all best-effort, never propagate):
+          1. ``MetricsCollector.record_error(channel, error_type)``
+          2. ``AdminDashboard.record_error(error_type, message, ...)``
+          3. If ``severity='critical'``: ``publish_event('setup_progress',
+             {'status': 'needs_user_action', 'action_hint': ...})``
+
+        A failure in ANY of the three side-effects is logged and
+        swallowed; the original exception (if any) is the caller's
+        concern and is not touched here.
+        """
+        sev = severity or self._severity_for(error_type)
+        msg = str(exc) if exc is not None else error_type
+        channel = self.name if hasattr(self, 'name') else 'unknown'
+
+        # (1) Prometheus counter
+        try:
+            from integrations.channels.admin.metrics import get_metrics_collector
+            get_metrics_collector().record_error(channel, error_type)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("channel-error metrics sink failed: %s", e)
+
+        # (2) Admin-UI structured log
+        try:
+            from integrations.channels.admin.dashboard import (
+                get_dashboard, ErrorSeverity,
+            )
+            sev_enum = getattr(ErrorSeverity, sev.upper(), ErrorSeverity.ERROR)
+            stack = traceback.format_exc() if exc is not None else None
+            get_dashboard().record_error(
+                error_type=error_type,
+                message=msg,
+                channel=channel,
+                severity=sev_enum,
+                stack_trace=stack,
+                context=context or {},
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("channel-error dashboard sink failed: %s", e)
+
+        # (3) setup_progress card — only for critical (auth / sdk_missing
+        # / explicitly-marked-critical adapter-level escalations).  Other
+        # severities don't fire UI cards (operator looks at the admin
+        # panel or Prometheus instead) to avoid card spam on transient
+        # rate-limits + retried network blips.
+        if sev == 'critical':
+            try:
+                from integrations.social.realtime import publish_event
+                publish_event('setup_progress', {
+                    'type': 'setup_progress',
+                    'job_type': f'channel_{channel}',
+                    'status': 'needs_user_action',
+                    'channel': channel,
+                    'error_type': error_type,
+                    'message': msg[:280],
+                    'action_hint': self._action_hint_for(channel, error_type),
+                })
+            except Exception as e:  # noqa: BLE001
+                logger.debug("channel-error setup_progress sink failed: %s", e)
+
+    @classmethod
+    def __init_subclass__(cls, **kwargs):
+        """Wrap concrete adapter methods so escaping exceptions land
+        in the canonical sink without touching adapter code.
+
+        Idempotent: a method that's already wrapped (via the
+        ``_AUTO_RECORD_WRAPPED_ATTR`` sentinel) is skipped on repeat
+        class-loads — keeps test reloads + decorator stacks clean.
+
+        Only methods listed in ``_AUTO_RECORD_METHODS`` are wrapped.
+        Internal helpers stay untouched so adapters can raise from
+        non-public code without triggering the sink."""
+        super().__init_subclass__(**kwargs)
+        for method_name in _AUTO_RECORD_METHODS:
+            method = cls.__dict__.get(method_name)
+            if method is None:
+                continue  # this adapter didn't override the method
+            if getattr(method, _AUTO_RECORD_WRAPPED_ATTR, False):
+                continue  # already wrapped
+
+            if inspect.iscoroutinefunction(method):
+                wrapped = _wrap_async_with_error_sink(method, method_name)
+            else:
+                wrapped = _wrap_sync_with_error_sink(method, method_name)
+            setattr(wrapped, _AUTO_RECORD_WRAPPED_ATTR, True)
+            setattr(cls, method_name, wrapped)
+
 
 class ChannelError(Exception):
     """Base exception for channel errors."""
@@ -260,3 +456,68 @@ class ChannelRateLimitError(ChannelError):
     def __init__(self, retry_after: Optional[int] = None):
         self.retry_after = retry_after
         super().__init__(f"Rate limited. Retry after {retry_after}s" if retry_after else "Rate limited")
+
+
+class ChannelAuthError(ChannelError):
+    """Authentication / credentials failure — missing or invalid token,
+    expired session, OAuth revoked, etc.  Distinguished from generic
+    ChannelError so the base-class error sink can emit a critical
+    ``setup_progress`` SSE card prompting the operator to refresh
+    credentials, rather than logging it as a transient send failure."""
+    pass
+
+
+class ChannelSDKMissingError(ChannelError):
+    """Required SDK / Python package is not importable on this install.
+    Surfaces as a critical ``setup_progress`` card prompting install
+    (e.g. ``pip install discord.py``).  Distinct from auth so the UI
+    can route to a different action (install vs reconfigure)."""
+    pass
+
+
+def _wrap_async_with_error_sink(method: Callable, method_name: str) -> Callable:
+    """Wrap an async adapter method so escaping exceptions land in
+    the canonical sink before being re-raised.  Re-raise preserves
+    the existing caller contract — wrapping must be transparent."""
+    @wraps(method)
+    async def _wrapped(self, *args, **kwargs):
+        try:
+            return await method(self, *args, **kwargs)
+        except Exception as exc:
+            try:
+                error_type = self._classify_exception(
+                    exc, fallback=method_name)
+                self._record_channel_error(
+                    error_type, exc,
+                    context={'method': method_name})
+            except Exception as sink_err:  # noqa: BLE001
+                # Sink machinery itself broke — log + still re-raise
+                # the original so adapter callers are unaffected.
+                logger.debug(
+                    "channel-error sink failed for %s.%s: %s",
+                    type(self).__name__, method_name, sink_err)
+            raise
+    return _wrapped
+
+
+def _wrap_sync_with_error_sink(method: Callable, method_name: str) -> Callable:
+    """Sync counterpart of ``_wrap_async_with_error_sink`` — for
+    adapters that override ``_AUTO_RECORD_METHODS`` entries as
+    plain ``def``."""
+    @wraps(method)
+    def _wrapped(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as exc:
+            try:
+                error_type = self._classify_exception(
+                    exc, fallback=method_name)
+                self._record_channel_error(
+                    error_type, exc,
+                    context={'method': method_name})
+            except Exception as sink_err:  # noqa: BLE001
+                logger.debug(
+                    "channel-error sink failed for %s.%s: %s",
+                    type(self).__name__, method_name, sink_err)
+            raise
+    return _wrapped
