@@ -215,3 +215,166 @@ def test_subsystem_taxonomy_uniform(fresh_collector, subsystem,
 
     rec = fresh_collector.get_unresolved()[0]
     assert rec.module == expected_module
+
+
+# ── AutoReportSubsystemFailures mixin ─────────────────────────────
+
+def test_mixin_auto_wraps_listed_methods(fresh_collector):
+    """A class that inherits the mixin + sets SUBSYSTEM +
+    AUTO_REPORTED_METHODS has those methods auto-wrapped at
+    class-load time.  Exceptions escaping wrapped methods feed the
+    self-heal pipeline with the right (subsystem, identifier)
+    shape — zero per-method except-block edits required."""
+    from exception_collector import AutoReportSubsystemFailures
+
+    class FakeBackend(AutoReportSubsystemFailures):
+        SUBSYSTEM = 'vlm'
+        AUTO_REPORTED_METHODS = ('start', 'describe')
+
+        @property
+        def name(self) -> str:
+            return 'fake_backend'
+
+        def start(self):
+            raise RuntimeError('CUDA OOM')
+
+        def describe(self, frame_bytes):
+            raise ImportError('missing transformers')
+
+    inst = FakeBackend()
+    with pytest.raises(RuntimeError, match='CUDA OOM'):
+        inst.start()
+    with pytest.raises(ImportError, match='missing transformers'):
+        inst.describe(b'jpeg-bytes')
+
+    recs = fresh_collector.get_unresolved()
+    assert len(recs) == 2
+    by_function = {r.function: r for r in recs}
+    assert by_function['start'].module == 'vlm.fake_backend'
+    assert by_function['start'].exc_type == 'RuntimeError'
+    assert by_function['describe'].module == 'vlm.fake_backend'
+    assert by_function['describe'].exc_type == 'ImportError'
+
+
+@pytest.mark.asyncio
+async def test_mixin_handles_async_methods(fresh_collector):
+    """Async methods are detected via inspect.iscoroutinefunction and
+    get an async wrapper.  Same self-heal push behavior, awaitable."""
+    from exception_collector import AutoReportSubsystemFailures
+
+    class FakeAsyncBackend(AutoReportSubsystemFailures):
+        SUBSYSTEM = 'llm'
+        AUTO_REPORTED_METHODS = ('load',)
+        name = 'fake_async'
+
+        async def load(self):
+            raise ConnectionError('llama-server unreachable')
+
+    inst = FakeAsyncBackend()
+    with pytest.raises(ConnectionError):
+        await inst.load()
+
+    rec = fresh_collector.get_unresolved()[0]
+    assert rec.module == 'llm.fake_async'
+    assert rec.function == 'load'
+
+
+def test_mixin_wrap_is_idempotent(fresh_collector):
+    """Re-running __init_subclass__ (e.g. module reload in dev) MUST
+    NOT stack wrappers — the sentinel attribute on the wrapper
+    short-circuits double-wraps."""
+    from exception_collector import (
+        AutoReportSubsystemFailures, _AUTO_REPORT_WRAPPED_ATTR,
+    )
+
+    class FakeIdem(AutoReportSubsystemFailures):
+        SUBSYSTEM = 'tool'
+        AUTO_REPORTED_METHODS = ('register',)
+        name = 'fake_idem'
+
+        def register(self):
+            raise ValueError('bad spec')
+
+    method = FakeIdem.__dict__['register']
+    assert getattr(method, _AUTO_REPORT_WRAPPED_ATTR, False) is True
+    # Manual re-invoke of __init_subclass__ — must be a no-op.
+    AutoReportSubsystemFailures.__init_subclass__.__func__(FakeIdem)
+    method_after = FakeIdem.__dict__['register']
+    assert method_after is method  # same object, not re-wrapped
+
+
+def test_mixin_success_path_no_record(fresh_collector):
+    """When wrapped method returns normally, the collector sees
+    NOTHING — wrap is transparent on the happy path."""
+    from exception_collector import AutoReportSubsystemFailures
+
+    class FakeOK(AutoReportSubsystemFailures):
+        SUBSYSTEM = 'daemon'
+        AUTO_REPORTED_METHODS = ('tick',)
+        name = 'fake_daemon'
+
+        def tick(self):
+            return 'ok'
+
+    inst = FakeOK()
+    assert inst.tick() == 'ok'
+    assert fresh_collector.get_unresolved() == []
+
+
+def test_mixin_intermediate_base_without_subsystem_passes_through(
+        fresh_collector):
+    """An intermediate base class that inherits the mixin but does
+    NOT set SUBSYSTEM (e.g. an abstract base under the mixin)
+    must NOT trigger wrap until a concrete subclass sets it.
+    Prevents the mixin from accidentally wrapping abstract methods
+    on the intermediate."""
+    from exception_collector import AutoReportSubsystemFailures
+
+    class IntermediateAbstract(AutoReportSubsystemFailures):
+        # SUBSYSTEM intentionally left empty — this is an abstract layer
+        AUTO_REPORTED_METHODS = ('do_thing',)
+
+        def do_thing(self):
+            raise RuntimeError('should never run on this abstract')
+
+    class ConcreteLeaf(IntermediateAbstract):
+        SUBSYSTEM = 'tool'
+        AUTO_REPORTED_METHODS = ('do_thing',)
+        name = 'concrete_leaf'
+
+        def do_thing(self):
+            raise RuntimeError('leaf failure')
+
+    leaf = ConcreteLeaf()
+    with pytest.raises(RuntimeError, match='leaf failure'):
+        leaf.do_thing()
+
+    rec = fresh_collector.get_unresolved()[0]
+    assert rec.module == 'tool.concrete_leaf'
+
+
+def test_mixin_identifier_fallback_to_class_name(fresh_collector):
+    """A class without ``name`` attribute falls back to the class
+    name as identifier — keeps the helper safe even when subclasses
+    forget the convention."""
+    from exception_collector import AutoReportSubsystemFailures
+
+    class FakeNoName(AutoReportSubsystemFailures):
+        SUBSYSTEM = 'daemon'
+        AUTO_REPORTED_METHODS = ('boot',)
+
+        # NO `name` attribute set
+
+        def boot(self):
+            # Use Exception (not BaseException-only like SystemExit)
+            # so the mixin's `except Exception` catches it.  Catching
+            # BaseException in the wrap would mask KeyboardInterrupt
+            # — that's design intent.
+            raise RuntimeError('died')
+
+    inst = FakeNoName()
+    with pytest.raises(RuntimeError):
+        inst.boot()
+
+    rec = fresh_collector.get_unresolved()[0]
+    assert rec.module == 'daemon.FakeNoName'
