@@ -90,12 +90,13 @@ from typing import Optional  # noqa: E402
 
 @pytest.fixture
 def sinks(monkeypatch):
-    """Patch all three downstream sinks + capture every call.
+    """Patch all four downstream sinks + capture every call.
     Returned dict has lists of recorded calls per channel-error path."""
     captured = {
-        'metrics': [],     # list of (channel, error_type)
-        'dashboard': [],   # list of kwargs dicts
-        'sse': [],         # list of payloads
+        'metrics': [],            # list of (channel, error_type)
+        'dashboard': [],          # list of kwargs dicts
+        'sse': [],                # list of (topic, payload)
+        'self_heal': [],          # list of (subsystem, identifier, exc_type, function, ctx)
     }
 
     fake_metrics = MagicMock()
@@ -120,6 +121,21 @@ def sinks(monkeypatch):
     monkeypatch.setattr(
         rt_mod, 'publish_event',
         lambda topic, data, **kw: captured['sse'].append((topic, data)))
+
+    # Self-heal pipeline stub — capture the canonical helper invocation
+    # so we can assert the (subsystem, identifier, exc_type) shape that
+    # SelfHealingDispatcher's pattern_key grouping depends on.
+    import exception_collector as ec_mod
+    def _fake_report(subsystem, identifier, exc, function, **ctx):
+        captured['self_heal'].append({
+            'subsystem': subsystem,
+            'identifier': identifier,
+            'exc_type': type(exc).__name__,
+            'exc_msg': str(exc),
+            'function': function,
+            'ctx': ctx,
+        })
+    monkeypatch.setattr(ec_mod, 'report_subsystem_failure', _fake_report)
 
     return captured
 
@@ -276,11 +292,66 @@ async def test_sdk_missing_at_connect_fires_install_card(sinks):
     assert payload['action_hint'] == 'install_fake_sdk'
 
 
+# ── 3b. Self-heal pipeline push uses canonical helper ─────────────
+
+@pytest.mark.asyncio
+async def test_self_heal_push_uses_canonical_helper(sinks):
+    """The (4) sink — ExceptionCollector / self-heal pipeline — must
+    route through ``exception_collector.report_subsystem_failure``
+    with ``subsystem='channels'`` and ``identifier=<adapter name>``.
+    Without this canonical-helper enforcement each channel adapter
+    would build its own ``module=f'channels.{name}'`` string —
+    parallel-path drift the user explicitly called out
+    (2026-05-28).  The helper centralises the module-key shape so
+    SelfHealingDispatcher's pattern_key grouping clusters all
+    failures on the same adapter under one self_heal goal."""
+    from integrations.channels.base import ChannelAuthError, ChannelConfig
+    AdapterCls = _make_adapter_class(
+        raise_in_send=ChannelAuthError('token expired'))
+    adapter = AdapterCls(ChannelConfig())
+
+    with pytest.raises(ChannelAuthError):
+        await adapter.send_message(chat_id='c1', text='hi')
+
+    assert len(sinks['self_heal']) == 1
+    push = sinks['self_heal'][0]
+    assert push['subsystem'] == 'channels'
+    assert push['identifier'] == 'fake'
+    assert push['exc_type'] == 'ChannelAuthError'
+    assert push['function'] == 'send_message'
+    # The ctx must carry error_type + severity so the dispatcher /
+    # self-heal agent can decide which repair tool to use.
+    assert push['ctx'].get('error_type') == 'auth'
+    assert push['ctx'].get('severity') == 'critical'
+
+
+@pytest.mark.asyncio
+async def test_self_heal_push_skipped_when_no_exception(sinks):
+    """Manual ``_record_channel_error(error_type, exc=None)`` (the
+    opt-in path for adapters that swallow + return SendResult)
+    should NOT push to the self-heal pipeline — ExceptionCollector
+    requires a real Python exception for the type + traceback
+    extraction."""
+    from integrations.channels.base import ChannelConfig
+    AdapterCls = _make_adapter_class()
+    adapter = AdapterCls(ChannelConfig())
+
+    adapter._record_channel_error(
+        'send_failed', exc=None, context={'method': 'custom_op'})
+
+    # metrics + dashboard still fire (they take strings)
+    assert sinks['metrics'] == [('fake', 'send_failed')]
+    assert len(sinks['dashboard']) == 1
+    # but self-heal does NOT (no Python exception to record)
+    assert sinks['self_heal'] == []
+
+
 # ── 4. Caller contract: success path is untouched ─────────────────
 
 @pytest.mark.asyncio
 async def test_success_path_no_side_effects(sinks):
-    """When send_message returns normally, the wrapper records NOTHING."""
+    """When send_message returns normally, the wrapper records NOTHING
+    on any of the 4 sinks (metrics, dashboard, sse, self-heal)."""
     from integrations.channels.base import ChannelConfig
     AdapterCls = _make_adapter_class()
     adapter = AdapterCls(ChannelConfig())
@@ -290,6 +361,7 @@ async def test_success_path_no_side_effects(sinks):
     assert sinks['metrics'] == []
     assert sinks['dashboard'] == []
     assert sinks['sse'] == []
+    assert sinks['self_heal'] == []
 
 
 # ── 5. Manual _record_channel_error call (opt-in from internal except) ──

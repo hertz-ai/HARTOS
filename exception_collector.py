@@ -246,3 +246,54 @@ def record_exception(exc: BaseException, module: str = '', function: str = '',
             user_prompt=user_prompt, action_id=action_id, context=ctx)
     except Exception:
         pass
+
+
+def report_subsystem_failure(subsystem: str, identifier: str,
+                             exc: BaseException, function: str,
+                             **ctx) -> None:
+    """Single canonical entry point for ANY subsystem's silent-failure
+    surface to feed the self-heal pipeline.
+
+    Subsystems with localized circuit breakers / demotion state /
+    install retries (TTS backends, channel adapters, VLM/LLM model
+    workers, daemon supervisors, dynamic tool registrations) all
+    need their failures to ALSO reach the canonical self-heal chain:
+
+        record_exception() → ExceptionCollector (singleton, bounded
+        buffer, dedup by pattern_key) → ExceptionWatcher (runs
+        inside agent_daemon._tick, classifies severity) →
+        SelfHealingDispatcher (creates a `self_heal` goal for an
+        idle agent when pattern crosses threshold) → idle agent
+        uses repair tools to fix the root cause.
+
+    Without this single entry, each subsystem would maintain its
+    own opinion of "module key" and ctx vocabulary — a parallel-
+    path violation that splinters the pattern_key grouping the
+    dispatcher relies on for dedup.  Use THIS helper instead:
+
+      report_subsystem_failure('tts',     'indic_parler', exc, 'demote', ...)
+      report_subsystem_failure('channels','discord',      exc, 'send_message', ...)
+      report_subsystem_failure('vlm',     'minicpm',      exc, 'load',  ...)
+      report_subsystem_failure('llm',     'qwen3_4b',     exc, 'load',  ...)
+      report_subsystem_failure('daemon',  'agent_daemon', exc, 'tick',  ...)
+      report_subsystem_failure('tool',    'pdf_extract',  exc, 'register', ...)
+
+    Module key is uniformly ``{subsystem}.{identifier}`` so the
+    dispatcher's pattern_key = ``{exc_type}::{subsystem}.{identifier}
+    ::{function}`` groups related failures correctly across the
+    entire system.  Self-heal goals carry the subsystem in their
+    config so the agent picks the right repair tool from the
+    capability matrix.
+
+    Fire-and-forget — never raises into caller.  Safe from any
+    except block.
+    """
+    try:
+        ExceptionCollector.get_instance().record(
+            exc,
+            module=f'{subsystem}.{identifier}' if identifier else subsystem,
+            function=function,
+            context={'subsystem': subsystem, 'identifier': identifier, **ctx},
+        )
+    except Exception:
+        pass

@@ -351,13 +351,24 @@ class ChannelAdapter(ABC):
 
         Side-effects (all best-effort, never propagate):
           1. ``MetricsCollector.record_error(channel, error_type)``
+             — Prometheus / time-series counter
           2. ``AdminDashboard.record_error(error_type, message, ...)``
+             — admin-UI structured log
           3. If ``severity='critical'``: ``publish_event('setup_progress',
              {'status': 'needs_user_action', 'action_hint': ...})``
+             — live UI card
+          4. ``record_exception(exc, module, function, context)``
+             — pushes into the canonical ExceptionCollector singleton
+             so the existing self-heal pipeline (ExceptionWatcher in
+             agent_daemon → SelfHealingDispatcher → self_heal goal →
+             idle agent fixes the root cause via repair tools) sees
+             channel failures the same as any other Python exception.
+             This is the wiring that turns a silent adapter failure
+             into an autonomous remediation goal.
 
-        A failure in ANY of the three side-effects is logged and
-        swallowed; the original exception (if any) is the caller's
-        concern and is not touched here.
+        A failure in ANY side-effect is logged and swallowed; the
+        original exception (if any) is the caller's concern and is
+        not touched here.
         """
         sev = severity or self._severity_for(error_type)
         msg = str(exc) if exc is not None else error_type
@@ -407,6 +418,34 @@ class ChannelAdapter(ABC):
                 })
             except Exception as e:  # noqa: BLE001
                 logger.debug("channel-error setup_progress sink failed: %s", e)
+
+        # (4) Self-heal pipeline — single canonical entry point.
+        # report_subsystem_failure is the ONE helper every subsystem
+        # uses to feed ExceptionCollector with consistent module-key
+        # shape ({subsystem}.{identifier}).  TTS demotion, VLM /
+        # LLM model-worker failures, daemon thread death, dynamic
+        # tool registration miss all funnel through the same helper —
+        # no per-subsystem string-formatting of the module key, no
+        # parallel push paths.  The dispatcher's pattern_key grouping
+        # only works correctly when every subsystem uses the same
+        # naming convention; this helper enforces it.
+        if exc is not None:
+            try:
+                from exception_collector import report_subsystem_failure
+                method_name = (context or {}).get('method', 'unknown')
+                report_subsystem_failure(
+                    subsystem='channels',
+                    identifier=channel,
+                    exc=exc,
+                    function=method_name,
+                    error_type=error_type,
+                    severity=sev,
+                    **{k: v for k, v in (context or {}).items()
+                       if k not in ('method',)},
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    "channel-error self-heal push failed: %s", e)
 
     @classmethod
     def __init_subclass__(cls, **kwargs):
