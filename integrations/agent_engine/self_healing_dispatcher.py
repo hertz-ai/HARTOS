@@ -97,6 +97,21 @@ class SelfHealingDispatcher:
         module = parts[1] if len(parts) > 1 else 'unknown'
         function = parts[2] if len(parts) > 2 else 'unknown'
 
+        # Surface the subsystem + identifier that report_subsystem_failure
+        # stamped into the record context, so the self-heal goal can route
+        # to the right repair tool from the capability matrix.  Without
+        # this the goal carried only the 'module' string ('tts.indic_parler')
+        # and the "agent picks the right repair tool" promise in the
+        # report_subsystem_failure / channel-base / tts-engine docstrings
+        # was unwired (self-review H1, 2026-05-29).  Module key is
+        # '{subsystem}.{identifier}' so we can also derive them from the
+        # split when the context fields are absent (older records).
+        _ctx = getattr(sample, 'context', None) or {}
+        subsystem = _ctx.get('subsystem')
+        identifier = _ctx.get('identifier')
+        if not subsystem and '.' in module:
+            subsystem, _, identifier = module.partition('.')
+
         title = f"Fix {exc_type} in {module}.{function}"
         if len(title) > 200:
             title = title[:197] + '...'
@@ -105,11 +120,16 @@ class SelfHealingDispatcher:
         unique_messages = list(dict.fromkeys(r.exc_message for r in records[:5]))
         sample_traceback = records[-1].traceback_str[:2000]
 
+        _subsystem_line = (
+            f"Subsystem: {subsystem} (identifier: {identifier})\n"
+            if subsystem else ""
+        )
         description = (
             f"Recurring exception detected ({len(records)} occurrences in last hour).\n\n"
             f"Exception: {exc_type}\n"
             f"Module: {module}\n"
             f"Function: {function}\n"
+            f"{_subsystem_line}"
             f"Messages: {'; '.join(unique_messages)}\n\n"
             f"Sample traceback:\n{sample_traceback}\n\n"
             f"Fix the root cause. Do not just add try/except — understand why "
@@ -124,6 +144,15 @@ class SelfHealingDispatcher:
             'exc_type': exc_type,
             'occurrence_count': len(records),
             'sample_traceback': sample_traceback,
+            # Capability-matrix routing inputs (self-review H1).  The
+            # repair agent reads config['subsystem'] to pick the right
+            # tool: 'tts'/'vlm'/'llm' → reinstall/venv-repair,
+            # 'channels' → reconnect/credential-refresh, 'daemon' →
+            # supervisor restart, 'tool' → re-register.  None when the
+            # exception came from a generic record_exception (not via
+            # report_subsystem_failure).
+            'subsystem': subsystem,
+            'identifier': identifier,
         }
 
         return GoalManager.create_goal(
