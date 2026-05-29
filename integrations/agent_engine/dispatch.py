@@ -121,17 +121,53 @@ _create_lock = threading.Lock()
 
 
 def mark_user_chat_activity():
-    """Call on every user /chat request (including autonomous CREATE)."""
+    """Call on every GENUINE user /chat request (including user-initiated
+    autonomous CREATE).  MUST NOT be called for the agent_daemon's own
+    background dispatches — see is_genuine_user_request()."""
     global _last_user_chat_at
     _last_user_chat_at = _time.time()
 
 
-def mark_create_start():
-    """Call when a CREATE pipeline starts."""
+def is_genuine_user_request(request_id) -> bool:
+    """True when a /chat request comes from a real user (so it should
+    mark user activity + make daemons yield), False when it's the
+    agent_daemon's own background goal dispatch.
+
+    The daemon's in-process Tier-1 dispatch tags request_id with the
+    'daemon_<goal_id>' prefix (see dispatch_goal's _daemon_request_id).
+    Genuine user turns — including user-initiated autonomous CREATE
+    ('do it for me') — carry a normal request_id and return True.
+
+    This is the single discriminator that breaks the 2026-05-29
+    yield-gate feedback loop: without it, every daemon dispatch
+    re-stamped _last_user_chat_at, so should_yield_to_user() read
+    'user active' forever (~24h of continuous yield, 1142 starvation
+    overrides) and the flywheel daemon never ran its normal path.
+    """
+    return not (bool(request_id) and str(request_id).startswith('daemon_'))
+
+
+def mark_create_start(request_id=None):
+    """Call when a CREATE pipeline starts.
+
+    Always increments the in-flight-CREATE counter (so other daemon
+    ticks yield while ANY create runs — daemon-initiated included,
+    since creates are LLM-heavy and shouldn't pile up).  The counter
+    is self-balancing via mark_create_end().
+
+    Only stamps the user-activity TIMESTAMP for genuine user creates.
+    A daemon-initiated CREATE (request_id='daemon_<goal>') must NOT
+    re-arm the 10-min user cooldown — otherwise the starvation-override
+    path (override → forced tick → daemon dispatch → create →
+    mark_create_start → re-stamp) keeps the yield gate stuck-on, the
+    same feedback loop the line-8427 guard closes for the non-create
+    path.  See is_genuine_user_request().
+    """
     global _active_create_sessions
     with _create_lock:
         _active_create_sessions += 1
-    mark_user_chat_activity()
+    if is_genuine_user_request(request_id):
+        mark_user_chat_activity()
 
 
 def mark_create_end():

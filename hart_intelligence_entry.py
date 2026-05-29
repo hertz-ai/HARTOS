@@ -8421,10 +8421,31 @@ def chat():
     if channel_context:
         thread_local_data.channel_context = channel_context
 
-    # USER PRIORITY: mark user activity so daemon dispatch yields the LLM
+    # USER PRIORITY: mark user activity so daemon dispatch yields the LLM.
+    #
+    # CRITICAL (2026-05-29 feedback-loop fix): only stamp for GENUINE
+    # user turns.  The agent_daemon dispatches goals via the in-process
+    # Tier-1 path (dispatch.py → hevolve_chat → this chat() handler)
+    # with request_id='daemon_<goal_id>' (dispatch.py:_daemon_request_id).
+    # If those daemon dispatches also stamped user activity, the
+    # `should_yield_to_user()` gate would read "user active" forever:
+    #   daemon tick → dispatch → chat() → stamp → gate stays True →
+    #   normal tick yields → only the 120s STARVATION OVERRIDE ever
+    #   dispatches.  Live log evidence: the yield gate stayed blocked
+    #   for ~85821s (~24h) with 1142 starvation overrides — the flywheel
+    #   daemon never ran its normal path, which is the real cause of the
+    #   "84 goals, 0 progress for days" symptom.
+    #
+    # A genuine user request — including a user-initiated autonomous
+    # CREATE ("do it for me") — carries a non-daemon request_id, so it
+    # still correctly marks the user active.  Only the daemon's own
+    # background dispatches are excluded.  Discriminator is the canonical
+    # dispatch.is_genuine_user_request (testable; single source of truth).
     try:
-        from integrations.agent_engine.dispatch import mark_user_chat_activity
-        mark_user_chat_activity()
+        from integrations.agent_engine.dispatch import (
+            mark_user_chat_activity, is_genuine_user_request)
+        if is_genuine_user_request(request_id):
+            mark_user_chat_activity()
     except ImportError:
         pass
 
@@ -8863,7 +8884,7 @@ def chat():
                     try:
                         try:
                             from integrations.agent_engine.dispatch import mark_create_start, mark_create_end
-                            mark_create_start()
+                            mark_create_start(request_id=request_id)
                         except ImportError:
                             mark_create_end = None
                         recipe_response = recipe(user_id, prompt, prompt_id, file_id, request_id)
@@ -9089,7 +9110,7 @@ def chat():
         if _in_review and not _in_convo:
             try:
                 from integrations.agent_engine.dispatch import mark_create_start, mark_create_end
-                mark_create_start()
+                mark_create_start(request_id=request_id)
             except ImportError:
                 mark_create_end = None
             try:
