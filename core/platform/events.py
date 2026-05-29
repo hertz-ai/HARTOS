@@ -369,6 +369,33 @@ class EventBus:
                     bus._wamp_loop = None
                     bus._wamp_connected = False
                     bus._wamp_session = None
+                    # CRITICAL (2026-05-29 WAMP-outbound-death fix):
+                    # close the loop before the next reconnect iteration
+                    # creates a fresh one.  Without this, each iteration
+                    # abandoned its asyncio loop; the abandoned loop's
+                    # default ThreadPoolExecutor got torn down (GC /
+                    # anyio teardown / atexit on the global crossbar
+                    # executor) while the REUSED `component` instance was
+                    # still trying to reconnect via run_in_executor on it
+                    # → "RuntimeError: cannot schedule new futures after
+                    # shutdown" forever (live log: 59+ occurrences), which
+                    # permanently killed WAMP outbound publish until
+                    # process restart and forced the relay workaround.
+                    # Cancel any pending tasks, then close, so the next
+                    # iteration starts with a clean loop + fresh executor.
+                    try:
+                        _pending = asyncio.all_tasks(loop=loop)
+                        for _t in _pending:
+                            _t.cancel()
+                        if _pending:
+                            loop.run_until_complete(
+                                asyncio.gather(*_pending, return_exceptions=True))
+                    except Exception:
+                        pass
+                    try:
+                        loop.close()
+                    except Exception:
+                        pass
                 # Reset backoff if connection lived > 60s (was a real session)
                 if connected_at and (_time.time() - connected_at) > 60:
                     backoff = 1
