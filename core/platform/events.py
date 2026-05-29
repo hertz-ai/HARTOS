@@ -90,7 +90,37 @@ _SSE_DENYLIST_PREFIXES: tuple = ('bus.',)
 # include user_id leaks the payload (e.g. a personal pair-code card)
 # to every connected client.  Add a prefix here only when the topic
 # is genuinely public to the whole org.
-_SSE_GLOBAL_PREFIXES: tuple = ('community.', 'hive.', 'public.')
+#
+# 2026-05-29 expansion (log review): the guard was refusing ~13,200
+# legitimate HOST/INFRA telemetry broadcasts — `system.health.snapshot`
+# (×11393), `system.pressure`, `system.optimization.applied`,
+# `resource.mode_changed`, `model.unloaded`, etc. — because the
+# allowlist only had community./hive./public.  These topics carry the
+# NODE's own CPU/RAM/health/model-lifecycle telemetry for the admin
+# ops dashboards (compute_optimizer._emit_health_snapshot,
+# model_lifecycle system.pressure, resource_governor mode changes).
+# They contain NO user or agent identifiers, so broadcasting them to
+# every SSE client is safe even multi-tenant — and refusing them left
+# every real-time admin health/pressure/optimization panel dark.  The
+# WAMP-side authorizer (integrations/social/realtime.py
+# _PUBLIC_TOPIC_PREFIXES) already treats system./model./catalog. as
+# public; this aligns the SSE guard with that same notion for the
+# infra subset.  (The two lists intentionally differ elsewhere: WAMP
+# also lists per-conversation chat.social/dm. which are authorized
+# per-subscriber, NOT SSE-global.)
+#
+# DELIBERATELY EXCLUDED — agent/goal/memory-scoped topics that carry an
+# agent_id/goal_id (agent.action.completed ×4882, action_state.changed,
+# inference.completed, memory.item_added).  On a multi-tenant node a
+# global SSE broadcast of those would leak cross-user activity metadata.
+# The correct fix is the PUBLISHER stamping the owning user_id so the
+# event routes per-user (admin SSE subscribes with elevated scope) —
+# tracked separately, NOT bypassed by whitelisting here.
+_SSE_GLOBAL_PREFIXES: tuple = (
+    'community.', 'hive.', 'public.',
+    # host/infra telemetry (no user/agent identifiers) — admin ops feed:
+    'system.', 'resource.', 'model.', 'catalog.', 'app.',
+)
 
 
 def _topic_targets_sse(topic: str) -> bool:

@@ -114,6 +114,85 @@ def test_p3a_sse_allows_personal_topic_when_user_id_present():
         assert kwargs.get('user_id') == 'user-7'
 
 
+# ─── P3a expansion (2026-05-29): host/infra telemetry whitelist ──────
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize('topic', [
+    'system.health.snapshot',     # ×11393 refused pre-fix
+    'system.pressure',
+    'system.optimization.applied',
+    'resource.mode_changed',
+    'resource.proactive_action',
+    'model.unloaded',
+    'catalog.updated',
+    'app.registered',
+])
+def test_p3a_sse_allows_infra_telemetry_without_user_id(topic):
+    """Host/infra telemetry (CPU/RAM/health/model-lifecycle/resource)
+    carries NO user or agent identifier and feeds the admin ops
+    dashboards — it MUST broadcast without a user_id.  Pre-fix the
+    guard refused ~13,200 of these and the real-time admin panels
+    went dark (log review 2026-05-29)."""
+    with _snapshot_modules('core.platform.events'):
+        if 'core.platform.events' in sys.modules:
+            del sys.modules['core.platform.events']
+        from core.platform import events
+        with patch.object(events, 'broadcast_sse_safe') as broadcast_mock:
+            bus = events.EventBus()
+            bus.emit(topic, {'health_score': 0.9, 'cpu_pct': 40})
+        broadcast_mock.assert_called_once(), (
+            f"infra telemetry topic {topic!r} must broadcast to SSE "
+            f"without a user_id — it has no per-user payload")
+        _, kwargs = broadcast_mock.call_args
+        assert kwargs.get('user_id') is None
+
+
+@_pytest.mark.parametrize('topic', [
+    'agent.action.completed',     # carries agent_id + goal_id
+    'action_state.changed',
+    'inference.completed',
+    'memory.item_added',
+])
+def test_p3a_sse_still_refuses_agent_scoped_without_user_id(topic):
+    """Regression guard: agent/goal/memory-scoped topics carry an
+    agent_id/goal_id and on a multi-tenant node a global broadcast
+    would leak cross-user activity metadata.  They MUST stay refused
+    until the PUBLISHER stamps the owning user_id — do NOT whitelist
+    these as infra-global.  This test fails loudly if someone adds
+    'agent.'/'inference.'/'memory.' to _SSE_GLOBAL_PREFIXES."""
+    with _snapshot_modules('core.platform.events'):
+        if 'core.platform.events' in sys.modules:
+            del sys.modules['core.platform.events']
+        from core.platform import events
+        with patch.object(events, 'broadcast_sse_safe') as broadcast_mock:
+            bus = events.EventBus()
+            bus.emit(topic, {'agent_id': 'skill.local.x', 'goal_id': 'g1'})
+        broadcast_mock.assert_not_called(), (
+            f"agent-scoped topic {topic!r} must NOT broadcast without a "
+            f"user_id — whitelisting it would leak cross-user metadata "
+            f"on a multi-tenant node")
+
+
+def test_p3a_agent_scoped_broadcasts_when_user_id_present():
+    """The agent-scoped topics DO broadcast once the publisher stamps
+    the owning user_id (the correct fix path) — per-user routing."""
+    with _snapshot_modules('core.platform.events'):
+        if 'core.platform.events' in sys.modules:
+            del sys.modules['core.platform.events']
+        from core.platform import events
+        with patch.object(events, 'broadcast_sse_safe') as broadcast_mock:
+            bus = events.EventBus()
+            bus.emit('agent.action.completed', {
+                'agent_id': 'skill.local.x', 'goal_id': 'g1',
+                'user_id': 'owner-42',
+            })
+        broadcast_mock.assert_called_once()
+        _, kwargs = broadcast_mock.call_args
+        assert kwargs.get('user_id') == 'owner-42'
+
+
 # ─── P3b: mark_read stamps read_at + mark_dismissed exists ───────────
 def test_p3b_mark_read_sets_read_at():
     """Behavioural: stub the DB session + SQLAlchemy event listener,
