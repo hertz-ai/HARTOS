@@ -198,6 +198,12 @@ def _run_bootstrap(app, cfg: dict) -> None:
             _register_hive_blueprints(app)
             _init_database(cfg)
             _init_channel_adapters(app, cfg)
+            # IMPORTANT: spawn hevolveai BEFORE the agent-engine subsystem
+            # so the WorldModelBridge eager-init sees an HEVOLVEAI_API_URL
+            # already set in the parent env (the supervisor exports it).
+            # Otherwise the bridge locks itself into http_disabled=True
+            # and the WAMP 0x05 hivemind channel handler never attaches.
+            _init_hevolveai_subprocess(cfg)
             _init_agent_engine_subsystem(app)
             _init_livekit_supervisor(cfg)
             _init_whatsapp_supervisor(cfg)
@@ -481,10 +487,57 @@ def _init_channel_adapters(app, cfg: dict) -> None:
 # ─── Step 9: Agent engine ───────────────────────────────────────────────
 
 
+def _init_hevolveai_subprocess(cfg: dict) -> None:
+    """Spawn the HevolveAI API server as a managed subprocess.
+
+    Pairs with the WorldModelBridge eager-init in
+    ``_init_agent_engine_subsystem``: this function exports
+    ``HEVOLVEAI_API_URL`` and starts the child BEFORE the bridge is
+    constructed, so the bridge takes the HTTP path and attaches the
+    WAMP 0x05 hivemind channel handler at boot.
+
+    Lifecycle:
+      * Windows: child is bound to a Job Object with
+        ``KILL_ON_JOB_CLOSE`` so it dies when Nunba dies (clean exit,
+        Task Manager kill, or crash).
+      * POSIX: ``start_new_session`` + atexit terminate hook.
+
+    Resource governor accounting: the child's PID is registered via
+    ``ResourceGovernor.register_subprocess('hevolveai', pid)`` so the
+    HARTOS monitor surfaces it in stats.
+
+    Idempotent: subsequent calls return the same supervisor.  Disable
+    via ``HEVOLVE_SKIP_HEVOLVEAI_SPAWN=1`` (e.g. when HevolveAI is
+    hosted out-of-process on a different box).
+    """
+    try:
+        from integrations.agent_engine.hevolveai_supervisor import (
+            start_supervisor as _hevolveai_start)
+        info = _hevolveai_start()
+        if info.get('should_run', True) is False:
+            logger.info(
+                "hevolveai supervisor skipped: %s",
+                info.get('reason', 'opted out'))
+            return
+        logger.info(
+            "hevolveai supervisor started: port=%s job_object_bound=%s",
+            info.get('port'), info.get('job_object_bound'))
+    except Exception as e:
+        logger.warning(f"hevolveai subprocess init failed: {e}")
+
+
 def _init_agent_engine_subsystem(app) -> None:
     """Initialise the HARTOS agent engine — daemon thread, goal seeding,
     world model, baselines.  Idempotent inside ``init_agent_engine``
     itself (added 2026-04-28) so re-entry is harmless.
+
+    Eager-wakes the WorldModelBridge singleton at the end so the WAMP
+    ``hivemind`` 0x05 channel handler is attached AT BOOT instead of
+    only on first inbound message — fixes a chicken-and-egg deadlock
+    where Direction A (publish skill) needed the bridge attached, but
+    the bridge was lazy-initialised on Direction B (inbound). Without
+    eager-init, the bridge stays dormant on every Nunba boot because
+    no peer ever sends the first message.
     """
     try:
         from integrations.agent_engine import init_agent_engine
@@ -492,6 +545,26 @@ def _init_agent_engine_subsystem(app) -> None:
         logger.info("Agent engine initialised")
     except Exception as e:
         logger.warning(f"Agent engine init failed: {e}")
+
+    # Eager bridge wake-up. Construction is cheap (queues + stats);
+    # _init_in_process() tries to find the in-process HiveMind and
+    # falls back to HTTP-disabled mode if none is running — that's
+    # fine here, the bridge SINGLETON existing is what registers the
+    # WAMP 0x05 channel handler so federation traffic can flow.
+    # NOTE: if there's no in-process hevolveai agent, the bridge sits
+    # in "no-op" mode (HTTP disabled in bundled builds). Federation
+    # publishing only resumes once an IntegratedRealtimeAgent is alive
+    # in the same process — see the separate step-2 wiring task.
+    try:
+        from integrations.agent_engine.world_model_bridge import get_world_model_bridge
+        _bridge = get_world_model_bridge()
+        logger.info(
+            "WorldModelBridge eager-init done "
+            f"(in_process={getattr(_bridge, '_in_process', False)}, "
+            f"http_disabled={getattr(_bridge, '_http_disabled', True)})"
+        )
+    except Exception as e:
+        logger.warning(f"WorldModelBridge eager-init skipped: {e}")
 
 
 # ─── Step 8b: LiveKit SFU supervisor (regional/flat only) ────────────

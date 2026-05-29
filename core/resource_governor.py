@@ -511,6 +511,34 @@ class ResourceGovernor:
             'uptime_start': 0.0,
         }
 
+        # Managed subprocesses spawned by HARTOS (e.g. hevolveai server).
+        # Keyed by display name -> pid.  Visible in get_stats() so the
+        # monitor / dashboards account for the full HARTOS process tree
+        # instead of just the current process.
+        self._managed_subprocesses: dict = {}
+
+    def register_subprocess(self, name: str, pid: int) -> None:
+        """Track a child process owned by HARTOS so the monitor accounts
+        for it.  Called by subsystem supervisors (e.g. hevolveai) right
+        after spawn.  Idempotent — re-registering the same name updates
+        the pid (covers supervisor restart loops).
+        """
+        if not name or not isinstance(pid, int) or pid <= 0:
+            return
+        with self._lock:
+            self._managed_subprocesses[name] = pid
+
+    def unregister_subprocess(self, name: str, pid: int) -> None:
+        """Untrack a child process — called after it exits.  Guards on
+        pid match so a stale unregister after restart doesn't clobber
+        the fresh PID."""
+        if not name:
+            return
+        with self._lock:
+            cur = self._managed_subprocesses.get(name)
+            if cur == pid:
+                self._managed_subprocesses.pop(name, None)
+
     # ── Lifecycle ─────────────────────────────────────────────────
 
     def start(self, defer_memory_limit: bool = False) -> None:
@@ -650,6 +678,7 @@ class ResourceGovernor:
         """Return a copy of governor statistics for dashboards."""
         with self._lock:
             stats = dict(self._stats)
+            stats['managed_subprocesses'] = dict(self._managed_subprocesses)
         stats['mode'] = self._mode
         stats['throttle'] = self._calculate_throttle()
         stats['cpu_limit'] = self._cpu_limit

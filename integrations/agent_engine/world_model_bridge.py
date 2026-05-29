@@ -104,15 +104,18 @@ class WorldModelBridge:
         # Disable HTTP when there's no server to talk to.
         # If in-process failed AND no explicit HEVOLVEAI_API_URL was configured
         # (just the default localhost:8000), there's no point spamming HTTP.
-        # Bundled mode (NUNBA_BUNDLED) always disables — Nunba owns the lifecycle.
-        # Non-bundled with default URL also disables — no server was started.
+        # An EXPLICIT HEVOLVEAI_API_URL means an operator (typically the
+        # hevolveai_supervisor in bundled Nunba, or the user in dev) has
+        # promised a server is — or will shortly be — reachable; HTTP stays
+        # enabled even in bundled mode so the supervisor-spawned HevolveAI
+        # subprocess becomes the federation participant.
         if not self._in_process:
             _explicit_url = os.environ.get('HEVOLVEAI_API_URL', '')
-            if os.environ.get('NUNBA_BUNDLED') == '1' or not _explicit_url:
+            if not _explicit_url:
                 self._http_disabled = True
                 logger.info(
                     "[WorldModelBridge] Learning not available in-process, "
-                    "no explicit HEVOLVEAI_API_URL — HTTP disabled")
+                    "no explicit HEVOLVEAI_API_URL - HTTP disabled")
 
         # Periodic HevolveAI integrity watcher (Gap 1 fix)
         self._crawl_watcher = None
@@ -719,6 +722,15 @@ class WorldModelBridge:
                 self._cb_record_success()
                 with self._lock:
                     self._stats['total_flushed'] += 1
+                    _first_flush = self._stats['total_flushed'] == 1
+                # One-time log on first successful HTTP flush so operators
+                # see Direction A go live without grepping for tensorboard
+                # metrics.  Subsequent flushes are silent (info log fatigue).
+                if _first_flush:
+                    logger.info(
+                        "[WorldModelBridge] Direction A live: first HTTP "
+                        "flush to %s/v1/chat/completions succeeded",
+                        self._api_url)
             except requests.RequestException:
                 self._cb_record_failure()
             except Exception as e:
