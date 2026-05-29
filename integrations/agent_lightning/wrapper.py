@@ -195,15 +195,68 @@ class AgentLightningWrapper:
                     and 'Failed to parse tool call arguments' in _err_str
                 )
                 if _is_toolcall_parse_500:
+                    # A malformed-JSON tool call is almost always a
+                    # SAMPLING FLUKE — one bad token (unescaped quote,
+                    # emoji, mid-string truncation) in an otherwise-valid
+                    # structure.  Autogen agents sample at temp>0, so
+                    # simply re-running generate_reply re-samples and the
+                    # fluke usually clears.  Retry up to _TOOLCALL_500_RETRIES
+                    # times BEFORE giving up — this converts "tool call
+                    # always lost on a bad sample" into "tool call
+                    # recovered when it's a fluke (the common case)".
+                    _TOOLCALL_500_RETRIES = 2
+                    for _attempt in range(1, _TOOLCALL_500_RETRIES + 1):
+                        logger.warning(
+                            "[TOOLCALL-PARSE-500] malformed tool-call JSON "
+                            "(attempt %d/%d) — re-sampling generate_reply. "
+                            "Error: %s",
+                            _attempt, _TOOLCALL_500_RETRIES, _err_str[:200])
+                        try:
+                            _retry_result = original_func(*args, **kwargs)
+                            logger.info(
+                                "[TOOLCALL-PARSE-500] recovered on retry %d "
+                                "— re-sample produced parseable output",
+                                _attempt)
+                            return _retry_result
+                        except Exception as _retry_exc:
+                            _err_str = str(_retry_exc)
+                            if not ('500' in _err_str and
+                                    'Failed to parse tool call arguments'
+                                    in _err_str):
+                                # A DIFFERENT failure on retry — stop
+                                # retrying, fall through to report+fallback.
+                                break
+
+                    # Retries exhausted (or a different error surfaced).
+                    # Route to the canonical self-heal pipeline so a
+                    # SUSTAINED pattern of toolcall-500s on this agent's
+                    # model creates a self_heal goal (e.g. "enable
+                    # grammar-constrained / json_schema tool output on the
+                    # llama-server request for <model>").  Same helper
+                    # every subsystem uses — pattern_key
+                    # 'RuntimeError::llm.<agent_id>::generate_reply' lets
+                    # SelfHealingDispatcher cluster repeated occurrences.
+                    try:
+                        from exception_collector import report_subsystem_failure
+                        report_subsystem_failure(
+                            subsystem='llm',
+                            identifier=str(self.agent_id),
+                            exc=e,
+                            function='generate_reply',
+                            failure_kind='toolcall_json_parse_500',
+                            retries_exhausted=_TOOLCALL_500_RETRIES,
+                        )
+                    except Exception:
+                        pass
+
                     logger.error(
                         "[TOOLCALL-PARSE-500] llama.cpp rejected the "
-                        "model's tool-call output (malformed JSON in "
-                        "arguments field — likely unescaped quotes / "
+                        "model's tool-call output after %d retries "
+                        "(malformed JSON in arguments — unescaped quotes / "
                         "emojis / mid-string truncation).  Returning "
                         "graceful fallback string instead of propagating "
                         "the 500, to avoid lifecycle FSM churn.  Error: "
-                        f"{_err_str[:300]}"
-                    )
+                        "%s", _TOOLCALL_500_RETRIES, _err_str[:300])
                     return (
                         "I had trouble producing the structured response "
                         "for that — the underlying model emitted output "
