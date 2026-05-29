@@ -2496,6 +2496,42 @@ def _self_critique_and_enhance(input_text: str) -> str:
         return f"Self-critique unavailable: {str(e)}"
 
 
+# Single source of truth for the Create_Agent tool description.
+# Previously duplicated at lines ~4580 and ~5042 — a DRY violation
+# that meant fixing the trigger heuristic required two edits and
+# allowed the two copies to drift.
+#
+# The wording is intentionally restrictive (PERSISTENT + MULTI-STEP)
+# because the prior version triggered for any "create / build / set
+# up / deploy" verb — including code-generation requests like "write
+# a palindrome function" that should be answered inline by the chat
+# LLM, not routed into the create_recipe peer-review pipeline.  The
+# 2026-05-28 palindrome cycle (request_id c4b09d1f-…) is the
+# repro: 4 review rounds + 1 escalation = 10 thinking-events, then
+# the force-approved plan called execute_windows_or_android_command
+# 9 times trying to type a palindrome check into a terminal.
+_CREATE_AGENT_TOOL_DESCRIPTION = (
+    "Use this tool ONLY when the user wants a PERSISTENT MULTI-STEP agent "
+    "that runs over time or across messages — e.g. 'set up a daily news "
+    "summarizer', 'create a trading bot that posts updates', 'build an "
+    "agent that monitors my inbox and replies to customer questions'.\n\n"
+    "Do NOT use this tool for any of:\n"
+    "  - One-shot code generation: 'write a palindrome function', "
+    "    'write a quicksort', 'show me a Fibonacci implementation'. "
+    "    Just write the code in your chat reply.\n"
+    "  - Single questions / explanations: 'what is X', 'explain Y', "
+    "    'how does Z work'. Answer directly.\n"
+    "  - Math / logic computations: palindrome checks, factorials, "
+    "    string reversal, search algorithms — compute the answer "
+    "    in your response, don't spawn an agent.\n"
+    "  - Direct documentation, refactoring, code review of pasted text.\n\n"
+    "Input should be the description of what the persistent agent should do.\n"
+    "If the user uses keywords like 'automatically', 'autonomous', "
+    "'do it for me', 'handle it', 'just create it', include them in your "
+    "input so the downstream pipeline runs in autonomous mode."
+)
+
+
 def _handle_create_agent_tool(input_text):
     """Tool handler: LLM decided user wants to create an agent.
 
@@ -4579,15 +4615,7 @@ def get_tools(req_tool, is_first: bool = False):
             labeled_tool(
                 name="Create_Agent",
                 func=_handle_create_agent_tool,
-                description=(
-                    "Use this tool when the user wants to create, build, set up, train, or deploy "
-                    "a new AI agent, assistant, bot, or automated workflow. "
-                    "Input should be the description of what the agent should do. "
-                    "Do NOT use this tool if the user is just asking ABOUT agents or discussing agents in general. "
-                    "Only use when the user explicitly wants a NEW agent created. "
-                    "If the user also says words like 'automatically', 'autonomous', 'do it for me', "
-                    "'handle it', 'just create it', include those keywords in your input."
-                ),
+                description=_CREATE_AGENT_TOOL_DESCRIPTION,
                 ui_label='Starting agent creation…',
             ),
             labeled_tool(
@@ -5040,15 +5068,7 @@ def get_tools(req_tool, is_first: bool = False):
             Tool(
                 name="Create_Agent",
                 func=_handle_create_agent_tool,
-                description=(
-                    "Use this tool when the user wants to create, build, set up, train, or deploy "
-                    "a new AI agent, assistant, bot, or automated workflow. "
-                    "Input should be the description of what the agent should do. "
-                    "Do NOT use this tool if the user is just asking ABOUT agents or discussing agents in general. "
-                    "Only use when the user explicitly wants a NEW agent created. "
-                    "If the user also says words like 'automatically', 'autonomous', 'do it for me', "
-                    "'handle it', 'just create it', include those keywords in your input."
-                ),
+                description=_CREATE_AGENT_TOOL_DESCRIPTION,
             ),
             Tool(
                 name="Request_Resource",
@@ -7470,12 +7490,24 @@ def _review_proposed_plan(plan, max_rounds_remaining):
         review_prompt = (
             "You are HART OS StatusVerifier reviewing an agent plan.\n"
             "Quality gates:\n"
-            "  1. flows[0].actions has >= 5 atomic steps for non-trivial tasks.\n"
-            "  2. Every action mentioning browser/click/type/screenshot/post/"
-            "open/navigate MUST invoke 'execute_windows_or_android_command'.\n"
+            "  1. flows[0].actions has AT LEAST 5 atomic steps for non-trivial tasks.\n"
+            "     There is NO MAXIMUM — complex tasks legitimately have many steps.\n"
+            "     A plan with 12 or 20 atomic steps is FINE if each step is a single\n"
+            "     tool call.  ONLY reject for 'too few steps', NEVER for 'too many'.\n"
+            "  2. GUI / desktop actions ONLY: actions mentioning browser/click/\n"
+            "     screenshot/navigate-url MUST invoke 'execute_windows_or_android_command'.\n"
+            "     Words like 'type', 'input', 'post', 'open' alone do NOT require\n"
+            "     this tool — chat-side user input uses send_message_to_user; code\n"
+            "     generation is inline in the response.\n"
             "  3. No banned phrases: 'ask the user', 'TODO', 'etc.', '...'\n"
             "  4. Steps in logical order (open before click, login before post).\n"
             "  5. Tool names match the registered catalog.\n\n"
+            "IMPORTANT: the plan JSON has already been validated and sanitized\n"
+            "upstream by helper.retrieve_json (4-tier fallback: json_repair package,\n"
+            "ast.literal_eval, regex, remote fix_json HTTP).  Do NOT report JSON\n"
+            "formatting issues — focus on plan CONTENT quality only.  If you think\n"
+            "you see a malformed brace, stray quote, or syntax error, assume it's\n"
+            "a serialization artifact and ignore it.\n\n"
             "Plan to review (JSON):\n"
             + json.dumps(plan, indent=2)[:6000]  # cap to keep ctx small
             + "\n\nRespond with ONLY a JSON object:\n"
@@ -7552,6 +7584,17 @@ def _autonomous_gather_info(user_id, description, prompt_id):
     # Auto-review + refinement loop (no human in path)
     review_rounds = 0
     MAX_REVIEW_ROUNDS = 3
+    # Oscillation detection (#palindrome-cycle-2026-05-28): the
+    # log evidence from request_id c4b09d1f-… showed the planner
+    # producing action counts of 12 → 2 → 10 → 9 across 4 rounds —
+    # the reviewer's contradictory feedback (round 1 said "12
+    # exceeds 5-step LIMIT", round 2 said "2 violates >= 5
+    # REQUIREMENT") was yo-yoing the planner instead of converging.
+    # When the action count swings by more than _OSC_DELTA between
+    # consecutive proposed_plans, the reviewer is not converging;
+    # burning more rounds wastes ~10s each.  Escalate immediately.
+    _prev_action_count = None
+    _OSC_DELTA = 3
     while review_rounds < MAX_REVIEW_ROUNDS:
         try:
             new_response = response.replace('true', 'True').replace('false', 'False')
@@ -7573,6 +7616,36 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 break
 
             if _status == 'proposed_plan':
+                # Oscillation guard — must run BEFORE the reviewer is
+                # called for this round.  Cheap dict-walk on the
+                # already-parsed plan.
+                try:
+                    _flows = parsed.get('flows') or []
+                    _actions = (_flows[0].get('actions') if _flows else []) or []
+                    _action_count = len(_actions)
+                except Exception:
+                    _action_count = None
+                if (_prev_action_count is not None and _action_count is not None
+                        and abs(_action_count - _prev_action_count) > _OSC_DELTA):
+                    app.logger.warning(
+                        f'Plan oscillation detected (round {review_rounds}): '
+                        f'action_count {_prev_action_count} -> {_action_count} '
+                        f'(delta {abs(_action_count - _prev_action_count)} > '
+                        f'threshold {_OSC_DELTA}). Reviewer is yo-yoing the '
+                        f'planner. Force-approving the most recent plan to '
+                        f'stop the cycle.'
+                    )
+                    try:
+                        response = gather_info(
+                            user_id,
+                            'approved (oscillation-detected after '
+                            f'{review_rounds + 1} rounds)',
+                            prompt_id, autonomous=True)
+                    except Exception as _osc_err:
+                        app.logger.error(
+                            f'Oscillation force-approve failed: {_osc_err}')
+                    break
+                _prev_action_count = _action_count
                 # Stage plan for audit + run auto-review
                 parsed['prompt_id'] = prompt_id
                 parsed['creator_user_id'] = user_id
