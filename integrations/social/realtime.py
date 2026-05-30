@@ -11,6 +11,7 @@ Topic routing (MessageBus TOPIC_MAP):
 """
 import logging
 import json
+import os
 
 logger = logging.getLogger('hevolve_social')
 
@@ -263,6 +264,79 @@ def _stamp_event(safe: dict, event: str) -> dict:
     return safe
 
 
+# ─── Outbound channel bridge (Phase 1 omni-channel, 2026-05-30) ──────
+#
+# A new post in a broadcast-designated community fans OUT to external
+# channels (Discord/Telegram/Slack/…) via the canonical
+# announcement_broadcaster — the same fire-and-forget path hive-proof
+# announcements already use (no parallel path).  This is the "Nunba
+# content made public on other channels to bring in new users" leg.
+#
+# Safe + private by construction:
+#   - The payload is ALREADY PII-sanitized here (`safe`), and the
+#     external text uses only title/content/link — never the author —
+#     so emails/phones never leave the box.
+#   - DOUBLE-GATED: (1) the community must be broadcast-enabled, AND
+#     (2) broadcast_announcement only sends when an operator has set
+#     `announce_chat_id` on ≥1 channel.  Nothing leaves until BOTH hold.
+#   - Only event == 'post.new' (edits/deletes never re-broadcast).
+#   - Best-effort: a channel error never blocks the internal fan-out.
+#
+# HEVOLVE_BROADCAST_COMMUNITIES (comma list, or '*' for all) selects
+# which communities broadcast.  Default = the public flywheel
+# communities only; personal/user communities stay internal unless the
+# operator opts them in.
+_DEFAULT_BROADCAST_COMMUNITIES = 'announcements,platform,developers,dev_community'
+_broadcast_communities_cache = None
+
+
+def _broadcast_communities() -> set:
+    global _broadcast_communities_cache
+    if _broadcast_communities_cache is None:
+        raw = os.environ.get('HEVOLVE_BROADCAST_COMMUNITIES',
+                             _DEFAULT_BROADCAST_COMMUNITIES)
+        _broadcast_communities_cache = {
+            c.strip().lower() for c in raw.split(',') if c.strip()}
+    return _broadcast_communities_cache
+
+
+def _community_broadcasts_externally(community_name) -> bool:
+    if not community_name:
+        return False
+    allow = _broadcast_communities()
+    return '*' in allow or str(community_name).lower() in allow
+
+
+def _format_post_for_channel(safe: dict) -> str:
+    """Compact external-channel message from a sanitized post dict:
+    title + trimmed body + link.  Never includes the author (PII)."""
+    title = (safe.get('title') or '').strip()
+    body = (safe.get('content') or '').strip()
+    if len(body) > 500:
+        body = body[:500].rstrip() + '…'
+    link = (safe.get('link_url') or '').strip()
+    parts = [p for p in (title, body, link) if p]
+    return '\n\n'.join(parts) or '(new post)'
+
+
+def _maybe_broadcast_external(safe: dict, community_name) -> None:
+    """Fan a new post out to external channels iff its community is
+    broadcast-enabled.  Best-effort; never raises into the fan-out."""
+    try:
+        if not _community_broadcasts_externally(community_name):
+            return
+        text = _format_post_for_channel(safe)
+        from integrations.channels.announcement_broadcaster import (
+            broadcast_announcement)
+        n = broadcast_announcement(text)
+        if n:
+            logger.info(
+                "post.new in '%s' fanned out to %d external channel "
+                "target(s)", community_name, n)
+    except Exception as e:
+        logger.debug("external post broadcast skipped: %s", e)
+
+
 def _publish_post_event(event: str, post_dict: dict,
                         community_name: str = None) -> None:
     """One fan-out for every post lifecycle event.
@@ -273,6 +347,10 @@ def _publish_post_event(event: str, post_dict: dict,
         data = dict(safe)
         data['community_id'] = community_name
         publish_event('community.message', data)
+    # Outbound bridge: new posts in broadcast-enabled communities also
+    # go public on external channels (Discord/Telegram/Slack/…).
+    if event == 'post.new':
+        _maybe_broadcast_external(safe, community_name)
 
 
 def _publish_comment_event(event: str, comment_dict: dict,
