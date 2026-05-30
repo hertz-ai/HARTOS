@@ -125,6 +125,27 @@ class ChannelConfig:
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
+# ─── Inbound feed ingestion gate (Phase 1 omni-channel, 2026-05-30) ──
+#
+# Which channels' GROUP/public posts get mirrored into the Nunba social
+# feed ("posts from other channels auto-created in Nunba").  Controlled
+# by HEVOLVE_INGEST_CHANNELS (comma list of channel types, or '*' for
+# all).  Default EMPTY = ingest nothing — the operator opts in per
+# channel.  Combined with the hard is_group gate below, private 1:1 DMs
+# are NEVER mirrored into the public feed regardless of this setting.
+_ingest_channels_cache = None
+
+
+def _channels_opted_into_ingest() -> set:
+    global _ingest_channels_cache
+    if _ingest_channels_cache is None:
+        import os
+        raw = os.environ.get('HEVOLVE_INGEST_CHANNELS', '')
+        _ingest_channels_cache = {
+            c.strip().lower() for c in raw.split(',') if c.strip()}
+    return _ingest_channels_cache
+
+
 class ChannelAdapter(ABC):
     """
     Base class for all channel adapters.
@@ -230,6 +251,51 @@ class ChannelAdapter(ABC):
                     await result
             except Exception as e:
                 logger.error(f"Error in message handler: {e}")
+        # Inbound bridge: mirror opted-in channels' GROUP posts into the
+        # Nunba social feed.  Independent of the agent handlers above —
+        # an ingest failure must not affect the agent reply, and vice
+        # versa.
+        self._maybe_ingest_to_feed(message)
+
+    def _maybe_ingest_to_feed(self, message: Message) -> None:
+        """Mirror an inbound channel post into the Nunba social feed via
+        the canonical cross_channel.ingest_channel_message (which dedups
+        by source_channel+source_message_id).  Triple-gated for privacy:
+          1. is_group — NEVER ingest a private 1:1 DM into the public feed
+          2. the channel must be opted in (HEVOLVE_INGEST_CHANNELS)
+          3. there must be content
+        Runs on a daemon thread because ingest does synchronous DB I/O
+        that must not block this adapter's async event loop.  Best-effort.
+        """
+        try:
+            if not getattr(message, 'is_group', False):
+                return  # privacy: DMs are never mirrored to the public feed
+            allow = _channels_opted_into_ingest()
+            chan = (message.channel or '').lower()
+            if '*' not in allow and chan not in allow:
+                return
+            content = message.content
+            if not content:
+                return
+            media_urls = [getattr(m, 'url', None) for m in (message.media or [])]
+            media_urls = [u for u in media_urls if u] or None
+            sender = message.sender_name or message.sender_id
+
+            def _run():
+                try:
+                    from integrations.social.cross_channel import (
+                        ingest_channel_message)
+                    ingest_channel_message(
+                        message.channel, sender, content,
+                        message_id=message.id, media_urls=media_urls)
+                except Exception as e:
+                    logger.debug("inbound feed ingest skipped: %s", e)
+
+            import threading
+            threading.Thread(
+                target=_run, daemon=True, name='channel-feed-ingest').start()
+        except Exception as e:
+            logger.debug("inbound ingest gate error: %s", e)
 
     def get_status(self) -> ChannelStatus:
         """Get current connection status."""
