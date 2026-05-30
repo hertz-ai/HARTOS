@@ -694,17 +694,19 @@ class AgentDaemon:
         # Evangelist, App Marketplace Auto-Promoter, …) actually fire.
         _override_active = False
         if should_yield_to_user():
+            from .dispatch import get_last_yield_reason
+            _yreason = get_last_yield_reason()
             _starved_for = time.time() - self._last_tick_completed_at
             if _starved_for < self._starvation_s:
                 logger.debug(
-                    "Agent daemon: yielding (user active or system pressure)")
+                    "Agent daemon: yielding (reason=%s)", _yreason)
                 return
             _override_active = True
             logger.warning(
                 "Agent daemon: STARVATION OVERRIDE — yield gate has blocked "
-                "for %.0fs (>%ds threshold); forcing one tick to drain "
-                "queue.  Set HEVOLVE_AGENT_STARVATION_S to tune.",
-                _starved_for, self._starvation_s)
+                "on '%s' for %.0fs (>%ds threshold); forcing one tick to "
+                "drain queue.  Set HEVOLVE_AGENT_STARVATION_S to tune.",
+                _yreason, _starved_for, self._starvation_s)
         # _throttle is consumed lower down for soft scaling decisions —
         # re-read after the hard yield gate so we still have a value.
         # Under starvation override we ignore the throttle multiplier on

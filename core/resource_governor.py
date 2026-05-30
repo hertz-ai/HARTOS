@@ -82,6 +82,23 @@ MODE_ACTIVE = 'active'
 MODE_IDLE = 'idle'
 MODE_SLEEP = 'sleep'
 
+# ── Load-based backoff thresholds ──
+# When the user is idle we still back off to ACTIVE if ANOTHER app is
+# loading the box (a render, a compile, a game) — but NOT for HARTOS's
+# own idle-compute work.  The decision uses EXTERNAL cpu (total minus
+# HARTOS's own process tree), so the flywheel/LLM raising CPU does not
+# make the governor throttle the very work it exists to run.
+#
+# Why this exists (2026-05-30 self-defeat loop): the monitor read TOTAL
+# system CPU, so when the user stepped away and the daemon's own LLM
+# work pushed CPU past LOAD_BACKOFF_CPU, the governor flipped to ACTIVE
+# (throttle 0.05) and should_yield_to_user() blocked every tick — the
+# flywheel halted the moment it started.  Measuring external CPU keeps
+# the "be polite to other apps" intent while letting an idle-compute
+# node actually contribute the spare cycles it was opted in to give.
+LOAD_BACKOFF_CPU = 0.85
+LOAD_BACKOFF_MEM = 0.90
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # ResourceEnforcer — hard OS-level process caps
@@ -517,6 +534,26 @@ class ResourceGovernor:
         # instead of just the current process.
         self._managed_subprocesses: dict = {}
 
+        # CPU attribution cache (refreshed once per monitor tick).  Splits
+        # total system CPU into HARTOS's own process tree vs everything
+        # else so load-based backoff reacts to OTHER apps, not our own
+        # idle-compute work.  get_throttle() reads these cached floats so
+        # the per-call hot path never walks the process tree.
+        self._own_proc_cache: dict = {}   # pid -> psutil.Process (kept across ticks for cpu_percent baseline)
+        self._cached_total_cpu: float = 0.0
+        self._cached_own_cpu: float = 0.0
+        self._cached_external_cpu: float = 0.0
+        # Prime the main-process cpu_percent baseline so the first
+        # attribution tick returns a real own-CPU value (psutil's first
+        # cpu_percent(None) on a fresh handle always returns 0.0).
+        try:
+            import psutil as _ps
+            _main = _ps.Process(os.getpid())
+            _main.cpu_percent(None)
+            self._own_proc_cache[os.getpid()] = _main
+        except Exception:
+            pass
+
     def register_subprocess(self, name: str, pid: int) -> None:
         """Track a child process owned by HARTOS so the monitor accounts
         for it.  Called by subsystem supervisors (e.g. hevolveai) right
@@ -683,6 +720,11 @@ class ResourceGovernor:
         stats['throttle'] = self._calculate_throttle()
         stats['cpu_limit'] = self._cpu_limit
         stats['gpu_allowed'] = self._gpu_allowed
+        # CPU attribution (why the mode/throttle is what it is): total vs
+        # HARTOS's own tree vs external.  external is what drives backoff.
+        stats['cpu_total'] = round(self._cached_total_cpu, 3)
+        stats['cpu_own'] = round(self._cached_own_cpu, 3)
+        stats['cpu_external'] = round(self._cached_external_cpu, 3)
         return stats
 
     # ── Mode Transitions ──────────────────────────────────────────
@@ -737,6 +779,26 @@ class ResourceGovernor:
         except Exception:
             pass
 
+    def _target_mode_for(self, user_idle: bool, ext_cpu: float, mem: float,
+                         battery_level: float, on_battery: bool) -> str:
+        """Pure mode decision from sampled signals — no side effects, so
+        it is directly unit-testable.
+
+        ``ext_cpu`` is EXTERNAL cpu (total minus HARTOS's own process
+        tree).  Using external rather than total CPU here is the
+        2026-05-30 self-defeat fix: HARTOS's own idle-compute work no
+        longer counts as "system heavily loaded", so the flywheel can run
+        when the user is away instead of throttling itself the instant it
+        starts.  We still go ACTIVE when ANOTHER app loads the box.
+        """
+        if on_battery and battery_level < BATTERY_SLEEP_THRESHOLD:
+            return MODE_SLEEP            # critical battery → suspend
+        if not user_idle:
+            return MODE_ACTIVE           # user at the keyboard → yield to them
+        if ext_cpu > LOAD_BACKOFF_CPU or mem > LOAD_BACKOFF_MEM:
+            return MODE_ACTIVE           # OTHER apps / memory pressure → be polite
+        return MODE_IDLE                 # user away, only our own work (if any)
+
     # ── Monitor Loop ──────────────────────────────────────────────
 
     def _monitor_loop(self) -> None:
@@ -755,29 +817,22 @@ class ResourceGovernor:
             except Exception:
                 pass
             try:
-                cpu = self._get_cpu_usage()
+                # Refresh CPU attribution once per tick (total / own /
+                # external) so this decision AND get_throttle() share one
+                # process-tree walk via the cache.
+                self._refresh_cpu_attribution()
                 mem = self._get_memory_pressure()
                 user_idle = self._detect_user_idle()
                 battery_level, on_battery = self._get_battery_status()
+                ext_cpu = self._cached_external_cpu
 
-                # Decision tree
-                if on_battery and battery_level < BATTERY_SLEEP_THRESHOLD:
-                    # Critical battery: force sleep
-                    self._transition_to(MODE_SLEEP)
-                elif not user_idle:
-                    # User is active
-                    self._transition_to(MODE_ACTIVE)
-                elif cpu > 0.85 or mem > 0.90:
-                    # System is heavily loaded even though user is idle
-                    # (e.g., background renders, compiles) — stay conservative
-                    self._transition_to(MODE_ACTIVE)
-                elif on_battery and battery_level < BATTERY_THROTTLE_THRESHOLD:
-                    # Low battery: allow idle work but keep it light
-                    self._transition_to(MODE_IDLE)
-                    self._cpu_limit = IDLE_CPU_LIMIT * 0.5  # half the idle budget
-                else:
-                    # User idle, system not overloaded, power is fine
-                    self._transition_to(MODE_IDLE)
+                target = self._target_mode_for(
+                    user_idle, ext_cpu, mem, battery_level, on_battery)
+                self._transition_to(target)
+                # Low-battery-but-not-critical: stay IDLE but on half budget.
+                if (target == MODE_IDLE and on_battery
+                        and battery_level < BATTERY_THROTTLE_THRESHOLD):
+                    self._cpu_limit = IDLE_CPU_LIMIT * 0.5
 
                 # Update GPU allowance based on VRAM availability
                 if self._mode == MODE_IDLE:
@@ -944,6 +999,103 @@ class ResourceGovernor:
         # Windows fallback without psutil: assume moderate usage
         return 0.3
 
+    def _get_own_cpu_usage(self) -> float:
+        """Fraction (0..1 of total capacity) consumed by HARTOS's OWN
+        process tree: this process + its children + every registered
+        managed subprocess (llama-server, hevolveai, …) + their children.
+
+        Used to compute EXTERNAL cpu for load-based backoff so the
+        governor never treats HARTOS's own idle-compute work as a reason
+        to throttle itself (the 2026-05-30 self-defeat loop).  Process
+        handles are cached across ticks because psutil's
+        ``cpu_percent(None)`` needs a prior call to establish its delta
+        baseline.  Bounded walk (own tree only) — never a full
+        ``process_iter``.  Returns 0.0 when psutil is unavailable, which
+        makes external==total (conservative: backs off as before).
+        """
+        psutil = _try_import_psutil()
+        if psutil is None:
+            return 0.0
+        try:
+            ncpu = psutil.cpu_count() or 1
+        except Exception:
+            ncpu = 1
+
+        own_pids = set()
+        # Main process tree.
+        try:
+            main = self._own_proc_cache.get(os.getpid())
+            if main is None:
+                main = psutil.Process(os.getpid())
+                main.cpu_percent(None)  # prime baseline
+                self._own_proc_cache[os.getpid()] = main
+            own_pids.add(os.getpid())
+            for child in main.children(recursive=True):
+                own_pids.add(child.pid)
+        except Exception:
+            pass
+        # Registered managed-subprocess trees (llama-server, hevolveai…).
+        with self._lock:
+            managed = list(self._managed_subprocesses.values())
+        for pid in managed:
+            try:
+                proc = self._own_proc_cache.get(pid)
+                if proc is None:
+                    proc = psutil.Process(pid)
+                    proc.cpu_percent(None)  # prime baseline
+                    self._own_proc_cache[pid] = proc
+                own_pids.add(pid)
+                for child in proc.children(recursive=True):
+                    own_pids.add(child.pid)
+            except Exception:
+                self._own_proc_cache.pop(pid, None)
+
+        total_pct = 0.0
+        for pid in own_pids:
+            proc = self._own_proc_cache.get(pid)
+            if proc is None:
+                try:
+                    proc = psutil.Process(pid)
+                    proc.cpu_percent(None)  # prime; contributes 0 this tick
+                    self._own_proc_cache[pid] = proc
+                    continue
+                except Exception:
+                    continue
+            try:
+                total_pct += proc.cpu_percent(None)  # since last call (~tick)
+            except Exception:
+                self._own_proc_cache.pop(pid, None)
+        # Prune handles for pids no longer in our tree (bounds cache size).
+        for pid in list(self._own_proc_cache.keys()):
+            if pid not in own_pids and pid != os.getpid():
+                self._own_proc_cache.pop(pid, None)
+
+        # Process.cpu_percent() sums across cores (can exceed 100); divide
+        # by core count to get the same 0..1 fraction _get_cpu_usage uses.
+        own_frac = (total_pct / 100.0) / ncpu
+        return max(0.0, min(1.0, own_frac))
+
+    def _refresh_cpu_attribution(self) -> None:
+        """Refresh cached total / own / external CPU.  Called once per
+        monitor tick so ``get_throttle()`` reads cheap cached floats
+        instead of walking the process tree on every call."""
+        total = self._get_cpu_usage()
+        own = self._get_own_cpu_usage()
+        self._cached_total_cpu = total
+        self._cached_own_cpu = own
+        self._cached_external_cpu = max(0.0, total - own)
+
+    def _external_cpu_for_throttle(self) -> float:
+        """External (non-HARTOS) CPU fraction for throttle scaling.
+
+        Falls back to total CPU when attribution hasn't run yet (governor
+        not started / first tick) so the pre-start default stays
+        conservative rather than optimistically 0.
+        """
+        if self._cached_total_cpu > 0.0:
+            return self._cached_external_cpu
+        return self._get_cpu_usage()
+
     def _get_memory_pressure(self) -> float:
         """Get memory pressure as a float 0.0 to 1.0.
 
@@ -1082,8 +1234,11 @@ class ResourceGovernor:
         if mode == MODE_ACTIVE:
             return ACTIVE_CPU_LIMIT  # 0.05
 
-        # IDLE mode — scale based on current resource usage
-        cpu = self._get_cpu_usage()
+        # IDLE mode — scale based on current resource usage.  Use EXTERNAL
+        # cpu (total - HARTOS's own tree): scaling on total here would make
+        # the daemon's own work drop its own throttle below should_yield's
+        # 0.3 gate, halting the flywheel it just started (2026-05-30 loop).
+        cpu = self._external_cpu_for_throttle()
         mem = self._get_memory_pressure()
 
         throttle = 1.0

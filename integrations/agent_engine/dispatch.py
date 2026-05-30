@@ -119,6 +119,41 @@ _USER_CHAT_COOLDOWN = 600  # 10 min — CREATE pipeline can take this long
 _active_create_sessions: int = 0  # count of in-flight CREATE requests
 _create_lock = threading.Lock()
 
+# Governor throttle below this → the daemon yields (gate reason #3).
+_GATE_THROTTLE_FLOOR = 0.3
+# The reason should_yield_to_user() last returned True, or None when it
+# last returned False.  Exposed so the daemon log + status probes can say
+# WHICH of the gate's reasons is blocking.  Why: 2026-05-29/30 cost ~3
+# days of guessing because the gate was a silent black box — it yielded
+# for one of four reasons and logged none of them, so the fix (18e59c0)
+# patched the wrong reason.  Never let the gate be silent again.
+_last_yield_reason = None
+
+
+def get_last_yield_reason():
+    """Return the reason should_yield_to_user() last blocked on, or None
+    when the gate is currently open.  One of: 'user_active',
+    'create_in_flight', 'model_pressure', 'governor_throttle'."""
+    return _last_yield_reason
+
+
+def _note_yield_reason(reason) -> None:
+    """Record the current yield reason; log at INFO only on TRANSITION so
+    there's a clean trail ('yield gate CLOSED: governor_throttle' →
+    'yield gate OPEN') with no per-tick spam."""
+    global _last_yield_reason
+    if reason == _last_yield_reason:
+        return
+    prev = _last_yield_reason
+    _last_yield_reason = reason
+    try:
+        if reason is None:
+            logger.info("yield gate OPEN (was %s) — daemons may run normal path", prev)
+        else:
+            logger.info("yield gate CLOSED: %s (was %s)", reason, prev)
+    except Exception:
+        pass
+
 
 def mark_user_chat_activity():
     """Call on every GENUINE user /chat request (including user-initiated
@@ -221,27 +256,37 @@ def should_yield_to_user() -> bool:
     yield reason (e.g. battery-saver mode, network-pressure)
     means editing exactly this function — no per-daemon copy-paste.
     """
+    reason = None
+    # Reason #1 — user recently active (is_user_recently_active stays the
+    # single source; we only LABEL which sub-condition fired).
     try:
         if is_user_recently_active():
-            return True
+            reason = ('create_in_flight' if _active_create_sessions > 0
+                      else 'user_active')
     except Exception:
         pass
-    try:
-        from integrations.service_tools.model_lifecycle import (
-            get_model_lifecycle_manager)
-        _pressure = get_model_lifecycle_manager().get_system_pressure()
-        if _pressure.get('throttle_factor', 1.0) < 0.1:
-            return True
-    except Exception:
-        pass
-    try:
-        from core.resource_governor import get_governor
-        _gov = get_governor()
-        if _gov is not None and _gov.get_throttle() < 0.3:
-            return True
-    except Exception:
-        pass
-    return False
+    # Reason #2 — LLM throttle collapsed under VRAM/CPU pressure.
+    if reason is None:
+        try:
+            from integrations.service_tools.model_lifecycle import (
+                get_model_lifecycle_manager)
+            _pressure = get_model_lifecycle_manager().get_system_pressure()
+            if _pressure.get('throttle_factor', 1.0) < 0.1:
+                reason = 'model_pressure'
+        except Exception:
+            pass
+    # Reason #3 — generic resource-governor throttle (now driven by
+    # EXTERNAL cpu, so our OWN idle-compute work no longer trips this).
+    if reason is None:
+        try:
+            from core.resource_governor import get_governor
+            _gov = get_governor()
+            if _gov is not None and _gov.get_throttle() < _GATE_THROTTLE_FLOOR:
+                reason = 'governor_throttle'
+        except Exception:
+            pass
+    _note_yield_reason(reason)
+    return reason is not None
 
 
 def _notify_watchdog_llm_start():

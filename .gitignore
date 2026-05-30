@@ -101,6 +101,8 @@ simplemem_db/
 *.db-journal
 .trueflow/
 .agent_ledger/
+data/          # episodic-memory / reasoning-trace runtime DBs
+runs/          # tensorboard tfevents from agent runs
 deploy/kong/*.json
 .pytest_cache/
 .secrets.baseline
