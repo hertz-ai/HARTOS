@@ -543,6 +543,7 @@ class ResourceGovernor:
         self._cached_total_cpu: float = 0.0
         self._cached_own_cpu: float = 0.0
         self._cached_external_cpu: float = 0.0
+        self._cached_llm_pid = None       # llama-server pid, resolved by port (re-resolved when stale)
         # Prime the main-process cpu_percent baseline so the first
         # attribution tick returns a real own-CPU value (psutil's first
         # cpu_percent(None) on a fresh handle always returns 0.0).
@@ -1034,9 +1035,19 @@ class ResourceGovernor:
                 own_pids.add(child.pid)
         except Exception:
             pass
-        # Registered managed-subprocess trees (llama-server, hevolveai…).
+        # Registered managed-subprocess trees (hevolveai…) PLUS the
+        # llama-server resolved by port.  llama-server is NOT spawned by
+        # HARTOS (it's a configured endpoint) so it's never
+        # register_subprocess'd — but the agent daemon's inference IS
+        # HARTOS's own work.  Without counting it as own, its inference CPU
+        # reads as a foreign app and trips both the governor backoff AND
+        # model_lifecycle pressure → the yield gate flaps and no goal ever
+        # completes a tick (2026-05-31 idle-hour: 0 executions).
         with self._lock:
             managed = list(self._managed_subprocesses.values())
+        _llm_pid = self._resolve_llm_server_pid()
+        if _llm_pid and _llm_pid not in managed:
+            managed.append(_llm_pid)
         for pid in managed:
             try:
                 proc = self._own_proc_cache.get(pid)
@@ -1095,6 +1106,66 @@ class ResourceGovernor:
         if self._cached_total_cpu > 0.0:
             return self._cached_external_cpu
         return self._get_cpu_usage()
+
+    def get_external_cpu_fraction(self):
+        """External (non-HARTOS) CPU fraction 0..1 — the SINGLE source other
+        subsystems should consult instead of raw ``psutil.cpu_percent`` so
+        HARTOS's own LLM/daemon work is excluded from "is the system
+        overloaded" decisions (e.g. ``model_lifecycle._calculate_throttle_
+        factor`` → the model_pressure yield-gate reason).  Returns ``None``
+        before the first monitor tick has populated the cache — callers
+        must fall back to total CPU in that window.
+        """
+        if self._cached_total_cpu > 0.0:
+            return self._cached_external_cpu
+        return None
+
+    def _resolve_llm_server_pid(self):
+        """PID of the local LLM server (llama-server), resolved by the TCP
+        port it listens on.  HARTOS does not spawn llama-server, so it's
+        never ``register_subprocess``'d — this is how its CPU gets
+        attributed to HARTOS's own work.  Cached: re-resolves only when the
+        cached pid has exited (the per-tick fast path is a cheap
+        ``pid_exists``).  Returns ``None`` when psutil is unavailable or no
+        listener is found (degrades to "llama counts as external", i.e. the
+        pre-fix conservative behaviour)."""
+        psutil = _try_import_psutil()
+        if psutil is None:
+            return None
+        cached = self._cached_llm_pid
+        if cached is not None:
+            try:
+                if psutil.pid_exists(cached):
+                    return cached
+            except Exception:
+                pass
+            self._cached_llm_pid = None
+            self._own_proc_cache.pop(cached, None)
+        # Resolve candidate LLM ports (registry + configured URL + defaults).
+        ports = set()
+        try:
+            from core.port_registry import get_port
+            ports.add(int(get_port('llm')))
+        except Exception:
+            pass
+        try:
+            from core.port_registry import get_local_llm_url
+            import re
+            m = re.search(r':(\d+)', get_local_llm_url() or '')
+            if m:
+                ports.add(int(m.group(1)))
+        except Exception:
+            pass
+        ports.update((8082, 8080))  # common llama-server defaults
+        try:
+            for c in psutil.net_connections(kind='inet'):
+                if (c.status == 'LISTEN' and c.laddr
+                        and c.laddr.port in ports and c.pid):
+                    self._cached_llm_pid = c.pid
+                    return c.pid
+        except Exception:
+            pass
+        return None
 
     def _get_memory_pressure(self) -> float:
         """Get memory pressure as a float 0.0 to 1.0.

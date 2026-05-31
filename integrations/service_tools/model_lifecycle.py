@@ -2240,10 +2240,27 @@ class ModelLifecycleManager:
         """
         factor = 1.0
 
-        # CPU pressure — use granular percentage for proportional throttling
+        # CPU pressure — use EXTERNAL cpu (total minus HARTOS's own process
+        # tree, incl. llama-server resolved by port) from the ResourceGovernor
+        # as the SINGLE source, NOT raw psutil.cpu_percent.  Raw total made
+        # the agent daemon's own LLM ticks spike CPU >=95% → factor 0.1 →
+        # throttle_factor < 0.1 → the should_yield 'model_pressure' reason
+        # fired, flapping the gate so no goal ever completed a tick
+        # (2026-05-31).  Falls back to total before the governor's first tick.
         try:
             import psutil
-            cpu_pct = psutil.cpu_percent(interval=None)
+            cpu_pct = None
+            try:
+                from core.resource_governor import get_governor
+                _gov = get_governor()
+                if _gov is not None:
+                    _ext = _gov.get_external_cpu_fraction()
+                    if _ext is not None:
+                        cpu_pct = _ext * 100.0
+            except Exception:
+                cpu_pct = None
+            if cpu_pct is None:
+                cpu_pct = psutil.cpu_percent(interval=None)
             if cpu_pct >= 95:
                 factor *= 0.1
             elif cpu_pct >= 90:
