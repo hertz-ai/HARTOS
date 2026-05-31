@@ -539,6 +539,17 @@ def call_visual_task(task_description: str, user_id: int, prompt_id: int):
     # logger call itself re-raised the LocalProxy error.  Use the
     # module-level `logger` (logging.getLogger(__name__)) — it works in
     # any thread regardless of Flask context.
+    # Guard: ACTION_API is '' when not set in config.json (config.get
+    # default).  This job runs on a 2s IntervalTrigger, so with an empty
+    # ACTION_API the action-details GET below builds a bare
+    # f"{ACTION_API}?user_id=..." == "?user_id=..." (no scheme/host) →
+    # pooled_request raises "Invalid URL" EVERY 2s, forever — spamming the
+    # log (~30 errs/min, live 2026-05-31) and burning CPU that feeds the
+    # box-busy → governor-throttle which starves the flywheel.  The visual
+    # task cannot work without the action API, so skip cheaply.
+    if not ACTION_API:
+        return None
+
     headers = {'Content-Type': 'application/json'}
     url = f'http://localhost:{_get_llm_port("backend")}/visual_agent'
 
@@ -3380,12 +3391,19 @@ def create_schedule(prompt_id, user_id):
                                       args=[i['job_description'], user_id, prompt_id, i['action_entry_point']])
                     _sched_log('info', f'Successfully created scheduler job {i["persona"]}')
 
-        _sched_log('info', 'Creating Visual scheduled tasks')
-        trigger = IntervalTrigger(seconds=int(2))
-        job_id = f"job_{int(time.time())}"
-        scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
-                          args=['get past 1 mins visual information', user_id, prompt_id])
-        _sched_log('info', 'Successfully created scheduler job')
+        # Only schedule the 2s visual-poll job when the action API it depends
+        # on is actually configured.  With ACTION_API='' (unset in config.json)
+        # this job can't work and would error every 2s forever (see the
+        # call_visual_task guard) — don't create it at all on such boxes.
+        if ACTION_API:
+            _sched_log('info', 'Creating Visual scheduled tasks')
+            trigger = IntervalTrigger(seconds=int(2))
+            job_id = f"job_{int(time.time())}"
+            scheduler.add_job(call_visual_task, trigger=trigger, id=job_id,
+                              args=['get past 1 mins visual information', user_id, prompt_id])
+            _sched_log('info', 'Successfully created scheduler job')
+        else:
+            _sched_log('info', 'Skipping 2s visual-poll job — ACTION_API not configured')
         if 'visual_scheduled_tasks' in config and len(config['visual_scheduled_tasks']) > 0:
             for i in config['visual_scheduled_tasks']:
                 if role and i['persona'].lower() == role.lower():
