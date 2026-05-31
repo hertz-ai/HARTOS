@@ -783,13 +783,23 @@ class AgentDaemon:
             # Split goals into two queues:
             #   - CREATE queue: goals without recipes (need LLM planning, 1 at a time)
             #   - REUSE pool: goals with recipes (cheap replay, round-robin)
-            import hashlib as _hlib
+            # Resolve recipe path against the SAME dir the pipeline saves to
+            # (get_prompts_dir → ~/Documents/Nunba/data/prompts in the frozen
+            # build), NOT a relative 'prompts' that resolves against the exe's
+            # CWD and never finds the saved recipe — which misclassified every
+            # reuse-able goal into the CREATE queue.  Use the single-source
+            # dispatch.prompt_id_for_goal hash, not a duplicate md5 (DRY).
+            from .dispatch import prompt_id_for_goal
+            try:
+                from core.platform_paths import get_prompts_dir
+                _prompts_dir = get_prompts_dir()
+            except Exception:
+                _prompts_dir = 'prompts'
             _create_queue = []
             _reuse_pool = []
             for goal in goals:
-                _gh = int(_hlib.md5(str(goal.id).encode()).hexdigest()[:10], 16) % 100_000_000_000
-                _pid = str(max(1, _gh))
-                _recipe_path = os.path.join('prompts', f'{_pid}_0_recipe.json')
+                _pid = prompt_id_for_goal(str(goal.id))
+                _recipe_path = os.path.join(_prompts_dir, f'{_pid}_0_recipe.json')
                 if os.path.exists(_recipe_path):
                     _reuse_pool.append(goal)
                 else:
