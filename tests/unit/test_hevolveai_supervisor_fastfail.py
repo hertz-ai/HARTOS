@@ -181,3 +181,66 @@ def test_run_loop_disables_after_consecutive_fast_fails(monkeypatch):
     assert spawn_count['n'] == 5, (
         f"expected exactly 5 spawns before disabling, got {spawn_count['n']}")
     assert 'DISABLING' in (sup.last_error or '')
+
+
+def test_run_loop_disables_after_consecutive_SLOW_crashes(monkeypatch):
+    """A child that loads, runs ~15s (NOT a sub-5s fast-fail), then crashes
+    EVERY time must ALSO disable — after _UNHEALTHY_LIMIT (6) consecutive
+    sub-60s exits — instead of respawning forever (the 2026-06-01 hevolveai
+    14-22s crash-loop that the old sub-5s-only breaker never caught)."""
+    from integrations.agent_engine import hevolveai_supervisor as hs
+
+    sup = hs._Supervisor.__new__(hs._Supervisor)
+    sup.stop_event = __import__('threading').Event()
+    sup.lock = __import__('threading').Lock()
+    sup.last_error = None
+    sup.last_started = None
+    sup.restart_count = 0
+    sup.port = 8000
+    sup.pythonpath = None
+    sup.python_exe = 'python'
+    sup.api_url = 'http://localhost:8000'
+    sup.proc = None
+
+    spawn_count = {'n': 0}
+
+    class _SlowDeadProc:
+        def __init__(self):
+            self.pid = 4242
+            self.stdout = None
+            self._handle = 0
+        def wait(self):
+            return 1  # crashes — but uptime is ~15s via the time mock below
+
+    monkeypatch.setattr(sup, '_popen_kwargs', lambda: {})
+    monkeypatch.setattr(sup, '_build_cmd', lambda: ['python', '-c', 'pass'])
+    monkeypatch.setattr(sup, '_build_env', lambda: {})
+    monkeypatch.setattr(sup, '_register_with_governor', lambda pid: None)
+    monkeypatch.setattr(sup, '_unregister_from_governor', lambda pid: None)
+
+    def _fake_popen(cmd, env=None, **kw):
+        spawn_count['n'] += 1
+        return _SlowDeadProc()
+    monkeypatch.setattr(hs.subprocess, 'Popen', _fake_popen)
+    monkeypatch.setattr(sup.stop_event, 'wait', lambda timeout=None: False)
+
+    # Monotonic clock advancing 15s per call → each spawn's uptime computes to
+    # ~15s: above the 5s fast-fail floor but below the 60s unhealthy floor.
+    _clock = {'t': 1000.0}
+    def _tick():
+        _clock['t'] += 15.0
+        return _clock['t']
+    monkeypatch.setattr(hs.time, 'time', _tick)
+
+    import threading
+    t = threading.Thread(target=sup._run, daemon=True)
+    t.start()
+    t.join(timeout=5)
+
+    assert not t.is_alive(), (
+        "the _run loop did not terminate — the SLOW-crash breaker is missing; "
+        "a child that crashes at 15s every time would respawn forever")
+    # 15s uptime is NOT a fast-fail, so only the unhealthy breaker fires → 6.
+    assert spawn_count['n'] == 6, (
+        f"expected 6 spawns before the unhealthy breaker disables, got {spawn_count['n']}")
+    assert 'DISABLING' in (sup.last_error or '')

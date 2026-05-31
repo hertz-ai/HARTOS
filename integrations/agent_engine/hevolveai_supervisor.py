@@ -130,7 +130,7 @@ def _hevolveai_port() -> int:
 
 def _hevolveai_available() -> bool:
     """True when the child interpreter will be able to ``import
-    hevolveai`` — either it's importable in THIS process (frozen Nunba
+    hevolveai`` -- either it's importable in THIS process (frozen Nunba
     runs the child under the same python-embed site-packages, so a
     parent find_spec is representative) OR a dev PYTHONPATH resolves to
     the sibling source repo (which we surface to the child).
@@ -165,7 +165,7 @@ def supervisor_should_run() -> bool:
       * ``HEVOLVEAI_API_URL`` points to a non-localhost host (we never
         spawn a remote target's server locally).
       * hevolveai is neither importable nor resolvable via a dev
-        sibling repo — spawning would crash-loop (see
+        sibling repo -- spawning would crash-loop (see
         ``_hevolveai_available``).
     """
     if os.environ.get('HEVOLVE_SKIP_HEVOLVEAI_SPAWN') == '1':
@@ -496,9 +496,31 @@ class _Supervisor:
 
     # -- Spawn & supervise loop ----------------------------------------
     def _build_cmd(self) -> list:
-        """Prefer ``-m hevolveai.server.api_server`` when the package is
-        importable (bundled or PYTHONPATH-rigged dev mode)."""
-        return [self.python_exe, '-m', 'hevolveai.server.api_server']
+        """Launch the API server via an explicit import + uvicorn.run.
+
+        We deliberately do NOT use ``-m hevolveai.server.api_server``.
+        In the bundled Nunba build the hevolveai package is Cython-compiled
+        and source-stripped (api_server.cp312-win_amd64.pyd, no .py), and
+        ``python -m pkg.mod`` fails there with
+            "No code object available for hevolveai.server.api_server"
+        because runpy needs a code object that a .pyd extension module does
+        not expose. Importing the compiled module works (that is the whole
+        point of Cython); we then run uvicorn ourselves on HEVOLVEAI_PORT.
+
+        This single command works in BOTH bundled (.pyd) and dev (.py via
+        the PYTHONPATH the supervisor exports) -- one launch path, no fork.
+        The module's FastAPI lifespan startup (background services, proof
+        monitor) still fires when uvicorn starts the app, identical to the
+        old ``if __name__ == '__main__'`` path minus the banner.
+        """
+        boot = (
+            "import os, uvicorn;"
+            "from hevolveai.server.api_server import app;"
+            "uvicorn.run(app, host='0.0.0.0',"
+            " port=int(os.environ.get('HEVOLVEAI_PORT', '8000')),"
+            " log_level='info')"
+        )
+        return [self.python_exe, '-c', boot]
 
     def _build_env(self) -> Dict[str, str]:
         env = dict(os.environ)
@@ -637,13 +659,25 @@ class _Supervisor:
         # Defense-in-depth circuit breaker (supervisor_should_run's
         # pre-spawn _hevolveai_available check is the primary guard;
         # this catches a child that IS importable but crashes on every
-        # start anyway — broken install, missing model weights, port
+        # start anyway -- broken install, missing model weights, port
         # bind race).  Count consecutive sub-_FAST_FAIL_S exits; after
         # _FAST_FAIL_LIMIT in a row, stop looping and disable until an
         # explicit restart, instead of spinning at the 60s cap forever.
-        _FAST_FAIL_S = 5.0
-        _FAST_FAIL_LIMIT = 5
+        _FAST_FAIL_S = 5.0       # exit faster than this = instant misconfig
+        _FAST_FAIL_LIMIT = 5     # 5 instant exits in a row -> disable
+        # ALSO catch SLOW crash-loops: a child that starts, loads its model
+        # (eating VRAM), runs ~10-30s, then crashes EVERY time is just as
+        # fatal — it churns VRAM/CPU forever without ever tripping the
+        # sub-5s breaker.  Live 2026-06-01: hevolveai crashed at 14-22s
+        # uptime (TypeError in its own code), spawned 8x, the fast-fail
+        # breaker never fired, and the VRAM/CPU churn (free VRAM 7.8->3.0GB)
+        # starved the flywheel via model_pressure.  Treat an exit within
+        # _UNHEALTHY_S of start as "never got healthy" and disable after
+        # _UNHEALTHY_LIMIT in a row.
+        _UNHEALTHY_S = 60.0
+        _UNHEALTHY_LIMIT = 6
         _consecutive_fast_fails = 0
+        _consecutive_unhealthy = 0
         while not self.stop_event.is_set():
             cmd = self._build_cmd()
             env = self._build_env()
@@ -692,6 +726,12 @@ class _Supervisor:
                     _consecutive_fast_fails += 1
                 else:
                     _consecutive_fast_fails = 0
+                # Slow crash-loop guard: exit within _UNHEALTHY_S of start =
+                # the child never reached a healthy steady state.
+                if _uptime < _UNHEALTHY_S:
+                    _consecutive_unhealthy += 1
+                else:
+                    _consecutive_unhealthy = 0
                 # Reset backoff if the child stayed up long enough to be
                 # considered healthy: a transient crash after hours of
                 # uptime should restart promptly, not wait the last 60s
@@ -699,14 +739,17 @@ class _Supervisor:
                 if (self.last_started is not None
                         and (time.time() - self.last_started) > 60.0):
                     backoff = 1.0
-                if _consecutive_fast_fails >= _FAST_FAIL_LIMIT:
+                if (_consecutive_fast_fails >= _FAST_FAIL_LIMIT
+                        or _consecutive_unhealthy >= _UNHEALTHY_LIMIT):
+                    _n = max(_consecutive_fast_fails, _consecutive_unhealthy)
+                    _window = (_FAST_FAIL_S
+                               if _consecutive_fast_fails >= _FAST_FAIL_LIMIT
+                               else _UNHEALTHY_S)
                     self.last_error = (
-                        f'hevolveai exited rc={rc} immediately '
-                        f'{_consecutive_fast_fails}x in a row '
-                        f'(<{_FAST_FAIL_S:.0f}s each) — DISABLING '
-                        f'supervisor (likely broken install / missing '
-                        f'weights). Restart Nunba or fix the install '
-                        f'to re-enable.')
+                        f'hevolveai exited rc={rc} unhealthily {_n}x in a row '
+                        f'(uptime <{_window:.0f}s each) -- DISABLING supervisor '
+                        f'(broken install / crashing child / missing weights). '
+                        f'Restart Nunba or fix the install to re-enable.')
                     logger.error(
                         "hevolveai_supervisor: %s", self.last_error)
                     return
