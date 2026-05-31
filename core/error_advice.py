@@ -133,7 +133,28 @@ def _try_agent_remediation(
                 source_module = last_frame.filename or ''
                 source_function = last_frame.name or ''
 
+        _fp = _fingerprint(exc)
         with db_session() as db:
+            # Cross-restart dedup: _should_emit's throttle is IN-MEMORY, so it
+            # resets on every process restart — without a DB check the same
+            # failure re-creates a fresh active self_heal goal on each Nunba
+            # relaunch (observed: 24 duplicate "Self-heal: tts.probe" goals
+            # accumulated since 2026-03-29, never dispatched, flooding the goal
+            # table + contending for the shared LLM slot once the daemon runs).
+            # Mirror self_healing_dispatcher._is_already_being_fixed — skip if an
+            # active self_heal goal already targets this fingerprint.  Best-effort.
+            try:
+                from integrations.social.models import AgentGoal
+                for _g in db.query(AgentGoal).filter(
+                        AgentGoal.status == 'active',
+                        AgentGoal.goal_type == 'self_heal').all():
+                    if (_g.config_json or {}).get('fingerprint') == _fp:
+                        logger.debug(
+                            f"[error_advice/{category}] active self_heal goal "
+                            f"already targets {_fp[:12]} — skipping duplicate")
+                        return
+            except Exception:
+                pass  # dedup is best-effort; fall through to create on any error
             GoalManager.create_goal(
                 db,
                 goal_type='self_heal',
@@ -159,7 +180,7 @@ def _try_agent_remediation(
                     'category': category,
                     'severity': severity,
                     'error_message': str(exc)[:500],
-                    'fingerprint': _fingerprint(exc),
+                    'fingerprint': _fp,
                     'context': {k: str(v)[:200] for k, v in context.items()},
                 },
                 spark_budget=50,
