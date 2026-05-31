@@ -1087,20 +1087,55 @@ def inject_instruction(db, agent_id: str, instruction: str,
                 )
         except Exception:
             pass
-    if not goal or not getattr(goal, 'prompt_id', None):
-        out['error'] = 'agent not found or has no prompt_id'
+    if not goal:
+        out['error'] = 'agent not found'
         return out
-
-    user_prompt = f'{goal.owner_id or goal.created_by}_{goal.prompt_id}'
 
     try:
         from lifecycle_hooks import get_registered_groupchat
     except ImportError:
         out['error'] = 'groupchat registry unavailable'
         return out
-    gc = get_registered_groupchat(user_prompt)
+
+    # Resolve the live GroupChat by its registry key {user_id}_{prompt_id}.
+    # Human/coding agents carry a stable prompt_id on the row.  Autonomous
+    # flywheel goals do NOT — dispatch_goal generates the prompt_id from a
+    # deterministic goal_id hash and never writes it back, so the row's
+    # prompt_id is null.  Recompute that SAME hash (single source:
+    # dispatch.prompt_id_for_goal) and try it against the owner candidates
+    # the daemon may have dispatched under — so the bridge can steer a
+    # running flywheel goal, not only human agents.
+    owner = getattr(goal, 'owner_id', None) or getattr(goal, 'created_by', None)
+    candidate_prompt_ids = []
+    if getattr(goal, 'prompt_id', None):
+        candidate_prompt_ids.append(str(goal.prompt_id))
+    try:
+        from integrations.agent_engine.dispatch import prompt_id_for_goal
+        _hashed = prompt_id_for_goal(str(agent_id))
+        if _hashed not in candidate_prompt_ids:
+            candidate_prompt_ids.append(_hashed)
+    except Exception:
+        pass
+    if not candidate_prompt_ids:
+        out['error'] = 'agent has no resolvable prompt_id'
+        return out
+
+    user_id_candidates = [c for c in (
+        owner, getattr(goal, 'user_id', None), 'system') if c]
+    gc = None
+    user_prompt = None
+    for _pid in candidate_prompt_ids:
+        for _uid in user_id_candidates:
+            key = f'{_uid}_{_pid}'
+            _found = get_registered_groupchat(key)
+            if _found is not None:
+                gc, user_prompt = _found, key
+                break
+        if gc is not None:
+            break
     if gc is None:
-        out['error'] = 'no live GroupChat registered for this agent'
+        out['error'] = ('no live GroupChat registered for this agent '
+                        '(not currently executing)')
         return out
 
     try:
