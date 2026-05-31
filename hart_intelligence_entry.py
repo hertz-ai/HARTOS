@@ -747,9 +747,17 @@ except Exception:
     pass
 stream_handler = logging.StreamHandler(sys.stdout)
 
-# Create a logging format
+# Create a logging format.
+# [%(threadName)s] is included so EVERY line says which thread it ran on —
+# without it, interleaved background threads (agent_daemon,
+# resource_governor_monitor, compute_optimizer, TTS _bg, hevolveai-supervisor)
+# all log as "RequestID: None" and are indistinguishable from the chat
+# request thread, making per-thread latency attribution undecidable (the
+# 2026-05-31 "why is hi slow" mis-attribution: a 17s gap was blamed on the
+# wrong subsystem purely from log adjacency).  threadName is a built-in
+# LogRecord attribute (always present) so this is free + safe.
 formatter = logging.Formatter(
-    '%(asctime)s - %(name)s- [RequestID: %(req_id)s] - %(levelname)s - %(message)s')
+    '%(asctime)s - %(name)s- [RequestID: %(req_id)s] [%(threadName)s] - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 stream_handler.setFormatter(formatter)
 
