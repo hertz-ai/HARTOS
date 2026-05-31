@@ -43,6 +43,40 @@ from PIL import Image
 
 from flask import current_app
 from helper import ToolMessageHandler, strip_json_values, get_time_based_history, retrieve_json, load_vlm_agent_files, _is_terminate_msg
+
+
+def _normalize_flow_recipe(config):
+    """Guarantee the ``{status, actions:[...]}`` flow-recipe shape the reuse
+    engine expects.
+
+    A PER-ACTION recipe (``{status, action, recipe, action_id, persona, …}``)
+    is sometimes written into the FLOW-recipe filename
+    (``{prompt_id}_{flow}_recipe.json``) — e.g. single-action flows where the
+    done-handler persisted ``json_obj`` directly.  Reuse then did
+    ``recipes[user_prompt]['actions']`` → ``KeyError: 'actions'`` ("Some ERROR
+    IN REUSE RECIPE 'actions'", live in frozen_debug.log) and fell back to the
+    expensive CREATE pipeline, so REUSE never engaged for those agents and the
+    flywheel kept re-paying full CREATE cost every dispatch.
+
+    Normalizing at LOAD wraps the lone per-action recipe as a one-element
+    ``actions`` list (preserving flow-level scheduled_tasks), so recipes
+    ALREADY on disk reuse correctly without a rewrite.  A correctly-shaped
+    flow recipe passes through unchanged; an unknown shape gets an empty
+    ``actions`` list so reuse degrades gracefully instead of crashing.
+    """
+    if not isinstance(config, dict):
+        return config
+    if isinstance(config.get('actions'), list):
+        return config
+    if 'action' in config or 'recipe' in config or 'action_id' in config:
+        norm = {'status': config.get('status', 'completed'), 'actions': [config]}
+        for _k in ('scheduled_tasks', 'visual_scheduled_tasks'):
+            if _k in config:
+                norm[_k] = config[_k]
+        return norm
+    out = dict(config)
+    out['actions'] = []
+    return out
 try:
     from helper import PROMPTS_DIR
 except Exception:
@@ -904,6 +938,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     with open(os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_recipe.json"), 'r') as f:
         config = json.load(f)
+        config = _normalize_flow_recipe(config)  # tolerate per-action recipe in flow slot
         recipes[user_prompt] = config
         final_recipe[prompt_id] = config
     goal = ''
@@ -3332,6 +3367,7 @@ def create_schedule(prompt_id, user_id):
     role_number, role = get_flow_number(user_id, prompt_id)
     with open(os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_recipe.json"), 'r') as f:
         config = json.load(f)
+        config = _normalize_flow_recipe(config)  # tolerate per-action recipe in flow slot
         recipes[user_prompt] = config
     try:
         if 'scheduled_tasks' in config and len(config['scheduled_tasks']) > 0:
