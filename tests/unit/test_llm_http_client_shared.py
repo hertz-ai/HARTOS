@@ -70,6 +70,41 @@ def test_autogen_config_injects_shared_http_client(monkeypatch):
             "each config entry must carry the shared httpx client")
 
 
+def test_shared_client_is_deepcopy_safe():
+    """Regression (flywheel REUSE crash, 2026-06-02): a plain httpx.Client is not
+    deep-copyable, and autogen/openai deepcopies the llm_config it lives in.  The
+    shared client is a SINGLETON, so deepcopy/copy MUST return the SAME instance
+    (never duplicate the pool)."""
+    import copy
+    import httpx
+    _reset_singleton()
+    c = hp.get_llm_http_client()
+    assert copy.deepcopy(c) is c, "deepcopy of the shared client must return itself"
+    assert copy.copy(c) is c, "copy of the shared client must return itself"
+    assert isinstance(c, httpx.Client), "must still be a usable httpx.Client"
+
+
+def test_autogen_config_list_survives_deepcopy(monkeypatch):
+    """The exact failure seen in frozen_debug.log:
+
+        Some ERROR IN REUSE RECIPE Please implement __deepcopy__ method for each
+        value class in llm_config to support deepcopy
+
+    autogen deepcopies the config_list when building/replaying agents; with the
+    shared http_client embedded, that copy MUST NOT raise, and the client must
+    stay the shared singleton on the other side."""
+    import copy
+    _reset_singleton()
+    for k in ('HEVOLVE_NODE_TIER', 'HEVOLVE_ACTIVE_CLOUD_PROVIDER',
+              'HEVOLVE_LLM_ENDPOINT_URL', 'HEVOLVE_LLM_API_KEY'):
+        monkeypatch.delenv(k, raising=False)
+    cfgs = ac.get_autogen_config_list()
+    shared = hp.get_llm_http_client()
+    copied = copy.deepcopy(cfgs)  # used to raise — the REUSE crash
+    assert copied and copied[0].get('http_client') is shared, (
+        "deepcopied config must keep the shared client instance")
+
+
 def test_http_client_key_is_openai_forwardable():
     """'http_client' must be exactly the kwarg openai.OpenAI accepts — autogen
     routes OpenAI.__init__ kwonly args straight through (oai/client.py:452,514),

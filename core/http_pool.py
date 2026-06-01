@@ -76,6 +76,37 @@ _llm_httpx_client = None
 _llm_httpx_lock = threading.Lock()
 
 
+def _shared_llm_http_client_class():
+    """Build the shared-client class lazily (httpx imported on first use).
+
+    autogen/openai DEEPCOPIES the llm_config — ``ConversableAgent`` copies its
+    ``config_list`` per agent, and the REUSE path copies the config when
+    rebuilding trained agents.  A plain ``httpx.Client`` is not deep-copyable, so
+    once we put the shared client into the config (the GIL fix below) every such
+    copy raised:
+
+        Some ERROR IN REUSE RECIPE Please implement __deepcopy__ method for each
+        value class in llm_config to support deepcopy
+
+    which crashed REUSE → fell back to (expensive) CREATE → defeated the
+    flywheel.  The client is a PROCESS-WIDE SINGLETON (one SSL context + one
+    connection pool — the whole point of the fix, and httpx.Client is documented
+    thread-safe), so the correct copy semantics are to return the SAME instance,
+    never duplicate the pool.  This is the autogen-recommended remedy named in
+    the error message itself.
+    """
+    import httpx
+
+    class _SharedLLMHttpClient(httpx.Client):
+        def __deepcopy__(self, memo):
+            return self
+
+        def __copy__(self):
+            return self
+
+    return _SharedLLMHttpClient
+
+
 def get_llm_http_client():
     """Return a process-wide shared ``httpx.Client`` for the autogen/openai LLM
     path.  Thread-safe singleton; never closed (lives for the process).
@@ -109,7 +140,9 @@ def get_llm_http_client():
         # Generous transport timeout: openai sets its own per-request timeout on
         # top of this, so it is only a fallback — it must never be tighter than a
         # long local generation, or it would cut streams off.
-        _llm_httpx_client = httpx.Client(
+        # Deepcopy-safe subclass so the config it lives in stays copyable (see
+        # _shared_llm_http_client_class for why REUSE deepcopies the config).
+        _llm_httpx_client = _shared_llm_http_client_class()(
             timeout=httpx.Timeout(600.0, connect=10.0))
         logger.info(
             "Shared LLM httpx.Client initialized — SSL context built once, "
