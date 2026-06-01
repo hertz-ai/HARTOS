@@ -41,7 +41,9 @@ def test_flag_on_invokes_cli_once(monkeypatch):
     monkeypatch.setenv('HEVOLVE_HEVOLVEAI_ARMORED', '1')
     mod = _load()
     fake = MagicMock(returncode=0, stderr='', stdout='')
-    with patch('subprocess.run', return_value=fake) as mk:
+    # bundle ABSENT → presence guard does not skip → CLI shell-out runs
+    with patch('os.path.isdir', return_value=False), \
+         patch('subprocess.run', return_value=fake) as mk:
         out = mod.ensure_hevolveai_armored()
     assert out == {'enabled': True, 'ok': True}
     assert mk.called
@@ -61,9 +63,34 @@ def test_force_runs_even_when_flag_off(monkeypatch):
 def test_producer_failure_reported_not_raised(monkeypatch):
     monkeypatch.setenv('HEVOLVE_HEVOLVEAI_ARMORED', 'true')
     mod = _load()
-    with patch('subprocess.run', return_value=MagicMock(returncode=1, stderr='boom', stdout='')):
+    with patch('os.path.isdir', return_value=False), \
+         patch('subprocess.run', return_value=MagicMock(returncode=1, stderr='boom', stdout='')):
         out = mod.ensure_hevolveai_armored()
     assert out['enabled'] is True and out['ok'] is False and 'boom' in out['error']
+
+
+def test_presence_guard_skips_when_bundle_present(monkeypatch):
+    """Flag on but a bundle already staged → skip the (multi-minute) recompile
+    at boot; the build/force path stays the fresh-producer."""
+    monkeypatch.setenv('HEVOLVE_HEVOLVEAI_ARMORED', '1')
+    mod = _load()
+    with patch('os.path.isdir', return_value=True), \
+         patch('os.path.isfile', return_value=True), \
+         patch('subprocess.run') as mk:
+        out = mod.ensure_hevolveai_armored()
+    assert out == {'enabled': True, 'ok': True, 'skipped': 'bundle present'}
+    assert not mk.called, "present bundle must NOT trigger a re-armor at boot"
+
+
+def test_force_bypasses_presence_guard(monkeypatch):
+    """force=True re-armors even when a bundle is present (the build path)."""
+    monkeypatch.delenv('HEVOLVE_HEVOLVEAI_ARMORED', raising=False)
+    mod = _load()
+    with patch('os.path.isdir', return_value=True), \
+         patch('os.path.isfile', return_value=True), \
+         patch('subprocess.run', return_value=MagicMock(returncode=0, stderr='', stdout='')) as mk:
+        out = mod.ensure_hevolveai_armored(force=True)
+    assert out['ok'] is True and mk.called
 
 
 def test_truthy_values(monkeypatch):

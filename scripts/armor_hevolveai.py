@@ -206,6 +206,17 @@ def ensure_hevolveai_armored(force: bool = False) -> dict:
     flag = os.environ.get('HEVOLVE_HEVOLVEAI_ARMORED', '').strip().lower()
     if not force and flag not in ('1', 'true', 'yes', 'on'):
         return {'enabled': False, 'reason': 'HEVOLVE_HEVOLVEAI_ARMORED not set'}
+    # Presence guard: don't re-armor on every boot.  The bundle is produced
+    # fresh-from-source by the install/build step (Nunba freeze, or force=True);
+    # at boot we only ensure it EXISTS.  Skip cheaply if it already does so a
+    # flag-on boot isn't a multi-minute recompile.  (force=True bypasses.)
+    if not force:
+        _bundle = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'vendor', 'hevolveai_armored', 'modules')
+        if os.path.isdir(_bundle) and os.path.isfile(
+                os.path.join(os.path.dirname(_bundle), '_key.bin')):
+            return {'enabled': True, 'ok': True, 'skipped': 'bundle present'}
     try:
         import subprocess
         _r = subprocess.run(
