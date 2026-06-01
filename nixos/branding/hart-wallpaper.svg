@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" width="1920" height="1080" role="img" aria-label="HART OS">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#080A12"/>
+      <stop offset="0.55" stop-color="#0F0E17"/>
+      <stop offset="1" stop-color="#16213e"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.5">
+      <stop offset="0" stop-color="#00D4AA" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#00D4AA" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="hart-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#00E6BA"/>
+      <stop offset="1" stop-color="#00A88E"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Backdrop -->
+  <rect width="1920" height="1080" fill="url(#bg)"/>
+  <rect width="1920" height="1080" fill="url(#glow)"/>
+
+  <!-- Mark (heart + circuit traces), centered -->
+  <g transform="translate(678,108) scale(2.2)" opacity="0.94">
+    <path d="M128 214 L58 144 A40 40 0 0 1 114 88 L128 102 L142 88 A40 40 0 0 1 198 144 Z"
+          stroke="url(#hart-grad)" stroke-width="9" stroke-linejoin="round" fill="none"/>
+    <g stroke="#00D4AA" stroke-width="4.5" stroke-linecap="round" opacity="0.95">
+      <path d="M128 168 L128 132"/><path d="M128 146 L98 146"/><path d="M128 146 L158 146"/>
+      <path d="M98 146 L88 128"/><path d="M158 146 L168 128"/><path d="M128 132 L128 116"/>
+    </g>
+    <g fill="#00D4AA">
+      <circle cx="128" cy="170" r="7"/><circle cx="128" cy="112" r="6"/>
+      <circle cx="86" cy="125" r="5"/><circle cx="170" cy="125" r="5"/>
+      <circle cx="98" cy="146" r="4"/><circle cx="158" cy="146" r="4"/>
+    </g>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="960" y="770" text-anchor="middle"
+        font-family="Inter, 'Segoe UI', system-ui, sans-serif"
+        font-size="64" font-weight="600" letter-spacing="14" fill="#E6FBF6">HART<tspan fill="#00D4AA"> OS</tspan></text>
+  <text x="960" y="812" text-anchor="middle"
+        font-family="Inter, 'Segoe UI', system-ui, sans-serif"
+        font-size="20" font-weight="400" letter-spacing="6" fill="#5A6B7A" opacity="0.85">AI-NATIVE · HUMANS IN CONTROL</text>
+</svg>

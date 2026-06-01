@@ -16,6 +16,14 @@
 #
 # Minimum 8GB RAM.
 
+let
+  # Rasterize the HART logo (SVG source in nixos/branding/) → PNG for Plymouth,
+  # which needs raster.  GNOME renders the SVG wallpaper directly (dconf below).
+  hartLogoPng = pkgs.runCommand "hart-logo-png" { nativeBuildInputs = [ pkgs.librsvg ]; } ''
+    mkdir -p $out
+    rsvg-convert -w 320 -h 320 ${../branding/hart-logo.svg} -o $out/logo.png
+  '';
+in
 {
   imports = [
     "${modulesPath}/installer/cd-dvd/installation-cd-graphical-gnome.nix"
@@ -297,12 +305,12 @@
         document-font-name = "Cantarell 11";
       };
       "org/gnome/desktop/background" = {
-        picture-uri = "file:///etc/hart/branding/wallpaper.png";
-        picture-uri-dark = "file:///etc/hart/branding/wallpaper-dark.png";
+        picture-uri = "file:///etc/hart/branding/wallpaper.svg";
+        picture-uri-dark = "file:///etc/hart/branding/wallpaper.svg";
         primary-color = "#080808";
       };
       "org/gnome/desktop/screensaver" = {
-        picture-uri = "file:///etc/hart/branding/lock-screen.png";
+        picture-uri = "file:///etc/hart/branding/lock-screen.svg";
         primary-color = "#080808";
       };
       # ─── Taskbar / Dash / Top Bar customization ───
@@ -502,27 +510,24 @@
   services.upower.enable = true;
   services.thermald.enable = true;
 
-  # ─── HART OS Branding ───
-  # Logo and wallpaper files are deployed to /etc/hart/branding/
-  # by the hart-branding package (or manually placed there)
+  # ─── HART OS Branding (real assets, not placeholders) ───
+  # SVG sources live in nixos/branding/.  GNOME renders SVG wallpapers directly
+  # (dconf above points here); Plymouth gets the rasterized logo (hartLogoPng).
+  # The mark: a geometric heart with circuit-board traces — human compassion +
+  # machine intelligence — in #00D4AA (HART teal) on dark #080808.
   environment.etc = {
-    "hart/branding/README" = {
-      text = ''
-        HART OS Branding Assets
-        =======================
-        wallpaper.png      — Desktop wallpaper (dark theme, HART logo)
-        wallpaper-dark.png — Dark variant
-        lock-screen.png    — Lock screen background
-        logo.svg           — HART OS logo (scalable)
-        logo-64.png        — HART OS logo 64x64
-        logo-128.png       — HART OS logo 128x128
-        icon.svg           — Application icon
-
-        The HART OS logo features a minimalist geometric heart shape
-        with circuit-board traces emanating from within, symbolizing
-        the union of human compassion and machine intelligence.
-        Color: #00D4AA (HART accent green) on dark (#080808) background.
-      '';
-    };
+    "hart/branding/wallpaper.svg".source = ../branding/hart-wallpaper.svg;
+    "hart/branding/lock-screen.svg".source = ../branding/hart-wallpaper.svg;
+    "hart/branding/logo.svg".source = ../branding/hart-logo.svg;
   };
+
+  # ─── Boot splash: HART logo, not the NixOS lizard ───
+  # Uses NixOS's default Plymouth theme but swaps in our logo via
+  # boot.plymouth.logo (low-risk — no custom theme module).  quiet+splash hide
+  # the kernel/systemd text boot behind the graphical splash.
+  boot.plymouth = {
+    enable = lib.mkForce true;  # base installer-CD profile may also set this
+    logo = lib.mkForce "${hartLogoPng}/logo.png";
+  };
+  boot.kernelParams = [ "quiet" "splash" ];
 }

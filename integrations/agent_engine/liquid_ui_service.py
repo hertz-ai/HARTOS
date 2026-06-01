@@ -499,7 +499,7 @@ class LiquidUIService:
             css_vars = ThemeService.get_css_variables()
             theme = ThemeService.get_active_theme()
         except Exception:
-            css_vars = ':root { --hart-background: #0F0E17; --hart-accent: #6C63FF; --hart-active: #00e676; --hart-text: #e0e0e0; --hart-glass-bg: rgba(15,14,23,0.65); --hart-glass-border: rgba(108,99,255,0.15); --hart-muted: #78909c; --hart-surface: #1a1a2e; --hart-blur: 20px; --hart-saturation: 180%; --hart-radius: 16px; --hart-panel-opacity: 0.65; --hart-topbar-height: 40px; --hart-icon-size: 20px; --hart-titlebar-height: 32px; --hart-font-family: "JetBrains Mono"; --hart-font-size: 13px; --hart-heading-size: 18px; --hart-font-weight: 400; --hart-heading-weight: 600; --hart-anim-speed: 200ms; --hart-error: #FF6B6B; --hart-caution: #ffab40; --hart-heading: #6C63FF; --hart-surface-hover: #252540; }'
+            css_vars = ':root { --hart-background: #0F0E17; --hart-accent: #00D4AA; --hart-active: #00e676; --hart-text: #e0e0e0; --hart-glass-bg: rgba(15,14,23,0.65); --hart-glass-border: rgba(0,212,170,0.18); --hart-muted: #78909c; --hart-surface: #1a1a2e; --hart-blur: 20px; --hart-saturation: 180%; --hart-radius: 16px; --hart-panel-opacity: 0.65; --hart-topbar-height: 40px; --hart-icon-size: 20px; --hart-titlebar-height: 32px; --hart-font-family: "JetBrains Mono"; --hart-font-size: 13px; --hart-heading-size: 18px; --hart-font-weight: 400; --hart-heading-weight: 600; --hart-anim-speed: 200ms; --hart-error: #FF6B6B; --hart-caution: #ffab40; --hart-heading: #00D4AA; --hart-surface-hover: #252540; }'
             theme = {}
 
         # Performance tier detection
@@ -662,7 +662,7 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
   font-family:var(--ds-font-body);font-size:14px;line-height:20px;outline:none;
   transition:border-color var(--ds-duration-medium) var(--ds-ease-standard),
     box-shadow var(--ds-duration-medium) var(--ds-ease-standard)}
-.ds-input:focus{border-color:var(--hart-accent);box-shadow:0 0 0 2px rgba(108,99,255,0.2)}
+.ds-input:focus{border-color:var(--hart-accent);box-shadow:0 0 0 2px rgba(0,212,170,0.25)}
 .ds-input::placeholder{color:var(--hart-muted)}
 .ds-input-label{font-size:12px;font-weight:500;letter-spacing:0.5px;
   color:var(--hart-muted);text-transform:uppercase}
