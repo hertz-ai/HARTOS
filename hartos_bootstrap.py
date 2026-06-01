@@ -511,29 +511,6 @@ def _init_hevolveai_subprocess(cfg: dict) -> None:
     hosted out-of-process on a different box).
     """
     try:
-        # Phase 4 (docs/architecture/HEVOLVEAI_ARMOR_CANONICAL_PLAN.md): the
-        # canonical, deployment-agnostic hook.  Produce the armored hevolveai
-        # bundle from CURRENT source BEFORE the supervisor spawns, so EVERY
-        # HARTOS variant (central/dev/Nunba) gets fresh-compiled + armored
-        # hevolveai — never a stale .pyd.  Flag-gated (HEVOLVE_HEVOLVEAI_ARMORED,
-        # default OFF) + presence-guarded + best-effort → no-op + zero-regression
-        # until explicitly opted in; the supervisor's plain path is the fallback.
-        try:
-            import importlib.util as _ilu
-            _ah_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), 'scripts', 'armor_hevolveai.py')
-            if os.path.isfile(_ah_path):
-                _spec = _ilu.spec_from_file_location('armor_hevolveai', _ah_path)
-                _ah = _ilu.module_from_spec(_spec)
-                _spec.loader.exec_module(_ah)
-                _armor = _ah.ensure_hevolveai_armored()
-                if _armor.get('enabled'):
-                    logger.info(
-                        "hevolveai armor (canonical): %s",
-                        _armor.get('skipped') or ('produced' if _armor.get('ok')
-                        else f"produce failed: {str(_armor.get('error',''))[:120]}"))
-        except Exception as _ae:
-            logger.debug("hevolveai armor produce skipped: %s", _ae)
         from integrations.agent_engine.hevolveai_supervisor import (
             start_supervisor as _hevolveai_start)
         info = _hevolveai_start()

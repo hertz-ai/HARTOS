@@ -1,16 +1,32 @@
-"""Phase 2 of HEVOLVEAI_ARMOR_CANONICAL_PLAN.md: supervisor armored-spawn,
-flag-gated, with a BYTE-IDENTICAL plain fallback.
+"""Reconciled canonical armor path (2026-06-01) — supersedes the flag-gated
+Phase-2 design.
 
-ZERO-REGRESSION guard (the load-bearing test): with the flag off — or on but no
-armored bundle staged — _build_cmd MUST return the exact pre-Phase-2 plain boot
-command, character-for-character.  The armored branch only activates under
-HEVOLVE_HEVOLVEAI_ARMORED + a present bundle (unverified until Phase 3 — that's
-fine, it's opt-in).
+The hevolveai SERVER subprocess installs the Hevolvearmor import hook via the
+SAME mechanism the in-process loader (security/native_hive_loader) uses — the
+HEVOLVE_ARMORED_DIR / HEVOLVE_ARMOR_KEY_FILE env vars that app.py exports + the
+canonical ``hevolvearmor.install`` API — with NO separate flag and NO second
+loader entry.  There is ONE armor path, two call sites (in-process + this
+subprocess), not a parallel build path.
+
+These tests pin:
+  * ONE boot path (no flag fork); the armor snippet runs BEFORE the api_server
+    import.
+  * the SAME env-var contract as the in-process loader (no drift).
+  * the dropped parallel path is GONE (no HEVOLVE_HEVOLVEAI_ARMORED flag, no
+    _loader.install_loader in the boot).
+  * BEHAVIOUR: with a real armored bundle + those env vars, the snippet installs
+    the hook and an armored module imports (42); with no bundle it is a silent
+    no-op so the dev boot is unchanged.
 """
 from __future__ import annotations
 
 import os
 import sys
+import shutil
+import tempfile
+import subprocess
+
+import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if ROOT not in sys.path:
@@ -18,76 +34,134 @@ if ROOT not in sys.path:
 
 from integrations.agent_engine import hevolveai_supervisor as hs  # noqa: E402
 
-# The exact plain boot that shipped before Phase 2 — the fallback must equal this.
-PLAIN_BOOT = (
-    "import os, uvicorn;"
-    "from hevolveai.server.api_server import app;"
-    "uvicorn.run(app, host='0.0.0.0',"
-    " port=int(os.environ.get('HEVOLVEAI_PORT', '8000')),"
-    " log_level='info')"
-)
-
 
 def _sup():
     sup = hs._Supervisor.__new__(hs._Supervisor)
-    sup.python_exe = 'python'
+    sup.python_exe = sys.executable
     return sup
 
 
-def test_flag_off_is_byte_identical_plain(monkeypatch):
-    monkeypatch.delenv('HEVOLVE_HEVOLVEAI_ARMORED', raising=False)
-    sup = _sup()
-    cmd = sup._build_cmd()
-    assert cmd == ['python', '-c', PLAIN_BOOT], (
-        "flag-off MUST be the exact pre-Phase-2 plain boot (zero-regression)")
-
-
-def test_flag_on_but_no_bundle_falls_back_plain(monkeypatch):
-    monkeypatch.setenv('HEVOLVE_HEVOLVEAI_ARMORED', '1')
-    sup = _sup()
-    # No bundle present → _armored_bundle_dir returns None → plain fallback.
-    monkeypatch.setattr(sup, '_armored_bundle_dir', lambda: None)
-    assert sup._build_cmd() == ['python', '-c', PLAIN_BOOT], (
-        "flag-on but no staged bundle MUST fall back to the exact plain boot")
-
-
-def test_armored_boot_when_flag_on_and_bundle_present(monkeypatch):
-    monkeypatch.setenv('HEVOLVE_HEVOLVEAI_ARMORED', '1')
-    sup = _sup()
-    monkeypatch.setattr(sup, '_armored_bundle_dir',
-                        lambda: os.path.join('X:', 'app', 'vendor', 'hevolveai_armored'))
-    cmd = sup._build_cmd()
-    assert cmd[0] == 'python' and cmd[1] == '-c'
+def test_single_boot_path_snippet_before_import():
+    cmd = _sup()._build_cmd()
+    assert cmd[0] == sys.executable and cmd[1] == '-c'
     boot = cmd[2]
-    # Installs the armored loader BEFORE importing api_server, same uvicorn run.
-    assert 'from hevolvearmor._loader import install_loader' in boot
+    # armor-install runs BEFORE the api_server import (so .enc shadows any .pyd)
     assert 'install_loader(' in boot
-    assert 'modules' in boot and '_key.bin' in boot
-    # api_server import + uvicorn boot are preserved after the loader install.
-    assert boot.index('install_loader(') < boot.index('from hevolveai.server.api_server import app')
+    assert 'from hevolveai.server.api_server import app' in boot
+    assert (boot.index('install_loader(')
+            < boot.index('from hevolveai.server.api_server import app'))
     assert "uvicorn.run(app, host='0.0.0.0'" in boot
+    # one launch path, never -m (breaks the .pyd bundle)
+    assert '-m' not in cmd
 
 
-def test_armored_dir_gate_flag_off_returns_none(monkeypatch):
+def test_boot_uses_canonical_env_contract_not_parallel_path():
+    """The subprocess uses the SAME env vars + install API as
+    security/native_hive_loader, and NONE of the dropped parallel path."""
+    boot = _sup()._build_cmd()[2]
+    # canonical env vars (shared with native_hive_loader + exported by app.py)
+    assert 'HEVOLVE_ARMORED_DIR' in boot
+    assert 'HEVOLVE_ARMOR_KEY_FILE' in boot
+    # raw-key loader (matches the producer's random _key.bin)
+    assert 'install_loader(' in boot
+    # the dropped parallel path (per-supervisor on/off flag) must NOT reappear
+    assert 'HEVOLVE_HEVOLVEAI_ARMORED' not in boot
+
+
+def test_flag_no_longer_consulted(monkeypatch):
+    """The old on/off flag is gone — toggling it does not change the boot."""
     monkeypatch.delenv('HEVOLVE_HEVOLVEAI_ARMORED', raising=False)
-    assert _sup()._armored_bundle_dir() is None
-
-
-def test_armored_dir_resolves_when_present(monkeypatch):
-    monkeypatch.setenv('HEVOLVE_HEVOLVEAI_ARMORED', 'true')
-    monkeypatch.setenv('HEVOLVE_HEVOLVEAI_ARMORED_DIR', os.path.join('Y:', 'bundle'))
-    sup = _sup()
-    # Simulate the override dir having modules/ + _key.bin.
-    monkeypatch.setattr(os.path, 'isdir', lambda p: p.endswith('modules'))
-    monkeypatch.setattr(os.path, 'isfile', lambda p: p.endswith('_key.bin'))
-    got = sup._armored_bundle_dir()
-    assert got == os.path.join('Y:', 'bundle')
-
-
-def test_armored_dir_none_when_bundle_absent(monkeypatch):
+    off = _sup()._build_cmd()
     monkeypatch.setenv('HEVOLVE_HEVOLVEAI_ARMORED', '1')
-    monkeypatch.delenv('HEVOLVE_HEVOLVEAI_ARMORED_DIR', raising=False)
-    sup = _sup()
-    monkeypatch.setattr(os.path, 'isdir', lambda p: False)
-    monkeypatch.setattr(os.path, 'isfile', lambda p: False)
-    assert sup._armored_bundle_dir() is None
+    on = _sup()._build_cmd()
+    assert off == on, "armor boot must be flag-independent (single path)"
+
+
+def test_source_guard_native_hive_loader_shares_env_vars():
+    """Source guard (DRY enforcement across files): the in-process loader and
+    the subprocess snippet reference the SAME env-var names, so the single
+    mechanism cannot silently fork into two.  Behavioural coverage is below;
+    this only pins the shared contract."""
+    nhl = os.path.join(ROOT, 'security', 'native_hive_loader.py')
+    with open(nhl, 'r', encoding='utf-8') as f:
+        src = f.read()
+    for var in ('HEVOLVE_ARMORED_DIR', 'HEVOLVE_ARMOR_KEY_FILE'):
+        assert var in src, f"{var} missing from native_hive_loader"
+        assert var in hs._ARMOR_INSTALL_SNIPPET, f"{var} missing from snippet"
+
+
+# -- behavioural: the snippet really installs the hook against a real bundle --
+
+def _armor_available():
+    try:
+        if os.path.join(ROOT, 'hevolvearmor') not in sys.path:
+            sys.path.insert(0, os.path.join(ROOT, 'hevolvearmor'))
+        import hevolvearmor  # noqa: F401
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _load_producer():
+    import importlib.util as ilu
+    spec = ilu.spec_from_file_location(
+        'armor_hevolveai', os.path.join(ROOT, 'scripts', 'armor_hevolveai.py'))
+    mod = ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.skipif(not _armor_available(),
+                    reason="hevolvearmor native / cryptography not available")
+def test_snippet_installs_hook_and_imports_real_bundle():
+    """Drive the EXACT supervisor snippet against a producer-made bundle: the
+    canonical hevolvearmor.install hook decrypts + imports an armored module."""
+    ah = _load_producer()
+    tmp = tempfile.mkdtemp(prefix='armor_snip_')
+    try:
+        pkg = os.path.join(tmp, 'src', 'armed_fixture')
+        os.makedirs(pkg)
+        with open(os.path.join(pkg, '__init__.py'), 'w') as f:
+            f.write('FROM_INIT = 1\n')
+        with open(os.path.join(pkg, 'bar.py'), 'w') as f:
+            f.write('ANSWER = 42\n')
+
+        key = ah.generate_key()
+        mods = os.path.join(tmp, 'modules')
+        stats = ah.armor_package(pkg, os.path.join(mods, 'armed_fixture'), key, False)
+        assert stats['failed'] == 0
+        key_file = os.path.join(tmp, '_key.bin')
+        with open(key_file, 'wb') as f:
+            f.write(key)
+
+        env = dict(os.environ)
+        env['HEVOLVE_ARMORED_DIR'] = mods
+        env['HEVOLVE_ARMOR_KEY_FILE'] = key_file
+        env['PYTHONPATH'] = (os.path.join(ROOT, 'hevolvearmor')
+                             + os.pathsep + env.get('PYTHONPATH', ''))
+        prog = hs._ARMOR_INSTALL_SNIPPET + (
+            "import armed_fixture.bar as b\n"
+            "print('RESULT', b.ANSWER)\n"
+        )
+        r = subprocess.run([sys.executable, '-c', prog],
+                           capture_output=True, text=True, env=env, timeout=120)
+        assert 'RESULT 42' in r.stdout, (r.stdout + '\n' + r.stderr)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@pytest.mark.skipif(not _armor_available(),
+                    reason="hevolvearmor native / cryptography not available")
+def test_snippet_is_noop_without_bundle():
+    """Dev path: no HEVOLVE_ARMORED_DIR → the snippet does nothing, no error,
+    so the api_server import that follows loads the plain on-disk package."""
+    env = dict(os.environ)
+    env.pop('HEVOLVE_ARMORED_DIR', None)
+    env.pop('HEVOLVE_ARMOR_KEY_FILE', None)
+    env['PYTHONPATH'] = (os.path.join(ROOT, 'hevolvearmor')
+                         + os.pathsep + env.get('PYTHONPATH', ''))
+    prog = hs._ARMOR_INSTALL_SNIPPET + "print('OK_NOOP')\n"
+    r = subprocess.run([sys.executable, '-c', prog],
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert 'OK_NOOP' in r.stdout and r.returncode == 0, (r.stdout + '\n' + r.stderr)

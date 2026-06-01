@@ -234,6 +234,41 @@ def _resolve_hevolveai_pythonpath() -> Optional[str]:
     return None
 
 
+# Canonical armored-import snippet for the spawned hevolveai server.
+#
+# Read the bundle dir + key file that app.py exports (HEVOLVE_ARMORED_DIR /
+# HEVOLVE_ARMOR_KEY_FILE) and install the Hevolvearmor import hook BEFORE
+# importing hevolveai — so the server loads the encrypted .enc modules instead
+# of any (possibly stale) .pyd.
+#
+# Loader API: ``hevolvearmor._loader.install_loader(dir, raw_key)`` — the
+# RAW-KEY entry.  Our producer (scripts/armor_hevolveai.py) encrypts with a
+# random 32-byte key stored in _key.bin, so the raw-key loader is the matching
+# decryptor.  (The Rust ``hevolvearmor.install`` takes a *passphrase* string, not
+# a raw key, so it cannot open these bundles — verified 2026-06-01.)  package
+# names auto-detect from the bundle's subdirs (hevolveai, embodied_ai).
+#
+# ONE mechanism, presence-gated, NO flag: same env vars the in-process loader
+# uses, activated purely by the bundle being staged.  When the env vars / bundle
+# / hevolvearmor package are absent (dev), it is a silent no-op and the import
+# that follows loads the plain on-disk package — byte-identical in effect to the
+# pre-armor boot.  test_supervisor_armored_spawn.py pins the env-var contract +
+# round-trips the snippet against a real bundle so it cannot silently rot.
+_ARMOR_INSTALL_SNIPPET = (
+    "import os\n"
+    "try:\n"
+    "    _ad = os.environ.get('HEVOLVE_ARMORED_DIR', '')\n"
+    "    _kf = os.environ.get('HEVOLVE_ARMOR_KEY_FILE', '')\n"
+    "    if _ad and os.path.isdir(_ad) and _kf and os.path.isfile(_kf):\n"
+    "        from hevolvearmor._loader import install_loader\n"
+    "        _raw = open(_kf, 'rb').read().strip()\n"
+    "        _k = _raw if len(_raw) == 32 else bytes.fromhex(_raw.decode('ascii'))\n"
+    "        install_loader(_ad, _k)\n"
+    "except Exception:\n"
+    "    pass\n"
+)
+
+
 def _port_in_use(port: int) -> bool:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -495,33 +530,6 @@ class _Supervisor:
             pass
 
     # -- Spawn & supervise loop ----------------------------------------
-    def _armored_bundle_dir(self):
-        """Return the ``vendor/hevolveai_armored`` dir IFF the armored path is
-        enabled AND a usable bundle (``modules/`` + ``_key.bin``) is present;
-        else ``None`` — Phase 2 of HEVOLVEAI_ARMOR_CANONICAL_PLAN.md.
-
-        Default OFF: ``HEVOLVE_HEVOLVEAI_ARMORED`` must be truthy.  When off, or
-        when no bundle is staged, ``_build_cmd`` falls back to the byte-identical
-        plain boot (zero-regression).  ``HEVOLVE_HEVOLVEAI_ARMORED_DIR`` overrides
-        the search.
-        """
-        flag = os.environ.get('HEVOLVE_HEVOLVEAI_ARMORED', '').strip().lower()
-        if flag not in ('1', 'true', 'yes', 'on'):
-            return None
-        here = os.path.dirname(os.path.abspath(__file__))  # integrations/agent_engine
-        candidates = [
-            os.path.normpath(os.path.join(here, '..', '..', 'vendor', 'hevolveai_armored')),
-            os.path.normpath(os.path.join(here, '..', '..', '..', 'vendor', 'hevolveai_armored')),
-        ]
-        _env_dir = os.environ.get('HEVOLVE_HEVOLVEAI_ARMORED_DIR')
-        if _env_dir:
-            candidates.insert(0, _env_dir)
-        for d in candidates:
-            if (os.path.isdir(os.path.join(d, 'modules'))
-                    and os.path.isfile(os.path.join(d, '_key.bin'))):
-                return d
-        return None
-
     def _build_cmd(self) -> list:
         """Launch the API server via an explicit import + uvicorn.run.
 
@@ -540,35 +548,23 @@ class _Supervisor:
         monitor) still fires when uvicorn starts the app, identical to the
         old ``if __name__ == '__main__'`` path minus the banner.
 
-        ARMORED PATH (Phase 2, flag-gated, default OFF): when an armored vendor
-        bundle is present AND HEVOLVE_HEVOLVEAI_ARMORED is on, boot installs the
-        Hevolvearmor loader (decrypts the .enc modules at import) BEFORE importing
-        api_server.  Otherwise the byte-identical plain boot below runs — so
-        default behaviour is unchanged.  The armored branch stays unverified
-        until the Phase 3 loader gate; it only activates under the explicit flag.
+        ARMORED IMPORT (canonical, presence-gated, NO flag): the boot first runs
+        ``_ARMOR_INSTALL_SNIPPET``, which installs the Hevolvearmor import hook
+        IFF the bundle + key staged by the build — and exported by app.py via
+        HEVOLVE_ARMORED_DIR / HEVOLVE_ARMOR_KEY_FILE — are present.  This is the
+        SAME mechanism the in-process loader (security/native_hive_loader) uses,
+        so there is ONE armor path, not two.  When the bundle is absent (dev),
+        the snippet is a silent no-op and the import below loads the plain
+        on-disk package exactly as before — zero behaviour change without a
+        bundle, armored .enc (never a stale .pyd) with one.
         """
-        _armored = self._armored_bundle_dir()
-        if _armored is not None:
-            _mods = os.path.join(_armored, 'modules')
-            _key = os.path.join(_armored, '_key.bin')
-            # repr() yields a valid escaped Python literal for the Windows path.
-            boot = (
-                "import os, uvicorn;"
-                "from hevolvearmor._loader import install_loader;"
-                "install_loader(%s, open(%s, 'rb').read(), ['hevolveai', 'embodied_ai']);"
-                "from hevolveai.server.api_server import app;"
-                "uvicorn.run(app, host='0.0.0.0',"
-                " port=int(os.environ.get('HEVOLVEAI_PORT', '8000')),"
-                " log_level='info')"
-            ) % (repr(_mods), repr(_key))
-            return [self.python_exe, '-c', boot]
-        # Plain fallback — byte-identical to the pre-Phase-2 path.
         boot = (
-            "import os, uvicorn;"
-            "from hevolveai.server.api_server import app;"
+            _ARMOR_INSTALL_SNIPPET +
+            "import uvicorn\n"
+            "from hevolveai.server.api_server import app\n"
             "uvicorn.run(app, host='0.0.0.0',"
             " port=int(os.environ.get('HEVOLVEAI_PORT', '8000')),"
-            " log_level='info')"
+            " log_level='info')\n"
         )
         return [self.python_exe, '-c', boot]
 

@@ -3,6 +3,46 @@
 **Status:** proposed 2026-06-01. Execute phase-by-phase; each phase is additive,
 flag-gated, independently revertible, and MUST leave every existing build green.
 
+---
+
+## ⚠ RECONCILED 2026-06-01 — the flag-gated phases below are SUPERSEDED
+
+While executing P1–P4 (flag `HEVOLVE_HEVOLVEAI_ARMORED` + `_loader.install_loader`
+spawn), an audit found a **canonical armor path already existed** and my
+flag-gated work was a **parallel path** (the very thing principle #4 forbids):
+
+- `app.py` already exports `HEVOLVE_ARMORED_DIR` / `HEVOLVE_ARMOR_KEY_FILE` and
+  `security/native_hive_loader.py` already consults them to install the armor
+  hook for the **in-process** hevolveai import. The Nunba freeze already stages
+  the `.enc` bundle + installs the cp312 loader wheel **unconditionally**.
+- My P2/P4 added a SECOND mechanism: a `HEVOLVE_HEVOLVEAI_ARMORED` flag + a
+  different bundle dir convention. Different env vars, different gating.
+
+**Reconciled design (one path, no flag):** the hevolveai **server subprocess**
+installs the hook via the SAME contract as in-process — read
+`HEVOLVE_ARMORED_DIR` + `HEVOLVE_ARMOR_KEY_FILE`, call
+`hevolvearmor._loader.install_loader(dir, raw_key)` (the **raw-key** loader —
+our producer writes a random `_key.bin`; the Rust `hevolvearmor.install` takes a
+*passphrase* string and CANNOT open these bundles), **presence-gated, no flag**.
+No-op when no bundle (dev unchanged). Lives in `_ARMOR_INSTALL_SNIPPET` in
+`hevolveai_supervisor.py`; pinned by `tests/unit/test_supervisor_armored_spawn.py`
+(env-var contract + a real producer→loader round-trip).
+
+**Latent bug found (task #67):** `native_hive_loader.py:392` calls
+`hevolvearmor.install(modules_dir, bytes(key))` — passing the raw key where a
+passphrase string is expected → `TypeError`, caught silently → **in-process
+armor has never actually worked**; it silently fell back to the `.pyd`. Fix is
+to switch it to the same `install_loader(dir, raw_key)` (with a `.pyd` fallback
+if the `.enc` is bad). Verify in a 3.12 build before relying on it.
+
+**Net effect on the phases below:** P5's "flip the flag" is **moot** (no flag).
+Remaining hardening = remove the stale committed `vendor/hevolveai_armored/`
+bundle + gitignore it (build-produced), drop the raw-`.pyd` wheel fallback, and
+fix #67. Commits: supervisor reconcile + flag removal (this change); P1–P4 flag
+machinery reverted.
+
+---
+
 ## Goal (the canonical principles)
 1. **Zero file shadowing** — never both `.py` and `.pyd`/`.pyc` for the same module
    in a *shippable/importable* tree (root cause of the stale-`.pyd`-shadows-fixed-`.py`
