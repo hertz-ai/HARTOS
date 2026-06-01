@@ -185,6 +185,40 @@ def armor_package(source_dir: str, output_dir: str, key: bytes,
     return stats
 
 
+def ensure_hevolveai_armored(force: bool = False) -> dict:
+    """Canonical, flag-gated entry that ANY HARTOS variant (central/dev/Nunba)
+    can call to (re)produce the armored hevolveai vendor bundle from current
+    source — Phase 1 of docs/architecture/HEVOLVEAI_ARMOR_CANONICAL_PLAN.md.
+
+    ZERO-REGRESSION by construction:
+      * Default OFF — returns a no-op unless HEVOLVE_HEVOLVEAI_ARMORED is
+        truthy (or force=True).  So merely importing/calling this changes
+        nothing until the armored path is explicitly opted into.
+      * Reuses the EXISTING CLI (main) as the single produce path — no
+        parallel armor logic — by invoking this module as a subprocess, so
+        main()'s behaviour (and the Nunba build's `python armor_hevolveai.py`
+        call) is byte-for-byte untouched.
+      * Best-effort: never raises into the caller (bootstrap must not die if
+        the producer fails on a box without the hevolveai source).
+
+    Returns: {enabled: bool, ok?: bool, reason?/error?: str}.
+    """
+    flag = os.environ.get('HEVOLVE_HEVOLVEAI_ARMORED', '').strip().lower()
+    if not force and flag not in ('1', 'true', 'yes', 'on'):
+        return {'enabled': False, 'reason': 'HEVOLVE_HEVOLVEAI_ARMORED not set'}
+    try:
+        import subprocess
+        _r = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), '-q'],
+            capture_output=True, text=True, timeout=600)
+        out = {'enabled': True, 'ok': _r.returncode == 0}
+        if _r.returncode != 0:
+            out['error'] = (_r.stderr or _r.stdout or '')[-500:]
+        return out
+    except Exception as e:
+        return {'enabled': True, 'ok': False, 'error': f'{type(e).__name__}: {e}'}
+
+
 def main():
     parser = argparse.ArgumentParser(description='Encrypt hevolveai into HARTOS vendor bundle')
     parser.add_argument('--source', help='Path to hevolveai/src/hevolveai/',
