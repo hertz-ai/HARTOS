@@ -52,6 +52,12 @@ Run: `pytest tests/probes/test_os_pillars.py tests/unit/test_shell_route_no_coll
 - **Broken wire — the one in-repo gap that fails a pillar outright:** **#66** — Direction-B cross-process skill relay. The data primitives exist (P8), but a skill learned on node A does not reach node B across processes. Until #66 is built, "hive learning compounds" is aspirational.
 - **Also pending the CI ISO boot:** glass-shell-as-session (#69), Plymouth/branding render, GIL fix (#68).
 
+## CI proof status (2026-06-02)
+- **Python pillars (P1/P3/P4/P5/P8-primitives):** the probe suite is green locally, and the pushed commits pass the CI checks that run on them (Security Scan ✅, Docker Build ✅).
+- **NixOS pillars (glass-shell #69, branding, cross-OS #6):** my changes are **CI-confirmed eval-clean** — CI's `nix flake check` caught one real bug I'd written blind (the kiosk session package missing `passthru.providedSessions`), I fixed it (28dd0fc), and CI no longer reports it.
+- **BUT the ISO build can't go green yet** — blocked by a **pre-existing (red since 05-23, 9 days before the pillar work) flake-evaluation gate** (`nix flake check --no-build`): (1) `nixpkgs.config defined multiple times` (read-only pkgs vs module-level `nixpkgs.config` in hart-base/desktop/server), and (2) `mobile` option missing (mobile-nixos is an input but not imported as a module in the phone config). Tracked as **#70**. Until #70 is fixed, every `iso-*` build is **skipped**, so glass-shell/branding/cross-OS can't be promoted from 🟡 to ✅ via the ISO build.
+- **Hardware pillars (P2 vision, P7 embodiment):** need the **Live USB boot** (operator will provide) — not provable in CI or on the dev box.
+
 ## How to use this doc
 A pillar is **real** only when its probe is green AND load-bearing (not merely
 contract/scaffolding). To promote a 🟡 to ✅: build the missing wire/runtime, then
