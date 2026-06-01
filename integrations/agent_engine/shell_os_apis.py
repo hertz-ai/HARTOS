@@ -1187,44 +1187,17 @@ def register_shell_os_routes(app):
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
-    # ─── Battery / Power Monitoring ─────────────────────────
-
-    @app.route('/api/shell/battery', methods=['GET'])
-    def shell_battery_status():
-        """Battery status: level, charging state, time remaining."""
-        bat_dir = '/sys/class/power_supply'
-        result = {'has_battery': False}
-        try:
-            if not os.path.isdir(bat_dir):
-                return jsonify(result)
-            for entry in os.listdir(bat_dir):
-                path = os.path.join(bat_dir, entry)
-                type_file = os.path.join(path, 'type')
-                if not os.path.isfile(type_file):
-                    continue
-                with open(type_file) as f:
-                    if f.read().strip() != 'Battery':
-                        continue
-                result['has_battery'] = True
-                result['name'] = entry
-                cap_file = os.path.join(path, 'capacity')
-                if os.path.isfile(cap_file):
-                    with open(cap_file) as f:
-                        result['level'] = int(f.read().strip())
-                status_file = os.path.join(path, 'status')
-                if os.path.isfile(status_file):
-                    with open(status_file) as f:
-                        result['charging'] = f.read().strip()
-                online_file = os.path.join(bat_dir, 'AC0', 'online')
-                if not os.path.isfile(online_file):
-                    online_file = os.path.join(bat_dir, 'ADP1', 'online')
-                if os.path.isfile(online_file):
-                    with open(online_file) as f:
-                        result['ac_power'] = f.read().strip() == '1'
-                break
-        except Exception as e:
-            result['error'] = str(e)
-        return jsonify(result)
+    # ─── Battery / WiFi / VPN ────────────────────────────────
+    # Canonical hardware control (battery, WiFi, VPN) lives in
+    # shell_system_apis.register_shell_system_routes — it owns the richer set
+    # (wifi networks/saved/toggle, vpn status/delete, battery profile) and the
+    # frontend panels call it.  Duplicating it here registered SECOND views
+    # with the SAME Flask endpoint names (shell_battery_status,
+    # shell_wifi_connect, shell_vpn_list, …) → AssertionError when
+    # register_shell_system_routes ran after register_shell_os_routes → it
+    # aborted AND register_app_install_routes never ran (app installer dead).
+    # Removed the dups; only the lid-action endpoint (no shell_system
+    # equivalent) stays here.  (2026-06-01)
 
     @app.route('/api/shell/power/lid', methods=['GET', 'PUT'])
     def shell_lid_action():
@@ -1247,294 +1220,18 @@ def register_shell_os_routes(app):
         return jsonify({'status': 'ok', 'action': action,
                         'note': 'Requires root to modify logind.conf'})
 
-    # ─── WiFi Management ────────────────────────────────────
-
-    @app.route('/api/shell/wifi/scan', methods=['GET'])
-    def shell_wifi_scan():
-        """Scan for available WiFi networks."""
-        try:
-            r = subprocess.run(['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY,BSSID',
-                               'dev', 'wifi', 'list', '--rescan', 'yes'],
-                              capture_output=True, text=True, timeout=30)
-            if r.returncode != 0:
-                return jsonify({'networks': [], 'error': r.stderr.strip()})
-            networks = []
-            for line in r.stdout.strip().split('\n'):
-                if not line.strip():
-                    continue
-                parts = line.split(':')
-                if len(parts) >= 3:
-                    networks.append({
-                        'ssid': parts[0],
-                        'signal': int(parts[1]) if parts[1].isdigit() else 0,
-                        'security': parts[2] if len(parts) > 2 else '',
-                        'bssid': parts[3] if len(parts) > 3 else '',
-                    })
-            return jsonify({'networks': networks})
-        except FileNotFoundError:
-            return jsonify({'networks': [], 'error': 'nmcli not available'})
-        except subprocess.TimeoutExpired:
-            return jsonify({'networks': [], 'error': 'WiFi scan timed out'})
-
-    @app.route('/api/shell/wifi/connect', methods=['POST'])
-    def shell_wifi_connect():
-        """Connect to a WiFi network."""
-        body = request.get_json(silent=True) or {}
-        ssid = body.get('ssid', '')
-        password = body.get('password', '')
-        if not ssid:
-            return jsonify({'error': 'ssid is required'}), 400
-        try:
-            cmd = ['nmcli', 'dev', 'wifi', 'connect', ssid]
-            if password:
-                cmd += ['password', password]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if r.returncode == 0:
-                return jsonify({'status': 'connected', 'ssid': ssid})
-            return jsonify({'status': 'failed', 'error': r.stderr.strip()}), 400
-        except FileNotFoundError:
-            return jsonify({'error': 'nmcli not available'}), 500
-        except subprocess.TimeoutExpired:
-            return jsonify({'error': 'Connection timed out'}), 504
-
-    @app.route('/api/shell/wifi/disconnect', methods=['POST'])
-    def shell_wifi_disconnect():
-        """Disconnect from current WiFi network."""
-        try:
-            r = subprocess.run(['nmcli', 'dev', 'disconnect', 'wifi'],
-                              capture_output=True, text=True, timeout=10)
-            return jsonify({'status': 'disconnected' if r.returncode == 0 else 'error',
-                           'message': r.stdout.strip() or r.stderr.strip()})
-        except FileNotFoundError:
-            return jsonify({'error': 'nmcli not available'}), 500
-
-    @app.route('/api/shell/wifi/forget', methods=['POST'])
-    def shell_wifi_forget():
-        """Forget (delete) a saved WiFi connection."""
-        body = request.get_json(silent=True) or {}
-        name = body.get('name', '')
-        if not name:
-            return jsonify({'error': 'name is required'}), 400
-        try:
-            r = subprocess.run(['nmcli', 'connection', 'delete', name],
-                              capture_output=True, text=True, timeout=10)
-            return jsonify({'status': 'ok' if r.returncode == 0 else 'error',
-                           'message': r.stdout.strip() or r.stderr.strip()})
-        except FileNotFoundError:
-            return jsonify({'error': 'nmcli not available'}), 500
-
-    @app.route('/api/shell/wifi/status', methods=['GET'])
-    def shell_wifi_status():
-        """Current WiFi connection status."""
-        try:
-            r = subprocess.run(['nmcli', '-t', '-f', 'NAME,TYPE,DEVICE,STATE',
-                               'connection', 'show', '--active'],
-                              capture_output=True, text=True, timeout=10)
-            wifi_conn = None
-            for line in (r.stdout or '').strip().split('\n'):
-                parts = line.split(':')
-                if len(parts) >= 4 and 'wireless' in parts[1].lower():
-                    wifi_conn = {'name': parts[0], 'device': parts[2], 'state': parts[3]}
-                    break
-            return jsonify({'connected': wifi_conn is not None,
-                           'connection': wifi_conn})
-        except FileNotFoundError:
-            return jsonify({'connected': False, 'error': 'nmcli not available'})
-
-    # ─── VPN Management ─────────────────────────────────────
-
-    @app.route('/api/shell/vpn/list', methods=['GET'])
-    def shell_vpn_list():
-        """List VPN connections (active and saved)."""
-        try:
-            r = subprocess.run(['nmcli', '-t', '-f', 'NAME,TYPE,STATE',
-                               'connection', 'show'],
-                              capture_output=True, text=True, timeout=10)
-            vpns = []
-            for line in (r.stdout or '').strip().split('\n'):
-                parts = line.split(':')
-                if len(parts) >= 3 and 'vpn' in parts[1].lower():
-                    vpns.append({'name': parts[0], 'type': parts[1],
-                                'state': parts[2]})
-            return jsonify({'vpns': vpns})
-        except FileNotFoundError:
-            return jsonify({'vpns': [], 'error': 'nmcli not available'})
-
-    @app.route('/api/shell/vpn/connect', methods=['POST'])
-    def shell_vpn_connect():
-        """Connect to a VPN by name."""
-        body = request.get_json(silent=True) or {}
-        name = body.get('name', '')
-        if not name:
-            return jsonify({'error': 'name is required'}), 400
-        try:
-            r = subprocess.run(['nmcli', 'connection', 'up', name],
-                              capture_output=True, text=True, timeout=30)
-            if r.returncode == 0:
-                return jsonify({'status': 'connected', 'name': name})
-            return jsonify({'status': 'failed', 'error': r.stderr.strip()}), 400
-        except FileNotFoundError:
-            return jsonify({'error': 'nmcli not available'}), 500
-
-    @app.route('/api/shell/vpn/disconnect', methods=['POST'])
-    def shell_vpn_disconnect():
-        """Disconnect a VPN connection."""
-        body = request.get_json(silent=True) or {}
-        name = body.get('name', '')
-        if not name:
-            return jsonify({'error': 'name is required'}), 400
-        try:
-            r = subprocess.run(['nmcli', 'connection', 'down', name],
-                              capture_output=True, text=True, timeout=10)
-            return jsonify({'status': 'disconnected' if r.returncode == 0 else 'error',
-                           'message': r.stdout.strip() or r.stderr.strip()})
-        except FileNotFoundError:
-            return jsonify({'error': 'nmcli not available'}), 500
-
-    @app.route('/api/shell/vpn/import', methods=['POST'])
-    def shell_vpn_import():
-        """Import a VPN config file (WireGuard .conf or OpenVPN .ovpn)."""
-        body = request.get_json(silent=True) or {}
-        path = body.get('path', '')
-        vpn_type = body.get('type', '')
-        if not path:
-            return jsonify({'error': 'path is required'}), 400
-        if not os.path.isfile(path):
-            return jsonify({'error': 'File not found'}), 404
-        if not vpn_type:
-            if path.endswith('.conf'):
-                vpn_type = 'wireguard'
-            elif path.endswith('.ovpn'):
-                vpn_type = 'openvpn'
-            else:
-                return jsonify({'error': 'type is required (wireguard or openvpn)'}), 400
-        try:
-            r = subprocess.run(['nmcli', 'connection', 'import', 'type', vpn_type,
-                               'file', path],
-                              capture_output=True, text=True, timeout=15)
-            if r.returncode == 0:
-                return jsonify({'status': 'imported', 'message': r.stdout.strip()})
-            return jsonify({'status': 'failed', 'error': r.stderr.strip()}), 400
-        except FileNotFoundError:
-            return jsonify({'error': 'nmcli not available'}), 500
-
-    # ─── Trash / Recycle Bin (freedesktop spec) ─────────────
-
-    def _trash_dir():
-        return os.path.join(os.path.expanduser('~'), '.local', 'share', 'Trash')
-
-    @app.route('/api/shell/trash', methods=['GET'])
-    def shell_trash_list():
-        """List items in trash."""
-        info_dir = os.path.join(_trash_dir(), 'info')
-        items = []
-        if os.path.isdir(info_dir):
-            for fname in os.listdir(info_dir):
-                if not fname.endswith('.trashinfo'):
-                    continue
-                info_path = os.path.join(info_dir, fname)
-                try:
-                    import configparser
-                    cp = configparser.ConfigParser()
-                    cp.read(info_path)
-                    items.append({
-                        'name': fname.replace('.trashinfo', ''),
-                        'original_path': cp.get('Trash Info', 'Path', fallback=''),
-                        'deletion_date': cp.get('Trash Info', 'DeletionDate', fallback=''),
-                    })
-                except Exception:
-                    items.append({'name': fname.replace('.trashinfo', '')})
-        return jsonify({'items': items, 'total': len(items)})
-
-    @app.route('/api/shell/trash', methods=['POST'])
-    def shell_trash_file():
-        """Move a file to trash (instead of permanent delete)."""
-        body = request.get_json(silent=True) or {}
-        path = body.get('path', '')
-        if not path or not os.path.exists(path):
-            return jsonify({'error': 'path is required and must exist'}), 400
-        trash = _trash_dir()
-        files_dir = os.path.join(trash, 'files')
-        info_dir = os.path.join(trash, 'info')
-        os.makedirs(files_dir, exist_ok=True)
-        os.makedirs(info_dir, exist_ok=True)
-        basename = os.path.basename(path)
-        dest = os.path.join(files_dir, basename)
-        # Handle name collision
-        counter = 1
-        while os.path.exists(dest):
-            name, ext = os.path.splitext(basename)
-            dest = os.path.join(files_dir, f"{name}.{counter}{ext}")
-            counter += 1
-        final_name = os.path.basename(dest)
-        try:
-            import shutil
-            shutil.move(path, dest)
-            from datetime import datetime
-            info_content = (
-                "[Trash Info]\n"
-                f"Path={os.path.abspath(path)}\n"
-                f"DeletionDate={datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}\n"
-            )
-            info_path = os.path.join(info_dir, final_name + '.trashinfo')
-            with open(info_path, 'w') as f:
-                f.write(info_content)
-            return jsonify({'status': 'trashed', 'name': final_name})
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-
-    @app.route('/api/shell/trash/restore', methods=['POST'])
-    def shell_trash_restore():
-        """Restore a file from trash to its original location."""
-        body = request.get_json(silent=True) or {}
-        name = body.get('name', '')
-        if not name:
-            return jsonify({'error': 'name is required'}), 400
-        trash = _trash_dir()
-        file_path = os.path.join(trash, 'files', name)
-        info_path = os.path.join(trash, 'info', name + '.trashinfo')
-        if not os.path.exists(file_path):
-            return jsonify({'error': 'Item not found in trash'}), 404
-        original_path = ''
-        try:
-            import configparser
-            cp = configparser.ConfigParser()
-            cp.read(info_path)
-            original_path = cp.get('Trash Info', 'Path', fallback='')
-        except Exception:
-            pass
-        if not original_path:
-            return jsonify({'error': 'Cannot determine original path'}), 400
-        try:
-            import shutil
-            os.makedirs(os.path.dirname(original_path), exist_ok=True)
-            shutil.move(file_path, original_path)
-            if os.path.isfile(info_path):
-                os.remove(info_path)
-            return jsonify({'status': 'restored', 'path': original_path})
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-
-    @app.route('/api/shell/trash/empty', methods=['POST'])
-    def shell_trash_empty():
-        """Empty the trash permanently."""
-        trash = _trash_dir()
-        count = 0
-        import shutil
-        for subdir in ['files', 'info']:
-            d = os.path.join(trash, subdir)
-            if os.path.isdir(d):
-                for item in os.listdir(d):
-                    item_path = os.path.join(d, item)
-                    try:
-                        if os.path.isdir(item_path):
-                            shutil.rmtree(item_path)
-                        else:
-                            os.remove(item_path)
-                        count += 1
-                    except Exception:
-                        pass
-        return jsonify({'status': 'emptied', 'removed': count})
+    # ─── Trash / Recycle Bin ────────────────────────────────
+    # Canonical trash lives in shell_system_apis.register_shell_system_routes
+    # (it owns /api/shell/trash + /move + /restore + DELETE /empty — the exact
+    # shape the shell's recycle-bin panel calls, per shell_manifest SYSTEM_PANELS).
+    # This module USED to also define '/api/shell/trash' GET as a view named
+    # `shell_trash_list`; register_shell_os_routes runs first, so when
+    # register_shell_system_routes ran second Flask raised
+    # "View function mapping is overwriting an existing endpoint function:
+    # shell_trash_list" — which aborted shell_system registration partway AND
+    # meant register_app_install_routes (called right after, in
+    # liquid_ui_service) never ran, silently killing the app installer.
+    # Removed the duplicate; trash is shell_system's responsibility.  (2026-06-01)
 
     # ─── Notes App ──────────────────────────────────────────
 
