@@ -110,3 +110,63 @@ def test_p3_audit_redacts_secrets(monkeypatch):
     store = sys.modules['integrations.social.models']._store
     assert 'sk-live-123' not in (store[-1].detail_json or '')
     assert 'Pune' in store[-1].detail_json
+
+
+# ════════════════════════════════════════════════════════════════════
+# P1 — Generated/liquid UI: an agent can push a live UI component (A2UI)
+# that is validated, stamped, and stored for delivery to the frontend.
+# ════════════════════════════════════════════════════════════════════
+
+def _bare_liquid_ui():
+    import threading
+    from integrations.agent_engine.liquid_ui_service import LiquidUIService
+    svc = LiquidUIService.__new__(LiquidUIService)   # no server boot
+    svc.a2ui_enabled = True
+    svc._agent_components = {}
+    svc._lock = threading.Lock()
+    return svc
+
+
+def test_p1_agent_can_push_valid_ui_component():
+    svc = _bare_liquid_ui()
+    ok = svc.agent_ui_update('agent_1', {'type': 'card', 'title': 'Done', 'content': 'task 5'})
+    assert ok is True, "P1: a valid A2UI component must be accepted"
+    stored = svc._agent_components.get('agent_1', [])
+    assert stored and stored[-1]['type'] == 'card'
+    assert stored[-1]['_agent_id'] == 'agent_1', "component must be stamped with the agent"
+
+
+def test_p1_invalid_component_type_is_rejected():
+    svc = _bare_liquid_ui()
+    assert svc.agent_ui_update('a', {'type': 'definitely_not_a_type'}) is False
+
+
+def test_p1_a2ui_respects_the_off_switch():
+    """Cross-pillar with P3 (full control): the generative UI can be turned OFF."""
+    svc = _bare_liquid_ui()
+    svc.a2ui_enabled = False
+    assert svc.agent_ui_update('a', {'type': 'card'}) is False
+
+
+# ════════════════════════════════════════════════════════════════════
+# P5 — Learns you, you own it: the per-user model persists LOCALLY and
+# round-trips (the data is a file on YOUR disk, not a cloud account).
+# ════════════════════════════════════════════════════════════════════
+
+def test_p5_resonance_profile_is_local_first_and_roundtrips(tmp_path):
+    from core.resonance_profile import (
+        UserResonanceProfile, save_resonance_profile, load_resonance_profile)
+    p = UserResonanceProfile(user_id='u1')
+    dim = list(p.tuning.keys())[0]
+    p.set_tuning(dim, 0.83)
+    save_resonance_profile(p, base_dir=str(tmp_path))
+    assert (tmp_path / 'u1_resonance.json').exists(), "P5: profile must persist locally"
+    loaded = load_resonance_profile('u1', base_dir=str(tmp_path))
+    assert loaded is not None and loaded.user_id == 'u1'
+    assert abs(loaded.get_tuning(dim) - 0.83) < 1e-6, "learned tuning must round-trip"
+
+
+def test_p5_get_or_create_returns_fresh_for_new_user(tmp_path):
+    from core.resonance_profile import get_or_create_profile
+    p = get_or_create_profile('brand_new', base_dir=str(tmp_path))
+    assert p is not None and p.user_id == 'brand_new'
