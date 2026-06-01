@@ -5,8 +5,12 @@
 
 {
   imports = [
-    # Mobile NixOS provides PinePhone kernel, device tree, modem support
-    "${mobile-nixos}/devices/pine64-pinephone"
+    # Mobile NixOS harness — declares the `mobile.*` option set AND loads the
+    # pine64-pinephone device (kernel, device tree, modem).  mobile-nixos is a
+    # plain path input (flake=false), so the device path alone leaves `mobile.*`
+    # UNDECLARED → "The option `mobile' does not exist" (#70).  lib/configuration.nix
+    # is the documented non-flake entrypoint that wires both.
+    (import "${mobile-nixos}/lib/configuration.nix" { device = "pine64-pinephone"; })
   ];
 
   # ─── Boot ───
