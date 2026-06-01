@@ -48,6 +48,23 @@ def test_prompt_id_for_goal_is_deterministic_and_numeric():
     assert prompt_id_for_goal('other') != a, "different goals differ"
 
 
+def test_source_guard_agent_daemon_uses_single_source_prompt_id_hash():
+    """DRY guard (paired with the behavioural determinism test above): the daemon
+    must store goal.prompt_id via dispatch.prompt_id_for_goal, NOT a second copy
+    of the md5(goal.id) formula.  A duplicate passes today (identical values) but
+    silently drifts the day prompt_id_for_goal changes — breaking REUSE tracking
+    AND the bridge's {owner}_{hash} GroupChat lookup, which no single-call-site
+    behavioural test can catch (the values are equal until the formula moves)."""
+    import inspect
+    from integrations.agent_engine import agent_daemon
+    src = inspect.getsource(agent_daemon)
+    assert 'prompt_id_for_goal' in src, (
+        "agent_daemon must resolve prompt_id via the single-source helper")
+    assert 'hashlib.md5(str(goal.id)' not in src, (
+        "agent_daemon has a duplicate md5(goal.id) prompt_id hash — it must call "
+        "dispatch.prompt_id_for_goal so the value matches the recipe path + bridge")
+
+
 def test_inject_resolves_flywheel_goal_with_null_prompt_id():
     """The fix: a flywheel goal (prompt_id=None) whose live GroupChat is
     registered under {owner}_{hash} must now resolve and accept the inject."""

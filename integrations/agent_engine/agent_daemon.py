@@ -935,12 +935,15 @@ class AgentDaemon:
                 except ImportError:
                     logger.warning("hive_guardrails not available — dispatch proceeds without guardrail pre-check")
 
-                # Store prompt_id on goal for REUSE tracking
-                # Must be NUMERIC — the adapter and /chat handler reject non-integer prompt_ids.
-                # Use deterministic hash of goal.id so same goal always gets same prompt_id.
-                import hashlib
-                _gh = int(hashlib.md5(str(goal.id).encode()).hexdigest()[:10], 16) % 100_000_000_000
-                prompt_id = str(max(1, _gh))
+                # Store prompt_id on goal for REUSE tracking — use the SINGLE
+                # SOURCE hash (dispatch.prompt_id_for_goal), NOT a duplicate md5.
+                # The CREATE/REUSE split above (and dispatch_goal + the steering
+                # bridge) all locate the recipe via this same hash; a second copy
+                # of the formula here would silently drift the day it changes,
+                # breaking REUSE tracking + bridge GroupChat lookup.  The helper is
+                # already numeric (adapter/chat handler reject non-integer ids).
+                from .dispatch import prompt_id_for_goal
+                prompt_id = prompt_id_for_goal(str(goal.id))
                 if not goal.prompt_id or not str(goal.prompt_id).isdigit():
                     goal.prompt_id = prompt_id
 
