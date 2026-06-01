@@ -70,6 +70,52 @@ _session_lock = threading.Lock()
 # Default timeout for all requests (connect, read) in seconds
 DEFAULT_TIMEOUT = (3, 15)
 
+# Shared httpx.Client for the autogen/openai LLM path.  Separate from the
+# requests Session above (openai uses httpx, not requests).
+_llm_httpx_client = None
+_llm_httpx_lock = threading.Lock()
+
+
+def get_llm_http_client():
+    """Return a process-wide shared ``httpx.Client`` for the autogen/openai LLM
+    path.  Thread-safe singleton; never closed (lives for the process).
+
+    WHY THIS EXISTS (py-spy diagnosis 2026-06-01): autogen rebuilds the OpenAI
+    client on EVERY ``register_for_llm`` (i.e. once per tool registration, via
+    ``ConversableAgent.update_tool_signature``).  Each fresh ``openai.OpenAI`` →
+    ``httpx.Client`` calls ``httpx.create_ssl_context`` → ``ssl.create_default_
+    context(cafile=certifi.where())``, which re-reads + re-parses the entire
+    system CA bundle (~150 root certs).  With ~40 core tools per agent and the
+    flywheel/coding agents spinning up agents continuously, that CA-bundle reload
+    storm was the #1 GIL hog — 56% of GIL-active samples, main process pinned at
+    >1 core, and a bare ``hi`` taking ~2m27s before the chat thread could win the
+    GIL.  (The LLM endpoint is the LOCAL llama-server over plain HTTP, so the TLS
+    setup is pure waste.)
+
+    Passing this ONE client as ``http_client`` in the autogen config_list (see
+    ``core.autogen_config.get_autogen_config_list``) makes openai reuse it, so
+    the SSL context is built exactly ONCE for the whole process.  ``httpx.Client``
+    is safe for concurrent use across the agent worker threads, and a shared
+    transport works across different ``base_url``s (openai applies base_url at
+    request-build time, not on the client).
+    """
+    global _llm_httpx_client
+    if _llm_httpx_client is not None:
+        return _llm_httpx_client
+    with _llm_httpx_lock:
+        if _llm_httpx_client is not None:
+            return _llm_httpx_client
+        import httpx
+        # Generous transport timeout: openai sets its own per-request timeout on
+        # top of this, so it is only a fallback — it must never be tighter than a
+        # long local generation, or it would cut streams off.
+        _llm_httpx_client = httpx.Client(
+            timeout=httpx.Timeout(600.0, connect=10.0))
+        logger.info(
+            "Shared LLM httpx.Client initialized — SSL context built once, "
+            "reused across all autogen client rebuilds")
+        return _llm_httpx_client
+
 
 def get_http_session() -> requests.Session:
     """
