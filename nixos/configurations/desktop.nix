@@ -31,7 +31,7 @@ in
 
   # ─── Disable ZFS (broken in nixpkgs 24.11 for kernel 6.15) ───
   boot.supportedFilesystems.zfs = lib.mkForce false;
-  nixpkgs.config.allowBroken = false;
+  # nixpkgs.config.allowBroken now set once at the flake level (#70)
 
   # Note: do NOT override `glibcLocales` with a custom `locales`
   # allow-list. Changing its derivation hash invalidates the

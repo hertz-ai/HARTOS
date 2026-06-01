@@ -76,6 +76,17 @@
       ./modules/hart-self-build.nix
     ];
 
+    # Single source of truth for nixpkgs config (allowUnfree etc.).  Kept OUT of
+    # the shared modules (hart-base/desktop/server used to each set it — a DRY
+    # spread) so vm-tests' runNixOSTest nodes, which receive read-only pkgs, do
+    # NOT hit "nixpkgs.config defined multiple times" (#70).  Real builds get it
+    # via mkSystem/mkImage below; the VM test gets it via its `pkgs` (checks).
+    nixpkgsConfig = {
+      allowUnfree = true;
+      allowBroken = false;  # was set per-config in desktop.nix/server.nix
+      permittedInsecurePackages = [ "electron-33.4.11" ];
+    };
+
     # Common specialArgs passed to all modules
     mkSpecialArgs = variant: {
       inherit llama-cpp mobile-nixos nixos-hardware;
@@ -90,6 +101,7 @@
         inherit system;
         specialArgs = mkSpecialArgs variant;
         modules = hartModules ++ [
+          { nixpkgs.config = nixpkgsConfig; }  # single source — #70
           ./configurations/${variant}.nix
         ] ++ extraModules;
       };
@@ -100,6 +112,7 @@
         inherit system format;
         specialArgs = mkSpecialArgs variant;
         modules = hartModules ++ [
+          { nixpkgs.config = nixpkgsConfig; }  # single source — #70
           ./configurations/${variant}.nix
         ] ++ extraModules;
       };
@@ -257,7 +270,9 @@
     # Checks: NixOS VM integration tests (nix flake check)
     # ═════════════════════════════════════════════════════════════
     checks.x86_64-linux = let
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      # Configured pkgs so runNixOSTest nodes (read-only) carry allowUnfree
+      # WITHOUT any node module setting nixpkgs.config — the #70 fix.
+      pkgs = import nixpkgs { system = "x86_64-linux"; config = nixpkgsConfig; };
       vmTests = import ./tests/vm-tests.nix {
         inherit pkgs hartModules;
         specialArgs = mkSpecialArgs "server";

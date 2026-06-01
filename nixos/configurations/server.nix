@@ -20,7 +20,7 @@
 
   # ─── Disable ZFS (broken in nixpkgs 24.11 for kernel 6.15) ───
   boot.supportedFilesystems.zfs = lib.mkForce false;
-  nixpkgs.config.allowBroken = false;
+  # nixpkgs.config.allowBroken now set once at the flake level (#70)
 
   # ─── Workaround: systemd-hwdb update fails on WSL2 build hosts ───
   # Replace the hwdb.bin derivation with a minimal stub.

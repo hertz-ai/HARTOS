@@ -96,11 +96,11 @@ in
   # ─── Configuration ──────────────────────────────────────────
   config = lib.mkIf cfg.enable {
 
-    # ── Allow unfree packages (NVIDIA drivers, CUDA) ──
-    nixpkgs.config.allowUnfree = true;
-    nixpkgs.config.permittedInsecurePackages = [
-      "electron-33.4.11"
-    ];
+    # ── nixpkgs.config (allowUnfree / permittedInsecurePackages) is set ONCE
+    #    at the flake level (`nixpkgsConfig` in flake.nix), NOT here.  hart-base
+    #    is imported by vm-tests' runNixOSTest nodes, which receive read-only
+    #    pkgs; a module-level nixpkgs.config there triggers "defined multiple
+    #    times" (#70).  Real builds get it via mkSystem/mkImage. ──
 
     # ── Branding ──
     environment.etc = {
