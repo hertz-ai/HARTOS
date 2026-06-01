@@ -170,3 +170,77 @@ def test_p5_get_or_create_returns_fresh_for_new_user(tmp_path):
     from core.resonance_profile import get_or_create_profile
     p = get_or_create_profile('brand_new', base_dir=str(tmp_path))
     assert p is not None and p.user_id == 'brand_new'
+
+
+# ════════════════════════════════════════════════════════════════════
+# P6 — One fabric: a SINGLE installer interface spans Windows + Linux +
+# Android ecosystems (the "runs everything" claim).  detect_platform is
+# pure logic and fully provable here; ACTUALLY installing/running a
+# Win/Android app is runtime-gated on the booted subsystems (ISO).
+# ════════════════════════════════════════════════════════════════════
+
+def test_p6_unified_installer_spans_os_ecosystems():
+    from integrations.agent_engine.app_installer import detect_platform, InstallerPlatform
+    assert detect_platform('game.apk') == InstallerPlatform.ANDROID
+    assert detect_platform('tool.appimage') == InstallerPlatform.APPIMAGE
+    assert detect_platform('app.flatpakref') == InstallerPlatform.FLATPAK
+    names = {m.name for m in InstallerPlatform}
+    assert {'ANDROID', 'FLATPAK', 'APPIMAGE'}.issubset(names), f"missing ecosystems: {names}"
+    assert any(n in names for n in ('WINDOWS', 'WINE', 'EXE', 'MSI')), \
+        f"P6: no Windows installer platform — 'runs Windows apps' unproven ({sorted(names)})"
+    # RUNTIME-GATED: the real install (flatpak/wine/apk) needs the booted subsystems.
+
+
+# ════════════════════════════════════════════════════════════════════
+# P2 — Sees you: the perceive surfaces (voice + camera) are WIRED as
+# routes.  Actual STT transcription + camera capture + VLM→action is
+# runtime-gated (mic/camera/model).
+# ════════════════════════════════════════════════════════════════════
+
+def test_p2_perceive_surfaces_are_wired():
+    try:
+        from flask import Flask
+        from integrations.agent_engine.shell_desktop_apis import register_shell_desktop_routes
+        from integrations.agent_engine.shell_system_apis import register_shell_system_routes
+    except Exception as e:
+        pytest.skip(f"shell route modules unavailable: {e}")
+    voice_app = Flask('p2_voice'); register_shell_desktop_routes(voice_app)
+    cam_app = Flask('p2_cam'); register_shell_system_routes(cam_app)
+    voice_rules = {r.rule for r in voice_app.url_map.iter_rules()}
+    cam_rules = {r.rule for r in cam_app.url_map.iter_rules()}
+    assert any('voice' in r for r in voice_rules), \
+        f"P2: no voice perceive route ({sorted(r for r in voice_rules if 'shell' in r)[:8]})"
+    assert any(('webcam' in r) or ('camera' in r) for r in cam_rules), "P2: no camera perceive route"
+    # RUNTIME-GATED: transcription + capture + VLM action execution need real I/O.
+
+
+# ════════════════════════════════════════════════════════════════════
+# P7 — Embodiment scaffolding: the embodied-learning skill relay exists
+# in HARTOS (in/out of the local world model).  The real perceive→act ML
+# lives in HevolveAI and needs a body — runtime-gated.
+# ════════════════════════════════════════════════════════════════════
+
+def test_p7_embodiment_skill_relay_present():
+    from integrations.agent_engine.world_model_bridge import WorldModelBridge
+    assert hasattr(WorldModelBridge, 'ingest_skill_packet'), "P7: no skill ingest"
+    assert hasattr(WorldModelBridge, 'distribute_skill_packet'), "P7: no skill distribute"
+    # CONTRACT only: the perceive→act loop on real hardware runs in HevolveAI.
+
+
+# ════════════════════════════════════════════════════════════════════
+# P8 — Hive: a node can EXPORT its learning delta (the data primitive).
+# VERDICT: primitives exist (export_resonance_delta / ingest_skill_packet
+# / import_hive_resonance) BUT the cross-PROCESS transport (Direction B:
+# inbound WAMP skill → HARTOS gossip) is BROKEN — #66.  So learning does
+# NOT yet propagate between separate machines.  P8 = primitives ✅, wire ❌.
+# ════════════════════════════════════════════════════════════════════
+
+def test_p8_node_can_export_learning_delta(tmp_path):
+    try:
+        from core.resonance_tuner import get_resonance_tuner
+        tuner = get_resonance_tuner()
+    except Exception as e:
+        pytest.skip(f"resonance tuner unavailable: {e}")
+    delta = tuner.export_resonance_delta(base_dir=str(tmp_path))
+    assert isinstance(delta, dict), "P8: a node must be able to export its learning delta"
+    # KNOWN GAP (#66): the cross-process relay that would carry this to peers is dead.
