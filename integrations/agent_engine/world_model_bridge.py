@@ -116,6 +116,23 @@ class WorldModelBridge:
                 logger.info(
                     "[WorldModelBridge] Learning not available in-process, "
                     "no explicit HEVOLVEAI_API_URL - HTTP disabled")
+            # B9: Direction B (a WAMP-received skill -> fan out to HARTOS gossip
+            # so HARTOS-only peers also learn) is wired via
+            # set_inbound_skill_hook, which is ONLY attached inside
+            # _init_in_process (it needs the in-process HiveMind whose
+            # on_remote_skill calls the hook). In the bundled subprocess
+            # topology the HiveMind lives in the spawned HevolveAI process while
+            # this bridge is in the HARTOS process, so the hook is never
+            # attached and Direction B is inactive. Make that VISIBLE instead of
+            # silently dead. The full fix is a cross-process channel (the
+            # HevolveAI subprocess notifies this bridge of received skills over
+            # the existing HTTP control path); tracked as a follow-up.
+            logger.warning(
+                "[WorldModelBridge] Direction B (inbound WAMP skill -> HARTOS "
+                "gossip fan-out) is INACTIVE in this out-of-process topology: "
+                "set_inbound_skill_hook only attaches to an in-process HiveMind. "
+                "Hierarchical federation to HARTOS-only peers is disabled until "
+                "a cross-process skill-relay channel is added.")
 
         # Periodic HevolveAI integrity watcher (Gap 1 fix)
         self._crawl_watcher = None
