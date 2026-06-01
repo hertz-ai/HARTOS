@@ -495,6 +495,33 @@ class _Supervisor:
             pass
 
     # -- Spawn & supervise loop ----------------------------------------
+    def _armored_bundle_dir(self):
+        """Return the ``vendor/hevolveai_armored`` dir IFF the armored path is
+        enabled AND a usable bundle (``modules/`` + ``_key.bin``) is present;
+        else ``None`` — Phase 2 of HEVOLVEAI_ARMOR_CANONICAL_PLAN.md.
+
+        Default OFF: ``HEVOLVE_HEVOLVEAI_ARMORED`` must be truthy.  When off, or
+        when no bundle is staged, ``_build_cmd`` falls back to the byte-identical
+        plain boot (zero-regression).  ``HEVOLVE_HEVOLVEAI_ARMORED_DIR`` overrides
+        the search.
+        """
+        flag = os.environ.get('HEVOLVE_HEVOLVEAI_ARMORED', '').strip().lower()
+        if flag not in ('1', 'true', 'yes', 'on'):
+            return None
+        here = os.path.dirname(os.path.abspath(__file__))  # integrations/agent_engine
+        candidates = [
+            os.path.normpath(os.path.join(here, '..', '..', 'vendor', 'hevolveai_armored')),
+            os.path.normpath(os.path.join(here, '..', '..', '..', 'vendor', 'hevolveai_armored')),
+        ]
+        _env_dir = os.environ.get('HEVOLVE_HEVOLVEAI_ARMORED_DIR')
+        if _env_dir:
+            candidates.insert(0, _env_dir)
+        for d in candidates:
+            if (os.path.isdir(os.path.join(d, 'modules'))
+                    and os.path.isfile(os.path.join(d, '_key.bin'))):
+                return d
+        return None
+
     def _build_cmd(self) -> list:
         """Launch the API server via an explicit import + uvicorn.run.
 
@@ -512,7 +539,30 @@ class _Supervisor:
         The module's FastAPI lifespan startup (background services, proof
         monitor) still fires when uvicorn starts the app, identical to the
         old ``if __name__ == '__main__'`` path minus the banner.
+
+        ARMORED PATH (Phase 2, flag-gated, default OFF): when an armored vendor
+        bundle is present AND HEVOLVE_HEVOLVEAI_ARMORED is on, boot installs the
+        Hevolvearmor loader (decrypts the .enc modules at import) BEFORE importing
+        api_server.  Otherwise the byte-identical plain boot below runs — so
+        default behaviour is unchanged.  The armored branch stays unverified
+        until the Phase 3 loader gate; it only activates under the explicit flag.
         """
+        _armored = self._armored_bundle_dir()
+        if _armored is not None:
+            _mods = os.path.join(_armored, 'modules')
+            _key = os.path.join(_armored, '_key.bin')
+            # repr() yields a valid escaped Python literal for the Windows path.
+            boot = (
+                "import os, uvicorn;"
+                "from hevolvearmor._loader import install_loader;"
+                "install_loader(%s, open(%s, 'rb').read(), ['hevolveai', 'embodied_ai']);"
+                "from hevolveai.server.api_server import app;"
+                "uvicorn.run(app, host='0.0.0.0',"
+                " port=int(os.environ.get('HEVOLVEAI_PORT', '8000')),"
+                " log_level='info')"
+            ) % (repr(_mods), repr(_key))
+            return [self.python_exe, '-c', boot]
+        # Plain fallback — byte-identical to the pre-Phase-2 path.
         boot = (
             "import os, uvicorn;"
             "from hevolveai.server.api_server import app;"
