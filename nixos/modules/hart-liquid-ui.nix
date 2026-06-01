@@ -107,18 +107,23 @@ Gtk.main()
   # Nunba/LiquidUI the OS *shell* instead of an app layered on GNOME.  Registered
   # via services.displayManager.sessionPackages; desktop.nix sets it default and
   # keeps GNOME as a selectable fallback session.
-  kioskSession = pkgs.writeTextFile {
-    name = "hart-shell-wayland-session";
-    destination = "/share/wayland-sessions/hart-shell.desktop";
-    text = ''
-      [Desktop Entry]
-      Name=HART OS
-      Comment=AI-native glass shell (Nunba / LiquidUI)
-      Exec=${pkgs.cage}/bin/cage -- ${glassShell}/bin/hart-glass-shell
-      Type=Application
-      DesktopNames=HART-OS
+  # The .desktop content (writeText keeps it heredoc-free + readable).
+  sessionDesktop = pkgs.writeText "hart-shell.desktop" ''
+    [Desktop Entry]
+    Name=HART OS
+    Comment=AI-native glass shell (Nunba / LiquidUI)
+    Exec=${pkgs.cage}/bin/cage -- ${glassShell}/bin/hart-glass-shell
+    Type=Application
+    DesktopNames=HART-OS
+  '';
+  # services.displayManager.sessionPackages REQUIRES passthru.providedSessions
+  # (the session id, matching the wayland-sessions/*.desktop basename) — without
+  # it nixos flake-check fails with "did not specify any session names".  A
+  # runCommand carries the passthru; writeTextFile cannot.
+  kioskSession = pkgs.runCommand "hart-shell-wayland-session"
+    { passthru.providedSessions = [ "hart-shell" ]; } ''
+      install -Dm644 ${sessionDesktop} $out/share/wayland-sessions/hart-shell.desktop
     '';
-  };
 in
 {
   # ═══════════════════════════════════════════════════════════
