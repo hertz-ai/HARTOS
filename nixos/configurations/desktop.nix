@@ -452,6 +452,15 @@
     user = lib.mkForce "hart-admin";
   };
 
+  # ─── Default session = the HART OS glass shell (NOT GNOME) ───
+  # This is the line that makes the install land in Nunba/LiquidUI instead of
+  # the GNOME desktop.  The "hart-shell" session is the cage kiosk registered by
+  # hart-liquid-ui.nix (Nunba/LiquidUI as the shell, no desktop beneath it).
+  # GNOME stays enabled + selectable at the greeter as a FALLBACK, so a shell
+  # that fails to come up can never brick the boot — interrupt auto-login and
+  # pick "GNOME".  Zero-regression by construction.
+  services.displayManager.defaultSession = lib.mkForce "hart-shell";
+
   # Audio: PipeWire bridges all subsystems (Linux, Android, Wine)
   services.pipewire = {
     enable = true;

@@ -53,6 +53,72 @@
 let
   cfg = config.hart;
   ui = config.hart.liquidUI;
+
+  # ── The glass shell renderer (single source) ──
+  # Fullscreen WebKit2 window onto the LiquidUI server.  If LiquidUI (:port) is
+  # not up yet it waits, then falls back to the Nunba SPA (:nunba.port) so the
+  # screen is NEVER the bare GNOME desktop or a blank page.  Used by BOTH the
+  # kiosk session (cage, below) and the in-GNOME app launcher — one renderer,
+  # no duplicate copies.
+  nunbaPort = toString (config.hart.nunba.port or 5000);
+  glassShell = pkgs.writeShellScriptBin "hart-glass-shell" ''
+    set -euo pipefail
+    URL="http://localhost:${toString ui.port}"
+    for i in $(seq 1 30); do
+      if ${pkgs.curl}/bin/curl -sf "$URL/health" >/dev/null 2>&1; then break; fi
+      sleep 1
+    done
+    if ! ${pkgs.curl}/bin/curl -sf "$URL/health" >/dev/null 2>&1; then
+      # LiquidUI down — fall back to the Nunba SPA so the shell is never blank.
+      if ${pkgs.curl}/bin/curl -sf "http://localhost:${nunbaPort}/" >/dev/null 2>&1; then
+        URL="http://localhost:${nunbaPort}"
+      fi
+    fi
+    export HART_SHELL_URL="$URL"
+    exec ${cfg.package.python}/bin/python -c "
+import gi, os
+gi.require_version('Gtk', '3.0')
+gi.require_version('WebKit2', '4.1')
+from gi.repository import Gtk, WebKit2
+
+class GlassShell(Gtk.Window):
+    def __init__(self):
+        super().__init__(title='HART OS')
+        self.set_default_size(1280, 800)
+        webview = WebKit2.WebView()
+        webview.load_uri(os.environ.get('HART_SHELL_URL', 'http://localhost:${toString ui.port}'))
+        s = webview.get_settings()
+        s.set_enable_javascript(True)
+        s.set_enable_developer_extras(False)
+        s.set_hardware_acceleration_policy(WebKit2.HardwareAccelerationPolicy.ALWAYS)
+        self.add(webview)
+        self.connect('destroy', Gtk.main_quit)
+        self.show_all()
+        self.fullscreen()
+
+GlassShell()
+Gtk.main()
+"
+  '';
+
+  # ── Kiosk Wayland session ──
+  # cage runs ONLY the glass shell as the compositor's single client.  There is
+  # no desktop, no app-grid, no GNOME beneath it — THIS is what makes
+  # Nunba/LiquidUI the OS *shell* instead of an app layered on GNOME.  Registered
+  # via services.displayManager.sessionPackages; desktop.nix sets it default and
+  # keeps GNOME as a selectable fallback session.
+  kioskSession = pkgs.writeTextFile {
+    name = "hart-shell-wayland-session";
+    destination = "/share/wayland-sessions/hart-shell.desktop";
+    text = ''
+      [Desktop Entry]
+      Name=HART OS
+      Comment=AI-native glass shell (Nunba / LiquidUI)
+      Exec=${pkgs.cage}/bin/cage -- ${glassShell}/bin/hart-glass-shell
+      Type=Application
+      DesktopNames=HART-OS
+    '';
+  };
 in
 {
   # ═══════════════════════════════════════════════════════════
@@ -275,57 +341,24 @@ in
     # ─────────────────────────────────────────────────────────
     (lib.mkIf (ui.renderer == "webkit") {
 
-      # User-level service: opens WebKit2 window connected to LiquidUI server
+      # Register the kiosk session ("HART OS") so the display manager can run the
+      # glass shell as the *session* itself.  desktop.nix sets it as the default
+      # session and keeps GNOME as a selectable fallback — THIS is what makes
+      # Nunba/LiquidUI the OS shell instead of an app layered on GNOME.
+      services.displayManager.sessionPackages = [ kioskSession ];
+
+      # Legacy in-GNOME renderer: repointed at the single ``glassShell`` script
+      # (no duplicate renderer) and NOT auto-started — the kiosk session launches
+      # the glass shell directly, so auto-layering it on the GNOME fallback would
+      # double-launch.  Kept as a manually-startable unit for debugging.
       systemd.user.services.hart-liquid-ui-renderer = {
         description = "HART OS LiquidUI Renderer (WebKit2)";
         after = [ "graphical-session.target" ];
         partOf = [ "graphical-session.target" ];
-        wantedBy = [ "graphical-session.target" ];
+        wantedBy = [ ];  # kiosk session is the canonical launch; do not auto-layer on GNOME
 
         serviceConfig = {
-          ExecStart = pkgs.writeShellScript "hart-liquid-ui-renderer" ''
-            set -euo pipefail
-
-            # Wait for LiquidUI server
-            for i in $(seq 1 30); do
-              if curl -sf "http://localhost:${toString ui.port}/health" >/dev/null 2>&1; then
-                break
-              fi
-              sleep 1
-            done
-
-            # Launch WebKit2 window
-            exec ${cfg.package.python}/bin/python -c "
-            import gi
-            gi.require_version('Gtk', '3.0')
-            gi.require_version('WebKit2', '4.1')
-            from gi.repository import Gtk, WebKit2, GLib
-
-            class LiquidUIWindow(Gtk.Window):
-                def __init__(self):
-                    super().__init__(title='HART OS')
-                    self.set_default_size(1280, 800)
-
-                    webview = WebKit2.WebView()
-                    webview.load_uri('http://localhost:${toString ui.port}')
-
-                    settings = webview.get_settings()
-                    settings.set_enable_javascript(True)
-                    settings.set_enable_developer_extras(False)
-                    settings.set_hardware_acceleration_policy(
-                        WebKit2.HardwareAccelerationPolicy.ALWAYS)
-
-                    self.add(webview)
-                    self.connect('destroy', Gtk.main_quit)
-
-                    # Fullscreen: this IS the desktop shell
-                    self.show_all()
-                    self.fullscreen()
-
-            win = LiquidUIWindow()
-            Gtk.main()
-            "
-          '';
+          ExecStart = "${glassShell}/bin/hart-glass-shell";
 
           Restart = "on-failure";
           RestartSec = 3;
@@ -448,7 +481,7 @@ in
         Type=Application
         Name=HART OS Desktop Shell
         Comment=HART OS Glass Desktop Shell
-        Exec=${cfg.package.python}/bin/python -c "import gi; gi.require_version('Gtk','3.0'); gi.require_version('WebKit2','4.1'); from gi.repository import Gtk, WebKit2; w = Gtk.Window(title='HART OS'); w.set_default_size(1280,800); v = WebKit2.WebView(); s = v.get_settings(); s.set_enable_javascript(True); v.load_uri('http://localhost:${toString ui.port}'); w.add(v); w.connect('destroy', Gtk.main_quit); w.show_all(); w.fullscreen(); Gtk.main()"
+        Exec=${glassShell}/bin/hart-glass-shell
         Icon=hart
         Categories=System;
         StartupNotify=true
