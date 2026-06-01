@@ -114,3 +114,25 @@ def test_get_stats_still_has_baseline_keys():
     for key in ("mode", "throttle", "cpu_limit", "gpu_allowed",
                 "managed_subprocesses"):
         assert key in stats
+
+
+# -- launch command must work with the Cython-compiled bundle ----------
+
+def test_build_cmd_uses_import_not_dash_m():
+    """Regression for the rc=1 child crash in the bundled Nunba build.
+
+    The bundled hevolveai package is Cython-compiled + source-stripped
+    (api_server.cp312-win_amd64.pyd), so `python -m hevolveai.server.api_server`
+    fails with "No code object available ...". The launcher MUST import the
+    module and run uvicorn instead, which works for both .pyd and .py.
+    """
+    # Build a supervisor instance without spawning (constructor is cheap).
+    sup = _sup._Supervisor()
+    cmd = sup._build_cmd()
+    # -c import form, never -m
+    assert "-c" in cmd, f"launcher must use python -c, got {cmd}"
+    assert "-m" not in cmd, f"launcher must NOT use -m (breaks .pyd bundle): {cmd}"
+    boot = cmd[-1]
+    assert "from hevolveai.server.api_server import app" in boot
+    assert "uvicorn.run(app" in boot
+    assert "HEVOLVEAI_PORT" in boot
