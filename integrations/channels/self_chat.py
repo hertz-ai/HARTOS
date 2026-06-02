@@ -125,10 +125,14 @@ class SelfChatHandler:
                 logger.debug("self-chat session.add_message failed", exc_info=True)
 
         # 3. Dispatch to agent API with is_self_chat marker
+        from .chat_contract import chat_request_fields, chat_reply
         payload = {
             "user_id": self.owner_user_id,
             "prompt_id": self.owner_prompt_id,
-            "prompt": message.content,
+            # Dual /chat contract (standalone 'prompt' + bundled Nunba 'text') —
+            # SAME single source FlaskChannelIntegration uses; self-chat is the
+            # second inbound path, so it must not drift back to prompt-only.
+            **chat_request_fields(message.content),
             "create_agent": False,  # self-chat never needs agent creation
             "device_id": self.device_id,
             "channel_context": {
@@ -155,7 +159,7 @@ class SelfChatHandler:
             return None
 
         try:
-            reply = (resp.json() or {}).get("response") or ""
+            reply = chat_reply(resp.json() or {})  # 'response' (HARTOS) or 'text' (Nunba)
         except Exception:  # noqa: BLE001
             reply = ""
         reply = reply or "✓ noted"

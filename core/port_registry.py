@@ -273,16 +273,11 @@ def _probe_llm_endpoint(url: str) -> bool:
         if (time.time() - ts) < _LLM_PROBE_NEG_TTL:
             return ok
     try:
-        import socket
         body = url.split('://', 1)[-1].split('/', 1)[0]
         host, _, port_s = body.partition(':')
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(_LLM_PROBE_TIMEOUT)
-        try:
-            ok = s.connect_ex(
-                (host or '127.0.0.1', int(port_s or 0))) == 0
-        finally:
-            s.close()
+        # Shared connect-probe primitive (one socket idiom for the whole module).
+        ok = _is_port_listening(int(port_s or 0), host or '127.0.0.1',
+                                _LLM_PROBE_TIMEOUT)
     except Exception:
         ok = False
     _llm_probe_cache[url] = (ok, time.time())
@@ -419,14 +414,10 @@ def get_local_draft_url() -> str:
     # If draft port has no server, use the main LLM instead (single-model mode).
     # This makes the main model serve BOTH draft and agentic roles on low VRAM.
     try:
-        import socket
         _body = url.split('://', 1)[-1].split('/', 1)[0]
         host, _, port_s = _body.partition(':')
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.3)
-        result = s.connect_ex((host or '127.0.0.1', int(port_s or 8081)))
-        s.close()
-        if result != 0:
+        # Shared connect-probe primitive (one socket idiom for the whole module).
+        if not _is_port_listening(int(port_s or 8081), host or '127.0.0.1', 0.3):
             # Draft port not listening → use main model as draft
             return get_local_llm_url()
     except Exception:

@@ -144,17 +144,14 @@ class FlaskChannelIntegration:
                     return None
 
             # Prepare request to agent API
+            from .chat_contract import chat_request_fields, chat_reply
             payload = {
                 "user_id": user_id,
                 "prompt_id": prompt_id,
-                # Two chat contracts answer /chat depending on topology:
-                # standalone HARTOS (hart_intelligence_entry.chat) reads
-                # "prompt"; the bundled Nunba desktop (chatbot_routes.chat_route,
-                # which shadows it on :5000) reads "text".  Send BOTH so the
-                # inbound channel→agent leg works in either — verified live: a
-                # prompt-only payload 400'd "Text is required" on the bundled app.
-                "prompt": message.content,
-                "text": message.content,
+                # Dual /chat contract (standalone HARTOS 'prompt' + bundled Nunba
+                # 'text') — single source in chat_contract, shared with
+                # SelfChatHandler so neither inbound path drifts.
+                **chat_request_fields(message.content),
                 "create_agent": self.create_mode,
                 "device_id": self._device_id,
                 "channel_context": {
@@ -178,12 +175,7 @@ class FlaskChannelIntegration:
 
             if response.status_code == 200:
                 result = response.json()
-                # Same dual contract as the request: standalone HARTOS /chat
-                # returns "response"; the bundled Nunba chat_route returns the
-                # reply under "text".  Read either so inbound gets the REAL
-                # reply (not the "I processed your request." fallback) in both.
-                agent_reply = (result.get("response") or result.get("text")
-                               or "I processed your request.")
+                agent_reply = chat_reply(result, "I processed your request.")
 
                 # Track response in session history
                 if session:

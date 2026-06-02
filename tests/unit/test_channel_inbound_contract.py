@@ -102,3 +102,30 @@ def test_inbound_reads_reply_from_response_key_standalone():
     with patch('integrations.channels.flask_integration.pooled_post', fake_post):
         reply = fi._handle_message(_msg())
     assert reply == 'pong'
+
+
+# ── chat_contract: the single source both inbound paths share ──────────
+
+def test_chat_contract_request_sends_both_keys():
+    from integrations.channels.chat_contract import chat_request_fields
+    assert chat_request_fields('hi') == {'prompt': 'hi', 'text': 'hi'}
+
+
+def test_chat_contract_reply_reads_either_key():
+    from integrations.channels.chat_contract import chat_reply
+    assert chat_reply({'response': 'a'}) == 'a'           # standalone HARTOS
+    assert chat_reply({'text': 'b'}) == 'b'               # bundled Nunba
+    assert chat_reply({'response': 'a', 'text': 'b'}) == 'a'  # response preferred
+    assert chat_reply({}, 'fallback') == 'fallback'
+    assert chat_reply(None, 'fallback') == 'fallback'     # non-dict safe
+
+
+def test_self_chat_uses_shared_dual_contract():
+    """SelfChatHandler (the 2nd inbound path) must send 'text' too + read
+    'text' — it used to be prompt-only/response-only (parallel-path bug)."""
+    import inspect
+    from integrations.channels import self_chat
+    src = inspect.getsource(self_chat)
+    assert 'chat_request_fields' in src and 'chat_reply' in src, (
+        "self_chat must go through the shared chat_contract, not a private "
+        "prompt-only/response-only path")
