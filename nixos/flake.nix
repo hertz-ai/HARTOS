@@ -270,11 +270,15 @@
     # Checks: NixOS VM integration tests (nix flake check)
     # ═════════════════════════════════════════════════════════════
     checks.x86_64-linux = let
-      # Configured pkgs so runNixOSTest nodes (read-only) carry allowUnfree
-      # WITHOUT any node module setting nixpkgs.config — the #70 fix.
-      pkgs = import nixpkgs { system = "x86_64-linux"; config = nixpkgsConfig; };
+      # Plain host pkgs for the test DRIVER only.  A *configured* host pkgs
+      # made runNixOSTest set each node's pkgs read-only, which then collided
+      # with the framework's own instrumentation overlay ("nixpkgs.overlays
+      # defined multiple times", #70).  Nodes instead get allowUnfree via
+      # `defaults.nixpkgs.config` inside vm-tests.nix, so they build their own
+      # pkgs and the framework overlay merges cleanly.
+      pkgs = nixpkgs.legacyPackages."x86_64-linux";
       vmTests = import ./tests/vm-tests.nix {
-        inherit pkgs hartModules;
+        inherit pkgs hartModules nixpkgsConfig;
         specialArgs = mkSpecialArgs "server";
       };
     in vmTests;

@@ -155,7 +155,7 @@
   '';
 
   # ─── Cellular ───
-  services.modemManager.enable = true;
+  networking.modemmanager.enable = true;  # #70: was services.modemManager (no such option)
 
   networking = {
     networkmanager = {
