@@ -2557,18 +2557,12 @@ def marketing_intents():
     })
 
 
-@social_bp.route('/marketing/stats', methods=['GET'])
-def marketing_stats():
-    """Aggregate click counts by code + event from the JSONL log.
-
-    Optional ?code=X filters to one channel. Returns
-    {by_code: {code: {click, download, install, signup}}, total}.
-    Reads the same file the /marketing/track endpoint writes.
-    """
+def _read_marketing_funnel(code_filter=None):
+    """SINGLE SOURCE reader for the marketing_clicks.jsonl funnel.  Returns
+    (by_code {code: {click,download,install,signup}}, total).  Used by both
+    /marketing/stats and /marketing/growth so the funnel is read one way."""
     import json as _json
     import os as _os
-
-    code_filter = (request.args.get('code') or '').strip().lower() or None
     try:
         from core.platform_paths import get_data_dir
         data_dir = get_data_dir()
@@ -2599,7 +2593,71 @@ def marketing_stats():
                 if e in bucket:
                     bucket[e] += 1
                 total += 1
+    return by_code, total
+
+
+@social_bp.route('/marketing/stats', methods=['GET'])
+def marketing_stats():
+    """Aggregate click counts by code + event from the JSONL log.
+
+    Optional ?code=X filters to one channel. Returns
+    {by_code: {code: {click, download, install, signup}}, total}.
+    Reads the same file the /marketing/track endpoint writes.
+    """
+    code_filter = (request.args.get('code') or '').strip().lower() or None
+    by_code, total = _read_marketing_funnel(code_filter)
     return _ok({'by_code': by_code, 'total': total})
+
+
+@social_bp.route('/marketing/growth', methods=['GET'])
+def marketing_growth():
+    """Progress-toward-10K dashboard: the actual user count vs the target, the
+    weekly velocity, AND the per-channel funnel (click->download->signup with a
+    conversion rate, sorted by signups) — so we can SEE whether we're on track
+    to 10K and which channel actually converts.  Combines the canonical user
+    store with the single-source marketing funnel reader.
+
+    Returns {target, total_users, pct_to_target, remaining, new_users_7d,
+             funnel_events_total, channels:[{code,click,download,install,signup,
+             signup_rate}], top_channel}.
+    """
+    import os as _os
+    from datetime import datetime as _dt, timedelta as _td
+
+    target = int(_os.environ.get('HEVOLVE_USER_TARGET', '10000'))
+    by_code, funnel_total = _read_marketing_funnel()
+
+    total_users = 0
+    new_7d = 0
+    try:
+        from .models import db_session, User
+        with db_session() as db:
+            total_users = db.query(User).count()
+            week_ago = _dt.utcnow() - _td(days=7)
+            new_7d = db.query(User).filter(User.created_at >= week_ago).count()
+    except Exception as e:
+        logger.debug(f"growth dashboard: user count unavailable ({e})")
+
+    channels = []
+    for code, b in by_code.items():
+        clicks = b.get('click', 0)
+        channels.append({
+            'code': code,
+            **b,
+            'signup_rate': round(b.get('signup', 0) / clicks, 4) if clicks else 0.0,
+        })
+    channels.sort(key=lambda x: (x.get('signup', 0), x.get('click', 0)), reverse=True)
+
+    return _ok({
+        'target': target,
+        'total_users': total_users,
+        'pct_to_target': round(100.0 * total_users / target, 2) if target else 0.0,
+        'remaining': max(0, target - total_users),
+        'new_users_7d': new_7d,
+        'funnel_events_total': funnel_total,
+        'channels': channels,
+        'top_channel': channels[0]['code'] if channels else None,
+    })
 
 
 # ═══════════════════════════════════════════════════════════════

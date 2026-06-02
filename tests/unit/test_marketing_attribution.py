@@ -198,3 +198,35 @@ def test_record_event_skips_user_referral_code(tmp_path):
         from integrations.social.api import _record_marketing_event
         assert _record_marketing_event('ABC123XYZ', 'signup', 'web') is None
         assert not os.path.exists(os.path.join(str(tmp_path), 'marketing_clicks.jsonl'))
+
+
+# ─── /marketing/growth — progress-toward-10K dashboard ───
+
+def test_growth_dashboard_combines_funnel_and_target(tmp_path):
+    """The "make sure we have 10K" view: user-count-vs-target + the per-channel
+    funnel with conversion, sorted so the best-converting channel surfaces."""
+    client, patcher = _make_client(str(tmp_path))
+    try:
+        for _ in range(5):
+            client.post('/api/social/marketing/track', json={'code': 'li_a', 'event': 'click'})
+        for _ in range(2):
+            client.post('/api/social/marketing/track', json={'code': 'li_a', 'event': 'signup'})
+        for _ in range(3):
+            client.post('/api/social/marketing/track', json={'code': 'tw1', 'event': 'click'})
+
+        resp = client.get('/api/social/marketing/growth')
+        assert resp.status_code == 200
+        data = resp.get_json()['data']
+        assert data['target'] == 10000
+        # user count + trajectory fields present (count may be 0 with no DB)
+        for k in ('total_users', 'pct_to_target', 'remaining', 'new_users_7d'):
+            assert k in data
+        assert isinstance(data['total_users'], int) and data['total_users'] >= 0
+        assert data['funnel_events_total'] == 10  # 5 + 2 + 3
+        # channels sorted by signups desc → li_a (2 signups) leads tw1 (0)
+        assert data['top_channel'] == 'li_a'
+        assert data['channels'][0]['code'] == 'li_a'
+        assert data['channels'][0]['signup'] == 2
+        assert data['channels'][0]['signup_rate'] == round(2 / 5, 4)
+    finally:
+        patcher.stop()
