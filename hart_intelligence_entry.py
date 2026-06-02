@@ -7601,8 +7601,14 @@ def _autonomous_gather_info(user_id, description, prompt_id):
     # When the action count swings by more than _OSC_DELTA between
     # consecutive proposed_plans, the reviewer is not converging;
     # burning more rounds wastes ~10s each.  Escalate immediately.
+    # Deterministic oscillation guard — extracted to a tiny pure module so it's
+    # unit-tested in isolation (#57, Gate 5).  Behaviour unchanged.
+    from core.plan_oscillation import (
+        plan_action_count as _plan_action_count,
+        is_plan_oscillating as _is_plan_oscillating,
+        OSC_DELTA as _OSC_DELTA,
+    )
     _prev_action_count = None
-    _OSC_DELTA = 3
     while review_rounds < MAX_REVIEW_ROUNDS:
         try:
             new_response = response.replace('true', 'True').replace('false', 'False')
@@ -7627,14 +7633,8 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 # Oscillation guard — must run BEFORE the reviewer is
                 # called for this round.  Cheap dict-walk on the
                 # already-parsed plan.
-                try:
-                    _flows = parsed.get('flows') or []
-                    _actions = (_flows[0].get('actions') if _flows else []) or []
-                    _action_count = len(_actions)
-                except Exception:
-                    _action_count = None
-                if (_prev_action_count is not None and _action_count is not None
-                        and abs(_action_count - _prev_action_count) > _OSC_DELTA):
+                _action_count = _plan_action_count(parsed)
+                if _is_plan_oscillating(_prev_action_count, _action_count):
                     app.logger.warning(
                         f'Plan oscillation detected (round {review_rounds}): '
                         f'action_count {_prev_action_count} -> {_action_count} '
