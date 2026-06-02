@@ -13,6 +13,11 @@ master_private_key.hex
 prompt/
 prompt/*
 logs/
+
+# Runtime scratch — agent traces / memory / per-run output (never commit;
+# may contain user data). Present since the 2026-05-30 run dirs.
+data/
+runs/
 log/
 # All log files — never commit logs
 *.log
