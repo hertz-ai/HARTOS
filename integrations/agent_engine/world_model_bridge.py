@@ -116,23 +116,30 @@ class WorldModelBridge:
                 logger.info(
                     "[WorldModelBridge] Learning not available in-process, "
                     "no explicit HEVOLVEAI_API_URL - HTTP disabled")
-            # B9: Direction B (a WAMP-received skill -> fan out to HARTOS gossip
-            # so HARTOS-only peers also learn) is wired via
-            # set_inbound_skill_hook, which is ONLY attached inside
-            # _init_in_process (it needs the in-process HiveMind whose
-            # on_remote_skill calls the hook). In the bundled subprocess
-            # topology the HiveMind lives in the spawned HevolveAI process while
-            # this bridge is in the HARTOS process, so the hook is never
-            # attached and Direction B is inactive. Make that VISIBLE instead of
-            # silently dead. The full fix is a cross-process channel (the
-            # HevolveAI subprocess notifies this bridge of received skills over
-            # the existing HTTP control path); tracked as a follow-up.
-            logger.warning(
-                "[WorldModelBridge] Direction B (inbound WAMP skill -> HARTOS "
-                "gossip fan-out) is INACTIVE in this out-of-process topology: "
-                "set_inbound_skill_hook only attaches to an in-process HiveMind. "
-                "Hierarchical federation to HARTOS-only peers is disabled until "
-                "a cross-process skill-relay channel is added.")
+            # #66: Direction B (inbound WAMP skill -> fan out to HARTOS gossip
+            # so HARTOS-only peers also learn).  The set_inbound_skill_hook
+            # path only fires when HiveMind is in THIS process; in the bundled
+            # subprocess topology HiveMind lives in the spawned HevolveAI
+            # process.  Rather than depend on the (closed-source) HevolveAI
+            # side to notify us, we subscribe to the SHARED `hivemind.skill.
+            # share` MessageBus topic DIRECTLY — the same topic Direction A
+            # publishes to — and fan out on receipt.  Entirely HARTOS-side, so
+            # it works in the co-located bundle without any HevolveAI change.
+            # No self-echo: Direction A's publish is gated on `self._in_process`
+            # (line ~1384), so an out-of-process bridge never publishes here.
+            try:
+                from core.peer_link.message_bus import get_message_bus
+                get_message_bus().subscribe(
+                    'hivemind.skill.share', self._on_cross_process_skill)
+                logger.info(
+                    "[WorldModelBridge] Direction B ACTIVE (out-of-process): "
+                    "subscribed to hivemind.skill.share over the MessageBus — "
+                    "inbound skills fan out to HARTOS gossip, no HevolveAI "
+                    "dependency.")
+            except Exception as e:
+                logger.warning(
+                    "[WorldModelBridge] Direction B inactive — could not "
+                    "subscribe to hivemind.skill.share over the bus: %s", e)
 
         # Periodic HevolveAI integrity watcher (Gap 1 fix)
         self._crawl_watcher = None
@@ -395,6 +402,29 @@ class WorldModelBridge:
                     f"[WorldModelBridge] in-process probe failed: {e}")
         logger.info(
             f"[WorldModelBridge] HTTP mode: {self._api_url}")
+
+    def _on_cross_process_skill(self, topic: str, data: Dict) -> None:
+        """#66: MessageBus handler for `hivemind.skill.share` when HiveMind is
+        OUT of this process (bundled subprocess topology).  Bridges a
+        bus-delivered skill packet into the same Direction-B fan-out the
+        in-process hook (`_on_inbound_wamp_skill`) uses, so HARTOS-only peers
+        learn the skill without any HevolveAI-side notification.
+
+        Echo-safety: an out-of-process bridge never PUBLISHES to this topic
+        (Direction A's publish is gated on `self._in_process`), so packets
+        here originate from the HevolveAI subprocess / peers.  We still drop a
+        packet whose `origin_node` is our own, defensively, in case a future
+        change makes this bridge publish too."""
+        try:
+            if not isinstance(data, dict):
+                return
+            origin = data.get('origin_node')
+            own = getattr(self, '_node_id', None)
+            if origin and own and origin == own:
+                return  # our own publish looped back — ignore
+            self._on_inbound_wamp_skill(data, source=str(origin or 'cross_process'))
+        except Exception as e:
+            logger.debug("[WorldModelBridge] _on_cross_process_skill error: %s", e)
 
     def _on_inbound_wamp_skill(self, packet: Dict, source: str) -> None:
         """Direction B handler — invoked by HevolveAI HiveMind for every
