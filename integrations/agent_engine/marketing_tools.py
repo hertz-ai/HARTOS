@@ -285,6 +285,27 @@ def register_marketing_tools(helper, assistant, user_id: str):
         except Exception as e:
             return json.dumps({'ok': False, 'error': str(e)})
 
+    def post_to_channel_via_browser(
+        channel: Annotated[str, "Platform with a web composer the user is logged into: twitter|linkedin|reddit|hackernews"],
+        content: Annotated[Optional[str], "Text to post (defaults to the canonical body for that channel from marketing/intents)"] = None,
+    ) -> str:
+        """Post to a channel through the user's LOGGED-IN BROWSER via the VLM loop —
+        the credential-free path for channels that have no API token.  Generic
+        across every platform in marketing/intents (NOT LinkedIn-only): it opens
+        the platform's composer URL, types the content, and clicks Post.
+
+        Use this when post_to_channel reports the adapter has no credentials but
+        the user is logged into that site in their desktop browser.  Gate every
+        EXTERNAL post on operator consent before calling.  Returns JSON
+        {ok, platform, code, status, detail}.
+        """
+        try:
+            from integrations.marketing.browser_poster import post_to_platform_via_browser
+            return json.dumps(post_to_platform_via_browser(
+                channel, body=content, user_id=str(user_id)))
+        except Exception as e:
+            return json.dumps({'ok': False, 'error': str(e)})
+
     # Register all marketing tools
     tools = [
         ('create_social_post', 'Create a post on the HART social platform for marketing', create_social_post),
@@ -294,6 +315,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
         ('create_referral_campaign', 'Create a referral-driven growth campaign with auto-generated referral code', create_referral_campaign),
         ('get_growth_metrics', 'Get platform growth metrics including viral coefficient (K factor)', get_growth_metrics),
         ('record_demo_video', 'Record a short screen demo video of the app running; returns a file path to attach via post_to_channel/create_social_post media_url', record_demo_video),
+        ('post_to_channel_via_browser', 'Post to a channel via the logged-in browser (VLM loop) when it has no API token — generic across twitter/linkedin/reddit/hackernews', post_to_channel_via_browser),
     ]
 
     for name, desc, func in tools:
