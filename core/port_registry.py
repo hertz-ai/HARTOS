@@ -206,6 +206,42 @@ def get_mode_label() -> str:
     return 'OS' if is_os_mode() else 'APP'
 
 
+def _is_port_listening(port: int, host: str = '127.0.0.1',
+                       timeout: float = 0.25) -> bool:
+    """True iff something is accepting TCP on host:port (connect-probe).
+    Opposite of check_port_available (a bind-probe)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        return s.connect_ex((host, int(port))) == 0
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def get_local_backend_url() -> str:
+    """Single source for the live local HARTOS backend base URL (no trailing
+    slash).
+
+    HEVOLVE_BASE_URL wins when set (remote/cloud deploys + the shared
+    discovery/federation base).  Otherwise probe the local serve ports and
+    return the first that's actually LISTENING — a standalone server serves on
+    backend (6777); the bundled desktop serves HARTOS in-process on the Flask
+    port (5000).  Falls back to backend on cold boot.
+
+    Used by BOTH the channel inbound bridge (flask_integration) and the
+    dispatch Tier-2 fallback — ONE resolver, so neither hardcodes a dead
+    :6777 in bundled mode (#71 + omni-channel bridge inbound)."""
+    env = os.environ.get('HEVOLVE_BASE_URL')
+    if env:
+        return env.rstrip('/')
+    for svc in ('backend', 'flask'):
+        if _is_port_listening(get_port(svc)):
+            return f'http://localhost:{get_port(svc)}'
+    return f'http://localhost:{get_port("backend")}'
+
+
 # ── LLM URL Resolution ──────────────────────────────────────
 
 _llm_url_cache: str = ''

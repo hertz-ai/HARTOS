@@ -43,8 +43,11 @@ class FlaskChannelIntegration:
         if default_prompt_id is None:
             default_prompt_id = DEFAULT_PROMPT_ID
         if agent_api_url is None:
-            from core.port_registry import get_port
-            agent_api_url = f"http://localhost:{get_port('backend')}/chat"
+            # #62 inbound leg: reach the LIVE local HARTOS, not a hardcoded
+            # :6777 (dead in bundled mode, where HARTOS serves in-process on
+            # :5000).  Shared resolver with dispatch Tier-2 — no parallel path.
+            from core.port_registry import get_local_backend_url
+            agent_api_url = get_local_backend_url() + '/chat'
         self.agent_api_url = agent_api_url
         self.default_user_id = default_user_id
         self.default_prompt_id = default_prompt_id
