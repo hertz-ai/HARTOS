@@ -173,3 +173,28 @@ def test_repeat_clicks_accumulate(tmp_path):
         assert data['by_code']['wa_broadcast']['click'] == 10
     finally:
         patcher.stop()
+
+
+# ─── _record_marketing_event — the single-source writer used by BOTH the
+#     /marketing/track route AND signup (register), so a marketing-driven
+#     signup is counted with the same writer the clicks/downloads use. ───
+
+def test_record_event_writes_signup_row_directly(tmp_path):
+    with patch('core.platform_paths.get_data_dir', return_value=str(tmp_path)):
+        from integrations.social.api import _record_marketing_event
+        row = _record_marketing_event('hn_show', 'signup', 'web', b'9.9.9.9', 'UA')
+        assert row is not None and row['code'] == 'hn_show' and row['event'] == 'signup'
+        path = os.path.join(str(tmp_path), 'marketing_clicks.jsonl')
+        last = json.loads(open(path, encoding='utf-8').read().strip().splitlines()[-1])
+        assert last['event'] == 'signup' and last['code'] == 'hn_show'
+        assert '9.9.9.9' not in open(path, encoding='utf-8').read()  # ip hashed
+
+
+def test_record_event_skips_user_referral_code(tmp_path):
+    """register() funnels ALL referral_codes through this writer; a mixed-case
+    user invite code (handled by the Referral table) must NOT create a channel
+    row, or it would pollute channel attribution."""
+    with patch('core.platform_paths.get_data_dir', return_value=str(tmp_path)):
+        from integrations.social.api import _record_marketing_event
+        assert _record_marketing_event('ABC123XYZ', 'signup', 'web') is None
+        assert not os.path.exists(os.path.join(str(tmp_path), 'marketing_clicks.jsonl'))

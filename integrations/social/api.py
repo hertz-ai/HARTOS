@@ -130,6 +130,18 @@ def register():
                 except Exception as e:
                     logger.debug(f"Referral code application skipped: {e}")
 
+                # Authoritative channel-attribution: count this signup against the
+                # channel code via the SAME single-source writer the click/download
+                # events use.  Silently skips when referral_code is a user invite
+                # code rather than a lowercase channel tag (li_a, hn_show, ...).
+                try:
+                    _record_marketing_event(
+                        referral_code, 'signup', 'web',
+                        (request.remote_addr or '').encode(),
+                        (request.headers.get('User-Agent') or '')[:200])
+                except Exception:
+                    pass
+
             return _ok(user.to_dict(include_token=True), status=201)
     except ValueError as e:
         return _err(str(e))
@@ -2442,6 +2454,51 @@ def unread_by_source():
 # MARKETING ATTRIBUTION (task #178 — flywheel download tracking)
 # ═══════════════════════════════════════════════════════════════
 
+def _record_marketing_event(code, event, platform='', ip=b'', ua=''):
+    """SINGLE SOURCE for the channel-attribution funnel.  Appends one row to
+    marketing_clicks.jsonl and returns it, or returns None if the code/event
+    shape is invalid (e.g. a user referral code that isn't a lowercase channel
+    tag — those are handled by the Referral table, not this funnel).
+
+    Used by BOTH the public /marketing/track route AND the signup flow
+    (register), so a marketing-driven signup is counted with the SAME writer the
+    click/download events use — no parallel attribution path.
+    """
+    import hashlib as _hashlib
+    import json as _json
+    import os as _os
+    import re as _re
+    from datetime import datetime as _dt
+
+    code = (code or '').strip()
+    event = (event or 'click').strip().lower()
+    # Channel codes look like "li_a", "tw1", "wa_broadcast".
+    if not _re.match(r'^[a-z][a-z0-9_]{0,31}$', code):
+        return None
+    if event not in {'click', 'download', 'install', 'signup'}:
+        return None
+
+    if isinstance(ip, str):
+        ip = ip.encode()
+    row = {
+        'ts': _dt.utcnow().isoformat() + 'Z',
+        'code': code,
+        'event': event,
+        'platform': (platform or '')[:32],
+        'ip_hash': _hashlib.sha256(ip).hexdigest()[:16],
+        'ua_hash': _hashlib.sha256((ua or '').encode()).hexdigest()[:16],
+    }
+    try:
+        from core.platform_paths import get_data_dir
+        data_dir = get_data_dir()
+    except Exception:
+        data_dir = _os.path.expanduser('~/.hartos')
+    _os.makedirs(data_dir, exist_ok=True)
+    with open(_os.path.join(data_dir, 'marketing_clicks.jsonl'), 'a', encoding='utf-8') as f:
+        f.write(_json.dumps(row) + '\n')
+    return row
+
+
 @social_bp.route('/marketing/track', methods=['POST'])
 def track_marketing_event():
     """Anonymous endpoint: record one click/install/signup attributed to
@@ -2450,51 +2507,25 @@ def track_marketing_event():
     Body: {code: str, event: str, platform: str?, user_agent: str?}
     event in {'click', 'download', 'install', 'signup'}.
 
-    Writes one JSONL row to ~/Documents/Nunba/data/marketing_clicks.jsonl
-    (or platform-equivalent via core.platform_paths). No auth — channel
-    codes are issued at post time, not user-bound.
+    Writes one JSONL row via _record_marketing_event (single source).  No auth —
+    channel codes are issued at post time, not user-bound.
 
     Returns {tracked: true, code, event, ts}.
     """
-    import hashlib as _hashlib
-    import json as _json
-    import os as _os
     import re as _re
-    from datetime import datetime as _dt
-
     data = _get_json()
     code = (data.get('code') or '').strip()
     event = (data.get('event') or 'click').strip().lower()
-    platform = (data.get('platform') or '').strip()[:32]
-
-    # Validate code shape — channel codes look like "li_a", "tw1", "wa_broadcast"
+    # Distinct 400s preserve the public contract (callers distinguish the two).
     if not _re.match(r'^[a-z][a-z0-9_]{0,31}$', code):
         return _err('invalid code', 400)
     if event not in {'click', 'download', 'install', 'signup'}:
         return _err('invalid event', 400)
-
-    ip = (request.remote_addr or '').encode()
-    ua = (request.headers.get('User-Agent') or '')[:200]
-    row = {
-        'ts': _dt.utcnow().isoformat() + 'Z',
-        'code': code,
-        'event': event,
-        'platform': platform,
-        'ip_hash': _hashlib.sha256(ip).hexdigest()[:16],
-        'ua_hash': _hashlib.sha256(ua.encode()).hexdigest()[:16],
-    }
-
-    try:
-        from core.platform_paths import get_data_dir
-        data_dir = get_data_dir()
-    except Exception:
-        data_dir = _os.path.expanduser('~/.hartos')
-    _os.makedirs(data_dir, exist_ok=True)
-    path = _os.path.join(data_dir, 'marketing_clicks.jsonl')
-    with open(path, 'a', encoding='utf-8') as f:
-        f.write(_json.dumps(row) + '\n')
-
-    return _ok({'tracked': True, 'code': code, 'event': event, 'ts': row['ts']})
+    row = _record_marketing_event(
+        code, event, (data.get('platform') or '').strip()[:32],
+        (request.remote_addr or '').encode(),
+        (request.headers.get('User-Agent') or '')[:200])
+    return _ok({'tracked': True, 'code': row['code'], 'event': row['event'], 'ts': row['ts']})
 
 
 @social_bp.route('/marketing/intents', methods=['GET'])
