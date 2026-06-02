@@ -617,7 +617,10 @@ def create_channel_bridge(
         Configured ChannelBridge instance
     """
     config = BridgeConfig(
-        crossbar_url=crossbar_url or os.getenv("CBURL", "ws://localhost:8088/ws"),
+        # Single source for the crossbar port (port_registry), same as
+        # BridgeConfig.from_env — no parallel hardcoded 8088 default.
+        crossbar_url=crossbar_url or os.getenv(
+            "CBURL", f"ws://localhost:{_get_crossbar_port()}/ws"),
         realm=realm or os.getenv("CBREALM", "realm1"),
     )
     return ChannelBridge(config, registry)

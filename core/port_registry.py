@@ -48,6 +48,12 @@ APP_PORTS = {
     # canonical resolver instead of duplicating the literal port.
     'flask':        5000,
     'langchain':    6778,
+    # Crossbar WAMP router — the channel-bridge + EventBus + PeerLink CROSSBAR
+    # leg connect here (canonical CBURL default ws://localhost:8088/ws across
+    # crossbar_server.py / core.platform.events / wamp_bridge).  Was MISSING,
+    # so get_port('crossbar') returned 0 and the channel bridge's default URL
+    # became ws://localhost:0/ws — it could never reach the router.
+    'crossbar':     8088,
 }
 
 # OS mode: privileged ports (HART OS is the operating system)
@@ -68,6 +74,10 @@ OS_PORTS = {
     'flask':        500,
     # 778 (not 677) to avoid colliding with backend=677 in OS mode.
     'langchain':    778,
+    # Crossbar stays on 8088 even in OS mode — it's a fixed WAMP-router port
+    # that crossbar_server.py / events.py hardcode (no OS-mode variant), so the
+    # bridge must match it in both modes (not a privileged <1024 reduction).
+    'crossbar':     8088,
 }
 
 # Environment variable overrides (takes precedence over both modes)
@@ -87,6 +97,7 @@ ENV_OVERRIDES = {
     'vlm_caption':  'HEVOLVE_VLM_CAPTION_PORT',
     'flask':        'HART_FLASK_PORT',
     'langchain':    'HART_LANGCHAIN_PORT',
+    'crossbar':     'HART_CROSSBAR_PORT',
 }
 
 
