@@ -225,17 +225,6 @@ class LiveKitService:
         return client_url  # already http(s) (or bare host)
 
     @staticmethod
-    def _run_coro(coro):
-        """Run a LiveKit-SDK coroutine from sync code.  Egress control
-        calls are infrequent, so a short-lived private loop is fine."""
-        import asyncio
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(coro)
-        finally:
-            loop.close()
-
-    @staticmethod
     def start_recording(call_id: str, *, layout: str = 'grid',
                         output_path: Optional[str] = None,
                         audio_only: bool = False) -> Dict[str, Any]:
@@ -277,7 +266,8 @@ class LiveKitService:
                 await lkapi.aclose()
 
         try:
-            info = LiveKitService._run_coro(_start())
+            from core.event_loop import run_async  # canonical sync→async runner
+            info = run_async(_start())
             return {
                 'ok': True,
                 'egress_id': info.egress_id,
@@ -309,7 +299,8 @@ class LiveKitService:
                 await lkapi.aclose()
 
         try:
-            info = LiveKitService._run_coro(_stop())
+            from core.event_loop import run_async  # canonical sync→async runner
+            info = run_async(_stop())
             return {'ok': True, 'egress_id': egress_id, 'status': int(info.status)}
         except Exception as e:
             logger.warning("LiveKitService.stop_recording failed: %s", e)
