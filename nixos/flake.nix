@@ -270,15 +270,23 @@
     # Checks: NixOS VM integration tests (nix flake check)
     # ═════════════════════════════════════════════════════════════
     checks.x86_64-linux = let
-      # Plain host pkgs for the test DRIVER only.  A *configured* host pkgs
-      # made runNixOSTest set each node's pkgs read-only, which then collided
-      # with the framework's own instrumentation overlay ("nixpkgs.overlays
-      # defined multiple times", #70).  Nodes instead get allowUnfree via
-      # `defaults.nixpkgs.config` inside vm-tests.nix, so they build their own
-      # pkgs and the framework overlay merges cleanly.
-      pkgs = nixpkgs.legacyPackages."x86_64-linux";
+      # Configured pkgs so runNixOSTest nodes (read-only) carry allowUnfree
+      # WITHOUT any node module setting nixpkgs.config — the #70 fix.
+      #
+      # KNOWN-REMAINING #70 (needs a working nix to fix+verify; this dev box's
+      # WSL filesystem ops hang so `nix flake check` can't run locally):
+      # the vm-test nodes import ../configurations/{server,desktop,edge}.nix,
+      # each of which imports the NixOS installer-CD profile
+      # ("${modulesPath}/installer/cd-dvd/installation-cd-*.nix").  That
+      # profile sets nixpkgs.overlays (+config), which collides with the
+      # read-only node.pkgs runNixOSTest derives from this host pkgs
+      # ("nodes.X.nixpkgs.overlays defined multiple times").  The fix is to
+      # gate the installer-CD import out of the vm-test node path (it's only
+      # needed for bootable ISO builds, not VM tests) — e.g. an `isVmTest`
+      # specialArg consumed by `imports = lib.optionals (!isVmTest) [...]`.
+      pkgs = import nixpkgs { system = "x86_64-linux"; config = nixpkgsConfig; };
       vmTests = import ./tests/vm-tests.nix {
-        inherit pkgs hartModules nixpkgsConfig;
+        inherit pkgs hartModules;
         specialArgs = mkSpecialArgs "server";
       };
     in vmTests;

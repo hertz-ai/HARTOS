@@ -155,7 +155,10 @@
   '';
 
   # ─── Cellular ───
-  networking.modemmanager.enable = true;  # #70: was services.modemManager (no such option)
+  # ModemManager comes with networking.networkmanager.enable below — there is
+  # no standalone services.modemManager option on this nixpkgs pin (#70: the
+  # eval error "services.modemManager does not exist", surfaced once the phosh
+  # error above was cleared).
 
   networking = {
     networkmanager = {

@@ -13,7 +13,7 @@
 #
 # These tests take 5-15 minutes each (VM boot + assertions).
 
-{ pkgs, hartModules, specialArgs, nixpkgsConfig }:
+{ pkgs, hartModules, specialArgs }:
 
 let
   # Helper: create a test configuration with all hart modules
@@ -30,10 +30,6 @@ in
   # ─────────────────────────────────────────────────────────────
   hart-server-boot = pkgs.testers.runNixOSTest {
     name = "hart-server-boot";
-
-    # #70: node allowUnfree via defaults (host pkgs is plain → no
-    # read-only-overlay collision with the test framework's overlay).
-    defaults.nixpkgs.config = nixpkgsConfig;
 
     nodes.server = { config, pkgs, lib, ... }: {
       imports = hartModules ++ [
@@ -110,10 +106,6 @@ in
   hart-desktop-boot = pkgs.testers.runNixOSTest {
     name = "hart-desktop-boot";
 
-    # #70: node allowUnfree via defaults (host pkgs is plain → no
-    # read-only-overlay collision with the test framework's overlay).
-    defaults.nixpkgs.config = nixpkgsConfig;
-
     nodes.desktop = { config, pkgs, lib, ... }: {
       imports = hartModules ++ [
         ../configurations/desktop.nix
@@ -165,10 +157,6 @@ in
   # ─────────────────────────────────────────────────────────────
   hart-edge-boot = pkgs.testers.runNixOSTest {
     name = "hart-edge-boot";
-
-    # #70: node allowUnfree via defaults (host pkgs is plain → no
-    # read-only-overlay collision with the test framework's overlay).
-    defaults.nixpkgs.config = nixpkgsConfig;
 
     nodes.edge = { config, pkgs, lib, ... }: {
       imports = hartModules ++ [
@@ -222,10 +210,6 @@ in
   # ─────────────────────────────────────────────────────────────
   hart-peer-discovery = pkgs.testers.runNixOSTest {
     name = "hart-peer-discovery";
-
-    # #70: node allowUnfree via defaults (host pkgs is plain → no
-    # read-only-overlay collision with the test framework's overlay).
-    defaults.nixpkgs.config = nixpkgsConfig;
 
     nodes.server = { config, pkgs, lib, ... }: {
       imports = hartModules ++ [
