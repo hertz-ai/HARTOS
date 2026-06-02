@@ -81,6 +81,42 @@ SEED_BOOTSTRAP_GOALS = [
         'use_product': True,
     },
     {
+        'slug': 'bootstrap_demo_video_recorder',
+        'goal_type': 'marketing',
+        'title': 'Record + Publish Nunba / HART OS Demo Videos',
+        'description': (
+            'Produce SHORT (15-30s) screen-demo videos of Nunba / HART OS actually '
+            'running, then publish them across external platforms — video demos are '
+            'the highest-signal proof for the 10K-user growth goal. Per cycle: '
+            '1) Pick ONE concrete, honest thing to show that traces to real code '
+            '(ask the local hive a question and show the answer; the recipe '
+            'CREATE->REUSE speedup; the glass desktop shell; a channel post landing). '
+            '2) Open the Nunba window (maximized) and arrange the interaction with '
+            'the desktop executor (VLM/pyautogui on port 8082) so the screen shows '
+            'the real product. 3) Call record_demo_video(duration_s=20, fps=8) to '
+            'capture it; it returns a file path (mp4, or gif fallback). '
+            '4) Write an honest, lowercase, no-hype caption + a link to one of '
+            'hevolve.ai/download, github.com/hertz-ai/HARTOS, or hevolve.ai/pricing. '
+            '5) Publish: post_to_channel(channel, caption, media_url=<path>) for each '
+            'external platform whose adapter has credentials, AND create_social_post('
+            'title, content=caption, media_url=<path>) for the platform feed. If a '
+            'channel lacks credentials, save the caption + the returned path and note '
+            'the gap rather than failing silently. 6) Track the ref-tag via the growth '
+            'tracker so signups attribute to the video. '
+            'CONSENT: gate every EXTERNAL publish on the operator consent push before '
+            'it goes out. No fake claims — every demo shows the real product doing a '
+            'real thing; if something is broken, that is not what you record.'
+        ),
+        'config': {
+            'goal_sub_type': 'content',
+            'channels': ['platform', 'twitter', 'linkedin'],
+            'media_kind': 'video',
+            'requires_consent': True,
+        },
+        'spark_budget': 250,
+        'use_product': True,
+    },
+    {
         'slug': 'bootstrap_crowdsource_intelligence',
         'goal_type': 'marketing',
         'title': 'Promote Crowdsourced Intelligence via Thought Experiments',

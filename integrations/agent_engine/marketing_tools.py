@@ -259,6 +259,32 @@ def register_marketing_tools(helper, assistant, user_id: str):
         except Exception as e:
             return json.dumps({'success': False, 'error': str(e)})
 
+    def record_demo_video(
+        duration_s: Annotated[int, "Seconds to record (2-60). Open + arrange the app you want to demo FIRST."] = 15,
+        fps: Annotated[int, "Frames per second (5-12 is plenty for a UI demo)."] = 8,
+    ) -> str:
+        """Record a short screen-capture DEMO VIDEO of whatever is on screen right
+        now (e.g. Nunba / HART OS running) and return the saved file path.
+
+        Arrange the demo BEFORE calling: open the Nunba window (ideally maximized),
+        and either start a scripted interaction with the desktop executor or have
+        the thing you want to show already visible.  This captures the primary
+        screen for `duration_s` and assembles a shareable mp4 (gif fallback).
+
+        Then publish it: pass the returned ``path`` as ``media_url`` to
+        ``post_to_channel(...)`` (external) or ``create_social_post(...)`` (platform).
+        Returns JSON {ok, path, format, frames, fps, duration_s} or {ok, error}.
+        """
+        try:
+            from integrations.remote_desktop.frame_capture import FrameCapture, FrameConfig
+            _fps = max(1, min(int(fps), 30))
+            _dur = max(2, min(int(duration_s), 60))
+            cap = FrameCapture(FrameConfig(max_fps=_fps, scale_factor=0.75))
+            res = cap.record_to_video(duration_s=_dur, fps=_fps)
+            return json.dumps(res)
+        except Exception as e:
+            return json.dumps({'ok': False, 'error': str(e)})
+
     # Register all marketing tools
     tools = [
         ('create_social_post', 'Create a post on the HART social platform for marketing', create_social_post),
@@ -267,6 +293,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
         ('post_to_channel', 'Post content to external channels (Twitter, Instagram, Email, Discord, etc.)', post_to_channel),
         ('create_referral_campaign', 'Create a referral-driven growth campaign with auto-generated referral code', create_referral_campaign),
         ('get_growth_metrics', 'Get platform growth metrics including viral coefficient (K factor)', get_growth_metrics),
+        ('record_demo_video', 'Record a short screen demo video of the app running; returns a file path to attach via post_to_channel/create_social_post media_url', record_demo_video),
     ]
 
     for name, desc, func in tools:
@@ -285,6 +312,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
             {'name': 'channel_distribution', 'description': 'Post to external channels', 'proficiency': 0.8},
             {'name': 'referral_campaigns', 'description': 'Create referral-driven growth campaigns', 'proficiency': 0.9},
             {'name': 'growth_analytics', 'description': 'Analyze growth metrics and viral coefficient', 'proficiency': 0.85},
+            {'name': 'demo_recording', 'description': 'Record screen demo videos of apps running for marketing', 'proficiency': 0.8},
         ])
     except Exception as e:
         logger.debug(f"Marketing skill registration skipped: {e}")
