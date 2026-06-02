@@ -181,8 +181,24 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                 ledger.save()
             elif task.status != ledger_status:
                 # Skip no-op transitions (e.g. IN_PROGRESS → IN_PROGRESS when
-                # multiple ActionStates map to the same LedgerTaskStatus)
-                ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
+                # multiple ActionStates map to the same LedgerTaskStatus).
+                #
+                # #56: the ledger validates transitions deliberately (its Bug-#2
+                # fix) and FAILED/COMPLETED/CANCELLED are terminal.  ActionState,
+                # by contrast, is authoritative for its OWN retry FSM (ERROR→
+                # IN_PROGRESS, TERMINATED→RECIPE_REQUESTED).  When the ledger task
+                # is already terminal but ActionState has legitimately moved on,
+                # forcing the transition is invalid BY DESIGN — update_task_status
+                # would WARN-spam (~100/run) for an expected, benign divergence.
+                # This advisory sync skips it quietly (the single-FSM unification,
+                # #56 option (a), is the deeper cleanup; the divergence is benign).
+                if task.is_terminal():
+                    logger.debug(
+                        "Advisory ledger sync: task %s terminal (%s), ActionState "
+                        "moved to %s — skipping invalid transition (authoritative "
+                        "FSM is ActionState).", task_id, task.status, state.value)
+                else:
+                    ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
 
             # === BLOCKED REASON: set specific reason based on ActionState source ===
             if ledger_status == LedgerTaskStatus.BLOCKED:
@@ -597,7 +613,13 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.FALLBACK_RECEIVED: [ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_RECEIVED],
         ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED, ActionState.RECIPE_REQUESTED],
         ActionState.RECIPE_RECEIVED: [ActionState.TERMINATED, ActionState.RECIPE_RECEIVED],
-        ActionState.TERMINATED: [ActionState.ASSIGNED],  # Final state but an entire actions can be updated and hence can go to assigned state again
+        # Final state, but: (a) an action can be re-opened (→ASSIGNED), and
+        # (b) recipe-capture can run AFTER termination (→RECIPE_REQUESTED).  The
+        # latter edge fixes the STUCK LOOP (#56): recipe-gen pushed a TERMINATED
+        # action toward RECIPE_REQUESTED, find_path failed, and autogen re-ran
+        # the same action.  RECIPE_REQUESTED→RECIPE_RECEIVED→TERMINATED already
+        # exists, so this just lets the capture flow complete instead of looping.
+        ActionState.TERMINATED: [ActionState.ASSIGNED, ActionState.RECIPE_REQUESTED],
         # Preview states (opt-in for destructive actions)
         ActionState.PREVIEW_PENDING: [ActionState.PREVIEW_APPROVED, ActionState.ERROR, ActionState.TERMINATED],
         ActionState.PREVIEW_APPROVED: [ActionState.IN_PROGRESS],
