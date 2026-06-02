@@ -68,6 +68,45 @@ def _cb_is_open() -> bool:
         return True
 
 
+def _is_local_port_listening(port: int, timeout: float = 0.25) -> bool:
+    """True iff something is accepting TCP on 127.0.0.1:<port>.  Short
+    timeout — this is a fallback-path probe, not a hot path."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        return s.connect_ex(('127.0.0.1', int(port))) == 0
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _local_dispatch_base_url() -> str:
+    """Base URL for the Tier-2 HTTP fallback to the local HARTOS /chat (#71).
+
+    HEVOLVE_BASE_URL wins when set — remote/cloud deploys point it at the
+    real host, and discovery/federation/peer share that same env, so we
+    must NOT override it (the shared-env Gate-1 caution).  This only fixes
+    the LOCAL default, which used to hardcode get_port('backend')=6777.
+
+    In a BUNDLED desktop, HARTOS is served IN-PROCESS on the Flask port
+    (5000); the standalone 6777 subprocess isn't running, so the old
+    default hit a dead port and Tier-2 always failed there.  Probe the
+    local candidates and use the first that's actually listening
+    (standalone → backend:6777; bundled → flask:5000), falling back to
+    backend if neither answers yet (cold boot).  No mode flag needed —
+    whichever server this process actually exposes is the one we hit."""
+    env = os.environ.get('HEVOLVE_BASE_URL')
+    if env:
+        return env
+    for svc in ('backend', 'flask'):
+        port = get_port(svc)
+        if _is_local_port_listening(port):
+            return f'http://localhost:{port}'
+    return f'http://localhost:{get_port("backend")}'
+
+
 def _internal_auth_headers() -> Optional[Dict[str, str]]:
     """Build auth headers for internal /chat dispatch.
 
@@ -676,7 +715,7 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
         logger.info(f"Circuit breaker open — skipping Tier-2 HTTP for goal {goal_id}")
         return None
 
-    base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
+    base_url = _local_dispatch_base_url()  # #71: probe live port, not dead 6777
 
     try:
         resp = pooled_post(f'{base_url}/chat', json=body,
@@ -837,7 +876,7 @@ def drain_instruction_queue(user_id: str, max_tokens: int = 8000) -> Optional[st
             if plan is None:
                 return None
 
-            base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
+            base_url = _local_dispatch_base_url()  # #71: probe live port, not dead 6777
             all_results = []
             any_success = False
 
