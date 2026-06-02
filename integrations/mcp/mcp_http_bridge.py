@@ -42,8 +42,25 @@ mcp_local_bp = Blueprint('mcp_local', __name__, url_prefix='/api/mcp/local')
 # or `~/.nunba/mcp.token` (Unix) — owned by the current user, 0600
 # on Unix.  Claude Code reads it and sends it as the bearer.
 _MCP_TOKEN_CACHE: Optional[str] = None
+# (source_path, mtime) the cached token was read from — so a rotation in ANY
+# Flask worker (which bumps the file mtime) is picked up by EVERY worker on its
+# next read, instead of each worker serving a stale cache until restart (#44).
+_MCP_TOKEN_CACHE_KEY: Optional[tuple] = None
 # One-shot WARN emitter for HARTOS_MCP_DISABLE_AUTH=1 (see _mcp_auth_gate).
 _MCP_AUTH_DISABLED_WARNED: bool = False
+
+
+def _read_token_file(path):
+    """Return (token, mtime) for the token file, or (None, None) if it's
+    absent / empty / unreadable.  mtime is the cache key."""
+    import os as _os
+    try:
+        _mtime = _os.path.getmtime(path)
+        with open(path, encoding='utf-8') as _f:
+            _tok = _f.read().strip()
+        return (_tok or None), _mtime
+    except OSError:
+        return None, None
 
 
 def _mcp_token_path() -> str:
@@ -78,56 +95,55 @@ def _ensure_mcp_token() -> str:
                                    (the original behaviour used by the
                                    Nunba desktop install)
     """
-    global _MCP_TOKEN_CACHE
-    if _MCP_TOKEN_CACHE:
-        return _MCP_TOKEN_CACHE
+    global _MCP_TOKEN_CACHE, _MCP_TOKEN_CACHE_KEY
     import os as _os
     import secrets as _secrets
 
     # (1) Literal env-var token — highest priority, zero filesystem touch.
+    #     Static (rotation happens upstream), so cache it indefinitely.
     _env_tok = _os.environ.get('HARTOS_MCP_TOKEN', '').strip()
     if _env_tok:
-        _MCP_TOKEN_CACHE = _env_tok
+        _MCP_TOKEN_CACHE, _MCP_TOKEN_CACHE_KEY = _env_tok, ('env', None)
         return _MCP_TOKEN_CACHE
 
-    # (2) Env-var-specified token FILE — for Vault/K8s mounted secrets.
+    # (2)/(3) File-sourced token: env-pointed file (Vault/K8s) OR the default
+    # disk path (Nunba desktop).  mtime-keyed cache — re-read whenever the file
+    # changes so a rotation in ANY worker is seen by EVERY worker on its next
+    # call (#44).  The old code cached the first read forever, so other workers
+    # kept honouring the rotated-away token until restart.
     _env_tok_file = _os.environ.get('HARTOS_MCP_TOKEN_FILE', '').strip()
+    _path = _env_tok_file or _mcp_token_path()
+    _tok, _mtime = _read_token_file(_path)
+    if _tok:
+        if _MCP_TOKEN_CACHE and _MCP_TOKEN_CACHE_KEY == (_path, _mtime):
+            return _MCP_TOKEN_CACHE  # unchanged since last read
+        _MCP_TOKEN_CACHE, _MCP_TOKEN_CACHE_KEY = _tok, (_path, _mtime)
+        return _MCP_TOKEN_CACHE
     if _env_tok_file:
-        try:
-            with open(_env_tok_file, encoding='utf-8') as _f:
-                _tok = _f.read().strip()
-                if _tok:
-                    _MCP_TOKEN_CACHE = _tok
-                    return _MCP_TOKEN_CACHE
-        except OSError as _e:
-            logger.warning(
-                "HARTOS_MCP_TOKEN_FILE=%s could not be read (%s) — "
-                "falling back to default disk path",
-                _env_tok_file, _e,
-            )
+        logger.warning(
+            "HARTOS_MCP_TOKEN_FILE=%s missing/empty — falling back to default "
+            "disk path", _env_tok_file)
 
-    # (3) Default disk path — the original Nunba desktop behaviour.
+    # No token file yet → create one at the default disk path.
     _path = _mcp_token_path()
     try:
-        if _os.path.isfile(_path):
-            with open(_path, encoding='utf-8') as _f:
-                _MCP_TOKEN_CACHE = _f.read().strip()
-                if _MCP_TOKEN_CACHE:
-                    return _MCP_TOKEN_CACHE
-        # Create a new token
         _os.makedirs(_os.path.dirname(_path), exist_ok=True)
-        _MCP_TOKEN_CACHE = _secrets.token_urlsafe(32)
+        _new = _secrets.token_urlsafe(32)
         with open(_path, 'w', encoding='utf-8') as _f:
-            _f.write(_MCP_TOKEN_CACHE)
+            _f.write(_new)
         try:
             # 0600 on Unix (no-op on Windows, ACLs inherit user profile)
             _os.chmod(_path, 0o600)
         except OSError:
             pass
+        _MCP_TOKEN_CACHE = _new
+        _MCP_TOKEN_CACHE_KEY = (_path, _os.path.getmtime(_path)) \
+            if _os.path.isfile(_path) else (_path, None)
         return _MCP_TOKEN_CACHE
     except OSError:
-        # Read-only fs — fall back to process-lifetime token
-        _MCP_TOKEN_CACHE = _secrets.token_urlsafe(32)
+        # Read-only fs — process-lifetime token; nothing to re-read.
+        if not _MCP_TOKEN_CACHE:
+            _MCP_TOKEN_CACHE, _MCP_TOKEN_CACHE_KEY = _secrets.token_urlsafe(32), ('mem', None)
         return _MCP_TOKEN_CACHE
 
 
@@ -171,7 +187,7 @@ def rotate_mcp_token() -> str:
     no-op (the env var is the source of truth and rotation must happen
     upstream — at the orchestrator that injected the env var).
     """
-    global _MCP_TOKEN_CACHE
+    global _MCP_TOKEN_CACHE, _MCP_TOKEN_CACHE_KEY
     import os as _os
     import secrets as _secrets
     # Env-var-pinned tokens cannot be rotated from inside the process —
@@ -198,7 +214,13 @@ def rotate_mcp_token() -> str:
             "rotate_mcp_token: failed to persist new token (%s) — "
             "falling back to in-memory only", e,
         )
+    # Update this worker's cache + mtime key so it's immediately consistent;
+    # OTHER workers pick up the new token via the mtime check on their next read.
     _MCP_TOKEN_CACHE = new_token
+    try:
+        _MCP_TOKEN_CACHE_KEY = (path, _os.path.getmtime(path))
+    except OSError:
+        _MCP_TOKEN_CACHE_KEY = (path, None)
     return new_token
 
 
