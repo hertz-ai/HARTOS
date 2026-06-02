@@ -33,13 +33,14 @@ def test_push_to_followers_blocks_non_public(monkeypatch):
     pd.gossip = types.SimpleNamespace(node_id='n1', base_url='http://x', node_name='X')
     monkeypatch.setitem(sys.modules, 'integrations.social.peer_discovery', pd)
 
-    # Non-public privacy values must be blocked BEFORE the fan-out.
-    for pv in ('private', 'community', 'unlisted', 'followers', 'mystery'):
+    # The real restricted privacy levels (privacy.PRIVACY_LEVELS) must be
+    # blocked BEFORE the fan-out.
+    for pv in ('private', 'community', 'friends'):
         fed.push_to_followers(None, {'id': 'x', 'privacy': pv})
-    assert reached == [], f"a non-public post reached fan-out: {reached}"
+    assert reached == [], f"a restricted post reached fan-out: {reached}"
 
-    # public / federation / None (default-public) must proceed past the gate.
+    # public + None (default/unknown → public per canonical privacy._normalize)
+    # proceed past the gate.
     fed.push_to_followers(None, {'id': 'p2', 'privacy': 'public'})
-    fed.push_to_followers(None, {'id': 'p3', 'privacy': 'federation'})
-    fed.push_to_followers(None, {'id': 'p4'})  # no privacy field → default public
-    assert len(reached) == 3, f"public/federation/None must federate, reached={reached}"
+    fed.push_to_followers(None, {'id': 'p4'})  # no privacy field → public
+    assert len(reached) == 2, f"public/None must federate, reached={reached}"

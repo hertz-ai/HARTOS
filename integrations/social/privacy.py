@@ -58,6 +58,14 @@ def _normalize(level):
     return level
 
 
+def is_public(level) -> bool:
+    """True iff a post at this privacy level is visible to everyone (and thus
+    safe to federate / broadcast off-instance).  Canonical scalar predicate —
+    reuses the one NULL/unknown-means-public invariant so callers (e.g. the
+    federation outbox) don't re-derive 'what counts as public'."""
+    return _normalize(level) == 'public'
+
+
 def can_view_post(db, viewer_user, post) -> bool:
     """Authoritative single-post check.  viewer_user may be None.
 

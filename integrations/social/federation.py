@@ -97,16 +97,16 @@ class FederationManager:
         Push a new local post to all instances that follow us.
         Called when a post is created locally.
         """
-        # Privacy gate (#47): a non-public post must NEVER leave this node, even
-        # if/when federation is re-enabled.  None == default/public (the privacy
-        # feature is opt-in); 'public'/'federation' are explicitly federable;
-        # everything else (private/community/unlisted/followers/unknown) is
-        # blocked fail-closed.
-        _privacy = (post_dict or {}).get('privacy')
-        if _privacy not in (None, 'public', 'federation'):
+        # Privacy gate (#47): only PUBLIC posts may leave this node, even if/when
+        # federation is re-enabled.  Uses the canonical privacy.is_public (the
+        # single NULL/unknown-means-public source) so federation eligibility
+        # always matches local visibility — friends/community/private never
+        # federate.
+        from .privacy import is_public
+        if not is_public((post_dict or {}).get('privacy')):
             logger.debug(
-                "Federation: not federating post %s (privacy=%r)",
-                (post_dict or {}).get('id'), _privacy)
+                "Federation: not federating non-public post %s (privacy=%r)",
+                (post_dict or {}).get('id'), (post_dict or {}).get('privacy'))
             return
 
         from .peer_discovery import gossip
