@@ -134,34 +134,52 @@ class AdminAPI:
         # Try to load saved configuration
         self._load_config()
 
+    def _config_path(self) -> str:
+        """Single source for the admin-config file location."""
+        return os.path.join(
+            os.path.dirname(__file__), "..", "..", "..",
+            "agent_data", "admin_config.json")
+
     def _load_config(self) -> None:
-        """Load configuration from file if exists."""
-        config_path = os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "..",
-            "..",
-            "agent_data",
-            "admin_config.json"
-        )
+        """Restore persisted admin state (channels + workflows + identity) so it
+        survives a restart (#45).  Previously this loaded into self._config —
+        which nothing reads — while the live state lived in separate attrs that
+        were never persisted, so identity + workflows (and channels) were lost on
+        every restart."""
+        config_path = self._config_path()
         try:
-            if os.path.exists(config_path):
-                with open(config_path, "r") as f:
-                    self._config = json.load(f)
-                logger.info("Loaded admin configuration from %s", config_path)
+            if not os.path.exists(config_path):
+                return
+            with open(config_path, "r") as f:
+                data = json.load(f)
+            self._config = data  # kept for any backward-compat reader
+            self._channels = data.get("channels") or {}
+            wf = {}
+            for k, v in (data.get("workflows") or {}).items():
+                try:
+                    wf[k] = WorkflowSchema(**v)
+                except Exception:
+                    logger.warning("admin: skipping unloadable workflow %s", k)
+            self._workflows = wf
+            _ident = data.get("identity")
+            try:
+                self._identity = IdentityConfigSchema(**_ident) if _ident else None
+            except Exception:
+                logger.warning("admin: skipping unloadable identity config")
+            logger.info("Loaded admin configuration from %s", config_path)
         except Exception as e:
             logger.warning("Failed to load admin config: %s", e)
 
     def _save_config(self) -> None:
-        """Save configuration to file using atomic write (temp + rename)."""
-        config_path = os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "..",
-            "..",
-            "agent_data",
-            "admin_config.json"
-        )
+        """Atomically persist admin state (channels + workflows + identity) so it
+        survives a restart (#45).  Serializes the LIVE attrs — the previous
+        version dumped an always-empty self._config, persisting nothing."""
+        config_path = self._config_path()
+        payload = {
+            "channels": self._channels,
+            "workflows": {k: w.to_dict() for k, w in self._workflows.items()},
+            "identity": self._identity.to_dict() if self._identity else None,
+        }
         try:
             config_dir = os.path.dirname(config_path)
             os.makedirs(config_dir, exist_ok=True)
@@ -169,7 +187,7 @@ class AdminAPI:
             fd, tmp_path = tempfile.mkstemp(dir=config_dir, suffix='.tmp')
             try:
                 with os.fdopen(fd, 'w') as f:
-                    json.dump(self._config, f, indent=2, default=str)
+                    json.dump(payload, f, indent=2, default=str)
                 os.replace(tmp_path, config_path)  # atomic rename
             except Exception:
                 os.unlink(tmp_path)
