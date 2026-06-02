@@ -202,5 +202,118 @@ class LiveKitService:
         # background task wired up by api_calls.end_call.
         return {'mode': 'livekit', 'ended': True}
 
+    # ── Server-side recording via LiveKit Egress (#72) ──────────────
+    #
+    # The "Teams recording while screen-sharing" model for the mobile
+    # demo: instead of an external OS screen-grab (which would capture
+    # everything outside the app), the LiveKit SERVER composites the
+    # call room — INCLUDING any screen-share track already published in
+    # the call (MediaProjection on Android) — and encodes it to an mp4
+    # server-side.  Records exactly what participants see, no per-device
+    # recorder.  Reuses the same (url, key, secret) issue_token signs
+    # with; SDK-guarded like issue_token so flat/no-SDK deploys degrade
+    # gracefully instead of raising.
+
+    @staticmethod
+    def _api_base_url(client_url: str) -> str:
+        """LiveKit's server (twirp) API shares the signaling port but
+        speaks http(s)://, not ws(s)://.  Convert the client URL."""
+        if client_url.startswith('wss://'):
+            return 'https://' + client_url[len('wss://'):]
+        if client_url.startswith('ws://'):
+            return 'http://' + client_url[len('ws://'):]
+        return client_url  # already http(s) (or bare host)
+
+    @staticmethod
+    def _run_coro(coro):
+        """Run a LiveKit-SDK coroutine from sync code.  Egress control
+        calls are infrequent, so a short-lived private loop is fine."""
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    @staticmethod
+    def start_recording(call_id: str, *, layout: str = 'grid',
+                        output_path: Optional[str] = None,
+                        audio_only: bool = False) -> Dict[str, Any]:
+        """Start a server-side LiveKit Egress recording of room ``call_id``.
+
+        Composites the whole room (camera + the screen-share track the
+        call already carries) to an mp4 on the egress host.  Returns
+        {ok, egress_id, filepath, status, room} or {ok: False, reason}
+        — the False shapes cover: no LiveKit config (p2p/central), SDK
+        absent, or a reachable SFU with no egress worker (the request was
+        well-formed + authenticated; only the egress *service* is missing).
+        """
+        url, api_key, api_secret = _resolved_config()
+        if not (url and api_key and api_secret):
+            return {'ok': False, 'mode': 'p2p_mesh',
+                    'reason': 'no LIVEKIT config; central/embedded deploy'}
+        if not (_HAS_LIVEKIT_SDK and livekit_api is not None):
+            return {'ok': False,
+                    'reason': 'livekit-api SDK not installed; pip install livekit-api'}
+
+        if not output_path:
+            output_path = f'{call_id}-{int(time.time())}.mp4'
+
+        async def _start():
+            lkapi = livekit_api.LiveKitAPI(
+                LiveKitService._api_base_url(url), api_key, api_secret)
+            try:
+                req = livekit_api.RoomCompositeEgressRequest(
+                    room_name=call_id,
+                    layout=layout,
+                    audio_only=audio_only,
+                    file_outputs=[livekit_api.EncodedFileOutput(
+                        file_type=livekit_api.EncodedFileType.MP4,
+                        filepath=output_path,
+                    )],
+                )
+                return await lkapi.egress.start_room_composite_egress(req)
+            finally:
+                await lkapi.aclose()
+
+        try:
+            info = LiveKitService._run_coro(_start())
+            return {
+                'ok': True,
+                'egress_id': info.egress_id,
+                'filepath': output_path,
+                'status': int(info.status),
+                'room': call_id,
+            }
+        except Exception as e:
+            logger.warning("LiveKitService.start_recording failed: %s", e)
+            return {'ok': False, 'reason': str(e), 'room': call_id}
+
+    @staticmethod
+    def stop_recording(egress_id: str) -> Dict[str, Any]:
+        """Stop a running egress recording.  Returns {ok, egress_id,
+        status} or {ok: False, reason}."""
+        url, api_key, api_secret = _resolved_config()
+        if not (url and api_key and api_secret):
+            return {'ok': False, 'reason': 'no LIVEKIT config'}
+        if not (_HAS_LIVEKIT_SDK and livekit_api is not None):
+            return {'ok': False, 'reason': 'livekit-api SDK not installed'}
+
+        async def _stop():
+            lkapi = livekit_api.LiveKitAPI(
+                LiveKitService._api_base_url(url), api_key, api_secret)
+            try:
+                return await lkapi.egress.stop_egress(
+                    livekit_api.StopEgressRequest(egress_id=egress_id))
+            finally:
+                await lkapi.aclose()
+
+        try:
+            info = LiveKitService._run_coro(_stop())
+            return {'ok': True, 'egress_id': egress_id, 'status': int(info.status)}
+        except Exception as e:
+            logger.warning("LiveKitService.stop_recording failed: %s", e)
+            return {'ok': False, 'reason': str(e)}
+
 
 __all__ = ['LiveKitService']
