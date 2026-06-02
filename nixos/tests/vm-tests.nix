@@ -31,6 +31,10 @@ in
   hart-server-boot = pkgs.testers.runNixOSTest {
     name = "hart-server-boot";
 
+    # #70: single read-only pkgs for all nodes so nixpkgs.overlays
+    # /config come from ONE source (avoids 'defined multiple times').
+    node.pkgs = pkgs;
+
     nodes.server = { config, pkgs, lib, ... }: {
       imports = hartModules ++ [
         ../configurations/server.nix
@@ -106,6 +110,10 @@ in
   hart-desktop-boot = pkgs.testers.runNixOSTest {
     name = "hart-desktop-boot";
 
+    # #70: single read-only pkgs for all nodes so nixpkgs.overlays
+    # /config come from ONE source (avoids 'defined multiple times').
+    node.pkgs = pkgs;
+
     nodes.desktop = { config, pkgs, lib, ... }: {
       imports = hartModules ++ [
         ../configurations/desktop.nix
@@ -157,6 +165,10 @@ in
   # ─────────────────────────────────────────────────────────────
   hart-edge-boot = pkgs.testers.runNixOSTest {
     name = "hart-edge-boot";
+
+    # #70: single read-only pkgs for all nodes so nixpkgs.overlays
+    # /config come from ONE source (avoids 'defined multiple times').
+    node.pkgs = pkgs;
 
     nodes.edge = { config, pkgs, lib, ... }: {
       imports = hartModules ++ [
@@ -210,6 +222,10 @@ in
   # ─────────────────────────────────────────────────────────────
   hart-peer-discovery = pkgs.testers.runNixOSTest {
     name = "hart-peer-discovery";
+
+    # #70: single read-only pkgs for all nodes so nixpkgs.overlays
+    # /config come from ONE source (avoids 'defined multiple times').
+    node.pkgs = pkgs;
 
     nodes.server = { config, pkgs, lib, ... }: {
       imports = hartModules ++ [
