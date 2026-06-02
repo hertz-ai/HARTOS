@@ -772,3 +772,112 @@ def test_response_has_no_privacy_key_when_column_is_null(fresh_db, monkeypatch):
     body = r.get_json()['data']
     assert 'privacy' not in body, (
         f"Legacy post (privacy=NULL) leaked a 'privacy' key: {body}")
+
+
+# ── #40: enforcement is UNCONDITIONAL — flag-OFF must still gate reads ──
+#
+# Pre-#40 every read endpoint gated visible_posts_filter / can_view_post
+# behind the `post_privacy` *authoring* flag, so a flag-OFF deploy served
+# private/friends posts to anyone (the documented CRITICAL leak).  The
+# flag now gates only AUTHORING (whether a user can SET a level); a stored
+# level is always honoured on read.  These tests run with the flag OFF and
+# seed a restricted row DIRECTLY — exactly how one arrives on a flag-off
+# deploy (a flag-on-then-off flip, a federation import, another client) —
+# then prove every read surface filters it.  The whole pre-existing
+# app_client fixture forces the flag ON, which is why the leak shipped.
+
+@pytest.fixture
+def flag_off_client(fresh_db, monkeypatch):
+    """Flask client with HEVOLVE_FLAG_POST_PRIVACY explicitly OFF."""
+    monkeypatch.delenv('HEVOLVE_FLAG_POST_PRIVACY', raising=False)
+    from flask import Flask
+    from integrations.social import api
+    from integrations.social.api_conversations import conversations_bp
+    app = Flask(__name__)
+    app.register_blueprint(api.social_bp)
+    app.register_blueprint(conversations_bp)
+    return app.test_client(), fresh_db[0]
+
+
+def _bearer(user):
+    from integrations.social import auth
+    return {'Authorization': f'Bearer {auth.generate_jwt(user.id, user.username, "flat")}'}
+
+
+def test_flag_off_get_post_still_404s_for_stranger(flag_off_client):
+    client, db = flag_off_client
+    a, b = _seed_users(db, 2)
+    p = _make_post(db, a.id, privacy='private')
+    r = client.get(f'/api/social/posts/{p.id}', headers=_bearer(b))
+    assert r.status_code == 404, "flag-off served a private post by id (#40 leak)"
+
+
+def test_flag_off_list_posts_excludes_private_for_stranger(flag_off_client):
+    client, db = flag_off_client
+    a, b = _seed_users(db, 2)
+    public = _make_post(db, a.id, privacy='public')
+    private = _make_post(db, a.id, privacy='private')
+    r = client.get('/api/social/posts', headers=_bearer(b))
+    assert r.status_code == 200
+    ids = {p['id'] for p in r.get_json()['data']}
+    assert public.id in ids and private.id not in ids
+
+
+def test_flag_off_global_feed_excludes_private_for_stranger(flag_off_client):
+    client, db = flag_off_client
+    a, b = _seed_users(db, 2)
+    public = _make_post(db, a.id, privacy='public')
+    private = _make_post(db, a.id, privacy='private')
+    r = client.get('/api/social/feed/all', headers=_bearer(b))
+    assert r.status_code == 200
+    ids = {p['id'] for p in r.get_json()['data']}
+    assert public.id in ids and private.id not in ids
+
+
+def test_flag_off_search_excludes_private_for_stranger(flag_off_client):
+    client, db = flag_off_client
+    a, b = _seed_users(db, 2)
+    public = _make_post(db, a.id, privacy='public', content='zz-marker-pub')
+    private = _make_post(db, a.id, privacy='private', content='zz-marker-priv')
+    r = client.get('/api/social/search?type=posts&q=zz-marker', headers=_bearer(b))
+    assert r.status_code == 200
+    ids = {p['id'] for p in r.get_json()['data']}
+    assert public.id in ids and private.id not in ids
+
+
+def test_flag_off_user_posts_excludes_private_for_stranger(flag_off_client):
+    client, db = flag_off_client
+    a, b = _seed_users(db, 2)
+    public = _make_post(db, a.id, privacy='public')
+    private = _make_post(db, a.id, privacy='private')
+    r = client.get(f'/api/social/users/{a.id}/posts', headers=_bearer(b))
+    assert r.status_code == 200
+    ids = {p['id'] for p in r.get_json()['data']}
+    assert public.id in ids and private.id not in ids
+
+
+def test_flag_off_compat_getallposts_excludes_private_for_stranger(flag_off_client):
+    """The RN compat alias forgot to thread the viewer — it leaked every
+    user's private posts.  #40 threads viewer_user + apply_privacy."""
+    client, db = flag_off_client
+    a, b = _seed_users(db, 2)
+    public = _make_post(db, a.id, privacy='public')
+    private = _make_post(db, a.id, privacy='private')
+    r = client.get('/api/social/compat/getAllPosts?pageSize=50&pageNumber=1',
+                   headers=_bearer(b))
+    assert r.status_code == 200
+    ids = {item['id'] for item in r.get_json()}  # raw list, not _ok-wrapped
+    assert public.id in ids and private.id not in ids
+
+
+def test_flag_off_gdpr_export_includes_owners_private_posts(flag_off_client):
+    """#40 exemption: an authorized export (owner) must be COMPLETE —
+    privacy filtering would silently drop the user's own private posts."""
+    client, db = flag_off_client
+    a, = _seed_users(db, 1)
+    public = _make_post(db, a.id, privacy='public')
+    private = _make_post(db, a.id, privacy='private')
+    r = client.get(f'/api/social/users/{a.id}/data/export', headers=_bearer(a))
+    assert r.status_code == 200
+    ids = {p['id'] for p in r.get_json()['data']['posts']}
+    assert public.id in ids and private.id in ids, "GDPR export must be complete"

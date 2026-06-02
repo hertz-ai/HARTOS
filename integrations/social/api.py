@@ -1136,10 +1136,14 @@ def check_handle_availability():
 def get_user_posts(user_id):
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    apply_privacy = bool(getattr(g, 'feature_flags', {}).get('post_privacy', False))
+    # #40: privacy enforcement is UNCONDITIONAL on reads.  A stored
+    # privacy level is always honored regardless of the `post_privacy`
+    # *authoring* flag (which only gates whether users can SET a level).
+    # visible_posts_filter collapses to public-only for NULL/public rows,
+    # so flag-off deploys with no privacy data see identical results.
     posts, total = PostService.list_posts(
         g.db, author_id=user_id, limit=limit, offset=offset,
-        viewer_user=g.user, apply_privacy=apply_privacy)
+        viewer_user=g.user, apply_privacy=True)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -1358,10 +1362,9 @@ def list_posts():
     community = request.args.get('community')
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    apply_privacy = bool(getattr(g, 'feature_flags', {}).get('post_privacy', False))
-    posts, total = PostService.list_posts(
+    posts, total = PostService.list_posts(  # #40: always enforce privacy
         g.db, sort, community, limit=limit, offset=offset,
-        viewer_user=g.user, apply_privacy=apply_privacy)
+        viewer_user=g.user, apply_privacy=True)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -1464,10 +1467,11 @@ def get_post(post_id):
     # private posts so we don't reveal that a hidden post exists at
     # this id.  Same shape the rest of the API uses for tenant
     # isolation.
-    if getattr(g, 'feature_flags', {}).get('post_privacy', False):
-        from .privacy import can_view_post
-        if not can_view_post(g.db, g.user, post):
-            return _err("Post not found", 404)
+    # #40: the single-post gate is unconditional — flag-off must not
+    # serve a private post to anyone who knows or guesses its id.
+    from .privacy import can_view_post
+    if not can_view_post(g.db, g.user, post):
+        return _err("Post not found", 404)
     PostService.increment_view(g.db, post)
     data = post.to_dict(include_author=True)
     # Include user's vote if authenticated
@@ -1877,10 +1881,9 @@ def get_community_posts(name):
     sort = request.args.get('sort', 'new')
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    apply_privacy = bool(getattr(g, 'feature_flags', {}).get('post_privacy', False))
-    posts, total = PostService.list_posts(
+    posts, total = PostService.list_posts(  # #40: always enforce privacy
         g.db, sort, community_name=community_name, limit=limit, offset=offset,
-        viewer_user=g.user, apply_privacy=apply_privacy)
+        viewer_user=g.user, apply_privacy=True)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -1966,10 +1969,9 @@ def remove_moderator(name, user_id):
 def personalized_feed():
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
-    apply_privacy = bool(getattr(g, 'feature_flags', {}).get('post_privacy', False))
-    posts, total = get_personalized_feed(
+    posts, total = get_personalized_feed(  # #40: always enforce privacy
         g.db, g.user.id, limit, offset,
-        viewer_user=g.user, apply_privacy=apply_privacy)
+        viewer_user=g.user, apply_privacy=True)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -1980,10 +1982,9 @@ def global_feed():
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
     uid = g.user.id if getattr(g, 'user', None) else None
-    apply_privacy = bool(getattr(g, 'feature_flags', {}).get('post_privacy', False))
-    posts, total = get_global_feed(
+    posts, total = get_global_feed(  # #40: always enforce privacy
         g.db, sort, limit, offset, user_id=uid,
-        viewer_user=g.user, apply_privacy=apply_privacy)
+        viewer_user=g.user, apply_privacy=True)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -1993,10 +1994,9 @@ def trending_feed():
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
     uid = g.user.id if getattr(g, 'user', None) else None
-    apply_privacy = bool(getattr(g, 'feature_flags', {}).get('post_privacy', False))
-    posts, total = get_trending_feed(
+    posts, total = get_trending_feed(  # #40: always enforce privacy
         g.db, limit, offset, user_id=uid,
-        viewer_user=g.user, apply_privacy=apply_privacy)
+        viewer_user=g.user, apply_privacy=True)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -2006,10 +2006,9 @@ def agent_feed():
     limit = min(int(request.args.get('limit', 25)), 100)
     offset = int(request.args.get('offset', 0))
     uid = g.user.id if getattr(g, 'user', None) else None
-    apply_privacy = bool(getattr(g, 'feature_flags', {}).get('post_privacy', False))
-    posts, total = get_agent_feed(
+    posts, total = get_agent_feed(  # #40: always enforce privacy
         g.db, limit, offset, user_id=uid,
-        viewer_user=g.user, apply_privacy=apply_privacy)
+        viewer_user=g.user, apply_privacy=True)
     return _ok([p.to_dict(include_author=True) for p in posts], _paginate(total, limit, offset))
 
 
@@ -2157,9 +2156,11 @@ def search():
         # flag is on.  Search is a high-leak surface (any user can
         # query for a post body across the whole platform), so this
         # is the second-most-important place to gate after /feed.
-        if getattr(g, 'feature_flags', {}).get('post_privacy', False):
-            from .privacy import visible_posts_filter
-            query = query.filter(visible_posts_filter(g.user))
+        # #40: unconditional — search is a high-leak surface (any user
+        # can query any term platform-wide), so per-post privacy is
+        # always AND'd in (community-visibility was filtered above).
+        from .privacy import visible_posts_filter
+        query = query.filter(visible_posts_filter(g.user))
         posts = query.order_by(Post.score.desc()).offset(offset).limit(limit).all()
         return _ok([p.to_dict(include_author=True) for p in posts])
 
@@ -3258,7 +3259,11 @@ def compat_get_all_posts():
     page_size = int(request.args.get('pageSize', 10))
     page_number = int(request.args.get('pageNumber', 1))
     offset = (page_number - 1) * page_size
-    posts, total = PostService.list_posts(g.db, 'new', limit=page_size, offset=offset)
+    # #40: thread the viewer + enforce privacy — was unfiltered, so it
+    # leaked private/friends posts to every RN caller.
+    posts, total = PostService.list_posts(
+        g.db, 'new', limit=page_size, offset=offset,
+        viewer_user=g.user, apply_privacy=True)
     result = []
     for p in posts:
         result.append({
@@ -3649,6 +3654,9 @@ def gdpr_export_user_data(user_id):
     if not user:
         return _err("User not found", 404)
 
+    # #40 exemption: an authorized GDPR export (owner or admin, gated
+    # above) must return the COMPLETE post set, so privacy filtering is
+    # deliberately NOT applied here (apply_privacy defaults False).
     posts = PostService.list_posts(g.db, author_id=user_id, limit=10000, offset=0)
     comments = g.db.query(Comment).filter_by(author_id=user_id).all()
     follows_out = g.db.query(Follow).filter_by(follower_id=user_id).all()
