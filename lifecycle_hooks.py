@@ -240,10 +240,15 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
     # Broadcast state change to EventBus
     try:
         from core.platform.events import emit_event
+        from core.event_attribution import owner_user_id
         emit_event('action_state.changed', {
             'action_id': action_id,
             'state': state.value,
             'prompt': user_prompt,
+            # #58: user_prompt is the canonical "{user_id}_{prompt_id}" key, so
+            # the owner is resolvable for free — stamp it so the P3a SSE guard
+            # routes this state change to that user's dashboard live.
+            'user_id': owner_user_id(user_prompt=user_prompt),
         })
     except Exception:
         pass

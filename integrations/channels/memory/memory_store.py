@@ -272,9 +272,14 @@ class MemoryStore:
         # Broadcast memory addition to EventBus
         try:
             from core.platform.events import emit_event
+            from core.event_attribution import owner_user_id
             emit_event('memory.item_added', {
                 'id': item.id, 'source': item.source,
                 'content_length': len(item.content),
+                # #58: stamp the owning user (from item metadata) so the P3a SSE
+                # guard routes this per-user instead of refusing it.  None when
+                # the item carries no user_id → refused as before (no leak).
+                'user_id': owner_user_id(metadata=item.metadata),
             })
         except Exception:
             pass
