@@ -1016,6 +1016,9 @@ class CommunityService:
             logger.debug(
                 "CommunityService.join polymorphic dual-write skipped: %s", e)
         db.flush()
+        # #55: fan out the membership change so other members see it live
+        # instead of only on the next /communities/{id} fetch.  Best-effort.
+        _publish_realtime('on_community_membership', community.id, user.id, 'join')
         return True
 
     @staticmethod
@@ -1043,6 +1046,8 @@ class CommunityService:
                     "CommunityService.leave polymorphic delete skipped: %s",
                     e)
             db.flush()
+            # #55: fan out the leave so members see it live (best-effort).
+            _publish_realtime('on_community_membership', community.id, user.id, 'leave')
 
     @staticmethod
     def get_members(db: Session, community_id: str, limit: int = 50, offset: int = 0

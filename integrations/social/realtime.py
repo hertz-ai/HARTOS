@@ -394,6 +394,26 @@ def on_comment_delete(comment_dict: dict, community_name: str = None):
     _publish_comment_event('comment.delete', comment_dict, community_name)
 
 
+def on_community_membership(community_id: str, user_id: str, action: str,
+                            role: str = None):
+    """Realtime fan-out for a community membership change (#55).
+
+    `action` in {'join', 'leave', 'role_change'}.  Routes via the per-community
+    topic (community.message → com.hertzai.hevolve.community.{id}) that web + RN
+    already subscribe to, so members see the change live instead of only on the
+    next /api/social/communities/{id} fetch.  Clients filter by event type
+    ('community.membership' vs 'post.new'/'comment.new')."""
+    if not community_id:
+        return
+    payload = _stamp_event({
+        'community_id': community_id,
+        'user_id': user_id,
+        'action': action,
+        'role': role,
+    }, 'community.membership')
+    publish_event('community.message', payload)
+
+
 def on_vote_update(target_type: str, target_id: str, score: int):
     # Local-only (no frontend subscribes to per-target WAMP topics)
     publish_event(f'social.{target_type}.{target_id}.vote', {'score': score})
