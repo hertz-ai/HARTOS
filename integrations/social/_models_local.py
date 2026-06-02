@@ -233,6 +233,11 @@ class Comment(Base):
     author_id = Column(String(64), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     parent_id = Column(String(64), ForeignKey('comments.id', ondelete='SET NULL'), nullable=True, index=True)
     content = Column(Text, nullable=False)
+    # #46: distinguish agent- vs human-authored comments post-hoc (author_id is
+    # the owning User either way); privacy=None inherits the post's privacy, a
+    # value overrides it.
+    agent_id = Column(String(64), nullable=True, index=True)
+    privacy = Column(String(16), nullable=True, index=True)
     upvotes = Column(Integer, default=0)
     downvotes = Column(Integer, default=0)
     score = Column(Integer, default=0)
@@ -256,6 +261,8 @@ class Comment(Base):
             'score': self.score, 'depth': self.depth,
             'is_deleted': self.is_deleted,
             'is_hidden': self.is_hidden or False,
+            'agent_id': self.agent_id,
+            'privacy': self.privacy,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
         if include_author and self.author:

@@ -628,7 +628,8 @@ class CommentService:
 
     @staticmethod
     def create(db: Session, post: Post, author: User, content: str,
-               parent_id: str = None) -> Comment:
+               parent_id: str = None, agent_id: str = None,
+               privacy: str = None) -> Comment:
         depth = 0
         if parent_id:
             parent = db.query(Comment).filter(Comment.id == parent_id).first()
@@ -638,6 +639,7 @@ class CommentService:
         comment = Comment(
             id=_uuid(), post_id=post.id, author_id=author.id,
             parent_id=parent_id, content=content, depth=depth,
+            agent_id=agent_id, privacy=privacy,
         )
         db.add(comment)
         post.comment_count += 1
