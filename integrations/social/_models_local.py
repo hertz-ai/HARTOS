@@ -3515,3 +3515,39 @@ class ChannelPresence(Base):
             'error_message': self.error_message,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class Event(Base):
+    """Omni-channel bridge Phase 3a (#64) — fallback mirror of sql.models.Event.
+    An event surfaced into Nunba from an external source (Discord scheduled event,
+    Meetup, .ics) or created manually.  Dedup on (source, source_event_id)."""
+    __tablename__ = 'events'
+    __table_args__ = (
+        UniqueConstraint('source', 'source_event_id', name='uq_event_source'),
+    )
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    title = Column(String(300), nullable=False)
+    description = Column(Text, default='')
+    start_time = Column(DateTime, nullable=True, index=True)
+    end_time = Column(DateTime, nullable=True)
+    location = Column(String(500), nullable=True)
+    url = Column(String(1000), nullable=True)
+    source = Column(String(40), nullable=False, index=True)   # discord|meetup|ics|manual
+    source_event_id = Column(String(200), nullable=True)
+    community_id = Column(String(64), nullable=True, index=True)
+    created_by = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'title': self.title, 'description': self.description,
+            'start_time': self.start_time.isoformat() if self.start_time else None,
+            'end_time': self.end_time.isoformat() if self.end_time else None,
+            'location': self.location, 'url': self.url,
+            'source': self.source, 'source_event_id': self.source_event_id,
+            'community_id': self.community_id, 'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
