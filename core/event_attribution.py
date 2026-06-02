@@ -18,6 +18,22 @@ than each re-deriving the owner.
 from typing import Optional
 
 
+def goal_owner_user_id(goal) -> Optional[str]:
+    """Canonical goal-owner precedence: owner_id > created_by > user_id.
+
+    SINGLE SOURCE for "who owns this goal" — reused by owner_user_id() below
+    AND by the steering bridge (integrations.social.dashboard_service), which
+    previously inlined a 2-field subset (owner_id or created_by).  Keeping one
+    helper stops the two from drifting.  getattr-safe; returns None if unknown.
+    """
+    if goal is None:
+        return None
+    uid = (getattr(goal, 'owner_id', None)
+           or getattr(goal, 'created_by', None)
+           or getattr(goal, 'user_id', None))
+    return str(uid) if uid else None
+
+
 def owner_user_id(user_prompt=None, goal_id=None, metadata=None) -> Optional[str]:
     """Best-effort owning user_id from a publisher's available context.
 
@@ -46,12 +62,9 @@ def owner_user_id(user_prompt=None, goal_id=None, metadata=None) -> Optional[str
             with db_session() as db:
                 g = db.query(AgentGoal).filter(
                     AgentGoal.id == str(goal_id)).first()
-                if g is not None:
-                    uid = (getattr(g, 'owner_id', None)
-                           or getattr(g, 'created_by', None)
-                           or getattr(g, 'user_id', None))
-                    if uid:
-                        return str(uid)
+                uid = goal_owner_user_id(g)
+                if uid:
+                    return uid
         except Exception:
             pass
 

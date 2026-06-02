@@ -1105,7 +1105,10 @@ def inject_instruction(db, agent_id: str, instruction: str,
     # dispatch.prompt_id_for_goal) and try it against the owner candidates
     # the daemon may have dispatched under — so the bridge can steer a
     # running flywheel goal, not only human agents.
-    owner = getattr(goal, 'owner_id', None) or getattr(goal, 'created_by', None)
+    # Single-source goal-owner precedence (owner_id>created_by>user_id) shared
+    # with the SSE attribution path so the two never drift.
+    from core.event_attribution import goal_owner_user_id
+    owner = goal_owner_user_id(goal)
     candidate_prompt_ids = []
     if getattr(goal, 'prompt_id', None):
         candidate_prompt_ids.append(str(goal.prompt_id))
