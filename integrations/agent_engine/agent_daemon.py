@@ -701,6 +701,19 @@ class AgentDaemon:
                 logger.debug(
                     "Agent daemon: yielding (reason=%s)", _yreason)
                 return
+            # B1: never override while a user request is in flight RIGHT NOW.
+            # The starvation override is for IDLE starvation (user away, governor
+            # self-throttling) — NOT for stealing the shared model from a live
+            # chat turn.  foreground_request is the most direct "serve me now".
+            try:
+                from core.foreground import foreground_active
+                if foreground_active() or _yreason == 'foreground_request':
+                    logger.debug(
+                        "Agent daemon: foreground request in flight — yielding "
+                        "(starvation override suppressed)")
+                    return
+            except Exception:
+                pass
             _override_active = True
             logger.warning(
                 "Agent daemon: STARVATION OVERRIDE — yield gate has blocked "

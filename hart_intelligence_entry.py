@@ -8185,7 +8185,25 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
         _tts_executor.submit(_bg)
 
 
+def _mark_foreground(fn):
+    """Mark a Flask view as a user-facing request so background daemons yield the
+    shared LLM/model to it for the request's duration (B1 — see core.foreground).
+    Import-safe: if the module is unavailable the view runs unchanged."""
+    from functools import wraps
+
+    @wraps(fn)
+    def _wrapped(*a, **kw):
+        try:
+            from core.foreground import foreground_request
+        except Exception:
+            return fn(*a, **kw)
+        with foreground_request():
+            return fn(*a, **kw)
+    return _wrapped
+
+
 @app.route('/chat', methods=['POST'])
+@_mark_foreground
 def chat():
     # ── G6: Authentication gate ──
     # Three-layer auth: API key > JWT > body user_id (backward compat)

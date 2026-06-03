@@ -269,14 +269,25 @@ def should_yield_to_user() -> bool:
     means editing exactly this function — no per-daemon copy-paste.
     """
     reason = None
-    # Reason #1 — user recently active (is_user_recently_active stays the
-    # single source; we only LABEL which sub-condition fired).
+    # Reason #0 — a user-facing request is in flight RIGHT NOW (finer + higher
+    # priority than the 10-min "recently active" window below).  Background LLM
+    # work must never steal the shared model mid-turn; the daemon's starvation
+    # override also refuses to fire while this is set (see agent_daemon._tick).
     try:
-        if is_user_recently_active():
-            reason = ('create_in_flight' if _active_create_sessions > 0
-                      else 'user_active')
+        from core.foreground import foreground_active
+        if foreground_active():
+            reason = 'foreground_request'
     except Exception:
         pass
+    # Reason #1 — user recently active (is_user_recently_active stays the
+    # single source; we only LABEL which sub-condition fired).
+    if reason is None:
+        try:
+            if is_user_recently_active():
+                reason = ('create_in_flight' if _active_create_sessions > 0
+                          else 'user_active')
+        except Exception:
+            pass
     # Reason #2 — LLM throttle collapsed under VRAM/CPU pressure.
     if reason is None:
         try:
