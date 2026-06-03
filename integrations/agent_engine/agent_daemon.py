@@ -999,6 +999,23 @@ class AgentDaemon:
 
                 # Track failures for exponential backoff
                 if result is None:
+                    # dispatch_goal returns None for TRANSIENT defers too (user
+                    # actively chatting / Tier-2 breaker open), not just real
+                    # failures.  Counting those toward the 5-strike AUTO-PAUSE
+                    # below would pause a healthy goal just because the user was
+                    # using the machine — the "goals stuck / 0 progress" bug.
+                    # Reuse the SAME canonical checks dispatch_goal defers on
+                    # (single source — never drifts) and skip without penalty.
+                    try:
+                        from .dispatch import is_transient_deferral
+                        _transient = is_transient_deferral()
+                    except Exception:
+                        _transient = False
+                    if _transient:
+                        logger.debug(
+                            f"Goal {goal_key}: transient defer (user active / "
+                            f"breaker open) — no backoff, no auto-pause")
+                        continue
                     with _module_lock:
                         info = _dispatch_backoff.get(goal_key, {'failures': 0})
                         info['failures'] = info.get('failures', 0) + 1

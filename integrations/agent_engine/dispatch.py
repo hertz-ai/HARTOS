@@ -231,6 +231,25 @@ def is_user_recently_active() -> bool:
     return (_time.time() - _last_user_chat_at) < _USER_CHAT_COOLDOWN
 
 
+def is_transient_deferral() -> bool:
+    """True when a ``dispatch_goal`` ``None`` is a TRANSIENT defer — the user is
+    actively using the LLM, or the Tier-2 circuit breaker is open — rather than a
+    real dispatch failure.
+
+    ``dispatch_goal`` returns ``None`` for BOTH cases, so the daemon can't tell
+    them apart from the return value alone.  The daemon calls this to avoid
+    counting a defer toward the 5-strike AUTO-PAUSE: a perfectly healthy goal
+    must never be paused just because the user was chatting (or the backend
+    hiccuped) — that was the "goals stuck / 0 progress" bug.  Composes the SAME
+    two checks ``dispatch_goal`` uses to defer (lines ~659 user-active, ~698
+    breaker-open), so the daemon's notion of "transient" never drifts from the
+    dispatcher's."""
+    try:
+        return is_user_recently_active() or _cb_is_open()
+    except Exception:
+        return False
+
+
 def should_yield_to_user() -> bool:
     """Single canonical gate every background daemon must call.
 
