@@ -554,6 +554,26 @@ class TestPersonaInjection:
         assert 'persona' not in built_empty.lower()
         assert 'persona' not in built_none.lower()
 
+    def test_recent_turns_render_history_with_consult_directive(self, dispatcher):
+        """With recent_turns the prompt embeds the prior turns AND highlights
+        that the model must CONSULT them before replying/acting — so it
+        continues the thread in context instead of restarting / re-introducing
+        itself (the live symptom: 'I'm Nunba' on every turn despite history)."""
+        turns = [
+            {'role': 'user', 'content': 'hi'},
+            {'role': 'assistant', 'content': 'Hey there! What is on your mind?'},
+        ]
+        built = dispatcher._build_draft_classifier_prompt(
+            'how can you help', recent_turns=turns)
+        assert 'Hey there! What is on your mind?' in built   # prior turn embedded
+        assert 'CONSULT this before you reply or act' in built  # the highlight
+        assert 'not starting fresh' in built                  # continuity nudge
+        assert 'how can you help' in built                    # current turn present
+
+    def test_no_recent_turns_omits_history_block(self, dispatcher):
+        built = dispatcher._build_draft_classifier_prompt('hi', recent_turns=None)
+        assert 'Recent conversation' not in built
+
 
 class TestAgentBindingGuard:
     """When the user picked a specific agent (chat handler passes

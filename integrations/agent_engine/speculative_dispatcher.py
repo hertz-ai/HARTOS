@@ -1006,10 +1006,10 @@ class SpeculativeDispatcher:
                     _hist_lines.append(f"Assistant: {_content}")
             if _hist_lines:
                 history_block = (
-                    "Recent conversation (oldest first; use this to "
-                    "interpret the user's current message in context — "
-                    "follow-ups like 'what's happening?' or 'why?' refer "
-                    "back to these turns):\n"
+                    "Recent conversation (oldest first) — CONSULT this before "
+                    "you reply or act, and continue it in context: you are "
+                    "mid-conversation, not starting fresh. Follow-ups like "
+                    "'what's happening?' or 'why?' refer back to these turns:\n"
                     + "\n".join(_hist_lines)
                     + "\n\n"
                 )
