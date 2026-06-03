@@ -20,14 +20,27 @@ Adding a new platform: add one entry to INTENTS.  No new code paths.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 from urllib.parse import quote
 
 
 # Canonical landing URLs (carry ?ref=code for attribution)
-_COMMERCIAL_API_DOCS = 'https://nunba.hevolve.ai/reference/commercial-api'
-_DOWNLOAD = 'https://hevolve.ai/download'
+# ``nunba.hevolve.ai`` does not resolve (DNS dead); the live commercial-API
+# landing is the pricing page that the landing SPA actually routes
+# (MainRoute.js ``/pricing`` -> CommercialApiPricing). Override via
+# HEVOLVE_API_LANDING_URL.
+_COMMERCIAL_API_DOCS = os.environ.get(
+    'HEVOLVE_API_LANDING_URL', 'https://hevolve.ai/pricing')
+# Live, multi-platform installer page. The shorter ``hevolve.ai/download`` is a
+# 404 today — the landing SPA has no such route (see MainRoute.js), so every
+# post that pointed installs there dead-ended (root cause of 0 funnel events).
+# ``docs.hevolve.ai/downloads/`` is the page that actually serves the
+# .exe / .dmg / .AppImage. Override via HEVOLVE_DOWNLOAD_URL once a tracked
+# ``hevolve.ai/download?ref=`` landing route is deployed (for funnel attribution).
+_DOWNLOAD = os.environ.get(
+    'HEVOLVE_DOWNLOAD_URL', 'https://docs.hevolve.ai/downloads/')
 
 
 def _with_ref(base: str, code: str) -> str:
@@ -101,7 +114,7 @@ Where the money goes:
 The split is committed in code, not policy. Verify in our open-source HARTOS repo.
 
 Docs: {landing}
-Or run the same intelligence locally for free: hevolve.ai/download'''
+Or run the same intelligence locally for free: {download}'''
 
 
 def _linkedin_share(landing_url: str) -> str:
@@ -163,7 +176,7 @@ def _build_intents() -> List[MarketingIntent]:
         platform='linkedin', code='li_a',
         intent_url=_linkedin_share(li_landing),
         landing_url=li_landing,
-        body_text=_LI_A_BODY.format(landing=li_landing),
+        body_text=_LI_A_BODY.format(landing=li_landing, download=_DOWNLOAD),
         notes=('LinkedIn URL only carries the link; paste body_text '
                'into the composer that opens.')))
 

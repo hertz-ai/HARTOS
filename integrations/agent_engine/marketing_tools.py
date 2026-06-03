@@ -15,6 +15,59 @@ from typing import Annotated, Optional
 logger = logging.getLogger('hevolve_social')
 
 
+# Consent type that gates EXTERNAL publishing. The platform keeps humans in
+# control: nothing leaves to a third-party site under the operator's identity
+# unless the operator has granted standing ``public_exposure`` consent. The
+# tool docstrings have always *promised* this gate ("Gate every EXTERNAL post on
+# operator consent before calling"); this makes the promise real + enforced
+# instead of prose the LLM may ignore. Grant/revoke via POST /api/social/consent
+# or ConsentService.grant_consent — revoking is the kill-switch that stops all
+# autonomous external posting immediately.
+_EXTERNAL_POST_CONSENT = 'public_exposure'
+
+
+def _external_post_allowed(user_id: str) -> bool:
+    """True iff the operator granted standing ``public_exposure`` consent.
+
+    Single gate for every EXTERNAL channel publish (``post_to_channel``,
+    ``post_to_channel_via_browser``). Internal on-platform posts
+    (``create_social_post``) are NOT gated — they never leave the platform.
+
+    Fail-closed: any error (no consent row, DB unavailable) denies the external
+    post, so the default posture is "do not post off-platform" until a human
+    opts in. That is the correct posture for an autonomous agent that can reach
+    the public internet under the operator's identity.
+    """
+    try:
+        from integrations.social.consent_service import ConsentService
+        from integrations.social.models import db_session
+        with db_session() as db:
+            return bool(ConsentService.check_consent(
+                db, str(user_id), _EXTERNAL_POST_CONSENT, scope='*'))
+    except Exception as e:
+        logger.warning(
+            "external-post consent check failed for user %s (denying): %s",
+            user_id, e)
+        return False
+
+
+def _consent_required_result(channel: str) -> str:
+    """Canonical 'blocked — needs operator consent' result for external posts."""
+    return json.dumps({
+        'success': False,
+        'ok': False,
+        'consent_required': _EXTERNAL_POST_CONSENT,
+        'channel': channel,
+        'error': (
+            f"External posting to {channel} requires standing operator consent "
+            f"('{_EXTERNAL_POST_CONSENT}'). Enable autonomous external posting "
+            f"via POST /api/social/consent "
+            f"{{'consent_type':'{_EXTERNAL_POST_CONSENT}','scope':'*'}}. Until "
+            f"then, post on-platform with create_social_post and note the gap."
+        ),
+    })
+
+
 def register_marketing_tools(helper, assistant, user_id: str):
     """Register marketing-specific tools with the agent (Tier 2).
 
@@ -125,7 +178,12 @@ def register_marketing_tools(helper, assistant, user_id: str):
 
         Routes to the appropriate channel adapter (Twitter, Instagram, Email, etc.).
         If the channel adapter is not available, delegates to a specialist agent.
+
+        Gated on standing operator ``public_exposure`` consent — returns a
+        consent_required result (no post) until a human opts in.
         """
+        if not _external_post_allowed(user_id):
+            return _consent_required_result(channel)
         try:
             from integrations.channels.extensions import get_available_adapters
             adapters = get_available_adapters()
@@ -295,10 +353,13 @@ def register_marketing_tools(helper, assistant, user_id: str):
         the platform's composer URL, types the content, and clicks Post.
 
         Use this when post_to_channel reports the adapter has no credentials but
-        the user is logged into that site in their desktop browser.  Gate every
-        EXTERNAL post on operator consent before calling.  Returns JSON
+        the user is logged into that site in their desktop browser.  Gated on
+        standing operator ``public_exposure`` consent — returns a consent_required
+        result (no post) until a human opts in.  Returns JSON
         {ok, platform, code, status, detail}.
         """
+        if not _external_post_allowed(user_id):
+            return _consent_required_result(channel)
         try:
             from integrations.marketing.browser_poster import post_to_platform_via_browser
             return json.dumps(post_to_platform_via_browser(

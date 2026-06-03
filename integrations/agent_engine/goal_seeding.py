@@ -99,7 +99,8 @@ SEED_BOOTSTRAP_GOALS = [
             'the real product. 3) Call record_demo_video(duration_s=20, fps=8) to '
             'capture it; it returns a file path (mp4, or gif fallback). '
             '4) Write an honest, lowercase, no-hype caption + a link to one of '
-            'hevolve.ai/download, github.com/hertz-ai/HARTOS, or hevolve.ai/pricing. '
+            'docs.hevolve.ai/downloads/ (the live installer page), '
+            'github.com/hertz-ai/HARTOS, or hevolve.ai/pricing. '
             '5) Publish: post_to_channel(channel, caption, media_url=<path>) for each '
             'external platform whose adapter has credentials, AND create_social_post('
             'title, content=caption, media_url=<path>) for the platform feed. If a '
@@ -1840,6 +1841,47 @@ LOOPHOLE_REMEDIATION_MAP = {
         'spark_budget': 100,
     },
 }
+
+
+# System identities the autonomous daemon dispatches marketing goals as
+# (agent_daemon resolves goal.user_id -> created_by -> 'system'; seed marketing
+# goals are created_by='system_bootstrap'). The consent grant must cover every
+# identity the gate (marketing_tools._external_post_allowed) could check.
+_AUTONOMOUS_MARKETING_IDENTITIES = ('system', 'system_bootstrap', 'system_daemon')
+
+
+def enable_autonomous_marketing_consent(db) -> int:
+    """Grant standing ``public_exposure`` consent so seed marketing goals may
+    post to EXTERNAL channels autonomously.
+
+    This is the single operator switch that flips the external-post consent gate
+    (``marketing_tools._external_post_allowed``) from blocking to allowing. It is
+    driven at boot by the ``HEVOLVE_AUTONOMOUS_MARKETING`` env flag — the human
+    who sets that flag IS the human-in-control decision to let the marketing
+    agent reach the public internet under the operator's identity.
+
+    Idempotent: only grants where no active consent already exists, so reboots
+    don't stack audit rows. Revoke via ``POST /api/social/consent/revoke`` (or
+    ``ConsentService.revoke_consent``) to stop all autonomous external posting;
+    unsetting the flag merely stops *re-granting* — it does not revoke.
+
+    Args:
+        db: SQLAlchemy session (caller owns the transaction / commit).
+    Returns:
+        Number of identities newly granted this call.
+    """
+    from integrations.social.consent_service import ConsentService
+    granted = 0
+    for uid in _AUTONOMOUS_MARKETING_IDENTITIES:
+        try:
+            if ConsentService.check_consent(db, uid, 'public_exposure', scope='*'):
+                continue
+            ConsentService.grant_consent(db, uid, 'public_exposure', scope='*')
+            granted += 1
+        except Exception as e:
+            logger.warning(
+                "autonomous-marketing consent grant for %s failed: %s", uid, e)
+    return granted
 
 
 def seed_bootstrap_goals(db, platform_product_id: Optional[str] = None) -> int:
