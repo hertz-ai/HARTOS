@@ -1532,6 +1532,13 @@ class AutoDiscovery:
         except (ValueError, UnicodeDecodeError):
             return {}
 
+        # Untrusted UDP input: a valid-JSON NON-dict (e.g. b'[1,2,3]' or b'"x"')
+        # would sail past the except above, then the payload.get(...) calls below
+        # raise AttributeError — which is NOT caught here and would bubble into
+        # the recv loop. Reject anything that isn't a dict explicitly.
+        if not isinstance(payload, dict):
+            return {}
+
         if payload.get('type') != 'hevolve-discovery':
             return {}
         if payload.get('node_id') == self._gossip.node_id:
