@@ -30,18 +30,20 @@ def _resolve_agent_data_dir():
 AGENT_DATA_DIR = _resolve_agent_data_dir()
 
 def _resolve_prompts_dir():
-    base = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts')
-    if os.path.isdir(base):
-        return base
-    # Bundled mode fallback: cross-platform prompts dir
-    if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-        try:
-            from core.platform_paths import get_prompts_dir
-            return get_prompts_dir()
-        except ImportError:
+    """Single source — delegates to the canonical deployment-aware resolver so the
+    recipe REUSE read dir (reuse_recipe.load_recipe → here) always matches the
+    SAVE dir (helper.PROMPTS_DIR) and the daemon reuse-CHECK, in every mode.  See
+    core.platform_paths.get_recipe_prompts_dir (bundled → user data dir; Docker &
+    dev → code-relative /app/prompts or <repo>/prompts; no extra env)."""
+    try:
+        from core.platform_paths import get_recipe_prompts_dir
+        return get_recipe_prompts_dir()
+    except Exception:
+        # Conservative fallback mirroring get_recipe_prompts_dir's rule.
+        if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
             return os.path.join(
                 os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts')
-    return base
+        return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts')
 
 PROMPTS_DIR = _resolve_prompts_dir()
 

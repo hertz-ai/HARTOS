@@ -783,16 +783,18 @@ class AgentDaemon:
             # Split goals into two queues:
             #   - CREATE queue: goals without recipes (need LLM planning, 1 at a time)
             #   - REUSE pool: goals with recipes (cheap replay, round-robin)
-            # Resolve recipe path against the SAME dir the pipeline saves to
-            # (get_prompts_dir → ~/Documents/Nunba/data/prompts in the frozen
-            # build), NOT a relative 'prompts' that resolves against the exe's
-            # CWD and never finds the saved recipe — which misclassified every
-            # reuse-able goal into the CREATE queue.  Use the single-source
+            # Resolve the recipe path with the SAME deployment-aware resolver the
+            # pipeline SAVES with (helper.PROMPTS_DIR) and the REUSE read uses
+            # (cache_loaders) — get_recipe_prompts_dir.  Using get_prompts_dir()
+            # here was correct ONLY in the frozen/bundled build (data dir); in
+            # Docker/dev the pipeline saves to the code-relative /app|repo/prompts,
+            # so this check looked in a DIFFERENT folder and misclassified every
+            # reuse-able goal into the CREATE queue.  Single-source
             # dispatch.prompt_id_for_goal hash, not a duplicate md5 (DRY).
             from .dispatch import prompt_id_for_goal
             try:
-                from core.platform_paths import get_prompts_dir
-                _prompts_dir = get_prompts_dir()
+                from core.platform_paths import get_recipe_prompts_dir
+                _prompts_dir = get_recipe_prompts_dir()
             except Exception:
                 _prompts_dir = 'prompts'
             _create_queue = []

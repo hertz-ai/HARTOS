@@ -101,8 +101,31 @@ def get_coding_workspace_dir() -> str:
 
 
 def get_prompts_dir() -> str:
-    """Return the prompts/ subdirectory."""
+    """Return the prompts/ subdirectory of the user data dir (bundled desktop)."""
     return os.path.join(get_db_dir(), 'prompts')
+
+
+def get_recipe_prompts_dir() -> str:
+    """Deployment-aware recipe dir — the SINGLE resolver that recipe SAVE
+    (helper / create_recipe), REUSE read (cache_loaders), and the daemon
+    reuse-CHECK (agent_daemon) MUST all share, so a recipe is written, checked,
+    and read in the SAME folder in every deployment mode, with NO extra env:
+
+      - Bundled desktop (sys.frozen / NUNBA_BUNDLED): the install tree is
+        read-only (e.g. Program Files), so recipes use the writable user data
+        dir (get_prompts_dir() -> ~/Documents/Nunba/data/prompts).
+      - Docker / cloud AND local dev: the code dir is writable and is already
+        where recipes live (WORKDIR /app/prompts in the container, <repo>/prompts
+        in dev), so use the code-relative prompts/.  Docker keeps working as is.
+
+    Mode is auto-detected (sys.frozen / NUNBA_BUNDLED); everything else falls to
+    the code-relative dir, so Docker and dev share one rule and need no flag.
+    The base is computed from THIS module's location so every caller resolves the
+    identical path regardless of where their own file sits.
+    """
+    if getattr(sys, 'frozen', False) or os.environ.get('NUNBA_BUNDLED'):
+        return get_prompts_dir()
+    return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts')
 
 
 def get_log_dir() -> str:
