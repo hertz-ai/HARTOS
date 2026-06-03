@@ -10,6 +10,7 @@ import os
 import sys
 import json
 import logging
+import threading
 
 logger = logging.getLogger('hevolve_core')
 
@@ -138,6 +139,55 @@ def load_recipe(user_prompt):
                 logger.debug(f"Failed to load recipe from {file_path}: {e}")
 
     return None
+
+
+# ── Agent config (prompts/{id}.json) — mtime-cached ("cache on set") ─────────
+# The agent's DEFINITION (name, personality, goal, creator_user_id), used to
+# colour the casual/fast-path identity prompt (agent_identity.build_identity_
+# prompt).  Cached for the chat hot path (1.5s budget) but KEYED ON THE FILE'S
+# mtime, so the cache refreshes the instant the config is written/edited — every
+# "set" (the CREATE save, or an edit via the social / channels-admin APIs) bumps
+# the mtime, so the next read reloads fresh.  No writer has to call us, and a
+# stale persona can never be served after a creator edits their agent.  A cache
+# HIT is one os.stat (microseconds).  prompts/{id}.json is plain JSON, never
+# encrypted (cf. create_recipe.py:833, hart_intelligence_entry.py:9174).
+_agent_config_cache = {}  # safe_id(str) -> (mtime, config_dict)
+_agent_config_lock = threading.Lock()
+
+
+def load_agent_config(prompt_id):
+    """Return the agent's config dict from prompts/{prompt_id}.json, or None.
+
+    mtime-cached + self-refreshing on write (see module note above).  Path-safe
+    (same rule as load_agent_data — no traversal).  Returns None for autonomous
+    agents that have no prompts/{id}.json, dropping any stale cache entry."""
+    if prompt_id is None:
+        return None
+    safe_id = str(prompt_id)
+    if not safe_id.replace('_', '').replace('-', '').isalnum():
+        return None
+    file_path = os.path.join(PROMPTS_DIR, f"{safe_id}.json")
+    try:
+        mtime = os.path.getmtime(file_path)
+    except OSError:
+        with _agent_config_lock:
+            _agent_config_cache.pop(safe_id, None)
+        return None
+    with _agent_config_lock:
+        cached = _agent_config_cache.get(safe_id)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+    except Exception as e:
+        logger.debug(f"Failed to load agent config for {safe_id}: {e}")
+        return None
+    if not isinstance(config, dict):
+        return None
+    with _agent_config_lock:
+        _agent_config_cache[safe_id] = (mtime, config)
+    return config
 
 
 # Terminal task statuses — duplicated from agent_ledger.core's

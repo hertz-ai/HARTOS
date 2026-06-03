@@ -216,7 +216,7 @@ except Exception:
 from bs4 import BeautifulSoup
 from enum import Enum
 from cultural_wisdom import get_cultural_prompt_compact
-from agent_identity import build_identity_prompt, SECRETS_GUARDRAIL
+from agent_identity import build_identity_prompt, SECRETS_GUARDRAIL, extract_owner_name
 
 # langchain_classic — pydantic v2-compatible fork of langchain 0.0.230
 from langchain_classic.llms import OpenAI
@@ -2272,15 +2272,19 @@ def create_prompt(tools):
     # constructions within the TTL window never re-hit the backend.
     user_details, actions = get_action_user_details(
         user_id=thread_local_data.get_user_id())
-    # Build dynamic identity based on active agent config
-    _active_agent_config = thread_local_data.get_agent_config() if hasattr(thread_local_data, 'get_agent_config') else None
-    _owner_name = ''
-    if user_details:
-        # Extract name from user details string (format varies)
-        import re as _re
-        _name_match = _re.search(r'(?:name|Name)[:\s]+([^\n,]+)', str(user_details))
-        if _name_match:
-            _owner_name = _name_match.group(1).strip()
+    # Build dynamic identity from the ACTIVE agent's config (prompts/{id}.json),
+    # loaded by the request's prompt_id via the mtime-cached, self-refreshing
+    # core.cache_loaders.load_agent_config.  Replaces a dead threadlocal stub
+    # (get_agent_config was never defined → hasattr always False → always None),
+    # which silently dropped the agent's persona from casual replies even though
+    # the full-agent path injects it via build_personality_prompt.  Fenced: the
+    # hot path never breaks if the load hiccups.
+    try:
+        from core.cache_loaders import load_agent_config as _load_agent_config
+        _active_agent_config = _load_agent_config(thread_local_data.get_prompt_id())
+    except Exception:
+        _active_agent_config = None
+    _owner_name = extract_owner_name(user_details)
     _dynamic_identity = build_identity_prompt(_active_agent_config, _owner_name, user_details)
 
     prefix = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
@@ -3936,10 +3940,15 @@ def _handle_join_external_room_tool(input_text: str) -> str:
             )
 
         # 4. Announce presence (HIVE MISSION — non-optional)
+        # Resolve the owner's display name from the user record via the same
+        # regex helper the chat-identity path uses (single source).
+        # get_user_display_name was a dead threadlocal stub that never existed,
+        # so owner_name was always None here.  Fenced: a lookup miss/failure
+        # falls back to None, exactly as before.
         owner_name = None
         try:
-            owner_name = thread_local_data.get_user_display_name() if hasattr(
-                thread_local_data, 'get_user_display_name') else None
+            _ud, _ = get_action_user_details(user_id=str(uid))
+            owner_name = extract_owner_name(_ud) or None
         except Exception:
             owner_name = None
         announced = announce_presence(
@@ -7100,8 +7109,13 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
     language = SUPPORTED_LANG_DICT.get(preferred_lang[:2], 'English')
     colloquial = True
 
-    # Build dynamic identity for fast-path too
-    _fast_agent_config = thread_local_data.get_agent_config() if hasattr(thread_local_data, 'get_agent_config') else None
+    # Build dynamic identity for fast-path too — same canonical loader as the
+    # main path (mtime-cached, keyed by prompt_id; replaces the dead stub).
+    try:
+        from core.cache_loaders import load_agent_config as _load_agent_config
+        _fast_agent_config = _load_agent_config(thread_local_data.get_prompt_id())
+    except Exception:
+        _fast_agent_config = None
     _fast_identity = build_identity_prompt(_fast_agent_config, '', user_details)
 
     # Regional tone + resonance (per-user adaptive tone)

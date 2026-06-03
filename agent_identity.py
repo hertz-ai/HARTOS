@@ -275,6 +275,12 @@ def build_identity_prompt(agent_config: Optional[dict] = None,
     if agent_config and not is_utility:
         # Layer 2: Agent personality
         personality = agent_config.get('personality', {})
+        # Some configs store `personality` as a plain string (e.g. 'vijai')
+        # rather than the structured dict this layer expects; coerce so the
+        # `.get('primary_traits')` access below can never raise on the chat hot
+        # path (this branch now runs for real — load_agent_config feeds it).
+        if not isinstance(personality, dict):
+            personality = {}
         agent_name = agent_config.get('name', '')
         agent_goal = agent_config.get('goal', '')
 
@@ -323,6 +329,19 @@ def build_identity_prompt(agent_config: Optional[dict] = None,
     )
 
     return '\n'.join(parts)
+
+
+def extract_owner_name(user_details) -> str:
+    """Best-effort owner/display name from a ``user_details`` string (format
+    varies: ``name: X``, ``Name: X`` …).  Single source for this regex so the
+    chat-identity path and the channel-presence announce path stay in lockstep
+    instead of carrying two copies.  Returns '' when nothing matches / input is
+    falsy."""
+    if not user_details:
+        return ''
+    import re
+    m = re.search(r'(?:name|Name)[:\s]+([^\n,]+)', str(user_details))
+    return m.group(1).strip() if m else ''
 
 
 def build_proactive_contact_prompt(agent_config: dict,
