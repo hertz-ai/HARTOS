@@ -290,6 +290,15 @@ KNOWN_BASELINES = {
 # Continuous loop interval: 6 hours
 _LOOP_INTERVAL_SECONDS = 6 * 3600
 
+# How long to wait before RE-CHECKING the yield gate while a user is active.
+# A benchmark cycle only runs every _LOOP_INTERVAL_SECONDS, but if we ALSO slept
+# that full 6h whenever should_yield_to_user() was True, a single moment of user
+# activity cost an entire cycle — so on a machine you actually use, the only
+# auto-running validator effectively never ran (the "nothing is live-validated"
+# stall).  Re-checking every couple of minutes resumes promptly once you go idle
+# (the user-activity cooldown is ~10 min) without ever running while you're busy.
+_YIELD_RECHECK_SECONDS = int(os.environ.get('HEVOLVE_BENCH_YIELD_RECHECK_S', '120'))
+
 # Default timeout per shard (seconds)
 _SHARD_TIMEOUT_SECONDS = 300
 
@@ -2541,6 +2550,15 @@ class HiveBenchmarkProver:
 
     # ── Continuous Loop ──────────────────────────────────────────────
 
+    def _interruptible_sleep(self, seconds: int) -> None:
+        """Sleep ``seconds`` in 1s steps, returning early if the loop is asked to
+        stop.  Single source for both the yield re-check wait and the post-cycle
+        rotation wait (they were byte-identical inline loops)."""
+        for _ in range(int(seconds)):
+            if not self._loop_running:
+                return
+            time.sleep(1)
+
     def _continuous_loop(self) -> None:
         """Background loop: rotate benchmarks, run, publish."""
         logger.info("Benchmark continuous loop started")
@@ -2552,10 +2570,11 @@ class HiveBenchmarkProver:
             # local LLM (100 questions × N models); running it during
             # chat is the textbook CPU-stall shape.
             if should_yield_to_user():
-                for _ in range(_LOOP_INTERVAL_SECONDS):
-                    if not self._loop_running:
-                        break
-                    time.sleep(1)
+                # Re-check SOON — never sleep a whole 6h cycle just because the
+                # user is momentarily active, or this (only auto-running)
+                # validator effectively never runs on a machine in use.  It
+                # resumes within minutes once the user-activity cooldown clears.
+                self._interruptible_sleep(_YIELD_RECHECK_SECONDS)
                 continue
 
             try:
@@ -2578,11 +2597,9 @@ class HiveBenchmarkProver:
                 logger.warning(
                     "Benchmark loop iteration failed: %s", exc)
 
-            # Sleep in small increments for clean shutdown
-            for _ in range(_LOOP_INTERVAL_SECONDS):
-                if not self._loop_running:
-                    break
-                time.sleep(1)
+            # Sleep one full rotation interval before the next benchmark
+            # (interruptible for clean shutdown).
+            self._interruptible_sleep(_LOOP_INTERVAL_SECONDS)
 
         logger.info("Benchmark continuous loop exited")
 
