@@ -55,9 +55,13 @@ logger = logging.getLogger(__name__)
 
 # Mode thresholds
 IDLE_THRESHOLD_SECONDS = 120        # 2 min of no input -> idle
-ACTIVE_CPU_LIMIT = 0.05             # 5% CPU max when user is active
-IDLE_CPU_LIMIT = 0.50               # 50% CPU max when idle
-SLEEP_CPU_LIMIT = 0.0               # Nothing when sleeping
+# CPU budget for HARTOS's OWN orchestration (NOT the model — llama-server is
+# always pinned to every core; see ResourceEnforcer._unrestrict_llm_affinity).
+# Single source: the advisory throttle AND the hard affinity cap both read these.
+# Env-tunable so the active/idle split can be adjusted without a code change.
+ACTIVE_CPU_LIMIT = float(os.environ.get('HEVOLVE_ACTIVE_CPU_LIMIT', '0.50'))  # at keyboard: usable
+IDLE_CPU_LIMIT = float(os.environ.get('HEVOLVE_IDLE_CPU_LIMIT', '0.80'))      # away: agents progress
+SLEEP_CPU_LIMIT = 0.0               # battery-critical: full stop (unchanged)
 
 # ── System buffer — always reserved for the rest of the OS ──
 SYSTEM_BUFFER_CPU_FRACTION = 0.25   # Reserve 25% CPU cores for OS
@@ -98,6 +102,42 @@ MODE_SLEEP = 'sleep'
 # node actually contribute the spare cycles it was opted in to give.
 LOAD_BACKOFF_CPU = 0.85
 LOAD_BACKOFF_MEM = 0.90
+
+
+def _find_llm_pids() -> set:
+    """PIDs listening on the local LLM-server port(s) (llama-server).  SINGLE
+    source used by BOTH the governor's own-CPU attribution
+    (``_resolve_llm_server_pid``) and the enforcer's affinity exemption
+    (``_unrestrict_llm_affinity``), so they never drift on which process is
+    'the model'.  Empty set when psutil is unavailable or nothing is listening.
+    """
+    psutil = _try_import_psutil()
+    if psutil is None:
+        return set()
+    ports = set()
+    try:
+        from core.port_registry import get_port
+        ports.add(int(get_port('llm')))
+    except Exception:
+        pass
+    try:
+        from core.port_registry import get_local_llm_url
+        import re
+        m = re.search(r':(\d+)', get_local_llm_url() or '')
+        if m:
+            ports.add(int(m.group(1)))
+    except Exception:
+        pass
+    ports.update((8082, 8080))  # common llama-server defaults
+    pids = set()
+    try:
+        for c in psutil.net_connections(kind='inet'):
+            if (c.status == 'LISTEN' and c.laddr
+                    and c.laddr.port in ports and c.pid):
+                pids.add(c.pid)
+    except Exception:
+        pass
+    return pids
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -158,19 +198,25 @@ class ResourceEnforcer:
     def update_caps(self, mode: str):
         """Tighten or relax caps based on governor mode.
 
-        ACTIVE: tight (25% CPU, 50% RAM, no GPU)
-        IDLE:   relaxed (75% CPU, 75% RAM, GPU allowed)
-        SLEEP:  minimal (5% CPU, 25% RAM, no GPU)
+        ACTIVE: usable (50% CPU, 60% RAM, GPU visible) — Nunba stays responsive
+                while you use it; the model is exempt from the CPU cap entirely.
+        IDLE:   relaxed (80% CPU, 80% RAM, GPU) — agents make progress.
+        SLEEP:  minimal (5% CPU, 25% RAM, no GPU) — battery-critical only.
         """
         if not self._enforced:
             return
 
+        # CPU comes from the single-source limits above; the model is exempt
+        # (affinity), so these only bound OUR orchestration.  GPU stays VISIBLE
+        # when active — the model is the foreground work the user waits on, not
+        # a background hog to hide the GPU from (gpu_frac=0 → CUDA_VISIBLE_DEVICES='').
         caps = {
-            MODE_ACTIVE: (0.25, 0.50, 0.0),
-            MODE_IDLE:   (0.75, 0.75, 0.75),
-            MODE_SLEEP:  (0.05, 0.25, 0.0),
+            #            cpu,              ram,  gpu
+            MODE_ACTIVE: (ACTIVE_CPU_LIMIT, 0.60, 0.75),
+            MODE_IDLE:   (IDLE_CPU_LIMIT,   0.80, 0.90),
+            MODE_SLEEP:  (0.05,             0.25, 0.0),
         }
-        cpu_frac, ram_frac, gpu_frac = caps.get(mode, (0.50, 0.50, 0.0))
+        cpu_frac, ram_frac, gpu_frac = caps.get(mode, (IDLE_CPU_LIMIT, 0.50, 0.0))
 
         total_ram_gb = self._get_total_ram_gb()
         usable_ram_gb = max(0.5, total_ram_gb * ram_frac - SYSTEM_BUFFER_RAM_GB)
@@ -202,65 +248,78 @@ class ResourceEnforcer:
 
     def _enforce_cpu(self, cpu_fraction: float, usable_cores: int,
                      total_cores: int):
-        """Enforce CPU cap via Job Object (Windows) or cgroup (Linux)."""
+        """Limit HARTOS's OWN orchestration to ``usable_cores`` via CPU affinity
+        + BELOW_NORMAL priority — deliberately NOT a job-wide hard rate cap.
+
+        A Job Object CPU-rate cap throttles the WHOLE job, and llama-server is a
+        CHILD of this process (it inherits our Job Object), so a rate cap would
+        strangle the model — the foreground work the user is waiting on.
+        Per-process affinity bounds only our threads; the model is then pinned
+        back to EVERY core (_unrestrict_llm_affinity).  The Windows Job Object is
+        still used for the MEMORY ceiling, created ONCE and reused (not recreated
+        per mode flip, which on Windows accumulates to the most-restrictive cap).
+        """
         if sys.platform == 'win32':
-            self._enforce_cpu_windows(cpu_fraction)
+            self._ensure_job_windows()            # memory ceiling only; no CPU rate
         elif sys.platform == 'linux':
             self._enforce_cpu_linux(cpu_fraction, total_cores)
-        # macOS: no hard CPU cap, rely on nice priority + psutil affinity
+        # macOS: rely on BELOW_NORMAL nice + affinity below.
 
-        # CPU affinity: restrict to subset of cores
         psutil = _try_import_psutil()
         if psutil is not None:
             try:
                 p = psutil.Process()
                 available = list(range(total_cores))
-                # Use last N cores (leave first cores for OS/foreground)
+                # Use last N cores (leave the first cores for OS/foreground apps).
                 target = available[-usable_cores:] if usable_cores < total_cores else available
                 p.cpu_affinity(target)
-                logger.info("ResourceEnforcer: CPU affinity set to cores %s", target)
+                logger.info("ResourceEnforcer: CPU affinity = %d/%d cores %s",
+                            usable_cores, total_cores, target)
             except Exception as e:
                 logger.debug("ResourceEnforcer: CPU affinity failed: %s", e)
+        # The model is never core-restricted — pin it back to every core.
+        self._unrestrict_llm_affinity(total_cores)
 
-    def _enforce_cpu_windows(self, cpu_fraction: float):
-        """Windows: use Job Object CPU rate limit."""
+    def _ensure_job_windows(self):
+        """Create the process Job Object ONCE (idempotent) and assign this
+        process to it.  Used for the MEMORY ceiling only — there is deliberately
+        NO CPU-rate control, because the rate cap is job-wide and llama-server is
+        a child that would inherit it (see _enforce_cpu).  Reused across mode
+        changes; _enforce_ram_windows updates the memory limit on this same
+        handle.  Creating a fresh Job Object per mode flip (the old behaviour)
+        accumulated nested jobs on Windows, pinning the process at the
+        most-restrictive cap so 'relax to idle' silently never took effect.
+        """
+        if self._job_handle:
+            return
         try:
             kernel32 = ctypes.windll.kernel32
-
-            # CreateJobObjectW
             job = kernel32.CreateJobObjectW(None, None)
             if not job:
                 logger.debug("ResourceEnforcer: CreateJobObject failed")
                 return
-
-            # JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
-            # Enable CPU rate control with hard cap
-            class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
-                _fields_ = [
-                    ('ControlFlags', ctypes.c_ulong),
-                    ('Value', ctypes.c_ulong),  # Union, using CpuRate
-                ]
-
-            # JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x1
-            # JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x4
-            rate_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
-            rate_info.ControlFlags = 0x1 | 0x4  # Enable + Hard cap
-            # CpuRate is in units of 1/100th of a percent (100 = 1%)
-            rate_info.Value = max(100, int(cpu_fraction * 10000))
-
-            # SetInformationJobObject with JobObjectCpuRateControlInformation (15)
-            kernel32.SetInformationJobObject(
-                job, 15, ctypes.byref(rate_info), ctypes.sizeof(rate_info))
-
-            # Assign current process to the Job Object
-            kernel32.AssignProcessToJobObject(
-                job, kernel32.GetCurrentProcess())
-
+            kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess())
             self._job_handle = job
-            logger.info("ResourceEnforcer: Windows Job Object CPU rate = %.0f%%",
-                         cpu_fraction * 100)
+            logger.info("ResourceEnforcer: Job Object ready "
+                        "(memory ceiling; CPU governed by affinity, not a rate cap)")
         except Exception as e:
-            logger.debug("ResourceEnforcer: Windows Job Object failed: %s", e)
+            logger.debug("ResourceEnforcer: Job Object create failed: %s", e)
+
+    def _unrestrict_llm_affinity(self, total_cores: int):
+        """Pin llama-server to EVERY core.  The model is a child of this process
+        and would otherwise inherit the restricted affinity set we apply to our
+        own orchestration — but the model must never be core-starved; it is the
+        user's foreground request running on the GPU.  Best-effort; runs only on
+        a mode change."""
+        psutil = _try_import_psutil()
+        if psutil is None:
+            return
+        all_cores = list(range(total_cores))
+        for pid in _find_llm_pids():
+            try:
+                psutil.Process(pid).cpu_affinity(all_cores)
+            except Exception:
+                pass
 
     def _enforce_cpu_linux(self, cpu_fraction: float, total_cores: int):
         """Linux: use cgroup v2 cpu.max."""
@@ -690,17 +749,16 @@ class ResourceGovernor:
         if mode == MODE_SLEEP:
             return False
 
-        if mode == MODE_ACTIVE:
-            # Active mode: only permit lightweight work
-            if resource in ('gpu', 'cpu_heavy', 'disk_heavy'):
-                return False
-            if resource == 'network_heavy':
-                return False
-            return True
-
-        # IDLE mode: allow most things
+        # GPU follows the gpu_allowed flag in BOTH active and idle — the model
+        # is foreground work the user waits on, never blocked just because the
+        # user is at the keyboard.  Politeness to other apps comes from CPU
+        # affinity + BELOW_NORMAL priority, not from refusing the GPU.
         if resource == 'gpu':
             return self._gpu_allowed
+        # Heavy disk / network BACKGROUND work still backs off in ACTIVE to stay
+        # polite; CPU is bounded by affinity, so cpu_heavy is fine either way.
+        if mode == MODE_ACTIVE and resource in ('disk_heavy', 'network_heavy'):
+            return False
         return True
 
     def report_user_activity(self) -> None:
@@ -741,8 +799,10 @@ class ResourceGovernor:
 
         if new_mode == MODE_ACTIVE:
             self._cpu_limit = ACTIVE_CPU_LIMIT
-            self._gpu_allowed = False
-            # Wake the cancel event so proactive stream backs off instantly
+            # GPU stays available — the model is the user's foreground request,
+            # not a background hog.  (Background proactive work still backs off
+            # immediately via the cancel event below.)
+            self._gpu_allowed = True
             self._cancel_event.set()
         elif new_mode == MODE_IDLE:
             self._cpu_limit = IDLE_CPU_LIMIT
@@ -1141,30 +1201,10 @@ class ResourceGovernor:
                 pass
             self._cached_llm_pid = None
             self._own_proc_cache.pop(cached, None)
-        # Resolve candidate LLM ports (registry + configured URL + defaults).
-        ports = set()
-        try:
-            from core.port_registry import get_port
-            ports.add(int(get_port('llm')))
-        except Exception:
-            pass
-        try:
-            from core.port_registry import get_local_llm_url
-            import re
-            m = re.search(r':(\d+)', get_local_llm_url() or '')
-            if m:
-                ports.add(int(m.group(1)))
-        except Exception:
-            pass
-        ports.update((8082, 8080))  # common llama-server defaults
-        try:
-            for c in psutil.net_connections(kind='inet'):
-                if (c.status == 'LISTEN' and c.laddr
-                        and c.laddr.port in ports and c.pid):
-                    self._cached_llm_pid = c.pid
-                    return c.pid
-        except Exception:
-            pass
+        # Resolve via the shared port-scan (single source — _find_llm_pids).
+        for pid in _find_llm_pids():
+            self._cached_llm_pid = pid
+            return pid
         return None
 
     def _get_memory_pressure(self) -> float:
