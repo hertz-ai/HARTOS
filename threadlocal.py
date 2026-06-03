@@ -139,6 +139,25 @@ class ThreadLocalData:
     def clear_task_source(self):
         self._local.task_source = 'own'
 
+    # --- Per-request originating channel context (Discord/Telegram/Slack/…) ---
+    # The inbound message's origin {channel, sender_id, chat_id, …}, set by the
+    # /chat handler from the request body and read by the agent's channel tools so
+    # a reply can be routed/tailored to the channel the message came from.  MUST
+    # be thread-local (per-request) — two concurrent inbound messages have
+    # different origins.  (It was previously assigned as a bare attribute on this
+    # module-level singleton, which is SHARED across threads, so concurrent
+    # requests clobbered each other's channel; see set_/get_request_id for the
+    # canonical _local-backed pattern every other per-request field follows.)
+
+    def set_channel_context(self, channel_context):
+        self._local.channel_context = channel_context
+
+    def get_channel_context(self):
+        return getattr(self._local, 'channel_context', None)
+
+    def clear_channel_context(self):
+        self._local.channel_context = None
+
     # --- User role (central | regional | flat | guest) — used by the
     #     ui_actions page registry to filter admin-only destinations ---
 

@@ -33,7 +33,7 @@ def _get_channel_context():
     """Read the current channel context from thread-local storage."""
     try:
         from threadlocal import thread_local_data
-        return getattr(thread_local_data, 'channel_context', None)
+        return thread_local_data.get_channel_context()
     except Exception:
         return None
 

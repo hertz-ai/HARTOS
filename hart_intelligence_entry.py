@@ -8438,8 +8438,11 @@ def chat():
     task_source = data.get('task_source', 'own')
     thread_local_data.set_task_source(task_source)
     channel_context = data.get('channel_context', None)
-    if channel_context:
-        thread_local_data.channel_context = channel_context
+    # Thread-local + ALWAYS set (incl. None): a pooled worker thread must never
+    # inherit a prior request's channel, and concurrent requests must not see
+    # each other's (the old `thread_local_data.channel_context = …` put it on the
+    # shared singleton instance, not _local — a cross-request leak).
+    thread_local_data.set_channel_context(channel_context)
 
     # USER PRIORITY: mark user activity so daemon dispatch yields the LLM.
     #
