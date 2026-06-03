@@ -58,16 +58,20 @@ if _DB_URL_ENV:
     DB_PATH = ':memory:' if DB_URL == 'sqlite://' else None
 elif _IS_DOCKER and not _DB_PATH_ENV:
     # Cloud/Docker mode WITHOUT a DB URL configured — this is a misconfiguration.
-    # Refuse to silently fall back to SQLite; log a loud warning and use in-memory
-    # so the server starts (health checks pass) but makes the problem obvious.
+    # Fall back to a FILE-backed SQLite at /app/logs/hartos_social.db rather than
+    # :memory: + StaticPool, which historically caused SQLAlchemy 2.0.16 lambda
+    # statement cache pollution and surfaced as opaque 500s on /api/social/*.
+    # File-backed sqlite gets NullPool (line ~135) → per-thread connections, no
+    # shared statement-cache, and data actually persists across requests.  Still
+    # log critical so operators see the misconfiguration.
     import logging as _logging_models
     _logging_models.getLogger(__name__).critical(
         'CLOUD/DOCKER MODE: HEVOLVE_DB_URL or DATABASE_URL not set! '
         'Set HEVOLVE_DB_URL=mysql+pymysql://user:pass@host/db to connect to cloud DB. '
-        'Falling back to in-memory SQLite — NO DATA WILL PERSIST.'
+        'Falling back to file-backed SQLite at /app/logs/hartos_social.db.'
     )
-    DB_PATH = ':memory:'
-    DB_URL = 'sqlite://'
+    DB_PATH = '/app/logs/hartos_social.db'
+    DB_URL = f'sqlite:///{DB_PATH}'
 elif _DB_PATH_ENV == ':memory:':
     DB_PATH = ':memory:'
     DB_URL = 'sqlite://'
