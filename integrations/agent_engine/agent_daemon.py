@@ -1138,6 +1138,24 @@ class AgentDaemon:
                 except Exception as e:
                     logger.debug(f"Content gen monitor: {e}")
 
+                # Flow-recipe reconciler (#85): recover flow recipes for goals
+                # whose actions all completed (each {pid}_{flow}_{i}.json saved)
+                # but whose flow-level recipe was never written because the
+                # local model never emitted the final status:done — so the
+                # CREATE/REUSE split keeps re-CREATEing them forever. Pure
+                # on-disk assembly, never fabricates a partial flow; flips
+                # genuinely-complete orphans from CREATE-churn to REUSE.
+                try:
+                    from core.flow_recipe_reconcile import (
+                        reconcile_orphaned_flow_recipes)
+                    rec = reconcile_orphaned_flow_recipes()
+                    if rec:
+                        logger.info(
+                            f"Flow-recipe reconciler: recovered {len(rec)} "
+                            f"orphaned flow recipe(s) -> REUSE: {rec}")
+                except Exception as e:
+                    logger.debug(f"Flow-recipe reconciler: {e}")
+
                 # Outreach follow-up checker: send due follow-ups every 5 ticks
                 try:
                     from .outreach_crm_tools import check_pending_followups_daemon
