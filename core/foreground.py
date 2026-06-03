@@ -62,3 +62,22 @@ def foreground_request():
         yield
     finally:
         exit_foreground()
+
+
+def mark_view(fn):
+    """Decorator: mark a request handler as a user-facing turn for its whole
+    duration, so background daemons yield the shared model to it.
+
+    SINGLE SOURCE for both chat entrypoints — the standalone HARTOS ``/chat``
+    route AND the bundled Nunba ``chat_route`` (which shadows /chat on :5000)
+    apply this same decorator, so there is one foreground rule, not a per-app
+    copy.  Generic (wraps any callable) and dependency-free, so importing it can
+    never break the host app.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        with foreground_request():
+            return fn(*args, **kwargs)
+    return _wrapped

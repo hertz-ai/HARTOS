@@ -75,3 +75,30 @@ def test_no_foreground_does_not_force_the_reason():
     with patch.object(dispatch, 'is_user_recently_active', return_value=False):
         dispatch.should_yield_to_user()
     assert dispatch.get_last_yield_reason() != 'foreground_request'
+
+
+def test_mark_view_marks_foreground_for_the_call_only():
+    """The shared mark_view decorator (used by BOTH the HARTOS /chat route and
+    the bundled Nunba chat_route) marks foreground for the call's duration."""
+    from core.foreground import mark_view, foreground_active, in_flight
+
+    @mark_view
+    def handler():
+        assert foreground_active() is True
+        return 'ok'
+
+    assert foreground_active() is False
+    assert handler() == 'ok'
+    assert foreground_active() is False and in_flight() == 0
+
+
+def test_mark_view_balances_on_exception():
+    from core.foreground import mark_view, foreground_active, in_flight
+
+    @mark_view
+    def boom():
+        raise ValueError('x')
+
+    with pytest.raises(ValueError):
+        boom()
+    assert foreground_active() is False and in_flight() == 0
