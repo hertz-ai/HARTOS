@@ -56,9 +56,17 @@ from typing import Any, Optional
 
 logger = logging.getLogger('llm_outbound')
 
+# 8082 is the LEGACY default this hook shipped with.  The MAIN model the
+# autogen / langchain / chat path actually calls resolves via
+# get_local_llm_url() (now :8080 by registry default).  Watching only 8082 made
+# every main-model call invisible to this log AND silently skipped the n_ctx
+# trim + the background-yield routing for it once the server moved to 8080.
+# _target_ports() resolves the live endpoint port so the hook never drifts from
+# the real server again.  See task #86.
 _TARGET_PORT = 8082
 _TARGET_PATH = '/v1/chat/completions'
 _LOG_FILENAME = 'llm_outbound.jsonl'
+_target_ports_cache = None  # type: Optional[set]
 
 _installed = False
 _install_lock = threading.Lock()
@@ -180,12 +188,41 @@ def _open_log_handle():
     return _file_handle
 
 
+def _target_ports() -> set:
+    """Local llama-server port(s) whose chat-completions we capture.
+
+    Resolves the MAIN model port the SAME way autogen does — from
+    ``get_local_llm_url()`` (with ``get_port('llm')`` as a backstop) — so the
+    hook always matches the real endpoint, and ALSO keeps the legacy 8082
+    (draft / historical default).  Cached after first resolution; the local
+    server port does not change mid-process."""
+    global _target_ports_cache
+    if _target_ports_cache is not None:
+        return _target_ports_cache
+    ports = {_TARGET_PORT}
+    try:
+        from core.port_registry import get_local_llm_url
+        import re as _re
+        m = _re.search(r':(\d+)', get_local_llm_url() or '')
+        if m:
+            ports.add(int(m.group(1)))
+    except Exception:
+        pass
+    try:
+        from core.port_registry import get_port
+        ports.add(int(get_port('llm')))
+    except Exception:
+        ports.add(8080)
+    _target_ports_cache = ports
+    return ports
+
+
 def _is_target_request(url, method: str) -> bool:
     if method != 'POST':
         return False
     try:
         return (
-            getattr(url, 'port', None) == _TARGET_PORT
+            getattr(url, 'port', None) in _target_ports()
             and getattr(url, 'path', '') == _TARGET_PATH
         )
     except Exception:
@@ -653,9 +690,9 @@ def install() -> bool:
             return False
         _installed = True
         logger.info(
-            "[outbound-hook] httpx (sync+async) patched — every POST "
-            "to :%d%s will be logged to %s",
-            _TARGET_PORT, _TARGET_PATH, _get_log_path(),
+            "[outbound-hook] httpx (sync+async) patched — every POST to "
+            "ports %s path %s will be logged to %s",
+            sorted(_target_ports()), _TARGET_PATH, _get_log_path(),
         )
         return True
 

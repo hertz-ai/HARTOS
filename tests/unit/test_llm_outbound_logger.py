@@ -370,3 +370,43 @@ def test_failure_during_log_does_not_break_request(tmp_path, monkeypatch):
     # Must not raise
     resp = fake_httpx.Client.send(_FakeClient(), request)
     assert resp.status_code == 200
+
+
+# ── Port resolution (#86): capture the MAIN model port, not just legacy 8082 ──
+
+def test_target_ports_includes_resolved_main_port_and_legacy(monkeypatch):
+    """The hook must watch the MAIN model port (the one autogen actually calls
+    via get_local_llm_url — default :8080) AND keep legacy :8082. Watching only
+    8082 made every main-model/autogen call invisible to this log and silently
+    skipped the n_ctx trim + the background-yield routing for it."""
+    import core.port_registry as pr
+    import core.llm_outbound_logger as mod
+    monkeypatch.setattr(pr, 'get_local_llm_url',
+                        lambda: 'http://127.0.0.1:8080/v1', raising=False)
+    monkeypatch.setattr(pr, 'get_port',
+                        lambda s: 8080 if s == 'llm' else 0, raising=False)
+    mod._target_ports_cache = None
+    try:
+        ports = mod._target_ports()
+        assert 8080 in ports   # main model now captured
+        assert 8082 in ports   # legacy/draft still captured
+    finally:
+        mod._target_ports_cache = None
+
+
+def test_is_target_request_matches_main_and_legacy_ports(monkeypatch):
+    import types
+    import core.port_registry as pr
+    import core.llm_outbound_logger as mod
+    monkeypatch.setattr(pr, 'get_local_llm_url',
+                        lambda: 'http://127.0.0.1:8080/v1', raising=False)
+    mod._target_ports_cache = None
+    try:
+        def _u(port):
+            return types.SimpleNamespace(port=port, path='/v1/chat/completions')
+        assert mod._is_target_request(_u(8080), 'POST') is True   # main model
+        assert mod._is_target_request(_u(8082), 'POST') is True   # legacy/draft
+        assert mod._is_target_request(_u(9999), 'POST') is False  # unrelated
+        assert mod._is_target_request(_u(8080), 'GET') is False   # POST only
+    finally:
+        mod._target_ports_cache = None
