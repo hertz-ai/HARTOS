@@ -68,10 +68,18 @@ _file_lock = threading.Lock()
 
 def _get_request_id() -> str:
     """Best-effort thread-local request_id pull.  Empty string when
-    we're outside an HTTP request context (e.g. daemon startup)."""
+    we're outside an HTTP request context (e.g. daemon startup).
+
+    Uses the canonical ``ThreadLocalData.get_request_id()`` accessor — the
+    request_id lives in the thread-local's ``_local`` store (set via
+    ``set_request_id`` at hart_intelligence_entry.py:8535 and read via
+    ``get_request_id`` everywhere else).  A previous ``getattr(_tl,
+    'request_id')`` read the INSTANCE attribute, which is never set, so the
+    ``X-HARTOS-Request-ID`` header + JSONL correlation key were always empty —
+    and the daemon-vs-user discriminator that now reads them would never fire."""
     try:
         from threadlocal import thread_local_data as _tl
-        rid = getattr(_tl, 'request_id', None)
+        rid = _tl.get_request_id()
         if rid:
             return str(rid)
     except Exception:
@@ -468,6 +476,75 @@ def _annotate_request(request, body):
         logger.debug("[outbound] header-stamp failed: %s", e)
 
 
+# ─── Foreground preemption of autonomous-background LLM calls ─────────
+# Every :8082 chat-completion already carries its caller identity in the
+# X-HARTOS-Request-ID header (stamped by _annotate_request).  Autonomous daemon
+# goal dispatches use request_id 'daemon_<goal_id>' (dispatch.py:_daemon_request
+# _id); genuine user turns do not.  We reuse the CANONICAL discriminator
+# (dispatch.is_genuine_user_request) so a daemon call (a) yields the local model
+# to a live user turn before contending and (b) runs on the closable background
+# client so it can be aborted mid-flight when the user hits enter.  The user's
+# own turn is never reclassified, never delayed, never cancelled.
+
+
+def _bg_yield_wait_s() -> float:
+    """Max seconds a background LLM call waits for a live user turn to finish
+    before proceeding (it can still be aborted mid-flight afterwards).  Tunable
+    via ``HEVOLVE_BG_YIELD_WAIT_S``; default 20s — covers a typical chat turn,
+    short enough that background work isn't starved if a session stays open."""
+    try:
+        return max(0.0, float(os.environ.get('HEVOLVE_BG_YIELD_WAIT_S', '20')))
+    except Exception:
+        return 20.0
+
+
+def _is_background_call(request) -> bool:
+    """True iff this llama call belongs to an autonomous background daemon agent
+    (request_id ``daemon_*``) rather than a genuine user turn.
+
+    Reads request_id from the ``X-HARTOS-Request-ID`` header stamped by
+    ``_annotate_request`` (so it travels with the request even across threads),
+    with a thread-local fallback, then applies the canonical
+    ``dispatch.is_genuine_user_request`` rule — single source of truth, no
+    duplicated prefix logic.  Conservative: ANY uncertainty returns False, so a
+    call is treated as cancellable background work only when we are sure; a user
+    turn is never cancelled."""
+    try:
+        rid = None
+        try:
+            rid = request.headers.get('X-HARTOS-Request-ID')
+        except Exception:
+            rid = None
+        if not rid:
+            rid = _get_request_id()
+        if not rid:
+            return False
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+        return not is_genuine_user_request(rid)
+    except Exception:
+        return False
+
+
+def _select_send_client(self, request):
+    """Choose which httpx client executes this :8082 send.
+
+    Autonomous daemon calls get the closable background client AFTER yielding to
+    any in-flight user turn; everything else gets the caller's own client,
+    unchanged.  Fully fenced — any failure falls back to the original client, so
+    the foreground path can never break."""
+    try:
+        if not _is_background_call(request):
+            return self
+        from core.foreground import foreground_active, wait_until_clear
+        if foreground_active():
+            # A user is being served right now — yield the model to them first.
+            wait_until_clear(_bg_yield_wait_s())
+        from core.http_pool import get_bg_llm_http_client
+        return get_bg_llm_http_client() or self
+    except Exception:
+        return self
+
+
 def _install_sync_patch(httpx_module) -> None:
     _orig_send = httpx_module.Client.send
 
@@ -483,9 +560,14 @@ def _install_sync_patch(httpx_module) -> None:
             # Trim BEFORE annotating headers so content-length matches.
             body, _ = _apply_trim_to_request(httpx_module, request, body)
             _annotate_request(request, body)
+        # Route autonomous-daemon calls through the closable background client
+        # (after yielding to any live user turn); user turns stay on `self`.
+        # _annotate_request ran above, so the X-HARTOS-Request-ID header the
+        # discriminator reads is already set.
+        send_client = _select_send_client(self, request)
         start = time.time()
         try:
-            response = _orig_send(self, request, **kwargs)
+            response = _orig_send(send_client, request, **kwargs)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
                          response_status=getattr(response, 'status_code', None),

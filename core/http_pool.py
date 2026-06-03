@@ -150,6 +150,70 @@ def get_llm_http_client():
         return _llm_httpx_client
 
 
+# ── Background-only LLM client (autonomous daemon calls, request_id 'daemon_*')
+# ──────────────────────────────────────────────────────────────────────────
+# A SEPARATE httpx.Client from the foreground shared client above, used only for
+# autonomous background-agent LLM calls.  Its whole reason to exist: it can be
+# closed mid-flight — dropping every in-flight background connection — the
+# instant a user chat arrives, so llama-server sees the client disconnect, aborts
+# those generations, and frees the single local model slot for the user.  The
+# foreground shared client is NEVER touched, so a live user turn is byte-for-byte
+# unchanged (the GIL fix above stays intact).
+#
+# verify=False: the only endpoint is the local plain-HTTP llama-server, so there
+# is no TLS — and it also skips ssl.create_default_context's CA-bundle parse, the
+# very GIL hog get_llm_http_client exists to avoid.  Built lazily, rebuilt fresh
+# after each close (the next background call gets a usable client again).
+_bg_llm_httpx_client = None
+_bg_llm_httpx_lock = threading.Lock()
+_bg_cancel_registered = False
+
+
+def get_bg_llm_http_client():
+    """Return the process-wide background-only ``httpx.Client`` for autonomous
+    daemon LLM calls.  Closable mid-flight via ``close_bg_llm_http_client`` (wired
+    to ``core.foreground``'s cancel registry, fired when a user chat starts).
+    Thread-safe; rebuilds a fresh client if the previous one was closed."""
+    global _bg_llm_httpx_client, _bg_cancel_registered
+    with _bg_llm_httpx_lock:
+        if not _bg_cancel_registered:
+            # Register the closer ONCE so the 0->1 foreground edge aborts any
+            # in-flight background call.  Idempotent + harmless if no client is
+            # open, so it never needs unregistering.
+            try:
+                from core.foreground import register_cancellable
+                register_cancellable(close_bg_llm_http_client)
+                _bg_cancel_registered = True
+            except Exception:
+                pass
+        if _bg_llm_httpx_client is not None and not _bg_llm_httpx_client.is_closed:
+            return _bg_llm_httpx_client
+        import httpx
+        _bg_llm_httpx_client = _shared_llm_http_client_class()(
+            timeout=httpx.Timeout(600.0, connect=10.0), verify=False)
+        logger.info("Background LLM httpx.Client initialized (closable for "
+                    "foreground preemption)")
+        return _bg_llm_httpx_client
+
+
+def close_bg_llm_http_client() -> None:
+    """Close the background LLM client, dropping all its in-flight connections so
+    llama-server aborts those generations and frees the slot for the user.
+
+    Idempotent + best-effort: a closed/absent client is a no-op.  Clears the
+    singleton so the next background call rebuilds a fresh client (which only
+    happens AFTER the foreground turn clears — see the wrapper's yield gate)."""
+    global _bg_llm_httpx_client
+    with _bg_llm_httpx_lock:
+        c = _bg_llm_httpx_client
+        _bg_llm_httpx_client = None
+    if c is not None:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
 def get_http_session() -> requests.Session:
     """
     Get or create a connection-pooled requests.Session.

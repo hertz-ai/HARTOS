@@ -169,8 +169,10 @@ def test_target_request_stamps_headers_does_not_mutate_body(
     fake_httpx = _build_fake_httpx_module()
     monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
     fake_tl = types.ModuleType('threadlocal')
+    # Model the REAL ThreadLocalData contract: request_id is read via the
+    # get_request_id() accessor (stored in _local), not a bare instance attr.
     fake_tl.thread_local_data = types.SimpleNamespace(
-        request_id='req-abc-1234')
+        get_request_id=lambda: 'req-abc-1234')
     monkeypatch.setitem(sys.modules, 'threadlocal', fake_tl)
     import core.llm_outbound_logger as mod
     mod.install()
@@ -216,7 +218,8 @@ def test_source_context_stamps_headers_and_tags_log(
     fake_httpx = _build_fake_httpx_module()
     monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
     fake_tl = types.ModuleType('threadlocal')
-    fake_tl.thread_local_data = types.SimpleNamespace(request_id='req-x')
+    fake_tl.thread_local_data = types.SimpleNamespace(
+        get_request_id=lambda: 'req-x')
     monkeypatch.setitem(sys.modules, 'threadlocal', fake_tl)
     import core.llm_outbound_logger as mod
     mod.install()
