@@ -383,6 +383,7 @@ def test_target_ports_includes_resolved_main_port_and_legacy(monkeypatch):
     import core.llm_outbound_logger as mod
     monkeypatch.setattr(pr, 'get_local_llm_url',
                         lambda: 'http://127.0.0.1:8080/v1', raising=False)
+    monkeypatch.setattr(pr, 'get_local_draft_url', lambda: '', raising=False)
     monkeypatch.setattr(pr, 'get_port',
                         lambda s: 8080 if s == 'llm' else 0, raising=False)
     mod._target_ports_cache = None
@@ -400,6 +401,7 @@ def test_is_target_request_matches_main_and_legacy_ports(monkeypatch):
     import core.llm_outbound_logger as mod
     monkeypatch.setattr(pr, 'get_local_llm_url',
                         lambda: 'http://127.0.0.1:8080/v1', raising=False)
+    monkeypatch.setattr(pr, 'get_local_draft_url', lambda: '', raising=False)
     mod._target_ports_cache = None
     try:
         def _u(port):
@@ -408,5 +410,39 @@ def test_is_target_request_matches_main_and_legacy_ports(monkeypatch):
         assert mod._is_target_request(_u(8082), 'POST') is True   # legacy/draft
         assert mod._is_target_request(_u(9999), 'POST') is False  # unrelated
         assert mod._is_target_request(_u(8080), 'GET') is False   # POST only
+    finally:
+        mod._target_ports_cache = None
+
+
+def test_target_ports_follows_dynamic_port_reassignment(monkeypatch):
+    """The llama-server port is NOT fixed — Nunba assigns it dynamically and
+    reassigns on port-conflict/restart (get_local_llm_url follows it). The hook
+    must FOLLOW the move, not freeze on the first value. A permanent cache (the
+    original #86 fix) re-blinded the log the moment the server changed ports;
+    this guards the regression by asserting caches-within-TTL AND follows-after.
+    """
+    import core.port_registry as pr
+    import core.llm_outbound_logger as mod
+    monkeypatch.setattr(pr, 'get_port',
+                        lambda s: 8080 if s == 'llm' else 0, raising=False)
+    monkeypatch.setattr(pr, 'get_local_draft_url', lambda: '', raising=False)
+    mod._target_ports_cache = None
+    try:
+        # Server first comes up on 8090.
+        monkeypatch.setattr(pr, 'get_local_llm_url',
+                            lambda: 'http://127.0.0.1:8090/v1', raising=False)
+        assert 8090 in mod._target_ports()
+
+        # It moves to 8091 — within the TTL the hook keeps the cached value
+        # (cheap hot path, no re-probe) and does not yet see the new port.
+        monkeypatch.setattr(pr, 'get_local_llm_url',
+                            lambda: 'http://127.0.0.1:8091/v1', raising=False)
+        ports_within_ttl = mod._target_ports()
+        assert 8090 in ports_within_ttl and 8091 not in ports_within_ttl
+
+        # Age the cache past the TTL → the hook RE-RESOLVES and follows the move.
+        cached_ports, _ = mod._target_ports_cache
+        mod._target_ports_cache = (cached_ports, 0.0)  # resolved_at = epoch
+        assert 8091 in mod._target_ports()
     finally:
         mod._target_ports_cache = None

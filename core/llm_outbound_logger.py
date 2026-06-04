@@ -66,7 +66,16 @@ logger = logging.getLogger('llm_outbound')
 _TARGET_PORT = 8082
 _TARGET_PATH = '/v1/chat/completions'
 _LOG_FILENAME = 'llm_outbound.jsonl'
-_target_ports_cache = None  # type: Optional[set]
+# (ports, resolved_at) — re-resolved on a short TTL, NOT cached for the process
+# lifetime.  The llama-server port is NOT fixed: Nunba assigns it dynamically
+# (records it in ~/.nunba/llama_config.json server_port) and REASSIGNS on port
+# conflict / restart; get_local_llm_url() follows that via its own probe-TTL.
+# A permanent cache here froze the watched port at first resolution — e.g. a
+# cold-boot placeholder before llama-server spawns — and silently re-blinded
+# the hook the moment the server landed on a different port (the exact drift
+# #86 set out to kill).  So mirror the resolver's TTL and re-resolve.
+_target_ports_cache = None  # type: Optional[tuple]
+_TARGET_PORTS_TTL = 30.0  # seconds — match get_local_llm_url's cache TTL
 
 _installed = False
 _install_lock = threading.Lock()
@@ -191,29 +200,37 @@ def _open_log_handle():
 def _target_ports() -> set:
     """Local llama-server port(s) whose chat-completions we capture.
 
-    Resolves the MAIN model port the SAME way autogen does — from
-    ``get_local_llm_url()`` (with ``get_port('llm')`` as a backstop) — so the
-    hook always matches the real endpoint, and ALSO keeps the legacy 8082
-    (draft / historical default).  Cached after first resolution; the local
-    server port does not change mid-process."""
+    Resolves the live MAIN and DRAFT model ports the SAME way the chat path
+    does — from ``get_local_llm_url()`` / ``get_local_draft_url()`` (with
+    ``get_port('llm')`` and the legacy 8082 as backstops).  Re-resolved every
+    ``_TARGET_PORTS_TTL`` seconds rather than cached for the process lifetime,
+    so the hook FOLLOWS the server when Nunba reassigns its port (cold-boot
+    placeholder -> real port, port-conflict reassignment, server restart)
+    instead of freezing — and re-blinding — on the first value.
+
+    The underlying resolvers carry their own 30s probe-cache, so the per-TTL
+    re-resolve is cheap and never re-probes a dead candidate on the hot path."""
     global _target_ports_cache
+    now = time.time()
     if _target_ports_cache is not None:
-        return _target_ports_cache
+        cached_ports, resolved_at = _target_ports_cache
+        if (now - resolved_at) < _TARGET_PORTS_TTL:
+            return cached_ports
     ports = {_TARGET_PORT}
     try:
-        from core.port_registry import get_local_llm_url
         import re as _re
-        m = _re.search(r':(\d+)', get_local_llm_url() or '')
-        if m:
-            ports.add(int(m.group(1)))
-    except Exception:
-        pass
-    try:
-        from core.port_registry import get_port
-        ports.add(int(get_port('llm')))
+        import core.port_registry as _pr
+        for _resolver in ('get_local_llm_url', 'get_local_draft_url'):
+            try:
+                m = _re.search(r':(\d+)', getattr(_pr, _resolver)() or '')
+                if m:
+                    ports.add(int(m.group(1)))
+            except Exception:
+                pass
+        ports.add(int(_pr.get_port('llm')))
     except Exception:
         ports.add(8080)
-    _target_ports_cache = ports
+    _target_ports_cache = (ports, now)
     return ports
 
 
