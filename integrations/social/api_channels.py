@@ -18,7 +18,7 @@ from flask import Blueprint, request, jsonify, g
 
 from .auth import require_auth
 from .models import (
-    get_db, UserChannelBinding, ConversationEntry, ChannelPresence,
+    db_session, UserChannelBinding, ConversationEntry, ChannelPresence,
 )
 
 logger = logging.getLogger(__name__)
@@ -401,12 +401,9 @@ def channel_connect_pair_code_submit(channel_type: str):
 @channel_user_bp.route('/presence', methods=['GET'])
 def get_presence():
     """Get all channel adapter statuses (public)."""
-    db = get_db()
-    try:
+    with db_session(commit=False) as db:
         presences = db.query(ChannelPresence).all()
         return jsonify({'success': True, 'data': [p.to_dict() for p in presences]})
-    finally:
-        db.close()
 
 
 @channel_user_bp.route('/presence/heartbeat', methods=['POST'])
@@ -419,28 +416,24 @@ def post_heartbeat():
     if not channel_type:
         return jsonify({'success': False, 'error': 'channel_type required'}), 400
 
-    db = get_db()
     try:
-        existing = db.query(ChannelPresence).filter_by(channel_type=channel_type).first()
-        if existing:
-            existing.status = status
-            existing.last_heartbeat = datetime.utcnow()
-            existing.error_message = data.get('error_message')
-        else:
-            presence = ChannelPresence(
-                channel_type=channel_type,
-                status=status,
-                last_heartbeat=datetime.utcnow(),
-                error_message=data.get('error_message'),
-            )
-            db.add(presence)
-        db.commit()
-        return jsonify({'success': True})
+        with db_session() as db:
+            existing = db.query(ChannelPresence).filter_by(channel_type=channel_type).first()
+            if existing:
+                existing.status = status
+                existing.last_heartbeat = datetime.utcnow()
+                existing.error_message = data.get('error_message')
+            else:
+                presence = ChannelPresence(
+                    channel_type=channel_type,
+                    status=status,
+                    last_heartbeat=datetime.utcnow(),
+                    error_message=data.get('error_message'),
+                )
+                db.add(presence)
+            return jsonify({'success': True})
     except Exception as e:
-        db.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
-    finally:
-        db.close()
 
 
 # ── Conversation History ───────────────────────────────────────
