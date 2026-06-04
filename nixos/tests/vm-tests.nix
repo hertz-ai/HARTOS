@@ -35,11 +35,17 @@ let
   # `extra` is imported as a module (NOT merged with //) so its nested attrs
   # (e.g. networking.interfaces on the peer-discovery nodes) recursively merge
   # with the base instead of clobbering networking.hostName.
-  mkNode = variant: extra: { config, pkgs, lib, ... }: {
+  mkNode = variant: extra: { pkgs, lib, hartSrc, ... }: {
     imports = hartModules ++ [ extra ];
     hart.enable = true;
     hart.variant = variant;
     hart.version = "0.0.0-test";
+    # hart.package has NO default (mkOption type=package, "set in variant
+    # config").  The full configs set it via callPackage hart-app.nix; the
+    # minimal node must too, else system.build.toplevel can't evaluate the
+    # hart-agent/backend/discovery services that read config.hart.package.
+    # `--no-build` only evaluates this derivation (it is not built here).
+    hart.package = pkgs.callPackage ../packages/hart-app.nix { inherit hartSrc; };
     # hart-base sets networking.hostName = mkDefault "hart-node"; runNixOSTest
     # also sets a default (the node name) -> two same-priority defaults conflict.
     # Force a deterministic per-node value (tests address by IP, not hostname).
