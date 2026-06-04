@@ -458,223 +458,22 @@ def _canonicalize_args(tool_name: str, arguments: dict) -> dict:
     return out
 
 
-# ── Lazy helpers (same as mcp_server.py, avoid import-time side effects) ──
-
-_registry = None
-_memory_graph = None
-
-
-def _get_registry():
-    global _registry
-    if _registry is None:
-        from integrations.expert_agents.registry import ExpertAgentRegistry
-        _registry = ExpertAgentRegistry()
-    return _registry
-
-
-def _get_db():
-    from integrations.social.models import get_db
-    return get_db()
-
-
-def _get_memory_graph(user_id: str = 'system'):
-    global _memory_graph
-    if _memory_graph is None:
-        from integrations.channels.memory.memory_graph import MemoryGraph
-        try:
-            from core.platform_paths import get_memory_graph_dir
-            db_path = get_memory_graph_dir()
-        except ImportError:
-            db_path = os.path.join(
-                os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'memory_graph'
-            )
-        _memory_graph = MemoryGraph(db_path=db_path, user_id=user_id)
-    return _memory_graph
-
-
-# ── Tool implementations ──────────────────────────────────────
-# Same logic as mcp_server.py tools, but without FastMCP decorators.
-
-def _tool_list_agents(category: Optional[str] = None, query: Optional[str] = None) -> str:
-    """List available expert agents. Filter by category or search by query."""
-    reg = _get_registry()
-    if query:
-        agents = reg.search_agents(query)
-    elif category:
-        from integrations.expert_agents.registry import AgentCategory
-        cat_map = {name.lower(): member for name, member in AgentCategory.__members__.items()}
-        cat = cat_map.get(category.lower())
-        if not cat:
-            return json.dumps({"error": f"Unknown category: {category}"})
-        agents = reg.get_agents_by_category(cat)
-    else:
-        agents = list(reg.agents.values())
-
-    result = []
-    for a in agents:
-        result.append({
-            "agent_id": a.agent_id, "name": a.name,
-            "category": a.category.name if hasattr(a.category, 'name') else str(a.category),
-            "description": a.description, "model_type": a.model_type,
-        })
-
-    prompts_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'prompts')
-    dynamic = []
-    if os.path.isdir(prompts_dir):
-        for f in _glob.glob(os.path.join(prompts_dir, '*.json')):
-            try:
-                with open(f) as fh:
-                    data = json.load(fh)
-                dynamic.append({
-                    "agent_id": data.get("prompt_id", Path(f).stem),
-                    "name": data.get("agent_name", Path(f).stem),
-                    "category": "dynamic_recipe",
-                    "description": data.get("description", "Trained agent recipe"),
-                })
-            except Exception:
-                pass
-
-    return json.dumps({"expert_agents": len(result), "dynamic_agents": len(dynamic),
-                       "agents": result[:50], "dynamic": dynamic[:20]}, indent=2)
-
-
-def _tool_list_goals(goal_type: Optional[str] = None, status: Optional[str] = None) -> str:
-    """List agent goals. Filter by type or status."""
-    try:
-        from integrations.agent_engine.goal_manager import GoalManager
-        db = _get_db()
-        try:
-            goals = GoalManager.list_goals(db, goal_type=goal_type, status=status)
-            return json.dumps({"count": len(goals), "goals": goals}, indent=2, default=str)
-        finally:
-            db.close()
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-def _tool_create_goal(goal_type: str, title: str, description: str = '', spark_budget: int = 200) -> str:
-    """Create a new goal for agents to pursue."""
-    try:
-        from integrations.agent_engine.goal_manager import GoalManager
-        db = _get_db()
-        try:
-            result = GoalManager.create_goal(db, goal_type=goal_type, title=title,
-                                             description=description, spark_budget=spark_budget)
-            db.commit()
-            return json.dumps(result, indent=2, default=str)
-        finally:
-            db.close()
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-def _tool_agent_status() -> str:
-    """Check agent daemon health, active dispatches, and system state.
-
-    Uses ``core.health_probe`` canonical probes — never reads env-var
-    snapshots or hardcoded ports.  See module docstring there for the
-    root-cause notes from the 2026-05-01 false-negative incident.
-    """
-    from core.health_probe import probe_agent_daemon, probe_llm
-    status = probe_agent_daemon()
-    status['llm_server'] = probe_llm()
-    try:
-        reg = _get_registry()
-        status['expert_agents'] = len(reg.agents)
-    except Exception:
-        status['expert_agents'] = 'unknown'
-    return json.dumps(status, indent=2, default=str)
+# ── Shared tool implementations (single source: _tool_impls) ──
+# The read-only tool bodies + the lazy _get_* helpers live in
+# integrations.mcp._tool_impls so this HTTP bridge and the stdio mcp_server
+# can't drift (#98c).  _get_db/_get_registry/_get_memory_graph are re-imported
+# so the framework-gateway + hive tools further down keep working unchanged.
+from integrations.mcp import _tool_impls as impls
+from integrations.mcp._tool_impls import _get_registry, _get_db, _get_memory_graph
 
 
 def _tool_remember(content: str, memory_type: str = 'decision') -> str:
-    """Store a memory in the persistent memory graph."""
-    try:
-        mg = _get_memory_graph()
-        memory_id = mg.register(content=content,
-                                metadata={'memory_type': memory_type, 'source_agent': 'mcp_bridge'})
-        return json.dumps({"stored": True, "memory_id": memory_id})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    """Store a memory in the persistent memory graph.
 
-
-def _tool_recall(query: str, top_k: int = 5) -> str:
-    """Search the persistent memory graph."""
-    try:
-        mg = _get_memory_graph()
-        memories = mg.recall(query=query, mode='hybrid', top_k=top_k)
-        result = []
-        for m in memories:
-            result.append({
-                "id": m.id, "content": m.content,
-                "memory_type": m.memory_type, "source_agent": m.source_agent,
-                "created_at": m.created_at,
-            })
-        return json.dumps({"count": len(result), "memories": result}, indent=2, default=str)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-def _tool_list_recipes() -> str:
-    """List trained agent recipes (prompts/*.json files)."""
-    prompts_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'prompts')
-    recipes = []
-    if os.path.isdir(prompts_dir):
-        for f in sorted(_glob.glob(os.path.join(prompts_dir, '*.json'))):
-            try:
-                with open(f) as fh:
-                    data = json.load(fh)
-                recipes.append({
-                    "file": Path(f).name,
-                    "prompt_id": data.get("prompt_id", ""),
-                    "agent_name": data.get("agent_name", ""),
-                    "status": data.get("agent_status", ""),
-                    "description": data.get("description", "")[:200],
-                })
-            except Exception:
-                recipes.append({"file": Path(f).name, "error": "parse failed"})
-    return json.dumps({"count": len(recipes), "recipes": recipes}, indent=2)
-
-
-def _tool_system_health() -> str:
-    """Full system health check: Flask server, LLM, DB, memory graph."""
-    from core.health_probe import probe_nunba_flask, probe_llm
-    health = {
-        'backend': probe_nunba_flask(),
-        'llm': probe_llm(),
-    }
-    try:
-        db = _get_db()
-        try:
-            from integrations.social.models import User
-            count = db.query(User).count()
-            health['db'] = {'status': 'up', 'user_count': count}
-        finally:
-            db.close()
-    except Exception as e:
-        health['db'] = {'status': 'error', 'detail': str(e)}
-    return json.dumps(health, indent=2, default=str)
-
-
-def _tool_social_query(query_type: str, limit: int = 20) -> str:
-    """Read-only social DB queries. Types: users, posts, goals, products, agents."""
-    try:
-        db = _get_db()
-        try:
-            if query_type == 'users':
-                from integrations.social.models import User
-                rows = db.query(User).order_by(User.created_at.desc()).limit(limit).all()
-                return json.dumps([{"id": r.id, "username": r.username,
-                                    "display_name": r.display_name} for r in rows], default=str)
-            elif query_type == 'goals':
-                from integrations.agent_engine.goal_manager import GoalManager
-                goals = GoalManager.list_goals(db)
-                return json.dumps({"count": len(goals), "goals": goals[:limit]}, default=str)
-            else:
-                return json.dumps({"error": f"Unknown query_type: {query_type}"})
-        finally:
-            db.close()
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    Thin wrapper over the shared impl — only the transport-specific provenance
+    tag ('mcp_bridge') differs; the body is single-sourced (#98c).
+    """
+    return impls.remember(content, memory_type, source_agent='mcp_bridge')
 
 
 # ── Watchdog & Monitoring Tools (read-only, no bypass) ─────────
@@ -873,17 +672,17 @@ def _load_tools():
         return
     _tools_loaded = True
 
-    # Read-only: observe the system
-    _register_tool('list_agents', 'List available expert agents', _tool_list_agents)
-    _register_tool('list_goals', 'List agent goals', _tool_list_goals)
-    _register_tool('agent_status', 'Check agent daemon health', _tool_agent_status)
-    _register_tool('list_recipes', 'List trained agent recipes', _tool_list_recipes)
-    _register_tool('system_health', 'Full system health check', _tool_system_health)
-    _register_tool('social_query', 'Read-only social DB queries', _tool_social_query)
+    # Read-only: observe the system (shared impls — single source _tool_impls)
+    _register_tool('list_agents', 'List available expert agents', impls.list_agents)
+    _register_tool('list_goals', 'List agent goals', impls.list_goals)
+    _register_tool('agent_status', 'Check agent daemon health', impls.agent_status)
+    _register_tool('list_recipes', 'List trained agent recipes', impls.list_recipes)
+    _register_tool('system_health', 'Full system health check', impls.system_health)
+    _register_tool('social_query', 'Read-only social DB queries', impls.social_query)
 
     # Memory (safe — memory graph only, no framework bypass)
     _register_tool('remember', 'Store a memory in the memory graph', _tool_remember)
-    _register_tool('recall', 'Search the persistent memory graph', _tool_recall)
+    _register_tool('recall', 'Search the persistent memory graph', impls.recall)
 
     # Framework gateway — ALL writes go through Flask routes (guardrails, constitution, budget gate)
     _register_tool('call_endpoint', 'Call any HARTOS API endpoint through the framework', _tool_call_endpoint)
