@@ -5,7 +5,7 @@ Automatically discovers and registers agents from prompt JSON files.
 Each trained agent (recipe JSON) becomes an A2A-compatible specialist.
 
 Architecture:
-- Scans prompts/ directory for {prompt_id}_{flow_id}_{role_number}.json files
+- Scans prompts/ directory for {prompt_id}_{flow_id}_recipe.json files
 - Extracts agent capabilities from recipe JSONs
 - Automatically creates A2A Agent Cards
 - Registers with Google A2A Protocol server

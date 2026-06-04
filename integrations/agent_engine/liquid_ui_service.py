@@ -4549,8 +4549,8 @@ function renderAgentOverlay(ev) {{
                 metrics['error'] = 'psutil not installed'
             # GPU via VRAMManager
             try:
-                from integrations.service_tools.vram_manager import VRAMManager
-                gpu = VRAMManager.detect_gpu()
+                from integrations.service_tools.vram_manager import get_vram_manager
+                gpu = get_vram_manager().detect_gpu()  # instance method — call on the singleton, not the class
                 if gpu and gpu.get('name'):
                     metrics['gpu'] = gpu
             except Exception:

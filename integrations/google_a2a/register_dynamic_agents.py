@@ -2,7 +2,7 @@
 Dynamic Agent Registration for Google A2A Protocol
 
 Replaces hardcoded agent registration with dynamic discovery.
-All agents are loaded from prompts/{prompt_id}_{flow_id}_{role_number}_recipe.json files.
+All agents are loaded from prompts/{prompt_id}_{flow_id}_recipe.json files.
 
 NO HARDCODED AGENTS!
 """
@@ -210,7 +210,10 @@ def list_available_agents():
         print(f"\n[Prompt {prompt_id}] {prompt_name}")
         print("-" * 80)
 
-        for agent in sorted(by_prompt[prompt_id], key=lambda a: (a.flow_id, a.role_number)):
+        # Sort by flow_id only — the flow IS the persona/role (naming is the
+        # 2-part {prompt_id}_{flow_id}); there is no separate role_number field
+        # (it was vestigial from an abandoned 3-part scheme → AttributeError).
+        for agent in sorted(by_prompt[prompt_id], key=lambda a: a.flow_id):
             status_icon = "✓" if agent.status == "done" else "○"
             auto_icon = "⚡" if agent.can_perform_without_user_input == "yes" else "👤"
             fallback_icon = "🔄" if agent.fallback_action else "  "
