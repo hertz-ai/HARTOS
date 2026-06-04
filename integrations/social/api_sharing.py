@@ -212,6 +212,9 @@ def create_share_link():
             'share_count': 1,
             'is_private': is_private,
         }, status=201)
+    except Exception:
+        db.rollback()  # was missing: a failed write closed a dirty session (#97)
+        raise
     finally:
         db.close()
 
@@ -321,6 +324,9 @@ def track_share_view(token):
 
         db.commit()
         return _ok({'view_count': link.view_count})
+    except Exception:
+        db.rollback()  # was missing: a failed write closed a dirty session (#97)
+        raise
     finally:
         db.close()
 
