@@ -47,6 +47,27 @@ COST_PER_1K_TOKENS = {
 }
 
 
+def _revenue_split_usd(amount_usd: float) -> Dict[str, float]:
+    """The 90/9/1 split of a USD amount, rounded to cents — single source.
+
+    Uses the canonical REVENUE_SPLIT_* constants (revenue_aggregator) so every
+    payment-response breakdown tracks the platform split instead of hardcoding
+    0.90/0.09/0.01; falls back to the documented defaults only if that import is
+    unavailable (slim runs) — same pattern as get_pricing().
+    """
+    try:
+        from integrations.agent_engine.revenue_aggregator import (
+            REVENUE_SPLIT_USERS, REVENUE_SPLIT_INFRA, REVENUE_SPLIT_CENTRAL,
+        )
+    except Exception:
+        REVENUE_SPLIT_USERS, REVENUE_SPLIT_INFRA, REVENUE_SPLIT_CENTRAL = 0.90, 0.09, 0.01
+    return {
+        'users_pool_usd': round(amount_usd * REVENUE_SPLIT_USERS, 2),
+        'infrastructure_usd': round(amount_usd * REVENUE_SPLIT_INFRA, 2),
+        'central_usd': round(amount_usd * REVENUE_SPLIT_CENTRAL, 2),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════
 # Service
 # ═══════════════════════════════════════════════════════════════
@@ -909,11 +930,7 @@ def upgrade_key(key_id):
                 'amount_usd': amount_usd,
                 'status': 'completed',
             },
-            'revenue_split': {
-                'users_pool_usd': round(amount_usd * 0.90, 2),
-                'infrastructure_usd': round(amount_usd * 0.09, 2),
-                'central_usd': round(amount_usd * 0.01, 2),
-            },
+            'revenue_split': _revenue_split_usd(amount_usd),
         })
     finally:
         try:
@@ -1258,11 +1275,7 @@ def phonepe_callback():
         'payment_request_id': payment_req.payment_id,
         'api_key_id': api_key_id,
         'new_tier': target_tier,
-        'revenue_split': {
-            'users_pool_usd': round(amount_usd * 0.90, 2),
-            'infrastructure_usd': round(amount_usd * 0.09, 2),
-            'central_usd': round(amount_usd * 0.01, 2),
-        },
+        'revenue_split': _revenue_split_usd(amount_usd),
     }), 200
 
 
@@ -1586,11 +1599,7 @@ def complete_upgrade_checkout():
                 'stripe_payment_intent': getattr(session, 'payment_intent', None),
                 'status': 'completed',
             },
-            'revenue_split': {
-                'users_pool_usd': round(amount_usd * 0.90, 2),
-                'infrastructure_usd': round(amount_usd * 0.09, 2),
-                'central_usd': round(amount_usd * 0.01, 2),
-            },
+            'revenue_split': _revenue_split_usd(amount_usd),
         }), 200
     finally:
         try:

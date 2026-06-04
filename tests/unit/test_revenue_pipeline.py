@@ -11,6 +11,38 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 
+# ─── Commercial-API split helper tracks the canonical constants (DRY) ───
+
+class TestCommercialRevenueSplitHelper:
+    """commercial_api._revenue_split_usd must DERIVE from the canonical
+    REVENUE_SPLIT_* constants, not re-hardcode 0.90/0.09/0.01 in each payment
+    response (the parallel-path the 2026-06-04 audit found + fixed)."""
+
+    def test_split_helper_tracks_canonical_constants(self):
+        from integrations.agent_engine.commercial_api import _revenue_split_usd
+        from integrations.agent_engine.revenue_aggregator import (
+            REVENUE_SPLIT_USERS, REVENUE_SPLIT_INFRA, REVENUE_SPLIT_CENTRAL,
+        )
+        s = _revenue_split_usd(250.0)
+        assert s == {
+            'users_pool_usd': round(250.0 * REVENUE_SPLIT_USERS, 2),
+            'infrastructure_usd': round(250.0 * REVENUE_SPLIT_INFRA, 2),
+            'central_usd': round(250.0 * REVENUE_SPLIT_CENTRAL, 2),
+        }
+
+    def test_split_helper_behaviour_preserved_90_9_1(self):
+        # The fix must not change today's numbers (constants are 0.90/0.09/0.01).
+        from integrations.agent_engine.commercial_api import _revenue_split_usd
+        assert _revenue_split_usd(100.0) == {
+            'users_pool_usd': 90.0, 'infrastructure_usd': 9.0, 'central_usd': 1.0,
+        }
+
+    def test_split_sums_to_amount(self):
+        from integrations.agent_engine.commercial_api import _revenue_split_usd
+        s = _revenue_split_usd(49.0)
+        assert round(sum(s.values()), 2) == 49.0
+
+
 # ─── Revenue Stream Aggregation Tests ───
 
 class TestRevenueStreams:
