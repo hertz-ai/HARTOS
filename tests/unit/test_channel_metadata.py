@@ -39,7 +39,12 @@ class TestChannelMetadata:
         assert categories == {'core', 'enterprise', 'social', 'decentralized', 'bridge', 'utility'}
 
     def test_auth_methods_valid(self):
-        valid = {'api_key', 'oauth2', 'websocket_token', 'qr_session', 'phone_2fa', 'credentials'}
+        # Independent allowlist of KNOWN-good auth methods (NOT derived from the
+        # catalog — that would make the check tautological; its job is to catch a
+        # typo'd / unhandled auth_method).  'gateway_qr' is WhatsApp's embedded
+        # Baileys-gateway QR flow (see metadata.py whatsapp comment).
+        valid = {'api_key', 'oauth2', 'websocket_token', 'qr_session', 'phone_2fa',
+                 'credentials', 'gateway_qr'}
         for name, meta in CHANNEL_CATALOG.items():
             assert meta['auth_method'] in valid, f'{name} has invalid auth_method: {meta["auth_method"]}'
 
