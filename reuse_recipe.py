@@ -262,10 +262,9 @@ llm_call_track = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_llm_call_t
 _active_tools = {}
 _active_tools_lock = threading.Lock()
 
-redis_client = redis.StrictRedis(
-    host=os.environ.get('HEVOLVE_REDIS_HOST', '127.0.0.1'),
-    port=int(os.environ.get('HEVOLVE_REDIS_PORT', '6379')),
-    db=0)
+# (removed dead module-level redis_client — never referenced; the only
+# `redis_client` uses here are getattr(backend, 'redis_client') on ledger
+# backends, unrelated. The one live recipe-pipeline client is helper.py. #93)
 agent_data = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_agent_data', loader=load_agent_data)
 user_simplemem = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_user_simplemem', loader=load_user_simplemem)
 # Azure OpenAI fallback config removed — credentials must come from

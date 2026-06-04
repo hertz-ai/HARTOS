@@ -406,8 +406,10 @@ from core.event_loop import get_or_create_event_loop
 config = _get_config()
 STUDENT_API = config.get('STUDENT_API', '')
 ACTION_API = config.get('ACTION_API', '')
-redis_client = redis.StrictRedis(
-    host='azure_all_vms.hertzai.com', port=6369, db=0)
+# (removed dead module-level redis_client that hardcoded a stale prod host
+# azure_all_vms.hertzai.com:6369 with no env override / no fallback — it was
+# never referenced; the only `redis_client` uses in this file are
+# getattr(backend, 'redis_client') on ledger backends, unrelated. #93)
 
 
 # Performance: TTL caches replace unbounded global dicts (auto-expire after 2 hours)
