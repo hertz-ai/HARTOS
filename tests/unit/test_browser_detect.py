@@ -86,3 +86,93 @@ def test_detection_never_touches_profile_contents():
         assert 'login data' not in low
         assert 'cookies.sqlite' not in low
         assert 'sessionstore' not in low
+
+
+# ── capability 2: consent-gated channel-usage detection (#63) ──────────────
+
+def test_channel_domain_keys_are_catalog_keys():
+    # Single-source-of-truth guard: every channel the allowlist names must be a
+    # real CHANNEL_CATALOG key, so the connect step can hand to register_channel.
+    from integrations.channels.metadata import CHANNEL_CATALOG
+    for ch in browser_detect._CHANNEL_WEB_DOMAINS:
+        assert ch in CHANNEL_CATALOG, f"{ch} not a catalog channel"
+
+
+def test_channel_for_url_maps_known_domains_and_subdomains():
+    assert browser_detect.channel_for_url('https://discord.com/channels/1/2') == 'discord'
+    assert browser_detect.channel_for_url('https://web.whatsapp.com/') == 'whatsapp'
+    assert browser_detect.channel_for_url('https://canary.discord.com/app') == 'discord'  # subdomain
+    assert browser_detect.channel_for_url('https://x.com/messages') == 'twitter'           # alias domain
+    assert browser_detect.channel_for_url('https://teams.microsoft.com/_#/conv') == 'teams'
+
+
+def test_channel_for_url_ignores_non_channel_and_empty():
+    assert browser_detect.channel_for_url('https://news.ycombinator.com/') is None
+    assert browser_detect.channel_for_url('https://mybank.example.com/login') is None
+    assert browser_detect.channel_for_url('') is None
+    assert browser_detect.channel_for_url(None) is None
+    # a domain that merely CONTAINS an allowlisted token must not match
+    assert browser_detect.channel_for_url('https://notdiscord.com.evil.test/') is None
+
+
+def test_detect_channel_usage_off_by_default_never_reads(monkeypatch):
+    monkeypatch.delenv('HART_BROWSER_HISTORY_SCAN', raising=False)
+    calls = []
+
+    def _spy_reader(root, name):
+        calls.append((root, name))
+        return ['https://discord.com/']
+
+    res = browser_detect.detect_channel_usage(
+        browsers=[{'name': 'chrome', 'profile_root': '/p', 'present': True}],
+        history_reader=_spy_reader,
+    )
+    assert res['enabled'] is False
+    assert res['channels'] == []
+    assert calls == [], "history must NOT be read when detection is gated off"
+    assert 'OFF' in res['notice']
+
+
+def test_detect_channel_usage_with_consent_maps_history():
+    history = {
+        'chrome': ['https://discord.com/channels/1', 'https://news.example.com/',
+                   'https://web.whatsapp.com/'],
+        'firefox': ['https://x.com/home'],
+    }
+    res = browser_detect.detect_channel_usage(
+        consent=True,
+        browsers=[
+            {'name': 'chrome', 'profile_root': '/c', 'present': True},
+            {'name': 'firefox', 'profile_root': '/f', 'present': True},
+            {'name': 'edge', 'profile_root': '/e', 'present': False},  # skipped
+        ],
+        history_reader=lambda root, name: history.get(name, []),
+    )
+    assert res['enabled'] is True
+    assert res['channels'] == ['discord', 'twitter', 'whatsapp']  # sorted, deduped
+    assert 'edge' not in res['browsers']                          # absent browser not scanned
+    assert sorted(res['browsers']) == ['chrome', 'firefox']
+    assert 'No cookies' in res['notice']
+
+
+def test_detect_channel_usage_env_flag_enables(monkeypatch):
+    monkeypatch.setenv('HART_BROWSER_HISTORY_SCAN', 'true')
+    res = browser_detect.detect_channel_usage(
+        browsers=[{'name': 'chrome', 'profile_root': '/c', 'present': True}],
+        history_reader=lambda root, name: ['https://app.slack.com/client/T1'],
+    )
+    assert res['enabled'] is True
+    assert res['channels'] == ['slack']
+
+
+def test_detect_channel_usage_reader_error_degrades_to_empty():
+    def _boom(root, name):
+        raise OSError("locked")
+
+    res = browser_detect.detect_channel_usage(
+        consent=True,
+        browsers=[{'name': 'chrome', 'profile_root': '/c', 'present': True}],
+        history_reader=_boom,
+    )
+    assert res['enabled'] is True
+    assert res['channels'] == []        # never raises; degrades to "found nothing"

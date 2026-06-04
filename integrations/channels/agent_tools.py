@@ -397,6 +397,74 @@ def build_channel_tool_closures(ctx):
     ))
 
     # ------------------------------------------------------------------
+    # 3b. suggest_channels  (browser auto-association — #63)
+    # ------------------------------------------------------------------
+    #
+    # Suggests channels the user ALREADY uses (detected from their own
+    # browser history, scoped to a messaging-domain allowlist) that aren't
+    # connected yet, so the agent can offer to connect them via the existing
+    # register_channel / OAuth flow.  Privacy posture (see browser_detect):
+    #   - OFF by default; only runs when the user has enabled browser scan
+    #     (HART_BROWSER_HISTORY_SCAN) or passes explicit consent.
+    #   - History only, scoped to the allowlist; cookies/logins never read.
+    #   - Suggests only — the connect itself is the existing consented flow.
+    @log_tool_execution
+    def suggest_channels() -> str:
+        """Suggest messaging channels the user already uses but hasn't connected,
+        detected from their own browser history (scoped to known app domains)."""
+        try:
+            uid = user_id or _get_user_id_from_threadlocal()
+            from integrations.channels.browser_detect import detect_channel_usage
+            result = detect_channel_usage()  # gated; consent via env flag
+            if not result.get('enabled'):
+                return result.get('notice') or "Browser channel detection is off."
+
+            detected = set(result.get('channels') or [])
+            notice = result.get('notice', '')
+            if not detected:
+                return ("No known messaging-app domains found in your browser "
+                        f"history. {notice}")
+
+            # Drop channels the user already has an active binding for.
+            connected = set()
+            if uid:
+                try:
+                    from integrations.social.models import get_db, UserChannelBinding
+                    db = get_db()
+                    try:
+                        for b in db.query(UserChannelBinding).filter_by(
+                                user_id=str(uid), is_active=True).all():
+                            connected.add(b.channel_type)
+                    finally:
+                        db.close()
+                except Exception:
+                    pass
+
+            suggestions = sorted(detected - connected)
+            if not suggestions:
+                return ("The channels you use are already connected. " + notice)
+
+            from integrations.channels.metadata import get_channel_metadata
+            names = ', '.join(
+                (get_channel_metadata(c) or {}).get('display_name', c)
+                for c in suggestions
+            )
+            return (f"You appear to use these channels that aren't connected yet: "
+                    f"{names}. Want me to connect any of them? {notice}")
+        except Exception as e:
+            return f"Error suggesting channels: {e}"
+
+    tools.append((
+        "suggest_channels",
+        "Suggest messaging channels the user already uses but hasn't connected, "
+        "detected from their OWN browser history (scoped to known messaging-app "
+        "domains; cookies/logins are never read; OFF unless the user enabled "
+        "browser scan). Use during onboarding or when the user asks what they "
+        "can connect. Always confirm before connecting.",
+        suggest_channels,
+    ))
+
+    # ------------------------------------------------------------------
     # 4. get_channel_context
     # ------------------------------------------------------------------
     @log_tool_execution
