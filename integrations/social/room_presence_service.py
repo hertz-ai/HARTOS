@@ -120,13 +120,10 @@ def gate(user_id: str, platform: str, room_id: str,
     }
     try:
         from integrations.social.consent_service import ConsentService
-        from integrations.social.models import get_db
-        db = get_db()
-        try:
+        from integrations.social.models import db_session
+        with db_session(commit=False) as db:
             allowed = ConsentService.check_consent(
                 db, str(user_id), _CONSENT_TYPE, scope=scope)
-        finally:
-            db.close()
     except Exception as e:
         logger.warning(
             "room_presence.gate: consent check failed for "
