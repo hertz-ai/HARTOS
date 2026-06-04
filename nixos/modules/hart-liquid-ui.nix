@@ -121,6 +121,23 @@ Gtk.main()
 "
   '';
 
+  # ── Kiosk session launcher ──
+  # Wraps cage so the Wayland stack boots the glass shell on ANY GPU — including
+  # broken / flaky drivers. A real NVIDIA box showed nouveau GSP init failing
+  # (`gsp: fini failed, -110`) and cage crashing at startup ("failed to idle
+  # channel"). wlroots ABORTS rather than use software rendering unless
+  # WLR_RENDERER_ALLOW_SOFTWARE=1, so the compositor died and the whole session
+  # with it. Force the entire kiosk to software rendering (Mesa llvmpipe +
+  # wlroots pixman): the shell is 2D and renders fine in software, KMS scanout
+  # still uses the kernel driver (the console text proves KMS works), and the
+  # broken GPU GL/compute path is never touched. A kiosk MUST paint on any GPU.
+  kioskLauncher = pkgs.writeShellScriptBin "hart-shell-session" ''
+    export WLR_RENDERER_ALLOW_SOFTWARE=1
+    export WLR_NO_HARDWARE_CURSORS=1
+    export LIBGL_ALWAYS_SOFTWARE=1
+    exec ${pkgs.cage}/bin/cage -- ${glassShell}/bin/hart-glass-shell
+  '';
+
   # ── Kiosk Wayland session ──
   # cage runs ONLY the glass shell as the compositor's single client.  There is
   # no desktop, no app-grid, no GNOME beneath it — THIS is what makes
@@ -132,7 +149,7 @@ Gtk.main()
     [Desktop Entry]
     Name=HART OS
     Comment=AI-native glass shell (Nunba / LiquidUI)
-    Exec=${pkgs.cage}/bin/cage -- ${glassShell}/bin/hart-glass-shell
+    Exec=${kioskLauncher}/bin/hart-shell-session
     Type=Application
     DesktopNames=HART-OS
   '';
