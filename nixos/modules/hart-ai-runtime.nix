@@ -213,17 +213,19 @@ in
             # Use `find`, NOT `ls glob | wc`: on a fresh ISO the model store is
             # empty, the glob matches nothing, `ls` exits non-zero, and under
             # `set -euo pipefail` that KILLS this oneshot — the "Failed to start
-            # Model Store Manager" seen on real hardware. `find` returns 0 with
-            # an empty result and never errors on a missing dir.
+            # Model Store Manager" seen on real hardware. `find` exits 0 on an
+            # *existing empty* dir, but STILL exits non-zero on a *missing* dir,
+            # so every `find | wc` keeps `|| true` to stay alive under pipefail
+            # even if a dir was never created (tmpfiles race / future format).
             if [[ -d "$MODEL_PATH/manifests" ]]; then
-              MANIFEST_COUNT=$(find "$MODEL_PATH/manifests" -maxdepth 1 -name '*.json' -type f 2>/dev/null | wc -l)
+              MANIFEST_COUNT=$(find "$MODEL_PATH/manifests" -maxdepth 1 -name '*.json' -type f 2>/dev/null | wc -l) || true
               echo "[HART OS AI] Verified $MANIFEST_COUNT model manifests"
             fi
 
             # Report available models
             for fmt in gguf safetensors onnx minicpm; do
-              COUNT=$(find "$MODEL_PATH/$fmt" -maxdepth 1 -type f 2>/dev/null | wc -l)
-              if [[ "$COUNT" -gt 0 ]]; then
+              COUNT=$(find "$MODEL_PATH/$fmt" -maxdepth 1 -type f 2>/dev/null | wc -l) || true
+              if [[ "''${COUNT:-0}" -gt 0 ]]; then
                 echo "[HART OS AI] $fmt models: $COUNT"
               fi
             done
