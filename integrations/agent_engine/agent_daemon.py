@@ -1248,32 +1248,73 @@ class AgentDaemon:
                 except Exception as e:
                     logger.debug(f"Revenue funding check: {e}")
 
-            # Baseline intelligence check: re-snapshot when world model stats shift
+            # Baseline intelligence check + recipe self-optimizer (Gate 4, #88).
+            # The measure half already ran here (validate_against_baseline) but
+            # only re-snapshotted on a regression — it never ACTED.  Close the
+            # loop: on a corroborated regression, retire the recipe so the
+            # existing CREATE/REUSE split re-CREATEs it (with experience hints);
+            # then accept the re-CREATE or roll back to the proven-better one.
             if self._tick_count % (self._remediate_every * 2) == 0:
                 try:
                     from .agent_baseline_service import (
                         AgentBaselineService, capture_baseline_async)
                     from integrations.social.models import AgentGoal
+                    from core import flow_recipe_optimizer as _opt
+                    _optimizer_on = os.environ.get(
+                        'HEVOLVE_RECIPE_OPTIMIZER', '1') not in ('0', 'false', 'no')
                     active_goals = db.query(AgentGoal).filter(
                         AgentGoal.status.in_(['active', 'completed'])).all()
                     checked = set()
                     for goal in active_goals:
-                        key = f'{goal.prompt_id}_{goal.flow_id or 0}'
-                        if key in checked or not goal.prompt_id:
+                        _flow = goal.flow_id or 0
+                        _pid = str(goal.prompt_id) if goal.prompt_id else ''
+                        key = f'{_pid}_{_flow}'
+                        if key in checked or not _pid:
                             continue
                         checked.add(key)
-                        result = AgentBaselineService.validate_against_baseline(
-                            str(goal.prompt_id), goal.flow_id or 0)
+
+                        def _latest_reward():
+                            try:
+                                snap = AgentBaselineService.get_latest_snapshot(
+                                    _pid, _flow) or {}
+                                return float((snap.get('lightning_metrics') or {}
+                                             ).get('avg_reward') or 0.0)
+                            except Exception:
+                                return 0.0
+
+                        # ── Resolve any in-flight re-optimization first ──
+                        if _optimizer_on and _opt.has_pending_optimization(_pid, _flow):
+                            if _opt.recipe_exists(_pid, _flow):  # daemon has re-CREATEd it
+                                if _latest_reward() >= (_opt.archived_reward(_pid, _flow) or 0.0):
+                                    _opt.accept_reoptimization(_pid, _flow)
+                                    logger.info(f"Recipe optimizer: accepted re-optimized {key}")
+                                else:
+                                    _opt.rollback_recipe(_pid, _flow)
+                                    logger.warning(f"Recipe optimizer: rolled back {key} "
+                                                   f"(re-CREATE regressed vs retired recipe)")
+                            continue  # never stack a new archive while one is pending
+
+                        # ── Measure -> (corroborated) ACT ──
+                        result = AgentBaselineService.validate_against_baseline(_pid, _flow)
                         if result and not result.get('passed', True):
                             capture_baseline_async(
-                                prompt_id=str(goal.prompt_id),
-                                flow_id=goal.flow_id or 0,
+                                prompt_id=_pid, flow_id=_flow,
                                 trigger='intelligence_change')
                             logger.info(
                                 f"Intelligence change detected for {key}: "
                                 f"{result.get('regressions', [])}")
+                            # Retire ONLY on a second, independent signal (declining
+                            # reward trend) + an active goal that will re-dispatch.
+                            _trend = AgentBaselineService.compute_trend(_pid, _flow)
+                            if (_optimizer_on and goal.status == 'active'
+                                    and _trend.get('trend') == 'declining'
+                                    and _trend.get('snapshot_count', 0) >= 2):
+                                if _opt.archive_recipe_for_reoptimization(
+                                        _pid, _flow, _latest_reward()):
+                                    logger.info(f"Recipe optimizer: retired underperforming "
+                                                f"{key} for re-CREATE (reward-declining + regressed)")
                 except Exception as e:
-                    logger.debug(f"Baseline intelligence check: {e}")
+                    logger.debug(f"Baseline intelligence + optimizer check: {e}")
 
             self._wd_heartbeat()
 
