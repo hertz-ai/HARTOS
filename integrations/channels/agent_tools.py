@@ -503,6 +503,57 @@ def build_channel_tool_closures(ctx):
         list_upcoming_events,
     ))
 
+    # 3d. sync_meetings  (calendar INGEST — #64, closes the Zoom/Meet orphan)
+    # fetch_and_ingest_zoom/gmeet were implemented + unit-tested but had NO
+    # caller, so list_upcoming_events (the READ side) had nothing to read for
+    # those sources. This wires the caller. Token resolution mirrors every other
+    # channel adapter: explicit param > env var (the param is also the seam the
+    # OAuth-connect flow uses to pass a per-user binding token). Degrades with a
+    # clear "connect your account" message — never a silent no-op.
+    @log_tool_execution
+    def sync_meetings(
+        provider: Annotated[str, "Which calendar to sync: 'zoom' or 'meet' (Google Meet)"],
+        access_token: Annotated[str, "OAuth bearer token; omit to use the connected account / env token"] = "",
+    ) -> str:
+        """Fetch the user's upcoming Zoom or Google Meet meetings and ingest them into their calendar (then list_upcoming_events surfaces them)."""
+        import os
+        prov = (provider or "").strip().lower()
+        uid = user_id or _get_user_id_from_threadlocal()
+        created_by = str(uid) if uid else None
+        try:
+            from integrations.social.events import (
+                fetch_and_ingest_zoom, fetch_and_ingest_gmeet)
+            if prov == "zoom":
+                tok = access_token or os.getenv("ZOOM_ACCESS_TOKEN", "")
+                if not tok:
+                    return ("No Zoom token available — connect your Zoom account "
+                            "(OAuth) or set ZOOM_ACCESS_TOKEN, then try again.")
+                events = fetch_and_ingest_zoom(tok, created_by=created_by)
+            elif prov in ("meet", "gmeet", "google", "google_meet"):
+                tok = access_token or os.getenv("GOOGLE_CALENDAR_TOKEN", "")
+                if not tok:
+                    return ("No Google token available — connect your Google account "
+                            "(OAuth) or set GOOGLE_CALENDAR_TOKEN, then try again.")
+                events = fetch_and_ingest_gmeet(tok, created_by=created_by)
+            else:
+                return f"Unknown provider '{provider}'. Use 'zoom' or 'meet'."
+            n = len(events)
+            if n == 0:
+                return (f"No upcoming {prov} meetings found (or the token was "
+                        "rejected). Nothing new ingested.")
+            return (f"Synced {n} upcoming {prov} meeting(s) into your calendar. "
+                    "Ask me to list your upcoming events to see them.")
+        except Exception as e:
+            return f"Error syncing {prov or 'meetings'}: {e}"
+
+    tools.append((
+        "sync_meetings",
+        "Fetch the user's upcoming Zoom or Google Meet meetings and ingest them "
+        "into their calendar so list_upcoming_events can surface them. Use when "
+        "the user asks to sync / import / connect their Zoom or Google Meet schedule.",
+        sync_meetings,
+    ))
+
     # ------------------------------------------------------------------
     # 4. get_channel_context
     # ------------------------------------------------------------------
