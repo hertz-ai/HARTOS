@@ -107,3 +107,65 @@ def test_store_and_get_roundtrip(monkeypatch):
     assert fcm_sync.store_local_fcm_token('9003054371', 'tokNEW', synced_at='2026') is True
     assert fcm_sync.get_local_fcm_token('9003054371') == 'tokNEW'
     assert fcm_sync.get_local_fcm_token('unregistered') is None
+
+
+# ── send path: message build + privacy notice + credential-gated send ───────
+def test_build_fcm_v1_message_stamps_privacy_notice():
+    msg = fcm_sync.build_fcm_v1_message('tok', 'Title', 'Body',
+                                        data={'k': 1, 'topic': 'chat.social'})
+    m = msg['message']
+    assert m['token'] == 'tok'
+    assert m['notification'] == {'title': 'Title', 'body': 'Body'}
+    assert m['data']['k'] == '1'                     # v1 requires string values
+    assert m['data']['topic'] == 'chat.social'
+    assert m['data']['privacy_tier_skipped'] == 'true'
+    assert 'local-private tier' in m['data']['privacy_notice']
+
+
+def test_build_fcm_v1_message_no_notice_when_disabled():
+    msg = fcm_sync.build_fcm_v1_message('tok', '', '', privacy_tier_skipped=False)
+    assert 'privacy_notice' not in msg['message']['data']
+    assert 'notification' not in msg['message']      # no title/body → no notif block
+
+
+def test_send_no_op_without_credential(monkeypatch):
+    monkeypatch.setattr(fcm_sync, 'get_local_fcm_token', lambda uid: 'tok')
+    monkeypatch.delenv('HART_FCM_ACCESS_TOKEN', raising=False)
+    monkeypatch.delenv('HART_FCM_SA_FILE', raising=False)
+    monkeypatch.delenv('HART_FCM_PROJECT', raising=False)
+
+    def _no_post(*a, **k):
+        raise AssertionError("must not POST to FCM without a credential")
+    monkeypatch.setitem(sys.modules, 'requests', types.SimpleNamespace(post=_no_post))
+    assert fcm_sync.send_fcm_push('u1', 't', 'b') is False
+
+
+def test_send_none_without_token(monkeypatch):
+    monkeypatch.setattr(fcm_sync, 'get_local_fcm_token', lambda uid: None)
+    monkeypatch.setattr(fcm_sync, 'sync_fcm_token', lambda uid, **k: None)
+    assert fcm_sync.send_fcm_push('u1', 't', 'b') is False
+
+
+def test_send_posts_to_fcm_with_credential(monkeypatch):
+    monkeypatch.setattr(fcm_sync, 'get_local_fcm_token', lambda uid: 'tokXYZ')
+    monkeypatch.setenv('HART_FCM_ACCESS_TOKEN', 'access123')
+    monkeypatch.setenv('HART_FCM_PROJECT', 'hart-proj')
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        text = ''
+
+    def _post(url, headers=None, json=None, timeout=None):
+        captured.update(url=url, headers=headers, json=json)
+        return _Resp()
+    monkeypatch.setitem(sys.modules, 'requests', types.SimpleNamespace(post=_post))
+
+    assert fcm_sync.send_fcm_push('9003054371', 'Consent', 'Approve external posting?') is True
+    assert 'hart-proj' in captured['url'] and captured['url'].endswith('/messages:send')
+    assert captured['headers']['Authorization'] == 'Bearer access123'
+    m = captured['json']['message']
+    assert m['token'] == 'tokXYZ'
+    assert m['notification'] == {'title': 'Consent', 'body': 'Approve external posting?'}
+    assert m['data']['privacy_tier_skipped'] == 'true'        # the tier-skip notice rides along
+    assert 'central FCM relay' in m['data']['privacy_notice']

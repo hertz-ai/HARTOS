@@ -131,3 +131,96 @@ def sync_fcm_token(user_id, synced_at=None):
         store_local_fcm_token(user_id, token, synced_at=synced_at)
         return token
     return get_local_fcm_token(user_id)
+
+
+# ── Decentralized push: local node → Google FCM, using the synced token ─────
+
+_FCM_V1_ENDPOINT = 'https://fcm.googleapis.com/v1/projects/{project}/messages:send'
+
+# Stamped into every push: sending through Google's FCM leaves the user's
+# local-private tier, so we never do it silently — the client surfaces this to
+# the user (per the privacy-transparency rule).
+_PRIVACY_TIER_NOTICE = (
+    'Delivered via the central FCM relay to reach your device — this left your '
+    'local-private tier.'
+)
+
+
+def build_fcm_v1_message(token, title, body, data=None, privacy_tier_skipped=True):
+    """Build an FCM HTTP v1 ``message`` body (pure — unit-testable).
+
+    All v1 ``data`` values must be strings.  When the push leaves the local
+    tier (the default for a personal push routed off-device), stamps the
+    privacy-tier notice so the user is told their message used the central relay.
+    """
+    _data = {str(k): str(v) for k, v in (data or {}).items()}
+    if privacy_tier_skipped:
+        _data['privacy_tier_skipped'] = 'true'
+        _data['privacy_notice'] = _PRIVACY_TIER_NOTICE
+    message = {'token': token, 'data': _data}
+    if title or body:
+        message['notification'] = {'title': title or '', 'body': body or ''}
+    return {'message': message}
+
+
+def _fcm_access_token():
+    """OAuth bearer for FCM v1, or None when no credential is configured.
+
+    ``HART_FCM_ACCESS_TOKEN`` short-circuits (tests / a pre-minted token).
+    Otherwise mints one from a service-account file at ``HART_FCM_SA_FILE`` via
+    google-auth.  Returns None (push disabled) when neither is set — the
+    decentralized send is OPT-IN via that edge credential.
+    """
+    tok = os.environ.get('HART_FCM_ACCESS_TOKEN')
+    if tok:
+        return tok
+    sa_file = os.environ.get('HART_FCM_SA_FILE')
+    if not sa_file:
+        return None
+    try:
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request
+        creds = service_account.Credentials.from_service_account_file(
+            sa_file, scopes=['https://www.googleapis.com/auth/firebase.messaging'])
+        creds.refresh(Request())
+        return creds.token
+    except Exception as e:
+        logger.debug("_fcm_access_token failed: %s", e)
+        return None
+
+
+def send_fcm_push(user_id, title, body, data=None, timeout=8):
+    """Push an FCM notification to ``user_id``'s device using the LOCALLY-cached
+    token (syncing it first if absent) — the decentralized, no-crossbar send.
+
+    Best-effort, never raises.  Returns True on a 200 from FCM, else False (no
+    token, no credential/project, network/HTTP error).  The edge credential
+    (HART_FCM_SA_FILE / HART_FCM_ACCESS_TOKEN) + HART_FCM_PROJECT gate the real
+    send, so a node with no push credential degrades cleanly to a no-op.
+    """
+    if not user_id:
+        return False
+    token = get_local_fcm_token(user_id) or sync_fcm_token(user_id)
+    if not token:
+        return False
+    access = _fcm_access_token()
+    project = os.environ.get('HART_FCM_PROJECT', '')
+    if not access or not project:
+        logger.debug("send_fcm_push(%s): no FCM credential/project — push disabled", user_id)
+        return False
+    try:
+        import requests
+        resp = requests.post(
+            _FCM_V1_ENDPOINT.format(project=project),
+            headers={'Authorization': f'Bearer {access}',
+                     'Content-Type': 'application/json'},
+            json=build_fcm_v1_message(token, title, body, data),
+            timeout=timeout)
+        if resp.status_code == 200:
+            return True
+        logger.debug("send_fcm_push(%s): FCM %s %s", user_id, resp.status_code,
+                     str(getattr(resp, 'text', ''))[:200])
+        return False
+    except Exception as e:
+        logger.debug("send_fcm_push(%s) failed: %s", user_id, e)
+        return False
