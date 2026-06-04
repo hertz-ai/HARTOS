@@ -21,21 +21,7 @@ logger = logging.getLogger('hevolve_social')
 sharing_bp = Blueprint('sharing', __name__, url_prefix='/api/social')
 
 
-def _ok(data=None, meta=None, status=200):
-    r = {'success': True}
-    if data is not None:
-        r['data'] = data
-    if meta is not None:
-        r['meta'] = meta
-    return jsonify(r), status
-
-
-def _err(msg, status=400):
-    return jsonify({'success': False, 'error': msg}), status
-
-
-def _get_json():
-    return request.get_json(force=True, silent=True) or {}
+from .api_common import _ok, _err, _get_json  # single-sourced (#97)
 
 
 def _generate_token(length=8):
