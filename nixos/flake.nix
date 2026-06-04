@@ -273,34 +273,18 @@
       # Configured pkgs so runNixOSTest nodes (read-only) carry allowUnfree
       # WITHOUT any node module setting nixpkgs.config — the #70 fix.
       #
-      # KNOWN-REMAINING #70 — ROOT-CAUSED, needs a working nix to fix+verify
-      # (this dev box's WSL filesystem ops hang, so `nix flake check` can't run
-      # locally; 2 blind CI rounds confirmed guessing is unreliable).  Three
-      # entangled problems make the vm-test nodes un-evaluable:
-      #
-      #   1. OVERLAYS COLLISION: the nodes import ../configurations/{server,
-      #      desktop,edge}.nix, each of which imports the installer-CD profile
-      #      ("${modulesPath}/installer/cd-dvd/installation-cd-*.nix").  That
-      #      profile sets nixpkgs.overlays, which collides with the read-only
-      #      node.pkgs runNixOSTest derives from this host pkgs
-      #      ("nodes.X.nixpkgs.overlays defined multiple times").
-      #   2. CASCADE: simply gating the installer-CD import out (isVmTest +
-      #      `imports = lib.optionals (!isVmTest) [...]`) is NOT enough — the
-      #      same configs also set `isoImage.*` (server/edge) which is an
-      #      option the installer-CD profile PROVIDES, so it then errors
-      #      "option isoImage does not exist".  Every installer-CD-dependent
-      #      option would need the same gating (un-enumerable without nix).
-      #   3. SPECIALARGS GAP: vm-tests.nix never passes specialArgs to the
-      #      inline nodes, so the configs' `hartSrc` would be undefined once
-      #      (1) is fixed — needs `node.specialArgs = specialArgs // {...}`.
-      #
-      # CLEANEST FIX (for a nix-equipped session): don't reuse the full ISO
-      # configs as test nodes at all.  Give vm-tests minimal node modules
-      # (hartModules + `{ hart.enable = true; hart.variant = "X"; }` + the few
-      # variant-specific services the testScript asserts), bypassing the
-      # installer-CD / isoImage machinery entirely.  Already-landed #70 fixes:
-      # phosh option removed (CI-confirmed), services.modemManager removed,
-      # nixpkgs.config single-sourced (fd95368).
+      # #70 FIX APPLIED (tests/vm-tests.nix): the vm-test nodes no longer import
+      # the full ISO configs (../configurations/X.nix).  Those configs imported
+      # the installer-CD profile, which set nixpkgs.overlays and collided with
+      # runNixOSTest's read-only node.pkgs ("nodes.X.nixpkgs.overlays defined
+      # multiple times") + dragged in isoImage.*, making the checks
+      # un-EVALUABLE and blocking `nix flake check` (hence all ISO CI).  The
+      # nodes are now built from the hart modules alone with the variant
+      # enabled ({hart.enable; hart.variant} — modules are variant-gated), and
+      # specialArgs(hartSrc) is passed via `node.specialArgs`.  `nix flake check
+      # --no-build` only needs the nodes to EVALUATE; the testScript assertions
+      # run in the build job.  Earlier landed #70 fixes: phosh +
+      # services.modemManager removed, nixpkgs.config single-sourced (fd95368).
       pkgs = import nixpkgs { system = "x86_64-linux"; config = nixpkgsConfig; };
       vmTests = import ./tests/vm-tests.nix {
         inherit pkgs hartModules;

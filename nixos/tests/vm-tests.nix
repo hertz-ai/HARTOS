@@ -5,23 +5,39 @@
 # Uses NixOS's built-in testers.runNixOSTest framework.
 # Each test boots a real VM via QEMU and runs assertions.
 #
-# Run all tests:
-#   nix flake check
-#
-# Run a single test:
-#   nix build .#checks.x86_64-linux.hart-server-boot
-#
+# Run all tests:        nix flake check
+# Run a single test:    nix build .#checks.x86_64-linux.hart-server-boot
 # These tests take 5-15 minutes each (VM boot + assertions).
+#
+# #70 FIX — minimal test nodes (was: import the full ISO configs):
+#   The nodes used to `imports = hartModules ++ [ ../configurations/X.nix ]`.
+#   Each ISO config imports the NixOS installer-CD profile, which sets
+#   nixpkgs.overlays — and that collides with runNixOSTest's read-only
+#   node.pkgs ("nodes.X.nixpkgs.overlays defined multiple times"), so
+#   `nix flake check` could not even EVALUATE the checks and the whole ISO CI
+#   gate was blocked.  Gating the installer-CD import out cascaded into
+#   isoImage.* errors (that option is PROVIDED by the installer-CD profile).
+#   Fix per the recorded recipe: build the nodes from the hart modules alone
+#   with the variant enabled — the modules are variant-gated
+#   (hart-agent/hart-backend branch on cfg.variant), so {hart.enable;
+#   hart.variant} configures each variant's services without any installer-CD /
+#   isoImage machinery.  specialArgs (hartSrc) is passed to the inline nodes via
+#   `node.specialArgs` (the previously-missing wiring) so modules that consume
+#   it evaluate.  The `nix flake check --no-build` gate only needs the nodes to
+#   EVALUATE; the testScript assertions run in the (separate) build job.
 
 { pkgs, hartModules, specialArgs }:
 
 let
-  # Helper: create a test configuration with all hart modules
-  mkTestConfig = variant: extra: {
-    imports = hartModules ++ [
-      ../configurations/${variant}.nix
-    ] ++ extra;
-  };
+  # Minimal node: hart modules + variant, NO ../configurations/X.nix (and thus
+  # no installer-CD overlay collision).  `extra` carries per-test virtualisation
+  # / networking overrides.
+  mkNode = variant: extra: { config, pkgs, lib, ... }: ({
+    imports = hartModules;
+    hart.enable = true;
+    hart.variant = variant;
+    hart.version = "0.0.0-test";
+  } // extra);
 
 in
 {
@@ -30,13 +46,9 @@ in
   # ─────────────────────────────────────────────────────────────
   hart-server-boot = pkgs.testers.runNixOSTest {
     name = "hart-server-boot";
+    node.specialArgs = specialArgs;
 
-    nodes.server = { config, pkgs, lib, ... }: {
-      imports = hartModules ++ [
-        ../configurations/server.nix
-      ];
-
-      # Override for test VM (less RAM, faster boot)
+    nodes.server = mkNode "server" {
       virtualisation = {
         memorySize = 2048;
         cores = 2;
@@ -44,9 +56,6 @@ in
           { from = "host"; host.port = 16777; guest.port = 6777; }
         ];
       };
-
-      # Provide specialArgs values for test
-      hart.version = "0.0.0-test";
     };
 
     testScript = ''
@@ -105,18 +114,13 @@ in
   # ─────────────────────────────────────────────────────────────
   hart-desktop-boot = pkgs.testers.runNixOSTest {
     name = "hart-desktop-boot";
+    node.specialArgs = specialArgs;
 
-    nodes.desktop = { config, pkgs, lib, ... }: {
-      imports = hartModules ++ [
-        ../configurations/desktop.nix
-      ];
-
+    nodes.desktop = mkNode "desktop" {
       virtualisation = {
         memorySize = 4096;
         cores = 2;
       };
-
-      hart.version = "0.0.0-test";
     };
 
     testScript = ''
@@ -157,18 +161,13 @@ in
   # ─────────────────────────────────────────────────────────────
   hart-edge-boot = pkgs.testers.runNixOSTest {
     name = "hart-edge-boot";
+    node.specialArgs = specialArgs;
 
-    nodes.edge = { config, pkgs, lib, ... }: {
-      imports = hartModules ++ [
-        ../configurations/edge.nix
-      ];
-
+    nodes.edge = mkNode "edge" {
       virtualisation = {
         memorySize = 1024;
         cores = 1;
       };
-
-      hart.version = "0.0.0-test";
     };
 
     testScript = ''
@@ -210,37 +209,24 @@ in
   # ─────────────────────────────────────────────────────────────
   hart-peer-discovery = pkgs.testers.runNixOSTest {
     name = "hart-peer-discovery";
+    node.specialArgs = specialArgs;
 
-    nodes.server = { config, pkgs, lib, ... }: {
-      imports = hartModules ++ [
-        ../configurations/server.nix
-      ];
-
+    nodes.server = mkNode "server" {
       virtualisation = {
         memorySize = 2048;
         cores = 1;
       };
-
-      hart.version = "0.0.0-test";
-
       # Both nodes share a virtual network
       networking.interfaces.eth1.ipv4.addresses = [
         { address = "192.168.1.1"; prefixLength = 24; }
       ];
     };
 
-    nodes.edge = { config, pkgs, lib, ... }: {
-      imports = hartModules ++ [
-        ../configurations/edge.nix
-      ];
-
+    nodes.edge = mkNode "edge" {
       virtualisation = {
         memorySize = 1024;
         cores = 1;
       };
-
-      hart.version = "0.0.0-test";
-
       networking.interfaces.eth1.ipv4.addresses = [
         { address = "192.168.1.2"; prefixLength = 24; }
       ];
