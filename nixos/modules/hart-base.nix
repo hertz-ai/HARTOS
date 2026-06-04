@@ -165,6 +165,16 @@ in
     services.getty.greetingLine =
       lib.mkForce ''<<< Welcome to HART OS ${cfg.version} (Sentient) (\m) - \l >>>'';
 
+    # ── Distro name (boot menu + system strings) ──
+    # The ISO boot menu showed "NixOS <nixpkgs-version> HART OS Desktop" — a
+    # user-visible "NixOS" leak at boot (confirmed from a CI QEMU console dump;
+    # isoImage.appendToMenuLabel only APPENDS, it can't drop the "NixOS"
+    # prefix). distroName is the supported override the boot-menu + various
+    # system strings derive from. distroId is left as the default so tooling
+    # that keys on os-release ID=nixos still works; the user-facing NAME is
+    # already "HART OS" via the explicit os-release above.
+    system.nixos.distroName = lib.mkForce "HART OS";
+
     # ── Users ──
     users.users.hart = {
       isSystemUser = true;
