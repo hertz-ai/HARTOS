@@ -146,6 +146,39 @@ in
       with subtest("Display manager starts (GNOME)"):
           desktop.wait_for_unit("display-manager.service", timeout=180)
 
+      # ── AI-native session services (regression guard for #99) ──
+      # These are all Type="notify" units whose ExecStart python does
+      # `import systemd.daemon; notify('READY=1')`. When systemd-python is
+      # missing from the hart python env the import raises, the process dies,
+      # and systemd kills the unit at TimeoutStartSec — so on a fresh ISO the
+      # bridge + LiquidUI server never come up (the originally-reported crash).
+      # Asserting they reach "active" fails on the broken build and passes once
+      # systemd-python is present.
+      with subtest("Model Bus service is active (Type=notify / systemd-python)"):
+          desktop.wait_for_unit("hart-model-bus.service", timeout=180)
+
+      with subtest("LiquidUI server is active (Type=notify / systemd-python)"):
+          desktop.wait_for_unit("hart-liquid-ui.service", timeout=180)
+
+      with subtest("App Bridge service is active (Type=notify / systemd-python)"):
+          desktop.wait_for_unit("hart-app-bridge.service", timeout=180)
+
+      # ── Android-on-Linux branding (regression guard for #101) ──
+      # The NixOS installer profile injects a normal `nixos` user that GDM
+      # would list on the greeter. It must be demoted to a hidden system
+      # account (uid < 1000) so HART OS never shows "nixos" at login.
+      with subtest("Installer 'nixos' user is hidden from the greeter"):
+          desktop.succeed("getent passwd nixos")                 # still defined
+          desktop.succeed('test "$(id -u nixos)" -lt 1000')      # but a system uid
+
+      # ── Glass-shell GI deps in the closure (regression guard for #99/#100) ──
+      # The cage glass shell does gi.require_version('Gtk','3.0')/('WebKit2',
+      # '4.1'); those typelibs must be built into the system so GI_TYPELIB_PATH
+      # can find them. (Full render is validated at real boot.)
+      with subtest("Glass-shell GI typelibs are present (Gtk-3.0 + WebKit2-4.1)"):
+          desktop.succeed("find /nix/store -name 'Gtk-3.0.typelib' -print -quit | grep -q .")
+          desktop.succeed("find /nix/store -name 'WebKit2-4.1.typelib' -print -quit | grep -q .")
+
       with subtest("Wine available (native Windows API)"):
           desktop.succeed("which wine64 || which wine")
 
