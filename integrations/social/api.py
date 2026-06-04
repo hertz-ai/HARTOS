@@ -3927,6 +3927,7 @@ def theme_apply():
         db.add(g.user)
         db.commit()
     except Exception as e:
+        db.rollback()  # was missing: caught commit error left g.db dirty for teardown (#97)
         logger.error(f"theme_apply commit error: {e}")
         return _err('Failed to save theme', 500)
     return _ok({'theme': preset})
@@ -3951,6 +3952,7 @@ def theme_customize():
         db.add(g.user)
         db.commit()
     except Exception as e:
+        db.rollback()  # was missing: caught commit error left g.db dirty for teardown (#97)
         logger.error(f"theme_customize commit error: {e}")
         return _err('Failed to save theme', 500)
     return _ok({'theme': merged})
