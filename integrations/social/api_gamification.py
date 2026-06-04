@@ -42,6 +42,9 @@ def resonance_wallet_self():
             wallet = ResonanceService.get_or_create_wallet(db, g.user_id).to_dict()
             db.commit()
         return _ok(wallet)
+    except Exception:
+        db.rollback()  # was missing: a failed write closed a dirty session (#97)
+        raise
     finally:
         db.close()
 
@@ -159,6 +162,9 @@ def resonance_level_info():
         }
         db.commit()
         return _ok(info)
+    except Exception:
+        db.rollback()  # was missing: a failed write closed a dirty session (#97)
+        raise
     finally:
         db.close()
 
@@ -175,6 +181,9 @@ def resonance_streak():
             'streak_best': wallet.streak_best,
             'last_active_date': wallet.last_active_date,
         })
+    except Exception:
+        db.rollback()  # was missing: a failed write closed a dirty session (#97)
+        raise
     finally:
         db.close()
 
