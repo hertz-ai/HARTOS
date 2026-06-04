@@ -44,6 +44,13 @@ let
     numpy
     pillow
 
+    # System metrics — LiquidUI's /api/shell/system/metrics (the CPU/RAM/disk
+    # context that IS the adaptive shell's value: "explains WHY the GPU is
+    # busy"). Imported lazily + guarded, so its absence only silently degrades
+    # the dashboard rather than crashing the service — exactly the kind of
+    # quietly-broken feature that hides without this.
+    psutil
+
     # Utilities
     python-dateutil
     pyyaml
