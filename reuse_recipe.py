@@ -2788,13 +2788,12 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                 if agent_to_return:
                     return agent_to_return
                 else:
-                    temp_message = messages[-1]["content"]
-                    temp_message = temp_message.replace("'", '"')
-                    json_match = re.search(r'{[\s\S]*}', temp_message)
-                    if json_match:
+                    # Canonical multi-strategy parse (json/repair/ast/regex)
+                    # instead of naive re.search + json.loads, which fails on the
+                    # exact malformed-JSON case retrieve_json survives (#95 Gate-1).
+                    json_obj = retrieve_json(messages[-1]["content"])
+                    if json_obj:
                         try:
-                            json_part = json_match.group(0)
-                            json_obj = json.loads(json_part)
                             send_message_to_user1(user_id, json_obj['message2userfinal'], '', prompt_id)
                         except Exception as e:
                             current_app.logger.error(f'Error sending message to user: {e}')
