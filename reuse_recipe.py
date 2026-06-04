@@ -3189,9 +3189,8 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                     return ''
                 except Exception:
                     try:
-                        json_match = re.search(r'{[\s\S]*}', group_chat.messages[-2]["content"])
-                        if json_match:
-                            json_obj = json.loads(json_match.group(0))
+                        json_obj = retrieve_json(group_chat.messages[-2]["content"])  # canonical parse (#95)
+                        if json_obj:
                             current_app.logger.info(f'got json object {json_obj}')
                             if json_obj['status'].lower() == 'completed':
                                 _known = user_tasks[user_prompt].current_action
@@ -3749,9 +3748,8 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                 continue
                         except Exception:
                             try:
-                                json_match = re.search(r'{[\s\S]*}', group_chat.messages[-2]["content"])
-                                if json_match:
-                                    json_obj = json.loads(json_match.group(0))
+                                json_obj = retrieve_json(group_chat.messages[-2]["content"])  # canonical parse (#95)
+                                if json_obj:
                                     current_app.logger.info(f'got json object {json_obj}')
                                     if json_obj['status'].lower() == 'completed':
                                         _llm_aid2 = int(json_obj.get("action_id", _w2_current))
