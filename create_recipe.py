@@ -1195,7 +1195,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
             if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
                 current_action_id = user_tasks[user_prompt].current_action
 
-            direct_vlm_path = os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_{current_action_id}_vlm_agent.json")
+            direct_vlm_path = helper_fun.safe_prompt_path(prompt_id, role_number, current_action_id, 'vlm_agent')
             if os.path.exists(direct_vlm_path):
                 tool_logger.info(f"Found direct VLM file for current action: {direct_vlm_path}")
                 try:
@@ -1326,7 +1326,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                         # Determine file path
                         role_number = get_current_flow(user_prompt)
                         action_id_to_use = action_id
-                        base_path = os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}")
+                        base_path = helper_fun.safe_prompt_path(prompt_id, role_number, ext='')
 
                         # Find next available action_id
                         while os.path.exists(f"{base_path}_{action_id_to_use}_vlm_agent.json"):
@@ -2350,7 +2350,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 # Recipe received, save it
                                 current_app.logger.info('Got Individual action recipe save it')
                                 flow = get_current_flow(user_prompt)
-                                name = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{json_obj["action_id"]}.json')
+                                name = helper_fun.safe_prompt_path(prompt_id, flow, json_obj["action_id"])
                                 user_tasks[user_prompt].fallback = False
                                 user_tasks[user_prompt].recipe = False
                                 metadata = strip_json_values(agent_data[prompt_id])
@@ -2397,7 +2397,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 current_app.logger.info(f'Late save: valid recipe with {len(_recipe_list)} steps')
                                 if _has_recipe:
                                     flow = get_current_flow(user_prompt)
-                                    name = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{json_obj["action_id"]}.json')
+                                    name = helper_fun.safe_prompt_path(prompt_id, flow, json_obj["action_id"])
                                     if not os.path.exists(name):
                                         metadata = strip_json_values(agent_data.get(prompt_id, {}))
                                         json_obj['metadata'] = metadata
@@ -4027,7 +4027,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                                             _TS.CANCELLED, _TS.SKIPPED):
                                     # Check if recipe was already saved for this action
                                     flow = get_current_flow(user_prompt)
-                                    _recipe_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{json_action_id}.json')
+                                    _recipe_file = helper_fun.safe_prompt_path(prompt_id, flow, json_action_id)
                                     if not os.path.exists(_recipe_file):
                                         # Recipe not yet saved — request it directly
                                         current_app.logger.info(
@@ -4290,7 +4290,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                 if _ca_state in (ActionState.COMPLETED, ActionState.TERMINATED) or _ca_ledger_done:
                     # Check if recipe file exists before advancing
                     _flow = get_current_flow(user_prompt)
-                    _recipe_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{_flow}_{_ca}.json')
+                    _recipe_path = helper_fun.safe_prompt_path(prompt_id, _flow, _ca)
                     if not os.path.exists(_recipe_path):
                         # #89: count consecutive re-requests for THIS action with
                         # no recipe landing — each one means the model's prior
@@ -4324,7 +4324,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                         # Fallback: if state_transition didn't save the recipe file,
                         # search recovered messages for status:done JSON and save it
                         _flow = get_current_flow(user_prompt)
-                        _rfile = os.path.join(PROMPTS_DIR, f'{prompt_id}_{_flow}_{_ca}.json')
+                        _rfile = helper_fun.safe_prompt_path(prompt_id, _flow, _ca)
                         if not os.path.exists(_rfile) and group_chat.messages:
                             for _msg in reversed(group_chat.messages):
                                 _rj = retrieve_json(_msg.get('content', ''))
@@ -4526,7 +4526,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                                                ActionState.RECIPE_REQUESTED]:
                 # Check if we've made any progress at all
                 _any_recipes = any(
-                    os.path.exists(os.path.join(PROMPTS_DIR, f'{prompt_id}_{get_current_flow(user_prompt)}_{i}.json'))
+                    os.path.exists(helper_fun.safe_prompt_path(prompt_id, get_current_flow(user_prompt), i))
                     for i in range(1, current_action_id + 1)
                 )
                 if not _any_recipes:
@@ -4596,7 +4596,7 @@ def all_flows_completed(prompt_id, total_personas, user_prompt):
 
     # Check each flow is complete
     for flow_idx, flow in enumerate(config['flows']):
-        flow_recipe_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow_idx}_recipe.json')
+        flow_recipe_file = helper_fun.safe_prompt_path(prompt_id, flow_idx, 'recipe')
         if not os.path.exists(flow_recipe_file):
             return False
 
@@ -4634,14 +4634,14 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
             if match:
                 action_ids = ast.literal_eval(match.group())
 
-                file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{num}.json')
+                file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
                 with open(file_path, 'r') as f:
                     data = json.load(f)
                 data['actions_this_action_depends_on'] = action_ids
                 with open(file_path, 'w') as f:
                     json.dump(data, f, indent=4)
             else:
-                file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{num}.json')
+                file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
                 with open(file_path, 'r') as f:
                     data = json.load(f)
                 data['actions_this_action_depends_on'] = []
@@ -4649,7 +4649,7 @@ def after_all_actions_terminated(assistant_agent, chat_instructor, group_chat, j
                     json.dump(data, f, indent=4)
         except (ValueError, SyntaxError) as e:
             current_app.logger.info(f'GOT ERROR AT EVAL OF LIST :{e}')
-            file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{num}.json')
+            file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
             with open(file_path, 'r') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = []
@@ -4695,14 +4695,14 @@ def after_all_actions_terminated_from_exception(assistant_agent, chat_instructor
                 action_ids = ast.literal_eval(match.group())
             except (ValueError, SyntaxError):
                 action_ids = []
-            file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{num}.json')
+            file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
             with open(file_path, 'r') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = action_ids
             with open(file_path, 'w') as f:
                 json.dump(data, f, indent=4)
         else:
-            file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_{num}.json')
+            file_path = helper_fun.safe_prompt_path(prompt_id, flow, num)
             with open(file_path, 'r') as f:
                 data = json.load(f)
             data['actions_this_action_depends_on'] = []
@@ -4893,7 +4893,7 @@ def set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt):
     # causing FileNotFoundError on the non-existent _0_5.json.
     action_count = len(user_tasks[user_prompt].actions)
     for i in range(1, action_count + 1):
-        _recipe_path = os.path.join(PROMPTS_DIR, f"{prompt_id}_{flow}_{i}.json")
+        _recipe_path = helper_fun.safe_prompt_path(prompt_id, flow, i)
         current_app.logger.info(f'checking for {_recipe_path}')
         try:
             with open(_recipe_path, 'r') as f:
@@ -4970,13 +4970,13 @@ def detect_and_resume_progress(prompt_id, user_prompt):
         total_actions_in_flow = len(flow_actions)
 
         # Check for flow recipe (indicates flow completion)
-        flow_recipe_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow_idx}_recipe.json')
+        flow_recipe_file = helper_fun.safe_prompt_path(prompt_id, flow_idx, 'recipe')
         flow_recipe_exists = os.path.exists(flow_recipe_file)
 
         # Count completed actions in this flow (actions with JSON files)
         completed_actions = []
         for action_id in range(1, total_actions_in_flow + 1):
-            action_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow_idx}_{action_id}.json')
+            action_file = helper_fun.safe_prompt_path(prompt_id, flow_idx, action_id)
             if os.path.exists(action_file):
                 completed_actions.append(action_id)
                 current_app.logger.info(f"[OK] Found: {action_file}")
@@ -5078,7 +5078,7 @@ def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
         # Check if current flow is actually complete (all actions have JSON files)
         all_actions_complete = True
         for action_id in range(1, current_flow_actions + 1):
-            action_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{current_flow}_{action_id}.json')
+            action_file = helper_fun.safe_prompt_path(prompt_id, current_flow, action_id)
             if not os.path.exists(action_file):
                 all_actions_complete = False
                 current_app.logger.warning(f"Action {action_id} not complete - missing {action_file}")
@@ -5087,7 +5087,7 @@ def safe_action_boundary_check(user_prompt, prompt_id, text, user_id):
         if not all_actions_complete:
             # [OK] FIX: Find the first incomplete action and resume from there
             for action_id in range(1, current_flow_actions + 1):
-                action_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{current_flow}_{action_id}.json')
+                action_file = helper_fun.safe_prompt_path(prompt_id, current_flow, action_id)
                 if not os.path.exists(action_file):
                     current_app.logger.info(f"Resuming from incomplete action {action_id}")
                     user_tasks[user_prompt].current_action = action_id
@@ -5187,7 +5187,7 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress):
         # Look for the most recent action JSON with metadata
         for flow_idx, progress in flow_progress.items():
             for action_id in sorted(progress['completed_actions'], reverse=True):
-                action_file = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow_idx}_{action_id}.json')
+                action_file = helper_fun.safe_prompt_path(prompt_id, flow_idx, action_id)
                 try:
                     with open(action_file, 'r') as f:
                         action_data = json.load(f)
@@ -5342,7 +5342,7 @@ def update_agent_creation_to_db(prompt_id):
 
 
 def create_final_recipe_for_current_flow(flow, merged_dict, prompt_id):
-    name = os.path.join(PROMPTS_DIR, f'{prompt_id}_{flow}_recipe.json')
+    name = helper_fun.safe_prompt_path(prompt_id, flow, 'recipe')
     # Atomic write (M3 in post-shipment review): write to temp + rename
     # so concurrent prompts_backup.snapshot_prompts can never capture
     # a half-written recipe file.  os.replace is atomic on the same
@@ -5368,7 +5368,7 @@ def get_current_flow(user_prompt):
 
 def create_time_agents_and_create_scheduled_jobs(flows, number_of_flows, prompt_id, user_id, user_prompt):
     for i in range(number_of_flows):
-        _recipe_file = os.path.join(PROMPTS_DIR, f"{prompt_id}_{i}_recipe.json")
+        _recipe_file = helper_fun.safe_prompt_path(prompt_id, i, 'recipe')
         with open(_recipe_file, 'r') as f:
             merged_dict = json.load(f)
             final_recipe[prompt_id] = merged_dict

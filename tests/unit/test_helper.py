@@ -399,6 +399,9 @@ class TestSafePromptPath:
                 os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')
             assert safe_prompt_path(pid, '2', '5') == \
                 os.path.join(PROMPTS_DIR, f'{pid}_2_5.json')
+            # base-path form (no extension) — for sites that append a suffix later
+            assert safe_prompt_path(pid, '0', ext='') == \
+                os.path.join(PROMPTS_DIR, f'{pid}_0')
 
     def test_accepts_hyphens_and_underscores(self):
         from helper import safe_prompt_path

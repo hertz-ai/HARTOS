@@ -946,7 +946,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     # role = get_role(user_id,prompt_id)
     role_number, role = get_flow_number(user_id, prompt_id)
 
-    with open(os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_recipe.json"), 'r') as f:
+    with open(helper_fun.safe_prompt_path(prompt_id, role_number, 'recipe'), 'r') as f:
         config = json.load(f)
         config = _normalize_flow_recipe(config)  # tolerate per-action recipe in flow slot
         recipes[user_prompt] = config
@@ -1070,13 +1070,13 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
     individual_recipe = []
     for i in range(1, (len(recipes[user_prompt]['actions']) + 1)):
-        current_app.logger.info(f'checking for {os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_{i}.json")}')
+        current_app.logger.info(f'checking for {helper_fun.safe_prompt_path(prompt_id, role_number, i)}')
         try:
-            with open(os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_{i}.json"), 'r') as f:
+            with open(helper_fun.safe_prompt_path(prompt_id, role_number, i), 'r') as f:
                 config = json.load(f)
                 individual_recipe.append(config)
         except Exception as e:
-            current_app.logger.error(f'Got error as :{e} while checking for {os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_{i}.json")}')
+            current_app.logger.error(f'Got error as :{e} while checking for {helper_fun.safe_prompt_path(prompt_id, role_number, i)}')
 
     # Build experience hints from accumulated recipe experience data
     experience_hints = ''
@@ -1955,7 +1955,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
             if user_prompt in user_tasks and hasattr(user_tasks[user_prompt], 'current_action'):
                 current_action_id = user_tasks[user_prompt].current_action
 
-            direct_vlm_path = os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_{current_action_id}_vlm_agent.json")
+            direct_vlm_path = helper_fun.safe_prompt_path(prompt_id, role_number, current_action_id, 'vlm_agent')
             if os.path.exists(direct_vlm_path):
                 current_app.logger.info(f"Found direct VLM file for current action: {direct_vlm_path}")
                 try:
@@ -2038,7 +2038,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
                         # Determine file path with the action_id
                         role_number, role = get_flow_number(user_id, prompt_id)
                         action_id_to_use = action_id
-                        base_path = os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}")
+                        base_path = helper_fun.safe_prompt_path(prompt_id, role_number, ext='')
 
                         # Import os here to ensure it's available
                         import os
@@ -3375,7 +3375,7 @@ def create_schedule(prompt_id, user_id):
     _sched_log('info', 'INSIDE Create Schedule')
     user_prompt = f'{user_id}_{prompt_id}'
     role_number, role = get_flow_number(user_id, prompt_id)
-    with open(os.path.join(PROMPTS_DIR, f"{prompt_id}_{role_number}_recipe.json"), 'r') as f:
+    with open(helper_fun.safe_prompt_path(prompt_id, role_number, 'recipe'), 'r') as f:
         config = json.load(f)
         config = _normalize_flow_recipe(config)  # tolerate per-action recipe in flow slot
         recipes[user_prompt] = config
