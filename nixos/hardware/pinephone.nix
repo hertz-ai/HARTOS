@@ -15,6 +15,18 @@
 
   # ─── Boot ───
   boot = {
+    # #70: packages.aarch64-linux.sd-phone (mkImage format="sd-aarch64") pulls
+    # nixpkgs' installer/sd-card/sd-image-aarch64.nix, which sets
+    # boot.loader.generic-extlinux-compatible.enable = true.  mobile-nixos'
+    # pine64-pinephone bootloader.nix sets it false (the device boots via its
+    # own u-boot path, not extlinux).  Two normal-priority definitions -> a
+    # "conflicting definition values" eval error that blocks `nix flake check`
+    # (it evaluates every package output).  Defer to the device authority
+    # (mobile-nixos owns this board's boot): force false.  No-op on the
+    # hart-phone nixosConfiguration (already false there); decisive on the
+    # sd-phone package where the true/false collision actually occurs.
+    loader.generic-extlinux-compatible.enable = lib.mkForce false;
+
     # Mobile NixOS provides the PinePhone kernel
     kernelParams = [
       "console=ttyS0,115200"
