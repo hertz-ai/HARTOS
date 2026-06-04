@@ -356,31 +356,54 @@ class ActionState(Enum):
 # Live 2026-06-04: a user chat routed through the speculative-expert CREATE
 # path stalled on action 2 (recipe_requested; action 1 already done) and
 # looped all 300 -> a generic TERMINATE with no conversation history.
-STALL_GUARD_MAX_ITERS = 30  # consecutive stuck iterations before breaking clean
+STALL_GUARD_MAX_ITERS = 30  # tight cap: action stuck in a "requested" state
+
+# Looser cap for an action wedged in any OTHER non-terminal state (IN_PROGRESS,
+# STATUS_VERIFICATION_REQUESTED, ASSIGNED, PENDING).  Live 2026-06-04: a daemon
+# coding goal's action 2 sat in IN_PROGRESS emitting unparseable recipe JSON and
+# never reached RECIPE_REQUESTED, so the tight guard below (which only watched
+# the "requested" states) never saw it and it spun toward the 300-iter hard cap.
+# Set WELL above the proven-safe working zone (a legit action advances its state
+# within a handful of group-chat rounds; the old guard let IN_PROGRESS run
+# unbounded and nothing tripped a working action) so this can ONLY rescue a
+# genuinely-wedged action — never a slow-but-progressing one.
+STALL_GUARD_INPROGRESS_ITERS = 120
 
 _STALL_STATES = (ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_REQUESTED)
+_TERMINAL_STATES = (ActionState.COMPLETED, ActionState.TERMINATED, ActionState.ERROR)
 
 
-def stall_guard_step(prev_stuck_action_id, prev_iters, action_id, state,
+def stall_guard_step(prev_stuck_key, prev_iters, action_id, state,
                      recipe_exists):
     """Pure, side-effect-free no-progress tracker for the CREATE loop.
 
-    Returns ``(stuck_action_id, iters, should_break)``:
-      * When the CURRENT action is in a stuck "requested" state AND its own
-        recipe is not yet on disk, increment the consecutive-stuck counter
-        (restarting it when the stuck action id changes).  ``should_break`` is
-        True once the counter exceeds ``STALL_GUARD_MAX_ITERS``.
-      * Otherwise the action progressed (state advanced or recipe saved) and
-        the counter resets to 0.
+    Returns ``(stuck_key, iters, should_break)`` where ``stuck_key`` is the
+    opaque ``(action_id, state)`` pair the caller threads back in:
+      * Progress signal = the CURRENT action's OWN recipe on disk, OR the action
+        reaching a TERMINAL state — either resets the counter to 0.
+      * Otherwise the action is non-terminal with no recipe: increment the
+        consecutive-stuck counter keyed on ``(action_id, state)``, restarting
+        whenever that pair changes (the action advanced to a new state, or a
+        different action became current).  ``should_break`` trips once the
+        counter exceeds the cap for the state class — the tight
+        ``STALL_GUARD_MAX_ITERS`` for the "requested" states (the action is done
+        and only the recipe is missing; it should arrive in 1-2 rounds) and the
+        looser ``STALL_GUARD_INPROGRESS_ITERS`` for every other non-terminal
+        state (a legit action may genuinely work in IN_PROGRESS for a while).
 
-    Progress is judged on the CURRENT action's OWN recipe — not "any earlier
-    action saved one" — so a later action stalling in a multi-action flow is
-    still caught (the bug the old guard missed).
+    Keying on ``(action_id, state)`` — not action_id alone — is what lets an
+    action wedged in IN_PROGRESS be caught: it never reaches a "requested"
+    state, so the old action-id-only guard reset every iteration and never
+    fired.  Progress is judged on the CURRENT action's OWN recipe (not "any
+    earlier action saved one"), so a later action stalling in a multi-action
+    flow is still caught.
     """
-    if state in _STALL_STATES and not recipe_exists:
-        iters = (prev_iters + 1) if prev_stuck_action_id == action_id else 1
-        return action_id, iters, iters > STALL_GUARD_MAX_ITERS
-    return None, 0, False
+    if recipe_exists or state in _TERMINAL_STATES:
+        return None, 0, False
+    cap = STALL_GUARD_MAX_ITERS if state in _STALL_STATES else STALL_GUARD_INPROGRESS_ITERS
+    key = (action_id, state)
+    iters = (prev_iters + 1) if prev_stuck_key == key else 1
+    return key, iters, iters > cap
 
 
 # Add to lifecycle_hooks.py

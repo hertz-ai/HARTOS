@@ -3930,15 +3930,15 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
             # expert CREATE path stalled on action 2 (recipe_requested; action 1
             # already done) and looped all 300 -> generic TERMINATE, no history.
             _ut = user_tasks[user_prompt]
-            _sg_id, _sg_iters, _sg_break = stall_guard_step(
-                getattr(_ut, '_stall_action_id', None),
+            _sg_key, _sg_iters, _sg_break = stall_guard_step(
+                getattr(_ut, '_stall_key', None),
                 getattr(_ut, '_stall_iters', 0),
                 current_action_id, current_state,
                 os.path.exists(os.path.join(
                     PROMPTS_DIR,
                     f'{prompt_id}_{get_current_flow(user_prompt)}_{current_action_id}.json')),
             )
-            _ut._stall_action_id, _ut._stall_iters = _sg_id, _sg_iters
+            _ut._stall_key, _ut._stall_iters = _sg_key, _sg_iters
             if _sg_break:
                 current_app.logger.warning(
                     f"[STALL-GUARD] action {current_action_id} stuck in "
