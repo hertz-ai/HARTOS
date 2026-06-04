@@ -192,7 +192,8 @@ from lifecycle_hooks import (
     lifecycle_hook_track_recipe_completion,
     lifecycle_hook_check_all_actions_terminated, StateTransitionError, lifecycle_hook_validate_final_agent_creation,
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
-    register_ledger_for_session   # Register ledger for auto-sync
+    register_ledger_for_session,  # Register ledger for auto-sync
+    stall_guard_step,             # No-progress stall tracker (reachable guard)
 )
 
 # Import helper_ledger functions for subtask management and ledger awareness
@@ -3899,6 +3900,32 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
 
             current_app.logger.info('inside while')
             current_state = get_action_state(user_prompt, current_action_id)
+
+            # No-progress stall guard (REACHABLE — placed before the condition
+            # branches below that `continue` past the late guard ~4463, whose
+            # `_any_recipes` progress check is also suppressed once an EARLIER
+            # action saved a recipe).  An action stuck in a "requested" state
+            # whose OWN recipe never arrives otherwise spins to max_iterations
+            # (300, ~25 min).  Per-action counter via stall_guard_step; resets
+            # on any progress.  Live 2026-06-04: a chat via the speculative-
+            # expert CREATE path stalled on action 2 (recipe_requested; action 1
+            # already done) and looped all 300 -> generic TERMINATE, no history.
+            _ut = user_tasks[user_prompt]
+            _sg_id, _sg_iters, _sg_break = stall_guard_step(
+                getattr(_ut, '_stall_action_id', None),
+                getattr(_ut, '_stall_iters', 0),
+                current_action_id, current_state,
+                os.path.exists(os.path.join(
+                    PROMPTS_DIR,
+                    f'{prompt_id}_{get_current_flow(user_prompt)}_{current_action_id}.json')),
+            )
+            _ut._stall_action_id, _ut._stall_iters = _sg_id, _sg_iters
+            if _sg_break:
+                current_app.logger.warning(
+                    f"[STALL-GUARD] action {current_action_id} stuck in "
+                    f"{current_state.value} for {_sg_iters} iterations with no "
+                    f"recipe — breaking clean (was spinning to max_iterations)")
+                break
 
             if group_chat.messages and group_chat.messages[-1]['name'] == 'ChatInstructor' and group_chat.messages[-1]['content'] == 'TERMINATE':
                 current_app.logger.info(f"group_chat.messages[-2]['content'] {group_chat.messages[-2]['content'][:10]}..")

@@ -343,6 +343,46 @@ class ActionState(Enum):
     PREVIEW_APPROVED = "preview_approved"         # 15. User approved destructive action, proceed
 
 
+# ── No-progress stall guard for the CREATE loop ───────────────────────────
+# create_recipe.get_response_group's main loop can spin to its 300-iteration
+# cap (~25 min of wasted compute, observed live) when an action sits in a
+# "requested" state whose recipe never arrives.  The late stuck-state guard
+# there is BOTH suppressed (it checked whether ANY earlier action saved a
+# recipe, so a multi-action flow whose LATER action stalls slips through) AND
+# unreachable (the condition branches above it `continue` past it).  This pure
+# tracker is the reachable, per-action replacement — call it once per loop
+# iteration right after the action state is refreshed.  It lives here
+# (autogen-free) so it is unit-testable without the full pipeline.
+# Live 2026-06-04: a user chat routed through the speculative-expert CREATE
+# path stalled on action 2 (recipe_requested; action 1 already done) and
+# looped all 300 -> a generic TERMINATE with no conversation history.
+STALL_GUARD_MAX_ITERS = 30  # consecutive stuck iterations before breaking clean
+
+_STALL_STATES = (ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_REQUESTED)
+
+
+def stall_guard_step(prev_stuck_action_id, prev_iters, action_id, state,
+                     recipe_exists):
+    """Pure, side-effect-free no-progress tracker for the CREATE loop.
+
+    Returns ``(stuck_action_id, iters, should_break)``:
+      * When the CURRENT action is in a stuck "requested" state AND its own
+        recipe is not yet on disk, increment the consecutive-stuck counter
+        (restarting it when the stuck action id changes).  ``should_break`` is
+        True once the counter exceeds ``STALL_GUARD_MAX_ITERS``.
+      * Otherwise the action progressed (state advanced or recipe saved) and
+        the counter resets to 0.
+
+    Progress is judged on the CURRENT action's OWN recipe — not "any earlier
+    action saved one" — so a later action stalling in a multi-action flow is
+    still caught (the bug the old guard missed).
+    """
+    if state in _STALL_STATES and not recipe_exists:
+        iters = (prev_iters + 1) if prev_stuck_action_id == action_id else 1
+        return action_id, iters, iters > STALL_GUARD_MAX_ITERS
+    return None, 0, False
+
+
 # Add to lifecycle_hooks.py
 class FlowLifecycleState:
     """Track overall flow lifecycle beyond individual actions"""
