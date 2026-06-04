@@ -61,6 +61,15 @@ let
   # kiosk session (cage, below) and the in-GNOME app launcher — one renderer,
   # no duplicate copies.
   nunbaPort = toString (config.hart.nunba.port or 5000);
+  # GObject-introspection typelibs the glass shell's gi.require_version needs.
+  # pygobject3 (the `gi` module) is in cfg.package.python, but the Gtk-3.0 /
+  # WebKit2-4.1 *typelibs* live in these packages and must be on GI_TYPELIB_PATH
+  # — the cage kiosk session sets no such path, so without this every
+  # gi.require_version() raises and the shell window dies on launch.
+  giTypelibPath = lib.makeSearchPath "lib/girepository-1.0" (with pkgs; [
+    glib gobject-introspection gtk3 webkitgtk_4_1
+    pango gdk-pixbuf atk harfbuzz libsoup_3 cairo
+  ]);
   glassShell = pkgs.writeShellScriptBin "hart-glass-shell" ''
     set -euo pipefail
     URL="http://localhost:${toString ui.port}"
@@ -74,6 +83,14 @@ let
         URL="http://localhost:${nunbaPort}"
       fi
     fi
+    # GI typelibs for the GTK/WebKit2 python below (see giTypelibPath note).
+    export GI_TYPELIB_PATH="${giTypelibPath}"
+    # WebKitGTK robustness on fresh-ISO boots (VM / software GL / no GPU): the
+    # DMABUF renderer + GL compositing crash on a GL-less display, which is
+    # exactly the first-boot / live-USB case. Disable both so a shell that
+    # cannot paint never takes down the whole session.
+    export WEBKIT_DISABLE_DMABUF_RENDERER=1
+    export WEBKIT_DISABLE_COMPOSITING_MODE=1
     export HART_SHELL_URL="$URL"
     exec ${cfg.package.python}/bin/python -c "
 import gi, os
@@ -90,7 +107,10 @@ class GlassShell(Gtk.Window):
         s = webview.get_settings()
         s.set_enable_javascript(True)
         s.set_enable_developer_extras(False)
-        s.set_hardware_acceleration_policy(WebKit2.HardwareAccelerationPolicy.ALWAYS)
+        # NEVER (not ALWAYS): a fresh ISO / live-USB / VM often has only
+        # software GL (llvmpipe). Forcing GPU accel there crashes WebKitGTK and
+        # takes down the shell session. Correctness/robustness over a few fps.
+        s.set_hardware_acceleration_policy(WebKit2.HardwareAccelerationPolicy.NEVER)
         self.add(webview)
         self.connect('destroy', Gtk.main_quit)
         self.show_all()
