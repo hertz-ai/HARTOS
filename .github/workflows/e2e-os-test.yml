@@ -232,6 +232,22 @@ jobs:
           # Check Conky config exists
           $SSH_CMD "find /nix/store -name 'hart.conkyrc' -print -quit 2>/dev/null | grep -q ." && echo "PASS: Conky config deployed" || echo "WARN: Conky config not found"
 
+          # AI-native session services — the #99 fix. These are Type=notify
+          # units that die on a fresh ISO without systemd-python in the hart
+          # python env. Informational (matches the smoke convention); the
+          # gating guard is nixos/tests/vm-tests.nix hart-desktop-boot.
+          $SSH_CMD "systemctl is-active hart-model-bus.service"  && echo "PASS: Model Bus active"      || echo "FAIL: Model Bus down (check systemd-python)"
+          $SSH_CMD "systemctl is-active hart-liquid-ui.service"  && echo "PASS: LiquidUI server active" || echo "FAIL: LiquidUI down (check systemd-python)"
+          $SSH_CMD "systemctl is-active hart-app-bridge.service" && echo "PASS: App Bridge active"     || echo "FAIL: App Bridge down (check systemd-python)"
+
+          # Android-on-Linux branding: the installer 'nixos' user must be a
+          # hidden system account (uid < 1000) so GDM never lists it — #101.
+          $SSH_CMD 'test "$(id -u nixos)" -lt 1000' && echo "PASS: nixos user hidden (system uid)" || echo "FAIL: nixos user still visible on greeter"
+
+          # Glass-shell GI typelibs present (#99/#100) — WebKit2 must be in the
+          # closure or the shell window can't render.
+          $SSH_CMD "find /nix/store -name 'WebKit2-4.1.typelib' -print -quit 2>/dev/null | grep -q ." && echo "PASS: WebKit2 typelib present" || echo "FAIL: WebKit2 typelib missing"
+
       - name: Run sandbox validation inside VM
         run: |
           sshpass -p 'hart' ssh \
