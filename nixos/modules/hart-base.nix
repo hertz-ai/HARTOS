@@ -111,7 +111,7 @@ in
         VERSION_ID="${cfg.version}"
         VERSION_CODENAME=sentient
         ID=hart-os
-        ID_LIKE=nixos
+        ID_LIKE=linux
         HOME_URL="https://hevolve.ai"
         SUPPORT_URL="https://github.com/hertz-ai/HARTOS/issues"
         BUG_REPORT_URL="https://github.com/hertz-ai/HARTOS/issues"
@@ -157,6 +157,13 @@ in
         '';
       };
     };
+
+    # ── TTY login banner ──
+    # NixOS's default getty greeting is "<<< Welcome to NixOS ... >>>" — a
+    # user-visible leak on Ctrl+Alt+F2..F6. Rebrand it (HART hides NixOS).
+    # \m = machine arch, \l = tty line (literal getty escapes, not nix).
+    services.getty.greetingLine =
+      lib.mkForce ''<<< Welcome to HART OS ${cfg.version} (Sentient) (\m) - \l >>>'';
 
     # ── Users ──
     users.users.hart = {

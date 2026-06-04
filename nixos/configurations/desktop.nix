@@ -460,6 +460,20 @@ in
     user = lib.mkForce "hart-admin";
   };
 
+  # ─── Hide the NixOS live-installer user (NixOS must be invisible) ───
+  # installation-cd-graphical-gnome.nix (imported above) injects a NORMAL
+  # `nixos` user (uid 1000) plus its own auto-login. We auto-login to
+  # hart-admin (above); here we demote `nixos` to a hidden SYSTEM account
+  # (uid < 1000) so GDM never lists it in the greeter, and we drop the TTY
+  # auto-login so a Ctrl+Alt+F-key never lands on "nixos" either. Android
+  # hides Linux from its users; HART OS hides NixOS the same way.
+  users.users.nixos = lib.mkForce {
+    isSystemUser = true;
+    group = "nixos";
+  };
+  users.groups.nixos = lib.mkForce {};
+  services.getty.autologinUser = lib.mkForce null;
+
   # ─── Default session = the HART OS glass shell (NOT GNOME) ───
   # This is the line that makes the install land in Nunba/LiquidUI instead of
   # the GNOME desktop.  The "hart-shell" session is the cage kiosk registered by
