@@ -16,13 +16,10 @@ from sqlalchemy.orm import Session, joinedload
 
 from .models import (
     User, Post, Comment, Vote, Follow, Community, CommunityMembership,
-    Notification, Report, TaskRequest, RecipeShare, AgentSkillBadge
+    Notification, Report, TaskRequest, RecipeShare, AgentSkillBadge,
+    _uuid,
 )
 from .auth import hash_password, verify_password, generate_api_token, generate_jwt
-
-
-def _uuid():
-    return str(uuid.uuid4())
 
 
 def _community_name_for(db: Session, post: Post) -> Optional[str]:
