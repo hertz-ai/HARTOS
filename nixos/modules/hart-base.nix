@@ -175,6 +175,12 @@ in
     # already "HART OS" via the explicit os-release above.
     system.nixos.distroName = lib.mkForce "HART OS";
 
+    # Don't ship the NixOS manual / `nixos-help` — it's a "NixOS" reference a
+    # user can surface, and building it adds time to the (already slow) ISO
+    # build. mkDefault so a variant can still re-enable docs if it wants; edge
+    # already turns ALL docs off, and that explicit setting wins over this.
+    documentation.nixos.enable = lib.mkDefault false;
+
     # ── Users ──
     users.users.hart = {
       isSystemUser = true;
