@@ -260,7 +260,12 @@ class A2AContextExchange:
         self.message_queues: Dict[str, deque] = {}  # agent_id -> message queue
         self.shared_context: Dict[str, Any] = {}  # Shared context across agents
         self.delegations: Dict[str, Dict[str, Any]] = {}  # delegation_id -> delegation info
-        self.lock = threading.Lock()
+        # RLock (reentrant), NOT Lock: send_message() acquires this lock and then
+        # calls register_agent() for an unknown recipient, which re-acquires it.
+        # A plain Lock self-deadlocks the calling thread there — the CI #82
+        # >120s timeout at internal_agent_communication.py:301 (send_message to
+        # an unregistered agent).  RLock lets the same thread re-enter.
+        self.lock = threading.RLock()
 
     def register_agent(self, agent_id: str):
         """Register an agent for A2A communication"""
