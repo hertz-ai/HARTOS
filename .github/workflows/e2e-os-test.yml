@@ -59,7 +59,12 @@ jobs:
     name: E2E Server (build + boot + smoke)
     needs: flake-check
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The HARTOS-specific derivations + squashfs ISO assembly build from scratch
+    # each run (they aren't in cache.nixos.org; magic-nix-cache was dropped over
+    # CDN throttling — see note below), so the cold build eats most of a short
+    # budget and the boot+smoke phase gets killed by the job wall-clock before
+    # the backend comes up. Give boot real headroom so this job validates.
+    timeout-minutes: 100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -159,7 +164,13 @@ jobs:
     name: E2E Desktop (build + boot + subsystem check)
     needs: flake-check
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The desktop ISO is large and its HARTOS-specific derivations + squashfs
+    # assembly build from scratch each run (not in cache.nixos.org), so the cold
+    # build ran ~54 min and left the 90-min budget too tight — the boot was
+    # killed at the job wall-clock while still waiting for :6777, so the
+    # service/branding checks never ran (observed run 26974741320). 160 min
+    # gives the slow shared-runner boot + checks room to complete.
+    timeout-minutes: 160
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
