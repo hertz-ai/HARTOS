@@ -17,17 +17,7 @@ logger = logging.getLogger('hevolve_social')
 audit_bp = Blueprint('audit', __name__, url_prefix='/api/social/audit')
 
 
-def _ok(data=None, meta=None, status=200):
-    r = {'success': True}
-    if data is not None:
-        r['data'] = data
-    if meta is not None:
-        r['meta'] = meta
-    return jsonify(r), status
-
-
-def _err(msg, status=400):
-    return jsonify({'success': False, 'error': msg}), status
+from .api_common import _ok, _err  # single-sourced envelope helpers (#97)
 
 
 # ═══════════════════════════════════════════════════════════════

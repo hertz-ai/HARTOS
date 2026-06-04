@@ -91,17 +91,7 @@ encounter_bp = Blueprint('encounter', __name__, url_prefix='/api/social')
 # Tiny helpers — response shape mirrors the rest of /api/social/*.
 # ──────────────────────────────────────────────────────────────────────
 
-def _ok(data: Any = None, meta: Any = None, status: int = 200):
-    r: dict[str, Any] = {'success': True}
-    if data is not None:
-        r['data'] = data
-    if meta is not None:
-        r['meta'] = meta
-    return jsonify(r), status
-
-
-def _err(msg: str, status: int = 400):
-    return jsonify({'success': False, 'error': msg}), status
+from .api_common import _ok, _err  # single-sourced envelope helpers (#97)
 
 
 def _json() -> dict[str, Any]:
