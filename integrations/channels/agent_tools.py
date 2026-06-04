@@ -465,6 +465,45 @@ def build_channel_tool_closures(ctx):
     ))
 
     # ------------------------------------------------------------------
+    # 3c. list_upcoming_events  (calendar awareness — #64 bridge READ side)
+    # ------------------------------------------------------------------
+    #
+    # The READ side of the Event ingest (ics / Zoom / Meet).  Without a reader
+    # the ingested events are write-only — this lets the agent answer "what
+    # meetings do I have?" from the user's own ingested calendar.  Scoped to the
+    # caller's user_id (created_by) so one user never sees another's events.
+    @log_tool_execution
+    def list_upcoming_events(
+        within_hours: Annotated[int, "Look-ahead window in hours (default 168 = one week)"] = 168,
+        limit: Annotated[int, "Maximum number of events to return"] = 20,
+    ) -> str:
+        """List the user's upcoming meetings/events (from ingested calendar / Zoom / Meet feeds)."""
+        try:
+            uid = user_id or _get_user_id_from_threadlocal()
+            from integrations.social.events import list_upcoming_events as _list_events
+            rows = _list_events(within_hours=within_hours, limit=limit,
+                                created_by=str(uid) if uid else None)
+            if not rows:
+                return "No upcoming events in your calendar for that window."
+            lines = ["**Upcoming events:**"]
+            for r in rows:
+                when = r.get('start_time') or '(time TBD)'
+                loc = f" — {r['location']}" if r.get('location') else ''
+                url = f" ({r['url']})" if r.get('url') else ''
+                lines.append(f"- {when}: {r.get('title', '(untitled)')}{loc}{url}")
+            return '\n'.join(lines)
+        except Exception as e:
+            return f"Error listing events: {e}"
+
+    tools.append((
+        "list_upcoming_events",
+        "List the user's upcoming meetings/events ingested from their calendar, "
+        "Zoom, or Google Meet feeds. Use when the user asks about their schedule, "
+        "meetings, or what's coming up.",
+        list_upcoming_events,
+    ))
+
+    # ------------------------------------------------------------------
     # 4. get_channel_context
     # ------------------------------------------------------------------
     @log_tool_execution

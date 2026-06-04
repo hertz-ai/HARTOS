@@ -301,3 +301,44 @@ def fetch_and_ingest_gmeet(access_token, time_min_iso=None, community_id=None,
     except Exception as e:
         logger.warning(f"fetch_and_ingest_gmeet failed: {e}")
         return []
+
+
+def list_upcoming_events(within_hours=168, community_id=None, created_by=None,
+                         limit=50, now=None):
+    """Read upcoming events from the Event table — the READ side of ingest_event.
+
+    Without this the Event table is write-only: every ingest_* path (ics / Zoom /
+    Meet) writes rows nothing can read back.  Returns the events whose
+    start_time is in [now, now+within_hours), soonest-first, as Event dicts.
+    Events with no start_time are excluded (can't be "upcoming").  Optional
+    community_id / created_by scope the read.  `now` is injectable for
+    deterministic tests; defaults to utcnow().  within_hours=0/None => no upper
+    horizon (everything from now on).  Returns [] on any failure.
+    """
+    try:
+        from integrations.social.models import db_session, Event
+    except Exception as e:
+        logger.warning(f"list_upcoming_events: models unavailable: {e}")
+        return []
+    if now is None:
+        now = datetime.utcnow()
+    try:
+        horizon = now + timedelta(hours=within_hours) if within_hours else None
+        with db_session() as db:
+            q = db.query(Event).filter(
+                Event.start_time != None,           # noqa: E711  (SQL IS NOT NULL)
+                Event.start_time >= now,
+            )
+            if horizon is not None:
+                q = q.filter(Event.start_time < horizon)
+            if community_id:
+                q = q.filter(Event.community_id == community_id)
+            if created_by:
+                q = q.filter(Event.created_by == created_by)
+            q = q.order_by(Event.start_time.asc())
+            if limit:
+                q = q.limit(limit)
+            return [ev.to_dict() for ev in q.all()]
+    except Exception as e:
+        logger.warning(f"list_upcoming_events failed: {e}")
+        return []

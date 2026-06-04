@@ -108,3 +108,52 @@ def test_ingest_ics_end_to_end_lands_two_rows(ev_models):
     ingest_ics(SAMPLE_ICS)
     with ev_models.db_session() as db:
         assert db.query(ev_models.Event).count() == 2, "re-ingest must dedup on UID"
+
+
+# ── list_upcoming_events: the READ side (without it the table is write-only) ──
+
+def test_list_upcoming_events_future_only_sorted(ev_models):
+    from datetime import datetime, timedelta
+    from integrations.social.events import ingest_event, list_upcoming_events
+    now = datetime(2026, 6, 4, 12, 0, 0)
+    ingest_event('manual', 'Past standup', source_event_id='p1',
+                 start_time=now - timedelta(hours=2))
+    ingest_event('manual', 'Soon: demo', source_event_id='f1',
+                 start_time=now + timedelta(hours=1))
+    ingest_event('manual', 'Later: sync', source_event_id='f2',
+                 start_time=now + timedelta(hours=5))
+    ingest_event('manual', 'Undated note', source_event_id='u1')  # no start_time
+
+    titles = [r['title'] for r in list_upcoming_events(now=now)]
+    assert titles == ['Soon: demo', 'Later: sync']            # future only, soonest-first
+    assert 'Past standup' not in titles                       # past excluded
+    assert 'Undated note' not in titles                       # no start_time excluded
+
+
+def test_list_upcoming_events_window_and_limit(ev_models):
+    from datetime import datetime, timedelta
+    from integrations.social.events import ingest_event, list_upcoming_events
+    now = datetime(2026, 6, 4, 12, 0, 0)
+    ingest_event('manual', 'In window', source_event_id='w1',
+                 start_time=now + timedelta(hours=10))
+    ingest_event('manual', 'Outside window', source_event_id='w2',
+                 start_time=now + timedelta(hours=400))       # beyond default 168h
+
+    assert [r['title'] for r in list_upcoming_events(now=now)] == ['In window']
+    wide = {r['title'] for r in list_upcoming_events(within_hours=500, now=now)}
+    assert wide == {'In window', 'Outside window'}
+    lim = list_upcoming_events(within_hours=500, limit=1, now=now)
+    assert len(lim) == 1 and lim[0]['title'] == 'In window'   # soonest within limit
+
+
+def test_list_upcoming_events_community_filter(ev_models):
+    from datetime import datetime, timedelta
+    from integrations.social.events import ingest_event, list_upcoming_events
+    now = datetime(2026, 6, 4, 12, 0, 0)
+    ingest_event('manual', 'Team A event', source_event_id='a1',
+                 start_time=now + timedelta(hours=2), community_id='comm-a')
+    ingest_event('manual', 'Team B event', source_event_id='b1',
+                 start_time=now + timedelta(hours=3), community_id='comm-b')
+
+    assert [r['title'] for r in list_upcoming_events(community_id='comm-a', now=now)] \
+        == ['Team A event']
