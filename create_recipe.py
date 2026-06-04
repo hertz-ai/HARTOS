@@ -3243,16 +3243,10 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
         current_app.logger.info(f'Checking for @user or @user in message')
         if '@user' in messages[-1]["content"].lower():
             current_app.logger.info('GOT @USER in message')
-            temp_message = messages[-1]["content"]
-            temp_message = temp_message.replace("'",'"')
-            json_match = re.search(r'{[\s\S]*}', temp_message)
-            if json_match:
+            json_obj = retrieve_json(messages[-1]["content"])  # canonical parse (#95)
+            if json_obj:
                 try:
-                    current_app.logger.info('GOT Json')
-                    current_app.logger.info(f'got json object')
-                    json_part = json_match.group(0)
                     current_app.logger.info('Sending user the message')
-                    json_obj = json.loads(json_part)
                     send_message_to_user1(user_id,json_obj['message2user'],'',prompt_id)
                 except Exception:
                     pass
