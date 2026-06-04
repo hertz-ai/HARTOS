@@ -881,7 +881,26 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         tool_logger.debug(f"Resonance profile loading skipped: {e}")
 
     # Create assistant agent (user_language resolved inside build_personality_prompt)
-    assistant = instantiate_assistant_agent(list_of_persona, user_prompt, personality=_agent_personality, resonance_profile=_resonance_profile)
+    # AUTONOMY SIGNAL (live-confirmed root cause, 2026-06-04): daemon / flywheel
+    # dispatches stamp request_id with the 'daemon_<goal>' prefix
+    # (dispatch.is_genuine_user_request — the canonical discriminator).  This was
+    # NEVER threaded to instantiate_assistant_agent, so it defaulted to
+    # autonomous=False and every autonomous goal got the assistant prompt
+    # "INTERACTIVE MODE: you may ask the user clarifying questions".  The local
+    # model then asked for clarification, the StatusVerifier flagged
+    # needs-user-input, and the action stalled forever (no user to answer) — the
+    # core Gate-1 stall, seen directly in the :8080 capture of a daemon coding
+    # goal running in INTERACTIVE mode.  Resolve it from the request_id so
+    # autonomous runs are told to use sensible defaults and never block.
+    _autonomous_run = False
+    try:
+        from integrations.agent_engine.dispatch import is_current_request_autonomous
+        _autonomous_run = is_current_request_autonomous()
+    except Exception:
+        _autonomous_run = False
+    assistant = instantiate_assistant_agent(
+        list_of_persona, user_prompt, personality=_agent_personality,
+        resonance_profile=_resonance_profile, autonomous=_autonomous_run)
 
     # Wrap assistant with Agent Lightning for training and optimization
     if is_agent_lightning_enabled():

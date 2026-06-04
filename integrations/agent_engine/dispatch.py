@@ -194,6 +194,25 @@ def is_genuine_user_request(request_id) -> bool:
     return not (bool(request_id) and str(request_id).startswith('daemon_'))
 
 
+def is_current_request_autonomous() -> bool:
+    """True when the IN-FLIGHT request is a daemon / flywheel dispatch (no live
+    user to answer clarifying questions); False for a genuine user turn.
+
+    Reads the thread-local request_id the /chat handler set and applies the one
+    canonical discriminator (is_genuine_user_request).  The CREATE pipeline uses
+    this to pick the assistant's AUTONOMOUS vs INTERACTIVE system prompt:
+    without it, autonomous goals were told they "may ask the user clarifying
+    questions", asked, and stalled forever waiting for an answer that never came
+    (the live 2026-06-04 :8080 capture showed a daemon goal in INTERACTIVE mode).
+    Degrades safe — any error / missing request_id returns False (interactive).
+    """
+    try:
+        from threadlocal import thread_local_data
+        return not is_genuine_user_request(thread_local_data.get_request_id() or '')
+    except Exception:
+        return False
+
+
 def mark_create_start(request_id=None):
     """Call when a CREATE pipeline starts.
 
