@@ -834,7 +834,7 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
     custom_agents = []
     agents_object = {}
-    with open(os.path.join(PROMPTS_DIR, f"{prompt_id}.json"), 'r') as f:
+    with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
             config = json.load(f)
             list_of_persona = config['flows'][get_current_flow(user_prompt)]['persona']
             current_app.logger.info(f'WORKING persona as {list_of_persona}')
@@ -5393,7 +5393,7 @@ def get_total_actions_for_current_flow_and_reset_actions(prompt_id, user_prompt)
 
 
 def get_prompt_config_json(prompt_id):
-    with open(os.path.join(PROMPTS_DIR, f"{prompt_id}.json"), 'r') as f:
+    with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
         config = json.load(f)
     return config
 

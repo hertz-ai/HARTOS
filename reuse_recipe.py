@@ -760,7 +760,7 @@ def create_agents_for_role(user_id: str, prompt_id):
 
     personas = []
     try:
-        with open(os.path.join(PROMPTS_DIR, f"{prompt_id}.json"), 'r') as f:
+        with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
             config = json.load(f)
             personas = config['personas']
             current_app.logger.info(f'Available Personas {personas}')
@@ -952,7 +952,7 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
         recipes[user_prompt] = config
         final_recipe[prompt_id] = config
     goal = ''
-    with open(os.path.join(PROMPTS_DIR, f"{prompt_id}.json"), 'r') as f:
+    with open(helper_fun.safe_prompt_path(prompt_id), 'r') as f:
         config = json.load(f)
         goal = config['goal']
 
@@ -3346,7 +3346,7 @@ def get_flow_number(user_id, prompt_id):
     if not role:
         role = None
     current_app.logger.info(f'Got role as {role}')
-    file_path = os.path.join(PROMPTS_DIR, f'{prompt_id}.json')
+    file_path = helper_fun.safe_prompt_path(prompt_id)
     with open(file_path, 'r') as f:
         data = json.load(f)
         available_roles = [x['name'] for x in data['personas']]
