@@ -13,6 +13,7 @@ import requests
 from datetime import datetime, timedelta
 
 from core.http_pool import pooled_get, pooled_post
+from core.session_cache import TTLCache  # bounded + TTL dedup (peer churn safe)
 
 logger = logging.getLogger('hevolve_social')
 
@@ -1321,7 +1322,18 @@ class AutoDiscovery:
         self._send_thread = None
         self._recv_thread = None
         self._lock = threading.Lock()
-        self._discovered_nodes: set = set()
+        # First-beacon dedup (suppresses re-logging + re-gossiping the same
+        # node every ~30s beacon).  Was an unbounded `set` that only ever grew
+        # — on a long-running node in a churny LAN (peers cycling through new
+        # node_ids) it leaked memory without bound (#83).  TTLCache caps size
+        # (FIFO-evicts the oldest) and expires entries after a TTL, so a node
+        # absent for the TTL is simply re-discovered (re-logged once) if it
+        # returns — correct + bounded.  Accessed only from the single recv
+        # thread, so no extra locking needed.
+        self._discovered_nodes = TTLCache(
+            ttl_seconds=int(os.environ.get('HEVOLVE_DISCOVERY_DEDUP_TTL', '3600')),
+            max_size=int(os.environ.get('HEVOLVE_DISCOVERY_DEDUP_MAX', '2048')),
+            name='peer_discovered_nodes')
         self._sock = None
         # Cached list of broadcast addresses (one per usable IPv4 NIC).
         # Refreshed on start; iterated each beacon send.  Replaces the
@@ -1682,10 +1694,10 @@ class AutoDiscovery:
                 continue
 
             node_id = payload.get('node_id')
-            if node_id in self._discovered_nodes:
+            if node_id in self._discovered_nodes:   # TTL-aware membership
                 continue
 
-            self._discovered_nodes.add(node_id)
+            self._discovered_nodes[node_id] = True   # bounded; FIFO-evicts oldest
             url = payload.get('url', '')
             logger.info(f"AutoDiscovery: found node "
                         f"{payload.get('name', node_id[:8])} at {url} via LAN")
