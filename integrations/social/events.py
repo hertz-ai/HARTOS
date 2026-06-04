@@ -10,7 +10,7 @@ Dedup is on (source, source_event_id): re-ingesting the same upstream event
 UPDATES the row instead of creating a duplicate.
 """
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger('hevolve_social')
 
@@ -135,3 +135,169 @@ def ingest_ics(ics_text, community_id=None, created_by=None):
         if row:
             results.append(row)
     return results
+
+
+# ── Video-meeting sources: Zoom + Google Meet (omni-channel bridge #64) ──
+# Same shape as the .ics path: a PURE parse_*() (no I/O, unit-tested against the
+# documented API response) feeds the canonical ingest_event(); a thin
+# fetch_and_ingest_*() wrapper adds the network call.  The OAuth bearer token is
+# the caller's responsibility (creds-gated, like every other channel adapter) —
+# absent a token the fetch is a no-op, so the source is simply inactive until
+# credentials are configured.  The wrappers are live-validated once those creds
+# exist; the mapping logic is fully covered now.
+
+def _parse_iso_dt(v):
+    """Parse an ISO-8601 datetime (Zoom + Google emit e.g. 2026-06-04T15:00:00Z).
+    Returns a naive-UTC datetime, or None.  Tolerates offset / fractional forms."""
+    if not v:
+        return None
+    v = v.strip()
+    for fmt in ('%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(v, fmt)
+        except ValueError:
+            continue
+    try:  # offsets (+05:30) / fractional seconds
+        return datetime.fromisoformat(v.replace('Z', '+00:00')).replace(tzinfo=None)
+    except (ValueError, AttributeError):
+        return None
+
+
+def parse_zoom_meetings(api_json):
+    """Zoom `GET /users/me/meetings` response → ingest_event field dicts (pure).
+
+    Documented shape: {"meetings": [{"id", "topic", "agenda", "start_time"
+    (ISO-8601 Z), "duration" (minutes), "join_url", …}]}.  No network — accepts
+    either the full dict or a bare meetings list so it is trivially unit-tested.
+    """
+    meetings = api_json.get('meetings', []) if isinstance(api_json, dict) else (api_json or [])
+    out = []
+    for m in meetings:
+        if not isinstance(m, dict):
+            continue
+        start = _parse_iso_dt(m.get('start_time'))
+        end = None
+        dur = m.get('duration')
+        if start is not None and isinstance(dur, (int, float)):
+            end = start + timedelta(minutes=int(dur))
+        out.append({
+            'source_event_id': str(m['id']) if m.get('id') is not None else None,
+            'title': m.get('topic') or '(untitled meeting)',
+            'description': m.get('agenda', '') or '',
+            'url': m.get('join_url'),
+            'start_time': start,
+            'end_time': end,
+        })
+    return out
+
+
+def ingest_zoom_meetings(api_json, community_id=None, created_by=None):
+    """Ingest every meeting from a Zoom meetings-list response (source='zoom')."""
+    results = []
+    for fields in parse_zoom_meetings(api_json):
+        row = ingest_event(source='zoom', community_id=community_id,
+                           created_by=created_by, **fields)
+        if row:
+            results.append(row)
+    return results
+
+
+def parse_gmeet_events(api_json):
+    """Google Calendar `events.list` response → ingest_event field dicts (pure).
+
+    Only events that actually carry a Meet link (hangoutLink, or a
+    conferenceData video entryPoint) are surfaced — a plain calendar entry is
+    not a meeting.  Documented shape: {"items": [{"id", "summary", "description",
+    "location", "start": {"dateTime"|"date"}, "end": {…}, "hangoutLink",
+    "conferenceData": {"entryPoints": [{"entryPointType": "video", "uri"}]}}]}.
+    """
+    items = api_json.get('items', []) if isinstance(api_json, dict) else (api_json or [])
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        link = it.get('hangoutLink')
+        if not link:
+            for ep in (it.get('conferenceData') or {}).get('entryPoints', []) or []:
+                if isinstance(ep, dict) and ep.get('entryPointType') == 'video' and ep.get('uri'):
+                    link = ep['uri']
+                    break
+        if not link:
+            continue  # not a Meet event — skip
+        start = it.get('start') or {}
+        end = it.get('end') or {}
+        out.append({
+            'source_event_id': it.get('id'),
+            'title': it.get('summary') or '(untitled meeting)',
+            'description': it.get('description', '') or '',
+            'location': it.get('location'),
+            'url': link,
+            'start_time': _parse_iso_dt(start.get('dateTime') or start.get('date')),
+            'end_time': _parse_iso_dt(end.get('dateTime') or end.get('date')),
+        })
+    return out
+
+
+def ingest_gmeet_events(api_json, community_id=None, created_by=None):
+    """Ingest every Meet-linked event from a Google Calendar response (source='gmeet')."""
+    results = []
+    for fields in parse_gmeet_events(api_json):
+        row = ingest_event(source='gmeet', community_id=community_id,
+                           created_by=created_by, **fields)
+        if row:
+            results.append(row)
+    return results
+
+
+_ZOOM_MEETINGS_API = 'https://api.zoom.us/v2/users/me/meetings'
+_GCAL_EVENTS_API = 'https://www.googleapis.com/calendar/v3/calendars/primary/events'
+
+
+def fetch_and_ingest_zoom(access_token, community_id=None, created_by=None, timeout=15):
+    """Fetch upcoming Zoom meetings (OAuth scope meeting:read) and ingest them.
+
+    Network wrapper around the unit-tested parse_zoom_meetings/ingest_event core.
+    Requires a Zoom OAuth bearer token; returns [] (inactive) without one, and
+    on any network/HTTP error (timeout-bounded).  Live-validated once Zoom OAuth
+    app credentials are configured.
+    """
+    if not access_token:
+        return []
+    try:
+        import requests
+        resp = requests.get(
+            _ZOOM_MEETINGS_API, params={'type': 'upcoming', 'page_size': 100},
+            headers={'Authorization': f'Bearer {access_token}'}, timeout=timeout)
+        resp.raise_for_status()
+        return ingest_zoom_meetings(resp.json(), community_id=community_id, created_by=created_by)
+    except Exception as e:
+        logger.warning(f"fetch_and_ingest_zoom failed: {e}")
+        return []
+
+
+def fetch_and_ingest_gmeet(access_token, time_min_iso=None, community_id=None,
+                           created_by=None, timeout=15):
+    """Fetch upcoming Meet-linked Google Calendar events and ingest them.
+
+    Network wrapper around the unit-tested parse_gmeet_events/ingest_event core.
+    Requires a Google OAuth bearer token (scope calendar.readonly); returns []
+    without one or on error.  `time_min_iso` defaults to now (caller may pass a
+    fixed value for determinism).  Live-validated once Google OAuth creds exist.
+    """
+    if not access_token:
+        return []
+    try:
+        import requests
+        if not time_min_iso:
+            from datetime import timezone
+            time_min_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        resp = requests.get(
+            _GCAL_EVENTS_API,
+            params={'timeMin': time_min_iso, 'singleEvents': 'true',
+                    'orderBy': 'startTime', 'maxResults': 100},
+            headers={'Authorization': f'Bearer {access_token}'}, timeout=timeout)
+        resp.raise_for_status()
+        return ingest_gmeet_events(resp.json(), community_id=community_id, created_by=created_by)
+    except Exception as e:
+        logger.warning(f"fetch_and_ingest_gmeet failed: {e}")
+        return []
