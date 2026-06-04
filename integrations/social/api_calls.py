@@ -44,16 +44,7 @@ logger = logging.getLogger('hevolve_social')
 calls_bp = Blueprint('calls', __name__, url_prefix='/api/social')
 
 
-def _ok(data, status=200):
-    return jsonify({'success': True, 'data': data}), status
-
-
-def _err(message, status=400):
-    return jsonify({'success': False, 'error': message}), status
-
-
-def _get_json():
-    return request.get_json(force=True, silent=True) or {}
+from .api_common import _ok, _err, _get_json  # single-sourced (#97)
 
 
 # ── Call lifecycle ───────────────────────────────────────────────────

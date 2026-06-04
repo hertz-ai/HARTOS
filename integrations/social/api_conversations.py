@@ -39,19 +39,7 @@ conversations_bp = Blueprint(
     'conversations', __name__, url_prefix='/api/social/conversations')
 
 
-def _ok(data=None, status=200):
-    r = {'success': True}
-    if data is not None:
-        r['data'] = data
-    return jsonify(r), status
-
-
-def _err(msg, status=400):
-    return jsonify({'success': False, 'error': msg}), status
-
-
-def _get_json():
-    return request.get_json(force=True, silent=True) or {}
+from .api_common import _ok, _err, _get_json  # single-sourced (#97)
 
 
 def _flag_on() -> bool:
