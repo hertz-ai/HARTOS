@@ -39,12 +39,17 @@
   };
 
   # ─── Cellular Modem (Quectel EG25-G) ───
-  # ModemManager handles voice calls, SMS, data
-  services.modemManager.enable = true;
+  # ModemManager (voice calls, SMS, data) is provided by
+  # networking.networkmanager.enable below — there is NO standalone
+  # services.modemManager option on this nixpkgs pin (it was removed; setting it
+  # is the "services.modemManager does not exist" #70 eval error).  See
+  # configurations/phone.nix:158-160 for the same note.
 
   # Modem firmware + power management
   systemd.services.eg25-manager = {
     description = "PinePhone EG25-G Modem Manager";
+    # ModemManager.service comes from NetworkManager (enabled below); the soft
+    # `after` ordering is satisfied without the (nonexistent) standalone option.
     after = [ "ModemManager.service" ];
     wantedBy = [ "multi-user.target" ];
     serviceConfig = {

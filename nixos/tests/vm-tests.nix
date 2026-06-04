@@ -32,12 +32,19 @@ let
   # Minimal node: hart modules + variant, NO ../configurations/X.nix (and thus
   # no installer-CD overlay collision).  `extra` carries per-test virtualisation
   # / networking overrides.
-  mkNode = variant: extra: { config, pkgs, lib, ... }: ({
-    imports = hartModules;
+  # `extra` is imported as a module (NOT merged with //) so its nested attrs
+  # (e.g. networking.interfaces on the peer-discovery nodes) recursively merge
+  # with the base instead of clobbering networking.hostName.
+  mkNode = variant: extra: { config, pkgs, lib, ... }: {
+    imports = hartModules ++ [ extra ];
     hart.enable = true;
     hart.variant = variant;
     hart.version = "0.0.0-test";
-  } // extra);
+    # hart-base sets networking.hostName = mkDefault "hart-node"; runNixOSTest
+    # also sets a default (the node name) -> two same-priority defaults conflict.
+    # Force a deterministic per-node value (tests address by IP, not hostname).
+    networking.hostName = lib.mkForce variant;
+  };
 
 in
 {
