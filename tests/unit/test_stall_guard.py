@@ -29,7 +29,7 @@ if ROOT not in sys.path:
 
 from lifecycle_hooks import (
     stall_guard_step, STALL_GUARD_MAX_ITERS, STALL_GUARD_INPROGRESS_ITERS,
-    ActionState,
+    ActionState, recipe_correction_directive,
 )
 
 
@@ -128,3 +128,24 @@ def test_later_action_stall_is_caught_even_if_earlier_action_done():
         2, ActionState.RECIPE_REQUESTED, recipe_exists=False,
         max_steps=STALL_GUARD_MAX_ITERS + 5)
     assert broke is True
+
+
+# ── recipe_correction_directive (#89 content-side: unparseable recipe JSON) ──
+def test_correction_directive_clean_first_attempt_is_empty():
+    assert recipe_correction_directive(0) == ''
+    assert recipe_correction_directive(-1) == ''
+
+
+def test_correction_directive_first_failure_demands_only_json():
+    d = recipe_correction_directive(1)
+    assert 'ONLY' in d and 'JSON' in d and 'fences' in d
+    # first correction does NOT yet hand over the verbatim fallback object
+    assert '"status":"done"' not in d
+
+
+def test_correction_directive_escalates_with_fallback_object():
+    d2 = recipe_correction_directive(2)
+    assert 'ONLY' in d2                      # still demands clean JSON
+    assert '"status":"done"' in d2           # plus a minimal valid object to emit
+    assert '"recipe":[]' in d2
+    assert len(d2) > len(recipe_correction_directive(1))   # escalation grows it

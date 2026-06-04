@@ -194,6 +194,7 @@ from lifecycle_hooks import (
     sync_action_state_to_ledger,  # Sync ActionState to SmartLedger
     register_ledger_for_session,  # Register ledger for auto-sync
     stall_guard_step,             # No-progress stall tracker (reachable guard)
+    recipe_correction_directive,  # Escalating "emit ONLY JSON" recipe fix (#89)
 )
 
 # Import helper_ledger functions for subtask management and ledger awareness
@@ -4289,12 +4290,25 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     _flow = get_current_flow(user_prompt)
                     _recipe_path = os.path.join(PROMPTS_DIR, f'{prompt_id}_{_flow}_{_ca}.json')
                     if not os.path.exists(_recipe_path):
+                        # #89: count consecutive re-requests for THIS action with
+                        # no recipe landing — each one means the model's prior
+                        # recipe response failed to parse.  Pass the PRIOR-failure
+                        # count so the request escalates a corrective "emit ONLY
+                        # JSON" directive instead of re-sending the same prompt.
+                        _pf = getattr(user_tasks[user_prompt], '_recipe_parse_failures', None)
+                        if _pf is None:
+                            _pf = {}
+                            user_tasks[user_prompt]._recipe_parse_failures = _pf
+                        _prior = _pf.get(_ca, 0)
+                        _pf[_ca] = _prior + 1
                         current_app.logger.info(
-                            f'[AUTO-ADVANCE] action {_ca} done but recipe not saved — requesting recipe')
+                            f'[AUTO-ADVANCE] action {_ca} done but recipe not saved '
+                            f'(attempt {_prior + 1}) — requesting recipe')
                         user_tasks[user_prompt].recipe = True
                         user_tasks[user_prompt].fallback = False
                         # Directly request recipe via initiate_chat
-                        _recipe_msg = request_recipe_for_action(_ca, prompt_id, role, user_prompt)
+                        _recipe_msg = request_recipe_for_action(
+                            _ca, prompt_id, role, user_prompt, parse_failures=_prior)
                         try:
                             result = chat_instructor.initiate_chat(
                                 recipient=manager, message=_recipe_msg, clear_history=False, silent=False)
@@ -4812,7 +4826,7 @@ def request_recipe_for_action_last(current_action_id, prompt_id, role, user_prom
     return message
 
 
-def request_recipe_for_action(current_action_id, prompt_id, role, user_prompt):
+def request_recipe_for_action(current_action_id, prompt_id, role, user_prompt, parse_failures=0):
     user_tasks[user_prompt].recipe = False
     user_tasks[user_prompt].fallback = False
     safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED, "recipe start")
@@ -4826,6 +4840,10 @@ def request_recipe_for_action(current_action_id, prompt_id, role, user_prompt):
                         4. For all Python functions, include comprehensive docstrings to explain their purpose, parameters, and usage. This should especially clarify non-coding steps that require utilizing the assistant's language capabilities.
                         5. If any internal tool is used to complete a step, provide detailed instructions on how to call or utilize that tool instead of providing the code for that step.
                         ''' + f'6. Metadata created till this action: {metadata}\n7. The persona must be one of the following: {role}. No other personas are allowed.'
+    # #89: after the model's prior recipe response failed to parse, escalate a
+    # "emit ONLY valid JSON" correction instead of re-sending the identical
+    # prompt (which just gets the same prose-wrapped garbage).
+    message += recipe_correction_directive(parse_failures)
     return message
 
 def fix_cyclic_dependency(cyc, individual_recipe):

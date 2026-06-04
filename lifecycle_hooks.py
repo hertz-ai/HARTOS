@@ -406,6 +406,39 @@ def stall_guard_step(prev_stuck_key, prev_iters, action_id, state,
     return key, iters, iters > cap
 
 
+# Minimal valid recipe the model is told to emit as a last resort so a wedged
+# action TERMINATES cleanly (status:done + empty recipe) instead of grinding.
+_RECIPE_FALLBACK_OBJECT = (
+    '{"status":"done","action":"","fallback_action":"","persona":"",'
+    '"recipe":[],"can_perform_without_user_input":"yes"}'
+)
+
+
+def recipe_correction_directive(parse_failures: int) -> str:
+    """Corrective text appended to a recipe request after the model's PRIOR
+    response failed to parse as the required JSON.  Pure — no I/O.
+
+    Why: local small models tend to wrap the recipe object in prose / markdown
+    ``` fences, which breaks json_repair and leaves the action grinding in
+    IN_PROGRESS (#89, observed live 2026-06-04).  Re-sending the identical
+    prompt just gets the same garbage; this escalates instead —
+
+      * ``parse_failures <= 0`` -> '' (a clean first attempt gets no nag).
+      * 1 -> demand ONLY the JSON object (no prose, no fences).
+      * 2+ -> additionally offer a minimal valid object to emit verbatim, so the
+        action can TERMINATE rather than spin to the stall-guard cap.
+    """
+    if parse_failures <= 0:
+        return ''
+    msg = ("\n\nIMPORTANT: your previous response could NOT be parsed as JSON. "
+           "Respond with ONLY the single JSON object specified above — no prose, "
+           "no explanation, no markdown ``` fences. Begin with '{' and end with '}'.")
+    if parse_failures >= 2:
+        msg += (" If you cannot produce a valid recipe, emit EXACTLY this and "
+                "nothing else: " + _RECIPE_FALLBACK_OBJECT)
+    return msg
+
+
 # Add to lifecycle_hooks.py
 class FlowLifecycleState:
     """Track overall flow lifecycle beyond individual actions"""
