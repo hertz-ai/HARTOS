@@ -636,6 +636,9 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
    style at all, so keyboard users couldn't see where they were. */
 :focus-visible{outline:2px solid var(--hart-accent);outline-offset:2px}
 .start-btn:focus-visible,.tray-btn:focus-visible,.start-item:focus-visible,.power-btn:focus-visible,.taskbar-chip:focus-visible,.agent-pill:focus-visible,.ctx-menu-item:focus-visible{outline:2px solid var(--hart-accent);outline-offset:-2px}
+/* Skip link (a11y): jump straight to content; off-screen until keyboard-focused. */
+.skip-link{position:fixed;top:-200px;left:8px;z-index:100000;padding:8px 16px;background:var(--hart-accent);color:var(--hart-on-accent);border-radius:8px;font-weight:600;text-decoration:none;transition:top 0.2s}
+.skip-link:focus{top:8px}
 .ds-btn:disabled,.ds-btn[disabled]{opacity:0.38;pointer-events:none}
 .ds-btn .mi{font-size:18px}
 .ds-btn-primary{background:var(--hart-accent);color:var(--hart-on-accent)}
@@ -1093,9 +1096,10 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 </head>
 <body>
 <div class="wallpaper"></div>
+<a href="#panels" class="skip-link">Skip to content</a>
 
 <!-- Top Bar -->
-<div class="top-bar glass">
+<div class="top-bar glass" role="banner">
   <div class="start-btn" role="button" tabindex="0" aria-haspopup="menu" aria-label="Start menu" onclick="toggleStartMenu()" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Start Menu (Super)">
     <span class="mi material-icons-round" aria-hidden="true">hexagon</span>
     <span>HART</span>
@@ -1117,7 +1121,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 </div>
 
 <!-- Panel Container -->
-<div class="panel-container" id="panels"></div>
+<div class="panel-container" id="panels" role="main" aria-label="Open windows"></div>
 
 <!-- Agent Pill (click to expand floating chat) -->
 <div class="agent-pill glass" id="agent-pill" onclick="toggleAssistantChat()">
@@ -1127,7 +1131,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 </div>
 
 <!-- Floating Assistant Chat Panel -->
-<div class="assistant-chat glass" id="assistant-chat">
+<div class="assistant-chat glass" id="assistant-chat" role="dialog" aria-label="HART Assistant" aria-modal="false">
   <div class="ac-header" id="ac-drag-handle">
     <span class="mi material-icons-round" style="font-size:20px;color:var(--hart-accent)">chat_bubble</span>
     <span class="ac-title">HART Assistant</span>
@@ -1158,7 +1162,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 </div>
 
 <!-- Lock Screen -->
-<div class="lock-screen" id="lock-screen">
+<div class="lock-screen" id="lock-screen" role="dialog" aria-modal="true" aria-label="Screen locked">
   <div class="lock-clock" id="lock-clock"></div>
   <div class="lock-date" id="lock-date"></div>
   <input class="lock-input" type="password" placeholder="Password" id="lock-pw"
@@ -1167,7 +1171,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 </div>
 
 <!-- Taskbar (open panels as chips) -->
-<div class="taskbar glass" id="taskbar"></div>
+<div class="taskbar glass" id="taskbar" role="navigation" aria-label="Taskbar"></div>
 
 <!-- Toast Notifications -->
 <div class="toast-container" id="toast-container" role="status" aria-live="polite"></div>
