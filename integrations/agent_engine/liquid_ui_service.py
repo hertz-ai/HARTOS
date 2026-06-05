@@ -1151,7 +1151,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 <!-- Start Menu -->
 <div class="start-menu glass" id="start-menu">
-  <input class="start-search" id="start-search" placeholder="Search..." oninput="filterStart(this.value)">
+  <input class="start-search" id="start-search" placeholder="Search..." oninput="filterStart(this.value)" onkeydown="if(event.key==='Enter'){{event.preventDefault();startSearchEnter()}}">
   <div class="start-scroll" id="start-scroll"></div>
   <div class="start-footer">
     <div class="power-btn" role="button" tabindex="0" onclick="shellAction('lock')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">lock</span>Lock</div>
@@ -1203,6 +1203,7 @@ let panels = {{}};
 let panelZ = 100;
 let startOpen = false;
 let focusedPanel = null;
+let mru = [];
 
 // ═══════════════════════════════════════════════
 //  HART Design System — Component Library
@@ -1625,6 +1626,13 @@ function filterStart(q) {{
     el.style.display = title.includes(lq) ? '' : 'none';
   }});
 }}
+// Enter in the start search launches the first visible result (Spotlight-style).
+function startSearchEnter() {{
+  const items = document.querySelectorAll('.start-item');
+  for(const el of items) {{
+    if(el.style.display !== 'none') {{ el.click(); return; }}
+  }}
+}}
 
 // ═══ Panel Manager ═══
 function openPanel(id, opts) {{
@@ -1775,6 +1783,7 @@ function bringToFront(id) {{
   p.el.style.zIndex = ++panelZ;
   Object.keys(panels).forEach(k=>panels[k].el.classList.toggle('focused',k===id));
   focusedPanel = id;
+  mru = [id, ...mru.filter(x=>x!==id)];
   updateTaskbar();
 }}
 
@@ -3401,9 +3410,13 @@ document.addEventListener('keydown', e => {{
   // Alt+Tab — cycle through panels
   if(e.key==='Tab'&&e.altKey) {{
     e.preventDefault();
-    const ids = Object.keys(panels);
+    // MRU order: Alt+Tab flips to the PREVIOUSLY-focused window (Win11/macOS),
+    // not creation order. Fall back to creation order if MRU is incomplete.
+    const order = mru.filter(id=>panels[id]);
+    const ids = order.length>=2 ? order : Object.keys(panels);
     if(ids.length<2) return;
-    const idx = (ids.indexOf(focusedPanel)+1)%ids.length;
+    const cur = ids.indexOf(focusedPanel);
+    const idx = cur<0 ? 0 : (cur+1)%ids.length;
     bringToFront(ids[idx]);
   }}
   // Super+D — show desktop (minimize all)
