@@ -506,6 +506,19 @@ class LiquidUIService:
         perf = theme.get('performance', {})
         is_potato = perf.get('disable_blur', False)
 
+        # Accessibility state — the SAME live dict the /api/shell/accessibility
+        # routes mutate (same process). High-contrast + reduced-motion apply as
+        # <html> classes (CSS in the design system). Previously the toggles stored
+        # nothing (key mismatch) AND the render never consumed the state; this
+        # wires both ends.
+        try:
+            from integrations.agent_engine.shell_os_apis import get_a11y_settings
+            _a11y = get_a11y_settings()
+        except Exception:
+            _a11y = {}
+        a11y_cls = (('a11y-contrast ' if _a11y.get('high_contrast') else '')
+                    + ('a11y-rmotion' if _a11y.get('reduced_motion') else '')).strip()
+
         wallpaper = theme.get('wallpaper', {})
         wp_css = wallpaper.get('value', 'radial-gradient(120% 120% at 18% 0%,rgba(0,212,170,0.07),transparent 50%),radial-gradient(100% 100% at 100% 100%,rgba(22,33,62,0.55),transparent 60%),linear-gradient(135deg,#0F0E17 0%,#1a1a2e 50%,#16213e 100%)')
         if wallpaper.get('type') == 'solid':
@@ -855,6 +868,12 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
     animation-iteration-count:1!important;transition-duration:0.01ms!important}
 }
 
+/* ── Accessibility: applied from the live a11y state via <html> classes ── */
+html.a11y-contrast{--hart-muted:#e8eef2;--hart-glass-bg:#0a0a12;--hart-glass-border:#ffffff;--hart-text:#ffffff}
+html.a11y-contrast .glass{background:#0a0a12;border-width:2px}
+html.a11y-rmotion *,html.a11y-rmotion *::before,html.a11y-rmotion *::after{
+  animation-duration:0.01ms!important;animation-iteration-count:1!important;transition-duration:0.01ms!important}
+
 /* ── Material Icons: LOCAL + offline-safe ── */
 /* Every shell icon is <span class="mi material-icons-round">name</span>. The
    Google <link> in <head> only defines this font family ONLINE, so a fresh
@@ -891,7 +910,7 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
         )
 
         return f'''<!DOCTYPE html>
-<html lang="en"><head>
+<html lang="en" class="{a11y_cls}"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>HART OS</title>
@@ -2496,15 +2515,16 @@ function loadAccessibilityPanel(el) {{
   fetch(SHELL+'/api/shell/accessibility',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Accessibility</div><div class="ds-stagger">';
     const items = [
-      ['screen_reader', 'Screen Reader', data.screen_reader],
-      ['text_increase', 'Large Text', data.large_text],
-      ['contrast', 'High Contrast', data.high_contrast],
-      ['animation', 'Reduce Motion', data.reduce_motion],
+      ['contrast', 'High Contrast', 'high_contrast', data.high_contrast],
+      ['animation', 'Reduce Motion', 'reduced_motion', data.reduced_motion],
+      ['record_voice_over', 'Screen Reader', 'screen_reader', data.screen_reader],
+      ['back_hand', 'Large Cursor', 'large_cursor', data.large_cursor],
+      ['keyboard', 'Sticky Keys', 'sticky_keys', data.sticky_keys],
     ];
-    items.forEach(([icon,label,val])=>{{
-      html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent">'+icon+'</span>'+
+    items.forEach(([icon,label,key,val])=>{{
+      html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent" aria-hidden="true">'+icon+'</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+label+'</div></div>'+
-        '<label class="ds-switch"><input type="checkbox" '+(val?'checked':'')+' onchange="toggleA11y(\\''+label.toLowerCase().replace(/ /g,'_')+'\\',this.checked)"><span class="ds-switch-slider"></span></label></div>';
+        '<label class="ds-switch"><input type="checkbox" role="switch" aria-label="'+label+'" '+(val?'checked':'')+' onchange="toggleA11y(\\''+key+'\\',this.checked)"><span class="ds-switch-slider"></span></label></div>';
     }});
     if(data.font_scale) html += dsStatusRow('format_size', 'Font Scale', data.font_scale+'x', 'var(--hart-muted)');
     html += '</div></div>';
@@ -2514,7 +2534,11 @@ function loadAccessibilityPanel(el) {{
 function toggleA11y(key,val) {{
   const body = {{}};
   body[key] = val;
-  fetch(SHELL+'/api/shell/accessibility',{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}}).catch(()=>{{}});
+  // Reload after a successful PUT so the render re-reads the live a11y state and
+  // applies the <html> class (high-contrast / reduced-motion). Same pattern the
+  // theme switcher uses.
+  fetch(SHELL+'/api/shell/accessibility',{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}})
+    .then(()=>location.reload()).catch(()=>{{}});
 }}
 
 // ═══ Screenshot & Recording ═══

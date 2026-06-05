@@ -61,3 +61,29 @@ def test_zoom_is_not_disabled():
     html = _render()
     # WCAG 1.4.4: the viewport must not block user zoom.
     assert 'user-scalable=no' not in html
+
+
+def test_a11y_panel_sends_canonical_keys_and_reloads():
+    """The settings toggles must send the SERVER's canonical keys (the old code
+    derived the key from the label → sent reduce_motion / large_text, which the
+    server silently dropped), and reload so the render re-applies the state."""
+    html = _render()
+    assert "'High Contrast', 'high_contrast'," in html
+    assert "'Reduce Motion', 'reduced_motion'," in html
+    assert '.then(()=>location.reload())' in html
+
+
+def test_a11y_state_is_consumed_by_the_render():
+    """High-contrast / reduced-motion in the live a11y state apply as <html>
+    classes (the render previously never consumed the state at all)."""
+    import integrations.agent_engine.shell_os_apis as sapi
+    sapi._A11Y_SETTINGS.update({'high_contrast': True, 'reduced_motion': True})
+    try:
+        html = _render()
+        assert 'class="a11y-contrast a11y-rmotion"' in html
+        assert 'html.a11y-contrast{' in html
+        assert 'html.a11y-rmotion *' in html
+    finally:
+        sapi._A11Y_SETTINGS.update({'high_contrast': False, 'reduced_motion': False})
+    # ...and OFF emits no a11y class.
+    assert '<html lang="en" class="">' in _render()

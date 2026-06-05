@@ -135,6 +135,31 @@ def _classify_destructive(action_desc):
         return False  # fail-closed: deny if classifier unavailable
 
 
+# ── Live accessibility state ──
+# Module-level so the shell RENDER (liquid_ui_service.render_desktop_shell, same
+# process) reads the SAME dict the /api/shell/accessibility routes mutate. Seeded
+# from the NixOS declarative file at import; runtime PUTs override for the session.
+_A11Y_SETTINGS = {
+    'font_scale': 1.0,
+    'high_contrast': False,
+    'reduced_motion': False,
+    'large_cursor': False,
+    'screen_reader': False,
+    'sticky_keys': False,
+}
+try:
+    with open('/etc/hart/accessibility.json') as _a11y_f:
+        _A11Y_SETTINGS.update({k: v for k, v in json.load(_a11y_f).items()
+                               if k in _A11Y_SETTINGS})
+except (FileNotFoundError, json.JSONDecodeError, OSError):
+    pass
+
+
+def get_a11y_settings():
+    """Live accessibility state — read by both the API and the shell render."""
+    return dict(_A11Y_SETTINGS)
+
+
 def register_shell_os_routes(app):
     """Register all extended shell OS API routes on a Flask app."""
 
@@ -928,24 +953,12 @@ def register_shell_os_routes(app):
     # Accessibility
     # ═══════════════════════════════════════════════════════════
 
-    _a11y_settings = {
-        'font_scale': 1.0,
-        'high_contrast': False,
-        'reduced_motion': False,
-        'large_cursor': False,
-        'screen_reader': False,
-        'sticky_keys': False,
-    }
+    _a11y_settings = _A11Y_SETTINGS  # module-level shared state (see top of file)
 
     @app.route('/api/shell/accessibility', methods=['GET'])
     def shell_accessibility_get():
-        """Get current accessibility settings."""
-        # Try NixOS declarative config first
-        try:
-            with open('/etc/hart/accessibility.json') as f:
-                return jsonify(json.load(f))
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass
+        """Get current accessibility settings (live state — seeded from the NixOS
+        declarative file at import, plus any runtime PUT overrides)."""
         return jsonify(_a11y_settings)
 
     @app.route('/api/shell/accessibility', methods=['PUT'])
