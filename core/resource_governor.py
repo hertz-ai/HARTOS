@@ -567,6 +567,14 @@ class ResourceGovernor:
         self._running: bool = False
         self._lock = threading.Lock()
         self._cancel_event = threading.Event()  # instant wake/cancel for proactive
+        # Dedicated shutdown signal for the MONITOR loop's interval sleep. It
+        # must NOT share _cancel_event: that event is SET for the whole time the
+        # mode is ACTIVE/SLEEP (to keep the proactive thread backed off), so a
+        # monitor that slept on it would never block — it would busy-spin the
+        # expensive _refresh_cpu_attribution()/children() walk and peg a core
+        # (the 2026-06-05 "Nunba hung + no TTS" GIL-starvation incident). Only
+        # stop() sets this; the monitor always sleeps its full interval.
+        self._stop_event = threading.Event()
 
         # Prime psutil CPU counter (first call always returns 0.0)
         try:
@@ -655,6 +663,7 @@ class ResourceGovernor:
                 return
             self._running = True
             self._cancel_event.clear()
+            self._stop_event.clear()   # reset shutdown signal for (re)start
             self._stats['uptime_start'] = time.time()
 
         # Apply hard OS-level resource caps at startup
@@ -711,7 +720,8 @@ class ResourceGovernor:
                 return
             self._running = False
 
-        self._cancel_event.set()
+        self._cancel_event.set()   # wake the proactive thread for shutdown
+        self._stop_event.set()     # wake the monitor loop's interval sleep
 
         # Wait for threads to exit (bounded timeout)
         for t in (self._monitor_thread, self._proactive_thread):
@@ -902,14 +912,17 @@ class ResourceGovernor:
             except Exception as e:
                 logger.debug("ResourceGovernor monitor error: %s", e)
 
-            # Sleep for the monitor interval, but wake early if stopping
-            self._cancel_event.wait(timeout=_MONITOR_INTERVAL_SECONDS)
+            # Sleep the monitor interval. Wait on the DEDICATED _stop_event, NOT
+            # _cancel_event: the latter stays SET for the whole duration of
+            # ACTIVE/SLEEP (to keep the proactive thread backed off), so waiting
+            # on it here returned instantly every tick and busy-spun the
+            # expensive _refresh_cpu_attribution()/children() walk — pegging a
+            # core, starving the GIL, killing TTS (2026-06-05 hang). _stop_event
+            # is set only by stop(), so this blocks the full interval in normal
+            # operation. Mode transitions manage _cancel_event themselves.
+            self._stop_event.wait(timeout=_MONITOR_INTERVAL_SECONDS)
             if not self._running:
                 break
-            # If cancel_event was set by mode transition, clear it for proactive
-            # (only if we're not in a mode that should keep it set)
-            if self._mode == MODE_IDLE:
-                self._cancel_event.clear()
 
     # ── Platform-Specific Detection ───────────────────────────────
 
