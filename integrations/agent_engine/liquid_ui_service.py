@@ -518,6 +518,20 @@ class LiquidUIService:
             _a11y = {}
         a11y_cls = (('a11y-contrast ' if _a11y.get('high_contrast') else '')
                     + ('a11y-rmotion' if _a11y.get('reduced_motion') else '')).strip()
+        # font_scale: the shell type is px, so scale the font-size tokens directly
+        # via an override emitted after css_vars (later source wins). Clamped.
+        try:
+            _fs = max(0.8, min(2.0, float(_a11y.get('font_scale', 1.0) or 1.0)))
+        except (TypeError, ValueError):
+            _fs = 1.0
+        a11y_fontscale = ''
+        if abs(_fs - 1.0) > 0.01:
+            _af_f = theme.get('font', {}) if isinstance(theme, dict) else {}
+            _af_sh = theme.get('shell', {}) if isinstance(theme, dict) else {}
+            a11y_fontscale = (':root{'
+                + '--hart-font-size:' + str(round(_af_f.get('size', 13) * _fs)) + 'px;'
+                + '--hart-heading-size:' + str(round(_af_f.get('heading_size', 18) * _fs)) + 'px;'
+                + '--hart-icon-size:' + str(round(_af_sh.get('icon_size', 20) * _fs)) + 'px}')
 
         wallpaper = theme.get('wallpaper', {})
         wp_css = wallpaper.get('value', 'radial-gradient(120% 120% at 18% 0%,rgba(0,212,170,0.07),transparent 50%),radial-gradient(100% 100% at 100% 100%,rgba(22,33,62,0.55),transparent 60%),linear-gradient(135deg,#0F0E17 0%,#1a1a2e 50%,#16213e 100%)')
@@ -919,6 +933,7 @@ html.a11y-rmotion *,html.a11y-rmotion *::before,html.a11y-rmotion *::after{
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
 <style>
 {css_vars}
+{a11y_fontscale}
 *{{margin:0;padding:0;box-sizing:border-box}}
 ::selection{{background:var(--hart-accent);color:#fff}}
 html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-family),monospace;
@@ -2526,7 +2541,14 @@ function loadAccessibilityPanel(el) {{
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+label+'</div></div>'+
         '<label class="ds-switch"><input type="checkbox" role="switch" aria-label="'+label+'" '+(val?'checked':'')+' onchange="toggleA11y(\\''+key+'\\',this.checked)"><span class="ds-switch-slider"></span></label></div>';
     }});
-    if(data.font_scale) html += dsStatusRow('format_size', 'Font Scale', data.font_scale+'x', 'var(--hart-muted)');
+    const _fsv = data.font_scale || 1;
+    html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent" aria-hidden="true">format_size</span>'+
+      '<div class="ds-list-item-content"><div class="ds-list-item-primary">Font Scale</div></div>'+
+      '<div class="ds-flex ds-gap-2" style="align-items:center">'+
+        '<button class="ds-btn ds-btn-icon ds-btn-tonal" aria-label="Decrease font size" onclick="setFontScale('+_fsv+'-0.1)"><span class="mi material-icons-round" aria-hidden="true">remove</span></button>'+
+        '<span style="min-width:46px;text-align:center">'+Math.round(_fsv*100)+'%</span>'+
+        '<button class="ds-btn ds-btn-icon ds-btn-tonal" aria-label="Increase font size" onclick="setFontScale('+_fsv+'+0.1)"><span class="mi material-icons-round" aria-hidden="true">add</span></button>'+
+      '</div></div>';
     html += '</div></div>';
     el.innerHTML = html;
   }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Accessibility unavailable</div>'; }});
@@ -2538,6 +2560,11 @@ function toggleA11y(key,val) {{
   // applies the <html> class (high-contrast / reduced-motion). Same pattern the
   // theme switcher uses.
   fetch(SHELL+'/api/shell/accessibility',{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}})
+    .then(()=>location.reload()).catch(()=>{{}});
+}}
+function setFontScale(v) {{
+  v = Math.max(0.8, Math.min(2.0, Math.round(v*10)/10));
+  fetch(SHELL+'/api/shell/accessibility',{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{font_scale:v}})}})
     .then(()=>location.reload()).catch(()=>{{}});
 }}
 
