@@ -1520,7 +1520,7 @@ function updateTaskbar() {{
     const active = id===focusedPanel ? 'active' : '';
     const icon = info.icon || 'web_asset';
     const title = info.title || id;
-    return '<div class="taskbar-chip glass '+active+'" onclick="bringToFront(\''+id+'\')" title="'+title+'">' +
+    return '<div class="taskbar-chip glass '+active+'" onclick="taskbarClick(\''+id+'\')" title="'+title+'">' +
       '<span class="mi material-icons-round">'+icon+'</span>' +
       '<span class="chip-label">'+title+'</span></div>';
   }}).join('');
@@ -1774,6 +1774,16 @@ function bringToFront(id) {{
   updateTaskbar();
 }}
 
+// Taskbar chip click: clicking the FOCUSED window's chip minimizes it (the
+// Win11/macOS dock gesture); otherwise raise/un-minimize it. Was bringToFront-
+// only, so there was no way to minimize a window via the taskbar.
+function taskbarClick(id) {{
+  const p = panels[id];
+  if(!p) return;
+  if(id===focusedPanel && !p.min) {{ minimizePanel(id); }}
+  else {{ bringToFront(id); }}
+}}
+
 // ═══ Drag & Resize ═══
 let dragState = null;
 function startDrag(e, id) {{
@@ -1796,7 +1806,13 @@ document.addEventListener('mousemove', e=>{{
   const p = panels[dragState.id];
   if(!p) return;
   if(dragState.mode==='move') {{
-    const nx = dragState.ox+dx, ny = dragState.oy+dy;
+    // Clamp the titlebar on-screen — it could be dragged under the top bar,
+    // below the taskbar, or past a side until unreachable (window lost
+    // unrecoverably). Keep >=80px on each axis.
+    const KEEP=80, TOP=40, TASK=44;
+    let nx = dragState.ox+dx, ny = dragState.oy+dy;
+    nx = Math.min(Math.max(nx, KEEP - p.el.offsetWidth), window.innerWidth - KEEP);
+    ny = Math.min(Math.max(ny, TOP), window.innerHeight - TASK - 28);
     p.el.style.left = nx+'px'; p.el.style.top = ny+'px';
     p.x = nx; p.y = ny;
   }} else {{
@@ -3173,6 +3189,7 @@ const AC_CAPS = [
 let acMessages = [];
 let acActiveCap = 'chat';
 let acDragging = false;
+let acInit = false;
 let acDragOfs = {{x:0,y:0}};
 
 function initAssistantChat() {{
@@ -3184,10 +3201,14 @@ function initAssistantChat() {{
     '<span class="mi material-icons-round">'+c.icon+'</span>'+c.name+'</div>'
   ).join('');
 
-  // Drag support
+  // Drag support — bind the global mousemove/mouseup listeners ONCE. This fn runs
+  // on EVERY chat open, so without this guard each open added another live
+  // document listener (a growing perf leak on the low-end target).
+  if(acInit) return;
   const handle = document.getElementById('ac-drag-handle');
   const chat = document.getElementById('assistant-chat');
   if(!handle||!chat) return;
+  acInit = true;
   handle.addEventListener('mousedown', function(e) {{
     if(e.target.closest('.ac-btn')) return;
     acDragging = true;
@@ -3198,8 +3219,11 @@ function initAssistantChat() {{
   document.addEventListener('mousemove', function(e) {{
     if(!acDragging) return;
     const chat = document.getElementById('assistant-chat');
-    chat.style.left = (e.clientX - acDragOfs.x) + 'px';
-    chat.style.top = (e.clientY - acDragOfs.y) + 'px';
+    let nx = e.clientX - acDragOfs.x, ny = e.clientY - acDragOfs.y;
+    nx = Math.min(Math.max(nx, 8), window.innerWidth - 80);
+    ny = Math.min(Math.max(ny, 40), window.innerHeight - 80);
+    chat.style.left = nx + 'px';
+    chat.style.top = ny + 'px';
     chat.style.right = 'auto';
     chat.style.bottom = 'auto';
   }});
