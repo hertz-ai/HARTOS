@@ -702,6 +702,23 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
 .ds-slider::-moz-range-thumb{width:20px;height:20px;border-radius:50%;
   background:var(--hart-accent);cursor:pointer;border:none;box-shadow:var(--ds-elevation-1)}
 
+/* ── Toggle switch ── */
+/* Used by the a11y + startup panels (class was used but never defined, so the
+   switches rendered as a raw checkbox + empty span). The native <input> is
+   visually hidden but stays FOCUSABLE (not display:none, which drops tab order);
+   the .ds-switch-slider is its next sibling. */
+.ds-switch{display:inline-flex;align-items:center;cursor:pointer}
+.ds-switch input{position:absolute;width:1px;height:1px;opacity:0;margin:0}
+.ds-switch-slider{display:inline-block;width:38px;height:22px;border-radius:999px;
+  background:var(--ds-surface-3);position:relative;flex-shrink:0;
+  transition:background var(--ds-duration-short) var(--ds-ease-standard)}
+.ds-switch-slider::before{content:'';position:absolute;top:2px;left:2px;width:18px;height:18px;
+  border-radius:50%;background:#fff;box-shadow:var(--ds-elevation-1);
+  transition:transform var(--ds-duration-short) var(--ds-ease-spring)}
+.ds-switch input:checked + .ds-switch-slider{background:var(--hart-accent)}
+.ds-switch input:checked + .ds-switch-slider::before{transform:translateX(16px)}
+.ds-switch input:focus-visible + .ds-switch-slider{outline:2px solid var(--hart-accent);outline-offset:2px}
+
 /* ── Card ── */
 .ds-card{background:var(--hart-surface);border-radius:var(--ds-radius-md);
   padding:var(--ds-space-4);border:1px solid var(--hart-glass-border);
