@@ -303,6 +303,27 @@ in
   environment.gnome.excludePackages = with pkgs; [
     gnome-tour  # Disable first-run tour (HART has its own onboarding)
   ];
+  # ─── GDM greeter branding ───
+  # The login screen (first thing after Plymouth) was stock GNOME. Brand it: HART
+  # logo (raster PNG — the greeter doesn't render SVG reliably) + a banner + dark
+  # scheme. GDM reads its OWN dconf profile, separate from the user one below.
+  # disable-user-list is intentionally NOT set: the installer 'nixos' user is
+  # already hidden via uid<1000, and forcing the list off would also hide
+  # hart-admin. Additive — does not touch autologin or the kiosk session.
+  programs.dconf.profiles.gdm.databases = [{
+    settings = {
+      "org/gnome/login-screen" = {
+        logo = "${hartLogoPng}/logo.png";
+        banner-message-enable = true;
+        banner-message-text = "HART OS — Humans are always in control";
+      };
+      "org/gnome/desktop/interface" = {
+        color-scheme = "prefer-dark";
+        gtk-theme = "Adwaita-dark";
+      };
+    };
+  }];
+
   programs.dconf.profiles.user.databases = [{
     settings = {
       # ─── HART OS Branding ───
