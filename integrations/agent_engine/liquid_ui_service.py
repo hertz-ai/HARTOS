@@ -855,6 +855,21 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
 }
 '''
 
+        # Potato-only perf override, interpolated after the design system above and
+        # ONLY when is_potato. The design-system block hardcodes backdrop-filter on
+        # .ds-modal/.ds-toast and infinite skeleton/toast animations, none gated —
+        # on llvmpipe those re-rasterise a region every frame. Disable the blur (+
+        # opaque bg for legibility), stop the decorative animations, and honour the
+        # previously-dead potato `disable_shadows` intent by zeroing elevations.
+        # Plain string (literal CSS braces) → no f-string escaping pitfalls.
+        _CSS_POTATO_OVERRIDE = (
+            '.ds-modal,.ds-toast{backdrop-filter:none;-webkit-backdrop-filter:none;'
+            'background:var(--hart-surface)}'
+            ' .ds-skeleton{animation:none;background:var(--ds-surface-2)}'
+            ' .ds-toast-progress{animation:none}'
+            ' .ds-elevation-1,.ds-elevation-2,.ds-elevation-3,.ds-elevation-4,.ds-elevation-5{box-shadow:none}'
+        )
+
         return f'''<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -1028,7 +1043,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 /* ── Lock Screen ── */
 .lock-screen{{position:fixed;inset:0;z-index:9999;display:none;align-items:center;
   justify-content:center;flex-direction:column;gap:16px;
-  background:rgba(0,0,0,{'0.7);backdrop-filter:blur(40px)' if not is_potato else '0.9)'}}}
+  background:rgba(0,0,0,{'0.7);backdrop-filter:blur(24px)' if not is_potato else '0.9)'}}}
 .lock-screen.active{{display:flex}}
 .lock-clock{{font-size:64px;font-weight:300}}
 .lock-date{{font-size:16px;color:var(--hart-muted)}}
@@ -1073,6 +1088,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 /* ── Animations ── */
 {_CSS_ANIMATIONS if not is_potato else _CSS_NO_ANIMATIONS}
 {_CSS_DESIGN_SYSTEM}
+{_CSS_POTATO_OVERRIDE if is_potato else ''}
 </style>
 </head>
 <body>
