@@ -89,8 +89,7 @@ let
     # DMABUF renderer + GL compositing crash on a GL-less display, which is
     # exactly the first-boot / live-USB case. Disable both so a shell that
     # cannot paint never takes down the whole session.
-    export WEBKIT_DISABLE_DMABUF_RENDERER=1
-    export WEBKIT_DISABLE_COMPOSITING_MODE=1
+    ${lib.optionalString (!ui.preferHardwareGL) "export WEBKIT_DISABLE_DMABUF_RENDERER=1\nexport WEBKIT_DISABLE_COMPOSITING_MODE=1"}
     export HART_SHELL_URL="$URL"
     exec ${cfg.package.python}/bin/python -c "
 import gi, os
@@ -110,7 +109,7 @@ class GlassShell(Gtk.Window):
         # NEVER (not ALWAYS): a fresh ISO / live-USB / VM often has only
         # software GL (llvmpipe). Forcing GPU accel there crashes WebKitGTK and
         # takes down the shell session. Correctness/robustness over a few fps.
-        s.set_hardware_acceleration_policy(WebKit2.HardwareAccelerationPolicy.NEVER)
+        s.set_hardware_acceleration_policy(WebKit2.HardwareAccelerationPolicy.${if ui.preferHardwareGL then "ON_DEMAND" else "NEVER"})
         self.add(webview)
         self.connect('destroy', Gtk.main_quit)
         self.show_all()
@@ -134,7 +133,7 @@ Gtk.main()
   kioskLauncher = pkgs.writeShellScriptBin "hart-shell-session" ''
     export WLR_RENDERER_ALLOW_SOFTWARE=1
     export WLR_NO_HARDWARE_CURSORS=1
-    export LIBGL_ALWAYS_SOFTWARE=1
+    ${lib.optionalString (!ui.preferHardwareGL) "export LIBGL_ALWAYS_SOFTWARE=1"}
     exec ${pkgs.cage}/bin/cage -- ${glassShell}/bin/hart-glass-shell
   '';
 
@@ -209,6 +208,22 @@ in
       type = lib.types.enum [ "auto" "dark" "light" "high-contrast" ];
       default = "auto";
       description = "UI theme (auto follows system dark/light preference)";
+    };
+
+    preferHardwareGL = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Let the kiosk glass shell use HARDWARE GL acceleration (smoother glass
+        blur on llvmpipe-bound systems) instead of forcing Mesa software
+        rendering. DEFAULT FALSE — the forced-software path is what makes the
+        shell paint on ANY GPU including broken/flaky drivers (the nouveau-GSP
+        crash class #99-103 hardened against); with this off the kiosk is
+        byte-identical to before this option. Enable ONLY on hardware with a
+        known-good GPU driver: on a flaky GPU it re-introduces the WebKitGTK/cage
+        crash. This is the documented lever for the software-GL-vs-glass-perf
+        trade-off — robustness stays the default.
+      '';
     };
 
     contextRefreshMs = lib.mkOption {
