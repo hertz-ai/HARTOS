@@ -268,12 +268,16 @@ in
 
             # Detect NVIDIA
             if command -v nvidia-smi &>/dev/null; then
-              GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-              GPU_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | head -1)
+              # timeout: a wedged GPU/driver must NOT hang this Type=notify
+              # service before `systemd-notify --ready` below — that is the
+              # broken-GPU boot-failure class (mirrors hart-first-boot.nix).
+              # `|| true` keeps detection best-effort under `set -euo pipefail`.
+              GPU_NAME=$(${pkgs.coreutils}/bin/timeout 8 nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1) || true
+              GPU_VRAM=$(${pkgs.coreutils}/bin/timeout 8 nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null | head -1) || true
               echo "[HART OS GPU] NVIDIA: $GPU_NAME ($GPU_VRAM)"
 
               # Set compute mode to shared (multi-agent)
-              nvidia-smi -c EXCLUSIVE_PROCESS 2>/dev/null || true
+              ${pkgs.coreutils}/bin/timeout 8 nvidia-smi -c EXCLUSIVE_PROCESS 2>/dev/null || true
 
               # Reserve VRAM for display
               echo "[HART OS GPU] Reserved ${ai.gpu.reserveVRAM} for display"
@@ -299,7 +303,7 @@ in
               sleep 30
               # Health check: log GPU utilization
               if command -v nvidia-smi &>/dev/null; then
-                nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total \
+                ${pkgs.coreutils}/bin/timeout 8 nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total \
                   --format=csv,noheader 2>/dev/null || true
               fi
             done

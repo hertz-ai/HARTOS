@@ -185,9 +185,14 @@ in
 
             # NVIDIA: persistence mode + max clocks
             if command -v nvidia-smi >/dev/null 2>&1; then
-              nvidia-smi -pm 1 2>/dev/null || true
-              nvidia-smi --lock-gpu-clocks=$(nvidia-smi --query-gpu=clocks.max.graphics --format=csv,noheader,nounits | head -1) 2>/dev/null || true
-              nvidia-smi --lock-memory-clocks=$(nvidia-smi --query-gpu=clocks.max.memory --format=csv,noheader,nounits | head -1) 2>/dev/null || true
+              ${pkgs.coreutils}/bin/timeout 8 nvidia-smi -pm 1 2>/dev/null || true
+              # timeout the inner queries too: a wedged GPU/driver would
+              # otherwise hang this oneshot indefinitely (boot-blocking,
+              # broken-GPU class — same as hart-first-boot.nix / gpu-sched).
+              GFX_MAX=$(${pkgs.coreutils}/bin/timeout 8 nvidia-smi --query-gpu=clocks.max.graphics --format=csv,noheader,nounits 2>/dev/null | head -1) || true
+              ${pkgs.coreutils}/bin/timeout 8 nvidia-smi --lock-gpu-clocks="$GFX_MAX" 2>/dev/null || true
+              MEM_MAX=$(${pkgs.coreutils}/bin/timeout 8 nvidia-smi --query-gpu=clocks.max.memory --format=csv,noheader,nounits 2>/dev/null | head -1) || true
+              ${pkgs.coreutils}/bin/timeout 8 nvidia-smi --lock-memory-clocks="$MEM_MAX" 2>/dev/null || true
               echo "[HART Gaming] NVIDIA GPU clocks locked to max"
             fi
 

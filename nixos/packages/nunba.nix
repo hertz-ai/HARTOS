@@ -45,7 +45,7 @@ pkgs.stdenv.mkDerivation {
     mkdir -p "\$CACHE_DIR"
     if [ ! -x "\$APP" ]; then
       echo "Nunba: first run — downloading launcher from GitHub…" >&2
-      if ! ${pkgs.curl}/bin/curl -fL --retry 3 -o "\$APP" "${installerUrl}"; then
+      if ! ${pkgs.curl}/bin/curl -fL --retry 3 --connect-timeout 30 --speed-time 30 --speed-limit 2048 -o "\$APP" "${installerUrl}"; then
         echo "Nunba: download failed. See ${installerFallback}" >&2
         exit 1
       fi
