@@ -829,6 +829,25 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
   *,*::before,*::after{animation-duration:0.01ms!important;
     animation-iteration-count:1!important;transition-duration:0.01ms!important}
 }
+
+/* ── Material Icons: LOCAL + offline-safe ── */
+/* Every shell icon is <span class="mi material-icons-round">name</span>. The
+   Google <link> in <head> only defines this font family ONLINE, so a fresh
+   offline boot rendered literal ligature words ("lock","notifications"). Define
+   it locally with a fallback stack onto the BUNDLED fonts (material-icons →
+   "Material Icons", material-symbols → "Material Symbols *") plus the `liga`
+   feature that turns ligature names into glyphs. Ligature names are shared
+   across Material Icons/Symbols variants, so offline icons still render (filled
+   style) instead of text. Additive: "Material Icons Round" is still first, so
+   the online round render is unchanged. */
+.mi, .material-icons-round {
+  font-family: 'Material Icons Round', 'Material Icons', 'Material Symbols Rounded', 'Material Symbols Outlined';
+  font-weight: normal; font-style: normal; line-height: 1;
+  letter-spacing: normal; text-transform: none; white-space: nowrap;
+  word-wrap: normal; direction: ltr; display: inline-block;
+  -webkit-font-feature-settings: 'liga'; font-feature-settings: 'liga';
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+}
 '''
 
         return f'''<!DOCTYPE html>
