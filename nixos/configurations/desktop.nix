@@ -23,6 +23,33 @@ let
     mkdir -p $out
     rsvg-convert -w 320 -h 320 ${../branding/hart-logo.svg} -o $out/logo.png
   '';
+
+  # ─── Premium boot splash (opt-in) ──────────────────────────────────────
+  # DEFAULT FALSE — boot stays on NixOS's stock Plymouth theme with the HART
+  # logo swapped in (boot.plymouth.logo below), the combination proven on the
+  # #99-103 boot path. Flip to true for the custom HART theme (dark gradient +
+  # centered logo + LUKS message/password support) AFTER verifying it paints on
+  # a real ISO boot. The theme uses Plymouth's `script` plugin (framebuffer/KMS,
+  # no GL — safe on the same broken-GPU path the glass shell hardens for), so a
+  # bad GPU can't text-downgrade it. Off = byte-identical to the current boot.
+  useCustomBootSplash = false;
+
+  hartPlymouth = pkgs.runCommand "hart-plymouth-theme" { } ''
+    d=$out/share/plymouth/themes/hart
+    mkdir -p "$d"
+    cp ${hartLogoPng}/logo.png "$d/logo.png"
+    cp ${../branding/plymouth/hart.script} "$d/hart.script"
+    {
+      echo "[Plymouth Theme]"
+      echo "Name=HART OS"
+      echo "Description=HART OS boot splash"
+      echo "ModuleName=script"
+      echo ""
+      echo "[script]"
+      echo "ImageDir=$d"
+      echo "ScriptFile=$d/hart.script"
+    } > "$d/hart.plymouth"
+  '';
 in
 {
   imports = [
@@ -571,6 +598,11 @@ in
   boot.plymouth = {
     enable = lib.mkForce true;  # base installer-CD profile may also set this
     logo = lib.mkForce "${hartLogoPng}/logo.png";
+  } // lib.optionalAttrs useCustomBootSplash {
+    # Opt-in only (useCustomBootSplash above). Off ⇒ {} ⇒ this merge is a no-op
+    # and boot.plymouth is byte-identical to the proven stock-theme-plus-logo.
+    themePackages = [ hartPlymouth ];
+    theme = lib.mkForce "hart";
   };
   boot.kernelParams = [ "quiet" "splash" ];
 }
