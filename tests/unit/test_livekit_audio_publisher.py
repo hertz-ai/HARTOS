@@ -1,26 +1,28 @@
 """Behavioural tests for livekit_audio_publisher (#64 reply-audio publish half).
 
-Loads the module by file path (bypassing integrations.social/__init__, which is
-heavy) and monkeypatches its `livekit_rtc` with fakes, so the WHOLE publish path
-— connect → publish_track → push_pcm → resample → 10ms framing → capture_frame —
-is exercised WITHOUT the real native SDK installed. Mirrors the seam style of
-test_livekit_transcript_subscriber.py. No grep/source-shape assertions.
+Monkeypatches the module's `livekit_rtc` with fakes and injects fake room +
+source via the constructor seams, so the WHOLE publish path — connect →
+publish_track → push_pcm → resample → 10ms framing → capture_frame — is exercised
+WITHOUT the real native SDK. Mirrors test_livekit_transcript_subscriber.py's seam
+style; the shared lifecycle now lives in _livekit_room._LiveKitRoomThread. No
+grep/source-shape assertions.
 """
-import importlib.util
+from __future__ import annotations
+
 import os
+import sys
 import time
 import types
 
-_HERE = os.path.dirname(__file__)
-_MOD_PATH = os.path.normpath(os.path.join(
-    _HERE, '..', '..', 'integrations', 'social', 'livekit_audio_publisher.py'))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
-
-def _load_module():
-    spec = importlib.util.spec_from_file_location('lap_under_test', _MOD_PATH)
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    return m
+import integrations.social.livekit_audio_publisher as pubmod
+from integrations.social.livekit_audio_publisher import (
+    LiveKitAudioPublisher, _iter_frames,
+)
+from integrations.social._livekit_room import resample_pcm16, HAS_LIVEKIT_RTC
 
 
 # ── Fakes (a livekit.rtc stand-in) ──────────────────────────────────
@@ -90,33 +92,28 @@ def _wait(pred, timeout=4.0, step=0.05):
     return pred()
 
 
-# ── Pure helpers ────────────────────────────────────────────────────
+# ── Pure helpers (the shared resampler + the publish framing) ───────
 
 def test_iter_frames_chunks_and_zero_pads():
-    P = _load_module()
     # 10ms @ 48k mono = 480 samples = 960 bytes/frame.  2000 bytes → 3 frames,
     # last zero-padded to a full frame.
-    frames = list(P._iter_frames(b'\x01\x02' * 1000, 48000, 1, 10))
+    frames = list(_iter_frames(b'\x01\x02' * 1000, 48000, 1, 10))
     assert [len(f) for f in frames] == [960, 960, 960]
-    assert frames[-1].endswith(b'\x00')  # padding present
+    assert frames[-1].endswith(b'\x00')
 
 
 def test_resample_passthrough_and_upsample():
-    P = _load_module()
-    assert P._resample_pcm(b'ABCD', 48000, 1, 48000, 1) == b'ABCD'
-    up = P._resample_pcm(b'\x00\x01' * 240, 24000, 1, 48000, 1)
+    assert resample_pcm16(b'ABCD', 48000, 1, 48000, 1) == b'ABCD'
+    up = resample_pcm16(b'\x00\x01' * 240, 24000, 1, 48000, 1)
     assert len(up) > 240 * 2 * 1.5  # ~doubled going 24k→48k
 
 
-# ── Full publish path (fakes) ───────────────────────────────────────
+# ── Full publish path (fakes via the constructor seams) ─────────────
 
-def test_start_publishes_track_and_streams_frames():
-    P = _load_module()
-    P.HAS_LIVEKIT_RTC = True
-    P.livekit_rtc = _fake_rtc()
-
+def test_start_publishes_track_and_streams_frames(monkeypatch):
+    monkeypatch.setattr(pubmod, 'livekit_rtc', _fake_rtc())
     src = _FakeSource(48000, 1)
-    pub = P.LiveKitAudioPublisher(
+    pub = LiveKitAudioPublisher(
         'call1', 'ws://sfu', 'tok',
         room_factory=_FakeRoom,
         source_factory=lambda r, c: src,
@@ -138,34 +135,22 @@ def test_start_publishes_track_and_streams_frames():
     assert pub._room.disconnected is True
 
 
+def test_missing_fields_no_start(monkeypatch):
+    monkeypatch.setattr(pubmod, 'livekit_rtc', _fake_rtc())
+    # room_factory bypasses the lib-gate; missing required fields → no start.
+    assert LiveKitAudioPublisher('', 'ws://x', 't',
+                                 room_factory=_FakeRoom).start() is False
+    assert LiveKitAudioPublisher('c', '', 't',
+                                 room_factory=_FakeRoom).start() is False
+    assert LiveKitAudioPublisher('c', 'ws://x', '',
+                                 room_factory=_FakeRoom).start() is False
+
+
 def test_no_sdk_start_is_noop():
-    P = _load_module()
-    P.HAS_LIVEKIT_RTC = False
-    pub = P.LiveKitAudioPublisher('c', 'ws://x', 't')  # no room_factory
+    # The unit-test install set has no `livekit`, so HAS_LIVEKIT_RTC is False and
+    # start() (no room_factory) is a no-op — the bridge then logs the reply text.
+    assert HAS_LIVEKIT_RTC is False
+    pub = LiveKitAudioPublisher('c', 'ws://x', 't')
     assert pub.start() is False
     assert pub.is_alive() is False
-    # push before start is a safe no-op, never raises
     assert pub.push_pcm(b'\x00\x01' * 100, 24000, 1) is False
-
-
-def test_missing_fields_no_start():
-    P = _load_module()
-    P.HAS_LIVEKIT_RTC = True
-    P.livekit_rtc = _fake_rtc()
-    assert P.LiveKitAudioPublisher('', 'ws://x', 't',
-                                   room_factory=_FakeRoom).start() is False
-    assert P.LiveKitAudioPublisher('c', '', 't',
-                                   room_factory=_FakeRoom).start() is False
-    assert P.LiveKitAudioPublisher('c', 'ws://x', '',
-                                   room_factory=_FakeRoom).start() is False
-
-
-if __name__ == '__main__':
-    # Standalone runner (this box OOMs pytest).
-    fns = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
-    passed = 0
-    for fn in fns:
-        fn()
-        print('PASS', fn.__name__)
-        passed += 1
-    print(f'\n{passed}/{len(fns)} passed')

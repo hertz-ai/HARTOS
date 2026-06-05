@@ -12,26 +12,19 @@ recv (Producer A), LiveKit RTC (this module), RN mic stream (Producer
 C's direct caller) — funnels into the SAME per-call STT queue that
 ``agent_voice_bridge._tick`` drains.  No parallel paths.
 
-Lib gate:
-    The module is importable even when ``livekit-rtc`` is NOT
-    installed.  ``HAS_LIVEKIT_RTC`` is False in that case and
-    ``LiveKitTranscriptSubscriber.start()`` becomes a synchronous
-    no-op so today's bridge-worker behavior is preserved.
-
-Threading model:
-    ``livekit-rtc`` is asyncio-based.  We run an asyncio event loop
-    in a daemon thread (mirrors the existing ``start_stt_stream_
-    server`` pattern in ``whisper_tool``).  Each subscribed
-    ``RemoteAudioTrack`` spawns a per-track frame-consumer task that
-    pushes resampled PCM through a per-participant sync ``websockets``
-    client back into the local STT WS.  No new event loops in the
-    request hot path; ``stop()`` cleanly tears down both.
+Lib gate + threading:
+    Shares the daemon-thread / asyncio-loop / connect / teardown / resample
+    machinery with the publish half via ``_LiveKitRoomThread``
+    (``_livekit_room.py``).  ``HAS_LIVEKIT_RTC`` is False when ``livekit`` isn't
+    installed and ``start()`` becomes a no-op, so today's bridge-worker
+    behaviour is preserved.  Only the subscribe-specific bits live here: the
+    per-participant WS forwarders, the track-subscribe handler, and the
+    frame-consumer.
 
 Resampling:
     LiveKit publishes 48kHz s16le mono per audio frame (default RTC
-    config).  Some senders may publish at other rates — we use stdlib
-    ``audioop.ratecv`` to convert to 16kHz mono if needed.  When the
-    frame is already 16kHz mono we forward it as-is (zero-copy).
+    config).  Some senders may publish at other rates — ``_resample_to_16k_mono``
+    converts to 16kHz mono (via the shared ``resample_pcm16``) for the STT WS.
 """
 from __future__ import annotations
 
@@ -39,123 +32,58 @@ import logging
 import threading
 from typing import Any, Callable, Dict, Optional
 
+from integrations.social._livekit_room import (
+    _LiveKitRoomThread,
+    HAS_LIVEKIT_RTC,
+    livekit_rtc,
+    resample_pcm16,
+)
+
 logger = logging.getLogger(__name__)
-
-
-try:
-    from livekit import rtc as livekit_rtc  # type: ignore
-    HAS_LIVEKIT_RTC = True
-except Exception:
-    livekit_rtc = None  # type: ignore
-    HAS_LIVEKIT_RTC = False
 
 
 # Target STT-server format.
 _TARGET_RATE = 16000
 _TARGET_CHANNELS = 1
-_SAMPLE_WIDTH = 2  # s16le
 
 
 def _resample_to_16k_mono(pcm: bytes, src_rate: int,
                           src_channels: int) -> bytes:
-    """Convert arbitrary PCM16 to 16kHz mono.  Stdlib audioop, no
-    new dep.  Returns ``b''`` on any conversion error.
-    """
-    if not pcm:
-        return b''
-    if src_rate == _TARGET_RATE and src_channels == _TARGET_CHANNELS:
-        return pcm
-    try:
-        import audioop
-        if src_channels > 1:
-            pcm = audioop.tomono(pcm, _SAMPLE_WIDTH, 1.0, 1.0)
-        if src_rate != _TARGET_RATE:
-            pcm, _ = audioop.ratecv(
-                pcm, _SAMPLE_WIDTH, _TARGET_CHANNELS,
-                src_rate, _TARGET_RATE, None)
-        return pcm
-    except Exception as e:
-        logger.debug('livekit_transcript_subscriber: resample failed: %s', e)
-        return b''
+    """Convert arbitrary PCM16 to 16kHz mono for the STT WS — the shared
+    ``resample_pcm16`` with this module's fixed target.  Kept as a named
+    wrapper because callers + tests reference it directly."""
+    return resample_pcm16(pcm, src_rate, src_channels,
+                          _TARGET_RATE, _TARGET_CHANNELS)
 
 
-class LiveKitTranscriptSubscriber:
+class LiveKitTranscriptSubscriber(_LiveKitRoomThread):
     """One subscriber per (call_id, livekit_room).  Connects, listens,
     pipes PCM through the local STT WS, tears down on ``stop()``.
 
     Constructor seams allow tests to inject:
-      - ``room_factory``    : callable returning an awaitable Room-like
-                              object instead of importing livekit.
+      - ``room_factory``    : (base) callable returning a Room-like object.
       - ``ws_connect``      : sync WS connect callable; defaults to
                               ``websockets.sync.client.connect``.
       - ``stt_port_provider``: returns the local STT WS port; defaults
                               to ``whisper_tool.get_stt_stream_port``.
     """
 
+    _THREAD_PREFIX = 'livekit-transcript'
+
     def __init__(self, call_id: str, livekit_url: str, token: str,
                  room_factory: Optional[Callable[[], Any]] = None,
                  ws_connect: Optional[Callable[..., Any]] = None,
                  stt_port_provider: Optional[Callable[[], Optional[int]]] = None):
-        self.call_id = str(call_id) if call_id is not None else ''
-        self.livekit_url = livekit_url
-        self.token = token
-        self._room_factory = room_factory
+        super().__init__(call_id, livekit_url, token, room_factory)
         self._ws_connect = ws_connect
         self._stt_port_provider = stt_port_provider
         # Per-participant WS clients keyed by participant identity.
         self._ws_per_participant: Dict[str, Any] = {}
         self._lock = threading.Lock()
-        self._thread: Optional[threading.Thread] = None
-        self._stop_evt = threading.Event()
-        self._loop: Any = None  # asyncio.AbstractEventLoop, set in thread
-        self._room: Any = None
 
-    # ── Public API ──────────────────────────────────────────────
+    # ── base hook: close per-participant WS clients on teardown ──
 
-    def start(self) -> bool:
-        """Spawn the daemon thread + asyncio loop.  No-op (returns
-        False) when livekit-rtc isn't installed.  Returns True iff a
-        thread was started."""
-        if not HAS_LIVEKIT_RTC and self._room_factory is None:
-            logger.info(
-                'livekit_transcript_subscriber: livekit-rtc not '
-                'installed — start() is a no-op (call_id=%s)',
-                self.call_id)
-            return False
-        if self._thread is not None and self._thread.is_alive():
-            return True
-        if not self.call_id or not self.livekit_url or not self.token:
-            logger.warning(
-                'livekit_transcript_subscriber: missing required '
-                'fields (call_id=%r url=%r token=%r)',
-                self.call_id, self.livekit_url, bool(self.token))
-            return False
-        self._stop_evt.clear()
-        self._thread = threading.Thread(
-            target=self._run, daemon=True,
-            name=f'livekit-transcript-{self.call_id[:12]}',
-        )
-        self._thread.start()
-        return True
-
-    def stop(self) -> None:
-        """Signal the thread to tear down.  Idempotent."""
-        self._stop_evt.set()
-        # Schedule the room disconnect on the asyncio loop.
-        loop = self._loop
-        room = self._room
-        if loop is not None and room is not None:
-            try:
-                import asyncio as _asyncio
-                fut = _asyncio.run_coroutine_threadsafe(
-                    self._async_disconnect(room), loop)
-                try:
-                    fut.result(timeout=5)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        # Close any per-participant WS clients.
+    def _on_stop(self) -> None:
         with self._lock:
             wss = list(self._ws_per_participant.values())
             self._ws_per_participant.clear()
@@ -269,25 +197,7 @@ class LiveKitTranscriptSubscriber:
                 pass
             return False
 
-    # ── asyncio-side LiveKit subscription ──────────────────────
-
-    def _run(self) -> None:
-        try:
-            import asyncio
-        except Exception:
-            return
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._async_main())
-        except Exception as e:
-            logger.warning(
-                'livekit_transcript_subscriber: loop crashed: %s', e)
-        finally:
-            try:
-                self._loop.close()
-            except Exception:
-                pass
+    # ── asyncio-side LiveKit subscription (override) ────────────
 
     async def _async_main(self) -> None:
         room = self._make_room()
@@ -300,8 +210,7 @@ class LiveKitTranscriptSubscriber:
             room.on('track_subscribed', self._on_track_subscribed)
         except Exception as e:
             logger.debug(
-                'livekit_transcript_subscriber: on() unavailable: %s',
-                e)
+                'livekit_transcript_subscriber: on() unavailable: %s', e)
         try:
             await room.connect(self.livekit_url, self.token)
         except Exception as e:
@@ -313,36 +222,6 @@ class LiveKitTranscriptSubscriber:
         import asyncio as _asyncio
         while not self._stop_evt.is_set():
             await _asyncio.sleep(0.25)
-
-    async def _async_disconnect(self, room) -> None:
-        try:
-            disconnect = getattr(room, 'disconnect', None)
-            if disconnect is None:
-                return
-            res = disconnect()
-            if hasattr(res, '__await__'):
-                await res
-        except Exception:
-            pass
-
-    def _make_room(self) -> Any:
-        if self._room_factory is not None:
-            try:
-                return self._room_factory()
-            except Exception as e:
-                logger.warning(
-                    'livekit_transcript_subscriber: room_factory '
-                    'failed: %s', e)
-                return None
-        if not HAS_LIVEKIT_RTC:
-            return None
-        try:
-            return livekit_rtc.Room()  # type: ignore[union-attr]
-        except Exception as e:
-            logger.warning(
-                'livekit_transcript_subscriber: livekit_rtc.Room() '
-                'failed: %s', e)
-            return None
 
     def _on_track_subscribed(self, track, publication, participant) -> None:
         """LiveKit fires this synchronously on track-subscribe.  We
@@ -407,3 +286,7 @@ class LiveKitTranscriptSubscriber:
             logger.debug(
                 'livekit_transcript_subscriber: track stream ended '
                 '(%s): %s', participant_identity, e)
+
+
+__all__ = ['LiveKitTranscriptSubscriber', 'HAS_LIVEKIT_RTC',
+           '_resample_to_16k_mono']
