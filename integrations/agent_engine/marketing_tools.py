@@ -82,7 +82,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
 
     def create_social_post(
         title: Annotated[str, "Post title"],
-        content: Annotated[str, "Post content/body"],
+        content: Annotated[str, "Post content/body — write as one real person to another; never AI/marketing-speak (it gets scrolled past)"],
         community_id: Annotated[Optional[str], "Community to post in (optional)"] = None,
         media_url: Annotated[Optional[str], "URL of media attachment (optional)"] = None,
     ) -> str:
@@ -139,7 +139,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
 
     def create_ad(
         title: Annotated[str, "Ad title"],
-        content: Annotated[str, "Ad content/copy"],
+        content: Annotated[str, "Ad content/copy — write like a person recommending something real; never AI/marketing-speak"],
         target_url: Annotated[str, "URL the ad links to"],
         ad_type: Annotated[str, "Ad type: banner|sponsored|native"] = 'native',
         budget: Annotated[int, "Spark budget for this ad"] = 50,
@@ -170,7 +170,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
 
     def post_to_channel(
         channel: Annotated[str, "Channel name: twitter|instagram|email|discord|telegram|whatsapp|slack|linkedin|nostr|matrix"],
-        content: Annotated[str, "Content to post"],
+        content: Annotated[str, "Content to post — write as one real person to another; never AI/marketing-speak (it gets scrolled past)"],
         media_url: Annotated[Optional[str], "Media URL to include (optional)"] = None,
         extra_config: Annotated[Optional[str], "JSON string with channel-specific config (optional)"] = None,
     ) -> str:

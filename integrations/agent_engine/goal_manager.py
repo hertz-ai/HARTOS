@@ -538,6 +538,35 @@ def _get_platform_identity() -> str:
     )
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Human voice — the SINGLE source of "don't sound like AI" guidance, shared by
+# every builder that produces PUBLISHED text (marketing, content, news).  The
+# rule the user set: AI-sounding content is exactly what people scroll past and
+# discard, so HOW it reads matters more than what it says.  Kept deliberately
+# tight — the local ~4B model executes these prompts and a wall of rules hurts
+# its completion rate.  Import this; never re-state it inline (no parallel copy).
+HUMAN_VOICE_GUIDE = (
+    "HOW TO WRITE (this decides whether anyone reads it):\n"
+    "Write as ONE real person typing to another — not a brand, not an AI. "
+    "Text that reads like AI gets scrolled past and discarded; that is the "
+    "single biggest reason good work goes unseen. Earn the read:\n"
+    "- Open on one concrete, specific thing — a real moment, a number, a thing "
+    "that actually happened. Never a mission statement or a rhetorical question.\n"
+    "- Short sentences. Plain words. One idea per line. Cut every word that "
+    "isn't load-bearing.\n"
+    "- Ban the AI tells: no 'unlock', 'elevate', 'leverage', 'seamless', "
+    "'revolutionize', 'game-changer', 'transformative', 'robust', 'unleash', "
+    "'in today's world', 'dive in', 'the power of'. No em-dash-stuffed triplets, "
+    "no 'it's not just X, it's Y', no '\U0001F680 Exciting news!'.\n"
+    "- At most one emoji, only if it's natural. Zero to two hashtags, or none.\n"
+    "- A real, slightly imperfect opinion beats a polished, balanced summary. "
+    "Specific beats grand. Don't restate the vision — let people feel it through "
+    "ONE useful, true detail (a result, a tip they can use today).\n"
+    "- Last check before posting: would a real person say this out loud to a "
+    "friend? If not, rewrite it until they would.\n\n"
+)
+
+
 def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
     """Build a marketing agent prompt from goal + product data.
 
@@ -622,6 +651,7 @@ def _build_marketing_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
         f"{platform_identity}\n"
         f"{product_section}"
         f"{philosophy}"
+        f"{HUMAN_VOICE_GUIDE}"
         f"YOUR CURRENT GOAL:\n"
         f"  Title: {goal_dict['title']}\n"
         f"  Details: {goal_dict.get('description', '')}\n"
@@ -1045,7 +1075,8 @@ def _build_news_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> 
         f"- Include source attribution in every notification\n"
         f"- No clickbait, no sensationalism, no misinformation\n"
         f"- Diverse sources — don't rely on a single feed\n"
-        f"- For breaking news: push immediately regardless of frequency\n"
+        f"- For breaking news: push immediately regardless of frequency\n\n"
+        f"{HUMAN_VOICE_GUIDE}"
     )
 
 
