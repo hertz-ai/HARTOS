@@ -25,26 +25,7 @@ logger = logging.getLogger('hevolve_social')
 gamification_bp = Blueprint('gamification', __name__, url_prefix='/api/social')
 
 
-def _ok(data=None, meta=None, status=200):
-    r = {'success': True}
-    if data is not None:
-        r['data'] = data
-    if meta is not None:
-        r['meta'] = meta
-    return jsonify(r), status
-
-
-def _err(msg, status=400):
-    return jsonify({'success': False, 'error': msg}), status
-
-
-def _paginate(total, limit, offset):
-    return {'total': total, 'limit': limit, 'offset': offset,
-            'has_more': offset + limit < total}
-
-
-def _get_json():
-    return request.get_json(force=True, silent=True) or {}
+from .api_common import _ok, _err, _paginate, _get_json  # single-sourced (#97)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -61,6 +42,9 @@ def resonance_wallet_self():
             wallet = ResonanceService.get_or_create_wallet(db, g.user_id).to_dict()
             db.commit()
         return _ok(wallet)
+    except Exception:
+        db.rollback()  # was missing: a failed write closed a dirty session (#97)
+        raise
     finally:
         db.close()
 
@@ -178,6 +162,9 @@ def resonance_level_info():
         }
         db.commit()
         return _ok(info)
+    except Exception:
+        db.rollback()  # was missing: a failed write closed a dirty session (#97)
+        raise
     finally:
         db.close()
 
@@ -194,6 +181,9 @@ def resonance_streak():
             'streak_best': wallet.streak_best,
             'last_active_date': wallet.last_active_date,
         })
+    except Exception:
+        db.rollback()  # was missing: a failed write closed a dirty session (#97)
+        raise
     finally:
         db.close()
 

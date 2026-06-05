@@ -31,13 +31,101 @@ The master key is a kill switch for a distributed intelligence. It is not a deve
 
 You MAY read `security/master_key.py` to understand the public key verification flow. You MAY NOT interact with the private key in any way.
 
+## Branch Discipline — MAIN BRANCH ONLY (MANDATORY)
+
+**Work directly on `main` in the main clone.  Every session.  No exceptions.**
+
+- **Never** create, use, or resume a `claude/*` branch.
+- **Never** create or use a git worktree (`.claude/worktrees/*`).
+- **Never** operate inside a worktree directory — even if the Claude
+  Code harness boots you there.  Step out immediately and use
+  absolute paths to the main clone.
+- **All commits land on `main`.**  All pushes go to `origin/main`.
+
+Full protocol + session-start sanity check + violation log live in
+the user-memory file `memory/feedback_main_branch_only.md` (under
+`~/.claude/projects/.../memory/`).  Read it if you ever see a
+`claude/*` branch or `.claude/worktrees/` dir — that is a regression
+and must be reported to the user, not silently accepted.
+
+If the harness forces you into a worktree:
+1. Do NOT edit files inside the worktree.
+2. Use absolute paths in every `Edit`/`Write`/`Read` call so tools
+   act on the main clone (e.g.
+   `C:\Users\sathi\PycharmProjects\HARTOS\hart_intelligence_entry.py`).
+3. Prefix every `git` command with
+   `cd C:/Users/sathi/PycharmProjects/HARTOS && git …`
+   so git never defaults to the worktree's CWD.
+4. After session ends, the user deletes the filesystem leftovers:
+   `cmd /c "rd /s /q C:\Users\sathi\PycharmProjects\HARTOS\.claude\worktrees"`.
+
+Why this rule exists (2026-04-21 incident): the Nunba session was
+booted on `claude/determined-elbakyan-94a24c` in a worktree, leaving
+a stale branch and filesystem leftovers that polluted `git branch -a`
+and confused which copy of the code had the latest edits.  User
+called it out directly: parallel branches always drift, and the user
+should never need to ask "which one has my fix?" — the answer is
+always `main`.  HARTOS follows the same rule for the same reason.
+
+## Sibling Repos — Canonical Filesystem Paths
+
+These paths are load-bearing. Use them verbatim — guessing the
+wrong directory burns a turn (the user has called this out).
+Mobile lives under `StudioProjects/`, server/desktop under
+`PycharmProjects/`.
+
+### PycharmProjects/
+| Path | Role |
+|------|------|
+| `C:\Users\sathi\PycharmProjects\HARTOS` | **HART OS** — agentic runtime (Flask :6777), recipe pipeline, channels, social, security, peer_link. Branch: `main` only. |
+| `C:\Users\sathi\PycharmProjects\Nunba-HART-Companion` | **Nunba** — Windows/macOS/Linux desktop wrapper (cx_Freeze). Also hosts the **landing-page React web app** at `landing-page/` (same React tree for browser + desktop Liquid Glass Shell). |
+| `C:\Users\sathi\PycharmProjects\Hevolve_Database` | **Hevolve_Database** — canonical user/account store. Owns `User.FCMtoken`, capture endpoint `POST /update_fcm_token`, retrieval `GET /get_fcm_token/{user_id}`. |
+| `C:\Users\sathi\PycharmProjects\Hevolve` | **Hevolve web** — the hevolve.ai web product. |
+| `C:\Users\sathi\PycharmProjects\hevolveai` | **HevolveAI** — closed-source intelligence layer (Cython-compiled `.pyd`). All ML lives here; **HARTOS has no ML code**. |
+
+### StudioProjects/
+| Path | Role |
+|------|------|
+| `C:\Users\sathi\StudioProjects\Hevolve_React_Native` | **Hevolve_React_Native** — React Native shared by Android + iOS. ConsentOverlayService + native bridges (`android/app/src/main/java/...`, `ios/...`). |
+| `C:\Users\sathi\StudioProjects\Nunba-Companion-iOS` | **Nunba-Companion-iOS** — native iOS companion (Swift/ObjC). Pairs with Nunba desktop; separate from the RN app. |
+
+### Topology (messaging fan-out at a glance)
+```
+HARTOS publish_event('chat.social', …, user_id=X)
+  → WAMP topic com.hertzai.hevolve.social.{X}
+  → broadcast_sse_safe('notification', …, user_id=X)
+
+  Web (Nunba/landing-page)         ── SSE primary, WAMP fallback
+  Desktop (Nunba)                  ── same React tree, SSE
+  Android (Hevolve_React_Native)   ── WAMP (autobahn-js)
+  iOS    (Hevolve_React_Native)    ── WAMP
+  iOS    (Nunba-Companion-iOS)     ── separate native, pairs with desktop
+
+  Hevolve_Database                 ── token store only; no outbound push helper yet
+```
+
+### Gotchas (record so I stop repeating)
+- **Mindstory ≠ Hevolve mobile.** Mindstory (`PycharmProjects/Mindstory`) is the video-generation Android app. The actual mobile is `StudioProjects/Hevolve_React_Native`.
+- **Nunba ≠ Nunba-Companion-iOS.** Nunba is desktop (Win/macOS/Linux). Nunba-Companion-iOS is the iOS sidekick.
+- **landing-page is INSIDE Nunba-HART-Companion**, not a separate repo. Web changes → `Nunba-HART-Companion/landing-page/src/`.
+- Cross-repo grep template lives in `memory/reference_repo_layout.md`.
+
 ## Common Commands
+
+### Logs (where to look when debugging)
+| Path | Contents |
+|------|----------|
+| `~/Documents/Nunba/logs/frozen_debug.log` | Main Nunba + HARTOS log — timestamps, RequestIDs, httpx calls, SSE broadcasts, ToolMessageHandler's `=== FULL INPUT MESSAGES DEBUG ===` dumps (messages portion only — autogen attaches system_message + tools AFTER `transform_messages` runs, so this dump is the messages-only view) |
+| `~/Documents/Nunba/logs/llama_server_8082.log` | llama-server stdout/stderr — **with `--log-timestamps --verbose`** every request body, slot lifecycle, `task.n_tokens`, and `send_error` line (e.g. `Context size has been exceeded`, `request (N tokens) exceeds the available context size`) carries a `[HH:MM:SS.mmm]` prefix. Every HARTOS-side caller (autogen / langchain / dispatcher / probes) sets the OpenAI `user` field to the thread-local request_id, so each task line correlates 1:1 with the frozen_debug RequestID column. Authoritative for "what was sent + when + by whom + how big". |
+| `~/Documents/Nunba/logs/draft_decision.jsonl` | Per-request draft-model boot decisions (cohort, VRAM, active TTS, delegate verdict) |
+
+For ctx-overflow diagnosis: grep `llama_server_8082.log` for the `request (N tokens) exceeds` line, take the timestamp + `user=<request_id>`, find the same request_id in frozen_debug to trace back to the originating /chat turn.
 
 ### Setup
 ```bash
-# Requires Python 3.10 (pydantic 1.10.9 incompatible with 3.12+)
-python3.10 -m venv venv310
-source venv310/Scripts/activate  # Windows: venv310\Scripts\activate.bat
+# Requires Python 3.9+ (test env runs on 3.11; pydantic 2.9.2 supports 3.9-3.13).
+python3.11 -m venv venv311
+source venv311/Scripts/activate  # Windows: venv311\Scripts\activate.bat
 pip install -r requirements.txt
 ```
 
@@ -80,7 +168,7 @@ REUSE Mode:  User Input → Load Recipe → Execute Steps → Output (90% faster
 ### Key Files
 | File | Purpose |
 |------|---------|
-| `hart_intelligence_entry.py` | Flask entry point (port 6777, Waitress server) |
+| `hart_intelligence_entry.py` | Flask entry point (port 6777, Hypercorn ASGI primary; Waitress WSGI fallback on ImportError) |
 | `create_recipe.py` | Agent creation, action execution, recipe generation |
 | `reuse_recipe.py` | Recipe reuse, trained agent execution |
 | `helper.py` | Action class, JSON utilities, tool handlers |
@@ -99,6 +187,18 @@ prompts/{prompt_id}.json                    # Prompt definition
 prompts/{prompt_id}_{flow_id}_recipe.json   # Trained recipe
 prompts/{prompt_id}_{flow_id}_{action_id}.json  # Action recipes
 ```
+
+### Canonical Identifier Types — read once, never guess again
+
+| ID | Logical type | Wire / on-disk | Notes |
+|---|---|---|---|
+| `prompt_id` | **integer** (DB primary key) for human-created agents; **UUID string** for autonomous agents (coding agent, hive agents) | normalized to **string** when stamped on tasks / used as a dict key | one field, two real domains — typing it `int` would break autonomous agents |
+| `flow_id` | **integer**, monotonic from 0 per `prompt_id` | int | Sourced by `get_flow_number(user_id, prompt_id)` in reuse, `get_current_flow(user_prompt)` in create. Recipe filename `{prompt_id}_{flow_id}_recipe.json` keeps the two in lockstep. |
+| `action_id` | **integer**, restarts from 1 every flow | int | Flow-scoped — the `(flow_id, action_id)` tuple is the unique recipe coordinate within a session. Encoded in `task_id = f"action_{action_id}"`. |
+| `session_id` (execution instance id) | **string**, free-shaped by caller; canonical pattern `"{user_id}_{prompt_id}"`, also `"goal_abc"`, also full UUID for autonomous | stored verbatim, no coercion | **A new session_id is minted for every execution instance**: CREATE mode = first execution, REUSE mode = each subsequent execution. Same agent, many sessions over time. |
+| `agent_id` | mirrors `prompt_id`'s domain | always string (`str(prompt_id)` coercion in `create_ledger_from_actions`) | "agent_id == prompt_id" convention is load-bearing for dashboard grouping. |
+
+Dashboard hierarchy: `prompt_id → [session_id list, newest first] → flow_id → [action_id sorted ascending]`. Schema fields that encode this are `Task.recipe_prompt_id`, `Task.recipe_flow_id`, `Task.recipe_action_id`, stamped by `create_ledger_from_actions` and inherited by `add_dynamic_task` from sibling tasks. See `docs/architecture/TASK_LEDGER_GROUPING_FIX_PLAN.md` for the full design + helper API (`SmartLedger.list_grouped_by_recipe_hierarchy`).
 
 ### Integrations
 - `integrations/agent_engine/` - Unified agent goal engine, daemon, speculative dispatch
@@ -156,11 +256,12 @@ User Prompt
 
 ## Dependencies
 
-Critical pinned versions:
-- `langchain==0.0.230`
-- `pydantic==1.10.9` (requires Python 3.10)
+Critical pinned versions (post Apr/May 2026 split-package migration):
+- `langchain-classic==1.0.1` + `langchain-community==0.4.1` + `langchain-core==1.2.15` + `langchain-anthropic==1.0.0` + `langchain-text-splitters==1.1.1` + `langchain-google-genai==4.2.1` + `langchain-groq==1.1.2` (split packages — imports use `from langchain_classic.X` / `from langchain_community.X`)
+- `pydantic==2.9.2`
 - `autogen` (multi-agent framework)
 - `chromadb==0.3.23` (vector store)
+- `hypercorn` (primary ASGI server) + `waitress==2.1.2` (WSGI fallback)
 
 ---
 
@@ -302,6 +403,24 @@ Tests that belong in every refactor:
 - Behavioral test for the change's intent
 - Boundary test (ENOSPC, empty input, malformed input)
 - Regression test for any bug the change is fixing
+
+**NO GREP-BASED TESTS.**  A test must `import` the actual code,
+mock the boundary (DB, publisher, network, registry), call the
+real function, and assert observable side-effects (mock call args,
+return values, state mutations).  Tests like
+`assert "topic_name" in open(file).read()` or
+`assert idx_of_a < idx_of_b` for ordering checks are NOT tests —
+they only prove a string survived the commit.
+
+Source-shape guards (clearly-labelled `test_source_guard_*`) are
+acceptable ONLY for DRY enforcement across many files where a
+behavioural test for a single call site cannot catch the
+regression.  They must NEVER be the only test for an edit.
+
+Full rule + acceptable-vs-not table + JS / Java / Swift guidance:
+`memory/feedback_no_grep_tests.md` (auto-loaded via the index).
+The user surfaced this on 2026-05-26 — incident: 21 grep-tests
+passed while proving nothing about behaviour.
 
 ### Gate 6 — cx_Freeze Bundle Accounting (BLOCKING for new modules)
 

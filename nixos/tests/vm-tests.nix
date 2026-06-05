@@ -5,22 +5,51 @@
 # Uses NixOS's built-in testers.runNixOSTest framework.
 # Each test boots a real VM via QEMU and runs assertions.
 #
-# Run all tests:
-#   nix flake check
-#
-# Run a single test:
-#   nix build .#checks.x86_64-linux.hart-server-boot
-#
+# Run all tests:        nix flake check
+# Run a single test:    nix build .#checks.x86_64-linux.hart-server-boot
 # These tests take 5-15 minutes each (VM boot + assertions).
+#
+# #70 FIX — minimal test nodes (was: import the full ISO configs):
+#   The nodes used to `imports = hartModules ++ [ ../configurations/X.nix ]`.
+#   Each ISO config imports the NixOS installer-CD profile, which sets
+#   nixpkgs.overlays — and that collides with runNixOSTest's read-only
+#   node.pkgs ("nodes.X.nixpkgs.overlays defined multiple times"), so
+#   `nix flake check` could not even EVALUATE the checks and the whole ISO CI
+#   gate was blocked.  Gating the installer-CD import out cascaded into
+#   isoImage.* errors (that option is PROVIDED by the installer-CD profile).
+#   Fix per the recorded recipe: build the nodes from the hart modules alone
+#   with the variant enabled — the modules are variant-gated
+#   (hart-agent/hart-backend branch on cfg.variant), so {hart.enable;
+#   hart.variant} configures each variant's services without any installer-CD /
+#   isoImage machinery.  specialArgs (hartSrc) is passed to the inline nodes via
+#   `node.specialArgs` (the previously-missing wiring) so modules that consume
+#   it evaluate.  The `nix flake check --no-build` gate only needs the nodes to
+#   EVALUATE; the testScript assertions run in the (separate) build job.
 
 { pkgs, hartModules, specialArgs }:
 
 let
-  # Helper: create a test configuration with all hart modules
-  mkTestConfig = variant: extra: {
-    imports = hartModules ++ [
-      ../configurations/${variant}.nix
-    ] ++ extra;
+  # Minimal node: hart modules + variant, NO ../configurations/X.nix (and thus
+  # no installer-CD overlay collision).  `extra` carries per-test virtualisation
+  # / networking overrides.
+  # `extra` is imported as a module (NOT merged with //) so its nested attrs
+  # (e.g. networking.interfaces on the peer-discovery nodes) recursively merge
+  # with the base instead of clobbering networking.hostName.
+  mkNode = variant: extra: { pkgs, lib, hartSrc, ... }: {
+    imports = hartModules ++ [ extra ];
+    hart.enable = true;
+    hart.variant = variant;
+    hart.version = "0.0.0-test";
+    # hart.package has NO default (mkOption type=package, "set in variant
+    # config").  The full configs set it via callPackage hart-app.nix; the
+    # minimal node must too, else system.build.toplevel can't evaluate the
+    # hart-agent/backend/discovery services that read config.hart.package.
+    # `--no-build` only evaluates this derivation (it is not built here).
+    hart.package = pkgs.callPackage ../packages/hart-app.nix { inherit hartSrc; };
+    # hart-base sets networking.hostName = mkDefault "hart-node"; runNixOSTest
+    # also sets a default (the node name) -> two same-priority defaults conflict.
+    # Force a deterministic per-node value (tests address by IP, not hostname).
+    networking.hostName = lib.mkForce variant;
   };
 
 in
@@ -30,13 +59,9 @@ in
   # ─────────────────────────────────────────────────────────────
   hart-server-boot = pkgs.testers.runNixOSTest {
     name = "hart-server-boot";
+    node.specialArgs = specialArgs;
 
-    nodes.server = { config, pkgs, lib, ... }: {
-      imports = hartModules ++ [
-        ../configurations/server.nix
-      ];
-
-      # Override for test VM (less RAM, faster boot)
+    nodes.server = mkNode "server" {
       virtualisation = {
         memorySize = 2048;
         cores = 2;
@@ -44,9 +69,6 @@ in
           { from = "host"; host.port = 16777; guest.port = 6777; }
         ];
       };
-
-      # Provide specialArgs values for test
-      hart.version = "0.0.0-test";
     };
 
     testScript = ''
@@ -105,18 +127,13 @@ in
   # ─────────────────────────────────────────────────────────────
   hart-desktop-boot = pkgs.testers.runNixOSTest {
     name = "hart-desktop-boot";
+    node.specialArgs = specialArgs;
 
-    nodes.desktop = { config, pkgs, lib, ... }: {
-      imports = hartModules ++ [
-        ../configurations/desktop.nix
-      ];
-
+    nodes.desktop = mkNode "desktop" {
       virtualisation = {
         memorySize = 4096;
         cores = 2;
       };
-
-      hart.version = "0.0.0-test";
     };
 
     testScript = ''
@@ -128,6 +145,39 @@ in
 
       with subtest("Display manager starts (GNOME)"):
           desktop.wait_for_unit("display-manager.service", timeout=180)
+
+      # ── AI-native session services (regression guard for #99) ──
+      # These are all Type="notify" units whose ExecStart python does
+      # `import systemd.daemon; notify('READY=1')`. When systemd-python is
+      # missing from the hart python env the import raises, the process dies,
+      # and systemd kills the unit at TimeoutStartSec — so on a fresh ISO the
+      # bridge + LiquidUI server never come up (the originally-reported crash).
+      # Asserting they reach "active" fails on the broken build and passes once
+      # systemd-python is present.
+      with subtest("Model Bus service is active (Type=notify / systemd-python)"):
+          desktop.wait_for_unit("hart-model-bus.service", timeout=180)
+
+      with subtest("LiquidUI server is active (Type=notify / systemd-python)"):
+          desktop.wait_for_unit("hart-liquid-ui.service", timeout=180)
+
+      with subtest("App Bridge service is active (Type=notify / systemd-python)"):
+          desktop.wait_for_unit("hart-app-bridge.service", timeout=180)
+
+      # ── Android-on-Linux branding (regression guard for #101) ──
+      # The NixOS installer profile injects a normal `nixos` user that GDM
+      # would list on the greeter. It must be demoted to a hidden system
+      # account (uid < 1000) so HART OS never shows "nixos" at login.
+      with subtest("Installer 'nixos' user is hidden from the greeter"):
+          desktop.succeed("getent passwd nixos")                 # still defined
+          desktop.succeed('test "$(id -u nixos)" -lt 1000')      # but a system uid
+
+      # ── Glass-shell GI deps in the closure (regression guard for #99/#100) ──
+      # The cage glass shell does gi.require_version('Gtk','3.0')/('WebKit2',
+      # '4.1'); those typelibs must be built into the system so GI_TYPELIB_PATH
+      # can find them. (Full render is validated at real boot.)
+      with subtest("Glass-shell GI typelibs are present (Gtk-3.0 + WebKit2-4.1)"):
+          desktop.succeed("find /nix/store -name 'Gtk-3.0.typelib' -print -quit | grep -q .")
+          desktop.succeed("find /nix/store -name 'WebKit2-4.1.typelib' -print -quit | grep -q .")
 
       with subtest("Wine available (native Windows API)"):
           desktop.succeed("which wine64 || which wine")
@@ -157,18 +207,13 @@ in
   # ─────────────────────────────────────────────────────────────
   hart-edge-boot = pkgs.testers.runNixOSTest {
     name = "hart-edge-boot";
+    node.specialArgs = specialArgs;
 
-    nodes.edge = { config, pkgs, lib, ... }: {
-      imports = hartModules ++ [
-        ../configurations/edge.nix
-      ];
-
+    nodes.edge = mkNode "edge" {
       virtualisation = {
         memorySize = 1024;
         cores = 1;
       };
-
-      hart.version = "0.0.0-test";
     };
 
     testScript = ''
@@ -210,37 +255,24 @@ in
   # ─────────────────────────────────────────────────────────────
   hart-peer-discovery = pkgs.testers.runNixOSTest {
     name = "hart-peer-discovery";
+    node.specialArgs = specialArgs;
 
-    nodes.server = { config, pkgs, lib, ... }: {
-      imports = hartModules ++ [
-        ../configurations/server.nix
-      ];
-
+    nodes.server = mkNode "server" {
       virtualisation = {
         memorySize = 2048;
         cores = 1;
       };
-
-      hart.version = "0.0.0-test";
-
       # Both nodes share a virtual network
       networking.interfaces.eth1.ipv4.addresses = [
         { address = "192.168.1.1"; prefixLength = 24; }
       ];
     };
 
-    nodes.edge = { config, pkgs, lib, ... }: {
-      imports = hartModules ++ [
-        ../configurations/edge.nix
-      ];
-
+    nodes.edge = mkNode "edge" {
       virtualisation = {
         memorySize = 1024;
         cores = 1;
       };
-
-      hart.version = "0.0.0-test";
-
       networking.interfaces.eth1.ipv4.addresses = [
         { address = "192.168.1.2"; prefixLength = 24; }
       ];

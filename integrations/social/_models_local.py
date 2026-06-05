@@ -227,6 +227,11 @@ class Comment(Base):
     author_id = Column(String(64), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     parent_id = Column(String(64), ForeignKey('comments.id', ondelete='SET NULL'), nullable=True, index=True)
     content = Column(Text, nullable=False)
+    # #46: distinguish agent- vs human-authored comments post-hoc (author_id is
+    # the owning User either way); privacy=None inherits the post's privacy, a
+    # value overrides it.
+    agent_id = Column(String(64), nullable=True, index=True)
+    privacy = Column(String(16), nullable=True, index=True)
     upvotes = Column(Integer, default=0)
     downvotes = Column(Integer, default=0)
     score = Column(Integer, default=0)
@@ -250,6 +255,8 @@ class Comment(Base):
             'score': self.score, 'depth': self.depth,
             'is_deleted': self.is_deleted,
             'is_hidden': self.is_hidden or False,
+            'agent_id': self.agent_id,
+            'privacy': self.privacy,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
         if include_author and self.author:
@@ -381,6 +388,16 @@ class Notification(Base):
     target_id = Column(String(64), nullable=True)
     message = Column(Text, default='')
     is_read = Column(Boolean, default=False)
+    # P3b (2026-05-26): when the row was marked read (set by
+    # NotificationService.mark_read).  Null until the user explicitly
+    # marks read.  Enables "unread since X" analytics without a
+    # separate audit log.
+    read_at = Column(DateTime, nullable=True)
+    # P3b: when the row was dismissed (overlay timed out, swipe-away,
+    # etc.) rather than explicitly read.  Null until dismissed.  Lets
+    # the UI distinguish "user read it" from "user ignored it" without
+    # adding a third state to is_read.
+    dismissed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=func.now())
 
     user = relationship('User', back_populates='notifications')
@@ -391,6 +408,8 @@ class Notification(Base):
             'source_user_id': self.source_user_id,
             'target_type': self.target_type, 'target_id': self.target_id,
             'message': self.message, 'is_read': self.is_read,
+            'read_at': self.read_at.isoformat() if self.read_at else None,
+            'dismissed_at': self.dismissed_at.isoformat() if self.dismissed_at else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -3380,5 +3399,41 @@ class ChannelPresence(Base):
             'status': self.status,
             'last_heartbeat': self.last_heartbeat.isoformat() if self.last_heartbeat else None,
             'error_message': self.error_message,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class Event(Base):
+    """Omni-channel bridge Phase 3a (#64) — fallback mirror of sql.models.Event.
+    An event surfaced into Nunba from an external source (Discord scheduled event,
+    Meetup, .ics) or created manually.  Dedup on (source, source_event_id)."""
+    __tablename__ = 'events'
+    __table_args__ = (
+        UniqueConstraint('source', 'source_event_id', name='uq_event_source'),
+    )
+
+    id = Column(String(64), primary_key=True, default=_uuid)
+    title = Column(String(300), nullable=False)
+    description = Column(Text, default='')
+    start_time = Column(DateTime, nullable=True, index=True)
+    end_time = Column(DateTime, nullable=True)
+    location = Column(String(500), nullable=True)
+    url = Column(String(1000), nullable=True)
+    source = Column(String(40), nullable=False, index=True)   # discord|meetup|ics|manual
+    source_event_id = Column(String(200), nullable=True)
+    community_id = Column(String(64), nullable=True, index=True)
+    created_by = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'title': self.title, 'description': self.description,
+            'start_time': self.start_time.isoformat() if self.start_time else None,
+            'end_time': self.end_time.isoformat() if self.end_time else None,
+            'location': self.location, 'url': self.url,
+            'source': self.source, 'source_event_id': self.source_event_id,
+            'community_id': self.community_id, 'created_by': self.created_by,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }

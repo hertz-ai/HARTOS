@@ -303,6 +303,20 @@ def _decrypt_binary_to_tmpfs(enc_path: str) -> Optional[str]:
 
 _armor_install_tried = False
 _armor_install_ok = False
+_armor_finder = None  # the installed ArmoredFinder, so we can uninstall on fallback
+
+
+def _uninstall_armor() -> None:
+    """Remove the armored import hook (if any) so a bad/stale .enc bundle can
+    fall back to the plain on-disk hevolveai package.  Best-effort."""
+    global _armor_finder, _armor_install_ok
+    try:
+        from hevolvearmor._loader import uninstall_loader
+        uninstall_loader(_armor_finder)
+    except Exception:
+        pass
+    _armor_finder = None
+    _armor_install_ok = False
 
 
 def _try_install_hevolvearmor() -> Tuple[bool, str]:
@@ -324,7 +338,7 @@ def _try_install_hevolvearmor() -> Tuple[bool, str]:
 
     Returns (installed, message).
     """
-    global _armor_install_tried, _armor_install_ok
+    global _armor_install_tried, _armor_install_ok, _armor_finder
     if _armor_install_tried:
         return _armor_install_ok, 'armor install cached'
     _armor_install_tried = True
@@ -389,7 +403,14 @@ def _try_install_hevolvearmor() -> Tuple[bool, str]:
         return False, 'no usable armor decryption key'
 
     try:
-        hevolvearmor.install(modules_dir, bytes(key))
+        # Raw-key loader: our producer (scripts/armor_hevolveai.py) encrypts with
+        # a random 32-byte key stored in _key.bin, so install_loader(dir, raw_key)
+        # is the matching decryptor.  NOTE: hevolvearmor.install() takes a
+        # *passphrase string*, not a raw key — passing raw bytes there raises
+        # TypeError, which is why this path was silently failing before (the old
+        # call was hevolvearmor.install(modules_dir, bytes(key))).
+        from hevolvearmor._loader import install_loader
+        _armor_finder = install_loader(modules_dir, bytes(key))
         _armor_install_ok = True
         logger.info(
             f"[armor] HevolveArmor import hook installed: modules_dir={modules_dir}")
@@ -413,39 +434,62 @@ def _try_load_cython_package() -> Tuple[bool, str]:
     """
     global _cython_module, _native_available, _stub_mode, _load_method
 
-    # Install armor import hook first (no-op if already tried or absent).
-    _try_install_hevolvearmor()
+    # Install armor import hook first (no-op if already tried or absent).  When
+    # it succeeds, hevolveai imports resolve to the encrypted .enc bundle via the
+    # hook; when it fails / no bundle, the plain on-disk package loads instead.
+    armored, _armor_msg = _try_install_hevolvearmor()
 
     try:
         import hevolveai
-        # Verify it's actually compiled (not someone's source checkout)
-        mod_file = getattr(hevolveai, '__file__', '') or ''
-        # Compiled packages have __init__.cpython-*.so or __init__.pyd
-        # OR a minimal stub __init__.py that imports from compiled submodules
-        # Check for at least one compiled submodule
-        pkg_dir = os.path.dirname(mod_file)
-        if pkg_dir:
-            has_compiled = any(
-                f.endswith('.so') or f.endswith('.pyd')
-                for d, _, files in os.walk(pkg_dir)
-                for f in files
-                if '.cpython-' in f or f.endswith('.pyd')
-            )
-            if not has_compiled:
-                # This is a source checkout, not the compiled wheel
-                return False, 'hevolveai found but not Cython-compiled (source install)'
+        # Plain wheel only: verify it is actually Cython-compiled (.pyd/.so) and
+        # not a bare source checkout.  An ARMORED import has no .pyd on disk —
+        # the .enc bundle IS the protected compiled form — so skip this check.
+        if not armored:
+            mod_file = getattr(hevolveai, '__file__', '') or ''
+            pkg_dir = os.path.dirname(mod_file)
+            if pkg_dir:
+                has_compiled = any(
+                    f.endswith('.so') or f.endswith('.pyd')
+                    for d, _, files in os.walk(pkg_dir)
+                    for f in files
+                    if '.cpython-' in f or f.endswith('.pyd')
+                )
+                if not has_compiled:
+                    # This is a source checkout, not the compiled wheel
+                    return False, 'hevolveai found but not Cython-compiled (source install)'
 
         _cython_module = hevolveai
         _native_available = True
         _stub_mode = False
-        _load_method = 'cython'
+        _load_method = 'armored' if armored else 'cython'
         version = getattr(hevolveai, '__version__', 'unknown')
-        logger.info(f"Loaded HevolveAI Cython package v{version} from {mod_file}")
-        return True, f'Cython wheel loaded: {mod_file}'
+        mod_file = getattr(hevolveai, '__file__', '') or '<armored>'
+        logger.info(f"Loaded HevolveAI ({_load_method}) v{version} from {mod_file}")
+        return True, f'{_load_method} hevolveai loaded: {mod_file}'
 
-    except ImportError:
-        return False, 'hevolveai package not installed'
     except Exception as e:
+        # A bad/stale .enc bundle must NOT take down a build that the plain .pyd
+        # would have loaded fine: drop the armor hook and retry the on-disk
+        # package — exactly the pre-fix behaviour (zero-regression safety net).
+        if armored:
+            logger.warning(
+                "[armor] armored hevolveai import failed (%s); uninstalling hook "
+                "and retrying plain package", e)
+            _uninstall_armor()
+            for _m in [m for m in list(sys.modules)
+                       if m == 'hevolveai' or m.startswith('hevolveai.')]:
+                sys.modules.pop(_m, None)
+            try:
+                import hevolveai
+                _cython_module = hevolveai
+                _native_available = True
+                _stub_mode = False
+                _load_method = 'cython'
+                return True, f'plain hevolveai (armor fallback: {e})'
+            except Exception as e2:
+                return False, f'hevolveai import error (armor+plain): {e2}'
+        if isinstance(e, ImportError):
+            return False, 'hevolveai package not installed'
         return False, f'hevolveai import error: {e}'
 
 

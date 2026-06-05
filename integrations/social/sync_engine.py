@@ -264,6 +264,23 @@ class SyncEngine:
             db.add(user)
             logger.info(f"Sync: created user {user_id} from sync")
 
+        # Cache the centrally-registered FCM token DOWN into the local store,
+        # keyed by the SAME notification user_id (the UUID) the push path uses.
+        # Central (Hevolve_Database) owns User.FCMtoken; delivering it in this
+        # sync payload sidesteps the UUID<->account-number identity gap entirely
+        # — the token arrives already mapped to the local UUID, so the push path
+        # (send_fcm_push -> get_local_fcm_token(uuid)) resolves it without the
+        # fragile HARTOS->central pull-by-UUID that always missed (#90). No-op
+        # when the payload omits the token (older central nodes).
+        fcm_token = payload.get('fcm_token') or payload.get('FCMtoken')
+        if fcm_token:
+            try:
+                from core.fcm_sync import store_local_fcm_token
+                if store_local_fcm_token(user_id, fcm_token):
+                    logger.info(f"Sync: cached FCM token for user {user_id}")
+            except Exception as _e:
+                logger.debug(f"Sync: FCM token cache skipped for {user_id}: {_e}")
+
     @staticmethod
     def _handle_revoke_token(payload: dict):
         """Add a JTI to the local token blocklist."""

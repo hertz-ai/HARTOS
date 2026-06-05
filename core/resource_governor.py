@@ -55,9 +55,13 @@ logger = logging.getLogger(__name__)
 
 # Mode thresholds
 IDLE_THRESHOLD_SECONDS = 120        # 2 min of no input -> idle
-ACTIVE_CPU_LIMIT = 0.05             # 5% CPU max when user is active
-IDLE_CPU_LIMIT = 0.50               # 50% CPU max when idle
-SLEEP_CPU_LIMIT = 0.0               # Nothing when sleeping
+# CPU budget for HARTOS's OWN orchestration (NOT the model — llama-server is
+# always pinned to every core; see ResourceEnforcer._unrestrict_llm_affinity).
+# Single source: the advisory throttle AND the hard affinity cap both read these.
+# Env-tunable so the active/idle split can be adjusted without a code change.
+ACTIVE_CPU_LIMIT = float(os.environ.get('HEVOLVE_ACTIVE_CPU_LIMIT', '0.50'))  # at keyboard: usable
+IDLE_CPU_LIMIT = float(os.environ.get('HEVOLVE_IDLE_CPU_LIMIT', '0.80'))      # away: agents progress
+SLEEP_CPU_LIMIT = 0.0               # battery-critical: full stop (unchanged)
 
 # ── System buffer — always reserved for the rest of the OS ──
 SYSTEM_BUFFER_CPU_FRACTION = 0.25   # Reserve 25% CPU cores for OS
@@ -81,6 +85,59 @@ _MONITOR_INTERVAL_SECONDS = 5
 MODE_ACTIVE = 'active'
 MODE_IDLE = 'idle'
 MODE_SLEEP = 'sleep'
+
+# ── Load-based backoff thresholds ──
+# When the user is idle we still back off to ACTIVE if ANOTHER app is
+# loading the box (a render, a compile, a game) — but NOT for HARTOS's
+# own idle-compute work.  The decision uses EXTERNAL cpu (total minus
+# HARTOS's own process tree), so the flywheel/LLM raising CPU does not
+# make the governor throttle the very work it exists to run.
+#
+# Why this exists (2026-05-30 self-defeat loop): the monitor read TOTAL
+# system CPU, so when the user stepped away and the daemon's own LLM
+# work pushed CPU past LOAD_BACKOFF_CPU, the governor flipped to ACTIVE
+# (throttle 0.05) and should_yield_to_user() blocked every tick — the
+# flywheel halted the moment it started.  Measuring external CPU keeps
+# the "be polite to other apps" intent while letting an idle-compute
+# node actually contribute the spare cycles it was opted in to give.
+LOAD_BACKOFF_CPU = 0.85
+LOAD_BACKOFF_MEM = 0.90
+
+
+def _find_llm_pids() -> set:
+    """PIDs listening on the local LLM-server port(s) (llama-server).  SINGLE
+    source used by BOTH the governor's own-CPU attribution
+    (``_resolve_llm_server_pid``) and the enforcer's affinity exemption
+    (``_unrestrict_llm_affinity``), so they never drift on which process is
+    'the model'.  Empty set when psutil is unavailable or nothing is listening.
+    """
+    psutil = _try_import_psutil()
+    if psutil is None:
+        return set()
+    ports = set()
+    try:
+        from core.port_registry import get_port
+        ports.add(int(get_port('llm')))
+    except Exception:
+        pass
+    try:
+        from core.port_registry import get_local_llm_url
+        import re
+        m = re.search(r':(\d+)', get_local_llm_url() or '')
+        if m:
+            ports.add(int(m.group(1)))
+    except Exception:
+        pass
+    ports.update((8082, 8080))  # common llama-server defaults
+    pids = set()
+    try:
+        for c in psutil.net_connections(kind='inet'):
+            if (c.status == 'LISTEN' and c.laddr
+                    and c.laddr.port in ports and c.pid):
+                pids.add(c.pid)
+    except Exception:
+        pass
+    return pids
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -141,19 +198,25 @@ class ResourceEnforcer:
     def update_caps(self, mode: str):
         """Tighten or relax caps based on governor mode.
 
-        ACTIVE: tight (25% CPU, 50% RAM, no GPU)
-        IDLE:   relaxed (75% CPU, 75% RAM, GPU allowed)
-        SLEEP:  minimal (5% CPU, 25% RAM, no GPU)
+        ACTIVE: usable (50% CPU, 60% RAM, GPU visible) — Nunba stays responsive
+                while you use it; the model is exempt from the CPU cap entirely.
+        IDLE:   relaxed (80% CPU, 80% RAM, GPU) — agents make progress.
+        SLEEP:  minimal (5% CPU, 25% RAM, no GPU) — battery-critical only.
         """
         if not self._enforced:
             return
 
+        # CPU comes from the single-source limits above; the model is exempt
+        # (affinity), so these only bound OUR orchestration.  GPU stays VISIBLE
+        # when active — the model is the foreground work the user waits on, not
+        # a background hog to hide the GPU from (gpu_frac=0 → CUDA_VISIBLE_DEVICES='').
         caps = {
-            MODE_ACTIVE: (0.25, 0.50, 0.0),
-            MODE_IDLE:   (0.75, 0.75, 0.75),
-            MODE_SLEEP:  (0.05, 0.25, 0.0),
+            #            cpu,              ram,  gpu
+            MODE_ACTIVE: (ACTIVE_CPU_LIMIT, 0.60, 0.75),
+            MODE_IDLE:   (IDLE_CPU_LIMIT,   0.80, 0.90),
+            MODE_SLEEP:  (0.05,             0.25, 0.0),
         }
-        cpu_frac, ram_frac, gpu_frac = caps.get(mode, (0.50, 0.50, 0.0))
+        cpu_frac, ram_frac, gpu_frac = caps.get(mode, (IDLE_CPU_LIMIT, 0.50, 0.0))
 
         total_ram_gb = self._get_total_ram_gb()
         usable_ram_gb = max(0.5, total_ram_gb * ram_frac - SYSTEM_BUFFER_RAM_GB)
@@ -185,65 +248,78 @@ class ResourceEnforcer:
 
     def _enforce_cpu(self, cpu_fraction: float, usable_cores: int,
                      total_cores: int):
-        """Enforce CPU cap via Job Object (Windows) or cgroup (Linux)."""
+        """Limit HARTOS's OWN orchestration to ``usable_cores`` via CPU affinity
+        + BELOW_NORMAL priority — deliberately NOT a job-wide hard rate cap.
+
+        A Job Object CPU-rate cap throttles the WHOLE job, and llama-server is a
+        CHILD of this process (it inherits our Job Object), so a rate cap would
+        strangle the model — the foreground work the user is waiting on.
+        Per-process affinity bounds only our threads; the model is then pinned
+        back to EVERY core (_unrestrict_llm_affinity).  The Windows Job Object is
+        still used for the MEMORY ceiling, created ONCE and reused (not recreated
+        per mode flip, which on Windows accumulates to the most-restrictive cap).
+        """
         if sys.platform == 'win32':
-            self._enforce_cpu_windows(cpu_fraction)
+            self._ensure_job_windows()            # memory ceiling only; no CPU rate
         elif sys.platform == 'linux':
             self._enforce_cpu_linux(cpu_fraction, total_cores)
-        # macOS: no hard CPU cap, rely on nice priority + psutil affinity
+        # macOS: rely on BELOW_NORMAL nice + affinity below.
 
-        # CPU affinity: restrict to subset of cores
         psutil = _try_import_psutil()
         if psutil is not None:
             try:
                 p = psutil.Process()
                 available = list(range(total_cores))
-                # Use last N cores (leave first cores for OS/foreground)
+                # Use last N cores (leave the first cores for OS/foreground apps).
                 target = available[-usable_cores:] if usable_cores < total_cores else available
                 p.cpu_affinity(target)
-                logger.info("ResourceEnforcer: CPU affinity set to cores %s", target)
+                logger.info("ResourceEnforcer: CPU affinity = %d/%d cores %s",
+                            usable_cores, total_cores, target)
             except Exception as e:
                 logger.debug("ResourceEnforcer: CPU affinity failed: %s", e)
+        # The model is never core-restricted — pin it back to every core.
+        self._unrestrict_llm_affinity(total_cores)
 
-    def _enforce_cpu_windows(self, cpu_fraction: float):
-        """Windows: use Job Object CPU rate limit."""
+    def _ensure_job_windows(self):
+        """Create the process Job Object ONCE (idempotent) and assign this
+        process to it.  Used for the MEMORY ceiling only — there is deliberately
+        NO CPU-rate control, because the rate cap is job-wide and llama-server is
+        a child that would inherit it (see _enforce_cpu).  Reused across mode
+        changes; _enforce_ram_windows updates the memory limit on this same
+        handle.  Creating a fresh Job Object per mode flip (the old behaviour)
+        accumulated nested jobs on Windows, pinning the process at the
+        most-restrictive cap so 'relax to idle' silently never took effect.
+        """
+        if self._job_handle:
+            return
         try:
             kernel32 = ctypes.windll.kernel32
-
-            # CreateJobObjectW
             job = kernel32.CreateJobObjectW(None, None)
             if not job:
                 logger.debug("ResourceEnforcer: CreateJobObject failed")
                 return
-
-            # JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
-            # Enable CPU rate control with hard cap
-            class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
-                _fields_ = [
-                    ('ControlFlags', ctypes.c_ulong),
-                    ('Value', ctypes.c_ulong),  # Union, using CpuRate
-                ]
-
-            # JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x1
-            # JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x4
-            rate_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
-            rate_info.ControlFlags = 0x1 | 0x4  # Enable + Hard cap
-            # CpuRate is in units of 1/100th of a percent (100 = 1%)
-            rate_info.Value = max(100, int(cpu_fraction * 10000))
-
-            # SetInformationJobObject with JobObjectCpuRateControlInformation (15)
-            kernel32.SetInformationJobObject(
-                job, 15, ctypes.byref(rate_info), ctypes.sizeof(rate_info))
-
-            # Assign current process to the Job Object
-            kernel32.AssignProcessToJobObject(
-                job, kernel32.GetCurrentProcess())
-
+            kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess())
             self._job_handle = job
-            logger.info("ResourceEnforcer: Windows Job Object CPU rate = %.0f%%",
-                         cpu_fraction * 100)
+            logger.info("ResourceEnforcer: Job Object ready "
+                        "(memory ceiling; CPU governed by affinity, not a rate cap)")
         except Exception as e:
-            logger.debug("ResourceEnforcer: Windows Job Object failed: %s", e)
+            logger.debug("ResourceEnforcer: Job Object create failed: %s", e)
+
+    def _unrestrict_llm_affinity(self, total_cores: int):
+        """Pin llama-server to EVERY core.  The model is a child of this process
+        and would otherwise inherit the restricted affinity set we apply to our
+        own orchestration — but the model must never be core-starved; it is the
+        user's foreground request running on the GPU.  Best-effort; runs only on
+        a mode change."""
+        psutil = _try_import_psutil()
+        if psutil is None:
+            return
+        all_cores = list(range(total_cores))
+        for pid in _find_llm_pids():
+            try:
+                psutil.Process(pid).cpu_affinity(all_cores)
+            except Exception:
+                pass
 
     def _enforce_cpu_linux(self, cpu_fraction: float, total_cores: int):
         """Linux: use cgroup v2 cpu.max."""
@@ -491,6 +567,14 @@ class ResourceGovernor:
         self._running: bool = False
         self._lock = threading.Lock()
         self._cancel_event = threading.Event()  # instant wake/cancel for proactive
+        # Dedicated shutdown signal for the MONITOR loop's interval sleep. It
+        # must NOT share _cancel_event: that event is SET for the whole time the
+        # mode is ACTIVE/SLEEP (to keep the proactive thread backed off), so a
+        # monitor that slept on it would never block — it would busy-spin the
+        # expensive _refresh_cpu_attribution()/children() walk and peg a core
+        # (the 2026-06-05 "Nunba hung + no TTS" GIL-starvation incident). Only
+        # stop() sets this; the monitor always sleeps its full interval.
+        self._stop_event = threading.Event()
 
         # Prime psutil CPU counter (first call always returns 0.0)
         try:
@@ -511,6 +595,55 @@ class ResourceGovernor:
             'uptime_start': 0.0,
         }
 
+        # Managed subprocesses spawned by HARTOS (e.g. hevolveai server).
+        # Keyed by display name -> pid.  Visible in get_stats() so the
+        # monitor / dashboards account for the full HARTOS process tree
+        # instead of just the current process.
+        self._managed_subprocesses: dict = {}
+
+        # CPU attribution cache (refreshed once per monitor tick).  Splits
+        # total system CPU into HARTOS's own process tree vs everything
+        # else so load-based backoff reacts to OTHER apps, not our own
+        # idle-compute work.  get_throttle() reads these cached floats so
+        # the per-call hot path never walks the process tree.
+        self._own_proc_cache: dict = {}   # pid -> psutil.Process (kept across ticks for cpu_percent baseline)
+        self._cached_total_cpu: float = 0.0
+        self._cached_own_cpu: float = 0.0
+        self._cached_external_cpu: float = 0.0
+        self._cached_llm_pid = None       # llama-server pid, resolved by port (re-resolved when stale)
+        # Prime the main-process cpu_percent baseline so the first
+        # attribution tick returns a real own-CPU value (psutil's first
+        # cpu_percent(None) on a fresh handle always returns 0.0).
+        try:
+            import psutil as _ps
+            _main = _ps.Process(os.getpid())
+            _main.cpu_percent(None)
+            self._own_proc_cache[os.getpid()] = _main
+        except Exception:
+            pass
+
+    def register_subprocess(self, name: str, pid: int) -> None:
+        """Track a child process owned by HARTOS so the monitor accounts
+        for it.  Called by subsystem supervisors (e.g. hevolveai) right
+        after spawn.  Idempotent — re-registering the same name updates
+        the pid (covers supervisor restart loops).
+        """
+        if not name or not isinstance(pid, int) or pid <= 0:
+            return
+        with self._lock:
+            self._managed_subprocesses[name] = pid
+
+    def unregister_subprocess(self, name: str, pid: int) -> None:
+        """Untrack a child process — called after it exits.  Guards on
+        pid match so a stale unregister after restart doesn't clobber
+        the fresh PID."""
+        if not name:
+            return
+        with self._lock:
+            cur = self._managed_subprocesses.get(name)
+            if cur == pid:
+                self._managed_subprocesses.pop(name, None)
+
     # ── Lifecycle ─────────────────────────────────────────────────
 
     def start(self, defer_memory_limit: bool = False) -> None:
@@ -530,6 +663,7 @@ class ResourceGovernor:
                 return
             self._running = True
             self._cancel_event.clear()
+            self._stop_event.clear()   # reset shutdown signal for (re)start
             self._stats['uptime_start'] = time.time()
 
         # Apply hard OS-level resource caps at startup
@@ -586,7 +720,8 @@ class ResourceGovernor:
                 return
             self._running = False
 
-        self._cancel_event.set()
+        self._cancel_event.set()   # wake the proactive thread for shutdown
+        self._stop_event.set()     # wake the monitor loop's interval sleep
 
         # Wait for threads to exit (bounded timeout)
         for t in (self._monitor_thread, self._proactive_thread):
@@ -624,17 +759,16 @@ class ResourceGovernor:
         if mode == MODE_SLEEP:
             return False
 
-        if mode == MODE_ACTIVE:
-            # Active mode: only permit lightweight work
-            if resource in ('gpu', 'cpu_heavy', 'disk_heavy'):
-                return False
-            if resource == 'network_heavy':
-                return False
-            return True
-
-        # IDLE mode: allow most things
+        # GPU follows the gpu_allowed flag in BOTH active and idle — the model
+        # is foreground work the user waits on, never blocked just because the
+        # user is at the keyboard.  Politeness to other apps comes from CPU
+        # affinity + BELOW_NORMAL priority, not from refusing the GPU.
         if resource == 'gpu':
             return self._gpu_allowed
+        # Heavy disk / network BACKGROUND work still backs off in ACTIVE to stay
+        # polite; CPU is bounded by affinity, so cpu_heavy is fine either way.
+        if mode == MODE_ACTIVE and resource in ('disk_heavy', 'network_heavy'):
+            return False
         return True
 
     def report_user_activity(self) -> None:
@@ -650,10 +784,16 @@ class ResourceGovernor:
         """Return a copy of governor statistics for dashboards."""
         with self._lock:
             stats = dict(self._stats)
+            stats['managed_subprocesses'] = dict(self._managed_subprocesses)
         stats['mode'] = self._mode
         stats['throttle'] = self._calculate_throttle()
         stats['cpu_limit'] = self._cpu_limit
         stats['gpu_allowed'] = self._gpu_allowed
+        # CPU attribution (why the mode/throttle is what it is): total vs
+        # HARTOS's own tree vs external.  external is what drives backoff.
+        stats['cpu_total'] = round(self._cached_total_cpu, 3)
+        stats['cpu_own'] = round(self._cached_own_cpu, 3)
+        stats['cpu_external'] = round(self._cached_external_cpu, 3)
         return stats
 
     # ── Mode Transitions ──────────────────────────────────────────
@@ -669,8 +809,10 @@ class ResourceGovernor:
 
         if new_mode == MODE_ACTIVE:
             self._cpu_limit = ACTIVE_CPU_LIMIT
-            self._gpu_allowed = False
-            # Wake the cancel event so proactive stream backs off instantly
+            # GPU stays available — the model is the user's foreground request,
+            # not a background hog.  (Background proactive work still backs off
+            # immediately via the cancel event below.)
+            self._gpu_allowed = True
             self._cancel_event.set()
         elif new_mode == MODE_IDLE:
             self._cpu_limit = IDLE_CPU_LIMIT
@@ -708,6 +850,26 @@ class ResourceGovernor:
         except Exception:
             pass
 
+    def _target_mode_for(self, user_idle: bool, ext_cpu: float, mem: float,
+                         battery_level: float, on_battery: bool) -> str:
+        """Pure mode decision from sampled signals — no side effects, so
+        it is directly unit-testable.
+
+        ``ext_cpu`` is EXTERNAL cpu (total minus HARTOS's own process
+        tree).  Using external rather than total CPU here is the
+        2026-05-30 self-defeat fix: HARTOS's own idle-compute work no
+        longer counts as "system heavily loaded", so the flywheel can run
+        when the user is away instead of throttling itself the instant it
+        starts.  We still go ACTIVE when ANOTHER app loads the box.
+        """
+        if on_battery and battery_level < BATTERY_SLEEP_THRESHOLD:
+            return MODE_SLEEP            # critical battery → suspend
+        if not user_idle:
+            return MODE_ACTIVE           # user at the keyboard → yield to them
+        if ext_cpu > LOAD_BACKOFF_CPU or mem > LOAD_BACKOFF_MEM:
+            return MODE_ACTIVE           # OTHER apps / memory pressure → be polite
+        return MODE_IDLE                 # user away, only our own work (if any)
+
     # ── Monitor Loop ──────────────────────────────────────────────
 
     def _monitor_loop(self) -> None:
@@ -726,29 +888,22 @@ class ResourceGovernor:
             except Exception:
                 pass
             try:
-                cpu = self._get_cpu_usage()
+                # Refresh CPU attribution once per tick (total / own /
+                # external) so this decision AND get_throttle() share one
+                # process-tree walk via the cache.
+                self._refresh_cpu_attribution()
                 mem = self._get_memory_pressure()
                 user_idle = self._detect_user_idle()
                 battery_level, on_battery = self._get_battery_status()
+                ext_cpu = self._cached_external_cpu
 
-                # Decision tree
-                if on_battery and battery_level < BATTERY_SLEEP_THRESHOLD:
-                    # Critical battery: force sleep
-                    self._transition_to(MODE_SLEEP)
-                elif not user_idle:
-                    # User is active
-                    self._transition_to(MODE_ACTIVE)
-                elif cpu > 0.85 or mem > 0.90:
-                    # System is heavily loaded even though user is idle
-                    # (e.g., background renders, compiles) — stay conservative
-                    self._transition_to(MODE_ACTIVE)
-                elif on_battery and battery_level < BATTERY_THROTTLE_THRESHOLD:
-                    # Low battery: allow idle work but keep it light
-                    self._transition_to(MODE_IDLE)
-                    self._cpu_limit = IDLE_CPU_LIMIT * 0.5  # half the idle budget
-                else:
-                    # User idle, system not overloaded, power is fine
-                    self._transition_to(MODE_IDLE)
+                target = self._target_mode_for(
+                    user_idle, ext_cpu, mem, battery_level, on_battery)
+                self._transition_to(target)
+                # Low-battery-but-not-critical: stay IDLE but on half budget.
+                if (target == MODE_IDLE and on_battery
+                        and battery_level < BATTERY_THROTTLE_THRESHOLD):
+                    self._cpu_limit = IDLE_CPU_LIMIT * 0.5
 
                 # Update GPU allowance based on VRAM availability
                 if self._mode == MODE_IDLE:
@@ -757,14 +912,17 @@ class ResourceGovernor:
             except Exception as e:
                 logger.debug("ResourceGovernor monitor error: %s", e)
 
-            # Sleep for the monitor interval, but wake early if stopping
-            self._cancel_event.wait(timeout=_MONITOR_INTERVAL_SECONDS)
+            # Sleep the monitor interval. Wait on the DEDICATED _stop_event, NOT
+            # _cancel_event: the latter stays SET for the whole duration of
+            # ACTIVE/SLEEP (to keep the proactive thread backed off), so waiting
+            # on it here returned instantly every tick and busy-spun the
+            # expensive _refresh_cpu_attribution()/children() walk — pegging a
+            # core, starving the GIL, killing TTS (2026-06-05 hang). _stop_event
+            # is set only by stop(), so this blocks the full interval in normal
+            # operation. Mode transitions manage _cancel_event themselves.
+            self._stop_event.wait(timeout=_MONITOR_INTERVAL_SECONDS)
             if not self._running:
                 break
-            # If cancel_event was set by mode transition, clear it for proactive
-            # (only if we're not in a mode that should keep it set)
-            if self._mode == MODE_IDLE:
-                self._cancel_event.clear()
 
     # ── Platform-Specific Detection ───────────────────────────────
 
@@ -877,6 +1035,153 @@ class ResourceGovernor:
 
         # Windows fallback without psutil: assume moderate usage
         return 0.3
+
+    def _get_own_cpu_usage(self) -> float:
+        """Fraction (0..1 of total capacity) consumed by HARTOS's OWN
+        process tree: this process + its children + every registered
+        managed subprocess (llama-server, hevolveai, …) + their children.
+
+        Used to compute EXTERNAL cpu for load-based backoff so the
+        governor never treats HARTOS's own idle-compute work as a reason
+        to throttle itself (the 2026-05-30 self-defeat loop).  Process
+        handles are cached across ticks because psutil's
+        ``cpu_percent(None)`` needs a prior call to establish its delta
+        baseline.  Bounded walk (own tree only) — never a full
+        ``process_iter``.  Returns 0.0 when psutil is unavailable, which
+        makes external==total (conservative: backs off as before).
+        """
+        psutil = _try_import_psutil()
+        if psutil is None:
+            return 0.0
+        try:
+            ncpu = psutil.cpu_count() or 1
+        except Exception:
+            ncpu = 1
+
+        own_pids = set()
+        # Main process tree.
+        try:
+            main = self._own_proc_cache.get(os.getpid())
+            if main is None:
+                main = psutil.Process(os.getpid())
+                main.cpu_percent(None)  # prime baseline
+                self._own_proc_cache[os.getpid()] = main
+            own_pids.add(os.getpid())
+            for child in main.children(recursive=True):
+                own_pids.add(child.pid)
+        except Exception:
+            pass
+        # Registered managed-subprocess trees (hevolveai…) PLUS the
+        # llama-server resolved by port.  llama-server is NOT spawned by
+        # HARTOS (it's a configured endpoint) so it's never
+        # register_subprocess'd — but the agent daemon's inference IS
+        # HARTOS's own work.  Without counting it as own, its inference CPU
+        # reads as a foreign app and trips both the governor backoff AND
+        # model_lifecycle pressure → the yield gate flaps and no goal ever
+        # completes a tick (2026-05-31 idle-hour: 0 executions).
+        with self._lock:
+            managed = list(self._managed_subprocesses.values())
+        _llm_pid = self._resolve_llm_server_pid()
+        if _llm_pid and _llm_pid not in managed:
+            managed.append(_llm_pid)
+        for pid in managed:
+            try:
+                proc = self._own_proc_cache.get(pid)
+                if proc is None:
+                    proc = psutil.Process(pid)
+                    proc.cpu_percent(None)  # prime baseline
+                    self._own_proc_cache[pid] = proc
+                own_pids.add(pid)
+                for child in proc.children(recursive=True):
+                    own_pids.add(child.pid)
+            except Exception:
+                self._own_proc_cache.pop(pid, None)
+
+        total_pct = 0.0
+        for pid in own_pids:
+            proc = self._own_proc_cache.get(pid)
+            if proc is None:
+                try:
+                    proc = psutil.Process(pid)
+                    proc.cpu_percent(None)  # prime; contributes 0 this tick
+                    self._own_proc_cache[pid] = proc
+                    continue
+                except Exception:
+                    continue
+            try:
+                total_pct += proc.cpu_percent(None)  # since last call (~tick)
+            except Exception:
+                self._own_proc_cache.pop(pid, None)
+        # Prune handles for pids no longer in our tree (bounds cache size).
+        for pid in list(self._own_proc_cache.keys()):
+            if pid not in own_pids and pid != os.getpid():
+                self._own_proc_cache.pop(pid, None)
+
+        # Process.cpu_percent() sums across cores (can exceed 100); divide
+        # by core count to get the same 0..1 fraction _get_cpu_usage uses.
+        own_frac = (total_pct / 100.0) / ncpu
+        return max(0.0, min(1.0, own_frac))
+
+    def _refresh_cpu_attribution(self) -> None:
+        """Refresh cached total / own / external CPU.  Called once per
+        monitor tick so ``get_throttle()`` reads cheap cached floats
+        instead of walking the process tree on every call."""
+        total = self._get_cpu_usage()
+        own = self._get_own_cpu_usage()
+        self._cached_total_cpu = total
+        self._cached_own_cpu = own
+        self._cached_external_cpu = max(0.0, total - own)
+
+    def _external_cpu_for_throttle(self) -> float:
+        """External (non-HARTOS) CPU fraction for throttle scaling.
+
+        Falls back to total CPU when attribution hasn't run yet (governor
+        not started / first tick) so the pre-start default stays
+        conservative rather than optimistically 0.
+        """
+        if self._cached_total_cpu > 0.0:
+            return self._cached_external_cpu
+        return self._get_cpu_usage()
+
+    def get_external_cpu_fraction(self):
+        """External (non-HARTOS) CPU fraction 0..1 — the SINGLE source other
+        subsystems should consult instead of raw ``psutil.cpu_percent`` so
+        HARTOS's own LLM/daemon work is excluded from "is the system
+        overloaded" decisions (e.g. ``model_lifecycle._calculate_throttle_
+        factor`` → the model_pressure yield-gate reason).  Returns ``None``
+        before the first monitor tick has populated the cache — callers
+        must fall back to total CPU in that window.
+        """
+        if self._cached_total_cpu > 0.0:
+            return self._cached_external_cpu
+        return None
+
+    def _resolve_llm_server_pid(self):
+        """PID of the local LLM server (llama-server), resolved by the TCP
+        port it listens on.  HARTOS does not spawn llama-server, so it's
+        never ``register_subprocess``'d — this is how its CPU gets
+        attributed to HARTOS's own work.  Cached: re-resolves only when the
+        cached pid has exited (the per-tick fast path is a cheap
+        ``pid_exists``).  Returns ``None`` when psutil is unavailable or no
+        listener is found (degrades to "llama counts as external", i.e. the
+        pre-fix conservative behaviour)."""
+        psutil = _try_import_psutil()
+        if psutil is None:
+            return None
+        cached = self._cached_llm_pid
+        if cached is not None:
+            try:
+                if psutil.pid_exists(cached):
+                    return cached
+            except Exception:
+                pass
+            self._cached_llm_pid = None
+            self._own_proc_cache.pop(cached, None)
+        # Resolve via the shared port-scan (single source — _find_llm_pids).
+        for pid in _find_llm_pids():
+            self._cached_llm_pid = pid
+            return pid
+        return None
 
     def _get_memory_pressure(self) -> float:
         """Get memory pressure as a float 0.0 to 1.0.
@@ -1008,8 +1313,11 @@ class ResourceGovernor:
         if mode == MODE_ACTIVE:
             return ACTIVE_CPU_LIMIT  # 0.05
 
-        # IDLE mode — scale based on current resource usage
-        cpu = self._get_cpu_usage()
+        # IDLE mode — scale based on current resource usage.  Use EXTERNAL
+        # cpu (total - HARTOS's own tree): scaling on total here would make
+        # the daemon's own work drop its own throttle below should_yield's
+        # 0.3 gate, halting the flywheel it just started (2026-05-30 loop).
+        cpu = self._external_cpu_for_throttle()
         mem = self._get_memory_pressure()
 
         throttle = 1.0
@@ -1066,9 +1374,16 @@ class ResourceGovernor:
                     _wd.heartbeat('resource_governor_proactive')
             except Exception:
                 pass
-            # Sleep in short increments, checking cancel event
-            # Wait returns True if the event is set (cancel requested)
-            cancelled = self._cancel_event.wait(timeout=5.0)
+            # Sleep the proactive interval. Wait on the DEDICATED _stop_event,
+            # NOT _cancel_event: the latter is SET for the whole duration of
+            # ACTIVE/SLEEP (to signal "stop proactive work"), so waiting on it
+            # here returned instantly every iteration and busy-spun the loop
+            # (watchdog heartbeat + 4 _jitter() calls) on a core — exactly while
+            # the user is active (2026-06-05 hang, the sibling of the monitor
+            # busy-spin). _stop_event is set only by stop(); the _mode != IDLE
+            # check below still suppresses proactive work while ACTIVE, and
+            # in-flight proactive tasks still abort via _cancel_event.
+            self._stop_event.wait(timeout=5.0)
 
             if not self._running:
                 break

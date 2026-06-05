@@ -21,12 +21,35 @@ let
     # Cryptography (Ed25519 identity, signing)
     cryptography
 
+    # systemd integration — REQUIRED by every Type="notify" service
+    # (hart-liquid-ui, hart-app-bridge, hart-model-bus). Their ExecStart
+    # Python does `import systemd.daemon; systemd.daemon.notify('READY=1')`.
+    # Without this the import raises ModuleNotFoundError, the process dies,
+    # and systemd kills the unit at TimeoutStartSec — i.e. the LiquidUI server
+    # and the app bridge never come up on a fresh ISO boot.
+    systemd
+
+    # GObject introspection (`import gi`) — REQUIRED by the LiquidUI glass
+    # shell (cage kiosk client). It does `import gi; gi.require_version('Gtk',
+    # '3.0'); gi.require_version('WebKit2','4.1')`. Missing pygobject3 crashes
+    # the shell window → cage exits → the greeter falls back to GDM (which then
+    # leaks the installer 'nixos' user). The GI *typelibs* (Gtk/WebKit2) are
+    # put on GI_TYPELIB_PATH by hart-liquid-ui.nix's glassShell wrapper.
+    pygobject3
+
     # LangChain ecosystem
     # langchain  # Pinned version; available in nixpkgs or via pip2nix
 
     # ML / AI
     numpy
     pillow
+
+    # System metrics — LiquidUI's /api/shell/system/metrics (the CPU/RAM/disk
+    # context that IS the adaptive shell's value: "explains WHY the GPU is
+    # busy"). Imported lazily + guarded, so its absence only silently degrades
+    # the dashboard rather than crashing the service — exactly the kind of
+    # quietly-broken feature that hides without this.
+    psutil
 
     # Utilities
     python-dateutil

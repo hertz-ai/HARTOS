@@ -113,16 +113,20 @@ async def async_main(urls):
 # Native web crawler (in-process, no HTTP API needed)
 
 # --- Path traversal protection for prompt file access ---
-# Frozen builds install to Program Files (read-only) — redirect to user data dir
-if getattr(sys, 'frozen', False):
-    try:
-        from core.platform_paths import get_prompts_dir
-        PROMPTS_DIR = os.path.abspath(get_prompts_dir())
-    except ImportError:
+# Recipe SAVE dir — the SINGLE deployment-aware resolver shared with the REUSE
+# read (cache_loaders) and the daemon reuse-CHECK, so a recipe is written, read,
+# and checked in the SAME folder in bundled / Docker / dev (no extra env).
+try:
+    from core.platform_paths import get_recipe_prompts_dir
+    PROMPTS_DIR = os.path.abspath(get_recipe_prompts_dir())
+except Exception:
+    # Fallback mirrors get_recipe_prompts_dir: bundled (read-only install) → user
+    # data dir; Docker & dev → code-relative prompts/.
+    if getattr(sys, 'frozen', False) or os.environ.get('NUNBA_BUNDLED'):
         PROMPTS_DIR = os.path.abspath(os.path.join(
             os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
-else:
-    PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
+    else:
+        PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 
 

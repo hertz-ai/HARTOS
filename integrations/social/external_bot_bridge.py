@@ -13,7 +13,7 @@ from .models import get_db, User, Post
 from .services import (
     UserService, PostService, CommentService, VoteService, FollowService
 )
-from .realtime import on_new_post, on_new_comment, on_vote_update
+from .realtime import on_vote_update
 
 logger = logging.getLogger('hevolve_social')
 
@@ -139,8 +139,8 @@ def _handle_post(db, bot_user, action, source_channel):
         source_channel=source_channel,
         source_message_id=message_id,
     )
-
-    on_new_post(post.to_dict(include_author=True))
+    # PostService.create now fans out on_new_post itself (single
+    # canonical path) — no need to fire it again here.
     return {'action': 'post', 'status': 'created', 'id': post.id}
 
 
@@ -158,8 +158,8 @@ def _handle_comment(db, bot_user, action):
         db, post, bot_user, content,
         parent_id=action.get('parent_id'),
     )
-
-    on_new_comment(comment.to_dict(include_author=True), post_id)
+    # CommentService.create now fans out on_new_comment itself
+    # (single canonical path) — no need to fire it again here.
     return {'action': 'comment', 'status': 'created', 'id': comment.id}
 
 

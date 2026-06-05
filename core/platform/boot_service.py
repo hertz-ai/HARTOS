@@ -80,7 +80,7 @@ if __name__ == '__main__':
 
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s %(name)s %(levelname)s %(message)s')
+        format='%(asctime)s %(name)s [%(threadName)s] %(levelname)s %(message)s')
 
     parser = argparse.ArgumentParser(description='HART OS Platform Boot Service')
     parser.add_argument('--daemon', action='store_true',

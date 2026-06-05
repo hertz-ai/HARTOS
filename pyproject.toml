@@ -114,6 +114,17 @@ dependencies = [
     # Image processing
     "Pillow>=9.5.0,<13.0.0",
     "opencv-python",
+    # Video assembly — imageio + the bundled-ffmpeg plugin.  Used by
+    # integrations/remote_desktop/frame_capture.py::record_to_video
+    # (demo/call capture, invoked from agent_engine/marketing_tools.py)
+    # and integrations/vision/ltx2_server.py (LTX2 video generation).
+    # The imports are guarded (graceful GIF fallback when absent), but
+    # listing them here makes the mp4/H.264 path work out-of-the-box on
+    # flat/regional/central topologies across Win/macOS/Linux.  imageio
+    # is pure-Python; imageio-ffmpeg ships a per-OS ffmpeg wheel pip
+    # auto-selects.  Compatible with the numpy<2 + Pillow pins above.
+    "imageio>=2.30.0,<3.0.0",
+    "imageio-ffmpeg>=0.5.0,<1.0.0",
 
     # Speech-to-text (ONNX runtime — no PyTorch needed, CPU-optimized)
     "sherpa-onnx>=1.11.0",

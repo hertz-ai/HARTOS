@@ -134,34 +134,52 @@ class AdminAPI:
         # Try to load saved configuration
         self._load_config()
 
+    def _config_path(self) -> str:
+        """Single source for the admin-config file location."""
+        return os.path.join(
+            os.path.dirname(__file__), "..", "..", "..",
+            "agent_data", "admin_config.json")
+
     def _load_config(self) -> None:
-        """Load configuration from file if exists."""
-        config_path = os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "..",
-            "..",
-            "agent_data",
-            "admin_config.json"
-        )
+        """Restore persisted admin state (channels + workflows + identity) so it
+        survives a restart (#45).  Previously this loaded into self._config —
+        which nothing reads — while the live state lived in separate attrs that
+        were never persisted, so identity + workflows (and channels) were lost on
+        every restart."""
+        config_path = self._config_path()
         try:
-            if os.path.exists(config_path):
-                with open(config_path, "r") as f:
-                    self._config = json.load(f)
-                logger.info("Loaded admin configuration from %s", config_path)
+            if not os.path.exists(config_path):
+                return
+            with open(config_path, "r") as f:
+                data = json.load(f)
+            self._config = data  # kept for any backward-compat reader
+            self._channels = data.get("channels") or {}
+            wf = {}
+            for k, v in (data.get("workflows") or {}).items():
+                try:
+                    wf[k] = WorkflowSchema(**v)
+                except Exception:
+                    logger.warning("admin: skipping unloadable workflow %s", k)
+            self._workflows = wf
+            _ident = data.get("identity")
+            try:
+                self._identity = IdentityConfigSchema(**_ident) if _ident else None
+            except Exception:
+                logger.warning("admin: skipping unloadable identity config")
+            logger.info("Loaded admin configuration from %s", config_path)
         except Exception as e:
             logger.warning("Failed to load admin config: %s", e)
 
     def _save_config(self) -> None:
-        """Save configuration to file using atomic write (temp + rename)."""
-        config_path = os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "..",
-            "..",
-            "agent_data",
-            "admin_config.json"
-        )
+        """Atomically persist admin state (channels + workflows + identity) so it
+        survives a restart (#45).  Serializes the LIVE attrs — the previous
+        version dumped an always-empty self._config, persisting nothing."""
+        config_path = self._config_path()
+        payload = {
+            "channels": self._channels,
+            "workflows": {k: w.to_dict() for k, w in self._workflows.items()},
+            "identity": self._identity.to_dict() if self._identity else None,
+        }
         try:
             config_dir = os.path.dirname(config_path)
             os.makedirs(config_dir, exist_ok=True)
@@ -169,7 +187,7 @@ class AdminAPI:
             fd, tmp_path = tempfile.mkstemp(dir=config_dir, suffix='.tmp')
             try:
                 with os.fdopen(fd, 'w') as f:
-                    json.dump(self._config, f, indent=2, default=str)
+                    json.dump(payload, f, indent=2, default=str)
                 os.replace(tmp_path, config_path)  # atomic rename
             except Exception:
                 os.unlink(tmp_path)
@@ -266,12 +284,88 @@ def version():
 @admin_bp.route("/channels", methods=["GET"])
 @api_response
 def list_channels():
-    """List all configured channels."""
+    """List all configured channels — both admin-configured bot configs
+    and the calling user's active channel bindings.
+
+    Historical gap (2026-05-27 user report — "whatsapp is already
+    authorized but Channel Integrations page shows No Channels
+    Configured"): this endpoint used to return only
+    ``AdminAPI._channels`` (an in-memory dict populated by the
+    create_channel POST below).  The Channel Setup Wizard's WhatsApp
+    pair-code flow writes to a DIFFERENT store —
+    ``UserChannelBinding`` rows in the social DB — so authorised
+    WhatsApp / Telegram / Slack bindings never appeared in the admin
+    Channel Integrations UI even though the bot was actually paired.
+
+    Fix: read BOTH sources and union them, tagging each entry with a
+    ``source`` field so the UI can render visual differentiation if it
+    wants.  No new write path is introduced — both stores keep their
+    canonical writers.  Eliminates the parallel-path read, not the
+    parallel store (deleting ``AdminAPI._channels`` is a larger
+    refactor; this fix is the minimum-viable cure for the symptom).
+
+    Response items shape (uniform across both sources):
+        channel_type, name, enabled, config, source, …binding-only fields
+    """
     api = get_api()
     page = request.args.get("page", 1, type=int)
     page_size = request.args.get("page_size", 20, type=int)
 
-    channels = list(api._channels.values())
+    # ── Source 1: admin-configured bot integrations ────────────────
+    admin_items = []
+    for ch in api._channels.values():
+        # Defensive copy so we don't mutate the in-memory dict the
+        # CRUD endpoints below also read.
+        entry = dict(ch) if isinstance(ch, dict) else {"channel_type": str(ch)}
+        entry["source"] = "admin_config"
+        admin_items.append(entry)
+
+    # ── Source 2: the calling user's UserChannelBinding rows ───────
+    # The Channel Setup Wizard's pair-code + OAuth flows write here;
+    # without surfacing these, an authorised channel is invisible to
+    # the admin UI.  Errors are swallowed at warning so the admin
+    # endpoint still works on nodes where the social DB is offline.
+    binding_items: List[Dict[str, Any]] = []
+    db = getattr(g, "db", None)
+    user_id = getattr(g, "user_id", None)
+    if db is not None and user_id is not None:
+        try:
+            from integrations.social.models import UserChannelBinding
+            rows = (
+                db.query(UserChannelBinding)
+                .filter_by(user_id=user_id, is_active=True)
+                .order_by(UserChannelBinding.created_at.desc())
+                .all()
+            )
+            for binding in rows:
+                d = binding.to_dict()
+                meta = d.get("metadata_json") or {}
+                binding_items.append({
+                    "channel_type": d.get("channel_type"),
+                    "name": (
+                        meta.get("display_name")
+                        or (d.get("channel_type") or "").title()
+                        or "Channel"
+                    ),
+                    "enabled": bool(d.get("is_active")),
+                    "config": {
+                        "channel_sender_id": d.get("channel_sender_id"),
+                        "channel_chat_id": d.get("channel_chat_id"),
+                        "auth_method": d.get("auth_method"),
+                    },
+                    "source": "user_binding",
+                    "binding_id": d.get("id"),
+                    "is_preferred": bool(d.get("is_preferred")),
+                    "last_message_at": d.get("last_message_at"),
+                    "created_at": d.get("created_at"),
+                })
+        except Exception as e:
+            logger.warning(
+                "list_channels: failed to load UserChannelBinding rows "
+                "for user_id=%s: %s", user_id, e,
+            )
+
+    channels = admin_items + binding_items
     total = len(channels)
     start = (page - 1) * page_size
     end = start + page_size

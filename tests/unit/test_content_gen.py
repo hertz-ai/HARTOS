@@ -335,6 +335,42 @@ class TestContentGenTracker:
         ids = [g['game_id'] for g in all_tasks]
         assert 'all-tasks-01' in ids
 
+    def test_get_all_game_tasks_survives_fresh_session(self, db):
+        """#43 regression guard: the dashboard read must come from the
+        durable AgentGoal rows, NOT an in-process cache that a restart or
+        TTL would evict.  Persist a goal via one session, then read it
+        back through a BRAND-NEW session that shares no Python state — if
+        get_all_game_tasks read an in-memory singleton (the reported bug)
+        the fresh reader would see nothing."""
+        from integrations.agent_engine.content_gen_tracker import ContentGenTracker
+        from sqlalchemy.orm import Session as SASession
+
+        goal = AgentGoal(
+            goal_type='content_gen',
+            title='Persisted across restart',
+            description='test',
+            status='active',
+            config_json={
+                'game_id': 'persist-restart-01',
+                'game_title': 'Persisted Game',
+                'media_requirements': {'images': 1, 'tts': 0, 'music': 0, 'video': 0},
+                'task_jobs': {},
+                'progress_snapshots': [],
+            },
+        )
+        db.add(goal)
+        db.flush()  # row is now in the DB; the writing session "ends"
+
+        # Fresh reader session on the same DB, no shared in-process state.
+        reader = SASession(bind=db.connection())
+        try:
+            ids = [g['game_id'] for g in ContentGenTracker.get_all_game_tasks(reader)]
+            assert 'persist-restart-01' in ids, (
+                "get_all_game_tasks did not return a persisted goal to a "
+                "fresh session — it is reading process-local state, not the DB")
+        finally:
+            reader.close()
+
     @patch('integrations.agent_engine.content_gen_tracker._check_media_service')
     @patch('integrations.agent_engine.content_gen_tracker._restart_media_service')
     def test_attempt_unblock(self, mock_restart, mock_check, db):

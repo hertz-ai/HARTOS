@@ -15,6 +15,59 @@ from typing import Annotated, Optional
 logger = logging.getLogger('hevolve_social')
 
 
+# Consent type that gates EXTERNAL publishing. The platform keeps humans in
+# control: nothing leaves to a third-party site under the operator's identity
+# unless the operator has granted standing ``public_exposure`` consent. The
+# tool docstrings have always *promised* this gate ("Gate every EXTERNAL post on
+# operator consent before calling"); this makes the promise real + enforced
+# instead of prose the LLM may ignore. Grant/revoke via POST /api/social/consent
+# or ConsentService.grant_consent — revoking is the kill-switch that stops all
+# autonomous external posting immediately.
+_EXTERNAL_POST_CONSENT = 'public_exposure'
+
+
+def _external_post_allowed(user_id: str) -> bool:
+    """True iff the operator granted standing ``public_exposure`` consent.
+
+    Single gate for every EXTERNAL channel publish (``post_to_channel``,
+    ``post_to_channel_via_browser``). Internal on-platform posts
+    (``create_social_post``) are NOT gated — they never leave the platform.
+
+    Fail-closed: any error (no consent row, DB unavailable) denies the external
+    post, so the default posture is "do not post off-platform" until a human
+    opts in. That is the correct posture for an autonomous agent that can reach
+    the public internet under the operator's identity.
+    """
+    try:
+        from integrations.social.consent_service import ConsentService
+        from integrations.social.models import db_session
+        with db_session() as db:
+            return bool(ConsentService.check_consent(
+                db, str(user_id), _EXTERNAL_POST_CONSENT, scope='*'))
+    except Exception as e:
+        logger.warning(
+            "external-post consent check failed for user %s (denying): %s",
+            user_id, e)
+        return False
+
+
+def _consent_required_result(channel: str) -> str:
+    """Canonical 'blocked — needs operator consent' result for external posts."""
+    return json.dumps({
+        'success': False,
+        'ok': False,
+        'consent_required': _EXTERNAL_POST_CONSENT,
+        'channel': channel,
+        'error': (
+            f"External posting to {channel} requires standing operator consent "
+            f"('{_EXTERNAL_POST_CONSENT}'). Enable autonomous external posting "
+            f"via POST /api/social/consent "
+            f"{{'consent_type':'{_EXTERNAL_POST_CONSENT}','scope':'*'}}. Until "
+            f"then, post on-platform with create_social_post and note the gap."
+        ),
+    })
+
+
 def register_marketing_tools(helper, assistant, user_id: str):
     """Register marketing-specific tools with the agent (Tier 2).
 
@@ -125,7 +178,12 @@ def register_marketing_tools(helper, assistant, user_id: str):
 
         Routes to the appropriate channel adapter (Twitter, Instagram, Email, etc.).
         If the channel adapter is not available, delegates to a specialist agent.
+
+        Gated on standing operator ``public_exposure`` consent — returns a
+        consent_required result (no post) until a human opts in.
         """
+        if not _external_post_allowed(user_id):
+            return _consent_required_result(channel)
         try:
             from integrations.channels.extensions import get_available_adapters
             adapters = get_available_adapters()
@@ -250,6 +308,56 @@ def register_marketing_tools(helper, assistant, user_id: str):
         except Exception as e:
             return json.dumps({'success': False, 'error': str(e)})
 
+    def record_demo_video(
+        duration_s: Annotated[int, "Seconds to record (2-60). Open + arrange the app you want to demo FIRST."] = 15,
+        fps: Annotated[int, "Frames per second (5-12 is plenty for a UI demo)."] = 8,
+    ) -> str:
+        """Record a short screen-capture DEMO VIDEO of whatever is on screen right
+        now (e.g. Nunba / HART OS running) and return the saved file path.
+
+        Arrange the demo BEFORE calling: open the Nunba window (ideally maximized),
+        and either start a scripted interaction with the desktop executor or have
+        the thing you want to show already visible.  This captures the primary
+        screen for `duration_s` and assembles a shareable mp4 (gif fallback).
+
+        Then publish it: pass the returned ``path`` as ``media_url`` to
+        ``post_to_channel(...)`` (external) or ``create_social_post(...)`` (platform).
+        Returns JSON {ok, path, format, frames, fps, duration_s} or {ok, error}.
+        """
+        try:
+            from integrations.remote_desktop.frame_capture import FrameCapture, FrameConfig
+            _fps = max(1, min(int(fps), 30))
+            _dur = max(2, min(int(duration_s), 60))
+            cap = FrameCapture(FrameConfig(max_fps=_fps, scale_factor=0.75))
+            res = cap.record_to_video(duration_s=_dur, fps=_fps)
+            return json.dumps(res)
+        except Exception as e:
+            return json.dumps({'ok': False, 'error': str(e)})
+
+    def post_to_channel_via_browser(
+        channel: Annotated[str, "Platform with a web composer the user is logged into: twitter|linkedin|reddit|hackernews"],
+        content: Annotated[Optional[str], "Text to post (defaults to the canonical body for that channel from marketing/intents)"] = None,
+    ) -> str:
+        """Post to a channel through the user's LOGGED-IN BROWSER via the VLM loop —
+        the credential-free path for channels that have no API token.  Generic
+        across every platform in marketing/intents (NOT LinkedIn-only): it opens
+        the platform's composer URL, types the content, and clicks Post.
+
+        Use this when post_to_channel reports the adapter has no credentials but
+        the user is logged into that site in their desktop browser.  Gated on
+        standing operator ``public_exposure`` consent — returns a consent_required
+        result (no post) until a human opts in.  Returns JSON
+        {ok, platform, code, status, detail}.
+        """
+        if not _external_post_allowed(user_id):
+            return _consent_required_result(channel)
+        try:
+            from integrations.marketing.browser_poster import post_to_platform_via_browser
+            return json.dumps(post_to_platform_via_browser(
+                channel, body=content, user_id=str(user_id)))
+        except Exception as e:
+            return json.dumps({'ok': False, 'error': str(e)})
+
     # Register all marketing tools
     tools = [
         ('create_social_post', 'Create a post on the HART social platform for marketing', create_social_post),
@@ -258,6 +366,8 @@ def register_marketing_tools(helper, assistant, user_id: str):
         ('post_to_channel', 'Post content to external channels (Twitter, Instagram, Email, Discord, etc.)', post_to_channel),
         ('create_referral_campaign', 'Create a referral-driven growth campaign with auto-generated referral code', create_referral_campaign),
         ('get_growth_metrics', 'Get platform growth metrics including viral coefficient (K factor)', get_growth_metrics),
+        ('record_demo_video', 'Record a short screen demo video of the app running; returns a file path to attach via post_to_channel/create_social_post media_url', record_demo_video),
+        ('post_to_channel_via_browser', 'Post to a channel via the logged-in browser (VLM loop) when it has no API token — generic across twitter/linkedin/reddit/hackernews', post_to_channel_via_browser),
     ]
 
     for name, desc, func in tools:
@@ -276,6 +386,7 @@ def register_marketing_tools(helper, assistant, user_id: str):
             {'name': 'channel_distribution', 'description': 'Post to external channels', 'proficiency': 0.8},
             {'name': 'referral_campaigns', 'description': 'Create referral-driven growth campaigns', 'proficiency': 0.9},
             {'name': 'growth_analytics', 'description': 'Analyze growth metrics and viral coefficient', 'proficiency': 0.85},
+            {'name': 'demo_recording', 'description': 'Record screen demo videos of apps running for marketing', 'proficiency': 0.8},
         ])
     except Exception as e:
         logger.debug(f"Marketing skill registration skipped: {e}")

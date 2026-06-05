@@ -13,6 +13,11 @@ master_private_key.hex
 prompt/
 prompt/*
 logs/
+
+# Runtime scratch — agent traces / memory / per-run output (never commit;
+# may contain user data). Present since the 2026-05-30 run dirs.
+data/
+runs/
 log/
 # All log files — never commit logs
 *.log
@@ -96,6 +101,8 @@ simplemem_db/
 *.db-journal
 .trueflow/
 .agent_ledger/
+data/          # episodic-memory / reasoning-trace runtime DBs
+runs/          # tensorboard tfevents from agent runs
 deploy/kong/*.json
 .pytest_cache/
 .secrets.baseline
@@ -128,3 +135,23 @@ hevolvearmor/target/
 ARCHITECTURE.md
 AUDIT_FIX_PLAN.md
 HART_IDENTITY_DESIGN.md
+
+# Standalone test artifacts / probes / scratch scripts —
+# leading-underscore convention marks throwaway investigation
+# tooling from interactive sessions. They shouldn't pollute the
+# repo but kept locally so a session can resume work.
+/_*.py
+/_*.txt
+/_*.md
+/_*.json
+/_*.jsonl
+/_*.png
+/_*.jpg
+/_*.html
+/_drops_ready/
+
+# npm deps inside vendored channel adapters
+integrations/channels/*/node_modules/
+
+# Runtime trading + capture logs
+integrations/trading/paper_trades.jsonl

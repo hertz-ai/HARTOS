@@ -53,6 +53,122 @@
 let
   cfg = config.hart;
   ui = config.hart.liquidUI;
+
+  # ── The glass shell renderer (single source) ──
+  # Fullscreen WebKit2 window onto the LiquidUI server.  If LiquidUI (:port) is
+  # not up yet it waits, then falls back to the Nunba SPA (:nunba.port) so the
+  # screen is NEVER the bare GNOME desktop or a blank page.  Used by BOTH the
+  # kiosk session (cage, below) and the in-GNOME app launcher — one renderer,
+  # no duplicate copies.
+  nunbaPort = toString (config.hart.nunba.port or 5000);
+  # GObject-introspection typelibs the glass shell's gi.require_version needs.
+  # pygobject3 (the `gi` module) is in cfg.package.python, but the Gtk-3.0 /
+  # WebKit2-4.1 *typelibs* live in these packages and must be on GI_TYPELIB_PATH
+  # — the cage kiosk session sets no such path, so without this every
+  # gi.require_version() raises and the shell window dies on launch.
+  giTypelibPath = lib.makeSearchPath "lib/girepository-1.0" (with pkgs; [
+    glib gobject-introspection gtk3 webkitgtk_4_1
+    pango gdk-pixbuf atk harfbuzz libsoup_3 cairo
+  ]);
+  glassShell = pkgs.writeShellScriptBin "hart-glass-shell" ''
+    set -euo pipefail
+    URL="http://localhost:${toString ui.port}"
+    for i in $(seq 1 30); do
+      if ${pkgs.curl}/bin/curl -sf "$URL/health" >/dev/null 2>&1; then break; fi
+      sleep 1
+    done
+    if ! ${pkgs.curl}/bin/curl -sf "$URL/health" >/dev/null 2>&1; then
+      # LiquidUI down — fall back to the Nunba SPA so the shell is never blank.
+      if ${pkgs.curl}/bin/curl -sf "http://localhost:${nunbaPort}/" >/dev/null 2>&1; then
+        URL="http://localhost:${nunbaPort}"
+      fi
+    fi
+    # GI typelibs for the GTK/WebKit2 python below (see giTypelibPath note).
+    export GI_TYPELIB_PATH="${giTypelibPath}"
+    # WebKitGTK robustness on fresh-ISO boots (VM / software GL / no GPU): the
+    # DMABUF renderer + GL compositing crash on a GL-less display, which is
+    # exactly the first-boot / live-USB case. Disable both so a shell that
+    # cannot paint never takes down the whole session.
+    ${lib.optionalString (!ui.preferHardwareGL) "export WEBKIT_DISABLE_DMABUF_RENDERER=1\nexport WEBKIT_DISABLE_COMPOSITING_MODE=1"}
+    ${lib.optionalString ui.runOnboardingInKiosk ''
+    # First-run identity ceremony (opt-in; default off). `hart-onboarding`
+    # self-gates via --check (exits 0 if already onboarded). timeout + || true
+    # bound any hang/crash so the shell ALWAYS comes up — the ceremony can never
+    # permanently block the kiosk. Validate on a real ISO boot before enabling.
+    if command -v hart-onboarding >/dev/null 2>&1; then
+      ${pkgs.coreutils}/bin/timeout 300 hart-onboarding || true
+    fi
+''}
+    export HART_SHELL_URL="$URL"
+    exec ${cfg.package.python}/bin/python -c "
+import gi, os
+gi.require_version('Gtk', '3.0')
+gi.require_version('WebKit2', '4.1')
+from gi.repository import Gtk, WebKit2
+
+class GlassShell(Gtk.Window):
+    def __init__(self):
+        super().__init__(title='HART OS')
+        self.set_default_size(1280, 800)
+        webview = WebKit2.WebView()
+        webview.load_uri(os.environ.get('HART_SHELL_URL', 'http://localhost:${toString ui.port}'))
+        s = webview.get_settings()
+        s.set_enable_javascript(True)
+        s.set_enable_developer_extras(False)
+        # NEVER (not ALWAYS): a fresh ISO / live-USB / VM often has only
+        # software GL (llvmpipe). Forcing GPU accel there crashes WebKitGTK and
+        # takes down the shell session. Correctness/robustness over a few fps.
+        s.set_hardware_acceleration_policy(WebKit2.HardwareAccelerationPolicy.${if ui.preferHardwareGL then "ON_DEMAND" else "NEVER"})
+        self.add(webview)
+        self.connect('destroy', Gtk.main_quit)
+        self.show_all()
+        self.fullscreen()
+
+GlassShell()
+Gtk.main()
+"
+  '';
+
+  # ── Kiosk session launcher ──
+  # Wraps cage so the Wayland stack boots the glass shell on ANY GPU — including
+  # broken / flaky drivers. A real NVIDIA box showed nouveau GSP init failing
+  # (`gsp: fini failed, -110`) and cage crashing at startup ("failed to idle
+  # channel"). wlroots ABORTS rather than use software rendering unless
+  # WLR_RENDERER_ALLOW_SOFTWARE=1, so the compositor died and the whole session
+  # with it. Force the entire kiosk to software rendering (Mesa llvmpipe +
+  # wlroots pixman): the shell is 2D and renders fine in software, KMS scanout
+  # still uses the kernel driver (the console text proves KMS works), and the
+  # broken GPU GL/compute path is never touched. A kiosk MUST paint on any GPU.
+  kioskLauncher = pkgs.writeShellScriptBin "hart-shell-session" ''
+    export WLR_RENDERER_ALLOW_SOFTWARE=1
+    export WLR_NO_HARDWARE_CURSORS=1
+    ${lib.optionalString (!ui.preferHardwareGL) "export LIBGL_ALWAYS_SOFTWARE=1"}
+    exec ${pkgs.cage}/bin/cage -- ${glassShell}/bin/hart-glass-shell
+  '';
+
+  # ── Kiosk Wayland session ──
+  # cage runs ONLY the glass shell as the compositor's single client.  There is
+  # no desktop, no app-grid, no GNOME beneath it — THIS is what makes
+  # Nunba/LiquidUI the OS *shell* instead of an app layered on GNOME.  Registered
+  # via services.displayManager.sessionPackages; desktop.nix sets it default and
+  # keeps GNOME as a selectable fallback session.
+  # The .desktop content (writeText keeps it heredoc-free + readable).
+  sessionDesktop = pkgs.writeText "hart-shell.desktop" ''
+    [Desktop Entry]
+    Name=HART OS
+    Comment=AI-native glass shell (Nunba / LiquidUI)
+    Exec=${kioskLauncher}/bin/hart-shell-session
+    Type=Application
+    DesktopNames=HART-OS
+  '';
+  # services.displayManager.sessionPackages REQUIRES passthru.providedSessions
+  # (the session id, matching the wayland-sessions/*.desktop basename) — without
+  # it nixos flake-check fails with "did not specify any session names".  A
+  # runCommand carries the passthru; writeTextFile cannot.
+  kioskSession = pkgs.runCommand "hart-shell-wayland-session"
+    { passthru.providedSessions = [ "hart-shell" ]; } ''
+      install -Dm644 ${sessionDesktop} $out/share/wayland-sessions/hart-shell.desktop
+    '';
 in
 {
   # ═══════════════════════════════════════════════════════════
@@ -103,6 +219,22 @@ in
       description = "UI theme (auto follows system dark/light preference)";
     };
 
+    preferHardwareGL = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Let the kiosk glass shell use HARDWARE GL acceleration (smoother glass
+        blur on llvmpipe-bound systems) instead of forcing Mesa software
+        rendering. DEFAULT FALSE — the forced-software path is what makes the
+        shell paint on ANY GPU including broken/flaky drivers (the nouveau-GSP
+        crash class #99-103 hardened against); with this off the kiosk is
+        byte-identical to before this option. Enable ONLY on hardware with a
+        known-good GPU driver: on a flaky GPU it re-introduces the WebKitGTK/cage
+        crash. This is the documented lever for the software-GL-vs-glass-perf
+        trade-off — robustness stays the default.
+      '';
+    };
+
     contextRefreshMs = lib.mkOption {
       type = lib.types.int;
       default = 2000;
@@ -113,6 +245,22 @@ in
       type = lib.types.bool;
       default = true;
       description = "Enable Agent-to-UI protocol (agents push UI components)";
+    };
+
+    runOnboardingInKiosk = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Run the "Light Your HART" first-boot identity ceremony (hart-onboarding)
+        inside the cage KIOSK session, before the glass shell. DEFAULT FALSE — the
+        ceremony is GTK4/libadwaita and must paint under the kiosk's software-GL;
+        if it cannot, it could delay the shell up to the 300s timeout on first
+        boot. The glass-shell wrapper guards it with the ceremony's own `--check`
+        (skip if already onboarded) + `timeout 300` + `|| true`, so it can NEVER
+        permanently block the kiosk — but ENABLE ONLY after verifying the ceremony
+        paints on a real ISO boot. Off = the shell starts directly (current,
+        byte-identical behaviour). Requires hart.onboarding (the variant default).
+      '';
     };
 
     embedNunba = lib.mkOption {
@@ -275,57 +423,24 @@ in
     # ─────────────────────────────────────────────────────────
     (lib.mkIf (ui.renderer == "webkit") {
 
-      # User-level service: opens WebKit2 window connected to LiquidUI server
+      # Register the kiosk session ("HART OS") so the display manager can run the
+      # glass shell as the *session* itself.  desktop.nix sets it as the default
+      # session and keeps GNOME as a selectable fallback — THIS is what makes
+      # Nunba/LiquidUI the OS shell instead of an app layered on GNOME.
+      services.displayManager.sessionPackages = [ kioskSession ];
+
+      # Legacy in-GNOME renderer: repointed at the single ``glassShell`` script
+      # (no duplicate renderer) and NOT auto-started — the kiosk session launches
+      # the glass shell directly, so auto-layering it on the GNOME fallback would
+      # double-launch.  Kept as a manually-startable unit for debugging.
       systemd.user.services.hart-liquid-ui-renderer = {
         description = "HART OS LiquidUI Renderer (WebKit2)";
         after = [ "graphical-session.target" ];
         partOf = [ "graphical-session.target" ];
-        wantedBy = [ "graphical-session.target" ];
+        wantedBy = [ ];  # kiosk session is the canonical launch; do not auto-layer on GNOME
 
         serviceConfig = {
-          ExecStart = pkgs.writeShellScript "hart-liquid-ui-renderer" ''
-            set -euo pipefail
-
-            # Wait for LiquidUI server
-            for i in $(seq 1 30); do
-              if curl -sf "http://localhost:${toString ui.port}/health" >/dev/null 2>&1; then
-                break
-              fi
-              sleep 1
-            done
-
-            # Launch WebKit2 window
-            exec ${cfg.package.python}/bin/python -c "
-            import gi
-            gi.require_version('Gtk', '3.0')
-            gi.require_version('WebKit2', '4.1')
-            from gi.repository import Gtk, WebKit2, GLib
-
-            class LiquidUIWindow(Gtk.Window):
-                def __init__(self):
-                    super().__init__(title='HART OS')
-                    self.set_default_size(1280, 800)
-
-                    webview = WebKit2.WebView()
-                    webview.load_uri('http://localhost:${toString ui.port}')
-
-                    settings = webview.get_settings()
-                    settings.set_enable_javascript(True)
-                    settings.set_enable_developer_extras(False)
-                    settings.set_hardware_acceleration_policy(
-                        WebKit2.HardwareAccelerationPolicy.ALWAYS)
-
-                    self.add(webview)
-                    self.connect('destroy', Gtk.main_quit)
-
-                    # Fullscreen: this IS the desktop shell
-                    self.show_all()
-                    self.fullscreen()
-
-            win = LiquidUIWindow()
-            Gtk.main()
-            "
-          '';
+          ExecStart = "${glassShell}/bin/hart-glass-shell";
 
           Restart = "on-failure";
           RestartSec = 3;
@@ -448,7 +563,7 @@ in
         Type=Application
         Name=HART OS Desktop Shell
         Comment=HART OS Glass Desktop Shell
-        Exec=${cfg.package.python}/bin/python -c "import gi; gi.require_version('Gtk','3.0'); gi.require_version('WebKit2','4.1'); from gi.repository import Gtk, WebKit2; w = Gtk.Window(title='HART OS'); w.set_default_size(1280,800); v = WebKit2.WebView(); s = v.get_settings(); s.set_enable_javascript(True); v.load_uri('http://localhost:${toString ui.port}'); w.add(v); w.connect('destroy', Gtk.main_quit); w.show_all(); w.fullscreen(); Gtk.main()"
+        Exec=${glassShell}/bin/hart-glass-shell
         Icon=hart
         Categories=System;
         StartupNotify=true

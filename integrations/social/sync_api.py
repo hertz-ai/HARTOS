@@ -14,15 +14,7 @@ logger = logging.getLogger('hevolve_social')
 sync_bp = Blueprint('sync', __name__, url_prefix='/api/social/sync')
 
 
-def _ok(data=None, status=200):
-    r = {'success': True}
-    if data is not None:
-        r['data'] = data
-    return jsonify(r), status
-
-
-def _err(msg, status=400):
-    return jsonify({'success': False, 'error': msg}), status
+from .api_common import _ok, _err  # single-sourced envelope helpers (#97)
 
 
 # ─── Backup ───
@@ -40,7 +32,7 @@ def create_backup():
     try:
         from .backup_service import create_backup as _create
         result = _create(db, g.user.id, passphrase)
-        return _ok(result, 201)
+        return _ok(result, status=201)
     except ValueError as e:
         return _err(str(e))
     except Exception as e:
@@ -128,7 +120,7 @@ def link_device():
         )
         db.add(binding)
         db.commit()
-        return _ok(binding.to_dict(), 201)
+        return _ok(binding.to_dict(), status=201)
     except Exception as e:
         db.rollback()
         logger.error(f"Device link failed: {e}")

@@ -96,11 +96,11 @@ in
   # ─── Configuration ──────────────────────────────────────────
   config = lib.mkIf cfg.enable {
 
-    # ── Allow unfree packages (NVIDIA drivers, CUDA) ──
-    nixpkgs.config.allowUnfree = true;
-    nixpkgs.config.permittedInsecurePackages = [
-      "electron-33.4.11"
-    ];
+    # ── nixpkgs.config (allowUnfree / permittedInsecurePackages) is set ONCE
+    #    at the flake level (`nixpkgsConfig` in flake.nix), NOT here.  hart-base
+    #    is imported by vm-tests' runNixOSTest nodes, which receive read-only
+    #    pkgs; a module-level nixpkgs.config there triggers "defined multiple
+    #    times" (#70).  Real builds get it via mkSystem/mkImage. ──
 
     # ── Branding ──
     environment.etc = {
@@ -111,7 +111,7 @@ in
         VERSION_ID="${cfg.version}"
         VERSION_CODENAME=sentient
         ID=hart-os
-        ID_LIKE=nixos
+        ID_LIKE=linux
         HOME_URL="https://hevolve.ai"
         SUPPORT_URL="https://github.com/hertz-ai/HARTOS/issues"
         BUG_REPORT_URL="https://github.com/hertz-ai/HARTOS/issues"
@@ -157,6 +157,29 @@ in
         '';
       };
     };
+
+    # ── TTY login banner ──
+    # NixOS's default getty greeting is "<<< Welcome to NixOS ... >>>" — a
+    # user-visible leak on Ctrl+Alt+F2..F6. Rebrand it (HART hides NixOS).
+    # \m = machine arch, \l = tty line (literal getty escapes, not nix).
+    services.getty.greetingLine =
+      lib.mkForce ''<<< Welcome to HART OS ${cfg.version} (Sentient) (\m) - \l >>>'';
+
+    # ── Distro name (boot menu + system strings) ──
+    # The ISO boot menu showed "NixOS <nixpkgs-version> HART OS Desktop" — a
+    # user-visible "NixOS" leak at boot (confirmed from a CI QEMU console dump;
+    # isoImage.appendToMenuLabel only APPENDS, it can't drop the "NixOS"
+    # prefix). distroName is the supported override the boot-menu + various
+    # system strings derive from. distroId is left as the default so tooling
+    # that keys on os-release ID=nixos still works; the user-facing NAME is
+    # already "HART OS" via the explicit os-release above.
+    system.nixos.distroName = lib.mkForce "HART OS";
+
+    # Don't ship the NixOS manual / `nixos-help` — it's a "NixOS" reference a
+    # user can surface, and building it adds time to the (already slow) ISO
+    # build. mkDefault so a variant can still re-enable docs if it wants; edge
+    # already turns ALL docs off, and that explicit setting wins over this.
+    documentation.nixos.enable = lib.mkDefault false;
 
     # ── Users ──
     users.users.hart = {

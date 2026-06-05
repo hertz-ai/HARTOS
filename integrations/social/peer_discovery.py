@@ -13,6 +13,7 @@ import requests
 from datetime import datetime, timedelta
 
 from core.http_pool import pooled_get, pooled_post
+from core.session_cache import TTLCache  # bounded + TTL dedup (peer churn safe)
 
 logger = logging.getLogger('hevolve_social')
 
@@ -1249,7 +1250,18 @@ class AutoDiscovery:
         self._send_thread = None
         self._recv_thread = None
         self._lock = threading.Lock()
-        self._discovered_nodes: set = set()
+        # First-beacon dedup (suppresses re-logging + re-gossiping the same
+        # node every ~30s beacon).  Was an unbounded `set` that only ever grew
+        # — on a long-running node in a churny LAN (peers cycling through new
+        # node_ids) it leaked memory without bound (#83).  TTLCache caps size
+        # (FIFO-evicts the oldest) and expires entries after a TTL, so a node
+        # absent for the TTL is simply re-discovered (re-logged once) if it
+        # returns — correct + bounded.  Accessed only from the single recv
+        # thread, so no extra locking needed.
+        self._discovered_nodes = TTLCache(
+            ttl_seconds=int(os.environ.get('HEVOLVE_DISCOVERY_DEDUP_TTL', '3600')),
+            max_size=int(os.environ.get('HEVOLVE_DISCOVERY_DEDUP_MAX', '2048')),
+            name='peer_discovered_nodes')
         self._sock = None
 
     def start(self) -> None:
@@ -1356,9 +1368,24 @@ class AutoDiscovery:
         except (ValueError, UnicodeDecodeError):
             return {}
 
+        # Untrusted UDP input: a valid-JSON NON-dict (e.g. b'[1,2,3]' or b'"x"')
+        # would sail past the except above, then the payload.get(...) calls below
+        # raise AttributeError — which is NOT caught here and would bubble into
+        # the recv loop. Reject anything that isn't a dict explicitly.
+        if not isinstance(payload, dict):
+            return {}
+
         if payload.get('type') != 'hevolve-discovery':
             return {}
-        if payload.get('node_id') == self._gossip.node_id:
+        # node_id is REQUIRED by the beacon spec and is used downstream as the
+        # dedup key and as `node_id[:8]` in the recv-loop log line. A beacon
+        # missing it (or carrying a non-string) would otherwise sail past here
+        # and crash the recv loop at node_id[:8]; reject it now, same as the
+        # type guard above (completes the malformed-beacon hardening).
+        node_id = payload.get('node_id')
+        if not isinstance(node_id, str) or not node_id:
+            return {}
+        if node_id == self._gossip.node_id:
             return {}
 
         # Verify guardrail hash
@@ -1490,10 +1517,10 @@ class AutoDiscovery:
                 continue
 
             node_id = payload.get('node_id')
-            if node_id in self._discovered_nodes:
+            if node_id in self._discovered_nodes:   # TTL-aware membership
                 continue
 
-            self._discovered_nodes.add(node_id)
+            self._discovered_nodes[node_id] = True   # bounded; FIFO-evicts oldest
             url = payload.get('url', '')
             logger.info(f"AutoDiscovery: found node "
                         f"{payload.get('name', node_id[:8])} at {url} via LAN")

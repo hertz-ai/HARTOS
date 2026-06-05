@@ -28,8 +28,10 @@ let
     cryptography
   ]);
 
-  # The onboarding script wrapper
-  onboardingBin = pkgs.writeShellScript "hart-onboarding" ''
+  # The onboarding script wrapper (a PATH command so the cage kiosk glass shell
+  # can invoke it too, not only the GNOME autostart — see hart-liquid-ui.nix
+  # runOnboardingInKiosk).
+  onboardingBin = pkgs.writeShellScriptBin "hart-onboarding" ''
     # Exit silently if already onboarded
     if ${pythonForOnboarding}/bin/python3 \
         ${hartSrc}/integrations/agent_engine/native_onboarding.py \
@@ -59,7 +61,7 @@ let
       Type=Application
       Name=Light Your HART
       Comment=HART OS first-time identity ceremony
-      Exec=${onboardingBin}
+      Exec=${onboardingBin}/bin/hart-onboarding
       Icon=preferences-system
       Terminal=false
       X-GNOME-Autostart-Phase=Application
@@ -76,7 +78,7 @@ let
       Type=Application
       Name=My HART Identity
       Comment=View your HART identity card
-      Exec=${onboardingBin}
+      Exec=${onboardingBin}/bin/hart-onboarding
       Icon=contact-new
       Categories=System;Settings;
       Terminal=false
@@ -88,6 +90,7 @@ in
 
     # Install the autostart entry, desktop shortcut, and GTK4/libadwaita
     environment.systemPackages = [
+      onboardingBin          # `hart-onboarding` on PATH (kiosk + manual re-run)
       onboardingDesktop
       identityDesktop
       pkgs.gtk4

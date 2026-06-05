@@ -109,7 +109,14 @@ class ImmutableAuditLog:
             (entry_id, entry_hash)
         """
         with self._lock:
-            timestamp = datetime.utcnow().isoformat()
+            # #48 fix: hash with the SAME timestamp we persist as created_at.
+            # The model's created_at default (datetime.utcnow) fires AGAIN at
+            # flush when we don't pass it, yielding a different value than the one
+            # mixed into entry_hash → verify_chain recomputed with the DB's
+            # created_at and saw a mismatch on EVERY DB-backed round-trip.
+            # Capture `now` once, hash it, and store it explicitly.
+            now = datetime.utcnow()
+            timestamp = now.isoformat()
             detail_json = _redact_sensitive(detail)
             prev_hash = self._get_last_hash()
             entry_hash = _compute_hash(
@@ -128,6 +135,7 @@ class ImmutableAuditLog:
                             detail_json=detail_json,
                             prev_hash=prev_hash,
                             entry_hash=entry_hash,
+                            created_at=now,  # #48: persist the hashed timestamp
                         )
                         db.add(entry)
                         db.commit()

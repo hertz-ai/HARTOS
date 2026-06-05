@@ -45,7 +45,7 @@ pkgs.stdenv.mkDerivation {
     mkdir -p "\$CACHE_DIR"
     if [ ! -x "\$APP" ]; then
       echo "Nunba: first run — downloading launcher from GitHub…" >&2
-      if ! ${pkgs.curl}/bin/curl -fL --retry 3 -o "\$APP" "${installerUrl}"; then
+      if ! ${pkgs.curl}/bin/curl -fL --retry 3 --connect-timeout 30 --speed-time 30 --speed-limit 2048 -o "\$APP" "${installerUrl}"; then
         echo "Nunba: download failed. See ${installerFallback}" >&2
         exit 1
       fi
@@ -53,7 +53,15 @@ pkgs.stdenv.mkDerivation {
     fi
     export NUNBA_BACKEND_URL="\''${NUNBA_BACKEND_URL:-http://localhost:6777}"
     export NUNBA_PORT="\''${NUNBA_PORT:-5000}"
-    exec "\$APP" "\$@"
+    # Run through appimage-run, NOT a raw exec: NixOS has no FHS loader, so a
+    # bare ./Nunba-x86_64.AppImage crashes ("No such file or directory" on the
+    # ELF interpreter) unless the AppImage binfmt subsystem happens to be
+    # enabled. appimage-run extracts + runs it in an FHS sandbox with the right
+    # libs every time, independent of hart.subsystems.appimage. (This is the
+    # canonical NixOS way to run a downloaded AppImage; it is the same runner
+    # the binfmt registration in hart-subsystems.nix points at — not a parallel
+    # path.) Fixes "nunba crashing in HART OS installation".
+    exec ${pkgs.appimage-run}/bin/appimage-run "\$APP" "\$@"
     LAUNCHER
     chmod +x $out/bin/nunba
 

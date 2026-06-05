@@ -389,6 +389,7 @@ class AgentAttributionOrchestrator:
         """Emit EventBus event for real-time dashboards."""
         try:
             from core.platform.events import emit_event
+            from core.event_attribution import owner_user_id
             emit_event('agent.action.completed', {
                 'action_id': action.action_id,
                 'agent_id': action.agent_id,
@@ -398,6 +399,10 @@ class AgentAttributionOrchestrator:
                     (action.completed_at or time.time()) - action.started_at, 2),
                 'step_count': len(action.steps),
                 'success_score': self._compute_success_score(action),
+                # #58: stamp the owning user so the P3a SSE guard routes this
+                # per-agent update to that user's dashboard instead of refusing
+                # it (None → still refused, as before — no leak).
+                'user_id': owner_user_id(goal_id=action.goal_id),
             })
         except Exception:
             pass  # Best effort — never crash on observability

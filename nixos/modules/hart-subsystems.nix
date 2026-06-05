@@ -79,6 +79,11 @@ in
     web = {
       enable = lib.mkEnableOption "Progressive Web App native support";
     };
+
+    # ─── Subsystem 5: macOS (Darling — experimental) ───
+    macos = {
+      enable = lib.mkEnableOption "Experimental macOS app support (Darling — Mach-O/Darwin translation, the macOS analogue of Wine)";
+    };
   };
 
   # ═══════════════════════════════════════════════════════════
@@ -107,6 +112,16 @@ in
           roboto-mono
           jetbrains-mono
           fira-code
+          # ── Glass shell typography + icons, bundled LOCALLY ──
+          # liquid_ui_service.py renders the shell with Inter (body) and the
+          # Material Icons ligature font for EVERY top-bar/tray icon. Those were
+          # loaded from fonts.googleapis.com, so a fresh OFFLINE ISO boot showed
+          # literal "lock"/"notifications" words instead of icons (and phoned
+          # Google on every launch). Bundling them makes the shell render fully
+          # offline + private. (A real OS ships its own fonts.)
+          inter                   # Shell body font (--ds-font-body)
+          material-icons          # Material Icons ligature font (.mi icons)
+          material-symbols        # Newer Material Symbols (forward-compat)
         ];
         fontconfig.defaultFonts = {
           serif = [ "Noto Serif" "Liberation Serif" ];
@@ -409,6 +424,23 @@ in
           echo "Installed: $APP_NAME → $APP_URL"
         '';
       };
+    })
+
+    # ─────────────────────────────────────────────────────────
+    # SUBSYSTEM 5: macOS Native (Darling) — EXPERIMENTAL, opt-in
+    # ─────────────────────────────────────────────────────────
+    # Darling is the open-source Mach-O / Darwin translation layer — the macOS
+    # analogue of Wine (NOT an emulator: it implements the Darwin syscall ABI +
+    # frameworks as native Linux libraries). It is x86_64-only and today runs
+    # mostly CLI + some GUI macOS binaries; maturity is well below Wine, so this
+    # stays default-OFF and never touches the default desktop build. The
+    # `pkgs ? darling` guard keeps evaluation safe on a nixpkgs rev/arch where
+    # darling is absent or unbuildable.
+    (lib.mkIf sub.macos.enable {
+      environment.systemPackages = lib.optional (pkgs ? darling) pkgs.darling;
+      systemd.tmpfiles.rules = [
+        "d /var/lib/hart/darwin 0750 hart hart -"
+      ];
     })
   ]);
 }

@@ -133,6 +133,12 @@
   # ─── Phosh (GNOME Mobile Shell) ───
   services.xserver.enable = false;   # Wayland only
 
+  # phosh is launched directly by greetd below.  There is NO
+  # `programs.phosh` NixOS option (the nix flake-check #70 failure:
+  # "The option `programs.phosh' does not exist"); the greetd session
+  # command is the supported launch path on this nixpkgs pin.  HiDPI
+  # output scaling lives in phoc's own config (phoc.ini), written via
+  # environment.etc below, not a non-existent NixOS option.
   services.greetd = {
     enable = true;
     settings.default_session = {
@@ -141,13 +147,18 @@
     };
   };
 
-  programs.phosh = {
-    enable = true;
-    phocConfig.output."DSI-1".scale = 2;
-  };
+  # phoc (the phosh Wayland compositor) reads this for per-output config;
+  # replaces the invalid programs.phosh.phocConfig.output."DSI-1".scale.
+  environment.etc."phosh/phoc.ini".text = ''
+    [output:DSI-1]
+    scale = 2
+  '';
 
   # ─── Cellular ───
-  services.modemManager.enable = true;
+  # ModemManager comes with networking.networkmanager.enable below — there is
+  # no standalone services.modemManager option on this nixpkgs pin (#70: the
+  # eval error "services.modemManager does not exist", surfaced once the phosh
+  # error above was cleared).
 
   networking = {
     networkmanager = {

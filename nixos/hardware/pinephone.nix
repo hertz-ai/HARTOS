@@ -5,12 +5,28 @@
 
 {
   imports = [
-    # Mobile NixOS provides PinePhone kernel, device tree, modem support
-    "${mobile-nixos}/devices/pine64-pinephone"
+    # Mobile NixOS harness — declares the `mobile.*` option set AND loads the
+    # pine64-pinephone device (kernel, device tree, modem).  mobile-nixos is a
+    # plain path input (flake=false), so the device path alone leaves `mobile.*`
+    # UNDECLARED → "The option `mobile' does not exist" (#70).  lib/configuration.nix
+    # is the documented non-flake entrypoint that wires both.
+    (import "${mobile-nixos}/lib/configuration.nix" { device = "pine64-pinephone"; })
   ];
 
   # ─── Boot ───
   boot = {
+    # #70: packages.aarch64-linux.sd-phone (mkImage format="sd-aarch64") pulls
+    # nixpkgs' installer/sd-card/sd-image-aarch64.nix, which sets
+    # boot.loader.generic-extlinux-compatible.enable = true.  mobile-nixos'
+    # pine64-pinephone bootloader.nix sets it false (the device boots via its
+    # own u-boot path, not extlinux).  Two normal-priority definitions -> a
+    # "conflicting definition values" eval error that blocks `nix flake check`
+    # (it evaluates every package output).  Defer to the device authority
+    # (mobile-nixos owns this board's boot): force false.  No-op on the
+    # hart-phone nixosConfiguration (already false there); decisive on the
+    # sd-phone package where the true/false collision actually occurs.
+    loader.generic-extlinux-compatible.enable = lib.mkForce false;
+
     # Mobile NixOS provides the PinePhone kernel
     kernelParams = [
       "console=ttyS0,115200"
@@ -35,12 +51,17 @@
   };
 
   # ─── Cellular Modem (Quectel EG25-G) ───
-  # ModemManager handles voice calls, SMS, data
-  services.modemManager.enable = true;
+  # ModemManager (voice calls, SMS, data) is provided by
+  # networking.networkmanager.enable below — there is NO standalone
+  # services.modemManager option on this nixpkgs pin (it was removed; setting it
+  # is the "services.modemManager does not exist" #70 eval error).  See
+  # configurations/phone.nix:158-160 for the same note.
 
   # Modem firmware + power management
   systemd.services.eg25-manager = {
     description = "PinePhone EG25-G Modem Manager";
+    # ModemManager.service comes from NetworkManager (enabled below); the soft
+    # `after` ordering is satisfied without the (nonexistent) standalone option.
     after = [ "ModemManager.service" ];
     wantedBy = [ "multi-user.target" ];
     serviceConfig = {

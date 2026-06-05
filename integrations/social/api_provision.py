@@ -138,6 +138,9 @@ def update_node(node_id):
                 db.commit()
 
             return jsonify(result)
+        except Exception:
+            db.rollback()  # was missing: a failed write closed a dirty session (#97)
+            raise
         finally:
             db.close()
     except Exception as e:
@@ -162,6 +165,9 @@ def decommission_node(node_id):
                 'success': True,
                 'message': f'Node {node.target_host} marked as decommissioned',
             })
+        except Exception:
+            db.rollback()  # was missing: a failed write closed a dirty session (#97)
+            raise
         finally:
             db.close()
     except Exception as e:

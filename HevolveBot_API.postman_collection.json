@@ -1,0 +1,397 @@
+{
+	"info": {
+		"_postman_id": "hevolvebot-langchain-agent",
+		"name": "HevolveBot LangChain Agent API",
+		"description": "Complete API collection for HevolveBot LangChain Agent.\n\nServer runs on port 6778 (Waitress).\n\nProtected endpoints require X-API-Key header.\nSet the `api_key` collection variable to match your HEVOLVE_API_KEY in .env.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://localhost:6778",
+			"type": "string"
+		},
+		{
+			"key": "api_key",
+			"value": "dev-test-key-12345",
+			"type": "string"
+		},
+		{
+			"key": "user_id",
+			"value": "12345",
+			"type": "string"
+		},
+		{
+			"key": "prompt_id",
+			"value": "66",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "Health & Status",
+			"item": [
+				{
+					"name": "GET /status - Health Check",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/status",
+							"host": ["{{base_url}}"],
+							"path": ["status"]
+						},
+						"description": "Health check endpoint. No auth required.\n\nExpected: {\"response\": \"Working...\"}"
+					},
+					"response": [
+						{
+							"name": "200 - Working",
+							"originalRequest": {
+								"method": "GET",
+								"url": {
+									"raw": "{{base_url}}/status",
+									"host": ["{{base_url}}"],
+									"path": ["status"]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"body": "{\"response\":\"Working...\"}"
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Chat",
+			"item": [
+				{
+					"name": "POST /chat - Simple Conversation",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-API-Key",
+								"value": "{{api_key}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"user_id\": \"{{user_id}}\",\n  \"prompt\": \"Hello, what can you do?\",\n  \"request_id\": \"test_001\",\n  \"create_agent\": false,\n  \"casual_conv\": true\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/chat",
+							"host": ["{{base_url}}"],
+							"path": ["chat"]
+						},
+						"description": "Chat endpoint in simple conversation mode (reuse existing agent).\n\nRequires: X-API-Key header\n\nFields:\n- user_id (required): User identifier\n- prompt (required): User message\n- request_id: Request tracking ID\n- create_agent: false = reuse, true = create new agent\n- casual_conv: true = casual mode"
+					}
+				},
+				{
+					"name": "POST /chat - Create Agent",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-API-Key",
+								"value": "{{api_key}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"user_id\": \"{{user_id}}\",\n  \"prompt\": \"Create me an agent that summarizes news articles\",\n  \"prompt_id\": \"{{prompt_id}}\",\n  \"create_agent\": true\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/chat",
+							"host": ["{{base_url}}"],
+							"path": ["chat"]
+						},
+						"description": "Chat endpoint in agent creation mode.\n\nRequires: X-API-Key header\n\nFields:\n- user_id (required): User identifier\n- prompt (required): Agent creation instructions\n- prompt_id (required for create): Links to prompt definition\n- create_agent: true = enter creation flow"
+					}
+				},
+				{
+					"name": "POST /chat - Full Payload (all fields)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-API-Key",
+								"value": "{{api_key}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"user_id\": \"{{user_id}}\",\n  \"prompt\": \"Hello, what can you do?\",\n  \"request_id\": \"test_002\",\n  \"create_agent\": false,\n  \"casual_conv\": true,\n  \"preferred_lang\": \"en\",\n  \"tools\": null,\n  \"file_id\": null,\n  \"prompt_id\": null,\n  \"probe\": null,\n  \"intermediate\": null\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/chat",
+							"host": ["{{base_url}}"],
+							"path": ["chat"]
+						},
+						"description": "Chat endpoint with ALL optional fields shown.\n\nRequires: X-API-Key header\n\nFields:\n- user_id (required): User identifier\n- prompt (required): User message\n- request_id: Request tracking ID\n- create_agent: false/true\n- casual_conv: Casual conversation mode (default true)\n- preferred_lang: Language code (default \"en\")\n- tools: Specific tools to enable\n- file_id: File attachment ID\n- prompt_id: Links to prompt definition\n- probe: Debug flag\n- intermediate: Intermediate response flag"
+					}
+				}
+			]
+		},
+		{
+			"name": "Agents",
+			"item": [
+				{
+					"name": "POST /time_agent - Scheduled Task",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-API-Key",
+								"value": "{{api_key}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"user_id\": \"{{user_id}}\",\n  \"prompt_id\": \"{{prompt_id}}\",\n  \"task_description\": \"Check weather every morning\",\n  \"request_from\": \"Reuse\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/time_agent",
+							"host": ["{{base_url}}"],
+							"path": ["time_agent"]
+						},
+						"description": "Time-based agent for scheduled task execution.\n\nRequires: X-API-Key header\n\nFields:\n- user_id (required): User identifier\n- prompt_id (required): Agent/prompt ID\n- task_description (required): What to schedule\n- request_from: \"Reuse\" (default) or \"Create\""
+					}
+				},
+				{
+					"name": "POST /visual_agent - Vision/VLM Task",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-API-Key",
+								"value": "{{api_key}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"user_id\": \"{{user_id}}\",\n  \"prompt_id\": \"{{prompt_id}}\",\n  \"task_description\": \"Describe the content of this image\",\n  \"request_from\": \"Reuse\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/visual_agent",
+							"host": ["{{base_url}}"],
+							"path": ["visual_agent"]
+						},
+						"description": "Visual Language Model agent for image/vision tasks.\n\nRequires: X-API-Key header\n\nFields:\n- user_id (required): User identifier\n- prompt_id (required): Agent/prompt ID\n- task_description (required): Vision task description\n- request_from: \"Reuse\" (default) or \"Create\""
+					}
+				}
+			]
+		},
+		{
+			"name": "Prompts",
+			"item": [
+				{
+					"name": "GET /prompts - List Prompts",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/prompts?user_id={{user_id}}",
+							"host": ["{{base_url}}"],
+							"path": ["prompts"],
+							"query": [
+								{
+									"key": "user_id",
+									"value": "{{user_id}}",
+									"description": "Required: User ID to list prompts for"
+								}
+							]
+						},
+						"description": "List prompts for a user. Local-first, cloud DB fallback.\n\nNo auth required.\n\nQuery params:\n- user_id (required): User identifier"
+					}
+				},
+				{
+					"name": "POST /prompts - Create Single Prompt",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"name\": \"News Summarizer\",\n  \"prompt\": \"Summarize daily news articles\",\n  \"user_id\": \"{{user_id}}\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/prompts",
+							"host": ["{{base_url}}"],
+							"path": ["prompts"]
+						},
+						"description": "Create or update a single prompt. Auto-assigns prompt_id if not provided.\n\nNo auth required.\n\nFields:\n- name: Display name for the agent\n- prompt: Goal/description\n- user_id: Creator user ID\n- prompt_id (optional): Specify to update existing"
+					}
+				},
+				{
+					"name": "POST /prompts - Create Batch Prompts",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"listprompts\": [\n    {\n      \"name\": \"Agent A\",\n      \"prompt\": \"Do task A\",\n      \"user_id\": \"{{user_id}}\"\n    },\n    {\n      \"name\": \"Agent B\",\n      \"prompt\": \"Do task B\",\n      \"user_id\": \"{{user_id}}\"\n    }\n  ]\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/prompts",
+							"host": ["{{base_url}}"],
+							"path": ["prompts"]
+						},
+						"description": "Create multiple prompts in a single request.\n\nNo auth required.\n\nFields:\n- listprompts: Array of prompt objects, each with name, prompt, user_id"
+					}
+				}
+			]
+		},
+		{
+			"name": "History & Acknowledgment",
+			"item": [
+				{
+					"name": "POST /add_history - Add Conversation History",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-API-Key",
+								"value": "{{api_key}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"user_id\": \"{{user_id}}\",\n  \"human_msg\": \"What is machine learning?\",\n  \"ai_msg\": \"Machine learning is a subset of AI that enables systems to learn from data.\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/add_history",
+							"host": ["{{base_url}}"],
+							"path": ["add_history"]
+						},
+						"description": "Add a human/AI message pair to conversation history.\n\nRequires: X-API-Key header\n\nFields:\n- user_id (required): User identifier\n- human_msg (required): The human's message\n- ai_msg (required): The AI's response"
+					}
+				},
+				{
+					"name": "POST /response_ack - Response Acknowledgment",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "X-API-Key",
+								"value": "{{api_key}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"user_id\": \"{{user_id}}\",\n  \"request_id\": \"req_001\",\n  \"prompt_id\": \"{{prompt_id}}\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/response_ack",
+							"host": ["{{base_url}}"],
+							"path": ["response_ack"]
+						},
+						"description": "Acknowledge receipt of a response.\n\nRequires: X-API-Key header\n\nNote: This endpoint currently has a bug - missing return statement (returns 500).\n\nFields:\n- user_id (required): User identifier\n- request_id (required): Request to acknowledge\n- prompt_id: Associated prompt ID"
+					}
+				}
+			]
+		},
+		{
+			"name": "Classification",
+			"item": [
+				{
+					"name": "POST /zeroshot/ - Single Label Classification",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"input_text\": \"The team scored a goal in the final minute of the match\",\n  \"labels\": [\"sports\", \"politics\", \"entertainment\"],\n  \"multi_label\": false\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/zeroshot/",
+							"host": ["{{base_url}}"],
+							"path": ["zeroshot", ""]
+						},
+						"description": "Zero-shot text classification (single label).\n\nNo auth required.\n\nFields:\n- input_text (required): Text to classify\n- labels (required): Array of candidate labels\n- multi_label: false = pick one best label (default)"
+					},
+					"response": [
+						{
+							"name": "200 - Sports classified",
+							"originalRequest": {
+								"method": "POST",
+								"url": {
+									"raw": "{{base_url}}/zeroshot/",
+									"host": ["{{base_url}}"],
+									"path": ["zeroshot", ""]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"body": "{\"labels\":[\"sports\",\"entertainment\",\"politics\"],\"scores\":[0.95,0.05,0.0],\"sequence\":\"The team scored a goal in the final minute of the match\"}"
+						}
+					]
+				},
+				{
+					"name": "POST /zeroshot/ - Multi Label Classification",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"input_text\": \"The celebrity athlete announced their retirement at a press conference attended by politicians\",\n  \"labels\": [\"sports\", \"politics\", \"entertainment\", \"celebrity\"],\n  \"multi_label\": true\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/zeroshot/",
+							"host": ["{{base_url}}"],
+							"path": ["zeroshot", ""]
+						},
+						"description": "Zero-shot text classification (multi-label).\n\nNo auth required.\n\nFields:\n- input_text (required): Text to classify\n- labels (required): Array of candidate labels\n- multi_label: true = multiple labels can apply, scores don't sum to 1"
+					}
+				}
+			]
+		}
+	]
+}

@@ -857,6 +857,9 @@ def integrity_register_node():
             peer.code_version = data.get('version')
         db.commit()
         return jsonify({'success': True, 'registered': True})
+    except Exception:
+        db.rollback()  # was missing: a failed write closed a dirty session (#97)
+        raise
     finally:
         db.close()
 

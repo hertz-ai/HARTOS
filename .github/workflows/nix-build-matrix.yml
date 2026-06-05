@@ -122,10 +122,14 @@ jobs:
               BASENAME=$(basename "$FILE")
               VERSION="${GITHUB_REF_NAME#v}"
               WEBSEED="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/${BASENAME}"
+              # Write to /tmp (writable) — "$FILE" lives in /nix/store, which is
+              # read-only, so `-o "${FILE}.torrent"` failed with "Permission
+              # denied" and red-failed every iso/qcow2 job even though the image
+              # itself built fine (#69).
               mktorrent -l 22 \
                 -c "HART OS — Hevolve Hive Agentic Runtime" \
                 -w "$WEBSEED" \
-                -o "${FILE}.torrent" \
+                -o "/tmp/${BASENAME}.torrent" \
                 "$FILE"
               echo "- **Torrent**: \`${BASENAME}.torrent\`" >> $GITHUB_STEP_SUMMARY
               echo "- **Web Seed**: \`$WEBSEED\`" >> $GITHUB_STEP_SUMMARY
@@ -141,6 +145,7 @@ jobs:
           name: hart-os-${{ matrix.target }}
           path: |
             /tmp/build-output.txt
+            /tmp/*.torrent
           retention-days: 7
 
   # ─── Summary ───────────────────────────────────────────────

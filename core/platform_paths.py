@@ -88,9 +88,126 @@ def get_agent_data_dir() -> str:
     return os.path.join(get_db_dir(), 'agent_data')
 
 
+# ── Social secret key (.social_secret_key) ───────────────────────
+# SINGLE SOURCE for where the persisted HS256 social/JWT secret lives.
+# The WRITER (integrations.social.auth) creates+persists it; the READER
+# (security.jwt_manager) reads it. They MUST agree on the locations or a
+# token minted by one fails verification by the other (#98e). Both import
+# these helpers instead of rebuilding their own candidate lists — which had
+# already drifted (dirname(db) vs db/.. ; differing fallback order).
+
+_SOCIAL_KEY_FILENAME = '.social_secret_key'
+
+
+def _social_key_file(directory: str) -> str:
+    """Path of the .social_secret_key leaf inside *directory*."""
+    return os.path.join(directory, _SOCIAL_KEY_FILENAME)
+
+
+def social_secret_key_candidates() -> list:
+    """Ordered locations the .social_secret_key may live, highest priority first.
+
+    This is the READER's discovery list (security.jwt_manager iterates it).
+    Order:
+      1. next to an explicit, absolute HEVOLVE_DB_PATH database file
+         (operator-pinned deployment) — omitted when unset/':memory:'/relative
+         so we never probe a junk '../.social_secret_key';
+      2. the platform data/ dir (bundled desktop + server default);
+      3. ./agent_data (source-tree / dev fallback).
+    The writer's create-target (`social_secret_key_write_target`) is always a
+    member of this list, so the reader's scan always finds a freshly written key.
+    """
+    out = []
+    db_path = os.environ.get('HEVOLVE_DB_PATH', '').strip()
+    if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+        out.append(_social_key_file(os.path.dirname(db_path)))
+    out.append(_social_key_file(get_db_dir()))
+    out.append(_social_key_file('agent_data'))
+    # Order-preserving de-dup (the db-dir and data-dir can coincide).
+    seen, ordered = set(), []
+    for p in out:
+        norm = os.path.normpath(p)
+        if norm not in seen:
+            seen.add(norm)
+            ordered.append(p)
+    return ordered
+
+
+def social_secret_key_write_target() -> str:
+    """Where a NEW .social_secret_key should be created.
+
+    Mirrors the writer's historical priority exactly (preserved to avoid
+    relocating — and thereby invalidating — existing keys):
+      explicit absolute HEVOLVE_DB_PATH dir  >  data/ dir when bundled/frozen
+      >  ./agent_data in a plain source tree.
+    Always one of `social_secret_key_candidates()`.
+    """
+    db_path = os.environ.get('HEVOLVE_DB_PATH', '').strip()
+    if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+        return _social_key_file(os.path.dirname(db_path))
+    if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
+        return _social_key_file(get_db_dir())
+    return _social_key_file('agent_data')
+
+
+def read_social_secret_key(min_len: int = 32) -> str:
+    """Return the first existing, sufficiently long .social_secret_key, else ''.
+
+    Scans `social_secret_key_candidates()` in priority order. A too-short key
+    file is skipped (treated as absent) so a corrupt stub never shadows a real
+    key further down the list.
+    """
+    for candidate in social_secret_key_candidates():
+        try:
+            candidate = os.path.normpath(candidate)
+            if os.path.exists(candidate):
+                with open(candidate, 'r') as f:
+                    key = f.read().strip()
+                if len(key) >= min_len:
+                    return key
+        except Exception:
+            continue
+    return ''
+
+
+def get_coding_workspace_dir() -> str:
+    """Return the AutoGen UserProxyAgent code-execution workspace.
+
+    Routes off CWD to a writable user-data path so install-tree CWD
+    (e.g. C:\\Program Files (x86)\\HevolveAI\\Nunba) doesn't fail
+    `[WinError 5] Access is denied: 'coding'`.
+    """
+    path = os.path.join(get_db_dir(), 'coding')
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def get_prompts_dir() -> str:
-    """Return the prompts/ subdirectory."""
+    """Return the prompts/ subdirectory of the user data dir (bundled desktop)."""
     return os.path.join(get_db_dir(), 'prompts')
+
+
+def get_recipe_prompts_dir() -> str:
+    """Deployment-aware recipe dir — the SINGLE resolver that recipe SAVE
+    (helper / create_recipe), REUSE read (cache_loaders), and the daemon
+    reuse-CHECK (agent_daemon) MUST all share, so a recipe is written, checked,
+    and read in the SAME folder in every deployment mode, with NO extra env:
+
+      - Bundled desktop (sys.frozen / NUNBA_BUNDLED): the install tree is
+        read-only (e.g. Program Files), so recipes use the writable user data
+        dir (get_prompts_dir() -> ~/Documents/Nunba/data/prompts).
+      - Docker / cloud AND local dev: the code dir is writable and is already
+        where recipes live (WORKDIR /app/prompts in the container, <repo>/prompts
+        in dev), so use the code-relative prompts/.  Docker keeps working as is.
+
+    Mode is auto-detected (sys.frozen / NUNBA_BUNDLED); everything else falls to
+    the code-relative dir, so Docker and dev share one rule and need no flag.
+    The base is computed from THIS module's location so every caller resolves the
+    identical path regardless of where their own file sits.
+    """
+    if getattr(sys, 'frozen', False) or os.environ.get('NUNBA_BUNDLED'):
+        return get_prompts_dir()
+    return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts')
 
 
 def get_log_dir() -> str:

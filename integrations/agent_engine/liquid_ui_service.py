@@ -66,6 +66,48 @@ COMPONENT_TYPES = {
     'agent_action': {'props': ['agent_id', 'action_type', 'description',
                                'status', 'result', 'timestamp']},
     'navigate': {'props': ['target', 'params', 'transition']},
+    # ── External-room copilot (UNIF-G5) ──
+    # Live transcript + decisions + action items for an external Discord
+    # audio room / Teams meet / WhatsApp group voice / Reddit voice room
+    # joined via UNIF-G2 Join_External_Room.  Idempotent overwrite — backend
+    # emits the FULL state on every transcript chunk; frontend replaces.
+    'meet_copilot': {'props': ['call_id', 'platform', 'room_id', 'state',
+                               'transcript_lines', 'decisions',
+                               'action_items', 'participants',
+                               'agent_role']},
+    # ── Device pairing QR (used by hart_intelligence_entry) ──
+    # WAS missing from allowlist while the emit site + web QRPairOverlay
+    # renderer both existed — emits were silently rejected here.  Added
+    # 2026-05-14 after probe_liquid_ui_audit found the gap.
+    'qr_pair': {'props': ['url', 'caption', 'expires_in_seconds',
+                          'session_id']},
+    # ── OAuth deep-link prompt ──
+    # hart_intelligence_entry emits when a tool needs an OAuth handshake
+    # (e.g. Reddit/Discord/Google sign-in).  Frontend renders as a
+    # notification with a single navigate-to-external-URL action.
+    'oauth_link': {'props': ['title', 'provider', 'authorize_url',
+                             'description', 'scopes']},
+    # ── Transient toast (channels/agent_tools success/error feedback) ──
+    # Lightweight notification with short auto-dismiss; web maps to the
+    # same NotificationCard renderer with `severity` driving the colour.
+    'toast': {'props': ['title', 'message', 'severity']},
+    # ── Channel pair-code consent card (gateway_qr auth_method) ──
+    # Emitted by hart_intelligence_entry._start_gateway_qr_pair_push
+    # while a user is conversationally connecting WhatsApp / Telegram /
+    # etc.  AgentOverlay.jsx already has the PairCodeOverlay renderer
+    # (auto-clipboard + countdown + Copy/Open).  Allowlisted here so
+    # the LiquidUI validator stops silently dropping the card on the
+    # desktop shell.  Added 2026-05-26 after the consent-fanout audit
+    # (memory/consent_fanout_p0_p3_plan.md, P0-A).
+    'pair_code': {'props': ['channel', 'channel_type', 'display_name',
+                            'color', 'icon', 'code', 'expires_in',
+                            'clipboard_payload', 'deeplink',
+                            'instructions']},
+    # ── Channel connected success card ──
+    # Sibling of pair_code; rendered as a brief success toast once the
+    # gateway confirms authentication.  Self-dismisses after 6s on web.
+    'channel_connected': {'props': ['channel', 'display_name', 'color',
+                                    'message']},
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -457,15 +499,42 @@ class LiquidUIService:
             css_vars = ThemeService.get_css_variables()
             theme = ThemeService.get_active_theme()
         except Exception:
-            css_vars = ':root { --hart-background: #0F0E17; --hart-accent: #6C63FF; --hart-active: #00e676; --hart-text: #e0e0e0; --hart-glass-bg: rgba(15,14,23,0.65); --hart-glass-border: rgba(108,99,255,0.15); --hart-muted: #78909c; --hart-surface: #1a1a2e; --hart-blur: 20px; --hart-saturation: 180%; --hart-radius: 16px; --hart-panel-opacity: 0.65; --hart-topbar-height: 40px; --hart-icon-size: 20px; --hart-titlebar-height: 32px; --hart-font-family: "JetBrains Mono"; --hart-font-size: 13px; --hart-heading-size: 18px; --hart-font-weight: 400; --hart-heading-weight: 600; --hart-anim-speed: 200ms; --hart-error: #FF6B6B; --hart-caution: #ffab40; --hart-heading: #6C63FF; --hart-surface-hover: #252540; }'
+            css_vars = ':root { --hart-background: #0F0E17; --hart-accent: #00D4AA; --hart-on-accent: #0F0E17; --hart-active: #00e676; --hart-text: #e0e0e0; --hart-glass-bg: rgba(15,14,23,0.65); --hart-glass-border: rgba(0,212,170,0.18); --hart-muted: #78909c; --hart-surface: #1a1a2e; --hart-blur: 20px; --hart-saturation: 180%; --hart-radius: 16px; --hart-panel-opacity: 0.65; --hart-topbar-height: 40px; --hart-icon-size: 20px; --hart-titlebar-height: 32px; --hart-font-family: "JetBrains Mono"; --hart-font-size: 13px; --hart-heading-size: 18px; --hart-font-weight: 400; --hart-heading-weight: 600; --hart-anim-speed: 200ms; --hart-error: #FF6B6B; --hart-caution: #ffab40; --hart-heading: #00D4AA; --hart-surface-hover: #252540; }'
             theme = {}
 
         # Performance tier detection
         perf = theme.get('performance', {})
         is_potato = perf.get('disable_blur', False)
 
+        # Accessibility state — the SAME live dict the /api/shell/accessibility
+        # routes mutate (same process). High-contrast + reduced-motion apply as
+        # <html> classes (CSS in the design system). Previously the toggles stored
+        # nothing (key mismatch) AND the render never consumed the state; this
+        # wires both ends.
+        try:
+            from integrations.agent_engine.shell_os_apis import get_a11y_settings
+            _a11y = get_a11y_settings()
+        except Exception:
+            _a11y = {}
+        a11y_cls = (('a11y-contrast ' if _a11y.get('high_contrast') else '')
+                    + ('a11y-rmotion' if _a11y.get('reduced_motion') else '')).strip()
+        # font_scale: the shell type is px, so scale the font-size tokens directly
+        # via an override emitted after css_vars (later source wins). Clamped.
+        try:
+            _fs = max(0.8, min(2.0, float(_a11y.get('font_scale', 1.0) or 1.0)))
+        except (TypeError, ValueError):
+            _fs = 1.0
+        a11y_fontscale = ''
+        if abs(_fs - 1.0) > 0.01:
+            _af_f = theme.get('font', {}) if isinstance(theme, dict) else {}
+            _af_sh = theme.get('shell', {}) if isinstance(theme, dict) else {}
+            a11y_fontscale = (':root{'
+                + '--hart-font-size:' + str(round(_af_f.get('size', 13) * _fs)) + 'px;'
+                + '--hart-heading-size:' + str(round(_af_f.get('heading_size', 18) * _fs)) + 'px;'
+                + '--hart-icon-size:' + str(round(_af_sh.get('icon_size', 20) * _fs)) + 'px}')
+
         wallpaper = theme.get('wallpaper', {})
-        wp_css = wallpaper.get('value', 'linear-gradient(135deg,#0F0E17 0%,#1a1a2e 50%,#16213e 100%)')
+        wp_css = wallpaper.get('value', 'radial-gradient(120% 120% at 18% 0%,rgba(0,212,170,0.07),transparent 50%),radial-gradient(100% 100% at 100% 100%,rgba(22,33,62,0.55),transparent 60%),linear-gradient(135deg,#0F0E17 0%,#1a1a2e 50%,#16213e 100%)')
         if wallpaper.get('type') == 'solid':
             wp_css = wallpaper['value']
 
@@ -589,9 +658,17 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
     filter var(--ds-duration-short) var(--ds-ease-standard);
   user-select:none;-webkit-tap-highlight-color:transparent}
 .ds-btn:focus-visible{outline:2px solid var(--hart-accent);outline-offset:2px}
+/* Global keyboard focus ring (a11y). :focus-visible = keyboard-only (mouse clicks
+   draw no ring), matching Win11/macOS. The shell chrome controls had NO focus
+   style at all, so keyboard users couldn't see where they were. */
+:focus-visible{outline:2px solid var(--hart-accent);outline-offset:2px}
+.start-btn:focus-visible,.tray-btn:focus-visible,.start-item:focus-visible,.power-btn:focus-visible,.taskbar-chip:focus-visible,.agent-pill:focus-visible,.ctx-menu-item:focus-visible{outline:2px solid var(--hart-accent);outline-offset:-2px}
+/* Skip link (a11y): jump straight to content; off-screen until keyboard-focused. */
+.skip-link{position:fixed;top:-200px;left:8px;z-index:100000;padding:8px 16px;background:var(--hart-accent);color:var(--hart-on-accent);border-radius:8px;font-weight:600;text-decoration:none;transition:top 0.2s}
+.skip-link:focus{top:8px}
 .ds-btn:disabled,.ds-btn[disabled]{opacity:0.38;pointer-events:none}
 .ds-btn .mi{font-size:18px}
-.ds-btn-primary{background:var(--hart-accent);color:#fff}
+.ds-btn-primary{background:var(--hart-accent);color:var(--hart-on-accent)}
 .ds-btn-primary:hover{box-shadow:var(--ds-elevation-1);filter:brightness(1.1)}
 .ds-btn-primary:active{filter:brightness(0.9)}
 .ds-btn-secondary{background:transparent;color:var(--hart-accent);border:1px solid var(--hart-glass-border)}
@@ -620,7 +697,7 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
   font-family:var(--ds-font-body);font-size:14px;line-height:20px;outline:none;
   transition:border-color var(--ds-duration-medium) var(--ds-ease-standard),
     box-shadow var(--ds-duration-medium) var(--ds-ease-standard)}
-.ds-input:focus{border-color:var(--hart-accent);box-shadow:0 0 0 2px rgba(108,99,255,0.2)}
+.ds-input:focus{border-color:var(--hart-accent);box-shadow:0 0 0 2px rgba(0,212,170,0.25)}
 .ds-input::placeholder{color:var(--hart-muted)}
 .ds-input-label{font-size:12px;font-weight:500;letter-spacing:0.5px;
   color:var(--hart-muted);text-transform:uppercase}
@@ -651,6 +728,23 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
 .ds-slider::-webkit-slider-thumb:active{box-shadow:var(--ds-elevation-3);transform:scale(1.25)}
 .ds-slider::-moz-range-thumb{width:20px;height:20px;border-radius:50%;
   background:var(--hart-accent);cursor:pointer;border:none;box-shadow:var(--ds-elevation-1)}
+
+/* ── Toggle switch ── */
+/* Used by the a11y + startup panels (class was used but never defined, so the
+   switches rendered as a raw checkbox + empty span). The native <input> is
+   visually hidden but stays FOCUSABLE (not display:none, which drops tab order);
+   the .ds-switch-slider is its next sibling. */
+.ds-switch{display:inline-flex;align-items:center;cursor:pointer}
+.ds-switch input{position:absolute;width:1px;height:1px;opacity:0;margin:0}
+.ds-switch-slider{display:inline-block;width:38px;height:22px;border-radius:999px;
+  background:var(--ds-surface-3);position:relative;flex-shrink:0;
+  transition:background var(--ds-duration-short) var(--ds-ease-standard)}
+.ds-switch-slider::before{content:'';position:absolute;top:2px;left:2px;width:18px;height:18px;
+  border-radius:50%;background:#fff;box-shadow:var(--ds-elevation-1);
+  transition:transform var(--ds-duration-short) var(--ds-ease-spring)}
+.ds-switch input:checked + .ds-switch-slider{background:var(--hart-accent)}
+.ds-switch input:checked + .ds-switch-slider::before{transform:translateX(16px)}
+.ds-switch input:focus-visible + .ds-switch-slider{outline:2px solid var(--hart-accent);outline-offset:2px}
 
 /* ── Card ── */
 .ds-card{background:var(--hart-surface);border-radius:var(--ds-radius-md);
@@ -787,18 +881,59 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
   *,*::before,*::after{animation-duration:0.01ms!important;
     animation-iteration-count:1!important;transition-duration:0.01ms!important}
 }
+
+/* ── Accessibility: applied from the live a11y state via <html> classes ── */
+html.a11y-contrast{--hart-muted:#e8eef2;--hart-glass-bg:#0a0a12;--hart-glass-border:#ffffff;--hart-text:#ffffff}
+html.a11y-contrast .glass{background:#0a0a12;border-width:2px}
+html.a11y-rmotion *,html.a11y-rmotion *::before,html.a11y-rmotion *::after{
+  animation-duration:0.01ms!important;animation-iteration-count:1!important;transition-duration:0.01ms!important}
+
+/* ── Material Icons: LOCAL + offline-safe ── */
+/* Every shell icon is <span class="mi material-icons-round">name</span>. The
+   Google <link> in <head> only defines this font family ONLINE, so a fresh
+   offline boot rendered literal ligature words ("lock","notifications"). Define
+   it locally with a fallback stack onto the BUNDLED fonts (material-icons →
+   "Material Icons", material-symbols → "Material Symbols *") plus the `liga`
+   feature that turns ligature names into glyphs. Ligature names are shared
+   across Material Icons/Symbols variants, so offline icons still render (filled
+   style) instead of text. Additive: "Material Icons Round" is still first, so
+   the online round render is unchanged. */
+.mi, .material-icons-round {
+  font-family: 'Material Icons Round', 'Material Icons', 'Material Symbols Rounded', 'Material Symbols Outlined';
+  font-weight: normal; font-style: normal; line-height: 1;
+  letter-spacing: normal; text-transform: none; white-space: nowrap;
+  word-wrap: normal; direction: ltr; display: inline-block;
+  -webkit-font-feature-settings: 'liga'; font-feature-settings: 'liga';
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+}
 '''
 
+        # Potato-only perf override, interpolated after the design system above and
+        # ONLY when is_potato. The design-system block hardcodes backdrop-filter on
+        # .ds-modal/.ds-toast and infinite skeleton/toast animations, none gated —
+        # on llvmpipe those re-rasterise a region every frame. Disable the blur (+
+        # opaque bg for legibility), stop the decorative animations, and honour the
+        # previously-dead potato `disable_shadows` intent by zeroing elevations.
+        # Plain string (literal CSS braces) → no f-string escaping pitfalls.
+        _CSS_POTATO_OVERRIDE = (
+            '.ds-modal,.ds-toast{backdrop-filter:none;-webkit-backdrop-filter:none;'
+            'background:var(--hart-surface)}'
+            ' .ds-skeleton{animation:none;background:var(--ds-surface-2)}'
+            ' .ds-toast-progress{animation:none}'
+            ' .ds-elevation-1,.ds-elevation-2,.ds-elevation-3,.ds-elevation-4,.ds-elevation-5{box-shadow:none}'
+        )
+
         return f'''<!DOCTYPE html>
-<html lang="en"><head>
+<html lang="en" class="{a11y_cls}"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>HART OS</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600;700&family=Fira+Code:wght@400;500;600&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
 <style>
 {css_vars}
+{a11y_fontscale}
 *{{margin:0;padding:0;box-sizing:border-box}}
 ::selection{{background:var(--hart-accent);color:#fff}}
 html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-family),monospace;
@@ -810,7 +945,9 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 /* ── Glass mixin (perf-aware) ── */
 .glass{{background:var(--hart-glass-bg);
   {'backdrop-filter:blur(var(--hart-blur)) saturate(var(--hart-saturation));-webkit-backdrop-filter:blur(var(--hart-blur)) saturate(var(--hart-saturation));' if not is_potato else '/* blur disabled for performance */'}
-  border:1px solid var(--hart-glass-border);border-radius:var(--hart-radius)}}
+  border:1px solid var(--hart-glass-border);border-top-color:rgba(255,255,255,0.16);
+  box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.08),inset 0 -1px 0 0 rgba(0,0,0,0.18);
+  border-radius:var(--hart-radius)}}
 
 /* ── Top Bar ── */
 .top-bar{{position:fixed;top:0;left:0;right:0;height:var(--hart-topbar-height);z-index:1000;
@@ -841,8 +978,8 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 /* ── Glass Panel (floating window) ── */
 .panel{{position:absolute;display:flex;flex-direction:column;min-width:320px;min-height:240px;
-  {'box-shadow:0 8px 32px rgba(0,0,0,0.4);' if not is_potato else 'box-shadow:0 2px 8px rgba(0,0,0,0.3);'}overflow:hidden;{'transition:box-shadow var(--hart-anim-speed)' if not is_potato else 'transition:none'}}}
-.panel.focused{{{'box-shadow:0 12px 48px rgba(0,0,0,0.5);' if not is_potato else 'box-shadow:0 3px 12px rgba(0,0,0,0.4);'}z-index:999}}
+  {'box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.08),0 1px 1px rgba(0,0,0,0.22),0 8px 32px rgba(0,0,0,0.38);' if not is_potato else 'box-shadow:0 2px 8px rgba(0,0,0,0.3);'}overflow:hidden;{'transition:box-shadow var(--hart-anim-speed)' if not is_potato else 'transition:none'}}}
+.panel.focused{{{'box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.10),0 2px 4px rgba(0,0,0,0.28),0 16px 56px rgba(0,0,0,0.48);' if not is_potato else 'box-shadow:0 3px 12px rgba(0,0,0,0.4);'}z-index:999}}
 .panel-titlebar{{height:var(--hart-titlebar-height);display:flex;align-items:center;padding:0 8px;
   gap:6px;cursor:grab;user-select:none;flex-shrink:0;border-bottom:1px solid var(--hart-glass-border)}}
 .panel-titlebar:active{{cursor:grabbing}}
@@ -866,7 +1003,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 .start-menu.open{{display:flex}}
 .start-search{{width:100%;padding:8px 12px;border-radius:10px;border:1px solid var(--hart-glass-border);
   background:var(--hart-surface,rgba(255,255,255,0.05));color:var(--hart-text);
-  font-family:var(--hart-font-family);font-size:13px;outline:none;margin-bottom:12px}}
+  font-family:var(--ds-font-body);font-size:13px;outline:none;margin-bottom:12px}}
 .start-search:focus{{border-color:var(--hart-accent)}}
 .start-scroll{{flex:1;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;
   scrollbar-color:var(--hart-muted) transparent}}
@@ -896,7 +1033,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 .agent-pill.hidden{{display:none}}
 .agent-pill .mi{{font-size:20px;color:var(--hart-accent);flex-shrink:0}}
 .agent-pill input{{flex:1;background:transparent;border:none;color:var(--hart-text);
-  font-family:var(--hart-font-family);font-size:13px;outline:none;min-width:0}}
+  font-family:var(--ds-font-body);font-size:13px;outline:none;min-width:0}}
 .agent-pill input::placeholder{{color:var(--hart-muted)}}
 .agent-response{{font-size:12px;color:var(--hart-muted);padding-top:6px;
   border-top:1px solid var(--hart-glass-border);display:none;width:100%}}
@@ -905,7 +1042,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 /* ── Floating Assistant Chat Panel ── */
 .assistant-chat{{position:fixed;bottom:56px;right:16px;z-index:1600;
   width:380px;height:520px;display:none;flex-direction:column;
-  border-radius:var(--hart-radius-lg,16px);overflow:hidden;
+  border-radius:var(--hart-radius);overflow:hidden;
   resize:both;min-width:320px;min-height:400px;max-width:600px;max-height:80vh}}
 .assistant-chat.open{{display:flex}}
 .assistant-chat .ac-header{{display:flex;align-items:center;gap:8px;
@@ -939,7 +1076,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   padding:8px 10px;border-top:1px solid var(--hart-glass-border);flex-shrink:0}}
 .assistant-chat .ac-input{{flex:1;background:transparent;border:1px solid var(--hart-glass-border);
   border-radius:20px;padding:8px 14px;color:var(--hart-text);
-  font-family:var(--hart-font-family);font-size:13px;outline:none;resize:none}}
+  font-family:var(--ds-font-body);font-size:13px;outline:none;resize:none}}
 .assistant-chat .ac-input:focus{{border-color:var(--hart-accent)}}
 .assistant-chat .ac-input::placeholder{{color:var(--hart-muted)}}
 .assistant-chat .ac-send{{background:var(--hart-accent);border:none;
@@ -960,13 +1097,13 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 /* ── Lock Screen ── */
 .lock-screen{{position:fixed;inset:0;z-index:9999;display:none;align-items:center;
   justify-content:center;flex-direction:column;gap:16px;
-  background:rgba(0,0,0,{'0.7);backdrop-filter:blur(40px)' if not is_potato else '0.9)'}}}
+  background:rgba(0,0,0,{'0.7);backdrop-filter:blur(24px)' if not is_potato else '0.9)'}}}
 .lock-screen.active{{display:flex}}
 .lock-clock{{font-size:64px;font-weight:300}}
 .lock-date{{font-size:16px;color:var(--hart-muted)}}
 .lock-input{{padding:10px 16px;border-radius:12px;border:1px solid var(--hart-glass-border);
   background:var(--hart-glass-bg);color:var(--hart-text);font-size:14px;
-  font-family:var(--hart-font-family);outline:none;width:280px;text-align:center}}
+  font-family:var(--ds-font-body);outline:none;width:280px;text-align:center}}
 .lock-status{{font-size:12px;color:var(--hart-muted)}}
 
 /* ── Scrollbar ── */
@@ -1005,35 +1142,37 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 /* ── Animations ── */
 {_CSS_ANIMATIONS if not is_potato else _CSS_NO_ANIMATIONS}
 {_CSS_DESIGN_SYSTEM}
+{_CSS_POTATO_OVERRIDE if is_potato else ''}
 </style>
 </head>
 <body>
 <div class="wallpaper"></div>
+<a href="#panels" class="skip-link">Skip to content</a>
 
 <!-- Top Bar -->
-<div class="top-bar glass">
-  <div class="start-btn" onclick="toggleStartMenu()" title="Start Menu (Super)">
-    <span class="mi material-icons-round">hexagon</span>
+<div class="top-bar glass" role="banner">
+  <div class="start-btn" role="button" tabindex="0" aria-haspopup="menu" aria-label="Start menu" onclick="toggleStartMenu()" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Start Menu (Super)">
+    <span class="mi material-icons-round" aria-hidden="true">hexagon</span>
     <span>HART</span>
   </div>
-  <div class="top-bar-center" id="agent-status"></div>
+  <div class="top-bar-center" id="agent-status" role="status" aria-live="polite" aria-label="Agent status"></div>
   <div class="top-bar-right">
-    <div class="tray-btn" onclick="openPanel('notifications')" title="Notifications">
-      <span class="mi material-icons-round">notifications</span>
+    <div class="tray-btn" role="button" tabindex="0" aria-label="Notifications" onclick="openPanel('notifications')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Notifications">
+      <span class="mi material-icons-round" aria-hidden="true">notifications</span>
       <div class="badge" id="notif-badge" style="display:none"></div>
     </div>
-    <div class="tray-btn" onclick="openPanel('appearance')" title="Appearance">
-      <span class="mi material-icons-round">palette</span>
+    <div class="tray-btn" role="button" tabindex="0" aria-label="Appearance" onclick="openPanel('appearance')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Appearance">
+      <span class="mi material-icons-round" aria-hidden="true">palette</span>
     </div>
-    <div class="tray-btn" onclick="openPanel('security')" title="Security">
-      <span class="mi material-icons-round">shield</span>
+    <div class="tray-btn" role="button" tabindex="0" aria-label="Security" onclick="openPanel('security')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Security">
+      <span class="mi material-icons-round" aria-hidden="true">shield</span>
     </div>
     <span class="clock" id="clock"></span>
   </div>
 </div>
 
 <!-- Panel Container -->
-<div class="panel-container" id="panels"></div>
+<div class="panel-container" id="panels" role="main" aria-label="Open windows"></div>
 
 <!-- Agent Pill (click to expand floating chat) -->
 <div class="agent-pill glass" id="agent-pill" onclick="toggleAssistantChat()">
@@ -1043,7 +1182,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 </div>
 
 <!-- Floating Assistant Chat Panel -->
-<div class="assistant-chat glass" id="assistant-chat">
+<div class="assistant-chat glass" id="assistant-chat" role="dialog" aria-label="HART Assistant" aria-modal="false">
   <div class="ac-header" id="ac-drag-handle">
     <span class="mi material-icons-round" style="font-size:20px;color:var(--hart-accent)">chat_bubble</span>
     <span class="ac-title">HART Assistant</span>
@@ -1051,7 +1190,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
     <button class="ac-btn mi material-icons-round" onclick="toggleAssistantChat()" title="Close">close</button>
   </div>
   <div class="ac-caps" id="ac-caps"></div>
-  <div class="ac-messages" id="ac-messages">
+  <div class="ac-messages" id="ac-messages" role="log" aria-live="polite">
     <div class="ac-msg assistant">Hi! I can help with anything — chat, code, agents, vision, voice, remote desktop, and 3,200+ OpenClaw skills. What would you like to do?</div>
   </div>
   <div class="ac-input-row">
@@ -1063,18 +1202,18 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 <!-- Start Menu -->
 <div class="start-menu glass" id="start-menu">
-  <input class="start-search" id="start-search" placeholder="Search..." oninput="filterStart(this.value)">
+  <input class="start-search" id="start-search" placeholder="Search..." oninput="filterStart(this.value)" onkeydown="if(event.key==='Enter'){{event.preventDefault();startSearchEnter()}}">
   <div class="start-scroll" id="start-scroll"></div>
   <div class="start-footer">
-    <div class="power-btn" onclick="shellAction('lock')"><span class="mi material-icons-round">lock</span>Lock</div>
-    <div class="power-btn" onclick="shellAction('suspend')"><span class="mi material-icons-round">dark_mode</span>Sleep</div>
-    <div class="power-btn" onclick="shellAction('restart')"><span class="mi material-icons-round">refresh</span>Restart</div>
-    <div class="power-btn" onclick="shellAction('shutdown')"><span class="mi material-icons-round">power_settings_new</span>Shut Down</div>
+    <div class="power-btn" role="button" tabindex="0" onclick="shellAction('lock')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">lock</span>Lock</div>
+    <div class="power-btn" role="button" tabindex="0" onclick="shellAction('suspend')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">dark_mode</span>Sleep</div>
+    <div class="power-btn" role="button" tabindex="0" onclick="shellAction('restart')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">refresh</span>Restart</div>
+    <div class="power-btn" role="button" tabindex="0" onclick="shellAction('shutdown')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">power_settings_new</span>Shut Down</div>
   </div>
 </div>
 
 <!-- Lock Screen -->
-<div class="lock-screen" id="lock-screen">
+<div class="lock-screen" id="lock-screen" role="dialog" aria-modal="true" aria-label="Screen locked">
   <div class="lock-clock" id="lock-clock"></div>
   <div class="lock-date" id="lock-date"></div>
   <input class="lock-input" type="password" placeholder="Password" id="lock-pw"
@@ -1083,10 +1222,10 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 </div>
 
 <!-- Taskbar (open panels as chips) -->
-<div class="taskbar glass" id="taskbar"></div>
+<div class="taskbar glass" id="taskbar" role="navigation" aria-label="Taskbar"></div>
 
 <!-- Toast Notifications -->
-<div class="toast-container" id="toast-container"></div>
+<div class="toast-container" id="toast-container" role="status" aria-live="polite"></div>
 
 <!-- Context Menu -->
 <div class="ctx-menu glass" id="ctx-menu" style="display:none"></div>
@@ -1115,6 +1254,7 @@ let panels = {{}};
 let panelZ = 100;
 let startOpen = false;
 let focusedPanel = null;
+let mru = [];
 
 // ═══════════════════════════════════════════════
 //  HART Design System — Component Library
@@ -1436,7 +1576,7 @@ function updateTaskbar() {{
     const active = id===focusedPanel ? 'active' : '';
     const icon = info.icon || 'web_asset';
     const title = info.title || id;
-    return '<div class="taskbar-chip glass '+active+'" onclick="bringToFront(\''+id+'\')" title="'+title+'">' +
+    return '<div class="taskbar-chip glass '+active+'" onclick="taskbarClick(\''+id+'\')" title="'+title+'">' +
       '<span class="mi material-icons-round">'+icon+'</span>' +
       '<span class="chip-label">'+title+'</span></div>';
   }}).join('');
@@ -1536,6 +1676,13 @@ function filterStart(q) {{
     const title = (el.dataset.title||'').toLowerCase();
     el.style.display = title.includes(lq) ? '' : 'none';
   }});
+}}
+// Enter in the start search launches the first visible result (Spotlight-style).
+function startSearchEnter() {{
+  const items = document.querySelectorAll('.start-item');
+  for(const el of items) {{
+    if(el.style.display !== 'none') {{ el.click(); return; }}
+  }}
 }}
 
 // ═══ Panel Manager ═══
@@ -1687,7 +1834,18 @@ function bringToFront(id) {{
   p.el.style.zIndex = ++panelZ;
   Object.keys(panels).forEach(k=>panels[k].el.classList.toggle('focused',k===id));
   focusedPanel = id;
+  mru = [id, ...mru.filter(x=>x!==id)];
   updateTaskbar();
+}}
+
+// Taskbar chip click: clicking the FOCUSED window's chip minimizes it (the
+// Win11/macOS dock gesture); otherwise raise/un-minimize it. Was bringToFront-
+// only, so there was no way to minimize a window via the taskbar.
+function taskbarClick(id) {{
+  const p = panels[id];
+  if(!p) return;
+  if(id===focusedPanel && !p.min) {{ minimizePanel(id); }}
+  else {{ bringToFront(id); }}
 }}
 
 // ═══ Drag & Resize ═══
@@ -1712,7 +1870,13 @@ document.addEventListener('mousemove', e=>{{
   const p = panels[dragState.id];
   if(!p) return;
   if(dragState.mode==='move') {{
-    const nx = dragState.ox+dx, ny = dragState.oy+dy;
+    // Clamp the titlebar on-screen — it could be dragged under the top bar,
+    // below the taskbar, or past a side until unreachable (window lost
+    // unrecoverably). Keep >=80px on each axis.
+    const KEEP=80, TOP=40, TASK=44;
+    let nx = dragState.ox+dx, ny = dragState.oy+dy;
+    nx = Math.min(Math.max(nx, KEEP - p.el.offsetWidth), window.innerWidth - KEEP);
+    ny = Math.min(Math.max(ny, TOP), window.innerHeight - TASK - 28);
     p.el.style.left = nx+'px'; p.el.style.top = ny+'px';
     p.x = nx; p.y = ny;
   }} else {{
@@ -2366,17 +2530,25 @@ function loadAccessibilityPanel(el) {{
   fetch(SHELL+'/api/shell/accessibility',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Accessibility</div><div class="ds-stagger">';
     const items = [
-      ['screen_reader', 'Screen Reader', data.screen_reader],
-      ['text_increase', 'Large Text', data.large_text],
-      ['contrast', 'High Contrast', data.high_contrast],
-      ['animation', 'Reduce Motion', data.reduce_motion],
+      ['contrast', 'High Contrast', 'high_contrast', data.high_contrast],
+      ['animation', 'Reduce Motion', 'reduced_motion', data.reduced_motion],
+      ['record_voice_over', 'Screen Reader', 'screen_reader', data.screen_reader],
+      ['back_hand', 'Large Cursor', 'large_cursor', data.large_cursor],
+      ['keyboard', 'Sticky Keys', 'sticky_keys', data.sticky_keys],
     ];
-    items.forEach(([icon,label,val])=>{{
-      html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent">'+icon+'</span>'+
+    items.forEach(([icon,label,key,val])=>{{
+      html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent" aria-hidden="true">'+icon+'</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+label+'</div></div>'+
-        '<label class="ds-switch"><input type="checkbox" '+(val?'checked':'')+' onchange="toggleA11y(\\''+label.toLowerCase().replace(/ /g,'_')+'\\',this.checked)"><span class="ds-switch-slider"></span></label></div>';
+        '<label class="ds-switch"><input type="checkbox" role="switch" aria-label="'+label+'" '+(val?'checked':'')+' onchange="toggleA11y(\\''+key+'\\',this.checked)"><span class="ds-switch-slider"></span></label></div>';
     }});
-    if(data.font_scale) html += dsStatusRow('format_size', 'Font Scale', data.font_scale+'x', 'var(--hart-muted)');
+    const _fsv = data.font_scale || 1;
+    html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent" aria-hidden="true">format_size</span>'+
+      '<div class="ds-list-item-content"><div class="ds-list-item-primary">Font Scale</div></div>'+
+      '<div class="ds-flex ds-gap-2" style="align-items:center">'+
+        '<button class="ds-btn ds-btn-icon ds-btn-tonal" aria-label="Decrease font size" onclick="setFontScale('+_fsv+'-0.1)"><span class="mi material-icons-round" aria-hidden="true">remove</span></button>'+
+        '<span style="min-width:46px;text-align:center">'+Math.round(_fsv*100)+'%</span>'+
+        '<button class="ds-btn ds-btn-icon ds-btn-tonal" aria-label="Increase font size" onclick="setFontScale('+_fsv+'+0.1)"><span class="mi material-icons-round" aria-hidden="true">add</span></button>'+
+      '</div></div>';
     html += '</div></div>';
     el.innerHTML = html;
   }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Accessibility unavailable</div>'; }});
@@ -2384,7 +2556,16 @@ function loadAccessibilityPanel(el) {{
 function toggleA11y(key,val) {{
   const body = {{}};
   body[key] = val;
-  fetch(SHELL+'/api/shell/accessibility',{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}}).catch(()=>{{}});
+  // Reload after a successful PUT so the render re-reads the live a11y state and
+  // applies the <html> class (high-contrast / reduced-motion). Same pattern the
+  // theme switcher uses.
+  fetch(SHELL+'/api/shell/accessibility',{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}})
+    .then(()=>location.reload()).catch(()=>{{}});
+}}
+function setFontScale(v) {{
+  v = Math.max(0.8, Math.min(2.0, Math.round(v*10)/10));
+  fetch(SHELL+'/api/shell/accessibility',{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{font_scale:v}})}})
+    .then(()=>location.reload()).catch(()=>{{}});
 }}
 
 // ═══ Screenshot & Recording ═══
@@ -3089,6 +3270,7 @@ const AC_CAPS = [
 let acMessages = [];
 let acActiveCap = 'chat';
 let acDragging = false;
+let acInit = false;
 let acDragOfs = {{x:0,y:0}};
 
 function initAssistantChat() {{
@@ -3100,10 +3282,14 @@ function initAssistantChat() {{
     '<span class="mi material-icons-round">'+c.icon+'</span>'+c.name+'</div>'
   ).join('');
 
-  // Drag support
+  // Drag support — bind the global mousemove/mouseup listeners ONCE. This fn runs
+  // on EVERY chat open, so without this guard each open added another live
+  // document listener (a growing perf leak on the low-end target).
+  if(acInit) return;
   const handle = document.getElementById('ac-drag-handle');
   const chat = document.getElementById('assistant-chat');
   if(!handle||!chat) return;
+  acInit = true;
   handle.addEventListener('mousedown', function(e) {{
     if(e.target.closest('.ac-btn')) return;
     acDragging = true;
@@ -3114,8 +3300,11 @@ function initAssistantChat() {{
   document.addEventListener('mousemove', function(e) {{
     if(!acDragging) return;
     const chat = document.getElementById('assistant-chat');
-    chat.style.left = (e.clientX - acDragOfs.x) + 'px';
-    chat.style.top = (e.clientY - acDragOfs.y) + 'px';
+    let nx = e.clientX - acDragOfs.x, ny = e.clientY - acDragOfs.y;
+    nx = Math.min(Math.max(nx, 8), window.innerWidth - 80);
+    ny = Math.min(Math.max(ny, 40), window.innerHeight - 80);
+    chat.style.left = nx + 'px';
+    chat.style.top = ny + 'px';
     chat.style.right = 'auto';
     chat.style.bottom = 'auto';
   }});
@@ -3249,6 +3438,21 @@ function applyPreset(id, resp) {{
     }}).catch(()=>{{ resp.textContent='Failed to apply theme'; }});
 }}
 
+// Focus trap: keep Tab within the active modal surface (lock screen / start menu
+// / dialog) so keyboard focus can't escape behind it. No-op when none is open.
+document.addEventListener('keydown', function(e) {{
+  if(e.key!=='Tab') return;
+  const trap = document.querySelector('.lock-screen.active, .start-menu.open, .ds-modal-overlay.ds-open .ds-modal');
+  if(!trap) return;
+  const nodes = trap.querySelectorAll('button,input,select,textarea,a[href],[tabindex]:not([tabindex="-1"]),[role="button"][tabindex]');
+  const f = Array.prototype.filter.call(nodes, el=>el.offsetParent!==null);
+  if(!f.length) return;
+  const first=f[0], last=f[f.length-1], act=document.activeElement;
+  if(!trap.contains(act)) {{ e.preventDefault(); first.focus(); }}
+  else if(e.shiftKey && act===first) {{ e.preventDefault(); last.focus(); }}
+  else if(!e.shiftKey && act===last) {{ e.preventDefault(); first.focus(); }}
+}});
+
 // ═══ Context Menu ═══
 document.addEventListener('contextmenu', e => {{
   e.preventDefault();
@@ -3289,9 +3493,13 @@ document.addEventListener('keydown', e => {{
   // Alt+Tab — cycle through panels
   if(e.key==='Tab'&&e.altKey) {{
     e.preventDefault();
-    const ids = Object.keys(panels);
+    // MRU order: Alt+Tab flips to the PREVIOUSLY-focused window (Win11/macOS),
+    // not creation order. Fall back to creation order if MRU is incomplete.
+    const order = mru.filter(id=>panels[id]);
+    const ids = order.length>=2 ? order : Object.keys(panels);
     if(ids.length<2) return;
-    const idx = (ids.indexOf(focusedPanel)+1)%ids.length;
+    const cur = ids.indexOf(focusedPanel);
+    const idx = cur<0 ? 0 : (cur+1)%ids.length;
     bringToFront(ids[idx]);
   }}
   // Super+D — show desktop (minimize all)
@@ -4507,8 +4715,8 @@ function renderAgentOverlay(ev) {{
                 metrics['error'] = 'psutil not installed'
             # GPU via VRAMManager
             try:
-                from integrations.service_tools.vram_manager import VRAMManager
-                gpu = VRAMManager.detect_gpu()
+                from integrations.service_tools.vram_manager import get_vram_manager
+                gpu = get_vram_manager().detect_gpu()  # instance method — call on the singleton, not the class
                 if gpu and gpu.get('name'):
                     metrics['gpu'] = gpu
             except Exception:

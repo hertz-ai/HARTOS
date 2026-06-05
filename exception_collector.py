@@ -246,3 +246,191 @@ def record_exception(exc: BaseException, module: str = '', function: str = '',
             user_prompt=user_prompt, action_id=action_id, context=ctx)
     except Exception:
         pass
+
+
+# ────────────────────────────────────────────────────────────────────
+# Reusable auto-wrap mixin: every subsystem inherits this once and
+# all its method failures auto-feed the self-heal pipeline.  No
+# bespoke per-subsystem report calls; no per-method except-block
+# edits.  Used by ChannelAdapter, VisionBackend, LLM workers,
+# daemon supervisors, dynamic tool registries — anywhere a class
+# represents a subsystem with installable / failable behaviour.
+# ────────────────────────────────────────────────────────────────────
+
+_AUTO_REPORT_WRAPPED_ATTR = '__subsystem_failure_wrapped__'
+
+
+def _wrap_async_with_subsystem_report(method, subsystem: str,
+                                      method_name: str):
+    """Wrap an async method so escaping exceptions feed the
+    canonical self-heal pipeline.  Re-raises unchanged."""
+    import asyncio  # noqa: F401  — referenced indirectly by `await`
+    import functools
+
+    @functools.wraps(method)
+    async def _wrapped(self, *args, **kwargs):
+        try:
+            return await method(self, *args, **kwargs)
+        except Exception as exc:
+            try:
+                identifier = self._identifier_for_self_heal()
+                report_subsystem_failure(
+                    subsystem, identifier, exc, method_name)
+            except Exception:
+                pass  # sink failure must not change caller contract
+            raise
+    return _wrapped
+
+
+def _wrap_sync_with_subsystem_report(method, subsystem: str,
+                                     method_name: str):
+    """Sync counterpart — for subsystems whose methods aren't async."""
+    import functools
+
+    @functools.wraps(method)
+    def _wrapped(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as exc:
+            try:
+                identifier = self._identifier_for_self_heal()
+                report_subsystem_failure(
+                    subsystem, identifier, exc, method_name)
+            except Exception:
+                pass
+            raise
+    return _wrapped
+
+
+class AutoReportSubsystemFailures:
+    """Mixin: auto-wrap configured methods so escaping exceptions feed
+    the canonical self-heal pipeline.
+
+    Subclass contract:
+      - Set class attr ``SUBSYSTEM = 'tts' | 'channels' | 'vlm' | 'llm'
+        | 'daemon' | 'tool'`` (lowercase, no dot — the helper splits
+        on '.').
+      - Set class attr ``AUTO_REPORTED_METHODS = ('start', 'load',
+        'send_message', ...)`` listing concrete method names that
+        should have their exceptions auto-pushed.
+      - Optionally override ``_identifier_for_self_heal(self)`` to
+        return a per-instance identifier (default: ``self.name`` if
+        the attribute exists, else the class name).
+
+    All listed methods on any concrete subclass get transparently
+    wrapped at class-load time by ``__init_subclass__``.  Wrapping is
+    idempotent — re-importing the module does NOT stack wrappers.
+    Async-vs-sync is auto-detected via ``inspect.iscoroutinefunction``.
+
+    The wrap re-raises the original exception — caller contracts are
+    unchanged.  Sink failures (collector unavailable, etc.) are
+    swallowed and logged at DEBUG — observability MUST NOT become a
+    new failure surface.
+
+    Why this mixin instead of per-subsystem decorators / explicit
+    pushes:
+      - One place to enforce the (subsystem, identifier) shape that
+        SelfHealingDispatcher's pattern_key grouping depends on.
+      - Zero changes to concrete subclass code beyond setting the
+        two class attrs.  Subclasses can also call
+        ``report_subsystem_failure`` directly from inline try/except
+        blocks where they swallow the exception (e.g. return
+        ``SendResult(success=False)`` and don't propagate).
+      - The same auto-wrap behaviour the user requested for ALL
+        venv-based model setup backend failures + ALL dynamic tool
+        registration failures + ALL daemon supervisors — instead of
+        adding bespoke wiring per surface.
+    """
+
+    SUBSYSTEM: str = ''
+    AUTO_REPORTED_METHODS: tuple = ()
+
+    def _identifier_for_self_heal(self) -> str:
+        """Per-instance identifier passed to the canonical helper.
+        Default: ``self.name`` (matches ChannelAdapter / VisionBackend
+        / similar patterns); falls back to class name when missing."""
+        name_attr = getattr(self, 'name', None)
+        if callable(name_attr):
+            try:
+                return str(name_attr())
+            except Exception:
+                pass
+        if isinstance(name_attr, str) and name_attr:
+            return name_attr
+        return type(self).__name__
+
+    @classmethod
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        subsystem = cls.SUBSYSTEM
+        if not subsystem:
+            # Intermediate base classes that don't set SUBSYSTEM
+            # (e.g. ChannelAdapter itself) just pass through —
+            # the leaf class that sets SUBSYSTEM gets the wrap.
+            return
+        import inspect
+        for method_name in cls.AUTO_REPORTED_METHODS:
+            method = cls.__dict__.get(method_name)
+            if method is None:
+                continue  # subclass didn't override this method
+            if getattr(method, _AUTO_REPORT_WRAPPED_ATTR, False):
+                continue  # already wrapped — idempotent
+            if inspect.iscoroutinefunction(method):
+                wrapped = _wrap_async_with_subsystem_report(
+                    method, subsystem, method_name)
+            else:
+                wrapped = _wrap_sync_with_subsystem_report(
+                    method, subsystem, method_name)
+            setattr(wrapped, _AUTO_REPORT_WRAPPED_ATTR, True)
+            setattr(cls, method_name, wrapped)
+
+
+def report_subsystem_failure(subsystem: str, identifier: str,
+                             exc: BaseException, function: str,
+                             **ctx) -> None:
+    """Single canonical entry point for ANY subsystem's silent-failure
+    surface to feed the self-heal pipeline.
+
+    Subsystems with localized circuit breakers / demotion state /
+    install retries (TTS backends, channel adapters, VLM/LLM model
+    workers, daemon supervisors, dynamic tool registrations) all
+    need their failures to ALSO reach the canonical self-heal chain:
+
+        record_exception() → ExceptionCollector (singleton, bounded
+        buffer, dedup by pattern_key) → ExceptionWatcher (runs
+        inside agent_daemon._tick, classifies severity) →
+        SelfHealingDispatcher (creates a `self_heal` goal for an
+        idle agent when pattern crosses threshold) → idle agent
+        uses repair tools to fix the root cause.
+
+    Without this single entry, each subsystem would maintain its
+    own opinion of "module key" and ctx vocabulary — a parallel-
+    path violation that splinters the pattern_key grouping the
+    dispatcher relies on for dedup.  Use THIS helper instead:
+
+      report_subsystem_failure('tts',     'indic_parler', exc, 'demote', ...)
+      report_subsystem_failure('channels','discord',      exc, 'send_message', ...)
+      report_subsystem_failure('vlm',     'minicpm',      exc, 'load',  ...)
+      report_subsystem_failure('llm',     'qwen3_4b',     exc, 'load',  ...)
+      report_subsystem_failure('daemon',  'agent_daemon', exc, 'tick',  ...)
+      report_subsystem_failure('tool',    'pdf_extract',  exc, 'register', ...)
+
+    Module key is uniformly ``{subsystem}.{identifier}`` so the
+    dispatcher's pattern_key = ``{exc_type}::{subsystem}.{identifier}
+    ::{function}`` groups related failures correctly across the
+    entire system.  Self-heal goals carry the subsystem in their
+    config so the agent picks the right repair tool from the
+    capability matrix.
+
+    Fire-and-forget — never raises into caller.  Safe from any
+    except block.
+    """
+    try:
+        ExceptionCollector.get_instance().record(
+            exc,
+            module=f'{subsystem}.{identifier}' if identifier else subsystem,
+            function=function,
+            context={'subsystem': subsystem, 'identifier': identifier, **ctx},
+        )
+    except Exception:
+        pass

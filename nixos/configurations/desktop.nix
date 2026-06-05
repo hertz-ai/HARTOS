@@ -16,6 +16,41 @@
 #
 # Minimum 8GB RAM.
 
+let
+  # Rasterize the HART logo (SVG source in nixos/branding/) → PNG for Plymouth,
+  # which needs raster.  GNOME renders the SVG wallpaper directly (dconf below).
+  hartLogoPng = pkgs.runCommand "hart-logo-png" { nativeBuildInputs = [ pkgs.librsvg ]; } ''
+    mkdir -p $out
+    rsvg-convert -w 320 -h 320 ${../branding/hart-logo.svg} -o $out/logo.png
+  '';
+
+  # ─── Premium boot splash (opt-in) ──────────────────────────────────────
+  # DEFAULT FALSE — boot stays on NixOS's stock Plymouth theme with the HART
+  # logo swapped in (boot.plymouth.logo below), the combination proven on the
+  # #99-103 boot path. Flip to true for the custom HART theme (dark gradient +
+  # centered logo + LUKS message/password support) AFTER verifying it paints on
+  # a real ISO boot. The theme uses Plymouth's `script` plugin (framebuffer/KMS,
+  # no GL — safe on the same broken-GPU path the glass shell hardens for), so a
+  # bad GPU can't text-downgrade it. Off = byte-identical to the current boot.
+  useCustomBootSplash = false;
+
+  hartPlymouth = pkgs.runCommand "hart-plymouth-theme" { } ''
+    d=$out/share/plymouth/themes/hart
+    mkdir -p "$d"
+    cp ${hartLogoPng}/logo.png "$d/logo.png"
+    cp ${../branding/plymouth/hart.script} "$d/hart.script"
+    {
+      echo "[Plymouth Theme]"
+      echo "Name=HART OS"
+      echo "Description=HART OS boot splash"
+      echo "ModuleName=script"
+      echo ""
+      echo "[script]"
+      echo "ImageDir=$d"
+      echo "ScriptFile=$d/hart.script"
+    } > "$d/hart.plymouth"
+  '';
+in
 {
   imports = [
     "${modulesPath}/installer/cd-dvd/installation-cd-graphical-gnome.nix"
@@ -23,7 +58,7 @@
 
   # ─── Disable ZFS (broken in nixpkgs 24.11 for kernel 6.15) ───
   boot.supportedFilesystems.zfs = lib.mkForce false;
-  nixpkgs.config.allowBroken = false;
+  # nixpkgs.config.allowBroken now set once at the flake level (#70)
 
   # Note: do NOT override `glibcLocales` with a custom `locales`
   # allow-list. Changing its derivation hash invalidates the
@@ -260,7 +295,15 @@
     gnomeExtensions.dash-to-dock       # Taskbar (dock) at bottom
     gnomeExtensions.appindicator       # System tray support
     jetbrains-mono                     # Default monospace font
-  ];
+  ]
+  # ── Remote Desktop (open-source TeamViewer equivalent) ──
+  # RustDesk: ID-based P2P remote control + file transfer. gnome-connections
+  # above is only an RDP/VNC *viewer*; RustDesk is the TeamViewer-style remote-
+  # control client+server the OS was missing. Attr-guarded so a nixpkgs rev that
+  # names it differently (rustdesk vs rustdesk-flutter) or lacks it cannot break
+  # evaluation; CI's Nix Build Matrix validates the package itself builds.
+  ++ lib.optional (pkgs ? rustdesk) pkgs.rustdesk
+  ++ lib.optional (pkgs ? "rustdesk-flutter") pkgs."rustdesk-flutter";
 
   # ─── ISO Branding ───
   isoImage = {
@@ -287,6 +330,27 @@
   environment.gnome.excludePackages = with pkgs; [
     gnome-tour  # Disable first-run tour (HART has its own onboarding)
   ];
+  # ─── GDM greeter branding ───
+  # The login screen (first thing after Plymouth) was stock GNOME. Brand it: HART
+  # logo (raster PNG — the greeter doesn't render SVG reliably) + a banner + dark
+  # scheme. GDM reads its OWN dconf profile, separate from the user one below.
+  # disable-user-list is intentionally NOT set: the installer 'nixos' user is
+  # already hidden via uid<1000, and forcing the list off would also hide
+  # hart-admin. Additive — does not touch autologin or the kiosk session.
+  programs.dconf.profiles.gdm.databases = [{
+    settings = {
+      "org/gnome/login-screen" = {
+        logo = "${hartLogoPng}/logo.png";
+        banner-message-enable = true;
+        banner-message-text = "HART OS — Humans are always in control";
+      };
+      "org/gnome/desktop/interface" = {
+        color-scheme = "prefer-dark";
+        gtk-theme = "Adwaita-dark";
+      };
+    };
+  }];
+
   programs.dconf.profiles.user.databases = [{
     settings = {
       # ─── HART OS Branding ───
@@ -297,12 +361,12 @@
         document-font-name = "Cantarell 11";
       };
       "org/gnome/desktop/background" = {
-        picture-uri = "file:///etc/hart/branding/wallpaper.png";
-        picture-uri-dark = "file:///etc/hart/branding/wallpaper-dark.png";
+        picture-uri = "file:///etc/hart/branding/wallpaper.svg";
+        picture-uri-dark = "file:///etc/hart/branding/wallpaper.svg";
         primary-color = "#080808";
       };
       "org/gnome/desktop/screensaver" = {
-        picture-uri = "file:///etc/hart/branding/lock-screen.png";
+        picture-uri = "file:///etc/hart/branding/lock-screen.svg";
         primary-color = "#080808";
       };
       # ─── Taskbar / Dash / Top Bar customization ───
@@ -452,6 +516,29 @@
     user = lib.mkForce "hart-admin";
   };
 
+  # ─── Hide the NixOS live-installer user (NixOS must be invisible) ───
+  # installation-cd-graphical-gnome.nix (imported above) injects a NORMAL
+  # `nixos` user (uid 1000) plus its own auto-login. We auto-login to
+  # hart-admin (above); here we demote `nixos` to a hidden SYSTEM account
+  # (uid < 1000) so GDM never lists it in the greeter, and we drop the TTY
+  # auto-login so a Ctrl+Alt+F-key never lands on "nixos" either. Android
+  # hides Linux from its users; HART OS hides NixOS the same way.
+  users.users.nixos = lib.mkForce {
+    isSystemUser = true;
+    group = "nixos";
+  };
+  users.groups.nixos = lib.mkForce {};
+  services.getty.autologinUser = lib.mkForce null;
+
+  # ─── Default session = the HART OS glass shell (NOT GNOME) ───
+  # This is the line that makes the install land in Nunba/LiquidUI instead of
+  # the GNOME desktop.  The "hart-shell" session is the cage kiosk registered by
+  # hart-liquid-ui.nix (Nunba/LiquidUI as the shell, no desktop beneath it).
+  # GNOME stays enabled + selectable at the greeter as a FALLBACK, so a shell
+  # that fails to come up can never brick the boot — interrupt auto-login and
+  # pick "GNOME".  Zero-regression by construction.
+  services.displayManager.defaultSession = lib.mkForce "hart-shell";
+
   # Audio: PipeWire bridges all subsystems (Linux, Android, Wine)
   services.pipewire = {
     enable = true;
@@ -493,27 +580,29 @@
   services.upower.enable = true;
   services.thermald.enable = true;
 
-  # ─── HART OS Branding ───
-  # Logo and wallpaper files are deployed to /etc/hart/branding/
-  # by the hart-branding package (or manually placed there)
+  # ─── HART OS Branding (real assets, not placeholders) ───
+  # SVG sources live in nixos/branding/.  GNOME renders SVG wallpapers directly
+  # (dconf above points here); Plymouth gets the rasterized logo (hartLogoPng).
+  # The mark: a geometric heart with circuit-board traces — human compassion +
+  # machine intelligence — in #00D4AA (HART teal) on dark #080808.
   environment.etc = {
-    "hart/branding/README" = {
-      text = ''
-        HART OS Branding Assets
-        =======================
-        wallpaper.png      — Desktop wallpaper (dark theme, HART logo)
-        wallpaper-dark.png — Dark variant
-        lock-screen.png    — Lock screen background
-        logo.svg           — HART OS logo (scalable)
-        logo-64.png        — HART OS logo 64x64
-        logo-128.png       — HART OS logo 128x128
-        icon.svg           — Application icon
-
-        The HART OS logo features a minimalist geometric heart shape
-        with circuit-board traces emanating from within, symbolizing
-        the union of human compassion and machine intelligence.
-        Color: #00D4AA (HART accent green) on dark (#080808) background.
-      '';
-    };
+    "hart/branding/wallpaper.svg".source = ../branding/hart-wallpaper.svg;
+    "hart/branding/lock-screen.svg".source = ../branding/hart-wallpaper.svg;
+    "hart/branding/logo.svg".source = ../branding/hart-logo.svg;
   };
+
+  # ─── Boot splash: HART logo, not the NixOS lizard ───
+  # Uses NixOS's default Plymouth theme but swaps in our logo via
+  # boot.plymouth.logo (low-risk — no custom theme module).  quiet+splash hide
+  # the kernel/systemd text boot behind the graphical splash.
+  boot.plymouth = {
+    enable = lib.mkForce true;  # base installer-CD profile may also set this
+    logo = lib.mkForce "${hartLogoPng}/logo.png";
+  } // lib.optionalAttrs useCustomBootSplash {
+    # Opt-in only (useCustomBootSplash above). Off ⇒ {} ⇒ this merge is a no-op
+    # and boot.plymouth is byte-identical to the proven stock-theme-plus-logo.
+    themePackages = [ hartPlymouth ];
+    theme = lib.mkForce "hart";
+  };
+  boot.kernelParams = [ "quiet" "splash" ];
 }

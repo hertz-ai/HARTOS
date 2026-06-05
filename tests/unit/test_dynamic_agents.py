@@ -16,6 +16,37 @@ from integrations.google_a2a import (
     get_registered_agent_info
 )
 
+
+# ── #92 regression: agents sorted by a non-existent role_number → AttributeError ──
+
+def _mk_agent(prompt_id, flow_id):
+    from integrations.google_a2a.dynamic_agent_registry import TrainedAgent
+    return TrainedAgent(
+        agent_id=f"{prompt_id}_{flow_id}", prompt_id=prompt_id, flow_id=flow_id,
+        persona="p", action="a", recipe=[], status="done",
+        can_perform_without_user_input="yes", fallback_action="",
+        metadata={}, recipe_file=f"{prompt_id}_{flow_id}_recipe.json",
+    )
+
+
+def test_trained_agent_has_no_role_number_field():
+    # The dataclass never had role_number (naming is 2-part {prompt_id}_{flow_id});
+    # the old sort key referenced it → AttributeError on every discovery.
+    from dataclasses import fields
+    from integrations.google_a2a.dynamic_agent_registry import TrainedAgent
+    names = {f.name for f in fields(TrainedAgent)}
+    assert 'role_number' not in names
+    assert 'flow_id' in names
+
+
+def test_agents_sort_by_flow_id_without_attributeerror():
+    import pytest
+    agents = [_mk_agent(71, 2), _mk_agent(71, 0), _mk_agent(71, 1)]
+    ordered = sorted(agents, key=lambda a: a.flow_id)          # the fixed production key
+    assert [a.flow_id for a in ordered] == [0, 1, 2]
+    with pytest.raises(AttributeError):                        # the old key WAS broken
+        sorted(agents, key=lambda a: (a.flow_id, a.role_number))
+
 def test_dynamic_discovery():
     """Test agent discovery from prompts directory"""
     print("="*80)

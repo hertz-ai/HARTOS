@@ -82,8 +82,13 @@ print(f'Node ID: {public_bytes.hex()[:16]}...')
     GPU="none"
     GPU_COUNT=0
     if command -v nvidia-smi &>/dev/null; then
-      GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1) || true
-      GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l) || GPU_COUNT=0
+      # `timeout` guards against a wedged GPU: on a box whose driver is failing
+      # (the real-hardware boot showed nouveau `gsp: fini failed`), nvidia-smi
+      # can hang, and a hung query stalls this oneshot until systemd kills it —
+      # "Failed to start HART OS First Boot Setup". Cap it; absent/odd output
+      # just leaves GPU=none.
+      GPU=$(${pkgs.coreutils}/bin/timeout 8 nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1) || true
+      GPU_COUNT=$(${pkgs.coreutils}/bin/timeout 8 nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l) || GPU_COUNT=0
     fi
 
     # Tier classification (matches security/system_requirements.py)

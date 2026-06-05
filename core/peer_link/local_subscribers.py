@@ -151,6 +151,26 @@ class DeliveryTracker:
                 except Exception:
                     pass
 
+                # Decentralized FCM fallback — this is the FCM send the class
+                # docstring deferred as "cloud-only".  A PERSONAL message
+                # unconfirmed after TTL means the user's device never acked
+                # locally (typically a backgrounded phone), so push it via FCM
+                # using the LOCALLY-cached token (core.fcm_sync) — no crossbar,
+                # no cloud round-trip.  No-op without a registered token / edge
+                # credential, so it is safe on every node; the send stamps the
+                # privacy-tier notice (we left the local tier to reach the
+                # device).  Generic body — the content renders in-app on open.
+                _uid = info.get('user_id')
+                if _uid:
+                    try:
+                        from core.fcm_sync import send_fcm_push
+                        send_fcm_push(
+                            _uid, title='HART',
+                            body='You have a new notification',
+                            data={'topic': info.get('topic', ''), 'msg_id': msg_id})
+                    except Exception:
+                        pass
+
     def get_stats(self) -> dict:
         with self._lock:
             return {'pending': len(self._pending)}

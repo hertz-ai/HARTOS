@@ -91,6 +91,20 @@ class AgentSkill:
         }
 
 
+def _balanced_skill_score(skill) -> float:
+    """Balanced-strategy composite score for a skill — single source (#98d).
+
+    40% proficiency + 25% success_rate + 20% inverse-latency (cap 60s) +
+    15% inverse-cost (cap 100 spark).  Previously duplicated byte-for-byte in
+    AgentSkillRegistry.find_agents_with_skill and A2AContextExchange._score_agent.
+    """
+    prof = skill.proficiency
+    rate = skill.get_success_rate() if skill.usage_count > 0 else prof
+    latency_norm = (1.0 - min(skill.avg_latency_ms / 60000.0, 1.0)) if skill.avg_latency_ms > 0 else 0.5
+    cost_norm = (1.0 - min(skill.avg_cost_spark / 100.0, 1.0)) if skill.avg_cost_spark > 0 else 0.5
+    return (0.40 * prof) + (0.25 * rate) + (0.20 * latency_norm) + (0.15 * cost_norm)
+
+
 class AgentSkillRegistry:
     """Registry for tracking agent skills and capabilities"""
 
@@ -162,18 +176,8 @@ class AgentSkillRegistry:
                     return rate - cost_penalty
                 matches.sort(key=efficiency_score, reverse=True)
             elif strategy == 'balanced':
-                # Weighted composite: 40% proficiency, 25% success_rate,
-                # 20% speed (inverse latency), 15% cost (inverse)
-                def balanced_score(item):
-                    s = item[1]
-                    prof = s.proficiency
-                    rate = s.get_success_rate() if s.usage_count > 0 else prof
-                    # Normalize latency: lower is better, cap at 60s
-                    latency_norm = 1.0 - min(s.avg_latency_ms / 60000.0, 1.0) if s.avg_latency_ms > 0 else 0.5
-                    # Normalize cost: lower is better, cap at 100 spark
-                    cost_norm = 1.0 - min(s.avg_cost_spark / 100.0, 1.0) if s.avg_cost_spark > 0 else 0.5
-                    return (0.40 * prof) + (0.25 * rate) + (0.20 * latency_norm) + (0.15 * cost_norm)
-                matches.sort(key=balanced_score, reverse=True)
+                # Weighted composite — single source: _balanced_skill_score (#98d)
+                matches.sort(key=lambda item: _balanced_skill_score(item[1]), reverse=True)
             else:
                 # Default: accuracy — highest proficiency first
                 matches.sort(key=lambda x: x[1].proficiency, reverse=True)
@@ -260,7 +264,12 @@ class A2AContextExchange:
         self.message_queues: Dict[str, deque] = {}  # agent_id -> message queue
         self.shared_context: Dict[str, Any] = {}  # Shared context across agents
         self.delegations: Dict[str, Dict[str, Any]] = {}  # delegation_id -> delegation info
-        self.lock = threading.Lock()
+        # RLock (reentrant), NOT Lock: send_message() acquires this lock and then
+        # calls register_agent() for an unknown recipient, which re-acquires it.
+        # A plain Lock self-deadlocks the calling thread there — the CI #82
+        # >120s timeout at internal_agent_communication.py:301 (send_message to
+        # an unregistered agent).  RLock lets the same thread re-enter.
+        self.lock = threading.RLock()
 
     def register_agent(self, agent_id: str):
         """Register an agent for A2A communication"""
@@ -395,11 +404,8 @@ class A2AContextExchange:
                 cost_penalty = min(skill.avg_cost_spark / 100.0, 1.0) if skill.avg_cost_spark > 0 else 0.0
                 scores.append(rate - cost_penalty)
             elif strategy == 'balanced':
-                prof = skill.proficiency
-                rate = skill.get_success_rate() if skill.usage_count > 0 else prof
-                latency_norm = (1.0 - min(skill.avg_latency_ms / 60000.0, 1.0)) if skill.avg_latency_ms > 0 else 0.5
-                cost_norm = (1.0 - min(skill.avg_cost_spark / 100.0, 1.0)) if skill.avg_cost_spark > 0 else 0.5
-                scores.append(0.40 * prof + 0.25 * rate + 0.20 * latency_norm + 0.15 * cost_norm)
+                # Weighted composite — single source: _balanced_skill_score (#98d)
+                scores.append(_balanced_skill_score(skill))
             else:
                 # accuracy (default)
                 scores.append(skill.proficiency)

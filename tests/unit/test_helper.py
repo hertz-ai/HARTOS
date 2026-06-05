@@ -386,6 +386,23 @@ class TestSafePromptPath:
         path = safe_prompt_path("42", "0", "1")
         assert "42_0_1.json" in path
 
+    def test_equivalent_to_inline_join_for_valid_ids(self):
+        # Locks the #94 migration: for every VALID id form (int / uuid),
+        # safe_prompt_path(...) must equal the inline os.path.join(PROMPTS_DIR,
+        # f'...') string the bypassing sites build — so routing them through it
+        # is provably transparent (only malicious ids diverge, by raising).
+        import os
+        from helper import safe_prompt_path, PROMPTS_DIR
+        for pid in ('71', '12345', 'a1b2c3d4-5e6f-7890-abcd-ef1234567890'):
+            assert safe_prompt_path(pid) == os.path.join(PROMPTS_DIR, f'{pid}.json')
+            assert safe_prompt_path(pid, '0', 'recipe') == \
+                os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')
+            assert safe_prompt_path(pid, '2', '5') == \
+                os.path.join(PROMPTS_DIR, f'{pid}_2_5.json')
+            # base-path form (no extension) — for sites that append a suffix later
+            assert safe_prompt_path(pid, '0', ext='') == \
+                os.path.join(PROMPTS_DIR, f'{pid}_0')
+
     def test_accepts_hyphens_and_underscores(self):
         from helper import safe_prompt_path
         path = safe_prompt_path("my-agent_v2")

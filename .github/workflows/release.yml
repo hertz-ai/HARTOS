@@ -26,6 +26,12 @@ jobs:
   # ═══════════════════════════════════════════════════════════
   test:
     runs-on: ubuntu-latest
+    # Hard ceiling so a single hung test can never burn the 6h GitHub job cap
+    # again — a no-timeout pytest step ran 6h05m before auto-cancel (2026-06-03,
+    # run 26870369540). The per-test --timeout below is the targeted guard that
+    # names the culprit; this job-level cap is the backstop if a C-level block
+    # escapes the thread-method timeout.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -39,7 +45,7 @@ jobs:
           pip install -r requirements.txt
           pip install -e . --no-deps
           python -c "from core.platform.events import EventBus; print(f'EventBus import OK: {EventBus}')"
-          pip install pytest pytest-asyncio
+          pip install pytest pytest-asyncio pytest-timeout
           pip install grep-ast tree-sitter tree-sitter-language-pack 2>/dev/null || true
           python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True)" 2>/dev/null || true
 
@@ -65,6 +71,7 @@ jobs:
             --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
             --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
             --noconftest \
+            --timeout=120 \
             -q --tb=line
 
       # Integration tests — cross-module flows (channels, social, federation).
@@ -80,6 +87,7 @@ jobs:
           python -m pytest \
             tests/integration/ \
             --noconftest \
+            --timeout=120 \
             -q --tb=line || echo "Integration tests had failures (non-blocking)"
 
       # E2E tests — full-stack scenarios. Best-effort.
@@ -95,6 +103,7 @@ jobs:
             tests/e2e/ \
             --ignore=tests/e2e/runtime_tests \
             --noconftest \
+            --timeout=120 \
             -q --tb=line || echo "E2E tests had failures (non-blocking)"
 
   # ═══════════════════════════════════════════════════════════

@@ -291,6 +291,91 @@ class FrameCapture:
             self._running = False
             self._cleanup()
 
+    def record_to_video(self, duration_s: float = 10.0, fps: int = 10,
+                        output_path: Optional[str] = None,
+                        max_frames: int = 1200) -> dict:
+        """Record the screen for ``duration_s`` at ``fps`` into a SHAREABLE video.
+
+        This is the missing "frames → shareable artifact" step for marketing demo
+        videos.  It reuses ``capture_frame()`` (the cross-platform dxcam/mss/
+        pyautogui tiers — so it works on Windows where Nunba runs, unlike the
+        Linux-only ``ffmpeg x11grab`` route in shell_os_apis) and assembles via
+        imageio (the same encoder vision/ltx2_server.py uses).  Prefers mp4
+        (H.264); falls back to GIF when the imageio-ffmpeg plugin is unavailable.
+
+        Captures at a FIXED cadence (no unchanged-frame skipping — a demo needs a
+        steady timeline), bounded by ``max_frames`` so a runaway duration can't
+        exhaust memory.
+
+        Returns: {ok, path, format, frames, fps, duration_s} or {ok: False, error}.
+        """
+        try:
+            import imageio.v2 as imageio
+        except ImportError:
+            try:
+                import imageio  # type: ignore
+            except ImportError:
+                return {'ok': False, 'error': 'imageio not available — cannot assemble video'}
+
+        if output_path is None:
+            try:
+                from core.platform_paths import get_data_dir
+                base = get_data_dir()
+            except Exception:
+                import tempfile
+                base = tempfile.gettempdir()
+            import os
+            demo_dir = os.path.join(base, 'demos')
+            os.makedirs(demo_dir, exist_ok=True)
+            output_path = os.path.join(demo_dir, f'demo_{int(time.time())}.mp4')
+
+        fps = max(1, int(fps))
+        interval = 1.0 / fps
+        n_target = min(int(max_frames), max(1, int(duration_s * fps)))
+
+        frames = []
+        self._running = True
+        try:
+            for _ in range(n_target):
+                if not self._running:
+                    break
+                start = time.monotonic()
+                jpeg = self.capture_frame()
+                if jpeg:
+                    try:
+                        frames.append(imageio.imread(io.BytesIO(jpeg)))
+                    except Exception as e:
+                        logger.debug(f"demo frame decode failed: {e}")
+                elapsed = time.monotonic() - start
+                time.sleep(max(0, interval - elapsed))
+        finally:
+            self._running = False
+            self._cleanup()
+
+        if not frames:
+            return {'ok': False, 'error': 'no frames captured (no screen-capture backend?)'}
+
+        # Prefer mp4 (H.264); fall back to GIF if the ffmpeg plugin is missing.
+        try:
+            imageio.mimwrite(output_path, frames, fps=fps, codec='libx264',
+                             macro_block_size=None)
+            fmt = 'mp4'
+        except Exception as e:
+            logger.info(f"mp4 encode unavailable ({e}); falling back to GIF")
+            import os
+            output_path = os.path.splitext(output_path)[0] + '.gif'
+            imageio.mimwrite(output_path, frames, duration=interval)
+            fmt = 'gif'
+
+        return {
+            'ok': True,
+            'path': output_path,
+            'format': fmt,
+            'frames': len(frames),
+            'fps': fps,
+            'duration_s': round(len(frames) / fps, 2),
+        }
+
     def stop(self) -> None:
         """Stop the capture loop."""
         self._running = False

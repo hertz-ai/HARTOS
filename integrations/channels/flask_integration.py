@@ -43,8 +43,11 @@ class FlaskChannelIntegration:
         if default_prompt_id is None:
             default_prompt_id = DEFAULT_PROMPT_ID
         if agent_api_url is None:
-            from core.port_registry import get_port
-            agent_api_url = f"http://localhost:{get_port('backend')}/chat"
+            # #62 inbound leg: reach the LIVE local HARTOS, not a hardcoded
+            # :6777 (dead in bundled mode, where HARTOS serves in-process on
+            # :5000).  Shared resolver with dispatch Tier-2 — no parallel path.
+            from core.port_registry import get_local_backend_url
+            agent_api_url = get_local_backend_url() + '/chat'
         self.agent_api_url = agent_api_url
         self.default_user_id = default_user_id
         self.default_prompt_id = default_prompt_id
@@ -117,10 +120,14 @@ class FlaskChannelIntegration:
                     return None
 
             # Prepare request to agent API
+            from .chat_contract import chat_request_fields, chat_reply
             payload = {
                 "user_id": user_id,
                 "prompt_id": prompt_id,
-                "prompt": message.content,
+                # Dual /chat contract (standalone HARTOS 'prompt' + bundled Nunba
+                # 'text') — single source in chat_contract, shared with
+                # SelfChatHandler so neither inbound path drifts.
+                **chat_request_fields(message.content),
                 "create_agent": self.create_mode,
                 "device_id": self._device_id,
                 "channel_context": {
@@ -144,7 +151,7 @@ class FlaskChannelIntegration:
 
             if response.status_code == 200:
                 result = response.json()
-                agent_reply = result.get("response", "I processed your request.")
+                agent_reply = chat_reply(result, "I processed your request.")
 
                 # Track response in session history
                 if session:

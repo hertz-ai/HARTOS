@@ -353,8 +353,9 @@ class FeedImporter:
             raise ValueError("Database session required for importing")
 
         try:
-            from .models import Post, get_db
+            from .models import Post, get_db, User, Community
             from .services import PostService
+            from urllib.parse import urlparse
 
             created_ids = []
 
@@ -368,37 +369,55 @@ class FeedImporter:
                     logger.debug(f"Skipping duplicate item: {item.title}")
                     continue
 
-                # Build post content
-                content = f"**{item.title}**\n\n{item.content}"
+                # Build post BODY.  title is a first-class column on the
+                # post, so don't duplicate it inside the body.  Keep the
+                # feed-hash marker in the body so the dedup query above
+                # (Post.content.contains(content_hash)) stays valid; we
+                # also stamp source_channel/source_message_id below for the
+                # canonical dedup columns.
+                body = item.content or ''
                 if item.link:
-                    content += f"\n\n[Source]({item.link})"
+                    body += f"\n\n[Source]({item.link})"
+                body += f"\n\n<!-- feed_hash:{item.content_hash} -->"
 
-                # Add content hash for future dedup
-                content += f"\n\n<!-- feed_hash:{item.content_hash} -->"
+                # PostService.create takes the author User object (not an
+                # id) — the old create_post(author_id=..., post_type=...,
+                # tags=..., community_id=...) signature never existed and
+                # raised AttributeError on every feed item.  Map onto the
+                # real API (services.py:412).  Tags are dropped: create()
+                # has no tags param and the post model is tagged via a
+                # separate path — adding tag support here would be a new
+                # concern, tracked separately.
+                author = self.db.query(User).filter(User.id == user_id).first()
+                if author is None:
+                    logger.error(
+                        f"feed_import: author user {user_id} not found; skipping item")
+                    continue
 
-                # Prepare tags
-                tags = list(item.categories)
-                if auto_tag and item.source_feed:
-                    # Add source domain as tag
-                    from urllib.parse import urlparse
-                    domain = urlparse(item.source_feed).netloc
-                    if domain:
-                        tags.append(f"via:{domain.replace('www.', '')}")
+                community_name = None
+                if community_id:
+                    _c = self.db.query(Community).filter(
+                        Community.id == community_id).first()
+                    community_name = _c.name if _c else None
 
-                # Create post
+                _domain = urlparse(item.source_feed).netloc if item.source_feed else ''
+
                 try:
-                    post = PostService.create_post(
+                    post = PostService.create(
                         self.db,
-                        author_id=user_id,
-                        content=content,
-                        tags=tags[:10],  # Limit tags
-                        media_urls=item.media_urls[:5],  # Limit media
-                        community_id=community_id,
-                        post_type='link' if item.link else 'text'
+                        author,
+                        (item.title or '(untitled)')[:300],
+                        body,
+                        content_type='link' if item.link else 'text',
+                        community_name=community_name,
+                        media_urls=(item.media_urls or [])[:5],
+                        link_url=item.link or None,
+                        source_channel=f"feed:{_domain}" if _domain else 'feed',
+                        source_message_id=item.content_hash,
                     )
                     self.db.commit()
                     created_ids.append(post.id)
-                    logger.info(f"Imported feed item as post {post.id}: {item.title[:50]}")
+                    logger.info(f"Imported feed item as post {post.id}: {(item.title or '')[:50]}")
                 except Exception as e:
                     self.db.rollback()
                     logger.error(f"Error creating post from feed item: {e}")

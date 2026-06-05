@@ -137,8 +137,24 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                 ledger.save()
             elif task.status != ledger_status:
                 # Skip no-op transitions (e.g. IN_PROGRESS → IN_PROGRESS when
-                # multiple ActionStates map to the same LedgerTaskStatus)
-                ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
+                # multiple ActionStates map to the same LedgerTaskStatus).
+                #
+                # #56: the ledger validates transitions deliberately (its Bug-#2
+                # fix) and FAILED/COMPLETED/CANCELLED are terminal.  ActionState,
+                # by contrast, is authoritative for its OWN retry FSM (ERROR→
+                # IN_PROGRESS, TERMINATED→RECIPE_REQUESTED).  When the ledger task
+                # is already terminal but ActionState has legitimately moved on,
+                # forcing the transition is invalid BY DESIGN — update_task_status
+                # would WARN-spam (~100/run) for an expected, benign divergence.
+                # This advisory sync skips it quietly (the single-FSM unification,
+                # #56 option (a), is the deeper cleanup; the divergence is benign).
+                if task.is_terminal():
+                    logger.debug(
+                        "Advisory ledger sync: task %s terminal (%s), ActionState "
+                        "moved to %s — skipping invalid transition (authoritative "
+                        "FSM is ActionState).", task_id, task.status, state.value)
+                else:
+                    ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
 
             # === BLOCKED REASON: set specific reason based on ActionState source ===
             if ledger_status == LedgerTaskStatus.BLOCKED:
@@ -196,10 +212,15 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
     # Broadcast state change to EventBus
     try:
         from core.platform.events import emit_event
+        from core.event_attribution import owner_user_id
         emit_event('action_state.changed', {
             'action_id': action_id,
             'state': state.value,
             'prompt': user_prompt,
+            # #58: user_prompt is the canonical "{user_id}_{prompt_id}" key, so
+            # the owner is resolvable for free — stamp it so the P3a SSE guard
+            # routes this state change to that user's dashboard live.
+            'user_id': owner_user_id(user_prompt=user_prompt),
         })
     except Exception:
         pass
@@ -276,6 +297,102 @@ class ActionState(Enum):
     SENSOR_CONFIRM = "sensor_confirm"             # 13. Waiting for sensor confirmation of physical outcome
     PREVIEW_PENDING = "preview_pending"           # 14. Destructive action awaiting user approval
     PREVIEW_APPROVED = "preview_approved"         # 15. User approved destructive action, proceed
+
+
+# ── No-progress stall guard for the CREATE loop ───────────────────────────
+# create_recipe.get_response_group's main loop can spin to its 300-iteration
+# cap (~25 min of wasted compute, observed live) when an action sits in a
+# "requested" state whose recipe never arrives.  The late stuck-state guard
+# there is BOTH suppressed (it checked whether ANY earlier action saved a
+# recipe, so a multi-action flow whose LATER action stalls slips through) AND
+# unreachable (the condition branches above it `continue` past it).  This pure
+# tracker is the reachable, per-action replacement — call it once per loop
+# iteration right after the action state is refreshed.  It lives here
+# (autogen-free) so it is unit-testable without the full pipeline.
+# Live 2026-06-04: a user chat routed through the speculative-expert CREATE
+# path stalled on action 2 (recipe_requested; action 1 already done) and
+# looped all 300 -> a generic TERMINATE with no conversation history.
+STALL_GUARD_MAX_ITERS = 30  # tight cap: action stuck in a "requested" state
+
+# Looser cap for an action wedged in any OTHER non-terminal state (IN_PROGRESS,
+# STATUS_VERIFICATION_REQUESTED, ASSIGNED, PENDING).  Live 2026-06-04: a daemon
+# coding goal's action 2 sat in IN_PROGRESS emitting unparseable recipe JSON and
+# never reached RECIPE_REQUESTED, so the tight guard below (which only watched
+# the "requested" states) never saw it and it spun toward the 300-iter hard cap.
+# Set WELL above the proven-safe working zone (a legit action advances its state
+# within a handful of group-chat rounds; the old guard let IN_PROGRESS run
+# unbounded and nothing tripped a working action) so this can ONLY rescue a
+# genuinely-wedged action — never a slow-but-progressing one.
+STALL_GUARD_INPROGRESS_ITERS = 120
+
+_STALL_STATES = (ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_REQUESTED)
+_TERMINAL_STATES = (ActionState.COMPLETED, ActionState.TERMINATED, ActionState.ERROR)
+
+
+def stall_guard_step(prev_stuck_key, prev_iters, action_id, state,
+                     recipe_exists):
+    """Pure, side-effect-free no-progress tracker for the CREATE loop.
+
+    Returns ``(stuck_key, iters, should_break)`` where ``stuck_key`` is the
+    opaque ``(action_id, state)`` pair the caller threads back in:
+      * Progress signal = the CURRENT action's OWN recipe on disk, OR the action
+        reaching a TERMINAL state — either resets the counter to 0.
+      * Otherwise the action is non-terminal with no recipe: increment the
+        consecutive-stuck counter keyed on ``(action_id, state)``, restarting
+        whenever that pair changes (the action advanced to a new state, or a
+        different action became current).  ``should_break`` trips once the
+        counter exceeds the cap for the state class — the tight
+        ``STALL_GUARD_MAX_ITERS`` for the "requested" states (the action is done
+        and only the recipe is missing; it should arrive in 1-2 rounds) and the
+        looser ``STALL_GUARD_INPROGRESS_ITERS`` for every other non-terminal
+        state (a legit action may genuinely work in IN_PROGRESS for a while).
+
+    Keying on ``(action_id, state)`` — not action_id alone — is what lets an
+    action wedged in IN_PROGRESS be caught: it never reaches a "requested"
+    state, so the old action-id-only guard reset every iteration and never
+    fired.  Progress is judged on the CURRENT action's OWN recipe (not "any
+    earlier action saved one"), so a later action stalling in a multi-action
+    flow is still caught.
+    """
+    if recipe_exists or state in _TERMINAL_STATES:
+        return None, 0, False
+    cap = STALL_GUARD_MAX_ITERS if state in _STALL_STATES else STALL_GUARD_INPROGRESS_ITERS
+    key = (action_id, state)
+    iters = (prev_iters + 1) if prev_stuck_key == key else 1
+    return key, iters, iters > cap
+
+
+# Minimal valid recipe the model is told to emit as a last resort so a wedged
+# action TERMINATES cleanly (status:done + empty recipe) instead of grinding.
+_RECIPE_FALLBACK_OBJECT = (
+    '{"status":"done","action":"","fallback_action":"","persona":"",'
+    '"recipe":[],"can_perform_without_user_input":"yes"}'
+)
+
+
+def recipe_correction_directive(parse_failures: int) -> str:
+    """Corrective text appended to a recipe request after the model's PRIOR
+    response failed to parse as the required JSON.  Pure — no I/O.
+
+    Why: local small models tend to wrap the recipe object in prose / markdown
+    ``` fences, which breaks json_repair and leaves the action grinding in
+    IN_PROGRESS (#89, observed live 2026-06-04).  Re-sending the identical
+    prompt just gets the same garbage; this escalates instead —
+
+      * ``parse_failures <= 0`` -> '' (a clean first attempt gets no nag).
+      * 1 -> demand ONLY the JSON object (no prose, no fences).
+      * 2+ -> additionally offer a minimal valid object to emit verbatim, so the
+        action can TERMINATE rather than spin to the stall-guard cap.
+    """
+    if parse_failures <= 0:
+        return ''
+    msg = ("\n\nIMPORTANT: your previous response could NOT be parsed as JSON. "
+           "Respond with ONLY the single JSON object specified above — no prose, "
+           "no explanation, no markdown ``` fences. Begin with '{' and end with '}'.")
+    if parse_failures >= 2:
+        msg += (" If you cannot produce a valid recipe, emit EXACTLY this and "
+                "nothing else: " + _RECIPE_FALLBACK_OBJECT)
+    return msg
 
 
 # Add to lifecycle_hooks.py
@@ -520,7 +637,13 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.FALLBACK_RECEIVED: [ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_RECEIVED],
         ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED, ActionState.RECIPE_REQUESTED],
         ActionState.RECIPE_RECEIVED: [ActionState.TERMINATED, ActionState.RECIPE_RECEIVED],
-        ActionState.TERMINATED: [ActionState.ASSIGNED],  # Final state but an entire actions can be updated and hence can go to assigned state again
+        # Final state, but: (a) an action can be re-opened (→ASSIGNED), and
+        # (b) recipe-capture can run AFTER termination (→RECIPE_REQUESTED).  The
+        # latter edge fixes the STUCK LOOP (#56): recipe-gen pushed a TERMINATED
+        # action toward RECIPE_REQUESTED, find_path failed, and autogen re-ran
+        # the same action.  RECIPE_REQUESTED→RECIPE_RECEIVED→TERMINATED already
+        # exists, so this just lets the capture flow complete instead of looping.
+        ActionState.TERMINATED: [ActionState.ASSIGNED, ActionState.RECIPE_REQUESTED],
         # Preview states (opt-in for destructive actions)
         ActionState.PREVIEW_PENDING: [ActionState.PREVIEW_APPROVED, ActionState.ERROR, ActionState.TERMINATED],
         ActionState.PREVIEW_APPROVED: [ActionState.IN_PROGRESS],

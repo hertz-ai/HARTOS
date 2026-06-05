@@ -42,8 +42,25 @@ mcp_local_bp = Blueprint('mcp_local', __name__, url_prefix='/api/mcp/local')
 # or `~/.nunba/mcp.token` (Unix) — owned by the current user, 0600
 # on Unix.  Claude Code reads it and sends it as the bearer.
 _MCP_TOKEN_CACHE: Optional[str] = None
+# (source_path, mtime) the cached token was read from — so a rotation in ANY
+# Flask worker (which bumps the file mtime) is picked up by EVERY worker on its
+# next read, instead of each worker serving a stale cache until restart (#44).
+_MCP_TOKEN_CACHE_KEY: Optional[tuple] = None
 # One-shot WARN emitter for HARTOS_MCP_DISABLE_AUTH=1 (see _mcp_auth_gate).
 _MCP_AUTH_DISABLED_WARNED: bool = False
+
+
+def _read_token_file(path):
+    """Return (token, mtime) for the token file, or (None, None) if it's
+    absent / empty / unreadable.  mtime is the cache key."""
+    import os as _os
+    try:
+        _mtime = _os.path.getmtime(path)
+        with open(path, encoding='utf-8') as _f:
+            _tok = _f.read().strip()
+        return (_tok or None), _mtime
+    except OSError:
+        return None, None
 
 
 def _mcp_token_path() -> str:
@@ -78,56 +95,55 @@ def _ensure_mcp_token() -> str:
                                    (the original behaviour used by the
                                    Nunba desktop install)
     """
-    global _MCP_TOKEN_CACHE
-    if _MCP_TOKEN_CACHE:
-        return _MCP_TOKEN_CACHE
+    global _MCP_TOKEN_CACHE, _MCP_TOKEN_CACHE_KEY
     import os as _os
     import secrets as _secrets
 
     # (1) Literal env-var token — highest priority, zero filesystem touch.
+    #     Static (rotation happens upstream), so cache it indefinitely.
     _env_tok = _os.environ.get('HARTOS_MCP_TOKEN', '').strip()
     if _env_tok:
-        _MCP_TOKEN_CACHE = _env_tok
+        _MCP_TOKEN_CACHE, _MCP_TOKEN_CACHE_KEY = _env_tok, ('env', None)
         return _MCP_TOKEN_CACHE
 
-    # (2) Env-var-specified token FILE — for Vault/K8s mounted secrets.
+    # (2)/(3) File-sourced token: env-pointed file (Vault/K8s) OR the default
+    # disk path (Nunba desktop).  mtime-keyed cache — re-read whenever the file
+    # changes so a rotation in ANY worker is seen by EVERY worker on its next
+    # call (#44).  The old code cached the first read forever, so other workers
+    # kept honouring the rotated-away token until restart.
     _env_tok_file = _os.environ.get('HARTOS_MCP_TOKEN_FILE', '').strip()
+    _path = _env_tok_file or _mcp_token_path()
+    _tok, _mtime = _read_token_file(_path)
+    if _tok:
+        if _MCP_TOKEN_CACHE and _MCP_TOKEN_CACHE_KEY == (_path, _mtime):
+            return _MCP_TOKEN_CACHE  # unchanged since last read
+        _MCP_TOKEN_CACHE, _MCP_TOKEN_CACHE_KEY = _tok, (_path, _mtime)
+        return _MCP_TOKEN_CACHE
     if _env_tok_file:
-        try:
-            with open(_env_tok_file, encoding='utf-8') as _f:
-                _tok = _f.read().strip()
-                if _tok:
-                    _MCP_TOKEN_CACHE = _tok
-                    return _MCP_TOKEN_CACHE
-        except OSError as _e:
-            logger.warning(
-                "HARTOS_MCP_TOKEN_FILE=%s could not be read (%s) — "
-                "falling back to default disk path",
-                _env_tok_file, _e,
-            )
+        logger.warning(
+            "HARTOS_MCP_TOKEN_FILE=%s missing/empty — falling back to default "
+            "disk path", _env_tok_file)
 
-    # (3) Default disk path — the original Nunba desktop behaviour.
+    # No token file yet → create one at the default disk path.
     _path = _mcp_token_path()
     try:
-        if _os.path.isfile(_path):
-            with open(_path, encoding='utf-8') as _f:
-                _MCP_TOKEN_CACHE = _f.read().strip()
-                if _MCP_TOKEN_CACHE:
-                    return _MCP_TOKEN_CACHE
-        # Create a new token
         _os.makedirs(_os.path.dirname(_path), exist_ok=True)
-        _MCP_TOKEN_CACHE = _secrets.token_urlsafe(32)
+        _new = _secrets.token_urlsafe(32)
         with open(_path, 'w', encoding='utf-8') as _f:
-            _f.write(_MCP_TOKEN_CACHE)
+            _f.write(_new)
         try:
             # 0600 on Unix (no-op on Windows, ACLs inherit user profile)
             _os.chmod(_path, 0o600)
         except OSError:
             pass
+        _MCP_TOKEN_CACHE = _new
+        _MCP_TOKEN_CACHE_KEY = (_path, _os.path.getmtime(_path)) \
+            if _os.path.isfile(_path) else (_path, None)
         return _MCP_TOKEN_CACHE
     except OSError:
-        # Read-only fs — fall back to process-lifetime token
-        _MCP_TOKEN_CACHE = _secrets.token_urlsafe(32)
+        # Read-only fs — process-lifetime token; nothing to re-read.
+        if not _MCP_TOKEN_CACHE:
+            _MCP_TOKEN_CACHE, _MCP_TOKEN_CACHE_KEY = _secrets.token_urlsafe(32), ('mem', None)
         return _MCP_TOKEN_CACHE
 
 
@@ -171,7 +187,7 @@ def rotate_mcp_token() -> str:
     no-op (the env var is the source of truth and rotation must happen
     upstream — at the orchestrator that injected the env var).
     """
-    global _MCP_TOKEN_CACHE
+    global _MCP_TOKEN_CACHE, _MCP_TOKEN_CACHE_KEY
     import os as _os
     import secrets as _secrets
     # Env-var-pinned tokens cannot be rotated from inside the process —
@@ -198,7 +214,13 @@ def rotate_mcp_token() -> str:
             "rotate_mcp_token: failed to persist new token (%s) — "
             "falling back to in-memory only", e,
         )
+    # Update this worker's cache + mtime key so it's immediately consistent;
+    # OTHER workers pick up the new token via the mtime check on their next read.
     _MCP_TOKEN_CACHE = new_token
+    try:
+        _MCP_TOKEN_CACHE_KEY = (path, _os.path.getmtime(path))
+    except OSError:
+        _MCP_TOKEN_CACHE_KEY = (path, None)
     return new_token
 
 
@@ -436,234 +458,22 @@ def _canonicalize_args(tool_name: str, arguments: dict) -> dict:
     return out
 
 
-# ── Lazy helpers (same as mcp_server.py, avoid import-time side effects) ──
-
-_registry = None
-_memory_graph = None
-
-
-def _get_registry():
-    global _registry
-    if _registry is None:
-        from integrations.expert_agents.registry import ExpertAgentRegistry
-        _registry = ExpertAgentRegistry()
-    return _registry
-
-
-def _get_db():
-    from integrations.social.models import get_db
-    return get_db()
-
-
-def _get_memory_graph(user_id: str = 'system'):
-    global _memory_graph
-    if _memory_graph is None:
-        from integrations.channels.memory.memory_graph import MemoryGraph
-        try:
-            from core.platform_paths import get_memory_graph_dir
-            db_path = get_memory_graph_dir()
-        except ImportError:
-            db_path = os.path.join(
-                os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'memory_graph'
-            )
-        _memory_graph = MemoryGraph(db_path=db_path, user_id=user_id)
-    return _memory_graph
-
-
-# ── Tool implementations ──────────────────────────────────────
-# Same logic as mcp_server.py tools, but without FastMCP decorators.
-
-def _tool_list_agents(category: Optional[str] = None, query: Optional[str] = None) -> str:
-    """List available expert agents. Filter by category or search by query."""
-    reg = _get_registry()
-    if query:
-        agents = reg.search_agents(query)
-    elif category:
-        from integrations.expert_agents.registry import AgentCategory
-        cat_map = {name.lower(): member for name, member in AgentCategory.__members__.items()}
-        cat = cat_map.get(category.lower())
-        if not cat:
-            return json.dumps({"error": f"Unknown category: {category}"})
-        agents = reg.get_agents_by_category(cat)
-    else:
-        agents = list(reg.agents.values())
-
-    result = []
-    for a in agents:
-        result.append({
-            "agent_id": a.agent_id, "name": a.name,
-            "category": a.category.name if hasattr(a.category, 'name') else str(a.category),
-            "description": a.description, "model_type": a.model_type,
-        })
-
-    prompts_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'prompts')
-    dynamic = []
-    if os.path.isdir(prompts_dir):
-        for f in _glob.glob(os.path.join(prompts_dir, '*.json')):
-            try:
-                with open(f) as fh:
-                    data = json.load(fh)
-                dynamic.append({
-                    "agent_id": data.get("prompt_id", Path(f).stem),
-                    "name": data.get("agent_name", Path(f).stem),
-                    "category": "dynamic_recipe",
-                    "description": data.get("description", "Trained agent recipe"),
-                })
-            except Exception:
-                pass
-
-    return json.dumps({"expert_agents": len(result), "dynamic_agents": len(dynamic),
-                       "agents": result[:50], "dynamic": dynamic[:20]}, indent=2)
-
-
-def _tool_list_goals(goal_type: Optional[str] = None, status: Optional[str] = None) -> str:
-    """List agent goals. Filter by type or status."""
-    try:
-        from integrations.agent_engine.goal_manager import GoalManager
-        db = _get_db()
-        try:
-            goals = GoalManager.list_goals(db, goal_type=goal_type, status=status)
-            return json.dumps({"count": len(goals), "goals": goals}, indent=2, default=str)
-        finally:
-            db.close()
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-def _tool_create_goal(goal_type: str, title: str, description: str = '', spark_budget: int = 200) -> str:
-    """Create a new goal for agents to pursue."""
-    try:
-        from integrations.agent_engine.goal_manager import GoalManager
-        db = _get_db()
-        try:
-            result = GoalManager.create_goal(db, goal_type=goal_type, title=title,
-                                             description=description, spark_budget=spark_budget)
-            db.commit()
-            return json.dumps(result, indent=2, default=str)
-        finally:
-            db.close()
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-def _tool_agent_status() -> str:
-    """Check agent daemon health, active dispatches, and system state."""
-    from core.port_registry import get_port
-    from core.http_pool import pooled_get
-    status = {
-        "daemon_enabled": os.environ.get('HEVOLVE_AGENT_ENGINE_ENABLED', 'false'),
-        "poll_interval": int(os.environ.get('HEVOLVE_AGENT_POLL_INTERVAL', '30')),
-    }
-    try:
-        resp = pooled_get(f'http://localhost:{get_port("llm")}/health', timeout=2)
-        status['llm_server'] = 'running' if resp.status_code == 200 else f'status {resp.status_code}'
-    except Exception:
-        status['llm_server'] = 'not reachable'
-    try:
-        reg = _get_registry()
-        status['expert_agents'] = len(reg.agents)
-    except Exception:
-        status['expert_agents'] = 'unknown'
-    return json.dumps(status, indent=2, default=str)
+# ── Shared tool implementations (single source: _tool_impls) ──
+# The read-only tool bodies + the lazy _get_* helpers live in
+# integrations.mcp._tool_impls so this HTTP bridge and the stdio mcp_server
+# can't drift (#98c).  _get_db/_get_registry/_get_memory_graph are re-imported
+# so the framework-gateway + hive tools further down keep working unchanged.
+from integrations.mcp import _tool_impls as impls
+from integrations.mcp._tool_impls import _get_registry, _get_db, _get_memory_graph
 
 
 def _tool_remember(content: str, memory_type: str = 'decision') -> str:
-    """Store a memory in the persistent memory graph."""
-    try:
-        mg = _get_memory_graph()
-        memory_id = mg.register(content=content,
-                                metadata={'memory_type': memory_type, 'source_agent': 'mcp_bridge'})
-        return json.dumps({"stored": True, "memory_id": memory_id})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    """Store a memory in the persistent memory graph.
 
-
-def _tool_recall(query: str, top_k: int = 5) -> str:
-    """Search the persistent memory graph."""
-    try:
-        mg = _get_memory_graph()
-        memories = mg.recall(query=query, mode='hybrid', top_k=top_k)
-        result = []
-        for m in memories:
-            result.append({
-                "id": m.id, "content": m.content,
-                "memory_type": m.memory_type, "source_agent": m.source_agent,
-                "created_at": m.created_at,
-            })
-        return json.dumps({"count": len(result), "memories": result}, indent=2, default=str)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-def _tool_list_recipes() -> str:
-    """List trained agent recipes (prompts/*.json files)."""
-    prompts_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'prompts')
-    recipes = []
-    if os.path.isdir(prompts_dir):
-        for f in sorted(_glob.glob(os.path.join(prompts_dir, '*.json'))):
-            try:
-                with open(f) as fh:
-                    data = json.load(fh)
-                recipes.append({
-                    "file": Path(f).name,
-                    "prompt_id": data.get("prompt_id", ""),
-                    "agent_name": data.get("agent_name", ""),
-                    "status": data.get("agent_status", ""),
-                    "description": data.get("description", "")[:200],
-                })
-            except Exception:
-                recipes.append({"file": Path(f).name, "error": "parse failed"})
-    return json.dumps({"count": len(recipes), "recipes": recipes}, indent=2)
-
-
-def _tool_system_health() -> str:
-    """Full system health check: Flask server, LLM, DB, memory graph."""
-    from core.port_registry import get_port
-    from core.http_pool import pooled_get
-    health = {}
-    try:
-        resp = pooled_get(f'http://localhost:{get_port("backend")}/status', timeout=2)
-        health['backend'] = {'status': 'up', 'code': resp.status_code}
-    except Exception:
-        health['backend'] = {'status': 'down'}
-    try:
-        resp = pooled_get(f'http://localhost:{get_port("llm")}/health', timeout=2)
-        health['llm'] = {'status': 'up', 'code': resp.status_code}
-    except Exception:
-        health['llm'] = {'status': 'down'}
-    try:
-        db = _get_db()
-        try:
-            from integrations.social.models import User
-            count = db.query(User).count()
-            health['db'] = {'status': 'up', 'user_count': count}
-        finally:
-            db.close()
-    except Exception as e:
-        health['db'] = {'status': 'error', 'detail': str(e)}
-    return json.dumps(health, indent=2, default=str)
-
-
-def _tool_social_query(query_type: str, limit: int = 20) -> str:
-    """Read-only social DB queries. Types: users, posts, goals, products, agents."""
-    try:
-        db = _get_db()
-        try:
-            if query_type == 'users':
-                from integrations.social.models import User
-                rows = db.query(User).order_by(User.created_at.desc()).limit(limit).all()
-                return json.dumps([{"id": r.id, "username": r.username,
-                                    "display_name": r.display_name} for r in rows], default=str)
-            elif query_type == 'goals':
-                from integrations.agent_engine.goal_manager import GoalManager
-                goals = GoalManager.list_goals(db)
-                return json.dumps({"count": len(goals), "goals": goals[:limit]}, default=str)
-            else:
-                return json.dumps({"error": f"Unknown query_type: {query_type}"})
-        finally:
-            db.close()
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    Thin wrapper over the shared impl — only the transport-specific provenance
+    tag ('mcp_bridge') differs; the body is single-sourced (#98c).
+    """
+    return impls.remember(content, memory_type, source_agent='mcp_bridge')
 
 
 # ── Watchdog & Monitoring Tools (read-only, no bypass) ─────────
@@ -751,14 +561,21 @@ def _tool_call_endpoint(method: str, path: str, body: Optional[str] = None) -> s
         from flask import current_app
         app = current_app._get_current_object()
     except RuntimeError:
-        # Not in request context — import app directly
-        try:
-            from hart_intelligence_entry import app
-        except ImportError:
-            try:
-                from hart_intelligence import app
-            except ImportError:
-                return json.dumps({"error": "HARTOS app not available"})
+        # Not in request context — resolve via singleton accessor.
+        # NEVER eager-import hart_intelligence here: this is a worker
+        # thread (MCP HTTP handler) and a direct import races the
+        # canonical loader's import lock.
+        from core.safe_hartos_attr import safe_hartos_attr
+        app = safe_hartos_attr('app')
+        if app is None:
+            logger.info(
+                "MCP call_endpoint: HARTOS app not yet loaded — "
+                "method=%s path=%s — returning 503-style error.",
+                method, path,
+            )
+            return json.dumps({
+                "error": "HARTOS app not available (loader still init)",
+            })
 
     if not path.startswith('/'):
         path = '/' + path
@@ -822,10 +639,17 @@ def _tool_list_routes() -> str:
         from flask import current_app
         app = current_app._get_current_object()
     except RuntimeError:
-        try:
-            from hart_intelligence_entry import app
-        except ImportError:
-            return json.dumps({"error": "HARTOS app not available"})
+        # Worker-thread safe — singleton accessor, no import lock race.
+        from core.safe_hartos_attr import safe_hartos_attr
+        app = safe_hartos_attr('app')
+        if app is None:
+            logger.info(
+                "MCP list_routes: HARTOS app not yet loaded — "
+                "returning empty 503 envelope.",
+            )
+            return json.dumps({
+                "error": "HARTOS app not available (loader still init)",
+            })
 
     routes = []
     for rule in app.url_map.iter_rules():
@@ -848,17 +672,17 @@ def _load_tools():
         return
     _tools_loaded = True
 
-    # Read-only: observe the system
-    _register_tool('list_agents', 'List available expert agents', _tool_list_agents)
-    _register_tool('list_goals', 'List agent goals', _tool_list_goals)
-    _register_tool('agent_status', 'Check agent daemon health', _tool_agent_status)
-    _register_tool('list_recipes', 'List trained agent recipes', _tool_list_recipes)
-    _register_tool('system_health', 'Full system health check', _tool_system_health)
-    _register_tool('social_query', 'Read-only social DB queries', _tool_social_query)
+    # Read-only: observe the system (shared impls — single source _tool_impls)
+    _register_tool('list_agents', 'List available expert agents', impls.list_agents)
+    _register_tool('list_goals', 'List agent goals', impls.list_goals)
+    _register_tool('agent_status', 'Check agent daemon health', impls.agent_status)
+    _register_tool('list_recipes', 'List trained agent recipes', impls.list_recipes)
+    _register_tool('system_health', 'Full system health check', impls.system_health)
+    _register_tool('social_query', 'Read-only social DB queries', impls.social_query)
 
     # Memory (safe — memory graph only, no framework bypass)
     _register_tool('remember', 'Store a memory in the memory graph', _tool_remember)
-    _register_tool('recall', 'Search the persistent memory graph', _tool_recall)
+    _register_tool('recall', 'Search the persistent memory graph', impls.recall)
 
     # Framework gateway — ALL writes go through Flask routes (guardrails, constitution, budget gate)
     _register_tool('call_endpoint', 'Call any HARTOS API endpoint through the framework', _tool_call_endpoint)
@@ -999,6 +823,8 @@ def _load_tools():
          'AUTO_EVOLVE_TOOLS', 'auto_evolve'),
         ('integrations.coding_agent.autoevolve_code_tools',
          'AUTOEVOLVE_CODE_TOOLS', 'autoevolve_code'),
+        ('integrations.coding_agent.backend_repair_tools',
+         'BACKEND_REPAIR_TOOLS', 'backend_repair'),
     ):
         try:
             import importlib

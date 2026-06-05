@@ -33,7 +33,7 @@ def _get_channel_context():
     """Read the current channel context from thread-local storage."""
     try:
         from threadlocal import thread_local_data
-        return getattr(thread_local_data, 'channel_context', None)
+        return thread_local_data.get_channel_context()
     except Exception:
         return None
 
@@ -267,6 +267,164 @@ def build_channel_tool_closures(ctx):
         "List all connected messaging channels, their connection status, and the user's "
         "channel bindings. Use when asked about connected channels or channel status.",
         list_channels,
+    ))
+
+    # ------------------------------------------------------------------
+    # 3b. suggest_channels  (browser auto-association — #63)
+    # ------------------------------------------------------------------
+    #
+    # Suggests channels the user ALREADY uses (detected from their own
+    # browser history, scoped to a messaging-domain allowlist) that aren't
+    # connected yet, so the agent can offer to connect them via the existing
+    # register_channel / OAuth flow.  Privacy posture (see browser_detect):
+    #   - OFF by default; only runs when the user has enabled browser scan
+    #     (HART_BROWSER_HISTORY_SCAN) or passes explicit consent.
+    #   - History only, scoped to the allowlist; cookies/logins never read.
+    #   - Suggests only — the connect itself is the existing consented flow.
+    @log_tool_execution
+    def suggest_channels() -> str:
+        """Suggest messaging channels the user already uses but hasn't connected,
+        detected from their own browser history (scoped to known app domains)."""
+        try:
+            uid = user_id or _get_user_id_from_threadlocal()
+            from integrations.channels.browser_detect import detect_channel_usage
+            result = detect_channel_usage()  # gated; consent via env flag
+            if not result.get('enabled'):
+                return result.get('notice') or "Browser channel detection is off."
+
+            detected = set(result.get('channels') or [])
+            notice = result.get('notice', '')
+            if not detected:
+                return ("No known messaging-app domains found in your browser "
+                        f"history. {notice}")
+
+            # Drop channels the user already has an active binding for.
+            connected = set()
+            if uid:
+                try:
+                    from integrations.social.models import get_db, UserChannelBinding
+                    db = get_db()
+                    try:
+                        for b in db.query(UserChannelBinding).filter_by(
+                                user_id=str(uid), is_active=True).all():
+                            connected.add(b.channel_type)
+                    finally:
+                        db.close()
+                except Exception:
+                    pass
+
+            suggestions = sorted(detected - connected)
+            if not suggestions:
+                return ("The channels you use are already connected. " + notice)
+
+            from integrations.channels.metadata import get_channel_metadata
+            names = ', '.join(
+                (get_channel_metadata(c) or {}).get('display_name', c)
+                for c in suggestions
+            )
+            return (f"You appear to use these channels that aren't connected yet: "
+                    f"{names}. Want me to connect any of them? {notice}")
+        except Exception as e:
+            return f"Error suggesting channels: {e}"
+
+    tools.append((
+        "suggest_channels",
+        "Suggest messaging channels the user already uses but hasn't connected, "
+        "detected from their OWN browser history (scoped to known messaging-app "
+        "domains; cookies/logins are never read; OFF unless the user enabled "
+        "browser scan). Use during onboarding or when the user asks what they "
+        "can connect. Always confirm before connecting.",
+        suggest_channels,
+    ))
+
+    # ------------------------------------------------------------------
+    # 3c. list_upcoming_events  (calendar awareness — #64 bridge READ side)
+    # ------------------------------------------------------------------
+    #
+    # The READ side of the Event ingest (ics / Zoom / Meet).  Without a reader
+    # the ingested events are write-only — this lets the agent answer "what
+    # meetings do I have?" from the user's own ingested calendar.  Scoped to the
+    # caller's user_id (created_by) so one user never sees another's events.
+    @log_tool_execution
+    def list_upcoming_events(
+        within_hours: Annotated[int, "Look-ahead window in hours (default 168 = one week)"] = 168,
+        limit: Annotated[int, "Maximum number of events to return"] = 20,
+    ) -> str:
+        """List the user's upcoming meetings/events (from ingested calendar / Zoom / Meet feeds)."""
+        try:
+            uid = user_id or _get_user_id_from_threadlocal()
+            from integrations.social.events import list_upcoming_events as _list_events
+            rows = _list_events(within_hours=within_hours, limit=limit,
+                                created_by=str(uid) if uid else None)
+            if not rows:
+                return "No upcoming events in your calendar for that window."
+            lines = ["**Upcoming events:**"]
+            for r in rows:
+                when = r.get('start_time') or '(time TBD)'
+                loc = f" — {r['location']}" if r.get('location') else ''
+                url = f" ({r['url']})" if r.get('url') else ''
+                lines.append(f"- {when}: {r.get('title', '(untitled)')}{loc}{url}")
+            return '\n'.join(lines)
+        except Exception as e:
+            return f"Error listing events: {e}"
+
+    tools.append((
+        "list_upcoming_events",
+        "List the user's upcoming meetings/events ingested from their calendar, "
+        "Zoom, or Google Meet feeds. Use when the user asks about their schedule, "
+        "meetings, or what's coming up.",
+        list_upcoming_events,
+    ))
+
+    # 3d. sync_meetings  (calendar INGEST — #64, closes the Zoom/Meet orphan)
+    # fetch_and_ingest_zoom/gmeet were implemented + unit-tested but had NO
+    # caller, so list_upcoming_events (the READ side) had nothing to read for
+    # those sources. This wires the caller. Token resolution mirrors every other
+    # channel adapter: explicit param > env var (the param is also the seam the
+    # OAuth-connect flow uses to pass a per-user binding token). Degrades with a
+    # clear "connect your account" message — never a silent no-op.
+    @log_tool_execution
+    def sync_meetings(
+        provider: Annotated[str, "Which calendar to sync: 'zoom' or 'meet' (Google Meet)"],
+        access_token: Annotated[str, "OAuth bearer token; omit to use the connected account / env token"] = "",
+    ) -> str:
+        """Fetch the user's upcoming Zoom or Google Meet meetings and ingest them into their calendar (then list_upcoming_events surfaces them)."""
+        import os
+        prov = (provider or "").strip().lower()
+        uid = user_id or _get_user_id_from_threadlocal()
+        created_by = str(uid) if uid else None
+        try:
+            from integrations.social.events import (
+                fetch_and_ingest_zoom, fetch_and_ingest_gmeet)
+            if prov == "zoom":
+                tok = access_token or os.getenv("ZOOM_ACCESS_TOKEN", "")
+                if not tok:
+                    return ("No Zoom token available — connect your Zoom account "
+                            "(OAuth) or set ZOOM_ACCESS_TOKEN, then try again.")
+                events = fetch_and_ingest_zoom(tok, created_by=created_by)
+            elif prov in ("meet", "gmeet", "google", "google_meet"):
+                tok = access_token or os.getenv("GOOGLE_CALENDAR_TOKEN", "")
+                if not tok:
+                    return ("No Google token available — connect your Google account "
+                            "(OAuth) or set GOOGLE_CALENDAR_TOKEN, then try again.")
+                events = fetch_and_ingest_gmeet(tok, created_by=created_by)
+            else:
+                return f"Unknown provider '{provider}'. Use 'zoom' or 'meet'."
+            n = len(events)
+            if n == 0:
+                return (f"No upcoming {prov} meetings found (or the token was "
+                        "rejected). Nothing new ingested.")
+            return (f"Synced {n} upcoming {prov} meeting(s) into your calendar. "
+                    "Ask me to list your upcoming events to see them.")
+        except Exception as e:
+            return f"Error syncing {prov or 'meetings'}: {e}"
+
+    tools.append((
+        "sync_meetings",
+        "Fetch the user's upcoming Zoom or Google Meet meetings and ingest them "
+        "into their calendar so list_upcoming_events can surface them. Use when "
+        "the user asks to sync / import / connect their Zoom or Google Meet schedule.",
+        sync_meetings,
     ))
 
     # ------------------------------------------------------------------

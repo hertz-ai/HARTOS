@@ -110,6 +110,23 @@ BUILTIN_BENCHMARKS = {
                        'Claude Opus 4 = 43.2%. Hive advantage: each node has '
                        'different OS/tool expertise.',
     },
+    'gaia_mini': {
+        'type': 'agent',
+        'problems': 30,
+        'levels': [1, 2, 3],
+        'description': 'GAIA (General AI Assistants) — 466 real-world agent '
+                       'tasks across web browsing, tool use, multimodal '
+                       'understanding. 3 difficulty levels. Public scores: '
+                       'GPT-4+plugins ~15% overall, Claude 3 Opus ~17%, '
+                       'GPT-4o ~32%, best human 92%. Hive advantage: '
+                       'multi-step tool use distributed across specialist '
+                       'nodes; each node contributes one step, ensemble '
+                       'integrates. This benchmark is the cleanest signal '
+                       'that sum-of-many > any-single-model for real '
+                       'agentic work, not just question-answering.',
+        'source': 'huggingface',
+        'dataset': 'gaia-benchmark/GAIA',
+    },
     # ── Ensemble benchmarks — THIS is where sum > single is proven ──
     # Same questions sent to ALL nodes (different models), answers fused.
     # Fusion accuracy must beat every individual model.
@@ -169,6 +186,7 @@ KNOWN_BASELINES = {
         'usamo': 0.976,                                 # 97.6%
         'hle': 0.647,                                   # 64.7% with tools
         'osworld': 0.796,                               # 79.6%
+        'gaia_mini': 0.65,                              # est. L1+L2+L3 avg
     },
     'claude-opus-4.6': {
         'mmlu_mini': 0.911, 'humaneval_mini': 0.808,
@@ -179,6 +197,7 @@ KNOWN_BASELINES = {
         'usamo': 0.423,
         'hle': 0.531,
         'osworld': 0.727,
+        'gaia_mini': 0.57,                               # ~57% L1+L2+L3 avg
     },
     'gpt-5.4': {
         'mmlu_mini': 0.90, 'humaneval_mini': 0.80,
@@ -188,6 +207,7 @@ KNOWN_BASELINES = {
         'usamo': 0.952,
         'hle': 0.521,
         'osworld': 0.750,
+        'gaia_mini': 0.55,                               # est.
     },
     'gemini-3.1-pro': {
         'mmlu_mini': 0.926, 'humaneval_mini': 0.806,
@@ -197,6 +217,20 @@ KNOWN_BASELINES = {
         'terminal_bench': 0.685,
         'usamo': 0.744,
         'hle': 0.514,
+        'gaia_mini': 0.52,                               # est.
+    },
+    # GPT-4o — the only published GAIA score, ~32% overall (Mar 2024 card)
+    'gpt-4o': {
+        'mmlu_mini': 0.887, 'humaneval_mini': 0.90,
+        'gaia_mini': 0.32,
+    },
+    # GPT-4 + plugins — original GAIA paper baseline
+    'gpt-4-plugins': {
+        'gaia_mini': 0.15,
+    },
+    # Claude 3 Opus — pre-Sonnet-4.5 baseline
+    'claude-3-opus': {
+        'gaia_mini': 0.17,
     },
     # ── Open models (what hive nodes actually run) ──
     'llama-3-70b': {
@@ -256,6 +290,15 @@ KNOWN_BASELINES = {
 # Continuous loop interval: 6 hours
 _LOOP_INTERVAL_SECONDS = 6 * 3600
 
+# How long to wait before RE-CHECKING the yield gate while a user is active.
+# A benchmark cycle only runs every _LOOP_INTERVAL_SECONDS, but if we ALSO slept
+# that full 6h whenever should_yield_to_user() was True, a single moment of user
+# activity cost an entire cycle — so on a machine you actually use, the only
+# auto-running validator effectively never ran (the "nothing is live-validated"
+# stall).  Re-checking every couple of minutes resumes promptly once you go idle
+# (the user-activity cooldown is ~10 min) without ever running while you're busy.
+_YIELD_RECHECK_SECONDS = int(os.environ.get('HEVOLVE_BENCH_YIELD_RECHECK_S', '120'))
+
 # Default timeout per shard (seconds)
 _SHARD_TIMEOUT_SECONDS = 300
 
@@ -264,7 +307,12 @@ _BENCHMARK_ROTATION = [
     # Ensemble first — these PROVE sum > single
     'ensemble_mmlu', 'ensemble_humaneval', 'ensemble_reasoning',
     # Real-world agent benchmarks (the ones that matter)
-    'swe_bench_mini', 'terminal_bench_mini',
+    # GAIA leads here because it measures ACTUAL agentic work (web
+    # browsing + tool use + multimodal) across 3 difficulty levels —
+    # the cleanest public signal for "hive > single model on real
+    # agent tasks, not just Q&A".  Frontier models still sit at 32-65%
+    # here, so there's real headroom to prove convergence.
+    'gaia_mini', 'swe_bench_mini', 'terminal_bench_mini',
     # Then individual (parallelized, proves speed)
     'mmlu_mini', 'humaneval_mini', 'gsm8k_mini',
     'reasoning_mini', 'mt_bench_mini', 'arc_mini',
@@ -1130,22 +1178,35 @@ class HiveBenchmarkProver:
         except Exception:
             pass
 
-        # 2. Create social post
+        # 2. Create social post via the canonical PostService — this
+        # fires on_new_post fan-out (#49/#51) so web + Android + iOS
+        # + desktop subscribers see the proof in real-time.  Prior
+        # implementation `db.add(Post(author_id='hive_benchmark_prover'))`
+        # bypassed PostService AND failed the posts.author_id FK
+        # constraint (the literal string is not a User.id UUID) — so
+        # benchmark proofs never persisted and the self-advertising
+        # leg of the flywheel was dead.  Switch to the canonical path:
+        # ensure a real system user exists, then PostService.create.
         try:
-            from integrations.social.models import db_session, Post
+            from integrations.social.models import db_session
+            from integrations.social.services import (
+                UserService, PostService)
             with db_session() as db:
-                post = Post(
-                    author_id='hive_benchmark_prover',
+                prover_user = UserService.ensure_system_user(
+                    db, 'nunba',
+                    display_name='Nunba',
+                    bio='Autonomous publisher of distributed-hive '
+                        'benchmark results.')
+                post = PostService.create(
+                    db, prover_user,
                     title=f"Benchmark Proof: {benchmark_name} "
                           f"— {score:.1%} ({num_nodes} nodes)",
                     content=comparison_text,
                     content_type='text',
                 )
-                db.add(post)
-                db.flush()
                 publish_info['post_id'] = post.id
         except Exception as exc:
-            logger.debug("Social post creation failed: %s", exc)
+            logger.warning("Benchmark social post creation failed: %s", exc)
 
         # 3. Dispatch to all channels via signal bridge
         try:
@@ -1167,15 +1228,23 @@ class HiveBenchmarkProver:
         except Exception as exc:
             logger.debug("Signal bridge dispatch failed: %s", exc)
 
-        # 4. Create thought experiment for community input
+        # 4. Create thought experiment for community input.  Same
+        # FK-constraint problem as the social post above — creator_id
+        # must be a real User.id; the prior 'hive_benchmark_prover'
+        # sentinel failed silently.  Reuse the system user we
+        # bootstrapped for the post so both surfaces are owned by the
+        # same identity.
         try:
             from integrations.social.thought_experiment_service import (
                 ThoughtExperimentService)
             from integrations.social.models import db_session
+            from integrations.social.services import UserService
             with db_session() as db:
+                prover_user = UserService.ensure_system_user(
+                    db, 'nunba', display_name='Nunba')
                 experiment = ThoughtExperimentService.create_experiment(
                     db=db,
-                    creator_id='hive_benchmark_prover',
+                    creator_id=prover_user.id,
                     title=f"Should we optimize for {benchmark_name} next?",
                     hypothesis=(
                         f"The hive scored {score:.1%} on {benchmark_name} "
@@ -1534,6 +1603,47 @@ class HiveBenchmarkProver:
                         'prompt': f'Ensemble problem {i}',
                     })
 
+        elif btype == 'agent':
+            # Real-world agent tasks (GAIA etc).  Try loading the
+            # actual dataset from gaia_dataset.py; if the HF 'datasets'
+            # library or cached JSON is missing, fall back to typed
+            # stubs so the benchmark still runs end-to-end with synthetic
+            # problems for wiring tests.
+            levels = spec.get('levels') or [1, 2, 3]
+            num_problems = spec.get('problems', 30)
+            dataset = spec.get('dataset', '')
+            loaded = []
+            try:
+                from .gaia_dataset import load_gaia_problems
+                loaded = load_gaia_problems(
+                    levels=levels, limit=num_problems,
+                ) or []
+            except Exception as exc:
+                logger.debug(f'GAIA dataset load failed: {exc}')
+            if loaded:
+                # Ensure every problem carries the benchmark_name prefix
+                for i, prob in enumerate(loaded):
+                    prob.setdefault('id', f'{benchmark_name}_agent_{i}')
+                    prob.setdefault('type', 'agent')
+                    prob.setdefault('index', i)
+                return loaded
+            # Synthetic fallback — one stub per level
+            for i in range(num_problems):
+                level = levels[i % len(levels)]
+                problems.append({
+                    'id': f'{benchmark_name}_L{level}_{i}',
+                    'type': 'agent',
+                    'level': level,
+                    'prompt': (
+                        f'[GAIA-L{level}] Real-world agentic task #{i + 1}. '
+                        'Multi-step: plan → tool-select → execute → verify. '
+                        '(Synthetic stub — install `datasets` + '
+                        f'cache {dataset} for real GAIA problems.)'
+                    ),
+                    'index': i,
+                    'dataset': dataset,
+                })
+
         elif btype == 'custom':
             measure = spec.get('measure', '')
             problems.append({
@@ -1756,14 +1866,50 @@ class HiveBenchmarkProver:
                     get_dispatcher)
                 dispatcher = get_dispatcher()
 
-                while time.time() < deadline:
+                # 2026-05-23 fix: short-circuit polling when no peer
+                # claims the task.  Before this guard, an unclaimed
+                # benchmark shard would spin the polling loop for the
+                # full `timeout` (300s default) waiting for a status
+                # transition that never came — because no peer was
+                # listening on the task queue — then fall through to
+                # local execution with zero remaining time budget,
+                # producing problems_solved=0 across the leaderboard.
+                # Evidence: 128/128 prior runs scored 0.0 in
+                # agent_data/benchmark_leaderboard.json.
+                #
+                # New behaviour: probe once for `claim_grace_seconds`.
+                # If the task stays at PENDING (nobody claimed), skip
+                # the long poll and let local execution use the full
+                # remaining time budget.  When a peer DOES claim, we
+                # poll until the deadline as before.
+                claim_grace_seconds = float(os.environ.get(
+                    'HEVOLVE_BENCHMARK_CLAIM_GRACE_SECONDS', '5'))
+                claim_deadline = time.time() + claim_grace_seconds
+                peer_claimed = False
+                while time.time() < claim_deadline:
                     task = dispatcher.get_task(task_id)
-                    if task and task.status in ('completed', 'validated'):
-                        result = task.result
+                    status = getattr(task, 'status', None) if task else None
+                    if status and status != 'pending':
+                        # 'assigned' / 'in_progress' / 'completed' /
+                        # 'validated' / 'failed' / 'cancelled' all
+                        # indicate the dispatcher routed it somewhere
+                        # (a peer or directly to a terminal state).
+                        peer_claimed = True
                         break
-                    if task and task.status == 'failed':
-                        break
-                    time.sleep(1)
+                    time.sleep(0.5)
+
+                if peer_claimed:
+                    while time.time() < deadline:
+                        task = dispatcher.get_task(task_id)
+                        if task and task.status in ('completed', 'validated'):
+                            result = task.result
+                            break
+                        if task and task.status == 'failed':
+                            break
+                        time.sleep(1)
+                # else: result stays None → falls through to
+                # _execute_shard_locally below, which is what we want
+                # when there's no peer listening.
             except Exception as exc:
                 logger.debug("Result polling failed for %s: %s",
                              task_id[:8], exc)
@@ -2404,10 +2550,33 @@ class HiveBenchmarkProver:
 
     # ── Continuous Loop ──────────────────────────────────────────────
 
+    def _interruptible_sleep(self, seconds: int) -> None:
+        """Sleep ``seconds`` in 1s steps, returning early if the loop is asked to
+        stop.  Single source for both the yield re-check wait and the post-cycle
+        rotation wait (they were byte-identical inline loops)."""
+        for _ in range(int(seconds)):
+            if not self._loop_running:
+                return
+            time.sleep(1)
+
     def _continuous_loop(self) -> None:
         """Background loop: rotate benchmarks, run, publish."""
         logger.info("Benchmark continuous loop started")
+        from integrations.agent_engine.dispatch import should_yield_to_user
         while self._loop_running:
+            # Single canonical daemon yield gate — re-checked every
+            # iteration so a long-running cycle yields as soon as the
+            # user starts typing.  ensemble_mmlu fully saturates the
+            # local LLM (100 questions × N models); running it during
+            # chat is the textbook CPU-stall shape.
+            if should_yield_to_user():
+                # Re-check SOON — never sleep a whole 6h cycle just because the
+                # user is momentarily active, or this (only auto-running)
+                # validator effectively never runs on a machine in use.  It
+                # resumes within minutes once the user-activity cooldown clears.
+                self._interruptible_sleep(_YIELD_RECHECK_SECONDS)
+                continue
+
             try:
                 # Pick next benchmark
                 benchmark = _BENCHMARK_ROTATION[
@@ -2428,11 +2597,9 @@ class HiveBenchmarkProver:
                 logger.warning(
                     "Benchmark loop iteration failed: %s", exc)
 
-            # Sleep in small increments for clean shutdown
-            for _ in range(_LOOP_INTERVAL_SECONDS):
-                if not self._loop_running:
-                    break
-                time.sleep(1)
+            # Sleep one full rotation interval before the next benchmark
+            # (interruptible for clean shutdown).
+            self._interruptible_sleep(_LOOP_INTERVAL_SECONDS)
 
         logger.info("Benchmark continuous loop exited")
 
@@ -2458,10 +2625,13 @@ class HiveBenchmarkProver:
             from integrations.social.thought_experiment_service import (
                 ThoughtExperimentService)
             from integrations.social.models import db_session
+            from integrations.social.services import UserService
             with db_session() as db:
+                prover_user = UserService.ensure_system_user(
+                    db, 'nunba', display_name='Nunba')
                 ThoughtExperimentService.create_experiment(
                     db=db,
-                    creator_id='hive_benchmark_prover',
+                    creator_id=prover_user.id,
                     title=(
                         f"Benchmark priority: focus on {worst_bench}?"),
                     hypothesis=(

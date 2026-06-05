@@ -163,8 +163,16 @@ class ModelOrchestrator:
 
     def select_best(self, model_type: str, language: Optional[str] = None,
                     require_capability: Optional[Dict[str, Any]] = None,
+                    exclude: Optional[List[str]] = None,
                     ) -> Optional[ModelEntry]:
-        """Select the best model for a type given current compute state."""
+        """Select the best model for a type given current compute state.
+
+        ``exclude`` — pass IDs the caller already tried + failed so the
+        next-best engine surfaces.  Threaded through to
+        ``ModelCatalog.select_best``; fallback ladders in TTS/STT/VLM
+        use this to walk the language preference order without
+        re-implementing the loop.
+        """
         cs = self._get_compute_state()
         return self._catalog.select_best(
             model_type=model_type,
@@ -173,6 +181,7 @@ class ModelOrchestrator:
             gpu_available=cs['gpu_available'],
             language=language,
             require_capability=require_capability,
+            exclude=exclude,
         )
 
     # ── Load / Unload ─────────────────────────────────────────────

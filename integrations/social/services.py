@@ -16,13 +16,121 @@ from sqlalchemy.orm import Session, joinedload
 
 from .models import (
     User, Post, Comment, Vote, Follow, Community, CommunityMembership,
-    Notification, Report, TaskRequest, RecipeShare, AgentSkillBadge
+    Notification, Report, TaskRequest, RecipeShare, AgentSkillBadge,
+    _uuid,
 )
 from .auth import hash_password, verify_password, generate_api_token, generate_jwt
 
 
-def _uuid():
-    return str(uuid.uuid4())
+def _community_name_for(db: Session, post: Post) -> Optional[str]:
+    """Look up the canonical community NAME for a post's community_id.
+    Used by lifecycle fan-out so post/comment events land on the right
+    community.message.{name} WAMP topic (TOPIC_MAP at
+    core/peer_link/message_bus.py:77 fills {community_id} from
+    data['community_id'], which by convention carries the name not the
+    UUID — see PostService.create's call to on_new_post).  Returns None
+    if the post has no community or the community row is missing."""
+    if not getattr(post, 'community_id', None):
+        return None
+    community = db.query(Community).filter_by(id=post.community_id).first()
+    return community.name if community else None
+
+
+def _publish_realtime(fn_name: str, *args, **kwargs) -> None:
+    """Best-effort thin wrapper for realtime.* publish calls from
+    service methods.  Fan-out availability must NEVER block the
+    user-visible mutation; transport errors land in the log and the
+    DB row still commits.  All calls go through ONE shim so adding
+    metrics / circuit-breaker / topic-blacklist later touches one
+    place."""
+    try:
+        from . import realtime
+        getattr(realtime, fn_name)(*args, **kwargs)
+    except Exception as e:
+        logger.warning(
+            "realtime.%s fan-out failed: %s", fn_name, e)
+
+
+# ─── Audit trail (Reddit-style accountability) ─────────────────
+#
+# Post edits + soft-deletes used to overwrite content silently with no
+# actor record.  ImmutableAuditLog gives us a hash-chained, append-only
+# trail so a deleted post's original title/body remains recoverable
+# (and the chain itself is tamper-evident).  Audit failure must NEVER
+# block the user action — best-effort try/except.
+#
+# Truncation budget: 4096 chars per content field keeps the audit
+# table from growing pathologically while still preserving enough of
+# the original for moderation / appeals.
+
+_AUDIT_CONTENT_TRUNCATE = 4096
+
+
+def _truncate_for_audit(s) -> Optional[str]:
+    """Cap large text fields to keep the audit table compact.
+    Returns None unchanged so the JSON detail stays sparse."""
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        s = str(s)
+    if len(s) <= _AUDIT_CONTENT_TRUNCATE:
+        return s
+    return s[:_AUDIT_CONTENT_TRUNCATE] + f'...[truncated {len(s) - _AUDIT_CONTENT_TRUNCATE} chars]'
+
+
+def _audit_post_event(event_type: str, *, actor_id: Optional[str],
+                      post, detail: dict) -> None:
+    """Best-effort append to ImmutableAuditLog for post mutations.
+    Swallows ALL exceptions — audit availability must not gate the
+    user action.  Operators monitor audit-chain integrity separately
+    via verify_chain()."""
+    try:
+        from security.immutable_audit_log import get_audit_log
+        actor = actor_id or 'unknown'
+        author_id = getattr(post, 'author_id', None)
+        action = (
+            f'edit post {post.id}' if event_type == 'post.update'
+            else f'delete post {post.id}'
+        )
+        full_detail = dict(detail or {})
+        full_detail['post_id'] = post.id
+        full_detail['author_id'] = author_id
+        get_audit_log().log_event(
+            event_type=event_type,
+            actor_id=actor,
+            action=action,
+            detail=full_detail,
+            target_id=post.id,
+        )
+    except Exception as e:
+        logger.warning(
+            "audit log append failed for %s on post=%s: %s",
+            event_type, getattr(post, 'id', '?'), e)
+
+
+def _audit_comment_event(event_type: str, *, actor_id: Optional[str],
+                         comment, detail: dict) -> None:
+    """Best-effort audit-log append for comment mutations.  Same
+    failure-mode contract as _audit_post_event."""
+    try:
+        from security.immutable_audit_log import get_audit_log
+        actor = actor_id or 'unknown'
+        author_id = getattr(comment, 'author_id', None)
+        action = f'delete comment {comment.id}'
+        full_detail = dict(detail or {})
+        full_detail['comment_id'] = comment.id
+        full_detail['author_id'] = author_id
+        get_audit_log().log_event(
+            event_type=event_type,
+            actor_id=actor,
+            action=action,
+            detail=full_detail,
+            target_id=comment.id,
+        )
+    except Exception as e:
+        logger.warning(
+            "audit log append failed for %s on comment=%s: %s",
+            event_type, getattr(comment, 'id', '?'), e)
 
 
 # ─── User Service ───
@@ -85,6 +193,52 @@ class UserService:
             User.owner_id == owner_id,
             User.user_type == 'agent',
         ).all()
+
+    @staticmethod
+    def ensure_system_user(db: Session, username: str,
+                           display_name: str = None,
+                           bio: str = '') -> User:
+        """Idempotent system-user bootstrap.
+
+        Returns the existing User row if `username` is taken AND that
+        row already has user_type='system'; else creates a new user
+        with user_type='system' and a generated api_token.  Used by
+        the flywheel publish path — hive_benchmark_prover,
+        thought_experiment_service, and any future "the hive itself
+        authored this" content needs a real User row to satisfy the
+        posts.author_id FK; the previous string sentinel
+        ('hive_benchmark_prover') failed the constraint silently
+        inside a try/except, so benchmark proofs never landed.
+
+        Collision guard: if a row with this username exists but is
+        NOT a system user (e.g. a human grabbed the handle before we
+        bootstrapped), raises ValueError rather than hijacking their
+        identity for system posts.  Operators must rename the human
+        account or pick a different system username.
+
+        Skips the 3-word agent_naming validation: system users are
+        not user-facing accounts and don't participate in handle
+        uniqueness via that validator.
+        """
+        existing = db.query(User).filter(User.username == username).first()
+        if existing:
+            if existing.user_type != 'system':
+                raise ValueError(
+                    f"system username {username!r} is already taken by a "
+                    f"non-system account (user_type={existing.user_type!r}); "
+                    "refusing to hijack — rename the human account or pick "
+                    "a different system identity"
+                )
+            return existing
+        user = User(
+            id=_uuid(), username=username,
+            display_name=display_name or username,
+            bio=bio, user_type='system',
+            api_token=generate_api_token(), is_verified=True,
+        )
+        db.add(user)
+        db.flush()
+        return user
 
     # Account lockout: track failed attempts per username
     _login_attempts = {}  # username -> (count, first_attempt_at)
@@ -301,6 +455,16 @@ class PostService:
         except Exception:
             pass
 
+        # Fan-out the post.new event so every consumer (web SSE,
+        # WAMP-subscribed Android/iOS/desktop) learns about it without
+        # polling.  Previously only external_bot_bridge fired this —
+        # human-authored posts via /api/social/posts POST never made
+        # it to live subscribers (#49-sibling for posts).
+        _publish_realtime(
+            'on_new_post',
+            post.to_dict(include_author=True),
+            community_name=community_name)
+
         return post
 
     @staticmethod
@@ -341,27 +505,86 @@ class PostService:
     def update(db: Session, post: Post, title: str = None, content: str = None,
                intent_category: str = None, hypothesis: str = None,
                expected_outcome: str = None, is_thought_experiment: bool = None,
-               dynamic_layout: dict = None) -> Post:
-        if title is not None:
+               dynamic_layout: dict = None,
+               actor_id: str = None) -> Post:
+        # Snapshot fields about to change so the audit detail can show
+        # the pre-edit state.  Reddit-style: deleted/edited content is
+        # still recoverable from the hash-chained audit log.
+        changed = {}
+        if title is not None and title != post.title:
+            changed['title'] = {'before': post.title, 'after': title}
             post.title = title
-        if content is not None:
+        if content is not None and content != post.content:
+            changed['content'] = {
+                'before': _truncate_for_audit(post.content),
+                'after': _truncate_for_audit(content),
+            }
             post.content = content
-        if intent_category is not None:
+        if intent_category is not None and intent_category != post.intent_category:
+            changed['intent_category'] = {
+                'before': post.intent_category, 'after': intent_category}
             post.intent_category = intent_category
-        if hypothesis is not None:
+        if hypothesis is not None and hypothesis != post.hypothesis:
+            changed['hypothesis'] = {
+                'before': _truncate_for_audit(post.hypothesis),
+                'after': _truncate_for_audit(hypothesis)}
             post.hypothesis = hypothesis
-        if expected_outcome is not None:
+        if expected_outcome is not None and expected_outcome != post.expected_outcome:
+            changed['expected_outcome'] = {
+                'before': _truncate_for_audit(post.expected_outcome),
+                'after': _truncate_for_audit(expected_outcome)}
             post.expected_outcome = expected_outcome
-        if is_thought_experiment is not None:
+        if is_thought_experiment is not None and is_thought_experiment != post.is_thought_experiment:
+            changed['is_thought_experiment'] = {
+                'before': bool(post.is_thought_experiment),
+                'after': bool(is_thought_experiment)}
             post.is_thought_experiment = is_thought_experiment
         if dynamic_layout is not None:
             post.dynamic_layout = dynamic_layout
+            changed['dynamic_layout'] = True  # opaque blob, just note it changed
         post.updated_at = datetime.utcnow()
+        if changed:
+            _audit_post_event(
+                'post.update', actor_id=actor_id, post=post, detail={
+                    'fields': changed,
+                })
         db.flush()
+
+        # Fan out the update so cached clients can patch the post
+        # in place (post.update event) instead of waiting for the
+        # next /api/social/posts refresh.  Only fire if something
+        # actually changed — no-op edits stay silent.
+        if changed:
+            _publish_realtime(
+                'on_post_update',
+                post.to_dict(include_author=True),
+                community_name=_community_name_for(db, post))
+
         return post
 
     @staticmethod
-    def delete(db: Session, post: Post):
+    def delete(db: Session, post: Post, actor_id: str = None):
+        # Snapshot before mutation so both the audit detail AND the
+        # post.delete fan-out payload have the pre-delete state
+        # (post.is_deleted=True hides the row from subsequent queries
+        # so we can't reconstruct it after the flip).  Audit log is
+        # written BEFORE the flip so a DB commit error doesn't leave
+        # an orphaned audit entry referring to state that never
+        # persisted.
+        community_name = _community_name_for(db, post)
+        delete_payload = {
+            'id': post.id,
+            'author_id': post.author_id,
+            'community_id': post.community_id,
+            'title': post.title,
+            'is_deleted': True,
+        }
+        _audit_post_event(
+            'post.delete', actor_id=actor_id, post=post, detail={
+                'title': post.title,
+                'content': _truncate_for_audit(post.content),
+                'community_id': post.community_id,
+            })
         post.is_deleted = True
         post.author.post_count = max(0, post.author.post_count - 1)
         if post.community_id:
@@ -369,6 +592,13 @@ class PostService:
             if community:
                 community.post_count = max(0, (community.post_count or 0) - 1)
         db.flush()
+
+        # Fan out the post.delete event so cached clients drop the
+        # entry from their feed instead of showing stale content
+        # until the next refresh.
+        _publish_realtime(
+            'on_post_delete', delete_payload,
+            community_name=community_name)
 
     @staticmethod
     def increment_view(db: Session, post: Post):
@@ -382,7 +612,8 @@ class CommentService:
 
     @staticmethod
     def create(db: Session, post: Post, author: User, content: str,
-               parent_id: str = None) -> Comment:
+               parent_id: str = None, agent_id: str = None,
+               privacy: str = None) -> Comment:
         depth = 0
         if parent_id:
             parent = db.query(Comment).filter(Comment.id == parent_id).first()
@@ -392,6 +623,7 @@ class CommentService:
         comment = Comment(
             id=_uuid(), post_id=post.id, author_id=author.id,
             parent_id=parent_id, content=content, depth=depth,
+            agent_id=agent_id, privacy=privacy,
         )
         db.add(comment)
         post.comment_count += 1
@@ -442,6 +674,16 @@ class CommentService:
         except Exception:
             pass
 
+        # Fan-out the new comment so every active subscriber on the
+        # post's community sees it without polling.  Previously the
+        # only caller of on_new_comment was external_bot_bridge —
+        # human-authored comments via /api/social/comments POST
+        # missed the realtime path entirely (#49).
+        _publish_realtime(
+            'on_new_comment',
+            comment.to_dict(include_author=True),
+            community_name=_community_name_for(db, post))
+
         return comment
 
     @staticmethod
@@ -458,10 +700,37 @@ class CommentService:
         return q.all()
 
     @staticmethod
-    def delete(db: Session, comment: Comment):
+    def delete(db: Session, comment: Comment, actor_id: str = None):
+        # Snapshot before mutation so the audit detail AND the
+        # comment.delete fan-out both see the original state.  After
+        # the flip, comment.content == '[deleted]' so we'd lose the
+        # original for both purposes.
+        post = db.query(Post).filter_by(id=comment.post_id).first()
+        community_name = _community_name_for(db, post) if post else None
+        delete_payload = {
+            'id': comment.id,
+            'post_id': comment.post_id,
+            'author_id': comment.author_id,
+            'is_deleted': True,
+        }
+        # Reddit-style: original content goes into the audit log
+        # detail BEFORE we overwrite with '[deleted]', so moderators
+        # / appeals can still see what was removed (the hash-chain
+        # makes the trail tamper-evident).
+        _audit_comment_event(
+            'comment.delete', actor_id=actor_id, comment=comment, detail={
+                'content': _truncate_for_audit(comment.content),
+                'post_id': comment.post_id,
+            })
         comment.is_deleted = True
         comment.content = '[deleted]'
         db.flush()
+
+        # Fan out so cached clients drop the comment from the thread
+        # view instead of showing stale content until refresh.
+        _publish_realtime(
+            'on_comment_delete', delete_payload,
+            community_name=community_name)
 
 
 # ─── Vote Service ───
@@ -705,6 +974,9 @@ class CommunityService:
         db.add(membership)
         community.member_count += 1
         db.flush()
+        # #55: fan out the membership change so other members see it live
+        # instead of only on the next /communities/{id} fetch.  Best-effort.
+        _publish_realtime('on_community_membership', community.id, user.id, 'join')
         return True
 
     @staticmethod
@@ -717,6 +989,8 @@ class CommunityService:
             db.delete(existing)
             community.member_count = max(0, community.member_count - 1)
             db.flush()
+            # #55: fan out the leave so members see it live (best-effort).
+            _publish_realtime('on_community_membership', community.id, user.id, 'leave')
 
     @staticmethod
     def get_members(db: Session, community_id: str, limit: int = 50, offset: int = 0
@@ -776,17 +1050,84 @@ class NotificationService:
 
     @staticmethod
     def mark_read(db: Session, notification_ids: List[str], user_id: str):
+        # P3b (2026-05-26): also set read_at so "unread since X"
+        # analytics and the dismissed-vs-read distinction work.  Uses
+        # func.now() so the timestamp is computed at the database
+        # (matches created_at's server-default convention).
         db.query(Notification).filter(
             Notification.id.in_(notification_ids), Notification.user_id == user_id
-        ).update({Notification.is_read: True}, synchronize_session=False)
+        ).update({
+            Notification.is_read: True,
+            Notification.read_at: func.now(),
+        }, synchronize_session=False)
         db.flush()
+        # P1-S1 (2026-05-26): cross-device fan-out after commit so every
+        # other open client decrements its badge in real-time instead of
+        # discovering the change on its next 30s poll.  Same WAMP/SSE
+        # pipe on_notification() already uses; the type discriminator
+        # ('notification.read') is what clients filter on.
+        _ids = list(notification_ids or [])
+        if _ids:
+            def _push_read_after_commit(_session):
+                try:
+                    from .realtime import on_notification_read
+                    on_notification_read(user_id, _ids)
+                except Exception:
+                    pass
+            event.listen(db, 'after_commit', _push_read_after_commit, once=True)
 
     @staticmethod
     def mark_all_read(db: Session, user_id: str):
+        # Collect ids BEFORE the bulk update so we can fan them out for
+        # cross-device sync (P1-S1).  Two-step query is cheap because
+        # the same is_read=False filter applies to both.
+        ids_to_flip = [
+            row.id for row in db.query(Notification.id).filter(
+                Notification.user_id == user_id,
+                Notification.is_read == False,
+            ).all()
+        ]
+        # P3b: stamp read_at alongside is_read flip.
         db.query(Notification).filter(
             Notification.user_id == user_id, Notification.is_read == False
-        ).update({Notification.is_read: True}, synchronize_session=False)
+        ).update({
+            Notification.is_read: True,
+            Notification.read_at: func.now(),
+        }, synchronize_session=False)
         db.flush()
+        if ids_to_flip:
+            def _push_read_all_after_commit(_session):
+                try:
+                    from .realtime import on_notification_read
+                    on_notification_read(user_id, ids_to_flip)
+                except Exception:
+                    pass
+            event.listen(db, 'after_commit', _push_read_all_after_commit, once=True)
+
+    @staticmethod
+    def mark_dismissed(db: Session, notification_ids: List[str], user_id: str):
+        """P3b (2026-05-26): mark notifications as dismissed without
+        flipping is_read.  Used when an overlay times out or the user
+        swipes a row away without engaging.  Distinct from mark_read
+        so analytics can answer "did the user actually read it, or
+        just dismiss it?"  Still fires the same cross-device fan-out
+        as mark_read so other devices remove the row from view."""
+        if not notification_ids:
+            return
+        db.query(Notification).filter(
+            Notification.id.in_(notification_ids), Notification.user_id == user_id
+        ).update({
+            Notification.dismissed_at: func.now(),
+        }, synchronize_session=False)
+        db.flush()
+        _ids = list(notification_ids)
+        def _push_dismissed_after_commit(_session):
+            try:
+                from .realtime import on_notification_read
+                on_notification_read(user_id, _ids)
+            except Exception:
+                pass
+        event.listen(db, 'after_commit', _push_dismissed_after_commit, once=True)
 
 
 # ─── Report Service ───

@@ -28,153 +28,49 @@ mcp = FastMCP("hartos", instructions=(
     "manage goals, query memory, and monitor system health."
 ))
 
-# ─── Lazy imports (deferred to avoid import-time side effects) ───
-
-_registry = None
-_memory_graph = None
-
-
-def _get_registry():
-    global _registry
-    if _registry is None:
-        from integrations.expert_agents.registry import ExpertAgentRegistry
-        _registry = ExpertAgentRegistry()
-    return _registry
-
-
-def _get_db():
-    from integrations.social.models import get_db
-    return get_db()
-
-
-def _get_memory_graph(user_id: str = 'system'):
-    global _memory_graph
-    if _memory_graph is None:
-        from integrations.channels.memory.memory_graph import MemoryGraph
-        try:
-            from core.platform_paths import get_memory_graph_dir
-            db_path = get_memory_graph_dir()
-        except ImportError:
-            db_path = os.path.join(
-                os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'memory_graph'
-            )
-        _memory_graph = MemoryGraph(db_path=db_path, user_id=user_id)
-    return _memory_graph
+# ─── Shared tool implementations (single source: _tool_impls) ───
+# Tool bodies live in integrations.mcp._tool_impls so the stdio server and the
+# HTTP bridge can't drift (#98c).  _get_* are re-imported so the transport-
+# specific tools below (dispatch_goal, switch_model, code, onboard_kong) keep
+# their existing calls unchanged.
+from integrations.mcp import _tool_impls as impls
+from integrations.mcp._tool_impls import _get_registry, _get_db, _get_memory_graph
 
 
 # ─── Tools ───
-
-@mcp.tool()
-def list_agents(category: Optional[str] = None, query: Optional[str] = None) -> str:
-    """List available expert agents. Filter by category or search by query.
-
-    Categories: software_dev, data_analytics, creative, business, education,
-    health, security, devops, research, robotics
-    """
-    reg = _get_registry()
-
-    if query:
-        agents = reg.search_agents(query)
-    elif category:
-        from integrations.expert_agents.registry import AgentCategory
-        cat_map = {name.lower(): member for name, member in AgentCategory.__members__.items()}
-        cat = cat_map.get(category.lower())
-        if not cat:
-            return json.dumps({"error": f"Unknown category: {category}. Valid: {list(cat_map.keys())}"})
-        agents = reg.get_agents_by_category(cat)
-    else:
-        agents = list(reg.agents.values())
-
-    result = []
-    for a in agents:
-        result.append({
-            "agent_id": a.agent_id,
-            "name": a.name,
-            "category": a.category.name if hasattr(a.category, 'name') else str(a.category),
-            "description": a.description,
-            "model_type": a.model_type,
-        })
-
-    # Also include dynamically discovered agents (trained recipes)
-    prompts_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'prompts')
-    dynamic = []
-    if os.path.isdir(prompts_dir):
-        for f in _glob.glob(os.path.join(prompts_dir, '*.json')):
-            try:
-                with open(f) as fh:
-                    data = json.load(fh)
-                dynamic.append({
-                    "agent_id": data.get("prompt_id", Path(f).stem),
-                    "name": data.get("agent_name", Path(f).stem),
-                    "category": "dynamic_recipe",
-                    "description": data.get("description", "Trained agent recipe"),
-                    "model_type": "llm",
-                })
-            except Exception:
-                pass
-
-    return json.dumps({
-        "expert_agents": len(result),
-        "dynamic_agents": len(dynamic),
-        "agents": result[:50],  # cap at 50 to avoid token overflow
-        "dynamic": dynamic[:20],
-    }, indent=2)
+# Shared, identical-across-transports tools register the canonical impl
+# directly.  Transport-specific tools (dispatch_goal, switch_model, code,
+# onboard_kong) keep their own @mcp.tool() defs further down.
+mcp.tool()(impls.list_agents)
+mcp.tool()(impls.list_goals)
+mcp.tool()(impls.create_goal)
+mcp.tool()(impls.agent_status)
+mcp.tool()(impls.recall)
+mcp.tool()(impls.list_recipes)
+mcp.tool()(impls.system_health)
+mcp.tool()(impls.social_query)
 
 
 @mcp.tool()
-def list_goals(
-    goal_type: Optional[str] = None,
-    status: Optional[str] = None
-) -> str:
-    """List agent goals. Filter by type (marketing, coding, ip_protection, etc.) or status (active, pending, completed)."""
-    try:
-        from integrations.agent_engine.goal_manager import GoalManager
-        db = _get_db()
-        try:
-            goals = GoalManager.list_goals(db, goal_type=goal_type, status=status)
-            return json.dumps({"count": len(goals), "goals": goals}, indent=2, default=str)
-        finally:
-            db.close()
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-@mcp.tool()
-def create_goal(
-    goal_type: str,
-    title: str,
-    description: str = '',
-    spark_budget: int = 200
-) -> str:
-    """Create a new goal for agents to pursue.
-
-    goal_type: marketing, coding, ip_protection, revenue, finance, self_heal,
-    federation, upgrade, thought_experiment, news, provision, content_gen
-    """
-    try:
-        from integrations.agent_engine.goal_manager import GoalManager
-        db = _get_db()
-        try:
-            result = GoalManager.create_goal(
-                db,
-                goal_type=goal_type,
-                title=title,
-                description=description,
-                spark_budget=spark_budget,
-            )
-            db.commit()
-            return json.dumps(result, indent=2, default=str)
-        finally:
-            db.close()
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
+def remember(content: str, memory_type: str = 'decision') -> str:
+    """Store a memory in the persistent memory graph. Types: fact, decision, insight, lifecycle."""
+    # Provenance tag is transport-specific; the body is shared (#98c).
+    return impls.remember(content, memory_type, source_agent='claude_orchestrator')
 
 @mcp.tool()
 def dispatch_goal(goal_id: str, goal_type: str = 'marketing') -> str:
-    """Dispatch a goal to an idle agent for execution. The daemon does this automatically every 30s, but this forces immediate dispatch."""
+    """Dispatch a goal to an idle agent for execution. The daemon does this automatically every 30s, but this forces immediate dispatch.
+
+    Persists ``last_dispatched_at`` on the Goal row so that flywheel
+    progress is observable in subsequent ``list_goals`` queries —
+    without this, repeated MCP dispatches looked identical to "stuck"
+    goals because the agent_daemon was the only writer of that field
+    (and the daemon has been silent for days on this install).
+    """
     try:
         from integrations.agent_engine.goal_manager import GoalManager
+        from integrations.social.models import AgentGoal as _GoalModel
+        from datetime import datetime as _dt
         db = _get_db()
         try:
             goal_result = GoalManager.get_goal(db, goal_id)
@@ -184,10 +80,22 @@ def dispatch_goal(goal_id: str, goal_type: str = 'marketing') -> str:
             goal = goal_result['goal']
             prompt = goal.get('description', goal.get('title', ''))
 
-            # Get system agent user_id
-            from integrations.social.models import User
-            sys_agent = db.query(User).filter_by(username='hevolve_system_agent').first()
-            user_id = sys_agent.id if sys_agent else 'system'
+            # Resolve the canonical system user (Nunba).  Falls back to
+            # ensure_system_user so the row is auto-created on first
+            # call — the prior `db.query(...).first() or 'system'`
+            # pattern returned the literal string 'system' when the
+            # User row didn't exist, which failed downstream FK checks
+            # on posts.author_id / goals.created_by.
+            from integrations.social.services import UserService
+            sys_user = UserService.ensure_system_user(
+                db, 'nunba', display_name='Nunba',
+                bio='The Hevolve hive — autonomous orchestrator '
+                    'for benchmarks, experiments, and dispatch.')
+            user_id = sys_user.id
+            # ensure_system_user may have inserted a new row — commit so
+            # subsequent queries (incl. the persistence write below)
+            # see it, instead of losing it on db.close().
+            db.commit()
         finally:
             db.close()
 
@@ -198,221 +106,26 @@ def dispatch_goal(goal_id: str, goal_type: str = 'marketing') -> str:
             goal_id=goal_id,
             goal_type=goal_type,
         )
-        return json.dumps({"dispatched": True, "goal_id": goal_id, "response_preview": str(response)[:500]}, default=str)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
 
-
-@mcp.tool()
-def agent_status() -> str:
-    """Check agent daemon health, active dispatches, and system state."""
-    status = {
-        "daemon_enabled": os.environ.get('HEVOLVE_AGENT_ENGINE_ENABLED', 'false'),
-        "poll_interval": int(os.environ.get('HEVOLVE_AGENT_POLL_INTERVAL', '30')),
-        "max_concurrent": int(os.environ.get('HEVOLVE_AGENT_MAX_CONCURRENT', '10')),
-        "speculative_enabled": os.environ.get('HEVOLVE_SPECULATIVE_ENABLED', 'false'),
-    }
-
-    # Check running server
-    try:
-        resp = pooled_get('http://localhost:5000/health', timeout=2)
-        status['nunba_server'] = 'running' if resp.status_code == 200 else f'status {resp.status_code}'
-    except Exception:
-        status['nunba_server'] = 'not reachable'
-
-    # Check LLM
-    try:
-        resp = pooled_get(f'http://localhost:{get_port("llm")}/health', timeout=2)
-        status['llm_server'] = 'running' if resp.status_code == 200 else f'status {resp.status_code}'
-    except Exception:
-        status['llm_server'] = 'not reachable'
-
-    # Goal counts
-    try:
-        from integrations.agent_engine.goal_manager import GoalManager
-        db = _get_db()
+        # Stamp last_dispatched_at so the goal row shows progress.
+        # Best-effort — a write failure here must not mask a successful
+        # dispatch (the response is what callers act on).
         try:
-            all_goals = GoalManager.list_goals(db)
-            by_status = {}
-            for g in all_goals:
-                s = g.get('status', 'unknown')
-                by_status[s] = by_status.get(s, 0) + 1
-            status['goals'] = {'total': len(all_goals), 'by_status': by_status}
-        finally:
-            db.close()
-    except Exception as e:
-        status['goals'] = {'error': str(e)}
-
-    # Expert agent count
-    try:
-        reg = _get_registry()
-        status['expert_agents'] = len(reg.agents)
-    except Exception:
-        status['expert_agents'] = 'unknown'
-
-    return json.dumps(status, indent=2, default=str)
-
-
-@mcp.tool()
-def remember(content: str, memory_type: str = 'decision') -> str:
-    """Store a memory in the persistent memory graph. Types: fact, decision, insight, lifecycle."""
-    try:
-        mg = _get_memory_graph()
-        memory_id = mg.register(
-            content=content,
-            metadata={'memory_type': memory_type, 'source_agent': 'claude_orchestrator'},
-        )
-        return json.dumps({"stored": True, "memory_id": memory_id})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-@mcp.tool()
-def recall(query: str, top_k: int = 5) -> str:
-    """Search the persistent memory graph. Returns relevant memories ranked by relevance."""
-    try:
-        mg = _get_memory_graph()
-        memories = mg.recall(query=query, mode='hybrid', top_k=top_k)
-        result = []
-        for m in memories:
-            result.append({
-                "id": m.id,
-                "content": m.content,
-                "memory_type": m.memory_type,
-                "source_agent": m.source_agent,
-                "created_at": m.created_at,
-            })
-        return json.dumps({"count": len(result), "memories": result}, indent=2, default=str)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-@mcp.tool()
-def list_recipes() -> str:
-    """List trained agent recipes (prompts/*.json files)."""
-    prompts_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'prompts')
-    recipes = []
-    if os.path.isdir(prompts_dir):
-        for f in sorted(_glob.glob(os.path.join(prompts_dir, '*.json'))):
+            db = _get_db()
             try:
-                with open(f) as fh:
-                    data = json.load(fh)
-                recipes.append({
-                    "file": Path(f).name,
-                    "prompt_id": data.get("prompt_id", ""),
-                    "agent_name": data.get("agent_name", ""),
-                    "status": data.get("agent_status", ""),
-                    "description": data.get("description", "")[:200],
-                })
-            except Exception:
-                recipes.append({"file": Path(f).name, "error": "parse failed"})
+                row = db.query(_GoalModel).filter_by(id=goal_id).first()
+                if row is not None:
+                    row.last_dispatched_at = _dt.utcnow()
+                    db.flush()
+                    db.commit()
+            finally:
+                db.close()
+        except Exception as _persist_err:
+            logger.warning(
+                "mcp.dispatch_goal: persist last_dispatched_at "
+                "failed for %s: %s", goal_id, _persist_err)
 
-    return json.dumps({"count": len(recipes), "recipes": recipes}, indent=2)
-
-
-@mcp.tool()
-def system_health() -> str:
-    """Full system health check: Flask server, LLM, DB, memory graph."""
-    health = {}
-
-    # Flask server
-    try:
-        resp = pooled_get('http://localhost:5000/health', timeout=2)
-        health['flask'] = {'status': 'up', 'code': resp.status_code}
-    except Exception:
-        health['flask'] = {'status': 'down'}
-
-    # LLM server
-    try:
-        resp = pooled_get(f'http://localhost:{get_port("llm")}/health', timeout=2)
-        health['llm'] = {'status': 'up', 'code': resp.status_code}
-        try:
-            models_resp = pooled_get(f'http://localhost:{get_port("llm")}/v1/models', timeout=2)
-            if models_resp.status_code == 200:
-                data = models_resp.json()
-                models = data.get('data', [])
-                health['llm']['models'] = [m.get('id', 'unknown') for m in models]
-        except Exception:
-            pass
-    except Exception:
-        health['llm'] = {'status': 'down'}
-
-    # LangChain agent (port 6778)
-    try:
-        resp = pooled_get('http://localhost:6778/health', timeout=2)
-        health['langchain'] = {'status': 'up' if resp.status_code == 200 else 'error'}
-    except Exception:
-        health['langchain'] = {'status': 'down'}
-
-    # DB
-    try:
-        db = _get_db()
-        try:
-            from integrations.social.models import User
-            count = db.query(User).count()
-            health['db'] = {'status': 'up', 'user_count': count}
-        finally:
-            db.close()
-    except Exception as e:
-        health['db'] = {'status': 'error', 'detail': str(e)}
-
-    # Memory graph
-    try:
-        mg = _get_memory_graph()
-        health['memory'] = {'status': 'up', 'db_path': mg.db_path if hasattr(mg, 'db_path') else 'unknown'}
-    except Exception as e:
-        health['memory'] = {'status': 'error', 'detail': str(e)}
-
-    return json.dumps(health, indent=2, default=str)
-
-
-@mcp.tool()
-def social_query(query_type: str, limit: int = 20) -> str:
-    """Read-only social DB queries. Types: users, posts, goals, products, agents.
-
-    Returns recent entries. For safety, only SELECT operations are performed.
-    """
-    try:
-        db = _get_db()
-        try:
-            if query_type == 'users':
-                from integrations.social.models import User
-                rows = db.query(User).order_by(User.created_at.desc()).limit(limit).all()
-                return json.dumps([{
-                    "id": r.id, "username": r.username, "display_name": r.display_name,
-                    "user_type": r.user_type, "role": r.role, "karma_score": r.karma_score,
-                } for r in rows], indent=2, default=str)
-
-            elif query_type == 'posts':
-                from integrations.social.models import Post
-                rows = db.query(Post).order_by(Post.created_at.desc()).limit(limit).all()
-                return json.dumps([{
-                    "id": r.id, "title": getattr(r, 'title', ''), "author_id": r.author_id,
-                    "content": (r.content or '')[:200], "vote_count": getattr(r, 'vote_count', 0),
-                } for r in rows], indent=2, default=str)
-
-            elif query_type == 'goals':
-                from integrations.agent_engine.goal_manager import GoalManager
-                goals = GoalManager.list_goals(db)
-                return json.dumps({"count": len(goals), "goals": goals[:limit]}, indent=2, default=str)
-
-            elif query_type == 'products':
-                from integrations.agent_engine.goal_manager import ProductManager
-                products = ProductManager.list_products(db)
-                return json.dumps({"count": len(products), "products": products[:limit]}, indent=2, default=str)
-
-            elif query_type == 'agents':
-                from integrations.social.models import User
-                rows = db.query(User).filter_by(user_type='agent').limit(limit).all()
-                return json.dumps([{
-                    "id": r.id, "username": r.username, "display_name": r.display_name,
-                    "agent_id": r.agent_id, "karma_score": r.karma_score,
-                } for r in rows], indent=2, default=str)
-
-            else:
-                return json.dumps({"error": f"Unknown query_type: {query_type}. Valid: users, posts, goals, products, agents"})
-        finally:
-            db.close()
+        return json.dumps({"dispatched": True, "goal_id": goal_id, "response_preview": str(response)[:500]}, default=str)
     except Exception as e:
         return json.dumps({"error": str(e)})
 

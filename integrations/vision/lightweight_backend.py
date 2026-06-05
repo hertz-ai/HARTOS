@@ -23,8 +23,41 @@ from core.http_pool import pooled_get, pooled_post
 logger = logging.getLogger('hevolve_vision')
 
 
-class VisionBackend(ABC):
-    """Abstract base for vision backends."""
+try:
+    from exception_collector import AutoReportSubsystemFailures
+except Exception:  # pragma: no cover — collector unavailable in minimal envs
+    class AutoReportSubsystemFailures:  # type: ignore[no-redef]
+        """No-op fallback when the self-heal pipeline isn't importable
+        (e.g. extreme degraded boot).  Lets VisionBackend subclasses
+        still load and run without surfacing pipeline hookups."""
+        SUBSYSTEM = ''
+        AUTO_REPORTED_METHODS: tuple = ()
+
+
+class VisionBackend(AutoReportSubsystemFailures, ABC):
+    """Abstract base for vision backends.
+
+    Inherits AutoReportSubsystemFailures so every concrete subclass
+    (MiniCPM / MobileVLM / CLIP / Qwen3-VL / Qwen3.5-0.8B / etc.)
+    has its core methods auto-wrapped to feed the canonical
+    self-heal pipeline.  Failures of any vision backend produce
+    pattern_key='vlm.<name>::<method>' records that
+    SelfHealingDispatcher clusters into one self_heal goal — the
+    same shape as channels / TTS / LLM / daemon.
+
+    Subclass override of self._identifier_for_self_heal() is
+    unnecessary because every concrete subclass already implements
+    the ``name`` property (the mixin's default reads ``self.name``).
+    """
+
+    SUBSYSTEM = 'vlm'
+    # Methods whose escaping exceptions auto-feed the self-heal pipe.
+    # `start` is the primary failure surface (model load); `describe`
+    # is the runtime synth surface (OOM, dispatch fail); `stop` is
+    # included so an unload that hangs doesn't go silent.  Adding new
+    # methods to a concrete backend (e.g. `embed`) just needs the
+    # method name in this tuple — no per-backend except-block edits.
+    AUTO_REPORTED_METHODS = ('start', 'describe', 'stop')
 
     @property
     @abstractmethod

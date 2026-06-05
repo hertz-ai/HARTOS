@@ -68,6 +68,50 @@ def _cb_is_open() -> bool:
         return True
 
 
+def _local_dispatch_base_url() -> str:
+    """Base URL for the Tier-2 HTTP fallback to the local HARTOS /chat (#71).
+
+    Delegates to the canonical core.port_registry.get_local_backend_url —
+    the SAME resolver the channel inbound bridge uses (flask_integration), so
+    neither hardcodes a dead :6777 in bundled mode (HARTOS serves in-process
+    on :5000 there).  HEVOLVE_BASE_URL still wins; otherwise it probes the
+    live local serve port (standalone backend:6777 / bundled flask:5000)."""
+    from core.port_registry import get_local_backend_url
+    return get_local_backend_url()
+
+
+def _internal_auth_headers() -> Optional[Dict[str, str]]:
+    """Build auth headers for internal /chat dispatch.
+
+    Why: on central/regional tiers, security/middleware.py Gate 2 rejects
+    unauthenticated internal /chat dispatches with HTTP 401
+    "Authentication required (Bearer token)". Without this header the
+    autonomous outreach flywheel silently 401'd from 2026-03-14 onward.
+
+    Prefers HEVOLVE_API_KEY (X-API-Key) if set; otherwise mints a
+    short-lived system_daemon JWT via integrations.social.auth.
+    Returns None on flat-tier deployments where auth is unneeded
+    (caller passes None to pooled_post → no header attached).
+    """
+    headers: Dict[str, str] = {}
+    try:
+        api_key = os.environ.get('HEVOLVE_API_KEY', '').strip()
+        if api_key:
+            headers['X-API-Key'] = api_key
+        else:
+            from integrations.social.auth import generate_jwt as _mint_jwt
+            jwt = _mint_jwt(
+                user_id='system_daemon',
+                username='system_daemon',
+                role='admin',
+            )
+            if jwt:
+                headers['Authorization'] = f'Bearer {jwt}'
+    except Exception as e:
+        logger.debug(f"daemon-dispatch auth header mint failed (non-fatal): {e}")
+    return headers or None
+
+
 # ── LLM concurrency control ──────────────────────────────────────────────
 # Local llama-server degrades exponentially with concurrent requests
 # (KV cache thrashing). Allow only N concurrent local LLM calls.
@@ -87,19 +131,109 @@ _USER_CHAT_COOLDOWN = 600  # 10 min — CREATE pipeline can take this long
 _active_create_sessions: int = 0  # count of in-flight CREATE requests
 _create_lock = threading.Lock()
 
+# Governor throttle below this → the daemon yields (gate reason #3).
+_GATE_THROTTLE_FLOOR = 0.3
+# The reason should_yield_to_user() last returned True, or None when it
+# last returned False.  Exposed so the daemon log + status probes can say
+# WHICH of the gate's reasons is blocking.  Why: 2026-05-29/30 cost ~3
+# days of guessing because the gate was a silent black box — it yielded
+# for one of four reasons and logged none of them, so the fix (18e59c0)
+# patched the wrong reason.  Never let the gate be silent again.
+_last_yield_reason = None
+
+
+def get_last_yield_reason():
+    """Return the reason should_yield_to_user() last blocked on, or None
+    when the gate is currently open.  One of: 'user_active',
+    'create_in_flight', 'model_pressure', 'governor_throttle'."""
+    return _last_yield_reason
+
+
+def _note_yield_reason(reason) -> None:
+    """Record the current yield reason; log at INFO only on TRANSITION so
+    there's a clean trail ('yield gate CLOSED: governor_throttle' →
+    'yield gate OPEN') with no per-tick spam."""
+    global _last_yield_reason
+    if reason == _last_yield_reason:
+        return
+    prev = _last_yield_reason
+    _last_yield_reason = reason
+    try:
+        if reason is None:
+            logger.info("yield gate OPEN (was %s) — daemons may run normal path", prev)
+        else:
+            logger.info("yield gate CLOSED: %s (was %s)", reason, prev)
+    except Exception:
+        pass
+
 
 def mark_user_chat_activity():
-    """Call on every user /chat request (including autonomous CREATE)."""
+    """Call on every GENUINE user /chat request (including user-initiated
+    autonomous CREATE).  MUST NOT be called for the agent_daemon's own
+    background dispatches — see is_genuine_user_request()."""
     global _last_user_chat_at
     _last_user_chat_at = _time.time()
 
 
-def mark_create_start():
-    """Call when a CREATE pipeline starts."""
+def is_genuine_user_request(request_id) -> bool:
+    """True when a /chat request comes from a real user (so it should
+    mark user activity + make daemons yield), False when it's the
+    agent_daemon's own background goal dispatch.
+
+    The daemon's in-process Tier-1 dispatch tags request_id with the
+    'daemon_<goal_id>' prefix (see dispatch_goal's _daemon_request_id).
+    Genuine user turns — including user-initiated autonomous CREATE
+    ('do it for me') — carry a normal request_id and return True.
+
+    This is the single discriminator that breaks the 2026-05-29
+    yield-gate feedback loop: without it, every daemon dispatch
+    re-stamped _last_user_chat_at, so should_yield_to_user() read
+    'user active' forever (~24h of continuous yield, 1142 starvation
+    overrides) and the flywheel daemon never ran its normal path.
+    """
+    return not (bool(request_id) and str(request_id).startswith('daemon_'))
+
+
+def is_current_request_autonomous() -> bool:
+    """True when the IN-FLIGHT request is a daemon / flywheel dispatch (no live
+    user to answer clarifying questions); False for a genuine user turn.
+
+    Reads the thread-local request_id the /chat handler set and applies the one
+    canonical discriminator (is_genuine_user_request).  The CREATE pipeline uses
+    this to pick the assistant's AUTONOMOUS vs INTERACTIVE system prompt:
+    without it, autonomous goals were told they "may ask the user clarifying
+    questions", asked, and stalled forever waiting for an answer that never came
+    (the live 2026-06-04 :8080 capture showed a daemon goal in INTERACTIVE mode).
+    Degrades safe — any error / missing request_id returns False (interactive).
+    """
+    try:
+        from threadlocal import thread_local_data
+        return not is_genuine_user_request(thread_local_data.get_request_id() or '')
+    except Exception:
+        return False
+
+
+def mark_create_start(request_id=None):
+    """Call when a CREATE pipeline starts.
+
+    Always increments the in-flight-CREATE counter (so other daemon
+    ticks yield while ANY create runs — daemon-initiated included,
+    since creates are LLM-heavy and shouldn't pile up).  The counter
+    is self-balancing via mark_create_end().
+
+    Only stamps the user-activity TIMESTAMP for genuine user creates.
+    A daemon-initiated CREATE (request_id='daemon_<goal>') must NOT
+    re-arm the 10-min user cooldown — otherwise the starvation-override
+    path (override → forced tick → daemon dispatch → create →
+    mark_create_start → re-stamp) keeps the yield gate stuck-on, the
+    same feedback loop the line-8427 guard closes for the non-create
+    path.  See is_genuine_user_request().
+    """
     global _active_create_sessions
     with _create_lock:
         _active_create_sessions += 1
-    mark_user_chat_activity()
+    if is_genuine_user_request(request_id):
+        mark_user_chat_activity()
 
 
 def mark_create_end():
@@ -114,6 +248,106 @@ def is_user_recently_active() -> bool:
     if _active_create_sessions > 0:
         return True
     return (_time.time() - _last_user_chat_at) < _USER_CHAT_COOLDOWN
+
+
+def is_transient_deferral() -> bool:
+    """True when a ``dispatch_goal`` ``None`` is a TRANSIENT defer — the user is
+    actively using the LLM, or the Tier-2 circuit breaker is open — rather than a
+    real dispatch failure.
+
+    ``dispatch_goal`` returns ``None`` for BOTH cases, so the daemon can't tell
+    them apart from the return value alone.  The daemon calls this to avoid
+    counting a defer toward the 5-strike AUTO-PAUSE: a perfectly healthy goal
+    must never be paused just because the user was chatting (or the backend
+    hiccuped) — that was the "goals stuck / 0 progress" bug.  Composes the SAME
+    two checks ``dispatch_goal`` uses to defer (lines ~659 user-active, ~698
+    breaker-open), so the daemon's notion of "transient" never drifts from the
+    dispatcher's."""
+    try:
+        return is_user_recently_active() or _cb_is_open()
+    except Exception:
+        return False
+
+
+def should_yield_to_user() -> bool:
+    """Single canonical gate every background daemon must call.
+
+    Returns True when the daemon must skip its tick / iteration
+    (yield CPU, GIL, LLM, GPU to the user-facing path).  Three
+    independent yield reasons:
+
+    1. ``is_user_recently_active()`` — user chatted in the last 10
+       minutes or a CREATE pipeline is running.
+    2. ``model_lifecycle.get_system_pressure().throttle_factor < 0.1``
+       — VRAM/CPU pressure is so high the LLM throttle factor has
+       collapsed; running another LLM call would saturate the
+       system and starve the user.
+    3. ``ResourceGovernor.get_throttle() < 0.3`` — generic CPU/RAM
+       pressure that is NOT LLM-shaped (e.g., a runaway Python loop,
+       a hammering background daemon, OS-level memory pressure).
+       The governor combines its mode (ACTIVE/IDLE/SLEEP), the
+       model_lifecycle pressure, AND its own per-process pressure
+       calc into a single 0.0-1.0 throttle factor (see
+       ``core.resource_governor._calculate_throttle``).  Below 0.3
+       means "the system is hot enough that user-facing latency is
+       at risk" — daemons must yield even if the LLM-specific
+       throttle is fine.  Captures the case the user flagged
+       2026-05-10: coding_daemon's autogen turns burning CPU/GIL
+       while the user was actively chatting, model_lifecycle's
+       LLM-only pressure didn't see it, gate passed, system slowed.
+
+    All three checks are best-effort — failure to import / read any
+    signal returns False (don't block daemons on a missing module).
+    The function is the single source of truth for daemon yield
+    semantics: ``agent_daemon._tick``,
+    ``agent_daemon._proactive_hive_tick``,
+    ``hive_benchmark_prover._continuous_loop``, and
+    ``coding_daemon._tick`` all consult it, so adding a fourth
+    yield reason (e.g. battery-saver mode, network-pressure)
+    means editing exactly this function — no per-daemon copy-paste.
+    """
+    reason = None
+    # Reason #0 — a user-facing request is in flight RIGHT NOW (finer + higher
+    # priority than the 10-min "recently active" window below).  Background LLM
+    # work must never steal the shared model mid-turn; the daemon's starvation
+    # override also refuses to fire while this is set (see agent_daemon._tick).
+    try:
+        from core.foreground import foreground_active
+        if foreground_active():
+            reason = 'foreground_request'
+    except Exception:
+        pass
+    # Reason #1 — user recently active (is_user_recently_active stays the
+    # single source; we only LABEL which sub-condition fired).
+    if reason is None:
+        try:
+            if is_user_recently_active():
+                reason = ('create_in_flight' if _active_create_sessions > 0
+                          else 'user_active')
+        except Exception:
+            pass
+    # Reason #2 — LLM throttle collapsed under VRAM/CPU pressure.
+    if reason is None:
+        try:
+            from integrations.service_tools.model_lifecycle import (
+                get_model_lifecycle_manager)
+            _pressure = get_model_lifecycle_manager().get_system_pressure()
+            if _pressure.get('throttle_factor', 1.0) < 0.1:
+                reason = 'model_pressure'
+        except Exception:
+            pass
+    # Reason #3 — generic resource-governor throttle (now driven by
+    # EXTERNAL cpu, so our OWN idle-compute work no longer trips this).
+    if reason is None:
+        try:
+            from core.resource_governor import get_governor
+            _gov = get_governor()
+            if _gov is not None and _gov.get_throttle() < _GATE_THROTTLE_FLOOR:
+                reason = 'governor_throttle'
+        except Exception:
+            pass
+    _note_yield_reason(reason)
+    return reason is not None
 
 
 def _notify_watchdog_llm_start():
@@ -307,6 +541,23 @@ def _check_robot_capability_match(goal_type: str, goal_id: str) -> bool:
         return True
 
 
+def prompt_id_for_goal(goal_id: str) -> str:
+    """Deterministic numeric prompt_id for an autonomous goal.
+
+    SINGLE SOURCE of the goal_id -> prompt_id mapping.  ``dispatch_goal``
+    stamps this prompt_id on the /chat pipeline (so the recipe is saved
+    under ``{prompt_id}_{flow}_*.json`` and REUSE works on later ticks),
+    and the steering bridge (``dashboard_service.inject_instruction`` /
+    ``get_agent_chat_tail``) recomputes it to resolve the LIVE GroupChat
+    for a goal whose ``AgentGoal.prompt_id`` column is still null (the
+    flywheel goals never write it back).  Both callers MUST use this one
+    formula or the bridge can't find the running group to steer it.
+    """
+    import hashlib
+    h = int(hashlib.md5(str(goal_id).encode()).hexdigest()[:10], 16) % 100_000_000_000
+    return str(max(1, h))
+
+
 def dispatch_goal(prompt: str, user_id: str, goal_id: str,
                   goal_type: str = 'marketing',
                   model_config: list = None) -> Optional[str]:
@@ -406,13 +657,12 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
             # Fall through to local dispatch if distributed fails
             logger.info(f"Distributed fallback -> local dispatch for {goal_type} goal {goal_id}")
 
-    # Generate a NUMERIC prompt_id (same format as hart_intelligence_entry._next_prompt_id)
+    # NUMERIC prompt_id (same format as hart_intelligence_entry._next_prompt_id)
     # so it passes the isdigit() check in the adapter and /chat handler.
-    # Use goal_id hash to ensure the SAME goal always gets the SAME prompt_id
-    # across dispatches — this is what enables recipe reuse on subsequent ticks.
-    import hashlib
-    _goal_hash = int(hashlib.md5(goal_id.encode()).hexdigest()[:10], 16) % 100_000_000_000
-    prompt_id = str(max(1, _goal_hash))
+    # Deterministic from goal_id so the SAME goal always gets the SAME
+    # prompt_id across dispatches — enables recipe reuse on later ticks AND
+    # lets the steering bridge recompute it to find the live GroupChat.
+    prompt_id = prompt_id_for_goal(goal_id)
 
     body = {
         'user_id': user_id,
@@ -487,10 +737,11 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
         logger.info(f"Circuit breaker open — skipping Tier-2 HTTP for goal {goal_id}")
         return None
 
-    base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
+    base_url = _local_dispatch_base_url()  # #71: probe live port, not dead 6777
 
     try:
-        resp = pooled_post(f'{base_url}/chat', json=body, timeout=120)
+        resp = pooled_post(f'{base_url}/chat', json=body,
+                           headers=_internal_auth_headers(), timeout=120)
         if resp.status_code == 200:
             _cb_record_success()
             result = resp.get_json() if hasattr(resp, 'get_json') else resp.json()
@@ -598,7 +849,8 @@ def _dispatch_single_instruction(base_url: str, user_id: str, inst,
         'task_source': 'own',
     }
     try:
-        resp = pooled_post(f'{base_url}/chat', json=body, timeout=300)
+        resp = pooled_post(f'{base_url}/chat', json=body,
+                           headers=_internal_auth_headers(), timeout=300)
         if resp.status_code == 200:
             result_text = resp.json().get('response', '')
             return (inst.id, result_text[:500], None)
@@ -646,7 +898,7 @@ def drain_instruction_queue(user_id: str, max_tokens: int = 8000) -> Optional[st
             if plan is None:
                 return None
 
-            base_url = os.environ.get('HEVOLVE_BASE_URL', f'http://localhost:{get_port("backend")}')
+            base_url = _local_dispatch_base_url()  # #71: probe live port, not dead 6777
             all_results = []
             any_success = False
 

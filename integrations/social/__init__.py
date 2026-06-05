@@ -495,6 +495,20 @@ def init_social(app):
         except Exception as e:
             logger.debug(f"Hive benchmark prover start skipped: {e}")
 
+        # Outbound announcement broadcaster — listens for
+        # hive.benchmark.published events and pushes the proof to
+        # externally-configured channel destinations (Discord /
+        # Telegram / Slack / etc.) so the flywheel's self-advertising
+        # leg escapes the HARTOS-only feed.  Idempotent; safe to call
+        # before the events registry exists (returns False and the
+        # next run-loop tick can retry).
+        try:
+            from integrations.channels.announcement_broadcaster import (
+                register_announcement_subscriber)
+            register_announcement_subscriber()
+        except Exception as e:
+            logger.debug(f"Announcement broadcaster wire-up skipped: {e}")
+
         watchdog.start()
         logger.info(f"NodeWatchdog started: monitoring "
                     f"{len(watchdog._threads)} threads")

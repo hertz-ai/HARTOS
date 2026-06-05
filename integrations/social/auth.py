@@ -48,17 +48,20 @@ if not SECRET_KEY:
     # Auto-generate and persist so tokens survive restarts.
     # Stored next to the database file (writable user dir).
     def _load_or_create_secret_key():
-        db_path = os.environ.get('HEVOLVE_DB_PATH', '')
-        if db_path and db_path != ':memory:' and os.path.isabs(db_path):
-            key_file = os.path.join(os.path.dirname(db_path), '.social_secret_key')
-        elif os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-            try:
-                from core.platform_paths import get_db_dir
-                key_file = os.path.join(get_db_dir(), '.social_secret_key')
-            except ImportError:
+        # Single-sourced with the JWTManager reader (core.platform_paths) so the
+        # writer and reader never diverge on WHERE the key lives (#98e).
+        try:
+            from core.platform_paths import social_secret_key_write_target
+            key_file = social_secret_key_write_target()
+        except ImportError:
+            # Fail-safe: same priority, inlined, if platform_paths is unavailable.
+            db_path = os.environ.get('HEVOLVE_DB_PATH', '')
+            if db_path and db_path != ':memory:' and os.path.isabs(db_path):
+                key_file = os.path.join(os.path.dirname(db_path), '.social_secret_key')
+            elif os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
                 key_file = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'data', '.social_secret_key')
-        else:
-            key_file = os.path.join('agent_data', '.social_secret_key')
+            else:
+                key_file = os.path.join('agent_data', '.social_secret_key')
         try:
             if os.path.exists(key_file):
                 with open(key_file, 'r') as f:
