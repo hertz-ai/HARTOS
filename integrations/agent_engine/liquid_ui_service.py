@@ -949,7 +949,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 .start-menu.open{{display:flex}}
 .start-search{{width:100%;padding:8px 12px;border-radius:10px;border:1px solid var(--hart-glass-border);
   background:var(--hart-surface,rgba(255,255,255,0.05));color:var(--hart-text);
-  font-family:var(--hart-font-family);font-size:13px;outline:none;margin-bottom:12px}}
+  font-family:var(--ds-font-body);font-size:13px;outline:none;margin-bottom:12px}}
 .start-search:focus{{border-color:var(--hart-accent)}}
 .start-scroll{{flex:1;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;
   scrollbar-color:var(--hart-muted) transparent}}
@@ -979,7 +979,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 .agent-pill.hidden{{display:none}}
 .agent-pill .mi{{font-size:20px;color:var(--hart-accent);flex-shrink:0}}
 .agent-pill input{{flex:1;background:transparent;border:none;color:var(--hart-text);
-  font-family:var(--hart-font-family);font-size:13px;outline:none;min-width:0}}
+  font-family:var(--ds-font-body);font-size:13px;outline:none;min-width:0}}
 .agent-pill input::placeholder{{color:var(--hart-muted)}}
 .agent-response{{font-size:12px;color:var(--hart-muted);padding-top:6px;
   border-top:1px solid var(--hart-glass-border);display:none;width:100%}}
@@ -988,7 +988,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 /* ── Floating Assistant Chat Panel ── */
 .assistant-chat{{position:fixed;bottom:56px;right:16px;z-index:1600;
   width:380px;height:520px;display:none;flex-direction:column;
-  border-radius:var(--hart-radius-lg,16px);overflow:hidden;
+  border-radius:var(--hart-radius);overflow:hidden;
   resize:both;min-width:320px;min-height:400px;max-width:600px;max-height:80vh}}
 .assistant-chat.open{{display:flex}}
 .assistant-chat .ac-header{{display:flex;align-items:center;gap:8px;
@@ -1022,7 +1022,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   padding:8px 10px;border-top:1px solid var(--hart-glass-border);flex-shrink:0}}
 .assistant-chat .ac-input{{flex:1;background:transparent;border:1px solid var(--hart-glass-border);
   border-radius:20px;padding:8px 14px;color:var(--hart-text);
-  font-family:var(--hart-font-family);font-size:13px;outline:none;resize:none}}
+  font-family:var(--ds-font-body);font-size:13px;outline:none;resize:none}}
 .assistant-chat .ac-input:focus{{border-color:var(--hart-accent)}}
 .assistant-chat .ac-input::placeholder{{color:var(--hart-muted)}}
 .assistant-chat .ac-send{{background:var(--hart-accent);border:none;
@@ -1049,7 +1049,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 .lock-date{{font-size:16px;color:var(--hart-muted)}}
 .lock-input{{padding:10px 16px;border-radius:12px;border:1px solid var(--hart-glass-border);
   background:var(--hart-glass-bg);color:var(--hart-text);font-size:14px;
-  font-family:var(--hart-font-family);outline:none;width:280px;text-align:center}}
+  font-family:var(--ds-font-body);outline:none;width:280px;text-align:center}}
 .lock-status{{font-size:12px;color:var(--hart-muted)}}
 
 /* ── Scrollbar ── */
