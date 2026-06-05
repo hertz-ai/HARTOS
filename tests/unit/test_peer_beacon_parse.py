@@ -56,3 +56,23 @@ def test_self_beacon_is_ignored():
     body = json.dumps(
         {'type': 'hevolve-discovery', 'node_id': 'self-node'}).encode('utf-8')
     assert d._parse_beacon(d.BEACON_MAGIC + body) == {}
+
+
+def test_missing_or_nonstring_node_id_returns_empty():
+    """A beacon with the right type but no usable node_id must be rejected at
+    parse time. Otherwise it reaches the recv loop's `node_id[:8]` log and raises
+    TypeError, killing the discovery thread — the same malformed-beacon crash
+    class the non-dict guard hardened against."""
+    d = _disco()
+    M = d.BEACON_MAGIC
+    # missing node_id key entirely
+    assert d._parse_beacon(
+        M + json.dumps({'type': 'hevolve-discovery'}).encode('utf-8')) == {}
+    # empty / whitespace-less empty string
+    assert d._parse_beacon(
+        M + json.dumps({'type': 'hevolve-discovery', 'node_id': ''}).encode('utf-8')) == {}
+    # non-string node_id — the exact value that would crash node_id[:8]
+    assert d._parse_beacon(
+        M + json.dumps({'type': 'hevolve-discovery', 'node_id': 123}).encode('utf-8')) == {}
+    assert d._parse_beacon(
+        M + json.dumps({'type': 'hevolve-discovery', 'node_id': ['x']}).encode('utf-8')) == {}

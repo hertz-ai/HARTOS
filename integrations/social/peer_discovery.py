@@ -1553,7 +1553,15 @@ class AutoDiscovery:
 
         if payload.get('type') != 'hevolve-discovery':
             return {}
-        if payload.get('node_id') == self._gossip.node_id:
+        # node_id is REQUIRED by the beacon spec and is used downstream as the
+        # dedup key and as `node_id[:8]` in the recv-loop log line. A beacon
+        # missing it (or carrying a non-string) would otherwise sail past here
+        # and crash the recv loop at node_id[:8]; reject it now, same as the
+        # type guard above (completes the malformed-beacon hardening).
+        node_id = payload.get('node_id')
+        if not isinstance(node_id, str) or not node_id:
+            return {}
+        if node_id == self._gossip.node_id:
             return {}
 
         # Verify guardrail hash
