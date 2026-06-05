@@ -57,9 +57,16 @@ def client_db(monkeypatch):
 
 
 def _seed_user(db):
+    # Unique identity per test: in the FULL suite another social-DB test can
+    # initialize integrations.social.models with a persistent engine before this
+    # fixture's :memory: env applies, so a fixed 'dev' username collides on the
+    # UNIQUE constraint. A uuid-suffixed username/email is collision-proof
+    # regardless of DB state (the tests assert on device_id + status, not name).
     from integrations.social.models import User
-    u = User(id=str(uuid.uuid4()), username='dev', display_name='Dev',
-             email='dev@x.test', password_hash='x:y', user_type='human')
+    uid = str(uuid.uuid4())
+    sfx = uid[:8]
+    u = User(id=uid, username=f'dev-{sfx}', display_name='Dev',
+             email=f'dev-{sfx}@x.test', password_hash='x:y', user_type='human')
     db.add(u)
     db.commit()
     return u
