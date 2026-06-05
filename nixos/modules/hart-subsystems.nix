@@ -79,6 +79,11 @@ in
     web = {
       enable = lib.mkEnableOption "Progressive Web App native support";
     };
+
+    # ─── Subsystem 5: macOS (Darling — experimental) ───
+    macos = {
+      enable = lib.mkEnableOption "Experimental macOS app support (Darling — Mach-O/Darwin translation, the macOS analogue of Wine)";
+    };
   };
 
   # ═══════════════════════════════════════════════════════════
@@ -409,6 +414,23 @@ in
           echo "Installed: $APP_NAME → $APP_URL"
         '';
       };
+    })
+
+    # ─────────────────────────────────────────────────────────
+    # SUBSYSTEM 5: macOS Native (Darling) — EXPERIMENTAL, opt-in
+    # ─────────────────────────────────────────────────────────
+    # Darling is the open-source Mach-O / Darwin translation layer — the macOS
+    # analogue of Wine (NOT an emulator: it implements the Darwin syscall ABI +
+    # frameworks as native Linux libraries). It is x86_64-only and today runs
+    # mostly CLI + some GUI macOS binaries; maturity is well below Wine, so this
+    # stays default-OFF and never touches the default desktop build. The
+    # `pkgs ? darling` guard keeps evaluation safe on a nixpkgs rev/arch where
+    # darling is absent or unbuildable.
+    (lib.mkIf sub.macos.enable {
+      environment.systemPackages = lib.optional (pkgs ? darling) pkgs.darling;
+      systemd.tmpfiles.rules = [
+        "d /var/lib/hart/darwin 0750 hart hart -"
+      ];
     })
   ]);
 }
