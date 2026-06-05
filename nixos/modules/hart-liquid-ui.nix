@@ -90,6 +90,15 @@ let
     # exactly the first-boot / live-USB case. Disable both so a shell that
     # cannot paint never takes down the whole session.
     ${lib.optionalString (!ui.preferHardwareGL) "export WEBKIT_DISABLE_DMABUF_RENDERER=1\nexport WEBKIT_DISABLE_COMPOSITING_MODE=1"}
+    ${lib.optionalString ui.runOnboardingInKiosk ''
+    # First-run identity ceremony (opt-in; default off). `hart-onboarding`
+    # self-gates via --check (exits 0 if already onboarded). timeout + || true
+    # bound any hang/crash so the shell ALWAYS comes up — the ceremony can never
+    # permanently block the kiosk. Validate on a real ISO boot before enabling.
+    if command -v hart-onboarding >/dev/null 2>&1; then
+      ${pkgs.coreutils}/bin/timeout 300 hart-onboarding || true
+    fi
+''}
     export HART_SHELL_URL="$URL"
     exec ${cfg.package.python}/bin/python -c "
 import gi, os
@@ -236,6 +245,22 @@ in
       type = lib.types.bool;
       default = true;
       description = "Enable Agent-to-UI protocol (agents push UI components)";
+    };
+
+    runOnboardingInKiosk = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Run the "Light Your HART" first-boot identity ceremony (hart-onboarding)
+        inside the cage KIOSK session, before the glass shell. DEFAULT FALSE — the
+        ceremony is GTK4/libadwaita and must paint under the kiosk's software-GL;
+        if it cannot, it could delay the shell up to the 300s timeout on first
+        boot. The glass-shell wrapper guards it with the ceremony's own `--check`
+        (skip if already onboarded) + `timeout 300` + `|| true`, so it can NEVER
+        permanently block the kiosk — but ENABLE ONLY after verifying the ceremony
+        paints on a real ISO boot. Off = the shell starts directly (current,
+        byte-identical behaviour). Requires hart.onboarding (the variant default).
+      '';
     };
 
     embedNunba = lib.mkOption {
