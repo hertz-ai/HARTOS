@@ -96,3 +96,36 @@ def test_stop_event_wakes_monitor_promptly(monkeypatch):
     assert not t.is_alive(), (
         "monitor did not wake on _stop_event within 2s — shutdown would block "
         "the full interval")
+
+
+def test_proactive_loop_does_not_spin_in_active_mode(monkeypatch):
+    """The PROACTIVE action-stream loop (the monitor's sibling thread) must also
+    sleep while the user is ACTIVE, not busy-spin. It used to wait on
+    _cancel_event — SET in ACTIVE/SLEEP — so the wait returned instantly and it
+    spun the loop (watchdog heartbeat + 4 _jitter() timer resets per iteration)
+    on a core, exactly while the user is active. Fix: wait on _stop_event."""
+    gov = ResourceGovernor()
+    gov._mode = MODE_ACTIVE
+    gov._cancel_event.set()                       # the ACTIVE signal (bug trigger)
+    import security.node_watchdog as _nw
+    monkeypatch.setattr(_nw, 'get_watchdog', lambda: None)
+
+    # _jitter is called 4× at init and 4× per ACTIVE iteration (the timer-reset
+    # branch). When the loop SLEEPS the full interval only the 4 init calls fire
+    # in the test window; when it SPINS the count runs to the hundreds.
+    jitter = {'n': 0}
+    monkeypatch.setattr(rg, '_jitter',
+                        lambda *_a: (jitter.__setitem__('n', jitter['n'] + 1), 0.0)[1])
+
+    gov._running = True
+    t = threading.Thread(target=gov._proactive_action_stream, daemon=True)
+    t.start()
+    time.sleep(0.4)
+    gov._running = False
+    gov._stop_event.set()                         # what stop() does
+    t.join(timeout=2.0)
+
+    assert not t.is_alive(), "proactive thread did not exit after stop()"
+    assert jitter['n'] <= 12, (
+        f"proactive loop busy-spun ({jitter['n']} _jitter calls in 0.4s) — it "
+        "waited on the ACTIVE-set _cancel_event instead of _stop_event")

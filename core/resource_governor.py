@@ -1419,9 +1419,16 @@ class ResourceGovernor:
                     _wd.heartbeat('resource_governor_proactive')
             except Exception:
                 pass
-            # Sleep in short increments, checking cancel event
-            # Wait returns True if the event is set (cancel requested)
-            cancelled = self._cancel_event.wait(timeout=5.0)
+            # Sleep the proactive interval. Wait on the DEDICATED _stop_event,
+            # NOT _cancel_event: the latter is SET for the whole duration of
+            # ACTIVE/SLEEP (to signal "stop proactive work"), so waiting on it
+            # here returned instantly every iteration and busy-spun the loop
+            # (watchdog heartbeat + 4 _jitter() calls) on a core — exactly while
+            # the user is active (2026-06-05 hang, the sibling of the monitor
+            # busy-spin). _stop_event is set only by stop(); the _mode != IDLE
+            # check below still suppresses proactive work while ACTIVE, and
+            # in-flight proactive tasks still abort via _cancel_event.
+            self._stop_event.wait(timeout=5.0)
 
             if not self._running:
                 break
