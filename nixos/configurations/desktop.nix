@@ -268,7 +268,15 @@ in
     gnomeExtensions.dash-to-dock       # Taskbar (dock) at bottom
     gnomeExtensions.appindicator       # System tray support
     jetbrains-mono                     # Default monospace font
-  ];
+  ]
+  # ── Remote Desktop (open-source TeamViewer equivalent) ──
+  # RustDesk: ID-based P2P remote control + file transfer. gnome-connections
+  # above is only an RDP/VNC *viewer*; RustDesk is the TeamViewer-style remote-
+  # control client+server the OS was missing. Attr-guarded so a nixpkgs rev that
+  # names it differently (rustdesk vs rustdesk-flutter) or lacks it cannot break
+  # evaluation; CI's Nix Build Matrix validates the package itself builds.
+  ++ lib.optional (pkgs ? rustdesk) pkgs.rustdesk
+  ++ lib.optional (pkgs ? "rustdesk-flutter") pkgs."rustdesk-flutter";
 
   # ─── ISO Branding ───
   isoImage = {
