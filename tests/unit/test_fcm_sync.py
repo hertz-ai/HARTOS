@@ -75,6 +75,83 @@ def test_sync_falls_back_to_local_on_miss(monkeypatch):
     assert fcm_sync.sync_fcm_token('u1') == 'cached_old'
 
 
+# ── #90: query the registry by the CENTRAL id when the mapping is known ─────
+def test_sync_queries_by_central_id_when_mapped(monkeypatch):
+    """A local UUID with a central-id mapping → the registry is queried by the
+    CENTRAL id (what it's keyed with), but the token is cached under the LOCAL
+    uuid (what the push path looks up)."""
+    seen = {}
+    monkeypatch.setattr(fcm_sync, 'resolve_central_id', lambda uid: '9003054371')
+    monkeypatch.setattr(fcm_sync, 'fetch_central_fcm_token',
+                        lambda rid, **k: (seen.__setitem__('queried', rid), 'tok')[1])
+    monkeypatch.setattr(fcm_sync, 'store_local_fcm_token',
+                        lambda uid, tok, **k: (seen.__setitem__('cached', (uid, tok)), True)[1])
+    assert fcm_sync.sync_fcm_token('local-uuid') == 'tok'
+    assert seen['queried'] == '9003054371'           # queried by central id
+    assert seen['cached'] == ('local-uuid', 'tok')   # cached under local uuid
+
+
+def test_sync_queries_by_uuid_when_no_mapping(monkeypatch):
+    """No mapping → query by the uuid itself — byte-for-byte the pre-#90
+    behaviour (zero regression)."""
+    seen = {}
+    monkeypatch.setattr(fcm_sync, 'resolve_central_id', lambda uid: None)
+    monkeypatch.setattr(fcm_sync, 'fetch_central_fcm_token',
+                        lambda rid, **k: (seen.__setitem__('queried', rid), None)[1])
+    monkeypatch.setattr(fcm_sync, 'get_local_fcm_token', lambda uid: 'cached')
+    assert fcm_sync.sync_fcm_token('local-uuid') == 'cached'
+    assert seen['queried'] == 'local-uuid'
+
+
+def _fake_social_models(user_obj):
+    """A stand-in integrations.social.models exposing db_session + User, where
+    a User query resolves to ``user_obj`` (or None)."""
+    class _Query:
+        def filter(self, *a, **k):
+            return self
+
+        def first(self):
+            return user_obj
+
+    class _DB:
+        def query(self, _model):
+            return _Query()
+
+    @contextlib.contextmanager
+    def db_session(commit=True):
+        yield _DB()
+
+    return types.SimpleNamespace(db_session=db_session, User=types.SimpleNamespace(id=None))
+
+
+def test_resolve_central_id_reads_user_settings(monkeypatch):
+    monkeypatch.setitem(sys.modules, 'integrations.social.models',
+                        _fake_social_models(types.SimpleNamespace(
+                            settings={'central_user_id': '9003054371'})))
+    assert fcm_sync.resolve_central_id('uuid') == '9003054371'
+
+
+def test_resolve_central_id_none_when_unset_or_missing(monkeypatch):
+    monkeypatch.setitem(sys.modules, 'integrations.social.models',
+                        _fake_social_models(types.SimpleNamespace(settings={})))
+    assert fcm_sync.resolve_central_id('uuid') is None
+    monkeypatch.setitem(sys.modules, 'integrations.social.models',
+                        _fake_social_models(None))  # user not found
+    assert fcm_sync.resolve_central_id('uuid') is None
+    assert fcm_sync.resolve_central_id('') is None  # no user_id
+
+
+def test_set_central_id_writes_user_settings(monkeypatch):
+    user = types.SimpleNamespace(settings={})
+    monkeypatch.setitem(sys.modules, 'integrations.social.models',
+                        _fake_social_models(user))
+    import sqlalchemy.orm.attributes as _attrs
+    monkeypatch.setattr(_attrs, 'flag_modified', lambda obj, key: None)  # ORM-only
+    assert fcm_sync.set_central_id('uuid', '9003054371') is True
+    assert user.settings.get('central_user_id') == '9003054371'
+    assert fcm_sync.set_central_id('uuid', '') is False  # nothing to store
+
+
 # ── store/get round-trip against a real in-memory SQLite ────────────────────
 def test_store_and_get_roundtrip(monkeypatch):
     from sqlalchemy import create_engine

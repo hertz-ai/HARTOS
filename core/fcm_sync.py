@@ -114,6 +114,71 @@ def get_local_fcm_token(user_id):
         return None
 
 
+# ── Local UUID ↔ central account-id mapping (#90) ────────────────────────────
+#
+# The central FCM registry is keyed by the central Hevolve account id (the
+# phone / account-number, e.g. 9003054371), but the local notification path
+# carries the local social ``User.id`` (a UUID).  When HARTOS knows the central
+# id for a user — it learns it at login with the central account, or central
+# pushes it down in the user-sync payload — we stash it on the canonical local
+# record (``User.settings['central_user_id']``, a migration-free JSON field) so
+# the pull can query the registry by the id it is actually keyed with, instead
+# of the UUID that always missed (#90).  No mapping known → callers fall back to
+# the UUID itself, i.e. byte-for-byte the previous behaviour.
+
+CENTRAL_ID_SETTINGS_KEY = 'central_user_id'
+
+
+def resolve_central_id(user_id):
+    """Return the central account id the FCM registry is keyed by for
+    ``user_id`` (from ``User.settings['central_user_id']``), or None when no
+    mapping is known.  Best-effort, never raises."""
+    if not user_id:
+        return None
+    try:
+        from integrations.social.models import db_session, User
+        with db_session(commit=False) as db:
+            u = db.query(User).filter(User.id == str(user_id)).first()
+            settings = getattr(u, 'settings', None) if u else None
+            if isinstance(settings, dict):
+                cid = settings.get(CENTRAL_ID_SETTINGS_KEY)
+                if cid and str(cid).strip():
+                    return str(cid).strip()
+    except Exception as e:
+        logger.debug("resolve_central_id(%s) failed: %s", user_id, e)
+    return None
+
+
+def set_central_id(user_id, central_id):
+    """Persist the central account id for the local ``user_id`` (on
+    ``User.settings``) so the FCM pull can query the central registry by the id
+    it is keyed with.  The hook a central-account login / device-link calls once
+    it knows both ids.  Idempotent, best-effort; returns True on a stored value.
+
+    Note: writes through a fresh session, so the local User row must already be
+    committed.  Sync-time capture (a User created in the same transaction) sets
+    ``settings`` inline instead — see sync_engine._handle_sync_user."""
+    if not user_id or not central_id:
+        return False
+    try:
+        from sqlalchemy.orm.attributes import flag_modified
+        from integrations.social.models import db_session, User
+        with db_session() as db:
+            u = db.query(User).filter(User.id == str(user_id)).first()
+            if not u:
+                return False
+            settings = dict(u.settings or {})
+            if settings.get(CENTRAL_ID_SETTINGS_KEY) == str(central_id):
+                return True
+            settings[CENTRAL_ID_SETTINGS_KEY] = str(central_id)
+            u.settings = settings
+            flag_modified(u, 'settings')
+        return True
+    except Exception as e:
+        logger.debug("set_central_id(%s) failed: %s", user_id, e)
+        return False
+
+
 def sync_fcm_token(user_id, synced_at=None):
     """Fetch the central token for ``user_id`` and cache it locally.
 
@@ -121,12 +186,13 @@ def sync_fcm_token(user_id, synced_at=None):
     / offline) falls back to any previously-cached local copy so an offline node
     keeps using the last-known token.  Returns None if neither exists.
 
-    NOTE on identity: ``user_id`` must be the id the FCM registry was keyed with
-    (the account number/phone), which is also what the notification path passes.
-    If the Android app never registered (registry returns "user not Found") this
-    correctly returns None — there is no token to sync yet.
+    Identity (#90): the registry is keyed by the central account id, so we query
+    it by ``resolve_central_id(user_id)`` when that mapping is known, and cache
+    the result under the LOCAL ``user_id`` (the key the push path looks up).
+    With no mapping we query by ``user_id`` itself — unchanged behaviour.
     """
-    token = fetch_central_fcm_token(user_id)
+    registry_id = resolve_central_id(user_id) or user_id
+    token = fetch_central_fcm_token(registry_id)
     if token:
         store_local_fcm_token(user_id, token, synced_at=synced_at)
         return token

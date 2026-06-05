@@ -264,6 +264,29 @@ class SyncEngine:
             db.add(user)
             logger.info(f"Sync: created user {user_id} from sync")
 
+        # Map the local UUID → central account id (#90) so the FCM pull can
+        # query the registry by the id it is keyed with (phone/account-number).
+        # Central knows the mapping; it rides down in the user-sync payload.
+        # Set inline on the row in THIS transaction — set_central_id's fresh
+        # session couldn't see an uncommitted create.  No-op when omitted.
+        central_id = (payload.get('central_user_id')
+                      or payload.get('account_number') or payload.get('phone'))
+        if central_id:
+            _row = existing if existing else user
+            try:
+                from sqlalchemy.orm.attributes import flag_modified
+                from core.fcm_sync import CENTRAL_ID_SETTINGS_KEY
+                _settings = dict(getattr(_row, 'settings', None) or {})
+                if _settings.get(CENTRAL_ID_SETTINGS_KEY) != str(central_id):
+                    _settings[CENTRAL_ID_SETTINGS_KEY] = str(central_id)
+                    _row.settings = _settings
+                    flag_modified(_row, 'settings')
+                    logger.info(
+                        f"Sync: mapped user {user_id} → central {central_id}")
+            except Exception as _e:
+                logger.debug(
+                    f"Sync: central-id map skipped for {user_id}: {_e}")
+
         # Cache the centrally-registered FCM token DOWN into the local store,
         # keyed by the SAME notification user_id (the UUID) the push path uses.
         # Central (Hevolve_Database) owns User.FCMtoken; delivering it in this
