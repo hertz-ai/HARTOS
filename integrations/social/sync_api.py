@@ -120,7 +120,7 @@ def link_device():
         )
         db.add(binding)
         db.commit()
-        return _ok(binding.to_dict(), 201)
+        return _ok(binding.to_dict(), status=201)
     except Exception as e:
         db.rollback()
         logger.error(f"Device link failed: {e}")
