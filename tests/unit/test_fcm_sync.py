@@ -169,3 +169,20 @@ def test_send_posts_to_fcm_with_credential(monkeypatch):
     assert m['notification'] == {'title': 'Consent', 'body': 'Approve external posting?'}
     assert m['data']['privacy_tier_skipped'] == 'true'        # the tier-skip notice rides along
     assert 'central FCM relay' in m['data']['privacy_notice']
+
+
+def test_send_skips_network_sync_when_no_credential(monkeypatch):
+    """The cheap credential gate must short-circuit BEFORE the token network
+    sync. A credential-less node (the default today) must never fire the up-to-8s
+    blocking registry GET — which send_fcm_push is called with per expired message
+    in DeliveryTracker's cleanup loop (2026-06-05 sweep, governor-hang family)."""
+    monkeypatch.delenv('HART_FCM_ACCESS_TOKEN', raising=False)
+    monkeypatch.delenv('HART_FCM_SA_FILE', raising=False)
+    monkeypatch.delenv('HART_FCM_PROJECT', raising=False)
+    monkeypatch.setattr(fcm_sync, 'get_local_fcm_token', lambda uid: None)   # cache miss
+
+    def _no_sync(*a, **k):
+        raise AssertionError(
+            "must not hit the central FCM registry without a push credential")
+    monkeypatch.setattr(fcm_sync, 'sync_fcm_token', _no_sync)
+    assert fcm_sync.send_fcm_push('u1', 't', 'b') is False

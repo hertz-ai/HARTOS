@@ -200,13 +200,19 @@ def send_fcm_push(user_id, title, body, data=None, timeout=8):
     """
     if not user_id:
         return False
-    token = get_local_fcm_token(user_id) or sync_fcm_token(user_id)
-    if not token:
-        return False
+    # Cheap credential/project gate FIRST: a node with no push credential (the
+    # default today) must never trigger the token network-sync below. Before
+    # this reorder, send_fcm_push fired an up-to-8s blocking GET to the central
+    # FCM registry per expired message in DeliveryTracker's cleanup loop, then
+    # discovered there was no credential and no-op'd — wasted blocking on every
+    # credential-less node (2026-06-05 sweep, same family as the governor hang).
     access = _fcm_access_token()
     project = os.environ.get('HART_FCM_PROJECT', '')
     if not access or not project:
         logger.debug("send_fcm_push(%s): no FCM credential/project — push disabled", user_id)
+        return False
+    token = get_local_fcm_token(user_id) or sync_fcm_token(user_id)
+    if not token:
         return False
     try:
         import requests
