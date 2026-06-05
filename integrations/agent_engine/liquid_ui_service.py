@@ -499,7 +499,7 @@ class LiquidUIService:
             css_vars = ThemeService.get_css_variables()
             theme = ThemeService.get_active_theme()
         except Exception:
-            css_vars = ':root { --hart-background: #0F0E17; --hart-accent: #00D4AA; --hart-active: #00e676; --hart-text: #e0e0e0; --hart-glass-bg: rgba(15,14,23,0.65); --hart-glass-border: rgba(0,212,170,0.18); --hart-muted: #78909c; --hart-surface: #1a1a2e; --hart-blur: 20px; --hart-saturation: 180%; --hart-radius: 16px; --hart-panel-opacity: 0.65; --hart-topbar-height: 40px; --hart-icon-size: 20px; --hart-titlebar-height: 32px; --hart-font-family: "JetBrains Mono"; --hart-font-size: 13px; --hart-heading-size: 18px; --hart-font-weight: 400; --hart-heading-weight: 600; --hart-anim-speed: 200ms; --hart-error: #FF6B6B; --hart-caution: #ffab40; --hart-heading: #00D4AA; --hart-surface-hover: #252540; }'
+            css_vars = ':root { --hart-background: #0F0E17; --hart-accent: #00D4AA; --hart-on-accent: #0F0E17; --hart-active: #00e676; --hart-text: #e0e0e0; --hart-glass-bg: rgba(15,14,23,0.65); --hart-glass-border: rgba(0,212,170,0.18); --hart-muted: #78909c; --hart-surface: #1a1a2e; --hart-blur: 20px; --hart-saturation: 180%; --hart-radius: 16px; --hart-panel-opacity: 0.65; --hart-topbar-height: 40px; --hart-icon-size: 20px; --hart-titlebar-height: 32px; --hart-font-family: "JetBrains Mono"; --hart-font-size: 13px; --hart-heading-size: 18px; --hart-font-weight: 400; --hart-heading-weight: 600; --hart-anim-speed: 200ms; --hart-error: #FF6B6B; --hart-caution: #ffab40; --hart-heading: #00D4AA; --hart-surface-hover: #252540; }'
             theme = {}
 
         # Performance tier detection
@@ -638,7 +638,7 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
 .start-btn:focus-visible,.tray-btn:focus-visible,.start-item:focus-visible,.power-btn:focus-visible,.taskbar-chip:focus-visible,.agent-pill:focus-visible,.ctx-menu-item:focus-visible{outline:2px solid var(--hart-accent);outline-offset:-2px}
 .ds-btn:disabled,.ds-btn[disabled]{opacity:0.38;pointer-events:none}
 .ds-btn .mi{font-size:18px}
-.ds-btn-primary{background:var(--hart-accent);color:#fff}
+.ds-btn-primary{background:var(--hart-accent);color:var(--hart-on-accent)}
 .ds-btn-primary:hover{box-shadow:var(--ds-elevation-1);filter:brightness(1.1)}
 .ds-btn-primary:active{filter:brightness(0.9)}
 .ds-btn-secondary{background:transparent;color:var(--hart-accent);border:1px solid var(--hart-glass-border)}

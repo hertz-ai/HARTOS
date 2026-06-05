@@ -301,6 +301,18 @@ class ThemeService:
                 lines.append(f'  --hart-{css_key}: {val};')
             else:
                 lines.append(f'  --hart-{css_key}: #{val};')
+        # Contrast-correct text colour for ON the accent (WCAG 1.4.3): dark text
+        # on a light/bright accent, light text on a dark one. Fixes white-on-teal
+        # (#00D4AA was ~1.9:1). Picked from the accent's perceived luminance, so
+        # custom accents stay legible too.
+        accent = (colors.get('accent', '00D4AA') or '00D4AA').lstrip('#')
+        try:
+            r, g, b = int(accent[0:2], 16), int(accent[2:4], 16), int(accent[4:6], 16)
+            lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+            on_accent = '#0F0E17' if lum > 0.5 else '#ffffff'
+        except (ValueError, IndexError):
+            on_accent = '#ffffff'
+        lines.append(f'  --hart-on-accent: {on_accent};')
         # Font
         lines.append(f'  --hart-font-family: "{font.get("family", "JetBrains Mono")}";')
         lines.append(f'  --hart-font-size: {font.get("size", 13)}px;')
