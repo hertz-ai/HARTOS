@@ -64,8 +64,6 @@ in
   # "gsp: fini failed, -110"), cascading into display manager and service failures.
   # The proprietary driver (hart-nvidia.nix) is the correct driver for these GPUs.
   boot.blacklistedKernelModules = [ "nouveau" ];
-  # nouveau.modeset=0 merged with the "quiet splash" params defined later via lib.mkBefore
-  boot.kernelParams = lib.mkBefore [ "nouveau.modeset=0" ];
   # nixpkgs.config.allowBroken now set once at the flake level (#70)
 
   # Note: do NOT override `glibcLocales` with a custom `locales`
@@ -612,5 +610,5 @@ in
     themePackages = [ hartPlymouth ];
     theme = lib.mkForce "hart";
   };
-  boot.kernelParams = [ "quiet" "splash" ];
+  boot.kernelParams = [ "quiet" "splash" "nouveau.modeset=0" ];
 }
