@@ -112,6 +112,16 @@ in
           roboto-mono
           jetbrains-mono
           fira-code
+          # ── Glass shell typography + icons, bundled LOCALLY ──
+          # liquid_ui_service.py renders the shell with Inter (body) and the
+          # Material Icons ligature font for EVERY top-bar/tray icon. Those were
+          # loaded from fonts.googleapis.com, so a fresh OFFLINE ISO boot showed
+          # literal "lock"/"notifications" words instead of icons (and phoned
+          # Google on every launch). Bundling them makes the shell render fully
+          # offline + private. (A real OS ships its own fonts.)
+          inter                   # Shell body font (--ds-font-body)
+          material-icons          # Material Icons ligature font (.mi icons)
+          material-symbols        # Newer Material Symbols (forward-compat)
         ];
         fontconfig.defaultFonts = {
           serif = [ "Noto Serif" "Liberation Serif" ];
