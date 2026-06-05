@@ -3438,6 +3438,21 @@ function applyPreset(id, resp) {{
     }}).catch(()=>{{ resp.textContent='Failed to apply theme'; }});
 }}
 
+// Focus trap: keep Tab within the active modal surface (lock screen / start menu
+// / dialog) so keyboard focus can't escape behind it. No-op when none is open.
+document.addEventListener('keydown', function(e) {{
+  if(e.key!=='Tab') return;
+  const trap = document.querySelector('.lock-screen.active, .start-menu.open, .ds-modal-overlay.ds-open .ds-modal');
+  if(!trap) return;
+  const nodes = trap.querySelectorAll('button,input,select,textarea,a[href],[tabindex]:not([tabindex="-1"]),[role="button"][tabindex]');
+  const f = Array.prototype.filter.call(nodes, el=>el.offsetParent!==null);
+  if(!f.length) return;
+  const first=f[0], last=f[f.length-1], act=document.activeElement;
+  if(!trap.contains(act)) {{ e.preventDefault(); first.focus(); }}
+  else if(e.shiftKey && act===first) {{ e.preventDefault(); last.focus(); }}
+  else if(!e.shiftKey && act===last) {{ e.preventDefault(); first.focus(); }}
+}});
+
 // ═══ Context Menu ═══
 document.addEventListener('contextmenu', e => {{
   e.preventDefault();
