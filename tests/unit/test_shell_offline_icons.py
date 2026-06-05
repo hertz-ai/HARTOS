@@ -50,5 +50,6 @@ def test_online_render_unchanged_google_link_kept():
 def test_shell_still_renders_the_icons():
     html = _render()
     # Sanity: the structure that uses the icons is intact and the doc is real.
-    assert 'class="mi material-icons-round">notifications' in html
+    # (Resilient to a11y attributes like aria-hidden on the icon span.)
+    assert 'material-icons-round' in html and 'notifications</span>' in html
     assert len(html) > 50000

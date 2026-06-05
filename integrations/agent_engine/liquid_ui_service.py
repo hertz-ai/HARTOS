@@ -631,6 +631,11 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
     filter var(--ds-duration-short) var(--ds-ease-standard);
   user-select:none;-webkit-tap-highlight-color:transparent}
 .ds-btn:focus-visible{outline:2px solid var(--hart-accent);outline-offset:2px}
+/* Global keyboard focus ring (a11y). :focus-visible = keyboard-only (mouse clicks
+   draw no ring), matching Win11/macOS. The shell chrome controls had NO focus
+   style at all, so keyboard users couldn't see where they were. */
+:focus-visible{outline:2px solid var(--hart-accent);outline-offset:2px}
+.start-btn:focus-visible,.tray-btn:focus-visible,.start-item:focus-visible,.power-btn:focus-visible,.taskbar-chip:focus-visible,.agent-pill:focus-visible,.ctx-menu-item:focus-visible{outline:2px solid var(--hart-accent);outline-offset:-2px}
 .ds-btn:disabled,.ds-btn[disabled]{opacity:0.38;pointer-events:none}
 .ds-btn .mi{font-size:18px}
 .ds-btn-primary{background:var(--hart-accent);color:#fff}
@@ -853,7 +858,7 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
         return f'''<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>HART OS</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600;700&family=Fira+Code:wght@400;500;600&display=swap" rel="stylesheet">
@@ -1075,21 +1080,21 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 <!-- Top Bar -->
 <div class="top-bar glass">
-  <div class="start-btn" onclick="toggleStartMenu()" title="Start Menu (Super)">
-    <span class="mi material-icons-round">hexagon</span>
+  <div class="start-btn" role="button" tabindex="0" aria-haspopup="menu" aria-label="Start menu" onclick="toggleStartMenu()" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Start Menu (Super)">
+    <span class="mi material-icons-round" aria-hidden="true">hexagon</span>
     <span>HART</span>
   </div>
-  <div class="top-bar-center" id="agent-status"></div>
+  <div class="top-bar-center" id="agent-status" role="status" aria-live="polite" aria-label="Agent status"></div>
   <div class="top-bar-right">
-    <div class="tray-btn" onclick="openPanel('notifications')" title="Notifications">
-      <span class="mi material-icons-round">notifications</span>
+    <div class="tray-btn" role="button" tabindex="0" aria-label="Notifications" onclick="openPanel('notifications')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Notifications">
+      <span class="mi material-icons-round" aria-hidden="true">notifications</span>
       <div class="badge" id="notif-badge" style="display:none"></div>
     </div>
-    <div class="tray-btn" onclick="openPanel('appearance')" title="Appearance">
-      <span class="mi material-icons-round">palette</span>
+    <div class="tray-btn" role="button" tabindex="0" aria-label="Appearance" onclick="openPanel('appearance')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Appearance">
+      <span class="mi material-icons-round" aria-hidden="true">palette</span>
     </div>
-    <div class="tray-btn" onclick="openPanel('security')" title="Security">
-      <span class="mi material-icons-round">shield</span>
+    <div class="tray-btn" role="button" tabindex="0" aria-label="Security" onclick="openPanel('security')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Security">
+      <span class="mi material-icons-round" aria-hidden="true">shield</span>
     </div>
     <span class="clock" id="clock"></span>
   </div>
@@ -1114,7 +1119,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
     <button class="ac-btn mi material-icons-round" onclick="toggleAssistantChat()" title="Close">close</button>
   </div>
   <div class="ac-caps" id="ac-caps"></div>
-  <div class="ac-messages" id="ac-messages">
+  <div class="ac-messages" id="ac-messages" role="log" aria-live="polite">
     <div class="ac-msg assistant">Hi! I can help with anything — chat, code, agents, vision, voice, remote desktop, and 3,200+ OpenClaw skills. What would you like to do?</div>
   </div>
   <div class="ac-input-row">
@@ -1129,10 +1134,10 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   <input class="start-search" id="start-search" placeholder="Search..." oninput="filterStart(this.value)">
   <div class="start-scroll" id="start-scroll"></div>
   <div class="start-footer">
-    <div class="power-btn" onclick="shellAction('lock')"><span class="mi material-icons-round">lock</span>Lock</div>
-    <div class="power-btn" onclick="shellAction('suspend')"><span class="mi material-icons-round">dark_mode</span>Sleep</div>
-    <div class="power-btn" onclick="shellAction('restart')"><span class="mi material-icons-round">refresh</span>Restart</div>
-    <div class="power-btn" onclick="shellAction('shutdown')"><span class="mi material-icons-round">power_settings_new</span>Shut Down</div>
+    <div class="power-btn" role="button" tabindex="0" onclick="shellAction('lock')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">lock</span>Lock</div>
+    <div class="power-btn" role="button" tabindex="0" onclick="shellAction('suspend')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">dark_mode</span>Sleep</div>
+    <div class="power-btn" role="button" tabindex="0" onclick="shellAction('restart')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">refresh</span>Restart</div>
+    <div class="power-btn" role="button" tabindex="0" onclick="shellAction('shutdown')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">power_settings_new</span>Shut Down</div>
   </div>
 </div>
 
@@ -1149,7 +1154,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <div class="taskbar glass" id="taskbar"></div>
 
 <!-- Toast Notifications -->
-<div class="toast-container" id="toast-container"></div>
+<div class="toast-container" id="toast-container" role="status" aria-live="polite"></div>
 
 <!-- Context Menu -->
 <div class="ctx-menu glass" id="ctx-menu" style="display:none"></div>
