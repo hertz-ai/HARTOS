@@ -58,6 +58,13 @@ in
 
   # ─── Disable ZFS (broken in nixpkgs 24.11 for kernel 6.15) ───
   boot.supportedFilesystems.zfs = lib.mkForce false;
+
+  # ─── Blacklist nouveau — prevents RTX/GTX GPU crash at boot ───
+  # nouveau's GSP firmware init fails on many NVIDIA cards (observed: RTX 2060,
+  # "gsp: fini failed, -110"), cascading into display manager and service failures.
+  # The proprietary driver (hart-nvidia.nix) is the correct driver for these GPUs.
+  boot.blacklistedKernelModules = [ "nouveau" ];
+  boot.kernelParams = [ "nouveau.modeset=0" ];
   # nixpkgs.config.allowBroken now set once at the flake level (#70)
 
   # Note: do NOT override `glibcLocales` with a custom `locales`

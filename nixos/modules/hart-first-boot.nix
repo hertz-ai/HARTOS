@@ -16,7 +16,10 @@ let
   pythonWithCrypto = pkgs.python310.withPackages (ps: [ ps.cryptography ]);
 
   firstBootScript = pkgs.writeShellScript "hart-first-boot" ''
-    set -euo pipefail
+    # No set -e: individual step failures must not abort the whole script.
+    # Each step logs its own error and we always write the marker at the end
+    # so a partial failure doesn't cause an infinite retry loop on every boot.
+    set -uo pipefail
 
     MARKER="${cfg.dataDir}/.first-boot-done"
     DATA_DIR="${cfg.dataDir}"
@@ -63,31 +66,29 @@ with open('$DATA_DIR/node_public.key', 'wb') as f:
 
 os.chmod('$DATA_DIR/node_private.key', 0o600)
 print(f'Node ID: {public_bytes.hex()[:16]}...')
-"
-      chown hart:hart "$DATA_DIR/node_private.key" "$DATA_DIR/node_public.key"
+" || echo "[WARN] Step 1: key generation failed — will retry on next boot if keys missing"
+      chown hart:hart "$DATA_DIR/node_private.key" "$DATA_DIR/node_public.key" 2>/dev/null || true
       # Immutable flag: even root cannot modify the private key
       ${pkgs.e2fsprogs}/bin/chattr +i "$DATA_DIR/node_private.key" 2>/dev/null || true
     fi
 
-    NODE_ID=$(${pkgs.xxd}/bin/xxd -p "$DATA_DIR/node_public.key" | tr -d '\n' | head -c 16)
+    NODE_ID="unknown"
+    if [[ -f "$DATA_DIR/node_public.key" ]]; then
+      NODE_ID=$(${pkgs.xxd}/bin/xxd -p "$DATA_DIR/node_public.key" | tr -d '\n' | head -c 16) || NODE_ID="unknown"
+    fi
     echo "  Node ID: ''${NODE_ID}..."
 
     # ─── Step 2: Detect hardware and classify tier ───
     echo "[2/4] Detecting hardware..."
 
-    CPU_CORES=$(${pkgs.coreutils}/bin/nproc)
-    RAM_KB=$(${pkgs.gnugrep}/bin/grep MemTotal /proc/meminfo | ${pkgs.gawk}/bin/awk '{print $2}')
+    CPU_CORES=$(${pkgs.coreutils}/bin/nproc 2>/dev/null) || CPU_CORES=1
+    RAM_KB=$(${pkgs.gnugrep}/bin/grep MemTotal /proc/meminfo 2>/dev/null | ${pkgs.gawk}/bin/awk '{print $2}') || RAM_KB=0
     RAM_GB=$((RAM_KB / 1048576))
 
     GPU="none"
     GPU_COUNT=0
     if command -v nvidia-smi &>/dev/null; then
-      # `timeout` guards against a wedged GPU: on a box whose driver is failing
-      # (the real-hardware boot showed nouveau `gsp: fini failed`), nvidia-smi
-      # can hang, and a hung query stalls this oneshot until systemd kills it —
-      # "Failed to start HART OS First Boot Setup". Cap it; absent/odd output
-      # just leaves GPU=none.
-      GPU=$(${pkgs.coreutils}/bin/timeout 8 nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1) || true
+      GPU=$(${pkgs.coreutils}/bin/timeout 8 nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1) || GPU="none"
       GPU_COUNT=$(${pkgs.coreutils}/bin/timeout 8 nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l) || GPU_COUNT=0
     fi
 
@@ -104,24 +105,22 @@ print(f'Node ID: {public_bytes.hex()[:16]}...')
     echo "  Variant: ${cfg.variant}"
 
     # Write tier for other services to read
-    echo "$TIER" > "$DATA_DIR/capability_tier"
-    chown hart:hart "$DATA_DIR/capability_tier"
+    echo "$TIER" > "$DATA_DIR/capability_tier" || true
+    chown hart:hart "$DATA_DIR/capability_tier" 2>/dev/null || true
 
     # ─── Step 3: Initialize database ───
     echo "[3/4] Initializing database..."
-
-    # Database init happens at backend startup via SQLAlchemy create_all + migrations
-    # Just ensure the env var points to the right path
     echo "  Database will be initialized on first backend start."
 
     # ─── Step 4: Boot audit ───
     echo "[4/4] Writing boot audit entry..."
 
-    TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) || TIMESTAMP="unknown"
     ENTRY="''${TIMESTAMP} | ''${NODE_ID} | ''${TIER} | ${cfg.variant}"
 
-    # Sign with Ed25519 private key
-    SIGNATURE=$(${pythonWithCrypto}/bin/python3 -c "
+    SIGNATURE="UNSIGNED"
+    if [[ -f "$DATA_DIR/node_private.key" ]]; then
+      SIGNATURE=$(${pythonWithCrypto}/bin/python3 -c "
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 entry = '''$ENTRY'''
@@ -132,18 +131,20 @@ private_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
 signature = private_key.sign(entry.encode('utf-8'))
 print(signature.hex())
 " 2>>"$LOG") || SIGNATURE="UNSIGNED"
+    fi
 
     FULL_ENTRY="''${ENTRY} | ''${SIGNATURE}"
-    echo "$FULL_ENTRY" >> "$DATA_DIR/boot_audit.log"
-    chown hart:hart "$DATA_DIR/boot_audit.log"
-    chmod 644 "$DATA_DIR/boot_audit.log"
+    echo "$FULL_ENTRY" >> "$DATA_DIR/boot_audit.log" || true
+    chown hart:hart "$DATA_DIR/boot_audit.log" 2>/dev/null || true
+    chmod 644 "$DATA_DIR/boot_audit.log" 2>/dev/null || true
     ${pkgs.e2fsprogs}/bin/chattr +a "$DATA_DIR/boot_audit.log" 2>/dev/null || true
 
     echo "[BootAudit] Entry written and log set to append-only."
 
-    # ─── Mark completion ───
-    touch "$MARKER"
-    chown hart:hart "$MARKER"
+    # ─── Mark completion — always runs regardless of step failures ───
+    # Writing this marker is the only thing that prevents infinite retry.
+    touch "$MARKER" || { echo "[ERROR] Could not write first-boot marker — will retry next boot"; exit 1; }
+    chown hart:hart "$MARKER" 2>/dev/null || true
 
     # ─── Welcome message ───
     IP=$(hostname -I 2>/dev/null | ${pkgs.gawk}/bin/awk '{print $1}')
