@@ -1,0 +1,20 @@
+# Optional real-time media stack — enables agent REPLY-AUDIO in live calls (#64).
+#
+# Install where calls with agent voice are used (HART OS desktop / a central SFU):
+#     pip install -r requirements-voice.txt
+#
+# Deliberately kept OUT of the base requirements.txt:
+#   - `livekit` is a ~11MB native package (bundles the Rust liblivekit_ffi). Not
+#     every deploy needs it, and the code degrades to a logged no-op without it:
+#     integrations/social/livekit_audio_publisher.py and agent_voice_bridge.py
+#     are lib-gated on HAS_LIVEKIT_RTC, so a base install is unaffected.
+#   - It requires protobuf>=4.25 + aiofiles>=24. The base file still pins those
+#     lower (protobuf==4.23.3 / aiofiles==23.2.1) for the legacy chromadb stack;
+#     installing this file resolves aiofiles>=24 in the voice env only (protobuf
+#     is already 5.x in practice). Folding livekit into the base file would make
+#     `pip install -r requirements.txt` fail the resolver on the protobuf pin.
+#
+# Pairs with the already-present livekit-api / livekit-protocol (token signing +
+# the self-hosted SFU supervisor); this adds the realtime media half (livekit.rtc)
+# that the AgentVoiceBridge publishes the agent's TTS frames through.
+livekit==1.1.10

@@ -193,6 +193,10 @@ class AgentBridgeWorker:
         self._transcript_lines: Deque[Dict[str, Any]] = deque(maxlen=10)
         self._decisions: List[str] = []
         self._action_items: List[str] = []
+        # The agent's "mouth": a LiveKitAudioPublisher created lazily on the
+        # first reply that needs voicing (so attach is cheap + no room is joined
+        # for a silent agent).  None until then / when no LiveKit room exists.
+        self._publisher: Any = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -250,6 +254,14 @@ class AgentBridgeWorker:
                         self.call_id, self.agent_id, e)
                 self._stop.wait(_WORKER_TICK_S)
         finally:
+            # Disconnect the audio publisher (leaves the LiveKit room) so a
+            # detached agent doesn't keep a phantom track in the call.
+            if self._publisher is not None:
+                try:
+                    self._publisher.stop()
+                except Exception:
+                    pass
+                self._publisher = None
             logger.info(
                 "AgentBridgeWorker stopped: call=%s agent=%s",
                 self.call_id, self.agent_id)
@@ -446,29 +458,107 @@ class AgentBridgeWorker:
                     self.call_id, self.agent_id, e)
 
     def _publish_audio_for(self, text: str) -> None:
-        """Synthesize `text` via PocketTTS + publish frames into the
-        LiveKit room.  Producer-adapter integration lands separately
-        (livekit-rtc room handle wiring is async-heavy, kept out of
-        this control-plane module so it can be reviewed in isolation).
+        """Synthesize ``text`` via PocketTTS and publish the audio frames into
+        the LiveKit room through this worker's ``LiveKitAudioPublisher`` (the
+        agent's "mouth").
 
-        Today: logs the reply at INFO so call audit trails record the
-        agent's spoken contribution even before audio is published.
+        Degrades cleanly: when the realtime SDK is absent (flat / Nunba bundled)
+        OR the call has no LiveKit room (p2p mesh / central), we log the reply at
+        INFO so the call audit trail still records the agent's spoken
+        contribution; no audio is published.  Best-effort — never raises out of
+        the tick loop.
         """
         if not text:
             return
         if not _HAS_LIVEKIT_RTC:
             logger.info(
-                "AgentBridgeWorker._publish_audio_for: livekit-rtc "
-                "absent; reply queued but not synthesized — "
+                "AgentBridgeWorker._publish_audio_for: livekit (rtc) "
+                "absent; reply queued but not voiced — "
                 "call=%s agent=%s text=%r",
                 self.call_id, self.agent_id, text[:120])
             return
-        # SDK present — synthesize via PocketTTS + publish frames.
-        # Filled in alongside the livekit-rtc room handle integration.
-        logger.info(
-            "AgentBridgeWorker._publish_audio_for: stub synthesize+"
-            "publish — call=%s agent=%s text=%r",
-            self.call_id, self.agent_id, text[:120])
+        pub = self._ensure_publisher()
+        if pub is None:
+            logger.info(
+                "AgentBridgeWorker._publish_audio_for: no LiveKit room for "
+                "this call (p2p/central) — reply not voiced — "
+                "call=%s agent=%s text=%r",
+                self.call_id, self.agent_id, text[:120])
+            return
+        pcm, rate, channels = self._synthesize_pcm(text)
+        if not pcm:
+            return
+        pub.push_pcm(pcm, src_rate=rate, src_channels=channels)
+
+    def _ensure_publisher(self):
+        """Return this worker's LiveKitAudioPublisher, creating + starting it on
+        first use.  Returns None when there is no LiveKit room to publish into
+        (issue_token returns a non-'livekit' mode) or the SDK/connect fails — the
+        caller then logs the reply text instead of voicing it."""
+        if self._publisher is not None:
+            return self._publisher if self._publisher.is_alive() else None
+        try:
+            from integrations.social.livekit_service import LiveKitService
+            from integrations.social.livekit_audio_publisher import (
+                LiveKitAudioPublisher,
+            )
+        except Exception as e:  # pragma: no cover — import-only failure
+            logger.debug(
+                "AgentBridgeWorker._ensure_publisher: imports unavailable "
+                "(%s)", e)
+            return None
+        # Mint the agent's publisher token via the SAME issuer humans use; the
+        # agent joins the room as identity=agent_id with publish rights.
+        try:
+            tok = LiveKitService.issue_token(
+                self.call_id, self.agent_id,
+                can_publish=True, is_agent=True)
+        except Exception as e:
+            logger.warning(
+                "AgentBridgeWorker._ensure_publisher: issue_token failed "
+                "(call=%s): %s", self.call_id, e)
+            return None
+        if (tok.get('mode') != 'livekit' or not tok.get('token')
+                or not tok.get('url')):
+            # p2p mesh / livekit_pending / central — nothing to publish into.
+            return None
+        pub = LiveKitAudioPublisher(self.call_id, tok['url'], tok['token'])
+        if not pub.start():
+            return None
+        self._publisher = pub
+        return pub
+
+    def _synthesize_pcm(self, text: str):
+        """``text`` → (pcm_bytes, sample_rate, channels) via PocketTTS.
+
+        PocketTTS writes a .wav (``pocket_tts_synthesize`` → JSON ``{path}``);
+        we read it back as PCM16 with the stdlib ``wave`` module.  The publisher
+        resamples to the LiveKit publish format, so we pass the wav's native
+        rate/channels straight through.  Returns ``(b'', 0, 1)`` on any failure
+        (TTS error, missing file, unreadable wav) — never raises."""
+        try:
+            import json
+            import wave
+            from integrations.service_tools.pocket_tts_tool import (
+                pocket_tts_synthesize,
+            )
+            res = json.loads(pocket_tts_synthesize(text))
+            path = res.get('path')
+            if not path:
+                logger.warning(
+                    "AgentBridgeWorker._synthesize_pcm: TTS produced no audio "
+                    "(call=%s): %s", self.call_id, res.get('error', res))
+                return b'', 0, 1
+            with wave.open(path, 'rb') as wf:
+                channels = wf.getnchannels()
+                rate = wf.getframerate()
+                pcm = wf.readframes(wf.getnframes())
+            return pcm, rate, channels
+        except Exception as e:
+            logger.warning(
+                "AgentBridgeWorker._synthesize_pcm failed (call=%s): %s",
+                self.call_id, e)
+            return b'', 0, 1
 
     def _emit_meet_copilot(self, state: str = 'live') -> None:
         """Push the rolling meet_copilot card state to the user's Liquid UI
