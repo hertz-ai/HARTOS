@@ -507,7 +507,7 @@ class LiquidUIService:
         is_potato = perf.get('disable_blur', False)
 
         wallpaper = theme.get('wallpaper', {})
-        wp_css = wallpaper.get('value', 'linear-gradient(135deg,#0F0E17 0%,#1a1a2e 50%,#16213e 100%)')
+        wp_css = wallpaper.get('value', 'radial-gradient(120% 120% at 18% 0%,rgba(0,212,170,0.07),transparent 50%),radial-gradient(100% 100% at 100% 100%,rgba(22,33,62,0.55),transparent 60%),linear-gradient(135deg,#0F0E17 0%,#1a1a2e 50%,#16213e 100%)')
         if wallpaper.get('type') == 'solid':
             wp_css = wallpaper['value']
 
@@ -871,7 +871,9 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 /* ── Glass mixin (perf-aware) ── */
 .glass{{background:var(--hart-glass-bg);
   {'backdrop-filter:blur(var(--hart-blur)) saturate(var(--hart-saturation));-webkit-backdrop-filter:blur(var(--hart-blur)) saturate(var(--hart-saturation));' if not is_potato else '/* blur disabled for performance */'}
-  border:1px solid var(--hart-glass-border);border-radius:var(--hart-radius)}}
+  border:1px solid var(--hart-glass-border);border-top-color:rgba(255,255,255,0.16);
+  box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.08),inset 0 -1px 0 0 rgba(0,0,0,0.18);
+  border-radius:var(--hart-radius)}}
 
 /* ── Top Bar ── */
 .top-bar{{position:fixed;top:0;left:0;right:0;height:var(--hart-topbar-height);z-index:1000;
@@ -902,8 +904,8 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 /* ── Glass Panel (floating window) ── */
 .panel{{position:absolute;display:flex;flex-direction:column;min-width:320px;min-height:240px;
-  {'box-shadow:0 8px 32px rgba(0,0,0,0.4);' if not is_potato else 'box-shadow:0 2px 8px rgba(0,0,0,0.3);'}overflow:hidden;{'transition:box-shadow var(--hart-anim-speed)' if not is_potato else 'transition:none'}}}
-.panel.focused{{{'box-shadow:0 12px 48px rgba(0,0,0,0.5);' if not is_potato else 'box-shadow:0 3px 12px rgba(0,0,0,0.4);'}z-index:999}}
+  {'box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.08),0 1px 1px rgba(0,0,0,0.22),0 8px 32px rgba(0,0,0,0.38);' if not is_potato else 'box-shadow:0 2px 8px rgba(0,0,0,0.3);'}overflow:hidden;{'transition:box-shadow var(--hart-anim-speed)' if not is_potato else 'transition:none'}}}
+.panel.focused{{{'box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.10),0 2px 4px rgba(0,0,0,0.28),0 16px 56px rgba(0,0,0,0.48);' if not is_potato else 'box-shadow:0 3px 12px rgba(0,0,0,0.4);'}z-index:999}}
 .panel-titlebar{{height:var(--hart-titlebar-height);display:flex;align-items:center;padding:0 8px;
   gap:6px;cursor:grab;user-select:none;flex-shrink:0;border-bottom:1px solid var(--hart-glass-border)}}
 .panel-titlebar:active{{cursor:grabbing}}
