@@ -8825,17 +8825,29 @@ def chat():
                     app.logger.info(
                         f"draft classifier: delegate="
                         f"{result.get('delegate')!r} "
-                        f"is_casual=False — routing to local autogen "
-                        f"CREATE+execute (hive remains downstream "
-                        f"fallback if local can't satisfy)"
+                        f"is_casual=False, is_create_agent=False — routing to "
+                        f"the langchain chat (get_ans), NOT autogen CREATE. "
+                        f"get_ans carries FULL_HISTORY (date-recall via "
+                        f"parsing_string -> get_time_based_history SimpleMem) "
+                        f"AND Create_Agent / Agentic_Router, so it answers "
+                        f"recall/Q&A directly or escalates a genuine task via "
+                        f"its own tools."
                     )
-                    create_agent = True
-                    autonomous = True
-                    _is_agentic_orchestration = True
-                    # Fall through — do NOT return draft standby; the
-                    # create_agent branch below runs in this same
-                    # request and dispatches to find_matching_agent /
-                    # _autonomous_gather_info / recipe().
+                    # #118 FIX: do NOT force create_agent/autonomous here.
+                    # Forcing CREATE on EVERY non-casual turn hijacked recall/
+                    # Q&A ("what did we discuss 15 days back") into an 8-action
+                    # execute_windows CREATE plan + review + stall, bypassing
+                    # get_ans — the ONLY path with the working FULL_HISTORY
+                    # date-recall tool. Falling through (no flags, no return)
+                    # reaches get_ans below (the create_agent block no-ops; a
+                    # bare recall has no prompt_id so the REUSE check is skipped
+                    # too). The 2026-05-07 "open chrome and research" regression
+                    # this branch was added for stays fixed: get_ans returns a
+                    # real, tool-grounded answer (escalating a genuine task via
+                    # Create_Agent / Agentic_Router), not the do-nothing draft
+                    # standby. VERIFY LIVE: a genuine multi-step task still
+                    # escalates (Computer_Action/Shell are casual-only, so tasks
+                    # route via Create_Agent -> CREATE).
                 else:
                     return _chat_reply(
                         user_id, request_id, result['response'],
