@@ -18,7 +18,7 @@ import logging
 import re
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Annotated, Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -105,18 +105,16 @@ def create_memory_tools(
             return f"Failed to remember: {e}"
 
     def recall_memory(
-        query: str,
-        mode: str = "hybrid",
-        since: 'str | None' = None,
-        until: 'str | None' = None,
+        query: Annotated[str, "What to look for, in natural language (a topic or keywords). For a pure time-recall like 'what did we discuss', pass a broad term or the topic."],
+        mode: Annotated[str, "Search mode: 'hybrid' (default, FTS+semantic), 'semantic', or 'text'."] = "hybrid",
+        since: Annotated[Optional[str], "Start of an OPTIONAL time window. ISO date ('2026-05-22'), a bare date, or a relative shortcut ('15d', '7d', '24h'). Use this for 'N days back' recalls — e.g. '15 days back' → since='16d'."] = None,
+        until: Annotated[Optional[str], "End of the OPTIONAL time window (same formats as since). Pass WITH since to bound a range around a past date — e.g. '15 days back' → until='14d'."] = None,
     ) -> str:
-        """Search all memories using natural language.
-
-        Returns matching memories with IDs for backtrace. Optional
-        ``since`` / ``until`` restrict the result to a time window —
-        use ISO-8601 ('2026-04-10T15:00') or a bare date ('2026-04-10')
-        or a relative shortcut ('1h', '24h', '7d'). Pass both for a
-        bounded range, either for a one-sided filter.
+        """Search past memories by natural language, optionally limited to a time
+        window. ``since`` / ``until`` accept ISO-8601 ('2026-04-10T15:00'), a bare
+        date ('2026-04-10'), or a relative shortcut ('1h', '24h', '7d'). Pass both
+        for a bounded range, either for a one-sided filter. Returns matching
+        memories with IDs for backtrace.
         """
         try:
             _since_ts = _parse_time_arg(since)
@@ -233,8 +231,11 @@ def create_memory_tools(
         ),
         "recall_memory": (
             recall_memory,
-            "Search all memories using natural language query. Returns matching memories with IDs "
-            "that can be used with backtrace_memory to trace their origin chain.",
+            "Search past conversation memories by natural-language query, OPTIONALLY filtered to a "
+            "time window via since/until (ISO date '2026-05-22', or relative '15d'/'7d'/'24h'). USE "
+            "THIS for recall questions about the past — e.g. 'what did we discuss 15 days back' → "
+            "recall_memory(query='what we discussed', since='16d', until='14d'). Returns matching "
+            "memories with IDs for backtrace_memory.",
         ),
         "backtrace_memory": (
             backtrace_memory,
