@@ -1626,85 +1626,126 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
 
 def get_time_based_history(prompt: str, session_id: str, start_date: str, end_date: str):
     '''
-        This function help to extract messages till specified time
-        inputs:
-            prompt: text from user from which we need to extract similar messages
-            session_id: user_{user_id}
-            start_date: time of search start
-            end_date: time till search
-    '''
+    Time-filtered + semantic conversation history retrieval (CANONICAL impl).
 
+    Replaces the removed Zep backend (#121). If start_date/end_date parse as
+    ISO-8601, queries ConversationEntry with a created_at BETWEEN range;
+    otherwise falls back to SimpleMem semantic search. The autogen
+    get_chat_history tool (core/agent_tools.py) + reuse_recipe call this;
+    hart_intelligence_entry's same-named wrapper delegates here. Ported verbatim
+    from the working hart_intelligence_entry implementation so there is ONE
+    date-recall impl, not a langchain-vs-autogen fork.
+
+    inputs:
+        prompt: text to semantically search (empty for a pure time-range pull)
+        session_id: 'user_{user_id}'
+        start_date / end_date: ISO-8601 (or empty / sentinel = no bound)
+    '''
+    import json as _json
+    from datetime import datetime as _dt
     start_time = time.time()
-    from langchain_classic.memory import ZepMemory  # lazy (see helper.py:32)
-    memory = ZepMemory(
-        session_id=session_id,
-        url='http://azure_all_vms.hertzai.com:8000',
-        api_key='***REMOVED***',
-        memory_key="chat_history",
-    )
+    try:
+        user_id = int(session_id.replace("user_", ""))
+    except Exception as e:
+        try:
+            current_app.logger.warning(f"get_time_based_history: bad session_id {session_id}: {e}")
+        except Exception:
+            pass
+        return _json.dumps({'res': []})
+
+    def _parse_iso(s):
+        if not s or not isinstance(s, str):
+            return None
+        s2 = s.strip().rstrip('Z').rstrip('z')
+        if not s2 or s2.lower() in ('none', 'null', 'na'):
+            return None
+        for fmt in ('%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S',
+                    '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+            try:
+                return _dt.strptime(s2, fmt)
+            except ValueError:
+                continue
+        return None
+
+    dt_start = _parse_iso(start_date)
+    dt_end = _parse_iso(end_date)
+    has_time_range = dt_start is not None or dt_end is not None
+    if dt_start is not None and dt_end is not None and dt_start == dt_end:
+        has_time_range = False
+
+    if has_time_range:
+        try:
+            from integrations.social._models_local import ConversationEntry
+            from integrations.social.models import get_db
+            results = []
+            db = get_db()
+            try:
+                q = db.query(ConversationEntry).filter(
+                    ConversationEntry.user_id == str(user_id),
+                )
+                if dt_start is not None:
+                    q = q.filter(ConversationEntry.created_at >= dt_start)
+                if dt_end is not None:
+                    q = q.filter(ConversationEntry.created_at <= dt_end)
+                rows = q.order_by(
+                    ConversationEntry.created_at.desc()
+                ).limit(50).all()
+                for r in rows:
+                    results.append({
+                        'message': {
+                            'content': getattr(r, 'content', '') or '',
+                            'role': getattr(r, 'role', 'assistant'),
+                        },
+                        'created_at': (r.created_at.isoformat()
+                                       if r.created_at else ''),
+                        'channel_type': getattr(r, 'channel_type', ''),
+                    })
+            finally:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+            try:
+                current_app.logger.info(
+                    f"Time-filtered history: {len(results)} rows in "
+                    f"{time.time() - start_time:.3f}s (range={dt_start}..{dt_end})"
+                )
+            except Exception:
+                pass
+            return _json.dumps({'res_in_filter': results})
+        except Exception as e:
+            try:
+                current_app.logger.warning(
+                    f"Time-filtered ConversationEntry query failed, "
+                    f"falling back to semantic: {e}"
+                )
+            except Exception:
+                pass
 
     try:
-        metadata = {}
-        if start_date:
-            metadata['start_date'] = start_date
-        if end_date:
-            metadata['end_date'] = end_date
-
+        from integrations.channels.memory.simplemem_langchain import SimpleMemChatMemory
+        memory = SimpleMemChatMemory.load_or_create(user_id)
+        results = memory.semantic_search(prompt)
+        if results:
+            serialized = [{'message': {'content': r.get('content', ''),
+                                       'role': 'assistant'}} for r in results]
+            final_res = {'res_in_filter': serialized}
+        else:
+            final_res = {'res_in_filter': []}
         try:
-            messages = memory.chat_memory.search(prompt, metadata=metadata)
-            current_app.logger.info(f'GOT THE messages from search {messages}')
-        except Exception as e:
-            current_app.logger.info(f'Error: {e}')
-        try:
-            extracted_metadata = [message.message['metadata']
-                                  for message in messages]
-            list_req_ids = [data.get('request_Id', None)
-                            for data in extracted_metadata]
-            current_app.logger.info(f'GOT THE EXTRACTED METADATA AS {extracted_metadata}')
-        except Exception as e:
-            current_app.logger.info(f"Error while getting req ids {e}")
-
-        # messages = [message.dict() for message in messages]
-        serialized_results = []
-        for result in messages:
-            serialized_result = result.dict(exclude_unset=True)
-            # Process the 'message' field to include only specific subfields
-            if 'message' in serialized_result and isinstance(serialized_result['message'], dict):
-                message = serialized_result['message']
-                filtered_message = {
-                    'content': message.get('content'),
-                    'role': message.get('role'),
-                    'created_at': message.get('created_at'),
-                    'request_id': message.get('metadata', {}).get('request_id') if 'metadata' in message else None
-                }
-                # Replace the original message with the filtered message
-                serialized_result['message'] = filtered_message
-            serialized_results.append(serialized_result)
-        messages = serialized_results
-        final_res = {'res_in_filter': messages}
-        current_app.logger.info(f"final-->{final_res}")
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        return json.dumps(final_res)
-    except Exception as e:
-        current_app.logger.info(f"Exception {e}")
-        try:
-            messages = memory.chat_memory.search(prompt)
+            current_app.logger.info(
+                f"SimpleMem search took {time.time() - start_time:.3f}s, "
+                f"{len(results)} results"
+            )
         except Exception:
-           current_app.logger.info(f'Error: {e}')
-
-        # current_app.logger.info(f"final messages in except-->{messages}")
+            pass
+        return _json.dumps(final_res)
+    except Exception as e:
         try:
-            extracted_metadata = [message.message['metadata']
-                                  for message in messages]
-            list_req_ids = [data.get('request_Id', None)
-                            for data in extracted_metadata]
-        except Exception as e:
-            current_app.logger.info(f"Error while getting req ids {e}")
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        current_app.logger.info("time taken for zep is {elapsed_time}")
-        return json.dumps({'res': [message.message['content'] for message in messages]})
+            current_app.logger.warning(f"SimpleMem search failed: {e}")
+        except Exception:
+            pass
+        return _json.dumps({'res': []})
 
 def parse_date(date_str):
     return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")

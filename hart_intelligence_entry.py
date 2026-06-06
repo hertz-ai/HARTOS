@@ -5826,126 +5826,18 @@ def get_action_user_details(user_id):
 
 
 def get_time_based_history(prompt: str, session_id: str, start_date: str, end_date: str):
+    '''Time-filtered + semantic conversation history retrieval.
+
+    #121: the date-recall implementation is now SINGLE-SOURCED in
+    helper.get_time_based_history (ConversationEntry BETWEEN-range + SimpleMem
+    semantic fallback). Both the langchain FULL_HISTORY path (parsing_string ->
+    here) and the autogen get_chat_history tool (core/agent_tools.py ->
+    helper.get_time_based_history) now use that one impl, instead of the prior
+    fork (this working copy vs helper's dead-Zep twin). helper does not import
+    this module, so the delegate is a one-way dependency (no import cycle).
     '''
-    Time-filtered + semantic conversation history retrieval.
-
-    If either ``start_date`` or ``end_date`` is provided (and parseable as
-    ISO-8601), we query ConversationEntry directly with a created_at
-    BETWEEN range — this is the "what did I do yesterday between 3pm
-    and 5pm" path. Otherwise we fall back to SimpleMem semantic search
-    for the "find messages about X" path.
-
-    The caller (parsing_string) passes BOTH params every time — the old
-    implementation accepted them and discarded them, which meant every
-    temporal query silently degraded to semantic match and returned
-    messages from the wrong day. Now the date filter actually fires.
-
-    inputs:
-        prompt: text from user from which we need to extract similar messages
-        session_id: user_{user_id}
-        start_date: ISO-8601 start (or empty / sentinel to mean "no lower bound")
-        end_date:   ISO-8601 end   (or empty / sentinel to mean "no upper bound")
-    '''
-    start_time = time.time()
-
-    try:
-        user_id = int(session_id.replace("user_", ""))
-    except Exception as e:
-        app.logger.warning(f"get_time_based_history: bad session_id {session_id}: {e}")
-        return json.dumps({'res': []})
-
-    # Parse ISO-8601 dates loosely. Empty / sentinel strings skip the
-    # bound so a single date still works ("everything since 2026-04-10").
-    def _parse_iso(s):
-        if not s or not isinstance(s, str):
-            return None
-        s2 = s.strip().rstrip('Z').rstrip('z')
-        if not s2 or s2.lower() in ('none', 'null', 'na'):
-            return None
-        for fmt in (
-            '%Y-%m-%dT%H:%M:%S.%f',
-            '%Y-%m-%dT%H:%M:%S',
-            '%Y-%m-%d %H:%M:%S',
-            '%Y-%m-%d',
-        ):
-            try:
-                return datetime.strptime(s2, fmt)
-            except ValueError:
-                continue
-        return None
-
-    dt_start = _parse_iso(start_date)
-    dt_end = _parse_iso(end_date)
-    has_time_range = dt_start is not None or dt_end is not None
-    # Reject the "both bounds equal and coerced from now()" sentinel the
-    # fallback parser used to emit — that was a no-op range that still
-    # produced a misleading "filtered" log line.
-    if dt_start is not None and dt_end is not None and dt_start == dt_end:
-        has_time_range = False
-
-    if has_time_range:
-        try:
-            from integrations.social._models_local import ConversationEntry
-            from integrations.social.models import get_db
-            results = []
-            db = get_db()
-            try:
-                q = db.query(ConversationEntry).filter(
-                    ConversationEntry.user_id == str(user_id),
-                )
-                if dt_start is not None:
-                    q = q.filter(ConversationEntry.created_at >= dt_start)
-                if dt_end is not None:
-                    q = q.filter(ConversationEntry.created_at <= dt_end)
-                # Cap at 50 rows so a wide range doesn't flood the LLM.
-                rows = q.order_by(
-                    ConversationEntry.created_at.desc()
-                ).limit(50).all()
-                for r in rows:
-                    results.append({
-                        'message': {
-                            'content': getattr(r, 'content', '') or '',
-                            'role': getattr(r, 'role', 'assistant'),
-                        },
-                        'created_at': (r.created_at.isoformat()
-                                       if r.created_at else ''),
-                        'channel_type': getattr(r, 'channel_type', ''),
-                    })
-            finally:
-                try:
-                    db.close()
-                except Exception:
-                    pass
-            elapsed = time.time() - start_time
-            app.logger.info(
-                f"Time-filtered history: {len(results)} rows in {elapsed:.3f}s "
-                f"(range={dt_start}..{dt_end})"
-            )
-            return json.dumps({'res_in_filter': results})
-        except Exception as e:
-            app.logger.warning(
-                f"Time-filtered ConversationEntry query failed, "
-                f"falling back to semantic: {e}"
-            )
-            # Fall through to the semantic path below
-
-    try:
-        memory = get_memory(user_id=user_id)
-        results = memory.semantic_search(prompt)
-
-        if results:
-            serialized = [{'message': {'content': r.get('content', ''), 'role': 'assistant'}} for r in results]
-            final_res = {'res_in_filter': serialized}
-        else:
-            final_res = {'res_in_filter': []}
-
-        elapsed = time.time() - start_time
-        app.logger.info(f"SimpleMem search took {elapsed:.3f}s, {len(results)} results")
-        return json.dumps(final_res)
-    except Exception as e:
-        app.logger.warning(f"SimpleMem search failed: {e}")
-        return json.dumps({'res': []})
-
+    import helper
+    return helper.get_time_based_history(prompt, session_id, start_date, end_date)
 
 def parsing_string(string):
     '''
