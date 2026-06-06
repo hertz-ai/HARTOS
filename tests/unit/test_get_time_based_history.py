@@ -93,6 +93,8 @@ def test_date_range_queries_conversation_entry():
         assert 'res_in_filter' in out, out
         assert len(out['res_in_filter']) == 1
         assert 'roadmap' in out['res_in_filter'][0]['message']['content']
+        # timestamp must ride along with each returned turn
+        assert out['res_in_filter'][0].get('created_at'), 'created_at must be attached'
     finally:
         _restore(saved)
 
@@ -126,8 +128,57 @@ def test_bad_session_id_is_safe():
     assert isinstance(out, dict)  # no crash, returns a JSON envelope
 
 
+# ── resolve_recall_window: the deterministic window math (pure, no DB) ────────
+
+def test_window_single_date_pads_two_days():
+    from datetime import datetime
+    lo, hi = helper.resolve_recall_window('2026-05-22', '2026-05-22')
+    assert lo == datetime(2026, 5, 20, 0, 0, 0)                 # -2 days
+    assert hi == datetime(2026, 5, 24, 23, 59, 59, 999999)      # +2 days, end-of-day
+
+
+def test_window_one_sided_is_centered_not_since():
+    # one-sided used to mean "everything since" (returned newest-50); now it is a
+    # padded window centred on the date — what "15 days back" actually means.
+    from datetime import datetime
+    lo, hi = helper.resolve_recall_window('2026-05-22', '')
+    assert (lo, hi) == (datetime(2026, 5, 20, 0, 0, 0),
+                        datetime(2026, 5, 24, 23, 59, 59, 999999))
+
+
+def test_window_bare_two_sided_range_covers_full_days():
+    from datetime import datetime
+    lo, hi = helper.resolve_recall_window('2026-05-22', '2026-05-25')
+    assert lo == datetime(2026, 5, 22, 0, 0, 0)                 # bare start -> day start
+    assert hi == datetime(2026, 5, 25, 23, 59, 59, 999999)      # bare end -> day end
+
+
+def test_window_none_for_dateless():
+    assert helper.resolve_recall_window('', '') is None
+    assert helper.resolve_recall_window(None, None) is None
+    assert helper.resolve_recall_window('garbage', 'nonsense') is None
+
+
+def test_window_explicit_timestamps_not_padded():
+    from datetime import datetime
+    lo, hi = helper.resolve_recall_window('2026-05-22T09:00:00', '2026-05-22T17:00:00')
+    assert lo == datetime(2026, 5, 22, 9, 0, 0)
+    assert hi == datetime(2026, 5, 22, 17, 0, 0)
+
+
+def test_window_inverted_range_is_ordered():
+    lo, hi = helper.resolve_recall_window('2026-05-25', '2026-05-20')
+    assert lo < hi
+
+
 if __name__ == '__main__':
-    test_date_range_queries_conversation_entry(); print('PASS date-range -> ConversationEntry')
+    test_date_range_queries_conversation_entry(); print('PASS date-range -> ConversationEntry (+created_at)')
     test_bare_query_falls_back_to_simplemem(); print('PASS bare-query -> SimpleMem')
     test_bad_session_id_is_safe(); print('PASS bad-session-id safe')
-    print('OK 3/3')
+    test_window_single_date_pads_two_days(); print('PASS single date -> ±2d window')
+    test_window_one_sided_is_centered_not_since(); print('PASS one-sided -> centred window')
+    test_window_bare_two_sided_range_covers_full_days(); print('PASS bare range -> full days')
+    test_window_none_for_dateless(); print('PASS dateless -> None (semantic)')
+    test_window_explicit_timestamps_not_padded(); print('PASS explicit timestamps honoured')
+    test_window_inverted_range_is_ordered(); print('PASS inverted range ordered')
+    print('OK 9/9')

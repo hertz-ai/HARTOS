@@ -1624,6 +1624,69 @@ def get_user_camera_inp(inp: Annotated[str, "The Question to check from visual c
 
 
 
+# ── Deterministic recall-window resolution (#121 follow-up) ──────────────────
+# A vague human recall ("what did we discuss 15 days back") AND a small model's
+# fuzzy date arithmetic both make the exact day unreliable. resolve_recall_window
+# turns the model's start/end into a forgiving [lo, hi] window so a conversation
+# a day or two off the target is still caught — deterministically, with no model
+# involvement (the model just supplies its best-guess date).
+RECALL_WINDOW_PAD_DAYS = 2  # ± padding (days) applied to a single-date recall
+
+
+def _parse_recall_date(s):
+    """Parse an ISO-8601 / bare-date string. Returns (datetime, is_bare_date)
+    or (None, False). is_bare_date is True for 'YYYY-MM-DD' (no time component)
+    so callers can expand it to full-day bounds instead of the midnight instant.
+    """
+    from datetime import datetime as _dt
+    if not s or not isinstance(s, str):
+        return None, False
+    s2 = s.strip().rstrip('Z').rstrip('z')
+    if not s2 or s2.lower() in ('none', 'null', 'na'):
+        return None, False
+    for fmt, bare in (('%Y-%m-%dT%H:%M:%S.%f', False),
+                      ('%Y-%m-%dT%H:%M:%S', False),
+                      ('%Y-%m-%d %H:%M:%S', False),
+                      ('%Y-%m-%d', True)):
+        try:
+            return _dt.strptime(s2, fmt), bare
+        except ValueError:
+            continue
+    return None, False
+
+
+def resolve_recall_window(start_date, end_date, pad_days=RECALL_WINDOW_PAD_DAYS):
+    """Deterministically resolve (start_date, end_date) into a [lo, hi] datetime
+    window for ConversationEntry filtering, or None when neither parses (caller
+    falls back to semantic search). Rules — no model involvement:
+
+      * neither parses              -> None (semantic fallback)
+      * a single point (one side
+        given, or both equal)       -> that calendar day, padded by ±pad_days,
+                                       so an approximate "N days back" still
+                                       catches conversations a day or two off
+      * an explicit two-sided range -> honoured as given; a BARE date expands to
+                                       full-day bounds so a 1-day range covers the
+                                       whole day, not a single instant (midnight)
+    """
+    from datetime import timedelta
+    s, s_bare = _parse_recall_date(start_date)
+    e, e_bare = _parse_recall_date(end_date)
+    if s is None and e is None:
+        return None
+    pad = timedelta(days=max(0, int(pad_days)))
+    if s is None or e is None or s == e:            # single point -> padded window
+        anchor = s if s is not None else e
+        day_lo = anchor.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_hi = anchor.replace(hour=23, minute=59, second=59, microsecond=999999)
+        return day_lo - pad, day_hi + pad
+    lo = s.replace(hour=0, minute=0, second=0, microsecond=0) if s_bare else s
+    hi = e.replace(hour=23, minute=59, second=59, microsecond=999999) if e_bare else e
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
 def get_time_based_history(prompt: str, session_id: str, start_date: str, end_date: str):
     '''
     Time-filtered + semantic conversation history retrieval (CANONICAL impl).
@@ -1642,7 +1705,6 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         start_date / end_date: ISO-8601 (or empty / sentinel = no bound)
     '''
     import json as _json
-    from datetime import datetime as _dt
     start_time = time.time()
     try:
         user_id = int(session_id.replace("user_", ""))
@@ -1653,27 +1715,10 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
             pass
         return _json.dumps({'res': []})
 
-    def _parse_iso(s):
-        if not s or not isinstance(s, str):
-            return None
-        s2 = s.strip().rstrip('Z').rstrip('z')
-        if not s2 or s2.lower() in ('none', 'null', 'na'):
-            return None
-        for fmt in ('%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S',
-                    '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
-            try:
-                return _dt.strptime(s2, fmt)
-            except ValueError:
-                continue
-        return None
+    window = resolve_recall_window(start_date, end_date)
 
-    dt_start = _parse_iso(start_date)
-    dt_end = _parse_iso(end_date)
-    has_time_range = dt_start is not None or dt_end is not None
-    if dt_start is not None and dt_end is not None and dt_start == dt_end:
-        has_time_range = False
-
-    if has_time_range:
+    if window is not None:
+        win_lo, win_hi = window
         try:
             from integrations.social._models_local import ConversationEntry
             from integrations.social.models import get_db
@@ -1682,11 +1727,9 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
             try:
                 q = db.query(ConversationEntry).filter(
                     ConversationEntry.user_id == str(user_id),
+                    ConversationEntry.created_at >= win_lo,
+                    ConversationEntry.created_at <= win_hi,
                 )
-                if dt_start is not None:
-                    q = q.filter(ConversationEntry.created_at >= dt_start)
-                if dt_end is not None:
-                    q = q.filter(ConversationEntry.created_at <= dt_end)
                 rows = q.order_by(
                     ConversationEntry.created_at.desc()
                 ).limit(50).all()
@@ -1708,7 +1751,7 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
             try:
                 current_app.logger.info(
                     f"Time-filtered history: {len(results)} rows in "
-                    f"{time.time() - start_time:.3f}s (range={dt_start}..{dt_end})"
+                    f"{time.time() - start_time:.3f}s (window={win_lo}..{win_hi})"
                 )
             except Exception:
                 pass
@@ -1727,8 +1770,17 @@ def get_time_based_history(prompt: str, session_id: str, start_date: str, end_da
         memory = SimpleMemChatMemory.load_or_create(user_id)
         results = memory.semantic_search(prompt)
         if results:
-            serialized = [{'message': {'content': r.get('content', ''),
-                                       'role': 'assistant'}} for r in results]
+            serialized = []
+            for r in results:
+                item = {'message': {'content': r.get('content', ''),
+                                    'role': r.get('role', 'assistant')}}
+                # Attach the timestamp so the model can date each memory it gets
+                # back. SimpleMem stores it under varying keys across versions.
+                ts = (r.get('created_at') or r.get('timestamp') or r.get('ts')
+                      or (r.get('metadata') or {}).get('created_at'))
+                if ts:
+                    item['created_at'] = ts
+                serialized.append(item)
             final_res = {'res_in_filter': serialized}
         else:
             final_res = {'res_in_filter': []}
