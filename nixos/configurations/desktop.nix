@@ -62,7 +62,11 @@ in
   # ─── Blacklist nouveau — prevents RTX/GTX GPU crash at boot ───
   # nouveau's GSP firmware init fails on many NVIDIA cards (observed: RTX 2060,
   # "gsp: fini failed, -110"), cascading into display manager and service failures.
-  # The proprietary driver (hart-nvidia.nix) is the correct driver for these GPUs.
+  # Two-layer blacklist:
+  #   1. module_blacklist=nouveau  → kernel-level, blocks nouveau even in initrd
+  #      (boot.blacklistedKernelModules only creates /etc/modprobe.d/ entries
+  #       which take effect AFTER initrd — too late for early GPU init)
+  #   2. boot.blacklistedKernelModules  → belt-and-suspenders for post-initrd
   boot.blacklistedKernelModules = [ "nouveau" ];
   # nixpkgs.config.allowBroken now set once at the flake level (#70)
 
@@ -610,5 +614,9 @@ in
     themePackages = [ hartPlymouth ];
     theme = lib.mkForce "hart";
   };
-  boot.kernelParams = [ "quiet" "splash" "nouveau.modeset=0" ];
+  boot.kernelParams = [
+    "quiet" "splash"
+    "module_blacklist=nouveau"  # kernel-level block: prevents nouveau loading in initrd
+    "nouveau.modeset=0"         # belt-and-suspenders: disables nouveau modesetting
+  ];
 }
