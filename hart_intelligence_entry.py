@@ -7388,7 +7388,9 @@ def _review_proposed_plan(plan, max_rounds_remaining):
     ('needs_refinement', feedback_text).
 
     Quality gates (mirrors StatusVerifier verdict shape):
-      1. flows[0].actions[] has >= 5 atomic steps for non-trivial tasks
+      1. Each step is ONE concrete tool call; a genuine multi-step GUI task is
+         fully decomposed (not crammed into a vague mega-step). Tool-satisfiable
+         tasks are complete at the few calls they need — no arbitrary min count.
       2. Browser/click/type/screenshot/post actions invoke
          execute_windows_or_android_command
       3. No banned phrases: 'ask the user', 'TODO', '...'
@@ -7404,10 +7406,14 @@ def _review_proposed_plan(plan, max_rounds_remaining):
         review_prompt = (
             "You are HART OS StatusVerifier reviewing an agent plan.\n"
             "Quality gates:\n"
-            "  1. flows[0].actions has AT LEAST 5 atomic steps for non-trivial tasks.\n"
-            "     There is NO MAXIMUM — complex tasks legitimately have many steps.\n"
-            "     A plan with 12 or 20 atomic steps is FINE if each step is a single\n"
-            "     tool call.  ONLY reject for 'too few steps', NEVER for 'too many'.\n"
+            "  1. Each step is ONE concrete tool call. A task fully satisfied by a\n"
+            "     few dedicated-tool calls (e.g. ONE get_chat_history for a recall,\n"
+            "     or google_search + send_message_to_user) is COMPLETE — do NOT\n"
+            "     demand a minimum step count. ONLY reject for UNDER-decomposition:\n"
+            "     a genuine multi-step GUI task crammed into one vague step (e.g.\n"
+            "     'post to LinkedIn' as a single step instead of open/navigate/\n"
+            "     click/type/post). A real GUI automation task has many atomic\n"
+            "     execute_windows steps; there is NO MAXIMUM.\n"
             "  2. GUI / desktop actions ONLY: actions mentioning browser/click/\n"
             "     screenshot/navigate-url MUST invoke 'execute_windows_or_android_command'.\n"
             "     Words like 'type', 'input', 'post', 'open' alone do NOT require\n"

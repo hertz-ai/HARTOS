@@ -74,13 +74,31 @@ Self-improvement:
   - validate_json_response      validate/repair a JSON response
 
 Quick mapping (use these defaults when the user describes intent in plain English):
+  - "what did we discuss / recall / N days ago / earlier"  -> get_chat_history
+  - "find what I saved / search my notes or past chats"    -> search_long_term_memory
   - "fetch a webpage / scrape a site"        -> crawl4ai
   - "search the internet / look up X online" -> google_search
   - "read text from an image / picture"      -> get_text_from_image
   - "schedule X / remind me at Y"            -> create_scheduled_jobs
-  - "run a command / open an app / click"    -> execute_windows_or_android_command
+  - "open an app / click / type / navigate a page (no tool fits)" -> execute_windows_or_android_command
   - "write/refactor/debug code"              -> execute_coding_task
 """
+
+
+def select_autonomous_tool_catalog() -> str:
+    """Tool catalog injected into the autonomous gather/plan prompt.
+
+    Returned by default so the plan author KNOWS the tools at its disposal and
+    plans with the right one per step (recall -> get_chat_history, web search ->
+    google_search, code -> execute_coding_task) instead of forcing every step
+    into GUI automation. Set HEVOLVE_AUTONOMOUS_GATHER_TOOL_MAP=0 to opt out
+    (e.g. to A/B the prompt-byte / latency cost).
+    """
+    if os.environ.get('HEVOLVE_AUTONOMOUS_GATHER_TOOL_MAP', '').strip().lower() in ('0', 'false', 'no', 'off'):
+        return ""
+    return AUTONOMOUS_TOOL_CATALOG
+
+
 # Store user-specific agents & their chat history
 user_agents: Dict[str, Tuple[Any, Any]] = {}
 
@@ -163,12 +181,10 @@ def create_agents_for_user(user_id: str, autonomous=False, initial_description=N
 
     # Build system message — enrich for autonomous mode
     if autonomous and initial_description:
-        # Feature-flagged: inject the tool catalog so the LLM picks real
-        # tool names instead of inventing.  Off by default to keep prompt
-        # bytes/latency unchanged; flip via HEVOLVE_AUTONOMOUS_GATHER_TOOL_MAP=1.
-        _tool_map = ""
-        if os.environ.get('HEVOLVE_AUTONOMOUS_GATHER_TOOL_MAP', '').strip().lower() in ('1', 'true', 'yes', 'on'):
-            _tool_map = AUTONOMOUS_TOOL_CATALOG
+        # The planner MUST know the full tool set at its disposal so it plans
+        # with the RIGHT tool per step instead of forcing GUI automation
+        # (see select_autonomous_tool_catalog — ON by default).
+        _tool_map = select_autonomous_tool_catalog()
         # AUTONOMOUS MODE: REPLACE the interactive system message entirely.
         # Live test 2026-05-16 13:04 showed that APPENDING the PLAN_FIRST
         # suffix to AGENT_CREATOR_SYSTEM_MESSAGE was diluted by the older
@@ -188,21 +204,31 @@ Response shape (EXACT keys, JSON only):
 
 RULES for flows[0].actions[]:
 - ONE concrete observable action per item.  No "and then" compounds.
-- For ANY computer-use task (open, click, paste, type, scroll, navigate, post, broadcast, send, share, browse, search, login, screenshot, copy, focus), EACH step MUST start with the literal prefix "execute_windows_or_android_command: " followed by plain-English instructions.  Examples:
+- USE THE RIGHT TOOL from "AVAILABLE TOOLS" above for each step — do NOT default
+  to GUI automation. Map the intent to the dedicated tool: recall / "what did we
+  discuss" / "N days ago" -> get_chat_history; search saved facts or past chats ->
+  search_long_term_memory; search the web -> google_search; fetch/scrape a URL ->
+  crawl4ai; OCR an image -> get_text_from_image; generate an image -> text_2_image;
+  message the user -> send_message_to_user; schedule -> create_scheduled_jobs;
+  write/refactor/debug code -> execute_coding_task. A step a tool can satisfy is
+  ONE step that names that tool (e.g. "get_chat_history for the last 15 days").
+- ONLY for a genuine GUI action that NO tool covers (open an app, click, type,
+  scroll, navigate a page, screenshot) prefix the step with
+  "execute_windows_or_android_command: " followed by plain English.  Examples:
     "execute_windows_or_android_command: bring Chrome window to foreground"
-    "execute_windows_or_android_command: navigate to https://linkedin.com/feed/"
     "execute_windows_or_android_command: click the 'Start a post' input box near the top of the feed"
-    "execute_windows_or_android_command: paste clipboard contents using Ctrl+V"
     "execute_windows_or_android_command: click the blue 'Post' button at the bottom-right of the compose modal"
     "execute_windows_or_android_command: take a screenshot to verify the post appeared in the feed"
-- 8 to 15 atomic steps for any non-trivial computer task.  Don't conflate steps.
+- Use AS FEW steps as the task needs: a question / recall / lookup is often ONE
+  tool step; only a genuine multi-step GUI task needs many (up to ~15). Do NOT pad
+  a tool-satisfiable task into a long GUI sequence.
 - Preserve EVERY detail of the task description in the plan.
 
 STAGE 2 — SUBSEQUENT CALL (incoming message is review verdict):
 - If incoming message is "approved" or starts with "approved": re-emit the SAME plan but with "status":"completed" and remove the "review_required" key.
 - Otherwise the message is refinement feedback: re-emit with "status":"proposed_plan" and apply the feedback to flows[0].actions[].
 
-STAGE 3 — Downstream: on "completed", the dispatcher saves persona JSON and hands the atomic-step list to the autogen team (Helper + Executor) which calls execute_windows_or_android_command for each step.
+STAGE 3 — Downstream: on "completed", the dispatcher saves persona JSON and hands the atomic-step list to the autogen team (Helper + Executor), which calls the tool named in each step (get_chat_history, google_search, execute_coding_task, execute_windows_or_android_command, etc.).
 
 ABSOLUTE RULES:
 - Plain ASCII only.  No em-dashes, no smart quotes, no Unicode.
