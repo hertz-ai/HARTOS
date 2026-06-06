@@ -376,7 +376,11 @@ in
         description = "HART OS Wine → Model Bus Bridge";
         after = [ "hart-model-bus.service" ];
         wants = [ "hart-model-bus.service" ];
-        wantedBy = [ "hart.target" ];
+        # partOf instead of wantedBy: wine bridge is a component of hart.target,
+        # not something hart.target waits on — avoids ordering cycle with
+        # hart-model-bus.service which is also pulled into hart.target.
+        partOf = [ "hart.target" ];
+        wantedBy = [ "multi-user.target" ];
 
         serviceConfig = {
           Type = "simple";

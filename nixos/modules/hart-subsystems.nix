@@ -234,7 +234,9 @@ in
       # Android Runtime service (native daemon, not container)
       systemd.services.hart-android-runtime = {
         description = "HART OS Android Native Runtime";
-        after = [ "hart.target" "graphical.target" ];
+        # graphical.target removed from after: it's after multi-user.target,
+        # but this service is wantedBy multi-user.target → ordering cycle.
+        after = [ "hart.target" ];
         wants = [ "hart.target" ];
         wantedBy = [ "multi-user.target" ];
 

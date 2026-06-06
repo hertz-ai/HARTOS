@@ -120,10 +120,15 @@ print(f'Node ID: {public_bytes.hex()[:16]}...')
 
     SIGNATURE="UNSIGNED"
     if [[ -f "$DATA_DIR/node_private.key" ]]; then
-      SIGNATURE=$(${pythonWithCrypto}/bin/python3 -c "
+      # Pass entry via env var to avoid shell→Python quoting issues.
+      # Nix ''...'' strings turn ''' into '' (two quotes), so embedding
+      # $ENTRY directly in Python source produces ''<value>'' which is
+      # a SyntaxError (leading-zero integer literal) on date strings.
+      SIGNATURE=$(HART_BOOT_ENTRY="$ENTRY" ${pythonWithCrypto}/bin/python3 -c "
+import os
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-entry = '''$ENTRY'''
+entry = os.environ['HART_BOOT_ENTRY']
 with open('$DATA_DIR/node_private.key', 'rb') as f:
     key_bytes = f.read()
 
