@@ -1458,10 +1458,12 @@ for _cfg_name in ('langchain_config.json', 'config.json'):
         pass
 
 # global variables
-try:
-    encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
-except (KeyError, Exception):
-    encoding = tiktoken.get_encoding("cl100k_base")  # GPT-4 default
+# Token counting: single source — core.token_utils.count_tokens_for_text
+# (tiktoken with a word-split fallback). Replaces the old module-global
+# `encoding` object + the inline `len(encoding.encode(x)) if encoding else
+# x.split()` chains (#112), and removes the import-time crash when tiktoken was
+# unavailable (the old except ran tiktoken.get_encoding on a None tiktoken).
+from core.token_utils import count_tokens_for_text
 
 # api and keys — use config if available, otherwise keep existing env vars / empty
 for _cfg_key in ('OPENAI_API_KEY', 'GOOGLE_CSE_ID', 'GOOGLE_API_KEY',
@@ -5363,7 +5365,7 @@ class CustomGPT(LLM):
 
         app.logger.info(f"len---->{len(prompt.split(' '))}")
         # encoding = tiktoken.get_encoding("gpt-3.5-turbo")
-        num_tokens = len(encoding.encode(prompt)) if encoding else len(prompt.split())
+        num_tokens = count_tokens_for_text(prompt)
         thread_local_data.update_req_token_count(num_tokens)
         app.logger.info(f"len---->{num_tokens}")
 
@@ -5601,8 +5603,8 @@ class CustomGPT(LLM):
             end_time = time.time()
             elapsed_time = end_time - start_time
             app.logger.info(f"time taken for this call is {elapsed_time}")
-            num_tokens = len(encoding.encode(
-                str(response).replace('\n', ' ').replace('\t', ''))) if encoding else len(str(response).split())
+            num_tokens = count_tokens_for_text(
+                str(response).replace('\n', ' ').replace('\t', ''))
             app.logger.info(f"current num_tokens: {num_tokens}")
             thread_local_data.update_res_token_count(num_tokens)
             end_result = str(response).replace('\n', ' ').replace('\t', '')
@@ -5648,8 +5650,8 @@ class CustomGPT(LLM):
                 _g12_finalize(prompt, _err_reply, _g12_student_future)
                 return _err_reply
             response_text = resp_json["choices"][0]["message"]["content"]
-            num_tokens = len(encoding.encode(
-                response_text.replace('\n', ' ').replace('\t', ''))) if encoding else len(response_text.split())
+            num_tokens = count_tokens_for_text(
+                response_text.replace('\n', ' ').replace('\t', ''))
             thread_local_data.update_res_token_count(num_tokens)
             _final_text = response_text.replace('\n', ' ').replace('\t', '')
             # G12: drain SSM student future and feed distillation engine
