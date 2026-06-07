@@ -193,12 +193,32 @@
         pkgs = nixpkgs.legacyPackages.${system};
         isX86 = system == "x86_64-linux";
         isArm = system == "aarch64-linux";
+        # SHA256SUMS sidecar for an isoImage: a dir with the .iso symlinked + its
+        # checksum, so an operator can `sha256sum -c` the build AND the flashed
+        # USB (dd-device readback) BEFORE booting. The "corrupt squashfs on bare
+        # metal while a VM boots fine" class is almost always a truncated or
+        # bit-flipped DD-flash / cheap USB; this is the verify step that catches
+        # it (and surfaces a non-reproducible build if two builders disagree).
+        isoSha256 = name: isoDrv: pkgs.runCommand "${name}-iso-sha256" { } ''
+          mkdir -p $out
+          cd ${isoDrv}/iso
+          ${pkgs.coreutils}/bin/sha256sum *.iso > $out/SHA256SUMS
+          for f in *.iso; do ln -s ${isoDrv}/iso/"$f" $out/"$f"; done
+          cat $out/SHA256SUMS
+        '';
       in
       {
         # ─── ISO Images (bootable USB / optical) ───
         iso-server  = self.nixosConfigurations.hart-server.config.system.build.isoImage;
         iso-desktop = self.nixosConfigurations.hart-desktop.config.system.build.isoImage;
         iso-edge    = self.nixosConfigurations.hart-edge.config.system.build.isoImage;
+
+        # ─── ISO + SHA256SUMS (flash-integrity verification for bare-metal) ───
+        # `nix build .#iso-desktop-sha256` yields the .iso + its SHA256SUMS so the
+        # USB is verifiable before AND after DD (sha256sum -c vs the dd'd device).
+        iso-server-sha256  = isoSha256 "hart-os-server"  self.nixosConfigurations.hart-server.config.system.build.isoImage;
+        iso-desktop-sha256 = isoSha256 "hart-os-desktop" self.nixosConfigurations.hart-desktop.config.system.build.isoImage;
+        iso-edge-sha256    = isoSha256 "hart-os-edge"    self.nixosConfigurations.hart-edge.config.system.build.isoImage;
 
         # ─── Raw EFI disk images (dd to SSD/NVMe) ───
         raw-server  = mkImage { inherit system; variant = "server";  format = "raw-efi"; };
