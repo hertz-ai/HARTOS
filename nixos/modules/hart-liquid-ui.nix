@@ -119,7 +119,7 @@ class GlassShell(Gtk.Window):
         webview.load_uri(os.environ.get('HART_SHELL_URL', 'http://localhost:${toString ui.port}'))
         s = webview.get_settings()
         s.set_enable_javascript(True)
-        s.set_enable_developer_extras(False)
+        s.set_enable_developer_extras(True)
         # NEVER (not ALWAYS): a fresh ISO / live-USB / VM often has only
         # software GL (llvmpipe). Forcing GPU accel there crashes WebKitGTK and
         # takes down the shell session. Correctness/robustness over a few fps.
