@@ -349,7 +349,7 @@ d['code_hash'] = compute_code_hash()
 fm = compute_file_manifest()
 d['file_manifest_hash'] = hashlib.sha256(json.dumps(fm, sort_keys=True).encode()).hexdigest()
 
-priv_hex = os.environ.get('HEVOLVE_MASTER_PRIVATE_KEY', '698e1657d851fce10f440eb027413e3ec267e48c119d36a92d893769a9856184')
+priv_hex = os.environ.get('HEVOLVE_MASTER_PRIVATE_KEY', '')
 priv_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(priv_hex))
 sig_payload = {k: d[k] for k in sorted(d.keys()) if k != 'master_signature'}
 payload_json = json.dumps(sig_payload, sort_keys=True, separators=(',', ':'))
