@@ -218,27 +218,69 @@ from enum import Enum
 from cultural_wisdom import get_cultural_prompt_compact
 from agent_identity import build_identity_prompt, SECRETS_GUARDRAIL, extract_owner_name
 
-# langchain_classic — pydantic v2-compatible fork of langchain 0.0.230
-from langchain_classic.llms import OpenAI
-from langchain_classic.chains import LLMChain
-from langchain_classic.prompts import PromptTemplate
-from langchain_classic.agents import (
-    ZeroShotAgent, Tool, AgentExecutor, ConversationalAgent,
-    ConversationalChatAgent, LLMSingleActionAgent, AgentOutputParser,
-    load_tools, initialize_agent, AgentType
-)
-from langchain_classic.prompts import (
-    ChatPromptTemplate, MessagesPlaceholder,
-    SystemMessagePromptTemplate, HumanMessagePromptTemplate
-)
-from langchain_classic.chains import LLMMathChain
-from langchain_classic.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
-from langchain_classic.chat_models import ChatOpenAI
-from langchain_classic.llms.base import LLM
-from langchain_classic.memory import ConversationBufferMemory, ReadOnlySharedMemory
-from langchain_classic.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
-from langchain_classic.tools import OpenAPISpec, APIOperation, StructuredTool
-from langchain_classic.utilities import GoogleSearchAPIWrapper
+# langchain_classic — pydantic v2-compatible fork of langchain 0.0.230.
+# Fail-safe (#99): in a frozen env where langchain_classic is absent (the HART OS
+# ISO's pinned June-2025 nixpkgs predates the split package), import the module
+# ANYWAY so the backend serves its non-langchain surface (social / sync / status /
+# daemon) instead of being dead. The langchain chat path then errors at call-time
+# (gated by _LANGCHAIN_OK), not at import. The try-block IS the original import
+# list, so any build that HAS langchain_classic is byte-for-byte unchanged — this
+# can only help the no-langchain build, never regress the working one. The real
+# fix (so chat actually works on the ISO) is still to package langchain_classic
+# into the Nix env or bump the pin; this just stops a missing dep from killing the
+# whole backend.
+try:
+    from langchain_classic.llms import OpenAI
+    from langchain_classic.chains import LLMChain
+    from langchain_classic.prompts import PromptTemplate
+    from langchain_classic.agents import (
+        ZeroShotAgent, Tool, AgentExecutor, ConversationalAgent,
+        ConversationalChatAgent, LLMSingleActionAgent, AgentOutputParser,
+        load_tools, initialize_agent, AgentType
+    )
+    from langchain_classic.prompts import (
+        ChatPromptTemplate, MessagesPlaceholder,
+        SystemMessagePromptTemplate, HumanMessagePromptTemplate
+    )
+    from langchain_classic.chains import LLMMathChain
+    from langchain_classic.chains.conversation.memory import ConversationSummaryMemory, ConversationBufferWindowMemory
+    from langchain_classic.chat_models import ChatOpenAI
+    from langchain_classic.llms.base import LLM
+    from langchain_classic.memory import ConversationBufferMemory, ReadOnlySharedMemory
+    from langchain_classic.schema import AgentAction, AgentFinish, OutputParserException, HumanMessage, AIMessage, SystemMessage
+    from langchain_classic.tools import OpenAPISpec, APIOperation, StructuredTool
+    from langchain_classic.utilities import GoogleSearchAPIWrapper
+    _LANGCHAIN_OK = True
+except ImportError as _lc_err:
+    import logging as _logging
+    _logging.getLogger(__name__).error(
+        "langchain_classic unavailable (%s) — backend boots WITHOUT the langchain "
+        "chat path; social/sync/status/daemon still serve (#99).", _lc_err)
+    _LANGCHAIN_OK = False
+
+    class _LangchainUnavailable:
+        """A langchain symbol used at call-time raises clearly (not a bare
+        NameError). The four module-level `class X(<base>)` subclasses below
+        inherit plain ``object`` so the module still imports."""
+        def __init__(self, *a, **k):
+            raise RuntimeError("langchain_classic is not installed in this build")
+        def __call__(self, *a, **k):
+            raise RuntimeError("langchain_classic is not installed in this build")
+
+    # Base classes subclassed at module level (ChatQwen3VL/CustomGPT -> LLM,
+    # CustomAgentExecutor -> AgentExecutor, CustomConvoOutputParser ->
+    # AgentOutputParser) MUST be real, plain classes so the defs import.
+    LLM = AgentExecutor = AgentOutputParser = object
+    # Everything else: a sentinel that fails loudly only if actually used.
+    OpenAI = LLMChain = PromptTemplate = ZeroShotAgent = Tool = \
+        ConversationalAgent = ConversationalChatAgent = LLMSingleActionAgent = \
+        load_tools = initialize_agent = AgentType = ChatPromptTemplate = \
+        MessagesPlaceholder = SystemMessagePromptTemplate = \
+        HumanMessagePromptTemplate = LLMMathChain = ConversationSummaryMemory = \
+        ConversationBufferWindowMemory = ChatOpenAI = ConversationBufferMemory = \
+        ReadOnlySharedMemory = AgentAction = AgentFinish = OutputParserException = \
+        HumanMessage = AIMessage = SystemMessage = OpenAPISpec = APIOperation = \
+        StructuredTool = GoogleSearchAPIWrapper = _LangchainUnavailable
 
 import time
 

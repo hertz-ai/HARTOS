@@ -20,12 +20,15 @@ let
     # dead); pytz / redis / python-dotenv are the next dominoes (all present in
     # this nixpkgs pin).
     #
-    # ⚠ BACKEND STILL BLOCKED: the module also imports `langchain_classic` 13x at
-    # column 0, and langchain_classic 1.x is NOT in this June-2025 nixpkgs pin
-    # (the split package post-dates it). hart-backend cannot import until that
-    # tree is packaged (pip2nix/poetry2nix), the pin is bumped, or the langchain
-    # imports are deferred. Tracked as its own task — these adds do NOT yet make
-    # the backend boot; they unblock the OTHER services that import cleanly.
+    # ⚠ CHAT DEGRADED (no longer a boot blocker): the module also imports
+    # `langchain_classic` 13x, and langchain_classic 1.x is NOT in this June-2025
+    # nixpkgs pin (the split package post-dates it). That import block is now
+    # wrapped in try/except in hart_intelligence_entry.py (#99): if it's absent
+    # the backend STILL BOOTS and serves social/sync/status/daemon — only the
+    # langchain chat path errors at call-time (gated by _LANGCHAIN_OK). So the
+    # backend imports cleanly here without langchain. To make CHAT itself work on
+    # the ISO, langchain_classic must still be packaged (pip2nix/poetry2nix) or
+    # the pin bumped — but that is no longer what gates a successful boot.
     beautifulsoup4
     pytz
     redis
