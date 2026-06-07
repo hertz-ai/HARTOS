@@ -146,11 +146,15 @@ def test_missing_fields_no_start(monkeypatch):
                                  room_factory=_FakeRoom).start() is False
 
 
-def test_no_sdk_start_is_noop():
-    # The unit-test install set has no `livekit`, so HAS_LIVEKIT_RTC is False and
-    # start() (no room_factory) is a no-op — the bridge then logs the reply text.
-    assert HAS_LIVEKIT_RTC is False
-    pub = LiveKitAudioPublisher('c', 'ws://x', 't')
+def test_no_sdk_start_is_noop(monkeypatch):
+    # Force the SDK-absent path deterministically. The no-op behaviour must hold
+    # whenever the realtime SDK isn't usable — NOT only when this env happens to
+    # lack `livekit`. A full voice dev env / CI-with-voice-extras HAS livekit
+    # installed (HAS_LIVEKIT_RTC True), which used to flip this assert and fail
+    # the test. Patch the base-module flag start() actually reads.
+    import integrations.social._livekit_room as roommod
+    monkeypatch.setattr(roommod, 'HAS_LIVEKIT_RTC', False)
+    pub = LiveKitAudioPublisher('c', 'ws://x', 't')   # no room_factory seam
     assert pub.start() is False
     assert pub.is_alive() is False
     assert pub.push_pcm(b'\x00\x01' * 100, 24000, 1) is False

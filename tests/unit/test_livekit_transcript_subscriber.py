@@ -156,14 +156,19 @@ class StartStopNoLibTest(unittest.TestCase):
     start() must be a no-op and stop() must not raise."""
 
     def test_start_is_noop_without_lib(self):
+        from unittest.mock import patch
+        import integrations.social._livekit_room as roommod
         from integrations.social.livekit_transcript_subscriber import (
-            LiveKitTranscriptSubscriber, HAS_LIVEKIT_RTC,
+            LiveKitTranscriptSubscriber,
         )
-        # In this env livekit-rtc is NOT installed.
-        self.assertFalse(HAS_LIVEKIT_RTC)
+        # Force the SDK-absent path deterministically: the no-op behaviour must
+        # hold whenever the realtime SDK isn't usable, NOT only when this env
+        # happens to lack `livekit` (a voice dev env / CI-with-voice-extras HAS
+        # it, HAS_LIVEKIT_RTC True). Patch the base flag start() reads.
         sub = LiveKitTranscriptSubscriber(
             call_id='c', livekit_url='wss://x', token='t')
-        self.assertFalse(sub.start())
+        with patch.object(roommod, 'HAS_LIVEKIT_RTC', False):
+            self.assertFalse(sub.start())
         # stop() is idempotent + safe.
         sub.stop()
 
