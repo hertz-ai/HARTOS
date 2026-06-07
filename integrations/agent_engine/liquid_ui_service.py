@@ -1256,6 +1256,15 @@ let startOpen = false;
 let focusedPanel = null;
 let mru = [];
 
+// AbortSignal.timeout() was added in WebKit 615 / Safari 15.4. Older WebKitGTK
+// builds (e.g. NixOS 24.11 ISO) may not have it — fall back to AbortController.
+function _sig(ms) {{
+  if(typeof AbortSignal !== 'undefined' && AbortSignal.timeout) return AbortSignal.timeout(ms);
+  const c = new AbortController();
+  setTimeout(()=>c.abort(), ms);
+  return c.signal;
+}}
+
 // ═══════════════════════════════════════════════
 //  HART Design System — Component Library
 // ═══════════════════════════════════════════════
@@ -1614,11 +1623,11 @@ function tickClock() {{
   if(ld) ld.textContent = d;
 }}
 setInterval(tickClock, PERF.clockMs);
-tickClock();
+try {{ tickClock(); }} catch(e) {{ console.error('[HART] tickClock:', e); }}
 
 // ═══ Agent Status (top bar) ═══
 function refreshAgentStatus() {{
-  fetch(BACKEND+'/api/social/dashboard/agents',{{signal:AbortSignal.timeout(3000)}})
+  fetch(BACKEND+'/api/social/dashboard/agents',{{signal:_sig(3000)}})
     .then(r=>r.json()).then(data=>{{
       const bar = document.getElementById('agent-status');
       const agents = (data.agents||[]).filter(a=>a.status==='running');
@@ -1630,7 +1639,7 @@ function refreshAgentStatus() {{
     }}).catch(()=>{{}});
 }}
 setInterval(refreshAgentStatus, PERF.agentStatusMs);
-refreshAgentStatus();
+try {{ refreshAgentStatus(); }} catch(e) {{ console.error('[HART] refreshAgentStatus:', e); }}
 
 // ═══ Start Menu ═══
 function buildStartMenu() {{
@@ -1660,7 +1669,7 @@ function buildStartMenu() {{
   }}
   scroll.innerHTML = html;
 }}
-buildStartMenu();
+try {{ buildStartMenu(); }} catch(e) {{ console.error('[HART] buildStartMenu:', e); }}
 
 function toggleStartMenu() {{
   const m = document.getElementById('start-menu');
@@ -1953,7 +1962,7 @@ function metricBar(l,p,u,s) {{ return dsMetricBar(l,p,u,s); }}
 function statusRow(i,l,v,c) {{ return dsStatusRow(i,l,v,c); }}
 
 function loadHardwareMonitor(el, apis) {{
-  Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}}))))
+  Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:_sig(3000)}}).then(r=>r.json()).catch(()=>({{}}))))
     .then(([sys,caps])=>{{
       const cpu=sys.cpu_percent||0, ram_used=sys.ram_used_gb||0, ram_total=sys.ram_total_gb||0;
       const disk_used=sys.disk_used_gb||0, disk_total=sys.disk_total_gb||0;
@@ -1972,7 +1981,7 @@ function loadHardwareMonitor(el, apis) {{
 }}
 
 function loadSecurityCenter(el, apis) {{
-  Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}}))))
+  Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:_sig(3000)}}).then(r=>r.json()).catch(()=>({{}}))))
     .then(([health,guardrail])=>{{
       const ghash = guardrail.guardrail_hash||'unknown';
       const wm = health.world_model||{{}};
@@ -1998,7 +2007,7 @@ function wifiConnect(ssid) {{
     showToast('WiFi', 'Connecting to '+ssid+'...', 'info');
     fetch(SHELL+'/api/shell/network/wifi/connect', {{
       method:'POST', headers:{{'Content-Type':'application/json'}},
-      body:JSON.stringify(body), signal:AbortSignal.timeout(35000)
+      body:JSON.stringify(body), signal:_sig(35000)
     }}).then(r=>r.json()).then(d=>{{
       if(d.success) {{ showToast('WiFi', 'Connected to '+ssid, 'success'); loadNetworkPanel(document.getElementById('sys-network'),
         (SYSTEM_PANELS['network']||{{}}).apis||[]); }}
@@ -2011,7 +2020,7 @@ function wifiDisconnect() {{
     if(!ok) return;
     fetch(SHELL+'/api/shell/network/wifi/disconnect', {{
       method:'POST', headers:{{'Content-Type':'application/json'}},
-      body:'{{}}', signal:AbortSignal.timeout(15000)
+      body:'{{}}', signal:_sig(15000)
     }}).then(r=>r.json()).then(d=>{{
       if(d.success) {{ showToast('WiFi', 'Disconnected', 'info'); loadNetworkPanel(document.getElementById('sys-network'),
         (SYSTEM_PANELS['network']||{{}}).apis||[]); }}
@@ -2022,9 +2031,9 @@ function wifiDisconnect() {{
 
 function loadNetworkPanel(el, apis) {{
   Promise.all([
-    ...apis.map(u=>fetch(BACKEND+u,{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}}))),
-    fetch(SHELL+'/api/shell/network/wifi',{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}})),
-    fetch(SHELL+'/api/shell/network/status',{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}}))
+    ...apis.map(u=>fetch(BACKEND+u,{{signal:_sig(3000)}}).then(r=>r.json()).catch(()=>({{}}))),
+    fetch(SHELL+'/api/shell/network/wifi',{{signal:_sig(3000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+'/api/shell/network/status',{{signal:_sig(3000)}}).then(r=>r.json()).catch(()=>({{}}))
   ]).then(results=>{{
       const topo = results[0]||{{}};
       const wifi = results[results.length-2]||{{}};
@@ -2079,7 +2088,7 @@ function loadNetworkPanel(el, apis) {{
 function loadHartIdentityPanel(el, apis) {{
   const profileUrl = apis[0] || '/api/onboarding/profile';
   const statusUrl = apis[1] || '/api/onboarding/status';
-  fetch(SHELL+statusUrl,{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).then(st=>{{
+  fetch(SHELL+statusUrl,{{signal:_sig(3000)}}).then(r=>r.json()).then(st=>{{
     if(!st.onboarded) {{
       el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">My HART</div>'+
         '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-3" style="padding:40px 0">'+
@@ -2088,7 +2097,7 @@ function loadHartIdentityPanel(el, apis) {{
         dsBtn('Light Your HART',{{variant:'primary', onclick:"fetch(SHELL+'/api/onboarding/start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{user_id:'1'}})}}).then(()=>showToast('Onboarding','Opening onboarding...','info')).catch(()=>{{}})"}})+'</div></div>';
       return;
     }}
-    fetch(SHELL+profileUrl,{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).then(p=>{{
+    fetch(SHELL+profileUrl,{{signal:_sig(3000)}}).then(r=>r.json()).then(p=>{{
       el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">My HART</div>'+
         '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-3" style="padding:24px 0">'+
         '<span class="mi material-icons-round ds-text-accent" style="font-size:56px">badge</span>'+
@@ -2113,7 +2122,7 @@ function selfBuildInstall() {{
     showToast('Self-Build','Staging '+pkg+'...','info');
     fetch(SHELL+'/api/system/self-build/install',{{
       method:'POST', headers:{{'Content-Type':'application/json'}},
-      body:JSON.stringify({{package:pkg}}), signal:AbortSignal.timeout(10000)
+      body:JSON.stringify({{package:pkg}}), signal:_sig(10000)
     }}).then(r=>r.json()).then(d=>{{
       if(d.success) {{ showToast('Self-Build','Staged: '+pkg,'success'); loadSelfBuildPanel(document.getElementById('sys-self_build'),
         (SYSTEM_PANELS['self_build']||{{}}).apis||[]); }}
@@ -2126,7 +2135,7 @@ function selfBuildRemove(pkg) {{
     if(!ok) return;
     fetch(SHELL+'/api/system/self-build/remove',{{
       method:'POST', headers:{{'Content-Type':'application/json'}},
-      body:JSON.stringify({{package:pkg}}), signal:AbortSignal.timeout(10000)
+      body:JSON.stringify({{package:pkg}}), signal:_sig(10000)
     }}).then(r=>r.json()).then(d=>{{
       if(d.success) {{ showToast('Self-Build','Removed: '+pkg,'info'); loadSelfBuildPanel(document.getElementById('sys-self_build'),
         (SYSTEM_PANELS['self_build']||{{}}).apis||[]); }}
@@ -2140,7 +2149,7 @@ function selfBuildTrigger(mode) {{
     showToast('Self-Build','Building ('+mode+')...','info');
     fetch(SHELL+'/api/system/self-build/trigger',{{
       method:'POST', headers:{{'Content-Type':'application/json'}},
-      body:JSON.stringify({{mode:mode}}), signal:AbortSignal.timeout(600000)
+      body:JSON.stringify({{mode:mode}}), signal:_sig(600000)
     }}).then(r=>r.json()).then(d=>{{
       if(d.success) showToast('Self-Build','Build complete!','success');
       else dsAlert('Build Failed', d.error||d.stderr||'Unknown error', 'error');
@@ -2154,8 +2163,8 @@ function loadSelfBuildPanel(el, apis) {{
   const statusUrl = apis[0] || '/api/system/self-build/status';
   const pkgsUrl = apis[1] || '/api/system/self-build/packages';
   Promise.all([
-    fetch(SHELL+statusUrl,{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
-    fetch(SHELL+pkgsUrl,{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))
+    fetch(SHELL+statusUrl,{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+pkgsUrl,{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}}))
   ]).then(([status,pkgData])=>{{
     const gen = status.generation||'?';
     const version = status.nixos_version||'unknown';
@@ -2198,7 +2207,7 @@ function loadSelfBuildPanel(el, apis) {{
 
 // ═══ Keyboard Shortcuts ═══
 function loadKeyboardShortcutsPanel(el) {{
-  fetch(SHELL+'/api/shell/shortcuts',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/shortcuts',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const profile = data.profile||'windows';
     const profiles = data.available_profiles||['windows','mac'];
     const sc = data.shortcuts||{{}};
@@ -2236,8 +2245,8 @@ function loadKeyboardShortcutsPanel(el) {{
 // ═══ Task Manager ═══
 function loadTaskManagerPanel(el) {{
   Promise.all([
-    fetch(SHELL+'/api/shell/tasks/processes',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
-    fetch(SHELL+'/api/shell/tasks/resources',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))
+    fetch(SHELL+'/api/shell/tasks/processes',{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+'/api/shell/tasks/resources',{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}}))
   ]).then(([procData,res])=>{{
     const procs = procData.processes||[];
     const cpu = res.cpu_percent||0, mem = res.memory_percent||0;
@@ -2269,8 +2278,8 @@ function taskKill(pid) {{
 // ═══ Storage ═══
 function loadStoragePanel(el) {{
   Promise.all([
-    fetch(SHELL+'/api/shell/storage',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
-    fetch(SHELL+'/api/shell/storage/cleanup',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))
+    fetch(SHELL+'/api/shell/storage',{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+'/api/shell/storage/cleanup',{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}}))
   ]).then(([st,cl])=>{{
     const disks = st.disks||[];
     const cleanable = cl.total_cleanable_mb||0;
@@ -2288,7 +2297,7 @@ function loadStoragePanel(el) {{
 
 // ═══ Startup Apps ═══
 function loadStartupAppsPanel(el) {{
-  fetch(SHELL+'/api/shell/startup',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/startup',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const apps = data.apps||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Startup Apps</div><div class="ds-stagger">';
     if(apps.length===0) html += '<div class="ds-body-md ds-text-muted">No startup apps configured</div>';
@@ -2308,7 +2317,7 @@ function toggleStartup(id,en) {{
 
 // ═══ Bluetooth Manager ═══
 function loadBluetoothManagerPanel(el) {{
-  fetch(SHELL+'/api/shell/bluetooth/status',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/bluetooth/status',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const devs = data.devices||[];
     const powered = data.powered!==false;
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Bluetooth</span>'+
@@ -2327,7 +2336,7 @@ function loadBluetoothManagerPanel(el) {{
 
 // ═══ Print Manager ═══
 function loadPrintManagerPanel(el) {{
-  fetch(SHELL+'/api/shell/printers',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/printers',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const printers = data.printers||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Printers</div><div class="ds-stagger">';
     if(printers.length===0) html += '<div class="ds-body-md ds-text-muted">No printers found</div>';
@@ -2342,7 +2351,7 @@ function loadPrintManagerPanel(el) {{
 
 // ═══ Media Library ═══
 function loadMediaLibraryPanel(el) {{
-  fetch(SHELL+'/api/shell/media/status',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/media/status',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Media Library</div>';
     html += '<div class="ds-flex ds-gap-3 ds-flex-wrap">';
     html += dsCard('<div class="ds-metric"><div class="ds-metric-value ds-text-accent">'+(data.photo_count||0)+'</div><div class="ds-metric-label">Photos</div></div>',{{elevated:true}});
@@ -2355,7 +2364,7 @@ function loadMediaLibraryPanel(el) {{
 
 // ═══ File Manager ═══
 function loadFileManagerPanel(el) {{
-  fetch(SHELL+'/api/shell/files/browse?path=~',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/files/browse?path=~',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const items = data.items||[];
     const cwd = data.path||'~';
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Files</span>'+
@@ -2377,7 +2386,7 @@ function browseDir(path) {{
   const el = document.getElementById('sys-file_manager');
   if(!el) return;
   el.innerHTML = dsSkeleton('panel',3);
-  fetch(SHELL+'/api/shell/files/browse?path='+encodeURIComponent(path),{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/files/browse?path='+encodeURIComponent(path),{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const items = data.items||[];
     const cwd = data.path||path;
     const parent = data.parent||'';
@@ -2419,7 +2428,7 @@ function termExec() {{
   inp.value = '';
   out.textContent += '$ '+cmd+'\\n';
   fetch(SHELL+'/api/shell/terminal/exec',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{command:cmd}}),signal:AbortSignal.timeout(30000)}}
+    body:JSON.stringify({{command:cmd}}),signal:_sig(30000)}}
   ).then(r=>r.json()).then(d=>{{
     out.textContent += (d.stdout||'')+(d.stderr?'\\n'+d.stderr:'')+'\\n';
     out.scrollTop = out.scrollHeight;
@@ -2428,7 +2437,7 @@ function termExec() {{
 
 // ═══ User Accounts ═══
 function loadUserAccountsPanel(el) {{
-  fetch(SHELL+'/api/shell/users',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/users',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const users = data.users||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">User Accounts</div><div class="ds-stagger">';
     users.forEach(u=>{{
@@ -2442,7 +2451,7 @@ function loadUserAccountsPanel(el) {{
 
 // ═══ Notification Center ═══
 function loadNotificationCenterPanel(el) {{
-  fetch(SHELL+'/api/shell/notifications',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/notifications',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const notifs = data.notifications||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Notifications</div><div class="ds-stagger">';
     if(notifs.length===0) html += '<div class="ds-body-md ds-text-muted">No notifications</div>';
@@ -2459,7 +2468,7 @@ function loadNotificationCenterPanel(el) {{
 
 // ═══ Updates ═══
 function loadUpdatesPanel(el) {{
-  fetch(BACKEND+'/api/upgrades/status',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(BACKEND+'/api/upgrades/status',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">System Updates</div>';
     html += dsStatusRow('system_update', 'Current Version', data.current_version||'unknown', 'var(--hart-active)');
     if(data.new_version) html += dsStatusRow('upgrade', 'Available', data.new_version, 'var(--hart-accent)');
@@ -2472,7 +2481,7 @@ function loadUpdatesPanel(el) {{
 
 // ═══ Backup & Restore ═══
 function loadBackupRestorePanel(el) {{
-  fetch(SHELL+'/api/shell/backup/list',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/backup/list',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const backups = data.backups||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Backup &amp; Restore</div><div class="ds-stagger">';
     if(backups.length===0) html += '<div class="ds-body-md ds-text-muted">No backups found</div>';
@@ -2486,7 +2495,7 @@ function loadBackupRestorePanel(el) {{
 
 // ═══ Devices & Mesh ═══
 function loadDevicesPanel(el) {{
-  fetch(SHELL+'/api/shell/devices',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/devices',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const devs = data.devices||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Devices &amp; Mesh</div><div class="ds-stagger">';
     if(devs.length===0) html += '<div class="ds-body-md ds-text-muted">No paired devices</div>';
@@ -2501,7 +2510,7 @@ function loadDevicesPanel(el) {{
 
 // ═══ Language & Region ═══
 function loadI18nPanel(el) {{
-  fetch(SHELL+'/api/shell/i18n/locales',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/i18n/locales',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const current = data.current||'en';
     const locales = data.available||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Language &amp; Region</div>';
@@ -2527,7 +2536,7 @@ function setLocale(code) {{
 
 // ═══ Accessibility ═══
 function loadAccessibilityPanel(el) {{
-  fetch(SHELL+'/api/shell/accessibility',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/accessibility',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Accessibility</div><div class="ds-stagger">';
     const items = [
       ['contrast', 'High Contrast', 'high_contrast', data.high_contrast],
@@ -2591,7 +2600,7 @@ function loadFirewallPanel(el) {{
 
 // ═══ Default Apps ═══
 function loadDefaultAppsPanel(el) {{
-  fetch(SHELL+'/api/shell/default-apps',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/default-apps',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const apps = data.defaults||{{}};
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Default Apps</div><div class="ds-stagger">';
     const cats = [['web-browser','Web Browser','public'],['text-editor','Text Editor','edit_note'],
@@ -2609,7 +2618,7 @@ function loadDefaultAppsPanel(el) {{
 
 // ═══ Font Manager ═══
 function loadFontManagerPanel(el) {{
-  fetch(SHELL+'/api/shell/fonts',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/fonts',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const fonts = data.fonts||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Fonts</span>'+
       '<span class="ds-chip"><span class="ds-chip-dot" style="background:var(--hart-accent)"></span>'+fonts.length+' installed</span></div>';
@@ -2626,7 +2635,7 @@ function loadFontManagerPanel(el) {{
 
 // ═══ Sound Manager ═══
 function loadSoundManagerPanel(el) {{
-  fetch(SHELL+'/api/shell/sounds/themes',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/sounds/themes',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const themes = data.themes||[];
     const current = data.current||'freedesktop';
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Sound Theme</div>';
@@ -2647,7 +2656,7 @@ function loadSoundManagerPanel(el) {{
 
 // ═══ Clipboard ═══
 function loadClipboardPanel(el) {{
-  fetch(SHELL+'/api/shell/clipboard/history',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/clipboard/history',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const items = data.history||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Clipboard</span>'+
       dsBtn('Clear',{{variant:'secondary',cls:'ds-btn-sm',onclick:"fetch(SHELL+'/api/shell/clipboard/clear',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}}).then(()=>loadClipboardPanel(document.getElementById('sys-clipboard_manager')))"}})+
@@ -2667,7 +2676,7 @@ function loadClipboardPanel(el) {{
 
 // ═══ Date & Time ═══
 function loadDateTimePanel(el) {{
-  fetch(SHELL+'/api/shell/datetime',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/datetime',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Date &amp; Time</div>';
     html += '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-2" style="padding:16px 0">'+
       '<div class="ds-display-sm ds-text-accent">'+(data.time||'')+'</div>'+
@@ -2684,8 +2693,8 @@ function loadDateTimePanel(el) {{
 // ═══ Wallpaper ═══
 function loadWallpaperPanel(el) {{
   Promise.all([
-    fetch(SHELL+'/api/shell/wallpaper',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
-    fetch(SHELL+'/api/shell/wallpaper/collection',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))
+    fetch(SHELL+'/api/shell/wallpaper',{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+'/api/shell/wallpaper/collection',{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}}))
   ]).then(([cur,col])=>{{
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Wallpaper</div>';
     html += dsStatusRow('wallpaper', 'Current', (cur.path||'Default').split('/').pop(), 'var(--hart-accent)');
@@ -2706,7 +2715,7 @@ function loadWallpaperPanel(el) {{
 
 // ═══ Keyboard & Input Methods ═══
 function loadInputMethodsPanel(el) {{
-  fetch(SHELL+'/api/shell/input-methods',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/input-methods',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const layout = data.layout||'us';
     const variant = data.variant||'';
     const methods = data.input_methods||[];
@@ -2736,7 +2745,7 @@ function loadNightLightPanel(el) {{
 
 // ═══ Workspaces ═══
 function loadWorkspacesPanel(el) {{
-  fetch(SHELL+'/api/shell/workspaces',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/workspaces',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const ws = data.workspaces||[];
     const current = data.current||1;
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Workspaces</div>'+
@@ -2787,7 +2796,7 @@ function loadImageViewerPanel(el) {{
 
 // ═══ Notes ═══
 function loadNotesAppPanel(el) {{
-  fetch(SHELL+'/api/shell/notes',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/notes',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const notes = data.notes||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Notes</span>'+
       dsBtn('New',{{variant:'primary',cls:'ds-btn-sm',onclick:"dsPrompt('New Note','',{{placeholder:'Write your note...',okLabel:'Save'}}).then(c=>{{if(!c)return;fetch(SHELL+'/api/shell/notes',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{content:c}})}}).then(()=>loadNotesAppPanel(document.getElementById('sys-notes_app')))}})"}})+'</div>';
@@ -2818,7 +2827,7 @@ function appStoreSearch() {{
   const r = document.getElementById('appstore-results');
   if(!q||!r||!q.value.trim()) return;
   r.innerHTML = dsSkeleton('panel',2);
-  fetch(SHELL+'/api/apps/search?q='+encodeURIComponent(q.value),{{signal:AbortSignal.timeout(15000)}}).then(r2=>r2.json()).then(data=>{{
+  fetch(SHELL+'/api/apps/search?q='+encodeURIComponent(q.value),{{signal:_sig(15000)}}).then(r2=>r2.json()).then(data=>{{
     const pkgs = data.results||[];
     if(pkgs.length===0) {{ r.innerHTML='<div class="ds-body-md ds-text-muted">No packages found</div>'; return; }}
     r.innerHTML = pkgs.slice(0,15).map(p=>
@@ -2832,7 +2841,7 @@ function appStoreSearch() {{
 
 // ═══ App Permissions ═══
 function loadAppPermissionsPanel(el) {{
-  fetch(SHELL+'/api/apps/installed',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/apps/installed',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const apps = data.apps||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">App Permissions</div><div class="ds-stagger">';
     if(apps.length===0) html += '<div class="ds-body-md ds-text-muted">No apps installed</div>';
@@ -2847,7 +2856,7 @@ function loadAppPermissionsPanel(el) {{
 
 // ═══ Battery Monitor ═══
 function loadBatteryMonitorPanel(el) {{
-  fetch(SHELL+'/api/shell/battery',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/battery',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const pct = data.percent||0;
     const charging = data.charging||false;
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Battery</div>'+
@@ -2865,8 +2874,8 @@ function loadBatteryMonitorPanel(el) {{
 // ═══ WiFi Manager ═══
 function loadWiFiManagerPanel(el) {{
   Promise.all([
-    fetch(SHELL+'/api/shell/wifi/status',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
-    fetch(SHELL+'/api/shell/wifi/scan',{{signal:AbortSignal.timeout(8000)}}).then(r=>r.json()).catch(()=>({{}}))
+    fetch(SHELL+'/api/shell/wifi/status',{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+'/api/shell/wifi/scan',{{signal:_sig(8000)}}).then(r=>r.json()).catch(()=>({{}}))
   ]).then(([status,scan])=>{{
     const connected = status.connected||{{}};
     const networks = scan.networks||[];
@@ -2895,7 +2904,7 @@ function loadWiFiManagerPanel(el) {{
 
 // ═══ VPN Manager ═══
 function loadVPNManagerPanel(el) {{
-  fetch(SHELL+'/api/shell/vpn/list',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/vpn/list',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const vpns = data.connections||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">VPN</span>'+
       dsBtn('Import',{{variant:'secondary',cls:'ds-btn-sm',onclick:"dsPrompt('Import VPN','Enter WireGuard config path',{{placeholder:'/path/to/wg0.conf',okLabel:'Import'}}).then(p=>{{if(!p)return;fetch(SHELL+'/api/shell/vpn/import',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{config_path:p,type:'wireguard'}})}}).then(r=>r.json()).then(d=>{{showToast('VPN',d.message||'Imported','success');loadVPNManagerPanel(document.getElementById('sys-vpn_manager'))}})}})"}})+'</div><div class="ds-stagger">';
@@ -2915,7 +2924,7 @@ function loadVPNManagerPanel(el) {{
 
 // ═══ Trash Bin ═══
 function loadTrashBinPanel(el) {{
-  fetch(SHELL+'/api/shell/trash',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/trash',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const items = data.items||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Trash</span>'+
       (items.length>0?dsBtn('Empty Trash',{{variant:'secondary',cls:'ds-btn-sm',onclick:"dsConfirm('Empty Trash','Permanently delete all items?',{{okLabel:'Empty',danger:true}}).then(ok=>{{if(!ok)return;fetch(SHELL+'/api/shell/trash/empty',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}}).then(()=>loadTrashBinPanel(document.getElementById('sys-trash_bin')))}})"}}):'')+
@@ -2944,7 +2953,7 @@ function loadWebcamViewerPanel(el) {{
 
 // ═══ Scanner ═══
 function loadScannerPanel(el) {{
-  fetch(SHELL+'/api/shell/scanner/list',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/scanner/list',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const scanners = data.scanners||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Scanner</div><div class="ds-stagger">';
     if(scanners.length===0) html += '<div class="ds-body-md ds-text-muted">No scanners detected</div>';
@@ -2966,7 +2975,7 @@ function loadWeatherPanel(el) {{
 }}
 
 function loadEventLog(el) {{
-  fetch(SHELL+'/api/shell/events',{{signal:AbortSignal.timeout(3000)}})
+  fetch(SHELL+'/api/shell/events',{{signal:_sig(3000)}})
     .then(r=>r.json()).then(data=>{{
       const events = data.events||[];
       el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Events</div>'+
@@ -2981,7 +2990,7 @@ function loadEventLog(el) {{
 }}
 
 function loadDriversPanel(el) {{
-  fetch(SHELL+'/api/shell/drivers',{{signal:AbortSignal.timeout(5000)}})
+  fetch(SHELL+'/api/shell/drivers',{{signal:_sig(5000)}})
     .then(r=>r.json()).then(data=>{{
       const devs = data.devices||[];
       el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Drivers &amp; Devices</div>'+
@@ -3020,7 +3029,7 @@ function setSourceVolume(srcId, vol) {{
 }}
 
 function loadAudioPanel(el) {{
-  fetch(SHELL+'/api/shell/audio',{{signal:AbortSignal.timeout(5000)}})
+  fetch(SHELL+'/api/shell/audio',{{signal:_sig(5000)}})
     .then(r=>r.json()).then(data=>{{
       const sinks = data.sinks||[];
       const sources = data.sources||[];
@@ -3059,7 +3068,7 @@ function loadAudioPanel(el) {{
 }}
 
 function loadBluetoothPanel(el) {{
-  fetch(SHELL+'/api/shell/bluetooth',{{signal:AbortSignal.timeout(5000)}})
+  fetch(SHELL+'/api/shell/bluetooth',{{signal:_sig(5000)}})
     .then(r=>r.json()).then(data=>{{
       const devs = data.devices||[];
       el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Bluetooth</div>'+
@@ -3070,7 +3079,7 @@ function loadBluetoothPanel(el) {{
 }}
 
 function loadPowerPanel(el) {{
-  fetch(SHELL+'/api/shell/power',{{signal:AbortSignal.timeout(5000)}})
+  fetch(SHELL+'/api/shell/power',{{signal:_sig(5000)}})
     .then(r=>r.json()).then(data=>{{
       const pct = data.percent||100;
       const state = data.state||'unknown';
@@ -3105,7 +3114,7 @@ function setBrightness(output, val) {{
 }}
 
 function loadDisplayPanel(el) {{
-  fetch(SHELL+'/api/shell/display',{{signal:AbortSignal.timeout(5000)}})
+  fetch(SHELL+'/api/shell/display',{{signal:_sig(5000)}})
     .then(r=>r.json()).then(data=>{{
       const displays = data.displays||[];
       if(displays.length===0) {{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px;font-size:32px;opacity:0.3">desktop_access_disabled</span>No displays detected</div>'; return; }}
@@ -3158,7 +3167,7 @@ function rdConnect() {{
 }}
 
 function loadRemoteDesktopPanel(el, apis) {{
-  Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))))
+  Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}}))))
     .then(([status,engines,sessions])=>{{
       const did = status.formatted_id || 'Unknown';
       const deviceId = status.device_id || '';
@@ -3893,7 +3902,7 @@ function renderAgentOverlay(ev) {{
     if(MANIFEST[target] || SYSTEM_PANELS[target]) {{
       openPanel(target, ev.params||{{}});
     }} else if(target.indexOf('/api/') === 0 && target.indexOf('..') === -1) {{
-      fetch(SHELL+target, {{method:'GET',signal:AbortSignal.timeout(5000)}}).catch(function(){{}});
+      fetch(SHELL+target, {{method:'GET',signal:_sig(5000)}}).catch(function(){{}});
     }}
     // External URLs and arbitrary paths are BLOCKED — prevents SSRF/open redirect
     // Minimal overlay confirmation
@@ -3921,7 +3930,7 @@ function renderAgentOverlay(ev) {{
 
 // ═══ Recent Files in Start Menu ═══
 (function loadRecentFiles() {{
-  fetch(SHELL+'/api/shell/files/recent',{{signal:AbortSignal.timeout(3000)}})
+  fetch(SHELL+'/api/shell/files/recent',{{signal:_sig(3000)}})
     .then(function(r){{return r.json();}}).then(function(data) {{
       const files = data.files || [];
       if(files.length === 0) return;
@@ -3943,8 +3952,8 @@ function renderAgentOverlay(ev) {{
 (function loginGreeting() {{
   if(PERF.potato) return;
   Promise.all([
-    fetch(BACKEND+'/api/social/dashboard/agents',{{signal:AbortSignal.timeout(3000)}}).then(function(r){{return r.json();}}).catch(function(){{return {{}}; }}),
-    fetch(BACKEND+'/api/social/dashboard/health',{{signal:AbortSignal.timeout(3000)}}).then(function(r){{return r.json();}}).catch(function(){{return {{}}; }}),
+    fetch(BACKEND+'/api/social/dashboard/agents',{{signal:_sig(3000)}}).then(function(r){{return r.json();}}).catch(function(){{return {{}}; }}),
+    fetch(BACKEND+'/api/social/dashboard/health',{{signal:_sig(3000)}}).then(function(r){{return r.json();}}).catch(function(){{return {{}}; }}),
   ]).then(function([agents,health]) {{
     const agentCount = (agents.agents||[]).filter(function(a){{return a.status==='running';}}).length;
     const peerCount = health.peer_count || 0;
