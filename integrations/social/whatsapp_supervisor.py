@@ -236,18 +236,20 @@ def ensure_baileys_deps() -> bool:
     return True
 
 
-# ── Supervisor (mirrors livekit_supervisor._Supervisor) ──────────────
-class _Supervisor:
+from core.process_supervisor import ProcessSupervisor
+
+
+# ── Supervisor (spawn/stream/backoff loop in core.process_supervisor, #110) ──
+class _Supervisor(ProcessSupervisor):
     """One per process.  Daemon thread → exits cleanly with parent."""
 
+    name = 'whatsapp'
+    # node missing at spawn → stop retrying (matches the original
+    # FileNotFoundError break) instead of backing off forever.
+    fatal_spawn_errors = (FileNotFoundError,)
+
     def __init__(self) -> None:
-        self.proc: Optional[subprocess.Popen] = None
-        self.thread: Optional[threading.Thread] = None
-        self.stop_event = threading.Event()
-        self.last_error: Optional[str] = None
-        self.last_started: Optional[float] = None
-        self.restart_count = 0
-        self.lock = threading.Lock()
+        super().__init__()
 
     def info(self) -> Dict[str, Any]:
         running = bool(self.proc and self.proc.poll() is None)
@@ -285,97 +287,37 @@ class _Supervisor:
             logger.info("whatsapp_supervisor: %s", self.last_error)
             return self.info()
 
-        self.thread = threading.Thread(
-            target=self._run, daemon=True, name='whatsapp-supervisor')
-        self.thread.start()
+        self._spawn_thread()
         return self.info()
 
-    def stop(self) -> None:
-        self.stop_event.set()
-        with self.lock:
-            if self.proc and self.proc.poll() is None:
-                try:
-                    self.proc.terminate()
-                    try:
-                        self.proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        self.proc.kill()
-                except OSError:
-                    pass
-
-    def _run(self) -> None:
+    def _build_popen(self):
         from core.subprocess_safe import hidden_popen_kwargs
         node = ensure_node() or 'node'
         gateway_js = _gateway_dir() / 'gateway.js'
         env = os.environ.copy()
         env['WHATSAPP_GATEWAY_PORT'] = str(_gateway_port())
         env['HEVOLVE_HOME'] = str(_hevolve_home())
+        cmd = [node, str(gateway_js)]
+        return cmd, dict(
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=str(_gateway_dir()),
+            env=env,
+            text=True,
+            bufsize=1,  # line-buffered for line-by-line drain
+            **hidden_popen_kwargs(),
+        )
 
-        backoff = 1.0
-        while not self.stop_event.is_set():
-            try:
-                cmd = [node, str(gateway_js)]
-                logger.info(
-                    "whatsapp_supervisor: spawning %s on port %d",
-                    ' '.join(cmd), _gateway_port())
-                with self.lock:
-                    self.proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        cwd=str(_gateway_dir()),
-                        env=env,
-                        text=True,
-                        bufsize=1,  # line-buffered for line-by-line drain
-                        **hidden_popen_kwargs(),
-                    )
-                    self.last_started = time.time()
-                    self.restart_count += 1
-
-                # Drain stdout into logger so operators see what
-                # Baileys is doing without a separate log file.  Lines
-                # are JSON when emitted by gateway.js (matches
-                # livekit_supervisor's stdout-streaming idiom).
-                if self.proc.stdout is not None:
-                    for raw in self.proc.stdout:
-                        if self.stop_event.is_set():
-                            break
-                        line = raw.rstrip()
-                        if not line:
-                            continue
-                        # Try JSON event; fall back to plain text.
-                        try:
-                            payload = json.loads(line)
-                            event = payload.get('event') or 'log'
-                            logger.info(
-                                "whatsapp_supervisor: %s %s",
-                                event,
-                                {k: v for k, v in payload.items()
-                                 if k != 'event'},
-                            )
-                        except (ValueError, AttributeError):
-                            logger.info("whatsapp_supervisor: %s", line)
-
-                rc = self.proc.wait() if self.proc else None
-                self.last_error = f'gateway exited rc={rc}'
-                if self.stop_event.is_set():
-                    break
-                logger.warning(
-                    "whatsapp_supervisor: gateway exited rc=%s; "
-                    "respawning in %.1fs", rc, backoff)
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
-            except FileNotFoundError as e:
-                self.last_error = f'node not found: {e}'
-                logger.error("whatsapp_supervisor: %s", self.last_error)
-                break
-            except Exception as e:  # noqa: BLE001 — supervisor catches all
-                self.last_error = f'spawn error: {e}'
-                logger.exception("whatsapp_supervisor: spawn error")
-                if self.stop_event.is_set():
-                    break
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
+    def _format_stdout_line(self, line: str) -> None:
+        # gateway.js emits JSON events; fall back to plain text.
+        try:
+            payload = json.loads(line)
+            event = payload.get('event') or 'log'
+            logger.info(
+                "whatsapp_supervisor: %s %s", event,
+                {k: v for k, v in payload.items() if k != 'event'})
+        except (ValueError, AttributeError):
+            logger.info("whatsapp_supervisor: %s", line)
 
 
 _supervisor: Optional[_Supervisor] = None

@@ -512,24 +512,24 @@ def _port_in_use(port: int) -> bool:
         return False
 
 
+from core.process_supervisor import ProcessSupervisor
+
+
 # ── Supervisor lifecycle ──────────────────────────────────────────────
-class _Supervisor:
+class _Supervisor(ProcessSupervisor):
     """Single instance per HARTOS process.  Started by start_supervisor()
     and lives for the lifetime of the process.  Daemon thread → exits
-    cleanly when the parent dies.
+    cleanly when the parent dies.  The spawn/stream/backoff loop + stop()
+    live in core.process_supervisor.ProcessSupervisor (#110).
     """
 
+    name = 'livekit'
+
     def __init__(self) -> None:
-        self.proc: Optional[subprocess.Popen] = None
+        super().__init__()
         self.binary: Optional[Path] = None
         self.config: Optional[Path] = None
-        self.thread: Optional[threading.Thread] = None
-        self.stop_event = threading.Event()
-        self.last_error: Optional[str] = None
-        self.last_started: Optional[float] = None
-        self.restart_count = 0
         self.url: str = get_livekit_url()
-        self.lock = threading.Lock()
 
     def start(self) -> Dict[str, Any]:
         """Provision keys + binary + config; spawn the supervisor thread.
@@ -559,70 +559,23 @@ class _Supervisor:
             logger.info("livekit_supervisor: %s", self.last_error)
             return self.info()
 
-        self.thread = threading.Thread(
-            target=self._run, daemon=True, name='livekit-supervisor')
-        self.thread.start()
+        self._spawn_thread()
         return self.info()
 
-    def stop(self) -> None:
-        self.stop_event.set()
-        with self.lock:
-            if self.proc and self.proc.poll() is None:
-                try:
-                    self.proc.terminate()
-                    try:
-                        self.proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        self.proc.kill()
-                except OSError:
-                    pass
+    def _build_popen(self):
+        # Hide the cmd console window on Windows via the canonical
+        # core.subprocess_safe.hidden_popen_kwargs (no inline os.name checks).
+        from core.subprocess_safe import hidden_popen_kwargs
+        cmd = [str(self.binary), '--config', str(self.config)]
+        return cmd, dict(
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=str(_livekit_home()),
+            **hidden_popen_kwargs(),
+        )
 
-    def _run(self) -> None:
-        backoff = 1.0
-        while not self.stop_event.is_set():
-            try:
-                cmd = [str(self.binary), '--config', str(self.config)]
-                logger.info("livekit_supervisor: spawning %s", ' '.join(cmd))
-                # Hide the cmd console window on Windows — the supervisor
-                # already streams stdout to logger.info above.  Routes
-                # through core.subprocess_safe.hidden_popen_kwargs so
-                # every site uses the same canonical helper instead of
-                # drifting inline `os.name == 'nt'` checks.
-                from core.subprocess_safe import hidden_popen_kwargs
-                with self.lock:
-                    self.proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        cwd=str(_livekit_home()),
-                        **hidden_popen_kwargs(),
-                    )
-                    self.last_started = time.time()
-                # Stream output to logger so operators see what's happening
-                # without needing to tail the binary's own log file.
-                if self.proc.stdout is not None:
-                    for raw in self.proc.stdout:
-                        if self.stop_event.is_set():
-                            break
-                        line = raw.decode('utf-8', errors='replace').rstrip()
-                        if line:
-                            logger.info('livekit-server: %s', line)
-                rc = self.proc.wait()
-                if self.stop_event.is_set():
-                    return
-                self.last_error = f'livekit-server exited rc={rc}'
-                logger.warning("livekit_supervisor: %s", self.last_error)
-            except Exception as e:
-                self.last_error = f'spawn failed: {e}'
-                logger.error("livekit_supervisor: %s", self.last_error,
-                             exc_info=True)
-
-            # Exponential backoff capped at 60s.
-            self.restart_count += 1
-            wait = min(backoff, 60.0)
-            backoff = min(backoff * 2.0, 60.0)
-            if self.stop_event.wait(wait):
-                return
+    def _format_stdout_line(self, line: str) -> None:
+        logger.info('livekit-server: %s', line)
 
     def info(self) -> Dict[str, Any]:
         running = (

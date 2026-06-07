@@ -441,26 +441,35 @@ _JOB = _JobHandle()
 
 
 # -- Supervisor lifecycle ---------------------------------------------
-class _Supervisor:
+from core.process_supervisor import ProcessSupervisor
+
+
+class _Supervisor(ProcessSupervisor):
     """Owns the HevolveAI uvicorn subprocess for the lifetime of HARTOS.
 
     Daemon thread; the OS-level Job Object KILL_ON_JOB_CLOSE flag is the
     primary kill mechanism on Windows.  ``stop()`` is the graceful
-    secondary path for clean HARTOS shutdown.
+    secondary path for clean HARTOS shutdown.  The spawn/stream/backoff loop
+    lives in core.process_supervisor.ProcessSupervisor (#110); the #59
+    fast-fail/unhealthy circuit breakers + Windows Job-Object bind + governor
+    registration live in the _on_started / _on_child_exit hooks below.
     """
 
+    name = 'hevolveai'
+    # #59: reset the backoff after a healthy run so a transient crash after
+    # hours of uptime respawns promptly (the base resets at this uptime).
+    reset_backoff_after = 60.0
+
     def __init__(self) -> None:
-        self.proc: Optional[subprocess.Popen] = None
-        self.thread: Optional[threading.Thread] = None
-        self.stop_event = threading.Event()
-        self.lock = threading.Lock()
-        self.last_error: Optional[str] = None
-        self.last_started: Optional[float] = None
-        self.restart_count = 0
+        super().__init__()
         self.python_exe: str = _resolve_python_exe()
         self.pythonpath: Optional[str] = _resolve_hevolveai_pythonpath()
         self.port: int = _hevolveai_port()
         self.api_url: str = _hevolveai_api_url()
+        # Circuit-breaker state — persisted across respawns (see _on_child_exit).
+        self._consecutive_fast_fails = 0
+        self._consecutive_unhealthy = 0
+        self._current_pid: Optional[int] = None
 
     def start(self) -> Dict[str, Any]:
         """Idempotent -- call once from HARTOS bootstrap."""
@@ -488,9 +497,7 @@ class _Supervisor:
         if sys.platform == 'win32' and _JOB.handle is None:
             _JOB.create()
 
-        self.thread = threading.Thread(
-            target=self._run, daemon=True, name='hevolveai-supervisor')
-        self.thread.start()
+        self._spawn_thread()
 
         # Best-effort atexit terminate so dev-mode (no Job Object) also
         # cleans up.  Windows already has KILL_ON_JOB_CLOSE; the duplicate
@@ -695,121 +702,60 @@ class _Supervisor:
             logger.debug(
                 "hevolveai_supervisor: mode-changed handler error: %s", e)
 
-    def _run(self) -> None:
-        """Supervise loop -- spawn, stream output, restart with backoff.
+    def _build_popen(self):
+        cmd = self._build_cmd()
+        kw = self._popen_kwargs()
+        kw['env'] = self._build_env()
+        return cmd, kw
 
-        Backoff is exponential capped at 60s, matching the LiveKit
-        supervisor (which also restarts external binaries).
+    def _on_started(self, proc) -> None:
+        self._current_pid = proc.pid
+        # Bind to the Job Object FIRST -- even a few ms of unbound runtime is
+        # enough for a Nunba crash to orphan the child.  proc._handle is the
+        # canonical Windows process HANDLE AssignProcessToJobObject needs.
+        if sys.platform == 'win32' and _JOB.handle is not None:
+            _JOB.assign(getattr(proc, '_handle', 0))
+        self._register_with_governor(self._current_pid)
+
+    def _format_stdout_line(self, line: str) -> None:
+        logger.info('hevolveai: %s', line)
+
+    def _on_child_exit(self, rc, uptime) -> bool:
+        """#59 circuit breakers. The pre-spawn _hevolveai_available check is the
+        primary guard; these catch a child that imports fine but crashes on
+        every start. FAST: exits faster than _FAST_FAIL_S = instant misconfig.
+        SLOW: a child that loads its model (eating VRAM), runs 10-30s, then
+        crashes every time churns VRAM/CPU without tripping the fast breaker
+        (live 2026-06-01: 14-22s uptime, 8x, free VRAM 7.8->3.0GB starved the
+        flywheel). Disable after N consecutive unhealthy exits in a row. (The
+        backoff reset after a healthy run is the base's reset_backoff_after=60.)
         """
-        backoff = 1.0
-        # Defense-in-depth circuit breaker (supervisor_should_run's
-        # pre-spawn _hevolveai_available check is the primary guard;
-        # this catches a child that IS importable but crashes on every
-        # start anyway -- broken install, missing model weights, port
-        # bind race).  Count consecutive sub-_FAST_FAIL_S exits; after
-        # _FAST_FAIL_LIMIT in a row, stop looping and disable until an
-        # explicit restart, instead of spinning at the 60s cap forever.
-        _FAST_FAIL_S = 5.0       # exit faster than this = instant misconfig
-        _FAST_FAIL_LIMIT = 5     # 5 instant exits in a row -> disable
-        # ALSO catch SLOW crash-loops: a child that starts, loads its model
-        # (eating VRAM), runs ~10-30s, then crashes EVERY time is just as
-        # fatal — it churns VRAM/CPU forever without ever tripping the
-        # sub-5s breaker.  Live 2026-06-01: hevolveai crashed at 14-22s
-        # uptime (TypeError in its own code), spawned 8x, the fast-fail
-        # breaker never fired, and the VRAM/CPU churn (free VRAM 7.8->3.0GB)
-        # starved the flywheel via model_pressure.  Treat an exit within
-        # _UNHEALTHY_S of start as "never got healthy" and disable after
-        # _UNHEALTHY_LIMIT in a row.
-        _UNHEALTHY_S = 60.0
-        _UNHEALTHY_LIMIT = 6
-        _consecutive_fast_fails = 0
-        _consecutive_unhealthy = 0
-        while not self.stop_event.is_set():
-            cmd = self._build_cmd()
-            env = self._build_env()
-            popen_kw = self._popen_kwargs()
-            logger.info(
-                "hevolveai_supervisor: spawning %s (port=%d, "
-                "pythonpath=%s)",
-                ' '.join(cmd), self.port,
-                self.pythonpath or '<bundled>')
-            try:
-                with self.lock:
-                    self.proc = subprocess.Popen(cmd, env=env, **popen_kw)
-                    self.last_started = time.time()
-                pid = self.proc.pid
-
-                # Bind to Job Object FIRST -- even a few ms of unbound
-                # runtime is enough for a Nunba crash to orphan the
-                # child.  ``self.proc._handle`` is the canonical Windows
-                # process HANDLE that ``AssignProcessToJobObject`` needs.
-                if sys.platform == 'win32' and _JOB.handle is not None:
-                    _JOB.assign(getattr(self.proc, '_handle', 0))
-
-                self._register_with_governor(pid)
-
-                # Stream child output to logger so operators see startup
-                # progress without tailing the child's own log file.
-                if self.proc.stdout is not None:
-                    for raw in self.proc.stdout:
-                        if self.stop_event.is_set():
-                            break
-                        line = raw.decode('utf-8', errors='replace').rstrip()
-                        if line:
-                            logger.info('hevolveai: %s', line)
-                rc = self.proc.wait()
-                self._unregister_from_governor(pid)
-                if self.stop_event.is_set():
-                    return
-                self.last_error = f'hevolveai exited rc={rc}'
-                logger.warning(
-                    "hevolveai_supervisor: %s", self.last_error)
-                # Track consecutive FAST failures (child died almost
-                # immediately = misconfiguration, not a transient crash).
-                _uptime = (time.time() - self.last_started
-                           if self.last_started is not None else 0.0)
-                if _uptime < _FAST_FAIL_S:
-                    _consecutive_fast_fails += 1
-                else:
-                    _consecutive_fast_fails = 0
-                # Slow crash-loop guard: exit within _UNHEALTHY_S of start =
-                # the child never reached a healthy steady state.
-                if _uptime < _UNHEALTHY_S:
-                    _consecutive_unhealthy += 1
-                else:
-                    _consecutive_unhealthy = 0
-                # Reset backoff if the child stayed up long enough to be
-                # considered healthy: a transient crash after hours of
-                # uptime should restart promptly, not wait the last 60s
-                # backoff accumulated during an earlier crash storm.
-                if (self.last_started is not None
-                        and (time.time() - self.last_started) > 60.0):
-                    backoff = 1.0
-                if (_consecutive_fast_fails >= _FAST_FAIL_LIMIT
-                        or _consecutive_unhealthy >= _UNHEALTHY_LIMIT):
-                    _n = max(_consecutive_fast_fails, _consecutive_unhealthy)
-                    _window = (_FAST_FAIL_S
-                               if _consecutive_fast_fails >= _FAST_FAIL_LIMIT
-                               else _UNHEALTHY_S)
-                    self.last_error = (
-                        f'hevolveai exited rc={rc} unhealthily {_n}x in a row '
-                        f'(uptime <{_window:.0f}s each) -- DISABLING supervisor '
-                        f'(broken install / crashing child / missing weights). '
-                        f'Restart Nunba or fix the install to re-enable.')
-                    logger.error(
-                        "hevolveai_supervisor: %s", self.last_error)
-                    return
-            except Exception as e:
-                self.last_error = f'spawn failed: {e}'
-                logger.error(
-                    "hevolveai_supervisor: %s",
-                    self.last_error, exc_info=True)
-
-            self.restart_count += 1
-            wait = min(backoff, 60.0)
-            backoff = min(backoff * 2.0, 60.0)
-            if self.stop_event.wait(wait):
-                return
+        if self._current_pid is not None:
+            self._unregister_from_governor(self._current_pid)
+        _FAST_FAIL_S, _FAST_FAIL_LIMIT = 5.0, 5
+        _UNHEALTHY_S, _UNHEALTHY_LIMIT = 60.0, 6
+        if uptime < _FAST_FAIL_S:
+            self._consecutive_fast_fails += 1
+        else:
+            self._consecutive_fast_fails = 0
+        if uptime < _UNHEALTHY_S:
+            self._consecutive_unhealthy += 1
+        else:
+            self._consecutive_unhealthy = 0
+        if (self._consecutive_fast_fails >= _FAST_FAIL_LIMIT
+                or self._consecutive_unhealthy >= _UNHEALTHY_LIMIT):
+            _n = max(self._consecutive_fast_fails, self._consecutive_unhealthy)
+            _window = (_FAST_FAIL_S
+                       if self._consecutive_fast_fails >= _FAST_FAIL_LIMIT
+                       else _UNHEALTHY_S)
+            self.last_error = (
+                f'hevolveai exited rc={rc} unhealthily {_n}x in a row '
+                f'(uptime <{_window:.0f}s each) -- DISABLING supervisor '
+                f'(broken install / crashing child / missing weights). '
+                f'Restart Nunba or fix the install to re-enable.')
+            logger.error("hevolveai_supervisor: %s", self.last_error)
+            return True
+        return False
 
     def info(self) -> Dict[str, Any]:
         running = (
