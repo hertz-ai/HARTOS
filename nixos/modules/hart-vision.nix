@@ -45,6 +45,11 @@ in
 
       environment = {
         HART_VISION_PORT = toString cfg.ports.vision;
+        # minicpm_server.py runs as a script (not `-m`), so Python puts the
+        # script's own dir on sys.path[0], NOT the app root — `import core` then
+        # raises ModuleNotFoundError ("No module named 'core'", the crash that
+        # looped hart-vision 88× on the ISO). Put the app root on PYTHONPATH.
+        PYTHONPATH = "${hartApp}";
         PYTHONDONTWRITEBYTECODE = "1";
         PYTHONUNBUFFERED = "1";
       };

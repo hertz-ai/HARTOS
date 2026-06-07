@@ -47,7 +47,9 @@ in
 
         Restart = "on-failure";
         RestartSec = 5;
-        WatchdogSec = 120;
+        # No WatchdogSec: waitress never sends sd_notify(WATCHDOG=1), so a watchdog
+        # timer would SIGABRT the backend every 120s once it is actually serving.
+        # Restart=on-failure still covers real crashes.
         TimeoutStartSec = 30;
         TimeoutStopSec = 15;
 

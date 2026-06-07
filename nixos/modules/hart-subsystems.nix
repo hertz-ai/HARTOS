@@ -234,9 +234,16 @@ in
       # Android Runtime service (native daemon, not container)
       systemd.services.hart-android-runtime = {
         description = "HART OS Android Native Runtime";
-        after = [ "hart.target" "graphical.target" ];
+        # Was: after=[hart.target graphical.target], wantedBy=[multi-user.target].
+        # graphical.target is ordered AFTER multi-user.target, so being pulled in
+        # by multi-user.target while ordered after graphical.target formed an
+        # ordering cycle (multi-user -> android -> graphical -> multi-user) that
+        # systemd broke by SKIPPING the Android runtime (and the Wine bridge as
+        # collateral). The runtime only needs binder + hart.target, so make it a
+        # plain hart.target child like every other HART service.
+        after = [ "hart.target" ];
         wants = [ "hart.target" ];
-        wantedBy = [ "multi-user.target" ];
+        wantedBy = [ "hart.target" ];
 
         serviceConfig = {
           Type = "notify";

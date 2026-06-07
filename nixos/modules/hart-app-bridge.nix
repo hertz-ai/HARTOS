@@ -137,6 +137,9 @@ in
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
 
+        # curl is NOT on the unit's minimal PATH (the Model-Bus probe uses it).
+        path = with pkgs; [ curl coreutils ];
+
         environment = {
           HEVOLVE_DATA_DIR = cfg.dataDir;
           HEVOLVE_DB_PATH = "${cfg.dataDir}/hevolve_database.db";
@@ -232,7 +235,9 @@ in
 
           Restart = "on-failure";
           RestartSec = 5;
-          WatchdogSec = 60;
+          # No WatchdogSec: AppBridgeService.serve_forever() sends READY=1 once but
+          # never periodic sd_notify(WATCHDOG=1) → systemd watchdog-killed it every
+          # 60s on the ISO. Restart still covers genuine crashes.
 
           # Resource limits
           Slice = "hart-agents.slice";

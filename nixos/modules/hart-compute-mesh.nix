@@ -165,7 +165,7 @@ in
             # Derive mesh device ID from node identity
             if [[ -f "${cfg.dataDir}/node_public.key" ]]; then
               # Use first 4 bytes of node public key as device index
-              DEVICE_IDX=$(xxd -p "${cfg.dataDir}/node_public.key" | head -c 4)
+              DEVICE_IDX=$(${pkgs.xxd}/bin/xxd -p "${cfg.dataDir}/node_public.key" | head -c 4)
               DEVICE_NUM=$((16#$DEVICE_IDX % 65534 + 1))
               echo "$DEVICE_NUM" > "$KEY_DIR/device_index"
               echo "[HART OS Mesh] Device index: $DEVICE_NUM"
@@ -294,7 +294,9 @@ in
 
           Restart = "on-failure";
           RestartSec = 10;
-          WatchdogSec = 120;
+          # No WatchdogSec: ComputeMeshService.serve_forever() sends READY=1 once
+          # but never periodic sd_notify(WATCHDOG=1) → watchdog self-kill. (Primary
+          # fix is mesh-keygen's xxd store-path so the mesh keys exist at all.)
 
           # Resource limits
           Slice = "hart-agents.slice";

@@ -150,6 +150,10 @@ in
         wants = [ "hart-backend.service" ];
         wantedBy = [ "hart.target" ];
 
+        # curl is NOT on the unit's minimal PATH; the backend-detection probes
+        # need it (without it the bus believes no backends are available).
+        path = with pkgs; [ curl coreutils ];
+
         environment = {
           HEVOLVE_DATA_DIR = cfg.dataDir;
           HEVOLVE_DB_PATH = "${cfg.dataDir}/hevolve_database.db";
@@ -256,7 +260,9 @@ in
 
           Restart = "on-failure";
           RestartSec = 5;
-          WatchdogSec = 60;
+          # No WatchdogSec: ModelBusService.serve_forever() sends READY=1 once but
+          # never the periodic sd_notify(WATCHDOG=1), so systemd SIGABRT-killed the
+          # bus every 60s (watchdog loop on the ISO). Restart still covers crashes.
 
           # Resource limits
           Slice = "hart-agents.slice";

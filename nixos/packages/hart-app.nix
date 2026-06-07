@@ -13,6 +13,11 @@ let
     flask
     waitress
     requests
+    beautifulsoup4  # bs4 — imported at hart_intelligence_entry startup (web
+                    # scraping / crawl4ai). Its absence is the "No module named
+                    # 'bs4'" that killed hart-backend on the first ISO boot:
+                    # waitress prints the import error and exits 0, so
+                    # Restart=on-failure never fires and the backend stays dead.
     pydantic  # 1.10.x series from nixpkgs 24.11
 
     # Database

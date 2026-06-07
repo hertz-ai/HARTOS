@@ -66,7 +66,12 @@ let
   # WebKit2-4.1 *typelibs* live in these packages and must be on GI_TYPELIB_PATH
   # — the cage kiosk session sets no such path, so without this every
   # gi.require_version() raises and the shell window dies on launch.
-  giTypelibPath = lib.makeSearchPath "lib/girepository-1.0" (with pkgs; [
+  # makeSearchPathOutput "out": the GObject / GLib / Gtk typelibs live in each
+  # package's `out` output, but several of these (glib, gtk3, ...) have a
+  # non-`out` DEFAULT output (bin/dev), so plain makeSearchPath pointed at the
+  # wrong store path and `gi` failed with "Typelib file for namespace 'GObject',
+  # version '2.0' not found" — the glass-shell SIGABRT (status=6) on the ISO.
+  giTypelibPath = lib.makeSearchPathOutput "out" "lib/girepository-1.0" (with pkgs; [
     glib gobject-introspection gtk3 webkitgtk_4_1
     pango gdk-pixbuf atk harfbuzz libsoup_3 cairo
   ]);
@@ -307,6 +312,10 @@ in
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
 
+        # curl is NOT on the unit's minimal PATH (the Model-Bus availability
+        # probe uses it).
+        path = with pkgs; [ curl coreutils ];
+
         environment = {
           HEVOLVE_DATA_DIR = cfg.dataDir;
           HEVOLVE_DB_PATH = "${cfg.dataDir}/hevolve_database.db";
@@ -380,7 +389,11 @@ in
 
           Restart = "on-failure";
           RestartSec = 5;
-          WatchdogSec = 30;
+          # No WatchdogSec: LiquidUIService.serve_forever() sends READY=1 once but
+          # never periodic sd_notify(WATCHDOG=1), so systemd SIGABRT-killed the
+          # server every 30s (status=6/ABRT watchdog loop on the ISO). NOTE: this
+          # is the headless LiquidUI SERVER; the GObject typelib crash was the
+          # separate cage glass-shell client (fixed via giTypelibPath above).
 
           # Resource limits — scale by variant
           Slice = "hart-agents.slice";

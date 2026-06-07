@@ -47,8 +47,8 @@ in
     ports = {
       backend = lib.mkOption {
         type = lib.types.port;
-        default = 677;
-        description = "Backend API port (OS-mode: 677, app-mode: 6777)";
+        default = 6777;
+        description = "Backend API port (Flask/Waitress). 6777 is non-privileged so the unprivileged hart user can bind it (677 is < 1024 and needs CAP_NET_BIND_SERVICE — the unit grants no such capability, and the hart-backend.nix header already documents 6777).";
       };
       discovery = lib.mkOption {
         type = lib.types.port;

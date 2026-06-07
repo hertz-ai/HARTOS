@@ -255,6 +255,12 @@ in
         after = [ "hart.target" ];
         wantedBy = [ "hart.target" ];
 
+        # lspci (pciutils) + systemd-notify are NOT on the unit's minimal PATH;
+        # bare `lspci` under `set -euo pipefail` killed the script before
+        # `systemd-notify --ready`, so this Type=notify unit timed out on start
+        # and auto-restart-looped on the ISO.
+        path = with pkgs; [ pciutils gnugrep systemd ];
+
         serviceConfig = {
           Type = "notify";
           User = "hart";
@@ -473,6 +479,11 @@ in
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
 
+        # awk (gawk) + curl + systemctl/journalctl are NOT on the unit's minimal
+        # PATH; bare `awk` (line ~497) under `set -euo pipefail` crash-looped this
+        # service 61x on the ISO.
+        path = with pkgs; [ gawk curl systemd coreutils ];
+
         serviceConfig = {
           Type = "simple";
           User = "hart";
@@ -557,6 +568,9 @@ in
         after = [ "hart.target" "hart-model-bus.service" ];
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
+
+        # curl is NOT on the unit's minimal PATH (the model-bus wait loop uses it).
+        path = with pkgs; [ curl coreutils ];
 
         serviceConfig = {
           Type = "simple";
@@ -721,6 +735,9 @@ in
         after = [ "hart.target" "hart-model-bus.service" ];
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
+
+        # curl on PATH so the prefetch warm-up calls actually reach the Model Bus.
+        path = with pkgs; [ curl coreutils ];
 
         serviceConfig = {
           Type = "simple";

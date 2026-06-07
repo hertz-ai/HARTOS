@@ -121,10 +121,15 @@ print(f'Node ID: {public_bytes.hex()[:16]}...')
     ENTRY="''${TIMESTAMP} | ''${NODE_ID} | ''${TIER} | ${cfg.variant}"
 
     # Sign with Ed25519 private key
-    SIGNATURE=$(${pythonWithCrypto}/bin/python3 -c "
+    SIGNATURE=$(HART_AUDIT_ENTRY="$ENTRY" ${pythonWithCrypto}/bin/python3 -c "
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+import os
 
-entry = '''$ENTRY'''
+# Read the entry from the environment, NOT interpolated into the Python source.
+# The previous triple-quote collapsed under Nix escaping to a double-quote and
+# produced a Python SyntaxError, so every boot-audit entry was UNSIGNED.
+# Env-passing is quote-safe for any content.
+entry = os.environ['HART_AUDIT_ENTRY']
 with open('$DATA_DIR/node_private.key', 'rb') as f:
     key_bytes = f.read()
 
@@ -146,7 +151,11 @@ print(signature.hex())
     chown hart:hart "$MARKER"
 
     # ─── Welcome message ───
-    IP=$(hostname -I 2>/dev/null | ${pkgs.gawk}/bin/awk '{print $1}')
+    # hostname is NOT on the unit's minimal PATH; bare `hostname` under
+    # `set -euo pipefail` exited the script right after the audit step (the
+    # service showed "failed" though all work was done). Reference it by store
+    # path and guard so the welcome banner can never fail the oneshot.
+    IP=$(${pkgs.nettools}/bin/hostname -I 2>/dev/null | ${pkgs.gawk}/bin/awk '{print $1}') || IP=""
     echo ""
     echo "============================================================"
     echo "  HART OS first boot complete!"
