@@ -153,6 +153,13 @@ def reconcile_orphaned_flow_recipes(prompt_id=None, prompts_dir: str | None = No
         list[tuple[str, int]] of (prompt_id, flow_idx) recipes written.
     """
     pdir = _resolve_prompts_dir(prompts_dir)
+    # The optimizer retires an underperforming recipe to {..}_recipe.json.optbak
+    # so the daemon re-CREATEs it WITH experience hints (Gate-4). Honour that
+    # marker: a flow mid-optimization must NOT be reconciled back from its
+    # unchanged action recipes (#111), or the archive instantly no-ops and the
+    # measure->improve loop never fires. Reuse the optimizer's own check so the
+    # .optbak suffix stays single-sourced (no parallel literal).
+    from core.flow_recipe_optimizer import has_pending_optimization
     reconciled: list[tuple[str, int]] = []
 
     for pid, flow_idxs in _flows_needing_reconcile(pdir, prompt_id).items():
@@ -164,6 +171,8 @@ def reconcile_orphaned_flow_recipes(prompt_id=None, prompts_dir: str | None = No
             recipe_path = os.path.join(pdir, f'{pid}_{flow_idx}_recipe.json')
             if os.path.exists(recipe_path):
                 continue  # already saved — never overwrite
+            if has_pending_optimization(pid, flow_idx, prompts_dir=pdir):
+                continue  # optimizer archived this flow (#111) — don't resurrect
             planned_n = _planned_action_count(config, flow_idx)
             if planned_n <= 0:
                 continue  # unknowable count — refuse to guess

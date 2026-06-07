@@ -145,6 +145,24 @@ def test_sweep_mode_discovers_orphans_without_prompt_id(tmp_path):
     assert not os.path.exists(os.path.join(d, '790_0_recipe.json'))
 
 
+def test_does_not_resurrect_an_optimizer_archived_flow(tmp_path):
+    # #111: the optimizer retired this flow's recipe to .optbak so the daemon
+    # re-CREATEs it WITH experience hints. The action recipes still exist, so the
+    # naive reconciler would rebuild the flow recipe and silently no-op Gate-4.
+    d = str(tmp_path)
+    _write(d, '785.json', _config(1))
+    _write(d, '785_0_1.json', _action(1))             # action recipe present...
+    # ...but the optimizer has archived the flow recipe (the daemon owns re-CREATE)
+    _write(d, '785_0_recipe.json.optbak', {'status': 'completed', 'actions': []})
+    _write(d, '785_0_recipe.json.optbak.meta.json',
+           {'archived_reward': 0.3, 'prompt_id': '785', 'flow_id': 0})
+
+    out = reconcile_orphaned_flow_recipes('785', prompts_dir=d)
+
+    assert out == []                                  # left for the daemon re-CREATE
+    assert not os.path.exists(os.path.join(d, '785_0_recipe.json'))
+
+
 def test_multiple_flows_per_prompt(tmp_path):
     d = str(tmp_path)
     _write(d, '784.json', _config(1, n_flows=2))  # flow 0 + flow 1
