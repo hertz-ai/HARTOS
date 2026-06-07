@@ -66,7 +66,7 @@ let
   # WebKit2-4.1 *typelibs* live in these packages and must be on GI_TYPELIB_PATH
   # — the cage kiosk session sets no such path, so without this every
   # gi.require_version() raises and the shell window dies on launch.
-  giTypelibPath = lib.makeSearchPath "lib/girepository-1.0" (with pkgs; [
+  giTypelibPath = lib.makeSearchPathOutput "out" "lib/girepository-1.0" (with pkgs; [
     glib gobject-introspection gtk3 webkitgtk_4_1
     pango gdk-pixbuf atk harfbuzz libsoup_3 cairo
   ]);
