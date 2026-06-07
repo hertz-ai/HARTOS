@@ -230,12 +230,214 @@ def check_crawl4ai_service() -> bool:
     return True  # Native in-process — no external service to check
 
 
+# ── Keyless web search (no API key, per-node, zero central rate-limit) ───────
+# Default path for google_search/top5_results.  We scrape a SERP's *public HTML*
+# (keyless — never the key-gated search APIs), then optionally crawl the result
+# links.  Run per node from the user's own IP at chat volume, so per-IP soft
+# limits never trip and there is no shared key to exhaust.  Deterministic
+# fall-through; never raises.
+_URL_RE = re.compile(r'^\s*https?://\S+', re.IGNORECASE)
+
+
+def _looks_like_url(q: str) -> bool:
+    """True when the model handed a direct link to fetch — skip the search step."""
+    return bool(_URL_RE.match(q or ''))
+
+
+def _unwrap_ddg_link(href: str) -> str:
+    """DDG html wraps results as //duckduckgo.com/l/?uddg=<encoded>.  Return the
+    real target URL."""
+    try:
+        if not href:
+            return href
+        if 'uddg=' in href:
+            from urllib.parse import urlparse, parse_qs, unquote
+            qs = parse_qs(urlparse(href).query)
+            if qs.get('uddg'):
+                return unquote(qs['uddg'][0])
+        if href.startswith('//'):
+            return 'https:' + href
+        return href
+    except Exception:
+        return href
+
+
+def _ddg_html_serp(query: str, max_results: int = 5) -> List[dict]:
+    """Keyless DuckDuckGo SERP via the html/ endpoint — no key, no account.
+    Returns [{'title','url','snippet'}]; best-effort [] on any failure."""
+    try:
+        from urllib.parse import quote
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                   'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'}
+        resp = pooled_get(f'https://html.duckduckgo.com/html/?q={quote(query)}',
+                          headers=headers, timeout=10)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        rows = []
+        for res in soup.select('div.result'):
+            a = res.select_one('a.result__a')
+            if not a:
+                continue
+            url = _unwrap_ddg_link(a.get('href'))
+            title = a.get_text(' ', strip=True)
+            snip_el = res.select_one('.result__snippet')
+            snippet = snip_el.get_text(' ', strip=True) if snip_el else ''
+            if url and title:
+                rows.append({'title': title, 'url': url, 'snippet': snippet})
+            if len(rows) >= max_results:
+                break
+        return rows
+    except Exception as e:
+        try:
+            current_app.logger.warning(f"DDG keyless SERP failed: {e}")
+        except Exception:
+            pass
+        return []
+
+
+def _mojeek_serp(query: str, max_results: int = 5) -> List[dict]:
+    """Keyless Mojeek SERP — independent index, scrape-tolerant (plain GET returns
+    HTTP 200, no key, no account, no anti-bot token).  Primary keyless backend.
+    Returns [{'title','url','snippet'}]; best-effort [] on any failure."""
+    try:
+        from urllib.parse import quote
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                   'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+                   'Accept-Language': 'en-US,en;q=0.9'}
+        resp = pooled_get(f'https://www.mojeek.com/search?q={quote(query)}',
+                          headers=headers, timeout=10)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        rows = []
+        for li in soup.select('ul.results-standard > li'):
+            a = li.select_one('a.title') or li.select_one('h2 a')
+            if not a or not a.get('href'):
+                continue
+            snip_el = li.select_one('p.s')
+            rows.append({'title': a.get_text(' ', strip=True),
+                         'url': a.get('href'),
+                         'snippet': snip_el.get_text(' ', strip=True) if snip_el else ''})
+            if len(rows) >= max_results:
+                break
+        return rows
+    except Exception as e:
+        try:
+            current_app.logger.warning(f"Mojeek keyless SERP failed: {e}")
+        except Exception:
+            pass
+        return []
+
+
+def _keyless_serp(query: str, max_results: int = 5) -> List[dict]:
+    """Keyless SERP, tier-ordered.  A: ``ddgs`` lib if installed (multi-source);
+    B: Mojeek html scrape (no dep, independent index, returns 200 to a plain GET);
+    C: DDG html scrape (no dep, but often 202-bot-blocked → weak fallback);
+    D: a self-hosted SearXNG when SEARXNG_URL is set (per-node / OS-node).  [] if
+    all empty."""
+    try:                                            # Tier A — ddgs (optional)
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
+        with DDGS() as ddg:
+            rows = [{'title': r.get('title', ''),
+                     'url': r.get('href') or r.get('link', ''),
+                     'snippet': r.get('body', '')}
+                    for r in ddg.text(query, max_results=max_results)]
+        rows = [r for r in rows if r['url']]
+        if rows:
+            return rows
+    except Exception:
+        pass
+    rows = _mojeek_serp(query, max_results)             # Tier B — Mojeek (primary)
+    if rows:
+        return rows
+    rows = _ddg_html_serp(query, max_results)           # Tier C — DDG (weak)
+    if rows:
+        return rows
+    try:                                            # Tier D — self-hosted SearXNG
+        import os as _os
+        base = (_os.environ.get('SEARXNG_URL') or '').strip()
+        if base:
+            from urllib.parse import quote
+            data = pooled_get(f"{base.rstrip('/')}/search?q={quote(query)}&format=json",
+                              timeout=10).json()
+            rows = [{'title': r.get('title', ''), 'url': r.get('url', ''),
+                     'snippet': r.get('content', '')}
+                    for r in (data.get('results') or [])[:max_results]]
+            rows = [r for r in rows if r['url']]
+            if rows:
+                return rows
+    except Exception:
+        pass
+    return []
+
+
+def _keyless_top5(query: str):
+    """Deterministic keyless google_search body.  Same return shape as
+    top5_results ([{'text','source',...}]) or [] to fall through to optional
+    BYO-key Google CSE.  Fastest path = SERP snippets + their source URLs (often
+    enough to answer + cite); crawl only when snippets are thin.  A bare URL from
+    the model skips search and crawls directly."""
+    query = (query or '').strip()
+    if not query:
+        return []
+
+    if _looks_like_url(query):       # model gave a link → crawl it, skip search
+        url = query.split()[0]
+        try:
+            parts = crawl4ai_batch_fetch([url], max_concurrent=1)
+            text = (parts[0] if parts else '') or fallback_fetch(url)
+        except Exception:
+            text = fallback_fetch(url)
+        text = re.sub(r'\s+', ' ', (text or '').strip())
+        return [{'text': text[:4000], 'source': [url],
+                 'method': 'direct_url', 'enhanced': bool(text)}]
+
+    rows = _keyless_serp(query, max_results=5)
+    if not rows:
+        return []
+    links = [r['url'] for r in rows if r.get('url')]
+
+    # FAST PATH — snippets usually answer it; return now WITH sources to cite.
+    snip = '\n'.join(f"{r['title']} — {r['snippet']} ({r['url']})"
+                     for r in rows if r.get('snippet'))
+    if len(snip) > 150:
+        return [{'text': snip, 'source': links, 'method': 'serp_snippets',
+                 'enhanced': True, 'word_count': len(snip.split()),
+                 'sources_processed': len(links)}]
+
+    # DEEP — snippets thin → crawl the top links for fuller content.
+    try:
+        contents = crawl4ai_batch_fetch(links[:2], max_concurrent=2)
+        body = ' '.join(re.sub(r'\s+', ' ', c.strip())
+                        for c in contents if c and len(c.strip()) > 100)
+        if body:
+            return [{'text': body[:4000], 'source': links[:2],
+                     'method': 'serp_crawl', 'enhanced': True,
+                     'word_count': len(body.split()),
+                     'sources_processed': min(2, len(links))}]
+    except Exception as e:
+        try:
+            current_app.logger.warning(f"crawl-after-search failed: {e}")
+        except Exception:
+            pass
+
+    return [{'text': snip or ' '.join(links), 'source': links,
+             'method': 'serp_links_only', 'sources_processed': len(links)}]
+
+
 def top5_results(query):
     """
     Enhanced top5_results using Crawl4AI API service
     Maintains the same interface as your original function
     """
     current_app.logger.info(f"Enhanced search for: {query}")
+
+    # Keyless-first: no API key, per-node, zero central rate-limit.  Returns
+    # answers with source links to cite; only if every keyless tier is empty do
+    # we fall through to the optional BYO-key Google CSE path below.
+    _keyless = _keyless_top5(query)
+    if _keyless:
+        return _keyless
 
     final_res = []
 
