@@ -180,27 +180,33 @@ def dispatch_morphable_turn(user_id: str, prompt: str,
     ledger.record(state=new_state, prompt=prompt, specialist=specialist)
 
     # ── Reply generation ────────────────────────────────────────────
-    # When state == 'specialist' we'd dispatch via
-    # agentic_router.dispatch_to_agent and let that path's existing
-    # GuardrailEnforcer / Constitutional Filter / Constructive Filter
-    # gate the reply.  When state == 'casual' or 'returning' we'd
-    # run the autogen GroupChat with `make_speaker_selection(ledger)`
-    # wired in.  Both real paths are gated behind autogen import +
-    # LLM availability — the heuristic fallback below keeps the
-    # pipeline testable in offline / CI environments.
+    # Reuse the canonical /chat brain — the same runtime the main chat
+    # and the 31-channel inbound adapters already use — instead of
+    # standing up a SECOND chat brain (an autogen GroupChat) here.  So
+    # the Nunba chat inherits /chat's routing, recall (#118/#121),
+    # persona and dynamic tools for free, and chat behaviour lives in
+    # exactly one place (Gate-4 / no parallel path).
+    #
+    # agent_id=None routes /chat to its LangChain assistant (the Nunba
+    # persona).  dispatch_via_chat is fail-safe: it returns the reply
+    # string, or None on ANY failure (chat unreachable / offline / CI /
+    # non-200), which falls through to the deterministic heuristic — so
+    # this stays testable with no network and never errors a chat turn.
+    # owner_id carries the real user so /chat recall reads THEIR history;
+    # no source_kind, so /chat returns the reply inline without fanning
+    # out to a channel.  (Routing a specialist turn to its OWN persona —
+    # passing the matched agent's User.id — is a follow-up: _match_
+    # specialist returns a name and that id mapping needs verifying.)
     reply: Optional[str] = None
     try:
-        # Real-model paths land in a separate commit (the autogen
-        # GroupChat wire-up needs the live LLM config + the actual
-        # agent registry the rest of HARTOS uses).  For now, this is
-        # a NotImplementedError so callers fall through to heuristic.
-        raise NotImplementedError("autogen / agentic dispatch wire-up "
-                                  "deferred to follow-up commit")
+        from integrations import agentic_router
+        reply = agentic_router.dispatch_via_chat(
+            None, prompt or '', {'owner_id': user_id})
     except Exception as e:
-        if not isinstance(e, NotImplementedError):
-            logger.warning(
-                "morphable_agent: live dispatch failed, falling back "
-                "to heuristic reply: %s", e)
+        logger.warning(
+            "morphable_agent: /chat dispatch failed, using heuristic: %s", e)
+        reply = None
+    if not reply:
         reply = _heuristic_reply(new_state, specialist, prompt or '')
 
     metadata = {

@@ -10,9 +10,11 @@ Tests cover:
     fallback path).
   - morphable_agent.is_nunba_conversation handle matching.
 
-Deterministic + offline-friendly.  The autogen / live-LLM path is
-intentionally gated behind a NotImplementedError so the unit tests
-exercise the heuristic fallback without requiring keys or network.
+Deterministic + offline-friendly.  The live reply path now goes through
+the canonical /chat brain (agentic_router.dispatch_via_chat); it is
+fail-safe (None on any failure -> heuristic).  An autouse fixture stubs
+it to None so the heuristic-path tests run without a real loopback POST,
+and TestDispatchLiveReply covers the real-reply wire + its fallbacks.
 """
 
 from __future__ import annotations
@@ -28,6 +30,18 @@ def reset_ledger_store():
     task_ledger._LEDGERS.clear()
     yield
     task_ledger._LEDGERS.clear()
+
+
+@pytest.fixture(autouse=True)
+def stub_chat_unreachable():
+    # In the unit env there's no /chat server, so the real code's loopback
+    # would just fail to None.  Make that deterministic (and avoid a real
+    # network attempt) by stubbing dispatch_via_chat -> None, so the
+    # heuristic-path tests below exercise the fallback exactly.  Tests that
+    # want the live path re-patch this target inside their own `with`.
+    with patch('integrations.agentic_router.dispatch_via_chat',
+               return_value=None):
+        yield
 
 
 # ── TaskLedger (pure data record) ────────────────────────────────────────
@@ -230,6 +244,50 @@ class TestDispatchMorphableTurn:
         morphable_agent.dispatch_morphable_turn('u-led', "second")
         led = task_ledger.get_or_create('u-led')
         assert len(led.history) == 2
+
+
+# ── Live reply via the canonical /chat brain (#115) ──────────────────────
+
+class TestDispatchLiveReply:
+    """The reply now comes from the canonical /chat brain when reachable
+    (agentic_router.dispatch_via_chat); the heuristic is only the fail-safe
+    fallback.  These re-patch dispatch_via_chat inside the test, overriding
+    the autouse None-stub."""
+
+    def test_uses_chat_reply_when_available(self):
+        with patch('integrations.agentic_router.dispatch_via_chat',
+                   return_value="Here's the real answer.") as d:
+            reply, meta = morphable_agent.dispatch_morphable_turn(
+                'u-live', "weather?")
+        assert reply == "Here's the real answer."      # real reply, not heuristic
+        assert 'chat_instructor' not in reply
+        # agent_id=None -> /chat LangChain; owner_id carries the real user so
+        # /chat recall reads THEIR history; prompt forwarded verbatim.
+        d.assert_called_once_with(None, "weather?", {'owner_id': 'u-live'})
+
+    def test_falls_back_to_heuristic_on_none(self):
+        with patch('integrations.agentic_router.dispatch_via_chat',
+                   return_value=None):
+            reply, _ = morphable_agent.dispatch_morphable_turn(
+                'u-none', "hello")
+        assert 'chat_instructor' in reply              # None -> heuristic
+
+    def test_falls_back_to_heuristic_on_error(self):
+        with patch('integrations.agentic_router.dispatch_via_chat',
+                   side_effect=RuntimeError('boom')):
+            reply, _ = morphable_agent.dispatch_morphable_turn(
+                'u-err', "hello")
+        assert 'chat_instructor' in reply              # error -> heuristic, no raise
+
+    def test_empty_chat_reply_falls_back(self):
+        # dispatch_via_chat's contract is non-empty-or-None (it strips +
+        # nulls blanks itself), but morphable also treats any falsy reply
+        # as no-reply -> heuristic.
+        with patch('integrations.agentic_router.dispatch_via_chat',
+                   return_value=""):
+            reply, _ = morphable_agent.dispatch_morphable_turn(
+                'u-blank', "hello")
+        assert 'chat_instructor' in reply
 
 
 # ── Conversation handle matching ─────────────────────────────────────────

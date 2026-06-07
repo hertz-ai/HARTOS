@@ -303,8 +303,8 @@ def dispatch_to_agent(agent_id: str, prompt: str,
     ).start()
 
 
-def _dispatch_via_chat(agent_id: str, rewritten_prompt: str,
-                       context: Dict) -> Optional[str]:
+def dispatch_via_chat(agent_id: str, rewritten_prompt: str,
+                      context: Dict) -> Optional[str]:
     """Reuse the canonical /chat endpoint instead of doing a raw
     ``llm.invoke``.
 
@@ -333,9 +333,13 @@ def _dispatch_via_chat(agent_id: str, rewritten_prompt: str,
     ``response`` field).  Caller falls back to raw ``llm.invoke`` so
     agents still respond rather than going silent.
 
-    Behind the ``HEVOLVE_FLAG_DISPATCH_VIA_CHAT`` env flag — default
-    off, dormant until production verifies the /chat path for social-
-    platform agent dispatches.
+    Public, fail-safe helper (returns None on any error).  Two callers:
+    the agent-MENTION worker below gates its use behind the
+    ``HEVOLVE_FLAG_DISPATCH_VIA_CHAT`` env flag (default off, dormant
+    until production verifies the /chat path for social-platform agent
+    dispatches); the morphable Nunba chat (#115) calls it directly so the
+    Nunba assistant shares the canonical /chat brain — that path is
+    unconditionally fail-safe to its heuristic, so it needs no flag.
     """
     try:
         from core.http_pool import pooled_post
@@ -461,7 +465,7 @@ def _dispatch_to_agent_worker(agent_id: str, prompt: str, context: Dict):
     #     Flag stays off until the /chat path is validated for social-
     #     platform dispatches; flipping the flag is the rollout switch.
     #
-    # On flag-on `_dispatch_via_chat` returning None (chat endpoint
+    # On flag-on `dispatch_via_chat` returning None (chat endpoint
     # unreachable, non-200, malformed response), we fall back to raw
     # llm.invoke so agents still respond rather than going silent.
     reply_text: Optional[str] = None
@@ -470,7 +474,7 @@ def _dispatch_to_agent_worker(agent_id: str, prompt: str, context: Dict):
         in ('1', 'true', 'yes', 'on')
     )
     if use_chat:
-        reply_text = _dispatch_via_chat(agent_id, rewritten, context)
+        reply_text = dispatch_via_chat(agent_id, rewritten, context)
         if reply_text is None:
             logger.info(
                 "dispatch_to_agent: /chat path failed; falling back to "
