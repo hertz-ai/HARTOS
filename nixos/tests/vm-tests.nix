@@ -108,8 +108,27 @@ in
       with subtest("Database initialized"):
           server.succeed("test -s /var/lib/hart/hevolve_database.db")
 
-      with subtest("OS branding present"):
-          server.succeed("grep -q HART OS /etc/os-release")
+      with subtest("OS branding present (HART OS, not NixOS)"):
+          # NOTE: 'HART OS' MUST be quoted — `grep -q HART OS file` greps "HART"
+          # in the files "OS" and file (the original bug here).
+          server.succeed("grep -q 'HART OS' /etc/os-release")
+          # ID=hart-os drives OS-mode detection (core.port_registry) AND hides
+          # the NixOS identity (#101); a leaked ID=nixos would break both.
+          server.succeed("grep -q '^ID=hart-os' /etc/os-release")
+          server.fail("grep -qi '^ID=nixos' /etc/os-release")
+
+      with subtest("First-boot succeeded, not failed (hostname/PATH fix)"):
+          # The oneshot used to exit non-zero on a bare `hostname` under
+          # `set -euo pipefail` even after doing its work; RemainAfterExit leaves
+          # it 'active' only on a clean exit (#101 / ISO sweep).
+          server.succeed("systemctl is-active hart-first-boot.service")
+
+      with subtest("Boot-audit entries are SIGNED (Ed25519, not UNSIGNED)"):
+          # The audit entry was built via a triple-quote that collapsed to a
+          # Python SyntaxError, so every entry was UNSIGNED (#101). A signed run
+          # leaves a hex signature as the last field and no UNSIGNED markers.
+          server.succeed("test -s /var/lib/hart/boot_audit.log")
+          server.fail("grep -q UNSIGNED /var/lib/hart/boot_audit.log")
 
       with subtest("Firewall allows port 6777"):
           server.succeed("nft list ruleset 2>/dev/null | grep -q 6777 || iptables -L -n | grep -q 6777")
@@ -178,6 +197,12 @@ in
       with subtest("Glass-shell GI typelibs are present (Gtk-3.0 + WebKit2-4.1)"):
           desktop.succeed("find /nix/store -name 'Gtk-3.0.typelib' -print -quit | grep -q .")
           desktop.succeed("find /nix/store -name 'WebKit2-4.1.typelib' -print -quit | grep -q .")
+
+      # ── HART is the SHELL, not an app on GNOME (#102) ──
+      with subtest("HART glass-shell session is registered as a login session"):
+          desktop.succeed(
+              "find /run/current-system/sw/share/wayland-sessions "
+              "-name 'hart-shell.desktop' -print -quit | grep -q .")
 
       with subtest("Wine available (native Windows API)"):
           desktop.succeed("which wine64 || which wine")
