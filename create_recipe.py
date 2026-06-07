@@ -82,6 +82,16 @@ from json_repair import repair_json
 # progress (Assistant emits NEW content) resets the counter.
 _STATE_TRANSITION_LOOP_STATE: dict = {}
 _STATE_TRANSITION_LOOP_THRESHOLD: int = 5
+# #2 (mutate-on-redispatch): when the SAME signature has repeated this many times
+# — BEFORE the hard break above — inject ONE escalating nudge so the next turn is
+# not byte-identical (breaks the deterministic fixpoint).  The nudge is ADDITIVE:
+# the action context + the StatusVerifier JSON-format spec are left intact, we
+# only append a "you repeated, take a concrete step + emit the status JSON"
+# directive.  _STATE_TRANSITION_NUDGED maps user_prompt -> the action_id already
+# nudged, so it fires at most once per stuck action and can never itself loop;
+# the threshold hard break stays the backstop if the nudge doesn't take.
+_STATE_TRANSITION_LOOP_NUDGE_AT: int = 3
+_STATE_TRANSITION_NUDGED: dict = {}
 
 # #485 L3 — consecutive-Assistant counter; at threshold redirect to Helper
 # to break attention-collapse loops where Assistant→verify can't escape
@@ -2039,7 +2049,41 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                         f"[LOOP-BREAK] state-set failed: {_stb_err}")
                 # Reset loop-state for this user — next turn starts fresh
                 _STATE_TRANSITION_LOOP_STATE.pop(user_prompt, None)
+                _STATE_TRANSITION_NUDGED.pop(user_prompt, None)
                 return None  # terminate GroupChat round
+
+            # #2 — EARLY ESCALATION NUDGE (one-shot per stuck action, fires BEFORE
+            # the hard break above).  The same turn has repeated but not yet hit
+            # the break threshold: append ONE additive directive so the next round
+            # is not byte-identical and the FSM can advance.  Keeps the action
+            # context + the StatusVerifier JSON spec — only adds the nudge — then
+            # falls through to normal routing (we do NOT return).
+            elif (_ls['count'] >= _STATE_TRANSITION_LOOP_NUDGE_AT
+                  and _STATE_TRANSITION_NUDGED.get(user_prompt) != current_action_id):
+                _STATE_TRANSITION_NUDGED[user_prompt] = current_action_id
+                try:
+                    _nudge = (
+                        f"SYSTEM: action {current_action_id} has repeated "
+                        f"{_ls['count']}x without advancing — the last reply did "
+                        f"not move it forward. Do NOT restate the instruction or "
+                        f"echo this prompt. Take ONE concrete step toward "
+                        f"completing it now; then @StatusVerifier MUST reply with "
+                        f"the action status JSON verbatim "
+                        f'({{"status":"completed" | "pending","action_id":'
+                        f'{current_action_id},"message":"...","fallback_action":'
+                        f'"..."}}) so the pipeline advances to the next action.'
+                    )
+                    groupchat.messages.append({
+                        'role': 'user', 'name': 'ChatInstructor',
+                        'content': _nudge,
+                    })
+                    current_app.logger.info(
+                        f"[STATE-TRANSITION-NUDGE] action={current_action_id} "
+                        f"count={_ls['count']} — injected one escalation nudge to "
+                        f"break the byte-identical re-dispatch.")
+                except Exception as _nudge_err:
+                    current_app.logger.warning(
+                        f"[STATE-TRANSITION-NUDGE] inject failed: {_nudge_err}")
         except Exception as _loop_guard_err:
             current_app.logger.exception(
                 f"[STATE-TRANSITION-LOOP] guard raised "
