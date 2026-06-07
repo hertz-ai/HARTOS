@@ -13,11 +13,23 @@ let
     flask
     waitress
     requests
-    beautifulsoup4  # bs4 — imported at hart_intelligence_entry startup (web
-                    # scraping / crawl4ai). Its absence is the "No module named
-                    # 'bs4'" that killed hart-backend on the first ISO boot:
-                    # waitress prints the import error and exits 0, so
-                    # Restart=on-failure never fires and the backend stays dead.
+    # ── hart_intelligence_entry module-load (column-0, unguarded) imports ──
+    # `waitress ... hart_intelligence_entry:app` imports the module, so every
+    # top-level import must resolve. bs4 was the FIRST crash on the ISO ("No
+    # module named 'bs4'" → waitress exits 0 → Restart never fires → backend
+    # dead); pytz / redis / python-dotenv are the next dominoes (all present in
+    # this nixpkgs pin).
+    #
+    # ⚠ BACKEND STILL BLOCKED: the module also imports `langchain_classic` 13x at
+    # column 0, and langchain_classic 1.x is NOT in this June-2025 nixpkgs pin
+    # (the split package post-dates it). hart-backend cannot import until that
+    # tree is packaged (pip2nix/poetry2nix), the pin is bumped, or the langchain
+    # imports are deferred. Tracked as its own task — these adds do NOT yet make
+    # the backend boot; they unblock the OTHER services that import cleanly.
+    beautifulsoup4
+    pytz
+    redis
+    python-dotenv
     pydantic  # 1.10.x series from nixpkgs 24.11
 
     # Database
