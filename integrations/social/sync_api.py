@@ -90,6 +90,24 @@ def link_device():
     if not device_id:
         return _err("device_id required")
 
+    # #117: re-home a guest session's memory onto this account when the client
+    # supplies the prior guest_user_id at login/link. Only an UNCLAIMED anonymous
+    # guest id is eligible (is_claimable_guest) — never an existing account — so
+    # this can't be used to absorb another user's chat history. Best-effort:
+    # never blocks the link itself.
+    guest_user_id = (data.get('guest_user_id') or '').strip()
+    if guest_user_id and guest_user_id != str(g.user.id):
+        try:
+            from core.user_memory_migration import (
+                is_claimable_guest, migrate_user_memory)
+            if is_claimable_guest(guest_user_id):
+                migrate_user_memory(guest_user_id, str(g.user.id))
+            else:
+                logger.info("link-device: guest_user_id %s not claimable; skip migrate",
+                            guest_user_id)
+        except Exception as e:
+            logger.warning("link-device: guest memory migration skipped: %s", e)
+
     db = get_db()
     try:
         existing = db.query(DeviceBinding).filter_by(
