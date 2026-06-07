@@ -65,7 +65,7 @@ def _emit_tool_call_stage(tool_name: str) -> None:
     swallowed.
     """
     try:
-        from core.constants import TOOL_LABELS
+        from core.constants import TOOL_LABELS, generic_tool_label
         from core.peer_link.crossbar_publish import publish_chat_stage
         from threadlocal import thread_local_data
 
@@ -76,7 +76,7 @@ def _emit_tool_call_stage(tool_name: str) -> None:
                 'tool_call',
                 user_id=str(user_id),
                 request_id=str(request_id),
-                text=TOOL_LABELS.get(tool_name, f'Running {tool_name}…'),
+                text=TOOL_LABELS.get(tool_name, generic_tool_label(tool_name)),
             )
         else:
             _emit_logger.debug(

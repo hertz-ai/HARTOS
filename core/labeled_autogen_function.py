@@ -101,5 +101,7 @@ def register_labeled_function(
 def generic_autogen_label(name: str) -> str:
     """Explicit opt-in to the 'Running {name}…' fallback for autogen
     tools whose name is already self-descriptive.  Use sparingly — a
-    real verb phrase is more polished."""
-    return f'Running {name}…'
+    real verb phrase is more polished.  Template single-sourced in
+    core.constants.generic_tool_label (#116)."""
+    from core.constants import generic_tool_label
+    return generic_tool_label(name)

@@ -634,10 +634,17 @@ def register_tool_label(name: str, label: str) -> None:
     to where they construct Tool() objects.  Idempotent — overwrites prior
     entry for the same name so a registry can refine its labels over time.
 
-    Tools that don't register a label fall back to the generic
-    'Running {name}…' template at the emit site in
-    hart_intelligence_entry._with_tool_logging.
+    Tools that don't register a label fall back to generic_tool_label() at the
+    emit site (core.tool_logging._emit_tool_call_stage).
     """
     if not name or not label:
         return
     TOOL_LABELS[str(name)] = str(label)[:60]
+
+
+def generic_tool_label(name: str) -> str:
+    """The single 'Running {name}…' fallback label for a tool with no registered
+    TOOL_LABELS entry.  Canonical home (#116): labeled_tool.generic_label,
+    labeled_autogen_function.generic_autogen_label, and the tool_logging emit
+    site all delegate here instead of pasting the template."""
+    return f'Running {name}…'

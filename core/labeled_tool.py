@@ -81,5 +81,7 @@ def labeled_tool(
 def generic_label(name: str) -> str:
     """Explicit opt-in to the 'Running {name}…' fallback for tools whose
     name is already self-descriptive.  Use sparingly — a real verb
-    phrase (e.g. 'Searching the web…') is usually more polished."""
-    return f'Running {name}…'
+    phrase (e.g. 'Searching the web…') is usually more polished.  The template
+    itself is single-sourced in core.constants.generic_tool_label (#116)."""
+    from core.constants import generic_tool_label
+    return generic_tool_label(name)
