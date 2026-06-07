@@ -58,12 +58,10 @@ _TERMINAL_STATUSES = ('done', 'completed')
 
 
 def _resolve_prompts_dir(prompts_dir: str | None) -> str:
-    if prompts_dir:
-        return prompts_dir
-    # SINGLE SOURCE: the same resolver helper.PROMPTS_DIR / the pipeline /
-    # the daemon CREATE-REUSE split all use — never a second path formula.
-    from core.platform_paths import get_recipe_prompts_dir
-    return get_recipe_prompts_dir()
+    # SINGLE SOURCE: the shared "override-or-canonical" resolver in
+    # platform_paths (the optimizer shares the same one — no per-module paste).
+    from core.platform_paths import resolve_recipe_prompts_dir
+    return resolve_recipe_prompts_dir(prompts_dir)
 
 
 def _load_json(path: str):

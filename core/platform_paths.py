@@ -210,6 +210,17 @@ def get_recipe_prompts_dir() -> str:
     return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts')
 
 
+def resolve_recipe_prompts_dir(override: str = None) -> str:
+    """`override` if given, else the canonical get_recipe_prompts_dir().
+
+    The "explicit-or-canonical" resolver the recipe daemon modules
+    (flow_recipe_reconcile / flow_recipe_optimizer) share for their
+    ``prompts_dir=None`` parameter — single-sourced here instead of pasted in
+    each module.
+    """
+    return override or get_recipe_prompts_dir()
+
+
 def get_log_dir() -> str:
     """Return the platform-appropriate log directory."""
     if _IS_WINDOWS:

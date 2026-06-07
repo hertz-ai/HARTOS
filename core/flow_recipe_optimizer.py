@@ -49,11 +49,9 @@ _META_SUFFIX = '.optbak.meta.json'
 
 
 def _resolve_prompts_dir(prompts_dir: Optional[str]) -> str:
-    if prompts_dir:
-        return prompts_dir
     # SAME single-source resolver the pipeline / reconciler / daemon use.
-    from core.platform_paths import get_recipe_prompts_dir
-    return get_recipe_prompts_dir()
+    from core.platform_paths import resolve_recipe_prompts_dir
+    return resolve_recipe_prompts_dir(prompts_dir)
 
 
 def _paths(prompts_dir: str, prompt_id, flow_id):
