@@ -181,6 +181,17 @@ in
     # already turns ALL docs off, and that explicit setting wins over this.
     documentation.nixos.enable = lib.mkDefault false;
 
+    # ── No nix-channels (flake-based OS; the last boot-console "NixOS" leak) ──
+    # The installer-CD profile wires up the NixOS/Nixpkgs *channel*, whose
+    # activation prints "unpacking the NixOS/Nixpkgs sources..." to the console
+    # and symlinks /root/.nix-defexpr/channels — which fails read-only on the
+    # live ISO ("ln: failed to create symbolic link ...channels"). Both are
+    # NixOS tells in the boot log. HART OS is flake-based and never uses
+    # channels, so disable the subsystem entirely: no unpack message, no channel
+    # symlink error, and nothing for a user to `nix-channel --list` into
+    # "nixpkgs". (Android hides Linux; HART OS hides NixOS — down to the console.)
+    nix.channel.enable = lib.mkForce false;
+
     # ── Users ──
     users.users.hart = {
       isSystemUser = true;
