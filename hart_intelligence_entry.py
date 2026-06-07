@@ -4175,42 +4175,17 @@ def _safe_load_google_search():
 
 
 def _with_tool_logging(func, tool_name):
-    """Wrap a tool function with logging and generic error handling.
+    """LangChain tool wrapper — delegates to the canonical core.tool_logging
+    (#114, single tool-log impl; no more parallel emit/error logic here).
 
-    Acts as a @before/@after decorator for all LangChain tools:
-    - Logs entry with tool name and truncated input
-    - Catches all exceptions and returns a user-friendly error string
-      instead of crashing the agent executor
-    - Logs completion with output length or error details
+    LangChain ``Tool`` objects carry a ``.name`` distinct from ``func.__name__``
+    (-> name=tool_name for the correct UI label), and the agent_executor wants a
+    plain-string error rather than the autogen JSON envelope (-> plain_errors).
+    The per-tool UI stage emit + TOOL_LABELS lookup now live once in
+    core.tool_logging._emit_tool_call_stage.
     """
-    from functools import wraps
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        logging.info(f"[TOOL] {tool_name} called | input: {str(args)[:200]}")
-        # Per-tool UI stage emit (#508 extension — covers all ~50 tools via
-        # this single chokepoint, no per-tool plumbing).  Emit failures are
-        # LOGGED, not swallowed (user directive 2026-05-11: no silent gulps).
-        try:
-            from core.constants import TOOL_LABELS
-            from core.peer_link.crossbar_publish import publish_chat_stage
-            publish_chat_stage(
-                'tool_call',
-                user_id=str(thread_local_data.get_user_id() or ''),
-                request_id=str(thread_local_data.get_request_id() or ''),
-                text=TOOL_LABELS.get(tool_name, f'Running {tool_name}…'),
-            )
-        except Exception:
-            logging.warning(
-                f"[TOOL] {tool_name} UI emit failed", exc_info=True
-            )
-        try:
-            result = func(*args, **kwargs)
-            logging.info(f"[TOOL] {tool_name} completed | output length: {len(str(result))}")
-            return result
-        except Exception as e:
-            logging.error(f"[TOOL] {tool_name} failed: {e}", exc_info=True)
-            return f"Tool '{tool_name}' encountered an error: {str(e)[:200]}"
-    return wrapper
+    from core.tool_logging import log_tool_execution
+    return log_tool_execution(func, name=tool_name, plain_errors=True)
 
 
 # Per-(user, prompt) cache for the casual_conv `is_first=True` tool

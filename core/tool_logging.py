@@ -29,10 +29,11 @@ Per CLAUDE.md Gate 4 (no parallel paths) this is THE single canonical
 home for tool-execution logging + per-tool UI emit.  `create_recipe.py`
 re-exports `log_tool_execution` for backward compatibility with the
 existing 40+ decorator sites.  LangChain's `_with_tool_logging` in
-`hart_intelligence_entry.py` is functionally similar but operates on
-LangChain `Tool.func` objects and has a different error-format
-contract (LangChain agent_executor wants a plain string, not the
-JSON envelope) — left in place pending a future merge.
+`hart_intelligence_entry.py` (#114) now DELEGATES here via the
+`name=` parameter (a LangChain `Tool` carries a `.name` distinct from
+`func.__name__`) and `plain_errors=True` (its agent_executor wants a
+plain string, not the JSON envelope) — one tool-log impl, no parallel
+path.
 """
 from __future__ import annotations
 
@@ -40,7 +41,7 @@ import asyncio
 import inspect
 import json
 import logging
-from functools import wraps
+from functools import partial, wraps
 
 # Module-level tool_logger named "agent_logger" — matches the legacy
 # logger create_recipe.py:284 configured with a RotatingFileHandler.
@@ -106,52 +107,73 @@ def _error_envelope(func_name: str, exc: BaseException) -> str:
     return f"Tool execution failed: {json.dumps(payload)}"
 
 
-def log_tool_execution(func):
+def log_tool_execution(func=None, *, name=None, plain_errors=False):
     """Decorator wrapping a tool function with logging + UI emit.
 
     Handles both sync and async callables.  Apply with `@log_tool_execution`
     or programmatically as `wrapped = log_tool_execution(func)`.
 
+    Args:
+        name: override the logged + UI-emitted tool name.  A LangChain ``Tool``
+            carries a ``.name`` distinct from ``func.__name__`` (often a generic
+            closure name), so the LangChain wrapper passes it for the correct UI
+            label.  Defaults to ``func.__name__``.
+        plain_errors: on failure return a plain
+            ``"Tool 'X' encountered an error: …"`` string instead of the JSON
+            error envelope.  LangChain's agent_executor wants a plain string;
+            autogen wants the envelope.  Default False (the envelope).
+
     See module docstring for the full behavior contract.
     """
+    if func is None:
+        # Called as @log_tool_execution(name=..., plain_errors=...) — bind the
+        # options and return the real decorator once the function arrives.
+        return partial(log_tool_execution, name=name, plain_errors=plain_errors)
+
+    tool_name = name or func.__name__
+
+    def _on_error(e):
+        tool_logger.error(f"TOOL EXECUTION ERROR: {tool_name} - {e}")
+        tool_logger.exception("Exception details:")
+        if plain_errors:
+            return f"Tool '{tool_name}' encountered an error: {str(e)[:200]}"
+        envelope = _error_envelope(tool_name, e)
+        tool_logger.info(f"Returning error response: {envelope}")
+        return envelope
+
     if inspect.iscoroutinefunction(func):
 
         @wraps(func)
         async def async_wrapper(*args, **kwargs):
-            tool_logger.info(f"TOOL EXECUTION START: {func.__name__}")
+            tool_logger.info(f"TOOL EXECUTION START: {tool_name}")
             tool_logger.info(
                 f"Arguments: {args}, Keyword Arguments: {kwargs}")
-            _emit_tool_call_stage(func.__name__)
+            _emit_tool_call_stage(tool_name)
             try:
                 result = await func(*args, **kwargs)
                 if not isinstance(result, str):
                     tool_logger.warning(
-                        f"Tool function {func.__name__} returned "
+                        f"Tool function {tool_name} returned "
                         f"non-string type: {type(result)}")
                     result = str(result)
                 tool_logger.info(
-                    f"TOOL EXECUTION SUCCESS: {func.__name__}")
+                    f"TOOL EXECUTION SUCCESS: {tool_name}")
                 tool_logger.info(
                     f"Result: {result[:100]}..."
                     if len(result) > 100 else f"Result: {result}"
                 )
                 return result
             except Exception as e:
-                tool_logger.error(
-                    f"TOOL EXECUTION ERROR: {func.__name__} - {e}")
-                tool_logger.exception("Exception details:")
-                envelope = _error_envelope(func.__name__, e)
-                tool_logger.info(f"Returning error response: {envelope}")
-                return envelope
+                return _on_error(e)
 
         return async_wrapper
 
     @wraps(func)
     def sync_wrapper(*args, **kwargs):
-        tool_logger.info(f"TOOL EXECUTION START: {func.__name__}")
+        tool_logger.info(f"TOOL EXECUTION START: {tool_name}")
         tool_logger.info(
             f"Arguments: {args}, Keyword Arguments: {kwargs}")
-        _emit_tool_call_stage(func.__name__)
+        _emit_tool_call_stage(tool_name)
         try:
             result = func(*args, **kwargs)
             # If the sync function accidentally returned a coroutine,
@@ -159,28 +181,23 @@ def log_tool_execution(func):
             # original create_recipe.py:365-367.
             if asyncio.iscoroutine(result):
                 tool_logger.info(
-                    f"Detected coroutine return from {func.__name__}, "
+                    f"Detected coroutine return from {tool_name}, "
                     f"running it to completion")
                 result = asyncio.get_event_loop().run_until_complete(
                     result)
             if not isinstance(result, str):
                 tool_logger.warning(
-                    f"Tool function {func.__name__} returned "
+                    f"Tool function {tool_name} returned "
                     f"non-string type: {type(result)}")
                 result = str(result)
-            tool_logger.info(f"TOOL EXECUTION SUCCESS: {func.__name__}")
+            tool_logger.info(f"TOOL EXECUTION SUCCESS: {tool_name}")
             tool_logger.info(
                 f"Result: {result[:100]}..."
                 if len(result) > 100 else f"Result: {result}"
             )
             return result
         except Exception as e:
-            tool_logger.error(
-                f"TOOL EXECUTION ERROR: {func.__name__} - {e}")
-            tool_logger.exception("Exception details:")
-            envelope = _error_envelope(func.__name__, e)
-            tool_logger.info(f"Returning error response: {envelope}")
-            return envelope
+            return _on_error(e)
 
     return sync_wrapper
 
