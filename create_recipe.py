@@ -92,6 +92,14 @@ _STATE_TRANSITION_LOOP_THRESHOLD: int = 5
 # the threshold hard break stays the backstop if the nudge doesn't take.
 _STATE_TRANSITION_LOOP_NUDGE_AT: int = 3
 _STATE_TRANSITION_NUDGED: dict = {}
+# Goal circuit-breaker: a daemon/autonomous goal whose GroupChat hard-loop-breaks
+# this many times across re-dispatches is unfixable by retry (the agent lacks the
+# capability, or the fix is out-of-band like a rebuild) — pause it so the daemon
+# stops re-dispatching it and the local model is freed for productive flywheel
+# goals.  Needed because a loop-break returns a fallback reply, so the daemon's
+# own _dispatch_backoff never sees a failure to count (the 686-thrash root).
+_GOAL_LOOP_BREAK_COUNT: dict = {}
+_GOAL_PARK_AFTER_BREAKS: int = 3
 
 # #485 L3 — consecutive-Assistant counter; at threshold redirect to Helper
 # to break attention-collapse loops where Assistant→verify can't escape
@@ -2047,6 +2055,31 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 except Exception as _stb_err:
                     current_app.logger.warning(
                         f"[LOOP-BREAK] state-set failed: {_stb_err}")
+                # Circuit-breaker (achieve-flywheel): count hard loop-breaks for
+                # this goal across re-dispatches; once it exceeds the threshold the
+                # goal is unfixable by retry, so PAUSE it — the daemon then stops
+                # re-dispatching it (capping the 686-style thrash) and the model is
+                # freed for productive goals.  Only autonomous goals (UUID
+                # prompt_id, len>=30); human chat (int prompt_id) is never paused.
+                try:
+                    _gbc = _GOAL_LOOP_BREAK_COUNT.get(user_prompt, 0) + 1
+                    _GOAL_LOOP_BREAK_COUNT[user_prompt] = _gbc
+                    if _gbc >= _GOAL_PARK_AFTER_BREAKS and len(str(prompt_id)) >= 30:
+                        from integrations.agent_engine.goal_manager import (
+                            GoalManager)
+                        from integrations.social.models import db_session
+                        with db_session(commit=True) as _cb_db:
+                            GoalManager.update_goal_status(
+                                _cb_db, str(prompt_id), 'paused')
+                        _GOAL_LOOP_BREAK_COUNT.pop(user_prompt, None)
+                        current_app.logger.warning(
+                            f"[GOAL-CIRCUIT-BREAKER] goal {prompt_id} hard "
+                            f"loop-broke {_gbc}x — paused; daemon stops "
+                            f"re-dispatching it so the model is freed for "
+                            f"productive flywheel goals.")
+                except Exception as _cb_err:
+                    current_app.logger.warning(
+                        f"[GOAL-CIRCUIT-BREAKER] park failed: {_cb_err}")
                 # Reset loop-state for this user — next turn starts fresh
                 _STATE_TRANSITION_LOOP_STATE.pop(user_prompt, None)
                 _STATE_TRANSITION_NUDGED.pop(user_prompt, None)
