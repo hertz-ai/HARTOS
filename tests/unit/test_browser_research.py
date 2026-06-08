@@ -1,0 +1,284 @@
+"""Browser Research subsystem — C1 test pack.
+
+Covers: skeleton, audit log, domain allowlist, vault stub, driver mode probe,
+T3 YouTube + web_generic dispatch, drift-guards.
+
+T2 platform scripts and Obscura concrete impls have their own tests in C4+.
+"""
+import json
+import os
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+HARTOS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if HARTOS_ROOT not in sys.path:
+    sys.path.insert(0, HARTOS_ROOT)
+
+
+class TestPackageImport(unittest.TestCase):
+    """Skeleton — module imports cleanly with no T2 dependencies."""
+
+    def test_package_imports(self):
+        import integrations.browser_research as br
+        self.assertTrue(hasattr(br, '__all__'))
+
+    def test_audit_imports(self):
+        from integrations.browser_research import audit
+        self.assertTrue(callable(audit.append))
+        self.assertTrue(callable(audit.read_recent))
+
+    def test_tools_imports(self):
+        from integrations.browser_research import tools
+        self.assertTrue(callable(tools.dispatch))
+        self.assertTrue(callable(tools.list_tools))
+
+    def test_vault_imports(self):
+        from integrations.browser_research import vault
+        v = vault.get_vault()
+        v2 = vault.get_vault()
+        self.assertIs(v, v2, 'vault must be a process-wide singleton')
+
+    def test_driver_imports_without_playwright(self):
+        # Driver module must import even if Obscura/Playwright are not installed.
+        from integrations.browser_research import driver
+        self.assertTrue(callable(driver.get_driver))
+        self.assertTrue(callable(driver.cdp_endpoint_reachable))
+
+
+class TestAuditLog(unittest.TestCase):
+    """Audit log writes one JSON line per call; never raises."""
+
+    def test_append_and_read_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {}, clear=False):
+                with patch('integrations.browser_research.audit._log_path',
+                           return_value=os.path.join(tmp, 'audit.log')):
+                    from integrations.browser_research import audit
+                    audit.append(user_id='u1', tool='YouTube_Transcript',
+                                 platform='youtube', connection_mechanism='public_http',
+                                 success=True)
+                    audit.append(user_id='u1', tool='Read_Webpage',
+                                 platform='web_generic', connection_mechanism='public_http',
+                                 success=False, error='timeout')
+                    records = audit.read_recent(limit=10)
+            self.assertEqual(len(records), 2)
+            self.assertEqual(records[0]['tool'], 'YouTube_Transcript')
+            self.assertEqual(records[1]['error'], 'timeout')
+            self.assertTrue(records[0]['success'])
+            self.assertFalse(records[1]['success'])
+
+    def test_append_never_raises_on_io_failure(self):
+        from integrations.browser_research import audit
+        with patch('integrations.browser_research.audit._log_path',
+                   return_value='/nonexistent/path/that/cannot/be/written/audit.log'):
+            audit.append(user_id='u1', tool='x', platform='y',
+                         connection_mechanism='z', success=False)
+
+
+class TestDomainAllowlist(unittest.TestCase):
+    """Allowlist fails closed; suffix match; unknown script rejected."""
+
+    def test_youtube_allowed(self):
+        from integrations.browser_research import domain_allowlist as dal
+        self.assertTrue(dal.host_allowed('youtube', 'https://www.youtube.com/watch?v=abc'))
+        self.assertTrue(dal.host_allowed('youtube', 'https://youtu.be/abc'))
+
+    def test_youtube_rejects_off_list(self):
+        from integrations.browser_research import domain_allowlist as dal
+        self.assertFalse(dal.host_allowed('youtube', 'https://evil.example.com/'))
+        self.assertFalse(dal.host_allowed('youtube', 'https://fake-youtube.com/'))
+
+    def test_unknown_script_fails_closed(self):
+        from integrations.browser_research import domain_allowlist as dal
+        self.assertFalse(dal.host_allowed('does_not_exist', 'https://anything.com/'))
+
+    def test_web_generic_empty_allowlist_accepts_any(self):
+        from integrations.browser_research import domain_allowlist as dal
+        self.assertTrue(dal.host_allowed('web_generic', 'https://anywhere.com/'))
+
+    def test_twitter_x_dot_com(self):
+        from integrations.browser_research import domain_allowlist as dal
+        self.assertTrue(dal.host_allowed('twitter', 'https://x.com/elon'))
+        self.assertTrue(dal.host_allowed('twitter', 'https://twitter.com/jack'))
+
+    def test_subdomain_suffix_match(self):
+        from integrations.browser_research import domain_allowlist as dal
+        self.assertTrue(dal.host_allowed('reddit', 'https://old.reddit.com/r/X'))
+
+    def test_malformed_url_rejected(self):
+        from integrations.browser_research import domain_allowlist as dal
+        self.assertFalse(dal.host_allowed('youtube', ''))
+        self.assertFalse(dal.host_allowed('youtube', 'not-a-url'))
+
+
+class TestVaultStub(unittest.TestCase):
+    """C1 stub: in-memory only, no cookies, no encryption yet."""
+
+    def test_add_get_revoke_lifecycle(self):
+        from integrations.browser_research.vault import AccountVault, Account
+        v = AccountVault()
+        acc = Account(platform='twitter', handle='@me', capabilities={'read'})
+        v.add(acc)
+        self.assertIs(v.get('twitter', '@me'), acc)
+        self.assertEqual(v.list_platforms(), ['twitter'])
+        self.assertTrue(v.revoke('twitter', '@me'))
+        self.assertIsNone(v.get('twitter', '@me'))
+        self.assertFalse(v.revoke('twitter', '@me'))
+
+
+class TestDriverModeProbe(unittest.TestCase):
+    """Driver instantiates without Obscura/Playwright; mode='auto' falls back."""
+
+    def test_cdp_probe_returns_false_for_dead_port(self):
+        from integrations.browser_research import driver
+        # Port 1 is privileged + unlikely to be listening for CDP.
+        self.assertFalse(driver.cdp_endpoint_reachable(host='127.0.0.1', port=1))
+
+    def test_get_driver_auto_falls_back_to_b1(self):
+        from integrations.browser_research import driver
+        with patch('integrations.browser_research.driver.cdp_endpoint_reachable',
+                   return_value=False):
+            d = driver.get_driver(mode='auto')
+            self.assertEqual(d.connection_mechanism, 'obscura_b1_headless_profile')
+
+    def test_get_driver_auto_picks_b2_when_reachable(self):
+        from integrations.browser_research import driver
+        with patch('integrations.browser_research.driver.cdp_endpoint_reachable',
+                   return_value=True):
+            d = driver.get_driver(mode='auto')
+            self.assertEqual(d.connection_mechanism, 'obscura_b2_cdp_user_chrome')
+
+    def test_b2_raises_when_unreachable(self):
+        from integrations.browser_research import driver
+        with patch('integrations.browser_research.driver.cdp_endpoint_reachable',
+                   return_value=False):
+            with self.assertRaises(RuntimeError):
+                driver.get_driver(mode='b2')
+
+    def test_unknown_mode_raises(self):
+        from integrations.browser_research import driver
+        with self.assertRaises(ValueError):
+            driver.get_driver(mode='garbage')
+
+
+class TestToolsDispatch(unittest.TestCase):
+    """Dispatcher routes correctly, logs audit, never raises."""
+
+    def test_list_tools_returns_known(self):
+        from integrations.browser_research import tools
+        names = {t['name'] for t in tools.list_tools()}
+        self.assertIn('YouTube_Transcript', names)
+        self.assertIn('Read_Webpage', names)
+
+    def test_unknown_tool_returns_error(self):
+        from integrations.browser_research import tools
+        result = tools.dispatch(tool='NoSuchTool', user_id='u1')
+        self.assertFalse(result['success'])
+        self.assertIn('unknown tool', result['error'])
+
+    def test_off_allowlist_url_blocked(self):
+        from integrations.browser_research import tools
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=os.path.join(tmp, 'a.log')):
+                result = tools.dispatch(tool='YouTube_Transcript', user_id='u1',
+                                        url='https://evil.example.com/foo')
+        self.assertFalse(result['success'])
+        self.assertIn('not allowed', result['error'])
+
+    def test_youtube_transcript_returns_connection_mechanism(self):
+        from integrations.browser_research import tools
+        # Even on failure (no youtube_transcript_api), the response shape includes
+        # connection_mechanism so the agent can describe what it tried.
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=os.path.join(tmp, 'a.log')):
+                result = tools.dispatch(tool='YouTube_Transcript', user_id='u1',
+                                        url='https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+        self.assertIn('connection_mechanism', result)
+        self.assertEqual(result['connection_mechanism'], 'public_http')
+
+    def test_web_generic_bad_scheme_rejected(self):
+        # file:// scheme has no host → allowlist fails closed → error returned.
+        from integrations.browser_research import tools
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=os.path.join(tmp, 'a.log')):
+                result = tools.dispatch(tool='Read_Webpage', user_id='u1',
+                                        url='file:///etc/passwd')
+        self.assertFalse(result['success'])
+        self.assertIn('error', result)
+
+    def test_web_generic_bad_scheme_from_script(self):
+        # Direct script call (bypassing dispatcher) rejects non-http schemes.
+        from integrations.browser_research.scripts import web_generic
+        result = web_generic.fetch('ftp://example.com/x')
+        self.assertFalse(result['success'])
+        self.assertIn('http', result['error'])
+
+
+class TestYoutubeIdExtraction(unittest.TestCase):
+    """ID extraction handles common YouTube URL shapes."""
+
+    def test_standard_watch(self):
+        from integrations.browser_research.scripts import youtube
+        self.assertEqual(
+            youtube._extract_video_id('https://www.youtube.com/watch?v=dQw4w9WgXcQ'),
+            'dQw4w9WgXcQ',
+        )
+
+    def test_short_youtu_be(self):
+        from integrations.browser_research.scripts import youtube
+        self.assertEqual(
+            youtube._extract_video_id('https://youtu.be/dQw4w9WgXcQ'),
+            'dQw4w9WgXcQ',
+        )
+
+    def test_shorts(self):
+        from integrations.browser_research.scripts import youtube
+        self.assertEqual(
+            youtube._extract_video_id('https://www.youtube.com/shorts/dQw4w9WgXcQ'),
+            'dQw4w9WgXcQ',
+        )
+
+    def test_non_youtube_returns_none(self):
+        from integrations.browser_research.scripts import youtube
+        self.assertIsNone(youtube._extract_video_id('https://vimeo.com/123'))
+        self.assertIsNone(youtube._extract_video_id(''))
+
+
+class TestT1AdapterIsolation(unittest.TestCase):
+    """Drift-guard: no channel adapter file imports browser_research.
+
+    Captures the zero-regression guarantee: existing 31 websocket adapters
+    are untouched by the new T2 subsystem.
+    """
+
+    def test_no_channel_adapter_imports_browser_research(self):
+        channels_dir = os.path.join(HARTOS_ROOT, 'integrations', 'channels')
+        offenders: list[str] = []
+        for root, dirs, files in os.walk(channels_dir):
+            # Skip vendored node_modules — Baileys & friends are JS, not our concern.
+            if 'node_modules' in dirs:
+                dirs.remove('node_modules')
+            if '__pycache__' in dirs:
+                dirs.remove('__pycache__')
+            for fname in files:
+                if not fname.endswith('.py'):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, encoding='utf-8') as f:
+                        src = f.read()
+                except OSError:
+                    continue
+                if 'browser_research' in src:
+                    offenders.append(fpath)
+        self.assertEqual(offenders, [],
+                         f'channel adapters must not import browser_research; offenders: {offenders}')
+
+
+if __name__ == '__main__':
+    unittest.main()
