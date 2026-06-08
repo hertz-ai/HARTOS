@@ -689,23 +689,35 @@ def force_state_through_valid_path(user_prompt: str, action_id: int, target_stat
         )
         return True
 
-    # Get the path to target state
+    # Resolve the step sequence.  An enumerated MULTI-STEP shortcut in
+    # state_paths wins (it threads through intermediate states that carry
+    # side-effects, e.g. ASSIGNED→COMPLETED via IN_PROGRESS).  Otherwise fall
+    # back to the DIRECT edge whenever validate_state_transition allows it —
+    # this keeps valid_transitions the single source of truth for "is this edge
+    # legal" and state_paths a pure shortcut table, instead of two maps that
+    # silently drift.  Without the fallback, a recovery edge added to
+    # valid_transitions but not mirrored here was unreachable: #128's
+    # RECIPE_REQUESTED→TERMINATED couldn't be forced, so the flow-complete force
+    # (create_recipe.py:4464) left a stuck recipe_requested action in
+    # IN_PROGRESS and the goal never completed.
     path_key = (current_state, target_state)
     if path_key in state_paths:
         path = state_paths[path_key]
-        logger.info(f"🔧 Auto-path for Action {action_id}: {current_state.value} → {target_state.value}")
-
-        # Execute each step in the path
-        for step_state in path:
-            try:
-                set_action_state(user_prompt, action_id, step_state, f"auto-path: {reason}")
-            except StateTransitionError as e:
-                logger.error(f"[ERROR] Auto-path failed at {step_state.value}: {e}")
-                return False
-        return True
+    elif validate_state_transition(user_prompt, action_id, target_state):
+        path = [target_state]
     else:
         logger.error(f"[ERROR] No valid path from {current_state.value} to {target_state.value}")
         return False
+
+    logger.info(f"🔧 Auto-path for Action {action_id}: {current_state.value} → {target_state.value}")
+    # Execute each step in the path
+    for step_state in path:
+        try:
+            set_action_state(user_prompt, action_id, step_state, f"auto-path: {reason}")
+        except StateTransitionError as e:
+            logger.error(f"[ERROR] Auto-path failed at {step_state.value}: {e}")
+            return False
+    return True
 
 
 # State tracking

@@ -110,3 +110,44 @@ def test_recipe_requested_has_recovery_edges():
     finally:
         with L._state_lock:
             L.action_states.pop(up, None)
+
+
+def test_force_path_recipe_requested_to_terminated_completes():
+    """#128 sufficiency — the recovery edge must also be reachable via
+    force_state_through_valid_path, the API the flow-complete logic actually uses.
+
+    create_recipe.py:4464 drives every non-terminated action to TERMINATED with
+    force_state_through_valid_path(...), which consults the SEPARATE state_paths
+    map — not validate_state_transition's valid_transitions map.  A stuck
+    recipe_requested action had no (RECIPE_REQUESTED, TERMINATED) entry there, so
+    the force returned False ('No valid path') and the action stayed
+    recipe_requested → ledger IN_PROGRESS → the goal never completed, EVEN with
+    the valid_transitions edge added.  force_state_through_valid_path now falls
+    back to the direct edge whenever validate_state_transition allows it, so
+    valid_transitions is the single authority and state_paths is only multi-step
+    shortcuts.  The action must actually END in TERMINATED (→ ledger COMPLETED).
+    """
+    try:
+        import lifecycle_hooks as L
+    except Exception as e:
+        pytest.skip(f"lifecycle_hooks unavailable: {e}")
+
+    up, aid = 'u128_force', 3
+    with L._state_lock:
+        L.action_states.setdefault(up, {})[aid] = L.ActionState.RECIPE_REQUESTED
+    try:
+        ok = L.force_state_through_valid_path(
+            up, aid, L.ActionState.TERMINATED, "flow complete")
+        assert ok is True, "force-terminate of a stuck recipe_requested action must succeed"
+        assert L.get_action_state(up, aid) == L.ActionState.TERMINATED, (
+            "action must actually reach TERMINATED (→ ledger COMPLETED), not stay "
+            "recipe_requested (→ ledger IN_PROGRESS)")
+        # the multi-step paths that ARE enumerated must still be honoured (the
+        # fallback only fires for un-enumerated pairs, so no regression there).
+        with L._state_lock:
+            L.action_states[up][aid] = L.ActionState.ASSIGNED
+        assert L.force_state_through_valid_path(
+            up, aid, L.ActionState.COMPLETED, "enumerated multi-step") is True
+    finally:
+        with L._state_lock:
+            L.action_states.pop(up, None)
