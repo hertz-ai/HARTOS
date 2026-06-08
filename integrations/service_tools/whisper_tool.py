@@ -1133,7 +1133,7 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False) -> tuple:
             'language': None,
         })
         if 'error' in result and not result.get('raw_json'):
-            logger.debug(f"Streaming transcribe failed: {result.get('error')}")
+            logger.warning(f"Streaming STT transcribe failed (returning empty text): {result.get('error')}")
             return ('', 'unknown')
         raw = result.get('raw_json') or json.dumps(result)
         try:
@@ -1142,7 +1142,7 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False) -> tuple:
         except json.JSONDecodeError:
             return ('', 'unknown')
     except Exception as e:
-        logger.debug(f"Streaming transcribe failed: {e}")
+        logger.warning(f"Streaming STT transcribe failed (returning empty text): {e}", exc_info=True)
         return ('', 'unknown')
     finally:
         if tmp is not None:
@@ -1174,6 +1174,25 @@ def start_stt_stream_server(port: int = 0) -> Optional[int]:
             port = get_port('stt_stream')
         except Exception:
             port = 8005  # default fallback
+
+    # Surface STT-engine availability LOUDLY at startup. A missing engine is why
+    # streaming STT silently returned '' "for so long" — the per-transcribe
+    # failure was only logged at debug (below). sherpa-onnx is primary,
+    # openai-whisper the fallback. find_spec checks importability without the
+    # cost of importing.
+    try:
+        import importlib.util as _ilu
+        if _ilu.find_spec('sherpa_onnx') is None:
+            _legacy_ok = _ilu.find_spec('whisper') is not None
+            logger.error(
+                "STT engine NOT installed: sherpa-onnx is missing%s. The :8005 "
+                "streaming STT server will bind but EVERY transcribe returns '' "
+                "(empty) — add sherpa-onnx>=1.11.0 (+ onnxruntime) to the bundle "
+                "deps.",
+                "" if _legacy_ok else
+                " AND the openai-whisper fallback is also missing")
+    except Exception:
+        pass
 
     import asyncio
     import threading
