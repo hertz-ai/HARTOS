@@ -3221,38 +3221,10 @@ function focusAgent() {{
   document.getElementById('agent-input').focus();
   document.getElementById('agent-pill').classList.add('expanded');
 }}
-function askAgent() {{
-  const input = document.getElementById('agent-input');
-  const text = input.value.trim();
-  if(!text) return;
-  input.value = '';
-  const resp = document.getElementById('agent-resp');
-  resp.textContent = 'Thinking...';
-  resp.classList.add('visible');
-
-  // Check for theme commands first
-  const lower = text.toLowerCase();
-  if(lower.includes('theme')||lower.includes('font')||lower.includes('bigger')||
-     lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
-    handleThemeCommand(lower, resp);
-    return;
-  }}
-  // Check for panel open commands
-  if(lower.startsWith('open ')) {{
-    const target = lower.replace('open ','').trim();
-    const match = Object.entries(MANIFEST).find(([k,v])=>
-      v.title.toLowerCase().includes(target)||k.includes(target));
-    if(match) {{ openPanel(match[0]); resp.textContent='Opened '+match[1].title; return; }}
-  }}
-
-  fetch(SHELL+'/api/agent/ask',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{text}})}})
-    .then(r=>r.json()).then(data=>{{
-      const txt = data.response || data.error || 'No response';
-      resp.textContent = txt;
-      speakText(txt, 'chat_response');
-    }}).catch(()=>{{ resp.textContent='Could not reach agent'; }});
-}}
+// askAgent() removed: it duplicated acSend() but wrote to the collapsed pill
+// (#agent-resp). With voice now routed through acSend (startRecording.onstop)
+// and the pill quick-ask copying into #ac-input (input line ~1180), acSend is
+// the single send path — no parallel send/route to drift.
 
 // ═══ Floating Assistant Chat ═══
 const AC_CAPS = [
@@ -3560,6 +3532,7 @@ document.addEventListener('click', e => {{
 let mediaRecorder = null;
 let audioChunks = [];
 let isRecording = false;
+let _acAudio = null;  // current server-TTS <audio>, tracked so user speech can interrupt it (barge-in)
 
 function toggleVoice() {{
   if(isRecording) {{ stopRecording(); return; }}
@@ -3567,6 +3540,7 @@ function toggleVoice() {{
 }}
 
 async function startRecording() {{
+  acStopSpeaking();  // barge-in: stop any in-progress TTS the instant the user starts speaking
   try {{
     const stream = await navigator.mediaDevices.getUserMedia({{audio:true}});
     const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '';
@@ -3578,19 +3552,21 @@ async function startRecording() {{
       const blob = new Blob(audioChunks, {{type: mediaRecorder.mimeType || 'audio/webm'}});
       const formData = new FormData();
       formData.append('audio', blob, 'voice.webm');
-      const resp = document.getElementById('agent-resp');
-      resp.textContent = 'Transcribing...';
-      resp.classList.add('visible');
+      // Route the transcript into the SAME conversation surface as typed
+      // input (#ac-input -> acSend -> #ac-messages). The mic lives inside the
+      // open floating chat, so the old #agent-input/askAgent target dropped
+      // voice turns into the collapsed pill where they were never visible.
+      showToast('Voice','Transcribing...','info');
       try {{
         const r = await fetch(SHELL+'/api/voice', {{method:'POST', body:formData}});
         const data = await r.json();
         if(data.text) {{
-          document.getElementById('agent-input').value = data.text;
-          askAgent();
+          const aci = document.getElementById('ac-input');
+          if(aci) {{ aci.value = data.text; acSend(); }}
         }} else if(data.error) {{
-          resp.textContent = data.error;
+          showToast('Voice', data.error, 'warning');
         }}
-      }} catch(err) {{ resp.textContent = 'Voice processing failed'; }}
+      }} catch(err) {{ showToast('Voice', 'Voice processing failed', 'warning'); }}
     }};
     mediaRecorder.start();
     isRecording = true;
@@ -3608,10 +3584,19 @@ function stopRecording() {{
   if(btn) btn.classList.remove('recording');
 }}
 
+// Stop any in-progress TTS — browser SpeechSynthesis + the server <audio>.
+// The single canonical "stop talking" (there was none before): used for
+// barge-in (startRecording) and to avoid overlapping replies (speakText).
+function acStopSpeaking() {{
+  try {{ if('speechSynthesis' in window) speechSynthesis.cancel(); }} catch(e) {{}}
+  try {{ if(_acAudio) {{ _acAudio.pause(); _acAudio = null; }} }} catch(e) {{}}
+}}
+
 // TTS helper — hybrid: browser instant + server quality
 function speakText(text, source) {{
   if(!text || PERF.potato) return;
   source = source || 'chat_response';
+  acStopSpeaking();  // never overlap two replies; also gives _acAudio a clean handle
   // 1. Browser instant feedback (Web Speech API)
   if('speechSynthesis' in window) {{
     const utt = new SpeechSynthesisUtterance(text);
@@ -3626,8 +3611,8 @@ function speakText(text, source) {{
   }}).then(function(r){{ return r.json(); }}).then(function(d){{
     if(d.audio_url && !d.error) {{
       if('speechSynthesis' in window) speechSynthesis.cancel();
-      var a = new Audio(SHELL+d.audio_url);
-      a.play().catch(function(){{}});
+      _acAudio = new Audio(SHELL+d.audio_url);
+      _acAudio.play().catch(function(){{}});
     }}
   }}).catch(function(){{}});
 }}
