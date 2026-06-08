@@ -1291,6 +1291,58 @@ def build_core_tool_closures(ctx):
             YouTube_Transcript,
         ))
 
+        # T2: cookie-authenticated read on user's logged-in platform sessions.
+        # Routes through web_crawler.crawl_url_with_cookies (extending the
+        # canonical crawler) with AccountVault cookies + optional CDP attach.
+        @log_tool_execution
+        def Search_Platform(
+            platform: Annotated[str, "twitter / reddit / linkedin / bilibili / xiaohongshu / weibo"],
+            query: Annotated[str, "Search keywords/phrase."],
+            handle: Annotated[Optional[str], "Vault handle whose cookies to use; first if omitted."] = None,
+        ) -> str:
+            """Search a platform using the user's logged-in session cookies.
+
+            Returns JSON with success/markdown/connection_mechanism — the
+            connection_mechanism tells the agent (and user) how access happened
+            (obscura_b2_cdp_user_chrome / obscura_b1_headless_profile).
+            Consent-gated on `web_research:<platform>`.
+            """
+            result = br_tools_module.dispatch(
+                tool='Search_Platform', user_id=str(user_id),
+                platform=platform, query=query, handle=handle,
+            )
+            return json.dumps(result, ensure_ascii=False)
+
+        tools.append((
+            "Search_Platform",
+            "Search a social platform (twitter/reddit/linkedin/bilibili/xiaohongshu/weibo) "
+            "using the user's logged-in session. Input: platform, query, optional handle. "
+            "Returns JSON with markdown content + connection_mechanism describing how the "
+            "agent accessed it (your Chrome, headless profile, or public). Consent-gated.",
+            Search_Platform,
+        ))
+
+        @log_tool_execution
+        def Read_Timeline(
+            platform: Annotated[str, "twitter / reddit / linkedin / bilibili / xiaohongshu / weibo"],
+            target_handle: Annotated[str, "Whose timeline to read (e.g. '@elonmusk')."],
+            handle: Annotated[Optional[str], "Vault handle whose cookies to use; first if omitted."] = None,
+        ) -> str:
+            """Read another user's public timeline via your logged-in browser session."""
+            result = br_tools_module.dispatch(
+                tool='Read_Timeline', user_id=str(user_id),
+                platform=platform, target_handle=target_handle, handle=handle,
+            )
+            return json.dumps(result, ensure_ascii=False)
+
+        tools.append((
+            "Read_Timeline",
+            "Read someone's public timeline on a platform via your logged-in session. "
+            "Input: platform, target_handle. Returns markdown + connection_mechanism. "
+            "Consent-gated on web_research:<platform>.",
+            Read_Timeline,
+        ))
+
         # NOTE: Read_Webpage was removed 2026-06-08 as a parallel-path violation.
         # The canonical "fetch a URL's content" tool is `data_extraction_from_url`
         # above (line ~1008), which already delegates to Crawl4AI →

@@ -113,19 +113,58 @@ class TestDomainAllowlist(unittest.TestCase):
         self.assertFalse(dal.host_allowed('youtube', 'not-a-url'))
 
 
-class TestVaultStub(unittest.TestCase):
-    """C1 stub: in-memory only, no cookies, no encryption yet."""
+class TestVaultEncrypted(unittest.TestCase):
+    """C4: AES-GCM encrypted-at-rest vault with cookie storage."""
 
     def test_add_get_revoke_lifecycle(self):
         from integrations.browser_research.vault import AccountVault, Account
-        v = AccountVault()
-        acc = Account(platform='twitter', handle='@me', capabilities={'read'})
-        v.add(acc)
-        self.assertIs(v.get('twitter', '@me'), acc)
-        self.assertEqual(v.list_platforms(), ['twitter'])
-        self.assertTrue(v.revoke('twitter', '@me'))
-        self.assertIsNone(v.get('twitter', '@me'))
-        self.assertFalse(v.revoke('twitter', '@me'))
+        with tempfile.TemporaryDirectory() as tmp:
+            v = AccountVault(path=os.path.join(tmp, 'vault.enc'))
+            cookies = [{'name': 'auth_token', 'value': 'abc123', 'domain': '.x.com', 'path': '/'}]
+            acc = Account(platform='twitter', handle='@me', cookies=cookies,
+                          capabilities={'read', 'post'})
+            v.add(acc)
+            got = v.get('twitter', '@me')
+            self.assertIsNotNone(got)
+            self.assertEqual(got.platform, 'twitter')
+            self.assertEqual(got.handle, '@me')
+            self.assertEqual(got.cookies, cookies)
+            self.assertEqual(got.capabilities, {'read', 'post'})
+            self.assertEqual(v.list_platforms(), ['twitter'])
+            self.assertEqual(v.list_handles('twitter'), ['@me'])
+            self.assertTrue(v.revoke('twitter', '@me'))
+            self.assertIsNone(v.get('twitter', '@me'))
+            self.assertFalse(v.revoke('twitter', '@me'))
+
+    def test_vault_persists_across_instances(self):
+        from integrations.browser_research.vault import AccountVault, Account
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'vault.enc')
+            v1 = AccountVault(path=path)
+            v1.add(Account(platform='reddit', handle='u/test',
+                           cookies=[{'name': 'session', 'value': 's1'}]))
+            # Fresh instance reads same disk
+            v2 = AccountVault(path=path)
+            got = v2.get('reddit', 'u/test')
+            self.assertIsNotNone(got)
+            self.assertEqual(got.cookies[0]['value'], 's1')
+
+    def test_vault_encrypts_at_rest(self):
+        """Cookie value must not appear in plaintext on disk if cryptography is available."""
+        from integrations.browser_research.vault import AccountVault, Account
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
+        except ImportError:
+            self.skipTest('cryptography not installed; vault degrades to plaintext (acceptable)')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'vault.enc')
+            v = AccountVault(path=path)
+            v.add(Account(platform='twitter', handle='@me',
+                          cookies=[{'name': 'auth_token', 'value': 'SECRET_VALUE_XYZ'}]))
+            with open(path, encoding='utf-8') as f:
+                disk = f.read()
+            self.assertNotIn('SECRET_VALUE_XYZ', disk,
+                             'cookie value must be encrypted at rest')
 
 
 class TestDriverModeProbe(unittest.TestCase):
@@ -283,6 +322,95 @@ class TestAgentToolRegistration(unittest.TestCase):
                          'Read_Webpage must NOT shadow data_extraction_from_url')
         self.assertIn('data_extraction_from_url', names,
                       'data_extraction_from_url is the canonical URL-fetch tool')
+
+
+class TestPerPlatformDispatch(unittest.TestCase):
+    """C4: Search_Platform / Read_Timeline route by `platform` kwarg + consent gate."""
+
+    def test_search_platform_without_platform_kwarg_fails(self):
+        from integrations.browser_research import tools
+        result = tools.dispatch(tool='Search_Platform', user_id='u1', query='foo')
+        self.assertFalse(result['success'])
+        self.assertIn('platform', result['error'])
+
+    def test_search_platform_unknown_platform_fails(self):
+        from integrations.browser_research import tools
+        result = tools.dispatch(tool='Search_Platform', user_id='u1',
+                                platform='myspace', query='foo')
+        self.assertFalse(result['success'])
+        self.assertIn('platform', result['error'])
+
+    def test_search_platform_consent_denied(self):
+        from integrations.browser_research import tools
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=os.path.join(tmp, 'a.log')):
+                result = tools.dispatch(
+                    tool='Search_Platform', user_id='u1',
+                    platform='twitter', query='ai news',
+                    consent_check=lambda uid, scope: False,
+                )
+        self.assertFalse(result['success'])
+        self.assertIn('consent required', result['error'])
+        self.assertEqual(result['liquid_ui']['type'], 'consent_prompt')
+        self.assertEqual(result['liquid_ui']['scope'], 'web_research:twitter')
+
+    def test_search_platform_with_consent_routes_to_twitter_script(self):
+        """Consent granted → script_mod.search() invoked.  Mock the crawler.
+
+        twitter.py imports fetch_with_session into its own namespace, so we
+        patch THAT binding (not _base's), per how Python imports work.
+        """
+        # Force import so we can patch the bound name
+        from integrations.browser_research.scripts import twitter as _tw  # noqa: F401
+        from integrations.browser_research import tools
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=os.path.join(tmp, 'a.log')):
+                with patch('integrations.browser_research.scripts.twitter.fetch_with_session',
+                           return_value={'success': True, 'url': 'https://x.com/search?q=ai',
+                                         'markdown': 'mocked',
+                                         'connection_mechanism': 'obscura_b1_headless_profile'}):
+                    result = tools.dispatch(
+                        tool='Search_Platform', user_id='u1',
+                        platform='twitter', query='ai',
+                        consent_check=lambda uid, scope: True,
+                    )
+        self.assertTrue(result['success'])
+        self.assertEqual(result['action'], 'search')
+        self.assertEqual(result['query'], 'ai')
+        self.assertEqual(result['connection_mechanism'], 'obscura_b1_headless_profile')
+
+    def test_read_timeline_requires_target_handle(self):
+        from integrations.browser_research import tools
+        result = tools.dispatch(
+            tool='Read_Timeline', user_id='u1',
+            platform='twitter',
+            consent_check=lambda uid, scope: True,
+        )
+        self.assertFalse(result['success'])
+        self.assertIn('target_handle', result['error'])
+
+
+class TestCrawlerExtension(unittest.TestCase):
+    """C4: web_crawler.crawl_url_with_cookies exists + accepts cookies/cdp."""
+
+    def test_extension_signature(self):
+        from integrations import web_crawler
+        self.assertTrue(callable(web_crawler.crawl_url_with_cookies))
+        # Sanity: it accepts the kwargs we'll be calling it with.
+        import inspect
+        sig = inspect.signature(web_crawler.crawl_url_with_cookies)
+        self.assertIn('cookies', sig.parameters)
+        self.assertIn('cdp_endpoint', sig.parameters)
+        self.assertIn('timeout', sig.parameters)
+
+    def test_existing_crawl_url_unchanged(self):
+        """Zero-regression: the canonical crawl_url is still there with its signature."""
+        from integrations import web_crawler
+        self.assertTrue(callable(web_crawler.crawl_url))
+        self.assertTrue(callable(web_crawler.crawl_url_for_agent))
+        self.assertTrue(callable(web_crawler.crawl_urls))
 
 
 class TestT1AdapterIsolation(unittest.TestCase):

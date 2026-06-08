@@ -30,10 +30,20 @@ logger = logging.getLogger('browser_research.tools')
 # browser_research would create a parallel path.
 _TOOL_ROUTES: dict[str, tuple[str, str]] = {
     'YouTube_Transcript':  ('youtube',     'transcript'),
-    # T2 routes registered as their scripts land (C4+):
-    # 'Search_Platform':  per-platform; uses web_crawler with vault cookies
-    # 'Read_Timeline':    per-platform; uses web_crawler with vault cookies
-    # 'Post_As_User':     per-platform; uses web_crawler with vault cookies
+    # T2 routes — dispatched by `platform` arg.  Tool name → script wires the
+    # CANONICAL action (search/timeline/post); the script module is resolved
+    # at dispatch time from the `platform` kwarg.  See `dispatch()` below.
+    'Search_Platform':     ('__per_platform__', 'search'),
+    'Read_Timeline':       ('__per_platform__', 'timeline'),
+}
+
+
+# Allowed platforms for the per-platform routes.  Drift-guarded against
+# domain_allowlist so a new script must declare both its allowed domains AND
+# its tool-route eligibility (fail-closed default).
+_PER_PLATFORM_ALLOWED = {
+    'twitter', 'reddit', 'linkedin',
+    'bilibili', 'xiaohongshu', 'weibo', 'douyin',
 }
 
 
@@ -51,6 +61,10 @@ def dispatch(
     *,
     url: Optional[str] = None,
     language: str = 'en',
+    platform: Optional[str] = None,
+    query: Optional[str] = None,
+    target_handle: Optional[str] = None,
+    handle: Optional[str] = None,
     consent_check=None,
     **extra: Any,
 ) -> dict:
@@ -58,6 +72,8 @@ def dispatch(
 
     `consent_check(user_id, scope) -> bool` injected to keep this module
     independent of consent_service at import time (and trivially testable).
+    For T2 tools (Search_Platform / Read_Timeline / Post_As_User), the
+    `platform` kwarg picks the script module.
     """
     route = _TOOL_ROUTES.get(tool)
     if route is None:
@@ -66,6 +82,44 @@ def dispatch(
             'error': f'unknown tool: {tool!r}. known: {sorted(_TOOL_ROUTES)}',
         }
     script_name, action = route
+
+    # T2 per-platform dispatch — resolve script_name from `platform` kwarg.
+    if script_name == '__per_platform__':
+        if not platform or platform not in _PER_PLATFORM_ALLOWED:
+            return {
+                'success': False,
+                'error': f'tool {tool!r} requires platform kwarg from '
+                         f'{sorted(_PER_PLATFORM_ALLOWED)}; got {platform!r}',
+            }
+        # Consent gate — T2 platforms need explicit user grant.
+        if consent_check is None:
+            try:
+                from integrations.social.consent_service import ConsentService
+                def _default_check(uid, scope):
+                    try:
+                        return ConsentService.has_capability(uid, scope)
+                    except Exception:
+                        return False
+                consent_check = _default_check
+            except Exception:
+                consent_check = lambda uid, scope: False
+        scope = f'web_research:{platform}'
+        if not consent_check(user_id, scope):
+            audit.append(
+                user_id=user_id, tool=tool, platform=platform,
+                connection_mechanism='consent_denied', success=False,
+                error=f'consent missing for scope {scope!r}',
+            )
+            return {
+                'success': False,
+                'error': f'consent required: grant {scope!r} via /admin/web-research',
+                'liquid_ui': {
+                    'type': 'consent_prompt',
+                    'scope': scope,
+                    'platform': platform,
+                },
+            }
+        script_name = platform
 
     # Domain allowlist gate (T3 web_generic accepts any URL by allowlist design).
     if url is not None and not domain_allowlist.host_allowed(script_name, url):
@@ -91,7 +145,7 @@ def dispatch(
         if script_name == 'youtube':
             from .scripts import youtube as script_mod
         else:
-            # Future scripts land here (C4+).
+            # Per-platform scripts: twitter / reddit / linkedin / bilibili / ...
             from importlib import import_module
             script_mod = import_module(f'{__package__}.scripts.{script_name}')
     except ImportError as exc:
@@ -105,12 +159,27 @@ def dispatch(
     if handler is None:
         return {'success': False, 'error': f'script {script_name!r} has no action {action!r}'}
 
-    # Build kwargs — only pass what the script declares it accepts.
+    # Build kwargs — only pass what the script's action accepts.
     kwargs: dict[str, Any] = {}
-    if url is not None:
-        kwargs['url'] = url
     if action == 'transcript':
+        if url is not None:
+            kwargs['url'] = url
         kwargs['language'] = language
+    elif action == 'search':
+        if query is None:
+            return {'success': False, 'error': 'search requires `query` kwarg'}
+        kwargs['query'] = query
+        if handle is not None:
+            kwargs['handle'] = handle
+    elif action == 'timeline':
+        if target_handle is None:
+            return {'success': False, 'error': 'timeline requires `target_handle` kwarg'}
+        kwargs['target_handle'] = target_handle
+        if handle is not None:
+            kwargs['viewer_handle'] = handle
+    else:
+        if url is not None:
+            kwargs['url'] = url
     kwargs.update(extra)
 
     try:
