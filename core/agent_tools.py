@@ -1270,6 +1270,11 @@ def build_core_tool_closures(ctx):
 
             Returns a JSON string with success/text/segment_count/connection_mechanism.
             Domain-locked to youtube.com / youtu.be by the dispatcher's allowlist.
+
+            Note: this is distinct from `data_extraction_from_url` because YouTube
+            transcripts use the youtube_transcript_api endpoint (captions/cc), not
+            page-content scraping.  Generic URL fetch belongs in
+            data_extraction_from_url (Crawl4AI → web_crawler.py).
             """
             result = br_tools_module.dispatch(
                 tool='YouTube_Transcript', user_id=str(user_id),
@@ -1279,33 +1284,21 @@ def build_core_tool_closures(ctx):
 
         tools.append((
             "YouTube_Transcript",
-            "Fetch a YouTube video's transcript text. No login, no API key. "
-            "Input: full YouTube URL (watch/youtu.be/shorts) + optional language code.",
+            "Fetch a YouTube video's transcript text via the captions/cc endpoint. "
+            "No login, no API key. Input: full YouTube URL (watch/youtu.be/shorts) "
+            "+ optional language code. For generic web pages use "
+            "data_extraction_from_url instead — Crawl4AI is the canonical URL fetch.",
             YouTube_Transcript,
         ))
 
-        @log_tool_execution
-        def Read_Webpage(
-            url: Annotated[str, "Full http:// or https:// URL of the page to read."],
-            prefer_clean_text: Annotated[bool, "Try Jina Reader proxy for clean markdown first."] = True,
-        ) -> str:
-            """Fetch a public web page's content without authentication.
-
-            Strategy ladder: Jina Reader (clean markdown) → raw HTTP.
-            1 MB body cap; 10s timeout.  Returns JSON with success/text/connection_mechanism.
-            """
-            result = br_tools_module.dispatch(
-                tool='Read_Webpage', user_id=str(user_id),
-                url=url, prefer_clean_text=prefer_clean_text,
-            )
-            return json.dumps(result, ensure_ascii=False)
-
-        tools.append((
-            "Read_Webpage",
-            "Fetch a public web page's text. No login. Jina Reader → raw HTTP fallback. "
-            "Input: full URL (must start http:// or https://).",
-            Read_Webpage,
-        ))
+        # NOTE: Read_Webpage was removed 2026-06-08 as a parallel-path violation.
+        # The canonical "fetch a URL's content" tool is `data_extraction_from_url`
+        # above (line ~1008), which already delegates to Crawl4AI →
+        # integrations/web_crawler.py (Playwright/Chromium headless with a
+        # requests+BeautifulSoup fallback).  T2 (cookie-authenticated) work in
+        # commits C4+ EXTENDS web_crawler.py with cookie injection + B2 CDP
+        # attach, instead of building a parallel driver.  See
+        # memory/project_browser_research_subsystem.md for the corrected plan.
 
     return tools
 

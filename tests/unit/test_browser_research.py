@@ -170,7 +170,9 @@ class TestToolsDispatch(unittest.TestCase):
         from integrations.browser_research import tools
         names = {t['name'] for t in tools.list_tools()}
         self.assertIn('YouTube_Transcript', names)
-        self.assertIn('Read_Webpage', names)
+        # Read_Webpage removed 2026-06-08 — was parallel path to
+        # data_extraction_from_url (Crawl4AI → web_crawler.py).
+        self.assertNotIn('Read_Webpage', names)
 
     def test_unknown_tool_returns_error(self):
         from integrations.browser_research import tools
@@ -200,23 +202,14 @@ class TestToolsDispatch(unittest.TestCase):
         self.assertIn('connection_mechanism', result)
         self.assertEqual(result['connection_mechanism'], 'public_http')
 
-    def test_web_generic_bad_scheme_rejected(self):
-        # file:// scheme has no host → allowlist fails closed → error returned.
+    def test_read_webpage_removed_unknown_tool(self):
+        # Drift-guard for the parallel-path removal: Read_Webpage must NOT route.
+        # data_extraction_from_url is the canonical "fetch a URL" tool — see
+        # core/agent_tools.py:1008 + integrations/web_crawler.py (Crawl4AI).
         from integrations.browser_research import tools
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch('integrations.browser_research.audit._log_path',
-                       return_value=os.path.join(tmp, 'a.log')):
-                result = tools.dispatch(tool='Read_Webpage', user_id='u1',
-                                        url='file:///etc/passwd')
+        result = tools.dispatch(tool='Read_Webpage', user_id='u1')
         self.assertFalse(result['success'])
-        self.assertIn('error', result)
-
-    def test_web_generic_bad_scheme_from_script(self):
-        # Direct script call (bypassing dispatcher) rejects non-http schemes.
-        from integrations.browser_research.scripts import web_generic
-        result = web_generic.fetch('ftp://example.com/x')
-        self.assertFalse(result['success'])
-        self.assertIn('http', result['error'])
+        self.assertIn('unknown tool', result['error'])
 
 
 class TestYoutubeIdExtraction(unittest.TestCase):
@@ -285,8 +278,11 @@ class TestAgentToolRegistration(unittest.TestCase):
         names = {name for name, _desc, _fn in closures}
         self.assertIn('YouTube_Transcript', names,
                       'YouTube_Transcript must be registered (BR-C2)')
-        self.assertIn('Read_Webpage', names,
-                      'Read_Webpage must be registered (BR-C2)')
+        # Read_Webpage removed 2026-06-08: data_extraction_from_url is canonical.
+        self.assertNotIn('Read_Webpage', names,
+                         'Read_Webpage must NOT shadow data_extraction_from_url')
+        self.assertIn('data_extraction_from_url', names,
+                      'data_extraction_from_url is the canonical URL-fetch tool')
 
 
 class TestT1AdapterIsolation(unittest.TestCase):

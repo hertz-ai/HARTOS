@@ -21,14 +21,19 @@ from . import audit, domain_allowlist
 logger = logging.getLogger('browser_research.tools')
 
 
-# Tool → (script_module, action) wiring.  C1: T3 only.
+# Tool → (script_module, action) wiring.
+# YouTube_Transcript is the only T3 tool that belongs here — it has a distinct
+# data source (captions/cc endpoint), not generic URL scraping.
+# Generic URL fetch is intentionally NOT in this dispatcher: the canonical tool
+# is `data_extraction_from_url` in core/agent_tools.py:1008, which already
+# delegates to Crawl4AI → integrations/web_crawler.py.  Re-routing through
+# browser_research would create a parallel path.
 _TOOL_ROUTES: dict[str, tuple[str, str]] = {
     'YouTube_Transcript':  ('youtube',     'transcript'),
-    'Read_Webpage':        ('web_generic', 'fetch'),
     # T2 routes registered as their scripts land (C4+):
-    # 'Search_Platform':  varies per platform arg
-    # 'Read_Timeline':    varies per platform arg
-    # 'Post_As_User':     varies per platform arg
+    # 'Search_Platform':  per-platform; uses web_crawler with vault cookies
+    # 'Read_Timeline':    per-platform; uses web_crawler with vault cookies
+    # 'Post_As_User':     per-platform; uses web_crawler with vault cookies
 }
 
 
@@ -85,8 +90,6 @@ def dispatch(
     try:
         if script_name == 'youtube':
             from .scripts import youtube as script_mod
-        elif script_name == 'web_generic':
-            from .scripts import web_generic as script_mod
         else:
             # Future scripts land here (C4+).
             from importlib import import_module
