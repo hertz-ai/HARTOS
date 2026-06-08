@@ -1594,7 +1594,7 @@ function updateTaskbar() {{
     const active = id===focusedPanel ? 'active' : '';
     const icon = info.icon || 'web_asset';
     const title = info.title || id;
-    return '<div class="taskbar-chip glass '+active+'" onclick="taskbarClick(\''+id+'\')" title="'+title+'">' +
+    return '<div class="taskbar-chip glass '+active+'" onclick="taskbarClick(\\''+id+'\\')" title="'+title+'">' +
       '<span class="mi material-icons-round">'+icon+'</span>' +
       '<span class="chip-label">'+title+'</span></div>';
   }}).join('');
@@ -1659,7 +1659,7 @@ function buildStartMenu() {{
     if(!items.length) return;
     html += '<div class="start-group"><div class="start-group-label">'+group+'</div><div class="start-grid">';
     items.forEach(([id,p])=>{{
-      html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(\''+id+'\')">';
+      html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(\\''+id+'\\')">';
       html += '<span class="mi material-icons-round">'+(p.icon||'apps')+'</span>';
       html += '<span class="label">'+p.title+'</span></div>';
     }});
@@ -1670,7 +1670,7 @@ function buildStartMenu() {{
   if(sysItems.length) {{
     html += '<div class="start-group"><div class="start-group-label">System</div><div class="start-grid">';
     sysItems.forEach(([id,p])=>{{
-      html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(\''+id+'\')">';
+      html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(\\''+id+'\\')">';
       html += '<span class="mi material-icons-round">'+(p.icon||'settings')+'</span>';
       html += '<span class="label">'+p.title+'</span></div>';
     }});
@@ -1738,17 +1738,17 @@ function openPanel(id, opts) {{
   const title = opts.title || def.title || id;
   const icon = def.icon || 'web_asset';
 
-  panel.innerHTML = '<div class="panel-titlebar" onmousedown="startDrag(event,\''+id+'\')"'+
-    ' ondblclick="toggleMax(\''+id+'\')">'+
+  panel.innerHTML = '<div class="panel-titlebar" onmousedown="startDrag(event,\\''+id+'\\')"'+
+    ' ondblclick="toggleMax(\\''+id+'\\')">'+
     '<span class="mi material-icons-round">'+icon+'</span>'+
     '<span class="title">'+title+'</span>'+
     '<div class="ctrl">'+
-    '<span title="Minimize" onclick="minimizePanel(\''+id+'\')"><span class="mi material-icons-round" style="font-size:14px">minimize</span></span>'+
-    '<span title="Maximize" onclick="toggleMax(\''+id+'\')"><span class="mi material-icons-round" style="font-size:14px">crop_square</span></span>'+
-    '<span class="close" title="Close" onclick="closePanel(\''+id+'\')"><span class="mi material-icons-round" style="font-size:14px">close</span></span>'+
+    '<span title="Minimize" onclick="minimizePanel(\\''+id+'\\')"><span class="mi material-icons-round" style="font-size:14px">minimize</span></span>'+
+    '<span title="Maximize" onclick="toggleMax(\\''+id+'\\')"><span class="mi material-icons-round" style="font-size:14px">crop_square</span></span>'+
+    '<span class="close" title="Close" onclick="closePanel(\\''+id+'\\')"><span class="mi material-icons-round" style="font-size:14px">close</span></span>'+
     '</div></div>'+
     '<div class="panel-body" id="panel-body-'+id+'"></div>'+
-    '<div class="panel-resize" onmousedown="startResize(event,\''+id+'\')"></div>';
+    '<div class="panel-resize" onmousedown="startResize(event,\\''+id+'\\')"></div>';
 
   document.getElementById('panels').appendChild(panel);
   panel.addEventListener('mousedown', ()=>bringToFront(id));
@@ -1760,7 +1760,7 @@ function openPanel(id, opts) {{
   }} else if(def.route) {{
     if(PERF.lazyIframes) {{
       // Potato: placeholder until focused, then load iframe
-      body.innerHTML = '<div class="native-content" style="display:flex;align-items:center;justify-content:center;height:100%"><span class="mi material-icons-round" style="font-size:48px;color:var(--hart-muted);cursor:pointer" onclick="loadIframe(\''+id+'\',\''+def.route+'\')">touch_app</span></div>';
+      body.innerHTML = '<div class="native-content" style="display:flex;align-items:center;justify-content:center;height:100%"><span class="mi material-icons-round" style="font-size:48px;color:var(--hart-muted);cursor:pointer" onclick="loadIframe(\\''+id+'\\',\\''+def.route+'\\')">touch_app</span></div>';
       body.dataset.route = def.route;
       body.dataset.loaded = '0';
     }} else {{
@@ -2239,7 +2239,7 @@ function loadKeyboardShortcutsPanel(el) {{
       html += '<div class="ds-section-label">'+group+'</div><div class="ds-stagger">';
       groups[group].forEach(key=>{{
         if(!sc[key]) return;
-        const label = key.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+        const label = key.replace(/_/g,' ').replace(/\\b\w/g,c=>c.toUpperCase());
         html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-muted">keyboard</span>'+
           '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+label+'</div></div>'+
           '<span class="ds-list-item-trailing"><code style="background:#1a1a1a;padding:2px 8px;border-radius:4px;font-size:12px;color:var(--hart-accent)">'+sc[key]+'</code></span></div>';
@@ -2673,7 +2673,7 @@ function loadClipboardPanel(el) {{
     if(items.length===0) html += '<div class="ds-body-md ds-text-muted">Clipboard empty</div>';
     else items.slice(0,15).forEach((c,i)=>{{
       const preview = (c.text||c.content||'').substring(0,80);
-      html += '<div class="ds-list-item ds-list-item-interactive" onclick="fetch(SHELL+\\'/api/shell/clipboard/copy\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{text:\\''+preview.replace(/'/g,"\\\\'").replace(/\n/g,' ')+'\\'}})}}); showToast(\\'Clipboard\\',\\'Copied\\',\\'info\\')">'+
+      html += '<div class="ds-list-item ds-list-item-interactive" onclick="fetch(SHELL+\\'/api/shell/clipboard/copy\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{text:\\''+preview.replace(/'/g,"\\\\'").replace(/\\n/g,' ')+'\\'}})}}); showToast(\\'Clipboard\\',\\'Copied\\',\\'info\\')">'+
         '<span class="mi material-icons-round ds-list-item-icon ds-text-muted">content_paste</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary ds-truncate">'+preview+'</div>'+
         '<div class="ds-list-item-secondary">'+(c.time||'')+(c.pinned?' &middot; Pinned':'')+'</div></div></div>';
@@ -3268,7 +3268,7 @@ function initAssistantChat() {{
   const capsEl = document.getElementById('ac-caps');
   if(!capsEl) return;
   capsEl.innerHTML = AC_CAPS.map(c=>
-    '<div class="ac-cap'+(c.id===acActiveCap?' active':'')+'" onclick="acSelectCap(\''+c.id+'\')" title="'+c.name+'">'+
+    '<div class="ac-cap'+(c.id===acActiveCap?' active':'')+'" onclick="acSelectCap(\\''+c.id+'\\')" title="'+c.name+'">'+
     '<span class="mi material-icons-round">'+c.icon+'</span>'+c.name+'</div>'
   ).join('');
 
@@ -3469,7 +3469,7 @@ document.addEventListener('contextmenu', e => {{
 document.addEventListener('click', ()=>{{document.getElementById('ctx-menu').style.display='none';}});
 
 function ctxItem(icon,label,action) {{
-  return '<div class="ctx-menu-item" onclick="'+action+';document.getElementById(\'ctx-menu\').style.display=\'none\'">'+
+  return '<div class="ctx-menu-item" onclick="'+action+';document.getElementById(\\'ctx-menu\\').style.display=\\'none\\'">'+
     '<span class="mi material-icons-round">'+icon+'</span>'+label+'</div>';
 }}
 function ctxSep() {{ return '<div class="ctx-menu-sep"></div>'; }}
@@ -3818,7 +3818,7 @@ function renderAgentOverlay(ev) {{
     if(ev.filename) html += '<span class="ds-label-sm ds-text-muted" style="font-family:monospace">'+(ev.filename)+'</span>';
     if(ev.language) html += '<span class="ds-label-sm" style="color:var(--hart-accent);font-size:9px;text-transform:uppercase">'+(ev.language)+'</span>';
     html += '</div>';
-    html += '<pre style="margin:0;padding:10px;background:rgba(0,0,0,0.5);border-radius:8px;overflow-x:auto;font-family:\'Fira Code\',\'Cascadia Code\',monospace;font-size:12px;line-height:1.4;color:#e0e0e0;white-space:pre-wrap;word-break:break-all"><code>'+(ev.content||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</code></pre>';
+    html += '<pre style="margin:0;padding:10px;background:rgba(0,0,0,0.5);border-radius:8px;overflow-x:auto;font-family:\\'Fira Code\\',\\'Cascadia Code\\',monospace;font-size:12px;line-height:1.4;color:#e0e0e0;white-space:pre-wrap;word-break:break-all"><code>'+(ev.content||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</code></pre>';
 
   }} else if(type === 'markdown') {{
     var md = ev.content||'';
@@ -3833,7 +3833,7 @@ function renderAgentOverlay(ev) {{
     md = md.replace(/^# (.+)$/gm,'<div class="ds-body-lg" style="font-weight:700;margin-top:6px">$1</div>');
     md = md.replace(/^[-*] (.+)$/gm,'<div style="padding-left:12px">&#8226; $1</div>');
     md = md.replace(/^\d+\. (.+)$/gm,function(m,p1){{ return '<div style="padding-left:12px">'+m.split('.')[0]+'. '+p1+'</div>'; }});
-    md = md.replace(/\n/g,'<br>');
+    md = md.replace(/\\n/g,'<br>');
     html += '<div class="ds-body-sm" style="line-height:1.5">'+md+'</div>';
 
   }} else if(type === 'media') {{
@@ -3846,7 +3846,7 @@ function renderAgentOverlay(ev) {{
     }} else if(mediaType === 'audio' || src.match(/\.(mp3|wav|ogg|aac)($|\?)/i)) {{
       html += '<audio src="'+src+'" '+(ev.controls!==false?'controls':'')+' style="width:100%">'+alt+'</audio>';
     }} else {{
-      html += '<img src="'+src+'" alt="'+alt+'" style="width:100%;border-radius:8px;max-height:160px;object-fit:cover" onerror="this.style.display=\'none\'">';
+      html += '<img src="'+src+'" alt="'+alt+'" style="width:100%;border-radius:8px;max-height:160px;object-fit:cover" onerror="this.style.display=\\'none\\'">';
     }}
     if(ev.caption) html += '<div class="ds-label-sm ds-text-muted" style="margin-top:4px">'+(ev.caption)+'</div>';
 
@@ -3863,7 +3863,7 @@ function renderAgentOverlay(ev) {{
   }} else if(type === 'form') {{
     html += '<div class="ds-body-md" style="font-weight:600;margin-bottom:8px">'+(ev.title||'Form')+'</div>';
     var formId = 'form-'+(ev._ts||Date.now());
-    html += '<form id="'+formId+'" style="display:flex;flex-direction:column;gap:6px" onsubmit="event.preventDefault();var fd={{}};new FormData(this).forEach(function(v,k){{fd[k]=v}});fetch(SHELL+\''+(ev.action||'/api/a2ui')+'\',{{method:\'POST\',headers:{{\'Content-Type\':\'application/json\'}},body:JSON.stringify(fd)}}).catch(function(){{}});return false;">';
+    html += '<form id="'+formId+'" style="display:flex;flex-direction:column;gap:6px" onsubmit="event.preventDefault();var fd={{}};new FormData(this).forEach(function(v,k){{fd[k]=v}});fetch(SHELL+\\''+(ev.action||'/api/a2ui')+'\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify(fd)}}).catch(function(){{}});return false;">';
     (ev.fields||[]).forEach(function(f){{
       var ftype = f.type||'text';
       var fname = f.name||f.label||'field';
@@ -3891,7 +3891,7 @@ function renderAgentOverlay(ev) {{
       var text = typeof item === 'string' ? item : (item.label||item.text||item.name||JSON.stringify(item));
       var action = typeof item === 'object' ? item.action : null;
       if(action || ev.interactive) {{
-        html += '<li style="padding:2px 0;cursor:pointer;color:var(--hart-accent)" onclick="try{{fetch(SHELL+\''+( action||'/api/a2ui')+'\',{{method:\'POST\',headers:{{\'Content-Type\':\'application/json\'}},body:JSON.stringify({{selected:'+i+',item:\''+text.replace(/'/g,'\\\\\\\'')+'\'}})}})}}catch(e){{}}">'+(text)+'</li>';
+        html += '<li style="padding:2px 0;cursor:pointer;color:var(--hart-accent)" onclick="try{{fetch(SHELL+\\''+( action||'/api/a2ui')+'\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{selected:'+i+',item:\\''+text.replace(/'/g,'\\\\\\\'')+'\\'}})}})}}catch(e){{}}">'+(text)+'</li>';
       }} else {{
         html += '<li style="padding:2px 0">'+(text)+'</li>';
       }}
@@ -3903,9 +3903,9 @@ function renderAgentOverlay(ev) {{
     html += '<div class="ds-body-sm ds-text-muted" style="margin-bottom:8px">'+(ev.description||ev.action||'An agent requests your approval.')+'</div>';
     if(ev.agent_id) html += '<div class="ds-label-sm ds-text-muted" style="margin-bottom:6px">Agent: '+(ev.agent_id)+'</div>';
     html += '<div style="display:flex;gap:6px;justify-content:flex-end">';
-    html += '<button class="ds-btn ds-btn-primary ds-btn-sm" onclick="dsRipple(event);_postApproval(\''+((ev.agent_id||'').replace(/'/g,''))+'\',\''+((ev.action||'').replace(/'/g,''))+'\',\'approve\');this.closest(\'.agent-overlay\').remove()"><span>Approve</span></button>';
-    html += '<button class="ds-btn ds-btn-outline ds-btn-sm" onclick="dsRipple(event);_postApproval(\''+((ev.agent_id||'').replace(/'/g,''))+'\',\''+((ev.action||'').replace(/'/g,''))+'\',\'deny\');this.closest(\'.agent-overlay\').remove()"><span>Deny</span></button>';
-    html += '<button class="ds-btn ds-btn-ghost ds-btn-sm" onclick="dsRipple(event);this.closest(\'.agent-overlay\').remove()"><span>Later</span></button>';
+    html += '<button class="ds-btn ds-btn-primary ds-btn-sm" onclick="dsRipple(event);_postApproval(\\''+((ev.agent_id||'').replace(/'/g,''))+'\\',\\''+((ev.action||'').replace(/'/g,''))+'\\',\\'approve\\');this.closest(\\'.agent-overlay\\').remove()"><span>Approve</span></button>';
+    html += '<button class="ds-btn ds-btn-outline ds-btn-sm" onclick="dsRipple(event);_postApproval(\\''+((ev.agent_id||'').replace(/'/g,''))+'\\',\\''+((ev.action||'').replace(/'/g,''))+'\\',\\'deny\\');this.closest(\\'.agent-overlay\\').remove()"><span>Deny</span></button>';
+    html += '<button class="ds-btn ds-btn-ghost ds-btn-sm" onclick="dsRipple(event);this.closest(\\'.agent-overlay\\').remove()"><span>Later</span></button>';
     html += '</div>';
 
   }} else if(type === 'navigate') {{
@@ -3953,7 +3953,7 @@ function renderAgentOverlay(ev) {{
       section.className = 'start-group';
       section.innerHTML = '<div class="start-group-label">Recent Files</div><div class="start-grid">' +
         files.slice(0,8).map(function(f) {{
-          return '<div class="start-item" onclick="launchApp(\'xdg-open\')">' +
+          return '<div class="start-item" onclick="launchApp(\\'xdg-open\\')">' +
             '<span class="mi material-icons-round" style="color:var(--hart-muted)">description</span>' +
             '<span class="label" title="'+f.path+'">'+f.name+'</span></div>';
         }}).join('') + '</div>';
