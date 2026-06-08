@@ -48,6 +48,41 @@ _PER_PLATFORM_ALLOWED = {
 }
 
 
+def _resolve_db_session():
+    """Best-effort lookup of a SQLAlchemy session usable by ConsentService.
+
+    Tries (in order):
+      1. Flask request-scoped session via flask.g (when called inside a request)
+      2. integrations.social._db_helpers.get_session() / SessionLocal()
+      3. hevolve_database.session.SessionLocal()
+    Returns None if none are available (dispatcher falls back to consent denied).
+    """
+    # 1. Flask g.db (request-scoped)
+    try:
+        from flask import g, has_request_context
+        if has_request_context() and getattr(g, 'db', None) is not None:
+            return g.db
+    except Exception:
+        pass
+    # 2. social db helpers
+    for modpath, attr in (
+        ('integrations.social._db_helpers', 'get_session'),
+        ('integrations.social._db_helpers', 'SessionLocal'),
+        ('hevolve_database.session', 'SessionLocal'),
+    ):
+        try:
+            mod = __import__(modpath, fromlist=[attr])
+            fn = getattr(mod, attr, None)
+            if fn is None:
+                continue
+            sess = fn() if callable(fn) else fn
+            if sess is not None:
+                return sess
+        except Exception:
+            continue
+    return None
+
+
 def list_tools() -> list[dict]:
     """Public introspection — what's wired in this build."""
     return [
@@ -93,17 +128,26 @@ def dispatch(
                          f'{sorted(_PER_PLATFORM_ALLOWED)}; got {platform!r}',
             }
         # Consent gate — T2 platforms need explicit user grant.
+        # Real ConsentService.check_consent(db, user_id, consent_type, scope, agent_id)
+        # is the canonical API — needs a SQLAlchemy session.  Dispatcher is
+        # transport-agnostic (in-process + Flask), so we lazy-resolve a db
+        # session from whatever's available and fail-closed if neither works.
         if consent_check is None:
-            try:
-                from integrations.social.consent_service import ConsentService
-                def _default_check(uid, scope):
-                    try:
-                        return ConsentService.has_capability(uid, scope)
-                    except Exception:
+            def _default_check(uid, scope):
+                try:
+                    from integrations.social.consent_service import ConsentService
+                    db = _resolve_db_session()
+                    if db is None:
                         return False
-                consent_check = _default_check
-            except Exception:
-                consent_check = lambda uid, scope: False
+                    return ConsentService.check_consent(
+                        db, str(uid),
+                        consent_type='cloud_capability',
+                        scope=scope, agent_id=None,
+                    )
+                except Exception as exc:
+                    logger.debug('consent check failed (%s) — denying', exc)
+                    return False
+            consent_check = _default_check
         scope = f'web_research:{platform}'
         if not consent_check(user_id, scope):
             audit.append(

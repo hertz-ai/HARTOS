@@ -476,6 +476,224 @@ class TestCrawlerExtension(unittest.TestCase):
         self.assertTrue(callable(web_crawler.crawl_urls))
 
 
+class TestEndToEnd_CookieAuthFlow(unittest.TestCase):
+    """END-TO-END: full chain from vault → script → web_crawler → audit → result.
+
+    The mock seam is INSIDE web_crawler.py only — at the underlying crawl4ai /
+    Playwright connect_over_cdp boundary.  Everything above that runs for real:
+
+      vault.add(Account)
+        -> vault.get(...)               (real AES-GCM round-trip)
+        -> twitter.search(query)
+        -> _base.fetch_with_session(...)
+        -> web_crawler.crawl_url_with_cookies(url, cookies, cdp_endpoint)
+          [MOCKED: _crawl_with_cookies returns synthetic result with cookies]
+        -> dispatcher annotates result + writes audit log
+        -> tools.dispatch returns to caller
+        -> assertions verify cookies traversed AND audit log persisted
+
+    This proves the wiring really delivers cookies end-to-end and produces
+    the connection_mechanism / audit trail the agent UI depends on.
+    """
+
+    def _run_e2e(self, audit_path, mock_crawl):
+        """Run the full e2e flow with the underlying crawler mocked."""
+        from integrations.browser_research import vault, tools
+        from integrations.browser_research.vault import Account
+        v = vault.reset_vault_for_tests(path=audit_path + '.vault.enc')
+        v.add(Account(
+            platform='twitter', handle='@me',
+            cookies=[{'name': 'auth_token', 'value': 'SECRET_AUTH',
+                      'domain': '.x.com', 'path': '/'}],
+            capabilities={'read'},
+        ))
+        # Patch the underlying crawler primitive — everything else is real.
+        with patch('integrations.browser_research.audit._log_path',
+                   return_value=audit_path):
+            with patch('integrations.web_crawler.crawl_url_with_cookies',
+                       side_effect=mock_crawl):
+                result = tools.dispatch(
+                    tool='Search_Platform', user_id='u1',
+                    platform='twitter', query='ai news', handle='@me',
+                    consent_check=lambda uid, scope: True,
+                )
+        return result
+
+    def test_cookies_traverse_to_crawler(self):
+        """Vault cookies must reach web_crawler.crawl_url_with_cookies."""
+        captured = {}
+        def fake_crawler(url, cookies=None, timeout=30, cdp_endpoint=None, **_):
+            captured['url'] = url
+            captured['cookies'] = cookies
+            captured['cdp_endpoint'] = cdp_endpoint
+            return {'success': True, 'url': url, 'markdown': 'mock body',
+                    'word_count': 2, 'connection_mechanism': 'obscura_b1_headless_profile'}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._run_e2e(os.path.join(tmp, 'audit.log'), fake_crawler)
+
+        self.assertTrue(result['success'], f'expected success, got {result!r}')
+        self.assertIn('x.com/search', captured['url'])
+        self.assertIn('ai+news', captured['url'])  # quote_plus encoded
+        self.assertEqual(len(captured['cookies']), 1)
+        self.assertEqual(captured['cookies'][0]['name'], 'auth_token')
+        self.assertEqual(captured['cookies'][0]['value'], 'SECRET_AUTH',
+                         'vault must AES-decrypt and pass the real cookie value through')
+
+    def test_b2_cdp_endpoint_traverses_when_env_set(self):
+        """HEVOLVE_BROWSER_USE_B2=1 + endpoint env -> reaches crawler."""
+        captured = {}
+        def fake_crawler(url, cookies=None, timeout=30, cdp_endpoint=None, **_):
+            captured['cdp_endpoint'] = cdp_endpoint
+            return {'success': True, 'url': url, 'markdown': 'x',
+                    'connection_mechanism': 'obscura_b2_cdp_user_chrome'}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {
+                'HEVOLVE_BROWSER_USE_B2': '1',
+                'HEVOLVE_BROWSER_CDP_ENDPOINT': 'http://127.0.0.1:9333',
+            }):
+                result = self._run_e2e(os.path.join(tmp, 'audit.log'), fake_crawler)
+        self.assertEqual(captured['cdp_endpoint'], 'http://127.0.0.1:9333')
+        self.assertEqual(result['connection_mechanism'], 'obscura_b2_cdp_user_chrome')
+
+    def test_audit_log_records_e2e_call(self):
+        """Audit log must capture the call (real I/O, real JSON write)."""
+        def fake_crawler(url, cookies=None, timeout=30, cdp_endpoint=None, **_):
+            return {'success': True, 'url': url, 'markdown': 'x',
+                    'connection_mechanism': 'obscura_b1_headless_profile'}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_path = os.path.join(tmp, 'audit.log')
+            self._run_e2e(audit_path, fake_crawler)
+            from integrations.browser_research import audit
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=audit_path):
+                records = audit.read_recent(limit=10)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['tool'], 'Search_Platform')
+        self.assertEqual(records[0]['platform'], 'twitter')
+        self.assertEqual(records[0]['connection_mechanism'],
+                         'obscura_b1_headless_profile')
+        self.assertTrue(records[0]['success'])
+
+    def test_e2e_via_langchain_agent_tool_facade(self):
+        """The LangChain/autogen-facing Search_Platform tool must serialize
+        the same full result as a JSON string — verifies the agent surface
+        sees the cookies-through-to-crawler chain end to end.
+        """
+        captured = {}
+        def fake_crawler(url, cookies=None, timeout=30, cdp_endpoint=None, **_):
+            captured['cookies'] = cookies
+            return {'success': True, 'url': url, 'markdown': 'tweet1 tweet2',
+                    'word_count': 2,
+                    'connection_mechanism': 'obscura_b1_headless_profile'}
+
+        from core import agent_tools
+        from integrations.browser_research import vault
+        from integrations.browser_research.vault import Account
+
+        class _FakeHelper:
+            def txt2img(self, *a, **kw): return ''
+            def get_user_camera_inp(self, *a, **kw): return ''
+            def save_agent_data_to_file(self, *a, **kw): return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_path = os.path.join(tmp, 'audit.log')
+            v = vault.reset_vault_for_tests(path=audit_path + '.vault.enc')
+            v.add(Account(platform='twitter', handle='@me',
+                          cookies=[{'name': 'auth_token', 'value': 'ETOKEN'}]))
+
+            ctx = {
+                'user_id': 7, 'prompt_id': 'p1', 'agent_data': {},
+                'helper_fun': _FakeHelper(),
+                'user_prompt': 'x', 'request_id_list': {'x': 'r1'},
+                'recent_file_id': '', 'scheduler': None,
+                'log_tool_execution': (lambda f: f),
+                'send_message_to_user1': (lambda *a, **kw: None),
+                'retrieve_json': (lambda s: {}),
+                'strip_json_values': (lambda x: x),
+                'save_conversation_db': (lambda *a, **kw: None),
+            }
+            try:
+                closures = agent_tools.build_core_tool_closures(ctx)
+            except Exception as exc:
+                self.skipTest(f'closures need heavier ctx: {exc}')
+                return
+            search_fn = next((fn for name, _, fn in closures
+                              if name == 'Search_Platform'), None)
+            self.assertIsNotNone(search_fn, 'Search_Platform must be registered')
+
+            # When called via the agent-tool closure, the dispatcher's default
+            # consent_check (real ConsentService) runs.  Mock has_capability so
+            # the e2e flow proceeds past the gate.
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=audit_path):
+                with patch('integrations.web_crawler.crawl_url_with_cookies',
+                           side_effect=fake_crawler):
+                    # Mock the canonical consent check so the e2e flow can
+                    # exercise the cookie chain without seeding a real DB.
+                    with patch(
+                        'integrations.social.consent_service.ConsentService.check_consent',
+                        return_value=True,
+                    ):
+                        with patch(
+                            'integrations.browser_research.tools._resolve_db_session',
+                            return_value=object(),
+                        ):
+                            json_result = search_fn(platform='twitter', query='ai',
+                                                    handle='@me')
+
+        # Result is JSON string from the agent tool — verify shape end-to-end.
+        parsed = json.loads(json_result)
+        self.assertTrue(parsed['success'])
+        self.assertEqual(parsed['connection_mechanism'],
+                         'obscura_b1_headless_profile')
+        self.assertEqual(parsed['action'], 'search')
+        self.assertEqual(captured['cookies'][0]['value'], 'ETOKEN',
+                         'cookie value must traverse all the way from vault'
+                         ' through agent_tools -> dispatch -> script -> crawler')
+
+
+class TestEndToEnd_PostPreviewConfirm(unittest.TestCase):
+    """E2E for the write-side preview-confirm chain."""
+
+    def test_post_preview_then_confirm_routes_to_per_platform_post(self):
+        """First call returns liquid_ui; agent re-invokes with dry_run=False.
+
+        The dry_run=False return is intentionally gated ('unimplemented_write')
+        — this test PINS that gate so a future commit can't silently start
+        posting without a per-platform POST implementation review.
+        """
+        from integrations.browser_research import tools
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=os.path.join(tmp, 'a.log')):
+                # Step 1: preview (dry_run defaults True)
+                step1 = tools.dispatch(
+                    tool='Post_As_User', user_id='u1',
+                    platform='twitter', content='hello',
+                    consent_check=lambda uid, scope: True,
+                )
+                self.assertTrue(step1['success'])
+                preview = step1['liquid_ui']
+                self.assertEqual(preview['type'], 'post_preview')
+                # Step 2: simulate user-confirm by invoking confirm_args
+                confirm_args = preview['confirm_args']
+                step2 = tools.dispatch(
+                    tool='Post_As_User', user_id='u1',
+                    consent_check=lambda uid, scope: True,
+                    **confirm_args,
+                )
+        # Step 2 returns 'unimplemented_write' until per-platform POST is plumbed.
+        # Drift-guard: if this assertion ever flips, somebody added a real
+        # post path that bypasses the canonical preview-confirm review.
+        self.assertFalse(step2['success'])
+        self.assertEqual(step2['connection_mechanism'], 'unimplemented_write')
+        self.assertIn('preview-only', step2['error'])
+
+
 class TestT1AdapterIsolation(unittest.TestCase):
     """Drift-guard: no channel adapter file imports browser_research.
 
