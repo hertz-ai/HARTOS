@@ -392,6 +392,69 @@ class TestPerPlatformDispatch(unittest.TestCase):
         self.assertIn('target_handle', result['error'])
 
 
+class TestPostAsUserPreviewConfirm(unittest.TestCase):
+    """C7: Post_As_User defaults dry_run=True, returns preview card.
+    Real post (dry_run=False) is intentionally gated until per-platform
+    write paths are reviewed.
+    """
+
+    def test_post_requires_content(self):
+        from integrations.browser_research import tools
+        result = tools.dispatch(
+            tool='Post_As_User', user_id='u1',
+            platform='twitter',
+            consent_check=lambda uid, scope: True,
+        )
+        self.assertFalse(result['success'])
+        self.assertIn('content', result['error'])
+
+    def test_dry_run_default_returns_preview(self):
+        from integrations.browser_research import tools
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=os.path.join(tmp, 'a.log')):
+                result = tools.dispatch(
+                    tool='Post_As_User', user_id='u1',
+                    platform='twitter', content='hello world',
+                    consent_check=lambda uid, scope: True,
+                )
+        self.assertTrue(result['success'])
+        self.assertTrue(result['dry_run'])
+        self.assertEqual(result['connection_mechanism'], 'preview_only')
+        self.assertEqual(result['liquid_ui']['type'], 'post_preview')
+        self.assertEqual(result['liquid_ui']['platform'], 'twitter')
+        self.assertEqual(result['liquid_ui']['content'], 'hello world')
+        self.assertEqual(result['liquid_ui']['confirm_args']['dry_run'], False)
+
+    def test_dry_run_false_gated_until_implemented(self):
+        """Real write is intentionally not yet plumbed — must return clear error."""
+        from integrations.browser_research import tools
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=os.path.join(tmp, 'a.log')):
+                result = tools.dispatch(
+                    tool='Post_As_User', user_id='u1',
+                    platform='twitter', content='hello', dry_run=False,
+                    consent_check=lambda uid, scope: True,
+                )
+        self.assertFalse(result['success'])
+        self.assertIn('preview-only', result['error'])
+        self.assertEqual(result['connection_mechanism'], 'unimplemented_write')
+
+    def test_post_consent_denied(self):
+        from integrations.browser_research import tools
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('integrations.browser_research.audit._log_path',
+                       return_value=os.path.join(tmp, 'a.log')):
+                result = tools.dispatch(
+                    tool='Post_As_User', user_id='u1',
+                    platform='twitter', content='x',
+                    consent_check=lambda uid, scope: False,
+                )
+        self.assertFalse(result['success'])
+        self.assertEqual(result['liquid_ui']['type'], 'consent_prompt')
+
+
 class TestCrawlerExtension(unittest.TestCase):
     """C4: web_crawler.crawl_url_with_cookies exists + accepts cookies/cdp."""
 

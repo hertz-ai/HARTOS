@@ -10,7 +10,7 @@ Domain-locked to linkedin.com by domain_allowlist.
 from urllib.parse import quote_plus
 from typing import Optional
 
-from ._base import fetch_with_session
+from ._base import fetch_with_session, post_preview
 
 PLATFORM = 'linkedin'
 BASE = 'https://www.linkedin.com'
@@ -36,3 +36,8 @@ def timeline(target_handle: str, viewer_handle: Optional[str] = None) -> dict:
     if result.get('markdown'):
         result['markdown'] = result['markdown'][:12000]
     return result
+
+
+def post(content, handle=None, dry_run=True):
+    return post_preview(PLATFORM, content, handle=handle, dry_run=dry_run)
+

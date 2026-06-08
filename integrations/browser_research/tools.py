@@ -35,6 +35,7 @@ _TOOL_ROUTES: dict[str, tuple[str, str]] = {
     # at dispatch time from the `platform` kwarg.  See `dispatch()` below.
     'Search_Platform':     ('__per_platform__', 'search'),
     'Read_Timeline':       ('__per_platform__', 'timeline'),
+    'Post_As_User':        ('__per_platform__', 'post'),
 }
 
 
@@ -177,6 +178,19 @@ def dispatch(
         kwargs['target_handle'] = target_handle
         if handle is not None:
             kwargs['viewer_handle'] = handle
+    elif action == 'post':
+        # Write-side gate: dry_run MUST default True.  First call returns a
+        # preview liquid_ui card; the agent must re-invoke with dry_run=False
+        # after the user explicitly confirms.  Same canonical preview-confirm
+        # pattern as Invite_Friend / book_ride / channel_send.
+        content = extra.pop('content', None)
+        if content is None:
+            return {'success': False, 'error': 'post requires `content` kwarg'}
+        dry_run = extra.pop('dry_run', True)
+        kwargs['content'] = content
+        kwargs['dry_run'] = bool(dry_run)
+        if handle is not None:
+            kwargs['handle'] = handle
     else:
         if url is not None:
             kwargs['url'] = url

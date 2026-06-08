@@ -1343,6 +1343,39 @@ def build_core_tool_closures(ctx):
             Read_Timeline,
         ))
 
+        @log_tool_execution
+        def Post_As_User(
+            platform: Annotated[str, "twitter / reddit / linkedin / bilibili / xiaohongshu / weibo"],
+            content: Annotated[str, "Text to post on the user's behalf."],
+            handle: Annotated[Optional[str], "Vault handle to post as; first if omitted."] = None,
+            dry_run: Annotated[bool, "TRUE returns a preview card; FALSE actually posts (requires prior confirm)."] = True,
+        ) -> str:
+            """Post on the user's behalf on a social platform.
+
+            **Preview-confirm gate**: dry_run defaults to TRUE.  First invocation
+            returns a `liquid_ui: post_preview` component for the UI to render
+            with explicit Cancel/Confirm buttons.  The agent MUST re-invoke with
+            dry_run=False after the user taps Confirm.  Same canonical pattern
+            as Invite_Friend and channel_send.
+
+            Consent-gated on `web_research:<platform>`.
+            """
+            result = br_tools_module.dispatch(
+                tool='Post_As_User', user_id=str(user_id),
+                platform=platform, content=content, handle=handle, dry_run=dry_run,
+            )
+            return json.dumps(result, ensure_ascii=False)
+
+        tools.append((
+            "Post_As_User",
+            "Post on the user's behalf on a social platform via their logged-in "
+            "browser session. PREVIEW-CONFIRM gated: dry_run=True (default) returns "
+            "a preview card the user must explicitly confirm before the actual post "
+            "happens with dry_run=False. Consent-gated on web_research:<platform>. "
+            "Input: platform, content, optional handle, dry_run.",
+            Post_As_User,
+        ))
+
         # NOTE: Read_Webpage was removed 2026-06-08 as a parallel-path violation.
         # The canonical "fetch a URL's content" tool is `data_extraction_from_url`
         # above (line ~1008), which already delegates to Crawl4AI →
