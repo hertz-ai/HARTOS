@@ -3339,7 +3339,15 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             return verify1
 
         current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
-        if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor":
+        # Agent names are case-sensitive.  The Helper agent is instantiated as
+        # name="Helper" (like "Executor"/"multi_role_agent" alongside it here).
+        # This was "helper" (lowercase) → it NEVER matched → Helper fell through
+        # to the final `return "auto"` and the 4B got to pick the next speaker,
+        # instead of the intended deterministic hand-back to the time_agent
+        # orchestrator (the same role the main flow's Helper→assistant plays).
+        # The other three names in this OR-chain are correctly cased, so this is
+        # an unambiguous typo, not intentional exclusion.
+        if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "Helper" or last_speaker.name == "Executor":
             return time_agent
         current_app.logger.info(f'Checking for @user or @user in message')
         if '@user' in messages[-1]["content"].lower():
