@@ -732,7 +732,19 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.PENDING, ActionState.ERROR, ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED],
         ActionState.FALLBACK_REQUESTED: [ActionState.FALLBACK_RECEIVED, ActionState.FALLBACK_REQUESTED],
         ActionState.FALLBACK_RECEIVED: [ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_RECEIVED],
-        ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED, ActionState.RECIPE_REQUESTED],
+        # RECIPE_REQUESTED recovery edges (#128).  The happy path is
+        # →RECIPE_RECEIVED, but when the (often 4B) model fails to emit a recipe
+        # the pipeline MUST be able to escape recipe_requested, two ways:
+        #   • →FALLBACK_REQUESTED — the autonomous-fallback pattern: the verifier
+        #     hook returns force_fallback (create_recipe.py:4066).
+        #   • →TERMINATED — the TERMINATE handler (lifecycle_hook_track_termination,
+        #     ~line 1018) gates on validate_state_transition(..., TERMINATED).
+        #   • →ERROR — a raising recipe step routes through ERROR's recovery set.
+        # Without these, the action sat in recipe_requested until the stall-guard
+        # broke the flow — the live ~9% goal-completion rate (9 987 'Invalid
+        # transition: recipe_requested → …' per window).  Mirrors the recovery
+        # edges COMPLETED and ERROR already carry; stays targeted (no →IN_PROGRESS).
+        ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED, ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_REQUESTED, ActionState.TERMINATED, ActionState.ERROR],
         ActionState.RECIPE_RECEIVED: [ActionState.TERMINATED, ActionState.RECIPE_RECEIVED],
         # Final state, but: (a) an action can be re-opened (→ASSIGNED), and
         # (b) recipe-capture can run AFTER termination (→RECIPE_REQUESTED).  The

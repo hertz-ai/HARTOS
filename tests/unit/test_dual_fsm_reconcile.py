@@ -62,3 +62,51 @@ def test_recipe_capture_cycle_from_terminated_is_complete():
     finally:
         with L._state_lock:
             L.action_states.pop(up, None)
+
+
+def test_recipe_requested_has_recovery_edges():
+    """#128 — RECIPE_REQUESTED was a near-trap: only →RECIPE_RECEIVED (happy path)
+    or a self-loop, with NO recovery edge.  When the local model fails to emit a
+    recipe (the common case for a 4B), the pipeline drives the action out of
+    recipe_requested two ways, and the FSM rejected BOTH:
+
+      * →FALLBACK_REQUESTED — the autonomous-fallback pattern: the verifier hook
+        returns force_fallback (create_recipe.py:4066) → safe_set_state(...,
+        FALLBACK_REQUESTED).  Rejected → the task's fallback flag flipped True
+        while the FSM stayed recipe_requested (the dual-FSM divergence of #56).
+      * →TERMINATED — the TERMINATE handler (lifecycle_hooks.py:1018) gates on
+        validate_state_transition(..., TERMINATED).  Rejected → the action could
+        never terminate.
+
+    With neither edge, the action sat in recipe_requested until the stall-guard
+    broke the flow ("stuck in recipe_requested ... with no recipe") — that's the
+    live ~9% goal-completion rate (9 987 'Invalid transition: recipe_requested →
+    ...' in one window).  The recovery edges mirror what COMPLETED and ERROR
+    already have; the fix stays targeted (no jump back into open execution).
+    """
+    try:
+        import lifecycle_hooks as L
+    except Exception as e:
+        pytest.skip(f"lifecycle_hooks unavailable: {e}")
+
+    up, aid = 'u128_999', 1
+
+    def _valid_from(state, target):
+        with L._state_lock:
+            L.action_states.setdefault(up, {})[aid] = state
+        return L.validate_state_transition(up, aid, target)
+
+    try:
+        # the recovery edges that were missing (the live stuck-state bug)
+        assert _valid_from(L.ActionState.RECIPE_REQUESTED, L.ActionState.FALLBACK_REQUESTED) is True
+        assert _valid_from(L.ActionState.RECIPE_REQUESTED, L.ActionState.TERMINATED) is True
+        assert _valid_from(L.ActionState.RECIPE_REQUESTED, L.ActionState.ERROR) is True
+        # happy path + idempotent self-loop must still hold (no regression)
+        assert _valid_from(L.ActionState.RECIPE_REQUESTED, L.ActionState.RECIPE_RECEIVED) is True
+        assert _valid_from(L.ActionState.RECIPE_REQUESTED, L.ActionState.RECIPE_REQUESTED) is True
+        # the fix must stay targeted — recipe_requested must NOT jump straight
+        # back into open execution (that would re-introduce a loop surface).
+        assert _valid_from(L.ActionState.RECIPE_REQUESTED, L.ActionState.IN_PROGRESS) is False
+    finally:
+        with L._state_lock:
+            L.action_states.pop(up, None)
