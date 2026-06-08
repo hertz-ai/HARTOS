@@ -91,6 +91,18 @@ COMPONENT_TYPES = {
     # Lightweight notification with short auto-dismiss; web maps to the
     # same NotificationCard renderer with `severity` driving the colour.
     'toast': {'props': ['title', 'message', 'severity']},
+    # ── Web research consent prompt (BR-C4+) ──
+    # Returned by browser_research.tools.dispatch when the user has not yet
+    # granted the per-platform `web_research:<platform>` consent scope.
+    # SPA renders a single-tap Grant action that calls consentApi.grant().
+    'consent_prompt': {'props': ['scope', 'platform', 'title', 'description']},
+    # ── Web research post preview (BR-C7) ──
+    # First call to Post_As_User returns this with dry_run=True; UI shows
+    # Cancel / Confirm.  Confirm tap re-invokes Post_As_User with the
+    # `confirm_args` payload (dry_run=False).
+    'post_preview': {'props': ['platform', 'handle', 'content',
+                               'confirm_tool', 'confirm_args',
+                               'confirm_label', 'cancel_label']},
     # ── Channel pair-code consent card (gateway_qr auth_method) ──
     # Emitted by hart_intelligence_entry._start_gateway_qr_pair_push
     # while a user is conversationally connecting WhatsApp / Telegram /
