@@ -1241,6 +1241,72 @@ def build_core_tool_closures(ctx):
         self_critique_and_enhance,
     ))
 
+    # ------------------------------------------------------------------
+    # Browser Research tools — T3 (no auth, no browser).
+    # ------------------------------------------------------------------
+    # Single canonical entry point — integrations.browser_research.tools.dispatch.
+    # Every invocation logs to web_research_audit.log and surfaces a
+    # `connection_mechanism` field so the agent can describe to the user how
+    # it accessed the resource (public_http, obscura_b2_cdp_user_chrome, ...).
+    #
+    # T2 platform tools (Twitter / Reddit / LinkedIn / Bilibili / XHS / Weibo)
+    # land via the same dispatcher in C4+ — agent_tools wiring stays here so
+    # there is exactly one tool-registration surface for both LangChain and
+    # autogen consumers (no parallel registry).
+    try:
+        from integrations.browser_research import tools as br_tools_module
+    except ImportError as _br_imp_err:
+        tool_logger.warning("browser_research unavailable, skipping registration: %s",
+                            _br_imp_err)
+        br_tools_module = None
+
+    if br_tools_module is not None:
+        @log_tool_execution
+        def YouTube_Transcript(
+            url: Annotated[str, "Full YouTube URL (watch / youtu.be / shorts)."],
+            language: Annotated[str, "Preferred subtitle language code, e.g. 'en'."] = "en",
+        ) -> str:
+            """Fetch a YouTube video's transcript text without authentication.
+
+            Returns a JSON string with success/text/segment_count/connection_mechanism.
+            Domain-locked to youtube.com / youtu.be by the dispatcher's allowlist.
+            """
+            result = br_tools_module.dispatch(
+                tool='YouTube_Transcript', user_id=str(user_id),
+                url=url, language=language,
+            )
+            return json.dumps(result, ensure_ascii=False)
+
+        tools.append((
+            "YouTube_Transcript",
+            "Fetch a YouTube video's transcript text. No login, no API key. "
+            "Input: full YouTube URL (watch/youtu.be/shorts) + optional language code.",
+            YouTube_Transcript,
+        ))
+
+        @log_tool_execution
+        def Read_Webpage(
+            url: Annotated[str, "Full http:// or https:// URL of the page to read."],
+            prefer_clean_text: Annotated[bool, "Try Jina Reader proxy for clean markdown first."] = True,
+        ) -> str:
+            """Fetch a public web page's content without authentication.
+
+            Strategy ladder: Jina Reader (clean markdown) → raw HTTP.
+            1 MB body cap; 10s timeout.  Returns JSON with success/text/connection_mechanism.
+            """
+            result = br_tools_module.dispatch(
+                tool='Read_Webpage', user_id=str(user_id),
+                url=url, prefer_clean_text=prefer_clean_text,
+            )
+            return json.dumps(result, ensure_ascii=False)
+
+        tools.append((
+            "Read_Webpage",
+            "Fetch a public web page's text. No login. Jina Reader → raw HTTP fallback. "
+            "Input: full URL (must start http:// or https://).",
+            Read_Webpage,
+        ))
+
     return tools
 
 

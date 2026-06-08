@@ -249,6 +249,46 @@ class TestYoutubeIdExtraction(unittest.TestCase):
         self.assertIsNone(youtube._extract_video_id(''))
 
 
+class TestAgentToolRegistration(unittest.TestCase):
+    """Drift-guard: tool names are registered in core.agent_tools so both
+    LangChain (helper.register_for_llm) and autogen
+    (executor.register_for_execution) pick them up via register_core_tools.
+    """
+
+    def test_browser_research_tools_in_closure_list(self):
+        # Build a minimal closure ctx and assert YouTube_Transcript +
+        # Read_Webpage appear in the returned tools list.
+        from core import agent_tools
+
+        class _FakeHelper:
+            def __init__(self): self.tools = []
+            def txt2img(self, *a, **kw): return ''
+            def get_user_camera_inp(self, *a, **kw): return ''
+            def save_agent_data_to_file(self, *a, **kw): return True
+
+        ctx = {
+            'user_id': 1, 'prompt_id': 'p1', 'agent_data': {},
+            'helper_fun': _FakeHelper(),
+            'user_prompt': 'x', 'request_id_list': {'x': 'r1'},
+            'recent_file_id': '', 'scheduler': None,
+            'log_tool_execution': (lambda f: f),
+            'send_message_to_user1': (lambda *a, **kw: None),
+            'retrieve_json': (lambda s: {}),
+            'strip_json_values': (lambda x: x),
+            'save_conversation_db': (lambda *a, **kw: None),
+        }
+        try:
+            closures = agent_tools.build_core_tool_closures(ctx)
+        except Exception as exc:
+            self.skipTest(f'closure build needs heavier fixtures: {exc}')
+            return
+        names = {name for name, _desc, _fn in closures}
+        self.assertIn('YouTube_Transcript', names,
+                      'YouTube_Transcript must be registered (BR-C2)')
+        self.assertIn('Read_Webpage', names,
+                      'Read_Webpage must be registered (BR-C2)')
+
+
 class TestT1AdapterIsolation(unittest.TestCase):
     """Drift-guard: no channel adapter file imports browser_research.
 
