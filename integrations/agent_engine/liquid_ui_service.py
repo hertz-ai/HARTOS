@@ -1187,6 +1187,12 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <div class="panel-container" id="panels" role="main" aria-label="Open windows"></div>
 
 <!-- Agent Pill (click to expand floating chat) -->
+<!-- HART OS native voice orb — frameless, transparent, no React (the OS shell
+     draws its own visualiser via /shell/static/voiceOrbViz.js) -->
+<canvas id="hart-voice-orb" width="320" height="320" aria-hidden="true"
+  style="position:fixed;right:16px;bottom:108px;width:160px;height:160px;z-index:1490;pointer-events:none;background:transparent;opacity:0;transition:opacity .4s ease"></canvas>
+<script src="/shell/static/voiceOrbViz.js"></script>
+
 <div class="agent-pill glass" id="agent-pill" onclick="toggleAssistantChat()">
   <span class="mi material-icons-round" style="color:var(--hart-accent)">chat_bubble</span>
   <input id="agent-input" placeholder="Ask HART..." onclick="event.stopPropagation();toggleAssistantChat()" onkeydown="if(event.key==='Enter'){{event.stopPropagation();toggleAssistantChat();setTimeout(function(){{var i=document.getElementById('ac-input');if(i){{i.value=document.getElementById('agent-input').value;document.getElementById('agent-input').value=''}}}},100)}}">
@@ -3582,7 +3588,8 @@ async function startRecording() {{
     }};
     mediaRecorder.start();
     isRecording = true;
-    document.querySelector('.mic-btn').classList.add('recording');
+    var _mb = document.querySelector('.mic-btn');
+    if(_mb) _mb.classList.add('recording');  // guarded: no such el when mic lives in the chat (was an unguarded null-deref)
     showToast('Voice','Recording... click mic again to stop','info');
   }} catch(err) {{
     showToast('Voice','Microphone access denied','warning');
@@ -3627,6 +3634,24 @@ function speakText(text, source) {{
       _acAudio.play().catch(function(){{}});
     }}
   }}).catch(function(){{}});
+}}
+
+// ── HART OS native voice orb: reflect the shell's EXISTING voice state ──
+// Reuses isRecording (listening) + _acAudio (speaking) by polling — does NOT
+// edit startRecording/speakText, and does NOT route their audio through the
+// orb's AudioContext (that could disturb TTS playback). setActive drives the
+// viz's built-in speech-energy animation. Skipped in potato mode (saves the RAF).
+if(!PERF.potato) {{
+  (function initHartOrb() {{
+    var c = document.getElementById('hart-voice-orb');
+    if(!c || !window.HartVoiceOrbViz) {{ setTimeout(initHartOrb, 400); return; }}
+    var orb = window.HartVoiceOrbViz(c, {{}});
+    c.style.opacity = '0.9';
+    setInterval(function() {{
+      var speaking = _acAudio && !_acAudio.paused && !_acAudio.ended;
+      orb.setActive(!!(speaking || isRecording));
+    }}, 200);
+  }})();
 }}
 
 // ═══ SSE Live Agent Action Stream ═══
@@ -4013,6 +4038,13 @@ function renderAgentOverlay(ev) {{
         @app.route('/')
         def index():
             return Response(self.render_desktop_shell(), mimetype='text/html')
+
+        # ── Shell's own static assets (native renderers — no React/iframe) ──
+        @app.route('/shell/static/<path:asset>')
+        def shell_static(asset):
+            static_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), 'static')
+            return send_from_directory(static_dir, asset)
 
         # ── Nunba SPA embedding (React pages inside panel iframes) ──
         nunba_dir = os.environ.get('NUNBA_STATIC_DIR', '')
