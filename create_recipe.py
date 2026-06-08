@@ -213,6 +213,8 @@ from lifecycle_hooks import (
     register_ledger_for_session,  # Register ledger for auto-sync
     stall_guard_step,             # No-progress stall tracker (reachable guard)
     recipe_correction_directive,  # Escalating "emit ONLY JSON" recipe fix (#89)
+    is_recipe_creation_request,   # Deterministic recipe-prompt detector (speaker routing)
+    RECIPE_CREATE_PROMPT_PREFIX,  # canonical recipe-prompt prefix (single source)
 )
 
 # Import helper_ledger functions for subtask management and ledger awareness
@@ -2517,6 +2519,28 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         if has_pending_tool_calls(messages):
             current_app.logger.info("DETECTED PENDING TOOL CALLS - routing to Assistant without message modification")
             return assistant
+
+        # ─── DETERMINISTIC RECIPE-REQUEST ROUTING ──────────────────────
+        # The recipe-creation prompt (request_recipe_for_action / _last, both
+        # built from RECIPE_CREATE_PROMPT_PREFIX) is emitted by ChatInstructor
+        # to ask for the {"status":"done", ...recipe} JSON that advances
+        # RECIPE_REQUESTED → RECIPE_RECEIVED.  The agent that reliably produces
+        # that JSON is the StatusVerifier (verify) — NOT the Assistant.  Without
+        # this pin the generic "ChatInstructor → return assistant" branch
+        # directly below hands the recipe request to the Assistant, which echoes
+        # the prompt or replies "I'm not sure I understand"; the action then
+        # only advances on a lucky round where the LLM speaker-selector happens
+        # to pick StatusVerifier (live 2026-06-07 19:13-19:18: one action,
+        # ~5 min, dozens of "could NOT be parsed" retries before a chance hit).
+        # Pin it deterministically — the stuck-loop guard above still backstops
+        # a StatusVerifier that itself fails to emit valid JSON, and this fires
+        # ONLY for the recipe prompt so the normal Assistant→verify status flow
+        # is untouched.
+        if is_recipe_creation_request(messages[-1].get("content")):
+            current_app.logger.info(
+                "[RECIPE-ROUTE] recipe-creation request → StatusVerifier "
+                "(deterministic pin, not LLM-selected)")
+            return verify
 
         if last_speaker.name == 'Executor' or last_speaker.name == 'Helper' or last_speaker.name == 'UserProxy' or last_speaker.name == 'UserProxy' or last_speaker.name == 'ChatInstructor':
             if group_chat.messages:
@@ -4886,7 +4910,7 @@ def request_recipe_for_action_last(current_action_id, prompt_id, role, user_prom
     user_tasks[user_prompt].fallback = False
     metadata = strip_json_values(agent_data[prompt_id])
     safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED, "recipe start")
-    message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action from history, along with a suitable name. Provide the output in the following JSON format:
+    message = RECIPE_CREATE_PROMPT_PREFIX + ''' that includes only the necessary steps for this action from history, along with a suitable name. Provide the output in the following JSON format:
                         { "status": "done", "action": "''' + str(user_tasks[user_prompt].get_action(user_tasks[
                                                                                                                       user_prompt].current_action - 1)) + '''","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                         Recipe Requirements:
@@ -4904,7 +4928,7 @@ def request_recipe_for_action(current_action_id, prompt_id, role, user_prompt, p
     user_tasks[user_prompt].fallback = False
     safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED, "recipe start")
     metadata = strip_json_values(agent_data[prompt_id])
-    message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
+    message = RECIPE_CREATE_PROMPT_PREFIX + ''' that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
                         { "status": "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                         Recipe Requirements:
                         1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action

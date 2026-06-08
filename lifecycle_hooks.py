@@ -439,6 +439,31 @@ def recipe_correction_directive(parse_failures: int) -> str:
     return msg
 
 
+# Canonical prefix of the recipe-creation prompt that
+# create_recipe.request_recipe_for_action / request_recipe_for_action_last
+# emit to ask an agent for the {"status":"done", ...recipe} JSON that advances
+# RECIPE_REQUESTED -> RECIPE_RECEIVED.  ONE source so (a) the deterministic
+# speaker-routing in create_recipe.state_transition can NEVER drift from the
+# actual prompt text, and (b) lifecycle_hook_track_recipe_request below matches
+# the same string.  Lives here (autogen-free) so it stays unit-testable.
+RECIPE_CREATE_PROMPT_PREFIX = (
+    'Focus on the current task at hand and create a detailed recipe'
+)
+
+
+def is_recipe_creation_request(content) -> bool:
+    """True when ``content`` is the recipe-creation prompt.
+
+    Pure + autogen-free so create_recipe.state_transition can call it to route
+    recipe requests deterministically to the StatusVerifier instead of letting
+    the LLM speaker-selector pick the Assistant/Helper (which echo the prompt
+    or reply "I'm not sure I understand", so the action only advances on a
+    lucky StatusVerifier round — live 2026-06-07 19:13-19:18).  Uses ``in`` (not
+    just ``startswith``) so an agent that echoes the prompt is still detected.
+    """
+    return isinstance(content, str) and RECIPE_CREATE_PROMPT_PREFIX in content
+
+
 # Add to lifecycle_hooks.py
 class FlowLifecycleState:
     """Track overall flow lifecycle beyond individual actions"""
@@ -936,7 +961,7 @@ def lifecycle_hook_track_recipe_request(user_prompt: str, user_tasks, group_chat
 
     # When recipe creation is requested
     if (group_chat.messages and
-        'Focus on the current task at hand and create a detailed recipe' in group_chat.messages[-1]['content']):
+        is_recipe_creation_request(group_chat.messages[-1].get('content'))):
 
         if validate_state_transition(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED):
             safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED,"hook tracking lifecycle_hook_track_recipe_request")
