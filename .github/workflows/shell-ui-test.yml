@@ -1,0 +1,50 @@
+name: Shell UI WebKit Safety
+
+# Fast functional gate for the HART OS glass-shell JavaScript + the floating
+# voice orb. The e2e-os-test workflow boots the ISO but only checks that
+# services are active and the WebKit typelib is present — it never EXECUTES the
+# shell's JavaScript, so a JS crash (e.g. the AbortSignal.timeout TypeError that
+# the NixOS 24.11 WebKitGTK throws, which kills the whole inline <script>) is
+# invisible to it. This job runs the orb renderer in an old-WebKitGTK-simulated
+# environment in seconds, so that class of bug is caught in CI, not on hardware.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'integrations/agent_engine/liquid_ui_service.py'
+      - 'integrations/agent_engine/static/**'
+      - 'tests/test_orb_webkit_safety.py'
+      - 'tests/js/orb_webkit_harness.js'
+      - '.github/workflows/shell-ui-test.yml'
+  pull_request:
+    paths:
+      - 'integrations/agent_engine/liquid_ui_service.py'
+      - 'integrations/agent_engine/static/**'
+
+concurrency:
+  group: shell-ui-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell-ui-webkit:
+    name: Shell JS + orb survive old WebKitGTK
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install test deps
+        run: python -m pip install --upgrade pip pytest
+
+      # The node + source tests always run (no heavy deps). The render tests
+      # self-skip if the shell module can't import in a minimal runner.
+      - name: Orb / shell WebKitGTK functional tests
+        run: python -m pytest tests/test_orb_webkit_safety.py -v
