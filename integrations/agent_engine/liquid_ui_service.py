@@ -1231,6 +1231,24 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <div class="ctx-menu glass" id="ctx-menu" style="display:none"></div>
 
 <script>
+// Catch any uncaught JS error and show it on screen — helps debug on kiosk
+// where DevTools inspector isn't accessible via right-click.
+window.onerror = function(msg, src, line, col, err) {{
+  var d = document.getElementById('_js_err');
+  if(!d) {{
+    d = document.createElement('div');
+    d.id = '_js_err';
+    d.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#c00;color:#fff;'
+      + 'font:13px monospace;padding:8px 12px;z-index:99999;white-space:pre-wrap;max-height:40vh;overflow-y:auto';
+    document.body.appendChild(d);
+  }}
+  d.textContent += '[JS ERROR] ' + msg + ' (' + src + ':' + line + ':' + col + ')\n';
+  return false;
+}};
+window.addEventListener('unhandledrejection', function(e) {{
+  window.onerror('[UnhandledPromise] ' + (e.reason||e), '', 0, 0, e.reason);
+}});
+
 // ═══ Configuration ═══
 const BACKEND = 'http://localhost:{self.backend_port}';
 const SHELL = 'http://localhost:{self.port}';
