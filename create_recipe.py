@@ -466,52 +466,85 @@ def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
 
 
 def send_message_to_user1(user_id, response, inp, prompt_id):
-    """Publish an intermediate agent response to the user — local, no cloud.
+    """Publish an intermediate agent response to the user.
 
-    Previously POSTed to http://aws_rasa.hertzai.com:9890/autogen_response
-    (a cloud broadcast endpoint).  That's wrong: the canonical per-user
-    push path inside Nunba is the WAMP chat topic
-    com.hertzai.hevolve.chat.{user_id} (mirrored to SSE via the
-    publish_async → broadcast_sse_safe leg).  Rerouted 2026-06-09 to
-    publish through the canonical bus instead so intermediate messages
-    flow to the chat UI without leaving the device.
+    Deployment-mode-aware (2026-06-09):
 
-    Falls back silently if the bus isn't reachable (the function's
-    return value was already discarded by callers — fire-and-forget).
+    - **Bundled** (sys.frozen — Nunba desktop / installer / embedded):
+      Emit directly to the canonical local chat topic
+      com.hertzai.hevolve.chat.{user_id} with the schema chat-stream
+      subscribers actually parse (text, request_id, prompt_id, bot_type,
+      options, page_image_url).  No cloud round-trip.  Subscribers
+      (Web SPA Demopage.js, Android RN AutobahnConnectionManager, Nunba
+      Python adapter) render the message; downstream TTS/video happen
+      via the local chat fan-out (no need to re-trigger here).
+
+    - **Standalone central HARTOS** (sys.frozen absent — Docker, dev):
+      POST to https://azurekong.hertzai.com:8443/autogen_response — the
+      canonical Kong gateway in front of the chatbot_pipeline backend
+      that historically owned this endpoint (handler at
+      chatbot_pipeline/chatbot.py:8009).  Same backend as the prior
+      aws_rasa.hertzai.com:9890, just via the TLS+auth+rate-limited
+      gateway instead of the raw HTTP backend.
+
+    Per user 2026-06-09: ``Agent_status`` field omitted on the local
+    path — it was an artefact of the cloud server's per-user session
+    dict and isn't needed by local subscribers.
+
+    Always fire-and-forget — callers don't read the return value.
     """
+    import sys as _sys
     user_prompt = f'{user_id}_{prompt_id}'
     try:
         request_id = f'{request_id_list[user_prompt]}-intermediate'
     except (KeyError, NameError):
         request_id = f'{user_prompt}-intermediate'
-    payload = {
+
+    _bundled = bool(getattr(_sys, 'frozen', False))
+
+    if _bundled:
+        # Bundled (Nunba install) — local chat topic, on-device.
+        text = str(response or '')
+        if not text:
+            return
+        chat_payload = {
+            'text': [text],
+            'request_id': request_id,
+            'prompt_id': prompt_id,
+            'bot_type': 'Custom GPT',
+            'options': [],
+            'newoptions': [],
+            'page_image_url': '',
+            'analogy_image_url': '',
+            'probe': False,
+            'inp': inp,
+        }
+        try:
+            from core.message_bus import publish_async
+            publish_async(f'com.hertzai.hevolve.chat.{user_id}', chat_payload)
+        except Exception as _e:
+            try:
+                current_app.logger.debug(
+                    f'send_message_to_user1: local publish failed ({_e})')
+            except Exception:
+                pass
+        return
+
+    # Standalone central HARTOS — canonical Kong gateway.
+    url = 'https://azurekong.hertzai.com:8443/autogen_response'
+    body = json.dumps({
         'user_id': user_id,
         'message': response,
         'inp': inp,
         'request_id': request_id,
-        'Agent_status': 'Review Mode',
-    }
+    })
+    headers = {'Content-Type': 'application/json'}
     try:
-        # Prefer the canonical in-process publish (no network hop, no
-        # cloud).  publish_async is the same path the main chat hot
-        # path uses for per-user broadcasts.
-        from core.message_bus import publish_async
-        topic = f'com.hertzai.hevolve.chat.{user_id}'
-        publish_async(topic, payload)
-        return
-    except Exception:
-        pass
-    try:
-        # Fallback: SSE broadcast directly (still local).
-        from routes.chatbot_routes import broadcast_sse_safe  # noqa: F401
-        broadcast_sse_safe('agent.intermediate', payload, user_id=str(user_id))
-    except Exception as _se:
-        # Last-resort: log + swallow.  Caller doesn't read the return value
-        # and intermediate messages are advisory, not critical.
+        pooled_post(url, data=body, headers=headers, timeout=15)
+    except Exception as _e:
         try:
             current_app.logger.debug(
-                f"send_message_to_user1: local publish unavailable ({_se}); "
-                f"dropping intermediate message for {user_id}")
+                f'send_message_to_user1: azurekong forward failed ({_e})')
         except Exception:
             pass
 
