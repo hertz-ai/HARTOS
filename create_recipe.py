@@ -465,13 +465,55 @@ def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
     return helper_fun.save_conversation_db(text, user_id, prompt_id, database_url, request_id)
 
 
-def send_message_to_user1(user_id,response,inp,prompt_id):
+def send_message_to_user1(user_id, response, inp, prompt_id):
+    """Publish an intermediate agent response to the user — local, no cloud.
+
+    Previously POSTed to http://aws_rasa.hertzai.com:9890/autogen_response
+    (a cloud broadcast endpoint).  That's wrong: the canonical per-user
+    push path inside Nunba is the WAMP chat topic
+    com.hertzai.hevolve.chat.{user_id} (mirrored to SSE via the
+    publish_async → broadcast_sse_safe leg).  Rerouted 2026-06-09 to
+    publish through the canonical bus instead so intermediate messages
+    flow to the chat UI without leaving the device.
+
+    Falls back silently if the bus isn't reachable (the function's
+    return value was already discarded by callers — fire-and-forget).
+    """
     user_prompt = f'{user_id}_{prompt_id}'
-    request_id = f'{request_id_list[user_prompt]}-intermediate'
-    url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
-    body = json.dumps({'user_id':user_id,'message':response,'inp':inp,'request_id':request_id, 'Agent_status': 'Review Mode'})
-    headers = {'Content-Type': 'application/json'}
-    res = pooled_post(url,data=body,headers=headers)
+    try:
+        request_id = f'{request_id_list[user_prompt]}-intermediate'
+    except (KeyError, NameError):
+        request_id = f'{user_prompt}-intermediate'
+    payload = {
+        'user_id': user_id,
+        'message': response,
+        'inp': inp,
+        'request_id': request_id,
+        'Agent_status': 'Review Mode',
+    }
+    try:
+        # Prefer the canonical in-process publish (no network hop, no
+        # cloud).  publish_async is the same path the main chat hot
+        # path uses for per-user broadcasts.
+        from core.message_bus import publish_async
+        topic = f'com.hertzai.hevolve.chat.{user_id}'
+        publish_async(topic, payload)
+        return
+    except Exception:
+        pass
+    try:
+        # Fallback: SSE broadcast directly (still local).
+        from routes.chatbot_routes import broadcast_sse_safe  # noqa: F401
+        broadcast_sse_safe('agent.intermediate', payload, user_id=str(user_id))
+    except Exception as _se:
+        # Last-resort: log + swallow.  Caller doesn't read the return value
+        # and intermediate messages are advisory, not critical.
+        try:
+            current_app.logger.debug(
+                f"send_message_to_user1: local publish unavailable ({_se}); "
+                f"dropping intermediate message for {user_id}")
+        except Exception:
+            pass
 
 
 def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
