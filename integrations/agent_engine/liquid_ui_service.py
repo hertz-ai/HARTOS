@@ -930,7 +930,8 @@ html.a11y-rmotion *,html.a11y-rmotion *::before,html.a11y-rmotion *::after{
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>HART OS</title>
-<style>/* fonts loaded from system via fontconfig; no external CDN needed for offline USB boot */</style>
+<script>if(navigator.onLine){{var _l=document.createElement('link');_l.rel='stylesheet';_l.href='https://fonts.googleapis.com/icon?family=Material+Icons+Round';document.head.appendChild(_l);}}</script>
+<style>/* Material Icons Round: CDN injected above only when online (testing); NixOS bundled font covers offline USB boot */</style>
 <style>
 {css_vars}
 {a11y_fontscale}
@@ -1242,12 +1243,15 @@ window.onerror = function(msg, src, line, col, err) {{
       + 'font:13px monospace;padding:8px 12px;z-index:99999;white-space:pre-wrap;max-height:40vh;overflow-y:auto';
     document.body.appendChild(d);
   }}
-  d.textContent += '[JS ERROR] ' + msg + ' (' + src + ':' + line + ':' + col + ')\n';
+  d.textContent += '[JS ERROR] ' + msg + ' (' + src + ':' + line + ':' + col + ')\\n';
   return false;
 }};
 window.addEventListener('unhandledrejection', function(e) {{
   window.onerror('[UnhandledPromise] ' + (e.reason||e), '', 0, 0, e.reason);
 }});
+
+// Helper: get panel id from nearest .panel ancestor (avoids quote-escaping in onclick strings)
+function _pid(el) {{ return el.closest('[data-panel-id]').dataset.panelId; }}
 
 // ═══ Configuration ═══
 const BACKEND = 'http://localhost:{self.backend_port}';
@@ -1374,7 +1378,7 @@ function dsSlider(opts) {{
     (id?' id="'+id+'"':'')+
     ' oninput="'+
     (oninput?oninput.replace(/"/g,'&quot;')+';':'')+
-    (id?'document.getElementById(\\''+id+'-val\\').textContent=this.value+\\''+unit+'\\';':'')+
+    (id?'document.getElementById("'+id+'-val").textContent=this.value+""+unit+"";':'')+
     '">';
   if(id) html += '<span class="ds-label-md" id="'+id+'-val" style="min-width:40px;text-align:right">'+value+unit+'</span>';
   html += '</div>';
@@ -1512,7 +1516,7 @@ function dsPrompt(title, message, opts) {{
       title: title,
       body: '<div class="ds-body-md ds-text-muted" style="margin-bottom:var(--ds-space-4)">'+(message||'')+'</div>'+
         '<input class="ds-input" type="'+inputType+'" id="ds-prompt-input" placeholder="'+placeholder+'" value="'+defaultValue+'"'+
-        ' onkeydown="if(event.key===\\'Enter\\')document.getElementById(\\'ds-prompt-ok\\').click()">',
+        ' onkeydown="if(event.key===&quot;Enter&quot;)document.getElementById(&quot;ds-prompt-ok&quot;).click()">',
       actions: [
         {{ label: 'Cancel', variant: 'text', action: function(){{ dsModalClose(); resolve(null); }} }},
         {{ label: opts.okLabel||'OK', variant: 'primary', action: function(){{
@@ -1603,7 +1607,7 @@ function updateTaskbar() {{
     const active = id===focusedPanel ? 'active' : '';
     const icon = info.icon || 'web_asset';
     const title = info.title || id;
-    return '<div class="taskbar-chip glass '+active+'" onclick="taskbarClick(\''+id+'\')" title="'+title+'">' +
+    return '<div class="taskbar-chip glass '+active+'" data-panel-id="'+id+'" onclick="taskbarClick(this.dataset.panelId)" title="'+title+'">' +
       '<span class="mi material-icons-round">'+icon+'</span>' +
       '<span class="chip-label">'+title+'</span></div>';
   }}).join('');
@@ -1668,7 +1672,7 @@ function buildStartMenu() {{
     if(!items.length) return;
     html += '<div class="start-group"><div class="start-group-label">'+group+'</div><div class="start-grid">';
     items.forEach(([id,p])=>{{
-      html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(\''+id+'\')">';
+      html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(this.dataset.id)">';
       html += '<span class="mi material-icons-round">'+(p.icon||'apps')+'</span>';
       html += '<span class="label">'+p.title+'</span></div>';
     }});
@@ -1679,7 +1683,7 @@ function buildStartMenu() {{
   if(sysItems.length) {{
     html += '<div class="start-group"><div class="start-group-label">System</div><div class="start-grid">';
     sysItems.forEach(([id,p])=>{{
-      html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(\''+id+'\')">';
+      html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(this.dataset.id)">';
       html += '<span class="mi material-icons-round">'+(p.icon||'settings')+'</span>';
       html += '<span class="label">'+p.title+'</span></div>';
     }});
@@ -1742,22 +1746,23 @@ function openPanel(id, opts) {{
   const panel = document.createElement('div');
   panel.className = 'panel glass';
   panel.id = 'panel-'+id;
+  panel.dataset.panelId = id;
   panel.style.cssText = 'left:'+x+'px;top:'+y+'px;width:'+sz[0]+'px;height:'+sz[1]+'px;z-index:'+(++panelZ);
 
   const title = opts.title || def.title || id;
   const icon = def.icon || 'web_asset';
 
-  panel.innerHTML = '<div class="panel-titlebar" onmousedown="startDrag(event,\''+id+'\')"'+
-    ' ondblclick="toggleMax(\''+id+'\')">'+
+  panel.innerHTML = '<div class="panel-titlebar" onmousedown="startDrag(event,_pid(this))"'+
+    ' ondblclick="toggleMax(_pid(this))">'+
     '<span class="mi material-icons-round">'+icon+'</span>'+
     '<span class="title">'+title+'</span>'+
     '<div class="ctrl">'+
-    '<span title="Minimize" onclick="minimizePanel(\''+id+'\')"><span class="mi material-icons-round" style="font-size:14px">minimize</span></span>'+
-    '<span title="Maximize" onclick="toggleMax(\''+id+'\')"><span class="mi material-icons-round" style="font-size:14px">crop_square</span></span>'+
-    '<span class="close" title="Close" onclick="closePanel(\''+id+'\')"><span class="mi material-icons-round" style="font-size:14px">close</span></span>'+
+    '<span title="Minimize" onclick="minimizePanel(_pid(this))"><span class="mi material-icons-round" style="font-size:14px">minimize</span></span>'+
+    '<span title="Maximize" onclick="toggleMax(_pid(this))"><span class="mi material-icons-round" style="font-size:14px">crop_square</span></span>'+
+    '<span class="close" title="Close" onclick="closePanel(_pid(this))"><span class="mi material-icons-round" style="font-size:14px">close</span></span>'+
     '</div></div>'+
     '<div class="panel-body" id="panel-body-'+id+'"></div>'+
-    '<div class="panel-resize" onmousedown="startResize(event,\''+id+'\')"></div>';
+    '<div class="panel-resize" onmousedown="startResize(event,_pid(this))"></div>';
 
   document.getElementById('panels').appendChild(panel);
   panel.addEventListener('mousedown', ()=>bringToFront(id));
@@ -1769,7 +1774,7 @@ function openPanel(id, opts) {{
   }} else if(def.route) {{
     if(PERF.lazyIframes) {{
       // Potato: placeholder until focused, then load iframe
-      body.innerHTML = '<div class="native-content" style="display:flex;align-items:center;justify-content:center;height:100%"><span class="mi material-icons-round" style="font-size:48px;color:var(--hart-muted);cursor:pointer" onclick="loadIframe(\''+id+'\',\''+def.route+'\')">touch_app</span></div>';
+      body.innerHTML = '<div class="native-content" style="display:flex;align-items:center;justify-content:center;height:100%"><span class="mi material-icons-round" style="font-size:48px;color:var(--hart-muted);cursor:pointer" data-route="'+def.route+'" onclick="loadIframe(_pid(this),this.dataset.route)">touch_app</span></div>';
       body.dataset.route = def.route;
       body.dataset.loaded = '0';
     }} else {{
@@ -2089,7 +2094,7 @@ function loadNetworkPanel(el, apis) {{
         if(available.length>0) {{
           html += '<div class="ds-section-label">Available WiFi Networks</div><div class="ds-stagger">';
           html += available.slice(0,6).map(n=>
-            '<div class="ds-list-item ds-list-item-interactive" onclick="wifiConnect(\\''+n.ssid.replace(/'/g,"\\\\'")+'\\')">' +
+            '<div class="ds-list-item ds-list-item-interactive" data-ssid="'+n.ssid+'" onclick="wifiConnect(this.dataset.ssid)">' +
             '<span class="mi material-icons-round ds-list-item-icon ds-text-accent">wifi</span>' +
             '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+n.ssid+'</div>'+
             '<div class="ds-list-item-secondary">'+n.security+'</div></div>' +
@@ -2111,7 +2116,7 @@ function loadHartIdentityPanel(el, apis) {{
       el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">My HART</div>'+
         '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-3" style="padding:40px 0">'+
         '<span class="mi material-icons-round ds-text-muted" style="font-size:48px">person_outline</span>'+
-        '<div class="ds-body-md ds-text-muted">You haven\\'t lit your HART yet.</div>'+
+        '<div class="ds-body-md ds-text-muted">You haven&#39;t lit your HART yet.</div>'+
         dsBtn('Light Your HART',{{variant:'primary', onclick:"fetch(SHELL+'/api/onboarding/start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{user_id:'1'}})}}).then(()=>showToast('Onboarding','Opening onboarding...','info')).catch(()=>{{}})"}})+'</div></div>';
       return;
     }}
@@ -2205,7 +2210,7 @@ function loadSelfBuildPanel(el, apis) {{
       html += pkgs.map(p=>
         '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent">inventory_2</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+p+'</div></div>'+
-        '<span class="ds-list-item-trailing" style="cursor:pointer" onclick="selfBuildRemove(\\''+p.replace(/'/g,"\\\\'")+'\\')">' +
+        '<span class="ds-list-item-trailing" style="cursor:pointer" data-pkg="'+p+'" onclick="selfBuildRemove(this.dataset.pkg)">' +
         '<span class="mi material-icons-round ds-text-muted" style="font-size:18px">delete_outline</span></span></div>'
       ).join('');
       html += '</div>';
@@ -2323,7 +2328,7 @@ function loadStartupAppsPanel(el) {{
       html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon '+(a.enabled?'ds-text-active':'ds-text-muted')+'">play_circle</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+a.name+'</div>'+
         '<div class="ds-list-item-secondary">'+(a.comment||a.exec||'')+'</div></div>'+
-        '<label class="ds-switch"><input type="checkbox" '+(a.enabled?'checked':'')+' onchange="toggleStartup(\\''+a.id+'\\',this.checked)"><span class="ds-switch-slider"></span></label></div>';
+        '<label class="ds-switch"><input type="checkbox" '+(a.enabled?'checked':'')+' data-id="'+a.id+'" onchange="toggleStartup(this.dataset.id,this.checked)"><span class="ds-switch-slider"></span></label></div>';
     }});
     html += '</div></div>';
     el.innerHTML = html;
@@ -2391,7 +2396,7 @@ function loadFileManagerPanel(el) {{
       const icon = f.is_dir?'folder':'description';
       const size = f.is_dir?'':' &middot; '+(f.size_human||'');
       html += '<div class="ds-list-item'+(f.is_dir?' ds-list-item-interactive':'')+'"'+
-        (f.is_dir?' onclick="browseDir(\\''+f.path.replace(/'/g,"\\\\'")+'\\');"':'')+'>'+
+        (f.is_dir?' data-path="'+f.path+'" onclick="browseDir(this.dataset.path);"':'')+'>'+
         '<span class="mi material-icons-round ds-list-item-icon '+(f.is_dir?'ds-text-accent':'ds-text-muted')+'">'+icon+'</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+f.name+'</div>'+
         '<div class="ds-list-item-secondary">'+(f.modified||'')+size+'</div></div></div>';
@@ -2410,14 +2415,14 @@ function browseDir(path) {{
     const parent = data.parent||'';
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Files</span>'+
       '<span class="ds-label-sm ds-text-muted">'+cwd+'</span></div>';
-    if(parent) html += '<div class="ds-list-item ds-list-item-interactive" onclick="browseDir(\\''+parent.replace(/'/g,"\\\\'")+'\\')">'+
+    if(parent) html += '<div class="ds-list-item ds-list-item-interactive" data-path="'+parent+'" onclick="browseDir(this.dataset.path)">'+
       '<span class="mi material-icons-round ds-list-item-icon ds-text-muted">arrow_back</span>'+
       '<div class="ds-list-item-content"><div class="ds-list-item-primary">..</div></div></div>';
     html += '<div class="ds-stagger">';
     items.slice(0,30).forEach(f=>{{
       const icon = f.is_dir?'folder':'description';
       html += '<div class="ds-list-item'+(f.is_dir?' ds-list-item-interactive':'')+'"'+
-        (f.is_dir?' onclick="browseDir(\\''+f.path.replace(/'/g,"\\\\'")+'\\');"':'')+'>'+
+        (f.is_dir?' data-path="'+f.path+'" onclick="browseDir(this.dataset.path);"':'')+'>'+
         '<span class="mi material-icons-round ds-list-item-icon '+(f.is_dir?'ds-text-accent':'ds-text-muted')+'">'+icon+'</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+f.name+'</div></div></div>';
     }});
@@ -2434,7 +2439,7 @@ function loadTerminalPanel(el) {{
     '<div style="display:flex;align-items:center;margin-top:8px">'+
     '<span style="color:#a0ffa0;margin-right:4px">$</span>'+
     '<input id="term-input" type="text" style="flex:1;background:transparent;border:none;color:#a0ffa0;font-family:monospace;font-size:13px;outline:none" '+
-    'placeholder="Type command..." onkeydown="if(event.key===\\'Enter\\')termExec()">'+
+    'placeholder="Type command..." onkeydown="if(event.key===&quot;Enter&quot;)termExec()">'+
     '</div></div></div>';
 }}
 function termExec() {{
@@ -2537,7 +2542,7 @@ function loadI18nPanel(el) {{
     locales.slice(0,15).forEach(l=>{{
       const active = l.code===current;
       html += '<div class="ds-list-item'+(active?'':' ds-list-item-interactive')+'"'+
-        (active?'':' onclick="setLocale(\\''+l.code+'\\')"')+'>'+
+        (active?'':' data-code="'+l.code+'" onclick="setLocale(this.dataset.code)"')+'>'+
         '<span class="mi material-icons-round ds-list-item-icon '+(active?'ds-text-active':'ds-text-muted')+'">translate</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+(l.name||l.code)+'</div></div>'+
         (active?'<span class="ds-list-item-trailing ds-text-active"><span class="mi material-icons-round">check</span></span>':'')+
@@ -2566,7 +2571,7 @@ function loadAccessibilityPanel(el) {{
     items.forEach(([icon,label,key,val])=>{{
       html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent" aria-hidden="true">'+icon+'</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+label+'</div></div>'+
-        '<label class="ds-switch"><input type="checkbox" role="switch" aria-label="'+label+'" '+(val?'checked':'')+' onchange="toggleA11y(\\''+key+'\\',this.checked)"><span class="ds-switch-slider"></span></label></div>';
+        '<label class="ds-switch"><input type="checkbox" role="switch" aria-label="'+label+'" '+(val?'checked':'')+' data-key="'+key+'" onchange="toggleA11y(this.dataset.key,this.checked)"><span class="ds-switch-slider"></span></label></div>';
     }});
     const _fsv = data.font_scale || 1;
     html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent" aria-hidden="true">format_size</span>'+
@@ -2643,12 +2648,38 @@ function loadFontManagerPanel(el) {{
     html += '<div class="ds-stagger">';
     fonts.slice(0,20).forEach(f=>{{
       html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent">font_download</span>'+
-        '<div class="ds-list-item-content"><div class="ds-list-item-primary" style="font-family:\\''+f.family+'\\'">'+f.family+'</div>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary" data-font="'+f.family+'">'+f.family+'</div>'+
         '<div class="ds-list-item-secondary">'+(f.style||f.styles||'')+'</div></div></div>';
     }});
     html += '</div></div>';
     el.innerHTML = html;
   }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Fonts unavailable</div>'; }});
+}}
+
+// ── Shell action helpers (avoid quote-escaping in inline onclick) ──
+function _shellPost(url, body, onOk) {{
+  fetch(SHELL+url, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(body)}})
+    .then(()=>{{ if(onOk) onOk(); }}).catch(()=>{{}});
+}}
+function shellSetSoundTheme(el) {{
+  _shellPost('/api/shell/sounds/set-theme', {{theme:el.dataset.theme}},
+    ()=>loadSoundManagerPanel(document.getElementById('sys-sound_manager')));
+}}
+function shellCopyClipboard(el) {{
+  _shellPost('/api/shell/clipboard/copy', {{text:el.dataset.clip}},
+    ()=>showToast('Clipboard','Copied','info'));
+}}
+function shellSetWallpaper(el) {{
+  _shellPost('/api/shell/wallpaper/set', {{path:el.dataset.path}},
+    ()=>showToast('Wallpaper','Set','success'));
+}}
+function shellDeleteNote(el) {{
+  _shellPost('/api/shell/notes/delete', {{id:el.dataset.id}},
+    ()=>loadNotesAppPanel(document.getElementById('sys-notes_app')));
+}}
+function shellRestoreTrash(el) {{
+  _shellPost('/api/shell/trash/restore', {{path:el.dataset.path}},
+    ()=>loadTrashBinPanel(document.getElementById('sys-trash_bin')));
 }}
 
 // ═══ Sound Manager ═══
@@ -2661,7 +2692,7 @@ function loadSoundManagerPanel(el) {{
     html += '<div class="ds-stagger">';
     themes.forEach(t=>{{
       html += '<div class="ds-list-item'+(t===current?'':' ds-list-item-interactive')+'"'+
-        (t===current?'':' onclick="fetch(SHELL+\\'/api/shell/sounds/set-theme\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{theme:\\''+t+'\\'}})}}).then(()=>loadSoundManagerPanel(document.getElementById(\\'sys-sound_manager\\')))"')+'>'+
+        (t===current?'':' data-theme="'+t+'" onclick="shellSetSoundTheme(this)"')+'>'+
         '<span class="mi material-icons-round ds-list-item-icon '+(t===current?'ds-text-active':'ds-text-muted')+'">volume_up</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+t+'</div></div>'+
         (t===current?'<span class="ds-list-item-trailing ds-text-active"><span class="mi material-icons-round">check</span></span>':'')+
@@ -2682,7 +2713,7 @@ function loadClipboardPanel(el) {{
     if(items.length===0) html += '<div class="ds-body-md ds-text-muted">Clipboard empty</div>';
     else items.slice(0,15).forEach((c,i)=>{{
       const preview = (c.text||c.content||'').substring(0,80);
-      html += '<div class="ds-list-item ds-list-item-interactive" onclick="fetch(SHELL+\\'/api/shell/clipboard/copy\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{text:\\''+preview.replace(/'/g,"\\\\'").replace(/\n/g,' ')+'\\'}})}}); showToast(\\'Clipboard\\',\\'Copied\\',\\'info\\')">'+
+      html += '<div class="ds-list-item ds-list-item-interactive" data-clip="'+preview+'" onclick="shellCopyClipboard(this)">'+
         '<span class="mi material-icons-round ds-list-item-icon ds-text-muted">content_paste</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary ds-truncate">'+preview+'</div>'+
         '<div class="ds-list-item-secondary">'+(c.time||'')+(c.pinned?' &middot; Pinned':'')+'</div></div></div>';
@@ -2721,8 +2752,8 @@ function loadWallpaperPanel(el) {{
       html += '<div class="ds-section-label">Collection</div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px">';
       walls.slice(0,12).forEach(w=>{{
         html += '<div style="aspect-ratio:16/9;border-radius:8px;background:#1a1a1a;cursor:pointer;overflow:hidden;border:2px solid transparent" '+
-          'onclick="fetch(SHELL+\\'/api/shell/wallpaper/set\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{path:\\''+w.path.replace(/'/g,"\\\\'")+'\\'}})}}); showToast(\\'Wallpaper\\',\\'Set\\',\\'success\\')">'+
-          '<img src="'+SHELL+'/api/shell/files/thumb?path='+encodeURIComponent(w.path)+'" style="width:100%;height:100%;object-fit:cover" onerror="this.parentNode.innerHTML=\\'<div style=padding:8px;font-size:11px>'+w.name+'</div>\\'"></div>';
+          'data-path="'+w.path+'" onclick="shellSetWallpaper(this)">'+
+          '<img src="'+SHELL+'/api/shell/files/thumb?path='+encodeURIComponent(w.path)+'" style="width:100%;height:100%;object-fit:cover" onerror="this.hidden=true"></div>';
       }});
       html += '</div>';
     }}
@@ -2824,7 +2855,7 @@ function loadNotesAppPanel(el) {{
       html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent">sticky_note_2</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary ds-truncate">'+(n.content||'').substring(0,80)+'</div>'+
         '<div class="ds-list-item-secondary">'+(n.created||n.date||'')+'</div></div>'+
-        '<span class="ds-list-item-trailing" style="cursor:pointer" onclick="fetch(SHELL+\\'/api/shell/notes/delete\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{id:\\''+n.id+'\\'}})}}).then(()=>loadNotesAppPanel(document.getElementById(\\'sys-notes_app\\')))">'+
+        '<span class="ds-list-item-trailing" style="cursor:pointer" data-id="'+n.id+'" onclick="shellDeleteNote(this)">'+
         '<span class="mi material-icons-round ds-text-muted" style="font-size:18px">delete_outline</span></span></div>';
     }});
     html += '</div></div>';
@@ -2908,7 +2939,7 @@ function loadWiFiManagerPanel(el) {{
     if(networks.length>0) {{
       html += '<div class="ds-section-label">Available Networks</div><div class="ds-stagger">';
       networks.filter(n=>!n.active).slice(0,8).forEach(n=>{{
-        html += '<div class="ds-list-item ds-list-item-interactive" onclick="wifiConnect(\\''+n.ssid.replace(/'/g,"\\\\'")+'\\')">'+
+        html += '<div class="ds-list-item ds-list-item-interactive" data-ssid="'+n.ssid+'" onclick="wifiConnect(this.dataset.ssid)">'+
           '<span class="mi material-icons-round ds-list-item-icon ds-text-accent">wifi</span>'+
           '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+n.ssid+'</div>'+
           '<div class="ds-list-item-secondary">'+n.security+' &middot; '+n.signal+'%</div></div></div>';
@@ -2952,7 +2983,7 @@ function loadTrashBinPanel(el) {{
       html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-muted">delete</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+t.name+'</div>'+
         '<div class="ds-list-item-secondary">'+(t.deleted_at||'')+'</div></div>'+
-        '<span class="ds-list-item-trailing" style="cursor:pointer" onclick="fetch(SHELL+\\'/api/shell/trash/restore\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{path:\\''+t.original_path.replace(/'/g,"\\\\'")+'\\'}})}}); loadTrashBinPanel(document.getElementById(\\'sys-trash_bin\\'))">'+
+        '<span class="ds-list-item-trailing" style="cursor:pointer" data-path="'+t.original_path+'" onclick="shellRestoreTrash(this)">'+
         '<span class="mi material-icons-round ds-text-accent" style="font-size:18px">restore</span></span></div>';
     }});
     html += '</div></div>';
@@ -3198,7 +3229,7 @@ function loadRemoteDesktopPanel(el, apis) {{
         '<span class="mi material-icons-round ds-text-active" style="font-size:24px">connected_tv</span></div>';
 
       // Device ID card
-      html += '<div class="ds-card ds-card-elevated ds-card-interactive" onclick="navigator.clipboard.writeText(\\''+deviceId+'\\').then(()=>{{this.querySelector(\\'.copy-hint\\').textContent=\\'Copied!\\';setTimeout(()=>this.querySelector(\\'.copy-hint\\').textContent=\\'Click to copy\\',2000)}})" title="Click to copy">';
+      html += '<div class="ds-card ds-card-elevated ds-card-interactive" data-did="'+deviceId+'" onclick="navigator.clipboard.writeText(this.dataset.did).then(()=>{{var h=this.querySelector(&quot;.copy-hint&quot;);h.textContent=&quot;Copied!&quot;;setTimeout(()=>h.textContent=&quot;Click to copy&quot;,2000)}})" title="Click to copy">';
       html += '<div class="ds-metric"><div class="ds-label-sm ds-text-muted">Your Device ID</div>';
       html += '<div class="ds-headline-md ds-text-heading" style="letter-spacing:3px;margin:var(--ds-space-2) 0">'+did+'</div>';
       html += '<div class="copy-hint ds-label-sm ds-text-muted">Click to copy</div></div></div>';
@@ -3305,7 +3336,7 @@ function initAssistantChat() {{
   const capsEl = document.getElementById('ac-caps');
   if(!capsEl) return;
   capsEl.innerHTML = AC_CAPS.map(c=>
-    '<div class="ac-cap'+(c.id===acActiveCap?' active':'')+'" onclick="acSelectCap(\''+c.id+'\')" title="'+c.name+'">'+
+    '<div class="ac-cap'+(c.id===acActiveCap?' active':'')+'" data-cap-id="'+c.id+'" onclick="acSelectCap(this.dataset.capId)" title="'+c.name+'">'+
     '<span class="mi material-icons-round">'+c.icon+'</span>'+c.name+'</div>'
   ).join('');
 
@@ -3365,7 +3396,7 @@ function minimizeAssistant() {{
 function acSelectCap(id) {{
   acActiveCap = id;
   document.querySelectorAll('.ac-cap').forEach(function(el) {{
-    el.classList.toggle('active', el.getAttribute('onclick').includes("'"+id+"'"));
+    el.classList.toggle('active', el.dataset.capId === id);
   }});
 }}
 
@@ -3504,9 +3535,10 @@ document.addEventListener('contextmenu', e => {{
   menu.style.display = 'block';
 }});
 document.addEventListener('click', ()=>{{document.getElementById('ctx-menu').style.display='none';}});
+function _closeCtx() {{ document.getElementById('ctx-menu').style.display='none'; }}
 
 function ctxItem(icon,label,action) {{
-  return '<div class="ctx-menu-item" onclick="'+action+';document.getElementById(\'ctx-menu\').style.display=\'none\'">'+
+  return '<div class="ctx-menu-item" onclick="'+action+';_closeCtx()">'+
     '<span class="mi material-icons-round">'+icon+'</span>'+label+'</div>';
 }}
 function ctxSep() {{ return '<div class="ctx-menu-sep"></div>'; }}
@@ -3698,6 +3730,25 @@ function _postApproval(agentId, action, decision) {{
 var _overlayStack = [];
 // HTML escape — prevents XSS from agent-pushed content
 function _esc(s){{if(!s)return'';var d=document.createElement('div');d.textContent=String(s);return d.innerHTML;}}
+function _submitA2UIForm(form) {{
+  event.preventDefault();
+  var action = form.dataset.action || '/api/a2ui';
+  var fd = {{}};
+  new FormData(form).forEach(function(v,k){{fd[k]=v;}});
+  fetch(SHELL+action,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(fd)}}).catch(function(){{}});
+  return false;
+}}
+function shellA2UIListSelect(el) {{
+  try {{
+    fetch(SHELL+(el.dataset.action||'/api/a2ui'),{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{selected:parseInt(el.dataset.idx||0),item:el.dataset.item||''}})}}).catch(function(){{}});
+  }} catch(e) {{}}
+}}
+function _doApproval(btn, verdict) {{
+  var div = btn.closest('[data-agent-id]');
+  if(div) {{ _postApproval(div.dataset.agentId||'', div.dataset.action||'', verdict); }}
+  var ov = btn.closest('.agent-overlay');
+  if(ov) ov.remove();
+}}
 
 function renderAgentOverlay(ev) {{
   // Sanitize all string fields to prevent XSS injection
@@ -3823,7 +3874,7 @@ function renderAgentOverlay(ev) {{
     if(ev.filename) html += '<span class="ds-label-sm ds-text-muted" style="font-family:monospace">'+(ev.filename)+'</span>';
     if(ev.language) html += '<span class="ds-label-sm" style="color:var(--hart-accent);font-size:9px;text-transform:uppercase">'+(ev.language)+'</span>';
     html += '</div>';
-    html += '<pre style="margin:0;padding:10px;background:rgba(0,0,0,0.5);border-radius:8px;overflow-x:auto;font-family:\'Fira Code\',\'Cascadia Code\',monospace;font-size:12px;line-height:1.4;color:#e0e0e0;white-space:pre-wrap;word-break:break-all"><code>'+(ev.content||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</code></pre>';
+    html += '<pre style="margin:0;padding:10px;background:rgba(0,0,0,0.5);border-radius:8px;overflow-x:auto;font-family:"Fira Code","Cascadia Code",monospace;font-size:12px;line-height:1.4;color:#e0e0e0;white-space:pre-wrap;word-break:break-all"><code>'+(ev.content||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</code></pre>';
 
   }} else if(type === 'markdown') {{
     var md = ev.content||'';
@@ -3838,7 +3889,7 @@ function renderAgentOverlay(ev) {{
     md = md.replace(/^# (.+)$/gm,'<div class="ds-body-lg" style="font-weight:700;margin-top:6px">$1</div>');
     md = md.replace(/^[-*] (.+)$/gm,'<div style="padding-left:12px">&#8226; $1</div>');
     md = md.replace(/^\d+\. (.+)$/gm,function(m,p1){{ return '<div style="padding-left:12px">'+m.split('.')[0]+'. '+p1+'</div>'; }});
-    md = md.replace(/\n/g,'<br>');
+    md = md.split(String.fromCharCode(10)).join('<br>');
     html += '<div class="ds-body-sm" style="line-height:1.5">'+md+'</div>';
 
   }} else if(type === 'media') {{
@@ -3851,7 +3902,7 @@ function renderAgentOverlay(ev) {{
     }} else if(mediaType === 'audio' || src.match(/\.(mp3|wav|ogg|aac)($|\?)/i)) {{
       html += '<audio src="'+src+'" '+(ev.controls!==false?'controls':'')+' style="width:100%">'+alt+'</audio>';
     }} else {{
-      html += '<img src="'+src+'" alt="'+alt+'" style="width:100%;border-radius:8px;max-height:160px;object-fit:cover" onerror="this.style.display=\'none\'">';
+      html += '<img src="'+src+'" alt="'+alt+'" style="width:100%;border-radius:8px;max-height:160px;object-fit:cover" onerror="this.hidden=true">';
     }}
     if(ev.caption) html += '<div class="ds-label-sm ds-text-muted" style="margin-top:4px">'+(ev.caption)+'</div>';
 
@@ -3868,7 +3919,7 @@ function renderAgentOverlay(ev) {{
   }} else if(type === 'form') {{
     html += '<div class="ds-body-md" style="font-weight:600;margin-bottom:8px">'+(ev.title||'Form')+'</div>';
     var formId = 'form-'+(ev._ts||Date.now());
-    html += '<form id="'+formId+'" style="display:flex;flex-direction:column;gap:6px" onsubmit="event.preventDefault();var fd={{}};new FormData(this).forEach(function(v,k){{fd[k]=v}});fetch(SHELL+\''+(ev.action||'/api/a2ui')+'\',{{method:\'POST\',headers:{{\'Content-Type\':\'application/json\'}},body:JSON.stringify(fd)}}).catch(function(){{}});return false;">';
+    html += '<form id="'+formId+'" data-action="'+(ev.action||'/api/a2ui')+'" style="display:flex;flex-direction:column;gap:6px" onsubmit="return _submitA2UIForm(this)">';
     (ev.fields||[]).forEach(function(f){{
       var ftype = f.type||'text';
       var fname = f.name||f.label||'field';
@@ -3896,7 +3947,7 @@ function renderAgentOverlay(ev) {{
       var text = typeof item === 'string' ? item : (item.label||item.text||item.name||JSON.stringify(item));
       var action = typeof item === 'object' ? item.action : null;
       if(action || ev.interactive) {{
-        html += '<li style="padding:2px 0;cursor:pointer;color:var(--hart-accent)" onclick="try{{fetch(SHELL+\''+( action||'/api/a2ui')+'\',{{method:\'POST\',headers:{{\'Content-Type\':\'application/json\'}},body:JSON.stringify({{selected:'+i+',item:\''+text.replace(/'/g,'\\\\\\\'')+'\'}})}})}}catch(e){{}}">'+(text)+'</li>';
+        html += '<li style="padding:2px 0;cursor:pointer;color:var(--hart-accent)" data-action="'+(action||'/api/a2ui')+'" data-idx="'+i+'" data-item="'+_esc(text)+'" onclick="shellA2UIListSelect(this)">'+(text)+'</li>';
       }} else {{
         html += '<li style="padding:2px 0">'+(text)+'</li>';
       }}
@@ -3907,10 +3958,10 @@ function renderAgentOverlay(ev) {{
     html += '<div class="ds-body-md" style="font-weight:600;margin-bottom:4px">Approval Required</div>';
     html += '<div class="ds-body-sm ds-text-muted" style="margin-bottom:8px">'+(ev.description||ev.action||'An agent requests your approval.')+'</div>';
     if(ev.agent_id) html += '<div class="ds-label-sm ds-text-muted" style="margin-bottom:6px">Agent: '+(ev.agent_id)+'</div>';
-    html += '<div style="display:flex;gap:6px;justify-content:flex-end">';
-    html += '<button class="ds-btn ds-btn-primary ds-btn-sm" onclick="dsRipple(event);_postApproval(\''+((ev.agent_id||'').replace(/'/g,''))+'\',\''+((ev.action||'').replace(/'/g,''))+'\',\'approve\');this.closest(\'.agent-overlay\').remove()"><span>Approve</span></button>';
-    html += '<button class="ds-btn ds-btn-outline ds-btn-sm" onclick="dsRipple(event);_postApproval(\''+((ev.agent_id||'').replace(/'/g,''))+'\',\''+((ev.action||'').replace(/'/g,''))+'\',\'deny\');this.closest(\'.agent-overlay\').remove()"><span>Deny</span></button>';
-    html += '<button class="ds-btn ds-btn-ghost ds-btn-sm" onclick="dsRipple(event);this.closest(\'.agent-overlay\').remove()"><span>Later</span></button>';
+    html += '<div style="display:flex;gap:6px;justify-content:flex-end" data-agent-id="'+(ev.agent_id||'')+'" data-action="'+(ev.action||'')+'">';
+    html += '<button class="ds-btn ds-btn-primary ds-btn-sm" onclick="dsRipple(event);_doApproval(this,&quot;approve&quot;)"><span>Approve</span></button>';
+    html += '<button class="ds-btn ds-btn-outline ds-btn-sm" onclick="dsRipple(event);_doApproval(this,&quot;deny&quot;)"><span>Deny</span></button>';
+    html += '<button class="ds-btn ds-btn-ghost ds-btn-sm" onclick="dsRipple(event);this.closest(&quot;.agent-overlay&quot;).remove()"><span>Later</span></button>';
     html += '</div>';
 
   }} else if(type === 'navigate') {{
@@ -3958,7 +4009,7 @@ function renderAgentOverlay(ev) {{
       section.className = 'start-group';
       section.innerHTML = '<div class="start-group-label">Recent Files</div><div class="start-grid">' +
         files.slice(0,8).map(function(f) {{
-          return '<div class="start-item" onclick="launchApp(\'xdg-open\')">' +
+          return '<div class="start-item" data-path="'+f.path.replace(/"/g,'&quot;')+'" onclick="launchApp(&quot;xdg-open&quot;,this.dataset.path)">' +
             '<span class="mi material-icons-round" style="color:var(--hart-muted)">description</span>' +
             '<span class="label" title="'+f.path+'">'+f.name+'</span></div>';
         }}).join('') + '</div>';
@@ -4043,6 +4094,10 @@ function renderAgentOverlay(ev) {{
         @app.route('/')
         def index():
             return Response(self.render_desktop_shell(), mimetype='text/html')
+
+        @app.route('/favicon.ico')
+        def favicon():
+            return Response(status=204)
 
         # ── Nunba SPA embedding (React pages inside panel iframes) ──
         nunba_dir = os.environ.get('NUNBA_STATIC_DIR', '')
