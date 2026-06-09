@@ -197,6 +197,45 @@ class TestDispatchDraftFirstDelegation:
         assert call_kwargs['model_id'] == 'qwen3.5-0.8b-draft'
         assert call_kwargs['response'] == 'Hello!'
 
+    def test_trivial_greeting_does_not_escalate_on_hallucinated_memory_query(
+            self, dispatcher, monkeypatch):
+        """The 0.8B draft sometimes hallucinates memory_query on a bare greeting
+        (live 2026-06-09: 'hii' → memory_query='earlier greetings').  That must
+        NOT swap the reply for the standby + escalate to a looping expert turn —
+        the draft's own greeting reply stands and nothing is dispatched."""
+        _mock_guardrails(monkeypatch)
+        draft_raw = ('{"reply": "Hey there!", "delegate": "none", '
+                     '"confidence": 0.95, "is_casual": true, '
+                     '"memory_query": "earlier greetings"}')
+        with patch.object(dispatcher, '_dispatch_to_model', return_value=draft_raw), \
+             patch.object(dispatcher, '_record_interaction_safely'), \
+             patch.object(dispatcher._expert_pool, 'submit') as mock_submit:
+            result = dispatcher.dispatch_draft_first(
+                'hii', user_id='u1', prompt_id='p1')
+
+        assert result['response'] == 'Hey there!'   # NOT the standby placeholder
+        assert result['delegate'] == 'none'         # NOT escalated
+        mock_submit.assert_not_called()
+
+    def test_substantive_memory_query_still_escalates(
+            self, dispatcher, monkeypatch):
+        """The greeting gate only suppresses TRIVIAL casual utterances — a real
+        multi-word recall request must still escalate so the expert turn can use
+        the recall tools."""
+        _mock_guardrails(monkeypatch)
+        draft_raw = ('{"reply": "draft answer", "delegate": "none", '
+                     '"confidence": 0.9, "is_casual": true, '
+                     '"memory_query": "our earlier discussion"}')
+        with patch.object(dispatcher, '_dispatch_to_model', return_value=draft_raw), \
+             patch.object(dispatcher, '_record_interaction_safely'), \
+             patch.object(dispatcher, '_check_and_reserve_budget', return_value=True), \
+             patch.object(dispatcher._expert_pool, 'submit') as mock_submit:
+            result = dispatcher.dispatch_draft_first(
+                'what did we discuss earlier today', user_id='u1', prompt_id='p1')
+
+        assert result['delegate'] == 'local'        # escalated for the real query
+        mock_submit.assert_called_once()
+
     def test_delegate_local_fires_background_expert(
             self, dispatcher, monkeypatch):
         _mock_guardrails(monkeypatch)

@@ -677,13 +677,25 @@ class SpeculativeDispatcher:
             v = str(value).strip().lower()
             return bool(v) and v != 'none'
 
+        # A trivial casual utterance ("hii", "hey", "thanks") carries no real
+        # recall intent, but the 0.8B draft sometimes HALLUCINATES memory_query
+        # on it (live 2026-06-09: 'hii' → memory_query='earlier greetings').  That
+        # would needlessly swap the reply for the standby placeholder and escalate
+        # to the expert turn, which then loops on a non-existent query and strands
+        # the user on "Let me check that for you…".  Suppress ONLY the memory_query
+        # escalation for such turns; the other actionable intents (channel_connect
+        # / create_agent / language_change / invite / join) can be terse — "connect
+        # discord" is two words and genuinely needs its tool — so they stay.
+        _trivial_casual = (bool(parsed.get('is_casual'))
+                           and len((prompt or '').strip().split()) <= 2)
+
         if delegate == 'none' and (
             _intent_set(parsed.get('channel_connect'))
             or parsed.get('is_create_agent')
             or _intent_set(parsed.get('language_change'))
             or _intent_set(parsed.get('invite_intent'))
             or _intent_set(parsed.get('join_room_intent'))
-            or _intent_set(parsed.get('memory_query'))
+            or (_intent_set(parsed.get('memory_query')) and not _trivial_casual)
         ):
             logger.info(
                 "draft-first: actionable intent flag set "
