@@ -520,7 +520,11 @@ def send_message_to_user1(user_id, response, inp, prompt_id):
             'inp': inp,
         }
         try:
-            from core.message_bus import publish_async
+            # Canonical worker-safe publisher is the module-level publish_async
+            # (create_recipe.py:109, routes via safe_hartos_attr). The previous
+            # `from core.message_bus import publish_async` raised
+            # ModuleNotFoundError every call (no such module) → bundled mode
+            # silently dropped every intermediate chat message.
             publish_async(f'com.hertzai.hevolve.chat.{user_id}', chat_payload)
         except Exception as _e:
             try:
@@ -5050,6 +5054,12 @@ def request_recipe_for_action(current_action_id, prompt_id, role, user_prompt, p
 
 def fix_cyclic_dependency(cyc, individual_recipe):
     res = fix_actions(individual_recipe, cyc)
+    # fix_actions returns None when the local llama-server is down or its
+    # response can't be parsed. Leave the recipe's dependencies unmodified
+    # rather than crashing the flow with `TypeError: 'NoneType' is not
+    # iterable` on the offline path.
+    if not res:
+        return
     for i in res:
         for j in individual_recipe:
             if i['action_id'] == j['action_id']:

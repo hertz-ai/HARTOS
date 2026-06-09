@@ -205,10 +205,14 @@ def agent_status() -> str:
     # unavailable so callers know not to trust the shadow.
     try:
         import requests as _r
-        from core.port_registry import get_port as _get_port
-        _port = _get_port('nunba') if 'nunba' in dir() else 5000
+        # Canonical "where is HARTOS serving" resolver — bundled→:5000,
+        # standalone→:6777, OS-mode→:500. The old `get_port('nunba') if
+        # 'nunba' in dir() else 5000` was dead code: 'nunba' is never a local
+        # var, so it hardcoded 5000 and broke on any non-bundled deployment.
+        from core.port_registry import get_local_backend_url
+        _base = get_local_backend_url().rstrip('/')
         _resp = _r.get(
-            f"http://127.0.0.1:{_port}/api/agent-engine/ledger/stats",
+            f"{_base}/api/agent-engine/ledger/stats",
             timeout=3,
         )
         if _resp.status_code == 200:
