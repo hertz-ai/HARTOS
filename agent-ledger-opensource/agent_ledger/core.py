@@ -603,6 +603,19 @@ class Task:
         if self.status == TaskStatus.COMPLETED and new_status == TaskStatus.ROLLED_BACK:
             return True
 
+        # Special case: FAILED -> COMPLETED/TERMINATED is a legitimate RECOVERY.
+        # The agent retry/fallback FSM (ActionState in lifecycle_hooks) can drive a
+        # task that was transiently marked FAILED — e.g. reaped by zombie_reaper
+        # while merely stalled in recipe_requested — to genuine success. When that
+        # happens the ledger's FAILED is stale and must follow, otherwise the
+        # recovered work reads as failed forever and the goal-completion count
+        # never moves. Only FORWARD recovery to a SUCCESS terminal is permitted;
+        # FAILED never goes back into active work (IN_PROGRESS/RESUMING), so the
+        # #59 fast-fail circuit breaker still prevents retry storms.
+        if self.status == TaskStatus.FAILED and new_status in (
+                TaskStatus.COMPLETED, TaskStatus.TERMINATED):
+            return True
+
         if TaskStatus.is_terminal_state(self.status):
             logger.warning(f"Cannot transition from terminal state {self.status} to {new_status}")
             return False

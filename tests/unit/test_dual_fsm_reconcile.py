@@ -18,6 +18,10 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+_LEDGER_SRC = os.path.join(ROOT, 'agent-ledger-opensource')
+if _LEDGER_SRC not in sys.path:
+    sys.path.insert(0, _LEDGER_SRC)
+
 
 def test_terminated_recipe_capture_edge():
     try:
@@ -151,3 +155,65 @@ def test_force_path_recipe_requested_to_terminated_completes():
     finally:
         with L._state_lock:
             L.action_states.pop(up, None)
+
+
+def test_ledger_allows_failed_recovery_to_success():
+    """#128 reconcile (ledger half): a FAILED ledger task may RECOVER to a SUCCESS
+    terminal (COMPLETED/TERMINATED) when the agent fallback FSM drives it there —
+    but NEVER back into active work (no retry storm; #59's circuit breaker holds),
+    and a genuine hard-terminal (CANCELLED) stays terminal.
+
+    Why this exists: a task can be reaped to FAILED (zombie_reaper) while merely
+    stalled in recipe_requested; now that #128 lets the action recover (fallback →
+    terminated), the ledger's FAILED is stale and must follow, else the recovered
+    work reads as failed forever and the goal-completion count never moves.
+    """
+    try:
+        from agent_ledger.core import Task, TaskType, TaskStatus
+    except Exception as e:
+        pytest.skip(f"agent_ledger unavailable: {e}")
+
+    def _t(status):
+        return Task(task_id="t1", description="d",
+                    task_type=TaskType.PRE_ASSIGNED, status=status)
+
+    # recovery to success — newly allowed, and it actually applies
+    rec = _t(TaskStatus.FAILED)
+    assert rec.transition_to(TaskStatus.COMPLETED) is True
+    assert rec.status == TaskStatus.COMPLETED
+    assert _t(TaskStatus.FAILED).transition_to(TaskStatus.TERMINATED) is True
+    # but NEVER back into active work (would re-enable retry storms #59 fixed)
+    assert _t(TaskStatus.FAILED).transition_to(TaskStatus.IN_PROGRESS) is False
+    assert _t(TaskStatus.FAILED).transition_to(TaskStatus.BLOCKED) is False
+    # a genuine hard-terminal stays terminal
+    assert _t(TaskStatus.CANCELLED).transition_to(TaskStatus.COMPLETED) is False
+    # the pre-existing COMPLETED→ROLLED_BACK special case is unregressed
+    assert _t(TaskStatus.COMPLETED).transition_to(TaskStatus.ROLLED_BACK) is True
+
+
+def test_auto_sync_reconciles_failed_ledger_on_recovery():
+    """#128 reconcile (sync half): when an action's ledger task is stale-FAILED
+    and the ActionState recovers to TERMINATED (→ ledger COMPLETED),
+    _auto_sync_to_ledger must reconcile the ledger to COMPLETED instead of the
+    #56 advisory-skip (which left the recovered goal reading FAILED and capped
+    the completed count)."""
+    try:
+        import lifecycle_hooks as L
+        from agent_ledger.core import Task, TaskType, TaskStatus, SmartLedger
+        from agent_ledger.backends import InMemoryBackend
+    except Exception as e:
+        pytest.skip(f"deps unavailable: {e}")
+
+    up = 'u128_reconcile'
+    ledger = SmartLedger(agent_id="test", session_id="s", backend=InMemoryBackend())
+    ledger.add_task(Task(task_id="action_1", description="d",
+                         task_type=TaskType.PRE_ASSIGNED, status=TaskStatus.FAILED))
+    L._ledger_registry[up] = ledger
+    try:
+        # ActionState recovered to TERMINATED (maps to ledger COMPLETED)
+        L._auto_sync_to_ledger(up, 1, L.ActionState.TERMINATED)
+        assert ledger.tasks["action_1"].status == TaskStatus.COMPLETED, (
+            "a recovered action must reconcile the stale ledger FAILED → COMPLETED, "
+            "not leave it FAILED")
+    finally:
+        L._ledger_registry.pop(up, None)

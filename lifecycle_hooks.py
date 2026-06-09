@@ -192,12 +192,27 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                 # would WARN-spam (~100/run) for an expected, benign divergence.
                 # This advisory sync skips it quietly (the single-FSM unification,
                 # #56 option (a), is the deeper cleanup; the divergence is benign).
-                if task.is_terminal():
+                # #128 recovery reconcile: a stalled action can now RECOVER
+                # (fallback → terminated) instead of trapping.  If it had been
+                # reaped to FAILED meanwhile, the ledger is stale — so when the
+                # ActionState reaches a SUCCESS terminal (ledger COMPLETED) over a
+                # FAILED task, apply the now-permitted recovery edge instead of
+                # silently skipping (which left the recovered goal reading FAILED
+                # and capped the completed count).  Every OTHER terminal divergence
+                # stays benign-skipped, exactly as #56 intended.
+                _recover_failed = (ledger_status == LedgerTaskStatus.COMPLETED
+                                   and task.status == LedgerTaskStatus.FAILED)
+                if task.is_terminal() and not _recover_failed:
                     logger.debug(
                         "Advisory ledger sync: task %s terminal (%s), ActionState "
                         "moved to %s — skipping invalid transition (authoritative "
                         "FSM is ActionState).", task_id, task.status, state.value)
                 else:
+                    if _recover_failed:
+                        logger.info(
+                            "Reconciled stale ledger FAILED → COMPLETED for %s "
+                            "(ActionState %s authoritative — recovered work).",
+                            task_id, state.value)
                     ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
 
             # === BLOCKED REASON: set specific reason based on ActionState source ===
