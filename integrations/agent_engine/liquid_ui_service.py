@@ -542,9 +542,11 @@ class LiquidUIService:
         try:
             from integrations.agent_engine.shell_manifest import (
                 PANEL_MANIFEST, DYNAMIC_PANELS, SYSTEM_PANELS, PANEL_GROUPS)
-            manifest_json = json.dumps(PANEL_MANIFEST)
-            system_json = json.dumps(SYSTEM_PANELS)
-            groups_json = json.dumps(PANEL_GROUPS)
+            # Replace </ with <\/ so the browser HTML parser never sees
+            # </script> inside the JSON and prematurely closes the script tag.
+            manifest_json = json.dumps(PANEL_MANIFEST).replace('</', '<\\/')
+            system_json = json.dumps(SYSTEM_PANELS).replace('</', '<\\/')
+            groups_json = json.dumps(PANEL_GROUPS).replace('</', '<\\/')
         except Exception:
             manifest_json = '{}'
             system_json = '{}'
@@ -928,9 +930,7 @@ html.a11y-rmotion *,html.a11y-rmotion *::before,html.a11y-rmotion *::after{
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>HART OS</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600;700&family=Fira+Code:wght@400;500;600&display=swap" rel="stylesheet">
-<link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
+<style>/* fonts loaded from system via fontconfig; no external CDN needed for offline USB boot */</style>
 <style>
 {css_vars}
 {a11y_fontscale}
