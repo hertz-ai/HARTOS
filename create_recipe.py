@@ -1141,6 +1141,28 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
         try:
             tool_logger.info('INSIDE execute_windows_or_android_command')
+
+            # Defensive: agents occasionally pass both args bundled as a
+            # dict in the first positional (e.g. {'instructions': '...',
+            # 'os_to_control': 'windows'}) instead of as separate kwargs.
+            # The declared signature is (instructions: str, os_to_control:
+            # str), so downstream code (e.g. simplified_instructions =
+            # ' '.join(instructions.lower().strip().split()) ~line 1189)
+            # crashes with `AttributeError: 'dict' object has no attribute
+            # 'lower'` when the dict slips through.  Coerce here, in one
+            # place, so every downstream string op is safe.  Last logged:
+            # 2026-05-29 in install agent_system.log.
+            if isinstance(instructions, dict):
+                if (not os_to_control or os_to_control == 'windows') \
+                        and 'os_to_control' in instructions:
+                    os_to_control = instructions.get('os_to_control') \
+                        or os_to_control or 'windows'
+                instructions = (
+                    instructions.get('instructions')
+                    or instructions.get('command')
+                    or str(instructions)
+                )
+
             user_prompt = f'{user_id}_{prompt_id}'
             role_number = get_current_flow(user_prompt)
 

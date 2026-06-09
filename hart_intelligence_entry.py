@@ -6593,25 +6593,66 @@ async def async_main(urls):
 
 
 def top5_results(query):
+    """Return the top-5 web results for ``query`` — None-safe + exception-safe.
+
+    The module-level ``search`` (GoogleSearchAPIWrapper) is allowed to be
+    None when GOOGLE_API_KEY / GOOGLE_CSE_ID env vars are missing (see
+    line ~2033 where the constructor is wrapped in try/except).  Earlier
+    versions of this function called ``search.results(...)`` unguarded,
+    so any local-only install reproduced the trace:
+
+        AttributeError: 'NoneType' object has no attribute 'results'
+        File "hart_intelligence_entry.py", line 6597, in top5_results
+
+    (Last logged: 2026-06-07 15:55:59 — `google_search('weather in
+    chennai right now')`.)  Fix: short-circuit when ``search`` is None,
+    catch any exception from ``search.results()`` itself, and broaden
+    the existing ``except RuntimeError`` to ``except Exception`` so a
+    transient network failure doesn't kill the calling agent either.
+    """
     final_res = []
-    top_2_search_res = search.results(query, 2)
-    top_2_search_res_link = [res['link'] for res in top_2_search_res]
+    cleaned_text = ""
+
+    if search is None:
+        app.logger.warning(
+            "top5_results: GoogleSearchAPIWrapper unavailable "
+            "(missing GOOGLE_API_KEY / GOOGLE_CSE_ID).  Returning empty.")
+        return []
+
+    try:
+        top_2_search_res = search.results(query, 2) or []
+    except Exception as e:
+        app.logger.warning(f"top5_results: search.results() failed: {e}")
+        return []
+
+    top_2_search_res_link = [
+        res['link'] for res in top_2_search_res
+        if isinstance(res, dict) and 'link' in res
+    ]
+    if not top_2_search_res_link:
+        return []
+
     try:
         text = asyncio.run(async_main(top_2_search_res_link))
         # Removing punctuation and extra characters
         app.logger.info(text)
-        cleaned_text = re.sub(r'[^\w\s]', '', text[0] +
-                              " "+text[1])  # Remove punctuation
-        # Remove extra newlines and leading/trailing whitespaces
-        cleaned_text = re.sub(r'\n+', '\n', cleaned_text).strip()
-    except RuntimeError as e:
-        app.logger.error(f"Runtime error occurred: {e}")
+        if text and len(text) >= 2:
+            cleaned_text = re.sub(r'[^\w\s]', '', text[0] +
+                                  " " + text[1])  # Remove punctuation
+            # Remove extra newlines and leading/trailing whitespaces
+            cleaned_text = re.sub(r'\n+', '\n', cleaned_text).strip()
+    except Exception as e:
+        app.logger.error(f"top5_results: fetch/clean failed: {e}")
 
     final_res.append({'text': cleaned_text, 'source': top_2_search_res_link})
     app.logger.info(f"res:-->{final_res}")
 
     if len(final_res) == 0:
-        return search.results(query, 4)
+        try:
+            return search.results(query, 4)
+        except Exception as e:
+            app.logger.warning(f"top5_results: fallback search failed: {e}")
+            return []
 
     return final_res
 
