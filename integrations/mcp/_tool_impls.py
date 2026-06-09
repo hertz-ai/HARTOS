@@ -168,6 +168,28 @@ def agent_status() -> str:
     All probes flow through ``core.health_probe`` (single canonical
     source).  See that module's docstring for the root-cause notes
     on why we route through it instead of reading env vars directly.
+
+    ── T2 fix (2026-06-09): MCP module-shadow defence ────────────────
+    ``probe_agent_daemon()`` does ``from integrations.agent_engine
+    .agent_daemon import agent_daemon`` and reads ``_running`` /
+    ``_tick_count`` off the imported module.  When Python's import
+    resolution returns a different module instance than the one the
+    live Flask process started the daemon from (dual ``integrations/``
+    locations in the Nunba install root + python-embed — both
+    legitimate per ``feedback_hartos_bundle_srp.md``), the probe sees
+    a fresh-zero singleton even though the real daemon is alive and
+    ticking.  Today's session caught this: MCP reported
+    ``daemon_enabled=false, _tick_count=0`` while the canonical Flask
+    endpoint /api/agent-engine/ledger/stats showed 5265 historical
+    tasks with active progression.
+
+    Defence: also fetch the canonical ledger stats over Flask
+    loopback HTTP and merge them in.  Loopback bypasses Python import
+    ambiguity — the request hits whichever ``agent_daemon`` singleton
+    Flask's ``sys.path`` resolves to, which is by definition the one
+    that's actually doing the work.  Callers now see both views
+    (module-attr + ledger truth) and can detect the shadow themselves
+    by comparing.
     """
     from core.health_probe import (
         probe_agent_daemon, probe_llm, probe_nunba_flask,
@@ -175,6 +197,39 @@ def agent_status() -> str:
     status = probe_agent_daemon()
     status['nunba_server'] = probe_nunba_flask()
     status['llm_server'] = probe_llm()
+
+    # ── Canonical ledger probe via Flask loopback ────────────────────
+    # Shadow-immune source of truth.  If the HTTP probe fails (Flask
+    # down, port mismatch), we still return the module-attr view so
+    # the tool degrades gracefully — but mark the canonical view as
+    # unavailable so callers know not to trust the shadow.
+    try:
+        import requests as _r
+        from core.port_registry import get_port as _get_port
+        _port = _get_port('nunba') if 'nunba' in dir() else 5000
+        _resp = _r.get(
+            f"http://127.0.0.1:{_port}/api/agent-engine/ledger/stats",
+            timeout=3,
+        )
+        if _resp.status_code == 200:
+            _data = _resp.json()
+            _stats = _data.get('stats') or {}
+            status['ledger'] = {
+                'source': 'flask_loopback_canonical',
+                'total_tasks': _stats.get('total'),
+                'by_status': _stats.get('by_status'),
+                'sessions': _stats.get('sessions'),
+            }
+        else:
+            status['ledger'] = {
+                'source': 'flask_loopback_canonical',
+                'error': f'HTTP {_resp.status_code}',
+            }
+    except Exception as _le:
+        status['ledger'] = {
+            'source': 'flask_loopback_canonical',
+            'error': f'probe failed: {_le}',
+        }
 
     # Goal counts (DB query — kept inline; not a "probe" in the
     # health-check sense, this is a count-by-status aggregation).
@@ -199,6 +254,26 @@ def agent_status() -> str:
         status['expert_agents'] = len(reg.agents)
     except Exception:
         status['expert_agents'] = 'unknown'
+
+    # ── Shadow-detection hint ────────────────────────────────────────
+    # If the module-attr view says daemon is dead (tick_count=0) but
+    # the canonical ledger view shows recent task activity, flag the
+    # discrepancy so audits stop chasing the shadow.
+    try:
+        _ledger = status.get('ledger') or {}
+        _ledger_total = (
+            _ledger.get('total_tasks') if isinstance(_ledger, dict) else None
+        )
+        if (status.get('daemon_tick_count') == 0
+                and isinstance(_ledger_total, int)
+                and _ledger_total > 0):
+            status['shadow_module_suspected'] = (
+                "daemon_tick_count=0 but canonical ledger has "
+                f"{_ledger_total} tasks — module-attr probe is reading "
+                "a shadow singleton; trust the 'ledger' block instead."
+            )
+    except Exception:
+        pass
 
     return json.dumps(status, indent=2, default=str)
 

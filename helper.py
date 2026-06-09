@@ -1696,15 +1696,89 @@ class Action:
         self.ledger = ledger
         current_app.logger.info(f"Smart Ledger attached with {len(ledger.tasks)} tasks")
 
+# ── txt2img circuit breaker (T3 — 2026-06-09) ────────────────────────
+# Background: aws_rasa.hertzai.com:5459 is a cloud endpoint that may be
+# unreachable from local-only installs.  The previous implementation
+# called pooled_post() with no timeout, no exception handling, and no
+# rate limit — agent_system.log on the installed Nunba flooded with
+# urllib3 ConnectionError + 15s ReadTimeout tracebacks every time an
+# agent triggered txt2img while offline.  Wasted CPU + 50+ MB of log
+# noise per day + every blocked dispatch.
+#
+# Fix: classic in-memory circuit breaker.  After N consecutive failures
+# the breaker OPENS for ``_TXT2IMG_OPEN_SECONDS`` and every call inside
+# that window returns immediately without touching the network.  First
+# failure of each open-cycle logs as ERROR; subsequent suppressed calls
+# log once-per-minute as INFO.  Successful call closes the breaker.
+_TXT2IMG_BREAKER = {
+    'consecutive_failures': 0,
+    'open_until': 0.0,
+    'last_suppress_log_at': 0.0,
+}
+_TXT2IMG_OPEN_AFTER = 3            # fails before opening
+_TXT2IMG_OPEN_SECONDS = 300        # 5 min open window
+_TXT2IMG_REQUEST_TIMEOUT = 10      # per-request hard cap
+
+
 def txt2img(text: Annotated[str, "Text to create image"]) -> str:
+    import time as _t2i_time
+    now = _t2i_time.time()
+
+    # ── Breaker open?  Skip the network call. ─────────────────────────
+    if now < _TXT2IMG_BREAKER['open_until']:
+        # Rate-limit the suppression log to once per 60s to avoid
+        # replacing one flood with another, smaller flood.
+        if now - _TXT2IMG_BREAKER['last_suppress_log_at'] > 60:
+            _safe_log(
+                'info',
+                "txt2img: circuit breaker OPEN "
+                f"(re-tries at {int(_TXT2IMG_BREAKER['open_until'])}); "
+                "returning empty result.",
+            )
+            _TXT2IMG_BREAKER['last_suppress_log_at'] = now
+        return ''  # downstream code handles empty url gracefully
+
     current_app.logger.info('INSIDE txt2img')
     url = f"http://aws_rasa.hertzai.com:5459/txt2img?prompt={text}"
-
     payload = ""
     headers = {}
 
-    response = pooled_post(url, headers=headers, data=payload)
-    return response.json()['img_url']
+    try:
+        response = pooled_post(
+            url, headers=headers, data=payload,
+            timeout=_TXT2IMG_REQUEST_TIMEOUT,
+        )
+        result = response.json().get('img_url', '')
+    except Exception as exc:
+        _TXT2IMG_BREAKER['consecutive_failures'] += 1
+        n = _TXT2IMG_BREAKER['consecutive_failures']
+        # Log only the FIRST failure of a streak at ERROR; subsequent
+        # in-streak failures at DEBUG to avoid log flood.
+        if n == 1:
+            _safe_log('error', f"txt2img: request failed ({exc})")
+        else:
+            _safe_log('debug', f"txt2img: request failed (#{n}): {exc}")
+        # Open the breaker once the failure threshold is hit.
+        if n >= _TXT2IMG_OPEN_AFTER:
+            _TXT2IMG_BREAKER['open_until'] = now + _TXT2IMG_OPEN_SECONDS
+            _safe_log(
+                'warning',
+                f"txt2img: circuit breaker OPENED after {n} consecutive "
+                f"failures — suppressing for {_TXT2IMG_OPEN_SECONDS}s.",
+            )
+        return ''
+
+    # ── Success: close the breaker. ──────────────────────────────────
+    if _TXT2IMG_BREAKER['consecutive_failures'] > 0:
+        _safe_log(
+            'info',
+            f"txt2img: recovered after "
+            f"{_TXT2IMG_BREAKER['consecutive_failures']} failure(s); "
+            "circuit breaker CLOSED.",
+        )
+        _TXT2IMG_BREAKER['consecutive_failures'] = 0
+        _TXT2IMG_BREAKER['open_until'] = 0.0
+    return result
 
 
 def get_frame(user_id, frame_store=None):
