@@ -4203,8 +4203,18 @@ function renderAgentOverlay(ev) {{
         # ── Theme hot-reload ──
         @app.route('/api/theme', methods=['POST'])
         def update_theme():
-            # Called by ThemeService when theme changes
-            return jsonify({'status': 'updated'})
+            data = request.get_json(force=True, silent=True) or {}
+            theme_id = data.get('theme_id', '').strip()
+            if not theme_id:
+                return jsonify({'error': 'theme_id required'}), 400
+            try:
+                from integrations.agent_engine.theme_service import ThemeService
+                result = ThemeService.apply_theme(theme_id)
+                if 'error' in result:
+                    return jsonify(result), 404
+                return jsonify({'status': 'updated', 'theme': result.get('id')})
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
 
         # ── Agent ambient input (text from agent pill) ──
         @app.route('/api/agent/ask', methods=['POST'])
