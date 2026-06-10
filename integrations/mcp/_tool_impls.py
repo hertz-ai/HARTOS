@@ -205,16 +205,37 @@ def agent_status() -> str:
     # unavailable so callers know not to trust the shadow.
     try:
         import requests as _r
-        # Canonical "where is HARTOS serving" resolver — bundled→:5000,
-        # standalone→:6777, OS-mode→:500. The old `get_port('nunba') if
-        # 'nunba' in dir() else 5000` was dead code: 'nunba' is never a local
-        # var, so it hardcoded 5000 and broke on any non-bundled deployment.
+        # The MCP server is a SEPARATE non-frozen process, so
+        # get_local_backend_url() resolves to the caller's deployment mode
+        # (standalone :6777) — not the target app's (bundled :5000). Probe
+        # candidates and use the first that answers; live-witnessed: the
+        # single-URL version reported ledger error HTTP 404 while the
+        # bundled app served the stats fine on :5000.
         from core.port_registry import get_local_backend_url
-        _base = get_local_backend_url().rstrip('/')
-        _resp = _r.get(
-            f"{_base}/api/agent-engine/ledger/stats",
-            timeout=3,
-        )
+        _bases = []
+        try:
+            _bases.append(get_local_backend_url().rstrip('/'))
+        except Exception:
+            pass
+        for _fallback in ('http://127.0.0.1:5000', 'http://127.0.0.1:6777'):
+            if _fallback not in _bases:
+                _bases.append(_fallback)
+        _resp = None
+        for _base in _bases:
+            try:
+                _cand = _r.get(
+                    f"{_base}/api/agent-engine/ledger/stats",
+                    timeout=3,
+                )
+                if _cand.status_code == 200:
+                    _resp = _cand
+                    break
+                if _resp is None:
+                    _resp = _cand
+            except Exception:
+                continue
+        if _resp is None:
+            raise ConnectionError(f"no backend answered: {_bases}")
         if _resp.status_code == 200:
             _data = _resp.json()
             _stats = _data.get('stats') or {}

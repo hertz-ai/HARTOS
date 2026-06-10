@@ -33,6 +33,30 @@ _budget_blocked_goals: set = set()
 _dispatch_backoff: dict = {}
 
 
+def _flow_recipe_exists(prompt_id) -> bool:
+    """Durable proof a goal's work ran to completion: its flow-0 recipe file.
+
+    Recipes are written ONLY by after_all_actions_terminated() — the artifact
+    cannot exist unless the goal's flow genuinely finished, and the filename is
+    keyed by dispatch.prompt_id_for_goal's hash, so it cannot belong to a
+    different goal. Used by BOTH the CREATE/REUSE classifier and the
+    completion gate so the two can never disagree (previously the classifier
+    KNEW the recipe existed and dispatched REUSE forever, while the completion
+    gate demanded spark_spent > 0 — impossible on an all-local box where
+    llama work costs 0 Spark by design — so no goal could ever complete:
+    5 noops -> auto-pause was the only exit).
+    """
+    try:
+        from core.platform_paths import get_recipe_prompts_dir
+        _dir = get_recipe_prompts_dir()
+    except Exception:
+        _dir = 'prompts'
+    try:
+        return os.path.exists(os.path.join(_dir, f'{prompt_id}_0_recipe.json'))
+    except Exception:
+        return False
+
+
 def _get_blocked_hitl_tasks(ledger, goal_id):
     """Get tasks blocked with APPROVAL_REQUIRED under a goal."""
     try:
@@ -742,6 +766,34 @@ class AgentDaemon:
             # DETERMINISTIC STOP: no goals = no action = system is inert
             # Skip CODING_GOAL_TYPES — coding_daemon handles those with
             # idle-agent detection + benchmark sync for backend routing.
+            # RECONCILE: goals auto-paused for "0 spark" noops whose flow
+            # recipe EXISTS are victims of the old spark-only completion gate
+            # (impossible to satisfy on an all-local box). The recipe is
+            # durable proof their work completed — flip them to completed.
+            try:
+                from .dispatch import prompt_id_for_goal as _pid_of
+                _paused = db.query(AgentGoal).filter(
+                    AgentGoal.status == 'paused').all()
+                _reconciled = 0
+                for _pg in _paused:
+                    _pcfg = _pg.config_json or {}
+                    if '0 spark' not in str(_pcfg.get('pause_reason', '')):
+                        continue
+                    if _flow_recipe_exists(_pid_of(str(_pg.id))):
+                        _pg.status = 'completed'
+                        _pcfg['completed_at'] = datetime.utcnow().isoformat()
+                        _pcfg['completion_signal'] = 'flow_recipe_reconcile'
+                        _pcfg.pop('noop_dispatch_count', None)
+                        _pg.config_json = _pcfg
+                        _reconciled += 1
+                if _reconciled:
+                    db.commit()
+                    logger.info(
+                        f"Agent daemon: reconciled {_reconciled} noop-paused "
+                        f"goal(s) -> completed (flow recipe exists)")
+            except Exception as _rec_err:
+                logger.debug(f"noop-paused reconcile skipped: {_rec_err}")
+
             goals = db.query(AgentGoal).filter(
                 AgentGoal.status == 'active',
                 ~AgentGoal.goal_type.in_(CODING_GOAL_TYPES),
@@ -805,17 +857,13 @@ class AgentDaemon:
             # reuse-able goal into the CREATE queue.  Single-source
             # dispatch.prompt_id_for_goal hash, not a duplicate md5 (DRY).
             from .dispatch import prompt_id_for_goal
-            try:
-                from core.platform_paths import get_recipe_prompts_dir
-                _prompts_dir = get_recipe_prompts_dir()
-            except Exception:
-                _prompts_dir = 'prompts'
             _create_queue = []
             _reuse_pool = []
             for goal in goals:
-                _pid = prompt_id_for_goal(str(goal.id))
-                _recipe_path = os.path.join(_prompts_dir, f'{_pid}_0_recipe.json')
-                if os.path.exists(_recipe_path):
+                # Shared recipe-existence check (_flow_recipe_exists) — the
+                # SAME signal the completion gate uses, so classifier and
+                # gate can never drift apart.
+                if _flow_recipe_exists(prompt_id_for_goal(str(goal.id))):
                     _reuse_pool.append(goal)
                 else:
                     _create_queue.append(goal)
@@ -1059,18 +1107,32 @@ class AgentDaemon:
                     cfg = goal.config_json or {}
                     is_continuous = cfg.get('continuous', False)
                     spark_spent = goal.spark_spent or 0
+                    # Real-work evidence, either signal suffices:
+                    #   spark_spent > 0      — metered (cloud) cost incurred
+                    #   _flow_recipe_exists  — the flow recipe artifact was
+                    #     written by after_all_actions_terminated(), i.e. the
+                    #     goal's flow genuinely ran to completion. Required
+                    #     because local llama work costs 0 Spark BY DESIGN
+                    #     (budget_gate), so on an all-local box spark_spent
+                    #     never rises and the old spark-only gate made
+                    #     completion structurally impossible (every goal
+                    #     noop'd 5x then auto-paused; completed stuck at 13).
+                    _recipe_done = _flow_recipe_exists(prompt_id)
                     if is_continuous:
                         # Continuous goals never auto-complete; cooldown gate
                         # higher up already prevents re-dispatch storms.
                         pass
-                    elif spark_spent > 0:
+                    elif spark_spent > 0 or _recipe_done:
                         goal.status = 'completed'
                         cfg['completed_at'] = datetime.utcnow().isoformat()
+                        cfg['completion_signal'] = (
+                            'spark' if spark_spent > 0 else 'flow_recipe')
                         cfg.pop('noop_dispatch_count', None)
                         goal.config_json = cfg
                         logger.info(
                             f"Goal {goal_key} COMPLETED "
-                            f"(spark_spent={spark_spent})")
+                            f"(spark_spent={spark_spent}, "
+                            f"recipe={_recipe_done})")
                     else:
                         # Dispatched but zero real work — track and back off.
                         noop_count = int(cfg.get('noop_dispatch_count', 0)) + 1
