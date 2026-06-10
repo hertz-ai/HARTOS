@@ -34,17 +34,14 @@ _dispatch_backoff: dict = {}
 
 
 def _flow_recipe_exists(prompt_id) -> bool:
-    """Durable proof a goal's work ran to completion: its flow-0 recipe file.
+    """Does the goal's flow-0 recipe artifact exist on disk?
 
-    Recipes are written ONLY by after_all_actions_terminated() — the artifact
-    cannot exist unless the goal's flow genuinely finished, and the filename is
-    keyed by dispatch.prompt_id_for_goal's hash, so it cannot belong to a
-    different goal. Used by BOTH the CREATE/REUSE classifier and the
-    completion gate so the two can never disagree (previously the classifier
-    KNEW the recipe existed and dispatched REUSE forever, while the completion
-    gate demanded spark_spent > 0 — impossible on an all-local box where
-    llama work costs 0 Spark by design — so no goal could ever complete:
-    5 noops -> auto-pause was the only exit).
+    Recipes are written ONLY by after_all_actions_terminated() and the
+    filename is keyed by dispatch.prompt_id_for_goal's hash, so it cannot
+    belong to a different goal. Used by the CREATE/REUSE classifier to route
+    dispatches. NOTE: recipe existence proves a procedure RAN once — it is
+    NOT goal completion (steward decision 2026-06-10: completion is measured
+    in spark transacted; do not wire this into the completion gate).
     """
     try:
         from core.platform_paths import get_recipe_prompts_dir
@@ -766,34 +763,6 @@ class AgentDaemon:
             # DETERMINISTIC STOP: no goals = no action = system is inert
             # Skip CODING_GOAL_TYPES — coding_daemon handles those with
             # idle-agent detection + benchmark sync for backend routing.
-            # RECONCILE: goals auto-paused for "0 spark" noops whose flow
-            # recipe EXISTS are victims of the old spark-only completion gate
-            # (impossible to satisfy on an all-local box). The recipe is
-            # durable proof their work completed — flip them to completed.
-            try:
-                from .dispatch import prompt_id_for_goal as _pid_of
-                _paused = db.query(AgentGoal).filter(
-                    AgentGoal.status == 'paused').all()
-                _reconciled = 0
-                for _pg in _paused:
-                    _pcfg = _pg.config_json or {}
-                    if '0 spark' not in str(_pcfg.get('pause_reason', '')):
-                        continue
-                    if _flow_recipe_exists(_pid_of(str(_pg.id))):
-                        _pg.status = 'completed'
-                        _pcfg['completed_at'] = datetime.utcnow().isoformat()
-                        _pcfg['completion_signal'] = 'flow_recipe_reconcile'
-                        _pcfg.pop('noop_dispatch_count', None)
-                        _pg.config_json = _pcfg
-                        _reconciled += 1
-                if _reconciled:
-                    db.commit()
-                    logger.info(
-                        f"Agent daemon: reconciled {_reconciled} noop-paused "
-                        f"goal(s) -> completed (flow recipe exists)")
-            except Exception as _rec_err:
-                logger.debug(f"noop-paused reconcile skipped: {_rec_err}")
-
             goals = db.query(AgentGoal).filter(
                 AgentGoal.status == 'active',
                 ~AgentGoal.goal_type.in_(CODING_GOAL_TYPES),
@@ -1107,32 +1076,26 @@ class AgentDaemon:
                     cfg = goal.config_json or {}
                     is_continuous = cfg.get('continuous', False)
                     spark_spent = goal.spark_spent or 0
-                    # Real-work evidence, either signal suffices:
-                    #   spark_spent > 0      — metered (cloud) cost incurred
-                    #   _flow_recipe_exists  — the flow recipe artifact was
-                    #     written by after_all_actions_terminated(), i.e. the
-                    #     goal's flow genuinely ran to completion. Required
-                    #     because local llama work costs 0 Spark BY DESIGN
-                    #     (budget_gate), so on an all-local box spark_spent
-                    #     never rises and the old spark-only gate made
-                    #     completion structurally impossible (every goal
-                    #     noop'd 5x then auto-paused; completed stuck at 13).
-                    _recipe_done = _flow_recipe_exists(prompt_id)
+                    # Completion = SPARK: the goal's purpose is spark
+                    # transacted on real work (steward decision 2026-06-10 —
+                    # a flow-recipe artifact proves a procedure RAN once, not
+                    # that the goal's economic outcome happened, so recipe
+                    # existence must NOT complete a goal). On all-local boxes
+                    # spark_spent stays 0 today because estimate_llm_cost_
+                    # spark prices local work at 0 — the fix is metering
+                    # local work into spark, not weakening this gate.
                     if is_continuous:
                         # Continuous goals never auto-complete; cooldown gate
                         # higher up already prevents re-dispatch storms.
                         pass
-                    elif spark_spent > 0 or _recipe_done:
+                    elif spark_spent > 0:
                         goal.status = 'completed'
                         cfg['completed_at'] = datetime.utcnow().isoformat()
-                        cfg['completion_signal'] = (
-                            'spark' if spark_spent > 0 else 'flow_recipe')
                         cfg.pop('noop_dispatch_count', None)
                         goal.config_json = cfg
                         logger.info(
                             f"Goal {goal_key} COMPLETED "
-                            f"(spark_spent={spark_spent}, "
-                            f"recipe={_recipe_done})")
+                            f"(spark_spent={spark_spent})")
                     else:
                         # Dispatched but zero real work — track and back off.
                         noop_count = int(cfg.get('noop_dispatch_count', 0)) + 1

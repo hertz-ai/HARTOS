@@ -1,12 +1,10 @@
-"""Completion-gate evidence: _flow_recipe_exists (agent_daemon).
+"""_flow_recipe_exists (agent_daemon) — CREATE/REUSE classifier signal.
 
-The flywheel deadlock this guards against (live-witnessed 2026-06-10):
-local llama work costs 0 Spark BY DESIGN (budget_gate), so on an all-local
-box `goal.spark_spent` never rises — the old spark-only completion gate made
-goal completion structurally impossible (every goal noop'd 5x then
-auto-paused; `completed` stuck at 13 while 45 goals sat paused). The flow
-recipe artifact — written only by after_all_actions_terminated() — is the
-durable real-work signal that holds on a free-local box.
+Recipe existence routes dispatch (CREATE when absent, REUSE when present).
+It is deliberately NOT a completion signal: a recipe proves a procedure ran
+once, not that the goal's economic outcome happened — completion is measured
+in spark transacted (steward decision 2026-06-10). The completion gate stays
+spark-based; the local-work metering gap is tracked separately.
 
 Behavioural: imports the real helper, points the canonical prompts-dir
 resolver at a tmp dir, asserts observable decisions.
@@ -15,7 +13,7 @@ import os
 import sys
 from unittest.mock import patch
 
-import pytest
+import pytest  # noqa: F401  (parametrize-ready; keeps harness conventions)
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if _ROOT not in sys.path:
@@ -50,27 +48,3 @@ class TestFlowRecipeExists:
                    side_effect=RuntimeError("boom")):
             # falls back to 'prompts' relative dir; nonexistent id -> False
             assert _flow_recipe_exists("no_such_goal_id_xyz") is False
-
-
-class TestGateDecision:
-    """The gate's decision table, exercised through the same helper the
-    daemon uses: complete iff spark>0 OR recipe exists (non-continuous)."""
-
-    @pytest.mark.parametrize(
-        "spark,recipe_on_disk,should_complete",
-        [
-            (0, False, False),   # nothing happened -> noop path
-            (0, True, True),     # free local work, recipe proof -> complete
-            (5, False, True),    # metered cloud work -> complete
-            (5, True, True),     # both signals -> complete
-        ],
-    )
-    def test_decision(self, tmp_path, spark, recipe_on_disk, should_complete):
-        pid = 7
-        if recipe_on_disk:
-            (tmp_path / f"{pid}_0_recipe.json").write_text("[]",
-                                                           encoding="utf-8")
-        with patch("core.platform_paths.get_recipe_prompts_dir",
-                   return_value=str(tmp_path)):
-            decision = spark > 0 or _flow_recipe_exists(pid)
-        assert decision is should_complete
