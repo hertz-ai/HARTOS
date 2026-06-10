@@ -177,6 +177,63 @@ def check_goal_budget(goal_id: Optional[str],
         return True, -1, 'budget_system_unavailable'
 
 
+def charge_goal_work_completed(prompt_id, actions_completed: int = 1) -> bool:
+    """Meter COMPLETED work into the goal's spark ledger.
+
+    Steward decision 2026-06-10 (option (a), with EARNED-spark attribution to
+    layer on later): local compute stays free at DISPATCH (estimate_llm_cost_
+    spark prices local work at 0 so the budget gate never blocks free local
+    dispatches), but once a flow has ACTUALLY run to completion the work is
+    charged here — so ``goal.spark_spent`` rises only on work genuinely done,
+    and the daemon's spark-only completion gate closes goals on real
+    transacted spark. Charging at dispatch instead would re-create the
+    completed-on-dispatch dashboard lie (reserve happens before work runs).
+
+    Charge = max(1, actions_completed), clamped to remaining budget. A
+    budget-starved goal records nothing -> stays incomplete -> the existing
+    noop-pause surfaces it (topping up spark_budget is the steward lever).
+    Resolves the goal by its stamped prompt_id (agent_daemon stamps
+    dispatch.prompt_id_for_goal at dispatch). Never raises — called from the
+    recipe pipeline, which must not break on accounting failures.
+    """
+    if prompt_id is None:
+        return False
+    try:
+        from integrations.social.models import get_db, AgentGoal
+        amount = max(1, int(actions_completed or 1))
+        db = get_db()
+        try:
+            goal = (db.query(AgentGoal)
+                    .filter(AgentGoal.prompt_id == str(prompt_id),
+                            AgentGoal.status == 'active')
+                    .with_for_update()
+                    .first())
+            if not goal:
+                return False
+            budget = goal.spark_budget or 0
+            spent = goal.spark_spent or 0
+            charge = min(amount, max(0, budget - spent))
+            if charge <= 0:
+                logger.info(
+                    f"Completed-work charge skipped for goal {goal.id}: "
+                    f"budget exhausted ({spent}/{budget}) — top up "
+                    f"spark_budget to let this goal complete")
+                db.rollback()
+                return False
+            goal.spark_spent = spent + charge
+            db.commit()
+            invalidate_goal_budget_cache(str(goal.id))
+            logger.info(
+                f"Spark charged on COMPLETED work: goal={goal.id} +{charge} "
+                f"(actions={actions_completed}, spent={spent + charge}/{budget})")
+            return True
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug(f"completed-work spark charge unavailable: {e}")
+        return False
+
+
 def invalidate_goal_budget_cache(goal_id: Optional[str] = None) -> None:
     """Clear the budget-check TTL cache.
 

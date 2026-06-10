@@ -3177,7 +3177,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                             current_app.logger.warning(
                                 f"[HALLUCINATION?] LLM claims action_id={_llm_action_id} "
                                 f"but pipeline assigned {_reuse_current_action}")
-                        _next, _ok = _advance_reuse_action(user_prompt, _reuse_current_action, "reuse-w1")
+                        _next, _ok = _advance_reuse_action(user_prompt, _reuse_current_action, "reuse-w1", prompt_id)
                         if not _ok:
                             return ''
                         user_message = _build_reuse_action_message(user_prompt, _next)
@@ -3199,7 +3199,7 @@ def get_agent_response(assistant: autogen.AssistantAgent, chat_instructor: autog
                                     current_app.logger.warning(
                                         f"[HALLUCINATION?] LLM claims action_id={_llm_claimed} "
                                         f"but pipeline has {_known}")
-                                _next2, _ok2 = _advance_reuse_action(user_prompt, _known, "reuse-w1-regex")
+                                _next2, _ok2 = _advance_reuse_action(user_prompt, _known, "reuse-w1-regex", prompt_id)
                                 if not _ok2:
                                     return ''
                                 user_message = _build_reuse_action_message(user_prompt, _next2)
@@ -3421,7 +3421,7 @@ creation_signals = TTLCache(ttl_seconds=7200, max_size=500, name='reuse_creation
 # REUSE ACTION ADVANCEMENT HELPER
 # =============================================================================
 
-def _advance_reuse_action(user_prompt, current_action_id, reason="reuse"):
+def _advance_reuse_action(user_prompt, current_action_id, reason="reuse", prompt_id=None):
     """
     Mark action COMPLETED → TERMINATED, advance to next action, set ASSIGNED → IN_PROGRESS.
     Returns (next_action_id, True) if advanced, or (None, False) if all actions done or state error.
@@ -3449,6 +3449,18 @@ def _advance_reuse_action(user_prompt, current_action_id, reason="reuse"):
 
     if next_id > len(user_tasks[user_prompt].actions):
         current_app.logger.info(f'[REUSE] All {len(user_tasks[user_prompt].actions)} actions completed')
+        # Meter the COMPLETED replay into the owning goal's spark ledger —
+        # the daemon's completion gate closes goals on transacted spark only
+        # (charged on finished work, never at dispatch). Mirrors the CREATE
+        # charge in create_recipe._save_flow_recipe.
+        if prompt_id is not None:
+            try:
+                from integrations.agent_engine.budget_gate import charge_goal_work_completed
+                charge_goal_work_completed(
+                    prompt_id, len(user_tasks[user_prompt].actions) or 1)
+            except Exception as _spark_err:
+                current_app.logger.debug(
+                    f'[REUSE] completed-work spark charge skipped: {_spark_err}')
         return None, False
 
     safe_set_state(user_prompt, next_id, ActionState.ASSIGNED, f"{reason}: next assigned")
@@ -3739,7 +3751,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                     current_app.logger.warning(
                                         f"[HALLUCINATION?] LLM claims action_id={_llm_aid} "
                                         f"but pipeline has {_w2_current}")
-                                _w2_next, _w2_ok = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2")
+                                _w2_next, _w2_ok = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2", prompt_id)
                                 if not _w2_ok:
                                     return ''
                                 user_message = _build_reuse_action_message(user_prompt, _w2_next)
@@ -3757,7 +3769,7 @@ def chat_agent(user_id, text, prompt_id, file_id, request_id):
                                             current_app.logger.warning(
                                                 f"[HALLUCINATION?] LLM claims action_id={_llm_aid2} "
                                                 f"but pipeline has {_w2_current}")
-                                        _w2_next2, _w2_ok2 = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2-regex")
+                                        _w2_next2, _w2_ok2 = _advance_reuse_action(user_prompt, _w2_current, "reuse-w2-regex", prompt_id)
                                         if not _w2_ok2:
                                             return ''
                                         user_message = _build_reuse_action_message(user_prompt, _w2_next2)

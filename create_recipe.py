@@ -5095,6 +5095,16 @@ def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
     create_final_recipe_for_current_flow(flow, _flow_recipe_data, prompt_id)
     current_app.logger.info(f'[FLOW-RECIPE-SAVED] {prompt_id}_{flow}_recipe.json')
     _push_thinking(user_id, f'Flow {flow} recipe saved.')
+    # Meter the COMPLETED work into the owning goal's spark ledger — this is
+    # the signal the daemon's completion gate closes goals on. Charged here
+    # (flow genuinely finished) and never at dispatch; see
+    # budget_gate.charge_goal_work_completed.
+    try:
+        from integrations.agent_engine.budget_gate import charge_goal_work_completed
+        charge_goal_work_completed(
+            prompt_id, len(_flow_recipe_data.get('actions') or []) or 1)
+    except Exception as _spark_err:
+        current_app.logger.debug(f'completed-work spark charge skipped: {_spark_err}')
 
 
 def set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt):
