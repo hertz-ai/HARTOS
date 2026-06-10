@@ -9804,25 +9804,44 @@ def _create_social_agent_from_prompt(user_id, prompt_id):
 # Local-first Prompt CRUD (syncs to cloud DB)
 # ═══════════════════════════════════════════════════════════════
 
+# Media/presentation fields a colliding LOCAL record adopts from its cloud
+# twin when it lacks them. Human-created agents share the SAME prompt_id in
+# both stores (central-DB integer id; agent-sync writes {pid}.json under that
+# id), so the local-first dedup used to DISCARD the cloud record wholesale —
+# and with it the idle/intro filler videos that only exist cloud-side. Idle
+# videos died agent-by-agent as agents localized ("idle videos not loading",
+# 2026-06-10). Local stays authoritative for recipe/state fields.
+_CLOUD_MEDIA_FIELDS = ('fillers', 'image_url', 'teacher_image_url',
+                       'video_text')
+
+
 def _merge_prompts_with_cloud(local_prompts: list, cloud_url: str) -> list:
     """Append cloud prompts to ``local_prompts``, dedup by prompt_id.
 
     Local-first: when the same prompt_id exists in both, the local copy
     is kept (it carries the newer recipe payload + filesystem-side
-    metadata).  Cloud failures are swallowed so a flaky DB never
-    breaks the local-only listing — same best-effort contract both
-    /prompts and /prompts/public have always offered.
+    metadata) — but it ADOPTS the cloud twin's media fields
+    (``_CLOUD_MEDIA_FIELDS``) when it lacks them, so cloud-hosted idle
+    filler videos survive localization.  Cloud failures are swallowed so
+    a flaky DB never breaks the local-only listing — same best-effort
+    contract both /prompts and /prompts/public have always offered.
 
     Single source of truth for the merge so /prompts (user-scoped) and
     /prompts/public (catalogue) cannot drift in dedup logic, error
     handling, or the 'cloud'/'has_recipe' field defaults.
     """
-    local_ids = {str(p.get('prompt_id', '')) for p in local_prompts}
+    by_id = {str(p.get('prompt_id', '')): p for p in local_prompts}
     try:
         res = pooled_get(cloud_url, timeout=5)
         if res.status_code == 200:
             for item in (res.json() or []):
-                if str(item.get('prompt_id', '')) in local_ids:
+                _pid = str(item.get('prompt_id', ''))
+                local_twin = by_id.get(_pid)
+                if local_twin is not None:
+                    # Graft cloud media onto the winning local record.
+                    for _f in _CLOUD_MEDIA_FIELDS:
+                        if not local_twin.get(_f) and item.get(_f):
+                            local_twin[_f] = item[_f]
                     continue
                 item['source'] = 'cloud'
                 item.setdefault('has_recipe', False)
