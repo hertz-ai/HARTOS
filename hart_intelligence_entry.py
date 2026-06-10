@@ -9864,6 +9864,16 @@ def get_prompts():
                                 os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
                             'flow_count': len(data.get('flows', [])),
                             'source': 'local',
+                            # Media passthrough — /prompts/public already
+                            # exposes image_url; the user-scoped list dropped
+                            # it, so /local agents rendered an empty video
+                            # column (no idle fallback portrait). fillers is
+                            # future-proofing: local agents have none today
+                            # (cloud-agent feature), but if cloud-sync ever
+                            # writes them locally, idle videos light up with
+                            # no further code change.
+                            'image_url': data.get('image_url', ''),
+                            'fillers': data.get('fillers') or [],
                         })
                 except Exception:
                     continue
