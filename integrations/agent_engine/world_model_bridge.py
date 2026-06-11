@@ -120,26 +120,33 @@ class WorldModelBridge:
             # so HARTOS-only peers also learn).  The set_inbound_skill_hook
             # path only fires when HiveMind is in THIS process; in the bundled
             # subprocess topology HiveMind lives in the spawned HevolveAI
-            # process.  Rather than depend on the (closed-source) HevolveAI
-            # side to notify us, we subscribe to the SHARED `hivemind.skill.
-            # share` MessageBus topic DIRECTLY — the same topic Direction A
-            # publishes to — and fan out on receipt.  Entirely HARTOS-side, so
-            # it works in the co-located bundle without any HevolveAI change.
-            # No self-echo: Direction A's publish is gated on `self._in_process`
-            # (line ~1384), so an out-of-process bridge never publishes here.
+            # process.
+            #
+            # Two complementary inbound channels:
+            #  1. MessageBus subscription (below): fires only if something in
+            #     THIS process republishes the topic onto the local bus.
+            #     NOTE: Direction A publishes to WAMP via the IN-process
+            #     HiveMind, NOT the local bus, so out-of-process this
+            #     subscription alone is a receiver without a publisher.
+            #  2. HTTP poller (#118-B9, the working cross-process relay):
+            #     the HevolveAI subprocess records inbound-skill METADATA in
+            #     HiveMind._inbound_skill_events; we poll
+            #     GET /v1/hivemind/inbound-events with a since_ts cursor and
+            #     fan each event into the same _on_inbound_wamp_skill path.
             try:
                 from core.peer_link.message_bus import get_message_bus
                 get_message_bus().subscribe(
                     'hivemind.skill.share', self._on_cross_process_skill)
                 logger.info(
-                    "[WorldModelBridge] Direction B ACTIVE (out-of-process): "
-                    "subscribed to hivemind.skill.share over the MessageBus — "
-                    "inbound skills fan out to HARTOS gossip, no HevolveAI "
-                    "dependency.")
+                    "[WorldModelBridge] Direction B: subscribed to "
+                    "hivemind.skill.share over the MessageBus (in-process "
+                    "republishers only)")
             except Exception as e:
                 logger.warning(
-                    "[WorldModelBridge] Direction B inactive — could not "
-                    "subscribe to hivemind.skill.share over the bus: %s", e)
+                    "[WorldModelBridge] Direction B bus subscription "
+                    "failed: %s", e)
+            if not self._http_disabled:
+                self._start_inbound_skill_poller()
 
         # Periodic HevolveAI integrity watcher (Gap 1 fix)
         self._crawl_watcher = None
@@ -402,6 +409,84 @@ class WorldModelBridge:
                     f"[WorldModelBridge] in-process probe failed: {e}")
         logger.info(
             f"[WorldModelBridge] HTTP mode: {self._api_url}")
+
+    def _start_inbound_skill_poller(self, interval_s: float = 10.0) -> None:
+        """#118-B9: start the cross-process Direction-B relay poller.
+
+        In the bundled subprocess topology the HevolveAI HiveMind cannot
+        call back into this process (the in-process hook does not cross
+        the boundary, and nothing republishes WAMP topics onto the local
+        MessageBus). The subprocess instead records inbound-skill METADATA
+        which this poller drains over HTTP and fans out through the same
+        _on_inbound_wamp_skill path the in-process hook uses -- one
+        fan-out implementation for both topologies.
+        """
+        if getattr(self, '_inbound_poller_thread', None) is not None:
+            return
+
+        self._inbound_poll_cursor = time.time()  # only relay events from now on
+
+        def _poll_loop():
+            while True:
+                try:
+                    time.sleep(interval_s)
+                    if self._http_disabled:
+                        continue
+                    self._poll_inbound_skill_events()
+                except Exception as e:
+                    logger.debug(
+                        "[WorldModelBridge] inbound-skill poll error: %s", e)
+
+        t = threading.Thread(
+            target=_poll_loop, daemon=True,
+            name="wmb-inbound-skill-poller")
+        t.start()
+        self._inbound_poller_thread = t
+        logger.info(
+            "[WorldModelBridge] Direction B ACTIVE (out-of-process): "
+            "polling %s/v1/hivemind/inbound-events every %.0fs",
+            self._api_url, interval_s)
+
+    def _poll_inbound_skill_events(self) -> int:
+        """Drain new inbound-skill events from the HevolveAI subprocess and
+        fan them out to HARTOS gossip. Returns the number of events relayed.
+        """
+        resp = pooled_get(
+            f"{self._api_url}/v1/hivemind/inbound-events",
+            params={'since_ts': self._inbound_poll_cursor},
+            timeout=5)
+        if resp.status_code != 200:
+            return 0
+        body = resp.json()
+        events = body.get('events') or []
+        # Advance the cursor to the server's clock (the events carry server
+        # timestamps; using our own clock would skip or repeat on skew).
+        self._inbound_poll_cursor = float(body.get('now', self._inbound_poll_cursor))
+        relayed = 0
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            # Rebuild the packet shape _on_inbound_wamp_skill expects.
+            # Metadata only: gossip fan-out needs task_id/description/
+            # complexity, never the tensor payload.
+            packet = {
+                'event': ev.get('event'),
+                'task_id': ev.get('task_id'),
+                'packet_wire': {
+                    'task_id': ev.get('task_id'),
+                    'description': ev.get('description', ''),
+                    'complexity': ev.get('complexity', 'unknown'),
+                },
+                'origin_node': ev.get('origin_node'),
+            }
+            self._on_inbound_wamp_skill(
+                packet, source=str(ev.get('source') or 'subprocess'))
+            relayed += 1
+        if relayed:
+            logger.info(
+                "[WorldModelBridge] B: relayed %d inbound skill event(s) "
+                "from subprocess to gossip", relayed)
+        return relayed
 
     def _on_cross_process_skill(self, topic: str, data: Dict) -> None:
         """#66: MessageBus handler for `hivemind.skill.share` when HiveMind is
