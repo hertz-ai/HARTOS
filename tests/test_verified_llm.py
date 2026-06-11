@@ -49,6 +49,36 @@ class VerifyLLMSuccessTests(unittest.TestCase):
         with patch("urllib.request.urlopen", return_value=_fake_resp(200, legacy)):
             self.assertTrue(verify_llm()["ok"])
 
+    def test_reasoning_model_empty_content_but_reasoning(self):
+        """Reasoning models (Qwen3.5 thinking-mode, the shipped default) burn
+        the whole max_tokens budget on reasoning_content with finish_reason=
+        'length', leaving content=''.  A non-empty reasoning stream is still
+        proof the model is loaded and generating, so the probe MUST verify it.
+
+        Regression guard for the live P0 (2026-06-10): a healthy reasoning
+        model was reported available:false, which latched the React chat
+        send-gate engineReady=false and stranded every message in the queue.
+        """
+        reasoning_body = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "Let me think about this",
+                    },
+                    "finish_reason": "length",
+                }
+            ]
+        }
+        with patch("urllib.request.urlopen", return_value=_fake_resp(200, reasoning_body)):
+            out = verify_llm()
+            self.assertTrue(out["ok"])
+            self.assertEqual(out["reason"], "verified")
+            self.assertIn("think", out["content_snippet"])
+        with patch("urllib.request.urlopen", return_value=_fake_resp(200, reasoning_body)):
+            self.assertTrue(is_llm_inference_verified())
+
 
 class VerifyLLMFailureTests(unittest.TestCase):
     def test_empty_content_flagged(self):
