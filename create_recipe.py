@@ -4233,7 +4233,16 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                     flow = get_current_flow(user_prompt)
                                     _recipe_file = helper_fun.safe_prompt_path(prompt_id, flow, json_action_id)
                                     if not os.path.exists(_recipe_file):
-                                        # Recipe not yet saved — request it directly
+                                        # Bank from the execution trace FIRST — the tool calls
+                                        # that already ran ARE the recipe; re-asking the 4B is
+                                        # a fallible LLM round-trip that left flows unbanked
+                                        # for weeks (memory: flywheel_action_banking_gap_
+                                        # 2026-06-11, goal 60834540771).
+                                        _bank_action_recipe_from_trace(
+                                            user_prompt, prompt_id, flow, json_action_id,
+                                            group_chat)
+                                    if not os.path.exists(_recipe_file):
+                                        # Trace banking failed — request it from the model
                                         current_app.logger.info(
                                             f"[RECIPE-NEEDED] {_claimed_task_id} completed but recipe not saved, requesting")
                                         user_tasks[user_prompt].recipe = True
@@ -5065,6 +5074,96 @@ def fix_cyclic_dependency(cyc, individual_recipe):
             if i['action_id'] == j['action_id']:
                 j['actions_this_action_depends_on'] = i['actions_this_action_depends_on']
                 break
+
+
+def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
+                                   group_chat):
+    """Persist {pid}_{flow}_{action}.json derived from the tool calls that
+    ACTUALLY executed for this action in the live group chat.
+
+    The 4B frequently completes an action (state_transition / #128 recovery
+    edges) without emitting a parseable recipe payload; the old path then
+    re-asked the model for the recipe — another fallible LLM round-trip.
+    Result: flows walked deep but banked nothing (goal 60834540771: ONE
+    action recipe in 3 weeks), so every restart re-walked from Action 1 and
+    no flow ever reached the completion charge.
+
+    Trace-derived banking records what really ran — only the executed tool
+    calls, never fabricated steps. An action with NO tool work banks an
+    explicit no-op marker (the 2026-06-04 "synthesis poisons validator"
+    guard). Must only be called IN-RUN: the trace lives in this dispatch's
+    group_chat and is gone after a restart. Returns True if banked.
+    """
+    try:
+        msgs = list(getattr(group_chat, 'messages', []) or [])
+        # The action's window: everything after the LAST "Execute Action N"
+        # message (re-dispatches of the same action overwrite the window).
+        start = 0
+        for i, m in enumerate(msgs):
+            c = m.get('content') if isinstance(m, dict) else None
+            if isinstance(c, str) and f'Execute Action {action_id}' in c:
+                start = i
+        steps = []
+        for m in msgs[start:]:
+            if not isinstance(m, dict):
+                continue
+            for tc in (m.get('tool_calls') or []):
+                fn = (tc.get('function') or {}) if isinstance(tc, dict) else {}
+                nm = fn.get('name', '')
+                if not nm:
+                    continue
+                steps.append({
+                    'steps': f"{nm}({str(fn.get('arguments') or '')[:400]})",
+                    'tool_name': nm,
+                    'generalized_functions': '',
+                    'agent_to_perform_this_action': 'Helper',
+                })
+        action_obj = {}
+        try:
+            action_obj = user_tasks[user_prompt].get_action(action_id - 1) or {}
+        except Exception:
+            pass
+        if not steps:
+            steps = [{
+                'steps': 'no-op: action completed without tool execution',
+                'tool_name': '',
+                'generalized_functions': '',
+                'agent_to_perform_this_action': 'Assistant',
+            }]
+        json_obj = {
+            'status': 'done',
+            'action': action_obj.get('action', ''),
+            'fallback_action': action_obj.get('fallback_action', ''),
+            'persona': 'Executor',
+            'action_id': int(action_id),
+            'recipe': steps,
+            'can_perform_without_user_input': 'yes',
+            'scheduled_tasks': [],
+            'metadata': {},
+            'recipe_source': 'execution_trace',
+        }
+        # Same secret-redaction guard as the model-recipe save path.
+        try:
+            from security.secret_redactor import redact_secrets
+            for _ri in json_obj['recipe']:
+                if isinstance(_ri.get('steps'), str):
+                    _ri['steps'], _ = redact_secrets(_ri['steps'])
+        except ImportError:
+            pass
+        name = helper_fun.safe_prompt_path(prompt_id, flow, action_id)
+        with open(name, 'w') as f:
+            json.dump(json_obj, f)
+        current_app.logger.info(
+            f"[TRACE-BANKED] action {action_id} recipe derived from "
+            f"{len(steps)} executed step(s) -> {name}")
+        return True
+    except Exception as e:
+        try:
+            current_app.logger.warning(
+                f"[TRACE-BANK] failed for action {action_id}: {e}")
+        except Exception:
+            pass
+        return False
 
 
 def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
