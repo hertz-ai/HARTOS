@@ -629,33 +629,85 @@ def topological_sort(actions):
 
     return True, sorted_actions, None
 
-def fix_actions(array_of_actions,cyclic_ids):
-    url = "http://aws_rasa.hertzai.com:5459/gpt3"
-    text = f"""From the Below json array of action we are getting cyclic dependency. the action_ids which are creating the cyclic dependecy are {cyclic_ids}.
-            You can Refer the below array of actions \n{array_of_actions}\n and return the corrected action dependency without cyclic dependency.
-            complete json array without cyclic dependency, RESPONSE FORMAT: e.g. [{{"action_id":"An integer action_id","actions_this_action_depends_on":[]}}]
-            IMPORTANT INSTRUCTIONS: Do not add any unnecessary hallucinated dependencies in actions
-            Output array:"""
-    payload = json.dumps({
-    "text": text,
-    "model": "3",
-    "temperature": 0,
-    "max_tokens": 3000,
-    "top_p": 1,
-    "frequency_penalty": 0
-    })
-    headers = {
-    'Content-Type': 'application/json'
-    }
+# ── Canonical local-LLM completion helper (2026-06-09) ──────────────
+# Every LLM-shaped call in this module previously POSTed to
+# http://aws_rasa.hertzai.com:5459/gpt3 — a cloud proxy.  That violated
+# the on-device promise (chat shows "🔒 On-device" badge), wasted
+# every-request 15s on the dead endpoint when offline, and routed
+# user data through a third party for tasks the local model already
+# handles.  Fix: single canonical helper that hits the llama-server
+# OpenAI-compat endpoint on loopback.  Every previous /gpt3 caller
+# now goes through this.
+#
+# If the local llama-server is itself down, return None gracefully
+# (callers already handle None — they fall back to no-op / unmodified
+# input).  No silent cloud fallback: on-device means on-device.
+def _local_llm_port():
+    """Resolve the local llama-server port. Defaults to 8080."""
     try:
-        response = pooled_post(url, headers=headers, data=payload)
-        response = response.json()
-        print(response)
-        x = ast.literal_eval(response['text'])
-        print(f'got json object')
-        return x
+        from core.port_registry import get_port as _gp
+        return _gp('llm')
+    except Exception:
+        import os as _os
+        return int(_os.environ.get('HEVOLVE_LLM_PORT', '8080'))
+
+
+def _local_llm_complete(prompt, max_tokens=3000, temperature=0):
+    """Local-only chat completion via llama-server (OpenAI-compat).
+
+    Returns the completion text (string) on success, None on failure.
+    Callers must handle None — never falls back to a cloud endpoint.
+    """
+    _port = _local_llm_port()
+    url = f"http://127.0.0.1:{_port}/v1/chat/completions"
+    payload = json.dumps({
+        "model": "local",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    })
+    headers = {'Content-Type': 'application/json'}
+    try:
+        response = pooled_post(url, headers=headers, data=payload, timeout=30)
+        body = response.json()
+        choices = body.get('choices') or []
+        if not choices:
+            _safe_log('warning',
+                      f"_local_llm_complete: no choices in response ({body})")
+            return None
+        msg = choices[0].get('message') or {}
+        return msg.get('content') or ''
+    except Exception as exc:
+        _safe_log('warning', f"_local_llm_complete: request failed: {exc}")
+        return None
+
+
+def fix_actions(array_of_actions, cyclic_ids):
+    """Resolve cyclic action dependencies via local LLM.
+
+    Was previously a cloud /gpt3 POST; rerouted 2026-06-09 to the
+    local llama-server (on-device promise).  Returns None if local
+    LLM is unavailable — caller already handles None as "skip fix."
+    """
+    prompt = (
+        f"From the Below json array of action we are getting cyclic dependency. "
+        f"the action_ids which are creating the cyclic dependecy are {cyclic_ids}.\n"
+        f"You can Refer the below array of actions \n{array_of_actions}\n "
+        f"and return the corrected action dependency without cyclic dependency.\n"
+        f"complete json array without cyclic dependency, "
+        f"RESPONSE FORMAT: e.g. "
+        f'[{{"action_id":"An integer action_id",'
+        f'"actions_this_action_depends_on":[]}}]\n'
+        f"IMPORTANT INSTRUCTIONS: Do not add any unnecessary hallucinated dependencies in actions\n"
+        f"Output array:"
+    )
+    text = _local_llm_complete(prompt, max_tokens=3000, temperature=0)
+    if text is None:
+        return None
+    try:
+        return ast.literal_eval(text)
     except Exception as e:
-        print(f'GOT ERROR WHILE JSON FIX:{e}')
+        _safe_log('warning', f"fix_actions: literal_eval failed ({e})")
         return None
 
 
@@ -693,45 +745,38 @@ def strip_json_values(obj: Any) -> Any:
 
 
 def fix_json(json_text):
-    url = "http://aws_rasa.hertzai.com:5459/gpt3"
-    text = """You are an expert JSON fixer. Your task is to correct a given JSON string, ensuring it is compatible with Python’s `eval()`.
+    """Repair malformed JSON via local LLM.
 
-    ### Instructions:
-    1. **Fix Formatting Issues:**
-    - Convert single quotes (`'`) to double quotes (`"`) where necessary (except inside stringified JSON).
-    - Ensure correct placement of commas, brackets, and braces.
-    - Fix missing or extra quotes.
-    - Properly escape special characters like newlines (`\n`).
-
-    2. **Convert JSON to Python-Compatible Format:**
-    - Ensure `true`, `false`, and `null` are replaced with `True`, `False`, and `None`.
-    - If the JSON contains a string representation of a dictionary inside a field (e.g., `'{"key": "value"}'`), ensure it remains correctly formatted.
-
-    3. **Preserve Key-Value Data:**
-    - Do not change any key names or values, only correct formatting.
-
-    4. **Output Only the Fixed JSON:**
-    - Provide only the corrected JSON without explanations or extra text.
-
-    ### Input JSON: """+f"{json_text}"+"""
-    Output Json:
+    Was previously a cloud /gpt3 POST; rerouted 2026-06-09 to the
+    local llama-server (on-device promise).  Returns None if local
+    LLM is unavailable — caller already handles None as "skip fix."
     """
-    payload = json.dumps({
-    "text": text,
-    "model": "3",
-    "temperature": 0,
-    "max_tokens": 3000,
-    "top_p": 1,
-    "frequency_penalty": 0
-    })
-    headers = {
-    'Content-Type': 'application/json'
-    }
+    prompt = (
+        "You are an expert JSON fixer. Your task is to correct a given "
+        "JSON string, ensuring it is compatible with Python's `eval()`.\n\n"
+        "    ### Instructions:\n"
+        "    1. **Fix Formatting Issues:**\n"
+        "    - Convert single quotes (`'`) to double quotes (`\"`) where necessary (except inside stringified JSON).\n"
+        "    - Ensure correct placement of commas, brackets, and braces.\n"
+        "    - Fix missing or extra quotes.\n"
+        "    - Properly escape special characters like newlines (`\\n`).\n\n"
+        "    2. **Convert JSON to Python-Compatible Format:**\n"
+        "    - Ensure `true`, `false`, and `null` are replaced with `True`, `False`, and `None`.\n"
+        "    - If the JSON contains a string representation of a dictionary inside a field "
+        "(e.g., `'{\"key\": \"value\"}'`), ensure it remains correctly formatted.\n\n"
+        "    3. **Preserve Key-Value Data:**\n"
+        "    - Do not change any key names or values, only correct formatting.\n\n"
+        "    4. **Output Only the Fixed JSON:**\n"
+        "    - Provide only the corrected JSON without explanations or extra text.\n\n"
+        f"    ### Input JSON: {json_text}\n"
+        "    Output Json:\n"
+    )
+    text = _local_llm_complete(prompt, max_tokens=3000, temperature=0)
+    if text is None:
+        return None
     try:
-        response = pooled_post(url, headers=headers, data=payload)
-        response = response.json()
-        x = ast.literal_eval(response['text'])
-        _safe_log('info', f'got json object')
+        x = ast.literal_eval(text)
+        _safe_log('info', 'got json object')
         return x
     except Exception as e:
         _safe_log('info', f'GOT ERROR WHILE JSON FIX:{e}')
@@ -1696,15 +1741,89 @@ class Action:
         self.ledger = ledger
         current_app.logger.info(f"Smart Ledger attached with {len(ledger.tasks)} tasks")
 
+# ── txt2img circuit breaker (T3 — 2026-06-09) ────────────────────────
+# Background: aws_rasa.hertzai.com:5459 is a cloud endpoint that may be
+# unreachable from local-only installs.  The previous implementation
+# called pooled_post() with no timeout, no exception handling, and no
+# rate limit — agent_system.log on the installed Nunba flooded with
+# urllib3 ConnectionError + 15s ReadTimeout tracebacks every time an
+# agent triggered txt2img while offline.  Wasted CPU + 50+ MB of log
+# noise per day + every blocked dispatch.
+#
+# Fix: classic in-memory circuit breaker.  After N consecutive failures
+# the breaker OPENS for ``_TXT2IMG_OPEN_SECONDS`` and every call inside
+# that window returns immediately without touching the network.  First
+# failure of each open-cycle logs as ERROR; subsequent suppressed calls
+# log once-per-minute as INFO.  Successful call closes the breaker.
+_TXT2IMG_BREAKER = {
+    'consecutive_failures': 0,
+    'open_until': 0.0,
+    'last_suppress_log_at': 0.0,
+}
+_TXT2IMG_OPEN_AFTER = 3            # fails before opening
+_TXT2IMG_OPEN_SECONDS = 300        # 5 min open window
+_TXT2IMG_REQUEST_TIMEOUT = 10      # per-request hard cap
+
+
 def txt2img(text: Annotated[str, "Text to create image"]) -> str:
+    import time as _t2i_time
+    now = _t2i_time.time()
+
+    # ── Breaker open?  Skip the network call. ─────────────────────────
+    if now < _TXT2IMG_BREAKER['open_until']:
+        # Rate-limit the suppression log to once per 60s to avoid
+        # replacing one flood with another, smaller flood.
+        if now - _TXT2IMG_BREAKER['last_suppress_log_at'] > 60:
+            _safe_log(
+                'info',
+                "txt2img: circuit breaker OPEN "
+                f"(re-tries at {int(_TXT2IMG_BREAKER['open_until'])}); "
+                "returning empty result.",
+            )
+            _TXT2IMG_BREAKER['last_suppress_log_at'] = now
+        return ''  # downstream code handles empty url gracefully
+
     current_app.logger.info('INSIDE txt2img')
     url = f"http://aws_rasa.hertzai.com:5459/txt2img?prompt={text}"
-
     payload = ""
     headers = {}
 
-    response = pooled_post(url, headers=headers, data=payload)
-    return response.json()['img_url']
+    try:
+        response = pooled_post(
+            url, headers=headers, data=payload,
+            timeout=_TXT2IMG_REQUEST_TIMEOUT,
+        )
+        result = response.json().get('img_url', '')
+    except Exception as exc:
+        _TXT2IMG_BREAKER['consecutive_failures'] += 1
+        n = _TXT2IMG_BREAKER['consecutive_failures']
+        # Log only the FIRST failure of a streak at ERROR; subsequent
+        # in-streak failures at DEBUG to avoid log flood.
+        if n == 1:
+            _safe_log('error', f"txt2img: request failed ({exc})")
+        else:
+            _safe_log('debug', f"txt2img: request failed (#{n}): {exc}")
+        # Open the breaker once the failure threshold is hit.
+        if n >= _TXT2IMG_OPEN_AFTER:
+            _TXT2IMG_BREAKER['open_until'] = now + _TXT2IMG_OPEN_SECONDS
+            _safe_log(
+                'warning',
+                f"txt2img: circuit breaker OPENED after {n} consecutive "
+                f"failures — suppressing for {_TXT2IMG_OPEN_SECONDS}s.",
+            )
+        return ''
+
+    # ── Success: close the breaker. ──────────────────────────────────
+    if _TXT2IMG_BREAKER['consecutive_failures'] > 0:
+        _safe_log(
+            'info',
+            f"txt2img: recovered after "
+            f"{_TXT2IMG_BREAKER['consecutive_failures']} failure(s); "
+            "circuit breaker CLOSED.",
+        )
+        _TXT2IMG_BREAKER['consecutive_failures'] = 0
+        _TXT2IMG_BREAKER['open_until'] = 0.0
+    return result
 
 
 def get_frame(user_id, frame_store=None):

@@ -603,6 +603,19 @@ class Task:
         if self.status == TaskStatus.COMPLETED and new_status == TaskStatus.ROLLED_BACK:
             return True
 
+        # Special case: FAILED -> COMPLETED/TERMINATED is a legitimate RECOVERY.
+        # The agent retry/fallback FSM (ActionState in lifecycle_hooks) can drive a
+        # task that was transiently marked FAILED — e.g. reaped by zombie_reaper
+        # while merely stalled in recipe_requested — to genuine success. When that
+        # happens the ledger's FAILED is stale and must follow, otherwise the
+        # recovered work reads as failed forever and the goal-completion count
+        # never moves. Only FORWARD recovery to a SUCCESS terminal is permitted;
+        # FAILED never goes back into active work (IN_PROGRESS/RESUMING), so the
+        # #59 fast-fail circuit breaker still prevents retry storms.
+        if self.status == TaskStatus.FAILED and new_status in (
+                TaskStatus.COMPLETED, TaskStatus.TERMINATED):
+            return True
+
         if TaskStatus.is_terminal_state(self.status):
             logger.warning(f"Cannot transition from terminal state {self.status} to {new_status}")
             return False
@@ -1351,6 +1364,11 @@ class SmartLedger:
         self.task_order: List[str] = []  # Track order of task creation
         self.events: List[Dict[str, Any]] = []
         self._lock = threading.RLock()  # Thread safety for self.tasks
+        # Separate lock for the slow serialize+write so a save()'s json.dump
+        # never holds self._lock — otherwise one daemon's save of a large
+        # ledger wedges another daemon's add_task on the same lock (the
+        # 2026-06-12 coordinator-ledger deadlock).
+        self._io_lock = threading.Lock()
 
         # Initialize storage backend
         if backend is None:
@@ -1385,21 +1403,34 @@ class SmartLedger:
                 self.task_order = []
 
     def save(self):
-        """Save ledger to backend storage."""
+        """Save ledger to backend storage.
+
+        Lock hygiene: build the snapshot dict under ``self._lock`` (a fast,
+        consistent read of task state) but do the SLOW serialize + file write
+        (``backend.save`` → json.dump) OUTSIDE ``self._lock`` under a dedicated
+        ``self._io_lock``. Holding ``self._lock`` across the json.dump of a
+        large ledger is what let one daemon's save wedge another daemon's
+        add_task on the same lock (the 2026-06-12 coordinator-ledger deadlock,
+        py-spy-confirmed). ``_io_lock`` still serializes concurrent writes so
+        the on-disk file is never half-written.
+        """
         with self._lock:
-            try:
-                data = {
-                    "agent_id": self.agent_id,
-                    "session_id": self.session_id,
-                    "last_updated": datetime.now().isoformat(),
-                    "task_order": self.task_order,
-                    "tasks": {
-                        task_id: task.to_dict()
-                        for task_id, task in self.tasks.items()
-                    }
+            data = {
+                "agent_id": self.agent_id,
+                "session_id": self.session_id,
+                "last_updated": datetime.now().isoformat(),
+                "task_order": list(self.task_order),
+                "tasks": {
+                    task_id: task.to_dict()
+                    for task_id, task in self.tasks.items()
                 }
+            }
+        # Serialize + write outside self._lock — a slow save no longer blocks
+        # add_task / get_task / update_task_status on another thread.
+        with self._io_lock:
+            try:
                 self.backend.save(self.ledger_key, data)
-                logger.info(f"Saved {len(self.tasks)} tasks to ledger")
+                logger.info(f"Saved {len(data['tasks'])} tasks to ledger")
             except Exception as e:
                 logger.error(f"Failed to save ledger: {e}")
 

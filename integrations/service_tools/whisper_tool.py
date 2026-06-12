@@ -240,17 +240,43 @@ def _get_faster_whisper_model(model_size: str = "base"):
         _record_whisper_failure(f"faster_whisper import failed: {e}")
         raise
 
-    # Detect if CUDA is available for CTranslate2 (separate from torch CUDA)
+    # Detect if CUDA is available for CTranslate2 (separate from torch CUDA).
+    #
+    # CTranslate2 is the engine faster-whisper actually runs on, so its
+    # supported-compute-types probe is the AUTHORITATIVE GPU gate — torch
+    # CUDA being present is neither necessary nor sufficient.  When the probe
+    # says no CUDA, we fall back to CPU int8 AND emit ONE clear warning naming
+    # WHY, so an operator on a CUDA box (e.g. RTX 3070) immediately sees that
+    # the GPU isn't engaged and what to install — instead of only the bare
+    # INFO "loaded on cpu" that today gives no actionable signal.
     device = "cpu"
     compute_type = "int8"
+    _cuda_reason = ""
     try:
         import ctranslate2
         if 'cuda' in ctranslate2.get_supported_compute_types('cuda'):
             device = "cuda"
             compute_type = "float16"
             logger.info("CTranslate2 CUDA available — loading faster-whisper on GPU")
-    except Exception:
-        pass
+        else:
+            _cuda_reason = (
+                "ctranslate2 reports no CUDA compute types "
+                "(CPU-only ctranslate2 build, or no NVIDIA driver/runtime)"
+            )
+    except ImportError as e:
+        _cuda_reason = f"ctranslate2 not importable ({e})"
+    except Exception as e:
+        # get_supported_compute_types can raise on a broken CUDA runtime;
+        # treat as CPU and surface the reason rather than silently swallowing.
+        _cuda_reason = f"ctranslate2 CUDA probe failed ({e})"
+
+    if device == "cpu":
+        logger.warning(
+            "ctranslate2 CUDA not available — STT on CPU (int8); %s. "
+            "Install the ctranslate2 CUDA build for GPU whisper "
+            "(see whisper_tool GPU-install note).",
+            _cuda_reason or "reason unknown",
+        )
 
     logger.info(f"Loading faster-whisper model '{model_size}' on {device} ({compute_type})...")
     try:
@@ -299,7 +325,21 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None) -> Optiona
         return None
 
     try:
-        kwargs = {"beam_size": 5}
+        # Anti-hallucination params (fixes the "1.5% 1.5% 1.5%…" repetition
+        # loop on silence/non-speech, reported 2026-06-12):
+        #   - vad_filter=True → Silero VAD strips non-speech BEFORE decoding,
+        #     so a silent/noise window transcribes to '' instead of a
+        #     hallucinated repeated token. This is the #1 fix.
+        #   - condition_on_previous_text=False → don't feed the model its own
+        #     prior output back; that feedback is what makes whisper get stuck
+        #     repeating a token in an autoregressive loop.
+        # Matters most on the realtime streaming path, where a bounded window
+        # is re-decoded every 2s and frequently contains gaps/silence.
+        kwargs = {
+            "beam_size": 5,
+            "vad_filter": True,
+            "condition_on_previous_text": False,
+        }
         if language:
             kwargs["language"] = language
         segments, info = model.transcribe(audio_path, **kwargs)
@@ -449,7 +489,10 @@ def _legacy_transcribe(audio_path: str, language: str = None) -> Optional[str]:
     try:
         model_name = _select_legacy_model()
         model = _get_whisper_model(model_name)
-        kwargs = {}
+        # Same anti-hallucination guard as the faster-whisper path. openai-
+        # whisper has no vad_filter, but condition_on_previous_text=False is
+        # the key lever that breaks the repeat-on-silence loop.
+        kwargs = {"condition_on_previous_text": False}
         if language:
             kwargs["language"] = language
         result = model.transcribe(audio_path, **kwargs)
@@ -841,6 +884,18 @@ STREAM_CHUNK_SECONDS = 2
 STREAM_CHUNK_BYTES = STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE * STREAM_CHANNELS * STREAM_CHUNK_SECONDS
 # Max buffer before forced transcription (30s)
 STREAM_MAX_BUFFER_BYTES = STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE * STREAM_CHANNELS * 30
+# Realtime guard: interim results re-decode only the most-recent N seconds of
+# audio, NOT the whole accumulated buffer.  Without this bound, each interim
+# pass at t=Ns re-transcribes all N seconds — O(n²) total work over an
+# utterance, so latency grows the longer the user speaks (the live symptom:
+# "responding but VERY DELAYED").  Capping the interim window makes per-interim
+# cost flat (O(window)) regardless of utterance length.  The FINAL pass (control
+# 'final' + MAX_BUFFER force-flush) still decodes the full buffer for accuracy.
+STREAM_INTERIM_WINDOW_SECONDS = 6
+STREAM_INTERIM_WINDOW_BYTES = (
+    STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE * STREAM_CHANNELS
+    * STREAM_INTERIM_WINDOW_SECONDS
+)
 
 
 def _ws_path(websocket) -> str:
@@ -1031,9 +1086,19 @@ async def _stt_stream_handler(websocket):
                 last_transcribe_size = 0
                 continue
 
-            # Interim transcription every STREAM_CHUNK_BYTES
+            # Interim transcription every STREAM_CHUNK_BYTES.
+            #
+            # Realtime fix: decode ONLY the most-recent
+            # STREAM_INTERIM_WINDOW_BYTES of audio, not the whole buffer
+            # from t=0.  This caps per-interim cost to O(window) so latency
+            # stays flat no matter how long the user has been speaking.  The
+            # accumulating ``audio_buffer`` is left untouched (the FINAL pass
+            # still decodes the full utterance for accuracy); we transcribe a
+            # throwaway BytesIO holding just the tail window.
             if buf_size - last_transcribe_size >= STREAM_CHUNK_BYTES:
-                text, lang = _transcribe_buffer(audio_buffer, keep_buffer=True)
+                interim_buf = _tail_window_buffer(
+                    audio_buffer, STREAM_INTERIM_WINDOW_BYTES)
+                text, lang = _transcribe_buffer(interim_buf, keep_buffer=True)
                 last_transcribe_size = buf_size
                 if text:
                     await websocket.send(json.dumps({
@@ -1094,6 +1159,33 @@ def _container_to_pcm(data: bytes) -> Optional[bytes]:
     return None
 
 
+def _tail_window_buffer(audio_buffer, window_bytes: int):
+    """Return a fresh BytesIO holding only the last ``window_bytes`` of audio.
+
+    Used by the interim transcription path to bound re-decode cost: instead of
+    re-transcribing the entire accumulated utterance every chunk (O(n²) over
+    the utterance), we decode just the recent window (O(window)).
+
+    The source ``audio_buffer`` is read non-destructively — its position and
+    contents are unchanged, so ongoing accumulation in the WS handler is not
+    corrupted.
+
+    Audio at this stage is raw PCM16 mono 16kHz (already decoded), so a byte
+    tail == a time tail.  The slice is aligned DOWN to an even
+    ``STREAM_BYTES_PER_SAMPLE`` boundary so we never split a sample frame.
+    """
+    import io
+    data = audio_buffer.getvalue()
+    if window_bytes <= 0 or len(data) <= window_bytes:
+        tail = data
+    else:
+        start = len(data) - window_bytes
+        # Align to a whole-sample boundary so we don't slice mid-sample.
+        start -= start % STREAM_BYTES_PER_SAMPLE
+        tail = data[start:]
+    return io.BytesIO(tail)
+
+
 def _transcribe_buffer(audio_buffer, keep_buffer: bool = False) -> tuple:
     """Transcribe accumulated audio buffer via the subprocess STT worker.
 
@@ -1133,7 +1225,7 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False) -> tuple:
             'language': None,
         })
         if 'error' in result and not result.get('raw_json'):
-            logger.debug(f"Streaming transcribe failed: {result.get('error')}")
+            logger.warning(f"Streaming STT transcribe failed (returning empty text): {result.get('error')}")
             return ('', 'unknown')
         raw = result.get('raw_json') or json.dumps(result)
         try:
@@ -1142,7 +1234,7 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False) -> tuple:
         except json.JSONDecodeError:
             return ('', 'unknown')
     except Exception as e:
-        logger.debug(f"Streaming transcribe failed: {e}")
+        logger.warning(f"Streaming STT transcribe failed (returning empty text): {e}", exc_info=True)
         return ('', 'unknown')
     finally:
         if tmp is not None:
@@ -1174,6 +1266,25 @@ def start_stt_stream_server(port: int = 0) -> Optional[int]:
             port = get_port('stt_stream')
         except Exception:
             port = 8005  # default fallback
+
+    # Surface STT-engine availability LOUDLY at startup. A missing engine is why
+    # streaming STT silently returned '' "for so long" — the per-transcribe
+    # failure was only logged at debug (below). sherpa-onnx is primary,
+    # openai-whisper the fallback. find_spec checks importability without the
+    # cost of importing.
+    try:
+        import importlib.util as _ilu
+        if _ilu.find_spec('sherpa_onnx') is None:
+            _legacy_ok = _ilu.find_spec('whisper') is not None
+            logger.error(
+                "STT engine NOT installed: sherpa-onnx is missing%s. The :8005 "
+                "streaming STT server will bind but EVERY transcribe returns '' "
+                "(empty) — add sherpa-onnx>=1.11.0 (+ onnxruntime) to the bundle "
+                "deps.",
+                "" if _legacy_ok else
+                " AND the openai-whisper fallback is also missing")
+    except Exception:
+        pass
 
     import asyncio
     import threading

@@ -92,6 +92,14 @@ _STATE_TRANSITION_LOOP_THRESHOLD: int = 5
 # the threshold hard break stays the backstop if the nudge doesn't take.
 _STATE_TRANSITION_LOOP_NUDGE_AT: int = 3
 _STATE_TRANSITION_NUDGED: dict = {}
+# Goal circuit-breaker: a daemon/autonomous goal whose GroupChat hard-loop-breaks
+# this many times across re-dispatches is unfixable by retry (the agent lacks the
+# capability, or the fix is out-of-band like a rebuild) — pause it so the daemon
+# stops re-dispatching it and the local model is freed for productive flywheel
+# goals.  Needed because a loop-break returns a fallback reply, so the daemon's
+# own _dispatch_backoff never sees a failure to count (the 686-thrash root).
+_GOAL_LOOP_BREAK_COUNT: dict = {}
+_GOAL_PARK_AFTER_BREAKS: int = 3
 
 # #485 L3 — consecutive-Assistant counter; at threshold redirect to Helper
 # to break attention-collapse loops where Assistant→verify can't escape
@@ -205,6 +213,8 @@ from lifecycle_hooks import (
     register_ledger_for_session,  # Register ledger for auto-sync
     stall_guard_step,             # No-progress stall tracker (reachable guard)
     recipe_correction_directive,  # Escalating "emit ONLY JSON" recipe fix (#89)
+    is_recipe_creation_request,   # Deterministic recipe-prompt detector (speaker routing)
+    RECIPE_CREATE_PROMPT_PREFIX,  # canonical recipe-prompt prefix (single source)
 )
 
 # Import helper_ledger functions for subtask management and ledger awareness
@@ -455,13 +465,92 @@ def save_conversation_db(text, user_id, prompt_id, database_url, request_id):
     return helper_fun.save_conversation_db(text, user_id, prompt_id, database_url, request_id)
 
 
-def send_message_to_user1(user_id,response,inp,prompt_id):
+def send_message_to_user1(user_id, response, inp, prompt_id):
+    """Publish an intermediate agent response to the user.
+
+    Deployment-mode-aware (2026-06-09):
+
+    - **Bundled** (sys.frozen — Nunba desktop / installer / embedded):
+      Emit directly to the canonical local chat topic
+      com.hertzai.hevolve.chat.{user_id} with the schema chat-stream
+      subscribers actually parse (text, request_id, prompt_id, bot_type,
+      options, page_image_url).  No cloud round-trip.  Subscribers
+      (Web SPA Demopage.js, Android RN AutobahnConnectionManager, Nunba
+      Python adapter) render the message; downstream TTS/video happen
+      via the local chat fan-out (no need to re-trigger here).
+
+    - **Standalone central HARTOS** (sys.frozen absent — Docker, dev):
+      POST to https://azurekong.hertzai.com:8443/autogen_response — the
+      canonical Kong gateway in front of the chatbot_pipeline backend
+      that historically owned this endpoint (handler at
+      chatbot_pipeline/chatbot.py:8009).  Same backend as the prior
+      aws_rasa.hertzai.com:9890, just via the TLS+auth+rate-limited
+      gateway instead of the raw HTTP backend.
+
+    Per user 2026-06-09: ``Agent_status`` field omitted on the local
+    path — it was an artefact of the cloud server's per-user session
+    dict and isn't needed by local subscribers.
+
+    Always fire-and-forget — callers don't read the return value.
+    """
+    import sys as _sys
     user_prompt = f'{user_id}_{prompt_id}'
-    request_id = f'{request_id_list[user_prompt]}-intermediate'
-    url = 'http://aws_rasa.hertzai.com:9890/autogen_response'
-    body = json.dumps({'user_id':user_id,'message':response,'inp':inp,'request_id':request_id, 'Agent_status': 'Review Mode'})
+    try:
+        request_id = f'{request_id_list[user_prompt]}-intermediate'
+    except (KeyError, NameError):
+        request_id = f'{user_prompt}-intermediate'
+
+    _bundled = bool(getattr(_sys, 'frozen', False))
+
+    if _bundled:
+        # Bundled (Nunba install) — local chat topic, on-device.
+        text = str(response or '')
+        if not text:
+            return
+        chat_payload = {
+            'text': [text],
+            'request_id': request_id,
+            'prompt_id': prompt_id,
+            'bot_type': 'Custom GPT',
+            'options': [],
+            'newoptions': [],
+            'page_image_url': '',
+            'analogy_image_url': '',
+            'probe': False,
+            'inp': inp,
+        }
+        try:
+            # Canonical worker-safe publisher is the module-level publish_async
+            # (create_recipe.py:109, routes via safe_hartos_attr). The previous
+            # `from core.message_bus import publish_async` raised
+            # ModuleNotFoundError every call (no such module) → bundled mode
+            # silently dropped every intermediate chat message.
+            publish_async(f'com.hertzai.hevolve.chat.{user_id}', chat_payload)
+        except Exception as _e:
+            try:
+                current_app.logger.debug(
+                    f'send_message_to_user1: local publish failed ({_e})')
+            except Exception:
+                pass
+        return
+
+    # Standalone central HARTOS — canonical Kong gateway.
+    url = 'https://azurekong.hertzai.com:8443/autogen_response'
+    body = json.dumps({
+        'user_id': user_id,
+        'message': response,
+        'inp': inp,
+        'request_id': request_id,
+    })
     headers = {'Content-Type': 'application/json'}
-    res = pooled_post(url,data=body,headers=headers)
+    try:
+        pooled_post(url, data=body, headers=headers, timeout=15)
+    except Exception as _e:
+        try:
+            current_app.logger.debug(
+                f'send_message_to_user1: azurekong forward failed ({_e})')
+        except Exception:
+            pass
 
 
 def execute_python_file(task_description:str,user_id: int,prompt_id:int,action_entry_point:int=0):
@@ -1131,6 +1220,28 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
         try:
             tool_logger.info('INSIDE execute_windows_or_android_command')
+
+            # Defensive: agents occasionally pass both args bundled as a
+            # dict in the first positional (e.g. {'instructions': '...',
+            # 'os_to_control': 'windows'}) instead of as separate kwargs.
+            # The declared signature is (instructions: str, os_to_control:
+            # str), so downstream code (e.g. simplified_instructions =
+            # ' '.join(instructions.lower().strip().split()) ~line 1189)
+            # crashes with `AttributeError: 'dict' object has no attribute
+            # 'lower'` when the dict slips through.  Coerce here, in one
+            # place, so every downstream string op is safe.  Last logged:
+            # 2026-05-29 in install agent_system.log.
+            if isinstance(instructions, dict):
+                if (not os_to_control or os_to_control == 'windows') \
+                        and 'os_to_control' in instructions:
+                    os_to_control = instructions.get('os_to_control') \
+                        or os_to_control or 'windows'
+                instructions = (
+                    instructions.get('instructions')
+                    or instructions.get('command')
+                    or str(instructions)
+                )
+
             user_prompt = f'{user_id}_{prompt_id}'
             role_number = get_current_flow(user_prompt)
 
@@ -2047,6 +2158,31 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                 except Exception as _stb_err:
                     current_app.logger.warning(
                         f"[LOOP-BREAK] state-set failed: {_stb_err}")
+                # Circuit-breaker (achieve-flywheel): count hard loop-breaks for
+                # this goal across re-dispatches; once it exceeds the threshold the
+                # goal is unfixable by retry, so PAUSE it — the daemon then stops
+                # re-dispatching it (capping the 686-style thrash) and the model is
+                # freed for productive goals.  Only autonomous goals (UUID
+                # prompt_id, len>=30); human chat (int prompt_id) is never paused.
+                try:
+                    _gbc = _GOAL_LOOP_BREAK_COUNT.get(user_prompt, 0) + 1
+                    _GOAL_LOOP_BREAK_COUNT[user_prompt] = _gbc
+                    if _gbc >= _GOAL_PARK_AFTER_BREAKS and len(str(prompt_id)) >= 30:
+                        from integrations.agent_engine.goal_manager import (
+                            GoalManager)
+                        from integrations.social.models import db_session
+                        with db_session(commit=True) as _cb_db:
+                            GoalManager.update_goal_status(
+                                _cb_db, str(prompt_id), 'paused')
+                        _GOAL_LOOP_BREAK_COUNT.pop(user_prompt, None)
+                        current_app.logger.warning(
+                            f"[GOAL-CIRCUIT-BREAKER] goal {prompt_id} hard "
+                            f"loop-broke {_gbc}x — paused; daemon stops "
+                            f"re-dispatching it so the model is freed for "
+                            f"productive flywheel goals.")
+                except Exception as _cb_err:
+                    current_app.logger.warning(
+                        f"[GOAL-CIRCUIT-BREAKER] park failed: {_cb_err}")
                 # Reset loop-state for this user — next turn starts fresh
                 _STATE_TRANSITION_LOOP_STATE.pop(user_prompt, None)
                 _STATE_TRANSITION_NUDGED.pop(user_prompt, None)
@@ -2390,6 +2526,17 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
                             current_state = get_action_state(user_prompt, user_tasks[user_prompt].current_action)
 
+                            if current_state == ActionState.RECIPE_RECEIVED and _recipe_is_placebo(json_obj):
+                                # The 4B echoed the recipe-template placeholders
+                                # ("Describe the action performed here" / "steps
+                                # here") instead of real content. Banking it
+                                # poisons every future REUSE replay (stalls
+                                # forever). Reject + re-request rather than save.
+                                current_app.logger.warning(
+                                    f'[PLACEBO-RECIPE] action {json_obj.get("action_id")} '
+                                    f'echoed template placeholders — rejecting, re-requesting')
+                                user_tasks[user_prompt].recipe = True
+                                return chat_instructor
                             if current_state == ActionState.RECIPE_RECEIVED:  # State was set in Location 1
                                 # Recipe received, save it
                                 current_app.logger.info('Got Individual action recipe save it')
@@ -2430,7 +2577,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 # (state_transition handled completion, while loop requested recipe,
                                 #  but this handler saw action already terminated — recipe still valid)
                                 _recipe_list = json_obj.get('recipe', None)
-                                _has_recipe = isinstance(_recipe_list, list) and len(_recipe_list) > 0
+                                _has_recipe = (isinstance(_recipe_list, list)
+                                               and len(_recipe_list) > 0
+                                               and not _recipe_is_placebo(json_obj))
                                 if not _has_recipe:
                                     if current_state == ActionState.TERMINATED:
                                         # Action already TERMINATED — don't retry recipe, let while loop advance
@@ -2484,6 +2633,28 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
         if has_pending_tool_calls(messages):
             current_app.logger.info("DETECTED PENDING TOOL CALLS - routing to Assistant without message modification")
             return assistant
+
+        # ─── DETERMINISTIC RECIPE-REQUEST ROUTING ──────────────────────
+        # The recipe-creation prompt (request_recipe_for_action / _last, both
+        # built from RECIPE_CREATE_PROMPT_PREFIX) is emitted by ChatInstructor
+        # to ask for the {"status":"done", ...recipe} JSON that advances
+        # RECIPE_REQUESTED → RECIPE_RECEIVED.  The agent that reliably produces
+        # that JSON is the StatusVerifier (verify) — NOT the Assistant.  Without
+        # this pin the generic "ChatInstructor → return assistant" branch
+        # directly below hands the recipe request to the Assistant, which echoes
+        # the prompt or replies "I'm not sure I understand"; the action then
+        # only advances on a lucky round where the LLM speaker-selector happens
+        # to pick StatusVerifier (live 2026-06-07 19:13-19:18: one action,
+        # ~5 min, dozens of "could NOT be parsed" retries before a chance hit).
+        # Pin it deterministically — the stuck-loop guard above still backstops
+        # a StatusVerifier that itself fails to emit valid JSON, and this fires
+        # ONLY for the recipe prompt so the normal Assistant→verify status flow
+        # is untouched.
+        if is_recipe_creation_request(messages[-1].get("content")):
+            current_app.logger.info(
+                "[RECIPE-ROUTE] recipe-creation request → StatusVerifier "
+                "(deterministic pin, not LLM-selected)")
+            return verify
 
         if last_speaker.name == 'Executor' or last_speaker.name == 'Helper' or last_speaker.name == 'UserProxy' or last_speaker.name == 'UserProxy' or last_speaker.name == 'ChatInstructor':
             if group_chat.messages:
@@ -3282,7 +3453,15 @@ def create_time_agents(user_id, prompt_id,role,goal,actions):
             return verify1
 
         current_app.logger.info(f'Inside state_transition with message :10 {messages[-1]["content"][:10]} & last_speaker {last_speaker.name}')
-        if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "helper" or last_speaker.name == "Executor":
+        # Agent names are case-sensitive.  The Helper agent is instantiated as
+        # name="Helper" (like "Executor"/"multi_role_agent" alongside it here).
+        # This was "helper" (lowercase) → it NEVER matched → Helper fell through
+        # to the final `return "auto"` and the 4B got to pick the next speaker,
+        # instead of the intended deterministic hand-back to the time_agent
+        # orchestrator (the same role the main flow's Helper→assistant plays).
+        # The other three names in this OR-chain are correctly cased, so this is
+        # an unambiguous typo, not intentional exclusion.
+        if last_speaker.name == f"user_proxy_{user_id}" or last_speaker.name == "multi_role_agent" or last_speaker.name == "Helper" or last_speaker.name == "Executor":
             return time_agent
         current_app.logger.info(f'Checking for @user or @user in message')
         if '@user' in messages[-1]["content"].lower():
@@ -4067,7 +4246,16 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                                     flow = get_current_flow(user_prompt)
                                     _recipe_file = helper_fun.safe_prompt_path(prompt_id, flow, json_action_id)
                                     if not os.path.exists(_recipe_file):
-                                        # Recipe not yet saved — request it directly
+                                        # Bank from the execution trace FIRST — the tool calls
+                                        # that already ran ARE the recipe; re-asking the 4B is
+                                        # a fallible LLM round-trip that left flows unbanked
+                                        # for weeks (memory: flywheel_action_banking_gap_
+                                        # 2026-06-11, goal 60834540771).
+                                        _bank_action_recipe_from_trace(
+                                            user_prompt, prompt_id, flow, json_action_id,
+                                            group_chat)
+                                    if not os.path.exists(_recipe_file):
+                                        # Trace banking failed — request it from the model
                                         current_app.logger.info(
                                             f"[RECIPE-NEEDED] {_claimed_task_id} completed but recipe not saved, requesting")
                                         user_tasks[user_prompt].recipe = True
@@ -4853,7 +5041,7 @@ def request_recipe_for_action_last(current_action_id, prompt_id, role, user_prom
     user_tasks[user_prompt].fallback = False
     metadata = strip_json_values(agent_data[prompt_id])
     safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED, "recipe start")
-    message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action from history, along with a suitable name. Provide the output in the following JSON format:
+    message = RECIPE_CREATE_PROMPT_PREFIX + ''' that includes only the necessary steps for this action from history, along with a suitable name. Provide the output in the following JSON format:
                         { "status": "done", "action": "''' + str(user_tasks[user_prompt].get_action(user_tasks[
                                                                                                                       user_prompt].current_action - 1)) + '''","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                         Recipe Requirements:
@@ -4871,7 +5059,7 @@ def request_recipe_for_action(current_action_id, prompt_id, role, user_prompt, p
     user_tasks[user_prompt].fallback = False
     safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED, "recipe start")
     metadata = strip_json_values(agent_data[prompt_id])
-    message = '''Focus on the current task at hand and create a detailed recipe that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
+    message = RECIPE_CREATE_PROMPT_PREFIX + ''' that includes only the necessary steps for this action, along with a suitable name. Provide the output in the following JSON format:
                         { "status": "done", "action": "Describe the action performed here","fallback_action":"", "persona":"","action_id": ''' + f'{user_tasks[user_prompt].current_action}' + ''', "recipe": [{{"steps":"steps here","tool_name":"Only include tool name here if used for this step.","generalized_functions": "Only include this field if any Python code is created, otherwise omit it entirely."}}],"can_perform_without_user_input":"can you perform this action on your own without user input in future. only say no when it is absolutely mandatory and you cannot proceed without it, if you can proceed by checking with other agents you should say yes.  say yes/no if no they give the reason as well e.g. no-i need user's likes and dislike", "scheduled_tasks": [ { "cron_expression": "Create this only if a time-based job is present; if no time-based job exists, do not create it.","persona":"", "action_entry_point":"An integer action_id is required as an entrypoint from list of existing action_ids to perform this job","job_description": "Provide a description of the scheduled job without specifying the time or frequency" } ] }
                         Recipe Requirements:
                         1. Generalized Python Functions: Give the code which was created and excuted successfully without any error handling edge cases. leave it blank when there is no code nedded to perform the action
@@ -4888,11 +5076,141 @@ def request_recipe_for_action(current_action_id, prompt_id, role, user_prompt, p
 
 def fix_cyclic_dependency(cyc, individual_recipe):
     res = fix_actions(individual_recipe, cyc)
+    # fix_actions returns None when the local llama-server is down or its
+    # response can't be parsed. Leave the recipe's dependencies unmodified
+    # rather than crashing the flow with `TypeError: 'NoneType' is not
+    # iterable` on the offline path.
+    if not res:
+        return
     for i in res:
         for j in individual_recipe:
             if i['action_id'] == j['action_id']:
                 j['actions_this_action_depends_on'] = i['actions_this_action_depends_on']
                 break
+
+
+# The recipe-request prompt (see ~line 5050) hands the 4B an EXAMPLE JSON whose
+# fields are literal placeholders. Small models sometimes echo those strings
+# verbatim instead of filling them in, banking a junk "recipe" that then stalls
+# every REUSE replay forever (live: goal 908f4987 banked
+# action="Describe the action performed here"). Reject ONLY exact template
+# echoes — real recipes never contain these strings, so false-positive risk is
+# nil. Keep this set in sync with the example JSON in request_recipe_for_action.
+_RECIPE_PLACEHOLDER_STRINGS = frozenset({
+    'describe the action performed here',
+    'steps here',
+    'only include tool name here if used for this step.',
+    'action here',
+})
+
+
+def _recipe_is_placebo(json_obj) -> bool:
+    """True if the model echoed the recipe-template placeholders (junk recipe)."""
+    try:
+        action = (json_obj.get('action') or '').strip().lower()
+        if action in _RECIPE_PLACEHOLDER_STRINGS:
+            return True
+        steps = json_obj.get('recipe') or []
+        for s in steps:
+            if not isinstance(s, dict):
+                continue
+            if (s.get('steps') or '').strip().lower() in _RECIPE_PLACEHOLDER_STRINGS:
+                return True
+            if (s.get('tool_name') or '').strip().lower() in _RECIPE_PLACEHOLDER_STRINGS:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
+                                   group_chat):
+    """Persist {pid}_{flow}_{action}.json derived from the tool calls that
+    ACTUALLY executed for this action in the live group chat.
+
+    The 4B frequently completes an action (state_transition / #128 recovery
+    edges) without emitting a parseable recipe payload; the old path then
+    re-asked the model for the recipe — another fallible LLM round-trip.
+    Result: flows walked deep but banked nothing (goal 60834540771: ONE
+    action recipe in 3 weeks), so every restart re-walked from Action 1 and
+    no flow ever reached the completion charge.
+
+    Trace-derived banking records what really ran — only the executed tool
+    calls, never fabricated steps. An action with NO tool work banks an
+    explicit no-op marker (the 2026-06-04 "synthesis poisons validator"
+    guard). Must only be called IN-RUN: the trace lives in this dispatch's
+    group_chat and is gone after a restart. Returns True if banked.
+    """
+    try:
+        msgs = list(getattr(group_chat, 'messages', []) or [])
+        # The action's window: everything after the LAST "Execute Action N"
+        # message (re-dispatches of the same action overwrite the window).
+        start = 0
+        for i, m in enumerate(msgs):
+            c = m.get('content') if isinstance(m, dict) else None
+            if isinstance(c, str) and f'Execute Action {action_id}' in c:
+                start = i
+        steps = []
+        for m in msgs[start:]:
+            if not isinstance(m, dict):
+                continue
+            for tc in (m.get('tool_calls') or []):
+                fn = (tc.get('function') or {}) if isinstance(tc, dict) else {}
+                nm = fn.get('name', '')
+                if not nm:
+                    continue
+                steps.append({
+                    'steps': f"{nm}({str(fn.get('arguments') or '')[:400]})",
+                    'tool_name': nm,
+                    'generalized_functions': '',
+                    'agent_to_perform_this_action': 'Helper',
+                })
+        action_obj = {}
+        try:
+            action_obj = user_tasks[user_prompt].get_action(action_id - 1) or {}
+        except Exception:
+            pass
+        if not steps:
+            steps = [{
+                'steps': 'no-op: action completed without tool execution',
+                'tool_name': '',
+                'generalized_functions': '',
+                'agent_to_perform_this_action': 'Assistant',
+            }]
+        json_obj = {
+            'status': 'done',
+            'action': action_obj.get('action', ''),
+            'fallback_action': action_obj.get('fallback_action', ''),
+            'persona': 'Executor',
+            'action_id': int(action_id),
+            'recipe': steps,
+            'can_perform_without_user_input': 'yes',
+            'scheduled_tasks': [],
+            'metadata': {},
+            'recipe_source': 'execution_trace',
+        }
+        # Same secret-redaction guard as the model-recipe save path.
+        try:
+            from security.secret_redactor import redact_secrets
+            for _ri in json_obj['recipe']:
+                if isinstance(_ri.get('steps'), str):
+                    _ri['steps'], _ = redact_secrets(_ri['steps'])
+        except ImportError:
+            pass
+        name = helper_fun.safe_prompt_path(prompt_id, flow, action_id)
+        with open(name, 'w') as f:
+            json.dump(json_obj, f)
+        current_app.logger.info(
+            f"[TRACE-BANKED] action {action_id} recipe derived from "
+            f"{len(steps)} executed step(s) -> {name}")
+        return True
+    except Exception as e:
+        try:
+            current_app.logger.warning(
+                f"[TRACE-BANK] failed for action {action_id}: {e}")
+        except Exception:
+            pass
+        return False
 
 
 def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
@@ -4923,6 +5241,16 @@ def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
     create_final_recipe_for_current_flow(flow, _flow_recipe_data, prompt_id)
     current_app.logger.info(f'[FLOW-RECIPE-SAVED] {prompt_id}_{flow}_recipe.json')
     _push_thinking(user_id, f'Flow {flow} recipe saved.')
+    # Meter the COMPLETED work into the owning goal's spark ledger — this is
+    # the signal the daemon's completion gate closes goals on. Charged here
+    # (flow genuinely finished) and never at dispatch; see
+    # budget_gate.charge_goal_work_completed.
+    try:
+        from integrations.agent_engine.budget_gate import charge_goal_work_completed
+        charge_goal_work_completed(
+            prompt_id, len(_flow_recipe_data.get('actions') or []) or 1)
+    except Exception as _spark_err:
+        current_app.logger.debug(f'completed-work spark charge skipped: {_spark_err}')
 
 
 def set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt):

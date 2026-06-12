@@ -87,3 +87,54 @@ def test_producer_armored_module_imports_through_loader():
                 sys.modules.pop(m, None)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_exec_module_sets_dunder_file_from_origin():
+    """An armored module that references ``__file__`` at import time must
+    not ``NameError`` — the loader must expose the .enc origin as
+    ``module.__file__`` before exec, mirroring CPython's FileLoader.
+
+    Root cause this guards: ``find_spec`` builds ``ModuleSpec(...)``
+    directly, which leaves ``has_location`` False, so CPython's
+    ``_init_module_attrs`` never sets ``__file__``; ``exec_module`` didn't
+    set it either.  The live hive-backend boot crash was exactly this —
+    ``embodied_ai/models/qwen_auto_encoder.py:670`` does
+    ``os.path.dirname(__file__)`` at module scope, raising
+    ``NameError: name '__file__' is not defined`` and taking the whole
+    hevolveai FastAPI app's lifespan startup down (only llama-server
+    survived).  Witnessed 2026-06-07 in gui_app.log.
+
+    Mocks ONLY the native-decrypt boundary; drives the real
+    ``exec_module`` so it runs in any env (no Rust ext / cryptography
+    needed) and asserts the observable effect.
+    """
+    import types
+
+    armor_pkg = os.path.join(ROOT, 'hevolvearmor')
+    if armor_pkg not in sys.path:
+        sys.path.insert(0, armor_pkg)
+    from hevolvearmor._loader import ArmoredFinder, ArmoredLoader
+
+    enc_path = os.path.join(
+        tempfile.gettempdir(), 'armored', 'pkg', 'usesfile.enc')
+    code = compile(
+        "import os\n"
+        "HERE = os.path.dirname(__file__)\n"
+        "BASENAME = os.path.basename(__file__)\n",
+        enc_path, 'exec')
+
+    # Bypass __init__ (needs a real modules_dir + key) — we only exercise
+    # exec_module, mocking the decrypt boundary to return our code object.
+    finder = ArmoredFinder.__new__(ArmoredFinder)
+    finder._code_cache = {}
+    finder._decrypt_and_unmarshal = lambda _p: code
+
+    loader = ArmoredLoader(finder, enc_path, is_package=False)
+    module = types.ModuleType('armored_usesfile')
+
+    # Pre-fix this raises NameError: name '__file__' is not defined.
+    loader.exec_module(module)
+
+    assert module.__file__ == enc_path
+    assert module.HERE == os.path.dirname(enc_path)
+    assert module.BASENAME == 'usesfile.enc'

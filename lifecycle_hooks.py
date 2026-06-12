@@ -192,12 +192,27 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                 # would WARN-spam (~100/run) for an expected, benign divergence.
                 # This advisory sync skips it quietly (the single-FSM unification,
                 # #56 option (a), is the deeper cleanup; the divergence is benign).
-                if task.is_terminal():
+                # #128 recovery reconcile: a stalled action can now RECOVER
+                # (fallback → terminated) instead of trapping.  If it had been
+                # reaped to FAILED meanwhile, the ledger is stale — so when the
+                # ActionState reaches a SUCCESS terminal (ledger COMPLETED) over a
+                # FAILED task, apply the now-permitted recovery edge instead of
+                # silently skipping (which left the recovered goal reading FAILED
+                # and capped the completed count).  Every OTHER terminal divergence
+                # stays benign-skipped, exactly as #56 intended.
+                _recover_failed = (ledger_status == LedgerTaskStatus.COMPLETED
+                                   and task.status == LedgerTaskStatus.FAILED)
+                if task.is_terminal() and not _recover_failed:
                     logger.debug(
                         "Advisory ledger sync: task %s terminal (%s), ActionState "
                         "moved to %s — skipping invalid transition (authoritative "
                         "FSM is ActionState).", task_id, task.status, state.value)
                 else:
+                    if _recover_failed:
+                        logger.info(
+                            "Reconciled stale ledger FAILED → COMPLETED for %s "
+                            "(ActionState %s authoritative — recovered work).",
+                            task_id, state.value)
                     ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
 
             # === BLOCKED REASON: set specific reason based on ActionState source ===
@@ -439,6 +454,31 @@ def recipe_correction_directive(parse_failures: int) -> str:
     return msg
 
 
+# Canonical prefix of the recipe-creation prompt that
+# create_recipe.request_recipe_for_action / request_recipe_for_action_last
+# emit to ask an agent for the {"status":"done", ...recipe} JSON that advances
+# RECIPE_REQUESTED -> RECIPE_RECEIVED.  ONE source so (a) the deterministic
+# speaker-routing in create_recipe.state_transition can NEVER drift from the
+# actual prompt text, and (b) lifecycle_hook_track_recipe_request below matches
+# the same string.  Lives here (autogen-free) so it stays unit-testable.
+RECIPE_CREATE_PROMPT_PREFIX = (
+    'Focus on the current task at hand and create a detailed recipe'
+)
+
+
+def is_recipe_creation_request(content) -> bool:
+    """True when ``content`` is the recipe-creation prompt.
+
+    Pure + autogen-free so create_recipe.state_transition can call it to route
+    recipe requests deterministically to the StatusVerifier instead of letting
+    the LLM speaker-selector pick the Assistant/Helper (which echo the prompt
+    or reply "I'm not sure I understand", so the action only advances on a
+    lucky StatusVerifier round — live 2026-06-07 19:13-19:18).  Uses ``in`` (not
+    just ``startswith``) so an agent that echoes the prompt is still detected.
+    """
+    return isinstance(content, str) and RECIPE_CREATE_PROMPT_PREFIX in content
+
+
 # Add to lifecycle_hooks.py
 class FlowLifecycleState:
     """Track overall flow lifecycle beyond individual actions"""
@@ -664,23 +704,35 @@ def force_state_through_valid_path(user_prompt: str, action_id: int, target_stat
         )
         return True
 
-    # Get the path to target state
+    # Resolve the step sequence.  An enumerated MULTI-STEP shortcut in
+    # state_paths wins (it threads through intermediate states that carry
+    # side-effects, e.g. ASSIGNED→COMPLETED via IN_PROGRESS).  Otherwise fall
+    # back to the DIRECT edge whenever validate_state_transition allows it —
+    # this keeps valid_transitions the single source of truth for "is this edge
+    # legal" and state_paths a pure shortcut table, instead of two maps that
+    # silently drift.  Without the fallback, a recovery edge added to
+    # valid_transitions but not mirrored here was unreachable: #128's
+    # RECIPE_REQUESTED→TERMINATED couldn't be forced, so the flow-complete force
+    # (create_recipe.py:4464) left a stuck recipe_requested action in
+    # IN_PROGRESS and the goal never completed.
     path_key = (current_state, target_state)
     if path_key in state_paths:
         path = state_paths[path_key]
-        logger.info(f"🔧 Auto-path for Action {action_id}: {current_state.value} → {target_state.value}")
-
-        # Execute each step in the path
-        for step_state in path:
-            try:
-                set_action_state(user_prompt, action_id, step_state, f"auto-path: {reason}")
-            except StateTransitionError as e:
-                logger.error(f"[ERROR] Auto-path failed at {step_state.value}: {e}")
-                return False
-        return True
+    elif validate_state_transition(user_prompt, action_id, target_state):
+        path = [target_state]
     else:
         logger.error(f"[ERROR] No valid path from {current_state.value} to {target_state.value}")
         return False
+
+    logger.info(f"🔧 Auto-path for Action {action_id}: {current_state.value} → {target_state.value}")
+    # Execute each step in the path
+    for step_state in path:
+        try:
+            set_action_state(user_prompt, action_id, step_state, f"auto-path: {reason}")
+        except StateTransitionError as e:
+            logger.error(f"[ERROR] Auto-path failed at {step_state.value}: {e}")
+            return False
+    return True
 
 
 # State tracking
@@ -707,7 +759,19 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         ActionState.ERROR: [ActionState.IN_PROGRESS, ActionState.PENDING, ActionState.ERROR, ActionState.FALLBACK_REQUESTED, ActionState.RECIPE_REQUESTED, ActionState.TERMINATED],
         ActionState.FALLBACK_REQUESTED: [ActionState.FALLBACK_RECEIVED, ActionState.FALLBACK_REQUESTED],
         ActionState.FALLBACK_RECEIVED: [ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_RECEIVED],
-        ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED, ActionState.RECIPE_REQUESTED],
+        # RECIPE_REQUESTED recovery edges (#128).  The happy path is
+        # →RECIPE_RECEIVED, but when the (often 4B) model fails to emit a recipe
+        # the pipeline MUST be able to escape recipe_requested, two ways:
+        #   • →FALLBACK_REQUESTED — the autonomous-fallback pattern: the verifier
+        #     hook returns force_fallback (create_recipe.py:4066).
+        #   • →TERMINATED — the TERMINATE handler (lifecycle_hook_track_termination,
+        #     ~line 1018) gates on validate_state_transition(..., TERMINATED).
+        #   • →ERROR — a raising recipe step routes through ERROR's recovery set.
+        # Without these, the action sat in recipe_requested until the stall-guard
+        # broke the flow — the live ~9% goal-completion rate (9 987 'Invalid
+        # transition: recipe_requested → …' per window).  Mirrors the recovery
+        # edges COMPLETED and ERROR already carry; stays targeted (no →IN_PROGRESS).
+        ActionState.RECIPE_REQUESTED: [ActionState.RECIPE_RECEIVED, ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_REQUESTED, ActionState.TERMINATED, ActionState.ERROR],
         ActionState.RECIPE_RECEIVED: [ActionState.TERMINATED, ActionState.RECIPE_RECEIVED],
         # Final state, but: (a) an action can be re-opened (→ASSIGNED), and
         # (b) recipe-capture can run AFTER termination (→RECIPE_REQUESTED).  The
@@ -936,7 +1000,7 @@ def lifecycle_hook_track_recipe_request(user_prompt: str, user_tasks, group_chat
 
     # When recipe creation is requested
     if (group_chat.messages and
-        'Focus on the current task at hand and create a detailed recipe' in group_chat.messages[-1]['content']):
+        is_recipe_creation_request(group_chat.messages[-1].get('content'))):
 
         if validate_state_transition(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED):
             safe_set_state(user_prompt, current_action_id, ActionState.RECIPE_REQUESTED,"hook tracking lifecycle_hook_track_recipe_request")

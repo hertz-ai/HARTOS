@@ -33,6 +33,27 @@ _budget_blocked_goals: set = set()
 _dispatch_backoff: dict = {}
 
 
+def _flow_recipe_exists(prompt_id) -> bool:
+    """Does the goal's flow-0 recipe artifact exist on disk?
+
+    Recipes are written ONLY by after_all_actions_terminated() and the
+    filename is keyed by dispatch.prompt_id_for_goal's hash, so it cannot
+    belong to a different goal. Used by the CREATE/REUSE classifier to route
+    dispatches. NOTE: recipe existence proves a procedure RAN once — it is
+    NOT goal completion (steward decision 2026-06-10: completion is measured
+    in spark transacted; do not wire this into the completion gate).
+    """
+    try:
+        from core.platform_paths import get_recipe_prompts_dir
+        _dir = get_recipe_prompts_dir()
+    except Exception:
+        _dir = 'prompts'
+    try:
+        return os.path.exists(os.path.join(_dir, f'{prompt_id}_0_recipe.json'))
+    except Exception:
+        return False
+
+
 def _get_blocked_hitl_tasks(ledger, goal_id):
     """Get tasks blocked with APPROVAL_REQUIRED under a goal."""
     try:
@@ -805,17 +826,13 @@ class AgentDaemon:
             # reuse-able goal into the CREATE queue.  Single-source
             # dispatch.prompt_id_for_goal hash, not a duplicate md5 (DRY).
             from .dispatch import prompt_id_for_goal
-            try:
-                from core.platform_paths import get_recipe_prompts_dir
-                _prompts_dir = get_recipe_prompts_dir()
-            except Exception:
-                _prompts_dir = 'prompts'
             _create_queue = []
             _reuse_pool = []
             for goal in goals:
-                _pid = prompt_id_for_goal(str(goal.id))
-                _recipe_path = os.path.join(_prompts_dir, f'{_pid}_0_recipe.json')
-                if os.path.exists(_recipe_path):
+                # Shared recipe-existence check (_flow_recipe_exists) — the
+                # SAME signal the completion gate uses, so classifier and
+                # gate can never drift apart.
+                if _flow_recipe_exists(prompt_id_for_goal(str(goal.id))):
                     _reuse_pool.append(goal)
                 else:
                     _create_queue.append(goal)
@@ -1059,6 +1076,14 @@ class AgentDaemon:
                     cfg = goal.config_json or {}
                     is_continuous = cfg.get('continuous', False)
                     spark_spent = goal.spark_spent or 0
+                    # Completion = SPARK: the goal's purpose is spark
+                    # transacted on real work (steward decision 2026-06-10 —
+                    # a flow-recipe artifact proves a procedure RAN once, not
+                    # that the goal's economic outcome happened, so recipe
+                    # existence must NOT complete a goal). On all-local boxes
+                    # spark_spent stays 0 today because estimate_llm_cost_
+                    # spark prices local work at 0 — the fix is metering
+                    # local work into spark, not weakening this gate.
                     if is_continuous:
                         # Continuous goals never auto-complete; cooldown gate
                         # higher up already prevents re-dispatch storms.

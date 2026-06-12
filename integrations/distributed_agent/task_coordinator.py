@@ -65,6 +65,7 @@ class DistributedTaskCoordinator:
         objective: str,
         decomposed_tasks: List[Dict[str, Any]],
         context: Optional[Dict[str, Any]] = None,
+        goal_id: Optional[str] = None,
     ) -> str:
         """
         Submit a goal with pre-decomposed tasks.
@@ -74,12 +75,29 @@ class DistributedTaskCoordinator:
             decomposed_tasks: List of {"task_id": ..., "description": ..., "capabilities": [...]}
             context: Optional domain-specific metadata (e.g. repo_url, genre, dataset_path).
                      Stored on the parent task and inherited by children.
+            goal_id: STABLE id of the originating goal. Pass the caller's real
+                     goal id (e.g. AgentGoal.id) so re-dispatch of the SAME goal
+                     is DEDUPED instead of flooding the ledger with a fresh task
+                     set every tick. Without it, a random id is minted per call
+                     and re-dispatches accumulate duplicate tasks unbounded —
+                     the live cause of the 9166-task ledger O(n²) save deadlock
+                     that wedged both daemons (2026-06-12). Falls back to a
+                     random id only when not provided.
 
         Returns:
             goal_id (parent task ID)
         """
-        goal_id = f"goal_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        goal_id = goal_id or f"goal_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         context = context or {}
+
+        # DEDUP: if this goal already has tasks in the ledger, the daemon is
+        # just re-dispatching an in-flight goal — reuse the existing task set,
+        # do NOT create a duplicate parent+children (the unbounded-growth bug).
+        if goal_id in self._ledger.tasks:
+            logger.info(
+                f"submit_goal: goal {goal_id} already has tasks — reusing "
+                f"(skipping duplicate task creation)")
+            return goal_id
 
         # Enforce HIVE_DEPTH — reject propagations deeper than the
         # published 3-level topology (flat → regional → central).  A

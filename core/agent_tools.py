@@ -1241,6 +1241,150 @@ def build_core_tool_closures(ctx):
         self_critique_and_enhance,
     ))
 
+    # ------------------------------------------------------------------
+    # Browser Research tools — T3 (no auth, no browser).
+    # ------------------------------------------------------------------
+    # Single canonical entry point — integrations.browser_research.tools.dispatch.
+    # Every invocation logs to web_research_audit.log and surfaces a
+    # `connection_mechanism` field so the agent can describe to the user how
+    # it accessed the resource (public_http, obscura_b2_cdp_user_chrome, ...).
+    #
+    # T2 platform tools (Twitter / Reddit / LinkedIn / Bilibili / XHS / Weibo)
+    # land via the same dispatcher in C4+ — agent_tools wiring stays here so
+    # there is exactly one tool-registration surface for both LangChain and
+    # autogen consumers (no parallel registry).
+    try:
+        from integrations.browser_research import tools as br_tools_module
+    except ImportError as _br_imp_err:
+        tool_logger.warning("browser_research unavailable, skipping registration: %s",
+                            _br_imp_err)
+        br_tools_module = None
+
+    if br_tools_module is not None:
+        @log_tool_execution
+        def YouTube_Transcript(
+            url: Annotated[str, "Full YouTube URL (watch / youtu.be / shorts)."],
+            language: Annotated[str, "Preferred subtitle language code, e.g. 'en'."] = "en",
+        ) -> str:
+            """Fetch a YouTube video's transcript text without authentication.
+
+            Returns a JSON string with success/text/segment_count/connection_mechanism.
+            Domain-locked to youtube.com / youtu.be by the dispatcher's allowlist.
+
+            Note: this is distinct from `data_extraction_from_url` because YouTube
+            transcripts use the youtube_transcript_api endpoint (captions/cc), not
+            page-content scraping.  Generic URL fetch belongs in
+            data_extraction_from_url (Crawl4AI → web_crawler.py).
+            """
+            result = br_tools_module.dispatch(
+                tool='YouTube_Transcript', user_id=str(user_id),
+                url=url, language=language,
+            )
+            return json.dumps(result, ensure_ascii=False)
+
+        tools.append((
+            "YouTube_Transcript",
+            "Fetch a YouTube video's transcript text via the captions/cc endpoint. "
+            "No login, no API key. Input: full YouTube URL (watch/youtu.be/shorts) "
+            "+ optional language code. For generic web pages use "
+            "data_extraction_from_url instead — Crawl4AI is the canonical URL fetch.",
+            YouTube_Transcript,
+        ))
+
+        # T2: cookie-authenticated read on user's logged-in platform sessions.
+        # Routes through web_crawler.crawl_url_with_cookies (extending the
+        # canonical crawler) with AccountVault cookies + optional CDP attach.
+        @log_tool_execution
+        def Search_Platform(
+            platform: Annotated[str, "twitter / reddit / linkedin / bilibili / xiaohongshu / weibo"],
+            query: Annotated[str, "Search keywords/phrase."],
+            handle: Annotated[Optional[str], "Vault handle whose cookies to use; first if omitted."] = None,
+        ) -> str:
+            """Search a platform using the user's logged-in session cookies.
+
+            Returns JSON with success/markdown/connection_mechanism — the
+            connection_mechanism tells the agent (and user) how access happened
+            (obscura_b2_cdp_user_chrome / obscura_b1_headless_profile).
+            Consent-gated on `web_research:<platform>`.
+            """
+            result = br_tools_module.dispatch(
+                tool='Search_Platform', user_id=str(user_id),
+                platform=platform, query=query, handle=handle,
+            )
+            return json.dumps(result, ensure_ascii=False)
+
+        tools.append((
+            "Search_Platform",
+            "Search a social platform (twitter/reddit/linkedin/bilibili/xiaohongshu/weibo) "
+            "using the user's logged-in session. Input: platform, query, optional handle. "
+            "Returns JSON with markdown content + connection_mechanism describing how the "
+            "agent accessed it (your Chrome, headless profile, or public). Consent-gated.",
+            Search_Platform,
+        ))
+
+        @log_tool_execution
+        def Read_Timeline(
+            platform: Annotated[str, "twitter / reddit / linkedin / bilibili / xiaohongshu / weibo"],
+            target_handle: Annotated[str, "Whose timeline to read (e.g. '@elonmusk')."],
+            handle: Annotated[Optional[str], "Vault handle whose cookies to use; first if omitted."] = None,
+        ) -> str:
+            """Read another user's public timeline via your logged-in browser session."""
+            result = br_tools_module.dispatch(
+                tool='Read_Timeline', user_id=str(user_id),
+                platform=platform, target_handle=target_handle, handle=handle,
+            )
+            return json.dumps(result, ensure_ascii=False)
+
+        tools.append((
+            "Read_Timeline",
+            "Read someone's public timeline on a platform via your logged-in session. "
+            "Input: platform, target_handle. Returns markdown + connection_mechanism. "
+            "Consent-gated on web_research:<platform>.",
+            Read_Timeline,
+        ))
+
+        @log_tool_execution
+        def Post_As_User(
+            platform: Annotated[str, "twitter / reddit / linkedin / bilibili / xiaohongshu / weibo"],
+            content: Annotated[str, "Text to post on the user's behalf."],
+            handle: Annotated[Optional[str], "Vault handle to post as; first if omitted."] = None,
+            dry_run: Annotated[bool, "TRUE returns a preview card; FALSE actually posts (requires prior confirm)."] = True,
+        ) -> str:
+            """Post on the user's behalf on a social platform.
+
+            **Preview-confirm gate**: dry_run defaults to TRUE.  First invocation
+            returns a `liquid_ui: post_preview` component for the UI to render
+            with explicit Cancel/Confirm buttons.  The agent MUST re-invoke with
+            dry_run=False after the user taps Confirm.  Same canonical pattern
+            as Invite_Friend and channel_send.
+
+            Consent-gated on `web_research:<platform>`.
+            """
+            result = br_tools_module.dispatch(
+                tool='Post_As_User', user_id=str(user_id),
+                platform=platform, content=content, handle=handle, dry_run=dry_run,
+            )
+            return json.dumps(result, ensure_ascii=False)
+
+        tools.append((
+            "Post_As_User",
+            "Post on the user's behalf on a social platform via their logged-in "
+            "browser session. PREVIEW-CONFIRM gated: dry_run=True (default) returns "
+            "a preview card the user must explicitly confirm before the actual post "
+            "happens with dry_run=False. Consent-gated on web_research:<platform>. "
+            "Input: platform, content, optional handle, dry_run.",
+            Post_As_User,
+        ))
+
+        # NOTE: Read_Webpage was removed 2026-06-08 as a parallel-path violation.
+        # The canonical "fetch a URL's content" tool is `data_extraction_from_url`
+        # above (line ~1008), which already delegates to Crawl4AI →
+        # integrations/web_crawler.py (Playwright/Chromium headless with a
+        # requests+BeautifulSoup fallback).  T2 (cookie-authenticated) work in
+        # commits C4+ EXTENDS web_crawler.py with cookie injection + B2 CDP
+        # attach, instead of building a parallel driver.  See
+        # memory/project_browser_research_subsystem.md for the corrected plan.
+
     return tools
 
 

@@ -321,10 +321,13 @@ def get_creative_tools():
     """Return LangChain tools for creative content generation."""
     tools = []
     try:
-        from langchain.tools import Tool
+        # langchain_core FIRST — `from langchain.tools import …` triggers the
+        # heavy langchain meta-package re-export chain (169s on first use in
+        # the frozen bundle; see agent_memory_tools.create_langchain_tools).
+        from langchain_core.tools import Tool
     except ImportError:
         try:
-            from langchain_core.tools import Tool
+            from langchain.tools import Tool
         except ImportError:
             return []
 

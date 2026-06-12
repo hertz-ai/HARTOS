@@ -6593,25 +6593,66 @@ async def async_main(urls):
 
 
 def top5_results(query):
+    """Return the top-5 web results for ``query`` — None-safe + exception-safe.
+
+    The module-level ``search`` (GoogleSearchAPIWrapper) is allowed to be
+    None when GOOGLE_API_KEY / GOOGLE_CSE_ID env vars are missing (see
+    line ~2033 where the constructor is wrapped in try/except).  Earlier
+    versions of this function called ``search.results(...)`` unguarded,
+    so any local-only install reproduced the trace:
+
+        AttributeError: 'NoneType' object has no attribute 'results'
+        File "hart_intelligence_entry.py", line 6597, in top5_results
+
+    (Last logged: 2026-06-07 15:55:59 — `google_search('weather in
+    chennai right now')`.)  Fix: short-circuit when ``search`` is None,
+    catch any exception from ``search.results()`` itself, and broaden
+    the existing ``except RuntimeError`` to ``except Exception`` so a
+    transient network failure doesn't kill the calling agent either.
+    """
     final_res = []
-    top_2_search_res = search.results(query, 2)
-    top_2_search_res_link = [res['link'] for res in top_2_search_res]
+    cleaned_text = ""
+
+    if search is None:
+        app.logger.warning(
+            "top5_results: GoogleSearchAPIWrapper unavailable "
+            "(missing GOOGLE_API_KEY / GOOGLE_CSE_ID).  Returning empty.")
+        return []
+
+    try:
+        top_2_search_res = search.results(query, 2) or []
+    except Exception as e:
+        app.logger.warning(f"top5_results: search.results() failed: {e}")
+        return []
+
+    top_2_search_res_link = [
+        res['link'] for res in top_2_search_res
+        if isinstance(res, dict) and 'link' in res
+    ]
+    if not top_2_search_res_link:
+        return []
+
     try:
         text = asyncio.run(async_main(top_2_search_res_link))
         # Removing punctuation and extra characters
         app.logger.info(text)
-        cleaned_text = re.sub(r'[^\w\s]', '', text[0] +
-                              " "+text[1])  # Remove punctuation
-        # Remove extra newlines and leading/trailing whitespaces
-        cleaned_text = re.sub(r'\n+', '\n', cleaned_text).strip()
-    except RuntimeError as e:
-        app.logger.error(f"Runtime error occurred: {e}")
+        if text and len(text) >= 2:
+            cleaned_text = re.sub(r'[^\w\s]', '', text[0] +
+                                  " " + text[1])  # Remove punctuation
+            # Remove extra newlines and leading/trailing whitespaces
+            cleaned_text = re.sub(r'\n+', '\n', cleaned_text).strip()
+    except Exception as e:
+        app.logger.error(f"top5_results: fetch/clean failed: {e}")
 
     final_res.append({'text': cleaned_text, 'source': top_2_search_res_link})
     app.logger.info(f"res:-->{final_res}")
 
     if len(final_res) == 0:
-        return search.results(query, 4)
+        try:
+            return search.results(query, 4)
+        except Exception as e:
+            app.logger.warning(f"top5_results: fallback search failed: {e}")
+            return []
 
     return final_res
 
@@ -9763,25 +9804,44 @@ def _create_social_agent_from_prompt(user_id, prompt_id):
 # Local-first Prompt CRUD (syncs to cloud DB)
 # ═══════════════════════════════════════════════════════════════
 
+# Media/presentation fields a colliding LOCAL record adopts from its cloud
+# twin when it lacks them. Human-created agents share the SAME prompt_id in
+# both stores (central-DB integer id; agent-sync writes {pid}.json under that
+# id), so the local-first dedup used to DISCARD the cloud record wholesale —
+# and with it the idle/intro filler videos that only exist cloud-side. Idle
+# videos died agent-by-agent as agents localized ("idle videos not loading",
+# 2026-06-10). Local stays authoritative for recipe/state fields.
+_CLOUD_MEDIA_FIELDS = ('fillers', 'image_url', 'teacher_image_url',
+                       'video_text')
+
+
 def _merge_prompts_with_cloud(local_prompts: list, cloud_url: str) -> list:
     """Append cloud prompts to ``local_prompts``, dedup by prompt_id.
 
     Local-first: when the same prompt_id exists in both, the local copy
     is kept (it carries the newer recipe payload + filesystem-side
-    metadata).  Cloud failures are swallowed so a flaky DB never
-    breaks the local-only listing — same best-effort contract both
-    /prompts and /prompts/public have always offered.
+    metadata) — but it ADOPTS the cloud twin's media fields
+    (``_CLOUD_MEDIA_FIELDS``) when it lacks them, so cloud-hosted idle
+    filler videos survive localization.  Cloud failures are swallowed so
+    a flaky DB never breaks the local-only listing — same best-effort
+    contract both /prompts and /prompts/public have always offered.
 
     Single source of truth for the merge so /prompts (user-scoped) and
     /prompts/public (catalogue) cannot drift in dedup logic, error
     handling, or the 'cloud'/'has_recipe' field defaults.
     """
-    local_ids = {str(p.get('prompt_id', '')) for p in local_prompts}
+    by_id = {str(p.get('prompt_id', '')): p for p in local_prompts}
     try:
         res = pooled_get(cloud_url, timeout=5)
         if res.status_code == 200:
             for item in (res.json() or []):
-                if str(item.get('prompt_id', '')) in local_ids:
+                _pid = str(item.get('prompt_id', ''))
+                local_twin = by_id.get(_pid)
+                if local_twin is not None:
+                    # Graft cloud media onto the winning local record.
+                    for _f in _CLOUD_MEDIA_FIELDS:
+                        if not local_twin.get(_f) and item.get(_f):
+                            local_twin[_f] = item[_f]
                     continue
                 item['source'] = 'cloud'
                 item.setdefault('has_recipe', False)
@@ -9823,6 +9883,16 @@ def get_prompts():
                                 os.path.join(PROMPTS_DIR, f'{pid}_0_recipe.json')),
                             'flow_count': len(data.get('flows', [])),
                             'source': 'local',
+                            # Media passthrough — /prompts/public already
+                            # exposes image_url; the user-scoped list dropped
+                            # it, so /local agents rendered an empty video
+                            # column (no idle fallback portrait). fillers is
+                            # future-proofing: local agents have none today
+                            # (cloud-agent feature), but if cloud-sync ever
+                            # writes them locally, idle videos light up with
+                            # no further code change.
+                            'image_url': data.get('image_url', ''),
+                            'fillers': data.get('fillers') or [],
                         })
                 except Exception:
                     continue

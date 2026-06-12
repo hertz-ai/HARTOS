@@ -135,6 +135,17 @@ class ArmoredLoader(importlib.abc.Loader):
     def exec_module(self, module):
         """Decrypt and execute the module code."""
         code = self._finder._decrypt_and_unmarshal(self._enc_path)
+        # find_spec builds ModuleSpec(...) directly, which leaves
+        # has_location False, so CPython's _init_module_attrs never sets
+        # __file__.  Armored modules that reference __file__ at import time
+        # (e.g. os.path.dirname(__file__)) would then NameError and take the
+        # whole import — and any FastAPI lifespan that imports them — down.
+        # Mirror the stdlib FileLoader: expose the .enc origin as __file__
+        # (and __path__ for packages) before executing the module body.
+        module.__dict__.setdefault('__file__', self._enc_path)
+        if self._is_package:
+            module.__dict__.setdefault(
+                '__path__', [os.path.dirname(self._enc_path)])
         exec(code, module.__dict__)
 
 

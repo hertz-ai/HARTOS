@@ -338,6 +338,17 @@ def init_social(app):
     except Exception as e:
         logger.debug(f"HevolveSocial consent blueprint skipped: {e}")
 
+    # BR-C3: Browser Research admin API — driver probe / vault list / audit tail.
+    # url_prefix is /api/web-research (NOT /api/social/web-research) because it
+    # spans channels + research + audit, not just social. Same canonical auth
+    # decorator (require_local_or_token) as the other admin surfaces.
+    try:
+        from .web_research_api import web_research_bp
+        app.register_blueprint(web_research_bp)
+        logger.info("HevolveSocial web-research API registered at /api/web-research/")
+    except Exception as e:
+        logger.debug(f"HevolveSocial web-research blueprint skipped: {e}")
+
     # NOTE: compute_pledge_bp (api_compute_pledge.py) was consolidated into tracker_bp
     # and the stale file deleted 2026-04-15. All pledge endpoints live at
     # /api/social/tracker/experiments/*/pledge* and /api/social/tracker/pledges/*
