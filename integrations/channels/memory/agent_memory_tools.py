@@ -299,13 +299,22 @@ def create_langchain_tools(
         List of LangChain Tool instances.
     """
     try:
-        from langchain.tools import StructuredTool
+        # Import from langchain_core (the canonical home of StructuredTool),
+        # NOT the `langchain` meta-package. `from langchain.tools import …`
+        # triggers langchain's lazy re-export machinery, which in the frozen
+        # bundle deep-imports the whole langchain/langchain_classic tree on
+        # first use — measured at 169s on the user's first chat
+        # (GET_TOOLS_TIMING memory_create_langchain_tools=169.15s, 2026-06-12).
+        # langchain_core.tools is the direct source (~4s cold, warm after
+        # boot) and re-exports the identical class.
+        from langchain_core.tools import StructuredTool
     except ImportError:
-        # In bundled mode, LangChain may use langchain_classic which
-        # has StructuredTool under a different path. This is expected
-        # noise in the frozen build — log at DEBUG, not WARNING.
-        logger.debug("LangChain StructuredTool not available — memory tools skipped")
-        return []
+        # Fallback to the meta-package only if core is somehow unavailable.
+        try:
+            from langchain.tools import StructuredTool
+        except ImportError:
+            logger.debug("LangChain StructuredTool not available — memory tools skipped")
+            return []
 
     tools = []
     for name, (func, desc) in tools_dict.items():
