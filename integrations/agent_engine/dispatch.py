@@ -489,6 +489,7 @@ def dispatch_goal_distributed(prompt: str, user_id: str, goal_id: str,
             objective=prompt[:200],
             decomposed_tasks=tasks,
             context=context,
+            goal_id=str(goal_id),  # STABLE id → re-dispatch dedups, no ledger flood
         )
         logger.info(f"Distributed dispatch: goal {goal_id} submitted as "
                     f"{distributed_goal_id} with {len(tasks)} tasks")
