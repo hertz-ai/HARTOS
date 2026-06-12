@@ -1175,6 +1175,12 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <!-- Panel Container -->
 <div class="panel-container" id="panels" role="main" aria-label="Open windows"></div>
 
+<!-- HART OS native voice orb — frameless, transparent, no React (the OS shell
+     draws its own visualiser via /shell/static/voiceOrbViz.js) -->
+<canvas id="hart-voice-orb" width="320" height="320" aria-hidden="true"
+  style="position:fixed;right:16px;bottom:108px;width:160px;height:160px;z-index:1490;pointer-events:none;background:transparent;opacity:0;transition:opacity .4s ease"></canvas>
+<script src="/shell/static/voiceOrbViz.js"></script>
+
 <!-- Agent Pill (click to expand floating chat) -->
 <div class="agent-pill glass" id="agent-pill" onclick="toggleAssistantChat()">
   <span class="mi material-icons-round" style="color:var(--hart-accent)">chat_bubble</span>
@@ -3619,6 +3625,7 @@ document.addEventListener('click', e => {{
 let mediaRecorder = null;
 let audioChunks = [];
 let isRecording = false;
+let _acAudio = null;  // current server-TTS <audio>, tracked so user speech can interrupt it (barge-in)
 
 function toggleVoice() {{
   if(isRecording) {{ stopRecording(); return; }}
@@ -3651,6 +3658,7 @@ async function startRecording() {{
         }}
       }} catch(err) {{ resp.textContent = 'Voice processing failed'; }}
     }};
+    acStopSpeaking();  // barge-in: stop any in-progress TTS the instant the user starts speaking
     mediaRecorder.start();
     isRecording = true;
     document.querySelector('.mic-btn').classList.add('recording');
@@ -3667,10 +3675,18 @@ function stopRecording() {{
   if(btn) btn.classList.remove('recording');
 }}
 
+// Stop any in-progress TTS — browser SpeechSynthesis + the server <audio>.
+// Single canonical "stop talking": used for barge-in (startRecording) and to avoid overlapping replies (speakText).
+function acStopSpeaking() {{
+  try {{ if('speechSynthesis' in window) speechSynthesis.cancel(); }} catch(e) {{}}
+  try {{ if(_acAudio) {{ _acAudio.pause(); _acAudio = null; }} }} catch(e) {{}}
+}}
+
 // TTS helper — hybrid: browser instant + server quality
 function speakText(text, source) {{
   if(!text || PERF.potato) return;
   source = source || 'chat_response';
+  acStopSpeaking();  // never overlap two replies; also gives _acAudio a clean handle
   // 1. Browser instant feedback (Web Speech API)
   if('speechSynthesis' in window) {{
     const utt = new SpeechSynthesisUtterance(text);
@@ -3685,10 +3701,26 @@ function speakText(text, source) {{
   }}).then(function(r){{ return r.json(); }}).then(function(d){{
     if(d.audio_url && !d.error) {{
       if('speechSynthesis' in window) speechSynthesis.cancel();
-      var a = new Audio(SHELL+d.audio_url);
-      a.play().catch(function(){{}});
+      _acAudio = new Audio(SHELL+d.audio_url);
+      _acAudio.play().catch(function(){{}});
     }}
   }}).catch(function(){{}});
+}}
+
+// ── HART OS native voice orb: reflect the shell's EXISTING voice state ──
+// Reuses isRecording (listening) + _acAudio (speaking) by polling.
+// setActive drives the viz's built-in speech-energy animation. Skipped in potato mode.
+if(!PERF.potato) {{
+  (function initHartOrb() {{
+    var c = document.getElementById('hart-voice-orb');
+    if(!c || !window.HartVoiceOrbViz) {{ setTimeout(initHartOrb, 400); return; }}
+    var orb = window.HartVoiceOrbViz(c, {{}});
+    c.style.opacity = '0.9';
+    setInterval(function() {{
+      var speaking = _acAudio && !_acAudio.paused && !_acAudio.ended;
+      orb.setActive(!!(speaking || isRecording));
+    }}, 200);
+  }})();
 }}
 
 // ═══ SSE Live Agent Action Stream ═══
