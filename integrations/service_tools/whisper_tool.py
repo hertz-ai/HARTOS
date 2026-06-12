@@ -325,7 +325,21 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None) -> Optiona
         return None
 
     try:
-        kwargs = {"beam_size": 5}
+        # Anti-hallucination params (fixes the "1.5% 1.5% 1.5%…" repetition
+        # loop on silence/non-speech, reported 2026-06-12):
+        #   - vad_filter=True → Silero VAD strips non-speech BEFORE decoding,
+        #     so a silent/noise window transcribes to '' instead of a
+        #     hallucinated repeated token. This is the #1 fix.
+        #   - condition_on_previous_text=False → don't feed the model its own
+        #     prior output back; that feedback is what makes whisper get stuck
+        #     repeating a token in an autoregressive loop.
+        # Matters most on the realtime streaming path, where a bounded window
+        # is re-decoded every 2s and frequently contains gaps/silence.
+        kwargs = {
+            "beam_size": 5,
+            "vad_filter": True,
+            "condition_on_previous_text": False,
+        }
         if language:
             kwargs["language"] = language
         segments, info = model.transcribe(audio_path, **kwargs)
@@ -475,7 +489,10 @@ def _legacy_transcribe(audio_path: str, language: str = None) -> Optional[str]:
     try:
         model_name = _select_legacy_model()
         model = _get_whisper_model(model_name)
-        kwargs = {}
+        # Same anti-hallucination guard as the faster-whisper path. openai-
+        # whisper has no vad_filter, but condition_on_previous_text=False is
+        # the key lever that breaks the repeat-on-silence loop.
+        kwargs = {"condition_on_previous_text": False}
         if language:
             kwargs["language"] = language
         result = model.transcribe(audio_path, **kwargs)
