@@ -2526,6 +2526,17 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
 
                             current_state = get_action_state(user_prompt, user_tasks[user_prompt].current_action)
 
+                            if current_state == ActionState.RECIPE_RECEIVED and _recipe_is_placebo(json_obj):
+                                # The 4B echoed the recipe-template placeholders
+                                # ("Describe the action performed here" / "steps
+                                # here") instead of real content. Banking it
+                                # poisons every future REUSE replay (stalls
+                                # forever). Reject + re-request rather than save.
+                                current_app.logger.warning(
+                                    f'[PLACEBO-RECIPE] action {json_obj.get("action_id")} '
+                                    f'echoed template placeholders — rejecting, re-requesting')
+                                user_tasks[user_prompt].recipe = True
+                                return chat_instructor
                             if current_state == ActionState.RECIPE_RECEIVED:  # State was set in Location 1
                                 # Recipe received, save it
                                 current_app.logger.info('Got Individual action recipe save it')
@@ -2566,7 +2577,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                 # (state_transition handled completion, while loop requested recipe,
                                 #  but this handler saw action already terminated — recipe still valid)
                                 _recipe_list = json_obj.get('recipe', None)
-                                _has_recipe = isinstance(_recipe_list, list) and len(_recipe_list) > 0
+                                _has_recipe = (isinstance(_recipe_list, list)
+                                               and len(_recipe_list) > 0
+                                               and not _recipe_is_placebo(json_obj))
                                 if not _has_recipe:
                                     if current_state == ActionState.TERMINATED:
                                         # Action already TERMINATED — don't retry recipe, let while loop advance
@@ -5074,6 +5087,40 @@ def fix_cyclic_dependency(cyc, individual_recipe):
             if i['action_id'] == j['action_id']:
                 j['actions_this_action_depends_on'] = i['actions_this_action_depends_on']
                 break
+
+
+# The recipe-request prompt (see ~line 5050) hands the 4B an EXAMPLE JSON whose
+# fields are literal placeholders. Small models sometimes echo those strings
+# verbatim instead of filling them in, banking a junk "recipe" that then stalls
+# every REUSE replay forever (live: goal 908f4987 banked
+# action="Describe the action performed here"). Reject ONLY exact template
+# echoes — real recipes never contain these strings, so false-positive risk is
+# nil. Keep this set in sync with the example JSON in request_recipe_for_action.
+_RECIPE_PLACEHOLDER_STRINGS = frozenset({
+    'describe the action performed here',
+    'steps here',
+    'only include tool name here if used for this step.',
+    'action here',
+})
+
+
+def _recipe_is_placebo(json_obj) -> bool:
+    """True if the model echoed the recipe-template placeholders (junk recipe)."""
+    try:
+        action = (json_obj.get('action') or '').strip().lower()
+        if action in _RECIPE_PLACEHOLDER_STRINGS:
+            return True
+        steps = json_obj.get('recipe') or []
+        for s in steps:
+            if not isinstance(s, dict):
+                continue
+            if (s.get('steps') or '').strip().lower() in _RECIPE_PLACEHOLDER_STRINGS:
+                return True
+            if (s.get('tool_name') or '').strip().lower() in _RECIPE_PLACEHOLDER_STRINGS:
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
