@@ -129,6 +129,27 @@ def register_shell_desktop_routes(app):
         'email': ('xdg-settings', 'get', 'default-url-scheme-handler', 'mailto'),
     }
 
+    # ─── AI sensory kill-switch (human hard cut + live proof) ────────────────
+    # The human's authoritative control over what the AI can sense. Only this
+    # route flips it — the AI agent has no path to. core.ai_sensing is the single
+    # gate every sensor ingestion checks; status() returns LIVE OS state (e.g. the
+    # vision service really stopped) so the proof can't be faked.
+    @app.route('/api/shell/ai-sensing', methods=['GET'])
+    def shell_ai_sensing_status():
+        from core.ai_sensing import status
+        return jsonify(status())
+
+    @app.route('/api/shell/ai-sensing', methods=['POST'])
+    def shell_ai_sensing_set():
+        from core.ai_sensing import disable_all, enable_all, status
+        data = request.get_json(force=True, silent=True) or {}
+        action = str(data.get('action', '')).lower()
+        if action in ('off', 'disable', 'shut'):
+            return jsonify(disable_all())
+        if action in ('on', 'enable', 'wake'):
+            return jsonify(enable_all())
+        return jsonify(status())
+
     @app.route('/api/shell/default-apps', methods=['GET'])
     def shell_default_apps():
         defaults = {}

@@ -1092,6 +1092,34 @@ html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot{animat
 .taskbar-chip{will-change:transform}
 @media(prefers-reduced-motion:reduce){.panel{animation:none}}
 html.a11y-rmotion .panel{animation:none}
+/* ── AI sensory kill-switch (always-accessible safety control) ── */
+.hart-senses{position:fixed;left:14px;bottom:54px;z-index:8100}
+.hart-senses-btn{width:46px;height:46px;border-radius:50%;border:1px solid var(--hart-glass-border);cursor:pointer;
+  background:var(--hart-glass-bg);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,.35);
+  transition:transform .18s cubic-bezier(.175,.885,.32,1.275),background .2s,box-shadow .2s}
+.hart-senses-btn:hover{transform:scale(1.08)}
+.hart-senses-btn .mi{font-size:24px;color:var(--hart-accent)}
+.hart-senses-btn.off{background:rgba(255,107,107,.18);border-color:var(--hart-error);
+  box-shadow:0 0 0 3px rgba(255,107,107,.18),0 4px 16px rgba(0,0,0,.4)}
+.hart-senses-btn.off .mi{color:var(--hart-error)}
+.hart-senses-panel{position:absolute;left:0;bottom:56px;display:none;flex-direction:column;gap:6px;
+  min-width:248px;max-width:300px;padding:12px 14px;border-radius:12px;background:var(--hart-glass-bg);
+  border:1px solid var(--hart-glass-border);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  box-shadow:0 8px 28px rgba(0,0,0,.4)}
+.hart-senses-panel.open{display:flex}
+.hart-senses-panel .hsp-title{font-size:12px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--hart-muted)}
+.hsp-row{display:flex;align-items:center;gap:8px;font-size:12px}
+.hsp-row .mi{font-size:16px;color:var(--hart-muted)}
+.hsp-name{flex:1}
+.hsp-state{font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;padding:2px 7px;border-radius:8px}
+.hsp-state.on{color:var(--hart-active);background:rgba(0,230,118,.12)}
+.hsp-state.off{color:var(--hart-error);background:rgba(255,107,107,.14)}
+.hsp-detail{font-size:10px;color:var(--hart-muted)}
+.hsp-foot{font-size:10px;color:var(--hart-muted);margin-top:4px;line-height:1.3}
+/* Orb closes its eyes when the human cuts the AI's senses */
+.hart-hero.ai-blind #hart-voice-orb{opacity:.12;filter:grayscale(1) brightness(.4);transition:opacity .5s,filter .5s}
+.hart-hero.ai-blind .hart-hero-mic{background:rgba(40,40,48,.5);box-shadow:none}
 '''
 
         return f'''<!DOCTYPE html>
@@ -1383,6 +1411,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script src="/shell/static/hartPersonalize.js"></script>
 <script src="/shell/static/hartMarketplace.js"></script>
 <script src="/shell/static/hartDock.js"></script>
+<script src="/shell/static/hartSenses.js"></script>
 
 <div class="agent-pill glass" id="agent-pill" onclick="toggleAssistantChat()">
   <span class="mi material-icons-round" style="color:var(--hart-accent)">chat_bubble</span>
@@ -1435,6 +1464,17 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 <!-- Virtual-desktop switcher (client-side; populated by hartWorkspaces.js) -->
 <div class="hart-ws-switcher glass" id="hart-ws-switcher" role="tablist" aria-label="Virtual desktops"></div>
+
+<!-- AI sensory kill-switch: human hard cut + live proof (orb "closes its eyes") -->
+<div class="hart-senses" id="hart-senses">
+  <div class="hart-senses-panel" id="hart-senses-panel" role="status" aria-live="polite">
+    <div class="hsp-title">AI sensory state</div>
+    <div id="hart-senses-proof"></div>
+  </div>
+  <button class="hart-senses-btn" id="hart-senses-btn" type="button" aria-pressed="false" aria-label="Shut or wake the AI's senses" title="Shut the AI's eyes &amp; ears (right-click for live proof)">
+    <span class="mi material-icons-round" aria-hidden="true">visibility</span>
+  </button>
+</div>
 
 <!-- Toast Notifications -->
 <div class="toast-container" id="toast-container" role="status" aria-live="polite"></div>
@@ -4322,6 +4362,15 @@ function renderAgentOverlay(ev) {{
         # ── Voice ──
         @app.route('/api/voice', methods=['POST'])
         def api_voice():
+            # Human kill-switch: if the user has cut the AI's hearing, refuse to
+            # transcribe — no mic audio is consumed (core.ai_sensing gate).
+            try:
+                from core.ai_sensing import allowed
+                if not allowed('mic'):
+                    return jsonify({'error': 'AI hearing is disabled by the user',
+                                    'sensing_disabled': True}), 403
+            except Exception:
+                pass
             audio = request.files.get('audio')
             if audio:
                 import tempfile
