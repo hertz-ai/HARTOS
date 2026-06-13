@@ -8181,6 +8181,35 @@ except Exception:
         return fn
 
 
+# Gate the foreground marker on the SAME discriminator the outbound monkeypatch
+# uses (dispatch.is_genuine_user_request).  The daemon reuses /chat for its own
+# autonomous goal dispatches (request_id 'daemon_*', carried in the
+# X-HARTOS-Request-ID header or the JSON body); without this gate those tripped
+# the 0->1 foreground edge, so the daemon yielded to ITSELF and a real user turn
+# was never the edge that fires the abort of in-flight background 4B calls — the
+# user's "hi" was starved (2026-06-13 dig).  Registered once; covers BOTH the
+# HARTOS /chat and the bundled Nunba chat_route (both apply mark_view).  Fails
+# open to "user" so a genuine turn is never accidentally de-prioritised.
+def _chat_request_is_genuine():
+    try:
+        from flask import request as _rq
+        _rid = _rq.headers.get('X-HARTOS-Request-ID')
+        if not _rid:
+            _rid = (_rq.get_json(silent=True) or {}).get('request_id')
+    except Exception:
+        return True  # no request context / unparsable -> treat as a user turn
+    try:
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+        return is_genuine_user_request(_rid)
+    except Exception:
+        return True
+try:
+    from core.foreground import set_genuine_check as _set_genuine_check
+    _set_genuine_check(_chat_request_is_genuine)
+except Exception:
+    pass
+
+
 @app.route('/chat', methods=['POST'])
 @_mark_foreground
 def chat():

@@ -38,6 +38,16 @@ _count = 0
 _cancel_lock = threading.Lock()
 _cancellables = set()  # type: set
 
+# Optional discriminator consulted by mark_view: a 0-arg predicate returning
+# False for a background/daemon request, so it does NOT mark foreground (and so a
+# genuine user turn — not the daemon's own /chat dispatch — owns the 0->1 edge
+# that fires the abort).  Kept here (dependency-free) so the single mark_view
+# source serves both the HARTOS /chat and the bundled Nunba chat_route; HARTOS
+# registers a check that reads the inbound request_id + dispatch
+# .is_genuine_user_request.  None => unregistered => every view marks foreground
+# (back-compat).
+_genuine_check = None
+
 
 def register_cancellable(fn) -> None:
     """Register a 0-arg callable that terminates an in-flight BACKGROUND LLM call.
@@ -125,20 +135,48 @@ def foreground_request():
         exit_foreground()
 
 
+def set_genuine_check(fn) -> None:
+    """Register the 0-arg predicate consulted by ``mark_view``.
+
+    Return ``False`` for a background/daemon request so it does NOT mark
+    foreground; ``None`` unregisters (every view marks foreground — the original
+    behaviour).  HARTOS registers one that reads the inbound request_id and
+    applies ``dispatch.is_genuine_user_request`` — the SAME discriminator the
+    outbound monkeypatch (``llm_outbound_logger._is_background_call``) already
+    uses, so the /chat gate and the call patch finally agree."""
+    global _genuine_check
+    _genuine_check = fn
+
+
 def mark_view(fn):
-    """Decorator: mark a request handler as a user-facing turn for its whole
-    duration, so background daemons yield the shared model to it.
+    """Decorator: mark a GENUINE user request handler as a foreground turn for
+    its whole duration, so background daemons yield the shared model to it.
 
     SINGLE SOURCE for both chat entrypoints — the standalone HARTOS ``/chat``
     route AND the bundled Nunba ``chat_route`` (which shadows /chat on :5000)
     apply this same decorator, so there is one foreground rule, not a per-app
-    copy.  Generic (wraps any callable) and dependency-free, so importing it can
-    never break the host app.
+    copy.  Generic (wraps any callable) and dependency-free.
+
+    If a genuine-check is registered (``set_genuine_check``) and reports the
+    request is NOT genuine (the daemon's own ``daemon_*`` /chat dispatch), the
+    view runs WITHOUT marking foreground — so the daemon never trips the abort
+    edge meant for a live user, never yields to itself, and the user's real turn
+    owns the 0->1 edge.  A missing/raising check fails OPEN (marks foreground) so
+    a real user turn is never accidentally starved.
     """
     import functools
 
     @functools.wraps(fn)
     def _wrapped(*args, **kwargs):
-        with foreground_request():
-            return fn(*args, **kwargs)
+        genuine = True
+        chk = _genuine_check
+        if chk is not None:
+            try:
+                genuine = chk()
+            except Exception:
+                genuine = True  # fail-open: never starve a real user turn
+        if genuine:
+            with foreground_request():
+                return fn(*args, **kwargs)
+        return fn(*args, **kwargs)
     return _wrapped
