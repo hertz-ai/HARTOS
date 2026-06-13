@@ -671,6 +671,29 @@ def force_state_through_valid_path(user_prompt: str, action_id: int, target_stat
         # From RECIPE states
         (ActionState.RECIPE_REQUESTED, ActionState.RECIPE_RECEIVED): [ActionState.RECIPE_RECEIVED],
         (ActionState.RECIPE_RECEIVED, ActionState.TERMINATED): [ActionState.TERMINATED],
+
+        # Force-to-terminal recovery (2026-06-13).  TERMINATED is the absorbing
+        # terminal state, so the flow-complete force-terminate (create_recipe.py
+        # ~4587) must drive ANY non-terminal action to TERMINATED.  Without these
+        # an action still ASSIGNED / IN_PROGRESS / awaiting-verification / PENDING
+        # at the flow boundary could not terminate ('Invalid transition: X ->
+        # terminated', 187x/boot on the live build); can_increment then blocked,
+        # the pipeline re-ran the same action forever and no goal ever reached
+        # recipe-save -> the flywheel never spun + the CPU churned.  Each routes
+        # through COMPLETED (TERMINATED's only legal predecessor) so state history
+        # stays consistent.  A force-completed action's recipe QUALITY is guarded
+        # downstream by trace-banking (#143: real tool calls -> real recipe) +
+        # placebo rejection (#140), NOT here -- this is liveness, not quality.
+        (ActionState.ASSIGNED, ActionState.TERMINATED): [
+            ActionState.IN_PROGRESS, ActionState.STATUS_VERIFICATION_REQUESTED,
+            ActionState.COMPLETED, ActionState.TERMINATED],
+        (ActionState.IN_PROGRESS, ActionState.TERMINATED): [
+            ActionState.STATUS_VERIFICATION_REQUESTED,
+            ActionState.COMPLETED, ActionState.TERMINATED],
+        (ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.TERMINATED): [
+            ActionState.COMPLETED, ActionState.TERMINATED],
+        (ActionState.PENDING, ActionState.TERMINATED): [
+            ActionState.COMPLETED, ActionState.TERMINATED],
     }
 
     if current_state == target_state:
@@ -1054,8 +1077,14 @@ def lifecycle_hook_track_termination(user_prompt: str, user_tasks, group_chat) -
     if (group_chat.messages and
         group_chat.messages[-1]['content'] == 'TERMINATE'):
 
-        if validate_state_transition(user_prompt, current_action_id, ActionState.TERMINATED):
-            safe_set_state(user_prompt, current_action_id, ActionState.TERMINATED,"hook tracking lifecycle_hook_track_termination")
+        # force_state_through_valid_path (not a bare validate): a TERMINATE for an
+        # action still stuck in ASSIGNED/IN_PROGRESS/PENDING (the 4B never drove
+        # the intermediate transitions) walks to TERMINATED via the force-to-
+        # terminal recovery paths instead of being rejected -> looping forever
+        # (the live 2026-06-13 'assigned -> terminated' stall).  Normal
+        # COMPLETED/RECIPE_RECEIVED terminations resolve through the same single
+        # [TERMINATED] step as before, so behaviour is unchanged for them.
+        if force_state_through_valid_path(user_prompt, current_action_id, ActionState.TERMINATED, "hook tracking lifecycle_hook_track_termination"):
             return True
 
     return False
