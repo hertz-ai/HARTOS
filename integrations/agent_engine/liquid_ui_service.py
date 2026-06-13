@@ -1120,6 +1120,27 @@ html.a11y-rmotion .panel{animation:none}
 /* Orb closes its eyes when the human cuts the AI's senses */
 .hart-hero.ai-blind #hart-voice-orb{opacity:.12;filter:grayscale(1) brightness(.4);transition:opacity .5s,filter .5s}
 .hart-hero.ai-blind .hart-hero-mic{background:rgba(40,40,48,.5);box-shadow:none}
+/* ── First-run "Light Your HART" ceremony overlay ── */
+.hart-onboarding{position:fixed;inset:0;z-index:12000;display:none;flex-direction:column;align-items:center;justify-content:center;
+  gap:26px;text-align:center;padding:48px;background:radial-gradient(circle at 50% 38%,#16142e,#07060f 72%)}
+.hart-onboarding.open{display:flex}
+.hart-onboarding .hob-orb{width:150px;height:150px;border-radius:50%;flex-shrink:0;
+  background:radial-gradient(circle at 50% 40%,rgba(160,150,255,.95),rgba(108,99,255,.35) 45%,transparent 70%);
+  box-shadow:0 0 70px rgba(108,99,255,.5),0 0 150px rgba(108,99,255,.22);animation:hob-breathe 3.2s ease-in-out infinite}
+@keyframes hob-breathe{0%,100%{transform:scale(1);opacity:.85}50%{transform:scale(1.08);opacity:1}}
+.hart-onboarding .hob-name{font-size:34px;font-weight:600;letter-spacing:1px;color:#fff;min-height:0;opacity:0;
+  transform:translateY(8px);transition:opacity .6s,transform .6s}
+.hart-onboarding .hob-name.show{opacity:1;transform:none;text-shadow:0 0 30px rgba(108,99,255,.6)}
+.hart-onboarding .hob-narr{max-width:640px;min-height:84px;display:flex;flex-direction:column;gap:10px}
+.hart-onboarding .hob-line{font-size:20px;line-height:1.5;color:#e9e7ff;font-family:var(--ds-font-body);
+  opacity:0;transform:translateY(6px);transition:opacity .6s,transform .6s}
+.hart-onboarding .hob-line.in{opacity:1;transform:none}
+.hart-onboarding .hob-opts{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;max-width:700px}
+.hart-onboarding .hob-opt{padding:12px 22px;border-radius:999px;border:1px solid rgba(160,150,255,.4);
+  background:rgba(108,99,255,.12);color:#fff;font-size:15px;font-family:var(--ds-font-body);cursor:pointer;
+  transition:background .18s,transform .18s cubic-bezier(.175,.885,.32,1.275),box-shadow .18s}
+.hart-onboarding .hob-opt:hover{background:rgba(108,99,255,.28);transform:translateY(-2px);box-shadow:0 8px 24px rgba(108,99,255,.35)}
+.hart-onboarding .hob-skip{position:fixed;bottom:20px;font-size:12px;color:rgba(255,255,255,.4)}
 '''
 
         return f'''<!DOCTYPE html>
@@ -1412,6 +1433,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script src="/shell/static/hartMarketplace.js"></script>
 <script src="/shell/static/hartDock.js"></script>
 <script src="/shell/static/hartSenses.js"></script>
+<script src="/shell/static/hartOnboarding.js"></script>
 
 <div class="agent-pill glass" id="agent-pill" onclick="toggleAssistantChat()">
   <span class="mi material-icons-round" style="color:var(--hart-accent)">chat_bubble</span>
@@ -1474,6 +1496,15 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   <button class="hart-senses-btn" id="hart-senses-btn" type="button" aria-pressed="false" aria-label="Shut or wake the AI's senses" title="Shut the AI's eyes &amp; ears (right-click for live proof)">
     <span class="mi material-icons-round" aria-hidden="true">visibility</span>
   </button>
+</div>
+
+<!-- First-run "Light Your HART" ceremony (web, in-shell; auto-runs after OS install when not onboarded) -->
+<div class="hart-onboarding" id="hart-onboarding" role="dialog" aria-modal="true" aria-label="Light Your HART">
+  <div class="hob-orb" aria-hidden="true"></div>
+  <div class="hob-name" id="hart-onboarding-name"></div>
+  <div class="hob-narr" id="hart-onboarding-narr" role="status" aria-live="polite"></div>
+  <div class="hob-opts" id="hart-onboarding-opts"></div>
+  <div class="hob-skip">Press Esc to skip</div>
 </div>
 
 <!-- Toast Notifications -->
