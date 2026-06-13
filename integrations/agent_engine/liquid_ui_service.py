@@ -91,18 +91,6 @@ COMPONENT_TYPES = {
     # Lightweight notification with short auto-dismiss; web maps to the
     # same NotificationCard renderer with `severity` driving the colour.
     'toast': {'props': ['title', 'message', 'severity']},
-    # ── Web research consent prompt (BR-C4+) ──
-    # Returned by browser_research.tools.dispatch when the user has not yet
-    # granted the per-platform `web_research:<platform>` consent scope.
-    # SPA renders a single-tap Grant action that calls consentApi.grant().
-    'consent_prompt': {'props': ['scope', 'platform', 'title', 'description']},
-    # ── Web research post preview (BR-C7) ──
-    # First call to Post_As_User returns this with dry_run=True; UI shows
-    # Cancel / Confirm.  Confirm tap re-invokes Post_As_User with the
-    # `confirm_args` payload (dry_run=False).
-    'post_preview': {'props': ['platform', 'handle', 'content',
-                               'confirm_tool', 'confirm_args',
-                               'confirm_label', 'cancel_label']},
     # ── Channel pair-code consent card (gateway_qr auth_method) ──
     # Emitted by hart_intelligence_entry._start_gateway_qr_pair_push
     # while a user is conversationally connecting WhatsApp / Telegram /
@@ -554,9 +542,11 @@ class LiquidUIService:
         try:
             from integrations.agent_engine.shell_manifest import (
                 PANEL_MANIFEST, DYNAMIC_PANELS, SYSTEM_PANELS, PANEL_GROUPS)
-            manifest_json = json.dumps(PANEL_MANIFEST)
-            system_json = json.dumps(SYSTEM_PANELS)
-            groups_json = json.dumps(PANEL_GROUPS)
+            # Replace </ with <\/ so the browser HTML parser never sees
+            # </script> inside the JSON and prematurely closes the script tag.
+            manifest_json = json.dumps(PANEL_MANIFEST).replace('</', '<\\/')
+            system_json = json.dumps(SYSTEM_PANELS).replace('</', '<\\/')
+            groups_json = json.dumps(PANEL_GROUPS).replace('</', '<\\/')
         except Exception:
             manifest_json = '{}'
             system_json = '{}'
@@ -1148,9 +1138,8 @@ html.a11y-rmotion .panel{animation:none}
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>HART OS</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600;700&family=Fira+Code:wght@400;500;600&display=swap" rel="stylesheet">
-<link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
+<script>if(navigator.onLine){{var _l=document.createElement('link');_l.rel='stylesheet';_l.href='https://fonts.googleapis.com/icon?family=Material+Icons+Round';document.head.appendChild(_l);}}</script>
+<style>/* Material Icons Round: CDN injected above only when online (testing); NixOS bundled font covers offline USB boot */</style>
 <style>
 {css_vars}
 {a11y_fontscale}
@@ -1435,6 +1424,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script src="/shell/static/hartSenses.js"></script>
 <script src="/shell/static/hartOnboarding.js"></script>
 
+<!-- Agent Pill (click to expand floating chat) -->
 <div class="agent-pill glass" id="agent-pill" onclick="toggleAssistantChat()">
   <span class="mi material-icons-round" style="color:var(--hart-accent)">chat_bubble</span>
   <input id="agent-input" placeholder="Ask HART..." onclick="event.stopPropagation();toggleAssistantChat()" onkeydown="if(event.key==='Enter'){{event.stopPropagation();toggleAssistantChat();setTimeout(function(){{var i=document.getElementById('ac-input');if(i){{i.value=document.getElementById('agent-input').value;document.getElementById('agent-input').value=''}}}},100)}}">
@@ -1514,6 +1504,27 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <div class="ctx-menu glass" id="ctx-menu" style="display:none"></div>
 
 <script>
+// Catch any uncaught JS error and show it on screen — helps debug on kiosk
+// where DevTools inspector isn't accessible via right-click.
+window.onerror = function(msg, src, line, col, err) {{
+  var d = document.getElementById('_js_err');
+  if(!d) {{
+    d = document.createElement('div');
+    d.id = '_js_err';
+    d.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#c00;color:#fff;'
+      + 'font:13px monospace;padding:8px 12px;z-index:99999;white-space:pre-wrap;max-height:40vh;overflow-y:auto';
+    document.body.appendChild(d);
+  }}
+  d.textContent += '[JS ERROR] ' + msg + ' (' + src + ':' + line + ':' + col + ')\\n';
+  return false;
+}};
+window.addEventListener('unhandledrejection', function(e) {{
+  window.onerror('[UnhandledPromise] ' + (e.reason||e), '', 0, 0, e.reason);
+}});
+
+// Helper: get panel id from nearest .panel ancestor (avoids quote-escaping in onclick strings)
+function _pid(el) {{ return el.closest('[data-panel-id]').dataset.panelId; }}
+
 // ═══ Configuration ═══
 const BACKEND = 'http://localhost:{self.backend_port}';
 const SHELL = 'http://localhost:{self.port}';
@@ -1538,6 +1549,15 @@ let panelZ = 100;
 let startOpen = false;
 let focusedPanel = null;
 let mru = [];
+
+// AbortSignal.timeout() was added in WebKit 615 / Safari 15.4. Older WebKitGTK
+// builds (e.g. NixOS 24.11 ISO) may not have it — fall back to AbortController.
+function _sig(ms) {{
+  if(typeof AbortSignal !== 'undefined' && AbortSignal.timeout) return AbortSignal.timeout(ms);
+  const c = new AbortController();
+  setTimeout(()=>c.abort(), ms);
+  return c.signal;
+}}
 
 // ═══════════════════════════════════════════════
 //  HART Design System — Component Library
@@ -1630,7 +1650,7 @@ function dsSlider(opts) {{
     (id?' id="'+id+'"':'')+
     ' oninput="'+
     (oninput?oninput.replace(/"/g,'&quot;')+';':'')+
-    (id?'document.getElementById(\\''+id+'-val\\').textContent=this.value+\\''+unit+'\\';':'')+
+    (id?'document.getElementById("'+id+'-val").textContent=this.value+""+unit+"";':'')+
     '">';
   if(id) html += '<span class="ds-label-md" id="'+id+'-val" style="min-width:40px;text-align:right">'+value+unit+'</span>';
   html += '</div>';
@@ -1768,7 +1788,7 @@ function dsPrompt(title, message, opts) {{
       title: title,
       body: '<div class="ds-body-md ds-text-muted" style="margin-bottom:var(--ds-space-4)">'+(message||'')+'</div>'+
         '<input class="ds-input" type="'+inputType+'" id="ds-prompt-input" placeholder="'+placeholder+'" value="'+defaultValue+'"'+
-        ' onkeydown="if(event.key===\\'Enter\\')document.getElementById(\\'ds-prompt-ok\\').click()">',
+        ' onkeydown="if(event.key===&quot;Enter&quot;)document.getElementById(&quot;ds-prompt-ok&quot;).click()">',
       actions: [
         {{ label: 'Cancel', variant: 'text', action: function(){{ dsModalClose(); resolve(null); }} }},
         {{ label: opts.okLabel||'OK', variant: 'primary', action: function(){{
@@ -1859,7 +1879,7 @@ function updateTaskbar() {{
     const active = id===focusedPanel ? 'active' : '';
     const icon = info.icon || 'web_asset';
     const title = info.title || id;
-    return '<div class="taskbar-chip glass '+active+'" onclick="taskbarClick(\\''+id+'\\')" title="'+title+'">' +
+    return '<div class="taskbar-chip glass '+active+'" data-panel-id="'+id+'" onclick="taskbarClick(this.dataset.panelId)" title="'+title+'">' +
       '<span class="mi material-icons-round">'+icon+'</span>' +
       '<span class="chip-label">'+title+'</span></div>';
   }}).join('');
@@ -1897,11 +1917,11 @@ function tickClock() {{
   if(ld) ld.textContent = d;
 }}
 setInterval(tickClock, PERF.clockMs);
-tickClock();
+try {{ tickClock(); }} catch(e) {{ console.error('[HART] tickClock:', e); }}
 
 // ═══ Agent Status (top bar) ═══
 function refreshAgentStatus() {{
-  fetch(BACKEND+'/api/social/dashboard/agents',{{signal:AbortSignal.timeout(3000)}})
+  fetch(BACKEND+'/api/social/dashboard/agents',{{signal:_sig(3000)}})
     .then(r=>r.json()).then(data=>{{
       const bar = document.getElementById('agent-status');
       const agents = (data.agents||[]).filter(a=>a.status==='running');
@@ -1913,7 +1933,7 @@ function refreshAgentStatus() {{
     }}).catch(()=>{{}});
 }}
 setInterval(refreshAgentStatus, PERF.agentStatusMs);
-refreshAgentStatus();
+try {{ refreshAgentStatus(); }} catch(e) {{ console.error('[HART] refreshAgentStatus:', e); }}
 
 // ═══ Start Menu ═══
 function buildStartMenu() {{
@@ -1924,7 +1944,7 @@ function buildStartMenu() {{
     if(!items.length) return;
     html += '<div class="start-group"><div class="start-group-label">'+group+'</div><div class="start-grid">';
     items.forEach(([id,p])=>{{
-      html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(\\''+id+'\\')">';
+      html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(this.dataset.id)">';
       html += '<span class="mi material-icons-round">'+(p.icon||'apps')+'</span>';
       html += '<span class="label">'+p.title+'</span></div>';
     }});
@@ -1935,7 +1955,7 @@ function buildStartMenu() {{
   if(sysItems.length) {{
     html += '<div class="start-group"><div class="start-group-label">System</div><div class="start-grid">';
     sysItems.forEach(([id,p])=>{{
-      html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(\\''+id+'\\')">';
+      html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(this.dataset.id)">';
       html += '<span class="mi material-icons-round">'+(p.icon||'settings')+'</span>';
       html += '<span class="label">'+p.title+'</span></div>';
     }});
@@ -1943,7 +1963,7 @@ function buildStartMenu() {{
   }}
   scroll.innerHTML = html;
 }}
-buildStartMenu();
+try {{ buildStartMenu(); }} catch(e) {{ console.error('[HART] buildStartMenu:', e); }}
 
 function toggleStartMenu() {{
   const m = document.getElementById('start-menu');
@@ -1998,22 +2018,23 @@ function openPanel(id, opts) {{
   const panel = document.createElement('div');
   panel.className = 'panel glass';
   panel.id = 'panel-'+id;
+  panel.dataset.panelId = id;
   panel.style.cssText = 'left:'+x+'px;top:'+y+'px;width:'+sz[0]+'px;height:'+sz[1]+'px;z-index:'+(++panelZ);
 
   const title = opts.title || def.title || id;
   const icon = def.icon || 'web_asset';
 
-  panel.innerHTML = '<div class="panel-titlebar" onmousedown="startDrag(event,\\''+id+'\\')"'+
-    ' ondblclick="toggleMax(\\''+id+'\\')">'+
+  panel.innerHTML = '<div class="panel-titlebar" onmousedown="startDrag(event,_pid(this))"'+
+    ' ondblclick="toggleMax(_pid(this))">'+
     '<span class="mi material-icons-round">'+icon+'</span>'+
     '<span class="title">'+title+'</span>'+
     '<div class="ctrl">'+
-    '<span title="Minimize" onclick="minimizePanel(\\''+id+'\\')"><span class="mi material-icons-round" style="font-size:14px">minimize</span></span>'+
-    '<span title="Maximize" onclick="toggleMax(\\''+id+'\\')"><span class="mi material-icons-round" style="font-size:14px">crop_square</span></span>'+
-    '<span class="close" title="Close" onclick="closePanel(\\''+id+'\\')"><span class="mi material-icons-round" style="font-size:14px">close</span></span>'+
+    '<span title="Minimize" onclick="minimizePanel(_pid(this))"><span class="mi material-icons-round" style="font-size:14px">minimize</span></span>'+
+    '<span title="Maximize" onclick="toggleMax(_pid(this))"><span class="mi material-icons-round" style="font-size:14px">crop_square</span></span>'+
+    '<span class="close" title="Close" onclick="closePanel(_pid(this))"><span class="mi material-icons-round" style="font-size:14px">close</span></span>'+
     '</div></div>'+
     '<div class="panel-body" id="panel-body-'+id+'"></div>'+
-    '<div class="panel-resize" onmousedown="startResize(event,\\''+id+'\\')"></div>';
+    '<div class="panel-resize" onmousedown="startResize(event,_pid(this))"></div>';
 
   document.getElementById('panels').appendChild(panel);
   panel.addEventListener('mousedown', ()=>bringToFront(id));
@@ -2025,7 +2046,7 @@ function openPanel(id, opts) {{
   }} else if(def.route) {{
     if(PERF.lazyIframes) {{
       // Potato: placeholder until focused, then load iframe
-      body.innerHTML = '<div class="native-content" style="display:flex;align-items:center;justify-content:center;height:100%"><span class="mi material-icons-round" style="font-size:48px;color:var(--hart-muted);cursor:pointer" onclick="loadIframe(\\''+id+'\\',\\''+def.route+'\\')">touch_app</span></div>';
+      body.innerHTML = '<div class="native-content" style="display:flex;align-items:center;justify-content:center;height:100%"><span class="mi material-icons-round" style="font-size:48px;color:var(--hart-muted);cursor:pointer" data-route="'+def.route+'" onclick="loadIframe(_pid(this),this.dataset.route)">touch_app</span></div>';
       body.dataset.route = def.route;
       body.dataset.loaded = '0';
     }} else {{
@@ -2236,7 +2257,7 @@ function metricBar(l,p,u,s) {{ return dsMetricBar(l,p,u,s); }}
 function statusRow(i,l,v,c) {{ return dsStatusRow(i,l,v,c); }}
 
 function loadHardwareMonitor(el, apis) {{
-  Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}}))))
+  Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:_sig(3000)}}).then(r=>r.json()).catch(()=>({{}}))))
     .then(([sys,caps])=>{{
       const cpu=sys.cpu_percent||0, ram_used=sys.ram_used_gb||0, ram_total=sys.ram_total_gb||0;
       const disk_used=sys.disk_used_gb||0, disk_total=sys.disk_total_gb||0;
@@ -2255,7 +2276,7 @@ function loadHardwareMonitor(el, apis) {{
 }}
 
 function loadSecurityCenter(el, apis) {{
-  Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}}))))
+  Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:_sig(3000)}}).then(r=>r.json()).catch(()=>({{}}))))
     .then(([health,guardrail])=>{{
       const ghash = guardrail.guardrail_hash||'unknown';
       const wm = health.world_model||{{}};
@@ -2281,7 +2302,7 @@ function wifiConnect(ssid) {{
     showToast('WiFi', 'Connecting to '+ssid+'...', 'info');
     fetch(SHELL+'/api/shell/network/wifi/connect', {{
       method:'POST', headers:{{'Content-Type':'application/json'}},
-      body:JSON.stringify(body), signal:AbortSignal.timeout(35000)
+      body:JSON.stringify(body), signal:_sig(35000)
     }}).then(r=>r.json()).then(d=>{{
       if(d.success) {{ showToast('WiFi', 'Connected to '+ssid, 'success'); loadNetworkPanel(document.getElementById('sys-network'),
         (SYSTEM_PANELS['network']||{{}}).apis||[]); }}
@@ -2294,7 +2315,7 @@ function wifiDisconnect() {{
     if(!ok) return;
     fetch(SHELL+'/api/shell/network/wifi/disconnect', {{
       method:'POST', headers:{{'Content-Type':'application/json'}},
-      body:'{{}}', signal:AbortSignal.timeout(15000)
+      body:'{{}}', signal:_sig(15000)
     }}).then(r=>r.json()).then(d=>{{
       if(d.success) {{ showToast('WiFi', 'Disconnected', 'info'); loadNetworkPanel(document.getElementById('sys-network'),
         (SYSTEM_PANELS['network']||{{}}).apis||[]); }}
@@ -2305,9 +2326,9 @@ function wifiDisconnect() {{
 
 function loadNetworkPanel(el, apis) {{
   Promise.all([
-    ...apis.map(u=>fetch(BACKEND+u,{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}}))),
-    fetch(SHELL+'/api/shell/network/wifi',{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}})),
-    fetch(SHELL+'/api/shell/network/status',{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).catch(()=>({{}}))
+    ...apis.map(u=>fetch(BACKEND+u,{{signal:_sig(3000)}}).then(r=>r.json()).catch(()=>({{}}))),
+    fetch(SHELL+'/api/shell/network/wifi',{{signal:_sig(3000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+'/api/shell/network/status',{{signal:_sig(3000)}}).then(r=>r.json()).catch(()=>({{}}))
   ]).then(results=>{{
       const topo = results[0]||{{}};
       const wifi = results[results.length-2]||{{}};
@@ -2345,7 +2366,7 @@ function loadNetworkPanel(el, apis) {{
         if(available.length>0) {{
           html += '<div class="ds-section-label">Available WiFi Networks</div><div class="ds-stagger">';
           html += available.slice(0,6).map(n=>
-            '<div class="ds-list-item ds-list-item-interactive" onclick="wifiConnect(\\''+n.ssid.replace(/'/g,"\\\\'")+'\\')">' +
+            '<div class="ds-list-item ds-list-item-interactive" data-ssid="'+n.ssid+'" onclick="wifiConnect(this.dataset.ssid)">' +
             '<span class="mi material-icons-round ds-list-item-icon ds-text-accent">wifi</span>' +
             '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+n.ssid+'</div>'+
             '<div class="ds-list-item-secondary">'+n.security+'</div></div>' +
@@ -2362,16 +2383,16 @@ function loadNetworkPanel(el, apis) {{
 function loadHartIdentityPanel(el, apis) {{
   const profileUrl = apis[0] || '/api/onboarding/profile';
   const statusUrl = apis[1] || '/api/onboarding/status';
-  fetch(SHELL+statusUrl,{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).then(st=>{{
+  fetch(SHELL+statusUrl,{{signal:_sig(3000)}}).then(r=>r.json()).then(st=>{{
     if(!st.onboarded) {{
       el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">My HART</div>'+
         '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-3" style="padding:40px 0">'+
         '<span class="mi material-icons-round ds-text-muted" style="font-size:48px">person_outline</span>'+
-        '<div class="ds-body-md ds-text-muted">You haven\\'t lit your HART yet.</div>'+
+        '<div class="ds-body-md ds-text-muted">You haven&#39;t lit your HART yet.</div>'+
         dsBtn('Light Your HART',{{variant:'primary', onclick:"fetch(SHELL+'/api/onboarding/start',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{user_id:'1'}})}}).then(()=>showToast('Onboarding','Opening onboarding...','info')).catch(()=>{{}})"}})+'</div></div>';
       return;
     }}
-    fetch(SHELL+profileUrl,{{signal:AbortSignal.timeout(3000)}}).then(r=>r.json()).then(p=>{{
+    fetch(SHELL+profileUrl,{{signal:_sig(3000)}}).then(r=>r.json()).then(p=>{{
       el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">My HART</div>'+
         '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-3" style="padding:24px 0">'+
         '<span class="mi material-icons-round ds-text-accent" style="font-size:56px">badge</span>'+
@@ -2396,7 +2417,7 @@ function selfBuildInstall() {{
     showToast('Self-Build','Staging '+pkg+'...','info');
     fetch(SHELL+'/api/system/self-build/install',{{
       method:'POST', headers:{{'Content-Type':'application/json'}},
-      body:JSON.stringify({{package:pkg}}), signal:AbortSignal.timeout(10000)
+      body:JSON.stringify({{package:pkg}}), signal:_sig(10000)
     }}).then(r=>r.json()).then(d=>{{
       if(d.success) {{ showToast('Self-Build','Staged: '+pkg,'success'); loadSelfBuildPanel(document.getElementById('sys-self_build'),
         (SYSTEM_PANELS['self_build']||{{}}).apis||[]); }}
@@ -2409,7 +2430,7 @@ function selfBuildRemove(pkg) {{
     if(!ok) return;
     fetch(SHELL+'/api/system/self-build/remove',{{
       method:'POST', headers:{{'Content-Type':'application/json'}},
-      body:JSON.stringify({{package:pkg}}), signal:AbortSignal.timeout(10000)
+      body:JSON.stringify({{package:pkg}}), signal:_sig(10000)
     }}).then(r=>r.json()).then(d=>{{
       if(d.success) {{ showToast('Self-Build','Removed: '+pkg,'info'); loadSelfBuildPanel(document.getElementById('sys-self_build'),
         (SYSTEM_PANELS['self_build']||{{}}).apis||[]); }}
@@ -2423,7 +2444,7 @@ function selfBuildTrigger(mode) {{
     showToast('Self-Build','Building ('+mode+')...','info');
     fetch(SHELL+'/api/system/self-build/trigger',{{
       method:'POST', headers:{{'Content-Type':'application/json'}},
-      body:JSON.stringify({{mode:mode}}), signal:AbortSignal.timeout(600000)
+      body:JSON.stringify({{mode:mode}}), signal:_sig(600000)
     }}).then(r=>r.json()).then(d=>{{
       if(d.success) showToast('Self-Build','Build complete!','success');
       else dsAlert('Build Failed', d.error||d.stderr||'Unknown error', 'error');
@@ -2437,8 +2458,8 @@ function loadSelfBuildPanel(el, apis) {{
   const statusUrl = apis[0] || '/api/system/self-build/status';
   const pkgsUrl = apis[1] || '/api/system/self-build/packages';
   Promise.all([
-    fetch(SHELL+statusUrl,{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
-    fetch(SHELL+pkgsUrl,{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))
+    fetch(SHELL+statusUrl,{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+pkgsUrl,{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}}))
   ]).then(([status,pkgData])=>{{
     const gen = status.generation||'?';
     const version = status.nixos_version||'unknown';
@@ -2461,7 +2482,7 @@ function loadSelfBuildPanel(el, apis) {{
       html += pkgs.map(p=>
         '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent">inventory_2</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+p+'</div></div>'+
-        '<span class="ds-list-item-trailing" style="cursor:pointer" onclick="selfBuildRemove(\\''+p.replace(/'/g,"\\\\'")+'\\')">' +
+        '<span class="ds-list-item-trailing" style="cursor:pointer" data-pkg="'+p+'" onclick="selfBuildRemove(this.dataset.pkg)">' +
         '<span class="mi material-icons-round ds-text-muted" style="font-size:18px">delete_outline</span></span></div>'
       ).join('');
       html += '</div>';
@@ -2481,7 +2502,7 @@ function loadSelfBuildPanel(el, apis) {{
 
 // ═══ Keyboard Shortcuts ═══
 function loadKeyboardShortcutsPanel(el) {{
-  fetch(SHELL+'/api/shell/shortcuts',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/shortcuts',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const profile = data.profile||'windows';
     const profiles = data.available_profiles||['windows','mac'];
     const sc = data.shortcuts||{{}};
@@ -2504,7 +2525,7 @@ function loadKeyboardShortcutsPanel(el) {{
       html += '<div class="ds-section-label">'+group+'</div><div class="ds-stagger">';
       groups[group].forEach(key=>{{
         if(!sc[key]) return;
-        const label = key.replace(/_/g,' ').replace(/\\b\w/g,c=>c.toUpperCase());
+        const label = key.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
         html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-muted">keyboard</span>'+
           '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+label+'</div></div>'+
           '<span class="ds-list-item-trailing"><code style="background:#1a1a1a;padding:2px 8px;border-radius:4px;font-size:12px;color:var(--hart-accent)">'+sc[key]+'</code></span></div>';
@@ -2519,8 +2540,8 @@ function loadKeyboardShortcutsPanel(el) {{
 // ═══ Task Manager ═══
 function loadTaskManagerPanel(el) {{
   Promise.all([
-    fetch(SHELL+'/api/shell/tasks/processes',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
-    fetch(SHELL+'/api/shell/tasks/resources',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))
+    fetch(SHELL+'/api/shell/tasks/processes',{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+'/api/shell/tasks/resources',{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}}))
   ]).then(([procData,res])=>{{
     const procs = procData.processes||[];
     const cpu = res.cpu_percent||0, mem = res.memory_percent||0;
@@ -2552,8 +2573,8 @@ function taskKill(pid) {{
 // ═══ Storage ═══
 function loadStoragePanel(el) {{
   Promise.all([
-    fetch(SHELL+'/api/shell/storage',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
-    fetch(SHELL+'/api/shell/storage/cleanup',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))
+    fetch(SHELL+'/api/shell/storage',{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+'/api/shell/storage/cleanup',{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}}))
   ]).then(([st,cl])=>{{
     const disks = st.disks||[];
     const cleanable = cl.total_cleanable_mb||0;
@@ -2571,7 +2592,7 @@ function loadStoragePanel(el) {{
 
 // ═══ Startup Apps ═══
 function loadStartupAppsPanel(el) {{
-  fetch(SHELL+'/api/shell/startup',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/startup',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const apps = data.apps||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Startup Apps</div><div class="ds-stagger">';
     if(apps.length===0) html += '<div class="ds-body-md ds-text-muted">No startup apps configured</div>';
@@ -2579,7 +2600,7 @@ function loadStartupAppsPanel(el) {{
       html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon '+(a.enabled?'ds-text-active':'ds-text-muted')+'">play_circle</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+a.name+'</div>'+
         '<div class="ds-list-item-secondary">'+(a.comment||a.exec||'')+'</div></div>'+
-        '<label class="ds-switch"><input type="checkbox" '+(a.enabled?'checked':'')+' onchange="toggleStartup(\\''+a.id+'\\',this.checked)"><span class="ds-switch-slider"></span></label></div>';
+        '<label class="ds-switch"><input type="checkbox" '+(a.enabled?'checked':'')+' data-id="'+a.id+'" onchange="toggleStartup(this.dataset.id,this.checked)"><span class="ds-switch-slider"></span></label></div>';
     }});
     html += '</div></div>';
     el.innerHTML = html;
@@ -2591,7 +2612,7 @@ function toggleStartup(id,en) {{
 
 // ═══ Bluetooth Manager ═══
 function loadBluetoothManagerPanel(el) {{
-  fetch(SHELL+'/api/shell/bluetooth/status',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/bluetooth/status',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const devs = data.devices||[];
     const powered = data.powered!==false;
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Bluetooth</span>'+
@@ -2610,7 +2631,7 @@ function loadBluetoothManagerPanel(el) {{
 
 // ═══ Print Manager ═══
 function loadPrintManagerPanel(el) {{
-  fetch(SHELL+'/api/shell/printers',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/printers',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const printers = data.printers||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Printers</div><div class="ds-stagger">';
     if(printers.length===0) html += '<div class="ds-body-md ds-text-muted">No printers found</div>';
@@ -2625,7 +2646,7 @@ function loadPrintManagerPanel(el) {{
 
 // ═══ Media Library ═══
 function loadMediaLibraryPanel(el) {{
-  fetch(SHELL+'/api/shell/media/status',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/media/status',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Media Library</div>';
     html += '<div class="ds-flex ds-gap-3 ds-flex-wrap">';
     html += dsCard('<div class="ds-metric"><div class="ds-metric-value ds-text-accent">'+(data.photo_count||0)+'</div><div class="ds-metric-label">Photos</div></div>',{{elevated:true}});
@@ -2638,7 +2659,7 @@ function loadMediaLibraryPanel(el) {{
 
 // ═══ File Manager ═══
 function loadFileManagerPanel(el) {{
-  fetch(SHELL+'/api/shell/files/browse?path=~',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/files/browse?path=~',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const items = data.items||[];
     const cwd = data.path||'~';
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Files</span>'+
@@ -2647,7 +2668,7 @@ function loadFileManagerPanel(el) {{
       const icon = f.is_dir?'folder':'description';
       const size = f.is_dir?'':' &middot; '+(f.size_human||'');
       html += '<div class="ds-list-item'+(f.is_dir?' ds-list-item-interactive':'')+'"'+
-        (f.is_dir?' onclick="browseDir(\\''+f.path.replace(/'/g,"\\\\'")+'\\');"':'')+'>'+
+        (f.is_dir?' data-path="'+f.path+'" onclick="browseDir(this.dataset.path);"':'')+'>'+
         '<span class="mi material-icons-round ds-list-item-icon '+(f.is_dir?'ds-text-accent':'ds-text-muted')+'">'+icon+'</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+f.name+'</div>'+
         '<div class="ds-list-item-secondary">'+(f.modified||'')+size+'</div></div></div>';
@@ -2660,20 +2681,20 @@ function browseDir(path) {{
   const el = document.getElementById('sys-file_manager');
   if(!el) return;
   el.innerHTML = dsSkeleton('panel',3);
-  fetch(SHELL+'/api/shell/files/browse?path='+encodeURIComponent(path),{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/files/browse?path='+encodeURIComponent(path),{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const items = data.items||[];
     const cwd = data.path||path;
     const parent = data.parent||'';
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Files</span>'+
       '<span class="ds-label-sm ds-text-muted">'+cwd+'</span></div>';
-    if(parent) html += '<div class="ds-list-item ds-list-item-interactive" onclick="browseDir(\\''+parent.replace(/'/g,"\\\\'")+'\\')">'+
+    if(parent) html += '<div class="ds-list-item ds-list-item-interactive" data-path="'+parent+'" onclick="browseDir(this.dataset.path)">'+
       '<span class="mi material-icons-round ds-list-item-icon ds-text-muted">arrow_back</span>'+
       '<div class="ds-list-item-content"><div class="ds-list-item-primary">..</div></div></div>';
     html += '<div class="ds-stagger">';
     items.slice(0,30).forEach(f=>{{
       const icon = f.is_dir?'folder':'description';
       html += '<div class="ds-list-item'+(f.is_dir?' ds-list-item-interactive':'')+'"'+
-        (f.is_dir?' onclick="browseDir(\\''+f.path.replace(/'/g,"\\\\'")+'\\');"':'')+'>'+
+        (f.is_dir?' data-path="'+f.path+'" onclick="browseDir(this.dataset.path);"':'')+'>'+
         '<span class="mi material-icons-round ds-list-item-icon '+(f.is_dir?'ds-text-accent':'ds-text-muted')+'">'+icon+'</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+f.name+'</div></div></div>';
     }});
@@ -2690,7 +2711,7 @@ function loadTerminalPanel(el) {{
     '<div style="display:flex;align-items:center;margin-top:8px">'+
     '<span style="color:#a0ffa0;margin-right:4px">$</span>'+
     '<input id="term-input" type="text" style="flex:1;background:transparent;border:none;color:#a0ffa0;font-family:monospace;font-size:13px;outline:none" '+
-    'placeholder="Type command..." onkeydown="if(event.key===\\'Enter\\')termExec()">'+
+    'placeholder="Type command..." onkeydown="if(event.key===&quot;Enter&quot;)termExec()">'+
     '</div></div></div>';
 }}
 function termExec() {{
@@ -2702,7 +2723,7 @@ function termExec() {{
   inp.value = '';
   out.textContent += '$ '+cmd+'\\n';
   fetch(SHELL+'/api/shell/terminal/exec',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{command:cmd}}),signal:AbortSignal.timeout(30000)}}
+    body:JSON.stringify({{command:cmd}}),signal:_sig(30000)}}
   ).then(r=>r.json()).then(d=>{{
     out.textContent += (d.stdout||'')+(d.stderr?'\\n'+d.stderr:'')+'\\n';
     out.scrollTop = out.scrollHeight;
@@ -2711,7 +2732,7 @@ function termExec() {{
 
 // ═══ User Accounts ═══
 function loadUserAccountsPanel(el) {{
-  fetch(SHELL+'/api/shell/users',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/users',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const users = data.users||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">User Accounts</div><div class="ds-stagger">';
     users.forEach(u=>{{
@@ -2725,7 +2746,7 @@ function loadUserAccountsPanel(el) {{
 
 // ═══ Notification Center ═══
 function loadNotificationCenterPanel(el) {{
-  fetch(SHELL+'/api/shell/notifications',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/notifications',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const notifs = data.notifications||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Notifications</div><div class="ds-stagger">';
     if(notifs.length===0) html += '<div class="ds-body-md ds-text-muted">No notifications</div>';
@@ -2742,7 +2763,7 @@ function loadNotificationCenterPanel(el) {{
 
 // ═══ Updates ═══
 function loadUpdatesPanel(el) {{
-  fetch(BACKEND+'/api/upgrades/status',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(BACKEND+'/api/upgrades/status',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">System Updates</div>';
     html += dsStatusRow('system_update', 'Current Version', data.current_version||'unknown', 'var(--hart-active)');
     if(data.new_version) html += dsStatusRow('upgrade', 'Available', data.new_version, 'var(--hart-accent)');
@@ -2755,7 +2776,7 @@ function loadUpdatesPanel(el) {{
 
 // ═══ Backup & Restore ═══
 function loadBackupRestorePanel(el) {{
-  fetch(SHELL+'/api/shell/backup/list',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/backup/list',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const backups = data.backups||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Backup &amp; Restore</div><div class="ds-stagger">';
     if(backups.length===0) html += '<div class="ds-body-md ds-text-muted">No backups found</div>';
@@ -2769,7 +2790,7 @@ function loadBackupRestorePanel(el) {{
 
 // ═══ Devices & Mesh ═══
 function loadDevicesPanel(el) {{
-  fetch(SHELL+'/api/shell/devices',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/devices',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const devs = data.devices||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Devices &amp; Mesh</div><div class="ds-stagger">';
     if(devs.length===0) html += '<div class="ds-body-md ds-text-muted">No paired devices</div>';
@@ -2784,7 +2805,7 @@ function loadDevicesPanel(el) {{
 
 // ═══ Language & Region ═══
 function loadI18nPanel(el) {{
-  fetch(SHELL+'/api/shell/i18n/locales',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/i18n/locales',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const current = data.current||'en';
     const locales = data.available||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Language &amp; Region</div>';
@@ -2793,7 +2814,7 @@ function loadI18nPanel(el) {{
     locales.slice(0,15).forEach(l=>{{
       const active = l.code===current;
       html += '<div class="ds-list-item'+(active?'':' ds-list-item-interactive')+'"'+
-        (active?'':' onclick="setLocale(\\''+l.code+'\\')"')+'>'+
+        (active?'':' data-code="'+l.code+'" onclick="setLocale(this.dataset.code)"')+'>'+
         '<span class="mi material-icons-round ds-list-item-icon '+(active?'ds-text-active':'ds-text-muted')+'">translate</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+(l.name||l.code)+'</div></div>'+
         (active?'<span class="ds-list-item-trailing ds-text-active"><span class="mi material-icons-round">check</span></span>':'')+
@@ -2810,7 +2831,7 @@ function setLocale(code) {{
 
 // ═══ Accessibility ═══
 function loadAccessibilityPanel(el) {{
-  fetch(SHELL+'/api/shell/accessibility',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/accessibility',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Accessibility</div><div class="ds-stagger">';
     const items = [
       ['contrast', 'High Contrast', 'high_contrast', data.high_contrast],
@@ -2822,7 +2843,7 @@ function loadAccessibilityPanel(el) {{
     items.forEach(([icon,label,key,val])=>{{
       html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent" aria-hidden="true">'+icon+'</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+label+'</div></div>'+
-        '<label class="ds-switch"><input type="checkbox" role="switch" aria-label="'+label+'" '+(val?'checked':'')+' onchange="toggleA11y(\\''+key+'\\',this.checked)"><span class="ds-switch-slider"></span></label></div>';
+        '<label class="ds-switch"><input type="checkbox" role="switch" aria-label="'+label+'" '+(val?'checked':'')+' data-key="'+key+'" onchange="toggleA11y(this.dataset.key,this.checked)"><span class="ds-switch-slider"></span></label></div>';
     }});
     const _fsv = data.font_scale || 1;
     html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent" aria-hidden="true">format_size</span>'+
@@ -2874,7 +2895,7 @@ function loadFirewallPanel(el) {{
 
 // ═══ Default Apps ═══
 function loadDefaultAppsPanel(el) {{
-  fetch(SHELL+'/api/shell/default-apps',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/default-apps',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const apps = data.defaults||{{}};
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Default Apps</div><div class="ds-stagger">';
     const cats = [['web-browser','Web Browser','public'],['text-editor','Text Editor','edit_note'],
@@ -2892,14 +2913,14 @@ function loadDefaultAppsPanel(el) {{
 
 // ═══ Font Manager ═══
 function loadFontManagerPanel(el) {{
-  fetch(SHELL+'/api/shell/fonts',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/fonts',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const fonts = data.fonts||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Fonts</span>'+
       '<span class="ds-chip"><span class="ds-chip-dot" style="background:var(--hart-accent)"></span>'+fonts.length+' installed</span></div>';
     html += '<div class="ds-stagger">';
     fonts.slice(0,20).forEach(f=>{{
       html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent">font_download</span>'+
-        '<div class="ds-list-item-content"><div class="ds-list-item-primary" style="font-family:\\''+f.family+'\\'">'+f.family+'</div>'+
+        '<div class="ds-list-item-content"><div class="ds-list-item-primary" data-font="'+f.family+'">'+f.family+'</div>'+
         '<div class="ds-list-item-secondary">'+(f.style||f.styles||'')+'</div></div></div>';
     }});
     html += '</div></div>';
@@ -2907,9 +2928,35 @@ function loadFontManagerPanel(el) {{
   }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Fonts unavailable</div>'; }});
 }}
 
+// ── Shell action helpers (avoid quote-escaping in inline onclick) ──
+function _shellPost(url, body, onOk) {{
+  fetch(SHELL+url, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(body)}})
+    .then(()=>{{ if(onOk) onOk(); }}).catch(()=>{{}});
+}}
+function shellSetSoundTheme(el) {{
+  _shellPost('/api/shell/sounds/set-theme', {{theme:el.dataset.theme}},
+    ()=>loadSoundManagerPanel(document.getElementById('sys-sound_manager')));
+}}
+function shellCopyClipboard(el) {{
+  _shellPost('/api/shell/clipboard/copy', {{text:el.dataset.clip}},
+    ()=>showToast('Clipboard','Copied','info'));
+}}
+function shellSetWallpaper(el) {{
+  _shellPost('/api/shell/wallpaper/set', {{path:el.dataset.path}},
+    ()=>showToast('Wallpaper','Set','success'));
+}}
+function shellDeleteNote(el) {{
+  _shellPost('/api/shell/notes/delete', {{id:el.dataset.id}},
+    ()=>loadNotesAppPanel(document.getElementById('sys-notes_app')));
+}}
+function shellRestoreTrash(el) {{
+  _shellPost('/api/shell/trash/restore', {{path:el.dataset.path}},
+    ()=>loadTrashBinPanel(document.getElementById('sys-trash_bin')));
+}}
+
 // ═══ Sound Manager ═══
 function loadSoundManagerPanel(el) {{
-  fetch(SHELL+'/api/shell/sounds/themes',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/sounds/themes',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const themes = data.themes||[];
     const current = data.current||'freedesktop';
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Sound Theme</div>';
@@ -2917,7 +2964,7 @@ function loadSoundManagerPanel(el) {{
     html += '<div class="ds-stagger">';
     themes.forEach(t=>{{
       html += '<div class="ds-list-item'+(t===current?'':' ds-list-item-interactive')+'"'+
-        (t===current?'':' onclick="fetch(SHELL+\\'/api/shell/sounds/set-theme\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{theme:\\''+t+'\\'}})}}).then(()=>loadSoundManagerPanel(document.getElementById(\\'sys-sound_manager\\')))"')+'>'+
+        (t===current?'':' data-theme="'+t+'" onclick="shellSetSoundTheme(this)"')+'>'+
         '<span class="mi material-icons-round ds-list-item-icon '+(t===current?'ds-text-active':'ds-text-muted')+'">volume_up</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+t+'</div></div>'+
         (t===current?'<span class="ds-list-item-trailing ds-text-active"><span class="mi material-icons-round">check</span></span>':'')+
@@ -2930,7 +2977,7 @@ function loadSoundManagerPanel(el) {{
 
 // ═══ Clipboard ═══
 function loadClipboardPanel(el) {{
-  fetch(SHELL+'/api/shell/clipboard/history',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/clipboard/history',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const items = data.history||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Clipboard</span>'+
       dsBtn('Clear',{{variant:'secondary',cls:'ds-btn-sm',onclick:"fetch(SHELL+'/api/shell/clipboard/clear',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}}).then(()=>loadClipboardPanel(document.getElementById('sys-clipboard_manager')))"}})+
@@ -2938,7 +2985,7 @@ function loadClipboardPanel(el) {{
     if(items.length===0) html += '<div class="ds-body-md ds-text-muted">Clipboard empty</div>';
     else items.slice(0,15).forEach((c,i)=>{{
       const preview = (c.text||c.content||'').substring(0,80);
-      html += '<div class="ds-list-item ds-list-item-interactive" onclick="fetch(SHELL+\\'/api/shell/clipboard/copy\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{text:\\''+preview.replace(/'/g,"\\\\'").replace(/\\n/g,' ')+'\\'}})}}); showToast(\\'Clipboard\\',\\'Copied\\',\\'info\\')">'+
+      html += '<div class="ds-list-item ds-list-item-interactive" data-clip="'+preview+'" onclick="shellCopyClipboard(this)">'+
         '<span class="mi material-icons-round ds-list-item-icon ds-text-muted">content_paste</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary ds-truncate">'+preview+'</div>'+
         '<div class="ds-list-item-secondary">'+(c.time||'')+(c.pinned?' &middot; Pinned':'')+'</div></div></div>';
@@ -2950,7 +2997,7 @@ function loadClipboardPanel(el) {{
 
 // ═══ Date & Time ═══
 function loadDateTimePanel(el) {{
-  fetch(SHELL+'/api/shell/datetime',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/datetime',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Date &amp; Time</div>';
     html += '<div class="ds-flex ds-flex-center ds-flex-col ds-gap-2" style="padding:16px 0">'+
       '<div class="ds-display-sm ds-text-accent">'+(data.time||'')+'</div>'+
@@ -2975,7 +3022,7 @@ function loadWallpaperPanel(el) {{
 
 // ═══ Keyboard & Input Methods ═══
 function loadInputMethodsPanel(el) {{
-  fetch(SHELL+'/api/shell/input-methods',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/input-methods',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const layout = data.layout||'us';
     const variant = data.variant||'';
     const methods = data.input_methods||[];
@@ -3057,7 +3104,7 @@ function loadImageViewerPanel(el) {{
 
 // ═══ Notes ═══
 function loadNotesAppPanel(el) {{
-  fetch(SHELL+'/api/shell/notes',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/notes',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const notes = data.notes||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Notes</span>'+
       dsBtn('New',{{variant:'primary',cls:'ds-btn-sm',onclick:"dsPrompt('New Note','',{{placeholder:'Write your note...',okLabel:'Save'}}).then(c=>{{if(!c)return;fetch(SHELL+'/api/shell/notes',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{content:c}})}}).then(()=>loadNotesAppPanel(document.getElementById('sys-notes_app')))}})"}})+'</div>';
@@ -3067,7 +3114,7 @@ function loadNotesAppPanel(el) {{
       html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-accent">sticky_note_2</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary ds-truncate">'+(n.content||'').substring(0,80)+'</div>'+
         '<div class="ds-list-item-secondary">'+(n.created||n.date||'')+'</div></div>'+
-        '<span class="ds-list-item-trailing" style="cursor:pointer" onclick="fetch(SHELL+\\'/api/shell/notes/delete\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{id:\\''+n.id+'\\'}})}}).then(()=>loadNotesAppPanel(document.getElementById(\\'sys-notes_app\\')))">'+
+        '<span class="ds-list-item-trailing" style="cursor:pointer" data-id="'+n.id+'" onclick="shellDeleteNote(this)">'+
         '<span class="mi material-icons-round ds-text-muted" style="font-size:18px">delete_outline</span></span></div>';
     }});
     html += '</div></div>';
@@ -3088,7 +3135,7 @@ function appStoreSearch() {{
   const r = document.getElementById('appstore-results');
   if(!q||!r||!q.value.trim()) return;
   r.innerHTML = dsSkeleton('panel',2);
-  fetch(SHELL+'/api/apps/search?q='+encodeURIComponent(q.value),{{signal:AbortSignal.timeout(15000)}}).then(r2=>r2.json()).then(data=>{{
+  fetch(SHELL+'/api/apps/search?q='+encodeURIComponent(q.value),{{signal:_sig(15000)}}).then(r2=>r2.json()).then(data=>{{
     const pkgs = data.results||[];
     if(pkgs.length===0) {{ r.innerHTML='<div class="ds-body-md ds-text-muted">No packages found</div>'; return; }}
     r.innerHTML = pkgs.slice(0,15).map(p=>
@@ -3102,7 +3149,7 @@ function appStoreSearch() {{
 
 // ═══ App Permissions ═══
 function loadAppPermissionsPanel(el) {{
-  fetch(SHELL+'/api/apps/installed',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/apps/installed',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const apps = data.apps||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">App Permissions</div><div class="ds-stagger">';
     if(apps.length===0) html += '<div class="ds-body-md ds-text-muted">No apps installed</div>';
@@ -3117,7 +3164,7 @@ function loadAppPermissionsPanel(el) {{
 
 // ═══ Battery Monitor ═══
 function loadBatteryMonitorPanel(el) {{
-  fetch(SHELL+'/api/shell/battery',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/battery',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const pct = data.percent||0;
     const charging = data.charging||false;
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Battery</div>'+
@@ -3135,8 +3182,8 @@ function loadBatteryMonitorPanel(el) {{
 // ═══ WiFi Manager ═══
 function loadWiFiManagerPanel(el) {{
   Promise.all([
-    fetch(SHELL+'/api/shell/wifi/status',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
-    fetch(SHELL+'/api/shell/wifi/scan',{{signal:AbortSignal.timeout(8000)}}).then(r=>r.json()).catch(()=>({{}}))
+    fetch(SHELL+'/api/shell/wifi/status',{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}})),
+    fetch(SHELL+'/api/shell/wifi/scan',{{signal:_sig(8000)}}).then(r=>r.json()).catch(()=>({{}}))
   ]).then(([status,scan])=>{{
     const connected = status.connected||{{}};
     const networks = scan.networks||[];
@@ -3151,7 +3198,7 @@ function loadWiFiManagerPanel(el) {{
     if(networks.length>0) {{
       html += '<div class="ds-section-label">Available Networks</div><div class="ds-stagger">';
       networks.filter(n=>!n.active).slice(0,8).forEach(n=>{{
-        html += '<div class="ds-list-item ds-list-item-interactive" onclick="wifiConnect(\\''+n.ssid.replace(/'/g,"\\\\'")+'\\')">'+
+        html += '<div class="ds-list-item ds-list-item-interactive" data-ssid="'+n.ssid+'" onclick="wifiConnect(this.dataset.ssid)">'+
           '<span class="mi material-icons-round ds-list-item-icon ds-text-accent">wifi</span>'+
           '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+n.ssid+'</div>'+
           '<div class="ds-list-item-secondary">'+n.security+' &middot; '+n.signal+'%</div></div></div>';
@@ -3165,7 +3212,7 @@ function loadWiFiManagerPanel(el) {{
 
 // ═══ VPN Manager ═══
 function loadVPNManagerPanel(el) {{
-  fetch(SHELL+'/api/shell/vpn/list',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/vpn/list',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const vpns = data.connections||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">VPN</span>'+
       dsBtn('Import',{{variant:'secondary',cls:'ds-btn-sm',onclick:"dsPrompt('Import VPN','Enter WireGuard config path',{{placeholder:'/path/to/wg0.conf',okLabel:'Import'}}).then(p=>{{if(!p)return;fetch(SHELL+'/api/shell/vpn/import',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{config_path:p,type:'wireguard'}})}}).then(r=>r.json()).then(d=>{{showToast('VPN',d.message||'Imported','success');loadVPNManagerPanel(document.getElementById('sys-vpn_manager'))}})}})"}})+'</div><div class="ds-stagger">';
@@ -3185,7 +3232,7 @@ function loadVPNManagerPanel(el) {{
 
 // ═══ Trash Bin ═══
 function loadTrashBinPanel(el) {{
-  fetch(SHELL+'/api/shell/trash',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/trash',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const items = data.items||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Trash</span>'+
       (items.length>0?dsBtn('Empty Trash',{{variant:'secondary',cls:'ds-btn-sm',onclick:"dsConfirm('Empty Trash','Permanently delete all items?',{{okLabel:'Empty',danger:true}}).then(ok=>{{if(!ok)return;fetch(SHELL+'/api/shell/trash/empty',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}}).then(()=>loadTrashBinPanel(document.getElementById('sys-trash_bin')))}})"}}):'')+
@@ -3195,7 +3242,7 @@ function loadTrashBinPanel(el) {{
       html += '<div class="ds-list-item"><span class="mi material-icons-round ds-list-item-icon ds-text-muted">delete</span>'+
         '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+t.name+'</div>'+
         '<div class="ds-list-item-secondary">'+(t.deleted_at||'')+'</div></div>'+
-        '<span class="ds-list-item-trailing" style="cursor:pointer" onclick="fetch(SHELL+\\'/api/shell/trash/restore\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{path:\\''+t.original_path.replace(/'/g,"\\\\'")+'\\'}})}}); loadTrashBinPanel(document.getElementById(\\'sys-trash_bin\\'))">'+
+        '<span class="ds-list-item-trailing" style="cursor:pointer" data-path="'+t.original_path+'" onclick="shellRestoreTrash(this)">'+
         '<span class="mi material-icons-round ds-text-accent" style="font-size:18px">restore</span></span></div>';
     }});
     html += '</div></div>';
@@ -3214,7 +3261,7 @@ function loadWebcamViewerPanel(el) {{
 
 // ═══ Scanner ═══
 function loadScannerPanel(el) {{
-  fetch(SHELL+'/api/shell/scanner/list',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
+  fetch(SHELL+'/api/shell/scanner/list',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const scanners = data.scanners||[];
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Scanner</div><div class="ds-stagger">';
     if(scanners.length===0) html += '<div class="ds-body-md ds-text-muted">No scanners detected</div>';
@@ -3236,7 +3283,7 @@ function loadWeatherPanel(el) {{
 }}
 
 function loadEventLog(el) {{
-  fetch(SHELL+'/api/shell/events',{{signal:AbortSignal.timeout(3000)}})
+  fetch(SHELL+'/api/shell/events',{{signal:_sig(3000)}})
     .then(r=>r.json()).then(data=>{{
       const events = data.events||[];
       el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Events</div>'+
@@ -3251,7 +3298,7 @@ function loadEventLog(el) {{
 }}
 
 function loadDriversPanel(el) {{
-  fetch(SHELL+'/api/shell/drivers',{{signal:AbortSignal.timeout(5000)}})
+  fetch(SHELL+'/api/shell/drivers',{{signal:_sig(5000)}})
     .then(r=>r.json()).then(data=>{{
       const devs = data.devices||[];
       el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Drivers &amp; Devices</div>'+
@@ -3290,7 +3337,7 @@ function setSourceVolume(srcId, vol) {{
 }}
 
 function loadAudioPanel(el) {{
-  fetch(SHELL+'/api/shell/audio',{{signal:AbortSignal.timeout(5000)}})
+  fetch(SHELL+'/api/shell/audio',{{signal:_sig(5000)}})
     .then(r=>r.json()).then(data=>{{
       const sinks = data.sinks||[];
       const sources = data.sources||[];
@@ -3329,7 +3376,7 @@ function loadAudioPanel(el) {{
 }}
 
 function loadBluetoothPanel(el) {{
-  fetch(SHELL+'/api/shell/bluetooth',{{signal:AbortSignal.timeout(5000)}})
+  fetch(SHELL+'/api/shell/bluetooth',{{signal:_sig(5000)}})
     .then(r=>r.json()).then(data=>{{
       const devs = data.devices||[];
       el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Bluetooth</div>'+
@@ -3340,7 +3387,7 @@ function loadBluetoothPanel(el) {{
 }}
 
 function loadPowerPanel(el) {{
-  fetch(SHELL+'/api/shell/power',{{signal:AbortSignal.timeout(5000)}})
+  fetch(SHELL+'/api/shell/power',{{signal:_sig(5000)}})
     .then(r=>r.json()).then(data=>{{
       const pct = data.percent||100;
       const state = data.state||'unknown';
@@ -3375,7 +3422,7 @@ function setBrightness(output, val) {{
 }}
 
 function loadDisplayPanel(el) {{
-  fetch(SHELL+'/api/shell/display',{{signal:AbortSignal.timeout(5000)}})
+  fetch(SHELL+'/api/shell/display',{{signal:_sig(5000)}})
     .then(r=>r.json()).then(data=>{{
       const displays = data.displays||[];
       if(displays.length===0) {{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px;font-size:32px;opacity:0.3">desktop_access_disabled</span>No displays detected</div>'; return; }}
@@ -3428,7 +3475,7 @@ function rdConnect() {{
 }}
 
 function loadRemoteDesktopPanel(el, apis) {{
-  Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))))
+  Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:_sig(5000)}}).then(r=>r.json()).catch(()=>({{}}))))
     .then(([status,engines,sessions])=>{{
       const did = status.formatted_id || 'Unknown';
       const deviceId = status.device_id || '';
@@ -3441,7 +3488,7 @@ function loadRemoteDesktopPanel(el, apis) {{
         '<span class="mi material-icons-round ds-text-active" style="font-size:24px">connected_tv</span></div>';
 
       // Device ID card
-      html += '<div class="ds-card ds-card-elevated ds-card-interactive" onclick="navigator.clipboard.writeText(\\''+deviceId+'\\').then(()=>{{this.querySelector(\\'.copy-hint\\').textContent=\\'Copied!\\';setTimeout(()=>this.querySelector(\\'.copy-hint\\').textContent=\\'Click to copy\\',2000)}})" title="Click to copy">';
+      html += '<div class="ds-card ds-card-elevated ds-card-interactive" data-did="'+deviceId+'" onclick="navigator.clipboard.writeText(this.dataset.did).then(()=>{{var h=this.querySelector(&quot;.copy-hint&quot;);h.textContent=&quot;Copied!&quot;;setTimeout(()=>h.textContent=&quot;Click to copy&quot;,2000)}})" title="Click to copy">';
       html += '<div class="ds-metric"><div class="ds-label-sm ds-text-muted">Your Device ID</div>';
       html += '<div class="ds-headline-md ds-text-heading" style="letter-spacing:3px;margin:var(--ds-space-2) 0">'+did+'</div>';
       html += '<div class="copy-hint ds-label-sm ds-text-muted">Click to copy</div></div></div>';
@@ -3491,10 +3538,38 @@ function focusAgent() {{
   document.getElementById('agent-input').focus();
   document.getElementById('agent-pill').classList.add('expanded');
 }}
-// askAgent() removed: it duplicated acSend() but wrote to the collapsed pill
-// (#agent-resp). With voice now routed through acSend (startRecording.onstop)
-// and the pill quick-ask copying into #ac-input (input line ~1180), acSend is
-// the single send path — no parallel send/route to drift.
+function askAgent() {{
+  const input = document.getElementById('agent-input');
+  const text = input.value.trim();
+  if(!text) return;
+  input.value = '';
+  const resp = document.getElementById('agent-resp');
+  resp.textContent = 'Thinking...';
+  resp.classList.add('visible');
+
+  // Check for theme commands first
+  const lower = text.toLowerCase();
+  if(lower.includes('theme')||lower.includes('font')||lower.includes('bigger')||
+     lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
+    handleThemeCommand(lower, resp);
+    return;
+  }}
+  // Check for panel open commands
+  if(lower.startsWith('open ')) {{
+    const target = lower.replace('open ','').trim();
+    const match = Object.entries(MANIFEST).find(([k,v])=>
+      v.title.toLowerCase().includes(target)||k.includes(target));
+    if(match) {{ openPanel(match[0]); resp.textContent='Opened '+match[1].title; return; }}
+  }}
+
+  fetch(SHELL+'/api/agent/ask',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{text}})}})
+    .then(r=>r.json()).then(data=>{{
+      const txt = data.response || data.error || 'No response';
+      resp.textContent = txt;
+      speakText(txt, 'chat_response');
+    }}).catch(()=>{{ resp.textContent='Could not reach agent'; }});
+}}
 
 // ═══ Floating Assistant Chat ═══
 const AC_CAPS = [
@@ -3520,7 +3595,7 @@ function initAssistantChat() {{
   const capsEl = document.getElementById('ac-caps');
   if(!capsEl) return;
   capsEl.innerHTML = AC_CAPS.map(c=>
-    '<div class="ac-cap'+(c.id===acActiveCap?' active':'')+'" onclick="acSelectCap(\\''+c.id+'\\')" title="'+c.name+'">'+
+    '<div class="ac-cap'+(c.id===acActiveCap?' active':'')+'" data-cap-id="'+c.id+'" onclick="acSelectCap(this.dataset.capId)" title="'+c.name+'">'+
     '<span class="mi material-icons-round">'+c.icon+'</span>'+c.name+'</div>'
   ).join('');
 
@@ -3580,7 +3655,7 @@ function minimizeAssistant() {{
 function acSelectCap(id) {{
   acActiveCap = id;
   document.querySelectorAll('.ac-cap').forEach(function(el) {{
-    el.classList.toggle('active', el.getAttribute('onclick').includes("'"+id+"'"));
+    el.classList.toggle('active', el.dataset.capId === id);
   }});
 }}
 
@@ -3722,9 +3797,10 @@ document.addEventListener('contextmenu', e => {{
   menu.style.display = 'block';
 }});
 document.addEventListener('click', ()=>{{document.getElementById('ctx-menu').style.display='none';}});
+function _closeCtx() {{ document.getElementById('ctx-menu').style.display='none'; }}
 
 function ctxItem(icon,label,action) {{
-  return '<div class="ctx-menu-item" onclick="'+action+';document.getElementById(\\'ctx-menu\\').style.display=\\'none\\'">'+
+  return '<div class="ctx-menu-item" onclick="'+action+';_closeCtx()">'+
     '<span class="mi material-icons-round">'+icon+'</span>'+label+'</div>';
 }}
 function ctxSep() {{ return '<div class="ctx-menu-sep"></div>'; }}
@@ -3813,7 +3889,6 @@ function toggleVoice() {{
 }}
 
 async function startRecording() {{
-  acStopSpeaking();  // barge-in: stop any in-progress TTS the instant the user starts speaking
   try {{
     const stream = await navigator.mediaDevices.getUserMedia({{audio:true}});
     const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '';
@@ -3825,11 +3900,9 @@ async function startRecording() {{
       const blob = new Blob(audioChunks, {{type: mediaRecorder.mimeType || 'audio/webm'}});
       const formData = new FormData();
       formData.append('audio', blob, 'voice.webm');
-      // Route the transcript into the SAME conversation surface as typed
-      // input (#ac-input -> acSend -> #ac-messages). The mic lives inside the
-      // open floating chat, so the old #agent-input/askAgent target dropped
-      // voice turns into the collapsed pill where they were never visible.
-      showToast('Voice','Transcribing...','info');
+      const resp = document.getElementById('agent-resp');
+      resp.textContent = 'Transcribing...';
+      resp.classList.add('visible');
       try {{
         const r = await fetch(SHELL+'/api/voice', {{method:'POST', body:formData}});
         const data = await r.json();
@@ -3838,14 +3911,15 @@ async function startRecording() {{
           const aci = document.getElementById('ac-input');
           if(aci) {{ aci.value = data.text; acSend(); }}
         }} else if(data.error) {{
-          showToast('Voice', data.error, 'warning');
+          resp.textContent = data.error;
         }}
-      }} catch(err) {{ showToast('Voice', 'Voice processing failed', 'warning'); }}
+      }} catch(err) {{ resp.textContent = 'Voice processing failed'; }}
     }};
+    acStopSpeaking();  // barge-in: stop any in-progress TTS the instant the user starts speaking
     mediaRecorder.start();
     isRecording = true;
     var _mb = document.querySelector('.mic-btn');
-    if(_mb) _mb.classList.add('recording');  // guarded: no such el when mic lives in the chat (was an unguarded null-deref)
+    if(_mb) _mb.classList.add('recording');  // guarded: no such el when the mic lives in the chat (was an unguarded null-deref)
     showToast('Voice','Recording... click mic again to stop','info');
   }} catch(err) {{
     showToast('Voice','Microphone access denied','warning');
@@ -3860,8 +3934,7 @@ function stopRecording() {{
 }}
 
 // Stop any in-progress TTS — browser SpeechSynthesis + the server <audio>.
-// The single canonical "stop talking" (there was none before): used for
-// barge-in (startRecording) and to avoid overlapping replies (speakText).
+// Single canonical "stop talking": used for barge-in (startRecording) and to avoid overlapping replies (speakText).
 function acStopSpeaking() {{
   try {{ if('speechSynthesis' in window) speechSynthesis.cancel(); }} catch(e) {{}}
   try {{ if(_acAudio) {{ _acAudio.pause(); _acAudio = null; }} }} catch(e) {{}}
@@ -3893,10 +3966,8 @@ function speakText(text, source) {{
 }}
 
 // ── HART OS native voice orb: reflect the shell's EXISTING voice state ──
-// Reuses isRecording (listening) + _acAudio (speaking) by polling — does NOT
-// edit startRecording/speakText, and does NOT route their audio through the
-// orb's AudioContext (that could disturb TTS playback). setActive drives the
-// viz's built-in speech-energy animation. Skipped in potato mode (saves the RAF).
+// Reuses isRecording (listening) + _acAudio (speaking) by polling.
+// setActive drives the viz's built-in speech-energy animation. Skipped in potato mode.
 if(!PERF.potato) {{
   (function initHartOrb() {{
     var c = document.getElementById('hart-voice-orb');
@@ -3949,6 +4020,25 @@ function _postApproval(agentId, action, decision) {{
 var _overlayStack = [];
 // HTML escape — prevents XSS from agent-pushed content
 function _esc(s){{if(!s)return'';var d=document.createElement('div');d.textContent=String(s);return d.innerHTML;}}
+function _submitA2UIForm(form) {{
+  event.preventDefault();
+  var action = form.dataset.action || '/api/a2ui';
+  var fd = {{}};
+  new FormData(form).forEach(function(v,k){{fd[k]=v;}});
+  fetch(SHELL+action,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(fd)}}).catch(function(){{}});
+  return false;
+}}
+function shellA2UIListSelect(el) {{
+  try {{
+    fetch(SHELL+(el.dataset.action||'/api/a2ui'),{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{selected:parseInt(el.dataset.idx||0),item:el.dataset.item||''}})}}).catch(function(){{}});
+  }} catch(e) {{}}
+}}
+function _doApproval(btn, verdict) {{
+  var div = btn.closest('[data-agent-id]');
+  if(div) {{ _postApproval(div.dataset.agentId||'', div.dataset.action||'', verdict); }}
+  var ov = btn.closest('.agent-overlay');
+  if(ov) ov.remove();
+}}
 
 function renderAgentOverlay(ev) {{
   // Sanitize all string fields to prevent XSS injection
@@ -4074,7 +4164,7 @@ function renderAgentOverlay(ev) {{
     if(ev.filename) html += '<span class="ds-label-sm ds-text-muted" style="font-family:monospace">'+(ev.filename)+'</span>';
     if(ev.language) html += '<span class="ds-label-sm" style="color:var(--hart-accent);font-size:9px;text-transform:uppercase">'+(ev.language)+'</span>';
     html += '</div>';
-    html += '<pre style="margin:0;padding:10px;background:rgba(0,0,0,0.5);border-radius:8px;overflow-x:auto;font-family:\\'Fira Code\\',\\'Cascadia Code\\',monospace;font-size:12px;line-height:1.4;color:#e0e0e0;white-space:pre-wrap;word-break:break-all"><code>'+(ev.content||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</code></pre>';
+    html += '<pre style="margin:0;padding:10px;background:rgba(0,0,0,0.5);border-radius:8px;overflow-x:auto;font-family:"Fira Code","Cascadia Code",monospace;font-size:12px;line-height:1.4;color:#e0e0e0;white-space:pre-wrap;word-break:break-all"><code>'+(ev.content||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</code></pre>';
 
   }} else if(type === 'markdown') {{
     var md = ev.content||'';
@@ -4089,7 +4179,7 @@ function renderAgentOverlay(ev) {{
     md = md.replace(/^# (.+)$/gm,'<div class="ds-body-lg" style="font-weight:700;margin-top:6px">$1</div>');
     md = md.replace(/^[-*] (.+)$/gm,'<div style="padding-left:12px">&#8226; $1</div>');
     md = md.replace(/^\d+\. (.+)$/gm,function(m,p1){{ return '<div style="padding-left:12px">'+m.split('.')[0]+'. '+p1+'</div>'; }});
-    md = md.replace(/\\n/g,'<br>');
+    md = md.split(String.fromCharCode(10)).join('<br>');
     html += '<div class="ds-body-sm" style="line-height:1.5">'+md+'</div>';
 
   }} else if(type === 'media') {{
@@ -4102,7 +4192,7 @@ function renderAgentOverlay(ev) {{
     }} else if(mediaType === 'audio' || src.match(/\.(mp3|wav|ogg|aac)($|\?)/i)) {{
       html += '<audio src="'+src+'" '+(ev.controls!==false?'controls':'')+' style="width:100%">'+alt+'</audio>';
     }} else {{
-      html += '<img src="'+src+'" alt="'+alt+'" style="width:100%;border-radius:8px;max-height:160px;object-fit:cover" onerror="this.style.display=\\'none\\'">';
+      html += '<img src="'+src+'" alt="'+alt+'" style="width:100%;border-radius:8px;max-height:160px;object-fit:cover" onerror="this.hidden=true">';
     }}
     if(ev.caption) html += '<div class="ds-label-sm ds-text-muted" style="margin-top:4px">'+(ev.caption)+'</div>';
 
@@ -4119,7 +4209,7 @@ function renderAgentOverlay(ev) {{
   }} else if(type === 'form') {{
     html += '<div class="ds-body-md" style="font-weight:600;margin-bottom:8px">'+(ev.title||'Form')+'</div>';
     var formId = 'form-'+(ev._ts||Date.now());
-    html += '<form id="'+formId+'" style="display:flex;flex-direction:column;gap:6px" onsubmit="event.preventDefault();var fd={{}};new FormData(this).forEach(function(v,k){{fd[k]=v}});fetch(SHELL+\\''+(ev.action||'/api/a2ui')+'\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify(fd)}}).catch(function(){{}});return false;">';
+    html += '<form id="'+formId+'" data-action="'+(ev.action||'/api/a2ui')+'" style="display:flex;flex-direction:column;gap:6px" onsubmit="return _submitA2UIForm(this)">';
     (ev.fields||[]).forEach(function(f){{
       var ftype = f.type||'text';
       var fname = f.name||f.label||'field';
@@ -4147,7 +4237,7 @@ function renderAgentOverlay(ev) {{
       var text = typeof item === 'string' ? item : (item.label||item.text||item.name||JSON.stringify(item));
       var action = typeof item === 'object' ? item.action : null;
       if(action || ev.interactive) {{
-        html += '<li style="padding:2px 0;cursor:pointer;color:var(--hart-accent)" onclick="try{{fetch(SHELL+\\''+( action||'/api/a2ui')+'\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{selected:'+i+',item:\\''+text.replace(/'/g,'\\\\\\\'')+'\\'}})}})}}catch(e){{}}">'+(text)+'</li>';
+        html += '<li style="padding:2px 0;cursor:pointer;color:var(--hart-accent)" data-action="'+(action||'/api/a2ui')+'" data-idx="'+i+'" data-item="'+_esc(text)+'" onclick="shellA2UIListSelect(this)">'+(text)+'</li>';
       }} else {{
         html += '<li style="padding:2px 0">'+(text)+'</li>';
       }}
@@ -4158,10 +4248,10 @@ function renderAgentOverlay(ev) {{
     html += '<div class="ds-body-md" style="font-weight:600;margin-bottom:4px">Approval Required</div>';
     html += '<div class="ds-body-sm ds-text-muted" style="margin-bottom:8px">'+(ev.description||ev.action||'An agent requests your approval.')+'</div>';
     if(ev.agent_id) html += '<div class="ds-label-sm ds-text-muted" style="margin-bottom:6px">Agent: '+(ev.agent_id)+'</div>';
-    html += '<div style="display:flex;gap:6px;justify-content:flex-end">';
-    html += '<button class="ds-btn ds-btn-primary ds-btn-sm" onclick="dsRipple(event);_postApproval(\\''+((ev.agent_id||'').replace(/'/g,''))+'\\',\\''+((ev.action||'').replace(/'/g,''))+'\\',\\'approve\\');this.closest(\\'.agent-overlay\\').remove()"><span>Approve</span></button>';
-    html += '<button class="ds-btn ds-btn-outline ds-btn-sm" onclick="dsRipple(event);_postApproval(\\''+((ev.agent_id||'').replace(/'/g,''))+'\\',\\''+((ev.action||'').replace(/'/g,''))+'\\',\\'deny\\');this.closest(\\'.agent-overlay\\').remove()"><span>Deny</span></button>';
-    html += '<button class="ds-btn ds-btn-ghost ds-btn-sm" onclick="dsRipple(event);this.closest(\\'.agent-overlay\\').remove()"><span>Later</span></button>';
+    html += '<div style="display:flex;gap:6px;justify-content:flex-end" data-agent-id="'+(ev.agent_id||'')+'" data-action="'+(ev.action||'')+'">';
+    html += '<button class="ds-btn ds-btn-primary ds-btn-sm" onclick="dsRipple(event);_doApproval(this,&quot;approve&quot;)"><span>Approve</span></button>';
+    html += '<button class="ds-btn ds-btn-outline ds-btn-sm" onclick="dsRipple(event);_doApproval(this,&quot;deny&quot;)"><span>Deny</span></button>';
+    html += '<button class="ds-btn ds-btn-ghost ds-btn-sm" onclick="dsRipple(event);this.closest(&quot;.agent-overlay&quot;).remove()"><span>Later</span></button>';
     html += '</div>';
 
   }} else if(type === 'navigate') {{
@@ -4171,7 +4261,7 @@ function renderAgentOverlay(ev) {{
     if(MANIFEST[target] || SYSTEM_PANELS[target]) {{
       openPanel(target, ev.params||{{}});
     }} else if(target.indexOf('/api/') === 0 && target.indexOf('..') === -1) {{
-      fetch(SHELL+target, {{method:'GET',signal:AbortSignal.timeout(5000)}}).catch(function(){{}});
+      fetch(SHELL+target, {{method:'GET',signal:_sig(5000)}}).catch(function(){{}});
     }}
     // External URLs and arbitrary paths are BLOCKED — prevents SSRF/open redirect
     // Minimal overlay confirmation
@@ -4199,7 +4289,7 @@ function renderAgentOverlay(ev) {{
 
 // ═══ Recent Files in Start Menu ═══
 (function loadRecentFiles() {{
-  fetch(SHELL+'/api/shell/files/recent',{{signal:AbortSignal.timeout(3000)}})
+  fetch(SHELL+'/api/shell/files/recent',{{signal:_sig(3000)}})
     .then(function(r){{return r.json();}}).then(function(data) {{
       const files = data.files || [];
       if(files.length === 0) return;
@@ -4209,7 +4299,7 @@ function renderAgentOverlay(ev) {{
       section.className = 'start-group';
       section.innerHTML = '<div class="start-group-label">Recent Files</div><div class="start-grid">' +
         files.slice(0,8).map(function(f) {{
-          return '<div class="start-item" onclick="launchApp(\\'xdg-open\\')">' +
+          return '<div class="start-item" data-path="'+f.path.replace(/"/g,'&quot;')+'" onclick="launchApp(&quot;xdg-open&quot;,this.dataset.path)">' +
             '<span class="mi material-icons-round" style="color:var(--hart-muted)">description</span>' +
             '<span class="label" title="'+f.path+'">'+f.name+'</span></div>';
         }}).join('') + '</div>';
@@ -4221,8 +4311,8 @@ function renderAgentOverlay(ev) {{
 (function loginGreeting() {{
   if(PERF.potato) return;
   Promise.all([
-    fetch(BACKEND+'/api/social/dashboard/agents',{{signal:AbortSignal.timeout(3000)}}).then(function(r){{return r.json();}}).catch(function(){{return {{}}; }}),
-    fetch(BACKEND+'/api/social/dashboard/health',{{signal:AbortSignal.timeout(3000)}}).then(function(r){{return r.json();}}).catch(function(){{return {{}}; }}),
+    fetch(BACKEND+'/api/social/dashboard/agents',{{signal:_sig(3000)}}).then(function(r){{return r.json();}}).catch(function(){{return {{}}; }}),
+    fetch(BACKEND+'/api/social/dashboard/health',{{signal:_sig(3000)}}).then(function(r){{return r.json();}}).catch(function(){{return {{}}; }}),
   ]).then(function([agents,health]) {{
     const agentCount = (agents.agents||[]).filter(function(a){{return a.status==='running';}}).length;
     const peerCount = health.peer_count || 0;
@@ -4295,12 +4385,9 @@ function renderAgentOverlay(ev) {{
         def index():
             return Response(self.render_desktop_shell(), mimetype='text/html')
 
-        # ── Shell's own static assets (native renderers — no React/iframe) ──
-        @app.route('/shell/static/<path:asset>')
-        def shell_static(asset):
-            static_dir = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), 'static')
-            return send_from_directory(static_dir, asset)
+        @app.route('/favicon.ico')
+        def favicon():
+            return Response(status=204)
 
         # ── Nunba SPA embedding (React pages inside panel iframes) ──
         nunba_dir = os.environ.get('NUNBA_STATIC_DIR', '')
@@ -4415,8 +4502,18 @@ function renderAgentOverlay(ev) {{
         # ── Theme hot-reload ──
         @app.route('/api/theme', methods=['POST'])
         def update_theme():
-            # Called by ThemeService when theme changes
-            return jsonify({'status': 'updated'})
+            data = request.get_json(force=True, silent=True) or {}
+            theme_id = data.get('theme_id', '').strip()
+            if not theme_id:
+                return jsonify({'error': 'theme_id required'}), 400
+            try:
+                from integrations.agent_engine.theme_service import ThemeService
+                result = ThemeService.apply_theme(theme_id)
+                if 'error' in result:
+                    return jsonify(result), 404
+                return jsonify({'status': 'updated', 'theme': result.get('id')})
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
 
         # ── Agent ambient input (text from agent pill) ──
         @app.route('/api/agent/ask', methods=['POST'])

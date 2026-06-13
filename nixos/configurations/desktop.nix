@@ -451,6 +451,7 @@ in
       liberation_ttf               # Metric-compatible with Arial/Times/Courier
       jetbrains-mono               # Monospace for code
       fira-code                    # Alternative monospace with ligatures
+      material-icons               # Material Icons (offline icons for LiquidUI shell)
     ];
     fontconfig.defaultFonts = {
       serif = [ "Noto Serif" "Liberation Serif" ];

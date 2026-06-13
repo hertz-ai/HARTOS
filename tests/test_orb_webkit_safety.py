@@ -110,15 +110,9 @@ def test_shell_inline_js_syntax_ok(tmp_path):
 
 
 # ── Shell-wide WebKitGTK fallback guard ────────────────────────────────────
-# xfail until debug_1's _sig() AbortController fallback (commit 48fa0a9) is on
-# this branch; it flips to xpass on merge, at which point the marker is removed
-# and this becomes a hard regression guard for all 60+ fetch-timeout sites.
-
-@pytest.mark.xfail(
-    reason="main still calls raw AbortSignal.timeout() (crashes NixOS 24.11 "
-           "WebKitGTK); needs debug_1's _sig() fallback (48fa0a9) merged.",
-    strict=False,
-)
+# debug_1's _sig() AbortController fallback is now merged (PR #73), so every
+# inline fetch-timeout site routes through it. This is now a HARD regression
+# guard: only the _sig() feature-detect itself may name AbortSignal.timeout().
 def test_shell_routes_timeouts_through_sig_fallback():
     src = _shell_source()
     assert 'function _sig(' in src, 'the _sig() WebKitGTK fallback helper is missing'

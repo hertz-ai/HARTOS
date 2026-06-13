@@ -13,7 +13,7 @@ on:
         type: boolean
         default: true
   push:
-    branches: [main, gpt4.1, develop]
+    branches: [main, gpt4.1, develop, debug_1, fix/boot-issues-nouveau-firstboot]
 
 permissions:
   contents: write
