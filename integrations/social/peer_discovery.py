@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 
 from core.http_pool import pooled_get, pooled_post
 from core.session_cache import TTLCache  # bounded + TTL dedup (peer churn safe)
+from core.ttl_cache import ttl_cached  # hard-TTL discovery cache (gossip counts)
 
 logger = logging.getLogger('hevolve_social')
 
@@ -109,6 +110,27 @@ _COMPACT_FIELDS = frozenset({
     'node_id', 'url', 'public_key', 'guardrail_hash', 'code_hash',
     'signature', 'tier', 'capability_tier', 'timestamp', 'hart_tag',
 })
+
+
+@ttl_cached(ttl_seconds=30)
+def _cached_node_count(what: str) -> int:
+    """Cached agent/post count for gossip advertising.
+
+    Module-level so the cache is keyed by ``what`` (a GLOBAL db count), not by
+    the GossipProtocol instance. Gossip advertises these counts every round; a
+    <=30s-stale count is fine and saves a COUNT query per tick — the 2026-06-13
+    dig caught this loop active in SQL ``fetchall``.
+    """
+    from .models import get_db, User, Post
+    db = get_db()
+    try:
+        if what == 'agent':
+            return db.query(User).filter(User.user_type == 'agent').count()
+        elif what == 'post':
+            return db.query(Post).filter(Post.is_deleted == False).count()
+        return 0
+    finally:
+        db.close()
 
 
 class GossipProtocol:
@@ -1277,17 +1299,10 @@ class GossipProtocol:
             db.close()
 
     def _get_count(self, what):
+        # Delegates to module-level _cached_node_count (30s hard TTL) so repeated
+        # gossip rounds don't re-run the COUNT query every tick (2026-06-13 dig).
         try:
-            from .models import get_db, User, Post
-            db = get_db()
-            try:
-                if what == 'agent':
-                    return db.query(User).filter(User.user_type == 'agent').count()
-                elif what == 'post':
-                    return db.query(Post).filter(Post.is_deleted == False).count()
-                return 0
-            finally:
-                db.close()
+            return _cached_node_count(what)
         except Exception:
             return 0
 

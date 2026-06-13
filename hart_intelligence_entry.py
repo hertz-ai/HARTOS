@@ -834,6 +834,19 @@ except Exception as _outbound_err:
     logging.getLogger(__name__).debug(
         "llm_outbound install skipped: %s", _outbound_err)
 
+# ── Proxy-lookup cache (process-wide) ─────────────────────────────────
+# requests/urllib re-read the Windows registry for proxy settings on EVERY
+# HTTP call (getproxies_registry); the 2026-06-13 sluggishness dig caught the
+# superadmin-report loop burning CPU there, and every other requests call pays
+# it too.  Cache the lookup with a TTL — same proxies, just not re-resolved per
+# call.  See core/proxy_cache.py.
+try:
+    from core.proxy_cache import install_proxy_cache
+    install_proxy_cache()
+except Exception as _proxy_err:
+    logging.getLogger(__name__).debug(
+        "proxy_cache install skipped: %s", _proxy_err)
+
 # ── Boot-time tool-registry warmer ────────────────────────────────────
 # Kicks a background daemon thread to pre-fill the 4 process-level tool
 # caches (service_tools / system_introspect / skills / provider_gateway)
