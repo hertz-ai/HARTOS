@@ -211,7 +211,10 @@ setup(
     # Include non-Python files
     include_package_data=True,
     package_data={
-        "": ["*.yaml", "*.yml", "*.json", "*.txt", "*.md"],
+        # *.js/*.svg/*.css bundle the glass-shell static assets
+        # (integrations/agent_engine/static/*) into wheels/sdists — without them
+        # a non-source install serves /shell/static 404s and the desktop is dead.
+        "": ["*.yaml", "*.yml", "*.json", "*.txt", "*.md", "*.js", "*.svg", "*.css"],
     },
 
     # Python version requirement

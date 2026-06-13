@@ -14,12 +14,14 @@ on:
       - 'integrations/agent_engine/liquid_ui_service.py'
       - 'integrations/agent_engine/static/**'
       - 'tests/test_orb_webkit_safety.py'
+      - 'tests/unit/test_shell_*.py'
       - 'tests/js/orb_webkit_harness.js'
       - '.github/workflows/shell-ui-test.yml'
   pull_request:
     paths:
       - 'integrations/agent_engine/liquid_ui_service.py'
       - 'integrations/agent_engine/static/**'
+      - 'tests/unit/test_shell_*.py'
 
 concurrency:
   group: shell-ui-${{ github.ref }}
@@ -48,3 +50,14 @@ jobs:
       # self-skip if the shell module can't import in a minimal runner.
       - name: Orb / shell WebKitGTK functional tests
         run: python -m pytest tests/test_orb_webkit_safety.py -v
+
+      # Phase A-D shell features (drag-drop desktop, virtual desktops, themes +
+      # wallpaper gallery, marketplace, polish). JS-shape + asset guards run on
+      # the static files; the render/round-trip tests self-skip without heavy deps.
+      - name: Shell feature tests (desktop / personalize / marketplace / polish)
+        run: >-
+          python -m pytest -v
+          tests/unit/test_shell_desktop_icons.py
+          tests/unit/test_shell_personalize.py
+          tests/unit/test_shell_marketplace.py
+          tests/unit/test_shell_polish.py

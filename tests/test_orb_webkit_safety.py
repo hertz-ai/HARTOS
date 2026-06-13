@@ -128,3 +128,54 @@ def test_shell_routes_timeouts_through_sig_fallback():
         f'{raw} raw AbortSignal.timeout() call sites — route them through _sig() '
         'so the shell survives old WebKitGTK'
     )
+
+
+# ── ALL static shell JS is present, valid, and WebKitGTK-safe ───────────────
+# The shell grew from one orb script to a fleet of static modules (hartSession,
+# hartHero, hartDesktop, hartWorkspaces, hartPersonalize, hartMarketplace,
+# hartDock). Each is a separate <script src>, so a syntax error or an
+# AbortSignal.timeout() in ANY of them silently kills that feature on the ISO.
+# These guards extend the orb's lesson to every static module (node + source
+# only, so they run in the minimal shell-ui CI).
+
+STATIC_DIR = os.path.join(HARTOS_ROOT, 'integrations', 'agent_engine', 'static')
+
+
+def _static_js():
+    return sorted(f for f in os.listdir(STATIC_DIR) if f.endswith('.js'))
+
+
+def test_all_static_js_syntax_ok():
+    node = _node()
+    for name in _static_js():
+        r = subprocess.run([node, '--check', os.path.join(STATIC_DIR, name)],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, name + ': ' + r.stderr
+
+
+def test_static_js_is_webkitgtk_safe():
+    """AbortSignal.timeout() (the NixOS 24.11 crasher) may appear ONCE — inside
+    the HartTimeoutSignal feature-detect wrapper in hartSession.js — and nowhere
+    else; no template literals / optional chaining / nullish coalescing either."""
+    raw_total = 0
+    for name in _static_js():
+        src = open(os.path.join(STATIC_DIR, name), encoding='utf-8').read()
+        n = src.count('AbortSignal.timeout(')
+        raw_total += n
+        if name != 'hartSession.js':
+            assert n == 0, name + ' calls AbortSignal.timeout() directly (use window.HartTimeoutSignal)'
+        assert '`' not in src, name + ' uses a template literal (avoid for old WebKitGTK)'
+        assert '?.' not in src, name + ' uses optional chaining'
+        assert '??' not in src, name + ' uses nullish coalescing'
+    assert raw_total <= 1, 'AbortSignal.timeout() should exist only in the HartTimeoutSignal wrapper'
+
+
+def test_referenced_static_assets_exist():
+    """Every /shell/static/<asset> the shell references must exist on disk — a
+    missing file means the shell serves a 404 and that feature silently dies
+    (the bundling end-to-end gap)."""
+    src = _shell_source()
+    refs = set(re.findall(r'/shell/static/([A-Za-z0-9_.\-]+)', src))
+    assert refs, 'no /shell/static refs found — wiring regression'
+    for asset in sorted(refs):
+        assert os.path.isfile(os.path.join(STATIC_DIR, asset)), 'referenced but missing on disk: ' + asset

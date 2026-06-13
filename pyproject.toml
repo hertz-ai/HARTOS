@@ -244,7 +244,8 @@ exclude = ["venv*", "tests*", "docs*", "examples*"]
 agent_ledger = "agent-ledger-opensource/agent_ledger"
 
 [tool.setuptools.package-data]
-"*" = ["*.yaml", "*.yml", "*.json", "*.txt", "*.md"]
+# *.js/*.svg/*.css bundle the glass-shell static assets (the desktop 404s without them)
+"*" = ["*.yaml", "*.yml", "*.json", "*.txt", "*.md", "*.js", "*.svg", "*.css"]
 
 [tool.setuptools_scm]
 version_scheme = "guess-next-dev"
