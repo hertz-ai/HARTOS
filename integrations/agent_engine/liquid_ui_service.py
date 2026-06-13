@@ -935,6 +935,165 @@ html.a11y-rmotion *,html.a11y-rmotion *::before,html.a11y-rmotion *::after{
             ' .ds-elevation-1,.ds-elevation-2,.ds-elevation-3,.ds-elevation-4,.ds-elevation-5{box-shadow:none}'
         )
 
+        # ═══ Voice-first hero + native depth + buttery motion + de-monochrome ═══
+        # Plain string (literal CSS braces) interpolated whole via {_CSS_HERO} in
+        # the <style>, like _CSS_DESIGN_SYSTEM — so no f-string escaping. Promotes
+        # the EXISTING #hart-voice-orb to the desktop centerpiece and fuses it with
+        # a central command bar; reuses the shell's voice/dispatch pipeline.
+        _CSS_HERO = '''
+/* ── Native-app feel: kill the web tells, crisp font rendering ── */
+html,body{overscroll-behavior:none;-webkit-font-smoothing:antialiased;
+  -moz-osx-font-smoothing:grayscale;text-rendering:optimizeLegibility;-webkit-tap-highlight-color:transparent}
+.top-bar,.taskbar,.start-menu,.panel-titlebar,.start-item,.taskbar-chip,
+.ds-btn,.hart-hero-chip,.hart-hero-status,.hart-hero-brand{cursor:default}
+img{-webkit-user-drag:none;user-select:none}
+
+/* ── Ambient colour wash (de-monochrome): slow drifting multi-hue blobs above
+   the wallpaper, theme-independent, so the desktop has living colour. ── */
+.hart-ambient{position:fixed;inset:-12%;z-index:1;pointer-events:none;opacity:0.5;
+  filter:blur(64px) saturate(140%);
+  background:
+    radial-gradient(38% 42% at 22% 26%, rgba(0,212,170,0.42), transparent 70%),
+    radial-gradient(34% 40% at 80% 30%, rgba(108,99,255,0.40), transparent 70%),
+    radial-gradient(42% 46% at 60% 80%, rgba(34,176,255,0.30), transparent 72%),
+    radial-gradient(30% 36% at 28% 82%, rgba(255,120,180,0.24), transparent 72%);
+  animation:hart-ambient-drift 30s ease-in-out infinite alternate}
+@keyframes hart-ambient-drift{0%{transform:translate3d(0,0,0) scale(1)}
+  50%{transform:translate3d(2.4%,-2.2%,0) scale(1.08)}100%{transform:translate3d(-2.4%,2.2%,0) scale(1.05)}}
+.hart-grain{position:fixed;inset:0;z-index:2;pointer-events:none;opacity:0.045;mix-blend-mode:overlay;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
+.hart-vignette{position:fixed;inset:0;z-index:2;pointer-events:none;
+  background:radial-gradient(120% 120% at 50% 38%, transparent 56%, rgba(0,0,0,0.30) 100%)}
+
+/* ── The hero ── */
+.hart-hero{position:fixed;left:50%;top:46%;transform:translate(-50%,-50%);z-index:40;
+  display:flex;flex-direction:column;align-items:center;gap:16px;text-align:center;
+  width:min(660px,86vw);pointer-events:none;
+  transition:opacity .55s cubic-bezier(.2,0,0,1),transform .55s cubic-bezier(.2,0,0,1),filter .55s}
+.hart-hero>*{pointer-events:auto}
+.hart-hero.dimmed{opacity:0;transform:translate(-50%,-56%) scale(.96);filter:blur(6px)}
+.hart-hero.dimmed>*{pointer-events:none}
+.hart-hero-brand{display:flex;align-items:center;gap:9px;opacity:.92}
+.hart-hero-brand img{width:34px;height:34px;filter:drop-shadow(0 3px 12px rgba(0,212,170,.4))}
+.hart-hero-brand span{font-size:14px;font-weight:600;letter-spacing:2.5px;opacity:.8}
+.hart-hero-orbwrap{position:relative;width:300px;height:300px;display:flex;align-items:center;justify-content:center}
+#hart-voice-orb{width:300px;height:300px;background:transparent;pointer-events:none;
+  filter:drop-shadow(0 12px 44px rgba(108,99,255,.25))}
+.hart-hero-mic{position:absolute;left:50%;top:50%;width:88px;height:88px;transform:translate(-50%,-50%);
+  border-radius:50%;cursor:pointer;border:1px solid var(--hart-glass-border);
+  background:radial-gradient(circle at 50% 34%,rgba(108,99,255,.30),rgba(15,14,23,.42));
+  backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;
+  transition:transform .25s cubic-bezier(.175,.885,.32,1.275),box-shadow .25s,background .25s}
+.hart-hero-mic .mi{font-size:36px;color:#fff;opacity:.92}
+.hart-hero-mic:hover{transform:translate(-50%,-50%) scale(1.07);box-shadow:0 10px 34px rgba(108,99,255,.45)}
+.hart-hero-mic:active{transform:translate(-50%,-50%) scale(.97)}
+.hart-hero-mic.listening{background:radial-gradient(circle at 50% 34%,rgba(255,107,107,.42),rgba(15,14,23,.42));
+  box-shadow:0 0 0 5px rgba(255,107,107,.22),0 10px 34px rgba(255,107,107,.35)}
+.hart-hero-status{font-size:13px;font-weight:500;letter-spacing:.3px;color:var(--hart-muted);min-height:18px;
+  transition:color .3s;max-width:560px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hart-hero-status.thinking{color:var(--hart-accent)}
+.hart-hero-bar{display:flex;align-items:center;gap:10px;width:100%;padding:7px 8px 7px 18px;
+  border-radius:var(--ds-radius-full);transition:box-shadow .25s,border-color .25s}
+.hart-hero-bar:focus-within{box-shadow:0 0 0 2px var(--hart-accent),0 18px 50px rgba(0,0,0,.42)}
+.hart-hero-bar-ic{font-size:21px;color:var(--hart-muted);flex-shrink:0}
+.hart-hero-input{flex:1;min-width:0;background:transparent;border:none;outline:none;color:var(--hart-text);
+  font-family:var(--ds-font-body);font-size:15.5px;letter-spacing:.2px}
+.hart-hero-input::placeholder{color:var(--hart-muted)}
+.hart-hero-go{width:42px;height:42px;border-radius:50%;border:none;flex-shrink:0;cursor:pointer;
+  background:var(--hart-accent);color:var(--hart-on-accent);display:flex;align-items:center;justify-content:center;
+  transition:transform .18s cubic-bezier(.175,.885,.32,1.275),filter .18s}
+.hart-hero-go:hover{filter:brightness(1.12);transform:scale(1.08)}
+.hart-hero-go:active{transform:scale(.94)}
+.hart-hero-go .mi{font-size:21px}
+.hart-hero-hevolve{display:flex;align-items:center;gap:7px;height:16px;opacity:0;font-size:11px;font-weight:600;
+  letter-spacing:1.2px;text-transform:uppercase;color:var(--hart-muted);transition:opacity .3s}
+.hart-hero-hevolve.on{opacity:.9}
+.hart-hero-hevolve .dot{width:7px;height:7px;border-radius:50%;background:var(--hart-accent);
+  box-shadow:0 0 10px var(--hart-accent);animation:hart-hevolve-pulse 1s ease-in-out infinite}
+@keyframes hart-hevolve-pulse{0%,100%{transform:scale(.7);opacity:.5}50%{transform:scale(1.15);opacity:1}}
+.hart-hero-chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:2px}
+.hart-hero-chip{padding:7px 15px;border-radius:var(--ds-radius-full);font-size:12px;font-weight:500;
+  background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);color:var(--hart-text);cursor:pointer;
+  font-family:var(--ds-font-body);transition:background .18s,transform .18s cubic-bezier(.175,.885,.32,1.275),box-shadow .18s}
+.hart-hero-chip:hover{background:var(--hart-surface-hover);transform:translateY(-2px);box-shadow:0 6px 18px rgba(0,0,0,.28)}
+.hart-hero-chip:active{transform:translateY(0)}
+
+/* ── Buttery spring micro-animations on existing chrome ── */
+.start-item{transition:background var(--hart-anim-speed),transform .18s cubic-bezier(.175,.885,.32,1.275)}
+.start-item:hover{transform:translateY(-2px) scale(1.02)}
+.taskbar-chip{transition:background .15s,transform .18s cubic-bezier(.175,.885,.32,1.275)}
+.taskbar-chip:hover{transform:translateY(-2px)}
+.tray-btn{transition:background var(--hart-anim-speed),transform .18s cubic-bezier(.175,.885,.32,1.275)}
+.tray-btn:hover{transform:translateY(-1px) scale(1.05)}
+.start-logo{width:20px;height:20px;flex-shrink:0}
+.top-bar .start-btn:hover .start-logo{filter:drop-shadow(0 0 8px var(--hart-accent))}
+@media(prefers-reduced-motion:reduce){.hart-ambient,.hart-hero-hevolve .dot{animation:none}}
+html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot{animation:none}
+'''
+
+        # ═══ Desktop icon layer (drag-drop, grid-snapped, persisted) ═══
+        # Plain string interpolated via {_CSS_DESKTOP}. The layer is
+        # pointer-events:none (so empty-desktop right-click still reaches the
+        # wallpaper menu); only the icons capture pointer events.
+        _CSS_DESKTOP = '''
+.hart-desktop{position:fixed;left:0;right:0;top:var(--hart-topbar-height);bottom:44px;z-index:20;pointer-events:none}
+.desktop-icon{position:absolute;width:84px;display:flex;flex-direction:column;align-items:center;gap:6px;
+  padding:8px 4px;border-radius:12px;cursor:pointer;pointer-events:auto;user-select:none;
+  transition:background .15s,transform .12s cubic-bezier(.175,.885,.32,1.275);will-change:transform}
+.desktop-icon:hover{background:rgba(255,255,255,0.08)}
+.desktop-icon:focus-visible{outline:2px solid var(--hart-accent);outline-offset:2px}
+.desktop-icon.dragging{z-index:60;transition:none;opacity:.92;cursor:grabbing}
+.desktop-icon .di-glyph{width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;
+  background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);
+  box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.08),0 4px 12px rgba(0,0,0,.28)}
+.desktop-icon:hover .di-glyph{box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.12),0 8px 20px rgba(0,0,0,.36);transform:translateY(-1px)}
+.desktop-icon .di-glyph .mi{font-size:28px;color:var(--hart-accent)}
+.desktop-icon .di-label{font-size:11px;line-height:1.25;text-align:center;max-width:80px;color:var(--hart-text);
+  text-shadow:0 1px 3px rgba(0,0,0,.6);overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+/* ── Virtual-desktop switcher (bottom-center) + settings squares ── */
+.hart-ws-switcher{position:fixed;bottom:6px;left:50%;transform:translateX(-50%);z-index:8050;display:flex;gap:4px;padding:4px 6px;border-radius:999px}
+.hart-ws-dot{width:26px;height:20px;border:none;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;
+  background:transparent;color:var(--hart-muted);font-family:var(--ds-font-body);
+  transition:background .15s,color .15s,transform .15s cubic-bezier(.175,.885,.32,1.275)}
+.hart-ws-dot:hover{background:var(--hart-surface-hover);transform:translateY(-1px)}
+.hart-ws-dot.active{background:var(--hart-accent);color:var(--hart-on-accent)}
+.hart-ws-square{aspect-ratio:16/9;border-radius:8px;background:#1a1a1a;border:2px solid transparent;
+  display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--hart-muted);font-weight:600;
+  transition:border-color .15s,background .15s,color .15s}
+.hart-ws-square:hover{background:rgba(255,255,255,0.06)}
+.hart-ws-square.active{border-color:var(--hart-accent);background:rgba(255,255,255,0.08);color:var(--hart-accent)}
+/* ── Themes / Wallpaper gallery (Personalize panel) ── */
+.hart-gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(116px,1fr));gap:10px;padding:4px 0 8px}
+.hart-tile{cursor:pointer;border-radius:10px;transition:transform .15s cubic-bezier(.175,.885,.32,1.275)}
+.hart-tile:hover{transform:translateY(-3px)}
+.hart-tile:focus-visible{outline:2px solid var(--hart-accent);outline-offset:2px}
+.hart-tile .htc-prev{position:relative;aspect-ratio:16/10;border-radius:10px;overflow:hidden;
+  border:1px solid var(--hart-glass-border);box-shadow:0 4px 12px rgba(0,0,0,.3)}
+.hart-tile:hover .htc-prev{border-color:var(--hart-accent)}
+.hart-tile .htc-dot{position:absolute;left:8px;bottom:8px;width:16px;height:16px;border-radius:50%;
+  box-shadow:0 0 8px currentColor,inset 0 0 0 2px rgba(255,255,255,0.25)}
+.hart-tile .htc-name{font-size:11px;color:var(--hart-text);text-align:center;margin-top:5px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* ── Marketplace app cards ── */
+.hart-app-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-bottom:8px}
+.hart-app-card{display:flex;align-items:center;gap:10px;padding:10px;border-radius:12px;
+  background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);
+  transition:transform .15s cubic-bezier(.175,.885,.32,1.275),box-shadow .15s}
+.hart-app-card:hover{transform:translateY(-2px);box-shadow:0 8px 20px rgba(0,0,0,.3)}
+.hart-app-card .hac-ic{width:42px;height:42px;flex-shrink:0;border-radius:10px;display:flex;align-items:center;justify-content:center;
+  background:rgba(255,255,255,0.05);border:1px solid var(--hart-glass-border)}
+.hart-app-card .hac-ic .mi{font-size:24px;color:var(--hart-accent)}
+.hart-app-card .hac-body{flex:1;min-width:0}
+.hart-app-card .hac-name{font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hart-app-card .hac-desc{font-size:11px;color:var(--hart-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* ── Buttery: window spring-open + dock perf hint (Phase D) ── */
+@keyframes hart-panel-in{from{opacity:0;transform:scale(.92) translateY(14px)}to{opacity:1;transform:scale(1) translateY(0)}}
+.panel{animation:hart-panel-in .3s cubic-bezier(.175,.885,.32,1.275)}
+.taskbar-chip{will-change:transform}
+@media(prefers-reduced-motion:reduce){.panel{animation:none}}
+html.a11y-rmotion .panel{animation:none}
+'''
+
         return f'''<!DOCTYPE html>
 <html lang="en" class="{a11y_cls}"><head>
 <meta charset="utf-8">
@@ -1154,17 +1313,42 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 /* ── Animations ── */
 {_CSS_ANIMATIONS if not is_potato else _CSS_NO_ANIMATIONS}
 {_CSS_DESIGN_SYSTEM}
+{_CSS_HERO}
+{_CSS_DESKTOP}
 {_CSS_POTATO_OVERRIDE if is_potato else ''}
 </style>
 </head>
 <body>
 <div class="wallpaper"></div>
+{'<div class="hart-ambient" aria-hidden="true"></div><div class="hart-grain" aria-hidden="true"></div>' if not is_potato else ''}
+<div class="hart-vignette" aria-hidden="true"></div>
+<!-- Desktop icon layer (drag-drop apps); populated by hartDesktop.js -->
+<div class="hart-desktop" id="hart-desktop" aria-label="Desktop icons"></div>
 <a href="#panels" class="skip-link">Skip to content</a>
+
+<!-- HART OS hero — voice-first command center (the desktop centerpiece). The
+     orb canvas below is the SAME #hart-voice-orb driven by initHartOrb; the bar
+     fuses search + agent dispatch + the voice transcript sink. -->
+<div class="hart-hero" id="hart-hero" role="search" aria-label="HART command center">
+  <div class="hart-hero-brand"><img src="/shell/static/hart-logo.svg" alt="HART OS" draggable="false"><span>HART OS</span></div>
+  <div class="hart-hero-orbwrap">
+    <canvas id="hart-voice-orb" width="360" height="360" aria-hidden="true"></canvas>
+    <button class="hart-hero-mic" id="hart-hero-mic" type="button" aria-label="Speak to HART (Super+Space)" title="Click or press Super+Space to speak"><span class="mi material-icons-round" aria-hidden="true">mic</span></button>
+  </div>
+  <div class="hart-hero-status" id="hart-hero-status" role="status" aria-live="polite">Ask HART anything — say it or type it</div>
+  <div class="hart-hero-bar glass">
+    <span class="mi material-icons-round hart-hero-bar-ic" aria-hidden="true">search</span>
+    <input id="hart-hero-input" class="hart-hero-input" type="text" autocomplete="off" spellcheck="false" placeholder="Search apps, ask the agent, or speak…" aria-label="Command and search">
+    <button class="hart-hero-go" id="hart-hero-go" type="button" aria-label="Send"><span class="mi material-icons-round" aria-hidden="true">arrow_forward</span></button>
+  </div>
+  <div class="hart-hero-hevolve" id="hart-hero-hevolve" aria-hidden="true"><span class="dot"></span>Hevolve AI</div>
+  <div class="hart-hero-chips" id="hart-hero-chips"></div>
+</div>
 
 <!-- Top Bar -->
 <div class="top-bar glass" role="banner">
   <div class="start-btn" role="button" tabindex="0" aria-haspopup="menu" aria-label="Start menu" onclick="toggleStartMenu()" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Start Menu (Super)">
-    <span class="mi material-icons-round" aria-hidden="true">hexagon</span>
+    <img src="/shell/static/hart-logo.svg" class="start-logo" alt="" aria-hidden="true" draggable="false">
     <span>HART</span>
   </div>
   <div class="top-bar-center" id="agent-status" role="status" aria-live="polite" aria-label="Agent status"></div>
@@ -1187,11 +1371,18 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <div class="panel-container" id="panels" role="main" aria-label="Open windows"></div>
 
 <!-- Agent Pill (click to expand floating chat) -->
-<!-- HART OS native voice orb — frameless, transparent, no React (the OS shell
-     draws its own visualiser via /shell/static/voiceOrbViz.js) -->
-<canvas id="hart-voice-orb" width="320" height="320" aria-hidden="true"
-  style="position:fixed;right:16px;bottom:108px;width:160px;height:160px;z-index:1490;pointer-events:none;background:transparent;opacity:0;transition:opacity .4s ease"></canvas>
+<!-- Voice orb visualiser + hero orchestrator. The orb canvas now lives inside
+     #hart-hero (centerpiece); initHartOrb still finds #hart-voice-orb and drives
+     it. hartHero.js fuses the orb with the command bar, reusing toggleVoice /
+     acSend / openPanel — one pipeline, no fork. Loaded after the inline script. -->
+<script src="/shell/static/hartSession.js"></script>
 <script src="/shell/static/voiceOrbViz.js"></script>
+<script src="/shell/static/hartHero.js"></script>
+<script src="/shell/static/hartDesktop.js"></script>
+<script src="/shell/static/hartWorkspaces.js"></script>
+<script src="/shell/static/hartPersonalize.js"></script>
+<script src="/shell/static/hartMarketplace.js"></script>
+<script src="/shell/static/hartDock.js"></script>
 
 <div class="agent-pill glass" id="agent-pill" onclick="toggleAssistantChat()">
   <span class="mi material-icons-round" style="color:var(--hart-accent)">chat_bubble</span>
@@ -1241,6 +1432,9 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 <!-- Taskbar (open panels as chips) -->
 <div class="taskbar glass" id="taskbar" role="navigation" aria-label="Taskbar"></div>
+
+<!-- Virtual-desktop switcher (client-side; populated by hartWorkspaces.js) -->
+<div class="hart-ws-switcher glass" id="hart-ws-switcher" role="tablist" aria-label="Virtual desktops"></div>
 
 <!-- Toast Notifications -->
 <div class="toast-container" id="toast-container" role="status" aria-live="polite"></div>
@@ -2701,25 +2895,11 @@ function loadDateTimePanel(el) {{
 
 // ═══ Wallpaper ═══
 function loadWallpaperPanel(el) {{
-  Promise.all([
-    fetch(SHELL+'/api/shell/wallpaper',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}})),
-    fetch(SHELL+'/api/shell/wallpaper/collection',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).catch(()=>({{}}))
-  ]).then(([cur,col])=>{{
-    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Wallpaper</div>';
-    html += dsStatusRow('wallpaper', 'Current', (cur.path||'Default').split('/').pop(), 'var(--hart-accent)');
-    const walls = col.wallpapers||[];
-    if(walls.length>0) {{
-      html += '<div class="ds-section-label">Collection</div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px">';
-      walls.slice(0,12).forEach(w=>{{
-        html += '<div style="aspect-ratio:16/9;border-radius:8px;background:#1a1a1a;cursor:pointer;overflow:hidden;border:2px solid transparent" '+
-          'onclick="fetch(SHELL+\\'/api/shell/wallpaper/set\\',{{method:\\'POST\\',headers:{{\\'Content-Type\\':\\'application/json\\'}},body:JSON.stringify({{path:\\''+w.path.replace(/'/g,"\\\\'")+'\\'}})}}); showToast(\\'Wallpaper\\',\\'Set\\',\\'success\\')">'+
-          '<img src="'+SHELL+'/api/shell/files/thumb?path='+encodeURIComponent(w.path)+'" style="width:100%;height:100%;object-fit:cover" onerror="this.parentNode.innerHTML=\\'<div style=padding:8px;font-size:11px>'+w.name+'</div>\\'"></div>';
-      }});
-      html += '</div>';
-    }}
-    html += '</div>';
-    el.innerHTML = html;
-  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Wallpaper settings unavailable</div>'; }});
+  // Personalize = themes gallery + wallpaper chooser (Phase B). The heavy HTML
+  // lives in hartPersonalize.js (window.hartRenderPersonalize) so this stays a
+  // brace-escape-free delegate; it reuses applyPreset + the wallpaper routes.
+  if(window.hartRenderPersonalize) {{ window.hartRenderPersonalize(el); }}
+  else {{ el.innerHTML = '<div class="ds-body-md ds-text-muted">Personalize loading&hellip;</div>'; setTimeout(function(){{loadWallpaperPanel(el)}}, 400); }}
 }}
 
 // ═══ Keyboard & Input Methods ═══
@@ -2754,20 +2934,21 @@ function loadNightLightPanel(el) {{
 
 // ═══ Workspaces ═══
 function loadWorkspacesPanel(el) {{
-  fetch(SHELL+'/api/shell/workspaces',{{signal:AbortSignal.timeout(5000)}}).then(r=>r.json()).then(data=>{{
-    const ws = data.workspaces||[];
-    const current = data.current||1;
-    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Workspaces</div>'+
-      '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:8px;padding:16px 0">';
-    (ws.length>0?ws:([1,2,3,4].map(i=>({{number:i}})))).forEach(w=>{{
-      const num = w.number||w.id;
-      const active = num===current;
-      html += '<div style="aspect-ratio:16/9;border-radius:8px;background:'+(active?'var(--hart-accent-10)':'#1a1a1a')+';border:2px solid '+(active?'var(--hart-accent)':'transparent')+';display:flex;align-items:center;justify-content:center;cursor:pointer">'+
-        '<span class="ds-title-sm '+(active?'ds-text-accent':'ds-text-muted')+'">'+num+'</span></div>';
-    }});
-    html += '</div></div>';
-    el.innerHTML = html;
-  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Workspaces unavailable</div>'; }});
+  // Two distinct layers, deliberately: the COMPOSITOR-workspace route
+  // /api/shell/workspaces (shell_desktop_apis.py, sway-backed) returns a single
+  // fallback workspace under the cage kiosk, so it is NOT the source here. The
+  // shell's own floating panels are grouped into virtual desktops client-side by
+  // hartWorkspaces.js — the meaningful "desktops" on a one-window kiosk. This
+  // panel reflects THAT state; squares live-sync via hartWorkspaces.apply().
+  var info = (window.hartWorkspaceInfo && window.hartWorkspaceInfo()) || {{count:4,current:1}};
+  var html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Workspaces</div>'+
+    '<div class="ds-body-sm ds-text-muted" style="margin-bottom:8px">Virtual desktops &mdash; switch with Ctrl+Alt+Arrows, Ctrl+Alt+number, the bottom switcher, or click below.</div>'+
+    '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:8px;padding:8px 0">';
+  for(var i=1;i<=info.count;i++) {{
+    html += '<div class="hart-ws-square'+(i===info.current?' active':'')+'" data-ws-square="'+i+'" onclick="window.hartSwitchWorkspace&&hartSwitchWorkspace('+i+')">'+i+'</div>';
+  }}
+  html += '</div><div class="ds-body-sm ds-text-muted" style="margin-top:8px">Open windows stay on the desktop where you launched them.</div></div>';
+  el.innerHTML = html;
 }}
 
 // ═══ Calculator ═══
@@ -2825,11 +3006,11 @@ function loadNotesAppPanel(el) {{
 
 // ═══ App Store ═══
 function loadAppStorePanel(el) {{
-  el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">App Store</div>'+
-    '<div style="display:flex;gap:8px;margin-bottom:12px">'+
-    '<input id="appstore-search" type="text" placeholder="Search packages..." style="flex:1;background:#1a1a1a;border:1px solid #333;color:var(--hart-text);border-radius:8px;padding:8px 12px;font-size:14px" onkeydown="if(event.key===\\'Enter\\')appStoreSearch()">'+
-    dsBtn('Search',{{variant:'primary',cls:'ds-btn-sm',onclick:'appStoreSearch()'}})+'</div>'+
-    '<div id="appstore-results" class="ds-stagger"><div class="ds-body-md ds-text-muted">Search for Nix, Flatpak, or AppImage packages</div></div></div>';
+  // Marketplace (Phase C): curated Flathub catalog + search + AI-recommend. The
+  // heavy HTML lives in hartMarketplace.js (window.hartRenderMarketplace) so this
+  // stays a brace-safe delegate; it reuses /api/apps/search + /api/apps/install.
+  if(window.hartRenderMarketplace) {{ window.hartRenderMarketplace(el); }}
+  else {{ el.innerHTML = '<div class="ds-body-md ds-text-muted">Marketplace loading&hellip;</div>'; setTimeout(function(){{loadAppStorePanel(el)}}, 400); }}
 }}
 function appStoreSearch() {{
   const q = document.getElementById('appstore-search');
@@ -3450,8 +3631,11 @@ document.addEventListener('contextmenu', e => {{
   // Desktop right-click
   if(e.target.classList.contains('wallpaper')||e.target===document.body) {{
     menu.innerHTML = [
-      ctxItem('palette','Appearance','openPanel("appearance")'),
-      ctxItem('wallpaper','Wallpaper','openPanel("appearance")'),
+      ctxItem('add_to_home_screen','Add app to desktop','window.hartAddAppPicker&&hartAddAppPicker()'),
+      ctxItem('grid_view','Auto-arrange icons','window.hartAutoArrange&&hartAutoArrange()'),
+      ctxSep(),
+      ctxItem('palette','Personalize','openPanel("wallpaper_manager")'),
+      ctxItem('wallpaper','Wallpaper','openPanel("wallpaper_manager")'),
       ctxSep(),
       ctxItem('terminal','Terminal','launchApp("terminal")'),
       ctxItem('refresh','Refresh','location.reload()'),
@@ -3579,6 +3763,7 @@ async function startRecording() {{
         const r = await fetch(SHELL+'/api/voice', {{method:'POST', body:formData}});
         const data = await r.json();
         if(data.text) {{
+          if(window.HartHeroShowTranscript) window.HartHeroShowTranscript(data.text);
           const aci = document.getElementById('ac-input');
           if(aci) {{ aci.value = data.text; acSend(); }}
         }} else if(data.error) {{

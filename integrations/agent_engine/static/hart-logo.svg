@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none" role="img" aria-label="HART OS">
+  <!-- HART OS mark: a geometric heart with circuit-board traces emanating from
+       within — the union of human compassion and machine intelligence.
+       Accent #00D4AA (HART teal). Transparent background for use on dark. -->
+  <defs>
+    <linearGradient id="hart-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#00E6BA"/>
+      <stop offset="1" stop-color="#00A88E"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Heart outline (chamfered, geometric) -->
+  <path d="M128 214 L58 144 A40 40 0 0 1 114 88 L128 102 L142 88 A40 40 0 0 1 198 144 Z"
+        stroke="url(#hart-grad)" stroke-width="9" stroke-linejoin="round" fill="none"/>
+
+  <!-- Circuit traces radiating from the core -->
+  <g stroke="#00D4AA" stroke-width="4.5" stroke-linecap="round" opacity="0.95">
+    <path d="M128 168 L128 132"/>
+    <path d="M128 146 L98 146"/>
+    <path d="M128 146 L158 146"/>
+    <path d="M98 146 L88 128"/>
+    <path d="M158 146 L168 128"/>
+    <path d="M128 132 L128 116"/>
+  </g>
+
+  <!-- Circuit nodes -->
+  <g fill="#00D4AA">
+    <circle cx="128" cy="170" r="7"/>
+    <circle cx="128" cy="112" r="6"/>
+    <circle cx="86" cy="125" r="5"/>
+    <circle cx="170" cy="125" r="5"/>
+    <circle cx="98" cy="146" r="4"/>
+    <circle cx="158" cy="146" r="4"/>
+  </g>
+</svg>
