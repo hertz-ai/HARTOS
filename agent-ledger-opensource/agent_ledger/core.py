@@ -1447,8 +1447,17 @@ class SmartLedger:
         self._heartbeat.start()
         logger.info(f"Heartbeat enabled for ledger {self.agent_id}")
 
-    def add_task(self, task: Task) -> bool:
-        """Add a new task to ledger."""
+    def add_task(self, task: Task, defer_save: bool = False) -> bool:
+        """Add a new task to ledger.
+
+        defer_save=True does the in-memory insert under _lock but SKIPS the
+        per-add backend.save (a full json.dump of the entire ledger). A bulk
+        caller adding a parent + N children (TaskCoordinator.submit_goal) sets
+        it so the K+3 full-ledger serializes collapse to ONE explicit save()
+        at the end — the GIL-held json.dump storm py-spy caught starving
+        Nunba's UI/Flask/SSE threads (2026-06-13, #145). Default False keeps
+        the always-persist contract for every other caller.
+        """
         with self._lock:
             if task.task_id in self.tasks:
                 logger.warning(f"Task {task.task_id} already exists")
@@ -1457,7 +1466,8 @@ class SmartLedger:
             self.tasks[task.task_id] = task
             if task.task_id not in self.task_order:
                 self.task_order.append(task.task_id)
-            self.save()
+            if not defer_save:
+                self.save()
             logger.info(f"Added task {task.task_id}: {task.description}")
             return True
 
@@ -1467,9 +1477,16 @@ class SmartLedger:
         status: TaskStatus,
         error_message: Optional[str] = None,
         result: Optional[Any] = None,
-        reason: Optional[str] = None
+        reason: Optional[str] = None,
+        defer_save: bool = False
     ):
-        """Update task status with validation and automatic dependency management."""
+        """Update task status with validation and automatic dependency management.
+
+        defer_save=True applies the status change + side-effects (state history,
+        _handle_task_completion on COMPLETED) in-memory under _lock but SKIPS the
+        backend.save, leaving the disk write to a bulk caller's single save()
+        (see add_task). Default False keeps the always-persist contract.
+        """
         with self._lock:
             if task_id not in self.tasks:
                 logger.error(f"Task {task_id} not found")
@@ -1507,7 +1524,8 @@ class SmartLedger:
             if error_message:
                 task.error_message = error_message
 
-            self.save()
+            if not defer_save:
+                self.save()
             logger.info(f"Updated task {task_id} status to {status}")
             return True
 

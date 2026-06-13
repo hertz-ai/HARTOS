@@ -120,8 +120,12 @@ class DistributedTaskCoordinator:
         )
         parent.context["objective"] = objective
         parent.context.update(context)
-        self._ledger.add_task(parent)
-        self._ledger.update_task_status(goal_id, TaskStatus.IN_PROGRESS)
+        # defer_save batches the parent + status + every child into the single
+        # save() below. Without it each add re-serialized the whole ledger —
+        # K+3 GIL-held json.dumps per goal, the json.dump storm py-spy caught
+        # pinning the CPU + starving the UI ~5 min after boot (2026-06-13, #145).
+        self._ledger.add_task(parent, defer_save=True)
+        self._ledger.update_task_status(goal_id, TaskStatus.IN_PROGRESS, defer_save=True)
 
         # Create child tasks
         for task_def in decomposed_tasks:
@@ -135,7 +139,7 @@ class DistributedTaskCoordinator:
             # Inherit parent context so children know the domain
             child.context.update(context)
             child.parent_task_id = goal_id
-            self._ledger.add_task(child)
+            self._ledger.add_task(child, defer_save=True)
             parent.child_task_ids.append(child_id)
 
         self._ledger.save()
