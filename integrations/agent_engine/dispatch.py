@@ -269,6 +269,42 @@ def is_transient_deferral() -> bool:
         return False
 
 
+# Concurrency ceiling for autonomous dispatch — single source both daemons call
+# so the policy can't drift (Gate-2/4).  The 2026-06-13 sluggishness: agent_daemon
+# AND coding_daemon each dispatched up to HEVOLVE_*_MAX_CONCURRENT (default 10)
+# concurrent CREATE pipelines while the user was away; on a 16-core desktop that
+# + the UI webview pinned every core for minutes (user had to kill Nunba).
+# should_yield_to_user() reason #3 is — by the #60 external-CPU design —
+# deliberately blind to our OWN cpu, so it never bounds the swarm; this cap must.
+_DEFAULT_AUTONOMOUS_CORE_RESERVE = 6   # cores kept free for the UI compositor + a live chat turn
+_CORES_PER_PIPELINE = 4                # ~logical cores a CREATE pipeline (4B client + autogen + tool subproc) uses
+
+
+def max_autonomous_concurrency(env_cap, cores=None, reserve=None) -> int:
+    """Cap concurrent autonomous dispatches to leave CPU headroom for the user.
+
+    Returns ``min(env_cap, headroom)`` where ``headroom = (cores - reserve) //
+    _CORES_PER_PIPELINE``, floored at 1 so the flywheel always makes progress.
+    A many-core server keeps its full env cap; a desktop is bounded to 1-2 so the
+    autonomous swarm never pegs every core (the 2026-06-13 incident).  Applied on
+    top of the existing throttle/override math, NOT in place of it — a pure
+    additional ceiling.
+
+    Env: ``HEVOLVE_AUTONOMOUS_CORE_RESERVE`` (default 6).  ``cores``/``reserve``
+    args exist for deterministic tests.
+    """
+    try:
+        if reserve is None:
+            reserve = int(os.environ.get('HEVOLVE_AUTONOMOUS_CORE_RESERVE',
+                                         str(_DEFAULT_AUTONOMOUS_CORE_RESERVE)))
+        if cores is None:
+            cores = os.cpu_count() or 4
+        headroom = max(1, (cores - reserve) // _CORES_PER_PIPELINE)
+        return max(1, min(int(env_cap), headroom))
+    except Exception:
+        return max(1, int(env_cap))
+
+
 def should_yield_to_user() -> bool:
     """Single canonical gate every background daemon must call.
 

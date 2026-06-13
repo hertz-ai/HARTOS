@@ -702,7 +702,8 @@ class AgentDaemon:
         from integrations.social.models import get_db, AgentGoal, Product
         from integrations.coding_agent.idle_detection import IdleDetectionService
         from .goal_manager import GoalManager, CODING_GOAL_TYPES
-        from .dispatch import dispatch_goal, should_yield_to_user
+        from .dispatch import (dispatch_goal, should_yield_to_user,
+                               max_autonomous_concurrency)
 
         # Single canonical yield gate — user activity + system pressure.
         # See dispatch.should_yield_to_user() docstring for the contract.
@@ -807,6 +808,10 @@ class AgentDaemon:
             # the flywheel actually move on these ticks.
             if not _override_active:
                 max_concurrent = max(1, int(max_concurrent * _throttle))
+            # Headroom ceiling — applies even under starvation override so a
+            # force-tick can't drain a wide batch that pegs every core + starves
+            # the UI (2026-06-13).  Shared policy, see dispatch.py.
+            max_concurrent = max_autonomous_concurrency(max_concurrent)
 
             # Minimum interval between dispatches for continuous goals.
             # Without this, a continuous goal (e.g. autoresearch coordinator)

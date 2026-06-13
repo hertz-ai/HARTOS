@@ -187,6 +187,10 @@ class CodingAgentDaemon:
             agent_idx = 0
             used_agents = set()
             max_concurrent = int(os.environ.get('HEVOLVE_CODING_MAX_CONCURRENT', '10'))
+            # Headroom ceiling so the coding swarm leaves cores for the user +
+            # UI (2026-06-13).  Shared policy, see dispatch.max_autonomous_concurrency.
+            from integrations.agent_engine.dispatch import max_autonomous_concurrency
+            max_concurrent = max_autonomous_concurrency(max_concurrent)
             now = datetime.utcnow()
 
             for goal in goals:
