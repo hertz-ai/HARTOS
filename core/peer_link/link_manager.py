@@ -22,6 +22,8 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
+from core.foreground import should_yield_to_user
+
 from .link import PeerLink, TrustLevel, LinkState
 
 logger = logging.getLogger('hevolve.peer_link')
@@ -321,6 +323,16 @@ class PeerLinkManager:
     def _maintenance_loop(self):
         """Background: prune idle links, attempt reconnects, key rotation."""
         while self._running:
+            # Yield the box when a user request is in flight / it's hot: skip
+            # this tick's heavy work and re-check after one cadence interval.
+            # Defers via the loop's OWN sleep primitive (never a bare continue),
+            # so there is no busy-spin and clean shutdown is still honoured.
+            if should_yield_to_user():
+                for _ in range(30):  # one cadence interval (30 s)
+                    if not self._running:
+                        break
+                    time.sleep(1)
+                continue
             try:
                 self._prune_idle_links()
                 self._attempt_reconnects()

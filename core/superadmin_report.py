@@ -22,6 +22,7 @@ import time
 import uuid
 from typing import Dict, List, Optional
 
+from core.foreground import should_yield_to_user
 from core.superadmins import (
     SUPERADMIN_CENTRAL_URLS,
     SUPERADMIN_FALLBACK_CENTRAL_URLS,
@@ -226,6 +227,82 @@ _loop_started = False
 _loop_lock = threading.Lock()
 
 
+def _heartbeat_safe() -> None:
+    """Best-effort watchdog heartbeat — same pattern as the other
+    long-cadence daemons (peer_discovery, AutoDiscovery).  Without this,
+    a watchdog with frozen-threshold < REPORT_OUTBOX_RETRY_SEC would
+    flag this thread as stalled.
+
+    MUST fire every loop iteration — independent of the yield gate — so
+    deferring the report/drain work never reads as a frozen thread."""
+    try:
+        from security.node_watchdog import get_watchdog
+        wd = get_watchdog()
+        if wd:
+            wd.heartbeat('superadmin_report')
+    except Exception:
+        pass
+
+
+def _report_drain_tick(get_node_info_callable, last_report: float) -> float:
+    """The loop's HEAVY work for one tick: report-in (when the interval
+    has elapsed) + outbox drain.  Returns the (possibly-updated)
+    ``last_report`` timestamp so the caller carries cadence forward.
+
+    Pure of the yield gate and the sleep — extracted so the yield gate
+    skips exactly this work."""
+    try:
+        now = time.time()
+        if now - last_report >= REPORT_INTERVAL_SEC:
+            try:
+                info = get_node_info_callable() or {}
+                if info.get('node_id'):
+                    n = report_join(info)
+                    if n > 0:
+                        logger.info(
+                            f"Reported to {n}/"
+                            f"{len(SUPERADMIN_CENTRAL_URLS)} "
+                            f"superadmin centrals")
+            except Exception as e:
+                logger.debug(f"Periodic report-in error: {e}")
+            last_report = now
+        # Always drain the outbox (cheap when empty).
+        try:
+            drained = drain_outbox()
+            if drained:
+                logger.info(f"Outbox drained {drained} stale reports")
+        except Exception as e:
+            logger.debug(f"Outbox drain error: {e}")
+    except Exception as e:
+        logger.debug(f"Report loop tick error: {e}")
+    return last_report
+
+
+def _loop_once(get_node_info_callable, last_report: float) -> float:
+    """Run exactly ONE iteration of the background loop and block for the
+    inter-tick interval.  Returns the carried-forward ``last_report``.
+
+    Single source of the per-iteration logic (shared by ``_loop`` and the
+    unit test).  Order is load-bearing:
+
+    1. ``_heartbeat_safe()`` ALWAYS fires first — before the yield gate —
+       so a busy box / live user turn that defers the report+drain work
+       never reads as a frozen thread to the watchdog.
+    2. ``should_yield_to_user()`` (the SINGLE canonical gate) — when True,
+       skip THIS tick's heavy work (report_join + drain_outbox) and just
+       sleep one interval (the loop's OWN sleep primitive).  Never a bare
+       ``continue`` — that would busy-spin a core, the exact bug removed.
+    3. Otherwise do the heavy work, then sleep the same interval — so the
+       cadence is identical whether or not we yielded."""
+    _heartbeat_safe()
+    if should_yield_to_user():
+        time.sleep(REPORT_OUTBOX_RETRY_SEC)
+        return last_report
+    last_report = _report_drain_tick(get_node_info_callable, last_report)
+    time.sleep(REPORT_OUTBOX_RETRY_SEC)
+    return last_report
+
+
 def start_background_loop(get_node_info_callable) -> None:
     """Start the periodic report + outbox-drain loop.
 
@@ -246,47 +323,8 @@ def start_background_loop(get_node_info_callable) -> None:
         # chance to settle and the node_info dict is populated.
         time.sleep(15)
         last_report = 0.0
-
-        def _heartbeat_safe():
-            """Best-effort watchdog heartbeat — same pattern as the
-            other long-cadence daemons (peer_discovery, AutoDiscovery).
-            Without this, a watchdog with frozen-threshold < REPORT_
-            OUTBOX_RETRY_SEC would flag this thread as stalled."""
-            try:
-                from security.node_watchdog import get_watchdog
-                wd = get_watchdog()
-                if wd:
-                    wd.heartbeat('superadmin_report')
-            except Exception:
-                pass
-
         while True:
-            _heartbeat_safe()
-            try:
-                now = time.time()
-                if now - last_report >= REPORT_INTERVAL_SEC:
-                    try:
-                        info = get_node_info_callable() or {}
-                        if info.get('node_id'):
-                            n = report_join(info)
-                            if n > 0:
-                                logger.info(
-                                    f"Reported to {n}/"
-                                    f"{len(SUPERADMIN_CENTRAL_URLS)} "
-                                    f"superadmin centrals")
-                    except Exception as e:
-                        logger.debug(f"Periodic report-in error: {e}")
-                    last_report = now
-                # Always drain the outbox (cheap when empty).
-                try:
-                    drained = drain_outbox()
-                    if drained:
-                        logger.info(f"Outbox drained {drained} stale reports")
-                except Exception as e:
-                    logger.debug(f"Outbox drain error: {e}")
-            except Exception as e:
-                logger.debug(f"Report loop tick error: {e}")
-            time.sleep(REPORT_OUTBOX_RETRY_SEC)
+            last_report = _loop_once(get_node_info_callable, last_report)
 
     t = threading.Thread(target=_loop, name='superadmin-report-in', daemon=True)
     t.start()

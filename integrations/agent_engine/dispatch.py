@@ -386,6 +386,19 @@ def should_yield_to_user() -> bool:
     return reason is not None
 
 
+# Register this gate as the canonical one for ``core/`` background loops, which
+# must NOT import ``integrations/`` (layering: integrations -> core OK, core ->
+# integrations BANNED).  Inversion of control mirroring ``core.foreground``'s
+# ``set_genuine_check`` — ``core.foreground.should_yield_to_user`` then proxies
+# here.  Best-effort: if ``core.foreground`` is unavailable the core accessor
+# simply fails open (returns False), so nothing breaks.
+try:
+    from core.foreground import set_yield_gate as _set_yield_gate
+    _set_yield_gate(should_yield_to_user)
+except Exception:
+    pass
+
+
 def _notify_watchdog_llm_start():
     """Tell the watchdog the current thread is blocked on a legitimate LLM call.
 

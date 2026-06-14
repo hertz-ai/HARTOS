@@ -148,6 +148,42 @@ def set_genuine_check(fn) -> None:
     _genuine_check = fn
 
 
+# Optional accessor to the ONE canonical daemon-yield gate
+# (``dispatch.should_yield_to_user``).  ``core/`` background loops must NOT
+# import ``integrations/`` (layering rule: integrations -> core OK, core ->
+# integrations BANNED), so dispatch registers ITSELF here via ``set_yield_gate``
+# (inversion of control, mirroring ``set_genuine_check``).  ``None`` => the gate
+# is unregistered => fail-OPEN ``False`` so a core loop is never blocked on a
+# missing/erroring gate (no regression vs. the pre-existing "no gate" behaviour).
+_yield_gate = None
+
+
+def set_yield_gate(fn) -> None:
+    """Register the 0-arg predicate that backs ``should_yield_to_user``.
+
+    ``dispatch.should_yield_to_user`` registers itself via this so ``core/``
+    loops can consult the SINGLE canonical gate without importing
+    ``integrations/``.  ``None`` unregisters (gate fails open)."""
+    global _yield_gate
+    _yield_gate = fn
+
+
+def should_yield_to_user() -> bool:
+    """Core-layer accessor to the ONE canonical daemon-yield gate.
+
+    Returns whatever the registered gate (``dispatch.should_yield_to_user``,
+    wired in via ``set_yield_gate``) reports.  Fail-OPEN ``False`` when no gate
+    is registered or the gate raises — a core loop is never blocked on a missing
+    gate, so this introduces no regression over the prior "no gate" behaviour."""
+    fn = _yield_gate
+    if fn is None:
+        return False
+    try:
+        return bool(fn())
+    except Exception:
+        return False
+
+
 def mark_view(fn):
     """Decorator: mark a GENUINE user request handler as a foreground turn for
     its whole duration, so background daemons yield the shared model to it.

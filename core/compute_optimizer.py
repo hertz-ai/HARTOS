@@ -36,6 +36,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from core.foreground import should_yield_to_user
+
 logger = logging.getLogger(__name__)
 
 
@@ -270,6 +272,17 @@ class ComputeOptimizer:
     def _hive_explore_loop(self) -> None:
         """Random-interval hive action stream exploration."""
         while not self._stop_event.is_set():
+            # Yield the box to a live user / hot machine: skip this tick's heavy
+            # work (_explore_hive_stream) and re-check after one cadence floor,
+            # reusing the loop's OWN sleep primitive (_stop_event.wait) — never a
+            # bare ``continue`` (that would busy-spin a core, the exact bug this
+            # removes).  Hive exploration has no mandatory heartbeat: it is purely
+            # proactive, so deferring a tick is safe, and the wait still honours a
+            # stop request (returns True -> break) for clean shutdown.
+            if should_yield_to_user():
+                if self._stop_event.wait(HIVE_EXPLORE_MIN):
+                    break  # Stop requested during deferral
+                continue
             delay = random.uniform(HIVE_EXPLORE_MIN, HIVE_EXPLORE_MAX)
             if self._stop_event.wait(delay):
                 break  # Stop requested during sleep

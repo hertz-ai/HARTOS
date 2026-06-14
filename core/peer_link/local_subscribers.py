@@ -24,6 +24,8 @@ import time
 from collections import OrderedDict
 from typing import Dict, Optional
 
+from core.foreground import should_yield_to_user
+
 logger = logging.getLogger('hevolve.local_subscribers')
 
 # ─── Delivery Tracker (replaces cloud confirmation.py) ─────────────────
@@ -124,6 +126,15 @@ class DeliveryTracker:
         """Background loop: check for unconfirmed messages and emit notifications."""
         while self._running:
             time.sleep(15)  # Check every 15s
+            # Yield the box to genuine foreground user activity: skip this
+            # tick's TTL-expiry sweep (and its event-emit + FCM push) while the
+            # user is active / the box is hot.  The full 15s sleep above already
+            # ran this iteration, so re-checking on the NEXT tick reuses the
+            # loop's own cadence — no busy-spin, no extra heartbeat.  Single
+            # canonical gate (core.foreground.should_yield_to_user), fail-open
+            # False, so an unconfirmed-delivery sweep is at most one cadence late.
+            if should_yield_to_user():
+                continue
             now = time.time()
             expired = []
 

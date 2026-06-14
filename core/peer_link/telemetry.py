@@ -27,6 +27,8 @@ import time
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional
 
+from core.foreground import should_yield_to_user
+
 logger = logging.getLogger('hevolve.peer_link')
 
 # Disconnection thresholds (seconds)
@@ -162,23 +164,46 @@ class CentralConnection:
 
     # --- Internal ------------------------------------------------
 
+    def _sleep_interval(self, seconds: int):
+        """Sleep ``seconds`` in 1-second increments, breaking early on stop.
+
+        The loop's ONE sleep primitive — reused both for the normal publish
+        cadence and for the back-off when yielding to a live user — so there is
+        no second/parallel timing path and ``stop()`` is honoured promptly."""
+        for _ in range(seconds):
+            if not self._running:
+                break
+            time.sleep(1)
+
+    def _telemetry_tick(self):
+        """One unit of telemetry work: connect, publish, drain control.
+
+        Extracted so the loop's per-iteration body has a single owner and is
+        independently drivable (tests, and the yield-skip below)."""
+        try:
+            self._try_connect()
+            if self._connected:
+                self._publish_telemetry()
+                self._check_control_messages()
+        except Exception as e:
+            logger.debug(f"Telemetry loop error: {e}")
+            self._mark_disconnected()
+
     def _telemetry_loop(self):
         """Background: publish telemetry, handle control messages."""
         while self._running:
-            try:
-                self._try_connect()
-                if self._connected:
-                    self._publish_telemetry()
-                    self._check_control_messages()
-            except Exception as e:
-                logger.debug(f"Telemetry loop error: {e}")
-                self._mark_disconnected()
+            # Yield the box to a live user / hot machine: skip this tick's heavy
+            # work (connect + _publish_telemetry) and re-check after one full
+            # interval, reusing the SAME sleep primitive — never a bare
+            # ``continue`` (that would busy-spin a core). Telemetry has no
+            # mandatory heartbeat: control (emergency halt) arrives via the WAMP
+            # subscription, not this poll, so deferring a tick is safe.
+            if should_yield_to_user():
+                self._sleep_interval(self._telemetry_interval)
+                continue
 
-            # Sleep in small increments
-            for _ in range(self._telemetry_interval):
-                if not self._running:
-                    break
-                time.sleep(1)
+            self._telemetry_tick()
+            self._sleep_interval(self._telemetry_interval)
 
     def _try_connect(self):
         """Check if any outbound transport is available (WAMP or HTTP)."""
