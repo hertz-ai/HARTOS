@@ -130,3 +130,70 @@ def test_threadlocal_still_takes_precedence_for_genuine_chat_turn():
     with request_id_context('daemon_stale'):
         # On THIS (request) thread the thread-local wins.
         assert _get_request_id() == 'live-user-turn'
+
+
+# ── Cross-contamination / end-to-end separation guards ───────────────────────
+# The catastrophic failure is NOT the bug we fixed (daemon never yielding) but
+# its inverse: a USER turn tagged daemon_* would be yielded/aborted — the user's
+# own "hi" cancelling itself.  These prove the daemon and user identities never
+# bleed into one another, even when they share an autogen worker thread/pool.
+
+def test_no_cross_contamination_sequential_daemon_user_daemon():
+    """Sequential decorated calls (daemon, then user, then daemon) each read
+    back exactly their own id — no bleed through the shared contextvar."""
+    seen = []
+
+    @with_llm_context('autogen.create')
+    def call(user_id, text, prompt_id, file_id, request_id):
+        seen.append(_read_request_id_in_copied_worker_context())
+        return 'ok'
+
+    call('u1', 'hi', 'p', None, 'daemon_A')
+    call('u2', 'hi', 'p', None, 'user-B-uuid')
+    call('u3', 'hi', 'p', None, 'daemon_C')
+    assert seen == ['daemon_A', 'user-B-uuid', 'daemon_C']
+
+
+def test_persistent_reused_worker_does_not_bleed_daemon_into_user():
+    """Worst case: a single-worker pool (forced thread reuse, exactly how
+    autogen reuses send threads) runs a daemon call's context then a user
+    call's context.  Because each call copies its OWN context — the way the
+    ``source`` label already does — the reused worker never bleeds the daemon
+    id into the user read."""
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=1)  # one thread, reused across calls
+    try:
+        reads = []
+
+        @with_llm_context('autogen.create')
+        def call(user_id, text, prompt_id, file_id, request_id):
+            ctx = contextvars.copy_context()
+            reads.append(pool.submit(lambda: ctx.run(_get_request_id)).result())
+            return 'ok'
+
+        call('u1', 'hi', 'p', None, 'daemon_A')
+        call('u2', 'hi', 'p', None, 'user-B-uuid')
+        assert reads == ['daemon_A', 'user-B-uuid']
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_nested_user_call_inside_daemon_restores_daemon_on_exit():
+    """Defensive (nesting shouldn't occur, but must be leak-proof): a user call
+    nested inside a daemon scope reads the user id, and the daemon id is fully
+    restored after the inner call returns."""
+    @with_llm_context('autogen.reuse')
+    def inner(user_id, text, prompt_id, file_id, request_id):
+        return _get_request_id()
+
+    @with_llm_context('autogen.create')
+    def outer(user_id, text, prompt_id, file_id, request_id):
+        before = _get_request_id()
+        nested = inner('u', 't', 'p', None, 'user-INNER')
+        after = _get_request_id()
+        return before, nested, after
+
+    before, nested, after = outer('u', 't', 'p', None, 'daemon_OUTER')
+    assert before == 'daemon_OUTER'
+    assert nested == 'user-INNER'
+    assert after == 'daemon_OUTER'  # inner reset restored the outer id
