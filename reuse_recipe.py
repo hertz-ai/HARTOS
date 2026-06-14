@@ -3657,10 +3657,10 @@ def get_ledger_status_for_logging(user_prompt: str) -> str:
         return "Ledger: status unavailable"
 
 
-from core.llm_outbound_logger import with_source as _with_source
+from core.llm_outbound_logger import with_llm_context as _with_llm_context
 
 
-@_with_source('autogen.reuse')
+@_with_llm_context('autogen.reuse')
 def chat_agent(user_id, text, prompt_id, file_id, request_id):
     current_app.logger.info('--' * 100)
     user_message = text

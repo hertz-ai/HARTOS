@@ -84,19 +84,38 @@ _file_lock = threading.Lock()
 
 
 def _get_request_id() -> str:
-    """Best-effort thread-local request_id pull.  Empty string when
-    we're outside an HTTP request context (e.g. daemon startup).
+    """Best-effort request_id pull for the outbound correlation key AND the
+    daemon-vs-user discriminator.  Empty string when neither source carries one.
 
-    Uses the canonical ``ThreadLocalData.get_request_id()`` accessor — the
-    request_id lives in the thread-local's ``_local`` store (set via
-    ``set_request_id`` at hart_intelligence_entry.py:8535 and read via
-    ``get_request_id`` everywhere else).  A previous ``getattr(_tl,
-    'request_id')`` read the INSTANCE attribute, which is never set, so the
-    ``X-HARTOS-Request-ID`` header + JSONL correlation key were always empty —
-    and the daemon-vs-user discriminator that now reads them would never fire."""
+    Two sources, in priority order:
+
+      1. The thread-local ``ThreadLocalData.get_request_id()`` — set
+         authoritatively by the /chat handler on the request thread
+         (hart_intelligence_entry.py:6898 / 7962).  Kept FIRST so a genuine
+         user turn's id is never shadowed.  (A previous ``getattr(_tl,
+         'request_id')`` read the INSTANCE attribute, which is never set, so the
+         header + JSONL key were always empty; the canonical accessor fixed it.)
+      2. The ``_request_id_var`` contextvar fallback — the daemon path enters
+         via ``hevolve_chat`` (routes.hartos_backend_adapter.chat) ->
+         ``recipe`` / ``chat_agent`` on a worker thread/context the handler's
+         thread-local never reached (``threadlocal`` uses ``threading.local()``,
+         which does not cross the autogen worker boundary).
+         ``with_llm_context`` binds the id there, and — exactly like the
+         ``source`` contextvar — it DOES survive into the httpx send.  Without
+         this fallback ~94% of daemon autogen calls logged request_id='' and so
+         bypassed the foreground yield/abort entirely (llm_outbound.jsonl,
+         2026-06-14): is_genuine_user_request('') is True, so the call was never
+         routed to the closable background client and never released the single
+         llama slot to a live user turn."""
     try:
         from threadlocal import thread_local_data as _tl
         rid = _tl.get_request_id()
+        if rid:
+            return str(rid)
+    except Exception:
+        pass
+    try:
+        rid = _request_id_var.get()
         if rid:
             return str(rid)
     except Exception:
@@ -117,6 +136,16 @@ import contextvars
 
 _source_var: 'contextvars.ContextVar[str]' = contextvars.ContextVar(
     'llm_outbound_source', default='')
+
+# Request-id contextvar — the propagation twin of ``_source_var`` above.  The
+# daemon stamps 'daemon_<goal>' on its dispatch thread, but autogen issues its
+# httpx send on a worker thread/context that a ``threading.local()`` cannot
+# reach, so the tag was lost for ~94% of autogen calls and the foreground
+# preempt could not see them as background.  A contextvar survives that boundary
+# exactly the way the source label already does.  ``with_llm_context`` binds it;
+# ``_get_request_id`` reads it as the fallback after the thread-local.
+_request_id_var: 'contextvars.ContextVar[str]' = contextvars.ContextVar(
+    'llm_outbound_request_id', default='')
 
 
 def set_source(name: str) -> 'contextvars.Token':
@@ -164,6 +193,63 @@ def with_source(name: str):
             with source_context(name):
                 return fn(*args, **kwargs)
         return _wrapper
+    return _deco
+
+
+@contextlib.contextmanager
+def request_id_context(request_id: str):
+    """Bind the request_id for LLM calls issued from this context — the
+    contextvar twin of ``source_context``.  Restores the prior value on exit
+    (even on exception) so a reused worker thread never leaks one request's id
+    into the next.  ``_get_request_id`` reads it as a fallback after the
+    thread-local."""
+    token = _request_id_var.set(str(request_id or ''))
+    try:
+        yield
+    finally:
+        _request_id_var.reset(token)
+
+
+def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
+    """Decorator for the autogen entry points (``create_recipe.recipe`` /
+    ``reuse_recipe.chat_agent``): set the outbound ``source`` label AND
+    propagate the decorated function's ``request_id`` argument into
+    ``_request_id_var`` so the daemon-vs-user discriminator survives the autogen
+    worker-thread boundary the thread-local cannot cross.
+
+    Why here and not ``set_request_id`` upstream: the daemon enters via
+    ``hevolve_chat`` (routes.hartos_backend_adapter.chat), which bypasses the
+    /chat handler that sets the thread-local — and even on the user path
+    ``recipe`` runs on a worker thread.  This is the one place that (a) has the
+    real ``request_id`` in hand and (b) wraps the whole autogen call, so the
+    contextvar reaches the httpx send exactly like ``source``.
+
+    Binds the id BY NAME via the signature, so it is robust to positional or
+    keyword call sites.  Supersedes a bare ``with_source`` on those two
+    functions; every other caller keeps using ``source_context`` /
+    ``with_source`` unchanged."""
+    import functools
+    import inspect
+
+    def _deco(fn):
+        try:
+            _sig = inspect.signature(fn)
+        except (ValueError, TypeError):
+            _sig = None
+
+        @functools.wraps(fn)
+        def _wrapper(*args, **kwargs):
+            rid = ''
+            if _sig is not None:
+                try:
+                    bound = _sig.bind_partial(*args, **kwargs)
+                    rid = bound.arguments.get(request_id_arg) or ''
+                except (TypeError, KeyError):
+                    rid = ''
+            with source_context(source_name), request_id_context(rid):
+                return fn(*args, **kwargs)
+        return _wrapper
+
     return _deco
 
 

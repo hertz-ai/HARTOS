@@ -5573,10 +5573,10 @@ def load_existing_metadata(prompt_id, user_prompt, flow_progress):
         current_app.logger.error(f"❌ Error loading existing metadata: {e}")
 
 
-from core.llm_outbound_logger import with_source as _with_source
+from core.llm_outbound_logger import with_llm_context as _with_llm_context
 
 
-@_with_source('autogen.create')
+@_with_llm_context('autogen.create')
 def recipe(user_id, text, prompt_id, file_id, request_id):
     user_prompt = f'{user_id}_{prompt_id}'
     request_id_list[user_prompt] = request_id
