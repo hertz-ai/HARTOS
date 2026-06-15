@@ -1569,6 +1569,11 @@ function _pid(el) {{ return el.closest('[data-panel-id]').dataset.panelId; }}
 const BACKEND = 'http://localhost:{self.backend_port}';
 const SHELL = 'http://localhost:{self.port}';
 const MANIFEST = {manifest_json};
+// External /shell/static modules (hartDesktop.js, hartDock.js, …) read
+// window.MANIFEST. A top-level `const` in a classic script is a lexical global,
+// NOT a property of window — so without this the desktop icons never render
+// (hartDesktop.js gates on window.MANIFEST). Expose it explicitly.
+window.MANIFEST = MANIFEST;
 const SYSTEM_PANELS = {system_json};
 const GROUPS = {groups_json};
 const NUNBA_BASE = '/app/#';

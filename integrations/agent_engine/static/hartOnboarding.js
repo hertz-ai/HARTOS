@@ -90,6 +90,11 @@
 
     var lines = resp.pa_lines || [];
     var options = resp.options || [];
+    // Nothing renderable and not a known interactive phase -> close instead of
+    // sitting as an invisible click-blocker / looping on empty responses.
+    if (!lines.length && !options.length && resp.phase !== 'reveal' && !resp.sealed) {
+      finish(); return;
+    }
     clearOpts();
     typeLines(lines, function () {
       if (resp.sealed) { revealName(resp); setTimeout(finish, 6000); return; }
@@ -119,8 +124,16 @@
     });
     api('/api/onboarding/status?user_id=' + USER).then(function (st) {
       if (st && st.onboarded) return;             // already lit — no ceremony
-      show();
-      api('/api/onboarding/start', 'POST', { user_id: USER }).then(handle).catch(function () { finish(); });
+      // Reveal the (full-screen, z-12000 modal) overlay ONLY once /start returns
+      // content to render. Otherwise a backend hiccup leaves an INVISIBLE
+      // full-screen overlay over the desktop that silently eats EVERY click
+      // ("no button works"). If start fails or is empty, never show it — the
+      // desktop stays fully interactive.
+      api('/api/onboarding/start', 'POST', { user_id: USER }).then(function (resp) {
+        if (!resp || resp.already_onboarded || resp.onboarded) return;
+        show();
+        handle(resp);
+      }).catch(function () { /* start failed -> never block the desktop */ });
     }).catch(function () { /* status unreachable -> never block the desktop */ });
   }
 
