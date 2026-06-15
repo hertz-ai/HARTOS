@@ -4378,7 +4378,20 @@ function renderAgentOverlay(ev) {{
         """Create Flask app serving the glass desktop shell + APIs."""
         from flask import Flask, request, jsonify, Response, send_from_directory
 
-        app = Flask(__name__)
+        # The shell HTML loads its logo + every external script from
+        # ``/shell/static/...`` (see render_desktop_shell: hart-logo.svg,
+        # voiceOrbViz.js, hartHero.js, hartDesktop.js, hartOnboarding.js, ...).
+        # Flask's DEFAULT static route is ``/static`` — so without this prefix
+        # EVERY ``/shell/static/*`` request 404s on a real boot: the orb never
+        # animates (only the static mic shows), the hero input/desktop never
+        # wire (dead clicks, can't type), onboarding never fires, and the logo
+        # renders as a broken-image "?". The ``static/`` dir is bundled into the
+        # ISO (hart-app.nix copies the tree) and sits next to this module, so
+        # Flask's built-in handler serves it directly — no parallel route. This
+        # was invisible to "inline render" testing, which never fetches
+        # ``/shell/static/``; the route test below exercises the real fetch.
+        app = Flask(__name__, static_url_path='/shell/static',
+                    static_folder='static')
 
         # ── Desktop Shell (the root page IS the OS) ──
         @app.route('/')
