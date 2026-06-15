@@ -1314,6 +1314,24 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   background:var(--hart-glass-bg);color:var(--hart-text);font-size:14px;
   font-family:var(--ds-font-body);outline:none;width:280px;text-align:center}}
 .lock-status{{font-size:12px;color:var(--hart-muted)}}
+.lock-brand{{display:flex;align-items:center;gap:10px;margin-bottom:8px;opacity:.92}}
+.lock-brand img{{width:30px;height:30px;filter:drop-shadow(0 2px 10px rgba(0,212,170,.4))}}
+.lock-brand span{{font-size:13px;letter-spacing:2.5px;font-weight:600;opacity:.8}}
+.lock-screen.setup .lock-clock,.lock-screen.setup .lock-date{{display:none}}
+/* ── Desktop widgets (live clock + system) ── */
+.hart-widgets{{position:fixed;top:calc(var(--hart-topbar-height,40px) + 18px);right:16px;z-index:30;
+  display:flex;flex-direction:column;gap:12px;width:222px}}
+.hart-widget{{background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);border-radius:16px;
+  padding:14px 16px;{'backdrop-filter:blur(var(--hart-blur)) saturate(var(--hart-saturation));' if not is_potato else ''}
+  box-shadow:0 8px 30px rgba(0,0,0,.28)}}
+.hw-clock{{text-align:center}}
+.hw-clock-time{{font-size:30px;font-weight:300;letter-spacing:.5px;color:var(--hart-text);font-variant-numeric:tabular-nums}}
+.hw-clock-date{{font-size:12px;color:var(--hart-muted);margin-top:2px}}
+.hw-title{{font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:var(--hart-muted);margin-bottom:6px}}
+.hw-row{{display:flex;justify-content:space-between;font-size:12px;color:var(--hart-text);margin-top:7px}}
+.hw-val{{color:var(--hart-accent);font-variant-numeric:tabular-nums}}
+.hw-bar{{height:5px;border-radius:3px;background:var(--hart-surface);overflow:hidden;margin-top:3px}}
+.hw-bar>i{{display:block;height:100%;background:var(--hart-accent);border-radius:3px;transition:width .5s}}
 
 /* ── Scrollbar ── */
 ::-webkit-scrollbar{{width:6px}}
@@ -1366,6 +1384,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <div class="hart-vignette" aria-hidden="true"></div>
 <!-- Desktop icon layer (drag-drop apps); populated by hartDesktop.js -->
 <div class="hart-desktop" id="hart-desktop" aria-label="Desktop icons"></div>
+<div class="hart-widgets" id="hart-widgets" aria-label="Desktop widgets"></div>
 <a href="#panels" class="skip-link">Skip to content</a>
 
 <!-- HART OS hero — voice-first command center (the desktop centerpiece). The
@@ -1429,6 +1448,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script src="/shell/static/hartDock.js"></script>
 <script src="/shell/static/hartSenses.js"></script>
 <script src="/shell/static/hartOnboarding.js"></script>
+<script src="/shell/static/hartSessionUI.js"></script>
 
 <!-- Agent Pill (click to expand floating chat) -->
 <div class="agent-pill glass" id="agent-pill" onclick="toggleAssistantChat()">
@@ -1470,6 +1490,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 <!-- Lock Screen -->
 <div class="lock-screen" id="lock-screen" role="dialog" aria-modal="true" aria-label="Screen locked">
+  <div class="lock-brand"><img src="/shell/static/hevolve-logo.png" alt="HART OS" draggable="false"><span>HART OS</span></div>
   <div class="lock-clock" id="lock-clock"></div>
   <div class="lock-date" id="lock-date"></div>
   <input class="lock-input" type="password" placeholder="Password" id="lock-pw"
