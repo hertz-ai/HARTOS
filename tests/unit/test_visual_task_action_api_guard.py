@@ -19,9 +19,16 @@ import os
 import sys
 from unittest.mock import patch
 
+import pytest
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+
+# reuse_recipe type-annotates module-level caches with autogen.AssistantAgent
+# (evaluated at import time), so importing it crashes when autogen is absent
+# (CI). Skip cleanly, matching the suite-wide pattern.
+pytest.importorskip('autogen', reason='autogen not installed')
 
 import reuse_recipe  # noqa: E402
 

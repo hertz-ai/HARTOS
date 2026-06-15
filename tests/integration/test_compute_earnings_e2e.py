@@ -148,8 +148,27 @@ def test_settle_to_endpoint_round_trip(monkeypatch):
     except (ImportError, AttributeError) as exc:
         pytest.skip(f'social models not importable in this env: {exc}')
 
-    # Use in-memory SQLite for deterministic isolation
+    # Use in-memory SQLite for deterministic isolation.
+    #
+    # `models.DB_URL` / `DB_PATH` and the `_engine` / `_SessionLocal`
+    # singletons are resolved ONCE at module import time.  By the time
+    # this test runs, `integrations.social.models` is already imported
+    # (the importorskip + `from ... import` above), so a bare
+    # `monkeypatch.setenv('HEVOLVE_DB_PATH', ':memory:')` is a no-op --
+    # `get_engine()` reads the frozen module-level `DB_URL`, not the
+    # env.  The test would then bind to whatever ambient file-backed
+    # engine the rest of the suite left behind, and the Flask readback
+    # could land on a DB the settle session never persisted to
+    # (intermittent `assert 0 >= 1`).  Force the in-memory engine
+    # directly -- the canonical reset used by the tests/test_phase7*
+    # suite -- so settle and the endpoint readback share one StaticPool
+    # connection.  monkeypatch restores all of these on teardown.
+    import integrations.social.models as _models_mod
     monkeypatch.setenv('HEVOLVE_DB_PATH', ':memory:')
+    monkeypatch.setattr(_models_mod, 'DB_URL', 'sqlite://', raising=False)
+    monkeypatch.setattr(_models_mod, 'DB_PATH', ':memory:', raising=False)
+    monkeypatch.setattr(_models_mod, '_engine', None, raising=False)
+    monkeypatch.setattr(_models_mod, '_SessionLocal', None, raising=False)
     try:
         init_db()
     except Exception as exc:

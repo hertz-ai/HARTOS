@@ -71,7 +71,12 @@ def test_ledger_integration():
     assert len(ready_tasks) == 1, "Should have exactly 1 ready task initially"
     assert ready_tasks[0].task_id == "action_1", "First task should be action_1"
 
-    # Complete first task
+    # Complete first task — follow the validated FSM path (PENDING -> IN_PROGRESS
+    # -> COMPLETED). update_task_status enforces _validate_transition, which (by
+    # design) rejects a direct PENDING -> COMPLETED jump, so a task must be
+    # started before it can be completed (matches every production caller, e.g.
+    # task_coordinator and examples/demo_ecommerce_ap2_simple).
+    ledger.update_task_status("action_1", "in_progress")
     ledger.update_task_status("action_1", "completed", result="Search completed successfully")
     print(f"[OK] Marked action_1 as completed")
 

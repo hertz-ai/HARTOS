@@ -10,9 +10,16 @@ the regression-able default-on policy. No grep/source-shape assertions.
 import os
 import sys
 
+import pytest
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+
+# gather_agentdetails type-annotates module-level signatures with
+# autogen.AssistantAgent (evaluated at import time), so importing it crashes
+# when autogen is absent (CI). Skip cleanly, matching the suite-wide pattern.
+pytest.importorskip('autogen', reason='autogen not installed')
 
 import gather_agentdetails as ga  # noqa: E402
 
