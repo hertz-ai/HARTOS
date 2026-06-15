@@ -162,7 +162,11 @@
   };
 
   function defaults() {
-    var want = ['app_store', 'files', 'security', 'appearance', 'terminal', 'weather'];
+    // Default desktop icons. render() only shows ids present in window.MANIFEST
+    // (the panel manifest), so these MUST be real manifest keys — the old list
+    // ('files'/'weather'/'terminal'/'app_store'/'security') were system-app ids
+    // absent from the manifest, so only 'appearance' ever rendered.
+    var want = ['appearance', 'feed', 'agents_browse', 'recipes', 'notifications', 'communities'];
     var M_ = M(), out = [], row = 0;
     want.forEach(function (id) { if (M_[id]) { out.push({ id: id, x: PAD, y: PAD + row * GRID }); row++; } });
     return out;
