@@ -938,18 +938,29 @@ html,body{overscroll-behavior:none;-webkit-font-smoothing:antialiased;
 .ds-btn,.hart-hero-chip,.hart-hero-status,.hart-hero-brand{cursor:default}
 img{-webkit-user-drag:none;user-select:none}
 
-/* ── Ambient colour wash (de-monochrome): slow drifting multi-hue blobs above
-   the wallpaper, theme-independent, so the desktop has living colour. ── */
-.hart-ambient{position:fixed;inset:-12%;z-index:1;pointer-events:none;opacity:0.5;
-  filter:blur(64px) saturate(140%);
-  background:
-    radial-gradient(38% 42% at 22% 26%, rgba(0,212,170,0.42), transparent 70%),
-    radial-gradient(34% 40% at 80% 30%, rgba(108,99,255,0.40), transparent 70%),
-    radial-gradient(42% 46% at 60% 80%, rgba(34,176,255,0.30), transparent 72%),
-    radial-gradient(30% 36% at 28% 82%, rgba(255,120,180,0.24), transparent 72%);
-  animation:hart-ambient-drift 30s ease-in-out infinite alternate}
-@keyframes hart-ambient-drift{0%{transform:translate3d(0,0,0) scale(1)}
-  50%{transform:translate3d(2.4%,-2.2%,0) scale(1.08)}100%{transform:translate3d(-2.4%,2.2%,0) scale(1.05)}}
+/* ── Animated motion background: independent blobs each on their own path ── */
+.hart-ambient{position:fixed;inset:0;z-index:1;pointer-events:none;overflow:hidden}
+.hart-blob{position:absolute;border-radius:50%;filter:blur(80px);opacity:.55;will-change:transform}
+.hart-blob-1{width:65vw;height:65vw;top:-20%;left:-15%;
+  background:radial-gradient(circle,rgba(0,212,170,.7),rgba(0,212,170,0) 70%);
+  animation:blob1 22s ease-in-out infinite alternate}
+.hart-blob-2{width:55vw;height:55vw;top:10%;right:-10%;
+  background:radial-gradient(circle,rgba(108,99,255,.65),rgba(108,99,255,0) 70%);
+  animation:blob2 28s ease-in-out infinite alternate}
+.hart-blob-3{width:50vw;height:50vw;bottom:-10%;left:30%;
+  background:radial-gradient(circle,rgba(34,176,255,.55),rgba(34,176,255,0) 70%);
+  animation:blob3 34s ease-in-out infinite alternate}
+.hart-blob-4{width:40vw;height:40vw;top:40%;right:20%;
+  background:radial-gradient(circle,rgba(255,120,180,.45),rgba(255,120,180,0) 70%);
+  animation:blob4 19s ease-in-out infinite alternate}
+.hart-blob-5{width:35vw;height:35vw;bottom:10%;left:-5%;
+  background:radial-gradient(circle,rgba(255,200,50,.35),rgba(255,200,50,0) 70%);
+  animation:blob5 25s ease-in-out infinite alternate}
+@keyframes blob1{0%{transform:translate(0,0) scale(1)}100%{transform:translate(12vw,8vh) scale(1.15)}}
+@keyframes blob2{0%{transform:translate(0,0) scale(1.05)}100%{transform:translate(-10vw,12vh) scale(.9)}}
+@keyframes blob3{0%{transform:translate(0,0) scale(.95)}100%{transform:translate(-8vw,-10vh) scale(1.2)}}
+@keyframes blob4{0%{transform:translate(0,0) scale(1)}100%{transform:translate(8vw,-8vh) scale(1.1)}}
+@keyframes blob5{0%{transform:translate(0,0) scale(1.1)}100%{transform:translate(14vw,6vh) scale(.85)}}
 .hart-grain{position:fixed;inset:0;z-index:2;pointer-events:none;opacity:0.045;mix-blend-mode:overlay;
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
 .hart-vignette{position:fixed;inset:0;z-index:2;pointer-events:none;
@@ -1017,8 +1028,8 @@ img{-webkit-user-drag:none;user-select:none}
 .tray-btn:hover{transform:translateY(-1px) scale(1.05)}
 .start-logo{width:20px;height:20px;flex-shrink:0}
 .top-bar .start-btn:hover .start-logo{filter:drop-shadow(0 0 8px var(--hart-accent))}
-@media(prefers-reduced-motion:reduce){.hart-ambient,.hart-hero-hevolve .dot{animation:none}}
-html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot{animation:none}
+@media(prefers-reduced-motion:reduce){.hart-blob,.hart-hero-hevolve .dot{animation:none}}
+html.a11y-rmotion .hart-blob,html.a11y-rmotion .hart-hero-hevolve .dot{animation:none}
 '''
 
         # ═══ Desktop icon layer (drag-drop, grid-snapped, persisted) ═══
@@ -1037,7 +1048,7 @@ html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot{animat
   background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);
   box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.08),0 4px 12px rgba(0,0,0,.28)}
 .desktop-icon:hover .di-glyph{box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.12),0 8px 20px rgba(0,0,0,.36);transform:translateY(-1px)}
-.desktop-icon .di-glyph .mi{font-size:28px;color:var(--hart-accent)}
+.desktop-icon .di-glyph .mi{font-size:28px;color:#fff;text-shadow:0 1px 4px rgba(0,0,0,.4)}
 .desktop-icon .di-label{font-size:11px;line-height:1.25;text-align:center;max-width:80px;color:var(--hart-text);
   text-shadow:0 1px 3px rgba(0,0,0,.6);overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
 /* ── Virtual-desktop switcher (bottom-center) + settings squares ── */
@@ -1224,7 +1235,11 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   border-radius:10px;cursor:pointer;transition:background var(--hart-anim-speed);
   text-align:center;gap:4px;user-select:none}}
 .start-item:hover{{background:var(--hart-surface-hover,rgba(255,255,255,0.08))}}
-.start-item .mi{{font-size:24px;color:var(--hart-accent)}}
+.start-item .si-icon{{width:46px;height:46px;border-radius:13px;display:flex;align-items:center;justify-content:center;
+  box-shadow:0 3px 10px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.18);flex-shrink:0;
+  transition:transform .18s cubic-bezier(.175,.885,.32,1.275),box-shadow .18s}}
+.start-item:hover .si-icon{{transform:scale(1.08) translateY(-2px);box-shadow:0 8px 22px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.22)}}
+.start-item .si-icon .mi{{font-size:24px;color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.3)}}
 .start-item .label{{font-size:11px;line-height:1.2;opacity:0.85}}
 .start-divider{{border-top:1px solid var(--hart-glass-border);margin:8px 0}}
 .start-footer{{display:flex;justify-content:center;gap:16px;padding-top:8px;border-top:1px solid var(--hart-glass-border)}}
@@ -1358,7 +1373,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 </head>
 <body>
 <div class="wallpaper"></div>
-{'<div class="hart-ambient" aria-hidden="true"></div><div class="hart-grain" aria-hidden="true"></div>' if not is_potato else ''}
+{'<div class="hart-ambient" aria-hidden="true"><div class="hart-blob hart-blob-1"></div><div class="hart-blob hart-blob-2"></div><div class="hart-blob hart-blob-3"></div><div class="hart-blob hart-blob-4"></div><div class="hart-blob hart-blob-5"></div></div><div class="hart-grain" aria-hidden="true"></div>' if not is_potato else ''}
 <div class="hart-vignette" aria-hidden="true"></div>
 <!-- Desktop icon layer (drag-drop apps); populated by hartDesktop.js -->
 <div class="hart-desktop" id="hart-desktop" aria-label="Desktop icons"></div>
@@ -1935,6 +1950,87 @@ function refreshAgentStatus() {{
 setInterval(refreshAgentStatus, PERF.agentStatusMs);
 try {{ refreshAgentStatus(); }} catch(e) {{ console.error('[HART] refreshAgentStatus:', e); }}
 
+// ═══ Icon colour map — gradient per Material icon name ═══
+const ICON_COLORS = {{
+  // Discover / Social
+  rss_feed:'linear-gradient(135deg,#FF6B35,#F7931E)',
+  search:'linear-gradient(135deg,#4facfe,#00f2fe)',
+  smart_toy:'linear-gradient(135deg,#a18cd1,#fbc2eb)',
+  chat_bubble:'linear-gradient(135deg,#43e97b,#38f9d7)',
+  forum:'linear-gradient(135deg,#43e97b,#38f9d7)',
+  notifications:'linear-gradient(135deg,#f7971e,#ffd200)',
+  notifications_active:'linear-gradient(135deg,#f7971e,#ffd200)',
+  // Create
+  groups:'linear-gradient(135deg,#667eea,#764ba2)',
+  campaign:'linear-gradient(135deg,#f093fb,#f5576c)',
+  code:'linear-gradient(135deg,#1c92d2,#f2fcfe)',
+  science:'linear-gradient(135deg,#00b09b,#96c93d)',
+  fact_check:'linear-gradient(135deg,#11998e,#38ef7d)',
+  auto_awesome:'linear-gradient(135deg,#f7971e,#ffd200)',
+  public:'linear-gradient(135deg,#2980b9,#6dd5fa)',
+  handshake:'linear-gradient(135deg,#ee9ca7,#ffdde1)',
+  // You
+  psychology:'linear-gradient(135deg,#7F00FF,#E100FF)',
+  resonance:'linear-gradient(135deg,#7F00FF,#E100FF)',
+  map:'linear-gradient(135deg,#1a9850,#91cf60)',
+  location_on:'linear-gradient(135deg,#fc4a1a,#f7b733)',
+  autopilot:'linear-gradient(135deg,#00b4db,#0083b0)',
+  cloud_sync:'linear-gradient(135deg,#4facfe,#00f2fe)',
+  palette:'linear-gradient(135deg,#f953c6,#b91d73)',
+  appearance:'linear-gradient(135deg,#f953c6,#b91d73)',
+  // Explore
+  menu_book:'linear-gradient(135deg,#f46b45,#eea849)',
+  emoji_events:'linear-gradient(135deg,#f7971e,#ffd200)',
+  bolt:'linear-gradient(135deg,#f7971e,#ffd200)',
+  leaderboard:'linear-gradient(135deg,#ee9ca7,#ffdde1)',
+  child_care:'linear-gradient(135deg,#43e97b,#38f9d7)',
+  park:'linear-gradient(135deg,#1a9850,#91cf60)',
+  rocket_launch:'linear-gradient(135deg,#fc4a1a,#f7b733)',
+  // System / Admin
+  dashboard:'linear-gradient(135deg,#2980b9,#6dd5fa)',
+  admin_panel_settings:'linear-gradient(135deg,#636fa4,#e8cbf0)',
+  shield:'linear-gradient(135deg,#1565c0,#0d47a1)',
+  security:'linear-gradient(135deg,#1565c0,#42a5f5)',
+  monitor_heart:'linear-gradient(135deg,#e53935,#e35d5b)',
+  devices:'linear-gradient(135deg,#4a4e69,#9a8c98)',
+  wifi:'linear-gradient(135deg,#1c92d2,#f2fcfe)',
+  volume_up:'linear-gradient(135deg,#f953c6,#b91d73)',
+  bluetooth:'linear-gradient(135deg,#1e3c72,#2a5298)',
+  battery_full:'linear-gradient(135deg,#11998e,#38ef7d)',
+  desktop_windows:'linear-gradient(135deg,#2980b9,#6dd5fa)',
+  folder:'linear-gradient(135deg,#f7971e,#ffd200)',
+  terminal:'linear-gradient(135deg,#232526,#414345)',
+  storage:'linear-gradient(135deg,#636fa4,#e8cbf0)',
+  print:'linear-gradient(135deg,#8e9eab,#eef2f3)',
+  wallpaper:'linear-gradient(135deg,#f953c6,#b91d73)',
+  keyboard:'linear-gradient(135deg,#4a4e69,#9a8c98)',
+  nightlight:'linear-gradient(135deg,#1e3c72,#2a5298)',
+  content_paste:'linear-gradient(135deg,#f46b45,#eea849)',
+  schedule:'linear-gradient(135deg,#fc4a1a,#f7b733)',
+  language:'linear-gradient(135deg,#2980b9,#6dd5fa)',
+  accessibility:'linear-gradient(135deg,#00b09b,#96c93d)',
+  screenshot_monitor:'linear-gradient(135deg,#636fa4,#e8cbf0)',
+  list_alt:'linear-gradient(135deg,#636fa4,#e8cbf0)',
+  perm_media:'linear-gradient(135deg,#f953c6,#b91d73)',
+  calculate:'linear-gradient(135deg,#f46b45,#eea849)',
+  photo:'linear-gradient(135deg,#f953c6,#b91d73)',
+  sticky_note_2:'linear-gradient(135deg,#f7971e,#ffd200)',
+  storefront:'linear-gradient(135deg,#43e97b,#38f9d7)',
+  email:'linear-gradient(135deg,#1565c0,#42a5f5)',
+  mic:'linear-gradient(135deg,#e53935,#e35d5b)',
+  cell_tower:'linear-gradient(135deg,#2980b9,#6dd5fa)',
+  dns:'linear-gradient(135deg,#1c92d2,#f2fcfe)',
+  vpn_key:'linear-gradient(135deg,#1e3c72,#2a5298)',
+  badge:'linear-gradient(135deg,#636fa4,#e8cbf0)',
+  extension:'linear-gradient(135deg,#667eea,#764ba2)',
+  system_update:'linear-gradient(135deg,#11998e,#38ef7d)',
+  videocam:'linear-gradient(135deg,#e53935,#e35d5b)',
+  music_note:'linear-gradient(135deg,#f953c6,#b91d73)',
+}};
+function _iconBg(icon){{
+  return ICON_COLORS[icon]||'linear-gradient(135deg,rgba(108,99,255,.7),rgba(0,212,170,.5))';
+}}
+
 // ═══ Start Menu ═══
 function buildStartMenu() {{
   const scroll = document.getElementById('start-scroll');
@@ -1944,8 +2040,9 @@ function buildStartMenu() {{
     if(!items.length) return;
     html += '<div class="start-group"><div class="start-group-label">'+group+'</div><div class="start-grid">';
     items.forEach(([id,p])=>{{
+      const ic = p.icon||'apps';
       html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(this.dataset.id)">';
-      html += '<span class="mi material-icons-round">'+(p.icon||'apps')+'</span>';
+      html += '<span class="si-icon" style="background:'+_iconBg(ic)+'"><span class="mi material-icons-round">'+ic+'</span></span>';
       html += '<span class="label">'+p.title+'</span></div>';
     }});
     html += '</div></div>';
@@ -1955,8 +2052,9 @@ function buildStartMenu() {{
   if(sysItems.length) {{
     html += '<div class="start-group"><div class="start-group-label">System</div><div class="start-grid">';
     sysItems.forEach(([id,p])=>{{
+      const ic = p.icon||'settings';
       html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(this.dataset.id)">';
-      html += '<span class="mi material-icons-round">'+(p.icon||'settings')+'</span>';
+      html += '<span class="si-icon" style="background:'+_iconBg(ic)+'"><span class="mi material-icons-round">'+ic+'</span></span>';
       html += '<span class="label">'+p.title+'</span></div>';
     }});
     html += '</div></div>';
@@ -2276,18 +2374,25 @@ function loadHardwareMonitor(el, apis) {{
 }}
 
 function loadSecurityCenter(el, apis) {{
-  Promise.all(apis.map(u=>fetch(BACKEND+u,{{signal:_sig(3000)}}).then(r=>r.json()).catch(()=>({{}}))))
-    .then(([health,guardrail])=>{{
+  const allFetches = [
+    ...apis.map(u=>fetch(BACKEND+u,{{signal:_sig(3000)}}).then(r=>r.json()).catch(()=>({{}}))),
+    fetch(BACKEND+'/status',{{signal:_sig(3000)}}).then(r=>r.json()).catch(()=>({{}}))
+  ];
+  Promise.all(allFetches)
+    .then(([health,guardrail,sysStatus])=>{{
       const ghash = guardrail.guardrail_hash||'unknown';
-      const wm = health.world_model||{{}};
+      const wmHealthy = sysStatus.hevolve_core_healthy || (health.world_model||{{}}).status==='healthy';
+      const wmLabel = wmHealthy ? 'Connected' : (sysStatus.status==='running' ? 'Offline (no HevolveAI)' : 'Disconnected');
+      const wmColor = wmHealthy ? 'var(--hart-active)' : (sysStatus.status==='running' ? 'var(--hart-caution)' : 'var(--hart-muted)');
       el.innerHTML = '<div class="ds-panel-grid ds-fade-in">'+
         '<div class="ds-panel-title">Security</div>'+
         '<div class="ds-stagger">'+
         dsStatusRow('shield', 'Guardrail Hash', ghash.substring(0,16)+'...', 'var(--hart-active)', {{sublabel:'Structural integrity verified'}})+
         dsStatusRow('verified_user', 'Integrity', health.status==='ok'?'Verified':'Check Required',
             health.status==='ok'?'var(--hart-active)':'var(--hart-caution)')+
-        dsStatusRow('psychology', 'World Model', wm.status||'disconnected',
-            wm.status==='healthy'?'var(--hart-active)':'var(--hart-muted)')+
+        dsStatusRow('psychology', 'World Model', wmLabel, wmColor)+
+        dsStatusRow('memory', 'Learning Mode', sysStatus.learning_mode||'unknown',
+            sysStatus.learning_active?'var(--hart-active)':'var(--hart-muted)')+
         '</div></div>';
     }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted ds-flex ds-flex-center" style="height:100px"><span class="mi material-icons-round" style="margin-right:8px">error_outline</span>Security info unavailable</div>'; }});
 }}
@@ -5300,6 +5405,40 @@ function renderAgentOverlay(ev) {{
             register_onboarding_routes(app)
         except Exception as e:
             logger.warning("Onboarding APIs registration: %s", e)
+
+        # ── Agent list proxy: UI calls /api/shell/agents → forward to BACKEND ──
+        backend_url = f'http://localhost:{self.backend_port}'
+
+        @app.route('/api/shell/agents', methods=['GET'])
+        def shell_agents_list():
+            import requests as _req
+            try:
+                r = _req.get(f'{backend_url}/api/agents',
+                             timeout=5, params=request.args)
+                return jsonify(r.json()), r.status_code
+            except Exception:
+                return jsonify({'agents': [], 'error': 'backend_unavailable'}), 200
+
+        @app.route('/api/agent/list', methods=['GET'])
+        def shell_agent_list_alias():
+            import requests as _req
+            try:
+                r = _req.get(f'{backend_url}/api/agents',
+                             timeout=5, params=request.args)
+                return jsonify(r.json()), r.status_code
+            except Exception:
+                return jsonify({'agents': [], 'error': 'backend_unavailable'}), 200
+
+        @app.route('/api/shell/status', methods=['GET'])
+        def shell_status_proxy():
+            import requests as _req
+            try:
+                r = _req.get(f'{backend_url}/status', timeout=5)
+                return jsonify(r.json()), r.status_code
+            except Exception:
+                return jsonify({'status': 'backend_unavailable',
+                                'hevolve_core_healthy': False,
+                                'learning_active': False}), 200
 
         return app
 
