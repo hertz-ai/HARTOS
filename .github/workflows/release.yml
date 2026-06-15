@@ -616,6 +616,11 @@ jobs:
             --title "HART OS nightly ${SHORT_SHA}" \
             --notes "Rolling bleeding-edge ISOs built from \`main\` @ ${SHORT_SHA} on every push. Not signed by the master key — for stable signed releases see the [release archive](https://github.com/${REPO}/releases). Each ISO verifies against its companion \`.sha256\`."
 
+          # Ship the USB flasher with every release — one tool (CLI + GUI) to
+          # write the split ISO to a USB without bespoke commands. See
+          # scripts/hart_usb_flasher.py.
+          cp "${GITHUB_WORKSPACE}/scripts/hart_usb_flasher.py" /tmp/all-artifacts/ 2>/dev/null || true
+
           echo "=== Uploading artifacts ==="
           find /tmp/all-artifacts -maxdepth 2 -type f | while read -r f; do
             echo "  -> $(basename "$f")"
