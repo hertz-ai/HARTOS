@@ -1663,7 +1663,10 @@ def register_shell_os_routes(app):
         try:
             from integrations.agent_engine.app_installer import AppInstaller
             installer = AppInstaller()
-            results = installer.search(query, platform=platform, limit=limit)
+            # AppInstaller.search(query, platforms: Optional[List[str]]) — there is
+            # no platform=/limit= kwarg (the old call raised TypeError, silently
+            # swallowed below, so search ALWAYS returned []). Pass a 1-list, slice.
+            results = installer.search(query, platforms=[platform] if platform else None)[:limit]
         except (ImportError, Exception) as e:
             logger.debug(f"App search error: {e}")
 
@@ -1677,15 +1680,22 @@ def register_shell_os_routes(app):
         try:
             from integrations.agent_engine.app_installer import AppInstaller
             installer = AppInstaller()
-            apps = installer.list_installed(platform=platform)
+            # list_installed() takes NO platform arg (old call raised TypeError);
+            # filter after.
+            apps = installer.list_installed()
+            if platform:
+                apps = [a for a in apps if a.get('platform') == platform]
         except (ImportError, Exception) as e:
             logger.debug(f"App list error: {e}")
 
-        # Also include AppRegistry entries
+        # Also include AppRegistry entries. Canonical accessor is the platform
+        # ServiceRegistry's 'apps' component — get_app_registry() does not exist
+        # (the old import raised ImportError, so registry apps never showed).
         try:
-            from core.platform.app_registry import get_app_registry
-            registry = get_app_registry()
-            for manifest in registry.list_all():
+            from core.platform.registry import get_registry
+            _reg = get_registry()
+            registry = _reg.get('apps') if _reg.has('apps') else None
+            for manifest in (registry.list_all() if registry else []):
                 if not any(a.get('name') == manifest.name for a in apps):
                     apps.append({
                         'name': manifest.name, 'id': manifest.id,
@@ -1709,11 +1719,18 @@ def register_shell_os_routes(app):
             return jsonify({'error': 'source required'}), 400
 
         try:
-            from integrations.agent_engine.app_installer import AppInstaller
+            from integrations.agent_engine.app_installer import (
+                AppInstaller, InstallRequest, InstallerPlatform)
+            from dataclasses import asdict
             installer = AppInstaller()
-            result = installer.install(source, platform=platform, name=name)
+            # install() takes an InstallRequest, not (source, platform=, name=).
+            try:
+                plat = InstallerPlatform(platform) if platform else InstallerPlatform.UNKNOWN
+            except ValueError:
+                plat = InstallerPlatform.UNKNOWN
+            result = installer.install(InstallRequest(source=source, platform=plat, name=name or ''))
             _audit_shell_op('app_install', {'source': source, 'platform': platform})
-            return jsonify(result)
+            return jsonify(asdict(result))   # InstallResult dataclass -> JSON
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
@@ -1761,9 +1778,10 @@ def register_shell_os_routes(app):
         # Merge with manifest-declared permissions
         manifest_perms = []
         try:
-            from core.platform.app_registry import get_app_registry
-            registry = get_app_registry()
-            manifest = registry.get(app_id)
+            from core.platform.registry import get_registry
+            _reg = get_registry()
+            registry = _reg.get('apps') if _reg.has('apps') else None
+            manifest = registry.get(app_id) if registry else None
             if manifest and hasattr(manifest, 'permissions'):
                 manifest_perms = manifest.permissions or []
         except (ImportError, Exception):
