@@ -1357,6 +1357,10 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 </style>
 </head>
 <body>
+<!-- Hevolve brand boot splash (Lottie). Inline styles: this HTML is inside an
+     f-string, so a CSS block would need brace-escaping; the overlay is a single
+     element + hartBootSplash.js drives the fade, so inline is cleaner here. -->
+<div id="hart-boot" aria-hidden="true" style="position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:#0F0E17;transition:opacity .6s ease"><div id="hart-boot-lottie" style="width:min(46vw,360px);height:min(64vw,497px)"></div></div>
 <div class="wallpaper"></div>
 {'<div class="hart-ambient" aria-hidden="true"></div><div class="hart-grain" aria-hidden="true"></div>' if not is_potato else ''}
 <div class="hart-vignette" aria-hidden="true"></div>
@@ -1368,7 +1372,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      orb canvas below is the SAME #hart-voice-orb driven by initHartOrb; the bar
      fuses search + agent dispatch + the voice transcript sink. -->
 <div class="hart-hero" id="hart-hero" role="search" aria-label="HART command center">
-  <div class="hart-hero-brand"><img src="/shell/static/hart-logo.svg" alt="HART OS" draggable="false"><span>HART OS</span></div>
+  <div class="hart-hero-brand"><img src="/shell/static/hevolve-logo.png" alt="HART OS" draggable="false"><span>HART OS</span></div>
   <div class="hart-hero-orbwrap">
     <canvas id="hart-voice-orb" width="360" height="360" aria-hidden="true"></canvas>
     <button class="hart-hero-mic" id="hart-hero-mic" type="button" aria-label="Speak to HART (Super+Space)" title="Click or press Super+Space to speak"><span class="mi material-icons-round" aria-hidden="true">mic</span></button>
@@ -1386,7 +1390,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <!-- Top Bar -->
 <div class="top-bar glass" role="banner">
   <div class="start-btn" role="button" tabindex="0" aria-haspopup="menu" aria-label="Start menu" onclick="toggleStartMenu()" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Start Menu (Super)">
-    <img src="/shell/static/hart-logo.svg" class="start-logo" alt="" aria-hidden="true" draggable="false">
+    <img src="/shell/static/hevolve-logo.png" class="start-logo" alt="" aria-hidden="true" draggable="false">
     <span>HART</span>
   </div>
   <div class="top-bar-center" id="agent-status" role="status" aria-live="polite" aria-label="Agent status"></div>
@@ -1413,6 +1417,8 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      #hart-hero (centerpiece); initHartOrb still finds #hart-voice-orb and drives
      it. hartHero.js fuses the orb with the command bar, reusing toggleVoice /
      acSend / openPanel — one pipeline, no fork. Loaded after the inline script. -->
+<script src="/shell/static/lottie.min.js"></script>
+<script src="/shell/static/hartBootSplash.js"></script>
 <script src="/shell/static/hartSession.js"></script>
 <script src="/shell/static/voiceOrbViz.js"></script>
 <script src="/shell/static/hartHero.js"></script>

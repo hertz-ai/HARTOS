@@ -61,7 +61,10 @@ def test_every_shell_static_asset_the_html_requests_is_served(shell):
     "hartHero.js",        # hero input + mic + chips wiring (typing & clicks)
     "hartDesktop.js",     # desktop icon interactivity
     "hartOnboarding.js",  # the "Light your HART" first-run ceremony
-    "hart-logo.svg",      # the broken-image "?" shown in two places
+    "hevolve-logo.png",   # the Hevolve brand mark (hero + start button)
+    "lottie.min.js",      # bundled offline Lottie player (boot splash)
+    "hartBootSplash.js",  # the Hevolve brand boot-splash driver
+    "hevolve-anim.json",  # the Hevolve hourglass Lottie animation
 ])
 def test_critical_shell_asset_is_fetchable(shell, asset):
     """Each named asset maps 1:1 to a symptom the steward saw on the booted
