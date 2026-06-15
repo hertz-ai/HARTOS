@@ -1332,6 +1332,19 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 .hw-val{{color:var(--hart-accent);font-variant-numeric:tabular-nums}}
 .hw-bar{{height:5px;border-radius:3px;background:var(--hart-surface);overflow:hidden;margin-top:3px}}
 .hw-bar>i{{display:block;height:100%;background:var(--hart-accent);border-radius:3px;transition:width .5s}}
+/* ── Microanimations: buttery hover lifts + soft open transitions (scoped to
+   NON-draggable elements so icon/window drag stays instant) ── */
+.start-item,.ctx-menu-item,.hart-hero-chip,.taskbar-chip,.tray-btn,.start-btn,.power-btn,.start-app{{
+  transition:transform .16s cubic-bezier(.22,1,.36,1),box-shadow .16s ease,background .16s ease,filter .16s ease}}
+.start-item:hover,.taskbar-chip:hover,.start-app:hover{{transform:translateY(-2px)}}
+.tray-btn:hover,.start-btn:hover,.power-btn:hover{{transform:scale(1.08)}}
+.ctx-menu-item:hover{{transform:translateX(2px)}}
+.hart-widget{{transition:transform .2s cubic-bezier(.22,1,.36,1),box-shadow .2s ease}}
+.hart-widget:hover{{transform:translateY(-2px);box-shadow:0 14px 40px rgba(0,0,0,.34)}}
+@keyframes hart-fade-in{{from{{opacity:0}}to{{opacity:1}}}}
+.panel{{animation:hart-fade-in .18s ease}}
+@media(prefers-reduced-motion:reduce){{.panel{{animation:none}}
+  .start-item,.ctx-menu-item,.hart-hero-chip,.taskbar-chip,.tray-btn,.start-btn,.power-btn,.start-app,.hart-widget{{transition:none}}}}
 
 /* ── Scrollbar ── */
 ::-webkit-scrollbar{{width:6px}}
