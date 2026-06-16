@@ -322,16 +322,18 @@ class MeetCopilotEmitTest(unittest.TestCase):
         chat_messages_mod.persist_external_room_event = persist_mock
         agentic_router_mod = MagicMock()
         agentic_router_mod.dispatch_to_agent = dispatch_mock
-        service_registry_mod = MagicMock()
-        # ServiceRegistry.get('LiquidUIService') → liquid_ui_service mock
-        registry_class = MagicMock()
-        registry_class.get = MagicMock(return_value=liquid_ui_service)
-        service_registry_mod.ServiceRegistry = registry_class
+        # _emit_meet_copilot resolves the UI service via
+        # core.platform.registry.get_registry().get_or_none('LiquidUIService')
+        # (the a2ui B1 singleton accessor) — mock that exact path.
+        registry_mod = MagicMock()
+        registry = MagicMock()
+        registry.get_or_none = MagicMock(return_value=liquid_ui_service)
+        registry_mod.get_registry = MagicMock(return_value=registry)
         return patch.dict(sys.modules, {
             'integrations.service_tools.whisper_tool': whisper_mod,
             'integrations.social.chat_messages': chat_messages_mod,
             'integrations.agentic_router': agentic_router_mod,
-            'core.platform.service_registry': service_registry_mod,
+            'core.platform.registry': registry_mod,
         })
 
     def test_emit_after_segment_includes_full_state(self):
