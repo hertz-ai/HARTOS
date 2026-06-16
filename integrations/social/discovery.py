@@ -581,7 +581,8 @@ def federation_pull():
         return jsonify({'success': False, 'error': 'peer_url required'}), 400
     db = get_db()
     try:
-        count = federation.pull_from_peer(db, peer_url, limit=data.get('limit', 20))
+        count = federation.pull_with_central_fallback(
+            db, peer_url, limit=data.get('limit', 20))
         db.commit()
         return jsonify({'success': True, 'new_posts': count})
     except Exception as e:

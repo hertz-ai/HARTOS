@@ -292,6 +292,29 @@ class FederationManager:
             logger.debug(f"Federation pull failed from {peer_url}: {e}")
             return 0
 
+    def pull_with_central_fallback(self, db, peer_url: str, limit: int = 20) -> int:
+        """CDN retrieval (#149/C4): pull content from the source peer; if it
+        yields nothing (peer offline OR empty), fall back to the durable copy at
+        the parent tier (central, else regional) — the "origin" that survives
+        when the source peer disappears.
+
+        Reuses pull_from_peer for BOTH legs (no parallel fetch) and the SAME
+        parent-URL resolver the sync drain uses (SyncEngine.parent_tier_url —
+        one source).  receive_inbox dedups, so a redundant central pull is
+        harmless.  Skips the fallback when there is no parent tier or the peer
+        WAS the parent (no self-pull / no recursion)."""
+        count = self.pull_from_peer(db, peer_url, limit=limit)
+        if count > 0:
+            return count
+        from .sync_engine import SyncEngine
+        central = SyncEngine.parent_tier_url()
+        if central and central.rstrip('/') != (peer_url or '').rstrip('/'):
+            logger.debug(
+                "Federation: peer %s yielded nothing — pulling durable copy "
+                "from parent origin %s (#149)", peer_url, central)
+            return self.pull_from_peer(db, central, limit=limit)
+        return count
+
     # ─── Helpers ───
 
     def _send_follow_notification(self, peer_url: str, follower_node_id: str,

@@ -424,8 +424,7 @@ class SyncEngine:
         """Attempt to drain queued items to target."""
         from .models import get_db
 
-        target_url = os.environ.get('HEVOLVE_CENTRAL_URL', '') or \
-                     os.environ.get('HEVOLVE_REGIONAL_URL', '')
+        target_url = SyncEngine.parent_tier_url()
         if not target_url:
             return
 
@@ -449,6 +448,15 @@ class SyncEngine:
             logger.debug(f"Sync drain error: {e}")
         finally:
             db.close()
+
+    @staticmethod
+    def parent_tier_url() -> str:
+        """Canonical parent-tier node URL this node syncs UP to — central, else
+        regional (empty on a flat/standalone node).  SINGLE resolver shared by
+        the drain loop (_do_sync_drain) and federation's C4 content-retrieval
+        fallback, so "where is my parent" has one source, not two."""
+        return (os.environ.get('HEVOLVE_CENTRAL_URL', '')
+                or os.environ.get('HEVOLVE_REGIONAL_URL', ''))
 
     @staticmethod
     def get_queue_stats(db, node_id: str) -> Dict:
