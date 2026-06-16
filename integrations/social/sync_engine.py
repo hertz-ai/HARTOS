@@ -204,7 +204,7 @@ class SyncEngine:
                     # Agent data sync - store as metadata for now
                     logger.info(f"Sync: received agent registration from child")
                 elif op == 'sync_post':
-                    logger.info(f"Sync: received post sync from child")
+                    SyncEngine._handle_sync_post(db, payload)
                 elif op == 'update_stats':
                     logger.info(f"Sync: received stats update from child")
                 elif op == 'register_node':
@@ -227,6 +227,27 @@ class SyncEngine:
                 errors.append({'id': item_id, 'error': str(e)})
 
         return {'processed': processed, 'errors': errors}
+
+    @staticmethod
+    def _handle_sync_post(db, payload: dict):
+        """Land a hierarchically-synced post as the durable central/regional
+        backup — the CDN "origin" copy that survives when the source peer goes
+        offline (#146).
+
+        Reuses the SAME federation inbox persistence (FederatedPost + dedup by
+        origin_node_id/origin_post_id + banned-node audit) that a peer-federated
+        post uses — content has ONE durable store, reached either horizontally
+        (peer → follower inbox) or vertically (child → parent sync). No parallel
+        content table. The payload IS the federation 'new_post' message the
+        producer queued; a non-'new_post' shape is a safe no-op (receive_inbox
+        returns None). Best-effort; never raises out to the batch loop."""
+        try:
+            from integrations.social.federation import federation
+            fid = federation.receive_inbox(db, payload)
+            if fid:
+                logger.info(f"Sync: landed federated post {fid} from child")
+        except Exception as e:
+            logger.warning(f"Sync: _handle_sync_post failed: {e}")
 
     @staticmethod
     def _handle_sync_user(db, payload: dict):
