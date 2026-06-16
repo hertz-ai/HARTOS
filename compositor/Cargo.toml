@@ -1,0 +1,85 @@
+# ═══════════════════════════════════════════════════════════════
+# HART-comp — the HART OS AI-native Wayland compositor (SKELETON)
+# ═══════════════════════════════════════════════════════════════
+#
+# STATUS: COMPILE-PENDING SKELETON. This crate is a Phase-3 tinywl-class
+# scaffold. It is authored on a Windows dev box where NO Wayland/KMS/Smithay
+# build can run, so it is NOT yet compiled. Every paint / DRM scanout / libinput
+# / layer-shell mount claim is VM-pending (CI nixosTest on an llvmpipe software-GL
+# VM, or local QEMU-KVM). See ../docs/architecture/HART_OS_NATIVE_ARCHITECTURE.md
+# §L1 and ./ROADMAP.md Phase 3.
+#
+# Ordering invariant (ROADMAP §"Ordering principle"): Smithay HART-comp is a
+# LATER moat upgrade behind a sway-as-Tier-1 fast path. sway already ships
+# OS-native windowing TODAY (nixos/modules/hart-sway-tier1.nix); this crate is
+# the eventual first-party compositor that owns the agent-driven window tree.
+#
+# The buildRustPackage PRECEDENT for the June-2025 nixpkgs pin (50ab793) is
+# proven FIRST on an existing crate (claw_native/rust) via
+# nixos/modules/hart-rust-precedent.nix, before this crate's Nix module
+# (nixos/modules/hart-comp.nix) depends on the toolchain resolving.
+
+[package]
+name = "hart-comp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "HART OS AI-native Wayland compositor (Smithay) — Phase-3 skeleton, compile-pending"
+# rust-version pinned conservatively to what the June-2025 nixpkgs pin (50ab793)
+# ships, so the buildRustPackage in hart-comp.nix resolves on the SAME toolchain
+# the hart-rust-precedent.nix module proves first.
+rust-version = "1.77"
+
+[[bin]]
+name = "hart-comp"
+path = "src/main.rs"
+
+[dependencies]
+# Smithay: the LIBRARY compositor framework. We own the event loop, the
+# layer-shell / xdg-shell handling, and the window-placement policy directly —
+# the control GNOME/Mutter and a forked sway will not cede (ROADMAP §3.1).
+#
+# Features are the MINIMAL skeleton set:
+#   - backend_drm   : DRM/KMS scanout (the real display backend)
+#   - backend_libinput / backend_session_libseat : input + seat management
+#   - backend_udev  : device hotplug
+#   - renderer_pixman : the MANDATORY software-render path (broken-GPU floor,
+#                       reproduces the verbatim cage llvmpipe/pixman guarantee
+#                       as a first-class type-checked code path, NOT an env prayer)
+#   - wayland_frontend : the Wayland protocol server (xdg-shell, layer-shell)
+#
+# Version pinned to a range the June-2025 nixpkgs pin can vendor. The exact
+# resolved lock is generated + committed in CI (cargoHash in hart-comp.nix),
+# NEVER hand-edited on the Windows box. If the crate graph does not resolve on
+# pin 50ab793, hart-rust-precedent.nix surfaces it FIRST (ROADMAP Phase 3).
+smithay = { version = "0.3", default-features = false, features = [
+  "backend_drm",
+  "backend_gbm",
+  "backend_libinput",
+  "backend_udev",
+  "backend_session_libseat",
+  "renderer_pixman",
+  "wayland_frontend",
+  "desktop",
+] }
+
+# calloop: Smithay's event loop. Re-exported by smithay but named explicitly so
+# the skeleton's event-loop stub is honest about the dependency.
+calloop = "0.13"
+
+# Structured logging — journal-friendly (the systemd unit captures stdout/stderr).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+# Optimize for size + a clean software path; the compositor must paint on any GPU.
+opt-level = 2
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[lints.rust]
+# Match the workspace discipline in claw_native/rust: forbid unsafe in our own
+# glue. Smithay's FFI lives behind its own crate boundary.
+unsafe_code = "forbid"
