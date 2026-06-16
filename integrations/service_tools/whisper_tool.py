@@ -1191,7 +1191,16 @@ async def _stt_stream_handler(websocket):
             # silence, flush a final immediately (don't wait for the client's
             # {control:final} or the 30s overflow).  Energy on the decoded PCM
             # of THIS chunk; chunk_ms = bytes / (16kHz * 2 bytes/ms).
-            if chunk_pcm:
+            #
+            # GATED to continuous voice-room streams (call_id present).  The
+            # push-to-talk chat mic (call_id=None) finalizes client-side via
+            # {control:final} on mic-release; the client fires onResult (which
+            # submits) on every is_final, so an auto-final on a mid-utterance
+            # thinking pause would split one utterance into two chat
+            # submissions.  Voice rooms WANT pause segmentation (one
+            # conversational turn per pause) — so VAD runs only there, leaving
+            # the chat-mic flow's behavior unchanged.
+            if call_id and chunk_pcm:
                 chunk_ms = len(chunk_pcm) / (
                     STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE / 1000.0)
                 if vad.update(_pcm_rms(chunk_pcm), chunk_ms):
