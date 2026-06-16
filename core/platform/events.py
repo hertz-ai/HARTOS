@@ -120,6 +120,13 @@ _SSE_GLOBAL_PREFIXES: tuple = (
     'community.', 'hive.', 'public.',
     # host/infra telemetry (no user/agent identifiers) — admin ops feed:
     'system.', 'resource.', 'model.', 'catalog.', 'app.',
+    # hive-network AGGREGATE telemetry — epoch / peer_count / convergence,
+    # no user or agent identifiers (federation.aggregated).  Same userless
+    # class as system./model.; feeds the federation health panel.  NOT
+    # 'learning.' — its learning.federation_update reasoning-trace emit
+    # carries an agent_id, so that one stays per-owner-routed (refused
+    # globally), exactly as agent.action.completed does.
+    'federation.',
 )
 
 
