@@ -78,7 +78,20 @@ def take_screenshot(tier: str) -> str:
         tier: 'inprocess' (pyautogui direct) or 'http' (localhost:5001)
     Returns:
         Base64-encoded JPEG screenshot string.
+
+    Raises:
+        PermissionError: if the human has cut the AI's 'screen' sense
+            (core.ai_sensing) — the constitutional kill-switch, enforced at
+            the grab so a disabled screen genuinely cannot be captured.
     """
+    try:
+        from core.ai_sensing import allowed
+        if not allowed('screen'):
+            raise PermissionError("screen sensing disabled by user")
+    except PermissionError:
+        raise
+    except Exception:
+        pass
     if tier == 'inprocess':
         if pyautogui is None:
             raise ImportError("pyautogui is required for in-process screenshots")
