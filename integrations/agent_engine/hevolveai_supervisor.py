@@ -587,6 +587,19 @@ class _Supervisor(ProcessSupervisor):
         # (Qwen-VL still uses GPU INTERNALLY via qwen_llamacpp_wrapper's
         # auto-upgrade -- that path is independent of this hint.)
         env.setdefault('HEVOLVE_DEVICE', 'cpu')
+        # Hand the child the ONE canonical local-LLM URL (port_registry's 4-tier
+        # resolver) so HevolveAI's QwenAutoEncoder reuses HARTOS's existing
+        # llama-server instead of spawning a SECOND one on :8080 (#137).  Explicit
+        # "not in env" guard preserves an operator override AND avoids invoking the
+        # resolver needlessly; best-effort so a resolver hiccup never blocks spawn.
+        if 'HEVOLVE_LOCAL_LLM_URL' not in env:
+            try:
+                from core.port_registry import get_local_llm_url
+                _llm_url = get_local_llm_url()
+                if _llm_url:
+                    env['HEVOLVE_LOCAL_LLM_URL'] = _llm_url
+            except Exception:
+                pass
         if self.pythonpath:
             existing = env.get('PYTHONPATH', '')
             env['PYTHONPATH'] = (
