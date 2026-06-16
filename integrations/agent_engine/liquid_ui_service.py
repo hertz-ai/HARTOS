@@ -5396,9 +5396,27 @@ function renderAgentOverlay(ev) {{
 
     # ─── Serve ────────────────────────────────────────────────
 
+    def _register_self(self) -> None:
+        """Register this instance so in-process A2UI emitters (channel consent
+        cards, the voice bridge, model-ready toasts) can reach it via
+        get_registry().get_or_none('LiquidUIService') — the in-process half of
+        the A2UI push channel.  A separately-hosted :6800 shell additionally
+        receives pushes through the EventBus/WAMP fan-out inside
+        agent_ui_update.  Idempotent: a second serve is a no-op, not a
+        double-register error.
+        """
+        try:
+            from core.platform.registry import get_registry
+            reg = get_registry()
+            if not reg.has('LiquidUIService'):
+                reg.register('LiquidUIService', lambda: self)
+        except Exception as e:
+            logger.debug("LiquidUIService self-register skipped: %s", e)
+
     def serve_forever(self):
         """Start the glass desktop shell service."""
         self._running = True
+        self._register_self()
 
         # Ensure platform substrate is ready (EventBus, AppRegistry, Extensions)
         try:

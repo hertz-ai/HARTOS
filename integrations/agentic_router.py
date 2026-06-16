@@ -629,9 +629,8 @@ def _post_agent_reply(agent_id: str, context: Dict, reply_text: str):
                         "dispatch_to_agent: cross-channel persist "
                         "skipped (%s)", e)
                 try:
-                    from core.platform.service_registry import (
-                        ServiceRegistry)
-                    svc = ServiceRegistry.get('LiquidUIService')
+                    from core.platform.registry import get_registry
+                    svc = get_registry().get_or_none('LiquidUIService')
                     if svc is not None:
                         svc.agent_ui_update(
                             str(agent.id),

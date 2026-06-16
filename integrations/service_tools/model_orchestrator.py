@@ -877,8 +877,8 @@ class ModelOrchestrator:
         from core.platform.events import broadcast_sse_safe
         broadcast_sse_safe('capability_update', _cap_event)
         try:
-            from core.platform.service_registry import ServiceRegistry
-            _lui = ServiceRegistry.get('LiquidUIService')
+            from core.platform.registry import get_registry
+            _lui = get_registry().get_or_none('LiquidUIService')
             if _lui:
                 _lui.agent_ui_update('system', {
                     'type': 'notification',
