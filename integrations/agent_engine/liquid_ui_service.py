@@ -30,12 +30,35 @@ Multi-modal output:
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger('hevolve.liquid_ui')
+
+# Verbs that MUTATE the desktop (window.close, fullscreen takeover, …) — added
+# in Phase 6.  These pass a fail-CLOSED guardrail; benign display cards do not
+# (and must not risk the prompt gate's false-positives).
+DESTRUCTIVE_COMPONENT_TYPES = frozenset()
+
+# Obvious XSS vectors we REJECT server-side.  The client also escapes on render,
+# so we reject (not escape) to avoid double-escaping legitimate content.
+_A2UI_XSS_RE = re.compile(
+    r'<\s*script|<\s*iframe|javascript:|data:text/html', re.I)
+
+
+def _a2ui_has_xss(value) -> bool:
+    """True if any nested string in the component carries an XSS vector."""
+    if isinstance(value, str):
+        return bool(_A2UI_XSS_RE.search(value))
+    if isinstance(value, dict):
+        return any(_a2ui_has_xss(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_a2ui_has_xss(v) for v in value)
+    return False
+
 
 # ═══════════════════════════════════════════════════════════════
 # UI Component Schema (A2UI protocol)
@@ -261,6 +284,7 @@ class LiquidUIService:
 
         self.context_engine = ContextEngine(backend_port, model_bus_port)
         self._agent_components: Dict[str, List[dict]] = {}
+        self._a2ui_buckets: Dict[str, tuple] = {}   # agent_id -> (tokens, ts)
         self._lock = threading.Lock()
         self._running = False
         self._model_available = False
@@ -427,6 +451,25 @@ class LiquidUIService:
         except Exception:
             pass
 
+        # Per-agent rate cap (token bucket) — a runaway agent can't flood the
+        # desktop with UI pushes.
+        if not self._a2ui_rate_ok(agent_id):
+            logger.warning("A2UI push rate-capped: %s from %s",
+                           comp_type, agent_id)
+            return False
+
+        # Destructive verbs (window.close / fullscreen takeover, Phase 6) pass
+        # the FULL fail-CLOSED guardrail; benign display cards do not.
+        if (comp_type in DESTRUCTIVE_COMPONENT_TYPES
+                and not self._a2ui_guardrail_ok(component)):
+            return False
+
+        # Server-side defense-in-depth: reject obvious XSS vectors.
+        if _a2ui_has_xss(component):
+            logger.warning("A2UI push rejected (unsafe content): %s from %s",
+                           comp_type, agent_id)
+            return False
+
         import time as _time
         component['_ts'] = _time.time()
         component['_agent_id'] = agent_id
@@ -468,6 +511,35 @@ class LiquidUIService:
 
         logger.info("A2UI: agent %s pushed %s component", agent_id, comp_type)
         return True
+
+    def _a2ui_rate_ok(self, agent_id: str) -> bool:
+        """Per-agent token bucket (20 burst, +2/s) — a runaway agent cannot
+        flood the desktop with UI pushes."""
+        now = time.monotonic()
+        cap, refill = 20.0, 2.0
+        with self._lock:
+            tokens, last = self._a2ui_buckets.get(agent_id, (cap, now))
+            tokens = min(cap, tokens + (now - last) * refill)
+            if tokens < 1.0:
+                self._a2ui_buckets[agent_id] = (tokens, now)
+                return False
+            self._a2ui_buckets[agent_id] = (tokens - 1.0, now)
+            return True
+
+    def _a2ui_guardrail_ok(self, component: dict) -> bool:
+        """Fail-CLOSED guardrail for DESTRUCTIVE verbs — block if guardrails
+        are unavailable (benign cards fail-open; a window mutation must not)."""
+        try:
+            from security.hive_guardrails import GuardrailEnforcer
+            allowed, reason, _ = GuardrailEnforcer.before_dispatch(
+                str(component.get('action') or component.get('type') or ''))
+            if not allowed:
+                logger.warning("A2UI destructive verb blocked: %s", reason)
+            return allowed
+        except Exception as e:
+            logger.error("A2UI guardrail unavailable — blocking destructive "
+                         "verb: %s", e)
+            return False
 
     def agent_request_approval(
         self, agent_id: str, action: str, description: str
