@@ -4454,6 +4454,12 @@ function renderAgentOverlay(ev) {{
 
     def _create_flask_app(self):
         """Create Flask app serving the glass desktop shell + APIs."""
+        # Register this instance the moment the shell is wired to be served —
+        # covers BOTH standalone serve_forever() AND the Nunba desktop bundle
+        # (HART OS *is* the Nunba desktop, co-located in-process), so every
+        # in-process A2UI emitter reaches the LIVE shell via
+        # get_registry().get_or_none('LiquidUIService').  Idempotent.
+        self._register_self()
         from flask import Flask, request, jsonify, Response, send_from_directory
 
         # The shell HTML loads its logo + every external script from
@@ -5416,7 +5422,6 @@ function renderAgentOverlay(ev) {{
     def serve_forever(self):
         """Start the glass desktop shell service."""
         self._running = True
-        self._register_self()
 
         # Ensure platform substrate is ready (EventBus, AppRegistry, Extensions)
         try:

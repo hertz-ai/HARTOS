@@ -59,3 +59,12 @@ def test_push_via_canonical_accessor_reaches_store():
             'agent-9', {'type': 'card', 'title': 'composed by intent'})
     assert reached is True
     assert svc._agent_components.get('agent-9')   # landed in the SSE store
+
+
+def test_create_flask_app_registers_the_serving_instance():
+    # HART OS desktop = the Nunba bundle, co-located in one process: building
+    # the Flask app to serve the shell + SSE must register THIS instance so
+    # in-process emitters reach the live shell (no :6777/:6800 split here).
+    svc = LiquidUIService(a2ui_enabled=True)
+    svc._create_flask_app()
+    assert get_registry().get_or_none('LiquidUIService') is svc
