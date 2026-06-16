@@ -394,10 +394,16 @@ class LiquidUIService:
     def agent_ui_update(self, agent_id: str, component: dict) -> bool:
         """Push a UI component from an agent to all connected frontends.
 
-        Delivery paths (all best-effort, agent_ui_update never fails):
+        Delivery paths (best-effort once accepted):
           1. In-memory store → polled by SSE stream → Nunba LiquidUI (web)
           2. EventBus → WAMP bridge → Android/iOS React Native via Crossbar
           3. EventBus → any other subscriber (desktop, CLI dashboard)
+
+        Constitutional controls (an agent painting the screen is governed
+        like an agent dispatch): the push is REFUSED while the human has
+        halted the HiveCircuitBreaker, and every accepted push is recorded
+        in the immutable audit log.  Returns False if disabled, the type is
+        unknown, or the hive is halted.
         """
         if not self.a2ui_enabled:
             return False
@@ -406,9 +412,36 @@ class LiquidUIService:
             logger.warning("Invalid A2UI component type: %s", comp_type)
             return False
 
+        # Kill-switch: when the human halts the hive, agent UI pushes stop
+        # too — the constitution governs an agent painting the screen exactly
+        # like an agent dispatching a goal (dispatch.py:668).  Fail-OPEN if
+        # the guardrail module can't be consulted: a benign consent card must
+        # never be lost to a guardrail import error.
+        try:
+            from security.hive_guardrails import HiveCircuitBreaker
+            if HiveCircuitBreaker.is_halted():
+                logger.warning(
+                    "A2UI push refused (hive halted): %s from %s",
+                    comp_type, agent_id)
+                return False
+        except Exception:
+            pass
+
         import time as _time
         component['_ts'] = _time.time()
         component['_agent_id'] = agent_id
+
+        # Provable audit trail — every accepted push is recorded exactly like
+        # a goal dispatch (dispatch.py:680).  Best-effort: an audit hiccup
+        # must not drop a user's card.  Type + agent only (no user payload).
+        try:
+            from security.immutable_audit_log import get_audit_log
+            get_audit_log().log_event(
+                'a2ui_push', actor_id=str(agent_id),
+                action=f'push {comp_type} component',
+                detail={'type': comp_type}, target_id=str(agent_id))
+        except Exception:
+            pass
 
         # 1. Store for SSE polling (Nunba web LiquidUI)
         with self._lock:
