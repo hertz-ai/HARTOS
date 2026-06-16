@@ -128,10 +128,12 @@
     fetch(SHELL + '/api/shell/system/metrics', { signal: ts(4000) })
       .then(function (r) { return r.json(); })
       .then(function (m) {
-        // Flat keys, matching the Task Manager panel: cpu_percent / memory_percent;
-        // disk via disk_percent or the first entry of a disks[] array.
+        // /api/shell/system/metrics returns cpu_percent (flat), ram.percent
+        // (NESTED — not a flat memory_percent), and a disks[] array. The live
+        // floor boot showed Memory stuck at 0% reading the flat key; read
+        // ram.percent first (fall back to the flat key for any other source).
         var cpu = m.cpu_percent || 0;
-        var mem = m.memory_percent || 0;
+        var mem = (m.ram && m.ram.percent) || m.memory_percent || 0;
         var disk = m.disk_percent;
         if (disk == null && m.disks && m.disks.length) disk = m.disks[0].percent;
         var el = $('hw-sys-body');
