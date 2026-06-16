@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Generator, Optional, Tuple
 
+from core.circuit_breaker import KeyedCircuitBreaker
+
 logger = logging.getLogger('hevolve.remote_desktop')
 
 # ── Optional dependencies (guarded imports) ─────────────────────
@@ -76,32 +78,9 @@ class FrameConfig:
     max_backoff_seconds: float = 2.0  # Max interval between frames
 
 
-# ── Circuit Breaker (vlm_adapter.py:34 pattern) ────────────────
-
-class _CaptureCircuitBreaker:
-    """Track failures per backend, open circuit after threshold."""
-
-    def __init__(self, threshold: int = 5):
-        self.threshold = threshold
-        self._failures: dict = {}  # backend_name → count
-        self._open: set = set()
-
-    def record_failure(self, backend: str) -> None:
-        self._failures[backend] = self._failures.get(backend, 0) + 1
-        if self._failures[backend] >= self.threshold:
-            self._open.add(backend)
-            logger.warning(f"Circuit breaker OPEN for {backend}")
-
-    def record_success(self, backend: str) -> None:
-        self._failures[backend] = 0
-        self._open.discard(backend)
-
-    def is_open(self, backend: str) -> bool:
-        return backend in self._open
-
-    def reset(self, backend: str) -> None:
-        self._failures.pop(backend, None)
-        self._open.discard(backend)
+# Per-backend circuit breaking now uses the canonical
+# core.circuit_breaker.KeyedCircuitBreaker (was a local _CaptureCircuitBreaker
+# duplicate) — one breaker impl, with the canonical cooldown + half-open recovery.
 
 
 # ── Frame Capture ───────────────────────────────────────────────
@@ -111,7 +90,7 @@ class FrameCapture:
 
     def __init__(self, config: Optional[FrameConfig] = None):
         self.config = config or FrameConfig()
-        self._circuit = _CaptureCircuitBreaker()
+        self._circuit = KeyedCircuitBreaker(threshold=5, name='frame_capture')
         self._lock = threading.Lock()
         self._running = False
         self._last_frame: Optional[bytes] = None
