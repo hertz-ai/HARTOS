@@ -36,37 +36,26 @@ name = "hart-comp"
 path = "src/main.rs"
 
 [dependencies]
-# Smithay: the LIBRARY compositor framework. We own the event loop, the
-# layer-shell / xdg-shell handling, and the window-placement policy directly —
-# the control GNOME/Mutter and a forked sway will not cede (ROADMAP §3.1).
-#
-# Features are the MINIMAL skeleton set:
-#   - backend_drm   : DRM/KMS scanout (the real display backend)
-#   - backend_libinput / backend_session_libseat : input + seat management
-#   - backend_udev  : device hotplug
-#   - renderer_pixman : the MANDATORY software-render path (broken-GPU floor,
-#                       reproduces the verbatim cage llvmpipe/pixman guarantee
-#                       as a first-class type-checked code path, NOT an env prayer)
-#   - wayland_frontend : the Wayland protocol server (xdg-shell, layer-shell)
-#
-# Version pinned to a range the June-2025 nixpkgs pin can vendor. The exact
-# resolved lock is generated + committed in CI (cargoHash in hart-comp.nix),
-# NEVER hand-edited on the Windows box. If the crate graph does not resolve on
-# pin 50ab793, hart-rust-precedent.nix surfaces it FIRST (ROADMAP Phase 3).
-smithay = { version = "0.3", default-features = false, features = [
-  "backend_drm",
-  "backend_gbm",
-  "backend_libinput",
-  "backend_udev",
-  "backend_session_libseat",
-  "renderer_pixman",
-  "wayland_frontend",
-  "desktop",
-] }
-
-# calloop: Smithay's event loop. Re-exported by smithay but named explicitly so
-# the skeleton's event-loop stub is honest about the dependency.
-calloop = "0.13"
+# Phase-3 skeleton is PURE LOGIC (render-path decision + boot-config + the
+# never-fail-floor invariant). main.rs does NOT yet link Smithay/calloop — the
+# `use smithay::...` block there is a COMMENTED manifest of the shape the real
+# compositor needs. Declaring those deps before the code uses them only breaks
+# the build, because:
+#   * Smithay is NOT published to crates.io with the modern API — crates.io
+#     `smithay 0.3.0` (2022) lacks the `desktop` AND `renderer_pixman` features
+#     this compositor needs (VERIFIED live: `cargo build` fails to select 0.3.0
+#     with feature `desktop`). The real dep is GIT Smithay pinned to a rev:
+#       smithay = { git = "https://github.com/Smithay/smithay", rev = "<pinned>",
+#         default-features = false, features = [
+#           "backend_drm", "backend_gbm", "backend_libinput", "backend_udev",
+#           "backend_session_libseat", "renderer_pixman", "wayland_frontend",
+#           "desktop" ] }
+#       calloop = "0.13"
+#     + a committed Cargo.lock, vendored + hashed in hart-comp.nix, proven on the
+#     nixpkgs pin via hart-rust-precedent.nix FIRST (ROADMAP Phase 3). They come
+#     back when the integration lands in CI — where Smithay can actually compile.
+# Until then the skeleton keeps a minimal, COMPILING dep set + a behavioural
+# never-fail-floor test floor (see #[cfg(test)] in main.rs).
 
 # Structured logging — journal-friendly (the systemd unit captures stdout/stderr).
 tracing = "0.1"
