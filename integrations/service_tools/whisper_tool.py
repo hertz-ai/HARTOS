@@ -1018,6 +1018,10 @@ async def _stt_stream_handler(websocket):
 
     audio_buffer = io.BytesIO()
     last_transcribe_size = 0
+    # Connection-level forced language, honoured from a {"type":"config",
+    # "language":"<code>"} control message (the docstring's promise — the code
+    # previously ignored it).  None => faster-whisper auto-detects per utterance.
+    stt_lang = None
     # UNIF-G7 Producer C: extract optional call context from the
     # WS request path.  When absent (call_id is None), the
     # _maybe_enqueue_call_segment helper degrades to a no-op so plain
@@ -1036,7 +1040,7 @@ async def _stt_stream_handler(websocket):
                         continue
                     if ctrl.get('control') == 'final':
                         # Force final transcription of remaining buffer
-                        text, lang = _transcribe_buffer(audio_buffer)
+                        text, lang = _transcribe_buffer(audio_buffer, language=stt_lang)
                         if text:
                             await websocket.send(json.dumps({
                                 'text': text, 'language': lang, 'is_final': True,
@@ -1045,6 +1049,13 @@ async def _stt_stream_handler(websocket):
                                 call_id, user_id, text, lang, True)
                         audio_buffer = io.BytesIO()
                         last_transcribe_size = 0
+                        continue
+                    if ctrl.get('type') == 'config':
+                        # Honour the documented {type:config, language} message:
+                        # set the forced language once for this connection.
+                        _cfg_lang = ctrl.get('language')
+                        if _cfg_lang:
+                            stt_lang = _cfg_lang
                         continue
                 except (json.JSONDecodeError, ValueError):
                     pass
@@ -1075,7 +1086,7 @@ async def _stt_stream_handler(websocket):
 
             # Force transcription if buffer exceeds max
             if buf_size >= STREAM_MAX_BUFFER_BYTES:
-                text, lang = _transcribe_buffer(audio_buffer)
+                text, lang = _transcribe_buffer(audio_buffer, language=stt_lang)
                 if text:
                     await websocket.send(json.dumps({
                         'text': text, 'language': lang, 'is_final': True,
@@ -1098,7 +1109,7 @@ async def _stt_stream_handler(websocket):
             if buf_size - last_transcribe_size >= STREAM_CHUNK_BYTES:
                 interim_buf = _tail_window_buffer(
                     audio_buffer, STREAM_INTERIM_WINDOW_BYTES)
-                text, lang = _transcribe_buffer(interim_buf, keep_buffer=True)
+                text, lang = _transcribe_buffer(interim_buf, keep_buffer=True, language=stt_lang)
                 last_transcribe_size = buf_size
                 if text:
                     await websocket.send(json.dumps({
@@ -1186,10 +1197,13 @@ def _tail_window_buffer(audio_buffer, window_bytes: int):
     return io.BytesIO(tail)
 
 
-def _transcribe_buffer(audio_buffer, keep_buffer: bool = False) -> tuple:
+def _transcribe_buffer(audio_buffer, keep_buffer: bool = False,
+                       language: Optional[str] = None) -> tuple:
     """Transcribe accumulated audio buffer via the subprocess STT worker.
 
-    Returns (text, language) tuple.
+    Returns (text, language) tuple.  ``language`` is an optional forced
+    language code (from the stream's {type:config} message); None lets
+    faster-whisper auto-detect per utterance.
 
     Runs through `_stt_tool` so CUDA OOM or faster-whisper/CTranslate2
     crashes on the realtime path only kill the worker subprocess — the
@@ -1222,7 +1236,7 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False) -> tuple:
         result = _stt_tool.call({
             'op': 'transcribe',
             'audio_path': tmp.name,
-            'language': None,
+            'language': language,
         })
         if 'error' in result and not result.get('raw_json'):
             logger.warning(f"Streaming STT transcribe failed (returning empty text): {result.get('error')}")

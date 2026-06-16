@@ -110,7 +110,7 @@ class InterimWindowBoundTest(unittest.TestCase):
 
         seen_interim_sizes = []
 
-        def _fake_transcribe(buf, keep_buffer=False):
+        def _fake_transcribe(buf, keep_buffer=False, language=None):
             # keep_buffer=True is the interim path; record its byte length.
             if keep_buffer:
                 seen_interim_sizes.append(len(buf.getvalue()))
@@ -143,7 +143,7 @@ class InterimWindowBoundTest(unittest.TestCase):
         final_sizes = []
         interim_sizes = []
 
-        def _fake_transcribe(buf, keep_buffer=False):
+        def _fake_transcribe(buf, keep_buffer=False, language=None):
             if keep_buffer:
                 interim_sizes.append(len(buf.getvalue()))
             else:
@@ -161,6 +161,51 @@ class InterimWindowBoundTest(unittest.TestCase):
         # A final is_final=True frame was sent.
         self.assertTrue(any('"is_final": true' in s for s in ws.sent))
 
+    def test_config_language_is_threaded_to_transcribe(self):
+        """#131: a {type:config, language} control sets the forced language for
+        the connection; every subsequent _transcribe_buffer call receives it
+        (the docstring promised this; the code used to hardcode None)."""
+        import json as _json
+        chunk = whisper_tool.STREAM_CHUNK_BYTES
+        messages = [
+            _json.dumps({"type": "config", "language": "hi"}),
+            _pcm(chunk), _pcm(chunk),
+            _json.dumps({"control": "final"}),
+        ]
+        ws = _FakeWS(messages)
+        seen_langs = []
+
+        def _fake_transcribe(buf, keep_buffer=False, language=None):
+            seen_langs.append(language)
+            return ("ok", "hi")
+
+        with mock.patch.object(whisper_tool, "_transcribe_buffer", _fake_transcribe):
+            _run(whisper_tool._stt_stream_handler(ws))
+
+        self.assertTrue(seen_langs, "no transcribe happened")
+        self.assertTrue(all(lang == "hi" for lang in seen_langs),
+                        f"forced language not threaded to every call: {seen_langs}")
+
+    def test_absent_config_keeps_language_none_autodetect(self):
+        """Regression guard: with NO config message, language stays None so
+        faster-whisper auto-detects exactly as before this change."""
+        import json as _json
+        chunk = whisper_tool.STREAM_CHUNK_BYTES
+        messages = [_pcm(chunk), _json.dumps({"control": "final"})]
+        ws = _FakeWS(messages)
+        seen_langs = []
+
+        def _fake_transcribe(buf, keep_buffer=False, language=None):
+            seen_langs.append(language)
+            return ("ok", "en")
+
+        with mock.patch.object(whisper_tool, "_transcribe_buffer", _fake_transcribe):
+            _run(whisper_tool._stt_stream_handler(ws))
+
+        self.assertTrue(seen_langs)
+        self.assertTrue(all(lang is None for lang in seen_langs),
+                        f"language must default to None (auto-detect): {seen_langs}")
+
     def test_max_buffer_force_flush_decodes_full_buffer(self):
         """Part A — the MAX_BUFFER force-flush is a FINAL decode (keep_buffer
         False) over the whole buffer, not a windowed interim."""
@@ -170,7 +215,7 @@ class InterimWindowBoundTest(unittest.TestCase):
 
         final_sizes = []
 
-        def _fake_transcribe(buf, keep_buffer=False):
+        def _fake_transcribe(buf, keep_buffer=False, language=None):
             if not keep_buffer:
                 final_sizes.append(len(buf.getvalue()))
             return ("flushed", "en")
