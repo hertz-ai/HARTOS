@@ -541,6 +541,41 @@ class LiquidUIService:
                          "verb: %s", e)
             return False
 
+    def _compose_intent_result(self, intent_text: str, chat_result: dict) -> bool:
+        """M1 — turn a brain /chat decomposition into COMPOSED desktop UI.
+
+        Single responsibility: take what the brain's intent classifier
+        (CREATE / REUSE / tool / vision / casual) decided and PAINT it on the
+        desktop as an A2UI card pushed through the now-wired ``agent_ui_update``
+        channel — instead of only narrating a chat bubble.  The orb/command bar
+        thereby becomes an intent COMPOSER, not a launcher.
+
+        No parallel decompose path: ``chat_result`` is the verbatim payload from
+        ``/chat`` (response text + intent + Agent_status + prompt_id).  Returns
+        True iff a composed component was accepted by ``agent_ui_update`` (False
+        when the hive is halted, rate-capped, a2ui disabled, or the reply was
+        empty — the bubble still renders in every case).
+        """
+        reply = (chat_result.get('response')
+                 or chat_result.get('error') or '').strip()
+        if not reply:
+            return False
+        status = chat_result.get('Agent_status') or ''
+        prompt_id = chat_result.get('prompt_id')
+        # The brain's own routing decides the icon: a created/reused agent gets
+        # the agent glyph, a plain answer gets the spark.
+        icon = 'smart_toy' if (status or prompt_id) else 'auto_awesome'
+        title = status or 'HART'
+        component = {
+            'type': 'card',
+            'title': title,
+            'icon': icon,
+            'content': reply,
+            'intent': intent_text,
+            'timestamp': time.time(),
+        }
+        return self.agent_ui_update('desktop_intent', component)
+
     def agent_request_approval(
         self, agent_id: str, action: str, description: str
     ) -> dict:
@@ -3697,14 +3732,17 @@ function askAgent() {{
   resp.textContent = 'Thinking...';
   resp.classList.add('visible');
 
-  // Check for theme commands first
+  // M1 — intent is the default surface (mirrors acSend).  Theme words and
+  // 'open <named app>' are demoted FALLBACK fast-paths; everything else routes
+  // through the brain decompose (/chat) and is COMPOSED onto the desktop via
+  // agent_ui_update (painted by the SSE overlay stream).
   const lower = text.toLowerCase();
   if(lower.includes('theme')||lower.includes('font')||lower.includes('bigger')||
      lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
     handleThemeCommand(lower, resp);
     return;
   }}
-  // Check for panel open commands
+  // Fallback fast-path: launch a NAMED app directly (no brain round-trip).
   if(lower.startsWith('open ')) {{
     const target = lower.replace('open ','').trim();
     const match = Object.entries(MANIFEST).find(([k,v])=>
@@ -3712,11 +3750,12 @@ function askAgent() {{
     if(match) {{ openPanel(match[0]); resp.textContent='Opened '+match[1].title; return; }}
   }}
 
+  // Default: route the intent through the brain and COMPOSE the desktop.
   fetch(SHELL+'/api/agent/ask',{{method:'POST',headers:{{'Content-Type':'application/json'}},
     body:JSON.stringify({{text}})}})
     .then(r=>r.json()).then(data=>{{
       const txt = data.response || data.error || 'No response';
-      resp.textContent = txt;
+      resp.textContent = data.composed ? ('✦ ' + txt) : txt;
       speakText(txt, 'chat_response');
     }}).catch(()=>{{ resp.textContent='Could not reach agent'; }});
 }}
@@ -3833,8 +3872,21 @@ function acSend() {{
   const typing = acAddMsg('assistant', 'Thinking...');
   typing.classList.add('typing');
 
-  // Check local commands first
+  // M1 — INTENT IS THE DEFAULT OPERATING SURFACE.
+  // The orb/command bar composes the desktop from what the human wants: the
+  // DEFAULT path sends free-form intent to /api/agent/ask, which routes it
+  // through the brain's EXISTING decompose (/chat → CREATE/REUSE) and PUSHES
+  // the result as a composed A2UI card via agent_ui_update (the SSE stream
+  // paints it through renderAgentOverlay).  'open <named app>' and theme words
+  // are demoted to explicit FALLBACK fast-paths, not the spine.
   const lower = text.toLowerCase();
+  if(lower.includes('theme')||lower.includes('font')||lower.includes('bigger')||
+     lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
+    const fakeResp = {{set textContent(v){{typing.textContent=v;typing.classList.remove('typing')}}}};
+    handleThemeCommand(lower, fakeResp);
+    return;
+  }}
+  // Fallback fast-path: launch a NAMED app directly (no brain round-trip).
   if(lower.startsWith('open ')) {{
     const target = lower.replace('open ','').trim();
     const match = Object.entries(MANIFEST).find(([k,v])=>
@@ -3846,19 +3898,15 @@ function acSend() {{
       return;
     }}
   }}
-  if(lower.includes('theme')||lower.includes('font')||lower.includes('bigger')||
-     lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
-    const fakeResp = {{set textContent(v){{typing.textContent=v;typing.classList.remove('typing')}}}};
-    handleThemeCommand(lower, fakeResp);
-    return;
-  }}
 
-  // Send to backend
+  // Default: route the intent through the brain and COMPOSE the desktop.
   fetch(SHELL+'/api/agent/ask',{{method:'POST',headers:{{'Content-Type':'application/json'}},
     body:JSON.stringify({{text:text,capability:acActiveCap}})}})
     .then(function(r){{return r.json()}}).then(function(data){{
       const reply = data.response || data.error || 'No response';
-      typing.textContent = reply;
+      // The composed card is painted on the desktop by the SSE overlay stream;
+      // the bubble is the spoken acknowledgement (casual chat still replies).
+      typing.textContent = data.composed ? ('✦ ' + reply) : reply;
       typing.classList.remove('typing');
       speakText(reply, 'chat_response');
     }}).catch(function(){{
@@ -4692,6 +4740,12 @@ function renderAgentOverlay(ev) {{
             if not text:
                 return jsonify({'error': 'No text provided'})
             import requests as req
+            # M1 — INTENT → DECOMPOSE → COMPOSE.  Route free-form intent through
+            # the brain's EXISTING intent classifier (/chat → CREATE/REUSE/tool/
+            # vision/casual — no parallel path) and COMPOSE the result onto the
+            # desktop as an A2UI card pushed through agent_ui_update (the now-wired
+            # B1/B2 push channel), instead of only narrating a chat bubble.  The
+            # reply text is still returned so casual chat keeps speaking.
             try:
                 resp = req.post(
                     f'http://localhost:{self.backend_port}/chat',
@@ -4700,9 +4754,11 @@ function renderAgentOverlay(ev) {{
                         'prompt_id': 'desktop_agent',
                         'prompt': text,
                     }, timeout=30)
-                return jsonify(resp.json())
+                payload = resp.json()
             except Exception as e:
                 return jsonify({'error': str(e)})
+            payload['composed'] = self._compose_intent_result(text, payload)
+            return jsonify(payload)
 
         # ── Shell APIs: Events ──
         @app.route('/api/shell/events', methods=['GET'])
