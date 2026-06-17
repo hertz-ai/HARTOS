@@ -261,8 +261,15 @@ in
         # and auto-restart-looped on the ISO.
         path = with pkgs; [ pciutils gnugrep systemd ];
 
+        # Stop crash-looping when GPU driver (e.g. nouveau) fails at init.
+        # 3 attempts in 60 s, then give up — shell still boots without GPU sched.
+        startLimitIntervalSec = 60;
+        startLimitBurst = 3;
+
         serviceConfig = {
           Type = "notify";
+          Restart = "on-failure";
+          RestartSec = 10;
           User = "hart";
           Group = "hart";
           SupplementaryGroups = [ "video" "render" ];

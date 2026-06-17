@@ -605,5 +605,19 @@ in
     themePackages = [ hartPlymouth ];
     theme = lib.mkForce "hart";
   };
-  boot.kernelParams = [ "quiet" "splash" ];
+  boot.kernelParams = [
+    "quiet" "splash"
+    # Disable nouveau GSP firmware mode — causes gsp: fini failed, -110 on many
+    # NVIDIA cards (RTX series). Without this, nouveau hangs at GPU init, taking
+    # down the GPU Scheduler and Android Runtime with it.
+    "nouveau.config=NvGspRm=0"
+    # Keep KMS active (nomodeset would break WebKit compositing), just suppress GSP.
+  ];
+
+  # Prevent nouveau from hard-hanging on GPUs where GSP fails even with NvGspRm=0.
+  # The shell falls back to software compositing (llvmpipe) which is fine for the
+  # kiosk WebKit renderer; the potato-mode flag is set automatically on llvmpipe.
+  boot.extraModprobeConfig = ''
+    options nouveau config=NvGspRm=0
+  '';
 }

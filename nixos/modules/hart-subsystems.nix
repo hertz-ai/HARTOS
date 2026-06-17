@@ -245,8 +245,16 @@ in
         wants = [ "hart.target" ];
         wantedBy = [ "hart.target" ];
 
+        # Stop crash-looping when binder_linux or GPU is unavailable.
+        # 3 attempts in 60 s, then systemd marks it failed and moves on —
+        # the shell still boots; Android apps just won't work this session.
+        startLimitIntervalSec = 60;
+        startLimitBurst = 3;
+
         serviceConfig = {
           Type = "notify";
+          Restart = "on-failure";
+          RestartSec = 10;
           ExecStart = pkgs.writeShellScript "hart-android-start" ''
             set -euo pipefail
 
