@@ -101,3 +101,23 @@ def test_walk_yields_the_gil():
     # 130 PIDs, yield every TOPPROC_YIELD_EVERY(50) -> several sleep(0) calls
     assert msleep.call_count >= 2
     assert all(c.args == (0,) for c in msleep.call_args_list)
+
+
+# ─── iter_processes: the canonical GIL-safe walker (shared with the shell
+#     task-manager routes) ───
+
+def test_iter_processes_walks_all_and_yields_gil():
+    counter = {'walks': 0}
+    with patch.object(co, '_try_import_psutil', return_value=_fake_psutil(counter, n=130)), \
+            patch.object(co.time, 'sleep') as msleep:
+        procs = list(co.iter_processes(['pid', 'name'], yield_every=50))
+    assert counter['walks'] == 1
+    assert len(procs) == 130
+    assert msleep.call_count >= 2                       # GIL released mid-walk
+    assert all(c.args == (0,) for c in msleep.call_args_list)
+
+
+def test_iter_processes_empty_when_psutil_missing():
+    """No psutil -> yields nothing (never raises) so callers degrade cleanly."""
+    with patch.object(co, '_try_import_psutil', return_value=None):
+        assert list(co.iter_processes(['pid'])) == []

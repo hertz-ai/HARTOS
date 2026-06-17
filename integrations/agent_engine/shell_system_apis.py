@@ -106,10 +106,14 @@ def register_shell_system_routes(app):
             import psutil
         except ImportError:
             return jsonify({'processes': [], 'total': 0, 'error': 'psutil not available'})
+        from core.compute_optimizer import iter_processes
         procs = []
-        for p in psutil.process_iter(['pid', 'name', 'username', 'cpu_percent',
-                                       'memory_percent', 'memory_info', 'status',
-                                       'nice', 'num_threads', 'create_time', 'cmdline']):
+        # GIL-safe walker (yields mid-walk) — this task-manager view fetches
+        # memory_info + cmdline per PID, the heaviest walk; without yielding, a
+        # poll of it would stall the event loop (the #151 class).
+        for p in iter_processes(['pid', 'name', 'username', 'cpu_percent',
+                                 'memory_percent', 'memory_info', 'status',
+                                 'nice', 'num_threads', 'create_time', 'cmdline']):
             try:
                 info = p.info
                 if search and search not in (info.get('name') or '').lower() and \

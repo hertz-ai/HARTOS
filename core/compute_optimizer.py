@@ -97,6 +97,29 @@ TOPPROC_SCAN_COOLDOWN = float(os.environ.get('OPTIMIZER_TOPPROC_COOLDOWN', '60')
 # event loop interleaves with it instead of stalling for the whole iteration.
 TOPPROC_YIELD_EVERY = int(os.environ.get('OPTIMIZER_TOPPROC_YIELD_EVERY', '50'))
 
+
+def iter_processes(attrs, yield_every: int = TOPPROC_YIELD_EVERY):
+    """Yield ``psutil`` processes for ``attrs``, releasing the GIL every
+    ``yield_every`` PIDs.
+
+    Single source for the heavy per-process walk: ``process_iter`` + the
+    requested per-PID fields (``memory_percent``/``memory_info``/``cmdline``)
+    are GIL-bound on Windows, so iterating every PID in one tight loop holds
+    the GIL long enough to starve the async HTTP/SSE event loop and other
+    threads — the #151 class (the optimizer's monitor walk hung the server;
+    the shell task-manager routes do the same heavy walk per poll).  Cooperative
+    ``time.sleep(0)`` yields let those threads run mid-walk.  Yields nothing
+    when psutil is unavailable.  Callers do their own filter/shape on
+    ``proc.info`` and catch ``NoSuchProcess``/``AccessDenied`` themselves.
+    """
+    psutil = _try_import_psutil()
+    if psutil is None:
+        return
+    for i, proc in enumerate(psutil.process_iter(attrs)):
+        yield proc
+        if (i + 1) % yield_every == 0:
+            time.sleep(0)
+
 # Hive exploration: random interval bounds (seconds)
 HIVE_EXPLORE_MIN = float(os.environ.get('OPTIMIZER_HIVE_MIN', '300'))   # 5 min
 HIVE_EXPLORE_MAX = float(os.environ.get('OPTIMIZER_HIVE_MAX', '1800'))  # 30 min
@@ -410,8 +433,11 @@ class ComputeOptimizer:
         self._last_topproc_ts = now
         try:
             procs = []
-            for i, proc in enumerate(psutil.process_iter(
-                    ['pid', 'name', 'cpu_percent', 'memory_percent'])):
+            # iter_processes walks every PID but releases the GIL periodically
+            # (the canonical GIL-safe walker — single source shared with the
+            # shell task-manager routes).
+            for proc in iter_processes(
+                    ['pid', 'name', 'cpu_percent', 'memory_percent']):
                 info = proc.info
                 if info.get('cpu_percent', 0) > 0.1:
                     procs.append({
@@ -420,10 +446,6 @@ class ComputeOptimizer:
                         'cpu_percent': round(info.get('cpu_percent', 0), 1),
                         'mem_percent': round(info.get('memory_percent', 0), 1),
                     })
-                # Release the GIL periodically so the HTTP/SSE event loop can
-                # run mid-walk instead of waiting for the whole iteration.
-                if i % TOPPROC_YIELD_EVERY == 0:
-                    time.sleep(0)
             procs.sort(key=lambda p: p['cpu_percent'], reverse=True)
             snap.top_processes = procs[:10]
         except Exception:

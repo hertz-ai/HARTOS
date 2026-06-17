@@ -5344,7 +5344,10 @@ function renderAgentOverlay(ev) {{
             procs = []
             try:
                 import psutil
-                for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+                from core.compute_optimizer import iter_processes
+                # GIL-safe walker (yields mid-walk) so a polled task-manager
+                # panel can't starve the event loop — the #151 class.
+                for p in iter_processes(['pid', 'name', 'cpu_percent', 'memory_percent']):
                     try:
                         info = p.info
                         if info.get('cpu_percent', 0) > 0 or info.get('memory_percent', 0) > 0.1:
