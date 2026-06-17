@@ -73,6 +73,12 @@ in
     };
 
     testScript = ''
+      # The driver keys the single machine global by its HOSTNAME — mkNode forces
+      # it to the variant ("desktop"), NOT the nodes.sup key — so the `sup` name
+      # is absent at runtime (NameError). Bind it from the machines list
+      # (single-node test → element 0). The real fix; skip* above only silence the
+      # static passes.
+      sup = machines[0]
       sup.start()
       sup.wait_for_unit("multi-user.target")
 

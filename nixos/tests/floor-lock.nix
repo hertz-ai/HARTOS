@@ -67,6 +67,12 @@ in
     };
 
     testScript = ''
+      # The driver keys the single machine global by its HOSTNAME — mkNode forces
+      # it to the variant ("desktop"), NOT the nodes.floor key — so the `floor`
+      # name is absent at runtime (NameError). Bind it from the machines list
+      # (single-node test → element 0). This is the real fix; the skip* flags
+      # above only silence the static passes that flagged the same absence.
+      floor = machines[0]
       floor.start()
       floor.wait_for_unit("multi-user.target")
 
