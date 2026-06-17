@@ -120,6 +120,29 @@ class HartWmClient:
             return {'ok': False, 'error': 'refused-by-constitution'}
         return self._ok(self._sway(['[con_id=%d]' % int(con_id), 'kill']))
 
+    # ── agent/MCP entry point ──
+    def dispatch_verb(self, verb: str, args: dict, agent_id: str) -> Dict[str, Any]:
+        """Single entry point for agent verbs + MCP co-pilot tools — routes a
+        window.* verb to the right method (destructive ones stay fail-closed
+        gated). This is what an A2UI window.* component or an MCP tool calls."""
+        args = args or {}
+        try:
+            if verb == 'window.list':
+                return {'ok': True, 'windows': self.list_windows()}
+            if verb == 'window.focus':
+                return self.focus_window(int(args['con_id']))
+            if verb == 'window.place':
+                return self.place_window(int(args['con_id']), int(args['x']),
+                                         int(args['y']), int(args['w']),
+                                         int(args['h']))
+            if verb == 'window.tile':
+                return self.tile_layout(str(args['layout']))
+            if verb == 'window.close':
+                return self.close_window(int(args['con_id']), agent_id)
+        except (KeyError, ValueError, TypeError) as e:
+            return {'ok': False, 'error': f'bad args for {verb}: {e}'}
+        return {'ok': False, 'error': f'unknown verb: {verb}'}
+
     # ── helpers ──
     @staticmethod
     def _ok(r) -> Dict[str, Any]:

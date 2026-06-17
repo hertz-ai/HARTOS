@@ -88,3 +88,29 @@ def test_no_compositor_returns_empty_not_crash():
     c = HartWmClient()
     c._backend = None
     assert c.list_windows() == []
+
+
+def test_dispatch_place_routes_to_place_window():
+    c = _sway_client()
+    with patch.object(wm, '_run', return_value=_proc(0)) as run:
+        r = c.dispatch_verb('window.place',
+                            {'con_id': 7, 'x': 10, 'y': 20, 'w': 800, 'h': 600},
+                            'agent-1')
+    assert r['ok'] is True
+    assert 'move position 10 20' in run.call_args.args[0][1]
+
+
+def test_dispatch_close_is_fail_closed_gated():
+    c = _sway_client()
+    with patch('security.hive_guardrails.HiveCircuitBreaker.is_halted',
+               return_value=True), \
+         patch.object(wm, '_run', return_value=_proc(0)) as run:
+        r = c.dispatch_verb('window.close', {'con_id': 7}, 'agent-1')
+    assert r['ok'] is False
+    run.assert_not_called()
+
+
+def test_dispatch_unknown_verb_and_bad_args():
+    c = _sway_client()
+    assert c.dispatch_verb('window.frobnicate', {}, 'a')['ok'] is False
+    assert c.dispatch_verb('window.place', {'con_id': 'NaN'}, 'a')['ok'] is False
