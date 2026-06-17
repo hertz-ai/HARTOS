@@ -96,16 +96,23 @@ in
 
       # ── 1. The cage hart-shell session IS the registered floor ──
       with subtest("Cage 'hart-shell' wayland-session is registered (floor = the session)"):
+          # Registered via services.displayManager.sessionPackages (hart-liquid-ui's
+          # kioskSession) -> the DM's store-based sessionData, NOT /run/current-
+          # system/sw/share/wayland-sessions (that path needs GNOME/GDM's
+          # pathsToLink; greetd does not add it). Assert the session .desktop is
+          # realized in the system closure (the greetd enabled above pulls it in).
           floor.succeed(
-              "find /run/current-system/sw/share/wayland-sessions "
-              "-name 'hart-shell.desktop' -print -quit | grep -q .")
+              "find /nix/store -maxdepth 5 -path "
+              "'*/share/wayland-sessions/hart-shell.desktop' -print -quit | grep -q .")
 
       with subtest("defaultSession is pinned to the cage floor (hart-shell), not GNOME"):
-          # The .desktop the greeter would auto-pick. We assert the session
-          # package exists; the actual greeter default is set in desktop.nix and
-          # forced above. (GNOME stays SELECTABLE — the human escape hatch.)
+          # The session package exists in the closure (the greeter default is set
+          # in desktop.nix + forced above; GNOME stays SELECTABLE). Same store-based
+          # sessionData location as above — not the GNOME-only /run/current-system
+          # path.
           floor.succeed(
-              "test -f /run/current-system/sw/share/wayland-sessions/hart-shell.desktop")
+              "find /nix/store -maxdepth 5 -path "
+              "'*/share/wayland-sessions/hart-shell.desktop' -print -quit | grep -q .")
 
       # ── 2. Forced software-GL: the broken-GPU paint floor, bit-for-bit ──
       with subtest("Kiosk launcher forces software GL (WLR/LIBGL/WEBKIT) — broken-GPU floor"):
