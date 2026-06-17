@@ -202,10 +202,11 @@ def is_genuine_user_request(request_id) -> bool:
     background, never aborted them, and a real "hi" queued behind them on the
     single 4B.  Genuine user calls always carry an id (the Nunba adapter
     defaults request_id to a timestamp when the client omits one, so an INBOUND
-    request is never empty), so empty == untagged == background here.  The
-    inbound /chat foreground gate keeps its OWN fail-open for a truly id-less
-    request (mark_view._chat_request_is_genuine) so no real turn is starved —
-    the fail-open lives there, not in this discriminator.
+    request is never empty), so empty == untagged == background here.  This is
+    the SOLE authority for "is this a user?" — the inbound mark_view gate
+    (_chat_request_is_genuine) and the outbound abort gate (_is_background_call)
+    both delegate here with NO bespoke, caller-specific rule, so they can never
+    give different answers for the same id.
     """
     return bool(request_id) and not str(request_id).startswith('daemon_')
 

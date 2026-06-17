@@ -8208,15 +8208,14 @@ def _chat_request_is_genuine():
     except Exception:
         return True  # no request context / unparsable -> treat as a user turn
     try:
+        # Delegate ENTIRELY to the one canonical discriminator — no bespoke,
+        # caller-specific "is user" rule here.  is_genuine_user_request is the
+        # single source of truth for empty / 'daemon_' / real-id across every
+        # caller (this inbound mark_view AND the outbound abort gate), so they
+        # can never diverge.  Empty → background is safe inbound too: a real
+        # /chat always carries an id (the frontend sends one; the Nunba adapter
+        # defaults a timestamp when omitted), so an inbound turn is never empty.
         from integrations.agent_engine.dispatch import is_genuine_user_request
-        # Inbound fail-open: a /chat that reached the handler with NO id at all
-        # is assumed a user — never starve a real turn.  is_genuine_user_request
-        # now treats empty as BACKGROUND (for the outbound abort gate), so the
-        # fail-open for a genuine id-less inbound turn must live HERE.  (In
-        # practice the Nunba adapter defaults request_id to a timestamp, so this
-        # is belt-and-suspenders; the daemon always carries 'daemon_<goal>'.)
-        if not _rid:
-            return True
         return is_genuine_user_request(_rid)
     except Exception:
         return True
