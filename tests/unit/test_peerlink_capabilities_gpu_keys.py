@@ -51,3 +51,34 @@ def test_detect_gpu_contract_has_no_legacy_keys():
     assert 'cuda_available' in d and 'available' not in d
     assert 'name' in d and 'device_name' not in d
     assert 'total_gb' in d and 'vram_total_mb' not in d
+
+
+def test_central_telemetry_compute_block_reports_gpu():
+    """The SAME bug existed in CentralConnection._publish_telemetry's compute
+    block (gpu.get('available')/'device_name'/'vram_free_mb' — none exist).
+    Drive the real method with detect_gpu + the message bus mocked; assert the
+    published telemetry advertises the GPU via the correct keys."""
+    import types
+    import core.peer_link.message_bus as mb
+    from core.peer_link.telemetry import CentralConnection
+
+    conn = CentralConnection.__new__(CentralConnection)  # skip heavy __init__
+    conn._node_id = 'node-test'
+    conn._telemetry = types.SimpleNamespace(get_summary=lambda: {})
+
+    captured = {}
+
+    class _Bus:
+        def publish(self, topic, payload, *a, **k):
+            captured['payload'] = payload
+
+    with patch.object(vram, 'detect_gpu', return_value={
+            'name': 'RTX 3070', 'total_gb': 8.0,
+            'free_gb': 3.5, 'cuda_available': True}), \
+            patch.object(mb, 'get_message_bus', return_value=_Bus()):
+        conn._publish_telemetry()
+
+    comp = captured['payload']['compute']
+    assert comp['gpu_available'] is True
+    assert comp['gpu_name'] == 'RTX 3070'
+    assert comp['vram_free_mb'] == 3584          # 3.5 GB * 1024
