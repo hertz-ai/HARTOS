@@ -39,6 +39,14 @@ CONSENT_TYPES = frozenset({
                          # First-time fallback emits a notification +
                          # request_consent record; user grants once,
                          # subsequent requests proceed without prompting.
+    'cloud_capability',  # Agent uses a cloud-backed capability (T2 browser
+                         # research read/post, encounter icebreaker, room
+                         # presence).  The de-facto type written by
+                         # consent_api.grant_consent and read by tools.py /
+                         # encounter_api / icebreaker_service /
+                         # room_presence_service — MUST be registered here or
+                         # check_consent's _validate_consent_type rejects it and
+                         # the whole T2 read/post subsystem is denied (#review).
 })
 
 
