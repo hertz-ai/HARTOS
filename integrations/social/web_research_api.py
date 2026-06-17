@@ -98,12 +98,14 @@ def revoke_vault(platform: str):
     try:
         from integrations.browser_research.vault import get_vault
         v = get_vault()
-        # Snapshot keys then revoke each (stub vault has no list method by handle).
-        with v._lock:
-            keys = [(p, h) for (p, h) in v._accounts if p == platform]
-        for plat, handle in keys:
-            v.revoke(plat, handle)
-        return jsonify({'ok': True, 'platform': platform, 'revoked': len(keys)})
+        # Use the vault's PUBLIC API. The prior code reached into v._accounts /
+        # v._lock, which the canonical AccountVault has no — it stores under
+        # _cache and exposes list_handles()/revoke(). Every call raised
+        # AttributeError -> HTTP 500.
+        handles = v.list_handles(platform)
+        for handle in handles:
+            v.revoke(platform, handle)
+        return jsonify({'ok': True, 'platform': platform, 'revoked': len(handles)})
     except Exception as exc:
         logger.exception('vault revoke failed')
         return jsonify({'ok': False, 'error': str(exc)}), 500
