@@ -53,10 +53,12 @@ jobs:
       - name: Build + run the floor-lock + session-supervisor nixosTests
         working-directory: nixos
         run: |
-          set -eo pipefail
-          for t in hart-floor-lock hart-session-supervisor-tier-drop; do
-            echo "::group::nix build .#checks.x86_64-linux.${t}"
-            nix build ".#checks.x86_64-linux.${t}" --print-build-logs --max-jobs 2 --cores 2
-            echo "::endgroup::"
-          done
-          echo "VM gate PASSED: floor-lock (never-blank cage floor) + session-supervisor (tier-drop)."
+          set -o pipefail
+          # --keep-going builds BOTH checks even if one fails, so each test's
+          # result is visible per run — a failure in one must NOT mask or block
+          # the other (floor-lock's full-desktop assertions vs the supervisor's
+          # self-contained tier-drop). nix exits non-zero if EITHER failed.
+          nix build --keep-going --print-build-logs --max-jobs 2 --cores 2 \
+            ".#checks.x86_64-linux.hart-floor-lock" \
+            ".#checks.x86_64-linux.hart-session-supervisor-tier-drop" \
+            && echo "VM gate PASSED: floor-lock (never-blank cage floor) + session-supervisor (tier-drop)."
