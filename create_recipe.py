@@ -284,23 +284,21 @@ from core.platform_paths import get_coding_workspace_dir
 # Then manually add the 4 hooks to your get_response_group while loop
 # Set up a dedicated logger that doesn't depend on Flask context
 # Use writable log dir: ~/Documents/Nunba/logs in bundled mode, else relative 'logs'
-if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-    try:
-        from core.platform_paths import get_log_dir as _get_log_dir
-        log_dir = _get_log_dir()
-    except ImportError:
-        log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
-else:
-    log_dir = "logs"
+# Use the canonical WRITABLE data dir; NEVER a CWD-relative 'logs' — on the
+# embedded OS the CWD is the read-only /nix/store package, so makedirs('logs')
+# crashes boot with OSError [Errno 30] Read-only file system (EROFS, which the
+# old `except PermissionError` (EACCES) did NOT catch). Catch all OSError.
 try:
+    from core.platform_paths import get_data_dir
+    log_dir = os.path.join(get_data_dir(), 'logs')
     os.makedirs(log_dir, exist_ok=True)
-except PermissionError:
+except Exception:
     try:
-        from core.platform_paths import get_log_dir as _get_log_dir
-        log_dir = _get_log_dir()
-    except ImportError:
         log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
-    os.makedirs(log_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
+    except Exception:
+        import tempfile
+        log_dir = tempfile.gettempdir()  # last resort: a log path must never brick boot
 
 # Single log file with rotation (no more timestamped files that accumulate forever)
 log_file = os.path.join(log_dir, "agent_system.log")

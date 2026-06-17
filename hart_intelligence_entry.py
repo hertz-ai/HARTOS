@@ -768,7 +768,16 @@ if _is_bundled:
         os.makedirs(_nunba_log_dir, exist_ok=True)
     _langchain_log_path = os.path.join(_nunba_log_dir, 'langchain.log')
 else:
-    _langchain_log_path = 'langchain.log'
+    # Non-bundled: write to the canonical WRITABLE data dir, NEVER the CWD — on the
+    # embedded OS the CWD is the read-only /nix/store package dir, so a relative
+    # 'langchain.log' crashes boot with OSError [Errno 30] Read-only file system.
+    try:
+        from core.platform_paths import get_data_dir
+        _ld = os.path.join(get_data_dir(), 'logs')
+        os.makedirs(_ld, exist_ok=True)
+        _langchain_log_path = os.path.join(_ld, 'langchain.log')
+    except Exception:
+        _langchain_log_path = os.devnull  # last resort: a log path must never brick boot
 
 handler = RotatingFileHandler(_langchain_log_path, maxBytes=5_000_000, backupCount=2, encoding='utf-8')
 handler.setLevel(logging.INFO)
