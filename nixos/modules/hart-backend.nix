@@ -52,8 +52,8 @@ in
         # No WatchdogSec: waitress never sends sd_notify(WATCHDOG=1), so a watchdog
         # timer would SIGABRT the backend every 120s once it is actually serving.
         # Restart=on-failure still covers real crashes.
-        # 180s: langchain + chromadb + autogen imports are slow on USB storage
-        TimeoutStartSec = 180;
+        # 600s: langchain + chromadb + autogen imports are slow on USB storage
+        TimeoutStartSec = 600;
         TimeoutStopSec = 15;
 
         # Security hardening
