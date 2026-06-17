@@ -108,7 +108,7 @@ in
       # Locate the installed selector wrapper (greetd's session command).
       # It is referenced from greetd's config; pull it from the store.
       selector = sup.succeed(
-          "find /nix/store -maxdepth 3 -name 'hart-session-selector' -type f -print -quit"
+          "find /nix/store -maxdepth 3 -name '*-hart-session-selector' -type f -print -quit"
       ).strip()
       assert selector, "hart-session-selector wrapper not found in the store"
 
