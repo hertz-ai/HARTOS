@@ -460,10 +460,18 @@ class PostService:
         # polling.  Previously only external_bot_bridge fired this —
         # human-authored posts via /api/social/posts POST never made
         # it to live subscribers (#49-sibling for posts).
+        post_dict = post.to_dict(include_author=True)
         _publish_realtime(
-            'on_new_post',
-            post.to_dict(include_author=True),
-            community_name=community_name)
+            'on_new_post', post_dict, community_name=community_name)
+
+        # Vertical CDN backup (#147/C2): rise PUBLIC posts to central via the
+        # tier sync — reuses federation's is_public gate + the same 'new_post'
+        # message; best-effort so a sync hiccup never fails the post create.
+        try:
+            from .federation import federation
+            federation.sync_to_parent(db, post_dict)
+        except Exception:
+            pass
 
         return post
 

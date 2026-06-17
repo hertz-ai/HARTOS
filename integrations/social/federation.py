@@ -114,14 +114,7 @@ class FederationManager:
         if not followers:
             return
 
-        payload = {
-            'type': 'new_post',
-            'origin_node_id': gossip.node_id,
-            'origin_url': gossip.base_url,
-            'origin_name': gossip.node_name,
-            'post': post_dict,
-            'timestamp': datetime.utcnow().isoformat(),
-        }
+        payload = self._outbox_message(post_dict)
 
         for follower in followers:
             threading.Thread(
@@ -159,6 +152,40 @@ class FederationManager:
                 logger.debug(f"Federation: delivery failed to {peer_url}: {resp.status_code}")
         except requests.RequestException as e:
             logger.debug(f"Federation: delivery error to {peer_url}: {e}")
+
+    def _outbox_message(self, post_dict: dict) -> dict:
+        """Canonical 'new_post' federation message for a local post — consumed
+        by BOTH the horizontal follower inbox (push_to_followers) and the
+        vertical parent sync (sync_to_parent).  One shape, one builder."""
+        from .peer_discovery import gossip
+        return {
+            'type': 'new_post',
+            'origin_node_id': gossip.node_id,
+            'origin_url': gossip.base_url,
+            'origin_name': gossip.node_name,
+            'post': post_dict,
+            'timestamp': datetime.utcnow().isoformat(),
+        }
+
+    def sync_to_parent(self, db, post_dict: dict) -> Optional[str]:
+        """Queue a PUBLIC local post UP the tier hierarchy to central — the
+        durable CDN "origin" backup (#147/C2).  Vertical counterpart to
+        push_to_followers (horizontal): the SAME privacy gate (is_public) and
+        the SAME 'new_post' message (_outbox_message); it lands at central via
+        SyncEngine → receive_sync_batch('sync_post') → receive_inbox (#146/C1).
+        Only public/consented content rises; friends/community/private stays
+        local.  Best-effort — a sync hiccup never blocks the post.  Returns the
+        queue id or None."""
+        from .privacy import is_public
+        if not is_public((post_dict or {}).get('privacy')):
+            return None
+        try:
+            from .sync_engine import SyncEngine
+            return SyncEngine.queue(
+                db, 'central', 'sync_post', self._outbox_message(post_dict))
+        except Exception as e:
+            logger.debug("Federation.sync_to_parent: queue failed: %s", e)
+            return None
 
     # ─── Inbox: Receive posts from followed instances ───
 
@@ -264,6 +291,29 @@ class FederationManager:
         except requests.RequestException as e:
             logger.debug(f"Federation pull failed from {peer_url}: {e}")
             return 0
+
+    def pull_with_central_fallback(self, db, peer_url: str, limit: int = 20) -> int:
+        """CDN retrieval (#149/C4): pull content from the source peer; if it
+        yields nothing (peer offline OR empty), fall back to the durable copy at
+        the parent tier (central, else regional) — the "origin" that survives
+        when the source peer disappears.
+
+        Reuses pull_from_peer for BOTH legs (no parallel fetch) and the SAME
+        parent-URL resolver the sync drain uses (SyncEngine.parent_tier_url —
+        one source).  receive_inbox dedups, so a redundant central pull is
+        harmless.  Skips the fallback when there is no parent tier or the peer
+        WAS the parent (no self-pull / no recursion)."""
+        count = self.pull_from_peer(db, peer_url, limit=limit)
+        if count > 0:
+            return count
+        from .sync_engine import SyncEngine
+        central = SyncEngine.parent_tier_url()
+        if central and central.rstrip('/') != (peer_url or '').rstrip('/'):
+            logger.debug(
+                "Federation: peer %s yielded nothing — pulling durable copy "
+                "from parent origin %s (#149)", peer_url, central)
+            return self.pull_from_peer(db, central, limit=limit)
+        return count
 
     # ─── Helpers ───
 

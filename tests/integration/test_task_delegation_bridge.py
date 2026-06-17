@@ -19,6 +19,53 @@ from agent_ledger import SmartLedger, TaskType, TaskStatus
 from integrations.internal_comm.task_delegation_bridge import TaskDelegationBridge
 
 
+def _setup_blocked_delegation():
+    """Build a parent task that is BLOCKED on a single in-flight delegation.
+
+    Shared by ``test_delegation_with_task_blocking`` and
+    ``test_auto_resume_after_delegation`` so each is a self-contained pytest
+    test (no cross-test argument passing) while ``run_all_tests`` can still
+    drive the manual sequence.
+
+    Returns:
+        (delegation_id, parent_task_id, child_task_id, bridge)
+    """
+    # Setup agents
+    register_agent_with_skills('agent_a', [
+        {'name': 'general_tasks', 'description': 'General task handling', 'proficiency': 0.8}
+    ])
+    register_agent_with_skills('agent_b', [
+        {'name': 'data_analysis', 'description': 'Data analysis specialist', 'proficiency': 0.95}
+    ])
+
+    # Create ledger and bridge
+    ledger = SmartLedger(agent_id="test_user", session_id="test_delegation")
+    bridge = TaskDelegationBridge(a2a_context, ledger)
+
+    # Create parent task
+    from agent_ledger import Task
+    parent_task_id = f"task_{uuid.uuid4().hex[:12]}"
+    parent_task = Task(
+        task_id=parent_task_id,
+        description="Process customer data",
+        task_type=TaskType.PRE_ASSIGNED
+    )
+    ledger.add_task(parent_task)
+
+    # Start parent task, then delegate a subtask (parent -> BLOCKED)
+    ledger.update_task_status(parent_task_id, TaskStatus.IN_PROGRESS)
+    delegation_id = bridge.delegate_task_with_tracking(
+        parent_task_id=parent_task_id,
+        from_agent='agent_a',
+        task_description="Analyze customer purchase patterns",
+        required_skills=['data_analysis'],
+        context={'data_source': 'customers.csv'}
+    )
+    status = bridge.get_delegation_status(delegation_id)
+    child_task_id = status['child_task']['task_id']
+    return delegation_id, parent_task_id, child_task_id, bridge
+
+
 def test_delegation_with_task_blocking():
     """Test that parent task is blocked during delegation"""
     print("\n" + "=" * 80)
@@ -83,12 +130,16 @@ def test_delegation_with_task_blocking():
     return delegation_id, parent_task.task_id, child_task_id, bridge
 
 
-def test_auto_resume_after_delegation(delegation_id, parent_task_id, child_task_id, bridge):
+def test_auto_resume_after_delegation():
     """Test that parent task auto-resumes when delegation completes"""
     print("\n" + "=" * 80)
     print("TEST 2: Auto-Resume After Delegation")
     print("=" * 80)
 
+    # Build our own blocked delegation so this test is self-contained under
+    # pytest (the parameters were previously the return values of TEST 1,
+    # which pytest mis-reads as missing fixtures).
+    delegation_id, parent_task_id, child_task_id, bridge = _setup_blocked_delegation()
     ledger = bridge.ledger
 
     # Verify parent is still blocked
@@ -307,10 +358,10 @@ def run_all_tests():
 
     try:
         # Test 1: Basic delegation with blocking
-        delegation_id, parent_task_id, child_task_id, bridge = test_delegation_with_task_blocking()
+        test_delegation_with_task_blocking()
 
-        # Test 2: Auto-resume
-        test_auto_resume_after_delegation(delegation_id, parent_task_id, child_task_id, bridge)
+        # Test 2: Auto-resume (self-contained — builds its own delegation)
+        test_auto_resume_after_delegation()
 
         # Test 3: Nested delegations
         test_nested_delegations()

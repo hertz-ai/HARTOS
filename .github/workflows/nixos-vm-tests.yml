@@ -1,0 +1,64 @@
+name: NixOS VM Tests (execute)
+
+# Phase-0 floor-lock + Phase-1 session-supervisor nixosTests actually RUN here
+# (vs the eval-only `nix flake check --no-build` in nix-check.yml / nix-build-
+# matrix.yml). Each boots a real software-GL VM and runs its testScript
+# assertions — the "CI/VM gate harness" the floor-lock + supervisor tests were
+# written for (compositor/ROADMAP.md Phase 0/1).
+#
+# MANUAL-FIRST (workflow_dispatch): the cold HART desktop closure build + the
+# 5-15-min VM run is long, and this is the FIRST CI EXECUTION of these tests
+# (until now every nix workflow used --no-build, so the testScripts had never
+# run). The first run may surface tuning needs (boot timeouts, llvmpipe perf)
+# visible only in the run log. Once it is green, add a `push: paths:` trigger on
+# nixos/tests/** + nixos/modules/hart-session-supervisor.nix so it gates changes.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: nixos-vm-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vm-tests:
+    name: Floor-lock + session-supervisor (build + run VM)
+    runs-on: ubuntu-latest
+    # Cold build of the HART desktop closure (not in cache.nixos.org) + the VM
+    # run; mirrors e2e-os-test.yml's 100-min ISO budget with headroom.
+    timeout-minutes: 120
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Same installer + binary cache as the proven e2e-os-test.yml runner.
+      # magic-nix-cache deliberately omitted (CDN throttling note in e2e).
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            substituters = https://cache.nixos.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+            narinfo-cache-negative-ttl = 0
+            max-jobs = 2
+            cores = 2
+
+      - name: KVM availability (the nixosTest driver uses /dev/kvm when present)
+        run: ls -l /dev/kvm || echo "no /dev/kvm present — the test driver falls back to TCG (much slower, but still runs)"
+
+      # Build each check EXPLICITLY — NOT `nix flake check`, which evaluates the
+      # whole flake and is broken-for-months on the upstream sd-phone mobile-nixos
+      # module-option drift (see e2e-os-test.yml). Targeting
+      # checks.x86_64-linux.<name> builds + runs ONLY these two VM testScripts.
+      - name: Build + run the floor-lock + session-supervisor nixosTests
+        working-directory: nixos
+        run: |
+          set -o pipefail
+          # --keep-going builds BOTH checks even if one fails, so each test's
+          # result is visible per run — a failure in one must NOT mask or block
+          # the other (floor-lock's full-desktop assertions vs the supervisor's
+          # self-contained tier-drop). nix exits non-zero if EITHER failed.
+          nix build --keep-going --print-build-logs --max-jobs 2 --cores 2 \
+            ".#checks.x86_64-linux.hart-floor-lock" \
+            ".#checks.x86_64-linux.hart-session-supervisor-tier-drop" \
+            && echo "VM gate PASSED: floor-lock (never-blank cage floor) + session-supervisor (tier-drop)."

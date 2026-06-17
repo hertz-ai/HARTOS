@@ -190,8 +190,25 @@ def is_genuine_user_request(request_id) -> bool:
     re-stamped _last_user_chat_at, so should_yield_to_user() read
     'user active' forever (~24h of continuous yield, 1142 starvation
     overrides) and the flywheel daemon never ran its normal path.
+
+    EMPTY / None request_id is NOT a user — it is background (returns False).
+    Live evidence (llm_outbound.jsonl, 2026-06-17): ~88% of empty-rid 4B calls
+    are daemon autogen turns whose 'daemon_<goal>' tag was lost crossing
+    autogen's worker-thread boundary (threading.local() does not cross it; only
+    the _request_id_var contextvar does, and it binds '' when recipe() /
+    chat_agent() are invoked without the id).  Treating empty as a user let
+    those 1,926 calls masquerade as a live turn, so the foreground preempt
+    (_is_background_call -> not is_genuine_user_request) never saw them as
+    background, never aborted them, and a real "hi" queued behind them on the
+    single 4B.  Genuine user calls always carry an id (the Nunba adapter
+    defaults request_id to a timestamp when the client omits one, so an INBOUND
+    request is never empty), so empty == untagged == background here.  This is
+    the SOLE authority for "is this a user?" — the inbound mark_view gate
+    (_chat_request_is_genuine) and the outbound abort gate (_is_background_call)
+    both delegate here with NO bespoke, caller-specific rule, so they can never
+    give different answers for the same id.
     """
-    return not (bool(request_id) and str(request_id).startswith('daemon_'))
+    return bool(request_id) and not str(request_id).startswith('daemon_')
 
 
 def is_current_request_autonomous() -> bool:

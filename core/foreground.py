@@ -75,13 +75,27 @@ def _fire_cancellables() -> None:
 
 def enter_foreground() -> None:
     """Mark that a user-facing request started being served.  On the 0->1 edge,
-    terminate any in-flight background LLM calls so the user gets the model now."""
+    terminate any in-flight background LLM calls so the user gets the model now,
+    and flip the ResourceGovernor to ACTIVE so the autonomous daemon swarm backs
+    off immediately."""
     global _count
     with _lock:
         _count += 1
         first = _count == 1
     if first:
         _fire_cancellables()
+        # Direct "a user turn just started" signal to the ONE canonical governor
+        # mode-flip (resource_governor.report_user_activity).  A GENUINE user turn
+        # owns this 0->1 edge (mark_view's _genuine_check keeps the daemon's own
+        # /chat dispatch out), so the daemon swarm throttles NOW instead of waiting
+        # for the governor's periodic CPU-attribution poll.  core->core import is
+        # layering-legal; best-effort + fail-open so a missing/raising governor
+        # never breaks the foreground gate.
+        try:
+            from core.resource_governor import get_governor
+            get_governor().report_user_activity()
+        except Exception:
+            pass
 
 
 def exit_foreground() -> None:

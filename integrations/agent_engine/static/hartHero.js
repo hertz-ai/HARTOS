@@ -99,11 +99,41 @@
       if (input && t) { input.value = t; setStatus('Heard: “' + t + '”', 'thinking'); }
     };
 
-    // The hero is the desktop backdrop: gracefully dim it when any window opens
-    // so foreground work owns the screen (macOS-desktop behaviour).
+    // The orb/command bar is the PRIMARY composition surface — never inert
+    // wallpaper. When a panel opens it gracefully DOCKS (shrinks + steps aside
+    // so foreground work has room) but stays fully visible, active, and
+    // reachable: the brain can still push composed UI to it and the user can
+    // still speak/type a command into the spine.
+    //
+    // We do NOT add the legacy `dimmed` class — that set opacity:0 +
+    // pointer-events:none, turning the spine into dead wallpaper (the exact
+    // launcher-is-the-spine symptom this removes). Instead we toggle `docked`
+    // for stylesheet hooks AND apply a self-contained dock transform inline so
+    // the behaviour holds even on a shell whose CSS predates this change:
+    //   - keeps opacity ~1 (visible) and pointer-events auto (clickable)
+    //   - scales down + parks the spine toward the screen edge (room for work)
+    // Restoring to '' on close hands the surface back to the stylesheet.
     var pc = $('panels');
     if (pc && typeof MutationObserver === 'function') {
-      var apply = function () { hero.classList.toggle('dimmed', pc.children.length > 0); };
+      var apply = function () {
+        var open = pc.children.length > 0;
+        // Defensively strip the inert state in case any prior build set it.
+        hero.classList.remove('dimmed');
+        hero.classList.toggle('docked', open);
+        // Self-contained dock — orb stays active + reachable, never wallpaper.
+        var s = hero.style;
+        if (open) {
+          s.opacity = '1';
+          s.pointerEvents = 'auto';
+          s.transform = 'translate(-50%,-50%) scale(.62)';
+          s.top = '82%';
+        } else {
+          s.opacity = '';
+          s.pointerEvents = '';
+          s.transform = '';
+          s.top = '';
+        }
+      };
       new MutationObserver(apply).observe(pc, { childList: true });
       apply();
     }

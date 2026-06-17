@@ -30,12 +30,39 @@ Multi-modal output:
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger('hevolve.liquid_ui')
+
+# Verbs that MUTATE the desktop (window.close, fullscreen takeover, …) — added
+# in Phase 6.  These pass a fail-CLOSED guardrail; benign display cards do not
+# (and must not risk the prompt gate's false-positives).
+DESTRUCTIVE_COMPONENT_TYPES = frozenset()
+
+# Obvious XSS vectors we REJECT server-side.  The client also escapes on render,
+# so we reject (not escape) to avoid double-escaping legitimate content.
+_A2UI_XSS_RE = re.compile(
+    r'<\s*(?:script|iframe|img|svg|object|embed)\b'  # script/iframe + tags that carry onerror/onload
+    r'|<[^>]*\son\w+\s*='                            # inline event-handler attr (onerror=/onload=/onclick=...)
+    r'|javascript:'
+    r'|data:text/html',
+    re.I)
+
+
+def _a2ui_has_xss(value) -> bool:
+    """True if any nested string in the component carries an XSS vector."""
+    if isinstance(value, str):
+        return bool(_A2UI_XSS_RE.search(value))
+    if isinstance(value, dict):
+        return any(_a2ui_has_xss(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_a2ui_has_xss(v) for v in value)
+    return False
+
 
 # ═══════════════════════════════════════════════════════════════
 # UI Component Schema (A2UI protocol)
@@ -261,6 +288,7 @@ class LiquidUIService:
 
         self.context_engine = ContextEngine(backend_port, model_bus_port)
         self._agent_components: Dict[str, List[dict]] = {}
+        self._a2ui_buckets: Dict[str, tuple] = {}   # agent_id -> (tokens, ts)
         self._lock = threading.Lock()
         self._running = False
         self._model_available = False
@@ -394,10 +422,16 @@ class LiquidUIService:
     def agent_ui_update(self, agent_id: str, component: dict) -> bool:
         """Push a UI component from an agent to all connected frontends.
 
-        Delivery paths (all best-effort, agent_ui_update never fails):
+        Delivery paths (best-effort once accepted):
           1. In-memory store → polled by SSE stream → Nunba LiquidUI (web)
           2. EventBus → WAMP bridge → Android/iOS React Native via Crossbar
           3. EventBus → any other subscriber (desktop, CLI dashboard)
+
+        Constitutional controls (an agent painting the screen is governed
+        like an agent dispatch): the push is REFUSED while the human has
+        halted the HiveCircuitBreaker, and every accepted push is recorded
+        in the immutable audit log.  Returns False if disabled, the type is
+        unknown, or the hive is halted.
         """
         if not self.a2ui_enabled:
             return False
@@ -406,9 +440,55 @@ class LiquidUIService:
             logger.warning("Invalid A2UI component type: %s", comp_type)
             return False
 
+        # Kill-switch: when the human halts the hive, agent UI pushes stop
+        # too — the constitution governs an agent painting the screen exactly
+        # like an agent dispatching a goal (dispatch.py:668).  Fail-OPEN if
+        # the guardrail module can't be consulted: a benign consent card must
+        # never be lost to a guardrail import error.
+        try:
+            from security.hive_guardrails import HiveCircuitBreaker
+            if HiveCircuitBreaker.is_halted():
+                logger.warning(
+                    "A2UI push refused (hive halted): %s from %s",
+                    comp_type, agent_id)
+                return False
+        except Exception:
+            pass
+
+        # Per-agent rate cap (token bucket) — a runaway agent can't flood the
+        # desktop with UI pushes.
+        if not self._a2ui_rate_ok(agent_id):
+            logger.warning("A2UI push rate-capped: %s from %s",
+                           comp_type, agent_id)
+            return False
+
+        # Destructive verbs (window.close / fullscreen takeover, Phase 6) pass
+        # the FULL fail-CLOSED guardrail; benign display cards do not.
+        if (comp_type in DESTRUCTIVE_COMPONENT_TYPES
+                and not self._a2ui_guardrail_ok(component)):
+            return False
+
+        # Server-side defense-in-depth: reject obvious XSS vectors.
+        if _a2ui_has_xss(component):
+            logger.warning("A2UI push rejected (unsafe content): %s from %s",
+                           comp_type, agent_id)
+            return False
+
         import time as _time
         component['_ts'] = _time.time()
         component['_agent_id'] = agent_id
+
+        # Provable audit trail — every accepted push is recorded exactly like
+        # a goal dispatch (dispatch.py:680).  Best-effort: an audit hiccup
+        # must not drop a user's card.  Type + agent only (no user payload).
+        try:
+            from security.immutable_audit_log import get_audit_log
+            get_audit_log().log_event(
+                'a2ui_push', actor_id=str(agent_id),
+                action=f'push {comp_type} component',
+                detail={'type': comp_type}, target_id=str(agent_id))
+        except Exception:
+            pass
 
         # 1. Store for SSE polling (Nunba web LiquidUI)
         with self._lock:
@@ -435,6 +515,70 @@ class LiquidUIService:
 
         logger.info("A2UI: agent %s pushed %s component", agent_id, comp_type)
         return True
+
+    def _a2ui_rate_ok(self, agent_id: str) -> bool:
+        """Per-agent token bucket (20 burst, +2/s) — a runaway agent cannot
+        flood the desktop with UI pushes."""
+        now = time.monotonic()
+        cap, refill = 20.0, 2.0
+        with self._lock:
+            tokens, last = self._a2ui_buckets.get(agent_id, (cap, now))
+            tokens = min(cap, tokens + (now - last) * refill)
+            if tokens < 1.0:
+                self._a2ui_buckets[agent_id] = (tokens, now)
+                return False
+            self._a2ui_buckets[agent_id] = (tokens - 1.0, now)
+            return True
+
+    def _a2ui_guardrail_ok(self, component: dict) -> bool:
+        """Fail-CLOSED guardrail for DESTRUCTIVE verbs — block if guardrails
+        are unavailable (benign cards fail-open; a window mutation must not)."""
+        try:
+            from security.hive_guardrails import GuardrailEnforcer
+            allowed, reason, _ = GuardrailEnforcer.before_dispatch(
+                str(component.get('action') or component.get('type') or ''))
+            if not allowed:
+                logger.warning("A2UI destructive verb blocked: %s", reason)
+            return allowed
+        except Exception as e:
+            logger.error("A2UI guardrail unavailable — blocking destructive "
+                         "verb: %s", e)
+            return False
+
+    def _compose_intent_result(self, intent_text: str, chat_result: dict) -> bool:
+        """M1 — turn a brain /chat decomposition into COMPOSED desktop UI.
+
+        Single responsibility: take what the brain's intent classifier
+        (CREATE / REUSE / tool / vision / casual) decided and PAINT it on the
+        desktop as an A2UI card pushed through the now-wired ``agent_ui_update``
+        channel — instead of only narrating a chat bubble.  The orb/command bar
+        thereby becomes an intent COMPOSER, not a launcher.
+
+        No parallel decompose path: ``chat_result`` is the verbatim payload from
+        ``/chat`` (response text + intent + Agent_status + prompt_id).  Returns
+        True iff a composed component was accepted by ``agent_ui_update`` (False
+        when the hive is halted, rate-capped, a2ui disabled, or the reply was
+        empty — the bubble still renders in every case).
+        """
+        reply = (chat_result.get('response')
+                 or chat_result.get('error') or '').strip()
+        if not reply:
+            return False
+        status = chat_result.get('Agent_status') or ''
+        prompt_id = chat_result.get('prompt_id')
+        # The brain's own routing decides the icon: a created/reused agent gets
+        # the agent glyph, a plain answer gets the spark.
+        icon = 'smart_toy' if (status or prompt_id) else 'auto_awesome'
+        title = status or 'HART'
+        component = {
+            'type': 'card',
+            'title': title,
+            'icon': icon,
+            'content': reply,
+            'intent': intent_text,
+            'timestamp': time.time(),
+        }
+        return self.agent_ui_update('desktop_intent', component)
 
     def agent_request_approval(
         self, agent_id: str, action: str, description: str
@@ -1329,6 +1473,37 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   background:var(--hart-glass-bg);color:var(--hart-text);font-size:14px;
   font-family:var(--ds-font-body);outline:none;width:280px;text-align:center}}
 .lock-status{{font-size:12px;color:var(--hart-muted)}}
+.lock-brand{{display:flex;align-items:center;gap:10px;margin-bottom:8px;opacity:.92}}
+.lock-brand img{{width:30px;height:30px;filter:drop-shadow(0 2px 10px rgba(0,212,170,.4))}}
+.lock-brand span{{font-size:13px;letter-spacing:2.5px;font-weight:600;opacity:.8}}
+.lock-screen.setup .lock-clock,.lock-screen.setup .lock-date{{display:none}}
+/* ── Desktop widgets (live clock + system) ── */
+.hart-widgets{{position:fixed;top:calc(var(--hart-topbar-height,40px) + 18px);right:16px;z-index:30;
+  display:flex;flex-direction:column;gap:12px;width:222px}}
+.hart-widget{{background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);border-radius:16px;
+  padding:14px 16px;{'backdrop-filter:blur(var(--hart-blur)) saturate(var(--hart-saturation));' if not is_potato else ''}
+  box-shadow:0 8px 30px rgba(0,0,0,.28)}}
+.hw-clock{{text-align:center}}
+.hw-clock-time{{font-size:30px;font-weight:300;letter-spacing:.5px;color:var(--hart-text);font-variant-numeric:tabular-nums}}
+.hw-clock-date{{font-size:12px;color:var(--hart-muted);margin-top:2px}}
+.hw-title{{font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:var(--hart-muted);margin-bottom:6px}}
+.hw-row{{display:flex;justify-content:space-between;font-size:12px;color:var(--hart-text);margin-top:7px}}
+.hw-val{{color:var(--hart-accent);font-variant-numeric:tabular-nums}}
+.hw-bar{{height:5px;border-radius:3px;background:var(--hart-surface);overflow:hidden;margin-top:3px}}
+.hw-bar>i{{display:block;height:100%;background:var(--hart-accent);border-radius:3px;transition:width .5s}}
+/* ── Microanimations: buttery hover lifts + soft open transitions (scoped to
+   NON-draggable elements so icon/window drag stays instant) ── */
+.start-item,.ctx-menu-item,.hart-hero-chip,.taskbar-chip,.tray-btn,.start-btn,.power-btn,.start-app{{
+  transition:transform .16s cubic-bezier(.22,1,.36,1),box-shadow .16s ease,background .16s ease,filter .16s ease}}
+.start-item:hover,.taskbar-chip:hover,.start-app:hover{{transform:translateY(-2px)}}
+.tray-btn:hover,.start-btn:hover,.power-btn:hover{{transform:scale(1.08)}}
+.ctx-menu-item:hover{{transform:translateX(2px)}}
+.hart-widget{{transition:transform .2s cubic-bezier(.22,1,.36,1),box-shadow .2s ease}}
+.hart-widget:hover{{transform:translateY(-2px);box-shadow:0 14px 40px rgba(0,0,0,.34)}}
+@keyframes hart-fade-in{{from{{opacity:0}}to{{opacity:1}}}}
+.panel{{animation:hart-fade-in .18s ease}}
+@media(prefers-reduced-motion:reduce){{.panel{{animation:none}}
+  .start-item,.ctx-menu-item,.hart-hero-chip,.taskbar-chip,.tray-btn,.start-btn,.power-btn,.start-app,.hart-widget{{transition:none}}}}
 
 /* ── Scrollbar ── */
 ::-webkit-scrollbar{{width:6px}}
@@ -1372,18 +1547,23 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 </style>
 </head>
 <body>
+<!-- Hevolve brand boot splash (Lottie). Inline styles: this HTML is inside an
+     f-string, so a CSS block would need brace-escaping; the overlay is a single
+     element + hartBootSplash.js drives the fade, so inline is cleaner here. -->
+<div id="hart-boot" aria-hidden="true" style="position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:#0F0E17;transition:opacity .6s ease"><div id="hart-boot-lottie" style="width:min(46vw,360px);height:min(64vw,497px)"></div></div>
 <div class="wallpaper"></div>
 {'<div class="hart-ambient" aria-hidden="true"><div class="hart-blob hart-blob-1"></div><div class="hart-blob hart-blob-2"></div><div class="hart-blob hart-blob-3"></div><div class="hart-blob hart-blob-4"></div><div class="hart-blob hart-blob-5"></div></div><div class="hart-grain" aria-hidden="true"></div>' if not is_potato else ''}
 <div class="hart-vignette" aria-hidden="true"></div>
 <!-- Desktop icon layer (drag-drop apps); populated by hartDesktop.js -->
 <div class="hart-desktop" id="hart-desktop" aria-label="Desktop icons"></div>
+<div class="hart-widgets" id="hart-widgets" aria-label="Desktop widgets"></div>
 <a href="#panels" class="skip-link">Skip to content</a>
 
 <!-- HART OS hero — voice-first command center (the desktop centerpiece). The
      orb canvas below is the SAME #hart-voice-orb driven by initHartOrb; the bar
      fuses search + agent dispatch + the voice transcript sink. -->
 <div class="hart-hero" id="hart-hero" role="search" aria-label="HART command center">
-  <div class="hart-hero-brand"><img src="/shell/static/hart-logo.svg" alt="HART OS" draggable="false"><span>HART OS</span></div>
+  <div class="hart-hero-brand"><img src="/shell/static/hevolve-logo.png" alt="HART OS" draggable="false"><span>HART OS</span></div>
   <div class="hart-hero-orbwrap">
     <canvas id="hart-voice-orb" width="360" height="360" aria-hidden="true"></canvas>
     <button class="hart-hero-mic" id="hart-hero-mic" type="button" aria-label="Speak to HART (Super+Space)" title="Click or press Super+Space to speak"><span class="mi material-icons-round" aria-hidden="true">mic</span></button>
@@ -1401,7 +1581,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <!-- Top Bar -->
 <div class="top-bar glass" role="banner">
   <div class="start-btn" role="button" tabindex="0" aria-haspopup="menu" aria-label="Start menu" onclick="toggleStartMenu()" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Start Menu (Super)">
-    <img src="/shell/static/hart-logo.svg" class="start-logo" alt="" aria-hidden="true" draggable="false">
+    <img src="/shell/static/hevolve-logo.png" class="start-logo" alt="" aria-hidden="true" draggable="false">
     <span>HART</span>
   </div>
   <div class="top-bar-center" id="agent-status" role="status" aria-live="polite" aria-label="Agent status"></div>
@@ -1428,6 +1608,8 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      #hart-hero (centerpiece); initHartOrb still finds #hart-voice-orb and drives
      it. hartHero.js fuses the orb with the command bar, reusing toggleVoice /
      acSend / openPanel — one pipeline, no fork. Loaded after the inline script. -->
+<script src="/shell/static/lottie.min.js"></script>
+<script src="/shell/static/hartBootSplash.js"></script>
 <script src="/shell/static/hartSession.js"></script>
 <script src="/shell/static/voiceOrbViz.js"></script>
 <script src="/shell/static/hartHero.js"></script>
@@ -1438,6 +1620,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script src="/shell/static/hartDock.js"></script>
 <script src="/shell/static/hartSenses.js"></script>
 <script src="/shell/static/hartOnboarding.js"></script>
+<script src="/shell/static/hartSessionUI.js"></script>
 
 <!-- Agent Pill (click to expand floating chat) -->
 <div class="agent-pill glass" id="agent-pill" onclick="toggleAssistantChat()">
@@ -1479,6 +1662,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 
 <!-- Lock Screen -->
 <div class="lock-screen" id="lock-screen" role="dialog" aria-modal="true" aria-label="Screen locked">
+  <div class="lock-brand"><img src="/shell/static/hevolve-logo.png" alt="HART OS" draggable="false"><span>HART OS</span></div>
   <div class="lock-clock" id="lock-clock"></div>
   <div class="lock-date" id="lock-date"></div>
   <input class="lock-input" type="password" placeholder="Password" id="lock-pw"
@@ -1544,6 +1728,11 @@ function _pid(el) {{ return el.closest('[data-panel-id]').dataset.panelId; }}
 const BACKEND = 'http://localhost:{self.backend_port}';
 const SHELL = 'http://localhost:{self.port}';
 const MANIFEST = {manifest_json};
+// External /shell/static modules (hartDesktop.js, hartDock.js, …) read
+// window.MANIFEST. A top-level `const` in a classic script is a lexical global,
+// NOT a property of window — so without this the desktop icons never render
+// (hartDesktop.js gates on window.MANIFEST). Expose it explicitly.
+window.MANIFEST = MANIFEST;
 const SYSTEM_PANELS = {system_json};
 const GROUPS = {groups_json};
 const NUNBA_BASE = '/app/#';
@@ -3652,14 +3841,17 @@ function askAgent() {{
   resp.textContent = 'Thinking...';
   resp.classList.add('visible');
 
-  // Check for theme commands first
+  // M1 — intent is the default surface (mirrors acSend).  Theme words and
+  // 'open <named app>' are demoted FALLBACK fast-paths; everything else routes
+  // through the brain decompose (/chat) and is COMPOSED onto the desktop via
+  // agent_ui_update (painted by the SSE overlay stream).
   const lower = text.toLowerCase();
   if(lower.includes('theme')||lower.includes('font')||lower.includes('bigger')||
      lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
     handleThemeCommand(lower, resp);
     return;
   }}
-  // Check for panel open commands
+  // Fallback fast-path: launch a NAMED app directly (no brain round-trip).
   if(lower.startsWith('open ')) {{
     const target = lower.replace('open ','').trim();
     const match = Object.entries(MANIFEST).find(([k,v])=>
@@ -3667,11 +3859,12 @@ function askAgent() {{
     if(match) {{ openPanel(match[0]); resp.textContent='Opened '+match[1].title; return; }}
   }}
 
+  // Default: route the intent through the brain and COMPOSE the desktop.
   fetch(SHELL+'/api/agent/ask',{{method:'POST',headers:{{'Content-Type':'application/json'}},
     body:JSON.stringify({{text}})}})
     .then(r=>r.json()).then(data=>{{
       const txt = data.response || data.error || 'No response';
-      resp.textContent = txt;
+      resp.textContent = data.composed ? ('✦ ' + txt) : txt;
       speakText(txt, 'chat_response');
     }}).catch(()=>{{ resp.textContent='Could not reach agent'; }});
 }}
@@ -3788,8 +3981,21 @@ function acSend() {{
   const typing = acAddMsg('assistant', 'Thinking...');
   typing.classList.add('typing');
 
-  // Check local commands first
+  // M1 — INTENT IS THE DEFAULT OPERATING SURFACE.
+  // The orb/command bar composes the desktop from what the human wants: the
+  // DEFAULT path sends free-form intent to /api/agent/ask, which routes it
+  // through the brain's EXISTING decompose (/chat → CREATE/REUSE) and PUSHES
+  // the result as a composed A2UI card via agent_ui_update (the SSE stream
+  // paints it through renderAgentOverlay).  'open <named app>' and theme words
+  // are demoted to explicit FALLBACK fast-paths, not the spine.
   const lower = text.toLowerCase();
+  if(lower.includes('theme')||lower.includes('font')||lower.includes('bigger')||
+     lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
+    const fakeResp = {{set textContent(v){{typing.textContent=v;typing.classList.remove('typing')}}}};
+    handleThemeCommand(lower, fakeResp);
+    return;
+  }}
+  // Fallback fast-path: launch a NAMED app directly (no brain round-trip).
   if(lower.startsWith('open ')) {{
     const target = lower.replace('open ','').trim();
     const match = Object.entries(MANIFEST).find(([k,v])=>
@@ -3801,19 +4007,15 @@ function acSend() {{
       return;
     }}
   }}
-  if(lower.includes('theme')||lower.includes('font')||lower.includes('bigger')||
-     lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
-    const fakeResp = {{set textContent(v){{typing.textContent=v;typing.classList.remove('typing')}}}};
-    handleThemeCommand(lower, fakeResp);
-    return;
-  }}
 
-  // Send to backend
+  // Default: route the intent through the brain and COMPOSE the desktop.
   fetch(SHELL+'/api/agent/ask',{{method:'POST',headers:{{'Content-Type':'application/json'}},
     body:JSON.stringify({{text:text,capability:acActiveCap}})}})
     .then(function(r){{return r.json()}}).then(function(data){{
       const reply = data.response || data.error || 'No response';
-      typing.textContent = reply;
+      // The composed card is painted on the desktop by the SSE overlay stream;
+      // the bubble is the spoken acknowledgement (casual chat still replies).
+      typing.textContent = data.composed ? ('✦ ' + reply) : reply;
       typing.classList.remove('typing');
       speakText(reply, 'chat_response');
     }}).catch(function(){{
@@ -4481,9 +4683,28 @@ function renderAgentOverlay(ev) {{
 
     def _create_flask_app(self):
         """Create Flask app serving the glass desktop shell + APIs."""
+        # Register this instance the moment the shell is wired to be served —
+        # covers BOTH standalone serve_forever() AND the Nunba desktop bundle
+        # (HART OS *is* the Nunba desktop, co-located in-process), so every
+        # in-process A2UI emitter reaches the LIVE shell via
+        # get_registry().get_or_none('LiquidUIService').  Idempotent.
+        self._register_self()
         from flask import Flask, request, jsonify, Response, send_from_directory
 
-        app = Flask(__name__)
+        # The shell HTML loads its logo + every external script from
+        # ``/shell/static/...`` (see render_desktop_shell: hart-logo.svg,
+        # voiceOrbViz.js, hartHero.js, hartDesktop.js, hartOnboarding.js, ...).
+        # Flask's DEFAULT static route is ``/static`` — so without this prefix
+        # EVERY ``/shell/static/*`` request 404s on a real boot: the orb never
+        # animates (only the static mic shows), the hero input/desktop never
+        # wire (dead clicks, can't type), onboarding never fires, and the logo
+        # renders as a broken-image "?". The ``static/`` dir is bundled into the
+        # ISO (hart-app.nix copies the tree) and sits next to this module, so
+        # Flask's built-in handler serves it directly — no parallel route. This
+        # was invisible to "inline render" testing, which never fetches
+        # ``/shell/static/``; the route test below exercises the real fetch.
+        app = Flask(__name__, static_url_path='/shell/static',
+                    static_folder='static')
 
         # ── Desktop Shell (the root page IS the OS) ──
         @app.route('/')
@@ -4628,6 +4849,12 @@ function renderAgentOverlay(ev) {{
             if not text:
                 return jsonify({'error': 'No text provided'})
             import requests as req
+            # M1 — INTENT → DECOMPOSE → COMPOSE.  Route free-form intent through
+            # the brain's EXISTING intent classifier (/chat → CREATE/REUSE/tool/
+            # vision/casual — no parallel path) and COMPOSE the result onto the
+            # desktop as an A2UI card pushed through agent_ui_update (the now-wired
+            # B1/B2 push channel), instead of only narrating a chat bubble.  The
+            # reply text is still returned so casual chat keeps speaking.
             try:
                 resp = req.post(
                     f'http://localhost:{self.backend_port}/chat',
@@ -4636,9 +4863,11 @@ function renderAgentOverlay(ev) {{
                         'prompt_id': 'desktop_agent',
                         'prompt': text,
                     }, timeout=30)
-                return jsonify(resp.json())
+                payload = resp.json()
             except Exception as e:
                 return jsonify({'error': str(e)})
+            payload['composed'] = self._compose_intent_result(text, payload)
+            return jsonify(payload)
 
         # ── Shell APIs: Events ──
         @app.route('/api/shell/events', methods=['GET'])
@@ -5224,7 +5453,10 @@ function renderAgentOverlay(ev) {{
             procs = []
             try:
                 import psutil
-                for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+                from core.compute_optimizer import iter_processes
+                # GIL-safe walker (yields mid-walk) so a polled task-manager
+                # panel can't starve the event loop — the #151 class.
+                for p in iter_processes(['pid', 'name', 'cpu_percent', 'memory_percent']):
                     try:
                         info = p.info
                         if info.get('cpu_percent', 0) > 0 or info.get('memory_percent', 0) > 0.1:
@@ -5443,6 +5675,23 @@ function renderAgentOverlay(ev) {{
         return app
 
     # ─── Serve ────────────────────────────────────────────────
+
+    def _register_self(self) -> None:
+        """Register this instance so in-process A2UI emitters (channel consent
+        cards, the voice bridge, model-ready toasts) can reach it via
+        get_registry().get_or_none('LiquidUIService') — the in-process half of
+        the A2UI push channel.  A separately-hosted :6800 shell additionally
+        receives pushes through the EventBus/WAMP fan-out inside
+        agent_ui_update.  Idempotent: a second serve is a no-op, not a
+        double-register error.
+        """
+        try:
+            from core.platform.registry import get_registry
+            reg = get_registry()
+            if not reg.has('LiquidUIService'):
+                reg.register('LiquidUIService', lambda: self)
+        except Exception as e:
+            logger.debug("LiquidUIService self-register skipped: %s", e)
 
     def serve_forever(self):
         """Start the glass desktop shell service."""

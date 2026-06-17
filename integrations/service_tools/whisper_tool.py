@@ -18,8 +18,10 @@ Models downloaded lazily on first use to ~/.hevolve/models/stt/
 100% local, zero cloud costs — Nunba is forever free.
 """
 
+import array
 import json
 import logging
+import math
 import os
 import tarfile
 import urllib.request
@@ -303,6 +305,38 @@ def _get_faster_whisper_model(model_size: str = "base"):
     return _faster_whisper_model
 
 
+# ── Anti-hallucination gate: "did a human actually speak, or is this noise?" ──
+# faster-whisper's vad_filter strips silent AUDIO regions before decoding, but a
+# short noise/music burst that VAD mis-reads as speech still decodes to a
+# hallucinated phrase (the classic "さて、さて、もみ" / "Thank you for watching" on
+# near-silence — submitted as a chat message, it makes the model reply in the
+# hallucinated language).  The reliable post-decode signals are the per-segment
+# no_speech_prob (P[this window is non-speech]) and avg_logprob (token
+# confidence).  These are Whisper's OWN thresholds, so the gate matches the
+# model's internal silence definition rather than inventing new numbers.
+NO_SPEECH_PROB_MAX = 0.6   # openai-whisper's default no_speech_threshold
+AVG_LOGPROB_MIN = -1.0     # openai-whisper's default logprob_threshold
+
+
+def _filter_speech_text(segments) -> str:
+    """Join only the segments that are real speech; drop silence/noise.
+
+    ``segments`` is an iterable of ``(text, no_speech_prob, avg_logprob)``.
+    Single source for the anti-hallucination gate shared by the faster-whisper
+    and openai-whisper (legacy) transcribe paths — no parallel filter.  A
+    segment is kept only when BOTH signals look like speech; a missing signal
+    (None) is treated as speech so we never over-drop when a backend doesn't
+    report it.
+    """
+    kept = []
+    for text, no_speech_prob, avg_logprob in segments:
+        nsp = no_speech_prob if no_speech_prob is not None else 0.0
+        alp = avg_logprob if avg_logprob is not None else 0.0
+        if nsp <= NO_SPEECH_PROB_MAX and alp >= AVG_LOGPROB_MIN:
+            kept.append((text or '').strip())
+    return " ".join(t for t in kept if t).strip()
+
+
 def _faster_whisper_transcribe(audio_path: str, language: str = None) -> Optional[str]:
     """Transcribe using faster-whisper. Returns JSON string or None on failure.
 
@@ -343,11 +377,21 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None) -> Optiona
         if language:
             kwargs["language"] = language
         segments, info = model.transcribe(audio_path, **kwargs)
-        text = " ".join(seg.text for seg in segments).strip()
+        # Speech-only join: drop silence/noise hallucinations via the shared
+        # no_speech_prob/avg_logprob gate (vad_filter alone still lets a short
+        # noise burst decode to a hallucinated phrase).
+        text = _filter_speech_text(
+            (seg.text, getattr(seg, 'no_speech_prob', None),
+             getattr(seg, 'avg_logprob', None))
+            for seg in segments
+        )
         _record_whisper_success()
         return json.dumps({
             "text": text,
-            "language": info.language if info.language else "unknown",
+            # Nothing survived the speech gate → the window was noise/silence.
+            # Report 'unknown', not the language Whisper hallucinated from the
+            # noise (fixes wrong-language replies to non-speech audio).
+            "language": (info.language if (text and info.language) else "unknown"),
         })
     except Exception as e:
         reason = f"transcribe({audio_path}) failed: {e}"
@@ -496,9 +540,20 @@ def _legacy_transcribe(audio_path: str, language: str = None) -> Optional[str]:
         if language:
             kwargs["language"] = language
         result = model.transcribe(audio_path, **kwargs)
+        # Same speech-only gate as the faster-whisper path (shared helper).
+        # openai-whisper exposes per-segment no_speech_prob/avg_logprob in
+        # result['segments']; if segments are absent, fall back to raw text.
+        segs = result.get("segments") or []
+        if segs:
+            text = _filter_speech_text(
+                (s.get("text", ""), s.get("no_speech_prob"), s.get("avg_logprob"))
+                for s in segs
+            )
+        else:
+            text = (result.get("text") or "").strip()
         return json.dumps({
-            "text": result["text"].strip(),
-            "language": result.get("language", "unknown"),
+            "text": text,
+            "language": (result.get("language", "unknown") if text else "unknown"),
         })
     except ImportError:
         return None
@@ -897,6 +952,105 @@ STREAM_INTERIM_WINDOW_BYTES = (
     * STREAM_INTERIM_WINDOW_SECONDS
 )
 
+# ── Server-side VAD pause-finalization (#131) ────────────────────────
+# The streaming server finalizes on three signals: an explicit client
+# {control:final}, a 30s max-buffer flush, OR — added here — a detected
+# end-of-utterance silence.  The first relied entirely on the client being
+# smart enough to send {control:final}; a raw-PCM feeder (or a client that
+# never signals end-of-speech) would otherwise only ever finalize on the 30s
+# overflow.  Energy-based silence detection makes finalization robust for ANY
+# client without changing the client-driven path (both still fire).
+STREAM_VAD_RMS_THRESHOLD = 400      # PCM16 RMS below this == silence (speech ~1-5k)
+STREAM_VAD_SILENCE_MS = 800         # trailing silence after speech that ends an utterance
+STREAM_VAD_MIN_SPEECH_MS = 300      # require this much speech first (ignore leading silence)
+# Cap the per-chunk RMS sum to a bounded tail so the GIL-held Python loop on
+# the async STT handler doesn't scale with chunk size (~100ms @ 16kHz).
+STREAM_RMS_MAX_SAMPLES = int(os.environ.get('HEVOLVE_STT_RMS_MAX_SAMPLES', '1600'))
+
+
+def _pcm_rms(pcm: bytes) -> float:
+    """Root-mean-square amplitude of PCM16LE mono ``pcm`` (0.0 == digital silence).
+
+    Pure + stdlib-only (``array``) so ``_StreamVadGate`` stays unit-testable
+    without numpy / faster-whisper loaded.  Single source for "how loud is this
+    chunk" — the handler calls this, not its own inline RMS.
+    """
+    n = len(pcm) - (len(pcm) % 2)
+    if n <= 0:
+        return 0.0
+    samples = array.array('h')
+    samples.frombytes(pcm[:n])
+    if not samples:
+        return 0.0
+    # Bound the GIL-held sum to a recent tail — end-of-utterance VAD only needs
+    # recent energy, and an unbounded per-chunk loop on the async handler would
+    # grow with chunk size.
+    if len(samples) > STREAM_RMS_MAX_SAMPLES:
+        samples = samples[-STREAM_RMS_MAX_SAMPLES:]
+    acc = 0
+    for s in samples:
+        acc += s * s
+    return math.sqrt(acc / len(samples))
+
+
+class _StreamVadGate:
+    """Energy-based end-of-utterance detector for the streaming STT server.
+
+    Pure decision logic (no I/O, no model) so it is unit-testable in isolation:
+    feed each chunk's RMS energy + duration; ``update`` returns True exactly
+    once per utterance — when enough speech has been seen AND a trailing
+    silence gap then exceeds the threshold.  Fires once, then re-arms on the
+    next speech (auto-reset), so continued silence does not re-fire.
+    """
+
+    def __init__(self, rms_threshold: float = STREAM_VAD_RMS_THRESHOLD,
+                 silence_ms: float = STREAM_VAD_SILENCE_MS,
+                 min_speech_ms: float = STREAM_VAD_MIN_SPEECH_MS):
+        self.rms_threshold = rms_threshold
+        self.silence_ms = silence_ms
+        self.min_speech_ms = min_speech_ms
+        self._speech_ms = 0.0
+        self._silence_ms = 0.0
+
+    def update(self, rms: float, chunk_ms: float) -> bool:
+        """Feed one audio chunk. Returns True iff this chunk completes an
+        end-of-utterance pause (speech seen, then silence ≥ threshold)."""
+        if rms >= self.rms_threshold:
+            self._speech_ms += chunk_ms
+            self._silence_ms = 0.0
+            return False
+        # Silence chunk — only counts once we've heard enough speech, so
+        # leading/standalone silence never finalizes an empty buffer.
+        if self._speech_ms < self.min_speech_ms:
+            return False
+        self._silence_ms += chunk_ms
+        if self._silence_ms >= self.silence_ms:
+            self.reset()  # one final per utterance; next speech re-arms
+            return True
+        return False
+
+    def reset(self):
+        self._speech_ms = 0.0
+        self._silence_ms = 0.0
+
+
+async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bool:
+    """Transcribe the FULL accumulated buffer and emit one final result.
+
+    Single source for finalization, shared by the {control:final}, 30s
+    max-buffer flush, and VAD pause-finalize paths so all three behave
+    identically (no parallel finalization logic — #131 Gate-2/4).  Returns
+    whether a non-empty transcription was sent.  Caller resets the buffer +
+    VAD gate (those are caller-local).
+    """
+    text, lang = _transcribe_buffer(audio_buffer, language=stt_lang)
+    if text:
+        await websocket.send(json.dumps({
+            'text': text, 'language': lang, 'is_final': True,
+        }))
+        _maybe_enqueue_call_segment(call_id, user_id, text, lang, True)
+    return bool(text)
+
 
 def _ws_path(websocket) -> str:
     """Best-effort URL-path extractor across websockets lib versions.
@@ -1018,6 +1172,14 @@ async def _stt_stream_handler(websocket):
 
     audio_buffer = io.BytesIO()
     last_transcribe_size = 0
+    # Server-side VAD: auto-finalizes on a detected end-of-utterance silence
+    # so finalization no longer depends solely on the client sending
+    # {control:final} (#131).  Re-arms after each final.
+    vad = _StreamVadGate()
+    # Connection-level forced language, honoured from a {"type":"config",
+    # "language":"<code>"} control message (the docstring's promise — the code
+    # previously ignored it).  None => faster-whisper auto-detects per utterance.
+    stt_lang = None
     # UNIF-G7 Producer C: extract optional call context from the
     # WS request path.  When absent (call_id is None), the
     # _maybe_enqueue_call_segment helper degrades to a no-op so plain
@@ -1033,18 +1195,22 @@ async def _stt_stream_handler(websocket):
                     if ctrl.get('control') == 'reset':
                         audio_buffer = io.BytesIO()
                         last_transcribe_size = 0
+                        vad.reset()
                         continue
                     if ctrl.get('control') == 'final':
                         # Force final transcription of remaining buffer
-                        text, lang = _transcribe_buffer(audio_buffer)
-                        if text:
-                            await websocket.send(json.dumps({
-                                'text': text, 'language': lang, 'is_final': True,
-                            }))
-                            _maybe_enqueue_call_segment(
-                                call_id, user_id, text, lang, True)
+                        await _emit_final(
+                            websocket, audio_buffer, stt_lang, call_id, user_id)
                         audio_buffer = io.BytesIO()
                         last_transcribe_size = 0
+                        vad.reset()
+                        continue
+                    if ctrl.get('type') == 'config':
+                        # Honour the documented {type:config, language} message:
+                        # set the forced language once for this connection.
+                        _cfg_lang = ctrl.get('language')
+                        if _cfg_lang:
+                            stt_lang = _cfg_lang
                         continue
                 except (json.JSONDecodeError, ValueError):
                     pass
@@ -1064,27 +1230,46 @@ async def _stt_stream_handler(websocket):
 
             if is_container:
                 # Save to temp file, let faster-whisper handle decoding
-                pcm_bytes = _container_to_pcm(message)
-                if pcm_bytes:
-                    audio_buffer.write(pcm_bytes)
+                chunk_pcm = _container_to_pcm(message) or b''
             else:
                 # Raw PCM16 mono 16kHz
-                audio_buffer.write(message)
+                chunk_pcm = bytes(message)
+            if chunk_pcm:
+                audio_buffer.write(chunk_pcm)
 
             buf_size = audio_buffer.getbuffer().nbytes
 
             # Force transcription if buffer exceeds max
             if buf_size >= STREAM_MAX_BUFFER_BYTES:
-                text, lang = _transcribe_buffer(audio_buffer)
-                if text:
-                    await websocket.send(json.dumps({
-                        'text': text, 'language': lang, 'is_final': True,
-                    }))
-                    _maybe_enqueue_call_segment(
-                        call_id, user_id, text, lang, True)
+                await _emit_final(
+                    websocket, audio_buffer, stt_lang, call_id, user_id)
                 audio_buffer = io.BytesIO()
                 last_transcribe_size = 0
+                vad.reset()
                 continue
+
+            # VAD pause-finalize: when this chunk completes an end-of-utterance
+            # silence, flush a final immediately (don't wait for the client's
+            # {control:final} or the 30s overflow).  Energy on the decoded PCM
+            # of THIS chunk; chunk_ms = bytes / (16kHz * 2 bytes/ms).
+            #
+            # GATED to continuous voice-room streams (call_id present).  The
+            # push-to-talk chat mic (call_id=None) finalizes client-side via
+            # {control:final} on mic-release; the client fires onResult (which
+            # submits) on every is_final, so an auto-final on a mid-utterance
+            # thinking pause would split one utterance into two chat
+            # submissions.  Voice rooms WANT pause segmentation (one
+            # conversational turn per pause) — so VAD runs only there, leaving
+            # the chat-mic flow's behavior unchanged.
+            if call_id and chunk_pcm:
+                chunk_ms = len(chunk_pcm) / (
+                    STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE / 1000.0)
+                if vad.update(_pcm_rms(chunk_pcm), chunk_ms):
+                    await _emit_final(
+                        websocket, audio_buffer, stt_lang, call_id, user_id)
+                    audio_buffer = io.BytesIO()
+                    last_transcribe_size = 0
+                    continue
 
             # Interim transcription every STREAM_CHUNK_BYTES.
             #
@@ -1098,7 +1283,7 @@ async def _stt_stream_handler(websocket):
             if buf_size - last_transcribe_size >= STREAM_CHUNK_BYTES:
                 interim_buf = _tail_window_buffer(
                     audio_buffer, STREAM_INTERIM_WINDOW_BYTES)
-                text, lang = _transcribe_buffer(interim_buf, keep_buffer=True)
+                text, lang = _transcribe_buffer(interim_buf, keep_buffer=True, language=stt_lang)
                 last_transcribe_size = buf_size
                 if text:
                     await websocket.send(json.dumps({
@@ -1186,10 +1371,13 @@ def _tail_window_buffer(audio_buffer, window_bytes: int):
     return io.BytesIO(tail)
 
 
-def _transcribe_buffer(audio_buffer, keep_buffer: bool = False) -> tuple:
+def _transcribe_buffer(audio_buffer, keep_buffer: bool = False,
+                       language: Optional[str] = None) -> tuple:
     """Transcribe accumulated audio buffer via the subprocess STT worker.
 
-    Returns (text, language) tuple.
+    Returns (text, language) tuple.  ``language`` is an optional forced
+    language code (from the stream's {type:config} message); None lets
+    faster-whisper auto-detect per utterance.
 
     Runs through `_stt_tool` so CUDA OOM or faster-whisper/CTranslate2
     crashes on the realtime path only kill the worker subprocess — the
@@ -1222,7 +1410,7 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False) -> tuple:
         result = _stt_tool.call({
             'op': 'transcribe',
             'audio_path': tmp.name,
-            'language': None,
+            'language': language,
         })
         if 'error' in result and not result.get('raw_json'):
             logger.warning(f"Streaming STT transcribe failed (returning empty text): {result.get('error')}")

@@ -1,0 +1,172 @@
+#!/usr/bin/env sh
+# ═══════════════════════════════════════════════════════════════
+# hartctl — HART OS operator control tool   (Phase 1: session tier)
+# ═══════════════════════════════════════════════════════════════
+#
+# The operator-facing companion to the out-of-process session tier-drop
+# supervisor (nixos/modules/hart-session-supervisor.nix). It reads + clears
+# the SAME latch the supervisor's selector wrapper uses, so there is ONE
+# source of truth for the /var/lib/hart/session-tier contract (Phase-0
+# state-file: values hart-comp | sway | cage).
+#
+# This file is installed onto PATH as `hartctl` by hart-session-supervisor.nix
+# (the @HART_*@ placeholders are substituted at build time). It is also
+# directly runnable for dev/unit testing by exporting the same vars:
+#
+#     HART_LATCH_FILE=/tmp/t/session-tier \
+#     HART_WINDOW_FILE=/tmp/t/session-tier.window \
+#       sh nixos/hartctl/hartctl session status
+#
+# Commands:
+#     hartctl session status        Print the current latched tier + window
+#     hartctl session reset-tier    Clear the latch so the next boot retries
+#                                   Tier-1 (the operator "reset to Tier 1"
+#                                   recovery path — a transient Tier-1 bug
+#                                   can never permanently mask as a downgrade)
+#     hartctl session get-tier      Print just the latched tier (scripting)
+#     hartctl session set-tier T    Force the latch to T (hart-comp|sway|cage)
+#     hartctl help                  This help
+#
+# WHY reset-tier matters (openRisk #8): tier-drop LATCHES across boot, so
+# without a reset path a one-off Tier-1 crash would silently run the box on
+# cage forever. reset-tier is that recovery path.
+
+set -u
+
+# Build-time substituted paths (fall back to env / defaults for dev runs).
+LATCH_FILE="${HART_LATCH_FILE:-@HART_LATCH_FILE@}"
+WINDOW_FILE="${HART_WINDOW_FILE:-@HART_WINDOW_FILE@}"
+
+# Strip un-substituted placeholders (when run straight from the repo).
+case "$LATCH_FILE" in (@HART_LATCH_FILE@) LATCH_FILE="/var/lib/hart/session-tier" ;; esac
+case "$WINDOW_FILE" in (@HART_WINDOW_FILE@) WINDOW_FILE="/var/lib/hart/session-tier.window" ;; esac
+
+FLOOR="cage"
+VALID_TIERS="hart-comp sway cage"
+
+err() { echo "hartctl: $*" >&2; }
+
+# POSIX sh has no function-local scope: loop/temp vars are global. Use
+# underscore-prefixed names here so they never clobber a caller's $t/$tier
+# (the set-tier validation reads $t AFTER calling is_valid_tier).
+is_valid_tier() {
+  for _vt in $VALID_TIERS; do [ "$1" = "$_vt" ] && return 0; done
+  return 1
+}
+
+# Read the LATCHED tier — semantics mirror the supervisor selector and
+# SESSION_TIER_CONTRACT.md §3 rule 1:
+#   - file present + valid value  -> that value (a real crash-drop is latched)
+#   - file MISSING / unreadable / invalid token -> the FLOOR `cage` (fail-safe)
+# To RE-ARM Tier-1 the operator runs `reset-tier`, which WRITES `hart-comp`
+# (it does NOT just delete the file) — so "missing ⇒ cage" never strands a box
+# that an operator meant to put back on Tier-1.
+read_tier() {
+  if [ -r "$LATCH_FILE" ]; then
+    _rt=$(tr -d '[:space:]' < "$LATCH_FILE" 2>/dev/null)
+    if is_valid_tier "$_rt"; then printf '%s' "$_rt"; return 0; fi
+  fi
+  printf '%s' "$FLOOR"
+}
+
+write_tier() {
+  dir=$(dirname "$LATCH_FILE")
+  [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null
+  umask 022
+  if printf '%s\n' "$1" > "$LATCH_FILE.tmp" 2>/dev/null && mv -f "$LATCH_FILE.tmp" "$LATCH_FILE" 2>/dev/null; then
+    return 0
+  fi
+  err "could not write latch '$LATCH_FILE' (need root?)"
+  return 1
+}
+
+# Top of the tier ladder — what reset-tier re-arms (SESSION_TIER_CONTRACT §4).
+TOP_TIER="hart-comp"
+
+# Reset-to-Tier-1: WRITE the top tier (not merely delete the file), and clear
+# the crash window so the freshly-armed tier gets a clean restart budget.
+# Writing hart-comp (vs deleting) is the contract's chosen form: "missing ⇒
+# cage" is fail-safe, so re-arming must be an explicit write of the top tier.
+rearm_tier1() {
+  rm -f "$WINDOW_FILE" "$WINDOW_FILE.tmp" 2>/dev/null
+  write_tier "$TOP_TIER"
+}
+
+usage() {
+  cat >&2 <<'EOF'
+hartctl — HART OS operator control tool
+
+Usage:
+  hartctl session status        Show the current latched session tier
+  hartctl session get-tier      Print just the latched tier (for scripts)
+  hartctl session reset-tier    Clear the latch -> next boot retries Tier-1
+  hartctl session set-tier T    Force the latch to T (hart-comp|sway|cage)
+  hartctl help                  Show this help
+
+The session tier latch is /var/lib/hart/session-tier; the supervisor drops
+one tier per crash-loop (3 / 5 min) and latches across boot. reset-tier is
+the operator recovery path so a transient Tier-1 bug never permanently
+downgrades you to cage.
+EOF
+}
+
+cmd_session() {
+  sub="${1:-status}"
+  shift 2>/dev/null || true
+  case "$sub" in
+    status)
+      tier=$(read_tier)
+      latched="yes"; [ -r "$LATCH_FILE" ] || latched="no (defaulting to floor)"
+      printf 'session tier: %s   [latch file present: %s]\n' "$tier" "$latched"
+      if [ "$tier" = "$FLOOR" ]; then
+        printf '  (on the never-fail floor: cage + WebKitGTK + software GL)\n'
+        printf '  run "hartctl session reset-tier" to re-arm Tier-1 (hart-comp) on next boot\n'
+      fi
+      if [ -r "$WINDOW_FILE" ]; then
+        n=$(wc -l < "$WINDOW_FILE" 2>/dev/null | tr -d '[:space:]')
+        printf 'recent crash records in window: %s\n' "${n:-0}"
+      else
+        printf 'recent crash records in window: 0\n'
+      fi
+      return 0
+      ;;
+    get-tier)
+      read_tier; printf '\n'; return 0
+      ;;
+    reset-tier)
+      if rearm_tier1; then
+        printf 'session tier re-armed to Tier-1 (hart-comp) — next boot attempts the top tier.\n'
+        return 0
+      fi
+      err "could not re-arm Tier-1 (need root?)"
+      return 1
+      ;;
+    set-tier)
+      t="${1:-}"
+      if [ -z "$t" ]; then err "set-tier needs a tier (hart-comp|sway|cage)"; return 2; fi
+      if ! is_valid_tier "$t"; then err "invalid tier '$t' (valid: $VALID_TIERS)"; return 2; fi
+      if write_tier "$t"; then
+        printf 'session tier latched to: %s\n' "$t"
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      err "unknown session subcommand '$sub'"
+      usage
+      return 2
+      ;;
+  esac
+}
+
+main() {
+  cmd="${1:-help}"
+  shift 2>/dev/null || true
+  case "$cmd" in
+    session) cmd_session "$@" ;;
+    help|-h|--help) usage; return 0 ;;
+    *) err "unknown command '$cmd'"; usage; return 2 ;;
+  esac
+}
+
+main "$@"

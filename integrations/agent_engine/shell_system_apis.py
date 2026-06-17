@@ -106,10 +106,14 @@ def register_shell_system_routes(app):
             import psutil
         except ImportError:
             return jsonify({'processes': [], 'total': 0, 'error': 'psutil not available'})
+        from core.compute_optimizer import iter_processes
         procs = []
-        for p in psutil.process_iter(['pid', 'name', 'username', 'cpu_percent',
-                                       'memory_percent', 'memory_info', 'status',
-                                       'nice', 'num_threads', 'create_time', 'cmdline']):
+        # GIL-safe walker (yields mid-walk) — this task-manager view fetches
+        # memory_info + cmdline per PID, the heaviest walk; without yielding, a
+        # poll of it would stall the event loop (the #151 class).
+        for p in iter_processes(['pid', 'name', 'username', 'cpu_percent',
+                                 'memory_percent', 'memory_info', 'status',
+                                 'nice', 'num_threads', 'create_time', 'cmdline']):
             try:
                 info = p.info
                 if search and search not in (info.get('name') or '').lower() and \
@@ -219,11 +223,17 @@ def register_shell_system_routes(app):
             from integrations.service_tools.vram_manager import detect_gpu
             gpu = detect_gpu()
             if gpu:
+                # detect_gpu contract: {name, total_gb, free_gb, cuda_available}.
+                # memory_gb must read total_gb — the prior 'vram_mb'/'utilization'/
+                # 'temperature' keys never existed in that dict, so the Task-Manager
+                # GPU panel showed 0 GB forever (#152 wrong-key class). util/temp
+                # aren't exposed by detect_gpu yet → honest 0 until a smi probe adds them.
                 res['gpu'] = {
-                    'name': gpu.get('name', ''),
-                    'memory_gb': round(gpu.get('vram_mb', 0) / 1024, 1),
-                    'utilization': gpu.get('utilization', 0),
-                    'temperature': gpu.get('temperature', 0),
+                    'name': gpu.get('name') or '',
+                    'memory_gb': round(gpu.get('total_gb', 0), 1),
+                    'memory_free_gb': round(gpu.get('free_gb', 0), 1),
+                    'utilization': 0,
+                    'temperature': 0,
                 }
         except (ImportError, Exception):
             pass

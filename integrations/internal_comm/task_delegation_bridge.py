@@ -176,7 +176,21 @@ class TaskDelegationBridge:
         # Step 2: Complete delegation in A2A
         self.a2a_context.complete_delegation(delegation_id, result)
 
-        # Step 3: Update child task status
+        # Step 3: Update child task status.
+        # The child was created PENDING (create_parent_child_task) and the
+        # delegate has now actually executed it, so drive it through the
+        # valid lifecycle PENDING -> IN_PROGRESS -> terminal. The ledger FSM
+        # rejects a direct PENDING -> COMPLETED/FAILED jump (a task that never
+        # started cannot reach a terminal state); skipping the IN_PROGRESS
+        # step left the child stuck PENDING and the parent never resumed.
+        child_task = self.ledger.get_task(child_task_id)
+        if child_task and TaskStatus.is_initial_state(child_task.status):
+            self.ledger.update_task_status(
+                child_task_id,
+                TaskStatus.IN_PROGRESS,
+                reason=f"Delegate started work for delegation {delegation_id}"
+            )
+
         child_status = TaskStatus.COMPLETED if success else TaskStatus.FAILED
         self.ledger.update_task_status(
             child_task_id,
@@ -184,15 +198,18 @@ class TaskDelegationBridge:
             json.dumps(result) if isinstance(result, (dict, list)) else str(result)
         )
 
-        # Step 4: Auto-resume parent task (task_ledger should handle this automatically)
-        # But let's explicitly trigger it to be safe
+        # Step 4: Auto-resume parent task once every delegation it is blocked
+        # on has finished. Resume via the ledger's canonical resume_task, which
+        # drives the valid BLOCKED -> RESUMING -> IN_PROGRESS path. A direct
+        # update_task_status(.., IN_PROGRESS) is rejected by the FSM (BLOCKED
+        # has no IN_PROGRESS target), which previously left the parent stuck
+        # BLOCKED forever.
         parent_task = self.ledger.get_task(parent_task_id)
         if parent_task and parent_task.status == TaskStatus.BLOCKED:
             # Check if all dependencies are complete
             if self._all_dependencies_complete(parent_task_id):
-                self.ledger.update_task_status(
+                self.ledger.resume_task(
                     parent_task_id,
-                    TaskStatus.IN_PROGRESS,
                     f"Resumed after delegation {delegation_id} completed"
                 )
                 logger.info(f"Parent task {parent_task_id} auto-resumed after delegation")
@@ -206,17 +223,21 @@ class TaskDelegationBridge:
         return True
 
     def _all_dependencies_complete(self, task_id: str) -> bool:
-        """Check if all dependencies of a task are complete"""
+        """Check if every task this one is waiting on has reached a terminal state.
+
+        A delegating parent tracks the work it is blocked on as its child
+        tasks (``create_parent_child_task`` stamps ``parent.child_task_ids`` /
+        ``child.parent_task_id``).  So "all dependencies complete" == "all
+        delegated children are in a terminal state" — which is exactly what
+        the canonical ``Task.has_all_children_completed`` checks.  Using it
+        keeps the nested/multi-delegation gate correct: a parent with more
+        than one outstanding delegation only auto-resumes once the LAST child
+        finishes, not the first.
+        """
         task = self.ledger.get_task(task_id)
-        if not task or not task.depends_on:
+        if not task:
             return True
-
-        for dep_id in task.depends_on:
-            dep_task = self.ledger.get_task(dep_id)
-            if not dep_task or not TaskStatus.is_terminal_state(dep_task.status):
-                return False
-
-        return True
+        return task.has_all_children_completed(self.ledger)
 
     def get_delegation_status(self, delegation_id: str) -> Optional[Dict[str, Any]]:
         """

@@ -12,7 +12,16 @@ This is the desktop expression of HART's "humans are always in control".
 
 Single source of truth: import `allowed(sensor)` at every sensor ingestion point
 rather than re-implementing a per-feature mute.
+
+Cross-process authority (Phase 7): in-process `allowed()` is per-process memory.
+A separate process (e.g. xdg-desktop-portal-hart's ScreenCast handler, which is
+its OWN systemd unit) cannot read it — so a screencast surface could capture the
+screen the human cut. `start_authority_server()` exposes the gate over a Unix
+socket in the canonical state holder (the brain); `query_authority(sensor)` is
+the FAIL-CLOSED client the portal MUST consult before any capture.
 """
+import os
+import socket
 import threading
 
 _lock = threading.RLock()
@@ -98,3 +107,75 @@ def status() -> dict:
             'screen_gated': disabled['screen'],
         },
     }
+
+
+# ── Cross-process authority (Phase 7) ───────────────────────────────────────
+
+def _authority_path(path: str = None) -> str:
+    return path or os.path.join(
+        os.environ.get('XDG_RUNTIME_DIR', '/tmp'), 'hart-ai-sensing.sock')
+
+
+def start_authority_server(path: str = None) -> bool:
+    """Expose the sense gate over a Unix socket so a SEPARATE process (the
+    screencast portal — its own systemd unit) can consult allowed(sensor) and
+    fail-closed. Runs in the canonical state holder (the brain). Returns False
+    where AF_UNIX is unavailable or the bind fails — the caller then keeps the
+    no-native-capture invariant rather than shipping an unguarded surface."""
+    if not hasattr(socket, 'AF_UNIX'):
+        return False
+    sock_path = _authority_path(path)
+    try:
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(sock_path)
+        os.chmod(sock_path, 0o600)
+        srv.listen(8)
+    except Exception:
+        return False
+
+    def _serve():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except Exception:
+                break
+            try:
+                sensor = conn.recv(64).decode('ascii', 'replace').strip()
+                conn.sendall(b'1' if allowed(sensor) else b'0')
+            except Exception:
+                try:
+                    conn.sendall(b'0')          # fail-closed on any error
+                except Exception:
+                    pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    threading.Thread(target=_serve, daemon=True,
+                     name='ai-sensing-authority').start()
+    return True
+
+
+def query_authority(sensor: str, path: str = None, timeout: float = 1.0) -> bool:
+    """Cross-process query of the sense gate. FAIL-CLOSED: returns False
+    (denied) if the authority is unreachable or errors — a portal that cannot
+    reach the gate must NOT capture. The portal consults THIS, never its own
+    flag, so the human's cut genuinely propagates across processes."""
+    if not hasattr(socket, 'AF_UNIX'):
+        return False
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(timeout)
+        c.connect(_authority_path(path))
+        c.sendall(sensor.encode('ascii'))
+        reply = c.recv(8).strip()
+        c.close()
+        return reply == b'1'
+    except Exception:
+        return False

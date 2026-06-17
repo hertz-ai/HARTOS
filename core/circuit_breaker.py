@@ -117,6 +117,47 @@ class CircuitBreaker:
             }
 
 
+class KeyedCircuitBreaker:
+    """Per-key circuit breaking — ONE canonical ``CircuitBreaker`` per key
+    (e.g. per capture-backend name, per peer, per endpoint), created lazily.
+
+    The single home for "track failures per X, open after threshold" so ad-hoc
+    per-key breakers (the old frame_capture._CaptureCircuitBreaker) don't drift
+    from the canonical breaker's cooldown + half-open recovery.  API mirrors the
+    drop-in it replaces: every method takes the key.  Thread-safe.
+    """
+
+    def __init__(self, threshold: int = 5, cooldown: float = 60.0,
+                 name: str = 'keyed'):
+        self._threshold = threshold
+        self._cooldown = cooldown
+        self._name = name
+        self._breakers: dict = {}  # key -> CircuitBreaker
+        self._lock = threading.Lock()
+
+    def _get(self, key: str) -> CircuitBreaker:
+        with self._lock:
+            cb = self._breakers.get(key)
+            if cb is None:
+                cb = CircuitBreaker(
+                    name=f'{self._name}:{key}',
+                    threshold=self._threshold, cooldown=self._cooldown)
+                self._breakers[key] = cb
+            return cb
+
+    def record_failure(self, key: str) -> None:
+        self._get(key).record_failure()
+
+    def record_success(self, key: str) -> None:
+        self._get(key).record_success()
+
+    def is_open(self, key: str) -> bool:
+        return self._get(key).is_open()
+
+    def reset(self, key: str) -> None:
+        self._get(key).reset()
+
+
 class PeerBackoff:
     """Exponential backoff tracker for unreachable peers/endpoints.
 

@@ -128,6 +128,7 @@ import pytest as _pytest
     'model.unloaded',
     'catalog.updated',
     'app.registered',
+    'federation.aggregated',      # hive aggregate telemetry: epoch/peer_count, no ids (#126)
 ])
 def test_p3a_sse_allows_infra_telemetry_without_user_id(topic):
     """Host/infra telemetry (CPU/RAM/health/model-lifecycle/resource)
@@ -154,6 +155,7 @@ def test_p3a_sse_allows_infra_telemetry_without_user_id(topic):
     'action_state.changed',
     'inference.completed',
     'memory.item_added',
+    'learning.federation_update',  # reasoning-trace emit carries agent_id (#126: NOT allowlisted)
 ])
 def test_p3a_sse_still_refuses_agent_scoped_without_user_id(topic):
     """Regression guard: agent/goal/memory-scoped topics carry an

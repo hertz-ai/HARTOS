@@ -53,6 +53,18 @@
       ./modules/hart-compute-mesh.nix
       ./modules/hart-liquid-ui.nix
       ./modules/hart-app-bridge.nix
+      # Never-blank-screen session tier-drop supervisor (Phase 1 / B4). Opt-in
+      # (hart.sessionSupervisor.enable=false default) -> pure no-op for every
+      # variant (gated config; lazy sway default never enters a disabled
+      # closure); imported so the option exists + the nixosTest can enable it.
+      ./modules/hart-session-supervisor.nix
+      # sway-as-Tier-1: the proven-in-WSL OS-native windowing session (canonical
+      # glass shell under sway) + the hart-swaymsg-shim the brain's HartWmClient
+      # drives at Tier-2. Opt-in (hart.swayTier1.enable=false default) -> no-op
+      # for every variant; NO test enables it, so it never pulls graphical-desktop
+      # (no inotify-class tie). Makes "sway-Tier-1-now" a real greeter-selectable
+      # session + gives the moat a Tier-2 shim target, instead of an orphan file.
+      ./modules/hart-sway-tier1.nix
       # Remote Desktop peripherals + casting
       ./modules/hart-peripheral-bridge.nix
       ./modules/hart-dlna.nix
@@ -310,7 +322,19 @@
         inherit pkgs hartModules;
         specialArgs = mkSpecialArgs "server";
       };
-    in vmTests;
+      # Phase-0 floor-lock + Phase-1 session-supervisor nixosTests were authored
+      # (tests/floor-lock.nix, tests/session-supervisor.nix) but never wired into
+      # `checks` (= vm-tests.nix only), so `nix flake check` ran NEITHER — a test
+      # that never runs guards nothing (CLAUDE.md Gate 5). Distinct attr names ->
+      # clean //. specialArgs only carries hartSrc here (each node sets its own
+      # hart.variant via mkNode), so the "desktop" tag is variant-neutral.
+      desktopTestArgs = {
+        inherit pkgs hartModules;
+        specialArgs = mkSpecialArgs "desktop";
+      };
+      floorLock  = import ./tests/floor-lock.nix desktopTestArgs;
+      supervisor = import ./tests/session-supervisor.nix desktopTestArgs;
+    in vmTests // floorLock // supervisor;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)

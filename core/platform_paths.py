@@ -200,12 +200,25 @@ def get_recipe_prompts_dir() -> str:
         where recipes live (WORKDIR /app/prompts in the container, <repo>/prompts
         in dev), so use the code-relative prompts/.  Docker keeps working as is.
 
-    Mode is auto-detected (sys.frozen / NUNBA_BUNDLED); everything else falls to
-    the code-relative dir, so Docker and dev share one rule and need no flag.
-    The base is computed from THIS module's location so every caller resolves the
-    identical path regardless of where their own file sits.
+    Mode is auto-detected; everything else falls to the code-relative dir, so
+    Docker and dev share one rule and need no flag. The base is computed from
+    THIS module's location so every caller resolves the identical path regardless
+    of where their own file sits.
+
+    Embedded HART OS (nix) is ALSO a read-only install: the code lives under the
+    read-only /nix/store, so it must use the writable data dir exactly like the
+    bundled desktop — else hart-backend crashes on boot with
+    `OSError: [Errno 30] Read-only file system: '/nix/store/.../prompts'` (caught
+    by the floor-lock/supervisor nixosTests). An explicit data-dir env or the OS
+    identity marker also qualify; Docker/dev with a writable code tree are
+    unaffected (none of these signals fire there).
     """
-    if getattr(sys, 'frozen', False) or os.environ.get('NUNBA_BUNDLED'):
+    if (getattr(sys, 'frozen', False)
+            or os.environ.get('NUNBA_BUNDLED')
+            or os.environ.get('HARTOS_DATA_DIR')
+            or os.environ.get('NUNBA_DATA_DIR')
+            or (_IS_LINUX and os.path.isfile('/etc/hartos-release'))
+            or os.path.abspath(__file__).startswith('/nix/store/')):
         return get_prompts_dir()
     return os.path.join(os.path.dirname(os.path.dirname(__file__)), 'prompts')
 

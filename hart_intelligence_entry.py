@@ -2795,6 +2795,15 @@ def _request_screen_consent(input_text: str) -> str:
 
 def _handle_screenshot_tool(input_text: str) -> str:
     """Take screenshot and describe using VLM."""
+    # AI senses kill-switch: refuse to grab the screen when the human has cut
+    # the AI's 'screen' sense — "humans are always in control", enforced at the
+    # grab (not advisory).  Mirrors the mic gate at /api/voice.
+    try:
+        from core.ai_sensing import allowed
+        if not allowed('screen'):
+            return "Screen access is turned off by the user (AI senses kill-switch)."
+    except Exception:
+        pass
     try:
         from PIL import ImageGrab
         import base64, io
@@ -8199,6 +8208,13 @@ def _chat_request_is_genuine():
     except Exception:
         return True  # no request context / unparsable -> treat as a user turn
     try:
+        # Delegate ENTIRELY to the one canonical discriminator — no bespoke,
+        # caller-specific "is user" rule here.  is_genuine_user_request is the
+        # single source of truth for empty / 'daemon_' / real-id across every
+        # caller (this inbound mark_view AND the outbound abort gate), so they
+        # can never diverge.  Empty → background is safe inbound too: a real
+        # /chat always carries an id (the frontend sends one; the Nunba adapter
+        # defaults a timestamp when omitted), so an inbound turn is never empty.
         from integrations.agent_engine.dispatch import is_genuine_user_request
         return is_genuine_user_request(_rid)
     except Exception:

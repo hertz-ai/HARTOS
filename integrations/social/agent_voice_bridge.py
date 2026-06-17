@@ -76,6 +76,13 @@ except Exception:
 _ACTIVE_WORKERS: Dict[tuple, 'AgentBridgeWorker'] = {}
 _WORKERS_LOCK = threading.Lock()
 
+# The agent's EARS: exactly ONE LiveKitTranscriptSubscriber per call_id (a single
+# room→STT transcription serves every agent on that call).  Lives in the same
+# bridge module — and under the SAME _WORKERS_LOCK — as the per-(call,agent)
+# worker + per-worker publisher, so "agent presence in a call" has one owner, not
+# a parallel lifecycle registry in a second file.  Keyed by call_id.
+_ACTIVE_SUBSCRIBERS: Dict[str, 'LiveKitTranscriptSubscriber'] = {}
+
 
 # ── TTS outbox: agent reply text → audio publisher ──────────────────
 #
@@ -576,8 +583,8 @@ class AgentBridgeWorker:
         the agent engine), the emit is a logged no-op.
         """
         try:
-            from core.platform.service_registry import ServiceRegistry
-            svc = ServiceRegistry.get('LiquidUIService')
+            from core.platform.registry import get_registry
+            svc = get_registry().get_or_none('LiquidUIService')
         except Exception as e:
             logger.debug(
                 "AgentBridgeWorker._emit_meet_copilot: ServiceRegistry "
@@ -612,6 +619,69 @@ class AgentBridgeWorker:
                 self.call_id, self.agent_id, e)
 
 
+def _ensure_call_subscriber(call_id: str) -> None:
+    """Start ONE LiveKitTranscriptSubscriber (the room→STT "ears") per call,
+    idempotently, so the per-(call,agent) bridge workers actually have transcript
+    segments to drain.  Without this the worker drains a queue nobody fills and
+    the agent is deaf — the subscriber class shipped but was never wired into the
+    attach flow.
+
+    Reuses the existing subscriber class + ``LiveKitService.issue_token`` and the
+    same canonical per-call STT queue the worker drains — no parallel path.  No-op
+    when livekit-rtc is absent or the call has no LiveKit room (p2p/central): the
+    worker then drains an empty queue exactly as before.  Best-effort; never
+    raises out to the caller."""
+    if not _HAS_LIVEKIT_RTC:
+        return
+    with _WORKERS_LOCK:
+        sub = _ACTIVE_SUBSCRIBERS.get(call_id)
+        if sub is not None and sub.is_alive():
+            return
+    try:
+        from integrations.social.livekit_service import LiveKitService
+        from integrations.social.livekit_transcript_subscriber import (
+            LiveKitTranscriptSubscriber,
+        )
+    except Exception as e:  # pragma: no cover — import-only failure
+        logger.debug("AgentVoiceBridge._ensure_call_subscriber: imports "
+                     "unavailable (%s)", e)
+        return
+    # Subscribe-only token (can_publish=False) for the room's single transcriber
+    # identity — the SAME issuer humans + the publisher use.
+    try:
+        tok = LiveKitService.issue_token(
+            call_id, 'transcript-bot', can_publish=False, is_agent=True)
+    except Exception as e:
+        logger.warning("AgentVoiceBridge._ensure_call_subscriber: issue_token "
+                       "failed (call=%s): %s", call_id, e)
+        return
+    if (tok.get('mode') != 'livekit' or not tok.get('token')
+            or not tok.get('url')):
+        return  # p2p mesh / central / pending — no room to subscribe to
+    sub = LiveKitTranscriptSubscriber(call_id, tok['url'], tok['token'])
+    if not sub.start():
+        return
+    with _WORKERS_LOCK:
+        existing = _ACTIVE_SUBSCRIBERS.get(call_id)
+        if existing is not None and existing.is_alive():
+            sub.stop()  # lost a race — keep the already-running one
+            return
+        _ACTIVE_SUBSCRIBERS[call_id] = sub
+
+
+def _maybe_stop_call_subscriber(call_id: str) -> None:
+    """Stop + drop the call's shared subscriber once NO bridge workers remain for
+    that call (the last agent detached).  Best-effort; never raises."""
+    with _WORKERS_LOCK:
+        still_serving = any(k[0] == call_id for k in _ACTIVE_WORKERS)
+        sub = None if still_serving else _ACTIVE_SUBSCRIBERS.pop(call_id, None)
+    if sub is not None:
+        try:
+            sub.stop()
+        except Exception:
+            pass
+
+
 class AgentVoiceBridge:
     """Public surface — what api_calls.add_agent_to_call invokes."""
 
@@ -633,13 +703,19 @@ class AgentVoiceBridge:
         with _WORKERS_LOCK:
             existing = _ACTIVE_WORKERS.get(key)
             if existing and existing.is_alive():
-                return existing.to_dict()
-            worker = AgentBridgeWorker(
-                call_id=call_id, agent_id=agent_id,
-                owner_id=owner_id, scope=scope)
-            worker.start()
-            _ACTIVE_WORKERS[key] = worker
-        return worker.to_dict()
+                result = existing.to_dict()
+            else:
+                worker = AgentBridgeWorker(
+                    call_id=call_id, agent_id=agent_id,
+                    owner_id=owner_id, scope=scope)
+                worker.start()
+                _ACTIVE_WORKERS[key] = worker
+                result = worker.to_dict()
+        # Ears: ensure the per-call transcript subscriber (room→STT queue) is
+        # running so the worker's _tick has segments to drain.  Idempotent and
+        # called OUTSIDE _WORKERS_LOCK (the helper takes the lock itself).
+        _ensure_call_subscriber(call_id)
+        return result
 
     @staticmethod
     def detach_agent(call_id: str, agent_id: str) -> bool:
@@ -653,10 +729,12 @@ class AgentVoiceBridge:
         # later same-key attach doesn't replay stale audio.
         with _TTS_LOCK:
             _TTS_OUTBOX.pop(key, None)
-        if worker is None:
-            return False
-        worker.stop()
-        return True
+        if worker is not None:
+            worker.stop()
+        # Ears: tear down the call's shared subscriber once the last agent on
+        # this call has detached (no-op while other agents remain).
+        _maybe_stop_call_subscriber(call_id)
+        return worker is not None
 
     @staticmethod
     def list_active(call_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -675,10 +753,17 @@ class AgentVoiceBridge:
         with _WORKERS_LOCK:
             workers = list(_ACTIVE_WORKERS.values())
             _ACTIVE_WORKERS.clear()
+            subs = list(_ACTIVE_SUBSCRIBERS.values())
+            _ACTIVE_SUBSCRIBERS.clear()
         with _TTS_LOCK:
             _TTS_OUTBOX.clear()
         for w in workers:
             w.stop()
+        for s in subs:
+            try:
+                s.stop()
+            except Exception:
+                pass
         return len(workers)
 
 
