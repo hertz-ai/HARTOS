@@ -20,6 +20,13 @@ in
       wantedBy = [ "hart.target" ];
 
       environment = {
+        # Recipe/prompts data must land in the service's WRITABLE StateDirectory
+        # (cfg.dataDir), not the /nix/store package dir (read-only) nor the
+        # /etc/hartos-release default /var/lib/hartos (outside this sandbox ->
+        # EROFS). This is get_data_dir()'s priority-2 signal, so get_recipe_
+        # prompts_dir() -> cfg.dataDir/data/prompts. Fixes the boot crash
+        # OSError [Errno 30] Read-only file system: '.../prompts'.
+        HARTOS_DATA_DIR = cfg.dataDir;
         HEVOLVE_DB_PATH = "${cfg.dataDir}/hevolve_database.db";
         HARTOS_BACKEND_PORT = toString cfg.ports.backend;
         HART_DISCOVERY_PORT = toString cfg.ports.discovery;
