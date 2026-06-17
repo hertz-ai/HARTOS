@@ -49,6 +49,10 @@ in
     # floor-lock test (node IS named `sup`, works at runtime). Skip the static
     # pre-check; the VM still boots and the tier-drop assertions still run.
     skipTypeCheck = true;
+    # The pyflakes lint (config.skipLint) ALSO flags the runtime-injected `sup`
+    # node global as "undefined name" — separate static pass from mypy, same false
+    # positive. Skip it too; `sup` exists at runtime when the VM boots.
+    skipLint = true;
     node.specialArgs = specialArgs;
 
     nodes.sup = mkNode "desktop" {

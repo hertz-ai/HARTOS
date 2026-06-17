@@ -48,6 +48,10 @@ in
     # (the vm-tests.nix server/desktop tests are structured identically). Skip the
     # static pre-check; the VM still boots and the assertions still run.
     skipTypeCheck = true;
+    # The pyflakes lint (config.skipLint) ALSO flags the runtime-injected `floor`
+    # node global as "undefined name" — a separate static pass from mypy, same
+    # false positive. Skip it too; `floor` exists at runtime when the VM boots.
+    skipLint = true;
     node.specialArgs = specialArgs;
 
     nodes.floor = mkNode "desktop" {
