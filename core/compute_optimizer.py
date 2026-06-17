@@ -425,12 +425,18 @@ class ComputeOptimizer:
         # than re-walking every tick — this is what stops the optimizer from
         # GIL-starving the server while the box stays hot.
         now = time.time()
-        if now - self._last_topproc_ts < TOPPROC_SCAN_COOLDOWN:
-            prev = self._last_snapshot
-            if prev is not None and prev.top_processes:
-                snap.top_processes = prev.top_processes
-            return
-        self._last_topproc_ts = now
+        # Make the cooldown check-and-stamp atomic: snapshot() is reachable
+        # concurrently from the monitor thread AND Hypercorn worker threads
+        # (via the /optimizer routes), so an unlocked check-then-set could let
+        # two breaching snapshots both pass the gate and double-walk. The walk
+        # itself stays OUTSIDE the lock (never hold the lock during process_iter).
+        with self._lock:
+            if now - self._last_topproc_ts < TOPPROC_SCAN_COOLDOWN:
+                prev = self._last_snapshot
+                if prev is not None and prev.top_processes:
+                    snap.top_processes = prev.top_processes
+                return
+            self._last_topproc_ts = now
         try:
             procs = []
             # iter_processes walks every PID but releases the GIL periodically
