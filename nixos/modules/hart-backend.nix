@@ -18,6 +18,8 @@ in
       wants = [ "network-online.target" ];
       partOf = [ "hart.target" ];
       wantedBy = [ "hart.target" ];
+      startLimitIntervalSec = 120;
+      startLimitBurst = 3;
 
       environment = {
         HEVOLVE_DB_PATH = "${cfg.dataDir}/hevolve_database.db";
@@ -46,11 +48,12 @@ in
         EnvironmentFile = lib.mkIf (builtins.pathExists "/etc/hart/hart.env") "/etc/hart/hart.env";
 
         Restart = "on-failure";
-        RestartSec = 5;
+        RestartSec = 10;
         # No WatchdogSec: waitress never sends sd_notify(WATCHDOG=1), so a watchdog
         # timer would SIGABRT the backend every 120s once it is actually serving.
         # Restart=on-failure still covers real crashes.
-        TimeoutStartSec = 30;
+        # 180s: langchain + chromadb + autogen imports are slow on USB storage
+        TimeoutStartSec = 180;
         TimeoutStopSec = 15;
 
         # Security hardening
