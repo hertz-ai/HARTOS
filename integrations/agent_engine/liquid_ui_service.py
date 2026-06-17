@@ -1083,28 +1083,22 @@ html,body{overscroll-behavior:none;-webkit-font-smoothing:antialiased;
 img{-webkit-user-drag:none;user-select:none}
 
 /* ── Animated motion background: independent blobs each on their own path ── */
-.hart-ambient{position:fixed;inset:0;z-index:1;pointer-events:none;overflow:hidden}
-.hart-blob{position:absolute;border-radius:50%;filter:blur(80px);opacity:.55;will-change:transform}
-.hart-blob-1{width:65vw;height:65vw;top:-20%;left:-15%;
-  background:radial-gradient(circle,rgba(0,212,170,.7),rgba(0,212,170,0) 70%);
-  animation:blob1 22s ease-in-out infinite alternate}
-.hart-blob-2{width:55vw;height:55vw;top:10%;right:-10%;
-  background:radial-gradient(circle,rgba(108,99,255,.65),rgba(108,99,255,0) 70%);
-  animation:blob2 28s ease-in-out infinite alternate}
-.hart-blob-3{width:50vw;height:50vw;bottom:-10%;left:30%;
-  background:radial-gradient(circle,rgba(34,176,255,.55),rgba(34,176,255,0) 70%);
-  animation:blob3 34s ease-in-out infinite alternate}
-.hart-blob-4{width:40vw;height:40vw;top:40%;right:20%;
-  background:radial-gradient(circle,rgba(255,120,180,.45),rgba(255,120,180,0) 70%);
-  animation:blob4 19s ease-in-out infinite alternate}
-.hart-blob-5{width:35vw;height:35vw;bottom:10%;left:-5%;
-  background:radial-gradient(circle,rgba(255,200,50,.35),rgba(255,200,50,0) 70%);
-  animation:blob5 25s ease-in-out infinite alternate}
-@keyframes blob1{0%{transform:translate(0,0) scale(1)}100%{transform:translate(12vw,8vh) scale(1.15)}}
-@keyframes blob2{0%{transform:translate(0,0) scale(1.05)}100%{transform:translate(-10vw,12vh) scale(.9)}}
-@keyframes blob3{0%{transform:translate(0,0) scale(.95)}100%{transform:translate(-8vw,-10vh) scale(1.2)}}
-@keyframes blob4{0%{transform:translate(0,0) scale(1)}100%{transform:translate(8vw,-8vh) scale(1.1)}}
-@keyframes blob5{0%{transform:translate(0,0) scale(1.1)}100%{transform:translate(14vw,6vh) scale(.85)}}
+/* Single blurred container (1 compositor layer) + 3 lightweight blobs */
+.hart-ambient{position:fixed;inset:-15%;z-index:1;pointer-events:none;overflow:hidden;
+  filter:blur(55px) saturate(140%)}
+.hart-blob{position:absolute;border-radius:50%;opacity:.65}
+.hart-blob-1{width:55vw;height:55vw;top:-5%;left:-10%;
+  background:radial-gradient(circle,rgba(0,212,170,.75),transparent 70%);
+  animation:blob1 32s ease-in-out infinite alternate}
+.hart-blob-2{width:50vw;height:50vw;top:10%;right:-5%;
+  background:radial-gradient(circle,rgba(108,99,255,.70),transparent 70%);
+  animation:blob2 40s ease-in-out infinite alternate}
+.hart-blob-3{width:45vw;height:45vw;bottom:-5%;left:28%;
+  background:radial-gradient(circle,rgba(34,176,255,.60),transparent 70%);
+  animation:blob3 48s ease-in-out infinite alternate}
+@keyframes blob1{0%{transform:translate(0,0)}100%{transform:translate(8vw,6vh)}}
+@keyframes blob2{0%{transform:translate(0,0)}100%{transform:translate(-7vw,9vh)}}
+@keyframes blob3{0%{transform:translate(0,0)}100%{transform:translate(-5vw,-7vh)}}
 .hart-grain{position:fixed;inset:0;z-index:2;pointer-events:none;opacity:0.045;mix-blend-mode:overlay;
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
 .hart-vignette{position:fixed;inset:0;z-index:2;pointer-events:none;
@@ -1552,7 +1546,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      element + hartBootSplash.js drives the fade, so inline is cleaner here. -->
 <div id="hart-boot" aria-hidden="true" style="position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:#0F0E17;transition:opacity .6s ease"><div id="hart-boot-lottie" style="width:min(46vw,360px);height:min(64vw,497px)"></div></div>
 <div class="wallpaper"></div>
-{'<div class="hart-ambient" aria-hidden="true"><div class="hart-blob hart-blob-1"></div><div class="hart-blob hart-blob-2"></div><div class="hart-blob hart-blob-3"></div><div class="hart-blob hart-blob-4"></div><div class="hart-blob hart-blob-5"></div></div><div class="hart-grain" aria-hidden="true"></div>' if not is_potato else ''}
+{'<div class="hart-ambient" aria-hidden="true"><div class="hart-blob hart-blob-1"></div><div class="hart-blob hart-blob-2"></div><div class="hart-blob hart-blob-3"></div></div><div class="hart-grain" aria-hidden="true"></div>' if not is_potato else ''}
 <div class="hart-vignette" aria-hidden="true"></div>
 <!-- Desktop icon layer (drag-drop apps); populated by hartDesktop.js -->
 <div class="hart-desktop" id="hart-desktop" aria-label="Desktop icons"></div>
