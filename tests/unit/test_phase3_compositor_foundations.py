@@ -190,11 +190,14 @@ class TestHartComp:
         assert "buildRustPackage" in src
         assert 'hartSrc + "/compositor"' in src
 
-    def test_fixed_cargohash_placeholder(self, src):
-        # compositor/ has no committed lock yet → the placeholder model.
-        assert "cargoHash" in src
-        assert "sha256-AAAA" in src  # the length-correct all-A placeholder
-        assert "placeholder" in src.lower()
+    def test_uses_committed_cargo_lock(self, src):
+        # compositor/ now ships a committed Cargo.lock, so hart-comp uses the
+        # reproducible cargoLock.lockFile path (mirrors hart-rust-precedent), NOT
+        # the all-A cargoHash placeholder that would fail the first `nix build`.
+        assert "cargoLock" in src
+        assert "lockFile" in src
+        assert 'compositorSrc + "/Cargo.lock"' in src
+        assert "sha256-AAAA" not in src  # the broken placeholder is gone
 
     def test_mandatory_software_render_floor(self, src):
         assert "pixman" in src  # the mandatory software renderer C dep

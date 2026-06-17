@@ -59,26 +59,28 @@ let
 
   # ── The HART-comp package (buildRustPackage of compositor/) ──
   #
-  # NOTE: compositor/ ships NO committed Cargo.lock yet (it is a compile-pending
-  # skeleton; the lock is generated + committed in CI on the Linux builder where
-  # Smithay's crate graph actually resolves on pin 50ab793). So this package uses
-  # the FIXED cargoHash PLACEHOLDER model the ROADMAP names — the right-length
-  # all-A placeholder that makes the FIRST `nix build` fail with the REAL hash,
-  # which CI pastes back. (hart-rust-precedent.nix uses cargoLock.lockFile because
-  # claw_native/rust DOES ship a lock; the two models are documented side-by-side
-  # so each crate uses the correct one.)
+  # NOTE: compositor/ ships a COMMITTED Cargo.lock (committed in 60d04a7;
+  # registry-only deps — tracing/tracing-subscriber). So this package uses the
+  # reproducible cargoLock.lockFile model — the SAME idiom as
+  # hart-rust-precedent.nix (claw_native/rust). Both Rust-in-Nix crates now use
+  # lockFile, the one correct/DRY path; no hand-maintained cargoHash that drifts.
   hartCompPkg = pkgs.rustPlatform.buildRustPackage {
     pname = "hart-comp";
     version = "0.1.0";
 
     src = compositorSrc;
 
-    # FIXED cargoHash PLACEHOLDER (ROADMAP Phase 3 "fixed cargoHash placeholder").
-    # Length-correct sha256 of all-zero so `nix build` fails with the real vendor
-    # hash on the FIRST CI run; CI commits the real value. This is the standard
-    # fixed-output bootstrap. It cannot resolve on the Windows box (no Cargo.lock
-    # to vendor yet) — which is correct: HART-comp build is VM/CI-only.
-    cargoHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    # compositor/ now ships a COMMITTED Cargo.lock (registry-only deps), so use
+    # the reproducible cargoLock.lockFile path — the SAME idiom as
+    # hart-rust-precedent.nix. This replaces the old all-A cargoHash placeholder
+    # that would have FAILED the first `nix build` (it was written when the crate
+    # shipped no lock; the lock landed in 60d04a7 without updating this module).
+    cargoLock = {
+      lockFile = compositorSrc + "/Cargo.lock";
+      # Forward-safety for any future git-sourced dep; current lock is
+      # registry-only (mirrors the precedent module).
+      allowBuiltinFetchGit = true;
+    };
 
     # Smithay's build needs the Wayland/DRM/input/render C libraries on Linux.
     # Attr-guarded so a nixpkgs rev that renames one cannot break EVAL; CI's Nix
