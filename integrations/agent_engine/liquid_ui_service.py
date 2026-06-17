@@ -46,7 +46,11 @@ DESTRUCTIVE_COMPONENT_TYPES = frozenset()
 # Obvious XSS vectors we REJECT server-side.  The client also escapes on render,
 # so we reject (not escape) to avoid double-escaping legitimate content.
 _A2UI_XSS_RE = re.compile(
-    r'<\s*script|<\s*iframe|javascript:|data:text/html', re.I)
+    r'<\s*(?:script|iframe|img|svg|object|embed)\b'  # script/iframe + tags that carry onerror/onload
+    r'|<[^>]*\son\w+\s*='                            # inline event-handler attr (onerror=/onload=/onclick=...)
+    r'|javascript:'
+    r'|data:text/html',
+    re.I)
 
 
 def _a2ui_has_xss(value) -> bool:
