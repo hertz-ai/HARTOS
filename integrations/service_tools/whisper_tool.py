@@ -443,12 +443,48 @@ def _get_sherpa_recognizer(model_name: str = "whisper-tiny"):
     return _sherpa_recognizer
 
 
+def _read_wav_f32(audio_path: str):
+    """Read a PCM WAV into ``(sample_rate, float32 mono samples in [-1, 1])``.
+
+    sherpa-onnx's ``OfflineStream.accept_waveform`` wants normalized float32
+    samples + the source sample rate.  The realtime STT pipeline writes 16-bit
+    PCM WAV (see the streaming writer ~L1229).  Uses ONLY stdlib ``wave`` +
+    numpy — no libsndfile / ffmpeg native dependency — so it behaves
+    identically in the frozen bundle on Windows, macOS and Linux.
+    """
+    import wave
+    import numpy as np
+    with wave.open(audio_path, 'rb') as wf:
+        sample_rate = wf.getframerate()
+        n_channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        raw = wf.readframes(wf.getnframes())
+    if sampwidth == 2:
+        data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sampwidth == 4:
+        data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+    elif sampwidth == 1:  # 8-bit PCM is unsigned, centred at 128
+        data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    else:
+        raise ValueError(f"unsupported WAV sample width: {sampwidth} bytes")
+    if n_channels > 1:  # down-mix to mono
+        data = data.reshape(-1, n_channels).mean(axis=1)
+    return sample_rate, data
+
+
 def _sherpa_transcribe(audio_path: str, model_name: str) -> Optional[str]:
     """Transcribe using sherpa-onnx. Returns JSON string or None on failure."""
     try:
         recognizer = _get_sherpa_recognizer(model_name)
+        # sherpa-onnx OfflineStream has NO ``accept_wave_file`` (verified
+        # sherpa_onnx 1.13.1 — methods are accept_waveform/result/…); the
+        # canonical API is ``accept_waveform(sample_rate, float_samples)``.
+        # The old call raised AttributeError on every utterance, so STT
+        # returned empty text — mic captured, nothing transcribed/sent/shown
+        # (incident 2026-06-17).
+        sample_rate, samples = _read_wav_f32(audio_path)
         stream = recognizer.create_stream()
-        stream.accept_wave_file(audio_path)
+        stream.accept_waveform(sample_rate, samples)
         recognizer.decode_stream(stream)
         text = stream.result.text.strip()
 

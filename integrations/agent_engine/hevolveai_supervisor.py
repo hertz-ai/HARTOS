@@ -167,6 +167,9 @@ def supervisor_should_run() -> bool:
       * hevolveai is neither importable nor resolvable via a dev
         sibling repo -- spawning would crash-loop (see
         ``_hevolveai_available``).
+      * the child interpreter cannot import ``torch`` -- the brain's
+        other hard dependency; spawning would crash-loop identically
+        (see ``_child_can_import_torch``).
     """
     if os.environ.get('HEVOLVE_SKIP_HEVOLVEAI_SPAWN') == '1':
         return False
@@ -174,6 +177,8 @@ def supervisor_should_run() -> bool:
     if url and ('localhost' not in url) and ('127.0.0.1' not in url):
         return False
     if not _hevolveai_available():
+        return False
+    if not _child_can_import_torch():
         return False
     return True
 
@@ -232,6 +237,67 @@ def _resolve_hevolveai_pythonpath() -> Optional[str]:
     if (candidate / 'hevolveai').is_dir():
         return str(candidate)
     return None
+
+
+# Cached verdict of the child-interpreter torch probe (see below).
+# None = not yet probed; True/False = the cached result for this process.
+_CHILD_TORCH_OK: Optional[bool] = None
+
+
+def _child_can_import_torch() -> bool:
+    """True when the CHILD interpreter can resolve ``torch``.
+
+    The brain hard-requires torch: ``hevolveai.server.api_server`` imports
+    ``embodied_ai.monitoring.weight_tracker`` at module load, which does
+    ``import torch``.  Without it the child exits rc=1 in <1s and the
+    supervisor crash-loops -- the SAME failure ``_hevolveai_available``
+    guards against for the hevolveai package, but for torch.
+
+    Why probe the CHILD rather than a parent ``find_spec`` (as
+    ``_hevolveai_available`` does for hevolveai): the parent's torch is
+    NOT representative of the child on macOS/Linux.  There
+    ``_resolve_python_exe`` falls back to ``sys.executable`` -- the frozen
+    Nunba binary run as ``<exe> -c`` -- whose sys.path is the minimal
+    frozen ``library.zip`` + ``lib`` set; torch is not bundled there even
+    when the parent process resolved torch from a dev ``.venv``.  On
+    Windows the child is ``python-embed/python.exe``, which carries torch
+    in its site-packages, so the probe passes and the brain spawns
+    normally.  This is a POSITIVE capability gate, not an OS check: the
+    brain auto-enables on any box where the child can import torch.
+
+    One short, cached subprocess per process (``find_spec`` only -- does
+    not load torch).  Conservative: any probe failure / timeout ->
+    unavailable, so a flaky probe never starts a crash-looping child.
+    macOS incident 2026-06-16: the post-build ``Nunba --validate`` smoke
+    test spawned this brain, which crash-looped on ``import torch`` (torch
+    absent from the frozen ``-c`` child) ~20x and failed DMG packaging.
+    See tests/unit/test_supervisor_torch_gate.py.
+    """
+    global _CHILD_TORCH_OK
+    if _CHILD_TORCH_OK is not None:
+        return _CHILD_TORCH_OK
+    verdict = False
+    try:
+        from core.subprocess_safe import run_bounded
+        res = run_bounded(
+            [_resolve_python_exe(), '-c',
+             "import importlib.util as u, sys; "
+             "sys.exit(0 if u.find_spec('torch') else 3)"],
+            timeout=30.0,
+        )
+        verdict = (res.returncode == 0 and not res.timed_out)
+    except Exception as e:  # FileNotFoundError / OSError / anything
+        logger.warning(
+            "hevolveai_supervisor: torch probe failed (%s); treating torch "
+            "as unavailable and skipping brain spawn", e)
+        verdict = False
+    if not verdict:
+        logger.info(
+            "hevolveai_supervisor: child interpreter (%s) cannot import "
+            "torch; brain spawn disabled (install torch where the child "
+            "resolves it to enable embodied-AI)", _resolve_python_exe())
+    _CHILD_TORCH_OK = verdict
+    return verdict
 
 
 # Canonical armored-import snippet for the spawned hevolveai server.
@@ -812,6 +878,10 @@ def start_supervisor() -> Dict[str, Any]:
             _reason = ('hevolveai not installed/importable and no dev '
                        'sibling repo found -- supervisor disabled (set '
                        'HEVOLVEAI_HOME or pip install hevolveai to enable)')
+        elif not _child_can_import_torch():
+            _reason = ('child interpreter cannot import torch -- supervisor '
+                       'disabled to avoid a crash-loop (install torch where '
+                       'the child resolves it to enable embodied-AI)')
         else:
             _reason = 'remote HEVOLVEAI_API_URL -- supervisor not started'
         return {'should_run': False, 'reason': _reason}
