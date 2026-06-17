@@ -5148,10 +5148,25 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         start = 0
         for i, m in enumerate(msgs):
             c = m.get('content') if isinstance(m, dict) else None
-            if isinstance(c, str) and f'Execute Action {action_id}' in c:
+            # Trailing ':' delimiter is required — dispatch markers are
+            # 'Execute Action N: ...', so without the colon 'Execute Action 2'
+            # also matches 'Execute Action 20:'..'29:' and banks the wrong
+            # action's tool calls for flows with >=10 actions (CREATE routinely
+            # decomposes into 11-23).
+            if isinstance(c, str) and f'Execute Action {action_id}:' in c:
                 start = i
+        # Window ENDS at the next action's dispatch so a later action's tool
+        # calls don't bleed into this one (the trace can hold later dispatches
+        # when banking runs at/after a flow boundary). start is THIS action's
+        # last dispatch, so the next 'Execute Action ' marker is a different one.
+        end = len(msgs)
+        for j in range(start + 1, len(msgs)):
+            cj = msgs[j].get('content') if isinstance(msgs[j], dict) else None
+            if isinstance(cj, str) and 'Execute Action ' in cj:
+                end = j
+                break
         steps = []
-        for m in msgs[start:]:
+        for m in msgs[start:end]:
             if not isinstance(m, dict):
                 continue
             for tc in (m.get('tool_calls') or []):
