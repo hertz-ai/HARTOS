@@ -485,15 +485,24 @@ def federation_inbox():
 
 @discovery_bp.route('/api/social/federation/outbox')
 def federation_outbox():
-    """Serve recent local posts for peers to pull."""
+    """Serve recent local PUBLIC posts for peers to pull."""
     from .models import get_db, Post
     from .peer_discovery import gossip
+    from .privacy import is_public
     db = get_db()
     try:
         limit = min(int(request.args.get('limit', 20)), 100)
-        posts = db.query(Post).filter(
+        # Privacy gate (#47 egress side): peers pull this outbox — including the
+        # C4 CDN-fallback retrieval path — so it MUST apply the SAME canonical
+        # is_public gate as the write side (federation.sync_to_parent /
+        # push_to_followers).  Without it, friends/community/private posts leak
+        # to any peer that GETs /outbox.  Fetch a bounded candidate window,
+        # then filter public-only via the single-source helper, then cap.
+        candidates = db.query(Post).filter(
             Post.is_deleted == False
-        ).order_by(Post.created_at.desc()).limit(limit).all()
+        ).order_by(Post.created_at.desc()).limit(max(limit * 5, 100)).all()
+        posts = [p for p in candidates
+                 if is_public(getattr(p, 'privacy', None))][:limit]
         return jsonify({
             'success': True,
             'node_id': gossip.node_id,
