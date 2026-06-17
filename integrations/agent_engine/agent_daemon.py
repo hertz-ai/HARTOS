@@ -165,6 +165,20 @@ class AgentDaemon:
         self._thread.start()
         logger.info(f"Agent daemon started (interval={self._interval}s)")
 
+    def run_forever(self):
+        """Start the daemon and BLOCK — the foreground entrypoint for systemd.
+
+        start() spawns the worker thread and returns immediately; a systemd
+        ExecStart (nixos/modules/hart-agent.nix calls AgentDaemon().run_forever())
+        needs the process to stay alive, so we start then join the worker. If the
+        worker thread ever exits this returns and systemd's Restart=on-failure
+        relaunches the unit. Without this method the unit crashed on boot with
+        AttributeError: 'AgentDaemon' object has no attribute 'run_forever'.
+        """
+        self.start()
+        if self._thread is not None:
+            self._thread.join()
+
     def stop(self):
         with self._lock:
             self._running = False
