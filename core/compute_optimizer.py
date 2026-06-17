@@ -84,6 +84,19 @@ DISK_HIGH_THRESHOLD = float(os.environ.get('OPTIMIZER_DISK_HIGH', '90'))
 # Monitor loop sleeps this long between threshold checks (seconds)
 MONITOR_INTERVAL = float(os.environ.get('OPTIMIZER_MONITOR_INTERVAL', '15'))
 
+# Minimum seconds between the EXPENSIVE per-process walk (process_iter +
+# memory_percent per PID, GIL-bound on Windows).  A breach can persist for
+# minutes; without this the walk fires every MONITOR_INTERVAL while the box is
+# hot — holding the GIL and starving the HTTP/SSE event loop exactly when the
+# system is already loaded (the optimizer becoming the load).  Bounds the
+# per-process GIL cost to one walk per cooldown no matter how long the breach
+# lasts; the cheap aggregate path still runs every tick for responsiveness.
+TOPPROC_SCAN_COOLDOWN = float(os.environ.get('OPTIMIZER_TOPPROC_COOLDOWN', '60'))
+
+# Release the GIL every N PIDs during the per-process walk so the HTTP/SSE
+# event loop interleaves with it instead of stalling for the whole iteration.
+TOPPROC_YIELD_EVERY = int(os.environ.get('OPTIMIZER_TOPPROC_YIELD_EVERY', '50'))
+
 # Hive exploration: random interval bounds (seconds)
 HIVE_EXPLORE_MIN = float(os.environ.get('OPTIMIZER_HIVE_MIN', '300'))   # 5 min
 HIVE_EXPLORE_MAX = float(os.environ.get('OPTIMIZER_HIVE_MAX', '1800'))  # 30 min
@@ -195,6 +208,10 @@ class ComputeOptimizer:
         # Snapshot history (bounded)
         self._snapshots: collections.deque = collections.deque(maxlen=60)
         self._last_snapshot: Optional[SystemSnapshot] = None
+        # Last time the expensive per-process walk ran (monotonic wall clock).
+        # Gates the walk to once per TOPPROC_SCAN_COOLDOWN so a sustained
+        # breach can't re-walk every tick and starve the server's GIL.
+        self._last_topproc_ts: float = 0.0
 
         # Optimization history (bounded)
         self._history: collections.deque = collections.deque(maxlen=HISTORY_MAXLEN)
@@ -356,18 +373,22 @@ class ComputeOptimizer:
     def _collect_top_processes(self, snap: SystemSnapshot) -> None:
         """Populate snap.top_processes via psutil.process_iter (expensive).
 
-        WHY GATED: ``psutil.process_iter(['memory_percent'])`` on Windows
-        walks every PID and issues OpenProcess + GetProcessMemoryInfo
-        per process, all under the GIL.  On a typical Windows box
-        (~150-300 PIDs) that's 200ms-2s of GIL-held CPU per call — which,
-        fired every MONITOR_INTERVAL seconds, periodically stalls WAMP
-        heartbeats, the chat hot path, and daemon yield gates.  py-spy
-        thread dumps caught exactly this loop active+gil.  The data is
-        only read by ``_suggest_optimizations`` when a threshold is
-        breached; emitting an empty list when nothing is hot costs
-        nothing downstream.  Gate covers cpu/ram/swap/disk so any
-        breach (incl. 89.5% RAM situations) still gets the per-process
-        detail it needs.
+        ``psutil.process_iter(['memory_percent'])`` on Windows walks every PID
+        and issues OpenProcess + GetProcessMemoryInfo per process, ALL under the
+        GIL — seconds of GIL-held CPU on a loaded box (~150-300 PIDs).  Fired
+        every MONITOR_INTERVAL while a breach persists, it starves the Hypercorn
+        event loop so HTTP/SSE/chat hang: the optimizer meant to RELIEVE load
+        BECOMES the load (py-spy caught this loop active+gil while every dynamic
+        route timed out, 2026-06-17).  Three layers keep the system responsive
+        in ANY state — this scan must never make a hot box hang harder:
+          1. breach-gate  — only worth walking when a process is actually hot;
+          2. cooldown     — at most one walk per TOPPROC_SCAN_COOLDOWN even
+             under a sustained breach (reuse the previous result in between), so
+             the per-process GIL cost stays bounded however long the box is hot;
+          3. GIL yield    — release the GIL every TOPPROC_YIELD_EVERY PIDs so a
+             single walk interleaves with the server instead of blocking it.
+        The data is only read by ``_suggest_optimizations`` on a breach; an
+        empty list when nothing is hot costs nothing downstream.
         """
         psutil = _try_import_psutil()
         if psutil is None:
@@ -377,9 +398,20 @@ class ComputeOptimizer:
                 or snap.swap_percent > SWAP_HIGH_THRESHOLD
                 or snap.disk_usage_percent > DISK_HIGH_THRESHOLD):
             return
+        # Cooldown: under a sustained breach, reuse the last walk's result rather
+        # than re-walking every tick — this is what stops the optimizer from
+        # GIL-starving the server while the box stays hot.
+        now = time.time()
+        if now - self._last_topproc_ts < TOPPROC_SCAN_COOLDOWN:
+            prev = self._last_snapshot
+            if prev is not None and prev.top_processes:
+                snap.top_processes = prev.top_processes
+            return
+        self._last_topproc_ts = now
         try:
             procs = []
-            for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+            for i, proc in enumerate(psutil.process_iter(
+                    ['pid', 'name', 'cpu_percent', 'memory_percent'])):
                 info = proc.info
                 if info.get('cpu_percent', 0) > 0.1:
                     procs.append({
@@ -388,6 +420,10 @@ class ComputeOptimizer:
                         'cpu_percent': round(info.get('cpu_percent', 0), 1),
                         'mem_percent': round(info.get('memory_percent', 0), 1),
                     })
+                # Release the GIL periodically so the HTTP/SSE event loop can
+                # run mid-walk instead of waiting for the whole iteration.
+                if i % TOPPROC_YIELD_EVERY == 0:
+                    time.sleep(0)
             procs.sort(key=lambda p: p['cpu_percent'], reverse=True)
             snap.top_processes = procs[:10]
         except Exception:
