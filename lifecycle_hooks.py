@@ -209,10 +209,22 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                         "FSM is ActionState).", task_id, task.status, state.value)
                 else:
                     if _recover_failed:
-                        logger.info(
-                            "Reconciled stale ledger FAILED → COMPLETED for %s "
-                            "(ActionState %s authoritative — recovered work).",
-                            task_id, state.value)
+                        if _is_possible_masked_failure(_recover_failed, state):
+                            _MASKED_FAILURE_STATE['count'] += 1
+                            _n = _MASKED_FAILURE_STATE['count']
+                            # Warn ONCE per process, then debug — #56 de-spammed
+                            # this exact path; the counter is the aggregate signal.
+                            (logger.warning if _n == 1 else logger.debug)(
+                                "#139 possible MASKED FAILURE (#%d this run): ledger "
+                                "FAILED → COMPLETED for %s via TERMINATED (a forced/"
+                                "give-up terminal, NOT a verified success) — audit "
+                                "the completed count. Behaviour unchanged; preventing "
+                                "this is a policy call (#139).", _n, task_id)
+                        else:
+                            logger.info(
+                                "Reconciled stale ledger FAILED → COMPLETED for %s "
+                                "(ActionState %s authoritative — recovered work).",
+                                task_id, state.value)
                     ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
 
             # === BLOCKED REASON: set specific reason based on ActionState source ===
@@ -386,6 +398,35 @@ STALL_GUARD_INPROGRESS_ITERS = 120
 
 _STALL_STATES = (ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_REQUESTED)
 _TERMINAL_STATES = (ActionState.COMPLETED, ActionState.TERMINATED, ActionState.ERROR)
+
+
+# #139 observability counter — bumped each time the FAILED→COMPLETED recovery
+# reconcile fires via the TERMINATED (forced) terminal (a possible masked
+# failure). Module-level so diag can quantify it without log-scraping; the
+# reconcile logs a WARNING only ONCE per process (then debug), because #56
+# deliberately de-spammed this path (it WARN-spammed ~100/run) — a per-event
+# warning here would re-introduce that.
+_MASKED_FAILURE_STATE = {'count': 0}
+
+
+def _is_possible_masked_failure(recover_failed, action_state):
+    """#139 — observability for the #128 FAILED→COMPLETED recovery reconcile.
+
+    That reconcile un-traps a stalled action whose ledger was reaped to FAILED
+    when the ActionState reaches a terminal that maps to ledger COMPLETED. That
+    is a GENUINE recovery when the terminal is a verified success (COMPLETED /
+    RECIPE_RECEIVED), but a POSSIBLE MASKED FAILURE when it is TERMINATED — the
+    forced/give-up terminal #128 routes a stalled-or-failed action through. A
+    force-terminated failure flipped to COMPLETED inflates the completed count
+    and hides a genuine failure.
+
+    Pure + side-effect-free so it is unit-testable. Observability ONLY: callers
+    still apply the reconcile (the flywheel must keep recovering). PREVENTING it
+    — i.e. NOT counting a force-terminated failure as COMPLETED — is a policy
+    call (#139), deliberately not made here. Returns True only for the
+    ambiguous TERMINATED case.
+    """
+    return bool(recover_failed) and action_state == ActionState.TERMINATED
 
 
 def stall_guard_step(prev_stuck_key, prev_iters, action_id, state,
