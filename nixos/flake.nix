@@ -58,6 +58,13 @@
       # variant (gated config; lazy sway default never enters a disabled
       # closure); imported so the option exists + the nixosTest can enable it.
       ./modules/hart-session-supervisor.nix
+      # sway-as-Tier-1: the proven-in-WSL OS-native windowing session (canonical
+      # glass shell under sway) + the hart-swaymsg-shim the brain's HartWmClient
+      # drives at Tier-2. Opt-in (hart.swayTier1.enable=false default) -> no-op
+      # for every variant; NO test enables it, so it never pulls graphical-desktop
+      # (no inotify-class tie). Makes "sway-Tier-1-now" a real greeter-selectable
+      # session + gives the moat a Tier-2 shim target, instead of an orphan file.
+      ./modules/hart-sway-tier1.nix
       # Remote Desktop peripherals + casting
       ./modules/hart-peripheral-bridge.nix
       ./modules/hart-dlna.nix
