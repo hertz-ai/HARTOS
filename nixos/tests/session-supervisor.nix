@@ -44,6 +44,11 @@ in
 {
   hart-session-supervisor-tier-drop = pkgs.testers.runNixOSTest {
     name = "hart-session-supervisor-tier-drop";
+    # runNixOSTest's mypy pre-check does NOT resolve the per-node Machine global
+    # (`sup`) the driver injects at RUNTIME — same false "Name not defined" as the
+    # floor-lock test (node IS named `sup`, works at runtime). Skip the static
+    # pre-check; the VM still boots and the tier-drop assertions still run.
+    skipTypeCheck = true;
     node.specialArgs = specialArgs;
 
     nodes.sup = mkNode "desktop" {
