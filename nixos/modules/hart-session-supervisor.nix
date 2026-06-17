@@ -353,6 +353,15 @@ in
       "d /run/hart      0750 hart hart -"
     ];
 
+    # Enabling greetd (below) pulls in upstream nixos graphical-desktop.nix,
+    # which sets fs.inotify.max_user_watches via mkDefault — the SAME option
+    # hart-base.nix also sets via mkDefault, and two equal-priority mkDefaults
+    # collide ("defined multiple times"). Resolve the tie HERE, gated to the
+    # supervisor that introduces greetd→graphical-desktop; the value is identical
+    # (524288) so behaviour is unchanged — only the priority tie is broken. Found
+    # by the wired-in nixosTest's CI eval (the gate working as intended).
+    boot.kernel.sysctl."fs.inotify.max_user_watches" = lib.mkForce 524288;
+
     # ── greetd: the out-of-process supervisor (NOT a Python thread) ──
     # greetd relaunches its session command whenever the session exits, which
     # is exactly the relaunch primitive the selector wrapper rides on. The
