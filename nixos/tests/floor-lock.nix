@@ -64,6 +64,21 @@ in
       # without importing the full ISO config. The minimal node enables the
       # desktop variant, which registers the kiosk session + the :6800 server.
       services.displayManager.defaultSession = pkgs.lib.mkForce "hart-shell";
+      # A display manager must be active for services.displayManager.sessionPackages
+      # (hart-liquid-ui's kioskSession) to register the hart-shell wayland-session
+      # into the system path; the minimal node has none (full desktop.nix uses
+      # GDM). greetd is the light DM the supervisor nixosTest already proved boots
+      # here. It pulls graphical-desktop.nix -> the fs.inotify mkDefault tie, so
+      # force it (identical 524288); force GDM off so two DMs don't fight the seat.
+      services.greetd = {
+        enable = true;
+        settings.default_session = {
+          command = "hart-shell-session";
+          user = "hart-admin";
+        };
+      };
+      services.xserver.displayManager.gdm.enable = pkgs.lib.mkForce false;
+      boot.kernel.sysctl."fs.inotify.max_user_watches" = pkgs.lib.mkForce 524288;
     };
 
     testScript = ''
