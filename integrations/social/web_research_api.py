@@ -25,31 +25,17 @@ web_research_bp = Blueprint('web_research', __name__, url_prefix='/api/web-resea
 
 
 def _maybe_require_local_or_token(view_fn):
-    """Apply Nunba's local-or-token auth decorator if available.
+    """Apply the canonical local-or-token auth decorator.
 
-    Lazy import keeps this blueprint importable on the HARTOS side where the
-    decorator may live in Nunba's main.py (cross-repo).  In the worst case
-    (decorator unavailable), the blueprint refuses non-local requests via
-    `_local_only_fallback` below — never wide-open.
+    Uses core.auth_local — the single HARTOS-canonical decorator, always
+    importable in both standalone and the Nunba bundle.  The prior code imported
+    from `main` (which doesn't exist on the HARTOS side), so it fell through to a
+    weaker IP-only fallback that trusted request.remote_addr and FAILED OPEN
+    behind a localhost reverse proxy (all requests appear as 127.0.0.1).  Routing
+    to the canonical decorator removes that parallel, weaker auth path (#review).
     """
-    try:
-        from main import require_local_or_token  # Nunba's canonical decorator
-        return require_local_or_token(view_fn)
-    except ImportError:
-        return _local_only_fallback(view_fn)
-
-
-def _local_only_fallback(view_fn):
-    """Last-resort guard: only accept requests from 127.0.0.1 / ::1."""
-    from functools import wraps
-
-    @wraps(view_fn)
-    def wrapper(*args, **kwargs):
-        remote = (request.remote_addr or '').strip()
-        if remote not in ('127.0.0.1', '::1', 'localhost'):
-            return jsonify({'error': 'local-only endpoint'}), 403
-        return view_fn(*args, **kwargs)
-    return wrapper
+    from core.auth_local import require_local_or_token
+    return require_local_or_token(view_fn)
 
 
 @web_research_bp.route('/probe', methods=['GET'])
