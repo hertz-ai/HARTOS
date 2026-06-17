@@ -910,6 +910,9 @@ STREAM_INTERIM_WINDOW_BYTES = (
 STREAM_VAD_RMS_THRESHOLD = 400      # PCM16 RMS below this == silence (speech ~1-5k)
 STREAM_VAD_SILENCE_MS = 800         # trailing silence after speech that ends an utterance
 STREAM_VAD_MIN_SPEECH_MS = 300      # require this much speech first (ignore leading silence)
+# Cap the per-chunk RMS sum to a bounded tail so the GIL-held Python loop on
+# the async STT handler doesn't scale with chunk size (~100ms @ 16kHz).
+STREAM_RMS_MAX_SAMPLES = int(os.environ.get('HEVOLVE_STT_RMS_MAX_SAMPLES', '1600'))
 
 
 def _pcm_rms(pcm: bytes) -> float:
@@ -926,6 +929,11 @@ def _pcm_rms(pcm: bytes) -> float:
     samples.frombytes(pcm[:n])
     if not samples:
         return 0.0
+    # Bound the GIL-held sum to a recent tail — end-of-utterance VAD only needs
+    # recent energy, and an unbounded per-chunk loop on the async handler would
+    # grow with chunk size.
+    if len(samples) > STREAM_RMS_MAX_SAMPLES:
+        samples = samples[-STREAM_RMS_MAX_SAMPLES:]
     acc = 0
     for s in samples:
         acc += s * s
