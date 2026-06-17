@@ -305,6 +305,38 @@ def _get_faster_whisper_model(model_size: str = "base"):
     return _faster_whisper_model
 
 
+# ── Anti-hallucination gate: "did a human actually speak, or is this noise?" ──
+# faster-whisper's vad_filter strips silent AUDIO regions before decoding, but a
+# short noise/music burst that VAD mis-reads as speech still decodes to a
+# hallucinated phrase (the classic "さて、さて、もみ" / "Thank you for watching" on
+# near-silence — submitted as a chat message, it makes the model reply in the
+# hallucinated language).  The reliable post-decode signals are the per-segment
+# no_speech_prob (P[this window is non-speech]) and avg_logprob (token
+# confidence).  These are Whisper's OWN thresholds, so the gate matches the
+# model's internal silence definition rather than inventing new numbers.
+NO_SPEECH_PROB_MAX = 0.6   # openai-whisper's default no_speech_threshold
+AVG_LOGPROB_MIN = -1.0     # openai-whisper's default logprob_threshold
+
+
+def _filter_speech_text(segments) -> str:
+    """Join only the segments that are real speech; drop silence/noise.
+
+    ``segments`` is an iterable of ``(text, no_speech_prob, avg_logprob)``.
+    Single source for the anti-hallucination gate shared by the faster-whisper
+    and openai-whisper (legacy) transcribe paths — no parallel filter.  A
+    segment is kept only when BOTH signals look like speech; a missing signal
+    (None) is treated as speech so we never over-drop when a backend doesn't
+    report it.
+    """
+    kept = []
+    for text, no_speech_prob, avg_logprob in segments:
+        nsp = no_speech_prob if no_speech_prob is not None else 0.0
+        alp = avg_logprob if avg_logprob is not None else 0.0
+        if nsp <= NO_SPEECH_PROB_MAX and alp >= AVG_LOGPROB_MIN:
+            kept.append((text or '').strip())
+    return " ".join(t for t in kept if t).strip()
+
+
 def _faster_whisper_transcribe(audio_path: str, language: str = None) -> Optional[str]:
     """Transcribe using faster-whisper. Returns JSON string or None on failure.
 
@@ -345,11 +377,21 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None) -> Optiona
         if language:
             kwargs["language"] = language
         segments, info = model.transcribe(audio_path, **kwargs)
-        text = " ".join(seg.text for seg in segments).strip()
+        # Speech-only join: drop silence/noise hallucinations via the shared
+        # no_speech_prob/avg_logprob gate (vad_filter alone still lets a short
+        # noise burst decode to a hallucinated phrase).
+        text = _filter_speech_text(
+            (seg.text, getattr(seg, 'no_speech_prob', None),
+             getattr(seg, 'avg_logprob', None))
+            for seg in segments
+        )
         _record_whisper_success()
         return json.dumps({
             "text": text,
-            "language": info.language if info.language else "unknown",
+            # Nothing survived the speech gate → the window was noise/silence.
+            # Report 'unknown', not the language Whisper hallucinated from the
+            # noise (fixes wrong-language replies to non-speech audio).
+            "language": (info.language if (text and info.language) else "unknown"),
         })
     except Exception as e:
         reason = f"transcribe({audio_path}) failed: {e}"
@@ -498,9 +540,20 @@ def _legacy_transcribe(audio_path: str, language: str = None) -> Optional[str]:
         if language:
             kwargs["language"] = language
         result = model.transcribe(audio_path, **kwargs)
+        # Same speech-only gate as the faster-whisper path (shared helper).
+        # openai-whisper exposes per-segment no_speech_prob/avg_logprob in
+        # result['segments']; if segments are absent, fall back to raw text.
+        segs = result.get("segments") or []
+        if segs:
+            text = _filter_speech_text(
+                (s.get("text", ""), s.get("no_speech_prob"), s.get("avg_logprob"))
+                for s in segs
+            )
+        else:
+            text = (result.get("text") or "").strip()
         return json.dumps({
-            "text": result["text"].strip(),
-            "language": result.get("language", "unknown"),
+            "text": text,
+            "language": (result.get("language", "unknown") if text else "unknown"),
         })
     except ImportError:
         return None
