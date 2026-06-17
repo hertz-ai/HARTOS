@@ -81,15 +81,21 @@ in
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
 
-        # Resource limits — scale by variant
+        # Resource limits — scale by variant. The backend boot-imports the full
+        # ML stack (langchain/chromadb/autogen) + 24-50 waitress thread stacks;
+        # the old caps (1G desktop / 2G server) were OVERRUN, so the cgroup denied
+        # new thread stacks -> RuntimeError: can't start new thread (caught by the
+        # e2e boot smoke, and it would bite real hardware too — the cap is the
+        # same there). Give the ML init real headroom; edge stays minimal (no
+        # heavy ML), so its small cap is correct.
         MemoryMax = if cfg.variant == "edge" then "384M"
-                    else if cfg.variant == "desktop" then "1G"
-                    else "2G";
+                    else if cfg.variant == "desktop" then "3G"
+                    else "4G";
         MemoryHigh = if cfg.variant == "edge" then "256M"
-                     else if cfg.variant == "desktop" then "768M"
-                     else "1536M";
+                     else if cfg.variant == "desktop" then "2560M"
+                     else "3584M";
         CPUWeight = if cfg.variant == "edge" then 50 else 100;
-        TasksMax = if cfg.variant == "edge" then 32 else 256;
+        TasksMax = if cfg.variant == "edge" then 32 else 512;
         IOWeight = if cfg.variant == "edge" then 50 else 100;
 
         StandardOutput = "journal";
