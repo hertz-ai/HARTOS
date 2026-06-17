@@ -266,10 +266,10 @@ def build_channel_tool_closures(ctx):
                                 "for %s: %s", channel_type, probe_err,
                             )
                             try:
-                                from core.platform.service_registry import (
-                                    ServiceRegistry,
+                                from core.platform.registry import (
+                                    get_registry,
                                 )
-                                _lui = ServiceRegistry.get('LiquidUIService')
+                                _lui = get_registry().get_or_none('LiquidUIService')
                                 if _lui:
                                     _lui.agent_ui_update(_probe_uid, {
                                         'type': 'toast',
@@ -833,8 +833,8 @@ def build_channel_tool_closures(ctx):
                 db.close()
             # User-visible toast confirming the action.
             try:
-                from core.platform.service_registry import ServiceRegistry
-                _lui = ServiceRegistry.get('LiquidUIService')
+                from core.platform.registry import get_registry
+                _lui = get_registry().get_or_none('LiquidUIService')
                 if _lui:
                     _lui.agent_ui_update(uid, {
                         'type': 'toast', 'severity': 'info',

@@ -583,8 +583,8 @@ class AgentBridgeWorker:
         the agent engine), the emit is a logged no-op.
         """
         try:
-            from core.platform.service_registry import ServiceRegistry
-            svc = ServiceRegistry.get('LiquidUIService')
+            from core.platform.registry import get_registry
+            svc = get_registry().get_or_none('LiquidUIService')
         except Exception as e:
             logger.debug(
                 "AgentBridgeWorker._emit_meet_copilot: ServiceRegistry "

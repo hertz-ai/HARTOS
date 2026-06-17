@@ -1,0 +1,74 @@
+# ═══════════════════════════════════════════════════════════════
+# HART-comp — the HART OS AI-native Wayland compositor (SKELETON)
+# ═══════════════════════════════════════════════════════════════
+#
+# STATUS: COMPILE-PENDING SKELETON. This crate is a Phase-3 tinywl-class
+# scaffold. It is authored on a Windows dev box where NO Wayland/KMS/Smithay
+# build can run, so it is NOT yet compiled. Every paint / DRM scanout / libinput
+# / layer-shell mount claim is VM-pending (CI nixosTest on an llvmpipe software-GL
+# VM, or local QEMU-KVM). See ../docs/architecture/HART_OS_NATIVE_ARCHITECTURE.md
+# §L1 and ./ROADMAP.md Phase 3.
+#
+# Ordering invariant (ROADMAP §"Ordering principle"): Smithay HART-comp is a
+# LATER moat upgrade behind a sway-as-Tier-1 fast path. sway already ships
+# OS-native windowing TODAY (nixos/modules/hart-sway-tier1.nix); this crate is
+# the eventual first-party compositor that owns the agent-driven window tree.
+#
+# The buildRustPackage PRECEDENT for the June-2025 nixpkgs pin (50ab793) is
+# proven FIRST on an existing crate (claw_native/rust) via
+# nixos/modules/hart-rust-precedent.nix, before this crate's Nix module
+# (nixos/modules/hart-comp.nix) depends on the toolchain resolving.
+
+[package]
+name = "hart-comp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "HART OS AI-native Wayland compositor (Smithay) — Phase-3 skeleton, compile-pending"
+# rust-version pinned conservatively to what the June-2025 nixpkgs pin (50ab793)
+# ships, so the buildRustPackage in hart-comp.nix resolves on the SAME toolchain
+# the hart-rust-precedent.nix module proves first.
+rust-version = "1.77"
+
+[[bin]]
+name = "hart-comp"
+path = "src/main.rs"
+
+[dependencies]
+# Phase-3 skeleton is PURE LOGIC (render-path decision + boot-config + the
+# never-fail-floor invariant). main.rs does NOT yet link Smithay/calloop — the
+# `use smithay::...` block there is a COMMENTED manifest of the shape the real
+# compositor needs. Declaring those deps before the code uses them only breaks
+# the build, because:
+#   * Smithay is NOT published to crates.io with the modern API — crates.io
+#     `smithay 0.3.0` (2022) lacks the `desktop` AND `renderer_pixman` features
+#     this compositor needs (VERIFIED live: `cargo build` fails to select 0.3.0
+#     with feature `desktop`). The real dep is GIT Smithay pinned to a rev:
+#       smithay = { git = "https://github.com/Smithay/smithay", rev = "<pinned>",
+#         default-features = false, features = [
+#           "backend_drm", "backend_gbm", "backend_libinput", "backend_udev",
+#           "backend_session_libseat", "renderer_pixman", "wayland_frontend",
+#           "desktop" ] }
+#       calloop = "0.13"
+#     + a committed Cargo.lock, vendored + hashed in hart-comp.nix, proven on the
+#     nixpkgs pin via hart-rust-precedent.nix FIRST (ROADMAP Phase 3). They come
+#     back when the integration lands in CI — where Smithay can actually compile.
+# Until then the skeleton keeps a minimal, COMPILING dep set + a behavioural
+# never-fail-floor test floor (see #[cfg(test)] in main.rs).
+
+# Structured logging — journal-friendly (the systemd unit captures stdout/stderr).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+# Optimize for size + a clean software path; the compositor must paint on any GPU.
+opt-level = 2
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[lints.rust]
+# Match the workspace discipline in claw_native/rust: forbid unsafe in our own
+# glue. Smithay's FFI lives behind its own crate boundary.
+unsafe_code = "forbid"

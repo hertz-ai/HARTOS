@@ -1118,6 +1118,48 @@ class ModelLifecycleManager:
             )
             self._handle_dead_process(tool_name, exit_code, proc_type)
 
+    def _record_llm_alive(self):
+        """Record that the main (external/adopted) llama-server answered an
+        HTTP health probe.
+
+        Single source for "the main engine is alive" so BOTH the
+        stateless-probe branch (no ``'llm'`` state yet) and the adopted-server
+        branch (a stale ``'llm'`` state stuck at UNLOADED because the server
+        was spawned outside ``RuntimeToolManager``) converge on the same
+        ACTIVE/GPU bookkeeping.
+
+        Without this heal the adopted branch left ``state.device == UNLOADED``
+        forever, so ``_check_llm_health`` re-logged a false
+        ``state.device=UNLOADED`` warning every tick (#125) and
+        ``_update_priorities`` skipped the engine entirely. The model was never
+        actually unloading — only the bookkeeping was stale.
+
+        Idempotent: a non-None, already-loaded state is left untouched.
+        ``GPU`` is a best-effort default (mirrors the original stateless-probe
+        registration); the engine runs GPU-loaded on this class of node.
+        """
+        with self._lock:
+            state = self._models.get('llm')
+            if state is None:
+                self._models['llm'] = ModelState(
+                    name='llm',
+                    device=ModelDevice.GPU,  # Best-effort default
+                    priority=ModelPriority.ACTIVE,
+                    vram_gb=0.0,
+                    ram_gb=0.0,
+                    last_access_time=time.time(),
+                    crash_count=0,
+                    pressure_evict_only=True,
+                )
+            elif state.device == ModelDevice.UNLOADED:
+                # Adopted server is alive but state was stale (spawned outside
+                # RTM -> never marked loaded). Heal in place so the next tick
+                # takes the fast path and stops logging a false UNLOADED.
+                state.device = ModelDevice.GPU
+                state.priority = ModelPriority.ACTIVE
+                state.crash_count = 0
+                state.last_access_time = time.time()
+
     def _check_llm_health(self, dead_models: list):
         """Check llama.cpp server health (separate from RTM sidecar tools).
 
@@ -1194,17 +1236,7 @@ class ModelLifecycleManager:
                         f"but had no registered state — registering now so "
                         f"future ticks can supervise it."
                     )
-                    with self._lock:
-                        self._models['llm'] = ModelState(
-                            name='llm',
-                            device=ModelDevice.GPU,  # Best-effort default
-                            priority=ModelPriority.ACTIVE,
-                            vram_gb=0.0,
-                            ram_gb=0.0,
-                            last_access_time=time.time(),
-                            crash_count=0,
-                            pressure_evict_only=True,
-                        )
+                    self._record_llm_alive()
                     return
             except ImportError:
                 logger.debug(
@@ -1273,6 +1305,11 @@ class ModelLifecycleManager:
                     logger.debug(
                         "[LLM-WATCHDOG] Adopted llama-server alive (HTTP 200)"
                     )
+                    # Heal a stale UNLOADED bookkeeping field: the server was
+                    # spawned outside RTM so its 'llm' state can be stuck at
+                    # UNLOADED even though it is serving. Without this, line
+                    # ~1222 re-logs a false UNLOADED every tick (#125).
+                    self._record_llm_alive()
         except ImportError as e:
             # Previous code: `except ImportError: pass` — silent.  Surface
             # this as a log line so when Nunba is bundled-without-supervisor

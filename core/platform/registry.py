@@ -193,6 +193,23 @@ class ServiceRegistry:
         """Check if a service is registered."""
         return name in self._entries
 
+    def get_or_none(self, name: str) -> Any:
+        """Get a service instance, or None if not registered.
+
+        The KeyError-safe accessor — use when a missing service is a NORMAL
+        condition (e.g. an optional UI service absent on a headless node)
+        rather than a programming error.  Still surfaces a RuntimeError if the
+        factory itself fails (a real error worth seeing).  This is the one
+        canonical "reach an optional service" call — callers must not invent
+        their own try/except or call .get() on the class.
+        """
+        if not self.has(name):
+            return None
+        try:
+            return self.get(name)
+        except KeyError:
+            return None
+
     def names(self) -> List[str]:
         """Return all registered service names."""
         return list(self._entries.keys())

@@ -2795,6 +2795,15 @@ def _request_screen_consent(input_text: str) -> str:
 
 def _handle_screenshot_tool(input_text: str) -> str:
     """Take screenshot and describe using VLM."""
+    # AI senses kill-switch: refuse to grab the screen when the human has cut
+    # the AI's 'screen' sense — "humans are always in control", enforced at the
+    # grab (not advisory).  Mirrors the mic gate at /api/voice.
+    try:
+        from core.ai_sensing import allowed
+        if not allowed('screen'):
+            return "Screen access is turned off by the user (AI senses kill-switch)."
+    except Exception:
+        pass
     try:
         from PIL import ImageGrab
         import base64, io

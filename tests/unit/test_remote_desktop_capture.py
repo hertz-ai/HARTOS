@@ -8,8 +8,9 @@ from unittest.mock import patch, MagicMock, PropertyMock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from integrations.remote_desktop.frame_capture import (
-    FrameCapture, FrameConfig, _CaptureCircuitBreaker,
+    FrameCapture, FrameConfig,
 )
+from core.circuit_breaker import KeyedCircuitBreaker
 from integrations.remote_desktop.input_handler import InputHandler
 from integrations.remote_desktop.clipboard_sync import ClipboardSync
 
@@ -39,11 +40,11 @@ class TestCircuitBreaker(unittest.TestCase):
     """Circuit breaker for capture backends."""
 
     def test_initially_closed(self):
-        cb = _CaptureCircuitBreaker(threshold=3)
+        cb = KeyedCircuitBreaker(threshold=3)
         self.assertFalse(cb.is_open('mss'))
 
     def test_opens_after_threshold(self):
-        cb = _CaptureCircuitBreaker(threshold=3)
+        cb = KeyedCircuitBreaker(threshold=3)
         cb.record_failure('mss')
         cb.record_failure('mss')
         self.assertFalse(cb.is_open('mss'))
@@ -51,7 +52,7 @@ class TestCircuitBreaker(unittest.TestCase):
         self.assertTrue(cb.is_open('mss'))
 
     def test_success_resets_count(self):
-        cb = _CaptureCircuitBreaker(threshold=3)
+        cb = KeyedCircuitBreaker(threshold=3)
         cb.record_failure('mss')
         cb.record_failure('mss')
         cb.record_success('mss')
@@ -60,14 +61,14 @@ class TestCircuitBreaker(unittest.TestCase):
         self.assertFalse(cb.is_open('mss'))
 
     def test_independent_backends(self):
-        cb = _CaptureCircuitBreaker(threshold=2)
+        cb = KeyedCircuitBreaker(threshold=2)
         cb.record_failure('mss')
         cb.record_failure('mss')
         self.assertTrue(cb.is_open('mss'))
         self.assertFalse(cb.is_open('pyautogui'))
 
     def test_reset(self):
-        cb = _CaptureCircuitBreaker(threshold=2)
+        cb = KeyedCircuitBreaker(threshold=2)
         cb.record_failure('mss')
         cb.record_failure('mss')
         self.assertTrue(cb.is_open('mss'))
@@ -97,7 +98,13 @@ class TestFrameCapture(unittest.TestCase):
     def test_capture_frame_returns_none_when_all_fail(self):
         """Returns None when all backends are circuit-broken."""
         fc = FrameCapture()
-        fc._circuit._open = {'dxcam', 'mss', 'pyautogui'}
+        # Open every backend's circuit via the PUBLIC api (KeyedCircuitBreaker
+        # holds per-key CircuitBreakers, not a pokeable _open set) — enough
+        # failures to cross the threshold opens each.
+        for backend in ('dxcam', 'mss', 'pyautogui'):
+            for _ in range(10):
+                fc._circuit.record_failure(backend)
+            self.assertTrue(fc._circuit.is_open(backend))
         result = fc.capture_frame()
         self.assertIsNone(result)
 

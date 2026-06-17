@@ -18,8 +18,10 @@ Models downloaded lazily on first use to ~/.hevolve/models/stt/
 100% local, zero cloud costs — Nunba is forever free.
 """
 
+import array
 import json
 import logging
+import math
 import os
 import tarfile
 import urllib.request
@@ -933,6 +935,97 @@ STREAM_INTERIM_WINDOW_BYTES = (
     * STREAM_INTERIM_WINDOW_SECONDS
 )
 
+# ── Server-side VAD pause-finalization (#131) ────────────────────────
+# The streaming server finalizes on three signals: an explicit client
+# {control:final}, a 30s max-buffer flush, OR — added here — a detected
+# end-of-utterance silence.  The first relied entirely on the client being
+# smart enough to send {control:final}; a raw-PCM feeder (or a client that
+# never signals end-of-speech) would otherwise only ever finalize on the 30s
+# overflow.  Energy-based silence detection makes finalization robust for ANY
+# client without changing the client-driven path (both still fire).
+STREAM_VAD_RMS_THRESHOLD = 400      # PCM16 RMS below this == silence (speech ~1-5k)
+STREAM_VAD_SILENCE_MS = 800         # trailing silence after speech that ends an utterance
+STREAM_VAD_MIN_SPEECH_MS = 300      # require this much speech first (ignore leading silence)
+
+
+def _pcm_rms(pcm: bytes) -> float:
+    """Root-mean-square amplitude of PCM16LE mono ``pcm`` (0.0 == digital silence).
+
+    Pure + stdlib-only (``array``) so ``_StreamVadGate`` stays unit-testable
+    without numpy / faster-whisper loaded.  Single source for "how loud is this
+    chunk" — the handler calls this, not its own inline RMS.
+    """
+    n = len(pcm) - (len(pcm) % 2)
+    if n <= 0:
+        return 0.0
+    samples = array.array('h')
+    samples.frombytes(pcm[:n])
+    if not samples:
+        return 0.0
+    acc = 0
+    for s in samples:
+        acc += s * s
+    return math.sqrt(acc / len(samples))
+
+
+class _StreamVadGate:
+    """Energy-based end-of-utterance detector for the streaming STT server.
+
+    Pure decision logic (no I/O, no model) so it is unit-testable in isolation:
+    feed each chunk's RMS energy + duration; ``update`` returns True exactly
+    once per utterance — when enough speech has been seen AND a trailing
+    silence gap then exceeds the threshold.  Fires once, then re-arms on the
+    next speech (auto-reset), so continued silence does not re-fire.
+    """
+
+    def __init__(self, rms_threshold: float = STREAM_VAD_RMS_THRESHOLD,
+                 silence_ms: float = STREAM_VAD_SILENCE_MS,
+                 min_speech_ms: float = STREAM_VAD_MIN_SPEECH_MS):
+        self.rms_threshold = rms_threshold
+        self.silence_ms = silence_ms
+        self.min_speech_ms = min_speech_ms
+        self._speech_ms = 0.0
+        self._silence_ms = 0.0
+
+    def update(self, rms: float, chunk_ms: float) -> bool:
+        """Feed one audio chunk. Returns True iff this chunk completes an
+        end-of-utterance pause (speech seen, then silence ≥ threshold)."""
+        if rms >= self.rms_threshold:
+            self._speech_ms += chunk_ms
+            self._silence_ms = 0.0
+            return False
+        # Silence chunk — only counts once we've heard enough speech, so
+        # leading/standalone silence never finalizes an empty buffer.
+        if self._speech_ms < self.min_speech_ms:
+            return False
+        self._silence_ms += chunk_ms
+        if self._silence_ms >= self.silence_ms:
+            self.reset()  # one final per utterance; next speech re-arms
+            return True
+        return False
+
+    def reset(self):
+        self._speech_ms = 0.0
+        self._silence_ms = 0.0
+
+
+async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bool:
+    """Transcribe the FULL accumulated buffer and emit one final result.
+
+    Single source for finalization, shared by the {control:final}, 30s
+    max-buffer flush, and VAD pause-finalize paths so all three behave
+    identically (no parallel finalization logic — #131 Gate-2/4).  Returns
+    whether a non-empty transcription was sent.  Caller resets the buffer +
+    VAD gate (those are caller-local).
+    """
+    text, lang = _transcribe_buffer(audio_buffer, language=stt_lang)
+    if text:
+        await websocket.send(json.dumps({
+            'text': text, 'language': lang, 'is_final': True,
+        }))
+        _maybe_enqueue_call_segment(call_id, user_id, text, lang, True)
+    return bool(text)
+
 
 def _ws_path(websocket) -> str:
     """Best-effort URL-path extractor across websockets lib versions.
@@ -1054,6 +1147,10 @@ async def _stt_stream_handler(websocket):
 
     audio_buffer = io.BytesIO()
     last_transcribe_size = 0
+    # Server-side VAD: auto-finalizes on a detected end-of-utterance silence
+    # so finalization no longer depends solely on the client sending
+    # {control:final} (#131).  Re-arms after each final.
+    vad = _StreamVadGate()
     # Connection-level forced language, honoured from a {"type":"config",
     # "language":"<code>"} control message (the docstring's promise — the code
     # previously ignored it).  None => faster-whisper auto-detects per utterance.
@@ -1073,18 +1170,15 @@ async def _stt_stream_handler(websocket):
                     if ctrl.get('control') == 'reset':
                         audio_buffer = io.BytesIO()
                         last_transcribe_size = 0
+                        vad.reset()
                         continue
                     if ctrl.get('control') == 'final':
                         # Force final transcription of remaining buffer
-                        text, lang = _transcribe_buffer(audio_buffer, language=stt_lang)
-                        if text:
-                            await websocket.send(json.dumps({
-                                'text': text, 'language': lang, 'is_final': True,
-                            }))
-                            _maybe_enqueue_call_segment(
-                                call_id, user_id, text, lang, True)
+                        await _emit_final(
+                            websocket, audio_buffer, stt_lang, call_id, user_id)
                         audio_buffer = io.BytesIO()
                         last_transcribe_size = 0
+                        vad.reset()
                         continue
                     if ctrl.get('type') == 'config':
                         # Honour the documented {type:config, language} message:
@@ -1111,27 +1205,46 @@ async def _stt_stream_handler(websocket):
 
             if is_container:
                 # Save to temp file, let faster-whisper handle decoding
-                pcm_bytes = _container_to_pcm(message)
-                if pcm_bytes:
-                    audio_buffer.write(pcm_bytes)
+                chunk_pcm = _container_to_pcm(message) or b''
             else:
                 # Raw PCM16 mono 16kHz
-                audio_buffer.write(message)
+                chunk_pcm = bytes(message)
+            if chunk_pcm:
+                audio_buffer.write(chunk_pcm)
 
             buf_size = audio_buffer.getbuffer().nbytes
 
             # Force transcription if buffer exceeds max
             if buf_size >= STREAM_MAX_BUFFER_BYTES:
-                text, lang = _transcribe_buffer(audio_buffer, language=stt_lang)
-                if text:
-                    await websocket.send(json.dumps({
-                        'text': text, 'language': lang, 'is_final': True,
-                    }))
-                    _maybe_enqueue_call_segment(
-                        call_id, user_id, text, lang, True)
+                await _emit_final(
+                    websocket, audio_buffer, stt_lang, call_id, user_id)
                 audio_buffer = io.BytesIO()
                 last_transcribe_size = 0
+                vad.reset()
                 continue
+
+            # VAD pause-finalize: when this chunk completes an end-of-utterance
+            # silence, flush a final immediately (don't wait for the client's
+            # {control:final} or the 30s overflow).  Energy on the decoded PCM
+            # of THIS chunk; chunk_ms = bytes / (16kHz * 2 bytes/ms).
+            #
+            # GATED to continuous voice-room streams (call_id present).  The
+            # push-to-talk chat mic (call_id=None) finalizes client-side via
+            # {control:final} on mic-release; the client fires onResult (which
+            # submits) on every is_final, so an auto-final on a mid-utterance
+            # thinking pause would split one utterance into two chat
+            # submissions.  Voice rooms WANT pause segmentation (one
+            # conversational turn per pause) — so VAD runs only there, leaving
+            # the chat-mic flow's behavior unchanged.
+            if call_id and chunk_pcm:
+                chunk_ms = len(chunk_pcm) / (
+                    STREAM_SAMPLE_RATE * STREAM_BYTES_PER_SAMPLE / 1000.0)
+                if vad.update(_pcm_rms(chunk_pcm), chunk_ms):
+                    await _emit_final(
+                        websocket, audio_buffer, stt_lang, call_id, user_id)
+                    audio_buffer = io.BytesIO()
+                    last_transcribe_size = 0
+                    continue
 
             # Interim transcription every STREAM_CHUNK_BYTES.
             #

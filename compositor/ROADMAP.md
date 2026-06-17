@@ -20,6 +20,20 @@
 4. **Smithay is a later moat upgrade behind a sway-as-Tier-1 fast path** — OS-native
    windowing is not blocked on a first-ever Rust-Nix bring-up.
 
+> **Phase-3 foundations landed (dev-box-authored, VM/CI-pending):** the sway-Tier-1-now
+> fast path (`nixos/modules/hart-sway-tier1.nix` — sway single-output kiosk running the
+> canonical glass shell + a `swaymsg` agent-windowing shim), the FIRST Rust-in-Nix
+> `buildRustPackage` precedent on the existing `claw_native/rust` crate
+> (`nixos/modules/hart-rust-precedent.nix`, `cargoLock.lockFile`, pin `50ab793`), the
+> HART-comp Smithay skeleton (`compositor/Cargo.toml` + `compositor/src/main.rs` — event
+> loop + mandatory pixman software-render path + layer-shell mount, all `todo!()`/stub +
+> `compile-pending`), and its opt-in session module (`nixos/modules/hart-comp.nix`,
+> `buildRustPackage` with a fixed `cargoHash` placeholder, **defaultSession stays cage**).
+> None are compiled/booted on the Windows dev box; every paint/scanout/`swaymsg`/build
+> claim is VM-pending (CI nixosTest llvmpipe / QEMU-KVM). The three new session modules are
+> NOT yet added to the shared flake `hartModules[]` — that registration + the real
+> `cargoHash`/`Cargo.lock` are the Phase-3 CI bring-up step, gated on the build resolving.
+
 Every phase is **additive behind the watchdog**; every claim becomes a tested deliverable or
 an honestly-labeled openRisk. **A phase is NOT done until its `nixosTest` is green on the
 software-GL VM AND its supervisor fault-injection proves the floor still paints AND its
@@ -178,21 +192,43 @@ from-scratch pixman/llvmpipe software-render path proven on broken-GPU fixtures.
 (`defaultSession` stays cage); the Phase-1 supervisor guarantees it can never brick the box.
 
 **Deliverables**
-- Land the `buildRustPackage` precedent **FIRST**: package an existing crate
-  (`claw_native/rust`) in a Nix module with a fixed `cargoHash` under the pinned nixpkgs
-  `50ab793`, proving Smithay's crate graph resolves on the June-2025 pin (if it does not, this
-  couples to the langchain pin-bump risk — surface it, do not hide it).
-- `hart-comp.nix`: Smithay HART-comp (tinywl-class) — udev/DRM/GBM backend + a MANDATORY pixman
-  software path, a real `--force-software` boot flag, KMS solid brand-color clear before first
-  frame (no flash-of-black). Added to `flake.nix` `hartModules[]` AND
-  `passthru.providedSessions=['hart-comp']` (mirror `kioskSession`) or eval fails.
-- Extend node integrity to cover the Rust binary: add the content-addressed Nix store path /
-  artifact hash to the signed release manifest checked by `verify_local_code_matches_manifest`
-  (`compute_file_manifest` currently hashes only `.py`), and add hart-comp as a
-  brand/origin-attested artifact so a forked compositor fails peer attestation.
-  `full_boot_verification` gates HART-comp on its own signature.
-- HART-comp boots only **AFTER** `full_boot_verification` (guardrail kernel + master-key +
-  origin attestation) passes — constitution gates the display.
+- **[LANDED, dev-authored]** Ship **sway as Tier-1 NOW** (`nixos/modules/hart-sway-tier1.nix`):
+  sway in single-output kiosk running the SAME canonical glass shell (`hart-glass-shell`, no
+  parallel renderer) under the forced-software-GL contract, with agent tile/summon/focus/move
+  shimmed via `hart-swaymsg-shim` (`swaymsg`) — so OS-native agent windowing ships WITHOUT the
+  Rust bring-up. Registers a greeter-selectable `hart-sway` session; `defaultSession` stays cage.
+  The shim is transport-only; the fail-closed gate stays brain-side (Phase 2/6). VM-pending:
+  real boot + `swaymsg` arrangement + paint proof on llvmpipe.
+- **[LANDED, dev-authored]** The `buildRustPackage` precedent **FIRST**, on an existing crate
+  (`nixos/modules/hart-rust-precedent.nix` → `claw_native/rust`), using `cargoLock.lockFile`
+  (the crate ships a committed `Cargo.lock`) under the pinned nixpkgs `50ab793`, proving the
+  stock pinned toolchain resolves a real crate graph before HART-comp depends on it. The fixed
+  `cargoHash` placeholder model is documented inline for crates lacking a committed lock. If the
+  graph does not resolve on the June-2025 pin, this module fails the gate in ISOLATION (surfaced,
+  not hidden). VM/CI-pending: the actual `nix build`.
+- **[LANDED, dev-authored]** `compositor/` Smithay HART-comp **skeleton** (`Cargo.toml` +
+  `src/main.rs`, tinywl-class): a calloop event loop + a MANDATORY pixman software-render path +
+  a real `--force-software` flag + a KMS solid brand-color clear before first frame
+  (no flash-of-black) + a `wlr-layer-shell` glass-shell mount point — every real Smithay handler
+  body `todo!()`/stub + `compile-pending`, with pure-logic unit tests asserting the never-fail
+  floor (unprobed/forced boot ALWAYS selects software). NOT compiled on the Windows box.
+- **[LANDED, dev-authored]** `nixos/modules/hart-comp.nix`: `buildRustPackage` of `compositor/`
+  (fixed `cargoHash` placeholder — `compositor/` has no committed lock yet; CI commits the real
+  hash), udev/DRM/GBM backend deps + the pixman C dep, `--force-software` session launcher,
+  opt-in `hart-comp` session, **`defaultSession` stays cage**. Asserts `hart.rustPrecedent.enable`
+  (the toolchain dependency is structural) + the canonical glass-shell renderer (no third
+  renderer). **Not yet added to flake `hartModules[]`** — that registration +
+  `passthru.providedSessions=['hart-comp']` wiring is the CI bring-up step gated on the build
+  resolving (mirror `kioskSession`).
+- **[VM/CI, not yet]** Extend node integrity to cover the Rust binary: add the content-addressed
+  Nix store path / artifact hash to the signed release manifest checked by
+  `verify_local_code_matches_manifest` (`compute_file_manifest` currently hashes only `.py`), and
+  add hart-comp as a brand/origin-attested artifact so a forked compositor fails peer attestation.
+  `full_boot_verification` gates HART-comp on its own signature. (Owned by the security task; this
+  module exposes `config.hart.comp.package` for that manifest to reach the binary.)
+- **[VM/CI, not yet]** HART-comp boots only **AFTER** `full_boot_verification` (guardrail kernel +
+  master-key + origin attestation) passes — constitution gates the display. Enforced by the
+  Phase-1 supervisor boot ordering + the signed-manifest gate above, NOT re-implemented here.
 
 **Tests**
 - `nixosTest`: eval gate — flake evaluates with `hart-comp.nix` in `hartModules[]` and a session
