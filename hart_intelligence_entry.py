@@ -478,17 +478,17 @@ try:
     from helper import retrieve_json, PROMPTS_DIR, safe_prompt_path, _is_terminate_msg
 except Exception:
     retrieve_json = None
-    # Frozen builds install to Program Files (read-only) — redirect to user data dir
-    if getattr(sys, 'frozen', False):
-        try:
-            from core.platform_paths import get_prompts_dir
-            PROMPTS_DIR = os.path.abspath(get_prompts_dir())
-        except ImportError:
-            PROMPTS_DIR = os.path.abspath(os.path.join(
-                os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
-    else:
-        PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
     safe_prompt_path = None
+    # helper failed to import — resolve PROMPTS_DIR via the SAME canonical resolver
+    # helper uses, so we NEVER fall back to the read-only /nix/store package dir on
+    # the embedded OS (the boot crash this guards). get_recipe_prompts_dir handles
+    # frozen desktop + embedded HART OS (/nix/store or /etc/hartos-release) + dev.
+    try:
+        from core.platform_paths import get_recipe_prompts_dir
+        PROMPTS_DIR = os.path.abspath(get_recipe_prompts_dir())
+    except Exception:
+        PROMPTS_DIR = os.path.abspath(os.path.join(
+            os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
 
 # Ensure prompts directory exists (agent creation writes JSON here)
 os.makedirs(PROMPTS_DIR, exist_ok=True)

@@ -120,6 +120,18 @@ in
 
       "hart/variant".text = cfg.variant;
 
+      # The embedded-OS identity marker core/platform_paths.py checks: get_data_dir()
+      # -> /var/lib/hartos and get_recipe_prompts_dir() -> the WRITABLE data dir
+      # (NOT the read-only /nix/store package path). Without it the hart services
+      # crash on boot writing prompts/ into the read-only store (OSError [Errno 30],
+      # caught by the floor-lock/supervisor nixosTests). /etc/os-release ID=hart-os
+      # is a separate file (OS-mode detection); this is the data-dir signal.
+      "hartos-release".text = ''
+        HART OS embedded
+        ID=hart-os
+        VERSION=${cfg.version}
+      '';
+
       # MOTD: dynamic system info on login
       "profile.d/hart-motd.sh" = {
         mode = "0755";
@@ -280,6 +292,13 @@ in
       "d ${cfg.dataDir}/agent_data 0750 hart hart -"
       "d ${cfg.dataDir}/models 0750 hart hart -"
       "d ${cfg.logDir} 0750 hart hart -"
+      # The python data root core/platform_paths.py:get_data_dir() resolves to when
+      # /etc/hartos-release is present (recipes, db, caches). hart-owned so the
+      # services' makedirs under it succeeds — the read-only /nix/store prompts
+      # crash fix. (Data-dir consistency with cfg.dataDir is a follow-up: set
+      # HARTOS_DATA_DIR=${cfg.dataDir} per-service to unify on one root.)
+      "d /var/lib/hartos 0750 hart hart -"
+      "d /var/lib/hartos/data 0750 hart hart -"
     ];
 
     # ── Systemd target: hart.target groups all HART services ──
