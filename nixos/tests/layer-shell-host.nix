@@ -276,6 +276,12 @@ in
         user = "hart-admin";
       };
       services.displayManager.defaultSession = "hart-glass-gtk4";
+
+      # GDM pulls graphical-desktop's fs.inotify.max_user_watches mkDefault while
+      # hart-base.nix also mkDefaults it -> two equal-priority mkDefaults collide
+      # ("defined multiple times"). mkForce wins over both (same fix as
+      # desktop-boot.nix + the b86aa93 session-supervisor DM path).
+      boot.kernel.sysctl."fs.inotify.max_user_watches" = pkgs.lib.mkForce 524288;
     };
 
     testScript = ''

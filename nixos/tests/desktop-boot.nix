@@ -129,6 +129,13 @@ in
         wayland = true;
       };
 
+      # GDM pulls nixpkgs' graphical-desktop module, which mkDefaults
+      # fs.inotify.max_user_watches; hart-base.nix ALSO mkDefaults it -> two
+      # equal-priority mkDefaults collide ("defined multiple times"). mkForce
+      # wins over both (same class as the b86aa93 session-supervisor fix for its
+      # DM path). The CI eval gate caught this; verified-by-CI on re-push.
+      boot.kernel.sysctl."fs.inotify.max_user_watches" = pkgs.lib.mkForce 524288;
+
       # Autologin hart-admin straight into the cage floor — exactly the pin
       # desktop.nix ships (defaultSession = "hart-shell"), but without importing
       # the full ISO config. This drives subtest 3: GDM logs the session in, cage
