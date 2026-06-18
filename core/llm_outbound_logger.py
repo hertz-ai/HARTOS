@@ -639,16 +639,26 @@ def _bg_yield_wait_s() -> float:
 
 
 def _is_background_call(request) -> bool:
-    """True iff this llama call belongs to an autonomous background daemon agent
-    (request_id ``daemon_*``) rather than a genuine user turn.
+    """True iff this llama call is autonomous background daemon work (request_id
+    ``daemon_*`` — or, per the accepted contract, ABSENT) rather than a genuine
+    user turn.
 
     Reads request_id from the ``X-HARTOS-Request-ID`` header stamped by
-    ``_annotate_request`` (so it travels with the request even across threads),
-    with a thread-local fallback, then applies the canonical
-    ``dispatch.is_genuine_user_request`` rule — single source of truth, no
-    duplicated prefix logic.  Conservative: ANY uncertainty returns False, so a
-    call is treated as cancellable background work only when we are sure; a user
-    turn is never cancelled."""
+    ``_annotate_request`` (so it travels with the request across the autogen
+    worker-thread boundary), with a thread-local fallback, then DELEGATES the
+    decision ENTIRELY to the one canonical ``dispatch.is_genuine_user_request``
+    — the SAME rule the inbound foreground gate (``_chat_request_is_genuine``)
+    applies, so the two can never diverge.  No bespoke, per-caller "is user"
+    logic here.
+
+    Empty / missing rid → ``is_genuine_user_request`` returns False → background
+    (abortable).  A real /chat always carries an id (the frontend sends one; the
+    adapter defaults a timestamp), so an UNtagged llama call is daemon work whose
+    ``daemon_`` tag was lost crossing into the autogen worker thread.  The prior
+    bespoke ``if not rid: return False`` here classified those as FOREGROUND,
+    which is exactly what left the daemon's empty-rid 4B calls on the
+    non-closable client so a user's "hi" could never preempt them (#162); it also
+    silently contradicted ``is_genuine_user_request``'s empty→background rule."""
     try:
         rid = None
         try:
@@ -657,8 +667,6 @@ def _is_background_call(request) -> bool:
             rid = None
         if not rid:
             rid = _get_request_id()
-        if not rid:
-            return False
         from integrations.agent_engine.dispatch import is_genuine_user_request
         return not is_genuine_user_request(rid)
     except Exception:
