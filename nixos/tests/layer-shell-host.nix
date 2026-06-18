@@ -74,10 +74,13 @@ in
         memorySize = 4096;
         cores = 2;
       };
-      # Opt the Phase-4 GTK4 layer-shell host ON (default off). The desktop
-      # variant already enables hart.liquidUI with the webkit renderer (the host's
-      # assertion), so this is coherent. defaultSession is NOT touched here — the
-      # never-break gate is that the GTK4 path is additive + cage stays the floor.
+      # Opt the Phase-4 GTK4 layer-shell host ON (default off). The host re-hosts
+      # the SAME served glass shell, so hart.layerShellHost asserts
+      # hart.liquidUI.enable=true with renderer="webkit". liquidUI defaults OFF and
+      # NO variant turns it on (desktop-boot.nix:94) -> enable it explicitly.
+      # defaultSession is NOT touched here — the GTK4 path is additive, cage stays
+      # the floor (the never-break gate).
+      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = false; };
       hart.layerShellHost.enable = true;
     };
 
@@ -252,6 +255,9 @@ in
 
       # Opt the Phase-4 GTK4 layer-shell host ON (default off). voiceEnabled is
       # left at the desktop default; it is irrelevant to the paint/crash gates.
+      # hart.layerShellHost asserts hart.liquidUI.enable=true + renderer="webkit"
+      # (it re-hosts the served glass shell); liquidUI defaults OFF, so enable it.
+      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = false; };
       hart.layerShellHost.enable = true;
 
       # ── A real display manager that autologins the GTK4 layer-shell session ──

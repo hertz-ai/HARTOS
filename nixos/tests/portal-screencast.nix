@@ -49,6 +49,10 @@ in
         memorySize = 4096;
         cores = 2;
       };
+      # hart.portal asserts hart.liquidUI.enable=true (the portal Settings bridge
+      # reads ThemeService tokens + the screencast gate consults core.ai_sensing,
+      # both hosted in the LiquidUI :6800 process the testScript waits for below).
+      hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = false; };
       # Enable the Phase-7 portal surface (opt-in; off by default everywhere else).
       hart.portal.enable = true;
       hart.portal.closeAutologinPamGap = true;
