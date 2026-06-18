@@ -266,7 +266,10 @@ def register_shell_os_routes(app):
     @_require_shell_auth
     def shell_files_browse():
         """Browse directory contents."""
-        path = request.args.get('path', os.path.expanduser('~'))
+        # expanduser so '~' and '~/Documents' (the explorer's Places sidebar)
+        # resolve to the real home; realpath('~') alone would yield a literal
+        # './~'. Absolute and relative non-~ paths pass through unchanged.
+        path = os.path.expanduser(request.args.get('path', '~'))
         show_hidden = request.args.get('hidden', 'false').lower() == 'true'
 
         # Security: prevent traversal outside allowed paths

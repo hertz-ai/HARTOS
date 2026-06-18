@@ -1606,6 +1606,8 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script src="/shell/static/hartSenses.js"></script>
 <script src="/shell/static/hartOnboarding.js"></script>
 <script src="/shell/static/hartSessionUI.js"></script>
+<link rel="stylesheet" href="/shell/static/hartResponsive.css">
+<script src="/shell/static/hartFiles.js"></script>
 
 <!-- Agent Pill (click to expand floating chat) -->
 <div class="agent-pill glass" id="agent-pill" onclick="toggleAssistantChat()">
@@ -2848,48 +2850,14 @@ function loadMediaLibraryPanel(el) {{
 
 // ═══ File Manager ═══
 function loadFileManagerPanel(el) {{
-  fetch(SHELL+'/api/shell/files/browse?path=~',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
-    const items = data.items||[];
-    const cwd = data.path||'~';
-    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Files</span>'+
-      '<span class="ds-label-sm ds-text-muted">'+cwd+'</span></div><div class="ds-stagger">';
-    items.slice(0,30).forEach(f=>{{
-      const icon = f.is_dir?'folder':'description';
-      const size = f.is_dir?'':' &middot; '+(f.size_human||'');
-      html += '<div class="ds-list-item'+(f.is_dir?' ds-list-item-interactive':'')+'"'+
-        (f.is_dir?' data-path="'+f.path+'" onclick="browseDir(this.dataset.path);"':'')+'>'+
-        '<span class="mi material-icons-round ds-list-item-icon '+(f.is_dir?'ds-text-accent':'ds-text-muted')+'">'+icon+'</span>'+
-        '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+f.name+'</div>'+
-        '<div class="ds-list-item-secondary">'+(f.modified||'')+size+'</div></div></div>';
-    }});
-    html += '</div></div>';
-    el.innerHTML = html;
-  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">File browser unavailable</div>'; }});
+  // Delegates to the canonical File Explorer module (static/hartFiles.js),
+  // which wires to the SAME /api/shell/files/* backend. No parallel browser.
+  if (window.HartFiles && window.HartFiles.mount) {{ window.HartFiles.mount(el); return; }}
+  el.innerHTML = '<div class="ds-body-md ds-text-muted">File manager loading…</div>';
 }}
 function browseDir(path) {{
-  const el = document.getElementById('sys-file_manager');
-  if(!el) return;
-  el.innerHTML = dsSkeleton('panel',3);
-  fetch(SHELL+'/api/shell/files/browse?path='+encodeURIComponent(path),{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
-    const items = data.items||[];
-    const cwd = data.path||path;
-    const parent = data.parent||'';
-    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Files</span>'+
-      '<span class="ds-label-sm ds-text-muted">'+cwd+'</span></div>';
-    if(parent) html += '<div class="ds-list-item ds-list-item-interactive" data-path="'+parent+'" onclick="browseDir(this.dataset.path)">'+
-      '<span class="mi material-icons-round ds-list-item-icon ds-text-muted">arrow_back</span>'+
-      '<div class="ds-list-item-content"><div class="ds-list-item-primary">..</div></div></div>';
-    html += '<div class="ds-stagger">';
-    items.slice(0,30).forEach(f=>{{
-      const icon = f.is_dir?'folder':'description';
-      html += '<div class="ds-list-item'+(f.is_dir?' ds-list-item-interactive':'')+'"'+
-        (f.is_dir?' data-path="'+f.path+'" onclick="browseDir(this.dataset.path);"':'')+'>'+
-        '<span class="mi material-icons-round ds-list-item-icon '+(f.is_dir?'ds-text-accent':'ds-text-muted')+'">'+icon+'</span>'+
-        '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+f.name+'</div></div></div>';
-    }});
-    html += '</div></div>';
-    el.innerHTML = html;
-  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Cannot browse</div>'; }});
+  // Legacy entry kept for any stray caller — routes into the canonical module.
+  if (window.HartFiles && window.HartFiles.navigate) window.HartFiles.navigate(path);
 }}
 
 // ═══ Terminal ═══
