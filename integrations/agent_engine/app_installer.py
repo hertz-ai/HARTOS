@@ -600,7 +600,18 @@ class AppInstaller:
                 env={**os.environ, 'WINEPREFIX': os.path.join(
                     self._install_dir, 'wine', 'prefix')})
 
-            # Wine often returns 0 even for interactive installers
+            # Wine's exit code is a WEAK success signal — GUI/interactive
+            # installers often fork and return 0 before finishing — so 0 cannot
+            # positively CONFIRM success. But a NON-ZERO exit IS a reliable
+            # FAILURE (wine missing, the .exe crashed, a bad MSI). This used to
+            # return success=True UNCONDITIONALLY, so a failed install was
+            # reported as a success and _auto_register_app pinned a desktop icon
+            # that launches nothing. Honour the failure signal: non-zero -> fail.
+            if result.returncode != 0:
+                return InstallResult(
+                    success=False, platform='windows', name=name,
+                    error=f'wine exited {result.returncode}: '
+                          f'{(result.stderr or "").strip()[:200]}')
             return InstallResult(
                 success=True, platform='windows', name=name,
                 install_path=f'{self._install_dir}/wine/prefix',
