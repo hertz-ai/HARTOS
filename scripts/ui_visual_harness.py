@@ -170,7 +170,7 @@ def _run_interactions(page):
     return r
 
 
-def main(scenario="shell"):
+def main(scenario="shell", engine="chromium"):
     from integrations.agent_engine.liquid_ui_service import LiquidUIService
 
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -196,7 +196,7 @@ def main(scenario="shell"):
     results = []
     any_pageerror = False
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = getattr(p, engine).launch(headless=True)
         for name, w, h in vps:
             page = browser.new_page(viewport={"width": w, "height": h})
             errors, failed, clog = [], [], []
@@ -272,4 +272,5 @@ def main(scenario="shell"):
 
 if __name__ == "__main__":
     scen = sys.argv[1] if len(sys.argv) > 1 else "shell"
-    sys.exit(main(scen))
+    eng = sys.argv[2] if len(sys.argv) > 2 else "chromium"
+    sys.exit(main(scen, eng))
