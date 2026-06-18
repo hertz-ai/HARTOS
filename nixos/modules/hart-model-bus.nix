@@ -358,9 +358,15 @@ in
     # ─────────────────────────────────────────────────────────
     (lib.mkIf bus.enableAndroidBridge {
 
-      # Android system property telling apps where the model bus lives
-      systemd.services.hart-android-runtime.environment = lib.mkIf
-        (config.systemd.services ? hart-android-runtime)
+      # Android system property telling apps where the model bus lives.
+      # The real Android runtime is the stock Waydroid container
+      # (virtualisation.waydroid -> waydroid-container.service); the old inert
+      # hart-android-runtime stub was deleted, so the previous
+      # `config.systemd.services ? hart-android-runtime` guard was permanently
+      # false and the URL was never injected. Gate on the canonical eval-time
+      # signal that materializes the container unit: virtualisation.waydroid.enable.
+      systemd.services.waydroid-container.environment = lib.mkIf
+        config.virtualisation.waydroid.enable
       {
         HART_MODEL_BUS_URL = "http://localhost:${toString bus.ports.http}";
       };

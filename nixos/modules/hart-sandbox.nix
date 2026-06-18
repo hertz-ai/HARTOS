@@ -166,10 +166,14 @@ let
             check "Android data directory" 1 "/var/lib/hart/android missing"
         fi
 
-        # Test 5: Android runtime service
-        if systemctl is-active hart-android-runtime.service &>/dev/null; then
+        # Test 5: Android runtime service — stock Waydroid container
+        # (virtualisation.waydroid -> waydroid-container.service); the old inert
+        # hart-android-runtime stub was deleted. "Running" means the container is
+        # active AND the Waydroid session is up (waydroid status RUNNING).
+        if systemctl is-active waydroid-container.service &>/dev/null \
+           && waydroid status 2>/dev/null | grep -qi 'Session:[[:space:]]*RUNNING'; then
             check "Android runtime service" 0 "Running"
-        elif systemctl is-enabled hart-android-runtime.service &>/dev/null; then
+        elif systemctl is-enabled waydroid-container.service &>/dev/null; then
             check "Android runtime service" 2 "Enabled but not running"
         else
             check "Android runtime service" 2 "Not enabled"
@@ -368,9 +372,12 @@ let
         # Linux
         echo -e "  ''${GREEN}●''${NC} Linux Native     : Active (NixOS)"
 
-        # Android
+        # Android — stock Waydroid container (waydroid-container.service); binder
+        # in the kernel is the "ready" gate, an active container + RUNNING session
+        # is "active".
         if lsmod 2>/dev/null | grep -q binder_linux; then
-            if systemctl is-active hart-android-runtime.service &>/dev/null; then
+            if systemctl is-active waydroid-container.service &>/dev/null \
+               && waydroid status 2>/dev/null | grep -qi 'Session:[[:space:]]*RUNNING'; then
                 echo -e "  ''${GREEN}●''${NC} Android Native   : Active (ART + Binder)"
             else
                 echo -e "  ''${YELLOW}●''${NC} Android Native   : Kernel ready, runtime stopped"
@@ -486,7 +493,11 @@ in
       description = "HART OS Subsystem Validation (First Boot)";
       after = [
         "hart.target"
-        "hart-android-runtime.service"
+        # Stock Waydroid container (virtualisation.waydroid) replaced the deleted
+        # inert hart-android-runtime stub. `after` is a soft ordering hint (no
+        # `wants`/`requires`), so referencing a unit that may not exist on every
+        # variant is a no-op — never-fail ordering preserved.
+        "waydroid-container.service"
         "hart-gpu-scheduler.service"
         "multi-user.target"
       ];

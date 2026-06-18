@@ -390,7 +390,16 @@
         inherit pkgs hartModules;
         specialArgs = mkSpecialArgs "server";
       };
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral;
+      # Native subsystems (genuine app support): a desktop node turns the
+      # Android (Waydroid) + web (browser-extension force-install) subsystems ON
+      # and asserts the runtime is REAL — the stock waydroid container unit is in
+      # the closure, the old `sleep infinity` Android stub is GONE, the first-boot
+      # Waydroid init is never-fail/oneshot, the Chromium+Firefox extension
+      # force-install policy surface exists, macOS-OFF is a pure no-op, and no
+      # fake snapd was shipped (snap is honestly unsupported). Distinct attr names
+      # -> clean //; desktop-variant node (mkNode), subsystems enabled in-test.
+      nativeSubsystems = import ./tests/native-subsystems.nix desktopTestArgs;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)
