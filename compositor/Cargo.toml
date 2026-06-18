@@ -3,11 +3,14 @@
 # ═══════════════════════════════════════════════════════════════
 #
 # STATUS: COMPILE-PENDING SKELETON. This crate is a Phase-3 tinywl-class
-# scaffold. It is authored on a Windows dev box where NO Wayland/KMS/Smithay
-# build can run, so it is NOT yet compiled. Every paint / DRM scanout / libinput
-# / layer-shell mount claim is VM-pending (CI nixosTest on an llvmpipe software-GL
-# VM, or local QEMU-KVM). See ../docs/architecture/HART_OS_NATIVE_ARCHITECTURE.md
-# §L1 and ./ROADMAP.md Phase 3.
+# scaffold (+ a Phase-5 window-bookkeeping draft). The PURE LOGIC compiles + is
+# unit-tested on the dev box; the Smithay-touching handler bodies are todo!()/
+# unwired. It is authored on a Windows box where NO Wayland/KMS/Smithay build can
+# run, so the Smithay paths are NOT compiled. Every paint / DRM scanout / libinput
+# / layer-shell mount / xdg-shell+XWayland toplevel-map claim is VM-pending (CI
+# nixosTest on an llvmpipe software-GL VM, or local QEMU-KVM). See
+# ../docs/architecture/HART_OS_NATIVE_ARCHITECTURE.md §L1 + §5.4 and ./ROADMAP.md
+# Phase 3 + Phase 5.
 #
 # Ordering invariant (ROADMAP §"Ordering principle"): Smithay HART-comp is a
 # LATER moat upgrade behind a sway-as-Tier-1 fast path. sway already ships
@@ -35,27 +38,61 @@ rust-version = "1.77"
 name = "hart-comp"
 path = "src/main.rs"
 
+# ── Features ──
+# `smithay` gates the REAL Wayland handler bodies (src/wayland.rs: the xdg-shell /
+# XWayland / xdg-decoration / wlr-foreign-toplevel-management trait impls + the
+# XWayland lifecycle + the live `State` summon orchestration). It is OFF by default
+# so the Windows dev box compiles + unit-tests ONLY the pure-logic floor
+# (src/main.rs + its #[cfg(test)] block). CI's Phase-5 bring-up enables it
+# (`cargo build --features smithay`, wired via hart-comp.nix `buildFeatures`) AT THE
+# SAME TIME it uncomments the git-Smithay dependency below — both flips are the one
+# CI step. Declared here so `#[cfg(feature = "smithay")]` is a KNOWN cfg (no
+# unexpected_cfgs warning) on the always-compiled build.
+#
+# When the dep is uncommented at CI bring-up, add `"dep:smithay"` (+ calloop) here:
+#   smithay = ["dep:smithay", "dep:calloop"]
+[features]
+default = []
+smithay = []
+
 [dependencies]
-# Phase-3 skeleton is PURE LOGIC (render-path decision + boot-config + the
-# never-fail-floor invariant). main.rs does NOT yet link Smithay/calloop — the
-# `use smithay::...` block there is a COMMENTED manifest of the shape the real
-# compositor needs. Declaring those deps before the code uses them only breaks
-# the build, because:
+# The skeleton is PURE LOGIC: the Phase-3 render-path/boot-config never-fail-floor
+# decision AND the Phase-5 window bookkeeping (handle minting + the manifest↔toplevel
+# map + the no-phantom-window SummonApp state machine — all Wayland-FREE, see the
+# PHASE 5 block + #[cfg(test)] in main.rs). main.rs does NOT yet link Smithay/calloop
+# — the `use smithay::...` block there is a COMMENTED manifest of the shape the real
+# compositor needs, and the Smithay HANDLER bodies (xdg-shell/XWayland/decoration/
+# foreign-toplevel map, each marked `// ⚠️ CI-COMPILE`) are todo!()/unwired. Declaring
+# those deps before the code uses them only breaks the build, because:
 #   * Smithay is NOT published to crates.io with the modern API — crates.io
 #     `smithay 0.3.0` (2022) lacks the `desktop` AND `renderer_pixman` features
 #     this compositor needs (VERIFIED live: `cargo build` fails to select 0.3.0
-#     with feature `desktop`). The real dep is GIT Smithay pinned to a rev:
+#     with feature `desktop`). The real dep is GIT Smithay pinned to a rev, declared
+#     as an OPTIONAL dep keyed to the `smithay` cargo feature above (so the default
+#     dev-box build never tries to resolve git Smithay; only `--features smithay` in
+#     CI does). Uncomment BOTH together at the Phase-5 CI bring-up step:
 #       smithay = { git = "https://github.com/Smithay/smithay", rev = "<pinned>",
+#         optional = true,
 #         default-features = false, features = [
 #           "backend_drm", "backend_gbm", "backend_libinput", "backend_udev",
 #           "backend_session_libseat", "renderer_pixman", "wayland_frontend",
-#           "desktop" ] }
-#       calloop = "0.13"
+#           "desktop",
+#           # Phase 5 native toplevels — Wine/X11 via XWayland. xdg-shell,
+#           # xdg-decoration, wlr-layer-shell, and wlr-foreign-toplevel-management
+#           # are part of "wayland_frontend"/"desktop"; XWayland is its own feature.
+#           "xwayland" ] }
+#       calloop = { version = "0.13", optional = true }
+#     …and flip the feature to `smithay = ["dep:smithay", "dep:calloop"]`. The real
+#     handler bodies that use these live in src/wayland.rs (`#![cfg(feature =
+#     "smithay")]`), so they compile ONLY on that CI flip — never on the dev box.
 #     + a committed Cargo.lock, vendored + hashed in hart-comp.nix, proven on the
 #     nixpkgs pin via hart-rust-precedent.nix FIRST (ROADMAP Phase 3). They come
 #     back when the integration lands in CI — where Smithay can actually compile.
-# Until then the skeleton keeps a minimal, COMPILING dep set + a behavioural
-# never-fail-floor test floor (see #[cfg(test)] in main.rs).
+#     hart-comp.nix already declares the XWayland C dep surface (xorg/xwayland) is
+#     added there at the SAME time the feature is uncommented (Phase-5 CI step).
+# Until then the skeleton keeps a minimal, COMPILING dep set + a behavioural test
+# floor: the never-fail-floor (Phase 3) AND the no-phantom-window invariants
+# (Phase 5) both assert via real types + calls in #[cfg(test)] in main.rs.
 
 # Structured logging — journal-friendly (the systemd unit captures stdout/stderr).
 tracing = "0.1"

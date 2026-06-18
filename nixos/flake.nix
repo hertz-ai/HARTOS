@@ -65,6 +65,25 @@
       # (no inotify-class tie). Makes "sway-Tier-1-now" a real greeter-selectable
       # session + gives the moat a Tier-2 shim target, instead of an orphan file.
       ./modules/hart-sway-tier1.nix
+      # Phase-4 GTK4 layer-shell glass-shell host: the budgeted GTK3 -> GTK4
+      # WebKitGTK host-window port that re-hosts the SAME served shell as a real
+      # wlr-layer-shell BACKGROUND surface (exclusive zone 0, JS unchanged). Opt-in
+      # (hart.layerShellHost.enable=false default) -> no-op for every variant;
+      # the Phase-4 nixosTest enables it on a desktop node to prove the GTK4 host
+      # paints on llvmpipe + a GTK4-crash drops to the GTK3 cage Tier-3 floor.
+      # defaultSession STAYS cage (GTK3); this only ADDS a greeter-selectable L2
+      # host-window session, instead of leaving the port an orphan file.
+      ./modules/hart-layer-shell-host.nix
+      # L4 Freedesktop portals + cross-process screen kill-switch + ext-session-
+      # lock (Phase 7). Opt-in (hart.portal.enable=false default) -> pure no-op for
+      # every variant; NO test enables it outside its own nixosTest, so it never
+      # pulls a portal/lock closure into the default build. Imported so the option
+      # exists + tests/portal-screencast.nix can enable it. Ships the cross-process
+      # screen gate (the portal MUST consult core.ai_sensing fail-closed BEFORE any
+      # native capture), wlr-screencopy routing, the theme->portal Settings bridge,
+      # and the real PAM-backed ext-session-lock for Tier-1/2. cage Tier-3 (no
+      # portal => no native capture) stays the safe floor.
+      ./modules/hart-portal.nix
       # Remote Desktop peripherals + casting
       ./modules/hart-peripheral-bridge.nix
       ./modules/hart-dlna.nix
@@ -334,7 +353,44 @@
       };
       floorLock  = import ./tests/floor-lock.nix desktopTestArgs;
       supervisor = import ./tests/session-supervisor.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor;
+      # GDM-based desktop-boot: the floor-lock's DM-driven twin. floor-lock runs a
+      # #70-minimal node with NO display manager, so it DEFERS DM-driven
+      # registration + the bit-for-bit software-GL launcher env + the first-frame
+      # paint + the WebView-kill recovery (floor-lock.nix :89,:116 name this test).
+      # This node adds a real GDM that materializes sessionPackages -> sessionData
+      # and autologins the cage hart-shell session, making those four gates TESTED
+      # on an llvmpipe VM. Distinct attr (hart-desktop-shell-boot) -> clean //.
+      desktopShellBoot = import ./tests/desktop-boot.nix desktopTestArgs;
+      # Phase-4 GTK4 layer-shell host: TWO nodes (distinct attrs -> clean //).
+      #  (a) hart-layer-shell-host — STRUCTURAL (no DM): the GTK4 toolkit typelibs
+      #      are in the closure + the served /shell/static fetch is 200 (dead-husk-
+      #      aware) + the GTK3 cage Tier-3 floor is intact + Model-1 z-order in code.
+      #  (b) hart-layer-shell-host-paint — the FRESH broken-GPU PAINT proof: a GDM
+      #      node autologins the hart-glass-gtk4 session (sway hosting the GTK4 +
+      #      WebKitGTK-6.0 + gtk4-layer-shell host), the GTK4 BACKGROUND surface
+      #      anchors + paints on llvmpipe under NEVER-accel, the rendered brand is
+      #      OCR'd off the framebuffer, and a GTK4-host kill lands on the cage floor
+      #      (still software-GL + the served shell still serves). The GTK4 path's
+      #      OWN paint floor, not an inherited GTK3 assumption (ROADMAP Phase 4).
+      # desktop-variant nodes (mkNode sets the variant); specialArgs carries hartSrc.
+      layerShellHost = import ./tests/layer-shell-host.nix desktopTestArgs;
+      # Phase-7 portals + cross-process screen kill-switch: boots a desktop node
+      # with hart.portal.enable; the LiquidUI shell host (the kill-switch's _state
+      # holder) starts the cross-process authority, and the test asserts the
+      # wlr-screencopy gate REFUSES (exit 77) when 'screen' is cut and ALLOWS
+      # when on — a Flatpak/Wine-equivalent capture denied at the portal gate, not
+      # just a flag. Plus: status() reports portal_screencast_blocked, the hart
+      # .portal backend + dbus policy are in the closure, and the hart-lock PAM
+      # service exists. Distinct attr names -> clean //; desktop-variant node.
+      portalScreencast = import ./tests/portal-screencast.nix desktopTestArgs;
+      # Central-controlled autonomous OTA: node auto-polls CENTRAL (not github),
+      # stages via the existing pipeline, autoApply switches with auto-rollback.
+      # server-variant node (OTA is variant-neutral; server is the lightest).
+      otaCentral = import ./tests/ota-central.nix {
+        inherit pkgs hartModules;
+        specialArgs = mkSpecialArgs "server";
+      };
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)

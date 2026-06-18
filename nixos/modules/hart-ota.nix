@@ -40,7 +40,17 @@ in
     checkInterval = lib.mkOption {
       type = lib.types.str;
       default = "1h";
-      description = "How often to check for updates (systemd OnUnitActiveSec format)";
+      description = ''
+        DORMANT — retained for compatibility, but NO LONGER schedules any
+        poll.  The node's trigger model is: POLL central ONLY (a) on
+        boot (the hart-ota-check OnBootSec timer) and (b) when the user
+        runs `hart-ota check`; there is NO periodic interval poll.  A
+        CENTRAL push (hart-ota-push, over the existing fleet/gossip
+        fabric) covers everything in between.  This option does not
+        wire OnUnitActiveSec anymore — setting it has no effect on the
+        timer; it is kept only so existing configs that set it still
+        evaluate.
+      '';
     };
 
     autoApply = lib.mkOption {
@@ -73,7 +83,30 @@ in
     flakeRef = lib.mkOption {
       type = lib.types.str;
       default = "github:hertz-ai/HARTOS";
-      description = "Nix flake reference for pulling updates";
+      description = ''
+        Nix flake reference for building/switching the system. When
+        centralEndpoint returns an approved flake_ref for this channel,
+        that value supersedes this one as the switch target (central can
+        pin an exact commit, e.g. github:hertz-ai/HARTOS/<sha>). This
+        remains the build target's repo and the offline fallback.
+      '';
+    };
+
+    centralEndpoint = lib.mkOption {
+      type = lib.types.str;
+      default = "http://etime.hertzai.com:6777/api/ota/latest";
+      description = ''
+        CENTRAL authority endpoint the node polls for the approved
+        {flake_ref, commit} of its channel — NOT github directly. The
+        queen-bee central account decides which revision each channel is
+        cleared to run; the node never auto-pulls an arbitrary upstream
+        commit. The check timer GETs `''${centralEndpoint}?channel=<channel>`
+        and expects JSON {flake_ref, commit, channel}. If central is
+        unreachable the node falls back to polling flakeRef (so an
+        air-gapped/edge node still updates), but central is the primary
+        source of truth. Set to "" to disable central polling and use
+        flakeRef only.
+      '';
     };
 
     preUpdateHook = lib.mkOption {
@@ -104,14 +137,22 @@ in
     ];
 
     # ─────────────────────────────────────────────────────────
-    # OTA Check Timer — periodic pull for updates
+    # OTA Check Timer — BOOT poll ONLY (no periodic interval)
     # ─────────────────────────────────────────────────────────
+    # Trigger model: the node polls CENTRAL on boot AND when the user runs
+    # `hart-ota check`; it NEVER polls on a periodic interval.  Everything
+    # in between a boot poll and a user-initiated check is covered by a
+    # CENTRAL push (hart-ota-push) over the existing fleet/gossip fabric.
+    # So this timer fires once at boot (OnBootSec) and that is the only
+    # schedule — OnUnitActiveSec is intentionally absent (checkInterval is
+    # dormant and no longer wires a recurring poll).  Persistent=true makes a
+    # boot poll that was missed (node off at boot time) still run on next
+    # start, without turning into a recurring timer.
     systemd.timers.hart-ota-check = {
-      description = "HART OS OTA Update Check Timer";
+      description = "HART OS OTA Boot Update Check (boot-only; no interval poll)";
       wantedBy = [ "timers.target" ];
       timerConfig = {
         OnBootSec = "5min";
-        OnUnitActiveSec = ota.checkInterval;
         RandomizedDelaySec = "5min";
         Persistent = true;
       };
@@ -130,6 +171,7 @@ in
         HEVOLVE_DB_PATH = "${cfg.dataDir}/hevolve_database.db";
         HART_OTA_CHANNEL = ota.channel;
         HART_OTA_FLAKE_REF = ota.flakeRef;
+        HART_OTA_CENTRAL_ENDPOINT = ota.centralEndpoint;
         HART_OTA_AUTO_APPLY = if ota.autoApply then "1" else "0";
         HEVOLVE_CANARY_DURATION_SECONDS = toString ota.canaryDuration;
         HEVOLVE_CANARY_PCT = "0.${if ota.canaryPercent < 10 then "0${toString ota.canaryPercent}" else toString ota.canaryPercent}";
@@ -170,29 +212,63 @@ in
           echo "[HART OTA] Pipeline stage: $STAGE"
 
           if [[ "$STAGE" == "idle" ]]; then
-            # ── Check flake for new version ──
-            echo "[HART OTA] Checking flake: ${ota.flakeRef}"
-            REMOTE_REV=$(${pkgs.nix}/bin/nix flake metadata "${ota.flakeRef}" --json 2>/dev/null \
-              | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || REMOTE_REV="check_failed"
+            # ── Resolve the approved {flake_ref, commit} for this channel ──
+            # PRIMARY source = CENTRAL authority (the queen-bee account decides
+            # which revision each channel is cleared to run). We poll CENTRAL,
+            # not github directly. SWITCH_FLAKE defaults to the configured
+            # flakeRef and is superseded by central's approved flake_ref so
+            # central can pin an exact commit (github:hertz-ai/HARTOS/<sha>).
+            SWITCH_FLAKE="${ota.flakeRef}"
+            REMOTE_REV="check_failed"
+            CENTRAL="${ota.centralEndpoint}"
+
+            if [[ -n "$CENTRAL" ]]; then
+              echo "[HART OTA] Polling CENTRAL: $CENTRAL?channel=${ota.channel}"
+              CENTRAL_JSON=$(${pkgs.curl}/bin/curl -sf --max-time 15 \
+                "$CENTRAL?channel=${ota.channel}" 2>/dev/null) || CENTRAL_JSON=""
+              if [[ -n "$CENTRAL_JSON" ]]; then
+                C_COMMIT=$(echo "$CENTRAL_JSON" | ${pkgs.jq}/bin/jq -r '.commit // ""')
+                C_FLAKE=$(echo "$CENTRAL_JSON" | ${pkgs.jq}/bin/jq -r '.flake_ref // ""')
+                if [[ -n "$C_COMMIT" && "$C_COMMIT" != "null" ]]; then
+                  REMOTE_REV="$C_COMMIT"
+                  [[ -n "$C_FLAKE" && "$C_FLAKE" != "null" ]] && SWITCH_FLAKE="$C_FLAKE"
+                  echo "[HART OTA] CENTRAL approved rev=$REMOTE_REV flake=$SWITCH_FLAKE"
+                fi
+              fi
+            fi
+
+            # ── Fallback: poll flakeRef directly only if central gave nothing ──
+            # (keeps an air-gapped / central-unreachable node updatable; central
+            #  stays the primary source of truth when present).
+            if [[ "$REMOTE_REV" == "check_failed" ]]; then
+              echo "[HART OTA] CENTRAL unavailable, falling back to flake: ${ota.flakeRef}"
+              REMOTE_REV=$(${pkgs.nix}/bin/nix flake metadata "${ota.flakeRef}" --json 2>/dev/null \
+                | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || REMOTE_REV="check_failed"
+            fi
 
             LOCAL_REV=$(${pkgs.nix}/bin/nix flake metadata /etc/nixos --json 2>/dev/null \
               | ${pkgs.jq}/bin/jq -r '.revision // "unknown"') || LOCAL_REV="unknown"
 
             echo "[HART OTA] Local: $LOCAL_REV"
-            echo "[HART OTA] Remote: $REMOTE_REV"
+            echo "[HART OTA] Approved: $REMOTE_REV"
 
             if [[ "$REMOTE_REV" != "check_failed" && "$REMOTE_REV" != "$LOCAL_REV" && "$REMOTE_REV" != "unknown" ]]; then
               echo "[HART OTA] New version available: $REMOTE_REV"
 
-              # Write update metadata
+              # Persist update metadata INCLUDING the central-approved switch flake
+              # so the (separate-tick) 'completed' branch switches to exactly the
+              # revision central cleared, not the channel HEAD.
               ${pkgs.jq}/bin/jq -n \
                 --arg rev "$REMOTE_REV" \
+                --arg flake "$SWITCH_FLAKE" \
                 --arg channel "${ota.channel}" \
                 --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-                '{revision: $rev, channel: $channel, discovered_at: $ts, status: "available"}' \
+                '{revision: $rev, switch_flake: $flake, channel: $channel, discovered_at: $ts, status: "available"}' \
                 > "$OTA_DIR/pending_update.json"
 
-              # Start the 7-stage pipeline via orchestrator
+              # Start the 7-stage pipeline via orchestrator (SIGN/CANARY gates
+              # still run locally — central only chooses WHICH commit, it never
+              # skips the local sign-verify + canary safety gates).
               ${hartApp.python}/bin/python -c "
               import sys, os
               sys.path.insert(0, '${hartApp}')
@@ -213,9 +289,16 @@ in
               ${ota.preUpdateHook}
             ''}
 
+            # Switch to exactly the flake CENTRAL approved at pipeline start
+            # (persisted in pending_update.json). Fall back to the configured
+            # flakeRef if the metadata is missing/older.
+            SWITCH_FLAKE=$(${pkgs.jq}/bin/jq -r '.switch_flake // empty' \
+              "$OTA_DIR/pending_update.json" 2>/dev/null || true)
+            [[ -z "$SWITCH_FLAKE" ]] && SWITCH_FLAKE="${ota.flakeRef}"
+
             if [[ "${if ota.autoApply then "1" else "0"}" == "1" ]]; then
-              echo "[HART OTA] Auto-apply enabled, switching..."
-              sudo nixos-rebuild switch --flake "${ota.flakeRef}#hart-${cfg.variant}" 2>&1 || {
+              echo "[HART OTA] Auto-apply enabled, switching to $SWITCH_FLAKE ..."
+              sudo nixos-rebuild switch --flake "$SWITCH_FLAKE#hart-${cfg.variant}" 2>&1 || {
                 echo "[HART OTA] Switch failed, rolling back..."
                 sudo nixos-rebuild switch --rollback 2>&1
               }
@@ -255,6 +338,82 @@ in
         StandardOutput = "journal";
         StandardError = "journal";
         SyslogIdentifier = "hart-ota-check";
+      };
+    };
+
+    # ─────────────────────────────────────────────────────────
+    # OTA Push Receiver — CENTRAL push → SAME apply (no new transport)
+    # ─────────────────────────────────────────────────────────
+    # The other half of the trigger model: between a boot poll and a user
+    # `hart-ota check`, CENTRAL can PUSH an approved build at any time.  The
+    # push rides the EXISTING fleet/gossip fabric — a signed `firmware_update`
+    # FleetCommand on the MessageBus 'fleet.command' topic (core.peer_link +
+    # WAMP/PeerLink/Crossbar legs).  Two legs receive it, both converging on the
+    # EXACT same staged apply (pipeline → autoApply switch → auto-rollback) the
+    # boot poll uses — central only chooses WHICH commit; the local SIGN/CANARY
+    # gates still run (a push NEVER force-applies past canary), master key never
+    # touched:
+    #
+    #   • REALTIME leg — lives IN hart-backend, the long-lived process that holds
+    #     the WAMP session.  core.peer_link.local_subscribers (bootstrapped at
+    #     backend start) subscribes to 'fleet.command' and routes OTA-class
+    #     commands to ota_push_listener.handle_push, which verifies the
+    #     central/regional signature and kicks hart-ota-check.  No separate
+    #     subscriber process (a second process can't receive the Crossbar leg —
+    #     wamp_session is process-local), so the realtime subscribe is NOT
+    #     re-implemented here.
+    #
+    #   • DURABLE leg — THIS oneshot.  A push sent while the node was OFF is
+    #     persisted as a pending FleetCommand row (offline-first fallback).  On
+    #     boot this drains those via ota_push_listener.drain_pending (REUSING
+    #     FleetCommandService.get_pending_commands, which re-verifies each
+    #     issuer) and kicks hart-ota-check for any OTA push.  Mirrors
+    #     embedded_main's boot drain — one node-side fleet-receive shape, reused.
+    #
+    # Runs as root (no User=) like hart-self-build-watch so it can start the
+    # privileged hart-ota-check unit directly — no new sudo/polkit rule, and the
+    # actual privileged switch still happens inside hart-ota-check's own
+    # hardened, audited context.
+    systemd.services.hart-ota-push = {
+      description = "HART OS OTA Push Receiver — durable drain (central push → staged apply)";
+      after = [ "network-online.target" "hart-backend.service" ];
+      wants = [ "network-online.target" ];
+      wantedBy = [ "multi-user.target" ];
+
+      environment = {
+        HEVOLVE_DATA_DIR = cfg.dataDir;
+        HEVOLVE_DB_PATH = "${cfg.dataDir}/hevolve_database.db";
+        HART_OTA_CHANNEL = ota.channel;
+        # The unit the push kicks — the SAME apply path the boot poll uses.
+        HART_OTA_CHECK_UNIT = "hart-ota-check.service";
+        PYTHONDONTWRITEBYTECODE = "1";
+        PYTHONUNBUFFERED = "1";
+      };
+
+      serviceConfig = {
+        Type = "oneshot";
+        WorkingDirectory = hartApp;
+        # Reuse the node-side listener — drain offline-queued central OTA pushes
+        # once and kick hart-ota-check for each.  No bespoke transport/pipeline
+        # in the Nix string; the realtime subscribe lives in hart-backend.
+        ExecStart = "${hartApp.python}/bin/python -m integrations.agent_engine.ota_push_listener --drain-only";
+        StandardOutput = "journal";
+        StandardError = "journal";
+        SyslogIdentifier = "hart-ota-push";
+      };
+    };
+
+    # Run the durable drain shortly after boot (and let the boot poll's timer
+    # cover the no-push path).  A oneshot on a boot timer — NOT a recurring poll
+    # (the trigger model forbids interval polling); realtime pushes are handled
+    # live by hart-backend, this only sweeps what was queued while offline.
+    systemd.timers.hart-ota-push = {
+      description = "HART OS OTA durable push-drain (boot sweep)";
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnBootSec = "3min";
+        RandomizedDelaySec = "2min";
+        Persistent = true;
       };
     };
 
@@ -383,6 +542,10 @@ in
             echo "=== HART OS Update Status ==="
             echo "Channel: ${ota.channel}"
             echo "Auto-apply: ${if ota.autoApply then "enabled" else "disabled"}"
+            echo "Central: ${if ota.centralEndpoint != "" then ota.centralEndpoint else "(disabled — flakeRef only)"}"
+            echo "Triggers: boot poll + 'hart-ota check' + central push (NO interval poll)"
+            PUSH=$(systemctl is-active hart-ota-push.service 2>/dev/null || echo "unknown")
+            echo "Push receiver: $PUSH"
             echo ""
             # Pipeline status from orchestrator
             curl -sf "$BACKEND/api/upgrades/status" 2>/dev/null | ${pkgs.jq}/bin/jq . || \
@@ -392,7 +555,10 @@ in
             nixos-version 2>/dev/null || echo "unknown"
             ;;
           check)
-            echo "Checking for updates..."
+            # User-initiated poll — one of the two poll triggers (the other is
+            # the boot timer).  Polls CENTRAL for this channel's approved build
+            # and stages it through the same pipeline; there is no interval poll.
+            echo "Checking CENTRAL for updates now (channel: ${ota.channel})..."
             systemctl start hart-ota-check.service
             journalctl -u hart-ota-check -n 20 --no-pager
             ;;
@@ -430,13 +596,18 @@ in
             echo ""
             echo "Commands:"
             echo "  hart-ota status       Show update status + current generation"
-            echo "  hart-ota check        Check for updates now"
+            echo "  hart-ota check        Poll CENTRAL for updates now (user trigger)"
             echo "  hart-ota apply        Apply staged update (nixos-rebuild switch)"
             echo "  hart-ota rollback     Revert to previous generation"
             echo "  hart-ota self-build   Rebuild OS from current config (runtime.nix)"
             echo "  hart-ota dry-run      Test build without applying"
             echo "  hart-ota diff         Show what would change"
             echo "  hart-ota history      Show update + build history"
+            echo ""
+            echo "Updates arrive on exactly two triggers (no periodic poll):"
+            echo "  1. POLL central  — on boot, and on 'hart-ota check'"
+            echo "  2. PUSH central  — at any time, via hart-ota-push over the"
+            echo "                     existing fleet/gossip fabric (signed)"
             ;;
           *)
             echo "Unknown command: $1 (try: hart-ota help)"

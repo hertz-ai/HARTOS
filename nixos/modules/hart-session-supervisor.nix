@@ -324,8 +324,10 @@ in
         Tier-2 launch command — proven wlroots WM (sway) running the same
         glass shell as a layer-shell client. Null disables Tier-2 (the
         supervisor falls straight through hart-comp/sway to the cage floor).
-        Phase 8 wires the sway config that auto-starts the glass shell + the
-        swaymsg tile/summon shim; until then sway is the bare WM fallback.
+        Default is the bare WM; when hart.swayTier1.enable is set, that module
+        upgrades this (via mkDefault) to its `hart-sway-session` launcher, which
+        auto-starts the glass shell + puts the swaymsg tile/summon shim on PATH
+        (the Phase-8 Tier-2 parity rung). An explicit operator value still wins.
       '';
     };
 

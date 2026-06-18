@@ -247,15 +247,26 @@ in
     # (Tier-1); at Tier-2 the brain calls the shim directly. (ROADMAP §6 Phase 6
     # "Tier-2 swaymsg shim".)
 
-    # ── Integration contract with the Phase-1 tier-drop supervisor ──
-    # hart-session-supervisor.nix's `swayCommand` option (Tier-2 launcher) should
-    # be pointed at THIS module's `hart-sway-session` (sway + the kiosk config +
-    # the glass shell + the swaymsg shim) — NOT the bare `${pkgs.sway}/bin/sway`
-    # its default uses while this module is unbuilt. The launcher is on PATH when
-    # hart.swayTier1.enable is set, so the supervisor can resolve it. We do NOT
-    # edit the supervisor here (separate module/owner); the operator/config wires
-    # `hart.sessionSupervisor.swayCommand = "hart-sway-session"` once both are on.
+    # ── Phase-8 wiring to the Phase-1 tier-drop supervisor ──
+    # Point the supervisor's Tier-2 `swayCommand` at THIS module's
+    # `hart-sway-session` (sway + the kiosk config that auto-EXECs the glass-shell
+    # client + the swaymsg tile/summon shim on PATH) — NOT the bare
+    # `${pkgs.sway}/bin/sway` the supervisor defaults to while this module is off.
+    # That bare default starts an EMPTY sway with no shell and no agent windowing;
+    # the real session below is the Tier-2 parity rung the architecture mandates
+    # "wired NOW" (ROADMAP Phase 8: "Tier-2 sway parity … same glass shell as a
+    # layer-shell client").
     #
+    # mkDefault (not mkForce): an operator who set `hart.sessionSupervisor.
+    # swayCommand` explicitly still wins; this only upgrades the DEFAULT from
+    # bare-sway to the real session whenever swayTier1 is enabled. The supervisor
+    # treats a null swayCommand as "Tier-2 unavailable, fall through to cage", so
+    # a non-null real session here strictly improves the ladder, never weakens the
+    # floor. The supervisor still owns WHEN sway is selected + the never-drop-
+    # below-cage invariant; this module only provides a better Tier-2 binary.
+    hart.sessionSupervisor.swayCommand =
+      lib.mkDefault "${swaySessionLauncher}/bin/hart-sway-session";
+
     # Floor invariant the supervisor honors: this module can NEVER drop below cage
     # Tier-3, and never flips defaultSession itself.
   };

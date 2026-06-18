@@ -85,12 +85,13 @@ in
           # the .desktop (that needs GDM's pathsToLink). What it CAN assert: the
           # cage session's exec (hart-shell-session) is realized in the closure —
           # the same store-find the forced-software-GL subtest below relies on.
-          # Full DM-based login-registration is the GDM-based hart-desktop-boot
-          # test's job, not this minimal floor-lock node's.
+          # Full DM-based login-registration is the GDM-based desktop-boot test's
+          # job (tests/desktop-boot.nix, hart-desktop-shell-boot), not this minimal
+          # floor-lock node's.
           # Present only when a DM materializes sessionPackages -> sessionData; the
           # minimal #70-safe node has no DM, so this is INFORMATIONAL here (the
-          # GDM-based hart-desktop-boot test verifies real registration). Never
-          # fail on its absence — the floor's verifiable value is the dead-husk.
+          # hart-desktop-shell-boot test verifies real registration). Never fail on
+          # its absence — the floor's verifiable value is the dead-husk.
           _launcher = floor.succeed(
               "find /nix/store -maxdepth 4 -name 'hart-shell-session' -type f "
               "-print -quit; true").strip()
@@ -104,8 +105,9 @@ in
           # GPU GL path. Grep the wrapper script content.
           # Only check the launcher's software-render env when it's in the closure
           # (a DM materialized it); the minimal node has no DM, so defer to the
-          # GDM-based hart-desktop-boot test there. _launcher is from the subtest
-          # above (with-subtest blocks share the testScript scope).
+          # GDM-based hart-desktop-shell-boot test (tests/desktop-boot.nix), which
+          # reads the SAME launcher off the DM-registered .desktop. _launcher is
+          # from the subtest above (with-subtest blocks share the testScript scope).
           if _launcher:
               launcher = floor.succeed("cat " + _launcher)
               assert "WLR_RENDERER_ALLOW_SOFTWARE=1" in launcher, \
@@ -113,7 +115,7 @@ in
               assert "LIBGL_ALWAYS_SOFTWARE=1" in launcher, \
                   "kiosk launcher missing LIBGL_ALWAYS_SOFTWARE — software floor lost"
           else:
-              floor.log("software-GL launcher content check deferred to hart-desktop-boot (no DM here)")
+              floor.log("software-GL launcher content check deferred to hart-desktop-shell-boot (no DM here)")
 
       # ── 3. Glass-shell GI typelibs present so cage can launch the WebView ──
       with subtest("Glass-shell GI typelibs present (Gtk-3.0 + WebKit2-4.1)"):

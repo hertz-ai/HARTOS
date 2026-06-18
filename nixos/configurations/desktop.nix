@@ -193,10 +193,19 @@ in
     };
 
     # ── OTA Updates ──
+    # Autonomous central-controlled OTA: the node polls CENTRAL on boot (and on
+    # `hart-ota check`) and receives CENTRAL pushes at any time over the existing
+    # fleet/gossip fabric — NO periodic interval poll. autoApply=true makes the
+    # apply hands-off (the `completed` branch switches via `nixos-rebuild switch
+    # --flake` with `|| nixos-rebuild switch --rollback`), so a steward publish
+    # lands on every node with no per-node USB/flash. The master-key SIGN gate +
+    # canary + auto-rollback still run before DEPLOY — central only chooses WHICH
+    # commit; the node never force-applies past canary, and the master key is
+    # never touched on the node. This replaces the user's last manual flash.
     ota = {
       enable = true;
       channel = "stable";
-      autoApply = false;               # Stage updates, user approves
+      autoApply = true;                # hands-off: central publish → auto-apply
     };
   };
 

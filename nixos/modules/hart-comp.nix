@@ -97,11 +97,37 @@ let
       mesa                # GBM + the optional hardware GL path
       seatd               # libseat session/seat management
       udev                # device hotplug
+      # ── Phase 5 (native toplevels) — added when the Smithay `xwayland` feature
+      # is uncommented in compositor/Cargo.toml at CI bring-up (today the feature
+      # is a commented manifest + the handler bodies are todo!()/unwired, so these
+      # are NOT yet needed to build the pure-logic skeleton). xwayland + the X11
+      # client libs back the XWayland path that surfaces Wine/legacy-X11 toplevels;
+      # xdg-shell / xdg-decoration / wlr-layer-shell / wlr-foreign-toplevel-
+      # management need no extra C dep (they ride wayland-protocols above):
+      #   xwayland xorg.libX11 xorg.libxcb xorg.xcbutilwm
     ]);
 
-    # The skeleton's pure-logic unit tests (render-path selection / splash alpha)
-    # run in the build; the real paint/scanout proof is the nixosTest VM. doCheck
-    # stays ON so the never-fail-floor invariant tests gate every build.
+    # ── Phase-5 native-toplevel feature (src/wayland.rs) ──
+    # The real Smithay handler bodies (xdg-shell / XWayland / xdg-decoration /
+    # wlr-foreign-toplevel-management trait impls + the live summon orchestration)
+    # live in compositor/src/wayland.rs behind `#![cfg(feature = "smithay")]`. They
+    # compile ONLY when the `smithay` cargo feature is on — which is ALSO when the
+    # git-Smithay dep + the xwayland C deps below get uncommented (one CI step). Until
+    # that bring-up, buildFeatures stays EMPTY so the default build is the pure-logic
+    # skeleton (no git-Smithay fetch, no Wayland link) and the dev box / this eval
+    # path never need Smithay. At Phase-5 CI bring-up, set:
+    #   buildFeatures = [ "smithay" ];
+    # together with uncommenting the smithay/calloop deps in Cargo.toml and the
+    # xwayland C libs below. We do NOT set it here (the build must stay resolvable on
+    # the pinned toolchain WITHOUT git-Smithay until the rev is pinned + vendored).
+    buildFeatures = [ ];
+
+    # The skeleton's pure-logic unit tests (render-path selection / splash alpha /
+    # the no-phantom-window WindowRegistry + SummonResolver invariants) run in the
+    # build; the real paint/scanout/toplevel-map proof is the nixosTest VM. doCheck
+    # stays ON so the never-fail-floor + no-phantom-window invariant tests gate every
+    # build. (Feature-OFF, so cargo test compiles only main.rs + its #[cfg(test)];
+    # wayland.rs is excluded until the smithay feature is on in CI.)
     doCheck = true;
 
     meta = {
