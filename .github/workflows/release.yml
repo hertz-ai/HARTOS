@@ -70,7 +70,6 @@ jobs:
             --ignore=tests/unit/test_social_models.py \
             --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
             --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
-            --noconftest \
             --timeout=120 \
             -q --tb=line
 
@@ -86,7 +85,6 @@ jobs:
           cd ${{ github.workspace }}
           python -m pytest \
             tests/integration/ \
-            --noconftest \
             --timeout=120 \
             -q --tb=line || echo "Integration tests had failures (non-blocking)"
 
@@ -102,7 +100,6 @@ jobs:
           python -m pytest \
             tests/e2e/ \
             --ignore=tests/e2e/runtime_tests \
-            --noconftest \
             --timeout=120 \
             -q --tb=line || echo "E2E tests had failures (non-blocking)"
 
@@ -681,9 +678,11 @@ jobs:
           mkdir -p _site/test-reports/junit _site/test-reports/coverage
           python -m pytest \
             tests/unit/ tests/functional/ \
-            --noconftest -v --tb=short \
+            -v --tb=short \
             --junitxml=_site/test-reports/junit/results.xml \
             --cov=integrations --cov=security --cov=core \
+            --cov=hart_intelligence_entry --cov=create_recipe --cov=reuse_recipe \
+            --cov=lifecycle_hooks --cov=helper --cov=helper_ledger \
             --cov-report=html:_site/test-reports/coverage \
             --cov-report=term-missing || true
 
