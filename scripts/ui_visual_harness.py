@@ -101,6 +101,75 @@ def _probe_dom(page):
     }
 
 
+def _run_interactions(page):
+    """Click the real chrome (start menu, tray, icon, context menu) and report
+    which handlers actually FIRE — the diagnosis static screenshots can't give."""
+    import time as _t
+    r = {}
+
+    def vis(sel):
+        try:
+            return page.eval_on_selector(sel, "el=>{const s=getComputedStyle(el);return s.display!=='none'&&s.visibility!=='hidden'&&el.offsetHeight>0;}")
+        except Exception:
+            return False
+
+    def npanels():
+        try:
+            return len(page.query_selector_all(".panel"))
+        except Exception:
+            return 0
+
+    # 1) Start menu — single-click the start button
+    try:
+        page.click(".start-btn", timeout=4000)
+        _t.sleep(0.7)
+        r["start_menu_opens"] = vis(".start-menu")
+        try:
+            page.screenshot(path=os.path.join(OUT_DIR, "interact_startmenu.png"))
+        except Exception:
+            pass
+        page.keyboard.press("Escape")
+        _t.sleep(0.3)
+    except Exception as exc:
+        r["start_menu_err"] = str(exc)[:160]
+
+    # 2) Tray button -> opens a panel
+    try:
+        before = npanels()
+        page.click(".tray-btn", timeout=4000)
+        _t.sleep(0.8)
+        r["tray_opens_panel"] = npanels() > before
+    except Exception as exc:
+        r["tray_err"] = str(exc)[:160]
+
+    # 3) Desktop icon — present? single-click selects? double-click opens?
+    try:
+        ic = page.query_selector(".desktop-icon")
+        r["desktop_icon_present"] = bool(ic)
+        if ic:
+            ic.click(timeout=4000)
+            _t.sleep(0.3)
+            r["single_click_selects"] = page.eval_on_selector(".desktop-icon", "el=>el.classList.contains('selected')")
+            before = npanels()
+            ic.dblclick(timeout=4000)
+            _t.sleep(0.8)
+            r["dblclick_opens_panel"] = npanels() > before
+    except Exception as exc:
+        r["icon_err"] = str(exc)[:160]
+
+    # 4) Context menu — right-click an icon shows #ctx-menu?
+    try:
+        ic = page.query_selector(".desktop-icon")
+        if ic:
+            ic.click(button="right", timeout=4000)
+            _t.sleep(0.5)
+            r["ctx_menu_shows"] = vis("#ctx-menu")
+    except Exception as exc:
+        r["ctx_err"] = str(exc)[:160]
+
+    return r
+
+
 def main(scenario="shell"):
     from integrations.agent_engine.liquid_ui_service import LiquidUIService
 
@@ -120,15 +189,19 @@ def main(scenario="shell"):
     skip_onboard = scenario != "onboarding"
     from playwright.sync_api import sync_playwright
 
+    # Interaction testing only needs one viewport (clicks behave the same); we
+    # care about WHICH handlers fire, not the layout.
+    vps = [v for v in VIEWPORTS if v[0] == "desktop"] if scenario == "interact" else VIEWPORTS
+
     results = []
     any_pageerror = False
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        for name, w, h in VIEWPORTS:
+        for name, w, h in vps:
             page = browser.new_page(viewport={"width": w, "height": h})
-            errors, failed = [], []
+            errors, failed, clog = [], [], []
             # default-arg binding captures THIS iteration's lists (closure-safe)
-            page.on("console", lambda m, e=errors: e.append(f"console: {m.text}") if m.type == "error" else None)
+            page.on("console", lambda m, e=errors, c=clog: (c.append(f"{m.type}: {m.text}"), e.append(f"console: {m.text}") if m.type == "error" else None))
             page.on("pageerror", lambda exc, e=errors: e.append(f"pageerror: {exc}"))
             page.on("requestfailed", lambda r, f=failed: f.append(f"{r.method} {r.url}"))
 
@@ -166,6 +239,8 @@ def main(scenario="shell"):
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"open files: {exc}")
 
+            inter = _run_interactions(page) if scenario == "interact" else None
+
             png = os.path.join(OUT_DIR, f"{scenario}_{name}.png")
             page.screenshot(path=png, full_page=False)
             size = os.path.getsize(png) if os.path.exists(png) else 0
@@ -178,7 +253,9 @@ def main(scenario="shell"):
                 "viewport": name, "w": w, "h": h,
                 "png": png, "bytes": size,
                 "dom": dom,
+                "interact": inter,
                 "console_errors": errors[:25],
+                "console_log": clog[-45:] if scenario == "interact" else [],
                 "failed_requests": failed[:25],
             })
             page.close()

@@ -40,13 +40,19 @@
 
   function launch(id) { if (typeof window.openPanel === 'function') window.openPanel(id); }
 
+  function selectIcon(el) {                            // desktop single-click = select (deselect siblings)
+    if (layer) Array.prototype.forEach.call(layer.querySelectorAll('.desktop-icon.selected'),
+      function (n) { n.classList.remove('selected'); });
+    if (el) el.classList.add('selected');
+  }
+
   function snap(v) { return Math.max(0, Math.round((v - PAD) / GRID) * GRID + PAD); }
 
   function bindIcon(el) {
     var id = el.getAttribute('data-id');
     var dragging = false, moved = false, sx = 0, sy = 0, ox = 0, oy = 0, dx = 0, dy = 0, raf = 0;
 
-    el.addEventListener('dblclick', function () { launch(id); });
+    el.addEventListener('dblclick', function () { launch(id); }); // desktop (mouse): double-click opens
     el.addEventListener('keydown', function (e) {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); launch(id); }
     });
@@ -78,6 +84,10 @@
         el.style.left = snap(ox + dx) + 'px';
         el.style.top = snap(oy + dy) + 'px';
         persist();
+      } else if (e && e.pointerType === 'touch') {    // touch surface: a single tap opens
+        launch(id);
+      } else {                                        // desktop mouse: single click selects
+        selectIcon(el);
       }
     }
     el.addEventListener('pointerup', endDrag);

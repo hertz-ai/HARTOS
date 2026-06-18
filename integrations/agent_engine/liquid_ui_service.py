@@ -1172,9 +1172,10 @@ html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot{animat
         _CSS_DESKTOP = '''
 .hart-desktop{position:fixed;left:0;right:0;top:var(--hart-topbar-height);bottom:44px;z-index:20;pointer-events:none}
 .desktop-icon{position:absolute;width:84px;display:flex;flex-direction:column;align-items:center;gap:6px;
-  padding:8px 4px;border-radius:12px;cursor:pointer;pointer-events:auto;user-select:none;
+  padding:8px 4px;border-radius:12px;cursor:default;pointer-events:auto;user-select:none;
   transition:background .15s,transform .12s cubic-bezier(.175,.885,.32,1.275);will-change:transform}
 .desktop-icon:hover{background:rgba(255,255,255,0.08)}
+.desktop-icon.selected{background:rgba(108,99,255,0.28);outline:1px solid rgba(108,99,255,0.5)}
 .desktop-icon:focus-visible{outline:2px solid var(--hart-accent);outline-offset:2px}
 .desktop-icon.dragging{z-index:60;transition:none;opacity:.92;cursor:grabbing}
 .desktop-icon .di-glyph{width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;
@@ -1548,7 +1549,6 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      orb canvas below is the SAME #hart-voice-orb driven by initHartOrb; the bar
      fuses search + agent dispatch + the voice transcript sink. -->
 <div class="hart-hero" id="hart-hero" role="search" aria-label="HART command center">
-  <div class="hart-hero-brand"><img src="/shell/static/hevolve-logo.png" alt="HART OS" draggable="false"><span>HART OS</span></div>
   <div class="hart-hero-orbwrap">
     <canvas id="hart-voice-orb" width="360" height="360" aria-hidden="true"></canvas>
     <button class="hart-hero-mic" id="hart-hero-mic" type="button" aria-label="Speak to HART (Super+Space)" title="Click or press Super+Space to speak"><span class="mi material-icons-round" aria-hidden="true">mic</span></button>
@@ -1610,7 +1610,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script src="/shell/static/hartFiles.js"></script>
 
 <!-- Agent Pill (click to expand floating chat) -->
-<div class="agent-pill glass" id="agent-pill" onclick="toggleAssistantChat()">
+<div class="agent-pill glass hidden" id="agent-pill" onclick="toggleAssistantChat()">
   <span class="mi material-icons-round" style="color:var(--hart-accent)">chat_bubble</span>
   <input id="agent-input" placeholder="Ask HART..." onclick="event.stopPropagation();toggleAssistantChat()" onkeydown="if(event.key==='Enter'){{event.stopPropagation();toggleAssistantChat();setTimeout(function(){{var i=document.getElementById('ac-input');if(i){{i.value=document.getElementById('agent-input').value;document.getElementById('agent-input').value=''}}}},100)}}">
   <div class="agent-response" id="agent-resp"></div>
