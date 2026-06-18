@@ -403,12 +403,18 @@ class TestMacOSDarling(_InstallerCase):
            return_value='/usr/bin/darling')
     @patch('integrations.agent_engine.app_installer.subprocess.run')
     def test_prefix_boot_failure_is_failure(self, mock_run, _which):
-        """`darling shell true` itself fails -> we never trust anything else."""
+        """`darling shell true` itself fails -> we never trust anything else.
+        (Uses a REAL temp Mach-O CLI so the on-disk isfile guard passes and the
+        boot-proof branch is what is exercised.)"""
         mock_run.return_value = MagicMock(
             returncode=1, stdout='', stderr='cannot init prefix')
-        res = self.installer._install_macos(InstallRequest(source='cli-binary'))
-        self.assertFalse(res.success)
-        self.assertIn('boot', res.error)
+        src = _tmpfile('', magic=b'\xcf\xfa\xed\xfe')
+        try:
+            res = self.installer._install_macos(InstallRequest(source=src))
+            self.assertFalse(res.success)
+            self.assertIn('boot', res.error)
+        finally:
+            os.unlink(src)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -631,6 +637,373 @@ class TestDispatchCoverage(_InstallerCase):
             # If p had no handler, install() returns the 'No installer for
             # platform' error; assert that never happens.
             self.assertNotIn('No installer for platform', res.error or '')
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SYMMETRIC UNINSTALL — every install type reaches parity, confirmed removal
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestUninstallDispatch(_InstallerCase):
+    """uninstall() routes each platform to its handler — no orphan, no parallel
+    path. Mirrors the install dispatch coverage."""
+
+    def test_each_platform_routes_to_its_uninstaller(self):
+        mapping = {
+            'nix': '_uninstall_nix',
+            'flatpak': '_uninstall_flatpak',
+            'appimage': '_uninstall_appimage',
+            'windows': '_uninstall_windows',
+            'android': '_uninstall_android',
+            'macos': '_uninstall_macos',
+            'snap': '_uninstall_snap',
+            'browser_ext': '_uninstall_browser_ext',
+        }
+        for plat, handler_name in mapping.items():
+            with patch.object(self.installer, handler_name) as mock_h:
+                mock_h.return_value = InstallResult(
+                    success=True, platform=plat, name='x')
+                self.installer.uninstall('x', plat)
+                mock_h.assert_called_once()
+
+    def test_unknown_platform_is_honest_failure(self):
+        res = self.installer.uninstall('x', 'beos')
+        self.assertFalse(res.success)
+        self.assertIn('not supported', res.error.lower())
+
+
+class TestUninstallAndroid(_InstallerCase):
+    """Android uninstall is REAL: `waydroid app remove` + CONFIRM the package is
+    GONE from `waydroid app list`. No session => honest failure."""
+
+    def test_confirmed_removal_success(self):
+        def fake_run(cmd, **kw):
+            if cmd[:3] == ['/usr/bin/waydroid', 'app', 'remove']:
+                return MagicMock(returncode=0, stdout='', stderr='')
+            if cmd[:3] == ['/usr/bin/waydroid', 'app', 'list']:
+                return MagicMock(returncode=0, stdout='(no apps)\n', stderr='')
+            return MagicMock(returncode=0, stdout='', stderr='')
+
+        with patch('integrations.agent_engine.app_installer.shutil.which',
+                   return_value='/usr/bin/waydroid'), \
+             patch.object(self.installer, '_waydroid_session_live',
+                          return_value=True), \
+             patch('integrations.agent_engine.app_installer.subprocess.run',
+                   side_effect=fake_run):
+            res = self.installer._uninstall_android('com.foo.bar')
+        self.assertTrue(res.success)
+        self.assertEqual(res.app_id, 'com.foo.bar')
+
+    def test_still_listed_after_remove_is_failure(self):
+        """remove ran rc=0 but the package is STILL in app list -> failure
+        (exit-0 is not proof of removal, mirroring the install contract)."""
+        def fake_run(cmd, **kw):
+            if cmd[:3] == ['/usr/bin/waydroid', 'app', 'remove']:
+                return MagicMock(returncode=0, stdout='', stderr='')
+            if cmd[:3] == ['/usr/bin/waydroid', 'app', 'list']:
+                return MagicMock(returncode=0,
+                                 stdout='packageName: com.foo.bar\n', stderr='')
+            return MagicMock(returncode=0, stdout='', stderr='')
+
+        with patch('integrations.agent_engine.app_installer.shutil.which',
+                   return_value='/usr/bin/waydroid'), \
+             patch.object(self.installer, '_waydroid_session_live',
+                          return_value=True), \
+             patch('integrations.agent_engine.app_installer.subprocess.run',
+                   side_effect=fake_run):
+            res = self.installer._uninstall_android('com.foo.bar')
+        self.assertFalse(res.success)
+        self.assertIn('still lists', res.error)
+
+    def test_no_session_is_honest_failure_no_command(self):
+        with patch('integrations.agent_engine.app_installer.shutil.which',
+                   return_value='/usr/bin/waydroid'), \
+             patch.object(self.installer, '_waydroid_session_live',
+                          return_value=False), \
+             patch('integrations.agent_engine.app_installer.subprocess.run',
+                   side_effect=AssertionError(
+                       'no remove command without a session')):
+            res = self.installer._uninstall_android('com.foo.bar')
+        self.assertFalse(res.success)
+        self.assertIn('hart.subsystems.android', res.error)
+
+
+class TestUninstallMacOS(_InstallerCase):
+    """macOS uninstall removes the Darling-managed bundle/binary under our
+    install dir and CONFIRMS it is gone; fails clearly when nothing is staged."""
+
+    def _stage(self, app_id, is_dir=True):
+        macos_dir = os.path.join(self.installer._install_dir, 'macos', 'apps')
+        os.makedirs(macos_dir, exist_ok=True)
+        target = os.path.join(macos_dir, app_id + ('.app' if is_dir else ''))
+        if is_dir:
+            os.makedirs(target)
+            with open(os.path.join(target, 'marker'), 'w') as f:
+                f.write('x')
+        else:
+            with open(target, 'wb') as f:
+                f.write(b'\xcf\xfa\xed\xfe')
+        return target
+
+    def test_confirmed_removal_of_bundle(self):
+        target = self._stage('MyApp', is_dir=True)
+        self.assertTrue(os.path.exists(target))
+        res = self.installer._uninstall_macos('MyApp')
+        self.assertTrue(res.success)
+        self.assertFalse(os.path.exists(target))
+
+    def test_confirmed_removal_of_cli_binary(self):
+        target = self._stage('mycli', is_dir=False)
+        res = self.installer._uninstall_macos('mycli')
+        self.assertTrue(res.success)
+        self.assertFalse(os.path.exists(target))
+
+    def test_nothing_staged_is_honest_failure(self):
+        res = self.installer._uninstall_macos('ghost')
+        self.assertFalse(res.success)
+        self.assertIn('No Darling-managed', res.error)
+
+    def test_remove_failure_propagates(self):
+        target = self._stage('MyApp', is_dir=True)
+        with patch('integrations.agent_engine.app_installer.shutil.rmtree',
+                   side_effect=PermissionError('read-only')):
+            res = self.installer._uninstall_macos('MyApp')
+        self.assertFalse(res.success)
+        self.assertIn('Failed to remove', res.error)
+        # On a propagated failure the target must still be there (no fake-gone).
+        self.assertTrue(os.path.exists(target))
+
+
+class TestUninstallSnap(_InstallerCase):
+    """Snap uninstall mirrors the install refusal — honest unsupported."""
+
+    def test_refuses_honestly(self):
+        res = self.installer._uninstall_snap('firefox')
+        self.assertFalse(res.success)
+        self.assertIn('not supported', res.error.lower())
+        self.assertEqual(res.platform, 'snap')
+
+
+class TestUninstallBrowserExt(_InstallerCase):
+    """Browser-ext uninstall drops the id from the managed policy + CONFIRMS it
+    is GONE on disk; write failure propagates; absent id is honest failure."""
+
+    def _write_chromium(self, policy_dir, ids):
+        import json
+        os.makedirs(policy_dir, exist_ok=True)
+        pf = os.path.join(policy_dir, 'hart_extensions.json')
+        with open(pf, 'w') as f:
+            json.dump({'ExtensionInstallForcelist':
+                       [f'{i};http://u' for i in ids]}, f)
+        return pf
+
+    def _write_firefox(self, policy_dir, ids):
+        import json
+        os.makedirs(policy_dir, exist_ok=True)
+        pf = os.path.join(policy_dir, 'policies.json')
+        with open(pf, 'w') as f:
+            json.dump({'policies': {'ExtensionSettings':
+                       {i: {'installation_mode': 'force_installed'}
+                        for i in ids}}}, f)
+        return pf
+
+    def test_removes_chromium_id_and_confirms_gone(self):
+        import json
+        policy_dir = tempfile.mkdtemp()
+        try:
+            pf = self._write_chromium(policy_dir, ['keep', 'drop'])
+            res = self.installer._uninstall_browser_ext(
+                'drop', {'policy_dir': policy_dir})
+            self.assertTrue(res.success)
+            with open(pf) as f:
+                ids = [e.split(';')[0]
+                       for e in json.load(f)['ExtensionInstallForcelist']]
+            self.assertNotIn('drop', ids)
+            self.assertIn('keep', ids)  # only the targeted id is removed
+        finally:
+            import shutil
+            shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_removes_firefox_id_and_confirms_gone(self):
+        import json
+        policy_dir = tempfile.mkdtemp()
+        try:
+            pf = self._write_firefox(policy_dir, ['keep@x', 'drop@x'])
+            res = self.installer._uninstall_browser_ext(
+                'drop@x', {'policy_dir': policy_dir})
+            self.assertTrue(res.success)
+            with open(pf) as f:
+                settings = json.load(f)['policies']['ExtensionSettings']
+            self.assertNotIn('drop@x', settings)
+            self.assertIn('keep@x', settings)
+        finally:
+            import shutil
+            shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_absent_id_is_honest_failure(self):
+        policy_dir = tempfile.mkdtemp()
+        try:
+            self._write_chromium(policy_dir, ['somethingelse'])
+            res = self.installer._uninstall_browser_ext(
+                'notthere', {'policy_dir': policy_dir})
+            self.assertFalse(res.success)
+            self.assertIn('not found', res.error.lower())
+        finally:
+            import shutil
+            shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_write_failure_propagates(self):
+        policy_dir = tempfile.mkdtemp()
+        try:
+            self._write_chromium(policy_dir, ['drop'])
+            real_open = open
+
+            def boom(path, mode='r', *a, **k):
+                if 'w' in mode:
+                    raise PermissionError('read-only')
+                return real_open(path, mode, *a, **k)
+
+            with patch('builtins.open', side_effect=boom):
+                res = self.installer._uninstall_browser_ext(
+                    'drop', {'policy_dir': policy_dir})
+            self.assertFalse(res.success)
+            self.assertIn('Failed to update', res.error)
+        finally:
+            import shutil
+            shutil.rmtree(policy_dir, ignore_errors=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Install symmetry — macOS isfile/dir guard (the prior review's follow-up)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestMacOSSourceGuard(_InstallerCase):
+    @patch('integrations.agent_engine.app_installer.shutil.which',
+           return_value='/usr/bin/darling')
+    @patch('integrations.agent_engine.app_installer.subprocess.run',
+           side_effect=AssertionError('missing source must not run a subprocess'))
+    def test_missing_source_fails_before_darling(self, _run, _which):
+        res = self.installer._install_macos(
+            InstallRequest(source='/no/such/path.app'))
+        self.assertFalse(res.success)
+        self.assertIn('not found', res.error.lower())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONSOLIDATED AGENT APP-OPS — list spans sources, launch routes through
+# dispatch_verb, uninstall confirms (the agent-facing surface)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestAgentAppOps(_InstallerCase):
+    """The ONE agent-facing app-ops verb: LIST (over AppRegistry.list_all,
+    source-agnostic), LAUNCH (via HartWmClient.dispatch_verb — no forked exec),
+    UNINSTALL (via the symmetric dispatcher), UPDATE."""
+
+    def _fake_manifest(self, mid, name, tags):
+        m = MagicMock()
+        m.id = mid
+        m.name = name
+        m.type = 'desktop_app'
+        m.version = '1.0'
+        m.tags = tags
+        m.group = 'Installed'
+        return m
+
+    def test_list_spans_sources_via_registry(self):
+        reg = MagicMock()
+        reg.list_all.return_value = [
+            self._fake_manifest('gimp', 'GIMP', ['installed', 'flatpak']),
+            self._fake_manifest('foo', 'Foo', ['installed', 'android']),
+        ]
+        with patch.object(self.installer, '_app_registry', return_value=reg), \
+             patch.object(self.installer, 'list_installed', return_value=[]):
+            out = self.installer.app_ops('list')
+        self.assertTrue(out['ok'])
+        by_id = {a['id']: a for a in out['apps']}
+        self.assertEqual(by_id['gimp']['source'], 'flatpak')
+        self.assertEqual(by_id['foo']['source'], 'android')
+        self.assertEqual(out['count'], 2)
+
+    def test_list_augments_with_live_system_packages(self):
+        reg = MagicMock()
+        reg.list_all.return_value = [
+            self._fake_manifest('gimp', 'GIMP', ['flatpak'])]
+        with patch.object(self.installer, '_app_registry', return_value=reg), \
+             patch.object(self.installer, 'list_installed', return_value=[
+                 {'name': 'htop', 'platform': 'nix', 'version': '3.2'}]):
+            out = self.installer.app_ops('list')
+        sources = {a['id']: a['source'] for a in out['apps']}
+        self.assertEqual(sources['htop'], 'nix')
+        self.assertEqual(sources['gimp'], 'flatpak')
+
+    def test_list_works_without_registry(self):
+        with patch.object(self.installer, '_app_registry', return_value=None), \
+             patch.object(self.installer, 'list_installed', return_value=[
+                 {'name': 'htop', 'platform': 'nix'}]):
+            out = self.installer.app_ops('list')
+        self.assertTrue(out['ok'])
+        self.assertEqual(out['apps'][0]['id'], 'htop')
+
+    def test_launch_routes_through_dispatch_verb(self):
+        wm = MagicMock()
+        wm.dispatch_verb.return_value = {'ok': True, 'manifest_id': 'gimp',
+                                         'handle': 'win-1', 'mapped': True}
+        with patch('integrations.agent_engine.hart_wm_client.get_wm_client',
+                   return_value=wm):
+            out = self.installer.app_ops('launch', agent_id='agent-7',
+                                         app_id='gimp')
+        self.assertTrue(out['ok'])
+        wm.dispatch_verb.assert_called_once_with(
+            'window.summon', {'manifest_id': 'gimp'}, 'agent-7')
+        self.assertEqual(out['op'], 'launch')
+        self.assertEqual(out['app_id'], 'gimp')
+
+    def test_launch_surfaces_honest_unsupported(self):
+        """Tier-2 summon returns unsupported (no phantom) — app_ops passes it
+        through honestly rather than faking a launch."""
+        wm = MagicMock()
+        wm.dispatch_verb.return_value = {'ok': False, 'error': 'unsupported'}
+        with patch('integrations.agent_engine.hart_wm_client.get_wm_client',
+                   return_value=wm):
+            out = self.installer.app_ops('launch', app_id='gimp')
+        self.assertFalse(out['ok'])
+        self.assertEqual(out['error'], 'unsupported')
+
+    def test_launch_requires_app_id(self):
+        out = self.installer.app_ops('launch')
+        self.assertFalse(out['ok'])
+        self.assertIn('app_id required', out['error'])
+
+    def test_uninstall_routes_through_dispatcher_and_confirms(self):
+        with patch.object(self.installer, '_uninstall_flatpak') as mock_u:
+            mock_u.return_value = InstallResult(
+                success=True, platform='flatpak', name='gimp', app_id='gimp')
+            out = self.installer.app_ops('uninstall', app_id='gimp',
+                                         platform='flatpak')
+        self.assertTrue(out['ok'])
+        self.assertEqual(out['op'], 'uninstall')
+        mock_u.assert_called_once_with('gimp')
+
+    def test_update_reinstalls_via_install(self):
+        with patch.object(self.installer, '_install_flatpak') as mock_i:
+            mock_i.return_value = InstallResult(
+                success=True, platform='flatpak', name='gimp', app_id='gimp',
+                version='2.10')
+            out = self.installer.app_ops('update', app_id='gimp',
+                                         platform='flatpak')
+        self.assertTrue(out['ok'])
+        self.assertEqual(out['op'], 'update')
+        self.assertEqual(out['version'], '2.10')
+        mock_i.assert_called_once()
+
+    def test_update_snap_is_honest_unsupported(self):
+        out = self.installer.app_ops('update', app_id='x', platform='snap')
+        self.assertFalse(out['ok'])
+        self.assertIn('not supported', out['error'].lower())
+
+    def test_unknown_op_is_honest_failure(self):
+        out = self.installer.app_ops('frobnicate')
+        self.assertFalse(out['ok'])
+        self.assertIn('unknown app-op', out['error'])
 
 
 if __name__ == '__main__':

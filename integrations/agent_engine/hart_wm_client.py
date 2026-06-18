@@ -172,8 +172,8 @@ class HartWmClient:
         try:
             from core.platform.registry import get_registry
             reg = get_registry()
-            if reg.has('AppRegistry'):
-                app_registry = reg.get('AppRegistry')
+            if reg.has('apps'):
+                app_registry = reg.get('apps')
                 fn = getattr(app_registry, 'window_handle_for', None)
                 if callable(fn):
                     return fn(manifest_id)

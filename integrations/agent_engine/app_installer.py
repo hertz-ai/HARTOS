@@ -285,8 +285,19 @@ class AppInstaller:
 
         return result
 
-    def uninstall(self, app_id: str, platform: str = '') -> InstallResult:
-        """Uninstall an application."""
+    def uninstall(self, app_id: str, platform: str = '',
+                  options: Optional[Dict] = None) -> InstallResult:
+        """Uninstall an application.
+
+        Symmetric with ``install``: every platform that has an install handler
+        has a matching uninstall handler wired into this SAME dispatch (no
+        parallel path), and an uninstall is reported success=True ONLY on a
+        CONFIRMED removal — never a bare exit code or a best-effort no-op.
+
+        ``options`` carries platform-specific knobs (e.g. browser_ext's
+        ``policy_dir`` / ``browser``) mirroring InstallRequest.options.
+        """
+        options = options or {}
         if platform == 'nix' or not platform:
             result = self._uninstall_nix(app_id)
         elif platform == 'flatpak':
@@ -295,6 +306,14 @@ class AppInstaller:
             result = self._uninstall_appimage(app_id)
         elif platform == 'windows':
             result = self._uninstall_windows(app_id)
+        elif platform == 'android':
+            result = self._uninstall_android(app_id)
+        elif platform == 'macos':
+            result = self._uninstall_macos(app_id)
+        elif platform == 'snap':
+            result = self._uninstall_snap(app_id)
+        elif platform == 'browser_ext':
+            result = self._uninstall_browser_ext(app_id, options)
         else:
             result = InstallResult(
                 success=False, platform=platform, name=app_id,
@@ -844,6 +863,17 @@ class AppInstaller:
                       'instead. (macOS support is experimental, GUI mostly '
                       'broken.)')
 
+        # Consistency with the other file-based handlers (windows/appimage/
+        # android/browser_ext): the source we are about to read must exist on
+        # disk. A .app bundle is a DIRECTORY, so accept a file OR a dir — but
+        # refuse a path that is neither (the prior review's non-blocking
+        # follow-up). Placed AFTER the darling-absent + .dmg/.pkg honest
+        # refusals so those stay reachable without a real file present.
+        if not os.path.isfile(req.source) and not os.path.isdir(req.source):
+            return InstallResult(
+                success=False, platform='macos', name=name,
+                error='File not found')
+
         # Prove the Darwin prefix actually boots before trusting anything else.
         try:
             boot = subprocess.run(
@@ -1163,6 +1193,364 @@ class AppInstaller:
             success=False, platform='windows', name=name,
             error='Wine uninstaller requires interactive session')
 
+    def _uninstall_android(self, pkg: str) -> InstallResult:
+        """Remove an Android package via Waydroid, CONFIRMED gone (mirror of the
+        install side's `waydroid app list` confirmation).
+
+        Honest contract: require `waydroid` on PATH AND a live RUNNING session
+        (no session => the package can't be touched => honest failure). Run
+        `waydroid app remove <pkg>`, then CONFIRM the package is ABSENT from
+        `waydroid app list` — exit-0 alone is NOT proof of removal, exactly as
+        exit-0 is not proof of install. Success ONLY on confirmed absence.
+        """
+        if not pkg:
+            return InstallResult(
+                success=False, platform='android', name=pkg,
+                error='package id required to remove an Android app')
+
+        waydroid = shutil.which('waydroid')
+        if not waydroid or not self._waydroid_session_live():
+            return InstallResult(
+                success=False, platform='android', name=pkg, app_id=pkg,
+                error='Android runtime not available — enable '
+                      'hart.subsystems.android (Waydroid) and start a session '
+                      'to remove an app. Nothing was removed.')
+
+        try:
+            subprocess.run(
+                [waydroid, 'app', 'remove', pkg],
+                capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            return InstallResult(
+                success=False, platform='android', name=pkg, app_id=pkg,
+                error='waydroid app remove timed out')
+        except OSError as e:
+            return InstallResult(
+                success=False, platform='android', name=pkg, app_id=pkg,
+                error=str(e))
+
+        # CONFIRM removal: the package must NOT appear in `waydroid app list`.
+        try:
+            listing = subprocess.run(
+                [waydroid, 'app', 'list'],
+                capture_output=True, text=True, timeout=60)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return InstallResult(
+                success=False, platform='android', name=pkg, app_id=pkg,
+                error=f'remove ran but could not verify via app list: {e}')
+
+        if listing.returncode == 0 and pkg not in (listing.stdout or ''):
+            return InstallResult(
+                success=True, platform='android', name=pkg, app_id=pkg)
+
+        return InstallResult(
+            success=False, platform='android', name=pkg, app_id=pkg,
+            error=f'waydroid still lists {pkg} after remove — not uninstalled')
+
+    def _uninstall_macos(self, app_id: str) -> InstallResult:
+        """Remove a Darling-installed macOS app/prefix, CONFIRMED gone.
+
+        The macOS installer launches a .app binary or CLI inside the shared
+        Darling Darwin prefix; HART tracks the launched target via
+        ``install_path`` (recorded on the InstallResult and mirrored into the
+        AppRegistry manifest). Uninstall = delete that on-disk target/bundle
+        under our managed install dir, then CONFIRM it is gone. If we cannot
+        resolve a managed path for the id, or the delete leaves it present,
+        fail clearly — never a fake success.
+        """
+        macos_dir = os.path.join(self._install_dir, 'macos', 'apps')
+        # Candidate paths we are allowed to remove (managed install dir only —
+        # never reach outside it). Match by id against bundles/binaries staged
+        # under our macOS app dir.
+        target = ''
+        if os.path.isdir(macos_dir):
+            for entry in os.listdir(macos_dir):
+                stem = entry.replace('.app', '')
+                if app_id == entry or app_id == stem or app_id.lower() == stem.lower():
+                    target = os.path.join(macos_dir, entry)
+                    break
+
+        if not target or not os.path.exists(target):
+            return InstallResult(
+                success=False, platform='macos', name=app_id,
+                error=f'No Darling-managed macOS app found for "{app_id}" under '
+                      f'{macos_dir}. Cannot remove what was never staged here '
+                      '(macOS support is experimental).')
+
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target)
+            else:
+                os.remove(target)
+        except (IOError, OSError, PermissionError) as e:
+            return InstallResult(
+                success=False, platform='macos', name=app_id,
+                error=f'Failed to remove macOS app: {e}')
+
+        # CONFIRM the target is gone.
+        if os.path.exists(target):
+            return InstallResult(
+                success=False, platform='macos', name=app_id,
+                error=f'macOS app still present after remove: {target}')
+
+        return InstallResult(
+            success=True, platform='macos', name=app_id, app_id=app_id)
+
+    def _uninstall_snap(self, app_id: str) -> InstallResult:
+        """Snap is NOT supported on HART OS — honest refusal, mirroring the
+        install side (``_install_snap``). There is no snapd to remove from, so
+        a snap uninstall is as infeasible as a snap install; refuse plainly
+        instead of faking a removal."""
+        return InstallResult(
+            success=False, platform='snap', name=app_id,
+            error='Snap is not supported on HART OS — nothing to uninstall. '
+                  'snapd is not bundled (no /snap FHS tree, no nix-snapd '
+                  'flake input), so a snap was never installed here.')
+
+    def _uninstall_browser_ext(self, ext_id: str,
+                               options: Optional[Dict] = None) -> InstallResult:
+        """Remove a browser extension from the managed-policy force-install list,
+        CONFIRMED gone (mirror of ``_install_browser_ext`` which writes + verifies
+        the id ON DISK).
+
+        Drops ``ext_id`` from BOTH the Chromium ExtensionInstallForcelist and the
+        Firefox ExtensionSettings managed policies (whichever holds it), rewrites
+        the policy file, then CONFIRMS by reading it back and asserting the id is
+        ABSENT. A write failure propagates (no fake success). Success requires the
+        id to have been present and now absent in at least one policy.
+        """
+        options = options or {}
+        if not ext_id:
+            return InstallResult(
+                success=False, platform='browser_ext', name=ext_id,
+                error='extension id required to uninstall a browser extension')
+
+        chromium_policy = os.path.join(
+            options.get('chromium_policy_dir', '/etc/chromium/policies/managed'),
+            'hart_extensions.json')
+        firefox_policy = os.path.join(
+            options.get('firefox_policy_dir', '/etc/firefox/policies'),
+            'policies.json')
+        # A single ``policy_dir`` (as the install side accepts) overrides both,
+        # so a test/caller can point uninstall at the same dir install used.
+        if options.get('policy_dir'):
+            chromium_policy = os.path.join(options['policy_dir'],
+                                           'hart_extensions.json')
+            firefox_policy = os.path.join(options['policy_dir'], 'policies.json')
+
+        removed_from = []
+
+        # ── Chromium ExtensionInstallForcelist ──
+        if os.path.isfile(chromium_policy):
+            try:
+                with open(chromium_policy, 'r') as f:
+                    policy = json.load(f) or {}
+                forcelist = policy.get('ExtensionInstallForcelist', [])
+                kept = [e for e in forcelist if e.split(';')[0] != ext_id]
+                if len(kept) != len(forcelist):
+                    policy['ExtensionInstallForcelist'] = kept
+                    with open(chromium_policy, 'w') as f:
+                        json.dump(policy, f, indent=2)
+                    # CONFIRM gone on disk.
+                    with open(chromium_policy, 'r') as f:
+                        written = json.load(f)
+                    still = any(
+                        e.split(';')[0] == ext_id
+                        for e in written.get('ExtensionInstallForcelist', []))
+                    if still:
+                        return InstallResult(
+                            success=False, platform='browser_ext', name=ext_id,
+                            error='Chromium policy rewritten but extension id '
+                                  'still present on verify')
+                    removed_from.append('chromium')
+            except (json.JSONDecodeError, IOError, PermissionError) as e:
+                return InstallResult(
+                    success=False, platform='browser_ext', name=ext_id,
+                    error=f'Failed to update Chromium managed policy: {e}')
+
+        # ── Firefox ExtensionSettings ──
+        if os.path.isfile(firefox_policy):
+            try:
+                with open(firefox_policy, 'r') as f:
+                    doc = json.load(f) or {}
+                ext_settings = doc.get('policies', {}).get(
+                    'ExtensionSettings', {})
+                if ext_id in ext_settings:
+                    del ext_settings[ext_id]
+                    with open(firefox_policy, 'w') as f:
+                        json.dump(doc, f, indent=2)
+                    # CONFIRM gone on disk.
+                    with open(firefox_policy, 'r') as f:
+                        written = json.load(f)
+                    if ext_id in written.get('policies', {}).get(
+                            'ExtensionSettings', {}):
+                        return InstallResult(
+                            success=False, platform='browser_ext', name=ext_id,
+                            error='Firefox policy rewritten but extension id '
+                                  'still present on verify')
+                    removed_from.append('firefox')
+            except (json.JSONDecodeError, IOError, PermissionError) as e:
+                return InstallResult(
+                    success=False, platform='browser_ext', name=ext_id,
+                    error=f'Failed to update Firefox policies.json: {e}')
+
+        if removed_from:
+            return InstallResult(
+                success=True, platform='browser_ext', name=ext_id,
+                app_id=ext_id,
+                install_path=chromium_policy if 'chromium' in removed_from
+                else firefox_policy)
+
+        return InstallResult(
+            success=False, platform='browser_ext', name=ext_id,
+            error=f'Extension "{ext_id}" not found in any managed-policy '
+                  'force-install list — nothing to remove.')
+
+    # ─── Consolidated agent app-ops surface ─────────────────
+
+    def app_ops(self, op: str, agent_id: str = 'agent',
+                **kwargs) -> Dict:
+        """ONE agent-facing surface for OS app lifecycle (the "agent uses each OS
+        app registry + invokes native operations" + "consolidated uninstall
+        across all OS apps" the user asked for).
+
+        This is NOT a parallel path: it is a thin consolidator that REUSES the
+        existing canonical pieces —
+          * LIST     → AppRegistry.list_all() (source-agnostic: one view across
+                       nix / flatpak / appimage / windows / android / macos /
+                       browser_ext / extension), falling back to list_installed()
+                       for live system packages not in the registry.
+          * LAUNCH   → HartWmClient.dispatch_verb('window.summon', …) — the ONE
+                       gated launcher (no forked exec); honest about Tier-2's
+                       no-phantom 'unsupported'.
+          * UNINSTALL→ self.uninstall() (the symmetric dispatcher above) — the
+                       audit + auto-unregister trio fires there.
+          * UPDATE   → re-install the package via self.install() (nix/flatpak's
+                       install IS the update path; honest 'unsupported' otherwise).
+
+        Args:
+            op: 'list' | 'launch' | 'uninstall' | 'update'
+            agent_id: the calling agent (audit attribution + WM gate actor).
+            kwargs: op-specific — app_id, platform, source, options.
+
+        Returns:
+            A dict envelope: {'ok': bool, 'op': str, ...} so an MCP tool / A2UI
+            component gets a uniform shape regardless of op.
+        """
+        op = (op or '').strip().lower()
+        if op == 'list':
+            return self._app_ops_list()
+        if op == 'launch':
+            return self._app_ops_launch(kwargs.get('app_id', ''), agent_id)
+        if op == 'uninstall':
+            res = self.uninstall(
+                kwargs.get('app_id', ''), kwargs.get('platform', ''),
+                kwargs.get('options'))
+            return {'ok': res.success, 'op': 'uninstall', 'app_id': res.app_id
+                    or kwargs.get('app_id', ''), 'platform': res.platform,
+                    'error': res.error}
+        if op == 'update':
+            return self._app_ops_update(kwargs.get('app_id', ''),
+                                        kwargs.get('platform', ''),
+                                        kwargs.get('source', ''),
+                                        kwargs.get('options'))
+        return {'ok': False, 'op': op,
+                'error': f'unknown app-op: {op!r} '
+                         '(list | launch | uninstall | update)'}
+
+    def _app_registry(self):
+        """Resolve the canonical AppRegistry from the ServiceRegistry, or None on
+        a headless/non-shell node. Reused by every app_ops branch — single
+        resolution path."""
+        try:
+            from core.platform.registry import get_registry
+            return get_registry().get_or_none('apps')
+        except Exception:
+            return None
+
+    def _app_ops_list(self) -> Dict:
+        """Consolidated, source-agnostic app list over AppRegistry.list_all()."""
+        apps = []
+        seen = set()
+        registry = self._app_registry()
+        if registry is not None:
+            for m in registry.list_all():
+                tags = list(getattr(m, 'tags', []) or [])
+                # The installer stamps the source platform as a tag on
+                # auto-registered apps; surface it as the consolidated source.
+                source = next((t for t in tags
+                               if t in ('nix', 'flatpak', 'appimage', 'windows',
+                                        'android', 'macos', 'browser_ext',
+                                        'extension')), '')
+                apps.append({
+                    'id': m.id,
+                    'name': m.name,
+                    'type': m.type,
+                    'version': getattr(m, 'version', ''),
+                    'source': source,
+                    'group': getattr(m, 'group', ''),
+                })
+                seen.add(m.id)
+        # Augment with live system packages not yet mirrored into the registry
+        # (e.g. pre-existing nix/flatpak installs) — still ONE consolidated view.
+        for entry in self.list_installed():
+            ident = entry.get('app_id') or entry.get('name', '')
+            if ident and ident not in seen:
+                apps.append({
+                    'id': ident,
+                    'name': entry.get('name', ident),
+                    'type': 'desktop_app',
+                    'version': entry.get('version', ''),
+                    'source': entry.get('platform', ''),
+                    'group': 'Installed',
+                })
+                seen.add(ident)
+        return {'ok': True, 'op': 'list', 'apps': apps, 'count': len(apps)}
+
+    def _app_ops_launch(self, app_id: str, agent_id: str) -> Dict:
+        """Launch an installed app by manifest id through the EXISTING gated WM
+        client (window.summon) — never a forked exec."""
+        app_id = (app_id or '').strip()
+        if not app_id:
+            return {'ok': False, 'op': 'launch', 'error': 'app_id required'}
+        try:
+            from integrations.agent_engine.hart_wm_client import get_wm_client
+            wm = get_wm_client()
+        except Exception as e:
+            return {'ok': False, 'op': 'launch', 'app_id': app_id,
+                    'error': f'WM client unavailable: {e}'}
+        result = wm.dispatch_verb('window.summon', {'manifest_id': app_id},
+                                  agent_id)
+        result = dict(result or {})
+        result['op'] = 'launch'
+        result['app_id'] = app_id
+        return result
+
+    def _app_ops_update(self, app_id: str, platform: str, source: str,
+                        options: Optional[Dict]) -> Dict:
+        """Update = re-install the latest package. For nix/flatpak the install
+        command IS the upgrade path (idempotent pull-latest); for file-staged
+        types the caller must supply a fresh ``source``. Honest 'unsupported'
+        when there is no in-place update path."""
+        if platform in ('snap',):
+            return {'ok': False, 'op': 'update', 'app_id': app_id,
+                    'platform': platform,
+                    'error': 'Snap is not supported on HART OS — no update path.'}
+        src = source or app_id
+        if not src:
+            return {'ok': False, 'op': 'update',
+                    'error': 'app_id or source required to update'}
+        plat = InstallerPlatform.UNKNOWN
+        for p in InstallerPlatform:
+            if p.value == platform:
+                plat = p
+                break
+        res = self.install(InstallRequest(
+            source=src, platform=plat, name=app_id, options=options or {}))
+        return {'ok': res.success, 'op': 'update', 'app_id': res.app_id or app_id,
+                'platform': res.platform, 'version': res.version,
+                'error': res.error}
+
 
 # ─── Singleton ──────────────────────────────────────────────
 
@@ -1289,7 +1677,7 @@ def register_app_install_routes(app):
             return jsonify({'error': 'app_id required'}), 400
 
         installer = get_installer()
-        result = installer.uninstall(app_id, platform)
+        result = installer.uninstall(app_id, platform, data.get('options', {}))
 
         return jsonify({
             'success': result.success,
