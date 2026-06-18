@@ -67,7 +67,6 @@ jobs:
           python -m pytest \
             tests/unit/ \
             tests/functional/ \
-            --ignore=tests/unit/test_social_models.py \
             --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
             --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
             --timeout=120 \

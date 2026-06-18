@@ -15,9 +15,39 @@ from integrations.social.models import (
 )
 
 
+@pytest.fixture(scope='module', autouse=True)
+def _isolate_social_engine():
+    """Run this file on a DEDICATED in-memory engine so its per-test
+    drop_all/create_all never touch the shared module singleton
+    (integrations.social.models._engine) that every other test file reuses.
+
+    Without this, the teardown drop_all below left the shared :memory: engine
+    table-less, corrupting later files in the full-suite run — which is exactly
+    why CI had to --ignore this file (commit b665566, "conftest corruption
+    source"). Correct-by-construction: the shared _engine/_SessionLocal are
+    saved and restored, so this file can no longer affect any other test
+    (verified: the shared engine's tables stay intact across this module)."""
+    import integrations.social.models as m
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    saved_engine, saved_session = m._engine, m._SessionLocal
+    iso_engine = create_engine(
+        'sqlite://', echo=False, future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool, pool_pre_ping=True)
+    m._engine = iso_engine
+    m._SessionLocal = sessionmaker(bind=iso_engine, expire_on_commit=False)
+    try:
+        yield
+    finally:
+        m._engine = saved_engine
+        m._SessionLocal = saved_session
+
+
 @pytest.fixture(autouse=True)
 def fresh_db():
-    """Create fresh tables for each test."""
+    """Create fresh tables for each test (on the isolated engine above)."""
     engine = get_engine()
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
