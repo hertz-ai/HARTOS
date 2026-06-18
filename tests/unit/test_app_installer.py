@@ -453,40 +453,41 @@ class TestAndroidHandler(unittest.TestCase):
         import shutil
         shutil.rmtree(self.installer._install_dir, ignore_errors=True)
 
-    def test_android_no_binder(self):
-        """No /dev/binder → error about Android subsystem."""
+    def test_android_no_waydroid(self):
+        """No waydroid runtime → honest 'not available' message + staged (NOT a
+        faked success). Updated for the Waydroid contract: the old copy-claims-
+        success fallback was removed."""
         with tempfile.NamedTemporaryFile(suffix='.apk', delete=False) as f:
             f.write(b'PK' + b'\x00' * 100)
             path = f.name
         try:
-            with patch('os.path.exists', return_value=False):
+            with patch('integrations.agent_engine.app_installer.shutil.which',
+                       return_value=None):
                 result = self.installer._install_android(
                     InstallRequest(source=path))
                 self.assertFalse(result.success)
-                self.assertIn('Android subsystem', result.error)
+                self.assertTrue(result.staged)
+                self.assertIn('hart.subsystems.android', result.error)
         finally:
             os.unlink(path)
 
-    @patch('shutil.which', return_value=None)
-    @patch('os.path.exists', side_effect=lambda p: p == '/dev/binder' or os.path.exists.__wrapped__(p) if hasattr(os.path.exists, '__wrapped__') else True)
-    def test_android_fallback_copy(self, mock_exists, _which):
-        """With binder but no adb → fallback to copy."""
+    def test_android_no_session_stages_not_installed(self):
+        """waydroid present but no live session → STAGED, not installed.
+        A copy is NOT an install; success must be False (the fixed fake-success
+        bug)."""
         with tempfile.NamedTemporaryFile(suffix='.apk', delete=False) as f:
             f.write(b'PK' + b'\x00' * 100)
             path = f.name
         try:
-            # Patch os.path.exists to return True for /dev/binder, pass-through for others
-            def side_effect(p):
-                if p == '/dev/binder':
-                    return True
-                return os.path.isfile(p)
-
-            with patch('integrations.agent_engine.app_installer.os.path.exists', side_effect=side_effect):
-                with patch('integrations.agent_engine.app_installer.shutil.which', return_value=None):
-                    result = self.installer._install_android(
-                        InstallRequest(source=path))
-                    self.assertTrue(result.success)
-                    self.assertEqual(result.platform, 'android')
+            with patch('integrations.agent_engine.app_installer.shutil.which',
+                       return_value='/usr/bin/waydroid'), \
+                 patch.object(self.installer, '_waydroid_session_live',
+                              return_value=False):
+                result = self.installer._install_android(
+                    InstallRequest(source=path))
+                self.assertFalse(result.success)
+                self.assertTrue(result.staged)
+                self.assertEqual(result.platform, 'android')
         finally:
             os.unlink(path)
 
@@ -510,12 +511,15 @@ class TestMacOSHandler(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn('Darling', result.error)
 
-    @patch('shutil.which', return_value='/usr/bin/darling')
-    def test_macos_with_darling_not_automated(self, _):
+    @patch('integrations.agent_engine.app_installer.shutil.which',
+           return_value='/usr/bin/darling')
+    def test_macos_dmg_refused_honestly(self, _):
+        """.dmg has no reliable headless install path under Darling → honest
+        failure (updated from the old 'not yet automated' stub)."""
         result = self.installer._install_macos(
             InstallRequest(source='app.dmg'))
         self.assertFalse(result.success)
-        self.assertIn('not yet automated', result.error)
+        self.assertIn('headless', result.error)
 
 
 class TestExtensionHandler(unittest.TestCase):
@@ -908,8 +912,9 @@ class TestPlatformsRoute(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         platforms = data['platforms']
-        # Should have 7 platforms (all except UNKNOWN)
-        self.assertEqual(len(platforms), 7)
+        # Should have 9 platforms (all except UNKNOWN): the original 7 plus the
+        # new snap (honest-unsupported) and browser_ext (.crx/.xpi) surfaces.
+        self.assertEqual(len(platforms), 9)
         names = [p['platform'] for p in platforms]
         self.assertIn('nix', names)
         self.assertIn('flatpak', names)
@@ -917,7 +922,12 @@ class TestPlatformsRoute(unittest.TestCase):
         self.assertIn('windows', names)
         self.assertIn('android', names)
         self.assertIn('macos', names)
+        self.assertIn('snap', names)
+        self.assertIn('browser_ext', names)
         self.assertIn('extension', names)
+        # snap is shown but honestly greyed out (unsupported on this image).
+        snap = [p for p in platforms if p['platform'] == 'snap'][0]
+        self.assertFalse(snap['available'])
 
     def test_appimage_always_available(self):
         client = _make_installer_app()

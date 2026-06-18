@@ -1,34 +1,25 @@
 """
-Per-type HONESTY audit for the cross-platform AppInstaller.
+Per-type HONESTY contract for the cross-platform AppInstaller.
 
 Goal: for EVERY install type the unified installer dispatches to, prove
 behaviourally — by mocking the subprocess / filesystem boundary, calling the
-REAL handler, and asserting observable behaviour — whether it is:
+REAL handler, and asserting observable behaviour — that it honours the actual
+runtime result and NEVER claims success without a positive confirmation.
+
+Contract enforced here (matches the design contract + the just-landed Wine fix):
 
   REAL  : constructs + invokes the correct install command with the right
-          package/app argument AND propagates a genuine failure
-          (boundary fails -> handler reports failure, not success).
-  FAKE  : returns success WITHOUT doing the work, or claims success even when
-          the boundary FAILS (the dangerous case the user must know about).
-  STUB  : returns failure / not-implemented even when its tool is present.
+          package/app argument AND propagates a genuine failure (boundary fails
+          -> handler reports failure, not success) AND requires an affirmative
+          post-install probe for success (waydroid app list / darling prefix
+          boot / managed-policy id on disk).
+  STAGED: a copy-to-disk with NO runtime is success=False + staged=True — a
+          staged file is NOT installed/launchable.
+  HONEST-UNSUPPORTED: returns success=False with an actionable message instead
+          of faking success or silently misrouting (snap, .dmg/.pkg).
 
-These complement ``test_app_installer.py`` (which covers the happy paths and
-detection). The tests HERE are specifically the fakeness / failure-propagation
-proofs that the existing suite does NOT make:
-
-  * Wine now PROPAGATES failure: a non-zero wine exit -> success=False with the
-    error surfaced (app_installer.py:602-616, FIXED). rc=0 stays a best-effort
-    success (wine's 0 is a weak signal for GUI installers).
-  * Android's copy fallback reports success for a mere file copy when no adb is
-    present (app_installer.py:646-654) — "installed" == "copied a file".
-  * macOS returns success=False even WITH darling on PATH (the handler is a
-    stub: app_installer.py:671-673).
-  * REAL installers (nix/flatpak/appimage/extension) DO propagate a genuine
-    boundary failure as success=False — the contrast that exposes Wine.
-  * Snap is not a supported platform at all (no enum member, no handler).
-
-NO grep / source-shape assertions: every test imports the real handler, mocks
-the boundary, calls the real method, and asserts the returned InstallResult.
+Every test imports the real handler, mocks the boundary, calls the real method,
+and asserts the returned InstallResult — NO grep / source-shape assertions.
 
 Run directly (pytest OOMs on the dev box):
     C:/Users/sathi/miniconda3/python.exe tests/unit/test_app_installer_per_type.py
@@ -42,6 +33,7 @@ from unittest.mock import patch, MagicMock
 
 from integrations.agent_engine.app_installer import (
     InstallerPlatform, InstallRequest, InstallResult, AppInstaller,
+    detect_platform,
 )
 
 
@@ -77,15 +69,13 @@ class TestNixIsReal(_InstallerCase):
         self.assertTrue(res.success)
         mock_run.assert_called_once()
         cmd = mock_run.call_args[0][0]
-        # Real command, real argument (the package the caller asked for).
         self.assertEqual(cmd[0], 'nix-env')
         self.assertIn('-iA', cmd)
         self.assertIn('nixpkgs.htop', cmd)
 
     @patch('integrations.agent_engine.app_installer.subprocess.run')
     def test_propagates_failure(self, mock_run):
-        """Boundary FAILS (returncode=1) -> handler must report failure.
-        This is the contract Wine VIOLATES."""
+        """Boundary FAILS (returncode=1) -> handler must report failure."""
         mock_run.return_value = MagicMock(returncode=1, stderr='attribute missing')
         res = self.installer._install_nix(InstallRequest(source='nixpkgs.nope'))
         self.assertFalse(res.success)
@@ -104,8 +94,6 @@ class TestNixIsReal(_InstallerCase):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestFlatpakIsReal(_InstallerCase):
-    """flatpak is REAL: real command, real exit-code check."""
-
     @patch('integrations.agent_engine.app_installer.subprocess.run')
     def test_invokes_flatpak_install_with_ref(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stderr='')
@@ -115,7 +103,7 @@ class TestFlatpakIsReal(_InstallerCase):
         cmd = mock_run.call_args[0][0]
         self.assertEqual(cmd[0], 'flatpak')
         self.assertIn('install', cmd)
-        self.assertIn('org.gimp.GIMP', cmd)  # ref, prefix stripped
+        self.assertIn('org.gimp.GIMP', cmd)
 
     @patch('integrations.agent_engine.app_installer.subprocess.run')
     def test_propagates_failure(self, mock_run):
@@ -131,22 +119,17 @@ class TestFlatpakIsReal(_InstallerCase):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestAppImageIsReal(_InstallerCase):
-    """appimage is REAL: it actually copies the file to the install dir and
-    makes it executable; a copy failure is reported as failure."""
-
     def test_copies_file_into_install_dir(self):
         src = _tmpfile('.AppImage', magic=b'\x7fELF')
         try:
             res = self.installer._install_appimage(InstallRequest(source=src))
             self.assertTrue(res.success)
-            # The work actually happened: the destination file exists on disk.
             self.assertTrue(os.path.isfile(res.install_path))
             self.assertTrue(res.install_path.endswith(os.path.basename(src)))
         finally:
             os.unlink(src)
 
     def test_propagates_copy_failure(self):
-        """A real boundary failure (shutil.copy2 raises) -> success=False."""
         src = _tmpfile('.AppImage', magic=b'\x7fELF')
         try:
             with patch('integrations.agent_engine.app_installer.shutil.copy2',
@@ -165,36 +148,23 @@ class TestAppImageIsReal(_InstallerCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# FAKE — Wine: returns success=True even when the wine subprocess FAILS
+# REAL — Wine: HONOURS the failure signal (non-zero exit -> failure)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestWindowsWineFailurePropagation(_InstallerCase):
-    """Wine now HONOURS the failure signal (fixed): _install_windows checks
-    result.returncode — a non-zero wine exit -> success=False with the error
-    surfaced, while rc=0 stays a best-effort success (wine's 0 is a weak signal
-    for GUI installers, but a non-zero exit is a reliable failure).
-
-    Regression guard for the FIXED bug: this used to return success=True
-    UNCONDITIONALLY after subprocess.run, so a failed install was reported as a
-    success and got a desktop icon that launches nothing.
-    """
+    """Wine HONOURS the failure signal: a non-zero exit -> success=False with
+    the error surfaced, while rc=0 stays a best-effort success."""
 
     @patch('integrations.agent_engine.app_installer.shutil.which',
            return_value='/usr/bin/wine64')
     @patch('integrations.agent_engine.app_installer.subprocess.run')
     def test_propagates_failure_when_wine_exits_nonzero(self, mock_run, _which):
-        # Wine FAILS hard: returncode=1, error on stderr.
         mock_run.return_value = MagicMock(
             returncode=1, stderr='wine: cannot find MZ', stdout='')
         src = _tmpfile('.exe', magic=b'MZ')
         try:
             res = self.installer._install_windows(InstallRequest(source=src))
-            # FIXED: a non-zero wine exit is a reliable failure -> success=False.
-            self.assertFalse(
-                res.success,
-                "Wine must report failure on rc!=0 (the fixed bug: it used to "
-                "claim success unconditionally).")
-            # And the wine exit/stderr is surfaced, not swallowed.
+            self.assertFalse(res.success)
             self.assertIn('exited 1', res.error)
             self.assertEqual(res.platform, 'windows')
         finally:
@@ -204,8 +174,6 @@ class TestWindowsWineFailurePropagation(_InstallerCase):
            return_value='/usr/bin/wine64')
     @patch('integrations.agent_engine.app_installer.subprocess.run')
     def test_does_invoke_wine_with_the_exe(self, mock_run, _which):
-        """It DOES build+run a real wine command (so the fakeness is in the
-        result-handling, not in skipping the boundary entirely)."""
         mock_run.return_value = MagicMock(returncode=0, stderr='', stdout='')
         src = _tmpfile('.exe', magic=b'MZ')
         try:
@@ -219,7 +187,6 @@ class TestWindowsWineFailurePropagation(_InstallerCase):
     @patch('integrations.agent_engine.app_installer.shutil.which',
            return_value=None)
     def test_reports_wine_absent(self, _which):
-        """The ONE honest failure path: no wine binary on PATH -> failure."""
         src = _tmpfile('.exe', magic=b'MZ')
         try:
             res = self.installer._install_windows(InstallRequest(source=src))
@@ -230,133 +197,349 @@ class TestWindowsWineFailurePropagation(_InstallerCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PARTIAL/MISLEADING — Android: adb path real, copy fallback reports success
-# for a plain file copy (and the runtime is inert: `sleep infinity` in NixOS)
+# REAL — Android via Waydroid: confirmed by `waydroid app list`, never a copy
 # ═══════════════════════════════════════════════════════════════════════════
 
-class TestAndroidIsMisleading(_InstallerCase):
-    """Android is PARTIAL/MISLEADING.
-
-    * The adb branch IS real (checks returncode==0).
-    * BUT when no adb is present (the actual on-device situation — the NixOS
-      android runtime is `exec sleep infinity`, hart-subsystems.nix:288, i.e.
-      no ART/Waydroid), the handler falls back to a plain ``shutil.copy2`` and
-      returns success=True. Copying an .apk into a directory is NOT installing
-      it; nothing can ever run it. "installed" here means "file copied".
+class TestAndroidWaydroidIsReal(_InstallerCase):
+    """Android is REAL via Waydroid:
+      * requires `waydroid` on PATH + a live RUNNING session;
+      * runs `waydroid app install <apk>`;
+      * CONFIRMS by `waydroid app list` containing the parsed package id —
+        exit-0 alone is insufficient;
+      * with NO waydroid/session, the APK is STAGED (success=False, staged=True),
+        NEVER reported as installed (the old fake-copy-success is gone).
     """
 
-    def _binder_present(self):
-        """Patch os.path.exists so /dev/binder looks present, real paths
-        pass through."""
-        real_exists = os.path.exists
+    def _patch_pkg(self, pkg='com.foo.bar'):
+        return patch.object(self.installer, '_apk_package_name',
+                            return_value=pkg)
 
-        def fake(p):
-            if p == '/dev/binder':
-                return True
-            return real_exists(p)
-        return patch('integrations.agent_engine.app_installer.os.path.exists',
-                     side_effect=fake)
-
-    @patch('integrations.agent_engine.app_installer.shutil.which')
-    @patch('integrations.agent_engine.app_installer.subprocess.run')
-    def test_adb_branch_is_real(self, mock_run, mock_which):
-        """With adb present and rc=0, it invokes `adb install -r <apk>`."""
-        mock_which.return_value = '/usr/bin/adb'
-        mock_run.return_value = MagicMock(returncode=0, stderr='', stdout='Success')
+    def test_install_confirmed_by_app_list(self):
+        """waydroid present + session live + install rc=0 + app list shows the
+        package -> success=True with the package id as app_id."""
         src = _tmpfile('.apk', magic=b'PK')
+
+        def fake_run(cmd, **kw):
+            if cmd[:3] == ['/usr/bin/waydroid', 'app', 'install']:
+                return MagicMock(returncode=0, stdout='', stderr='')
+            if cmd[:3] == ['/usr/bin/waydroid', 'app', 'list']:
+                return MagicMock(
+                    returncode=0, stdout='Name: Foo\npackageName: com.foo.bar\n',
+                    stderr='')
+            return MagicMock(returncode=0, stdout='', stderr='')
+
         try:
-            with self._binder_present():
+            with self._patch_pkg('com.foo.bar'), \
+                 patch('integrations.agent_engine.app_installer.shutil.which',
+                       return_value='/usr/bin/waydroid'), \
+                 patch.object(self.installer, '_waydroid_session_live',
+                              return_value=True), \
+                 patch('integrations.agent_engine.app_installer.subprocess.run',
+                       side_effect=fake_run):
                 res = self.installer._install_android(InstallRequest(source=src))
             self.assertTrue(res.success)
-            cmd = mock_run.call_args[0][0]
-            self.assertEqual(cmd[0], '/usr/bin/adb')
-            self.assertIn('install', cmd)
-            self.assertIn(src, cmd)
+            self.assertEqual(res.app_id, 'com.foo.bar')
+            self.assertFalse(res.staged)
         finally:
             os.unlink(src)
 
-    @patch('integrations.agent_engine.app_installer.shutil.which')
-    @patch('integrations.agent_engine.app_installer.subprocess.run')
-    def test_adb_failure_falls_through_to_copy_and_still_succeeds(
-            self, mock_run, mock_which):
-        """Even if adb FAILS (rc=1), the handler does not report failure — it
-        silently falls through to the copy fallback and returns success. So an
-        adb-level install error is masked as success."""
-        mock_which.return_value = '/usr/bin/adb'
-        mock_run.return_value = MagicMock(
-            returncode=1, stderr='INSTALL_FAILED_INVALID_APK', stdout='')
+    def test_exit_zero_but_not_in_app_list_is_failure(self):
+        """The contract's teeth: `waydroid app install` returns 0 but the
+        package is NOT in `waydroid app list` -> success=False (exit-0 is not
+        proof; some builds print errors on stderr while returning 0)."""
         src = _tmpfile('.apk', magic=b'PK')
-        try:
-            with self._binder_present():
-                res = self.installer._install_android(InstallRequest(source=src))
-            self.assertTrue(res.success)        # masked failure
-            self.assertTrue(os.path.isfile(res.install_path))  # just a copy
-        finally:
-            os.unlink(src)
 
-    def test_copy_fallback_reports_success_for_a_mere_copy(self):
-        """No adb on PATH + binder present -> the handler ONLY copies the file
-        and calls that an install. Prove the boundary that was hit is the
-        filesystem copy, not any package-install command."""
-        src = _tmpfile('.apk', magic=b'PK')
-        try:
-            with self._binder_present():
-                with patch('integrations.agent_engine.app_installer.shutil.which',
-                           return_value=None):  # no adb
-                    # subprocess.run must NOT be the thing that "installs":
-                    # if it is called at all it would only be adb, which is
-                    # absent, so guard that no install command runs.
-                    with patch('integrations.agent_engine.app_installer.'
-                               'subprocess.run',
-                               side_effect=AssertionError(
-                                   'no package-install command should run in '
-                                   'the copy fallback')):
-                        res = self.installer._install_android(
-                            InstallRequest(source=src))
-            self.assertTrue(res.success)
-            # The ONLY observable effect is a copied file — not an install.
-            self.assertTrue(os.path.isfile(res.install_path))
-            self.assertEqual(
-                os.path.basename(res.install_path), os.path.basename(src))
-        finally:
-            os.unlink(src)
+        def fake_run(cmd, **kw):
+            if cmd[:3] == ['/usr/bin/waydroid', 'app', 'install']:
+                return MagicMock(returncode=0, stdout='',
+                                 stderr='E: something went wrong')
+            if cmd[:3] == ['/usr/bin/waydroid', 'app', 'list']:
+                return MagicMock(returncode=0, stdout='(no apps)\n', stderr='')
+            return MagicMock(returncode=0, stdout='', stderr='')
 
-    def test_no_binder_fails_cleanly(self):
-        """The one honest failure: no /dev/binder -> failure (subsystem off)."""
-        src = _tmpfile('.apk', magic=b'PK')
         try:
-            with patch('integrations.agent_engine.app_installer.os.path.exists',
-                       return_value=False):
+            with self._patch_pkg('com.foo.bar'), \
+                 patch('integrations.agent_engine.app_installer.shutil.which',
+                       return_value='/usr/bin/waydroid'), \
+                 patch.object(self.installer, '_waydroid_session_live',
+                              return_value=True), \
+                 patch('integrations.agent_engine.app_installer.subprocess.run',
+                       side_effect=fake_run):
                 res = self.installer._install_android(InstallRequest(source=src))
             self.assertFalse(res.success)
-            self.assertIn('Android subsystem', res.error)
+            self.assertIn('did not register', res.error)
         finally:
             os.unlink(src)
 
+    def test_no_waydroid_stages_but_does_not_claim_install(self):
+        """No waydroid on PATH -> the APK is copied to disk for later BUT the
+        result is success=False + staged=True. A staged file is NOT installed.
+        Critically: no install command runs (the old copy-that-claimed-success
+        is gone)."""
+        src = _tmpfile('.apk', magic=b'PK')
+        try:
+            with self._patch_pkg('com.foo.bar'), \
+                 patch('integrations.agent_engine.app_installer.shutil.which',
+                       return_value=None), \
+                 patch('integrations.agent_engine.app_installer.subprocess.run',
+                       side_effect=AssertionError(
+                           'no install command should run without waydroid')):
+                res = self.installer._install_android(InstallRequest(source=src))
+            self.assertFalse(res.success)        # NOT installed
+            self.assertTrue(res.staged)          # but staged to disk
+            self.assertTrue(os.path.isfile(res.install_path))
+            self.assertIn('hart.subsystems.android', res.error)
+        finally:
+            os.unlink(src)
+
+    def test_waydroid_present_but_no_session_stages(self):
+        """waydroid on PATH but NO live session -> staged, not installed, and
+        no install command attempted."""
+        src = _tmpfile('.apk', magic=b'PK')
+        try:
+            with self._patch_pkg('com.foo.bar'), \
+                 patch('integrations.agent_engine.app_installer.shutil.which',
+                       return_value='/usr/bin/waydroid'), \
+                 patch.object(self.installer, '_waydroid_session_live',
+                              return_value=False), \
+                 patch('integrations.agent_engine.app_installer.subprocess.run',
+                       side_effect=AssertionError(
+                           'no install command should run without a session')):
+                res = self.installer._install_android(InstallRequest(source=src))
+            self.assertFalse(res.success)
+            self.assertTrue(res.staged)
+        finally:
+            os.unlink(src)
+
+    def test_missing_file_fails(self):
+        res = self.installer._install_android(
+            InstallRequest(source='/no/such/app.apk'))
+        self.assertFalse(res.success)
+        self.assertIn('not found', res.error.lower())
+
 
 # ═══════════════════════════════════════════════════════════════════════════
-# STUB — macOS: returns failure even WITH darling present
+# REAL (narrow) — macOS via Darling: runs CLI, refuses .dmg/.pkg + GUI honestly
 # ═══════════════════════════════════════════════════════════════════════════
 
-class TestMacOSIsStub(_InstallerCase):
-    """macOS is a STUB: app_installer.py:671-673 returns success=False even
-    when darling is on PATH, and never invokes any install boundary."""
-
-    @patch('integrations.agent_engine.app_installer.subprocess.run',
-           side_effect=AssertionError('macOS stub must not run any subprocess'))
-    @patch('integrations.agent_engine.app_installer.shutil.which',
-           return_value='/usr/bin/darling')
-    def test_with_darling_still_not_implemented(self, _which, _run):
-        res = self.installer._install_macos(InstallRequest(source='app.dmg'))
-        self.assertFalse(res.success)             # stub
-        self.assertIn('not yet automated', res.error)
+class TestMacOSDarling(_InstallerCase):
+    """macOS is a narrow REAL surface via Darling:
+      * no darling -> honest absent failure;
+      * .dmg/.pkg -> honest 'no headless path' failure (never faked);
+      * .app whose prefix boots + binary runs rc=0 -> success;
+      * a non-zero darling exit -> failure (GUI mostly broken, surfaced).
+    """
 
     @patch('integrations.agent_engine.app_installer.shutil.which',
            return_value=None)
     def test_without_darling_reports_absent(self, _which):
-        res = self.installer._install_macos(InstallRequest(source='app.dmg'))
+        res = self.installer._install_macos(InstallRequest(source='app.app'))
         self.assertFalse(res.success)
         self.assertIn('Darling', res.error)
+
+    @patch('integrations.agent_engine.app_installer.subprocess.run',
+           side_effect=AssertionError('dmg/pkg must not run any subprocess'))
+    @patch('integrations.agent_engine.app_installer.shutil.which',
+           return_value='/usr/bin/darling')
+    def test_dmg_refused_honestly(self, _which, _run):
+        res = self.installer._install_macos(InstallRequest(source='thing.dmg'))
+        self.assertFalse(res.success)
+        self.assertIn('headless', res.error)
+
+    @patch('integrations.agent_engine.app_installer.shutil.which',
+           return_value='/usr/bin/darling')
+    @patch('integrations.agent_engine.app_installer.subprocess.run')
+    def test_app_bundle_runs_via_darling_shell(self, mock_run, _which):
+        """A .app bundle whose prefix boots + binary exits 0 -> success, and
+        the boundary actually invoked `darling shell <binary>`."""
+        bundle = tempfile.mkdtemp(suffix='.app')
+        macos_dir = os.path.join(bundle, 'Contents', 'MacOS')
+        os.makedirs(macos_dir)
+        binary = os.path.join(macos_dir, 'MyApp')
+        with open(binary, 'wb') as f:
+            f.write(b'\xcf\xfa\xed\xfe')  # Mach-O magic
+
+        mock_run.return_value = MagicMock(returncode=0, stdout='', stderr='')
+        try:
+            res = self.installer._install_macos(InstallRequest(source=bundle))
+            self.assertTrue(res.success)
+            # The last subprocess call launched the bundle binary via darling.
+            last_cmd = mock_run.call_args[0][0]
+            self.assertEqual(last_cmd[0], '/usr/bin/darling')
+            self.assertEqual(last_cmd[1], 'shell')
+            self.assertEqual(last_cmd[2], binary)
+        finally:
+            import shutil
+            shutil.rmtree(bundle, ignore_errors=True)
+
+    @patch('integrations.agent_engine.app_installer.shutil.which',
+           return_value='/usr/bin/darling')
+    @patch('integrations.agent_engine.app_installer.subprocess.run')
+    def test_nonzero_darling_exit_is_failure(self, mock_run, _which):
+        """Prefix boots (rc=0) but the app run exits non-zero -> failure."""
+        bundle = tempfile.mkdtemp(suffix='.app')
+        macos_dir = os.path.join(bundle, 'Contents', 'MacOS')
+        os.makedirs(macos_dir)
+        binary = os.path.join(macos_dir, 'MyApp')
+        with open(binary, 'wb') as f:
+            f.write(b'\xcf\xfa\xed\xfe')
+
+        def fake_run(cmd, **kw):
+            if cmd[:3] == ['/usr/bin/darling', 'shell', 'true']:
+                return MagicMock(returncode=0, stdout='', stderr='')
+            return MagicMock(returncode=5, stdout='',
+                             stderr='dyld: Symbol not found')
+
+        mock_run.side_effect = fake_run
+        try:
+            res = self.installer._install_macos(InstallRequest(source=bundle))
+            self.assertFalse(res.success)
+            self.assertIn('exited 5', res.error)
+        finally:
+            import shutil
+            shutil.rmtree(bundle, ignore_errors=True)
+
+    @patch('integrations.agent_engine.app_installer.shutil.which',
+           return_value='/usr/bin/darling')
+    @patch('integrations.agent_engine.app_installer.subprocess.run')
+    def test_prefix_boot_failure_is_failure(self, mock_run, _which):
+        """`darling shell true` itself fails -> we never trust anything else."""
+        mock_run.return_value = MagicMock(
+            returncode=1, stdout='', stderr='cannot init prefix')
+        res = self.installer._install_macos(InstallRequest(source='cli-binary'))
+        self.assertFalse(res.success)
+        self.assertIn('boot', res.error)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HONEST-UNSUPPORTED — Snap: real enum, real handler, honest refusal, no misroute
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSnapHonestlyUnsupported(_InstallerCase):
+    """Snap now has a REAL enum + handler that refuses honestly, and detection
+    routes .snap / 'snap:' to SNAP — NOT silently to the nix catch-all."""
+
+    def test_snap_enum_member_exists(self):
+        self.assertTrue(any(p.value == 'snap' for p in InstallerPlatform))
+
+    def test_handler_refuses_honestly(self):
+        res = self.installer._install_snap(InstallRequest(source='snap:firefox'))
+        self.assertFalse(res.success)
+        self.assertIn('not supported', res.error.lower())
+        self.assertEqual(res.platform, 'snap')
+
+    def test_snap_prefix_routes_to_snap_not_nix(self):
+        """install('snap:firefox') reaches _install_snap, NOT _install_nix."""
+        with patch.object(self.installer, '_install_nix',
+                          side_effect=AssertionError('must not route to nix')):
+            res = self.installer.install(InstallRequest(source='snap:firefox'))
+        self.assertEqual(res.platform, 'snap')
+        self.assertFalse(res.success)
+
+    def test_dot_snap_file_detects_as_snap(self):
+        src = _tmpfile('.snap', magic=b'\x00')
+        try:
+            self.assertEqual(detect_platform(src), InstallerPlatform.SNAP)
+        finally:
+            os.unlink(src)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# REAL — Browser extension (.crx/.xpi) via managed policy, verified on disk
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestBrowserExtensionIsReal(_InstallerCase):
+    """A real browser-extension install: write the id into the on-disk managed
+    policy and CONFIRM by reading it back. Distinct from .hartpkg EXTENSION."""
+
+    def test_crx_writes_and_verifies_chromium_forcelist(self):
+        src = _tmpfile('.crx', magic=b'Cr24')
+        policy_dir = tempfile.mkdtemp()
+        try:
+            with patch('integrations.agent_engine.app_installer.shutil.which',
+                       side_effect=lambda b: '/usr/bin/chromium'
+                       if b == 'chromium' else None):
+                res = self.installer._install_browser_ext(InstallRequest(
+                    source=src,
+                    options={'id': 'abcdefghijklmnop', 'policy_dir': policy_dir}))
+            self.assertTrue(res.success)
+            self.assertEqual(res.app_id, 'abcdefghijklmnop')
+            # REAL proof: the id is present in the on-disk managed policy file.
+            import json
+            with open(res.install_path) as f:
+                policy = json.load(f)
+            ids = [e.split(';')[0]
+                   for e in policy['ExtensionInstallForcelist']]
+            self.assertIn('abcdefghijklmnop', ids)
+        finally:
+            os.unlink(src)
+            import shutil
+            shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_xpi_writes_and_verifies_firefox_settings(self):
+        src = _tmpfile('.xpi', magic=b'PK')
+        policy_dir = tempfile.mkdtemp()
+        try:
+            with patch('integrations.agent_engine.app_installer.shutil.which',
+                       side_effect=lambda b: '/usr/bin/firefox'
+                       if b == 'firefox' else None):
+                res = self.installer._install_browser_ext(InstallRequest(
+                    source=src,
+                    options={'id': 'ext@example.com', 'policy_dir': policy_dir}))
+            self.assertTrue(res.success)
+            import json
+            with open(res.install_path) as f:
+                doc = json.load(f)
+            self.assertIn('ext@example.com',
+                          doc['policies']['ExtensionSettings'])
+            self.assertEqual(
+                doc['policies']['ExtensionSettings']['ext@example.com'][
+                    'installation_mode'], 'force_installed')
+        finally:
+            os.unlink(src)
+            import shutil
+            shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_crx_no_chromium_fails(self):
+        src = _tmpfile('.crx', magic=b'Cr24')
+        try:
+            with patch('integrations.agent_engine.app_installer.shutil.which',
+                       return_value=None):
+                res = self.installer._install_browser_ext(
+                    InstallRequest(source=src))
+            self.assertFalse(res.success)
+            self.assertIn('Chromium', res.error)
+        finally:
+            os.unlink(src)
+
+    def test_crx_write_failure_propagates(self):
+        """A real write boundary failure -> success=False (no fake success)."""
+        src = _tmpfile('.crx', magic=b'Cr24')
+        policy_dir = tempfile.mkdtemp()
+        try:
+            with patch('integrations.agent_engine.app_installer.shutil.which',
+                       side_effect=lambda b: '/usr/bin/chromium'
+                       if b == 'chromium' else None), \
+                 patch('integrations.agent_engine.app_installer.os.makedirs'), \
+                 patch('builtins.open', side_effect=PermissionError('read-only')):
+                res = self.installer._install_browser_ext(InstallRequest(
+                    source=src,
+                    options={'id': 'x', 'policy_dir': policy_dir}))
+            self.assertFalse(res.success)
+            self.assertIn('Failed to write', res.error)
+        finally:
+            os.unlink(src)
+            import shutil
+            shutil.rmtree(policy_dir, ignore_errors=True)
+
+    def test_crx_detects_as_browser_ext_not_extension(self):
+        """.crx must NOT masquerade as a .hartpkg EXTENSION."""
+        src = _tmpfile('.crx', magic=b'Cr24')
+        try:
+            self.assertEqual(detect_platform(src),
+                             InstallerPlatform.BROWSER_EXT)
+        finally:
+            os.unlink(src)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -364,11 +547,9 @@ class TestMacOSIsStub(_InstallerCase):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestExtensionIsReal(_InstallerCase):
-    """The HART extension installer is REAL (in-process): it calls the
-    extension registry's load() and reports failure when that raises or the
-    registry is unavailable. NOTE: `.hartpkg` is HART's OWN extension format —
-    it is NOT a browser `.crx`/`.xpi`; there is no real browser-extension
-    install path anywhere in this installer."""
+    """The HART .hartpkg installer is REAL (in-process). NOTE: `.hartpkg` is
+    HART's OWN format — it is NOT a browser .crx/.xpi (those go through
+    _install_browser_ext / InstallerPlatform.BROWSER_EXT)."""
 
     def test_loads_via_registry(self):
         ext = MagicMock()
@@ -403,40 +584,9 @@ class TestExtensionIsReal(_InstallerCase):
                 InstallRequest(source='thing.hartpkg'))
         self.assertFalse(res.success)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# NOT SUPPORTED — Snap (no enum member, no handler, no dispatch)
-# ═══════════════════════════════════════════════════════════════════════════
-
-class TestSnapNotSupported(_InstallerCase):
-    """Snap is NOT a supported platform: there is no InstallerPlatform.SNAP and
-    no handler. Prove it behaviourally: a 'snap:'-prefixed source is NOT routed
-    to any snap install; it is mis-detected as a nix package name (the
-    catch-all). The user must know snap is unsupported, not silently nix'd."""
-
-    def test_no_snap_enum_member(self):
-        self.assertFalse(
-            any(p.value == 'snap' for p in InstallerPlatform),
-            "An InstallerPlatform.SNAP appeared — snap may now be supported; "
-            "update the audit.")
-
-    def test_snap_source_is_misrouted_to_nix_not_snap(self):
-        """`snap install` is never invoked; the source falls through to the nix
-        handler (catch-all). Behavioural proof via which() of the dispatch."""
-        called = {}
-
-        def fake_nix(req):
-            called['nix'] = req.source
-            return InstallResult(success=False, platform='nix', name=req.source,
-                                 error='nix-env not available')
-
-        with patch.object(self.installer, '_install_nix', side_effect=fake_nix):
-            # 'snap:firefox' is not a file and has no nix:/flatpak: prefix, so
-            # install() routes it to NIX (the unknown-string catch-all).
-            res = self.installer.install(InstallRequest(source='snap:firefox'))
-        self.assertIn('nix', called)                 # routed to nix, not snap
-        self.assertEqual(res.platform, 'nix')
-        self.assertFalse(res.success)
+    def test_hartpkg_detects_as_extension_not_browser_ext(self):
+        self.assertEqual(detect_platform('a.hartpkg'),
+                         InstallerPlatform.EXTENSION)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -444,8 +594,8 @@ class TestSnapNotSupported(_InstallerCase):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestDispatchCoverage(_InstallerCase):
-    """Every non-UNKNOWN/non-NIX-default platform reaches a distinct handler.
-    (NIX is also the catch-all; this just asserts the table is wired.)"""
+    """Every non-UNKNOWN platform reaches a distinct handler — including the
+    NEW snap + browser_ext, so neither falls through to the nix catch-all."""
 
     def test_each_platform_routes_to_its_handler(self):
         mapping = {
@@ -455,6 +605,8 @@ class TestDispatchCoverage(_InstallerCase):
             InstallerPlatform.WINDOWS: '_install_windows',
             InstallerPlatform.ANDROID: '_install_android',
             InstallerPlatform.MACOS: '_install_macos',
+            InstallerPlatform.SNAP: '_install_snap',
+            InstallerPlatform.BROWSER_EXT: '_install_browser_ext',
             InstallerPlatform.EXTENSION: '_install_extension',
         }
         for plat, handler_name in mapping.items():
@@ -464,6 +616,21 @@ class TestDispatchCoverage(_InstallerCase):
                 self.installer.install(
                     InstallRequest(source='x', platform=plat))
                 mock_h.assert_called_once()
+
+    def test_every_non_unknown_platform_has_a_handler(self):
+        """No orphan enum: each value (except UNKNOWN) must dispatch to a real
+        method, so adding an enum without a handler fails this test."""
+        for p in InstallerPlatform:
+            if p == InstallerPlatform.UNKNOWN:
+                continue
+            with patch.object(self.installer, '_install_nix') as nix:
+                nix.return_value = InstallResult(
+                    success=False, platform='nix', name='x')
+                res = self.installer.install(
+                    InstallRequest(source='x', platform=p))
+            # If p had no handler, install() returns the 'No installer for
+            # platform' error; assert that never happens.
+            self.assertNotIn('No installer for platform', res.error or '')
 
 
 if __name__ == '__main__':

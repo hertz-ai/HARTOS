@@ -4,9 +4,14 @@ Unified App Installer — Cross-Platform Package Installation API.
 Handles installation from ANY platform through a single interface:
   - Linux: Nix packages, Flatpak, AppImage
   - Windows: .exe/.msi via Wine binfmt integration
-  - Android: .apk via Android subsystem (binder/ashmem)
-  - macOS: .app/.dmg via Darling (experimental)
-  - HART OS: Extensions from extensions/ directory
+  - Android: .apk via Waydroid (real ART/PackageManager; confirmed by app list)
+  - macOS: .app via Darling (experimental, CLI-leaning; .dmg/.pkg refused)
+  - Snap: UNSUPPORTED on this image (honest refusal, never a silent misroute)
+  - Browser ext: .crx (Chromium) / .xpi (Firefox) via managed-policy force-install
+  - HART OS: .hartpkg extensions from the in-process extension registry
+
+Every handler confirms a POSITIVE runtime result (waydroid app list / darling
+prefix boot / managed-policy id on disk / non-zero exit) — never exit-0-or-copy.
 
 Detection chain:
   1. File extension → platform mapping
@@ -39,7 +44,13 @@ class InstallerPlatform(Enum):
     WINDOWS = 'windows'
     ANDROID = 'android'
     MACOS = 'macos'
+    SNAP = 'snap'
+    # ``EXTENSION`` is HART's OWN in-process .hartpkg extension format ONLY.
+    # ``BROWSER_EXT`` is a real browser extension (.crx / .xpi) force-installed
+    # into the bundled Chromium/Firefox via enterprise managed-policy. They are
+    # two DISTINCT enum values so a .crx never masquerades as a .hartpkg.
     EXTENSION = 'extension'
+    BROWSER_EXT = 'browser_ext'
     UNKNOWN = 'unknown'
 
 
@@ -77,6 +88,13 @@ class InstallResult:
     app_id: str = ''
     error: str = ''
     duration_seconds: float = 0.0
+    # ``staged`` is True ONLY when the source file was copied/placed on disk but
+    # NO runtime installed/launchable it (e.g. an APK copied while Waydroid is
+    # not running). A staged result is NEVER success=True — a staged file is not
+    # installed. This distinguishes "file is on disk for later" from "installed
+    # and runnable", and is the honest replacement for the old copy-that-claimed-
+    # success Android fallback.
+    staged: bool = False
 
 
 # ─── Extension → Platform mapping ───────────────────────────
@@ -98,6 +116,13 @@ _EXT_PLATFORM_MAP = {
     '.flatpakref': InstallerPlatform.FLATPAK,
     '.AppImage': InstallerPlatform.APPIMAGE,
     '.appimage': InstallerPlatform.APPIMAGE,
+    # Snap — a REAL enum value so .snap no longer silently falls through to the
+    # NIX catch-all and mis-claims; the handler returns an honest "unsupported".
+    '.snap': InstallerPlatform.SNAP,
+    # Browser extensions (force-installed into the bundled browser via managed
+    # policy). DISTINCT from HART's own .hartpkg below.
+    '.crx': InstallerPlatform.BROWSER_EXT,
+    '.xpi': InstallerPlatform.BROWSER_EXT,
     # HART OS
     '.hartpkg': InstallerPlatform.EXTENSION,
 }
@@ -186,6 +211,10 @@ class AppInstaller:
                 req.platform = InstallerPlatform.NIX
             elif req.source.startswith('flathub:') or req.source.startswith('flatpak:'):
                 req.platform = InstallerPlatform.FLATPAK
+            elif req.source.startswith('snap:'):
+                # Route to the SNAP handler (honest "unsupported"), NOT the NIX
+                # catch-all — a 'snap:' source must never be silently nix'd.
+                req.platform = InstallerPlatform.SNAP
             elif os.path.isfile(req.source):
                 req.platform = detect_platform(req.source)
             else:
@@ -209,6 +238,8 @@ class AppInstaller:
             InstallerPlatform.WINDOWS: self._install_windows,
             InstallerPlatform.ANDROID: self._install_android,
             InstallerPlatform.MACOS: self._install_macos,
+            InstallerPlatform.SNAP: self._install_snap,
+            InstallerPlatform.BROWSER_EXT: self._install_browser_ext,
             InstallerPlatform.EXTENSION: self._install_extension,
         }
 
@@ -310,6 +341,11 @@ class AppInstaller:
                 'appimage': AppType.DESKTOP_APP.value,
                 'windows': AppType.DESKTOP_APP.value,
                 'android': AppType.DESKTOP_APP.value,
+                'macos': AppType.DESKTOP_APP.value,
+                # A browser extension is NOT a desktop app — it lives inside the
+                # browser via managed policy, so it gets the EXTENSION app type
+                # (no standalone launcher icon).
+                'browser_ext': AppType.EXTENSION.value,
                 'extension': AppType.EXTENSION.value,
             }
             app_type = platform_type_map.get(result.platform, AppType.DESKTOP_APP.value)
@@ -625,63 +661,435 @@ class AppInstaller:
                 success=False, platform='windows', name=name,
                 error=str(e))
 
+    def _apk_package_name(self, apk_path: str) -> str:
+        """Best-effort parse of the Android package name from an APK.
+
+        Tries `aapt dump badging` first (most reliable), then falls back to
+        reading the binary AndroidManifest.xml inside the ZIP and scraping the
+        UTF-16 string pool for the package id. Returns '' if neither works —
+        callers must NOT treat '' as a valid package (it would make the
+        post-install `waydroid app list` confirmation pass on a stale match).
+        """
+        aapt = shutil.which('aapt') or shutil.which('aapt2')
+        if aapt:
+            try:
+                out = subprocess.run(
+                    [aapt, 'dump', 'badging', apk_path],
+                    capture_output=True, text=True, timeout=30)
+                if out.returncode == 0:
+                    for line in (out.stdout or '').splitlines():
+                        if line.startswith('package:'):
+                            # package: name='com.foo.bar' versionCode=...
+                            marker = "name='"
+                            i = line.find(marker)
+                            if i != -1:
+                                j = line.find("'", i + len(marker))
+                                if j != -1:
+                                    return line[i + len(marker):j]
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        # Fallback: scrape the binary AndroidManifest for a 'com.*' / package id.
+        try:
+            import zipfile
+            import re
+            with zipfile.ZipFile(apk_path) as zf:
+                raw = zf.read('AndroidManifest.xml')
+            # Binary AXML stores strings UTF-16LE in a pool; decode lossily and
+            # pull the first plausible java-package token. This is heuristic but
+            # only used as a fallback when aapt is absent.
+            text = raw.decode('utf-16-le', errors='ignore')
+            for m in re.finditer(r'([a-zA-Z][\w]*(?:\.[a-zA-Z][\w]*){2,})', text):
+                tok = m.group(1)
+                # Skip android.* framework attrs; want the app's own package.
+                if not tok.startswith('android.') and not tok.startswith('http'):
+                    return tok
+        except Exception:
+            pass
+        return ''
+
+    def _waydroid_session_live(self) -> bool:
+        """True iff a Waydroid container session is actually RUNNING.
+
+        Checks `waydroid status` for RUNNING; falls back to /dev/binder presence
+        only as a weak signal. A live session is REQUIRED for `waydroid app
+        install` to do anything — without it the install is a no-op.
+        """
+        waydroid = shutil.which('waydroid')
+        if waydroid:
+            try:
+                out = subprocess.run(
+                    [waydroid, 'status'],
+                    capture_output=True, text=True, timeout=15)
+                if out.returncode == 0 and 'RUNNING' in (out.stdout or '').upper():
+                    return True
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        return False
+
     def _install_android(self, req: InstallRequest) -> InstallResult:
-        """Install an Android APK."""
+        """Install an Android APK via Waydroid (real ART/PackageManager).
+
+        REAL install contract (no fake-success): require `waydroid` on PATH AND
+        a live RUNNING session; run `waydroid app install <apk>`; then CONFIRM by
+        polling `waydroid app list` for the APK's parsed package id — exit-0
+        alone is NOT proof (some Waydroid builds emit errors on stderr while
+        returning 0). On no-waydroid / no-session the source is STAGED to disk
+        (success=False, staged=True) with an actionable message — a copied APK is
+        NOT installed, so it is never reported as installed/launchable.
+        """
         if not os.path.isfile(req.source):
             return InstallResult(
                 success=False, platform='android',
                 name=req.name or req.source, error='File not found')
 
         name = req.name or os.path.basename(req.source).replace('.apk', '')
+        pkg = self._apk_package_name(req.source)
 
-        # Check if Android subsystem is available
-        if not os.path.exists('/dev/binder'):
-            return InstallResult(
-                success=False, platform='android', name=name,
-                error='Android subsystem not enabled. Set hart.kernel.androidNative.enable = true in NixOS config')
-
-        # Try ADB-style install
-        adb = shutil.which('adb')
-        if adb:
+        waydroid = shutil.which('waydroid')
+        if not waydroid or not self._waydroid_session_live():
+            # Honest staging: place the APK on disk for a later live session, but
+            # DO NOT claim it is installed. success=False + staged=True.
+            android_dir = os.path.join(self._install_dir, 'android', 'apps')
+            dest = ''
             try:
-                result = subprocess.run(
-                    [adb, 'install', '-r', req.source],
-                    capture_output=True, text=True, timeout=120)
-                if result.returncode == 0:
-                    return InstallResult(
-                        success=True, platform='android', name=name,
-                        app_id=name)
-            except (subprocess.TimeoutExpired, Exception):
-                pass
+                os.makedirs(android_dir, exist_ok=True)
+                dest = os.path.join(android_dir, os.path.basename(req.source))
+                shutil.copy2(req.source, dest)
+            except (IOError, PermissionError):
+                dest = ''
+            return InstallResult(
+                success=False, staged=True, platform='android', name=name,
+                install_path=dest, app_id=pkg,
+                error='Android runtime not available — enable '
+                      'hart.subsystems.android (Waydroid) and start a session. '
+                      'APK staged to disk but NOT installed.')
 
-        # Fallback: copy to Android app directory
-        android_dir = os.path.join(self._install_dir, 'android', 'apps')
-        os.makedirs(android_dir, exist_ok=True)
-        dest = os.path.join(android_dir, os.path.basename(req.source))
+        # Live Waydroid session — do the real install.
         try:
-            shutil.copy2(req.source, dest)
+            result = subprocess.run(
+                [waydroid, 'app', 'install', req.source],
+                capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
             return InstallResult(
-                success=True, platform='android', name=name,
-                install_path=dest, app_id=name)
-        except (IOError, PermissionError) as e:
+                success=False, platform='android', name=name, app_id=pkg,
+                error='waydroid app install timed out')
+        except OSError as e:
             return InstallResult(
-                success=False, platform='android', name=name,
+                success=False, platform='android', name=name, app_id=pkg,
                 error=str(e))
 
+        # exit-0 is INSUFFICIENT — confirm the package is actually present.
+        if not pkg:
+            # Without a package id we cannot positively confirm; refuse to claim
+            # success rather than trust a bare exit code.
+            if result.returncode != 0:
+                return InstallResult(
+                    success=False, platform='android', name=name,
+                    error=f'waydroid app install exited {result.returncode}: '
+                          f'{(result.stderr or "").strip()[:200]}')
+            return InstallResult(
+                success=False, platform='android', name=name,
+                error='Install ran but the APK package name could not be parsed '
+                      'to confirm it via `waydroid app list`. Install aapt or '
+                      'verify manually.')
+
+        try:
+            listing = subprocess.run(
+                [waydroid, 'app', 'list'],
+                capture_output=True, text=True, timeout=60)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return InstallResult(
+                success=False, platform='android', name=name, app_id=pkg,
+                error=f'install ran but could not verify via app list: {e}')
+
+        if listing.returncode == 0 and pkg in (listing.stdout or ''):
+            return InstallResult(
+                success=True, platform='android', name=name, app_id=pkg)
+
+        return InstallResult(
+            success=False, platform='android', name=name, app_id=pkg,
+            error=f'waydroid app install did not register {pkg} '
+                  f'(exit {result.returncode}): '
+                  f'{(result.stderr or "").strip()[:200]}')
+
     def _install_macos(self, req: InstallRequest) -> InstallResult:
-        """Install a macOS app via Darling (experimental)."""
-        name = req.name or os.path.basename(req.source).replace('.dmg', '').replace('.app', '')
+        """Install/run a macOS app via Darling (experimental, CLI-leaning).
+
+        Honest contract: require `darling`; first prove the Darwin prefix boots
+        with `darling shell true` (exit 0). For a .app bundle, locate
+        Contents/MacOS/<binary> and launch it via `darling shell <binary>`,
+        honouring the exit code. For .dmg/.pkg there is NO reliable headless
+        mount+install path under Darling — refuse honestly (success=False).
+        GUI (AppKit/Metal/modern Swift) is largely non-functional and we never
+        auto-pin a desktop icon for a macOS GUI app.
+        """
+        name = req.name or os.path.basename(req.source).replace(
+            '.dmg', '').replace('.app', '').replace('.pkg', '')
 
         darling = shutil.which('darling')
         if not darling:
             return InstallResult(
                 success=False, platform='macos', name=name,
-                error='Darling not installed. macOS app support is experimental. '
-                      'Consider using the app natively on macOS via remote desktop.')
+                error='Darling not installed. macOS app support is experimental '
+                      '(opt-in: hart.subsystems.macos.enable). Consider using the '
+                      'app natively on macOS via remote desktop.')
+
+        ext = os.path.splitext(req.source)[1].lower()
+        if ext in ('.dmg', '.pkg'):
+            return InstallResult(
+                success=False, platform='macos', name=name,
+                error='.dmg/.pkg have no reliable headless install path under '
+                      'Darling. Mount/extract the .app bundle and install that '
+                      'instead. (macOS support is experimental, GUI mostly '
+                      'broken.)')
+
+        # Prove the Darwin prefix actually boots before trusting anything else.
+        try:
+            boot = subprocess.run(
+                [darling, 'shell', 'true'],
+                capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            return InstallResult(
+                success=False, platform='macos', name=name,
+                error='darling prefix boot (`darling shell true`) timed out')
+        except OSError as e:
+            return InstallResult(
+                success=False, platform='macos', name=name, error=str(e))
+        if boot.returncode != 0:
+            return InstallResult(
+                success=False, platform='macos', name=name,
+                error=f'darling prefix failed to boot (exit {boot.returncode}): '
+                      f'{(boot.stderr or "").strip()[:200]}')
+
+        # Resolve the executable inside a .app bundle.
+        if ext == '.app' or os.path.isdir(req.source):
+            macos_dir = os.path.join(req.source, 'Contents', 'MacOS')
+            binary = ''
+            if os.path.isdir(macos_dir):
+                for entry in sorted(os.listdir(macos_dir)):
+                    cand = os.path.join(macos_dir, entry)
+                    if os.path.isfile(cand):
+                        binary = cand
+                        break
+            if not binary:
+                return InstallResult(
+                    success=False, platform='macos', name=name,
+                    error='Could not locate Contents/MacOS/<binary> in the .app '
+                          'bundle.')
+            target = binary
+        else:
+            # A bare Mach-O CLI binary.
+            target = req.source
+
+        try:
+            run = subprocess.run(
+                [darling, 'shell', target],
+                capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            return InstallResult(
+                success=False, platform='macos', name=name,
+                error='darling shell launch timed out')
+        except OSError as e:
+            return InstallResult(
+                success=False, platform='macos', name=name, error=str(e))
+
+        if run.returncode != 0:
+            return InstallResult(
+                success=False, platform='macos', name=name,
+                error=f'darling shell exited {run.returncode}: '
+                      f'{(run.stderr or "").strip()[:200]} '
+                      '(macOS GUI under Darling is largely non-functional).')
 
         return InstallResult(
-            success=False, platform='macos', name=name,
-            error='macOS app installation via Darling is not yet automated')
+            success=True, platform='macos', name=name,
+            install_path=target, app_id=name)
+
+    def _install_snap(self, req: InstallRequest) -> InstallResult:
+        """Snap is NOT supported on HART OS — honest refusal (no fake success).
+
+        snapd hard-codes an FHS /snap + /var/lib/snapd tree and runtime-generated
+        AppArmor profiles that conflict with the Nix store model. The flake pins
+        nixpkgs to a fixed commit with NO snapd input and no /snap FHS shim; the
+        only real path is the out-of-tree third-party `nix-snapd` flake, which is
+        a steward supply-chain decision, NOT a silent module. So native snap is
+        INFEASIBLE on this image. Point the user at the Flatpak/AppImage/Nix
+        equivalent instead of silently misrouting .snap to the nix catch-all.
+        """
+        name = req.name or os.path.basename(
+            req.source.replace('snap:', '')).replace('.snap', '')
+        return InstallResult(
+            success=False, platform='snap', name=name,
+            error='Snap is not supported on HART OS — snapd requires an FHS '
+                  '/snap tree + the out-of-tree nix-snapd flake which this image '
+                  'does not bundle. Install the Flatpak, AppImage, or Nix '
+                  'equivalent instead.')
+
+    def _install_browser_ext(self, req: InstallRequest) -> InstallResult:
+        """Install a browser extension (.crx → Chromium, .xpi → Firefox).
+
+        REAL install via enterprise managed-policy force-install — DISTINCT from
+        HART's in-process .hartpkg extension registry. Writes the extension's
+        id (+ update_url for Chromium) into the on-disk managed-policy list, then
+        CONFIRMS by reading that file back and asserting the id is present. The
+        browser force-installs the extension on its next launch, so "installed"
+        here means "policy written + will load" — stated plainly. Failure =
+        browser/policy dir absent or the write/verify failed.
+        """
+        if not os.path.isfile(req.source):
+            return InstallResult(
+                success=False, platform='browser_ext',
+                name=req.name or req.source, error='File not found')
+
+        ext = os.path.splitext(req.source)[1].lower()
+        name = req.name or os.path.basename(req.source)
+
+        if ext == '.crx':
+            return self._install_chromium_ext(req, name)
+        if ext == '.xpi':
+            return self._install_firefox_ext(req, name)
+        return InstallResult(
+            success=False, platform='browser_ext', name=name,
+            error=f'Unsupported browser-extension type: {ext} '
+                  '(.crx for Chromium, .xpi for Firefox)')
+
+    def _install_chromium_ext(self, req: InstallRequest, name: str) -> InstallResult:
+        """Force-install a Chromium .crx via ExtensionInstallForcelist policy.
+
+        The managed policy lives at /etc/chromium/policies/managed/<file>.json
+        (the path programs.chromium writes under hart.subsystems.web.enable). A
+        bare local .crx is not force-installable by id alone — an update_url is
+        required; the caller may pass options['update_url'] (Chrome Web Store or
+        a self-hosted update manifest). The extension id may be supplied via
+        options['id']; otherwise it is derived from the .crx filename.
+        """
+        if not shutil.which('chromium') and not shutil.which('chromium-browser'):
+            return InstallResult(
+                success=False, platform='browser_ext', name=name,
+                error='Chromium not installed. Enable hart.subsystems.web '
+                      '(programs.chromium) to manage extensions.')
+
+        ext_id = req.options.get('id') or os.path.splitext(
+            os.path.basename(req.source))[0]
+        update_url = req.options.get(
+            'update_url', 'https://clients2.google.com/service/update2/crx')
+
+        policy_dir = req.options.get(
+            'policy_dir', '/etc/chromium/policies/managed')
+        policy_file = os.path.join(policy_dir, 'hart_extensions.json')
+        forcelist_entry = f'{ext_id};{update_url}'
+
+        try:
+            os.makedirs(policy_dir, exist_ok=True)
+            policy = {}
+            if os.path.isfile(policy_file):
+                try:
+                    with open(policy_file, 'r') as f:
+                        policy = json.load(f) or {}
+                except (json.JSONDecodeError, IOError):
+                    policy = {}
+            forcelist = policy.get('ExtensionInstallForcelist', [])
+            if forcelist_entry not in forcelist:
+                forcelist.append(forcelist_entry)
+            policy['ExtensionInstallForcelist'] = forcelist
+            with open(policy_file, 'w') as f:
+                json.dump(policy, f, indent=2)
+        except (IOError, PermissionError) as e:
+            return InstallResult(
+                success=False, platform='browser_ext', name=name,
+                error=f'Failed to write Chromium managed policy: {e}')
+
+        # CONFIRM: read the policy file back and assert the id is present.
+        try:
+            with open(policy_file, 'r') as f:
+                written = json.load(f)
+            present = any(
+                e.split(';')[0] == ext_id
+                for e in written.get('ExtensionInstallForcelist', []))
+        except (json.JSONDecodeError, IOError) as e:
+            return InstallResult(
+                success=False, platform='browser_ext', name=name,
+                error=f'Could not verify Chromium policy on disk: {e}')
+
+        if not present:
+            return InstallResult(
+                success=False, platform='browser_ext', name=name,
+                error='Chromium policy written but extension id not found on '
+                      'verify')
+
+        # NOTE: the extension activates on Chromium's NEXT launch (managed
+        # policy is read at startup). success=True means "policy written + will
+        # force-install" — verified by the on-disk policy read above.
+        return InstallResult(
+            success=True, platform='browser_ext', name=name,
+            install_path=policy_file, app_id=ext_id)
+
+    def _install_firefox_ext(self, req: InstallRequest, name: str) -> InstallResult:
+        """Force-install a Firefox .xpi via the ExtensionSettings policy.
+
+        Writes/merges an ExtensionSettings entry into the managed policies.json
+        (the path programs.firefox.policies writes) pointing at the .xpi, then
+        verifies the id is present on disk. The .xpi must be AMO-signed unless an
+        unbranded/ESR policy build is used.
+        """
+        if not shutil.which('firefox'):
+            return InstallResult(
+                success=False, platform='browser_ext', name=name,
+                error='Firefox not installed. Enable hart.subsystems.web with a '
+                      'bundled Firefox to manage extensions.')
+
+        ext_id = req.options.get('id') or os.path.splitext(
+            os.path.basename(req.source))[0]
+        policy_dir = req.options.get(
+            'policy_dir', '/etc/firefox/policies')
+        policy_file = os.path.join(policy_dir, 'policies.json')
+        install_url = req.options.get('install_url') or f'file://{os.path.abspath(req.source)}'
+
+        try:
+            os.makedirs(policy_dir, exist_ok=True)
+            doc = {}
+            if os.path.isfile(policy_file):
+                try:
+                    with open(policy_file, 'r') as f:
+                        doc = json.load(f) or {}
+                except (json.JSONDecodeError, IOError):
+                    doc = {}
+            policies = doc.setdefault('policies', {})
+            ext_settings = policies.setdefault('ExtensionSettings', {})
+            ext_settings[ext_id] = {
+                'installation_mode': 'force_installed',
+                'install_url': install_url,
+            }
+            with open(policy_file, 'w') as f:
+                json.dump(doc, f, indent=2)
+        except (IOError, PermissionError) as e:
+            return InstallResult(
+                success=False, platform='browser_ext', name=name,
+                error=f'Failed to write Firefox policies.json: {e}')
+
+        # CONFIRM on disk.
+        try:
+            with open(policy_file, 'r') as f:
+                written = json.load(f)
+            present = ext_id in written.get(
+                'policies', {}).get('ExtensionSettings', {})
+        except (json.JSONDecodeError, IOError) as e:
+            return InstallResult(
+                success=False, platform='browser_ext', name=name,
+                error=f'Could not verify Firefox policy on disk: {e}')
+
+        if not present:
+            return InstallResult(
+                success=False, platform='browser_ext', name=name,
+                error='Firefox policy written but extension id not found on '
+                      'verify')
+
+        # NOTE: the extension activates on Firefox's NEXT launch (managed policy
+        # is read at startup). success=True means "policy written + will
+        # force-install" — verified by the on-disk policy read above.
+        return InstallResult(
+            success=True, platform='browser_ext', name=name,
+            install_path=policy_file, app_id=ext_id)
 
     def _install_extension(self, req: InstallRequest) -> InstallResult:
         """Install a HART OS extension."""
@@ -860,6 +1268,7 @@ def register_app_install_routes(app):
 
         return jsonify({
             'success': result.success,
+            'staged': result.staged,
             'platform': result.platform,
             'name': result.name,
             'version': result.version,
@@ -987,10 +1396,20 @@ def register_app_install_routes(app):
                 available = shutil.which('wine64') is not None or \
                            shutil.which('wine') is not None
             elif p == InstallerPlatform.ANDROID:
-                available = os.path.exists('/dev/binder')
+                tool = 'waydroid'
+                available = shutil.which('waydroid') is not None
             elif p == InstallerPlatform.MACOS:
                 tool = 'darling'
                 available = shutil.which('darling') is not None
+            elif p == InstallerPlatform.SNAP:
+                # Honestly unsupported — shown so the UI can grey it out.
+                tool = 'snapd'
+                available = False
+            elif p == InstallerPlatform.BROWSER_EXT:
+                tool = 'chromium/firefox'
+                available = (shutil.which('chromium') is not None or
+                             shutil.which('chromium-browser') is not None or
+                             shutil.which('firefox') is not None)
             elif p == InstallerPlatform.EXTENSION:
                 available = True
 
