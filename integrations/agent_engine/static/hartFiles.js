@@ -91,6 +91,19 @@
     },
     openWith: function (path) {
       return fetch(S() + '/api/shell/open-with', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: path }), signal: sig(8000) }).then(function (r) { return r.json(); });
+    },
+    search: function (path, q, recursive, hidden) {
+      var u = S() + '/api/shell/files/search?path=' + encodeURIComponent(path) +
+        '&q=' + encodeURIComponent(q) + '&recursive=' + (recursive ? 'true' : 'false') +
+        (hidden ? '&hidden=true' : '');
+      return fetch(u, { signal: sig(15000) }).then(function (r) { return r.json(); });
+    },
+    chmod: function (path, mode) {
+      return fetch(S() + '/api/shell/files/chmod', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: path, mode: mode }), signal: sig(8000) }).then(function (r) { return r.json(); });
+    },
+    // Thumbnail is an <img src> (GET), so expose the URL builder, not a fetch.
+    thumbUrl: function (path, size) {
+      return S() + '/api/shell/files/thumbnail?path=' + encodeURIComponent(path) + '&size=' + (size || 96);
     }
   };
 
@@ -104,6 +117,9 @@
       view: 'list',          // 'list' | 'grid'
       sortBy: 'name', sortDir: 1,
       hidden: false, filter: '',
+      searchSub: false,      // 'search subfolders' toggle (recursive route)
+      searchResults: null,   // when set: entries[] from /search (rel-pathed)
+      searchTrunc: false, searchSeq: 0,
       el: null, root: null, ro: null
     };
   }
@@ -158,6 +174,29 @@
       '.hf-props-card{width:min(420px,92%);background:rgba(24,22,42,.98);border:1px solid rgba(160,150,255,.22);border-radius:14px;padding:20px}',
       '.hf-props-row{display:flex;justify-content:space-between;gap:16px;padding:7px 0;border-bottom:1px solid rgba(160,150,255,.1);font-size:13px}',
       '.hf-props-row b{color:var(--ds-text-muted,#9a96c4);font-weight:500}',
+      // search-subfolders toggle (sits beside the Filter box)
+      '.hf-subfx{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:9px;border:1px solid rgba(160,150,255,.18);background:rgba(160,150,255,.06);color:inherit;cursor:pointer;flex:0 0 auto}',
+      '.hf-subfx:hover{background:rgba(108,99,255,.22)}.hf-subfx.on{background:rgba(108,99,255,.34);border-color:var(--hf-acc)}.hf-subfx .mi{font-size:18px}',
+      // drag-drop: dragged source + drop-target highlight on a folder row / place
+      '.hf-row.dragsrc,.hf-tile.dragsrc{opacity:.45}',
+      '.hf-row.drop-on,.hf-tile.drop-on,.hf-side-item.drop-on{outline:2px solid var(--hf-acc);outline-offset:-2px;background:rgba(108,99,255,.34)}',
+      '.hf-drag-ghost{position:fixed;z-index:13500;pointer-events:none;padding:4px 10px;border-radius:8px;background:rgba(24,22,42,.96);border:1px solid var(--hf-acc);color:#fff;font-size:12.5px;box-shadow:0 10px 30px rgba(0,0,0,.5)}',
+      // thumbnail image (list row + grid tile) — same box as the glyph it replaces
+      '.hf-thumb{flex:0 0 auto;object-fit:cover;border-radius:4px;background:rgba(0,0,0,.25)}',
+      '.hf-row .hf-thumb{width:22px;height:22px;margin-right:10px}',
+      '.hf-tile .hf-thumb{width:46px;height:46px;border-radius:7px}',
+      // search result rows carry a small relative-path subtitle
+      '.hf-rel{font-size:11px;color:var(--ds-text-muted,#8d8ab0);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.hf-row .hf-namewrap{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;justify-content:center}',
+      // permissions editor inside Properties
+      '.hf-perm{margin-top:6px}',
+      '.hf-perm-grid{display:grid;grid-template-columns:auto repeat(3,1fr);gap:6px 10px;align-items:center;margin:8px 0}',
+      '.hf-perm-grid .ph{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--ds-text-muted,#8d8ab0);text-align:center}',
+      '.hf-perm-grid .rl{font-size:12.5px;color:var(--ds-text-muted,#9a96c4)}',
+      '.hf-perm-cb{width:18px;height:18px;accent-color:var(--hf-acc);cursor:pointer;justify-self:center}',
+      '.hf-perm-oct{font-family:ui-monospace,Menlo,Consolas,monospace;color:#fff}',
+      '.hf-perm-save{height:32px;padding:0 14px;border-radius:8px;border:1px solid var(--hf-acc);background:rgba(108,99,255,.28);color:#fff;cursor:pointer;font-size:12.5px}',
+      '.hf-perm-save[disabled]{opacity:.4;pointer-events:none}',
       // responsive (container-width via ResizeObserver classes on .hf-root)
       '.hf-root.hf-narrow .hf-sidebar{position:absolute;left:0;top:0;bottom:0;z-index:9;width:210px;background:rgba(16,14,30,.98);transform:translateX(-105%);transition:transform .22s;border-right:1px solid rgba(160,150,255,.2)}',
       '.hf-root.hf-narrow.hf-side-open .hf-sidebar{transform:none}',
@@ -199,6 +238,7 @@
     if (!ST) return;
     if (pushHistory !== false && ST.cwd && ST.cwd !== path) { ST.back.push(ST.cwd); ST.fwd = []; }
     ST.filter = ''; ST.sel = []; ST.anchor = -1;
+    ST.searchResults = null; ST.searchTrunc = false;  // leaving a folder ends a search
     render(true);
     API.browse(path, ST.hidden).then(function (d) {
       if (!d || d.error) { renderError(d && d.error ? d.error : 'Cannot open folder'); return; }
@@ -230,9 +270,35 @@
     });
   }
   function visible() {
+    // When a subfolder search is active, the result set IS the view (already
+    // server-filtered + rel-pathed); the Filter box drives that search instead
+    // of an in-memory filter.
+    if (ST.searchResults) return ST.searchResults;
     if (!ST.filter) return ST.entries;
     var q = ST.filter.toLowerCase();
     return ST.entries.filter(function (e) { return e.name.toLowerCase().indexOf(q) >= 0; });
+  }
+  function inSearch() { return !!ST.searchResults; }
+  function runSearch() {
+    var q = (ST.filter || '').trim();
+    if (!q) { ST.searchResults = null; ST.searchTrunc = false; render(false); return; }
+    var seq = ++ST.searchSeq;
+    API.search(ST.cwd, q, true, ST.hidden).then(function (d) {
+      if (seq !== ST.searchSeq) return;          // a newer keystroke won
+      if (!d || d.error) { ST.searchResults = []; ST.searchTrunc = false; }
+      else { ST.searchResults = (d.entries || []).slice(); ST.searchTrunc = !!d.truncated; }
+      ST.sel = []; ST.anchor = -1;
+      render(false);
+    }).catch(function () {
+      if (seq !== ST.searchSeq) return;
+      ST.searchResults = []; ST.searchTrunc = false; render(false);
+    });
+  }
+  // Debounced trigger so typing in the Filter box doesn't fire a walk per key.
+  var _searchTimer = 0;
+  function scheduleSearch() {
+    if (_searchTimer) clearTimeout(_searchTimer);
+    _searchTimer = setTimeout(function () { _searchTimer = 0; runSearch(); }, 260);
   }
 
   // ── render ───────────────────────────────────────────────────────────────
@@ -270,12 +336,32 @@
     });
     return h;
   }
+  function isImage(f) { return !f.is_dir && iconFor(f) === 'image'; }
+  // Glyph span + (for images) an <img> thumbnail that replaces the glyph once it
+  // loads; on error the <img> removes itself and the glyph stays. cls = the
+  // glyph size class ('mi' is shared); klass = extra (hf-ic-dir/file).
+  function glyphOrThumb(f, size, klass) {
+    var glyph = '<span class="mi material-icons-round ' + klass + '">' + iconFor(f) + '</span>';
+    if (!isImage(f)) return glyph;
+    var img = '<img class="hf-thumb" alt="" loading="lazy" src="' + esc(API.thumbUrl(f.path, size)) +
+      '" onload="this.previousElementSibling&&(this.previousElementSibling.style.display=\'none\')" ' +
+      'onerror="this.remove()">';
+    return glyph + img;
+  }
   function rowHtml(f, i) {
     var selc = ST.sel.indexOf(f.path) >= 0 ? ' sel' : '';
     var cutc = (ST.clip && ST.clip.mode === 'cut' && ST.clip.paths.indexOf(f.path) >= 0) ? ' cut' : '';
+    var nameCell;
+    if (inSearch() && f.rel) {
+      var loc = dirname(f.rel); if (loc === '/' || loc === '.') loc = ST.cwd;
+      nameCell = '<span class="hf-namewrap"><span class="hf-name">' + esc(f.name) + '</span>' +
+        '<span class="hf-rel">' + esc(loc) + '</span></span>';
+    } else {
+      nameCell = '<span class="hf-name">' + esc(f.name) + '</span>';
+    }
     return '<div class="hf-row' + selc + cutc + '" data-i="' + i + '" data-path="' + esc(f.path) + '" data-dir="' + (f.is_dir ? 1 : 0) + '">' +
-      '<span class="mi material-icons-round ' + (f.is_dir ? 'hf-ic-dir' : 'hf-ic-file') + '">' + iconFor(f) + '</span>' +
-      '<span class="hf-name">' + esc(f.name) + '</span>' +
+      glyphOrThumb(f, 48, f.is_dir ? 'hf-ic-dir' : 'hf-ic-file') +
+      nameCell +
       '<span class="hf-size">' + (f.is_dir ? '' : human(f.size)) + '</span>' +
       '<span class="hf-kind">' + esc(kind(f)) + '</span>' +
       '<span class="hf-date">' + fmtDate(f.modified) + '</span></div>';
@@ -284,7 +370,7 @@
     var selc = ST.sel.indexOf(f.path) >= 0 ? ' sel' : '';
     var cutc = (ST.clip && ST.clip.mode === 'cut' && ST.clip.paths.indexOf(f.path) >= 0) ? ' cut' : '';
     return '<div class="hf-tile' + selc + cutc + '" data-i="' + i + '" data-path="' + esc(f.path) + '" data-dir="' + (f.is_dir ? 1 : 0) + '">' +
-      '<span class="mi material-icons-round ' + (f.is_dir ? 'hf-ic-dir' : 'hf-ic-file') + '">' + iconFor(f) + '</span>' +
+      glyphOrThumb(f, 96, f.is_dir ? 'hf-ic-dir' : 'hf-ic-file') +
       '<span class="hf-name">' + esc(f.name) + '</span></div>';
   }
   function sortCaret(col) { return ST.sortBy === col ? ('<span class="mi material-icons-round">' + (ST.sortDir > 0 ? 'arrow_drop_down' : 'arrow_drop_up') + '</span>') : ''; }
@@ -302,7 +388,8 @@
       '<button class="hf-tb-btn" data-act="up" ' + (canUp ? '' : 'disabled') + ' title="Up (Alt+Up)"><span class="mi material-icons-round">arrow_upward</span></button>' +
       '<button class="hf-tb-btn" data-act="refresh" title="Refresh (F5)"><span class="mi material-icons-round">refresh</span></button>' +
       '<div class="hf-crumbs">' + crumbsHtml() + '</div>' +
-      '<input class="hf-search" placeholder="Filter…" value="' + esc(ST.filter) + '">' +
+      '<input class="hf-search" placeholder="' + (ST.searchSub ? 'Search subfolders…' : 'Filter…') + '" value="' + esc(ST.filter) + '">' +
+      '<button class="hf-subfx' + (ST.searchSub ? ' on' : '') + '" data-act="subfx" title="Search subfolders"><span class="mi material-icons-round">' + (ST.searchSub ? 'manage_search' : 'search') + '</span></button>' +
       '<button class="hf-tb-btn" data-act="newfolder" title="New Folder (Ctrl+Shift+N)"><span class="mi material-icons-round">create_new_folder</span></button>' +
       '<button class="hf-tb-btn" data-act="view" title="Toggle view"><span class="mi material-icons-round">' + (ST.view === 'list' ? 'grid_view' : 'view_list') + '</span></button>' +
       '<button class="hf-tb-btn" data-act="hidden" title="Hidden files" style="' + (ST.hidden ? 'background:rgba(108,99,255,.3)' : '') + '"><span class="mi material-icons-round">' + (ST.hidden ? 'visibility' : 'visibility_off') + '</span></button>' +
@@ -312,7 +399,9 @@
     if (loading) {
       html += '<div class="hf-empty"><span class="mi material-icons-round">hourglass_top</span>Loading…</div>';
     } else if (!vis.length) {
-      html += '<div class="hf-empty"><span class="mi material-icons-round">folder_open</span>' + (ST.filter ? 'No items match “' + esc(ST.filter) + '”' : 'This folder is empty') + '</div>';
+      var emptyMsg = inSearch() ? ('No results for “' + esc(ST.filter) + '” in subfolders')
+        : (ST.filter ? 'No items match “' + esc(ST.filter) + '”' : 'This folder is empty');
+      html += '<div class="hf-empty"><span class="mi material-icons-round">' + (inSearch() ? 'search_off' : 'folder_open') + '</span>' + emptyMsg + '</div>';
     } else if (ST.view === 'list') {
       html += '<div class="hf-cols">' +
         '<span class="hf-col hf-col-name" data-sort="name">Name ' + sortCaret('name') + '</span>' +
@@ -330,7 +419,9 @@
     html += '</div></div>';
     // status bar
     var selSize = 0; ST.sel.forEach(function (p) { var e = byPath(p); if (e && !e.is_dir) selSize += (e.size || 0); });
-    html += '<div class="hf-status"><span>' + vis.length + ' item' + (vis.length === 1 ? '' : 's') + '</span>' +
+    var countLabel = (inSearch() ? (vis.length + ' result' + (vis.length === 1 ? '' : 's') + (ST.searchTrunc ? '+ (showing first ' + vis.length + ')' : ''))
+      : (vis.length + ' item' + (vis.length === 1 ? '' : 's')));
+    html += '<div class="hf-status"><span>' + countLabel + '</span>' +
       (ST.sel.length ? '<span>' + ST.sel.length + ' selected' + (selSize ? ' · ' + human(selSize) : '') + '</span>' : '') +
       (ST.clip ? '<span style="margin-left:auto">' + ST.clip.mode + ': ' + ST.clip.paths.length + '</span>' : '') + '</div>';
 
@@ -344,12 +435,17 @@
     var b = ST.root.querySelector('[data-act="refresh"]'); if (b) b.onclick = refresh;
   }
 
-  function byPath(p) { for (var i = 0; i < ST.entries.length; i++) if (ST.entries[i].path === p) return ST.entries[i]; return null; }
+  function byPath(p) {
+    var i;
+    for (i = 0; i < ST.entries.length; i++) if (ST.entries[i].path === p) return ST.entries[i];
+    if (ST.searchResults) for (i = 0; i < ST.searchResults.length; i++) if (ST.searchResults[i].path === p) return ST.searchResults[i];
+    return null;
+  }
 
   // ── wiring ───────────────────────────────────────────────────────────────
   function wire() {
     var r = ST.root;
-    r.querySelectorAll('.hf-tb-btn').forEach(function (b) {
+    r.querySelectorAll('.hf-tb-btn,.hf-subfx').forEach(function (b) {
       b.onclick = function () {
         var a = b.getAttribute('data-act');
         if (a === 'back') back(); else if (a === 'fwd') forward(); else if (a === 'up') up();
@@ -357,6 +453,11 @@
         else if (a === 'view') { ST.view = ST.view === 'list' ? 'grid' : 'list'; render(false); }
         else if (a === 'hidden') { ST.hidden = !ST.hidden; refresh(); }
         else if (a === 'side') r.classList.toggle('hf-side-open');
+        else if (a === 'subfx') {
+          ST.searchSub = !ST.searchSub;
+          if (ST.searchSub) { if (ST.filter.trim()) runSearch(); else render(false); }
+          else { ST.searchResults = null; ST.searchTrunc = false; render(false); }  // back to instant local filter
+        }
       };
     });
     r.querySelectorAll('.hf-crumb').forEach(function (c) { c.onclick = function () { navigate(c.getAttribute('data-p'), true); }; });
@@ -365,15 +466,137 @@
       c.onclick = function () { var k = c.getAttribute('data-sort'); if (ST.sortBy === k) ST.sortDir = -ST.sortDir; else { ST.sortBy = k; ST.sortDir = 1; } applySort(); render(false); };
     });
     var s = r.querySelector('.hf-search');
-    if (s) s.oninput = function () { ST.filter = s.value; var keep = s; renderKeepFocus(keep); };
+    if (s) {
+      s.oninput = function () {
+        ST.filter = s.value;
+        if (ST.searchSub) {
+          // recursive route (debounced); keep the instant local filter live too
+          // so the current dir narrows immediately while the walk returns.
+          if (!s.value.trim()) { ST.searchResults = null; ST.searchTrunc = false; }
+          scheduleSearch(); renderKeepFocus(s);
+        } else {
+          renderKeepFocus(s);  // instant filter of the current dir
+        }
+      };
+      s.onkeydown = function (e) {
+        if (e.key === 'Enter' && ST.searchSub) { if (_searchTimer) { clearTimeout(_searchTimer); _searchTimer = 0; } runSearch(); }
+      };
+    }
 
     r.querySelectorAll('.hf-row,.hf-tile').forEach(function (it) {
-      it.onclick = function (ev) { onItemClick(it, ev); };
+      it.onclick = function (ev) { if (it._dragged) { it._dragged = false; return; } onItemClick(it, ev); };
       it.ondblclick = function () { openItem(it.getAttribute('data-path'), it.getAttribute('data-dir') === '1'); };
       it.oncontextmenu = function (ev) { ev.preventDefault(); if (ST.sel.indexOf(it.getAttribute('data-path')) < 0) selectOnly(it.getAttribute('data-path')); itemMenu(ev, it.getAttribute('data-path'), it.getAttribute('data-dir') === '1'); };
+      bindDrag(it);
     });
     var main = r.querySelector('.hf-main');
     if (main) main.oncontextmenu = function (ev) { if (ev.target.closest('.hf-row,.hf-tile')) return; ev.preventDefault(); emptyMenu(ev); };
+  }
+
+  // ── intra-window drag-drop (MOVE same root / COPY with Ctrl·Cmd) ──────────
+  // Reuses the pointer-event + setPointerCapture pattern from hartDesktop.js:
+  // arm on pointerdown, treat as a drag only past a 4px threshold (so plain
+  // clicks/dblclicks still fire), live-highlight the folder row / Places entry
+  // under the pointer, drop -> existing /move or /copy, then refresh.
+  function sameRoot(a, b) {
+    // Same allowed-root => MOVE is in-place; cross-root would surprise, so COPY.
+    // We approximate "same root" by sharing the top two path segments of cwd's
+    // home; simplest robust check: both under the current home prefix.
+    var h = (ST.home || '').replace(/\\/g, '/');
+    a = String(a).replace(/\\/g, '/'); b = String(b).replace(/\\/g, '/');
+    if (h && a.indexOf(h) === 0 && b.indexOf(h) === 0) return true;
+    // fall back to drive/root-letter comparison
+    var ra = a.slice(0, 3), rb = b.slice(0, 3);
+    return ra.toLowerCase() === rb.toLowerCase();
+  }
+  function dropTargetUnder(x, y) {
+    var els = (document.elementsFromPoint ? document.elementsFromPoint(x, y) : [document.elementFromPoint(x, y)]);
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i]; if (!el) continue;
+      var side = el.closest && el.closest('.hf-side-item');
+      if (side && ST.root.contains(side)) return { el: side, path: side.getAttribute('data-nav'), kind: 'place' };
+      var row = el.closest && el.closest('.hf-row,.hf-tile');
+      if (row && ST.root.contains(row) && row.getAttribute('data-dir') === '1') {
+        return { el: row, path: row.getAttribute('data-path'), kind: 'folder' };
+      }
+    }
+    return null;
+  }
+  function clearDrop() {
+    ST.root.querySelectorAll('.drop-on').forEach(function (e) { e.classList.remove('drop-on'); });
+  }
+  function bindDrag(it) {
+    var armed = false, dragging = false, sx = 0, sy = 0, ghost = null, cur = null, pid = null, p = null;
+    it.addEventListener('pointerdown', function (e) {
+      if (e.button !== 0) return;
+      // If the row isn't selected, select it first so a drag carries it.
+      p = it.getAttribute('data-path');
+      if (ST.sel.indexOf(p) < 0) selectOnly(p);
+      armed = true; dragging = false; sx = e.clientX; sy = e.clientY; pid = e.pointerId;
+    });
+    it.addEventListener('pointermove', function (e) {
+      if (!armed) return;
+      if (!dragging) {
+        if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) <= 4) return;
+        dragging = true; it._dragged = true;
+        try { it.setPointerCapture(pid); } catch (_) {}
+        it.classList.add('dragsrc');
+        ghost = document.createElement('div'); ghost.className = 'hf-drag-ghost';
+        var n = ST.sel.length;
+        ghost.textContent = n > 1 ? (n + ' items') : basename(p);
+        document.body.appendChild(ghost);
+      }
+      if (ghost) { ghost.style.left = (e.clientX + 12) + 'px'; ghost.style.top = (e.clientY + 14) + 'px'; }
+      clearDrop();
+      var t = dropTargetUnder(e.clientX, e.clientY);
+      // never highlight a target that is itself part of the dragged selection
+      if (t && ST.sel.indexOf(t.path) < 0) { t.el.classList.add('drop-on'); cur = t; }
+      else cur = null;
+    });
+    function finish(e) {
+      if (!armed) return; armed = false;
+      if (!dragging) return;             // a plain click — onclick handles it
+      dragging = false;
+      try { it.releasePointerCapture(pid); } catch (_) {}
+      if (ghost) { try { ghost.remove(); } catch (_) {} ghost = null; }
+      it.classList.remove('dragsrc'); clearDrop();
+      if (cur && cur.path) {
+        var copy = e && (e.ctrlKey || e.metaKey);
+        var dest = cur.path;
+        // don't drop a folder into itself
+        var srcs = ST.sel.slice().filter(function (s) { return s !== dest; });
+        if (srcs.length) dropMove(srcs, dest, copy && !sameRootAll(srcs, dest) ? true : copy);
+      }
+      cur = null;
+    }
+    it.addEventListener('pointerup', finish);
+    it.addEventListener('pointercancel', finish);
+  }
+  function sameRootAll(srcs, dest) {
+    for (var i = 0; i < srcs.length; i++) if (!sameRoot(srcs[i], dest)) return false;
+    return true;
+  }
+  function dropMove(srcs, dest, copy) {
+    // Cross-root drags can't MOVE meaningfully; force COPY there.
+    if (!copy && !sameRootAll(srcs, dest)) copy = true;
+    // Skip MOVEs that would be a no-op (item already lives directly in dest);
+    // a COPY into the same folder is still meaningful (the backend renames on
+    // collision is not implemented, so it just surfaces the "name exists" warn).
+    var work = srcs.filter(function (src) { return copy || dest !== dirname(src); });
+    if (!work.length) { clearDrop(); return; }
+    var done = 0, errs = 0, n = work.length;
+    work.forEach(function (src) {
+      var dst = joinp(dest, basename(src));
+      var op = copy ? API.copy(src, dst) : API.move(src, dst);
+      op.then(function (d) { if (d && d.error) errs++; }).catch(function () { errs++; }).then(function () {
+        if (++done === n) finishDrop(copy, errs);
+      });
+    });
+  }
+  function finishDrop(copy, errs) {
+    if (errs) toast(copy ? 'Copy' : 'Move', errs + ' failed (name may exist)', 'warn');
+    else toast(copy ? 'Copied' : 'Moved', 'Done', 'info');
+    refresh();
   }
   function renderKeepFocus(prevSearch) {
     var pos = prevSearch ? prevSearch.selectionStart : null;
@@ -475,9 +698,41 @@
       });
     });
   }
+  // POSIX-mode helpers for the permissions editor.
+  function normOct(s) { s = String(s == null ? '' : s).replace(/[^0-7]/g, ''); return s.length >= 3 ? s.slice(-3) : null; }
+  function permGridHtml(oct3) {
+    var rows = [['Owner', 0], ['Group', 1], ['Other', 2]];
+    var bits = ['r', 'w', 'x'];
+    var h = '<div class="hf-perm-grid"><span></span><span class="ph">R</span><span class="ph">W</span><span class="ph">X</span>';
+    rows.forEach(function (rw) {
+      var digit = parseInt(oct3.charAt(rw[1]), 8);
+      h += '<span class="rl">' + rw[0] + '</span>';
+      for (var b = 0; b < 3; b++) {
+        var mask = [4, 2, 1][b], on = (digit & mask) ? ' checked' : '';
+        h += '<input type="checkbox" class="hf-perm-cb" data-grp="' + rw[1] + '" data-bit="' + bits[b] + '"' + on + '>';
+      }
+    });
+    return h + '</div>';
+  }
+  function gridToOct(scope) {
+    var o = [0, 0, 0];
+    scope.querySelectorAll('.hf-perm-cb').forEach(function (cb) {
+      if (!cb.checked) return;
+      var g = +cb.getAttribute('data-grp'), bit = cb.getAttribute('data-bit');
+      o[g] += bit === 'r' ? 4 : bit === 'w' ? 2 : 1;
+    });
+    return '' + o[0] + o[1] + o[2];
+  }
   function properties(path) {
     API.info(path).then(function (d) {
       if (!d || d.error) { toast('Properties', (d && d.error) || 'Unavailable', 'warn'); return; }
+      var oct3 = normOct(d.permissions);
+      var permBlock = oct3
+        ? ('<div class="hf-perm"><div class="hf-props-row" style="border-bottom:none;padding-bottom:0">' +
+             '<b>Permissions</b><span class="hf-perm-oct" data-perm-oct>' + esc(oct3) + '</span></div>' +
+             permGridHtml(oct3) +
+             '<div style="display:flex;justify-content:flex-end"><button class="hf-perm-save" data-perm-save disabled>Apply</button></div></div>')
+        : ('<div class="hf-props-row"><b>Permissions</b><span>' + esc(d.permissions || '—') + '</span></div>');
       var card = '<div class="hf-props"><div class="hf-props-card">' +
         '<div style="display:flex;align-items:center;gap:12px;margin-bottom:14px"><span class="mi material-icons-round" style="font-size:34px;color:var(--hart-accent,#6c63ff)">' + iconFor(d) + '</span>' +
         '<div style="font-size:16px;font-weight:600;word-break:break-all">' + esc(d.name) + '</div></div>' +
@@ -486,13 +741,44 @@
         '<div class="hf-props-row"><b>Location</b><span style="word-break:break-all;text-align:right">' + esc(dirname(d.path)) + '</span></div>' +
         '<div class="hf-props-row"><b>Modified</b><span>' + fmtDate(d.modified) + '</span></div>' +
         '<div class="hf-props-row"><b>Created</b><span>' + fmtDate(d.created) + '</span></div>' +
-        '<div class="hf-props-row"><b>Permissions</b><span>' + esc(d.permissions || '') + '</span></div>' +
+        permBlock +
         '<button class="hf-tb-btn" data-close="1" style="width:100%;margin-top:16px;height:38px;gap:8px">Close</button>' +
         '</div></div>';
       var wrap = document.createElement('div'); wrap.innerHTML = card; var node = wrap.firstChild;
       ST.root.appendChild(node);
       function close() { try { ST.root.removeChild(node); } catch (e) {} }
       node.onclick = function (e) { if (e.target === node || e.target.getAttribute('data-close')) close(); };
+
+      // Permissions editor wiring (only present when we have an octal mode).
+      var octEl = node.querySelector('[data-perm-oct]');
+      var saveBtn = node.querySelector('[data-perm-save]');
+      if (octEl && saveBtn) {
+        var orig = oct3;
+        function refreshOct() {
+          var cur = gridToOct(node);
+          octEl.textContent = cur;
+          if (cur === orig) saveBtn.setAttribute('disabled', ''); else saveBtn.removeAttribute('disabled');
+        }
+        node.querySelectorAll('.hf-perm-cb').forEach(function (cb) { cb.onchange = refreshOct; });
+        saveBtn.onclick = function (ev) {
+          ev.stopPropagation();
+          var mode = gridToOct(node);
+          saveBtn.setAttribute('disabled', '');
+          API.chmod(d.path, mode).then(function (res) {
+            if (res && res.error) { toast('Permissions', res.error, 'warn'); saveBtn.removeAttribute('disabled'); return; }
+            orig = (res && res.mode) || mode; octEl.textContent = orig;
+            toast('Permissions', 'Set to ' + orig, 'info');
+            // keep dialog open; reflect any clamp (e.g. Windows) in the grid
+            if (res && res.mode && res.mode !== mode) {
+              node.querySelectorAll('.hf-perm-cb').forEach(function (cb) {
+                var g = +cb.getAttribute('data-grp'), bit = cb.getAttribute('data-bit');
+                var digit = parseInt(res.mode.charAt(g), 8), mask = bit === 'r' ? 4 : bit === 'w' ? 2 : 1;
+                cb.checked = !!(digit & mask);
+              });
+            }
+          }).catch(function () { toast('Permissions', 'Failed', 'warn'); saveBtn.removeAttribute('disabled'); });
+        };
+      }
     }).catch(function () { toast('Properties', 'Unavailable', 'warn'); });
   }
   function confirmAct(title, body, onYes) {
@@ -548,7 +834,7 @@
   function bindKeys(root) {
     root.addEventListener('keydown', function (e) {
       if (e.target && e.target.classList && (e.target.classList.contains('hf-rename') || e.target.classList.contains('hf-search'))) {
-        if (e.key === 'Escape' && e.target.classList.contains('hf-search')) { ST.filter = ''; render(false); }
+        if (e.key === 'Escape' && e.target.classList.contains('hf-search')) { ST.filter = ''; ST.searchResults = null; ST.searchTrunc = false; render(false); }
         return;
       }
       var mod = e.ctrlKey || e.metaKey;

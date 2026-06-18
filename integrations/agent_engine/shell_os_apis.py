@@ -2165,4 +2165,229 @@ def register_shell_os_routes(app):
         except FileNotFoundError:
             return jsonify({'error': 'thunderbird not installed'}), 404
 
+    # ═══════════════════════════════════════════════════════════
+    # File Explorer P1 — recursive search, thumbnails, chmod
+    # (extends the SAME sandbox/auth/audit/destructive trio as the
+    #  browse/move/copy/delete file-op surface above — NO parallel path)
+    # ═══════════════════════════════════════════════════════════
+
+    @app.route('/api/shell/files/search', methods=['GET'])
+    @_require_shell_auth
+    def shell_files_search():
+        """Recursive filename search under a directory.
+
+        Mirrors the /browse entry shape (name/path/is_dir/size/modified/extension)
+        and adds a `rel` field (path relative to the search root) so the explorer
+        can show where each hit lives. GIL-safe: bounded by a depth cap and a
+        result cap, pruning dirs[] in place exactly like shell_file_search_by_tag
+        (#151) so a deep tree never walks unboundedly on the shared event loop.
+        """
+        path = os.path.expanduser(request.args.get('path', '~'))
+        query = (request.args.get('q', '') or '').strip()
+        recursive = request.args.get('recursive', 'true').lower() == 'true'
+        show_hidden = request.args.get('hidden', 'false').lower() == 'true'
+
+        real_path = os.path.realpath(path)
+        if not _is_path_allowed(real_path):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
+        if not os.path.isdir(real_path):
+            return jsonify({'error': 'Not a directory'}), 400
+        if not query:
+            return jsonify({'path': real_path, 'query': query,
+                            'entries': [], 'count': 0, 'truncated': False})
+
+        q = query.lower()
+        MAX_DEPTH = 8        # generous but bounded
+        MAX_RESULTS = 500    # hard cap on payload size
+        entries = []
+        truncated = False
+
+        def _entry(fp, is_dir):
+            try:
+                stat = os.stat(fp)
+            except (PermissionError, OSError):
+                return None
+            return {
+                'name': os.path.basename(fp),
+                'path': fp,
+                'rel': os.path.relpath(fp, real_path),
+                'is_dir': is_dir,
+                'size': stat.st_size if not is_dir else 0,
+                'modified': stat.st_mtime,
+                'extension': os.path.splitext(fp)[1].lower() if not is_dir else '',
+            }
+
+        try:
+            if recursive:
+                for root, dirs, files in os.walk(real_path):
+                    depth = root[len(real_path):].count(os.sep)
+                    if depth >= MAX_DEPTH:
+                        dirs[:] = []
+                    if not show_hidden:
+                        dirs[:] = [d for d in dirs if not d.startswith('.')]
+                    # match directory names too (folders are searchable targets)
+                    for dname in dirs:
+                        if q in dname.lower():
+                            e = _entry(os.path.join(root, dname), True)
+                            if e:
+                                entries.append(e)
+                                if len(entries) >= MAX_RESULTS:
+                                    truncated = True
+                                    break
+                    if truncated:
+                        break
+                    for fname in files:
+                        if not show_hidden and fname.startswith('.'):
+                            continue
+                        if q in fname.lower():
+                            e = _entry(os.path.join(root, fname), False)
+                            if e:
+                                entries.append(e)
+                                if len(entries) >= MAX_RESULTS:
+                                    truncated = True
+                                    break
+                    if truncated:
+                        break
+            else:
+                for entry in os.scandir(real_path):
+                    if not show_hidden and entry.name.startswith('.'):
+                        continue
+                    if q in entry.name.lower():
+                        e = _entry(entry.path, entry.is_dir())
+                        if e:
+                            entries.append(e)
+                            if len(entries) >= MAX_RESULTS:
+                                truncated = True
+                                break
+        except PermissionError:
+            return jsonify({'error': 'Permission denied'}), 403
+
+        entries.sort(key=lambda e: (not e['is_dir'], e['name'].lower()))
+        return jsonify({
+            'path': real_path,
+            'query': query,
+            'recursive': recursive,
+            'entries': entries,
+            'count': len(entries),
+            'truncated': truncated,
+        })
+
+    _THUMB_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff',
+                   '.ico'}
+
+    def _thumb_cache_dir():
+        try:
+            from core.platform_paths import get_db_dir
+            base = get_db_dir()
+        except Exception:
+            base = os.path.join(tempfile.gettempdir(), 'hart')
+        d = os.path.join(base, 'thumb_cache')
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @app.route('/api/shell/files/thumbnail', methods=['GET'])
+    @_require_shell_auth
+    def shell_files_thumbnail():
+        """Return a small thumbnail (PNG) for an image file.
+
+        Pillow if importable, else a graceful 204 (the explorer falls back to the
+        material glyph). Output dimension is capped; thumbnails are cached on disk
+        under get_db_dir()/thumb_cache keyed by (realpath, mtime, size) so repeat
+        views are cheap. Non-image / oversize / unreadable -> 204 (never 500),
+        so a bad file never breaks the grid render.
+        """
+        path = request.args.get('path', '')
+        try:
+            size = int(request.args.get('size', 96))
+        except (TypeError, ValueError):
+            size = 96
+        size = max(16, min(size, 512))  # clamp
+
+        if not path or not os.path.isfile(path):
+            return Response(status=204)
+        if not _is_path_allowed(path):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
+        if os.path.splitext(path)[1].lower() not in _THUMB_EXTS:
+            return Response(status=204)
+
+        try:
+            from PIL import Image
+        except Exception:
+            return Response(status=204)  # Pillow absent -> graceful glyph fallback
+
+        try:
+            st = os.stat(path)
+            real = os.path.realpath(path)
+            import hashlib
+            key = hashlib.sha1(
+                f'{real}|{int(st.st_mtime)}|{st.st_size}|{size}'.encode('utf-8')
+            ).hexdigest()
+            cache_path = os.path.join(_thumb_cache_dir(), key + '.png')
+            if os.path.isfile(cache_path):
+                with open(cache_path, 'rb') as fh:
+                    return Response(fh.read(), mimetype='image/png')
+
+            with Image.open(path) as im:
+                im.draft('RGB', (size, size))  # fast pre-scale on JPEG
+                im = im.convert('RGBA')
+                im.thumbnail((size, size))
+                im.save(cache_path, format='PNG', optimize=True)
+            with open(cache_path, 'rb') as fh:
+                return Response(fh.read(), mimetype='image/png')
+        except Exception:
+            return Response(status=204)  # unreadable/corrupt -> fallback, never 500
+
+    @app.route('/api/shell/files/chmod', methods=['POST'])
+    @_require_shell_auth
+    def shell_files_chmod():
+        """Change a file's POSIX mode (owner/group/other rwx).
+
+        chmod is a routine file op (like move/copy), NOT destructive like delete,
+        so it gates on sandbox + auth + immutable audit only (no action-classifier
+        gate, which 'unknown'-fail-closed-403'd every real change). On Windows
+        os.chmod only honours the read-only bit, so this is a safe no-op there —
+        we still return the requested mode for UI consistency. `mode` accepts an
+        octal string ('755', '0644') or an int.
+        """
+        data = request.get_json(force=True)
+        path = data.get('path', '')
+        raw_mode = data.get('mode', '')
+
+        if not path or not os.path.exists(path):
+            return jsonify({'error': 'path not found'}), 404
+        if not _is_path_allowed(path):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
+
+        # Parse mode: octal string ('0755'/'755') or int -> 0..0o777
+        try:
+            if isinstance(raw_mode, int):
+                mode_int = raw_mode
+            else:
+                mode_int = int(str(raw_mode).strip(), 8)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'mode must be an octal string (e.g. "755")'}), 400
+        if not (0 <= mode_int <= 0o777):
+            return jsonify({'error': 'mode out of range (000-777)'}), 400
+
+        # chmod is a routine file op (like move/copy), NOT destructive like
+        # delete, so it is NOT routed through _classify_destructive:
+        # classify_action('chmod 750: ...') returns 'unknown' -> fail-closed 403,
+        # which broke every real permission change. Sandbox (_is_path_allowed) +
+        # auth (_require_shell_auth) + immutable audit are the gate, matching the
+        # working shell_files_move / shell_files_copy pattern.
+        _audit_shell_op('file_chmod', {'path': path, 'mode': oct(mode_int)[-3:]})
+
+        try:
+            os.chmod(path, mode_int)
+        except (PermissionError, OSError) as e:
+            return jsonify({'error': str(e)}), 400
+
+        # Re-read so the UI reflects the actual mode (Windows may clamp it).
+        try:
+            applied = oct(os.stat(path).st_mode)[-3:]
+        except OSError:
+            applied = oct(mode_int)[-3:]
+        return jsonify({'path': path, 'mode': applied,
+                        'requested': oct(mode_int)[-3:]})
+
     logger.info("Registered shell OS API routes (extended)")
