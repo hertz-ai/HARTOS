@@ -246,6 +246,28 @@ def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
                     rid = bound.arguments.get(request_id_arg) or ''
                 except (TypeError, KeyError):
                     rid = ''
+            if not rid:
+                # #162 diagnostic — an LLM entry point (recipe / chat_agent) bound
+                # with NO request_id means every autogen call it issues will log
+                # request_id='' and (pre-385504a) bypass the foreground abort. Log
+                # WHO + whether the thread-local still has it, so the next build's
+                # frozen_debug disambiguates the loss point that static analysis
+                # cannot: a present thread_local_rid ⇒ the *caller* didn't thread
+                # the arg (fix upstream at the recipe()/chat_agent call site); an
+                # absent one ⇒ the daemon_/user tag was already gone before this
+                # frame (fix at /chat handler ↔ payload). Low-frequency (once per
+                # goal/turn, not per token), so INFO is safe.
+                try:
+                    import threading as _t
+                    from threadlocal import thread_local_data as _tl
+                    _tl_rid = _tl.get_request_id()
+                    logger.info(
+                        "LLM-CONTEXT empty request_id at %s (source=%s, thread=%s, "
+                        "thread_local_rid=%r) — rid not threaded to this frame (#162)",
+                        getattr(fn, '__name__', '?'), source_name,
+                        _t.current_thread().name, _tl_rid)
+                except Exception:
+                    pass
             with source_context(source_name), request_id_context(rid):
                 return fn(*args, **kwargs)
         return _wrapper
