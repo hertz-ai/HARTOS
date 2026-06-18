@@ -15,6 +15,7 @@ on:
       - 'integrations/agent_engine/static/**'
       - 'tests/test_orb_webkit_safety.py'
       - 'tests/unit/test_shell_*.py'
+      - 'tests/unit/test_shell_*.mjs'
       - 'tests/js/orb_webkit_harness.js'
       - '.github/workflows/shell-ui-test.yml'
   pull_request:
@@ -58,6 +59,7 @@ jobs:
         run: >-
           python -m pytest -v
           tests/unit/test_shell_desktop_icons.py
+          tests/unit/test_shell_icon_customize.py
           tests/unit/test_shell_personalize.py
           tests/unit/test_shell_marketplace.py
           tests/unit/test_shell_polish.py

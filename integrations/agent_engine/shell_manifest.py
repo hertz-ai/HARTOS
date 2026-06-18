@@ -640,6 +640,94 @@ PANEL_GROUPS = ['Discover', 'Create', 'You', 'Explore', 'Manage', 'System']
 
 
 # ═══════════════════════════════════════════════════════════════
+# Icon colours — DE-MONOCHROME the shell (single source of truth)
+# ═══════════════════════════════════════════════════════════════
+# The glass shell used to tint EVERY icon with one --hart-accent hue, so the
+# desktop read as a single blue wash. macOS/Windows give each app its own
+# colour. We derive a stable per-app colour here (ONE place) so the desktop
+# icon glyph, dock chips, start items and titlebars all agree — no parallel
+# palette scattered across the JS render paths.
+#
+# Resolution order (most specific wins):
+#   1. an explicit per-entry  'color'  on the manifest dict (author override)
+#   2. ICON_COLOR_OVERRIDES[icon_name]  — high-recognition apps (security=green…)
+#   3. GROUP_COLORS[group]              — the app's start-menu group hue
+#   4. DEFAULT_ICON_COLOR               — neutral accent fallback
+#
+# Colours are vibrant but tuned for the dark glass background (mid-bright, ~70%
+# lum) so glyphs stay legible on frosted panels.
+
+DEFAULT_ICON_COLOR = '#7FD1C0'   # soft teal — neutral accent fallback
+
+# One hue family per start-menu group → instant visual grouping.
+GROUP_COLORS = {
+    'Discover': '#4FC3F7',   # sky blue
+    'Create':   '#FFB74D',   # amber/orange
+    'You':      '#BA68C8',   # violet
+    'Explore':  '#4DD0A0',   # mint green
+    'Manage':   '#F06292',   # rose
+    'System':   '#90A4AE',   # cool grey
+}
+
+# Per-icon overrides for apps whose identity colour is well-known, so e.g. the
+# Security center reads green and the Terminal reads graphite regardless of the
+# group it sits in. Keyed by the manifest 'icon' (Material Symbols name).
+ICON_COLOR_OVERRIDES = {
+    # security / trust
+    'shield': '#34C759', 'security': '#34C759', 'admin_panel_settings': '#34C759',
+    'vpn_key': '#FFD54F', 'badge': '#FFD54F', 'lock': '#34C759',
+    # comms / social
+    'rss_feed': '#FF7043', 'chat_bubble': '#42A5F5', 'forum': '#42A5F5',
+    'groups': '#26C6DA', 'campaign': '#FF8A65', 'notifications': '#FF5252',
+    'email': '#5C6BC0', 'cell_tower': '#26A69A',
+    # build / code / agents
+    'code': '#5C6BC0', 'smart_toy': '#7E57C2', 'terminal': '#607D8B',
+    'build': '#FFA726', 'extension': '#66BB6A', 'science': '#26C6DA',
+    'storefront': '#FF7043', 'storage': '#78909C',
+    # media / files
+    'folder': '#FFCA28', 'photo': '#26C6DA', 'perm_media': '#EC407A',
+    'wallpaper': '#AB47BC', 'palette': '#EC407A', 'music_note': '#EF5350',
+    'videocam': '#42A5F5', 'photo_library': '#26C6DA',
+    # system / hardware
+    'wifi': '#42A5F5', 'bluetooth': '#2979FF', 'battery_full': '#66BB6A',
+    'volume_up': '#26A69A', 'monitor_heart': '#EF5350', 'monitoring': '#FF7043',
+    'devices': '#78909C', 'print': '#90A4AE', 'language': '#42A5F5',
+    'schedule': '#5C6BC0', 'delete': '#FF7043', 'system_update': '#66BB6A',
+    # money / rewards
+    'payments': '#66BB6A', 'emoji_events': '#FFD54F', 'leaderboard': '#FFA726',
+    'auto_awesome': '#FFD54F', 'rocket_launch': '#FF7043', 'bolt': '#FFCA28',
+}
+
+
+def color_for(icon_name, group=None, override=None):
+    """Resolve the de-monochrome colour for one app icon (single source).
+
+    Pure function — no I/O. Most-specific source wins (see module header).
+    """
+    if override:
+        return override
+    if icon_name and icon_name in ICON_COLOR_OVERRIDES:
+        return ICON_COLOR_OVERRIDES[icon_name]
+    if group and group in GROUP_COLORS:
+        return GROUP_COLORS[group]
+    return DEFAULT_ICON_COLOR
+
+
+def with_icon_colors(panels):
+    """Return a shallow copy of a {id: entry} panel dict with a resolved
+    'color' stamped on every entry, so the JS render paths (start menu, dock,
+    desktop icons, titlebars) read one agreed colour. Honours an author's
+    explicit 'color' override; otherwise derives from icon then group.
+    """
+    out = {}
+    for pid, entry in panels.items():
+        e = dict(entry)
+        e['color'] = color_for(e.get('icon'), e.get('group'), e.get('color'))
+        out[pid] = e
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════
 

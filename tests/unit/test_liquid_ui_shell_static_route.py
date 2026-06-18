@@ -65,6 +65,10 @@ def test_every_shell_static_asset_the_html_requests_is_served(shell):
     "lottie.min.js",      # bundled offline Lottie player (boot splash)
     "hartBootSplash.js",  # the Hevolve brand boot-splash driver
     "hevolve-anim.json",  # the Hevolve hourglass Lottie animation
+    # The bundled icon font — referenced by the CSS @font-face (NOT a src="…"),
+    # so _static_refs above can't see it. If this 404s, EVERY shell glyph
+    # vanishes offline (smart_toy/shield + all tray/dock icons go blank).
+    "MaterialSymbolsRounded.woff2",
 ])
 def test_critical_shell_asset_is_fetchable(shell, asset):
     """Each named asset maps 1:1 to a symptom the steward saw on the booted

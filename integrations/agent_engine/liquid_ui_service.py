@@ -135,6 +135,13 @@ COMPONENT_TYPES = {
     # gateway confirms authentication.  Self-dismisses after 6s on web.
     'channel_connected': {'props': ['channel', 'display_name', 'color',
                                     'message']},
+    # ── App installed → desktop icon (NixOS-style: install an app, its icon
+    # appears) ── Emitted by app_installer._auto_register_app on a successful
+    # install.  The desktop (hartDesktop.js) merges {id,title,icon,exec} into
+    # window.MANIFEST and auto-pins via the EXISTING hartPinIcon, so the new
+    # app's icon shows up live without a refresh.
+    'app_installed': {'props': ['id', 'title', 'icon', 'exec', 'group',
+                                'platform']},
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -685,11 +692,30 @@ class LiquidUIService:
         # Import panel manifest
         try:
             from integrations.agent_engine.shell_manifest import (
-                PANEL_MANIFEST, DYNAMIC_PANELS, SYSTEM_PANELS, PANEL_GROUPS)
+                PANEL_MANIFEST, DYNAMIC_PANELS, SYSTEM_PANELS, PANEL_GROUPS,
+                with_icon_colors)
+            # Merge in installed apps (DESKTOP_APP/EXTENSION the app-installer
+            # auto-registered) so their desktop icons survive a page refresh:
+            # hartDesktop.render() only shows ids present in window.MANIFEST.
+            # Same source of truth (AppRegistry.installed_app_manifest) the live
+            # install push uses - no parallel manifest - merged BEFORE
+            # with_icon_colors so installed apps get the same palette tint.
+            panels = dict(PANEL_MANIFEST)
+            try:
+                from core.platform.registry import get_registry
+                _reg = get_registry()
+                if _reg.has('apps'):
+                    panels.update(_reg.get('apps').installed_app_manifest())
+            except Exception:
+                pass
+            # De-monochrome: stamp a resolved per-app 'color' on every entry from
+            # the single-source palette so the JS render paths (start menu, dock,
+            # desktop icons, titlebars) all tint with one agreed colour instead
+            # of the old single --hart-accent wash.
             # Replace </ with <\/ so the browser HTML parser never sees
             # </script> inside the JSON and prematurely closes the script tag.
-            manifest_json = json.dumps(PANEL_MANIFEST).replace('</', '<\\/')
-            system_json = json.dumps(SYSTEM_PANELS).replace('</', '<\\/')
+            manifest_json = json.dumps(with_icon_colors(panels)).replace('</', '<\\/')
+            system_json = json.dumps(with_icon_colors(SYSTEM_PANELS)).replace('</', '<\\/')
             groups_json = json.dumps(PANEL_GROUPS).replace('</', '<\\/')
         except Exception:
             manifest_json = '{}'
@@ -1034,18 +1060,25 @@ html.a11y-contrast .glass{background:#0a0a12;border-width:2px}
 html.a11y-rmotion *,html.a11y-rmotion *::before,html.a11y-rmotion *::after{
   animation-duration:0.01ms!important;animation-iteration-count:1!important;transition-duration:0.01ms!important}
 
-/* ── Material Icons: LOCAL + offline-safe ── */
-/* Every shell icon is <span class="mi material-icons-round">name</span>. The
-   Google <link> in <head> only defines this font family ONLINE, so a fresh
-   offline boot rendered literal ligature words ("lock","notifications"). Define
-   it locally with a fallback stack onto the BUNDLED fonts (material-icons →
-   "Material Icons", material-symbols → "Material Symbols *") plus the `liga`
-   feature that turns ligature names into glyphs. Ligature names are shared
-   across Material Icons/Symbols variants, so offline icons still render (filled
-   style) instead of text. Additive: "Material Icons Round" is still first, so
-   the online round render is unchanged. */
+/* ── Material Icons: BUNDLED woff2 — works fully offline, every glyph ── */
+/* Every shell icon is <span class="mi material-icons-round">name</span>.
+   The shell ships its OWN icon font (integrations/agent_engine/static/
+   MaterialSymbolsRounded.woff2 — a static, filled instance of Material Symbols
+   Rounded, ~440KB, 6.5k glyphs incl. smart_toy/shield). It is loaded via the
+   @font-face below from /shell/static, so EVERY glyph renders on a fresh
+   OFFLINE USB boot AND on the frozen Win/macOS desktop (which has no Material
+   font at all). The legacy 'Material Icons Round' lacked newer glyphs
+   (smart_toy, shield) — Material Symbols is a strict superset, so nothing
+   regresses. The Google <link> in <head> stays as a progressive-enhancement
+   only (online round variant); the bundled font is authoritative. The `liga`
+   feature turns the ligature names ("smart_toy") into glyphs. */
+@font-face {
+  font-family: 'Material Symbols Rounded';
+  font-style: normal; font-weight: 400; font-display: block;
+  src: url('/shell/static/MaterialSymbolsRounded.woff2') format('woff2');
+}
 .mi, .material-icons-round {
-  font-family: 'Material Icons Round', 'Material Icons', 'Material Symbols Rounded', 'Material Symbols Outlined';
+  font-family: 'Material Symbols Rounded', 'Material Icons Round', 'Material Icons', 'Material Symbols Outlined';
   font-weight: normal; font-style: normal; line-height: 1;
   letter-spacing: normal; text-transform: none; white-space: nowrap;
   word-wrap: normal; direction: ltr; display: inline-block;
@@ -1185,6 +1218,35 @@ html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot{animat
 .desktop-icon .di-glyph .mi{font-size:28px;color:var(--hart-accent)}
 .desktop-icon .di-label{font-size:11px;line-height:1.25;text-align:center;max-width:80px;color:var(--hart-text);
   text-shadow:0 1px 3px rgba(0,0,0,.6);overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+/* Emoji/unicode glyph (not the Material icon font) — same size as .mi, normal family */
+.desktop-icon .di-glyph .di-emoji{font-family:"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",system-ui;font-size:30px;line-height:1}
+/* ── Per-icon Customize dialog (macOS-/Windows-style glyph/label/color) ── */
+.hart-icustom-backdrop{position:fixed;inset:0;z-index:9000;display:flex;align-items:center;justify-content:center;
+  background:rgba(0,0,0,0.42);backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px)}
+.hart-icustom{width:340px;max-width:92vw;padding:18px;border-radius:16px;display:flex;flex-direction:column;gap:12px;
+  color:var(--hart-text);font-family:var(--ds-font-body,system-ui);box-shadow:0 18px 50px rgba(0,0,0,.5)}
+.hart-icustom-head{display:flex;align-items:center;gap:14px}
+.hart-icustom .hic-prev{flex:none}
+.hart-icustom .hic-prev .di-glyph{width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;
+  background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border)}
+.hart-icustom .hic-prev .di-glyph .mi{font-size:28px;color:var(--hart-accent)}
+.hart-icustom .hic-prev .di-glyph .di-emoji{font-family:"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",system-ui;font-size:30px;line-height:1}
+.hart-icustom-title{font-size:15px;font-weight:600}
+.hart-icustom-row{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--hart-muted)}
+.hart-icustom-row input[type=text]{padding:8px 10px;border-radius:9px;border:1px solid var(--hart-glass-border);
+  background:var(--hart-surface,rgba(255,255,255,0.05));color:var(--hart-text);font:14px var(--ds-font-body,system-ui)}
+.hart-icustom-row input[type=text]:focus{outline:none;border-color:var(--hart-accent)}
+.hart-icustom .hic-color-wrap{display:flex;align-items:center;gap:10px}
+.hart-icustom .hic-color-wrap input[type=color]{width:40px;height:30px;padding:0;border:1px solid var(--hart-glass-border);
+  border-radius:8px;background:none;cursor:pointer}
+.hart-icustom-actions{display:flex;align-items:center;gap:8px;margin-top:4px}
+.hart-icustom-btn{padding:7px 14px;border-radius:9px;border:1px solid var(--hart-glass-border);cursor:pointer;
+  background:var(--hart-surface,rgba(255,255,255,0.06));color:var(--hart-text);font:13px var(--ds-font-body,system-ui);
+  transition:background .15s,transform .12s}
+.hart-icustom-btn:hover{background:var(--hart-surface-hover,rgba(255,255,255,0.12));transform:translateY(-1px)}
+.hart-icustom-btn.primary{background:var(--hart-accent);color:var(--hart-on-accent,#fff);border-color:transparent}
+.hart-icustom-btn.ghost{background:transparent}
+.hart-icustom-btn:focus-visible{outline:2px solid var(--hart-accent);outline-offset:2px}
 /* ── Virtual-desktop switcher (bottom-center) + settings squares ── */
 .hart-ws-switcher{position:fixed;bottom:6px;left:50%;transform:translateX(-50%);z-index:8050;display:flex;gap:4px;padding:4px 6px;border-radius:999px}
 .hart-ws-dot{width:26px;height:20px;border:none;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;
@@ -1284,7 +1346,7 @@ html.a11y-rmotion .panel{animation:none}
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>HART OS</title>
 <script>if(navigator.onLine){{var _l=document.createElement('link');_l.rel='stylesheet';_l.href='https://fonts.googleapis.com/icon?family=Material+Icons+Round';document.head.appendChild(_l);}}</script>
-<style>/* Material Icons Round: CDN injected above only when online (testing); NixOS bundled font covers offline USB boot */</style>
+<style>/* Icons: the BUNDLED /shell/static/MaterialSymbolsRounded.woff2 @font-face below is authoritative (every glyph, fully offline). This CDN <link> is progressive-enhancement ONLY (online round variant). */</style>
 <style>
 {css_vars}
 {a11y_fontscale}
@@ -1600,6 +1662,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script src="/shell/static/hartHero.js"></script>
 <script src="/shell/static/hartDesktop.js"></script>
 <script src="/shell/static/hartWorkspaces.js"></script>
+<script src="/shell/static/hartEffects.js"></script>
 <script src="/shell/static/hartPersonalize.js"></script>
 <script src="/shell/static/hartMarketplace.js"></script>
 <script src="/shell/static/hartDock.js"></script>
@@ -1724,6 +1787,15 @@ const SYSTEM_PANELS = {system_json};
 const GROUPS = {groups_json};
 const NUNBA_BASE = '/app/#';
 
+// De-monochrome: every manifest/system entry carries a resolved per-app `color`
+// (stamped server-side from shell_manifest.with_icon_colors — the single source
+// of truth). miStyle() turns it into an inline glyph tint so the start menu,
+// dock, desktop icons and titlebars all colour-agree instead of one accent
+// wash. Exposed on window so the /shell/static modules (hartDesktop.js) reuse
+// the SAME resolver — no parallel palette.
+function miStyle(def) {{ return (def && def.color) ? ' style="color:'+def.color+'"' : ''; }}
+window.miStyle = miStyle;
+
 // ═══ Performance Config (auto-detected from theme) ═══
 const PERF = {{
   potato: {'true' if is_potato else 'false'},
@@ -1733,6 +1805,10 @@ const PERF = {{
   destroyMinimized: {'true' if perf.get('destroy_minimized_iframes') else 'false'},
   lazyIframes: {'true' if perf.get('lazy_load_iframes') else 'false'},
 }};
+// Mirror PERF onto window so the /shell/static effects module (hartEffects.js)
+// can read the SAME software-render gate (potato) without depending on the
+// inline-script const being reachable across script tags. Single source: PERF.
+window.HART_PERF = PERF;
 
 // ═══ State ═══
 let panels = {{}};
@@ -2071,7 +2147,7 @@ function updateTaskbar() {{
     const icon = info.icon || 'web_asset';
     const title = info.title || id;
     return '<div class="taskbar-chip glass '+active+'" data-panel-id="'+id+'" onclick="taskbarClick(this.dataset.panelId)" title="'+title+'">' +
-      '<span class="mi material-icons-round">'+icon+'</span>' +
+      '<span class="mi material-icons-round"'+miStyle(info)+'>'+icon+'</span>' +
       '<span class="chip-label">'+title+'</span></div>';
   }}).join('');
 }}
@@ -2094,6 +2170,10 @@ function snapPanel(id, side) {{
   p.max=false;
   setTimeout(function(){{p.el.style.transition='';}},250);
 }}
+// Expose the CANONICAL snap so the /shell/static effects module (hartEffects.js
+// snap-zones) reuses it — no parallel snap geometry. Same pattern as miStyle /
+// hartSwitchWorkspace.
+window.snapPanel = snapPanel;
 
 // ═══ Clock ═══
 function tickClock() {{
@@ -2136,7 +2216,7 @@ function buildStartMenu() {{
     html += '<div class="start-group"><div class="start-group-label">'+group+'</div><div class="start-grid">';
     items.forEach(([id,p])=>{{
       html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(this.dataset.id)">';
-      html += '<span class="mi material-icons-round">'+(p.icon||'apps')+'</span>';
+      html += '<span class="mi material-icons-round"'+miStyle(p)+'>'+(p.icon||'apps')+'</span>';
       html += '<span class="label">'+p.title+'</span></div>';
     }});
     html += '</div></div>';
@@ -2147,7 +2227,7 @@ function buildStartMenu() {{
     html += '<div class="start-group"><div class="start-group-label">System</div><div class="start-grid">';
     sysItems.forEach(([id,p])=>{{
       html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(this.dataset.id)">';
-      html += '<span class="mi material-icons-round">'+(p.icon||'settings')+'</span>';
+      html += '<span class="mi material-icons-round"'+miStyle(p)+'>'+(p.icon||'settings')+'</span>';
       html += '<span class="label">'+p.title+'</span></div>';
     }});
     html += '</div></div>';
@@ -2197,6 +2277,15 @@ function openPanel(id, opts) {{
     }}
   }}
   const def = MANIFEST[id] || SYSTEM_PANELS[id] || {{}};
+  // Installed native app (from the app-installer): no in-shell panel to draw —
+  // hand off to the EXISTING launch path (gtk-launch via /api/shell/launch).
+  // These entries carry an `exec` and no `route`; everything else falls through
+  // to the normal panel render below.
+  if(def.exec && !def.route && !SYSTEM_PANELS[id]) {{
+    launchApp(def.exec);
+    if(startOpen) toggleStartMenu();
+    return;
+  }}
   const sz = def.default_size || [700,500];
   const isSystem = !!SYSTEM_PANELS[id];
 
@@ -2217,7 +2306,7 @@ function openPanel(id, opts) {{
 
   panel.innerHTML = '<div class="panel-titlebar" onmousedown="startDrag(event,_pid(this))"'+
     ' ondblclick="toggleMax(_pid(this))">'+
-    '<span class="mi material-icons-round">'+icon+'</span>'+
+    '<span class="mi material-icons-round"'+miStyle(def)+'>'+icon+'</span>'+
     '<span class="title">'+title+'</span>'+
     '<div class="ctrl">'+
     '<span title="Minimize" onclick="minimizePanel(_pid(this))"><span class="mi material-icons-round" style="font-size:14px">minimize</span></span>'+
@@ -2350,6 +2439,10 @@ function startDrag(e, id) {{
   const p = panels[id];
   if(!p||p.max) return;
   dragState = {{id, mode:'move', sx:e.clientX, sy:e.clientY, ox:p.el.offsetLeft, oy:p.el.offsetTop}};
+  // Notify the effects module (snap-zones) of the canonical drag start so it
+  // reuses THIS drag lifecycle instead of forking its own mousedown detection.
+  // No-op unless hartEffects.js is loaded + effects are enabled (not potato).
+  try{{ window.dispatchEvent(new CustomEvent('hart:dragstart',{{detail:{{id:id}}}})); }}catch(_e){{}}
   e.preventDefault();
 }}
 function startResize(e, id) {{
@@ -2380,7 +2473,16 @@ document.addEventListener('mousemove', e=>{{
     p.w = nw; p.h = nh;
   }}
 }});
-document.addEventListener('mouseup', ()=>{{ dragState=null; }});
+document.addEventListener('mouseup', e=>{{
+  // Hand the effects module the final pointer position + the panel id so a
+  // snap-zone it highlighted during the drag can commit via the canonical
+  // snapPanel. Fired BEFORE clearing dragState so the listener sees the id.
+  if(dragState && dragState.mode==='move'){{
+    try{{ window.dispatchEvent(new CustomEvent('hart:dragend',
+      {{detail:{{id:dragState.id, x:e.clientX, y:e.clientY}}}})); }}catch(_e){{}}
+  }}
+  dragState=null;
+}});
 
 // ═══ System Panels (design system) ═══
 function loadSystemPanel(id, body) {{
@@ -4164,6 +4266,11 @@ if(!PERF.potato) {{
           const type = ev.type || 'notification';
           if(type === 'notification') {{
             showToast(ev.title||ev.agent||'Notification', ev.message||'', ev.severity||'info');
+          }} else if(type === 'app_installed') {{
+            // Installed app -> live desktop icon. Reuse hartDesktop's manifest
+            // merge + hartPinIcon (no fork); icon appears without a refresh.
+            if(window.hartInstallIcon) window.hartInstallIcon(ev);
+            showToast('Installed', (ev.title||ev.id||'App')+' added to your desktop', 'info');
           }} else {{
             // Render as floating overlay fragment
             renderAgentOverlay(ev);
@@ -5484,6 +5591,30 @@ function renderAgentOverlay(ev) {{
             register_app_install_routes(app)
         except Exception as e:
             logger.warning("Shell APIs registration: %s", e)
+
+        # AI-senses cross-process authority (Phase 7) — THIS process is the
+        # canonical holder of core.ai_sensing._state: register_shell_desktop_routes
+        # above mounts POST /api/shell/ai-sensing here, the ONE writer the human's
+        # floating-eye button hits. So the authority socket MUST be served from
+        # here (not the :6777 backend, whose _state is a different process's copy),
+        # so a SEPARATE process — the xdg-desktop-portal-hart ScreenCast handler,
+        # its own systemd unit — consults allowed('screen') fail-closed before any
+        # native capture. Without this server the portal's query_authority() denies
+        # (fail-closed): a missing server never OPENS a capture, it only keeps the
+        # portal shut. Best-effort + idempotent: no-op where AF_UNIX is unavailable
+        # (Windows dev) or the bind fails.
+        try:
+            from core import ai_sensing as _ai_sensing
+            if _ai_sensing.start_authority_server():
+                logger.info(
+                    "AI-senses authority server started (cross-process screen "
+                    "gate for the portal) on %s", _ai_sensing._authority_path())
+            else:
+                logger.debug(
+                    "AI-senses authority server not started (no AF_UNIX / bind "
+                    "failed) — portal screencast stays fail-closed")
+        except Exception as e:
+            logger.debug("AI-senses authority server start skipped: %s", e)
 
         # Register OpenClaw + floating assistant APIs
         try:

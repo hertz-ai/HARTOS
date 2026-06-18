@@ -1651,112 +1651,42 @@ def register_shell_os_routes(app):
             'total_pairs': len(cfg.get('sync_pairs', [])),
         })
 
-    # ─── App Store APIs ─────────────────────────────────────
-
-    @app.route('/api/apps/search', methods=['GET'])
-    def shell_app_search():
-        """Search for installable apps across all platforms."""
-        query = request.args.get('q', '')
-        platform = request.args.get('platform')
-        limit = int(request.args.get('limit', 20))
-        if not query:
-            return jsonify({'error': 'q parameter required'}), 400
-
-        results = []
-        try:
-            from integrations.agent_engine.app_installer import AppInstaller
-            installer = AppInstaller()
-            # AppInstaller.search(query, platforms: Optional[List[str]]) — there is
-            # no platform=/limit= kwarg (the old call raised TypeError, silently
-            # swallowed below, so search ALWAYS returned []). Pass a 1-list, slice.
-            results = installer.search(query, platforms=[platform] if platform else None)[:limit]
-        except (ImportError, Exception) as e:
-            logger.debug(f"App search error: {e}")
-
-        return jsonify({'query': query, 'results': results, 'count': len(results)})
-
-    @app.route('/api/apps/installed', methods=['GET'])
-    def shell_app_installed():
-        """List installed applications."""
-        platform = request.args.get('platform')
-        apps = []
-        try:
-            from integrations.agent_engine.app_installer import AppInstaller
-            installer = AppInstaller()
-            # list_installed() takes NO platform arg (old call raised TypeError);
-            # filter after.
-            apps = installer.list_installed()
-            if platform:
-                apps = [a for a in apps if a.get('platform') == platform]
-        except (ImportError, Exception) as e:
-            logger.debug(f"App list error: {e}")
-
-        # Also include AppRegistry entries. Canonical accessor is the platform
-        # ServiceRegistry's 'apps' component — get_app_registry() does not exist
-        # (the old import raised ImportError, so registry apps never showed).
-        try:
-            from core.platform.registry import get_registry
-            _reg = get_registry()
-            registry = _reg.get('apps') if _reg.has('apps') else None
-            for manifest in (registry.list_all() if registry else []):
-                if not any(a.get('name') == manifest.name for a in apps):
-                    apps.append({
-                        'name': manifest.name, 'id': manifest.id,
-                        'type': manifest.type, 'icon': manifest.icon,
-                        'group': manifest.group,
-                    })
-        except (ImportError, Exception):
-            pass
-
-        return jsonify({'apps': apps, 'count': len(apps)})
-
-    @app.route('/api/apps/install', methods=['POST'])
-    @_require_shell_auth
-    def shell_app_install():
-        """Install an application."""
-        body = request.get_json(silent=True) or {}
-        source = body.get('source')
-        platform = body.get('platform')
-        name = body.get('name')
-        if not source:
-            return jsonify({'error': 'source required'}), 400
-
-        try:
-            from integrations.agent_engine.app_installer import (
-                AppInstaller, InstallRequest, InstallerPlatform)
-            from dataclasses import asdict
-            installer = AppInstaller()
-            # install() takes an InstallRequest, not (source, platform=, name=).
-            try:
-                plat = InstallerPlatform(platform) if platform else InstallerPlatform.UNKNOWN
-            except ValueError:
-                plat = InstallerPlatform.UNKNOWN
-            result = installer.install(InstallRequest(source=source, platform=plat, name=name or ''))
-            _audit_shell_op('app_install', {'source': source, 'platform': platform})
-            return jsonify(asdict(result))   # InstallResult dataclass -> JSON
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-
-    @app.route('/api/apps/uninstall', methods=['POST'])
-    @_require_shell_auth
-    def shell_app_uninstall():
-        """Uninstall an application."""
-        body = request.get_json(silent=True) or {}
-        app_id = body.get('app_id')
-        platform = body.get('platform')
-        if not app_id:
-            return jsonify({'error': 'app_id required'}), 400
-
-        try:
-            from integrations.agent_engine.app_installer import AppInstaller
-            installer = AppInstaller()
-            result = installer.uninstall(app_id, platform=platform)
-            _audit_shell_op('app_uninstall', {'app_id': app_id})
-            return jsonify(result)
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
+    # ─── App Store APIs (consolidated) ──────────────────────
+    # Phase-8 route consolidation: search / installed / install / uninstall (and
+    # detect / history / platforms) used to be DEFINED here on /api/apps/* AND
+    # AGAIN in app_installer.register_app_install_routes on /api/shell/apps/* —
+    # two implementations of the SAME AppInstaller calls that drifted (this copy
+    # had the call-shape bug test_shell_app_routes.py was written to catch). They
+    # are now ONE surface owned by register_app_install_routes, registered on BOTH
+    # the /api/shell/apps/* and /api/apps/* prefixes with the install/uninstall
+    # gate. We delegate here so a caller that only registers shell_os_routes
+    # (tests, edge nodes) still gets the /api/apps/* store routes. Idempotent: the
+    # latch inside register_app_install_routes makes the liquid_ui double-call
+    # (shell_os_routes + its own direct call) a no-op.
+    try:
+        from integrations.agent_engine.app_installer import (
+            register_app_install_routes)
+        register_app_install_routes(app)
+    except Exception as e:  # pragma: no cover - non-shell node
+        logger.debug(f"app install route delegation skipped: {e}")
 
     # ─── App Permissions APIs ─────────────────────────────────
+    # Part of the ONE consolidated app surface: register each permission verb on
+    # BOTH the canonical /api/shell/apps/* prefix and the legacy /api/apps/*
+    # (one view, two URL rules) — same dual-prefix scheme app_installer uses for
+    # the store verbs. The impl + its file I/O stay HERE (heavily mocked by
+    # test_shell_os_apis.py via shell_os_apis.open / _PERMISSIONS_FILE) because
+    # they never touch AppInstaller, so they are not part of the store-route
+    # duplication that was consolidated above.
+
+    def _apps_route(suffix, **kwargs):
+        """Bind one permission view to both /api/shell/apps and /api/apps."""
+        def deco(fn):
+            for i, pfx in enumerate(('/api/shell/apps', '/api/apps')):
+                ep = fn.__name__ if i == 0 else f'{fn.__name__}__legacy'
+                app.add_url_rule(pfx + suffix, ep, fn, **kwargs)
+            return fn
+        return deco
 
     _PERMISSIONS_FILE = os.path.expanduser('~/.config/hart/app-permissions.json')
 
@@ -1772,7 +1702,7 @@ def register_shell_os_routes(app):
         with open(_PERMISSIONS_FILE, 'w') as f:
             json.dump(data, f, indent=2)
 
-    @app.route('/api/apps/<app_id>/permissions', methods=['GET'])
+    @_apps_route('/<app_id>/permissions', methods=['GET'])
     def shell_app_permissions(app_id):
         """Get permissions for an installed app."""
         perms = _load_permissions()
@@ -1804,7 +1734,7 @@ def register_shell_os_routes(app):
 
         return jsonify({'app_id': app_id, 'permissions': result})
 
-    @app.route('/api/apps/<app_id>/permission/<perm_type>', methods=['POST'])
+    @_apps_route('/<app_id>/permission/<perm_type>', methods=['POST'])
     @_require_shell_auth
     def shell_app_set_permission(app_id, perm_type):
         """Grant or revoke a permission for an app."""
@@ -1829,7 +1759,7 @@ def register_shell_os_routes(app):
             'type': perm_type, 'granted': granted,
         })
 
-    @app.route('/api/apps/<app_id>/permissions/reset', methods=['POST'])
+    @_apps_route('/<app_id>/permissions/reset', methods=['POST'])
     @_require_shell_auth
     def shell_app_reset_permissions(app_id):
         """Reset all permissions for an app to defaults."""

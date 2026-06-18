@@ -337,8 +337,43 @@ class AppInstaller:
             )
             apps.register(manifest)
             logger.info(f"Auto-registered app: {app_id} ({result.platform})")
+            # Live desktop icon: push an `app_installed` A2UI card so the glass
+            # desktop merges this app into window.MANIFEST and auto-pins an icon
+            # (NixOS-style: install an app, its icon appears) WITHOUT a refresh.
+            # Reuses the in-process A2UI channel + AppRegistry.manifest_entry_for
+            # as the single source of truth for the entry shape — no fork.
+            self._push_desktop_icon(app_id, manifest)
         except Exception as e:
             logger.debug(f"App auto-register skipped: {e}")
+
+    def _push_desktop_icon(self, app_id: str, manifest):
+        """Emit an `app_installed` A2UI card so the live desktop pins an icon.
+
+        Best-effort and in-process: routes through the registered
+        ``LiquidUIService.agent_ui_update`` (the same governed A2UI path agent
+        cards use — kill-switch + audit + rate-cap apply). The desktop merges
+        the entry into ``window.MANIFEST`` and calls the EXISTING
+        ``hartPinIcon``; a headless/server shell additionally receives it via
+        the EventBus/WAMP fan-out inside ``agent_ui_update``.
+        """
+        try:
+            from core.platform.app_registry import AppRegistry
+            from core.platform.registry import get_registry
+            svc = get_registry().get_or_none('LiquidUIService')
+            if not svc:
+                return
+            entry = AppRegistry.manifest_entry_for(manifest)
+            svc.agent_ui_update('app_installer', {
+                'type': 'app_installed',
+                'id': app_id,
+                'title': entry['title'],
+                'icon': entry['icon'],
+                'exec': entry['exec'],
+                'group': entry['group'],
+                'platform': ','.join(manifest.tags) if getattr(manifest, 'tags', None) else '',
+            })
+        except Exception as e:
+            logger.debug(f"Desktop icon push skipped: {e}")
 
     def _auto_unregister_app(self, app_id: str):
         """Unregister app from AppRegistry on uninstall."""
@@ -726,10 +761,59 @@ def get_installer() -> AppInstaller:
 # ─── Flask Route Registration ───────────────────────────────
 
 def register_app_install_routes(app):
-    """Register app installation API routes on a Flask app."""
+    """Register the SINGLE app-management route surface on a Flask app.
+
+    Phase-8 route consolidation: this is the ONE owner of every app verb —
+    install / uninstall / installed / search / detect / history / platforms AND
+    the per-app permission endpoints. Each verb is registered on BOTH the
+    canonical ``/api/shell/apps/*`` prefix AND the legacy ``/api/apps/*`` prefix
+    (one view function, two URL rules) so the marketplace frontend
+    (hartMarketplace.js -> /api/apps/*), shell_manifest's documented API list,
+    and every existing test keep resolving — without a second implementation.
+
+    ``shell_os_apis.register_shell_os_routes`` delegates its former /api/apps/*
+    store routes here (it no longer defines its own AppInstaller-calling bodies),
+    so there is no parallel path. Mutating verbs (install/uninstall + permission
+    writes) pass ``_require_shell_auth`` — the gate the legacy /api/apps/* had but
+    the canonical /api/shell/apps/* previously lacked. Idempotent: liquid_ui
+    calls this directly AND via register_shell_os_routes; the second call is a
+    no-op (Flask would otherwise raise "overwriting an existing endpoint").
+    """
     from flask import jsonify, request
 
-    @app.route('/api/shell/apps/install', methods=['POST'])
+    # Idempotency latch — both register_shell_os_routes and the liquid_ui init
+    # call this; register the routes exactly once per app.
+    if getattr(app, '_hart_app_routes_registered', False):
+        return
+    app._hart_app_routes_registered = True
+
+    # The canonical local-shell auth gate. Imported (not redefined) so there is
+    # ONE auth decision for the whole shell — the same gate file-manager/terminal
+    # routes use. Fail-OPEN to a permissive shim ONLY if shell_os_apis is somehow
+    # unavailable (a non-shell node), matching how hart_wm_client degrades.
+    try:
+        from integrations.agent_engine.shell_os_apis import _require_shell_auth
+    except Exception:  # pragma: no cover - non-shell node fallback
+        def _require_shell_auth(f):
+            return f
+
+    # Both prefixes resolve to ONE view function. ``_route`` stacks the two URL
+    # rules; the canonical prefix is first so url_for/endpoint naming is stable.
+    _PREFIXES = ('/api/shell/apps', '/api/apps')
+
+    def _route(suffix, **kwargs):
+        """Decorator: bind a view to BOTH prefixes (one impl, two routes)."""
+        def deco(fn):
+            for i, pfx in enumerate(_PREFIXES):
+                # Distinct endpoint name per rule (Flask requires uniqueness);
+                # the legacy alias reuses the same callable.
+                ep = fn.__name__ if i == 0 else f'{fn.__name__}__legacy'
+                app.add_url_rule(pfx + suffix, ep, fn, **kwargs)
+            return fn
+        return deco
+
+    @_route('/install', methods=['POST'])
+    @_require_shell_auth
     def shell_apps_install():
         """Install an application (any platform).
 
@@ -774,7 +858,8 @@ def register_app_install_routes(app):
             'duration': round(result.duration_seconds, 2),
         }), 200 if result.success else 400
 
-    @app.route('/api/shell/apps/uninstall', methods=['POST'])
+    @_route('/uninstall', methods=['POST'])
+    @_require_shell_auth
     def shell_apps_uninstall():
         """Uninstall an application."""
         data = request.get_json(force=True)
@@ -793,7 +878,7 @@ def register_app_install_routes(app):
             'error': result.error,
         })
 
-    @app.route('/api/shell/apps/installed', methods=['GET'])
+    @_route('/installed', methods=['GET'])
     def shell_apps_installed():
         """List all installed applications across platforms."""
         installer = get_installer()
@@ -803,30 +888,48 @@ def register_app_install_routes(app):
             'count': len(apps),
         })
 
-    @app.route('/api/shell/apps/search', methods=['GET'])
+    @_route('/search', methods=['GET'])
     def shell_apps_search():
         """Search for packages across platforms.
 
         Query params:
             q: search query
-            platforms: comma-separated list (nix,flatpak)
+            platforms: comma-separated list (nix,flatpak) — canonical
+            platform: single platform — legacy /api/apps/* spelling (back-compat)
+            limit: optional result cap — legacy /api/apps/* param (back-compat)
         """
         query = request.args.get('q', '')
         if not query:
             return jsonify({'error': 'q parameter required'}), 400
 
+        # Accept BOTH the canonical comma-list `platforms` AND the legacy single
+        # `platform` the old /api/apps/* surface used, so consolidating the two
+        # prefixes never silently drops a caller's platform filter.
         platforms_str = request.args.get('platforms', '')
-        platforms = platforms_str.split(',') if platforms_str else None
+        if platforms_str:
+            platforms = platforms_str.split(',')
+        else:
+            single = request.args.get('platform')
+            platforms = [single] if single else None
 
         installer = get_installer()
         results = installer.search(query, platforms)
+
+        # Legacy `limit` cap (the old /api/apps/search honoured it).
+        try:
+            limit = int(request.args.get('limit', 0))
+        except (TypeError, ValueError):
+            limit = 0
+        if limit > 0:
+            results = results[:limit]
+
         return jsonify({
             'query': query,
             'results': results,
             'count': len(results),
         })
 
-    @app.route('/api/shell/apps/detect', methods=['POST'])
+    @_route('/detect', methods=['POST'])
     def shell_apps_detect():
         """Detect the platform of an installer file."""
         data = request.get_json(force=True)
@@ -842,7 +945,7 @@ def register_app_install_routes(app):
             'size': os.path.getsize(file_path),
         })
 
-    @app.route('/api/shell/apps/history', methods=['GET'])
+    @_route('/history', methods=['GET'])
     def shell_apps_history():
         """Get installation history."""
         installer = get_installer()
@@ -851,7 +954,7 @@ def register_app_install_routes(app):
             'count': len(installer.history()),
         })
 
-    @app.route('/api/shell/apps/platforms', methods=['GET'])
+    @_route('/platforms', methods=['GET'])
     def shell_apps_platforms():
         """List supported platforms and their availability."""
         platforms = []

@@ -114,3 +114,41 @@ def test_dispatch_unknown_verb_and_bad_args():
     c = _sway_client()
     assert c.dispatch_verb('window.frobnicate', {}, 'a')['ok'] is False
     assert c.dispatch_verb('window.place', {'con_id': 'NaN'}, 'a')['ok'] is False
+
+
+# ── Phase 5: the additive native-window summon path (no phantom handle) ──
+
+def test_summon_stays_honest_unsupported_when_no_native_window_bound():
+    # Tier-2 shim cannot await a map; with NO native window already known, summon
+    # must report unsupported and NEVER fabricate a handle (no-phantom-windows).
+    c = _sway_client()
+    with patch.object(HartWmClient, '_native_window_handle', return_value=None):
+        r = c.summon_app('blender')
+    assert r['ok'] is False and r['error'] == 'unsupported'
+    assert 'handle' not in r            # no phantom handle
+
+
+def test_summon_reuses_an_existing_real_native_window_handle():
+    # The additive path: if HART-comp already mapped this manifest (a REAL map,
+    # recorded in AppRegistry), summon hands back THAT handle — not a phantom.
+    c = _sway_client()
+    with patch.object(HartWmClient, '_native_window_handle',
+                      return_value='win_9c04'):
+        r = c.summon_app('blender')
+    assert r['ok'] is True
+    assert r['handle'] == 'win_9c04' and r['mapped'] is True and r['reused'] is True
+
+
+def test_summon_empty_manifest_id_rejected():
+    c = _sway_client()
+    assert c.summon_app('')['ok'] is False
+
+
+def test_summon_native_handle_lookup_is_safe_without_registry():
+    # On a headless node AppRegistry may be unregistered; the lookup must not
+    # crash — it returns None and summon falls to the honest unsupported.
+    c = _sway_client()
+    # _native_window_handle imports get_registry lazily; force the import to fail.
+    with patch('core.platform.registry.get_registry',
+               side_effect=RuntimeError('no registry')):
+        assert c._native_window_handle('blender') is None

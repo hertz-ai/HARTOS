@@ -1062,6 +1062,15 @@ except ImportError:
 except Exception as e:
     app.logger.warning(f"Commercial API init skipped: {e}")
 
+# Central OTA control — GET /api/ota/latest (PUBLIC pointer nodes poll on their
+# hart-ota-check timer), POST /api/ota/publish (account-gated, kicks the upgrade
+# pipeline + fans a signed firmware_update fleet command), GET /api/ota/nodes
+# (live per-node rollout) — is served by the fleet_update blueprint, registered
+# inside integrations/social/__init__.py alongside the other social surfaces.
+# (There is ONE OTA backend; the former agent_engine/ota_api.py duplicate was
+# removed during integration — Flask routed to the social blueprint anyway, so
+# it was dead code; its pipeline-kick + audit folded into api_fleet_update.py.)
+
 # Hive Session API — Claude Code as hive worker node
 try:
     from integrations.coding_agent.claude_hive_session import get_blueprint as _get_hive_bp
@@ -1156,6 +1165,16 @@ except ImportError:
     pass
 except Exception as e:
     app.logger.warning(f"Resource Governor start skipped: {e}")
+
+# NOTE — the AI-senses cross-process authority server (Phase 7) is NOT started
+# here. core.ai_sensing._state is mutated ONLY by POST /api/shell/ai-sensing,
+# which is served by the LiquidUI shell process (liquid_ui_service.py), not this
+# :6777 backend. The authority socket must reflect the SAME _state the human
+# mutates, so start_authority_server() is called THERE (the canonical holder).
+# Starting it here too would bind a SECOND copy of _state that the kill-switch
+# never updates — reporting a stale "screen allowed" after the human cut it. One
+# writer, one authority. (Co-located bundles where both run in one process are
+# unaffected: a single start_authority_server() in the shared heap still wins.)
 
 # Central Orchestrator Client — heartbeat to hevolve.ai central + master
 # kill-switch polling.  Env-gated: no-op when HEVOLVE_CENTRAL_ORCHESTRATOR_URL

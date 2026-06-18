@@ -2,14 +2,19 @@
  * hartDesktop.js — HART OS desktop layer: drag-drop app icons.
  *
  * Pin apps to the desktop, drag to arrange (grid-snapped + persisted),
- * double-click / Enter to launch, right-click for Open / Remove, and an
- * "Add app to desktop" picker. Reuses the shell's own primitives so there is
- * no parallel path:
+ * double-click / Enter to launch, right-click for Open / Customize / Remove,
+ * and an "Add app to desktop" picker. Reuses the shell's own primitives so
+ * there is no parallel path:
  *   MANIFEST          — app id -> {title, icon}
  *   openPanel(id)     — launch
  *   ctxItem/ctxSep + #ctx-menu — the shell's context-menu renderer
  *   /api/shell/session-state   — single JSON blob (read-modify-write so we
  *                                never clobber other shell state)
+ *
+ * Per-icon customization (glyph / label / color, macOS-/Windows-style) travels
+ * INSIDE the same `desktop_icons` entries — readPositions() is the single
+ * serializer (it reads the override back off each icon's data-attrs) and
+ * persist() the single writer, so there is no parallel override store.
  *
  * Machine-native performance: drag uses a GPU-composited transform (no layout
  * thrash) committed to left/top only on drop; moves are rAF-batched; backend
@@ -24,11 +29,103 @@
 
   function M() { return window.MANIFEST || {}; }
 
+  // A glyph is rendered with the Material Symbols icon font ONLY when it looks
+  // like a ligature name (lowercase snake_case ASCII, e.g. "open_in_new").
+  // Anything else (emoji, unicode) is rendered as plain text — putting an emoji
+  // inside .material-icons-round makes the icon font mangle it. Single source
+  // of "is this a Material name" so makeIcon + the dialog agree.
+  function isMaterialName(g) { return /^[a-z0-9_]+$/.test(g || ''); }
+
+  // Inner HTML for an icon's glyph. color (optional) is applied inline so it
+  // overrides the stylesheet's `.di-glyph .mi{color:var(--hart-accent)}`.
+  function glyphSpan(glyph, color) {
+    var g = glyph || 'apps';
+    var style = color ? ' style="color:' + color + '"' : '';
+    if (isMaterialName(g)) {
+      return '<span class="mi material-icons-round"' + style + ' aria-hidden="true"></span>';
+    }
+    // Emoji / unicode: plain span (no icon font). textContent set by caller.
+    return '<span class="mi di-emoji"' + style + ' aria-hidden="true"></span>';
+  }
+
+  // The effective override for an icon = explicit override fields, falling back
+  // to the MANIFEST default. Used to seed the dialog and to render.
+  function effective(id, ov) {
+    var def = M()[id] || {};
+    ov = ov || {};
+    return {
+      glyph: (ov.glyph != null && ov.glyph !== '') ? ov.glyph : (def.icon || 'apps'),
+      label: (ov.label != null && ov.label !== '') ? ov.label : (def.title || id),
+      color: ov.color || ''   // '' = no user override (manifest default applied at render)
+    };
+  }
+
+  // Pure DOM apply of an override onto an existing .desktop-icon element. Reused
+  // by makeIcon (initial render) AND the customize dialog (immediate apply), so
+  // glyph/label/color rendering lives in exactly one place. Stashes the raw
+  // override back onto data-attrs so readPositions() can serialize it.
+  function applyIconVisual(el, ov) {
+    ov = ov || {};
+    var id = el.getAttribute('data-id');
+    var eff = effective(id, ov);
+    // De-monochrome default: with NO user colour override, tint the glyph with
+    // the per-app colour stamped on the manifest (single source = shell_manifest.
+    // with_icon_colors) instead of the single --hart-accent wash. A real user
+    // override (eff.color) still wins; this default is render-only and is NOT
+    // persisted (readPositions serializes data-ov-color, untouched below), so
+    // the desktop blob stays lean and the dialog's "Theme default" stays honest.
+    var renderColor = eff.color || ((M()[id] || {}).color) || '';
+
+    var glyphBox = el.querySelector('.di-glyph');
+    glyphBox.innerHTML = glyphSpan(eff.glyph, renderColor);
+    var span = glyphBox.querySelector('.mi');
+    if (!isMaterialName(eff.glyph)) span.textContent = eff.glyph;   // emoji -> text
+    else span.textContent = eff.glyph;                              // ligature name
+    // Tint the glyph plate to match (lighter when it's the manifest default so a
+    // user-chosen colour still reads as "customized" vs the default vibrancy).
+    glyphBox.style.background = renderColor ? _tint(renderColor, eff.color ? 0.22 : 0.15) : '';
+    glyphBox.style.borderColor = renderColor ? _tint(renderColor, eff.color ? 0.55 : 0.40) : '';
+
+    el.querySelector('.di-label').textContent = eff.label;          // textContent = no HTML injection
+    el.setAttribute('aria-label', eff.label);
+
+    // Persist-source: only stash fields that actually override the default, so
+    // an un-customized icon serializes to a plain {id,x,y} (no override noise).
+    _setOv(el, 'glyph', ov.glyph);
+    _setOv(el, 'label', ov.label);
+    _setOv(el, 'color', ov.color);
+  }
+
+  function _setOv(el, k, v) {
+    if (v != null && v !== '') el.setAttribute('data-ov-' + k, v);
+    else el.removeAttribute('data-ov-' + k);
+  }
+  // Read the override an icon currently carries (mirror of _setOv).
+  function _getOv(el) {
+    return { glyph: el.getAttribute('data-ov-glyph') || '',
+             label: el.getAttribute('data-ov-label') || '',
+             color: el.getAttribute('data-ov-color') || '' };
+  }
+  // Low-alpha tint of a #rrggbb color for the glyph plate background.
+  function _tint(hex, a) {
+    var m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+    if (!m) return '';
+    var n = parseInt(m[1], 16);
+    return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + (a == null ? 0.22 : a) + ')';
+  }
+
   function readPositions() {
     return Array.prototype.map.call(layer.querySelectorAll('.desktop-icon'), function (el) {
-      return { id: el.getAttribute('data-id'),
-               x: parseInt(el.style.left, 10) || 0,
-               y: parseInt(el.style.top, 10) || 0 };
+      var ov = _getOv(el);
+      var rec = { id: el.getAttribute('data-id'),
+                  x: parseInt(el.style.left, 10) || 0,
+                  y: parseInt(el.style.top, 10) || 0 };
+      // Only attach override fields that are actually set — keeps the blob lean
+      // and keeps un-customized icons byte-identical to the old {id,x,y} shape.
+      if (ov.glyph) rec.glyph = ov.glyph;
+      if (ov.label) rec.label = ov.label;
+      if (ov.color) rec.color = ov.color;
+      return rec;
     });
   }
 
@@ -99,6 +196,7 @@
       if (!menu || typeof window.ctxItem !== 'function') return;
       menu.innerHTML = [
         window.ctxItem('open_in_new', 'Open', "window.openPanel&&openPanel('" + id + "')"),
+        window.ctxItem('tune', 'Customize…', "window.hartCustomizeIcon&&hartCustomizeIcon('" + id + "')"),
         (window.ctxSep ? window.ctxSep() : ''),
         window.ctxItem('delete', 'Remove from desktop', "window.hartRemoveIcon&&hartRemoveIcon('" + id + "')")
       ].join('');
@@ -118,11 +216,10 @@
     el.setAttribute('aria-label', def.title || item.id);
     el.style.left = (item.x != null ? item.x : PAD) + 'px';
     el.style.top = (item.y != null ? item.y : PAD) + 'px';
-    el.innerHTML =
-      '<div class="di-glyph"><span class="mi material-icons-round" aria-hidden="true">' +
-      (def.icon || 'apps') + '</span></div>' +
-      '<div class="di-label"></div>';
-    el.querySelector('.di-label').textContent = def.title || item.id; // textContent = no HTML injection
+    el.innerHTML = '<div class="di-glyph"></div><div class="di-label"></div>';
+    // applyIconVisual fills glyph + label from the stored override (falling back
+    // to MANIFEST) — the single render path, shared with the customize dialog.
+    applyIconVisual(el, { glyph: item.glyph, label: item.label, color: item.color });
     bindIcon(el);
     return el;
   }
@@ -132,6 +229,100 @@
     readPositions().forEach(function (p) { if (p.x < GRID + PAD) used[Math.round((p.y - PAD) / GRID)] = 1; });
     var row = 0; while (used[row]) row++;
     return row;
+  }
+
+  // ── Customize dialog (macOS-/Windows-style per-icon glyph/label/color) ──
+  // Reuses the shell's glass tokens. Save -> applyIconVisual (immediate) +
+  // persist (single writer). Reset clears the override back to the MANIFEST.
+  function closeDialog() {
+    var d = document.getElementById('hart-icon-customize');
+    if (d && d.parentNode) d.parentNode.removeChild(d);
+  }
+  window.hartCustomizeIcon = function (id) {
+    if (!layer) return;
+    var el = layer.querySelector('.desktop-icon[data-id="' + id + '"]');
+    if (!el) return;
+    closeDialog();
+    var eff = effective(id, _getOv(el));
+
+    var ov = document.createElement('div');
+    ov.id = 'hart-icon-customize';
+    ov.className = 'hart-icustom-backdrop';
+    ov.setAttribute('role', 'dialog');
+    ov.setAttribute('aria-modal', 'true');
+    ov.setAttribute('aria-label', 'Customize icon');
+    ov.innerHTML =
+      '<div class="hart-icustom glass" role="document">' +
+        '<div class="hart-icustom-head">' +
+          '<div class="hic-prev"><div class="di-glyph"></div></div>' +
+          '<div class="hart-icustom-title">Customize icon</div>' +
+        '</div>' +
+        '<label class="hart-icustom-row">Glyph (Material Symbols name or emoji)' +
+          '<input id="hic-glyph" type="text" autocomplete="off" spellcheck="false"></label>' +
+        '<label class="hart-icustom-row">Label' +
+          '<input id="hic-label" type="text" autocomplete="off"></label>' +
+        '<label class="hart-icustom-row">Color' +
+          '<span class="hic-color-wrap"><input id="hic-color" type="color">' +
+          '<button type="button" id="hic-color-clear" class="hart-icustom-btn ghost">Theme default</button></span></label>' +
+        '<div class="hart-icustom-actions">' +
+          '<button type="button" id="hic-reset" class="hart-icustom-btn ghost">Reset</button>' +
+          '<span style="flex:1"></span>' +
+          '<button type="button" id="hic-cancel" class="hart-icustom-btn">Cancel</button>' +
+          '<button type="button" id="hic-save" class="hart-icustom-btn primary">Save</button>' +
+        '</div>' +
+      '</div>';
+    document.body.appendChild(ov);
+
+    var $ = function (s) { return ov.querySelector(s); };
+    var inGlyph = $('#hic-glyph'), inLabel = $('#hic-label'), inColor = $('#hic-color');
+    var preview = $('.hic-prev');
+    inGlyph.value = eff.glyph;
+    inLabel.value = eff.label;
+    inColor.value = /^#?[0-9a-f]{6}$/i.test(eff.color) ? eff.color : _accentHex();
+
+    function current() {
+      // '' for color means "no override" (theme default) — tracked separately so
+      // clicking the swatch is distinct from leaving it on Theme default.
+      return { glyph: inGlyph.value.trim(),
+               label: inLabel.value.trim(),
+               color: ov._colorOn ? inColor.value : '' };
+    }
+    function refreshPreview() {
+      // Render the live preview through the SAME applyIconVisual path.
+      preview.setAttribute('data-id', id);
+      applyIconVisual(preview, current());
+    }
+    // Seed the swatch "on" only from a real per-icon override — NOT from a
+    // manifest-default colour. The preview still shows the manifest colour
+    // (current().color='' -> effective() falls back to def.color) while a plain
+    // Save persists no colour, so the desktop blob stays lean.
+    ov._colorOn = !!_getOv(el).color;
+    refreshPreview();
+
+    inGlyph.addEventListener('input', refreshPreview);
+    inLabel.addEventListener('input', refreshPreview);
+    inColor.addEventListener('input', function () { ov._colorOn = true; refreshPreview(); });
+    $('#hic-color-clear').addEventListener('click', function () { ov._colorOn = false; refreshPreview(); });
+
+    function commit(o) { applyIconVisual(el, o); persist(); closeDialog(); }
+    $('#hic-save').addEventListener('click', function () { commit(current()); });
+    $('#hic-reset').addEventListener('click', function () { commit({ glyph: '', label: '', color: '' }); });
+    $('#hic-cancel').addEventListener('click', closeDialog);
+    ov.addEventListener('mousedown', function (e) { if (e.target === ov) closeDialog(); });
+    ov.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') { e.preventDefault(); closeDialog(); }
+      else if (e.key === 'Enter' && e.target.tagName === 'INPUT') { e.preventDefault(); commit(current()); }
+    });
+    inGlyph.focus(); inGlyph.select();
+  };
+
+  function _accentHex() {
+    try {
+      var c = getComputedStyle(document.documentElement).getPropertyValue('--hart-accent').trim();
+      var m = /^#?([0-9a-f]{6})$/i.exec(c);
+      if (m) return '#' + m[1];
+    } catch (_) {}
+    return '#6c63ff';
   }
 
   // ── Exposed actions (wired from the desktop context menu) ──
@@ -144,6 +335,29 @@
     if (layer.querySelector('.desktop-icon[data-id="' + id + '"]')) return;
     layer.appendChild(makeIcon({ id: id, x: PAD, y: PAD + firstFreeRow() * GRID }));
     persist();
+  };
+  // Installed app -> live desktop icon (NixOS-style). The app-installer pushes
+  // an `app_installed` A2UI event; the shell's SSE consumer calls this. We
+  // register the entry into window.MANIFEST (so render()/hartPinIcon accept it
+  // AND a later refresh still finds it) then REUSE hartPinIcon to place + persist
+  // the icon. openPanel launches it via its `exec` (the gtk-launch path).
+  window.hartInstallIcon = function (entry) {
+    if (!entry || !entry.id) return;
+    var id = String(entry.id);
+    window.MANIFEST = window.MANIFEST || {};
+    // Merge (don't clobber a richer existing definition; fill missing fields).
+    var prev = window.MANIFEST[id] || {};
+    window.MANIFEST[id] = {
+      title: entry.title || prev.title || id,
+      icon: entry.icon || prev.icon || 'apps',
+      exec: entry.exec || prev.exec || id,
+      group: entry.group || prev.group || 'Installed',
+      color: entry.color || prev.color,
+      installed: true
+    };
+    // Layer may still be initializing (init() polls); retry the pin briefly.
+    if (!layer) { setTimeout(function () { window.hartPinIcon(id); }, 400); return; }
+    window.hartPinIcon(id);
   };
   window.hartAutoArrange = function () {
     if (!layer) return;

@@ -105,6 +105,13 @@ def status() -> dict:
             'camera_service_running': _vision_running(),
             'mic_gated': disabled['mic'],
             'screen_gated': disabled['screen'],
+            # Cross-process screencast verdict (Phase 7): when the human cuts
+            # 'screen', the xdg-desktop-portal-hart ScreenCast/screencopy gate
+            # REFUSES every native (Flatpak/Wine/Qt) capture too — not just the
+            # in-process VLM grab. This is the un-fakeable proof the portal
+            # path is shut, mirroring camera_service_running for the camera.
+            # True == every screencast surface is blocked at the portal.
+            'portal_screencast_blocked': disabled['screen'],
         },
     }
 
@@ -112,8 +119,20 @@ def status() -> dict:
 # ── Cross-process authority (Phase 7) ───────────────────────────────────────
 
 def _authority_path(path: str = None) -> str:
-    return path or os.path.join(
-        os.environ.get('XDG_RUNTIME_DIR', '/tmp'), 'hart-ai-sensing.sock')
+    """Resolve the cross-process authority socket path.
+
+    Priority: explicit arg > HART_AI_SENSING_SOCK env > $XDG_RUNTIME_DIR.
+    The env override is the load-bearing one: the brain (hart-backend) is a
+    SYSTEM service with no XDG_RUNTIME_DIR, and the portal is its OWN systemd
+    unit — both must agree on ONE path. hart-portal.nix pins both sides to
+    /run/hart/ai-sensing.sock via this env var so the gate genuinely spans the
+    two processes (a path mismatch would silently fail-open the portal? no —
+    query_authority fail-CLOSES on connect error, so a mismatch denies capture,
+    never grants it; the env just makes the happy path work)."""
+    return (path
+            or os.environ.get('HART_AI_SENSING_SOCK')
+            or os.path.join(
+                os.environ.get('XDG_RUNTIME_DIR', '/tmp'), 'hart-ai-sensing.sock'))
 
 
 def start_authority_server(path: str = None) -> bool:

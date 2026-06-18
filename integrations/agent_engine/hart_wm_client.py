@@ -114,6 +114,73 @@ class HartWmClient:
             return {'ok': False, 'error': 'bad layout'}
         return self._ok(self._sway(['layout', layout]))
 
+    def move_to_workspace(self, con_id: int, n: int) -> Dict[str, Any]:
+        """window.move_to_workspace (IPC §4.7). Non-destructive arrange."""
+        cmd = '[con_id=%d] move container to workspace number %d' % (
+            int(con_id), int(n))
+        return self._ok(self._sway([cmd]))
+
+    def switch_workspace(self, n: int) -> Dict[str, Any]:
+        """workspace.switch (IPC §4.8) — moves REAL native windows only; the
+        shell's hartWorkspaces.js keeps its own client-side panel show/hide on
+        every tier (one source of truth per object class). Non-destructive."""
+        return self._ok(self._sway(['workspace', 'number', str(int(n))]))
+
+    def summon_app(self, manifest_id: str) -> Dict[str, Any]:
+        """window.summon (IPC §4.6) — launch an app by manifest id, then surface
+        the result HONESTLY.
+
+        The native-window launch path (ALONGSIDE the iframe panels — additive, the
+        panels are untouched): if the app is ALREADY open as a native window the
+        brain knows about (AppRegistry's manifest↔handle map, fed by HART-comp's
+        real ``window.opened`` map events), return that EXISTING handle — that
+        handle came from a real map, so it is not a phantom.
+
+        Otherwise a fresh summon needs to LAUNCH and AWAIT A REAL MAP. On the sway
+        Tier-2 shim we can neither tag a launcher's child for map-correlation nor
+        await a wlr-foreign-toplevel map event, so we return ``unsupported`` and
+        NEVER fabricate a window handle (the no-phantom-windows rule, §1.4/§4.6).
+        HART-comp Tier-1 is where SummonApp awaits the real map (the Rust
+        ``SummonResolver``/``State::on_real_map`` keyed on a map within
+        ``SUMMON_MAP_TIMEOUT``); a banked ``window.summon`` step replayed on REUSE
+        therefore surfaces this honest ``unsupported`` rather than a phantom-success
+        no-op (§8). Non-destructive."""
+        manifest_id = str(manifest_id or '').strip()
+        if not manifest_id:
+            return {'ok': False, 'error': 'manifest_id required'}
+        # Additive native-window path: if HART-comp already told us this manifest
+        # is open as a native toplevel (a REAL map), hand back that handle. This is
+        # the brain-side WindowRegistry mirror — never a fabricated handle.
+        existing = self._native_window_handle(manifest_id)
+        if existing:
+            return {'ok': True, 'manifest_id': manifest_id,
+                    'handle': existing, 'mapped': True, 'reused': True}
+        # Fresh summon: feature-detect a map-await launch backend. None exists at
+        # Tier-2 (the swaymsg shim can't correlate a launch to a map). HART-comp
+        # Tier-1's IPC server is where the launch→await-map wiring lands, keyed on
+        # the map event, not an exit code.
+        return {'ok': False, 'error': 'unsupported', 'manifest_id': manifest_id,
+                'note': 'summon needs HART-comp Tier-1 map-await; Tier-2 shim '
+                        'cannot confirm a toplevel mapped (no phantom handle)'}
+
+    @staticmethod
+    def _native_window_handle(manifest_id: str) -> Optional[str]:
+        """The compositor handle for ``manifest_id`` if it is open as a native
+        window (AppRegistry's manifest↔handle map, populated from real HART-comp
+        ``window.opened`` events). None if not open or the registry is unavailable
+        (e.g. headless node). Read-only — never mints a handle."""
+        try:
+            from core.platform.registry import get_registry
+            reg = get_registry()
+            if reg.has('AppRegistry'):
+                app_registry = reg.get('AppRegistry')
+                fn = getattr(app_registry, 'window_handle_for', None)
+                if callable(fn):
+                    return fn(manifest_id)
+        except Exception:
+            pass
+        return None
+
     # ── DESTRUCTIVE (fail-closed gated + audited) ──
     def close_window(self, con_id: int, agent_id: str) -> Dict[str, Any]:
         if not self._guard_destructive('window.close', agent_id, con_id):
@@ -137,6 +204,13 @@ class HartWmClient:
                                          int(args['h']))
             if verb == 'window.tile':
                 return self.tile_layout(str(args['layout']))
+            if verb == 'window.move_to_workspace':
+                return self.move_to_workspace(int(args['con_id']),
+                                              int(args['workspace']))
+            if verb in ('workspace.switch', 'window.switch_workspace'):
+                return self.switch_workspace(int(args['workspace']))
+            if verb == 'window.summon':
+                return self.summon_app(str(args['manifest_id']))
             if verb == 'window.close':
                 return self.close_window(int(args['con_id']), agent_id)
         except (KeyError, ValueError, TypeError) as e:

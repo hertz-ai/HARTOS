@@ -342,7 +342,37 @@ def bootstrap_local_subscribers() -> None:
     # Probe uses a different topic pattern but subscribe anyway
     bus.subscribe('task.probe', _on_probe)
 
+    # 7. OTA push receiver (realtime leg) — a CENTRAL push of an approved build
+    #    arrives as a signed firmware_update FleetCommand on the EXISTING
+    #    'fleet.command' bus topic.  This is the long-lived process that holds
+    #    the WAMP session, so it is the right home for the realtime subscription
+    #    (no standalone second-process subscriber, no new transport).  OTA-class
+    #    commands are routed to ota_push_listener.handle_push, which verifies the
+    #    central/regional signature and kicks hart-ota-check — converging on the
+    #    SAME staged apply (pipeline → autoApply switch → auto-rollback) the boot
+    #    poll uses.  Non-OTA fleet commands are ignored here (their own consumers
+    #    own them); handle_push returns False for those.
+    try:
+        from integrations.agent_engine.ota_push_listener import handle_push as _ota_push
+
+        def _on_fleet_command(topic, data):
+            try:
+                if isinstance(data, str):
+                    data = json.loads(data)
+            except Exception:
+                return
+            try:
+                _ota_push(data)
+            except Exception as e:
+                logger.debug(f"OTA push handler error: {e}")
+
+        bus.subscribe('fleet.command', _on_fleet_command)
+        _ota_leg = ", ota-push"
+    except Exception as e:
+        logger.debug(f"OTA push receiver not wired: {e}")
+        _ota_leg = ""
+
     logger.info(
         "Local subscribers bootstrapped: confirmation, longrunning, "
-        "intermediate, exception, timeout, probe"
+        "intermediate, exception, timeout, probe" + _ota_leg
     )
