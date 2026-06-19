@@ -1770,6 +1770,50 @@ class WorldModelBridge:
 
     # ─── Embodied interaction (same latent space) ────────────────
 
+    def _propagate_embodied_error(self, where: str, *, action: Optional[dict] = None,
+                                  exc: Optional[BaseException] = None,
+                                  status: Optional[int] = None) -> None:
+        """Propagate an embodied action/sensor/feedback failure THROUGH the
+        hevolveai hive — not just the local circuit breaker.
+
+        1. record the local breaker failure (fast-fail at threshold);
+        2. record into the central ``ExceptionCollector`` so the hive's
+           SelfHealingDispatcher sees the embodied-error pattern and can raise a
+           fix goal — the SAME error sink every other backend uses (one sink, no
+           parallel error path);
+        3. when the breaker is now OPEN (backend confirmed down, not a transient
+           blip), gossip an ``embodied.backend_down`` event so peer nodes
+           downgrade to a fallback embodied node (regional federation) instead of
+           dispatching into a dead one. The callers return early while the
+           breaker is open (see send_action:_cb_is_open), so this throttles to
+           ~once per cooldown — no gossip flood.
+
+        Fire-and-forget: never raises into the embodied control path."""
+        self._cb_record_failure()
+        try:
+            from exception_collector import ExceptionCollector
+            _e = exc if exc is not None else RuntimeError(
+                f"embodied {where} failed (status={status}) at {self._api_url}")
+            ExceptionCollector.get_instance().record(
+                _e, module='world_model_bridge', function=where,
+                context={'api_url': self._api_url, 'status': status,
+                         'action_type': (action or {}).get('type'),
+                         'node_tier': self._node_tier})
+        except Exception:
+            pass
+        if self._cb_is_open():
+            try:
+                from integrations.social.peer_discovery import gossip
+                gossip.broadcast({
+                    'type': 'embodied.backend_down',
+                    'node_id': self._node_id,
+                    'where': where,
+                    'api_url': self._api_url,
+                    'ts': time.time(),
+                })
+            except Exception:
+                pass
+
     def send_action(self, action: dict) -> bool:
         """Send a motor/actuator command to HevolveAI's world model.
 
@@ -1821,10 +1865,11 @@ class WorldModelBridge:
                     self._stats['total_actions_sent'] = self._stats.get(
                         'total_actions_sent', 0) + 1
                 return True
-            self._cb_record_failure()
+            self._propagate_embodied_error(
+                'send_action', action=action, status=resp.status_code)
             return False
-        except requests.RequestException:
-            self._cb_record_failure()
+        except requests.RequestException as e:
+            self._propagate_embodied_error('send_action', action=action, exc=e)
             return False
 
     def ingest_sensor_batch(self, readings: list) -> int:
@@ -1863,10 +1908,11 @@ class WorldModelBridge:
                     self._stats['total_sensor_readings'] = self._stats.get(
                         'total_sensor_readings', 0) + len(readings)
                 return len(readings)
-            self._cb_record_failure()
+            self._propagate_embodied_error(
+                'ingest_sensor_batch', status=resp.status_code)
             return 0
-        except requests.RequestException:
-            self._cb_record_failure()
+        except requests.RequestException as e:
+            self._propagate_embodied_error('ingest_sensor_batch', exc=e)
             return 0
 
     def get_learning_feedback(self) -> Optional[Dict]:
@@ -1901,10 +1947,11 @@ class WorldModelBridge:
             if resp.status_code == 200:
                 self._cb_record_success()
                 return resp.json()
-            self._cb_record_failure()
+            self._propagate_embodied_error(
+                'get_learning_feedback', status=resp.status_code)
             return None
-        except requests.RequestException:
-            self._cb_record_failure()
+        except requests.RequestException as e:
+            self._propagate_embodied_error('get_learning_feedback', exc=e)
             return None
 
     def record_embodied_interaction(
