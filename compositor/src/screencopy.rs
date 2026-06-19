@@ -69,6 +69,7 @@ use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform
 use smithay::wayland::shm::{shm_format_to_fourcc, with_buffer_contents_mut, BufferData};
 use tracing::{info, warn};
 
+use crate::comp_core;
 use crate::winit::State;
 
 /// We capture in Xrgb8888 — the mandatory shm format every wlr client (grim,
@@ -138,7 +139,7 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for State {
                 // Whole-output capture. HART-comp has exactly ONE output (the winit
                 // window); we ignore the `output` arg (a single-output compositor) and
                 // capture the full current size.
-                let size = state.output_physical_size();
+                let size = comp_core::output_physical_size(state);
                 let region = Rectangle::from_size((size.w, size.h).into());
                 init_frame(state, frame, region, data_init);
             }
@@ -155,7 +156,7 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for State {
                 // client can never read outside the framebuffer (the ExportMem contract
                 // rejects an out-of-bounds region — we clamp rather than fail so a
                 // slightly-oversized region still yields a sane capture).
-                let out = state.output_physical_size();
+                let out = comp_core::output_physical_size(state);
                 let rx = x.max(0).min(out.w);
                 let ry = y.max(0).min(out.h);
                 let rw = width.max(1).min(out.w - rx);

@@ -90,6 +90,7 @@ use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::{X11Wm, XWayland, XWaylandEvent};
 use tracing::{error, info, warn};
 
+use crate::comp_core::{self, HartRenderElement};
 use crate::shared::send_frame_callbacks;
 use crate::wayland::{ClientState, State};
 use crate::{select_render_path, BootConfig, WindowRegistry, HART_SPLASH_RGBA};
@@ -203,6 +204,21 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut space: Space<Window> = Space::default();
     space.map_output(&output, (0, 0));
 
+    // M8 — bake the default-arrow cursor once + the killswitch black buffer, the SAME
+    // dependency-free RGBA fallback the winit backend uses (so a cursor is visible on the
+    // pixman floor with no xcursor theme, and the screen-kill draw is one cheap solid).
+    let (cur_rgba, cur_w, cur_h, cur_hotspot) = comp_core::bake_default_cursor();
+    let cursor_buffer = smithay::backend::renderer::element::memory::MemoryRenderBuffer::from_slice(
+        &cur_rgba,
+        Fourcc::Argb8888,
+        (cur_w, cur_h),
+        1,
+        Transform::Normal,
+        None,
+    );
+    let black_buffer =
+        smithay::backend::renderer::element::solid::SolidColorBuffer::new((1920, 1080), [0.0, 0.0, 0.0, 1.0]);
+
     let mut state = State {
         dh: dh.clone(),
         loop_handle: event_loop.handle(),
@@ -226,12 +242,25 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         renderer,
         xwm: None,
         running: true,
-        // Wire the IPC sink to a tracing log for now (the com.hart.Compositor socket
-        // server is the winit-gated ipc.rs; the DRM path logs the same edges). This is
-        // a real sink, not a stub — every map/unmap emits a structured event line.
+        // Wire the WindowRecord-typed summon/foreign sink to a tracing log (the
+        // socket-based com.hart.Compositor IPC fan-out is `state.ipc` below). Every
+        // map/unmap emits a structured event line here too.
         emit_ipc_event: Box::new(|kind, rec| {
             info!(event = kind, handle = rec.handle.as_str(), "compositor.window_event");
         }),
+        // M8 full-desktop WM state (the SAME field set winit::State holds).
+        next_window_loc: (32, 32).into(),
+        active_workspace: 0,
+        hidden_windows: Vec::new(),
+        desktop_shown: true,
+        suppressed_keys: Vec::new(),
+        cursor_status: smithay::input::pointer::CursorImageStatus::default_named(),
+        cursor_buffer,
+        cursor_hotspot: cur_hotspot,
+        ws_switch_at: None,
+        capture_blocked: false,
+        black_buffer,
+        ipc: crate::ipc::IpcState::default(),
     };
 
     // 7. The per-device backend table (one entry per opened GPU). Held OUTSIDE State so
@@ -329,6 +358,13 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     //      effort: a spawn failure leaves xwm=None (Wayland-native clients unaffected).
     spawn_xwayland(&dh, &event_loop.handle());
 
+    // 12c. M8 — bind the com.hart.Compositor IPC server (the SAME framed-JSON Unix-socket
+    //      twin the winit backend serves), so an agent arranges REAL windows on real
+    //      hardware too — the MOAT on the DRM path. `ipc::start_ipc` is generic over the
+    //      backend State (via `comp_core::CompState`), so this is ONE server, not a
+    //      winit-only path. Best-effort: a bind failure leaves the compositor running.
+    let _ipc_socket = crate::ipc::start_ipc(&event_loop.handle());
+
     // 13. THE LOOP. We carry the per-device table in a tuple with State so the VBlank
     //     re-render can reach the DrmCompositor surfaces. The DRM `notifier`/VBlank source
     //     was inserted as part of `device_added` keyed on the node, calling `render_node`.
@@ -355,6 +391,14 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         // box the VBlank source paces the actual flips; this tick just keeps the frame
         // fresh + drains client frame callbacks so clients draw their next frame.
         render_all(&mut state, &mut devices);
+
+        // M8 — settle finished effects: clear the workspace-switch crossfade clock once it
+        // completes so it does not re-evaluate forever (the 60Hz tick PLAYS an in-flight
+        // fade frame-by-frame; map-in fades self-settle past FADE_IN_MS). The SAME tidy-up
+        // the winit loop does, so the DRM desktop's crossfade behaves identically.
+        if !comp_core::effects_animating(&state) {
+            state.ws_switch_at = None;
+        }
 
         // Send frame callbacks so clients (the glass shell) draw their next frame.
         let now_ms = 0u32; // monotonic ms is unused by the shell; 0 is a valid "now".
@@ -544,55 +588,39 @@ fn device_added(
 /// the page-flip. The canonical `render_frame → queue_frame → frame_submitted` sequence
 /// from the rev's DrmCompositor doc example.
 fn render_all(state: &mut State, devices: &mut HashMap<DrmNode, DeviceData>) {
-    use smithay::backend::renderer::element::surface::{
-        render_elements_from_surface_tree, WaylandSurfaceRenderElement,
-    };
-    use smithay::backend::renderer::element::Kind;
-
     let clear = Color32F::new(
         HART_SPLASH_RGBA[0],
         HART_SPLASH_RGBA[1],
         HART_SPLASH_RGBA[2],
         HART_SPLASH_RGBA[3],
     );
-    let output = state.output.clone();
 
-    // Build the heterogeneous-free element list: windows (above) then the layer-shell
-    // glass-shell desktop (below). Pixman is the renderer; one element type suffices on
-    // the DRM floor (no cursor/killswitch element kinds yet — Stage-B parity).
-    let mut elements: Vec<WaylandSurfaceRenderElement<PixmanRenderer>> = Vec::new();
-    for window in state.space.elements().rev() {
-        let loc = state.space.element_location(window).unwrap_or_default();
-        let phys = loc.to_physical_precise_round(1.0);
-        if let Some(surface) = window.wl_surface() {
-            elements.extend(render_elements_from_surface_tree(
-                &mut state.renderer,
-                &surface,
-                phys,
-                1.0,
-                1.0,
-                Kind::Unspecified,
-            ));
+    // M8 — the FULL z-order, built by the SHARED comp_core builder (killswitch → cursor
+    // → windows-faded → layer-shell desktop), the SAME element list the winit backend
+    // composites. PixmanRenderer satisfies the builder's `Renderer + ImportAll +
+    // ImportMem` bounds, so the DRM desktop gets the cursor, the screen kill-switch, and
+    // the map/workspace fades with ZERO parallel render code. The size is the output's
+    // current physical mode (the capturable framebuffer extent).
+    let size = comp_core::output_physical_size(state);
+    // The renderer lives ON `state`, but `build_frame_elements` needs BOTH `&mut state`
+    // (reads the space/cursor/effects, updates the killswitch buffer) AND `&mut renderer`
+    // (imports surface textures) — disjoint fields the borrow checker can't see through
+    // the `CompState` accessors. Swap the renderer OUT for the build (anvil's pattern),
+    // then restore it. The placeholder is a fresh PixmanRenderer; if it can't be made we
+    // skip this frame (the next tick retries) rather than panic — the never-fail posture.
+    let mut renderer = match PixmanRenderer::new() {
+        Ok(placeholder) => std::mem::replace(&mut state.renderer, placeholder),
+        Err(err) => {
+            warn!(?err, "HART-comp DRM: could not allocate a render scratch renderer; skipping frame");
+            return;
         }
-    }
-    {
-        let map = layer_map_for_output(&output);
-        for layer in map.layers() {
-            let loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
-            elements.extend(render_elements_from_surface_tree(
-                &mut state.renderer,
-                layer.wl_surface(),
-                (loc.x, loc.y),
-                1.0,
-                1.0,
-                Kind::Unspecified,
-            ));
-        }
-    }
+    };
+    let elements: Vec<HartRenderElement<PixmanRenderer>> =
+        comp_core::build_frame_elements(state, &mut renderer, size);
 
     for device in devices.values_mut() {
         for compositor in device.surfaces.values_mut() {
-            match compositor.render_frame::<_, _>(&mut state.renderer, &elements, clear, FrameFlags::DEFAULT) {
+            match compositor.render_frame::<_, _>(&mut renderer, &elements, clear, FrameFlags::DEFAULT) {
                 Ok(result) => {
                     if !result.is_empty {
                         if let Err(err) = compositor.queue_frame(()) {
@@ -606,6 +634,9 @@ fn render_all(state: &mut State, devices: &mut HashMap<DrmNode, DeviceData>) {
             }
         }
     }
+    // Restore the real renderer (it carries no per-frame state for pixman, but keeping the
+    // ORIGINAL instance avoids re-allocating its internal caches every tick).
+    state.renderer = renderer;
 }
 
 /// Pick a connector's preferred mode (or the first available).

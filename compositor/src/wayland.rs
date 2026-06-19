@@ -128,6 +128,10 @@ use crate::{
 // The backend-agnostic surface-tree / map-edge / app-id readers (M7 Stage-B hoist).
 // SHARED with the winit backend so there is one implementation, not a parallel path.
 use crate::shared::{surface_has_buffer, toplevel_app_id, toplevel_title, x11_app_id, x11_title};
+// M8 — the SHARED WM brain (workspaces, keybindings, cursor, killswitch, effects, IPC
+// verbs). The DRM State impls `CompState` (below) to feed it, so the FULL desktop runs
+// on real hardware too — ONE implementation across both backends, not a parallel path.
+use crate::comp_core::{self, CompState};
 
 // ════════════════════════════════════════════════════════════════════════════
 // The compositor State — owns the pure registry + the live Smithay protocol
@@ -211,8 +215,38 @@ pub struct State {
 
     /// IPC event sink — `window.opened`/`window.closed`/… frames to subscribers
     /// (the com.hart.Compositor server, Phase 6). Boxed so this module does not
-    /// depend on the transport concretely.
+    /// depend on the transport concretely. (The summon/Foreign-toplevel path uses this
+    /// WindowRecord-typed sink; the M8 shared WM edges fan out via `ipc` below.)
     pub emit_ipc_event: Box<dyn FnMut(&str, &WindowRecord)>,
+
+    // ════════════════════════════════════════════════════════════════════════
+    // M8 — the full-desktop WM state, the SAME field set winit::State holds, so the
+    // shared `comp_core::CompState` brain (workspaces, keybindings, cursor, killswitch,
+    // effects, the com.hart.Compositor IPC) runs on the DRM path too. Constructed in
+    // udev.rs::run_udev. These are why M8 wires the FULL desktop on real hardware, not
+    // just the Stage-A layer-shell boot floor.
+    // ════════════════════════════════════════════════════════════════════════
+    /// M3 cascade placement cursor (each new toplevel offset from the last).
+    pub next_window_loc: smithay::utils::Point<i32, Logical>,
+    /// M5 workspaces — `space` holds ONLY the active workspace; the rest live here.
+    pub active_workspace: usize,
+    pub hidden_windows: Vec<crate::comp_core::HiddenWindow>,
+    pub desktop_shown: bool,
+    /// M5 keycodes whose intercepted press must also have its release swallowed.
+    pub suppressed_keys: Vec<smithay::input::keyboard::Keycode>,
+    /// M6 software cursor — the latest client-requested image + the baked default arrow.
+    pub cursor_status: smithay::input::pointer::CursorImageStatus,
+    pub cursor_buffer: smithay::backend::renderer::element::memory::MemoryRenderBuffer,
+    pub cursor_hotspot: smithay::utils::Point<i32, Logical>,
+    /// M6 effects — the workspace-switch crossfade clock (per-window fade is user-data).
+    pub ws_switch_at: Option<std::time::Instant>,
+    /// M6 killswitch — the constitutional screen cut (black surface + input/capture gate).
+    pub capture_blocked: bool,
+    pub black_buffer: smithay::backend::renderer::element::solid::SolidColorBuffer,
+    /// M8 — the com.hart.Compositor IPC server's per-compositor state (the event
+    /// fan-out subscribers). The DRM backend serves the SAME framed-JSON socket the
+    /// winit backend does, so an agent arranges real windows on real hardware too.
+    pub ipc: crate::ipc::IpcState,
 }
 
 // ── Per-client state. Carries the compositor-side client bookkeeping Smithay needs
@@ -225,6 +259,102 @@ pub struct ClientState {
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// M8 — the DRM State feeds the SHARED WM brain by impl'ing `comp_core::CompState`.
+// Every accessor hands back a field this State holds; the brain (comp_core::*) drives
+// them, so the FULL desktop — window arrange (the moat), workspaces, keybindings,
+// software cursor, screen kill-switch, fade effects, the com.hart.Compositor IPC —
+// runs on the DRM path with ZERO parallel code vs winit. The seat handles are
+// `…Handle<State>` (State impls SeatHandler below), satisfying the supertrait bound.
+// ════════════════════════════════════════════════════════════════════════════
+impl CompState for State {
+    fn space(&self) -> &Space<Window> {
+        &self.space
+    }
+    fn space_mut(&mut self) -> &mut Space<Window> {
+        &mut self.space
+    }
+    fn keyboard(&self) -> &KeyboardHandle<State> {
+        &self.keyboard
+    }
+    fn pointer(&self) -> &PointerHandle<State> {
+        &self.pointer
+    }
+    fn output(&self) -> &Output {
+        &self.output
+    }
+    fn xwm_mut(&mut self) -> &mut Option<X11Wm> {
+        &mut self.xwm
+    }
+    fn next_window_loc(&self) -> smithay::utils::Point<i32, Logical> {
+        self.next_window_loc
+    }
+    fn set_next_window_loc(&mut self, loc: smithay::utils::Point<i32, Logical>) {
+        self.next_window_loc = loc;
+    }
+    fn active_workspace(&self) -> usize {
+        self.active_workspace
+    }
+    fn set_active_workspace(&mut self, n: usize) {
+        self.active_workspace = n;
+    }
+    fn hidden_windows(&self) -> &[comp_core::HiddenWindow] {
+        &self.hidden_windows
+    }
+    fn hidden_windows_mut(&mut self) -> &mut Vec<comp_core::HiddenWindow> {
+        &mut self.hidden_windows
+    }
+    fn desktop_shown(&self) -> bool {
+        self.desktop_shown
+    }
+    fn set_desktop_shown(&mut self, on: bool) {
+        self.desktop_shown = on;
+    }
+    fn suppressed_keys_mut(&mut self) -> &mut Vec<smithay::input::keyboard::Keycode> {
+        &mut self.suppressed_keys
+    }
+    fn cursor_status(&self) -> &smithay::input::pointer::CursorImageStatus {
+        &self.cursor_status
+    }
+    fn cursor_buffer(&self) -> &smithay::backend::renderer::element::memory::MemoryRenderBuffer {
+        &self.cursor_buffer
+    }
+    fn cursor_hotspot(&self) -> smithay::utils::Point<i32, Logical> {
+        self.cursor_hotspot
+    }
+    fn ws_switch_at(&self) -> Option<std::time::Instant> {
+        self.ws_switch_at
+    }
+    fn set_ws_switch_at(&mut self, at: Option<std::time::Instant>) {
+        self.ws_switch_at = at;
+    }
+    fn capture_blocked(&self) -> bool {
+        self.capture_blocked
+    }
+    fn set_capture_blocked_flag(&mut self, on: bool) {
+        self.capture_blocked = on;
+    }
+    fn black_buffer_mut(&mut self) -> &mut smithay::backend::renderer::element::solid::SolidColorBuffer {
+        &mut self.black_buffer
+    }
+    fn emit_window_event(&mut self, event: &str, window: &Window, handle: &str) {
+        // Fan the edge out over the SHARED framed-JSON IPC (the same socket the winit
+        // backend serves), AND mirror it to the WindowRecord-typed summon/foreign sink
+        // so the existing DRM-side log line + foreign-toplevel projection still fire.
+        let payload = comp_core::ipc_event_window_json_for(self, window, handle);
+        self.ipc.emit_event(event, payload);
+    }
+    fn registry_on_unmap(&mut self, handle: &WindowHandle) -> bool {
+        self.windows.on_unmap(handle)
+    }
+    fn loop_handle(&self) -> &smithay::reexports::calloop::LoopHandle<'static, State> {
+        &self.loop_handle
+    }
+    fn ipc_state_mut(&mut self) -> &mut crate::ipc::IpcState {
+        &mut self.ipc
+    }
 }
 
 impl State {
@@ -352,6 +482,18 @@ impl smithay::input::SeatHandler for State {
     fn seat_state(&mut self) -> &mut SeatState<State> {
         &mut self.seat_state
     }
+
+    /// M8 — a client set (or hid) its cursor. Stash the latest status; the shared render
+    /// path (`comp_core::build_frame_elements`) draws it each frame (client surface, the
+    /// baked default arrow, or nothing when Hidden) — the SAME software-cursor path as
+    /// winit. Without this the DRM desktop showed no cursor (Stage-A had no cursor draw).
+    fn cursor_image(
+        &mut self,
+        _seat: &smithay::input::Seat<Self>,
+        image: smithay::input::pointer::CursorImageStatus,
+    ) {
+        self.cursor_status = image;
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -376,9 +518,11 @@ impl XdgShellHandler for State {
     /// `CompositorHandler::commit`). We mint the handle at THAT edge, not here.
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface.clone());
-        // Place below the orb/overlays per the Phase-4 z-order model; above the
-        // layer-shell BACKGROUND desktop. Real geometry is the tiling policy's job.
-        self.space.map_element(window, (0, 0), false);
+        // M8 — cascade each new toplevel offset from the last (the SAME `next_cascade_loc`
+        // the winit backend uses) so multiple windows are visibly distinct, not stacked at
+        // the origin. The AI-native WM (the IPC tile/place verbs) refines real placement.
+        let loc = comp_core::next_cascade_loc(self);
+        self.space.map_element(window, loc, true);
         // Send an initial configure so the client can commit its first buffer.
         surface.send_configure();
     }
@@ -434,8 +578,20 @@ pub fn xdg_toplevel_mapped(state: &mut State, surface: &ToplevelSurface) {
     let title = toplevel_title(surface);
     let handle = state.on_real_map(app_id, title, ToplevelKind::Xdg);
     // Stash the handle on the Window's user-data so destroy can reverse it.
-    if let Some(window) = state.window_for_toplevel(surface) {
+    let window = state.window_for_toplevel(surface).cloned();
+    if let Some(window) = window {
         window.user_data().insert_if_missing(|| handle.clone());
+        // M8 full-desktop bookkeeping (identical to winit's commit map-edge): tag the
+        // active workspace so window.list + move/switch see it, start the map-in fade
+        // clock, and give the just-mapped toplevel keyboard focus + raise it so a
+        // just-launched app receives keystrokes without a click.
+        comp_core::tag_window_workspace(state, &window);
+        window.user_data().insert_if_missing(|| comp_core::MapAnim(std::time::Instant::now()));
+        state.space.raise_element(&window, true);
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        let surf = window.wl_surface().map(|s| s.into_owned());
+        let keyboard = state.keyboard.clone();
+        keyboard.set_focus(state, surf, serial);
     }
     // Optional `place` from the SummonApp request is applied by the IPC layer
     // after it observes window.opened (it has the geometry; we have the map).
@@ -494,8 +650,10 @@ impl XwmHandler for State {
         let app_id = x11_app_id(&window);
         let title = x11_title(&window);
         // Wrap the X11 surface as a desktop Window so it tiles with xdg toplevels.
+        // M8 — cascade it (the SAME placement the winit X11 map edge uses).
+        let loc = comp_core::next_cascade_loc(self);
         let win = Window::new_x11_window(window);
-        self.space.map_element(win.clone(), (0, 0), false);
+        self.space.map_element(win.clone(), loc, true);
         // Configure it to the geometry the space gave it (X11 needs an explicit
         // configure to know its size); best-effort, the real tiling policy refines.
         if let Some(bbox) = self.space.element_bbox(&win) {
@@ -505,6 +663,11 @@ impl XwmHandler for State {
         }
         let handle = self.on_real_map(app_id, title, ToplevelKind::XWayland);
         win.user_data().insert_if_missing(|| handle);
+        // M8 full-desktop bookkeeping (identical to winit's X11 map edge): tag the
+        // active workspace + start the map-in fade clock. (X11 keyboard focus is set on
+        // the surface's first commit, as the wl_surface associates asynchronously.)
+        comp_core::tag_window_workspace(self, &win);
+        win.user_data().insert_if_missing(|| comp_core::MapAnim(std::time::Instant::now()));
     }
 
     /// An override-redirect window mapped (it positions itself; we honor its loc).
@@ -703,6 +866,14 @@ fn on_surface_destroyed(state: &mut State, surface: &WlSurface) {
             state.space.unmap_elem(&w);
         }
         state.sync_foreign_toplevels();
+    } else {
+        // M8 — the destroyed toplevel may live on a NON-active workspace (so it is in
+        // `hidden_windows`, not the visible space, and `handle_for_surface` missed it).
+        // Purge it there (emits window.closed + invalidates the handle), the SAME
+        // hidden-workspace cleanup the winit destroy path does.
+        comp_core::purge_hidden_window(state, |w| {
+            w.wl_surface().map(|s| &*s == surface).unwrap_or(false)
+        });
     }
 }
 
@@ -717,104 +888,16 @@ fn on_surface_destroyed(state: &mut State, surface: &WlSurface) {
 // ════════════════════════════════════════════════════════════════════════════
 
 impl State {
-    /// Reverse-lookup the live `Window` whose ROOT surface is `surface` (mirrors
-    /// winit.rs::window_for_surface). `Window::wl_surface()` comes from `WaylandFocus`.
-    fn window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
-        self.space
-            .elements()
-            .find(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false))
-            .cloned()
-    }
-
-    /// M7 — route a single libinput event into the seat. Stage-A boot floor: forward
-    /// keyboard keys to the focused client + absolute/relative pointer motion + buttons
-    /// + axis to the pointer-focused surface. The full click-to-focus / keyboard-shortcut
-    /// / workspace logic is the winit backend's (M3/M5) and is Stage-B parity here — the
-    /// boot floor needs the seat live so the glass shell receives input, not the whole WM.
+    /// M8 — route a single libinput event into the FULL shared WM input path
+    /// (`comp_core::process_input_event`): click-to-focus + raise, the keyboard-shortcut
+    /// chords (workspaces/snap/close/show-desktop), the pointer hit-test honouring the
+    /// layer z-order, and the screen-kill input gate — IDENTICAL to the winit backend.
+    /// The Stage-A forward-only stub is gone; the DRM desktop is now the full WM.
     pub fn process_input_event<B: smithay::backend::input::InputBackend>(
         &mut self,
         event: smithay::backend::input::InputEvent<B>,
     ) {
-        use smithay::backend::input::{
-            AbsolutePositionEvent, Event, InputEvent, KeyboardKeyEvent, PointerButtonEvent,
-        };
-        use smithay::input::keyboard::FilterResult;
-        use smithay::input::pointer::{ButtonEvent, MotionEvent};
-        use smithay::utils::SERIAL_COUNTER;
-        match event {
-            InputEvent::Keyboard { event } => {
-                let serial = SERIAL_COUNTER.next_serial();
-                let time = event.time_msec();
-                let code = event.key_code();
-                let key_state = event.state();
-                let keyboard = self.keyboard.clone();
-                // Forward every key to the focused client (no compositor chords on the DRM
-                // floor yet — Stage-B parity). The filter always returns Forward.
-                keyboard.input::<(), _>(self, code, key_state, serial, time, |_, _, _| {
-                    FilterResult::Forward
-                });
-            }
-            InputEvent::PointerMotionAbsolute { event } => {
-                let serial = SERIAL_COUNTER.next_serial();
-                let output_geo = match self.space.output_geometry(&self.output) {
-                    Some(g) => g,
-                    None => return,
-                };
-                let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
-                let pointer = self.pointer.clone();
-                let under = self.surface_under(pos);
-                pointer.motion(
-                    self,
-                    under,
-                    &MotionEvent { location: pos, serial, time: event.time_msec() },
-                );
-                pointer.frame(self);
-            }
-            InputEvent::PointerButton { event } => {
-                let serial = SERIAL_COUNTER.next_serial();
-                let pointer = self.pointer.clone();
-                pointer.button(
-                    self,
-                    &ButtonEvent {
-                        button: event.button_code(),
-                        state: event.state(),
-                        serial,
-                        time: event.time_msec(),
-                    },
-                );
-                pointer.frame(self);
-            }
-            _ => {}
-        }
-    }
-
-    /// Hit-test the surface under `pos` for POINTER focus (toplevels then layer
-    /// surfaces). Trimmed from winit.rs::surface_under to the Stage-A floor (no z-order
-    /// layer juggling beyond "windows above, layer-shell below").
-    fn surface_under(
-        &self,
-        pos: smithay::utils::Point<f64, Logical>,
-    ) -> Option<(WlSurface, smithay::utils::Point<f64, Logical>)> {
-        if let Some((window, win_loc)) = self.space.element_under(pos) {
-            if let Some((surface, surf_loc)) =
-                window.surface_under(pos - win_loc.to_f64(), WindowSurfaceType::ALL)
-            {
-                return Some((surface, (surf_loc + win_loc).to_f64()));
-            }
-        }
-        let layers = layer_map_for_output(&self.output);
-        if let Some(layer) = layers
-            .layer_under(WlrLayer::Top, pos)
-            .or_else(|| layers.layer_under(WlrLayer::Background, pos))
-        {
-            let layer_loc = layers.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
-            if let Some((surface, loc)) =
-                layer.surface_under(pos - layer_loc.to_f64(), WindowSurfaceType::ALL)
-            {
-                return Some((surface, (loc + layer_loc).to_f64()));
-            }
-        }
-        None
+        comp_core::process_input_event(self, event);
     }
 }
 
@@ -856,7 +939,7 @@ impl CompositorHandler for State {
         while let Some(parent) = get_parent(&root) {
             root = parent;
         }
-        if let Some(window) = self.window_for_surface(&root) {
+        if let Some(window) = comp_core::window_for_surface(self, &root) {
             window.on_commit();
             // THE MAP EDGE (no-phantom-window mint site): root commit + not-yet-mapped +
             // a real buffer → mint once via on_real_map (ToplevelKind::Xdg). Identical to
@@ -866,6 +949,23 @@ impl CompositorHandler for State {
                 if let Some(toplevel) = window.toplevel() {
                     xdg_toplevel_mapped(self, &toplevel.clone());
                 }
+            }
+
+            // M8 — X11 keyboard-focus-on-association (identical to winit's commit
+            // handler). An X11 toplevel minted its handle EARLY in `map_window_request`
+            // (before its wl_surface existed); the X11↔wl_surface association is ASYNC, so
+            // its first commit (this one, with a buffer + a matched window) is where we
+            // give it keyboard focus, ONCE (de-duplicated by the `X11Focused` marker).
+            if &root == surface
+                && window.x11_surface().is_some()
+                && surface_has_buffer(surface)
+                && window.user_data().get::<comp_core::X11Focused>().is_none()
+            {
+                window.user_data().insert_if_missing(|| comp_core::X11Focused);
+                self.space.raise_element(&window, true);
+                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                let keyboard = self.keyboard.clone();
+                keyboard.set_focus(self, Some(root.clone()), serial);
             }
         }
         ensure_initial_configure(self, surface);
@@ -942,7 +1042,7 @@ smithay::delegate_dispatch2!(State);
 /// client can attach a buffer (the map edge). Ported 1:1 from winit.rs.
 fn ensure_initial_configure(state: &mut State, surface: &WlSurface) {
     // xdg toplevel?
-    if let Some(window) = state.window_for_surface(surface) {
+    if let Some(window) = comp_core::window_for_surface(state, surface) {
         if let Some(toplevel) = window.toplevel() {
             let initial_configure_sent = with_states(surface, |states| {
                 states

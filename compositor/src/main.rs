@@ -66,6 +66,17 @@ use std::time::{Duration, Instant};
 #[cfg(any(feature = "winit", feature = "smithay"))]
 mod shared;
 
+// ── Milestone 8 (Stage B): the SHARED compositor brain — the AI-native WM IPC verbs,
+// the input router, the workspace machinery, the keyboard-shortcut actions, the
+// software cursor + screen kill-switch + fade effects, and the render-element z-order,
+// ALL hoisted out of winit.rs and made generic over the backend (the `CompState`
+// trait). ONE implementation feeds BOTH the winit (dev/WSL) and DRM (real-HW)
+// backends — no parallel WM path. Gated to `any(winit, smithay)` (off on the default
+// dev-box build). See src/comp_core.rs for the full rationale + the seat-handle
+// ownership constraint that made a TRAIT (not a shared struct field) the only path. ──
+#[cfg(any(feature = "winit", feature = "smithay"))]
+mod comp_core;
+
 // ── Phase-5 Smithay handler BODIES (CI-COMPILE only) ──
 // The real xdg-shell / XWayland / xdg-decoration / wlr-foreign-toplevel-management
 // handler bodies live in `wayland.rs`, gated behind the `smithay` cargo feature
@@ -95,11 +106,14 @@ mod udev;
 #[cfg(feature = "winit")]
 mod winit;
 
-// ── Milestone 4: the com.hart.Compositor IPC server (Unix-socket twin), wired to
-// the winit Space so an agent arranges REAL native windows. Gated behind the SAME
-// `winit` feature as the live compositor it drives (the IPC handlers mutate
-// `winit::State.space`). Off on the default dev-box build. See src/ipc.rs.
-#[cfg(feature = "winit")]
+// ── Milestone 4 (+ M8): the com.hart.Compositor IPC server (Unix-socket twin) — the
+// framed-JSON transport that lets an agent arrange REAL native windows. M8 made it
+// GENERIC over the backend (via `comp_core::CompState`), so it is gated to
+// `any(winit, smithay)`: BOTH the winit (dev/WSL) and the DRM (real-HW) backends serve
+// the SAME socket surface (the moat on real hardware too). The verb BODIES live in
+// `comp_core`; this is the transport + dispatch. Off on the default dev-box build.
+// See src/ipc.rs.
+#[cfg(any(feature = "winit", feature = "smithay"))]
 mod ipc;
 
 // ── Milestone 6 (headline): zwlr_screencopy_v1 served against HART-comp's OWN

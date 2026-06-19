@@ -60,6 +60,11 @@ default = []
 smithay = [
     "dep:smithay",
     "dep:calloop",
+    # M8 — the com.hart.Compositor IPC server (src/ipc.rs) is now SHARED by both
+    # backends (re-gated to `any(winit, smithay)`), so the DRM build needs its
+    # framed-JSON deps too. Same two crates the winit feature pulls — symmetric.
+    "dep:serde",
+    "dep:serde_json",
     "smithay/backend_drm",
     "smithay/backend_gbm",
     "smithay/backend_libinput",
