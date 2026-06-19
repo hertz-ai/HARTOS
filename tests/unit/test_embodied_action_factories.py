@@ -42,18 +42,41 @@ def test_end_effector_delta_gripper_omitted_when_none():
     assert 'gripper' not in b.params  # omitted, not None
 
 
-def test_world_model_rollout():
-    a = RobotAction.world_model_rollout([{'type': 'motor_velocity'}], horizon=12)
+def test_world_model_rollout_is_language_conditioned():
+    # RobotWorld: language instruction (+ observation) → predicted future
+    a = RobotAction.world_model_rollout('imagine picking up the cube',
+                                        observation={'rgb': 'x'}, horizon=12)
     assert a.action_type == 'world_model_rollout'
+    assert a.params['instruction'] == 'imagine picking up the cube'
     assert a.params['horizon'] == 12
-    assert len(a.params['action_sequence']) == 1
+    assert a.params['observation'] == {'rgb': 'x'}
+
+
+def test_manip_action_80d_masked():
+    # RobotManip canonical 80-D masked state-action
+    a = RobotAction.manip_action([0.0] * 80, mask=[1] * 29 + [0] * 51)
+    assert a.action_type == 'manip_action'
+    assert len(a.params['state_action']) == 80
+    assert len(a.params['mask']) == 80
+    b = RobotAction.manip_action([0.0] * 80)
+    assert 'mask' not in b.params  # omitted when None
+
+
+def test_navigate_defaults_to_eight_waypoints():
+    # RobotNav outputs 8 (x, y, theta) waypoints
+    a = RobotAction.navigate('go to the kitchen')
+    assert a.action_type == 'navigate'
+    assert a.params['goal'] == 'go to the kitchen'
+    assert a.params['num_waypoints'] == 8
 
 
 def test_all_factories_are_bridge_serializable():
     for a in (RobotAction.vla_instruct('go'),
               RobotAction.action_chunk([]),
               RobotAction.end_effector_delta(dx=0.1),
-              RobotAction.world_model_rollout([])):
+              RobotAction.world_model_rollout('imagine'),
+              RobotAction.manip_action([0.0] * 80),
+              RobotAction.navigate('here')):
         d = a.to_dict()
         assert set(d) >= {'type', 'target', 'params', 'source'}
         assert isinstance(d['params'], dict)

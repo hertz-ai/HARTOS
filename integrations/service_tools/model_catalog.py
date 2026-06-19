@@ -646,51 +646,85 @@ class ModelCatalog:
         return added
 
     def _populate_embodied_models(self) -> int:
-        """Embodied / VLA model entries (Qwen-RobotSuite class).
+        """Embodied model entries — Qwen-RobotSuite (THREE foundation models).
 
-        Bootstraps the embodied model's METADATA exactly like an LLM — the policy
-        itself runs INSIDE HevolveAI (raw native intelligence; HARTOS has no ML),
-        so this is purely the catalog record that makes the embodied model
-        discoverable to the admin UI + the orchestrator: its action vocabulary
-        (the RobotAction VLA factories), the sensor modalities it consumes (the
-        SensorReading schema), and the WorldModelBridge endpoints that reach it.
-        Errors dispatching to it propagate through the hive via
-        WorldModelBridge._propagate_embodied_error.
+        RobotSuite is three INDEPENDENT models that run inside HevolveAI (raw
+        native intelligence; HARTOS has no ML): RobotManip (VLA manipulation),
+        RobotWorld (language-conditioned video world model), and RobotNav
+        (navigation). This bootstraps their METADATA exactly like an LLM — the
+        catalog record that makes each discoverable to the admin UI + the
+        orchestrator: its action vocabulary (RobotAction factories), the sensor
+        modalities it consumes (SensorReading schema), and the shared
+        WorldModelBridge endpoints. Errors dispatching to any of them propagate
+        through the hive via WorldModelBridge._propagate_embodied_error.
         """
-        added = 0
-        if 'embodied-qwen-robotsuite' not in self._entries:
-            entry = ModelEntry(
-                id='embodied-qwen-robotsuite',
-                name='Qwen RobotSuite (Embodied VLA + World Model)',
-                model_type=ModelType.EMBODIED, source='pip',
-                repo_id='Qwen/RobotSuite',   # exact repo/version per RobotSuite release
-                vram_gb=4.0, ram_gb=4.0, disk_gb=4.0,
-                min_capability_tier='standard',
-                backend='in_process',        # served by HevolveAI; the bridge routes
-                supports_gpu=True, supports_cpu=True, supports_cpu_offload=True,
-                cpu_offload_method='torch_to_cpu', idle_timeout_s=600,
+        bridge_caps = {
+            'bridge': 'integrations.agent_engine.world_model_bridge.WorldModelBridge',
+            'action_endpoint': '/v1/actions',
+            'sensor_endpoint': '/v1/sensors/batch',
+            'feedback_endpoint': '/v1/feedback/latest',
+        }
+        common = dict(
+            model_type=ModelType.EMBODIED, source='pip', backend='in_process',
+            supports_gpu=True, supports_cpu=True, supports_cpu_offload=True,
+            cpu_offload_method='torch_to_cpu', idle_timeout_s=600,
+            min_capability_tier='standard', tags=['local', 'embodied', 'robotics'],
+        )
+        specs = [
+            dict(  # RobotManip — VLA manipulation: camera + language → low-level actions
+                id='embodied-qwen-robotmanip',
+                name='Qwen-RobotManip (VLA manipulation)',
+                repo_id='QwenLM/Qwen-VLA',
+                vram_gb=8.0, ram_gb=8.0, disk_gb=16.0,
+                quality_score=0.78, speed_score=0.6,
                 capabilities={
-                    # what HARTOS can REQUEST (the RobotAction VLA factories)
-                    'action_verbs': ['vla_instruct', 'action_chunk',
-                                     'end_effector_delta', 'world_model_rollout'],
-                    # what the policy CONSUMES (SensorReading schema modalities)
-                    'sensor_modalities': ['camera', 'depth', 'imu', 'force_torque',
-                                          'proximity', 'encoder', 'lidar'],
-                    'language_conditioned': True,   # VLA: instruction → action
-                    'world_model': True,            # forward state prediction
-                    'closed_loop': True,
-                    'control_hz': 10, 'default_horizon': 8,
-                    # the dual-mode bridge + HevolveAI HTTP endpoints
-                    'bridge': 'integrations.agent_engine.world_model_bridge'
-                              '.WorldModelBridge',
-                    'action_endpoint': '/v1/actions',
-                    'sensor_endpoint': '/v1/sensors/batch',
-                    'feedback_endpoint': '/v1/feedback/latest',
+                    'action_verbs': ['vla_instruct', 'manip_action',
+                                     'action_chunk', 'end_effector_delta'],
+                    'inputs': ['camera', 'language'],
+                    'sensor_modalities': ['camera', 'depth', 'force_torque', 'encoder'],
+                    'language_conditioned': True, 'closed_loop': True, 'control_hz': 10,
+                    # canonical 80-D masked state-action (2×29 per-arm + 22 reserved)
+                    'action_space': '80d_masked', 'action_dims': 80,
+                    'per_arm_dims': 29, 'reserved_dims': 22,
+                    'per_arm_blocks': ['joint_positions', 'end_effector_pose',
+                                       'gripper', 'dexterous_hand'],
                 },
-                quality_score=0.75, speed_score=0.7,
-                tags=['local', 'embodied', 'vla', 'robotics'],
-            )
-            self.register(entry, persist=False)
+            ),
+            dict(  # RobotWorld — language-conditioned video world model
+                id='embodied-qwen-robotworld',
+                name='Qwen-RobotWorld (language-conditioned video world model)',
+                repo_id='Qwen/Qwen-RobotWorld',
+                vram_gb=12.0, ram_gb=12.0, disk_gb=24.0,
+                quality_score=0.75, speed_score=0.4,
+                capabilities={
+                    'action_verbs': ['world_model_rollout'],
+                    'inputs': ['language', 'camera'],
+                    'sensor_modalities': ['camera'],
+                    'language_conditioned': True, 'world_model': True,
+                    'output': 'predicted_video', 'default_horizon': 8,
+                },
+            ),
+            dict(  # RobotNav — navigation → 8 (x, y, theta) waypoints
+                id='embodied-qwen-robotnav',
+                name='Qwen-RobotNav (navigation)',
+                repo_id='QwenLM/Qwen-RobotNav',
+                vram_gb=6.0, ram_gb=6.0, disk_gb=12.0,
+                quality_score=0.74, speed_score=0.7,
+                capabilities={
+                    'action_verbs': ['navigate'],
+                    'inputs': ['camera', 'language'],
+                    'sensor_modalities': ['camera', 'depth', 'lidar', 'imu', 'gps'],
+                    'output': 'waypoints_xytheta', 'num_waypoints': 8,
+                },
+            ),
+        ]
+        added = 0
+        for spec in specs:
+            if spec['id'] in self._entries:
+                continue
+            caps = {**bridge_caps, **spec.pop('capabilities')}
+            self.register(ModelEntry(capabilities=caps, **common, **spec),
+                          persist=False)
             added += 1
         return added
 

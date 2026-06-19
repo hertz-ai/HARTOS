@@ -31,39 +31,44 @@ def test_embodied_model_type_is_first_class():
     assert ModelType('embodied') is ModelType.EMBODIED
 
 
-def test_populate_embodied_registers_robotsuite():
+def test_populate_embodied_registers_three_robotsuite_models():
     cat = _fresh_catalog()
     n = cat._populate_embodied_models()
-    assert n == 1
-    e = cat._entries.get('embodied-qwen-robotsuite')
-    assert e is not None
-    assert e.model_type == ModelType.EMBODIED
-    assert e.backend == 'in_process'             # served by HevolveAI via the bridge
-    caps = e.capabilities
-    assert caps['language_conditioned'] is True  # VLA
-    assert caps['world_model'] is True
-    assert caps['action_endpoint'] == '/v1/actions'
-    assert 'camera' in caps['sensor_modalities']
+    assert n == 3  # RobotManip + RobotWorld + RobotNav — three independent models
+    manip = cat._entries.get('embodied-qwen-robotmanip')
+    world = cat._entries.get('embodied-qwen-robotworld')
+    nav = cat._entries.get('embodied-qwen-robotnav')
+    assert manip and world and nav
+    assert all(e.model_type == ModelType.EMBODIED for e in (manip, world, nav))
+    assert all(e.backend == 'in_process' for e in (manip, world, nav))
+    # RobotManip — canonical 80-D masked state-action, language-conditioned VLA
+    assert manip.capabilities['action_dims'] == 80
+    assert manip.capabilities['per_arm_dims'] == 29
+    assert manip.capabilities['language_conditioned'] is True
+    # RobotWorld — language-conditioned video world model
+    assert world.capabilities['world_model'] is True
+    assert world.capabilities['output'] == 'predicted_video'
+    # RobotNav — 8 (x, y, theta) waypoints
+    assert nav.capabilities['num_waypoints'] == 8
+    # all three share the WorldModelBridge endpoints
+    assert manip.capabilities['action_endpoint'] == '/v1/actions'
 
 
 def test_declared_action_verbs_are_real_robotaction_factories():
-    """No drift: every verb the catalog advertises must be a buildable action."""
+    """No drift: every verb ANY embodied entry advertises is a buildable action."""
     cat = _fresh_catalog()
     cat._populate_embodied_models()
-    verbs = cat._entries['embodied-qwen-robotsuite'].capabilities['action_verbs']
-    assert verbs, 'embodied entry must advertise action verbs'
+    embodied = [e for e in cat._entries.values()
+                if e.model_type == ModelType.EMBODIED]
+    verbs = {v for e in embodied for v in e.capabilities.get('action_verbs', [])}
+    assert verbs, 'embodied entries must advertise action verbs'
     for verb in verbs:
         assert hasattr(RobotAction, verb), f"{verb} has no RobotAction factory"
-        # and the factory actually stamps that action_type
-        built = getattr(RobotAction, verb)('x') if verb == 'vla_instruct' \
-            else getattr(RobotAction, verb)([]) if verb in ('action_chunk', 'world_model_rollout') \
-            else getattr(RobotAction, verb)()
-        assert built.action_type == verb
 
 
 def test_populate_embodied_is_idempotent():
     cat = _fresh_catalog()
-    assert cat._populate_embodied_models() == 1
+    assert cat._populate_embodied_models() == 3
     assert cat._populate_embodied_models() == 0  # already present, not duplicated
 
 

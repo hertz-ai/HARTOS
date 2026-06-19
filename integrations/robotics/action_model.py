@@ -12,16 +12,22 @@ Action types:
   Low-level actuator (executed directly by HevolveAI's native control):
     motor_velocity, servo_position, gpio_output, gripper,
     navigate_to, speak, emergency_stop
-  Embodied / VLA (a Vision-Language-Action model — e.g. Qwen RobotSuite —
-  runs INSIDE HevolveAI; HARTOS requests at this high level, HevolveAI's
+  Embodied / VLA (Qwen-RobotSuite = THREE models inside HevolveAI:
+  RobotManip [VLA manipulation], RobotWorld [language-conditioned video world
+  model], RobotNav [navigation]; HARTOS requests at this high level, HevolveAI's
   policy expands them into the low-level actuator stream above):
-    vla_instruct        — language instruction + observation → policy step
-                          (the embodied analog of an LLM prompt → reply)
+    vla_instruct        — RobotManip: camera + language instruction → low-level
+                          actions (the embodied analog of an LLM prompt → reply)
+    manip_action        — RobotManip: a raw canonical 80-D masked state-action
+                          (two 29-D per-arm blocks: joint positions, end-effector
+                          pose, gripper, dexterous-hand joints; + 22 reserved)
     action_chunk        — execute a chunk of policy-emitted low-level actions
-                          at a fixed control rate (VLA action chunking)
+                          at a fixed control rate (action chunking)
     end_effector_delta  — Cartesian end-effector pose delta + gripper
-    world_model_rollout — forward-predict future states for an action
-                          sequence (planning + early error detection)
+    world_model_rollout — RobotWorld: language instruction → predicted future
+                          rollout (predicted video / latent states; planning +
+                          early error detection)
+    navigate            — RobotNav: goal + observation → 8 (x, y, theta) waypoints
 
 `action_type` is a free string by design — the vocabulary is the HARTOS↔
 HevolveAI contract; HevolveAI's RobotSuite adapter interprets it.  Add a verb
@@ -136,17 +142,46 @@ class RobotAction:
                    params=params, source=source)
 
     @classmethod
-    def world_model_rollout(cls, action_sequence: list, horizon: int = 8,
-                            target: str = '*', source: str = 'agent') -> 'RobotAction':
-        """Forward-predict future states for ``action_sequence`` (no execution).
-
-        Asks HevolveAI's world model to imagine the outcome of a candidate action
-        sequence — used for planning and for early error detection (compare the
-        predicted vs the observed trajectory; large divergence = a fault to
-        propagate through the hive)."""
+    def world_model_rollout(cls, instruction: str, observation: Optional[Dict] = None,
+                            horizon: int = 8, target: str = '*',
+                            source: str = 'agent') -> 'RobotAction':
+        """Qwen-RobotWorld: a language ``instruction`` (+ current observation) →
+        a predicted future rollout.  RobotWorld is a language-conditioned video
+        world model — its output is predicted video / latent future states.  Used
+        for planning AND early error detection: compare the predicted vs the
+        observed trajectory; large divergence = a fault to propagate through the
+        hive."""
         return cls(
             action_type='world_model_rollout', target=target,
-            params={'action_sequence': list(action_sequence),
+            params={'instruction': instruction, 'observation': observation or {},
                     'horizon': int(horizon)},
             source=source,
         )
+
+    @classmethod
+    def manip_action(cls, state_action: list, mask: Optional[list] = None,
+                     target: str = 'arm', source: str = 'agent') -> 'RobotAction':
+        """Qwen-RobotManip canonical masked state-action: an 80-D vector — two
+        29-D per-arm blocks (joint positions, end-effector pose, gripper state,
+        dexterous-hand joints) + 22 reserved — with an optional per-dimension
+        binary ``mask`` selecting which dims are actually commanded.  Send a RAW
+        canonical action (teleop / replay / closed-loop); for language-driven
+        manipulation use ``vla_instruct`` and let RobotManip emit this."""
+        params: Dict[str, Any] = {'state_action': list(state_action)}
+        if mask is not None:
+            params['mask'] = list(mask)
+        return cls(action_type='manip_action', target=target,
+                   params=params, source=source)
+
+    @classmethod
+    def navigate(cls, goal, observation: Optional[Dict] = None,
+                 num_waypoints: int = 8, target: str = 'base',
+                 source: str = 'agent') -> 'RobotAction':
+        """Qwen-RobotNav: a ``goal`` (language and/or (x, y) coordinate) + the
+        current observation → a path of ``num_waypoints`` (x, y, theta) waypoints
+        (RobotNav outputs 8).  Distinct from the low-level ``navigate_to``
+        actuator command (a single waypoint executed directly)."""
+        return cls(action_type='navigate', target=target,
+                   params={'goal': goal, 'observation': observation or {},
+                           'num_waypoints': int(num_waypoints)},
+                   source=source)
