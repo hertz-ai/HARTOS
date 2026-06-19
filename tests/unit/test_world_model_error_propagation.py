@@ -103,3 +103,22 @@ def test_success_does_not_propagate_or_gossip():
         ok = b.send_action(_ok_action())
     assert ok is True
     assert not MockEC.get_instance.return_value.record.called
+
+
+def test_instruct_builds_canonical_vla_action_and_dispatches():
+    """High-level instruct() → RobotAction.vla_instruct → send_action (one call)."""
+    b = _make_bridge()
+    captured = {}
+
+    def fake_send(action):
+        captured['action'] = action
+        return True
+
+    b.send_action = fake_send
+    ok = b.instruct('pick up the red cube', observation={'rgb': 'x'}, horizon=4)
+    assert ok is True
+    a = captured['action']
+    assert a['type'] == 'vla_instruct'
+    assert a['params']['instruction'] == 'pick up the red cube'
+    assert a['params']['horizon'] == 4
+    assert a['params']['observation'] == {'rgb': 'x'}

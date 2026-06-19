@@ -1872,6 +1872,22 @@ class WorldModelBridge:
             self._propagate_embodied_error('send_action', action=action, exc=e)
             return False
 
+    def instruct(self, instruction: str, observation: Optional[Dict] = None,
+                 horizon: int = 8, target: str = '*') -> bool:
+        """High-level embodied 'think + act': hand a natural-language goal + the
+        current observation to the VLA policy (Qwen-RobotSuite class) in ONE call
+        — the embodied analog of asking an LLM a question.
+
+        Builds the canonical ``RobotAction.vla_instruct`` (so the verb is
+        constructed one way, never an inline dict) and dispatches it through
+        ``send_action`` — inheriting the safety gate, the circuit breaker, and the
+        hive error propagation (``_propagate_embodied_error``).  Returns
+        ``send_action``'s success bool."""
+        from integrations.robotics.action_model import RobotAction
+        action = RobotAction.vla_instruct(
+            instruction, observation=observation, horizon=horizon, target=target)
+        return self.send_action(action.to_dict())
+
     def ingest_sensor_batch(self, readings: list) -> int:
         """Feed sensor data to HevolveAI's world model for learning.
 
