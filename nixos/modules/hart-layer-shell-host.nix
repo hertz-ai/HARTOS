@@ -160,6 +160,12 @@ class GlassShellLayer:
         # The background desktop should not steal keyboard focus from native
         # windows on top of it; ON_DEMAND lets the shell take focus only when the
         # user actually interacts with it (clicks the orb / a panel).
+        # NOTE: ON_DEMAND on a BACKGROUND layer means the surface is NOT given
+        # keyboard focus automatically by the compositor — typing only works once
+        # the surface holds focus. So ON_DEMAND MUST be paired with an explicit
+        # self._webview.grab_focus() after present() (below); without that grab,
+        # the layer-shell surface never accepts keystrokes and the caret/typing
+        # are dead even though the WebView renders.
         LayerShell.set_keyboard_mode(
             self._win, LayerShell.KeyboardMode.ON_DEMAND)
 
@@ -187,6 +193,11 @@ class GlassShellLayer:
         self._win.add_controller(keyctl)
         # GTK4: present() (no .show_all()); layer-shell sizes it to the anchors.
         self._win.present()
+        # Explicitly grab keyboard focus into the WebView after present(). With
+        # KeyboardMode.ON_DEMAND on a background layer-shell surface the
+        # compositor does NOT auto-focus us, so without this grab left-clicks
+        # land on a focus-less surface and typing/caret never work.
+        self._webview.grab_focus()
 
     def _on_key(self, _ctrl, keyval, _keycode, _state):
         from gi.repository import Gdk

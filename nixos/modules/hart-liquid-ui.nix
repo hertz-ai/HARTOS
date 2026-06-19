@@ -130,6 +130,11 @@ class GlassShell(Gtk.Window):
         self.connect('key-press-event', self._on_key)
         self.show_all()
         self.fullscreen()
+        # The cage WebView must explicitly grab keyboard focus after the window
+        # is shown/fullscreened — without this the WebView never receives focus,
+        # so left-clicks land on a focus-less surface and typing/caret never work
+        # (dead UI on the live USB). Focus the actual web content, not the window.
+        webview.grab_focus()
 
     def _on_key(self, widget, event):
         from gi.repository import Gdk
