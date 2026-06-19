@@ -79,15 +79,19 @@ let
       lockFile = compositorSrc + "/Cargo.lock";
       # The ONE git-sourced dep is Smithay (rev 4784339…), pulled by the `smithay`
       # cargo feature (buildFeatures below). Nix's fixed-output fetch of a git crate
-      # needs its content hash. `lib.fakeHash` is a DELIBERATE placeholder: the real
-      # sha256 is NOT computable on the Windows/WSL dev box (local nix-build hangs on
-      # /mnt/c), so the FIRST CI `nix build` will FAIL with the "hash mismatch …
-      # got: sha256-…" message that reports the correct value — copy that into the
-      # entry below + push. This is the standard "fakeHash → CI surfaces the real
-      # hash" bootstrap for a git crate, the same loop the ROADMAP names for the
-      # Smithay rev. Keyed by `${pname}-${version}` from Cargo.lock.
+      # needs its content hash. This is the REAL sha256 of the pinned-rev checkout,
+      # resolved off /mnt/c (the local nix-build hang is only on the SOURCE tree, not
+      # on a git fetch into the store): realising the importCargoLock fetchgit
+      # derivation for rev 47843391c3cd34a32e5ed1721878ca2279269185 reported
+      #   got: sha256-44CNdBNGmGqBkCIVRVtJoQljZfn/JF682xAPX4m/2N8=
+      # (cross-checked: `builtins.fetchGit {url;rev;}` + `nix hash path` on the same
+      # rev yields the identical NAR hash — Smithay has no submodules, so the
+      # fetchgit-vs-fetchGit default difference is moot). With this REAL hash the
+      # git crate is reproducibly fetchable, so `hart.comp.enable = true` (or a CI
+      # `nix build .#…config.hart.comp.package`) no longer fails the Smithay-hash
+      # gate. Keyed by `${pname}-${version}` from Cargo.lock.
       outputHashes = {
-        "smithay-0.7.0" = lib.fakeHash;
+        "smithay-0.7.0" = "sha256-44CNdBNGmGqBkCIVRVtJoQljZfn/JF682xAPX4m/2N8=";
       };
     };
 

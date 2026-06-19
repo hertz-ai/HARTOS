@@ -308,10 +308,20 @@ pub struct State {
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
     pub shm_state: ShmState,
+    /// wl_output / xdg-output manager. RAII-HELD: the per-output globals are created
+    /// via `Output::create_global`; `delegate_output!` needs no accessor returning
+    /// this manager, so the field is never read after `new` — held only to keep the
+    /// `xdg_output_manager` global advertised (same as wayland.rs::State).
+    #[allow(dead_code)]
     pub output_manager_state: OutputManagerState,
     pub layer_shell_state: WlrLayerShellState,
     pub data_device_state: DataDeviceState,
     pub seat_state: SeatState<State>,
+    /// The live `wl_seat`. RAII-HELD: input/focus route through the cached
+    /// `keyboard`/`pointer` handles below (extracted from this seat), so the `seat`
+    /// itself is never read again — held only to keep the `wl_seat` global alive
+    /// (same as wayland.rs::State).
+    #[allow(dead_code)]
     pub seat: Seat<State>,
 
     // ── M3: input handles (cached so the loop can route winit input + read the
@@ -322,6 +332,10 @@ pub struct State {
 
     // ── M3: xdg-decoration — negotiate server-side decorations (the compositor owns
     // the chrome). A plain field constructed with `XdgDecorationState::new::<State>`.
+    // RAII-HELD: `XdgDecorationHandler` has no `xdg_decoration_state()` accessor on
+    // this rev, so the field is never read after `new` — held only to keep the
+    // `zxdg_decoration_manager_v1` global advertised (same as wayland.rs::State).
+    #[allow(dead_code)]
     pub xdg_decoration_state: XdgDecorationState,
 
     // ── M3: XWayland (Wine / legacy X11). `xwayland_shell_state` is the X11↔wl_surface

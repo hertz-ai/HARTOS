@@ -151,12 +151,21 @@ pub struct State {
     // ── Smithay protocol state ──
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    /// `xdg-decoration` protocol state. RAII-HELD: `XdgDecorationHandler` has no
+    /// `xdg_decoration_state()` accessor on this rev (the global is registered at
+    /// construction), so the field is never read after `new` — it exists only to
+    /// keep the `zxdg_decoration_manager_v1` global advertised for its lifetime.
+    #[allow(dead_code)]
     pub xdg_decoration_state: XdgDecorationState,
     pub foreign_toplevel_state: ForeignToplevelListState,
     /// Seat protocol state. `seat_state()` (SeatHandler) returns this; the live
-    /// `seat` is created from it. A real field (NOT a stub) — the X11Wm + input
-    /// dispatch borrow it.
+    /// `seat` is created from it.
     pub seat_state: SeatState<State>,
+    /// The live `wl_seat`. RAII-HELD: input dispatch routes through the cached
+    /// `keyboard`/`pointer` handles below (extracted from this seat at
+    /// construction), so the `seat` itself is never read again — it is held only to
+    /// keep the `wl_seat` global alive for the session.
+    #[allow(dead_code)]
     pub seat: Seat<State>,
     /// X11↔wl_surface association protocol state (master `xwayland_shell`). The
     /// X11Wm requires a `XWaylandShellHandler` returning this; a plain field, made
@@ -169,7 +178,11 @@ pub struct State {
     // whole Stage-A boot-floor deliverable. ──
     /// wl_shm — clients (the glass shell, weston-simple-shm) allocate their buffers here.
     pub shm_state: ShmState,
-    /// wl_output / xdg-output — the output advertised to clients (the DRM connector).
+    /// wl_output / xdg-output manager. RAII-HELD: `delegate_output!` needs no
+    /// accessor returning it (the per-output globals are created via
+    /// `Output::create_global` in udev.rs), so the manager field is never read after
+    /// `new` — it is held only to keep the `xdg_output_manager` global advertised.
+    #[allow(dead_code)]
     pub output_manager_state: OutputManagerState,
     /// wlr-layer-shell — the glass-shell desktop mounts as a BACKGROUND layer surface.
     pub layer_shell_state: WlrLayerShellState,

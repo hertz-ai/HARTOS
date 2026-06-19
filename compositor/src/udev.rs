@@ -373,6 +373,18 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Sweep the no-phantom-window timeout (the Phase-5 guarantee on the DRM path):
+        // a `SummonApp` whose toplevel never maps within `SUMMON_MAP_TIMEOUT` resolves
+        // to an HONEST timeout — NEVER a fabricated handle. The pure `is_timed_out_at`
+        // decides; this only feeds it the real clock each tick + reports each timed-out
+        // manifest to the IPC sink (the brain's awaiting SummonApp future is then
+        // completed with error.code="timeout"). This is the same sweep the winit
+        // backend's loop owns — the DRM Tier-1 must not silently drop it, or a Wine
+        // launch that returned 0 but mapped nothing would hang the summon forever.
+        for manifest_id in state.expire_summons(std::time::Instant::now()) {
+            warn!(manifest = %manifest_id, "HART-comp DRM: SummonApp timed out (no toplevel mapped) — honest timeout, no handle");
+        }
+
         // Dispatch the Wayland clients (process their requests into our handlers), refresh
         // the space, and flush. Display dispatched DIRECTLY (no unsafe Generic source).
         if let Err(err) = display.dispatch_clients(&mut state) {
