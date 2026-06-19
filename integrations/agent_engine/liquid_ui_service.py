@@ -2340,6 +2340,10 @@ function openPanel(id, opts) {{
   }}
 
   panels[id] = {{el:panel, x, y, w:sz[0], h:sz[1], max:false, min:false}};
+  // Open MAXIMIZED by default — the glass shell is a full desktop, so panels
+  // should fill the workspace (Win/macOS "open large") rather than a tiny
+  // cascade window. Floating bubbles (assistant) keep their compact size.
+  if(!def.floating && !opts.noMax) applyMax(id);
   bringToFront(id);
   updateTaskbar();
   if(startOpen) toggleStartMenu();
@@ -2447,20 +2451,30 @@ function retryRoutePanel(id) {{
   if(route) renderRoutePanel(id, body, route, def.title||id);
 }}
 
+// Canonical maximize: fill the workspace (below the top bar, above the taskbar).
+function applyMax(id) {{
+  const p = panels[id];
+  if(!p || p.max) return;
+  p.el.style.left = '0'; p.el.style.top = '0';
+  p.el.style.width = '100vw'; p.el.style.height = 'calc(100vh - var(--hart-topbar-height) - 44px)';
+  p.el.style.borderRadius = '0';
+  p.el.classList.add('maximized');
+  p.max = true;
+}}
+// Canonical restore: back to the remembered float geometry.
+function applyRestore(id) {{
+  const p = panels[id];
+  if(!p || !p.max) return;
+  p.el.style.left = p.x+'px'; p.el.style.top = p.y+'px';
+  p.el.style.width = p.w+'px'; p.el.style.height = p.h+'px';
+  p.el.style.borderRadius = '';
+  p.el.classList.remove('maximized');
+  p.max = false;
+}}
 function toggleMax(id) {{
   const p = panels[id];
   if(!p) return;
-  if(p.max) {{
-    p.el.style.left = p.x+'px'; p.el.style.top = p.y+'px';
-    p.el.style.width = p.w+'px'; p.el.style.height = p.h+'px';
-    p.el.style.borderRadius = '';
-    p.max = false;
-  }} else {{
-    p.el.style.left = '0'; p.el.style.top = '0';
-    p.el.style.width = '100vw'; p.el.style.height = 'calc(100vh - var(--hart-topbar-height) - 44px)';
-    p.el.style.borderRadius = '0';
-    p.max = true;
-  }}
+  if(p.max) applyRestore(id); else applyMax(id);
 }}
 
 function bringToFront(id) {{
