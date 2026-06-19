@@ -352,6 +352,7 @@ in
       tappingDragLock = true;    # tap-drag stays engaged across a lift
       naturalScrolling = true;   # match the GNOME dconf natural-scroll above
       clickMethod = "clickfinger";  # 2-finger tap = right, 3 = middle
+      disableWhileTyping = true; # ignore palm/stray taps while typing
     };
   };
 

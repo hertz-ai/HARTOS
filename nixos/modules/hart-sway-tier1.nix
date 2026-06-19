@@ -151,6 +151,21 @@ let
     gaps inner 0
     gaps outer 0
 
+    # Touchpad: tap-to-click (LIVE-OS #19). sway/wlroots reads its pointer config
+    # from this `input` block, NOT services.libinput (which only feeds X11 /
+    # logind seat defaults that GNOME honours). Without `tap enabled` here a tap on
+    # the touch SURFACE does nothing under sway — only the physical button clicks.
+    # Mirrors the cage/seat libinput config in desktop.nix so every tier behaves
+    # the same: tap = left click, two-finger tap = right, natural scroll, DWT on.
+    input "type:touchpad" {
+        tap enabled
+        drag enabled
+        drag_lock enabled
+        natural_scroll enabled
+        click_method clickfinger
+        dwt enabled
+    }
+
     # Launch the glass shell as sway's startup client (fullscreen).
     exec ${swayShellClient}/bin/hart-sway-shell-client
 
