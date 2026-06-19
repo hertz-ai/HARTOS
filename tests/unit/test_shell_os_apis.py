@@ -647,107 +647,60 @@ class TestShellBackup(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════
 
 class TestShellBattery(unittest.TestCase):
-    """Tests for /api/shell/battery and /api/shell/power/lid."""
+    """Tests for /api/shell/battery (shell_system_apis) and
+    /api/shell/power/lid (shell_os_apis).
 
-    @patch('integrations.agent_engine.shell_os_apis.os.path.isdir', return_value=False)
-    def test_battery_status_no_battery(self, _mock_isdir):
-        client = _make_os_app()
-        r = client.get('/api/shell/battery')
+    `/api/shell/battery` moved to shell_system_apis in 01e0b8e; it is served by
+    `_battery_info()`, which reads `psutil.sensors_battery()` then enriches from
+    Linux sysfs via `glob.glob('/sys/class/power_supply/...')`. Its canonical
+    response keys are `present`, `status`, `capacity`, `plugged_in`, `health`
+    (NOT the old `has_battery`/`level`/`charging`/`ac_power`). The lid route is
+    still in shell_os_apis, so those tests keep `_make_os_app()`.
+    """
+
+    def test_battery_status_no_battery(self):
+        """No psutil battery and no sysfs BAT* dirs → present is False."""
+        client = _make_system_app()
+        with patch('psutil.sensors_battery', return_value=None):
+            with patch('glob.glob', return_value=[]):
+                r = client.get('/api/shell/battery')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertFalse(data['has_battery'])
+        self.assertFalse(data['present'])
 
     def test_battery_status_with_battery(self):
-        """Battery endpoint returns level and charging state when battery present."""
-        client = _make_os_app()
-        bat_base = '/sys/class/power_supply'
-        # Use os.path.join so keys match Windows backslash convention
-        file_contents = {
-            os.path.join(bat_base, 'BAT0', 'type'): 'Battery\n',
-            os.path.join(bat_base, 'BAT0', 'capacity'): '75\n',
-            os.path.join(bat_base, 'BAT0', 'status'): 'Charging\n',
-        }
-        _real_isdir = os.path.isdir
-        _real_isfile = os.path.isfile
-        _real_listdir = os.listdir
-        _real_open = open
-
-        def mock_isdir(p):
-            if 'power_supply' in str(p):
-                return p == bat_base
-            return _real_isdir(p)
-
-        def mock_isfile(p):
-            if 'power_supply' in str(p):
-                return p in file_contents
-            return _real_isfile(p)
-
-        def mock_listdir(p):
-            if p == bat_base:
-                return ['BAT0']
-            return _real_listdir(p)
-
-        def smart_open(path, *args, **kwargs):
-            if path in file_contents:
-                from io import StringIO
-                return StringIO(file_contents[path])
-            return _real_open(path, *args, **kwargs)
-
-        with patch('os.path.isdir', side_effect=mock_isdir):
-            with patch('os.path.isfile', side_effect=mock_isfile):
-                with patch('os.listdir', side_effect=mock_listdir):
-                    with patch('builtins.open', side_effect=smart_open):
-                        r = client.get('/api/shell/battery')
+        """Battery endpoint reports capacity and charging status from psutil."""
+        client = _make_system_app()
+        fake_bat = MagicMock()
+        fake_bat.percent = 75
+        fake_bat.power_plugged = True
+        fake_bat.secsleft = -1
+        with patch('psutil.sensors_battery', return_value=fake_bat):
+            # No sysfs enrichment on the test host.
+            with patch('glob.glob', return_value=[]):
+                r = client.get('/api/shell/battery')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertTrue(data['has_battery'])
-        self.assertEqual(data['level'], 75)
-        self.assertEqual(data['charging'], 'Charging')
+        self.assertTrue(data['present'])
+        self.assertEqual(data['capacity'], 75)
+        # plugged_in + percent < 100 → 'charging'
+        self.assertEqual(data['status'], 'charging')
+        self.assertTrue(data['plugged_in'])
 
     def test_battery_ac_power(self):
-        """Battery endpoint returns ac_power field when AC adapter present."""
-        client = _make_os_app()
-        bat_base = '/sys/class/power_supply'
-        file_contents = {
-            os.path.join(bat_base, 'BAT0', 'type'): 'Battery\n',
-            os.path.join(bat_base, 'BAT0', 'capacity'): '90\n',
-            os.path.join(bat_base, 'BAT0', 'status'): 'Full\n',
-            os.path.join(bat_base, 'AC0', 'online'): '1\n',
-        }
-        _real_isdir = os.path.isdir
-        _real_isfile = os.path.isfile
-        _real_listdir = os.listdir
-        _real_open = open
-
-        def mock_isdir(p):
-            if 'power_supply' in str(p):
-                return p == bat_base
-            return _real_isdir(p)
-
-        def mock_isfile(p):
-            if 'power_supply' in str(p):
-                return p in file_contents
-            return _real_isfile(p)
-
-        def mock_listdir(p):
-            if p == bat_base:
-                return ['BAT0']
-            return _real_listdir(p)
-
-        def smart_open(path, *args, **kwargs):
-            if path in file_contents:
-                from io import StringIO
-                return StringIO(file_contents[path])
-            return _real_open(path, *args, **kwargs)
-
-        with patch('os.path.isdir', side_effect=mock_isdir):
-            with patch('os.path.isfile', side_effect=mock_isfile):
-                with patch('os.listdir', side_effect=mock_listdir):
-                    with patch('builtins.open', side_effect=smart_open):
-                        r = client.get('/api/shell/battery')
+        """Full battery on AC reports plugged_in True and status 'full'."""
+        client = _make_system_app()
+        fake_bat = MagicMock()
+        fake_bat.percent = 100
+        fake_bat.power_plugged = True
+        fake_bat.secsleft = -1
+        with patch('psutil.sensors_battery', return_value=fake_bat):
+            with patch('glob.glob', return_value=[]):
+                r = client.get('/api/shell/battery')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertTrue(data.get('ac_power'))
+        self.assertTrue(data['plugged_in'])
+        self.assertEqual(data['status'], 'full')
 
     def test_lid_get_default(self):
         client = _make_os_app()
@@ -778,53 +731,69 @@ class TestShellBattery(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════
 
 class TestShellWiFi(unittest.TestCase):
-    """Tests for /api/shell/wifi/* routes."""
+    """Tests for the canonical /api/shell/wifi/* routes (shell_system_apis).
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    WiFi moved to shell_system_apis in 01e0b8e. The scan route is
+    GET /api/shell/wifi/networks (NOT .../scan); it shells out via the module's
+    `_run` (→ shell_system_apis.subprocess.run) with
+    `nmcli -t -f SSID,SIGNAL,SECURITY,FREQ,BSSID device wifi list` and returns
+    `{'networks': [{ssid, signal, security, frequency}], 'count': N}`. When nmcli
+    is absent `_run` returns None → an empty `networks` list with NO `error` key.
+    Connect returns `{'connected': True, 'ssid': ...}`; status returns
+    `{enabled, connected, ssid, signal, frequency, ip}`.
+    """
+
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_wifi_scan_returns_networks(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
-        proc.stdout = 'MyNet:85:WPA2:AA:BB:CC\nOpenNet:60::DD:EE:FF\n'
+        # nmcli -t -f SSID,SIGNAL,SECURITY,FREQ,BSSID ...
+        proc.stdout = ('MyNet:85:WPA2:5180 MHz:AA:BB:CC\n'
+                       'OpenNet:60::2412 MHz:DD:EE:FF\n')
         proc.stderr = ''
         mock_sub.run.return_value = proc
         mock_sub.TimeoutExpired = Exception
-        r = client.get('/api/shell/wifi/scan')
+        r = client.get('/api/shell/wifi/networks')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertEqual(len(data['networks']), 2)
+        self.assertEqual(data['count'], 2)
+        # Sorted by signal descending → MyNet (85) first.
         self.assertEqual(data['networks'][0]['ssid'], 'MyNet')
         self.assertEqual(data['networks'][0]['signal'], 85)
         self.assertEqual(data['networks'][0]['security'], 'WPA2')
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_wifi_scan_empty(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = ''
         proc.stderr = ''
         mock_sub.run.return_value = proc
         mock_sub.TimeoutExpired = Exception
-        r = client.get('/api/shell/wifi/scan')
+        r = client.get('/api/shell/wifi/networks')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertEqual(data['networks'], [])
+        self.assertEqual(data['count'], 0)
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_wifi_scan_nmcli_not_found(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
+        # _run swallows FileNotFoundError → None → empty network list.
         mock_sub.run.side_effect = FileNotFoundError
         mock_sub.TimeoutExpired = Exception
-        r = client.get('/api/shell/wifi/scan')
+        r = client.get('/api/shell/wifi/networks')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertEqual(data['networks'], [])
-        self.assertEqual(data['error'], 'nmcli not available')
+        self.assertEqual(data['count'], 0)
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_wifi_connect_success(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = 'successfully activated'
@@ -835,31 +804,47 @@ class TestShellWiFi(unittest.TestCase):
                         json={'ssid': 'MyNet', 'password': '1234'})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['status'], 'connected')
+        self.assertTrue(data['connected'])
         self.assertEqual(data['ssid'], 'MyNet')
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_wifi_connect_missing_ssid(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         r = client.post('/api/shell/wifi/connect', json={})
         self.assertEqual(r.status_code, 400)
         data = json.loads(r.data)
         self.assertIn('error', data)
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_wifi_status(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
-        proc.stdout = 'MyNet:802-11-wireless:wlan0:activated\n'
+        # radio check then `nmcli -t -f ACTIVE,SSID,SIGNAL,FREQ device wifi`.
+        proc.stdout = 'enabled\n'
         proc.stderr = ''
-        mock_sub.run.return_value = proc
+
+        def run_side_effect(cmd, *a, **kw):
+            p = MagicMock()
+            p.returncode = 0
+            p.stderr = ''
+            if cmd[:3] == ['nmcli', 'radio', 'wifi']:
+                p.stdout = 'enabled\n'
+            elif 'ACTIVE,SSID,SIGNAL,FREQ' in cmd:
+                p.stdout = 'yes:MyNet:85:5180 MHz\n'
+            else:
+                p.stdout = 'IP4.ADDRESS[1]:192.168.1.5/24\n'
+            return p
+
+        mock_sub.run.side_effect = run_side_effect
+        mock_sub.TimeoutExpired = Exception
         r = client.get('/api/shell/wifi/status')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
+        self.assertTrue(data['enabled'])
         self.assertTrue(data['connected'])
-        self.assertEqual(data['connection']['name'], 'MyNet')
-        self.assertEqual(data['connection']['device'], 'wlan0')
+        self.assertEqual(data['ssid'], 'MyNet')
+        self.assertEqual(data['signal'], 85)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -867,25 +852,37 @@ class TestShellWiFi(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════
 
 class TestShellVPN(unittest.TestCase):
-    """Tests for /api/shell/vpn/* routes."""
+    """Tests for the canonical /api/shell/vpn/* routes (shell_system_apis).
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    VPN moved to shell_system_apis in 01e0b8e. `list` parses
+    `nmcli -t -f NAME,TYPE,ACTIVE connection show` and returns
+    `{'connections': [{name, type, active}]}` (NOT `vpns`). `connect`/`disconnect`
+    both require a `name` body field and return `{'connected': True, 'name': ...}`
+    / `{'disconnected': True}`. `import` takes `config_path` (NOT `path`), checks
+    `os.path.isfile`, and returns `{'imported': True, 'name': ...}`.
+    """
+
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_vpn_list(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
-        proc.stdout = 'MyVPN:vpn:activated\nWork:vpn:deactivated\n'
+        # nmcli -t -f NAME,TYPE,ACTIVE connection show
+        proc.stdout = 'MyVPN:vpn:yes\nWork:vpn:no\nEth:ethernet:no\n'
         proc.stderr = ''
         mock_sub.run.return_value = proc
+        mock_sub.TimeoutExpired = Exception
         r = client.get('/api/shell/vpn/list')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(len(data['vpns']), 2)
-        self.assertEqual(data['vpns'][0]['name'], 'MyVPN')
+        # Only the two vpn-typed rows are returned.
+        self.assertEqual(len(data['connections']), 2)
+        self.assertEqual(data['connections'][0]['name'], 'MyVPN')
+        self.assertTrue(data['connections'][0]['active'])
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_vpn_connect_success(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = 'Connection successfully activated'
@@ -895,44 +892,48 @@ class TestShellVPN(unittest.TestCase):
         r = client.post('/api/shell/vpn/connect', json={'name': 'MyVPN'})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['status'], 'connected')
+        self.assertTrue(data['connected'])
         self.assertEqual(data['name'], 'MyVPN')
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_vpn_connect_missing_name(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         r = client.post('/api/shell/vpn/connect', json={})
         self.assertEqual(r.status_code, 400)
         data = json.loads(r.data)
         self.assertIn('error', data)
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_vpn_disconnect(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = 'Connection successfully deactivated'
         proc.stderr = ''
         mock_sub.run.return_value = proc
+        mock_sub.TimeoutExpired = Exception
         r = client.post('/api/shell/vpn/disconnect', json={'name': 'MyVPN'})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['status'], 'disconnected')
+        self.assertTrue(data['disconnected'])
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
-    @patch('integrations.agent_engine.shell_os_apis.os.path.isfile', return_value=True)
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.os.path.isfile', return_value=True)
     def test_vpn_import_wireguard(self, _mock_isfile, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
-        proc.stdout = 'Connection imported'
+        # nmcli echoes the new connection name in single quotes.
+        proc.stdout = "Connection 'test' (uuid) successfully added."
         proc.stderr = ''
         mock_sub.run.return_value = proc
+        mock_sub.TimeoutExpired = Exception
         r = client.post('/api/shell/vpn/import',
-                        json={'path': '/tmp/test.conf'})
+                        json={'config_path': '/tmp/test.conf', 'type': 'wireguard'})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['status'], 'imported')
+        self.assertTrue(data['imported'])
+        self.assertEqual(data['name'], 'test')
 
 
 # ═══════════════════════════════════════════════════════════════
