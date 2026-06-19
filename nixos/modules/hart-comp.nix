@@ -59,27 +59,36 @@ let
 
   # ── The HART-comp package (buildRustPackage of compositor/) ──
   #
-  # NOTE: compositor/ ships a COMMITTED Cargo.lock (committed in 60d04a7;
-  # registry-only deps — tracing/tracing-subscriber). So this package uses the
-  # reproducible cargoLock.lockFile model — the SAME idiom as
-  # hart-rust-precedent.nix (claw_native/rust). Both Rust-in-Nix crates now use
-  # lockFile, the one correct/DRY path; no hand-maintained cargoHash that drifts.
+  # NOTE: post the M1 forward-port the committed Cargo.lock is NO LONGER
+  # registry-only — it now has 245 packages including the GIT Smithay dep pinned to
+  # rev 47843391c3cd34a32e5ed1721878ca2279269185 (the `smithay`/`winit` cargo features
+  # pull it). So a future reader must NOT "simplify" the outputHashes entry below
+  # away — it is load-bearing for the smithay-feature resolution. This package uses
+  # the reproducible cargoLock.lockFile model (the SAME idiom as
+  # hart-rust-precedent.nix), PLUS an explicit `outputHashes` for the one git dep.
   hartCompPkg = pkgs.rustPlatform.buildRustPackage {
     pname = "hart-comp";
     version = "0.1.0";
 
     src = compositorSrc;
 
-    # compositor/ now ships a COMMITTED Cargo.lock (registry-only deps), so use
-    # the reproducible cargoLock.lockFile path — the SAME idiom as
-    # hart-rust-precedent.nix. This replaces the old all-A cargoHash placeholder
-    # that would have FAILED the first `nix build` (it was written when the crate
-    # shipped no lock; the lock landed in 60d04a7 without updating this module).
+    # compositor/ ships a COMMITTED Cargo.lock (now 245 packages incl. the git
+    # Smithay rev), so use the reproducible cargoLock.lockFile path — the SAME idiom
+    # as hart-rust-precedent.nix.
     cargoLock = {
       lockFile = compositorSrc + "/Cargo.lock";
-      # Forward-safety for any future git-sourced dep; current lock is
-      # registry-only (mirrors the precedent module).
-      allowBuiltinFetchGit = true;
+      # The ONE git-sourced dep is Smithay (rev 4784339…), pulled by the `smithay`
+      # cargo feature (buildFeatures below). Nix's fixed-output fetch of a git crate
+      # needs its content hash. `lib.fakeHash` is a DELIBERATE placeholder: the real
+      # sha256 is NOT computable on the Windows/WSL dev box (local nix-build hangs on
+      # /mnt/c), so the FIRST CI `nix build` will FAIL with the "hash mismatch …
+      # got: sha256-…" message that reports the correct value — copy that into the
+      # entry below + push. This is the standard "fakeHash → CI surfaces the real
+      # hash" bootstrap for a git crate, the same loop the ROADMAP names for the
+      # Smithay rev. Keyed by `${pname}-${version}` from Cargo.lock.
+      outputHashes = {
+        "smithay-0.7.0" = lib.fakeHash;
+      };
     };
 
     # Smithay's build needs the Wayland/DRM/input/render C libraries on Linux.
@@ -94,46 +103,51 @@ let
       libxkbcommon
       pixman              # MANDATORY software-render path (never-fail floor)
       libdrm
-      mesa                # GBM + the optional hardware GL path
-      seatd               # libseat session/seat management
-      udev                # device hotplug
-      # ── Phase 5 (native toplevels) — added when the Smithay `xwayland` feature
-      # is uncommented in compositor/Cargo.toml at CI bring-up (today the feature
-      # is a commented manifest + the handler bodies are todo!()/unwired, so these
-      # are NOT yet needed to build the pure-logic skeleton). xwayland + the X11
-      # client libs back the XWayland path that surfaces Wine/legacy-X11 toplevels;
-      # xdg-shell / xdg-decoration / wlr-layer-shell / wlr-foreign-toplevel-
-      # management need no extra C dep (they ride wayland-protocols above):
-      #   xwayland xorg.libX11 xorg.libxcb xorg.xcbutilwm
+      mesa                # GBM (libgbm ships in mesa) for the DRM scanout allocator
+      seatd               # provides libseat (the backend_session_libseat C dep)
+      libseat             # explicit libseat so pkg-config finds it on this pin
+      udev                # device hotplug (backend_udev)
+      # ── M7: native-toplevel XWayland C deps. The `smithay` cargo feature enables
+      # `smithay/xwayland`, which links against an X11 client stack, so these MUST be
+      # present or the link fails. xdg-shell / xdg-decoration / wlr-layer-shell /
+      # wlr-foreign-toplevel-management need no extra C dep (they ride
+      # wayland-protocols above). Uncommented at the M7 bring-up together with
+      # buildFeatures = [ "smithay" ] below.
+      xwayland
+      xorg.libX11
+      xorg.libxcb
+      xorg.xcbutilwm
     ]);
 
-    # ── Phase-5 native-toplevel feature (src/wayland.rs) ──
-    # The real Smithay handler bodies (xdg-shell / XWayland / xdg-decoration /
-    # wlr-foreign-toplevel-management trait impls + the live summon orchestration)
-    # live in compositor/src/wayland.rs behind `#![cfg(feature = "smithay")]`. They
-    # compile ONLY when the `smithay` cargo feature is on — which is ALSO when the
-    # git-Smithay dep + the xwayland C deps below get uncommented (one CI step). Until
-    # that bring-up, buildFeatures stays EMPTY so the default build is the pure-logic
-    # skeleton (no git-Smithay fetch, no Wayland link) and the dev box / this eval
-    # path never need Smithay. At Phase-5 CI bring-up, set:
-    #   buildFeatures = [ "smithay" ];
-    # together with uncommenting the smithay/calloop deps in Cargo.toml and the
-    # xwayland C libs below. We do NOT set it here (the build must stay resolvable on
-    # the pinned toolchain WITHOUT git-Smithay until the rev is pinned + vendored).
-    buildFeatures = [ ];
+    # ── M7: the real-hardware DRM backend feature (src/wayland.rs + src/udev.rs) ──
+    # The real Smithay handler bodies (compositor/shm/output/layer/xdg-shell/XWayland/
+    # decoration/foreign-toplevel + the DRM/KMS scanout run loop on the PixmanRenderer
+    # software floor) live behind `#[cfg(feature = "smithay")]`. They compile ONLY when
+    # the `smithay` cargo feature is on — which pulls the git-Smithay dep (resolved via
+    # the cargoLock.outputHashes entry above) + needs the xwayland C deps above. M7
+    # turns it ON: the DRM path now COMPILES green (verified in WSL: `cargo build
+    # --features smithay` exits 0; it cannot RUN there — no DRM device — that is the
+    # flash's job). `doCheck` below runs the pure-logic floor (main.rs #[cfg(test)],
+    # feature-independent), so the smithay-only modules are type-checked by the build
+    # but the unit tests stay the backend-agnostic invariants.
+    buildFeatures = [ "smithay" ];
 
-    # The skeleton's pure-logic unit tests (render-path selection / splash alpha /
-    # the no-phantom-window WindowRegistry + SummonResolver invariants) run in the
-    # build; the real paint/scanout/toplevel-map proof is the nixosTest VM. doCheck
+    # The pure-logic unit tests (render-path selection / splash alpha / the
+    # no-phantom-window WindowRegistry + SummonResolver invariants) run in the build;
+    # the real paint/scanout/toplevel-map proof is the flash onto hardware. doCheck
     # stays ON so the never-fail-floor + no-phantom-window invariant tests gate every
-    # build. (Feature-OFF, so cargo test compiles only main.rs + its #[cfg(test)];
-    # wayland.rs is excluded until the smithay feature is on in CI.)
+    # build. With buildFeatures = [ "smithay" ] now ON, `cargo test --features smithay`
+    # COMPILES the DRM modules (wayland.rs + udev.rs) AND runs the 19 feature-
+    # independent tests in main.rs — so the build both type-checks the DRM path and
+    # asserts the backend-agnostic invariants. (Verified in WSL: cargo test green at
+    # default; the smithay modules compile under --features smithay.)
     doCheck = true;
 
     meta = {
       description =
-        "HART OS AI-native Wayland compositor (Smithay) — Tier-1, opt-in, "
-        + "compile-pending skeleton; software-render floor + com.hart.Compositor IPC";
+        "HART OS AI-native Wayland compositor (Smithay) — Tier-1, opt-in; "
+        + "real-HW DRM/KMS scanout on the pixman software-render floor + "
+        + "com.hart.Compositor IPC";
       license = lib.licenses.mit;
       platforms = lib.platforms.linux;
       mainProgram = "hart-comp";
@@ -152,6 +166,9 @@ let
   # owned by the security task) — NOT re-implemented here. This launcher is the thin
   # exec wrapper; it inherits the constitution gate from the session boot path.
   compSessionLauncher = pkgs.writeShellScriptBin "hart-comp-session" ''
+    set -u
+    PATH=${lib.makeBinPath (with pkgs; [ coreutils ])}:$PATH
+
     # Mandatory software-render floor — same contract as cage Tier-3 + sway Tier-2.
     # HART-comp's pixman path is type-checked (not an env prayer), but we ALSO pass
     # --force-software + set the shared env so the decision is unambiguous and a
@@ -160,7 +177,49 @@ let
     export WLR_NO_HARDWARE_CURSORS=1
     ${lib.optionalString (!(ui.preferHardwareGL or false)) "export LIBGL_ALWAYS_SOFTWARE=1"}
     export HART_COMP_FORCE_SOFTWARE=${if (ui.preferHardwareGL or false) then "0" else "1"}
-    exec ${hartCompPkg}/bin/hart-comp ${lib.optionalString (!(ui.preferHardwareGL or false)) "--force-software"}
+
+    # ── M7: Tier-1 is the REAL-HARDWARE DRM backend (`--backend drm`) — NOT the winit
+    # dev backend (which needs a host Wayland socket that does not exist on a bare TTY).
+    # hart-comp owns DRM/KMS scanout + the libinput seat; it creates its OWN wayland-N
+    # socket. We run it in the BACKGROUND, wait for that socket to appear (it sets
+    # WAYLAND_DISPLAY in its own env, but a sibling child needs the name explicitly), and
+    # launch the canonical glass shell as its layer-shell client — exactly how sway
+    # Tier-2 launches `hart-glass-shell` as ITS client (the SINGLE glass-shell renderer,
+    # no parallel client). HART_COMP_NO_TEST_CLIENT suppresses the dev auto-foot client.
+    : "''${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+    export XDG_RUNTIME_DIR
+    export HART_COMP_NO_TEST_CLIENT=1
+
+    ${hartCompPkg}/bin/hart-comp --backend drm ${lib.optionalString (!(ui.preferHardwareGL or false)) "--force-software"} &
+    HART_COMP_PID=$!
+
+    # Wait (bounded) for hart-comp to create its wayland socket, then point the glass
+    # shell at it. The socket is the first wayland-N in XDG_RUNTIME_DIR that hart-comp
+    # created (it logs the name; we discover it by polling the runtime dir).
+    SHELL_SOCK=""
+    for _ in $(seq 1 50); do
+      # Newest wayland-N socket in the runtime dir (hart-comp's auto socket).
+      SHELL_SOCK=$(ls -t "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v '\.lock$' | head -1 || true)
+      [ -n "$SHELL_SOCK" ] && [ -S "$SHELL_SOCK" ] && break
+      # Bail early if the compositor died (the supervisor counts this as a crash).
+      kill -0 "$HART_COMP_PID" 2>/dev/null || break
+      sleep 0.2
+    done
+
+    if [ -n "$SHELL_SOCK" ] && [ -S "$SHELL_SOCK" ]; then
+      export WAYLAND_DISPLAY="$(basename "$SHELL_SOCK")"
+      if command -v hart-glass-shell >/dev/null 2>&1; then
+        hart-glass-shell &
+      else
+        echo "hart-comp-session: hart-glass-shell not on PATH (enable hart.liquidUI)" >&2
+      fi
+    else
+      echo "hart-comp-session: hart-comp did not create a wayland socket — exiting so the supervisor drops a tier" >&2
+    fi
+
+    # Foreground the compositor: when it EXITS, control returns to the selector wrapper,
+    # which counts a fast exit as a crash and drops a tier (never a blank screen).
+    wait "$HART_COMP_PID"
   '';
 
   compSessionDesktop = pkgs.writeText "hart-comp.desktop" ''
@@ -245,15 +304,22 @@ in
       # all stay selectable (the full never-fail ladder).
       services.displayManager.sessionPackages = [ compSession ];
 
-      # ── Integration contract with the Phase-1 tier-drop supervisor ──
-      # hart-session-supervisor.nix's `compCommand` option (Tier-1 launcher,
-      # default null = "slot reserved, falls through to sway/cage") should be
-      # pointed at THIS module's `hart-comp-session` ONLY after the compositor's
-      # software-render path is VM-proven on llvmpipe. Until then it stays null so
-      # the supervisor falls straight through to a tier that paints. The launcher
-      # is on PATH when hart.comp.enable is set. We do NOT edit the supervisor here
-      # (separate module/owner); the operator/config wires
-      # `hart.sessionSupervisor.compCommand = "hart-comp-session"` post-VM-proof.
+      # ── M7: wire HART-comp as the Tier-1 rung of the B4 tier-drop supervisor ──
+      # hart-session-supervisor.nix's ladder is [ "hart-comp" "sway" "cage" ]; its
+      # `compCommand` defaults to null = "slot reserved, falls straight through to
+      # sway/cage". We point it at THIS module's `hart-comp-session` launcher (the
+      # --backend drm session above) via mkDefault, so when the steward arms Tier-1
+      # (hart.comp.enable = true) the supervisor's `tier_available "hart-comp"`
+      # returns true and HART-comp becomes the real Tier-1 — and a crash-loop drops
+      # hart-comp → sway → cage, NEVER a blank screen (the supervisor's invariant).
+      # mkDefault so an explicit operator override still wins; the launcher is on PATH
+      # via environment.systemPackages above. This is gated under hart.comp.enable
+      # (default false), so shipped images still default to cage until armed —
+      # defaultSession is untouched here (the supervisor owns session selection, and
+      # it only PROMOTES hart-comp when its launch SUCCEEDS; a DRM-less box falls
+      # through to sway/cage on the launcher's early exit).
+      hart.sessionSupervisor.compCommand =
+        lib.mkDefault "${compSessionLauncher}/bin/hart-comp-session";
 
       # com.hart.Compositor D-Bus policy (the IPC the brain's HartWmClient drives in
       # Phase 6). Declared so the bus name is reserved + the policy is in place when

@@ -105,6 +105,19 @@
       ./modules/hart-onboarding.nix
       # Runtime self-build (OS rebuilds itself live)
       ./modules/hart-self-build.nix
+      # ── HART-comp: the AI-native Smithay/Rust Tier-1 compositor (THE MOAT) ──
+      # The FIRST Rust-in-Nix build. hart-rust-precedent.nix proves the pinned
+      # toolchain resolves a real crate graph (claw_native/rust) FIRST; hart-comp.nix
+      # builds compositor/ (the DRM/KMS Wayland compositor) via buildRustPackage with
+      # buildFeatures = [ "smithay" ]. BOTH are imported so their options exist + the
+      # hart-comp assertion (`config.hart.rustPrecedent.enable`) resolves; BOTH default
+      # OFF (hart.comp.enable / hart.rustPrecedent.enable = false), so they are a pure
+      # no-op for every variant until the steward arms Tier-1. defaultSession STAYS
+      # cage; hart-comp.nix only ADDS a greeter-selectable session + the supervisor's
+      # Tier-1 rung. (M7: the DRM backend + run path now COMPILE; the package is
+      # CI-gated via `nix build .#…config.hart.comp.package` + the flake eval here.)
+      ./modules/hart-rust-precedent.nix
+      ./modules/hart-comp.nix
     ];
 
     # Single source of truth for nixpkgs config (allowUnfree etc.).  Kept OUT of
