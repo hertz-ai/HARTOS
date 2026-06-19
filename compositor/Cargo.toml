@@ -84,6 +84,11 @@ winit = [
     "smithay/backend_winit",
     "smithay/renderer_gl",
     "smithay/backend_egl",
+    # M3 — XWayland (Wine / legacy X11) on the winit path. `xwayland` transitively
+    # enables `x11rb_event_source` (the calloop X11 source the XWayland event loop
+    # needs), so no separate passthrough is required. This pulls smithay's xwayland
+    # module + the `Window::new_x11_window`/`x11_surface` accessors into the build.
+    "smithay/xwayland",
 ]
 
 [dependencies]

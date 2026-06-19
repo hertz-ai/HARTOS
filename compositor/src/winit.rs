@@ -39,10 +39,14 @@ use std::time::{Duration, Instant};
 
 use smithay::{
     backend::{
+        input::{
+            AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
+            KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        },
         renderer::{
             Color32F, Frame, Renderer,
             element::{
-                Kind,
+                AsRenderElements, Kind,
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             },
             gles::GlesRenderer,
@@ -51,7 +55,11 @@ use smithay::{
         winit::{self, WinitEvent},
     },
     desktop::{Space, Window, WindowSurfaceType},
-    input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
+    input::{
+        Seat, SeatHandler, SeatState,
+        keyboard::{FilterResult, KeyboardHandle},
+        pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle},
+    },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{EventLoop, LoopHandle},
@@ -62,7 +70,7 @@ use smithay::{
             Client,
         },
     },
-    utils::{Serial, Transform},
+    utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -76,21 +84,37 @@ use smithay::{
         },
         shell::{
             wlr_layer::{
-                Layer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler, WlrLayerShellState,
+                Layer as WlrLayer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler,
+                WlrLayerShellState,
             },
             xdg::{
                 PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
                 XdgToplevelSurfaceData,
+                decoration::{XdgDecorationHandler, XdgDecorationState},
             },
         },
         shm::{ShmHandler, ShmState},
         socket::ListeningSocketSource,
     },
 };
-use smithay::desktop::LayerSurface;
+use smithay::desktop::{LayerSurface, layer_map_for_output};
 // `Window::wl_surface()` is provided by the `WaylandFocus` trait on this rev (not
 // an inherent method) — it MUST be in scope for `window_for_surface` to call it.
 use smithay::wayland::seat::WaylandFocus;
+// xdg-decoration mode enum (server-side vs client-side) — the SSD negotiation in
+// `XdgDecorationHandler` below.
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+// ── XWayland (Wine / legacy X11): the headline M3 feature. These types only exist
+// when the `smithay/xwayland` feature is enabled (added to the `winit` cargo feature
+// in Cargo.toml). The X11Wm routes X11 surface map/unmap through `XwmHandler`; the
+// XWaylandShell association protocol + the DnD grab hand-off are `start_wm` bounds.
+use smithay::xwayland::{
+    X11Surface, X11Wm, XWayland, XWaylandClientData, XWaylandEvent,
+    xwm::{Reorder, ResizeEdge as X11ResizeEdge, XwmHandler, XwmId},
+};
+use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
+use smithay::input::dnd::DndGrabHandler;
+use std::process::Stdio;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -139,6 +163,26 @@ pub struct State {
     pub seat_state: SeatState<State>,
     pub seat: Seat<State>,
 
+    // ── M3: input handles (cached so the loop can route winit input + read the
+    // cursor position for click-to-focus). `pointer.current_location()` is the
+    // hit-test origin; both are cheap clones of the seat's handles.
+    pub pointer: PointerHandle<State>,
+    pub keyboard: KeyboardHandle<State>,
+
+    // ── M3: xdg-decoration — negotiate server-side decorations (the compositor owns
+    // the chrome). A plain field constructed with `XdgDecorationState::new::<State>`.
+    pub xdg_decoration_state: XdgDecorationState,
+
+    // ── M3: XWayland (Wine / legacy X11). `xwayland_shell_state` is the X11↔wl_surface
+    // association protocol (a `start_wm` bound); `xwm` is the live X11 window manager,
+    // `None` until `XWaylandEvent::Ready` attaches it.
+    pub xwayland_shell_state: XWaylandShellState,
+    pub xwm: Option<X11Wm>,
+
+    // ── M3: cascade placement cursor — each newly-mapped toplevel is offset from the
+    // last so multiple windows don't fully overlap (the "MULTIPLE WINDOWS" gate).
+    pub next_window_loc: Point<i32, Logical>,
+
     /// The single winit output (the HART-comp window inside WSLg).
     pub output: Output,
 }
@@ -170,6 +214,246 @@ impl State {
         info!(handle = handle.as_str(), "window.opened (toplevel mapped + painted)");
         handle
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // M3 — multi-window placement
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Cascade the next toplevel's initial position so multiple windows don't fully
+    /// overlap (the "tile or cascade" gate). Advances a diagonal cursor by a fixed
+    /// step, wrapping back near the origin before it walks off the bottom-right of the
+    /// output. Pure placement policy — the AI-native WM (Phase 6 IPC) refines it later.
+    fn next_cascade_loc(&mut self) -> Point<i32, Logical> {
+        // A generous diagonal step so multiple windows are CLEARLY distinct (not just
+        // a hairline offset). Tuned for the 1280x800 dev output; the AI-native WM
+        // (Phase 6 IPC) refines real placement later.
+        const STEP_X: i32 = 230;
+        const STEP_Y: i32 = 150;
+        const MARGIN: i32 = 16;
+        let loc = self.next_window_loc;
+        let out_size = self
+            .space
+            .output_geometry(&self.output)
+            .map(|g| g.size)
+            .unwrap_or((1280, 800).into());
+        // Advance the cascade cursor; wrap back near the origin (offset slightly each
+        // wrap is overkill for M3) before it walks off the bottom-right.
+        let mut next = Point::from((loc.x + STEP_X, loc.y + STEP_Y));
+        if next.x + 200 > out_size.w || next.y + 150 > out_size.h {
+            next = Point::from((MARGIN, MARGIN));
+        }
+        self.next_window_loc = next;
+        loc
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // M3 — input routing (keyboard focus + pointer hit-test + click-to-focus)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Hit-test the surface under `pos` for POINTER focus, honouring z-order:
+    /// Overlay/Top layer surfaces first, then mapped toplevels (newest on top via the
+    /// space), then Bottom/Background layer surfaces. Returns the bare `WlSurface`
+    /// (winit's `PointerFocus = WlSurface`, so no focus-target enum is needed) plus
+    /// the surface-local origin the pointer handle wants. Modelled on anvil's
+    /// `surface_under` (trimmed: no FullscreenSurface, single output).
+    fn surface_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let output = &self.output;
+        let output_geo = self.space.output_geometry(output)?;
+        let layers = layer_map_for_output(output);
+
+        // Overlay / Top layer surfaces sit above the toplevels.
+        if let Some(layer) = layers
+            .layer_under(WlrLayer::Overlay, pos)
+            .or_else(|| layers.layer_under(WlrLayer::Top, pos))
+        {
+            let layer_loc = layers.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
+            if let Some((surface, loc)) =
+                layer.surface_under(pos - layer_loc.to_f64(), WindowSurfaceType::ALL)
+            {
+                return Some((surface, (loc + layer_loc).to_f64()));
+            }
+        }
+
+        // Mapped toplevels (xdg + X11), in the space's stacking order.
+        if let Some((window, win_loc)) = self.space.element_under(pos) {
+            if let Some((surface, surf_loc)) =
+                window.surface_under(pos - win_loc.to_f64(), WindowSurfaceType::ALL)
+            {
+                return Some((surface, (surf_loc + win_loc).to_f64()));
+            }
+        }
+
+        // Bottom / Background layer surfaces (the glass-shell desktop) sit below.
+        if let Some(layer) = layers
+            .layer_under(WlrLayer::Bottom, pos)
+            .or_else(|| layers.layer_under(WlrLayer::Background, pos))
+        {
+            let layer_loc = layers.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
+            if let Some((surface, loc)) =
+                layer.surface_under(pos - layer_loc.to_f64(), WindowSurfaceType::ALL)
+            {
+                return Some((surface, (loc + layer_loc).to_f64()));
+            }
+        }
+        let _ = output_geo;
+        None
+    }
+
+    /// Move the KEYBOARD focus to whatever is under `pos` (called on click), raising a
+    /// clicked toplevel to the top of the stack (click-to-focus + raise). Uses the
+    /// toplevel's ROOT surface for focus (clicking a subsurface/popup focuses the
+    /// window). Modelled on anvil's `update_keyboard_focus` (trimmed: no grabs check
+    /// beyond the basics, single output, no FullscreenSurface / input-method grab).
+    fn update_keyboard_focus(&mut self, pos: Point<f64, Logical>, serial: Serial) {
+        let keyboard = self.keyboard.clone();
+        // Respect an active pointer/keyboard grab (e.g. a popup menu) — don't steal
+        // focus out from under it.
+        if self.pointer.is_grabbed() || keyboard.is_grabbed() {
+            return;
+        }
+
+        // A toplevel under the cursor → raise it + focus it.
+        if let Some((window, _)) = self.space.element_under(pos).map(|(w, l)| (w.clone(), l)) {
+            self.space.raise_element(&window, true);
+            // For an X11 window also raise it in the X11 stacking order so XWayland
+            // keeps the same z-order the compositor shows.
+            if let Some(x11) = window.x11_surface() {
+                if let Some(xwm) = self.xwm.as_mut() {
+                    let _ = xwm.raise_window(x11);
+                }
+            }
+            let surface = window.wl_surface().map(|s| s.into_owned());
+            keyboard.set_focus(self, surface, serial);
+            return;
+        }
+
+        // Otherwise a focusable layer surface (Overlay/Top) under the cursor.
+        let output = self.output.clone();
+        let layers = layer_map_for_output(&output);
+        if let Some(layer) = layers
+            .layer_under(WlrLayer::Overlay, pos)
+            .or_else(|| layers.layer_under(WlrLayer::Top, pos))
+        {
+            if layer.can_receive_keyboard_focus() {
+                let layer_loc = layers.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
+                if layer
+                    .surface_under(pos - layer_loc.to_f64(), WindowSurfaceType::ALL)
+                    .is_some()
+                {
+                    keyboard.set_focus(self, Some(layer.wl_surface().clone()), serial);
+                }
+            }
+        }
+    }
+
+    /// Route a single winit input event into the seat. Replaces the M1 no-op stub.
+    /// Trimmed to the events `WinitInput` actually emits (keyboard, absolute pointer
+    /// motion, button, axis); touch is handled by the existing M2 tap path elsewhere.
+    fn process_input_event<B: InputBackend>(&mut self, event: InputEvent<B>) {
+        match event {
+            InputEvent::Keyboard { event } => self.on_keyboard_key::<B>(event),
+            InputEvent::PointerMotionAbsolute { event } => {
+                self.on_pointer_move_absolute::<B>(event)
+            }
+            InputEvent::PointerButton { event } => self.on_pointer_button::<B>(event),
+            InputEvent::PointerAxis { event } => self.on_pointer_axis::<B>(event),
+            _ => {}
+        }
+    }
+
+    /// Forward a key press/release to the focused surface's client. The seat tracks
+    /// the focused surface (set by `update_keyboard_focus` on click and on first map),
+    /// so this is a straight forward — no compositor shortcut interception in M3.
+    fn on_keyboard_key<B: InputBackend>(&mut self, evt: B::KeyboardKeyEvent) {
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = evt.time_msec();
+        let code = evt.key_code();
+        let state = evt.state();
+        let keyboard = self.keyboard.clone();
+        keyboard.input::<(), _>(self, code, state, serial, time, |_, _, _| {
+            FilterResult::Forward
+        });
+    }
+
+    /// Route absolute pointer motion (winit gives us window-relative coords) to the
+    /// surface under the cursor, then send a pointer frame.
+    fn on_pointer_move_absolute<B: InputBackend>(&mut self, evt: B::PointerMotionAbsoluteEvent) {
+        let output_geo = match self.space.output_geometry(&self.output) {
+            Some(g) => g,
+            None => return,
+        };
+        let pos = evt.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+        let serial = SERIAL_COUNTER.next_serial();
+        let pointer = self.pointer.clone();
+        let under = self.surface_under(pos);
+        pointer.motion(
+            self,
+            under,
+            &MotionEvent {
+                location: pos,
+                serial,
+                time: evt.time_msec(),
+            },
+        );
+        pointer.frame(self);
+    }
+
+    /// Route a pointer button. On press, first move the keyboard focus + raise the
+    /// clicked window (click-to-focus), then forward the button to the pointer-focused
+    /// surface's client.
+    fn on_pointer_button<B: InputBackend>(&mut self, evt: B::PointerButtonEvent) {
+        let serial = SERIAL_COUNTER.next_serial();
+        let button = evt.button_code();
+        let state = evt.state();
+        if state == ButtonState::Pressed {
+            self.update_keyboard_focus(self.pointer.current_location(), serial);
+        }
+        let pointer = self.pointer.clone();
+        pointer.button(
+            self,
+            &ButtonEvent {
+                button,
+                state,
+                serial,
+                time: evt.time_msec(),
+            },
+        );
+        pointer.frame(self);
+    }
+
+    /// Route a scroll/axis event to the pointer-focused surface.
+    fn on_pointer_axis<B: InputBackend>(&mut self, evt: B::PointerAxisEvent) {
+        let horizontal = evt.amount(Axis::Horizontal).unwrap_or_else(|| {
+            evt.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.0
+        });
+        let vertical = evt.amount(Axis::Vertical).unwrap_or_else(|| {
+            evt.amount_v120(Axis::Vertical).unwrap_or(0.0) * 15.0 / 120.0
+        });
+        let mut frame = AxisFrame::new(evt.time_msec()).source(evt.source());
+        if horizontal != 0.0 {
+            frame = frame.value(Axis::Horizontal, horizontal);
+            if let Some(d) = evt.amount_v120(Axis::Horizontal) {
+                frame = frame.v120(Axis::Horizontal, d as i32);
+            }
+        }
+        if vertical != 0.0 {
+            frame = frame.value(Axis::Vertical, vertical);
+            if let Some(d) = evt.amount_v120(Axis::Vertical) {
+                frame = frame.v120(Axis::Vertical, d as i32);
+            }
+        }
+        if evt.source() == AxisSource::Finger {
+            if evt.amount(Axis::Horizontal) == Some(0.0) {
+                frame = frame.stop(Axis::Horizontal);
+            }
+            if evt.amount(Axis::Vertical) == Some(0.0) {
+                frame = frame.stop(Axis::Vertical);
+            }
+        }
+        let pointer = self.pointer.clone();
+        pointer.axis(self, frame);
+        pointer.frame(self);
+    }
 }
 
 // ── BufferHandler ───────────────────────────────────────────────────────────
@@ -184,10 +468,17 @@ impl CompositorHandler for State {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client
-            .get_data::<ClientState>()
-            .expect("client without ClientState")
-            .compositor_state
+        // The XWayland client is inserted by smithay with `XWaylandClientData` (NOT our
+        // `ClientState`), which carries its OWN `CompositorClientState`. Check it first,
+        // then fall back to our socket-inserted clients. Mirrors anvil's shell/mod.rs —
+        // without this the XWayland connection panics ("client without ClientState").
+        if let Some(state) = client.get_data::<XWaylandClientData>() {
+            return &state.compositor_state;
+        }
+        if let Some(state) = client.get_data::<ClientState>() {
+            return &state.compositor_state;
+        }
+        panic!("client_compositor_state: unknown client data type")
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -226,6 +517,12 @@ impl CompositorHandler for State {
                     if let Some(w) = self.window_for_surface(&root) {
                         w.user_data().insert_if_missing(|| handle);
                     }
+                    // M3: give the freshly-mapped toplevel the keyboard focus + raise
+                    // it, so a just-launched app receives keystrokes without a click.
+                    self.space.raise_element(&window, true);
+                    let serial = SERIAL_COUNTER.next_serial();
+                    let keyboard = self.keyboard.clone();
+                    keyboard.set_focus(self, Some(root.clone()), serial);
                 }
             }
         }
@@ -250,7 +547,11 @@ impl XdgShellHandler for State {
         // Wrap as a desktop Window and place it; it is NOT mapped until the client
         // commits its first buffer (detected in `commit` → `ensure_initial_configure`).
         let window = Window::new_wayland_window(surface.clone());
-        self.space.map_element(window, (0, 0), true);
+        // M3 cascade: place each new toplevel offset from the previous so multiple
+        // windows are visibly distinct (the "tile or cascade" gate), then advance the
+        // cursor + wrap before it walks off the output.
+        let loc = self.next_cascade_loc();
+        self.space.map_element(window, loc, true);
         // Send the initial configure so the client can commit its first buffer.
         surface.send_configure();
     }
@@ -290,7 +591,7 @@ impl WlrLayerShellHandler for State {
         &mut self,
         surface: WlrLayerSurface,
         _wl_output: Option<wl_output::WlOutput>,
-        _layer: Layer,
+        _layer: WlrLayer,
         namespace: String,
     ) {
         let output = self.output.clone();
@@ -345,6 +646,182 @@ impl DataDeviceHandler for State {
     }
 }
 impl WaylandDndGrabHandler for State {}
+
+// ── XdgDecorationHandler — M3 server-side decoration negotiation ────────────────
+// The compositor prefers to own the chrome (SSD), so GTK/Qt apps drop their own CSD
+// titlebar. Clients that hard-refuse SSD (request ClientSide) keep their frame — the
+// correct fallback, not a bug. Ported from wayland.rs (the same SSD policy). M3 does
+// NOT draw a HeaderBar yet (that is Phase-8 chrome polish) — it negotiates the mode;
+// windows are visually distinguished by the cascade placement above.
+impl XdgDecorationHandler for State {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_pending_configure();
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
+        let chosen = match mode {
+            DecorationMode::ClientSide => DecorationMode::ClientSide,
+            _ => DecorationMode::ServerSide,
+        };
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(chosen);
+        });
+        toplevel.send_pending_configure();
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        toplevel.send_pending_configure();
+    }
+}
+
+// ── XWaylandShellHandler — the X11↔wl_surface association protocol state accessor;
+// a `start_wm` bound. The association is observed; the map edge that mints a handle is
+// `XwmHandler::map_window_request`. Ported from wayland.rs.
+impl XWaylandShellHandler for State {
+    fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
+        &mut self.xwayland_shell_state
+    }
+}
+
+// ── DndGrabHandler — drag'n'drop hand-off for X11 clients (a `start_wm` bound). Both
+// callbacks are defaulted; HART-comp has no extra DnD bookkeeping at M3. Because the
+// winit State impls SeatHandler + DataDeviceHandler and PointerFocus/TouchFocus =
+// WlSurface, `WlSurface: DndFocus<State>` is satisfied (data_device's impl), so
+// start_wm's `PointerFocus: DndFocus` / `TouchFocus: DndFocus` bounds hold without an
+// X11Surface focus target.
+impl DndGrabHandler for State {}
+
+// ── XwmHandler — the live X11 window-manager callbacks. The map/unmap bodies carry
+// the no-phantom-window bookkeeping (ported 1:1 from wayland.rs): `map_window_request`
+// is the corrected Wine map edge — it mints the handle via `on_real_map(..,
+// ToplevelKind::XWayland)` ONLY when a real X11 toplevel maps. All non-listed methods
+// are trait-defaulted.
+impl XwmHandler for State {
+    fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
+        self.xwm
+            .as_mut()
+            .expect("xwm_state called before the X11Wm was attached")
+    }
+
+    fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+
+    fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+
+    fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        // Accept the client's map request so XWayland composites it.
+        let _ = window.set_mapped(true);
+        let app_id = x11_app_id(&window);
+        let title = x11_title(&window);
+        // X11 needs an explicit configure to learn its on-screen position. Configure
+        // it to the cascade location at the client's OWN requested SIZE
+        // (`window.geometry().size`) — NOT the space bbox, which at map time (before
+        // the buffer commits) is empty and would size the window to 0×0 (it would map
+        // but paint nothing — the bug this replaces). Then wrap it as a desktop Window.
+        let loc = self.next_cascade_loc();
+        let size = window.geometry().size;
+        let _ = window.configure(Some(Rectangle::new(loc, size)));
+        let win = Window::new_x11_window(window);
+        self.space.map_element(win.clone(), loc, true);
+        let handle = self.on_real_map(app_id, title, ToplevelKind::XWayland);
+        win.user_data().insert_if_missing(|| handle);
+        // Focus the freshly-mapped X11 toplevel + raise it in the X11 stack.
+        self.space.raise_element(&win, true);
+        if let Some(x11) = win.x11_surface() {
+            if let Some(xwm) = self.xwm.as_mut() {
+                let _ = xwm.raise_window(x11);
+            }
+        }
+        let serial = SERIAL_COUNTER.next_serial();
+        let surface = win.wl_surface().map(|s| s.into_owned());
+        let keyboard = self.keyboard.clone();
+        keyboard.set_focus(self, surface, serial);
+    }
+
+    fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        let location = window.geometry().loc;
+        let win = Window::new_x11_window(window);
+        self.space.map_element(win, location, true);
+    }
+
+    fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        let elem = self
+            .space
+            .elements()
+            .find(|w| w.x11_surface() == Some(&window))
+            .cloned();
+        if let Some(elem) = elem {
+            if let Some(handle) = elem.user_data().get::<WindowHandle>().cloned() {
+                if self.windows.on_unmap(&handle) {
+                    info!(handle = handle.as_str(), "window.closed (X11 toplevel unmapped)");
+                }
+            }
+            self.space.unmap_elem(&elem);
+        }
+        if !window.is_override_redirect() {
+            let _ = window.set_mapped(false);
+        }
+    }
+
+    fn destroyed_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+
+    fn configure_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        _x: Option<i32>,
+        _y: Option<i32>,
+        w: Option<u32>,
+        h: Option<u32>,
+        _reorder: Option<Reorder>,
+    ) {
+        let mut geo = window.geometry();
+        if let Some(w) = w {
+            geo.size.w = w as i32;
+        }
+        if let Some(h) = h {
+            geo.size.h = h as i32;
+        }
+        let _ = window.configure(geo);
+    }
+
+    fn configure_notify(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        geometry: Rectangle<i32, Logical>,
+        _above: Option<u32>,
+    ) {
+        let elem = self
+            .space
+            .elements()
+            .find(|w| w.x11_surface() == Some(&window))
+            .cloned();
+        if let Some(elem) = elem {
+            self.space.map_element(elem, geometry.loc, false);
+        }
+    }
+
+    fn resize_request(
+        &mut self,
+        _xwm: XwmId,
+        _window: X11Surface,
+        _button: u32,
+        _edges: X11ResizeEdge,
+    ) {
+    }
+
+    fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {}
+
+    fn disconnected(&mut self, _xwm: XwmId) {
+        self.xwm = None;
+    }
+}
 
 // ── OutputHandler — required for the output global's dispatch ──
 impl smithay::wayland::output::OutputHandler for State {}
@@ -510,17 +987,23 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
     output.set_preferred(mode);
 
-    // 5. The protocol globals (the S4 minimal set a shm/xdg client needs to map).
+    // 5. The protocol globals (the S4 minimal set a shm/xdg client needs to map +
+    //    the M3 set: xdg-decoration for SSD negotiation, xwayland-shell for the X11
+    //    association protocol the X11Wm needs).
     let compositor_state = CompositorState::new::<State>(&dh);
     let xdg_shell_state = XdgShellState::new::<State>(&dh);
     let shm_state = ShmState::new::<State>(&dh, vec![]);
     let output_manager_state = OutputManagerState::new_with_xdg_output::<State>(&dh);
     let layer_shell_state = WlrLayerShellState::new::<State>(&dh);
     let data_device_state = DataDeviceState::new::<State>(&dh);
+    let xdg_decoration_state = XdgDecorationState::new::<State>(&dh);
+    let xwayland_shell_state = XWaylandShellState::new::<State>(&dh);
     let mut seat_state = SeatState::new();
     let mut seat = seat_state.new_wl_seat(&dh, "hart-winit");
-    let _keyboard = seat.add_keyboard(Default::default(), 200, 25)?;
-    let _pointer = seat.add_pointer();
+    // M3: keep the keyboard + pointer handles — the loop routes winit input into them
+    // and reads the cursor position for click-to-focus.
+    let keyboard = seat.add_keyboard(Default::default(), 200, 25)?;
+    let pointer = seat.add_pointer();
 
     let mut space: Space<Window> = Space::default();
     space.map_output(&output, (0, 0));
@@ -546,11 +1029,23 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         data_device_state,
         seat_state,
         seat,
+        pointer,
+        keyboard,
+        xdg_decoration_state,
+        xwayland_shell_state,
+        xwm: None,
+        next_window_loc: (32, 32).into(),
         output: output.clone(),
     };
 
     // 6. (No calloop Generic source for the Display — see step 1. The Display is
     //    dispatched directly in the loop below, the safe-code minimal.rs pattern.)
+
+    // 6b. M3 — spawn XWayland nested in OUR display, so X11 clients (Wine / xterm /
+    //    xeyes) get an X server. On `Ready` we attach the X11 WM (start_wm), which
+    //    routes X11 surface map/unmap through `XwmHandler`. `DISPLAY=:N` is published
+    //    to the environment + logged so the harness can launch X11 children against it.
+    spawn_xwayland(&dh, &event_loop.handle());
 
     // 7. Spawn a test client so a window MAPS + PAINTS (the M1 done-bar). It
     //    connects to OUR socket, not the host's.
@@ -572,10 +1067,10 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
                 output.set_preferred(new_mode);
                 state.space.map_output(&output, (0, 0));
             }
-            // M1: input is a no-op (the done-bar is map+paint, not interaction).
-            // The seat exists so clients bind wl_seat; routing winit input into it
-            // is Milestone 2.
-            WinitEvent::Input(_) => {}
+            // M3: route winit input (keyboard / pointer motion / button / axis) into
+            // the seat — keyboard to the focused surface, pointer to the surface under
+            // the cursor, click-to-focus + raise. Replaces the M1 no-op stub.
+            WinitEvent::Input(event) => state.process_input_event(event),
             WinitEvent::CloseRequested => {
                 info!("winit window close requested — shutting down");
                 state.running = false;
@@ -593,22 +1088,51 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         let render_result = (|| -> Result<(), Box<dyn std::error::Error>> {
             let (renderer, mut framebuffer) = backend.bind()?;
 
-            // Build paint elements: every mapped xdg toplevel + every layer
-            // surface, newest on top. Modelled on minimal.rs's proven
-            // render_elements_from_surface_tree path (no Space render dependency,
-            // so it compiles cleanly on this rev) while still honouring z-order:
-            // layer-shell BACKGROUND first (drawn at the bottom), toplevels above.
+            // Build paint elements front-to-back (draw_render_elements paints in slice
+            // order, so the TOP-most element comes FIRST). Z-order, top→bottom:
+            //   1. mapped toplevels (xdg + X11) in the space's stacking order, raised
+            //      (clicked / newest) ones on top — `space.elements()` yields
+            //      bottom→top, so we reverse to get top-first. Each window paints at its
+            //      `element_location` so M3's cascade + click-to-raise are VISIBLE.
+            //   2. layer-shell surfaces (the glass-shell desktop) underneath.
+            // This replaces M1's `toplevel_surfaces()` (unordered, xdg-only, all at
+            // (0,0)) so multiple windows stack + the X11 (XWayland) windows paint too.
             let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
 
-            // toplevels (above)
-            for toplevel in state.xdg_shell_state.toplevel_surfaces() {
-                elements.extend(render_elements_from_surface_tree(
+            // DEBUG: once a second, dump each space element's loc/size/surface/buffer so
+            // a non-painting window (e.g. an X11 toplevel that mapped but committed no
+            // buffer) is diagnosable. Gated behind HART_COMP_DEBUG_RENDER.
+            if std::env::var_os("HART_COMP_DEBUG_RENDER").is_some()
+                && state.start_time.elapsed().as_millis() % 1000 < 20
+            {
+                for window in state.space.elements() {
+                    let loc = state.space.element_location(window).unwrap_or_default();
+                    let bbox = state.space.element_bbox(window);
+                    let surf = window.wl_surface();
+                    let has_buf = surf.as_ref().map(|s| surface_has_buffer(s)).unwrap_or(false);
+                    let is_x11 = window.x11_surface().is_some();
+                    info!(
+                        ?loc, ?bbox, has_surface = surf.is_some(), has_buffer = has_buf, is_x11,
+                        "render.element"
+                    );
+                }
+            }
+
+            // toplevels (above), top-most first. Render via the Window's own
+            // `AsRenderElements` (NOT a manual `window.wl_surface()` walk): for X11
+            // windows that delegates to `X11Surface::render_elements`, which paints the
+            // X11 surface tree even though the public `wl_surface()` accessor can be None
+            // for XWayland-shell-associated surfaces (the bug that left xterm blank). The
+            // location is PHYSICAL (scale 1.0 here, so it equals the logical coords).
+            for window in state.space.elements().rev() {
+                let loc = state.space.element_location(window).unwrap_or_default();
+                let phys = loc.to_physical_precise_round(1.0);
+                elements.extend(AsRenderElements::<GlesRenderer>::render_elements(
+                    window,
                     renderer,
-                    toplevel.wl_surface(),
-                    (0, 0),
+                    phys,
+                    smithay::utils::Scale::from(1.0),
                     1.0,
-                    1.0,
-                    Kind::Unspecified,
                 ));
             }
             // layer surfaces (below the toplevels in this list = drawn under them,
@@ -661,10 +1185,13 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
             warn!(?err, "render error");
         }
 
-        // ── (c) Send frame callbacks so clients draw their NEXT frame. ──
+        // ── (c) Send frame callbacks so clients draw their NEXT frame. Iterate the
+        //    space (covers BOTH xdg + X11 windows) plus the layer surfaces.
         let now_ms = state.start_time.elapsed().as_millis() as u32;
-        for toplevel in state.xdg_shell_state.toplevel_surfaces() {
-            send_frame_callbacks(toplevel.wl_surface(), now_ms);
+        for window in state.space.elements() {
+            if let Some(surface) = window.wl_surface() {
+                send_frame_callbacks(&surface, now_ms);
+            }
         }
         {
             let map = smithay::desktop::layer_map_for_output(&output);
@@ -761,4 +1288,92 @@ fn toplevel_title(toplevel: &ToplevelSurface) -> Option<String> {
             .get::<XdgToplevelSurfaceData>()
             .and_then(|d| d.lock().unwrap().title.clone())
     })
+}
+
+/// X11 WM_CLASS → app_id analogue (the join key the brain's launcher tags).
+fn x11_app_id(x11: &X11Surface) -> Option<String> {
+    Some(x11.class()).filter(|s| !s.is_empty())
+}
+
+/// X11 window title.
+fn x11_title(x11: &X11Surface) -> Option<String> {
+    Some(x11.title()).filter(|s| !s.is_empty())
+}
+
+/// M3 — spawn XWayland nested in OUR display + attach the X11 WM on `Ready`. Modelled
+/// 1:1 on anvil `state.rs::start_xwayland`: `XWayland::spawn` returns `(XWayland,
+/// Client)`; the `Client` is captured here and threaded into the `Ready` handler so
+/// `X11Wm::start_wm` can bind it (the `Ready` event carries only the privileged X11
+/// socket + display number, NOT the client). On `Ready` we publish `DISPLAY=:N` so X11
+/// children (Wine / xterm / xeyes) connect to THIS X server, and log it so the harness
+/// can launch them. Best-effort: a spawn failure logs + leaves `xwm = None` (the
+/// compositor still runs for Wayland-native clients — XWayland is an opportunistic
+/// add-on, never a boot gate).
+/// XWayland child stdio: inherit (visible in hart-comp's log) when
+/// `HART_COMP_XWAYLAND_VERBOSE` is set, else null. Used for both stdout + stderr.
+fn xwayland_stdio() -> Stdio {
+    if std::env::var_os("HART_COMP_XWAYLAND_VERBOSE").is_some() {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    }
+}
+
+fn spawn_xwayland(dh: &DisplayHandle, loop_handle: &LoopHandle<'static, State>) {
+    let (xwayland, client) = match XWayland::spawn(
+        dh,
+        None,
+        std::iter::empty::<(String, String)>(),
+        std::iter::empty::<String>(),
+        true,
+        // Inherit XWayland's stdout/stderr when HART_COMP_XWAYLAND_VERBOSE is set so a
+        // failed bring-up is diagnosable; default null to keep the journal quiet.
+        xwayland_stdio(),
+        xwayland_stdio(),
+        |_| {},
+    ) {
+        Ok(ret) => ret,
+        Err(err) => {
+            warn!(?err, "XWayland: spawn failed (X11 apps unavailable; Wayland-native clients unaffected)");
+            return;
+        }
+    };
+
+    let inserted = loop_handle.insert_source(xwayland, move |event, _, state| match event {
+        XWaylandEvent::Ready {
+            x11_socket,
+            display_number,
+        } => {
+            match X11Wm::start_wm(
+                state.loop_handle.clone(),
+                &state.dh,
+                x11_socket,
+                client.clone(),
+            ) {
+                Ok(wm) => {
+                    state.xwm = Some(wm);
+                    // Publish DISPLAY so X11 children connect to OUR XWayland, and log
+                    // it as the launch hint for the harness (DISPLAY=:N xterm/xeyes).
+                    // (set_var is safe on edition 2021; the crate forbids `unsafe`.)
+                    let x11_display = format!(":{display_number}");
+                    std::env::set_var("DISPLAY", &x11_display);
+                    info!(
+                        x11_display = %x11_display,
+                        "XWayland ready — X11 WM attached (launch X11 apps with this DISPLAY)"
+                    );
+                }
+                Err(err) => {
+                    error!(?err, "XWayland: failed to start the X11 WM");
+                    state.xwm = None;
+                }
+            }
+        }
+        XWaylandEvent::Error => {
+            warn!("XWayland crashed on startup");
+            state.xwm = None;
+        }
+    });
+    if let Err(err) = inserted {
+        error!(?err, "XWayland: failed to insert the XWayland source into the event loop");
+    }
 }
