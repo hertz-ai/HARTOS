@@ -555,6 +555,35 @@ The ISO includes custom GRUB configuration:
 - Plymouth boot splash: `deploy/distro/branding/plymouth/hart-theme/`
 - Boot menu: Install, Live, Safe Mode (minimal services)
 
+### Dual-Boot alongside Windows (graphical install wizard)
+
+The **desktop** ISO boots a **graphical install wizard** — it imports NixOS's
+`installer/cd-dvd/installation-cd-graphical-gnome.nix` (the Calamares-based
+graphical installer), not only the CLI `nixos-install`. To install HART OS
+beside an existing Windows install:
+
+1. **In Windows** → *Disk Management* → **Shrink** the Windows partition to leave
+   ≥ 20 GB unallocated. Back up first; repartitioning is destructive if mis-done.
+2. **Boot the HART OS desktop ISO** (e.g. the USB flashed with
+   `hart_usb_flasher.py`). Ensure the firmware boots it in **UEFI mode** (not
+   legacy/CSM) so HART OS shares the existing Windows EFI System Partition.
+3. At the GRUB menu pick **Install** → the **graphical wizard** opens → choose
+   *Install alongside* (or **Manual** partitioning targeting the free space) →
+   **keep the existing EFI System Partition** → finish + reboot.
+4. **Make Windows appear in the boot menu:** default builds do **not** enable
+   os-prober, so GRUB won't list Windows automatically. Enable it in the desktop
+   config and rebuild:
+
+   ```nix
+   boot.loader.grub.useOSProber = true;   # GRUB detects + chain-loads Windows
+   ```
+
+   (systemd-boot variants instead expose the Windows EFI entry directly once the
+   ESP is shared.)
+
+> Dual-boot is a **manual-partitioning** flow today — there is no one-click
+> "shrink Windows + install" automation yet, and os-prober is off by default.
+
 ### Raspberry Pi / ARM
 
 ```bash
