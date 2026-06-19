@@ -192,6 +192,12 @@ pub struct State {
 
     /// The single winit output (the HART-comp window inside WSLg).
     pub output: Output,
+
+    // ── M4: the com.hart.Compositor IPC server's per-compositor state (the
+    // `events.subscribe` sinks). The IPC command handlers (src/ipc.rs) mutate the
+    // fields ABOVE (space/seat/xwm) against a verb; this holds only the event
+    // fan-out subscribers so the map/unmap/focus edges below can push event frames.
+    pub ipc: crate::ipc::IpcState,
 }
 
 impl State {
@@ -520,16 +526,24 @@ impl CompositorHandler for State {
                     let app_id = toplevel_app_id(toplevel);
                     let title = toplevel_title(toplevel);
                     let handle = self.on_real_map(app_id, title, ToplevelKind::Xdg);
+                    let handle_str = handle.as_str().to_string();
                     // Stash the handle on the Window so destroy can reverse it.
                     if let Some(w) = self.window_for_surface(&root) {
                         w.user_data().insert_if_missing(|| handle);
                     }
+                    // M4: emit window.opened to IPC subscribers (IPC_PROTOCOL.md §5) —
+                    // the same edge that minted the handle, so the event proves a real map.
+                    let payload = ipc_event_window_json(self, &window, &handle_str);
+                    self.ipc.emit_event("window.opened", payload);
                     // M3: give the freshly-mapped toplevel the keyboard focus + raise
                     // it, so a just-launched app receives keystrokes without a click.
                     self.space.raise_element(&window, true);
                     let serial = SERIAL_COUNTER.next_serial();
                     let keyboard = self.keyboard.clone();
                     keyboard.set_focus(self, Some(root.clone()), serial);
+                    // M4: input focus changed → window.focused (additive signal, §5).
+                    let focus_payload = ipc_event_window_json(self, &window, &handle_str);
+                    self.ipc.emit_event("window.focused", focus_payload);
                 }
             }
 
@@ -602,6 +616,10 @@ impl XdgShellHandler for State {
             if let Some(handle) = window.user_data().get::<WindowHandle>().cloned() {
                 if self.windows.on_unmap(&handle) {
                     info!(handle = handle.as_str(), "window.closed (toplevel destroyed)");
+                    // M4: emit window.closed to IPC subscribers, invalidating the
+                    // handle (IPC_PROTOCOL.md §5). Built before unmap so geometry is real.
+                    let payload = ipc_event_window_json(self, &window, handle.as_str());
+                    self.ipc.emit_event("window.closed", payload);
                 }
             }
             self.space.unmap_elem(&window);
@@ -763,7 +781,14 @@ impl XwmHandler for State {
             }
         }
         let handle = self.on_real_map(app_id, title, ToplevelKind::XWayland);
+        let handle_str = handle.as_str().to_string();
         win.user_data().insert_if_missing(|| handle);
+        // M4: emit window.opened to IPC subscribers (IPC_PROTOCOL.md §5) — minted on
+        // the REAL X11 map (the corrected Wine path: a handle only here, never on the
+        // installer's unconditional success). Note an X11 window's geometry is known
+        // (we configured it above) even before its wl_surface associates.
+        let payload = ipc_event_window_json(self, &win, &handle_str);
+        self.ipc.emit_event("window.opened", payload);
         // Raise the freshly-mapped X11 toplevel in BOTH the desktop stack and the X11
         // stacking order (so XWayland keeps the same z-order the compositor shows).
         self.space.raise_element(&win, true);
@@ -803,6 +828,9 @@ impl XwmHandler for State {
             if let Some(handle) = elem.user_data().get::<WindowHandle>().cloned() {
                 if self.windows.on_unmap(&handle) {
                     info!(handle = handle.as_str(), "window.closed (X11 toplevel unmapped)");
+                    // M4: emit window.closed to IPC subscribers (IPC_PROTOCOL.md §5).
+                    let payload = ipc_event_window_json(self, &elem, handle.as_str());
+                    self.ipc.emit_event("window.closed", payload);
                 }
             }
             self.space.unmap_elem(&elem);
@@ -1080,6 +1108,7 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         xwm: None,
         next_window_loc: (32, 32).into(),
         output: output.clone(),
+        ipc: crate::ipc::IpcState::default(),
     };
 
     // 6. (No calloop Generic source for the Display — see step 1. The Display is
@@ -1090,6 +1119,13 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     //    routes X11 surface map/unmap through `XwmHandler`. `DISPLAY=:N` is published
     //    to the environment + logged so the harness can launch X11 children against it.
     spawn_xwayland(&dh, &event_loop.handle());
+
+    // 6c. M4 — bind the com.hart.Compositor IPC server (Unix-socket twin) into the
+    //    SAME calloop loop, so an agent (the brain's HartWmClient, or the M4 test
+    //    client) arranges REAL windows via framed-JSON verbs against `state.space`.
+    //    Best-effort: a bind failure leaves the compositor running for everything
+    //    else (the IPC is an add-on, never a boot gate — same posture as XWayland).
+    let _ipc_socket = crate::ipc::start_ipc(&event_loop.handle());
 
     // 7. Spawn a test client so a window MAPS + PAINTS (the M1 done-bar). It
     //    connects to OUR socket, not the host's.
@@ -1342,6 +1378,43 @@ fn x11_app_id(x11: &X11Surface) -> Option<String> {
 /// X11 window title.
 fn x11_title(x11: &X11Surface) -> Option<String> {
     Some(x11.title()).filter(|s| !s.is_empty())
+}
+
+// ── M4 — uniform app_id/title readers for the IPC `window.list` serializer
+// (src/ipc.rs). A `Window` is either an xdg toplevel or an X11 surface; these pick
+// the right accessor so `window.list` reports provenance for BOTH kinds from the one
+// `space.elements()` source of truth. Reused by the event-frame builders below.
+/// app_id for any mapped `Window` (xdg `app_id` or X11 WM_CLASS).
+pub(crate) fn ipc_window_app_id(window: &Window) -> Option<String> {
+    if let Some(toplevel) = window.toplevel() {
+        return toplevel_app_id(toplevel);
+    }
+    window.x11_surface().and_then(x11_app_id)
+}
+
+/// title for any mapped `Window` (xdg `title` or X11 window title).
+pub(crate) fn ipc_window_title(window: &Window) -> Option<String> {
+    if let Some(toplevel) = window.toplevel() {
+        return toplevel_title(toplevel);
+    }
+    window.x11_surface().and_then(x11_title)
+}
+
+/// Build the IPC event-frame `window` payload (IPC_PROTOCOL.md §5) for one mapped
+/// `Window`. Same shape as a `window.list` row, from the same source of truth.
+fn ipc_event_window_json(state: &State, window: &Window, handle: &str) -> serde_json::Value {
+    let geo = state.space.element_geometry(window);
+    let (x, y, w, h) = geo
+        .map(|g| (g.loc.x, g.loc.y, g.size.w, g.size.h))
+        .unwrap_or((0, 0, 0, 0));
+    let is_x11 = window.x11_surface().is_some();
+    serde_json::json!({
+        "handle": handle,
+        "app_id": ipc_window_app_id(window),
+        "title": ipc_window_title(window),
+        "geometry": { "x": x, "y": y, "w": w, "h": h },
+        "kind": if is_x11 { "x11" } else { "xdg" },
+    })
 }
 
 /// M3 — spawn XWayland nested in OUR display + attach the X11 WM on `Ready`. Modelled

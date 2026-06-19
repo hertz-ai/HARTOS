@@ -70,6 +70,13 @@ mod wayland;
 #[cfg(feature = "winit")]
 mod winit;
 
+// ── Milestone 4: the com.hart.Compositor IPC server (Unix-socket twin), wired to
+// the winit Space so an agent arranges REAL native windows. Gated behind the SAME
+// `winit` feature as the live compositor it drives (the IPC handlers mutate
+// `winit::State.space`). Off on the default dev-box build. See src/ipc.rs.
+#[cfg(feature = "winit")]
+mod ipc;
+
 // NOTE: these `use smithay::...` imports are the SHAPE the real compositor needs.
 // They are commented at module scope intentionally — uncommenting + filling the
 // handler bodies is the Phase-3/Phase-5 CI bring-up work, done where Smithay can

@@ -81,6 +81,12 @@ smithay = [
 winit = [
     "dep:smithay",
     "dep:calloop",
+    # M4 — the com.hart.Compositor IPC server (src/ipc.rs) speaks framed JSON over a
+    # Unix socket. `serde` is already in the tree (smithay pulls it); `serde_json` is
+    # the only direct add. Both keyed to the feature that compiles ipc.rs so the
+    # default dev-box build never resolves them.
+    "dep:serde",
+    "dep:serde_json",
     "smithay/backend_winit",
     "smithay/renderer_gl",
     "smithay/backend_egl",
@@ -169,4 +175,19 @@ features = ["wayland_frontend","desktop"]
 
 [dependencies.calloop]
 version = "0.13"
+optional = true
+
+# ── M4: the com.hart.Compositor IPC server's JSON framing (src/ipc.rs). Optional,
+# enabled by the `winit` feature (the only build that compiles ipc.rs). `serde` with
+# `derive` for the request/response envelope structs; `serde_json` for the framed
+# bodies. Both versions match what is already resolved in Cargo.lock via smithay's
+# tree, so no new transitive churn — `serde_json` was the only crate not already
+# extracted, and it is in the offline registry cache.
+[dependencies.serde]
+version = "1"
+optional = true
+features = ["derive"]
+
+[dependencies.serde_json]
+version = "1"
 optional = true
