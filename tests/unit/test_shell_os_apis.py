@@ -939,8 +939,33 @@ class TestShellVPN(unittest.TestCase):
 # Trash / Recycle Bin
 # ═══════════════════════════════════════════════════════════════
 
+def _make_system_app():
+    """Create a Flask test app with the canonical shell *system* routes.
+
+    Trash / recycle-bin lives in shell_system_apis.register_shell_system_routes
+    — NOT shell_os_apis. The duplicate trash routes were removed from
+    shell_os_apis in 01e0b8e (they collided on the Flask endpoint name
+    `shell_trash_list` and silently aborted system-route registration, which in
+    turn killed the app installer). The contract the shell's recycle-bin panel
+    actually calls is the manifest's `trash_bin` SYSTEM_PANEL:
+    GET /api/shell/trash, POST /api/shell/trash/move,
+    POST /api/shell/trash/restore, DELETE /api/shell/trash/empty.
+    """
+    from flask import Flask
+    app = Flask(__name__)
+    app.config['TESTING'] = True
+    from integrations.agent_engine.shell_system_apis import register_shell_system_routes
+    register_shell_system_routes(app)
+    return app.test_client()
+
+
 class TestShellTrash(unittest.TestCase):
-    """Tests for /api/shell/trash routes using real temp dirs."""
+    """Tests for the canonical /api/shell/trash routes (shell_system_apis).
+
+    These hit the REAL routes against a temp XDG trash dir, redirecting
+    `_trash_dir()`'s `expanduser('~')` to a tmp home. `gio` is absent on the
+    test host, so the manual ~/.local/share/Trash fallback path is exercised.
+    """
 
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp(prefix='hart_trash_test_')
@@ -953,41 +978,47 @@ class TestShellTrash(unittest.TestCase):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def _patch_trash_dir(self):
-        """Return a patch that redirects _trash_dir() to our temp trash root."""
-        return patch('integrations.agent_engine.shell_os_apis.os.path.expanduser',
+        """Redirect shell_system_apis' expanduser('~') to our temp home.
+
+        `_trash_dir()` builds the trash root from `expanduser('~')`, so patching
+        it in the shell_system_apis module relocates the whole trash tree.
+        """
+        return patch('integrations.agent_engine.shell_system_apis.os.path.expanduser',
                      return_value=self._tmpdir)
 
     def test_trash_list_empty(self):
-        client = _make_os_app()
+        client = _make_system_app()
         with self._patch_trash_dir():
             r = client.get('/api/shell/trash')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertEqual(data['items'], [])
-        self.assertEqual(data['total'], 0)
+        self.assertEqual(data['total_items'], 0)
 
     def test_trash_file(self):
-        client = _make_os_app()
+        client = _make_system_app()
         # Create a source file to trash
         src_file = os.path.join(self._tmpdir, 'myfile.txt')
         with open(src_file, 'w') as f:
             f.write('hello')
         with self._patch_trash_dir():
-            r = client.post('/api/shell/trash', json={'path': src_file})
+            r = client.post('/api/shell/trash/move', json={'path': src_file})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['status'], 'trashed')
+        self.assertTrue(data['trashed'])
+        # Source file was moved out of its original location
+        self.assertFalse(os.path.isfile(src_file))
         # Verify file moved to trash files dir
         self.assertTrue(os.path.isdir(self._files_dir))
         trashed_files = os.listdir(self._files_dir)
-        self.assertGreater(len(trashed_files), 0)
+        self.assertIn('myfile.txt', trashed_files)
         # Verify .trashinfo was created
         self.assertTrue(os.path.isdir(self._info_dir))
         info_files = [f for f in os.listdir(self._info_dir) if f.endswith('.trashinfo')]
-        self.assertGreater(len(info_files), 0)
+        self.assertIn('myfile.txt.trashinfo', info_files)
 
     def test_trash_restore(self):
-        client = _make_os_app()
+        client = _make_system_app()
         # Pre-populate trash
         os.makedirs(self._files_dir, exist_ok=True)
         os.makedirs(self._info_dir, exist_ok=True)
@@ -1001,15 +1032,21 @@ class TestShellTrash(unittest.TestCase):
         )
         with open(os.path.join(self._info_dir, 'restored.txt.trashinfo'), 'w') as f:
             f.write(info_content)
+        # Canonical restore keys off the trash item `id` (the filename in
+        # files/), not a free-form name.
         with self._patch_trash_dir():
-            r = client.post('/api/shell/trash/restore', json={'name': 'restored.txt'})
+            r = client.post('/api/shell/trash/restore', json={'id': 'restored.txt'})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['status'], 'restored')
+        self.assertEqual(data['restored_count'], 1)
+        self.assertIn(restore_dest, data['restored_paths'])
         self.assertTrue(os.path.isfile(restore_dest))
+        # The .trashinfo for a restored item is cleaned up.
+        self.assertFalse(os.path.isfile(
+            os.path.join(self._info_dir, 'restored.txt.trashinfo')))
 
     def test_trash_empty(self):
-        client = _make_os_app()
+        client = _make_system_app()
         # Pre-populate trash with files
         os.makedirs(self._files_dir, exist_ok=True)
         os.makedirs(self._info_dir, exist_ok=True)
@@ -1019,24 +1056,34 @@ class TestShellTrash(unittest.TestCase):
             f.write('b')
         with open(os.path.join(self._info_dir, 'a.txt.trashinfo'), 'w') as f:
             f.write('[Trash Info]\nPath=/tmp/a.txt\n')
+        # Canonical empty is DELETE (matches manifest trash_bin api list).
         with self._patch_trash_dir():
-            r = client.post('/api/shell/trash/empty')
+            r = client.delete('/api/shell/trash/empty')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['status'], 'emptied')
-        self.assertGreater(data['removed'], 0)
+        self.assertTrue(data['emptied'])
         # Verify dirs are empty
         self.assertEqual(os.listdir(self._files_dir), [])
 
     def test_trash_missing_path(self):
-        client = _make_os_app()
-        r = client.post('/api/shell/trash', json={'path': '/nonexistent_xyz'})
+        client = _make_system_app()
+        # Move-to-trash of a path that does not exist returns 404.
+        r = client.post('/api/shell/trash/move',
+                        json={'path': '/nonexistent_xyz'})
+        self.assertEqual(r.status_code, 404)
+        data = json.loads(r.data)
+        self.assertIn('error', data)
+
+    def test_trash_no_path(self):
+        client = _make_system_app()
+        # Move-to-trash with no path returns 400.
+        r = client.post('/api/shell/trash/move', json={})
         self.assertEqual(r.status_code, 400)
         data = json.loads(r.data)
         self.assertIn('error', data)
 
     def test_trash_list_with_items(self):
-        client = _make_os_app()
+        client = _make_system_app()
         # Pre-populate info dir with .trashinfo files
         os.makedirs(self._info_dir, exist_ok=True)
         for name in ['doc.txt', 'pic.png']:
@@ -1051,7 +1098,7 @@ class TestShellTrash(unittest.TestCase):
             r = client.get('/api/shell/trash')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['total'], 2)
+        self.assertEqual(data['total_items'], 2)
         names = [item['name'] for item in data['items']]
         self.assertIn('doc.txt', names)
         self.assertIn('pic.png', names)
