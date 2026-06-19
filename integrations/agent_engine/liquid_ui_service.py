@@ -1271,18 +1271,42 @@ html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot{animat
   box-shadow:0 0 8px currentColor,inset 0 0 0 2px rgba(255,255,255,0.25)}
 .hart-tile .htc-name{font-size:11px;color:var(--hart-text);text-align:center;margin-top:5px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-/* ── Marketplace app cards ── */
-.hart-app-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-bottom:8px}
-.hart-app-card{display:flex;align-items:center;gap:10px;padding:10px;border-radius:12px;
+/* ── Marketplace (App Store) — premium liquid-glass cards ── */
+.hart-mkt{padding:var(--ds-space-2) var(--ds-space-1) var(--ds-space-6)}
+.hart-mkt-head{margin-bottom:var(--ds-space-5)}
+.hart-mkt-search{display:flex;gap:var(--ds-space-2);margin:var(--ds-space-4) 0 var(--ds-space-2);
+  position:sticky;top:0;z-index:3;padding-bottom:var(--ds-space-2);
+  background:linear-gradient(to bottom,var(--hart-surface) 70%,transparent)}
+.hart-mkt-search .ds-input{flex:1}
+.hart-mkt-section{margin-top:var(--ds-space-5)}
+.hart-mkt-section:first-child{margin-top:var(--ds-space-2)}
+.hart-app-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(248px,1fr));
+  gap:var(--ds-space-3);margin-top:var(--ds-space-3)}
+.hart-app-card{position:relative;display:flex;flex-direction:column;gap:var(--ds-space-3);
+  padding:var(--ds-space-4);border-radius:var(--ds-radius-lg);overflow:hidden;
   background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);
-  transition:transform .15s cubic-bezier(.175,.885,.32,1.275),box-shadow .15s}
-.hart-app-card:hover{transform:translateY(-2px);box-shadow:0 8px 20px rgba(0,0,0,.3)}
-.hart-app-card .hac-ic{width:42px;height:42px;flex-shrink:0;border-radius:10px;display:flex;align-items:center;justify-content:center;
-  background:rgba(255,255,255,0.05);border:1px solid var(--hart-glass-border)}
-.hart-app-card .hac-ic .mi{font-size:24px;color:var(--hart-accent)}
-.hart-app-card .hac-body{flex:1;min-width:0}
-.hart-app-card .hac-name{font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.hart-app-card .hac-desc{font-size:11px;color:var(--hart-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  backdrop-filter:blur(12px) saturate(1.2);-webkit-backdrop-filter:blur(12px) saturate(1.2);
+  box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.06),0 2px 10px rgba(0,0,0,0.22);
+  transition:transform .18s cubic-bezier(.175,.885,.32,1.275),box-shadow .18s,border-color .18s}
+/* subtle top-light grain wash so cards feel like frosted glass, not flat tiles */
+.hart-app-card::before{content:'';position:absolute;inset:0;pointer-events:none;
+  background:radial-gradient(120% 90% at 0% 0%,rgba(255,255,255,0.06),transparent 60%);opacity:.9}
+.hart-app-card:hover{transform:translateY(-3px);border-color:var(--hart-accent);
+  box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.10),0 12px 30px rgba(0,0,0,0.34)}
+.hart-app-card .hac-top{display:flex;align-items:flex-start;gap:var(--ds-space-3);position:relative}
+.hart-app-card .hac-ic{width:52px;height:52px;flex-shrink:0;border-radius:var(--ds-radius-md);
+  display:flex;align-items:center;justify-content:center;
+  background:linear-gradient(150deg,rgba(255,255,255,0.10),rgba(255,255,255,0.03));
+  border:1px solid var(--hart-glass-border);box-shadow:inset 0 1px 0 rgba(255,255,255,0.10)}
+.hart-app-card .hac-ic .mi{font-size:28px;color:var(--hart-accent)}
+.hart-app-card .hac-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.hart-app-card .hac-name{font-size:14px;font-weight:600;line-height:18px;color:var(--hart-heading);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hart-app-card .hac-desc{font-size:12px;line-height:16px;color:var(--hart-muted);
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.hart-app-card .hac-cat{font-size:10px;font-weight:600;letter-spacing:.6px;text-transform:uppercase;
+  color:var(--hart-accent);opacity:.8}
+.hart-app-card .ds-btn{position:relative;align-self:stretch;justify-content:center}
 /* ── Buttery: window spring-open + dock perf hint (Phase D) ── */
 @keyframes hart-panel-in{from{opacity:0;transform:scale(.92) translateY(14px)}to{opacity:1;transform:scale(1) translateY(0)}}
 .panel{animation:hart-panel-in .3s cubic-bezier(.175,.885,.32,1.275)}

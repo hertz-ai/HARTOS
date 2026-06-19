@@ -51,17 +51,24 @@
   }
 
   function appCard(app) {
+    // Premium vertical card: icon + name/category/description up top, a full-
+    // width Install action below — frosted-glass styling lives in _CSS_DESKTOP
+    // (.hart-app-card). Built with DOM nodes (no innerHTML) so names/descriptions
+    // are inserted as text, never markup.
     var el = document.createElement('div'); el.className = 'hart-app-card';
+    var top = document.createElement('div'); top.className = 'hac-top';
     var ic = document.createElement('div'); ic.className = 'hac-ic';
     ic.innerHTML = '<span class="mi material-icons-round" aria-hidden="true">' + (app.i || 'apps') + '</span>';
     var body = document.createElement('div'); body.className = 'hac-body';
-    var nm = document.createElement('div'); nm.className = 'hac-name'; nm.textContent = app.n;
+    if (app.c) { var cat = document.createElement('div'); cat.className = 'hac-cat'; cat.textContent = app.c; body.appendChild(cat); }
+    var nm = document.createElement('div'); nm.className = 'hac-name'; nm.textContent = app.n; nm.title = app.n;
     var ds = document.createElement('div'); ds.className = 'hac-desc'; ds.textContent = app.d || '';
     body.appendChild(nm); body.appendChild(ds);
+    top.appendChild(ic); top.appendChild(body);
     var btn = document.createElement('button'); btn.className = 'ds-btn ds-btn-tonal ds-btn-sm'; btn.type = 'button';
     btn.textContent = 'Install';
     btn.addEventListener('click', function () { install(app); });
-    el.appendChild(ic); el.appendChild(body); el.appendChild(btn);
+    el.appendChild(top); el.appendChild(btn);
     return el;
   }
 
@@ -83,32 +90,37 @@
   window.hartRenderMarketplace = function (el) {
     if (!el) return;
     el.innerHTML = '';
-    var grid = document.createElement('div'); grid.className = 'ds-panel-grid ds-fade-in';
-    var title = document.createElement('div'); title.className = 'ds-panel-title'; title.textContent = 'Marketplace';
-    grid.appendChild(title);
+    var wrap = document.createElement('div'); wrap.className = 'hart-mkt ds-fade-in';
+
+    var head = document.createElement('div'); head.className = 'hart-mkt-head';
+    var title = document.createElement('div'); title.className = 'ds-panel-title'; title.textContent = 'App Store';
+    head.appendChild(title);
     var sub = document.createElement('div'); sub.className = 'ds-body-sm ds-text-muted';
     sub.textContent = 'Free, open-source software from Flathub — one click to install.';
-    grid.appendChild(sub);
+    head.appendChild(sub);
+    wrap.appendChild(head);
 
-    var row = document.createElement('div'); row.setAttribute('style', 'display:flex;gap:8px;margin:10px 0');
+    var row = document.createElement('div'); row.className = 'hart-mkt-search';
     var inp = document.createElement('input'); inp.className = 'ds-input'; inp.type = 'text';
     inp.placeholder = 'Search apps, or describe what you need…';
     var go = document.createElement('button'); go.className = 'ds-btn ds-btn-primary ds-btn-sm'; go.type = 'button';
     go.textContent = 'Search';
-    row.appendChild(inp); row.appendChild(go); grid.appendChild(row);
+    row.appendChild(inp); row.appendChild(go); wrap.appendChild(row);
 
-    var results = document.createElement('div'); results.id = 'hart-mkt-results'; grid.appendChild(results);
+    var results = document.createElement('div'); results.id = 'hart-mkt-results'; wrap.appendChild(results);
 
     function renderFeatured() {
       results.innerHTML = '';
       CATS.forEach(function (cat) {
         var apps = CATALOG.filter(function (a) { return a.c === cat; });
         if (!apps.length) return;
+        var sec = document.createElement('div'); sec.className = 'hart-mkt-section';
         var lbl = document.createElement('div'); lbl.className = 'ds-section-label'; lbl.textContent = cat;
-        results.appendChild(lbl);
+        sec.appendChild(lbl);
         var g = document.createElement('div'); g.className = 'hart-app-grid';
         apps.forEach(function (a) { g.appendChild(appCard(a)); });
-        results.appendChild(g);
+        sec.appendChild(g);
+        results.appendChild(sec);
       });
     }
 
@@ -148,6 +160,6 @@
     inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); doSearch(); } });
 
     renderFeatured();
-    el.appendChild(grid);
+    el.appendChild(wrap);
   };
 })();
