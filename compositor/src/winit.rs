@@ -42,7 +42,7 @@ use smithay::{
     backend::{
         input::{
             AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-            KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+            KeyState, Keycode, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
         },
         renderer::{
             Color32F, Frame, Renderer,
@@ -282,10 +282,15 @@ pub struct State {
     /// bare; the next toggle restores them. A bool so a second Super+D un-hides.
     pub desktop_shown: bool,
 
-    /// M5: keysyms whose PRESS triggered an intercepted shortcut, so the matching
+    /// M5: KEYCODES whose PRESS triggered an intercepted shortcut, so the matching
     /// RELEASE is also swallowed (else the focused client gets a dangling key-up for a
-    /// key it never saw pressed). Anvil's exact `suppressed_keys` mechanism.
-    pub suppressed_keys: Vec<Keysym>,
+    /// key it never saw pressed). Anvil's `suppressed_keys` mechanism, but keyed on the
+    /// physical KEYCODE rather than the resolved keysym: a keycode is INVARIANT between a
+    /// key's press and its release, whereas the modified keysym is NOT (release a held
+    /// Shift/Super before the key and the release's `modified_sym` differs from the
+    /// press's — anvil's keysym-keyed set would then MISS the release and leak a dangling
+    /// key-up to the focused client). Keycode-keyed suppression closes that leak.
+    pub suppressed_keys: Vec<Keycode>,
 }
 
 impl State {
@@ -494,7 +499,17 @@ impl State {
         let mut suppressed = self.suppressed_keys.clone();
         let action: Option<WmAction> = keyboard
             .input::<Option<WmAction>, _>(self, code, state, serial, time, |_, modifiers, handle| {
+                // The MODIFIED sym (Shift→uppercase etc.) drives the letter/arrow/Tab
+                // chords (so Super+Shift+letter would match its uppercase sym, anvil's
+                // convention). The DIGIT row, however, must NOT use the modified sym:
+                // Shift maps the US digits to `!@#$%^&*(`, which fall OUTSIDE the
+                // `KEY_1..=KEY_9` range, so a Super+Shift+N "move to workspace" chord
+                // would never resolve. `raw_latin_sym_or_raw_current_sym` returns the
+                // layout-agnostic LEVEL-0 sym (the bare `1`..`9`) regardless of Shift, so
+                // both Super+N and Super+Shift+N see the same digit. (None only when the
+                // keycode produces no valid keysym — then no digit chord can match.)
                 let keysym = handle.modified_sym();
+                let digit_sym = handle.raw_latin_sym_or_raw_current_sym();
                 // M5 DEBUG (HART_COMP_DEBUG_KEYS): trace every key so the harness can
                 // verify the chord reaches the seat + the modifier state is tracked.
                 if std::env::var_os("HART_COMP_DEBUG_KEYS").is_some() {
@@ -502,22 +517,25 @@ impl State {
                         ?state,
                         logo = modifiers.logo, alt = modifiers.alt, shift = modifiers.shift,
                         raw = keysym.raw(),
+                        digit = digit_sym.map(|s| s.raw()),
+                        keycode = code.raw(),
                         "key.seen"
                     );
                 }
                 if state == KeyState::Pressed {
-                    match process_keyboard_shortcut(*modifiers, keysym) {
+                    match process_keyboard_shortcut(*modifiers, keysym, digit_sym) {
                         Some(act) => {
-                            // Remember the keysym so its release is swallowed too.
-                            suppressed.push(keysym);
+                            // Remember the KEYCODE so its release is swallowed too (the
+                            // keycode is invariant across press→release; the keysym is not).
+                            suppressed.push(code);
                             FilterResult::Intercept(Some(act))
                         }
                         None => FilterResult::Forward,
                     }
                 } else {
-                    // Release: swallow iff this keysym's press was intercepted.
-                    if suppressed.contains(&keysym) {
-                        suppressed.retain(|k| *k != keysym);
+                    // Release: swallow iff this KEYCODE's press was intercepted.
+                    if suppressed.contains(&code) {
+                        suppressed.retain(|k| *k != code);
                         FilterResult::Intercept(None)
                     } else {
                         FilterResult::Forward
@@ -1545,20 +1563,37 @@ fn which(prog: &str) -> Option<std::path::PathBuf> {
     })
 }
 
-/// M5 — map a `(ModifiersState, Keysym)` chord to a compositor `WmAction`, or `None`
-/// to forward the key to the focused client. Modelled 1:1 on anvil's
-/// `process_keyboard_shortcut` (`KeyAction` map): `mods.logo` = the Super/Windows key,
-/// `mods.alt`/`mods.shift` the obvious modifiers; letter/arrow keys match the named
-/// `Keysym` consts (`Keysym::q`/`Left`/…), and the digit row uses the `KEY_1..=KEY_9`
-/// raw-keysym range (`keysyms as xkb`, `keysym.raw()` is the `u32` the range compares),
-/// with `n = raw - KEY_1` the 0-based workspace index (anvil's exact `Screen()` formula).
+/// M5 — map a chord to a compositor `WmAction`, or `None` to forward the key to the
+/// focused client. Modelled 1:1 on anvil's `process_keyboard_shortcut` (`KeyAction`
+/// map): `mods.logo` = the Super/Windows key, `mods.alt`/`mods.shift` the obvious
+/// modifiers; letter/arrow/Tab chords match the named `Keysym` consts
+/// (`Keysym::q`/`Left`/…) on the MODIFIED sym, and the digit row matches the
+/// `KEY_1..=KEY_9` range with `n = raw - KEY_1` the 0-based workspace index.
+///
+/// `keysym` is the MODIFIED sym (Shift→uppercase applied), used for the letter/arrow/
+/// Tab chords. `digit_sym` is the LAYOUT-AGNOSTIC level-0 sym from the keyboard handle
+/// (`raw_latin_sym_or_raw_current_sym`), used ONLY for the digit-row chords — because
+/// Shift maps the US digits to `!@#$%^&*(` (NOT a uniform offset), so matching the
+/// MODIFIED sym against `KEY_1..=KEY_9` would make every Super+Shift+N "move to
+/// workspace" chord silently fail. The level-0 sym is the bare `1`..`9` whether or not
+/// Shift is held, so Super+N and Super+Shift+N resolve the same digit. `digit_sym` is
+/// `None` only when the keycode produces no valid keysym (then no digit chord matches).
 ///
 /// The MAP is the single source of truth for "which chords HART-comp owns"; everything
 /// not listed returns `None` and the app keeps the key (so e.g. an app's own Ctrl+C,
 /// Super+Space IME toggle, etc. are untouched). Order: the Super+Shift digit case is
 /// checked BEFORE the plain Super digit case (shift is the more specific match).
-fn process_keyboard_shortcut(mods: ModifiersState, keysym: Keysym) -> Option<WmAction> {
-    let raw = keysym.raw();
+fn process_keyboard_shortcut(
+    mods: ModifiersState,
+    keysym: Keysym,
+    digit_sym: Option<Keysym>,
+) -> Option<WmAction> {
+    // The digit-row workspace index (0-based) IFF the key is a top-row digit 1..9, read
+    // from the layout-agnostic level-0 sym so Shift never knocks it out of range.
+    let workspace_digit = digit_sym
+        .map(|s| s.raw())
+        .filter(|raw| (xkb::KEY_1..=xkb::KEY_9).contains(raw))
+        .map(|raw| (raw - xkb::KEY_1) as usize);
     // ── Alt+Tab / Alt+Shift+Tab — focus cycle (Super must NOT be held). xkb emits
     //    ISO_Left_Tab for Shift+Tab, so accept either that or Tab+shift. ──
     if mods.alt && !mods.logo {
@@ -1573,12 +1608,16 @@ fn process_keyboard_shortcut(mods: ModifiersState, keysym: Keysym) -> Option<WmA
     if mods.logo {
         // Super+Shift+1..9 — move the focused window to workspace N (more specific
         // than the plain Super+digit below, so check it first).
-        if mods.shift && (xkb::KEY_1..=xkb::KEY_9).contains(&raw) {
-            return Some(WmAction::MoveToWorkspace((raw - xkb::KEY_1) as usize));
+        if mods.shift {
+            if let Some(n) = workspace_digit {
+                return Some(WmAction::MoveToWorkspace(n));
+            }
         }
         // Super+1..9 — switch to workspace N (0-based).
-        if !mods.shift && (xkb::KEY_1..=xkb::KEY_9).contains(&raw) {
-            return Some(WmAction::SwitchWorkspace((raw - xkb::KEY_1) as usize));
+        if !mods.shift {
+            if let Some(n) = workspace_digit {
+                return Some(WmAction::SwitchWorkspace(n));
+            }
         }
         // Super+Q — close the focused toplevel.
         if keysym == Keysym::q {
@@ -2114,15 +2153,22 @@ fn spawn_xwayland(dh: &DisplayHandle, loop_handle: &LoopHandle<'static, State>) 
 // ════════════════════════════════════════════════════════════════════════════
 // M5 — behavioural unit floor for the keyboard-shortcut MAP.
 //
-// `process_keyboard_shortcut` is a PURE function (ModifiersState, Keysym) -> the
-// resolved WmAction, so the full chord→action contract is unit-testable without a
-// live compositor — which matters because the WSL-nested-in-headless-sway harness
-// cannot inject keyboard into the winit backend (sway forwards keysyms, but winit's
-// nested wl_keyboard does not surface them; the ACTION side is proven live via the
-// IPC verbs that call the SAME switch/move/place/close bodies). These assert the
-// MAP: every documented chord resolves to its action, the modifier discrimination is
-// exact (Super+Shift+N ≠ Super+N), and non-chord keys are forwarded (None) so apps
-// keep their own keystrokes. Mirrors anvil's `process_keyboard_shortcut` table.
+// `process_keyboard_shortcut` is a PURE function (ModifiersState, modified Keysym,
+// level-0 digit Keysym) -> the resolved WmAction, so the full chord→action contract is
+// unit-testable without a live compositor — which matters because the
+// WSL-nested-in-headless-sway harness CANNOT inject a real keystroke into the winit
+// backend: wtype rewrites its virtual keymap and presses evdev keycode 1 for every
+// key, and neither the nested winit backend nor Smithay's seat honour that per-press
+// keymap, so every injected key collapses to keycode 9 = Escape (proven live via
+// WAYLAND_DEBUG + HART_COMP_DEBUG_KEYS). On real evdev hardware (the DRM/libinput
+// `wayland.rs` backend) keycodes arrive straight from the kernel and resolve correctly,
+// so the chord LOGIC is exercised here at the unit level and the EXECUTORS are exercised
+// live via the IPC verbs that call the SAME switch/move/place/close bodies.
+//
+// These assert the MAP: every documented chord resolves to its action, the modifier
+// discrimination is exact (Super+Shift+N ≠ Super+N), the digit row survives Shift
+// (the `digit_sym` fix), and non-chord keys are forwarded (None) so apps keep their
+// own keystrokes. Mirrors anvil's `process_keyboard_shortcut` table.
 // ════════════════════════════════════════════════════════════════════════════
 #[cfg(test)]
 mod m5_keybinding_tests {
@@ -2138,41 +2184,51 @@ mod m5_keybinding_tests {
         }
     }
 
+    /// A non-digit chord: the live closure passes the modified sym as BOTH the letter/
+    /// arrow sym and (harmlessly) the level-0 sym — a letter/arrow's level-0 sym is never
+    /// in `KEY_1..=KEY_9`, so it can never spuriously match a digit chord. Model that by
+    /// passing the same sym for `digit_sym`.
+    fn chord(m: ModifiersState, keysym: Keysym) -> Option<WmAction> {
+        process_keyboard_shortcut(m, keysym, Some(keysym))
+    }
+
+    /// A DIGIT chord, modelling the real seat: `modified` is what `modified_sym()`
+    /// returns (Shift maps US `1`→`!`, `3`→`#`, …) and `level0` is the layout-agnostic
+    /// `raw_latin_sym_or_raw_current_sym()` (the bare digit, Shift-independent).
+    fn digit_chord(m: ModifiersState, modified: Keysym, level0: Keysym) -> Option<WmAction> {
+        process_keyboard_shortcut(m, modified, Some(level0))
+    }
+
     #[test]
     fn alt_tab_cycles_focus_forward() {
         // Alt+Tab (no Super) → CycleFocus. Super must NOT be held.
-        assert_eq!(
-            process_keyboard_shortcut(mods(false, true, false), Keysym::Tab),
-            Some(WmAction::CycleFocus)
-        );
+        assert_eq!(chord(mods(false, true, false), Keysym::Tab), Some(WmAction::CycleFocus));
     }
 
     #[test]
     fn alt_shift_tab_cycles_focus_back() {
         // xkb emits ISO_Left_Tab for Shift+Tab; accept that OR Tab+shift.
         assert_eq!(
-            process_keyboard_shortcut(mods(false, true, true), Keysym::ISO_Left_Tab),
+            chord(mods(false, true, true), Keysym::ISO_Left_Tab),
             Some(WmAction::CycleFocusBack)
         );
-        assert_eq!(
-            process_keyboard_shortcut(mods(false, true, true), Keysym::Tab),
-            Some(WmAction::CycleFocusBack)
-        );
+        assert_eq!(chord(mods(false, true, true), Keysym::Tab), Some(WmAction::CycleFocusBack));
     }
 
     #[test]
     fn super_digits_switch_workspaces_zero_based() {
-        // Super+1 → workspace 0, Super+9 → workspace 8 (anvil's `raw - KEY_1`).
+        // Super+1 → workspace 0, Super+9 → workspace 8 (anvil's `raw - KEY_1`). No Shift,
+        // so the modified sym IS the bare digit.
         assert_eq!(
-            process_keyboard_shortcut(mods(true, false, false), Keysym::_1),
+            digit_chord(mods(true, false, false), Keysym::_1, Keysym::_1),
             Some(WmAction::SwitchWorkspace(0))
         );
         assert_eq!(
-            process_keyboard_shortcut(mods(true, false, false), Keysym::_2),
+            digit_chord(mods(true, false, false), Keysym::_2, Keysym::_2),
             Some(WmAction::SwitchWorkspace(1))
         );
         assert_eq!(
-            process_keyboard_shortcut(mods(true, false, false), Keysym::_9),
+            digit_chord(mods(true, false, false), Keysym::_9, Keysym::_9),
             Some(WmAction::SwitchWorkspace(8))
         );
     }
@@ -2182,61 +2238,68 @@ mod m5_keybinding_tests {
         // Super+Shift+N → MoveToWorkspace(N-1). Shift is the MORE specific match and
         // must win over the plain Super+N switch.
         assert_eq!(
-            process_keyboard_shortcut(mods(true, false, true), Keysym::_3),
+            digit_chord(mods(true, false, true), Keysym::_3, Keysym::_3),
             Some(WmAction::MoveToWorkspace(2))
         );
         // Same digit WITHOUT shift is a switch, not a move — the discrimination is exact.
         assert_eq!(
-            process_keyboard_shortcut(mods(true, false, false), Keysym::_3),
+            digit_chord(mods(true, false, false), Keysym::_3, Keysym::_3),
             Some(WmAction::SwitchWorkspace(2))
         );
     }
 
     #[test]
-    fn super_q_closes_focused() {
+    fn super_shift_digit_resolves_when_modified_sym_is_shifted() {
+        // REGRESSION GUARD for the real defect: on a US keymap, Shift maps the digit row
+        // to `!@#$%^&*(`, so `modified_sym()` for the Super+Shift+3 chord is `numbersign`
+        // (#), NOT `3`. Matching the MODIFIED sym against `KEY_1..=KEY_9` therefore FAILED
+        // (numbersign is out of range) → MoveToWorkspace never fired from the keyboard.
+        // The fix reads the LEVEL-0 sym (the bare `3`) for the digit range. Prove that the
+        // chord still resolves even though the modified sym is the shifted symbol.
         assert_eq!(
-            process_keyboard_shortcut(mods(true, false, false), Keysym::q),
-            Some(WmAction::CloseFocused)
+            digit_chord(mods(true, false, true), Keysym::numbersign, Keysym::_3),
+            Some(WmAction::MoveToWorkspace(2))
         );
+        assert_eq!(
+            digit_chord(mods(true, false, true), Keysym::exclam, Keysym::_1),
+            Some(WmAction::MoveToWorkspace(0))
+        );
+        assert_eq!(
+            digit_chord(mods(true, false, true), Keysym::parenleft, Keysym::_9),
+            Some(WmAction::MoveToWorkspace(8))
+        );
+    }
+
+    #[test]
+    fn super_q_closes_focused() {
+        assert_eq!(chord(mods(true, false, false), Keysym::q), Some(WmAction::CloseFocused));
     }
 
     #[test]
     fn super_arrows_snap_and_restore() {
-        assert_eq!(
-            process_keyboard_shortcut(mods(true, false, false), Keysym::Left),
-            Some(WmAction::SnapLeft)
-        );
-        assert_eq!(
-            process_keyboard_shortcut(mods(true, false, false), Keysym::Right),
-            Some(WmAction::SnapRight)
-        );
-        assert_eq!(
-            process_keyboard_shortcut(mods(true, false, false), Keysym::Up),
-            Some(WmAction::Maximize)
-        );
-        assert_eq!(
-            process_keyboard_shortcut(mods(true, false, false), Keysym::Down),
-            Some(WmAction::RestoreWindow)
-        );
+        assert_eq!(chord(mods(true, false, false), Keysym::Left), Some(WmAction::SnapLeft));
+        assert_eq!(chord(mods(true, false, false), Keysym::Right), Some(WmAction::SnapRight));
+        assert_eq!(chord(mods(true, false, false), Keysym::Up), Some(WmAction::Maximize));
+        assert_eq!(chord(mods(true, false, false), Keysym::Down), Some(WmAction::RestoreWindow));
     }
 
     #[test]
     fn super_d_toggles_show_desktop() {
-        assert_eq!(
-            process_keyboard_shortcut(mods(true, false, false), Keysym::d),
-            Some(WmAction::ShowDesktop)
-        );
+        assert_eq!(chord(mods(true, false, false), Keysym::d), Some(WmAction::ShowDesktop));
     }
 
     #[test]
     fn non_chord_keys_are_forwarded_to_the_app() {
         // A plain letter (no modifier) is NOT a WM chord → None → the app keeps it.
-        assert_eq!(process_keyboard_shortcut(mods(false, false, false), Keysym::a), None);
+        assert_eq!(chord(mods(false, false, false), Keysym::a), None);
         // Ctrl+C (no logo/alt) is the app's, not ours.
-        assert_eq!(process_keyboard_shortcut(mods(false, false, false), Keysym::c), None);
+        assert_eq!(chord(mods(false, false, false), Keysym::c), None);
         // A bare arrow (no Super) is the app's (cursor movement), not a snap.
-        assert_eq!(process_keyboard_shortcut(mods(false, false, false), Keysym::Left), None);
+        assert_eq!(chord(mods(false, false, false), Keysym::Left), None);
         // Super+letter we don't bind (e.g. Super+Z) is forwarded.
-        assert_eq!(process_keyboard_shortcut(mods(true, false, false), Keysym::z), None);
+        assert_eq!(chord(mods(true, false, false), Keysym::z), None);
+        // A bare digit (no Super) is the app's — even though its level-0 sym IS a digit,
+        // without Super neither the switch nor the move chord fires.
+        assert_eq!(digit_chord(mods(false, false, false), Keysym::_1, Keysym::_1), None);
     }
 }
