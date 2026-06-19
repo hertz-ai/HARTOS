@@ -103,6 +103,12 @@ setsid runuser -u sathish -- bash -c "
   export LIBGL_ALWAYS_SOFTWARE=1
   export HART_COMP_FORCE_SOFTWARE=1
   export HART_COMP_NO_TEST_CLIENT=1
+  # XWayland 23.2 (built from source into /opt/xwayland-new — jammy ships only 22.1.1,
+  # which lacks the modern xwayland-shell association protocol Smithay needs to attach a
+  # wl_surface to an X11 window, so X11 windows would map-but-never-paint). Smithay spawns
+  # the X server via Command::new(\"Xwayland\") + a PATH lookup, so the newer one MUST be
+  # first on PATH. Its libwayland-1.22 dep is baked in via rpath (host is 1.20).
+  export PATH=/opt/xwayland-new:\$PATH
   # Diagnostics OFF for the clean proof run. To debug, export HART_COMP_XWAYLAND_VERBOSE=1
   # (XWayland child stdio) and/or HART_COMP_DEBUG_RENDER=1 (per-element render dump)
   # before invoking this script.

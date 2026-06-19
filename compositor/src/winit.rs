@@ -125,6 +125,13 @@ use crate::{
 /// transition (0→N / N→0) instead of spamming every frame. Pure observability.
 static LAYERS_PAINTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// One-shot marker stashed in an X11 `Window`'s user-data the first time it is given
+/// keyboard focus (on its first associated commit — see `CompositorHandler::commit`).
+/// X11 surfaces associate their `wl_surface` ASYNCHRONOUSLY under XWayland, so the
+/// focus-on-map cannot happen in `map_window_request` (the surface is still `None`
+/// there); it is deferred to the first commit and de-duplicated by this marker.
+struct X11Focused;
+
 // ────────────────────────────────────────────────────────────────────────────
 // Per-client state. Carries the compositor-side client bookkeeping Smithay needs.
 // ────────────────────────────────────────────────────────────────────────────
@@ -525,6 +532,27 @@ impl CompositorHandler for State {
                     keyboard.set_focus(self, Some(root.clone()), serial);
                 }
             }
+
+            // X11 (XWayland) keyboard-focus-on-association. An X11 toplevel mints its
+            // handle EARLY (in `XwmHandler::map_window_request`, before the wl_surface
+            // exists), so the xdg map-edge branch above is skipped for it. But the
+            // X11↔wl_surface association is ASYNC: `wl_surface()` only becomes real on
+            // the client's first commit (the xwayland-shell serial handshake). THIS is
+            // that first commit — the surface now has a buffer and `window_for_surface`
+            // matched it, so it IS associated. Give the X11 window keyboard focus once,
+            // here, so a just-launched X11 app receives keystrokes without a click. The
+            // one-shot guard is a marker in the window's user-data.
+            if &root == surface
+                && window.x11_surface().is_some()
+                && surface_has_buffer(surface)
+                && window.user_data().get::<X11Focused>().is_none()
+            {
+                window.user_data().insert_if_missing(|| X11Focused);
+                self.space.raise_element(&window, true);
+                let serial = SERIAL_COUNTER.next_serial();
+                let keyboard = self.keyboard.clone();
+                keyboard.set_focus(self, Some(root.clone()), serial);
+            }
         }
         ensure_initial_configure(self, surface);
     }
@@ -718,29 +746,45 @@ impl XwmHandler for State {
         let _ = window.set_mapped(true);
         let app_id = x11_app_id(&window);
         let title = x11_title(&window);
-        // X11 needs an explicit configure to learn its on-screen position. Configure
-        // it to the cascade location at the client's OWN requested SIZE
-        // (`window.geometry().size`) — NOT the space bbox, which at map time (before
-        // the buffer commits) is empty and would size the window to 0×0 (it would map
-        // but paint nothing — the bug this replaces). Then wrap it as a desktop Window.
+        // Map the X11 surface into the space at the cascade location FIRST, then
+        // configure it to the geometry the space gave it — modelled 1:1 on anvil's
+        // `map_window_request` (place → `element_bbox` → `configure`). Configuring to
+        // the post-map bbox (rather than the client's raw pre-map geometry) is the
+        // robust path: the space owns the window's on-screen rect, and X11 needs an
+        // explicit configure to learn its position. `element_bbox` carries the
+        // client's last-configure size (non-empty for a normal X11 toplevel), so the
+        // window is sized correctly, not 0×0.
         let loc = self.next_cascade_loc();
-        let size = window.geometry().size;
-        let _ = window.configure(Some(Rectangle::new(loc, size)));
         let win = Window::new_x11_window(window);
         self.space.map_element(win.clone(), loc, true);
+        if let Some(bbox) = self.space.element_bbox(&win) {
+            if let Some(xsurface) = win.x11_surface() {
+                let _ = xsurface.configure(Some(bbox));
+            }
+        }
         let handle = self.on_real_map(app_id, title, ToplevelKind::XWayland);
         win.user_data().insert_if_missing(|| handle);
-        // Focus the freshly-mapped X11 toplevel + raise it in the X11 stack.
+        // Raise the freshly-mapped X11 toplevel in BOTH the desktop stack and the X11
+        // stacking order (so XWayland keeps the same z-order the compositor shows).
         self.space.raise_element(&win, true);
         if let Some(x11) = win.x11_surface() {
             if let Some(xwm) = self.xwm.as_mut() {
                 let _ = xwm.raise_window(x11);
             }
         }
-        let serial = SERIAL_COUNTER.next_serial();
-        let surface = win.wl_surface().map(|s| s.into_owned());
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, surface, serial);
+        // Keyboard focus: the X11↔wl_surface association is ASYNC under XWayland — at
+        // map-request time `wl_surface()` is usually still `None` (it resolves on the
+        // client's first commit, via the xwayland-shell association). So focusing the
+        // surface here would no-op. Stash the intent on the seat by raising + giving
+        // the window the activated state; the actual keyboard focus is set on the X11
+        // surface's first commit in `CompositorHandler::commit` (which now handles X11
+        // roots too), once `wl_surface()` is real. If it already resolved (fast path),
+        // focus it immediately.
+        if let Some(surface) = win.wl_surface().map(|s| s.into_owned()) {
+            let serial = SERIAL_COUNTER.next_serial();
+            let keyboard = self.keyboard.clone();
+            keyboard.set_focus(self, Some(surface), serial);
+        }
     }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
