@@ -335,6 +335,26 @@ in
     };
   };
 
+  # ─── Touchpad: libinput tap-to-click (session-agnostic) ───
+  # The dconf "org/gnome/desktop/peripherals/touchpad" tap-to-click below ONLY
+  # applies to a GNOME Shell session. The shipped defaultSession is the cage /
+  # GTK4 glass shell (services.displayManager.defaultSession = "hart-glass-gtk4"),
+  # which reads its pointer config straight from libinput at the seat level — so
+  # tapping the touch SURFACE did nothing on the live OS while the physical
+  # button still clicked (pointer + button work; Tapping was simply never
+  # enabled for non-GNOME sessions). Enabling services.libinput.touchpad here
+  # turns tap-to-click on for EVERY session (cage glass shell + GTK4 host + GNOME
+  # fallback), not just GNOME's dconf path.
+  services.libinput = {
+    enable = true;
+    touchpad = {
+      tapping = true;            # single-finger tap = left click (THE fix)
+      tappingDragLock = true;    # tap-drag stays engaged across a lift
+      naturalScrolling = true;   # match the GNOME dconf natural-scroll above
+      clickMethod = "clickfinger";  # 2-finger tap = right, 3 = middle
+    };
+  };
+
   # GNOME Shell extensions + theming
   environment.gnome.excludePackages = with pkgs; [
     gnome-tour  # Disable first-run tour (HART has its own onboarding)
