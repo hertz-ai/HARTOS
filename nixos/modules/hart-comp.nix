@@ -1,4 +1,4 @@
-{ config, lib, pkgs, hartSrc ? /etc/hart, ... }:
+{ config, lib, pkgs, hartSrc ? /etc/hart, hartRustNixpkgs ? null, ... }:
 
 # ════════════════════════════════════════════════════════════════════════════
 # HART OS — HART-comp: the AI-native Smithay/Rust compositor (Tier-1, OPT-IN)
@@ -57,6 +57,45 @@ let
   # The compositor crate lives at <repo-root>/compositor (the Smithay skeleton).
   compositorSrc = hartSrc + "/compositor";
 
+  # ── Newer Rust (≥1.85) for the edition2024 Smithay manifest ──
+  # The main pin (24.11, 50ab793) tops out at Rust 1.83, but the pinned git-Smithay
+  # rev declares `edition = "2024"` + `rust-version = "1.85"`, so Cargo < 1.85 cannot
+  # even PARSE its Cargo.toml ("feature `edition2024` is required") — proven by the
+  # first real `nix build .#hart-comp` in CI (M9). We therefore build hart-comp with
+  # `rust_1_86` (rustc 1.86.0) sourced from the nixos-25.05 input threaded in via
+  # specialArgs (`hartRustNixpkgs`), while keeping EVERY C buildInput below on the
+  # 24.11 `pkgs` (24.11's `mesa` still bundles libgbm; 25.05 split it into a separate
+  # `libgbm` attr, so mixing 25.05 libs would re-break the gbm link). Newer compiler,
+  # same libs — the standard nixpkgs "build this crate with a specific Rust" idiom via
+  # makeRustPlatform. This is stock nixpkgs, NOT rust-overlay/fenix (the precedent's
+  # "no new toolchain class" holds: the toolchain is still plain nixpkgs).
+  #
+  # Fallback to `pkgs.rustPlatform` if the input is somehow absent (e.g. a consumer
+  # that imports this module without the flake specialArgs) so eval never crashes;
+  # that path only matters off the flake, where the package is not actually built.
+  rustNixpkgs =
+    if hartRustNixpkgs != null
+    then import hartRustNixpkgs {
+      inherit (pkgs.stdenv.hostPlatform) system;
+      config = pkgs.config;
+    }
+    else pkgs;
+  # rust_1_86 = rustc 1.86.0 + matching cargo (≥1.85 → edition2024 OK). We use 25.05's
+  # OWN makeRustPlatform (and hence its buildRustPackage + importCargoLock/cargo-vendor
+  # machinery), because the vendoring step itself runs cargo to PARSE every dep
+  # manifest — that is exactly what failed on 24.11 (cargo 1.82 choked on Smithay's
+  # edition2024 Cargo.toml). 25.05's vendor machinery is built for cargo 1.86, so the
+  # whole Rust build path is self-consistent on 25.05; only the C buildInputs below
+  # stay on the 24.11 `pkgs` (libgbm-in-mesa). Off-flake (input absent), fall back to
+  # the 24.11 rustPlatform so plain module eval never crashes.
+  hartRustPlatform =
+    if hartRustNixpkgs != null
+    then rustNixpkgs.makeRustPlatform {
+      cargo = rustNixpkgs.rust_1_86.packages.stable.cargo;
+      rustc = rustNixpkgs.rust_1_86.packages.stable.rustc;
+    }
+    else pkgs.rustPlatform;
+
   # ── The HART-comp package (buildRustPackage of compositor/) ──
   #
   # NOTE: post the M1 forward-port the committed Cargo.lock is NO LONGER
@@ -66,7 +105,7 @@ let
   # away — it is load-bearing for the smithay-feature resolution. This package uses
   # the reproducible cargoLock.lockFile model (the SAME idiom as
   # hart-rust-precedent.nix), PLUS an explicit `outputHashes` for the one git dep.
-  hartCompPkg = pkgs.rustPlatform.buildRustPackage {
+  hartCompPkg = hartRustPlatform.buildRustPackage {
     pname = "hart-comp";
     version = "0.1.0";
 

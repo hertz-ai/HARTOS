@@ -10,6 +10,23 @@
     # TODO: update once upstream fix lands.
     nixpkgs.url = "github:NixOS/nixpkgs/50ab793";
 
+    # ── Newer-Rust toolchain source for the hart-comp Smithay crate ONLY ──
+    # The main pin (50ab793) is the NixOS 24.11 release branch, whose newest Rust is
+    # 1.83 (rust_1_82 / rust_1_83 are the only versioned attrs). The git-Smithay rev
+    # the compositor pins (47843391, June-2026 main) has `edition = "2024"` +
+    # `rust-version = "1.85"` in its Cargo.toml, so Cargo < 1.85 fails to even PARSE
+    # its manifest ("feature `edition2024` is required"). 24.11 therefore CANNOT
+    # build the moat crate — discovered by the first real `nix build .#hart-comp` in
+    # CI (M9). This second input pins nixos-25.05 SOLELY to source `rust_1_86`
+    # (rustc 1.86.0) for hart-comp's buildRustPackage. It is stock nixpkgs (NOT
+    # rust-overlay/fenix — the precedent's "no new toolchain class" still holds), and
+    # it touches NOTHING else: every ISO/image build keeps the 24.11 pin, and
+    # hart-comp's C buildInputs (wayland/mesa/seatd/…) ALSO stay on 24.11 (24.11's
+    # `mesa` still ships libgbm; 25.05 split it into a separate `libgbm` attr, so
+    # mixing 25.05 libs would re-break the gbm link). Newer compiler, same libs.
+    # Pinned to an exact rev (not the branch) for reproducibility.
+    nixpkgs-rust.url = "github:NixOS/nixpkgs/ac62194c3917d5f474c1a844b6fd6da2db95077d";
+
     llama-cpp = {
       url = "github:ggml-org/llama.cpp";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -31,7 +48,7 @@
     };
   };
 
-  outputs = { self, nixpkgs, llama-cpp, nixos-generators, nixos-hardware, mobile-nixos }:
+  outputs = { self, nixpkgs, nixpkgs-rust, llama-cpp, nixos-generators, nixos-hardware, mobile-nixos }:
   let
     # Shared module list for all variants
     hartModules = [
@@ -137,6 +154,12 @@
       hartVersion = "1.0.0";
       hartVariant = variant;
       hartSrc = ../.;  # repo root
+      # The newer-Rust nixpkgs (25.05) — passed as the raw flake input so hart-comp.nix
+      # can instantiate `rust_1_86` for ITS system (the module knows its own system via
+      # pkgs.stdenv). Only hart-comp.nix consumes it; every other module ignores it.
+      # See the `nixpkgs-rust` input comment for WHY (24.11 Rust < 1.85 can't parse the
+      # edition2024 Smithay manifest).
+      hartRustNixpkgs = nixpkgs-rust;
     };
 
     # Build a full NixOS system configuration
