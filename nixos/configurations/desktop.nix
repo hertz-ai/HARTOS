@@ -540,14 +540,23 @@ in
   users.groups.nixos = lib.mkForce {};
   services.getty.autologinUser = lib.mkForce null;
 
-  # ─── Default session = the HART OS glass shell (NOT GNOME) ───
-  # This is the line that makes the install land in Nunba/LiquidUI instead of
-  # the GNOME desktop.  The "hart-shell" session is the cage kiosk registered by
-  # hart-liquid-ui.nix (Nunba/LiquidUI as the shell, no desktop beneath it).
-  # GNOME stays enabled + selectable at the greeter as a FALLBACK, so a shell
-  # that fails to come up can never brick the boot — interrupt auto-login and
-  # pick "GNOME".  Zero-regression by construction.
-  services.displayManager.defaultSession = lib.mkForce "hart-shell";
+  # ─── Default session = the HART OS native glass shell on a REAL compositor ───
+  # MIGRATED off the cage web-kiosk (Tier-3 floor) to the GTK4 layer-shell host
+  # running on a real Wayland compositor (sway, Tier-2) — the native-compositor
+  # path the #3 (sway-Tier-1) / #4 + #10 (GTK4 layer-shell host) phases built.
+  # hart.layerShellHost registers the "hart-glass-gtk4" wayland-session
+  # (hart-layer-shell-host.nix); it RE-HOSTS the SAME served LiquidUI glass shell
+  # (webkit), so there is no shell rewrite. Its assertion (hart.liquidUI.enable +
+  # renderer="webkit") is satisfied by this config.
+  #
+  # NEVER-FAIL (cannot brick the boot): the cage "hart-shell" session stays
+  # REGISTERED (hart-liquid-ui.nix) AND GNOME stays selectable at the greeter, so
+  # a compositor that fails to come up either drops to cage via the B4
+  # out-of-process tier-drop supervisor, or you interrupt auto-login and pick
+  # "HART OS (cage)" / "GNOME". Revert = flip this one line back to "hart-shell".
+  # Zero-regression by construction.
+  hart.layerShellHost.enable = true;
+  services.displayManager.defaultSession = lib.mkForce "hart-glass-gtk4";
 
   # Audio: PipeWire bridges all subsystems (Linux, Android, Wine)
   services.pipewire = {
