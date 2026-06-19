@@ -215,6 +215,24 @@ Backs the shell's display-resolution/scale system panels with a real backend.
 **result:** `{ "subscription": "sub_4a", "events": [ ... ] }`
 Thereafter the compositor sends unsolicited event frames (§5) on that subscription.
 
+### 4.11 `screen.kill` — `ScreenKill(on)` *(M6 — the constitutional screen kill-switch)*
+**args:** `{ "on": true }` (omit → defaults `true`)
+**result:** `{ "blocked": true }`
+The brain pushes this when the human cuts (or restores) the `screen` sense (§6.4). It sets
+**one** compositor flag that simultaneously:
+1. draws a full-output **opaque black** surface ABOVE every window/layer (privacy);
+2. **stops forwarding input** to clients (control); and
+3. **refuses every `zwlr_screencopy` `copy`** — the frame is `failed()`, so no native
+   capture can read the screen while cut (no-native-capture invariant).
+
+This keeps the gate **at the compositor with zero per-frame IPC**: the brain-side authority
+(`core.ai_sensing`) pushes the *edge* over this socket rather than being polled every frame.
+Until the Phase-7 portal + cross-process lock land, `zwlr_screencopy` (served against
+HART-comp's own framebuffer so `grim`/`wf-recorder` capture it directly) is the governed
+capture path and honours this same gate. The brain-side caller is
+`integrations/agent_engine/hart_wm_client.py` (the same singleton that drives every other
+verb); it maps a `screen` cut/restore from `core.ai_sensing` to `screen.kill {on}`.
+
 ---
 
 ## 5. Events

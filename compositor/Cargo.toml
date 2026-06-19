@@ -148,9 +148,17 @@ codegen-units = 1
 panic = "abort"
 
 [lints.rust]
-# Match the workspace discipline in claw_native/rust: forbid unsafe in our own
-# glue. Smithay's FFI lives behind its own crate boundary.
-unsafe_code = "forbid"
+# Match the workspace discipline in claw_native/rust: NO unsafe in our own glue.
+# Smithay's FFI lives behind its own crate boundary. This is `deny` (not `forbid`)
+# for exactly ONE reason: M6's zwlr_screencopy read-back must memcpy the framebuffer
+# bytes into the client's shm `wl_buffer`, whose mapping Smithay hands us as a raw
+# `*mut u8` (`with_buffer_contents_mut`) — there is no safe Smithay helper for the
+# wlr-screencopy copy at this pinned rev (it predates the upstreamed handler). That
+# single, bounds-checked memcpy carries a `#[allow(unsafe_code)]` + a SAFETY comment
+# in src/screencopy.rs::fill_one; `deny` keeps every OTHER line unsafe-free (a stray
+# unsafe block anywhere else is still a hard error) while permitting that one audited
+# exception. The DRM path (wayland.rs) and all pure logic remain unsafe-free.
+unsafe_code = "deny"
 
 # ── The real GIT Smithay dep, pinned to the EXACT rev in Cargo.lock
 # (47843391c3cd34a32e5ed1721878ca2279269185). Optional, so the default dev-box

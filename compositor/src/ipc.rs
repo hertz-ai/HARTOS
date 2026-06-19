@@ -475,6 +475,19 @@ fn dispatch_request(
             }
         }
 
+        // ── M6 screen.kill(on) — the constitutional screen kill-switch. The brain
+        //    pushes this when the human cuts/restores `screen` (IPC_PROTOCOL.md §6.4 +
+        //    killswitch_plan). It sets ONE compositor flag that (a) draws a full-output
+        //    opaque black surface ABOVE all windows, (b) stops forwarding input to
+        //    clients, and (c) refuses every zwlr_screencopy `copy`. This keeps the
+        //    no-native-capture + privacy/control invariant AT THE COMPOSITOR with zero
+        //    per-frame IPC — the brain-side authority pushes the edge, not polls it. ──
+        "screen.kill" | "ScreenKill" => {
+            let on = args.get("on").and_then(Value::as_bool).unwrap_or(true);
+            let blocked = state.set_capture_blocked(on);
+            Response::ok(id, json!({ "blocked": blocked }))
+        }
+
         // ── §4.10 events.subscribe — register this stream for unsolicited events ──
         "events.subscribe" | "Subscribe" => {
             let events = args.get("events").cloned().unwrap_or_else(|| json!([

@@ -43,7 +43,15 @@
 // honest "not wired yet" — so a reviewer can never mistake the scaffold for a
 // working compositor, and CI compiles the SHAPE before the behavior lands.
 
-#![forbid(unsafe_code)]
+// `deny` (not `forbid`) for ONE audited exception: M6's zwlr_screencopy read-back must
+// memcpy the framebuffer into the client's shm `wl_buffer`, whose mapping Smithay hands
+// over as a raw `*mut u8` (`with_buffer_contents_mut`) with no safe write helper at this
+// pinned rev. That single bounds-checked copy carries a scoped `#[allow(unsafe_code)]` +
+// SAFETY comment in src/screencopy.rs::fill_one; `deny` keeps every OTHER line in the
+// crate unsafe-free (a stray unsafe block anywhere else is still a hard error). See the
+// matching note in Cargo.toml [lints.rust]. The DRM path + all pure logic stay
+// unsafe-free.
+#![deny(unsafe_code)]
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,6 +84,15 @@ mod winit;
 // `winit::State.space`). Off on the default dev-box build. See src/ipc.rs.
 #[cfg(feature = "winit")]
 mod ipc;
+
+// ── Milestone 6 (headline): zwlr_screencopy_v1 served against HART-comp's OWN
+// output framebuffer, so `grim` captures HART-comp DIRECTLY (not the sway host
+// re-composite). Gated behind the SAME `winit` feature as the live compositor whose
+// framebuffer it reads back. Off on the default dev-box build. See src/screencopy.rs
+// (the cursor / animations / screen kill-switch all land in winit.rs and are PROVEN
+// through this capture path — see the module header for the ordering rationale).
+#[cfg(feature = "winit")]
+mod screencopy;
 
 // NOTE: these `use smithay::...` imports are the SHAPE the real compositor needs.
 // They are commented at module scope intentionally — uncommenting + filling the

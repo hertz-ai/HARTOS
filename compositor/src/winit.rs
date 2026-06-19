@@ -45,9 +45,20 @@ use smithay::{
             KeyState, Keycode, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
         },
         renderer::{
-            Color32F, Frame, Renderer,
+            Color32F, Frame, ImportAll, ImportMem, Renderer,
             element::{
                 AsRenderElements, Kind,
+                // M6: the render-element list is now HETEROGENEOUS — window/layer
+                // surfaces (faded via the alpha arg), the software cursor (a client
+                // surface OR a baked default arrow), and the killswitch black surface.
+                // The `render_elements!` macro builds the single enum that unifies
+                // them so one `draw_render_elements` pass paints all three kinds in
+                // z-order. `SolidColorRenderElement`/`SolidColorBuffer` draw the
+                // killswitch (+ the fallback cursor) with zero texture deps;
+                // `MemoryRenderBufferRenderElement` + `MemoryRenderBuffer` bake the
+                // default-arrow cursor once.
+                memory::MemoryRenderBufferRenderElement,
+                solid::{SolidColorBuffer, SolidColorRenderElement},
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             },
             gles::GlesRenderer,
@@ -76,7 +87,7 @@ use smithay::{
             Client,
         },
     },
-    utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Transform},
+    utils::{Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial, Size, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -130,6 +141,27 @@ use crate::{
 /// Last painted wlr-layer-surface count, so the render loop logs a one-line
 /// transition (0→N / N→0) instead of spamming every frame. Pure observability.
 static LAYERS_PAINTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+// ════════════════════════════════════════════════════════════════════════════
+// M6 — the unified render element. Through M5 the render list was a homogeneous
+// `Vec<WaylandSurfaceRenderElement<GlesRenderer>>`. M6 makes it HETEROGENEOUS:
+//   • `Surface` — window + layer client surfaces (faded via the alpha arg on map/close)
+//   • `Memory`  — the software cursor (a baked default-arrow MemoryRenderBuffer)
+//   • `Solid`   — the killswitch full-output black surface (+ the cursor fallback)
+// `render_elements!` generates the enum + its `RenderElement<GlesRenderer>` impl so a
+// single `draw_render_elements` pass paints all three kinds in one z-ordered slice.
+// Modelled on anvil's `CustomRenderElements` (render.rs) — same macro, trimmed to the
+// element kinds HART-comp actually produces.
+// NOTE: the `render_elements!` macro parses each trait bound as a single token tree
+// (`$bound:tt`), so the bounds MUST be bare idents — `smithay::…::ImportAll` (a path
+// with `::`) fails to match. The traits are imported by bare name in the `use smithay`
+// block above (`renderer::{ImportAll, ImportMem}`).
+smithay::backend::renderer::element::render_elements! {
+    pub HartRenderElement<R> where R: ImportAll + ImportMem;
+    Surface=WaylandSurfaceRenderElement<R>,
+    Memory=MemoryRenderBufferRenderElement<R>,
+    Solid=SolidColorRenderElement,
+}
 
 /// One-shot marker stashed in an X11 `Window`'s user-data the first time it is given
 /// keyboard focus (on its first associated commit — see `CompositorHandler::commit`).
@@ -199,6 +231,43 @@ pub(crate) struct HiddenWindow {
     pub(crate) workspace: usize,
     /// Where it was on the visible output before being hidden.
     pub(crate) loc: Point<i32, Logical>,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// M6 — effects: per-window fade clock + the workspace-switch crossfade clock.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Fade duration for a window map-in (the close-out fade is observed differently —
+/// see `close_focused_window`/the IPC close — because the surface is gone once the
+/// client acks the close, so we fade the LIVE map-in and let close be instant; a
+/// proper close-fade needs holding a snapshot texture, deferred as polish). 150ms is
+/// the M6 spec figure: long enough to capture mid-fade, short enough to feel instant.
+const FADE_IN_MS: u128 = 150;
+/// Workspace-switch crossfade duration — the whole active set fades in on switch.
+const WS_FADE_MS: u128 = 120;
+
+/// When a window was mapped, so the render loop can compute its fade-in alpha
+/// (`elapsed/FADE_IN_MS`, clamped to 1.0). Stashed in the window's user-data (the
+/// `WindowHandle` mechanism). `Cell` for the insert-if-missing-then-read pattern the
+/// other M5 user-data carriers use. The instant is monotonic (`Instant`).
+struct MapAnim(Instant);
+
+impl MapAnim {
+    /// The fade-in alpha for this window NOW: 0→1 over `FADE_IN_MS`, then pinned 1.0.
+    /// A fully-faded-in window returns exactly 1.0 so the common steady-state path
+    /// hits the renderer's opaque fast-path (no per-frame alpha blend once settled).
+    fn alpha(&self) -> f32 {
+        let e = self.0.elapsed().as_millis();
+        if e >= FADE_IN_MS {
+            1.0
+        } else {
+            (e as f32 / FADE_IN_MS as f32).clamp(0.0, 1.0)
+        }
+    }
+    /// Is this window still animating (so the loop must keep redrawing)?
+    fn animating(&self) -> bool {
+        self.0.elapsed().as_millis() < FADE_IN_MS
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -291,6 +360,42 @@ pub struct State {
     /// press's — anvil's keysym-keyed set would then MISS the release and leak a dangling
     /// key-up to the focused client). Keycode-keyed suppression closes that leak.
     pub suppressed_keys: Vec<Keycode>,
+
+    // ── M6 — SCREENCOPY (zwlr_screencopy_v1). `pending_screencopy` holds `copy`-
+    // requested frames awaiting the next paint (the read-back needs the live
+    // GlesRenderer + framebuffer, which only exist inside the render closure). The
+    // render loop drains it via `screencopy::service_pending_screencopy`. See
+    // src/screencopy.rs. ──
+    pub pending_screencopy: Vec<crate::screencopy::PendingScreencopy>,
+
+    // ── M6 — SCREEN KILL-SWITCH (constitutional). When the human cuts `screen`, the
+    // brain pushes `screen.kill {on:true}` over the EXISTING IPC, setting this flag.
+    // While set: (a) the render loop draws a full-output OPAQUE BLACK element ABOVE
+    // everything, and (b) input is NOT forwarded to clients, and (c) every screencopy
+    // `copy` immediately `failed()`s. One bool drives all three — the no-capture +
+    // privacy + control kill, enforced at the compositor with zero per-frame IPC. ──
+    pub capture_blocked: bool,
+
+    // ── M6 — SOFTWARE CURSOR. `cursor_status` is the latest client-requested cursor
+    // image (a surface the client set, Hidden, or the default named arrow). The render
+    // loop draws it ABOVE all windows/layers (but BELOW the killswitch). `cursor_buffer`
+    // caches the baked default-arrow `MemoryRenderBuffer` (built once at boot) so the
+    // common "no client cursor" case costs one cached element + a reposition, no
+    // per-frame allocation. ──
+    pub cursor_status: CursorImageStatus,
+    pub cursor_buffer: smithay::backend::renderer::element::memory::MemoryRenderBuffer,
+    /// The baked arrow's hotspot (the click point, relative to the image top-left), so
+    /// the cursor is positioned so its tip — not its top-left — sits at the pointer.
+    pub cursor_hotspot: Point<i32, Logical>,
+
+    // ── M6 — EFFECTS clocks. `ws_switch_at` is set when a workspace switch happens so
+    // the render loop crossfades the newly-shown set in over `WS_FADE_MS`. `None` once
+    // settled. Per-window map fade lives in each window's `MapAnim` user-data. ──
+    pub ws_switch_at: Option<Instant>,
+
+    // ── M6 — the killswitch black surface buffer (full-output opaque black). Cached +
+    // resized on output change so the kill draw is one cheap solid element. ──
+    pub black_buffer: SolidColorBuffer,
 }
 
 impl State {
@@ -350,6 +455,39 @@ impl State {
         }
         self.next_window_loc = next;
         loc
+    }
+
+    /// M6 — the current output size in PHYSICAL (framebuffer) pixels. Screencopy
+    /// reports this as the capturable region; the killswitch + cursor math also use it.
+    /// Scale is 1.0 on the winit path, so logical == physical here; reading the output's
+    /// current mode keeps it correct across a winit resize.
+    pub fn output_physical_size(&self) -> Size<i32, Physical> {
+        self.output
+            .current_mode()
+            .map(|m| m.size)
+            .unwrap_or_else(|| (1280, 800).into())
+    }
+
+    /// M6 — the screen kill-switch. The brain pushes `screen.kill {on}` over the IPC
+    /// when the human cuts/restores `screen`; this flips the one flag that drives all
+    /// three effects (black surface ABOVE everything + input not forwarded + screencopy
+    /// refused). Returns the new state. A force-redraw is implicit (the loop always
+    /// repaints), so the black surface appears on the very next frame.
+    pub fn set_capture_blocked(&mut self, on: bool) -> bool {
+        if self.capture_blocked != on {
+            self.capture_blocked = on;
+            info!(blocked = on, "screen.kill — capture/input/screencopy gate toggled");
+        }
+        // If turning the kill OFF, also fail any frames that queued just as it engaged
+        // (defensive — queue_copy already refuses while blocked, so this is normally a
+        // no-op). If turning ON, fail everything already queued so no in-flight capture
+        // leaks a frame painted before the black surface.
+        if on {
+            for p in self.pending_screencopy.drain(..) {
+                p.frame.failed();
+            }
+        }
+        self.capture_blocked
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -456,6 +594,14 @@ impl State {
     /// Trimmed to the events `WinitInput` actually emits (keyboard, absolute pointer
     /// motion, button, axis); touch is handled by the existing M2 tap path elsewhere.
     fn process_input_event<B: InputBackend>(&mut self, event: InputEvent<B>) {
+        // M6 — screen kill-switch: while the human has cut `screen`, do NOT forward ANY
+        // input to clients (the privacy/control half of the kill — apps behind the black
+        // surface receive nothing). We still SWALLOW the events (vs. ignoring earlier in
+        // the pipe) so no key/pointer leaks through; the compositor's own shutdown path
+        // (WinitEvent::CloseRequested) is unaffected as it never reaches here.
+        if self.capture_blocked {
+            return;
+        }
         match event {
             InputEvent::Keyboard { event } => self.on_keyboard_key::<B>(event),
             InputEvent::PointerMotionAbsolute { event } => {
@@ -786,6 +932,9 @@ impl State {
         }
         // Switching workspaces means the desktop is showing its windows again.
         self.desktop_shown = true;
+        // M6: start the workspace-switch crossfade — the render loop fades the
+        // newly-shown set in over WS_FADE_MS (a cheap whole-set alpha ramp).
+        self.ws_switch_at = Some(Instant::now());
         info!(workspace = n, restored = restored.len(), "workspace.switched");
         true
     }
@@ -1089,6 +1238,9 @@ impl CompositorHandler for State {
                     // `window.list` + move/switch can read it). It maps onto the
                     // workspace the user is currently looking at.
                     self.tag_window_workspace(&window);
+                    // M6: start the map-in fade clock (the render loop ramps this
+                    // window's alpha 0→1 over FADE_IN_MS). Stamped once on the real map.
+                    window.user_data().insert_if_missing(|| MapAnim(Instant::now()));
                     // M4: emit window.opened to IPC subscribers (IPC_PROTOCOL.md §5) —
                     // the same edge that minted the handle, so the event proves a real map.
                     let payload = ipc_event_window_json(self, &window, &handle_str);
@@ -1243,7 +1395,13 @@ impl SeatHandler for State {
     }
 
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
+    /// M6: a client set (or hid) its cursor. Stash the latest status; the render loop
+    /// reads it each frame to draw the software cursor (a client surface, the baked
+    /// default arrow, or nothing when Hidden). The standard anvil pattern — store, draw
+    /// in the loop, no work here.
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        self.cursor_status = image;
+    }
 }
 
 // ── SelectionHandler + DataDevice* — required by the dispatch2 protocol bundle ──
@@ -1349,6 +1507,8 @@ impl XwmHandler for State {
         win.user_data().insert_if_missing(|| handle);
         // M5: tag the new X11 toplevel with the active workspace.
         self.tag_window_workspace(&win);
+        // M6: start the map-in fade clock (render loop ramps alpha 0→1 over FADE_IN_MS).
+        win.user_data().insert_if_missing(|| MapAnim(Instant::now()));
         // M4: emit window.opened to IPC subscribers (IPC_PROTOCOL.md §5) — minted on
         // the REAL X11 map (the corrected Wine path: a handle only here, never on the
         // installer's unconditional success). Note an X11 window's geometry is known
@@ -1736,6 +1896,28 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     // `ImportMemWl` trait import just to add the same mandatory formats). Matches
     // examples/minimal.rs, which maps shm clients with exactly `vec![]`.
 
+    // M6 — register the zwlr_screencopy_v1 manager global so `grim` can capture
+    // HART-comp DIRECTLY. Version 3 (the buffer_done/linux_dmabuf level grim uses);
+    // the per-client bind filter defaults to "allow all" — the socket-owner boundary
+    // (§6.5) already constrains who connects, and the killswitch gates the actual copy.
+    let _screencopy_global = dh
+        .create_global::<State, smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1, _>(3, ());
+
+    // M6 — bake the default-arrow cursor once (a dependency-free RGBA fallback so a
+    // cursor is visible on llvmpipe without an xcursor theme load). `MemoryRenderBuffer`
+    // owns the bytes; the render loop imports it to a texture lazily on first draw.
+    let (cur_rgba, cur_w, cur_h, cur_hotspot) = bake_default_cursor();
+    let cursor_buffer = smithay::backend::renderer::element::memory::MemoryRenderBuffer::from_slice(
+        &cur_rgba,
+        smithay::backend::allocator::Fourcc::Argb8888,
+        (cur_w, cur_h),
+        1,
+        Transform::Normal,
+        None,
+    );
+    // M6 — the killswitch full-output black buffer (resized each frame it is drawn).
+    let black_buffer = SolidColorBuffer::new((win_size.w, win_size.h), [0.0, 0.0, 0.0, 1.0]);
+
     let mut state = State {
         dh: dh.clone(),
         loop_handle: event_loop.handle(),
@@ -1764,6 +1946,14 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         hidden_windows: Vec::new(),
         desktop_shown: true,
         suppressed_keys: Vec::new(),
+        // M6: screencopy queue empty; capture allowed; default cursor; no effect in flight.
+        pending_screencopy: Vec::new(),
+        capture_blocked: false,
+        cursor_status: CursorImageStatus::default_named(),
+        cursor_buffer,
+        cursor_hotspot: cur_hotspot,
+        ws_switch_at: None,
+        black_buffer,
     };
 
     // 6. (No calloop Generic source for the Display — see step 1. The Display is
@@ -1817,107 +2007,20 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        // ── (b) Render the desktop into the winit framebuffer. ──
+        // ── (b) Render the desktop into the winit framebuffer (+ M6: cursor, fades,
+        //    killswitch black, then service screencopy against the painted frame). ──
         let size = backend.window_size();
         let damage = [smithay::utils::Rectangle::from_size(size)];
-        let render_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-            let (renderer, mut framebuffer) = backend.bind()?;
-
-            // Build paint elements front-to-back (draw_render_elements paints in slice
-            // order, so the TOP-most element comes FIRST). Z-order, top→bottom:
-            //   1. mapped toplevels (xdg + X11) in the space's stacking order, raised
-            //      (clicked / newest) ones on top — `space.elements()` yields
-            //      bottom→top, so we reverse to get top-first. Each window paints at its
-            //      `element_location` so M3's cascade + click-to-raise are VISIBLE.
-            //   2. layer-shell surfaces (the glass-shell desktop) underneath.
-            // This replaces M1's `toplevel_surfaces()` (unordered, xdg-only, all at
-            // (0,0)) so multiple windows stack + the X11 (XWayland) windows paint too.
-            let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
-
-            // DEBUG: once a second, dump each space element's loc/size/surface/buffer so
-            // a non-painting window (e.g. an X11 toplevel that mapped but committed no
-            // buffer) is diagnosable. Gated behind HART_COMP_DEBUG_RENDER.
-            if std::env::var_os("HART_COMP_DEBUG_RENDER").is_some()
-                && state.start_time.elapsed().as_millis() % 1000 < 20
-            {
-                for window in state.space.elements() {
-                    let loc = state.space.element_location(window).unwrap_or_default();
-                    let bbox = state.space.element_bbox(window);
-                    let surf = window.wl_surface();
-                    let has_buf = surf.as_ref().map(|s| surface_has_buffer(s)).unwrap_or(false);
-                    let is_x11 = window.x11_surface().is_some();
-                    info!(
-                        ?loc, ?bbox, has_surface = surf.is_some(), has_buffer = has_buf, is_x11,
-                        "render.element"
-                    );
-                }
-            }
-
-            // toplevels (above), top-most first. Render via the Window's own
-            // `AsRenderElements` (NOT a manual `window.wl_surface()` walk): for X11
-            // windows that delegates to `X11Surface::render_elements`, which paints the
-            // X11 surface tree even though the public `wl_surface()` accessor can be None
-            // for XWayland-shell-associated surfaces (the bug that left xterm blank). The
-            // location is PHYSICAL (scale 1.0 here, so it equals the logical coords).
-            for window in state.space.elements().rev() {
-                let loc = state.space.element_location(window).unwrap_or_default();
-                let phys = loc.to_physical_precise_round(1.0);
-                elements.extend(AsRenderElements::<GlesRenderer>::render_elements(
-                    window,
-                    renderer,
-                    phys,
-                    smithay::utils::Scale::from(1.0),
-                    1.0,
-                ));
-            }
-            // layer surfaces (below the toplevels in this list = drawn under them,
-            // since draw_render_elements paints front-to-back in slice order)
-            let mut layers_painted = 0usize;
-            {
-                let map = smithay::desktop::layer_map_for_output(&output);
-                for layer in map.layers() {
-                    layers_painted += 1;
-                    let loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
-                    elements.extend(render_elements_from_surface_tree(
-                        renderer,
-                        layer.wl_surface(),
-                        (loc.x, loc.y),
-                        1.0,
-                        1.0,
-                        Kind::Unspecified,
-                    ));
-                }
-            }
-            // Positive render proof, logged ONLY when the painted-layer count CHANGES
-            // (0→1 when the glass-shell/swaybg layer maps, 1→0 on unmap) — so a tail of
-            // the log shows "the layer surface is in the composited frame" without
-            // spamming 60×/s. This is the BACKGROUND-layer paint signal the M2
-            // "the background fills" gate needs.
-            {
-                let prev = LAYERS_PAINTED.swap(layers_painted, std::sync::atomic::Ordering::Relaxed);
-                if prev != layers_painted {
-                    info!(
-                        layers_painted,
-                        "layer.composited (wlr-layer surfaces now in the rendered frame)"
-                    );
-                }
-            }
-
-            let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
-            // HART splash clear — the brand color, so a slow client never flashes black.
-            let clear = Color32F::new(
-                HART_SPLASH_RGBA[0],
-                HART_SPLASH_RGBA[1],
-                HART_SPLASH_RGBA[2],
-                HART_SPLASH_RGBA[3],
-            );
-            frame.clear(clear, &damage)?;
-            draw_render_elements(&mut frame, 1.0, &elements, &damage)?;
-            let _sync = frame.finish()?;
-            Ok(())
-        })();
-        if let Err(err) = render_result {
+        if let Err(err) = render_frame(&mut state, &mut backend, &output, size, &damage) {
             warn!(?err, "render error");
+        }
+        // M6 — settle finished effects: clear the workspace-switch clock once the
+        // crossfade completed so it doesn't re-evaluate forever. The loop renders every
+        // iteration (calloop's 16ms timeout below paces it ~60fps), so an in-flight fade
+        // PLAYS frame-by-frame without extra scheduling — `effects_animating` only gates
+        // this tidy-up. (Map-in fades self-settle: `MapAnim::alpha` pins 1.0 past 150ms.)
+        if !effects_animating(&state) {
+            state.ws_switch_at = None;
         }
 
         // ── (c) Send frame callbacks so clients draw their NEXT frame. Iterate the
@@ -1962,6 +2065,323 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     info!("HART-comp winit compositor exited cleanly");
     Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// M6 — the render frame. Factored out of the loop so the screencopy read-back (which
+// needs `&mut State` AFTER the immutable element-build) can run against the SAME bound
+// framebuffer without a closure borrow tangle. Z-order, TOP→bottom (draw_render_elements
+// paints slice-order = index 0 is top-most):
+//   0. killswitch black surface (when capture_blocked) — ABOVE everything
+//   1. software cursor (client surface or the baked arrow), hidden when blocked
+//   2. window toplevels (xdg + X11), faded on map-in + the workspace-switch crossfade
+//   3. layer surfaces (the glass-shell desktop) underneath
+// then services queued screencopy frames against the just-painted output.
+fn render_frame(
+    state: &mut State,
+    backend: &mut smithay::backend::winit::WinitGraphicsBackend<GlesRenderer>,
+    output: &Output,
+    size: Size<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use smithay::backend::renderer::element::Kind as ElemKind;
+
+    let (renderer, mut framebuffer) = backend.bind()?;
+
+    // The unified heterogeneous element list (windows + cursor + killswitch).
+    let mut elements: Vec<HartRenderElement<GlesRenderer>> = Vec::new();
+
+    // ── 0. KILLSWITCH (top): a full-output opaque black solid ABOVE all windows. ──
+    if state.capture_blocked {
+        state.black_buffer.update((size.w, size.h), [0.0, 0.0, 0.0, 1.0]);
+        let solid = SolidColorRenderElement::from_buffer(
+            &state.black_buffer,
+            (0, 0),
+            smithay::utils::Scale::from(1.0),
+            1.0,
+            ElemKind::Unspecified,
+        );
+        elements.push(HartRenderElement::Solid(solid));
+    } else {
+        // ── 1. SOFTWARE CURSOR (below the killswitch, above windows). Skipped while
+        //    the killswitch is up (a black privacy screen shows no cursor). ──
+        build_cursor_elements(state, renderer, &mut elements);
+    }
+
+    // DEBUG: once a second, dump each space element's loc/size/surface/buffer so a
+    // non-painting window is diagnosable. Gated behind HART_COMP_DEBUG_RENDER.
+    if std::env::var_os("HART_COMP_DEBUG_RENDER").is_some()
+        && state.start_time.elapsed().as_millis() % 1000 < 20
+    {
+        for window in state.space.elements() {
+            let loc = state.space.element_location(window).unwrap_or_default();
+            let bbox = state.space.element_bbox(window);
+            let surf = window.wl_surface();
+            let has_buf = surf.as_ref().map(|s| surface_has_buffer(s)).unwrap_or(false);
+            let is_x11 = window.x11_surface().is_some();
+            info!(?loc, ?bbox, has_surface = surf.is_some(), has_buffer = has_buf, is_x11, "render.element");
+        }
+    }
+
+    // ── 2. WINDOW TOPLEVELS (above the layers, below the cursor), top-most first.
+    //    Each window's alpha = its map-in fade × the workspace-switch crossfade, so a
+    //    just-mapped window fades 0→1 and a fresh workspace fades the whole set in.
+    //    The alpha is the LAST arg of `render_elements` (the existing M3 call already
+    //    passed 1.0 there — M6 just makes it dynamic). ──
+    let ws_alpha = workspace_fade_alpha(state);
+    for window in state.space.elements().rev() {
+        let loc = state.space.element_location(window).unwrap_or_default();
+        let phys = loc.to_physical_precise_round(1.0);
+        let map_alpha = window
+            .user_data()
+            .get::<MapAnim>()
+            .map(|a| a.alpha())
+            .unwrap_or(1.0);
+        let alpha = (map_alpha * ws_alpha).clamp(0.0, 1.0);
+        // M6 fade PROOF: when an effect is mid-flight this logs the actual sub-1.0 alpha
+        // being handed to the renderer, so the fade is observable in the journal even
+        // when the nested WSL EGL surface freezes before a mid-fade frame can be grabbed
+        // (the alpha math runs regardless of whether `submit` to the host succeeds).
+        if alpha < 0.999 && std::env::var_os("HART_COMP_DEBUG_FADE").is_some() {
+            let handle = window
+                .user_data()
+                .get::<WindowHandle>()
+                .map(|h| h.as_str().to_string())
+                .unwrap_or_default();
+            info!(handle = %handle, map_alpha, ws_alpha, alpha, "effect.fade (sub-1.0 alpha → renderer)");
+        }
+        let win_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+            AsRenderElements::<GlesRenderer>::render_elements(
+                window,
+                renderer,
+                phys,
+                smithay::utils::Scale::from(1.0),
+                alpha,
+            );
+        elements.extend(win_elems.into_iter().map(HartRenderElement::Surface));
+    }
+
+    // ── 3. LAYER surfaces (below the toplevels in this list = drawn under them). ──
+    let mut layers_painted = 0usize;
+    {
+        let map = smithay::desktop::layer_map_for_output(output);
+        for layer in map.layers() {
+            layers_painted += 1;
+            let loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
+            let layer_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                render_elements_from_surface_tree(
+                    renderer,
+                    layer.wl_surface(),
+                    (loc.x, loc.y),
+                    1.0,
+                    ws_alpha,
+                    Kind::Unspecified,
+                );
+            elements.extend(layer_elems.into_iter().map(HartRenderElement::Surface));
+        }
+    }
+    // Positive render proof, logged ONLY when the painted-layer count CHANGES.
+    {
+        let prev = LAYERS_PAINTED.swap(layers_painted, std::sync::atomic::Ordering::Relaxed);
+        if prev != layers_painted {
+            info!(layers_painted, "layer.composited (wlr-layer surfaces now in the rendered frame)");
+        }
+    }
+
+    // Paint the frame.
+    {
+        let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+        let clear = Color32F::new(
+            HART_SPLASH_RGBA[0],
+            HART_SPLASH_RGBA[1],
+            HART_SPLASH_RGBA[2],
+            HART_SPLASH_RGBA[3],
+        );
+        frame.clear(clear, damage)?;
+        draw_render_elements(&mut frame, 1.0, &elements, damage)?;
+        let _sync = frame.finish()?;
+    }
+    // `elements` borrows `renderer` (the surface textures) — drop it before the
+    // screencopy read-back re-borrows `renderer` mutably.
+    drop(elements);
+
+    // ── M6 SCREENCOPY: service queued frames against the JUST-PAINTED framebuffer. The
+    //    read-back captures EXACTLY what was painted (cursor + fades + killswitch), the
+    //    whole reason to capture HART-comp's own output rather than the host recomposite. ──
+    crate::screencopy::service_pending_screencopy(
+        state,
+        renderer,
+        &framebuffer,
+        size,
+        Transform::Flipped180,
+    );
+    Ok(())
+}
+
+/// M6 — build the software-cursor render element(s) at the pointer location, PREPENDED
+/// so the cursor draws on top of windows. Three cases, mirroring anvil's cursor draw:
+///   • `CursorImageStatus::Surface(s)` — the client set a cursor surface; render its
+///     surface tree at the pointer minus the client's hotspot.
+///   • `CursorImageStatus::Named(_)` / default — draw the baked default arrow (a
+///     cached `MemoryRenderBuffer`), tip at the pointer (minus the arrow's hotspot).
+///   • `CursorImageStatus::Hidden` — the client hid the cursor; draw nothing.
+/// Position is physical (scale 1.0 here, matching the window/layer element math).
+fn build_cursor_elements(
+    state: &State,
+    renderer: &mut GlesRenderer,
+    elements: &mut Vec<HartRenderElement<GlesRenderer>>,
+) {
+    use smithay::backend::renderer::element::Kind as ElemKind;
+    let pos = state.pointer.current_location();
+    match &state.cursor_status {
+        CursorImageStatus::Hidden => {}
+        CursorImageStatus::Surface(surface) => {
+            // The client's hotspot is stored in the surface's CursorImageSurfaceData.
+            let hotspot = with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<smithay::input::pointer::CursorImageSurfaceData>()
+                    .and_then(|d| {
+                        let attrs = d.lock().unwrap();
+                        Some(attrs.hotspot)
+                    })
+                    .unwrap_or_default()
+            });
+            // i32-physical location for the surface-tree helper.
+            let cpos = (pos - hotspot.to_f64()).to_physical_precise_round(1.0);
+            let surf_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                render_elements_from_surface_tree(renderer, surface, cpos, 1.0, 1.0, ElemKind::Cursor);
+            // Cursor on top → insert at the FRONT (slice index 0 is top-most).
+            for (i, e) in surf_elems.into_iter().enumerate() {
+                elements.insert(i, HartRenderElement::Surface(e));
+            }
+        }
+        // Named / default → the baked arrow.
+        _ => {
+            // f64-physical location for the memory-buffer element ctor.
+            let cpos: Point<f64, Physical> =
+                (pos - state.cursor_hotspot.to_f64()).to_physical(1.0);
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                cpos,
+                &state.cursor_buffer,
+                None,
+                None,
+                None,
+                ElemKind::Cursor,
+            ) {
+                Ok(e) => elements.insert(0, HartRenderElement::Memory(e)),
+                Err(err) => warn!(?err, "cursor: failed to build the default-arrow element"),
+            }
+        }
+    }
+}
+
+/// M6 — the workspace-switch crossfade factor NOW: 0→1 over `WS_FADE_MS` after a
+/// switch, then a steady 1.0. Multiplies every visible surface's alpha so the whole
+/// new workspace fades in. Returns 1.0 (no fade) when no switch is in flight.
+fn workspace_fade_alpha(state: &State) -> f32 {
+    match state.ws_switch_at {
+        None => 1.0,
+        Some(t) => {
+            let e = t.elapsed().as_millis();
+            if e >= WS_FADE_MS {
+                1.0
+            } else {
+                (e as f32 / WS_FADE_MS as f32).clamp(0.0, 1.0)
+            }
+        }
+    }
+}
+
+/// M6 — is any effect still animating (a window mid-fade, or a workspace crossfade in
+/// flight)? The loop forces a redraw next iteration while true, so a fade actually
+/// PLAYS rather than freezing on the first frame (clients only damage on content
+/// change; an alpha ramp is compositor-side, so we must self-schedule the frames).
+fn effects_animating(state: &State) -> bool {
+    if let Some(t) = state.ws_switch_at {
+        if t.elapsed().as_millis() < WS_FADE_MS {
+            return true;
+        }
+    }
+    state
+        .space
+        .elements()
+        .any(|w| w.user_data().get::<MapAnim>().map(|a| a.animating()).unwrap_or(false))
+}
+
+/// Bake a small default arrow cursor as RGBA bytes — a dependency-free fallback so a
+/// visible cursor renders on llvmpipe with no xcursor theme load. A classic left-
+/// pointing arrow: a white fill with a 1px black outline, drawn into a 24×24 buffer by
+/// a compact edge-function rasterizer. Returns (rgba, width, height, hotspot). The
+/// hotspot is the arrow TIP (top-left), so the cursor points where the user clicks.
+fn bake_default_cursor() -> (Vec<u8>, i32, i32, Point<i32, Logical>) {
+    const W: i32 = 24;
+    const H: i32 = 24;
+    // The arrow polygon (classic pointer), in buffer pixels. Tip at (0,0).
+    // Points trace the outline clockwise: tip → down-left edge → notch → tail.
+    let poly: [(f32, f32); 7] = [
+        (0.0, 0.0),
+        (0.0, 17.0),
+        (4.0, 13.0),
+        (7.0, 19.0),
+        (10.0, 18.0),
+        (7.0, 12.0),
+        (12.0, 12.0),
+    ];
+    // Point-in-polygon (even-odd) for the fill test.
+    let inside = |px: f32, py: f32| -> bool {
+        let mut c = false;
+        let n = poly.len();
+        let mut j = n - 1;
+        for i in 0..n {
+            let (xi, yi) = poly[i];
+            let (xj, yj) = poly[j];
+            if ((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi) {
+                c = !c;
+            }
+            j = i;
+        }
+        c
+    };
+    let mut rgba = vec![0u8; (W * H * 4) as usize];
+    for y in 0..H {
+        for x in 0..W {
+            let cx = x as f32 + 0.5;
+            let cy = y as f32 + 0.5;
+            let fill = inside(cx, cy);
+            // Outline: a pixel that is empty but adjacent to a filled pixel (1px border).
+            let mut outline = false;
+            if !fill {
+                'scan: for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let nx = cx + dx as f32;
+                        let ny = cy + dy as f32;
+                        if inside(nx, ny) {
+                            outline = true;
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+            let idx = ((y * W + x) * 4) as usize;
+            if fill {
+                // White, opaque (premultiplied; alpha 255 so RGB unchanged).
+                rgba[idx] = 255;
+                rgba[idx + 1] = 255;
+                rgba[idx + 2] = 255;
+                rgba[idx + 3] = 255;
+            } else if outline {
+                // Black outline, opaque.
+                rgba[idx] = 0;
+                rgba[idx + 1] = 0;
+                rgba[idx + 2] = 0;
+                rgba[idx + 3] = 255;
+            }
+            // else: transparent (already zeroed).
+        }
+    }
+    (rgba, W, H, Point::from((0, 0)))
 }
 
 /// Drain a surface tree's frame callbacks (mirrors minimal.rs's helper). Without
@@ -2301,5 +2721,76 @@ mod m5_keybinding_tests {
         // A bare digit (no Super) is the app's — even though its level-0 sym IS a digit,
         // without Super neither the switch nor the move chord fires.
         assert_eq!(digit_chord(mods(false, false, false), Keysym::_1, Keysym::_1), None);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// M6 — behavioural unit floor for the PURE effect helpers (the parts that don't need
+// a live GlesRenderer/Display). The cursor BAKE + the two fade clocks are pure
+// functions, so the contract (a visible arrow with fill+outline; alpha ramps 0→1 then
+// pins) is unit-testable without the WSL-nested-EGL harness — which matters because the
+// nested winit EGL surface goes ContextLost ~3s in (so the LIVE black-surface/crossfade
+// proofs are flaky), but the LOGIC that produces them is deterministic and asserted
+// here. The screencopy WIRE path (manager bind → capture_output → copy → ready/failed)
+// is exercised live by `grim` against $HART_SOCK (it captures hart-comp directly), and
+// the kill-switch REFUSAL is proven by the "capture blocked … failing the frame" log +
+// grim getting a failed (unreadable) frame.
+#[cfg(test)]
+mod m6_effect_tests {
+    use super::{FADE_IN_MS, MapAnim, WS_FADE_MS, bake_default_cursor};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn default_cursor_bakes_a_visible_arrow_with_fill_and_outline() {
+        // The fallback cursor MUST be a real, visible arrow: a non-trivial RGBA buffer
+        // with BOTH white-fill pixels (the arrow body) and black-outline pixels (the
+        // 1px border), and a fully-transparent background — so it shows on llvmpipe with
+        // no xcursor theme. Hotspot is the tip at (0,0).
+        let (rgba, w, h, hot) = bake_default_cursor();
+        assert_eq!(w, 24);
+        assert_eq!(h, 24);
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+        assert_eq!((hot.x, hot.y), (0, 0), "hotspot must be the arrow tip");
+
+        let (mut white, mut black, mut transparent) = (0u32, 0u32, 0u32);
+        for px in rgba.chunks_exact(4) {
+            match (px[0], px[1], px[2], px[3]) {
+                (255, 255, 255, 255) => white += 1,
+                (0, 0, 0, 255) => black += 1,
+                (_, _, _, 0) => transparent += 1,
+                _ => {}
+            }
+        }
+        assert!(white > 40, "arrow body should have a meaningful white fill (got {white})");
+        assert!(black > 10, "arrow should have a black outline (got {black})");
+        assert!(transparent > 100, "most of the 24x24 buffer is transparent (got {transparent})");
+        // The opaque arrow (fill+outline) must be a MINORITY of the buffer (it is a small
+        // pointer, not a filled square) — guards against an all-white regression.
+        assert!(white + black < (w * h) as u32 / 2, "arrow must not fill the whole buffer");
+    }
+
+    #[test]
+    fn map_fade_alpha_ramps_then_pins_at_one() {
+        // A freshly-mapped window starts near-transparent and ramps to fully opaque over
+        // FADE_IN_MS, then pins at exactly 1.0 (so the steady state hits the opaque
+        // fast-path). We can't pause time, but a JUST-created clock is < FADE_IN_MS old,
+        // so its alpha is < 1.0; a clock backdated past FADE_IN_MS reads exactly 1.0.
+        let fresh = MapAnim(Instant::now());
+        let a = fresh.alpha();
+        assert!((0.0..=1.0).contains(&a), "alpha in [0,1], got {a}");
+        assert!(fresh.animating(), "a fresh map is still animating");
+
+        // Backdate the clock to well past the fade → settled at 1.0, not animating.
+        let settled = MapAnim(Instant::now() - Duration::from_millis(FADE_IN_MS as u64 + 50));
+        assert_eq!(settled.alpha(), 1.0, "past FADE_IN_MS the alpha pins at 1.0");
+        assert!(!settled.animating(), "a settled window no longer animates");
+    }
+
+    #[test]
+    fn workspace_fade_constant_is_short_and_positive() {
+        // The crossfade must be perceptible-but-snappy. Guards against a 0ms (no fade) or
+        // a multi-second (sluggish) regression of the tuning constants.
+        assert!(WS_FADE_MS > 0 && WS_FADE_MS <= 500, "ws fade should be a short ramp");
+        assert!(FADE_IN_MS > 0 && FADE_IN_MS <= 500, "map fade should be a short ramp");
     }
 }
