@@ -1773,20 +1773,20 @@ class WorldModelBridge:
     def _propagate_embodied_error(self, where: str, *, action: Optional[dict] = None,
                                   exc: Optional[BaseException] = None,
                                   status: Optional[int] = None) -> None:
-        """Propagate an embodied action/sensor/feedback failure THROUGH the
-        hevolveai hive — not just the local circuit breaker.
+        """Route an embodied action/sensor/feedback failure into the hive's
+        CANONICAL error machinery — not just the local circuit breaker.
 
-        1. record the local breaker failure (fast-fail at threshold);
+        1. record the local breaker failure (fast-fail at threshold — fronts the
+           embodied backend so a dead HevolveAI isn't hammered);
         2. record into the central ``ExceptionCollector`` so the hive's
-           SelfHealingDispatcher sees the embodied-error pattern and can raise a
-           fix goal — the SAME error sink every other backend uses (one sink, no
-           parallel error path);
-        3. when the breaker is now OPEN (backend confirmed down, not a transient
-           blip), gossip an ``embodied.backend_down`` event so peer nodes
-           downgrade to a fallback embodied node (regional federation) instead of
-           dispatching into a dead one. The callers return early while the
-           breaker is open (see send_action:_cb_is_open), so this throttles to
-           ~once per cooldown — no gossip flood.
+           SelfHealingDispatcher sees the embodied-error PATTERN and can raise a
+           fix goal — the SAME single error sink every other backend uses.
+
+        Node/subsystem reachability is deliberately NOT re-broadcast here: the
+        breaker state is already exposed by ``check_health`` (dashboard) and node
+        health by ``peer_discovery.get_health`` — one health source of truth, no
+        bespoke second channel (a prior ``embodied.backend_down`` gossip had no
+        consumer and duplicated that mechanism; removed).
 
         Fire-and-forget: never raises into the embodied control path."""
         self._cb_record_failure()
@@ -1801,18 +1801,6 @@ class WorldModelBridge:
                          'node_tier': self._node_tier})
         except Exception:
             pass
-        if self._cb_is_open():
-            try:
-                from integrations.social.peer_discovery import gossip
-                gossip.broadcast({
-                    'type': 'embodied.backend_down',
-                    'node_id': self._node_id,
-                    'where': where,
-                    'api_url': self._api_url,
-                    'ts': time.time(),
-                })
-            except Exception:
-                pass
 
     def send_action(self, action: dict) -> bool:
         """Send a motor/actuator command to HevolveAI's world model.

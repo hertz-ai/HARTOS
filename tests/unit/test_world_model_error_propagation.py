@@ -3,19 +3,17 @@
 WorldModelBridge talks to HevolveAI's embodied model over HTTP (/v1/actions,
 /v1/sensors/batch, /v1/feedback/latest). Before this, a failure only bumped the
 LOCAL circuit breaker — nothing reached the hive's error machinery. These tests
-assert _propagate_embodied_error() now:
-  - records every embodied failure into the central ExceptionCollector (the SAME
-    sink SelfHealingDispatcher consumes → fix goals), and
-  - gossips `embodied.backend_down` once the breaker trips OPEN (peers downgrade
-    to a fallback embodied node), naturally throttled by the breaker.
+assert _propagate_embodied_error() records every embodied failure into the central
+ExceptionCollector (the SAME sink SelfHealingDispatcher consumes → fix goals).
+Node/subsystem reachability is NOT re-broadcast here — one health source of truth
+(check_health / peer_discovery.get_health); a prior consumer-less
+embodied.backend_down gossip was removed (parallel-path cleanup).
 
-Behavioural: real WorldModelBridge, boundary (pooled_post / collector / gossip)
-mocked, real circuit breaker exercised.
+Behavioural: real WorldModelBridge, boundary (pooled_post / collector) mocked,
+real circuit breaker exercised.
 
     python -m pytest tests/unit/test_world_model_error_propagation.py --noconftest -q
 """
-import sys
-import types
 from unittest.mock import patch, MagicMock
 
 import requests
@@ -62,26 +60,19 @@ def test_send_action_exception_records_into_exception_collector():
     assert MockEC.get_instance.return_value.record.called
 
 
-def test_breaker_open_gossips_embodied_backend_down():
+def test_breaker_records_every_failure_to_collector_until_open():
+    """Each embodied failure reaches the canonical error sink; once the breaker
+    is OPEN the callers return early (no hammering a dead backend) — node health
+    is surfaced via check_health/get_health, not a bespoke broadcast."""
     b = _make_bridge()
     resp = MagicMock(); resp.status_code = 500
-    sent = []
-    fake_pd = types.SimpleNamespace(
-        gossip=types.SimpleNamespace(
-            broadcast=lambda msg, targets=None: sent.append(msg)))
     with patch.object(wmb, 'pooled_post', return_value=resp), \
-            patch('exception_collector.ExceptionCollector'), \
-            patch.dict(sys.modules, {'integrations.social.peer_discovery': fake_pd}):
-        # default breaker threshold=5 → the 5th failure opens it → one gossip;
-        # subsequent calls return early on _cb_is_open (no flood).
+            patch('exception_collector.ExceptionCollector') as MockEC:
         for _ in range(8):
             b.send_action(_ok_action())
-    downs = [m for m in sent if m.get('type') == 'embodied.backend_down']
-    assert downs, f"expected an embodied.backend_down gossip, got {sent}"
-    assert downs[0]['node_id'] == 'node-test'
-    assert downs[0]['where'] == 'send_action'
-    # throttled: the breaker's open early-return means we don't gossip on every call
-    assert len(downs) == 1, f"gossip should fire once per down-period, got {len(downs)}"
+    # default threshold=5 → 5 records, then send_action short-circuits on cb_open
+    assert MockEC.get_instance.return_value.record.call_count == 5
+    assert b._cb_is_open() is True
 
 
 def test_sensor_ingest_failure_also_propagates():
