@@ -49,6 +49,32 @@ Torrents are web-seeded via GitHub CDN.
 
 **Desktop ISO is larger than GitHub's 2 GB per-asset limit** and therefore ships split into `…iso.part-00`, `…iso.part-01`, … Download every `part-*` alongside the `.sha256` and a companion `…iso.reassemble.sh`, then run the script (or `cat *.part-* > …iso`) to stitch them and verify the checksum.
 
+### Flash to a USB stick
+
+One command fetches a release's multi-part ISO, writes it to the stick at the
+correct byte offsets, and reads back the ISO9660 `CD001` + `0x55AA` boot
+signature to verify — no manual reassembly:
+
+```bash
+# 1. List removable disks to find your device id (e.g. #1)
+python scripts/hart_usb_flasher.py --list
+
+# 2. Flash the latest desktop ISO to disk #1  (DESTRUCTIVE — wipes the stick)
+python scripts/hart_usb_flasher.py --tag <nightly-tag> --device 1 --mode download --yes
+```
+
+- `--tag` is the release tag (e.g. `nightly-<sha>-<runid>`; the newest is marked
+  **Latest** on the [releases page](https://github.com/hertz-ai/HARTOS/releases)).
+- Prefer a picker? Run `python scripts/hart_usb_flasher.py --gui`.
+- Only removable/USB disks are offered; writing a system disk needs
+  `--allow-system` **and** `--yes`. Use `--mode stream` when scratch disk is tight.
+- The flasher ships as a per-release asset, so you can flash without cloning.
+
+> **Windows:** if you hit `exclusive open failed (err 32) — is the disk still
+> mounted?`, the stick's volume is still mounted. Eject it (or re-insert) so
+> Windows releases the lock, then re-run — the flasher's `diskpart clean` needs
+> exclusive access.
+
 ## Nunba — Unified Agentic Client (Desktop)
 
 Nunba is the unified HART client — Windows, macOS, Linux desktop builds
