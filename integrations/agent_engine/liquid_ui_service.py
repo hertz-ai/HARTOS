@@ -2325,12 +2325,15 @@ function openPanel(id, opts) {{
     loadSystemPanel(id, body);
   }} else if(def.route) {{
     if(PERF.lazyIframes) {{
-      // Potato: placeholder until focused, then load iframe
-      body.innerHTML = '<div class="native-content" style="display:flex;align-items:center;justify-content:center;height:100%"><span class="mi material-icons-round" style="font-size:48px;color:var(--hart-muted);cursor:pointer" data-route="'+def.route+'" onclick="loadIframe(_pid(this),this.dataset.route)">touch_app</span></div>';
+      // Potato: tap-to-load placeholder until focused (keeps memory low), but it
+      // is itself a content container — never a blank body.
+      body.innerHTML = '<div class="panel-route-stage native-content" style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;height:100%;text-align:center">'+
+        '<span class="mi material-icons-round" style="font-size:48px;color:var(--hart-accent);cursor:pointer" data-route="'+def.route+'" onclick="loadIframe(_pid(this),this.dataset.route)">touch_app</span>'+
+        '<div class="ds-body-sm ds-text-muted">Tap to load '+(def.title||id)+'</div></div>';
       body.dataset.route = def.route;
       body.dataset.loaded = '0';
     }} else {{
-      body.innerHTML = '<iframe src="'+NUNBA_BASE+def.route+'" loading="lazy"></iframe>';
+      renderRoutePanel(id, body, def.route, def.title||id);
     }}
   }} else {{
     body.innerHTML = '<div class="native-content">Panel: '+id+'</div>';
@@ -2377,13 +2380,71 @@ function minimizePanel(id) {{
   }}
 }}
 
-// Lazy iframe loader (potato mode)
+// Lazy iframe loader (potato mode) — routes through the canonical staged loader
+// so even the deferred path gets a skeleton + graceful reconnecting fallback.
 function loadIframe(id, route) {{
   const body = document.getElementById('panel-body-'+id);
   if(body && body.dataset.loaded !== '1') {{
-    body.innerHTML = '<iframe src="'+NUNBA_BASE+route+'" loading="lazy"></iframe>';
+    const def = MANIFEST[id] || SYSTEM_PANELS[id] || {{}};
+    renderRoutePanel(id, body, route, def.title||id);
     body.dataset.loaded = '1';
   }}
+}}
+
+// ═══ Canonical route-panel loader ═══
+// Every iframe panel (agents/recipes/communities/…) ALWAYS gets a content
+// container: a loading skeleton first, then the SPA iframe once it loads. If the
+// backend never answers (SPA down / tier-dropped / offline) the iframe stays
+// blank — so we watch it and swap in a graceful "reconnecting" empty state with a
+// retry, never leaving the panel body blank.
+function renderRoutePanel(id, body, route, title) {{
+  if(!body) return;
+  // 1) Always-visible content container: skeleton + (hidden) iframe stacked.
+  body.innerHTML =
+    '<div class="route-skeleton native-content" style="position:absolute;inset:0;z-index:2;background:transparent">'+
+      dsSkeleton('list',5)+
+    '</div>'+
+    '<iframe class="route-frame" style="opacity:0;transition:opacity .25s" '+
+      'src="'+NUNBA_BASE+route+'" loading="lazy"></iframe>';
+  body.dataset.route = route;
+  const frame = body.querySelector('.route-frame');
+  const skel = body.querySelector('.route-skeleton');
+  if(!frame) return;
+  let settled = false;
+  function reveal() {{
+    if(settled) return; settled = true;
+    frame.style.opacity = '1';
+    if(skel) skel.remove();
+  }}
+  function reconnecting() {{
+    if(settled) return; settled = true;
+    if(frame) frame.remove();
+    body.innerHTML =
+      '<div class="route-empty native-content" style="display:flex;flex-direction:column;'+
+        'align-items:center;justify-content:center;gap:12px;height:100%;text-align:center;padding:24px">'+
+        '<span class="mi material-icons-round" style="font-size:46px;color:var(--hart-muted)">cloud_off</span>'+
+        '<div class="ds-title-sm">Reconnecting&hellip;</div>'+
+        '<div class="ds-body-sm ds-text-muted" style="max-width:280px">'+
+          (title||'This view')+" couldn't reach the hive backend yet. It will appear here once the connection is back."+
+        '</div>'+
+        '<button class="ds-btn ds-btn-tonal ds-btn-sm" type="button" '+
+          'onclick="retryRoutePanel(\\''+id+'\\')">Retry</button>'+
+      '</div>';
+  }}
+  // iframe onload fires for both real content AND error pages; treat a successful
+  // load as "reveal". A never-loading frame falls to the timeout → reconnecting.
+  frame.addEventListener('load', reveal);
+  frame.addEventListener('error', reconnecting);
+  setTimeout(function(){{ if(!settled) reconnecting(); }}, 8000);
+}}
+
+// Retry handler for the reconnecting empty state — re-stage the same route.
+function retryRoutePanel(id) {{
+  const body = document.getElementById('panel-body-'+id);
+  if(!body) return;
+  const route = body.dataset.route;
+  const def = MANIFEST[id] || SYSTEM_PANELS[id] || {{}};
+  if(route) renderRoutePanel(id, body, route, def.title||id);
 }}
 
 function toggleMax(id) {{
