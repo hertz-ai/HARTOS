@@ -157,6 +157,31 @@ LANGCHAIN_API_KEY=your-key
 
 Create `config.json` with API keys for: OPENAI, GROQ, GOOGLE_CSE_ID, GOOGLE_API_KEY, NEWS_API_KEY, SERPAPI_API_KEY
 
+## Update Delivery — OTA, NOT manual flash
+
+**Updates ship over-the-air. The ISO/USB flash is FIRST-INSTALL only.** Do NOT
+ask the user to re-flash to deliver an update — line up an OTA push instead
+(and confirm before the outward central publish, since it deploys to their node).
+
+- **Config:** `nixos/configurations/desktop.nix` → `hart.ota = { enable = true;
+  channel = "stable"; autoApply = true; }` — its own comment: *"This replaces the
+  user's last manual flash."*
+- **Mechanism:** `nixos/modules/hart-ota.nix` — a 7-stage pipeline **BUILD → TEST
+  → AUDIT → BENCHMARK → SIGN → CANARY → DEPLOY**. Central publishes WHICH commit
+  (a pinned `github:hertz-ai/HARTOS/<sha>`); the node pulls (on boot / `hart-ota
+  check`) or receives a central push over the fleet/gossip fabric, builds the
+  closure, and **atomically switches the NixOS generation** (rollback =
+  `nixos-rebuild switch --rollback`; the canary auto-reverts on health
+  regression; the node never force-applies past canary).
+- **SIGN is master-key-gated → steward-only, AI-EXCLUDED.** Claude preps + greens
+  the closure; the human signs the release.
+- **To ship a Nix-built component (e.g. the HART-comp compositor) via OTA:** its
+  package must actually BUILD in Nix (eval passing is NOT enough), then the
+  steward signs the publish. A failed BUILD stage simply doesn't deliver — it
+  never bricks the node.
+
+See `memory/reference_ota_delivery_model.md`.
+
 ## Architecture
 
 ### Core Flow

@@ -30,6 +30,29 @@ curl http://localhost:6777/status
 
 ---
 
+## Updates — Over-The-Air (OTA), not re-flashing
+
+**You flash the USB/ISO once, to install a node. After that, HART OS updates
+itself over-the-air — you never re-flash for an update.**
+
+`hart.ota` (enabled by default on the desktop) runs a signed, canary-guarded
+pipeline: central publishes an approved commit → the node pulls it (on boot, or
+`hart-ota check`) or receives a central push → it builds the new closure, runs
+**BUILD → TEST → AUDIT → BENCHMARK → SIGN → CANARY → DEPLOY**, and atomically
+switches to the new NixOS generation. If health regresses, the canary
+auto-rolls-back (`nixos-rebuild switch --rollback`) — so a bad update can never
+brick the node.
+
+- **Channel:** `hart.ota.channel` = `stable` | `testing` | `nightly`.
+- **Trigger:** `hart-ota check` (manual pull) or a central push; there is no
+  periodic interval poll.
+- **Signing:** the SIGN stage uses the master key, held by the human steward —
+  no update deploys without a steward-signed release.
+
+The ISO/flasher below is therefore the **first-install** path only.
+
+---
+
 ## System Requirements
 
 ### Hardware Tiers
