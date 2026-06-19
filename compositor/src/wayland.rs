@@ -67,7 +67,8 @@ use smithay::{
     reexports::{
         calloop::{EventLoop, LoopHandle},
         wayland_server::{
-            protocol::wl_surface::WlSurface, Display, DisplayHandle,
+            protocol::{wl_seat::WlSeat, wl_surface::WlSurface},
+            Client, Display, DisplayHandle,
         },
     },
     utils::{Logical, Rectangle, Serial},
@@ -81,9 +82,22 @@ use smithay::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler,
             XdgShellState,
         },
+        // master: the X11↔wl_surface association protocol the X11Wm needs as a
+        // handler bound on `start_wm` (its state is a plain field on `State`).
+        xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
     },
-    xwayland::{X11Surface, X11Wm, XWayland, XWaylandEvent},
+    xwayland::{
+        xwm::{Reorder, ResizeEdge as X11ResizeEdge, XwmId},
+        X11Surface, X11Wm, XWayland, XWaylandEvent, XwmHandler,
+    },
 };
+// `DndGrabHandler` is a `start_wm` bound (drag'n'drop hand-off for X11 clients).
+// Both its methods are defaulted, so the impl is empty — but it must be present.
+use smithay::input::dnd::DndGrabHandler;
+// `WaylandFocus` provides `Window::wl_surface()` (master surfaces the surface
+// accessor on this trait, not the inherent impl — the reverse-lookup in
+// `handle_for_surface` needs it in scope).
+use smithay::wayland::seat::WaylandFocus;
 // xdg-decoration mode enum (server-side vs client-side).
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 
@@ -118,8 +132,15 @@ pub struct State {
     pub xdg_shell_state: XdgShellState,
     pub xdg_decoration_state: XdgDecorationState,
     pub foreign_toplevel_state: ForeignToplevelListState,
+    /// Seat protocol state. `seat_state()` (SeatHandler) returns this; the live
+    /// `seat` is created from it. A real field (NOT a stub) — the X11Wm + input
+    /// dispatch borrow it.
     pub seat_state: SeatState<State>,
     pub seat: Seat<State>,
+    /// X11↔wl_surface association protocol state (master `xwayland_shell`). The
+    /// X11Wm requires a `XWaylandShellHandler` returning this; a plain field, made
+    /// by `XWaylandShellState::new::<State>(&dh)` at construction.
+    pub xwayland_shell_state: XWaylandShellState,
 
     /// The desktop window tree (positions toplevels above the layer-shell shell).
     pub space: Space<Window>,
@@ -240,6 +261,31 @@ impl State {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// SeatHandler — input seat (keyboard/pointer/touch). REQUIRED for `SeatState<State>`
+// to exist AND as a transitive `X11Wm::start_wm` bound. The focus associated types
+// pick concrete focus targets that satisfy the trait bounds master imposes:
+//   • KeyboardFocus = WlSurface   (impls KeyboardTarget; no DnD bound on keyboard)
+//   • PointerFocus  = X11Surface  (impls PointerTarget AND DndFocus — the latter is
+//                                  required by start_wm's `PointerFocus: DndFocus`;
+//                                  X11Surface's DndFocus needs only XwmHandler+
+//                                  SeatHandler, so it pulls in NO DataDeviceHandler)
+//   • TouchFocus    = X11Surface  (impls TouchTarget AND DndFocus, same reason)
+// `seat_state()` returns the REAL `SeatState<State>` field on `State` (not a stub).
+// focus_changed/cursor_image/led_state_changed are trait-defaulted → omitted (that
+// is the trait's intended default, not a fake).
+// ════════════════════════════════════════════════════════════════════════════
+
+impl smithay::input::SeatHandler for State {
+    type KeyboardFocus = WlSurface;
+    type PointerFocus = X11Surface;
+    type TouchFocus = X11Surface;
+
+    fn seat_state(&mut self) -> &mut SeatState<State> {
+        &mut self.seat_state
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // XdgShellHandler — native Wayland toplevels (Flatpak / PWA / modern apps).
 // ════════════════════════════════════════════════════════════════════════════
 //
@@ -255,9 +301,10 @@ impl XdgShellHandler for State {
 
     /// A client created a toplevel. It is NOT mapped yet (no buffer committed) —
     /// we map it into the space and send the initial configure; the REAL map
-    /// (first commit with a buffer) is observed in `commit`/`map_toplevel` where
-    /// we call `on_real_map`. Per Smithay's model the window becomes "mapped" once
-    /// it has a committed buffer; we mint the handle at THAT edge, not here.
+    /// (first commit with a buffer) is observed by the compositor `commit` handler,
+    /// which calls the free fn `xdg_toplevel_mapped` below (master has NO
+    /// `toplevel_mapped` trait method — the map edge is a buffer commit, detected in
+    /// `CompositorHandler::commit`). We mint the handle at THAT edge, not here.
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface.clone());
         // Place below the orb/overlays per the Phase-4 z-order model; above the
@@ -267,27 +314,16 @@ impl XdgShellHandler for State {
         surface.send_configure();
     }
 
-    /// The toplevel committed its first buffer → it is now MAPPED. THIS is the
-    /// real map edge (no-phantom-window mint site for xdg-shell).
-    fn toplevel_mapped(&mut self, surface: ToplevelSurface) {
-        let app_id = surface_app_id(&surface);
-        let title = surface_title(&surface);
-        let handle = self.on_real_map(app_id, title, ToplevelKind::Xdg);
-        // Stash the handle on the Window's user-data so destroy can reverse it.
-        if let Some(window) = self.window_for_toplevel(&surface) {
-            window.user_data().insert_if_missing(|| handle.clone());
-        }
-        // Optional `place` from the SummonApp request is applied by the IPC layer
-        // after it observes window.opened (it has the geometry; we have the map).
-    }
-
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         // Popups (menus/tooltips) ride above their parent; not tracked as
         // top-level windows in the registry (they have no manifest identity).
         let _ = surface;
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: WlSurface, _serial: Serial) {}
+    // master: `grab` takes a `WlSeat` (the protocol seat resource), not a
+    // `WlSurface`. Popup grabs (the implicit pointer/keyboard grab a menu takes)
+    // are honored by the seat's default grab; we have no extra bookkeeping.
+    fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {}
 
     fn reposition_request(
         &mut self,
@@ -299,9 +335,10 @@ impl XdgShellHandler for State {
 
     /// The toplevel was destroyed → invalidate its handle + emit window.closed.
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        if let Some(wl) = surface.wl_surface().cloned() {
-            on_surface_destroyed(self, &wl);
-        }
+        // master: `ToplevelSurface::wl_surface()` returns `&WlSurface` (not Option),
+        // so clone it directly — there is nothing to unwrap.
+        let wl = surface.wl_surface().clone();
+        on_surface_destroyed(self, &wl);
     }
 }
 
@@ -313,6 +350,26 @@ impl State {
             w.toplevel().map(|t| t == surface).unwrap_or(false)
         })
     }
+}
+
+/// ⚠️ CI-COMPILE. The REAL xdg-shell map edge. master has NO `toplevel_mapped`
+/// callback on `XdgShellHandler`; the map happens when a toplevel commits its first
+/// buffer, which the compositor observes in `CompositorHandler::commit` (the event
+/// loop's commit handler calls THIS, exactly as anvil maps in its commit path). It
+/// is a free fn (not a trait method) because that is where master surfaces the edge.
+/// Body is the no-phantom-window mint site for xdg-shell — unchanged from the draft:
+/// it calls `State::on_real_map(.., ToplevelKind::Xdg)`, the SINGLE handle-mint site,
+/// so a pending `SummonApp` resolves to `Mapped(handle)` ONLY here, on the real map.
+pub fn xdg_toplevel_mapped(state: &mut State, surface: &ToplevelSurface) {
+    let app_id = surface_app_id(surface);
+    let title = surface_title(surface);
+    let handle = state.on_real_map(app_id, title, ToplevelKind::Xdg);
+    // Stash the handle on the Window's user-data so destroy can reverse it.
+    if let Some(window) = state.window_for_toplevel(surface) {
+        window.user_data().insert_if_missing(|| handle.clone());
+    }
+    // Optional `place` from the SummonApp request is applied by the IPC layer
+    // after it observes window.opened (it has the geometry; we have the map).
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -327,52 +384,197 @@ impl State {
 // and ONLY this handler completes the summon with `Mapped`.
 
 /// ⚠️ CI-COMPILE. Drive the XWayland lifecycle. On `Ready` the X11 WM attaches; on
-/// `Exited` we tear it down. Inserted as a calloop event source at startup.
-pub fn handle_xwayland_event(state: &mut State, event: XWaylandEvent) {
+/// `Error` XWayland crashed on startup. Inserted as a calloop event source at
+/// startup. master: `XWayland::spawn` returns `(XWayland, Client)` — the `Client`
+/// is captured at the spawn site and threaded in HERE (the `Ready` event itself
+/// carries only the privileged X11 socket + display number, NOT the client). The
+/// X11Wm borrows the `DisplayHandle` (`&state.dh`) and takes the `Client`.
+pub fn handle_xwayland_event(state: &mut State, event: XWaylandEvent, client: &Client) {
     match event {
         XWaylandEvent::Ready {
             x11_socket,
             display_number: _,
         } => {
-            // Real body: build the X11Wm bound to our DisplayHandle + the XWayland
-            // connection, so X11 surfaces route through `X11WmHandler` below.
-            match X11Wm::start_wm(state.loop_handle.clone(), state.dh.clone(), x11_socket, ()) {
+            // Build the X11Wm bound to our DisplayHandle + the XWayland connection
+            // + the XWayland client, so X11 surfaces route through `XwmHandler`.
+            match X11Wm::start_wm(
+                state.loop_handle.clone(),
+                &state.dh,
+                x11_socket,
+                client.clone(),
+            ) {
                 Ok(wm) => state.xwm = Some(wm),
                 Err(e) => {
                     tracing::error!(error = %e, "XWayland: failed to start X11 WM");
                 }
             }
         }
-        XWaylandEvent::Exited => {
+        XWaylandEvent::Error => {
+            tracing::warn!("XWayland crashed on startup");
             state.xwm = None;
         }
     }
 }
 
-// X11 surface map/unmap (Smithay routes these via the X11Wm callbacks; the exact
-// trait/rev differs, so the BODY below is the shape — the invariant is fixed).
-
-impl State {
-    /// ⚠️ CI-COMPILE. An X11 (Wine) toplevel mapped → mint a handle keyed on the
-    /// REAL map (ToplevelKind::XWayland). This is where the installer's
-    /// unconditional Wine `success=True` is corrected: no map ⇒ no handle.
-    pub fn on_xwayland_mapped(&mut self, x11: &X11Surface) {
-        let app_id = x11_app_id(x11);
-        let title = x11_title(x11);
-        // Wrap the X11 surface as a desktop Window so it tiles with xdg toplevels.
-        let window = Window::new_x11_window(x11.clone());
-        self.space.map_element(window.clone(), (0, 0), false);
-        let handle = self.on_real_map(app_id, title, ToplevelKind::XWayland);
-        window.user_data().insert_if_missing(|| handle);
+// ── XwmHandler — the live X11 window-manager callbacks (master routes X11 surface
+// map/unmap/configure through this trait, NOT through ad-hoc `on_xwayland_*`
+// methods). REQUIRED methods (the rest are defaulted): xwm_state, new_window,
+// new_override_redirect_window, map_window_request, mapped_override_redirect_window,
+// unmapped_window, destroyed_window, configure_request, configure_notify,
+// resize_request, move_request. The map/unmap bodies carry the REAL no-phantom
+// bookkeeping: `map_window_request` is the corrected Wine map edge — it mints the
+// handle via `on_real_map(.., ToplevelKind::XWayland)` ONLY when a real X11 toplevel
+// maps (the installer's unconditional `success=True` is refused here).
+impl XwmHandler for State {
+    fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
+        // The single X11Wm this compositor owns (attached on XWaylandEvent::Ready).
+        self.xwm.as_mut().expect("xwm_state called before the X11Wm was attached")
     }
 
-    /// ⚠️ CI-COMPILE. An X11 toplevel was destroyed → invalidate + window.closed.
-    pub fn on_xwayland_unmapped(&mut self, x11: &X11Surface) {
-        if let Some(wl) = x11.wl_surface() {
+    fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {
+        // The X11 window exists but has not requested mapping yet — no handle until
+        // it actually maps (no-phantom-window). Nothing to record here.
+    }
+
+    fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {
+        // Override-redirect (menus/tooltips/popups) — not tracked as top-level
+        // windows in the registry (no manifest identity), mapped on their own notify.
+    }
+
+    /// ⚠️ CI-COMPILE. The REAL X11 (Wine) map edge. master delivers it here. This is
+    /// where the installer's unconditional Wine `success=True` is corrected: a handle
+    /// is minted ONLY now, on a real map. Reuses the SAME `on_real_map` single mint
+    /// site as the xdg path, so a pending Wine `SummonApp` resolves to
+    /// `Mapped(handle)` keyed on THIS map, never the launcher exit code.
+    fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        // Accept the client's map request (mirrors anvil) so XWayland composites it.
+        let _ = window.set_mapped(true);
+        let app_id = x11_app_id(&window);
+        let title = x11_title(&window);
+        // Wrap the X11 surface as a desktop Window so it tiles with xdg toplevels.
+        let win = Window::new_x11_window(window);
+        self.space.map_element(win.clone(), (0, 0), false);
+        // Configure it to the geometry the space gave it (X11 needs an explicit
+        // configure to know its size); best-effort, the real tiling policy refines.
+        if let Some(bbox) = self.space.element_bbox(&win) {
+            if let Some(xsurface) = win.x11_surface() {
+                let _ = xsurface.configure(Some(bbox));
+            }
+        }
+        let handle = self.on_real_map(app_id, title, ToplevelKind::XWayland);
+        win.user_data().insert_if_missing(|| handle);
+    }
+
+    /// An override-redirect window mapped (it positions itself; we honor its loc).
+    fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        let location = window.geometry().loc;
+        let win = Window::new_x11_window(window);
+        self.space.map_element(win, location, true);
+    }
+
+    /// ⚠️ CI-COMPILE. An X11 toplevel was unmapped → invalidate its handle +
+    /// window.closed (the same destroy path the xdg toplevels funnel through).
+    fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        // Drop the desktop element wrapping this X11 surface from the space.
+        let elem = self
+            .space
+            .elements()
+            .find(|w| w.x11_surface() == Some(&window))
+            .cloned();
+        if let Some(elem) = elem {
+            self.space.unmap_elem(&elem);
+        }
+        // Mirror the pure registry + emit window.closed via the one destroy path.
+        if let Some(wl) = window.wl_surface() {
             on_surface_destroyed(self, &wl);
         }
+        if !window.is_override_redirect() {
+            let _ = window.set_mapped(false);
+        }
+    }
+
+    fn destroyed_window(&mut self, _xwm: XwmId, _window: X11Surface) {
+        // The unmap already invalidated the handle; X11 destroy needs no extra
+        // bookkeeping (the registry row is gone, the space element is unmapped).
+    }
+
+    /// The client asked to resize itself. We do not let X11 windows move freely
+    /// (the WM owns placement) but we honor the requested SIZE, mirroring anvil.
+    fn configure_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        _x: Option<i32>,
+        _y: Option<i32>,
+        w: Option<u32>,
+        h: Option<u32>,
+        _reorder: Option<Reorder>,
+    ) {
+        let mut geo = window.geometry();
+        if let Some(w) = w {
+            geo.size.w = w as i32;
+        }
+        if let Some(h) = h {
+            geo.size.h = h as i32;
+        }
+        let _ = window.configure(geo);
+    }
+
+    /// XWayland told us where it actually put an override-redirect window → keep the
+    /// space element's position in sync so input hit-testing is correct.
+    fn configure_notify(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        geometry: Rectangle<i32, Logical>,
+        _above: Option<u32>,
+    ) {
+        let elem = self
+            .space
+            .elements()
+            .find(|w| w.x11_surface() == Some(&window))
+            .cloned();
+        if let Some(elem) = elem {
+            self.space.map_element(elem, geometry.loc, false);
+        }
+    }
+
+    /// Interactive resize/move are driven by the AI-native placement policy, not by
+    /// the client grabbing the pointer; we intentionally do not start a client-driven
+    /// grab here (the WM owns geometry). A real interactive-resize affordance is
+    /// Phase-8 polish; refusing the client-initiated grab is the correct default.
+    fn resize_request(
+        &mut self,
+        _xwm: XwmId,
+        _window: X11Surface,
+        _button: u32,
+        _edges: X11ResizeEdge,
+    ) {
+    }
+
+    fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {}
+
+    fn disconnected(&mut self, _xwm: XwmId) {
+        // The X11Wm connection dropped (XWayland gone) → release our handle.
+        self.xwm = None;
     }
 }
+
+// ── XWaylandShellHandler — the X11↔wl_surface association protocol state accessor
+// (master `xwayland_shell`). A `start_wm` bound; `surface_associated` is defaulted
+// (the association is observed; the map edge that mints a handle is
+// `map_window_request` above).
+impl XWaylandShellHandler for State {
+    fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
+        &mut self.xwayland_shell_state
+    }
+}
+
+// ── DndGrabHandler — drag'n'drop hand-off for X11 clients (a `start_wm` bound). Both
+// callbacks (`dropped`/`cancelled`) are defaulted; HART-comp has no extra DnD
+// bookkeeping at this phase, so the impl is empty. (PointerFocus/TouchFocus =
+// `X11Surface`, which impls `DndFocus`, satisfy the associated `start_wm` bounds.)
+impl DndGrabHandler for State {}
 
 // ════════════════════════════════════════════════════════════════════════════
 // XdgDecorationHandler — HART-comp draws frames itself (server-side decorations).
@@ -381,11 +583,10 @@ impl State {
 // ⚠️ CI-COMPILE. INVARIANT: prefer SSD so the AI-native WM owns the chrome +
 // placement policy uniformly; fall back to CSD only for clients that hard-refuse.
 
+// master: `XdgDecorationHandler` has NO `xdg_decoration_state()` method (the global
+// is a plain `XdgDecorationState` field on `State`, made by
+// `XdgDecorationState::new::<State>(&dh)`; the trait is only the three notifications).
 impl XdgDecorationHandler for State {
-    fn xdg_decoration_state(&mut self) -> &mut XdgDecorationState {
-        &mut self.xdg_decoration_state
-    }
-
     /// A new toplevel asked about decorations → default it to SSD.
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         toplevel.with_pending_state(|state| {
@@ -464,25 +665,24 @@ fn on_surface_destroyed(state: &mut State, surface: &WlSurface) {
 }
 
 // Smithay accessor shims — the exact getters differ by rev; these name intent.
+// master: `ToplevelSurface::wl_surface()` returns `&WlSurface` (not Option) and
+// `with_states(&WlSurface, f) -> T` returns the closure value directly (no Result),
+// so the closure's `Option<String>` IS the return — no `.ok()`/`.flatten()`.
 fn surface_app_id(surface: &ToplevelSurface) -> Option<String> {
-    smithay::wayland::shell::xdg::with_states(surface.wl_surface(), |states| {
+    smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
         states
             .data_map
             .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
             .and_then(|d| d.lock().unwrap().app_id.clone())
     })
-    .ok()
-    .flatten()
 }
 fn surface_title(surface: &ToplevelSurface) -> Option<String> {
-    smithay::wayland::shell::xdg::with_states(surface.wl_surface(), |states| {
+    smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
         states
             .data_map
             .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
             .and_then(|d| d.lock().unwrap().title.clone())
     })
-    .ok()
-    .flatten()
 }
 fn x11_app_id(x11: &X11Surface) -> Option<String> {
     // X11 WM_CLASS instance/class → app_id analogue.

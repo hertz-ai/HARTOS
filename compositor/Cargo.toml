@@ -53,7 +53,7 @@ path = "src/main.rs"
 #   smithay = ["dep:smithay", "dep:calloop"]
 [features]
 default = []
-smithay = []
+smithay = ["dep:smithay", "dep:calloop"]
 
 [dependencies]
 # The skeleton is PURE LOGIC: the Phase-3 render-path/boot-config never-fail-floor
@@ -109,3 +109,19 @@ panic = "abort"
 # Match the workspace discipline in claw_native/rust: forbid unsafe in our own
 # glue. Smithay's FFI lives behind its own crate boundary.
 unsafe_code = "forbid"
+
+# ── Phase-5 CI bring-up: the real GIT Smithay dep (master), keyed to the
+# `smithay` cargo feature so the default dev-box build never resolves it. master
+# HAS `renderer_pixman` (software floor) AND `foreign_toplevel_list` (the 2023 rev
+# did not — that is why master is the target). Both flips (this dep + the feature
+# above) are the one CI step.
+[dependencies.smithay]
+git = "https://github.com/Smithay/smithay"
+branch = "master"
+optional = true
+default-features = false
+features = ["backend_drm","backend_gbm","backend_libinput","backend_udev","backend_session_libseat","renderer_pixman","wayland_frontend","desktop","xwayland"]
+
+[dependencies.calloop]
+version = "0.13"
+optional = true
