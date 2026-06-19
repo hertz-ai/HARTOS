@@ -4239,19 +4239,23 @@ function speakText(text, source) {{
 
 // ── HART OS native voice orb: reflect the shell's EXISTING voice state ──
 // Reuses isRecording (listening) + _acAudio (speaking) by polling.
-// setActive drives the viz's built-in speech-energy animation. Skipped in potato mode.
-if(!PERF.potato) {{
-  (function initHartOrb() {{
-    var c = document.getElementById('hart-voice-orb');
-    if(!c || !window.HartVoiceOrbViz) {{ setTimeout(initHartOrb, 400); return; }}
-    var orb = window.HartVoiceOrbViz(c, {{}});
-    c.style.opacity = '0.9';
-    setInterval(function() {{
-      var speaking = _acAudio && !_acAudio.paused && !_acAudio.ended;
-      orb.setActive(!!(speaking || isRecording));
-    }}, 200);
-  }})();
-}}
+// setActive drives the viz's built-in speech-energy animation.
+// ALWAYS init (NOT potato-gated): the orb's idle breathing animation is cheap
+// (a single rAF loop + a 200ms two-boolean poll) and is the centerpiece of the
+// voice-first desktop — a frozen/absent orb on a live USB (which classifies as
+// "potato") makes the shell look dead. The EXPENSIVE audio-reactive path
+// (getByteFrequencyData) is already gated INSIDE voiceOrbViz.js by `active`, so
+// it only runs while actually speaking/listening — no cost when idle.
+(function initHartOrb() {{
+  var c = document.getElementById('hart-voice-orb');
+  if(!c || !window.HartVoiceOrbViz) {{ setTimeout(initHartOrb, 400); return; }}
+  var orb = window.HartVoiceOrbViz(c, {{}});
+  c.style.opacity = '0.9';
+  setInterval(function() {{
+    var speaking = _acAudio && !_acAudio.paused && !_acAudio.ended;
+    orb.setActive(!!(speaking || isRecording));
+  }}, 200);
+}})();
 
 // ═══ SSE Live Agent Action Stream ═══
 // Renders ALL agent components as floating overlay fragments in real-time.
