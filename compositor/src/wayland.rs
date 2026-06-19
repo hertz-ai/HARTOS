@@ -56,39 +56,58 @@
 // `[features] smithay`) is where the exact module paths are reconciled on first
 // CI compile — Smithay moves these between revs (e.g. `foreign_toplevel_list` is
 // `wlr_foreign_toplevel` on some revs). Each `use` below names WHY it is needed.
-use std::sync::atomic::Ordering;
-
 use smithay::{
     // Backend: software-floor renderer + DRM scanout + libinput seat (Phase 3,
     // shared here so the event loop that drives the maps is one loop).
     backend::renderer::pixman::PixmanRenderer,
-    desktop::{Space, Window, WindowSurfaceType},
-    input::{Seat, SeatState},
+    backend::renderer::utils::on_commit_buffer_handler,
+    desktop::{layer_map_for_output, LayerSurface, Space, Window, WindowSurfaceType},
+    input::{
+        keyboard::KeyboardHandle, pointer::PointerHandle, Seat, SeatState,
+    },
+    output::Output,
     reexports::{
-        calloop::{EventLoop, LoopHandle},
+        calloop::LoopHandle,
         wayland_server::{
-            protocol::{wl_seat::WlSeat, wl_surface::WlSurface},
-            Client, Display, DisplayHandle,
+            backend::{ClientData, ClientId, DisconnectReason},
+            protocol::{wl_buffer::WlBuffer, wl_output, wl_seat::WlSeat, wl_surface::WlSurface},
+            Client, DisplayHandle,
         },
     },
     utils::{Logical, Rectangle, Serial},
     wayland::{
-        compositor::CompositorState,
+        buffer::BufferHandler,
+        compositor::{
+            get_parent, is_sync_subsurface, with_states, CompositorClientState,
+            CompositorHandler, CompositorState,
+        },
         foreign_toplevel_list::{
             ForeignToplevelListHandler, ForeignToplevelListState,
         },
-        shell::xdg::{
-            decoration::{XdgDecorationHandler, XdgDecorationState},
-            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler,
-            XdgShellState,
+        output::{OutputHandler, OutputManagerState},
+        selection::{
+            data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler},
+            SelectionHandler,
         },
+        shell::{
+            wlr_layer::{
+                Layer as WlrLayer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler,
+                WlrLayerShellState,
+            },
+            xdg::{
+                decoration::{XdgDecorationHandler, XdgDecorationState},
+                PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler,
+                XdgShellState, XdgToplevelSurfaceData,
+            },
+        },
+        shm::{ShmHandler, ShmState},
         // master: the X11↔wl_surface association protocol the X11Wm needs as a
         // handler bound on `start_wm` (its state is a plain field on `State`).
         xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
     },
     xwayland::{
         xwm::{Reorder, ResizeEdge as X11ResizeEdge, XwmId},
-        X11Surface, X11Wm, XWayland, XWaylandEvent, XwmHandler,
+        X11Surface, X11Wm, XWaylandClientData, XwmHandler,
     },
 };
 // `DndGrabHandler` is a `start_wm` bound (drag'n'drop hand-off for X11 clients).
@@ -104,9 +123,11 @@ use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_to
 // Pull the pure bookkeeping + summon state machine from the crate root. THIS is
 // the contract boundary: the Smithay handlers only ever call these pure methods.
 use crate::{
-    PendingSummon, SummonOutcome, ToplevelKind, WindowHandle, WindowRecord,
-    WindowRegistry, NEXT_HANDLE_ID,
+    PendingSummon, ToplevelKind, WindowHandle, WindowRecord, WindowRegistry,
 };
+// The backend-agnostic surface-tree / map-edge / app-id readers (M7 Stage-B hoist).
+// SHARED with the winit backend so there is one implementation, not a parallel path.
+use crate::shared::{surface_has_buffer, toplevel_app_id, toplevel_title, x11_app_id, x11_title};
 
 // ════════════════════════════════════════════════════════════════════════════
 // The compositor State — owns the pure registry + the live Smithay protocol
@@ -142,6 +163,27 @@ pub struct State {
     /// by `XWaylandShellState::new::<State>(&dh)` at construction.
     pub xwayland_shell_state: XWaylandShellState,
 
+    // ── M7: the protocol globals a real shm/xdg/layer-shell client needs to MAP +
+    // PAINT on the DRM backend (the SAME minimal set winit.rs constructs). Without
+    // these the DRM State could not serve the glass-shell layer surface that is the
+    // whole Stage-A boot-floor deliverable. ──
+    /// wl_shm — clients (the glass shell, weston-simple-shm) allocate their buffers here.
+    pub shm_state: ShmState,
+    /// wl_output / xdg-output — the output advertised to clients (the DRM connector).
+    pub output_manager_state: OutputManagerState,
+    /// wlr-layer-shell — the glass-shell desktop mounts as a BACKGROUND layer surface.
+    pub layer_shell_state: WlrLayerShellState,
+    /// wl_data_device — selection/DnD (a `delegate_dispatch2!` bundle requirement +
+    /// the X11 DnD focus targets ride it).
+    pub data_device_state: DataDeviceState,
+    /// libinput keyboard/pointer handles (cached so the input loop routes evdev events
+    /// into them, exactly like the winit backend routes winit input).
+    pub keyboard: KeyboardHandle<State>,
+    pub pointer: PointerHandle<State>,
+    /// The single DRM output (the connected display). Created in `udev.rs` from the
+    /// connector's preferred mode; clients see it as their `wl_output`.
+    pub output: Output,
+
     /// The desktop window tree (positions toplevels above the layer-shell shell).
     pub space: Space<Window>,
     /// Software-floor renderer (pixman) — the never-fail paint path.
@@ -150,10 +192,26 @@ pub struct State {
     /// XWayland WM handle (Wine/legacy X11). `None` until `XWaylandEvent::Ready`.
     pub xwm: Option<X11Wm>,
 
+    /// Whether the compositor loop should keep running (cleared on a fatal session
+    /// loss). The DRM loop checks this each iteration.
+    pub running: bool,
+
     /// IPC event sink — `window.opened`/`window.closed`/… frames to subscribers
     /// (the com.hart.Compositor server, Phase 6). Boxed so this module does not
     /// depend on the transport concretely.
     pub emit_ipc_event: Box<dyn FnMut(&str, &WindowRecord)>,
+}
+
+// ── Per-client state. Carries the compositor-side client bookkeeping Smithay needs
+// for socket-inserted clients (mirrors winit.rs::ClientState — same shape, the DRM
+// State serves the SAME glass-shell socket client). ──
+#[derive(Default)]
+pub struct ClientState {
+    pub compositor_state: CompositorClientState,
+}
+impl ClientData for ClientState {
+    fn initialized(&self, _client_id: ClientId) {}
+    fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
 impl State {
@@ -262,23 +320,21 @@ impl State {
 
 // ════════════════════════════════════════════════════════════════════════════
 // SeatHandler — input seat (keyboard/pointer/touch). REQUIRED for `SeatState<State>`
-// to exist AND as a transitive `X11Wm::start_wm` bound. The focus associated types
-// pick concrete focus targets that satisfy the trait bounds master imposes:
-//   • KeyboardFocus = WlSurface   (impls KeyboardTarget; no DnD bound on keyboard)
-//   • PointerFocus  = X11Surface  (impls PointerTarget AND DndFocus — the latter is
-//                                  required by start_wm's `PointerFocus: DndFocus`;
-//                                  X11Surface's DndFocus needs only XwmHandler+
-//                                  SeatHandler, so it pulls in NO DataDeviceHandler)
-//   • TouchFocus    = X11Surface  (impls TouchTarget AND DndFocus, same reason)
-// `seat_state()` returns the REAL `SeatState<State>` field on `State` (not a stub).
-// focus_changed/cursor_image/led_state_changed are trait-defaulted → omitted (that
-// is the trait's intended default, not a fake).
+// to exist AND as a transitive `X11Wm::start_wm` bound. ALL THREE focus targets are
+// `WlSurface` (the SAME choice as winit.rs::SeatHandler) — the M7 input router
+// (`process_input_event`) routes pointer motion/buttons to the bare `WlSurface` under
+// the cursor, so `PointerFocus` MUST be `WlSurface`. start_wm's `PointerFocus: DndFocus`
+// / `TouchFocus: DndFocus` bounds are satisfied because the State now impls
+// `DataDeviceHandler` (its `WlSurface: DndFocus<State>` impl), so no X11Surface focus
+// target is needed — exactly the winit backend's wiring. `seat_state()` returns the REAL
+// `SeatState<State>` field. focus_changed/cursor_image/led_state_changed are
+// trait-defaulted → omitted (the trait's intended default, not a fake).
 // ════════════════════════════════════════════════════════════════════════════
 
 impl smithay::input::SeatHandler for State {
     type KeyboardFocus = WlSurface;
-    type PointerFocus = X11Surface;
-    type TouchFocus = X11Surface;
+    type PointerFocus = WlSurface;
+    type TouchFocus = WlSurface;
 
     fn seat_state(&mut self) -> &mut SeatState<State> {
         &mut self.seat_state
@@ -361,8 +417,8 @@ impl State {
 /// it calls `State::on_real_map(.., ToplevelKind::Xdg)`, the SINGLE handle-mint site,
 /// so a pending `SummonApp` resolves to `Mapped(handle)` ONLY here, on the real map.
 pub fn xdg_toplevel_mapped(state: &mut State, surface: &ToplevelSurface) {
-    let app_id = surface_app_id(surface);
-    let title = surface_title(surface);
+    let app_id = toplevel_app_id(surface);
+    let title = toplevel_title(surface);
     let handle = state.on_real_map(app_id, title, ToplevelKind::Xdg);
     // Stash the handle on the Window's user-data so destroy can reverse it.
     if let Some(window) = state.window_for_toplevel(surface) {
@@ -383,38 +439,11 @@ pub fn xdg_toplevel_mapped(state: &mut State, surface: &ToplevelSurface) {
 // Wine window. `summon_precheck("windows")` returns None (proceed to await-map),
 // and ONLY this handler completes the summon with `Mapped`.
 
-/// ⚠️ CI-COMPILE. Drive the XWayland lifecycle. On `Ready` the X11 WM attaches; on
-/// `Error` XWayland crashed on startup. Inserted as a calloop event source at
-/// startup. master: `XWayland::spawn` returns `(XWayland, Client)` — the `Client`
-/// is captured at the spawn site and threaded in HERE (the `Ready` event itself
-/// carries only the privileged X11 socket + display number, NOT the client). The
-/// X11Wm borrows the `DisplayHandle` (`&state.dh`) and takes the `Client`.
-pub fn handle_xwayland_event(state: &mut State, event: XWaylandEvent, client: &Client) {
-    match event {
-        XWaylandEvent::Ready {
-            x11_socket,
-            display_number: _,
-        } => {
-            // Build the X11Wm bound to our DisplayHandle + the XWayland connection
-            // + the XWayland client, so X11 surfaces route through `XwmHandler`.
-            match X11Wm::start_wm(
-                state.loop_handle.clone(),
-                &state.dh,
-                x11_socket,
-                client.clone(),
-            ) {
-                Ok(wm) => state.xwm = Some(wm),
-                Err(e) => {
-                    tracing::error!(error = %e, "XWayland: failed to start X11 WM");
-                }
-            }
-        }
-        XWaylandEvent::Error => {
-            tracing::warn!("XWayland crashed on startup");
-            state.xwm = None;
-        }
-    }
-}
+// NOTE: the XWayland LIFECYCLE driver (spawn + `XWaylandEvent::Ready` → `X11Wm::start_wm`)
+// lives in `udev.rs::spawn_xwayland` (and `winit.rs::spawn_xwayland` for the dev backend),
+// inserted as a calloop source by the backend that owns the event loop. It is NOT a
+// standalone fn here — that would be a parallel path. The `XwmHandler` below is the live
+// X11 WM callback surface both backends route X11 map/unmap through.
 
 // ── XwmHandler — the live X11 window-manager callbacks (master routes X11 surface
 // map/unmap/configure through this trait, NOT through ad-hoc `on_xwayland_*`
@@ -664,42 +693,274 @@ fn on_surface_destroyed(state: &mut State, surface: &WlSurface) {
     }
 }
 
-// Smithay accessor shims — the exact getters differ by rev; these name intent.
-// master: `ToplevelSurface::wl_surface()` returns `&WlSurface` (not Option) and
-// `with_states(&WlSurface, f) -> T` returns the closure value directly (no Result),
-// so the closure's `Option<String>` IS the return — no `.ok()`/`.flatten()`.
-fn surface_app_id(surface: &ToplevelSurface) -> Option<String> {
-    smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-        states
-            .data_map
-            .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
-            .and_then(|d| d.lock().unwrap().app_id.clone())
-    })
-}
-fn surface_title(surface: &ToplevelSurface) -> Option<String> {
-    smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-        states
-            .data_map
-            .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
-            .and_then(|d| d.lock().unwrap().title.clone())
-    })
-}
-fn x11_app_id(x11: &X11Surface) -> Option<String> {
-    // X11 WM_CLASS instance/class → app_id analogue.
-    Some(x11.class()).filter(|s| !s.is_empty())
-}
-fn x11_title(x11: &X11Surface) -> Option<String> {
-    Some(x11.title()).filter(|s| !s.is_empty())
+// ════════════════════════════════════════════════════════════════════════════
+// M7 — the protocol handlers that make `State` a COMPLETE compositor able to SERVE
+// real clients on the DRM backend. Through M6 `wayland.rs` had only XdgShell /
+// XWayland / decoration / foreign-toplevel / seat impls — it compiled but could not
+// serve clients (nothing constructed a `Display<State>` + dispatched). These are the
+// missing bundle a `delegate_dispatch2!(State)` requires + the glass-shell layer
+// mount. They mirror winit.rs's handlers 1:1 (the SAME protocol surface) — the only
+// difference is the renderer type, which lives in `udev.rs`'s render loop, not here.
+// ════════════════════════════════════════════════════════════════════════════
+
+impl State {
+    /// Reverse-lookup the live `Window` whose ROOT surface is `surface` (mirrors
+    /// winit.rs::window_for_surface). `Window::wl_surface()` comes from `WaylandFocus`.
+    fn window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
+        self.space
+            .elements()
+            .find(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false))
+            .cloned()
+    }
+
+    /// M7 — route a single libinput event into the seat. Stage-A boot floor: forward
+    /// keyboard keys to the focused client + absolute/relative pointer motion + buttons
+    /// + axis to the pointer-focused surface. The full click-to-focus / keyboard-shortcut
+    /// / workspace logic is the winit backend's (M3/M5) and is Stage-B parity here — the
+    /// boot floor needs the seat live so the glass shell receives input, not the whole WM.
+    pub fn process_input_event<B: smithay::backend::input::InputBackend>(
+        &mut self,
+        event: smithay::backend::input::InputEvent<B>,
+    ) {
+        use smithay::backend::input::{
+            AbsolutePositionEvent, Event, InputEvent, KeyboardKeyEvent, PointerButtonEvent,
+        };
+        use smithay::input::keyboard::FilterResult;
+        use smithay::input::pointer::{ButtonEvent, MotionEvent};
+        use smithay::utils::SERIAL_COUNTER;
+        match event {
+            InputEvent::Keyboard { event } => {
+                let serial = SERIAL_COUNTER.next_serial();
+                let time = event.time_msec();
+                let code = event.key_code();
+                let key_state = event.state();
+                let keyboard = self.keyboard.clone();
+                // Forward every key to the focused client (no compositor chords on the DRM
+                // floor yet — Stage-B parity). The filter always returns Forward.
+                keyboard.input::<(), _>(self, code, key_state, serial, time, |_, _, _| {
+                    FilterResult::Forward
+                });
+            }
+            InputEvent::PointerMotionAbsolute { event } => {
+                let serial = SERIAL_COUNTER.next_serial();
+                let output_geo = match self.space.output_geometry(&self.output) {
+                    Some(g) => g,
+                    None => return,
+                };
+                let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+                let pointer = self.pointer.clone();
+                let under = self.surface_under(pos);
+                pointer.motion(
+                    self,
+                    under,
+                    &MotionEvent { location: pos, serial, time: event.time_msec() },
+                );
+                pointer.frame(self);
+            }
+            InputEvent::PointerButton { event } => {
+                let serial = SERIAL_COUNTER.next_serial();
+                let pointer = self.pointer.clone();
+                pointer.button(
+                    self,
+                    &ButtonEvent {
+                        button: event.button_code(),
+                        state: event.state(),
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
+                pointer.frame(self);
+            }
+            _ => {}
+        }
+    }
+
+    /// Hit-test the surface under `pos` for POINTER focus (toplevels then layer
+    /// surfaces). Trimmed from winit.rs::surface_under to the Stage-A floor (no z-order
+    /// layer juggling beyond "windows above, layer-shell below").
+    fn surface_under(
+        &self,
+        pos: smithay::utils::Point<f64, Logical>,
+    ) -> Option<(WlSurface, smithay::utils::Point<f64, Logical>)> {
+        if let Some((window, win_loc)) = self.space.element_under(pos) {
+            if let Some((surface, surf_loc)) =
+                window.surface_under(pos - win_loc.to_f64(), WindowSurfaceType::ALL)
+            {
+                return Some((surface, (surf_loc + win_loc).to_f64()));
+            }
+        }
+        let layers = layer_map_for_output(&self.output);
+        if let Some(layer) = layers
+            .layer_under(WlrLayer::Top, pos)
+            .or_else(|| layers.layer_under(WlrLayer::Background, pos))
+        {
+            let layer_loc = layers.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
+            if let Some((surface, loc)) =
+                layer.surface_under(pos - layer_loc.to_f64(), WindowSurfaceType::ALL)
+            {
+                return Some((surface, (loc + layer_loc).to_f64()));
+            }
+        }
+        None
+    }
 }
 
-// Touch the imports the draft references structurally so a future reviewer sees
-// the full surface the real loop wires (renderer/space/seat/EventLoop/Display).
-// Removed at first CI compile when the real `run_event_loop_smithay` lands.
-#[allow(dead_code)]
-fn _imports_touch() {
-    let _ = NEXT_HANDLE_ID.load(Ordering::Relaxed);
-    let _sz: Option<Rectangle<i32, Logical>> = None;
-    let _surface_type = WindowSurfaceType::TOPLEVEL;
-    fn _types(_d: &Display<State>, _e: &EventLoop<State>, _x: &XWayland) {}
-    let _ = SummonOutcome::TimedOut;
+// ── BufferHandler ───────────────────────────────────────────────────────────
+impl BufferHandler for State {
+    fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
+}
+
+// ── CompositorHandler — THE map edge lives here (first buffer commit), exactly as
+// the winit backend detects it. An xdg toplevel is "mapped" the first time it commits
+// a buffer; we mint the handle then via `on_real_map` (the SINGLE mint site), so a
+// handle still proves a real map on the DRM path too (no-phantom-window). ──
+impl CompositorHandler for State {
+    fn compositor_state(&mut self) -> &mut CompositorState {
+        &mut self.compositor_state
+    }
+
+    fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        // The XWayland client carries XWaylandClientData (its OWN CompositorClientState);
+        // socket-inserted clients carry our ClientState. Check XWayland first, then ours
+        // — without this the XWayland connection panics ("client without ClientState").
+        if let Some(state) = client.get_data::<XWaylandClientData>() {
+            return &state.compositor_state;
+        }
+        if let Some(state) = client.get_data::<ClientState>() {
+            return &state.compositor_state;
+        }
+        panic!("client_compositor_state: unknown client data type")
+    }
+
+    fn commit(&mut self, surface: &WlSurface) {
+        // Latch the newly-committed buffer into Smithay's surface state.
+        on_commit_buffer_handler::<Self>(surface);
+        if is_sync_subsurface(surface) {
+            return;
+        }
+        // Walk to the root (the toplevel's surface).
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        if let Some(window) = self.window_for_surface(&root) {
+            window.on_commit();
+            // THE MAP EDGE (no-phantom-window mint site): root commit + not-yet-mapped +
+            // a real buffer → mint once via on_real_map (ToplevelKind::Xdg). Identical to
+            // winit.rs's commit map-edge, so a handle proves a real map here too.
+            let already_mapped = window.user_data().get::<WindowHandle>().is_some();
+            if &root == surface && !already_mapped && surface_has_buffer(surface) {
+                if let Some(toplevel) = window.toplevel() {
+                    xdg_toplevel_mapped(self, &toplevel.clone());
+                }
+            }
+        }
+        ensure_initial_configure(self, surface);
+    }
+}
+
+// ── ShmHandler ───────────────────────────────────────────────────────────────
+impl ShmHandler for State {
+    fn shm_state(&self) -> &ShmState {
+        &self.shm_state
+    }
+}
+
+// ── WlrLayerShellHandler — the glass-shell desktop mounts as a BACKGROUND layer
+// (the Stage-A boot-floor deliverable: scanout of the layer-shell glass shell). Ported
+// 1:1 from winit.rs. ──
+impl WlrLayerShellHandler for State {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: WlrLayerSurface,
+        _wl_output: Option<wl_output::WlOutput>,
+        _layer: WlrLayer,
+        namespace: String,
+    ) {
+        let output = self.output.clone();
+        let mut map = layer_map_for_output(&output);
+        let ns = namespace.clone();
+        match map.map_layer(&LayerSurface::new(surface, namespace)) {
+            Ok(()) => tracing::info!(
+                namespace = %ns,
+                layer = ?_layer,
+                "layer.mapped (wlr-layer-shell surface tracked — the glass-shell desktop mount point)"
+            ),
+            Err(err) => tracing::warn!(?err, namespace = %ns, "failed to map layer surface"),
+        }
+    }
+
+    fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        let output = self.output.clone();
+        let mut map = layer_map_for_output(&output);
+        let found = map
+            .layers()
+            .find(|l| l.layer_surface() == &surface)
+            .cloned();
+        if let Some(layer) = found {
+            map.unmap_layer(&layer);
+        }
+    }
+}
+
+// ── SelectionHandler + DataDevice* — required by the delegate_dispatch2 bundle. ──
+impl SelectionHandler for State {
+    type SelectionUserData = ();
+}
+impl DataDeviceHandler for State {
+    fn data_device_state(&mut self) -> &mut DataDeviceState {
+        &mut self.data_device_state
+    }
+}
+impl WaylandDndGrabHandler for State {}
+
+// ── OutputHandler — required for the output global's dispatch. ──
+impl OutputHandler for State {}
+
+// One macro generates every Dispatch/GlobalDispatch impl from the Handler traits above
+// (the unified dispatch model on this Smithay rev — the SAME macro winit.rs uses).
+smithay::delegate_dispatch2!(State);
+
+/// Send the initial xdg/layer configure once, on the surface's first commit, so the
+/// client can attach a buffer (the map edge). Ported 1:1 from winit.rs.
+fn ensure_initial_configure(state: &mut State, surface: &WlSurface) {
+    // xdg toplevel?
+    if let Some(window) = state.window_for_surface(surface) {
+        if let Some(toplevel) = window.toplevel() {
+            let initial_configure_sent = with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .map(|d| d.lock().unwrap().initial_configure_sent)
+                    .unwrap_or(false)
+            });
+            if !initial_configure_sent {
+                toplevel.send_configure();
+            }
+        }
+        return;
+    }
+    // wlr layer surface?
+    let output = state.output.clone();
+    let mut map = layer_map_for_output(&output);
+    if let Some(layer) = map
+        .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+        .cloned()
+    {
+        map.arrange();
+        let initial_configure_sent = with_states(surface, |states| {
+            states
+                .data_map
+                .get::<smithay::wayland::shell::wlr_layer::LayerSurfaceData>()
+                .map(|d| d.lock().unwrap().initial_configure_sent)
+                .unwrap_or(false)
+        });
+        if !initial_configure_sent {
+            layer.layer_surface().send_configure();
+        }
+    }
 }

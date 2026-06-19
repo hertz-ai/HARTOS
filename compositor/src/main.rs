@@ -57,6 +57,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+// ── Backend-AGNOSTIC Smithay glue shared by BOTH backends (winit + DRM/udev) ──
+// The surface-tree / map-edge / app-id readers that touch neither the renderer
+// concretely nor the backend transport live in `shared.rs`, gated to
+// `any(feature="winit", feature="smithay")` so ONE implementation feeds both
+// backends (M7 Stage-B hoist; the DRY gate — no parallel helper path). Off on the
+// default dev-box build (neither feature on). See src/shared.rs.
+#[cfg(any(feature = "winit", feature = "smithay"))]
+mod shared;
+
 // ── Phase-5 Smithay handler BODIES (CI-COMPILE only) ──
 // The real xdg-shell / XWayland / xdg-decoration / wlr-foreign-toplevel-management
 // handler bodies live in `wayland.rs`, gated behind the `smithay` cargo feature
@@ -68,6 +77,14 @@ use std::time::{Duration, Instant};
 // the honest "not wired here" — and the source-guard asserts they remain so).
 #[cfg(feature = "smithay")]
 mod wayland;
+
+// ── Milestone 7: the REAL-HARDWARE DRM/udev backend (KMS scanout + libinput seat),
+// the software-floor twin of `winit`. Gated behind the `smithay` cargo feature (the
+// DRM stack). It reuses the SAME `wayland.rs` State + handlers + the `shared.rs`
+// helpers; the only backend-specific parts are the DRM/GBM/libinput wiring + the
+// PixmanRenderer scanout. `--backend drm` routes here. See src/udev.rs.
+#[cfg(feature = "smithay")]
+mod udev;
 
 // ── Milestone 1: the REAL running compositor (winit backend, WSL/WSLg) ──
 // Gated behind the DISTINCT `winit` cargo feature (parallel to the DRM `wayland`
@@ -712,12 +729,27 @@ fn mount_glass_shell_layer() {
 /// XWayland toplevel maps (Phase 5, feeding `WindowRegistry`), and the
 /// com.hart.Compositor IPC server (Phase 6). Nothing destructive happens here yet.
 fn run_event_loop(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // ── Milestone 7: when built with the `smithay` (DRM) feature AND asked for the
+    // DRM backend, run the REAL-HARDWARE compositor (KMS scanout + libinput seat on
+    // the PixmanRenderer software floor). This is the never-fail boot path the
+    // hart-comp.nix session + the B4 supervisor's Tier-1 rung drive. It cannot RUN on
+    // a box with no DRM device (WSL/dev) — there it errors honestly and the supervisor
+    // drops to sway/cage — but it COMPILES here, which is the M7 proof for the DRM
+    // path. `--backend winit` on a smithay build still falls through to the skeleton
+    // floor below (winit needs the distinct `winit` feature's GlesRenderer).
+    #[cfg(feature = "smithay")]
+    {
+        if cfg.backend == Backend::Drm {
+            return udev::run_udev(cfg);
+        }
+    }
+
     // ── Milestone 1: when built with the `winit` feature, run the REAL compositor
     // (winit backend, nested in WSLg). This is no longer a skeleton on that build —
     // it boots the event loop, creates a wayland-N socket, and paints clients. The
     // pure-logic skeleton below remains the feature-OFF fallback so the dev-box
     // build (no Wayland/Smithay) stays green. `--backend drm` is reserved for the
-    // DRM path (src/wayland.rs); on a winit-only build we always run winit.
+    // DRM path (src/udev.rs); on a winit-only build we always run winit.
     #[cfg(feature = "winit")]
     {
         return winit::run_winit(cfg);

@@ -137,6 +137,12 @@ use tracing::{error, info, warn};
 use crate::{
     BootConfig, HART_SPLASH_RGBA, ToplevelKind, WindowHandle, WindowRegistry, select_render_path,
 };
+// Backend-AGNOSTIC surface-tree / map-edge / app-id readers (M7 Stage-B hoist) —
+// SHARED with the DRM/udev backend so there is ONE implementation, not a parallel path.
+use crate::shared::{
+    send_frame_callbacks, surface_has_buffer, toplevel_app_id, toplevel_title, x11_app_id,
+    x11_title,
+};
 
 /// Last painted wlr-layer-surface count, so the render loop logs a one-line
 /// transition (0→N / N→0) instead of spamming every frame. Pure observability.
@@ -2384,76 +2390,10 @@ fn bake_default_cursor() -> (Vec<u8>, i32, i32, Point<i32, Logical>) {
     (rgba, W, H, Point::from((0, 0)))
 }
 
-/// Drain a surface tree's frame callbacks (mirrors minimal.rs's helper). Without
-/// this, well-behaved clients (which wait for the frame callback before drawing
-/// the next frame) freeze after the first frame.
-fn send_frame_callbacks(surface: &WlSurface, time: u32) {
-    use smithay::wayland::compositor::{
-        SurfaceAttributes, TraversalAction, with_surface_tree_downward,
-    };
-    with_surface_tree_downward(
-        surface,
-        (),
-        |_, _, &()| TraversalAction::DoChildren(()),
-        |_surf, states, &()| {
-            for callback in states
-                .cached_state
-                .get::<SurfaceAttributes>()
-                .current()
-                .frame_callbacks
-                .drain(..)
-            {
-                callback.done(time);
-            }
-        },
-        |_, _, &()| true,
-    );
-}
-
-/// Has `surface` actually got a committed buffer latched (i.e. is it MAPPED)? This
-/// is the post-`on_commit_buffer_handler` truth: the renderer surface state holds
-/// the latched buffer only once the client attached + committed one. Used as the
-/// map-edge gate in `commit` (no handle is minted until this is true).
-fn surface_has_buffer(surface: &WlSurface) -> bool {
-    use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
-    with_states(surface, |states| {
-        states
-            .data_map
-            .get::<RendererSurfaceStateUserData>()
-            .map(|d| d.lock().unwrap().buffer().is_some())
-            .unwrap_or(false)
-    })
-}
-
-/// Read a toplevel's `app_id` (the join key the brain's launcher would tag).
-fn toplevel_app_id(toplevel: &ToplevelSurface) -> Option<String> {
-    with_states(toplevel.wl_surface(), |states| {
-        states
-            .data_map
-            .get::<XdgToplevelSurfaceData>()
-            .and_then(|d| d.lock().unwrap().app_id.clone())
-    })
-}
-
-/// Read a toplevel's `title`.
-fn toplevel_title(toplevel: &ToplevelSurface) -> Option<String> {
-    with_states(toplevel.wl_surface(), |states| {
-        states
-            .data_map
-            .get::<XdgToplevelSurfaceData>()
-            .and_then(|d| d.lock().unwrap().title.clone())
-    })
-}
-
-/// X11 WM_CLASS → app_id analogue (the join key the brain's launcher tags).
-fn x11_app_id(x11: &X11Surface) -> Option<String> {
-    Some(x11.class()).filter(|s| !s.is_empty())
-}
-
-/// X11 window title.
-fn x11_title(x11: &X11Surface) -> Option<String> {
-    Some(x11.title()).filter(|s| !s.is_empty())
-}
+// NOTE: `send_frame_callbacks` / `surface_has_buffer` / `toplevel_app_id` /
+// `toplevel_title` / `x11_app_id` / `x11_title` are backend-AGNOSTIC and now live in
+// `crate::shared` (imported at the top of this module) — ONE implementation shared with
+// the DRM/udev backend, not a parallel copy (M7 Stage-B hoist, CLAUDE.md Gate 4).
 
 // ── M4 — uniform app_id/title readers for the IPC `window.list` serializer
 // (src/ipc.rs). A `Window` is either an xdg toplevel or an X11 surface; these pick
