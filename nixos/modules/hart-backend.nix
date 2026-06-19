@@ -14,8 +14,13 @@ in
     systemd.services.hart-backend = {
       description = "HART OS Backend (Flask/Waitress)";
       documentation = [ "https://github.com/hertz-ai/HARTOS" ];
-      after = [ "network-online.target" "hart-first-boot.service" ];
-      wants = [ "network-online.target" ];
+      # NO network-online.target: the backend binds 0.0.0.0:6777 LOCALLY and
+      # serves the shell's local API without the internet. On an offline live
+      # USB, waiting on network-online stalls the boot ~90-120s (systemd-
+      # networkd-wait-online timeout) before :6777 ever serves, which floods
+      # the shell with "Connection refused" to localhost:6777. Only depend on
+      # hart-first-boot (data-dir/StateDirectory provisioning).
+      after = [ "hart-first-boot.service" ];
       partOf = [ "hart.target" ];
       wantedBy = [ "hart.target" ];
 
