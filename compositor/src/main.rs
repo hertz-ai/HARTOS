@@ -61,6 +61,15 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "smithay")]
 mod wayland;
 
+// ── Milestone 1: the REAL running compositor (winit backend, WSL/WSLg) ──
+// Gated behind the DISTINCT `winit` cargo feature (parallel to the DRM `wayland`
+// module, NOT to the always-compiled skeleton). On the Windows dev box neither
+// `winit` nor `smithay` is on, so this module is NOT compiled and the pure-logic
+// floor + `#[cfg(test)]` below stay green. `cargo build --features winit` (in WSL,
+// nested in WSLg) compiles + RUNS it. See src/winit.rs for the full rationale.
+#[cfg(feature = "winit")]
+mod winit;
+
 // NOTE: these `use smithay::...` imports are the SHAPE the real compositor needs.
 // They are commented at module scope intentionally — uncommenting + filling the
 // handler bodies is the Phase-3/Phase-5 CI bring-up work, done where Smithay can
@@ -117,6 +126,19 @@ enum RenderPath {
     Hardware,
 }
 
+/// Which backend the compositor drives. `Winit` nests in an existing Wayland host
+/// (WSLg's wayland-0) for dev/WSL — runnable with no DRM/KMS. `Drm` is the real
+/// hardware path (src/wayland.rs). The `--backend` arg selects it; the cargo
+/// feature decides which is even compiled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    /// winit/wayland-client nested backend (dev/WSL). Default when the `winit`
+    /// feature is built.
+    Winit,
+    /// DRM/KMS real-hardware backend (src/wayland.rs).
+    Drm,
+}
+
 /// Boot-time configuration resolved from argv + environment. Kept tiny on purpose.
 #[derive(Debug, Clone)]
 struct BootConfig {
@@ -124,6 +146,11 @@ struct BootConfig {
     /// supervisor / the hart-comp.nix unit pass this on broken-GPU boxes so a
     /// half-finished hardware path can never brick the box.
     force_software: bool,
+    /// `--backend winit|drm`. Defaults to `Winit` (the runnable dev/WSL path) so
+    /// `cargo run --features winit` Just Works under WSLg; a real-HW deploy passes
+    /// `--backend drm` (and is built with `--features smithay`).
+    #[allow(dead_code)] // read only on the winit/drm feature builds, not the floor
+    backend: Backend,
 }
 
 impl BootConfig {
@@ -134,7 +161,26 @@ impl BootConfig {
             || std::env::var("WLR_RENDERER_ALLOW_SOFTWARE").is_ok()
             || std::env::var("LIBGL_ALWAYS_SOFTWARE").is_ok()
             || std::env::var("HART_COMP_FORCE_SOFTWARE").is_ok();
-        BootConfig { force_software }
+
+        // `--backend winit|drm` (default winit). Parsed positionally: the token
+        // AFTER `--backend` is the value.
+        let mut backend = Backend::Winit;
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--backend") {
+            match args.get(i + 1).map(String::as_str) {
+                Some("drm") => backend = Backend::Drm,
+                Some("winit") => backend = Backend::Winit,
+                Some(other) => {
+                    tracing::warn!(backend = other, "unknown --backend; defaulting to winit");
+                }
+                None => tracing::warn!("--backend given without a value; defaulting to winit"),
+            }
+        }
+
+        BootConfig {
+            force_software,
+            backend,
+        }
     }
 }
 
@@ -642,40 +688,47 @@ fn mount_glass_shell_layer() {
 /// XWayland toplevel maps (Phase 5, feeding `WindowRegistry`), and the
 /// com.hart.Compositor IPC server (Phase 6). Nothing destructive happens here yet.
 fn run_event_loop(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let path = select_render_path(cfg);
+    // ── Milestone 1: when built with the `winit` feature, run the REAL compositor
+    // (winit backend, nested in WSLg). This is no longer a skeleton on that build —
+    // it boots the event loop, creates a wayland-N socket, and paints clients. The
+    // pure-logic skeleton below remains the feature-OFF fallback so the dev-box
+    // build (no Wayland/Smithay) stays green. `--backend drm` is reserved for the
+    // DRM path (src/wayland.rs); on a winit-only build we always run winit.
+    #[cfg(feature = "winit")]
+    {
+        return winit::run_winit(cfg);
+    }
 
-    // 1. Paint the brand clear BEFORE anything else (no flash-of-black).
-    paint_splash_clear(path);
+    #[allow(unreachable_code)]
+    {
+        let path = select_render_path(cfg);
 
-    // 2. Mount the glass shell layer-shell surface (the desktop).
-    mount_glass_shell_layer();
+        // 1. Paint the brand clear BEFORE anything else (no flash-of-black).
+        paint_splash_clear(path);
 
-    // 3. Phase-5 native-window tree (the manifest↔toplevel map). Constructed here
-    //    so the real loop's xdg-shell / XWayland map handlers feed it; the skeleton
-    //    only proves it constructs (the behavior is unit-tested below + VM-proven).
-    let _windows = WindowRegistry::new();
+        // 2. Mount the glass shell layer-shell surface (the desktop).
+        mount_glass_shell_layer();
 
-    // 4. TODO[phase3-vm]: real calloop event loop.
-    //    let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
-    //    insert DRM device source, libinput source, wayland display source,
-    //    XdgShellState + XWayland + XdgDecorationState + ForeignToplevelListState
-    //    (Phase 5), com.hart.Compositor IPC socket source (Phase 6).
-    //    On each toplevel map -> on_xdg_toplevel_mapped / on_xwayland_surface_mapped
-    //    -> WindowRegistry::on_map; resolve any PendingSummon; emit window.opened.
-    //    A per-tick timer expires PendingSummon past SUMMON_MAP_TIMEOUT -> TimedOut.
-    //    event_loop.run(None, &mut state, |_| { /* dispatch */ })?;
-    //
-    // SKELETON stand-in: the loop is not started (there is no Wayland socket on
-    // Windows). We log readiness and return so `cargo check` proves the SHAPE.
-    tracing::info!(
-        ?path,
-        "HART-comp skeleton initialized (event loop NOT started — compile-pending, VM-only)"
-    );
+        // 3. Phase-5 native-window tree (the manifest↔toplevel map). Constructed
+        //    here so the real loop's xdg-shell / XWayland map handlers feed it; the
+        //    skeleton only proves it constructs (the behavior is unit-tested below).
+        let _windows = WindowRegistry::new();
 
-    // A real run would block here. The skeleton returns immediately; the integer
-    // below documents the intended idle tick the real loop uses for housekeeping.
-    let _idle_tick = Duration::from_millis(16); // ~60fps housekeeping cadence
-    Ok(())
+        // 4. SKELETON stand-in: the loop is not started (there is no Wayland socket
+        //    on Windows). We log readiness and return so `cargo check` proves the
+        //    SHAPE. The REAL loop is src/winit.rs (winit, built `--features winit`)
+        //    and src/wayland.rs (DRM, `--features smithay`).
+        tracing::info!(
+            ?path,
+            "HART-comp skeleton initialized (event loop NOT started — feature-OFF floor; \
+             build --features winit to RUN the real compositor)"
+        );
+
+        // A real run would block here. The skeleton returns immediately; the integer
+        // below documents the intended idle tick the real loop uses for housekeeping.
+        let _idle_tick = Duration::from_millis(16); // ~60fps housekeeping cadence
+        Ok(())
+    }
 }
 
 fn main() {
@@ -717,7 +770,7 @@ mod tests {
 
     #[test]
     fn force_software_pins_software_path() {
-        let cfg = BootConfig { force_software: true };
+        let cfg = BootConfig { force_software: true, backend: Backend::Winit };
         assert_eq!(select_render_path(&cfg), RenderPath::Software);
     }
 
@@ -726,7 +779,7 @@ mod tests {
         // With the hardware probe stubbed FALSE (the safe Windows-dev default),
         // even a non-forced boot MUST select the software floor — never a blank
         // screen waiting on an unproven hardware path.
-        let cfg = BootConfig { force_software: false };
+        let cfg = BootConfig { force_software: false, backend: Backend::Winit };
         assert_eq!(select_render_path(&cfg), RenderPath::Software);
     }
 
