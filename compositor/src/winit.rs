@@ -34,6 +34,7 @@
 
 #![cfg(feature = "winit")]
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,7 +42,7 @@ use smithay::{
     backend::{
         input::{
             AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-            KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+            KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
         },
         renderer::{
             Color32F, Frame, Renderer,
@@ -57,7 +58,12 @@ use smithay::{
     desktop::{Space, Window, WindowSurfaceType},
     input::{
         Seat, SeatHandler, SeatState,
-        keyboard::{FilterResult, KeyboardHandle},
+        // M5: keyboard-shortcut interception needs the keysym + modifier types and the
+        // `keysyms as xkb` constant module (the `KEY_1..=KEY_9` digit range), exactly as
+        // anvil/src/input_handler.rs imports them at this pinned rev. `Keysym::Tab` /
+        // `Keysym::Left` / … are associated consts on `xkeysym::Keysym`; `keysym.raw()`
+        // gives the `u32` the digit-range `.contains()` compares.
+        keyboard::{FilterResult, KeyboardHandle, Keysym, ModifiersState, keysyms as xkb},
         pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
@@ -132,6 +138,69 @@ static LAYERS_PAINTED: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 /// there); it is deferred to the first commit and de-duplicated by this marker.
 struct X11Focused;
 
+// ════════════════════════════════════════════════════════════════════════════
+// M5 — WM completeness: keyboard-shortcut actions + per-window workspace tag +
+// pre-snap geometry stash.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The action a compositor keyboard shortcut resolves to (anvil's `KeyAction`
+/// analogue, IPC_PROTOCOL.md §4 verbs surfaced as chords). `process_keyboard_shortcut`
+/// maps a `(ModifiersState, Keysym)` to one of these; the chord is INTERCEPTED (never
+/// forwarded to the focused client) iff the map returns `Some`. The action is executed
+/// AFTER `KeyboardHandle::input` returns (outside the filter closure) to avoid a second
+/// `&mut self` borrow — exactly anvil's two-phase pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WmAction {
+    /// Alt+Tab — cycle keyboard focus to the next window (stack-order MRU).
+    CycleFocus,
+    /// Alt+Shift+Tab — cycle focus to the previous window.
+    CycleFocusBack,
+    /// Super+1..9 — switch to workspace N (0-based; N = keysym - KEY_1).
+    SwitchWorkspace(usize),
+    /// Super+Shift+1..9 — move the focused window to workspace N.
+    MoveToWorkspace(usize),
+    /// Super+Q — close the focused toplevel.
+    CloseFocused,
+    /// Super+Left — snap the focused window to the left half.
+    SnapLeft,
+    /// Super+Right — snap the focused window to the right half.
+    SnapRight,
+    /// Super+Up — maximize the focused window.
+    Maximize,
+    /// Super+Down — restore the focused window's pre-snap geometry.
+    RestoreWindow,
+    /// Super+D — toggle show-desktop (hide all, then restore).
+    ShowDesktop,
+}
+
+/// Which workspace a mapped `Window` belongs to. Stashed in the `Window`'s user-data
+/// (the SAME mechanism as `WindowHandle`) on map, read by `window.list` + by the
+/// move/switch logic. `Cell` because `UserDataMap` only offers `insert_if_missing` +
+/// `get` (no replace) — `move_to_workspace` re-tags via `.set()`. Default 0 (the
+/// first workspace), matching `State.active_workspace`'s initial value.
+struct WorkspaceTag(Cell<usize>);
+
+/// The focused window's geometry captured the FIRST time it is snapped/maximized, so
+/// Super+Down (`RestoreWindow`) can put it back. Stashed in user-data; `Cell` for the
+/// same insert-if-missing-then-set reason as `WorkspaceTag`. `None` until the first
+/// snap — `RestoreWindow` with no stash falls back to a centered default.
+struct PreSnapGeom(Cell<Option<Rectangle<i32, Logical>>>);
+
+/// A window that has been moved OFF the visible `Space` (it lives on a non-active
+/// workspace, or is hidden by show-desktop). Held here with the location to restore
+/// it to, so switching back re-maps it exactly where it was. Keeping inactive windows
+/// OUT of `self.space` is what lets the render loop + input path stay UNCHANGED — they
+/// naturally only ever see the active workspace (one source of truth, no parallel
+/// "is this window visible" filter sprinkled through the render path).
+pub(crate) struct HiddenWindow {
+    pub(crate) window: Window,
+    /// The workspace this window belongs to (so `switch_workspace(n)` knows which held
+    /// windows to bring back).
+    pub(crate) workspace: usize,
+    /// Where it was on the visible output before being hidden.
+    pub(crate) loc: Point<i32, Logical>,
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Per-client state. Carries the compositor-side client bookkeeping Smithay needs.
 // ────────────────────────────────────────────────────────────────────────────
@@ -198,6 +267,25 @@ pub struct State {
     // fields ABOVE (space/seat/xwm) against a verb; this holds only the event
     // fan-out subscribers so the map/unmap/focus edges below can push event frames.
     pub ipc: crate::ipc::IpcState,
+
+    // ── M5: WORKSPACES. The visible `space` above holds ONLY the active workspace's
+    // windows (so render + input stay single-source). `active_workspace` is the
+    // currently-shown index (0-based); `hidden_windows` holds every window on a
+    // NON-active workspace (and the show-desktop stash), each with the location to
+    // restore it to. Switching = unmap the active set into `hidden_windows` + map the
+    // target set back. The M4 `workspace.switch`/`move_to_workspace` IPC verbs drive
+    // this SAME state (no parallel workspace model).
+    pub active_workspace: usize,
+    pub hidden_windows: Vec<HiddenWindow>,
+    /// Show-desktop (Super+D) toggle: when true the active workspace's windows are
+    /// stashed in `hidden_windows` (workspace = `active_workspace`) and the desktop is
+    /// bare; the next toggle restores them. A bool so a second Super+D un-hides.
+    pub desktop_shown: bool,
+
+    /// M5: keysyms whose PRESS triggered an intercepted shortcut, so the matching
+    /// RELEASE is also swallowed (else the focused client gets a dangling key-up for a
+    /// key it never saw pressed). Anvil's exact `suppressed_keys` mechanism.
+    pub suppressed_keys: Vec<Keysym>,
 }
 
 impl State {
@@ -374,18 +462,466 @@ impl State {
         }
     }
 
-    /// Forward a key press/release to the focused surface's client. The seat tracks
-    /// the focused surface (set by `update_keyboard_focus` on click and on first map),
-    /// so this is a straight forward — no compositor shortcut interception in M3.
+    /// M5 — intercept compositor keyboard shortcuts BEFORE forwarding to the focused
+    /// client; forward everything else. Modelled 1:1 on anvil's `keyboard_key_to_action`
+    /// (`input_handler.rs`, this pinned rev): the seat's `KeyboardHandle::input` filter
+    /// closure runs before the key reaches the focused client, so returning
+    /// `FilterResult::Intercept(action)` SWALLOWS the chord (the app never sees it) and
+    /// `input()` returns `Some(action)`; `Forward` delivers it normally.
+    ///
+    /// Two things make the chord NOT also reach the client (the explicit M5 ask):
+    ///   1. On a PRESS that maps to an action, return `Intercept` — that stops the press.
+    ///   2. The matching RELEASE is also swallowed via `suppressed_keys` (else the client
+    ///      gets a dangling key-up for a key it never saw pressed): on the action-press we
+    ///      push the keysym; on release, if present we remove it + `Intercept(())` (do
+    ///      nothing), else `Forward`.
+    ///
+    /// The action is EXECUTED after `input()` returns (outside the closure) to avoid a
+    /// second `&mut self` borrow — the closure only RESOLVES the action; the caller runs
+    /// it. (`apply_wm_action` re-borrows `self` freely.)
     fn on_keyboard_key<B: InputBackend>(&mut self, evt: B::KeyboardKeyEvent) {
         let serial = SERIAL_COUNTER.next_serial();
         let time = evt.time_msec();
         let code = evt.key_code();
         let state = evt.state();
         let keyboard = self.keyboard.clone();
-        keyboard.input::<(), _>(self, code, state, serial, time, |_, _, _| {
-            FilterResult::Forward
+
+        // Clone the suppressed-keys set into the closure, write it back after (anvil's
+        // pattern — the closure can't borrow `self.suppressed_keys` while `input` holds
+        // `&mut self`). The closure returns the resolved `WmAction` (if any) as the
+        // filter's `T`; `Intercept(None)` swallows a key with no action (a suppressed
+        // release), `Intercept(Some(a))` swallows + carries the action to run.
+        let mut suppressed = self.suppressed_keys.clone();
+        let action: Option<WmAction> = keyboard
+            .input::<Option<WmAction>, _>(self, code, state, serial, time, |_, modifiers, handle| {
+                let keysym = handle.modified_sym();
+                // M5 DEBUG (HART_COMP_DEBUG_KEYS): trace every key so the harness can
+                // verify the chord reaches the seat + the modifier state is tracked.
+                if std::env::var_os("HART_COMP_DEBUG_KEYS").is_some() {
+                    info!(
+                        ?state,
+                        logo = modifiers.logo, alt = modifiers.alt, shift = modifiers.shift,
+                        raw = keysym.raw(),
+                        "key.seen"
+                    );
+                }
+                if state == KeyState::Pressed {
+                    match process_keyboard_shortcut(*modifiers, keysym) {
+                        Some(act) => {
+                            // Remember the keysym so its release is swallowed too.
+                            suppressed.push(keysym);
+                            FilterResult::Intercept(Some(act))
+                        }
+                        None => FilterResult::Forward,
+                    }
+                } else {
+                    // Release: swallow iff this keysym's press was intercepted.
+                    if suppressed.contains(&keysym) {
+                        suppressed.retain(|k| *k != keysym);
+                        FilterResult::Intercept(None)
+                    } else {
+                        FilterResult::Forward
+                    }
+                }
+            })
+            .flatten();
+        self.suppressed_keys = suppressed;
+
+        // Run the resolved action now that `input()` released its `&mut self`.
+        if let Some(act) = action {
+            self.apply_wm_action(act, serial);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // M5 — keyboard-shortcut action execution. Each arm calls EXISTING helpers
+    // (the M3 focus body / the M4 IPC geometry+close methods / the M5 workspace
+    // methods) so there is no new geometry/focus code path here — the chords are
+    // a second TRIGGER for the same verbs the IPC already drives.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Execute a resolved `WmAction`. Called from `on_keyboard_key` AFTER the seat's
+    /// `input()` returns, so re-borrowing `self` is free.
+    fn apply_wm_action(&mut self, action: WmAction, serial: Serial) {
+        match action {
+            WmAction::CycleFocus => self.cycle_focus(true, serial),
+            WmAction::CycleFocusBack => self.cycle_focus(false, serial),
+            // switch/move return a bool (changed?) for the IPC verb; the chord ignores it.
+            WmAction::SwitchWorkspace(n) => {
+                let _ = self.switch_workspace(n);
+            }
+            WmAction::MoveToWorkspace(n) => {
+                let _ = self.move_focused_to_workspace(n);
+            }
+            WmAction::CloseFocused => self.close_focused_window(),
+            WmAction::SnapLeft => self.snap_focused("left-half"),
+            WmAction::SnapRight => self.snap_focused("right-half"),
+            WmAction::Maximize => self.snap_focused("maximize"),
+            WmAction::RestoreWindow => self.restore_focused_window(),
+            WmAction::ShowDesktop => self.toggle_show_desktop(),
+        }
+    }
+
+    /// The currently keyboard-focused mapped `Window`, resolved via the seat's current
+    /// focus surface (walking to the root) — the single "what does the user have
+    /// focused" query the snap/close/restore actions share.
+    fn focused_window(&self) -> Option<Window> {
+        let focus = self.keyboard.current_focus()?;
+        let mut root = focus.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        self.window_for_surface(&root)
+    }
+
+    /// Alt+Tab focus cycle. Stack-order rotation: `space.elements()` yields bottom→top,
+    /// the top (`order[n-1]`) being the currently-raised/focused window. To visit EVERY
+    /// window across repeated presses (not just toggle the top two), FORWARD raises the
+    /// BOTTOM-most window (`order[0]`, the least-recently-raised) — each press rotates
+    /// the whole stack bottom→up, so a third Alt+Tab reaches the third window. BACKWARD
+    /// raises the window just below the top (`order[n-2]`), undoing the last forward.
+    /// Raising the chosen window + focusing it is the identical body as `ipc_focus_window`
+    /// / the click path. (A strict most-recently-USED order would need a
+    /// `focus_history: Vec<Window>`; anvil has no MRU either — this is stack-order, which
+    /// for the common "raise each in turn" case behaves the same.)
+    fn cycle_focus(&mut self, forward: bool, serial: Serial) {
+        // Bottom→top stacking order of the active workspace.
+        let order: Vec<Window> = self.space.elements().cloned().collect();
+        let n = order.len();
+        if n < 2 {
+            return; // 0 or 1 window — nothing to cycle.
+        }
+        // FORWARD → the bottom window rotates to front; BACKWARD → the one below the top.
+        let next_idx = if forward { 0 } else { n - 2 };
+        let target = order[next_idx].clone();
+        self.space.raise_element(&target, true);
+        if let Some(x11) = target.x11_surface() {
+            if let Some(xwm) = self.xwm.as_mut() {
+                let _ = xwm.raise_window(x11);
+            }
+        }
+        let surface = target.wl_surface().map(|s| s.into_owned());
+        let keyboard = self.keyboard.clone();
+        keyboard.set_focus(self, surface, serial);
+        // Keep IPC subscribers in sync (the M4 focus edge).
+        if let Some(handle) = target.user_data().get::<WindowHandle>().map(|h| h.as_str().to_string()) {
+            let payload = ipc_event_window_json(self, &target, &handle);
+            self.ipc.emit_event("window.focused", payload);
+        }
+    }
+
+    /// Super+Q — close the focused toplevel (reuses the M4 `ipc_close_window` body:
+    /// xdg `send_close()` / X11 `set_mapped(false)`; the real destroy + `window.closed`
+    /// flow through `toplevel_destroyed`/`unmapped_window`).
+    fn close_focused_window(&mut self) {
+        if let Some(window) = self.focused_window() {
+            if let Some(handle) = window.user_data().get::<WindowHandle>().map(|h| h.as_str().to_string()) {
+                self.ipc_close_window(&handle);
+            }
+        }
+    }
+
+    /// Super+Left/Right/Up — snap the focused window to a named zone (left/right half,
+    /// or maximize). Stashes the window's PRE-snap geometry the FIRST time so Super+Down
+    /// can restore it, then reuses the M4 `ipc_zone_rect` + `ipc_place_window` geometry
+    /// (no new geometry math). `zone` is one of `ipc_zone_rect`'s names.
+    fn snap_focused(&mut self, zone: &str) {
+        let window = match self.focused_window() {
+            Some(w) => w,
+            None => return,
+        };
+        let handle = match window.user_data().get::<WindowHandle>().map(|h| h.as_str().to_string()) {
+            Some(h) => h,
+            None => return,
+        };
+        // Stash the current geometry once (so RestoreWindow has a target).
+        if let Some(cur) = self.space.element_geometry(&window) {
+            window
+                .user_data()
+                .insert_if_missing(|| PreSnapGeom(Cell::new(None)));
+            if let Some(stash) = window.user_data().get::<PreSnapGeom>() {
+                if stash.0.get().is_none() {
+                    stash.0.set(Some(cur));
+                }
+            }
+        }
+        if let Some((x, y, w, h)) = self.ipc_zone_rect(zone) {
+            self.ipc_place_window(&handle, x, y, w, h);
+        }
+    }
+
+    /// Super+Down — restore the focused window to its stashed pre-snap geometry, or a
+    /// centered 60% default if it was never snapped. Clears the stash so a later snap
+    /// re-captures. Reuses `ipc_place_window`.
+    fn restore_focused_window(&mut self) {
+        let window = match self.focused_window() {
+            Some(w) => w,
+            None => return,
+        };
+        let handle = match window.user_data().get::<WindowHandle>().map(|h| h.as_str().to_string()) {
+            Some(h) => h,
+            None => return,
+        };
+        let stashed = window
+            .user_data()
+            .get::<PreSnapGeom>()
+            .and_then(|s| s.0.take()); // take() clears it so the next snap re-captures.
+        let (x, y, w, h) = match stashed {
+            Some(g) => (g.loc.x, g.loc.y, g.size.w, g.size.h),
+            None => {
+                // No stash → a sensible centered 60% of the output.
+                match self.space.output_geometry(&self.output) {
+                    Some(o) => {
+                        let w = o.size.w * 3 / 5;
+                        let h = o.size.h * 3 / 5;
+                        (o.loc.x + (o.size.w - w) / 2, o.loc.y + (o.size.h - h) / 2, w, h)
+                    }
+                    None => return,
+                }
+            }
+        };
+        self.ipc_place_window(&handle, x, y, w, h);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // M5 — workspaces. The visible `space` holds ONLY the active workspace; every
+    // other window lives in `hidden_windows` (off-screen, with its restore loc).
+    // Switching = stash the active set + restore the target set. This keeps the
+    // render + input paths single-source (they only ever see `space`).
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Tag a freshly-mapped window with the active workspace (called from the map
+    /// edges). The tag rides in the window's user-data (the `WindowHandle` mechanism)
+    /// so `window.list` + move/switch can read it. Idempotent: only sets it once.
+    fn tag_window_workspace(&self, window: &Window) {
+        let ws = self.active_workspace;
+        window
+            .user_data()
+            .insert_if_missing(|| WorkspaceTag(Cell::new(ws)));
+    }
+
+    /// Read a window's workspace tag (0 if somehow untagged — the first workspace).
+    fn window_workspace(window: &Window) -> usize {
+        window
+            .user_data()
+            .get::<WorkspaceTag>()
+            .map(|t| t.0.get())
+            .unwrap_or(0)
+    }
+
+    /// The held (non-visible) windows, for `window.list` to enumerate alongside the
+    /// visible space. `pub(crate)` so ipc.rs can read it without exposing the field's
+    /// mutation surface.
+    pub(crate) fn ipc_hidden_windows(&self) -> &[HiddenWindow] {
+        &self.hidden_windows
+    }
+
+    /// Super+1..9 / `workspace.switch(n)` — show workspace `n`. Stashes every window
+    /// currently on the visible space into `hidden_windows`, then restores every held
+    /// window tagged `n` and focuses the top one. No-op if already on `n`. Returns true
+    /// if the active workspace changed (the IPC verb reports it).
+    pub fn switch_workspace(&mut self, n: usize) -> bool {
+        if n == self.active_workspace {
+            return false;
+        }
+        // 1. Stash the active set (each visible window → hidden_windows, tagged with the
+        //    workspace we are LEAVING so a later switch-back restores it here).
+        let leaving = self.active_workspace;
+        let active: Vec<Window> = self.space.elements().cloned().collect();
+        for window in active {
+            let loc = self.space.element_location(&window).unwrap_or_default();
+            // Keep the tag authoritative (it is already `leaving` for these, but a
+            // window that was move_to_workspace'd here carries the right tag already).
+            window
+                .user_data()
+                .insert_if_missing(|| WorkspaceTag(Cell::new(leaving)));
+            let ws = Self::window_workspace(&window);
+            self.space.unmap_elem(&window);
+            self.hidden_windows.push(HiddenWindow { window, workspace: ws, loc });
+        }
+        // 2. Restore the target set (drain hidden_windows where workspace == n).
+        self.active_workspace = n;
+        let mut restored: Vec<Window> = Vec::new();
+        let mut i = 0;
+        while i < self.hidden_windows.len() {
+            if self.hidden_windows[i].workspace == n {
+                let hw = self.hidden_windows.remove(i);
+                self.space.map_element(hw.window.clone(), hw.loc, false);
+                restored.push(hw.window);
+            } else {
+                i += 1;
+            }
+        }
+        // 3. Focus the top restored window (if any) so the new workspace is live.
+        if let Some(top) = restored.last().cloned() {
+            self.space.raise_element(&top, true);
+            let serial = SERIAL_COUNTER.next_serial();
+            let surface = top.wl_surface().map(|s| s.into_owned());
+            let keyboard = self.keyboard.clone();
+            keyboard.set_focus(self, surface, serial);
+        } else {
+            // Empty workspace — drop keyboard focus so stale keys don't leak to a
+            // window that is no longer visible.
+            let serial = SERIAL_COUNTER.next_serial();
+            let keyboard = self.keyboard.clone();
+            keyboard.set_focus(self, None, serial);
+        }
+        // Switching workspaces means the desktop is showing its windows again.
+        self.desktop_shown = true;
+        info!(workspace = n, restored = restored.len(), "workspace.switched");
+        true
+    }
+
+    /// Super+Shift+1..9 / `move_to_workspace(handle,n)` — move the focused window to
+    /// workspace `n`. If `n` is the active workspace it is a no-op. Otherwise the window
+    /// is re-tagged, unmapped off the visible space into `hidden_windows`, and focus
+    /// moves to the next remaining active window. Returns true if a window moved.
+    pub fn move_focused_to_workspace(&mut self, n: usize) -> bool {
+        let window = match self.focused_window() {
+            Some(w) => w,
+            None => return false,
+        };
+        self.move_window_to_workspace(&window, n)
+    }
+
+    /// The handle-keyed twin of `move_focused_to_workspace`, for the IPC verb. Moves a
+    /// specific mapped window (by handle) to workspace `n`. Resolves the window across
+    /// BOTH the visible space and the hidden set (an agent may move a window that lives
+    /// on a non-active workspace).
+    pub fn move_window_to_workspace_by_handle(&mut self, handle: &str, n: usize) -> bool {
+        // Visible window?
+        if let Some(window) = self.ipc_window_for_handle(handle) {
+            return self.move_window_to_workspace(&window, n);
+        }
+        // Hidden window? Re-tag it + relocate it within the hidden set (or surface it
+        // if `n` is the active workspace).
+        if let Some(idx) = self
+            .hidden_windows
+            .iter()
+            .position(|hw| hw.window.user_data().get::<WindowHandle>().map(|h| h.as_str() == handle).unwrap_or(false))
+        {
+            let window = self.hidden_windows[idx].window.clone();
+            window.user_data().insert_if_missing(|| WorkspaceTag(Cell::new(n)));
+            if let Some(tag) = window.user_data().get::<WorkspaceTag>() {
+                tag.0.set(n);
+            }
+            if n == self.active_workspace {
+                // Surface it onto the visible space at its stored location.
+                let hw = self.hidden_windows.remove(idx);
+                self.space.map_element(hw.window, hw.loc, false);
+            } else {
+                self.hidden_windows[idx].workspace = n;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// A toplevel that was on a NON-active workspace (so it lived in `hidden_windows`,
+    /// not the visible space) has been destroyed. Resolve it in the hidden set, emit
+    /// `window.closed` + invalidate its handle, and drop it — the symmetric cleanup the
+    /// space-based destroy path does for visible windows. `pred` matches the destroyed
+    /// surface (xdg or X11). Returns true if a hidden window was purged.
+    fn purge_hidden_window(&mut self, pred: impl Fn(&Window) -> bool) -> bool {
+        let idx = match self.hidden_windows.iter().position(|hw| pred(&hw.window)) {
+            Some(i) => i,
+            None => return false,
+        };
+        let hw = self.hidden_windows.remove(idx);
+        if let Some(handle) = hw.window.user_data().get::<WindowHandle>().cloned() {
+            if self.windows.on_unmap(&handle) {
+                info!(handle = handle.as_str(), "window.closed (hidden-workspace toplevel destroyed)");
+                let payload = ipc_event_window_json(self, &hw.window, handle.as_str());
+                self.ipc.emit_event("window.closed", payload);
+            }
+        }
+        true
+    }
+
+    /// Shared body: move `window` to workspace `n`. If `n == active`, ensure the tag is
+    /// `n` and keep it visible (no-op move). Otherwise stash it off-screen and refocus
+    /// the next active window.
+    fn move_window_to_workspace(&mut self, window: &Window, n: usize) -> bool {
+        // Re-tag (set, not insert — the window may already be tagged).
+        window
+            .user_data()
+            .insert_if_missing(|| WorkspaceTag(Cell::new(n)));
+        if let Some(tag) = window.user_data().get::<WorkspaceTag>() {
+            tag.0.set(n);
+        }
+        if n == self.active_workspace {
+            return true; // Stays visible; only the tag changed.
+        }
+        let loc = self.space.element_location(window).unwrap_or_default();
+        self.space.unmap_elem(window);
+        self.hidden_windows.push(HiddenWindow {
+            window: window.clone(),
+            workspace: n,
+            loc,
         });
+        // Refocus the next remaining active window (top of the stack), or clear focus.
+        let serial = SERIAL_COUNTER.next_serial();
+        let keyboard = self.keyboard.clone();
+        if let Some(top) = self.space.elements().last().cloned() {
+            self.space.raise_element(&top, true);
+            let surface = top.wl_surface().map(|s| s.into_owned());
+            keyboard.set_focus(self, surface, serial);
+        } else {
+            keyboard.set_focus(self, None, serial);
+        }
+        info!(workspace = n, "window.moved_to_workspace");
+        true
+    }
+
+    /// Super+D — toggle show-desktop. When showing the desktop (hiding windows): stash
+    /// every visible window into `hidden_windows` tagged with the active workspace.
+    /// When restoring: bring back exactly those (the same path `switch_workspace` uses
+    /// to restore the active set). A second Super+D un-hides.
+    pub fn toggle_show_desktop(&mut self) {
+        if self.desktop_shown {
+            // Hide: stash the active set (tagged active so restore brings them back).
+            let active: Vec<Window> = self.space.elements().cloned().collect();
+            if active.is_empty() {
+                return; // Nothing to hide.
+            }
+            let ws = self.active_workspace;
+            for window in active {
+                let loc = self.space.element_location(&window).unwrap_or_default();
+                window
+                    .user_data()
+                    .insert_if_missing(|| WorkspaceTag(Cell::new(ws)));
+                self.space.unmap_elem(&window);
+                self.hidden_windows.push(HiddenWindow { window, workspace: ws, loc });
+            }
+            let serial = SERIAL_COUNTER.next_serial();
+            let keyboard = self.keyboard.clone();
+            keyboard.set_focus(self, None, serial);
+            self.desktop_shown = false;
+            info!("desktop.shown (windows hidden)");
+        } else {
+            // Restore: re-map the active-workspace held windows.
+            let n = self.active_workspace;
+            let mut restored: Vec<Window> = Vec::new();
+            let mut i = 0;
+            while i < self.hidden_windows.len() {
+                if self.hidden_windows[i].workspace == n {
+                    let hw = self.hidden_windows.remove(i);
+                    self.space.map_element(hw.window.clone(), hw.loc, false);
+                    restored.push(hw.window);
+                } else {
+                    i += 1;
+                }
+            }
+            if let Some(top) = restored.last().cloned() {
+                self.space.raise_element(&top, true);
+                let serial = SERIAL_COUNTER.next_serial();
+                let surface = top.wl_surface().map(|s| s.into_owned());
+                let keyboard = self.keyboard.clone();
+                keyboard.set_focus(self, surface, serial);
+            }
+            self.desktop_shown = true;
+            info!(restored = restored.len(), "desktop.restored (windows back)");
+        }
     }
 
     /// Route absolute pointer motion (winit gives us window-relative coords) to the
@@ -531,6 +1067,10 @@ impl CompositorHandler for State {
                     if let Some(w) = self.window_for_surface(&root) {
                         w.user_data().insert_if_missing(|| handle);
                     }
+                    // M5: tag the new toplevel with the active workspace (so
+                    // `window.list` + move/switch can read it). It maps onto the
+                    // workspace the user is currently looking at.
+                    self.tag_window_workspace(&window);
                     // M4: emit window.opened to IPC subscribers (IPC_PROTOCOL.md §5) —
                     // the same edge that minted the handle, so the event proves a real map.
                     let payload = ipc_event_window_json(self, &window, &handle_str);
@@ -623,6 +1163,12 @@ impl XdgShellHandler for State {
                 }
             }
             self.space.unmap_elem(&window);
+        } else {
+            // M5: the destroyed toplevel may be on a NON-active workspace (so it lives
+            // in `hidden_windows`, not the visible space). Purge it there.
+            self.purge_hidden_window(|w| {
+                w.wl_surface().map(|s| &*s == &wl).unwrap_or(false)
+            });
         }
     }
 }
@@ -783,6 +1329,8 @@ impl XwmHandler for State {
         let handle = self.on_real_map(app_id, title, ToplevelKind::XWayland);
         let handle_str = handle.as_str().to_string();
         win.user_data().insert_if_missing(|| handle);
+        // M5: tag the new X11 toplevel with the active workspace.
+        self.tag_window_workspace(&win);
         // M4: emit window.opened to IPC subscribers (IPC_PROTOCOL.md §5) — minted on
         // the REAL X11 map (the corrected Wine path: a handle only here, never on the
         // installer's unconditional success). Note an X11 window's geometry is known
@@ -834,6 +1382,9 @@ impl XwmHandler for State {
                 }
             }
             self.space.unmap_elem(&elem);
+        } else {
+            // M5: an X11 toplevel on a non-active workspace lives in `hidden_windows`.
+            self.purge_hidden_window(|w| w.x11_surface() == Some(&window));
         }
         if !window.is_override_redirect() {
             let _ = window.set_mapped(false);
@@ -994,6 +1545,66 @@ fn which(prog: &str) -> Option<std::path::PathBuf> {
     })
 }
 
+/// M5 — map a `(ModifiersState, Keysym)` chord to a compositor `WmAction`, or `None`
+/// to forward the key to the focused client. Modelled 1:1 on anvil's
+/// `process_keyboard_shortcut` (`KeyAction` map): `mods.logo` = the Super/Windows key,
+/// `mods.alt`/`mods.shift` the obvious modifiers; letter/arrow keys match the named
+/// `Keysym` consts (`Keysym::q`/`Left`/…), and the digit row uses the `KEY_1..=KEY_9`
+/// raw-keysym range (`keysyms as xkb`, `keysym.raw()` is the `u32` the range compares),
+/// with `n = raw - KEY_1` the 0-based workspace index (anvil's exact `Screen()` formula).
+///
+/// The MAP is the single source of truth for "which chords HART-comp owns"; everything
+/// not listed returns `None` and the app keeps the key (so e.g. an app's own Ctrl+C,
+/// Super+Space IME toggle, etc. are untouched). Order: the Super+Shift digit case is
+/// checked BEFORE the plain Super digit case (shift is the more specific match).
+fn process_keyboard_shortcut(mods: ModifiersState, keysym: Keysym) -> Option<WmAction> {
+    let raw = keysym.raw();
+    // ── Alt+Tab / Alt+Shift+Tab — focus cycle (Super must NOT be held). xkb emits
+    //    ISO_Left_Tab for Shift+Tab, so accept either that or Tab+shift. ──
+    if mods.alt && !mods.logo {
+        if mods.shift && (keysym == Keysym::ISO_Left_Tab || keysym == Keysym::Tab) {
+            return Some(WmAction::CycleFocusBack);
+        }
+        if keysym == Keysym::Tab {
+            return Some(WmAction::CycleFocus);
+        }
+    }
+    // ── Super-based window-management chords. ──
+    if mods.logo {
+        // Super+Shift+1..9 — move the focused window to workspace N (more specific
+        // than the plain Super+digit below, so check it first).
+        if mods.shift && (xkb::KEY_1..=xkb::KEY_9).contains(&raw) {
+            return Some(WmAction::MoveToWorkspace((raw - xkb::KEY_1) as usize));
+        }
+        // Super+1..9 — switch to workspace N (0-based).
+        if !mods.shift && (xkb::KEY_1..=xkb::KEY_9).contains(&raw) {
+            return Some(WmAction::SwitchWorkspace((raw - xkb::KEY_1) as usize));
+        }
+        // Super+Q — close the focused toplevel.
+        if keysym == Keysym::q {
+            return Some(WmAction::CloseFocused);
+        }
+        // Super+arrows — snap / maximize / restore.
+        if keysym == Keysym::Left {
+            return Some(WmAction::SnapLeft);
+        }
+        if keysym == Keysym::Right {
+            return Some(WmAction::SnapRight);
+        }
+        if keysym == Keysym::Up {
+            return Some(WmAction::Maximize);
+        }
+        if keysym == Keysym::Down {
+            return Some(WmAction::RestoreWindow);
+        }
+        // Super+D — toggle show-desktop.
+        if keysym == Keysym::d {
+            return Some(WmAction::ShowDesktop);
+        }
+    }
+    None
+}
+
 /// THE compositor: boot the winit backend nested in the host Wayland (WSLg),
 /// create our own socket, run the calloop loop, and paint client surfaces.
 /// This is what the skeleton's `run_event_loop` never did.
@@ -1109,6 +1720,11 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         next_window_loc: (32, 32).into(),
         output: output.clone(),
         ipc: crate::ipc::IpcState::default(),
+        // M5: workspace 0 is active at boot; nothing hidden; desktop visible.
+        active_workspace: 0,
+        hidden_windows: Vec::new(),
+        desktop_shown: true,
+        suppressed_keys: Vec::new(),
     };
 
     // 6. (No calloop Generic source for the Display — see step 1. The Display is
@@ -1492,5 +2108,135 @@ fn spawn_xwayland(dh: &DisplayHandle, loop_handle: &LoopHandle<'static, State>) 
     });
     if let Err(err) = inserted {
         error!(?err, "XWayland: failed to insert the XWayland source into the event loop");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// M5 — behavioural unit floor for the keyboard-shortcut MAP.
+//
+// `process_keyboard_shortcut` is a PURE function (ModifiersState, Keysym) -> the
+// resolved WmAction, so the full chord→action contract is unit-testable without a
+// live compositor — which matters because the WSL-nested-in-headless-sway harness
+// cannot inject keyboard into the winit backend (sway forwards keysyms, but winit's
+// nested wl_keyboard does not surface them; the ACTION side is proven live via the
+// IPC verbs that call the SAME switch/move/place/close bodies). These assert the
+// MAP: every documented chord resolves to its action, the modifier discrimination is
+// exact (Super+Shift+N ≠ Super+N), and non-chord keys are forwarded (None) so apps
+// keep their own keystrokes. Mirrors anvil's `process_keyboard_shortcut` table.
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod m5_keybinding_tests {
+    use super::{WmAction, process_keyboard_shortcut};
+    use smithay::input::keyboard::{Keysym, ModifiersState};
+
+    fn mods(logo: bool, alt: bool, shift: bool) -> ModifiersState {
+        ModifiersState {
+            logo,
+            alt,
+            shift,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn alt_tab_cycles_focus_forward() {
+        // Alt+Tab (no Super) → CycleFocus. Super must NOT be held.
+        assert_eq!(
+            process_keyboard_shortcut(mods(false, true, false), Keysym::Tab),
+            Some(WmAction::CycleFocus)
+        );
+    }
+
+    #[test]
+    fn alt_shift_tab_cycles_focus_back() {
+        // xkb emits ISO_Left_Tab for Shift+Tab; accept that OR Tab+shift.
+        assert_eq!(
+            process_keyboard_shortcut(mods(false, true, true), Keysym::ISO_Left_Tab),
+            Some(WmAction::CycleFocusBack)
+        );
+        assert_eq!(
+            process_keyboard_shortcut(mods(false, true, true), Keysym::Tab),
+            Some(WmAction::CycleFocusBack)
+        );
+    }
+
+    #[test]
+    fn super_digits_switch_workspaces_zero_based() {
+        // Super+1 → workspace 0, Super+9 → workspace 8 (anvil's `raw - KEY_1`).
+        assert_eq!(
+            process_keyboard_shortcut(mods(true, false, false), Keysym::_1),
+            Some(WmAction::SwitchWorkspace(0))
+        );
+        assert_eq!(
+            process_keyboard_shortcut(mods(true, false, false), Keysym::_2),
+            Some(WmAction::SwitchWorkspace(1))
+        );
+        assert_eq!(
+            process_keyboard_shortcut(mods(true, false, false), Keysym::_9),
+            Some(WmAction::SwitchWorkspace(8))
+        );
+    }
+
+    #[test]
+    fn super_shift_digits_move_to_workspace() {
+        // Super+Shift+N → MoveToWorkspace(N-1). Shift is the MORE specific match and
+        // must win over the plain Super+N switch.
+        assert_eq!(
+            process_keyboard_shortcut(mods(true, false, true), Keysym::_3),
+            Some(WmAction::MoveToWorkspace(2))
+        );
+        // Same digit WITHOUT shift is a switch, not a move — the discrimination is exact.
+        assert_eq!(
+            process_keyboard_shortcut(mods(true, false, false), Keysym::_3),
+            Some(WmAction::SwitchWorkspace(2))
+        );
+    }
+
+    #[test]
+    fn super_q_closes_focused() {
+        assert_eq!(
+            process_keyboard_shortcut(mods(true, false, false), Keysym::q),
+            Some(WmAction::CloseFocused)
+        );
+    }
+
+    #[test]
+    fn super_arrows_snap_and_restore() {
+        assert_eq!(
+            process_keyboard_shortcut(mods(true, false, false), Keysym::Left),
+            Some(WmAction::SnapLeft)
+        );
+        assert_eq!(
+            process_keyboard_shortcut(mods(true, false, false), Keysym::Right),
+            Some(WmAction::SnapRight)
+        );
+        assert_eq!(
+            process_keyboard_shortcut(mods(true, false, false), Keysym::Up),
+            Some(WmAction::Maximize)
+        );
+        assert_eq!(
+            process_keyboard_shortcut(mods(true, false, false), Keysym::Down),
+            Some(WmAction::RestoreWindow)
+        );
+    }
+
+    #[test]
+    fn super_d_toggles_show_desktop() {
+        assert_eq!(
+            process_keyboard_shortcut(mods(true, false, false), Keysym::d),
+            Some(WmAction::ShowDesktop)
+        );
+    }
+
+    #[test]
+    fn non_chord_keys_are_forwarded_to_the_app() {
+        // A plain letter (no modifier) is NOT a WM chord → None → the app keeps it.
+        assert_eq!(process_keyboard_shortcut(mods(false, false, false), Keysym::a), None);
+        // Ctrl+C (no logo/alt) is the app's, not ours.
+        assert_eq!(process_keyboard_shortcut(mods(false, false, false), Keysym::c), None);
+        // A bare arrow (no Super) is the app's (cursor movement), not a snap.
+        assert_eq!(process_keyboard_shortcut(mods(false, false, false), Keysym::Left), None);
+        // Super+letter we don't bind (e.g. Super+Z) is forwarded.
+        assert_eq!(process_keyboard_shortcut(mods(true, false, false), Keysym::z), None);
     }
 }

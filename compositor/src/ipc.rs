@@ -445,6 +445,36 @@ fn dispatch_request(
             None => Response::err(id, "invalid_args", "window.close needs args.handle"),
         },
 
+        // ── §4.8 workspace.switch(n) — show workspace N (M5 drives the SAME
+        //    State.active_workspace the Super+N chord does). `n` is 0-based internally;
+        //    the response echoes the 1-based wire value the caller sent. ──
+        "workspace.switch" | "SwitchWorkspace" => match arg_workspace(args) {
+            Some(n) => {
+                let changed = state.switch_workspace(n);
+                Response::ok(id, json!({ "workspace": n + 1, "switched": changed }))
+            }
+            None => Response::err(id, "invalid_args", "workspace.switch needs args.workspace (>=1)"),
+        },
+
+        // ── §4.7 window.move_to_workspace(handle, n) — move a window to workspace N. ──
+        "window.move_to_workspace" | "MoveToWorkspace" => {
+            match (arg_handle(args), arg_workspace(args)) {
+                (Some(h), Some(n)) => {
+                    if state.move_window_to_workspace_by_handle(&h, n) {
+                        // Echo the 1-based wire value (n is 0-based internally).
+                        Response::ok(id, json!({ "handle": h, "workspace": n + 1 }))
+                    } else {
+                        Response::err(id, "not_found", format!("no mapped window for handle {h}"))
+                    }
+                }
+                _ => Response::err(
+                    id,
+                    "invalid_args",
+                    "window.move_to_workspace needs args.handle + args.workspace (>=1)",
+                ),
+            }
+        }
+
         // ── §4.10 events.subscribe — register this stream for unsolicited events ──
         "events.subscribe" | "Subscribe" => {
             let events = args.get("events").cloned().unwrap_or_else(|| json!([
@@ -464,6 +494,19 @@ fn arg_handle(args: &Value) -> Option<String> {
 }
 fn arg_i32(args: &Value, key: &str) -> Option<i32> {
     args.get(key).and_then(Value::as_i64).map(|v| v as i32)
+}
+
+/// The `workspace` arg — the IPC contract numbers workspaces from 1 on the wire
+/// (`{"workspace": 2}`, IPC_PROTOCOL.md §4.5/§4.7/§4.8), but the compositor indexes
+/// them from 0 internally (the Super+1 chord = `SwitchWorkspace(0)`, `n = keysym -
+/// KEY_1`). Convert 1-based wire → 0-based internal here so the two triggers (chord +
+/// IPC) drive the SAME `active_workspace` space. Rejects `< 1`.
+fn arg_workspace(args: &Value) -> Option<usize> {
+    let n = args.get("workspace").and_then(Value::as_i64)?;
+    if n < 1 {
+        return None;
+    }
+    Some((n - 1) as usize)
 }
 
 /// Resolve a `target` payload to an `(x, y, w, h)` rect — either explicit
@@ -488,12 +531,20 @@ fn resolve_target(state: &State, target: Option<&Value>) -> Option<(i32, i32, i3
 // ════════════════════════════════════════════════════════════════════════════
 impl State {
     /// `window.list` (§4.1): one JSON object per mapped toplevel, from the SAME
-    /// source of truth M3 paints — `space.elements()`, joined with the per-window
-    /// `WindowHandle` minted on real map. Never lists a phantom.
+    /// source of truth M3 paints — `space.elements()` (the VISIBLE active workspace),
+    /// PLUS the M5 `hidden_windows` set (windows on non-active workspaces), each joined
+    /// with the per-window `WindowHandle` minted on real map. Never lists a phantom.
+    ///
+    /// Each row carries `workspace` (1-based, the IPC wire convention) + `visible` (true
+    /// for the active workspace's windows, false for the held set) so an agent — or the
+    /// M5 test — can SEE that e.g. switching to workspace 2 left the workspace-1 windows
+    /// real-but-hidden, not destroyed. Geometry for a hidden window is its stored
+    /// restore rect (size from the last visible geometry, loc from the held location).
     pub fn ipc_list_windows(&self) -> Vec<Value> {
         use crate::winit::{ipc_window_app_id, ipc_window_title};
         let focused_surface = self.keyboard.current_focus();
         let mut out = Vec::new();
+        // Visible windows (the active workspace).
         for window in self.space.elements() {
             let handle = match window.user_data().get::<crate::WindowHandle>() {
                 Some(h) => h.as_str().to_string(),
@@ -516,6 +567,35 @@ impl State {
                 "focused": focused,
                 "kind": if is_x11 { "x11" } else { "xdg" },
                 "mapped": true,
+                "workspace": self.active_workspace + 1, // 1-based on the wire
+                "visible": true,
+            }));
+        }
+        // Hidden windows (non-active workspaces + show-desktop stash). Real, mapped,
+        // just not on the visible output — listed so workspace state is observable.
+        for hw in self.ipc_hidden_windows() {
+            let window = &hw.window;
+            let handle = match window.user_data().get::<crate::WindowHandle>() {
+                Some(h) => h.as_str().to_string(),
+                None => continue,
+            };
+            let is_x11 = window.x11_surface().is_some();
+            // Size from the last-known geometry; loc from the held restore point.
+            let (w, h) = self
+                .space
+                .element_geometry(window)
+                .map(|g| (g.size.w, g.size.h))
+                .unwrap_or((0, 0));
+            out.push(json!({
+                "handle": handle,
+                "app_id": ipc_window_app_id(window),
+                "title": ipc_window_title(window),
+                "geometry": { "x": hw.loc.x, "y": hw.loc.y, "w": w, "h": h },
+                "focused": false, // a hidden window cannot hold input focus
+                "kind": if is_x11 { "x11" } else { "xdg" },
+                "mapped": true,
+                "workspace": hw.workspace + 1, // 1-based on the wire
+                "visible": false,
             }));
         }
         out
@@ -523,7 +603,8 @@ impl State {
 
     /// Find the live mapped `Window` whose minted handle is `handle` (mirrors
     /// `window_for_surface`, but keyed on the IPC handle stamped in user_data on map).
-    fn ipc_window_for_handle(&self, handle: &str) -> Option<smithay::desktop::Window> {
+    /// `pub(crate)` so the M5 workspace methods in winit.rs can resolve a handle too.
+    pub(crate) fn ipc_window_for_handle(&self, handle: &str) -> Option<smithay::desktop::Window> {
         self.space
             .elements()
             .find(|w| {
