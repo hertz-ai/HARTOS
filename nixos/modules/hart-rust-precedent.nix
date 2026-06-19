@@ -1,4 +1,4 @@
-{ config, lib, pkgs, hartSrc ? /etc/hart, ... }:
+{ config, lib, pkgs, hartSrc ? /etc/hart, hartRustNixpkgs ? null, ... }:
 
 # ════════════════════════════════════════════════════════════════════════════
 # HART OS — FIRST Rust-in-Nix buildRustPackage PRECEDENT
@@ -16,11 +16,18 @@
 #   risk, with NO existing precedent to reuse.
 #
 #   THEREFORE: this module lands the buildRustPackage precedent FIRST, on an
-#   EXISTING crate (claw_native/rust, which already has a committed Cargo.lock),
-#   under the pinned nixpkgs 50ab793 (June 2025). If the Rust toolchain + crate
-#   graph do NOT resolve on that pin, this module fails the eval/build gate LOUDLY
-#   and IN ISOLATION — before HART-comp ever depends on the toolchain. Proving the
-#   toolchain on a crate we already have de-risks the compositor build.
+#   EXISTING crate (claw_native/rust, which already has a committed Cargo.lock). If
+#   the Rust toolchain + crate graph do NOT resolve, this module fails the eval/build
+#   gate LOUDLY and IN ISOLATION — before HART-comp ever depends on the toolchain.
+#   Proving the toolchain on a crate we already have de-risks the compositor build.
+#
+#   M9 UPDATE — which toolchain: the original plan was the STOCK pin-50ab793 (24.11)
+#   toolchain, but the first real CI build proved claw's CURRENT Cargo.lock pulls an
+#   edition2024 transitive dep (time-macros 0.2.27) that 24.11's cargo 1.82/1.83
+#   cannot parse — the SAME wall hart-comp hit. So the precedent now builds with the
+#   SAME rust_1_86 (from the nixos-25.05 `hartRustNixpkgs` input) that hart-comp uses;
+#   it still isolates "does rust_1_86 resolve a SIMPLER real crate graph FIRST" before
+#   the heavier Smithay graph. See the rust-platform block in the `let` below.
 #
 # STATUS: AUTHORED ON A WINDOWS DEV BOX — NOT BUILT HERE.
 #   No Rust/Nix build can run on Windows. This Nix expression is authored and
@@ -29,10 +36,13 @@
 #   It is opt-in (default OFF) and changes NO runtime behavior of any existing
 #   tier — it only adds an isolated package + an optional `claw` binary on PATH.
 #
-# DRY / no-parallel-path: this reuses the SAME pinned nixpkgs the rest of the
-# flake uses (the toolchain comes from `pkgs`, which the flake builds from pin
-# 50ab793). It introduces NO second nixpkgs, NO rust-overlay, NO fenix — the
-# whole point is to prove the STOCK pinned toolchain resolves the crate graph.
+# DRY / no-parallel-path: the C-lib side + everything else still rides the SAME pin
+# the rest of the flake uses (`pkgs` from 50ab793). The Rust COMPILER alone comes from
+# the nixos-25.05 `hartRustNixpkgs` input (rust_1_86) because 24.11's is too old for
+# the edition2024 transitive deps (see the M9 UPDATE above). It introduces NO rust-
+# overlay and NO fenix — rust_1_86 is plain stock nixpkgs, just a newer pin, and it is
+# the EXACT same toolchain hart-comp.nix uses (one toolchain, two crates — not a
+# parallel path).
 
 let
   cfg = config.hart;
@@ -47,6 +57,38 @@ let
   # <root>/claw_native/rust. We use it via `src = ... + "/claw_native/rust"` so
   # the package builds from the in-tree crate, not a fetched copy.
   clawCrateSrc = hartSrc + "/claw_native/rust";
+
+  # ── Newer Rust (≥1.85) — the stock 24.11 toolchain is too old for the CURRENT
+  # claw graph ──
+  # ORIGINAL premise: "prove the STOCK pinned (24.11) toolchain resolves a real crate
+  # graph." DISCOVERED FALSE by the first real `nix build .#hart-rust-precedent` in CI
+  # (M9): claw_native/rust's committed Cargo.lock now pulls an edition2024 TRANSITIVE
+  # dep (time-macros 0.2.27, via reqwest→…→time), and 24.11's cargo (1.82/1.83) cannot
+  # even PARSE its Cargo.toml during vendoring ("failed to parse manifest at
+  # …/time-macros-0.2.27/Cargo.toml"). So the stock 24.11 toolchain canNOT resolve
+  # THIS crate graph either — the same edition2024 wall hart-comp hit. We therefore
+  # build the precedent with the SAME rust_1_86 (rustc 1.86.0) from the nixos-25.05
+  # input threaded in via specialArgs (`hartRustNixpkgs`), so the precedent still does
+  # its job: isolate that the rust_1_86 toolchain resolves a SIMPLER real crate graph
+  # (claw-cli) FIRST, before hart-comp depends on the same toolchain for the heavier
+  # Smithay graph. Kept BYTE-FOR-BYTE in sync with the same block in hart-comp.nix
+  # (DRY across exactly two call sites; a shared lib file would add more surface than
+  # the 8-line mirror saves). Off-flake (input absent) → fall back to 24.11 so plain
+  # eval never crashes.
+  rustNixpkgs =
+    if hartRustNixpkgs != null
+    then import hartRustNixpkgs {
+      inherit (pkgs.stdenv.hostPlatform) system;
+      config = pkgs.config;
+    }
+    else pkgs;
+  hartRustPlatform =
+    if hartRustNixpkgs != null
+    then rustNixpkgs.makeRustPlatform {
+      cargo = rustNixpkgs.rust_1_86.packages.stable.cargo;
+      rustc = rustNixpkgs.rust_1_86.packages.stable.rustc;
+    }
+    else pkgs.rustPlatform;
 
   # ── The precedent package ──
   # buildRustPackage with the COMMITTED Cargo.lock as the source of truth for the
@@ -65,7 +107,7 @@ let
   # │ never resolve on the Windows box. The placeholder form is documented so      │
   # │ hart-comp.nix (whose crate has no committed lock yet) has the recipe.        │
   # └──────────────────────────────────────────────────────────────────────────────┘
-  clawPrecedentPkg = pkgs.rustPlatform.buildRustPackage {
+  clawPrecedentPkg = hartRustPlatform.buildRustPackage {
     pname = "hart-claw-precedent";
     version = "0.1.0";
 
