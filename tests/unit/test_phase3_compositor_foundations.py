@@ -256,12 +256,19 @@ class TestCompositorSkeleton:
         assert "smithay" in cargo
         assert "renderer_pixman" in cargo  # the mandatory software path feature
 
-    def test_cargo_pins_edition_and_forbids_unsafe(self, cargo):
+    def test_cargo_pins_edition_and_denies_unsafe(self, cargo):
         assert 'edition = "2021"' in cargo
-        assert 'unsafe_code = "forbid"' in cargo
+        # M6 narrowed `forbid` → `deny` for ONE audited screencopy memcpy exception
+        # (src/screencopy.rs::fill_one writes the framebuffer into the client's shm
+        # wl_buffer via a `*mut u8` the rev gives no safe helper for). `deny` keeps
+        # every OTHER line unsafe-free (a stray unsafe block is still a hard error);
+        # the DRM path (wayland.rs/udev.rs) + all pure logic remain unsafe-free.
+        assert 'unsafe_code = "deny"' in cargo
 
-    def test_main_forbids_unsafe(self, main_rs):
-        assert "#![forbid(unsafe_code)]" in main_rs
+    def test_main_denies_unsafe(self, main_rs):
+        # See test_cargo_pins_edition_and_denies_unsafe: deny (not forbid) for the one
+        # audited screencopy memcpy exception; every other line stays unsafe-free.
+        assert "#![deny(unsafe_code)]" in main_rs
 
     def test_software_path_is_first_class_decision_not_env_prayer(self, main_rs):
         # The never-fail floor is a typed decision (RenderPath enum), not just env.

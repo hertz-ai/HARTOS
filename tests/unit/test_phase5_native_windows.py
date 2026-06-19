@@ -241,12 +241,16 @@ class TestManifestAndRoadmap:
         assert re.search(r"#.*xwayland", cargo), \
             "xwayland feature must be in the commented Smithay manifest, not a live dep"
 
-    def test_hart_comp_nix_notes_phase5_xwayland_c_dep_at_ci_time(self):
+    def test_hart_comp_nix_has_xwayland_c_deps_live_at_m7(self):
         src = _read(os.path.join(MODULES_DIR, "hart-comp.nix"))
-        # The XWayland C dep surface is noted (commented) as added at CI bring-up,
-        # not silently live before the feature is uncommented.
-        assert "xwayland" in src.lower()
-        assert "Phase 5" in src or "Phase-5" in src
+        # M7 turned the smithay feature ON, so the XWayland C deps the
+        # `smithay/xwayland` feature links against must now be LIVE buildInputs (not a
+        # commented manifest). The X11 client stack: libX11 + libxcb + xcbutilwm.
+        low = src.lower()
+        assert "xwayland" in low
+        assert "libx11" in low and "libxcb" in low and "xcbutilwm" in low
+        # And libseat (the backend_session_libseat C dep) is present for the DRM path.
+        assert "libseat" in low
 
     def test_roadmap_phase5_split_landed_pure_vs_ci_smithay(self):
         roadmap = _read(os.path.join(COMPOSITOR_DIR, "ROADMAP.md"))
@@ -274,7 +278,10 @@ class TestNeverBreakFloor:
         src = _main_rs()
         assert "enum RenderPath" in src
         assert "fn select_render_path" in src
-        assert "#![forbid(unsafe_code)]" in src
+        # M6 narrowed `forbid` → `deny` for ONE audited screencopy memcpy exception
+        # (src/screencopy.rs::fill_one) — every OTHER line stays unsafe-free. The DRM
+        # path + all pure logic remain unsafe-free.
+        assert "#![deny(unsafe_code)]" in src
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -312,10 +319,16 @@ class TestRealSmithayBodiesAreFeatureGated:
         assert "impl XdgShellHandler for State" in way
         assert "impl XdgDecorationHandler for State" in way
         assert "impl ForeignToplevelListHandler for State" in way
-        # XWayland is driven via the event fn + the X11 map/unmap methods.
-        assert "fn handle_xwayland_event" in way
-        assert "XWaylandEvent::Ready" in way
-        assert "fn on_xwayland_mapped" in way
+        # XWayland (Wine / legacy X11) is driven via the live X11 window-manager
+        # callbacks (`XwmHandler`), the corrected-Wine map edge being
+        # `map_window_request` → `on_real_map(.., ToplevelKind::XWayland)`. (The
+        # XWayland LIFECYCLE — spawn + XWaylandEvent::Ready → X11Wm::start_wm — moved
+        # to each backend's `spawn_xwayland` in udev.rs/winit.rs at M7, so it is no
+        # longer a standalone fn here; a second copy would be a parallel path.)
+        assert "impl XwmHandler for State" in way
+        assert "fn map_window_request" in way
+        # The single mint site both the xdg + X11 map edges funnel through.
+        assert "fn on_real_map" in way
 
     def test_wayland_bodies_are_not_todo_placeholders(self):
         # The whole point: these are REAL bodies, not todo!(). (The main.rs free-fn
@@ -381,11 +394,14 @@ class TestSummonResolverOrchestration:
 
 
 class TestHartCompNixDriesTheFeatureFlip:
-    def test_hart_comp_nix_buildfeatures_off_until_ci_bringup(self):
-        # buildFeatures stays EMPTY (pure-logic build) until the Phase-5 CI step
-        # turns the smithay feature on TOGETHER with uncommenting the git-Smithay
-        # dep — both flips are one step, documented in the module.
+    def test_hart_comp_nix_buildfeatures_on_at_m7_bringup(self):
+        # M7 IS the bring-up the skeleton anticipated: buildFeatures is now
+        # [ "smithay" ] (was [ ]), the one flip that compiles wayland.rs + udev.rs
+        # (the DRM/KMS scanout run path). It is the documented CI flip — the module
+        # still names wayland.rs (and now udev.rs) as the modules it turns on.
         src = _read(os.path.join(MODULES_DIR, "hart-comp.nix"))
-        assert "buildFeatures = [ ]" in src
-        assert 'buildFeatures = [ "smithay" ]' in src  # the documented CI flip
+        assert 'buildFeatures = [ "smithay" ]' in src
+        # The empty-feature pre-bring-up state must be GONE (no lingering [ ] flip).
+        assert "buildFeatures = [ ]" not in src
         assert "wayland.rs" in src
+        assert "udev.rs" in src
