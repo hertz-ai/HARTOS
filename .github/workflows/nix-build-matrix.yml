@@ -42,10 +42,10 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
-            # See the build job for the rationale — fall back to local realisation
-            # when the throttled magic-nix-cache 418s instead of aborting.
+            # See the build job for the rationale — keep cache.nixos.org as the only
+            # substituter and fall back to local realisation on a genuine miss.
             fallback = true
-      - uses: DeterminateSystems/magic-nix-cache-action@v7
+      # NOTE: magic-nix-cache-action intentionally REMOVED — see the build job.
 
       - name: Evaluate all outputs (no build)
         working-directory: nixos
@@ -56,7 +56,11 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: evaluate
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Bumped 90 -> 150: with the throttling magic-nix-cache removed (see the Install
+    # Nix step), HART's own derivations build from source each run instead of being
+    # served cross-run, so the heaviest target (iso-desktop, ~70 min before) has more
+    # cold-build headroom. cache.nixos.org still serves the upstream closure.
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -79,18 +83,23 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
-            # `fallback = true`: when a substituter (incl. the magic-nix-cache local
-            # proxy) errors out, BUILD FROM SOURCE instead of aborting. The org's
-            # magic-nix-cache is unauthenticated (no FlakeHub creds) and the GitHub
-            # Actions Cache throttles it mid-run (HTTP 418 / ResourceExhausted), which
-            # was randomly ABORTING otherwise-fine builds (hart-rust-precedent +
-            # docker-server died on the same 418 while hart-comp passed). With fallback
-            # a cache 418 just means "compile it locally", so a throttle no longer reds
-            # the job. Keeps the cache when it works.
+            # `fallback = true`: on a genuine substituter MISS (path not in
+            # cache.nixos.org), build from source instead of erroring.
             fallback = true
 
-      - name: Cache Nix store
-        uses: DeterminateSystems/magic-nix-cache-action@v7
+      # magic-nix-cache-action was REMOVED here (it used to follow). In THIS org it
+      # is unauthenticated (logs "Cannot find netrc credentials for api.flakehub.com")
+      # and the GitHub Actions Cache THROTTLES its local narinfo proxy mid-build —
+      #   error: unable to download 'http://127.0.0.1:.../….narinfo': HTTP error 418
+      #          GitHub Actions Cache throttled Magic Nix Cache.
+      # A 418 from a configured substituter is a HARD transport error that aborts the
+      # build REGARDLESS of `fallback` (fallback only covers a clean miss, not a 418),
+      # so the throttle was randomly red-failing otherwise-fine jobs (hart-rust-
+      # precedent + docker-server died on it while hart-comp passed, purely by timing).
+      # Dropping the action leaves cache.nixos.org (configured by nix-installer-action)
+      # as the sole substituter + local source builds — slower on cold paths but
+      # RELIABLE, no throttling proxy to abort the Rust compiles. Re-add only once the
+      # org has working FlakeHub/cache auth.
 
       - name: Free disk space
         run: |
