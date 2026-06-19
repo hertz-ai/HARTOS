@@ -42,6 +42,9 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
+            # See the build job for the rationale — fall back to local realisation
+            # when the throttled magic-nix-cache 418s instead of aborting.
+            fallback = true
       - uses: DeterminateSystems/magic-nix-cache-action@v7
 
       - name: Evaluate all outputs (no build)
@@ -76,6 +79,15 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
+            # `fallback = true`: when a substituter (incl. the magic-nix-cache local
+            # proxy) errors out, BUILD FROM SOURCE instead of aborting. The org's
+            # magic-nix-cache is unauthenticated (no FlakeHub creds) and the GitHub
+            # Actions Cache throttles it mid-run (HTTP 418 / ResourceExhausted), which
+            # was randomly ABORTING otherwise-fine builds (hart-rust-precedent +
+            # docker-server died on the same 418 while hart-comp passed). With fallback
+            # a cache 418 just means "compile it locally", so a throttle no longer reds
+            # the job. Keeps the cache when it works.
+            fallback = true
 
       - name: Cache Nix store
         uses: DeterminateSystems/magic-nix-cache-action@v7
