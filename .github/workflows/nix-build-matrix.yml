@@ -15,10 +15,16 @@ on:
     branches: [main]
     paths:
       - 'nixos/**'
+      # Rust-in-Nix crate sources: a compositor/ or claw_native/rust/ edit (not just
+      # a .nix edit) must re-trigger the hart-comp / hart-rust-precedent compile.
+      - 'compositor/**'
+      - 'claw_native/rust/**'
   pull_request:
     branches: [main]
     paths:
       - 'nixos/**'
+      - 'compositor/**'
+      - 'claw_native/rust/**'
 
 concurrency:
   group: nix-build-${{ github.ref }}
@@ -52,6 +58,9 @@ jobs:
       fail-fast: false
       matrix:
         target:
+          # ── Rust-in-Nix crate compiles (M9) — actually BUILD the crates, not eval ──
+          - hart-rust-precedent  # FIRST Rust-in-Nix compile (claw-cli) — isolate toolchain resolution
+          - hart-comp            # the Smithay compositor crate (buildFeatures=["smithay"]) — THE M9 gate
           - iso-server      # x86_64 headless — core variant
           - iso-desktop     # x86_64 GNOME + native subsystems
           - iso-edge        # x86_64 minimal observer

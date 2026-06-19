@@ -324,7 +324,31 @@
           name = "hart-pxe-server-go";
           src = ../deploy/distro/pxe/hart-pxe-server-go;
         };
-
+      }
+      # ── Rust-in-Nix BUILD gates (compile the crates in CI, not just eval) ──
+      # These re-expose the SAME read-only options the modules already promise in
+      # their docstrings (hart-comp.nix:264-266 / hart-rust-precedent.nix:135 —
+      # "CI gates on `nix build .#…config.hart.<x>.package`"). They are short
+      # ALIASES, NOT second package definitions — the package expression lives once,
+      # in the module, exposed via `lib.mkDefault` on EVERY config (outside the
+      # `lib.mkIf <x>.enable` block), so building it does NOT arm the session or trip
+      # the enable assertions (rustPrecedent.enable / liquidUI webkit). That is
+      # exactly what the option's docstring intends: CI compiles the binary so the
+      # node-integrity manifest can hash it WITHOUT flipping defaultSession.
+      #
+      # x86_64-only (guard like the ISO sha256 entries): the compositor is a
+      # Linux/x86_64 DRM/Wayland crate; cross-eval on aarch64/riscv legacyPackages is
+      # unnecessary and only the x86_64 CI runner compiles it.
+      #
+      # Precedent FIRST (claw-cli, registry-only lock) so a toolchain-resolution
+      # failure is isolated BEFORE hart-comp depends on it (the whole reason
+      # hart-rust-precedent.nix exists). Then hart-comp (the git-Smithay crate,
+      # buildFeatures = [ "smithay" ], fetched via the resolved outputHashes entry).
+      // pkgs.lib.optionalAttrs isX86 {
+        hart-rust-precedent = self.nixosConfigurations.hart-desktop.config.hart.rustPrecedent.package;
+        hart-comp           = self.nixosConfigurations.hart-desktop.config.hart.comp.package;
+      }
+      // {
         # Default: server ISO
         default = self.packages.${system}.iso-server;
       }
