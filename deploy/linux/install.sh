@@ -166,17 +166,22 @@ fi
 
 # Python check
 PYTHON_CMD=""
-for cmd in python3.10 python3.11 python3; do
+# requirements.txt now needs Python 3.11+ (yarl==1.9.2 et al. have NO 3.10 wheels);
+# 3.12+ carries pydantic-1.x compat risk. So: REQUIRE 3.11, prefer it, install it
+# if absent. 3.10 is detected only to warn + fall through to the 3.11 install.
+for cmd in python3.11 python3 python3.10; do
     if command -v "$cmd" &>/dev/null; then
         PY_VER=$("$cmd" --version 2>&1 | awk '{print $2}')
         PY_MAJOR=$(echo "$PY_VER" | cut -d. -f1)
         PY_MINOR=$(echo "$PY_VER" | cut -d. -f2)
-        if [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -ge 10 && "$PY_MINOR" -le 11 ]]; then
+        if [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -eq 11 ]]; then
             PYTHON_CMD="$cmd"
             log_info "Python: $PY_VER ($cmd) OK"
             break
+        elif [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -eq 10 ]]; then
+            log_warn "Python $PY_VER found, but requirements.txt needs 3.11+ — will install 3.11."
         elif [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -ge 12 ]]; then
-            log_warn "Python $PY_VER detected but 3.12+ has pydantic 1.x compat issues. Prefer 3.10 or 3.11."
+            log_warn "Python $PY_VER detected but 3.12+ has pydantic-1.x compat issues. Need 3.11."
         fi
     fi
 done
@@ -218,13 +223,13 @@ fi
 # Install Python if needed
 # ============================================================
 if [[ -z "$PYTHON_CMD" ]]; then
-    log_step "Installing Python 3.10..."
+    log_step "Installing Python 3.11..."
     apt-get update -qq
     apt-get install -y -qq software-properties-common
     add-apt-repository -y ppa:deadsnakes/ppa
     apt-get update -qq
-    apt-get install -y -qq python3.10 python3.10-venv python3.10-dev
-    PYTHON_CMD="python3.10"
+    apt-get install -y -qq python3.11 python3.11-venv python3.11-dev
+    PYTHON_CMD="python3.11"
 fi
 
 # Ensure venv module available
