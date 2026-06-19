@@ -108,8 +108,13 @@ let
       pixman              # MANDATORY software-render path (never-fail floor)
       libdrm
       mesa                # GBM (libgbm ships in mesa) for the DRM scanout allocator
-      seatd               # provides libseat (the backend_session_libseat C dep)
-      libseat             # explicit libseat so pkg-config finds it on this pin
+      seatd               # provides BOTH the libseat C lib (libseat.pc) + the seatd
+                          # daemon — `backend_session_libseat` links libseat from here.
+                          # NOTE: do NOT also add `pkgs.libseat` — on this nixpkgs pin
+                          # (50ab793) `libseat` is a THROW alias renamed to `seatd`, so
+                          # listing both makes `nix build` fail at buildInputs eval
+                          # ("'libseat' has been renamed to/replaced by 'seatd'"). seatd
+                          # alone is the canonical provider (M9: removed the dup libseat).
       udev                # device hotplug (backend_udev)
       # ── M7: native-toplevel XWayland C deps. The `smithay` cargo feature enables
       # `smithay/xwayland`, which links against an X11 client stack, so these MUST be
