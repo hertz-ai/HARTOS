@@ -5015,8 +5015,20 @@ function renderAgentOverlay(ev) {{
                 pass
             return jsonify({'networks': networks[:20], 'connected': connected})
 
-        @app.route('/api/shell/network/wifi/connect', methods=['POST'])
-        def shell_wifi_connect():
+        # NOTE: distinct view-function name (shell_network_wifi_connect, NOT
+        # shell_wifi_connect) + explicit endpoint=. The canonical hardware-control
+        # module shell_system_apis.register_shell_system_routes ALSO defines a
+        # view named shell_wifi_connect (rule /api/shell/wifi/connect). Flask
+        # derives the endpoint from the function name, so a name clash made
+        # register_shell_system_routes raise AssertionError ("overwriting an
+        # existing endpoint") — which aborted it mid-registration and silently
+        # dropped its remaining ~16 routes (all /api/shell/vpn/*, the rest of
+        # /api/shell/wifi/*, trash, display rotation). This rule (/network/wifi/*)
+        # is the one the shell's own JS calls (liquid_ui_service ~2596), so it
+        # stays — only the endpoint name is de-conflicted.
+        @app.route('/api/shell/network/wifi/connect', methods=['POST'],
+                   endpoint='shell_network_wifi_connect')
+        def shell_network_wifi_connect():
             data = request.get_json(silent=True) or {}
             ssid = data.get('ssid', '').strip()
             password = data.get('password', '')
@@ -5035,8 +5047,11 @@ function renderAgentOverlay(ev) {{
             except Exception as e:
                 return jsonify({'success': False, 'error': str(e)}), 500
 
-        @app.route('/api/shell/network/wifi/disconnect', methods=['POST'])
-        def shell_wifi_disconnect():
+        # Distinct endpoint name (see shell_network_wifi_connect above): the
+        # canonical shell_system_apis also defines shell_wifi_disconnect.
+        @app.route('/api/shell/network/wifi/disconnect', methods=['POST'],
+                   endpoint='shell_network_wifi_disconnect')
+        def shell_network_wifi_disconnect():
             try:
                 r = subprocess.run(
                     ['nmcli', 'device', 'disconnect', 'wlan0'],
@@ -5343,25 +5358,16 @@ function renderAgentOverlay(ev) {{
             except Exception as e:
                 return jsonify({'success': False, 'error': str(e)}), 500
 
-        @app.route('/api/shell/display/scale', methods=['POST'])
-        def shell_display_scale():
-            data = request.get_json(silent=True) or {}
-            output = data.get('output', '')
-            scale = data.get('scale')
-            if not output or scale is None:
-                return jsonify({'success': False, 'error': 'output and scale required'}), 400
-            scale = max(0.5, min(3.0, float(scale)))
-            try:
-                # xrandr scale is inverse: scale 2.0 means 0.5x transform
-                transform = str(round(1.0 / scale, 4))
-                r = subprocess.run(
-                    ['xrandr', '--output', output, '--scale', f'{transform}x{transform}'],
-                    capture_output=True, text=True, timeout=5)
-                if r.returncode == 0:
-                    return jsonify({'success': True, 'scale': scale})
-                return jsonify({'success': False, 'error': r.stderr.strip()}), 400
-            except Exception as e:
-                return jsonify({'success': False, 'error': str(e)}), 500
+        # NOTE: /api/shell/display/scale is registered canonically by
+        # shell_desktop_apis.register_shell_desktop_routes (GET/PUT, with both
+        # Wayland swaymsg + X11 GDK_SCALE handling). A SECOND inline definition
+        # here used the SAME Flask view-function name 'shell_display_scale',
+        # which made Flask raise AssertionError ("overwriting an existing
+        # endpoint") inside register_shell_desktop_routes — swallowed by the
+        # broad except below, but the raise ABORTED the try block so the next
+        # registrations (register_shell_system_routes + register_app_install_
+        # routes) never ran, silently dropping all /api/shell/* + /api/apps/*
+        # (the app store). Removed the inline duplicate; the canonical one wins.
 
         # ── Shell APIs: System Metrics ──
         @app.route('/api/shell/system/metrics', methods=['GET'])
