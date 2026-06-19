@@ -17,8 +17,10 @@
     # `rust-version = "1.85"` in its Cargo.toml, so Cargo < 1.85 fails to even PARSE
     # its manifest ("feature `edition2024` is required"). 24.11 therefore CANNOT
     # build the moat crate — discovered by the first real `nix build .#hart-comp` in
-    # CI (M9). This second input pins nixos-25.05 SOLELY to source `rust_1_86`
-    # (rustc 1.86.0) for hart-comp's buildRustPackage. It is stock nixpkgs (NOT
+    # CI (M9). This second input pins nixos-25.05 SOLELY to source `rust_1_88`
+    # (rustc 1.88.0) for the hart-comp + hart-rust-precedent buildRustPackages —
+    # 1.88 because claw's graph (time 0.3.47 / time-core / home 0.5.12) needs MSRV
+    # 1.88, and it also satisfies Smithay's 1.85 floor. It is stock nixpkgs (NOT
     # rust-overlay/fenix — the precedent's "no new toolchain class" still holds), and
     # it touches NOTHING else: every ISO/image build keeps the 24.11 pin, and
     # hart-comp's C buildInputs (wayland/mesa/seatd/…) ALSO stay on 24.11 (24.11's
@@ -154,9 +156,10 @@
       hartVersion = "1.0.0";
       hartVariant = variant;
       hartSrc = ../.;  # repo root
-      # The newer-Rust nixpkgs (25.05) — passed as the raw flake input so hart-comp.nix
-      # can instantiate `rust_1_86` for ITS system (the module knows its own system via
-      # pkgs.stdenv). Only hart-comp.nix consumes it; every other module ignores it.
+      # The newer-Rust nixpkgs (25.05) — passed as the raw flake input so the Rust
+      # modules can instantiate `rust_1_88` for THEIR system (the module knows its own
+      # system via pkgs.stdenv). Only hart-comp.nix + hart-rust-precedent.nix consume
+      # it; every other module ignores it.
       # See the `nixpkgs-rust` input comment for WHY (24.11 Rust < 1.85 can't parse the
       # edition2024 Smithay manifest).
       hartRustNixpkgs = nixpkgs-rust;

@@ -25,8 +25,8 @@
 #   toolchain, but the first real CI build proved claw's CURRENT Cargo.lock pulls an
 #   edition2024 transitive dep (time-macros 0.2.27) that 24.11's cargo 1.82/1.83
 #   cannot parse — the SAME wall hart-comp hit. So the precedent now builds with the
-#   SAME rust_1_86 (from the nixos-25.05 `hartRustNixpkgs` input) that hart-comp uses;
-#   it still isolates "does rust_1_86 resolve a SIMPLER real crate graph FIRST" before
+#   SAME rust_1_88 (from the nixos-25.05 `hartRustNixpkgs` input) that hart-comp uses;
+#   it still isolates "does rust_1_88 resolve a SIMPLER real crate graph FIRST" before
 #   the heavier Smithay graph. See the rust-platform block in the `let` below.
 #
 # STATUS: AUTHORED ON A WINDOWS DEV BOX — NOT BUILT HERE.
@@ -38,9 +38,9 @@
 #
 # DRY / no-parallel-path: the C-lib side + everything else still rides the SAME pin
 # the rest of the flake uses (`pkgs` from 50ab793). The Rust COMPILER alone comes from
-# the nixos-25.05 `hartRustNixpkgs` input (rust_1_86) because 24.11's is too old for
+# the nixos-25.05 `hartRustNixpkgs` input (rust_1_88) because 24.11's is too old for
 # the edition2024 transitive deps (see the M9 UPDATE above). It introduces NO rust-
-# overlay and NO fenix — rust_1_86 is plain stock nixpkgs, just a newer pin, and it is
+# overlay and NO fenix — rust_1_88 is plain stock nixpkgs, just a newer pin, and it is
 # the EXACT same toolchain hart-comp.nix uses (one toolchain, two crates — not a
 # parallel path).
 
@@ -67,9 +67,9 @@ let
   # even PARSE its Cargo.toml during vendoring ("failed to parse manifest at
   # …/time-macros-0.2.27/Cargo.toml"). So the stock 24.11 toolchain canNOT resolve
   # THIS crate graph either — the same edition2024 wall hart-comp hit. We therefore
-  # build the precedent with the SAME rust_1_86 (rustc 1.86.0) from the nixos-25.05
+  # build the precedent with the SAME rust_1_88 (rustc 1.88.0) from the nixos-25.05
   # input threaded in via specialArgs (`hartRustNixpkgs`), so the precedent still does
-  # its job: isolate that the rust_1_86 toolchain resolves a SIMPLER real crate graph
+  # its job: isolate that the rust_1_88 toolchain resolves a SIMPLER real crate graph
   # (claw-cli) FIRST, before hart-comp depends on the same toolchain for the heavier
   # Smithay graph. Kept BYTE-FOR-BYTE in sync with the same block in hart-comp.nix
   # (DRY across exactly two call sites; a shared lib file would add more surface than
@@ -85,8 +85,8 @@ let
   hartRustPlatform =
     if hartRustNixpkgs != null
     then rustNixpkgs.makeRustPlatform {
-      cargo = rustNixpkgs.rust_1_86.packages.stable.cargo;
-      rustc = rustNixpkgs.rust_1_86.packages.stable.rustc;
+      cargo = rustNixpkgs.rust_1_88.packages.stable.cargo;
+      rustc = rustNixpkgs.rust_1_88.packages.stable.rustc;
     }
     else pkgs.rustPlatform;
 

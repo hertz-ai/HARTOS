@@ -62,7 +62,7 @@ let
   # rev declares `edition = "2024"` + `rust-version = "1.85"`, so Cargo < 1.85 cannot
   # even PARSE its Cargo.toml ("feature `edition2024` is required") — proven by the
   # first real `nix build .#hart-comp` in CI (M9). We therefore build hart-comp with
-  # `rust_1_86` (rustc 1.86.0) sourced from the nixos-25.05 input threaded in via
+  # `rust_1_88` (rustc 1.88.0) sourced from the nixos-25.05 input threaded in via
   # specialArgs (`hartRustNixpkgs`), while keeping EVERY C buildInput below on the
   # 24.11 `pkgs` (24.11's `mesa` still bundles libgbm; 25.05 split it into a separate
   # `libgbm` attr, so mixing 25.05 libs would re-break the gbm link). Newer compiler,
@@ -80,19 +80,19 @@ let
       config = pkgs.config;
     }
     else pkgs;
-  # rust_1_86 = rustc 1.86.0 + matching cargo (≥1.85 → edition2024 OK). We use 25.05's
+  # rust_1_88 = rustc 1.88.0 + matching cargo (≥1.85 → edition2024 OK). We use 25.05's
   # OWN makeRustPlatform (and hence its buildRustPackage + importCargoLock/cargo-vendor
   # machinery), because the vendoring step itself runs cargo to PARSE every dep
   # manifest — that is exactly what failed on 24.11 (cargo 1.82 choked on Smithay's
-  # edition2024 Cargo.toml). 25.05's vendor machinery is built for cargo 1.86, so the
+  # edition2024 Cargo.toml). 25.05's vendor machinery is built for cargo 1.88, so the
   # whole Rust build path is self-consistent on 25.05; only the C buildInputs below
   # stay on the 24.11 `pkgs` (libgbm-in-mesa). Off-flake (input absent), fall back to
   # the 24.11 rustPlatform so plain module eval never crashes.
   hartRustPlatform =
     if hartRustNixpkgs != null
     then rustNixpkgs.makeRustPlatform {
-      cargo = rustNixpkgs.rust_1_86.packages.stable.cargo;
-      rustc = rustNixpkgs.rust_1_86.packages.stable.rustc;
+      cargo = rustNixpkgs.rust_1_88.packages.stable.cargo;
+      rustc = rustNixpkgs.rust_1_88.packages.stable.rustc;
     }
     else pkgs.rustPlatform;
 
