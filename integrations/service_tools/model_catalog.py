@@ -50,6 +50,7 @@ class ModelType(str, Enum):
     VIDEO_GEN = 'video_gen'
     AUDIO_GEN = 'audio_gen'
     EMBEDDING = 'embedding'
+    EMBODIED  = 'embodied'   # VLA / world-model robot policy (Qwen RobotSuite class)
 
     @property
     def label(self) -> str:
@@ -68,6 +69,7 @@ _MODEL_TYPE_LABELS = {
     ModelType.VIDEO_GEN: 'Video Generation',
     ModelType.AUDIO_GEN: 'Audio/Music Generation',
     ModelType.EMBEDDING: 'Embedding Model',
+    ModelType.EMBODIED:  'Embodied VLA / World Model',
 }
 
 # Backwards-compatible dict for code that iterates MODEL_TYPES
@@ -522,6 +524,7 @@ class ModelCatalog:
         added += self._populate_tts_models()
         added += self._populate_stt_models()
         added += self._populate_vlm_models()
+        added += self._populate_embodied_models()
         added += self._populate_videogen_models()
         added += self._populate_audiogen_models()
 
@@ -534,7 +537,7 @@ class ModelCatalog:
         # For entries that existed before AND still exist, populator.register()
         # would have overwritten them — so check timestamps on _entries that
         # weren't touched but have auto-populatable prefixes.
-        AUTO_PREFIXES = ('tts-', 'stt-', 'vlm-', 'video_gen-', 'audio_gen-')
+        AUTO_PREFIXES = ('tts-', 'stt-', 'vlm-', 'video_gen-', 'audio_gen-', 'embodied-')
         stale = []
         for eid, entry in list(self._entries.items()):
             if eid in touched_this_boot:
@@ -637,6 +640,55 @@ class ModelCatalog:
                               'description_loop': True},
                 quality_score=0.8, speed_score=0.7,
                 tags=['local', 'vision'],
+            )
+            self.register(entry, persist=False)
+            added += 1
+        return added
+
+    def _populate_embodied_models(self) -> int:
+        """Embodied / VLA model entries (Qwen-RobotSuite class).
+
+        Bootstraps the embodied model's METADATA exactly like an LLM — the policy
+        itself runs INSIDE HevolveAI (raw native intelligence; HARTOS has no ML),
+        so this is purely the catalog record that makes the embodied model
+        discoverable to the admin UI + the orchestrator: its action vocabulary
+        (the RobotAction VLA factories), the sensor modalities it consumes (the
+        SensorReading schema), and the WorldModelBridge endpoints that reach it.
+        Errors dispatching to it propagate through the hive via
+        WorldModelBridge._propagate_embodied_error.
+        """
+        added = 0
+        if 'embodied-qwen-robotsuite' not in self._entries:
+            entry = ModelEntry(
+                id='embodied-qwen-robotsuite',
+                name='Qwen RobotSuite (Embodied VLA + World Model)',
+                model_type=ModelType.EMBODIED, source='pip',
+                repo_id='Qwen/RobotSuite',   # exact repo/version per RobotSuite release
+                vram_gb=4.0, ram_gb=4.0, disk_gb=4.0,
+                min_capability_tier='standard',
+                backend='in_process',        # served by HevolveAI; the bridge routes
+                supports_gpu=True, supports_cpu=True, supports_cpu_offload=True,
+                cpu_offload_method='torch_to_cpu', idle_timeout_s=600,
+                capabilities={
+                    # what HARTOS can REQUEST (the RobotAction VLA factories)
+                    'action_verbs': ['vla_instruct', 'action_chunk',
+                                     'end_effector_delta', 'world_model_rollout'],
+                    # what the policy CONSUMES (SensorReading schema modalities)
+                    'sensor_modalities': ['camera', 'depth', 'imu', 'force_torque',
+                                          'proximity', 'encoder', 'lidar'],
+                    'language_conditioned': True,   # VLA: instruction → action
+                    'world_model': True,            # forward state prediction
+                    'closed_loop': True,
+                    'control_hz': 10, 'default_horizon': 8,
+                    # the dual-mode bridge + HevolveAI HTTP endpoints
+                    'bridge': 'integrations.agent_engine.world_model_bridge'
+                              '.WorldModelBridge',
+                    'action_endpoint': '/v1/actions',
+                    'sensor_endpoint': '/v1/sensors/batch',
+                    'feedback_endpoint': '/v1/feedback/latest',
+                },
+                quality_score=0.75, speed_score=0.7,
+                tags=['local', 'embodied', 'vla', 'robotics'],
             )
             self.register(entry, persist=False)
             added += 1
