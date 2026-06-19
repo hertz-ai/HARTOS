@@ -92,7 +92,10 @@ def test_uninstall_calls_installer(client, monkeypatch, prefix):
     r = client.post(prefix + "/uninstall", json={"app_id": "htop", "platform": "nix"})
     assert r.status_code == 200, r.get_data(as_text=True)
     assert r.get_json()["success"] is True
-    inst.uninstall.assert_called_once_with("htop", "nix")
+    # uninstall() gained a 3rd `options` arg (symmetric-uninstall work, afceff9);
+    # the route forwards data.get('options', {}), so an options-less request
+    # passes {} positionally.
+    inst.uninstall.assert_called_once_with("htop", "nix", {})
 
 
 def test_install_is_auth_gated_on_canonical_surface():
