@@ -97,6 +97,10 @@ use crate::{
     BootConfig, HART_SPLASH_RGBA, ToplevelKind, WindowHandle, WindowRegistry, select_render_path,
 };
 
+/// Last painted wlr-layer-surface count, so the render loop logs a one-line
+/// transition (0→N / N→0) instead of spamming every frame. Pure observability.
+static LAYERS_PAINTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 // ────────────────────────────────────────────────────────────────────────────
 // Per-client state. Carries the compositor-side client bookkeeping Smithay needs.
 // ────────────────────────────────────────────────────────────────────────────
@@ -293,8 +297,14 @@ impl WlrLayerShellHandler for State {
         let mut map = smithay::desktop::layer_map_for_output(&output);
         // map_layer arranges + tracks the layer surface; the initial configure is
         // sent from `ensure_initial_configure` on its first commit.
-        if let Err(err) = map.map_layer(&LayerSurface::new(surface, namespace)) {
-            warn!(?err, "failed to map layer surface");
+        let ns = namespace.clone();
+        match map.map_layer(&LayerSurface::new(surface, namespace)) {
+            Ok(()) => info!(
+                namespace = %ns,
+                layer = ?_layer,
+                "layer.mapped (wlr-layer-shell surface tracked — the glass-shell desktop mount point)"
+            ),
+            Err(err) => warn!(?err, namespace = %ns, "failed to map layer surface"),
         }
     }
 
@@ -386,7 +396,20 @@ fn ensure_initial_configure(state: &mut State, surface: &WlSurface) {
 /// Tries a sequence of clients (terminal first, then the simple-shm demo) so M1's
 /// "a client surface composited" bar is met on whatever is installed. The child
 /// inherits `WAYLAND_DISPLAY=<our socket>` so it connects to US, not the host.
+///
+/// Set `HART_COMP_NO_TEST_CLIENT=1` to suppress the auto-client entirely — used in
+/// Milestone 2 when an EXTERNAL client (swaybg / the WebKit glass-shell host) is
+/// attached deliberately and the auto foot toplevel would only add noise. The map
+/// bar is still met by that external client; this just hands control of "what binds"
+/// to the harness.
 fn spawn_test_client(socket_name: &str) {
+    if std::env::var_os("HART_COMP_NO_TEST_CLIENT").is_some() {
+        info!(
+            socket = socket_name,
+            "HART_COMP_NO_TEST_CLIENT set — not spawning the auto test client (attach one with WAYLAND_DISPLAY={socket_name})"
+        );
+        return;
+    }
     let candidates: &[&[&str]] = &[
         &["foot"],
         &["weston-terminal"],
@@ -590,9 +613,11 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
             }
             // layer surfaces (below the toplevels in this list = drawn under them,
             // since draw_render_elements paints front-to-back in slice order)
+            let mut layers_painted = 0usize;
             {
                 let map = smithay::desktop::layer_map_for_output(&output);
                 for layer in map.layers() {
+                    layers_painted += 1;
                     let loc = map.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
                     elements.extend(render_elements_from_surface_tree(
                         renderer,
@@ -602,6 +627,20 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
                         1.0,
                         Kind::Unspecified,
                     ));
+                }
+            }
+            // Positive render proof, logged ONLY when the painted-layer count CHANGES
+            // (0→1 when the glass-shell/swaybg layer maps, 1→0 on unmap) — so a tail of
+            // the log shows "the layer surface is in the composited frame" without
+            // spamming 60×/s. This is the BACKGROUND-layer paint signal the M2
+            // "the background fills" gate needs.
+            {
+                let prev = LAYERS_PAINTED.swap(layers_painted, std::sync::atomic::Ordering::Relaxed);
+                if prev != layers_painted {
+                    info!(
+                        layers_painted,
+                        "layer.composited (wlr-layer surfaces now in the rendered frame)"
+                    );
                 }
             }
 
