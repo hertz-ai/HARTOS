@@ -212,7 +212,19 @@ def check_update_approved():
 
     db = get_db()
     try:
-        pointer = _latest_pointer_for_channel(db, channel)
+        # REGION-SCOPED policy: the staged-rollout verdict for THIS node is
+        # read from the newest firmware_update command ADDRESSED TO IT — so a
+        # regional's re-roll can only move its OWN members' verdicts, never a
+        # node in another region (cross-region rollout-override guard).  When
+        # the node has never been individually targeted (e.g. a brand-new node
+        # polling before any fan-out reached it), fall back to the channel-wide
+        # pointer so standalone/un-managed nodes keep their pre-canary
+        # auto-approve behaviour.
+        pointer = _latest_pointer_for_channel(db, channel,
+                                              target_node_id=node_id)
+        if not pointer:
+            pointer = _latest_pointer_for_channel(db, channel,
+                                                  central_only=True)
     except Exception as e:
         logger.debug("update-approved: pointer lookup failed: %s", e)
         pointer = None
@@ -242,7 +254,31 @@ def check_update_approved():
 # Central OTA control — the "Update Control" panel's backend
 # ═══════════════════════════════════════════════════════════════
 
-def _latest_pointer_for_channel(db, channel: str):
+def _is_central_issuer(db, issued_by: str) -> bool:
+    """True iff ``issued_by`` is a central-tier PeerNode (or this node when it
+    is central).  Used to make the channel-wide policy fallback honour ONLY a
+    central-issued rollout policy — a regional's re-roll must never become the
+    global pointer that a node in another region reads."""
+    if not issued_by:
+        return False
+    try:
+        from .fleet_command import _get_self_node_id
+        if issued_by == _get_self_node_id():
+            # This node published it; it is central only if it runs as central.
+            import os
+            return os.environ.get('HEVOLVE_NODE_TIER', '') == 'central'
+    except Exception:
+        pass
+    try:
+        from .models import PeerNode
+        peer = db.query(PeerNode).filter_by(node_id=issued_by).first()
+        return bool(peer and (peer.tier or 'flat') == 'central')
+    except Exception:
+        return False
+
+
+def _latest_pointer_for_channel(db, channel: str, target_node_id: str = '',
+                                central_only: bool = False):
     """Return the newest published firmware_update for a channel as a pointer.
 
     The pointer is derived from the FleetCommand log itself — the most recent
@@ -250,16 +286,32 @@ def _latest_pointer_for_channel(db, channel: str):
     pointer table (single source of truth = the command we already write on
     publish). Returns ``{flake_ref, commit, channel, published_at, ...}`` or
     None when the channel has never been published.
+
+    REGION-SCOPED POLICY (cross-region rollout-override guard): when
+    ``target_node_id`` is supplied, only commands ADDRESSED TO THAT NODE are
+    considered.  Because every fan-out (central OR regional) materialises one
+    per-target ``firmware_update`` command (push_broadcast → push_command), the
+    newest command targeting a node IS that node's own rollout policy — so a
+    regional's re-roll can only move the verdict for ITS OWN members, never for
+    a node in another region.  The unscoped form (no target) is the channel-wide
+    pointer used by the public ``/api/ota/latest`` poll, which carries no policy
+    decision.
     """
     from .models import FleetCommand
 
     # Newest first; scan a bounded window so a busy fleet doesn't load the whole
     # table. params_json holds the channel — filter in Python (channel lives in
     # JSON, not a column) over the most recent firmware_update rows.
-    rows = (
+    query = (
         db.query(FleetCommand)
         .filter(FleetCommand.cmd_type == 'firmware_update')
-        .order_by(FleetCommand.created_at.desc())
+    )
+    if target_node_id:
+        # Scope to the node's OWN commands so a foreign regional's re-roll can
+        # never become this node's policy pointer.
+        query = query.filter(FleetCommand.target_node_id == target_node_id)
+    rows = (
+        query.order_by(FleetCommand.created_at.desc())
         .limit(500)
         .all()
     )
@@ -269,6 +321,10 @@ def _latest_pointer_for_channel(db, channel: str):
         except (ValueError, TypeError):
             continue
         if (params.get('channel') or 'stable') != channel:
+            continue
+        # Global fallback policy is honoured ONLY from a central issuer — a
+        # regional's channel-wide write must never gate a foreign-region node.
+        if central_only and not _is_central_issuer(db, row.issued_by):
             continue
         # The staged-rollout policy (canary_pct / approve / deny) rides the same
         # params (single source of truth — no separate rollout table).

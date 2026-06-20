@@ -381,7 +381,23 @@ class FleetCommandService:
                     return False
                 if peer.status in ('dead', 'banned'):
                     return False
-                if (peer.tier or 'flat') not in ('central', 'regional'):
+                issuer_tier = peer.tier or 'flat'
+                if issuer_tier not in ('central', 'regional'):
+                    return False
+                # REGION SCOPE (cross-region privilege-escalation guard).
+                # The HTTP initiate routes scope a REGIONAL's fan-out to its own
+                # sub-fleet, but a compromised/rogue regional can bypass the
+                # route by directly Ed25519-signing a command aimed at a node in
+                # ANOTHER region and putting it on the bus.  The trust model the
+                # APPLY path enforces must therefore independently reject that:
+                # a regional issuer may only target nodes in its OWN region.
+                # Only a CENTRAL issuer may target globally.  A targetless
+                # broadcast envelope (target_node_id == '') is never honoured
+                # from a regional here — a regional broadcast is materialised as
+                # one per-target signed command (push_broadcast), each of which
+                # carries a concrete target this check can scope.
+                if issuer_tier == 'regional' and not _target_in_region(
+                        db, issued_by, target_node_id):
                     return False
                 issuer_pubkey_hex = peer.public_key or ''
             except Exception:
@@ -409,6 +425,33 @@ class FleetCommandService:
 # ═══════════════════════════════════════════════════════════════
 # Issuer verification
 # ═══════════════════════════════════════════════════════════════
+
+def _target_in_region(db, regional_node_id: str, target_node_id: str) -> bool:
+    """Is ``target_node_id`` inside ``regional_node_id``'s own sub-fleet?
+
+    The cross-region authority guard for a REGIONAL-issued command.  REUSES the
+    SINGLE source of truth for region membership — HierarchyService
+    .region_member_node_ids (the central-issued RegionAssignment rows) — so a
+    regional can never target a node outside the region central assigned it.
+
+    A regional may also legitimately command ITSELF (its own node_id), which is
+    not listed as its own RegionAssignment member.  Everything else is rejected.
+
+    Fail-CLOSED: an empty target, a missing membership set, or any DB error
+    returns False — an unverifiable region scope must never widen a regional's
+    reach to another region.
+    """
+    if not target_node_id:
+        return False  # a regional may not issue a targetless/global command
+    if target_node_id == regional_node_id:
+        return True  # a regional may command itself
+    try:
+        from .hierarchy_service import HierarchyService
+        members = HierarchyService.region_member_node_ids(db, regional_node_id)
+        return target_node_id in members
+    except Exception:
+        return False  # fail-closed — can't prove scope ⇒ refuse
+
 
 def _verify_issuer(db, issued_by: str) -> bool:
     """Check that a fleet command issuer exists in PeerNode and has authority.

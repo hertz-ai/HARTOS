@@ -185,10 +185,13 @@ class TestUpdateApprovedDerivesPolicyFromCommandLog(unittest.TestCase):
         from integrations.social.models import Base, get_engine
         Base.metadata.create_all(get_engine())
 
-    def _publish_pointer(self, db, commit, canary_pct):
+    def _publish_pointer(self, db, commit, canary_pct, target='n1'):
+        # The per-node policy pointer is the firmware_update command ADDRESSED
+        # TO the polling node (the region-scoped gate reads the node's OWN
+        # command so a foreign regional can't override it).
         from integrations.social.models import FleetCommand
         db.add(FleetCommand(
-            target_node_id='some-node', cmd_type='firmware_update',
+            target_node_id=target, cmd_type='firmware_update',
             params_json=json.dumps({'update_url': 'github:x/y/' + commit,
                                     'release_hash': commit, 'channel': 'stable',
                                     'canary_pct': canary_pct}),
@@ -200,12 +203,58 @@ class TestUpdateApprovedDerivesPolicyFromCommandLog(unittest.TestCase):
         app = _app()
         db = get_db()
         try:
-            self._publish_pointer(db, 'cafe', canary_pct=0)  # paused rollout
+            # paused rollout for THIS node (the command targets n1).
+            self._publish_pointer(db, 'cafe', canary_pct=0, target='n1')
             # The gate opens its OWN db via get_db — point it at this session.
             with patch('integrations.social.models.get_db', return_value=db):
                 with app.test_client() as c:
                     r = c.get('/api/social/fleet/update-approved?v=cafe&node_id=n1')
             self.assertFalse(json.loads(r.data)['approved'])
+        finally:
+            db.rollback(); db.close()
+
+
+class TestCrossRegionRolloutOverrideBlocked(unittest.TestCase):
+    """PRIVILEGE-ESCALATION GUARD (cross-region rollout-policy override): a
+    regional's re-roll writes firmware_update commands targeting only ITS OWN
+    members.  A node in another region polling the gate must NOT pick up that
+    foreign regional's canary_pct/deny policy — the verdict is read from the
+    command ADDRESSED TO the polling node, not whichever regional wrote last."""
+
+    @classmethod
+    def setUpClass(cls):
+        from integrations.social.models import Base, get_engine
+        Base.metadata.create_all(get_engine())
+
+    def _cmd(self, db, target, commit, canary_pct, issued_by):
+        from integrations.social.models import FleetCommand
+        db.add(FleetCommand(
+            target_node_id=target, cmd_type='firmware_update',
+            params_json=json.dumps({'update_url': 'github:x/y/' + commit,
+                                    'release_hash': commit, 'channel': 'stable',
+                                    'canary_pct': canary_pct}),
+            issued_by=issued_by, signature='sig', status='pending'))
+        db.flush()
+
+    def test_foreign_regional_reroll_does_not_gate_other_region_node(self):
+        from integrations.social.models import get_db
+        app = _app()
+        db = get_db()
+        try:
+            # Central admitted victim_node at 100%.
+            self._cmd(db, target='victim_node', commit='v1',
+                      canary_pct=100, issued_by='central_node')
+            # A FOREIGN regional re-rolls a HOLD (canary_pct=0) but its command
+            # targets only ITS OWN member, not victim_node.
+            self._cmd(db, target='foreign_regional_member', commit='v1',
+                      canary_pct=0, issued_by='foreign_regional')
+            with patch('integrations.social.models.get_db', return_value=db):
+                with app.test_client() as c:
+                    r = c.get(
+                        '/api/social/fleet/update-approved?v=v1&node_id=victim_node')
+            # victim_node reads its OWN (central, 100%) command — still approved,
+            # the foreign regional's hold did NOT leak across the region boundary.
+            self.assertTrue(json.loads(r.data)['approved'])
         finally:
             db.rollback(); db.close()
 

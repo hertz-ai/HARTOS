@@ -322,11 +322,65 @@ class TestVerifyCommandSignature:
         cmd = self._signed('central_issuer_a')
         assert FleetCommandService.verify_command_signature(cmd, db=db) is True
 
+    def _assign(self, db, regional_node_id, local_node_id):
+        """Make ``local_node_id`` a member of ``regional_node_id``'s sub-fleet
+        via the central-issued RegionAssignment table (the SAME source of truth
+        the region-scope guard reads)."""
+        from integrations.social.models import RegionAssignment
+        db.add(RegionAssignment(
+            local_node_id=local_node_id, regional_node_id=regional_node_id,
+            status='active', approved_by_central=True))
+        db.flush()
+
     def test_valid_regional_signature_verifies(self, db):
+        """A regional signing a command for a node IN ITS OWN region verifies."""
         from security.node_integrity import get_public_key_hex
         pub = get_public_key_hex()
         self._register_issuer(db, 'regional_issuer_a', 'regional', pub)
-        cmd = self._signed('regional_issuer_a')
+        self._assign(db, 'regional_issuer_a', 'local_in_region_a')
+        cmd = self._signed('regional_issuer_a', target='local_in_region_a')
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is True
+
+    def test_regional_cross_region_target_rejected(self, db):
+        """PRIVILEGE-ESCALATION GUARD: a genuinely-signed regional command aimed
+        at a node OUTSIDE the issuer's region is rejected by the verifier itself
+        (not just the HTTP route).  This is the cross-region firmware_update
+        attack — a rogue regional crafting + Ed25519-signing a command for
+        another region's node — and it must fail at the trust layer."""
+        from security.node_integrity import get_public_key_hex
+        pub = get_public_key_hex()
+        self._register_issuer(db, 'regional_attacker', 'regional', pub)
+        # regional_attacker owns local_mine, but targets a node it does NOT own.
+        self._assign(db, 'regional_attacker', 'local_mine')
+        cmd = self._signed('regional_attacker', target='node_in_other_region')
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is False
+
+    def test_regional_targetless_broadcast_rejected(self, db):
+        """A regional may not issue a targetless (global) command — only a
+        materialised per-target command can be region-scoped, so an empty
+        target from a regional is refused."""
+        from security.node_integrity import get_public_key_hex
+        pub = get_public_key_hex()
+        self._register_issuer(db, 'regional_global', 'regional', pub)
+        cmd = self._signed('regional_global', target='')
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is False
+
+    def test_central_cross_region_target_allowed(self, db):
+        """A CENTRAL issuer may target globally — no region restriction applies
+        (central is the queen bee).  Verifies the guard is regional-only."""
+        from security.node_integrity import get_public_key_hex
+        pub = get_public_key_hex()
+        self._register_issuer(db, 'central_global', 'central', pub)
+        cmd = self._signed('central_global', target='any_node_anywhere')
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is True
+
+    def test_regional_self_target_allowed(self, db):
+        """A regional may command ITSELF even though it isn't its own region
+        member (it has no RegionAssignment row pointing to itself)."""
+        from security.node_integrity import get_public_key_hex
+        pub = get_public_key_hex()
+        self._register_issuer(db, 'regional_self', 'regional', pub)
+        cmd = self._signed('regional_self', target='regional_self')
         assert FleetCommandService.verify_command_signature(cmd, db=db) is True
 
     def test_tampered_params_fail(self, db):
