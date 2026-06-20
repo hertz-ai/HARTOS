@@ -285,32 +285,103 @@ class FleetCommandService:
             return {'success': False, 'message': str(e)}
 
     @staticmethod
-    def verify_command_signature(cmd_dict: dict) -> bool:
+    def verify_command_signature(cmd_dict: dict, db=None) -> bool:
         """Verify a command was signed by an authorized node (central/regional).
 
+        TWO independent checks, BOTH must pass:
+
+          1. CRYPTOGRAPHIC — the command's Ed25519 ``signature`` verifies,
+             via ``security.node_integrity.verify_signature``, against the
+             ISSUER's ``PeerNode.public_key`` over the canonical signing
+             message (``_command_signing_message``).  A forged or tampered
+             command fails here — a relay can PROPAGATE a signed command but
+             has no key to forge or re-sign one.
+          2. AUTHORITY — the issuer is a known, non-dead/banned PeerNode whose
+             topology ``tier`` is central or regional (the same authority set
+             ``_verify_issuer`` enforces on the durable-queue path).
+
+        Self-issued commands (issued_by == this node) are trusted without the
+        PeerNode lookup — a node signs its own commands with its own key and is
+        not listed as its own peer.  The signature is still required.
+
         Args:
-            cmd_dict: Command dict with 'signature' and 'issued_by' fields.
+            cmd_dict: Command dict with ``signature``, ``issued_by``,
+                ``cmd_type``, ``params`` (or ``params_json``) and
+                ``target_node_id`` fields — i.e. a ``FleetCommand.to_dict()``
+                or the same shape published on the 'fleet.command' bus.
+            db: Optional SQLAlchemy session.  When omitted a short-lived one is
+                opened (the realtime bus/listener path has no request session).
 
         Returns:
-            True if signature is valid and issuer is authorized.
+            True iff the signature is cryptographically valid AND the issuer is
+            an authorized central/regional node.  Fail-closed on any error.
         """
         signature = cmd_dict.get('signature', '')
         issued_by = cmd_dict.get('issued_by', '')
-
         if not signature or not issued_by:
             return False
 
-        try:
-            from security.key_delegation import verify_tier_authorization
-            # Central and regional nodes are authorized to issue commands
-            return verify_tier_authorization(issued_by, required_tier='regional')
-        except ImportError:
-            # If key_delegation unavailable, verify via guardrail hash
+        cmd_type = cmd_dict.get('cmd_type', '')
+        target_node_id = cmd_dict.get('target_node_id', '')
+        params = cmd_dict.get('params')
+        if params is None:
+            raw = cmd_dict.get('params_json')
             try:
-                from security.hive_guardrails import verify_guardrail_integrity
-                return verify_guardrail_integrity()
-            except ImportError:
+                params = json.loads(raw) if raw else {}
+            except (ValueError, TypeError):
+                params = {}
+
+        # Resolve the issuer's verifying public key + authority tier.
+        # Self-issued: use this node's own key, tier is implicitly authorized
+        # (a node may always command itself; the bus/relay still requires a
+        # valid self-signature so a replayed-but-mutated command is rejected).
+        self_id = _get_self_node_id()
+        issuer_pubkey_hex = ''
+        if issued_by == self_id:
+            try:
+                from security.node_integrity import get_public_key_hex
+                issuer_pubkey_hex = get_public_key_hex()
+            except Exception:
                 return False
+        else:
+            owns_db = False
+            if db is None:
+                try:
+                    from .models import get_db
+                    db = get_db()
+                    owns_db = True
+                except Exception:
+                    return False  # no way to authorize a foreign issuer
+            try:
+                from .models import PeerNode
+                peer = db.query(PeerNode).filter_by(node_id=issued_by).first()
+                if not peer:
+                    return False
+                if peer.status in ('dead', 'banned'):
+                    return False
+                if (peer.tier or 'flat') not in ('central', 'regional'):
+                    return False
+                issuer_pubkey_hex = peer.public_key or ''
+            except Exception:
+                return False
+            finally:
+                if owns_db:
+                    db.close()
+
+        if not issuer_pubkey_hex:
+            return False
+
+        # Cryptographic verification over the canonical signing message.
+        try:
+            from security.node_integrity import verify_signature
+            sig_bytes = bytes.fromhex(signature) if isinstance(signature, str) \
+                else bytes(signature)
+            msg = _command_signing_message(cmd_type, params, target_node_id)
+            return verify_signature(issuer_pubkey_hex, msg, sig_bytes)
+        except (ValueError, TypeError):
+            return False
+        except Exception:
+            return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -740,12 +811,31 @@ def _get_self_node_id() -> str:
         return 'unknown'
 
 
+def _command_signing_message(cmd_type: str, params: dict,
+                             target_node_id: str) -> bytes:
+    """Canonical bytes a fleet command's signature covers.
+
+    SINGLE source of truth for the signed payload so the signer
+    (``_sign_command``) and the verifier (``verify_command_signature``)
+    can never drift.  Sorted-key JSON makes the encoding deterministic
+    across nodes and Python versions.
+    """
+    message = f"{cmd_type}:{json.dumps(params, sort_keys=True)}:{target_node_id}"
+    return message.encode()
+
+
 def _sign_command(cmd_type: str, params: dict, target_node_id: str) -> str:
-    """Sign a command with this node's private key."""
+    """Sign a command with this node's private key.
+
+    Returns a HEX-encoded Ed25519 signature (stable, round-trippable text
+    for the FleetCommand.signature column and the 'fleet.command' wire
+    envelope).  Empty string when signing is unavailable — the durable DB
+    queue + issuer re-verification remain the trust fallback.
+    """
     try:
         from security.node_integrity import sign_message
-        message = f"{cmd_type}:{json.dumps(params, sort_keys=True)}:{target_node_id}"
-        return sign_message(message.encode())
+        sig = sign_message(_command_signing_message(cmd_type, params, target_node_id))
+        return sig.hex() if isinstance(sig, (bytes, bytearray)) else str(sig)
     except (ImportError, Exception) as e:
         logger.debug(f"Fleet: command signing unavailable: {e}")
         return ''
