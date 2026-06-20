@@ -642,8 +642,96 @@ def verify_iso(disk, dd, log):
     return ok_cd and ok_boot
 
 
+# ───────────────────────── HARTLOG diagnostic-log partition ─────────────────────────
+# The desktop live ISO uses ~6.6 GB of a 28 GB stick — ~21 GB is free. After a
+# successful flash we carve that free space into ONE FAT32 partition labelled
+# HARTLOG. The HART OS boot-log module (nixos/modules/hart-boot-log.nix) detects
+# that label at boot and writes the boot journal + tier-supervisor state + GTK4/
+# GL diagnostics to it, so the Windows host can read the boot journal off the
+# stick (no TTY hand-copy). The label HARTLOG is the ONE source of truth shared
+# with that module (hart.bootLog.label).
+LOG_PART_LABEL = "HARTLOG"
+
+
+def create_log_partition(disk, log):
+    """Create a FAT32 partition labelled HARTLOG in the stick's FREE SPACE.
+
+    ROBUST BY CONTRACT: this runs AFTER a successful flash + boot-sig verify, and
+    it must NEVER fail/abort the (already-successful) flash. Every failure path —
+    no free space, diskpart missing/errored, non-Windows, any exception — is
+    caught and logged, and the function returns False without raising. The flash
+    is already done and bootable; the log partition is a debug convenience.
+
+    Mirrors the existing diskpart-fallback style (the flasher already shells
+    diskpart for enumeration + `clean`). Windows-only: only diskpart can carve a
+    partition into the post-isohybrid free space and FAT32-format + label it so
+    Windows mounts the drive natively. On Linux/macOS this is a logged no-op (the
+    user flashing from those hosts can read the ISO's own journal via other
+    means; the HARTLOG convenience targets the Windows-host debug loop).
+    """
+    if not IS_WIN:
+        log("  HARTLOG partition: skipped (only created on Windows; flash is complete)")
+        return False
+    import tempfile
+    # Carve ALL remaining free space into one primary partition, format FAT32,
+    # label HARTLOG. `create partition primary` with no size= uses the largest
+    # contiguous free region — exactly the post-ISO unallocated tail. `quick`
+    # format so it's fast; `assign` lets Windows mount it now (a drive letter is
+    # harmless and lets the user open it immediately after replug).
+    script = "\n".join([
+        "select disk %d" % disk["number"],
+        "create partition primary",
+        "format fs=fat32 label=%s quick" % LOG_PART_LABEL,
+        "assign",
+        "",
+    ])
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(script)
+        try:
+            r = subprocess.run(["diskpart", "/s", path],
+                               capture_output=True, text=True, timeout=120)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log("  HARTLOG partition: diskpart unavailable/timed out (%s) — "
+                "skipped (flash is complete + bootable)" % e)
+            return False
+        out = (r.stdout or "") + (r.stderr or "")
+        low = out.lower()
+        # diskpart reports success per step; the format completion line is the
+        # authoritative "it worked" marker. A "no usable free extent" / "not
+        # enough usable space" means the ISO consumed (almost) the whole stick —
+        # a clean skip, never an error.
+        ok = ("successfully formatted the volume" in low
+              or "diskpart successfully formatted" in low
+              or ("format" in low and "100 percent completed" in low))
+        if ok:
+            log("  HARTLOG partition: created + FAT32-formatted in free space "
+                "(label=%s) — the host can now read hart-boot-latest.log off it"
+                % LOG_PART_LABEL)
+            return True
+        if "free" in low and ("no usable" in low or "not enough" in low):
+            log("  HARTLOG partition: no free space on the stick "
+                "(ISO filled it) — skipped (flash is complete + bootable)")
+            return False
+        log("  HARTLOG partition: diskpart did not confirm format — skipped "
+            "(flash is complete + bootable). diskpart said: %s"
+            % out.strip()[-200:])
+        return False
+    except Exception as e:                       # belt-and-suspenders: never fail the flash
+        log("  HARTLOG partition: unexpected error (%s) — skipped "
+            "(flash is complete + bootable)" % e)
+        return False
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 # ───────────────────────── orchestration ─────────────────────────
-def flash(tag, variant, disk, mode, tmp, progress=None, log=None):
+def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
+          make_log_partition=True):
     log = log or (lambda m: None)
     progress = progress or (lambda f: None)
     gh = find_gh()
@@ -701,6 +789,20 @@ def flash(tag, variant, disk, mode, tmp, progress=None, log=None):
     log("Verifying signatures...")
     ok = verify_iso(disk, dd, log)
     log("DONE - bootable OK" if ok else "DONE but signature check FAILED")
+    # AFTER a successful flash + boot-sig verify, carve a HARTLOG FAT32 partition
+    # into the stick's free space so the live ISO can write its boot journal
+    # there for the Windows host to read. Gated on the verify passing (no point
+    # adding a debug partition to a stick that didn't flash) AND opt-out-able via
+    # --no-log-partition. create_log_partition NEVER raises / never fails the
+    # flash — the flash is already done + bootable; this is a debug convenience.
+    if ok and make_log_partition:
+        log("Creating HARTLOG diagnostic-log partition in the free space...")
+        try:
+            create_log_partition(disk, log)
+        except Exception as e:                   # the carve can NEVER fail the flash
+            log("  HARTLOG partition: ignored error (%s) — flash is complete + bootable" % e)
+    elif not make_log_partition:
+        log("HARTLOG partition: disabled via --no-log-partition")
     return ok
 
 
@@ -801,7 +903,8 @@ def cmd_flash(args):
         % (tag, args.variant, disk["number"], disk["model"], args.mode,
            warn or "removable/blank"))
     try:
-        ok = flash(tag, args.variant, disk, args.mode, args.tmp, log=log)
+        ok = flash(tag, args.variant, disk, args.mode, args.tmp, log=log,
+                   make_log_partition=not args.no_log_partition)
     except Exception as e:
         log("FLASH FAILED: %s" % e)
         sys.stderr.write("FLASH FAILED: %s\n  (debug log: %s)\n" % (e, log_path))
@@ -827,6 +930,10 @@ def build_parser():
     p.add_argument("--log", help="debug log file (default: <tmp>/hart_flash.log)")
     p.add_argument("--allow-system", action="store_true",
                    help="DANGEROUS: also offer non-removable/system disks")
+    p.add_argument("--no-log-partition", action="store_true",
+                   help="skip creating the HARTLOG diagnostic-log partition in "
+                        "the stick's free space (Windows; created by default after "
+                        "a successful flash so the host can read the boot journal)")
     return p
 
 
@@ -898,6 +1005,15 @@ def launch_gui():
     ttk.Radiobutton(row3, text="Streaming (faster)", variable=mode_var, value="stream").pack(side="left")
     ttk.Radiobutton(row3, text="Download+Flash", variable=mode_var, value="download").pack(side="left")
 
+    row4 = ttk.Frame(frm); row4.pack(fill="x", pady=3)
+    # Default ON (matches the CLI default): carve a HARTLOG FAT32 partition into
+    # the free space so the host can read the live ISO's boot journal off the
+    # stick. Windows-only; a no-op elsewhere.
+    logpart_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(row4,
+                    text="Create HARTLOG diagnostic-log partition (read boot logs from this PC)",
+                    variable=logpart_var).pack(side="left")
+
     pbar = ttk.Progressbar(frm, mode="determinate", maximum=1.0)
     pbar.pack(fill="x", pady=(10, 4))
     logbox = tk.Text(frm, height=15, wrap="word", font=("Consolas", 9))
@@ -931,7 +1047,8 @@ def launch_gui():
                      % (tag_var.get().strip(), var_var.get(), d["number"],
                         mode_var.get(), warn or "removable/blank"))
                 flash(tag_var.get().strip(), var_var.get(), d, mode_var.get(),
-                      tmp, progress=lambda f: pbar.config(value=f), log=flog)
+                      tmp, progress=lambda f: pbar.config(value=f), log=flog,
+                      make_log_partition=logpart_var.get())
                 messagebox.showinfo("Done", "Flash complete — the stick is bootable.")
             except Exception as e:
                 log("FAILED: %s" % e)

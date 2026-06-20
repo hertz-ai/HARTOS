@@ -286,3 +286,202 @@ def test_list_parts_parses_real_assets(monkeypatch):
     parts = flasher.list_parts("gh", "nightly-x", "desktop")
     assert [p["name"].split(".part-")[1] for p in parts] == ["00", "01"]   # sorted, parts only
     assert all("desktop" in p["name"] for p in parts)
+
+
+# ─────────── HARTLOG diagnostic-log partition (Part B) ───────────
+# After a successful flash + boot-sig verify, the flasher carves a FAT32
+# partition labelled HARTLOG into the stick's free space so the live ISO can
+# write its boot journal there for the Windows host to read. The carve must:
+#   (a) run the right diskpart script (create primary + format fat32 label),
+#   (b) report success ONLY when diskpart confirms the format,
+#   (c) NEVER fail/abort the (already-successful) flash on ANY error,
+#   (d) be skippable via --no-log-partition,
+#   (e) run AFTER a successful verify (not before, not on a failed flash).
+
+# Real diskpart output for a successful `format fs=fat32 label=HARTLOG quick`.
+_DISKPART_FORMAT_OK = """Microsoft DiskPart version 10.0.26100.1150
+
+DiskPart succeeded in creating the specified partition.
+
+  100 percent completed
+
+DiskPart successfully formatted the volume.
+
+DiskPart successfully assigned the drive letter or mount point.
+"""
+
+# diskpart when the ISO consumed the whole stick — no usable free extent.
+_DISKPART_NO_FREE = """Microsoft DiskPart version 10.0.26100.1150
+
+There is not enough usable free space on specified disk(s).
+"""
+
+
+def _fake_log_partition_diskpart(captured, output=_DISKPART_FORMAT_OK, returncode=0):
+    """A subprocess.run replacement that captures the diskpart script the
+    HARTLOG carve writes + returns a canned diskpart result."""
+    def fake_run(cmd, **kw):
+        if cmd[:1] == ["diskpart"]:
+            captured["script"] = open(cmd[2], encoding="utf-8").read()
+            return _CP(output, returncode=returncode)
+        raise AssertionError("unexpected subprocess: %r" % (cmd,))
+    return fake_run
+
+
+def test_create_log_partition_runs_correct_diskpart_script(monkeypatch):
+    """The carve must select the target disk, create a primary partition, and
+    FAT32-format it with the HARTLOG label — the contract the boot-log module
+    detects. On a confirmed format it returns True."""
+    monkeypatch.setattr(flasher, "IS_WIN", True)
+    captured = {}
+    monkeypatch.setattr(flasher.subprocess, "run", _fake_log_partition_diskpart(captured))
+    logs = []
+    ok = flasher.create_log_partition({"number": 1}, logs.append)
+    assert ok is True
+    s = captured["script"]
+    assert "select disk 1" in s
+    assert "create partition primary" in s
+    assert "format fs=fat32 label=HARTLOG quick" in s
+    # The label the carve writes MUST match the module's contract constant.
+    assert flasher.LOG_PART_LABEL == "HARTLOG"
+    assert any("HARTLOG partition: created" in m for m in logs)
+
+
+def test_create_log_partition_no_free_space_is_clean_skip(monkeypatch):
+    """If the ISO filled the stick (no usable free extent), the carve is a clean
+    skip — returns False, logs the reason, does NOT raise."""
+    monkeypatch.setattr(flasher, "IS_WIN", True)
+    captured = {}
+    monkeypatch.setattr(flasher.subprocess, "run",
+                        _fake_log_partition_diskpart(captured, output=_DISKPART_NO_FREE))
+    logs = []
+    ok = flasher.create_log_partition({"number": 1}, logs.append)
+    assert ok is False
+    assert any("no free space" in m for m in logs)
+
+
+def test_create_log_partition_diskpart_timeout_never_raises(monkeypatch):
+    """A diskpart timeout/OSError must be swallowed — the flash is already done;
+    the log partition is a debug convenience that can never fail it."""
+    monkeypatch.setattr(flasher, "IS_WIN", True)
+
+    def boom(cmd, **kw):
+        raise flasher.subprocess.TimeoutExpired(cmd, kw.get("timeout", 120))
+
+    monkeypatch.setattr(flasher.subprocess, "run", boom)
+    logs = []
+    ok = flasher.create_log_partition({"number": 1}, logs.append)   # must NOT raise
+    assert ok is False
+    assert any("diskpart unavailable" in m or "timed out" in m for m in logs)
+
+
+def test_create_log_partition_non_windows_is_noop(monkeypatch):
+    """On Linux/macOS the carve is a logged no-op (diskpart is Windows-only)."""
+    monkeypatch.setattr(flasher, "IS_WIN", False)
+    called = {"n": 0}
+    monkeypatch.setattr(flasher.subprocess, "run",
+                        lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+    logs = []
+    ok = flasher.create_log_partition({"number": 1}, logs.append)
+    assert ok is False
+    assert called["n"] == 0                       # never shells diskpart off-Windows
+    assert any("only created on Windows" in m for m in logs)
+
+
+def _stub_flash_machinery(monkeypatch, verify_result=True):
+    """Stub every heavy step of flash() so a test can exercise ONLY the
+    post-verify HARTLOG step + its ordering. Returns the call-order list."""
+    order = []
+    monkeypatch.setattr(flasher, "IS_WIN", False)            # skip the Windows writer path
+    monkeypatch.setattr(flasher, "find_gh", lambda: "gh")
+    monkeypatch.setattr(flasher, "find_dd", lambda: None)
+    monkeypatch.setattr(flasher, "list_parts",
+                        lambda gh, tag, variant: [{"name": "p0", "id": 1, "size": 10,
+                                                   "state": "uploaded"}])
+    monkeypatch.setattr(flasher, "download_part", lambda *a, **k: "/tmp/p0")
+    monkeypatch.setattr(flasher, "stream_to_device", lambda *a, **k: 10)
+    monkeypatch.setattr(flasher, "write_source_to_device", lambda *a, **k: 10)
+    monkeypatch.setattr(flasher, "stream_producer", lambda *a, **k: ["curl"])
+    monkeypatch.setattr(flasher.os, "remove", lambda *a, **k: None)
+    monkeypatch.setattr(flasher, "_run", lambda *a, **k: _CP(""))
+
+    def fake_verify(disk, dd, log):
+        order.append("verify")
+        return verify_result
+    monkeypatch.setattr(flasher, "verify_iso", fake_verify)
+
+    def fake_carve(disk, log):
+        order.append("carve")
+        return True
+    monkeypatch.setattr(flasher, "create_log_partition", fake_carve)
+    return order
+
+
+def test_flash_creates_log_partition_after_successful_verify(monkeypatch):
+    """End-to-end ordering: flash() must call create_log_partition AFTER a
+    successful verify_iso (a debug partition on a verified-bootable stick)."""
+    order = _stub_flash_machinery(monkeypatch, verify_result=True)
+    ok = flasher.flash("tag", "desktop", {"number": 1, "model": "USB", "dev": "/dev/sdb",
+                                          "physdrive": "/dev/sdb"},
+                       "download", "/tmp", log=lambda m: None)
+    assert ok is True
+    assert order == ["verify", "carve"], \
+        "create_log_partition must run AFTER verify_iso, only on success"
+
+
+def test_flash_skips_log_partition_when_verify_fails(monkeypatch):
+    """A FAILED verify must NOT get a log partition — no point debug-partitioning
+    a stick that didn't flash."""
+    order = _stub_flash_machinery(monkeypatch, verify_result=False)
+    ok = flasher.flash("tag", "desktop", {"number": 1, "model": "USB", "dev": "/dev/sdb",
+                                          "physdrive": "/dev/sdb"},
+                       "download", "/tmp", log=lambda m: None)
+    assert ok is False
+    assert order == ["verify"], "no carve on a failed verify"
+
+
+def test_flash_no_log_partition_flag_skips_the_carve(monkeypatch):
+    """--no-log-partition (make_log_partition=False) skips the carve even on a
+    successful verify."""
+    order = _stub_flash_machinery(monkeypatch, verify_result=True)
+    ok = flasher.flash("tag", "desktop", {"number": 1, "model": "USB", "dev": "/dev/sdb",
+                                          "physdrive": "/dev/sdb"},
+                       "download", "/tmp", log=lambda m: None,
+                       make_log_partition=False)
+    assert ok is True
+    assert order == ["verify"], "make_log_partition=False must skip the carve"
+
+
+def test_flash_carve_exception_does_not_fail_the_flash(monkeypatch):
+    """If create_log_partition RAISES (it shouldn't, but belt-and-suspenders),
+    the flash result is still the verify result — the carve can never turn a
+    successful flash into a failure."""
+    order = _stub_flash_machinery(monkeypatch, verify_result=True)
+
+    def raising_carve(disk, log):
+        order.append("carve")
+        raise RuntimeError("diskpart exploded")
+    monkeypatch.setattr(flasher, "create_log_partition", raising_carve)
+
+    # create_log_partition is documented never to raise, but flash() must not
+    # let a hypothetical raise corrupt the already-successful result. Guard it
+    # the same way the function guards itself: the flash already returned ok=True
+    # by the time the carve runs, so wrap the call.
+    try:
+        ok = flasher.flash("tag", "desktop",
+                           {"number": 1, "model": "USB", "dev": "/dev/sdb",
+                            "physdrive": "/dev/sdb"},
+                           "download", "/tmp", log=lambda m: None)
+    except RuntimeError:
+        pytest.fail("a carve exception must not propagate out of flash()")
+    assert ok is True
+    assert order == ["verify", "carve"]
+
+
+def test_no_log_partition_flag_parses(monkeypatch):
+    """The --no-log-partition opt-out flag exists and defaults to off (carve ON
+    by default)."""
+    args = flasher.build_parser().parse_args(["--device", "1", "--yes"])
+    assert args.no_log_partition is False
+    args2 = flasher.build_parser().parse_args(["--device", "1", "--yes", "--no-log-partition"])
+    assert args2.no_log_partition is True
