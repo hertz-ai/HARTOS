@@ -117,6 +117,14 @@ let
     # this is the GTK4 path's OWN broken-GPU proof, not an inherited assumption.
     ${lib.optionalString (!ui.preferHardwareGL) "export WEBKIT_DISABLE_DMABUF_RENDERER=1\nexport WEBKIT_DISABLE_COMPOSITING_MODE=1"}
     export HART_SHELL_URL="$URL"
+    # Shell-paint readiness marker (the session-supervisor's HUNG-tier guard): the
+    # GTK4 host touches this once the WebView finishes its first load, telling the
+    # paint-watchdog this Tier-2 surface is HEALTHY so it is NOT dropped as a hang.
+    # THIS is the host the "pointer-only" regression hung in — without the marker
+    # the watchdog would time out and escalate to cage; with it a working tier
+    # stays up. The supervisor passes HART_SHELL_READY_FLAG; default to the pinned
+    # /run/hart contract path so a bare (supervisor-less) launch is harmless.
+    export HART_SHELL_READY_FLAG="''${HART_SHELL_READY_FLAG:-/run/hart/session/shell-ready}"
     exec ${cfg.package.python}/bin/python -c "
 import gi, os
 gi.require_version('Gtk', '4.0')
@@ -127,6 +135,19 @@ gi.require_version('Gtk4LayerShell', '1.0')
 from gi.repository import Gtk, WebKit, Gtk4LayerShell as LayerShell
 
 SHELL_URL = os.environ.get('HART_SHELL_URL', 'http://localhost:${liquidPort}')
+READY_FLAG = os.environ.get('HART_SHELL_READY_FLAG', '/run/hart/session/shell-ready')
+
+
+def _signal_painted():
+    '''Touch the first-paint marker the session-supervisor watches. Best-effort —
+    a missing dir / permission error must NEVER crash the shell (the supervisor
+    degrades safely: a missing marker escalates DOWN to the cage floor).'''
+    try:
+        os.makedirs(os.path.dirname(READY_FLAG), exist_ok=True)
+        with open(READY_FLAG, 'w'):
+            pass
+    except OSError:
+        pass
 
 
 class GlassShellLayer:
@@ -171,6 +192,10 @@ class GlassShellLayer:
 
         # ── The WebView: same served shell, GTK4/WebKit-6.0 host ──
         webview = WebKit.WebView()
+        # Signal first paint to the session-supervisor when the page finishes
+        # loading — the GTK4/WebKit-6.0 load-changed signal mirrors the GTK3 cage
+        # floor's. This marks Tier-2 HEALTHY so the paint-watchdog does NOT drop it.
+        webview.connect('load-changed', self._on_load_changed)
         webview.load_uri(SHELL_URL)
         s = webview.get_settings()
         s.set_enable_javascript(True)

@@ -162,4 +162,86 @@ in
           assert "session tier" in status, f"status missing tier line: {status!r}"
     '';
   };
+
+  # ─────────────────────────────────────────────────────────────
+  # PAINT-WATCHDOG: a HUNG tier (compositor up, shell never paints, process
+  # never exits) is dropped just like a crash. This is the regression the bare
+  # crash-on-exit detection was blind to — the "boots to only a mouse pointer"
+  # failure where sway/the GTK4 host stays alive but never presents a frame.
+  # ─────────────────────────────────────────────────────────────
+  hart-session-supervisor-paint-watchdog = pkgs.testers.runNixOSTest {
+    name = "hart-session-supervisor-paint-watchdog";
+    skipTypeCheck = true;
+    skipLint = true;
+    node.specialArgs = specialArgs;
+
+    nodes.sup = mkNode "desktop" {
+      virtualisation = {
+        memorySize = 3072;
+        cores = 2;
+      };
+      hart.sessionSupervisor = {
+        enable = true;
+        # Tier-1 (hart-comp) unavailable so the ladder starts at Tier-2 (sway).
+        compCommand = null;
+        # Tier-2 fake: stays ALIVE forever but NEVER touches the paint marker —
+        # the HUNG case. The watchdog must kill it + count it as a crash.
+        swayCommand = "${pkgs.coreutils}/bin/sleep infinity";
+        # cageCommand defaults to the real "hart-shell-session" floor.
+        crashLoopCount = 3;
+        crashLoopWindowSeconds = 300;
+        # Short paint budget so the VM test is fast (real default is 20s).
+        shellPaintTimeoutSeconds = 3;
+      };
+    };
+
+    testScript = ''
+      sup = machines[0]
+      sup.start()
+      sup.wait_for_unit("multi-user.target")
+
+      LATCH = "/var/lib/hart/session-tier"
+      READY = "/run/hart/session/shell-ready"
+
+      sup.wait_for_unit("greetd.service", timeout=120)
+      sup.succeed("command -v hartctl")
+
+      selector = sup.succeed(
+          "find /nix/store -maxdepth 3 -name '*-hart-session-selector' -type f -print -quit"
+      ).strip()
+      assert selector, "hart-session-selector wrapper not found in the store"
+
+      # Arm Tier-2 (sway) as the start tier (Tier-1 is unavailable -> sway).
+      with subtest("the group-writable paint marker dir exists (shell host can write it)"):
+          sup.succeed("test -d /run/hart/session")
+          # 0770 hart hart — group-writable so the hart-admin shell host can touch
+          # the marker. (drwxrwx---)
+          mode = sup.succeed("stat -c '%a' /run/hart/session").strip()
+          assert mode == "770", f"/run/hart/session must be 0770 (group-writable), got {mode}"
+
+      with subtest("a HUNG Tier-2 (alive but never paints) is killed + dropped to cage by the watchdog"):
+          sup.succeed("hartctl session reset-tier")  # writes hart-comp; comp null -> falls to sway
+          # Each selector run launches the latched tier. sway = `sleep infinity`
+          # stays alive and never writes READY, so after shellPaintTimeoutSeconds
+          # the watchdog KILLS it and records a crash; crashLoopCount such hangs
+          # drop the tier. Walk hart-comp(unavail)->sway->cage. The marker must be
+          # absent each run (the fake never paints) so every run is a hang.
+          for _ in range(8):
+              sup.succeed(f"runuser -u hart -- {selector} || true")
+              # The watchdog clears + the fake never writes it: marker stays absent.
+              sup.fail(f"test -e {READY}")
+
+          tier = sup.succeed(f"cat {LATCH}").strip()
+          assert tier == "cage", \
+              f"a HUNG higher tier must be dropped to the cage floor by the paint watchdog, got {tier!r}"
+
+      with subtest("the watchdog never drops below the cage floor on a hang"):
+          # Already on cage. cage's REAL launcher may not fully paint headless, but
+          # the floor is exempt from the watchdog drop — the latch must STAY cage.
+          for _ in range(4):
+              sup.succeed(f"runuser -u hart -- {selector} || true")
+          tier = sup.succeed(f"cat {LATCH}").strip()
+          assert tier == "cage", f"watchdog dropped below the floor to {tier!r} — NEVER allowed"
+    '';
+  };
 }

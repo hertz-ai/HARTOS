@@ -105,17 +105,41 @@ let
     fi
 ''}
     export HART_SHELL_URL="$URL"
+    # Shell-paint readiness marker (the session-supervisor's HUNG-tier guard
+    # consumes it): the host touches this once the WebView finishes loading its
+    # first frame. The supervisor passes HART_SHELL_READY_FLAG; default to the
+    # pinned /run/hart contract path so a bare launch (no supervisor) is harmless.
+    export HART_SHELL_READY_FLAG="''${HART_SHELL_READY_FLAG:-/run/hart/session/shell-ready}"
     exec ${cfg.package.python}/bin/python -c "
 import gi, os
 gi.require_version('Gtk', '3.0')
 gi.require_version('WebKit2', '4.1')
 from gi.repository import Gtk, WebKit2
 
+READY_FLAG = os.environ.get('HART_SHELL_READY_FLAG', '/run/hart/session/shell-ready')
+
+
+def _signal_painted():
+    '''Touch the first-paint marker the session-supervisor watches. Best-effort:
+    a missing /run/hart dir or a permission error must NEVER crash the shell —
+    the supervisor degrades safely (it escalates DOWN on a missing marker).'''
+    try:
+        os.makedirs(os.path.dirname(READY_FLAG), exist_ok=True)
+        with open(READY_FLAG, 'w'):
+            pass
+    except OSError:
+        pass
+
+
 class GlassShell(Gtk.Window):
     def __init__(self):
         super().__init__(title='HART OS')
         self.set_default_size(1280, 800)
         webview = WebKit2.WebView()
+        # Signal first paint to the supervisor when the page finishes loading
+        # (the WebView is realized + content presented). This is what tells the
+        # paint-watchdog this tier is HEALTHY so it is NOT dropped as a hang.
+        webview.connect('load-changed', self._on_load_changed)
         webview.load_uri(os.environ.get('HART_SHELL_URL', 'http://localhost:${toString ui.port}'))
         s = webview.get_settings()
         s.set_enable_javascript(True)
@@ -135,6 +159,10 @@ class GlassShell(Gtk.Window):
         # so left-clicks land on a focus-less surface and typing/caret never work
         # (dead UI on the live USB). Focus the actual web content, not the window.
         webview.grab_focus()
+
+    def _on_load_changed(self, _webview, event):
+        if event == WebKit2.LoadEvent.FINISHED:
+            _signal_painted()
 
     def _on_key(self, widget, event):
         from gi.repository import Gdk

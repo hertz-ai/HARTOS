@@ -76,6 +76,38 @@ let
   # the latch.
   unhealthyFlag = "/run/hart/compositor-unhealthy";
 
+  # ── Shell-paint readiness marker (the HUNG-tier guard) ──
+  # The crash-loop accounting below only catches a tier whose COMPOSITOR PROCESS
+  # EXITS. It is blind to the worse real-hardware failure the "boots to only a
+  # mouse pointer" regression exposed: the compositor is UP (sway's cursor shows)
+  # but the glass-shell layer-shell host never PAINTS and never exits — so the
+  # session hangs forever and `sh -c "$CMD"` blocks, never reaching the drop
+  # logic. The screen is stuck with no shell and no fallback.
+  #
+  # The fix is the shell-paint watchdog (selector loop below): the shell host
+  # signals "I painted my first frame" by touching this tmpfs marker; if the
+  # marker does NOT appear within shellPaintTimeoutSeconds while the compositor is
+  # still alive, the tier is HUNG and is dropped exactly like a crash (same
+  # record_crash → lower_tier → write_tier path, no parallel mechanism). It is in
+  # /run (tmpfs) so every boot starts with a clean slate, and the selector clears
+  # it before each launch so a previous tier's marker can never mask a hang.
+  #
+  # Contract for the shell host (cage hart-glass-shell + the GTK4 layer-shell
+  # host): touch this marker once the WebView presents its first frame. Absent
+  # that touch (e.g. an older shell build that does not yet write it), the
+  # watchdog still fires on timeout and escalates DOWN — which is the safe
+  # direction (a slow-but-fine tier degrades to a faster-painting one; it never
+  # strands the user on a blank higher tier). The cage FLOOR is exempt: it is the
+  # audited paint floor and there is nothing below it to drop to.
+  #
+  # The marker lives in a dedicated GROUP-WRITABLE dir (/run/hart/session, 0770
+  # hart hart) — NOT directly under /run/hart (0750, the `hart` group cannot
+  # write there). The shell host + selector run as hart-admin, which IS in the
+  # `hart` group, so both can create/clear the marker here. We do NOT widen the
+  # shared /run/hart mode (other consumers rely on 0750) — only this subdir.
+  sessionRunDir = "/run/hart/session";
+  readyFlag = "${sessionRunDir}/shell-ready";
+
   # Ordered tier ladder, highest → lowest. The LAST entry (cage) is the floor.
   # A tier is "available" only if its launcher command is non-null; an
   # unavailable higher tier falls straight through to the next so the screen
@@ -124,8 +156,10 @@ let
     LATCH="${latchFile}"
     WINDOW="${windowFile}"
     UNHEALTHY="${unhealthyFlag}"
+    READY="${readyFlag}"
     MAX_CRASHES=${toString sup.crashLoopCount}
     WINDOW_SECS=${toString sup.crashLoopWindowSeconds}
+    PAINT_TIMEOUT=${toString sup.shellPaintTimeoutSeconds}
     LADDER="${lib.concatStringsSep " " tierLadder}"
     FLOOR="cage"
 
@@ -240,11 +274,85 @@ let
     fi
 
     log "launching tier '$TIER': $CMD"
-    # Run the session in the foreground. When it EXITS (crash or clean),
-    # control returns here; greetd relaunches this selector for the next
-    # session attempt. On a crash we drop a tier and latch BEFORE returning.
+    # Clear any stale paint marker from a previous tier/boot BEFORE launch so it
+    # can never mask this tier's hang (it lives in /run tmpfs but a same-boot
+    # re-launch could leave a marker behind). The shell host re-touches it on its
+    # first painted frame.
+    rm -f "$READY" 2>/dev/null || true
+
+    # Tell the launched shell host WHERE to write its first-paint marker, so the
+    # host and this watchdog share ONE path (no hardcoded divergence). The host
+    # honours HART_SHELL_READY_FLAG and falls back to the same /run/hart default.
+    export HART_SHELL_READY_FLAG="$READY"
+
+    # Run the session in the BACKGROUND so the paint-watchdog can observe a HUNG
+    # tier (compositor up, shell never paints, process never exits). When it
+    # EXITS (crash or clean), `wait` below returns its rc; greetd then relaunches
+    # this selector for the next session attempt. On a crash OR a paint-timeout we
+    # drop a tier and latch BEFORE returning.
     start=$(date +%s)
-    sh -c "$CMD"
+    sh -c "$CMD" &
+    sesspid=$!
+
+    # ── Shell-paint watchdog ──────────────────────────────────────────────────
+    # Poll up to PAINT_TIMEOUT for one of three outcomes:
+    #   (a) the session process exits early  -> fall through to exit-accounting
+    #       (the EXISTING crash path handles it — unchanged);
+    #   (b) the shell touches $READY         -> it painted; stop watching and just
+    #       `wait` for the session (a healthy long-lived run);
+    #   (c) the timeout elapses with the process STILL ALIVE and NO $READY marker
+    #       -> the tier is HUNG. On a non-floor tier, kill it and treat it as a
+    #       crash so the SAME record_crash -> lower_tier -> write_tier drop runs.
+    # PAINT_TIMEOUT=0 disables the watchdog (pure crash-only behaviour).
+    painted=0
+    if [ "$PAINT_TIMEOUT" -gt 0 ]; then
+      waited=0
+      while [ "$waited" -lt "$PAINT_TIMEOUT" ]; do
+        if ! kill -0 "$sesspid" 2>/dev/null; then
+          break                       # (a) session already exited — crash path
+        fi
+        if [ -e "$READY" ]; then
+          painted=1                    # (b) shell painted its first frame
+          break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+      done
+
+      if [ "$painted" -eq 0 ] && kill -0 "$sesspid" 2>/dev/null; then
+        # (c) HUNG: compositor process alive but no first-paint within the budget.
+        if [ "$TIER" != "$FLOOR" ]; then
+          log "tier '$TIER' is HUNG (compositor up, no first paint in ''${PAINT_TIMEOUT}s) — killing + treating as a crash"
+          kill -TERM "$sesspid" 2>/dev/null || true
+          sleep 2
+          kill -KILL "$sesspid" 2>/dev/null || true
+          wait "$sesspid" 2>/dev/null || true
+          # Reuse the EXACT crash-drop path (no parallel mechanism): record this
+          # hang as a crash and, on threshold, drop one tier + latch. A hung tier
+          # is at least as bad as a crashed one, so it counts toward the same
+          # window — a tier that hangs MAX_CRASHES times escalates DOWN.
+          if record_crash; then
+            nxt=$(lower_tier "$TIER")
+            log "paint-watchdog crash-loop on '$TIER' ($MAX_CRASHES hangs/crashes in ''${WINDOW_SECS}s) — dropping to '$nxt' and latching"
+            write_tier "$nxt"
+            clear_window
+          fi
+          # Return to greetd; it relaunches the selector, which now reads the
+          # (possibly) lowered latch.
+          exit 0
+        else
+          # The floor itself hasn't signalled paint yet — never drop below it.
+          # Let it keep running (cage is the audited paint floor); just stop
+          # watching and wait normally. The screen still paints by the floor's
+          # own contract; a missing marker here only means an older floor build.
+          log "floor ('$FLOOR') has not signalled paint within ''${PAINT_TIMEOUT}s — staying on the floor (cannot drop below it)"
+        fi
+      fi
+    fi
+
+    # Healthy/painted OR floor: wait for the session to exit normally, then run
+    # the SAME exit-accounting as before (crash-on-early-exit / clean logout).
+    wait "$sesspid"
     rc=$?
     end=$(date +%s)
     ran=$((end - start))
@@ -305,6 +413,22 @@ in
       '';
     };
 
+    shellPaintTimeoutSeconds = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 20;
+      description = ''
+        Shell-paint watchdog budget (seconds). After a tier's compositor is
+        launched, the glass-shell host must signal its first painted frame (touch
+        /run/hart/session/shell-ready) within this many seconds. If it does NOT — while
+        the compositor process is still alive — the tier is treated as HUNG and
+        dropped one rung exactly like a crash (same crash-loop accounting). This
+        catches the "compositor up but shell never paints / never exits" failure
+        the bare crash-on-exit detection is blind to (the real-hardware
+        pointer-only boot). Set to 0 to disable the watchdog (crash-only
+        behaviour). The cage FLOOR is never dropped by this watchdog.
+      '';
+    };
+
     cageCommand = lib.mkOption {
       type = lib.types.str;
       default = "hart-shell-session";
@@ -353,6 +477,10 @@ in
     systemd.tmpfiles.rules = [
       "d /var/lib/hart 0750 hart hart -"
       "d /run/hart      0750 hart hart -"
+      # Group-writable so the shell host (hart-admin, in the `hart` group) can
+      # write the first-paint marker the paint-watchdog consumes. Scoped subdir —
+      # the shared /run/hart stays 0750.
+      "d /run/hart/session 0770 hart hart -"
     ];
 
     # Enabling greetd (below) pulls in upstream nixos graphical-desktop.nix,
