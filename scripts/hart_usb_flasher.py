@@ -343,7 +343,12 @@ def human(n):
 
 # ───────────────────────── release parts ─────────────────────────
 def list_parts(gh, tag, variant):
-    """Return sorted [{name, id, size}] for <variant> ISO parts of <tag>."""
+    """Return sorted [{name, id, size}] for <variant> ISO parts of <tag>.
+
+    A missing/unpublished tag makes `gh api` 404 and emit an error object
+    ({"message":"Not Found",...}) on stdout instead of asset lines. Guard the
+    dict access so that case yields an empty list (=> a clean "no parts" error
+    in flash()) rather than a KeyError, and so a malformed line never aborts."""
     r = _run([gh, "api", "repos/%s/releases/tags/%s" % (REPO, tag),
               "--jq", ".assets[] | {name:.name, id:.id, size:.size, state:.state}"])
     parts = []
@@ -351,8 +356,12 @@ def list_parts(gh, tag, variant):
         line = line.strip()
         if not line:
             continue
-        a = json.loads(line)
-        if variant in a["name"] and ".part-" in a["name"]:
+        try:
+            a = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        name = a.get("name") if isinstance(a, dict) else None
+        if name and variant in name and ".part-" in name:
             parts.append(a)
     parts.sort(key=lambda a: a["name"])
     return parts
@@ -451,13 +460,31 @@ class _WinExclusiveWriter:
                                        ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD]
         k.CloseHandle.argtypes = [wintypes.HANDLE]
         self.invalid = wintypes.HANDLE(-1).value
-        # GENERIC_READ|WRITE, FILE_SHARE_NONE (exclusive), OPEN_EXISTING
-        self.h = k.CreateFileW(r"\\.\PhysicalDrive%d" % disk_number,
-                               0xC0000000, 0, None, 3, 0, None)
+        # GENERIC_READ|WRITE, FILE_SHARE_NONE (exclusive), OPEN_EXISTING.
+        # Right after diskpart `clean` (or when a clean FAILED and Windows is
+        # mid-rescan of the partition table) the volume manager briefly holds
+        # the drive, so the first exclusive open loses with ERROR_SHARING_
+        # VIOLATION (32) / ERROR_NOT_READY (21). The grip clears within a few
+        # seconds — retry with backoff instead of aborting the whole flash.
+        # (Verified: a bare exclusive open succeeds seconds after the flasher's
+        # first attempt failed err 32 on a Cruzer Blade whose `clean` was
+        # refused with "Incorrect function".)
+        _TRANSIENT = (32, 21, 5)        # SHARING_VIOLATION, NOT_READY, ACCESS_DENIED
+        last_err = 0
+        for attempt in range(6):
+            self.h = k.CreateFileW(r"\\.\PhysicalDrive%d" % disk_number,
+                                   0xC0000000, 0, None, 3, 0, None)
+            if self.h != self.invalid:
+                break
+            last_err = ctypes.get_last_error()
+            if last_err not in _TRANSIENT:
+                break
+            time.sleep(2 + attempt)     # 2,3,4,5,6s — let the volume manager release
         if self.h == self.invalid:
             raise RuntimeError("exclusive open of PhysicalDrive%d failed (err %d) — "
-                               "is the disk still mounted?"
-                               % (disk_number, ctypes.get_last_error()))
+                               "is the disk still mounted? (a re-plug or reboot "
+                               "resets a stick whose controller refuses writes)"
+                               % (disk_number, last_err))
 
     def write_at(self, byte_offset, fobj):
         ctypes, wintypes, k = self.ctypes, self.wintypes, self.k

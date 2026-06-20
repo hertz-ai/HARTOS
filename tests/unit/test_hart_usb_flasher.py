@@ -262,3 +262,27 @@ def test_self_heal_not_invoked_when_disk_already_present(monkeypatch):
                         lambda log=None: healed.__setitem__("n", healed["n"] + 1) or True)
     _, candidates = flasher.list_disks_with_self_heal(log=lambda m: None)
     assert healed["n"] == 0 and [d["number"] for d in candidates] == [1]
+
+
+def test_list_parts_missing_tag_returns_empty_not_keyerror(monkeypatch):
+    """A missing/unpublished tag makes `gh api` 404 and emit an error object on
+    stdout. `list_parts` must return [] (=> a clean "no parts" error downstream)
+    rather than crash with KeyError: 'name' on the error JSON."""
+    err_obj = '{"message":"Not Found","documentation_url":"...","status":"404"}'
+    monkeypatch.setattr(flasher, "_run", lambda cmd, **kw: _CP(err_obj))
+    assert flasher.list_parts("gh", "nightly-does-not-exist", "desktop") == []
+
+
+def test_list_parts_parses_real_assets(monkeypatch):
+    """Well-formed asset lines for the desktop variant are kept + sorted by name;
+    non-part assets (sha256/torrent) and other variants are dropped."""
+    lines = "\n".join([
+        '{"name":"hart-os-1.0.0-desktop-x86_64-linux.iso.part-01","id":2,"size":20,"state":"uploaded"}',
+        '{"name":"hart-os-1.0.0-desktop-x86_64-linux.iso.part-00","id":1,"size":10,"state":"uploaded"}',
+        '{"name":"hart-os-1.0.0-desktop-x86_64-linux.iso.sha256","id":9,"size":39,"state":"uploaded"}',
+        '{"name":"hart-os-1.0.0-server-x86_64-linux.iso.part-00","id":7,"size":99,"state":"uploaded"}',
+    ])
+    monkeypatch.setattr(flasher, "_run", lambda cmd, **kw: _CP(lines))
+    parts = flasher.list_parts("gh", "nightly-x", "desktop")
+    assert [p["name"].split(".part-")[1] for p in parts] == ["00", "01"]   # sorted, parts only
+    assert all("desktop" in p["name"] for p in parts)
