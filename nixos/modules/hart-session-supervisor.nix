@@ -20,12 +20,16 @@
 # WHAT IT DOES:
 #   - greetd (out-of-process display manager) launches ONE selector wrapper.
 #   - The wrapper reads the latch /var/lib/hart/session-tier
-#       (values: hart-comp | sway | cage   — the Phase-0 state-file contract),
-#     defaulting to cage when absent/unreadable.
-#   - It launches the chosen tier's session command:
-#       Tier 1  hart-comp  (Smithay; RESERVED — only when a real session is
-#                            wired by Phase 3; until then it falls straight
-#                            through to the next tier so this is never blank)
+#       (values: hart-comp | sway | cage   — the Phase-0 state-file contract).
+#     When the latch is ABSENT/unreadable (a fresh boot), it seeds the START
+#     tier (the `startTier` option, default `hart-comp` = the head of the
+#     ladder) so the boot tries the BEST tier first and only DEGRADES on a real
+#     failure. (Set startTier=cage to restore the old fail-safe-to-floor start.)
+#   - It launches the chosen tier's session command — best tier first, falling
+#     back on failure (crash OR shell-paint timeout):
+#       Tier 1  hart-comp  (Smithay/Rust, --backend drm; the START tier — runs
+#                            the SAME GTK4 layer-shell glass host as sway; an
+#                            unavailable/crashing/hung Tier-1 drops to Tier-2)
 #       Tier 2  sway       (proven wlroots WM running the SAME glass shell)
 #       Tier 3  cage       (the EXACT audited never-fail paint floor that
 #                            ships today — hart-liquid-ui.nix's hart-shell-
@@ -50,11 +54,15 @@
 #     session selection.
 #   - Latch is operator-clearable.
 #   - Cage Tier-3 remains the audited floor; the supervisor cannot drop
-#     below it.
-#   - defaultSession STAYS cage: this module is OPT-IN (enable = false) until
-#     VM-proven (WSL-QEMU loop-kill fault injection). When disabled it is a
-#     pure no-op and the GDM + hart-shell session in desktop.nix is
-#     byte-identical to before.
+#     below it (the watchdog/crash-loop never latches below `cage`).
+#   - The module is OPT-IN (enable = false default). When DISABLED it is a pure
+#     no-op and the GDM + hart-shell session in desktop.nix is byte-identical to
+#     before. When ENABLED the supervisor OWNS session selection (greetd replaces
+#     GDM) and drives the ladder — starting at `startTier` (default Tier-1) and
+#     degrading to the cage floor on failure. The displayManager-level
+#     defaultSession is meaningless under greetd's command model (greetd runs the
+#     selector, not a named session), so the desktop's cage-pin no longer gates
+#     the boot tier — the supervisor does.
 #
 # VM-GATED: every claim here (greetd relaunch, crash-loop drop, latch across
 #   boot, lands-on-cage) MUST be proven in a CI nixosTest / local QEMU-KVM —
@@ -162,20 +170,28 @@ let
     PAINT_TIMEOUT=${toString sup.shellPaintTimeoutSeconds}
     LADDER="${lib.concatStringsSep " " tierLadder}"
     FLOOR="cage"
+    # The HIGHEST tier a FRESH (un-latched) boot starts at — so the ladder tries
+    # the BEST tier first and only degrades on a real crash/hang. A drop still
+    # latches the LOWER tier across boot; this is purely the un-latched default.
+    START="${sup.startTier}"
 
     log() { echo "[hart-session-supervisor] $*" >&2; }
 
     # ── Read the tier to launch (SESSION_TIER_CONTRACT.md §3 rule 1) ──
     #   - latch PRESENT + valid value (hart-comp|sway|cage) -> that latched tier
-    #   - latch MISSING / unreadable / invalid token        -> the FLOOR `cage`
+    #   - latch MISSING / unreadable / invalid token        -> the START tier
+    #     (startTier option; default `hart-comp` = the head of the ladder)
     #
-    # "Missing ⇒ cage" is fail-safe by construction: we NEVER boot a higher
-    # unproven tier just because the latch is absent or torn. To RE-ARM Tier-1
-    # the operator runs `hartctl session reset-tier`, which WRITES `hart-comp`
-    # (it does not merely delete the file) — §4. So a fresh image ships with the
-    # supervisor opt-in + the latch absent ⇒ cage floor, exactly the current
-    # defaultSession behaviour, until an operator (or Phase 3 default) arms a
-    # higher tier.
+    # A FRESH boot starts at the BEST tier ($START, default Tier-1 hart-comp) and
+    # the ladder only DEGRADES on a real failure — a crash or a paint-timeout —
+    # each of which writes the LOWER tier to the latch (which then persists across
+    # boot). The supervisor owns the never-blank guarantee, so starting high is
+    # safe: an unavailable/crashing/hung higher tier falls straight through to
+    # sway then the cage floor (and can never drop below cage). Set startTier=cage
+    # to restore the old "missing ⇒ floor, never attempt a higher tier unless an
+    # operator arms it" behaviour. `hartctl session reset-tier` still re-arms the
+    # top rung (writes hart-comp) so a transient Tier-1 bug never permanently
+    # masks as a downgrade.
     read_tier() {
       if [ -r "$LATCH" ]; then
         _rtv=$(cat "$LATCH" 2>/dev/null | tr -d '[:space:]')
@@ -183,7 +199,7 @@ let
           hart-comp|sway|cage) printf '%s' "$_rtv"; return 0 ;;
         esac
       fi
-      printf '%s' "$FLOOR"
+      printf '%s' "$START"
     }
 
     # ── Atomically write the latch (latches across boot) ──
@@ -413,6 +429,30 @@ in
       '';
     };
 
+    startTier = lib.mkOption {
+      type = lib.types.enum [ "hart-comp" "sway" "cage" ];
+      default = "hart-comp";
+      description = ''
+        The HIGHEST tier a FRESH boot starts at — the top rung the ladder
+        attempts before the watchdog/crash-loop drops it. When the latch is
+        ABSENT / unreadable / invalid (a clean image, a wiped state dir, a torn
+        write), the selector seeds it to this tier instead of the cage floor, so
+        the boot tries the BEST tier first and only DEGRADES on a real failure
+        (a crash or a paint-timeout). A drop still LATCHES across boot, and
+        `hartctl session reset-tier` re-arms the top rung; this option only sets
+        where an UN-latched boot begins.
+
+        Default `hart-comp` (Tier-1, the head of the ladder): the supervisor owns
+        the never-blank guarantee, so starting high is safe — an unavailable or
+        crashing/hung higher tier falls straight through to sway then the cage
+        floor (the supervisor can never drop below cage). Set to `cage` for the
+        old fail-safe-to-floor behaviour (never attempt a higher tier unless an
+        operator arms it). `sway` starts at Tier-2. The chosen tier must still be
+        AVAILABLE (its launch command non-null) or the selector skips it down the
+        ladder exactly as it does for a latched-but-unavailable tier.
+      '';
+    };
+
     shellPaintTimeoutSeconds = lib.mkOption {
       type = lib.types.ints.unsigned;
       default = 20;
@@ -490,7 +530,15 @@ in
     # supervisor that introduces greetd→graphical-desktop; the value is identical
     # (524288) so behaviour is unchanged — only the priority tie is broken. Found
     # by the wired-in nixosTest's CI eval (the gate working as intended).
-    boot.kernel.sysctl."fs.inotify.max_user_watches" = lib.mkForce 524288;
+    #
+    # PRIORITY 90 (mkOverride 90), NOT mkForce(50): on the real desktop closure
+    # hart-kernel.nix ALSO sets this option, with mkForce(50) = 1048576. Two
+    # mkForces would themselves collide. Using mkOverride 90 (weaker than
+    # mkForce(50) but stronger than the two mkDefaults at 1000) lets hart-kernel's
+    # mkForce win cleanly WHEN it is enabled (desktop: 1048576 applies), while
+    # still breaking the mkDefault tie on a supervisor node that has NO hart-kernel
+    # (the nixosTest nodes). One value, no collision either way.
+    boot.kernel.sysctl."fs.inotify.max_user_watches" = lib.mkOverride 90 524288;
 
     # ── greetd: the out-of-process supervisor (NOT a Python thread) ──
     # greetd relaunches its session command whenever the session exits, which

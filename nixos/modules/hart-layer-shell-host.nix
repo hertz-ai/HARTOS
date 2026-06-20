@@ -351,15 +351,27 @@ in
     # full never-fail ladder). This module NEVER assigns defaultSession.
     services.displayManager.sessionPackages = [ hostSession ];
 
-    # ── Integration contract with the Phase-1 tier-drop supervisor ──
-    # hart-session-supervisor.nix's `swayCommand` (Tier-2 launcher) can be pointed
-    # at THIS module's `hart-glass-shell-gtk4-session` once the GTK4 host's broken-
-    # GPU paint proof passes in CI — giving Tier-2 a TRUE layer-shell desktop
-    # (the GTK3 cage stays Tier-3 underneath either way). We do NOT edit the
-    # supervisor here (separate module/owner); the operator/config wires
-    # `hart.sessionSupervisor.swayCommand = "hart-glass-shell-gtk4-session"` after
-    # the proof. Floor invariant the supervisor honors: a GTK4-host crash can
-    # NEVER drop below the cage GTK3 Tier-3 floor (the Phase-4 nixosTest proves a
-    # crash drops to cage and the shell still paints).
+    # ── Integration with the Phase-1 tier-drop supervisor: BE Tier-2 ──
+    # Repoint the supervisor's Tier-2 `swayCommand` at THIS module's
+    # `hart-glass-shell-gtk4-session` (sway hosting the GTK4 + WebKitGTK-6.0 +
+    # gtk4-layer-shell host) so Tier-2 is a TRUE layer-shell desktop running the
+    # SAME glass host as Tier-1 hart-comp — not bare sway and not the GTK3 cage
+    # fullscreen window. The cage GTK3 host stays Tier-3 underneath either way; a
+    # GTK4-host crash OR hang (the shell-paint watchdog) drops to it (the Phase-4 +
+    # paint-watchdog nixosTests prove the drop lands on cage and the shell paints).
+    #
+    # mkOverride 900 (stronger than mkDefault=1000) so this wins over BOTH the
+    # supervisor's bare-sway option default AND hart-sway-tier1.nix's mkDefault
+    # `hart-sway-session` — when the GTK4 layer-shell host is enabled it IS the
+    # Tier-2 session. An explicit operator `hart.sessionSupervisor.swayCommand`
+    # (priority < 900, e.g. mkForce) still wins. Gated on the supervisor being
+    # enabled so this is a pure no-op when the ladder is off (the supervisor option
+    # always exists — its module is imported unconditionally — but writing the
+    # value only matters when greetd drives the boot).
+    hart.sessionSupervisor.swayCommand = lib.mkIf cfg.sessionSupervisor.enable
+      (lib.mkOverride 900 "${sessionLauncher}/bin/hart-glass-shell-gtk4-session");
+
+    # Floor invariant the supervisor honors: a GTK4-host crash/hang can NEVER drop
+    # below the cage GTK3 Tier-3 floor.
   };
 }

@@ -231,12 +231,20 @@ let
     # hart-comp owns DRM/KMS scanout + the libinput seat; it creates its OWN wayland-N
     # socket. We run it in the BACKGROUND, wait for that socket to appear (it sets
     # WAYLAND_DISPLAY in its own env, but a sibling child needs the name explicitly), and
-    # launch the canonical glass shell as its layer-shell client — exactly how sway
-    # Tier-2 launches `hart-glass-shell` as ITS client (the SINGLE glass-shell renderer,
-    # no parallel client). HART_COMP_NO_TEST_CLIENT suppresses the dev auto-foot client.
+    # launch the SAME GTK4 layer-shell glass host as Tier-2 sway as its client — the
+    # SINGLE glass-shell renderer, no parallel client.
+    # HART_COMP_NO_TEST_CLIENT suppresses the dev auto-foot client.
     : "''${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
     export XDG_RUNTIME_DIR
     export HART_COMP_NO_TEST_CLIENT=1
+
+    # Shell-paint readiness marker (the session-supervisor's HUNG-tier guard): the
+    # glass host touches this once its WebView presents its first frame, telling the
+    # paint-watchdog this Tier-1 surface is HEALTHY so it is NOT dropped as a hang.
+    # The supervisor passes HART_SHELL_READY_FLAG into the session env; default to
+    # the pinned /run/hart contract path so a bare (supervisor-less) launch is
+    # harmless. We inherit + re-export it so the glass-host child sees it.
+    export HART_SHELL_READY_FLAG="''${HART_SHELL_READY_FLAG:-/run/hart/session/shell-ready}"
 
     ${hartCompPkg}/bin/hart-comp --backend drm ${lib.optionalString (!(ui.preferHardwareGL or false)) "--force-software"} &
     HART_COMP_PID=$!
@@ -256,10 +264,20 @@ let
 
     if [ -n "$SHELL_SOCK" ] && [ -S "$SHELL_SOCK" ]; then
       export WAYLAND_DISPLAY="$(basename "$SHELL_SOCK")"
-      if command -v hart-glass-shell >/dev/null 2>&1; then
+      # Prefer the GTK4 wlr-layer-shell glass host (hart.layerShellHost) — the
+      # SAME host Tier-2 sway runs, anchored BACKGROUND (exclusive zone 0) so it
+      # IS the desktop and native toplevels map above it. It touches the
+      # HART_SHELL_READY_FLAG first-paint marker, so the supervisor's shell-paint
+      # watchdog covers Tier-1 exactly as it covers Tier-2 (compositor up but no
+      # first frame within the budget => HUNG => drop to sway then cage). Fall back
+      # to the GTK3 cage `hart-glass-shell` (also touches the marker) if the GTK4
+      # host is not in the closure — never a parallel renderer, just degrade.
+      if command -v hart-glass-shell-gtk4 >/dev/null 2>&1; then
+        hart-glass-shell-gtk4 &
+      elif command -v hart-glass-shell >/dev/null 2>&1; then
         hart-glass-shell &
       else
-        echo "hart-comp-session: hart-glass-shell not on PATH (enable hart.liquidUI)" >&2
+        echo "hart-comp-session: no glass-shell host on PATH (enable hart.liquidUI / hart.layerShellHost)" >&2
       fi
     else
       echo "hart-comp-session: hart-comp did not create a wayland socket — exiting so the supervisor drops a tier" >&2

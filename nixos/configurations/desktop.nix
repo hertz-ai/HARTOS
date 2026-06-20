@@ -173,6 +173,43 @@ in
       renderer = "webkit";
     };
 
+    # ── Supervisor-managed compositor TIER LADDER (the never-blank boot) ──
+    # The out-of-process session tier-drop supervisor (greetd) OWNS the boot
+    # session: it starts at the BEST tier and falls back on failure —
+    #   Tier-1 hart-comp (Smithay/Rust, --backend drm)
+    #     → Tier-2 sway (the hart-glass-gtk4 layer-shell session)
+    #       → Tier-3 cage (hart-shell, the audited never-fail paint floor).
+    # A crash OR a shell-paint timeout drops + LATCHES one tier down; cage is the
+    # floor the supervisor can never drop below. This REPLACES the crude fixed
+    # cage-pin (68ce3c3 `defaultSession = "hart-shell"`) with the real tiered
+    # design — see the session block lower in this file.
+    sessionSupervisor = {
+      enable = true;
+      # Fresh/un-latched boots start at Tier-1 (hart-comp). The supervisor owns
+      # the never-blank guarantee, so an unavailable/crashing/hung Tier-1 falls
+      # straight through to sway then the cage floor. (Default already hart-comp;
+      # stated explicitly so the boot tier is visible at the desktop config.)
+      startTier = "hart-comp";
+    };
+
+    # Tier-1: HART-comp, the AI-native Smithay/Rust compositor (--backend drm).
+    # Enabling it puts the hart-comp package + the `hart-comp-session` launcher in
+    # the desktop closure and arms the supervisor's Tier-1 rung (compCommand via
+    # mkDefault in hart-comp.nix). hart-comp reuses the SAME GTK4 layer-shell glass
+    # host as Tier-2 sway, so it satisfies the same shell-paint watchdog marker.
+    comp.enable = true;
+    # HART-comp is the FIRST Rust-in-Nix build; its assertion requires the
+    # precedent module (claw-cli) to prove the pinned toolchain resolves a real
+    # crate graph FIRST. Enable it so `hart.comp.enable` is coherent.
+    rustPrecedent.enable = true;
+
+    # Tier-2: sway running the canonical glass shell + the swaymsg WM shim the
+    # brain drives when HART-comp is absent. Registers the sway session + the
+    # supervisor's Tier-2 rung. The supervisor's swayCommand is repointed to the
+    # GTK4 layer-shell host session (the `hart-glass-gtk4` session) lower in this
+    # file so Tier-2 is a TRUE layer-shell desktop, not bare sway.
+    swayTier1.enable = true;
+
     # App Bridge: Android ↔ Linux ↔ Windows cross-subsystem routing
     appBridge = {
       enable = true;
@@ -594,28 +631,42 @@ in
   #    uses, merely started eagerly. (tty3..tty6 stay on-demand via NAutoVTs.)
   systemd.services."autovt@tty2".wantedBy = [ "multi-user.target" ];
 
-  # ─── Default session = the cage glass shell (the PROVEN painting floor) ───
-  # REVERTED from the sway-Tier-2 "hart-glass-gtk4" default (ff02e48) back to the
-  # cage "hart-shell" session. ff02e48 flipped the desktop default onto the GTK4
-  # layer-shell host running under sway (Tier-2); on REAL HARDWARE that booted to
-  # ONLY A MOUSE POINTER for a very long time — sway came up (its cursor showed)
-  # but the GTK4 + WebKit glass-shell layer-shell host never painted, and the
-  # session-supervisor did NOT fall back because sway was not CRASHING (the shell
-  # host merely HUNG). Stuck on Tier-2 with no shell and no console.
+  # ─── Boot session = the SUPERVISOR-MANAGED TIER LADDER (not a fixed default) ───
+  # The crude fixed cage-pin (68ce3c3: `services.displayManager.defaultSession =
+  # lib.mkForce "hart-shell"`) is REMOVED in favour of the real tiered design the
+  # architecture mandates. With hart.sessionSupervisor.enable = true (set in the
+  # hart block above), greetd REPLACES GDM and runs the tier-drop SELECTOR as the
+  # boot session — so the supervisor, not a fixed defaultSession, owns which tier
+  # boots:
   #
-  # The cage "hart-shell" session is the audited, HW-proven never-fail paint floor
-  # (its earlier interactivity bugs — keyboard focus, tap-to-click, empty panels —
-  # are already fixed). It stays the DEFAULT until the sway/Tier-2 glass-shell host
-  # is verified to PAINT on real hardware (the "only pointer" regression above).
+  #   Tier-1 hart-comp (Smithay/Rust, --backend drm; the START tier)
+  #     → Tier-2 sway   (the hart-glass-gtk4 layer-shell session, wired below)
+  #       → Tier-3 cage (hart-shell, the audited never-fail paint floor — the
+  #                       supervisor can NEVER drop below it).
   #
-  # sway / hart-glass-gtk4 (Tier-2) + hart-comp (Tier-1) stay REGISTERED as
-  # greeter-selectable sessions and as supervisor rungs (the never-fail ladder);
-  # ONLY the DEFAULT changes back to cage. The shell-paint watchdog added to the
-  # tier-drop supervisor now also escalates a HUNG (not just a crashed) higher tier
-  # down toward this cage floor — but the cage default means a fresh boot lands on
-  # the proven floor with zero dependence on that escalation. Re-flip = one line.
+  # The ladder tries the BEST tier first and DROPS one rung on a real failure —
+  # a crash OR the shell-paint watchdog firing (compositor up but no first frame
+  # within shellPaintTimeoutSeconds; the "only-a-pointer" hang ff02e48 exposed).
+  # A drop LATCHES across boot; `hartctl session reset-tier` re-arms Tier-1. The
+  # supervisor's config sets `defaultSession = "hart-shell"` for the floor, which
+  # is moot under greetd's command model — greetd runs the selector, not a named
+  # session. So we do NOT (and must not) ALSO mkForce defaultSession here (two
+  # equal-priority mkForces would collide); the supervisor block owns it.
+  #
+  # HONEST HW CAVEAT: the GTK4 glass-shell host that Tier-1 + Tier-2 share still
+  # HANGS on real hardware (the pointer-only first-paint bug). Until that is
+  # fixed, a real boot will TRY Tier-1 (hart-comp), likely hang ~shellPaint
+  # seconds, DROP to Tier-2 (sway, same host, hang again), then DROP to Tier-3
+  # cage (the GTK3 host that paints). The ladder degrades safely to the proven
+  # floor — it is never a blank screen — but Tier-1/Tier-2 only become the live
+  # session once the GTK4 host's on-HW paint is fixed (needs the on-HW journal,
+  # now reachable via the recovery TTY added in b97f1ae).
   hart.layerShellHost.enable = true;
-  services.displayManager.defaultSession = lib.mkForce "hart-shell";
+  # Tier-2 = the GTK4 layer-shell glass host UNDER sway (the `hart-glass-gtk4`
+  # session), not bare sway. The layer-shell-host module repoints the supervisor's
+  # swayCommand to its `hart-glass-shell-gtk4-session` launcher (mkOverride, so it
+  # wins over both the bare-sway option default and swayTier1's mkDefault). This
+  # gives Tier-2 a TRUE layer-shell desktop running the same glass host as Tier-1.
 
   # Audio: PipeWire bridges all subsystems (Linux, Android, Wine)
   services.pipewire = {
