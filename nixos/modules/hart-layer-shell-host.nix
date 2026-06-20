@@ -116,6 +116,23 @@ let
     # cannot paint never takes the session down. SAME contract as the cage floor;
     # this is the GTK4 path's OWN broken-GPU proof, not an inherited assumption.
     ${lib.optionalString (!ui.preferHardwareGL) "export WEBKIT_DISABLE_DMABUF_RENDERER=1\nexport WEBKIT_DISABLE_COMPOSITING_MODE=1"}
+    # ── GTK4/GSK SOFTWARE RENDERER (the real-HW paint-hang fix) ──────────────────
+    # THE difference between this GTK4 host and the GTK3 cage floor: GTK4 draws via
+    # GSK, whose DEFAULT renderer is GL (gl/ngl) — it spins up its OWN GL context on
+    # the layer-shell surface, SEPARATE from WebKit's (the WEBKIT_DISABLE_* above
+    # only governs WebKitGTK's compositor, NOT GTK4's own GSK renderer). On llvmpipe
+    # that GL context resolves to software GL and PAINTS (why the CI nixosTest +
+    # this host both work there); on a REAL GPU driver GSK's GL/EGL/GBM context
+    # creation HANGS on the layer-shell surface, so the compositor cursor shows on a
+    # black screen and the first frame never presents (the "pointer-only" boot).
+    # The GTK3 cage floor is IMMUNE because GTK3 has no GSK — it paints via cairo
+    # directly. Pin GSK to the cairo (software) renderer + disable GDK's GL so the
+    # GTK4 host paints on ANY GPU, exactly the never-fail floor the cage/sway/hart-
+    # comp paths hold. Gated on !preferHardwareGL like the WEBKIT_DISABLE_* belt, so
+    # the hardware-GL opt-in still gets GSK's GL renderer. Software GL forced in the
+    # session launcher (LIBGL_ALWAYS_SOFTWARE) is the belt for the hardware-GL case;
+    # GSK_RENDERER=cairo here is the suspenders that NEVER touches a GL context.
+    ${lib.optionalString (!ui.preferHardwareGL) "export GSK_RENDERER=cairo\nexport GDK_GL=disable"}
     export HART_SHELL_URL="$URL"
     # Shell-paint readiness marker (the session-supervisor's HUNG-tier guard): the
     # GTK4 host touches this once the WebView finishes its first load, telling the
@@ -223,6 +240,22 @@ class GlassShellLayer:
         # compositor does NOT auto-focus us, so without this grab left-clicks
         # land on a focus-less surface and typing/caret never work.
         self._webview.grab_focus()
+
+    def _on_load_changed(self, _webview, event):
+        '''Touch the first-paint marker once the WebView finishes its first load.
+
+        This is the GTK4/WebKit-6.0 mirror of the GTK3 cage floor's
+        _on_load_changed. WITHOUT it the connected 'load-changed' handler does not
+        exist, _signal_painted() is NEVER called, /run/hart/session/shell-ready
+        never fires, and the session-supervisor's paint-watchdog times this Tier-2
+        surface out as HUNG and drops to the cage floor — the EXACT 'shell-ready
+        never fires' half of the pointer-only regression. LoadEvent.FINISHED is the
+        WebKitGTK-6.0 enum (same name as the GTK3 WebKit2 binding). Re-grab focus on
+        first paint so typing works once the page's JS has run (mirrors the cage
+        floor + the m2 WSL reference host).'''
+        if event == WebKit.LoadEvent.FINISHED:
+            _signal_painted()
+            self._webview.grab_focus()
 
     def _on_key(self, _ctrl, keyval, _keycode, _state):
         from gi.repository import Gdk

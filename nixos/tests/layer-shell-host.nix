@@ -134,6 +134,32 @@ in
               "GTK4 host missing WEBKIT_DISABLE_COMPOSITING_MODE — would crash on llvmpipe"
           assert "HardwareAccelerationPolicy.NEVER" in host_src, \
               "GTK4 host must pin HardwareAccelerationPolicy.NEVER (broken-GPU floor)"
+          # GTK4 draws via GSK, whose DEFAULT renderer is GL — a SEPARATE GL context
+          # from WebKit's, NOT covered by WEBKIT_DISABLE_* above. On a real GPU that
+          # GSK GL/EGL/GBM context hangs on the layer-shell surface (pointer-only
+          # black screen); llvmpipe resolves it to software GL so it paints (why this
+          # very test passes). Pin GSK to the cairo software renderer + disable GDK
+          # GL so the GTK4 host paints on ANY GPU — the GTK3 cage floor is immune
+          # only because it has no GSK (cairo-direct). This is the real-HW paint-hang
+          # fix; without it the host works on llvmpipe but black-screens on real HW.
+          assert "GSK_RENDERER=cairo" in host_src, \
+              "GTK4 host missing GSK_RENDERER=cairo — GSK's GL renderer hangs on a real GPU"
+          assert "GDK_GL=disable" in host_src, \
+              "GTK4 host missing GDK_GL=disable — GDK would still create a GL context"
+
+      with subtest("GTK4 host wires the first-paint marker (load-changed -> shell-ready)"):
+          # The session-supervisor's paint-watchdog drops a tier to the cage floor
+          # if /run/hart/session/shell-ready is not touched within its budget. The
+          # host connects 'load-changed' to _on_load_changed; that handler MUST exist
+          # and call _signal_painted() on LoadEvent.FINISHED, or the marker never
+          # fires and a HEALTHY GTK4 tier is wrongly dropped as HUNG (the other half
+          # of the pointer-only regression).
+          assert "def _on_load_changed" in host_src, \
+              "GTK4 host connects load-changed but never DEFINES _on_load_changed — marker never fires"
+          assert "_signal_painted()" in host_src, \
+              "GTK4 host never CALLS _signal_painted() — shell-ready marker never fires, watchdog drops the tier"
+          assert "WebKit.LoadEvent.FINISHED" in host_src, \
+              "GTK4 host must signal paint on WebKit.LoadEvent.FINISHED (first-frame marker)"
 
       # ── 3. The GTK4 toolkit GI typelibs are present so the host can launch ──
       with subtest("GTK4 host GI typelibs present (Gtk-4.0 + WebKit-6.0 + Gtk4LayerShell-1.0)"):

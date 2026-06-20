@@ -165,6 +165,42 @@ class TestGtk4SoftwareGLFloor:
         # a few fps, the exact lesson the GTK3 floor encodes, re-applied on GTK4.
         assert "HardwareAccelerationPolicy.NEVER" in src
 
+    def test_forces_gsk_software_renderer_the_real_hw_paint_fix(self, src):
+        # THE real-HW paint-hang fix. GTK4 draws via GSK, whose DEFAULT renderer is
+        # GL — a SEPARATE GL context from WebKit's, NOT covered by WEBKIT_DISABLE_*.
+        # On a real GPU that GSK GL/EGL/GBM context hangs on the layer-shell surface
+        # (pointer-only black screen + shell-ready never fires); on llvmpipe it
+        # resolves to software GL and paints (why the CI nixosTest passes). The GTK3
+        # cage floor is immune ONLY because it has no GSK (cairo-direct). Pin GSK to
+        # the cairo software renderer + disable GDK GL so the GTK4 host paints on ANY
+        # GPU. Gated on !preferHardwareGL like the WEBKIT_DISABLE_* belt.
+        assert "GSK_RENDERER=cairo" in src, (
+            "GTK4 host missing GSK_RENDERER=cairo — GSK's default GL renderer hangs "
+            "on a real GPU (works on llvmpipe, black-screens on real HW)."
+        )
+        assert "GDK_GL=disable" in src, (
+            "GTK4 host missing GDK_GL=disable — GDK would still create a GL context."
+        )
+
+    def test_first_paint_marker_handler_is_defined_and_signals(self, src):
+        # The session-supervisor's paint-watchdog drops the tier to the cage floor
+        # unless /run/hart/session/shell-ready is touched within its budget. The host
+        # connects 'load-changed' to _on_load_changed; that handler MUST exist and
+        # call _signal_painted() on LoadEvent.FINISHED — otherwise the marker never
+        # fires and a HEALTHY GTK4 tier is wrongly dropped as HUNG. (The original
+        # GTK4 host connected the signal but never DEFINED the method.)
+        assert "webview.connect('load-changed', self._on_load_changed)" in src
+        assert "def _on_load_changed" in src, (
+            "GTK4 host connects load-changed but never DEFINES _on_load_changed — "
+            "_signal_painted() never runs and the shell-ready marker never fires."
+        )
+        assert "_signal_painted()" in src, (
+            "GTK4 host never CALLS _signal_painted() — the watchdog drops the tier."
+        )
+        assert "WebKit.LoadEvent.FINISHED" in src, (
+            "GTK4 host must gate the marker on WebKit.LoadEvent.FINISHED (first frame)."
+        )
+
 
 # ═══════════════════════════════════════════════════════════════
 # 4. DRY: re-hosts the SAME served shell; cage GTK3 floor kept VERBATIM
