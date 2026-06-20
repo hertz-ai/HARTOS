@@ -187,13 +187,16 @@ in
       enable = true;
       # Fresh/un-latched boots start at Tier-1 (hart-comp). The supervisor owns
       # the never-blank guarantee, so an unavailable/crashing/hung Tier-1 falls
-      # DEFERRED to cage: baking hart.comp into the ISO made the iso-desktop build
-      # hang 4h+ (the first Rust/Smithay build in the image — no nightly could
-      # complete), AND Tier-1+Tier-2 both hang on the still-unfixed GTK4 glass host
-      # (they fall to cage anyway). Boot straight to the working cage floor until
-      # the host paint is fixed; flip back to "hart-comp" once comp.enable is
-      # re-armed below. The supervisor ladder CODE is unchanged.
-      startTier = "cage";
+      # RE-ARMED to hart-comp: both deferral blockers are fixed —
+      #   (1) the GTK4 glass-host paint hang — GSK's GL renderer on a real GPU +
+      #       an undefined _on_load_changed that never fired the shell-ready marker
+      #       — fixed in 75ba78d (GSK_RENDERER=cairo + the marker handler), and
+      #   (2) the iso-desktop build hang — the Release build-iso cores=2 throttle on
+      #       the from-source Rust compile — fixed in 48b73d6 (warm the Rust closure
+      #       at full cores before the throttled ISO step).
+      # The boot now tries Tier-1 first; the shell-paint watchdog still drops to
+      # sway then the cage floor if Tier-1 fails on real HW (safe to re-arm).
+      startTier = "hart-comp";
     };
 
     # Tier-1: HART-comp, the AI-native Smithay/Rust compositor (--backend drm).
@@ -201,17 +204,14 @@ in
     # the desktop closure and arms the supervisor's Tier-1 rung (compCommand via
     # mkDefault in hart-comp.nix). hart-comp reuses the SAME GTK4 layer-shell glass
     # host as Tier-2 sway, so it satisfies the same shell-paint watchdog marker.
-    # DEFERRED: baking hart.comp (the Rust/Smithay compositor) into the ISO made
-    # the iso-desktop build HANG 4h+ — the first Rust-in-Nix build inside the image
-    # never settled, so no nightly could complete. Re-arm this AND
-    # startTier="hart-comp" above ONLY once (a) the GTK4 glass-host paint hang is
-    # fixed so Tier-1 actually paints, and (b) the hart.comp Nix build is cached so
-    # the ISO stays fast. The supervisor ladder + the compositor sources are
-    # untouched — this flag only controls whether the heavy Rust closure ships in
-    # the ISO. rustPrecedent (claw-cli, another Rust build) is only needed to
-    # satisfy hart.comp.enable's assertion, so it goes too.
-    comp.enable = false;
-    rustPrecedent.enable = false;
+    # RE-ARMED (both deferral preconditions met): (a) the GTK4 glass-host paint
+    # hang is fixed (75ba78d — GSK cairo renderer + the shell-ready marker handler),
+    # and (b) the iso-desktop build no longer hangs (48b73d6 — the Release build-iso
+    # job warms the hart.comp Rust closure at full cores BEFORE the throttled ISO
+    # step, so it is reused, not recompiled under the cores=2 cap). The shell-paint
+    # watchdog still falls back to sway then cage if Tier-1 fails on real HW.
+    comp.enable = true;
+    rustPrecedent.enable = true;
 
     # Tier-2: sway running the canonical glass shell + the swaymsg WM shim the
     # brain drives when HART-comp is absent. Registers the sway session + the
