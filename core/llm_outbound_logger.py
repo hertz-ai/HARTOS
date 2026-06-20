@@ -257,10 +257,11 @@ def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
                 # absent one ⇒ the daemon_/user tag was already gone before this
                 # frame (fix at /chat handler ↔ payload). Low-frequency (once per
                 # goal/turn, not per token), so INFO is safe.
+                _tl_rid = ''
                 try:
                     import threading as _t
                     from threadlocal import thread_local_data as _tl
-                    _tl_rid = _tl.get_request_id()
+                    _tl_rid = _tl.get_request_id() or ''
                     logger.info(
                         "LLM-CONTEXT empty request_id at %s (source=%s, thread=%s, "
                         "thread_local_rid=%r) — rid not threaded to this frame (#162)",
@@ -268,6 +269,17 @@ def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
                         _t.current_thread().name, _tl_rid)
                 except Exception:
                     pass
+                # #162 fix: the decorated arg didn't carry a rid, but DON'T
+                # clobber an inherited one with ''.  The worker thread may hold
+                # the originating rid in the thread-local (re-bound at the
+                # speculative dispatcher's expert-task entry) or in a
+                # propagated contextvar.  Binding that keeps the user's own
+                # autogen turn FOREGROUND instead of background-and-preempted.
+                if not rid:
+                    try:
+                        rid = _tl_rid or _request_id_var.get() or ''
+                    except Exception:
+                        rid = _tl_rid or ''
             with source_context(source_name), request_id_context(rid):
                 return fn(*args, **kwargs)
         return _wrapper

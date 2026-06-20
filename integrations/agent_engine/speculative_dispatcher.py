@@ -1272,10 +1272,22 @@ class SpeculativeDispatcher:
                 )
             self._active[speculation_id] = entry
 
+        # #162 — capture the request thread's rid (thread-local) so the pool
+        # worker can re-bind it.  A ThreadPoolExecutor worker starts with an
+        # EMPTY thread-local, so without this the expert's autogen turn runs
+        # request_id='' → _is_background_call mis-marks the USER's own work as
+        # background and the foreground preempt starves it (witnessed:
+        # source=autogen.create, thread=spec_expert_0, thread_local_rid=None).
+        try:
+            from threadlocal import thread_local_data as _tl
+            _req_rid = _tl.get_request_id() or ''
+        except Exception:
+            _req_rid = ''
         self._expert_pool.submit(
             self._expert_background_task,
             speculation_id, prompt, fast_response,
             expert_model, user_id, prompt_id, goal_id, goal_type,
+            _req_rid,
         )
         return True
 
@@ -1524,12 +1536,27 @@ class SpeculativeDispatcher:
 
     def _expert_background_task(self, speculation_id: str, original_prompt: str,
                                 fast_response: str, expert_model, user_id: str,
-                                prompt_id: str, goal_id: str, goal_type: str):
+                                prompt_id: str, goal_id: str, goal_type: str,
+                                request_id: str = ''):
         """Background: dispatch expert → deliver (or fall through to draft
         standby).  Outer try/finally owns the shared invariants —
         circuit-breaker gate, exception swallowing, ``_active`` cleanup —
         so the helper can focus on dispatch + delivery semantics.
+
+        ``request_id`` is the originating user turn's id, captured on the
+        request thread at submit time and re-bound HERE (#162) — thread-locals
+        don't cross the pool boundary, so this is the one place the expert's
+        autogen LLM calls can inherit the user's rid and stay foreground.
         """
+        # #162 — re-bind the originating rid on THIS worker thread so every
+        # LLM call the expert issues (recipe/autogen via _dispatch_expert_*)
+        # is classified foreground, not background-and-preemptible.
+        if request_id:
+            try:
+                from threadlocal import thread_local_data as _tl
+                _tl.set_request_id(request_id=request_id)
+            except Exception:
+                pass
         try:
             # GUARDRAIL: circuit breaker (check again — may have been halted)
             from security.hive_guardrails import HiveCircuitBreaker
