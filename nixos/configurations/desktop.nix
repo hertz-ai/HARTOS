@@ -254,6 +254,21 @@ in
       channel = "stable";
       autoApply = true;                # hands-off: central publish → auto-apply
     };
+
+    # ── Persistent boot-diagnostic log partition ──
+    # The live ISO's journal lives in tmpfs (RAM) — wiped on reboot, never on the
+    # stick, unreadable from the Windows host. With this ON, IF a FAT32 partition
+    # labelled HARTLOG is present (the flasher creates it in the stick's free
+    # space after a successful flash), HART OS writes the full current-boot
+    # journal + the session-supervisor tier latch/decisions + the shell-ready
+    # paint marker + the GTK4/GSK/GDK/EGL/GBM/WebKit GL diagnostics to
+    # /hart-boot-latest.log on it — EARLY in boot, on a ~20s periodic timer (so a
+    # HUNG Tier-1 pointer-only boot STILL leaves the journal-so-far), and at
+    # shutdown, fsync'ing each write. So the loop becomes: flash → boot (even if
+    # Tier-1 hangs) → plug the stick into Windows → read the journal. A pure
+    # NO-OP when no HARTLOG partition is present, so an old stick still boots
+    # fine and the capture never blocks/slows/fails boot.
+    bootLog.enable = true;
   };
 
   # HART application package

@@ -137,6 +137,17 @@
       # CI-gated via `nix build .#…config.hart.comp.package` + the flake eval here.)
       ./modules/hart-rust-precedent.nix
       ./modules/hart-comp.nix
+      # Persistent boot-diagnostic log partition: when a FAT32 partition labelled
+      # HARTLOG is present (the flasher creates it in the stick's free space),
+      # HART OS writes the full current-boot journal + tier-supervisor state +
+      # GTK4/GL diagnostics to it early in boot, on a periodic timer (so a HUNG
+      # Tier-1 boot still leaves a record), and at shutdown — so a Windows host
+      # reads the boot journal off the stick WITHOUT hand-copying from a TTY.
+      # Opt-in (hart.bootLog.enable=false default) -> pure no-op for every
+      # variant; ALSO a clean no-op at runtime when no HARTLOG partition exists.
+      # Imported so the option exists + tests/boot-log.nix can enable it; the
+      # live/desktop config turns it on (desktop.nix).
+      ./modules/hart-boot-log.nix
     ];
 
     # Single source of truth for nixpkgs config (allowUnfree etc.).  Kept OUT of
@@ -462,7 +473,16 @@
       # fake snapd was shipped (snap is honestly unsupported). Distinct attr names
       # -> clean //; desktop-variant node (mkNode), subsystems enabled in-test.
       nativeSubsystems = import ./tests/native-subsystems.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems;
+      # Persistent boot-diagnostic log partition: a desktop node enables
+      # hart.bootLog + attaches a spare disk the test formats FAT32/labels HARTLOG
+      # (the stand-in for the stick's free-space partition the flasher creates).
+      # It runs the REAL capture script and asserts the full bundle (boot journal
+      # + supervisor tier state + shell-ready marker + GTK4/GL diagnostics) lands
+      # on the partition with a stable hart-boot-latest.log, AND that the
+      # no-HARTLOG path is a clean no-op (old stick / plain flash still boots).
+      # Distinct attr name -> clean //; desktop-variant node (mkNode).
+      bootLog = import ./tests/boot-log.nix desktopTestArgs;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)
