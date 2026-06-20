@@ -207,7 +207,14 @@ in
       isNormalUser = true;
       description = "HART OS Administrator";
       extraGroups = [ "wheel" "hart" "video" "render" ];
-      initialPassword = "hart";  # Change on first login
+      # Baked SHA-512 hash of "hart" (login = hart-admin / hart). `initialPassword`
+      # is applied by a runtime activation step that does NOT reliably persist on a
+      # read-only / baked live-ISO squashfs — it left hart-admin with no usable
+      # password, so every GDM greeter login failed ("authentication didn't work").
+      # `hashedPassword` is baked into the image and works (server.nix uses it for
+      # the same reason). The INSTALLER should re-prompt for the user's own password
+      # on install; this baked default exists only to reach that first login.
+      hashedPassword = "$6$hartos00$4CRZoq04d/q2rp1.FAXAXMqZeUkDfh90FYFA2vpl4b/3JWAs1EvmjW7dgDf/wt.mjt6iIovSKaZmZtJkoj0dx1";
     };
 
     # ── Networking ──
