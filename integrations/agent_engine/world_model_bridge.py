@@ -1837,14 +1837,32 @@ class WorldModelBridge:
         # propagation when outcomes differ from predictions.  No separate
         # action_stream module — the correction path handles backprop.
 
-        # HTTP fallback
+        # HTTP fallback. There is NO /v1/actions motor endpoint on HevolveAI:
+        # the downstream is sensor-ingest-centric, not action-centric. An
+        # action is a generated PREDICTION the world model tests against
+        # reality (see the latent-space note above), so it rides the SAME
+        # /v1/sensor/ingest mouth as every other observation -- tagged
+        # reality_signature=0.0 (generated, not a physical sensor) and carried
+        # on the endpoint's existing text modality. No new endpoint, no
+        # parallel path.
         if self._http_disabled or self._cb_is_open():
             return False
 
+        import base64
+        action_json = json.dumps(action)
         try:
             resp = pooled_post(
-                f'{self._api_url}/v1/actions',
-                json=action,
+                f'{self._api_url}/v1/sensor/ingest',
+                json={
+                    'modality': 'text',
+                    'source': 'agent_response',
+                    'data': base64.b64encode(
+                        action_json.encode('utf-8')).decode('ascii'),
+                    'format': 'text',
+                    'text': action_json,
+                    'session_id': f"{action.get('target', '_')}_action",
+                    'reality_signature': 0.0,
+                },
                 timeout=self._timeout_default,
             )
             if resp.status_code in (200, 201):
@@ -1896,28 +1914,76 @@ class WorldModelBridge:
         # embodied.step(sensor, train=True).  SensorInput dataclass already
         # carries type/modality metadata.  No separate sensor_ingest module.
 
-        # HTTP fallback
+        # HTTP fallback. HevolveAI exposes NO /v1/sensors/batch route -- the
+        # one sensor mouth is /v1/sensor/ingest (vision/audio/text). Fan the
+        # batch onto that endpoint, one POST per reading, mapping the unified
+        # SensorReading schema (sensor_model.py) to the SensorIngestRequest
+        # body. Non-vision/non-audio sensor types (imu/gps/force_torque/
+        # lidar/...) have no modality branch there, so they are skipped rather
+        # than posted as an unsupported modality (which would 400). Returns the
+        # count actually accepted. No new endpoint, no parallel path.
         if self._http_disabled or self._cb_is_open():
             return 0
 
-        try:
-            resp = pooled_post(
-                f'{self._api_url}/v1/sensors/batch',
-                json={'readings': readings},
-                timeout=self._timeout_flush,
-            )
-            if resp.status_code in (200, 201):
-                self._cb_record_success()
-                with self._lock:
-                    self._stats['total_sensor_readings'] = self._stats.get(
-                        'total_sensor_readings', 0) + len(readings)
-                return len(readings)
-            self._propagate_embodied_error(
-                'ingest_sensor_batch', status=resp.status_code)
-            return 0
-        except requests.RequestException as e:
-            self._propagate_embodied_error('ingest_sensor_batch', exc=e)
-            return 0
+        accepted = 0
+        for reading in readings:
+            if not isinstance(reading, dict):
+                continue
+            stype = reading.get('sensor_type')
+            data = reading.get('data') or {}
+            stream_source = data.get('stream_source', '')
+            # reality_signature: physical mic/camera/peer = 1.0; screen-grab
+            # ('desktop') and generated tts = 0.0 (mirrors submit_sensor_frame's
+            # camera-vs-screen rule).
+            reality_signature = 0.0 if stream_source in ('desktop', 'tts') else 1.0
+            sid = reading.get('sensor_id', stype or 'sensor')
+            if stype == 'camera' and data.get('frame_base64'):
+                body = {
+                    'modality': 'vision',
+                    'source': stream_source or 'camera',
+                    'data': data['frame_base64'],
+                    'format': data.get('encoding', 'jpeg'),
+                    'session_id': f'{sid}_{stream_source or "camera"}',
+                    'reality_signature': reality_signature,
+                }
+            elif stype == 'audio' and (
+                    data.get('pcm_base64') or data.get('wav_base64')):
+                if data.get('pcm_base64'):
+                    audio_b64, fmt = data['pcm_base64'], 'pcm_16k'
+                else:
+                    audio_b64, fmt = data['wav_base64'], 'wav'
+                body = {
+                    'modality': 'audio',
+                    'source': stream_source or 'mic',
+                    'data': audio_b64,
+                    'format': fmt,
+                    'session_id': f'{sid}_{stream_source or "mic"}',
+                    'reality_signature': reality_signature,
+                }
+                if data.get('transcript'):
+                    body['text'] = str(data['transcript'])[:500]
+            else:
+                # No /v1/sensor/ingest modality for this sensor type -- skip.
+                continue
+            try:
+                resp = pooled_post(
+                    f'{self._api_url}/v1/sensor/ingest',
+                    json=body,
+                    timeout=self._timeout_flush,
+                )
+                if resp.status_code in (200, 201):
+                    self._cb_record_success()
+                    accepted += 1
+                else:
+                    self._propagate_embodied_error(
+                        'ingest_sensor_batch', status=resp.status_code)
+            except requests.RequestException as e:
+                self._propagate_embodied_error('ingest_sensor_batch', exc=e)
+        if accepted:
+            with self._lock:
+                self._stats['total_sensor_readings'] = self._stats.get(
+                    'total_sensor_readings', 0) + accepted
+        return accepted
 
     def get_learning_feedback(self) -> Optional[Dict]:
         """Poll HevolveAI for real-time learning feedback.
@@ -1939,18 +2005,25 @@ class WorldModelBridge:
             except Exception:
                 pass
 
-        # HTTP fallback
+        # HTTP fallback. There is NO /v1/feedback/latest route -- learning
+        # feedback is exposed by the SAME /v1/stats surface the in-process
+        # branch already reads (provider.get_stats()). Mirror that branch's
+        # shape (last_feedback, else the full stats dict) so HTTP and
+        # in-process return the same thing. No new endpoint.
         if self._http_disabled or self._cb_is_open():
             return None
 
         try:
             resp = pooled_get(
-                f'{self._api_url}/v1/feedback/latest',
+                f'{self._api_url}/v1/stats',
                 timeout=self._timeout_default,
             )
             if resp.status_code == 200:
                 self._cb_record_success()
-                return resp.json()
+                stats = resp.json()
+                if isinstance(stats, dict):
+                    return stats.get('last_feedback') or stats
+                return stats
             self._propagate_embodied_error(
                 'get_learning_feedback', status=resp.status_code)
             return None

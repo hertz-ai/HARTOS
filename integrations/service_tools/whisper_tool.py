@@ -1049,6 +1049,17 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
             'text': text, 'language': lang, 'is_final': True,
         }))
         _maybe_enqueue_call_segment(call_id, user_id, text, lang, True)
+        # Feed this finalized mic segment to HevolveAI's world model for
+        # continual learning. The bridge call does a SYNCHRONOUS HTTP POST, so
+        # run it on the default executor to avoid blocking the realtime STT
+        # event loop. Gated on call_id (voice-room streams) so the push-to-talk
+        # chat mic is untouched. Snapshot the PCM now -- the caller resets the
+        # buffer right after this returns.
+        if call_id:
+            import asyncio
+            asyncio.get_running_loop().run_in_executor(
+                None, _maybe_ingest_audio_sensor,
+                call_id, user_id, audio_buffer.getvalue(), text, lang)
     return bool(text)
 
 
@@ -1130,6 +1141,53 @@ def _maybe_enqueue_call_segment(
     except Exception as e:
         logger.debug(
             "whisper_tool._maybe_enqueue_call_segment failed "
+            "(call=%s): %s", call_id, e)
+
+
+def _maybe_ingest_audio_sensor(
+    call_id: Optional[str],
+    user_id: Optional[str],
+    pcm_bytes: bytes,
+    transcript: str,
+    lang: str,
+) -> None:
+    """Feed a finalized mic segment (raw PCM16 16kHz mono + its transcript) to
+    HevolveAI's world model for continual learning.
+
+    This is the MISSING producer for the audio sensor path: live mic PCM
+    otherwise lands only in the STT queue (_maybe_enqueue_call_segment) and
+    never reaches the embodied learner.  It rides the EXISTING
+    WorldModelBridge.ingest_sensor_batch -> /v1/sensor/ingest (audio) transport
+    using the unified SensorReading schema (sensor_model.py 'audio') -- no new
+    bridge method, no new endpoint, no parallel path.  Gated on call_id so the
+    push-to-talk chat mic (call_id=None) is completely unaffected.
+
+    Runs on a thread-pool executor (the bridge call does a blocking HTTP POST);
+    best-effort, never raises out of the WS handler hot path.
+    """
+    if not call_id or not pcm_bytes:
+        return
+    try:
+        import base64
+        from integrations.agent_engine.world_model_bridge import (
+            get_world_model_bridge)
+        from integrations.robotics.sensor_model import SensorReading
+        reading = SensorReading(
+            sensor_id=f'mic_{call_id}',
+            sensor_type='audio',
+            data={
+                'pcm_base64': base64.b64encode(pcm_bytes).decode('ascii'),
+                'sample_rate': STREAM_SAMPLE_RATE,
+                'channels': 1,
+                'stream_source': 'mic',
+                'transcript': transcript,
+                'lang': lang,
+            },
+        )
+        get_world_model_bridge().ingest_sensor_batch([reading.to_dict()])
+    except Exception as e:
+        logger.debug(
+            "whisper_tool._maybe_ingest_audio_sensor failed "
             "(call=%s): %s", call_id, e)
 
 

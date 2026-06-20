@@ -144,9 +144,13 @@ class TestIngestSensorBatch:
     @patch('integrations.agent_engine.world_model_bridge.pooled_post')
     def test_http_batch_success(self, mock_post, bridge):
         mock_post.return_value = MagicMock(status_code=200)
+        # camera + audio are the sensor types /v1/sensor/ingest can encode;
+        # other types (imu/gps/...) have no modality branch and are skipped.
         readings = [
-            {'sensor_id': 'imu_0', 'sensor_type': 'imu', 'data': {'accel_x': 1.0}},
-            {'sensor_id': 'gps_0', 'sensor_type': 'gps', 'data': {'latitude': 37.0, 'longitude': -122.0}},
+            {'sensor_id': 'cam_0', 'sensor_type': 'camera',
+             'data': {'frame_base64': 'QUJD', 'stream_source': 'camera'}},
+            {'sensor_id': 'mic_0', 'sensor_type': 'audio',
+             'data': {'pcm_base64': 'QUJD', 'stream_source': 'mic'}},
         ]
         result = bridge.ingest_sensor_batch(readings)
         assert result == 2
@@ -155,8 +159,22 @@ class TestIngestSensorBatch:
     @patch('integrations.agent_engine.world_model_bridge.pooled_post')
     def test_http_batch_failure(self, mock_post, bridge):
         mock_post.return_value = MagicMock(status_code=500)
-        result = bridge.ingest_sensor_batch([{'sensor_id': 'x', 'data': {}}])
+        # a camera reading reaches the POST; a 500 => 0 accepted.
+        result = bridge.ingest_sensor_batch(
+            [{'sensor_id': 'cam_0', 'sensor_type': 'camera',
+              'data': {'frame_base64': 'QUJD'}}])
         assert result == 0
+
+    @patch('integrations.agent_engine.world_model_bridge.pooled_post')
+    def test_http_batch_skips_non_modal(self, mock_post, bridge):
+        """imu/gps/... have no /v1/sensor/ingest modality -> skipped, not posted."""
+        mock_post.return_value = MagicMock(status_code=200)
+        result = bridge.ingest_sensor_batch([
+            {'sensor_id': 'imu_0', 'sensor_type': 'imu', 'data': {'accel_x': 1.0}},
+            {'sensor_id': 'gps_0', 'sensor_type': 'gps', 'data': {'latitude': 37.0}},
+        ])
+        assert result == 0
+        mock_post.assert_not_called()
 
     def test_circuit_breaker_blocks_batch(self, bridge):
         bridge._circuit_breaker._failures = bridge._circuit_breaker.threshold
