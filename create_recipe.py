@@ -14,7 +14,16 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
 )
 
 import ast
-import autogen
+# autogen is imported lazily (core.optional_import.lazy_module): it drags
+# google.api_core (~7.6s) + flaml + the contrib capabilities chain ->
+# llmlingua -> torch (~4.2s) at import time, but every autogen.* use in
+# this module is INSIDE a function (AST-verified: zero module-level /
+# class-base uses).  The proxy keeps all ``autogen.X`` call sites
+# byte-for-byte unchanged and pays the cost only when the first agent is
+# actually constructed — saving ~11-24s off `import create_recipe` and
+# therefore off the backend boot.  See tests/unit/test_lazy_autogen_import.py.
+from core.optional_import import lazy_module
+autogen = lazy_module("autogen")
 
 # Qwen3.5's Jinja chat template rejects system messages mid-conversation:
 #   "System message must be at the beginning"
@@ -39,10 +48,8 @@ import asyncio
 import traceback
 from datetime import datetime
 import time
-from autogen.coding import DockerCommandLineCodeExecutor
 import re
 import json
-from autogen import ConversableAgent
 from flask import current_app
 try:
     from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR, _is_terminate_msg
@@ -53,8 +60,15 @@ os.makedirs(PROMPTS_DIR, exist_ok=True)
 import helper as helper_fun
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from autogen.agentchat.contrib.capabilities import transform_messages, transforms
-from autogen.cache.in_memory_cache import InMemoryCache
+# transform_messages / transforms are autogen.agentchat.contrib.capabilities
+# submodules — importing them eagerly pulls the SAME heavy chain as autogen
+# (llmlingua -> torch via text_compressors).  They are used only inside the
+# agent-building functions, so proxy them lazily too (same rationale + test
+# as the `autogen` proxy above).
+transform_messages = lazy_module(
+    "autogen.agentchat.contrib.capabilities.transform_messages")
+transforms = lazy_module(
+    "autogen.agentchat.contrib.capabilities.transforms")
 from json_repair import repair_json
 
 # ─── State-transition stuck-loop detector (#485) ────────────────────

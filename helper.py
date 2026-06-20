@@ -14,13 +14,21 @@ def _safe_log(level, msg):
 import requests
 import re
 import ast
-try:
-    import autogen
-    from autogen.agentchat.contrib.capabilities import transform_messages, transforms
-except ImportError:
-    autogen = None
-    transform_messages = None
-    transforms = None
+# autogen is imported lazily — it drags google.api_core (~7.6s) + flaml +
+# the contrib capabilities chain -> llmlingua -> torch (~4.2s) at import
+# time, but every autogen.* / transform_messages.* / transforms.* use in
+# this module is INSIDE a function (AST-verified: zero module-level /
+# class-base uses; used only in create_visual_agent + the agent builders).
+# `import helper` is on the backend-boot critical path (create_recipe /
+# reuse_recipe / gather_agentdetails all import it), so deferring autogen
+# here is what actually keeps it out of the boot.  Same proxy + test as
+# create_recipe.py.  See tests/unit/test_lazy_autogen_import.py.
+from core.optional_import import lazy_module
+autogen = lazy_module("autogen")
+transform_messages = lazy_module(
+    "autogen.agentchat.contrib.capabilities.transform_messages")
+transforms = lazy_module(
+    "autogen.agentchat.contrib.capabilities.transforms")
 import json
 from flask import current_app
 from typing import List, Dict, Tuple, Annotated, Set, FrozenSet, Any

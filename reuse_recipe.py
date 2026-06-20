@@ -1,4 +1,11 @@
 """reuse_recipe.py"""
+# PEP 563: stringize ALL annotations (incl. the module-level
+# `user_agents: Dict[str, Tuple[autogen.AssistantAgent, ...]]` below) so
+# they are never evaluated at import time.  Required for the lazy autogen
+# proxy: without this, those variable annotations would touch
+# autogen.AssistantAgent at module load and force the heavy import we are
+# trying to defer.  MUST be the first statement after the docstring.
+from __future__ import annotations
 # Guard: cx_Freeze frozen builds close stdout/stderr.
 import sys, os
 from core.io_guard import silence_stdio; silence_stdio()
@@ -15,10 +22,15 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
 
 from enum import Enum
 import random
-try:
-    import autogen
-except ImportError:
-    autogen = None
+# autogen is imported lazily — it drags google.api_core (~7.6s) + flaml +
+# the contrib capabilities chain -> llmlingua -> torch (~4.2s) at import
+# time, but every autogen.* use here is inside a function (the two
+# module-level type annotations at L248-249 are stringized by the
+# `from __future__ import annotations` above, so they don't evaluate
+# autogen).  Deferring keeps autogen off the backend-boot import path.
+# Same proxy + test as create_recipe.py — see tests/unit/test_lazy_autogen_import.py.
+from core.optional_import import lazy_module
+autogen = lazy_module("autogen")
 import os
 import pytz
 from core.http_pool import pooled_get, pooled_post, pooled_request
@@ -83,7 +95,12 @@ except Exception:
     PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
 os.makedirs(PROMPTS_DIR, exist_ok=True)
 import helper as helper_fun
-from autogen.agentchat.contrib.capabilities import transform_messages, transforms
+# Lazy — same heavy-chain rationale as the `autogen` proxy above; used
+# only inside the agent-building functions.
+transform_messages = lazy_module(
+    "autogen.agentchat.contrib.capabilities.transform_messages")
+transforms = lazy_module(
+    "autogen.agentchat.contrib.capabilities.transforms")
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import traceback
