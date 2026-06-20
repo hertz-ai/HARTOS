@@ -1679,22 +1679,29 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      #hart-hero (centerpiece); initHartOrb still finds #hart-voice-orb and drives
      it. hartHero.js fuses the orb with the command bar, reusing toggleVoice /
      acSend / openPanel — one pipeline, no fork. Loaded after the inline script. -->
-<script src="/shell/static/lottie.min.js"></script>
-<script src="/shell/static/hartBootSplash.js"></script>
-<script src="/shell/static/hartSession.js"></script>
-<script src="/shell/static/voiceOrbViz.js"></script>
-<script src="/shell/static/hartHero.js"></script>
-<script src="/shell/static/hartDesktop.js"></script>
-<script src="/shell/static/hartWorkspaces.js"></script>
-<script src="/shell/static/hartEffects.js"></script>
-<script src="/shell/static/hartPersonalize.js"></script>
-<script src="/shell/static/hartMarketplace.js"></script>
-<script src="/shell/static/hartDock.js"></script>
-<script src="/shell/static/hartSenses.js"></script>
-<script src="/shell/static/hartOnboarding.js"></script>
-<script src="/shell/static/hartSessionUI.js"></script>
+<!-- All shell modules use `defer`: they must NOT block HTML parsing / first
+     paint (≈456KB total, lottie.min.js alone is 305KB).  `defer` keeps them
+     in document order AND guarantees they run AFTER the inline config script
+     below sets window.MANIFEST / BACKEND / GROUPS — which is exactly the
+     contract each module already documents ("loaded after the inline shell
+     JS") and self-enforces via its `document.readyState==='loading'` init
+     gate.  So deferring is strictly safer ordering, not a behaviour change. -->
+<script defer src="/shell/static/lottie.min.js"></script>
+<script defer src="/shell/static/hartBootSplash.js"></script>
+<script defer src="/shell/static/hartSession.js"></script>
+<script defer src="/shell/static/voiceOrbViz.js"></script>
+<script defer src="/shell/static/hartHero.js"></script>
+<script defer src="/shell/static/hartDesktop.js"></script>
+<script defer src="/shell/static/hartWorkspaces.js"></script>
+<script defer src="/shell/static/hartEffects.js"></script>
+<script defer src="/shell/static/hartPersonalize.js"></script>
+<script defer src="/shell/static/hartMarketplace.js"></script>
+<script defer src="/shell/static/hartDock.js"></script>
+<script defer src="/shell/static/hartSenses.js"></script>
+<script defer src="/shell/static/hartOnboarding.js"></script>
+<script defer src="/shell/static/hartSessionUI.js"></script>
 <link rel="stylesheet" href="/shell/static/hartResponsive.css">
-<script src="/shell/static/hartFiles.js"></script>
+<script defer src="/shell/static/hartFiles.js"></script>
 
 <!-- Agent Pill (click to expand floating chat) -->
 <div class="agent-pill glass hidden" id="agent-pill" onclick="toggleAssistantChat()">
