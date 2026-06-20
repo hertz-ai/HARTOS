@@ -64,6 +64,7 @@ via curl, exactly as the OS module does today. The pipeline's master-key SIGN
 gate, canary, and atomic NixOS rollback all stay in place — publish never
 force-applies past canary.
 """
+import hashlib
 import json
 import logging
 import time
@@ -79,23 +80,162 @@ fleet_update_bp = Blueprint('fleet_update', __name__)
 _DEFAULT_TIER_FILTER = ''
 
 
+# ═══════════════════════════════════════════════════════════════
+# Staged rollout / canary (gap #59) — replaces the approve-all stub
+# ═══════════════════════════════════════════════════════════════
+#
+# The rollout POLICY is NOT a new table: it rides the SAME firmware_update
+# command params that already are the channel pointer (single source of truth,
+# exactly like _latest_pointer_for_channel). Publishing (or POST /api/ota/
+# rollout) carries optional canary fields:
+#   canary_pct : 0..100 — the % of the fleet (deterministic per node) eligible.
+#                100 (or absent) = full rollout (today's auto-approve behaviour).
+#   approve    : [node_id, ...] — always approved, regardless of the percentage.
+#   deny       : [node_id, ...] — always blocked (hard stop; wins over approve).
+# A node polling /api/social/fleet/update-approved?v=<commit>&node_id=<id> gets
+# a per-node yes/no so a regional/central operator can ramp 5% → 50% → 100%
+# WITHOUT re-publishing the artifact — the master-key SIGN gate, the node-side
+# canary, and atomic NixOS rollback all stay in place underneath.
+
+def _canary_bucket(node_id: str, version: str) -> int:
+    """Map (node_id, version) deterministically into [0, 100).
+
+    Stable across calls/processes (sha256, no salt) so a given node's verdict
+    for a given version never flickers as it re-polls — a node either is or is
+    not in the canary cohort.  Keyed on version too, so each release reshuffles
+    which nodes are early (no node is permanently the guinea pig).
+    """
+    h = hashlib.sha256(f"{node_id}|{version}".encode()).hexdigest()
+    return int(h[:8], 16) % 100
+
+
+def _rollout_decision(node_id: str, version: str, policy: dict) -> bool:
+    """Decide whether ``version`` is approved for ``node_id`` under ``policy``.
+
+    Precedence (most specific first):
+      1. deny list      → False (hard stop, wins over everything).
+      2. approve list   → True.
+      3. canary_pct     → bucket(node_id, version) < canary_pct.
+      4. no policy / canary_pct >= 100 → True (full rollout / standalone
+         auto-approve — preserves the pre-canary behaviour).
+
+    ``policy`` is the pointer's params dict (may be empty → approve-all).
+    """
+    deny = policy.get('deny') or []
+    approve = policy.get('approve') or []
+    if node_id and node_id in deny:
+        return False
+    if node_id and node_id in approve:
+        return True
+
+    canary_pct = policy.get('canary_pct')
+    if canary_pct is None:
+        return True  # no staged-rollout policy → approve (back-compat)
+    try:
+        canary_pct = int(canary_pct)
+    except (ValueError, TypeError):
+        return True  # malformed policy must not block the fleet
+    if canary_pct >= 100:
+        return True
+    if canary_pct <= 0:
+        # 0% canary with no explicit approve = nobody yet (a paused rollout).
+        return False
+    if not node_id:
+        # Can't bucket an anonymous poller — fail safe to NOT in the canary.
+        return False
+    return _canary_bucket(node_id, version) < canary_pct
+
+
+def _canary_params_from_body(data: dict) -> dict:
+    """Extract + validate the staged-rollout fields from a request body.
+
+    Returns a dict with only the keys that were supplied (so absent fields keep
+    today's full-rollout default).  Used by both publish routes and the rollout
+    route — ONE parser so the policy shape can't drift between them.  Raises
+    ValueError on a malformed value (the caller turns it into a 400).
+    """
+    out = {}
+    if 'canary_pct' in data and data['canary_pct'] is not None:
+        try:
+            pct = int(data['canary_pct'])
+        except (ValueError, TypeError):
+            raise ValueError('canary_pct must be an integer 0..100')
+        if not (0 <= pct <= 100):
+            raise ValueError('canary_pct must be between 0 and 100')
+        out['canary_pct'] = pct
+    for key in ('approve', 'deny'):
+        if key in data and data[key] is not None:
+            val = data[key]
+            if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+                raise ValueError(f'{key} must be a list of node_id strings')
+            out[key] = val
+    return out
+
+
 @fleet_update_bp.route('/api/social/fleet/update-approved', methods=['GET'])
 def check_update_approved():
-    """Check if a version is approved for fleet rollout.
+    """REAL staged-rollout gate: is ``v`` approved for THIS node right now?
+
+    The node-side updater (deploy/distro/update/hart-update-service.py and the
+    NixOS apply path) polls this with the version it is about to apply; an
+    ``approved: False`` holds the node at its current generation.  The verdict
+    is per-node so a regional/central operator can ramp a canary (5% → 50% →
+    100%) WITHOUT re-publishing the artifact.
+
+    The rollout policy is read from the channel POINTER (the newest
+    firmware_update command for the channel — the same single source
+    /api/ota/latest serves).  Precedence: deny list → approve list →
+    canary_pct bucket → full rollout.  When the requested version does NOT
+    match the channel's published commit, or no policy is set, the node is
+    approved (preserves standalone / pre-canary auto-approve — a non-fleet
+    node with no central pointer is never blocked).
 
     Query params:
-        v: version string to check (e.g., '1.2.3')
+        v:        version / commit the node intends to apply (REQUIRED to gate)
+        node_id:  the polling node's id (defaults to this host's id)
+        channel:  stable | testing | nightly (default: stable)
 
     Returns:
-        {approved: bool, version: str}
-
-    Regional hosts can override this with approval lists, staged rollout
-    percentages, or canary checks. Default: approve all versions.
+        {approved: bool, version: str, channel: str, reason: str}
     """
+    from .models import get_db
+
     version = request.args.get('v', '')
-    # For now: approve all versions for standalone nodes
-    # Regional hosts can implement approval logic later
-    return jsonify({'approved': True, 'version': version})
+    channel = request.args.get('channel', 'stable')
+    node_id = request.args.get('node_id', '')
+    if not node_id:
+        try:
+            from .fleet_command import _get_self_node_id
+            node_id = _get_self_node_id()
+        except Exception:
+            node_id = ''
+
+    db = get_db()
+    try:
+        pointer = _latest_pointer_for_channel(db, channel)
+    except Exception as e:
+        logger.debug("update-approved: pointer lookup failed: %s", e)
+        pointer = None
+    finally:
+        db.close()
+
+    # No central pointer for this channel → standalone / un-managed node.
+    # Preserve the historical auto-approve so non-fleet nodes keep updating.
+    if not pointer or not pointer.get('commit'):
+        return jsonify({'approved': True, 'version': version, 'channel': channel,
+                        'reason': 'no-fleet-policy'})
+
+    # The node is asking about a different commit than the one published for
+    # this channel — not the canary target; don't block it on this pointer.
+    if version and version != pointer.get('commit'):
+        return jsonify({'approved': True, 'version': version, 'channel': channel,
+                        'reason': 'version-mismatch-passthrough'})
+
+    policy = pointer.get('policy') or {}
+    approved = _rollout_decision(node_id, version or pointer.get('commit', ''), policy)
+    reason = 'approved' if approved else 'staged-rollout-hold'
+    return jsonify({'approved': approved, 'version': version or pointer.get('commit', ''),
+                    'channel': channel, 'reason': reason})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -130,12 +270,19 @@ def _latest_pointer_for_channel(db, channel: str):
             continue
         if (params.get('channel') or 'stable') != channel:
             continue
+        # The staged-rollout policy (canary_pct / approve / deny) rides the same
+        # params (single source of truth — no separate rollout table).
+        policy = {}
+        for key in ('canary_pct', 'approve', 'deny'):
+            if key in params:
+                policy[key] = params[key]
         return {
             'channel': channel,
             'flake_ref': params.get('update_url', ''),
             'commit': params.get('release_hash', ''),
             'published_at': row.created_at,
             'published_by': row.issued_by,
+            'policy': policy,
         }
     return None
 
@@ -263,14 +410,21 @@ def ota_publish():
         if channel not in ('stable', 'testing', 'nightly'):
             return jsonify({'success': False,
                             'error': 'channel must be stable|testing|nightly'}), 400
+        try:
+            canary = _canary_params_from_body(data)
+        except ValueError as e:
+            return jsonify({'success': False, 'error': str(e)}), 400
 
         # firmware_update executor reads update_url + release_hash; carry the
-        # channel so /api/ota/latest can recover the pointer from the command.
+        # channel so /api/ota/latest can recover the pointer from the command,
+        # and the optional staged-rollout policy (canary_pct/approve/deny) so
+        # /api/social/fleet/update-approved can gate the ramp per node.
         params = {
             'update_url': flake_ref,
             'release_hash': commit,
             'channel': channel,
             'published_at': time.time(),
+            **canary,
         }
 
         commands = FleetCommandService.push_broadcast(
@@ -350,6 +504,10 @@ def ota_publish_regional():
         if channel not in ('stable', 'testing', 'nightly'):
             return jsonify({'success': False,
                             'error': 'channel must be stable|testing|nightly'}), 400
+        try:
+            canary = _canary_params_from_body(data)
+        except ValueError as e:
+            return jsonify({'success': False, 'error': str(e)}), 400
 
         # SUB-FLEET SCOPE — region derived from THIS node, never the request.
         self_node_id = _get_self_node_id()
@@ -360,6 +518,7 @@ def ota_publish_regional():
             'release_hash': commit,
             'channel': channel,
             'published_at': time.time(),
+            **canary,
         }
 
         # Scoped fan-out: the SAME signed-command path as central, but the
@@ -395,6 +554,105 @@ def ota_publish_regional():
         })
 
     return _do_publish_regional()
+
+
+@fleet_update_bp.route('/api/ota/rollout', methods=['POST'])
+def ota_rollout():
+    """REGIONAL/CENTRAL: re-configure the staged-rollout policy of the CURRENT
+    channel pointer WITHOUT re-publishing the artifact — i.e. ramp the canary.
+
+    Reads the channel's existing pointer (the newest firmware_update command),
+    then writes a fresh firmware_update carrying the SAME commit/flake_ref but
+    the new canary policy (canary_pct/approve/deny).  Because the newest command
+    IS the pointer, the next /api/social/fleet/update-approved poll gates each
+    node against the updated percentage — so an operator does 5% → 50% → 100%
+    by calling this three times.  No new table; one source of truth.
+
+    Gated by @require_regional (central OR regional).  A CENTRAL caller re-rolls
+    the global pointer; a REGIONAL caller re-rolls scoped to its OWN sub-fleet
+    members (same hard scope as /api/ota/publish-regional — it can never widen
+    beyond its region).
+
+    Body:
+        channel:    stable | testing | nightly (default: stable)  — MUST already
+                    have a published pointer (400 if not).
+        canary_pct: 0..100  (and/or)  approve: [...]  deny: [...]
+
+    Returns:
+        {success, channel, commit, canary_pct, node_count, command_ids, audited}
+    """
+    from .auth import require_regional
+
+    @require_regional
+    def _do_rollout():
+        from .fleet_command import FleetCommandService, _get_self_node_id
+        from .hierarchy_service import HierarchyService
+
+        data = request.get_json(force=True, silent=True) or {}
+        channel = (data.get('channel') or 'stable').strip()
+        if channel not in ('stable', 'testing', 'nightly'):
+            return jsonify({'success': False,
+                            'error': 'channel must be stable|testing|nightly'}), 400
+        try:
+            canary = _canary_params_from_body(data)
+        except ValueError as e:
+            return jsonify({'success': False, 'error': str(e)}), 400
+        if not canary:
+            return jsonify({'success': False,
+                            'error': 'provide at least one of canary_pct/approve/deny'}), 400
+
+        # Re-roll the CURRENT pointer — never invents a commit.
+        pointer = _latest_pointer_for_channel(g.db, channel)
+        if not pointer or not pointer.get('commit'):
+            return jsonify({'success': False,
+                            'error': f'no published pointer for channel {channel}'}), 400
+
+        # New policy = old policy overlaid with the supplied fields (so a partial
+        # update, e.g. just canary_pct, keeps any existing approve/deny lists).
+        merged = dict(pointer.get('policy') or {})
+        merged.update(canary)
+
+        params = {
+            'update_url': pointer.get('flake_ref', ''),
+            'release_hash': pointer['commit'],
+            'channel': channel,
+            'published_at': time.time(),
+            **merged,
+        }
+
+        # Scope: central re-rolls global; regional re-rolls its own members.
+        role = getattr(getattr(g, 'user', None), 'role', '') or ''
+        is_central = role == 'central' or getattr(getattr(g, 'user', None), 'is_admin', False)
+        if is_central:
+            commands = FleetCommandService.push_broadcast(
+                g.db, 'firmware_update', params, issued_by=g.user_id)
+            scope = 'global'
+        else:
+            members = HierarchyService.region_member_node_ids(g.db, _get_self_node_id())
+            commands = FleetCommandService.push_broadcast(
+                g.db, 'firmware_update', params, issued_by=g.user_id, node_ids=members)
+            scope = 'region'
+
+        audited = _audit_publish(g.user_id, channel, pointer['commit'],
+                                 pointer.get('flake_ref', ''), len(commands), False)
+
+        logger.info(
+            "OTA-rollout: %s re-rolled %s -> %s (scope=%s, canary_pct=%s, nodes=%d)",
+            g.user_id, channel, pointer['commit'], scope,
+            merged.get('canary_pct'), len(commands))
+
+        return jsonify({
+            'success': True,
+            'channel': channel,
+            'commit': pointer['commit'],
+            'canary_pct': merged.get('canary_pct'),
+            'scope': scope,
+            'node_count': len(commands),
+            'command_ids': [c.get('id') for c in commands],
+            'audited': audited,
+        })
+
+    return _do_rollout()
 
 
 @fleet_update_bp.route('/api/ota/nodes', methods=['GET'])
