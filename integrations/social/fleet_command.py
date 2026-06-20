@@ -120,15 +120,29 @@ class FleetCommandService:
     def push_broadcast(
         db, cmd_type: str, params: dict,
         tier_filter: str = '', issued_by: str = '',
+        node_ids: Optional[List[str]] = None,
     ) -> List[Dict]:
-        """Broadcast a command to all nodes (optionally filtered by tier).
+        """Broadcast a command to all active nodes (optionally scoped).
+
+        ONE fan-out path for every broadcast: it signs one FleetCommand per
+        target via push_command.  Two optional scopes (AND-combined):
+
+          * tier_filter — restrict to a capability tier (e.g. 'embedded').
+          * node_ids    — an explicit allowlist of target node_ids.  Used by a
+            REGIONAL OTA publish to scope fan-out to exactly the locals its
+            region hosts (the central-issued RegionAssignment set) so a regional
+            can never command nodes outside its region.  An EMPTY list means
+            "no targets" (returns []), NOT "all nodes" — a scoped caller that
+            resolves no members must fan out to nobody, never fall through to a
+            global broadcast.
 
         Args:
             db: SQLAlchemy session.
             cmd_type: One of VALID_COMMAND_TYPES.
             params: Command-specific parameters.
-            tier_filter: Optional tier to target (e.g. 'embedded', 'observer').
+            tier_filter: Optional capability tier to target.
             issued_by: Node ID of the issuer.
+            node_ids: Optional explicit node_id allowlist (None = unscoped).
 
         Returns:
             List of command dicts created.
@@ -139,10 +153,17 @@ class FleetCommandService:
             logger.warning(f"Fleet: rejected broadcast with invalid type '{cmd_type}'")
             return []
 
-        # Find target nodes
+        # An explicitly-empty allowlist scopes to nobody — never widen to all.
+        if node_ids is not None and len(node_ids) == 0:
+            logger.info("Fleet: scoped broadcast with empty allowlist — 0 targets")
+            return []
+
+        # Find target nodes (active only). Scopes are AND-combined.
         query = db.query(PeerNode).filter(PeerNode.status == 'active')
         if tier_filter:
             query = query.filter(PeerNode.capability_tier == tier_filter)
+        if node_ids is not None:
+            query = query.filter(PeerNode.node_id.in_(list(node_ids)))
 
         peers = query.all()
         results = []
@@ -158,6 +179,7 @@ class FleetCommandService:
         logger.info(
             f"Fleet: broadcast {cmd_type} to {len(results)} nodes"
             f"{f' (tier={tier_filter})' if tier_filter else ''}"
+            f"{f' (scoped to {len(node_ids)} ids)' if node_ids is not None else ''}"
         )
         return results
 

@@ -2,12 +2,14 @@
 Fleet OTA Update Endpoints — the SINGLE central-authority OTA backend for the
 publish→pull→apply loop.
 
-Four surfaces, all on the EXISTING fleet_update_bp (no parallel blueprint):
+Surfaces, all on the EXISTING fleet_update_bp (no parallel blueprint):
 
-  GET  /api/social/fleet/update-approved  — regional approval gate (legacy)
+  GET  /api/social/fleet/update-approved  — staged-rollout / canary gate (nodes poll)
   GET  /api/ota/latest?channel=<c>        — PUBLIC channel pointer the nodes poll
-  POST /api/ota/publish                   — central-gated "publish to my nodes"
+  POST /api/ota/publish                   — central-gated "publish to ALL my nodes"
+  POST /api/ota/publish-regional          — regional-gated "publish to MY sub-fleet"
   GET  /api/ota/nodes?channel=<c>         — central-gated live per-node poll/apply view
+  POST /api/ota/rollout                   — regional/central staged-rollout config
 
 This is the ONE OTA HTTP backend (the node-side NixOS `hart-ota-check` timer,
 the node-side `ota_push_listener`, and the Nunba "Update Control" panel all
@@ -300,6 +302,99 @@ def ota_publish():
         })
 
     return _do_publish()
+
+
+@fleet_update_bp.route('/api/ota/publish-regional', methods=['POST'])
+def ota_publish_regional():
+    """REGIONAL-INITIATED: publish an update to THIS regional's OWN sub-fleet.
+
+    Mirrors ``/api/ota/publish`` but gated by ``@require_regional`` and HARD
+    SCOPED to the locals this regional hosts — it can NEVER publish beyond its
+    region.  The member set is resolved server-side from the central-issued
+    RegionAssignment table keyed on THIS node's id (``_get_self_node_id``); the
+    region is NEVER taken from the request body, so a regional cannot spoof a
+    different region or target central/other-region nodes.  The global
+    all-nodes path stays exclusively behind ``/api/ota/publish`` +
+    ``@require_central``.
+
+    Each command is signed (Ed25519) by THIS regional's delegated cert and
+    carries the same firmware_update params as the central path, so
+    ``/api/ota/latest`` pointer recovery and the node executor are wire-
+    unchanged.  If the regional hosts no locals, returns 200 with
+    ``node_count: 0`` — it never falls through to a global broadcast.
+
+    Body:
+        channel:   stable | testing | nightly  (default: stable)
+        flake_ref: nix flake ref to switch to
+        commit:    the approved git SHA / release hash (REQUIRED)
+
+    Returns:
+        {success, channel, commit, flake_ref, region_node_id, member_count,
+         node_count, command_ids, pipeline_started, audited}
+    """
+    from .auth import require_regional
+
+    @require_regional
+    def _do_publish_regional():
+        from .fleet_command import FleetCommandService, _get_self_node_id
+        from .hierarchy_service import HierarchyService
+
+        data = request.get_json(force=True, silent=True) or {}
+        channel = (data.get('channel') or 'stable').strip()
+        flake_ref = (data.get('flake_ref') or '').strip()
+        commit = (data.get('commit') or '').strip()
+
+        if not commit:
+            return jsonify({'success': False,
+                            'error': 'commit (release hash) required'}), 400
+        if channel not in ('stable', 'testing', 'nightly'):
+            return jsonify({'success': False,
+                            'error': 'channel must be stable|testing|nightly'}), 400
+
+        # SUB-FLEET SCOPE — region derived from THIS node, never the request.
+        self_node_id = _get_self_node_id()
+        members = HierarchyService.region_member_node_ids(g.db, self_node_id)
+
+        params = {
+            'update_url': flake_ref,
+            'release_hash': commit,
+            'channel': channel,
+            'published_at': time.time(),
+        }
+
+        # Scoped fan-out: the SAME signed-command path as central, but the
+        # node_ids allowlist hard-caps it to this region's members. An empty
+        # member set fans out to nobody (push_broadcast returns []), never to
+        # the whole fleet.
+        commands = FleetCommandService.push_broadcast(
+            g.db, 'firmware_update', params,
+            issued_by=g.user_id, node_ids=members,
+        )
+
+        # A regional publish does NOT kick the central node's pipeline (that is
+        # the central account's job). It IS audited like any privileged action.
+        audited = _audit_publish(g.user_id, channel, commit, flake_ref,
+                                 len(commands), False)
+
+        logger.info(
+            "OTA-regional: %s published %s -> %s (region=%s, members=%d, nodes=%d)",
+            g.user_id, channel, commit, self_node_id[:8] if self_node_id else '?',
+            len(members), len(commands))
+
+        return jsonify({
+            'success': True,
+            'channel': channel,
+            'commit': commit,
+            'flake_ref': flake_ref,
+            'region_node_id': self_node_id,
+            'member_count': len(members),
+            'node_count': len(commands),
+            'command_ids': [c.get('id') for c in commands],
+            'pipeline_started': False,
+            'audited': audited,
+        })
+
+    return _do_publish_regional()
 
 
 @fleet_update_bp.route('/api/ota/nodes', methods=['GET'])
