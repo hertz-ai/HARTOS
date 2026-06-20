@@ -108,6 +108,23 @@ def link_device():
         except Exception as e:
             logger.warning("link-device: guest memory migration skipped: %s", e)
 
+    # Profile down-sync (#2): the authenticated both-ids hook fcm_sync documents
+    # but nothing wired.  g.user.id is the local UUID; the client supplies its
+    # central account id here (same call already carries device metadata).  Pull
+    # the central profile + FCM token DOWN into the local social store, which
+    # also populates User.settings['central_user_id'] so #90 FCM resolution
+    # starts working for real central accounts.  GATE: only the logged-in user's
+    # OWN profile (the central id is bound to this session).  Best-effort —
+    # never blocks the link (same posture as the #117 guest migration above).
+    central_user_id = (data.get('central_user_id') or '')
+    central_user_id = str(central_user_id).strip()
+    if central_user_id:
+        try:
+            from core.profile_sync import sync_profile
+            sync_profile(str(g.user.id), central_user_id)
+        except Exception as e:
+            logger.warning("link-device: profile down-sync skipped: %s", e)
+
     db = get_db()
     try:
         existing = db.query(DeviceBinding).filter_by(

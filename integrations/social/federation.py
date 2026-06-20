@@ -187,6 +187,76 @@ class FederationManager:
             logger.debug("Federation.sync_to_parent: queue failed: %s", e)
             return None
 
+    def _agent_message(self, db, user) -> dict:
+        """Canonical 'register_agent' envelope for a local agent User — the
+        agent twin of _outbox_message.  ONE builder, same gossip origin fields
+        (origin_node_id/url/name) as the post envelope, so the agent up-sync
+        has a single shape that the central receiver (_handle_sync_agent)
+        mirrors back.  Carries the agent profile (User.to_dict) + a skill/recipe
+        summary so the central registry entry + skill badges land too."""
+        from .peer_discovery import gossip
+        return {
+            'type': 'agent',
+            'origin_node_id': gossip.node_id,
+            'origin_url': gossip.base_url,
+            'origin_name': gossip.node_name,
+            'agent': user.to_dict(),
+            'skills': self._agent_skill_summary(db, user),
+            'timestamp': datetime.utcnow().isoformat(),
+        }
+
+    @staticmethod
+    def _agent_skill_summary(db, user) -> list:
+        """Skill-badge summary for an agent (metadata only — not the full
+        recipe files).  Mirrors what _handle_sync_user replicates for users
+        (profile, not full history); the receiver upserts these via the same
+        agent_bridge._sync_skills helper.  Best-effort: a query hiccup yields
+        an empty list rather than blocking the up-sync."""
+        try:
+            from .models import AgentSkillBadge
+            badges = db.query(AgentSkillBadge).filter(
+                AgentSkillBadge.user_id == user.id).all()
+            return [{
+                'name': b.skill_name,
+                'proficiency': b.proficiency,
+                'usage_count': b.usage_count,
+                'success_rate': b.success_rate,
+            } for b in badges]
+        except Exception as e:
+            logger.debug("Federation._agent_skill_summary: skipped: %s", e)
+            return []
+
+    def sync_agent_to_parent(self, db, user) -> Optional[str]:
+        """Queue a PUBLIC local agent UP the tier hierarchy to central — the
+        agent twin of sync_to_parent (gap #4).  Same gate→build→queue control
+        flow, one axis over (agents instead of posts):
+
+          - returns None unless this User is an agent (user_type=='agent');
+          - PUBLIC gate = owner CONSENT, not a privacy column (agents have
+            none): ConsentService.check_consent(db, owner_id, 'public_exposure')
+            — the canonical "content made public" signal, the SAME gate the
+            autonomous-marketing funnel uses.  Ownerless system/hive agents
+            (owner_id is None) fail the consent lookup and are correctly NOT
+            replicated as public user content;
+          - builds the canonical _agent_message envelope and queues it to
+            central as the already-declared 'register_agent' op.
+
+        Best-effort — a sync hiccup never blocks agent creation.  Returns the
+        queue id or None."""
+        if getattr(user, 'user_type', None) != 'agent':
+            return None
+        owner_id = getattr(user, 'owner_id', None)
+        try:
+            from .consent_service import ConsentService
+            if not ConsentService.check_consent(db, owner_id, 'public_exposure'):
+                return None
+            from .sync_engine import SyncEngine
+            return SyncEngine.queue(
+                db, 'central', 'register_agent', self._agent_message(db, user))
+        except Exception as e:
+            logger.debug("Federation.sync_agent_to_parent: queue failed: %s", e)
+            return None
+
     # ─── Inbox: Receive posts from followed instances ───
 
     def receive_inbox(self, db, payload: dict) -> Optional[str]:

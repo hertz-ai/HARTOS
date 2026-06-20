@@ -201,8 +201,7 @@ class SyncEngine:
 
             try:
                 if op == 'register_agent':
-                    # Agent data sync - store as metadata for now
-                    logger.info(f"Sync: received agent registration from child")
+                    SyncEngine._handle_sync_agent(db, payload)
                 elif op == 'sync_post':
                     SyncEngine._handle_sync_post(db, payload)
                 elif op == 'update_stats':
@@ -248,6 +247,72 @@ class SyncEngine:
                 logger.info(f"Sync: landed federated post {fid} from child")
         except Exception as e:
             logger.warning(f"Sync: _handle_sync_post failed: {e}")
+
+    @staticmethod
+    def _handle_sync_agent(db, payload: dict):
+        """Land a hierarchically-synced PUBLIC agent (gap #4) as a central/
+        regional User row — the registry twin of _handle_sync_post (content).
+
+        Mirrors _handle_sync_user's persist contract: upsert the User BY ID
+        (preserves the central identity), create with the SAME field set
+        UserService.register_agent builds (user_type='agent' + generate_api_token
+        + is_verified), update only the sync-owned fields on an existing row
+        (never overwrite the local api_token / secrets).  Optionally upserts
+        skill badges from the envelope via the existing agent_bridge._sync_skills
+        helper so the recipe/skill metadata lands too.  Best-effort — never
+        raises out to the batch loop (receive_sync_batch's per-item try/except +
+        idempotency guard the retry/dead-letter)."""
+        from .models import User
+
+        if payload.get('type') != 'agent':
+            return  # defensive no-op for a non-agent shape (cf. _handle_sync_post)
+
+        agent = payload.get('agent') or {}
+        agent_pk = agent.get('id')
+        username = agent.get('username', '')
+        if not agent_pk or not username:
+            logger.warning("sync_agent: missing agent id or username")
+            return
+
+        existing = db.query(User).filter_by(id=agent_pk).first()
+        if existing:
+            # Update only the sync-owned fields (NEVER the local api_token).
+            for fld in ('display_name', 'bio', 'agent_id', 'handle',
+                        'local_name', 'owner_id'):
+                val = agent.get(fld)
+                if val is not None:
+                    setattr(existing, fld, val)
+            logger.info(f"Sync: updated agent {agent_pk} from sync")
+            row = existing
+        else:
+            from .auth import generate_api_token
+            row = User(
+                id=agent_pk,
+                username=username,
+                display_name=agent.get('display_name', username),
+                bio=agent.get('bio', ''),
+                user_type='agent',
+                agent_id=agent.get('agent_id'),
+                owner_id=agent.get('owner_id'),
+                handle=agent.get('handle'),
+                local_name=agent.get('local_name'),
+                api_token=generate_api_token(),   # set ONLY on create
+                is_verified=True,
+            )
+            db.add(row)
+            db.flush()
+            logger.info(f"Sync: created agent {agent_pk} from sync")
+
+        # Skill/recipe metadata: reuse the existing badge-upsert helper (no
+        # parallel writer).  Best-effort — a skills hiccup must not undo the
+        # agent upsert above.
+        skills = payload.get('skills')
+        if skills:
+            try:
+                from .agent_bridge import _sync_skills
+                _sync_skills(db, row, skills)
+            except Exception as e:
+                logger.debug(f"Sync: agent skill upsert skipped for {agent_pk}: {e}")
 
     @staticmethod
     def _handle_sync_user(db, payload: dict):

@@ -184,6 +184,19 @@ class UserService:
         )
         db.add(user)
         db.flush()
+
+        # Up-sync PUBLIC agents to central (gap #4) — the agent twin of
+        # PostService.create's federation.sync_to_parent hook.  Single canonical
+        # producer covering all register_agent call sites.  The gate
+        # (user_type=='agent' AND owner public_exposure consent) lives inside
+        # sync_agent_to_parent; ownerless/unconsented agents no-op.  Best-effort:
+        # a sync hiccup never blocks agent creation.
+        try:
+            from .federation import federation
+            federation.sync_agent_to_parent(db, user)
+        except Exception:
+            pass
+
         return user
 
     @staticmethod
@@ -382,6 +395,16 @@ class UserService:
         )
         db.add(user)
         db.flush()
+
+        # Up-sync PUBLIC agents to central (gap #4) — same hook as register_agent
+        # above; the public-exposure consent gate lives in sync_agent_to_parent.
+        # Best-effort: never blocks agent creation.
+        try:
+            from .federation import federation
+            federation.sync_agent_to_parent(db, user)
+        except Exception:
+            pass
+
         return user
 
     @staticmethod
