@@ -135,7 +135,6 @@ let
         fi
       fi
     fi
-    WE_MOUNTED=1
 
     BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '-' | cut -c1-12) || BOOT_ID="unknown"
     STAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) || STAMP="?"
@@ -257,9 +256,11 @@ let
 
     # ── Unmount cleanly so the Windows host sees a consistent filesystem. On the
     # periodic phase we KEEP it mounted (re-mount churn on a slow stick is worse
-    # than holding the mount); on shutdown we always unmount. Early-boot unmounts
-    # too so a crash before the first periodic tick still leaves a clean fs. ──
-    if [ "$PHASE" != "periodic" ] && [ "''${WE_MOUNTED:-0}" = "1" ]; then
+    # than holding the mount). On every OTHER phase (early/shutdown/manual) we
+    # unmount IF it is mounted — regardless of which phase mounted it (a prior
+    # periodic tick may hold the mount), so shutdown always leaves a clean fs and
+    # an early-boot crash before the first periodic tick still leaves a clean fs.
+    if [ "$PHASE" != "periodic" ] && mountpoint -q "$MNT" 2>/dev/null; then
       sync || true
       umount "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null || true
     fi
