@@ -337,8 +337,8 @@ in
 
   # ─── Touchpad: libinput tap-to-click (session-agnostic) ───
   # The dconf "org/gnome/desktop/peripherals/touchpad" tap-to-click below ONLY
-  # applies to a GNOME Shell session. The shipped defaultSession is the cage /
-  # GTK4 glass shell (services.displayManager.defaultSession = "hart-glass-gtk4"),
+  # applies to a GNOME Shell session. The shipped defaultSession is the cage
+  # glass shell (services.displayManager.defaultSession = "hart-shell"),
   # which reads its pointer config straight from libinput at the seat level — so
   # tapping the touch SURFACE did nothing on the live OS while the physical
   # button still clicked (pointer + button work; Tapping was simply never
@@ -561,23 +561,28 @@ in
   users.groups.nixos = lib.mkForce {};
   services.getty.autologinUser = lib.mkForce null;
 
-  # ─── Default session = the HART OS native glass shell on a REAL compositor ───
-  # MIGRATED off the cage web-kiosk (Tier-3 floor) to the GTK4 layer-shell host
-  # running on a real Wayland compositor (sway, Tier-2) — the native-compositor
-  # path the #3 (sway-Tier-1) / #4 + #10 (GTK4 layer-shell host) phases built.
-  # hart.layerShellHost registers the "hart-glass-gtk4" wayland-session
-  # (hart-layer-shell-host.nix); it RE-HOSTS the SAME served LiquidUI glass shell
-  # (webkit), so there is no shell rewrite. Its assertion (hart.liquidUI.enable +
-  # renderer="webkit") is satisfied by this config.
+  # ─── Default session = the cage glass shell (the PROVEN painting floor) ───
+  # REVERTED from the sway-Tier-2 "hart-glass-gtk4" default (ff02e48) back to the
+  # cage "hart-shell" session. ff02e48 flipped the desktop default onto the GTK4
+  # layer-shell host running under sway (Tier-2); on REAL HARDWARE that booted to
+  # ONLY A MOUSE POINTER for a very long time — sway came up (its cursor showed)
+  # but the GTK4 + WebKit glass-shell layer-shell host never painted, and the
+  # session-supervisor did NOT fall back because sway was not CRASHING (the shell
+  # host merely HUNG). Stuck on Tier-2 with no shell and no console.
   #
-  # NEVER-FAIL (cannot brick the boot): the cage "hart-shell" session stays
-  # REGISTERED (hart-liquid-ui.nix) AND GNOME stays selectable at the greeter, so
-  # a compositor that fails to come up either drops to cage via the B4
-  # out-of-process tier-drop supervisor, or you interrupt auto-login and pick
-  # "HART OS (cage)" / "GNOME". Revert = flip this one line back to "hart-shell".
-  # Zero-regression by construction.
+  # The cage "hart-shell" session is the audited, HW-proven never-fail paint floor
+  # (its earlier interactivity bugs — keyboard focus, tap-to-click, empty panels —
+  # are already fixed). It stays the DEFAULT until the sway/Tier-2 glass-shell host
+  # is verified to PAINT on real hardware (the "only pointer" regression above).
+  #
+  # sway / hart-glass-gtk4 (Tier-2) + hart-comp (Tier-1) stay REGISTERED as
+  # greeter-selectable sessions and as supervisor rungs (the never-fail ladder);
+  # ONLY the DEFAULT changes back to cage. The shell-paint watchdog added to the
+  # tier-drop supervisor now also escalates a HUNG (not just a crashed) higher tier
+  # down toward this cage floor — but the cage default means a fresh boot lands on
+  # the proven floor with zero dependence on that escalation. Re-flip = one line.
   hart.layerShellHost.enable = true;
-  services.displayManager.defaultSession = lib.mkForce "hart-glass-gtk4";
+  services.displayManager.defaultSession = lib.mkForce "hart-shell";
 
   # Audio: PipeWire bridges all subsystems (Linux, Android, Wine)
   services.pipewire = {
