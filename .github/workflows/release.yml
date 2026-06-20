@@ -275,6 +275,77 @@ jobs:
           sudo apt-get autoremove -y && sudo apt-get clean
           df -h /
 
+      # ── Warm the store with the Rust-in-Nix closure at FULL parallelism ──
+      # WHY THIS STEP EXISTS (the iso-desktop 4h+ hang, run that sat in_progress
+      # 4h23m): baking hart.comp (the Smithay/Rust Tier-1 compositor) into the
+      # iso-desktop closure folds a 245-crate Rust+LLVM compile into the ISO build.
+      # The standalone `nix build .#hart-comp` finishes GREEN in the Nix Build
+      # Matrix job because THAT job leaves `cores` at Nix's default (0 = use ALL
+      # runner cores). The ISO job, by contrast, pins `cores = 2` / `max-jobs = 2`
+      # (added in 8477368 to stop the desktop ISO's parallel C closure from
+      # saturating/OOM-ing the 7-core runner). A 2-core throttle is FINE for the
+      # cache-served C closure but CATASTROPHIC for a CPU-bound 245-crate Rust+LLVM
+      # compile — it stretched the desktop ISO build past 4h and it never settled,
+      # so no nightly could complete. hart.comp is NOT in cache.nixos.org (it is a
+      # HART-local Rust derivation), so the throttled ISO `nix build` had to compile
+      # it from source under the 2-core cap.
+      #
+      # FIX: realise the heavy Rust derivations (hart-rust-precedent FIRST, then
+      # hart-comp) into the LOCAL /nix/store HERE, at `--cores 0` (all cores) and
+      # higher `--max-jobs`, BEFORE the throttled ISO step. Once they are in the
+      # store, the ISO `nix build` finds them already built and never recompiles
+      # them — the 2-core cap then only governs the remaining (lighter, mostly
+      # cache-served) closure, exactly as it did before hart.comp existed.
+      #
+      # Scoped to iso-desktop: hart.comp + hart-rust-precedent are pulled in ONLY
+      # by the desktop closure (flake.nix exposes both via the hart-desktop config),
+      # so warming them is wasted work on server/edge. The flake's `.#hart-comp` /
+      # `.#hart-rust-precedent` package ALIASES are always present and build the
+      # package WITHOUT arming the session (they ride lib.mkDefault on every config,
+      # outside the `lib.mkIf comp.enable` block), so this warms the store whether
+      # or not the steward has re-armed `hart.comp.enable`.
+      #
+      # DELIBERATELY runs WHILE comp.enable is still deferred (false): it
+      # continuously PROVES the full-core in-ISO-runner Rust build settles in
+      # normal time, so the steward gets a standing green signal that re-arming
+      # `hart.comp.enable = true` is SAFE (the whole point — make the build viable
+      # so Tier-1 CAN ship). When they DO re-arm it, the hart-comp closure is
+      # already realised in this runner's store and the throttled ISO step reuses
+      # it instead of recompiling under the 2-core cap.
+      #
+      # Never blocks the release: `|| true` — if the precedent/comp build itself
+      # regresses, the ISO step (which, with comp.enable currently OFF, does not
+      # even pull hart.comp) still runs. The Nix Build Matrix job is the hard gate
+      # that red-fails a broken hart-comp; this is purely a store-warming optimiser.
+      - name: Warm Rust closure (hart-rust-precedent, hart-comp) at full cores
+        if: matrix.target == 'iso-desktop'
+        working-directory: nixos
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "=== Pre-building the Rust-in-Nix closure at full parallelism ==="
+          echo "    (precedent first to isolate toolchain resolution, then hart-comp)"
+          # --cores 0 = ALL runner cores per derivation (this is the actual fix —
+          # the global cores=2 was strangling the CPU-bound rustc/LLVM compiles).
+          # --max-jobs 2 keeps the CONCURRENT-derivation count (and hence peak
+          # memory) at the SAME ceiling the ISO step already tolerates; we are not
+          # raising memory pressure, only un-throttling the per-build core count.
+          # These per-invocation flags OVERRIDE the global cores=2/max-jobs=2 from
+          # the installer conf for THIS warm-up only; the ISO step below keeps the
+          # 2-core safety cap for its (cache-served) C closure.
+          for tgt in hart-rust-precedent hart-comp; do
+            echo "--- nix build .#$tgt (warm) ---"
+            time nix build ".#$tgt" \
+              --no-link --print-out-paths --show-trace \
+              --cores 0 --max-jobs 2 \
+              --option narinfo-cache-negative-ttl 0 || {
+                echo "::warning title=Rust warm-up::nix build .#$tgt did not complete in the warm step — the ISO step will fall back to its own (throttled) build path. See the Nix Build Matrix job for the authoritative hart-comp gate."
+                # Do not fail the release on a warm-up miss.
+                continue
+              }
+          done
+          echo "=== Rust closure warm-up done ==="
+
       - name: Build ${{ matrix.target }}
         working-directory: nixos
         shell: bash
