@@ -13,6 +13,7 @@ When target is a watch: find phone as relay → push tts_stream with relay_to_de
 """
 import json
 import logging
+import uuid
 from typing import Dict, List, Optional
 
 from .fleet_command import FleetCommandService
@@ -167,8 +168,10 @@ class DeviceRoutingService:
     ) -> Dict:
         """Push consent request to user's primary device.
 
-        Creates both a Notification (persistent, cross-device visible) and
-        a FleetCommand (real-time push to best device).
+        Creates a Notification (persistent, cross-device visible), fires a
+        consent_prompt FCM (the native Truecaller-style ConsentOverlayService
+        that draws over other apps so the user can act without opening the
+        app), and a FleetCommand (real-time push to the RN app when open).
 
         Args:
             db: SQLAlchemy session.
@@ -188,6 +191,37 @@ class DeviceRoutingService:
             message=f"[{action}] {description}",
         )
 
+        # Fire the Truecaller-style consent overlay on the user's phone.  The
+        # native ConsentOverlayService is started ONLY by an FCM whose data
+        # carries type=='consent_prompt' (MyFirebaseMessagingService
+        # .handleConsentPrompt → startService).  The FleetCommand below reaches
+        # the RN app only when it is OPEN, so without this FCM the over-other-
+        # apps overlay never pops while the user is away from the agent's
+        # device — which is the whole point (agents run on the laptop; the user
+        # acts on the phone).  Payload mirrors chatbot_pipeline/confirmation.py.
+        # No-ops cleanly on a node with no edge FCM credential (send_fcm_push
+        # gates on HART_FCM_SA_FILE/HART_FCM_ACCESS_TOKEN + HART_FCM_PROJECT).
+        request_id = uuid.uuid4().hex
+        try:
+            from core.fcm_sync import send_fcm_push
+            send_fcm_push(
+                str(user_id),
+                'HARTOS consent',
+                f"[{action}] {description}" if description
+                else f"An agent needs your consent: {action}",
+                data={
+                    'type': 'consent_prompt',
+                    'request_id': request_id,
+                    'user_id': str(user_id),
+                    'topic_reply': f'com.hertzai.pupit.{user_id}',
+                    'action': str(action),
+                    'agent_id': str(agent_id),
+                },
+            )
+        except Exception as exc:  # a push failure must never break the record
+            logger.debug('consent_prompt FCM push failed (%s) — notification + '
+                         'fleet command remain', exc)
+
         # Find primary device (phone > desktop > tablet > any)
         devices = db.query(DeviceBinding).filter_by(
             user_id=user_id, is_active=True,
@@ -196,7 +230,7 @@ class DeviceRoutingService:
         if not devices:
             db.flush()
             return {'success': True, 'command_id': None, 'device_id': '',
-                    'method': 'notification_only'}
+                    'request_id': request_id, 'method': 'fcm_consent_prompt'}
 
         # Pick best device — prefer phone, then by recency
         target = devices[0]
@@ -210,6 +244,7 @@ class DeviceRoutingService:
             'agent_id': agent_id,
             'description': description,
             'timeout_s': timeout_s,
+            'request_id': request_id,
         }
         cmd = FleetCommandService.push_command(
             db, target.device_id, 'agent_consent', params,
@@ -221,5 +256,6 @@ class DeviceRoutingService:
             'success': True,
             'command_id': cmd_id,
             'device_id': target.device_id,
+            'request_id': request_id,
             'method': 'fleet_command',
         }
