@@ -90,17 +90,27 @@ def list_disks():
 
 
 def _list_disks_windows():
+    """Enumerate disks via Get-Disk, but with a hard subprocess TIMEOUT and a
+    diskpart fallback. The Windows Storage/PnP/WMI stack can WEDGE under heavy
+    WSL2/Hyper-V/QEMU load — `Get-Disk` then hangs 15+ minutes. diskpart is a
+    native tool that does NOT touch the wedged WMI path, so it still sees the
+    disks. See memory/reference_windows_usb_wedge_pnputil_reset.md."""
     ps = (
         "Get-Disk | ForEach-Object { [pscustomobject]@{ "
         "Number=$_.Number; Model=$_.FriendlyName; Size=[int64]$_.Size; "
         "Bus=[string]$_.BusType; Boot=[bool]$_.IsBoot; System=[bool]$_.IsSystem } } "
         "| ConvertTo-Json -Compress"
     )
-    r = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
-    out = (r.stdout or "").strip()
-    if not out:
-        return []
-    data = json.loads(out)
+    try:
+        r = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                 timeout=12)
+        out = (r.stdout or "").strip()
+        if not out:
+            return _list_disks_windows_diskpart()
+        data = json.loads(out)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        # WMI/Storage wedged or returned garbage — diskpart is native + fast.
+        return _list_disks_windows_diskpart()
     if isinstance(data, dict):
         data = [data]
     disks = []
@@ -119,6 +129,153 @@ def _list_disks_windows():
             "physdrive": r"\\.\PhysicalDrive%d" % int(n),
         })
     return disks
+
+
+def _diskpart_script(lines):
+    """Run a diskpart script (list of commands) with a timeout, return stdout.
+    diskpart bypasses the wedge-prone WMI/Storage enumeration path."""
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        r = subprocess.run(["diskpart", "/s", path],
+                           capture_output=True, text=True, timeout=30)
+        return r.stdout or ""
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _parse_diskpart_size(size_str):
+    """'28 GB' / '953 GB' / '3072 KB' -> bytes (int)."""
+    parts = size_str.split()
+    if len(parts) < 2:
+        return 0
+    try:
+        val = float(parts[0])
+    except ValueError:
+        return 0
+    unit = parts[1].upper()
+    mult = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}.get(unit, 0)
+    return int(val * mult)
+
+
+def _list_disks_windows_diskpart():
+    """Diskpart-based disk enumeration — the native fallback when Get-Disk hangs.
+
+    Parses `list disk` for the disk numbers + sizes, then `select disk N` +
+    `detail disk` per disk for the bus `Type :` (USB => removable) and the
+    `Boot Disk :` line (Yes => system). Returns the SAME dict shape as
+    `_list_disks_windows`."""
+    import re
+    out = _diskpart_script(["list disk"])
+    disks = []
+    # Lines look like:  "  Disk 0    Online          953 GB  2048 KB        *"
+    for line in out.splitlines():
+        m = re.match(r"\s*Disk\s+(\d+)\s+\S+\s+(\d+\s*[KMGT]?B)", line)
+        if not m:
+            continue
+        n = int(m.group(1))
+        size = _parse_diskpart_size(m.group(2))
+        detail = _diskpart_script(["select disk %d" % n, "detail disk"])
+        bus, model, system = _parse_diskpart_detail(detail)
+        disks.append({
+            "number": n,
+            "model": model or "?",
+            "size": size,
+            "bus": bus,
+            "removable": bus == "USB",
+            "system": system,
+            "dev": "/dev/sd%c" % chr(ord("a") + n),
+            "physdrive": r"\\.\PhysicalDrive%d" % n,
+        })
+    return disks
+
+
+def _parse_diskpart_detail(detail):
+    """From `detail disk` output extract (bus, model, system).
+
+    The model name is the first non-empty, non-`Key : value`, non-`Disk ID:`
+    line after the header. `Type : USB` => bus 'USB'. `Boot Disk : Yes` (or a
+    USB-less disk that is the boot/pagefile disk) => system True."""
+    bus, model, system = "", "", False
+    for raw in detail.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith("type") and ":" in line:
+            bus = line.split(":", 1)[1].strip().upper()
+        elif low.startswith("boot disk") and ":" in line:
+            system = system or line.split(":", 1)[1].strip().lower().startswith("yes")
+        elif low.startswith("pagefile disk") and ":" in line:
+            system = system or line.split(":", 1)[1].strip().lower().startswith("yes")
+        elif (not model and ":" not in line
+              and not low.startswith("microsoft diskpart")
+              and not low.startswith("copyright")
+              and not low.startswith("on computer")
+              and not low.startswith("disk ")
+              and not low.startswith("volume ")
+              and not low.startswith("-")):
+            model = line
+    # A USB-bus disk is removable and never a system disk.
+    if bus == "USB":
+        system = False
+    return bus, model, system
+
+
+def _windows_usb_host_controllers():
+    """Return the USB host-controller PCI Instance IDs from pnputil. These are
+    the `PCI\\VEN_...` xHCI eXtensible-Host-Controller entries — restarting them
+    re-enumerates the whole USB bus without a reboot. pnputil is native and does
+    NOT use the wedge-prone WMI path."""
+    try:
+        r = subprocess.run(
+            ["pnputil", "/enum-devices", "/connected", "/class", "USB"],
+            capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    ids = []
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("Instance ID:"):
+            inst = line.split(":", 1)[1].strip()
+            # Only the PCI host controllers — NOT the hubs/devices hanging off
+            # them. Restarting a hub/Root-Hub hangs on a wedged stack; the PCI
+            # xHCI controller restart is the safe reboot-equivalent reset.
+            if inst.upper().startswith("PCI\\"):
+                ids.append(inst)
+    return ids
+
+
+def _windows_usb_self_heal(log=None):
+    """Un-wedge a hung Windows USB stack WITHOUT a reboot: restart each USB PCI
+    host controller via pnputil (re-enumerates the bus), then wait for the
+    devices to settle. Native path — works where Get-Disk/WMI hangs. See
+    memory/reference_windows_usb_wedge_pnputil_reset.md."""
+    log = log or (lambda m: print(m, flush=True))
+    log("USB stack looked wedged — resetting the controllers, re-scanning…")
+    controllers = _windows_usb_host_controllers()
+    if not controllers:
+        log("  no USB host controllers found to restart (pnputil empty/timed out)")
+        return False
+    restarted = 0
+    for inst in controllers:
+        try:
+            r = subprocess.run(["pnputil", "/restart-device", inst],
+                               capture_output=True, text=True, timeout=30)
+            ok = r.returncode == 0 or "restart" in (r.stdout or "").lower()
+            log("  restart %s: %s" % (inst, "OK" if ok else "(no change)"))
+            restarted += 1 if ok else 0
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log("  restart %s: skipped (%s)" % (inst, e))
+    time.sleep(4)  # let the bus re-enumerate before we re-scan
+    return restarted > 0
 
 
 def _list_disks_linux():
@@ -156,6 +313,24 @@ def _list_disks_macos():
 
 def usb_disks(disks):
     return [d for d in disks if d["removable"] and not d["system"]]
+
+
+def list_disks_with_self_heal(allow_system=False, log=None):
+    """Enumerate disks; if the candidate set is empty on Windows, the USB stack
+    may be wedged (Get-Disk hung / nothing enumerated). Run the pnputil
+    controller-restart self-heal ONCE, re-enumerate (the native diskpart path),
+    and return the disks. So a user who says "it's plugged in" auto-recovers
+    instead of needing a reboot.
+
+    Returns (all_disks, candidate_disks)."""
+    log = log or (lambda m: print(m, flush=True))
+    disks = list_disks()
+    candidates = disks if allow_system else usb_disks(disks)
+    if not candidates and IS_WIN:
+        if _windows_usb_self_heal(log):
+            disks = list_disks()
+            candidates = disks if allow_system else usb_disks(disks)
+    return disks, candidates
 
 
 def human(n):
@@ -549,8 +724,7 @@ def _tee_logger(log_path, console):
 
 # ───────────────────────── CLI ─────────────────────────
 def cmd_list(args):
-    disks = list_disks()
-    shown = disks if args.allow_system else usb_disks(disks)
+    _, shown = list_disks_with_self_heal(args.allow_system)
     if not shown:
         print("No removable/USB disks found." if not args.allow_system else "No disks.")
         return 1
@@ -564,8 +738,8 @@ def cmd_list(args):
 
 
 def pick_disk(args):
-    disks = list_disks()
-    pool = disks if args.allow_system else usb_disks(disks)
+    _, pool = list_disks_with_self_heal(args.allow_system,
+                                        log=lambda m: sys.stderr.write(m + "\n"))
     sel = [d for d in pool if str(d["number"]) == str(args.device)]
     if not sel:
         sys.stderr.write("Device %r is not an offered %s disk. Run --list.\n" %
@@ -675,7 +849,7 @@ def launch_gui():
     disk_cb = ttk.Combobox(row, state="readonly", width=46); disk_cb.pack(side="left")
 
     def refresh():
-        ds = usb_disks(list_disks())
+        _, ds = list_disks_with_self_heal(allow_system=False, log=log)
         disks_state["list"] = ds
         disk_cb["values"] = ["#%s  %s  (%s)" % (d["number"], d["model"], human(d["size"])) for d in ds]
         if ds:
