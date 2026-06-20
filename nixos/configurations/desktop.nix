@@ -187,9 +187,13 @@ in
       enable = true;
       # Fresh/un-latched boots start at Tier-1 (hart-comp). The supervisor owns
       # the never-blank guarantee, so an unavailable/crashing/hung Tier-1 falls
-      # straight through to sway then the cage floor. (Default already hart-comp;
-      # stated explicitly so the boot tier is visible at the desktop config.)
-      startTier = "hart-comp";
+      # DEFERRED to cage: baking hart.comp into the ISO made the iso-desktop build
+      # hang 4h+ (the first Rust/Smithay build in the image — no nightly could
+      # complete), AND Tier-1+Tier-2 both hang on the still-unfixed GTK4 glass host
+      # (they fall to cage anyway). Boot straight to the working cage floor until
+      # the host paint is fixed; flip back to "hart-comp" once comp.enable is
+      # re-armed below. The supervisor ladder CODE is unchanged.
+      startTier = "cage";
     };
 
     # Tier-1: HART-comp, the AI-native Smithay/Rust compositor (--backend drm).
@@ -197,11 +201,17 @@ in
     # the desktop closure and arms the supervisor's Tier-1 rung (compCommand via
     # mkDefault in hart-comp.nix). hart-comp reuses the SAME GTK4 layer-shell glass
     # host as Tier-2 sway, so it satisfies the same shell-paint watchdog marker.
-    comp.enable = true;
-    # HART-comp is the FIRST Rust-in-Nix build; its assertion requires the
-    # precedent module (claw-cli) to prove the pinned toolchain resolves a real
-    # crate graph FIRST. Enable it so `hart.comp.enable` is coherent.
-    rustPrecedent.enable = true;
+    # DEFERRED: baking hart.comp (the Rust/Smithay compositor) into the ISO made
+    # the iso-desktop build HANG 4h+ — the first Rust-in-Nix build inside the image
+    # never settled, so no nightly could complete. Re-arm this AND
+    # startTier="hart-comp" above ONLY once (a) the GTK4 glass-host paint hang is
+    # fixed so Tier-1 actually paints, and (b) the hart.comp Nix build is cached so
+    # the ISO stays fast. The supervisor ladder + the compositor sources are
+    # untouched — this flag only controls whether the heavy Rust closure ships in
+    # the ISO. rustPrecedent (claw-cli, another Rust build) is only needed to
+    # satisfy hart.comp.enable's assertion, so it goes too.
+    comp.enable = false;
+    rustPrecedent.enable = false;
 
     # Tier-2: sway running the canonical glass shell + the swaymsg WM shim the
     # brain drives when HART-comp is absent. Registers the sway session + the
