@@ -173,6 +173,13 @@ ask the user to re-flash to deliver an update — line up an OTA push instead
   closure, and **atomically switches the NixOS generation** (rollback =
   `nixos-rebuild switch --rollback`; the canary auto-reverts on health
   regression; the node never force-applies past canary).
+- **Mesh, NOT central-only:** a **regional-tier** node can also initiate (the node
+  accepts `required_tier='regional'`, central/regional Ed25519, master-anchored);
+  the **gossip/WAMP/PeerLink** fabric relays peer-to-peer (any same-network peer);
+  **regional hosts own + serve their sub-fleet** (discovery + staged rollout + the
+  pull source — `centralEndpoint` can be a regional host, not only etime). Trust is
+  still master-anchored (regional certs delegated from central; a relay can't forge
+  authority).
 - **SIGN is master-key-gated → steward-only, AI-EXCLUDED.** Claude preps + greens
   the closure; the human signs the release.
 - **To ship a Nix-built component (e.g. the HART-comp compositor) via OTA:** its
