@@ -1,7 +1,8 @@
 """Embodied error propagation through the hevolveai hive.
 
-WorldModelBridge talks to HevolveAI's embodied model over HTTP (/v1/actions,
-/v1/sensors/batch, /v1/feedback/latest). Before this, a failure only bumped the
+WorldModelBridge talks to HevolveAI's embodied model over HTTP — HevolveAI is
+sensor-ingest-centric (actions + sensors → /v1/sensor/ingest, feedback → /v1/stats).
+Before this, a failure only bumped the
 LOCAL circuit breaker — nothing reached the hive's error machinery. These tests
 assert _propagate_embodied_error() records every embodied failure into the central
 ExceptionCollector (the SAME sink SelfHealingDispatcher consumes → fix goals).

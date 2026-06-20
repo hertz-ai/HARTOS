@@ -658,11 +658,14 @@ class ModelCatalog:
         WorldModelBridge endpoints. Errors dispatching to any of them propagate
         through the hive via WorldModelBridge._propagate_embodied_error.
         """
+        # The bridge owns endpoint selection per-method — HevolveAI is
+        # sensor-ingest-centric (actions + sensors → /v1/sensor/ingest, feedback
+        # → /v1/stats), and that single source of truth lives in WorldModelBridge.
+        # The catalog must NOT hardcode endpoint URLs (a prior copy advertised
+        # /v1/actions, /v1/sensors/batch, /v1/feedback/latest that don't exist on
+        # HevolveAI → catalog↔bridge drift; removed).
         bridge_caps = {
             'bridge': 'integrations.agent_engine.world_model_bridge.WorldModelBridge',
-            'action_endpoint': '/v1/actions',
-            'sensor_endpoint': '/v1/sensors/batch',
-            'feedback_endpoint': '/v1/feedback/latest',
         }
         common = dict(
             model_type=ModelType.EMBODIED, source='pip', backend='in_process',

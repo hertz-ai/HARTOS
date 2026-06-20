@@ -50,8 +50,11 @@ def test_populate_embodied_registers_three_robotsuite_models():
     assert world.capabilities['output'] == 'predicted_video'
     # RobotNav — 8 (x, y, theta) waypoints
     assert nav.capabilities['num_waypoints'] == 8
-    # all three share the WorldModelBridge endpoints
-    assert manip.capabilities['action_endpoint'] == '/v1/actions'
+    # all three route through the ONE WorldModelBridge, which OWNS endpoint
+    # selection — the catalog must not hardcode drift-prone endpoint URLs
+    assert manip.capabilities['bridge'].endswith('WorldModelBridge')
+    assert 'action_endpoint' not in manip.capabilities
+    assert 'sensor_endpoint' not in manip.capabilities
 
 
 def test_declared_action_verbs_are_real_robotaction_factories():
