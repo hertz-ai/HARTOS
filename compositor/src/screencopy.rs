@@ -157,11 +157,7 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for State {
                 // rejects an out-of-bounds region — we clamp rather than fail so a
                 // slightly-oversized region still yields a sane capture).
                 let out = comp_core::output_physical_size(state);
-                let rx = x.max(0).min(out.w);
-                let ry = y.max(0).min(out.h);
-                let rw = width.max(1).min(out.w - rx);
-                let rh = height.max(1).min(out.h - ry);
-                let region = Rectangle::new((rx, ry).into(), (rw, rh).into());
+                let region = clamp_region(x, y, width, height, out.w, out.h);
                 init_frame(state, frame, region, data_init);
             }
             zwlr_screencopy_manager_v1::Request::Destroy => {}
@@ -413,6 +409,29 @@ fn fill_one(
     Ok(())
 }
 
+/// Clamp a client-requested `CaptureOutputRegion` rect to the output bounds, so a
+/// client can never read outside the framebuffer. PURE region math (no renderer / no
+/// Smithay state): the requested `(x, y, width, height)` is clamped against the output's
+/// `(out_w, out_h)` exactly as the inline `CaptureOutputRegion` arm did — extracted so
+/// the clamp is one source of truth AND unit-testable without a live output.
+///
+/// Invariants the clamp guarantees: origin in `[0, out]`, width/height ≥ 1, and the rect
+/// never extends past the right/bottom edge (`rx + rw ≤ out_w`, `ry + rh ≤ out_h`).
+fn clamp_region(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    out_w: i32,
+    out_h: i32,
+) -> Rectangle<i32, BufferCoord> {
+    let rx = x.max(0).min(out_w);
+    let ry = y.max(0).min(out_h);
+    let rw = width.max(1).min(out_w - rx);
+    let rh = height.max(1).min(out_h - ry);
+    Rectangle::new((rx, ry).into(), (rw, rh).into())
+}
+
 /// Map a logical capture region to the physical framebuffer rectangle under the
 /// output's render transform, so a read-back of the raw framebuffer yields an upright
 /// image. Smithay's `Transform::transform_rect_in(rect, area_size)` is the canonical
@@ -440,4 +459,154 @@ fn now_secs_nsecs() -> (u64, u32) {
 #[allow(unused)]
 pub(crate) fn shm_supported(format: wl_shm::Format) -> bool {
     shm_format_to_fourcc(format).is_some()
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PURE region/format math unit floor (M6 screencopy). These exercise the
+// framebuffer read-back's geometry helpers — region clamping (the no-out-of-bounds
+// gate), the output-transform region map (upright capture), the wall-clock split for
+// the `ready` timestamp, and the advertised capture format — with NO live renderer /
+// GlesRenderer / wl_buffer. The killswitch gate + the shm-buffer validation in
+// `queue_copy` are exercised live via the M6 grim-capture harness (they need a real
+// `State` + client buffer); these cover everything that is computable in isolation.
+// Compiled only under `--features winit` (the feature that builds screencopy.rs).
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── clamp_region: the no-out-of-bounds gate for CaptureOutputRegion ──
+
+    #[test]
+    fn clamp_region_passes_through_an_in_bounds_rect() {
+        let r = clamp_region(100, 50, 320, 240, 1920, 1080);
+        assert_eq!((r.loc.x, r.loc.y), (100, 50));
+        assert_eq!((r.size.w, r.size.h), (320, 240));
+    }
+
+    #[test]
+    fn clamp_region_full_output_is_the_whole_framebuffer() {
+        let r = clamp_region(0, 0, 1920, 1080, 1920, 1080);
+        assert_eq!((r.loc.x, r.loc.y), (0, 0));
+        assert_eq!((r.size.w, r.size.h), (1920, 1080));
+    }
+
+    #[test]
+    fn clamp_region_negative_origin_is_pinned_to_zero() {
+        let r = clamp_region(-50, -30, 200, 200, 1920, 1080);
+        assert_eq!((r.loc.x, r.loc.y), (0, 0), "negative origin clamps to (0,0)");
+        assert_eq!((r.size.w, r.size.h), (200, 200));
+    }
+
+    #[test]
+    fn clamp_region_oversized_width_is_trimmed_to_the_right_edge() {
+        // Origin at x=1800 on a 1920-wide output: only 120px remain, so an asked-for
+        // 500px width is trimmed so rx+rw never exceeds out_w.
+        let r = clamp_region(1800, 0, 500, 100, 1920, 1080);
+        assert_eq!(r.loc.x, 1800);
+        assert_eq!(r.size.w, 120, "width trimmed so rx+rw == out_w (1920)");
+        assert_eq!(r.loc.x + r.size.w, 1920);
+    }
+
+    #[test]
+    fn clamp_region_oversized_height_is_trimmed_to_the_bottom_edge() {
+        let r = clamp_region(0, 1000, 100, 500, 1920, 1080);
+        assert_eq!(r.loc.y, 1000);
+        assert_eq!(r.size.h, 80, "height trimmed so ry+rh == out_h (1080)");
+        assert_eq!(r.loc.y + r.size.h, 1080);
+    }
+
+    #[test]
+    fn clamp_region_zero_or_negative_size_floors_to_one_px() {
+        // width/height ≥ 1 always (a 0-px or negative request would make an empty
+        // framebuffer read-back the ExportMem contract rejects).
+        let r = clamp_region(10, 10, 0, -5, 1920, 1080);
+        assert_eq!(r.size.w, 1, "width floors to 1");
+        assert_eq!(r.size.h, 1, "height floors to 1");
+    }
+
+    #[test]
+    fn clamp_region_origin_past_the_far_edge_still_yields_a_valid_one_px_rect() {
+        // x beyond out_w: rx pins to out_w, then rw = (out_w - rx).max(1) = 1 — the
+        // rect is degenerate-but-valid (1px), never out-of-bounds or empty.
+        let r = clamp_region(5000, 5000, 100, 100, 1920, 1080);
+        assert_eq!(r.loc.x, 1920);
+        assert_eq!(r.loc.y, 1080);
+        assert_eq!(r.size.w, 1);
+        assert_eq!(r.size.h, 1);
+    }
+
+    // ── transform_region: upright-capture region map under the output transform ──
+
+    #[test]
+    fn transform_region_normal_is_identity() {
+        let region = Rectangle::new((100, 50).into(), (320, 240).into());
+        let out = (1920, 1080).into();
+        let mapped = transform_region(region, out, Transform::Normal);
+        assert_eq!(mapped, region, "Normal transform leaves the region unchanged");
+    }
+
+    #[test]
+    fn transform_region_full_output_under_flipped180_is_the_same_rect() {
+        // A 180° point reflection maps the FULL-output rect back onto itself (the M6
+        // winit render transform is Flipped180; a full-screen grab is unaffected).
+        let region = Rectangle::new((0, 0).into(), (1920, 1080).into());
+        let out = (1920, 1080).into();
+        let mapped = transform_region(region, out, Transform::Flipped180);
+        assert_eq!((mapped.size.w, mapped.size.h), (1920, 1080));
+        assert_eq!((mapped.loc.x, mapped.loc.y), (0, 0));
+    }
+
+    #[test]
+    fn transform_region_subregion_under_flipped180_flips_only_the_y_axis() {
+        // Flipped180 is a Y-axis flip (NOT a full point reflection): the x origin is
+        // preserved, the y origin maps to `area.h - y - height`, and the size is
+        // unchanged. A top-left 100x100 rect at (0,0) maps to the BOTTOM-LEFT corner
+        // (x stays 0, y becomes 1080-0-100). (Matches Smithay's own
+        // `transform_rect_f180` semantics for `Transform::Flipped180`.)
+        let region = Rectangle::new((0, 0).into(), (100, 100).into());
+        let out = (1920, 1080).into();
+        let mapped = transform_region(region, out, Transform::Flipped180);
+        assert_eq!((mapped.size.w, mapped.size.h), (100, 100), "size preserved");
+        assert_eq!(mapped.loc.x, 0, "x origin is NOT flipped by Flipped180");
+        assert_eq!(mapped.loc.y, 1080 - 100, "y origin flips to area.h - y - height");
+    }
+
+    // ── now_secs_nsecs: the `ready` presentation timestamp split ──
+
+    #[test]
+    fn now_secs_nsecs_is_a_plausible_wall_clock() {
+        let (sec, nsec) = now_secs_nsecs();
+        // Well after 2021 (1.6e9) and the nanosecond part is a valid sub-second value.
+        assert!(sec > 1_600_000_000, "seconds is a real UNIX wall clock: {sec}");
+        assert!(nsec < 1_000_000_000, "nsec is a sub-second remainder: {nsec}");
+    }
+
+    #[test]
+    fn ready_timestamp_hi_lo_split_round_trips() {
+        // The wire splits the u64 seconds into (hi, lo) u32 halves for `ready`. Prove
+        // the split the render path uses reconstructs the original on a value whose hi
+        // half is non-zero (so a truncating split would be caught).
+        let sec: u64 = 0x0000_0001_2345_6789;
+        let hi = (sec >> 32) as u32;
+        let lo = (sec & 0xFFFF_FFFF) as u32;
+        assert_eq!(hi, 1);
+        assert_eq!(lo, 0x2345_6789);
+        assert_eq!(((hi as u64) << 32) | lo as u64, sec);
+    }
+
+    // ── format invariants ──
+
+    #[test]
+    fn capture_fourcc_is_the_mandatory_opaque_format() {
+        assert_eq!(CAPTURE_FOURCC, Fourcc::Xrgb8888, "we advertise the opaque Xrgb floor");
+    }
+
+    #[test]
+    fn shm_supported_accepts_the_wlr_capture_formats() {
+        // grim/wf-recorder always allocate Xrgb8888 or Argb8888 — both must map to a
+        // Fourcc (the read-back copies straight into either).
+        assert!(shm_supported(wl_shm::Format::Xrgb8888));
+        assert!(shm_supported(wl_shm::Format::Argb8888));
+    }
 }

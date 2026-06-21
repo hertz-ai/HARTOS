@@ -640,3 +640,273 @@ fn ipc_add_subscriber<S: CompState>(state: &mut S, stream: &mut UnixStream) -> S
     ipc.subscribers.push(sub);
     id
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// PURE IPC unit floor — the framed-JSON transport (IPC_PROTOCOL.md §2/§3) + the
+// argument extractors + the response envelope + the subscriber fan-out. None of
+// these need a live `State`/`Space`/`Seat`: they operate on byte buffers, JSON
+// values, and Unix socketpairs. The window-MUTATING verb dispatch
+// (focus/place/tile/...) runs against the live `space` and is exercised by the M4/M5
+// live IPC harness against $HART_SOCK; THIS module covers everything that is
+// computable in isolation — the framing reassembly, the poison-frame guard, the
+// request parse contract (valid / malformed / unknown-method shape), the 1-based↔
+// 0-based workspace conversion, the explicit-rect target resolution, and the live
+// event fan-out + dead-subscriber drop. Compiled under `any(winit, smithay)`.
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    // ── framing: write_frame + Connection reassembly (IPC_PROTOCOL.md §2) ──
+
+    /// Frame a JSON body the way `write_frame` does (4-byte BE length + body), into a
+    /// plain Vec so `Connection::next_frame` can be driven without a socket.
+    fn framed(body: &[u8]) -> Vec<u8> {
+        let mut v = (body.len() as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn conn_with(buf: Vec<u8>) -> Connection {
+        // A Connection needs a stream for its `fill()`/`stream` field, but `next_frame`
+        // only reads `self.buf` — so pair a throwaway socket and pre-load the buffer.
+        let (a, _b) = UnixStream::pair().expect("socketpair");
+        let mut c = Connection::new(a);
+        c.buf = buf;
+        c
+    }
+
+    #[test]
+    fn next_frame_returns_none_until_a_whole_frame_is_buffered() {
+        let body = br#"{"method":"window.list"}"#;
+        let full = framed(body);
+        // Only the first 6 bytes buffered (length prefix + 2 body bytes) → not yet a frame.
+        let mut c = conn_with(full[..6].to_vec());
+        assert!(c.next_frame().is_none(), "a partial frame yields None");
+    }
+
+    #[test]
+    fn next_frame_pops_one_complete_frame_and_leaves_the_remainder() {
+        let body1 = br#"{"method":"window.list"}"#;
+        let body2 = br#"{"method":"screen.kill","args":{"on":true}}"#;
+        let mut buf = framed(body1);
+        buf.extend(framed(body2)); // two frames back-to-back in one buffer
+        let mut c = conn_with(buf);
+
+        let got1 = c.next_frame().expect("first frame fully buffered");
+        assert_eq!(got1, body1, "first frame body is returned verbatim");
+        let got2 = c.next_frame().expect("second frame is still buffered after the first pop");
+        assert_eq!(got2, body2, "the remainder reassembles into the second frame");
+        assert!(c.next_frame().is_none(), "buffer drained after both frames");
+    }
+
+    #[test]
+    fn next_frame_reassembles_a_body_split_across_two_reads() {
+        // The wire may split a frame; feeding the second half later must reassemble it.
+        let body = br#"{"method":"window.focus","args":{"handle":"win_1"}}"#;
+        let full = framed(body);
+        let split = full.len() - 5;
+        let mut c = conn_with(full[..split].to_vec());
+        assert!(c.next_frame().is_none(), "incomplete → None");
+        c.buf.extend_from_slice(&full[split..]); // the rest arrives
+        assert_eq!(c.next_frame().expect("now complete"), body);
+    }
+
+    #[test]
+    fn next_frame_drops_the_buffer_on_a_poison_length_prefix() {
+        // A length prefix above MAX_FRAME_LEN must NOT allocate gigabytes — the guard
+        // clears the buffer + returns None (resync) rather than honouring the size.
+        let poison = (MAX_FRAME_LEN + 1).to_be_bytes().to_vec();
+        let mut c = conn_with(poison);
+        assert!(c.next_frame().is_none(), "poison frame yields None");
+        assert!(c.buf.is_empty(), "the poison buffer is dropped to resync");
+    }
+
+    #[test]
+    fn write_frame_then_next_frame_round_trips_over_a_real_socketpair() {
+        // End-to-end of the wire helpers: write_frame onto one end, read+reassemble on
+        // the other via Connection (the exact path register_connection uses).
+        let (mut tx, rx) = UnixStream::pair().expect("socketpair");
+        let body = br#"{"id":"r1","method":"window.tile","args":{"layout":"grid"}}"#;
+        write_frame(&mut tx, body).expect("write the framed body");
+        drop(tx); // EOF so fill() returns Ok(true) after draining
+
+        let mut c = Connection::new(rx);
+        let closed = c.fill().expect("drain readable bytes");
+        let got = c.next_frame().expect("a whole frame reassembled from the socket");
+        assert_eq!(got, body);
+        assert!(closed, "peer closed → fill reports EOF");
+    }
+
+    // ── request parse contract (IPC_PROTOCOL.md §3) ──
+
+    #[test]
+    fn request_parses_a_well_formed_frame_with_id_method_args() {
+        let req: Request =
+            serde_json::from_slice(br#"{"id":"abc","method":"window.move","args":{"handle":"win_2","x":10,"y":20}}"#)
+                .expect("valid request parses");
+        assert_eq!(req.id.as_deref(), Some("abc"));
+        assert_eq!(req.method, "window.move");
+        assert_eq!(arg_handle(&req.args).as_deref(), Some("win_2"));
+        assert_eq!(arg_i32(&req.args, "x"), Some(10));
+        assert_eq!(arg_i32(&req.args, "y"), Some(20));
+    }
+
+    #[test]
+    fn request_id_and_args_default_when_omitted() {
+        // `id` is optional and `args` defaults to Null (so a bare `{"method":"..."}`
+        // is valid — a read-only verb like window.list takes no args).
+        let req: Request =
+            serde_json::from_slice(br#"{"method":"window.list"}"#).expect("bare method parses");
+        assert!(req.id.is_none(), "missing id → None");
+        assert!(req.args.is_null(), "missing args → Null");
+        assert_eq!(req.method, "window.list");
+    }
+
+    #[test]
+    fn request_without_a_method_is_a_parse_error() {
+        // `method` is required — a frame lacking it is malformed (handle_frame turns this
+        // into an `invalid_args` error response, never a panic).
+        let err = serde_json::from_slice::<Request>(br#"{"id":"x"}"#);
+        assert!(err.is_err(), "a request with no method must fail to parse");
+    }
+
+    #[test]
+    fn malformed_json_is_a_parse_error_not_a_panic() {
+        assert!(serde_json::from_slice::<Request>(b"{not json").is_err());
+        assert!(serde_json::from_slice::<Request>(b"").is_err());
+    }
+
+    // ── argument extractors ──
+
+    #[test]
+    fn arg_handle_reads_a_string_handle_or_none() {
+        assert_eq!(arg_handle(&json!({"handle": "win_7f3a"})).as_deref(), Some("win_7f3a"));
+        assert_eq!(arg_handle(&json!({"handle": 5})), None, "non-string handle → None");
+        assert_eq!(arg_handle(&json!({})), None, "missing handle → None");
+    }
+
+    #[test]
+    fn arg_i32_reads_an_integer_coord_or_none() {
+        assert_eq!(arg_i32(&json!({"x": 42}), "x"), Some(42));
+        assert_eq!(arg_i32(&json!({"x": -1}), "x"), Some(-1));
+        assert_eq!(arg_i32(&json!({"x": "nope"}), "x"), None);
+        assert_eq!(arg_i32(&json!({}), "x"), None);
+    }
+
+    #[test]
+    fn arg_workspace_converts_1_based_wire_to_0_based_internal() {
+        // The wire numbers workspaces from 1; internally they are 0-based (Super+1 =
+        // SwitchWorkspace(0)). The converter is what keeps the chord + IPC on the SAME
+        // active_workspace space.
+        assert_eq!(arg_workspace(&json!({"workspace": 1})), Some(0));
+        assert_eq!(arg_workspace(&json!({"workspace": 2})), Some(1));
+        assert_eq!(arg_workspace(&json!({"workspace": 9})), Some(8));
+    }
+
+    #[test]
+    fn arg_workspace_rejects_zero_and_negative_and_missing() {
+        assert_eq!(arg_workspace(&json!({"workspace": 0})), None, "0 is below the 1-based floor");
+        assert_eq!(arg_workspace(&json!({"workspace": -3})), None, "negative is rejected");
+        assert_eq!(arg_workspace(&json!({})), None, "missing workspace → None");
+    }
+
+    // ── response envelope (IPC_PROTOCOL.md §3) ──
+
+    #[test]
+    fn response_ok_serializes_the_success_envelope() {
+        let resp = Response::ok(Some("req9".into()), json!({"handle": "win_1", "focused": true}));
+        let v: Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["v"], PROTOCOL_VERSION);
+        assert_eq!(v["id"], "req9");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["result"]["handle"], "win_1");
+        assert!(v["error"].is_null(), "a success carries no error body");
+    }
+
+    #[test]
+    fn response_err_serializes_the_structured_error_envelope() {
+        let resp = Response::err(Some("req9".into()), "not_found", "no mapped window for handle win_x");
+        let v: Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["ok"], false);
+        assert!(v["result"].is_null(), "an error carries a null result");
+        assert_eq!(v["error"]["code"], "not_found");
+        assert_eq!(v["error"]["message"], "no mapped window for handle win_x");
+    }
+
+    #[test]
+    fn response_preserves_a_null_id_for_pre_parse_errors() {
+        // A malformed frame fails before the id is known → id is null on the wire.
+        let resp = Response::err(None, "invalid_args", "malformed request");
+        let v: Value = serde_json::to_value(&resp).unwrap();
+        assert!(v["id"].is_null());
+        assert_eq!(v["error"]["code"], "invalid_args");
+    }
+
+    // ── socket path (IPC_PROTOCOL.md §2) ──
+
+    #[test]
+    fn socket_path_is_hart_comp_sock_under_the_runtime_dir() {
+        let p = socket_path();
+        assert_eq!(
+            p.file_name().and_then(|s| s.to_str()),
+            Some("hart-comp.sock"),
+            "the socket is always named hart-comp.sock"
+        );
+    }
+
+    // ── IpcState event fan-out (IPC_PROTOCOL.md §5) ──
+
+    #[test]
+    fn emit_event_to_no_subscribers_is_a_no_op() {
+        let mut ipc = IpcState::default();
+        // No panic, no allocation path taken — the empty-subscriber early return.
+        ipc.emit_event("window.opened", json!({"handle": "win_1"}));
+        assert!(ipc.subscribers.is_empty());
+    }
+
+    #[test]
+    fn emit_event_pushes_a_framed_event_to_a_live_subscriber() {
+        // A subscriber stream receives the §5 event frame (4-byte length + JSON with
+        // v/event/window). Drive a real socketpair: push the subscriber end into the
+        // set, emit, then read+decode the frame off the peer.
+        let (server_side, client_side) = UnixStream::pair().expect("socketpair");
+        let mut ipc = IpcState::default();
+        ipc.subscribers.push(server_side);
+
+        ipc.emit_event("window.focused", json!({"handle": "win_42", "app_id": "foot"}));
+
+        // Read the framed event off the client end. The server end stays open (the live
+        // subscriber), so the reader MUST be non-blocking — otherwise `fill()` would
+        // block after draining the one frame (no EOF). Non-blocking → `fill()` returns
+        // Ok(false) (WouldBlock) once the buffered bytes are drained.
+        client_side.set_nonblocking(true).expect("non-blocking reader");
+        let mut rx = Connection::new(client_side);
+        rx.fill().expect("drain");
+        let body = rx.next_frame().expect("one event frame was written");
+        let frame: Value = serde_json::from_slice(&body).expect("event frame is valid JSON");
+        assert_eq!(frame["v"], PROTOCOL_VERSION);
+        assert_eq!(frame["event"], "window.focused");
+        assert_eq!(frame["window"]["handle"], "win_42");
+        assert_eq!(frame["window"]["app_id"], "foot");
+        assert_eq!(ipc.subscribers.len(), 1, "a live subscriber is retained");
+    }
+
+    #[test]
+    fn emit_event_drops_a_dead_subscriber() {
+        // A subscriber whose peer has gone away fails the write and is dropped from the
+        // set (so a crashed agent never wedges the fan-out).
+        let (server_side, client_side) = UnixStream::pair().expect("socketpair");
+        let mut ipc = IpcState::default();
+        ipc.subscribers.push(server_side);
+        drop(client_side); // the subscriber's reader is gone → writes will fail (EPIPE)
+
+        // Write enough that the kernel actually surfaces the broken pipe. A handful of
+        // emits guarantees the send buffer fills/errors on the closed peer.
+        for _ in 0..256 {
+            ipc.emit_event("window.opened", json!({"handle": "win_dead"}));
+        }
+        assert!(ipc.subscribers.is_empty(), "a dead subscriber is retained-out of the set");
+    }
+}

@@ -1084,4 +1084,113 @@ mod tests {
         // And nothing to expire / resolve.
         assert!(r.expire(Instant::now()).is_empty());
     }
+
+    // ── render-path / backend selection coverage (the boot-config decisions) ──
+
+    #[test]
+    fn drm_backend_still_selects_the_software_floor_when_unprobed() {
+        // The DRM backend (pixman) is a software floor by construction; the path
+        // decision is still Software for an unprobed/non-forced DRM boot.
+        let cfg = BootConfig { force_software: false, backend: Backend::Drm };
+        assert_eq!(select_render_path(&cfg), RenderPath::Software);
+    }
+
+    #[test]
+    fn render_path_variants_are_distinct() {
+        // A trivial-but-load-bearing guard: Software != Hardware (the never-fail floor
+        // must be a different decision from the opportunistic upgrade).
+        assert_ne!(RenderPath::Software, RenderPath::Hardware);
+        assert_eq!(RenderPath::Software, RenderPath::Software);
+    }
+
+    // ── registry record read (the IPC event-payload source) ──
+
+    #[test]
+    fn record_returns_the_window_record_until_unmapped() {
+        // `record(handle)` is the source the IPC `window.opened`/`closed` frames read
+        // (app_id/title/kind). It resolves while the handle is live and is None after
+        // on_unmap — the same invalidation the IPC contract promises.
+        let mut reg = WindowRegistry::new();
+        let h = reg.on_map(
+            Some("gimp".into()),
+            ToplevelKind::XWayland,
+            Some("Gimp".into()),
+            Some("GNU Image Manip".into()),
+        );
+        let rec = reg.record(&h).expect("a live handle has a record");
+        assert_eq!(rec.kind, ToplevelKind::XWayland);
+        assert_eq!(rec.app_id.as_deref(), Some("Gimp"));
+        assert_eq!(rec.title.as_deref(), Some("GNU Image Manip"));
+        assert_eq!(rec.manifest_id.as_deref(), Some("gimp"));
+        reg.on_unmap(&h);
+        assert!(reg.record(&h).is_none(), "record is None after the handle is invalidated");
+    }
+
+    #[test]
+    fn list_enumerates_every_live_handle() {
+        // window.list reads the registry — it must enumerate every mapped handle,
+        // brain-summoned or not, and shrink as windows close.
+        let mut reg = WindowRegistry::new();
+        let h1 = reg.on_map(Some("a".into()), ToplevelKind::Xdg, None, None);
+        let _h2 = reg.on_map(None, ToplevelKind::Xdg, None, None); // externally opened
+        assert_eq!(reg.list().len(), 2, "both mapped windows list");
+        reg.on_unmap(&h1);
+        assert_eq!(reg.list().len(), 1, "closing one shrinks the list");
+    }
+
+    // ── inert-subsystem precheck completeness ──
+
+    #[test]
+    fn summon_subsystem_is_inert_only_for_android_and_macos() {
+        assert!(summon_subsystem_is_inert("android"));
+        assert!(summon_subsystem_is_inert("macos"));
+        // Every mappable platform is NOT inert (so it proceeds to await a real map).
+        for live in ["windows", "linux", "flatpak", "pwa", "web"] {
+            assert!(!summon_subsystem_is_inert(live), "{live} can map a native window");
+        }
+    }
+
+    // ── multi-summon resolution order (FIFO match by manifest+kind) ──
+
+    #[test]
+    fn two_pending_summons_resolve_independently_by_manifest() {
+        // Two apps summoned; each resolves ONLY on its own matching map, in any order,
+        // without consuming the other's pending slot.
+        let mut r = SummonResolver::new();
+        r.begin("blender", Some(ToplevelKind::Xdg));
+        r.begin("inkscape", Some(ToplevelKind::Xdg));
+        assert_eq!(r.pending_count(), 2);
+
+        let hi = mint_handle();
+        assert_eq!(
+            r.resolve("inkscape", ToplevelKind::Xdg, hi.clone()),
+            Some(SummonOutcome::Mapped(hi)),
+            "inkscape resolves on its own map"
+        );
+        assert_eq!(r.pending_count(), 1, "blender still pending after inkscape resolved");
+
+        let hb = mint_handle();
+        assert_eq!(
+            r.resolve("blender", ToplevelKind::Xdg, hb.clone()),
+            Some(SummonOutcome::Mapped(hb))
+        );
+        assert_eq!(r.pending_count(), 0);
+    }
+
+    #[test]
+    fn expire_only_sweeps_the_elapsed_summon_leaving_the_fresh_one() {
+        // A mixed pending set: one elapsed, one fresh. expire() returns only the
+        // elapsed manifest and leaves the fresh summon awaiting its map.
+        let mut r = SummonResolver::new();
+        r.pending.push(PendingSummon::new_at(
+            "stale",
+            Some(ToplevelKind::Xdg),
+            Instant::now() - Duration::from_secs(60),
+            Duration::from_secs(10),
+        ));
+        r.begin("fresh", Some(ToplevelKind::Xdg));
+        let expired = r.expire(Instant::now());
+        assert_eq!(expired, vec![("stale".to_string(), SummonOutcome::TimedOut)]);
+        assert_eq!(r.pending_count(), 1, "the fresh summon survives the sweep");
+    }
 }

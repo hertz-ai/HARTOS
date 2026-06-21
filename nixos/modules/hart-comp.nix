@@ -185,10 +185,18 @@ let
     # the real paint/scanout/toplevel-map proof is the flash onto hardware. doCheck
     # stays ON so the never-fail-floor + no-phantom-window invariant tests gate every
     # build. With buildFeatures = [ "smithay" ] now ON, `cargo test --features smithay`
-    # COMPILES the DRM modules (wayland.rs + udev.rs) AND runs the 19 feature-
-    # independent tests in main.rs — so the build both type-checks the DRM path and
-    # asserts the backend-agnostic invariants. (Verified in WSL: cargo test green at
-    # default; the smithay modules compile under --features smithay.)
+    # COMPILES the DRM modules (wayland.rs + udev.rs) AND runs the feature-independent
+    # tests in main.rs (26) PLUS the smithay-gated `#[cfg(test)]` floors hoisted into the
+    # shared modules — comp_core.rs (the chord map + cursor bake + fade-clock math),
+    # ipc.rs (the framed-JSON transport: reassembly, the poison-frame guard, the
+    # request/response envelope, the arg extractors, the 1↔0 workspace conversion + the
+    # event fan-out), and udev.rs (the DRM-node override precedence + the color-format
+    # floor). So the build both type-checks the DRM path AND asserts the backend-agnostic
+    # invariants. (Verified in WSL: cargo test green at default; the smithay modules
+    # compile under --features smithay.) The winit-only screencopy region/format floor
+    # (clamp + transform + ready-timestamp) runs under the `--features winit` check; the
+    # live-Wayland SMOKE E2E (compositor/tests/smoke_e2e.rs — boot→map→arrange→capture)
+    # is `#[ignore]`d and run by the nested-Wayland CI job with `-- --ignored`.
     doCheck = true;
 
     meta = {

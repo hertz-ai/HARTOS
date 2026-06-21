@@ -1569,6 +1569,67 @@ mod tests {
     }
 
     #[test]
+    fn digit_zero_is_not_a_workspace_chord() {
+        // The workspace range is KEY_1..=KEY_9 — KEY_0 falls outside, so Super+0 is
+        // forwarded to the app (there is no workspace 0 on the wire / 10th workspace).
+        assert_eq!(digit_chord(mods(true, false, false), Keysym::_0, Keysym::_0), None);
+        assert_eq!(digit_chord(mods(true, false, true), Keysym::_0, Keysym::_0), None);
+    }
+
+    #[test]
+    fn alt_takes_tab_only_when_logo_is_not_also_held() {
+        // The Alt+Tab arm is gated `mods.alt && !mods.logo`. With BOTH Alt and Super
+        // held, Tab is NOT a focus-cycle (Super owns the chord space) — it forwards.
+        assert_eq!(chord(mods(true, true, false), Keysym::Tab), None);
+        // Plain Alt+Tab still cycles.
+        assert_eq!(chord(mods(false, true, false), Keysym::Tab), Some(WmAction::CycleFocus));
+    }
+
+    #[test]
+    fn super_shift_with_a_non_digit_key_is_not_a_move_chord() {
+        // Super+Shift only resolves a MoveToWorkspace for a digit; Super+Shift+letter is
+        // not mapped (digit_sym is None for a letter), so it forwards.
+        assert_eq!(process_keyboard_shortcut(mods(true, false, true), Keysym::a, None), None);
+        // And a digit with NO digit_sym (e.g. a layout the reader couldn't resolve)
+        // also falls through rather than guessing.
+        assert_eq!(process_keyboard_shortcut(mods(true, false, true), Keysym::_3, None), None);
+    }
+
+    #[test]
+    fn logo_arrows_outrank_nothing_else_no_modifier_collision() {
+        // Bare arrows (no Super) forward; Super+arrow is the snap/restore chord. Guards
+        // that the snap arm does not fire without the logo modifier.
+        assert_eq!(chord(mods(false, false, false), Keysym::Up), None);
+        assert_eq!(chord(mods(false, false, false), Keysym::Down), None);
+        assert_eq!(chord(mods(true, false, false), Keysym::Up), Some(WmAction::Maximize));
+        assert_eq!(chord(mods(true, false, false), Keysym::Down), Some(WmAction::RestoreWindow));
+    }
+
+    #[test]
+    fn no_modifier_at_all_forwards_every_key() {
+        // The bare-key floor: with no logo/alt/shift, NOTHING is intercepted — every
+        // keystroke reaches the focused client (the compositor steals only its chords).
+        for k in [Keysym::Tab, Keysym::q, Keysym::d, Keysym::Left, Keysym::Right, Keysym::_5] {
+            assert_eq!(process_keyboard_shortcut(mods(false, false, false), k, Some(k)), None);
+        }
+    }
+
+    #[test]
+    fn map_fade_alpha_is_monotonic_across_the_ramp() {
+        use std::time::Duration;
+        // alpha at 0ms ≤ alpha at 75ms ≤ alpha at 150ms, and the midpoint is strictly
+        // between the endpoints (a real ramp, not a step). Built from explicit past
+        // instants so no real time elapses.
+        let now = Instant::now();
+        let a0 = MapAnim(now).alpha();
+        let a_mid = MapAnim(now - Duration::from_millis(75)).alpha();
+        let a_end = MapAnim(now - Duration::from_millis(FADE_IN_MS as u64)).alpha();
+        assert!(a0 <= a_mid && a_mid <= a_end, "fade alpha is monotonic: {a0} {a_mid} {a_end}");
+        assert!(a_mid > 0.0 && a_mid < 1.0, "midpoint is strictly mid-ramp: {a_mid}");
+        assert_eq!(a_end, 1.0, "at FADE_IN_MS the ramp has reached full opacity");
+    }
+
+    #[test]
     fn default_cursor_bakes_a_visible_arrow_with_fill_and_outline() {
         let (rgba, w, h, hot) = bake_default_cursor();
         assert_eq!(w, 24);

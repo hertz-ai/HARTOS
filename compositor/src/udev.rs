@@ -119,12 +119,23 @@ struct DeviceData {
     surfaces: HashMap<crtc::Handle, HartDrmCompositor>,
 }
 
+/// The operator escape-hatch override for the DRM node path (anvil's `ANVIL_DRM_DEVICE`
+/// analogue). PURE: reads `HART_COMP_DRM_DEVICE` and returns `Some(path)` only when the
+/// var is set AND non-empty — an empty override is treated as unset so a stray
+/// `HART_COMP_DRM_DEVICE=` in the unit environment does not force a bogus node. Extracted
+/// from `resolve_primary_node` so the override precedence is unit-testable without a GPU.
+fn drm_device_override() -> Option<String> {
+    std::env::var("HART_COMP_DRM_DEVICE")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
 /// Resolve the primary GPU's DRM node — `HART_COMP_DRM_DEVICE` overrides (the same
 /// operator escape hatch anvil's `ANVIL_DRM_DEVICE` gives), else `primary_gpu(seat)`.
 /// Returns an error (NOT a panic) when there is no GPU, so the supervisor can drop a
 /// tier instead of the process aborting (the never-fail posture).
 fn resolve_primary_node(seat: &str) -> Result<DrmNode, Box<dyn std::error::Error>> {
-    if let Ok(var) = std::env::var("HART_COMP_DRM_DEVICE") {
+    if let Some(var) = drm_device_override() {
         return DrmNode::from_path(&var)
             .map_err(|e| format!("HART_COMP_DRM_DEVICE={var} is not a DRM node: {e}").into());
     }
@@ -733,4 +744,76 @@ fn spawn_xwayland(
 #[allow(dead_code)]
 fn _types_touch() {
     let _s: Option<Size<i32, smithay::utils::Physical>> = None;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PURE DRM-config unit floor. The DRM backend is overwhelmingly hardware-bound — it
+// opens /dev/dri via libseat, creates a GbmDevice, binds a DrmDevice, and page-flips
+// to a CRTC; NONE of that is testable off real hardware (those paths are exercised by
+// the M7 virgl-QEMU scanout harness + the CI nixosTest llvmpipe VM). What IS pure +
+// testable in isolation: the operator DRM-node override precedence + the never-fail
+// color-format floor. `pick_mode`/`pick_crtc` are pure ALGORITHMS but take live
+// Smithay `connector::Info`/`ResourceHandles`/`DrmDevice` snapshots that cannot be
+// constructed without a DRM node, so they are covered by the QEMU scanout harness, not
+// here (see the report's "untestable without DRM" list). Compiled under `smithay`.
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Env reads/writes are process-global; serialize the override tests so they don't
+    // race when the test binary runs them in parallel.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn drm_device_override_is_none_when_the_var_is_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("HART_COMP_DRM_DEVICE").ok();
+        std::env::remove_var("HART_COMP_DRM_DEVICE");
+        assert_eq!(drm_device_override(), None, "unset var → no override");
+        if let Some(v) = saved {
+            std::env::set_var("HART_COMP_DRM_DEVICE", v);
+        }
+    }
+
+    #[test]
+    fn drm_device_override_returns_a_set_non_empty_path() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("HART_COMP_DRM_DEVICE").ok();
+        std::env::set_var("HART_COMP_DRM_DEVICE", "/dev/dri/card9");
+        assert_eq!(
+            drm_device_override().as_deref(),
+            Some("/dev/dri/card9"),
+            "a set override path wins over primary_gpu()"
+        );
+        match saved {
+            Some(v) => std::env::set_var("HART_COMP_DRM_DEVICE", v),
+            None => std::env::remove_var("HART_COMP_DRM_DEVICE"),
+        }
+    }
+
+    #[test]
+    fn drm_device_override_treats_an_empty_var_as_unset() {
+        // A stray `HART_COMP_DRM_DEVICE=` must NOT force an empty (invalid) node path —
+        // it falls through to the real primary_gpu() probe.
+        let _g = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("HART_COMP_DRM_DEVICE").ok();
+        std::env::set_var("HART_COMP_DRM_DEVICE", "");
+        assert_eq!(drm_device_override(), None, "empty override → treated as unset");
+        match saved {
+            Some(v) => std::env::set_var("HART_COMP_DRM_DEVICE", v),
+            None => std::env::remove_var("HART_COMP_DRM_DEVICE"),
+        }
+    }
+
+    #[test]
+    fn color_formats_are_the_never_fail_floor_set() {
+        // The DrmCompositor primary-plane formats MUST include the 8-bit Argb/Xrgb floor
+        // that pixman + virtually every KMS driver supports (no 10-bit gamble on an
+        // unproven box). Order matters: Argb first (alpha-capable), Xrgb fallback.
+        assert!(!COLOR_FORMATS.is_empty(), "an empty format set fails DrmCompositor::new");
+        assert_eq!(COLOR_FORMATS.len(), 2);
+        assert_eq!(COLOR_FORMATS[0], Fourcc::Argb8888, "Argb (alpha-capable) is first");
+        assert_eq!(COLOR_FORMATS[1], Fourcc::Xrgb8888, "Xrgb (opaque) is the fallback");
+    }
 }
