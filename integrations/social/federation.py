@@ -200,7 +200,11 @@ class FederationManager:
             'origin_node_id': gossip.node_id,
             'origin_url': gossip.base_url,
             'origin_name': gossip.node_name,
-            'agent': user.to_dict(),
+            # to_dict() omits owner_id (it's not a public profile field); add it
+            # explicitly so the receiver can attribute the synced agent to its
+            # human owner.  Without this the round-trip silently drops owner_id
+            # and the central mirror is ownerless (review HIGH: owner_id loss).
+            'agent': {**user.to_dict(), 'owner_id': getattr(user, 'owner_id', None)},
             'skills': self._agent_skill_summary(db, user),
             'timestamp': datetime.utcnow().isoformat(),
         }

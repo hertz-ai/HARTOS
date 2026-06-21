@@ -108,22 +108,21 @@ def link_device():
         except Exception as e:
             logger.warning("link-device: guest memory migration skipped: %s", e)
 
-    # Profile down-sync (#2): the authenticated both-ids hook fcm_sync documents
-    # but nothing wired.  g.user.id is the local UUID; the client supplies its
-    # central account id here (same call already carries device metadata).  Pull
-    # the central profile + FCM token DOWN into the local social store, which
-    # also populates User.settings['central_user_id'] so #90 FCM resolution
-    # starts working for real central accounts.  GATE: only the logged-in user's
-    # OWN profile (the central id is bound to this session).  Best-effort —
-    # never blocks the link (same posture as the #117 guest migration above).
-    central_user_id = (data.get('central_user_id') or '')
-    central_user_id = str(central_user_id).strip()
-    if central_user_id:
-        try:
-            from core.profile_sync import sync_profile
-            sync_profile(str(g.user.id), central_user_id)
-        except Exception as e:
-            logger.warning("link-device: profile down-sync skipped: %s", e)
+    # Profile down-sync (#2) is DEFERRED here — intentionally NOT wired.
+    # The previous hook pulled the central profile by a client-supplied
+    # `central_user_id`, which is an IDOR: nothing proves the caller owns that
+    # central account, so any authenticated user could pull another user's PII +
+    # FCM token (review BLOCK). A correct down-sync needs a VERIFIED central-
+    # account link (the central endpoint authenticating the caller and checking
+    # caller == user_id). Until that trust flow exists we do NOT pull by client
+    # claim. We surface the deferral explicitly rather than silently swallowing
+    # a broken/insecure call (no generic "skipped" masking the real reason).
+    if data.get('central_user_id'):
+        logger.info(
+            "link-device: profile down-sync deferred for user %s — needs a "
+            "verified central-account link (gap #2 trust flow); a client-"
+            "supplied central_user_id is not trusted and is ignored",
+            getattr(g, 'user', None) and g.user.id)
 
     db = get_db()
     try:

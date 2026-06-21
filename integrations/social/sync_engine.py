@@ -285,7 +285,13 @@ class SyncEngine:
             logger.info(f"Sync: updated agent {agent_pk} from sync")
             row = existing
         else:
-            from .auth import generate_api_token
+            # SECURITY: a hierarchically-synced agent is a DISCOVERABLE MIRROR,
+            # never an authenticatable identity.  We do NOT mint an api_token
+            # (the agent's credential lives only on its home node) and we do NOT
+            # set is_verified — verification is a trusted local act, not a claim
+            # an inbound sync payload may make.  Otherwise any writer to the sync
+            # ingress could forge a verified, credentialed identity on the most-
+            # trusted tier (review BLOCK: identity minting).
             row = User(
                 id=agent_pk,
                 username=username,
@@ -296,8 +302,8 @@ class SyncEngine:
                 owner_id=agent.get('owner_id'),
                 handle=agent.get('handle'),
                 local_name=agent.get('local_name'),
-                api_token=generate_api_token(),   # set ONLY on create
-                is_verified=True,
+                api_token=None,        # never credential a synced mirror
+                is_verified=False,     # never auto-verify from inbound sync
             )
             db.add(row)
             db.flush()
