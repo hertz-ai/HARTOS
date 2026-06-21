@@ -69,6 +69,11 @@ in
         # cageCommand defaults to "hart-shell-session" — the real floor.
         crashLoopCount = 3;
         crashLoopWindowSeconds = 300;
+        # No real DRM master to reclaim in the VM — zero the settle so the 12×
+        # selector loop stays fast + deterministic (the settle is a real-HW EBUSY
+        # guard, exercised by the boot path, not this crash-accounting test).
+        drmMasterSettleSeconds = 0;
+        tierTermGraceSeconds = 0;
       };
     };
 
@@ -91,6 +96,27 @@ in
           # greetd.service; gdm must be off.
           sup.wait_for_unit("greetd.service", timeout=120)
           sup.fail("systemctl is-active gdm.service")
+
+      # ── 1b. SEAT / DRM preconditions for a compositor on real HW ──
+      # The bare-metal "permission denied / device busy across all tiers" root
+      # cause was a missing seat/DRM bring-up. Assert the three fixes are live:
+      #   - seatd (the libseat BACKEND the compositors talk to) is running,
+      #   - the session user is in the device groups the compositor needs to open
+      #     /dev/dri (video/render = KMS + GPU) and /dev/input (input = libinput)
+      #     AND the seat group (seatd brokers devices only to seat-group members),
+      #   - greetd is wrapped to prefer the seatd backend (LIBSEAT_BACKEND=seatd),
+      #     so libseat does not fall to its unreliable-under-greetd logind probe.
+      with subtest("seatd is active + hart-admin has the seat/DRM/input groups"):
+          sup.wait_for_unit("seatd.service", timeout=60)
+          groups = sup.succeed("id -nG hart-admin").split()
+          for g in ("video", "render", "input", "seat"):
+              assert g in groups, \
+                  f"hart-admin missing the '{g}' group ({groups}) — compositor can't open the seat's DRM/input"
+          # greetd's session command must export LIBSEAT_BACKEND=seatd (the wrapper)
+          # so every tier inherits the seatd backend preference.
+          greetd_cmd = sup.succeed("systemctl cat greetd.service")
+          assert "LIBSEAT_BACKEND=seatd" in greetd_cmd, \
+              "greetd session does not prefer the seatd libseat backend"
 
       # ── 2. hartctl on PATH; fail-safe to cage when unlatched (contract §3.1) ──
       with subtest("hartctl reports the cage floor when the latch is absent (fail-safe)"):
@@ -192,6 +218,11 @@ in
         crashLoopWindowSeconds = 300;
         # Short paint budget so the VM test is fast (real default is 20s).
         shellPaintTimeoutSeconds = 3;
+        # Exercise the SIGTERM grace (sleep dies on TERM immediately, so 2s is the
+        # ceiling, not a real wait) but zero the post-kill settle (no real DRM
+        # master in the VM) so the 8× hung-kill loop stays fast.
+        tierTermGraceSeconds = 2;
+        drmMasterSettleSeconds = 0;
       };
     };
 
@@ -282,6 +313,7 @@ in
           crashLoopCount = 3;
           crashLoopWindowSeconds = 300;
           shellPaintTimeoutSeconds = 5;             # ample for the immediate touch
+          drmMasterSettleSeconds = 0;               # no real DRM master in the VM
         };
       };
 
@@ -349,6 +381,7 @@ in
           # cageCommand defaults to the real floor launcher (always available).
           crashLoopCount = 3;
           crashLoopWindowSeconds = 300;
+          drmMasterSettleSeconds = 0;  # no real DRM master in the VM — stay fast
           # Disable the paint watchdog: this test only exercises the un-latched
           # START resolution, not the hang path.
           shellPaintTimeoutSeconds = 0;
@@ -437,6 +470,7 @@ in
         crashLoopCount = 3;
         crashLoopWindowSeconds = 300;
         shellPaintTimeoutSeconds = 0;   # crash-only path for this test
+        drmMasterSettleSeconds = 0;     # no real DRM master in the VM — stay fast
       };
     };
 
@@ -616,6 +650,7 @@ in
         swayCommand = "${pkgs.coreutils}/bin/true";
         crashLoopCount = 3;
         crashLoopWindowSeconds = 300;
+        drmMasterSettleSeconds = 0;  # no real DRM master in the VM — stay fast
         # Irrelevant here (no launch happens in an unhealthy run) but pin it off so
         # nothing about the paint path can interfere with the assertion.
         shellPaintTimeoutSeconds = 0;

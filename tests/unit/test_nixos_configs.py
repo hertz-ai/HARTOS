@@ -2068,3 +2068,75 @@ class TestSessionSupervisorNixTestWiring:
             "hart-session-supervisor-unhealthy-flag",
         ]:
             assert node in wf, f"VM workflow does not build/run {node} — it would never gate"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Seat / DRM bring-up — the real-HW "permission denied / device busy" root fix
+# ═══════════════════════════════════════════════════════════════
+#
+# On bare metal every tier (hart-comp/sway/cage) failed to come up because the
+# standard Wayland-compositor seat/DRM setup was missing. The BEHAVIOUR (seatd
+# running, hart-admin in the seat/input/video/render groups, greetd preferring
+# the seatd libseat backend) is proven by the wired-in nixosTest's "seatd is
+# active + hart-admin has the seat/DRM/input groups" subtest (it boots greetd and
+# reads `id -nG`). Per feedback_no_grep_tests.md these structural checks keep ONLY
+# the cross-file OPTION WIRING a VM boot is wasteful to re-assert: that seatd is
+# enabled where greetd is introduced, the groups are declared, and the DRM-master
+# handoff knobs exist. They never substitute for the behavioural subtest.
+class TestSeatDrmBringUp:
+    """hart-session-supervisor.nix + hart-base.nix wire the compositor seat/DRM
+    access (seatd backend, device groups, Plymouth DRM-master handoff, tier-drop
+    master release) so the ladder actually scans out on real hardware."""
+
+    @pytest.fixture(autouse=True)
+    def load(self):
+        self.sup = read_nix(os.path.join(MODULES_DIR, "hart-session-supervisor.nix"))
+        self.base = read_nix(os.path.join(MODULES_DIR, "hart-base.nix"))
+
+    def test_seatd_enabled_with_greetd(self):
+        """seatd is the libseat BACKEND the greetd-launched compositor talks to —
+        without it libseat falls to its unreliable-under-greetd logind probe and
+        the compositor cannot acquire the seat's DRM master / input devices."""
+        assert "services.seatd.enable = true" in self.sup
+
+    def test_session_prefers_seatd_backend(self):
+        """The greetd session is wrapped to export LIBSEAT_BACKEND=seatd so every
+        tier prefers the seatd daemon over the logind probe (one wrapper, DRY)."""
+        assert "LIBSEAT_BACKEND=seatd" in self.sup
+
+    def test_hart_admin_in_seat_group(self):
+        """seatd brokers /dev/dri + /dev/input only to seat-group members — the
+        supervisor adds hart-admin to `seat` (the group exists only once seatd is
+        enabled, so it is added HERE, not in hart-base)."""
+        assert 'users.users.hart-admin.extraGroups = [ "seat" ]' in self.sup
+
+    def test_hart_admin_has_video_render_input_groups(self):
+        """hart-base puts hart-admin in video (KMS /dev/dri/card*), render (GPU
+        /dev/dri/renderD*) AND input (/dev/input/* for libinput) — WITHOUT input
+        a Wayland compositor boots dead-input (EACCES on /dev/input)."""
+        m = re.search(r"users\.users\.hart-admin\s*=\s*\{(.*?)\};", self.base, re.S)
+        assert m, "hart-admin user block not found in hart-base.nix"
+        block = m.group(1)
+        for g in ('"video"', '"render"', '"input"'):
+            assert g in block, f"hart-admin missing group {g} (compositor can't open the seat device)"
+
+    def test_plymouth_drm_master_handoff(self):
+        """The boot splash holds DRM master on card0; greetd must order After
+        plymouth-quit-wait so the splash has RELEASED master before the compositor
+        claims it (else drmSetMaster → EBUSY)."""
+        assert "plymouth-quit-wait.service" in self.sup
+
+    def test_greetd_on_own_vt(self):
+        """greetd runs on its OWN vt (off the tty2..tty6 recovery range + off the
+        boot-console tty1) so its session is the seat's ACTIVE session — the
+        precondition for legally holding DRM master on that seat."""
+        assert "vt = 7" in self.sup
+
+    def test_tier_drop_releases_drm_master(self):
+        """A tier-drop must let the prior compositor drop DRM master before the next
+        tier launches: SIGTERM-with-grace (not instant SIGKILL) + a post-kill settle
+        so the kernel reclaims card0's master (prevents the EBUSY handoff race)."""
+        # The graceful-kill grace + the master settle options + helper exist.
+        assert "tierTermGraceSeconds" in self.sup
+        assert "drmMasterSettleSeconds" in self.sup
+        assert "drm_master_settle" in self.sup

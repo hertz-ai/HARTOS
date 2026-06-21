@@ -174,8 +174,28 @@ let
     # the BEST tier first and only degrades on a real crash/hang. A drop still
     # latches the LOWER tier across boot; this is purely the un-latched default.
     START="${sup.startTier}"
+    # Grace (seconds) to let a HUNG compositor drop DRM master after SIGTERM before
+    # we SIGKILL it (a hard kill mid-scanout can orphan card0's DRM master → the
+    # next tier gets EBUSY). And the settle (seconds) we pause after a tier's
+    # process is gone so the kernel reclaims that master before the next tier (which
+    # greetd relaunches) tries drmSetMaster. Both small + bounded — they only add a
+    # few seconds to a DROP, never to a healthy boot.
+    TIER_TERM_GRACE=${toString sup.tierTermGraceSeconds}
+    DRM_SETTLE=${toString sup.drmMasterSettleSeconds}
 
     log() { echo "[hart-session-supervisor] $*" >&2; }
+
+    # ── Let the kernel reclaim the DRM master a just-exited compositor held ──
+    # After a tier's process is GONE (crashed, hung-killed, or logged out), the
+    # kernel needs a brief moment to release that process's DRM master + GBM/scanout
+    # state on card0. Without this the NEXT tier greetd relaunches can race the
+    # teardown and fail drmSetMaster with EBUSY ("device busy") — the exact bare-HW
+    # symptom across all tiers. A plain bounded sleep (no card0 poking) is the
+    # safest portable settle; DRM_SETTLE=0 disables it (the nixosTest VMs, which
+    # have no real DRM master to reclaim, set it to 0 to stay fast).
+    drm_master_settle() {
+      [ "$DRM_SETTLE" -gt 0 ] 2>/dev/null && sleep "$DRM_SETTLE" || true
+    }
 
     # ── Read the tier to launch (SESSION_TIER_CONTRACT.md §3 rule 1) ──
     #   - latch PRESENT + valid value (hart-comp|sway|cage) -> that latched tier
@@ -366,10 +386,23 @@ let
         # (c) HUNG: compositor process alive but no first-paint within the budget.
         if [ "$TIER" != "$FLOOR" ]; then
           log "tier '$TIER' is HUNG (compositor up, no first paint in ''${PAINT_TIMEOUT}s) — killing + dropping immediately"
+          # SIGTERM FIRST and give the compositor a real grace window to drop DRM
+          # master cleanly (drmDropMaster on its way out) before we SIGKILL. A
+          # straight SIGKILL on a compositor that is mid-scanout can orphan the DRM
+          # master on card0, so the NEXT tier greetd relaunches hits EBUSY ("device
+          # busy") and the whole ladder stalls on a black screen. SIGTERM → wait →
+          # SIGKILL only if it ignored the term is the standard graceful-handoff.
           kill -TERM "$sesspid" 2>/dev/null || true
-          sleep 2
+          term_waited=0
+          while [ "$term_waited" -lt "$TIER_TERM_GRACE" ] && kill -0 "$sesspid" 2>/dev/null; do
+            sleep 1
+            term_waited=$((term_waited + 1))
+          done
           kill -KILL "$sesspid" 2>/dev/null || true
           wait "$sesspid" 2>/dev/null || true
+          # Let the kernel reclaim DRM master + tear down the GBM/scanout state the
+          # killed compositor held, so the next tier can become master cleanly.
+          drm_master_settle
           # A HANG is DETERMINISTIC, unlike a fast-exit crash: the compositor came
           # up but the shell never painted within the budget, and a retry will hang
           # the SAME way (it is not a transient flake). So a hung non-floor tier is
@@ -406,6 +439,10 @@ let
     end=$(date +%s)
     ran=$((end - start))
     log "tier '$TIER' exited rc=$rc after ''${ran}s"
+    # The compositor process is GONE — settle so the kernel reclaims its DRM master
+    # on card0 before greetd relaunches the selector and the next tier tries to
+    # become master (prevents the EBUSY race on a crash/quick-exit handoff).
+    drm_master_settle
 
     # A session that ran a long time then exited is a normal logout, NOT a
     # crash — don't count it toward the crash-loop. Only short-lived exits
@@ -506,6 +543,35 @@ in
       '';
     };
 
+    tierTermGraceSeconds = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 5;
+      description = ''
+        Seconds to wait after SIGTERM-ing a HUNG tier's compositor before
+        SIGKILL. The grace lets the compositor drop DRM master cleanly
+        (drmDropMaster) on its way out; a straight SIGKILL mid-scanout can orphan
+        the DRM master on card0, so the NEXT tier the supervisor relaunches fails
+        drmSetMaster with EBUSY ("device busy") and the ladder stalls on a black
+        screen. Bounded so a stuck compositor still dies (then SIGKILL) — it only
+        adds to a DROP, never to a healthy boot. 0 = SIGKILL immediately (the old
+        behaviour; the nixosTest fakes set it low for speed).
+      '';
+    };
+
+    drmMasterSettleSeconds = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 2;
+      description = ''
+        Seconds to pause after a tier's compositor process is GONE (crashed,
+        hung-killed, or logged out) before returning to greetd — giving the kernel
+        time to reclaim that process's DRM master + GBM/scanout state on card0 so
+        the next tier can become master cleanly instead of racing the teardown
+        (the EBUSY handoff race seen across all tiers on real HW). Small + bounded.
+        0 = no settle (the nixosTest VMs have no real DRM master to reclaim, so
+        they set it to 0 to stay fast).
+      '';
+    };
+
     cageCommand = lib.mkOption {
       type = lib.types.str;
       default = "hart-shell-session";
@@ -599,6 +665,52 @@ in
     # (the nixosTest nodes). One value, no collision either way.
     boot.kernel.sysctl."fs.inotify.max_user_watches" = lib.mkOverride 90 524288;
 
+    # ── SEAT / DRM access for the greetd-launched compositor (real-HW root fix) ──
+    # On real hardware the tier compositors (hart-comp/sway/cage) all failed to
+    # come up with "permission denied" (/dev/dri or /dev/input EACCES) or "device
+    # busy" (could not become DRM master, EBUSY) — the standard Wayland-compositor
+    # seat/DRM bring-up was missing. The three pieces that make the ladder actually
+    # scan out on bare metal:
+    #
+    #   1. services.seatd — a working libseat BACKEND. greetd's session is NOT a
+    #      full logind graphical session (greetd opens a PAM session but the seat
+    #      activation libseat-via-logind expects is unreliable under greetd), so
+    #      libseat's logind backend can fail and the compositor cannot acquire the
+    #      seat's DRM master / input devices. seatd is the canonical fallback
+    #      backend (LIBSEAT_BACKEND=seatd): a tiny daemon that brokers /dev/dri +
+    #      /dev/input to the session over a socket, no logind seat required. The
+    #      hart-comp crate already links libseat from pkgs.seatd (hart-comp.nix
+    #      buildInputs) and cage/sway use libseat too — this provides the daemon
+    #      side they talk to. Enabling it also creates the `seat` group.
+    #   2. hart-admin in the `seat` group — seatd only brokers devices to members
+    #      of the seat group. (video/render/input come from hart-base; seat is
+    #      added HERE because the group only exists once seatd is enabled.)
+    #   3. LIBSEAT_BACKEND=seatd in the session env — prefer the seatd backend
+    #      directly instead of letting libseat probe logind first (which is the
+    #      unreliable path under greetd). Set on the selector's session so every
+    #      tier inherits it.
+    services.seatd.enable = true;
+    users.users.hart-admin.extraGroups = [ "seat" ];
+
+    # ── Plymouth / fbcon must RELEASE DRM master before the compositor claims it ──
+    # The boot splash (boot.plymouth, desktop.nix) holds DRM master on card0; if it
+    # is still up when the first tier launches, the compositor's drmSetMaster fails
+    # EBUSY. NixOS wires `plymouth-quit.service` to stop the splash, but by default
+    # it is ordered only relative to the display-manager target — under greetd we
+    # make the dependency explicit so the splash is GONE (DRM master released)
+    # before greetd grabs the seat. `plymouth-quit-wait.service` blocks until
+    # plymouthd has actually exited, so After it = the KMS scanout is free. Guarded
+    # with an mkIf existence check so a node WITHOUT plymouth (the nixosTest VMs)
+    # never references a missing unit.
+    systemd.services.greetd = {
+      after = [ "plymouth-quit-wait.service" ];
+      # Don't let a stuck plymouth-quit BLOCK the login forever — it's an ordering
+      # preference, not a hard requirement (a missing/failed splash must still let
+      # the seat come up). `wants` (not `requires`) keeps greetd starting even if
+      # the splash unit is absent or fails.
+      wants = [ "plymouth-quit-wait.service" ];
+    };
+
     # ── greetd: the out-of-process supervisor (NOT a Python thread) ──
     # greetd relaunches its session command whenever the session exits, which
     # is exactly the relaunch primitive the selector wrapper rides on. The
@@ -609,11 +721,21 @@ in
     # (mkForce so the desktop.nix gdm.enable + defaultSession do not collide).
     # GNOME stays user-selectable (see the autologin escape note below) as the
     # ultimate human escape hatch, preserving the desktop.nix guarantee.
+    #
+    # vt = 7: run the greeter on its OWN VT, OFF the recovery range (tty2..tty6
+    # stay free getty consoles — desktop.nix's Ctrl+Alt+F-key escape) and off
+    # tty1 (where the boot console / plymouth lives). greetd activating its own
+    # VT is what makes its session the seat's ACTIVE session, which is the
+    # precondition for the compositor to legally hold DRM master on that seat.
     services.greetd = {
       enable = true;
+      vt = 7;
       settings = {
         default_session = {
-          command = "${selectorScript}";
+          # Wrap the selector so the whole session tree inherits LIBSEAT_BACKEND
+          # =seatd — prefer the seatd daemon over libseat's unreliable-under-greetd
+          # logind probe. (env(1) keeps this DRY: one wrapper, every tier inherits.)
+          command = "${pkgs.coreutils}/bin/env LIBSEAT_BACKEND=seatd ${selectorScript}";
           user = "hart-admin";
         };
       };

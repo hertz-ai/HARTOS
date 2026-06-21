@@ -206,7 +206,14 @@ in
     users.users.hart-admin = {
       isNormalUser = true;
       description = "HART OS Administrator";
-      extraGroups = [ "wheel" "hart" "video" "render" ];
+      # video + render: open /dev/dri/card* (KMS/DRM) + /dev/dri/renderD* (GPU).
+      # input: open /dev/input/* (libinput keyboard/mouse/touch) — WITHOUT it a
+      # Wayland compositor (cage/sway/hart-comp) launched by greetd cannot read
+      # the seat's input devices (EACCES on /dev/input) and boots dead-input. The
+      # `seat` group (libseat/seatd backend) is added by hart-session-supervisor
+      # .nix ONLY when it enables services.seatd (the group exists only then), so
+      # referencing it here unconditionally cannot fail eval on a seatd-less node.
+      extraGroups = [ "wheel" "hart" "video" "render" "input" ];
       # Baked SHA-512 hash of "hart" (login = hart-admin / hart). `initialPassword`
       # is applied by a runtime activation step that does NOT reliably persist on a
       # read-only / baked live-ISO squashfs — it left hart-admin with no usable
