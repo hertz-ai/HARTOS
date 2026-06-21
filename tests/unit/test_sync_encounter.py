@@ -75,14 +75,29 @@ def test_consented_encounter_queued_without_location(monkeypatch):
     data = msg['data']
     assert data['user_a_id'] == 'ua' and data['encounter_count'] == 1
     assert 'lat' not in data and 'lng' not in data and 'location_label' not in data
-    cargs, ckw = chk.call_args.args, chk.call_args.kwargs
-    assert cargs[1] == 'ua' and cargs[2] == 'cloud_egress' and ckw.get('scope') == 'social_sync'
+    # BOTH parties' cloud_egress consent is checked (not just user_a)
+    checked = {c.args[1] for c in chk.call_args_list}
+    assert checked == {'ua', 'ub'}
+    assert all(c.args[2] == 'cloud_egress' and c.kwargs.get('scope') == 'social_sync'
+               for c in chk.call_args_list)
 
 
 def test_unconsented_encounter_not_queued():
     with patch.object(se.SyncEngine, 'queue') as q, \
             patch('integrations.social.consent_service.ConsentService.check_consent',
                   return_value=False):
+        assert se.SyncEngine.queue_entity(None, _encounter()) is None
+    q.assert_not_called()
+
+
+def test_encounter_requires_BOTH_parties_consent():
+    # F7: user_a consented, user_b did NOT → the encounter must NOT leave the
+    # node (gating on user_a alone previously leaked user_b's participation).
+    def _consent(db, uid, ctype, scope='*', agent_id=None):
+        return uid == 'ua'
+    with patch.object(se.SyncEngine, 'queue') as q, \
+            patch('integrations.social.consent_service.ConsentService.check_consent',
+                  side_effect=_consent):
         assert se.SyncEngine.queue_entity(None, _encounter()) is None
     q.assert_not_called()
 

@@ -801,9 +801,17 @@ _ENCOUNTER_SYNC_FIELDS = ['user_a_id', 'user_b_id', 'context_type', 'context_id'
 
 
 def _encounter_gate(db, obj, demander):
+    # An encounter reveals BOTH parties' social-graph participation, so it leaves
+    # the node ONLY if EACH party opted in via cloud_egress consent — fail-closed
+    # if either is absent or withheld. (Gating on user_a_id alone — the
+    # lexicographic-MIN of the pair, set by record_encounter's sorted() — leaked
+    # the OTHER party's participation whenever only the min-id user had consented.)
     from .consent_service import ConsentService
-    return ConsentService.check_consent(
-        db, getattr(obj, 'user_a_id', None), 'cloud_egress', scope='social_sync')
+    a = getattr(obj, 'user_a_id', None)
+    b = getattr(obj, 'user_b_id', None)
+    return bool(a) and bool(b) and ConsentService.check_consent(
+        db, a, 'cloud_egress', scope='social_sync') and ConsentService.check_consent(
+        db, b, 'cloud_egress', scope='social_sync')
 
 
 def _encounter_serialize(db, obj):
