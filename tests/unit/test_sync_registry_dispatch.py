@@ -58,3 +58,19 @@ def test_unknown_op_is_noop_not_error():
         None, [{'id': 'i9', 'operation_type': 'bogus', 'payload': {}}])
     assert res['errors'] == []
     assert 'i9' in res['processed']          # acked (logged), never raised
+
+
+def test_every_non_entity_op_executes_its_handler(monkeypatch):
+    """Exercise every non-entity dispatch lambda BODY (the log-only acks +
+    the blocklist mutation) so the registry wiring is 100% line-covered."""
+    seen = []
+    monkeypatch.setattr(se.SyncEngine, '_handle_sync_blocklist',
+                        staticmethod(lambda p: seen.append(('blocklist', p))))
+    ops = ['update_stats', 'register_node', 'coding_task_assign',
+           'coding_submission', 'sync_blocklist']
+    items = [{'id': f'n{i}', 'operation_type': op, 'payload': {'k': i}}
+             for i, op in enumerate(ops)]
+    res = se.SyncEngine.receive_sync_batch(None, items)
+    assert res['errors'] == []
+    assert len(res['processed']) == len(ops)        # all five acked
+    assert ('blocklist', {'k': 4}) in seen          # the blocklist lambda ran
