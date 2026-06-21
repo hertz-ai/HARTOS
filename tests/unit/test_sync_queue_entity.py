@@ -17,18 +17,26 @@ import integrations.social.sync_engine as se
 
 
 def test_public_post_routes_to_sync_post_queue():
+    # REAL public-post shape: Post.to_dict OMITS 'privacy' entirely when NULL
+    # (= public), so the match must NOT require a 'privacy' key. Regression guard
+    # for the self-review bug where default-public posts silently never synced.
     with patch.object(se.SyncEngine, 'queue', return_value='q1') as q, \
             patch('integrations.social.federation.federation._outbox_message',
                   side_effect=lambda o: {'type': 'new_post', 'post': o}):
-        out = se.SyncEngine.queue_entity(None, {'id': 'p1', 'privacy': None})
+        out = se.SyncEngine.queue_entity(
+            None, {'id': 'p1', 'author_id': 'u1', 'content_type': 'text'})
     assert out == 'q1'
     _, tier, op, msg = q.call_args.args
     assert tier == 'central' and op == 'sync_post' and msg['type'] == 'new_post'
 
 
 def test_private_post_is_not_queued():
+    # a real post dict (which MATCHES) whose privacy gates it OUT — exercises the
+    # GATE, not a non-match.
     with patch.object(se.SyncEngine, 'queue') as q:
-        out = se.SyncEngine.queue_entity(None, {'id': 'p2', 'privacy': 'private'})
+        out = se.SyncEngine.queue_entity(
+            None, {'id': 'p2', 'author_id': 'u1', 'content_type': 'text',
+                   'privacy': 'private'})
     assert out is None
     q.assert_not_called()
 
@@ -68,7 +76,7 @@ def test_unknown_obj_no_match_no_queue():
     human = types.SimpleNamespace(id='h', user_type='human')
     with patch.object(se.SyncEngine, 'queue') as q:
         assert se.SyncEngine.queue_entity(None, human) is None
-        assert se.SyncEngine.queue_entity(None, {'no': 'privacy key'}) is None
+        assert se.SyncEngine.queue_entity(None, {'random': 'non-entity dict'}) is None
     q.assert_not_called()
 
 
@@ -76,5 +84,6 @@ def test_queue_failure_is_swallowed_best_effort():
     with patch.object(se.SyncEngine, 'queue', side_effect=RuntimeError('down')), \
             patch('integrations.social.federation.federation._outbox_message',
                   side_effect=lambda o: {'type': 'new_post', 'post': o}):
-        out = se.SyncEngine.queue_entity(None, {'id': 'p3', 'privacy': None})
+        out = se.SyncEngine.queue_entity(
+            None, {'id': 'p3', 'author_id': 'u1', 'content_type': 'text'})
     assert out is None          # never blocks the caller's write

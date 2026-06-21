@@ -853,7 +853,12 @@ def _friend_serialize(db, obj):
 SYNC_ENTITIES: Dict[str, SyncEntity] = {
     'sync_post': SyncEntity(
         op='sync_post', apply=SyncEngine._handle_sync_post,
-        match=lambda o: isinstance(o, dict) and 'privacy' in o,
+        # Identify a post dict by STABLE fields, never 'privacy' — Post.to_dict
+        # OMITS that key when privacy is NULL (the default-public case), so a
+        # 'privacy' in o match silently dropped EVERY default-public post (all of
+        # them when the privacy flag is off). The gate (_post_gate→is_public,
+        # where is_public(None)=True) decides public-vs-private.
+        match=lambda o: isinstance(o, dict) and 'content_type' in o and 'author_id' in o,
         gate=_post_gate, serialize=_post_serialize,
         owner=lambda o: o.get('author_id')),
     'register_agent': SyncEntity(

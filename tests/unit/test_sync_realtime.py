@@ -36,6 +36,21 @@ def test_friend_sync_emits_status_to_initiator(monkeypatch):
     assert payload['sync_status'] == 'synced'
 
 
+def test_default_public_post_emits_status_to_author(monkeypatch):
+    # NULL-privacy (default public) post — the self-review regression case: it
+    # must match, sync, AND emit to the author.
+    _gossip(monkeypatch)
+    post = {'id': 'p1', 'author_id': 'ua', 'content_type': 'text'}
+    with patch.object(se.SyncEngine, 'queue', return_value='q1'), \
+            patch('integrations.social.federation.federation._outbox_message',
+                  side_effect=lambda o: {'type': 'new_post', 'post': o}), \
+            patch('integrations.social.realtime.on_notification') as notif:
+        out = se.SyncEngine.queue_entity(None, post)
+    assert out == 'q1'
+    owner, payload = notif.call_args.args
+    assert owner == 'ua' and payload['entity'] == 'sync_post'
+
+
 # ── high-frequency entity stays SILENT (no owner extractor) ──
 def test_resonance_sync_does_not_emit(monkeypatch):
     _gossip(monkeypatch)
