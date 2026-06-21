@@ -229,8 +229,20 @@ let
     }
 
     # ── Next-lower available tier (never below the floor) ──
+    # SAFETY: drop is ONLY ever DOWNWARD. If `cur` is not a member of the ladder
+    # (a torn/garbage latch that slipped past read_tier's validation, or a future
+    # caller passing an unvalidated value), we must NOT walk past a never-matched
+    # `cur` and hand back the first available tier — that would be an UPWARD drop.
+    # Return the FLOOR (cage) for any out-of-ladder `cur`: a drop can never raise
+    # the tier, and the floor always paints. (Today's callers pass read_tier-
+    # validated values so this guard is belt-and-suspenders, but the invariant
+    # "lower_tier never returns above `cur`" must hold structurally, not by luck.)
     lower_tier() {
       cur="$1"; seen=""; pick=""
+      case " $LADDER " in
+        *" $cur "*) : ;;                       # cur IS a ladder member — proceed
+        *) printf '%s' "$FLOOR"; return 0 ;;    # out-of-ladder cur -> floor, never up
+      esac
       for t in $LADDER; do
         if [ -n "$seen" ] && tier_available "$t"; then pick="$t"; break; fi
         [ "$t" = "$cur" ] && seen=1
@@ -261,6 +273,16 @@ let
 
     # ── If node_watchdog flagged the compositor unhealthy this boot, treat it
     #    as a crash for tier-drop accounting (signal-only; it never picks). ──
+    #
+    # CRITICAL — this block ALWAYS `exit 0`s after handling, so a single selector
+    # invocation records AT MOST ONE crash. Falling through here to launch a tier
+    # would (a) record a SECOND crash for the same boot on that tier's crash/hang
+    # path (firing the crash-loop threshold a cycle early and non-deterministically),
+    # and (b) launch the OLD `read_tier` value even after we just dropped+latched a
+    # LOWER one — relaunching the very tier the watchdog flagged unhealthy. Instead
+    # we record the unhealthy signal as THIS boot's one crash, drop+latch if the
+    # threshold is breached, and return to greetd, which relaunches the selector on
+    # the (possibly lowered) latch — a clean, single-crash cycle.
     if [ -e "$UNHEALTHY" ]; then
       log "node_watchdog signalled compositor unhealthy"
       rm -f "$UNHEALTHY" 2>/dev/null || true
@@ -268,11 +290,16 @@ let
         cur=$(read_tier)
         if [ "$cur" != "$FLOOR" ]; then
           nxt=$(lower_tier "$cur")
-          log "unhealthy-signal crash-loop: dropping $cur -> $nxt"
+          log "unhealthy-signal crash-loop: dropping $cur -> $nxt (latching + relaunching on the new tier)"
           write_tier "$nxt"
           clear_window
+        else
+          log "unhealthy-signal crash-loop on the floor ('$FLOOR') — cannot drop further; relaunching the floor"
         fi
       fi
+      # Return to greetd on the (possibly lowered) latch WITHOUT launching a tier in
+      # this run — guarantees this invocation recorded exactly one crash.
+      exit 0
     fi
 
     # ── Select the tier: latched value, skipping unavailable higher tiers ──
@@ -338,23 +365,29 @@ let
       if [ "$painted" -eq 0 ] && kill -0 "$sesspid" 2>/dev/null; then
         # (c) HUNG: compositor process alive but no first-paint within the budget.
         if [ "$TIER" != "$FLOOR" ]; then
-          log "tier '$TIER' is HUNG (compositor up, no first paint in ''${PAINT_TIMEOUT}s) — killing + treating as a crash"
+          log "tier '$TIER' is HUNG (compositor up, no first paint in ''${PAINT_TIMEOUT}s) — killing + dropping immediately"
           kill -TERM "$sesspid" 2>/dev/null || true
           sleep 2
           kill -KILL "$sesspid" 2>/dev/null || true
           wait "$sesspid" 2>/dev/null || true
-          # Reuse the EXACT crash-drop path (no parallel mechanism): record this
-          # hang as a crash and, on threshold, drop one tier + latch. A hung tier
-          # is at least as bad as a crashed one, so it counts toward the same
-          # window — a tier that hangs MAX_CRASHES times escalates DOWN.
-          if record_crash; then
-            nxt=$(lower_tier "$TIER")
-            log "paint-watchdog crash-loop on '$TIER' ($MAX_CRASHES hangs/crashes in ''${WINDOW_SECS}s) — dropping to '$nxt' and latching"
-            write_tier "$nxt"
-            clear_window
-          fi
+          # A HANG is DETERMINISTIC, unlike a fast-exit crash: the compositor came
+          # up but the shell never painted within the budget, and a retry will hang
+          # the SAME way (it is not a transient flake). So a hung non-floor tier is
+          # dropped after the FIRST paint-timeout — NOT after crashLoopCount hangs.
+          # Waiting crashLoopCount × PAINT_TIMEOUT here would mean ~66s of black
+          # screen on real HW (3 × 20s + relaunch overhead) before reaching cage;
+          # an immediate drop reaches a painting tier on the very next relaunch.
+          # We still record the hang in the crash window (DRY: the SAME record_crash
+          # → lower_tier → write_tier accounting, so the window/threshold telemetry
+          # is consistent) but the DROP is unconditional, not threshold-gated — only
+          # the fast-EXIT crash path below requires crashLoopCount.
+          record_crash || true
+          nxt=$(lower_tier "$TIER")
+          log "paint-watchdog: HUNG '$TIER' dropped to '$nxt' on the FIRST paint-timeout (deterministic hang) — latching"
+          write_tier "$nxt"
+          clear_window
           # Return to greetd; it relaunches the selector, which now reads the
-          # (possibly) lowered latch.
+          # lowered latch.
           exit 0
         else
           # The floor itself hasn't signalled paint yet — never drop below it.
@@ -461,9 +494,13 @@ in
         launched, the glass-shell host must signal its first painted frame (touch
         /run/hart/session/shell-ready) within this many seconds. If it does NOT — while
         the compositor process is still alive — the tier is treated as HUNG and
-        dropped one rung exactly like a crash (same crash-loop accounting). This
-        catches the "compositor up but shell never paints / never exits" failure
-        the bare crash-on-exit detection is blind to (the real-hardware
+        dropped one rung IMMEDIATELY (on the FIRST paint-timeout), because a hang is
+        DETERMINISTIC: the compositor came up but never painted, and a retry hangs
+        the same way. (Only the fast-EXIT crash path requires crashLoopCount
+        consecutive crashes; a hang does not — waiting crashLoopCount × this budget
+        would mean a ~minute of black screen on real HW before reaching the floor.)
+        This catches the "compositor up but shell never paints / never exits"
+        failure the bare crash-on-exit detection is blind to (the real-hardware
         pointer-only boot). Set to 0 to disable the watchdog (crash-only
         behaviour). The cage FLOOR is never dropped by this watchdog.
       '';
@@ -511,6 +548,28 @@ in
   # Configuration  (opt-in; pure no-op when disabled)
   # ═══════════════════════════════════════════════════════════
   config = lib.mkIf (cfg.enable && sup.enable) {
+
+    # cageCommand is the FLOOR — the tier the supervisor can never drop below and
+    # the last thing standing between the user and a blank screen. cageCommand is
+    # types.str (not nullOr), but the empty string "" would make
+    # `tier_available cage` false at runtime, the floor would be unlaunchable, and
+    # the selector hits `FATAL: no available session command` → greetd relaunches
+    # the selector → fatal loop = the EXACT blank screen this module exists to
+    # prevent. A runtime FATAL on a display manager is invisible to the user; catch
+    # it at build/eval time instead with an assertion that fails the closure.
+    assertions = [
+      {
+        assertion = sup.cageCommand != "";
+        message = ''
+          hart.sessionSupervisor.cageCommand must be a non-empty launch command:
+          it is the never-fail FLOOR the supervisor can never drop below. An empty
+          string makes the floor unlaunchable → the selector would loop on
+          "FATAL: no available session command" = a blank screen, the precise
+          failure this module prevents. Set it to the cage session launcher (the
+          default "hart-shell-session").
+        '';
+      }
+    ];
 
     # The latch + crash-window live under the existing hart state dir; the
     # tmpfs run dir holds the node_watchdog "unhealthy" signal flag.

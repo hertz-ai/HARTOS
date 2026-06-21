@@ -216,8 +216,11 @@ in
           # exactly that (the model decision is load-bearing, not prose).
           assert "Layer.BACKGROUND" in host_src, \
               "GTK4 host must anchor the BACKGROUND layer (Model 1 — the desktop plane)"
-          assert "set_exclusive_zone" in host_src and "0" in host_src, \
-              "GTK4 host must set exclusive zone 0 (backdrop, not a panel) — Model 1"
+          # Match the EXACT zero-zone call, not `"0" in host_src` (a tautology — any
+          # source contains a '0'). The exclusive zone must be set to 0 on the host
+          # window: `set_exclusive_zone(self._win, 0)`.
+          assert "set_exclusive_zone(self._win, 0)" in host_src, \
+              "GTK4 host must call set_exclusive_zone(self._win, 0) (backdrop, not a panel) — Model 1"
           # And it must NOT have silently forked into a second top-layer WebView
           # (that would be Model 2, which breaks 'JS unchanged' — explicitly not
           # chosen here).
@@ -410,8 +413,9 @@ in
               "GTK4 host missing WEBKIT_DISABLE_DMABUF_RENDERER — DMABUF path crashes GL-less"
           assert "WEBKIT_DISABLE_COMPOSITING_MODE=1" in host_src, \
               "GTK4 host missing WEBKIT_DISABLE_COMPOSITING_MODE — compositing crashes GL-less"
-          # And the in-code Z-ORDER MODEL (1) anchoring is the one being painted.
-          assert "Layer.BACKGROUND" in host_src and "set_exclusive_zone" in host_src, \
+          # And the in-code Z-ORDER MODEL (1) anchoring is the one being painted —
+          # the EXACT zone-0 call, not a bare `set_exclusive_zone` substring.
+          assert "Layer.BACKGROUND" in host_src and "set_exclusive_zone(self._win, 0)" in host_src, \
               "GTK4 host being painted is not the Model-1 BACKGROUND/zone-0 surface"
 
       # ════════════════════════════════════════════════════════════════

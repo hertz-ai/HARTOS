@@ -580,4 +580,127 @@ in
           assert sup.succeed("systemctl is-active getty@tty3.service").strip() == "active"
     '';
   };
+
+  # ─────────────────────────────────────────────────────────────
+  # NODE_WATCHDOG UNHEALTHY SIGNAL: when node_watchdog touches the one-way
+  # /run/hart/compositor-unhealthy flag, ONE selector invocation must record
+  # EXACTLY ONE crash and then return to greetd WITHOUT launching a tier in the
+  # same run. This proves the fix for the double-record bug: previously the
+  # unhealthy block recorded+dropped and then FELL THROUGH to launch the OLD-latch
+  # tier, whose crash/hang path recorded a SECOND crash for the same boot (firing
+  # the crash-loop threshold a cycle early + non-deterministically). The block now
+  # `exit 0`s immediately after handling, so a single invocation == at most one
+  # crash. We use crashLoopCount=3 so ONE unhealthy run records 1 (< threshold) and
+  # does NOT drop — letting us count the window file and assert it is exactly 1
+  # line and the latch is unchanged (a fall-through would have added a 2nd line and
+  # possibly dropped). Then a SECOND + THIRD unhealthy run reach the threshold and
+  # drop EXACTLY ONE tier (hart-comp → sway), proving per-run single-crash
+  # accounting end to end.
+  # ─────────────────────────────────────────────────────────────
+  hart-session-supervisor-unhealthy-flag = pkgs.testers.runNixOSTest {
+    name = "hart-session-supervisor-unhealthy-flag";
+    skipTypeCheck = true;
+    skipLint = true;
+    node.specialArgs = specialArgs;
+
+    nodes.sup = mkNode "desktop" {
+      virtualisation = { memorySize = 3072; cores = 2; };
+      hart.sessionSupervisor = {
+        enable = true;
+        # Both higher tiers are AVAILABLE and would PAINT (true exits 0 immediately,
+        # which the watchdog-disabled crash path treats as a fast exit). They are
+        # never reached in an unhealthy run — the unhealthy block exits BEFORE any
+        # launch — so their exact command is irrelevant; we only need them
+        # available so a DROP from hart-comp lands on sway (not skipped).
+        compCommand = "${pkgs.coreutils}/bin/true";
+        swayCommand = "${pkgs.coreutils}/bin/true";
+        crashLoopCount = 3;
+        crashLoopWindowSeconds = 300;
+        # Irrelevant here (no launch happens in an unhealthy run) but pin it off so
+        # nothing about the paint path can interfere with the assertion.
+        shellPaintTimeoutSeconds = 0;
+      };
+    };
+
+    testScript = ''
+      sup = machines[0]
+      sup.start()
+      sup.wait_for_unit("multi-user.target")
+      sup.wait_for_unit("greetd.service", timeout=120)
+
+      LATCH = "/var/lib/hart/session-tier"
+      WINDOW = "/var/lib/hart/session-tier.window"
+      UNHEALTHY = "/run/hart/compositor-unhealthy"
+
+      selector = sup.succeed(
+          "find /nix/store -maxdepth 3 -name '*-hart-session-selector' -type f -print -quit"
+      ).strip()
+      assert selector, "hart-session-selector wrapper not found in the store"
+
+      def window_lines():
+          # Count crash timestamps recorded in the window file (0 if absent).
+          return int(sup.succeed(
+              f"if [ -f {WINDOW} ]; then wc -l < {WINDOW} | tr -d ' '; else echo 0; fi"
+          ).strip())
+
+      with subtest("a clean start state: arm Tier-1, clear the window + the flag"):
+          sup.succeed("hartctl session reset-tier")  # latch = hart-comp, window cleared
+          sup.succeed(f"rm -f {WINDOW} {UNHEALTHY}")
+          assert sup.succeed(f"cat {LATCH}").strip() == "hart-comp"
+          assert window_lines() == 0, "window must start empty"
+
+      with subtest("ONE unhealthy signal records EXACTLY ONE crash and does NOT fall through to launch a tier"):
+          # node_watchdog's one-way signal: touch the flag, run the selector ONCE.
+          sup.succeed(f"touch {UNHEALTHY}")
+          out = sup.succeed(f"runuser -u hart -- {selector} 2>&1; echo RC=$?")
+          assert "RC=0" in out, f"selector must return 0 to greetd, got: {out!r}"
+          # The flag was consumed (the selector removes it).
+          sup.fail(f"test -e {UNHEALTHY}")
+          # THE fix: exactly ONE crash recorded for this single invocation. A
+          # fall-through to launch the (true→exits-fast) tier would have recorded a
+          # SECOND crash on the exit-accounting path → 2 lines.
+          n = window_lines()
+          assert n == 1, f"one unhealthy run must record EXACTLY one crash, got {n} (double-record regression)"
+          # Below threshold (3) so NO drop yet — the latch is untouched. A
+          # fall-through that also launched + crashed could have tipped accounting;
+          # the latch staying hart-comp confirms the single, non-dropping record.
+          assert sup.succeed(f"cat {LATCH}").strip() == "hart-comp", \
+              "one sub-threshold unhealthy crash must not drop the tier"
+          # And the selector did NOT log a tier launch in an unhealthy run (it
+          # exits before the 'launching tier' line).
+          assert "launching tier" not in out, \
+              "the unhealthy block must NOT launch a tier in the same run (it exits first)"
+
+      with subtest("the unhealthy signal reaching the threshold drops EXACTLY ONE tier (hart-comp -> sway)"):
+          # Two more unhealthy runs reach crashLoopCount=3. Each records exactly one
+          # crash; the third tips the threshold and drops ONE rung + clears the
+          # window. A per-run double-record would have over-counted and dropped
+          # early / by more than one rung.
+          sup.succeed(f"touch {UNHEALTHY}")
+          sup.succeed(f"runuser -u hart -- {selector} || true")   # 2nd crash (window=2)
+          assert window_lines() == 2, "second unhealthy run must record exactly one more crash"
+          assert sup.succeed(f"cat {LATCH}").strip() == "hart-comp", "still below threshold — no drop"
+
+          sup.succeed(f"touch {UNHEALTHY}")
+          sup.succeed(f"runuser -u hart -- {selector} || true")   # 3rd crash -> drop + clear
+          assert sup.succeed(f"cat {LATCH}").strip() == "sway", \
+              "the 3rd unhealthy crash must drop EXACTLY one rung hart-comp -> sway"
+          # The drop cleared the window (fresh budget at the new tier).
+          assert window_lines() == 0, "a drop must clear the crash window"
+
+      with subtest("the unhealthy drop never goes below the cage floor"):
+          # Walk sway -> cage, then prove a further unhealthy crash-loop on cage
+          # cannot drop below the floor.
+          for _ in range(3):
+              sup.succeed(f"touch {UNHEALTHY}")
+              sup.succeed(f"runuser -u hart -- {selector} || true")
+          assert sup.succeed(f"cat {LATCH}").strip() == "cage", \
+              "sway must drop to the cage floor under the unhealthy crash-loop"
+          for _ in range(4):
+              sup.succeed(f"touch {UNHEALTHY}")
+              sup.succeed(f"runuser -u hart -- {selector} || true")
+          assert sup.succeed(f"cat {LATCH}").strip() == "cage", \
+              "the unhealthy crash-loop must NEVER drop below the cage floor"
+    '';
+  };
 }

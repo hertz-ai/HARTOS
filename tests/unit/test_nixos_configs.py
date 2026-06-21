@@ -1582,9 +1582,20 @@ class TestPeripheralBridgeEnableGuard:
 
 class TestHartlogCreateModule:
     """hart-hartlog-create.nix: Live-OS carves HARTLOG into the USB free space,
-    replacing the Windows-flasher diskpart path. The SAFETY contract (never
-    touch the in-use partitions, removable-only, no-op on every error) is the
-    load-bearing part — assert its presence structurally."""
+    replacing the Windows-flasher diskpart path.
+
+    The BEHAVIOUR (the carve mechanics, the never-touch-existing-partitions
+    invariant, the removable-only gate, the idempotent + full-disk + no-resolve
+    no-ops) is proven on a real Linux block layer by the wired-in nixosTest
+    nixos/tests/hartlog-create.nix (it formats a stand-in GPT disk + runs the REAL
+    script + asserts RC=0 / untouched ISO GUID / no second partition). Per
+    feedback_no_grep_tests.md these structural checks keep ONLY the cross-file
+    DRY/contract guards a VM boot can't cheaply reach — the on-disk label lockstep
+    and the flake/desktop wiring. The grep-on-source duplicates of the behavioural
+    assertions (sgdisk/mkfs present, --largest-new, the RM/usb gate, the
+    already-exists/free-space no-ops, the before-ordering) were REMOVED: they only
+    proved a string survived the commit, which the nixosTest already proves
+    behaviourally."""
 
     @pytest.fixture(autouse=True)
     def load_module(self):
@@ -1599,60 +1610,20 @@ class TestHartlogCreateModule:
         assert "hlog.enable" in self.content or "hartlogCreate.enable" in self.content
 
     def test_label_defaults_to_bootlog_label(self):
-        """ONE contract: the create-side label must default to bootLog.label so
-        the read-side (hart-boot-log) and write-side never drift."""
+        """GENUINE cross-file DRY guard (a VM boot can't cheaply prove the DEFAULT
+        expression): the create-side label must default to bootLog.label so the
+        read-side (hart-boot-log) and write-side never drift out of lockstep."""
         assert "config.hart.bootLog.label" in self.content
 
-    def test_uses_sgdisk_and_mkfs_vfat(self):
-        """The Linux-side carve: sgdisk to add the partition in free space +
-        mkfs.vfat to FAT32-format + label it."""
-        assert "sgdisk" in self.content
-        assert "mkfs.vfat" in self.content
-        assert "gptfdisk" in self.content
-        assert "dosfstools" in self.content
-
-    def test_carves_only_largest_free_block(self):
-        """--largest-new allocates from the EXISTING free pool ONLY; it cannot
-        move/resize an existing partition, so the in-use ISO/EFI/boot partitions
-        are never touched."""
-        assert "largest-new" in self.content
-
-    def test_removable_usb_safety_gate(self):
-        """NEVER repartition an internal disk — gate on RM=1 / TRAN=usb."""
-        assert "removable" in self.content.lower()
-        assert "RM" in self.content
-        assert "usb" in self.content.lower()
-
-    def test_idempotent_skip_when_hartlog_exists(self):
-        """A second boot must find the partition + no-op (idempotent)."""
-        assert "blkid -L" in self.content
-        assert "already exists" in self.content or "idempotent" in self.content
-
-    def test_no_op_when_no_free_space(self):
-        assert "no trailing free space" in self.content or "free space" in self.content
-
-    def test_ordered_before_boot_log(self):
-        """Must run BEFORE the boot-log capture so the first boot's journal lands
-        on the partition this unit creates."""
-        assert "hart-boot-log-early.service" in self.content
-        assert "before" in self.content
-
-    def test_runs_as_oneshot_with_timeout(self):
-        assert "oneshot" in self.content
-        assert "TimeoutStartSec" in self.content
-
-    def test_never_fails_boot_set_u_not_e(self):
-        """`set -u` only (NOT -e): a probe failing must not abort the carve; the
-        script decides explicitly + always exits 0."""
-        assert "set -u" in self.content
-        assert "set -e" not in self.content
-        assert "exit 0" in self.content
-
     def test_in_flake_modules(self):
+        """Gate-5 wiring guard: the module must be imported in flake.nix or the
+        nixosTest could never enable it."""
         flake = read_nix(os.path.join(NIXOS_DIR, "flake.nix"))
         assert "hart-hartlog-create.nix" in flake
 
     def test_desktop_enables_it(self):
+        """Cross-config wiring the nixosTest (which enables it via mkNode, not the
+        desktop closure) does NOT cover: the shipped desktop must opt it on."""
         desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
         assert "hartlogCreate.enable = true" in desktop
 
@@ -1664,7 +1635,18 @@ class TestHartlogCreateModule:
 class TestBootContinuityModule:
     """hart-boot-continuity.nix: on a Live-OS reboot, set a ONE-SHOT efibootmgr
     BootNext to the USB's own entry — NEVER BootOrder (so Windows is never
-    stranded). The "never touch BootOrder" invariant is the safety contract."""
+    stranded).
+
+    The BEHAVIOUR (the unit + efibootmgr in the closure, the ExecStop reboot-path
+    ordering, the non-UEFI / poweroff / no-match no-ops exiting 0, and ZERO NVRAM
+    writes on a no-op via a shadowed efibootmgr recorder) is proven by the wired-in
+    nixosTest nixos/tests/boot-continuity.nix. Per feedback_no_grep_tests.md these
+    structural checks keep ONLY the never-strand-Windows SAFETY invariant as a
+    cheap static guard (the one critical assertion worth a fast belt-and-suspenders
+    static check IN ADDITION to the behavioural one) plus the flake/desktop wiring.
+    The grep-on-source duplicates (efibootmgr/--bootnext present, the
+    /sys/firmware/efi + command-v + could-not-match no-op gates, the ExecStop +
+    ordering) were REMOVED — the nixosTest proves them behaviourally."""
 
     @pytest.fixture(autouse=True)
     def load_module(self):
@@ -1678,53 +1660,24 @@ class TestBootContinuityModule:
         assert "mkIf" in self.content
         assert "bc.enable" in self.content or "bootContinuity.enable" in self.content
 
-    def test_uses_efibootmgr_bootnext(self):
-        assert "efibootmgr" in self.content
-        assert "--bootnext" in self.content
-
     def test_never_writes_bootorder(self):
-        """THE safety invariant: the module must NEVER set/modify BootOrder —
-        only the one-shot BootNext. A BootOrder write would risk stranding the
-        user's Windows boot."""
+        """THE never-strand-Windows SAFETY invariant — kept as a fast static guard
+        IN ADDITION to the behavioural nixosTest, because a regression here (a
+        stray BootOrder write) would risk bricking the user's Windows boot, so it
+        is worth catching the instant a diff lands, not only on a 10-min VM run.
+        The module must NEVER set/modify BootOrder — only the one-shot BootNext."""
         # No efibootmgr -o / --bootorder write anywhere in the module.
         assert "--bootorder" not in self.content.lower()
         assert "efibootmgr -o" not in self.content
         assert "efibootmgr --bootorder" not in self.content
 
-    def test_no_op_when_not_uefi(self):
-        """Gate on /sys/firmware/efi — no-op on a legacy/BIOS boot."""
-        assert "/sys/firmware/efi" in self.content
-
-    def test_no_op_when_efibootmgr_missing(self):
-        assert "command -v efibootmgr" in self.content
-
-    def test_no_op_when_entry_unmatched(self):
-        """Never guess: if the USB's own entry can't be matched, do nothing."""
-        assert "could not match" in self.content or "never guess" in self.content.lower()
-
-    def test_skips_on_poweroff(self):
-        """A power-off must not arm a next boot — only a reboot returns to HART OS."""
-        assert "poweroff" in self.content
-
-    def test_runs_execstop_on_shutdown(self):
-        """ExecStop on the way down is the systemd idiom for this hook."""
-        assert "ExecStop" in self.content
-        assert "RemainAfterExit = true" in self.content
-
-    def test_ordered_before_reboot(self):
-        assert "systemd-reboot.service" in self.content
-        assert "shutdown.target" in self.content
-
-    def test_never_fails_shutdown_set_u_not_e(self):
-        assert "set -u" in self.content
-        assert "set -e" not in self.content
-        assert "exit 0" in self.content
-
     def test_in_flake_modules(self):
+        """Gate-5 wiring guard: imported in flake.nix or the nixosTest can't run."""
         flake = read_nix(os.path.join(NIXOS_DIR, "flake.nix"))
         assert "hart-boot-continuity.nix" in flake
 
     def test_desktop_enables_it(self):
+        """Cross-config wiring the nixosTest (mkNode enable) does not cover."""
         desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
         assert "bootContinuity.enable = true" in desktop
 
@@ -1737,9 +1690,18 @@ class TestBootLogModule:
     """hart-boot-log.nix: when a FAT32 HARTLOG partition is present, capture the
     full boot journal + tier-supervisor state + GTK4/GL diagnostics to it early,
     on a periodic timer (so a HUNG boot still leaves a record), and at shutdown.
-    The never-block-boot / clean-no-op contract is the load-bearing part — the
-    BEHAVIOURAL proof lives in nixos/tests/boot-log.nix; these are the structural
-    DRY/contract guards that run WITHOUT a Linux block layer (the dev box)."""
+
+    The BEHAVIOUR (the three capture units + the active timer, the no-HARTLOG clean
+    no-op, the full diagnostic bundle landing with every curated section incl. the
+    shell-ready marker + GSK/GDK/EGL surface + the boot journal, the early-phase
+    clean unmount + fsck-clean fs, the stable overwritten latest file) is proven on
+    a real FAT32 device by the wired-in nixosTest nixos/tests/boot-log.nix. Per
+    feedback_no_grep_tests.md these structural checks keep ONLY the on-stick LABEL
+    default (the ONE source of truth the carve side + flasher must agree on, a
+    default-value contract a VM boot is wasteful to prove) plus the flake/desktop
+    wiring. The grep-on-source duplicates (findfs/blkid, the three phase names, the
+    interval option, the no-op string, the paint-hang surface strings, sync/umount)
+    were REMOVED — the nixosTest proves them behaviourally."""
 
     @pytest.fixture(autouse=True)
     def load_module(self):
@@ -1754,61 +1716,19 @@ class TestBootLogModule:
         assert "blog.enable" in self.content or "bootLog.enable" in self.content
 
     def test_label_default_is_hartlog(self):
-        """ONE source of truth for the on-stick contract: the label the flasher +
-        the live-OS carve write, and this module reads, is HARTLOG."""
+        """GENUINE single-source contract guard (a VM can't cheaply prove the
+        DEFAULT value): the label the flasher + the live-OS carve write and this
+        module reads is HARTLOG. Pairs with TestHartlogCreateModule's lockstep
+        test (the carve defaults its label to THIS one)."""
         assert 'default = "HARTLOG"' in self.content
 
-    def test_finds_partition_by_label(self):
-        """Detection is by filesystem LABEL (findfs / blkid -L) — the exact
-        contract the carve side writes."""
-        assert "findfs" in self.content or "blkid -L" in self.content
-
-    def test_three_capture_phases(self):
-        """early + periodic + shutdown — the periodic tick is what makes a HUNG
-        boot debuggable (it never settles, only a periodic capture lands it)."""
-        assert "hart-boot-log-early" in self.content
-        assert "hart-boot-log-periodic" in self.content
-        assert "hart-boot-log-shutdown" in self.content
-        assert "systemd.timers" in self.content
-
-    def test_periodic_interval_option(self):
-        assert "intervalSeconds" in self.content
-        assert "OnUnitActiveSec" in self.content
-
-    def test_no_op_when_no_hartlog_present(self):
-        """A missing HARTLOG partition is a clean no-op (old stick / plain flash)
-        — the capture logs one line + exits 0, never blocks boot."""
-        assert "no '" in self.content and "partition present" in self.content
-        assert "clean no-op" in self.content
-
-    def test_captures_the_paint_hang_surface(self):
-        """The bundle must carry the GTK4/Tier-1 paint-hang debug surface: the
-        shell-ready marker, the supervisor tier state, and GSK/EGL/GL errors."""
-        assert "shell-ready" in self.content
-        assert "GSK" in self.content or "GDK" in self.content or "EGL" in self.content
-        assert "journalctl -b" in self.content
-
-    def test_fsyncs_so_a_poweroff_keeps_the_bundle(self):
-        """FAT has no journal — sync the partition so an abrupt power-off after a
-        hung boot still keeps the bytes."""
-        assert "sync" in self.content
-
-    def test_unmounts_on_non_periodic_phase(self):
-        """early/shutdown unmount cleanly (Windows host sees a consistent fs);
-        only the periodic phase keeps it mounted (re-mount-churn avoidance)."""
-        assert "umount" in self.content
-        assert 'PHASE" != "periodic"' in self.content or "periodic" in self.content
-
-    def test_never_fails_boot_set_u_not_e(self):
-        assert "set -u" in self.content
-        assert "set -e" not in self.content
-        assert "exit 0" in self.content
-
     def test_in_flake_modules(self):
+        """Gate-5 wiring guard: imported in flake.nix or the nixosTest can't run."""
         flake = read_nix(os.path.join(NIXOS_DIR, "flake.nix"))
         assert "hart-boot-log.nix" in flake
 
     def test_desktop_enables_it(self):
+        """Cross-config wiring the nixosTest (mkNode enable) does not cover."""
         desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
         assert "bootLog.enable = true" in desktop
 
@@ -1898,7 +1818,22 @@ class TestBootNixosTestsRegistered:
 # these are the acceptable cross-file DRY / never-fail source-guard class — the
 # VM test owns the behaviour, this owns the contract SHAPE.
 class TestSessionSupervisorModule:
-    """hart-session-supervisor.nix option + ladder wiring."""
+    """hart-session-supervisor.nix OPTION + LADDER CONTRACT guards.
+
+    The BEHAVIOUR (greetd replaces GDM, the crash-loop drop + latch to cage, the
+    paint-watchdog hang-kill, the latch-across-reboot, never-below-cage, the
+    group-writable marker dir, the start-tier resolution, the recovery TTYs, AND —
+    after this change — the node_watchdog-unhealthy single-crash drop) is proven by
+    the wired-in nixosTests nixos/tests/session-supervisor.nix. Per
+    feedback_no_grep_tests.md these structural checks keep ONLY the option
+    enum/type/default REGEX guards (a VM boot is wasteful for a default value) and
+    the load-bearing ladder/floor CONSTANTS — the contract SHAPE the VM test
+    can't cheaply assert. The grep-on-source duplicates that merely shadowed a
+    behavioural nixosTest assertion (greetd-replaces-gdm, the selector-in-bg
+    launch, the marker dir mode, the floor-exempt branch, the persistent-latch +
+    tmpfs-flag paths, the record_crash/lower_tier symbol-presence, the
+    SIGNAL-EMITTER-ONLY comment grep) were REMOVED — the nixosTests prove them
+    behaviourally."""
 
     @pytest.fixture(autouse=True)
     def load_module(self):
@@ -1913,7 +1848,9 @@ class TestSessionSupervisorModule:
 
     def test_opt_in_no_op_when_disabled(self):
         """The module is OPT-IN: pure no-op unless BOTH hart.enable and
-        sessionSupervisor.enable are set (never silently replaces GDM)."""
+        sessionSupervisor.enable are set (never silently replaces GDM). A VM with
+        the supervisor ENABLED cannot cheaply prove the DISABLED path is a no-op —
+        this guards the mkIf gate that makes it so."""
         assert "lib.mkIf (cfg.enable && sup.enable)" in self.content
 
     def test_start_tier_is_enum_of_the_three_tiers(self):
@@ -1930,10 +1867,15 @@ class TestSessionSupervisorModule:
         assert 'default = "hart-comp"' in m.group(1)
 
     def test_tier_ladder_order_highest_to_lowest(self):
-        """The ordered ladder is hart-comp → sway → cage; cage LAST = the floor."""
+        """The ORDERED ladder constant is hart-comp → sway → cage; cage LAST = the
+        floor. The load-bearing source-of-truth for the drop direction (a reorder
+        would silently invert the ladder); the VM proves the EFFECT, this locks the
+        literal so a reorder is caught the instant a diff lands."""
         assert 'tierLadder = [ "hart-comp" "sway" "cage" ]' in self.content
 
     def test_cage_is_the_floor(self):
+        """The floor constant the supervisor can never drop below — paired with the
+        ladder ordering above."""
         assert 'FLOOR="cage"' in self.content
 
     def test_crash_loop_count_default_three(self):
@@ -1957,61 +1899,18 @@ class TestSessionSupervisorModule:
         assert "default = 20" in m.group(1)
         assert "ints.unsigned" in m.group(1)
 
-    def test_ready_marker_path_is_run_tmpfs(self):
-        """The first-paint marker lives in /run (tmpfs) so a stale marker can
-        never survive a reboot and mask a hang on the next boot."""
-        assert 'sessionRunDir = "/run/hart/session"' in self.content
-        assert 'readyFlag = "${sessionRunDir}/shell-ready"' in self.content
-
-    def test_ready_marker_dir_is_group_writable(self):
-        """0770 hart hart — group-writable so the hart-admin shell host (in the
-        `hart` group) can touch the marker the watchdog consumes."""
-        assert '"d /run/hart/session 0770 hart hart -"' in self.content
-
-    def test_latch_on_persistent_state_dir(self):
-        """The latch is under /var/lib/hart (persistent), NOT /run — so a drop
-        LATCHES across boot by construction."""
-        assert 'stateDir   = "/var/lib/hart"' in self.content
-        assert 'latchFile  = "${stateDir}/session-tier"' in self.content
-
-    def test_unhealthy_flag_is_run_tmpfs(self):
-        """node_watchdog's compositor-unhealthy SIGNAL flag is in /run tmpfs so a
-        fresh boot always gets a clean slate; node_watchdog never writes the latch."""
-        assert 'unhealthyFlag = "/run/hart/compositor-unhealthy"' in self.content
-
-    def test_greetd_replaces_gdm_when_enabled(self):
-        """greetd is the out-of-process supervisor; when enabled it force-disables
-        GDM so the two display managers don't both claim the seat."""
-        assert "services.greetd" in self.content
-        assert "enable = true" in self.content
-        assert "services.xserver.displayManager.gdm.enable = lib.mkForce false" in self.content
-
-    def test_greetd_runs_the_selector_as_session(self):
-        assert "hart-session-selector" in self.content
-        assert "default_session" in self.content
-        assert 'command = "${selectorScript}"' in self.content
-
-    def test_selector_runs_session_in_background_for_watchdog(self):
-        """The session is launched in the BACKGROUND so the paint-watchdog can
-        observe a HUNG tier (compositor up, never paints, never exits)."""
-        assert 'sh -c "$CMD" &' in self.content
-        assert "sesspid=$!" in self.content
-
-    def test_watchdog_drop_reuses_the_crash_path_no_parallel_mechanism(self):
-        """A hang counts toward the SAME record_crash → lower_tier → write_tier
-        drop as a crash — no second/parallel drop mechanism (DRY)."""
-        assert "record_crash" in self.content
-        assert "lower_tier" in self.content
-        assert "write_tier" in self.content
-
-    def test_floor_is_exempt_from_watchdog_drop(self):
-        """cage (the floor) is never dropped by the paint-watchdog — there is
-        nothing below it and it is the audited paint floor."""
-        assert 'if [ "$TIER" != "$FLOOR" ]; then' in self.content
+    def test_cage_command_non_empty_assertion(self):
+        """GENUINE module-shape contract a VM boot would only surface as a runtime
+        FATAL-loop blank screen: cageCommand is types.str (not nullOr), and an
+        empty "" would make the FLOOR unlaunchable → the selector loops on
+        'FATAL: no available session command' = the exact blank screen this module
+        prevents. A module `assertion` must fail the closure at eval time instead.
+        Assert the assertion exists and gates on cageCommand != ""."""
+        assert 'assertion = sup.cageCommand != ""' in self.content
 
     def test_cage_command_reused_verbatim_not_reimplemented(self):
         """Tier-3 is hart-liquid-ui.nix's hart-shell-session, reused — the floor is
-        never reimplemented in the supervisor."""
+        never reimplemented in the supervisor (a default-value DRY contract)."""
         m = re.search(r"cageCommand\s*=\s*lib\.mkOption\s*\{(.*?)\};", self.content, re.S)
         assert m, "cageCommand option block not found"
         assert 'default = "hart-shell-session"' in m.group(1)
@@ -2027,13 +1926,6 @@ class TestSessionSupervisorModule:
         m = re.search(r"swayCommand\s*=\s*lib\.mkOption\s*\{(.*?)\};", self.content, re.S)
         assert m, "swayCommand option block not found"
         assert "nullOr" in m.group(1)
-
-    def test_node_watchdog_stays_signal_only(self):
-        """node_watchdog never selects a session — session selection is
-        OUT-OF-PROCESS (greetd) by construction. The only wire is the one-way
-        unhealthy signal flag."""
-        assert "SIGNAL EMITTER ONLY" in self.content
-        assert "never reads or writes the latch" in self.content
 
 
 class TestSessionSupervisorDesktopWiring:
@@ -2152,6 +2044,16 @@ class TestSessionSupervisorNixTestWiring:
         # selector exports via HART_SHELL_READY_FLAG (one shared path).
         assert "HART_SHELL_READY_FLAG" in self.nixtest
 
+    def test_unhealthy_flag_node_present(self):
+        """The node_watchdog-unhealthy-signal path has its OWN behavioural node:
+        touching /run/hart/compositor-unhealthy and running the selector ONCE must
+        record EXACTLY ONE crash + drop cleanly WITHOUT falling through to launch a
+        tier (proving the double-record fix). It exercises the one-way signal flag
+        the old structural test only grepped for."""
+        assert "hart-session-supervisor-unhealthy-flag" in self.nixtest
+        # It touches the real signal flag the supervisor consumes.
+        assert "/run/hart/compositor-unhealthy" in self.nixtest
+
     def test_each_new_node_in_ci_vm_workflow(self):
         """Every check that should RUN must be built explicitly in the VM workflow
         (the workflow targets checks by name, not `nix flake check`)."""
@@ -2163,5 +2065,6 @@ class TestSessionSupervisorNixTestWiring:
             "hart-session-supervisor-start-tier",
             "hart-session-supervisor-reboot-latch",
             "hart-session-supervisor-recovery-tty",
+            "hart-session-supervisor-unhealthy-flag",
         ]:
             assert node in wf, f"VM workflow does not build/run {node} — it would never gate"
