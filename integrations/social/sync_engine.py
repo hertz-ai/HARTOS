@@ -34,6 +34,7 @@ class SyncEntity:
     gate: Callable = None         # (db, obj, demander) -> bool — consent/privacy
     serialize: Callable = None    # (db, obj) -> dict — provenance-stamped, no assets
     match: Callable = None        # (obj) -> bool — resolve an obj to this entity (producer)
+    owner: Callable = None        # (obj) -> user_id — whose clients see the sync-status (P4); None = no emit
     topic: str = ''               # WAMP topic template for P2P + down-push
     p2p: bool = True
     central: bool = True
@@ -100,11 +101,33 @@ class SyncEngine:
             if not ent.gate(db, obj, demander):
                 return None
             payload = ent.serialize(db, obj)
-            return (SyncEngine.queue(db, 'central', ent.op, payload)
-                    if ent.central else None)
+            qid = (SyncEngine.queue(db, 'central', ent.op, payload)
+                   if ent.central else None)
+            # P4 real-time: tell the owner's clients the entity synced — REUSE
+            # the existing on_notification fan-out (chat.social WAMP + SSE), not
+            # a new transport. Opt-in per entity (only those with an owner
+            # extractor; high-frequency/internal entities stay silent).
+            if qid and ent.owner:
+                SyncEngine._emit_sync_status(ent.owner(obj), ent.op)
+            return qid
         except Exception as e:
             logger.debug("SyncEngine.queue_entity: %s", e)
             return None
+
+    @staticmethod
+    def _emit_sync_status(owner_id, op, status: str = 'synced'):
+        """P4: surface sync state to the owner's clients via the EXISTING
+        on_notification channel (chat.social WAMP + SSE that RN/web/desktop
+        already consume) — no new transport, no parallel fan-out path.
+        Best-effort; never blocks the producer."""
+        if not owner_id:
+            return
+        try:
+            from .realtime import on_notification
+            on_notification(str(owner_id), {'type': 'sync_status',
+                                            'entity': op, 'sync_status': status})
+        except Exception:
+            pass
 
     @staticmethod
     def _signed_send_payload(node_id, batch) -> dict:
@@ -831,7 +854,8 @@ SYNC_ENTITIES: Dict[str, SyncEntity] = {
     'sync_post': SyncEntity(
         op='sync_post', apply=SyncEngine._handle_sync_post,
         match=lambda o: isinstance(o, dict) and 'privacy' in o,
-        gate=_post_gate, serialize=_post_serialize),
+        gate=_post_gate, serialize=_post_serialize,
+        owner=lambda o: o.get('author_id')),
     'register_agent': SyncEntity(
         op='register_agent', apply=SyncEngine._handle_sync_agent,
         match=lambda o: getattr(o, 'user_type', None) == 'agent',
@@ -839,7 +863,8 @@ SYNC_ENTITIES: Dict[str, SyncEntity] = {
     'sync_community': SyncEntity(
         op='sync_community', apply=SyncEngine._handle_sync_community,
         match=lambda o: getattr(o, '__tablename__', None) == 'communities',
-        gate=_community_gate, serialize=_community_serialize),
+        gate=_community_gate, serialize=_community_serialize,
+        owner=lambda o: getattr(o, 'creator_id', None)),
     'sync_membership': SyncEntity(
         op='sync_membership', apply=SyncEngine._handle_sync_membership,
         match=lambda o: getattr(o, '__tablename__', None) == 'community_memberships',
@@ -855,7 +880,8 @@ SYNC_ENTITIES: Dict[str, SyncEntity] = {
     'sync_friendship': SyncEntity(
         op='sync_friendship', apply=SyncEngine._handle_sync_friendship,
         match=lambda o: isinstance(o, dict) and 'user_a_id' in o and 'status' in o,
-        gate=_friend_gate, serialize=_friend_serialize),
+        gate=_friend_gate, serialize=_friend_serialize,
+        owner=lambda o: o.get('initiator_id')),
     'sync_user': SyncEntity(
         op='sync_user', apply=SyncEngine._handle_sync_user),
 }
