@@ -119,6 +119,17 @@ class MemoryStore:
                 isolation_level=None,
             )
             self._conn.row_factory = sqlite3.Row
+            # PERF-4 (audit #566): register_conversation does 2 INSERTs (+ FTS5
+            # trigger writes) per chat turn.  The default rollback journal +
+            # synchronous=FULL fsyncs per statement (5-30x slower than WAL).
+            # Match the sibling embeddings.py store's WAL idiom (same DB family,
+            # one pattern — not a parallel path) and add synchronous=NORMAL:
+            # safe under WAL (a hard crash can lose only the last few committed
+            # txns, which is fine for a local memory cache).  No-op for the
+            # ":memory:" path (stays journal_mode=memory).
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA busy_timeout=30000")
             # Enable FTS5 if available
             try:
                 self._conn.execute("SELECT fts5()")
