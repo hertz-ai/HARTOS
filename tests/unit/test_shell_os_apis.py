@@ -540,6 +540,49 @@ class TestFirmwareSetup(unittest.TestCase):
                 patch(f'{self.MOD}.open', m, create=True):
             self.assertFalse(firmware_setup_supported())
 
+    # ── The REAL destructive-classifier gate (NOT patched) ──
+    # Regression guard for the dead-feature class: the power-action handler must
+    # NOT route the enumerated power verbs through the free-form destructive
+    # classifier. With the REAL classifier, 'firmware'/'uefi' classify as
+    # 'unknown' (and 'reboot'/'shutdown' as 'destructive'), so the old gate
+    # 403'd EVERY power action on a real box — the firmware feature was dead. The
+    # canonical gate for a power verb is the enumerated whitelist + the firmware
+    # capability probe, identical to the liquid_ui_service session route.
+
+    def test_firmware_permitted_with_real_classifier_on_capable_box(self):
+        """REAL _classify_destructive (NOT patched): firmware setup runs on a
+        capability-advertising box — it must NOT be refused as 'unknown'."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.firmware_setup_supported', return_value=True), \
+                patch(f'{self.MOD}.subprocess.Popen') as popen:
+            r = client.post('/api/shell/power/action', json={'action': 'firmware'})
+        self.assertEqual(r.status_code, 200)
+        popen.assert_called_once_with(['systemctl', 'reboot', '--firmware-setup'])
+
+    def test_firmware_refused_with_real_classifier_on_incapable_box(self):
+        """REAL _classify_destructive (NOT patched): on a legacy-BIOS / no-cap box
+        the firmware action is refused (400) by the CAPABILITY gate and never
+        reboots — so the refusal reason is 'unsupported', not 'destructive'."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.firmware_setup_supported', return_value=False), \
+                patch(f'{self.MOD}.subprocess.Popen') as popen:
+            r = client.post('/api/shell/power/action', json={'action': 'firmware'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('not supported', json.loads(r.data)['error'])
+        popen.assert_not_called()
+
+    def test_reboot_and_shutdown_permitted_with_real_classifier(self):
+        """REAL classifier: 'reboot'/'shutdown' classify as 'destructive' yet are
+        intentional, capability-free power verbs — they must still execute (the
+        old generic gate wrongly 403'd them)."""
+        for action, cmd in (('reboot', ['systemctl', 'reboot']),
+                            ('shutdown', ['systemctl', 'poweroff'])):
+            client = _make_os_app()
+            with patch(f'{self.MOD}.subprocess.Popen') as popen:
+                r = client.post('/api/shell/power/action', json={'action': action})
+            self.assertEqual(r.status_code, 200, action)
+            popen.assert_called_once_with(cmd)
+
 
 # ═══════════════════════════════════════════════════════════════
 # i18n

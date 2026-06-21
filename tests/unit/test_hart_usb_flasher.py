@@ -178,6 +178,41 @@ def test_diskpart_fallback_parses_usb_and_system(monkeypatch):
     assert [d["number"] for d in flasher.usb_disks(disks)] == [1]
 
 
+_DETAIL_USB_BOOT_DISK = """Disk 2 is now the selected disk.
+
+SanDisk Extreme USB Device
+Disk ID: A1B2C3D4
+Type   : USB
+Status : Online
+Boot Disk  : Yes
+Pagefile Disk  : Yes
+"""
+
+
+def test_usb_stick_that_is_the_live_boot_disk_stays_system_and_excluded(monkeypatch):
+    """A USB-bus disk that is ITSELF the live boot/pagefile medium (the machine
+    was booted FROM the stick) MUST classify system=True and be EXCLUDED from the
+    default write offer. Regression guard: the old code force-cleared `system`
+    for any USB-bus disk, discarding the `Boot Disk: Yes` signal — so the
+    diskpart fallback would have offered the live boot disk as a writable target
+    (the exact wrong-disk catastrophe the safety layer prevents). This must match
+    the Get-Disk path, which honours IsSystem/IsBoot regardless of bus."""
+    bus, model, system = flasher._parse_diskpart_detail(_DETAIL_USB_BOOT_DISK)
+    assert bus == "USB"
+    assert "SanDisk" in model
+    # The USB stick is the live boot/pagefile medium -> system True, NOT cleared.
+    assert system is True
+
+    disk = {"number": 2, "removable": True, "system": system,
+            "model": model, "size": 32 * 1024**3}
+    # Safety filter: a system USB disk is NOT in the default offered pool.
+    assert flasher.usb_disks([disk]) == []
+    # And disk_warning surfaces the boot-disk danger even though it is USB.
+    monkeypatch.setattr(flasher, "disk_contents_summary", lambda d: "0 partition(s)")
+    assert "SYSTEM" in flasher.disk_warning(disk).upper() or \
+           "BOOT DISK" in flasher.disk_warning(disk).upper()
+
+
 def test_get_disk_timeout_falls_back_to_diskpart(monkeypatch):
     """When the Get-Disk PowerShell call TIMES OUT (the wedged-WMI symptom),
     `_list_disks_windows` must transparently fall back to the diskpart path."""
@@ -504,3 +539,126 @@ def test_windows_log_partition_flag_parses(monkeypatch):
     args2 = flasher.build_parser().parse_args(
         ["--device", "1", "--yes", "--windows-log-partition"])
     assert args2.windows_log_partition is True           # explicit legacy opt-in
+
+
+# ─────────── _WinExclusiveWriter.write_at byte-placement ───────────
+# The actual byte-write path (seek + write at offset) had ZERO non-hardware
+# coverage, yet the file's own docstring warns "a wrong offset corrupts the
+# image". These tests drive write_at against an in-memory BytesIO-backed fake
+# kernel32 handle (no ctypes WinDLL, no PhysicalDrive) and assert bytes land at
+# the right offsets + the final partial sector is zero-padded to SECTOR.
+
+import io
+
+
+class _FakeDWORD:
+    """Stand-in for wintypes.DWORD() — write_at sets .value via byref()."""
+    def __init__(self):
+        self.value = 0
+
+
+class _FakeKernel32:
+    """A fake kernel32 backed by a BytesIO. SetFilePointerEx moves the cursor,
+    WriteFile writes the buffer at the cursor + reports the byte count, exactly
+    as the real WriteFile/SetFilePointerEx pair the writer drives."""
+    def __init__(self):
+        self.buf = io.BytesIO()
+
+    def SetFilePointerEx(self, h, offset, _new_ptr, _whence):
+        # _whence == 0 (FILE_BEGIN); a negative seek would fail in the real API.
+        if offset < 0:
+            return 0
+        self.buf.seek(offset)
+        return 1                                   # non-zero == success
+
+    def WriteFile(self, _h, data, length, written_ref, _overlapped):
+        # ctypes passes the buffer; bytes() handles both bytes and ctypes views.
+        self.buf.write(bytes(bytes(data)[:length]))
+        written_ref._obj.value = length            # byref() target
+        return 1                                   # non-zero == success
+
+
+class _FakeByref:
+    """Minimal ctypes.byref stand-in: wraps the DWORD so WriteFile can set it."""
+    def __init__(self, obj):
+        self._obj = obj
+
+
+def _fake_writer():
+    """A _WinExclusiveWriter wired to a fake kernel32 + BytesIO — bypasses the
+    real exclusive-handle open (no hardware, no ctypes WinDLL)."""
+    w = flasher._WinExclusiveWriter.__new__(flasher._WinExclusiveWriter)
+    fake_k = _FakeKernel32()
+    w.k = fake_k
+    w.h = object()                                  # opaque handle; the fake k ignores it
+
+    class _FakeCtypes:
+        @staticmethod
+        def byref(obj):
+            return _FakeByref(obj)
+
+        @staticmethod
+        def get_last_error():
+            return 0
+    w.ctypes = _FakeCtypes()
+
+    class _FakeWintypes:
+        DWORD = _FakeDWORD
+    w.wintypes = _FakeWintypes()
+    return w, fake_k
+
+
+def test_write_at_places_bytes_at_the_seeked_offset():
+    """A single write lands exactly at byte_offset — never at 0 + never shifted."""
+    w, k = _fake_writer()
+    offset = 3 * 1024 * 1024                         # 3 MiB, MiB-aligned like a part
+    payload = b"HART" * (flasher.SECTOR // 4)        # exactly one 512B sector
+    n = w.write_at(offset, io.BytesIO(payload))
+    assert n == len(payload)
+    raw = k.buf.getvalue()
+    assert len(raw) == offset + len(payload)
+    assert raw[:offset] == b"\x00" * offset          # nothing written before offset
+    assert raw[offset:offset + len(payload)] == payload
+
+
+def test_write_at_multipart_offsets_are_correct():
+    """Multiple parts written at cumulative offsets (the real multi-part flow)
+    land contiguously, each at its own offset — no overlap, no gap, no shift."""
+    w, k = _fake_writer()
+    p0 = b"A" * flasher.SECTOR
+    p1 = b"B" * flasher.SECTOR
+    p2 = b"C" * flasher.SECTOR
+    offs = [0, flasher.SECTOR, 2 * flasher.SECTOR]
+    w.write_at(offs[0], io.BytesIO(p0))
+    w.write_at(offs[1], io.BytesIO(p1))
+    w.write_at(offs[2], io.BytesIO(p2))
+    raw = k.buf.getvalue()
+    assert raw[offs[0]:offs[0] + flasher.SECTOR] == p0
+    assert raw[offs[1]:offs[1] + flasher.SECTOR] == p1
+    assert raw[offs[2]:offs[2] + flasher.SECTOR] == p2
+    assert len(raw) == 3 * flasher.SECTOR
+
+
+def test_write_at_pads_final_partial_sector_with_zeros():
+    """A payload that is NOT a whole-sector multiple is zero-padded UP to the next
+    SECTOR boundary (raw block writes must be sector-aligned), and the reported
+    byte count reflects the padded length."""
+    w, k = _fake_writer()
+    payload = b"\xab" * (flasher.SECTOR + 100)       # 1 full sector + 100 bytes
+    n = w.write_at(0, io.BytesIO(payload))
+    expected_len = 2 * flasher.SECTOR                # padded up to 2 full sectors
+    assert n == expected_len
+    raw = k.buf.getvalue()
+    assert len(raw) == expected_len
+    assert raw[:len(payload)] == payload             # real bytes intact
+    assert raw[len(payload):] == b"\x00" * (expected_len - len(payload))  # zero pad
+
+
+def test_write_at_chunks_larger_than_chunk_size_are_all_written():
+    """A source bigger than CHUNK is read + written across multiple WriteFile
+    calls; every byte still lands, in order, with no truncation."""
+    w, k = _fake_writer()
+    payload = bytes((i % 256) for i in range(flasher.CHUNK + flasher.SECTOR))
+    n = w.write_at(0, io.BytesIO(payload))
+    assert n == len(payload)                         # already sector-aligned
+    assert k.buf.getvalue() == payload

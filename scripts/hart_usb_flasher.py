@@ -201,8 +201,13 @@ def _parse_diskpart_detail(detail):
     """From `detail disk` output extract (bus, model, system).
 
     The model name is the first non-empty, non-`Key : value`, non-`Disk ID:`
-    line after the header. `Type : USB` => bus 'USB'. `Boot Disk : Yes` (or a
-    USB-less disk that is the boot/pagefile disk) => system True."""
+    line after the header. `Type : USB` => bus 'USB'. `Boot Disk : Yes`
+    (or `Pagefile Disk : Yes`) => system True — INCLUDING USB-bus disks: on a
+    machine booted FROM a USB stick that stick IS the live boot/pagefile medium
+    and MUST stay flagged + excluded from the default write offer (else the
+    diskpart fallback would offer the live boot disk as a writable target — the
+    exact wrong-disk catastrophe the safety layer exists to prevent). This
+    matches the Get-Disk path, which honours IsSystem/IsBoot regardless of bus."""
     bus, model, system = "", "", False
     for raw in detail.splitlines():
         line = raw.strip()
@@ -223,9 +228,6 @@ def _parse_diskpart_detail(detail):
               and not low.startswith("volume ")
               and not low.startswith("-")):
             model = line
-    # A USB-bus disk is removable and never a system disk.
-    if bus == "USB":
-        system = False
     return bus, model, system
 
 

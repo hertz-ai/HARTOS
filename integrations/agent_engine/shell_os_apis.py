@@ -897,14 +897,24 @@ def register_shell_os_routes(app):
     @app.route('/api/shell/power/action', methods=['POST'])
     @_require_shell_auth
     def shell_power_action():
-        """Execute power action (suspend, hibernate, reboot, shutdown)."""
+        """Execute power action (suspend, hibernate, reboot, shutdown, lock,
+        firmware/uefi)."""
         data = request.get_json(force=True)
         action = data.get('action', '')
 
-        if not _classify_destructive(f'power action: {action}'):
-            return jsonify({'error': 'Action classified as destructive — requires approval'}), 403
-
-        _audit_shell_op('power_action', {'action': action})
+        # These are an ENUMERATED, intentional set of power verbs — already
+        # behind the local-shell auth gate (@_require_shell_auth) and (for
+        # firmware/uefi) the firmware-capability gate below. They must NOT be
+        # routed through the FREE-FORM destructive classifier: that classifier
+        # exists for arbitrary command/file text (terminal exec, file delete),
+        # and it (a) refuses 'reboot'/'shutdown' as destructive and (b) refuses
+        # 'firmware'/'suspend'/'hibernate' as 'unknown' (fail-closed) — so on a
+        # real box EVERY power action 403'd and the firmware feature was dead.
+        # The canonical gate for a power verb is membership in this whitelist
+        # (and the capability probe for firmware/uefi) — the SAME decision the
+        # liquid_ui_service /api/shell/session/<action> route uses, so the two
+        # entry points for the identical `systemctl reboot --firmware-setup`
+        # command no longer gate differently (Gate-4: one canonical path).
         actions = {
             'suspend': ['systemctl', 'suspend'],
             'hibernate': ['systemctl', 'hibernate'],
@@ -928,6 +938,7 @@ def register_shell_os_routes(app):
                                      'this system (legacy BIOS or capability not '
                                      'advertised)'}), 400
 
+        _audit_shell_op('power_action', {'action': action})
         try:
             subprocess.Popen(actions[action])
             return jsonify({'action': action, 'initiated': True})
