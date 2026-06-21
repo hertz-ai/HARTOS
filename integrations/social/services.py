@@ -991,6 +991,16 @@ class CommunityService:
             id=_uuid(), user_id=creator.id, community_id=community.id, role='admin')
         db.add(membership)
         db.flush()
+
+        # Up-sync PUBLIC communities through the ONE unified producer (P3) — the
+        # gate (not is_private) + serialize + queue live in the registry; private
+        # communities no-op.  Best-effort: a sync hiccup never blocks creation.
+        try:
+            from .sync_engine import SyncEngine
+            SyncEngine.queue_entity(db, community)
+        except Exception:
+            pass
+
         return community
 
     @staticmethod

@@ -356,6 +356,45 @@ class SyncEngine:
                 logger.debug(f"Sync: agent skill upsert skipped for {agent_pk}: {e}")
 
     @staticmethod
+    def _apply_synced_row(db, model, data: dict, fields: list, ts_field: str = None):
+        """Generic idempotent upsert-by-id receiver for a simple synced entity —
+        the reusable twin of _handle_sync_user's create-or-update, parameterised
+        by model + the sync-owned fields (so P3 entities are registrations, not
+        bespoke receivers).  Dedup is inherent (upsert by primary key); optional
+        LWW: when ts_field is given and the incoming row is OLDER than the local
+        one, the stale write is skipped.  Best-effort; returns the row id or
+        None."""
+        row_id = (data or {}).get('id')
+        if not row_id:
+            return None
+        row = db.query(model).filter_by(id=row_id).first()
+        if row is not None and ts_field:
+            inc = data.get(ts_field)
+            cur = getattr(row, ts_field, None)
+            cur = cur.isoformat() if hasattr(cur, 'isoformat') else cur
+            if inc and cur and str(inc) < str(cur):
+                return row_id  # stale write loses (LWW) — keep the newer local row
+        if row is None:
+            row = model(id=row_id)
+            db.add(row)
+        for f in fields:
+            if f in data and data[f] is not None:
+                setattr(row, f, data[f])
+        db.flush()
+        return row_id
+
+    @staticmethod
+    def _handle_sync_community(db, payload: dict):
+        """Land a synced community (P3) — public communities are a discoverable
+        mirror, reusing the generic upsert-by-id apply.  payload is the
+        _entity_message envelope; the row rides in payload['data']."""
+        return SyncEngine._apply_synced_row(
+            db, _community_model(), (payload or {}).get('data') or {},
+            ['name', 'display_name', 'description', 'rules', 'icon_url',
+             'banner_url', 'creator_id', 'is_default', 'is_private',
+             'member_count', 'post_count'])
+
+    @staticmethod
     def _handle_sync_user(db, payload: dict):
         """Create or update a User record from sync data."""
         from .models import User
@@ -617,6 +656,21 @@ def _agent_serialize(db, obj):
     return federation._agent_message(db, obj)
 
 
+def _community_model():
+    from .models import Community
+    return Community
+
+
+def _community_gate(db, obj, demander):
+    # public communities replicate (discoverable); private stay local
+    return not getattr(obj, 'is_private', False)
+
+
+def _community_serialize(db, obj):
+    from .federation import federation
+    return federation._entity_message(db, 'community', obj)
+
+
 SYNC_ENTITIES: Dict[str, SyncEntity] = {
     'sync_post': SyncEntity(
         op='sync_post', apply=SyncEngine._handle_sync_post,
@@ -626,6 +680,10 @@ SYNC_ENTITIES: Dict[str, SyncEntity] = {
         op='register_agent', apply=SyncEngine._handle_sync_agent,
         match=lambda o: getattr(o, 'user_type', None) == 'agent',
         gate=_agent_gate, serialize=_agent_serialize),
+    'sync_community': SyncEntity(
+        op='sync_community', apply=SyncEngine._handle_sync_community,
+        match=lambda o: getattr(o, '__tablename__', None) == 'communities',
+        gate=_community_gate, serialize=_community_serialize),
     'sync_user': SyncEntity(
         op='sync_user', apply=SyncEngine._handle_sync_user),
 }

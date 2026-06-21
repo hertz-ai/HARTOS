@@ -225,6 +225,21 @@ class FederationManager:
             logger.debug("Federation._agent_skill_summary: skipped: %s", e)
             return []
 
+    def _entity_message(self, db, kind: str, obj) -> dict:
+        """Generic provenance-stamped envelope for a synced entity (P3+) — the
+        unified twin of _outbox_message/_agent_message for the simple entities
+        (community, …).  ONE shape: the same gossip origin fields + the row's
+        to_dict() under 'data'.  The receiver upserts payload['data'] by id."""
+        from .peer_discovery import gossip
+        return {
+            'type': kind,
+            'origin_node_id': gossip.node_id,
+            'origin_url': gossip.base_url,
+            'origin_name': gossip.node_name,
+            'data': obj.to_dict(),
+            'timestamp': datetime.utcnow().isoformat(),
+        }
+
     def sync_agent_to_parent(self, db, user) -> Optional[str]:
         """Queue a PUBLIC local agent UP the tier hierarchy to central — the
         agent twin of sync_to_parent (gap #4).  Same gate→build→queue control

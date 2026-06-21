@@ -27,9 +27,11 @@ def test_registry_holds_the_three_entities():
         assert callable(ent.apply)
 
 
-def test_dispatch_covers_every_legacy_op_exactly():
-    # No op dropped, none invented — behaviour parity with the old ladder.
-    assert set(se.OP_DISPATCH) == _LEGACY_OPS
+def test_dispatch_covers_every_legacy_op():
+    # No LEGACY op dropped — behaviour parity with the old if/elif ladder. New
+    # entity ops (sync_community in P3, and onward) are additive registrations,
+    # exactly as the unified registry intends.
+    assert _LEGACY_OPS.issubset(set(se.OP_DISPATCH))
 
 
 def test_entity_op_routes_through_registry(monkeypatch):
