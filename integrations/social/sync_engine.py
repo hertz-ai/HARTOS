@@ -427,6 +427,33 @@ class SyncEngine:
             ts_field='updated_at', key_field='user_id')
 
     @staticmethod
+    def _handle_sync_friendship(db, payload: dict):
+        """Land a synced friendship (P3) — friendships is a raw-SQL table (no
+        model), so a portable upsert by id: SELECT then INSERT/UPDATE (no
+        dialect-specific ON CONFLICT — works on SQLite node + MySQL central).
+        Best-effort; returns the id or None."""
+        from sqlalchemy import text
+        d = (payload or {}).get('data') or {}
+        fid = d.get('id')
+        if not fid:
+            return None
+        params = {'id': fid, 'a': d.get('user_a_id'), 'b': d.get('user_b_id'),
+                  's': d.get('status'), 'i': d.get('initiator_id'),
+                  'c': d.get('created_at'), 'ac': d.get('accepted_at')}
+        exists = db.execute(text("SELECT id FROM friendships WHERE id = :id"),
+                            {'id': fid}).fetchone()
+        if exists:
+            db.execute(text(
+                "UPDATE friendships SET status=:s, accepted_at=:ac WHERE id=:id"),
+                params)
+        else:
+            db.execute(text(
+                "INSERT INTO friendships (id, user_a_id, user_b_id, status, "
+                "initiator_id, created_at, accepted_at) VALUES "
+                "(:id, :a, :b, :s, :i, :c, :ac)"), params)
+        return fid
+
+    @staticmethod
     def _handle_sync_user(db, payload: dict):
         """Create or update a User record from sync data."""
         from .models import User
@@ -769,6 +796,20 @@ def _resonance_serialize(db, obj):
     return federation._entity_message(db, 'resonance', data)
 
 
+def _friend_gate(db, obj, demander):
+    # friendships are PII (the social graph) — central backup only with the
+    # initiator's cloud_egress consent (fail-closed)
+    from .consent_service import ConsentService
+    return ConsentService.check_consent(
+        db, (obj or {}).get('initiator_id'), 'cloud_egress', scope='social_sync')
+
+
+def _friend_serialize(db, obj):
+    # obj is already the friendship dict (raw-SQL row has no to_dict)
+    from .federation import federation
+    return federation._entity_message(db, 'friendship', obj)
+
+
 SYNC_ENTITIES: Dict[str, SyncEntity] = {
     'sync_post': SyncEntity(
         op='sync_post', apply=SyncEngine._handle_sync_post,
@@ -794,6 +835,10 @@ SYNC_ENTITIES: Dict[str, SyncEntity] = {
         op='sync_resonance', apply=SyncEngine._handle_sync_resonance,
         match=lambda o: getattr(o, '__tablename__', None) == 'resonance_wallets',
         gate=_resonance_gate, serialize=_resonance_serialize),
+    'sync_friendship': SyncEntity(
+        op='sync_friendship', apply=SyncEngine._handle_sync_friendship,
+        match=lambda o: isinstance(o, dict) and 'user_a_id' in o and 'status' in o,
+        gate=_friend_gate, serialize=_friend_serialize),
     'sync_user': SyncEntity(
         op='sync_user', apply=SyncEngine._handle_sync_user),
 }
