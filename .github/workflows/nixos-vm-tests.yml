@@ -96,4 +96,5 @@ jobs:
             ".#checks.x86_64-linux.hart-boot-log" \
             ".#checks.x86_64-linux.hart-hartlog-create" \
             ".#checks.x86_64-linux.hart-boot-continuity" \
-            && echo "VM gate PASSED: floor-lock + session-supervisor (tier-drop + paint-watchdog + paint-watchdog-keep + start-tier + reboot-latch + recovery-tty + unhealthy-flag single-crash drop) + GDM desktop-boot + GTK4 layer-shell structural + GTK4 layer-shell PAINT (cage paints, recovers, GTK4 host paints on llvmpipe + drops to cage) + boot infra (HARTLOG journal-capture + Live-OS HARTLOG self-create + efibootmgr boot-continuity)."
+            ".#checks.x86_64-linux.hart-boot-continuity-poweroff-gate" \
+            && echo "VM gate PASSED: floor-lock + session-supervisor (tier-drop + paint-watchdog + paint-watchdog-keep + start-tier + reboot-latch + recovery-tty + unhealthy-flag single-crash drop) + GDM desktop-boot + GTK4 layer-shell structural + GTK4 layer-shell PAINT (cage paints, recovers, GTK4 host paints on llvmpipe + drops to cage) + boot infra (HARTLOG journal-capture + Live-OS HARTLOG self-create + efibootmgr boot-continuity + poweroff-never-arms-BootNext)."

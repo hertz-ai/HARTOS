@@ -37,9 +37,13 @@
 #   - NO-OP if the USB's own boot entry cannot be matched.
 #   - NEVER modifies BootOrder — only `--bootnext` (one-shot, firmware-cleared).
 #   - It runs as an ExecStop ordered to fire only on the way DOWN, and ONLY when
-#     the shutdown is a REBOOT (not a poweroff) — a power-off should not arm a
-#     next boot. Bounded timeout; any error is logged + swallowed (exit 0) so it
-#     can never block or fail the shutdown transaction.
+#     the shutdown is genuinely a REBOOT — detected from the ACTUAL scheduled
+#     action (/run/systemd/shutdown/scheduled MODE=, then `systemctl list-jobs`
+#     for reboot.target vs poweroff.target/halt.target), NOT from the hardcoded
+#     ExecStop ACTION arg (which would arm BootNext on EVERY shutdown including a
+#     poweroff — the #187/F4 bug). A poweroff/halt arms NOTHING. Bounded timeout;
+#     any error is logged + swallowed (exit 0) so it can never block or fail the
+#     shutdown transaction.
 #   - `set -u` only (NOT -e): a probe failing must not abort; we gate explicitly.
 #
 # VM/HW-gated: "sets BootNext to the USB's own entry on a real reboot" needs real
@@ -53,9 +57,11 @@ let
   cfg = config.hart;
   bc = config.hart.bootContinuity;
 
-  # Minimal-PATH discipline. efibootmgr + the block tools we resolve the USB with.
+  # Minimal-PATH discipline. efibootmgr + the block tools we resolve the USB with
+  # + systemd (systemctl) so the reboot-vs-poweroff detection can read the actual
+  # scheduled job rather than trusting the ExecStop ACTION arg alone.
   binPath = lib.makeBinPath (with pkgs; [
-    coreutils util-linux efibootmgr gawk gnugrep gnused
+    coreutils util-linux efibootmgr systemd gawk gnugrep gnused
   ]);
 
   bootNextScript = pkgs.writeShellScript "hart-boot-continuity-set" ''
@@ -76,18 +82,60 @@ let
       exit 0
     fi
 
-    # ── 2. Only arm a next boot on a REBOOT, never on a poweroff. ──
-    # systemd records the pending shutdown action. On a poweroff there is no next
-    # boot to steer; only a reboot should return to HART OS. We read the scheduled
-    # action from systemd if available; if we can't tell, we still proceed only
-    # for the reboot ExecStop wiring (this script is invoked from the reboot path).
-    # The unit is ordered so its ExecStop fires before systemd-reboot; the
-    # ACTION arg lets a future poweroff-path reuse skip cleanly.
+    # ── 2. Only arm a next boot on a REBOOT, never on a poweroff/halt. ──
+    # CRITICAL (#187/F4): a poweroff MUST NEVER arm BootNext — there is no next
+    # boot to steer, and arming one would silently change what the machine does on
+    # its NEXT power-on. The ExecStop ACTION arg is hardcoded "reboot" in the unit,
+    # so trusting it ALONE armed BootNext on EVERY shutdown including poweroff (the
+    # bug). Instead we detect the ACTUAL scheduled shutdown action and gate on it;
+    # the ACTION arg is only a fallback hint when systemd can't tell us.
+    #
+    # Detection, most-authoritative first:
+    #   (a) The shutdown SCHEDULED file systemd writes for `shutdown`/`systemctl`
+    #       requests: /run/systemd/shutdown/scheduled has a `MODE=` line
+    #       (reboot|poweroff|halt). Present for scheduled + most interactive
+    #       shutdowns.
+    #   (b) The live JOB LIST: as the system goes down, systemd enqueues a start
+    #       job for the final target. `systemctl list-jobs` shows reboot.target on
+    #       a reboot, poweroff.target on a poweroff, halt.target on a halt. This is
+    #       the authoritative in-flight signal at ExecStop time.
+    #   (c) Fallback: the ExecStop ACTION arg (default "reboot").
+    #
+    # We compute a single REBOOTING verdict: arm BootNext ONLY if the detected
+    # action is unambiguously a reboot. Any poweroff/halt signal — OR an inability
+    # to positively confirm a reboot when a poweroff/halt signal is present — means
+    # NO-OP. (We default to reboot only when NO contrary signal exists, preserving
+    # the return-to-HART behaviour on a plain `reboot`.)
     ACTION="''${1:-reboot}"
-    if [ "$ACTION" = "poweroff" ] || [ "$ACTION" = "halt" ]; then
-      log "shutdown action is '$ACTION' (not a reboot) — not arming BootNext (no-op)"
+    DETECTED=""
+
+    # (a) scheduled-shutdown file
+    if [ -r /run/systemd/shutdown/scheduled ]; then
+      _mode=$(gawk -F= '/^MODE=/{print $2}' /run/systemd/shutdown/scheduled 2>/dev/null | head -n1) || _mode=""
+      case "$_mode" in
+        reboot)          DETECTED="reboot" ;;
+        poweroff|halt)   DETECTED="$_mode" ;;
+      esac
+    fi
+
+    # (b) live job list — only consult if the file didn't give a verdict
+    if [ -z "$DETECTED" ] && command -v systemctl >/dev/null 2>&1; then
+      _jobs=$(systemctl list-jobs --no-legend 2>/dev/null) || _jobs=""
+      case "$_jobs" in
+        *poweroff.target*) DETECTED="poweroff" ;;
+        *halt.target*)     DETECTED="halt" ;;
+        *reboot.target*)   DETECTED="reboot" ;;
+      esac
+    fi
+
+    # (c) fall back to the ExecStop ACTION hint
+    [ -z "$DETECTED" ] && DETECTED="$ACTION"
+
+    if [ "$DETECTED" != "reboot" ]; then
+      log "scheduled shutdown action is '$DETECTED' (ACTION arg='$ACTION') — NOT a reboot, so NOT arming BootNext (no-op). A poweroff must never steer the next boot."
       exit 0
     fi
+    log "scheduled shutdown action is a reboot (detected='$DETECTED', ACTION arg='$ACTION') — proceeding to arm a one-shot BootNext"
 
     # ── 3. Resolve the disk the LIVE ROOT was booted from (the USB). ──
     # Same robust walk as hart-hartlog-create: live mountpoints -> backing block
@@ -197,20 +245,23 @@ in
   config = lib.mkIf (cfg.enable && bc.enable) {
 
     # A shutdown-time hook: RemainAfterExit + ExecStop is the systemd idiom for
-    # "do work on the way down". We order its ExecStop to run BEFORE
-    # systemd-reboot.service (the reboot path) but it is NOT pulled in by the
-    # poweroff path's ordering, and the script itself skips non-reboot actions —
-    # so a power-off never arms a next boot. It must never block shutdown.
+    # "do work on the way down". The ExecStop fires on EVERY shutdown (the
+    # shutdown.target conflict tears this unit down on reboot AND poweroff alike),
+    # so the reboot-vs-poweroff decision CANNOT live in the unit ordering — it
+    # lives in the SCRIPT, which detects the ACTUAL scheduled action
+    # (/run/systemd/shutdown/scheduled, then `systemctl list-jobs`) and arms
+    # BootNext ONLY for a real reboot. A poweroff/halt no-ops. It must never block
+    # shutdown.
     systemd.services.hart-boot-continuity = {
       description = "HART OS — on a Live-OS reboot, set a one-shot BootNext to the USB's own EFI entry (returns to HART OS; never changes BootOrder)";
       wantedBy = [ "multi-user.target" ];
       # Order so the ExecStop fires as the system goes down, before the EFI
-      # variable store + reboot are torn down/executed.
+      # variable store + reboot/poweroff are torn down/executed.
       before = [ "shutdown.target" "systemd-reboot.service" ];
       after = [ "local-fs.target" ];
       conflicts = [ "shutdown.target" ];
       # Don't let a nixos-rebuild switch stop+restart this (which would fire the
-      # ExecStop BootNext mid-session); it is a reboot-only hook.
+      # ExecStop mid-session); it is a shutdown-only hook.
       restartIfChanged = false;
       stopIfChanged = false;
       unitConfig = {
@@ -221,9 +272,12 @@ in
         RemainAfterExit = true;
         # ExecStart is a no-op marker; the real work is ExecStop on the way down.
         ExecStart = "${pkgs.coreutils}/bin/true";
-        # Pass "reboot" so the script's action gate is explicit. (A power-off does
-        # not order this unit's ExecStop ahead of systemd-poweroff in a way that
-        # would arm a boot; the script's ACTION gate is the belt-and-suspenders.)
+        # The "reboot" arg is only a FALLBACK hint for when systemd can't report
+        # the scheduled action; the script's PRIMARY gate is the actual detected
+        # action (scheduled-shutdown file + `systemctl list-jobs`), so a poweroff
+        # is correctly detected and NO-OPs even though this same ExecStop also runs
+        # on the poweroff path. (#187/F4: trusting this arg alone armed BootNext on
+        # every shutdown including poweroff.)
         ExecStop = "${bootNextScript} reboot";
         TimeoutStopSec = "30s";
       };

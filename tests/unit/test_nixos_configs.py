@@ -1695,6 +1695,19 @@ class TestBootContinuityModule:
         assert "efibootmgr -o" not in self.content
         assert "efibootmgr --bootorder" not in self.content
 
+    def test_poweroff_detected_from_real_action_not_just_arg(self):
+        """#187/F4: a poweroff must NEVER arm BootNext. The bug was trusting the
+        hardcoded ExecStop ACTION arg (always "reboot") — so it armed on EVERY
+        shutdown including poweroff. The fix detects the ACTUAL scheduled action.
+        Guard that the real-action signals are consulted (the behavioural UEFI
+        nixosTest proves a poweroff arms nothing; this is the cheap source guard)."""
+        # The scheduled-shutdown record + the live job list are the real signals.
+        assert "/run/systemd/shutdown/scheduled" in self.content
+        assert "list-jobs" in self.content
+        # It branches on poweroff/halt (not just the reboot arg).
+        assert "poweroff" in self.content
+        assert "halt" in self.content
+
     def test_in_flake_modules(self):
         """Gate-5 wiring guard: imported in flake.nix or the nixosTest can't run."""
         flake = read_nix(os.path.join(NIXOS_DIR, "flake.nix"))
@@ -1836,6 +1849,23 @@ class TestBootNixosTestsRegistered:
         content = read_nix(os.path.join(TESTS_DIR, "boot-continuity.nix"))
         assert "BootOrder" in content
         assert "--bootnext" in content
+
+    def test_boot_continuity_test_has_uefi_poweroff_gate_node(self):
+        """#187/F4: a dedicated UEFI (OVMF) nixosTest node must prove the poweroff
+        gate behaviourally — the non-UEFI node can't reach it (it no-ops at the
+        UEFI gate first). The node boots useEFIBoot, injects a scheduled poweroff,
+        and asserts ZERO efibootmgr calls (arms nothing) while a scheduled reboot
+        DOES reach the arm/resolve stage (the gate discriminates)."""
+        content = read_nix(os.path.join(TESTS_DIR, "boot-continuity.nix"))
+        assert "hart-boot-continuity-poweroff-gate" in content
+        assert "useEFIBoot" in content
+        # It drives the poweroff via the scheduled-shutdown record + a recorder.
+        assert "MODE=poweroff" in content
+        # The node must be built in the CI VM workflow (a test that never runs
+        # guards nothing — Gate 5).
+        wf = read_nix(os.path.join(REPO_ROOT, ".github", "workflows", "nixos-vm-tests.yml"))
+        assert "hart-boot-continuity-poweroff-gate" in wf, \
+            "VM workflow does not build hart-boot-continuity-poweroff-gate — it would never gate"
 
 
 # ═══════════════════════════════════════════════════════════════
