@@ -324,6 +324,8 @@ class FederationManager:
 
         logger.info(f"Federation: received post '{federated.title[:50]}' "
                      f"from {origin_node[:8]}")
+        # P5: periodically enforce the 10 TB central origin-store ceiling (LRU).
+        self._maybe_enforce_ceiling(db)
         return federated.id
 
     # ─── Federated Feed ───
@@ -393,6 +395,59 @@ class FederationManager:
                 "from parent origin %s (#149)", peer_url, central)
             return self.pull_from_peer(db, central, limit=limit)
         return count
+
+    # 10 TB ceiling for the whole central durable-origin store (#177 P5).
+    ASSET_CEILING_BYTES = 10 * 1024 ** 4
+
+    def enforce_asset_ceiling(self, db, max_bytes: int = None,
+                              batch: int = 200) -> dict:
+        """Cap the central durable-origin store (federated_posts — the copy
+        pull_with_central_fallback serves) at a TOTAL-bytes ceiling (default
+        10 TB across ALL users) via LRU eviction.  Over-cap evicts the COLDEST
+        rows first (non-boosted, oldest received_at); the origin node still holds
+        the post, so retrieval falls back to the source peer (or 410 if that peer
+        is also gone — never a silent data claim).  Boosted posts are retained.
+        Idempotent, best-effort; returns {total_bytes, evicted, under_ceiling}."""
+        from sqlalchemy import func as _f
+        from .models import FederatedPost
+        cap = self.ASSET_CEILING_BYTES if max_bytes is None else max_bytes
+
+        def _total():
+            return int(db.query(
+                _f.coalesce(_f.sum(_f.length(FederatedPost.content)), 0)
+            ).scalar() or 0)
+
+        total, evicted = _total(), 0
+        while total > cap:
+            victims = [r[0] for r in db.query(FederatedPost.id).filter(
+                FederatedPost.is_boosted.is_(False)
+            ).order_by(FederatedPost.received_at.asc()).limit(batch).all()]
+            if not victims:
+                break  # only boosted rows remain — cannot evict further
+            db.query(FederatedPost).filter(
+                FederatedPost.id.in_(victims)).delete(synchronize_session=False)
+            db.flush()
+            evicted += len(victims)
+            total = _total()
+            logger.info("Federation: asset ceiling — evicted %d cold federated "
+                        "posts (LRU); total now ~%d bytes", len(victims), total)
+        return {'total_bytes': total, 'evicted': evicted,
+                'under_ceiling': total <= cap}
+
+    _CEILING_CHECK_EVERY = 500
+    _inbox_since_check = 0
+
+    def _maybe_enforce_ceiling(self, db):
+        """Amortise the O(rows) ceiling SUM over many inbox receives — enforce
+        the 10 TB cap once per _CEILING_CHECK_EVERY inserts.  Best-effort; never
+        blocks a receive."""
+        try:
+            FederationManager._inbox_since_check += 1
+            if FederationManager._inbox_since_check >= self._CEILING_CHECK_EVERY:
+                FederationManager._inbox_since_check = 0
+                self.enforce_asset_ceiling(db)
+        except Exception as e:
+            logger.debug("Federation._maybe_enforce_ceiling: %s", e)
 
     # ─── Helpers ───
 
