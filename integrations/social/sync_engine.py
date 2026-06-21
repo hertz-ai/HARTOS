@@ -395,6 +395,15 @@ class SyncEngine:
              'member_count', 'post_count'])
 
     @staticmethod
+    def _handle_sync_membership(db, payload: dict):
+        """Land a synced community membership (P3 join/leave) — generic upsert
+        by id, reusing _apply_synced_row.  Public-community membership only
+        (the producer gate enforces it)."""
+        return SyncEngine._apply_synced_row(
+            db, _membership_model(), (payload or {}).get('data') or {},
+            ['user_id', 'community_id', 'role'])
+
+    @staticmethod
     def _handle_sync_user(db, payload: dict):
         """Create or update a User record from sync data."""
         from .models import User
@@ -671,6 +680,24 @@ def _community_serialize(db, obj):
     return federation._entity_message(db, 'community', obj)
 
 
+def _membership_model():
+    from .models import CommunityMembership
+    return CommunityMembership
+
+
+def _membership_gate(db, obj, demander):
+    # sync membership of PUBLIC communities only (private membership is private)
+    from .models import Community
+    c = db.query(Community).filter_by(
+        id=getattr(obj, 'community_id', None)).first()
+    return bool(c) and not c.is_private
+
+
+def _membership_serialize(db, obj):
+    from .federation import federation
+    return federation._entity_message(db, 'community_membership', obj)
+
+
 SYNC_ENTITIES: Dict[str, SyncEntity] = {
     'sync_post': SyncEntity(
         op='sync_post', apply=SyncEngine._handle_sync_post,
@@ -684,6 +711,10 @@ SYNC_ENTITIES: Dict[str, SyncEntity] = {
         op='sync_community', apply=SyncEngine._handle_sync_community,
         match=lambda o: getattr(o, '__tablename__', None) == 'communities',
         gate=_community_gate, serialize=_community_serialize),
+    'sync_membership': SyncEntity(
+        op='sync_membership', apply=SyncEngine._handle_sync_membership,
+        match=lambda o: getattr(o, '__tablename__', None) == 'community_memberships',
+        gate=_membership_gate, serialize=_membership_serialize),
     'sync_user': SyncEntity(
         op='sync_user', apply=SyncEngine._handle_sync_user),
 }

@@ -1054,6 +1054,13 @@ class CommunityService:
             logger.debug(
                 "CommunityService.join polymorphic dual-write skipped: %s", e)
         db.flush()
+        # Up-sync membership of PUBLIC communities (P3) through the ONE unified
+        # producer; private-community membership no-ops (gate). Best-effort.
+        try:
+            from .sync_engine import SyncEngine
+            SyncEngine.queue_entity(db, membership)
+        except Exception:
+            pass
         # #55: fan out the membership change so other members see it live
         # instead of only on the next /communities/{id} fetch.  Best-effort.
         _publish_realtime('on_community_membership', community.id, user.id, 'join')
