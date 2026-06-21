@@ -356,32 +356,34 @@ class SyncEngine:
                 logger.debug(f"Sync: agent skill upsert skipped for {agent_pk}: {e}")
 
     @staticmethod
-    def _apply_synced_row(db, model, data: dict, fields: list, ts_field: str = None):
-        """Generic idempotent upsert-by-id receiver for a simple synced entity —
-        the reusable twin of _handle_sync_user's create-or-update, parameterised
-        by model + the sync-owned fields (so P3 entities are registrations, not
-        bespoke receivers).  Dedup is inherent (upsert by primary key); optional
-        LWW: when ts_field is given and the incoming row is OLDER than the local
-        one, the stale write is skipped.  Best-effort; returns the row id or
-        None."""
-        row_id = (data or {}).get('id')
-        if not row_id:
+    def _apply_synced_row(db, model, data: dict, fields: list, ts_field: str = None,
+                          key_field: str = 'id'):
+        """Generic idempotent upsert receiver for a simple synced entity — the
+        reusable twin of _handle_sync_user's create-or-update, parameterised by
+        model + sync-owned fields + the natural key (default 'id'; the resonance
+        wallet keys by 'user_id').  Dedup is inherent (upsert by the key);
+        optional LWW: when ts_field is given and the incoming row is OLDER than
+        the local one, the stale write is skipped — so a node's newer state
+        always wins (no data/earnings loss; central stays a backup, never
+        authoritative).  Best-effort; returns the key or None."""
+        row_key = (data or {}).get(key_field)
+        if not row_key:
             return None
-        row = db.query(model).filter_by(id=row_id).first()
+        row = db.query(model).filter_by(**{key_field: row_key}).first()
         if row is not None and ts_field:
             inc = data.get(ts_field)
             cur = getattr(row, ts_field, None)
             cur = cur.isoformat() if hasattr(cur, 'isoformat') else cur
             if inc and cur and str(inc) < str(cur):
-                return row_id  # stale write loses (LWW) — keep the newer local row
+                return row_key  # stale write loses (LWW) — keep the newer local row
         if row is None:
-            row = model(id=row_id)
+            row = model(**{key_field: row_key})
             db.add(row)
         for f in fields:
             if f in data and data[f] is not None:
                 setattr(row, f, data[f])
         db.flush()
-        return row_id
+        return row_key
 
     @staticmethod
     def _handle_sync_community(db, payload: dict):
@@ -411,6 +413,18 @@ class SyncEngine:
             db, _encounter_model(), (payload or {}).get('data') or {},
             ['user_a_id', 'user_b_id', 'context_type', 'context_id',
              'encounter_count', 'bond_level', 'is_mutual_aware'])
+
+    @staticmethod
+    def _handle_sync_resonance(db, payload: dict):
+        """Land a synced resonance wallet (P3) — central is a BACKUP, never
+        authoritative; LWW by updated_at means the node's newer balance always
+        wins (no earnings loss).  Keyed by user_id (the wallet's natural key)."""
+        return SyncEngine._apply_synced_row(
+            db, _resonance_model(), (payload or {}).get('data') or {},
+            ['pulse', 'spark', 'spark_lifetime', 'signal', 'level', 'level_title',
+             'xp', 'xp_next_level', 'streak_days', 'streak_best',
+             'last_active_date', 'season_pulse', 'season_spark'],
+            ts_field='updated_at', key_field='user_id')
 
     @staticmethod
     def _handle_sync_user(db, payload: dict):
@@ -734,6 +748,27 @@ def _encounter_serialize(db, obj):
     return federation._entity_message(db, 'encounter', data)
 
 
+def _resonance_model():
+    from .models import ResonanceWallet
+    return ResonanceWallet
+
+
+def _resonance_gate(db, obj, demander):
+    # the spark wallet is financial PII — central backup is OFF unless the user
+    # opts in via cloud_egress consent (fail-closed)
+    from .consent_service import ConsentService
+    return ConsentService.check_consent(
+        db, getattr(obj, 'user_id', None), 'cloud_egress', scope='social_sync')
+
+
+def _resonance_serialize(db, obj):
+    from .federation import federation
+    data = obj.to_dict()            # keyed by user_id; balance fields
+    data['updated_at'] = (obj.updated_at.isoformat()
+                          if getattr(obj, 'updated_at', None) else None)
+    return federation._entity_message(db, 'resonance', data)
+
+
 SYNC_ENTITIES: Dict[str, SyncEntity] = {
     'sync_post': SyncEntity(
         op='sync_post', apply=SyncEngine._handle_sync_post,
@@ -755,6 +790,10 @@ SYNC_ENTITIES: Dict[str, SyncEntity] = {
         op='sync_encounter', apply=SyncEngine._handle_sync_encounter,
         match=lambda o: getattr(o, '__tablename__', None) == 'encounters',
         gate=_encounter_gate, serialize=_encounter_serialize),
+    'sync_resonance': SyncEntity(
+        op='sync_resonance', apply=SyncEngine._handle_sync_resonance,
+        match=lambda o: getattr(o, '__tablename__', None) == 'resonance_wallets',
+        gate=_resonance_gate, serialize=_resonance_serialize),
     'sync_user': SyncEntity(
         op='sync_user', apply=SyncEngine._handle_sync_user),
 }
