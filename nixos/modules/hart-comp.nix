@@ -187,16 +187,22 @@ let
     # build. With buildFeatures = [ "smithay" ] now ON, `cargo test --features smithay`
     # COMPILES the DRM modules (wayland.rs + udev.rs) AND runs the feature-independent
     # tests in main.rs (26) PLUS the smithay-gated `#[cfg(test)]` floors hoisted into the
-    # shared modules — comp_core.rs (the chord map + cursor bake + fade-clock math),
-    # ipc.rs (the framed-JSON transport: reassembly, the poison-frame guard, the
-    # request/response envelope, the arg extractors, the 1↔0 workspace conversion + the
-    # event fan-out), and udev.rs (the DRM-node override precedence + the color-format
-    # floor). So the build both type-checks the DRM path AND asserts the backend-agnostic
-    # invariants. (Verified in WSL: cargo test green at default; the smithay modules
-    # compile under --features smithay.) The winit-only screencopy region/format floor
-    # (clamp + transform + ready-timestamp) runs under the `--features winit` check; the
-    # live-Wayland SMOKE E2E (compositor/tests/smoke_e2e.rs — boot→map→arrange→capture)
-    # is `#[ignore]`d and run by the nested-Wayland CI job with `-- --ignored`.
+    # shared modules — comp_core.rs (the chord map + cursor bake + fade-clock math, the
+    # snap-zone `zone_rect` + tile `tile_rects` geometry, AND the screencopy region/time
+    # floor: `clamp_region` no-out-of-bounds clamp + `transform_region` upright map +
+    # `now_secs_nsecs` ready-timestamp split — these PURE helpers live in comp_core.rs,
+    # gated `any(winit, smithay)`, NOT in screencopy.rs's winit-only `#![cfg]`, so this
+    # smithay doCheck actually EXERCISES them), ipc.rs (the framed-JSON transport:
+    # reassembly, the poison-frame guard, the request/response envelope, the arg
+    # extractors, the 1↔0 workspace conversion + the event fan-out), and udev.rs (the
+    # DRM-node override precedence + the color-format floor). So the build both
+    # type-checks the DRM path AND asserts the backend-agnostic invariants. (Verified in
+    # WSL: cargo test green at default; the smithay modules compile under --features
+    # smithay.) The remaining winit-only screencopy floor is just the capture-FORMAT
+    # invariants (CAPTURE_FOURCC + shm_supported), which touch winit-only items so they
+    # run under the `--features winit` check; the live-Wayland SMOKE E2E
+    # (compositor/tests/smoke_e2e.rs — boot→map→arrange→capture) is `#[ignore]`d and run
+    # by the nested-Wayland CI job with `-- --ignored`.
     doCheck = true;
 
     meta = {

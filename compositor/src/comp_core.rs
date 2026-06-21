@@ -84,7 +84,8 @@ use smithay::input::{
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{
-    Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Scale, Serial, Size,
+    Buffer as BufferCoord, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Scale, Serial,
+    Size, Transform,
 };
 use smithay::wayland::compositor::{get_parent, with_states};
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
@@ -335,6 +336,71 @@ pub fn output_physical_size<S: CompState>(state: &S) -> Size<i32, Physical> {
         .current_mode()
         .map(|m| m.size)
         .unwrap_or_else(|| (1280, 800).into())
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PURE screencopy region/time math (M6, hoisted from screencopy.rs). These are the
+// framebuffer read-back's geometry helpers — region clamping (the no-out-of-bounds
+// gate), the output-transform region map (upright capture), and the wall-clock split
+// for the `ready` presentation timestamp. They touch NO renderer / wl_buffer / live
+// State — just i32 region arithmetic + the system clock — so they live HERE under the
+// shared `any(winit, smithay)` cfg (NOT in screencopy.rs's winit-only `#![cfg]`). That
+// is load-bearing: hart-comp.nix's `doCheck` runs `cargo test --features smithay`, which
+// does NOT compile screencopy.rs (`#![cfg(feature = "winit")]`); hoisting these here is
+// what lets the smithay build's check exercise their unit floor (the tests are alongside
+// in this module's #[cfg(test)] block). screencopy.rs CALLS these (one source of truth,
+// no parallel path).
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Clamp a client-requested `CaptureOutputRegion` rect to the output bounds, so a
+/// client can never read outside the framebuffer. PURE region math (no renderer / no
+/// Smithay state): the requested `(x, y, width, height)` is clamped against the output's
+/// `(out_w, out_h)` — extracted so the clamp is one source of truth AND unit-testable
+/// without a live output.
+///
+/// Invariants the clamp guarantees: origin in `[0, out]`, width/height ≥ 1, and the rect
+/// never extends past the right/bottom edge (`rx + rw ≤ out_w`, `ry + rh ≤ out_h`). The
+/// width/height floor is a hard `.max(1)` AFTER the right-edge clamp, so even a 0-sized
+/// output (`out_w == 0`) yields a degenerate-but-valid 1px rect rather than an empty
+/// read-back the ExportMem contract rejects.
+pub fn clamp_region(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    out_w: i32,
+    out_h: i32,
+) -> Rectangle<i32, BufferCoord> {
+    let rx = x.max(0).min(out_w);
+    let ry = y.max(0).min(out_h);
+    // Trim to the remaining span, then floor to 1px: `(out_w - rx)` can be 0 (origin at
+    // the far edge, or a 0-wide output), and the read-back invariant is width/height ≥ 1.
+    let rw = width.max(1).min(out_w - rx).max(1);
+    let rh = height.max(1).min(out_h - ry).max(1);
+    Rectangle::new((rx, ry).into(), (rw, rh).into())
+}
+
+/// Map a logical capture region to the physical framebuffer rectangle under the
+/// output's render transform, so a read-back of the raw framebuffer yields an upright
+/// image. Smithay's `Transform::transform_rect_in(rect, area_size)` is the canonical
+/// helper (the same one the renderer uses to place elements).
+pub fn transform_region(
+    region: Rectangle<i32, BufferCoord>,
+    output_size: Size<i32, Physical>,
+    transform: Transform,
+) -> Rectangle<i32, BufferCoord> {
+    let area: Size<i32, BufferCoord> = (output_size.w, output_size.h).into();
+    transform.transform_rect_in(region, &area)
+}
+
+/// Wall-clock split into (whole seconds u64, sub-second nanoseconds u32) for the
+/// `ready` presentation timestamp. CLOCK_REALTIME is fine here — grim only logs it.
+pub fn now_secs_nsecs() -> (u64, u32) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => (d.as_secs(), d.subsec_nanos()),
+        Err(_) => (0, 0),
+    }
 }
 
 /// The screen kill-switch toggle (the `CompState::set_capture_blocked` default body).
@@ -1047,10 +1113,15 @@ pub fn ipc_window_geometry<S: CompState>(state: &S, handle: &str) -> Option<(i32
     Some((g.loc.x, g.loc.y, g.size.w, g.size.h))
 }
 
-/// Compute a named-zone rect over the output (§4.4 zones). Logical pixels.
-pub fn ipc_zone_rect<S: CompState>(state: &S, zone: &str) -> Option<(i32, i32, i32, i32)> {
-    let geo = state.space().output_geometry(state.output())?;
-    let (ox, oy, ow, oh) = (geo.loc.x, geo.loc.y, geo.size.w, geo.size.h);
+/// PURE named-zone geometry over an output rect `(ox, oy, ow, oh)`. No live State — just
+/// the §4.4 zone arithmetic — so the zone set is one source of truth AND unit-testable
+/// without a mapped output. `ipc_zone_rect` is the thin State wrapper that reads the
+/// output geometry then defers here. Returns `None` for an unknown zone name.
+///
+/// Right/bottom-edge coverage: the "right"/"bottom" halves use `ow - half_w` / `oh -
+/// half_h` (NOT a second `half`), so on an ODD output dimension the two halves still
+/// TILE the full extent with no 1px seam (e.g. ow=1921 → left 960 + right 961 == 1921).
+pub fn zone_rect(ox: i32, oy: i32, ow: i32, oh: i32, zone: &str) -> Option<(i32, i32, i32, i32)> {
     let half_w = ow / 2;
     let half_h = oh / 2;
     let r = match zone {
@@ -1069,26 +1140,31 @@ pub fn ipc_zone_rect<S: CompState>(state: &S, zone: &str) -> Option<(i32, i32, i
     Some(r)
 }
 
-/// `window.tile` (§4.5): arrange EVERY mapped toplevel over the output. Supported
-/// layouts: grid (default), cols/columns, rows, master-stack, fullscreen. Returns the
-/// arranged handles in the order applied.
-pub fn ipc_tile<S: CompState>(state: &mut S, layout: &str) -> Vec<String> {
-    let handles: Vec<String> = state
-        .space()
-        .elements()
-        .filter_map(|w| w.user_data().get::<WindowHandle>().map(|h| h.as_str().to_string()))
-        .collect();
-    let n = handles.len();
+/// Compute a named-zone rect over the output (§4.4 zones). Logical pixels. Thin wrapper:
+/// reads the live output geometry then defers to the pure `zone_rect`.
+pub fn ipc_zone_rect<S: CompState>(state: &S, zone: &str) -> Option<(i32, i32, i32, i32)> {
+    let geo = state.space().output_geometry(state.output())?;
+    zone_rect(geo.loc.x, geo.loc.y, geo.size.w, geo.size.h, zone)
+}
+
+/// PURE tile geometry: lay `n` windows over an output rect `(ox, oy, ow, oh)` per the
+/// named `layout` (grid (default), cols/columns, rows, master-stack, fullscreen). No live
+/// State — just the §4.5 arithmetic — so each layout is unit-testable without mapped
+/// windows. Returns one `(x, y, w, h)` per window, in tile order. `n == 0` → empty.
+///
+/// KNOWN NON-COVERAGE on indivisible extents (intentional, documented): the cols/rows/
+/// grid cell size is an INTEGER `ow / cols` (truncating), so when the extent is not a
+/// multiple of the divisor the LAST column/row leaves a remainder strip uncovered on the
+/// right/bottom edge — e.g. ow=1920, n=7 grid: cols=3, cw=640, 3*640=1920 (exact here),
+/// but cols=3 with ow=1921 → cw=640, last col ends at 1920, a 1px strip uncovered. This
+/// is the simple-tiler contract (no fractional pixels, no last-cell stretch); the gap is
+/// at most `(divisor-1)`px and the test below pins it so a future "fix" is a conscious
+/// choice, not an accident.
+pub fn tile_rects(ox: i32, oy: i32, ow: i32, oh: i32, n: usize, layout: &str) -> Vec<(i32, i32, i32, i32)> {
     if n == 0 {
         return Vec::new();
     }
-    let geo = match state.space().output_geometry(state.output()) {
-        Some(g) => g,
-        None => return Vec::new(),
-    };
-    let (ox, oy, ow, oh) = (geo.loc.x, geo.loc.y, geo.size.w, geo.size.h);
-
-    let rects: Vec<(i32, i32, i32, i32)> = match layout {
+    match layout {
         "fullscreen" => (0..n).map(|_| (ox, oy, ow, oh)).collect(),
         "cols" | "columns" => {
             let cw = ow / n as i32;
@@ -1125,7 +1201,28 @@ pub fn ipc_tile<S: CompState>(state: &mut S, layout: &str) -> Vec<String> {
                 })
                 .collect()
         }
+    }
+}
+
+/// `window.tile` (§4.5): arrange EVERY mapped toplevel over the output. Supported
+/// layouts: grid (default), cols/columns, rows, master-stack, fullscreen. Returns the
+/// arranged handles in the order applied. Thin wrapper: reads the live handle list +
+/// output geometry, then defers the rect math to the pure `tile_rects`.
+pub fn ipc_tile<S: CompState>(state: &mut S, layout: &str) -> Vec<String> {
+    let handles: Vec<String> = state
+        .space()
+        .elements()
+        .filter_map(|w| w.user_data().get::<WindowHandle>().map(|h| h.as_str().to_string()))
+        .collect();
+    let n = handles.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let geo = match state.space().output_geometry(state.output()) {
+        Some(g) => g,
+        None => return Vec::new(),
     };
+    let rects = tile_rects(geo.loc.x, geo.loc.y, geo.size.w, geo.size.h, n, layout);
 
     for (handle, (x, y, w, h)) in handles.iter().zip(rects.iter()) {
         ipc_place_window(state, handle, *x, *y, *w, *h);
@@ -1505,6 +1602,284 @@ mod tests {
     }
     fn digit_chord(m: ModifiersState, modified: Keysym, level0: Keysym) -> Option<WmAction> {
         process_keyboard_shortcut(m, modified, Some(level0))
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // clamp_region — the screencopy no-out-of-bounds gate (hoisted here from
+    // screencopy.rs so the smithay-feature doCheck exercises it; screencopy.rs is
+    // winit-only and never compiles under `--features smithay`).
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn clamp_region_passes_through_an_in_bounds_rect() {
+        let r = clamp_region(100, 50, 320, 240, 1920, 1080);
+        assert_eq!((r.loc.x, r.loc.y), (100, 50));
+        assert_eq!((r.size.w, r.size.h), (320, 240));
+    }
+
+    #[test]
+    fn clamp_region_full_output_is_the_whole_framebuffer() {
+        let r = clamp_region(0, 0, 1920, 1080, 1920, 1080);
+        assert_eq!((r.loc.x, r.loc.y), (0, 0));
+        assert_eq!((r.size.w, r.size.h), (1920, 1080));
+    }
+
+    #[test]
+    fn clamp_region_negative_origin_is_pinned_to_zero() {
+        let r = clamp_region(-50, -30, 200, 200, 1920, 1080);
+        assert_eq!((r.loc.x, r.loc.y), (0, 0), "negative origin clamps to (0,0)");
+        assert_eq!((r.size.w, r.size.h), (200, 200));
+    }
+
+    #[test]
+    fn clamp_region_oversized_width_is_trimmed_to_the_right_edge() {
+        // Origin at x=1800 on a 1920-wide output: only 120px remain, so an asked-for
+        // 500px width is trimmed so rx+rw never exceeds out_w.
+        let r = clamp_region(1800, 0, 500, 100, 1920, 1080);
+        assert_eq!(r.loc.x, 1800);
+        assert_eq!(r.size.w, 120, "width trimmed so rx+rw == out_w (1920)");
+        assert_eq!(r.loc.x + r.size.w, 1920);
+    }
+
+    #[test]
+    fn clamp_region_oversized_height_is_trimmed_to_the_bottom_edge() {
+        let r = clamp_region(0, 1000, 100, 500, 1920, 1080);
+        assert_eq!(r.loc.y, 1000);
+        assert_eq!(r.size.h, 80, "height trimmed so ry+rh == out_h (1080)");
+        assert_eq!(r.loc.y + r.size.h, 1080);
+    }
+
+    #[test]
+    fn clamp_region_zero_or_negative_size_floors_to_one_px() {
+        // width/height ≥ 1 always (a 0-px or negative request would make an empty
+        // framebuffer read-back the ExportMem contract rejects).
+        let r = clamp_region(10, 10, 0, -5, 1920, 1080);
+        assert_eq!(r.size.w, 1, "width floors to 1");
+        assert_eq!(r.size.h, 1, "height floors to 1");
+    }
+
+    #[test]
+    fn clamp_region_origin_past_the_far_edge_still_yields_a_valid_one_px_rect() {
+        // x beyond out_w: rx pins to out_w, then rw = (out_w - rx).max(1) = 1 — the
+        // rect is degenerate-but-valid (1px), never out-of-bounds or empty.
+        let r = clamp_region(5000, 5000, 100, 100, 1920, 1080);
+        assert_eq!(r.loc.x, 1920);
+        assert_eq!(r.loc.y, 1080);
+        assert_eq!(r.size.w, 1);
+        assert_eq!(r.size.h, 1);
+    }
+
+    #[test]
+    fn clamp_region_zero_output_still_yields_a_valid_one_px_rect() {
+        // Defensive (output is never 0x0 in practice): a 0-wide/0-tall output would make
+        // `out_w - rx == 0`, which a bare `.min()` would let through as a 0-sized rect —
+        // violating the width/height ≥ 1 doc invariant the read-back relies on. The
+        // explicit `.max(1)` after the right-edge clamp floors BOTH axes to 1px.
+        let r = clamp_region(0, 0, 100, 100, 0, 0);
+        assert_eq!((r.loc.x, r.loc.y), (0, 0));
+        assert_eq!(r.size.w, 1, "width floors to 1 even on a 0-wide output");
+        assert_eq!(r.size.h, 1, "height floors to 1 even on a 0-tall output");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // transform_region — upright-capture region map under the output transform.
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn transform_region_normal_is_identity() {
+        let region = Rectangle::new((100, 50).into(), (320, 240).into());
+        let out = (1920, 1080).into();
+        let mapped = transform_region(region, out, Transform::Normal);
+        assert_eq!(mapped, region, "Normal transform leaves the region unchanged");
+    }
+
+    #[test]
+    fn transform_region_full_output_under_flipped180_is_the_same_rect() {
+        // Flipped180 is a Y-axis flip; the FULL-output rect maps back onto itself (the M6
+        // winit render transform is Flipped180; a full-screen grab is unaffected).
+        let region = Rectangle::new((0, 0).into(), (1920, 1080).into());
+        let out = (1920, 1080).into();
+        let mapped = transform_region(region, out, Transform::Flipped180);
+        assert_eq!((mapped.size.w, mapped.size.h), (1920, 1080));
+        assert_eq!((mapped.loc.x, mapped.loc.y), (0, 0));
+    }
+
+    #[test]
+    fn transform_region_subregion_under_flipped180_flips_only_the_y_axis() {
+        // Flipped180 is a Y-axis flip (NOT a full point reflection): the x origin is
+        // preserved, the y origin maps to `area.h - y - height`, and the size is
+        // unchanged. A top-left 100x100 rect at (0,0) maps to the BOTTOM-LEFT corner
+        // (x stays 0, y becomes 1080-0-100). (Matches Smithay's own
+        // `transform_rect_f180` semantics for `Transform::Flipped180`.)
+        let region = Rectangle::new((0, 0).into(), (100, 100).into());
+        let out = (1920, 1080).into();
+        let mapped = transform_region(region, out, Transform::Flipped180);
+        assert_eq!((mapped.size.w, mapped.size.h), (100, 100), "size preserved");
+        assert_eq!(mapped.loc.x, 0, "x origin is NOT flipped by Flipped180");
+        assert_eq!(mapped.loc.y, 1080 - 100, "y origin flips to area.h - y - height");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // now_secs_nsecs — the `ready` presentation timestamp split.
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn now_secs_nsecs_is_a_plausible_wall_clock() {
+        let (sec, nsec) = now_secs_nsecs();
+        // Well after 2021 (1.6e9) and the nanosecond part is a valid sub-second value.
+        assert!(sec > 1_600_000_000, "seconds is a real UNIX wall clock: {sec}");
+        assert!(nsec < 1_000_000_000, "nsec is a sub-second remainder: {nsec}");
+    }
+
+    #[test]
+    fn ready_timestamp_hi_lo_split_round_trips() {
+        // The wire splits the u64 seconds into (hi, lo) u32 halves for `ready`. Prove
+        // the split the render path uses reconstructs the original on a value whose hi
+        // half is non-zero (so a truncating split would be caught).
+        let sec: u64 = 0x0000_0001_2345_6789;
+        let hi = (sec >> 32) as u32;
+        let lo = (sec & 0xFFFF_FFFF) as u32;
+        assert_eq!(hi, 1);
+        assert_eq!(lo, 0x2345_6789);
+        assert_eq!(((hi as u64) << 32) | lo as u64, sec);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // zone_rect — the §4.4 snap-zone geometry (pure, extracted from ipc_zone_rect).
+    // Every zone is asserted against a 1920x1080 output at origin (0,0).
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn zone_rect_covers_every_named_zone() {
+        let (ow, oh) = (1920, 1080);
+        assert_eq!(zone_rect(0, 0, ow, oh, "left-half"), Some((0, 0, 960, 1080)));
+        assert_eq!(zone_rect(0, 0, ow, oh, "right-half"), Some((960, 0, 960, 1080)));
+        assert_eq!(zone_rect(0, 0, ow, oh, "top-half"), Some((0, 0, 1920, 540)));
+        assert_eq!(zone_rect(0, 0, ow, oh, "bottom-half"), Some((0, 540, 1920, 540)));
+        assert_eq!(zone_rect(0, 0, ow, oh, "top-left"), Some((0, 0, 960, 540)));
+        assert_eq!(zone_rect(0, 0, ow, oh, "top-right"), Some((960, 0, 960, 540)));
+        assert_eq!(zone_rect(0, 0, ow, oh, "bottom-left"), Some((0, 540, 960, 540)));
+        assert_eq!(zone_rect(0, 0, ow, oh, "bottom-right"), Some((960, 540, 960, 540)));
+        assert_eq!(zone_rect(0, 0, ow, oh, "center"), Some((480, 270, 960, 540)));
+        assert_eq!(zone_rect(0, 0, ow, oh, "maximize"), Some((0, 0, 1920, 1080)));
+        assert_eq!(zone_rect(0, 0, ow, oh, "fullscreen"), Some((0, 0, 1920, 1080)));
+    }
+
+    #[test]
+    fn zone_rect_unknown_zone_is_none() {
+        assert_eq!(zone_rect(0, 0, 1920, 1080, "nope"), None);
+        assert_eq!(zone_rect(0, 0, 1920, 1080, ""), None);
+    }
+
+    #[test]
+    fn zone_rect_honours_a_nonzero_output_origin() {
+        // A multi-monitor/inset output at (100, 200): zones are offset by the origin.
+        assert_eq!(zone_rect(100, 200, 1920, 1080, "right-half"), Some((100 + 960, 200, 960, 1080)));
+        assert_eq!(zone_rect(100, 200, 1920, 1080, "bottom-right"), Some((100 + 960, 200 + 540, 960, 540)));
+    }
+
+    #[test]
+    fn zone_rect_left_right_halves_tile_an_odd_width_with_no_seam() {
+        // ODD width 1921: left = 1921/2 = 960, right = 1921 - 960 = 961. The two halves
+        // butt edge-to-edge AND together cover the full width — no 1px gap or overlap.
+        let ow = 1921;
+        let (lx, _ly, lw, _lh) = zone_rect(0, 0, ow, 1080, "left-half").unwrap();
+        let (rx, _ry, rw, _rh) = zone_rect(0, 0, ow, 1080, "right-half").unwrap();
+        assert_eq!(lx + lw, rx, "right-half begins exactly where left-half ends (no seam)");
+        assert_eq!(rx + rw, ow, "right edge of right-half reaches the full width");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // tile_rects — the §4.5 tile geometry (pure, extracted from ipc_tile).
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn tile_rects_empty_for_zero_windows() {
+        assert!(tile_rects(0, 0, 1920, 1080, 0, "grid").is_empty());
+    }
+
+    #[test]
+    fn tile_rects_fullscreen_stacks_all_on_the_whole_output() {
+        let r = tile_rects(0, 0, 1920, 1080, 3, "fullscreen");
+        assert_eq!(r.len(), 3);
+        for cell in &r {
+            assert_eq!(*cell, (0, 0, 1920, 1080));
+        }
+    }
+
+    #[test]
+    fn tile_rects_cols_splits_the_width_evenly() {
+        // 4 windows, 1920 wide → 4 columns of 480, full height, butting edge-to-edge.
+        let r = tile_rects(0, 0, 1920, 1080, 4, "cols");
+        assert_eq!(r, vec![
+            (0, 0, 480, 1080),
+            (480, 0, 480, 1080),
+            (960, 0, 480, 1080),
+            (1440, 0, 480, 1080),
+        ]);
+    }
+
+    #[test]
+    fn tile_rects_rows_splits_the_height_evenly() {
+        let r = tile_rects(0, 0, 1920, 900, 3, "rows");
+        assert_eq!(r, vec![
+            (0, 0, 1920, 300),
+            (0, 300, 1920, 300),
+            (0, 600, 1920, 300),
+        ]);
+    }
+
+    #[test]
+    fn tile_rects_master_stack_one_window_is_fullscreen() {
+        assert_eq!(tile_rects(0, 0, 1920, 1080, 1, "master-stack"), vec![(0, 0, 1920, 1080)]);
+    }
+
+    #[test]
+    fn tile_rects_master_stack_master_plus_stack() {
+        // 3 windows: master = left half full height; the other 2 stack the right half.
+        let r = tile_rects(0, 0, 1920, 1080, 3, "master-stack");
+        assert_eq!(r[0], (0, 0, 960, 1080), "master is the left half, full height");
+        assert_eq!(r[1], (960, 0, 960, 540), "stack[0] is top of the right half");
+        assert_eq!(r[2], (960, 540, 960, 540), "stack[1] is bottom of the right half");
+    }
+
+    #[test]
+    fn tile_rects_grid_is_the_default_layout() {
+        // 4 windows → 2x2 grid of 960x540. Unknown layout name falls through to grid.
+        let grid = tile_rects(0, 0, 1920, 1080, 4, "grid");
+        let unknown = tile_rects(0, 0, 1920, 1080, 4, "whatever");
+        assert_eq!(grid, unknown, "an unknown layout name defaults to grid");
+        assert_eq!(grid, vec![
+            (0, 0, 960, 540),
+            (960, 0, 960, 540),
+            (0, 540, 960, 540),
+            (960, 540, 960, 540),
+        ]);
+    }
+
+    #[test]
+    fn tile_rects_grid_nondivisible_width_leaves_a_documented_edge_gap() {
+        // 7 windows on a 1920-wide output: cols = ceil(sqrt(7)) = 3, cw = 1920/3 = 640.
+        // The grid is 3 cols x 3 rows (last row holds 1). The RIGHTMOST column starts at
+        // 2*640 = 1280 and ends at 1280+640 = 1920 — exact here (1920 % 3 == 0). To force
+        // an indivisible case, use ow = 1922: cw = 640, last col ends at 1920, leaving a
+        // 2px strip (1922-1920) uncovered. This is the simple-tiler contract (integer
+        // cells, no last-cell stretch) — the gap is at most (cols-1)px and is asserted so
+        // any future "fill to edge" change is a CONSCIOUS choice, not an accident.
+        let r = tile_rects(0, 0, 1922, 1080, 7, "grid");
+        assert_eq!(r.len(), 7);
+        let cols = 3i32;
+        let cw = 1922 / cols; // 640
+        let rightmost_x = 2 * cw; // start of the last column
+        let covered_right = rightmost_x + cw; // 1920
+        let gap = 1922 - covered_right; // 2px uncovered strip
+        assert_eq!(cw, 640);
+        assert_eq!(covered_right, 1920);
+        assert_eq!(gap, 2, "indivisible width leaves a documented <cols px edge gap (simple-tiler contract)");
+        // Every cell is the same integer size — none is stretched to absorb the remainder.
+        for cell in &r {
+            assert_eq!(cell.2, cw, "every grid cell is the integer column width (no last-cell stretch)");
+        }
     }
 
     #[test]
