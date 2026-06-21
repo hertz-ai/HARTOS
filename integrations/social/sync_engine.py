@@ -12,9 +12,30 @@ import requests
 from datetime import datetime
 
 from core.http_pool import pooled_get, pooled_post
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict, Optional, Callable
 
 logger = logging.getLogger('hevolve_social')
+
+
+@dataclass(frozen=True)
+class SyncEntity:
+    """One registry entry per syncable thing — the single source of truth for
+    the unified sync layer (docs/architecture/UNIFIED_SYNC_ARCHITECTURE.md).
+
+    Adding a syncable entity = ONE registration here, with zero new dispatch /
+    producer / transport code.  ``apply`` is the idempotent upsert-by-id
+    receiver; ``gate``/``serialize``/``topic`` are consumed by the producer
+    (queue_entity) + real-time transport and are populated as each phase lands
+    (P2+).  Op names are the existing wire ops (backward-compatible)."""
+    op: str                       # wire op name (e.g. 'sync_post')
+    apply: Callable               # (db, payload) -> str|None — idempotent receiver
+    model: type = None
+    gate: Callable = None         # (db, obj, demander) -> bool — consent/privacy
+    serialize: Callable = None    # (db, obj) -> dict — provenance-stamped, no assets
+    topic: str = ''               # WAMP topic template for P2P + down-push
+    p2p: bool = True
+    central: bool = True
 
 
 class SyncEngine:
@@ -200,24 +221,13 @@ class SyncEngine:
                     continue
 
             try:
-                if op == 'register_agent':
-                    SyncEngine._handle_sync_agent(db, payload)
-                elif op == 'sync_post':
-                    SyncEngine._handle_sync_post(db, payload)
-                elif op == 'update_stats':
-                    logger.info(f"Sync: received stats update from child")
-                elif op == 'register_node':
-                    logger.info(f"Sync: received node registration from child")
-                elif op == 'coding_task_assign':
-                    logger.info(f"Sync: received coding task assignment from parent")
-                elif op == 'coding_submission':
-                    logger.info(f"Sync: received coding submission from child")
-                elif op == 'sync_user':
-                    SyncEngine._handle_sync_user(db, payload)
-                elif op == 'revoke_token':
-                    SyncEngine._handle_revoke_token(payload)
-                elif op == 'sync_blocklist':
-                    SyncEngine._handle_sync_blocklist(payload)
+                # Single dispatch: the registry (SYNC_ENTITIES) + the few non-
+                # entity ops collapsed into ONE op→handler map.  The if/elif
+                # ladder is gone — adding an entity is a registration, not a
+                # branch here (docs/architecture/UNIFIED_SYNC_ARCHITECTURE.md).
+                handler = OP_DISPATCH.get(op)
+                if handler is not None:
+                    handler(db, payload)
                 else:
                     logger.debug(f"Sync: unknown operation type: {op}")
 
@@ -550,6 +560,31 @@ class SyncEngine:
             'failed': failed,
             'total_pending': queued + in_progress,
         }
+
+
+# ── Unified sync registry (the single source of truth) ───────────────────────
+# Each syncable entity is ONE SyncEntity.  The receiver dispatch + (later phases)
+# the producer + real-time transport all read from here — never an if/elif
+# ladder or a second producer.  P1: the 3 existing entities; gate/serialize/
+# topic land in P2+.  Op names are the existing wire ops (backward-compatible).
+SYNC_ENTITIES: Dict[str, SyncEntity] = {
+    'sync_post': SyncEntity(op='sync_post', apply=SyncEngine._handle_sync_post),
+    'register_agent': SyncEntity(op='register_agent', apply=SyncEngine._handle_sync_agent),
+    'sync_user': SyncEntity(op='sync_user', apply=SyncEngine._handle_sync_user),
+}
+
+# The ONE op→handler dispatch the receiver uses: every entity's apply, PLUS the
+# non-entity operations (token/blocklist mutations + log-only acks), all
+# normalised to a (db, payload) callable so receive_sync_batch stays branchless.
+OP_DISPATCH: Dict[str, Callable] = {op: e.apply for op, e in SYNC_ENTITIES.items()}
+OP_DISPATCH.update({
+    'revoke_token': lambda db, payload: SyncEngine._handle_revoke_token(payload),
+    'sync_blocklist': lambda db, payload: SyncEngine._handle_sync_blocklist(payload),
+    'update_stats': lambda db, payload: logger.info("Sync: received stats update from child"),
+    'register_node': lambda db, payload: logger.info("Sync: received node registration from child"),
+    'coding_task_assign': lambda db, payload: logger.info("Sync: received coding task assignment from parent"),
+    'coding_submission': lambda db, payload: logger.info("Sync: received coding submission from child"),
+})
 
 
 # Module-level singleton
