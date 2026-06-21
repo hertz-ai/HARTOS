@@ -5310,41 +5310,56 @@ def _g12_kick_off_student(prompt: str):
 
 
 def _g12_finalize(prompt: str, teacher_response: str, student_future) -> None:
-    """Collect the student future (short-timeout) and enqueue distillation.
+    """Schedule distillation when the student future completes — NEVER block
+    the teacher return.
 
-    Fire-and-forget — we never hold up the teacher return.  Callers MUST
-    pass the teacher text they're about to return; distillation only fires
-    when both responses are available AND they differ.
+    PERF-3 (audit): this used to ``student_future.result(timeout=0.5)`` —
+    blocking the user-reply path up to 0.5s per LLM iteration waiting on the
+    SSM student's forward pass.  That work is distillation TRAINING DATA; it is
+    never needed to answer the user.  We now attach a completion callback
+    instead of joining, so the reply returns immediately (finally matching this
+    function's long-standing "fire-and-forget" contract) and the
+    teacher/student pair is recorded through the SAME canonical sink
+    (world_model_bridge.record_teacher_student_pair) the moment the student
+    finishes — even past 0.5s, so we record MORE pairs than the old
+    drop-on-timeout path, at zero reply-latency cost.
     """
     if student_future is None or not teacher_response:
         return
+
+    def _record_when_ready(fut) -> None:
+        # Runs on the student executor's thread when the SSM pass completes (or
+        # immediately, on the caller's thread, if already settled).  Either way
+        # this is the fast record only — never the 0.5s wait.  record_* is
+        # already reachable concurrently across chat turns, so no new
+        # thread-safety surface is introduced here.
+        try:
+            student = fut.result()
+        except Exception:
+            return
+        if not student or not isinstance(student, dict):
+            return
+        s_text = student.get('response')
+        if not s_text:
+            return
+        try:
+            from integrations.agent_engine.world_model_bridge import (
+                get_world_model_bridge,
+            )
+            bridge = get_world_model_bridge()
+            bridge.record_teacher_student_pair(
+                prompt=prompt,
+                teacher_response=teacher_response,
+                student_response=str(s_text),
+                student_action=student.get('action_tensor'),
+            )
+        except Exception:
+            pass
+
     try:
-        # Budget: we're about to return to the user anyway.  If the student
-        # isn't done within 500ms, drop it for this turn — distillation
-        # can pick up the next request.
-        student = student_future.result(timeout=0.5)
-    except _g12_cf.TimeoutError:
-        # Let it finish in the background; we just don't use it this turn.
-        return
+        student_future.add_done_callback(_record_when_ready)
     except Exception:
-        return
-    if not student or not isinstance(student, dict):
-        return
-    s_text = student.get('response')
-    if not s_text:
-        return
-    try:
-        from integrations.agent_engine.world_model_bridge import (
-            get_world_model_bridge,
-        )
-        bridge = get_world_model_bridge()
-        bridge.record_teacher_student_pair(
-            prompt=prompt,
-            teacher_response=teacher_response,
-            student_response=str(s_text),
-            student_action=student.get('action_tensor'),
-        )
-    except Exception:
+        # Future already settled / executor torn down — best-effort, never raise.
         pass
 
 
