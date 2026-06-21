@@ -148,6 +148,17 @@
       # Imported so the option exists + tests/boot-log.nix can enable it; the
       # live/desktop config turns it on (desktop.nix).
       ./modules/hart-boot-log.nix
+      # Live-OS self-creation of the HARTLOG partition: on first boot from a
+      # removable/USB stick with trailing free space + no existing HARTLOG, HART
+      # OS carves a FAT32 HARTLOG partition into ONLY that free space (sgdisk +
+      # mkfs.vfat), so hart-boot-log can land the journal on the stick. REPLACES
+      # the Windows-flasher diskpart path (which hung on a wedged VDS + corrupted
+      # a freshly-flashed stick's EFI/GPT). Ordered BEFORE hart-boot-log's
+      # capture. Opt-in (hart.hartlogCreate.enable=false default) -> pure no-op
+      # for every variant; ALSO a no-op at runtime when not USB-booted / no free
+      # space / HARTLOG already exists. Imported so the option exists +
+      # tests/hartlog-create.nix can enable it; desktop.nix turns it on.
+      ./modules/hart-hartlog-create.nix
     ];
 
     # Single source of truth for nixpkgs config (allowUnfree etc.).  Kept OUT of
@@ -482,7 +493,15 @@
       # no-HARTLOG path is a clean no-op (old stick / plain flash still boots).
       # Distinct attr name -> clean //; desktop-variant node (mkNode).
       bootLog = import ./tests/boot-log.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog;
+      # Live-OS HARTLOG self-create: a desktop node enables hart.hartlogCreate +
+      # attaches a spare disk standing in for the USB stick (GPT + a small "ISO"
+      # part + trailing free space). It runs the REAL carve script and asserts a
+      # NEW HARTLOG FAT32 partition appears in the free space, the pre-existing
+      # part is UNTOUCHED, a second run is an idempotent no-op, and a full disk is
+      # a clean no-op. This is the Linux-side replacement for the corrupting
+      # Windows diskpart path. Distinct attr name -> clean //; desktop node.
+      hartlogCreate = import ./tests/hartlog-create.nix desktopTestArgs;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)

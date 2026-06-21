@@ -289,13 +289,14 @@ def test_list_parts_parses_real_assets(monkeypatch):
 
 
 # ─────────── HARTLOG diagnostic-log partition (Part B) ───────────
-# After a successful flash + boot-sig verify, the flasher carves a FAT32
-# partition labelled HARTLOG into the stick's free space so the live ISO can
-# write its boot journal there for the Windows host to read. The carve must:
+# The Windows diskpart carve of the HARTLOG partition is now OPT-IN (DEFAULT OFF):
+# the Live OS creates it itself on first boot (Linux-side, safe). The Windows
+# path hung on a wedged VDS AND corrupted a freshly-flashed stick's EFI/GPT, so it
+# is gated behind --windows-log-partition. When explicitly enabled, the carve must:
 #   (a) run the right diskpart script (create primary + format fat32 label),
 #   (b) report success ONLY when diskpart confirms the format,
 #   (c) NEVER fail/abort the (already-successful) flash on ANY error,
-#   (d) be skippable via --no-log-partition,
+#   (d) be OFF unless --windows-log-partition is passed,
 #   (e) run AFTER a successful verify (not before, not on a failed flash).
 
 # Real diskpart output for a successful `format fs=fat32 label=HARTLOG quick`.
@@ -418,15 +419,31 @@ def _stub_flash_machinery(monkeypatch, verify_result=True):
 
 
 def test_flash_creates_log_partition_after_successful_verify(monkeypatch):
-    """End-to-end ordering: flash() must call create_log_partition AFTER a
-    successful verify_iso (a debug partition on a verified-bootable stick)."""
+    """End-to-end ordering: when the legacy Windows carve is EXPLICITLY enabled
+    (make_log_partition=True / --windows-log-partition), flash() must call
+    create_log_partition AFTER a successful verify_iso (a debug partition on a
+    verified-bootable stick)."""
+    order = _stub_flash_machinery(monkeypatch, verify_result=True)
+    ok = flasher.flash("tag", "desktop", {"number": 1, "model": "USB", "dev": "/dev/sdb",
+                                          "physdrive": "/dev/sdb"},
+                       "download", "/tmp", log=lambda m: None,
+                       make_log_partition=True)
+    assert ok is True
+    assert order == ["verify", "carve"], \
+        "create_log_partition must run AFTER verify_iso, only on success"
+
+
+def test_flash_default_skips_windows_carve(monkeypatch):
+    """THE inversion: the Windows diskpart carve is now OFF BY DEFAULT (the Live
+    OS creates HARTLOG itself, which can't corrupt the stick's EFI/GPT). A plain
+    flash() with no make_log_partition arg must NOT carve."""
     order = _stub_flash_machinery(monkeypatch, verify_result=True)
     ok = flasher.flash("tag", "desktop", {"number": 1, "model": "USB", "dev": "/dev/sdb",
                                           "physdrive": "/dev/sdb"},
                        "download", "/tmp", log=lambda m: None)
     assert ok is True
-    assert order == ["verify", "carve"], \
-        "create_log_partition must run AFTER verify_iso, only on success"
+    assert order == ["verify"], \
+        "the Windows carve must be OFF by default — the Live OS owns HARTLOG now"
 
 
 def test_flash_skips_log_partition_when_verify_fails(monkeypatch):
@@ -440,9 +457,9 @@ def test_flash_skips_log_partition_when_verify_fails(monkeypatch):
     assert order == ["verify"], "no carve on a failed verify"
 
 
-def test_flash_no_log_partition_flag_skips_the_carve(monkeypatch):
-    """--no-log-partition (make_log_partition=False) skips the carve even on a
-    successful verify."""
+def test_flash_explicit_disable_skips_the_carve(monkeypatch):
+    """An explicit make_log_partition=False skips the carve even on a successful
+    verify (same as the default now)."""
     order = _stub_flash_machinery(monkeypatch, verify_result=True)
     ok = flasher.flash("tag", "desktop", {"number": 1, "model": "USB", "dev": "/dev/sdb",
                                           "physdrive": "/dev/sdb"},
@@ -471,17 +488,19 @@ def test_flash_carve_exception_does_not_fail_the_flash(monkeypatch):
         ok = flasher.flash("tag", "desktop",
                            {"number": 1, "model": "USB", "dev": "/dev/sdb",
                             "physdrive": "/dev/sdb"},
-                           "download", "/tmp", log=lambda m: None)
+                           "download", "/tmp", log=lambda m: None,
+                           make_log_partition=True)
     except RuntimeError:
         pytest.fail("a carve exception must not propagate out of flash()")
     assert ok is True
     assert order == ["verify", "carve"]
 
 
-def test_no_log_partition_flag_parses(monkeypatch):
-    """The --no-log-partition opt-out flag exists and defaults to off (carve ON
-    by default)."""
+def test_windows_log_partition_flag_parses(monkeypatch):
+    """The carve is OFF by default; --windows-log-partition is the explicit opt-in
+    to the legacy Windows diskpart path (the Live OS owns HARTLOG creation now)."""
     args = flasher.build_parser().parse_args(["--device", "1", "--yes"])
-    assert args.no_log_partition is False
-    args2 = flasher.build_parser().parse_args(["--device", "1", "--yes", "--no-log-partition"])
-    assert args2.no_log_partition is True
+    assert args.windows_log_partition is False           # default: Live OS owns it
+    args2 = flasher.build_parser().parse_args(
+        ["--device", "1", "--yes", "--windows-log-partition"])
+    assert args2.windows_log_partition is True           # explicit legacy opt-in

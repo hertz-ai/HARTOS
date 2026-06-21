@@ -731,7 +731,7 @@ def create_log_partition(disk, log):
 
 # ───────────────────────── orchestration ─────────────────────────
 def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
-          make_log_partition=True):
+          make_log_partition=False):
     log = log or (lambda m: None)
     progress = progress or (lambda f: None)
     gh = find_gh()
@@ -789,20 +789,27 @@ def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
     log("Verifying signatures...")
     ok = verify_iso(disk, dd, log)
     log("DONE - bootable OK" if ok else "DONE but signature check FAILED")
-    # AFTER a successful flash + boot-sig verify, carve a HARTLOG FAT32 partition
-    # into the stick's free space so the live ISO can write its boot journal
-    # there for the Windows host to read. Gated on the verify passing (no point
-    # adding a debug partition to a stick that didn't flash) AND opt-out-able via
-    # --no-log-partition. create_log_partition NEVER raises / never fails the
-    # flash — the flash is already done + bootable; this is a debug convenience.
+    # HARTLOG partition creation now DEFAULTS OFF on Windows. The Live OS creates
+    # it itself on first boot (nixos/modules/hart-hartlog-create.nix), Linux-side,
+    # which is SAFE. The Windows diskpart carve was DOUBLY broken: it HUNG on a
+    # wedged Windows VDS, and a half-completed `diskpart create partition` CORRUPTED
+    # a freshly-flashed stick's EFI/GPT (boot failed with start_image returned
+    # 0x8000000000000001 = EFI_LOAD_ERROR). So we no longer touch the stick after a
+    # successful flash by default — never risk bricking the very stick we flashed.
+    # The legacy carve stays opt-in via --windows-log-partition (make_log_partition)
+    # for anyone who explicitly wants the old path; it is gated on the verify
+    # passing and NEVER raises / never fails the flash.
     if ok and make_log_partition:
-        log("Creating HARTLOG diagnostic-log partition in the free space...")
+        log("Creating HARTLOG diagnostic-log partition in the free space "
+            "(--windows-log-partition; the Live OS normally creates it itself)...")
         try:
             create_log_partition(disk, log)
         except Exception as e:                   # the carve can NEVER fail the flash
             log("  HARTLOG partition: ignored error (%s) — flash is complete + bootable" % e)
-    elif not make_log_partition:
-        log("HARTLOG partition: disabled via --no-log-partition")
+    else:
+        log("HARTLOG partition: not created on Windows (default) — the Live OS "
+            "creates it itself on first boot, which can't corrupt the stick's "
+            "EFI/GPT. Pass --windows-log-partition to force the legacy Windows path.")
     return ok
 
 
@@ -904,7 +911,7 @@ def cmd_flash(args):
            warn or "removable/blank"))
     try:
         ok = flash(tag, args.variant, disk, args.mode, args.tmp, log=log,
-                   make_log_partition=not args.no_log_partition)
+                   make_log_partition=args.windows_log_partition)
     except Exception as e:
         log("FLASH FAILED: %s" % e)
         sys.stderr.write("FLASH FAILED: %s\n  (debug log: %s)\n" % (e, log_path))
@@ -930,10 +937,14 @@ def build_parser():
     p.add_argument("--log", help="debug log file (default: <tmp>/hart_flash.log)")
     p.add_argument("--allow-system", action="store_true",
                    help="DANGEROUS: also offer non-removable/system disks")
-    p.add_argument("--no-log-partition", action="store_true",
-                   help="skip creating the HARTLOG diagnostic-log partition in "
-                        "the stick's free space (Windows; created by default after "
-                        "a successful flash so the host can read the boot journal)")
+    p.add_argument("--windows-log-partition", action="store_true",
+                   help="OPT-IN to the LEGACY Windows diskpart carve of the HARTLOG "
+                        "diagnostic-log partition in the stick's free space. OFF by "
+                        "default: the Live OS now creates HARTLOG itself on first "
+                        "boot (Linux-side, safe). The Windows diskpart path hung on "
+                        "a wedged VDS AND corrupted a freshly-flashed stick's "
+                        "EFI/GPT — only use this if you specifically need the old "
+                        "path.")
     return p
 
 
@@ -1006,12 +1017,13 @@ def launch_gui():
     ttk.Radiobutton(row3, text="Download+Flash", variable=mode_var, value="download").pack(side="left")
 
     row4 = ttk.Frame(frm); row4.pack(fill="x", pady=3)
-    # Default ON (matches the CLI default): carve a HARTLOG FAT32 partition into
-    # the free space so the host can read the live ISO's boot journal off the
-    # stick. Windows-only; a no-op elsewhere.
-    logpart_var = tk.BooleanVar(value=True)
+    # Default OFF (matches the CLI default): the Live OS creates the HARTLOG
+    # partition itself on first boot (Linux-side, safe). The legacy Windows
+    # diskpart carve hung on a wedged VDS AND corrupted a freshly-flashed stick's
+    # EFI/GPT, so it is OPT-IN only now.
+    logpart_var = tk.BooleanVar(value=False)
     ttk.Checkbutton(row4,
-                    text="Create HARTLOG diagnostic-log partition (read boot logs from this PC)",
+                    text="Legacy: create HARTLOG via Windows diskpart (OFF — the Live OS now does this safely)",
                     variable=logpart_var).pack(side="left")
 
     pbar = ttk.Progressbar(frm, mode="determinate", maximum=1.0)

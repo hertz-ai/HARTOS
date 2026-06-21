@@ -269,6 +269,22 @@ in
     # NO-OP when no HARTLOG partition is present, so an old stick still boots
     # fine and the capture never blocks/slows/fails boot.
     bootLog.enable = true;
+
+    # ── Live-OS self-creation of the HARTLOG partition ──
+    # The HARTLOG partition (read by bootLog above) is now created BY THE LIVE OS
+    # on first USB boot, NOT by the Windows flasher. The flasher's diskpart path
+    # was doubly broken — it HUNG on a wedged Windows VDS, and a half-completed
+    # `diskpart create partition` CORRUPTED a freshly-flashed stick's EFI/GPT
+    # (boot failed with start_image returned 0x8000000000000001 = EFI_LOAD_ERROR).
+    # With this ON, the first boot from the USB carves a FAT32 HARTLOG partition
+    # into ONLY the stick's trailing free space (sgdisk --largest-new + mkfs.vfat),
+    # ordered BEFORE the bootLog capture so the very first boot's journal lands on
+    # it. NEVER touches the in-use ISO/EFI/boot partitions; a pure NO-OP when not
+    # USB-booted, when no free space exists, when HARTLOG already exists, or on any
+    # error — it can never block or fail boot. The label defaults to bootLog.label
+    # so the create-side and read-side stay in lockstep.
+    hartlogCreate.enable = true;
+
   };
 
   # HART application package

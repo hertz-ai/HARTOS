@@ -62,6 +62,8 @@ EXPECTED_MODULES = [
     "hart-compute-mesh.nix",
     "hart-liquid-ui.nix",
     "hart-app-bridge.nix",
+    # Boot-experience modules (HARTLOG self-create + boot continuity)
+    "hart-hartlog-create.nix",
 ]
 
 # Python backend services for the AI-Native modules
@@ -1570,3 +1572,86 @@ class TestPeripheralBridgeEnableGuard:
         content = read_nix(os.path.join(MODULES_DIR, "hart-peripheral-bridge.nix"))
         assert "mkIf" in content
         assert "peripheralBridge.enable" in content
+
+
+# ═══════════════════════════════════════════════════════════════
+# Boot-experience: Live-OS HARTLOG self-create (Feature 1)
+# ═══════════════════════════════════════════════════════════════
+
+class TestHartlogCreateModule:
+    """hart-hartlog-create.nix: Live-OS carves HARTLOG into the USB free space,
+    replacing the Windows-flasher diskpart path. The SAFETY contract (never
+    touch the in-use partitions, removable-only, no-op on every error) is the
+    load-bearing part — assert its presence structurally."""
+
+    @pytest.fixture(autouse=True)
+    def load_module(self):
+        self.content = read_nix(os.path.join(MODULES_DIR, "hart-hartlog-create.nix"))
+
+    def test_has_enable_option(self):
+        assert "mkEnableOption" in self.content
+        assert "hartlogCreate" in self.content
+
+    def test_has_mkif_guard(self):
+        assert "mkIf" in self.content
+        assert "hlog.enable" in self.content or "hartlogCreate.enable" in self.content
+
+    def test_label_defaults_to_bootlog_label(self):
+        """ONE contract: the create-side label must default to bootLog.label so
+        the read-side (hart-boot-log) and write-side never drift."""
+        assert "config.hart.bootLog.label" in self.content
+
+    def test_uses_sgdisk_and_mkfs_vfat(self):
+        """The Linux-side carve: sgdisk to add the partition in free space +
+        mkfs.vfat to FAT32-format + label it."""
+        assert "sgdisk" in self.content
+        assert "mkfs.vfat" in self.content
+        assert "gptfdisk" in self.content
+        assert "dosfstools" in self.content
+
+    def test_carves_only_largest_free_block(self):
+        """--largest-new allocates from the EXISTING free pool ONLY; it cannot
+        move/resize an existing partition, so the in-use ISO/EFI/boot partitions
+        are never touched."""
+        assert "largest-new" in self.content
+
+    def test_removable_usb_safety_gate(self):
+        """NEVER repartition an internal disk — gate on RM=1 / TRAN=usb."""
+        assert "removable" in self.content.lower()
+        assert "RM" in self.content
+        assert "usb" in self.content.lower()
+
+    def test_idempotent_skip_when_hartlog_exists(self):
+        """A second boot must find the partition + no-op (idempotent)."""
+        assert "blkid -L" in self.content
+        assert "already exists" in self.content or "idempotent" in self.content
+
+    def test_no_op_when_no_free_space(self):
+        assert "no trailing free space" in self.content or "free space" in self.content
+
+    def test_ordered_before_boot_log(self):
+        """Must run BEFORE the boot-log capture so the first boot's journal lands
+        on the partition this unit creates."""
+        assert "hart-boot-log-early.service" in self.content
+        assert "before" in self.content
+
+    def test_runs_as_oneshot_with_timeout(self):
+        assert "oneshot" in self.content
+        assert "TimeoutStartSec" in self.content
+
+    def test_never_fails_boot_set_u_not_e(self):
+        """`set -u` only (NOT -e): a probe failing must not abort the carve; the
+        script decides explicitly + always exits 0."""
+        assert "set -u" in self.content
+        assert "set -e" not in self.content
+        assert "exit 0" in self.content
+
+    def test_in_flake_modules(self):
+        flake = read_nix(os.path.join(NIXOS_DIR, "flake.nix"))
+        assert "hart-hartlog-create.nix" in flake
+
+    def test_desktop_enables_it(self):
+        desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        assert "hartlogCreate.enable = true" in desktop
+
+
