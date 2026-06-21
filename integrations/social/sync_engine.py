@@ -404,6 +404,15 @@ class SyncEngine:
             ['user_id', 'community_id', 'role'])
 
     @staticmethod
+    def _handle_sync_encounter(db, payload: dict):
+        """Land a synced encounter (P3) — LOCATION-FREE (lat/lng/location never
+        travel), generic upsert by id."""
+        return SyncEngine._apply_synced_row(
+            db, _encounter_model(), (payload or {}).get('data') or {},
+            ['user_a_id', 'user_b_id', 'context_type', 'context_id',
+             'encounter_count', 'bond_level', 'is_mutual_aware'])
+
+    @staticmethod
     def _handle_sync_user(db, payload: dict):
         """Create or update a User record from sync data."""
         from .models import User
@@ -677,7 +686,7 @@ def _community_gate(db, obj, demander):
 
 def _community_serialize(db, obj):
     from .federation import federation
-    return federation._entity_message(db, 'community', obj)
+    return federation._entity_message(db, 'community', obj.to_dict())
 
 
 def _membership_model():
@@ -695,7 +704,34 @@ def _membership_gate(db, obj, demander):
 
 def _membership_serialize(db, obj):
     from .federation import federation
-    return federation._entity_message(db, 'community_membership', obj)
+    return federation._entity_message(db, 'community_membership', obj.to_dict())
+
+
+def _encounter_model():
+    from .models import Encounter
+    return Encounter
+
+
+# Encounters are PII (who met whom) AND carry precise location (lat/lng).
+# Central replication is OFF unless the user opts in via cloud_egress consent,
+# and the LOCATION fields (lat/lng/location_label) are NEVER synced.
+_ENCOUNTER_SYNC_FIELDS = ['user_a_id', 'user_b_id', 'context_type', 'context_id',
+                         'encounter_count', 'bond_level', 'is_mutual_aware']
+
+
+def _encounter_gate(db, obj, demander):
+    from .consent_service import ConsentService
+    return ConsentService.check_consent(
+        db, getattr(obj, 'user_a_id', None), 'cloud_egress', scope='social_sync')
+
+
+def _encounter_serialize(db, obj):
+    from .federation import federation
+    d = obj.to_dict()
+    data = {'id': d.get('id')}
+    for f in _ENCOUNTER_SYNC_FIELDS:
+        data[f] = d.get(f)          # location columns deliberately excluded
+    return federation._entity_message(db, 'encounter', data)
 
 
 SYNC_ENTITIES: Dict[str, SyncEntity] = {
@@ -715,6 +751,10 @@ SYNC_ENTITIES: Dict[str, SyncEntity] = {
         op='sync_membership', apply=SyncEngine._handle_sync_membership,
         match=lambda o: getattr(o, '__tablename__', None) == 'community_memberships',
         gate=_membership_gate, serialize=_membership_serialize),
+    'sync_encounter': SyncEntity(
+        op='sync_encounter', apply=SyncEngine._handle_sync_encounter,
+        match=lambda o: getattr(o, '__tablename__', None) == 'encounters',
+        gate=_encounter_gate, serialize=_encounter_serialize),
     'sync_user': SyncEntity(
         op='sync_user', apply=SyncEngine._handle_sync_user),
 }

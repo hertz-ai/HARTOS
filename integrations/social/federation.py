@@ -225,18 +225,20 @@ class FederationManager:
             logger.debug("Federation._agent_skill_summary: skipped: %s", e)
             return []
 
-    def _entity_message(self, db, kind: str, obj) -> dict:
+    def _entity_message(self, db, kind: str, data: dict) -> dict:
         """Generic provenance-stamped envelope for a synced entity (P3+) — the
-        unified twin of _outbox_message/_agent_message for the simple entities
-        (community, …).  ONE shape: the same gossip origin fields + the row's
-        to_dict() under 'data'.  The receiver upserts payload['data'] by id."""
+        unified twin of _outbox_message/_agent_message.  ONE shape: the gossip
+        origin fields + the (already field-selected) row dict under 'data'.  The
+        per-entity serialize builds `data` from to_dict(), optionally FILTERED to
+        drop sensitive columns (e.g. encounter lat/lng).  Receiver upserts
+        payload['data'] by id."""
         from .peer_discovery import gossip
         return {
             'type': kind,
             'origin_node_id': gossip.node_id,
             'origin_url': gossip.base_url,
             'origin_name': gossip.node_name,
-            'data': obj.to_dict(),
+            'data': data,
             'timestamp': datetime.utcnow().isoformat(),
         }
 
