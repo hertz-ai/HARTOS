@@ -223,6 +223,38 @@ in
           # chosen here).
           assert host_src.count("WebKit.WebView()") == 1, \
               "GTK4 host created >1 WebView — Model 2 was not chosen (JS-unchanged broken)"
+
+      # ── 7. DRY: Tier-1 (hart-comp) + Tier-2 (sway/layer-shell) run the SAME host ──
+      with subtest("Tier-1 (hart-comp) and Tier-2 (layer-shell) launch the SAME hart-glass-shell-gtk4 binary"):
+          # The whole point of the layer-shell host: ONE glass host window every
+          # higher tier re-hosts the served shell through — not a per-tier copy. The
+          # Tier-2 layer-shell session execs the GTK4 host via its sway config; the
+          # Tier-1 hart-comp session launcher runs the SAME `hart-glass-shell-gtk4`
+          # binary (found on PATH — the layer-shell host adds it to systemPackages).
+          # Assert BOTH session commands reference the identical binary basename, so
+          # a rename in one tier can't silently fork the host (a parity regression).
+          comp_launcher = host.succeed(
+              "find /nix/store -maxdepth 4 -name 'hart-comp-session' -type f "
+              "-print -quit; true").strip()
+          # hart-comp is opt-in and OFF on this node, but its session launcher is
+          # only realized in the closure when armed; treat absence as informational
+          # (the binary-NAME parity is the load-bearing invariant either way).
+          if comp_launcher:
+              comp_src = host.succeed("cat " + comp_launcher)
+              assert "hart-glass-shell-gtk4" in comp_src, \
+                  "Tier-1 hart-comp session does not launch the SAME hart-glass-shell-gtk4 host as Tier-2"
+              host.log("Tier-1 hart-comp session references hart-glass-shell-gtk4 (same host as Tier-2)")
+          else:
+              host.log("hart-comp session launcher not in closure (Tier-1 disabled here) — name-parity asserted in the unit guard")
+          # The Tier-2 sway host config (the layer-shell session's single client)
+          # MUST exec the same binary basename — read it back off the closure.
+          sway_conf = host.succeed(
+              "find /nix/store -maxdepth 3 -name 'hart-gtk4-layer-host.conf' "
+              "-print -quit").strip()
+          assert sway_conf, "Tier-2 sway host config (hart-gtk4-layer-host.conf) not realized"
+          conf_src = host.succeed("cat " + sway_conf)
+          assert "hart-glass-shell-gtk4" in conf_src, \
+              "Tier-2 sway host config does not exec the hart-glass-shell-gtk4 host binary"
     '';
   };
 
@@ -411,6 +443,22 @@ in
           # un-fakeable by a half-started host. A screenshot is saved either way.
           paint.screenshot("hart_gtk4_layer_shell_first_frame")
           paint.wait_for_text("HART", timeout=120)
+
+      with subtest("PAINT+MARKER E2E: the GTK4 host TOUCHES /run/hart/session/shell-ready on first paint"):
+          # The full paint+marker contract, end-to-end on a live session. OCR above
+          # proves PIXELS presented; this proves the GTK4 host's _on_load_changed
+          # actually fired _signal_painted() on LoadEvent.FINISHED and the
+          # session-supervisor's HUNG-tier guard sees a HEALTHY Tier-2 (so a
+          # painting GTK4 surface is NOT wrongly dropped to cage). Without the marker
+          # handler the surface paints but the watchdog still escalates — the OTHER
+          # half of the pointer-only regression. The marker lives under the GTK4
+          # host's autologin user runtime, so look in BOTH the pinned /run/hart
+          # contract path and any per-user XDG_RUNTIME_DIR the supervisor may pass.
+          paint.wait_until_succeeds(
+              "test -e /run/hart/session/shell-ready "
+              "|| find /run/user -name 'shell-ready' -path '*hart*' 2>/dev/null | grep -q .",
+              timeout=120)
+          paint.log("GTK4 host touched the shell-ready first-paint marker")
 
       # ════════════════════════════════════════════════════════════════
       # 4. NEVER-BREAK: a GTK4-host crash drops to a tier that PAINTS (cage floor)

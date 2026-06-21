@@ -251,6 +251,21 @@ in
           shell.screenshot("hart_shell_first_frame")
           shell.wait_for_text("HART", timeout=120)
 
+      with subtest("PAINT+MARKER PARITY: the cage GTK3 host TOUCHES /run/hart/session/shell-ready on first paint"):
+          # The cage GTK3 Tier-3 floor host must satisfy the SAME paint-watchdog
+          # contract as the GTK4 layer-shell host (Phase-4 parity): on
+          # WebKit2.LoadEvent.FINISHED its _on_load_changed calls _signal_painted(),
+          # touching /run/hart/session/shell-ready so the session-supervisor sees a
+          # HEALTHY tier. OCR above proved PIXELS; this proves the floor host's
+          # marker fired — so a painting cage floor is never wrongly dropped as HUNG
+          # (both hosts honor ONE marker contract). The marker may land in the
+          # pinned /run/hart path or the autologin user's XDG runtime dir.
+          shell.wait_until_succeeds(
+              "test -e /run/hart/session/shell-ready "
+              "|| find /run/user -name 'shell-ready' -path '*hart*' 2>/dev/null | grep -q .",
+              timeout=120)
+          shell.log("cage GTK3 floor host touched the shell-ready first-paint marker (parity with GTK4)")
+
       # ════════════════════════════════════════════════════════════════
       # 4. WEBVIEW-KILL RECOVERY via Restart=on-failure, NO WatchdogSec self-kill
       # ════════════════════════════════════════════════════════════════

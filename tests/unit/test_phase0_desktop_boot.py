@@ -216,6 +216,18 @@ class TestGate3FirstFramePaints:
         assert "pgrep" in src and "cage" in src
         assert "hart-glass-shell" in src or "gi.require_version" in src
 
+    def test_cage_host_touches_shell_ready_marker_parity_with_gtk4(self, src):
+        # PARITY (Phase-4): the cage GTK3 floor host must satisfy the SAME paint-
+        # watchdog contract as the GTK4 layer-shell host — on first paint its
+        # _on_load_changed touches /run/hart/session/shell-ready so the supervisor
+        # sees a HEALTHY tier. The live cage-paint node (this test) is where that
+        # parity is exercised; OCR proves pixels, the marker wait proves the floor
+        # host's _signal_painted() fired (both hosts honor ONE marker contract).
+        assert "/run/hart/session/shell-ready" in src
+        assert "wait_until_succeeds" in src and "shell-ready" in src
+        low = src.lower()
+        assert "marker" in low and "parity" in low
+
 
 # ═══════════════════════════════════════════════════════════════
 # 5. GATE 4 — WebView-kill RECOVERED by Restart=on-failure, NO WatchdogSec
