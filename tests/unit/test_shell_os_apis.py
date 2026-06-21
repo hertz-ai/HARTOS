@@ -494,6 +494,52 @@ class TestFirmwareSetup(unittest.TestCase):
         popen.assert_called_once_with(
             ['systemctl', 'reboot', '--firmware-setup'])
 
+    def test_power_action_uefi_alias_runs_firmware_setup(self):
+        """The 'uefi' alias maps to the SAME `systemctl reboot --firmware-setup`
+        command + is gated by the SAME capability probe — so both labels the UI
+        might send behave identically (one command, no second code path)."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}._classify_destructive', return_value=True), \
+                patch(f'{self.MOD}.firmware_setup_supported', return_value=True), \
+                patch(f'{self.MOD}.subprocess.Popen') as popen:
+            r = client.post('/api/shell/power/action', json={'action': 'uefi'})
+        self.assertEqual(r.status_code, 200)
+        popen.assert_called_once_with(
+            ['systemctl', 'reboot', '--firmware-setup'])
+
+    def test_power_action_uefi_alias_refused_when_unsupported(self):
+        """The 'uefi' alias is refused (400) + never reboots on a non-capable box,
+        exactly like 'firmware' — the gate covers BOTH aliases (no bypass)."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}._classify_destructive', return_value=True), \
+                patch(f'{self.MOD}.firmware_setup_supported', return_value=False), \
+                patch(f'{self.MOD}.subprocess.Popen') as popen:
+            r = client.post('/api/shell/power/action', json={'action': 'uefi'})
+        self.assertEqual(r.status_code, 400)
+        popen.assert_not_called()
+
+    def test_not_supported_when_efivar_truncated(self):
+        """A short/garbage OsIndicationsSupported read (< 12 bytes: the 4-byte
+        attribute prefix + 8-byte value can't be parsed) is conservatively NOT
+        supported — never claim a capability from a malformed efivar."""
+        from integrations.agent_engine.shell_os_apis import firmware_setup_supported
+        m = unittest.mock.mock_open(read_data=b'\x07\x00\x00\x00\x01')  # only 5 bytes
+        with patch(f'{self.MOD}.os.path.isdir', return_value=True), \
+                patch(f'{self.MOD}.open', m, create=True):
+            self.assertFalse(firmware_setup_supported())
+
+    def test_supported_reads_value_after_attribute_prefix(self):
+        """The boot-to-fw-UI bit must be read from the VALUE (bytes 4:12), NOT the
+        4-byte attribute prefix — a prefix that happens to have bit0 set while the
+        value bit is CLEAR must still report unsupported (correct field offset)."""
+        from integrations.agent_engine.shell_os_apis import firmware_setup_supported
+        # attributes prefix bit0=1, but the 8-byte VALUE has bit0=0.
+        efivar = (0x01).to_bytes(4, 'little') + (0x00).to_bytes(8, 'little')
+        m = unittest.mock.mock_open(read_data=efivar)
+        with patch(f'{self.MOD}.os.path.isdir', return_value=True), \
+                patch(f'{self.MOD}.open', m, create=True):
+            self.assertFalse(firmware_setup_supported())
+
 
 # ═══════════════════════════════════════════════════════════════
 # i18n

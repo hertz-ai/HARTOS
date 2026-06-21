@@ -136,6 +136,18 @@ in
           bl.succeed("ls /tmp/hl/hart-boot-*.log | grep -v latest | grep -q .")
           bl.succeed("umount /tmp/hl")
 
+      # ── 3b. The early phase unmounts the module's private mountpoint cleanly ──
+      # The early/shutdown phases must leave NO mount at the private mountpoint (so
+      # a Windows host sees a consistent fs) — only the periodic phase keeps it
+      # mounted (re-mount-churn avoidance). After the early capture above, the
+      # private mountpoint must be free, AND the FAT fs must be fsck-clean (a dirty
+      # bit / lost cluster would mean the unmount/sync contract was violated).
+      with subtest("the early phase leaves the private mountpoint unmounted + fs clean"):
+          bl.fail(f"mountpoint -q {MNT}")
+          # fsck.fat -n is read-only; exit 0 == clean. (dosfstools is in the node.)
+          fsck = bl.succeed(f"fsck.fat -n {found} 2>&1; echo RC=$?")
+          assert "RC=0" in fsck, f"HARTLOG fs not clean after early-phase unmount: {fsck!r}"
+
       # ── 4. The latest file is OVERWRITTEN each cycle (stable name) ──
       with subtest("hart-boot-latest.log is overwritten in place (stable host-readable name)"):
           # Run a second capture; the latest file must still be ONE file (the

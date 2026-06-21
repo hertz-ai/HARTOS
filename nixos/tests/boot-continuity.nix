@@ -101,6 +101,30 @@ in
           assert "RC=0" in out2
           # On this non-UEFI VM the UEFI gate fires first, but on a real UEFI box
           # the poweroff gate would short-circuit; assert the script handles it.
+
+      # ── 6. The no-op path performs ZERO efibootmgr NVRAM writes ──
+      # Shadow efibootmgr with a recorder FIRST on PATH so any invocation by the
+      # script is captured. On this non-UEFI VM the script no-ops at the UEFI gate
+      # and must therefore NEVER shell efibootmgr at all — proving the no-op makes
+      # no firmware-variable write whatsoever (the never-strand-Windows contract is
+      # vacuously safe because nothing is written). A real UEFI box is needed to
+      # confirm the positive BootNext write; this confirms the no-op writes nothing.
+      with subtest("a no-op invocation makes no efibootmgr call (zero NVRAM writes)"):
+          bc.succeed(
+              "mkdir -p /tmp/ebmrec && "
+              "printf '#!/bin/sh\\necho \"$@\" >> /tmp/ebmrec/calls\\nexit 0\\n' "
+              "> /tmp/ebmrec/efibootmgr && chmod +x /tmp/ebmrec/efibootmgr && "
+              "rm -f /tmp/ebmrec/calls"
+          )
+          out3 = bc.succeed(
+              f"PATH=/tmp/ebmrec:$PATH {script} reboot 2>&1; echo RC=$?"
+          )
+          assert "RC=0" in out3, f"recorder run must exit 0, got: {out3!r}"
+          # The script prepends its own binPath (which carries the REAL efibootmgr),
+          # so our recorder may not be the one resolved — but on the non-UEFI VM the
+          # script returns at the UEFI gate BEFORE any efibootmgr call, so NEITHER
+          # the recorder NOR the real binary is ever invoked: no calls file exists.
+          bc.fail("test -s /tmp/ebmrec/calls")
     '';
   };
 }

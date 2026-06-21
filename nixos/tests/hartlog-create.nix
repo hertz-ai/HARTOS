@@ -105,6 +105,46 @@ in
           assert "RC=0" in out2
           assert "already exists" in out2 or "idempotent" in out2, \
               f"second run must be an idempotent no-op, got: {out2!r}"
+
+      # ── 6. A FULL disk (no trailing free space) is a clean no-op ──
+      # Wipe the stand-in + fill it with a single partition that consumes ALL the
+      # usable space, then DELETE the HARTLOG label-resolution so the idempotent
+      # gate doesn't short-circuit before the free-space gate. The carve must
+      # refuse (no usable tail) and exit 0 WITHOUT creating a second partition.
+      with subtest("a full disk (no trailing free space) is a clean no-op"):
+          hc.succeed(f"sgdisk --zap-all {disk}")
+          # --largest-new on a fresh disk grabs ALL usable space -> no free tail.
+          hc.succeed(f"sgdisk --largest-new=1 --change-name=1:FULLISO {disk}")
+          hc.succeed("udevadm settle || true")
+          n_before = hc.succeed(f"sgdisk -p {disk} | grep -cE '^ +[0-9]+ ' || true").strip()
+          out_full = hc.succeed(f"HART_HARTLOG_TEST_DISK={disk} hart-hartlog-create 2>&1; echo RC=$?")
+          assert "RC=0" in out_full, f"full-disk carve must exit 0, got: {out_full!r}"
+          assert ("no trailing free space" in out_full
+                  or "too small" in out_full
+                  or "ISO filled the stick" in out_full), \
+              f"full disk must no-op via the free-space gate, got: {out_full!r}"
+          # No HARTLOG appeared and the partition count is unchanged.
+          hc.fail("blkid -L HARTLOG")
+          n_after = hc.succeed(f"sgdisk -p {disk} | grep -cE '^ +[0-9]+ ' || true").strip()
+          assert n_after == n_before, \
+              f"full-disk no-op must not create a partition ({n_before} -> {n_after})"
+
+      # ── 7. The auto-detect path REFUSES the VM's non-removable boot disk ──
+      # Run WITHOUT the test seam so the script walks the live root to the VM's
+      # OWN boot disk (an internal, non-removable virtio disk — RM=0, TRAN!=usb).
+      # The single most important safety gate must refuse to repartition it and
+      # exit 0 cleanly. (This is the never-touch-an-internal-disk invariant.)
+      with subtest("the auto-detect path refuses a non-removable/internal boot disk"):
+          out_rm = hc.succeed("hart-hartlog-create 2>&1; echo RC=$?")
+          assert "RC=0" in out_rm, f"non-removable refusal must exit 0, got: {out_rm!r}"
+          # It either refused the internal disk outright, or bailed earlier (loop /
+          # unresolved backing device) — every branch here is a documented no-op
+          # and NONE of them may carve. The key invariant: no internal-disk carve.
+          assert ("not removable" in out_rm
+                  or "refusing to repartition an internal disk" in out_rm
+                  or "could not resolve" in out_rm
+                  or "loop device" in out_rm), \
+              f"expected a documented non-removable/no-resolve no-op, got: {out_rm!r}"
     '';
   };
 }

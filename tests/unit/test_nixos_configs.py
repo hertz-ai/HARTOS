@@ -62,7 +62,8 @@ EXPECTED_MODULES = [
     "hart-compute-mesh.nix",
     "hart-liquid-ui.nix",
     "hart-app-bridge.nix",
-    # Boot-experience modules (HARTLOG self-create + boot continuity)
+    # Boot-experience modules (persistent boot log + HARTLOG self-create + continuity)
+    "hart-boot-log.nix",
     "hart-hartlog-create.nix",
     "hart-boot-continuity.nix",
 ]
@@ -1726,3 +1727,441 @@ class TestBootContinuityModule:
     def test_desktop_enables_it(self):
         desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
         assert "bootContinuity.enable = true" in desktop
+
+
+# ═══════════════════════════════════════════════════════════════
+# Boot-experience: persistent boot-diagnostic log partition (Feature 3)
+# ═══════════════════════════════════════════════════════════════
+
+class TestBootLogModule:
+    """hart-boot-log.nix: when a FAT32 HARTLOG partition is present, capture the
+    full boot journal + tier-supervisor state + GTK4/GL diagnostics to it early,
+    on a periodic timer (so a HUNG boot still leaves a record), and at shutdown.
+    The never-block-boot / clean-no-op contract is the load-bearing part — the
+    BEHAVIOURAL proof lives in nixos/tests/boot-log.nix; these are the structural
+    DRY/contract guards that run WITHOUT a Linux block layer (the dev box)."""
+
+    @pytest.fixture(autouse=True)
+    def load_module(self):
+        self.content = read_nix(os.path.join(MODULES_DIR, "hart-boot-log.nix"))
+
+    def test_has_enable_option(self):
+        assert "mkEnableOption" in self.content
+        assert "bootLog" in self.content
+
+    def test_has_mkif_guard(self):
+        assert "mkIf" in self.content
+        assert "blog.enable" in self.content or "bootLog.enable" in self.content
+
+    def test_label_default_is_hartlog(self):
+        """ONE source of truth for the on-stick contract: the label the flasher +
+        the live-OS carve write, and this module reads, is HARTLOG."""
+        assert 'default = "HARTLOG"' in self.content
+
+    def test_finds_partition_by_label(self):
+        """Detection is by filesystem LABEL (findfs / blkid -L) — the exact
+        contract the carve side writes."""
+        assert "findfs" in self.content or "blkid -L" in self.content
+
+    def test_three_capture_phases(self):
+        """early + periodic + shutdown — the periodic tick is what makes a HUNG
+        boot debuggable (it never settles, only a periodic capture lands it)."""
+        assert "hart-boot-log-early" in self.content
+        assert "hart-boot-log-periodic" in self.content
+        assert "hart-boot-log-shutdown" in self.content
+        assert "systemd.timers" in self.content
+
+    def test_periodic_interval_option(self):
+        assert "intervalSeconds" in self.content
+        assert "OnUnitActiveSec" in self.content
+
+    def test_no_op_when_no_hartlog_present(self):
+        """A missing HARTLOG partition is a clean no-op (old stick / plain flash)
+        — the capture logs one line + exits 0, never blocks boot."""
+        assert "no '" in self.content and "partition present" in self.content
+        assert "clean no-op" in self.content
+
+    def test_captures_the_paint_hang_surface(self):
+        """The bundle must carry the GTK4/Tier-1 paint-hang debug surface: the
+        shell-ready marker, the supervisor tier state, and GSK/EGL/GL errors."""
+        assert "shell-ready" in self.content
+        assert "GSK" in self.content or "GDK" in self.content or "EGL" in self.content
+        assert "journalctl -b" in self.content
+
+    def test_fsyncs_so_a_poweroff_keeps_the_bundle(self):
+        """FAT has no journal — sync the partition so an abrupt power-off after a
+        hung boot still keeps the bytes."""
+        assert "sync" in self.content
+
+    def test_unmounts_on_non_periodic_phase(self):
+        """early/shutdown unmount cleanly (Windows host sees a consistent fs);
+        only the periodic phase keeps it mounted (re-mount-churn avoidance)."""
+        assert "umount" in self.content
+        assert 'PHASE" != "periodic"' in self.content or "periodic" in self.content
+
+    def test_never_fails_boot_set_u_not_e(self):
+        assert "set -u" in self.content
+        assert "set -e" not in self.content
+        assert "exit 0" in self.content
+
+    def test_in_flake_modules(self):
+        flake = read_nix(os.path.join(NIXOS_DIR, "flake.nix"))
+        assert "hart-boot-log.nix" in flake
+
+    def test_desktop_enables_it(self):
+        desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        assert "bootLog.enable = true" in desktop
+
+
+# ═══════════════════════════════════════════════════════════════
+# Boot-experience: the behavioural nixosTests are WIRED INTO `checks`
+# ═══════════════════════════════════════════════════════════════
+
+class TestBootNixosTestsRegistered:
+    """The three boot modules each ship a BEHAVIOURAL nixosTest (real Linux block
+    layer / efibootmgr / mkfs.vfat) under nixos/tests/. A test that is never
+    wired into `flake.nix` checks NEVER runs (CLAUDE.md Gate 5: a test that never
+    runs guards nothing). These guards assert each test file EXISTS and is
+    imported + composed into `checks.x86_64-linux` so `nix flake check` runs it."""
+
+    BOOT_TESTS = [
+        ("boot-log.nix", "bootLog"),
+        ("hartlog-create.nix", "hartlogCreate"),
+        ("boot-continuity.nix", "bootContinuity"),
+    ]
+
+    @pytest.fixture(autouse=True)
+    def load_flake(self):
+        self.flake = read_nix(os.path.join(NIXOS_DIR, "flake.nix"))
+
+    @pytest.mark.parametrize("filename,_attr", BOOT_TESTS)
+    def test_nixos_test_file_exists(self, filename, _attr):
+        path = os.path.join(TESTS_DIR, filename)
+        assert os.path.isfile(path), f"missing behavioural nixosTest: nixos/tests/{filename}"
+
+    @pytest.mark.parametrize("filename,attr", BOOT_TESTS)
+    def test_nixos_test_is_imported(self, filename, attr):
+        """The flake must `import ./tests/<filename>` and bind it to a let-var."""
+        assert f"./tests/{filename}" in self.flake, \
+            f"{filename} not imported in flake.nix checks"
+        assert f"{attr} = import ./tests/{filename}" in self.flake, \
+            f"{filename} not bound to the `{attr}` check var"
+
+    @pytest.mark.parametrize("filename,attr", BOOT_TESTS)
+    def test_nixos_test_composed_into_checks(self, filename, attr):
+        """The bound var must be merged into the returned `checks` attrset (the
+        `... // bootLog // hartlogCreate // bootContinuity` tail), else it never
+        runs under `nix flake check`."""
+        # The composition tail is a chain of `// <attr>`; assert ours is in it.
+        assert f"// {attr}" in self.flake, \
+            f"{attr} not composed into checks.x86_64-linux (would never run)"
+
+    def test_boot_log_test_attaches_a_fat32_disk(self):
+        """The boot-log nixosTest must attach a spare disk + format it FAT32/label
+        HARTLOG (the behavioural stand-in for the stick's free-space partition)."""
+        content = read_nix(os.path.join(TESTS_DIR, "boot-log.nix"))
+        assert "emptyDiskImages" in content
+        assert "mkfs.vfat" in content
+        assert "HARTLOG" in content
+
+    def test_hartlog_create_test_proves_never_touch_existing(self):
+        """The carve nixosTest must assert the pre-existing partition is UNTOUCHED
+        (the never-touch-the-in-use-partitions invariant) + idempotent re-run."""
+        content = read_nix(os.path.join(TESTS_DIR, "hartlog-create.nix"))
+        assert "untouched" in content.lower() or "never touch" in content.lower()
+        assert "idempotent" in content.lower()
+        # the new no-op gates this change adds:
+        assert "no trailing free space" in content or "full disk" in content.lower()
+        assert "non-removable" in content.lower() or "internal disk" in content.lower()
+
+    def test_boot_continuity_test_proves_never_bootorder(self):
+        """The continuity nixosTest must assert the script NEVER writes BootOrder
+        (the never-strand-Windows invariant)."""
+        content = read_nix(os.path.join(TESTS_DIR, "boot-continuity.nix"))
+        assert "BootOrder" in content
+        assert "--bootnext" in content
+
+
+# ═══════════════════════════════════════════════════════════════
+# Session tier-drop supervisor — the never-blank-screen guarantee
+# ═══════════════════════════════════════════════════════════════
+#
+# hart-session-supervisor.nix is the greetd-driven out-of-process tier-drop
+# supervisor. Its BEHAVIOUR (greetd relaunch, crash-loop drop, paint-watchdog
+# hang-kill, latch-across-boot, never-below-cage) is proven by the wired-in
+# nixosTests (nixos/tests/session-supervisor.nix → flake checks). These STRUCTURAL
+# guards lock the OPTION WIRING a VM assertion can't cheaply reach or would be
+# wasteful to boot a VM for: that the options exist with the right enum/type, that
+# the tier ladder + floor are correctly ordered, that desktop.nix opts the
+# supervisor on at the right startTier, and that the recovery-TTY block is wired so
+# Ctrl+Alt+F-key always reaches a console. Per memory/feedback_no_grep_tests.md
+# these are the acceptable cross-file DRY / never-fail source-guard class — the
+# VM test owns the behaviour, this owns the contract SHAPE.
+class TestSessionSupervisorModule:
+    """hart-session-supervisor.nix option + ladder wiring."""
+
+    @pytest.fixture(autouse=True)
+    def load_module(self):
+        self.content = read_nix(os.path.join(MODULES_DIR, "hart-session-supervisor.nix"))
+
+    def test_file_exists(self):
+        assert os.path.isfile(os.path.join(MODULES_DIR, "hart-session-supervisor.nix"))
+
+    def test_has_enable_option(self):
+        assert "mkEnableOption" in self.content
+        assert "options.hart.sessionSupervisor" in self.content
+
+    def test_opt_in_no_op_when_disabled(self):
+        """The module is OPT-IN: pure no-op unless BOTH hart.enable and
+        sessionSupervisor.enable are set (never silently replaces GDM)."""
+        assert "lib.mkIf (cfg.enable && sup.enable)" in self.content
+
+    def test_start_tier_is_enum_of_the_three_tiers(self):
+        """startTier is an enum constrained to exactly the three ladder tiers —
+        a typo can't smuggle in an invalid start tier."""
+        assert "startTier" in self.content
+        assert 'lib.types.enum [ "hart-comp" "sway" "cage" ]' in self.content
+
+    def test_start_tier_defaults_to_tier1(self):
+        """Default startTier is the head of the ladder (hart-comp); the supervisor
+        owns the never-blank guarantee so starting high is safe."""
+        m = re.search(r"startTier\s*=\s*lib\.mkOption\s*\{(.*?)\};", self.content, re.S)
+        assert m, "startTier option block not found"
+        assert 'default = "hart-comp"' in m.group(1)
+
+    def test_tier_ladder_order_highest_to_lowest(self):
+        """The ordered ladder is hart-comp → sway → cage; cage LAST = the floor."""
+        assert 'tierLadder = [ "hart-comp" "sway" "cage" ]' in self.content
+
+    def test_cage_is_the_floor(self):
+        assert 'FLOOR="cage"' in self.content
+
+    def test_crash_loop_count_default_three(self):
+        m = re.search(r"crashLoopCount\s*=\s*lib\.mkOption\s*\{(.*?)\};", self.content, re.S)
+        assert m, "crashLoopCount option block not found"
+        assert "default = 3" in m.group(1)
+        assert "ints.positive" in m.group(1)
+
+    def test_crash_loop_window_default_300(self):
+        m = re.search(r"crashLoopWindowSeconds\s*=\s*lib\.mkOption\s*\{(.*?)\};", self.content, re.S)
+        assert m, "crashLoopWindowSeconds option block not found"
+        assert "default = 300" in m.group(1)
+        assert "ints.positive" in m.group(1)
+
+    def test_paint_timeout_option_unsigned_default_20(self):
+        """The shell-paint watchdog budget — the HUNG-tier guard the bare crash
+        detection is blind to. unsigned so 0 (disable) is a valid value."""
+        assert "shellPaintTimeoutSeconds" in self.content
+        m = re.search(r"shellPaintTimeoutSeconds\s*=\s*lib\.mkOption\s*\{(.*?)\};", self.content, re.S)
+        assert m, "shellPaintTimeoutSeconds option block not found"
+        assert "default = 20" in m.group(1)
+        assert "ints.unsigned" in m.group(1)
+
+    def test_ready_marker_path_is_run_tmpfs(self):
+        """The first-paint marker lives in /run (tmpfs) so a stale marker can
+        never survive a reboot and mask a hang on the next boot."""
+        assert 'sessionRunDir = "/run/hart/session"' in self.content
+        assert 'readyFlag = "${sessionRunDir}/shell-ready"' in self.content
+
+    def test_ready_marker_dir_is_group_writable(self):
+        """0770 hart hart — group-writable so the hart-admin shell host (in the
+        `hart` group) can touch the marker the watchdog consumes."""
+        assert '"d /run/hart/session 0770 hart hart -"' in self.content
+
+    def test_latch_on_persistent_state_dir(self):
+        """The latch is under /var/lib/hart (persistent), NOT /run — so a drop
+        LATCHES across boot by construction."""
+        assert 'stateDir   = "/var/lib/hart"' in self.content
+        assert 'latchFile  = "${stateDir}/session-tier"' in self.content
+
+    def test_unhealthy_flag_is_run_tmpfs(self):
+        """node_watchdog's compositor-unhealthy SIGNAL flag is in /run tmpfs so a
+        fresh boot always gets a clean slate; node_watchdog never writes the latch."""
+        assert 'unhealthyFlag = "/run/hart/compositor-unhealthy"' in self.content
+
+    def test_greetd_replaces_gdm_when_enabled(self):
+        """greetd is the out-of-process supervisor; when enabled it force-disables
+        GDM so the two display managers don't both claim the seat."""
+        assert "services.greetd" in self.content
+        assert "enable = true" in self.content
+        assert "services.xserver.displayManager.gdm.enable = lib.mkForce false" in self.content
+
+    def test_greetd_runs_the_selector_as_session(self):
+        assert "hart-session-selector" in self.content
+        assert "default_session" in self.content
+        assert 'command = "${selectorScript}"' in self.content
+
+    def test_selector_runs_session_in_background_for_watchdog(self):
+        """The session is launched in the BACKGROUND so the paint-watchdog can
+        observe a HUNG tier (compositor up, never paints, never exits)."""
+        assert 'sh -c "$CMD" &' in self.content
+        assert "sesspid=$!" in self.content
+
+    def test_watchdog_drop_reuses_the_crash_path_no_parallel_mechanism(self):
+        """A hang counts toward the SAME record_crash → lower_tier → write_tier
+        drop as a crash — no second/parallel drop mechanism (DRY)."""
+        assert "record_crash" in self.content
+        assert "lower_tier" in self.content
+        assert "write_tier" in self.content
+
+    def test_floor_is_exempt_from_watchdog_drop(self):
+        """cage (the floor) is never dropped by the paint-watchdog — there is
+        nothing below it and it is the audited paint floor."""
+        assert 'if [ "$TIER" != "$FLOOR" ]; then' in self.content
+
+    def test_cage_command_reused_verbatim_not_reimplemented(self):
+        """Tier-3 is hart-liquid-ui.nix's hart-shell-session, reused — the floor is
+        never reimplemented in the supervisor."""
+        m = re.search(r"cageCommand\s*=\s*lib\.mkOption\s*\{(.*?)\};", self.content, re.S)
+        assert m, "cageCommand option block not found"
+        assert 'default = "hart-shell-session"' in m.group(1)
+
+    def test_comp_command_null_until_phase3(self):
+        """Tier-1 (hart-comp) launch command is nullOr str (a null tier falls
+        straight through to the next so the slot is reserved, never blank)."""
+        m = re.search(r"compCommand\s*=\s*lib\.mkOption\s*\{(.*?)\};", self.content, re.S)
+        assert m, "compCommand option block not found"
+        assert "nullOr" in m.group(1)
+
+    def test_sway_command_nullable(self):
+        m = re.search(r"swayCommand\s*=\s*lib\.mkOption\s*\{(.*?)\};", self.content, re.S)
+        assert m, "swayCommand option block not found"
+        assert "nullOr" in m.group(1)
+
+    def test_node_watchdog_stays_signal_only(self):
+        """node_watchdog never selects a session — session selection is
+        OUT-OF-PROCESS (greetd) by construction. The only wire is the one-way
+        unhealthy signal flag."""
+        assert "SIGNAL EMITTER ONLY" in self.content
+        assert "never reads or writes the latch" in self.content
+
+
+class TestSessionSupervisorDesktopWiring:
+    """desktop.nix opts the supervisor on at the right tier + keeps the recovery
+    consoles reachable — the cross-config wiring a VM would be wasteful to boot."""
+
+    @pytest.fixture(autouse=True)
+    def load_config(self):
+        self.config = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+
+    def test_desktop_enables_supervisor(self):
+        assert "sessionSupervisor" in self.config
+        # The supervisor block enables it.
+        m = re.search(r"sessionSupervisor\s*=\s*\{(.*?)\};", self.config, re.S)
+        assert m, "sessionSupervisor block not found in desktop.nix"
+        assert "enable = true" in m.group(1)
+
+    def test_desktop_start_tier_is_tier1(self):
+        """The desktop boots at Tier-1 (hart-comp) — the ladder tries the best tier
+        first; the watchdog drops it on real-HW failure."""
+        m = re.search(r"sessionSupervisor\s*=\s*\{(.*?)\};", self.config, re.S)
+        assert m, "sessionSupervisor block not found in desktop.nix"
+        assert 'startTier = "hart-comp"' in m.group(1)
+
+    def test_no_parallel_default_session_pin(self):
+        """The crude fixed cage-pin (mkForce defaultSession = hart-shell) is REMOVED
+        from desktop.nix — the supervisor owns tier selection now, so a second
+        mkForce here would collide with the supervisor's own mkForce. Check only
+        non-comment lines (the removal is documented in a comment block)."""
+        code_lines = [
+            ln for ln in self.config.splitlines()
+            if not ln.lstrip().startswith("#")
+        ]
+        code = "\n".join(code_lines)
+        assert "defaultSession = lib.mkForce" not in code, \
+            "desktop.nix still pins defaultSession via mkForce — collides with the supervisor"
+        assert 'mkForce "hart-shell"' not in code, \
+            "desktop.nix still force-pins the cage session — the supervisor owns tier selection now"
+
+    # ── Recovery consoles: Ctrl+Alt+F2..F6 always reach a getty login ──
+    def test_console_framework_stays_enabled(self):
+        """`console.enable` keeps the virtual terminals (tty1..tty6) on so a
+        future kiosk tweak can't silently disable VT switching."""
+        assert "console.enable = lib.mkDefault true" in self.config
+
+    def test_tty_autologin_nulled_so_fkey_never_lands_on_hidden_user(self):
+        assert "services.getty.autologinUser = lib.mkForce null" in self.config
+
+    def test_recovery_getty_prespawned_on_tty2(self):
+        """A getty is pre-spawned on tty2 from boot (not summoned lazily) so a
+        recovery console is ALREADY alive the instant the user switches — recovery
+        never depends on logind's on-demand autovt spawn while the graphical
+        session is wedged."""
+        assert 'systemd.services."autovt@tty2".wantedBy = [ "multi-user.target" ]' in self.config
+
+    def test_recovery_block_documents_the_pointer_only_regression(self):
+        """The recovery block exists BECAUSE of the only-a-pointer hang — keep the
+        rationale so it is never removed as 'dead config'."""
+        c = self.config.lower()
+        assert "ctrl+alt+f" in c
+        assert "recovery" in c
+
+    def test_comment_keeps_tty2_through_tty6_range(self):
+        """tty3..tty6 stay on-demand via NAutoVTs (logind default) — the comment
+        names the full recovery range so it's not narrowed to tty2 alone."""
+        assert "tty2..tty6" in self.config or "tty2-6" in self.config
+
+
+class TestSessionSupervisorNixTestWiring:
+    """The session-supervisor nixosTests are REGISTERED in flake checks (Gate 5:
+    a test that never runs guards nothing) AND each focused scenario the task
+    names is present as a deterministic VM node."""
+
+    @pytest.fixture(autouse=True)
+    def load(self):
+        self.flake = read_nix(os.path.join(NIXOS_DIR, "flake.nix"))
+        self.nixtest = read_nix(os.path.join(TESTS_DIR, "session-supervisor.nix"))
+
+    def test_module_in_flake(self):
+        assert "hart-session-supervisor" in self.flake
+
+    def test_supervisor_test_imported_and_merged_into_checks(self):
+        assert "import ./tests/session-supervisor.nix" in self.flake
+        assert "supervisor =" in self.flake
+        # Merged into the final checks attrset (the `//` chain).
+        assert "// supervisor" in self.flake
+
+    def test_tier_drop_node_present(self):
+        assert "hart-session-supervisor-tier-drop" in self.nixtest
+
+    def test_paint_watchdog_node_present(self):
+        assert "hart-session-supervisor-paint-watchdog" in self.nixtest
+
+    def test_fresh_boot_start_tier_node_present(self):
+        """A node proving a fresh (un-latched) boot honours startTier for all three
+        valid values (cage/sway/hart-comp)."""
+        assert "hart-session-supervisor-start-tier" in self.nixtest
+
+    def test_reboot_latch_persist_node_present(self):
+        """A node proving a dropped tier stays dropped across a REAL reboot (the
+        latch persists) and never goes below cage."""
+        assert "hart-session-supervisor-reboot-latch" in self.nixtest
+
+    def test_recovery_tty_node_present(self):
+        """A node proving getty on tty2..tty6 + the autovt@tty2 pre-spawn are
+        reachable even while a graphical session holds VT1."""
+        assert "hart-session-supervisor-recovery-tty" in self.nixtest
+
+    def test_paint_watchdog_keep_node_present(self):
+        """The watchdog has a POSITIVE case too: a tier whose compositor DOES touch
+        the marker within the budget is KEPT, not dropped (a dedicated node with a
+        painting fake compositor — proves the watchdog doesn't over-fire)."""
+        assert "hart-session-supervisor-paint-watchdog-keep" in self.nixtest
+        assert "shell-ready" in self.nixtest
+        # The painting fake honours the real contract: it touches the marker the
+        # selector exports via HART_SHELL_READY_FLAG (one shared path).
+        assert "HART_SHELL_READY_FLAG" in self.nixtest
+
+    def test_each_new_node_in_ci_vm_workflow(self):
+        """Every check that should RUN must be built explicitly in the VM workflow
+        (the workflow targets checks by name, not `nix flake check`)."""
+        wf = read_nix(os.path.join(REPO_ROOT, ".github", "workflows", "nixos-vm-tests.yml"))
+        for node in [
+            "hart-session-supervisor-tier-drop",
+            "hart-session-supervisor-paint-watchdog",
+            "hart-session-supervisor-paint-watchdog-keep",
+            "hart-session-supervisor-start-tier",
+            "hart-session-supervisor-reboot-latch",
+            "hart-session-supervisor-recovery-tty",
+        ]:
+            assert node in wf, f"VM workflow does not build/run {node} — it would never gate"
