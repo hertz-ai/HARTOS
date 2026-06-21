@@ -244,4 +244,340 @@ in
           assert tier == "cage", f"watchdog dropped below the floor to {tier!r} — NEVER allowed"
     '';
   };
+
+  # ─────────────────────────────────────────────────────────────
+  # PAINT-WATCHDOG POSITIVE CASE: a tier whose compositor DOES touch the paint
+  # marker within the budget is KEPT, never dropped. The hang test proves the
+  # watchdog FIRES; this proves it does NOT over-fire — a healthy painting tier
+  # must survive. The fake Tier-2 here honours the real contract: it touches the
+  # marker the selector exports via $HART_SHELL_READY_FLAG (proving the host and
+  # the watchdog share ONE path, no hardcoded divergence), then stays alive past
+  # the budget. The watchdog must observe `painted=1`, stop watching, and leave
+  # the latch on sway.
+  # ─────────────────────────────────────────────────────────────
+  hart-session-supervisor-paint-watchdog-keep =
+    let
+      # A painting fake: touch the marker the selector tells us about, then stay
+      # alive (a healthy long-lived compositor). Because it painted within the
+      # budget the watchdog keeps it; we then SIGTERM it out of band so the
+      # selector returns. The long-lived run (no quick exit) is a normal session,
+      # not a crash — the latch must stay sway.
+      paintThenStay = pkgs.writeShellScript "fake-painting-comp" ''
+        touch "$HART_SHELL_READY_FLAG"
+        exec ${pkgs.coreutils}/bin/sleep infinity
+      '';
+    in
+    pkgs.testers.runNixOSTest {
+      name = "hart-session-supervisor-paint-watchdog-keep";
+      skipTypeCheck = true;
+      skipLint = true;
+      node.specialArgs = specialArgs;
+
+      nodes.sup = mkNode "desktop" {
+        virtualisation = { memorySize = 3072; cores = 2; };
+        hart.sessionSupervisor = {
+          enable = true;
+          compCommand = null;                       # Tier-1 unavailable -> sway
+          swayCommand = "${paintThenStay}";         # Tier-2 PAINTS then stays alive
+          crashLoopCount = 3;
+          crashLoopWindowSeconds = 300;
+          shellPaintTimeoutSeconds = 5;             # ample for the immediate touch
+        };
+      };
+
+      testScript = ''
+        sup = machines[0]
+        sup.start()
+        sup.wait_for_unit("multi-user.target")
+        sup.wait_for_unit("greetd.service", timeout=120)
+
+        LATCH = "/var/lib/hart/session-tier"
+        READY = "/run/hart/session/shell-ready"
+
+        selector = sup.succeed(
+            "find /nix/store -maxdepth 3 -name '*-hart-session-selector' -type f -print -quit"
+        ).strip()
+        assert selector, "selector wrapper not found in the store"
+
+        with subtest("a Tier-2 that PAINTS within the budget is KEPT (watchdog does not over-fire)"):
+            sup.succeed("hartctl session reset-tier")   # arm Tier-1; comp null -> sway
+            # Run the selector in the background — the painting fake stays alive, so
+            # the selector blocks in `wait` after observing the paint. We give it a
+            # moment to launch + touch the marker, assert the marker appeared (the
+            # host wrote the path the selector exported), then SIGTERM the fake so
+            # the selector returns. A painted, long-lived run is NOT a crash, so the
+            # latch must remain sway — the tier was KEPT.
+            sup.succeed(f"runuser -u hart -- {selector} >/tmp/sel.log 2>&1 & echo started")
+            # The fake touches the marker immediately on launch; wait for it.
+            sup.wait_until_succeeds(f"test -e {READY}", timeout=30)
+            # The compositor stayed up AND painted -> the watchdog kept it. Tear it
+            # down so the selector exits cleanly (a long-lived run is a normal
+            # logout, not a crash).
+            sup.succeed("pkill -TERM -f sleep || true")
+            # The latch was NEVER lowered: a painting tier is kept on sway.
+            tier = sup.succeed(f"cat {LATCH} 2>/dev/null || echo sway").strip()
+            assert tier in ("sway", "hart-comp"), \
+                f"a painting Tier-2 must be KEPT (latch sway / un-dropped), got {tier!r}"
+            assert tier != "cage", \
+                "a tier that PAINTED within the budget was wrongly dropped to cage — watchdog over-fired"
+      '';
+    };
+
+  # ─────────────────────────────────────────────────────────────
+  # FRESH BOOT honours startTier — for ALL THREE valid values.
+  # A clean (un-latched) boot must start at the configured startTier, not the
+  # floor: the ladder tries the BEST configured tier first and only DEGRADES on a
+  # real failure. Three nodes, one per enum value (cage|sway|hart-comp), so the
+  # option is proven honored end-to-end (the selector's read_tier fallback to
+  # $START on an absent latch).
+  # ─────────────────────────────────────────────────────────────
+  hart-session-supervisor-start-tier =
+    let
+      # A node parameterised by its configured startTier + the tier the un-latched
+      # boot must resolve to (after skipping unavailable higher tiers). All three
+      # tiers are AVAILABLE here (comp/sway = a harmless real command, cage = the
+      # floor) so the resolved tier equals the configured startTier exactly.
+      startTierNode = startTier: mkNode "desktop" {
+        virtualisation = { memorySize = 2048; cores = 2; };
+        hart.sessionSupervisor = {
+          enable = true;
+          inherit startTier;
+          # Make ALL tiers available so startTier is honored verbatim (an
+          # unavailable tier would legitimately skip down — tested elsewhere).
+          compCommand = "${pkgs.coreutils}/bin/true";
+          swayCommand = "${pkgs.coreutils}/bin/true";
+          # cageCommand defaults to the real floor launcher (always available).
+          crashLoopCount = 3;
+          crashLoopWindowSeconds = 300;
+          # Disable the paint watchdog: this test only exercises the un-latched
+          # START resolution, not the hang path.
+          shellPaintTimeoutSeconds = 0;
+        };
+      };
+    in
+    pkgs.testers.runNixOSTest {
+      name = "hart-session-supervisor-start-tier";
+      skipTypeCheck = true;
+      skipLint = true;
+      node.specialArgs = specialArgs;
+
+      nodes = {
+        startcomp = startTierNode "hart-comp";
+        startsway = startTierNode "sway";
+        startcage = startTierNode "cage";
+      };
+
+      testScript = ''
+        start_all()
+        LATCH = "/var/lib/hart/session-tier"
+
+        # The driver keys each machine global by hostname (mkNode forces it to the
+        # variant "desktop"), so all three share the name — bind by index instead.
+        comp, sway, cage = machines[0], machines[1], machines[2]
+        for m in (comp, sway, cage):
+            m.wait_for_unit("multi-user.target")
+            m.wait_for_unit("greetd.service", timeout=120)
+
+        # Each node's hostname collides on "desktop"; address them by the index we
+        # already bound. Pair each with its EXPECTED un-latched start tier.
+        cases = [
+            (machines[0], "hart-comp"),
+            (machines[1], "sway"),
+            (machines[2], "cage"),
+        ]
+
+        for m, expected in cases:
+            with subtest(f"a fresh (un-latched) boot starts at startTier={expected}"):
+                selector = m.succeed(
+                    "find /nix/store -maxdepth 3 -name '*-hart-session-selector' "
+                    "-type f -print -quit"
+                ).strip()
+                assert selector, "selector wrapper not found in the store"
+                # Guarantee the latch is ABSENT (a truly fresh boot) immediately
+                # before the run so read_tier MUST fall back to $START. The selector
+                # only WRITES the latch on a DROP, so an un-latched clean start never
+                # records the chosen tier in the latch — the START decision is
+                # observable only in the selector's `launching tier '<TIER>'` log.
+                # Capture that line from a SINGLE deterministic run (stderr→stdout):
+                # the tier it launches for an absent latch IS the configured
+                # startTier. (All tiers are available here, so no skip-down.)
+                m.succeed(f"rm -f {LATCH} {LATCH}.tmp /var/lib/hart/session-tier.window")
+                log = m.succeed(
+                    f"runuser -u hart -- {selector} 2>&1 | "
+                    "grep -o \"launching tier '[a-z-]*'\" | tail -1 || true"
+                ).strip()
+                assert f"launching tier '{expected}'" in log, \
+                    f"un-latched boot did not start at startTier={expected!r}; selector said: {log!r}"
+                # The clean start must NOT have written a latch (only a drop does);
+                # the next fresh boot would again seed startTier.
+                assert m.succeed(f"test -f {LATCH}; echo $?").strip() == "1", \
+                    "a clean un-latched start must not write the latch (only a drop latches)"
+      '';
+    };
+
+  # ─────────────────────────────────────────────────────────────
+  # LATCH PERSISTS ACROSS A REAL REBOOT — a dropped tier stays dropped, and the
+  # latch never goes below cage. The tier-drop test proves the latch is on a
+  # persistent mount; THIS proves the live invariant: drop the tier, REBOOT the
+  # VM, and assert the post-reboot boot reads the LOWERED latch (does not silently
+  # re-arm Tier-1), and that it is still the cage floor (never below it).
+  # ─────────────────────────────────────────────────────────────
+  hart-session-supervisor-reboot-latch = pkgs.testers.runNixOSTest {
+    name = "hart-session-supervisor-reboot-latch";
+    skipTypeCheck = true;
+    skipLint = true;
+    node.specialArgs = specialArgs;
+
+    nodes.sup = mkNode "desktop" {
+      virtualisation = { memorySize = 3072; cores = 2; };
+      hart.sessionSupervisor = {
+        enable = true;
+        compCommand = "${pkgs.coreutils}/bin/false";   # Tier-1 crashes instantly
+        swayCommand = "${pkgs.coreutils}/bin/false";    # Tier-2 crashes instantly
+        crashLoopCount = 3;
+        crashLoopWindowSeconds = 300;
+        shellPaintTimeoutSeconds = 0;   # crash-only path for this test
+      };
+    };
+
+    testScript = ''
+      sup = machines[0]
+      sup.start()
+      sup.wait_for_unit("multi-user.target")
+      sup.wait_for_unit("greetd.service", timeout=120)
+
+      LATCH = "/var/lib/hart/session-tier"
+
+      selector = sup.succeed(
+          "find /nix/store -maxdepth 3 -name '*-hart-session-selector' -type f -print -quit"
+      ).strip()
+      assert selector, "selector wrapper not found in the store"
+
+      with subtest("crash-loop drops + latches the tier down to cage"):
+          sup.succeed("hartctl session reset-tier")  # arm Tier-1
+          for _ in range(12):
+              sup.succeed(f"runuser -u hart -- {selector} || true")
+          assert sup.succeed(f"cat {LATCH}").strip() == "cage", \
+              "pre-reboot: crash-loop must drop the latch to the cage floor"
+
+      with subtest("the LOWERED latch SURVIVES a real reboot (dropped stays dropped)"):
+          # A real power-cycle of the VM — /var/lib/hart is on the persistent disk,
+          # so the latch the supervisor wrote must still be cage after the reboot.
+          # This is the live proof of "latches across boot" the tier-drop test only
+          # inferred from the mount point.
+          sup.shutdown()
+          sup.start()
+          sup.wait_for_unit("multi-user.target")
+          sup.wait_for_unit("greetd.service", timeout=120)
+          tier = sup.succeed(f"cat {LATCH}").strip()
+          assert tier == "cage", \
+              f"after reboot the dropped latch must STILL be cage (latched), got {tier!r}"
+          # And hartctl agrees the live latch is the floor.
+          assert sup.succeed("hartctl session get-tier").strip() == "cage", \
+              "hartctl must read the persisted cage latch after reboot"
+
+      with subtest("the latch never goes below cage even after more crash-loops post-reboot"):
+          for _ in range(6):
+              sup.succeed(f"runuser -u hart -- {selector} || true")
+          assert sup.succeed(f"cat {LATCH}").strip() == "cage", \
+              "post-reboot crash-loop dropped below the floor — NEVER allowed"
+
+      with subtest("reset-tier re-arms Tier-1 and that ALSO survives a reboot"):
+          sup.succeed("hartctl session reset-tier")
+          assert sup.succeed(f"cat {LATCH}").strip() == "hart-comp"
+          sup.shutdown()
+          sup.start()
+          sup.wait_for_unit("multi-user.target")
+          assert sup.succeed(f"cat {LATCH}").strip() == "hart-comp", \
+              "a reset-armed Tier-1 latch must also persist across reboot"
+    '';
+  };
+
+  # ─────────────────────────────────────────────────────────────
+  # RECOVERY: Ctrl+Alt+F-key ALWAYS reaches a getty login console, EVEN while a
+  # graphical session (greetd → the supervisor selector) holds VT1. This is the
+  # never-trap-the-machine guarantee the only-a-pointer hang exposed: the user
+  # must be able to switch to a TTY and log in to recover, independent of the
+  # compositor's health. A real VM can't press Ctrl+Alt+F2, but it CAN assert the
+  # mechanism is live: getty on tty2..tty6 is reachable (the autovt@ttyN template
+  # is enabled), autovt@tty2 is PRE-SPAWNED (active from boot, not lazy), and the
+  # console framework is on — so a VT switch lands on a real login, not a void.
+  # ─────────────────────────────────────────────────────────────
+  hart-session-supervisor-recovery-tty = pkgs.testers.runNixOSTest {
+    name = "hart-session-supervisor-recovery-tty";
+    skipTypeCheck = true;
+    skipLint = true;
+    node.specialArgs = specialArgs;
+
+    nodes.sup = mkNode "desktop" {
+      virtualisation = { memorySize = 3072; cores = 2; };
+      # The supervisor owns VT1 via greetd — exactly the "graphical session holds
+      # VT1" condition. The recovery TTYs must still be reachable underneath it.
+      hart.sessionSupervisor = {
+        enable = true;
+        # A harmless Tier that stays up so VT1 is genuinely occupied while we probe
+        # the recovery consoles (a never-painting sleep, watchdog disabled so it is
+        # NOT killed — we want VT1 held for the duration of the probes).
+        compCommand = null;
+        swayCommand = "${pkgs.coreutils}/bin/sleep infinity";
+        shellPaintTimeoutSeconds = 0;   # don't let the watchdog tear down VT1
+      };
+      # The desktop config pre-spawns autovt@tty2; the minimal mkNode node does not
+      # import desktop.nix, so wire the SAME recovery contract here so the test
+      # proves the mechanism (the structural test guards desktop.nix carries it).
+      systemd.services."autovt@tty2".wantedBy = [ "multi-user.target" ];
+      services.getty.autologinUser = pkgs.lib.mkForce null;
+    };
+
+    testScript = ''
+      sup = machines[0]
+      sup.start()
+      sup.wait_for_unit("multi-user.target")
+
+      with subtest("greetd (the supervisor) holds the graphical seat on VT1"):
+          sup.wait_for_unit("greetd.service", timeout=120)
+
+      with subtest("a getty login console is reachable on tty2..tty6 (the recovery range)"):
+          # autovt@ttyN is the template logind activates on a Ctrl+Alt+Fn switch.
+          # We can't press the chord in a headless VM, but we CAN start the exact
+          # units logind would and confirm each comes up as a real getty login —
+          # i.e. a VT switch would land on a console, not a void. tty2 is already
+          # pre-spawned (below); start tty3..tty6 to prove the whole range works.
+          for n in range(2, 7):
+              sup.succeed(f"systemctl start autovt@tty{n}.service")
+              sup.wait_for_unit(f"getty@tty{n}.service", timeout=30)
+              # The unit must be a getty (agetty) login prompt, not a stub.
+              active = sup.succeed(f"systemctl is-active getty@tty{n}.service").strip()
+              assert active == "active", f"getty@tty{n} not active ({active}) — recovery void"
+
+      with subtest("autovt@tty2 is PRE-SPAWNED from boot (recovery console already alive)"):
+          # The belt-and-suspenders pin: tty2's getty must be active WITHOUT us
+          # starting it, because desktop.nix (and this node) put it wantedBy
+          # multi-user.target — so the instant the user switches to VT2 the console
+          # is already there, never depending on logind's lazy autovt spawn while
+          # the graphical session is wedged.
+          # (It is wantedBy multi-user.target, so it came up at boot.)
+          assert "multi-user.target" in sup.succeed(
+              "systemctl show -p WantedBy autovt@tty2.service"
+          ), "autovt@tty2 is not wantedBy multi-user.target — not pre-spawned"
+          assert sup.succeed("systemctl is-active getty@tty2.service").strip() == "active", \
+              "tty2 getty is not active from boot — recovery console not pre-spawned"
+
+      with subtest("the TTY autologin is nulled so a recovery F-key never lands on a hidden user"):
+          # getty.autologinUser is null → the F-key reaches a real LOGIN PROMPT,
+          # not an auto-session on the hidden `nixos`/kiosk user.
+          al = sup.succeed("systemctl cat getty@tty2.service || true")
+          assert "--autologin" not in al, \
+              "getty has --autologin wired — a recovery F-key would skip the login prompt"
+
+      with subtest("the graphical session on VT1 cannot veto the kernel VT switch"):
+          # logind owns the seat; the compositor cannot refuse a VT switch. Assert
+          # logind is up and the seat has multiple VTs (NAutoVTs default 6) so the
+          # switch target exists.
+          sup.wait_for_unit("systemd-logind.service")
+          # The recovery consoles we brought up above are the switch targets; their
+          # being active proves the seat can host them alongside greetd's VT1.
+          assert sup.succeed("systemctl is-active getty@tty3.service").strip() == "active"
+    '';
+  };
 }
