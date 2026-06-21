@@ -308,12 +308,62 @@ def _get_log_path() -> str:
         )
 
 
+# PERF-2 (audit): this writer reached ~196MB — unbounded append + buffering=1
+# (a flush syscall per line).  Bound it through ONE canonical rotation point
+# (no parallel rotation path).  We deliberately KEEP the full request body — the
+# forensic value the live diagnosis flow relies on — and only (a) cap the file
+# and (b) drop the per-line flush.  Recent forensics survive in the live file +
+# one .old backup (~2x cap).  Override the cap with HEVOLVE_LLM_OUTBOUND_MAX_MB.
+def _max_outbound_log_bytes() -> int:
+    try:
+        mb = int(os.environ.get('HEVOLVE_LLM_OUTBOUND_MAX_MB', '') or 20)
+    except ValueError:
+        mb = 20
+    return max(1, mb) * 1024 * 1024
+
+
+def _rotate_if_oversized(path: str, max_bytes: int | None = None) -> bool:
+    """Rename ``path`` → ``path + '.old'`` when it exceeds ``max_bytes``.
+
+    Best-effort, never raises; one backup generation (prior .old overwritten).
+    Returns True iff a rotation happened.  SOLE rotation impl for this writer —
+    callers must not re-implement it (DRY / no parallel path)."""
+    if max_bytes is None:
+        max_bytes = _max_outbound_log_bytes()
+    try:
+        if os.path.getsize(path) <= max_bytes:
+            return False
+    except OSError:
+        return False  # missing / unstatable → nothing to rotate
+    try:
+        os.replace(path, path + '.old')
+        return True
+    except OSError:
+        return False
+
+
+def _close_handle() -> None:
+    """Close + drop the cached handle so the next ``_open_log_handle`` reopens
+    (and rotates via ``_rotate_if_oversized`` there if oversized)."""
+    global _file_handle
+    try:
+        if _file_handle is not None and not getattr(_file_handle, 'closed', True):
+            _file_handle.close()
+    except OSError:
+        pass
+    _file_handle = None
+
+
 def _open_log_handle():
     global _file_handle
     if _file_handle is None or getattr(_file_handle, 'closed', True):
         path = _get_log_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        _file_handle = open(path, 'a', encoding='utf-8', buffering=1)
+        _rotate_if_oversized(path)  # PERF-2: bound before (re)open
+        # Default buffering (was buffering=1 → flush per line).  A post-hoc
+        # forensic log has no live readers, so per-line durability is wasted
+        # syscalls; the process-exit close + OS flush preserve the tail.
+        _file_handle = open(path, 'a', encoding='utf-8')
     return _file_handle
 
 
@@ -615,6 +665,16 @@ def log_outbound(body: dict, *,
         with _file_lock:
             fh = _open_log_handle()
             fh.write(line)
+            # PERF-2: bound WITHIN a long session too (handle is opened once and
+            # reused, so a pre-open-only guard wouldn't help a multi-hour desktop
+            # run).  tell() is the cheap in-stream position (no extra stat).  At
+            # the cap, close so the NEXT call rotates + reopens — reusing the one
+            # _rotate_if_oversized in _open_log_handle (no parallel rotation).
+            try:
+                if fh.tell() >= _max_outbound_log_bytes():
+                    _close_handle()
+            except OSError:
+                pass
     except Exception as e:
         logger.debug("log_outbound failed: %s", e)
 
