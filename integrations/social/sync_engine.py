@@ -107,6 +107,20 @@ class SyncEngine:
             return None
 
     @staticmethod
+    def _signed_send_payload(node_id, batch) -> dict:
+        """P4: the up-sync batch envelope, signed with the node's key so central
+        can verify WHICH node sent it (closes the hierarchy_sync ingress IDOR).
+        Signing is best-effort — an unsigned batch still applies outside 'hard'
+        enforcement (the central-side _verify_sync_sender gate decides)."""
+        payload = {'items': batch, 'node_id': node_id}
+        try:
+            from security.node_integrity import sign_json_payload
+            payload['signature'] = sign_json_payload(payload)
+        except Exception:
+            pass
+        return payload
+
+    @staticmethod
     def drain_queue(db, node_id: str, target_url: str, batch_size: int = 50) -> Dict:
         """Send queued operations to target. Returns counts."""
         from .models import SyncQueue
@@ -151,7 +165,10 @@ class SyncEngine:
         # Send batch — E2E encrypt if target has X25519 key
         sent = 0
         failed = 0
-        send_payload = {'items': batch, 'node_id': node_id}
+        # P4: sign the batch so central can verify WHICH node sent it (closes the
+        # unauthenticated hierarchy_sync ingress IDOR). Signed before any E2E wrap
+        # so the signature rides inside the envelope.
+        send_payload = SyncEngine._signed_send_payload(node_id, batch)
         try:
             target_x25519 = SyncEngine._get_target_x25519(db, target_url)
             if target_x25519:
