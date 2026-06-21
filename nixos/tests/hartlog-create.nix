@@ -12,8 +12,11 @@
 # create script the module installs, and asserts:
 #   - a NEW HARTLOG FAT32 partition appeared in the free space,
 #   - the pre-existing "ISO" partition is UNTOUCHED (same start/size/uuid),
+#   - the decision is logged LOUDLY to /run/hart/hartlog-create.status,
 #   - a second run is an idempotent no-op (HARTLOG already exists),
-#   - a FULL disk (no free space) is a clean no-op.
+#   - a FULL disk (no free space) is a clean no-op (+ a LOUD NOOP marker),
+#   - an isohybrid MBR/DOS disk is carved via the parted path (NOT sgdisk, which
+#     would convert the table) — a primary is appended, the table stays DOS.
 #
 # WHY [VM]-gated: it needs a real Linux block layer (sgdisk/mkfs.vfat on a real
 # GPT disk) — it cannot run on the Windows dev box. The "carves the REAL USB the
@@ -45,8 +48,9 @@ in
         emptyDiskImages = [ 512 ];
       };
       hart.hartlogCreate.enable = true;
-      # The carve tools + a labelled-device lookup for the test body.
-      environment.systemPackages = [ pkgs.gptfdisk pkgs.dosfstools pkgs.util-linux ];
+      # The carve tools + a labelled-device lookup for the test body. parted is the
+      # MBR/DOS carve path the module uses + the test drives the DOS stand-in with.
+      environment.systemPackages = [ pkgs.gptfdisk pkgs.parted pkgs.dosfstools pkgs.util-linux ];
     };
 
     testScript = ''
@@ -91,6 +95,14 @@ in
           fstype = hc.succeed("blkid -L HARTLOG | xargs blkid -o value -s TYPE").strip()
           assert "vfat" in fstype, f"HARTLOG must be FAT32/vfat, got {fstype!r}"
 
+      # ── 3b. The LOUD decision marker records the verdict (never a silent no-op) ──
+      with subtest("the decision is logged LOUDLY to /run/hart/hartlog-create.status"):
+          status = hc.succeed("cat /run/hart/hartlog-create.status")
+          # The marker must end with an unambiguous CREATED verdict naming the disk.
+          assert "DECISION=CREATED" in status, \
+              f"status marker must record the CREATED decision, got: {status!r}"
+          assert disk in status, f"status marker must name the picked disk {disk}, got: {status!r}"
+
       # ── 4. The pre-existing ISO partition is UNTOUCHED ──
       with subtest("the in-use ISO partition is never touched"):
           iso_uuid_after = hc.succeed(f"sgdisk --info=1 {disk} | grep -i 'Partition unique GUID'").strip()
@@ -128,6 +140,41 @@ in
           n_after = hc.succeed(f"sgdisk -p {disk} | grep -cE '^ +[0-9]+ ' || true").strip()
           assert n_after == n_before, \
               f"full-disk no-op must not create a partition ({n_before} -> {n_after})"
+          # And the no-op is recorded LOUDLY (never a silent no-op).
+          st = hc.succeed("cat /run/hart/hartlog-create.status")
+          assert "DECISION=NOOP" in st, f"full-disk no-op must record DECISION=NOOP, got: {st!r}"
+
+      # ── 6b. An isohybrid MBR (DOS-label) disk is carved via parted (not sgdisk) ──
+      # The live ISO can be written DOS/MBR, where sgdisk MUST NOT run (it would
+      # convert the table + destroy the boot layout). Build a DOS-label stand-in
+      # with a small primary + trailing free space and assert the carve appends a
+      # primary FAT32 HARTLOG via the parted path, leaving the existing primary
+      # untouched.
+      with subtest("an isohybrid MBR/DOS disk is carved via parted, existing primary untouched"):
+          hc.succeed(f"sgdisk --zap-all {disk}")
+          hc.succeed(f"wipefs -a {disk} || true")
+          # Fresh DOS label + one 64 MiB primary at the start (the 'ISO'), rest free.
+          hc.succeed(f"parted -s {disk} mklabel msdos")
+          hc.succeed(f"parted -s {disk} mkpart primary fat32 1MiB 65MiB")
+          hc.succeed("udevadm settle || true")
+          pttype = hc.succeed(f"lsblk -ndo PTTYPE {disk}").strip()
+          assert pttype == "dos", f"stand-in must be a DOS/MBR disk, got {pttype!r}"
+          n_dos_before = hc.succeed(f"parted -ms {disk} unit s print | grep -cE '^[0-9]+:' || true").strip()
+          out_mbr = hc.succeed(f"HART_HARTLOG_TEST_DISK={disk} hart-hartlog-create 2>&1; echo RC=$?")
+          assert "RC=0" in out_mbr, f"MBR carve must exit 0, got: {out_mbr!r}"
+          # The carve must have taken the parted (DOS) path, not sgdisk.
+          assert "DECISION=CREATED" in out_mbr or "MBR" in out_mbr, \
+              f"MBR carve should report the DOS/MBR path, got: {out_mbr!r}"
+          hc.succeed("blkid -L HARTLOG")
+          mfstype = hc.succeed("blkid -L HARTLOG | xargs blkid -o value -s TYPE").strip()
+          assert "vfat" in mfstype, f"MBR HARTLOG must be FAT32/vfat, got {mfstype!r}"
+          # The pre-existing primary is still there (a new primary was appended).
+          n_dos_after = hc.succeed(f"parted -ms {disk} unit s print | grep -cE '^[0-9]+:' || true").strip()
+          assert int(n_dos_after) == int(n_dos_before) + 1, \
+              f"MBR carve must ADD exactly one primary ({n_dos_before} -> {n_dos_after})"
+          # The table is STILL a DOS label — never converted to GPT.
+          assert hc.succeed(f"lsblk -ndo PTTYPE {disk}").strip() == "dos", \
+              "MBR carve must NOT convert the table to GPT (would destroy the boot layout)"
 
       # ── 7. The auto-detect path REFUSES the VM's non-removable boot disk ──
       # Run WITHOUT the test seam so the script walks the live root to the VM's

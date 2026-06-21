@@ -1615,6 +1615,30 @@ class TestHartlogCreateModule:
         read-side (hart-boot-log) and write-side never drift out of lockstep."""
         assert "config.hart.bootLog.label" in self.content
 
+    def test_writes_loud_status_marker(self):
+        """The never-silent-no-op contract: every decision (picked disk, free space,
+        no-op reason) is recorded to /run/hart/hartlog-create.status so a silent
+        no-op is never undebuggable. (The behavioural nixosTest asserts the marker's
+        CREATED/NOOP content; this is the cheap cross-file path guard.)"""
+        assert "/run/hart/hartlog-create.status" in self.content
+        assert "DECISION=" in self.content
+
+    def test_handles_isohybrid_mbr_layout(self):
+        """The live ISO can be DOS/MBR isohybrid where sgdisk MUST NOT run (it would
+        convert the table + destroy the boot layout). The module must branch on the
+        table type and use the parted mkpart path for a DOS label."""
+        assert "PTTYPE" in self.content
+        # parted is the MBR carve path (sgdisk only handles the GPT case).
+        assert "parted" in self.content
+        assert "mkpart" in self.content
+
+    def test_follows_loop_to_real_usb(self):
+        """A hybrid ISO's live root can be a loop/overlay mount, so the module must
+        follow a loop device back to the disk its backing file lives on (losetup
+        BACK-FILE) or match the HART_OS ISO volume label — not just bail on loop."""
+        assert "BACK-FILE" in self.content or "losetup" in self.content
+        assert "HART_OS" in self.content
+
     def test_in_flake_modules(self):
         """Gate-5 wiring guard: the module must be imported in flake.nix or the
         nixosTest could never enable it."""
@@ -1793,6 +1817,18 @@ class TestBootNixosTestsRegistered:
         # the new no-op gates this change adds:
         assert "no trailing free space" in content or "full disk" in content.lower()
         assert "non-removable" in content.lower() or "internal disk" in content.lower()
+
+    def test_hartlog_create_test_proves_mbr_path_and_loud_marker(self):
+        """The carve nixosTest must ALSO prove the isohybrid MBR/DOS carve path
+        (parted, table stays DOS — sgdisk would convert it) and that the decision
+        is recorded in the LOUD /run/hart/hartlog-create.status marker."""
+        content = read_nix(os.path.join(TESTS_DIR, "hartlog-create.nix"))
+        # The MBR/DOS stand-in is carved via parted and the table is not converted.
+        assert "mklabel msdos" in content or "DOS" in content
+        assert "DECISION=CREATED" in content
+        # The loud no-op marker is asserted too.
+        assert "/run/hart/hartlog-create.status" in content
+        assert "DECISION=NOOP" in content
 
     def test_boot_continuity_test_proves_never_bootorder(self):
         """The continuity nixosTest must assert the script NEVER writes BootOrder
