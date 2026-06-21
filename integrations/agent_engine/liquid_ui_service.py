@@ -1737,6 +1737,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
     <div class="power-btn" role="button" tabindex="0" onclick="shellAction('lock')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">lock</span>Lock</div>
     <div class="power-btn" role="button" tabindex="0" onclick="shellAction('suspend')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">dark_mode</span>Sleep</div>
     <div class="power-btn" role="button" tabindex="0" onclick="shellAction('restart')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">refresh</span>Restart</div>
+    <div class="power-btn" id="power-btn-firmware" role="button" tabindex="0" style="display:none" onclick="shellAction('firmware')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">developer_board</span>Restart to Firmware (UEFI)</div>
     <div class="power-btn" role="button" tabindex="0" onclick="shellAction('shutdown')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">power_settings_new</span>Shut Down</div>
   </div>
 </div>
@@ -4228,13 +4229,25 @@ function shellAction(action) {{
     document.getElementById('lock-pw').focus();
     return;
   }}
-  const labels = {{suspend:'put the system to sleep',restart:'restart the system',shutdown:'shut down the system'}};
-  dsConfirm(action.charAt(0).toUpperCase()+action.slice(1),
+  const labels = {{suspend:'put the system to sleep',restart:'restart the system',shutdown:'shut down the system',firmware:'restart into the Firmware (UEFI) setup'}};
+  const titles = {{firmware:'Restart to Firmware'}};
+  dsConfirm(titles[action]||action.charAt(0).toUpperCase()+action.slice(1),
     'Are you sure you want to '+(labels[action]||action)+'?',
-    {{okLabel:action.charAt(0).toUpperCase()+action.slice(1), danger:action==='shutdown'}}).then(function(ok){{
-    if(ok) fetch(SHELL+'/api/shell/session/'+action,{{method:'POST'}}).catch(()=>{{}});
+    {{okLabel:(titles[action]||action.charAt(0).toUpperCase()+action.slice(1)), danger:action==='shutdown'}}).then(function(ok){{
+    if(ok) fetch(SHELL+'/api/shell/session/'+action,{{method:'POST'}}).then(function(r){{
+      // The 'firmware' action is gated server-side too — surface a clean refusal
+      // if the box turns out not to support boot-to-firmware (legacy BIOS).
+      if(action==='firmware' && r && !r.ok) r.json().then(function(j){{
+        dsConfirm('Firmware setup unavailable', (j&&j.error)||'Not supported on this system.', {{okLabel:'OK'}});
+      }}).catch(()=>{{}});
+    }}).catch(()=>{{}});
   }});
 }}
+// Reveal the "Restart to Firmware (UEFI)" power button only on a UEFI box that
+// advertises the boot-to-firmware capability (hidden on legacy BIOS). Pure read.
+fetch(SHELL+'/api/shell/session/firmware-capable').then(function(r){{return r.json();}}).then(function(j){{
+  if(j && j.supported){{ var b=document.getElementById('power-btn-firmware'); if(b) b.style.display=''; }}
+}}).catch(()=>{{}});
 function unlock() {{
   // In production: PAM verification. Dev mode: any password works.
   document.getElementById('lock-screen').classList.remove('active');
@@ -5013,14 +5026,28 @@ function renderAgentOverlay(ev) {{
         @app.route('/api/shell/session/<action>', methods=['POST'])
         def shell_session(action):
             import re
-            if action not in ('lock', 'logout', 'suspend', 'shutdown', 'restart'):
+            if action not in ('lock', 'logout', 'suspend', 'shutdown', 'restart',
+                              'firmware'):
                 return jsonify({'error': 'Invalid action'}), 400
+            # 'firmware' = "Restart into Firmware (UEFI)": ask systemd to set the
+            # UEFI OsIndications boot-to-firmware-UI flag, then reboot — the next
+            # boot enters the BIOS/UEFI setup. Only meaningful on a UEFI box whose
+            # firmware advertises the boot-to-fw capability; refuse on legacy BIOS
+            # so the user never gets a plain reboot when they asked for firmware.
+            # Single source of truth for the capability probe (shell_os_apis).
+            from integrations.agent_engine.shell_os_apis import (
+                firmware_setup_supported)
+            if action == 'firmware' and not firmware_setup_supported():
+                return jsonify({
+                    'error': 'Reboot to firmware setup is not supported on this '
+                             'system (legacy BIOS or capability not advertised)'}), 400
             cmds = {
                 'lock': ['loginctl', 'lock-session'],
                 'logout': ['loginctl', 'terminate-session', ''],
                 'suspend': ['systemctl', 'suspend'],
                 'shutdown': ['systemctl', 'poweroff'],
                 'restart': ['systemctl', 'reboot'],
+                'firmware': ['systemctl', 'reboot', '--firmware-setup'],
             }
             try:
                 subprocess.Popen(
@@ -5029,6 +5056,15 @@ function renderAgentOverlay(ev) {{
                 return jsonify({'status': action})
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
+
+        @app.route('/api/shell/session/firmware-capable', methods=['GET'])
+        def shell_session_firmware_capable():
+            """Report whether 'Restart into Firmware (UEFI)' is available so the
+            power menu can SHOW the button only on a capable UEFI box (hidden on
+            legacy BIOS). Pure read; no privileged action."""
+            from integrations.agent_engine.shell_os_apis import (
+                firmware_setup_supported)
+            return jsonify({'supported': firmware_setup_supported()})
 
         # ── Shell APIs: Services ──
         @app.route('/api/shell/services', methods=['GET'])

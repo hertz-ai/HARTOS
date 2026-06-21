@@ -424,6 +424,78 @@ class TestShellPower(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════
+# Firmware setup (Restart into Firmware / UEFI) — Feature 3
+# ═══════════════════════════════════════════════════════════════
+
+class TestFirmwareSetup(unittest.TestCase):
+    """firmware_setup_supported() capability probe + the gated power action.
+
+    `systemctl reboot --firmware-setup` only works on a UEFI box whose firmware
+    advertises EFI_OS_INDICATIONS_BOOT_TO_FW_UI in OsIndicationsSupported. The
+    probe + the gate must hide/refuse the action on legacy BIOS so the user never
+    gets a plain reboot when they asked to enter firmware setup."""
+
+    MOD = 'integrations.agent_engine.shell_os_apis'
+
+    def test_no_op_on_legacy_bios(self):
+        """No /sys/firmware/efi -> not UEFI-booted -> NOT supported."""
+        from integrations.agent_engine.shell_os_apis import firmware_setup_supported
+        with patch(f'{self.MOD}.os.path.isdir', return_value=False):
+            self.assertFalse(firmware_setup_supported())
+
+    def test_supported_when_capability_bit_set(self):
+        """UEFI-booted + OsIndicationsSupported has the boot-to-fw-UI bit -> True.
+        The efivar layout is a 4-byte attributes prefix + an 8-byte LE value."""
+        from integrations.agent_engine.shell_os_apis import firmware_setup_supported
+        # attributes (4B) + value with bit0 set (8B LE).
+        efivar = b'\x07\x00\x00\x00' + (0x01).to_bytes(8, 'little')
+        m = unittest.mock.mock_open(read_data=efivar)
+        with patch(f'{self.MOD}.os.path.isdir', return_value=True), \
+                patch(f'{self.MOD}.open', m, create=True):
+            self.assertTrue(firmware_setup_supported())
+
+    def test_not_supported_when_capability_bit_clear(self):
+        """UEFI-booted but the boot-to-fw-UI bit is CLEAR -> not supported."""
+        from integrations.agent_engine.shell_os_apis import firmware_setup_supported
+        efivar = b'\x07\x00\x00\x00' + (0x00).to_bytes(8, 'little')
+        m = unittest.mock.mock_open(read_data=efivar)
+        with patch(f'{self.MOD}.os.path.isdir', return_value=True), \
+                patch(f'{self.MOD}.open', m, create=True):
+            self.assertFalse(firmware_setup_supported())
+
+    def test_not_supported_when_efivar_unreadable(self):
+        """UEFI-booted but the efivar is absent/unreadable -> conservative False
+        (a wrong 'supported' would give the user a plain reboot)."""
+        from integrations.agent_engine.shell_os_apis import firmware_setup_supported
+        with patch(f'{self.MOD}.os.path.isdir', return_value=True), \
+                patch(f'{self.MOD}.open', side_effect=FileNotFoundError, create=True):
+            self.assertFalse(firmware_setup_supported())
+
+    def test_power_action_firmware_refused_when_unsupported(self):
+        """POST /api/shell/power/action {firmware} -> 400 on a non-capable box,
+        and it must NOT spawn a reboot."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}._classify_destructive', return_value=True), \
+                patch(f'{self.MOD}.firmware_setup_supported', return_value=False), \
+                patch(f'{self.MOD}.subprocess.Popen') as popen:
+            r = client.post('/api/shell/power/action', json={'action': 'firmware'})
+        self.assertEqual(r.status_code, 400)
+        popen.assert_not_called()
+
+    def test_power_action_firmware_runs_reboot_firmware_setup(self):
+        """On a capable box the action spawns `systemctl reboot --firmware-setup`
+        via the SAME privileged path the other power actions use."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}._classify_destructive', return_value=True), \
+                patch(f'{self.MOD}.firmware_setup_supported', return_value=True), \
+                patch(f'{self.MOD}.subprocess.Popen') as popen:
+            r = client.post('/api/shell/power/action', json={'action': 'firmware'})
+        self.assertEqual(r.status_code, 200)
+        popen.assert_called_once_with(
+            ['systemctl', 'reboot', '--firmware-setup'])
+
+
+# ═══════════════════════════════════════════════════════════════
 # i18n
 # ═══════════════════════════════════════════════════════════════
 

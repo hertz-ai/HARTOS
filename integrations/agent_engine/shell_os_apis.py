@@ -160,6 +160,52 @@ def get_a11y_settings():
     return dict(_A11Y_SETTINGS)
 
 
+# ── Firmware-setup (reboot-into-UEFI) capability ──
+# CANONICAL home for "can this box reboot straight into the UEFI/BIOS setup?".
+# ONE writer, imported by both the shell-OS power-action handler AND the
+# liquid_ui_service session route + power-menu gate, so the answer never drifts
+# (DRY: no second copy of this probe).
+#
+# `systemctl reboot --firmware-setup` works only on a UEFI system whose firmware
+# advertises the "boot to firmware UI" capability via the EFI global variable
+# OsIndicationsSupported (bit 0 = EFI_OS_INDICATIONS_BOOT_TO_FW_UI). On legacy
+# BIOS there is no /sys/firmware/efi and the flag is meaningless, so we hide the
+# action entirely. We read the efivar directly (no privileged call): its layout
+# is a 4-byte attributes prefix followed by the 8-byte little-endian value.
+_FW_BOOT_TO_FW_UI = 0x0000000000000001  # EFI_OS_INDICATIONS_BOOT_TO_FW_UI
+
+# efivarfs path for OsIndicationsSupported (EFI global variable namespace GUID
+# 8be4df61-93ca-11d2-aa0d-00e098032b8c).
+_OS_INDICATIONS_SUPPORTED = (
+    '/sys/firmware/efi/efivars/'
+    'OsIndicationsSupported-8be4df61-93ca-11d2-aa0d-00e098032b8c')
+
+
+def firmware_setup_supported():
+    """True iff the system is UEFI-booted AND its firmware advertises the
+    boot-to-firmware-UI capability (so `systemctl reboot --firmware-setup` will
+    actually enter setup). False on legacy BIOS or when the capability is absent
+    — the caller hides the action so the user never gets a plain reboot when they
+    asked for firmware setup."""
+    # 1. Must be UEFI-booted at all.
+    if not os.path.isdir('/sys/firmware/efi'):
+        return False
+    # 2. Read OsIndicationsSupported and test the boot-to-fw-UI bit.
+    try:
+        with open(_OS_INDICATIONS_SUPPORTED, 'rb') as f:
+            raw = f.read()
+        # 4-byte attributes prefix + the variable data (8-byte LE value).
+        if len(raw) < 12:
+            return False
+        value = int.from_bytes(raw[4:12], 'little')
+        return bool(value & _FW_BOOT_TO_FW_UI)
+    except (FileNotFoundError, PermissionError, OSError):
+        # The efivar is absent/unreadable. Be conservative: if we are UEFI-booted
+        # but cannot read the capability, do NOT claim support (hide the action)
+        # — a wrong "supported" would give the user a plain reboot.
+        return False
+
+
 def register_shell_os_routes(app):
     """Register all extended shell OS API routes on a Flask app."""
 
@@ -865,9 +911,22 @@ def register_shell_os_routes(app):
             'reboot': ['systemctl', 'reboot'],
             'shutdown': ['systemctl', 'poweroff'],
             'lock': ['loginctl', 'lock-sessions'],
+            # 'firmware'/'uefi' = "Restart into Firmware (UEFI)": set the UEFI
+            # OsIndications boot-to-firmware-UI flag, then reboot — the next boot
+            # enters the BIOS/UEFI setup. Uses the SAME privileged path the other
+            # power actions use (no new password-less sudo hole).
+            'firmware': ['systemctl', 'reboot', '--firmware-setup'],
+            'uefi': ['systemctl', 'reboot', '--firmware-setup'],
         }
         if action not in actions:
             return jsonify({'error': f'Invalid action. Valid: {list(actions.keys())}'}), 400
+
+        # Gate firmware setup to UEFI boxes that advertise the capability — never
+        # give the user a plain reboot when they asked to enter firmware setup.
+        if action in ('firmware', 'uefi') and not firmware_setup_supported():
+            return jsonify({'error': 'Reboot to firmware setup is not supported on '
+                                     'this system (legacy BIOS or capability not '
+                                     'advertised)'}), 400
 
         try:
             subprocess.Popen(actions[action])
