@@ -159,6 +159,15 @@
       # space / HARTLOG already exists. Imported so the option exists +
       # tests/hartlog-create.nix can enable it; desktop.nix turns it on.
       ./modules/hart-hartlog-create.nix
+      # Boot continuity: when a restart is initiated FROM the Live OS, set a
+      # ONE-SHOT efibootmgr BootNext to the USB's OWN EFI boot entry so the next
+      # boot returns to HART OS WITHOUT the user mashing F12. It does NOT change
+      # the permanent BootOrder, so Windows still boots normally when chosen. A
+      # no-op if efibootmgr is missing, not UEFI-booted, or the entry can't be
+      # matched. Opt-in (hart.bootContinuity.enable=false default) -> pure no-op
+      # for every variant; desktop.nix turns it on. tests/boot-continuity.nix
+      # gates the structural assertions.
+      ./modules/hart-boot-continuity.nix
     ];
 
     # Single source of truth for nixpkgs config (allowUnfree etc.).  Kept OUT of
@@ -501,7 +510,14 @@
       # a clean no-op. This is the Linux-side replacement for the corrupting
       # Windows diskpart path. Distinct attr name -> clean //; desktop node.
       hartlogCreate = import ./tests/hartlog-create.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate;
+      # Boot continuity (one-shot BootNext): a desktop node enables
+      # hart.bootContinuity; the test asserts the unit + efibootmgr are in the
+      # closure, the ExecStop reboot hook is wired + ordered before
+      # systemd-reboot, the script NEVER writes BootOrder (the never-strand-
+      # Windows invariant), and running it on a non-UEFI VM is a clean no-op
+      # exit 0. The live BootNext write needs real UEFI HW. Distinct attr -> //.
+      bootContinuity = import ./tests/boot-continuity.nix desktopTestArgs;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)

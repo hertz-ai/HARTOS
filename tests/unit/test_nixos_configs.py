@@ -64,6 +64,7 @@ EXPECTED_MODULES = [
     "hart-app-bridge.nix",
     # Boot-experience modules (HARTLOG self-create + boot continuity)
     "hart-hartlog-create.nix",
+    "hart-boot-continuity.nix",
 ]
 
 # Python backend services for the AI-Native modules
@@ -1655,3 +1656,73 @@ class TestHartlogCreateModule:
         assert "hartlogCreate.enable = true" in desktop
 
 
+# ═══════════════════════════════════════════════════════════════
+# Boot-experience: boot continuity / one-shot BootNext (Feature 2)
+# ═══════════════════════════════════════════════════════════════
+
+class TestBootContinuityModule:
+    """hart-boot-continuity.nix: on a Live-OS reboot, set a ONE-SHOT efibootmgr
+    BootNext to the USB's own entry — NEVER BootOrder (so Windows is never
+    stranded). The "never touch BootOrder" invariant is the safety contract."""
+
+    @pytest.fixture(autouse=True)
+    def load_module(self):
+        self.content = read_nix(os.path.join(MODULES_DIR, "hart-boot-continuity.nix"))
+
+    def test_has_enable_option(self):
+        assert "mkEnableOption" in self.content
+        assert "bootContinuity" in self.content
+
+    def test_has_mkif_guard(self):
+        assert "mkIf" in self.content
+        assert "bc.enable" in self.content or "bootContinuity.enable" in self.content
+
+    def test_uses_efibootmgr_bootnext(self):
+        assert "efibootmgr" in self.content
+        assert "--bootnext" in self.content
+
+    def test_never_writes_bootorder(self):
+        """THE safety invariant: the module must NEVER set/modify BootOrder —
+        only the one-shot BootNext. A BootOrder write would risk stranding the
+        user's Windows boot."""
+        # No efibootmgr -o / --bootorder write anywhere in the module.
+        assert "--bootorder" not in self.content.lower()
+        assert "efibootmgr -o" not in self.content
+        assert "efibootmgr --bootorder" not in self.content
+
+    def test_no_op_when_not_uefi(self):
+        """Gate on /sys/firmware/efi — no-op on a legacy/BIOS boot."""
+        assert "/sys/firmware/efi" in self.content
+
+    def test_no_op_when_efibootmgr_missing(self):
+        assert "command -v efibootmgr" in self.content
+
+    def test_no_op_when_entry_unmatched(self):
+        """Never guess: if the USB's own entry can't be matched, do nothing."""
+        assert "could not match" in self.content or "never guess" in self.content.lower()
+
+    def test_skips_on_poweroff(self):
+        """A power-off must not arm a next boot — only a reboot returns to HART OS."""
+        assert "poweroff" in self.content
+
+    def test_runs_execstop_on_shutdown(self):
+        """ExecStop on the way down is the systemd idiom for this hook."""
+        assert "ExecStop" in self.content
+        assert "RemainAfterExit = true" in self.content
+
+    def test_ordered_before_reboot(self):
+        assert "systemd-reboot.service" in self.content
+        assert "shutdown.target" in self.content
+
+    def test_never_fails_shutdown_set_u_not_e(self):
+        assert "set -u" in self.content
+        assert "set -e" not in self.content
+        assert "exit 0" in self.content
+
+    def test_in_flake_modules(self):
+        flake = read_nix(os.path.join(NIXOS_DIR, "flake.nix"))
+        assert "hart-boot-continuity.nix" in flake
+
+    def test_desktop_enables_it(self):
+        desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        assert "bootContinuity.enable = true" in desktop

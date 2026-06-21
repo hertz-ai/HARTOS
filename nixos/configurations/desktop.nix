@@ -285,6 +285,15 @@ in
     # so the create-side and read-side stay in lockstep.
     hartlogCreate.enable = true;
 
+    # ── Boot continuity (return to HART OS on a Live-OS-initiated restart) ──
+    # When the user restarts FROM the Live OS, set a ONE-SHOT efibootmgr BootNext
+    # to the USB's OWN EFI boot entry so the next boot returns to HART OS without
+    # mashing F12. It does NOT change the permanent BootOrder, so the user's
+    # Windows still boots normally when chosen — only a Live-OS restart returns
+    # here. A no-op if efibootmgr is missing, not UEFI-booted, or the USB entry
+    # can't be matched. Intentionally BootNext (one-shot), never BootOrder, so it
+    # can never strand the user's Windows boot.
+    bootContinuity.enable = true;
   };
 
   # HART application package
