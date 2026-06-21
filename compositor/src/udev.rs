@@ -56,7 +56,7 @@ use std::time::Duration;
 
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags};
+use smithay::backend::drm::compositor::{DrmCompositor, FrameError, FrameFlags};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, DrmSurface};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
@@ -107,6 +107,32 @@ const COLOR_FORMATS: &[Fourcc] = &[Fourcc::Argb8888, Fourcc::Xrgb8888];
 type HartDrmCompositor =
     DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
 
+/// One CRTC's scanout surface + its page-flip pacing state. `awaiting_vblank` is the
+/// F1 (#166) torn-frame fix: it is set the instant a frame is `queue_frame`'d (a flip
+/// is in flight to the CRTC) and cleared only when the matching `DrmEvent::VBlank`
+/// lands and `frame_submitted()` reaps it. The render tick refuses to `queue_frame` a
+/// NEW frame while this is true — so a frame is submitted ONLY after the prior flip's
+/// vblank completes, never on top of an in-flight flip (which the kernel would reject
+/// with EBUSY and which tears the scanout).
+struct SurfaceData {
+    /// The DrmCompositor that composites + page-flips this CRTC.
+    compositor: HartDrmCompositor,
+    /// A page-flip is in flight to this CRTC; the next queue must wait for its vblank.
+    awaiting_vblank: bool,
+    /// When the in-flight flip was queued. Guards against a LOST vblank (a VT switch /
+    /// suspend / driver hiccup can swallow the page-flip event): if no vblank arrives
+    /// within `VBLANK_STALL_TIMEOUT`, `render_all` force-clears `awaiting_vblank` and
+    /// retries, so one dropped vblank degrades to a stutter — NOT a permanent freeze that
+    /// the paint watchdog would turn into a boot loop (#166 + #186 robustness).
+    flip_queued_at: Option<std::time::Instant>,
+}
+
+/// If a queued page-flip's vblank has not arrived within this long, assume it was lost
+/// (VT switch / suspend / driver hiccup) and let the CRTC re-render. ~5 frames at 60Hz —
+/// comfortably past a real vblank (16.7ms) so we never pre-empt a healthy flip, but short
+/// enough that a dropped vblank is an imperceptible stutter rather than a frozen screen.
+const VBLANK_STALL_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// One opened DRM device (the GPU) + its per-CRTC scanout surfaces. Held in the loop
 /// data so the VBlank handler can find the right surface to mark submitted + re-queue.
 struct DeviceData {
@@ -115,8 +141,90 @@ struct DeviceData {
     /// GBM device — the buffer allocator backing both the scanout swapchain + the
     /// framebuffer exporter. Cloned into the allocator/exporter; held so it outlives them.
     _gbm: GbmDevice<DrmDeviceFd>,
-    /// One DrmCompositor per active CRTC (one display). Keyed by CRTC handle.
-    surfaces: HashMap<crtc::Handle, HartDrmCompositor>,
+    /// One scanout surface per active CRTC (one display). Keyed by CRTC handle.
+    surfaces: HashMap<crtc::Handle, SurfaceData>,
+}
+
+/// What the render tick should do with one CRTC after attempting to present a frame.
+/// PURE policy value (no Smithay types) so the flip-error→action decision is unit-
+/// testable on the dev box (#186) — the `FrameError` → `FlipOutcome` adapter that
+/// feeds it (`classify_frame_error`) is the only Smithay-touching, CI-compiled half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameAction {
+    /// The flip was queued (or there was nothing to draw): leave the CRTC alone, the
+    /// vblank will pace the next frame.
+    Presented,
+    /// A transient error (swapchain exhausted, a flip the kernel refused with EBUSY/
+    /// EACCES, an empty frame): skip THIS frame, mark the output for redraw, retry on
+    /// the next tick. The compositor stays alive (the never-fail floor).
+    Reschedule,
+    /// The DRM device is inactive (VT-switched away / asleep): hold off rendering to it
+    /// until the session reactivates. Not an error — just don't flip to a dark CRTC.
+    DeviceInactive,
+}
+
+/// A renderer-agnostic classification of a DRM flip/commit/render failure. Mapped from
+/// Smithay's `FrameError`/`RenderFrameError` by `classify_frame_error`; consumed by the
+/// PURE `flip_action`. The split keeps the policy (which is what we actually want to
+/// test) free of Smithay types so it compiles + runs under the default `cargo test`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlipOutcome {
+    /// The device is not currently the DRM master (VT switch / suspend).
+    DeviceInactive,
+    /// A transient, retryable failure: the swapchain is momentarily out of buffers, the
+    /// kernel refused the atomic commit/flip (EBUSY/EACCES/EINVAL — a busy CRTC, a seat
+    /// hiccup), or the frame turned out empty. Retry next tick.
+    Transient,
+    /// A hard renderer/import/framebuffer failure (e.g. lost GL context analogue, no
+    /// usable plane format). Still must NOT kill the compositor — we degrade by skipping
+    /// the frame and retrying; if it persists the supervisor drops a tier.
+    Fatal,
+}
+
+/// PURE: map a DRM present outcome to the render tick's next action. A flip error is a
+/// logged, retried frame — NEVER a process death (#186). Every non-success outcome
+/// degrades to `Reschedule` (retry the frame next tick) except an inactive device,
+/// which is a deliberate "don't paint a dark CRTC" hold, not a failure. Unit-tested on
+/// the dev box (no Smithay types in the signature).
+fn flip_action(outcome: Result<(), FlipOutcome>) -> FrameAction {
+    match outcome {
+        Ok(()) => FrameAction::Presented,
+        Err(FlipOutcome::DeviceInactive) => FrameAction::DeviceInactive,
+        // Transient AND fatal both degrade-not-die: skip + retry. The distinction is
+        // only for logging severity at the call site; neither ever aborts the loop.
+        Err(FlipOutcome::Transient | FlipOutcome::Fatal) => FrameAction::Reschedule,
+    }
+}
+
+/// The Smithay-touching half (#186): collapse a `FrameError` (from `queue_frame`) into the
+/// renderer-agnostic `FlipOutcome` the pure `flip_action` understands. `DeviceInactive`
+/// (VT switch / suspend) is held; an `Access` ioctl failure (EBUSY/EACCES/EINVAL — the
+/// "permission denied" / "resource busy" the real laptop boot hit), `DrmMasterFailed`,
+/// `TestFailed`, an exhausted swapchain, or an empty frame are all TRANSIENT → retried;
+/// anything else (no usable format / framebuffer) is `Fatal` but STILL degrades (skip +
+/// retry), never aborts. This is the single chokepoint that turns "a flip ioctl returned
+/// an error" into "log it + retry the frame" instead of a `panic!`/`.unwrap()` death.
+fn classify_frame_error<A, B, F>(err: &FrameError<A, B, F>) -> FlipOutcome
+where
+    A: std::error::Error + Send + Sync + 'static,
+    B: std::error::Error + Send + Sync + 'static,
+    F: std::error::Error + Send + Sync + 'static,
+{
+    use smithay::backend::drm::DrmError;
+    match err {
+        FrameError::DrmError(DrmError::DeviceInactive) => FlipOutcome::DeviceInactive,
+        // EBUSY/EACCES/EINVAL on the atomic commit/page-flip, lost DRM master, or a
+        // failed atomic test — all transient seat/CRTC hiccups: retry the frame.
+        FrameError::DrmError(DrmError::Access(_))
+        | FrameError::DrmError(DrmError::DrmMasterFailed)
+        | FrameError::DrmError(DrmError::TestFailed(_)) => FlipOutcome::Transient,
+        // The swapchain is momentarily exhausted (we owe a `frame_submitted`) or there
+        // was nothing to flip — both clear on a subsequent tick.
+        FrameError::NoFreeSlotsError | FrameError::EmptyFrame => FlipOutcome::Transient,
+        // Any other DRM error or a hard format/framebuffer failure: degrade (skip +
+        // retry); a persistent one is what makes the supervisor drop a tier.
+        _ => FlipOutcome::Fatal,
+    }
 }
 
 /// The operator escape-hatch override for the DRM node path (anvil's `ANVIL_DRM_DEVICE`
@@ -272,6 +380,8 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         capture_blocked: false,
         black_buffer,
         ipc: crate::ipc::IpcState::default(),
+        // F1 (#166) — no flips in flight at boot; the VBlank source populates this.
+        vblank_completed: std::collections::HashSet::new(),
     };
 
     // 7. The per-device backend table (one entry per opened GPU). Held OUTSIDE State so
@@ -483,7 +593,7 @@ fn device_added(
     let allocator = GbmAllocator::new(gbm.clone(), GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
     let exporter = GbmFramebufferExporter::new(gbm.clone(), node.into());
 
-    let mut surfaces: HashMap<crtc::Handle, HartDrmCompositor> = HashMap::new();
+    let mut surfaces: HashMap<crtc::Handle, SurfaceData> = HashMap::new();
 
     // Scan connectors + pick a CRTC for each connected one, then build a DrmSurface +
     // DrmCompositor. Uses the raw `drm` Device trait (no smithay-drm-extras dep) — the
@@ -564,22 +674,31 @@ fn device_added(
             Some(gbm.clone()),
         )
         .map_err(|e| format!("DrmCompositor::new failed: {e}"))?;
-        surfaces.insert(crtc, compositor);
+        surfaces.insert(
+            crtc,
+            SurfaceData { compositor, awaiting_vblank: false, flip_queued_at: None },
+        );
         info!(crtc = ?crtc, "HART-comp DRM: output online (pixman scanout)");
     }
 
-    // Insert the per-device DRM event source (VBlank → mark the flip submitted so the
-    // next frame can be queued). Keyed on the node so the closure finds the right device.
+    // Insert the per-device DRM event source. On a VBlank the matching CRTC's flip has
+    // completed scan-out: record the CRTC so the render tick can `frame_submitted()` it
+    // (the table-holding half) IN VBLANK ORDER and unblock its next flip (F1, #166). The
+    // calloop closure only gets `&mut State`, not the per-device `surfaces` table, so the
+    // hand-off is this `vblank_completed` set — drained by `reap_completed_vblanks`. This
+    // replaces the old unconditional per-tick `frame_submitted()`, which freed swapchain
+    // buffers before the hardware had finished scanning them out (the torn-frame cause).
     state
         .loop_handle
-        .insert_source(drm_notifier, move |event, _meta, _state: &mut State| match event {
-            DrmEvent::VBlank(_crtc) => {
-                // The actual `frame_submitted()` + re-queue is driven from the render tick
-                // in the main loop (which holds the `devices` table). VBlank here only
-                // confirms the flip landed; Stage A's 60Hz tick re-renders regardless, so
-                // the page-flip cadence is self-sustaining without per-VBlank table access.
+        .insert_source(drm_notifier, move |event, _meta, state: &mut State| match event {
+            DrmEvent::VBlank(crtc) => {
+                state.vblank_completed.insert(crtc);
             }
-            DrmEvent::Error(err) => error!(?err, "HART-comp DRM: device error"),
+            // A device-level DRM error must NOT abort the compositor (#186): log it and
+            // keep running. A genuinely dead device stops producing vblanks, which the
+            // paint watchdog / B4 supervisor observes and drops a tier on — the loop
+            // itself never panics on a transient seat/DRM error event.
+            DrmEvent::Error(err) => error!(?err, "HART-comp DRM: device error (kept alive — supervisor handles a dead device)"),
         })
         .map_err(|e| format!("insert DRM notifier failed: {e}"))?;
 
@@ -594,11 +713,57 @@ fn device_added(
     Ok(())
 }
 
-/// Render every active DRM surface: build the element list from the space + the
-/// layer-shell desktop, composite on the pixman floor, clear to HART_SPLASH, and queue
-/// the page-flip. The canonical `render_frame → queue_frame → frame_submitted` sequence
-/// from the rev's DrmCompositor doc example.
+/// Reap every vblank that landed since the last tick (F1, #166). Called from the render
+/// tick BEFORE rendering: for each CRTC the VBlank source recorded in `vblank_completed`,
+/// mark its flip submitted (`frame_submitted()` — frees the just-scanned-out swapchain
+/// slot AND submits any frame that was held back while this flip was in flight) and clear
+/// its `awaiting_vblank` gate so the tick may queue its NEXT frame. Reaping ONLY on the
+/// real vblank (not unconditionally every tick) is the torn-frame fix: a buffer is freed
+/// strictly after the hardware finished scanning it out, and frame N+1 is page-flipped
+/// only after frame N's flip completed — never on top of an in-flight flip.
+fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, DeviceData>) {
+    if state.vblank_completed.is_empty() {
+        return;
+    }
+    let completed: Vec<crtc::Handle> = state.vblank_completed.drain().collect();
+    for crtc in completed {
+        for device in devices.values_mut() {
+            if let Some(surface) = device.surfaces.get_mut(&crtc) {
+                // frame_submitted() can itself attempt the deferred submit (a flip), which
+                // can fail on a transient seat/DRM hiccup — degrade, never panic (#186).
+                match surface.compositor.frame_submitted() {
+                    Ok(_) => {}
+                    Err(err) => {
+                        let outcome = classify_frame_error(&err);
+                        match flip_action(Err(outcome)) {
+                            FrameAction::DeviceInactive => {
+                                info!(?crtc, "HART-comp DRM: frame_submitted on inactive device — holding");
+                            }
+                            _ => warn!(?err, ?crtc, "HART-comp DRM: frame_submitted failed — will retry next frame"),
+                        }
+                    }
+                }
+                // The in-flight flip for this CRTC is now retired; the tick may queue again.
+                surface.awaiting_vblank = false;
+                surface.flip_queued_at = None;
+            }
+        }
+    }
+}
+
+/// Render every active DRM surface that is NOT mid-flip: build the element list from the
+/// space + the layer-shell desktop, composite on the pixman floor, clear to HART_SPLASH,
+/// and queue the page-flip. The canonical `render_frame → queue_frame → (await vblank) →
+/// frame_submitted` sequence from the rev's DrmCompositor doc example — the
+/// `frame_submitted` half is driven by the vblank event (`reap_completed_vblanks`), NOT
+/// here, so frames are paced by real flips (F1, #166). EVERY render/flip error degrades
+/// (log + skip + retry next tick) and KEEPS THE COMPOSITOR ALIVE — a flip error is a
+/// logged warning and a re-tried frame, never a `panic!`/`.unwrap()` death (F2/F3, #186).
 fn render_all(state: &mut State, devices: &mut HashMap<DrmNode, DeviceData>) {
+    // Retire any flips whose vblank arrived since the last tick first, so a CRTC freed
+    // this tick can be re-queued immediately below (one-frame-latency, no stall).
+    reap_completed_vblanks(state, devices);
+
     let clear = Color32F::new(
         HART_SPLASH_RGBA[0],
         HART_SPLASH_RGBA[1],
@@ -629,19 +794,69 @@ fn render_all(state: &mut State, devices: &mut HashMap<DrmNode, DeviceData>) {
     let elements: Vec<HartRenderElement<PixmanRenderer>> =
         comp_core::build_frame_elements(state, &mut renderer, size);
 
+    let now = std::time::Instant::now();
     for device in devices.values_mut() {
-        for compositor in device.surfaces.values_mut() {
-            match compositor.render_frame::<_, _>(&mut renderer, &elements, clear, FrameFlags::DEFAULT) {
-                Ok(result) => {
-                    if !result.is_empty {
-                        if let Err(err) = compositor.queue_frame(()) {
-                            warn!(?err, "HART-comp DRM: queue_frame failed");
+        for (crtc, surface) in device.surfaces.iter_mut() {
+            // F1 (#166): never start a new flip while the prior one is still in flight to
+            // this CRTC — wait for its vblank (which clears `awaiting_vblank` in
+            // `reap_completed_vblanks`). Submitting on top of an in-flight flip is what
+            // the kernel rejects (EBUSY) and what tears the scanout.
+            if surface.awaiting_vblank {
+                // …UNLESS the vblank was lost (VT switch / suspend / driver hiccup ate the
+                // page-flip event). Without this escape a single dropped vblank would
+                // freeze the CRTC forever (we'd wait on a vblank that never comes), the
+                // paint watchdog would see a frozen screen, and the supervisor would crash-
+                // loop the boot. A lost vblank instead degrades to a brief stutter (#186).
+                let stalled = surface
+                    .flip_queued_at
+                    .map(|t| now.duration_since(t) >= VBLANK_STALL_TIMEOUT)
+                    .unwrap_or(true);
+                if !stalled {
+                    continue;
+                }
+                warn!(?crtc, "HART-comp DRM: page-flip vblank lost (>100ms) — recovering, re-rendering");
+                surface.awaiting_vblank = false;
+                surface.flip_queued_at = None;
+            }
+            // `render_frame` returns a result that BORROWS the compositor; reduce it to the
+            // Copy `is_empty` bool immediately so no borrow of `surface.compositor` spans
+            // the sibling-field writes (`awaiting_vblank`/`flip_queued_at`) below.
+            let render_outcome = surface
+                .compositor
+                .render_frame::<_, _>(&mut renderer, &elements, clear, FrameFlags::DEFAULT)
+                .map(|result| result.is_empty);
+            match render_outcome {
+                Ok(true) => {
+                    // Nothing changed — no flip to schedule, no vblank to await.
+                    continue;
+                }
+                Ok(false) => match surface.compositor.queue_frame(()) {
+                    // The flip is in flight; gate this CRTC until its vblank lands.
+                    Ok(()) => {
+                        surface.awaiting_vblank = true;
+                        surface.flip_queued_at = Some(now);
+                    }
+                    Err(err) => {
+                        // A flip/commit ioctl error (the real-HW EACCES/EBUSY/ENODEV/
+                        // EINVAL): classify → log → leave `awaiting_vblank` false so the
+                        // NEXT tick re-renders + retries. The compositor stays ALIVE.
+                        match flip_action(Err(classify_frame_error(&err))) {
+                            FrameAction::DeviceInactive => info!(
+                                ?crtc,
+                                "HART-comp DRM: queue_frame on inactive device (VT switch/suspend) — holding"
+                            ),
+                            // flip_action returns Reschedule for every other Err; Presented
+                            // is unreachable for an Err input but matched for exhaustiveness.
+                            FrameAction::Reschedule | FrameAction::Presented => warn!(
+                                ?err, ?crtc,
+                                "HART-comp DRM: queue_frame failed — degrading, retry next frame"
+                            ),
                         }
                     }
-                    // Mark the previous flip submitted so the swapchain frees its slot.
-                    let _ = compositor.frame_submitted();
-                }
-                Err(err) => warn!(?err, "HART-comp DRM: render_frame failed"),
+                },
+                // render_frame failed (renderer import / no free slot / device inactive):
+                // skip THIS frame, retry next tick. Never a panic (#186).
+                Err(err) => warn!(?err, ?crtc, "HART-comp DRM: render_frame failed — degrading, retry next frame"),
             }
         }
     }
@@ -670,7 +885,7 @@ fn pick_crtc(
     drm: &DrmDevice,
     res: &smithay::reexports::drm::control::ResourceHandles,
     conn: &connector::Info,
-    claimed: &HashMap<crtc::Handle, HartDrmCompositor>,
+    claimed: &HashMap<crtc::Handle, SurfaceData>,
 ) -> Option<crtc::Handle> {
     // Encoders to consider: the currently-bound one first (if any), else all possible.
     let encoders: Vec<_> = conn
@@ -815,5 +1030,74 @@ mod tests {
         assert_eq!(COLOR_FORMATS.len(), 2);
         assert_eq!(COLOR_FORMATS[0], Fourcc::Argb8888, "Argb (alpha-capable) is first");
         assert_eq!(COLOR_FORMATS[1], Fourcc::Xrgb8888, "Xrgb (opaque) is the fallback");
+    }
+
+    // ── F2/F3 (#186) — the flip-error → action policy. This is the seam that turns "a
+    // DRM page-flip/commit/render call returned Err" into "log + retry the frame", NOT a
+    // `panic!`/`.unwrap()` that kills the whole compositor and crash-loops the boot. The
+    // pure `flip_action` decides; `classify_frame_error` (the Smithay adapter, exercised
+    // by the QEMU/HW scanout harness — it needs a live `FrameError`) feeds it. These
+    // assert the INVARIANT that matters: every error path degrades, none aborts. ──
+
+    #[test]
+    fn flip_action_ok_presents() {
+        // A successful flip leaves the CRTC alone — the vblank paces the next frame.
+        assert_eq!(flip_action(Ok(())), FrameAction::Presented);
+    }
+
+    #[test]
+    fn flip_action_transient_reschedules_never_dies() {
+        // The real-laptop EBUSY/EACCES "resource busy"/"permission denied" on the atomic
+        // commit classifies Transient → the tick must Reschedule (retry next frame). The
+        // KEY assertion is that this is NOT a process death: a flip error is a retried
+        // frame. There is no `Die`/`Abort` variant in `FrameAction` BY DESIGN.
+        assert_eq!(flip_action(Err(FlipOutcome::Transient)), FrameAction::Reschedule);
+    }
+
+    #[test]
+    fn flip_action_fatal_still_degrades_not_dies() {
+        // Even a "fatal" renderer/format failure degrades to Reschedule (skip + retry) —
+        // the compositor stays alive; a PERSISTENT fatal is what the supervisor observes
+        // (no paint) and drops a tier on. The compositor itself never aborts the loop.
+        assert_eq!(flip_action(Err(FlipOutcome::Fatal)), FrameAction::Reschedule);
+    }
+
+    #[test]
+    fn flip_action_device_inactive_holds_not_dies() {
+        // A VT switch / suspend (DeviceInactive) is a deliberate "don't paint a dark CRTC"
+        // hold — not an error, and crucially not a death. The compositor waits for the
+        // session to reactivate and resumes painting; it must never panic on this.
+        assert_eq!(flip_action(Err(FlipOutcome::DeviceInactive)), FrameAction::DeviceInactive);
+    }
+
+    #[test]
+    fn no_flip_outcome_maps_to_a_compositor_death() {
+        // Exhaustive guard: EVERY FlipOutcome must map to a NON-fatal FrameAction. If a
+        // future variant is added and forgotten, this fails — there is intentionally no
+        // FrameAction that tears down the compositor, so a flip error can NEVER crash-loop
+        // the boot (the whole point of #186).
+        for outcome in [FlipOutcome::DeviceInactive, FlipOutcome::Transient, FlipOutcome::Fatal] {
+            let action = flip_action(Err(outcome));
+            assert!(
+                matches!(action, FrameAction::Reschedule | FrameAction::DeviceInactive),
+                "{outcome:?} must degrade (Reschedule/DeviceInactive), never abort — got {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vblank_stall_timeout_is_past_a_real_vblank_but_under_a_freeze() {
+        // The lost-vblank escape hatch (#166/#186 robustness) must be LONGER than a real
+        // 60Hz vblank interval (16.7ms) so it never pre-empts a healthy in-flight flip,
+        // yet SHORT enough that a dropped vblank is a stutter, not a watchdog-tripping
+        // freeze. 100ms sits in that window (≈6 missed frames).
+        assert!(
+            VBLANK_STALL_TIMEOUT > Duration::from_millis(17),
+            "stall timeout must clear a real 60Hz vblank interval"
+        );
+        assert!(
+            VBLANK_STALL_TIMEOUT < Duration::from_millis(500),
+            "stall timeout must recover well before a paint-watchdog freeze"
+        );
     }
 }

@@ -247,6 +247,17 @@ pub struct State {
     /// fan-out subscribers). The DRM backend serves the SAME framed-JSON socket the
     /// winit backend does, so an agent arranges real windows on real hardware too.
     pub ipc: crate::ipc::IpcState,
+
+    /// F1 (#166) — CRTCs whose page-flip vblank arrived since the last render tick. The
+    /// per-device DRM VBlank source (a calloop closure with only `&mut State`, NOT the
+    /// per-device surface table) inserts the completed CRTC here; the render tick's
+    /// `reap_completed_vblanks` drains it, calls `frame_submitted()` on the matching
+    /// surface IN VBLANK ORDER, and unblocks that CRTC's next flip. This is the hand-off
+    /// that lets frame-submit be paced by REAL vblanks instead of fired unconditionally
+    /// every tick (which freed in-flight scanout buffers → torn frames).
+    pub vblank_completed: std::collections::HashSet<
+        smithay::reexports::drm::control::crtc::Handle,
+    >,
 }
 
 // ── Per-client state. Carries the compositor-side client bookkeeping Smithay needs
@@ -1048,8 +1059,12 @@ fn ensure_initial_configure(state: &mut State, surface: &WlSurface) {
                 states
                     .data_map
                     .get::<XdgToplevelSurfaceData>()
-                    .map(|d| d.lock().unwrap().initial_configure_sent)
-                    .unwrap_or(false)
+                    // A poisoned surface-data mutex must NOT abort the compositor on a
+                    // client commit (#186 never-fail floor): treat "can't read the flag"
+                    // as "configure already sent" so we don't double-configure, and keep
+                    // the compositor alive. `.lock()` poisons only after a prior panic.
+                    .and_then(|d| d.lock().ok().map(|g| g.initial_configure_sent))
+                    .unwrap_or(true)
             });
             if !initial_configure_sent {
                 toplevel.send_configure();
@@ -1069,8 +1084,9 @@ fn ensure_initial_configure(state: &mut State, surface: &WlSurface) {
             states
                 .data_map
                 .get::<smithay::wayland::shell::wlr_layer::LayerSurfaceData>()
-                .map(|d| d.lock().unwrap().initial_configure_sent)
-                .unwrap_or(false)
+                // Same poisoned-mutex guard as the xdg path above (#186).
+                .and_then(|d| d.lock().ok().map(|g| g.initial_configure_sent))
+                .unwrap_or(true)
         });
         if !initial_configure_sent {
             layer.layer_surface().send_configure();

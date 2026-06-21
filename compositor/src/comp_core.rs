@@ -1321,7 +1321,11 @@ pub fn build_cursor_elements<S, R>(
                 states
                     .data_map
                     .get::<smithay::input::pointer::CursorImageSurfaceData>()
-                    .map(|d| d.lock().unwrap().hotspot)
+                    // A poisoned cursor-data mutex must NOT abort the compositor mid-frame
+                    // (the never-fail render floor, #186): fall back to a zero hotspot and
+                    // keep painting. `.lock()` poisons only if a prior holder panicked — at
+                    // which point dropping the cursor offset is strictly better than dying.
+                    .and_then(|d| d.lock().ok().map(|g| g.hotspot))
                     .unwrap_or_default()
             });
             let cpos = (pos - hotspot.to_f64()).to_physical_precise_round(1.0);
