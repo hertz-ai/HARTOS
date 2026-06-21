@@ -424,6 +424,68 @@ class MessageBus:
         self._deliver_to_subscribers(new_topic, data)
         return True
 
+    def bootstrap_peerlink_ingress(self) -> bool:
+        """Wire the inbound PeerLink 'events' channel → receive_from_peer.
+
+        THE missing wire that made the multi-hop fleet.command relay (gap #57)
+        dead code.  ``_route_peerlink`` SENDS every bus message — including the
+        relayed 'fleet.command' — on the PeerLink ``'events'`` channel
+        (``mgr.broadcast('events', envelope, …)``).  But nothing on the
+        RECEIVING side listened to inbound ``'events'`` frames, so a peer's
+        ``PeerLink._receive_loop`` found zero handlers for that channel and
+        dropped the frame on the floor.  ``receive_from_peer`` (and therefore
+        ``_relay_fleet_command``) was only ever reached over the WAMP/Crossbar
+        leg — which does NOT reach NAT'd sub-trees.  The PeerLink leg is exactly
+        the one that buys reach into a NAT'd node N hops from central, and its
+        inbound handler was absent.
+
+        This registers ONE handler on the link manager's ``'events'`` channel.
+        ``PeerLinkManager.register_channel_handler`` applies it to every current
+        and future link, and ``PeerLink._receive_loop`` invokes channel handlers
+        as ``handler(channel, data, peer_id)`` — so the handler takes that
+        3-arg link signature and forwards the received envelope into the EXISTING
+        ``receive_from_peer`` ingress (dedup + signature-verify + loop/TTL-safe
+        relay all live there; this method adds NO second relay path).  The
+        inbound peer is passed as ``sender_peer_id`` so the re-broadcast excludes
+        the link the command arrived on (no echo-back).
+
+        Idempotent: registers at most once per bus instance.  Best-effort — a
+        missing PeerLink layer (HTTP-only tier, tests) is a silent no-op, never
+        an error.  Returns True iff the handler was newly registered.
+        """
+        if getattr(self, '_peerlink_ingress_wired', False):
+            return False
+
+        try:
+            from core.peer_link.link_manager import get_link_manager
+            mgr = get_link_manager()
+        except Exception as e:
+            logger.debug("PeerLink ingress not wired (no link manager): %s", e)
+            return False
+
+        def _on_events_channel(channel, data, sender_peer_id):
+            # link.py dispatches as handler(channel, data, peer_id).  The wire
+            # envelope carries msg_id/topic/data (+ hop_ttl/origin/relay_path for
+            # the relayed topic); hand it straight to the single ingress.
+            try:
+                if isinstance(data, dict):
+                    self.receive_from_peer(data, sender_peer_id=sender_peer_id or '')
+            except Exception as e:
+                logger.debug("PeerLink 'events' ingress error: %s", e)
+            return None  # fire-and-forget; the relay has no synchronous reply
+
+        try:
+            mgr.register_channel_handler('events', _on_events_channel)
+        except Exception as e:
+            logger.debug("PeerLink ingress registration skipped: %s", e)
+            return False
+
+        self._peerlink_ingress_wired = True
+        logger.info(
+            "PeerLink 'events' ingress wired → receive_from_peer "
+            "(multi-hop fleet.command relay reachable over PeerLink)")
+        return True
+
     def get_stats(self) -> dict:
         return dict(self._stats)
 

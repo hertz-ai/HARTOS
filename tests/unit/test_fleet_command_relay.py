@@ -240,5 +240,139 @@ class TestNonRelayedTopicsUnchanged(_RelayCase):
         self.m_verify.assert_not_called()
 
 
+class TestPeerLinkIngressWiring(unittest.TestCase):
+    """The #188/F5 fix: the inbound PeerLink 'events' channel is wired to
+    receive_from_peer, so a relay node actually re-broadcasts an OTA push to
+    its peers (the multi-hop relay was DEAD before this — no inbound handler
+    listened on 'events', so receive_from_peer was never reached over PeerLink
+    and a NAT'd node N hops away never got the push).
+
+    These mock ONLY the link-manager boundary (no real sockets), drive the REAL
+    bootstrap_peerlink_ingress wiring + the REAL handler it registers, and
+    assert that a 3-node chain (central → THIS relay → next-hop) forwards the
+    UNALTERED signed command one hop further, loop-safely.
+    """
+
+    def setUp(self):
+        self.bus = MessageBus()
+
+        # A stand-in link manager that records register_channel_handler +
+        # captures broadcasts (the outbound re-broadcast leg).
+        self.mgr = MagicMock()
+        self._broadcasts = []
+
+        def _broadcast(channel, envelope, exclude_peer='', **kw):
+            self._broadcasts.append({
+                'channel': channel, 'envelope': envelope,
+                'exclude_peer': exclude_peer,
+            })
+            return 1  # pretend one downstream peer received it
+
+        self.mgr.broadcast.side_effect = _broadcast
+
+        self._getmgr = patch('core.peer_link.link_manager.get_link_manager',
+                             return_value=self.mgr)
+        self._getmgr.start()
+
+        # Pin this relay node's id + force the signature gate True (we are not
+        # testing crypto here — that is covered by the verify_command_signature
+        # tests — we are testing the WIRING that was missing).
+        self._selfid = patch.object(self.bus, '_self_node_id',
+                                    return_value='relaynode0000000')
+        self._selfid.start()
+        self._verify = patch(
+            'integrations.social.fleet_command.FleetCommandService.verify_command_signature',
+            return_value=True)
+        self._verify.start()
+
+    def tearDown(self):
+        for p in (self._getmgr, self._selfid, self._verify):
+            p.stop()
+
+    def _registered_events_handler(self):
+        """Run the real wiring, return the handler registered on 'events'."""
+        self.assertTrue(self.bus.bootstrap_peerlink_ingress())
+        # register_channel_handler('events', handler) — pull the handler arg.
+        for call in self.mgr.register_channel_handler.call_args_list:
+            if call.args and call.args[0] == 'events':
+                return call.args[1]
+        self.fail("no handler registered on the 'events' channel")
+
+    def test_ingress_is_idempotent(self):
+        self.assertTrue(self.bus.bootstrap_peerlink_ingress())
+        self.assertFalse(self.bus.bootstrap_peerlink_ingress())  # second is no-op
+
+    def test_relay_forwards_unaltered_signed_command_one_hop(self):
+        """central → relay → next-hop: the relay forwards the SAME signed blob
+        (issued_by/signature/params untouched — a relay never re-signs),
+        hop_ttl decremented, this node stamped on relay_path, sender excluded."""
+        handler = self._registered_events_handler()
+
+        signed = _signed_cmd()  # central's signed firmware_update
+        wire = {
+            'msg_id': 'ota-from-central',
+            'topic': RELAY_TOPIC,
+            'data': signed,
+            'hop_ttl': RELAY_DEFAULT_HOP_TTL,
+            'origin': 'central00central0',
+            'relay_path': [],
+        }
+        # link.py dispatches inbound as handler(channel, data, peer_id).
+        handler('events', wire, 'central00central0')
+
+        # Re-broadcast happened exactly once, on the 'events' channel.
+        self.assertEqual(len(self._broadcasts), 1)
+        bc = self._broadcasts[0]
+        self.assertEqual(bc['channel'], 'events')
+
+        out = bc['envelope']
+        # SAME msg_id across the hop (downstream LRU collapses duplicates).
+        self.assertEqual(out['msg_id'], 'ota-from-central')
+        # hop_ttl decremented by exactly one.
+        self.assertEqual(out['hop_ttl'], RELAY_DEFAULT_HOP_TTL - 1)
+        # This relay appended to the path (loop guard for the next nodes).
+        self.assertEqual(out['relay_path'], ['relaynode0000000'])
+        # True origin preserved verbatim for audit.
+        self.assertEqual(out['origin'], 'central00central0')
+        # The signed command is forwarded UNALTERED — a relay holds no key and
+        # must not mutate issued_by / signature / params.
+        self.assertEqual(out['data']['issued_by'], signed['issued_by'])
+        self.assertEqual(out['data']['signature'], signed['signature'])
+        self.assertEqual(out['data']['params'], signed['params'])
+        # The inbound sender is excluded so the push never echoes back.
+        self.assertEqual(bc['exclude_peer'], 'central00central0')
+
+    def test_duplicate_arrival_is_not_re_relayed(self):
+        """A re-received duplicate (same msg_id, e.g. via a second peer) is
+        dropped by the LRU dedup — forwarded exactly once, never twice."""
+        handler = self._registered_events_handler()
+
+        def _wire():
+            return {'msg_id': 'dup-ota', 'topic': RELAY_TOPIC, 'data': _signed_cmd(),
+                    'hop_ttl': RELAY_DEFAULT_HOP_TTL, 'origin': 'central00central0',
+                    'relay_path': []}
+
+        handler('events', _wire(), 'peerA')        # first arrival
+        handler('events', _wire(), 'peerB')        # duplicate via another peer
+
+        self.assertEqual(len(self._broadcasts), 1)  # relayed once, not twice
+
+    def test_hop_ttl_zero_is_not_re_relayed(self):
+        """A command that arrives with hop_ttl=0 is delivered locally but NOT
+        forwarded — the drop-at-zero blast-radius cap (loop-safe)."""
+        handler = self._registered_events_handler()
+        wire = {'msg_id': 'ttl0-ota', 'topic': RELAY_TOPIC, 'data': _signed_cmd(),
+                'hop_ttl': 0, 'origin': 'central00central0', 'relay_path': []}
+        handler('events', wire, 'peerA')
+        self.assertEqual(len(self._broadcasts), 0)  # no further hop
+
+    def test_non_dict_payload_is_ignored(self):
+        """A malformed inbound 'events' frame (non-dict) never raises and never
+        relays — the handler is defensive."""
+        handler = self._registered_events_handler()
+        handler('events', b'not-a-dict', 'peerA')  # must not raise
+        self.assertEqual(len(self._broadcasts), 0)
+
+
 if __name__ == '__main__':
     unittest.main()

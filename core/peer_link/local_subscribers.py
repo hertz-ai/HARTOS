@@ -372,7 +372,24 @@ def bootstrap_local_subscribers() -> None:
         logger.debug(f"OTA push receiver not wired: {e}")
         _ota_leg = ""
 
+    # 8. PeerLink inbound 'events' channel → MessageBus.receive_from_peer.
+    #    THE wire that makes the multi-hop fleet.command relay (gap #57) live:
+    #    _route_peerlink SENDS bus messages on the 'events' channel, but without
+    #    an inbound handler a relay node's PeerLink dropped the frame and
+    #    receive_from_peer (→ _relay_fleet_command) was never reached over
+    #    PeerLink — so an OTA push could NOT cross a NAT'd peer hop.  Wiring it
+    #    here (the same long-lived bootstrap as the OTA bus subscriber above)
+    #    closes the mesh: a NAT'd node N hops from central now receives the push.
+    try:
+        if bus.bootstrap_peerlink_ingress():
+            _ingress_leg = ", peerlink-ingress"
+        else:
+            _ingress_leg = ""
+    except Exception as e:
+        logger.debug(f"PeerLink ingress not wired: {e}")
+        _ingress_leg = ""
+
     logger.info(
         "Local subscribers bootstrapped: confirmation, longrunning, "
-        "intermediate, exception, timeout, probe" + _ota_leg
+        "intermediate, exception, timeout, probe" + _ota_leg + _ingress_leg
     )
