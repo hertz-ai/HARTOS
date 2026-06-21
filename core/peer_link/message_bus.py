@@ -650,7 +650,22 @@ class MessageBus:
             if relay_meta:
                 envelope.update(relay_meta)
 
-            sent = mgr.broadcast('events', envelope, exclude_peer=exclude_peer)
+            # Regular bus messages reach the user's OWN devices only (SAME_USER
+            # multi-device sync).  The signed fleet.command relay reaches the
+            # whole fleet — multi-hop into NAT'd sub-trees is its entire purpose
+            # (and it is signature-gated in _relay_fleet_command).  Without this
+            # scope, wiring the inbound 'events' handler would deliver a per-user
+            # topic to a non-SAME_USER (fleet) peer.
+            trust_filter = None
+            if topic != RELAY_TOPIC:
+                try:
+                    from core.peer_link.link import TrustLevel
+                    trust_filter = TrustLevel.SAME_USER
+                except Exception:
+                    trust_filter = None
+
+            sent = mgr.broadcast('events', envelope, trust_filter=trust_filter,
+                                 exclude_peer=exclude_peer)
             if sent > 0:
                 self._stats['delivered_peerlink'] += sent
         except Exception:
