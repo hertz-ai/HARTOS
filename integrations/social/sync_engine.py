@@ -800,18 +800,25 @@ _ENCOUNTER_SYNC_FIELDS = ['user_a_id', 'user_b_id', 'context_type', 'context_id'
                          'encounter_count', 'bond_level', 'is_mutual_aware']
 
 
+def _cloud_egress_ok(db, user_id) -> bool:
+    """Canonical PII-egress gate: True iff ``user_id`` opted into central /
+    off-node replication of their private social data.  ONE home for the
+    cloud_egress + 'social_sync' scope literal, reused by every PII entity
+    (encounter / resonance / friend).  Fail-closed for a missing/None user_id."""
+    from .consent_service import ConsentService
+    return ConsentService.check_consent(db, user_id, 'cloud_egress',
+                                        scope='social_sync')
+
+
 def _encounter_gate(db, obj, demander):
     # An encounter reveals BOTH parties' social-graph participation, so it leaves
     # the node ONLY if EACH party opted in via cloud_egress consent — fail-closed
     # if either is absent or withheld. (Gating on user_a_id alone — the
     # lexicographic-MIN of the pair, set by record_encounter's sorted() — leaked
     # the OTHER party's participation whenever only the min-id user had consented.)
-    from .consent_service import ConsentService
     a = getattr(obj, 'user_a_id', None)
     b = getattr(obj, 'user_b_id', None)
-    return bool(a) and bool(b) and ConsentService.check_consent(
-        db, a, 'cloud_egress', scope='social_sync') and ConsentService.check_consent(
-        db, b, 'cloud_egress', scope='social_sync')
+    return bool(a) and bool(b) and _cloud_egress_ok(db, a) and _cloud_egress_ok(db, b)
 
 
 def _encounter_serialize(db, obj):
@@ -831,9 +838,7 @@ def _resonance_model():
 def _resonance_gate(db, obj, demander):
     # the spark wallet is financial PII — central backup is OFF unless the user
     # opts in via cloud_egress consent (fail-closed)
-    from .consent_service import ConsentService
-    return ConsentService.check_consent(
-        db, getattr(obj, 'user_id', None), 'cloud_egress', scope='social_sync')
+    return _cloud_egress_ok(db, getattr(obj, 'user_id', None))
 
 
 def _resonance_serialize(db, obj):
@@ -847,9 +852,7 @@ def _resonance_serialize(db, obj):
 def _friend_gate(db, obj, demander):
     # friendships are PII (the social graph) — central backup only with the
     # initiator's cloud_egress consent (fail-closed)
-    from .consent_service import ConsentService
-    return ConsentService.check_consent(
-        db, (obj or {}).get('initiator_id'), 'cloud_egress', scope='social_sync')
+    return _cloud_egress_ok(db, (obj or {}).get('initiator_id'))
 
 
 def _friend_serialize(db, obj):
