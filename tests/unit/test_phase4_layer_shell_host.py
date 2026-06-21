@@ -404,6 +404,28 @@ class TestPhase4NixosTest:
         low = src.lower()
         assert "kill" in low and "cage" in low and "floor" in low
 
+    def test_paint_node_asserts_shell_ready_marker_touched_e2e(self, src):
+        # The full paint+marker E2E the task names: OCR proves PIXELS, this proves
+        # the GTK4 host's _on_load_changed actually touched /run/hart/session/
+        # shell-ready on first paint (so the supervisor's HUNG guard sees a HEALTHY
+        # Tier-2 — a painting surface must NOT be dropped as hung). The paint node
+        # waits for the marker after the OCR.
+        assert "/run/hart/session/shell-ready" in src
+        low = src.lower()
+        assert "marker" in low
+        # Asserted via a real filesystem wait, not prose.
+        assert "wait_until_succeeds" in src and "shell-ready" in src
+
+    def test_structural_node_asserts_tier1_tier2_same_host_binary(self, src):
+        # DRY across tiers: the structural node reads back the Tier-2 sway host
+        # config + (when armed) the Tier-1 hart-comp launcher and asserts BOTH
+        # reference the identical hart-glass-shell-gtk4 binary — one glass host, not
+        # a per-tier copy.
+        assert "hart-comp-session" in src
+        assert "hart-gtk4-layer-host.conf" in src
+        # The binary basename is the single source of truth shared across tiers.
+        assert src.count("hart-glass-shell-gtk4") >= 1
+
 
 # ═══════════════════════════════════════════════════════════════
 # 8. Wired into the flake: hartModules[] + checks (else it never runs)
@@ -453,3 +475,384 @@ class TestNeverFailOrderingInvariant:
             assert "displayManager.defaultSession" not in src, (
                 f"{name} must NOT touch displayManager.defaultSession."
             )
+
+
+# ═══════════════════════════════════════════════════════════════
+# Extraction helpers — pull the EMBEDDED host scripts out of the Nix
+# modules so they can be SYNTAX-checked on the dev box (py_compile /
+# dash -n), not merely grepped. The Nix wrapper cannot be built here
+# (no Wayland/wlroots/WebKitGTK), but the shell + python it embeds ARE
+# plain text whose SYNTAX is verifiable today. This is the dev-box-side
+# of the task's "py_compile the host python; dash -n the host scripts".
+# ═══════════════════════════════════════════════════════════════
+
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def _skip_nix_antiquote(s, i):
+    """Given ``s[i:i+2] == '${'`` (the start of a Nix antiquotation), return the
+    index just past its matching ``}``. Tracks brace nesting AND skips over any
+    nested Nix strings inside the antiquote — both double-quoted (``"…"``, which
+    may legitimately contain ``"ON_DEMAND"`` etc.) and indented (``''…''``, e.g.
+    the cage host's ``${lib.optionalString ui.runOnboardingInKiosk ''…''}``) — so
+    a ``"`` or ``''`` INSIDE the antiquote is never mistaken for the enclosing
+    string's terminator. This is the crux: the host scripts embed antiquotations
+    whose Nix code contains the very quote chars that delimit the outer string."""
+    n = len(s)
+    j = i + 2          # past the '${'
+    depth = 1
+    while j < n and depth > 0:
+        c = s[j]
+        if c == "{":
+            depth += 1
+            j += 1
+        elif c == "}":
+            depth -= 1
+            j += 1
+        elif c == '"':
+            # nested double-quoted Nix string — skip to its close (handle \").
+            j += 1
+            while j < n and s[j] != '"':
+                if s[j] == "\\":
+                    j += 1
+                j += 1
+            j += 1
+        elif c == "'" and j + 1 < n and s[j + 1] == "'":
+            # nested indented Nix string ''…'' — skip to its close ''.
+            j += 2
+            while j < n - 1 and not (s[j] == "'" and s[j + 1] == "'"):
+                j += 1
+            j += 2
+        else:
+            j += 1
+    return j
+
+
+def _neutralize_nix_interp(text):
+    """Replace Nix ``${...}`` antiquotations with a syntactically-inert token so
+    the extracted body parses as plain shell / python.
+
+    ``${pkgs.curl}`` / ``${liquidPort}`` / ``${if … then "ON_DEMAND" else …}`` are
+    real Nix antiquotations (Nix substitutes a store path / string at build time).
+    After extraction these are not valid shell/python, so collapse each to the
+    bareword ``NIX`` — a valid identifier fragment in both languages
+    (``${pkgs.curl}/bin/curl`` -> ``NIX/bin/curl``;
+    ``HardwareAccelerationPolicy.${if …}`` -> ``HardwareAccelerationPolicy.NIX``).
+    Antiquote boundaries are found with the brace/string-aware scanner above (NOT
+    a naive regex), so an antiquote containing braces or quotes is collapsed whole.
+
+    NOTE: ``''${VAR}'' `` (Nix's escape for a LITERAL ``${VAR}`` that must reach the
+    generated bash) is un-escaped to a genuine ``${VAR}`` by the caller BEFORE this
+    runs, so a real shell parameter expansion survives and is not collapsed."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "$" and i + 1 < n and text[i + 1] == "{":
+            end = _skip_nix_antiquote(text, i)
+            out.append("NIX")
+            i = end
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def _scan_nix_indented_string(s, start):
+    """Return (body, end) for a Nix indented string whose body begins at ``start``
+    (just past the opening ``''``). Walks to the closing ``''`` while honoring the
+    two Nix escapes — ``''${`` (escaped antiquote) and ``'''`` (escaped quote) — and
+    SKIPPING any ``${…}`` antiquotation (whose nested ``''…''`` would otherwise look
+    like the terminator). ``body`` is the raw substring; ``end`` is past the ``''``."""
+    n = len(s)
+    i = start
+    while i < n - 1:
+        if s[i] == "$" and s[i + 1] == "{":
+            i = _skip_nix_antiquote(s, i)
+            continue
+        if s[i] == "'" and s[i + 1] == "'":
+            nxt = s[i + 2] if i + 2 < n else ""
+            if nxt == "$" and i + 3 < n and s[i + 3] == "{":
+                i += 2          # ''${ escaped antiquote — not a terminator
+                continue
+            if nxt == "'":
+                i += 3          # ''' escaped single-quote
+                continue
+            return s[start:i], i + 2   # genuine closing ''
+        i += 1
+    return s[start:n], n
+
+
+def _extract_shell_script_body(nix_src, drv_name):
+    """Return the bash body of ``writeShellScriptBin "<drv_name>" ''…''`` with the
+    Nix escape un-applied (``''${`` -> ``${``) and antiquotations neutralized,
+    ready for ``dash -n``. Uses the antiquote-aware indented-string scanner so a
+    nested ``${lib.optionalString … ''…''}`` does not truncate the body."""
+    marker = 'writeShellScriptBin "%s" \'\'' % drv_name
+    start = nix_src.index(marker) + len(marker)
+    body, _ = _scan_nix_indented_string(nix_src, start)
+    # Un-escape Nix's ''${ -> ${ so a LITERAL shell ${VAR} expansion survives
+    # (e.g. HART_SHELL_READY_FLAG="''${HART_SHELL_READY_FLAG:-…}"), BEFORE the
+    # antiquote-collapse pass (which would otherwise eat the real expansion).
+    body = body.replace("''${", "${")
+    return _neutralize_nix_interp(body)
+
+
+def _extract_python_c_body(nix_src):
+    """Return the python passed to ``python -c "…"`` inside the host wrapper, with
+    Nix antiquotations neutralized, ready for ``py_compile``.
+
+    The python is a Nix DOUBLE-quoted string (``python -c "<py>"``). Its body can
+    contain ``${if … then "ON_DEMAND" else "NEVER"}`` — antiquotations whose nested
+    ``"`` would fool a naive ``index('"')``. Walk to the real closing ``"`` while
+    skipping ``${…}`` antiquotations and honoring ``\\`` escapes."""
+    marker = 'python -c "'
+    start = nix_src.index(marker) + len(marker)
+    i = start
+    n = len(nix_src)
+    while i < n:
+        c = nix_src[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "$" and i + 1 < n and nix_src[i + 1] == "{":
+            i = _skip_nix_antiquote(nix_src, i)
+            continue
+        if c == '"':
+            break               # the real closing quote of the Nix string
+        i += 1
+    body = nix_src[start:i]
+    return _neutralize_nix_interp(body)
+
+
+def _dash_check(script_text):
+    """Run ``dash -n`` (POSIX-sh syntax check, no execution) on script_text.
+    Returns (ok, stderr). Skips cleanly if dash is unavailable."""
+    dash = shutil.which("dash") or "/usr/bin/dash"
+    if not os.path.exists(dash):
+        pytest.skip("dash not available on this host")
+    # newline="\n": force LF line endings. On Windows the default text mode writes
+    # CRLF, and dash chokes on the trailing \r ("word unexpected" at the first
+    # compound statement) — a false failure that has nothing to do with the script.
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".sh", delete=False, encoding="utf-8", newline="\n"
+    ) as f:
+        f.write(script_text)
+        path = f.name
+    try:
+        proc = subprocess.run(
+            [dash, "-n", path], capture_output=True, text=True
+        )
+        return proc.returncode == 0, proc.stderr
+    finally:
+        os.unlink(path)
+
+
+def _py_compile_check(py_text):
+    """Compile py_text in-process via ``compile()`` (py_compile's core) — proves
+    the embedded host python PARSES + builds bytecode. Returns (ok, err)."""
+    try:
+        compile(py_text, "<embedded-glass-host>", "exec")
+        return True, ""
+    except SyntaxError as e:
+        return False, f"{e.__class__.__name__}: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 10. The embedded host scripts COMPILE: py_compile the host python +
+#     dash -n the host shell wrappers (BOTH the GTK4 host AND the GTK3
+#     cage floor — the two real paint hosts). A grep test proves a string
+#     survived; THIS proves the script the kiosk execs is not malformed.
+# ═══════════════════════════════════════════════════════════════
+
+class TestHostScriptsCompile:
+    @pytest.fixture(scope="class")
+    def gtk4_src(self):
+        return _read(MODULE)
+
+    @pytest.fixture(scope="class")
+    def cage_src(self):
+        return _read(os.path.join(MODULES_DIR, "hart-liquid-ui.nix"))
+
+    def test_gtk4_host_python_py_compiles(self, gtk4_src):
+        # The GTK4 host's `python -c` body must PARSE — a malformed host crashes
+        # the GTK4 Tier-2 session the instant it execs (no syntax error is caught
+        # by the nixosTest's grep assertions). compile() is py_compile's core.
+        py = _extract_python_c_body(gtk4_src)
+        # Sanity: we actually extracted the GTK4 host, not an empty slice.
+        assert "GlassShellLayer" in py and "gi.require_version('Gtk', '4.0')" in py, (
+            "GTK4 host python extraction failed — body did not contain the host class"
+        )
+        ok, err = _py_compile_check(py)
+        assert ok, f"GTK4 host python does NOT compile:\n{err}"
+
+    def test_cage_gtk3_host_python_py_compiles(self, cage_src):
+        # The GTK3 cage Tier-3 FLOOR host python must also parse — it is the tier
+        # a GTK4 crash drops to; a malformed floor host would defeat the never-fail
+        # ladder. Same compile guard, the floor's host body.
+        py = _extract_python_c_body(cage_src)
+        assert "class GlassShell" in py and "gi.require_version('Gtk', '3.0')" in py, (
+            "cage GTK3 host python extraction failed — body did not contain GlassShell"
+        )
+        ok, err = _py_compile_check(py)
+        assert ok, f"cage GTK3 floor host python does NOT compile:\n{err}"
+
+    def test_gtk4_host_shell_wrapper_dash_n_clean(self, gtk4_src):
+        # The GTK4 host's shell wrapper (the curl-probe + env-export preamble that
+        # execs python) must be POSIX-sh valid — a syntax error there means the
+        # host never launches. dash -n is the no-execute POSIX syntax check.
+        sh = _extract_shell_script_body(gtk4_src, "hart-glass-shell-gtk4")
+        assert "HART_SHELL_READY_FLAG" in sh and "GI_TYPELIB_PATH" in sh, (
+            "GTK4 host shell extraction failed — preamble markers missing"
+        )
+        ok, err = _dash_check(sh)
+        assert ok, f"GTK4 host shell wrapper fails dash -n:\n{err}"
+
+    def test_gtk4_session_launcher_dash_n_clean(self, gtk4_src):
+        # The session launcher (forces software GL, execs sway onto the host) is a
+        # separate writeShellScriptBin — syntax-check it too.
+        sh = _extract_shell_script_body(gtk4_src, "hart-glass-shell-gtk4-session")
+        assert "WLR_RENDERER_ALLOW_SOFTWARE=1" in sh, (
+            "GTK4 session launcher extraction failed — software-GL env missing"
+        )
+        ok, err = _dash_check(sh)
+        assert ok, f"GTK4 session launcher fails dash -n:\n{err}"
+
+    def test_cage_gtk3_host_shell_wrapper_dash_n_clean(self, cage_src):
+        # Parity: the cage floor's glass-shell wrapper must be POSIX-sh valid too
+        # (it is the tier a GTK4 crash lands on).
+        sh = _extract_shell_script_body(cage_src, "hart-glass-shell")
+        assert "HART_SHELL_READY_FLAG" in sh, (
+            "cage host shell extraction failed — marker preamble missing"
+        )
+        ok, err = _dash_check(sh)
+        assert ok, f"cage GTK3 host shell wrapper fails dash -n:\n{err}"
+
+    def test_cage_gtk3_session_launcher_dash_n_clean(self, cage_src):
+        sh = _extract_shell_script_body(cage_src, "hart-shell-session")
+        assert "WLR_RENDERER_ALLOW_SOFTWARE=1" in sh, (
+            "cage session launcher extraction failed — software-GL env missing"
+        )
+        ok, err = _dash_check(sh)
+        assert ok, f"cage GTK3 session launcher fails dash -n:\n{err}"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 11. PARITY — the GTK3 cage floor host satisfies the SAME paint-watchdog
+#     contract as the GTK4 host: define _on_load_changed, call
+#     _signal_painted() on LoadEvent.FINISHED, touch /run/hart/session/
+#     shell-ready. BOTH hosts must keep the marker or the supervisor wrongly
+#     drops a HEALTHY tier (the pointer-only regression, on either host).
+# ═══════════════════════════════════════════════════════════════
+
+class TestCageGtk3MarkerParity:
+    @pytest.fixture(scope="class")
+    def cage(self):
+        return _read(os.path.join(MODULES_DIR, "hart-liquid-ui.nix"))
+
+    @pytest.fixture(scope="class")
+    def gtk4(self):
+        return _read(MODULE)
+
+    def test_cage_host_defines_and_connects_load_changed(self, cage):
+        # The cage GTK3 host connects 'load-changed' AND defines the handler — the
+        # original GTK4 bug (connected-but-undefined) must never exist on the floor.
+        assert "webview.connect('load-changed', self._on_load_changed)" in cage
+        assert "def _on_load_changed" in cage, (
+            "cage GTK3 host connects load-changed but never DEFINES it — the floor "
+            "would never touch shell-ready and the watchdog would drop a healthy floor."
+        )
+
+    def test_cage_host_signals_paint_on_finished(self, cage):
+        # On LoadEvent.FINISHED the cage host must call _signal_painted() — the same
+        # first-frame marker the GTK4 host fires (WebKit2 enum on the GTK3 binding).
+        assert "_signal_painted()" in cage
+        assert "WebKit2.LoadEvent.FINISHED" in cage, (
+            "cage host must gate the marker on WebKit2.LoadEvent.FINISHED (first frame)."
+        )
+
+    def test_cage_host_touches_the_same_shell_ready_marker(self, cage):
+        # Same /run/hart contract path + same HART_SHELL_READY_FLAG override the
+        # GTK4 host uses — ONE marker path both hosts honor (DRY watchdog contract).
+        assert "/run/hart/session/shell-ready" in cage
+        assert "HART_SHELL_READY_FLAG" in cage
+
+    def test_both_hosts_share_the_identical_marker_contract(self, cage, gtk4):
+        # The marker path + env var + write semantics are byte-identical across the
+        # two hosts (one watchdog contract, two toolkit hosts). Assert the shared
+        # tokens appear in BOTH so a future edit to one can't silently diverge.
+        for token in (
+            "/run/hart/session/shell-ready",
+            'os.environ.get(\'HART_SHELL_READY_FLAG\'',
+            "os.makedirs(os.path.dirname(READY_FLAG), exist_ok=True)",
+        ):
+            assert token in cage, f"cage host missing shared marker token: {token!r}"
+            assert token in gtk4, f"GTK4 host missing shared marker token: {token!r}"
+
+    def test_cage_floor_signal_painted_is_oserror_safe(self, cage):
+        # The marker write must NEVER crash the floor host (a missing /run/hart dir
+        # / EROFS must degrade, not SIGABRT) — the supervisor escalates DOWN on a
+        # missing marker, so a crash here would be strictly worse than no marker.
+        assert "except OSError:" in cage, (
+            "cage _signal_painted must swallow OSError — a marker write must never "
+            "crash the never-fail floor host."
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 12. DRY — Tier-1 (hart-comp) and Tier-2 (sway/layer-shell host) launch the
+#     SAME `hart-glass-shell-gtk4` glass host binary (ONE source). The whole
+#     point of the layer-shell host is that every higher tier re-hosts the
+#     one served shell through the one host window — not a per-tier copy.
+# ═══════════════════════════════════════════════════════════════
+
+class TestTier1Tier2SameGlassHostBinary:
+    @pytest.fixture(scope="class")
+    def comp(self):
+        return _read(os.path.join(MODULES_DIR, "hart-comp.nix"))
+
+    @pytest.fixture(scope="class")
+    def layer(self):
+        return _read(MODULE)
+
+    def test_tier2_sessions_exec_the_gtk4_host_binary(self, layer):
+        # Tier-2 = the layer-shell host module: its sway config execs the GTK4 host
+        # binary as sway's single startup client (the one source of the host).
+        assert "hart-glass-shell-gtk4" in layer
+        assert "exec ${layerShellHost}/bin/hart-glass-shell-gtk4" in layer, (
+            "Tier-2 sway host config must exec the layerShellHost GTK4 binary."
+        )
+
+    def test_tier1_hartcomp_launches_the_same_gtk4_host_binary(self, comp):
+        # Tier-1 = hart-comp: its session launcher must run the SAME
+        # `hart-glass-shell-gtk4` binary (preferred) so Tier-1 and Tier-2 are the
+        # one host, not two. hart-comp finds it on PATH (it is added to
+        # systemPackages by the layer-shell host module), the GTK3 cage host is the
+        # documented fallback only.
+        assert "hart-glass-shell-gtk4" in comp, (
+            "Tier-1 hart-comp must launch the SAME hart-glass-shell-gtk4 host as "
+            "Tier-2 — one glass host across the tiers (DRY), not a per-tier copy."
+        )
+
+    def test_both_tiers_name_the_identical_binary_one_source(self, comp, layer):
+        # The binary NAME is the single source of truth shared across both tiers.
+        # If the layer-shell module renamed the drv, Tier-1's PATH lookup would
+        # silently miss and fall back to the GTK3 cage host (a parity regression).
+        binary = "hart-glass-shell-gtk4"
+        assert binary in layer and binary in comp, (
+            "Tier-1 (hart-comp) and Tier-2 (layer-shell host) must reference the "
+            f"identical glass host binary name {binary!r} — one source."
+        )
+        # And the layer-shell module is the SOLE definer (writeShellScriptBin) of
+        # that binary — hart-comp only references it, it does not redefine a copy.
+        assert 'writeShellScriptBin "hart-glass-shell-gtk4"' in layer, (
+            "the GTK4 host binary must be DEFINED once in hart-layer-shell-host.nix."
+        )
+        assert 'writeShellScriptBin "hart-glass-shell-gtk4"' not in comp, (
+            "hart-comp must NOT redefine the GTK4 host — it references the one "
+            "source on PATH (a second definition would be a parallel path)."
+        )
