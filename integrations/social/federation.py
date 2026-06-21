@@ -176,16 +176,11 @@ class FederationManager:
         Only public/consented content rises; friends/community/private stays
         local.  Best-effort — a sync hiccup never blocks the post.  Returns the
         queue id or None."""
-        from .privacy import is_public
-        if not is_public((post_dict or {}).get('privacy')):
-            return None
-        try:
-            from .sync_engine import SyncEngine
-            return SyncEngine.queue(
-                db, 'central', 'sync_post', self._outbox_message(post_dict))
-        except Exception as e:
-            logger.debug("Federation.sync_to_parent: queue failed: %s", e)
-            return None
+        # Thin shim over the ONE unified producer (SyncEngine.queue_entity),
+        # which resolves the 'sync_post' entity and runs the SAME is_public gate
+        # + _outbox_message serialize + queue.  No second producer path.
+        from .sync_engine import SyncEngine
+        return SyncEngine.queue_entity(db, post_dict)
 
     def _agent_message(self, db, user) -> dict:
         """Canonical 'register_agent' envelope for a local agent User — the
@@ -247,19 +242,12 @@ class FederationManager:
 
         Best-effort — a sync hiccup never blocks agent creation.  Returns the
         queue id or None."""
-        if getattr(user, 'user_type', None) != 'agent':
-            return None
-        owner_id = getattr(user, 'owner_id', None)
-        try:
-            from .consent_service import ConsentService
-            if not ConsentService.check_consent(db, owner_id, 'public_exposure'):
-                return None
-            from .sync_engine import SyncEngine
-            return SyncEngine.queue(
-                db, 'central', 'register_agent', self._agent_message(db, user))
-        except Exception as e:
-            logger.debug("Federation.sync_agent_to_parent: queue failed: %s", e)
-            return None
+        # Thin shim over the ONE unified producer (SyncEngine.queue_entity),
+        # which resolves the 'register_agent' entity and runs the SAME
+        # user_type=='agent' + owner public_exposure consent gate + _agent_message
+        # serialize + queue.  Non-agent / ownerless / unconsented no-op.
+        from .sync_engine import SyncEngine
+        return SyncEngine.queue_entity(db, user)
 
     # ─── Inbox: Receive posts from followed instances ───
 

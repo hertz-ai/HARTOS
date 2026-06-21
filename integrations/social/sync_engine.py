@@ -33,6 +33,7 @@ class SyncEntity:
     model: type = None
     gate: Callable = None         # (db, obj, demander) -> bool — consent/privacy
     serialize: Callable = None    # (db, obj) -> dict — provenance-stamped, no assets
+    match: Callable = None        # (obj) -> bool — resolve an obj to this entity (producer)
     topic: str = ''               # WAMP topic template for P2P + down-push
     p2p: bool = True
     central: bool = True
@@ -80,6 +81,30 @@ class SyncEngine:
         db.add(item)
         db.flush()
         return item.id
+
+    @staticmethod
+    def queue_entity(db, obj, demander: str = 'user') -> Optional[str]:
+        """Single producer for the unified sync layer — the ONE entry point to
+        replicate any entity UP to central
+        (docs/architecture/UNIFIED_SYNC_ARCHITECTURE.md).  Resolves the entity
+        from the registry (SyncEntity.match), runs its gate (privacy/consent),
+        serializes (provenance-stamped, NO asset bytes), and queues it.  Reuses
+        the canonical gate/serialize helpers — no per-caller branch, no second
+        producer.  Best-effort: never blocks the caller's write.  Returns the
+        queue id, or None (no match / gated / failed)."""
+        try:
+            ent = next((e for e in SYNC_ENTITIES.values()
+                        if e.match and e.match(obj)), None)
+            if ent is None or ent.gate is None:
+                return None
+            if not ent.gate(db, obj, demander):
+                return None
+            payload = ent.serialize(db, obj)
+            return (SyncEngine.queue(db, 'central', ent.op, payload)
+                    if ent.central else None)
+        except Exception as e:
+            logger.debug("SyncEngine.queue_entity: %s", e)
+            return None
 
     @staticmethod
     def drain_queue(db, node_id: str, target_url: str, batch_size: int = 50) -> Dict:
@@ -567,10 +592,42 @@ class SyncEngine:
 # the producer + real-time transport all read from here — never an if/elif
 # ladder or a second producer.  P1: the 3 existing entities; gate/serialize/
 # topic land in P2+.  Op names are the existing wire ops (backward-compatible).
+# Producer-side gate/serialize/match per entity — REUSE the canonical helpers
+# (privacy.is_public, federation._outbox_message/_agent_message,
+# ConsentService.check_consent), lazy-imported so the registry has no import-time
+# cycle.  queue_entity drives off these; there is no second producer.
+def _post_gate(db, obj, demander):
+    from .privacy import is_public
+    return is_public((obj or {}).get('privacy'))
+
+
+def _post_serialize(db, obj):
+    from .federation import federation
+    return federation._outbox_message(obj)
+
+
+def _agent_gate(db, obj, demander):
+    from .consent_service import ConsentService
+    return ConsentService.check_consent(
+        db, getattr(obj, 'owner_id', None), 'public_exposure')
+
+
+def _agent_serialize(db, obj):
+    from .federation import federation
+    return federation._agent_message(db, obj)
+
+
 SYNC_ENTITIES: Dict[str, SyncEntity] = {
-    'sync_post': SyncEntity(op='sync_post', apply=SyncEngine._handle_sync_post),
-    'register_agent': SyncEntity(op='register_agent', apply=SyncEngine._handle_sync_agent),
-    'sync_user': SyncEntity(op='sync_user', apply=SyncEngine._handle_sync_user),
+    'sync_post': SyncEntity(
+        op='sync_post', apply=SyncEngine._handle_sync_post,
+        match=lambda o: isinstance(o, dict) and 'privacy' in o,
+        gate=_post_gate, serialize=_post_serialize),
+    'register_agent': SyncEntity(
+        op='register_agent', apply=SyncEngine._handle_sync_agent,
+        match=lambda o: getattr(o, 'user_type', None) == 'agent',
+        gate=_agent_gate, serialize=_agent_serialize),
+    'sync_user': SyncEntity(
+        op='sync_user', apply=SyncEngine._handle_sync_user),
 }
 
 # The ONE op→handler dispatch the receiver uses: every entity's apply, PLUS the
