@@ -1141,7 +1141,7 @@ class ModelLifecycleManager:
         with self._lock:
             state = self._models.get('llm')
             if state is None:
-                self._models['llm'] = ModelState(
+                state = ModelState(
                     name='llm',
                     device=ModelDevice.GPU,  # Best-effort default
                     priority=ModelPriority.ACTIVE,
@@ -1151,6 +1151,7 @@ class ModelLifecycleManager:
                     crash_count=0,
                     pressure_evict_only=True,
                 )
+                self._models['llm'] = state
             elif state.device == ModelDevice.UNLOADED:
                 # Adopted server is alive but state was stale (spawned outside
                 # RTM -> never marked loaded). Heal in place so the next tick
@@ -1159,6 +1160,17 @@ class ModelLifecycleManager:
                 state.priority = ModelPriority.ACTIVE
                 state.crash_count = 0
                 state.last_access_time = time.time()
+            # PIN the main engine.  It is an EXTERNAL adopted llama-server the
+            # lifecycle CANNOT actually unload, so any pressure eviction only
+            # stamps a FALSE device=UNLOADED — which bounces the user's
+            # foreground "hi" to the LangChain-local "Loading tools..." rung and
+            # evicts piper TTS in the same sweep (the both-symptom ladder
+            # demotion seen under daemon-driven CPU pressure).  Healing the state
+            # on the next tick (#125) only papered over the churn; pinning
+            # PREVENTS it — every eviction rung (VRAM/RAM/CPU/idle) guards on
+            # `not s.pinned`, vram_gb=0.0 ⇒ zero pinned-budget cost, and
+            # _check_llm_health still supervises a REAL death over HTTP.
+            state.pinned = True
 
     def _check_llm_health(self, dead_models: list):
         """Check llama.cpp server health (separate from RTM sidecar tools).
