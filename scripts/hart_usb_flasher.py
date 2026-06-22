@@ -391,18 +391,18 @@ def _dismount_windows(disk):
     ps = ("Get-Partition -DiskNumber %d -ErrorAction SilentlyContinue | "
           "Get-Volume -ErrorAction SilentlyContinue | "
           "Where-Object DriveLetter | ForEach-Object { $_.DriveLetter }" % disk["number"])
-    r = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
+    r = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=30)
     for letter in (r.stdout or "").split():
         letter = letter.strip()
         if letter:
-            _run(["cmd", "/c", "mountvol", "%s:" % letter, "/D"])
+            _run(["cmd", "/c", "mountvol", "%s:" % letter, "/D"], timeout=20)
 
 
 def _win_automount(enable):
     """Toggle Windows auto-mounting of new volumes (mountvol /E or /N). With it
     disabled, Windows won't re-mount — and protect — the ISO9660 volume as it is
     written, which otherwise fails raw writes with 'Invalid request code'."""
-    _run(["cmd", "/c", "mountvol", "/E" if enable else "/N"])
+    _run(["cmd", "/c", "mountvol", "/E" if enable else "/N"], timeout=20)
 
 
 def _win_diskpart_clean(disk_number, log):
@@ -416,7 +416,8 @@ def _win_diskpart_clean(disk_number, log):
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write("select disk %d\nclean\n" % disk_number)
-        r = subprocess.run(["diskpart", "/s", path], capture_output=True, text=True)
+        r = subprocess.run(["diskpart", "/s", path], capture_output=True, text=True,
+                            timeout=45)
         ok = "succeeded in cleaning" in (r.stdout or "").lower()
         log("  diskpart clean disk %d: %s" %
             (disk_number, "OK" if ok else (r.stdout or r.stderr or "").strip()[-160:]))
@@ -434,9 +435,26 @@ def _prepare_windows_device(disk, dd, log):
     any drive-letter mounts, and wipe the partition table with diskpart `clean`
     so there is no protected partition/volume. Without this, raw writes fail with
     'Invalid request code' / 'Permission denied' at ~12 MB."""
-    _win_automount(False)
-    _dismount_windows(disk)
-    _win_diskpart_clean(disk["number"], log)
+    def _do_prepare():
+        _win_automount(False)
+        _dismount_windows(disk)
+        _win_diskpart_clean(disk["number"], log)
+
+    try:
+        _do_prepare()
+    except subprocess.TimeoutExpired:
+        # A wedged Windows VDS (heavy WSL2 / Hyper-V / QEMU / nested-virt host)
+        # can hang a diskpart `clean` / Get-Volume step INDEFINITELY. Reset the
+        # USB host controllers via pnputil — the SAME reboot-free un-wedge the
+        # enumeration path uses — then retry the prepare ONCE.
+        log("  device-prepare HUNG (VDS wedged) — pnputil USB self-heal + retry")
+        _windows_usb_self_heal(log)
+        try:
+            _do_prepare()
+        except subprocess.TimeoutExpired:
+            log("  device-prepare STILL hung after the USB reset — continuing to the "
+                "raw write anyway (prepare is best-effort: the exclusive-handle retry "
+                "loop + the ISO image overwrite the partition table)")
 
 
 class _WinExclusiveWriter:
