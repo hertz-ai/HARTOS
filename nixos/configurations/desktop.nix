@@ -197,6 +197,14 @@ in
       # The boot now tries Tier-1 first; the shell-paint watchdog still drops to
       # sway then the cage floor if Tier-1 fails on real HW (safe to re-arm).
       startTier = "hart-comp";
+      # The glass-shell host blocks on the :6800 LiquidUI server's /health for up to
+      # 30s before it can paint its first frame. The default 20s watchdog therefore
+      # killed a tier that was legitimately WAITING for the backend (real-HW boot
+      # 2026-06-24: Tier-1/2 dropped to cage mid-wait). 45s > the host's 30s wait +
+      # load + paint, so a backend that comes up within 30s is NOT killed; a truly
+      # hung tier still drops (just 25s later). Paired with the :6800-starts-fast fix
+      # (hart-liquid-ui no longer orders after the model bus), this should rarely bind.
+      shellPaintTimeoutSeconds = 45;
     };
 
     # Tier-1: HART-comp, the AI-native Smithay/Rust compositor (--backend drm).

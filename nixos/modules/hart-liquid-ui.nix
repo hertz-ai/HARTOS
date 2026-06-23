@@ -341,6 +341,16 @@ in
         pkgs.webkitgtk_4_1
         pkgs.gobject-introspection
       ];
+
+      # The Phase-1 tier-drop supervisor's cage FLOOR launcher. Like hart-comp.nix
+      # (compCommand) and hart-layer-shell-host.nix (swayCommand), point the floor at
+      # the ABSOLUTE store path of the cage session launcher: the supervisor option
+      # default is the BARE "hart-shell-session", which is NOT on the greetd selector's
+      # PATH, so the floor died "command not found" (rc=127) and crash-looped on the
+      # floor — the never-fail guarantee itself broken (real-HW boot 2026-06-24).
+      # mkOverride 900 mirrors swayCommand; gated on the supervisor so it's a no-op off.
+      hart.sessionSupervisor.cageCommand = lib.mkIf config.hart.sessionSupervisor.enable
+        (lib.mkOverride 900 "${kioskLauncher}/bin/hart-shell-session");
     }
 
     # ─────────────────────────────────────────────────────────
@@ -350,7 +360,15 @@ in
       systemd.services.hart-liquid-ui = {
         description = "HART OS LiquidUI — AI-Generated Adaptive Interface";
         documentation = [ "https://github.com/hertz-ai/HARTOS" ];
-        after = [ "hart.target" "hart-model-bus.service" ];
+        # :PORT must come up FAST: the glass-shell host blocks on :PORT/health for up
+        # to 30s before it paints, and the session-supervisor's shell-paint watchdog
+        # drops a tier that hasn't painted — so a slow :PORT made Tier-1/2 get killed
+        # mid-wait and fall to cage (real-HW boot 2026-06-24). The shell server does
+        # NOT need the model bus to render: it degrades to a static UI without it (see
+        # the Model-Bus probe in ExecStart). `wants` STILL pulls the model bus in (the
+        # generative UI activates once it appears), but it is DROPPED from `after` so
+        # :PORT no longer waits behind model loading — they start concurrently.
+        after = [ "hart.target" ];
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
 
