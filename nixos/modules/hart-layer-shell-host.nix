@@ -156,9 +156,9 @@ READY_FLAG = os.environ.get('HART_SHELL_READY_FLAG', '/run/hart/session/shell-re
 
 
 def _signal_painted():
-    '''Touch the first-paint marker the session-supervisor watches. Best-effort —
-    a missing dir / permission error must NEVER crash the shell (the supervisor
-    degrades safely: a missing marker escalates DOWN to the cage floor).'''
+    # Touch the first-paint marker the session-supervisor watches. Best-effort:
+    # a missing dir / permission error must NEVER crash the shell (the supervisor
+    # degrades safely: a missing marker escalates DOWN to the cage floor).
     try:
         os.makedirs(os.path.dirname(READY_FLAG), exist_ok=True)
         with open(READY_FLAG, 'w'):
@@ -168,14 +168,13 @@ def _signal_painted():
 
 
 class GlassShellLayer:
-    '''The glass shell as a GTK4 wlr-layer-shell BACKGROUND surface.
-
-    Z-ORDER MODEL (1) — picked in code: ONE layer-shell surface (one WebView),
-    overlays/orb co-planar inside it, anchored to all 4 edges as the BACKGROUND
-    layer with exclusive zone 0. Native toplevels (Phase 5) sit ABOVE this; the
-    orb does NOT float over a focused native window (the honest Model-1 limit).
-    The served shell HTML/JS is UNCHANGED — that is the whole reason for Model 1.
-    '''
+    # The glass shell as a GTK4 wlr-layer-shell BACKGROUND surface.
+    #
+    # Z-ORDER MODEL (1) - picked in code: ONE layer-shell surface (one WebView),
+    # overlays/orb co-planar inside it, anchored to all 4 edges as the BACKGROUND
+    # layer with exclusive zone 0. Native toplevels (Phase 5) sit ABOVE this; the
+    # orb does NOT float over a focused native window (the honest Model-1 limit).
+    # The served shell HTML/JS is UNCHANGED - that is the whole reason for Model 1.
 
     def __init__(self, app):
         self._win = Gtk.ApplicationWindow(application=app)
@@ -242,17 +241,17 @@ class GlassShellLayer:
         self._webview.grab_focus()
 
     def _on_load_changed(self, _webview, event):
-        '''Touch the first-paint marker once the WebView finishes its first load.
-
-        This is the GTK4/WebKit-6.0 mirror of the GTK3 cage floor's
-        _on_load_changed. WITHOUT it the connected 'load-changed' handler does not
-        exist, _signal_painted() is NEVER called, /run/hart/session/shell-ready
-        never fires, and the session-supervisor's paint-watchdog times this Tier-2
-        surface out as HUNG and drops to the cage floor — the EXACT 'shell-ready
-        never fires' half of the pointer-only regression. LoadEvent.FINISHED is the
-        WebKitGTK-6.0 enum (same name as the GTK3 WebKit2 binding). Re-grab focus on
-        first paint so typing works once the page's JS has run (mirrors the cage
-        floor + the m2 WSL reference host).'''
+        # Touch the first-paint marker once the WebView finishes its first load.
+        #
+        # This is the GTK4/WebKit-6.0 mirror of the GTK3 cage floor's
+        # _on_load_changed. WITHOUT it the connected load-changed handler does not
+        # exist, _signal_painted() is NEVER called, /run/hart/session/shell-ready
+        # never fires, and the session-supervisor's paint-watchdog times this Tier-2
+        # surface out as HUNG and drops to the cage floor - the EXACT shell-ready-
+        # never-fires half of the pointer-only regression. LoadEvent.FINISHED is the
+        # WebKitGTK-6.0 enum (same name as the GTK3 WebKit2 binding). Re-grab focus on
+        # first paint so typing works once the page JS has run (mirrors the cage
+        # floor + the m2 WSL reference host).
         if event == WebKit.LoadEvent.FINISHED:
             _signal_painted()
             self._webview.grab_focus()

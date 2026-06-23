@@ -640,7 +640,15 @@ in
     # The latch + crash-window live under the existing hart state dir; the
     # tmpfs run dir holds the node_watchdog "unhealthy" signal flag.
     systemd.tmpfiles.rules = [
-      "d /var/lib/hart 0750 hart hart -"
+      # 0770 (group-writable), NOT 0750: the selector wrapper runs as hart-admin (in
+      # the `hart` GROUP, not the `hart` OWNER) and MUST WRITE the session-tier latch
+      # + the crash-window file here. At 0750 the group has only r-x, so every latch /
+      # window write failed "Permission denied" and a tier-drop could NEVER persist —
+      # the selector kept re-attempting hart-comp forever, the real-HW BOOT LOOP.
+      # Confirmed in the boot journal: "hart-session-selector: line 133:
+      # /var/lib/hart/session-tier.window: Permission denied". (Mirrors the same
+      # group-write reason /run/hart/session below is already 0770 for the shell host.)
+      "d /var/lib/hart 0770 hart hart -"
       "d /run/hart      0750 hart hart -"
       # Group-writable so the shell host (hart-admin, in the `hart` group) can
       # write the first-paint marker the paint-watchdog consumes. Scoped subdir —

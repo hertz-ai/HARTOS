@@ -120,9 +120,9 @@ READY_FLAG = os.environ.get('HART_SHELL_READY_FLAG', '/run/hart/session/shell-re
 
 
 def _signal_painted():
-    '''Touch the first-paint marker the session-supervisor watches. Best-effort:
-    a missing /run/hart dir or a permission error must NEVER crash the shell —
-    the supervisor degrades safely (it escalates DOWN on a missing marker).'''
+    # Touch the first-paint marker the session-supervisor watches. Best-effort:
+    # a missing /run/hart dir or a permission error must NEVER crash the shell -
+    # the supervisor degrades safely (it escalates DOWN on a missing marker).
     try:
         os.makedirs(os.path.dirname(READY_FLAG), exist_ok=True)
         with open(READY_FLAG, 'w'):
