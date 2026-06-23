@@ -98,25 +98,36 @@ in
           sup.fail("systemctl is-active gdm.service")
 
       # ── 1b. SEAT / DRM preconditions for a compositor on real HW ──
-      # The bare-metal "permission denied / device busy across all tiers" root
-      # cause was a missing seat/DRM bring-up. Assert the three fixes are live:
-      #   - seatd (the libseat BACKEND the compositors talk to) is running,
+      # The bare-metal "permission denied / device busy across all tiers" boot loop
+      # was a SEAT-MANAGER conflict: an earlier fix forced seatd on top of systemd-
+      # logind (two seat managers fighting). The corrected preconditions:
+      #   - systemd-logind (THE seat manager on a systemd box) is up; the compositor
+      #     rides greetd's active logind session to acquire the seat's DRM + input,
       #   - the session user is in the device groups the compositor needs to open
-      #     /dev/dri (video/render = KMS + GPU) and /dev/input (input = libinput)
-      #     AND the seat group (seatd brokers devices only to seat-group members),
-      #   - greetd is wrapped to prefer the seatd backend (LIBSEAT_BACKEND=seatd),
-      #     so libseat does not fall to its unreliable-under-greetd logind probe.
-      with subtest("seatd is active + hart-admin has the seat/DRM/input groups"):
+      #     /dev/dri (video/render = KMS + GPU) and /dev/input (input = libinput),
+      #   - greetd FORCES the logind backend (LIBSEAT_BACKEND=logind): the compositor
+      #     uses systemd-logind, the single seat manager, NOT seatd layered on top of
+      #     logind (two seat managers fighting = the real-HW boot loop / frozen input).
+      with subtest("logind is the seat manager + greetd forces the logind backend"):
+          # systemd-logind is THE seat manager (always up on systemd); libseat-logind
+          # rides greetd's active logind session to TakeDevice the seat's DRM + input.
+          sup.wait_for_unit("systemd-logind.service", timeout=60)
+          # seatd stays enabled as an idle fallback (keeps the seat group valid) but is
+          # NOT the forced backend.
           sup.wait_for_unit("seatd.service", timeout=60)
           groups = sup.succeed("id -nG hart-admin").split()
           for g in ("video", "render", "input", "seat"):
               assert g in groups, \
                   f"hart-admin missing the '{g}' group ({groups}) — compositor can't open the seat's DRM/input"
-          # greetd's session command must export LIBSEAT_BACKEND=seatd (the wrapper)
-          # so every tier inherits the seatd backend preference.
+          # greetd's session command must FORCE LIBSEAT_BACKEND=logind so every tier
+          # uses the logind seat manager (the canonical greetd-on-systemd path), and
+          # must NOT force seatd-over-logind (the dual-seat-manager regression that
+          # froze input + EBUSY-looped the boot on real hardware).
           greetd_cmd = sup.succeed("systemctl cat greetd.service")
-          assert "LIBSEAT_BACKEND=seatd" in greetd_cmd, \
-              "greetd session does not prefer the seatd libseat backend"
+          assert "LIBSEAT_BACKEND=logind" in greetd_cmd, \
+              "greetd session must force the logind libseat backend (canonical greetd-on-systemd)"
+          assert "LIBSEAT_BACKEND=seatd" not in greetd_cmd, \
+              "greetd must NOT force seatd over logind — two seat managers fight on real HW (the boot loop)"
 
       # ── 2. hartctl on PATH; fail-safe to cage when unlatched (contract §3.1) ──
       with subtest("hartctl reports the cage floor when the latch is absent (fail-safe)"):

@@ -666,29 +666,38 @@ in
     boot.kernel.sysctl."fs.inotify.max_user_watches" = lib.mkOverride 90 524288;
 
     # ── SEAT / DRM access for the greetd-launched compositor (real-HW root fix) ──
-    # On real hardware the tier compositors (hart-comp/sway/cage) all failed to
-    # come up with "permission denied" (/dev/dri or /dev/input EACCES) or "device
-    # busy" (could not become DRM master, EBUSY) — the standard Wayland-compositor
-    # seat/DRM bring-up was missing. The three pieces that make the ladder actually
-    # scan out on bare metal:
+    # On real hardware the tier compositors (hart-comp/sway/cage) all failed to come
+    # up with "permission denied" (/dev/dri or /dev/input EACCES) or "device busy"
+    # (could not become DRM master, EBUSY) and the boot LOOPED with a frozen cursor at
+    # 0,0 (DRM master was intermittently granted — the compositor drew its cursor —
+    # but libinput devices never opened, so no pointer motion ever arrived). The seat
+    # access pieces that make the ladder actually scan out on bare metal:
     #
-    #   1. services.seatd — a working libseat BACKEND. greetd's session is NOT a
-    #      full logind graphical session (greetd opens a PAM session but the seat
-    #      activation libseat-via-logind expects is unreliable under greetd), so
-    #      libseat's logind backend can fail and the compositor cannot acquire the
-    #      seat's DRM master / input devices. seatd is the canonical fallback
-    #      backend (LIBSEAT_BACKEND=seatd): a tiny daemon that brokers /dev/dri +
-    #      /dev/input to the session over a socket, no logind seat required. The
-    #      hart-comp crate already links libseat from pkgs.seatd (hart-comp.nix
-    #      buildInputs) and cage/sway use libseat too — this provides the daemon
-    #      side they talk to. Enabling it also creates the `seat` group.
-    #   2. hart-admin in the `seat` group — seatd only brokers devices to members
-    #      of the seat group. (video/render/input come from hart-base; seat is
-    #      added HERE because the group only exists once seatd is enabled.)
-    #   3. LIBSEAT_BACKEND=seatd in the session env — prefer the seatd backend
-    #      directly instead of letting libseat probe logind first (which is the
-    #      unreliable path under greetd). Set on the selector's session so every
-    #      tier inherits it.
+    #   1. systemd-logind is THE seat manager (it always runs on a systemd box) and it
+    #      owns the seat + the VTs. The greetd-launched compositor acquires the seat's
+    #      DRM master + libinput devices through libseat's LOGIND backend
+    #      (LIBSEAT_BACKEND=logind, forced on the greetd session below) — the
+    #      canonical greetd-on-systemd path. NixOS's greetd PAM sets startSession=true
+    #      (pam_systemd), so greetd's session IS a full ACTIVE logind graphical
+    #      session on the seat, which is exactly what libseat-logind needs to
+    #      TakeDevice the seat's DRM + input. This is how cage worked BEFORE the
+    #      supervisor; every tier now rides the SAME proven path.
+    #   2. hart-admin in video/render/input (hart-base.nix) — direct device-node
+    #      access for /dev/dri (KMS+GPU) and /dev/input (libinput), belt-and-
+    #      suspenders alongside the logind broker.
+    #   3. greetd on its OWN VT (vt=7, below) so its session is the seat's ACTIVE
+    #      session — the precondition for logind to grant DRM master on the seat.
+    #
+    # WHY NOT force seatd (the real-HW regression THIS corrects): an earlier fix
+    # (c6899df4) forced LIBSEAT_BACKEND=seatd on the false premise that "greetd's
+    # session is not a full logind session". It IS, on NixOS. Forcing seatd while
+    # systemd-logind is ALSO managing the seat/VTs is two seat managers fighting —
+    # the exact boot loop (DRM grabbed but input dead + EBUSY tier-drops, the cursor
+    # stuck at 0,0). It "passed" the VM nixosTest only because a QEMU guest's trivial
+    # single-VT seat never exposes the contention. seatd stays ENABLED below purely as
+    # an idle fallback (it keeps the `seat` group valid and is available for a future
+    # logind-less topology); with the env forcing logind, NO client ever connects to
+    # seatd, so the idle daemon never touches the seat. (See the command comment.)
     services.seatd.enable = true;
     users.users.hart-admin.extraGroups = [ "seat" ];
 
@@ -733,9 +742,19 @@ in
       settings = {
         default_session = {
           # Wrap the selector so the whole session tree inherits LIBSEAT_BACKEND
-          # =seatd — prefer the seatd daemon over libseat's unreliable-under-greetd
-          # logind probe. (env(1) keeps this DRY: one wrapper, every tier inherits.)
-          command = "${pkgs.coreutils}/bin/env LIBSEAT_BACKEND=seatd ${selectorScript}";
+          # =logind — the systemd-logind libseat backend, the canonical path for a
+          # greetd-launched compositor on a systemd box. greetd's PAM sets
+          # startSession=true (pam_systemd), so greetd's session IS a full ACTIVE
+          # logind graphical session on the seat — exactly what libseat-logind needs
+          # to TakeDevice the seat's DRM + input. (env(1) keeps this DRY: one wrapper,
+          # every tier inherits.)
+          #
+          # MUST be forced explicitly, not left to probe: libseat tries the seatd
+          # backend FIRST when a seatd SOCKET exists (services.seatd.enable runs the
+          # daemon), so without this override every tier would silently pick seatd —
+          # the dual-seat-manager fight with logind that froze input + EBUSY-looped
+          # the boot on real HW. Forcing logind pins the single, proven seat manager.
+          command = "${pkgs.coreutils}/bin/env LIBSEAT_BACKEND=logind ${selectorScript}";
           user = "hart-admin";
         };
       };
