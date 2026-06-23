@@ -95,19 +95,23 @@ def send_completion(
     Returns:
         Response text or None on failure.
     """
-    if not model:
-        model = os.environ.get('HEVOLVE_CODING_MODEL', 'gpt-4')
-
     try:
         import openai
-        from helper import get_openai_config
+        # Canonical LLM endpoint — the SAME single-source config create_recipe /
+        # reuse_recipe use (core.autogen_config -> get_local_llm_url for flat
+        # local, cloud for regional/central).  The old code imported a
+        # NON-EXISTENT helper.get_openai_config, so EVERY coding / auto-evolve
+        # completion ImportError'd before reaching the model ("No edit generated
+        # by LLM") — the RSI / autoresearch loop was a silent no-op.
+        from core.autogen_config import get_autogen_config_list
 
-        config = get_openai_config()
-        client_kwargs = {}
-        if config.get('api_key'):
-            client_kwargs['api_key'] = config['api_key']
-        if config.get('api_base'):
-            client_kwargs['base_url'] = config['api_base']
+        config = (get_autogen_config_list() or [{}])[0]
+        client_kwargs = {'api_key': config.get('api_key') or 'dummy'}
+        if config.get('base_url'):
+            client_kwargs['base_url'] = config['base_url']
+        if not model:
+            model = (os.environ.get('HEVOLVE_CODING_MODEL')
+                     or config.get('model') or 'local')
 
         client = openai.OpenAI(**client_kwargs)
         response = client.chat.completions.create(
