@@ -148,13 +148,21 @@ class LlamaScheduler:
                     heapq.heappush(self._wait, (req.pri, req.seq, req))
             # cancel the preempted daemon OUTSIDE the lock (close() may block on
             # a socket).  Its own release() later is a no-op (already evicted).
-            if victim is not None and victim.cancel_fn:
+            if victim is not None:
+                if victim.cancel_fn:
+                    try:
+                        victim.cancel_fn()
+                    except Exception:
+                        pass
+                # Record the preempt so the daemon (dispatch.is_transient_deferral)
+                # re-queues the canceled goal instead of counting it as a failure.
                 try:
-                    victim.cancel_fn()
-                    logger.info("llama_scheduler: user %s preempted daemon %s",
-                                req.rid or '<empty>', victim.rid or '<empty>')
+                    from core.foreground import note_preempt
+                    note_preempt()
                 except Exception:
                     pass
+                logger.info("llama_scheduler: user %s preempted daemon %s",
+                            req.rid or '<empty>', victim.rid or '<empty>')
             if req.admitted:
                 return req
             granted = req.event.wait(timeout)

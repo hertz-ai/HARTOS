@@ -281,7 +281,15 @@ def is_transient_deferral() -> bool:
     breaker-open), so the daemon's notion of "transient" never drifts from the
     dispatcher's."""
     try:
-        return is_user_recently_active() or _cb_is_open()
+        if is_user_recently_active() or _cb_is_open():
+            return True
+        # A goal whose in-flight LLM call was just PREEMPTED for a live user turn
+        # (foreground abort / llama_scheduler eviction) is a transient defer too —
+        # re-queue it next tick, never count it toward auto-pause.  The user may
+        # already be "inactive" by the time we re-check, so this explicit preempt
+        # signal catches the window is_user_recently_active() can miss.
+        from core.foreground import preempted_recently
+        return preempted_recently()
     except Exception:
         return False
 
