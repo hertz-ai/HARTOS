@@ -768,19 +768,18 @@ def _is_background_call(request) -> bool:
 
 
 def _select_send_client(self, request):
-    """Choose which httpx client executes this :8082 send.
+    """Choose which httpx client executes this send.
 
-    Autonomous daemon calls get the closable background client AFTER yielding to
-    any in-flight user turn; everything else gets the caller's own client,
-    unchanged.  Fully fenced — any failure falls back to the original client, so
-    the foreground path can never break."""
+    Autonomous daemon calls get the CLOSABLE background client so the scheduler's
+    preempt (``close_bg_llm_http_client``) can abort them; everything else gets
+    the caller's own client, unchanged.  The yield / priority / preempt is now
+    owned by ``core.llama_scheduler`` (acquired in ``_patched_send``) — the SAME
+    queue the requests/pooled_post path uses — NOT here; this only picks the
+    abortable transport for a daemon call.  Fully fenced — any failure falls back
+    to the original client, so the foreground path can never break."""
     try:
         if not _is_background_call(request):
             return self
-        from core.foreground import foreground_active, wait_until_clear
-        if foreground_active():
-            # A user is being served right now — yield the model to them first.
-            wait_until_clear(_bg_yield_wait_s())
         from core.http_pool import get_bg_llm_http_client
         return get_bg_llm_http_client() or self
     except Exception:
@@ -807,9 +806,25 @@ def _install_sync_patch(httpx_module) -> None:
         # _annotate_request ran above, so the X-HARTOS-Request-ID header the
         # discriminator reads is already set.
         send_client = _select_send_client(self, request)
+        # Admit through the slot-aware priority scheduler — the SAME queue the
+        # requests/pooled_post path uses — so this httpx (autogen/langchain/openai)
+        # call is slot-aware: a user turn arriving to a full server preempts an
+        # in-flight daemon; a daemon yields for a slot.  Fail-open to a no-op
+        # context if the scheduler is unavailable, so the send can never be
+        # blocked on a scheduler import error.
+        try:
+            from core.http_pool import close_bg_llm_http_client
+            from core.llama_scheduler import get_scheduler
+            _kind = 'daemon' if _is_background_call(request) else 'user'
+            _slot_cm = get_scheduler().slot(_get_request_id(), _kind,
+                                            cancel_fn=close_bg_llm_http_client,
+                                            timeout=120.0)
+        except Exception:
+            _slot_cm = contextlib.nullcontext()
         start = time.time()
         try:
-            response = _orig_send(send_client, request, **kwargs)
+            with _slot_cm:
+                response = _orig_send(send_client, request, **kwargs)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
                          response_status=getattr(response, 'status_code', None),
