@@ -2,7 +2,7 @@
 
 > **Companion to** [`HART_OS_NATIVE_ARCHITECTURE.md`](HART_OS_NATIVE_ARCHITECTURE.md)
 > (the intent-first v2 architecture + phased build plan) and
-> [`../../compositor/ROADMAP.md`](../../compositor/ROADMAP.md).
+> [`../../compositor/ROADMAP.md`](https://github.com/hertz-ai/HARTOS/blob/main/compositor/ROADMAP.md).
 >
 > **Purpose:** This is the adversarial validation of the v2 architecture against the
 > actual tree, plus the real test-suite run. Every claim below was checked by reading
