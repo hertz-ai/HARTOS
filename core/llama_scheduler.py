@@ -63,6 +63,46 @@ def _resolve_slots(n) -> int:
     return _DEFAULT_SLOTS
 
 
+def _read_config_slots():
+    """Explicit slot count from ~/.nunba/llama_config.json — the SAME file the
+    port is saved in (server_port).  Honoured first so if the server launcher
+    starts recording its --parallel there (n_parallel/server_slots/total_slots),
+    the scheduler picks it up with zero further wiring.  None if absent."""
+    try:
+        import json
+        path = os.path.join(os.path.expanduser('~'), '.nunba', 'llama_config.json')
+        if os.path.isfile(path):
+            with open(path) as f:
+                cfg = json.load(f)
+            for key in ('n_parallel', 'server_slots', 'total_slots', 'parallel'):
+                val = cfg.get(key)
+                if val:
+                    return max(1, int(val))
+    except Exception:
+        pass
+    return None
+
+
+def _read_server_slots():
+    """The llama-server's authoritative slot count: GET /props -> total_slots —
+    i.e. exactly the ``--parallel`` it was started with.  Works no matter WHO
+    launched it (Nunba bundle, trueflow, manual).  None on any failure."""
+    try:
+        import requests
+        from core.port_registry import get_local_llm_url
+        base = get_local_llm_url().rstrip('/')
+        if base.endswith('/v1'):
+            base = base[:-3]
+        resp = requests.get(base + '/props', timeout=2.0)
+        if resp.status_code == 200:
+            n = resp.json().get('total_slots')
+            if n:
+                return max(1, int(n))
+    except Exception:
+        pass
+    return None
+
+
 class _Req:
     """One admission request.  Token-keyed by ``seq`` (unique) so two daemon
     calls with the same (often empty) rid never collide on a slot."""
@@ -104,6 +144,15 @@ class LlamaScheduler:
         with self._lock:
             self._n = _resolve_slots(n)
             self._promote_locked()
+
+    def refresh_slots(self) -> None:
+        """Resolve n_slots from the recorded config (~/.nunba/llama_config.json)
+        else the live server ``/props`` total_slots, keeping the current value on
+        any failure.  Safe to run in a background thread (set_slots is locked)."""
+        n = _read_config_slots() or _read_server_slots()
+        if n:
+            self.set_slots(n)
+            logger.info("llama_scheduler: n_slots auto-detected = %d", n)
 
     def inflight(self):
         """List of ``(rid, kind)`` currently holding a slot — what any new
@@ -235,4 +284,12 @@ def get_scheduler() -> LlamaScheduler:
     with _scheduler_lock:
         if _scheduler is None:
             _scheduler = LlamaScheduler()
+            # Auto-detect the real slot count OFF the hot path: the first caller
+            # gets the default (2) immediately; this background probe upgrades it
+            # from config / the server's /props within ~a second.
+            try:
+                threading.Thread(target=_scheduler.refresh_slots,
+                                 name='llama-slots-detect', daemon=True).start()
+            except Exception:
+                pass
     return _scheduler

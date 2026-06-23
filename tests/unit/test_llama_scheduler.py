@@ -12,6 +12,7 @@ collide), and fail-open timeout.
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from core.llama_scheduler import LlamaScheduler
 
@@ -111,6 +112,29 @@ class TestLlamaScheduler(unittest.TestCase):
         s.set_slots(2)                        # grow → promote the waiter
         th.join(2)
         self.assertTrue(got and got[0] is not None)
+
+
+class TestSlotAutoDetect(unittest.TestCase):
+    def test_refresh_from_config_field_first(self):
+        s = LlamaScheduler(n_slots=2)
+        with patch('core.llama_scheduler._read_config_slots', return_value=4), \
+             patch('core.llama_scheduler._read_server_slots', return_value=99):
+            s.refresh_slots()
+        self.assertEqual(s.n_slots, 4)          # config field wins over /props
+
+    def test_refresh_from_server_props_when_config_absent(self):
+        s = LlamaScheduler(n_slots=2)
+        with patch('core.llama_scheduler._read_config_slots', return_value=None), \
+             patch('core.llama_scheduler._read_server_slots', return_value=3):
+            s.refresh_slots()
+        self.assertEqual(s.n_slots, 3)          # falls back to live /props
+
+    def test_refresh_keeps_current_when_both_unavailable(self):
+        s = LlamaScheduler(n_slots=2)
+        with patch('core.llama_scheduler._read_config_slots', return_value=None), \
+             patch('core.llama_scheduler._read_server_slots', return_value=None):
+            s.refresh_slots()
+        self.assertEqual(s.n_slots, 2)          # fail-open: keep the default
 
 
 if __name__ == '__main__':
