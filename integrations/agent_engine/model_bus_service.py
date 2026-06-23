@@ -43,11 +43,16 @@ def _publish_routing_status(user_id: str, message: str, request_id: str = ''):
     so the user sees: "Processing locally..." → "Checking hive network..." etc.
     """
     from core.peer_link.crossbar_publish import publish_thinking_trace
+    from core.constants import CHAT_ACTION_STATUS
     ok = publish_thinking_trace(
         text=message,
         user_id=user_id,
         request_id=request_id or '',
         bot_type='ComputeRouter',
+        # Routing PROGRESS ("Processing locally…", "Checking hive network…"),
+        # not the model's reasoning — ride action 'Status' so it drives the
+        # "analysing…" spinner, never a priority-49 Thought-process Step.
+        action=CHAT_ACTION_STATUS,
     )
     if ok:
         logger.debug(

@@ -482,6 +482,21 @@ CHAT_STAGE_TEXTS: dict = {
 CHAT_STAGES: frozenset = frozenset(CHAT_STAGE_TEXTS)
 
 
+# Chat-bubble wire contract (#508) — the `priority` + `action` values carried in
+# the com.hertzai.hevolve.chat.{user_id} envelope and keyed on by the frontend
+# (Demopage.handleDataReceived: priority===49 && action==='Thinking').
+# CANONICAL here so the publisher (core.peer_link.crossbar_publish) and every
+# consumer share ONE source — `49` / 'Thinking' / 'Status' were previously magic
+# literals duplicated across both envelope shapes.  The frontend mirrors these in
+# landing-page/src/constants/chatBubble.js (cross-language; keep in lockstep).
+CHAT_BUBBLE_PRIORITY: int = 49
+# The model's ACTUAL reasoning → rendered as Thought-process Steps (id-49 container).
+CHAT_ACTION_THINKING: str = 'Thinking'
+# Canned pipeline PROGRESS (publish_chat_stage / routing status) → drives the
+# "analysing…" spinner ONLY, never a Step.
+CHAT_ACTION_STATUS: str = 'Status'
+
+
 # Per-tool human-readable labels for tool_call stage emits (#508).  Static
 # entries cover the hardcoded tools in get_tools(is_first=True) + canonical
 # provider/builtin tools.  Dynamic tool registries (skills, service_tools,
