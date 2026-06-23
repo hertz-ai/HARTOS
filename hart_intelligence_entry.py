@@ -8245,9 +8245,17 @@ except Exception:
 def _chat_request_is_genuine():
     try:
         from flask import request as _rq
-        _rid = _rq.headers.get('X-HARTOS-Request-ID')
-        if not _rid:
-            _rid = (_rq.get_json(silent=True) or {}).get('request_id')
+        # Read request_id from EVERY transport a HART client uses, in priority
+        # order.  The previous header+JSON-only read missed it whenever the
+        # client put it elsewhere: the Nunba desktop omitted it entirely (now
+        # sent in the JSON body) and the Android client sends it as a multipart
+        # FORM field (OkHttp MultipartBody.Part 'request_id'), which
+        # get_json(silent=True) returns None for → empty → the user turn was
+        # misclassified as BACKGROUND, so enter_foreground never fired and the
+        # daemon never yielded the llama slot (the "hi" starvation).
+        _rid = (_rq.headers.get('X-HARTOS-Request-ID')
+                or _rq.values.get('request_id')   # form (multipart/urlencoded) + query
+                or (_rq.get_json(silent=True) or {}).get('request_id'))
     except Exception:
         return True  # no request context / unparsable -> treat as a user turn
     try:
@@ -8457,7 +8465,10 @@ def chat():
     # so calling it every request is cheap (~10us stat call).
     if preferred_lang:
         _persist_language(preferred_lang)
-    request_id = data.get('request_id', None)
+    # request_id may arrive as a multipart/urlencoded FORM field (Android OkHttp)
+    # rather than in the JSON body — read both so the thread-local id (and every
+    # downstream foreground/yield + log correlation) is never silently empty.
+    request_id = data.get('request_id') or request.values.get('request_id') or None
     req_tool = data.get('tools', None)
     file_id = data.get('file_id', None)
     prompt_id = data.get('prompt_id', None)
