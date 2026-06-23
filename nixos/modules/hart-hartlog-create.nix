@@ -236,6 +236,26 @@ let
     # flagged removable). $DISK is now set in both branches; safety gates below
     # (free space + never-touch-existing) still apply to both.
 
+    # ── 3.5 Self-heal a created-but-UNFORMATTED HARTLOG (the busy-disk first-boot
+    #    case). If a PRIOR boot carved the GPT partition (sgdisk named it $LABEL) but
+    #    could not mkfs it (the live disk was busy so the node never settled), the
+    #    trailing free space is now CONSUMED and the carve below would no-op forever,
+    #    leaving HARTLOG permanently raw + host-unreadable. blkid -L (step 1) already
+    #    returned no FS-label match, so a partition whose GPT PARTLABEL is $LABEL but
+    #    whose FSTYPE is empty is exactly our own unformatted carve — FORMAT it (safe:
+    #    we created + named it) and exit. GPT-only: the MBR path has no partition name
+    #    to identify ours safely, so it relies on the bounded settle-retry in step 6.
+    EXIST=$(lsblk -lnpo NAME,PARTLABEL,FSTYPE "$DISK" 2>/dev/null | gawk -v L="$LABEL" '$2==L && $3==""{print $1; exit}') || EXIST=""
+    if [ -n "$EXIST" ] && [ -b "$EXIST" ]; then
+      cecho "found a created-but-unformatted $LABEL partition ($EXIST) from a prior boot — formatting it (self-heal)"
+      if mkfs.vfat -F 32 -n "$LABEL" "$EXIST" >/dev/null 2>&1; then
+        udevadm settle 2>/dev/null || true
+        decide CREATED "$LABEL FAT32 formatted on the pre-existing $EXIST (self-heal) — hart-boot-log can now land the journal"
+        exit 0
+      fi
+      cecho "self-heal mkfs on $EXIST failed — falling through to a fresh carve attempt"
+    fi
+
     # ── 4. Determine the partition-table TYPE (GPT vs isohybrid MBR/DOS). ──
     # An isohybrid ISO can be written GPT or MBR (DOS). sgdisk only carves GPT;
     # forcing it on an MBR disk would CONVERT the table (destroying the isohybrid
@@ -329,16 +349,33 @@ let
     fi
 
     # ── 6. Re-read the table, resolve the new node, FAT32-format + label it. ──
+    # On a LIVE USB the disk is BUSY (the ISO9660/EFI partitions are mounted FROM it),
+    # so a full-table re-read via `partprobe` is REFUSED ("device or resource busy")
+    # and the new partition's /dev node may not appear on the first probe. That is the
+    # exact failure that left HARTLOG created-but-unformatted (a raw, host-unreadable
+    # partition): mkfs.vfat below was skipped because the node never resolved, and the
+    # next boot then no-op'd on "no trailing free space" → HARTLOG NEVER became a valid
+    # FAT32. The fix: `partx -a` ADDS only the new partition to the kernel WITHOUT
+    # re-reading the whole busy table, then we POLL (bounded) for the node to settle —
+    # retrying partx -a each round — before formatting.
+    partx -a "$DISK" 2>/dev/null || true
     partprobe "$DISK" 2>/dev/null || partx -u "$DISK" 2>/dev/null || true
-    udevadm settle 2>/dev/null || sleep 2 || true
-
-    # The new partition is the highest-numbered one on the disk.
-    NEWPART=$(lsblk -lnpo NAME,TYPE "$DISK" 2>/dev/null | gawk '$2=="part"{p=$1} END{print p}') || NEWPART=""
+    NEWPART=""
+    _try=0
+    while [ "$_try" -lt 10 ]; do
+      udevadm settle 2>/dev/null || true
+      # The new partition is the highest-numbered one on the disk.
+      NEWPART=$(lsblk -lnpo NAME,TYPE "$DISK" 2>/dev/null | gawk '$2=="part"{p=$1} END{print p}') || NEWPART=""
+      [ -n "$NEWPART" ] && [ -b "$NEWPART" ] && break
+      partx -a "$DISK" 2>/dev/null || true
+      sleep 1
+      _try=$((_try + 1))
+    done
     if [ -z "$NEWPART" ] || [ ! -b "$NEWPART" ]; then
-      decide FAIL "could not resolve the new partition node on $DISK after creation (partition exists; next boot may format)"
+      decide FAIL "could not resolve the new partition node on $DISK after creation (partition exists; next boot's self-heal will format it)"
       exit 0
     fi
-    cecho "created new partition $NEWPART on $DISK"
+    cecho "created new partition $NEWPART on $DISK (resolved after $_try settle retries)"
 
     # FAT32 + label so the Windows host mounts it natively + hart-boot-log finds it
     # by-label. -F 32 forces FAT32; -n sets the volume label (HARTLOG).

@@ -176,6 +176,33 @@ in
           assert hc.succeed(f"lsblk -ndo PTTYPE {disk}").strip() == "dos", \
               "MBR carve must NOT convert the table to GPT (would destroy the boot layout)"
 
+      # ── 6c. Self-heal a created-but-UNFORMATTED HARTLOG (the busy-disk first-boot
+      # case). On a real live USB the disk is BUSY (the ISO is mounted from it), so the
+      # new partition's node may not settle before mkfs — leaving a HARTLOG-named GPT
+      # partition with NO filesystem AND no free tail, so every later boot would no-op
+      # forever and HARTLOG would stay raw + host-unreadable. The carve must instead
+      # DETECT its own named-but-unformatted partition and FORMAT it in place.
+      with subtest("a created-but-unformatted HARTLOG partition is self-healed (formatted)"):
+          hc.succeed(f"sgdisk --zap-all {disk}")
+          hc.succeed(f"wipefs -a {disk} || true")
+          # A small ISO primary + a HARTLOG-NAMED partition consuming the rest, with
+          # NO filesystem (sgdisk names it; no mkfs) — exactly the prior-boot remnant.
+          hc.succeed(f"sgdisk --new=1:2048:+64M --change-name=1:ISO {disk}")
+          hc.succeed(f"sgdisk --largest-new=2 --change-name=2:HARTLOG --typecode=2:0700 {disk}")
+          hc.succeed("udevadm settle || true")
+          # Precondition: HARTLOG does NOT resolve by FS label yet (it has no FS), and
+          # there is no trailing free space (part2 consumed it) — so the ONLY way it
+          # becomes valid is the self-heal path, never a fresh carve.
+          hc.fail("blkid -L HARTLOG")
+          out_heal = hc.succeed(f"HART_HARTLOG_TEST_DISK={disk} hart-hartlog-create 2>&1; echo RC=$?")
+          assert "RC=0" in out_heal, f"self-heal must exit 0, got: {out_heal!r}"
+          assert "self-heal" in out_heal, f"must take the self-heal path, got: {out_heal!r}"
+          # Now HARTLOG resolves as a real FAT32 — the existing partition was formatted
+          # IN PLACE (not a new carve: the disk had no free tail).
+          hc.succeed("blkid -L HARTLOG")
+          hfstype = hc.succeed("blkid -L HARTLOG | xargs blkid -o value -s TYPE").strip()
+          assert "vfat" in hfstype, f"self-healed HARTLOG must be FAT32/vfat, got {hfstype!r}"
+
       # ── 7. The auto-detect path REFUSES the VM's non-removable boot disk ──
       # Run WITHOUT the test seam so the script walks the live root to the VM's
       # OWN boot disk (an internal, non-removable virtio disk — RM=0, TRAN!=usb).
