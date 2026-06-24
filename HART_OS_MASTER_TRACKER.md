@@ -50,7 +50,8 @@ Updated by Claude each session. Newest concerns at top of each section.
 | 3.4 | **Float the ONE Nunba UI into every shell (microfrontend), don't recreate per tier** (NEW) | 📋 | Direction captured. Needs: confirm whether `liquid_ui_service` (server-rendered shell) and the Nunba React app (`landing-page/`) are duplicate UIs, then unify — float the React app as a microfrontend hosted by cage/sway/hart-comp, instead of two shell implementations |
 | 3.5 | Onboarding "New password" overlaps search hint | 🟢 | FIXED `b19c9501` — opaque base under the tint (WebKitGTK backdrop-filter unreliable) |
 | 3.6 | **App Store: dead buttons / can't install / no bundled-apps list** (NEW) | 🟢 | Route-drop is ALREADY in your boot (verified — backend works). Net-new `b19c9501`: "Installed (N)" list + honest install feedback. ⚠️ If buttons are STILL fully unresponsive after reflash → deeper WebView-focus (LIVE-OS #2), will chase |
-| 3.7 | **Group eye + mic at bottom (sensory), leave orb alone** (NEW) | 🟢 | FIXED `b19c9501` — `#hart-senses-mic` beside the eye; central orb byte-identical/untouched |
+| 3.7 | **Group eye + mic at bottom (sensory), leave orb alone** (NEW) | 🟢 | FIXED `b19c9501` — `#hart-senses-mic` beside the eye; central orb byte-identical/untouched. ❓ Orb still has its OWN center mic (left alone as asked) → 2 mics now; awaiting steward call on whether to strip the orb's inner mic glyph (mic-at-bottom-only) |
+| 3.8 | **Remove em dashes from the OS's visible text** (NEW) | 🟢 | FIXED `39063b74` — 14 em dashes → hyphen in the shell render-text + static-JS UI strings; comments/docstrings/logs left (not visual); verified zero in the served /shell |
 
 ## 4. Cross-OS apps & native app format
 
