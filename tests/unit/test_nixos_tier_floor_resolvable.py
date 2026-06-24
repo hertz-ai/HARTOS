@@ -74,3 +74,27 @@ def test_desktop_watchdog_outlasts_shell_health_wait():
         f"shellPaintTimeoutSeconds ({watchdog}s) must exceed the glass host's :6800 "
         f"/health wait ({host_wait}s) — otherwise a tier legitimately waiting for the "
         f"backend is killed mid-wait and drops to cage (the real-HW 2026-06-24 boot).")
+
+
+def test_gtk4_host_ld_preloads_gtk4_layer_shell():
+    host = _read("modules/hart-layer-shell-host.nix")
+    # gtk4-layer-shell interposes libwayland-client's symbols, so it MUST load BEFORE
+    # libwayland; pulled in lazily via the GI typelib it loads too late and
+    # `LayerShell.init_for_window` silently fails ("GtkWindow is not a layer surface") ->
+    # the GTK4 host never anchors the BACKGROUND desktop -> Tier-1 (hart-comp) + Tier-2
+    # (sway) are declared HUNG and fall to cage (the real-HW 2026-06-24 boot). The launcher
+    # must LD_PRELOAD the runtime .so to force early load (gtk4-layer-shell's own fix).
+    assert re.search(r"libgtk4-layer-shell\.so\*.*LD_PRELOAD", host, re.S), (
+        "the GTK4 layer-shell host launcher must LD_PRELOAD libgtk4-layer-shell.so "
+        "(globbed from the gtk4-layer-shell store path) before exec'ing the python host — "
+        "without it the layer surface never initialises and Tier-1/Tier-2 drop to cage.")
+
+
+def test_sway_tier2_enables_touchpad_tap():
+    host = _read("modules/hart-layer-shell-host.nix")
+    # libinput defaults tap-to-click OFF, so a light tap on a laptop touchpad clicks
+    # nothing (the real-HW 2026-06-24 "taps not registering"). When sway hosts Tier-2 it
+    # must enable tap on touchpads (hart-comp Tier-1 does the same in udev.rs).
+    assert re.search(r'input\s+"type:touchpad"\s*\{[^}]*\btap\s+enabled', host, re.S), (
+        'the sway Tier-2 host config must enable touchpad tap-to-click '
+        '(input "type:touchpad" { tap enabled }) — libinput defaults it off.')

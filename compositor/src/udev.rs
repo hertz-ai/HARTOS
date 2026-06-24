@@ -425,10 +425,22 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     let _ = shm_formats; // pixman's mandatory Argb/Xrgb already advertised via ShmState::new
 
     // 11. Bind the calloop event sources.
-    //   (a) libinput → State::process_input_event (the shared input router).
+    //   (a) libinput → State::process_input_event (the shared input router). As each
+    //       device appears, enable touchpad TAP-TO-CLICK: libinput defaults it OFF, so a
+    //       light tap on a laptop touchpad registers NOTHING (only a physical button press
+    //       clicks) — the real-HW 2026-06-24 "touchpad taps not registering". A non-touchpad
+    //       reports finger_count 0 and is left untouched; a failed set is ignored (best-
+    //       effort, never fatal — the never-fail floor). Tier-2 sway sets the same via its
+    //       libinput config; the cage Tier-3 floor cannot configure libinput, so this is
+    //       hart-comp's own. `config_tap_set_enabled` takes &mut self, hence `mut event`.
     event_loop
         .handle()
-        .insert_source(libinput_backend, move |event, _, state: &mut State| {
+        .insert_source(libinput_backend, move |mut event, _, state: &mut State| {
+            if let smithay::backend::input::InputEvent::DeviceAdded { device } = &mut event {
+                if device.config_tap_finger_count() > 0 {
+                    let _ = device.config_tap_set_enabled(true);
+                }
+            }
             state.process_input_event(event);
         })
         .map_err(|e| format!("insert libinput source failed: {e}"))?;

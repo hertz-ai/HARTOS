@@ -110,6 +110,20 @@ let
     fi
     # GI typelibs for the GTK4 / WebKit-6.0 / gtk4-layer-shell python below.
     export GI_TYPELIB_PATH="${giTypelibPath}"
+    # ── gtk4-layer-shell LOAD ORDER (the real-HW "not a layer surface" fix) ──
+    # gtk4-layer-shell works by INTERPOSING libwayland-client's wl_proxy_* symbols, so
+    # it MUST be loaded BEFORE libwayland-client. Pulled in lazily via the GI typelib
+    # (`from gi.repository import Gtk4LayerShell`) it loads AFTER GTK has already linked
+    # libwayland -> the interposition silently fails and LayerShell.init_for_window()
+    # leaves the window a plain xdg-toplevel ("GtkWindow is not a layer surface"), so the
+    # shell never anchors as the BACKGROUND desktop, never first-paints, and the
+    # supervisor declares the tier HUNG and drops to cage (the real-HW 2026-06-24 boot:
+    # "Failed to initialize layer surface. GTK4 Layer Shell may have been linked after
+    # libwayland"). LD_PRELOAD the runtime .so so it loads first -- gtk4-layer-shell's own
+    # documented fix; Nix has no link-order knob for a GI-dlopened library.
+    for _glsl in ${lib.getLib pkgs.gtk4-layer-shell}/lib/libgtk4-layer-shell.so*; do
+      if [ -e "$_glsl" ]; then export LD_PRELOAD="$_glsl"; break; fi
+    done
     # WebKitGTK robustness on fresh-ISO boots (VM / software GL / no GPU): the
     # DMABUF renderer + GL compositing crash on a GL-less display — exactly the
     # first-boot / live-USB / llvmpipe case. Disable both so a GTK4 host that
@@ -305,6 +319,15 @@ app.run(None)
     default_floating_border none
     gaps inner 0
     gaps outer 0
+    # Touchpad tap-to-click. libinput defaults tap-to-click OFF, so a light tap on a
+    # laptop touchpad registers NOTHING (only a physical button press clicks) -- the
+    # real-HW 2026-06-24 "touchpad taps not registering". sway applies this libinput
+    # config to every touchpad when Tier-2 hosts the shell. (hart-comp Tier-1 enables
+    # the same in udev.rs; cage Tier-3 cannot configure libinput.)
+    input "type:touchpad" {
+      tap enabled
+      tap_button_map lrm
+    }
     # Launch the GTK4 layer-shell host as sway's startup client. It anchors itself
     # as the BACKGROUND layer (exclusive zone 0) via gtk4-layer-shell — so it is
     # the desktop, not a fullscreen app. Native toplevels (Phase 5) map above it.
