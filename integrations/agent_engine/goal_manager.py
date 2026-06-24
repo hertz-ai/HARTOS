@@ -910,6 +910,9 @@ def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
     category = config.get('category', '') or ''
     ctx = config.get('context', {}) or {}
     backend = ctx.get('backend') if isinstance(ctx, dict) else None
+    missing_package = (
+        ctx.get('missing_package') if isinstance(ctx, dict) else None
+    )
 
     base = (
         f"YOU ARE A SELF-HEALING CODE AGENT.\n\n"
@@ -946,6 +949,32 @@ def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
             f"so the next user-side rebuild fixes the venv.\n\n"
             f"Always check the log_path returned by repair_backend_venv "
             f"to inspect actual pip output before drawing conclusions.\n"
+        )
+
+    if category == 'subprocess.tool_load' and missing_package and not backend:
+        # A missing Python dependency — NOT a source bug.  Editing source
+        # can never summon a package, so the generic "read source, write
+        # fix" path below just loops.  The runtime already tried a
+        # deterministic `pip install` and it FAILED (that's the only
+        # reason this agentic goal was dispatched — see
+        # gpu_worker._maybe_self_heal_from_line).  Route to dependency
+        # remediation, not code editing.
+        return base + (
+            f"FAILURE SHAPE: a Python dependency is missing\n"
+            f"  Missing package: {missing_package!r}\n\n"
+            f"This is NOT a source-code bug.  A deterministic "
+            f"`pip install {missing_package}` was already attempted and "
+            f"FAILED — that is why you are here.  Editing source modules "
+            f"can never resolve a missing package and will just loop.\n\n"
+            f"REMEDIATION:\n"
+            f"1. Diagnose WHY the install failed — network, missing build "
+            f"deps, wrong index, or a pip-name vs import-name mismatch.\n"
+            f"2. Propose adding {missing_package!r} to the canonical freeze "
+            f"pip plan (Nunba scripts/setup_freeze_nunba.py _tts_deps or "
+            f"the matching _<X>_deps tuple) AND tts/package_installer.py's "
+            f"legacy fallback plan, so the next user-side rebuild bundles "
+            f"it and no runtime install is needed.\n"
+            f"3. Do NOT edit unrelated source modules to work around it.\n"
         )
 
     return base + (

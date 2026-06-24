@@ -464,8 +464,6 @@ class GPUWorker:
         """
         if not self._proc or not self._proc.stderr:
             return
-        if not hasattr(self, '_self_heal_seen_modules'):
-            self._self_heal_seen_modules = set()
         try:
             for line in self._proc.stderr:
                 line = line.rstrip()
@@ -488,6 +486,10 @@ class GPUWorker:
         if not match:
             return
         pkg = match.group(1)
+        # Lazy-init the idempotency set here so the method is
+        # self-contained — callable directly, not only via _drain_stderr.
+        if not hasattr(self, '_self_heal_seen_modules'):
+            self._self_heal_seen_modules = set()
         if pkg in self._self_heal_seen_modules:
             return
         self._self_heal_seen_modules.add(pkg)
@@ -497,52 +499,27 @@ class GPUWorker:
             f"dispatching to error_advice + deterministic self-heal"
         )
 
-        # 1) Agentic side: create a self_heal goal for the coding agent.
-        #    Throttled per-fingerprint inside error_advice; safe to call
-        #    on every detected event.
-        try:
-            from core.error_advice import handle_exception
-            synthetic = ModuleNotFoundError(f"No module named '{pkg}'")
-            synthetic.name = pkg  # type: ignore[attr-defined]
-            handle_exception(
-                synthetic,
-                category='subprocess.tool_load',
-                severity='high',
-                agent_remediation=True,
-                context={
-                    'worker_name': self.name,
-                    'worker_module': self.module,
-                    'missing_package': pkg,
-                    'remediation_hint': (
-                        f"Add '{pkg}' to the freeze pip plan (Nunba "
-                        f"scripts/setup_freeze_nunba.py _tts_deps or "
-                        f"the appropriate _<X>_deps tuple) so it's "
-                        f"bundled into python-embed/Lib/site-packages "
-                        f"on the next build, AND add it to "
-                        f"tts/package_installer.py legacy fallback "
-                        f"plan for runtime self-heal coverage."
-                    ),
-                },
-            )
-        except Exception as e:
-            logger.debug(f"{self.name}: error_advice dispatch skipped: {e}")
-
-        # 2) Deterministic fast-path: pip-install the missing package
-        #    directly so the next worker spawn picks it up without
-        #    waiting for the agentic loop.  Uses the same
-        #    ``self.python_exe`` the worker subprocess used (so the
-        #    package lands in the SAME interpreter's site-packages,
-        #    e.g. python-embed/Lib/site-packages on a frozen install,
-        #    or the dev .venv on a source run).  Spawned in a daemon
-        #    thread so we don't block the stderr drain loop.
+        # Remediation is deterministic-FIRST, agentic-FALLBACK.  A
+        # ``ModuleNotFoundError`` is a missing *dependency*, not a code
+        # bug — the canonical fix is to pip-install it, NOT to spin up a
+        # code-writing agent that edits source (which can never summon a
+        # package and just loops, churning the GIL — witnessed 2026-06-24
+        # with pyloudnorm).  So we install in this daemon thread and only
+        # dispatch the agentic self-heal goal if the install actually
+        # FAILED (rc != 0).  Single chokepoint; no parallel remediation
+        # paths.  Spawned in a daemon thread so we don't block the stderr
+        # drain loop.
         def _install_async():
+            rc = None
             try:
                 # `--target` to user-site keeps it consistent with
                 # tts.package_installer's existing pattern: bundled
                 # python-embed is read-only on Program Files installs,
                 # so user-writable site-packages is required.  We rely
                 # on the user-site already being on sys.path (set by
-                # platform_paths.ensure_user_site_on_path at boot).
+                # platform_paths.ensure_user_site_on_path at boot) and
+                # inherited by future worker spawns via PYTHONPATH (see
+                # _spawn).
                 target = self._user_site_packages_dir()
                 pip_args = [
                     self.python_exe, '-m', 'pip', 'install',
@@ -559,20 +536,70 @@ class GPUWorker:
                 rc = subprocess.run(
                     pip_args, capture_output=True, text=True, timeout=180,
                 ).returncode
-                if rc == 0:
-                    logger.info(
-                        f"{self.name}: '{pkg}' installed; respawn worker to "
-                        f"retry tool load."
-                    )
-                else:
-                    logger.warning(
-                        f"{self.name}: pip install '{pkg}' rc={rc} — "
-                        f"agent self-heal goal will pick up from here."
-                    )
             except Exception as e:
                 logger.debug(
                     f"{self.name}: deterministic pip install for '{pkg}' "
                     f"skipped: {e}"
+                )
+
+            if rc == 0:
+                # P2: the dep is present now — reap the crashed/stale
+                # subprocess so the NEXT call() respawns a fresh worker
+                # that imports the newly-installed package.  Lazy respawn
+                # (vs. eager) avoids holding VRAM for a tool that may not
+                # be used again soon.  No agentic goal is dispatched — the
+                # loop a code agent would otherwise spin on is eliminated.
+                logger.info(
+                    f"{self.name}: '{pkg}' installed; reaping worker so the "
+                    f"next call respawns with the dependency present."
+                )
+                try:
+                    self.stop()
+                except Exception as e:
+                    logger.debug(
+                        f"{self.name}: post-install reap skipped: {e}"
+                    )
+                return
+
+            # Install failed (or was skipped) — NOW fall back to the
+            # agentic self-heal goal.  Throttled per-fingerprint inside
+            # error_advice, so a flood of identical frames is safe.  The
+            # prompt (goal_manager._build_self_heal_prompt) routes the
+            # missing_package case to dependency remediation, not source
+            # editing.
+            logger.warning(
+                f"{self.name}: deterministic install of '{pkg}' failed "
+                f"(rc={rc}); dispatching agentic self-heal fallback."
+            )
+            try:
+                from core.error_advice import handle_exception
+                synthetic = ModuleNotFoundError(f"No module named '{pkg}'")
+                synthetic.name = pkg  # type: ignore[attr-defined]
+                handle_exception(
+                    synthetic,
+                    category='subprocess.tool_load',
+                    severity='high',
+                    agent_remediation=True,
+                    context={
+                        'worker_name': self.name,
+                        'worker_module': self.module,
+                        'missing_package': pkg,
+                        'remediation_hint': (
+                            f"Deterministic `pip install {pkg}` FAILED. "
+                            f"Do NOT edit source to fix a missing package. "
+                            f"Diagnose the pip failure (network / build "
+                            f"deps / wrong index), then add '{pkg}' to the "
+                            f"freeze pip plan (Nunba "
+                            f"scripts/setup_freeze_nunba.py _tts_deps or "
+                            f"the appropriate _<X>_deps tuple) AND to "
+                            f"tts/package_installer.py legacy fallback "
+                            f"plan so the next build bundles it."
+                        ),
+                    },
+                )
+            except Exception as e:
+                logger.debug(
+                    f"{self.name}: error_advice dispatch skipped: {e}"
                 )
 
         threading.Thread(
