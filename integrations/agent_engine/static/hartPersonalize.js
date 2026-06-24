@@ -139,8 +139,8 @@
     }
     if (typeof window.hartLoadInto === 'function') {
       window.hartLoadInto(ig, '/api/shell/wallpaper/collection', renderImages, {
-        title: 'Appearance is offline',
-        msg: 'Could not reach the hive backend yet - your themes and wallpapers will appear here once the connection is back.'
+        title: 'Photo wallpapers unavailable',
+        msg: 'Your photo wallpapers could not load yet (they come from your local Pictures). The themes and gradient wallpapers above work offline; photos appear when the file service is back.'
       });
     } else {
       var loading = document.createElement('div'); loading.className = 'ds-body-sm ds-text-muted';

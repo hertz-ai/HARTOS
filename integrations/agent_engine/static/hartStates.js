@@ -68,8 +68,8 @@
           container.innerHTML = '';
           container.appendChild(window.hartEmptyState({
             kind: 'offline',
-            title: (copy && copy.title) || 'Waiting for the hive',
-            msg: (copy && copy.msg) || 'Could not reach the hive backend yet - it will appear here once the connection is back.',
+            title: (copy && copy.title) || 'Reconnecting',
+            msg: (copy && copy.msg) || 'Could not load this yet. It will appear once the connection is restored.',
             onRetry: go
           }));
           // Silent auto-recover — the copy promised it. Capped so we never spin forever.

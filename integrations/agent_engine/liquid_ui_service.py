@@ -2743,7 +2743,7 @@ function renderRoutePanel(id, body, route, title) {{
         '<span class="mi material-icons-round" style="font-size:46px;color:var(--hart-muted)">cloud_off</span>'+
         '<div class="ds-title-sm">Reconnecting&hellip;</div>'+
         '<div class="ds-body-sm ds-text-muted" style="max-width:280px">'+
-          (title||'This view')+" couldn't reach the hive backend yet. It will appear here once the connection is back."+
+          (title||'This view')+" couldn't load yet. It will appear once the connection is restored."+
         '</div>'+
         '<button class="ds-btn ds-btn-tonal ds-btn-sm" type="button" '+
           'onclick="retryRoutePanel(\\''+id+'\\')">Retry</button>'+
