@@ -173,6 +173,23 @@ in
       renderer = "webkit";
     };
 
+    # ── Privacy-first "everything ON" — every LOCAL feature default-on ──
+    # Steward principle (memory hartos_privacy_first_defaults_2026-06-24): the OS
+    # ships COMPLETE; the user never opts into a LOCAL capability. Anything that
+    # LEAVES the device/network to the Hive (federation, public exposure,
+    # contributing compute, autonomous marketing) stays consent-gated + opt-in
+    # (brain-side) and is deliberately NOT toggled on here.
+    portal.enable = true;          # screenshot + screen-record (grim/wf-recorder) + theme bridge + PAM ext-session-lock — all fail-closed on the screen kill-switch
+    accessibility.enable = true;   # screen reader / magnifier / contrast / sticky keys
+    cups.enable = true;            # printing
+    dns.enable = true;             # secure DNS (DoH/DoT) — the user's own resolver
+    email.enable = true;           # Thunderbird (the user's own mail)
+    firewall.enable = true;        # firewall management
+    ime.enable = true;             # input method editor (CJK + more)
+    nightlight.enable = true;      # blue-light filter
+    devtools.enable = true;        # developer tools
+    dlna.enable = true;            # the user's own LAN media (not the Hive)
+
     # ── Supervisor-managed compositor TIER LADDER (the never-blank boot) ──
     # The out-of-process session tier-drop supervisor (greetd) OWNS the boot
     # session: it starts at the BEST tier and falls back on failure —
