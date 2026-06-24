@@ -8,7 +8,7 @@
  * state makes it actionable; nothing lights on a guess or a timer.
  *
  * Gate 4 (one writer): this module is the SOLE writer of <html data-*> EXCEPT
- * `data-multiws`, which hartWorkspaces.js owns (it alone knows desktop occupancy).
+ * 'data-multiws', which hartWorkspaces.js owns (it alone knows desktop occupancy).
  * It never touches #panels, the taskbar, or openPanel — only chrome affordances
  * (hero chips, sensory pod dimming, pager, ambient wash). The "cut senses" control
  * is explicitly exempt from hiding (safety-critical) — the CSS keeps it visible.

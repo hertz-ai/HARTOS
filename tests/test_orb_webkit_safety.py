@@ -153,6 +153,13 @@ def test_static_js_is_webkitgtk_safe():
     else; no template literals / optional chaining / nullish coalescing either."""
     raw_total = 0
     for name in _static_js():
+        # Vendored, minified third-party bundles (e.g. lottie.min.js — the offline
+        # Hevolve boot-splash player) are NOT HART-authored: we cannot rewrite their ES
+        # syntax, and their browser-compat is the vendor's concern (they are still
+        # parse-checked by test_all_static_js_syntax_ok via `node --check`). These bans
+        # are a HART CODE-STYLE rule for the shell JS we OWN, so skip vendored *.min.js.
+        if name.endswith('.min.js'):
+            continue
         src = open(os.path.join(STATIC_DIR, name), encoding='utf-8').read()
         n = src.count('AbortSignal.timeout(')
         raw_total += n

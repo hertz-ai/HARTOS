@@ -4,8 +4,8 @@
  *
  * Wires ONLY to the canonical backend (no parallel file-op path, no second
  * sandbox): /api/shell/files/{browse,mkdir,delete,move,copy,info} +
- * /api/shell/open-with + /api/shell/files/recent. `move` doubles as rename
- * (the backend has no separate /rename); `info` is Properties.
+ * /api/shell/open-with + /api/shell/files/recent. 'move' doubles as rename
+ * (the backend has no separate /rename); 'info' is Properties.
  *
  * Mounted by loadFileManagerPanel(el) -> window.HartFiles.mount(el). Reuses the
  * global SHELL origin const (lazily, since it is defined after this script) and

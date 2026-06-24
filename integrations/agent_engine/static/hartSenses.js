@@ -58,16 +58,16 @@
     var d = (st && st.disabled) || {};
     var p = (st && st.proof) || {};
     cut = !!(d.mic || d.camera || d.screen);
-    setBlind(cut);                                       // existing: paints `.off` (slate "shut")
+    setBlind(cut);                                       // existing: paints '.off' (slate "shut")
     renderProof(st);
     // DETERMINISTIC eye lamp. The eye is the kill-switch for ALL the AI's senses
     // (mic + camera + screen), so its "active" lamp must reflect ANY live sense,
     // not the camera alone — otherwise the common case (hearing/screen ON, camera
     // service idle) shows a NEUTRAL eye that reads as "nothing happening" while the
-    // AI is fully able to hear. Light `.is-sensing` when senses aren't cut AND at
+    // AI is fully able to hear. Light '.is-sensing' when senses aren't cut AND at
     // least one channel is genuinely live: hearing ungated (!mic), screen ungated
     // (!screen), or the camera service actually running (the un-fakeable proof).
-    // Still never lit on a guess/timer — every term is live OS state. `.is-sensing`
+    // Still never lit on a guess/timer — every term is live OS state. '.is-sensing'
     // is styled in _CSS_LIVING_GLASS.
     var anySensing = (d.mic !== true) || (d.screen !== true) || (p.camera_service_running === true);
     var eye = document.getElementById('hart-senses-btn');
@@ -94,13 +94,13 @@
   // ─────────────────────────────────────────────────────────────────────────
   // Drag + grid-snap + edge-magnetism + persistence — the missing #104 piece.
   //
-  // hartSenses.js had ZERO pointer handlers (the CSS `.dragging`/grip scaffolding
+  // hartSenses.js had ZERO pointer handlers (the CSS '.dragging'/grip scaffolding
   // existed but nothing moved the pod). This mirrors the PROVEN drag grammar from
   // hartDesktop.js (pointer-capture, rAF-batched transform, snap on drop) so there
   // is no parallel drag impl. The whole #hart-senses is picked up from its body
   // (or the grip); the eye/mic buttons still ACT (they're excluded from drag).
   // Position snaps to a 24px lattice, magnetises to the nearest corner, clamps to
-  // the viewport, persists `{x,y,edge}` through the single HartSession writer, and
+  // the viewport, persists '{x,y,edge}' through the single HartSession writer, and
   // stamps data-edge so the proof popover opens AWAY from the screen edge.
   // ─────────────────────────────────────────────────────────────────────────
   var POD = null, SNAP = 24, EDGE = 44;

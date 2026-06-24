@@ -113,7 +113,7 @@
       else { if (st) st.textContent = 'Incorrect password'; pw.value = ''; pw.focus(); }
     });
   }
-  // Replace the inline stub `unlock()` (which accepted any password) with the
+  // Replace the inline stub 'unlock()' (which accepted any password) with the
   // real check — same function name, so the existing onkeydown keeps working.
   window.unlock = onEnter;
 

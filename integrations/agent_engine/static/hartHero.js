@@ -163,7 +163,7 @@
     // window._hartThinking (the brain is computing — owned by acSend). The orb
     // becomes a state lamp via #hart-hero-orbwrap[data-orb-state] — the CSS in
     // _CSS_LIVING_GLASS draws accent/purple/green rings off that attr. We KEEP
-    // toggling the legacy `.listening` class too so a stale build (whose CSS
+    // toggling the legacy '.listening' class too so a stale build (whose CSS
     // predates data-orb-state) still shows a listening cue. The hevolve dot + the
     // hero status text are MIRRORS of the real flag here — never a fixed timer —
     // so the lamp can't lie while the brain is still in flight (64-600s on the
@@ -204,9 +204,9 @@
     // reachable: the brain can still push composed UI to it and the user can
     // still speak/type a command into the spine.
     //
-    // We do NOT add the legacy `dimmed` class — that set opacity:0 +
+    // We do NOT add the legacy 'dimmed' class — that set opacity:0 +
     // pointer-events:none, turning the spine into dead wallpaper (the exact
-    // launcher-is-the-spine symptom this removes). Instead we toggle `docked`
+    // launcher-is-the-spine symptom this removes). Instead we toggle 'docked'
     // for stylesheet hooks AND apply a self-contained dock transform inline so
     // the behaviour holds even on a shell whose CSS predates this change:
     //   - keeps opacity ~1 (visible) and pointer-events auto (clickable)

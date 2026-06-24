@@ -5092,7 +5092,7 @@ function renderAgentOverlay(ev) {{
         from flask import Flask, request, jsonify, Response, send_from_directory
 
         # The shell HTML loads its logo + every external script from
-        # ``/shell/static/...`` (see render_desktop_shell: hart-logo.svg,
+        # the ``/shell/static/`` prefix (see render_desktop_shell: hart-logo.svg,
         # voiceOrbViz.js, hartHero.js, hartDesktop.js, hartOnboarding.js, ...).
         # Flask's DEFAULT static route is ``/static`` — so without this prefix
         # EVERY ``/shell/static/*`` request 404s on a real boot: the orb never

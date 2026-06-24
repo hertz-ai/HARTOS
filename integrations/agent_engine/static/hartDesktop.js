@@ -12,7 +12,7 @@
  *                                never clobber other shell state)
  *
  * Per-icon customization (glyph / label / color, macOS-/Windows-style) travels
- * INSIDE the same `desktop_icons` entries — readPositions() is the single
+ * INSIDE the same 'desktop_icons' entries — readPositions() is the single
  * serializer (it reads the override back off each icon's data-attrs) and
  * persist() the single writer, so there is no parallel override store.
  *
@@ -37,7 +37,7 @@
   function isMaterialName(g) { return /^[a-z0-9_]+$/.test(g || ''); }
 
   // Inner HTML for an icon's glyph. color (optional) is applied inline so it
-  // overrides the stylesheet's `.di-glyph .mi{color:var(--hart-accent)}`.
+  // overrides the stylesheet's '.di-glyph .mi{color:var(--hart-accent)}'.
   function glyphSpan(glyph, color) {
     var g = glyph || 'apps';
     var style = color ? ' style="color:' + color + '"' : '';
@@ -359,10 +359,10 @@
     persist();
   };
   // Installed app -> live desktop icon (NixOS-style). The app-installer pushes
-  // an `app_installed` A2UI event; the shell's SSE consumer calls this. We
+  // an 'app_installed' A2UI event; the shell's SSE consumer calls this. We
   // register the entry into window.MANIFEST (so render()/hartPinIcon accept it
   // AND a later refresh still finds it) then REUSE hartPinIcon to place + persist
-  // the icon. openPanel launches it via its `exec` (the gtk-launch path).
+  // the icon. openPanel launches it via its 'exec' (the gtk-launch path).
   window.hartInstallIcon = function (entry) {
     if (!entry || !entry.id) return;
     var id = String(entry.id);
@@ -391,7 +391,7 @@
     return Math.max(1, Math.floor((window.innerHeight - top - 2 * PAD) / GRID));
   }
 
-  // Real SORT + column-major reflow into the grid. `by` ∈ name|type|color|null
+  // Real SORT + column-major reflow into the grid. 'by' ∈ name|type|color|null
   // (null = keep DOM order = "auto-arrange"). Staggered glide so it reads as a
   // deliberate tidy, then clears the per-icon transition + persists (single
   // writer). Generalizes the old one-column hartAutoArrange.
