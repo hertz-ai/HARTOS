@@ -173,34 +173,6 @@ in
       renderer = "webkit";
     };
 
-    # ── Privacy-first "everything ON" — every LOCAL feature default-on ──
-    # Steward principle (memory hartos_privacy_first_defaults_2026-06-24): the OS
-    # ships COMPLETE; the user never opts into a LOCAL capability. Anything that
-    # LEAVES the device/network to the Hive (federation, public exposure,
-    # contributing compute, autonomous marketing) stays consent-gated + opt-in
-    # (brain-side) and is deliberately NOT toggled on here.
-    portal.enable = true;          # screenshot + screen-record (grim/wf-recorder) + theme bridge + PAM ext-session-lock — all fail-closed on the screen kill-switch
-    accessibility.enable = true;   # screen reader / magnifier / contrast / sticky keys
-    printing.enable = true;        # printing — hart-cups.nix declares hart.printing (NOT hart.cups)
-    # firewall DEFERRED: hart-firewall.nix uses iptables `extraCommands`, which is INCOMPATIBLE
-    # with the desktop's nftables firewall (eval assertion fails). The base networking.firewall
-    # already protects the node; hart-firewall needs an nftables rewrite before it can default on.
-    # DEFERRED (not blocking this build): hart-dns.nix + hart-email.nix are NOT imported in the
-    # flake yet, and both write SHARED config (dns -> networking.nameservers/services.resolved;
-    # email -> services.gnome.gnome-keyring + security.pam) that must be conflict-checked against
-    # the desktop closure first. Import + enable them once CI-eval'd — secure DNS + mail client
-    # are a follow-up, they must never block the flash.
-    ime.enable = true;             # input method editor (CJK + more)
-    devtools.enable = true;        # developer tools
-    # NOT default-on — AVAILABLE but the user activates them. These don't merely
-    # "exist": they actively change the screen or expose data, so an opinionated
-    # default is wrong. nightlight TINTS the screen (a personal preference — better
-    # off, or scheduled at sunset when the user opts in); dlna BROADCASTS the user's
-    # media on the LAN (an exposure the user should choose — privacy-first). The
-    # toggles live in the shell; default false. (Secure DNS + firewall above stay ON
-    # because they are privacy-POSITIVE, not opinionated.)
-    # hart.nightlight.enable = false (default);  hart.dlna.enable = false (default)
-
     # ── Supervisor-managed compositor TIER LADDER (the never-blank boot) ──
     # The out-of-process session tier-drop supervisor (greetd) OWNS the boot
     # session: it starts at the BEST tier and falls back on failure —
