@@ -33,7 +33,6 @@
   /* Command center: smaller orb, lifted, full-width command bar. */
   .hart-hero { top: 38%; width: 94vw; }
   .hart-hero-orbwrap { width: 184px; height: 184px; }
-  .hart-hero-mic { width: 68px; height: 68px; }
   .hart-hero-bar { width: 100%; }
   .hart-hero-status { font-size: 13px; }
 

@@ -689,6 +689,21 @@ class LiquidUIService:
         if wallpaper.get('type') == 'solid':
             wp_css = wallpaper['value']
 
+        # Living-Glass: emit the active accent as a comma-triple so every glow /
+        # ring / selection re-tints when the theme accent changes. Parsed from the
+        # SAME accent ThemeService resolves (#308-310). Emitted right after
+        # {css_vars} (later source wins) so it overrides any earlier definition.
+        # _CSS_LIVING_GLASS reads it via var(--hart-accent-rgb, 0,212,170); this
+        # makes the variable real rather than relying only on the teal fallback.
+        try:
+            _ac = ((theme.get('colors', {}) or {}).get('accent', '00D4AA')
+                   or '00D4AA').lstrip('#')
+            _ar, _ag, _ab = (int(_ac[0:2], 16), int(_ac[2:4], 16), int(_ac[4:6], 16))
+            accent_rgb_css = (':root{--hart-accent-rgb:'
+                              + f'{_ar},{_ag},{_ab}' + '}')
+        except (ValueError, IndexError, TypeError, AttributeError):
+            accent_rgb_css = ':root{--hart-accent-rgb:0,212,170}'
+
         # Import panel manifest
         try:
             from integrations.agent_engine.shell_manifest import (
@@ -1143,19 +1158,19 @@ img{-webkit-user-drag:none;user-select:none}
 .hart-hero-brand{display:flex;align-items:center;gap:9px;opacity:.92}
 .hart-hero-brand img{width:34px;height:34px;filter:drop-shadow(0 3px 12px rgba(0,212,170,.4))}
 .hart-hero-brand span{font-size:14px;font-weight:600;letter-spacing:2.5px;opacity:.8}
-.hart-hero-orbwrap{position:relative;width:300px;height:300px;display:flex;align-items:center;justify-content:center}
+/* The ORB ITSELF is the click-to-talk control (no mic glyph inside it). The
+   canvas keeps pointer-events:none; the orbwrap captures the click + carries
+   the listening glow that the old centre mic used to show. */
+.hart-hero-orbwrap{position:relative;width:300px;height:300px;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;border-radius:50%;
+  transition:transform .25s cubic-bezier(.175,.885,.32,1.275),box-shadow .25s}
+.hart-hero-orbwrap:hover{transform:scale(1.03)}
+.hart-hero-orbwrap:active{transform:scale(.985)}
+.hart-hero-orbwrap:focus-visible{outline:none;box-shadow:0 0 0 3px var(--hart-accent)}
 #hart-voice-orb{width:300px;height:300px;background:transparent;pointer-events:none;
   filter:drop-shadow(0 12px 44px rgba(108,99,255,.25))}
-.hart-hero-mic{position:absolute;left:50%;top:50%;width:88px;height:88px;transform:translate(-50%,-50%);
-  border-radius:50%;cursor:pointer;border:1px solid var(--hart-glass-border);
-  background:radial-gradient(circle at 50% 34%,rgba(108,99,255,.30),rgba(15,14,23,.42));
-  backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;
-  transition:transform .25s cubic-bezier(.175,.885,.32,1.275),box-shadow .25s,background .25s}
-.hart-hero-mic .mi{font-size:36px;color:#fff;opacity:.92}
-.hart-hero-mic:hover{transform:translate(-50%,-50%) scale(1.07);box-shadow:0 10px 34px rgba(108,99,255,.45)}
-.hart-hero-mic:active{transform:translate(-50%,-50%) scale(.97)}
-.hart-hero-mic.listening{background:radial-gradient(circle at 50% 34%,rgba(255,107,107,.42),rgba(15,14,23,.42));
-  box-shadow:0 0 0 5px rgba(255,107,107,.22),0 10px 34px rgba(255,107,107,.35)}
+.hart-hero-orbwrap.listening{box-shadow:0 0 0 5px rgba(255,107,107,.22),0 10px 44px rgba(255,107,107,.35)}
+.hart-hero-orbwrap.listening #hart-voice-orb{filter:drop-shadow(0 12px 44px rgba(255,107,107,.4))}
 .hart-hero-status{font-size:13px;font-weight:500;letter-spacing:.3px;color:var(--hart-muted);min-height:18px;
   transition:color .3s;max-width:560px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hart-hero-status.thinking{color:var(--hart-accent)}
@@ -1319,10 +1334,26 @@ html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot{animat
 .taskbar-chip{will-change:transform}
 @media(prefers-reduced-motion:reduce){.panel{animation:none}}
 html.a11y-rmotion .panel{animation:none}
-/* ── AI sensory cluster (always-accessible: vision kill-switch + audio) ── */
-.hart-senses{position:fixed;left:14px;bottom:54px;z-index:8100}
-/* Eye + mic grouped as one bottom "sensory" pair (vision | audio). */
-.hart-senses-cluster{display:flex;align-items:center;gap:10px}
+/* ── AI sensory cluster — a FLOATING, DRAGGABLE widget (not rigid like cage).
+   The whole #hart-senses is picked up + dropped anywhere (pointer + touch),
+   constrained to the viewport, position persisted to localStorage. JS sets
+   left/top inline; this default is the bottom-left spot it falls back to.
+   `touch-action:none` so a drag doesn't scroll/zoom the page on touch. ── */
+.hart-senses{position:fixed;left:14px;top:auto;bottom:54px;z-index:8100;touch-action:none}
+.hart-senses.dragging{cursor:grabbing;user-select:none}
+.hart-senses.dragging .hart-senses-cluster{box-shadow:0 12px 36px rgba(0,0,0,.5);transform:scale(1.03)}
+/* Eye + mic grouped as one floating glass "sensory" pair (grip | vision | audio). */
+.hart-senses-cluster{display:flex;align-items:center;gap:8px;padding:6px;border-radius:999px;
+  background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.08),0 6px 22px rgba(0,0,0,.4);
+  transition:box-shadow .2s,transform .2s cubic-bezier(.175,.885,.32,1.275)}
+/* Drag affordance — grab the dots (or anywhere on the widget) to move it. */
+.hart-senses-grip{display:flex;align-items:center;justify-content:center;width:22px;height:40px;flex-shrink:0;
+  cursor:grab;color:var(--hart-muted);border-radius:8px;touch-action:none}
+.hart-senses-grip:hover{color:var(--hart-text);background:rgba(255,255,255,0.06)}
+.hart-senses.dragging .hart-senses-grip{cursor:grabbing}
+.hart-senses-grip .mi{font-size:20px;opacity:.85}
 .hart-senses-mic .mi{color:var(--hart-accent)}
 .hart-senses-mic.listening{background:rgba(255,107,107,.18);border-color:var(--hart-error);
   box-shadow:0 0 0 3px rgba(255,107,107,.18),0 4px 16px rgba(0,0,0,.4)}
@@ -1352,7 +1383,7 @@ html.a11y-rmotion .panel{animation:none}
 .hsp-foot{font-size:10px;color:var(--hart-muted);margin-top:4px;line-height:1.3}
 /* Orb closes its eyes when the human cuts the AI's senses */
 .hart-hero.ai-blind #hart-voice-orb{opacity:.12;filter:grayscale(1) brightness(.4);transition:opacity .5s,filter .5s}
-.hart-hero.ai-blind .hart-hero-mic{background:rgba(40,40,48,.5);box-shadow:none}
+.hart-hero.ai-blind .hart-hero-orbwrap{cursor:default;box-shadow:none}
 /* ── First-run "Light Your HART" ceremony overlay ── */
 .hart-onboarding{position:fixed;inset:0;z-index:12000;display:none;flex-direction:column;align-items:center;justify-content:center;
   gap:26px;text-align:center;padding:48px;background:radial-gradient(circle at 50% 38%,#16142e,#07060f 72%)}
@@ -1376,8 +1407,225 @@ html.a11y-rmotion .panel{animation:none}
 .hart-onboarding .hob-skip{position:fixed;bottom:20px;font-size:12px;color:rgba(255,255,255,.4)}
 '''
 
+        # ═══ "Living Glass" unified design system (overhaul) ═══
+        # Plain string (literal CSS braces) concatenated whole via
+        # {_CSS_LIVING_GLASS} in the <style> AFTER {_CSS_HERO} + {_CSS_DESKTOP}
+        # (later source wins — so it re-skins existing selectors without deleting
+        # them; a stale cached build still works). Defines ONLY new tokens + new
+        # component classes and IMPORTS --hart-accent / --ds-* / --ds-ease-* rather
+        # than redefining them. One accent light, one overhead source, one motion
+        # grammar; chrome lights only on DETERMINISTIC real-state hooks (the JS half
+        # writes #hart-hero-orbwrap[data-orb-state], <html data-*>, .is-sensing,
+        # senses .listening, the pager classes — see the implementation contract).
+        _CSS_LIVING_GLASS = '''
+:root{
+  /* ── Accent triad (theme-driven; re-tints on theme change) ── */
+  --lg-accent: var(--hart-accent);
+  --lg-accent-rgb: var(--hart-accent-rgb, 0,212,170);
+  --lg-glow-0: rgba(var(--lg-accent-rgb),.55);
+  --lg-glow-1: rgba(var(--lg-accent-rgb),.26);
+  --lg-glow-2: rgba(var(--lg-accent-rgb),.12);
+  /* ── Deterministic STATE lights — one hue per real machine signal ── */
+  --lg-listen-rgb: 0,224,194;     /* mic open / listening */
+  --lg-think-rgb:  108,99,255;    /* AI computing (the reclaimed purple) */
+  --lg-speak-rgb:  25,227,125;    /* TTS out */
+  --lg-vision-rgb: 52,176,255;    /* camera/screen being read */
+  --lg-blind-rgb:  120,120,132;   /* senses shut by the human */
+  --lg-alert-rgb:  255,92,122;    /* errors / hard danger */
+  /* ── Neutral ink ladder ── */
+  --lg-heading: #F4F6FF; --lg-text: #E4E7F2; --lg-muted: #9AA2B8; --lg-faint: #646B82;
+  /* ── Glass depth ladder — 4 honest elevations ── */
+  --lg-1-bg: rgba(20,19,33,.42);  --lg-1-blur:14px; --lg-1-bd: rgba(255,255,255,.07);
+  --lg-2-bg: rgba(18,17,30,.56);  --lg-2-blur:20px; --lg-2-bd: rgba(255,255,255,.10);
+  --lg-3-bg: rgba(15,14,26,.70);  --lg-3-blur:26px; --lg-3-bd: rgba(255,255,255,.13);
+  --lg-4-bg: rgba(12,11,22,.82);  --lg-4-blur:34px; --lg-4-bd: rgba(255,255,255,.16);
+  --lg-sat: 1.4;
+  --lg-spec: inset 0 1px 0 0 rgba(255,255,255,.14);
+  --lg-sh-1: 0 2px 10px rgba(0,0,0,.30);
+  --lg-sh-2: 0 8px 26px rgba(0,0,0,.42);
+  --lg-sh-3: 0 18px 50px rgba(0,0,0,.52);
+  --lg-sh-4: 0 30px 72px rgba(0,0,0,.58);
+  /* ── Signature lit "presence ring" — orb, mic, eye, focus reuse these ── */
+  --lg-ring-listen: 0 0 0 2px rgba(var(--lg-listen-rgb),.85), 0 0 0 7px rgba(var(--lg-listen-rgb),.20), 0 8px 30px rgba(var(--lg-listen-rgb),.38);
+  --lg-ring-think:  0 0 0 2px rgba(var(--lg-think-rgb),.85),  0 0 0 8px rgba(var(--lg-think-rgb),.18),  0 8px 30px rgba(var(--lg-think-rgb),.36);
+  --lg-ring-speak:  0 0 0 2px rgba(var(--lg-speak-rgb),.85),  0 0 0 7px rgba(var(--lg-speak-rgb),.18),  0 8px 28px rgba(var(--lg-speak-rgb),.34);
+  --lg-ring-vision: 0 0 0 2px rgba(var(--lg-vision-rgb),.80), 0 0 0 6px rgba(var(--lg-vision-rgb),.18), 0 8px 26px rgba(var(--lg-vision-rgb),.32);
+  /* ── Type ── */
+  --lg-num: "tnum" 1;
+  --lg-ls-display: -.4px; --lg-ls-title: -.1px; --lg-ls-micro: .6px;
+  /* ── Motion roles ── */
+  --lg-spring: var(--ds-ease-spring);
+  --lg-glide:  var(--ds-ease-standard);
+  --lg-enter:  cubic-bezier(.16,1,.3,1);
+  --lg-exit:   cubic-bezier(.4,0,1,1);
+  --lg-breathe:cubic-bezier(.37,0,.63,1);
+  --t-micro:140ms; --t-fast:180ms; --t-move:220ms; --t-reveal:320ms; --t-ceremony:560ms;
+  --lg-stagger:28ms;
+  /* ── Shared geometry (single source; matches hartDesktop.js GRID/PAD) ── */
+  --lg-grid: 92px; --lg-pad: 24px; --lg-snap-widget: 24px;
+}
+@media (prefers-reduced-motion: reduce){
+  :root{--t-micro:0ms;--t-fast:0ms;--t-move:0ms;--t-reveal:0ms;--t-ceremony:0ms}
+}
+/* ── Canonical glass mixin (4 rungs) ── */
+.lg-1,.lg-2,.lg-3,.lg-4{border:1px solid var(--lg-1-bd);box-shadow:var(--lg-spec),var(--lg-sh-1);
+  background:var(--lg-1-bg);-webkit-backdrop-filter:blur(var(--lg-1-blur)) saturate(var(--lg-sat));backdrop-filter:blur(var(--lg-1-blur)) saturate(var(--lg-sat))}
+.lg-2{background:var(--lg-2-bg);border-color:var(--lg-2-bd);box-shadow:var(--lg-spec),var(--lg-sh-2);-webkit-backdrop-filter:blur(var(--lg-2-blur)) saturate(var(--lg-sat));backdrop-filter:blur(var(--lg-2-blur)) saturate(var(--lg-sat))}
+.lg-3{background:var(--lg-3-bg);border-color:var(--lg-3-bd);box-shadow:var(--lg-spec),var(--lg-sh-3);-webkit-backdrop-filter:blur(var(--lg-3-blur)) saturate(var(--lg-sat));backdrop-filter:blur(var(--lg-3-blur)) saturate(var(--lg-sat))}
+.lg-4{background:var(--lg-4-bg);border-color:var(--lg-4-bd);box-shadow:var(--lg-spec),var(--lg-sh-4);-webkit-backdrop-filter:blur(var(--lg-4-blur)) saturate(var(--lg-sat));backdrop-filter:blur(var(--lg-4-blur)) saturate(var(--lg-sat))}
+.lg-num{font-variant-numeric:tabular-nums;font-feature-settings:var(--lg-num)}
+
+/* ═══ DIMENSION 1 — THE ORB (deterministic lit voice control) ═══
+   #hart-hero-orbwrap[data-orb-state] (hartHero.js writes it). Supersede the
+   legacy RED .listening glow (:1157) — later source wins, do NOT delete it. */
+.hart-hero-orbwrap{transition:transform .25s var(--lg-spring),box-shadow var(--t-move) var(--lg-breathe)}
+.hart-hero-orbwrap::after{content:'';position:absolute;inset:-6px;border-radius:50%;pointer-events:none;
+  opacity:0;transition:opacity var(--t-reveal) var(--lg-enter),box-shadow var(--t-move)}
+.hart-hero-orbwrap[data-orb-state="listening"]::after{opacity:1;box-shadow:var(--lg-ring-listen);animation:lg-breathe-ring 2.2s var(--lg-breathe) infinite}
+.hart-hero-orbwrap[data-orb-state="speaking"]::after {opacity:1;box-shadow:var(--lg-ring-speak)}
+.hart-hero-orbwrap[data-orb-state="thinking"]::after {opacity:1;box-shadow:var(--lg-ring-think)}
+@keyframes lg-breathe-ring{0%,100%{transform:scale(1);opacity:.85}50%{transform:scale(1.03);opacity:1}}
+/* Supersede the legacy RED listening glow so it never shows: */
+.hart-hero-orbwrap.listening{box-shadow:none}
+/* Thinking comet — conic sweep masked to the ring */
+.hart-hero-orbwrap[data-orb-state="thinking"]::before{content:'';position:absolute;inset:-6px;border-radius:50%;pointer-events:none;
+  background:conic-gradient(from 0deg,transparent 0 78%,rgba(var(--lg-think-rgb),.9) 90%,transparent 100%);
+  -webkit-mask:radial-gradient(closest-side,transparent calc(100% - 5px),#000 calc(100% - 4px));
+          mask:radial-gradient(closest-side,transparent calc(100% - 5px),#000 calc(100% - 4px));
+  animation:lg-comet 1.4s linear infinite}
+@keyframes lg-comet{to{transform:rotate(360deg)}}
+/* Press ripple from click point */
+.lg-orb-ripple{position:absolute;border-radius:50%;pointer-events:none;background:radial-gradient(circle,rgba(var(--lg-accent-rgb),.35),transparent 70%);animation:lg-ripple .45s var(--lg-exit) forwards}
+@keyframes lg-ripple{from{transform:scale(.2);opacity:.7}to{transform:scale(2.4);opacity:0}}
+html.a11y-rmotion .hart-hero-orbwrap[data-orb-state="thinking"]::before,
+html.a11y-rmotion .hart-hero-orbwrap[data-orb-state="listening"]::after{animation:none}
+
+/* ═══ DIMENSION 2 — THE SENSORY POD (floating, draggable, grid-snapping) ═══
+   Supersede the legacy senses block (:1327-1371). The cluster inherits .lg-1
+   (class added in markup). hartSenses.js writes .dragging/.settle/[data-edge]/
+   #hart-senses-btn.is-sensing; mic .listening already exists (restyle only). */
+.hart-senses-cluster{padding:6px;gap:6px}
+.hart-senses.dragging .hart-senses-cluster{transform:scale(1.04);box-shadow:var(--lg-spec),var(--lg-sh-3)}
+.hart-senses.settle .hart-senses-cluster{animation:lg-settle .34s var(--lg-spring)}
+@keyframes lg-settle{0%{transform:scale(1.06)}100%{transform:scale(1)}}
+.hart-senses-grip{cursor:grab}
+.hart-senses.dragging .hart-senses-grip{cursor:grabbing}
+/* EYE — deterministic 3-state (was only .off red) */
+.hart-senses-btn.is-sensing{background:rgba(var(--lg-vision-rgb),.16);border-color:rgb(var(--lg-vision-rgb));box-shadow:var(--lg-ring-vision)}
+.hart-senses-btn.is-sensing .mi{color:rgb(var(--lg-vision-rgb));animation:lg-pulse 2.4s var(--lg-breathe) infinite}
+.hart-senses-btn.off{background:rgba(var(--lg-blind-rgb),.20);border-color:rgb(var(--lg-blind-rgb))}
+.hart-senses-btn.off .mi{color:rgb(var(--lg-blind-rgb))}
+/* MIC — listening cyan (supersede the legacy red .hart-senses-mic.listening :1343) */
+.hart-senses-mic.listening{background:rgba(var(--lg-listen-rgb),.18);border-color:rgb(var(--lg-listen-rgb));box-shadow:var(--lg-ring-listen)}
+.hart-senses-mic.listening .mi{color:rgb(var(--lg-listen-rgb))}
+@keyframes lg-pulse{0%,100%{opacity:.7}50%{opacity:1}}
+/* Edge-aware proof popover: opens AWAY from the nearest screen edge */
+.hart-senses[data-edge~="b"] .hart-senses-panel{bottom:56px;top:auto}
+.hart-senses[data-edge~="t"] .hart-senses-panel{top:56px;bottom:auto}
+.hart-senses[data-edge~="r"] .hart-senses-panel{right:0;left:auto}
+.hart-senses[data-edge~="l"] .hart-senses-panel{left:0;right:auto}
+/* Snap-grid ghost while dragging */
+.lg-senses-ghost{position:fixed;inset:0;z-index:8090;pointer-events:none;opacity:0;transition:opacity var(--t-reveal);
+  background-image:radial-gradient(rgba(var(--lg-accent-rgb),.16) 1px,transparent 1px);background-size:24px 24px}
+.lg-senses-ghost.show{opacity:1}
+html.a11y-rmotion .hart-senses-btn.is-sensing .mi{animation:none}
+
+/* ═══ DIMENSION 3 — CONTEXTUAL / DETERMINISTIC VISIBILITY ENGINE ═══
+   hartVisibility.js is the sole writer of <html data-*> (data-multiws owned by
+   hartWorkspaces.js). All show/hide is declarative CSS on EXISTING markup. */
+.hart-hero-chips{transition:opacity var(--t-move) var(--lg-enter),transform var(--t-move) var(--lg-enter)}
+html[data-busy="1"] .hart-hero-chips,html[data-panels="1"] .hart-hero-chips,html[data-typing="1"] .hart-hero-chips{opacity:0;transform:translateY(6px) scale(.98);pointer-events:none}
+/* Sensory pod: SAFETY control — dims when idle, NEVER hides; full while sensing/voice */
+.hart-senses{transition:opacity var(--t-reveal) var(--lg-glide)}
+html[data-idle="1"] .hart-senses{opacity:.55}
+html[data-voice="1"] .hart-senses,html[data-blind="1"] .hart-senses{opacity:1}
+/* Pager: hidden only on a pristine, empty desktop; reveals as soon as the virtual-
+   desktop feature is USABLE — any window is open OR you've navigated off desktop 1
+   (data-multiws set by hartWorkspaces). Seeded data-multiws="0" in the <html> markup
+   so the rule matches at first paint (an ABSENT attr would not) — no reveal FOUC. */
+.hart-ws-switcher{transition:opacity var(--t-move) var(--lg-enter),transform var(--t-move) var(--lg-enter)}
+html[data-multiws="0"] .hart-ws-switcher{opacity:0;transform:translate(-50%,8px);pointer-events:none}
+/* Ambient wash subtly shifts toward the active state (the WHOLE room reacts).
+   thinking / voice / speaking each tint the room so the active state is felt
+   peripherally — speaking gets parity with the other two (it previously had no
+   <html>-level consumer, so the "AI is talking" signal lit nothing). */
+html[data-thinking="1"] .hart-ambient{filter:blur(64px) saturate(150%) hue-rotate(16deg);transition:filter var(--t-reveal)}
+html[data-voice="1"] .hart-ambient{filter:blur(64px) saturate(160%) hue-rotate(-10deg);transition:filter var(--t-reveal)}
+html[data-speaking="1"] .hart-ambient{filter:blur(64px) saturate(155%) hue-rotate(-26deg);transition:filter var(--t-reveal)}
+/* While HART speaks, the hevolve "live" pip in the spine glows the TTS-out green so
+   the speaking state has a deterministic on-screen cue (not just the orb canvas). */
+html[data-speaking="1"] .hart-hero-hevolve{opacity:.9}
+html[data-speaking="1"] .hart-hero-hevolve .dot{background:rgb(var(--lg-speak-rgb));box-shadow:0 0 0 3px rgba(var(--lg-speak-rgb),.22)}
+/* Agents-running signal: when >=1 agent is live, the top-bar agent cluster reads
+   as ACTIVE (chip dots gain a soft live-glow); with none, it stays muted. This
+   makes data-agents actionable (it had no consumer before). */
+html[data-agents="1"] .top-bar-center .agent-chip .dot{box-shadow:0 0 0 3px rgba(0,230,118,.22)}
+html[data-agents="0"] .top-bar-center{opacity:.72}
+/* Offline signal: when the network is down, fade + desaturate the agent-status
+   cluster (the live network surface) so "offline" is visible, not silent. */
+html[data-online="0"] .top-bar-center{opacity:.5;filter:grayscale(.7);transition:opacity var(--t-reveal),filter var(--t-reveal)}
+
+/* ═══ DIMENSION 4 — DESKTOP ICONS (sort + marquee + drop-cell) ═══
+   Re-skin .desktop-icon (:1207); supersede flat-purple .selected (:1211).
+   hartDesktop.js writes .arranging on #hart-desktop + .lg-drop-cell/.lg-marquee. */
+.desktop-icon.selected{background:rgba(var(--lg-accent-rgb),.22);outline:1px solid rgba(var(--lg-accent-rgb),.55);box-shadow:0 8px 30px rgba(var(--lg-accent-rgb),.30)}
+.desktop-icon.dragging{transform:scale(1.06);box-shadow:var(--lg-sh-3);z-index:60}
+.hart-desktop::before{content:'';position:absolute;inset:0;opacity:0;pointer-events:none;transition:opacity var(--t-fast);
+  background-image:radial-gradient(rgba(var(--lg-accent-rgb),.16) 1.5px,transparent 1.5px);background-size:var(--lg-grid) var(--lg-grid);background-position:var(--lg-pad) var(--lg-pad)}
+.hart-desktop.arranging::before{opacity:1}
+.lg-drop-cell{position:absolute;width:84px;height:84px;border-radius:14px;pointer-events:none;border:2px dashed rgba(var(--lg-accent-rgb),.6);background:rgba(var(--lg-accent-rgb),.08);transition:left var(--t-fast) var(--lg-glide),top var(--t-fast) var(--lg-glide)}
+.lg-marquee{position:fixed;z-index:55;pointer-events:none;border:1px solid rgba(var(--lg-accent-rgb),.7);background:rgba(var(--lg-accent-rgb),.10);border-radius:6px}
+
+/* ═══ DIMENSION 5 — THE WORKSPACE PAGER (segmented, occupancy-aware, thumb) ═══
+   Supersede the .hart-ws-dot block (:1251). .hart-ws-switcher inherits .lg-2
+   (class already on markup :1793). hartWorkspaces.js writes the pager DOM. */
+.hart-ws-switcher{padding:3px;gap:2px;height:30px;align-items:center}
+.hart-pager-thumb{position:absolute;top:3px;left:3px;height:24px;border-radius:var(--ds-radius-full);background:rgba(var(--lg-accent-rgb),.92);box-shadow:0 2px 10px rgba(var(--lg-accent-rgb),.4);transition:transform var(--t-move) var(--lg-spring),width var(--t-move) var(--lg-spring);z-index:0}
+.hart-pager-seg{position:relative;z-index:1;min-width:34px;height:24px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;border:none;background:transparent;cursor:pointer;color:var(--lg-muted);border-radius:var(--ds-radius-full);transition:color var(--t-fast)}
+.hart-pager-seg .hps-n{font-size:11px;font-weight:700;line-height:1}
+.hart-pager-seg .hps-occ{display:flex;gap:2px;height:3px}
+.hart-pager-seg .hps-occ i{width:3px;height:3px;border-radius:50%;background:currentColor;opacity:.7}
+.hart-pager-seg.empty .hps-occ{opacity:.35}
+.hart-pager-seg:hover{color:var(--lg-text)}
+.hart-pager-seg.active{color:var(--hart-on-accent)}
+@media(prefers-reduced-motion:reduce){.hart-pager-thumb{transition:none}}
+
+/* ═══ DIMENSION 7 — OFFLINE / EMPTY STATES (designed, never naive) ═══
+   hartStates.js builds .lg-empty / .lg-empty-{loading,offline,empty}. */
+.lg-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:var(--ds-space-3);padding:var(--ds-space-12) var(--ds-space-6);min-height:240px;animation:lg-empty-in var(--t-reveal) var(--lg-enter)}
+@keyframes lg-empty-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.lg-empty-disc{width:56px;height:56px;border-radius:var(--ds-radius-lg);display:flex;align-items:center;justify-content:center;background:var(--lg-1-bg);border:1px solid var(--lg-1-bd);box-shadow:var(--lg-spec)}
+.lg-empty-disc .mi{font-size:28px;color:var(--lg-muted)}
+.lg-empty-offline .lg-empty-disc .mi{color:rgb(var(--lg-blind-rgb));animation:lg-empty-breathe 3s var(--lg-breathe) infinite}
+@keyframes lg-empty-breathe{0%,100%{opacity:.6;transform:scale(1)}50%{opacity:1;transform:scale(1.06)}}
+.lg-empty-title{font-size:15px;font-weight:600;color:var(--lg-heading);letter-spacing:-.1px}
+.lg-empty-msg{font-size:13px;line-height:1.5;color:var(--lg-muted);max-width:340px}
+.lg-empty-retry{margin-top:var(--ds-space-1)}
+html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
+
+/* ═══ DIMENSION 6 — VISUAL DESIGN LANGUAGE (cohesion pass) ═══
+   Chips spring + tabular numerals on clock/pager/counters. */
+.hart-hero-chip{transition:background .18s,transform .18s var(--lg-spring),box-shadow .18s}
+.hart-hero-chip:hover{transform:translateY(-2px);box-shadow:var(--lg-sh-2)}
+.hart-hero-chip:active{transform:scale(.97)}
+.top-bar-right .clock{font-variant-numeric:tabular-nums;font-feature-settings:var(--lg-num)}
+'''
+        # Potato (no-blur) variant of the .lg-1..4 mixin + state surfaces — mirrors
+        # the .glass branch (:1414) + _CSS_POTATO_OVERRIDE (:1097): drop the
+        # backdrop-filter and raise bg opacity so the chrome stays legible without
+        # the GPU-costly blur on low-end hardware.
+        if is_potato:
+            _CSS_LIVING_GLASS += (
+                '.lg-1,.lg-2,.lg-3,.lg-4{backdrop-filter:none;-webkit-backdrop-filter:none}'
+                '.lg-1{background:rgba(20,19,33,.92)}'
+                '.lg-2{background:rgba(18,17,30,.94)}'
+                '.lg-3{background:rgba(15,14,26,.95)}'
+                '.lg-4{background:rgba(12,11,22,.96)}'
+                '.lg-senses-ghost,.hart-desktop::before{display:none}'
+            )
+
         return f'''<!DOCTYPE html>
-<html lang="en" class="{a11y_cls}"><head>
+<html lang="en" class="{a11y_cls}" data-multiws="0"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>HART OS</title>
@@ -1385,6 +1633,7 @@ html.a11y-rmotion .panel{animation:none}
 <style>/* Icons: the BUNDLED /shell/static/MaterialSymbolsRounded.woff2 @font-face below is authoritative (every glyph, fully offline). This CDN <link> is progressive-enhancement ONLY (online round variant). */</style>
 <style>
 {css_vars}
+{accent_rgb_css}
 {a11y_fontscale}
 *{{margin:0;padding:0;box-sizing:border-box}}
 ::selection{{background:var(--hart-accent);color:#fff}}
@@ -1634,6 +1883,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 {_CSS_DESIGN_SYSTEM}
 {_CSS_HERO}
 {_CSS_DESKTOP}
+{_CSS_LIVING_GLASS}
 {_CSS_POTATO_OVERRIDE if is_potato else ''}
 </style>
 </head>
@@ -1654,9 +1904,8 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      orb canvas below is the SAME #hart-voice-orb driven by initHartOrb; the bar
      fuses search + agent dispatch + the voice transcript sink. -->
 <div class="hart-hero" id="hart-hero" role="search" aria-label="HART command center">
-  <div class="hart-hero-orbwrap">
+  <div class="hart-hero-orbwrap" id="hart-hero-orbwrap" data-orb-state="idle" role="button" tabindex="0" aria-label="Speak to HART (Super+Space)" title="Click or press Super+Space to speak">
     <canvas id="hart-voice-orb" width="360" height="360" aria-hidden="true"></canvas>
-    <button class="hart-hero-mic" id="hart-hero-mic" type="button" aria-label="Speak to HART (Super+Space)" title="Click or press Super+Space to speak"><span class="mi material-icons-round" aria-hidden="true">mic</span></button>
   </div>
   <div class="hart-hero-status" id="hart-hero-status" role="status" aria-live="polite">Ask HART anything - say it or type it</div>
   <div class="hart-hero-bar glass">
@@ -1717,6 +1966,11 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script defer src="/shell/static/hartMarketplace.js"></script>
 <script defer src="/shell/static/hartDock.js"></script>
 <script defer src="/shell/static/hartSenses.js"></script>
+<!-- Living-Glass: deterministic visibility engine (sole writer of <html data-*>)
+     + designed offline/empty-state component. Loaded after hartSenses.js (it reads
+     its #hart-hero / #panels / senses hooks) and before hartSessionUI.js. -->
+<script defer src="/shell/static/hartVisibility.js"></script>
+<script defer src="/shell/static/hartStates.js"></script>
 <script defer src="/shell/static/hartOnboarding.js"></script>
 <script defer src="/shell/static/hartSessionUI.js"></script>
 <link rel="stylesheet" href="/shell/static/hartResponsive.css">
@@ -1781,12 +2035,13 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      as one grouped "sensory" pair. The eye hard-cuts the AI's senses + shows live
      proof (hartSenses.js); the mic toggles voice input (toggleVoice). This is the
      SMALL bottom mic — NOT the central voice orb, which stays untouched. -->
-<div class="hart-senses" id="hart-senses">
+<div class="hart-senses" id="hart-senses" data-edge="b">
   <div class="hart-senses-panel" id="hart-senses-panel" role="status" aria-live="polite">
     <div class="hsp-title">AI sensory state</div>
     <div id="hart-senses-proof"></div>
   </div>
-  <div class="hart-senses-cluster" role="group" aria-label="AI senses (vision &amp; audio)">
+  <div class="hart-senses-cluster lg-1" role="group" aria-label="AI senses (vision &amp; audio)">
+    <span class="hart-senses-grip" aria-hidden="true"><span class="mi material-icons-round">drag_indicator</span></span>
     <button class="hart-senses-btn" id="hart-senses-btn" type="button" aria-pressed="false" aria-label="Shut or wake the AI's senses" title="Shut the AI's eyes &amp; ears (right-click for live proof)">
       <span class="mi material-icons-round" aria-hidden="true">visibility</span>
     </button>

@@ -25,6 +25,51 @@
     }
   }
 
+  // How many panels live on desktop n (occupancy — drives the per-segment dots).
+  function windowsOn(n) {
+    var c = 0;
+    if (pc) Array.prototype.forEach.call(pc.querySelectorAll('.panel'), function (p) {
+      if ((parseInt(p.getAttribute('data-ws') || '1', 10)) === n) c++;
+    });
+    return c;
+  }
+
+  // Slide the accent thumb under the active segment (tracked by position+width).
+  function moveThumb() {
+    var seg = bar && bar.querySelector('.hart-pager-seg[data-ws="' + current + '"]');
+    var th = bar && bar.querySelector('.hart-pager-thumb');
+    if (seg && th) { th.style.transform = 'translateX(' + seg.offsetLeft + 'px)'; th.style.width = seg.offsetWidth + 'px'; }
+  }
+
+  // Paint per-segment occupancy dots + active state, and stamp data-multiws — the
+  // Dimension-3 visibility hook the pager OWNS (it alone knows occupancy; Gate 4).
+  //
+  // The pager reveals once ANY window is open (occ >= 1 OR not on desktop 1), NOT
+  // only when >1 desktop is already occupied. The old ">1 occupied" rule was a
+  // discoverability DEADLOCK: a panel is tagged with the CURRENT desktop, so to
+  // ever occupy a 2nd desktop you must first SWITCH — but the switcher was hidden
+  // until a 2nd desktop was already occupied. Revealing it as soon as there's a
+  // window to distribute (or you've already navigated off desktop 1) breaks that
+  // loop while still keeping the rail out of the way on a pristine, empty desktop.
+  function paintOccupancy() {
+    if (!bar) return;
+    var occ = 0, total = 0;
+    Array.prototype.forEach.call(bar.querySelectorAll('.hart-pager-seg'), function (seg) {
+      var n = parseInt(seg.dataset.ws, 10), c = windowsOn(n);
+      if (c) occ++;
+      total += c;
+      var box = seg.querySelector('.hps-occ');
+      if (box) {
+        box.innerHTML = '';
+        for (var k = 0; k < Math.min(c, 3); k++) box.appendChild(document.createElement('i'));
+      }
+      seg.classList.toggle('empty', c === 0);
+      seg.classList.toggle('active', n === current);
+    });
+    var usable = total > 0 || current !== 1;   // a window exists, or we've navigated away
+    document.documentElement.setAttribute('data-multiws', usable ? '1' : '0');
+  }
+
   function apply() {
     if (pc) {
       Array.prototype.forEach.call(pc.querySelectorAll('.panel'), function (p) {
@@ -32,11 +77,8 @@
         p.style.display = (ws === current) ? '' : 'none';
       });
     }
-    if (bar) {
-      Array.prototype.forEach.call(bar.querySelectorAll('.hart-ws-dot'), function (d, i) {
-        d.classList.toggle('active', (i + 1) === current);
-      });
-    }
+    moveThumb();
+    paintOccupancy();
     // Keep the settings-panel squares live too (both views share this state).
     Array.prototype.forEach.call(document.querySelectorAll('.hart-ws-square'), function (sq) {
       sq.classList.toggle('active', parseInt(sq.getAttribute('data-ws-square'), 10) === current);
@@ -51,30 +93,38 @@
   };
   window.hartWorkspaceInfo = function () { return { count: COUNT, current: current }; };
 
+  // Segmented glass rail: a sliding accent thumb + per-desktop occupancy dots.
+  // Replaces the 4 flat numbered .hart-ws-dot buttons. Scroll-wheel cycles.
   function buildBar() {
     bar = document.getElementById('hart-ws-switcher');
     if (!bar) return;
-    bar.innerHTML = '';
+    bar.innerHTML = '<div class="hart-pager-thumb"></div>';
     for (var i = 1; i <= COUNT; i++) {
       (function (n) {
-        var b = document.createElement('button');
-        b.className = 'hart-ws-dot' + (n === current ? ' active' : '');
-        b.type = 'button';
-        b.textContent = String(n);
-        b.setAttribute('aria-label', 'Switch to desktop ' + n);
-        b.addEventListener('click', function () { window.hartSwitchWorkspace(n); });
-        bar.appendChild(b);
+        var seg = document.createElement('button');
+        seg.className = 'hart-pager-seg';
+        seg.type = 'button';
+        seg.dataset.ws = String(n);
+        seg.setAttribute('aria-label', 'Desktop ' + n);
+        seg.innerHTML = '<span class="hps-n lg-num">' + n + '</span><span class="hps-occ"></span>';
+        seg.addEventListener('click', function () { window.hartSwitchWorkspace(n); });
+        bar.appendChild(seg);
       })(i);
     }
+    bar.addEventListener('wheel', function (e) {
+      e.preventDefault();
+      window.hartSwitchWorkspace(current + (e.deltaY > 0 ? 1 : -1));
+    }, { passive: false });
   }
 
   function init() {
     pc = document.getElementById('panels');
     if (!pc) { return setTimeout(init, 300); }
     buildBar();
+    apply();   // initial thumb position + data-multiws (before any panel opens)
     new MutationObserver(function (muts) {
       muts.forEach(function (m) { Array.prototype.forEach.call(m.addedNodes, tagPanel); });
-      apply();
+      apply();   // occupancy stays live as panels open/close (Dimension-3 hook)
     }).observe(pc, { childList: true });
 
     // Ctrl+Alt+Left/Right switch; Ctrl+Alt+1..4 jump (the common Linux binding,

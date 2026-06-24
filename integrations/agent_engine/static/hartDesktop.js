@@ -160,6 +160,7 @@
       sx = e.clientX; sy = e.clientY;
       ox = parseInt(el.style.left, 10) || 0; oy = parseInt(el.style.top, 10) || 0;
       el.classList.add('dragging');
+      if (layer) layer.classList.add('arranging');   // show the snap-grid overlay while dragging
       try { el.setPointerCapture(e.pointerId); } catch (_) {}
     });
     el.addEventListener('pointermove', function (e) {
@@ -168,18 +169,39 @@
       if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
       if (raf) return;
       raf = requestAnimationFrame(function () {       // GPU transform, no layout
-        raf = 0; el.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
+        raf = 0;
+        el.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
+        // If this icon is part of a multi-selection, the whole group follows live
+        // (same GPU-composited transform applied to each selected sibling).
+        if (el.classList.contains('selected') && layer) {
+          var sel = layer.querySelectorAll('.desktop-icon.selected');
+          if (sel.length > 1) Array.prototype.forEach.call(sel, function (n) { n.style.transform = el.style.transform; });
+        }
       });
     });
     function endDrag(e) {
       if (!dragging) return;
       dragging = false; el.classList.remove('dragging');
+      if (layer) layer.classList.remove('arranging');
       if (raf) { cancelAnimationFrame(raf); raf = 0; }
       try { el.releasePointerCapture(e.pointerId); } catch (_) {}
       el.style.transform = '';
       if (moved) {                                    // commit to grid + persist
-        el.style.left = snap(ox + dx) + 'px';
-        el.style.top = snap(oy + dy) + 'px';
+        // GROUP MOVE: if this icon is part of a multi-selection (marquee), apply
+        // the SAME snapped delta to every selected icon so the whole group moves
+        // as one. Otherwise just this icon. One persist() at the end (single writer).
+        var sel = layer ? layer.querySelectorAll('.desktop-icon.selected') : [];
+        if (el.classList.contains('selected') && sel.length > 1) {
+          var ddx = snap(ox + dx) - ox, ddy = snap(oy + dy) - oy;
+          Array.prototype.forEach.call(sel, function (n) {
+            n.style.transform = '';
+            n.style.left = snap((parseInt(n.style.left, 10) || 0) + ddx) + 'px';
+            n.style.top = snap((parseInt(n.style.top, 10) || 0) + ddy) + 'px';
+          });
+        } else {
+          el.style.left = snap(ox + dx) + 'px';
+          el.style.top = snap(oy + dy) + 'px';
+        }
         persist();
       } else if (e && e.pointerType === 'touch') {    // touch surface: a single tap opens
         launch(id);
@@ -359,14 +381,42 @@
     if (!layer) { setTimeout(function () { window.hartPinIcon(id); }, 400); return; }
     window.hartPinIcon(id);
   };
-  window.hartAutoArrange = function () {
+  // How many icon rows fit in one screen column (accounts for the top bar).
+  function rowsPerScreen() {
+    var top = 40;
+    try {
+      var v = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--hart-topbar-height'), 10);
+      if (v) top = v;
+    } catch (_) {}
+    return Math.max(1, Math.floor((window.innerHeight - top - 2 * PAD) / GRID));
+  }
+
+  // Real SORT + column-major reflow into the grid. `by` ∈ name|type|color|null
+  // (null = keep DOM order = "auto-arrange"). Staggered glide so it reads as a
+  // deliberate tidy, then clears the per-icon transition + persists (single
+  // writer). Generalizes the old one-column hartAutoArrange.
+  window.hartArrange = function (by) {
     if (!layer) return;
-    var col = 0;
-    Array.prototype.forEach.call(layer.querySelectorAll('.desktop-icon'), function (el) {
-      el.style.left = PAD + 'px'; el.style.top = (PAD + col * GRID) + 'px'; col++;
+    var M_ = M();
+    var items = Array.prototype.slice.call(layer.querySelectorAll('.desktop-icon'));
+    var key = {
+      name: function (el) { return ((M_[el.dataset.id] || {}).title || el.dataset.id || '').toLowerCase(); },
+      type: function (el) { return ((M_[el.dataset.id] || {}).group || 'zzz').toLowerCase(); },
+      color: function (el) { return el.getAttribute('data-ov-color') || (M_[el.dataset.id] || {}).color || '~'; }
+    }[by] || null;
+    if (key) items.sort(function (a, b) { var ka = key(a), kb = key(b); return ka < kb ? -1 : ka > kb ? 1 : 0; });
+    var rows = rowsPerScreen(), i = 0;
+    items.forEach(function (el) {
+      var col = Math.floor(i / rows), row = i % rows; i++;
+      el.style.transition = 'left var(--t-reveal,320ms) var(--lg-glide,ease) ' + (i * 8) + 'ms,top var(--t-reveal,320ms) var(--lg-glide,ease) ' + (i * 8) + 'ms';
+      el.style.left = (PAD + col * GRID) + 'px';
+      el.style.top = (PAD + row * GRID) + 'px';
     });
-    persist();
+    if (window.HartSession) window.HartSession.set('icon_sort', by || 'auto');
+    setTimeout(function () { items.forEach(function (el) { el.style.transition = ''; }); persist(); }, 600);
   };
+  // Back-compat alias — existing callers (context menu, etc.) still work.
+  window.hartAutoArrange = function () { window.hartArrange(null); };
   window.hartAddAppPicker = function () {
     var menu = document.getElementById('ctx-menu');
     if (!menu || typeof window.ctxItem !== 'function') return;
@@ -401,9 +451,63 @@
     list.forEach(function (it) { if (M()[it.id]) layer.appendChild(makeIcon(it)); });
   }
 
+  // ── Marquee (rubber-band) multi-select over the empty desktop ──
+  // #hart-desktop is pointer-events:none (so right-click reaches the wallpaper
+  // menu) and only icons capture events — therefore an empty-area drag lands on
+  // .wallpaper / <body>. We bind on document, start a band ONLY when the press
+  // begins on empty desktop (not on an icon / panel / chrome), draw a fixed
+  // .lg-marquee, and toggle .selected on every icon whose rect intersects. A
+  // plain empty click (no drag) clears the selection. Group-move of the selection
+  // is handled in endDrag (the shared delta path).
+  function initMarquee() {
+    var mq = null, mx = 0, my = 0, marquing = false;
+    function onEmpty(t) {
+      // Empty desktop = the wallpaper or the body, and NOT inside any icon/panel/menu.
+      return t && (t.classList && t.classList.contains('wallpaper') || t === document.body) &&
+        !(t.closest && t.closest('.desktop-icon,.panel,.start-menu,.ctx-menu,.taskbar,.top-bar,.hart-senses,.hart-hero,#hart-ws-switcher'));
+    }
+    document.addEventListener('pointerdown', function (e) {
+      if (e.button !== 0 || !onEmpty(e.target)) return;
+      marquing = true; mx = e.clientX; my = e.clientY;
+      mq = document.createElement('div'); mq.className = 'lg-marquee';
+      mq.style.cssText = 'left:' + mx + 'px;top:' + my + 'px;width:0;height:0';
+      document.body.appendChild(mq);
+    });
+    document.addEventListener('pointermove', function (e) {
+      if (!marquing || !mq) return;
+      var x = Math.min(e.clientX, mx), y = Math.min(e.clientY, my),
+          w = Math.abs(e.clientX - mx), h = Math.abs(e.clientY - my);
+      mq.style.left = x + 'px'; mq.style.top = y + 'px'; mq.style.width = w + 'px'; mq.style.height = h + 'px';
+      if (!layer) return;
+      var bx = x, by = y, bw = w, bh = h;
+      Array.prototype.forEach.call(layer.querySelectorAll('.desktop-icon'), function (el) {
+        var r = el.getBoundingClientRect();
+        var hits = !(r.right < bx || r.left > bx + bw || r.bottom < by || r.top > by + bh);
+        el.classList.toggle('selected', hits);
+      });
+    });
+    function endMarquee() {
+      if (!marquing) return;
+      marquing = false;
+      if (mq && mq.parentNode) mq.parentNode.removeChild(mq);
+      mq = null;
+    }
+    document.addEventListener('pointerup', function (e) {
+      if (!marquing) return;
+      // A plain click on empty space (no real drag) clears the selection.
+      if (Math.abs(e.clientX - mx) + Math.abs(e.clientY - my) < 4 && layer) {
+        Array.prototype.forEach.call(layer.querySelectorAll('.desktop-icon.selected'),
+          function (n) { n.classList.remove('selected'); });
+      }
+      endMarquee();
+    });
+    document.addEventListener('pointercancel', endMarquee);
+  }
+
   function init() {
     layer = document.getElementById('hart-desktop');
     if (!layer || !window.MANIFEST || !window.HartSession) { return setTimeout(init, 300); }
+    initMarquee();
     window.HartSession.ready(function () {
       var icons = window.HartSession.get('desktop_icons');
       render((icons && icons.length) ? icons : defaults());

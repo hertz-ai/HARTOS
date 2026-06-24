@@ -107,28 +107,50 @@
       wg.appendChild(c);
     });
 
-    // Image wallpapers from the existing collection (best effort)
+    // Image wallpapers from the existing collection. Routed through the shared
+    // designed-state loader (hartStates.js): loading skeleton -> grid on success,
+    // breathing "offline" card + one-click retry + silent auto-recover on failure
+    // — no naive 'Loading…'/'Images unavailable' strings, no stack traces. Falls
+    // back to the original inline flow if hartStates.js isn't loaded yet (the
+    // <script> include is wired brain-side), so this never breaks unwired.
     var ig = section('Images');
-    var loading = document.createElement('div'); loading.className = 'ds-body-sm ds-text-muted';
-    loading.textContent = 'Loading…'; ig.appendChild(loading);
-    fetch('/api/shell/wallpaper/collection',
-      { signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null })
-      .then(function (r) { return r.json(); }).then(function (col) {
-        ig.innerHTML = '';
-        var imgs = (col.wallpapers || []).slice(0, 12);
-        if (!imgs.length) { ig.appendChild(loading); loading.textContent = 'No image wallpapers found'; return; }
-        imgs.forEach(function (w) {
-          var url = '/api/shell/files/thumb?path=' + encodeURIComponent(w.path);
-          var c = card('hart-wall-card', 'background:#1a1a1a;overflow:hidden', w.name || 'Image', null);
-          var img = document.createElement('img');
-          img.src = url; img.setAttribute('style', 'width:100%;height:100%;object-fit:cover');
-          img.onerror = function () { img.style.display = 'none'; };
-          c.querySelector('.htc-prev').appendChild(img);
-          c.addEventListener('click', function () { window.hartSetWallpaperImage(url, w.path); toast('Wallpaper', w.name || 'Image'); });
-          ig.appendChild(c);
-        });
-      }).catch(function () { ig.innerHTML = ''; var d = document.createElement('div');
-        d.className = 'ds-body-sm ds-text-muted'; d.textContent = 'Images unavailable'; ig.appendChild(d); });
+    function renderImages(host, col) {
+      var imgs = (col.wallpapers || []).slice(0, 12);
+      if (!imgs.length) {
+        if (typeof window.hartEmptyState === 'function') {
+          host.appendChild(window.hartEmptyState({ kind: 'empty', icon: 'wallpaper',
+            title: 'No image wallpapers', msg: 'Add images to your Pictures folder to see them here.' }));
+        } else {
+          var e = document.createElement('div'); e.className = 'ds-body-sm ds-text-muted';
+          e.textContent = 'No image wallpapers found'; host.appendChild(e);
+        }
+        return;
+      }
+      imgs.forEach(function (w) {
+        var url = '/api/shell/files/thumb?path=' + encodeURIComponent(w.path);
+        var c = card('hart-wall-card', 'background:#1a1a1a;overflow:hidden', w.name || 'Image', null);
+        var img = document.createElement('img');
+        img.src = url; img.setAttribute('style', 'width:100%;height:100%;object-fit:cover');
+        img.onerror = function () { img.style.display = 'none'; };
+        c.querySelector('.htc-prev').appendChild(img);
+        c.addEventListener('click', function () { window.hartSetWallpaperImage(url, w.path); toast('Wallpaper', w.name || 'Image'); });
+        host.appendChild(c);
+      });
+    }
+    if (typeof window.hartLoadInto === 'function') {
+      window.hartLoadInto(ig, '/api/shell/wallpaper/collection', renderImages, {
+        title: 'Appearance is offline',
+        msg: 'Could not reach the hive backend yet - your themes and wallpapers will appear here once the connection is back.'
+      });
+    } else {
+      var loading = document.createElement('div'); loading.className = 'ds-body-sm ds-text-muted';
+      loading.textContent = 'Loading…'; ig.appendChild(loading);
+      fetch('/api/shell/wallpaper/collection',
+        { signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null })
+        .then(function (r) { return r.json(); }).then(function (col) { ig.innerHTML = ''; renderImages(ig, col); })
+        .catch(function () { ig.innerHTML = ''; var d = document.createElement('div');
+          d.className = 'ds-body-sm ds-text-muted'; d.textContent = 'Images unavailable'; ig.appendChild(d); });
+    }
 
     el.appendChild(grid);
   };

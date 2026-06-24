@@ -30,15 +30,26 @@
   }
 
   function start() {
+    // The ORB ITSELF is the click-to-talk control (there is no centre mic glyph).
+    // We hang the voice toggle + listening reflection on the orbwrap; the
+    // #hart-voice-orb canvas stays pointer-events:none and visually untouched.
     var hero = $('hart-hero'), input = $('hart-hero-input'), go = $('hart-hero-go'),
-        mic = $('hart-hero-mic'), status = $('hart-hero-status'),
+        orb = $('hart-hero-orbwrap'), status = $('hart-hero-status'),
         chips = $('hart-hero-chips'), hev = $('hart-hero-hevolve');
     if (!hero || !input) { return setTimeout(start, 300); }
 
     function setStatus(t, cls) {
       if (status) { status.textContent = t; status.className = 'hart-hero-status' + (cls ? ' ' + cls : ''); }
     }
-    function thinking(on) { if (hev) hev.classList.toggle('on', !!on); }
+    // The hevolve dot MIRRORS the single global flag — it never owns it. acSend is
+    // the CANONICAL writer of window._hartThinking (Gate 4 one-writer); the reflect
+    // loop below reads that flag and lights/clears the dot, so a hero-local timer
+    // can never race acSend's real terminal paths (the local 4B routinely runs
+    // 64-600s — a fixed clear would make the "thinking" lamp lie). For the
+    // deterministic fast-paths that DON'T call acSend (e.g. a known app launch we
+    // could show a brief "Thinking…" for), the caller flips the flag and the same
+    // reflect loop clears it; no second source of truth, no fixed-duration guess.
+    function hevDot(on) { if (hev) hev.classList.toggle('on', !!on); }
 
     // DETERMINISTIC-FIRST app launch: an app/panel name ("firefox", "files",
     // "settings") should open INSTANTLY via the canonical openPanel(id), never
@@ -92,20 +103,41 @@
       if (chat && !chat.classList.contains('open') && typeof window.toggleAssistantChat === 'function') {
         window.toggleAssistantChat();
       }
+      // acSend is the SOLE owner of window._hartThinking here: it sets it now and
+      // clears it on its REAL terminal paths (response arrived / error / fast-path).
+      // The hero must NOT arm a fixed-duration clear — the brain can run far longer
+      // than any guess, and a premature flip would make the "thinking" lamp lie
+      // (then snap off again when acSend resolves). We only paint our local status
+      // text; the reflect loop below resets it off the real flag, never a timer.
       if (aci) { aci.value = text; if (typeof window.acSend === 'function') window.acSend(); }
       input.value = '';
       setStatus('Hevolve AI is thinking…', 'thinking');
-      thinking(true);
-      setTimeout(function () { thinking(false); if (!listening()) setStatus(DEFAULT_HINT, ''); }, 4500);
     }
 
     input.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') { e.preventDefault(); dispatch(input.value); }
     });
     if (go) go.addEventListener('click', function () { dispatch(input.value); });
-    if (mic) mic.addEventListener('click', function () {
-      if (typeof window.toggleVoice === 'function') window.toggleVoice();
-    });
+    // Clicking (or keyboard-activating) the orb toggles voice — the orb IS the
+    // voice interface. role="button" + tabindex make it keyboard-reachable.
+    function speak() { if (typeof window.toggleVoice === 'function') window.toggleVoice(); }
+    if (orb) {
+      orb.addEventListener('click', speak);
+      orb.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ' || e.code === 'Space') { e.preventDefault(); speak(); }
+      });
+      // Press ripple from the click point — a tactile "you touched the orb" pulse.
+      // Purely visual (pointer-events:none span removed after the animation); the
+      // canvas + toggleVoice are untouched.
+      orb.addEventListener('pointerdown', function (e) {
+        var r = document.createElement('span'); r.className = 'lg-orb-ripple';
+        var b = orb.getBoundingClientRect(), s = 120;
+        r.style.cssText = 'left:' + (e.clientX - b.left - s / 2) + 'px;top:' + (e.clientY - b.top - s / 2) +
+          'px;width:' + s + 'px;height:' + s + 'px';
+        orb.appendChild(r);
+        setTimeout(function () { if (r.parentNode) r.parentNode.removeChild(r); }, 480);
+      });
+    }
 
     // Quick-action chips. Reuse openPanel(id) with canonical MANIFEST keys; a
     // wrong/absent key is a harmless no-op, never a fork.
@@ -126,13 +158,37 @@
       });
     }
 
-    // Reflect listening state from the existing flag (no second AudioContext).
-    var wasListen = false;
+    // Reflect the orb's lit STATE from the real existing globals (no second
+    // AudioContext, no second loop): isRecording (listening), _acAudio (TTS out),
+    // window._hartThinking (the brain is computing — owned by acSend). The orb
+    // becomes a state lamp via #hart-hero-orbwrap[data-orb-state] — the CSS in
+    // _CSS_LIVING_GLASS draws accent/purple/green rings off that attr. We KEEP
+    // toggling the legacy `.listening` class too so a stale build (whose CSS
+    // predates data-orb-state) still shows a listening cue. The hevolve dot + the
+    // hero status text are MIRRORS of the real flag here — never a fixed timer —
+    // so the lamp can't lie while the brain is still in flight (64-600s on the
+    // local 4B). Priority: thinking > speaking > listening > idle.
+    var wasListen = false, wasThink = false;
+    function ttsPlaying() {
+      try { return !!(_acAudio && !_acAudio.paused && !_acAudio.ended); } catch (e) { return false; }
+    }
     setInterval(function () {
-      var l = listening();
-      if (mic) mic.classList.toggle('listening', l);
+      var l = listening(), think = !!window._hartThinking;
+      var st = think ? 'thinking'
+             : (ttsPlaying() ? 'speaking'
+             : (l ? 'listening' : 'idle'));
+      if (orb) {
+        orb.setAttribute('data-orb-state', st);
+        orb.classList.toggle('listening', l);   // legacy cue, superseded by data-orb-state CSS
+      }
+      hevDot(think);                              // dot mirrors the real flag (acSend owns it)
+      // Status text follows the real state, NOT a guessed duration: listening wins,
+      // else clear back to the hint once thinking truly ends (the job the removed
+      // 4.5s timer used to do — now driven off acSend's actual terminal clear).
       if (l) { setStatus('Listening…', 'thinking'); wasListen = true; }
       else if (wasListen) { wasListen = false; setStatus(DEFAULT_HINT, ''); }
+      else if (wasThink && !think) { setStatus(DEFAULT_HINT, ''); }
+      wasThink = think;
     }, 350);
 
     // Speech transcript -> hero bar: the "your words become the search" moment.
