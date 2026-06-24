@@ -1,4 +1,4 @@
-{ config, lib, pkgs, llama-cpp, ... }:
+{ config, lib, pkgs, ... }:
 
 # HART OS Local LLM Module
 # llama.cpp server for local inference with GPU support
@@ -8,8 +8,34 @@
 let
   cfg = config.hart;
 
-  # Use the llama-cpp flake output with CUDA support if available
-  llama-server = llama-cpp.packages.${pkgs.system}.default or pkgs.llama-cpp;
+  # GPU-accelerated llama.cpp. Vulkan is the UNIVERSAL GPU backend -- Intel iGPU (mesa
+  # ANV), AMD (RADV), NVIDIA (its Vulkan ICD) -- so ONE build offloads on any GPU and
+  # cleanly falls back to CPU. The old flake `.default` was CPU-only, so EVERY layer ran
+  # on the CPU = the "assistant keeps thinking" slowness. The Vulkan RUNTIME is already
+  # present (desktop.nix `hardware.graphics.enable` -> mesa ICDs in /run/opengl-driver).
+  # This is the NixOS analogue of the Nunba companion's "CPU prebundled, GPU when present"
+  # bootstrap: one universal binary, GPU-or-CPU decided at launch, no runtime download.
+  llama-server = pkgs.llama-cpp.override { vulkanSupport = true; };
+
+  # GPU-aware launcher. A Vulkan-built llama-server with --n-gpu-layers>0 but NO Vulkan
+  # device ERRORS out at load (and would crash-loop under Restart=on-failure), so gate
+  # -ngl on a real render node + a Vulkan ICD actually being present; otherwise pure-CPU.
+  llamaLauncher = pkgs.writeShellScriptBin "hart-llm-server" ''
+    set -eu
+    NGL=""
+    if [ -e /dev/dri/renderD128 ] && ls /run/opengl-driver/share/vulkan/icd.d/*.json >/dev/null 2>&1; then
+      NGL="--n-gpu-layers ${toString config.hart.llm.gpuLayers}"
+      echo "hart-llm: Vulkan GPU present -> offloading ${toString config.hart.llm.gpuLayers} layers" >&2
+    else
+      echo "hart-llm: no Vulkan GPU -> CPU inference (${toString config.hart.llm.threads} threads)" >&2
+    fi
+    exec ${llama-server}/bin/llama-server \
+      --model "${config.hart.llm.modelPath}" \
+      --port "${toString cfg.ports.llm}" \
+      --ctx-size "${toString config.hart.llm.contextSize}" \
+      --threads "${toString config.hart.llm.threads}" \
+      $NGL
+  '';
 in
 {
   options.hart.llm = {
@@ -39,8 +65,11 @@ in
 
     gpuLayers = lib.mkOption {
       type = lib.types.int;
-      default = 0;
-      description = "Number of layers to offload to GPU (0 = auto-detect at runtime)";
+      default = 999;
+      description =
+        "Layers to offload to the (Vulkan) GPU when one is present. 999 = offload ALL "
+        + "(llama.cpp clamps to the model's real layer count). The launcher only passes "
+        + "this when a Vulkan device actually exists, else it runs pure-CPU.";
     };
   };
 
@@ -71,13 +100,10 @@ in
         Type = "simple";
         User = "hart";
         Group = "hart";
-        ExecStart = lib.concatStringsSep " " [
-          "${llama-server}/bin/llama-server"
-          "--model ${config.hart.llm.modelPath}"
-          "--port ${toString cfg.ports.llm}"
-          "--ctx-size ${toString config.hart.llm.contextSize}"
-          "--threads ${toString config.hart.llm.threads}"
-        ];
+        # The GPU-aware launcher (see `llamaLauncher` in the `let` above): offloads to the
+        # Vulkan GPU when one is present, pure-CPU otherwise. Replaces the old bare
+        # llama-server call that passed NO --n-gpu-layers, so every layer ran on the CPU.
+        ExecStart = "${llamaLauncher}/bin/hart-llm-server";
 
         EnvironmentFile = lib.mkIf (builtins.pathExists "/etc/hart/hart.env") "/etc/hart/hart.env";
 
