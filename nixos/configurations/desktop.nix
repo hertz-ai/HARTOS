@@ -186,9 +186,15 @@ in
     email.enable = true;           # Thunderbird (the user's own mail)
     firewall.enable = true;        # firewall management
     ime.enable = true;             # input method editor (CJK + more)
-    nightlight.enable = true;      # blue-light filter
     devtools.enable = true;        # developer tools
-    dlna.enable = true;            # the user's own LAN media (not the Hive)
+    # NOT default-on — AVAILABLE but the user activates them. These don't merely
+    # "exist": they actively change the screen or expose data, so an opinionated
+    # default is wrong. nightlight TINTS the screen (a personal preference — better
+    # off, or scheduled at sunset when the user opts in); dlna BROADCASTS the user's
+    # media on the LAN (an exposure the user should choose — privacy-first). The
+    # toggles live in the shell; default false. (Secure DNS + firewall above stay ON
+    # because they are privacy-POSITIVE, not opinionated.)
+    # hart.nightlight.enable = false (default);  hart.dlna.enable = false (default)
 
     # ── Supervisor-managed compositor TIER LADDER (the never-blank boot) ──
     # The out-of-process session tier-drop supervisor (greetd) OWNS the boot
