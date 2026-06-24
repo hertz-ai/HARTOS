@@ -58,10 +58,10 @@
         res = res || {};
         if (res.success) {
           if (btn) { btn.textContent = 'Installed'; btn.classList.add('is-installed'); }
-          toast('Installed ' + app.n, (res.platform || 'flatpak') + ' — added to your apps', 'success');
+          toast('Installed ' + app.n, (res.platform || 'flatpak') + ' - added to your apps', 'success');
         } else if (res.staged) {
           if (btn) { btn.disabled = false; btn.textContent = 'Install'; }
-          toast('Downloaded ' + app.n, 'Staged — finish from the App Store when ready', 'warning');
+          toast('Downloaded ' + app.n, 'Staged - finish from the App Store when ready', 'warning');
         } else {
           if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
           toast('Could not install ' + app.n, res.error || 'The installer is unavailable on this system', 'error');
@@ -69,7 +69,7 @@
       })
       .catch(function () {
         if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
-        toast('Install failed', app.n + ' — no response from the installer', 'error');
+        toast('Install failed', app.n + ' - no response from the installer', 'error');
       });
   }
 
@@ -127,7 +127,7 @@
     var title = document.createElement('div'); title.className = 'ds-panel-title'; title.textContent = 'App Store';
     head.appendChild(title);
     var sub = document.createElement('div'); sub.className = 'ds-body-sm ds-text-muted';
-    sub.textContent = 'Free, open-source software from Flathub — one click to install.';
+    sub.textContent = 'Free, open-source software from Flathub - one click to install.';
     head.appendChild(sub);
     wrap.appendChild(head);
 

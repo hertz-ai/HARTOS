@@ -50,7 +50,7 @@
     box.appendChild(row('Screen', !!d.screen, ''));
     var foot = document.createElement('div');
     foot.className = 'hsp-foot';
-    foot.textContent = 'Live OS state, polled — the AI cannot override this.';
+    foot.textContent = 'Live OS state, polled - the AI cannot override this.';
     box.appendChild(foot);
   }
 
@@ -72,7 +72,7 @@
       .then(function (r) { return r.json(); }).then(function (st) {
         apply(st);
         if (window.showToast) window.showToast('AI senses',
-          cut ? 'Shut — eyes & ears closed' : 'Awake', cut ? 'warning' : 'success');
+          cut ? 'Shut - eyes & ears closed' : 'Awake', cut ? 'warning' : 'success');
         var panel = document.getElementById('hart-senses-panel');
         if (panel) panel.classList.toggle('open', cut);   // reveal the proof when cut
       }).catch(function () {});

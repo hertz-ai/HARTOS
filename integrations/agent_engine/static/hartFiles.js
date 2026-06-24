@@ -732,12 +732,12 @@
              '<b>Permissions</b><span class="hf-perm-oct" data-perm-oct>' + esc(oct3) + '</span></div>' +
              permGridHtml(oct3) +
              '<div style="display:flex;justify-content:flex-end"><button class="hf-perm-save" data-perm-save disabled>Apply</button></div></div>')
-        : ('<div class="hf-props-row"><b>Permissions</b><span>' + esc(d.permissions || '—') + '</span></div>');
+        : ('<div class="hf-props-row"><b>Permissions</b><span>' + esc(d.permissions || '-') + '</span></div>');
       var card = '<div class="hf-props"><div class="hf-props-card">' +
         '<div style="display:flex;align-items:center;gap:12px;margin-bottom:14px"><span class="mi material-icons-round" style="font-size:34px;color:var(--hart-accent,#6c63ff)">' + iconFor(d) + '</span>' +
         '<div style="font-size:16px;font-weight:600;word-break:break-all">' + esc(d.name) + '</div></div>' +
         '<div class="hf-props-row"><b>Kind</b><span>' + esc(kind(d)) + '</span></div>' +
-        '<div class="hf-props-row"><b>Size</b><span>' + (d.is_dir ? '—' : human(d.size)) + '</span></div>' +
+        '<div class="hf-props-row"><b>Size</b><span>' + (d.is_dir ? '-' : human(d.size)) + '</span></div>' +
         '<div class="hf-props-row"><b>Location</b><span style="word-break:break-all;text-align:right">' + esc(dirname(d.path)) + '</span></div>' +
         '<div class="hf-props-row"><b>Modified</b><span>' + fmtDate(d.modified) + '</span></div>' +
         '<div class="hf-props-row"><b>Created</b><span>' + fmtDate(d.created) + '</span></div>' +

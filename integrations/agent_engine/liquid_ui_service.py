@@ -1658,7 +1658,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
     <canvas id="hart-voice-orb" width="360" height="360" aria-hidden="true"></canvas>
     <button class="hart-hero-mic" id="hart-hero-mic" type="button" aria-label="Speak to HART (Super+Space)" title="Click or press Super+Space to speak"><span class="mi material-icons-round" aria-hidden="true">mic</span></button>
   </div>
-  <div class="hart-hero-status" id="hart-hero-status" role="status" aria-live="polite">Ask HART anything — say it or type it</div>
+  <div class="hart-hero-status" id="hart-hero-status" role="status" aria-live="polite">Ask HART anything - say it or type it</div>
   <div class="hart-hero-bar glass">
     <span class="mi material-icons-round hart-hero-bar-ic" aria-hidden="true">search</span>
     <input id="hart-hero-input" class="hart-hero-input" type="text" autocomplete="off" spellcheck="false" placeholder="Search apps, ask the agent, or speak…" aria-label="Command and search">
@@ -1739,7 +1739,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   </div>
   <div class="ac-caps" id="ac-caps"></div>
   <div class="ac-messages" id="ac-messages" role="log" aria-live="polite">
-    <div class="ac-msg assistant">Hi! I can help with anything — chat, code, agents, vision, voice, remote desktop, and 3,200+ OpenClaw skills. What would you like to do?</div>
+    <div class="ac-msg assistant">Hi! I can help with anything - chat, code, agents, vision, voice, remote desktop, and 3,200+ OpenClaw skills. What would you like to do?</div>
   </div>
   <div class="ac-input-row">
     <span class="mi material-icons-round ac-btn" onclick="acVoiceInput()" title="Voice input" style="font-size:20px">mic</span>
@@ -1790,7 +1790,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
     <button class="hart-senses-btn" id="hart-senses-btn" type="button" aria-pressed="false" aria-label="Shut or wake the AI's senses" title="Shut the AI's eyes &amp; ears (right-click for live proof)">
       <span class="mi material-icons-round" aria-hidden="true">visibility</span>
     </button>
-    <button class="hart-senses-btn hart-senses-mic" id="hart-senses-mic" type="button" aria-label="Talk to HART (toggle voice)" title="Talk to HART — toggle voice input" onclick="window.toggleVoice&amp;&amp;toggleVoice()">
+    <button class="hart-senses-btn hart-senses-mic" id="hart-senses-mic" type="button" aria-label="Talk to HART (toggle voice)" title="Talk to HART - toggle voice input" onclick="window.toggleVoice&amp;&amp;toggleVoice()">
       <span class="mi material-icons-round" aria-hidden="true">mic</span>
     </button>
   </div>
@@ -4538,7 +4538,7 @@ function renderAgentOverlay(ev) {{
 
   }} else if(type === 'checkout') {{
     html += '<div class="ds-body-md" style="font-weight:600">Checkout</div>';
-    html += '<div class="ds-body-sm ds-text-muted">'+(ev.items||[]).length+' items — '+(ev.total||0)+' '+(ev.currency||'Spark')+'</div>';
+    html += '<div class="ds-body-sm ds-text-muted">'+(ev.items||[]).length+' items - '+(ev.total||0)+' '+(ev.currency||'Spark')+'</div>';
     if(ev.confirm_action) html += '<div style="margin-top:8px;text-align:right">'+dsBtn('Confirm Payment',{{variant:'primary',cls:'ds-btn-sm',onclick:"fetch(SHELL+'"+ev.confirm_action+"',{{method:'POST'}})"}})+'</div>';
 
   }} else if(type === 'payment_status') {{

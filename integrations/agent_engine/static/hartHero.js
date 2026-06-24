@@ -17,7 +17,7 @@
  */
 (function () {
   'use strict';
-  var DEFAULT_HINT = 'Ask HART anything — say it or type it';
+  var DEFAULT_HINT = 'Ask HART anything - say it or type it';
 
   function $(id) { return document.getElementById(id); }
 

@@ -88,7 +88,7 @@
     var st = $('lock-status');
     if (st) st.textContent = setup
       ? 'Create a password to lock your HART'
-      : (window.HartLock.hasPassword() ? '' : 'No password set — press Enter to enter');
+      : (window.HartLock.hasPassword() ? '' : 'No password set - press Enter to enter');
     var pw = $('lock-pw');
     if (pw) { pw.value = ''; pw.placeholder = setup ? 'New password' : 'Password'; }
     ls.classList.add('active');
