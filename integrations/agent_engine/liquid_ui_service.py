@@ -1280,6 +1280,8 @@ html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot{animat
 .hart-mkt-search .ds-input{flex:1}
 .hart-mkt-section{margin-top:var(--ds-space-5)}
 .hart-mkt-section:first-child{margin-top:var(--ds-space-2)}
+/* Already-installed / pre-bundled apps section (sits above the featured catalogue) */
+.hart-mkt-installed{margin-top:var(--ds-space-2);margin-bottom:var(--ds-space-2)}
 .hart-app-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(248px,1fr));
   gap:var(--ds-space-3);margin-top:var(--ds-space-3)}
 .hart-app-card{position:relative;display:flex;flex-direction:column;gap:var(--ds-space-3);
@@ -1307,14 +1309,24 @@ html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot{animat
 .hart-app-card .hac-cat{font-size:10px;font-weight:600;letter-spacing:.6px;text-transform:uppercase;
   color:var(--hart-accent);opacity:.8}
 .hart-app-card .ds-btn{position:relative;align-self:stretch;justify-content:center}
+/* Already-installed action: a calm, non-interactive "done" state (not a CTA) */
+.hart-app-card .ds-btn.is-installed{background:rgba(0,230,118,.14);color:var(--hart-active);
+  border:1px solid rgba(0,230,118,.35);cursor:default;opacity:1}
+.hart-app-card .ds-btn.is-installed:hover{transform:none;filter:none}
 /* ── Buttery: window spring-open + dock perf hint (Phase D) ── */
 @keyframes hart-panel-in{from{opacity:0;transform:scale(.92) translateY(14px)}to{opacity:1;transform:scale(1) translateY(0)}}
 .panel{animation:hart-panel-in .3s cubic-bezier(.175,.885,.32,1.275)}
 .taskbar-chip{will-change:transform}
 @media(prefers-reduced-motion:reduce){.panel{animation:none}}
 html.a11y-rmotion .panel{animation:none}
-/* ── AI sensory kill-switch (always-accessible safety control) ── */
+/* ── AI sensory cluster (always-accessible: vision kill-switch + audio) ── */
 .hart-senses{position:fixed;left:14px;bottom:54px;z-index:8100}
+/* Eye + mic grouped as one bottom "sensory" pair (vision | audio). */
+.hart-senses-cluster{display:flex;align-items:center;gap:10px}
+.hart-senses-mic .mi{color:var(--hart-accent)}
+.hart-senses-mic.listening{background:rgba(255,107,107,.18);border-color:var(--hart-error);
+  box-shadow:0 0 0 3px rgba(255,107,107,.18),0 4px 16px rgba(0,0,0,.4)}
+.hart-senses-mic.listening .mi{color:var(--hart-error)}
 .hart-senses-btn{width:46px;height:46px;border-radius:50%;border:1px solid var(--hart-glass-border);cursor:pointer;
   background:var(--hart-glass-bg);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
   display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,.35);
@@ -1535,9 +1547,16 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 .ctx-menu-sep{{border-top:1px solid var(--hart-glass-border);margin:4px 0}}
 
 /* ── Lock Screen ── */
+/* OPAQUE base (--hart-background) UNDER the translucent tint: a lock / password
+   takeover must fully cover the desktop. backdrop-filter is unreliable on the
+   kiosk WebKitGTK, so relying on a 70% tint + blur let the hero search bar bleed
+   THROUGH — the "Create a password" card visually overlapped the search hint.
+   An opaque solid layer first guarantees nothing behind it shows, on every
+   renderer; the blur stays a progressive enhancement on top. */
 .lock-screen{{position:fixed;inset:0;z-index:9999;display:none;align-items:center;
   justify-content:center;flex-direction:column;gap:16px;
-  background:rgba(0,0,0,{'0.7);backdrop-filter:blur(24px)' if not is_potato else '0.9)'}}}
+  background:var(--hart-background,#0F0E17);
+  background:linear-gradient(rgba(7,6,15,{'0.82),rgba(7,6,15,0.82)),var(--hart-background,#0F0E17);backdrop-filter:blur(24px)' if not is_potato else '0.97),rgba(7,6,15,0.97)),var(--hart-background,#0F0E17)'}}}
 .lock-screen.active{{display:flex}}
 .lock-clock{{font-size:64px;font-weight:300}}
 .lock-date{{font-size:16px;color:var(--hart-muted)}}
@@ -1758,15 +1777,23 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <!-- Virtual-desktop switcher (client-side; populated by hartWorkspaces.js) -->
 <div class="hart-ws-switcher glass" id="hart-ws-switcher" role="tablist" aria-label="Virtual desktops"></div>
 
-<!-- AI sensory kill-switch: human hard cut + live proof (orb "closes its eyes") -->
+<!-- AI sensory cluster (bottom-left): vision (eye kill-switch) + audio (mic) read
+     as one grouped "sensory" pair. The eye hard-cuts the AI's senses + shows live
+     proof (hartSenses.js); the mic toggles voice input (toggleVoice). This is the
+     SMALL bottom mic — NOT the central voice orb, which stays untouched. -->
 <div class="hart-senses" id="hart-senses">
   <div class="hart-senses-panel" id="hart-senses-panel" role="status" aria-live="polite">
     <div class="hsp-title">AI sensory state</div>
     <div id="hart-senses-proof"></div>
   </div>
-  <button class="hart-senses-btn" id="hart-senses-btn" type="button" aria-pressed="false" aria-label="Shut or wake the AI's senses" title="Shut the AI's eyes &amp; ears (right-click for live proof)">
-    <span class="mi material-icons-round" aria-hidden="true">visibility</span>
-  </button>
+  <div class="hart-senses-cluster" role="group" aria-label="AI senses (vision &amp; audio)">
+    <button class="hart-senses-btn" id="hart-senses-btn" type="button" aria-pressed="false" aria-label="Shut or wake the AI's senses" title="Shut the AI's eyes &amp; ears (right-click for live proof)">
+      <span class="mi material-icons-round" aria-hidden="true">visibility</span>
+    </button>
+    <button class="hart-senses-btn hart-senses-mic" id="hart-senses-mic" type="button" aria-label="Talk to HART (toggle voice)" title="Talk to HART — toggle voice input" onclick="window.toggleVoice&amp;&amp;toggleVoice()">
+      <span class="mi material-icons-round" aria-hidden="true">mic</span>
+    </button>
+  </div>
 </div>
 
 <!-- First-run "Light Your HART" ceremony (web, in-shell; auto-runs after OS install when not onboarded) -->
@@ -4326,6 +4353,8 @@ async function startRecording() {{
     isRecording = true;
     var _mb = document.querySelector('.mic-btn');
     if(_mb) _mb.classList.add('recording');  // guarded: no such el when the mic lives in the chat (was an unguarded null-deref)
+    var _sm = document.getElementById('hart-senses-mic');  // bottom sensory-cluster mic mirrors listening state
+    if(_sm) _sm.classList.add('listening');
     showToast('Voice','Recording... click mic again to stop','info');
   }} catch(err) {{
     showToast('Voice','Microphone access denied','warning');
@@ -4337,6 +4366,8 @@ function stopRecording() {{
   isRecording = false;
   const btn = document.querySelector('.mic-btn');
   if(btn) btn.classList.remove('recording');
+  const _sm = document.getElementById('hart-senses-mic');  // clear the bottom mic's listening state
+  if(_sm) _sm.classList.remove('listening');
 }}
 
 // Stop any in-progress TTS — browser SpeechSynthesis + the server <audio>.

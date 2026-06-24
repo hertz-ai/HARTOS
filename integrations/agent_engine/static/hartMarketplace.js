@@ -39,17 +39,42 @@
   ];
   var CATS = ['Web', 'Creative', 'Media', 'Productivity', 'Develop', 'Chat', 'Games'];
 
-  function toast(t, m) { if (window.showToast) window.showToast(t, m, 'info'); }
+  function toast(t, m, sev) { if (window.showToast) window.showToast(t, m, sev || 'info'); }
 
-  function install(app) {
+  // Honest install: drive the button through its own lifecycle off the REAL
+  // server response (the old code fired-and-forgot a misleading "Installing"
+  // toast even when the platform was unavailable / the install failed). The
+  // installer returns {success, staged, name, error, platform}; staged is NEVER
+  // success (a downloaded-but-not-applied file), so it gets its own message.
+  function install(app, btn) {
+    if (btn) { btn.disabled = true; btn.textContent = 'Installing…'; }
     fetch('/api/apps/install', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       // pass both shapes: {package,platform} (what the existing UI sends) AND a
       // source hint (app_installer keys flatpak off a 'flatpak:' source).
-      body: JSON.stringify({ package: app.id, platform: 'flatpak', source: 'flatpak:' + app.id }) })
-      .then(function () { toast('Installing ' + app.n, 'From Flathub — this can take a minute'); })
-      .catch(function () { toast('Install failed', app.n); });
+      body: JSON.stringify({ package: app.id, platform: 'flatpak', source: 'flatpak:' + app.id }),
+      signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(120000) : null })
+      .then(function (r) { return r.json().catch(function () { return { success: r.ok }; }); })
+      .then(function (res) {
+        res = res || {};
+        if (res.success) {
+          if (btn) { btn.textContent = 'Installed'; btn.classList.add('is-installed'); }
+          toast('Installed ' + app.n, (res.platform || 'flatpak') + ' — added to your apps', 'success');
+        } else if (res.staged) {
+          if (btn) { btn.disabled = false; btn.textContent = 'Install'; }
+          toast('Downloaded ' + app.n, 'Staged — finish from the App Store when ready', 'warning');
+        } else {
+          if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+          toast('Could not install ' + app.n, res.error || 'The installer is unavailable on this system', 'error');
+        }
+      })
+      .catch(function () {
+        if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+        toast('Install failed', app.n + ' — no response from the installer', 'error');
+      });
   }
 
+  // app.installed === true renders a non-interactive "Installed" state instead of
+  // an Install button (reused for the pre-bundled / already-installed section).
   function appCard(app) {
     // Premium vertical card: icon + name/category/description up top, a full-
     // width Install action below — frosted-glass styling lives in _CSS_DESKTOP
@@ -65,9 +90,15 @@
     var ds = document.createElement('div'); ds.className = 'hac-desc'; ds.textContent = app.d || '';
     body.appendChild(nm); body.appendChild(ds);
     top.appendChild(ic); top.appendChild(body);
-    var btn = document.createElement('button'); btn.className = 'ds-btn ds-btn-tonal ds-btn-sm'; btn.type = 'button';
-    btn.textContent = 'Install';
-    btn.addEventListener('click', function () { install(app); });
+    var btn = document.createElement('button'); btn.type = 'button';
+    if (app.installed) {
+      btn.className = 'ds-btn ds-btn-tonal ds-btn-sm is-installed';
+      btn.textContent = 'Installed'; btn.disabled = true;
+    } else {
+      btn.className = 'ds-btn ds-btn-tonal ds-btn-sm';
+      btn.textContent = 'Install';
+      btn.addEventListener('click', function () { install(app, btn); });
+    }
     el.appendChild(top); el.appendChild(btn);
     return el;
   }
@@ -107,7 +138,39 @@
     go.textContent = 'Search';
     row.appendChild(inp); row.appendChild(go); wrap.appendChild(row);
 
+    // Already-installed / pre-bundled apps live in their own section ABOVE the
+    // featured catalogue, reusing the SAME /api/apps/installed source the
+    // permissions panel uses (no parallel list) so the steward can see what's
+    // already on the system. Populated async; stays empty/hidden until the fetch
+    // returns rows (keeps the curated catalogue first-paint instant).
+    // Own class (NOT .hart-mkt-section) so it isn't mistaken for a featured
+    // category section; it still reuses the .ds-section-label + .hart-app-grid
+    // inner structure when populated.
+    var installedSec = document.createElement('div'); installedSec.className = 'hart-mkt-installed';
+    installedSec.style.display = 'none';
+    wrap.appendChild(installedSec);
+
     var results = document.createElement('div'); results.id = 'hart-mkt-results'; wrap.appendChild(results);
+
+    function loadInstalled() {
+      fetch('/api/apps/installed', { signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(6000) : null })
+        .then(function (r) { return r.json(); }).then(function (data) {
+          var apps = (data && data.apps) || [];
+          if (!apps.length) return;                       // nothing installed -> stay hidden
+          installedSec.innerHTML = '';
+          var lbl = document.createElement('div'); lbl.className = 'ds-section-label';
+          lbl.textContent = 'Installed (' + apps.length + ')';
+          installedSec.appendChild(lbl);
+          var g = document.createElement('div'); g.className = 'hart-app-grid';
+          apps.slice(0, 24).forEach(function (a) {
+            g.appendChild(appCard({ id: a.app_id || a.name, n: a.name || a.app_id,
+              c: a.platform || 'system', i: 'check_circle',
+              d: a.version ? ('v' + a.version) : '', installed: true }));
+          });
+          installedSec.appendChild(g);
+          installedSec.style.display = '';
+        }).catch(function () { /* installed list is best-effort; never block the store */ });
+    }
 
     function renderFeatured() {
       results.innerHTML = '';
@@ -160,6 +223,7 @@
     inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); doSearch(); } });
 
     renderFeatured();
+    loadInstalled();          // surface already-installed / pre-bundled apps
     el.appendChild(wrap);
   };
 })();

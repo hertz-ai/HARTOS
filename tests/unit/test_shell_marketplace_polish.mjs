@@ -102,5 +102,49 @@ const last = c0 && c0._kids[c0._kids.length - 1];
 ok(last && last.tagName === 'BUTTON' && /Install/.test(last.textContent),
   '[#22] full-width Install action sits below the content');
 
-console.log(failures ? `\nRESULT: ${failures} FAILURE(S)` : '\nRESULT: ALL PASS');
-process.exit(failures ? 1 : 0);
+// ── Installed / pre-bundled section: reuses /api/apps/installed (issue 1c) ────
+// Re-render with a fetch that RESOLVES the installed-apps endpoint with rows, and
+// assert the store surfaces them in a dedicated .hart-mkt-installed section with
+// non-interactive "Installed" cards (a disabled .is-installed button).
+async function installedPath() {
+  let installedCalled = false;
+  const fetchMock = (url) => {
+    if (String(url).indexOf('/api/apps/installed') >= 0) {
+      installedCalled = true;
+      return Promise.resolve({ json: () => Promise.resolve({
+        apps: [
+          { name: 'Firefox', app_id: 'org.mozilla.firefox', platform: 'flatpak', version: '120' },
+          { name: 'VLC', app_id: 'org.videolan.VLC', platform: 'flatpak', version: '3.0' },
+        ], count: 2 }) });
+    }
+    return Promise.reject(new Error('offline in test'));
+  };
+  const sb2 = { window: {}, document: doc, console,
+    setTimeout: (fn) => { if (typeof fn === 'function') fn(); return 0; },
+    clearTimeout: () => {}, fetch: fetchMock };
+  sb2.window.document = doc;
+  vm.createContext(sb2);
+  vm.runInContext(CODE, sb2);
+  const host2 = makeEl('div');
+  sb2.window.hartRenderMarketplace(host2);
+  // let the installed-fetch promise chain settle (fetch -> .then -> json() ->
+  // .then). A real macrotask tick drains all queued microtasks reliably.
+  await new Promise(function (r) { setTimeout(r, 0); });
+  await new Promise(function (r) { setTimeout(r, 0); });
+
+  ok(installedCalled, '[#1c] marketplace fetches /api/apps/installed');
+  const inst = host2.find('hart-mkt-installed');
+  ok(!!inst, '[#1c] renders a dedicated .hart-mkt-installed section');
+  ok(inst && /Installed \(2\)/.test(inst.text()), '[#1c] installed section is labelled with the count');
+  const instCards = inst ? inst.findAll('hart-app-card') : [];
+  ok(instCards.length === 2, '[#1c] renders one card per installed app (got ' + instCards.length + ')');
+  const ibtn = instCards[0] && instCards[0]._kids[instCards[0]._kids.length - 1];
+  ok(ibtn && ibtn.classList.contains('is-installed') && ibtn.disabled === true,
+    '[#1c] installed card shows a non-interactive "Installed" button (no dead Install click)');
+  ok(ibtn && /Installed/.test(ibtn.textContent), '[#1c] installed button reads "Installed"');
+}
+
+installedPath().then(function () {
+  console.log(failures ? `\nRESULT: ${failures} FAILURE(S)` : '\nRESULT: ALL PASS');
+  process.exit(failures ? 1 : 0);
+});
