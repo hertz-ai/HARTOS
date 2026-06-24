@@ -83,6 +83,12 @@
       ./modules/hart-compute-mesh.nix
       ./modules/hart-liquid-ui.nix
       ./modules/hart-app-bridge.nix
+      # Native desktop notifications: mako (the wlroots-native org.freedesktop.
+      # Notifications daemon) as a glass-styled graphical-session user service, so
+      # foreign apps (Wine/Android), AI-composed .hartapp surfaces, and the robot can
+      # raise a real toast via notify-send / D-Bus. Never-fail (a mako crash only loses
+      # native toasts; the in-shell SSE toast is the fallback on every tier).
+      ./modules/hart-notify.nix
       # Never-blank-screen session tier-drop supervisor (Phase 1 / B4). Opt-in
       # (hart.sessionSupervisor.enable=false default) -> pure no-op for every
       # variant (gated config; lazy sway default never enters a disabled
