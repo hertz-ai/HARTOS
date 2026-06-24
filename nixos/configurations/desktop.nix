@@ -181,10 +181,13 @@ in
     # (brain-side) and is deliberately NOT toggled on here.
     portal.enable = true;          # screenshot + screen-record (grim/wf-recorder) + theme bridge + PAM ext-session-lock — all fail-closed on the screen kill-switch
     accessibility.enable = true;   # screen reader / magnifier / contrast / sticky keys
-    cups.enable = true;            # printing
-    dns.enable = true;             # secure DNS (DoH/DoT) — the user's own resolver
-    email.enable = true;           # Thunderbird (the user's own mail)
+    printing.enable = true;        # printing — hart-cups.nix declares hart.printing (NOT hart.cups)
     firewall.enable = true;        # firewall management
+    # DEFERRED (not blocking this build): hart-dns.nix + hart-email.nix are NOT imported in the
+    # flake yet, and both write SHARED config (dns -> networking.nameservers/services.resolved;
+    # email -> services.gnome.gnome-keyring + security.pam) that must be conflict-checked against
+    # the desktop closure first. Import + enable them once CI-eval'd — secure DNS + mail client
+    # are a follow-up, they must never block the flash.
     ime.enable = true;             # input method editor (CJK + more)
     devtools.enable = true;        # developer tools
     # NOT default-on — AVAILABLE but the user activates them. These don't merely
