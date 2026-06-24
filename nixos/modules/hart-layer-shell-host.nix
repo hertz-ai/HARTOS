@@ -301,7 +301,23 @@ app.run(None)
   sessionLauncher = pkgs.writeShellScriptBin "hart-glass-shell-gtk4-session" ''
     export WLR_RENDERER_ALLOW_SOFTWARE=1
     export WLR_NO_HARDWARE_CURSORS=1
-    ${lib.optionalString (!ui.preferHardwareGL) "export LIBGL_ALWAYS_SOFTWARE=1"}
+    ${if ui.preferHardwareGL then ''
+    # Operator opted into hardware GL (hart.liquidUI.preferHardwareGL = true) — do
+    # NOT force software; honour the explicit opt-in unconditionally.
+    echo "[hart-gtk4-session] Tier-2 GL = HARDWARE (operator preferHardwareGL=true)" >&2
+    '' else ''
+    # GPU smoke-test gate: force software GL UNLESS the boot probe proved the GPU good
+    # (/run/hart/gpu-render == hardware). wlroots keeps its own pixman fallback via
+    # WLR_RENDERER_ALLOW_SOFTWARE, and a GPU that lies still drops to the cage floor.
+    # The chosen mode is logged to the journal so a real-HW boot shows what engaged.
+    HART_GPU_VERDICT="$(cat /run/hart/gpu-render 2>/dev/null || echo unknown)"
+    if [ "$HART_GPU_VERDICT" != "hardware" ]; then
+      export LIBGL_ALWAYS_SOFTWARE=1
+      echo "[hart-gtk4-session] Tier-2 GL = SOFTWARE (gpu-render verdict: $HART_GPU_VERDICT)" >&2
+    else
+      echo "[hart-gtk4-session] Tier-2 GL = HARDWARE (gpu-render verdict: hardware)" >&2
+    fi
+    ''}
     # sway hosts the layer-shell surface; the GTK4 host is sway's startup client.
     # Software-GL forced above so it paints on any GPU. (A bare hart-comp variant
     # selects the same host binary once its software-render path is VM-proven.)

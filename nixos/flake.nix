@@ -77,6 +77,17 @@
       # variant (gated config; lazy sway default never enters a disabled
       # closure); imported so the option exists + the nixosTest can enable it.
       ./modules/hart-session-supervisor.nix
+      # GPU smoke-test gate: a boot-time oneshot (BEFORE greetd) that probes
+      # whether the GPU can create a GL context + report a hardware renderer and
+      # writes the verdict (hardware/software) to /run/hart/gpu-render. A safe
+      # consumer (Tier-2 sway, hart-layer-shell-host.nix) reads it to DEFAULT to
+      # hardware GL only when the GPU is proven, else forces software. Opt-in via
+      # the always-true-by-default hart.gpu.accelerate; gated on cfg.enable. The
+      # cage Tier-3 floor + the GTK4 GSK cairo renderer + hart-comp pixman stay
+      # forced-software regardless (the probe NEVER touches the floor). FAIL-SAFE:
+      # any error/timeout/missing-tool writes `software`; the unit always succeeds
+      # so it can never block or fail the boot.
+      ./modules/hart-gpu-probe.nix
       # sway-as-Tier-1: the proven-in-WSL OS-native windowing session (canonical
       # glass shell under sway) + the hart-swaymsg-shim the brain's HartWmClient
       # drives at Tier-2. Opt-in (hart.swayTier1.enable=false default) -> no-op
