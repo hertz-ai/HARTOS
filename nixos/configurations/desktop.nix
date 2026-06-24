@@ -182,7 +182,9 @@ in
     portal.enable = true;          # screenshot + screen-record (grim/wf-recorder) + theme bridge + PAM ext-session-lock — all fail-closed on the screen kill-switch
     accessibility.enable = true;   # screen reader / magnifier / contrast / sticky keys
     printing.enable = true;        # printing — hart-cups.nix declares hart.printing (NOT hart.cups)
-    firewall.enable = true;        # firewall management
+    # firewall DEFERRED: hart-firewall.nix uses iptables `extraCommands`, which is INCOMPATIBLE
+    # with the desktop's nftables firewall (eval assertion fails). The base networking.firewall
+    # already protects the node; hart-firewall needs an nftables rewrite before it can default on.
     # DEFERRED (not blocking this build): hart-dns.nix + hart-email.nix are NOT imported in the
     # flake yet, and both write SHARED config (dns -> networking.nameservers/services.resolved;
     # email -> services.gnome.gnome-keyring + security.pam) that must be conflict-checked against
