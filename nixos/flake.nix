@@ -65,6 +65,17 @@
       ./modules/hart-nunba.nix
       ./modules/hart-kernel.nix
       ./modules/hart-subsystems.nix
+      # Cross-OS runtime smoke-test: a post-boot oneshot (IN PARALLEL with the
+      # desktop, NOT before greetd) that actually EXECUTES a tiny test command
+      # inside each ENABLED foreign-OS runtime (Windows/Wine, Android/Waydroid,
+      # macOS/Darling) + the Linux runtimes (Flatpak/AppImage) and writes an HONEST
+      # per-runtime status (ok/failed/ready/no-image/skip) to /run/hart/compat-status
+      # — so the OS's cross-OS capability is MEASURED, not claimed unconditionally
+      # by the installer. On by default (hart.subsystems.smoketest.enable, gated on
+      # the subsystems master toggle). FAIL-SAFE: each probe records failed on a
+      # hang/error (never aborts the others), absent tool => skip; the unit always
+      # succeeds so it can never block or fail the boot.
+      ./modules/hart-compat-smoketest.nix
       ./modules/hart-ai-runtime.nix
       ./modules/hart-sandbox.nix
       # AI-Native Everything OS modules
