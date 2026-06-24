@@ -258,6 +258,21 @@ pub struct State {
     pub vblank_completed: std::collections::HashSet<
         smithay::reexports::drm::control::crtc::Handle,
     >,
+
+    /// A libseat session activate/pause request parked by the session notifier (VT switch /
+    /// suspend / resume), drained by the render loop's `apply_pending_session`. The notifier
+    /// calloop closure gets ONLY `&mut State` — never the per-device DRM table it must
+    /// `activate()`/`pause()` — so, exactly like `vblank_completed` hands a CRTC to the render
+    /// tick, it parks the request here: `Some(true)` = session ACTIVE → re-acquire DRM master on
+    /// every device + `reset_state()` every surface; `Some(false)` = session PAUSED → drop
+    /// master; `None` = nothing pending. REQUIRED, not cosmetic: the device tracks the SESSION
+    /// `active` flag (what `is_active()` reads; init TRUE) SEPARATELY from the DRM-master
+    /// `privileged` flag (init FALSE), with NO auto-recovery for either — so an unprivileged-at-
+    /// startup device (active TRUE, the real-HW "Unable to become drm master" race) retries every
+    /// page-flip EACCES forever, and a VT-paused device (active FALSE) returns DeviceInactive;
+    /// BOTH stay black until the caller calls `activate()`. See `apply_pending_session` for the
+    /// full dual-flag rationale.
+    pub pending_session_activate: Option<bool>,
 }
 
 // ── Per-client state. Carries the compositor-side client bookkeeping Smithay needs

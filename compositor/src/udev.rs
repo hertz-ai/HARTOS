@@ -136,8 +136,10 @@ const VBLANK_STALL_TIMEOUT: Duration = Duration::from_millis(100);
 /// One opened DRM device (the GPU) + its per-CRTC scanout surfaces. Held in the loop
 /// data so the VBlank handler can find the right surface to mark submitted + re-queue.
 struct DeviceData {
-    /// The DRM device handle (kept alive; dropping it tears down the modeset).
-    _drm: DrmDevice,
+    /// The DRM device. Held to keep the modeset alive (dropping it tears it down) AND to
+    /// `activate()`/`pause()` it on libseat session changes — VT switch / suspend / resume
+    /// and the unprivileged-at-startup master recovery (see `apply_pending_session`).
+    drm: DrmDevice,
     /// GBM device — the buffer allocator backing both the scanout swapchain + the
     /// framebuffer exporter. Cloned into the allocator/exporter; held so it outlives them.
     _gbm: GbmDevice<DrmDeviceFd>,
@@ -382,6 +384,9 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         ipc: crate::ipc::IpcState::default(),
         // F1 (#166) — no flips in flight at boot; the VBlank source populates this.
         vblank_completed: std::collections::HashSet::new(),
+        // No libseat session activate/pause pending at boot; the notifier parks them here and
+        // the proactive activate before the loop primes the unprivileged-startup recovery.
+        pending_session_activate: None,
     };
 
     // 7. The per-device backend table (one entry per opened GPU). Held OUTSIDE State so
@@ -428,17 +433,27 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         })
         .map_err(|e| format!("insert libinput source failed: {e}"))?;
 
-    //   (b) the session notifier → pause/activate the DRM devices on VT switch / sleep.
-    //       The device table is captured by a raw pointer-free closure is impossible
-    //       (calloop closures take only `&mut State`), so the device map lives in State-
-    //       adjacent storage reached through an Rc-free design: we move it into the loop's
-    //       shared data via the `EventLoop::run` data argument below. For pause/activate
-    //       we therefore re-scan on activate (idempotent) rather than hold the table here.
+    //   (b) the session notifier → activate/pause the DRM devices on VT switch / suspend /
+    //       resume. The calloop closure gets ONLY `&mut State`, never the per-device DRM
+    //       table it must act on — so, exactly like the VBlank source hands a CRTC to the
+    //       render tick via `vblank_completed`, it PARKS the request in
+    //       `state.pending_session_activate` and the loop body (which holds `devices`)
+    //       applies it via `apply_pending_session`. This is REQUIRED, not cosmetic: on the
+    //       pinned rev `render_frame`/`queue_frame` hard-gate on `surface.is_active()` and
+    //       there is NO auto-recovery, so a device left unprivileged (the real-HW "Unable to
+    //       become drm master" startup race) or paused on a VT-away stays black until we
+    //       explicitly re-acquire master.
     event_loop
         .handle()
-        .insert_source(notifier, move |event, &mut (), _state: &mut State| match event {
-            SessionEvent::PauseSession => info!("HART-comp DRM: session paused (VT switch / sleep)"),
-            SessionEvent::ActivateSession => info!("HART-comp DRM: session resumed"),
+        .insert_source(notifier, move |event, &mut (), state: &mut State| match event {
+            SessionEvent::PauseSession => {
+                info!("HART-comp DRM: session paused (VT switch / sleep) — dropping DRM master");
+                state.pending_session_activate = Some(false);
+            }
+            SessionEvent::ActivateSession => {
+                info!("HART-comp DRM: session resumed — re-acquiring DRM master");
+                state.pending_session_activate = Some(true);
+            }
         })
         .map_err(|e| format!("insert session notifier failed: {e}"))?;
 
@@ -492,6 +507,20 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     //
     //     Kick off the first frame on every surface so the splash + glass shell paint
     //     immediately (the DRM page-flip cadence is then self-sustaining via VBlank).
+    //
+    //     But first re-acquire DRM master: a device may have come up UNPRIVILEGED in a startup
+    //     VT race (the real-HW "Unable to become drm master, assuming unprivileged mode" log —
+    //     the master `privileged` flag stays false). Its session `active` flag is TRUE, so
+    //     `render_frame` proceeds, but every page-flip ioctl returns EACCES and #186 retries it
+    //     FOREVER (master is never re-acquired on its own) → the first kick and every frame
+    //     after paint NOTHING: a black, SETTLED Tier-1 the paint watchdog can't catch (the shell
+    //     page still loads, so the shell-ready marker still fires). Park + apply an activate now
+    //     so we re-take master before the first kick if the session is already active; if it
+    //     isn't yet, the EACCES retries bridge until the libseat ActivateSession in the loop
+    //     re-drives it. activate() is idempotent on a healthy boot (one extra repaint), so this
+    //     is always safe.
+    state.pending_session_activate = Some(true);
+    apply_pending_session(&mut state, &mut devices);
     render_all(&mut state, &mut devices);
 
     info!(socket = %socket_name, "HART-comp DRM compositor initialized — entering the loop (real-HW scanout on the pixman floor)");
@@ -506,6 +535,12 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
             state.running = false;
             continue;
         }
+
+        // Apply any libseat session activate/pause the notifier parked during this dispatch
+        // (VT switch / suspend / resume): re-acquire or drop DRM master on every device
+        // BEFORE we render to it, so a reactivated CRTC paints THIS tick and we never flip to
+        // a device that just went away. No-op when nothing is parked.
+        apply_pending_session(&mut state, &mut devices);
 
         // Re-render every surface each tick (the pixman floor has no damage-driven
         // scheduling here; a 60Hz repaint is the simple never-fail cadence). On a real
@@ -705,7 +740,7 @@ fn device_added(
     devices.insert(
         node,
         DeviceData {
-            _drm: drm,
+            drm,
             _gbm: gbm,
             surfaces,
         },
@@ -747,6 +782,70 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
                 surface.awaiting_vblank = false;
                 surface.flip_queued_at = None;
             }
+        }
+    }
+}
+
+/// Apply a libseat session activate/pause request the notifier parked in
+/// `state.pending_session_activate` (VT switch / suspend / resume, or the proactive startup
+/// activate). REQUIRED on the pinned Smithay rev because a DRM device tracks TWO independent
+/// states with NO auto-recovery for either:
+///   • the SESSION `active` flag (what `is_active()` reads) — init TRUE, set false by `pause()`
+///     and true by `activate()`; `render_frame`/`queue_frame` return `DeviceInactive` while it
+///     is false (a VT-switched-away device → hold, never paint a dark CRTC); and
+///   • the DRM-master `privileged` flag — init FALSE, set true ONLY by a successful
+///     `acquire_master_lock()` inside `DrmDevice::new` or `activate()`; while false every
+///     page-flip ioctl returns EACCES (`FrameError::Access` → our #186 Transient → retried).
+/// So a device that came up unprivileged in a startup VT race (the real-HW "Unable to become
+/// drm master, assuming unprivileged mode") has active=TRUE but privileged=FALSE → its flips
+/// retry EACCES FOREVER (master is never re-acquired on its own) → a BLACK, settled Tier-1; a
+/// paused device has active=FALSE → holds. BOTH are recovered ONLY by `activate()`, which
+/// re-acquires master AND sets active — the one required call.
+///
+/// On ACTIVATE: `activate(false)` every device (re-take drmSetMaster + set active, keep
+/// connectors) then `reset_state()` every surface — the rev's documented "call after the session
+/// is re-activated / VT switched to" step, which forces a full repaint — and clear the in-flight-
+/// flip gate (a VT switch / the unprivileged startup may have swallowed the prior flip's vblank).
+/// We deliberately do NOT guard on is_active() (it reads the SESSION flag, TRUE at an unprivileged
+/// startup — a guard would skip exactly the device we must re-master; activate() is idempotent on
+/// a device that already holds master). On PAUSE: `pause()` every device (drop master + clear
+/// active) and clear the gate (a paused device delivers no vblank, so `awaiting_vblank` would
+/// otherwise wedge until the stall timeout). A failed activate is logged + skipped (master not
+/// grantable yet → flips keep retrying / holding → a later ActivateSession re-drives it) — never a
+/// panic (the never-fail floor).
+fn apply_pending_session(state: &mut State, devices: &mut HashMap<DrmNode, DeviceData>) {
+    let activate = match state.pending_session_activate.take() {
+        Some(v) => v,
+        None => return,
+    };
+    for device in devices.values_mut() {
+        if activate {
+            // Do NOT guard on is_active() here: on this rev is_active() reads the SESSION
+            // `active` flag (initialised TRUE), NOT the DRM-master `privileged` flag
+            // (initialised FALSE — the unprivileged-startup case, where master must be
+            // re-acquired). A guard on is_active() would SKIP exactly the device we have to
+            // fix (active=true, privileged=false). activate() re-takes drmSetMaster and is
+            // idempotent on a device that already holds master (the only cost is one extra
+            // reset_state() repaint on a healthy boot).
+            if let Err(err) = device.drm.activate(false) {
+                warn!(?err, "HART-comp DRM: DRM master re-acquire failed — a later session-activate re-drives it");
+                continue;
+            }
+            info!("HART-comp DRM: (re)acquired DRM master (session active) — scanning out");
+            for surface in device.surfaces.values_mut() {
+                if let Err(err) = surface.compositor.reset_state() {
+                    warn!(?err, "HART-comp DRM: surface reset_state() after activate failed — frame retries next tick");
+                }
+                surface.awaiting_vblank = false;
+                surface.flip_queued_at = None;
+            }
+        } else {
+            device.drm.pause();
+            for surface in device.surfaces.values_mut() {
+                surface.awaiting_vblank = false;
+                surface.flip_queued_at = None;
+            }
+            info!("HART-comp DRM: dropped DRM master (session paused)");
         }
     }
 }
