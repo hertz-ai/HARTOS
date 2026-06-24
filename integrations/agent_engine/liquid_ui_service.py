@@ -4052,6 +4052,11 @@ function acSend() {{
   // Show typing indicator
   const typing = acAddMsg('assistant', 'Thinking...');
   typing.classList.add('typing');
+  // Drive the voice orb's energetic animation for the whole PROCESSING window
+  // (not just TTS/mic) so it never looks frozen while the brain is thinking.
+  // Cleared on EVERY terminal path below (theme/open fast-paths, success, error)
+  // so it can't get stuck true. The orb poll ORs this flag in.
+  window._hartThinking = true;
 
   // M1 — INTENT IS THE DEFAULT OPERATING SURFACE.
   // The orb/command bar composes the desktop from what the human wants: the
@@ -4065,6 +4070,7 @@ function acSend() {{
      lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
     const fakeResp = {{set textContent(v){{typing.textContent=v;typing.classList.remove('typing')}}}};
     handleThemeCommand(lower, fakeResp);
+    window._hartThinking = false;  // terminal: handled locally, no brain wait
     return;
   }}
   // Fallback fast-path: launch a NAMED app directly (no brain round-trip).
@@ -4076,6 +4082,7 @@ function acSend() {{
       openPanel(match[0]);
       typing.textContent = 'Opened ' + match[1].title;
       typing.classList.remove('typing');
+      window._hartThinking = false;  // terminal: launched locally, no brain wait
       return;
     }}
   }}
@@ -4089,10 +4096,12 @@ function acSend() {{
       // the bubble is the spoken acknowledgement (casual chat still replies).
       typing.textContent = data.composed ? ('✦ ' + reply) : reply;
       typing.classList.remove('typing');
+      window._hartThinking = false;  // terminal: response arrived
       speakText(reply, 'chat_response');
     }}).catch(function(){{
       typing.textContent = 'Could not reach agent';
       typing.classList.remove('typing');
+      window._hartThinking = false;  // terminal: request failed
     }});
 }}
 
@@ -4282,12 +4291,18 @@ function toggleVoice() {{
 async function startRecording() {{
   try {{
     const stream = await navigator.mediaDevices.getUserMedia({{audio:true}});
+    // Feed the live mic into the voice orb for REAL listening reactivity (the
+    // orb analyses, never plays it back — no echo). Safe no-op if not ready yet.
+    try {{ if(window._hartVoiceOrb) window._hartVoiceOrb.connectStream(stream); }} catch(e) {{}}
     const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '';
     mediaRecorder = mimeType ? new MediaRecorder(stream,{{mimeType}}) : new MediaRecorder(stream);
     audioChunks = [];
     mediaRecorder.ondataavailable = function(e) {{ audioChunks.push(e.data); }};
     mediaRecorder.onstop = async function() {{
       stream.getTracks().forEach(function(t){{t.stop();}});
+      // Release the mic from the orb so the stopped track doesn't linger on the
+      // analyser; the speaking/idle cases fall back to the synthetic sine.
+      try {{ if(window._hartVoiceOrb) window._hartVoiceOrb.disconnect(); }} catch(e) {{}}
       const blob = new Blob(audioChunks, {{type: mediaRecorder.mimeType || 'audio/webm'}});
       const formData = new FormData();
       formData.append('audio', blob, 'voice.webm');
@@ -4369,10 +4384,16 @@ function speakText(text, source) {{
   var c = document.getElementById('hart-voice-orb');
   if(!c || !window.HartVoiceOrbViz) {{ setTimeout(initHartOrb, 400); return; }}
   var orb = window.HartVoiceOrbViz(c, {{}});
+  // Expose the orb so the record path can feed it the REAL mic stream
+  // (connectStream) for true listening reactivity. The mic is NOT routed to the
+  // speakers inside voiceOrbViz.js (analyser only), so this can't echo/feedback.
+  window._hartVoiceOrb = orb;
   c.style.opacity = '0.9';
   setInterval(function() {{
     var speaking = _acAudio && !_acAudio.paused && !_acAudio.ended;
-    orb.setActive(!!(speaking || isRecording));
+    // Animate while SPEAKING (TTS), LISTENING (mic), or PROCESSING (the
+    // "Thinking…" window set by acSend) — so the orb is never frozen mid-thought.
+    orb.setActive(!!(speaking || isRecording || window._hartThinking));
   }}, 200);
 }})();
 

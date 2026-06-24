@@ -40,11 +40,54 @@
     }
     function thinking(on) { if (hev) hev.classList.toggle('on', !!on); }
 
+    // DETERMINISTIC-FIRST app launch: an app/panel name ("firefox", "files",
+    // "settings") should open INSTANTLY via the canonical openPanel(id), never
+    // crawl through the slow brain. We match against the shell's OWN registries
+    // (no parallel app list): window.MANIFEST (id+title, exposed by the inline
+    // shell script) and — to also cover SYSTEM_PANELS, which is a bare const and
+    // not on window — the already-rendered .start-item nodes (data-id/data-title,
+    // built once from MANIFEST + SYSTEM_PANELS). Returns true if it launched.
+    //
+    // Match is case-insensitive on id AND title: exact or prefix wins outright;
+    // 1-char queries never auto-launch (too noisy); substring only for >= 3 chars
+    // (2 chars = exact/prefix only) so a stray short token can't hijack a question.
+    function tryLaunch(text) {
+      var q = (text || '').toLowerCase().trim();
+      if (q.length < 2) return false;
+      var allowSub = q.length >= 3;
+      function hit(id, title) {
+        id = (id || '').toLowerCase(); title = (title || '').toLowerCase();
+        if (id === q || title === q) return true;            // exact
+        if (id.indexOf(q) === 0 || title.indexOf(q) === 0) return true;  // prefix
+        return allowSub && (id.indexOf(q) >= 0 || title.indexOf(q) >= 0); // substring
+      }
+      // 1) Canonical MANIFEST (the real registry) — launch via openPanel(id).
+      var M = window.MANIFEST;
+      if (M && typeof window.openPanel === 'function') {
+        for (var id in M) {
+          if (!Object.prototype.hasOwnProperty.call(M, id)) continue;
+          if (hit(id, (M[id] && M[id].title) || '')) { window.openPanel(id); return true; }
+        }
+      }
+      // 2) System panels (+ anything else in the start menu) — click the rendered
+      //    .start-item, which invokes the same canonical openPanel(this.dataset.id).
+      var items = document.querySelectorAll('.start-item');
+      for (var i = 0; i < items.length; i++) {
+        var el = items[i];
+        if (hit(el.dataset && el.dataset.id, el.dataset && el.dataset.title)) { el.click(); return true; }
+      }
+      return false;
+    }
+
     // Dispatch into the EXISTING assistant pipeline (open chat -> fill #ac-input
     // -> acSend). Mirrors how a typed command and a spoken command converge.
+    // App names launch instantly (tryLaunch); only real questions/commands fall
+    // through to the slow brain.
     function dispatch(text) {
       text = (text || '').trim();
       if (!text) return;
+      // Deterministic fast-path: a known app/panel name launches now, no "Thinking…".
+      if (tryLaunch(text)) { input.value = ''; setStatus(DEFAULT_HINT, ''); return; }
       var chat = $('assistant-chat'), aci = $('ac-input');
       if (chat && !chat.classList.contains('open') && typeof window.toggleAssistantChat === 'function') {
         window.toggleAssistantChat();
