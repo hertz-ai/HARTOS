@@ -50,8 +50,18 @@ Updated by Claude each session. Newest concerns at top of each section.
 | 3.4 | **Float the ONE Nunba UI into every shell (microfrontend), don't recreate per tier** (NEW) | 📋 | Direction captured. Needs: confirm whether `liquid_ui_service` (server-rendered shell) and the Nunba React app (`landing-page/`) are duplicate UIs, then unify — float the React app as a microfrontend hosted by cage/sway/hart-comp, instead of two shell implementations |
 | 3.5 | Onboarding "New password" overlaps search hint | 🟢 | FIXED `b19c9501` — opaque base under the tint (WebKitGTK backdrop-filter unreliable) |
 | 3.6 | **App Store: dead buttons / can't install / no bundled-apps list** (NEW) | 🟢 | Route-drop is ALREADY in your boot (verified — backend works). Net-new `b19c9501`: "Installed (N)" list + honest install feedback. ⚠️ If buttons are STILL fully unresponsive after reflash → deeper WebView-focus (LIVE-OS #2), will chase |
-| 3.7 | **Group eye + mic at bottom (sensory), leave orb alone** (NEW) | 🟢 | FIXED `b19c9501` — `#hart-senses-mic` beside the eye; central orb byte-identical/untouched. ❓ Orb still has its OWN center mic (left alone as asked) → 2 mics now; awaiting steward call on whether to strip the orb's inner mic glyph (mic-at-bottom-only) |
+| 3.7 | **Group eye + mic at bottom (sensory), leave orb alone** (NEW) | 🟢 | FIXED `b19c9501` — `#hart-senses-mic` beside the eye; central orb byte-identical/untouched. → SUPERSEDED by 3.9: steward says remove the orb mic ENTIRELY (the orb IS the voice control) |
 | 3.8 | **Remove em dashes from the OS's visible text** (NEW) | 🟢 | FIXED `39063b74` — 14 em dashes → hyphen in the shell render-text + static-JS UI strings; comments/docstrings/logs left (not visual); verified zero in the served /shell |
+| | **── UX OVERHAUL (ultracode workflow `wcheodrri`, MAX effort) ──** | 🔄 | 3-vision Behance design panel → synthesis → split implement (CSS/structure ‖ JS behavior) → adversarial review → fix. I verify served-page + tests, then commit. Covers 3.9–3.16 |
+| 3.9 | **Orb must have NO mic** — the orb IS the voice control ("what's the point of a mic within the orb?") | 🔄 | SUPERSEDES 3.7: remove `#hart-hero-mic` entirely; orb click = toggle voice |
+| 3.10 | **Sensory inputs = floating, DRAGGABLE, grid-snapping widget** (not rigid like cage) | 🔄 | eye+mic (+ room for more) movable, position persisted; web-layer drag → works on cage now, real in Tier-1 |
+| 3.11 | **Contextual/deterministic visibility** — elements appear/disappear by what's needed now | 🔄 | a real visibility engine keyed on live state |
+| 3.12 | **Active-state lighting** — mic lights when used, eye lights when AI sees, orb lights when listening/thinking | 🔄 | deterministic, on real state |
+| 3.13 | **Desktop icons** rearrangeable / sortable / draggable / **snap-to-grid**, layout persisted | 🔄 | |
+| 3.14 | **Workspace pager redesign** — the naive "1 2 3 4" → a designed premium pager | 🔄 | |
+| 3.15 | **Pager is also BROKEN** — clicking 2/3/4 selects but the desktop never switches (NEW) | 🔄 | functional fix folded into the pager work + behavior-review; I confirm switching works before commit |
+| 3.16 | **Behance-level visual overhaul** — no naive elements, cohesive tokens, depth + motion | 🔄 | the umbrella above |
+| 3.17 | **Appearance panel can't reach the hive backend** — shows "could not reach the hive backend yet…" on double-click (NEW) | 🟡 | (a) DESIGN the offline/empty state (in `wcheodrri`); (b) the hive backend being DOWN is a separate root issue (LIVE-OS, backend not up) to chase |
 
 ## 4. Cross-OS apps & native app format
 
