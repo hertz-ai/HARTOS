@@ -22,18 +22,28 @@ let
   # -ngl on a real render node + a Vulkan ICD actually being present; otherwise pure-CPU.
   llamaLauncher = pkgs.writeShellScriptBin "hart-llm-server" ''
     set -eu
+    # CPU-thread budget. 0 = AUTO = leave one core for the rest of the OS (nproc - 1, min
+    # 1) so CPU-FALLBACK inference never saturates every core and starves the interactive
+    # desktop/shell. (The systemd CPUWeight + Nice below keep it a background citizen on the
+    # SHARED cores too -- the desktop always wins under contention, spare CPU is still used
+    # when it is idle.)
+    THREADS="${toString config.hart.llm.threads}"
+    if [ "$THREADS" -le 0 ]; then
+      THREADS=$(( $(${pkgs.coreutils}/bin/nproc) - 1 ))
+      [ "$THREADS" -lt 1 ] && THREADS=1
+    fi
     NGL=""
     if [ -e /dev/dri/renderD128 ] && ls /run/opengl-driver/share/vulkan/icd.d/*.json >/dev/null 2>&1; then
       NGL="--n-gpu-layers ${toString config.hart.llm.gpuLayers}"
-      echo "hart-llm: Vulkan GPU present -> offloading ${toString config.hart.llm.gpuLayers} layers" >&2
+      echo "hart-llm: Vulkan GPU present -> offloading ${toString config.hart.llm.gpuLayers} layers ($THREADS CPU threads)" >&2
     else
-      echo "hart-llm: no Vulkan GPU -> CPU inference (${toString config.hart.llm.threads} threads)" >&2
+      echo "hart-llm: no Vulkan GPU -> CPU inference ($THREADS threads, one core left for the OS)" >&2
     fi
     exec ${llama-server}/bin/llama-server \
       --model "${config.hart.llm.modelPath}" \
       --port "${toString cfg.ports.llm}" \
       --ctx-size "${toString config.hart.llm.contextSize}" \
-      --threads "${toString config.hart.llm.threads}" \
+      --threads "$THREADS" \
       $NGL
   '';
 in
@@ -59,8 +69,11 @@ in
 
     threads = lib.mkOption {
       type = lib.types.int;
-      default = 4;
-      description = "Number of CPU threads for inference";
+      default = 0;
+      description =
+        "CPU threads for inference. 0 = AUTO: leave one core for the rest of the OS "
+        + "(nproc - 1, min 1) so CPU-fallback inference never starves the interactive "
+        + "desktop/shell. Set a positive value to pin it.";
     };
 
     gpuLayers = lib.mkOption {
@@ -131,13 +144,19 @@ in
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
 
-        # Resource limits — LLM is the heaviest service
+        # Resource limits. The LLM is the heaviest service, but it must NOT starve the
+        # interactive desktop/shell when it falls back to CPU-only inference. So it is a
+        # deliberate BACKGROUND citizen: CPUWeight 50 (BELOW the default 100 the UI services
+        # run at, so they win the shared cores under contention) + Nice 10, paired with the
+        # launcher's "leave one core for the OS" thread budget. Spare CPU is still used when
+        # the desktop is idle; the desktop just always wins when it needs it. (Was
+        # CPUWeight 150 -- ABOVE the UI -- which would let CPU-fallback inference stall the
+        # whole desktop, the very thing the steward flagged.)
         MemoryMax = "8G";
-        CPUWeight = 150;
+        CPUWeight = 50;
         TasksMax = 64;
-        IOWeight = 100;
-        # Nice value: lower priority than backend
-        Nice = 5;
+        IOWeight = 50;
+        Nice = 10;
 
         StandardOutput = "journal";
         StandardError = "journal";

@@ -34,3 +34,16 @@ def test_ngl_is_gated_on_a_real_vulkan_device():
     assert "renderD128" in _LLM and "icd.d" in _LLM, (
         "--n-gpu-layers must be gated on a real render node (/dev/dri/renderD128) AND a "
         "Vulkan ICD (/run/opengl-driver/.../icd.d) being present — never -ngl with no GPU.")
+
+
+def test_cpu_fallback_does_not_starve_the_os():
+    # On CPU fallback the LLM must NOT starve the interactive desktop/shell: it runs as a
+    # BACKGROUND citizen (CPUWeight below the UI's default 100) and the launcher leaves one
+    # core for the OS (nproc - 1). Was CPUWeight 150 (ABOVE the UI) + a fixed 4 threads,
+    # which would stall the whole desktop on CPU-only inference (the steward's catch).
+    assert "CPUWeight = 50" in _LLM, (
+        "hart-llm CPUWeight must be BELOW the UI services' default 100 (was 150 = above it, "
+        "so CPU-fallback inference out-prioritised and stalled the desktop).")
+    assert "nproc) - 1" in _LLM, (
+        "the launcher must size CPU threads to nproc - 1 (leave one core for the OS) so "
+        "CPU-fallback inference never saturates every core.")
