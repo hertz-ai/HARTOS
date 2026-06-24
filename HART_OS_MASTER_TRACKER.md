@@ -61,7 +61,10 @@ Updated by Claude each session. Newest concerns at top of each section.
 | 3.14 | **Workspace pager redesign** — the naive "1 2 3 4" → a designed premium pager | 🔄 | |
 | 3.15 | **Pager is also BROKEN** — clicking 2/3/4 selects but the desktop never switches (NEW) | 🔄 | functional fix folded into the pager work + behavior-review; I confirm switching works before commit |
 | 3.16 | **Behance-level visual overhaul** — no naive elements, cohesive tokens, depth + motion | 🔄 | the umbrella above |
-| 3.17 | **Appearance panel can't reach the hive backend** — shows "could not reach the hive backend yet…" on double-click (NEW) | 🟡 | (a) DESIGN the offline/empty state (in `wcheodrri`); (b) the hive backend being DOWN is a separate root issue (LIVE-OS, backend not up) to chase |
+| 3.17 | **Appearance "couldn't reach the hive backend"** on double-click (NEW) | 🟢(local) | RESOLVED. The copy LIED: the panel always had 8 LOCAL themes + 8 gradient wallpapers (offline-safe); only the Images section fetches /api/shell/wallpaper/collection = the user's LOCAL Pictures, NOT the hive. Overhaul renders the local themes; `9b037af0` (local) fixes the misleading copy (Images→"Photo wallpapers unavailable"; generic→neutral "Reconnecting"). No real hive dependency |
+| 3.18 | **Everything-on by default (privacy-first)** (NEW) | 🟢(local) | `b0fbddac` (local) desktop.nix: portal/screenshot-record + a11y/cups/dns/email/firewall/ime/devtools ON; Hive-egress (federation/public-exposure/contributing-compute/marketing) stays OPT-IN + consent. Memory: hartos_privacy_first_defaults |
+| 3.19 | **nightlight + dlna = preferences, not default-on** (NEW) | 🟢(local) | `edbeb6c6` (local) — reverted from 3.18 (steward catch); available but user-activated (screen tint / LAN media broadcast). DNS + firewall stay ON (privacy-POSITIVE) |
+| 3.20 | **Screenshot + screen-record now functional** (NEW) | 🟢(local) | `b0fbddac` enables hart.portal → grim/wf-recorder installed + fail-closed on the screen kill-switch. Was built but OFF (portal was opt-in). The app-to-app ScreenCast portal stays VM-pending |
 
 ## 4. Cross-OS apps & native app format
 
