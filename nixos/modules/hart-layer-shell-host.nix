@@ -140,13 +140,29 @@ let
     # creation HANGS on the layer-shell surface, so the compositor cursor shows on a
     # black screen and the first frame never presents (the "pointer-only" boot).
     # The GTK3 cage floor is IMMUNE because GTK3 has no GSK — it paints via cairo
-    # directly. Pin GSK to the cairo (software) renderer + disable GDK's GL so the
-    # GTK4 host paints on ANY GPU, exactly the never-fail floor the cage/sway/hart-
-    # comp paths hold. Gated on !preferHardwareGL like the WEBKIT_DISABLE_* belt, so
-    # the hardware-GL opt-in still gets GSK's GL renderer. Software GL forced in the
-    # session launcher (LIBGL_ALWAYS_SOFTWARE) is the belt for the hardware-GL case;
-    # GSK_RENDERER=cairo here is the suspenders that NEVER touches a GL context.
-    ${lib.optionalString (!ui.preferHardwareGL) "export GSK_RENDERER=cairo\nexport GDK_GL=disable"}
+    # directly. THE FIX (Part 2 candidate for the GSK-GL layer-shell hang): GL is NEVER
+    # used here — export GDK_GL=disable ALWAYS — so the GL/EGL/GBM context-creation hang
+    # above CANNOT recur. GTK4's VULKAN GSK renderer is a SEPARATE path (no GL context)
+    # on the SAME GPU backend the LLM already proved, so when the boot probe
+    # (/run/hart/gpu-render) says the GPU is good we ask GSK for `vulkan`; with GL
+    # disabled, if Vulkan can't init GSK falls back to CAIRO (software), never to the
+    # hanging GL. Else (software/unproven) -> cairo, the floor. SAFE-BY-FLOOR: if
+    # GSK-vulkan ITSELF hangs on the layer-shell surface the tier never first-paints and
+    # the supervisor drops to the cage GTK3 floor (no GSK at all). CANDIDATE — real-HW
+    # unverified; the next boot's journal proves vulkan vs the hang.
+    export GDK_GL=disable
+    ${if ui.preferHardwareGL then ''
+    export GSK_RENDERER=vulkan
+    echo "[hart-glass-shell-gtk4] GSK = VULKAN (operator preferHardwareGL=true; GL disabled)" >&2
+    '' else ''
+    if [ "$(cat /run/hart/gpu-render 2>/dev/null)" = "hardware" ]; then
+      export GSK_RENDERER=vulkan
+      echo "[hart-glass-shell-gtk4] GSK = VULKAN (GPU probed good; GL disabled, cairo fallback)" >&2
+    else
+      export GSK_RENDERER=cairo
+      echo "[hart-glass-shell-gtk4] GSK = CAIRO (software floor)" >&2
+    fi
+    ''}
     export HART_SHELL_URL="$URL"
     # Shell-paint readiness marker (the session-supervisor's HUNG-tier guard): the
     # GTK4 host touches this once the WebView finishes its first load, telling the

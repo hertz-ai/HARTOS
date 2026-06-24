@@ -311,37 +311,40 @@ def test_cage_module_not_gated_on_probe_anywhere():
         "verdict anywhere — the floor stays 100% software.")
 
 
-def test_gtk4_host_keeps_gsk_cairo_and_webkit_software_forces_ungated():
+def test_gtk4_host_gsk_gates_vulkan_but_never_uses_gl():
     host = _read(_HOST)
-    # The GTK4 HOST env (layerShellHost, distinct from the sessionLauncher) keeps
-    # GSK_RENDERER=cairo + GDK_GL=disable + the WEBKIT_DISABLE_* forces gated only
-    # on !preferHardwareGL — NOT on the probe verdict (the documented GSK GL hang
-    # fix; a separate task addresses that hang).
-    assert re.search(
-        r'optionalString \(!ui\.preferHardwareGL\) "export GSK_RENDERER=cairo',
-        host), (
-        "the GTK4 host must keep GSK_RENDERER=cairo forced on !preferHardwareGL "
-        "(the GSK GL layer-shell hang workaround) — it must NOT be gated on the probe.")
-    assert re.search(
-        r'optionalString \(!ui\.preferHardwareGL\) "export WEBKIT_DISABLE_DMABUF_RENDERER=1',
-        host), (
-        "the GTK4 host must keep the WEBKIT_DISABLE_* forces on !preferHardwareGL "
-        "— they must NOT be gated on the probe verdict.")
-    # The GSK/WebKit host forces must NOT have been re-gated on the probe file.
-    # (Find the layerShellHost block specifically and assert the probe path is
-    # absent from its GSK/WebKit lines.)
+    # Part 2 (the GTK4 GSK-GL layer-shell hang): the host now GATES GSK_RENDERER on the
+    # boot probe — VULKAN when the GPU is proven, CAIRO otherwise — but it must NEVER use
+    # the GL renderer (the documented hang). The safety: GDK_GL=disable is UNCONDITIONAL,
+    # so even if Vulkan init fails GSK falls back to cairo, never to the hanging GL; a
+    # GSK-vulkan hang on the layer-shell surface still drops to the cage GTK3 floor.
     lhm = re.search(
         r'layerShellHost = pkgs\.writeShellScriptBin "hart-glass-shell-gtk4" \'\'(.*?)\'\';',
         host, re.S)
     assert lhm, "could not locate the GTK4 layerShellHost env block"
     layer_host = lhm.group(1)
-    # The host env block sets GSK_RENDERER but must not gate it on the probe file.
-    assert "GSK_RENDERER=cairo" in layer_host
-    assert "/run/hart/gpu-render" not in layer_host, (
-        "the GTK4 host env (GSK_RENDERER=cairo / WEBKIT_DISABLE_* / GDK_GL) must "
-        "NOT be gated on /run/hart/gpu-render — only the Tier-2 sway LAUNCHER's "
-        "LIBGL force is. The GSK cairo + WebKit forces are the documented hang "
-        "workaround and stay exactly as-is.")
+    # GDK_GL=disable must be UNCONDITIONAL (its own line, outside any if/optionalString) —
+    # GL is the hang path and must never be reachable as a Vulkan-failure fallback.
+    assert re.search(r'^\s*export GDK_GL=disable\s*$', layer_host, re.M), (
+        "the GTK4 host must export GDK_GL=disable UNCONDITIONALLY — GL is the hang path "
+        "and must never be reachable, so a Vulkan-init failure falls back to cairo, not GL.")
+    # The only GSK renderers it may ever select are vulkan (probed-good GPU) + cairo
+    # (floor / Vulkan fallback) — NEVER gl/opengl.
+    assert "GSK_RENDERER=vulkan" in layer_host and "GSK_RENDERER=cairo" in layer_host, (
+        "the GTK4 host must select GSK vulkan (probed GPU) or cairo (floor).")
+    assert "GSK_RENDERER=gl" not in layer_host and "GSK_RENDERER=opengl" not in layer_host, (
+        "the GTK4 host must NEVER select the GL/opengl GSK renderer (the layer-shell hang).")
+    # The vulkan-vs-cairo choice is gated on the boot probe verdict.
+    assert "/run/hart/gpu-render" in layer_host, (
+        "the GTK4 host's GSK vulkan-vs-cairo choice must be gated on the boot probe "
+        "(/run/hart/gpu-render).")
+    # WebKit forces stay gated on !preferHardwareGL (NOT the probe) — WebKit GPU is a
+    # separate later step, not part of the GSK fix.
+    assert re.search(
+        r'optionalString \(!ui\.preferHardwareGL\) "export WEBKIT_DISABLE_DMABUF_RENDERER=1',
+        host), (
+        "the GTK4 host must keep the WEBKIT_DISABLE_* forces on !preferHardwareGL "
+        "(WebKit GPU is a separate later step, not part of the GSK fix).")
 
 
 def test_hart_comp_pixman_renderer_not_gated_on_probe():
