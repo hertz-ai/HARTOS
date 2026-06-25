@@ -155,13 +155,17 @@ let
     export GSK_RENDERER=vulkan
     echo "[hart-glass-shell-gtk4] GSK = VULKAN (operator preferHardwareGL=true; GL disabled)" >&2
     '' else ''
-    if [ "$(cat /run/hart/gpu-render 2>/dev/null)" = "hardware" ]; then
-      export GSK_RENDERER=vulkan
-      echo "[hart-glass-shell-gtk4] GSK = VULKAN (GPU probed good; GL disabled, cairo fallback)" >&2
-    else
-      export GSK_RENDERER=cairo
-      echo "[hart-glass-shell-gtk4] GSK = CAIRO (software floor)" >&2
-    fi
+    # AUTO path = ALWAYS cairo (software). The on-HW journal (2026-06-25, NVIDIA-Optimus Lenovo:
+    # Intel iGPU + GeForce 940MX) PROVED the old "probe=hardware -> vulkan" decision fails BOTH
+    # tiers: on Tier-1's pixman SOFTWARE floor a hardware-Vulkan client gets VK_ERROR_SURFACE_
+    # LOST_KHR (GPU client vs software compositor = no shared dmabuf to present to), and on
+    # Tier-2 sway it never first-painted in the 45s watchdog window. Cairo is the PROVEN paint
+    # path (75ba78d). The Intel iGPU is the healthy render path; the dGPU (940MX via nouveau) is
+    # what FAULTS (MMIO PRIVRING in the journal) -- the blocker is the render PATH + the dGPU
+    # driver, not the iGPU -- so hardware accel returns via preferHardwareGL once the compositor's
+    # GPU buffer-sharing + the portal are proven on real HW (and nouveau is bypassed/blacklisted).
+    export GSK_RENDERER=cairo
+    echo "[hart-glass-shell-gtk4] GSK = CAIRO (software floor; auto path -- vulkan regressed on real HW 2026-06-25)" >&2
     ''}
     export HART_SHELL_URL="$URL"
     # Shell-paint readiness marker (the session-supervisor's HUNG-tier guard): the
@@ -317,6 +321,15 @@ app.run(None)
   sessionLauncher = pkgs.writeShellScriptBin "hart-glass-shell-gtk4-session" ''
     export WLR_RENDERER_ALLOW_SOFTWARE=1
     export WLR_NO_HARDWARE_CURSORS=1
+    # Desktop identity for xdg-desktop-portal: WITHOUT this the GTK4 host's startup
+    # color-scheme query to org.freedesktop.portal.Settings has no desktop hint, so
+    # D-Bus tries to ACTIVATE org.freedesktop.portal.Desktop and BLOCKS for the full
+    # 25s activation timeout (the real-HW 2026-06-25 journal: "Settings portal not
+    # found ... Timeout was reached" → the 45s paint-watchdog then drops the tier).
+    # Setting it lets the portal (started in the sway host config) own the name so the
+    # query resolves in ms, and selects the gtk backend.
+    export XDG_CURRENT_DESKTOP=sway
+    export XDG_SESSION_DESKTOP=sway
     ${if ui.preferHardwareGL then ''
     # Operator opted into hardware GL (hart.liquidUI.preferHardwareGL = true) — do
     # NOT force software; honour the explicit opt-in unconditionally.
@@ -360,6 +373,15 @@ app.run(None)
       tap enabled
       tap_button_map lrm
     }
+    # Start xdg-desktop-portal BEFORE the host so it owns org.freedesktop.portal.Desktop
+    # by the time GTK4 makes its startup Settings query — otherwise GTK D-Bus-activates it
+    # and blocks 25s (the real-HW paint-killer). The gtk backend (xdg-desktop-portal-gtk,
+    # from hart-subsystems extraPortals) answers Settings.Read; XDG_DATA_DIRS is widened so
+    # the frontend finds the backend's .portal file in this bare-sway (non-graphical-session)
+    # launch. Best-effort: if it can't start, GTK still falls through (now without the 25s
+    # activation stall because the name is being serviced). This also gives installed Flatpak
+    # apps working file-chooser/screenshot portals.
+    exec XDG_DATA_DIRS="${pkgs.xdg-desktop-portal-gtk}/share:${pkgs.xdg-desktop-portal}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}" ${pkgs.xdg-desktop-portal}/libexec/xdg-desktop-portal -r
     # Launch the GTK4 layer-shell host as sway's startup client. It anchors itself
     # as the BACKGROUND layer (exclusive zone 0) via gtk4-layer-shell — so it is
     # the desktop, not a fullscreen app. Native toplevels (Phase 5) map above it.

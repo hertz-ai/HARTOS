@@ -746,6 +746,16 @@ in
     enable32Bit = true;
   };
 
+  # ─── GPU: drive the desktop on the Intel iGPU; blacklist nouveau ───
+  # The real-HW 2026-06-25 journal showed nouveau (the open-source driver for the
+  # discrete GeForce 940MX) throwing `MMIO read ... FAULT [PRIVRING]` — a Maxwell
+  # dGPU nouveau cannot reliably drive — which faults the GPU and drags out the
+  # boot. The desktop only needs the Intel iGPU (healthy GL/Vulkan, drives the
+  # panel via i915), so blacklist nouveau and KMS-off the dGPU (nouveau.modeset=0
+  # below). The 940MX returns later, OPT-IN, via the proprietary driver for AI
+  # compute (hardware-gated) — display never depends on it.
+  boot.blacklistedKernelModules = [ "nouveau" ];
+
   # ─── Printing & Scanning ───
   services.printing.enable = true;
   services.avahi = {
@@ -791,5 +801,7 @@ in
     themePackages = [ hartPlymouth ];
     theme = lib.mkForce "hart";
   };
-  boot.kernelParams = [ "quiet" "splash" ];
+  # nouveau.modeset=0 keeps the faulting Maxwell dGPU from KMS-initialising at all
+  # (belt-and-suspenders with the blacklist above) — the Intel iGPU owns the display.
+  boot.kernelParams = [ "quiet" "splash" "nouveau.modeset=0" ];
 }
