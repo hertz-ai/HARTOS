@@ -130,6 +130,14 @@
     var r = POD.getBoundingClientRect(); ox = r.left; oy = r.top; place(ox, oy);
     sx = e.clientX; sy = e.clientY; drag = true; moved = false;
     POD.classList.add('dragging');
+    // Suppress the browser's native text/element selection for the whole drag — without
+    // this, dragging the pod by its body/grip rubber-bands a selection across the desktop
+    // icons + labels underneath (the real-HW 2026-06-25 "auto-selecting text and visual
+    // elements while dragging"). preventDefault stops selection STARTING; user-select:none
+    // on the root stops any in-flight selection painting. Restored in onUp.
+    e.preventDefault();
+    var de = document.documentElement;
+    de.style.userSelect = 'none'; de.style.webkitUserSelect = 'none';
     (ghost = ghost || mkGhost()).classList.add('show');
     try { POD.setPointerCapture(e.pointerId); } catch (_) {}
   }
@@ -143,6 +151,8 @@
   function onUp(e) {
     if (!drag) return;
     drag = false; POD.classList.remove('dragging');
+    var de = document.documentElement;                   // restore native selection (suppressed in onDown)
+    de.style.userSelect = ''; de.style.webkitUserSelect = '';
     if (ghost) ghost.classList.remove('show');
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
     var s = clampSnap(parseInt(POD.style.left, 10) || 0, parseInt(POD.style.top, 10) || 0);

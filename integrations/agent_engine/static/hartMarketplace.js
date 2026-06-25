@@ -46,8 +46,34 @@
   // toast even when the platform was unavailable / the install failed). The
   // installer returns {success, staged, name, error, platform}; staged is NEVER
   // success (a downloaded-but-not-applied file), so it gets its own message.
+  // Indeterminate install progress bar. The backend installer is a BLOCKING
+  // flatpak call with no progress stream, so an honest % isn't available yet (a
+  // determinate bar would be a lie). This shows a sweeping bar under the button so
+  // the user sees work is happening — not a frozen "Installing…". Built with inline
+  // styles + the Web Animations API (no CSS f-string edit, no brace-escape risk);
+  // degrades to a static track if element.animate is absent. Returns a remover.
+  function installBar(btn) {
+    if (!btn || !btn.parentNode) return function () {};
+    var track = document.createElement('div');
+    track.setAttribute('style', 'height:3px;margin-top:6px;border-radius:3px;overflow:hidden;' +
+      'background:rgba(255,255,255,0.12)');
+    var fill = document.createElement('div');
+    fill.setAttribute('style', 'height:100%;width:40%;border-radius:3px;' +
+      'background:linear-gradient(90deg,transparent,#00D4AA,transparent)');
+    track.appendChild(fill);
+    btn.parentNode.appendChild(track);
+    var anim = null;
+    try {
+      anim = fill.animate(
+        [{ transform: 'translateX(-120%)' }, { transform: 'translateX(320%)' }],
+        { duration: 1100, iterations: Infinity, easing: 'ease-in-out' });
+    } catch (_) { fill.style.width = '100%'; fill.style.opacity = '0.6'; }
+    return function () { try { if (anim) anim.cancel(); } catch (_) {} if (track.parentNode) track.parentNode.removeChild(track); };
+  }
+
   function install(app, btn) {
-    if (btn) { btn.disabled = true; btn.textContent = 'Installing…'; }
+    var clearBar = function () {};
+    if (btn) { btn.disabled = true; btn.textContent = 'Installing…'; clearBar = installBar(btn); }
     fetch('/api/apps/install', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       // pass both shapes: {package,platform} (what the existing UI sends) AND a
       // source hint (app_installer keys flatpak off a 'flatpak:' source).
@@ -56,6 +82,7 @@
       .then(function (r) { return r.json().catch(function () { return { success: r.ok }; }); })
       .then(function (res) {
         res = res || {};
+        clearBar();
         if (res.success) {
           if (btn) { btn.textContent = 'Installed'; btn.classList.add('is-installed'); }
           toast('Installed ' + app.n, (res.platform || 'flatpak') + ' - added to your apps', 'success');
@@ -68,6 +95,7 @@
         }
       })
       .catch(function () {
+        clearBar();
         if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
         toast('Install failed', app.n + ' - no response from the installer', 'error');
       });
