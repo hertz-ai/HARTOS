@@ -1,0 +1,77 @@
+name: Deploy HARTOS Deepbox
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy on Deepbox
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEEPBOX_HOST }}
+          username: ${{ secrets.DEEPBOX_USER }}
+          key: ${{ secrets.DEEPBOX_SSH_KEY }}
+          script: |
+            set -e
+
+            cd /opt/hzai-LLM-Langchain-Chatbot-Agent/repo/LLM-langchain_Chatbot-Agent
+
+            rm -f release_manifest.json
+
+            git fetch origin --prune
+            git checkout main
+            git reset --hard origin/main
+
+            docker rm -f langchain langchain_tmp 2>/dev/null || true
+            docker rmi -f langchain_gpt:main 2>/dev/null || true
+
+            docker build --no-cache -t langchain_gpt:main .
+
+            sudo docker run --name langchain_tmp -d \
+              --env-file .env \
+              -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat /etc/hevolve/master_private_key.hex)" \
+              langchain_gpt:main sleep 3600
+
+            docker exec langchain_tmp sh -lc '
+            cd /app
+            export MASTER_PRIVATE_KEY_HEX="$HEVOLVE_MASTER_PRIVATE_KEY"
+            python scripts/sign_release.py \
+              --version v1.0.0 \
+              --git-sha "$(git rev-parse HEAD 2>/dev/null || echo no-git)" \
+              --code-hash "$(python - <<PY
+            import sys; sys.path.insert(0,".")
+            from security.node_integrity import compute_code_hash
+            print(compute_code_hash())
+            PY
+            )" \
+              --manifest-hash "$(python - <<PY
+            import sys, hashlib, json; sys.path.insert(0,".")
+            from security.node_integrity import compute_file_manifest
+            m=compute_file_manifest()
+            print(hashlib.sha256(json.dumps(m, sort_keys=True).encode()).hexdigest())
+            PY
+            )" \
+              --output /tmp/release_manifest.json
+            '
+
+            sudo docker cp langchain_tmp:/tmp/release_manifest.json ./release_manifest.json
+            docker rm -f langchain_tmp
+
+            sudo docker run -d --name langchain --restart unless-stopped \
+              -p 6777:6777 \
+              --env-file .env \
+              -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat /etc/hevolve/master_private_key.hex)" \
+              -v "$(pwd)/config.json:/app/config.json:ro" \
+              -v "$(pwd)/release_manifest.json:/app/release_manifest.json:ro" \
+              -v /opt/hzai-LLM-Langchain-Chatbot-Agent/logs:/app/logs \
+              -v /opt/hzai-LLM-Langchain-Chatbot-Agent/mount/images:/app/output_images \
+              langchain_gpt:main
+
+            sleep 10
+            docker ps | grep langchain
+            curl -sS http://127.0.0.1:6777/status
