@@ -297,10 +297,17 @@ in
     ];
 
     # ── Systemd target: hart.target groups all HART services ──
+    # NO network-online.target: hart.target is a pure grouping target; hart-backend
+    # (the shell's local :6777 API) is partOf+wantedBy it, so ANY network-online wait
+    # here is inherited by the backend and stalls the boot-critical path ~90-120s on
+    # an offline live USB (NetworkManager-wait-online timeout) -> the glass shell's
+    # BACKEND-served panels connection-refuse to localhost:6777 ("Reconnecting").
+    # Net-needing HART services (dns/ota/firewall/sso/subsystems) each declare their
+    # OWN best-effort `wants=network-online` locally, so dropping it from the group
+    # changes nothing for them while freeing the offline boot path. multi-user.target
+    # already implies local-fs/sysinit ordering for the grouped services.
     systemd.targets.hart = {
       description = "HART OS Services";
-      after = [ "network-online.target" ];
-      wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
     };
 

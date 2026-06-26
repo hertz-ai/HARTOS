@@ -174,8 +174,13 @@ in
 
     systemd.services.hart-first-boot = {
       description = "HART OS First Boot Setup";
-      after = [ "network-online.target" "local-fs.target" ];
-      wants = [ "network-online.target" ];
+      # NO network-online.target: this oneshot is fully offline (Ed25519 keygen,
+      # local hardware detect via nproc/meminfo/nvidia-smi, local Ed25519 audit
+      # signing) and writes ONLY to local disk. hart-backend orders `after` this
+      # service, so a network-online wait here delays :6777 by ~90-120s on an
+      # offline live USB. Keep local-fs.target — the script writes node keys /
+      # capability_tier / boot_audit.log to ${cfg.dataDir} and needs the FS mounted.
+      after = [ "local-fs.target" ];
       wantedBy = [ "multi-user.target" ];
 
       unitConfig = {
