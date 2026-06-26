@@ -26,10 +26,13 @@ Updated by Claude each session. Newest concerns at top of each section.
 | 1.1 | Tier-1/Tier-2 must paint, not black-loop | ✅ | DRM-master fix `52a6e26e`; cage floor renders the full shell (your photo) |
 | 1.2 | Touchpad taps register | 🟢→⚠️ | **sway/hart-comp** tap-to-click fixed `e1bf4af3`. **BUT you're on CAGE, which the fix does NOT cover** → see 1.6 |
 | 1.3 | gtk4-layer-shell drop-to-cage | 🟢 | LD_PRELOAD fix `e1bf4af3` (needs reflash) |
-| 1.4 | **Tier-2 sway HUNG → cage (your boot log)** | 🔄 | ROOT CAUSE FOUND: `libEGL: not allowed to force software rendering when API selects a hardware device` — on your Intel iGPU `LIBGL_ALWAYS_SOFTWARE` is *refused*, GL goes hardware + hangs. **Today's GPU fixes target exactly this** (1.5) |
-| 1.5 | GPU render lever | 🟢 | **gpu-gate** `c4323ed` (stop forcing software when GPU proven) + **GSK-Vulkan** `70e0a116` (no GL context to hang). Both un-flashed — **reflash to test if Tier-2 paints** |
-| 1.6 | **Taps STILL dead in cage** (NEW) | ⏳ | cage has no config file; the sway tap fix doesn't reach it. Fix = system libinput tap default for the cage floor. Also: reaching sway (1.5) gives taps for free |
-| 1.7 | Portal timeout in boot log | ⏳ | `org.freedesktop.portal.Desktop: Timeout` — the missing portal daemon (see 5.x capture/portal gap) delays GTK startup |
+| 1.4 | **Tier-2 sway HUNG → cage** (06-25 journal) | 🟢(unflashed) | TWO real-HW root causes nailed from the journal: (a) GSK=**vulkan** regressed paint (surface-lost on Tier-1 pixman, no-paint on Tier-2) → forced **cairo** `d032cc5`; (b) ~26s GTK stall on the missing portal → start xdg-desktop-portal + `XDG_CURRENT_DESKTOP=sway` `d032cc5`. In `dd841b65` build |
+| 1.5 | GPU render lever | 🟢 | `c4323ed`/`70e0a116` superseded by 1.4's **cairo** decision — Vulkan can't present to a software compositor; cairo is the proven paint path. GPU accel returns via `preferHardwareGL` once compositor GPU-buffer-sharing is real-HW proven |
+| 1.6 | **Taps STILL dead in cage** (NEW) | ⏳ | cage has no config file; the sway tap fix doesn't reach it. Reaching sway (1.4) gives taps for free |
+| 1.7 | Portal timeout in boot log | 🟢(unflashed) | FIXED `d032cc5` — start xdg-desktop-portal (gtk backend) in the sway host + set XDG_CURRENT_DESKTOP so GTK's startup Settings query resolves in ms instead of the 25s D-Bus activation stall |
+| 1.8 | **nouveau MMIO FAULT [PRIVRING]** on the 940MX (NEW, 06-25 journal) | 🟢(unflashed) | `d032cc5` blacklist nouveau + `nouveau.modeset=0` — the Maxwell dGPU the open driver can't drive faulted + dragged out boot; Intel iGPU (healthy) drives display. dGPU returns opt-in via proprietary driver for AI compute |
+| 1.9 | **Backend unreachable on offline USB** ("couldn't connect / Reconnecting") | 🟢(unflashed) | LIVE-OS #1 ROOT CAUSE: transitive network-online.target stall delayed :6777 ~90-120s. `acc4dd1b` drops it from hart.target + hart-first-boot so the brain binds offline. In `dd841b65` |
+| 1.10 | **hart-comp XWayland missing** (06-25 journal) | 🟢(unflashed) | `dd84a24d` adds pkgs.xwayland to the hart-comp session PATH + guarantees XDG_RUNTIME_DIR. A STEP toward the Rust moat (not the finish — moat still skeleton); no Rust rebuild |
 
 ## 2. Performance
 
@@ -65,6 +68,9 @@ Updated by Claude each session. Newest concerns at top of each section.
 | 3.18 | **Everything-on by default (privacy-first)** (NEW) | 🟢(local) | `b0fbddac` (local) desktop.nix: portal/screenshot-record + a11y/cups/dns/email/firewall/ime/devtools ON; Hive-egress (federation/public-exposure/contributing-compute/marketing) stays OPT-IN + consent. Memory: hartos_privacy_first_defaults |
 | 3.19 | **nightlight + dlna = preferences, not default-on** (NEW) | 🟢(local) | `edbeb6c6` (local) — reverted from 3.18 (steward catch); available but user-activated (screen tint / LAN media broadcast). DNS + firewall stay ON (privacy-POSITIVE) |
 | 3.20 | **Screenshot + screen-record now functional** (NEW) | 🟢(local) | `b0fbddac` enables hart.portal → grim/wf-recorder installed + fail-closed on the screen kill-switch. Was built but OFF (portal was opt-in). The app-to-app ScreenCast portal stays VM-pending |
+| 3.21 | **OS connectivity tray — wifi/bluetooth/battery/volume + quick settings** (NEW, "nothing an OS should have") | 🟢(unflashed) | `dd841b65` (ultracode workflow) — top-bar indicator cluster (live glyphs) + glass quick-settings popover (toggle wifi/bt, join a network, volume slider, battery). Backend probes ALREADY existed (shell_system_apis) + degrade cleanly; the gap was the tray. New `hartConnectivity.js`. Works on EVERY tier incl. cage |
+| 3.22 | **Sensory-pod drag rubber-bands a selection** (NEW, 06-25) | 🟢(unflashed) | `edc4a9b3` — preventDefault + user-select:none during the drag |
+| 3.23 | **App Store install: no progress bar** (NEW, 06-25) | 🟢(unflashed) | `edc4a9b3` — honest indeterminate sweeping bar (backend flatpak install is blocking with no progress stream; a real % needs a bg-job refactor, queued) |
 
 ## 4. Cross-OS apps & native app format
 
