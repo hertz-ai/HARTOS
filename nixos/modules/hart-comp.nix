@@ -229,7 +229,15 @@ let
   # exec wrapper; it inherits the constitution gate from the session boot path.
   compSessionLauncher = pkgs.writeShellScriptBin "hart-comp-session" ''
     set -u
-    PATH=${lib.makeBinPath (with pkgs; [ coreutils ])}:$PATH
+    # coreutils provides the launcher's own ls/seq/sleep/basename/id; xwayland puts
+    # the `Xwayland` BINARY on PATH so Smithay's `XWayland::spawn` (which is hardcoded
+    # to `Command::new("Xwayland")` and resolves it from $PATH — it only forwards PATH
+    # + XDG_RUNTIME_DIR to the child) can launch it. xwayland in the package's
+    # buildInputs is only the LINK-time C lib (smithay/xwayland); the runtime binary
+    # must be on the session PATH or the X11/Wine path is dead ("xserver spawning
+    # XWayland … No such file or directory" on real HW). Wayland-native clients are
+    # unaffected — XWayland is best-effort — but the moat wants legacy/Wine windows too.
+    PATH=${lib.makeBinPath (with pkgs; [ coreutils xwayland ])}:$PATH
 
     # Mandatory software-render floor — same contract as cage Tier-3 + sway Tier-2.
     # HART-comp's pixman path is type-checked (not an env prayer), but we ALSO pass
@@ -250,6 +258,14 @@ let
     # HART_COMP_NO_TEST_CLIENT suppresses the dev auto-foot client.
     : "''${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
     export XDG_RUNTIME_DIR
+    # The compositor binds its com.hart.Compositor IPC twin + its wayland-N socket
+    # under $XDG_RUNTIME_DIR; both fail "No such file or directory" if the dir is
+    # absent. Under greetd's logind session pam_systemd creates /run/user/$UID, but a
+    # supervisor-less / non-logind launch (or a too-early bind) may race it — so
+    # guarantee the dir exists (0700, owner-only, the systemd runtime-dir contract)
+    # before the compositor starts. Idempotent: a no-op when pam_systemd already made it.
+    mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+    chmod 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
     export HART_COMP_NO_TEST_CLIENT=1
 
     # Shell-paint readiness marker (the session-supervisor's HUNG-tier guard): the
