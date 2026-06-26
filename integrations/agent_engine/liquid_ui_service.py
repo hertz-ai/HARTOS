@@ -1975,6 +1975,12 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script defer src="/shell/static/hartSessionUI.js"></script>
 <link rel="stylesheet" href="/shell/static/hartResponsive.css">
 <script defer src="/shell/static/hartFiles.js"></script>
+<!-- OS connectivity cluster (wifi/bluetooth/battery/volume indicators +
+     quick-settings) in the top-bar tray. Loaded after hartStates.js (it reuses
+     the designed-state helpers) and hartSession.js (HartTimeoutSignal). Polls
+     /api/shell/connectivity/summary on SHELL=:6800 (same-process) and degrades
+     to a neutral 'unknown' glyph when a tool/hardware is absent. -->
+<script defer src="/shell/static/hartConnectivity.js"></script>
 
 <!-- Agent Pill (click to expand floating chat) -->
 <div class="agent-pill glass hidden" id="agent-pill" onclick="toggleAssistantChat()">
@@ -5615,7 +5621,10 @@ function renderAgentOverlay(ev) {{
             volume = data.get('volume')
             if not sink_id or volume is None:
                 return jsonify({'success': False, 'error': 'sink_id and volume required'}), 400
-            volume = max(0, min(150, int(volume)))
+            try:
+                volume = max(0, min(150, int(volume)))
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'volume must be an integer'}), 400
             try:
                 r = subprocess.run(
                     ['pactl', 'set-sink-volume', sink_id, f'{volume}%'],
@@ -5719,6 +5728,205 @@ function renderAgentOverlay(ev) {{
             except Exception:
                 pass
             return jsonify(info)
+
+        # ── Shell APIs: Volume (wpctl-first, pactl fallback) ──
+        # The top-bar connectivity cluster needs a SIMPLE default-sink volume
+        # get/set/mute that does not require the caller to know a sink_id (the
+        # existing /api/shell/audio/* endpoints are per-sink + pactl-only). wpctl
+        # (WirePlumber, the PipeWire session manager shipped on the desktop) is
+        # preferred; pactl is the fallback. EVERY call is subprocess.run with a
+        # timeout and degrades to {available:false} when neither tool is present
+        # (the live USB may have neither) — never crashes, never hangs.
+        def _vol_run(cmd, timeout=4):
+            try:
+                return subprocess.run(cmd, capture_output=True, text=True,
+                                      timeout=timeout)
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                return None
+
+        def _volume_get():
+            # wpctl get-volume @DEFAULT_AUDIO_SINK@ -> "Volume: 0.55 [MUTED]"
+            r = _vol_run(['wpctl', 'get-volume', '@DEFAULT_AUDIO_SINK@'])
+            if r and r.returncode == 0 and 'Volume:' in r.stdout:
+                try:
+                    frac = float(r.stdout.split('Volume:')[1].strip().split()[0])
+                    return {'available': True, 'tool': 'wpctl',
+                            'volume': int(round(frac * 100)),
+                            'muted': 'MUTED' in r.stdout.upper()}
+                except (ValueError, IndexError):
+                    pass
+            # pactl fallback
+            mr = _vol_run(['pactl', 'get-sink-mute', '@DEFAULT_SINK@'])
+            vr = _vol_run(['pactl', 'get-sink-volume', '@DEFAULT_SINK@'])
+            if vr and vr.returncode == 0 and '%' in vr.stdout:
+                try:
+                    pct = int(vr.stdout.split('/')[1].strip().rstrip('%'))
+                    muted = bool(mr and mr.returncode == 0 and
+                                 'yes' in mr.stdout.lower())
+                    return {'available': True, 'tool': 'pactl',
+                            'volume': max(0, min(150, pct)), 'muted': muted}
+                except (ValueError, IndexError):
+                    pass
+            return {'available': False, 'volume': None, 'muted': None}
+
+        @app.route('/api/shell/volume', methods=['GET'],
+                   endpoint='shell_volume_get')
+        def shell_volume_get():
+            return jsonify(_volume_get())
+
+        @app.route('/api/shell/volume', methods=['POST'],
+                   endpoint='shell_volume_set')
+        def shell_volume_set():
+            data = request.get_json(silent=True) or {}
+            volume = data.get('volume')
+            if volume is None:
+                return jsonify({'available': False,
+                                'error': 'volume required'}), 400
+            try:
+                volume = max(0, min(150, int(volume)))
+            except (TypeError, ValueError):
+                return jsonify({'available': False,
+                                'error': 'volume must be an integer'}), 400
+            r = _vol_run(['wpctl', 'set-volume', '@DEFAULT_AUDIO_SINK@',
+                          str(volume / 100.0)])
+            if r and r.returncode == 0:
+                return jsonify({'available': True, 'volume': volume,
+                                'tool': 'wpctl'})
+            r = _vol_run(['pactl', 'set-sink-volume', '@DEFAULT_SINK@',
+                          str(volume) + '%'])
+            if r and r.returncode == 0:
+                return jsonify({'available': True, 'volume': volume,
+                                'tool': 'pactl'})
+            return jsonify({'available': False,
+                            'error': 'no volume tool (wpctl/pactl)'}), 200
+
+        @app.route('/api/shell/volume/mute', methods=['POST'],
+                   endpoint='shell_volume_mute')
+        def shell_volume_mute():
+            data = request.get_json(silent=True) or {}
+            muted = data.get('muted', None)
+            # wpctl uses toggle|1|0
+            arg = 'toggle' if muted is None else ('1' if muted else '0')
+            r = _vol_run(['wpctl', 'set-mute', '@DEFAULT_AUDIO_SINK@', arg])
+            if r and r.returncode == 0:
+                return jsonify(_volume_get())
+            parg = 'toggle' if muted is None else ('1' if muted else '0')
+            r = _vol_run(['pactl', 'set-sink-mute', '@DEFAULT_SINK@', parg])
+            if r and r.returncode == 0:
+                return jsonify(_volume_get())
+            return jsonify({'available': False,
+                            'error': 'no volume tool (wpctl/pactl)'}), 200
+
+        # ── Shell APIs: Connectivity summary (ONE poll for the top-bar) ──
+        # The top-bar indicator cluster (hartConnectivity.js) polls THIS single
+        # endpoint so it makes one request per tick instead of four. Each block is
+        # independently guarded (subprocess timeout + FileNotFoundError/OSError
+        # caught) so a missing tool only blanks its own indicator ('available':
+        # false), never the whole summary, and never crashes/hangs. The quick-
+        # settings ACTIONS (scan, connect, toggle, set-volume) hit the existing
+        # per-domain endpoints — this is read-only aggregation, NOT a parallel
+        # control path.
+        #
+        # DRY DEBT (Gate 4, tracked): the wifi-radio / bt-power / battery PROBES
+        # below duplicate the canonical probes in shell_system_apis.py
+        # (shell_wifi_status, shell_bt_status, _battery_info). They are NOT reused
+        # because those are nested closures inside register_shell_system_routes,
+        # not importable without restructuring route registration (a higher
+        # iso-build risk than warranted for this fix). TODO: when those probes are
+        # promoted to module-level pure functions in shell_system_apis.py, call
+        # them here so there is ONE probe implementation per domain and the shapes
+        # cannot drift (the canonical wifi also reads FREQ/IP; battery reads
+        # health/AC/voltage).
+        @app.route('/api/shell/connectivity/summary', methods=['GET'],
+                   endpoint='shell_connectivity_summary')
+        def shell_connectivity_summary():
+            wifi = {'available': False, 'enabled': False, 'connected': False,
+                    'ssid': None, 'signal': None}
+            try:
+                r = subprocess.run(['nmcli', 'radio', 'wifi'],
+                                   capture_output=True, text=True, timeout=4)
+                if r.returncode == 0:
+                    wifi['available'] = True
+                    wifi['enabled'] = r.stdout.strip().lower() == 'enabled'
+                r = subprocess.run(
+                    ['nmcli', '-t', '-f', 'ACTIVE,SSID,SIGNAL',
+                     'device', 'wifi'],
+                    capture_output=True, text=True, timeout=4)
+                if r.returncode == 0:
+                    wifi['available'] = True
+                    for line in r.stdout.strip().split('\n'):
+                        parts = line.split(':')
+                        if len(parts) >= 2 and parts[0] == 'yes':
+                            wifi['connected'] = True
+                            wifi['ssid'] = parts[1] or None
+                            if len(parts) >= 3 and parts[2].isdigit():
+                                wifi['signal'] = int(parts[2])
+                            break
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                pass
+
+            bt = {'available': False, 'powered': False, 'connected_count': 0}
+            try:
+                r = subprocess.run(['bluetoothctl', 'show'],
+                                   capture_output=True, text=True, timeout=4)
+                if r.returncode == 0:
+                    bt['available'] = True
+                    for line in r.stdout.split('\n'):
+                        if 'Powered:' in line:
+                            bt['powered'] = 'yes' in line.lower()
+                            break
+                if bt['powered']:
+                    r = subprocess.run(['bluetoothctl', 'devices', 'Connected'],
+                                       capture_output=True, text=True, timeout=4)
+                    if r.returncode == 0:
+                        bt['connected_count'] = len(
+                            [ln for ln in r.stdout.strip().split('\n')
+                             if ln.strip().startswith('Device')])
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                pass
+
+            # Battery: reuse psutil + sysfs (the canonical cross-platform path).
+            battery = {'available': False, 'percent': None,
+                       'plugged_in': False, 'state': 'unknown'}
+            try:
+                import psutil
+                b = psutil.sensors_battery()
+                if b is not None:
+                    battery['available'] = True
+                    battery['percent'] = int(round(b.percent))
+                    battery['plugged_in'] = bool(b.power_plugged)
+                    battery['state'] = ('charging' if b.power_plugged
+                                        else 'discharging')
+            except (ImportError, RuntimeError, OSError):
+                pass
+            if not battery['available']:
+                try:
+                    import glob as _g
+                    bats = sorted(_g.glob('/sys/class/power_supply/BAT*'))
+                    if bats:
+                        d = bats[0]
+                        try:
+                            with open(d + '/capacity') as f:
+                                cap = f.read().strip()
+                            if cap.isdigit():
+                                battery['available'] = True
+                                battery['percent'] = int(cap)
+                        except (OSError, ValueError):
+                            pass
+                        try:
+                            with open(d + '/status') as f:
+                                st = f.read().strip().lower()
+                            if st:
+                                battery['state'] = st
+                                battery['plugged_in'] = st in (
+                                    'charging', 'full')
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+
+            return jsonify({'wifi': wifi, 'bluetooth': bt,
+                            'battery': battery, 'volume': _volume_get()})
 
         # ── Shell APIs: Display ──
         @app.route('/api/shell/display', methods=['GET'])
