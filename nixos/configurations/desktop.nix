@@ -414,6 +414,17 @@ in
     isoName = lib.mkForce "hart-os-${config.hart.version}-desktop-${pkgs.system}.iso";
     volumeID = lib.mkForce "HART_OS";
     appendToMenuLabel = " HART OS Desktop";
+    # The desktop closure (GNOME + HART + every subsystem + the compositor) sits at
+    # the ISO9660 size ceiling. The dd841b65 build FAILED at xorriso:
+    #   "Image size 3419136s exceeds free space on media 2742704s" (exit 32)
+    # i.e. the squashfs (compressed with the installer profile's default
+    # zstd -Xcompression-level 19) came out ~1.3 GiB LARGER than the nixpkgs ISO
+    # size estimate assumed. zstd level 22 (max; squashfs compresses per-block so
+    # the higher level costs CPU, not catastrophic memory) squeezes the squashfs
+    # harder so the real image lands under the estimate — and a smaller ISO also
+    # flashes faster. Bumped from the default 19 because the desktop variant is the
+    # only one near the ceiling (server/edge build fine at 19).
+    squashfsCompression = "zstd -Xcompression-level 22";
   };
 
   # ═══════════════════════════════════════════════════════════════
