@@ -76,3 +76,71 @@
   .hart-hero { top: 44%; }
   .hart-hero-orbwrap { width: 340px; height: 340px; }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * DESIGN OVERHAUL v2 (2026-06-27) — futuristic AI-native glass, ALL widths.
+ * The steward: "styling looks outdated; a Behance designer would design a
+ * futuristic desktop." Loaded last, so this token + surface override wins over
+ * the inline default AND the theme path without touching any markup/ID/class.
+ * The #1 fix: a real UI typeface instead of mono-everywhere. Then deep-space
+ * ambient (not saturated blue), layered frosted glass with depth, teal-as-glow,
+ * generous radius. A user's saved wallpaper/theme (inline element style) still
+ * wins, so this only re-skins the DEFAULT look.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+:root {
+  /* UI text = humanist sans (system fonts, no network asset needed on the ISO);
+     mono kept ONLY for metrics/code via --hart-font-mono. */
+  --hart-font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+  --hart-font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
+  --hart-background: #08080C;
+  --hart-text: #EAF0F2;
+  --hart-muted: #8A93A6;
+  --hart-surface: #14141F;
+  --hart-surface-hover: #1E1F2C;
+  --hart-glass-bg: rgba(18,19,28,0.56);
+  --hart-glass-border: rgba(255,255,255,0.09);
+  --hart-blur: 28px;
+  --hart-saturation: 160%;
+  --hart-radius: 18px;
+  --hart-accent-rgb: 0,212,170;
+}
+/* Deep-space ambient: near-black base + faint teal/violet blooms (default only). */
+.wallpaper {
+  background:
+    radial-gradient(58% 48% at 14% 8%, rgba(0,230,195,0.10), transparent 60%),
+    radial-gradient(55% 55% at 92% 96%, rgba(124,92,255,0.12), transparent 60%),
+    radial-gradient(120% 90% at 50% 122%, rgba(16,20,40,0.55), transparent 70%),
+    linear-gradient(160deg, #0A0A10 0%, #08080C 55%, #0A0910 100%);
+}
+/* Frosted glass with real depth: inner top highlight + soft outer shadow + hairline. */
+.glass, .panel, .top-bar, .hart-hero-bar, .start-menu, .ctx-menu, .agent-pill {
+  border: 1px solid var(--hart-glass-border);
+  box-shadow: 0 24px 70px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.05);
+  backdrop-filter: blur(var(--hart-blur)) saturate(var(--hart-saturation));
+  -webkit-backdrop-filter: blur(var(--hart-blur)) saturate(var(--hart-saturation));
+}
+/* App-rail icon tiles: subtle gradient + accent glyph glow + hover lift. */
+.desktop-icon .di-glyph {
+  background: linear-gradient(150deg, rgba(255,255,255,0.10), rgba(255,255,255,0.02));
+  border: 1px solid var(--hart-glass-border);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.10), 0 10px 22px rgba(0,0,0,0.32);
+  border-radius: 15px;
+  transition: transform .2s cubic-bezier(.2,.8,.2,1), box-shadow .2s;
+}
+.desktop-icon .di-glyph .mi { filter: drop-shadow(0 0 8px rgba(var(--hart-accent-rgb),0.45)); }
+/* Fix the off-brand purple selection -> teal. */
+.desktop-icon.selected {
+  background: rgba(var(--hart-accent-rgb),0.16) !important;
+  outline: 1px solid rgba(var(--hart-accent-rgb),0.45) !important;
+}
+/* Command bar: prominent frosted pill with an accent focus halo. */
+.hart-hero-bar { border-radius: 30px; box-shadow: 0 18px 50px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.06); }
+.hart-hero-bar:focus-within { border-color: rgba(var(--hart-accent-rgb),0.55); box-shadow: 0 0 0 1px rgba(var(--hart-accent-rgb),0.35), 0 0 26px rgba(var(--hart-accent-rgb),0.25); }
+.hart-hero-go { box-shadow: 0 0 18px rgba(var(--hart-accent-rgb),0.5); }
+/* Tray hover/focus = soft accent, not flat. */
+.tray-btn:hover { background: rgba(255,255,255,0.06); }
+.tray-btn:hover .mi { color: var(--hart-text); }
+/* Tabular mono for the clock + metric numbers (the one place mono belongs). */
+.clock, .metric-value, .sys-value, [class*="-pct"], .hc-vol-pct { font-family: var(--hart-font-mono); font-variant-numeric: tabular-nums; }
+/* Start-menu logo keeps its accent glow; brand text in the UI font. */
+.start-btn span { font-weight: 600; letter-spacing: .02em; }

@@ -1981,6 +1981,10 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      /api/shell/connectivity/summary on SHELL=:6800 (same-process) and degrades
      to a neutral 'unknown' glyph when a tool/hardware is absent. -->
 <script defer src="/shell/static/hartConnectivity.js"></script>
+<!-- Flash HART OS to USB wizard (System panel 'flash'): drives the proven
+     scripts/hart_usb_flasher.py via /api/shell/flash/* so a running node can
+     create more install sticks. Exposes window.loadFlashWizard. -->
+<script defer src="/shell/static/hartFlash.js"></script>
 
 <!-- Agent Pill (click to expand floating chat) -->
 <div class="agent-pill glass hidden" id="agent-pill" onclick="toggleAssistantChat()">
@@ -2895,6 +2899,7 @@ function loadSystemPanel(id, body) {{
   else if(id==='bluetooth') loadBluetoothPanel(container);
   else if(id==='power') loadPowerPanel(container);
   else if(id==='display') loadDisplayPanel(container);
+  else if(id==='flash') {{ if(window.loadFlashWizard) window.loadFlashWizard(container); }}
   else if(id==='remote_desktop') loadRemoteDesktopPanel(container, apis);
   else if(id==='hart_identity') loadHartIdentityPanel(container, apis);
   else if(id==='self_build') loadSelfBuildPanel(container, apis);
@@ -4226,7 +4231,7 @@ function askAgent() {{
       const txt = data.response || data.error || 'No response';
       resp.textContent = data.composed ? ('✦ ' + txt) : txt;
       speakText(txt, 'chat_response');
-    }}).catch(()=>{{ resp.textContent='Could not reach agent'; }});
+    }}).catch(()=>{{ resp.textContent='Assistant unavailable. It may still be starting - try again in a moment.'; }});
 }}
 
 // ═══ Floating Assistant Chat ═══
@@ -4387,7 +4392,7 @@ function acSend() {{
       window._hartThinking = false;  // terminal: response arrived
       speakText(reply, 'chat_response');
     }}).catch(function(){{
-      typing.textContent = 'Could not reach agent';
+      typing.textContent = 'Assistant unavailable. It may still be starting - try again in a moment.';
       typing.classList.remove('typing');
       window._hartThinking = false;  // terminal: request failed
     }});
@@ -6258,6 +6263,17 @@ function renderAgentOverlay(ev) {{
             register_app_install_routes(app)
         except Exception as e:
             logger.warning("Shell APIs registration: %s", e)
+
+        # Flash-to-USB routes registered SEPARATELY so a failure in this newer,
+        # optional module (e.g. the flasher import) can NEVER cascade and drop the
+        # core shell APIs above (the #18 route-drop class). Best-effort: the Flash
+        # panel just won't work if this fails; everything else stays up.
+        try:
+            from integrations.agent_engine.shell_flash_apis import (
+                register_shell_flash_routes)
+            register_shell_flash_routes(app)
+        except Exception as e:
+            logger.warning("Flash-to-USB API registration: %s", e)
 
         # AI-senses cross-process authority (Phase 7) — THIS process is the
         # canonical holder of core.ai_sensing._state: register_shell_desktop_routes

@@ -62,7 +62,7 @@ type Asset struct {
 // --yes is set every confirmation defaults to its safe value.
 var (
 	flagMode = flag.String("mode", "",
-		"Non-interactive deployment mode: nunba, docker, server, desktop, edge, pip")
+		"Non-interactive deployment mode: nunba, docker, server, desktop, edge, pip, flash")
 	flagTier = flag.String("tier", "flat",
 		"HARTOS tier when --mode=docker: central, regional, flat (default flat)")
 	flagYes = flag.Bool("yes", false,
@@ -96,6 +96,7 @@ func main() {
 	fmt.Println("  4. HART OS Edge ISO (minimal, IoT)")
 	fmt.Println("  5. pip install (developer)")
 	fmt.Println("  6. HARTOS Docker (server / cloud — pulls signed image)")
+	fmt.Println("  7. Flash HART OS to a USB stick (pick disk → write → verify)")
 	fmt.Print("\n  Choice [1]: ")
 
 	var choice string
@@ -117,6 +118,8 @@ func main() {
 		pipInstall()
 	case "6":
 		installDocker(*flagTier, *flagPort, *flagImage)
+	case "7":
+		flashToUSB()
 	default:
 		fmt.Println("Invalid choice.")
 		os.Exit(1)
@@ -141,9 +144,11 @@ func dispatchMode(mode, platform string) {
 		pipInstall()
 	case "docker":
 		installDocker(*flagTier, *flagPort, *flagImage)
+	case "flash":
+		flashToUSB()
 	default:
 		fmt.Printf("Unknown mode: %s\n", mode)
-		fmt.Println("Valid modes: nunba, docker, server, desktop, edge, pip")
+		fmt.Println("Valid modes: nunba, docker, server, desktop, edge, pip, flash")
 		os.Exit(1)
 	}
 }
@@ -227,9 +232,102 @@ func downloadISO(variant string) {
 	}
 
 	fmt.Printf("\nISO saved to %s\n", dest)
-	fmt.Println("Flash to USB:")
-	fmt.Printf("  sudo dd if=%s of=/dev/sdX bs=4M status=progress\n", dest)
-	fmt.Println("  Or use Balena Etcher / Rufus.")
+
+	// Offer to flash it to a USB stick right now via the proven HART flasher
+	// (the steward's "the installer should call the flasher" — no manual dd /
+	// Etcher / Rufus dance). Interactive only; --yes never auto-erases a disk.
+	if !*flagYes {
+		fmt.Print("\nFlash HART OS to a USB stick now? [y/N]: ")
+		var ans string
+		fmt.Scanln(&ans)
+		if ans == "y" || ans == "Y" || ans == "yes" {
+			flashToUSB()
+			return
+		}
+	}
+	fmt.Println("\nTo flash later: re-run this installer and choose option 7 (Flash to USB),")
+	fmt.Println("or manually:")
+	fmt.Printf("  Linux/macOS: sudo dd if=%s of=/dev/sdX bs=4M status=progress\n", dest)
+	fmt.Println("  Windows:     Balena Etcher or Rufus")
+}
+
+// flashToUSB writes HART OS to a removable USB stick by BOOTSTRAPPING the proven,
+// hardened flasher (scripts/hart_usb_flasher.py — a release asset) rather than
+// reimplementing cross-platform raw-disk writing in Go (DRY: the flasher already
+// solved Get-Disk timeouts, the diskpart fallback, the Windows exclusive-handle
+// retry, and the ISO9660 + 0x55AA bootable-signature verify, across Win/macOS/
+// Linux). The Go binary stays dependency-free for every OTHER path; ONLY the flash
+// path needs Python 3 (the flasher's runtime). If Python is absent we print the
+// manual route instead of failing.
+//
+// The flasher itself does the version pick + multi-part download + write + verify,
+// so this needs no pre-downloaded ISO — one tool, one download, fully verified.
+func flashToUSB() {
+	fmt.Println("\n  Flash HART OS to a USB stick")
+
+	py := findPython()
+	if py == "" {
+		fmt.Println("  Python 3 is required to run the HART USB flasher and was not found on PATH.")
+		fmt.Println("  Install Python 3 from https://python.org and re-run, or flash manually:")
+		printManualFlash()
+		return
+	}
+
+	fmt.Println("  Fetching the HART USB flasher...")
+	release, err := getLatestRelease(repoOwner, repoHARTOS)
+	if err != nil {
+		fmt.Printf("  Could not reach the release: %v\n", err)
+		printManualFlash()
+		return
+	}
+	asset := findAsset(release, []string{"hart_usb_flasher.py"})
+	if asset == nil {
+		fmt.Printf("  The flasher is not in release %s.\n", release.TagName)
+		printManualFlash()
+		return
+	}
+	dest := filepath.Join(os.TempDir(), "hart_usb_flasher.py")
+	if err := downloadFile(dest, asset.BrowserDownloadURL); err != nil {
+		fmt.Printf("  Could not download the flasher: %v\n", err)
+		printManualFlash()
+		return
+	}
+
+	// Launch the flasher's GUI: it lists removable disks, picks the variant, and
+	// writes + verifies with a progress bar. Inherit stdio so its prompts + the
+	// destructive-write confirmation reach the user. If the GUI can't open (no
+	// tkinter) the flasher prints its own CLI hint.
+	fmt.Println("  Launching the HART USB flasher (pick your USB stick + variant)...")
+	cmd := exec.Command(py, dest, "--gui")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("  The flasher exited: %v\n", err)
+		fmt.Printf("  You can also run it directly:  %s %s --list\n", py, dest)
+		printManualFlash()
+		return
+	}
+	fmt.Println("  Done. If the flash verified, the stick is bootable.")
+}
+
+// findPython returns the first python 3 interpreter on PATH (python3, then python,
+// then the Windows `py` launcher), or "" if none is found.
+func findPython() string {
+	for _, c := range []string{"python3", "python", "py"} {
+		if p, err := exec.LookPath(c); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// printManualFlash is the fallback when the flasher can't run (no Python / no net).
+func printManualFlash() {
+	fmt.Println("  Manual flash:")
+	fmt.Println("    Linux/macOS: sudo dd if=<hart-os.iso> of=/dev/sdX bs=4M status=progress")
+	fmt.Println("    Windows:     Balena Etcher or Rufus")
+	fmt.Println("    Flasher:     https://github.com/hertz-ai/HARTOS/releases (hart_usb_flasher.py)")
 }
 
 // installDocker is the workflow-driven server-deploy path.  It pulls the

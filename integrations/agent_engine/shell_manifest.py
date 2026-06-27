@@ -340,6 +340,11 @@ SYSTEM_PANELS = {
         'group': 'System', 'default_size': [600, 400],
         'apis': ['/api/shell/display'],
     },
+    'flash': {
+        'title': 'Flash HART OS to USB', 'icon': 'usb',
+        'group': 'System', 'default_size': [640, 580],
+        'apis': ['/api/shell/flash/disks'],
+    },
     'remote_desktop': {
         'title': 'Remote Desktop', 'icon': 'connected_tv',
         'group': 'System', 'default_size': [800, 600],
