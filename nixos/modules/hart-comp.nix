@@ -28,16 +28,17 @@
 #   with the latch written. Nothing here flips defaultSession; this module only
 #   ADDS a greeter-selectable session + the supervisor's Tier-1 rung.
 #
-# STATUS: AUTHORED ON A WINDOWS DEV BOX — NOT BUILT/BOOTED HERE.
-#   No Rust/Wayland/KMS build can run on Windows. compositor/ is a COMPILE-PENDING
-#   skeleton (see compositor/src/main.rs). This Nix expression is authored +
-#   structurally validated (test_nixos_configs.py + the Phase-3 source-guard); the
-#   real `nix build` + paint proof + GBM-fail-to-pixman + crash-loop-to-cage are
-#   ALL VM/CI-pending (Linux nixosTest on llvmpipe, or local QEMU-KVM). Per the
-#   ROADMAP "Honest hardware limit": no compositor source is authored ahead of CI
-#   beyond this clearly-marked skeleton, and this module is NOT added to the shared
-#   flake hartModules[] yet (that addition + the providedSessions registration is
-#   the Phase-3 CI bring-up step, gated on the build resolving).
+# STATUS: the smithay/DRM compositor is REAL + Nix-built (the smithay build runs in
+#   CI, not on this Windows dev box — no Wayland/KMS here).
+#   compositor/ BUILDS in Nix/CI (M9 green; hart-comp.nix sets buildFeatures =
+#   ["smithay"]) and its pixman software-DRM scanout is VM-PROVEN (a virgl-QEMU
+#   scanout PNG exists). On the Windows dev box the smithay path cannot build, so it
+#   is authored + structurally validated here (test_nixos_configs.py + the Phase-3
+#   source-guard) and compiled in CI. What is still PENDING: real-HARDWARE paint on
+#   the target GPU (GBM-fail-to-pixman + crash-loop-to-cage on a real panel), proven
+#   via the boot-journal loop. The module IS wired into the flake (providedSessions
+#   + the supervisor's Tier-1 rung); cage stays the never-fail floor until real-HW
+#   paint is proven.
 #
 # DRY / no-parallel-path:
 #   - REUSES the SAME software-GL hardening contract as cage Tier-3 + sway Tier-2
@@ -54,7 +55,7 @@ let
   ui = config.hart.liquidUI;
   comp = config.hart.comp;
 
-  # The compositor crate lives at <repo-root>/compositor (the Smithay skeleton).
+  # The compositor crate lives at <repo-root>/compositor (the Smithay compositor).
   compositorSrc = hartSrc + "/compositor";
 
   # ── Newer Rust (≥1.85) for the edition2024 Smithay manifest ──
@@ -343,8 +344,8 @@ in
     enable = lib.mkEnableOption ''
       HART OS HART-comp: the AI-native Smithay/Rust Tier-1 compositor that owns the
       window tree + exposes com.hart.Compositor so agents own window placement.
-      OPT-IN, default OFF; compile-pending skeleton (compositor/), VM-proof
-      required before it can become default. Does NOT flip defaultSession — cage
+      OPT-IN, default OFF; the compositor builds in Nix/CI + is VM-proven, real-HW
+      paint proof required before it can become default. Does NOT flip defaultSession — cage
       stays the floor; this only registers a greeter-selectable session + the
       supervisor's Tier-1 rung.
     '';
@@ -419,7 +420,7 @@ in
 
       # com.hart.Compositor D-Bus policy (the IPC the brain's HartWmClient drives in
       # Phase 6). Declared so the bus name is reserved + the policy is in place when
-      # the IPC server lands; the SKELETON does not yet claim it (no server running).
+      # the IPC server lands; the feature-off build does not yet claim it (no server running).
       # The fail-closed guardrail/circuit-breaker/audit/rate-cap gate lives
       # BRAIN-SIDE (agent_ui_update, Phase 2/6), NOT in this policy file.
       services.dbus.packages = [

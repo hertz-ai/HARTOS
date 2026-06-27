@@ -167,8 +167,9 @@ class TestRustPrecedent:
         assert "inputs.rust-overlay" not in src
         assert "rustChannelOf" not in src  # rust-overlay's signature fn
         assert "fenix.packages" not in src
-        # And the toolchain comes from the stock pkgs.rustPlatform.
-        assert "pkgs.rustPlatform.buildRustPackage" in src
+        # And the toolchain comes from the stock rustPlatform.buildRustPackage
+        # (hartRustPlatform = the pinned-nixpkgs rustPlatform; no rust-overlay/fenix).
+        assert "buildRustPackage" in src
 
     def test_marked_not_built_on_windows(self, src):
         low = src.lower()
@@ -236,7 +237,9 @@ class TestHartComp:
     def test_marked_compile_pending_not_built_on_windows(self, src):
         low = src.lower()
         assert "windows dev box" in low
-        assert "compile-pending" in low or "skeleton" in low
+        # Honest marking: the smithay path is real + Nix-built + VM-proven, with
+        # real-hardware paint still pending (no longer "the whole thing is a skeleton").
+        assert "vm-proven" in low or "real-hw" in low or "real-hardware" in low
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -295,9 +298,13 @@ class TestCompositorSkeleton:
 
     def test_honestly_marked_compile_pending_and_todo(self, main_rs):
         low = main_rs.lower()
-        assert "compile-pending" in low or "compile_pending" in low
-        assert "todo" in low  # real handler bodies are todo!()/stub
-        # The event loop is explicitly NOT started on the skeleton.
+        # The smithay DRM path is REAL + Nix-built + VM-proven; only the feature-off
+        # dev-box fallback is a stub. Assert the CURRENT honest markers (not the old
+        # "the whole thing is compile-pending" claim), plus the still-true fallback
+        # words (todo!() shims + an unstarted loop on the feature-off build).
+        assert "vm-proven" in low or "real-hardware" in low or "real hardware" in low
+        assert "todo" in low  # the feature-off fallback handler bodies are todo!()/stub
+        # The event loop is explicitly NOT started on the feature-off fallback.
         assert "not started" in low or "NOT started" in main_rs
 
     def test_has_rust_unit_test_floor(self, main_rs):

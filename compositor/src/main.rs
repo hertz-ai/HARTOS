@@ -1,13 +1,20 @@
 // ════════════════════════════════════════════════════════════════════════════
-// HART-comp — HART OS AI-native Wayland compositor (Smithay) — PHASE-3 SKELETON
-//                                                            + PHASE-5 WINDOW DRAFT
+// HART-comp — HART OS AI-native Wayland compositor (Smithay) — REAL DRM/PIXMAN
+//                                                            + PHASE-5 WINDOWS
 // ════════════════════════════════════════════════════════════════════════════
 //
-// ⚠️  STATUS: COMPILE-PENDING SKELETON — authored on a Windows dev box where no
-//     Wayland/KMS/Smithay build can run. The Smithay HANDLER BODIES below are
-//     NOT compiled or booted yet. Every paint, DRM scanout, libinput seat,
-//     layer-shell mount, AND xdg-shell/XWayland toplevel map is VM-pending
-//     (CI nixosTest on an llvmpipe software-GL VM, or local QEMU-KVM).
+// ⚠️  STATUS: REAL Smithay compositor — BUILDS IN NIX/CI (M9 green) + VM-PROVEN.
+//     The smithay DRM/pixman software-scanout path (src/wayland.rs + src/udev.rs,
+//     `--features smithay`) is a real ~8400-line compositor that COMPILES under
+//     `nix build .#…hart.comp.package` and whose pixman KMS scanout is VM-PROVEN
+//     (a real virgl-QEMU scanout PNG exists — M9 + the integration milestone).
+//     Real-HARDWARE paint on the target GPU is STILL BEING VERIFIED (the flash's
+//     job — the dev box has no DRM device). What remains a true placeholder is the
+//     feature-OFF pure-logic fallback in THIS file (`main.rs` with neither `winit`
+//     nor `smithay` on): its Smithay handler shims are `todo!()` and its event
+//     loop is NOT started — that fallback is all the Windows dev box compiles, by
+//     design, so the never-fail render-path + no-phantom-window invariants get a
+//     behavioural unit floor even where Smithay cannot link.
 //     See ../docs/architecture/HART_OS_NATIVE_ARCHITECTURE.md §L1 + §5.4 +
 //     ./ROADMAP.md Phase 3 + Phase 5, and the honest hardware limit in
 //     ROADMAP §"Honest hardware limit".
@@ -28,20 +35,29 @@
 //     above, so the map→handle / no-map→no-handle invariant is exercised by unit
 //     tests TODAY and the Smithay wiring is the only VM bring-up left.
 //
-// WHY THIS IS A SKELETON, NOT THE COMPOSITOR:
-//   The ROADMAP ordering invariant is sway-as-Tier-1-NOW, Smithay-as-later-moat.
-//   OS-native agent windowing ships TODAY via nixos/modules/hart-sway-tier1.nix
-//   (sway + swaymsg shim — and the brain-side HartWmClient already drives it,
-//   integrations/agent_engine/hart_wm_client.py, LIVE-verified in WSL sway). This
-//   file is the eventual first-party compositor that will own the agent-driven
-//   window tree + the com.hart.Compositor IPC (the moat GNOME/Copilot cannot
-//   match: an AI that owns window-PLACEMENT POLICY). It stays a tinywl-class
-//   scaffold so the FIRST Rust-in-Nix build is bring-up-proven on llvmpipe before
-//   real window management is wired.
+// WHAT THIS main.rs IS (vs the real Smithay handler bodies):
+//   The REAL compositor lives in src/wayland.rs (DRM, `--features smithay`),
+//   src/udev.rs (KMS scanout + libinput seat), src/winit.rs (the WSL/WSLg dev
+//   backend, `--features winit`), and the backend-AGNOSTIC brain in
+//   src/comp_core.rs + src/ipc.rs + src/screencopy.rs. Those BUILD: M9 is green
+//   (`nix build .#…hart.comp.package` with `buildFeatures = ["smithay"]`), and the
+//   pixman DRM scanout is VM-PROVEN (virgl-QEMU PNG). The ROADMAP ordering
+//   invariant is sway-as-Tier-1-NOW, Smithay-HART-comp-as-the-deeper-moat: OS-
+//   native agent windowing also ships TODAY via nixos/modules/hart-sway-tier1.nix
+//   (sway + swaymsg shim — the brain-side HartWmClient already drives it,
+//   integrations/agent_engine/hart_wm_client.py, LIVE-verified in WSL sway).
+//   This file's job in the REAL build is the boot entrypoint + the typed never-
+//   fail render-path decision + the Phase-5 window bookkeeping (handle minting,
+//   the manifest↔toplevel map, the no-phantom-window SummonApp state machine) that
+//   the real backends drive.
 //
-// EVERY real Smithay handler body below is `todo!()` / a stub returning the
-// honest "not wired yet" — so a reviewer can never mistake the scaffold for a
-// working compositor, and CI compiles the SHAPE before the behavior lands.
+// THE ONE PART THAT IS STILL A PLACEHOLDER is the feature-OFF fallback compiled on
+// the Windows dev box (neither `winit` nor `smithay`): there the Smithay handler
+// shims below are `todo!()` and the event loop is NOT started — they are the honest
+// "not wired in the feature-off floor", kept so a reader of the always-compiled
+// dev-box crate is never misled, and so the pure-logic invariants have a unit floor
+// even where Smithay cannot link. With a feature ON, the real bodies in
+// wayland.rs/udev.rs/winit.rs replace them.
 
 // `deny` (not `forbid`) for ONE audited exception: M6's zwlr_screencopy read-back must
 // memcpy the framebuffer into the client's shm `wl_buffer`, whose mapping Smithay hands
@@ -99,7 +115,7 @@ mod udev;
 
 // ── Milestone 1: the REAL running compositor (winit backend, WSL/WSLg) ──
 // Gated behind the DISTINCT `winit` cargo feature (parallel to the DRM `wayland`
-// module, NOT to the always-compiled skeleton). On the Windows dev box neither
+// module, NOT to the always-compiled pure-logic floor). On the Windows dev box neither
 // `winit` nor `smithay` is on, so this module is NOT compiled and the pure-logic
 // floor + `#[cfg(test)]` below stay green. `cargo build --features winit` (in WSL,
 // nested in WSLg) compiles + RUNS it. See src/winit.rs for the full rationale.
@@ -129,7 +145,7 @@ mod screencopy;
 // They are commented at module scope intentionally — uncommenting + filling the
 // handler bodies is the Phase-3/Phase-5 CI bring-up work, done where Smithay can
 // compile. Keeping them as a documented manifest (not live imports) means the
-// skeleton's `cargo check` surface stays minimal while the intent is explicit.
+// feature-OFF `cargo check` surface stays minimal while the intent is explicit.
 //
 //   // ── Phase 3: backend + render + shell mount ──
 //   use smithay::backend::drm::{DrmDevice, DrmNode};
@@ -277,7 +293,7 @@ fn select_render_path(cfg: &BootConfig) -> RenderPath {
 // Each item below is `#[allow(dead_code)]` for the SAME reason as the Smithay
 // handler stubs: it is reachable from the `#[cfg(test)]` floor (which proves the
 // invariants TODAY) and from the CI-compiled Smithay handlers (`on_map`/`on_unmap`
-// callers), but NOT yet from the skeleton `main` (the event loop is unstarted). The
+// callers), but NOT yet from the feature-OFF `main` (its event loop is unstarted). The
 // allow is per-item so dead-code detection stays LIVE for the rest of the crate;
 // the reads/calls land the moment the Smithay event loop is wired in CI.
 
@@ -702,8 +718,9 @@ fn on_foreign_toplevel_sync(_registry: &WindowRegistry) {
 /// EGL) renderer to the DRM framebuffer and clears to HART_SPLASH_RGBA before any
 /// client maps, so there is no flash-of-black while the glass shell boots.
 ///
-/// SKELETON: logs intent only. The real body is Phase-3 CI work (needs a DRM
-/// framebuffer that does not exist on Windows).
+/// FEATURE-OFF FALLBACK: logs intent only. The real body lives in the `winit`/
+/// `smithay` builds (which paint for real — the smithay path builds in Nix/CI +
+/// is VM-scanout-proven); this no-feature stand-in needs no DRM framebuffer.
 fn paint_splash_clear(path: RenderPath) {
     tracing::info!(
         ?path,
@@ -721,10 +738,11 @@ fn paint_splash_clear(path: RenderPath) {
 /// render_desktop_shell + /shell/static. Native toplevels (Phase 5) sit ABOVE it;
 /// A2UI/orb overlays (Phase 4 z-order decision) sit above those.
 ///
-/// SKELETON: records the mount intent. The real body initializes
-/// WlrLayerShellState and waits for the shell's layer surface to map, keying boot
-/// health on a REAL /shell/static fetch (dead-husk-aware, the f294f52 lesson),
-/// NOT on inline render. That fetch + paint proof is the Phase-3/4 nixosTest gate.
+/// FEATURE-OFF FALLBACK: records the mount intent. The real body (the `winit`/
+/// `smithay` builds) initializes WlrLayerShellState and waits for the shell's layer
+/// surface to map, keying boot health on a REAL /shell/static fetch (dead-husk-
+/// aware, the f294f52 lesson), NOT on inline render. That fetch + paint proof is
+/// the nixosTest gate; the smithay scanout path is VM-proven.
 fn mount_glass_shell_layer() {
     tracing::info!(
         "TODO[phase3-vm]: mount glass shell as wlr-layer-shell BACKGROUND surface \
@@ -737,20 +755,25 @@ fn mount_glass_shell_layer() {
     //   window before declaring the compositor healthy.
 }
 
-/// The compositor event loop. SKELETON: builds a calloop loop, paints the splash
-/// clear, registers the layer-shell mount point, and idles. The real loop drives
-/// DRM page-flips, libinput events, the Wayland display dispatch, the xdg-shell /
-/// XWayland toplevel maps (Phase 5, feeding `WindowRegistry`), and the
-/// com.hart.Compositor IPC server (Phase 6). Nothing destructive happens here yet.
+/// The compositor event loop. With a backend feature ON this DELEGATES to the REAL
+/// loop: `--features smithay` + `--backend drm` → `udev::run_udev` (KMS scanout +
+/// libinput seat on the PixmanRenderer software floor — builds in Nix/CI, VM-
+/// scanout-proven); `--features winit` → `winit::run_winit` (WSL/WSLg). That real
+/// loop drives DRM page-flips, libinput events, the Wayland display dispatch, the
+/// xdg-shell / XWayland toplevel maps (Phase 5, feeding `WindowRegistry`), and the
+/// com.hart.Compositor IPC server (Phase 6). The feature-OFF fallback at the bottom
+/// (neither feature — the Windows dev-box build) does NOT start a loop; it only
+/// exercises the typed render-path + window-bookkeeping invariants and returns.
 fn run_event_loop(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     // ── Milestone 7: when built with the `smithay` (DRM) feature AND asked for the
     // DRM backend, run the REAL-HARDWARE compositor (KMS scanout + libinput seat on
     // the PixmanRenderer software floor). This is the never-fail boot path the
     // hart-comp.nix session + the B4 supervisor's Tier-1 rung drive. It cannot RUN on
     // a box with no DRM device (WSL/dev) — there it errors honestly and the supervisor
-    // drops to sway/cage — but it COMPILES here, which is the M7 proof for the DRM
-    // path. `--backend winit` on a smithay build still falls through to the skeleton
-    // floor below (winit needs the distinct `winit` feature's GlesRenderer).
+    // drops to sway/cage — but it BUILDS in Nix/CI (M9 green) and its pixman scanout is
+    // VM-proven, which is the real-HW proof short of the target-GPU flash. `--backend
+    // winit` on a smithay build still falls through to the feature-OFF pure-logic floor
+    // below (winit needs the distinct `winit` feature's GlesRenderer).
     #[cfg(feature = "smithay")]
     {
         if cfg.backend == Backend::Drm {
@@ -759,11 +782,11 @@ fn run_event_loop(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Milestone 1: when built with the `winit` feature, run the REAL compositor
-    // (winit backend, nested in WSLg). This is no longer a skeleton on that build —
-    // it boots the event loop, creates a wayland-N socket, and paints clients. The
-    // pure-logic skeleton below remains the feature-OFF fallback so the dev-box
-    // build (no Wayland/Smithay) stays green. `--backend drm` is reserved for the
-    // DRM path (src/udev.rs); on a winit-only build we always run winit.
+    // (winit backend, nested in WSLg). On that build it boots the event loop, creates
+    // a wayland-N socket, and paints clients. The pure-logic fallback below remains the
+    // feature-OFF path so the dev-box build (no Wayland/Smithay) stays green. `--backend
+    // drm` is reserved for the DRM path (src/udev.rs); on a winit-only build we always
+    // run winit.
     #[cfg(feature = "winit")]
     {
         return winit::run_winit(cfg);
@@ -781,20 +804,22 @@ fn run_event_loop(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
 
         // 3. Phase-5 native-window tree (the manifest↔toplevel map). Constructed
         //    here so the real loop's xdg-shell / XWayland map handlers feed it; the
-        //    skeleton only proves it constructs (the behavior is unit-tested below).
+        //    feature-OFF fallback only proves it constructs (unit-tested below).
         let _windows = WindowRegistry::new();
 
-        // 4. SKELETON stand-in: the loop is not started (there is no Wayland socket
-        //    on Windows). We log readiness and return so `cargo check` proves the
-        //    SHAPE. The REAL loop is src/winit.rs (winit, built `--features winit`)
-        //    and src/wayland.rs (DRM, `--features smithay`).
+        // 4. Feature-OFF fallback stand-in: the event loop is NOT started (this build
+        //    has no backend linked — no Wayland socket). We log readiness and return so
+        //    `cargo check` proves the SHAPE. The REAL loop is src/winit.rs (winit, built
+        //    `--features winit`) and src/wayland.rs + src/udev.rs (DRM, `--features
+        //    smithay` — builds in Nix/CI, VM-scanout-proven).
         tracing::info!(
             ?path,
-            "HART-comp skeleton initialized (event loop NOT started — feature-OFF floor; \
-             build --features winit to RUN the real compositor)"
+            "HART-comp feature-OFF fallback initialized (event loop NOT started — no \
+             backend linked; build --features smithay for the real DRM compositor or \
+             --features winit to RUN it nested in WSL)"
         );
 
-        // A real run would block here. The skeleton returns immediately; the integer
+        // A real run would block here. The feature-off fallback returns immediately; the integer
         // below documents the intended idle tick the real loop uses for housekeeping.
         let _idle_tick = Duration::from_millis(16); // ~60fps housekeeping cadence
         Ok(())
@@ -809,28 +834,40 @@ fn main() {
         )
         .init();
 
+    // NOTE: the REAL compositor is this same binary built `--features smithay`
+    // (DRM/pixman, M9-green in Nix/CI + VM-scanout-proven) or `--features winit`
+    // (WSL); the Nix session launcher (hart-comp.nix) runs the `--features smithay`
+    // build with `--backend drm`. With NEITHER feature compiled, run_event_loop hits
+    // the pure-logic FALLBACK that does not start a Wayland loop (no backend linked).
+    // The warning below is written to be true on BOTH builds and to NOT mislead a
+    // reader into thinking the compositor is unbuilt (the M9 build proves otherwise).
     tracing::warn!(
-        "HART-comp is a COMPILE-PENDING Phase-3 skeleton (+ Phase-5 window-bookkeeping \
-         draft). OS-native windowing ships TODAY via sway Tier-1 (hart-sway-tier1.nix). \
-         This binary is opt-in only; defaultSession stays cage until the software-render \
-         path is VM-proven."
+        "HART-comp: OS-native windowing ships TODAY via sway Tier-1 \
+         (hart-sway-tier1.nix); HART-comp itself is opt-in. The REAL HART-comp is the \
+         `--features smithay` DRM/pixman build (builds in Nix/CI, VM-scanout-proven) — \
+         the Nix session runs it with `--backend drm`; a NO-feature build of this binary \
+         is only the pure-logic fallback (no event loop). defaultSession stays cage until \
+         the software-render path is real-hardware-proven on the target GPU (VM scanout \
+         already proven)."
     );
 
     let cfg = BootConfig::from_args();
     if let Err(e) = run_event_loop(&cfg) {
-        tracing::error!(error = %e, "HART-comp skeleton failed to initialize");
+        tracing::error!(error = %e, "HART-comp failed to initialize");
         std::process::exit(1);
     }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Skeleton-only tests: prove the PURE decision logic (render-path selection +
-// boot-config parsing) AND the Phase-5 window-bookkeeping invariants (handle
-// minting only on map, manifest↔toplevel map, the no-phantom-window SummonApp
-// state machine) WITHOUT any Wayland/DRM dependency, so even the skeleton has a
-// behavioural unit floor that CI can run the moment Smithay compiles. Real
-// paint/scanout/toplevel-map proof remains VM-only (the Smithay handler bodies
-// above are todo!() until then).
+// Pure-logic tests (feature-INDEPENDENT — they run on the default dev-box build):
+// prove the PURE decision logic (render-path selection + boot-config parsing) AND
+// the Phase-5 window-bookkeeping invariants (handle minting only on map,
+// manifest↔toplevel map, the no-phantom-window SummonApp state machine) WITHOUT any
+// Wayland/DRM dependency, so the behavioural floor runs even where Smithay cannot
+// link. The REAL Smithay paint/scanout/toplevel-map path (wayland.rs/udev.rs)
+// builds in Nix/CI (M9 green) and is VM-scanout-proven; real-HARDWARE paint on the
+// target GPU is still being verified. The feature-OFF shims below are the one part
+// still todo!() — by design, the dev-box fallback.
 // ────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
