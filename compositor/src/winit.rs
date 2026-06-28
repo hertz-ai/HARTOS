@@ -503,6 +503,15 @@ impl CompositorHandler for State {
             }
         }
         ensure_initial_configure(self, surface);
+
+        // #134 keyboard-focus-on-map (parity with the DRM/wayland.rs commit handler): once
+        // the desktop glass shell has mapped (committed a buffer), give it the keyboard if
+        // nothing else is focused, so the shell is typeable WITHOUT a click. No-op for
+        // non-layer/unmapped surfaces and whenever a toplevel already holds focus.
+        if surface_has_buffer(surface) {
+            let serial = SERIAL_COUNTER.next_serial();
+            comp_core::focus_desktop_shell_if_idle(self, surface, serial);
+        }
     }
 }
 

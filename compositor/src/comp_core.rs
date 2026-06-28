@@ -73,13 +73,13 @@ use smithay::backend::renderer::{
 use smithay::backend::renderer::{Color32F, Frame, RendererSuper, utils::draw_render_elements};
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-    KeyState, Keycode, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+    KeyState, Keycode, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
 use smithay::desktop::{Space, Window, WindowSurfaceType, layer_map_for_output};
 use smithay::input::{
     SeatHandler,
     keyboard::{FilterResult, Keysym, ModifiersState, keysyms as xkb},
-    pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent},
+    pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, RelativeMotionEvent},
 };
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -489,9 +489,30 @@ pub fn update_keyboard_focus<S: CompState>(state: &mut S, pos: Point<f64, Logica
 
     let output = state.output().clone();
     let layers = layer_map_for_output(&output);
+    // Overlay / Top layer surfaces (panels, popups) win the click over the desktop.
     if let Some(layer) = layers
         .layer_under(WlrLayer::Overlay, pos)
         .or_else(|| layers.layer_under(WlrLayer::Top, pos))
+    {
+        if layer.can_receive_keyboard_focus() {
+            let layer_loc = layers.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
+            if layer
+                .surface_under(pos - layer_loc.to_f64(), WindowSurfaceType::ALL)
+                .is_some()
+            {
+                keyboard.set_focus(state, Some(layer.wl_surface().clone()), serial);
+                return;
+            }
+        }
+    }
+    // #134 — Bottom / Background fallback: a click on the desktop glass shell (a BACKGROUND
+    // wlr-layer-shell surface with OnDemand keyboard interactivity) re-focuses it once
+    // focus has drifted to a toplevel, so the user can always type back into the shell.
+    // Mirrors anvil's `update_keyboard_focus` Bottom/Background tail (a parity gap before
+    // this). Reached only when no toplevel and no Overlay/Top surface was under the click.
+    if let Some(layer) = layers
+        .layer_under(WlrLayer::Bottom, pos)
+        .or_else(|| layers.layer_under(WlrLayer::Background, pos))
     {
         if layer.can_receive_keyboard_focus() {
             let layer_loc = layers.layer_geometry(layer).map(|g| g.loc).unwrap_or_default();
@@ -505,15 +526,78 @@ pub fn update_keyboard_focus<S: CompState>(state: &mut S, pos: Point<f64, Logica
     }
 }
 
-/// Route a single input event into the seat. Trimmed to the events the backends emit
-/// (keyboard, absolute pointer motion, button, axis). M6 screen kill-switch: while the
-/// human has cut `screen`, do NOT forward ANY input to clients.
+/// THE #134 keyboard-focus-on-map for the desktop glass shell. The HART glass shell maps
+/// as a BACKGROUND wlr-layer-shell surface with `OnDemand` keyboard interactivity, so on a
+/// fresh boot the compositor never hands it the keyboard: there is no toplevel and no click
+/// yet (and the pointer itself may be a fresh-boot casualty). The result is the #134
+/// symptom's keyboard half — a painted desktop that cannot be typed into. This grants the
+/// keyboard to a committed layer surface that (a) can receive keyboard focus
+/// (Exclusive/OnDemand) and (b) is the mapped layer surface for `surface`, but ONLY while
+/// nothing else holds focus. That guard makes it safe to call on every commit: it never
+/// steals the keyboard from a focused toplevel, and it naturally re-homes focus to the
+/// desktop whenever a toplevel closes and leaves focus idle (smithay clears focus when the
+/// focused surface dies). Idempotent — once focus is set, `current_focus().is_some()` makes
+/// every later call a single cheap check. Returns whether focus was granted (the test seam).
+pub fn focus_desktop_shell_if_idle<S: CompState>(
+    state: &mut S,
+    surface: &WlSurface,
+    serial: Serial,
+) -> bool {
+    // Never steal focus from a focused toplevel / an already-focused shell.
+    if state.keyboard().current_focus().is_some() {
+        return false;
+    }
+    let output = state.output().clone();
+    // Resolve the MAPPED layer surface for this committed wl_surface (TOPLEVEL role only —
+    // a subsurface/popup commit returns None and is ignored). Clone it so the LayerMap
+    // borrow is dropped before `set_focus` re-borrows `state`.
+    let layer = {
+        let map = layer_map_for_output(&output);
+        map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL).cloned()
+    };
+    let layer = match layer {
+        Some(l) => l,
+        None => return false,
+    };
+    if !layer.can_receive_keyboard_focus() {
+        return false;
+    }
+    let keyboard = state.keyboard().clone();
+    keyboard.set_focus(state, Some(surface.clone()), serial);
+    true
+}
+
+/// Route a single input event into the seat. Handles the events BOTH backends emit:
+/// keyboard, RELATIVE pointer motion (real-HW touchpad/mouse via libinput), ABSOLUTE
+/// pointer motion (winit/tablet), button, axis. M6 screen kill-switch: while the human
+/// has cut `screen`, do NOT forward ANY input to clients.
+///
+/// #134 — the `PointerMotion` (relative) arm is THE real-hardware pointer fix: libinput
+/// emits relative motion for touchpads + mice, and before this arm existed every such
+/// event hit the `_ => {}` sink, so the cursor was frozen at (0,0) on a real boot while
+/// the shell still painted. The winit backend only ever emits the absolute variant, so a
+/// winit-only test could never surface the regression (the gap the #134 symptom exposed).
 pub fn process_input_event<S: CompState, B: InputBackend>(state: &mut S, event: InputEvent<B>) {
+    // #134/#128 observability — the FIRST real seat event (pointer OR keyboard) proves the
+    // libinput → Seat delivery path is live. A painted-but-input-dead Tier-1 is invisible
+    // to the paint-only watchdog (it reads HEALTHY off the shell-ready marker), so emit a
+    // one-shot liveness signal here. Done BEFORE the kill-switch gate: a delivered-then-
+    // blocked event still proves the seat is alive. Matches by reference so `event` is not
+    // consumed before the real routing below.
+    match &event {
+        InputEvent::Keyboard { .. }
+        | InputEvent::PointerMotion { .. }
+        | InputEvent::PointerMotionAbsolute { .. }
+        | InputEvent::PointerButton { .. }
+        | InputEvent::PointerAxis { .. } => note_input_alive(),
+        _ => {}
+    }
     if state.capture_blocked() {
         return;
     }
     match event {
         InputEvent::Keyboard { event } => on_keyboard_key::<S, B>(state, event),
+        InputEvent::PointerMotion { event } => on_pointer_move_relative::<S, B>(state, event),
         InputEvent::PointerMotionAbsolute { event } => {
             on_pointer_move_absolute::<S, B>(state, event)
         }
@@ -521,6 +605,24 @@ pub fn process_input_event<S: CompState, B: InputBackend>(state: &mut S, event: 
         InputEvent::PointerAxis { event } => on_pointer_axis::<S, B>(state, event),
         _ => {}
     }
+}
+
+/// One-shot input-liveness beacon (#134/#128). On the FIRST real pointer/keyboard event,
+/// log a journal line and best-effort touch `/run/hart/session/input-alive` — the marker
+/// the out-of-process session supervisor / HARTLOG can later read to tell a
+/// painted-but-input-starved boot (HEALTHY paint, dead seat) apart from a working desktop,
+/// and drop a tier next time. The flag is a single relaxed atomic: the marker write fires
+/// exactly once and every later event is one atomic load. The file write is best-effort
+/// (a missing `/run/hart/session` dir on the dev box, or a read-only FS, just leaves the
+/// journal line as the signal); it never blocks and never aborts the compositor.
+fn note_input_alive() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static INPUT_SEEN: AtomicBool = AtomicBool::new(false);
+    if INPUT_SEEN.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    info!("hart-comp: first seat input delivered — libinput/Seat path is LIVE (#134 liveness beacon)");
+    let _ = std::fs::write("/run/hart/session/input-alive", b"1\n");
 }
 
 /// Intercept compositor keyboard shortcuts BEFORE forwarding to the focused client;
@@ -895,6 +997,72 @@ pub fn toggle_show_desktop<S: CompState>(state: &mut S) {
 }
 
 // ── pointer routing ──
+
+/// Advance a pointer location by a relative `delta` and clamp it inside the output rect,
+/// so a touchpad/mouse relative-motion event can never push the cursor outside the
+/// framebuffer. PURE geometry (no Seat, no surface hit-test) — the ONE clamp both the
+/// relative-motion router and its unit tests call (no parallel path). Mirrors anvil's
+/// `clamp_coords` for the single-output case: the cursor may rest exactly on the right/
+/// bottom edge (`[loc, loc+size]`). A degenerate 0-sized output (no real mode latched
+/// yet) is left UNCLAMPED on that axis, so a pre-mode event is not pinned to the origin.
+pub fn advance_and_clamp_pointer(
+    loc: Point<f64, Logical>,
+    delta: Point<f64, Logical>,
+    output_geo: Rectangle<i32, Logical>,
+) -> Point<f64, Logical> {
+    let mut next = loc + delta;
+    let min_x = output_geo.loc.x as f64;
+    let min_y = output_geo.loc.y as f64;
+    let max_x = (output_geo.loc.x + output_geo.size.w) as f64;
+    let max_y = (output_geo.loc.y + output_geo.size.h) as f64;
+    if max_x > min_x {
+        next.x = next.x.clamp(min_x, max_x);
+    }
+    if max_y > min_y {
+        next.y = next.y.clamp(min_y, max_y);
+    }
+    next
+}
+
+/// Route RELATIVE pointer motion — the real-hardware touchpad + mouse path (libinput
+/// emits `InputEvent::PointerMotion`, NOT the absolute variant a winit/tablet device
+/// emits). THE #134 fix: read the current pointer location, add the device delta, clamp
+/// to the output, hit-test the surface under the new position, then send BOTH a
+/// `relative_motion` (for clients using the relative-pointer protocol / active grabs) and
+/// an absolute `motion` (the actual cursor move + enter/leave), plus a `frame`. Mirrors
+/// anvil's `on_pointer_move`, minus the pointer-constraints lock/confine (hart-comp binds
+/// no pointer-constraints global, so there is nothing to honour). Without this arm every
+/// touchpad/mouse motion hit `process_input_event`'s `_ => {}` sink and the cursor stayed
+/// frozen at (0,0) while the shell still painted — the #134 input-dead symptom.
+pub fn on_pointer_move_relative<S: CompState, B: InputBackend>(
+    state: &mut S,
+    evt: B::PointerMotionEvent,
+) {
+    let serial = SERIAL_COUNTER.next_serial();
+    let pointer = state.pointer().clone();
+    let current = pointer.current_location();
+    let pos = match state.space().output_geometry(state.output()) {
+        Some(geo) => advance_and_clamp_pointer(current, evt.delta(), geo),
+        // No output geometry yet (pre-mode): apply the raw delta rather than pin to (0,0).
+        None => current + evt.delta(),
+    };
+    let under = surface_under(state, pos);
+    pointer.relative_motion(
+        state,
+        under.clone(),
+        &RelativeMotionEvent {
+            delta: evt.delta(),
+            delta_unaccel: evt.delta_unaccel(),
+            utime: evt.time(),
+        },
+    );
+    pointer.motion(
+        state,
+        under,
+        &MotionEvent { location: pos, serial, time: evt.time_msec() },
+    );
+    pointer.frame(state);
+}
 
 /// Route absolute pointer motion (window-relative coords) to the surface under the
 /// cursor, then send a pointer frame.
@@ -1684,6 +1852,107 @@ mod tests {
         assert_eq!(r.size.w, 1, "width floors to 1 even on a 0-wide output");
         assert_eq!(r.size.h, 1, "height floors to 1 even on a 0-tall output");
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // advance_and_clamp_pointer — THE #134 relative-motion math. This is the load-
+    // bearing half of the real-hardware pointer fix: `on_pointer_move_relative` reads
+    // `current_location()`, calls THIS to apply the libinput delta + clamp to the
+    // output, then sends the absolute `motion`. A winit-only test never exercised it
+    // (winit emits only ABSOLUTE motion), which is exactly how the frozen-at-(0,0)
+    // regression shipped. These assert the contract a live Seat then forwards.
+    // ════════════════════════════════════════════════════════════════════════
+
+    fn out_geo(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    #[test]
+    fn pointer_relative_delta_advances_the_cursor() {
+        // THE anti-regression: a relative motion MUST move the cursor (the dropped-event
+        // bug left every delta unapplied, pinning the cursor at the origin). An in-bounds
+        // delta from (100,100) lands exactly at (105, 97).
+        let next = advance_and_clamp_pointer(
+            Point::from((100.0, 100.0)),
+            Point::from((5.0, -3.0)),
+            out_geo(0, 0, 1920, 1080),
+        );
+        assert_eq!((next.x, next.y), (105.0, 97.0));
+    }
+
+    #[test]
+    fn pointer_relative_motion_off_the_origin_is_not_pinned() {
+        // The literal #134 symptom guard: starting at (0,0) a positive delta yields a
+        // location that is NO LONGER (0,0) — proving relative motion unfreezes the cursor.
+        let next = advance_and_clamp_pointer(
+            Point::from((0.0, 0.0)),
+            Point::from((12.0, 8.0)),
+            out_geo(0, 0, 1920, 1080),
+        );
+        assert_ne!((next.x, next.y), (0.0, 0.0));
+        assert_eq!((next.x, next.y), (12.0, 8.0));
+    }
+
+    #[test]
+    fn pointer_clamps_to_the_right_and_bottom_edge() {
+        // A big delta near the far corner pins exactly to the output edge (anvil rests the
+        // cursor ON the edge, [loc, loc+size]), never past the framebuffer.
+        let next = advance_and_clamp_pointer(
+            Point::from((1915.0, 1075.0)),
+            Point::from((50.0, 50.0)),
+            out_geo(0, 0, 1920, 1080),
+        );
+        assert_eq!((next.x, next.y), (1920.0, 1080.0));
+    }
+
+    #[test]
+    fn pointer_clamps_to_the_left_and_top_edge() {
+        // A negative delta past the origin pins to (0,0) — the cursor can never go
+        // negative (off the top-left of the framebuffer).
+        let next = advance_and_clamp_pointer(
+            Point::from((5.0, 5.0)),
+            Point::from((-50.0, -50.0)),
+            out_geo(0, 0, 1920, 1080),
+        );
+        assert_eq!((next.x, next.y), (0.0, 0.0));
+    }
+
+    #[test]
+    fn pointer_clamp_honours_a_nonzero_output_origin() {
+        // An inset/multi-monitor output at (100,200): the clamp window is
+        // [100,900]x[200,800], so a far-negative delta pins to the output's own origin,
+        // not to global (0,0).
+        let geo = out_geo(100, 200, 800, 600);
+        let pinned = advance_and_clamp_pointer(
+            Point::from((110.0, 210.0)),
+            Point::from((-500.0, -500.0)),
+            geo,
+        );
+        assert_eq!((pinned.x, pinned.y), (100.0, 200.0));
+        let far = advance_and_clamp_pointer(
+            Point::from((850.0, 750.0)),
+            Point::from((500.0, 500.0)),
+            geo,
+        );
+        assert_eq!((far.x, far.y), (900.0, 800.0));
+    }
+
+    #[test]
+    fn pointer_pre_mode_zero_output_applies_the_raw_delta() {
+        // Before a real mode latches the output can be 0-sized; clamping to it would pin
+        // the cursor to the origin forever. The helper leaves a 0-sized axis UNCLAMPED so
+        // motion still flows until the real mode arrives.
+        let next = advance_and_clamp_pointer(
+            Point::from((40.0, 30.0)),
+            Point::from((10.0, 10.0)),
+            out_geo(0, 0, 0, 0),
+        );
+        assert_eq!((next.x, next.y), (50.0, 40.0), "no clamp on a 0-sized output");
+    }
+
+    // NOTE: the keyboard-focus-on-map path (`focus_desktop_shell_if_idle`) and the live
+    // forwarding of a relative `MotionEvent` through the Seat both need a live
+    // Display/Seat/layer-map, so they are exercised on the real-HW boot (the flash) and
+    // the QEMU/winit integration session, not this pure dev-box floor.
 
     // ════════════════════════════════════════════════════════════════════════
     // transform_region — upright-capture region map under the output transform.

@@ -510,15 +510,33 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     //       there is NO auto-recovery, so a device left unprivileged (the real-HW "Unable to
     //       become drm master" startup race) or paused on a VT-away stays black until we
     //       explicitly re-acquire master.
+    //       INPUT across a VT switch / suspend (#134 LATENT, not fresh-boot): a libseat
+    //       PauseSession REVOKES the evdev fds the kernel had handed libinput; libinput then
+    //       reads EBADF forever and delivers NOTHING after a resume unless it is explicitly
+    //       cycled. So on PauseSession we `libinput_context.suspend()` (close the devices)
+    //       and on ActivateSession `libinput_context.resume()` (re-open + re-enumerate every
+    //       device) — exactly anvil's udev seat handling. Without this, the FIRST VT switch
+    //       (Ctrl+Alt+F2 → recovery TTY → back) or lid-close/suspend-resume on the Lenovo
+    //       would leave the pointer + keyboard dead even though the fresh-boot path now works.
+    //       The notifier owns the original `libinput_context` (the LibinputInputBackend holds
+    //       a clone; both refer to the SAME context, so cycling either side affects delivery).
+    let mut session_libinput = libinput_context;
     event_loop
         .handle()
         .insert_source(notifier, move |event, &mut (), state: &mut State| match event {
             SessionEvent::PauseSession => {
-                info!("HART-comp DRM: session paused (VT switch / sleep) — dropping DRM master");
+                info!("HART-comp DRM: session paused (VT switch / sleep) — suspending libinput + dropping DRM master");
+                session_libinput.suspend();
                 state.pending_session_activate = Some(false);
             }
             SessionEvent::ActivateSession => {
-                info!("HART-comp DRM: session resumed — re-acquiring DRM master");
+                info!("HART-comp DRM: session resumed — resuming libinput + re-acquiring DRM master");
+                if session_libinput.resume().is_err() {
+                    // Degrade, never die (#186 floor): a failed libinput resume is logged and
+                    // the next ActivateSession edge retries. We still re-take DRM master so the
+                    // screen comes back; a wedged seat is observable via the input-alive beacon.
+                    warn!("HART-comp DRM: libinput resume failed — input may be degraded until the next session-activate");
+                }
                 state.pending_session_activate = Some(true);
             }
         })

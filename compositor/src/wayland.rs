@@ -997,6 +997,16 @@ impl CompositorHandler for State {
             }
         }
         ensure_initial_configure(self, surface);
+
+        // #134 keyboard-focus-on-map: once the desktop glass shell has actually mapped
+        // (committed a buffer), give it the keyboard if nothing else is focused — so the
+        // user can type on a fresh boot WITHOUT a click (a dead/late pointer must never
+        // make the desktop untypeable). No-op for non-layer surfaces, unmapped surfaces,
+        // and whenever a toplevel already holds focus (it only fires while focus is idle).
+        if surface_has_buffer(surface) {
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            comp_core::focus_desktop_shell_if_idle(self, surface, serial);
+        }
     }
 }
 
