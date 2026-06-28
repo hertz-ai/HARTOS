@@ -88,6 +88,55 @@ let
     pango gdk-pixbuf graphene harfbuzz libsoup_3 cairo
   ]);
 
+  # ── Portal-free private D-Bus session (THE real-HW first-paint fix, 2026-06-28) ──
+  #
+  # ROOT CAUSE of the real-HW boot loop (hart-comp Tier-1 AND sway Tier-2 both
+  # "compositor up, no first paint in 45s -> killed + dropped to cage", even on the
+  # GSK=cairo software floor): GTK4's GtkSettings issues a SYNCHRONOUS
+  # org.freedesktop.portal.Settings.Read('org.freedesktop.appearance','color-scheme')
+  # on the GTK MAIN LOOP during window setup, with D-Bus auto-start allowed. In the
+  # greetd session no xdg-desktop-portal owns org.freedesktop.portal.Desktop, so that
+  # call tries to ACTIVATE the portal and BLOCKS for the full D-Bus activation TIMEOUT
+  # (~25s) because the portal never claims the name -> the GTK main loop is FROZEN ->
+  # the WebView never reaches LoadEvent.FINISHED -> /run/hart/session/shell-ready is
+  # never touched -> the 45s paint-watchdog declares the tier HUNG and drops it
+  # (journal: "Settings portal not found ... StartServiceByName ... Timeout was
+  # reached"). The GTK3 cage floor is structurally immune ONLY because GTK3 issues no
+  # appearance-portal read at all. This is why the hang persisted on cairo: the freeze
+  # is on D-Bus, NOT on GSK/GL or the layer-shell anchor.
+  #
+  # FIX (empirically proven in WSL 2026-06-28, GTK 4.6.9 + WebKit-6.0): run the GTK4
+  # host on a PRIVATE D-Bus session bus with NO activatable services (no <servicedir>
+  # / no <standard_session_servicedirs/>), so the portal name is non-activatable and
+  # GTK's Settings.Read returns ServiceUnknown in MILLISECONDS -> GTK falls back to its
+  # default color-scheme, exactly like the cage GTK3 floor that never reads the portal.
+  # Measured with the (hanging) portal .service STILL present: 27.06s freeze -> 0.51s
+  # first paint. GTK_USE_PORTAL=0 was measured and does NOT help (still 27s) -- the
+  # settings-portal read is not gated by it -- so the private bus is the reliable
+  # lever, not an env toggle. Because this lives in the SHARED hart-glass-shell-gtk4
+  # wrapper it DECOUPLES first-paint from xdg-desktop-portal on BOTH Tier-1 hart-comp
+  # (which starts no portal at all) and Tier-2 sway with one change (DRY). The host
+  # talks to the served shell over HTTP :6800, not D-Bus, so a private bus does not
+  # affect the UI; portal/theme integration for native apps that map ABOVE the desktop
+  # is a separate, deferred concern (they run on the real session bus under sway).
+  noPortalBusConfig = pkgs.writeText "hart-glass-shell-noportal-bus.conf" ''
+    <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+    <busconfig>
+      <type>session</type>
+      <listen>unix:tmpdir=/tmp</listen>
+      <!-- NO servicedir / standard_session_servicedirs: NOTHING is activatable on
+           this bus, so GTK4's startup org.freedesktop.portal.Settings.Read fails FAST
+           with ServiceUnknown instead of blocking on the ~25s portal activation
+           timeout. This mirrors the cage GTK3 floor (which never reads the portal). -->
+      <policy context="default">
+        <allow send_destination="*"/>
+        <allow own="*"/>
+        <allow receive_sender="*"/>
+      </policy>
+      <limit name="max_match_rules_per_connection">4096</limit>
+    </busconfig>
+  '';
+
   # ── The GTK4 layer-shell glass-shell host (Phase-4 L2 host window) ──
   # Mirrors the cage wrapper's URL probe + software-GL hardening (one contract)
   # but hosts the SAME served shell as a GTK4 wlr-layer-shell BACKGROUND surface
@@ -176,7 +225,24 @@ let
     # stays up. The supervisor passes HART_SHELL_READY_FLAG; default to the pinned
     # /run/hart contract path so a bare (supervisor-less) launch is harmless.
     export HART_SHELL_READY_FLAG="''${HART_SHELL_READY_FLAG:-/run/hart/session/shell-ready}"
-    exec ${cfg.package.python}/bin/python -c "
+    # ── DECOUPLE first-paint from xdg-desktop-portal + make RealtimeKit a no-op ──
+    # Run the GTK4 host on the portal-free PRIVATE session bus defined above
+    # (noPortalBusConfig). THIS is the fix for the 2026-06-28 real-HW "compositor up,
+    # no first paint in 45s -> drop to cage" on BOTH hart-comp Tier-1 and sway Tier-2:
+    # GtkSettings' synchronous appearance-portal Read can no longer block on the ~25s
+    # D-Bus activation timeout (it gets an instant ServiceUnknown and falls back to
+    # defaults, like the cage GTK3 floor), so the WebView reaches LoadEvent.FINISHED
+    # and touches shell-ready well within the 45s window (WSL-measured 0.51s vs
+    # 27.06s). --dbus-daemon is pinned to the closure binary so this never depends on
+    # PATH; dbus-run-session inherits ALL of the env exported above
+    # (GSK_RENDERER / GDK_GL / WEBKIT_* / LD_PRELOAD / GI_TYPELIB_PATH / HART_SHELL_*),
+    # so the cairo software floor + the gtk4-layer-shell LD_PRELOAD are unaffected.
+    # RealtimeKit: the "org.freedesktop.RealtimeKit1 was not provided by any .service
+    # file" journal line is a SYSTEM-bus name with no .service file, i.e. an instant
+    # ServiceUnknown fast-fail (WebKit/PipeWire just run at normal priority), NOT a
+    # block -- nothing here waits on it. (security.rtkit.enable, if ever wanted, is a
+    # system-wide desktop.nix concern, outside this host's scope.)
+    exec ${pkgs.dbus}/bin/dbus-run-session --dbus-daemon=${pkgs.dbus}/bin/dbus-daemon --config-file=${noPortalBusConfig} -- ${cfg.package.python}/bin/python -c "
 import gi, os
 gi.require_version('Gtk', '4.0')
 # WebKitGTK 6.0 is the GTK4 binding; the namespace is 'WebKit' (NOT 'WebKit2',
@@ -246,6 +312,12 @@ class GlassShellLayer:
         # loading — the GTK4/WebKit-6.0 load-changed signal mirrors the GTK3 cage
         # floor's. This marks Tier-2 HEALTHY so the paint-watchdog does NOT drop it.
         webview.connect('load-changed', self._on_load_changed)
+        # Diagnostic only (does NOT touch the marker): surface WHY a load failed to
+        # the journal so a real-HW boot shows the reason instead of a silent blank.
+        # The first-paint marker still fires solely on LoadEvent.FINISHED (which
+        # WebKit emits even after a failed load), keeping the watchdog contract
+        # byte-identical to the cage GTK3 floor.
+        webview.connect('load-failed', self._on_load_failed)
         webview.load_uri(SHELL_URL)
         s = webview.get_settings()
         s.set_enable_javascript(True)
@@ -311,6 +383,22 @@ class GlassShellLayer:
             _signal_painted()
             self._webview.grab_focus()
 
+    def _on_load_failed(self, _webview, _event, failing_uri, error):
+        # Journal-only diagnostic so a real-HW boot shows the load-failure reason
+        # (connection refused while :6800 is still coming up, TLS, etc.) instead of a
+        # silent blank surface. Deliberately does NOT touch the shell-ready marker:
+        # WebKit still emits load-changed FINISHED after a failed load, so the marker
+        # fires there (same signal, same path as the cage floor). Returning False
+        # lets WebKit show its default error page (never raises out of the handler).
+        import sys
+        try:
+            detail = getattr(error, 'message', None) or str(error)
+            print('[hart-glass-shell-gtk4] load-failed', failing_uri, detail,
+                  file=sys.stderr)
+        except Exception:
+            pass
+        return False
+
     def _on_realize(self, _widget):
         # The surface now has a backing GdkSurface, the earliest point a
         # grab_focus() can stick. Pairs with KeyboardMode.ON_DEMAND so the shell
@@ -360,13 +448,13 @@ app.run(None)
   sessionLauncher = pkgs.writeShellScriptBin "hart-glass-shell-gtk4-session" ''
     export WLR_RENDERER_ALLOW_SOFTWARE=1
     export WLR_NO_HARDWARE_CURSORS=1
-    # Desktop identity for xdg-desktop-portal: WITHOUT this the GTK4 host's startup
-    # color-scheme query to org.freedesktop.portal.Settings has no desktop hint, so
-    # D-Bus tries to ACTIVATE org.freedesktop.portal.Desktop and BLOCKS for the full
-    # 25s activation timeout (the real-HW 2026-06-25 journal: "Settings portal not
-    # found ... Timeout was reached" → the 45s paint-watchdog then drops the tier).
-    # Setting it lets the portal (started in the sway host config) own the name so the
-    # query resolves in ms, and selects the gtk backend.
+    # Desktop identity for native/Flatpak apps + xdg-desktop-portal backend selection
+    # under Tier-2 sway. NOTE (2026-06-28): the GTK4 host's OWN first-paint no longer
+    # depends on this, or on any portal at all -- it runs on a portal-free private
+    # D-Bus session (noPortalBusConfig in hart-glass-shell-gtk4), so GtkSettings can no
+    # longer block on the portal activation timeout that was killing the tier. These
+    # exports remain for the benefit of apps that map ABOVE the desktop on the real
+    # session bus, not for the host's paint path.
     export XDG_CURRENT_DESKTOP=sway
     export XDG_SESSION_DESKTOP=sway
     ${if ui.preferHardwareGL then ''
@@ -412,18 +500,30 @@ app.run(None)
       tap enabled
       tap_button_map lrm
     }
-    # Start xdg-desktop-portal BEFORE the host so it owns org.freedesktop.portal.Desktop
-    # by the time GTK4 makes its startup Settings query — otherwise GTK D-Bus-activates it
-    # and blocks 25s (the real-HW paint-killer). The gtk backend (xdg-desktop-portal-gtk,
-    # from hart-subsystems extraPortals) answers Settings.Read; XDG_DATA_DIRS is widened so
-    # the frontend finds the backend's .portal file in this bare-sway (non-graphical-session)
-    # launch. Best-effort: if it can't start, GTK still falls through (now without the 25s
-    # activation stall because the name is being serviced). This also gives installed Flatpak
-    # apps working file-chooser/screenshot portals.
+    # Wildcard output config: enable every detected output at its preferred mode.
+    # Without ANY output config sway logs "Could not find config for output <name>
+    # (BUG 0x6675)" while bringing up eDP-1 on real HW. That is BENIGN -- sway still
+    # enables the output with its detected mode and the layer-shell surface still gets
+    # a configure (LoadEvent.FINISHED is independent of surface size) -- but it has been
+    # misread as a paint failure. The wildcard gives sway a config for every output so
+    # the message does not fire and the output is guaranteed enabled for the BACKGROUND
+    # layer-shell surface to anchor to; the host's all-edge anchor sizes the shell to
+    # whatever mode sway detects, so a missing per-output config never aborts the anchor.
+    output * {
+      enable
+    }
+    # Best-effort xdg-desktop-portal for native/Flatpak apps (file-chooser/screenshot)
+    # that map ABOVE the desktop on the real session bus. NOTE (2026-06-28): the GTK4
+    # glass host's OWN first-paint NO LONGER depends on this portal -- it runs on a
+    # portal-free private D-Bus session (noPortalBusConfig), so GtkSettings can no
+    # longer block on the portal activation timeout that was killing the tier. Kept
+    # best-effort for apps on the real session bus; if it cannot start, the desktop
+    # still paints. XDG_DATA_DIRS is widened so the frontend finds the gtk backend's
+    # .portal file in this bare-sway (non-graphical-session) launch.
     exec XDG_DATA_DIRS="${pkgs.xdg-desktop-portal-gtk}/share:${pkgs.xdg-desktop-portal}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}" ${pkgs.xdg-desktop-portal}/libexec/xdg-desktop-portal -r
     # Launch the GTK4 layer-shell host as sway's startup client. It anchors itself
-    # as the BACKGROUND layer (exclusive zone 0) via gtk4-layer-shell — so it is
-    # the desktop, not a fullscreen app. Native toplevels (Phase 5) map above it.
+    # as the BACKGROUND layer (exclusive zone 0) via gtk4-layer-shell so it is the
+    # desktop, not a fullscreen app. Native toplevels (Phase 5) map above it.
     exec ${layerShellHost}/bin/hart-glass-shell-gtk4
   '';
 
