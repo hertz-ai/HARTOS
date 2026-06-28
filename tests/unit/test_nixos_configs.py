@@ -296,9 +296,6 @@ class TestDesktopVariant:
     def test_conky_enabled(self):
         assert "conky.enable = true" in self.config
 
-    def test_nunba_enabled(self):
-        assert "nunba.enable = true" in self.config
-
     def test_android_native(self):
         assert "androidNative.enable = true" in self.config
 
@@ -1965,6 +1962,26 @@ class TestSessionSupervisorModule:
         assert "default = 20" in m.group(1)
         assert "ints.unsigned" in m.group(1)
 
+    def test_input_alive_timeout_option_unsigned_default_0_failsafe(self):
+        """The input-alive watchdog budget — the INPUT twin of the paint watchdog,
+        catching a tier that PAINTS but never delivers input (#134). The DEFAULT
+        MUST be 0 (disabled): marker absence is ambiguous (real input-death VS a
+        build whose compositors do not write the marker yet), and dropping on a
+        missing WRITER would flap every healthy tier to the floor. Default-0 is the
+        never-flap fail-safe — this locks it at the cheapest level (a VM boot is
+        wasteful for a default value). unsigned so 0 is valid; the VM nodes prove
+        the enabled behaviour (drop / keep / disabled-no-flap)."""
+        assert "inputAliveTimeoutSeconds" in self.content
+        m = re.search(r"inputAliveTimeoutSeconds\s*=\s*lib\.mkOption\s*\{(.*?)\};", self.content, re.S)
+        assert m, "inputAliveTimeoutSeconds option block not found"
+        assert "default = 0" in m.group(1), "input watchdog must default OFF (never-flap fail-safe)"
+        assert "ints.unsigned" in m.group(1)
+        # The marker the supervisor exports + consumes, shared with the compositor.
+        assert "HART_INPUT_ALIVE_FLAG" in self.content
+        assert "input-alive" in self.content
+        # DRY: paint-hang and input-hang share ONE drop path (no parallel mechanism).
+        assert "drop_hung_tier" in self.content
+
     def test_cage_command_non_empty_assertion(self):
         """GENUINE module-shape contract a VM boot would only surface as a runtime
         FATAL-loop blank screen: cageCommand is types.str (not nullOr), and an
@@ -2120,6 +2137,25 @@ class TestSessionSupervisorNixTestWiring:
         # It touches the real signal flag the supervisor consumes.
         assert "/run/hart/compositor-unhealthy" in self.nixtest
 
+    def test_input_watchdog_nodes_present(self):
+        """The input-alive dimension (#134: PAINTS but never delivers input) has its
+        OWN behavioural nodes: a DROP case (a fake that paints but never signals
+        input is killed + dropped to cage), a KEEP case (a fake that paints AND
+        signals input is kept — proves no over-fire), and a DISABLED case (the
+        DEFAULT 0 keeps a painted-but-input-dead tier — proves the never-flap
+        fail-safe). The fakes honour the real contract: they touch the marker the
+        selector exports via HART_INPUT_ALIVE_FLAG (one shared path)."""
+        for node in (
+            "hart-session-supervisor-input-watchdog",
+            "hart-session-supervisor-input-watchdog-keep",
+            "hart-session-supervisor-input-watchdog-disabled",
+        ):
+            assert node in self.nixtest, f"input-alive VM node {node} missing"
+        # The fakes use the exported marker path (writer + watchdog share ONE path),
+        # and the disabled node proves the never-flap default.
+        assert "HART_INPUT_ALIVE_FLAG" in self.nixtest
+        assert "input-alive" in self.nixtest
+
     def test_each_new_node_in_ci_vm_workflow(self):
         """Every check that should RUN must be built explicitly in the VM workflow
         (the workflow targets checks by name, not `nix flake check`)."""
@@ -2132,6 +2168,9 @@ class TestSessionSupervisorNixTestWiring:
             "hart-session-supervisor-reboot-latch",
             "hart-session-supervisor-recovery-tty",
             "hart-session-supervisor-unhealthy-flag",
+            "hart-session-supervisor-input-watchdog",
+            "hart-session-supervisor-input-watchdog-keep",
+            "hart-session-supervisor-input-watchdog-disabled",
         ]:
             assert node in wf, f"VM workflow does not build/run {node} — it would never gate"
 

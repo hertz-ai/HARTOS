@@ -123,6 +123,47 @@ let
   sessionRunDir = "/run/hart/session";
   readyFlag = "${sessionRunDir}/shell-ready";
 
+  # ── Input-alive marker (the INPUT twin of the paint marker) ──
+  # The paint watchdog above catches a tier that never PRESENTS a frame. It is
+  # blind to the WORSE-on-real-hardware failure the "pointer frozen at 0,0,
+  # nothing types" regression exposed (#134): the compositor is UP and PAINTS (the
+  # onboarding screen renders, a caret BLINKS — frames ARE being scanned out) but
+  # NO input is delivered, pointer AND keyboard dead at once. That is the
+  # seat/libinput layer failing to feed events into the compositor (the libinput
+  # event source not live in the calloop loop, missing seat pointer/keyboard
+  # capabilities, or no devices opened by libseat), NOT a hung compositor (it
+  # still presents the blink) and NOT a WebView focus issue (pointer MOTION is
+  # focus-independent yet frozen). A painted-but-input-starved tier PASSES the
+  # paint watchdog and then `wait`s forever, locking the user out behind a pretty,
+  # dead screen.
+  #
+  # The input-alive marker is the symmetric signal: the tier's compositor touches
+  # this tmpfs flag once its INPUT PIPELINE is proven LIVE — libinput's event
+  # source is wired into the event loop AND it is actually delivering events into
+  # the seat (the natural write site is the first InputEvent dispatched into
+  # State::process_input_event in compositor/src/udev.rs step 11(a), which fires
+  # at STARTUP as libseat opens the devices, NOT a user keypress). It is a
+  # STARTUP-assertable capability signal, deliberately NOT "the user has
+  # interacted", so an idle user can never be mistaken for a dead seat — that
+  # distinction is the whole flap-safety of this dimension. Same dir, same 0770
+  # group-writable rule, same export-the-path contract as shell-ready, so the
+  # compositor and this watchdog share ONE path with no hardcoded divergence
+  # (HART_INPUT_ALIVE_FLAG, exported next to HART_SHELL_READY_FLAG below).
+  #
+  # FAIL-SAFE / NEVER-FLAP: this check is OFF by default
+  # (inputAliveTimeoutSeconds = 0). Absence of the marker is AMBIGUOUS — it can
+  # mean "input genuinely dead" OR "this tier's compositor build does not write
+  # the marker yet" — and dropping on a missing WRITER would flap EVERY healthy
+  # tier down to the floor on every boot. So unlike the paint marker (whose
+  # absence-after-timeout safely degrades to a faster-painting tier), the input
+  # marker is only treated as AUTHORITATIVE when an operator opts in by setting
+  # inputAliveTimeoutSeconds > 0 — which declares "the tiers I run write this
+  # marker, so its absence is real input-death." Until the tier compositors
+  # (udev.rs / the cage floor) write HART_INPUT_ALIVE_FLAG, it stays 0 and this is
+  # a pure no-op (mirrors compCommand=null reserving Tier-1 until Phase 3). The
+  # cage FLOOR is exempt (nothing below it to drop to), exactly like paint.
+  inputAliveFlag = "${sessionRunDir}/input-alive";
+
   # Ordered tier ladder, highest → lowest. The LAST entry (cage) is the floor.
   # A tier is "available" only if its launcher command is non-null; an
   # unavailable higher tier falls straight through to the next so the screen
@@ -172,6 +213,7 @@ let
     WINDOW="${windowFile}"
     UNHEALTHY="${unhealthyFlag}"
     READY="${readyFlag}"
+    INPUT_ALIVE="${inputAliveFlag}"
     # ── Fresh-boot re-promotion state (transient-cold-boot self-heal) ──
     #   HANGMARK (persistent, next to the latch): set ONLY by a paint-HANG drop;
     #     a crash-loop drop clears it (a crash is sticky, never re-promoted).
@@ -186,6 +228,7 @@ let
     MAX_CRASHES=${toString sup.crashLoopCount}
     WINDOW_SECS=${toString sup.crashLoopWindowSeconds}
     PAINT_TIMEOUT=${toString sup.shellPaintTimeoutSeconds}
+    INPUT_TIMEOUT=${toString sup.inputAliveTimeoutSeconds}
     LADDER="${lib.concatStringsSep " " tierLadder}"
     FLOOR="cage"
     # The HIGHEST tier a FRESH (un-latched) boot starts at — so the ladder tries
@@ -309,6 +352,61 @@ let
 
     clear_window() { : > "$WINDOW" 2>/dev/null || true; }
 
+    # ── Kill a HUNG non-floor tier and drop one rung (the SINGLE deterministic-
+    #    hang drop path, shared by BOTH the paint-timeout and the input-alive-
+    #    timeout watchdogs — DRY, no parallel mechanism) ───────────────────────
+    # A HANG is DETERMINISTIC, unlike a fast-exit crash: the compositor came up but
+    # never satisfied a liveness signal (no first paint, OR painted but no input)
+    # and a retry fails the SAME way — so it is dropped after the FIRST timeout,
+    # NOT after crashLoopCount (waiting crashLoopCount × the budget would mean a
+    # minute-plus of black/dead screen on real HW before reaching the floor). The
+    # caller GUARANTEES "$TIER" != "$FLOOR" and that the session process is still
+    # alive; $1 is the human reason for the log. Does NOT return — exits to greetd
+    # on the lowered, latched tier.
+    drop_hung_tier() {
+      _reason="$1"
+      log "tier '$TIER' is HUNG ($_reason) — killing + dropping immediately"
+      # SIGTERM FIRST and give the compositor a real grace window to drop DRM
+      # master cleanly (drmDropMaster on its way out) before we SIGKILL. A straight
+      # SIGKILL on a compositor that is mid-scanout can orphan the DRM master on
+      # card0, so the NEXT tier greetd relaunches hits EBUSY ("device busy") and the
+      # whole ladder stalls on a black screen. SIGTERM → wait → SIGKILL only if it
+      # ignored the term is the standard graceful handoff.
+      kill -TERM "$sesspid" 2>/dev/null || true
+      term_waited=0
+      while [ "$term_waited" -lt "$TIER_TERM_GRACE" ] && kill -0 "$sesspid" 2>/dev/null; do
+        sleep 1
+        term_waited=$((term_waited + 1))
+      done
+      kill -KILL "$sesspid" 2>/dev/null || true
+      wait "$sesspid" 2>/dev/null || true
+      # Let the kernel reclaim DRM master + tear down the GBM/scanout state the
+      # killed compositor held, so the next tier can become master cleanly.
+      drm_master_settle
+      # We still record the hang in the crash window (DRY: the SAME record_crash →
+      # lower_tier → write_tier accounting keeps the window/threshold telemetry
+      # consistent) but the DROP is unconditional, not threshold-gated — only the
+      # fast-EXIT crash path requires crashLoopCount.
+      record_crash || true
+      nxt=$(lower_tier "$TIER")
+      log "watchdog: HUNG '$TIER' dropped to '$nxt' on the FIRST timeout (deterministic hang) — latching"
+      write_tier "$nxt"
+      # A HANG MAY be a transient cold-boot slow start, not a permanent break — arm
+      # ONE fresh-boot re-promotion. BUT if this boot already spent its re-promotion
+      # retry on this tier (REPROMOTED_FLAG set), the hang is CONFIRMED: clear the
+      # arm so the latch settles and is never re-walked on later boots (the latch's
+      # never-re-walk guarantee holds for confirmed failures).
+      if [ -e "$REPROMOTED_FLAG" ]; then
+        rm -f "$HANGMARK" 2>/dev/null || true
+      else
+        : > "$HANGMARK" 2>/dev/null || true
+      fi
+      clear_window
+      # Return to greetd; it relaunches the selector, which now reads the lowered
+      # latch.
+      exit 0
+    }
+
     # ── Fresh-boot re-promotion of a transiently HANG-dropped tier ────────────
     # A latch is lowered by either a fast-exit CRASH-LOOP (crashLoopCount fast
     # exits — a strong "genuinely broken" signal that stays STICKY) or a single
@@ -395,16 +493,21 @@ let
     fi
 
     log "launching tier '$TIER': $CMD"
-    # Clear any stale paint marker from a previous tier/boot BEFORE launch so it
-    # can never mask this tier's hang (it lives in /run tmpfs but a same-boot
-    # re-launch could leave a marker behind). The shell host re-touches it on its
-    # first painted frame.
+    # Clear any stale paint + input markers from a previous tier/boot BEFORE launch
+    # so they can never mask this tier's hang (they live in /run tmpfs but a same-
+    # boot re-launch could leave a marker behind). The shell host re-touches the
+    # paint marker on its first painted frame; the compositor re-touches the input
+    # marker once its input pipeline is live.
     rm -f "$READY" 2>/dev/null || true
+    rm -f "$INPUT_ALIVE" 2>/dev/null || true
 
-    # Tell the launched shell host WHERE to write its first-paint marker, so the
-    # host and this watchdog share ONE path (no hardcoded divergence). The host
-    # honours HART_SHELL_READY_FLAG and falls back to the same /run/hart default.
+    # Tell the launched shell host + compositor WHERE to write their liveness
+    # markers, so the writers and this watchdog share ONE path each (no hardcoded
+    # divergence). The host honours HART_SHELL_READY_FLAG (first paint) and the
+    # compositor honours HART_INPUT_ALIVE_FLAG (input pipeline live); both fall back
+    # to the same /run/hart defaults when unset.
     export HART_SHELL_READY_FLAG="$READY"
+    export HART_INPUT_ALIVE_FLAG="$INPUT_ALIVE"
 
     # Run the session in the BACKGROUND so the paint-watchdog can observe a HUNG
     # tier (compositor up, shell never paints, process never exits). When it
@@ -443,60 +546,55 @@ let
       if [ "$painted" -eq 0 ] && kill -0 "$sesspid" 2>/dev/null; then
         # (c) HUNG: compositor process alive but no first-paint within the budget.
         if [ "$TIER" != "$FLOOR" ]; then
-          log "tier '$TIER' is HUNG (compositor up, no first paint in ''${PAINT_TIMEOUT}s) — killing + dropping immediately"
-          # SIGTERM FIRST and give the compositor a real grace window to drop DRM
-          # master cleanly (drmDropMaster on its way out) before we SIGKILL. A
-          # straight SIGKILL on a compositor that is mid-scanout can orphan the DRM
-          # master on card0, so the NEXT tier greetd relaunches hits EBUSY ("device
-          # busy") and the whole ladder stalls on a black screen. SIGTERM → wait →
-          # SIGKILL only if it ignored the term is the standard graceful-handoff.
-          kill -TERM "$sesspid" 2>/dev/null || true
-          term_waited=0
-          while [ "$term_waited" -lt "$TIER_TERM_GRACE" ] && kill -0 "$sesspid" 2>/dev/null; do
-            sleep 1
-            term_waited=$((term_waited + 1))
-          done
-          kill -KILL "$sesspid" 2>/dev/null || true
-          wait "$sesspid" 2>/dev/null || true
-          # Let the kernel reclaim DRM master + tear down the GBM/scanout state the
-          # killed compositor held, so the next tier can become master cleanly.
-          drm_master_settle
-          # A HANG is DETERMINISTIC, unlike a fast-exit crash: the compositor came
-          # up but the shell never painted within the budget, and a retry will hang
-          # the SAME way (it is not a transient flake). So a hung non-floor tier is
-          # dropped after the FIRST paint-timeout — NOT after crashLoopCount hangs.
-          # Waiting crashLoopCount × PAINT_TIMEOUT here would mean ~66s of black
-          # screen on real HW (3 × 20s + relaunch overhead) before reaching cage;
-          # an immediate drop reaches a painting tier on the very next relaunch.
-          # We still record the hang in the crash window (DRY: the SAME record_crash
-          # → lower_tier → write_tier accounting, so the window/threshold telemetry
-          # is consistent) but the DROP is unconditional, not threshold-gated — only
-          # the fast-EXIT crash path below requires crashLoopCount.
-          record_crash || true
-          nxt=$(lower_tier "$TIER")
-          log "paint-watchdog: HUNG '$TIER' dropped to '$nxt' on the FIRST paint-timeout (deterministic hang) — latching"
-          write_tier "$nxt"
-          # A paint-HANG MAY be a transient cold-boot slow first paint, not a
-          # permanent break — arm ONE fresh-boot re-promotion. BUT if this boot
-          # already spent its re-promotion retry on this tier (REPROMOTED_FLAG set),
-          # the hang is CONFIRMED: clear the arm so the latch settles and is never
-          # re-walked on later boots (the latch's never-re-walk guarantee holds for
-          # confirmed failures).
-          if [ -e "$REPROMOTED_FLAG" ]; then
-            rm -f "$HANGMARK" 2>/dev/null || true
-          else
-            : > "$HANGMARK" 2>/dev/null || true
-          fi
-          clear_window
-          # Return to greetd; it relaunches the selector, which now reads the
-          # lowered latch.
-          exit 0
+          drop_hung_tier "compositor up, no first paint in ''${PAINT_TIMEOUT}s"
         else
           # The floor itself hasn't signalled paint yet — never drop below it.
           # Let it keep running (cage is the audited paint floor); just stop
           # watching and wait normally. The screen still paints by the floor's
           # own contract; a missing marker here only means an older floor build.
           log "floor ('$FLOOR') has not signalled paint within ''${PAINT_TIMEOUT}s — staying on the floor (cannot drop below it)"
+        fi
+      fi
+    fi
+
+    # ── Input-alive watchdog (the INPUT twin of the paint watchdog) ────────────
+    # A tier can PASS the paint watchdog (it presented a frame, $READY exists) yet
+    # be INPUT-STARVED: the compositor scans out but the seat/libinput layer never
+    # delivers pointer/keyboard events (the real-HW "pointer frozen at 0,0, nothing
+    # types" — #134). The paint check is blind to it; this catches it. It runs ONLY
+    # when the tier actually PAINTED (painted=1 — input-aliveness is only meaningful
+    # once a tier is presenting) AND the operator opted in (INPUT_TIMEOUT > 0 — see
+    # inputAliveFlag's never-flap note: marker absence is authoritative ONLY when
+    # the running tiers are known to write it) AND the process is still alive. We
+    # poll up to INPUT_TIMEOUT for $INPUT_ALIVE; if the compositor never asserts its
+    # input pipeline is live while still running, the tier is input-dead and is
+    # dropped via the SAME deterministic-hang path (drop_hung_tier — DRY). The cage
+    # FLOOR is exempt. INPUT_TIMEOUT=0 (default) makes this a pure no-op, byte-
+    # identical to the paint-only behaviour, so a build whose tiers do not yet write
+    # the marker can NEVER flap a healthy tier down.
+    if [ "$painted" -eq 1 ] && [ "$INPUT_TIMEOUT" -gt 0 ] && kill -0 "$sesspid" 2>/dev/null; then
+      input_alive=0
+      iwaited=0
+      while [ "$iwaited" -lt "$INPUT_TIMEOUT" ]; do
+        if ! kill -0 "$sesspid" 2>/dev/null; then
+          break                       # session exited — the crash path below handles it
+        fi
+        if [ -e "$INPUT_ALIVE" ]; then
+          input_alive=1               # the compositor proved its input pipeline is live
+          break
+        fi
+        sleep 1
+        iwaited=$((iwaited + 1))
+      done
+
+      if [ "$input_alive" -eq 0 ] && kill -0 "$sesspid" 2>/dev/null; then
+        if [ "$TIER" != "$FLOOR" ]; then
+          drop_hung_tier "painted but no input-alive signal in ''${INPUT_TIMEOUT}s (input-starved seat)"
+        else
+          # The floor painted but never signalled input — never drop below it. cage
+          # is the audited never-fail surface; a missing input marker here only
+          # means an older floor build that does not write it yet.
+          log "floor ('$FLOOR') painted but no input-alive signal within ''${INPUT_TIMEOUT}s — staying on the floor (cannot drop below it)"
         fi
       fi
     fi
@@ -610,6 +708,41 @@ in
         failure the bare crash-on-exit detection is blind to (the real-hardware
         pointer-only boot). Set to 0 to disable the watchdog (crash-only
         behaviour). The cage FLOOR is never dropped by this watchdog.
+      '';
+    };
+
+    inputAliveTimeoutSeconds = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 0;
+      description = ''
+        Input-alive watchdog budget (seconds) — the INPUT twin of
+        shellPaintTimeoutSeconds. After a tier has PAINTED (touched
+        /run/hart/session/shell-ready), its compositor must ALSO signal that its
+        input pipeline is LIVE by touching /run/hart/session/input-alive within
+        this many seconds. If it does NOT — while the compositor process is still
+        alive — the tier is treated as INPUT-STARVED (it presents frames but the
+        seat/libinput layer delivers no pointer/keyboard events: the real-hardware
+        "pointer frozen at 0,0, nothing types" failure, #134, that the paint
+        watchdog is blind to) and dropped one rung via the SAME deterministic-hang
+        path as a paint timeout.
+
+        DEFAULT 0 = DISABLED (a pure no-op, byte-identical to the paint-only
+        behaviour). This MUST stay 0 until the tiers being run actually write
+        HART_INPUT_ALIVE_FLAG, because a missing marker is AMBIGUOUS (real
+        input-death VS a compositor build that does not emit the marker yet) and
+        dropping on a missing WRITER would flap every healthy tier to the floor on
+        every boot. Setting it > 0 is the operator's declaration "my tiers write
+        this marker, so its absence is genuine input-death." Recommended enabled
+        value: comparable to the paint budget (e.g. 25-45s) so a slow-but-fine
+        cold-boot input enumeration still signals in time and is not mistaken for a
+        dead seat.
+
+        The marker is a STARTUP capability signal (input pipeline wired +
+        delivering events into the seat), NOT "the user has interacted" — so an
+        idle user is never read as a dead seat (the whole flap-safety of this
+        dimension). The cage FLOOR is never dropped by this watchdog (nothing below
+        it). Assessed only AFTER a confirmed first paint, so the paint watchdog
+        (shellPaintTimeoutSeconds) must be enabled for this to run.
       '';
     };
 

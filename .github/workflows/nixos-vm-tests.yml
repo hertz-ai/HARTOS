@@ -90,6 +90,9 @@ jobs:
             ".#checks.x86_64-linux.hart-session-supervisor-reboot-latch" \
             ".#checks.x86_64-linux.hart-session-supervisor-recovery-tty" \
             ".#checks.x86_64-linux.hart-session-supervisor-unhealthy-flag" \
+            ".#checks.x86_64-linux.hart-session-supervisor-input-watchdog" \
+            ".#checks.x86_64-linux.hart-session-supervisor-input-watchdog-keep" \
+            ".#checks.x86_64-linux.hart-session-supervisor-input-watchdog-disabled" \
             ".#checks.x86_64-linux.hart-desktop-shell-boot" \
             ".#checks.x86_64-linux.hart-layer-shell-host" \
             ".#checks.x86_64-linux.hart-layer-shell-host-paint" \

@@ -749,4 +749,221 @@ in
               "the unhealthy crash-loop must NEVER drop below the cage floor"
     '';
   };
+
+  # ─────────────────────────────────────────────────────────────
+  # INPUT-ALIVE WATCHDOG (the INPUT twin of the paint watchdog): a tier that
+  # PAINTS (touches shell-ready) but is INPUT-STARVED (never touches input-alive
+  # while staying alive) is the real-HW "pointer frozen at 0,0, nothing types"
+  # failure (#134) the paint watchdog is blind to. With inputAliveTimeoutSeconds
+  # > 0 (the operator opting in), the watchdog must kill + drop it exactly like a
+  # paint hang, and never below the cage floor.
+  # ─────────────────────────────────────────────────────────────
+  hart-session-supervisor-input-watchdog =
+    let
+      # A painting-but-input-dead fake: touch the PAINT marker the selector
+      # exported (so it passes the paint watchdog) but NEVER the INPUT marker, then
+      # stay alive forever. The input watchdog must catch it.
+      paintNoInput = pkgs.writeShellScript "fake-paint-no-input" ''
+        touch "$HART_SHELL_READY_FLAG"
+        exec ${pkgs.coreutils}/bin/sleep infinity
+      '';
+    in
+    pkgs.testers.runNixOSTest {
+      name = "hart-session-supervisor-input-watchdog";
+      skipTypeCheck = true;
+      skipLint = true;
+      node.specialArgs = specialArgs;
+
+      nodes.sup = mkNode "desktop" {
+        virtualisation = { memorySize = 3072; cores = 2; };
+        hart.sessionSupervisor = {
+          enable = true;
+          compCommand = null;                       # Tier-1 unavailable -> sway
+          swayCommand = "${paintNoInput}";          # Tier-2 PAINTS but never input
+          crashLoopCount = 3;
+          crashLoopWindowSeconds = 300;
+          shellPaintTimeoutSeconds = 3;             # ample for the immediate paint touch
+          inputAliveTimeoutSeconds = 3;             # OPT IN: short input budget for the VM
+          tierTermGraceSeconds = 2;
+          drmMasterSettleSeconds = 0;               # no real DRM master in the VM
+        };
+      };
+
+      testScript = ''
+        sup = machines[0]
+        sup.start()
+        sup.wait_for_unit("multi-user.target")
+        sup.wait_for_unit("greetd.service", timeout=120)
+
+        LATCH = "/var/lib/hart/session-tier"
+        READY = "/run/hart/session/shell-ready"
+        INPUT_ALIVE = "/run/hart/session/input-alive"
+
+        selector = sup.succeed(
+            "find /nix/store -maxdepth 3 -name '*-hart-session-selector' -type f -print -quit"
+        ).strip()
+        assert selector, "selector wrapper not found in the store"
+
+        with subtest("a PAINTED-but-input-starved Tier-2 is killed + dropped to cage by the input watchdog"):
+            sup.succeed("hartctl session reset-tier")  # arm Tier-1; comp null -> sway
+            # Each selector run launches sway = the painting-but-input-dead fake. It
+            # touches READY (passes the paint watchdog) but NEVER INPUT_ALIVE, so
+            # after inputAliveTimeoutSeconds the input watchdog KILLS it and records a
+            # hang; the deterministic-hang drop walks hart-comp(unavail)->sway->cage.
+            for _ in range(8):
+                sup.succeed(f"runuser -u hart -- {selector} || true")
+                # The fake DID paint but NEVER signalled input — prove the drop was the
+                # INPUT dimension (paint marker present, input marker absent), not the
+                # paint watchdog.
+                sup.fail(f"test -e {INPUT_ALIVE}")
+
+            tier = sup.succeed(f"cat {LATCH}").strip()
+            assert tier == "cage", \
+                f"a painted-but-input-dead higher tier must be dropped to the cage floor, got {tier!r}"
+
+        with subtest("the input watchdog never drops below the cage floor"):
+            # Already on cage. cage's REAL launcher may not signal input headless, but
+            # the floor is exempt from the watchdog drop — the latch must STAY cage.
+            for _ in range(4):
+                sup.succeed(f"runuser -u hart -- {selector} || true")
+            tier = sup.succeed(f"cat {LATCH}").strip()
+            assert tier == "cage", f"input watchdog dropped below the floor to {tier!r} — NEVER allowed"
+      '';
+    };
+
+  # ─────────────────────────────────────────────────────────────
+  # INPUT-ALIVE WATCHDOG POSITIVE CASE: a tier that PAINTS *and* signals
+  # input-alive within the budget is KEPT, never dropped. The negative test proves
+  # the input watchdog FIRES; this proves it does NOT over-fire — a healthy tier
+  # that delivers input must survive. The fake honours BOTH contracts (touches the
+  # paths the selector exports via $HART_SHELL_READY_FLAG + $HART_INPUT_ALIVE_FLAG,
+  # proving writer and watchdog share ONE path each), then stays alive. The
+  # watchdog must observe input_alive=1, stop watching, and leave the latch on sway.
+  # ─────────────────────────────────────────────────────────────
+  hart-session-supervisor-input-watchdog-keep =
+    let
+      paintAndInput = pkgs.writeShellScript "fake-paint-and-input" ''
+        touch "$HART_SHELL_READY_FLAG"
+        touch "$HART_INPUT_ALIVE_FLAG"
+        exec ${pkgs.coreutils}/bin/sleep infinity
+      '';
+    in
+    pkgs.testers.runNixOSTest {
+      name = "hart-session-supervisor-input-watchdog-keep";
+      skipTypeCheck = true;
+      skipLint = true;
+      node.specialArgs = specialArgs;
+
+      nodes.sup = mkNode "desktop" {
+        virtualisation = { memorySize = 3072; cores = 2; };
+        hart.sessionSupervisor = {
+          enable = true;
+          compCommand = null;                       # Tier-1 unavailable -> sway
+          swayCommand = "${paintAndInput}";         # Tier-2 PAINTS + signals input
+          crashLoopCount = 3;
+          crashLoopWindowSeconds = 300;
+          shellPaintTimeoutSeconds = 5;
+          inputAliveTimeoutSeconds = 5;             # OPT IN: input watchdog active
+          drmMasterSettleSeconds = 0;
+        };
+      };
+
+      testScript = ''
+        sup = machines[0]
+        sup.start()
+        sup.wait_for_unit("multi-user.target")
+        sup.wait_for_unit("greetd.service", timeout=120)
+
+        LATCH = "/var/lib/hart/session-tier"
+        READY = "/run/hart/session/shell-ready"
+        INPUT_ALIVE = "/run/hart/session/input-alive"
+
+        selector = sup.succeed(
+            "find /nix/store -maxdepth 3 -name '*-hart-session-selector' -type f -print -quit"
+        ).strip()
+        assert selector, "selector wrapper not found in the store"
+
+        with subtest("a Tier-2 that PAINTS *and* signals input within the budget is KEPT (no over-fire)"):
+            sup.succeed("hartctl session reset-tier")   # arm Tier-1; comp null -> sway
+            # Run the selector in the background — the fake stays alive after touching
+            # BOTH markers, so the selector blocks in `wait` once it observes input.
+            sup.succeed(f"runuser -u hart -- {selector} >/tmp/sel.log 2>&1 & echo started")
+            # Both markers appear immediately on launch; wait for the input one (the
+            # one this watchdog gates on).
+            sup.wait_until_succeeds(f"test -e {READY}", timeout=30)
+            sup.wait_until_succeeds(f"test -e {INPUT_ALIVE}", timeout=30)
+            # The tier painted AND signalled input -> the watchdog kept it. Tear it
+            # down so the selector exits (a long-lived run is a normal logout).
+            sup.succeed("pkill -TERM -f sleep || true")
+            tier = sup.succeed(f"cat {LATCH} 2>/dev/null || echo sway").strip()
+            assert tier in ("sway", "hart-comp"), \
+                f"an input-alive Tier-2 must be KEPT (latch sway / un-dropped), got {tier!r}"
+            assert tier != "cage", \
+                "a tier that signalled input within the budget was wrongly dropped — input watchdog over-fired"
+      '';
+    };
+
+  # ─────────────────────────────────────────────────────────────
+  # INPUT-ALIVE WATCHDOG FAIL-SAFE DEFAULT (the never-flap guarantee): with
+  # inputAliveTimeoutSeconds = 0 (the DEFAULT), the input watchdog is a pure no-op
+  # — a tier that PAINTS but never signals input is KEPT, NOT dropped. This proves
+  # the critical invariant: a build whose compositors do not yet write the
+  # input-alive marker can never flap a healthy painting tier down to the floor.
+  # ─────────────────────────────────────────────────────────────
+  hart-session-supervisor-input-watchdog-disabled =
+    let
+      paintNoInput = pkgs.writeShellScript "fake-paint-no-input-disabled" ''
+        touch "$HART_SHELL_READY_FLAG"
+        exec ${pkgs.coreutils}/bin/sleep infinity
+      '';
+    in
+    pkgs.testers.runNixOSTest {
+      name = "hart-session-supervisor-input-watchdog-disabled";
+      skipTypeCheck = true;
+      skipLint = true;
+      node.specialArgs = specialArgs;
+
+      nodes.sup = mkNode "desktop" {
+        virtualisation = { memorySize = 3072; cores = 2; };
+        hart.sessionSupervisor = {
+          enable = true;
+          compCommand = null;                       # Tier-1 unavailable -> sway
+          swayCommand = "${paintNoInput}";          # PAINTS, never signals input
+          crashLoopCount = 3;
+          crashLoopWindowSeconds = 300;
+          shellPaintTimeoutSeconds = 5;
+          # inputAliveTimeoutSeconds omitted -> DEFAULT 0 (input watchdog disabled).
+          drmMasterSettleSeconds = 0;
+        };
+      };
+
+      testScript = ''
+        sup = machines[0]
+        sup.start()
+        sup.wait_for_unit("multi-user.target")
+        sup.wait_for_unit("greetd.service", timeout=120)
+
+        LATCH = "/var/lib/hart/session-tier"
+        READY = "/run/hart/session/shell-ready"
+
+        selector = sup.succeed(
+            "find /nix/store -maxdepth 3 -name '*-hart-session-selector' -type f -print -quit"
+        ).strip()
+        assert selector, "selector wrapper not found in the store"
+
+        with subtest("with the input watchdog DISABLED (default 0), a painted-but-input-dead tier is KEPT (never flaps)"):
+            sup.succeed("hartctl session reset-tier")   # arm Tier-1; comp null -> sway
+            sup.succeed(f"runuser -u hart -- {selector} >/tmp/sel.log 2>&1 & echo started")
+            # The tier paints; with inputAliveTimeoutSeconds=0 the selector does NOT
+            # wait on / drop for the missing input marker — it just `wait`s the
+            # healthy long-lived session.
+            sup.wait_until_succeeds(f"test -e {READY}", timeout=30)
+            sup.succeed("pkill -TERM -f sleep || true")
+            tier = sup.succeed(f"cat {LATCH} 2>/dev/null || echo sway").strip()
+            assert tier != "cage", \
+                "with the input watchdog disabled, a painting tier was flapped to cage — the fail-safe default is broken"
+            assert tier in ("sway", "hart-comp"), \
+                f"the painting tier must be KEPT (latch sway / un-dropped) when input watchdog is off, got {tier!r}"
+      '';
+    };
 }

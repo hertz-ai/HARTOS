@@ -27,11 +27,87 @@
       body: body ? JSON.stringify(body) : undefined }).then(function (r) { return r.json(); });
   }
 
-  var overlay, narr, opts, lang = 'en';
+  var overlay, narr, opts, skipBtn, lang = 'en';
+
+  // ── Keyboard-reachable navigation (a dead pointer must NEVER lock the user out:
+  // the real-HW symptom is the pointer frozen at 0,0). The whole flow is keyboard
+  // navigable — Tab cycles the controls, Enter activates a native <button>, and the
+  // always-visible Skip control + the Esc hatch both finish. Every focus call is
+  // guarded so the dependency-free test DOM (no .focus) is a no-op, never a throw. ──
+  function focusEl(el) {
+    if (el && typeof el.focus === 'function') { try { el.focus(); } catch (e) {} }
+  }
+
+  // The focusable controls currently in the overlay, in Tab order: the rendered
+  // option buttons first, then the always-present Skip control. Walks children so
+  // it works in both the real DOM and the dependency-free test shim.
+  function controls() {
+    var list = [], kids = (opts && opts.children) || [], i;
+    for (i = 0; i < kids.length; i++) {
+      if (kids[i] && kids[i].tagName === 'BUTTON') list.push(kids[i]);
+    }
+    if (skipBtn) list.push(skipBtn);
+    return list;
+  }
+
+  // Pull focus to the first actionable control of a screen (the first option, or
+  // the Skip control on a narration-only screen) so the flow is drivable from the
+  // keyboard the instant it renders — no pointer required.
+  function focusFirst() {
+    var c = controls();
+    focusEl(c.length ? c[0] : null);
+  }
+
+  // The always-visible, keyboard-reachable Skip control + an "Esc to skip" hint.
+  // Built once and appended to the overlay (hidden with it: a display:none ancestor
+  // hides it), and it reuses the SAME finish() the Esc hatch calls — ONE exit path,
+  // no parallel skip semantics. Created here (not in the server markup) because this
+  // driver owns the overlay's interactive controls.
+  function ensureSkip() {
+    if (skipBtn || !overlay) return skipBtn;
+    // The server ships a static "Press Esc to skip" text node (.hob-skip — a div,
+    // not an actionable control). Hide it so there are not two skip affordances.
+    // Guarded: the test DOM shim has no querySelector -> skipped silently.
+    try {
+      if (typeof overlay.querySelector === 'function') {
+        var legacy = overlay.querySelector('.hob-skip');
+        if (legacy && legacy.tagName !== 'BUTTON' && legacy.style) legacy.style.display = 'none';
+      }
+    } catch (e) {}
+
+    var wrap = document.createElement('div');
+    wrap.className = 'hob-skip-wrap';
+    wrap.style.cssText = 'position:fixed;left:0;right:0;bottom:18px;display:flex;'
+      + 'flex-direction:column;align-items:center;gap:6px;z-index:1';
+
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'hob-opt hob-skip-btn';
+    b.textContent = 'Skip setup';
+    if (typeof b.setAttribute === 'function') b.setAttribute('aria-label', 'Skip setup (or press Esc)');
+    b.style.cssText = 'padding:8px 20px;font-size:13px';
+    b.addEventListener('click', function () { finish(); });
+
+    var hint = document.createElement('div');
+    hint.className = 'hob-skip-hint';
+    hint.textContent = 'Esc to skip';
+    hint.style.cssText = 'font-size:12px;color:rgba(255,255,255,.45)';
+
+    wrap.appendChild(b);
+    wrap.appendChild(hint);
+    overlay.appendChild(wrap);
+    skipBtn = b;
+    return b;
+  }
 
   function show() {
     if (overlay) overlay.classList.add('open');
     document.documentElement.classList.add('onboarding-active');
+    ensureSkip();
+    // Pull focus INTO the modal so the keyboard can drive it even with a dead
+    // pointer. A frame later so the just-shown overlay is focusable; rAF runs
+    // synchronously in the test shim -> a no-op there, real focus on WebKit.
+    requestAnimationFrame(function () { focusFirst(); });
   }
   function finish() {
     if (overlay) overlay.classList.remove('open');
@@ -45,6 +121,12 @@
     b.className = 'hob-opt'; b.type = 'button'; b.textContent = label;
     b.addEventListener('click', cb);
     opts.appendChild(b);
+    // First option of a freshly-rendered screen (clearOpts wiped opts): pull focus
+    // onto it so Tab/Enter can pick among the options without a pointer. rAF is
+    // synchronous in the test shim (a guarded no-op), real on WebKit.
+    if (opts.children && opts.children.length === 1) {
+      requestAnimationFrame(function () { focusEl(b); });
+    }
     return b;
   }
 
@@ -227,8 +309,24 @@
   function start() {
     overlay = $('hart-onboarding'); narr = $('hart-onboarding-narr'); opts = $('hart-onboarding-opts');
     if (!overlay || !narr) { return setTimeout(start, 400); }
+    ensureSkip();   // the keyboard-reachable Skip control exists before the overlay opens
+    // Keyboard navigation for the WHOLE flow: Esc finishes (the never-trap hatch),
+    // and Tab / Shift+Tab CYCLE focus among the overlay's own controls (a focus
+    // trap) so a dead pointer can drive every screen and can never tab into the
+    // hidden desktop behind this z-12000 modal.
     document.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape' && overlay.classList.contains('open')) finish();   // never trap
+      if (!overlay.classList.contains('open')) return;
+      if (e.key === 'Escape') { finish(); return; }            // never trap (the Esc hatch)
+      if (e.key === 'Tab') {
+        var c = controls();
+        if (!c.length) return;
+        var active = document.activeElement, idx = -1, i;
+        for (i = 0; i < c.length; i++) { if (c[i] === active) { idx = i; break; } }
+        var dir = e.shiftKey ? -1 : 1;
+        var next = idx < 0 ? 0 : (idx + dir + c.length) % c.length;
+        if (e.preventDefault) e.preventDefault();
+        focusEl(c[next]);
+      }
     });
     api('/api/onboarding/status?user_id=' + USER).then(function (st) {
       if (st && st.onboarded) return;             // already lit — no ceremony
