@@ -135,6 +135,22 @@ def _classify_destructive(action_desc):
         return False  # fail-closed: deny if classifier unavailable
 
 
+# Read-only diagnostic binaries that NEVER need the (LLM-backed) destructive
+# classifier: with shell=False (no pipes/redirects) they cannot mutate state, and
+# gating them on the classifier made the Terminal hang whenever the local LLM was
+# busy or down (every command returned "Fetch is aborted" on real hardware). The
+# classifier still guards every other command. One canonical allowlist; do not duplicate.
+_READONLY_SAFE_BINS = frozenset({
+    'journalctl', 'dmesg', 'ls', 'cat', 'head', 'tail', 'grep', 'egrep', 'fgrep',
+    'ps', 'free', 'df', 'du', 'lsblk', 'blkid', 'lsusb', 'lspci', 'lscpu', 'lsmod',
+    'lsof', 'uname', 'hostname', 'uptime', 'whoami', 'id', 'who', 'w',
+    'printenv', 'date', 'cal', 'pwd', 'echo', 'stat', 'file', 'wc', 'nproc',
+})
+# NOTE: 'env' is deliberately EXCLUDED - `env <program>` executes an arbitrary
+# program, which would bypass the destructive classifier. 'printenv' covers the
+# read-only environment-dump use case.
+
+
 # ── Live accessibility state ──
 # Module-level so the shell RENDER (liquid_ui_service.render_desktop_shell, same
 # process) reads the SAME dict the /api/shell/accessibility routes mutate. Seeded
@@ -545,14 +561,24 @@ def register_shell_os_routes(app):
             if pattern in cmd_lower:
                 return jsonify({'error': 'Command blocked by safety filter'}), 403
 
-        if not _classify_destructive(f'terminal exec: {command[:200]}'):
-            return jsonify({'error': 'Action classified as destructive — requires approval'}), 403
+        # shell=False prevents command injection; shlex.split tokenizes safely.
+        try:
+            cmd_list = shlex.split(command)
+        except ValueError:
+            cmd_list = command.split()
+        base = os.path.basename(cmd_list[0]) if cmd_list else ''
+
+        # Fast-path obviously read-only diagnostic commands PAST the (LLM-backed)
+        # destructive classifier. Otherwise a busy/down local LLM hangs the classify
+        # call and the Terminal fetch aborts on EVERY command (the real-HW bug). With
+        # shell=False these binaries cannot pipe or redirect, so they stay read-only.
+        if base not in _READONLY_SAFE_BINS:
+            if not _classify_destructive(f'terminal exec: {command[:200]}'):
+                return jsonify({'error': 'Action classified as destructive - requires approval'}), 403
 
         _audit_shell_op('terminal_exec', {'command': command[:200]})
 
         try:
-            # shell=False prevents command injection; shlex.split tokenizes safely
-            cmd_list = shlex.split(command)
             result = subprocess.run(
                 cmd_list, shell=False, capture_output=True,
                 text=True, timeout=timeout, cwd=cwd)

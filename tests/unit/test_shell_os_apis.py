@@ -278,6 +278,32 @@ class TestShellTerminal(unittest.TestCase):
                             json={'command': 'sleep 60', 'timeout': 1})
         self.assertEqual(r.status_code, 408)
 
+    def test_readonly_command_skips_the_llm_classifier(self):
+        """Real-HW fix: a read-only diagnostic command must NOT call the (LLM-backed)
+        destructive classifier, so the Terminal stays usable when the local LLM is busy
+        (every command was returning 'Fetch is aborted' because the classify call hung)."""
+        client = _make_os_app()
+        fake = type('R', (), {'stdout': 'log line', 'stderr': '', 'returncode': 0})()
+        with patch('integrations.agent_engine.shell_os_apis._classify_destructive') as clf, \
+             patch('integrations.agent_engine.shell_os_apis.subprocess.run',
+                   return_value=fake) as run:
+            clf.return_value = False  # would BLOCK the command if it were ever consulted
+            r = client.post('/api/shell/terminal/exec',
+                            json={'command': 'journalctl -b -p warning'})
+        self.assertEqual(r.status_code, 200)            # ran despite classifier=block
+        clf.assert_not_called()                          # the fast-path skipped the classifier
+        run.assert_called_once()
+        self.assertEqual(run.call_args[0][0][0], 'journalctl')  # the real binary ran
+
+    def test_non_readonly_command_still_classified(self):
+        """A command NOT on the read-only allowlist is still gated by the classifier."""
+        client = _make_os_app()
+        with patch('integrations.agent_engine.shell_os_apis._classify_destructive',
+                   return_value=False) as clf:
+            r = client.post('/api/shell/terminal/exec', json={'command': 'cp a b'})
+        self.assertEqual(r.status_code, 403)             # blocked as destructive
+        clf.assert_called_once()                          # the classifier WAS consulted
+
 
 # ═══════════════════════════════════════════════════════════════
 # User Accounts
