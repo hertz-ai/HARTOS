@@ -230,12 +230,39 @@ in
     (lib.mkIf kernelCfg.aiCompute.enable {
 
       # GPU kernel modules
+      #
+      # Only the Intel iGPU (i915) is force-loaded: it drives the panel on
+      # the Intel + integrated-graphics desktop, so KMS must come up
+      # deterministically at boot. The discrete-GPU modules are NOT
+      # force-loaded. boot.kernelModules feeds systemd-modules-load.service,
+      # which FAILS the unit when a listed module is absent from the running
+      # kernel. On a box without that hardware (e.g. the Intel + GeForce
+      # 940MX laptop, which has no AMD GPU and ships no proprietary NVIDIA
+      # driver), force-loading "amdgpu"/"nvidia" errored out and degraded the
+      # boot. Instead the discrete drivers are made available for udev to
+      # auto-load by PCI modalias, only when the matching hardware is
+      # actually present (load-if-present: never fails on absent hardware).
+      # A server/edge box with a real discrete GPU still gets its driver:
+      # udev matches the dGPU PCI modalias and loads it; nvidia_drm is also
+      # brought up by the nvidia-drm.modeset kernel param below, and
+      # nvidia_uvm is loaded on first CUDA use.
       boot.kernelModules = [
-        "nvidia"          # NVIDIA (loaded if hardware present)
-        "nvidia_uvm"      # NVIDIA Unified Virtual Memory (GPU ↔ CPU)
-        "nvidia_drm"      # NVIDIA Direct Rendering Manager
-        "amdgpu"          # AMD GPU (loaded if hardware present)
-        "i915"            # Intel integrated GPU
+        "i915"            # Intel integrated GPU - drives the panel (force-load)
+      ];
+
+      # Discrete-GPU drivers: load-if-present, so absent hardware never fails
+      # systemd-modules-load. Only amdgpu is listed here: it is IN-TREE, so it
+      # exists in the kernel module set and udev auto-loads it by PCI modalias
+      # when an AMD GPU is present. The proprietary NVIDIA modules (nvidia,
+      # nvidia_uvm, nvidia_drm) are OUT-OF-TREE - they are NOT in the mainline
+      # kernel module set, so listing them here would fail the initrd build
+      # ("module not found"). They are loaded by the nvidia package's own udev
+      # rules + the nvidia-drm.modeset param when hardware.nvidia is configured
+      # (server/edge); on a box without NVIDIA they simply never load. The old
+      # boot.kernelModules force-load of nvidia/amdgpu is what failed systemd-
+      # modules-load on the Intel + 940MX desktop.
+      boot.initrd.availableKernelModules = [
+        "amdgpu"          # AMD GPU - in-tree, udev loads it when present
       ];
 
       # Transparent Huge Pages: 2MB pages for model loading
