@@ -312,12 +312,18 @@ class GlassShellLayer:
         # loading — the GTK4/WebKit-6.0 load-changed signal mirrors the GTK3 cage
         # floor's. This marks Tier-2 HEALTHY so the paint-watchdog does NOT drop it.
         webview.connect('load-changed', self._on_load_changed)
-        # Diagnostic only (does NOT touch the marker): surface WHY a load failed to
-        # the journal so a real-HW boot shows the reason instead of a silent blank.
-        # The first-paint marker still fires solely on LoadEvent.FINISHED (which
-        # WebKit emits even after a failed load), keeping the watchdog contract
-        # byte-identical to the cage GTK3 floor.
+        # Sets the _last_load_failed guard (and journals the reason) so the FINISHED
+        # that WebKit STILL emits after a failed load (it substitutes a stock error
+        # page) does NOT touch the shell-ready marker in _on_load_changed. A blank /
+        # error surface (e.g. :6800 connection-refused) must read as HUNG so the
+        # supervisor drops to a working tier, NOT count as HEALTHY (the false-healthy
+        # WebKit FMEA). A GOOD load leaves the guard False, so it still fires the
+        # marker on FINISHED, byte-identical to before.
         webview.connect('load-failed', self._on_load_failed)
+        # False-healthy guard, cleared on every fresh load_uri (this initial
+        # navigation), set in _on_load_failed. Initialised before load_uri runs so it
+        # is always defined before the first load-changed / load-failed fires.
+        self._last_load_failed = False
         webview.load_uri(SHELL_URL)
         s = webview.get_settings()
         s.set_enable_javascript(True)
@@ -368,7 +374,12 @@ class GlassShellLayer:
         self._webview.grab_focus()
 
     def _on_load_changed(self, _webview, event):
-        # Touch the first-paint marker once the WebView finishes its first load.
+        # Touch the first-paint marker once the WebView finishes its first load --
+        # but ONLY when that load actually SUCCEEDED. WebKit emits LoadEvent.FINISHED
+        # even after a failed load (it substitutes a stock error page), so gating on
+        # _last_load_failed is what stops a blank :6800-refused surface from touching
+        # shell-ready and counting as HEALTHY (the false-healthy WebKit FMEA). A GOOD
+        # load leaves _last_load_failed False, so this path stays byte-identical.
         #
         # This is the GTK4/WebKit-6.0 mirror of the GTK3 cage floor's
         # _on_load_changed. WITHOUT it the connected load-changed handler does not
@@ -377,19 +388,28 @@ class GlassShellLayer:
         # surface out as HUNG and drops to the cage floor - the EXACT shell-ready-
         # never-fires half of the pointer-only regression. LoadEvent.FINISHED is the
         # WebKitGTK-6.0 enum (same name as the GTK3 WebKit2 binding). Re-grab focus on
-        # first paint so typing works once the page JS has run (mirrors the cage
-        # floor + the m2 WSL reference host).
+        # every FINISHED (good load or error page) so typing works once the page JS
+        # has run (mirrors the cage floor + the m2 WSL reference host); only the
+        # shell-ready marker is gated on the load actually succeeding.
         if event == WebKit.LoadEvent.FINISHED:
-            _signal_painted()
+            if not self._last_load_failed:
+                _signal_painted()
             self._webview.grab_focus()
 
     def _on_load_failed(self, _webview, _event, failing_uri, error):
+        # Mark this load as FAILED so the LoadEvent.FINISHED that WebKit STILL emits
+        # afterwards (it substitutes a stock error page) does NOT touch the shell-ready
+        # marker in _on_load_changed. A blank / error surface (e.g. :6800 connection-
+        # refused) must read as HUNG so the supervisor drops to a working tier, NOT
+        # count as HEALTHY (the false-healthy WebKit FMEA). The flag is cleared on the
+        # next fresh load_uri, so a later successful load still signals first-paint.
+        # Set FIRST, before the (best-effort) journal print, so the guard holds even
+        # if logging raises.
+        self._last_load_failed = True
         # Journal-only diagnostic so a real-HW boot shows the load-failure reason
         # (connection refused while :6800 is still coming up, TLS, etc.) instead of a
-        # silent blank surface. Deliberately does NOT touch the shell-ready marker:
-        # WebKit still emits load-changed FINISHED after a failed load, so the marker
-        # fires there (same signal, same path as the cage floor). Returning False
-        # lets WebKit show its default error page (never raises out of the handler).
+        # silent blank surface. Returning False lets WebKit show its default error
+        # page (never raises out of the handler).
         import sys
         try:
             detail = getattr(error, 'message', None) or str(error)
