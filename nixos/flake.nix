@@ -139,10 +139,22 @@
       ./modules/hart-nvidia.nix
       ./modules/hart-luks.nix
       ./modules/hart-firewall.nix
+      # Secure DNS (DoH/DoT via systemd-resolved). Opt-in (hart.dns.enable=false
+      # default) -> pure no-op for every variant; the desktop config turns it on
+      # (privacy-first: encrypted resolution by default). Imported here so the
+      # option exists + the desktop closure can enable it without an un-imported-
+      # module eval failure.
+      ./modules/hart-dns.nix
       ./modules/hart-power.nix
       ./modules/hart-accessibility.nix
       # Desktop management
       ./modules/hart-cups.nix
+      # Thunderbird email client + default mailto handler + GNOME-keyring creds.
+      # Opt-in (hart.email.enable=false default) -> pure no-op for every variant;
+      # the desktop config turns it on and it OWNS the mailto MIME association
+      # (the desktop xdg.mime block no longer sets x-scheme-handler/mailto, so the
+      # two can't collide). Imported here so the option exists.
+      ./modules/hart-email.nix
       ./modules/hart-nightlight.nix
       ./modules/hart-ime.nix
       ./modules/hart-gaming.nix

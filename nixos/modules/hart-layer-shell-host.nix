@@ -266,6 +266,27 @@ class GlassShellLayer:
         keyctl = Gtk.EventControllerKey.new()
         keyctl.connect('key-pressed', self._on_key)
         self._win.add_controller(keyctl)
+
+        # Reliable keyboard focus (the LIVE-OS #2 'typing is dead' fix).
+        # A single post-present() grab_focus() is NOT reliable: on a BACKGROUND
+        # layer-shell surface with KeyboardMode.ON_DEMAND the compositor does not
+        # auto-route keys to us, and grab_focus() is a no-op on a widget that is
+        # not yet realized/mapped, so the very first present() grab can fire
+        # before the surface exists and the caret/typing stay dead. Wire the grab
+        # to the realize AND map signals (fired when the surface actually comes
+        # up) so focus is taken the moment it CAN stick. Connect BEFORE present()
+        # so the map handler runs during it.
+        self._win.connect('realize', self._on_realize)
+        self._win.connect('map', self._on_map)
+        # Re-grab on every pointer press so clicking the orb / command bar always
+        # makes typing live again, even after focus drifted to a native toplevel
+        # stacked above this BACKGROUND desktop. CAPTURE phase + no claim means
+        # the press still reaches the web content (we steal focus, not the event).
+        click = Gtk.GestureClick.new()
+        click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        click.connect('pressed', self._on_pointer_press)
+        webview.add_controller(click)
+
         # GTK4: present() (no .show_all()); layer-shell sizes it to the anchors.
         self._win.present()
         # Explicitly grab keyboard focus into the WebView after present(). With
@@ -289,6 +310,24 @@ class GlassShellLayer:
         if event == WebKit.LoadEvent.FINISHED:
             _signal_painted()
             self._webview.grab_focus()
+
+    def _on_realize(self, _widget):
+        # The surface now has a backing GdkSurface, the earliest point a
+        # grab_focus() can stick. Pairs with KeyboardMode.ON_DEMAND so the shell
+        # is ready to type into as soon as it is realized.
+        self._webview.grab_focus()
+
+    def _on_map(self, _widget):
+        # The surface is now mapped (visible). grab_focus() on an unmapped widget
+        # is a no-op, so this map-time re-grab is what actually makes the first
+        # keystrokes land: THE reliable focus point for the layer surface.
+        self._webview.grab_focus()
+
+    def _on_pointer_press(self, _gesture, _n_press, _x, _y):
+        # Any pointer press re-asserts keyboard focus into the WebView so a click
+        # on the orb / command bar always makes typing live, even after focus
+        # drifted to a native window above this BACKGROUND desktop layer.
+        self._webview.grab_focus()
 
     def _on_key(self, _ctrl, keyval, _keycode, _state):
         from gi.repository import Gdk

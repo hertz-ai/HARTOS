@@ -302,6 +302,26 @@ in
     # can't be matched. Intentionally BootNext (one-shot), never BootOrder, so it
     # can never strand the user's Windows boot.
     bootContinuity.enable = true;
+
+    # ── Privacy-first networking + desktop apps (Category-4 LOCAL features) ──
+    # Per the privacy-first principle every LOCAL capability ships ON by default
+    # (no opt-in friction); nothing here leaves the device without consent.
+    #   - firewall: nftables zones + SYN-flood rate limiting + fwupd firmware
+    #     checks. The module enables networking.nftables and uses
+    #     extraInputRules (NOT the iptables-only extraCommands) so it coexists
+    #     with the rest of the desktop closure WITHOUT the iptables-vs-nftables
+    #     assertion that broke iso-desktop before. Ports: hart backend (6777) +
+    #     SSH (22) TCP, discovery UDP.
+    #   - dns: encrypted resolution (DoT via systemd-resolved, Cloudflare
+    #     default). A pure local resolver config; systemd-resolved coexists with
+    #     GNOME's NetworkManager (NM uses resolved as its DNS backend).
+    #   - email: Thunderbird as the default mailto handler. The email module OWNS
+    #     the x-scheme-handler/mailto MIME association (the desktop xdg.mime block
+    #     below no longer sets it, so the two definitions can't collide), and its
+    #     gnome-keyring/PAM-login settings agree with GNOME's own (both true).
+    firewall.enable = true;
+    dns.enable = true;
+    email.enable = true;
   };
 
   # HART application package
@@ -638,7 +658,10 @@ in
     "audio/mpeg" = "io.bassi.Amberol.desktop";
     "audio/flac" = "io.bassi.Amberol.desktop";
     "inode/directory" = "org.gnome.Nautilus.desktop";
-    "x-scheme-handler/mailto" = "org.mozilla.Thunderbird.desktop";
+    # x-scheme-handler/mailto is OWNED by hart-email.nix (hart.email.enable above),
+    # which registers thunderbird.desktop as the mailto handler. Setting it here
+    # too would be a second, conflicting attrsOf-str definition (different value)
+    # and fail eval, so the email module is the single source of truth for it.
   };
 
   # D-Bus policy for HART agent bridge
