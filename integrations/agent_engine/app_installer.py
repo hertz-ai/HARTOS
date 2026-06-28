@@ -28,6 +28,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -95,6 +96,22 @@ class InstallResult:
     # and runnable", and is the honest replacement for the old copy-that-claimed-
     # success Android fallback.
     staged: bool = False
+
+    @property
+    def verified(self) -> bool:
+        """Post-install confirmation signal (the "post-install verified" the
+        background-job UI surfaces).
+
+        This module's standing contract is that a handler returns success=True
+        ONLY after a POSITIVE runtime confirmation — package-manager exit 0,
+        ``waydroid app list`` showing the package, the Darling prefix booting,
+        the managed-policy id read back off disk, or the extension registry
+        loading it. So a NON-STAGED success IS the verified signal. A staged
+        result is a file on disk that no runtime confirmed, hence never
+        verified. Derived (not a stored field) so no handler return site needs
+        rewriting to set it.
+        """
+        return bool(self.success) and not self.staged
 
 
 # ─── Extension → Platform mapping ───────────────────────────
@@ -193,6 +210,16 @@ class AppInstaller:
         self._install_dir = os.environ.get(
             'HART_APP_DIR', '/var/lib/hart/apps')
         self._history: List[dict] = []
+        # ── Background install-job state (one at a time) ──
+        # A single lock guards the live progress dict so the worker thread and
+        # the /progress reader never see a torn update. ``_job`` is the latest
+        # job's progress snapshot (or None before the first install); ``_job_seq``
+        # mints a monotonic per-job token so a superseded job can never clobber a
+        # newer one's progress.
+        self._job_lock = threading.Lock()
+        self._job: Optional[Dict] = None
+        self._job_thread: Optional[threading.Thread] = None
+        self._job_seq = 0
 
     def install(self, req: InstallRequest) -> InstallResult:
         """Install an application from any platform.
@@ -551,6 +578,155 @@ class AppInstaller:
     def history(self) -> List[dict]:
         """Get installation history."""
         return list(self._history)
+
+    # ─── Background install job (determinate progress) ──────
+
+    def start_install(self, req: InstallRequest) -> Dict:
+        """Begin a DETERMINATE background install job — ONE at a time.
+
+        Wraps (never rewrites) the existing blocking ``install()`` on a worker
+        thread and publishes phase/fraction into a lock-guarded progress dict the
+        UI polls via ``get_progress()``. If a job is still in flight (phase not
+        ``done``/``error``) the call is refused with ``busy=True`` plus the live
+        progress so the caller can show what is already running. Returns an
+        envelope carrying a per-job ``token`` the client echoes back when polling
+        (so a superseded poller can detect it lost the slot). The synchronous
+        ``install()`` path is untouched and keeps working.
+        """
+        with self._job_lock:
+            if self._job is not None and self._job.get('phase') not in (
+                    'done', 'error'):
+                return {
+                    'ok': False, 'busy': True,
+                    'error': 'an install is already in progress',
+                    'progress': dict(self._job),
+                }
+            self._job_seq += 1
+            token = self._job_seq
+            self._job = {
+                'token': token,
+                'phase': 'downloading',
+                'fraction': 0.05,
+                'name': (req.name
+                         or (os.path.basename(req.source) if req.source else '')
+                         or req.source or 'app'),
+                'platform': (req.platform.value
+                             if req.platform != InstallerPlatform.UNKNOWN else ''),
+                'success': False,
+                'staged': False,
+                'verified': False,
+                'app_id': '',
+                'version': '',
+                'error': '',
+                'started': time.time(),
+                'updated': time.time(),
+            }
+            snapshot = dict(self._job)
+            worker = threading.Thread(
+                target=self._run_install_job, args=(req, token), daemon=True)
+            self._job_thread = worker
+        worker.start()
+        return {'ok': True, 'token': token, 'progress': snapshot}
+
+    def get_progress(self) -> Dict:
+        """Lock-guarded snapshot of the active/last install job.
+
+        Returns an idle envelope before the first install. ``active`` is True
+        while the job is still running (phase not ``done``/``error``).
+        """
+        with self._job_lock:
+            if self._job is None:
+                return {'active': False, 'phase': 'idle', 'fraction': 0.0}
+            snap = dict(self._job)
+        snap['active'] = snap.get('phase') not in ('done', 'error')
+        return snap
+
+    def _job_set(self, token: int, **updates) -> None:
+        """Lock-guarded partial update of the live progress dict, applied ONLY if
+        ``token`` is still the active job (a superseded job never clobbers a
+        newer one's progress)."""
+        with self._job_lock:
+            if self._job is None or self._job.get('token') != token:
+                return
+            self._job.update(updates)
+            self._job['updated'] = time.time()
+
+    def _creep_fraction(self, token: int, stop: threading.Event,
+                        cap: float) -> None:
+        """Advance the active job's fraction asymptotically toward ``cap`` (never
+        reaching it) while the blocking handler runs, so the determinate bar
+        shows liveness.
+
+        The platform handlers fetch AND install inside one opaque blocking call,
+        so a real sub-progress fraction is not parseable without rewriting them.
+        This is an HONEST estimate: it is strictly bounded BELOW the next real
+        checkpoint (``verifying`` at 0.92) so it can never claim the install
+        finished, and it only touches THIS token's job while the phase is still
+        ``installing``.
+        """
+        while not stop.wait(0.5):
+            with self._job_lock:
+                if self._job is None or self._job.get('token') != token:
+                    return
+                if self._job.get('phase') != 'installing':
+                    return
+                cur = float(self._job.get('fraction', 0.12))
+                # Close 15% of the remaining gap each tick → asymptotic approach,
+                # mathematically never equal to cap.
+                self._job['fraction'] = round(cur + (cap - cur) * 0.15, 4)
+                self._job['updated'] = time.time()
+
+    def _run_install_job(self, req: InstallRequest, token: int) -> None:
+        """Worker: run the EXISTING ``install()`` for ``req`` and report its
+        honest outcome (success / staged / verified) through the progress dict.
+
+        Phase model (every transition is a REAL state change):
+          downloading → installing → verifying → done | error
+        The download/install boundary is not observable inside the opaque handler
+        so it is covered by the single ``installing`` phase (with the bounded
+        estimated creep above); ``verifying`` reflects reading back the handler's
+        positive confirmation; ``done``/``error`` are terminal.
+        """
+        stop_creep = threading.Event()
+        try:
+            self._job_set(token, phase='installing', fraction=0.12)
+            creeper = threading.Thread(
+                target=self._creep_fraction, args=(token, stop_creep, 0.85),
+                daemon=True)
+            creeper.start()
+            try:
+                result = self.install(req)
+            finally:
+                stop_creep.set()
+
+            # Read back the handler's POSITIVE confirmation — the post-install
+            # check it already performed (waydroid app list / policy read-back /
+            # registry load / package-manager exit). ``verified`` is derived from
+            # that on InstallResult.
+            self._job_set(token, phase='verifying', fraction=0.92)
+            if result.success:
+                self._job_set(
+                    token, phase='done', fraction=1.0, success=True,
+                    staged=False, verified=result.verified,
+                    app_id=result.app_id, platform=result.platform,
+                    version=result.version, name=result.name, error='')
+            elif result.staged:
+                # Staged = file on disk, no runtime confirmed it. Terminal but
+                # NOT a success and NOT an error — its own honest outcome.
+                self._job_set(
+                    token, phase='done', fraction=1.0, success=False,
+                    staged=True, verified=False, app_id=result.app_id,
+                    platform=result.platform, name=result.name,
+                    error=result.error)
+            else:
+                self._job_set(
+                    token, phase='error', fraction=1.0, success=False,
+                    staged=False, verified=False, platform=result.platform,
+                    name=result.name, error=result.error or 'install failed')
+        except Exception as e:  # never let the worker die silently
+            stop_creep.set()
+            self._job_set(token, phase='error', fraction=1.0, success=False,
+                          staged=False, verified=False, error=str(e))
 
     # ─── Platform Handlers ──────────────────────────────────
 
@@ -1619,6 +1795,26 @@ def register_app_install_routes(app):
             return fn
         return deco
 
+    def _install_req_from_json(data) -> InstallRequest:
+        """Build an InstallRequest from a request body. ONE parser shared by the
+        synchronous /install and the background /install/start routes — no
+        parallel body-parsing path. install() re-detects the platform
+        authoritatively; an explicit ``platform`` here is just a hint/override."""
+        platform = InstallerPlatform.UNKNOWN
+        platform_str = data.get('platform', '')
+        for p in InstallerPlatform:
+            if p.value == platform_str:
+                platform = p
+                break
+        return InstallRequest(
+            source=data.get('source', ''),
+            platform=platform,
+            name=data.get('name', ''),
+            version=data.get('version', ''),
+            sha256=data.get('sha256', ''),
+            options=data.get('options', {}),
+        )
+
     @_route('/install', methods=['POST'])
     @_require_shell_auth
     def shell_apps_install():
@@ -1631,25 +1827,10 @@ def register_app_install_routes(app):
             sha256: str — (optional) expected checksum
         """
         data = request.get_json(force=True)
-        source = data.get('source', '')
-        if not source:
+        if not data.get('source'):
             return jsonify({'error': 'source required'}), 400
 
-        platform_str = data.get('platform', '')
-        platform = InstallerPlatform.UNKNOWN
-        for p in InstallerPlatform:
-            if p.value == platform_str:
-                platform = p
-                break
-
-        req = InstallRequest(
-            source=source,
-            platform=platform,
-            name=data.get('name', ''),
-            version=data.get('version', ''),
-            sha256=data.get('sha256', ''),
-            options=data.get('options', {}),
-        )
+        req = _install_req_from_json(data)
 
         installer = get_installer()
         result = installer.install(req)
@@ -1657,6 +1838,7 @@ def register_app_install_routes(app):
         return jsonify({
             'success': result.success,
             'staged': result.staged,
+            'verified': result.verified,
             'platform': result.platform,
             'name': result.name,
             'version': result.version,
@@ -1665,6 +1847,39 @@ def register_app_install_routes(app):
             'error': result.error,
             'duration': round(result.duration_seconds, 2),
         }), 200 if result.success else 400
+
+    @_route('/install/start', methods=['POST'])
+    @_require_shell_auth
+    def shell_apps_install_start():
+        """Begin a DETERMINATE background install (ONE at a time).
+
+        Body shape is identical to /install. Returns ``{ok, token, progress}`` on
+        a fresh start; ``409`` with ``{busy: true, progress}`` if an install is
+        already running. Poll /install/progress for phase + fraction + the
+        post-install ``verified`` flag. The synchronous /install route is
+        unaffected and still works.
+        """
+        data = request.get_json(force=True)
+        if not data.get('source'):
+            return jsonify({'error': 'source required'}), 400
+
+        req = _install_req_from_json(data)
+        envelope = get_installer().start_install(req)
+        if not envelope.get('ok'):
+            # busy → 409 (already running) so the client distinguishes it from a
+            # 400 bad-request; any other refusal → 400.
+            return jsonify(envelope), 409 if envelope.get('busy') else 400
+        return jsonify(envelope), 200
+
+    @_route('/install/progress', methods=['GET'])
+    def shell_apps_install_progress():
+        """Poll the active/last background install job's progress.
+
+        Read-only status (no auth gate, mirroring /installed + /search):
+        ``{active, phase, fraction, name, platform, success, staged, verified,
+        app_id, error}``.
+        """
+        return jsonify(get_installer().get_progress())
 
     @_route('/uninstall', methods=['POST'])
     @_require_shell_auth

@@ -39,63 +39,144 @@
   ];
   var CATS = ['Web', 'Creative', 'Media', 'Productivity', 'Develop', 'Chat', 'Games'];
 
+  // Single base for the EXISTING installer route surface (app_installer.py). The
+  // determinate flow composes the background-job endpoints off it
+  // ('/api/apps/install/start' + '/api/apps/install/progress'); the synchronous
+  // '/api/apps/install' remains the same family. One base, no parallel installer.
+  var INSTALL_API = '/api/apps/install';
+
   function toast(t, m, sev) { if (window.showToast) window.showToast(t, m, sev || 'info'); }
 
-  // Honest install: drive the button through its own lifecycle off the REAL
-  // server response (the old code fired-and-forgot a misleading "Installing"
-  // toast even when the platform was unavailable / the install failed). The
-  // installer returns {success, staged, name, error, platform}; staged is NEVER
-  // success (a downloaded-but-not-applied file), so it gets its own message.
-  // Indeterminate install progress bar. The backend installer is a BLOCKING
-  // flatpak call with no progress stream, so an honest % isn't available yet (a
-  // determinate bar would be a lie). This shows a sweeping bar under the button so
-  // the user sees work is happening — not a frozen "Installing…". Built with inline
-  // styles + the Web Animations API (no CSS f-string edit, no brace-escape risk);
-  // degrades to a static track if element.animate is absent. Returns a remover.
-  function installBar(btn) {
-    if (!btn || !btn.parentNode) return function () {};
+  // Determinate install progress bar. The backend now runs the install as a
+  // one-at-a-time background job (POST /api/apps/install/start) and publishes
+  // real phase checkpoints (downloading -> installing -> verifying -> done) plus
+  // a bounded fraction over GET /api/apps/install/progress. This bar fills to that
+  // fraction (no indeterminate sweep) and the button text tracks the phase, so the
+  // user sees genuine progress and, at the end, the honest "verified" confirmation.
+  // Built with inline styles (no CSS edit). Returns {set, remove}.
+  function progressBar(btn) {
+    if (!btn || !btn.parentNode) return null;
     var track = document.createElement('div');
     track.setAttribute('style', 'height:3px;margin-top:6px;border-radius:3px;overflow:hidden;' +
       'background:rgba(255,255,255,0.12)');
     var fill = document.createElement('div');
-    fill.setAttribute('style', 'height:100%;width:40%;border-radius:3px;' +
-      'background:linear-gradient(90deg,transparent,#00D4AA,transparent)');
+    fill.setAttribute('style', 'height:100%;width:0%;border-radius:3px;' +
+      'background:linear-gradient(90deg,#00D4AA,#7C5CFF);transition:width 0.45s ease');
     track.appendChild(fill);
     btn.parentNode.appendChild(track);
-    var anim = null;
-    try {
-      anim = fill.animate(
-        [{ transform: 'translateX(-120%)' }, { transform: 'translateX(320%)' }],
-        { duration: 1100, iterations: Infinity, easing: 'ease-in-out' });
-    } catch (_) { fill.style.width = '100%'; fill.style.opacity = '0.6'; }
-    return function () { try { if (anim) anim.cancel(); } catch (_) {} if (track.parentNode) track.parentNode.removeChild(track); };
+    return {
+      set: function (frac) {
+        var f = (typeof frac === 'number' && frac >= 0) ? frac : 0;
+        if (f > 1) f = 1;
+        fill.style.width = (f * 100).toFixed(1) + '%';
+      },
+      remove: function () { if (track.parentNode) track.parentNode.removeChild(track); }
+    };
+  }
+
+  function phaseLabel(phase) {
+    if (phase === 'downloading') return 'Downloading…';
+    if (phase === 'verifying') return 'Verifying…';
+    if (phase === 'done') return 'Finishing…';
+    return 'Installing…';   // installing + any unknown intermediate phase
+  }
+
+  // Terminal outcome handler. Drives the button + toast off the REAL job result
+  // (success/verified/staged/error). staged is NEVER a success (a downloaded-but-
+  // not-applied file); verified is the post-install confirmation the background
+  // job reads back from the platform handler.
+  function finishInstall(app, btn, bar, res) {
+    res = res || {};
+    if (bar) bar.remove();
+    if (res.success) {
+      if (btn) { btn.disabled = true; btn.textContent = 'Installed'; btn.classList.add('is-installed'); }
+      var detail = res.verified
+        ? ((res.platform || 'flatpak') + ' - verified, added to your apps')
+        : ((res.platform || 'flatpak') + ' - added (verification pending)');
+      toast('Installed ' + app.n, detail, 'success');
+    } else if (res.staged) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Install'; }
+      toast('Downloaded ' + app.n, 'Staged - finish from the App Store when ready', 'warning');
+    } else {
+      if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+      toast('Could not install ' + app.n, res.error || 'The installer is unavailable on this system', 'error');
+    }
+  }
+
+  // Poll the background job's progress until it reaches a terminal phase. The
+  // 'token' ties this poller to its own job: if a newer install supersedes it (the
+  // backend is one-at-a-time and re-tokens each job) we stop quietly instead of
+  // reporting someone else's result onto this card.
+  function pollProgress(app, btn, bar, token) {
+    var tries = 0;
+    function tick() {
+      tries++;
+      fetch(INSTALL_API + '/progress',
+        { signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(6000) : null })
+        .then(function (r) { return r.json(); })
+        .then(function (res) {
+          res = res || {};
+          if (token != null && res.token != null && res.token !== token) {
+            // Our slot was taken over by a newer install. Release this card.
+            if (bar) bar.remove();
+            if (btn) { btn.disabled = false; btn.textContent = 'Install'; }
+            return;
+          }
+          var phase = res.phase || 'installing';
+          if (bar && typeof res.fraction === 'number') bar.set(res.fraction);
+          if (btn) btn.textContent = phaseLabel(phase);
+          if (phase === 'done' || phase === 'error') { finishInstall(app, btn, bar, res); return; }
+          setTimeout(tick, 700);
+        })
+        .catch(function () {
+          // Transient poll failure: retry a bounded number of times before giving
+          // up (covers a brief shell hiccup without spinning forever).
+          if (tries < 80) { setTimeout(tick, 1000); return; }
+          finishInstall(app, btn, bar, { error: 'Lost contact with the installer' });
+        });
+    }
+    tick();
   }
 
   function install(app, btn) {
-    var clearBar = function () {};
-    if (btn) { btn.disabled = true; btn.textContent = 'Installing…'; clearBar = installBar(btn); }
-    fetch('/api/apps/install', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+    var bar = progressBar(btn);
+    if (bar) bar.set(0.05);
+    fetch(INSTALL_API + '/start', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       // pass both shapes: {package,platform} (what the existing UI sends) AND a
       // source hint (app_installer keys flatpak off a 'flatpak:' source).
       body: JSON.stringify({ package: app.id, platform: 'flatpak', source: 'flatpak:' + app.id }),
-      signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(120000) : null })
-      .then(function (r) { return r.json().catch(function () { return { success: r.ok }; }); })
+      signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(15000) : null })
+      .then(function (r) {
+        var status = r.status;
+        return r.json().catch(function () { return { ok: r.ok }; }).then(function (j) {
+          j = j || {}; j._status = status; return j;
+        });
+      })
       .then(function (res) {
         res = res || {};
-        clearBar();
-        if (res.success) {
-          if (btn) { btn.textContent = 'Installed'; btn.classList.add('is-installed'); }
-          toast('Installed ' + app.n, (res.platform || 'flatpak') + ' - added to your apps', 'success');
-        } else if (res.staged) {
+        if (res._status === 409 || res.busy) {
+          // Another app is installing (backend is one-at-a-time). Reset and ask
+          // the user to retry shortly. Never silently queue or fake progress.
+          if (bar) bar.remove();
           if (btn) { btn.disabled = false; btn.textContent = 'Install'; }
-          toast('Downloaded ' + app.n, 'Staged - finish from the App Store when ready', 'warning');
-        } else {
+          toast('Please wait', 'Another app is installing. Try again in a moment.', 'warning');
+          return;
+        }
+        if (res.ok === false) {
+          if (bar) bar.remove();
           if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
           toast('Could not install ' + app.n, res.error || 'The installer is unavailable on this system', 'error');
+          return;
         }
+        // Job accepted. Switch to determinate polling.
+        var prog = res.progress || {};
+        if (bar && typeof prog.fraction === 'number') bar.set(prog.fraction);
+        if (btn) btn.textContent = phaseLabel(prog.phase || 'installing');
+        pollProgress(app, btn, bar, res.token);
       })
       .catch(function () {
-        clearBar();
+        if (bar) bar.remove();
         if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
         toast('Install failed', app.n + ' - no response from the installer', 'error');
       });
