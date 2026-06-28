@@ -78,69 +78,331 @@
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * DESIGN OVERHAUL v2 (2026-06-27) — futuristic AI-native glass, ALL widths.
- * The steward: "styling looks outdated; a Behance designer would design a
- * futuristic desktop." Loaded last, so this token + surface override wins over
- * the inline default AND the theme path without touching any markup/ID/class.
- * The #1 fix: a real UI typeface instead of mono-everywhere. Then deep-space
- * ambient (not saturated blue), layered frosted glass with depth, teal-as-glow,
- * generous radius. A user's saved wallpaper/theme (inline element style) still
- * wins, so this only re-skins the DEFAULT look.
+ * DESIGN OVERHAUL v3 CINEMATIC (2026-06-28) — "Netflix Home" for HART OS.
+ * Evolves the v2 futuristic-glass pass. The steward: make the whole desktop
+ * "look + move like NETFLIX HOME: cinematic, immersive, premium, 100x optimal
+ * and crazy to see" — and explicitly REJECTED single-hue teal: weave the full
+ * Hevolve brand SPECTRUM tastefully across cards/accents/gradients.
+ *
+ * This file loads LAST (after the inline <style>'s _CSS_LIVING_GLASS), so it
+ * wins on source order WITHOUT touching any markup / ID / class name. It
+ * REUSES the existing --lg-* glass/glow/motion tokens and --t-* durations
+ * rather than forking a second motion grammar; the only NEW tokens it adds are
+ * the brand spectrum (--hv-*), which had no single source before (the ambient
+ * used ad-hoc rgba). A user's saved wallpaper/theme (inline element style)
+ * still wins — this only re-skins the DEFAULT look.
+ *
+ * Motion law: GPU-only (transform / opacity / filter), 60fps, cubic-bezier
+ * ~(.2,.8,.2,1) for the signature Netflix card-focus lift. Every non-essential
+ * animation is disabled under prefers-reduced-motion / html.a11y-rmotion.
+ * The orb canvas is NOT animated here (Stream B owns it) — only its surrounding
+ * ambient/space is made cinematic, all on non-orb elements.
  * ═══════════════════════════════════════════════════════════════════════════ */
 :root {
   /* UI text = humanist sans (system fonts, no network asset needed on the ISO);
-     mono kept ONLY for metrics/code via --hart-font-mono. */
+     mono kept ONLY for metrics/code via --hart-font-mono. (kept from v2) */
   --hart-font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
   --hart-font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
-  --hart-background: #08080C;
-  --hart-text: #EAF0F2;
+  --hart-background: #07070B;
+  --hart-text: #ECF1F4;
   --hart-muted: #8A93A6;
   --hart-surface: #14141F;
-  --hart-surface-hover: #1E1F2C;
+  --hart-surface-hover: #20212F;
   --hart-glass-bg: rgba(18,19,28,0.56);
   --hart-glass-border: rgba(255,255,255,0.09);
-  --hart-blur: 28px;
-  --hart-saturation: 160%;
-  --hart-radius: 18px;
-  --hart-accent-rgb: 0,212,170;
+  --hart-blur: 30px;
+  --hart-saturation: 165%;
+  --hart-radius: 20px;
+  --hart-accent-rgb: 0,230,195;
+  /* ── HEVOLVE BRAND SPECTRUM (single source; the steward's 6 hues) ── */
+  --hv-teal:    #00E6C3;  --hv-teal-rgb:    0,230,195;
+  --hv-cyan:    #29C5FF;  --hv-cyan-rgb:    41,197,255;
+  --hv-blue:    #3B82F6;  --hv-blue-rgb:    59,130,246;
+  --hv-violet:  #9B5CFF;  --hv-violet-rgb:  155,92,255;
+  --hv-magenta: #FF2E9A;  --hv-magenta-rgb: 255,46,154;
+  --hv-amber:   #FFC83D;  --hv-amber-rgb:   255,200,61;
+  /* The signature Netflix focus easing + a slightly slower "cinematic" reveal. */
+  --hv-focus: cubic-bezier(.2,.8,.2,1);
+  --hv-lift: 380ms;
 }
-/* Deep-space ambient: near-black base + faint teal/violet blooms (default only). */
+
+/* ── Cinematic base: near-black canvas + spectrum bloom + a soft vignette.
+   These layers paint UNDER the chrome (.wallpaper is z-index:0 in the shell).
+   Multi-hue, never one teal wash — a faint ambient bloom anchored to corners. */
 .wallpaper {
   background:
-    radial-gradient(58% 48% at 14% 8%, rgba(0,230,195,0.10), transparent 60%),
-    radial-gradient(55% 55% at 92% 96%, rgba(124,92,255,0.12), transparent 60%),
-    radial-gradient(120% 90% at 50% 122%, rgba(16,20,40,0.55), transparent 70%),
-    linear-gradient(160deg, #0A0A10 0%, #08080C 55%, #0A0910 100%);
+    radial-gradient(46% 40% at 12% 6%,  rgba(0,230,195,0.13),  transparent 62%),
+    radial-gradient(40% 38% at 88% 10%, rgba(41,197,255,0.11), transparent 64%),
+    radial-gradient(52% 50% at 94% 94%, rgba(155,92,255,0.15), transparent 64%),
+    radial-gradient(44% 42% at 8%  92%, rgba(255,46,154,0.10), transparent 66%),
+    radial-gradient(34% 30% at 50% 40%, rgba(59,130,246,0.07), transparent 70%),
+    radial-gradient(130% 100% at 50% 128%, rgba(10,12,26,0.62), transparent 72%),
+    linear-gradient(158deg, #0A0A11 0%, #07070B 52%, #0B0912 100%);
 }
-/* Frosted glass with real depth: inner top highlight + soft outer shadow + hairline. */
+/* Cinematic vignette — frames the screen, content-forward (purely additive,
+   pointer-events:none so it never blocks the desktop; sits above wallpaper). */
+.wallpaper::after {
+  content: ''; position: fixed; inset: 0; z-index: 1; pointer-events: none;
+  background:
+    radial-gradient(135% 120% at 50% 34%, transparent 52%, rgba(0,0,0,0.22) 82%, rgba(0,0,0,0.46) 100%);
+}
+
+/* ── Frosted glass with real depth: inner top highlight + soft outer shadow +
+   hairline. Generous, cinematic. (chrome surfaces) ── */
 .glass, .panel, .top-bar, .hart-hero-bar, .start-menu, .ctx-menu, .agent-pill {
   border: 1px solid var(--hart-glass-border);
-  box-shadow: 0 24px 70px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.05);
+  box-shadow: 0 26px 76px rgba(0,0,0,0.52), inset 0 1px 0 rgba(255,255,255,0.06);
   backdrop-filter: blur(var(--hart-blur)) saturate(var(--hart-saturation));
   -webkit-backdrop-filter: blur(var(--hart-blur)) saturate(var(--hart-saturation));
 }
-/* App-rail icon tiles: subtle gradient + accent glyph glow + hover lift. */
-.desktop-icon .di-glyph {
-  background: linear-gradient(150deg, rgba(255,255,255,0.10), rgba(255,255,255,0.02));
-  border: 1px solid var(--hart-glass-border);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.10), 0 10px 22px rgba(0,0,0,0.32);
-  border-radius: 15px;
-  transition: transform .2s cubic-bezier(.2,.8,.2,1), box-shadow .2s;
+
+/* ════════ NETFLIX HOVER-EXPAND — the signature card-focus feel ════════
+   Tiles / panels / cards SCALE UP + lift + glow + raise z on hover AND on
+   keyboard focus-within. GPU-only (transform), smooth --hv-focus easing.
+   Each surface keeps its own transition for its other props; we add the lift. */
+
+/* App-rail icon tiles: raise z + brighten on hover/focus. The visible LIFT is
+   animated on the inner .di-glyph (below), NOT on the .desktop-icon wrapper. The
+   wrapper's transform channel is owned by the drag handler (hartDesktop.js writes
+   el.style.transform = translate(dx,dy) every frame and clears it on drop), so a
+   `transition: transform` here would interpolate every drag frame (lag) and
+   overshoot on release. will-change:transform still promotes the wrapper for a
+   GPU-composited drag. */
+.desktop-icon {
+  transition: background .18s var(--hv-focus);
+  will-change: transform;
 }
-.desktop-icon .di-glyph .mi { filter: drop-shadow(0 0 8px rgba(var(--hart-accent-rgb),0.45)); }
-/* Fix the off-brand purple selection -> teal. */
+.desktop-icon:hover,
+.desktop-icon:focus-within { z-index: 40; }
+.desktop-icon.dragging { z-index: 60; }   /* drag still wins over hover lift */
+
+/* The glyph plate itself: depth + a spectrum sheen overlay (::after) that does
+   NOT fight the per-app inline style.background hartDesktop.js writes — the
+   pseudo layers a brand-hue wash ON TOP, so the rail reads colorful + alive. */
+.desktop-icon .di-glyph {
+  position: relative;
+  border: 1px solid var(--hart-glass-border);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.12), 0 10px 24px rgba(0,0,0,0.34);
+  border-radius: 16px; overflow: hidden;
+  transition: transform var(--hv-lift) var(--hv-focus), box-shadow var(--hv-lift) var(--hv-focus);
+}
+.desktop-icon .di-glyph::after {
+  content: ''; position: absolute; inset: 0; pointer-events: none; z-index: 0;
+  border-radius: inherit; mix-blend-mode: screen; opacity: .55;
+  transition: opacity var(--hv-lift) var(--hv-focus);
+}
+/* The glyph + label ride above the sheen. */
+.desktop-icon .di-glyph .mi,
+.desktop-icon .di-glyph .di-emoji { position: relative; z-index: 1; }
+.desktop-icon:hover .di-glyph,
+.desktop-icon:focus-within .di-glyph { transform: translateY(-5px) scale(1.05); }
+.desktop-icon:hover .di-glyph::after,
+.desktop-icon:focus-within .di-glyph::after { opacity: .85; }
+
+/* Per-nth-child BRAND-HUE gradient sheen + matching hover glow — cycles the 6
+   spectrum hues so a row of identical-looking tiles still feels like a spectrum,
+   not one teal. The glyph itself keeps the per-app manifest colour underneath. */
+.desktop-icon:nth-child(6n+1) .di-glyph::after { background: linear-gradient(150deg, rgba(var(--hv-teal-rgb),.40),    transparent 72%); }
+.desktop-icon:nth-child(6n+2) .di-glyph::after { background: linear-gradient(150deg, rgba(var(--hv-cyan-rgb),.40),    transparent 72%); }
+.desktop-icon:nth-child(6n+3) .di-glyph::after { background: linear-gradient(150deg, rgba(var(--hv-blue-rgb),.40),    transparent 72%); }
+.desktop-icon:nth-child(6n+4) .di-glyph::after { background: linear-gradient(150deg, rgba(var(--hv-violet-rgb),.42),  transparent 72%); }
+.desktop-icon:nth-child(6n+5) .di-glyph::after { background: linear-gradient(150deg, rgba(var(--hv-magenta-rgb),.40), transparent 72%); }
+.desktop-icon:nth-child(6n+6) .di-glyph::after { background: linear-gradient(150deg, rgba(var(--hv-amber-rgb),.40),   transparent 72%); }
+.desktop-icon:nth-child(6n+1):hover .di-glyph, .desktop-icon:nth-child(6n+1):focus-within .di-glyph { box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 14px 34px rgba(var(--hv-teal-rgb),.36); }
+.desktop-icon:nth-child(6n+2):hover .di-glyph, .desktop-icon:nth-child(6n+2):focus-within .di-glyph { box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 14px 34px rgba(var(--hv-cyan-rgb),.36); }
+.desktop-icon:nth-child(6n+3):hover .di-glyph, .desktop-icon:nth-child(6n+3):focus-within .di-glyph { box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 14px 34px rgba(var(--hv-blue-rgb),.36); }
+.desktop-icon:nth-child(6n+4):hover .di-glyph, .desktop-icon:nth-child(6n+4):focus-within .di-glyph { box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 14px 34px rgba(var(--hv-violet-rgb),.40); }
+.desktop-icon:nth-child(6n+5):hover .di-glyph, .desktop-icon:nth-child(6n+5):focus-within .di-glyph { box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 14px 34px rgba(var(--hv-magenta-rgb),.38); }
+.desktop-icon:nth-child(6n+6):hover .di-glyph, .desktop-icon:nth-child(6n+6):focus-within .di-glyph { box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 14px 34px rgba(var(--hv-amber-rgb),.36); }
+.desktop-icon .di-glyph .mi { filter: drop-shadow(0 0 9px rgba(var(--hart-accent-rgb),0.40)); }
+
+/* Marketplace app cards — Netflix-grade focus expand + colored lift. */
+.hart-app-card {
+  transition: transform var(--hv-lift) var(--hv-focus), box-shadow var(--hv-lift) var(--hv-focus), border-color .2s var(--hv-focus);
+  will-change: transform;
+}
+.hart-app-card:hover,
+.hart-app-card:focus-within {
+  transform: translateY(-8px) scale(1.025);
+  border-color: rgba(var(--hv-cyan-rgb),0.55);
+  box-shadow: inset 0 1px 0 0 rgba(255,255,255,0.12), 0 22px 54px rgba(0,0,0,0.46), 0 0 40px rgba(var(--hv-cyan-rgb),0.18);
+  z-index: 2;
+}
+
+/* Start-menu app tiles + wallpaper/theme gallery tiles: the same focus lift. */
+.start-item {
+  transition: background var(--t-fast, .18s) var(--hv-focus), transform var(--hv-lift) var(--hv-focus), box-shadow var(--hv-lift) var(--hv-focus);
+}
+.start-item:hover,
+.start-item:focus-within {
+  transform: translateY(-3px) scale(1.04);
+  box-shadow: 0 12px 30px rgba(0,0,0,0.40), 0 0 22px rgba(var(--hv-violet-rgb),0.20);
+}
+.hart-tile:hover,
+.hart-tile:focus-within { transform: translateY(-5px) scale(1.03); }
+.hart-tile:hover .htc-prev,
+.hart-tile:focus-within .htc-prev { box-shadow: 0 16px 38px rgba(0,0,0,0.42), 0 0 26px rgba(var(--hv-cyan-rgb),0.22); }
+
+/* ════════ IMAGE-CARD SCRIM + POSTER-ZOOM - text-over-art, cinematic ════════
+   .htc-prev is the real art surface (gradient swatch OR an appended <img>;
+   base sets position:relative + overflow:hidden, so a pseudo scrim + an image
+   zoom both clip cleanly). The scrim is a bottom-anchored gradient that darkens
+   the lower third: any label, status dot, or agent-composed caption laid OVER
+   the art stays readable, and the poster gains cinematic depth. Pure gradient,
+   no motion. No :has() (old WebKitGTK on the cage shell can't parse it), so the
+   scrim is gentle enough to flatter solid theme swatches too. */
+.hart-tile .htc-prev::after {
+  content: ''; position: absolute; inset: 0; z-index: 1; pointer-events: none;
+  border-radius: inherit;
+  background: linear-gradient(to top, rgba(5,6,12,0.52) 0%, rgba(5,6,12,0.14) 36%, transparent 62%);
+  opacity: .92; transition: opacity var(--t-fast, .18s) var(--hv-focus);
+}
+.hart-tile:hover .htc-prev::after,
+.hart-tile:focus-within .htc-prev::after { opacity: 1; }
+/* The status dot + any caption ride ABOVE the scrim; the image rides below it. */
+.hart-tile .htc-prev > .htc-dot { z-index: 2; }
+.hart-tile .htc-prev > img { z-index: 0; }
+/* Netflix poster-zoom: the art scales within its clipped frame on hover/focus.
+   <img> only (gradient/theme swatches have no child image, so they're untouched).
+   GPU-only transform; disabled under reduced motion below. */
+.hart-tile .htc-prev > img {
+  transition: transform var(--hv-lift) var(--hv-focus);
+  will-change: transform;
+}
+.hart-tile:hover .htc-prev > img,
+.hart-tile:focus-within .htc-prev > img { transform: scale(1.08); }
+
+/* Reusable TEXT-OVER-ART primitive - vocabulary the local LLM composes with via
+   agent_ui_update (Liquid UI is agentic; this is NOT a static page, just the
+   paint the agent reaches for). Wrap any image/gradient block in .hv-art and put
+   a caption in .hv-art-cap: the art clips + zooms on hover, the scrim guarantees
+   the caption reads, exactly like the .htc-prev poster above. Cascade-safe: only
+   activates on elements the agent explicitly tags .hv-art. */
+.hv-art {
+  position: relative; overflow: hidden; border-radius: var(--hart-radius, 18px);
+  transition: transform var(--hv-lift) var(--hv-focus), box-shadow var(--hv-lift) var(--hv-focus);
+  will-change: transform;
+}
+.hv-art > img { display: block; width: 100%; height: 100%; object-fit: cover; transition: transform var(--hv-lift) var(--hv-focus); }
+.hv-art::after {
+  content: ''; position: absolute; inset: 0; z-index: 1; pointer-events: none; border-radius: inherit;
+  background: linear-gradient(to top, rgba(4,5,11,0.74) 0%, rgba(4,5,11,0.30) 30%, transparent 58%);
+}
+.hv-art-cap {
+  position: absolute; left: 14px; right: 14px; bottom: 12px; z-index: 2;
+  color: #fff; text-shadow: 0 1px 12px rgba(0,0,0,0.66);
+}
+.hv-art:hover, .hv-art:focus-within {
+  transform: translateY(-6px) scale(1.02); z-index: 3;
+  box-shadow: 0 24px 58px rgba(0,0,0,0.50), 0 0 40px rgba(var(--hv-cyan-rgb),0.18);
+}
+.hv-art:hover > img, .hv-art:focus-within > img { transform: scale(1.07); }
+
+/* Open windows: a gentle focus glow when interacted with (does not move them —
+   panels are user-dragged, so only the shadow/border breathe, never transform). */
+.panel:focus-within {
+  border-color: rgba(var(--hv-cyan-rgb),0.30);
+  box-shadow: 0 30px 86px rgba(0,0,0,0.58), inset 0 1px 0 rgba(255,255,255,0.07), 0 0 36px rgba(var(--hv-cyan-rgb),0.12);
+}
+
+/* Fix the off-brand flat-purple selection -> spectrum teal (kept from v2). */
 .desktop-icon.selected {
   background: rgba(var(--hart-accent-rgb),0.16) !important;
-  outline: 1px solid rgba(var(--hart-accent-rgb),0.45) !important;
+  outline: 1px solid rgba(var(--hart-accent-rgb),0.50) !important;
+  box-shadow: 0 10px 32px rgba(var(--hart-accent-rgb),0.28) !important;
 }
-/* Command bar: prominent frosted pill with an accent focus halo. */
-.hart-hero-bar { border-radius: 30px; box-shadow: 0 18px 50px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.06); }
-.hart-hero-bar:focus-within { border-color: rgba(var(--hart-accent-rgb),0.55); box-shadow: 0 0 0 1px rgba(var(--hart-accent-rgb),0.35), 0 0 26px rgba(var(--hart-accent-rgb),0.25); }
-.hart-hero-go { box-shadow: 0 0 18px rgba(var(--hart-accent-rgb),0.5); }
-/* Tray hover/focus = soft accent, not flat. */
-.tray-btn:hover { background: rgba(255,255,255,0.06); }
-.tray-btn:hover .mi { color: var(--hart-text); }
+
+/* ════════ COMMAND BAR — premium frosted pill with a living accent ════════ */
+.hart-hero-bar {
+  border-radius: 32px;
+  box-shadow: 0 20px 56px rgba(0,0,0,0.46), inset 0 1px 0 rgba(255,255,255,0.07);
+}
+.hart-hero-bar:focus-within {
+  border-color: rgba(var(--hart-accent-rgb),0.55);
+  box-shadow: 0 0 0 1px rgba(var(--hart-accent-rgb),0.40), 0 0 30px rgba(var(--hart-accent-rgb),0.26), 0 20px 56px rgba(0,0,0,0.46);
+}
+/* The send button: spectrum sheen + a subtle LIVING glow pulse (filter/opacity
+   only — never the orb). Pulses gently so the accent feels alive, not static. */
+.hart-hero-go {
+  background: linear-gradient(135deg, var(--hv-teal), var(--hv-cyan)) !important;
+  box-shadow: 0 0 20px rgba(var(--hart-accent-rgb),0.48);
+  animation: hv-accent-breathe 3.6s var(--lg-breathe, ease-in-out) infinite;
+}
+.hart-hero-go:hover { filter: brightness(1.12) saturate(1.1); }
+@keyframes hv-accent-breathe {
+  0%, 100% { box-shadow: 0 0 18px rgba(var(--hart-accent-rgb),0.40); }
+  50%      { box-shadow: 0 0 30px rgba(var(--hart-accent-rgb),0.62); }
+}
+/* Brand wordmark logo keeps a spectrum-tinted glow. */
+.hart-hero-brand img { filter: drop-shadow(0 3px 14px rgba(var(--hv-cyan-rgb),0.42)); }
+
+/* Tray buttons: soft accent on hover/focus, lift handled by the inline base. */
+.tray-btn:hover, .tray-btn:focus-visible { background: rgba(255,255,255,0.07); }
+.tray-btn:hover .mi, .tray-btn:focus-visible .mi { color: var(--hart-text); }
+
 /* Tabular mono for the clock + metric numbers (the one place mono belongs). */
 .clock, .metric-value, .sys-value, [class*="-pct"], .hc-vol-pct { font-family: var(--hart-font-mono); font-variant-numeric: tabular-nums; }
 /* Start-menu logo keeps its accent glow; brand text in the UI font. */
 .start-btn span { font-weight: 600; letter-spacing: .02em; }
+
+/* ════════ CINEMATIC ENTRANCE — staggered reveal (fade + rise) ════════
+   The icon rail and panels rise into place on first paint, with a small
+   per-item delay (the Netflix "content settles in" feel). GPU-only, runs once.
+   Fill is `backwards` (NOT `both`): backwards holds the start frame during the
+   delay (no flash) but does NOT keep applying the end frame after the run. `both`
+   would pin transform/opacity at animation-priority forever, OVERRIDING the
+   inline drag transform on .desktop-icon and the :hover lift on .start-item.
+   It is NOT gated on .dragging either: toggling animation off/on per click
+   (every pointerdown adds .dragging, pointerup removes it) would RESTART the
+   entrance on every tap. */
+@keyframes hv-rise {
+  from { opacity: 0; transform: translateY(16px) scale(.985); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+.hart-desktop .desktop-icon { animation: hv-rise var(--t-reveal, 320ms) var(--hv-focus) backwards; }
+.hart-desktop .desktop-icon:nth-child(1) { animation-delay: 40ms; }
+.hart-desktop .desktop-icon:nth-child(2) { animation-delay: 80ms; }
+.hart-desktop .desktop-icon:nth-child(3) { animation-delay: 120ms; }
+.hart-desktop .desktop-icon:nth-child(4) { animation-delay: 160ms; }
+.hart-desktop .desktop-icon:nth-child(5) { animation-delay: 200ms; }
+.hart-desktop .desktop-icon:nth-child(6) { animation-delay: 240ms; }
+.hart-desktop .desktop-icon:nth-child(7) { animation-delay: 280ms; }
+.hart-desktop .desktop-icon:nth-child(8) { animation-delay: 320ms; }
+.hart-desktop .desktop-icon:nth-child(n+9) { animation-delay: 360ms; }
+/* (No `.dragging { animation: none }` guard: see the `backwards`-fill note above —
+   the entrance self-clears, so it never fights the drag transform, and removing
+   the guard avoids replaying the entrance on every tap.) */
+/* Panels already spring-open via inline hart-panel-in; layer a soft staggered
+   reveal on the start-menu items so the launcher cascades open. */
+.start-menu .start-item { animation: hv-rise var(--t-reveal, 320ms) var(--hv-focus) backwards; }
+.start-menu .start-item:nth-child(1) { animation-delay: 20ms; }
+.start-menu .start-item:nth-child(2) { animation-delay: 44ms; }
+.start-menu .start-item:nth-child(3) { animation-delay: 68ms; }
+.start-menu .start-item:nth-child(4) { animation-delay: 92ms; }
+.start-menu .start-item:nth-child(5) { animation-delay: 116ms; }
+.start-menu .start-item:nth-child(n+6) { animation-delay: 140ms; }
+
+/* ════════ REDUCED MOTION — disable the non-essential cinematic motion ════════
+   Honours both the OS pref and the live a11y toggle (<html class="a11y-rmotion">).
+   Hover lifts collapse to a still highlight; entrances + the accent pulse stop. */
+@media (prefers-reduced-motion: reduce) {
+  .hart-hero-go { animation: none; }
+  .hart-desktop .desktop-icon, .start-menu .start-item { animation: none; }
+  .desktop-icon:hover .di-glyph, .desktop-icon:focus-within .di-glyph,
+  .hart-app-card:hover, .hart-app-card:focus-within,
+  .start-item:hover, .start-item:focus-within,
+  .hart-tile:hover, .hart-tile:focus-within,
+  .hv-art:hover, .hv-art:focus-within { transform: none; }
+  .hart-tile:hover .htc-prev > img, .hart-tile:focus-within .htc-prev > img,
+  .hv-art:hover > img, .hv-art:focus-within > img { transform: none; }
+}
+html.a11y-rmotion .hart-hero-go { animation: none; }
+html.a11y-rmotion .hart-desktop .desktop-icon,
+html.a11y-rmotion .start-menu .start-item { animation: none; }
+html.a11y-rmotion .desktop-icon:hover .di-glyph, html.a11y-rmotion .desktop-icon:focus-within .di-glyph,
+html.a11y-rmotion .hart-app-card:hover, html.a11y-rmotion .hart-app-card:focus-within,
+html.a11y-rmotion .start-item:hover, html.a11y-rmotion .start-item:focus-within,
+html.a11y-rmotion .hart-tile:hover, html.a11y-rmotion .hart-tile:focus-within,
+html.a11y-rmotion .hv-art:hover, html.a11y-rmotion .hv-art:focus-within { transform: none; }
+html.a11y-rmotion .hart-tile:hover .htc-prev > img, html.a11y-rmotion .hart-tile:focus-within .htc-prev > img,
+html.a11y-rmotion .hv-art:hover > img, html.a11y-rmotion .hv-art:focus-within > img { transform: none; }

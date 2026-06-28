@@ -24,8 +24,22 @@
   'use strict';
   var GRID = 92;     // snap cell (px)
   var PAD = 24;      // desktop margin
+  var TAP_MS = 300;  // pointerup within this of pointerdown ...
+  var TAP_PX = 8;    // ... and within this distance == a TAP (single-activate)
   var layer = null;  // positions persist via the shared window.HartSession (one
                      // writer per key, so the wallpaper module can't clobber us)
+
+  // Pull in the self-contained context-menu module (own file, own glass style)
+  // by injecting its <script> from here, so no shell file needs a new tag. Guard
+  // against a double-inject if init() ever re-runs.
+  (function injectCtxMenu() {
+    if (window.HartCtxMenu || document.getElementById('hart-ctxmenu-js')) return;
+    var s = document.createElement('script');
+    s.id = 'hart-ctxmenu-js';
+    s.src = '/shell/static/hartContextMenu.js';
+    s.defer = true;
+    (document.head || document.documentElement).appendChild(s);
+  })();
 
   function M() { return window.MANIFEST || {}; }
 
@@ -86,7 +100,12 @@
     glyphBox.style.background = renderColor ? _tint(renderColor, eff.color ? 0.22 : 0.15) : '';
     glyphBox.style.borderColor = renderColor ? _tint(renderColor, eff.color ? 0.55 : 0.40) : '';
 
-    el.querySelector('.di-label').textContent = eff.label;          // textContent = no HTML injection
+    // The customize-dialog PREVIEW (.hic-prev) is a glyph plate with NO .di-label
+    // node, so guard it — an unconditional el.querySelector('.di-label').textContent
+    // is null.textContent in a real browser, which threw mid-setup and left the
+    // dialog as a dead, undismissable modal (the shim's querySelector hid it).
+    var lblEl = el.querySelector('.di-label');
+    if (lblEl) lblEl.textContent = eff.label;                       // textContent = no HTML injection
     el.setAttribute('aria-label', eff.label);
 
     // Persist-source: only stash fields that actually override the default, so
@@ -148,25 +167,58 @@
   function bindIcon(el) {
     var id = el.getAttribute('data-id');
     var dragging = false, moved = false, sx = 0, sy = 0, ox = 0, oy = 0, dx = 0, dy = 0, raf = 0;
+    var downAt = 0, lpTimer = 0;
 
-    el.addEventListener('dblclick', function () { launch(id); }); // desktop (mouse): double-click opens
+    // A real tap on a touchscreen is a quick, near-stationary press+release. The
+    // old code only opened on touch via the 'moved' flag (a 3px jitter would
+    // flip it to a no-op move) and the mouse needed a DOUBLE click — so a single
+    // tap on the device never launched. We now treat ANY pointer (touch OR
+    // mouse) as single-activate: a press that ends within TAP_MS and < TAP_PX
+    // LAUNCHES. Mouse dblclick is kept harmless (re-launch is idempotent: an
+    // already-open panel just gets raised by openPanel).
+    el.style.touchAction = 'none';            // a drag must not scroll/select on touch
+    el.style.webkitUserSelect = 'none';
+    el.style.userSelect = 'none';
+
+    el.addEventListener('dblclick', function (e) { e.preventDefault(); launch(id); });
     el.addEventListener('keydown', function (e) {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); launch(id); }
     });
 
+    function clearLongPress() { if (lpTimer) { clearTimeout(lpTimer); lpTimer = 0; } }
+
     el.addEventListener('pointerdown', function (e) {
       if (e.button !== 0) return;
       dragging = true; moved = false;
-      sx = e.clientX; sy = e.clientY;
+      downAt = (e.timeStamp || Date.now());
+      sx = e.clientX; sy = e.clientY; dx = 0; dy = 0;
       ox = parseInt(el.style.left, 10) || 0; oy = parseInt(el.style.top, 10) || 0;
       el.classList.add('dragging');
       if (layer) layer.classList.add('arranging');   // show the snap-grid overlay while dragging
       try { el.setPointerCapture(e.pointerId); } catch (_) {}
+      e.preventDefault();                            // stop native text/image selection on the press
+      // Touch long-press == right-click: open the icon menu after 500ms if the
+      // finger has not moved (cancelled by move past threshold / up / cancel).
+      clearLongPress();
+      if (e.pointerType === 'touch') {
+        var lx = e.clientX, ly = e.clientY;
+        lpTimer = setTimeout(function () {
+          lpTimer = 0;
+          if (dragging && !moved) {
+            dragging = false; el.classList.remove('dragging');
+            if (layer) layer.classList.remove('arranging');
+            try { el.releasePointerCapture(e.pointerId); } catch (_) {}
+            el.style.transform = '';
+            openIconMenu(id, lx, ly);
+          }
+        }, 500);
+      }
     });
     el.addEventListener('pointermove', function (e) {
       if (!dragging) return;
       dx = e.clientX - sx; dy = e.clientY - sy;
-      if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+      if (Math.abs(dx) + Math.abs(dy) > TAP_PX) { moved = true; clearLongPress(); }
+      if (!moved) return;                            // below threshold: still a candidate tap, no drag yet
       if (raf) return;
       raf = requestAnimationFrame(function () {       // GPU transform, no layout
         raf = 0;
@@ -182,10 +234,13 @@
     function endDrag(e) {
       if (!dragging) return;
       dragging = false; el.classList.remove('dragging');
+      clearLongPress();
       if (layer) layer.classList.remove('arranging');
       if (raf) { cancelAnimationFrame(raf); raf = 0; }
       try { el.releasePointerCapture(e.pointerId); } catch (_) {}
       el.style.transform = '';
+      var dt = (e && e.timeStamp ? e.timeStamp : Date.now()) - downAt;
+      var isTap = !moved && (Math.abs(dx) + Math.abs(dy) <= TAP_PX) && dt <= TAP_MS;
       if (moved) {                                    // commit to grid + persist
         // GROUP MOVE: if this icon is part of a multi-selection (marquee), apply
         // the SAME snapped delta to every selected icon so the whole group moves
@@ -203,29 +258,43 @@
           el.style.top = snap(oy + dy) + 'px';
         }
         persist();
-      } else if (e && e.pointerType === 'touch') {    // touch surface: a single tap opens
+      } else if (isTap) {                             // touch OR mouse: a single tap opens
+        selectIcon(el);                               // reflect selection too (visual feedback)
+        try { el.focus(); } catch (_) {}              // pointerdown.preventDefault() suppressed focus; restore it for keyboard
         launch(id);
-      } else {                                        // desktop mouse: single click selects
+      } else {                                        // a slow press that didn't move: just select
         selectIcon(el);
+        try { el.focus(); } catch (_) {}
       }
     }
     el.addEventListener('pointerup', endDrag);
-    el.addEventListener('pointercancel', endDrag);
+    el.addEventListener('pointercancel', function (e) { clearLongPress(); endDrag(e); });
 
     el.addEventListener('contextmenu', function (e) {
       e.preventDefault(); e.stopPropagation();
-      var menu = document.getElementById('ctx-menu');
-      if (!menu || typeof window.ctxItem !== 'function') return;
-      menu.innerHTML = [
-        window.ctxItem('open_in_new', 'Open', "window.openPanel&&openPanel('" + id + "')"),
-        window.ctxItem('tune', 'Customize…', "window.hartCustomizeIcon&&hartCustomizeIcon('" + id + "')"),
-        (window.ctxSep ? window.ctxSep() : ''),
-        window.ctxItem('delete', 'Remove from desktop', "window.hartRemoveIcon&&hartRemoveIcon('" + id + "')")
-      ].join('');
-      menu.style.left = e.clientX + 'px';
-      menu.style.top = e.clientY + 'px';
-      menu.style.display = 'block';
+      openIconMenu(id, e.clientX, e.clientY);
     });
+  }
+
+  // Right-click / long-press menu for a desktop ICON. Self-contained menu
+  // (HartCtxMenu) wired to the file's existing helpers — no parallel renderer.
+  function openIconMenu(id, x, y) {
+    if (!window.HartCtxMenu) return;
+    var def = M()[id] || {};
+    var items = [
+      { icon: 'open_in_new', label: 'Open', onClick: function () { launch(id); } },
+      { icon: 'drive_file_rename_outline', label: 'Rename', onClick: function () { renameIcon(id); } },
+      { sep: true },
+      { icon: 'tune', label: 'Properties', onClick: function () { window.hartCustomizeIcon && window.hartCustomizeIcon(id); } }
+    ];
+    // "Uninstall" for a real installed app (removes the app); otherwise the
+    // desktop-only entry is "Remove from desktop" (unpins, keeps the app).
+    if (def.installed) {
+      items.push({ icon: 'delete_forever', label: 'Uninstall', danger: true, onClick: function () { uninstallApp(id); } });
+    } else {
+      items.push({ icon: 'delete', label: 'Remove from desktop', danger: true, onClick: function () { window.hartRemoveIcon && window.hartRemoveIcon(id); } });
+    }
+    window.HartCtxMenu.open(items, x, y);
   }
 
   function makeIcon(item) {
@@ -352,6 +421,79 @@
     var el = layer && layer.querySelector('.desktop-icon[data-id="' + id + '"]');
     if (el) { el.parentNode.removeChild(el); persist(); }
   };
+  // Inline rename: a tiny editable field over the icon's label. Writes through
+  // the SAME canonical path as the Customize dialog (applyIconVisual stores the
+  // 'label' override on data-attrs, persist() serializes it) so there is no
+  // second rename store. Empty/blank == "reset to the manifest title".
+  function renameIcon(id) {
+    var el = layer && layer.querySelector('.desktop-icon[data-id="' + id + '"]');
+    if (!el) return;
+    var lbl = el.querySelector('.di-label');
+    if (!lbl || el.querySelector('.di-rename')) return;
+    var cur = effective(id, _getOv(el)).label;
+    var inp = document.createElement('input');
+    inp.type = 'text';
+    inp.className = 'di-rename';
+    inp.value = cur;
+    inp.setAttribute('aria-label', 'Rename icon');
+    // Minimal inline styling so it does not depend on shell CSS for this widget.
+    inp.style.cssText = 'width:80px;font:11px system-ui;text-align:center;border-radius:6px;' +
+      'border:1px solid var(--hart-accent,#8b80ff);background:rgba(0,0,0,.5);color:#fff;padding:1px 3px;outline:none';
+    lbl.style.display = 'none';
+    lbl.parentNode.insertBefore(inp, lbl.nextSibling);
+    var done = false;
+    function finish(commit) {
+      if (done) return; done = true;
+      if (commit) {
+        var ov = _getOv(el);
+        ov.label = inp.value.trim();                 // '' -> effective() falls back to manifest title
+        applyIconVisual(el, ov);
+        persist();
+      }
+      if (inp.parentNode) inp.parentNode.removeChild(inp);
+      lbl.style.display = '';
+    }
+    inp.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+      e.stopPropagation();                           // don't trigger the icon's Enter-to-launch
+    });
+    // A pointer interaction on the field must not start an icon drag.
+    inp.addEventListener('pointerdown', function (e) { e.stopPropagation(); });
+    inp.addEventListener('click', function (e) { e.stopPropagation(); });
+    inp.addEventListener('blur', function () { finish(true); });
+    inp.focus(); inp.select();
+  }
+  // Uninstall a real installed app, then drop its desktop icon. Reuses the
+  // shell's installer route family (/api/apps/install has a sibling uninstall);
+  // if that endpoint is unavailable we still unpin the icon (always-correct
+  // local action) so the menu item is never a dead end. Confirms first.
+  function uninstallApp(id) {
+    var def = M()[id] || {};
+    var name = def.title || id;
+    function drop() {
+      window.hartRemoveIcon && window.hartRemoveIcon(id);
+      if (window.MANIFEST && window.MANIFEST[id]) { try { delete window.MANIFEST[id]; } catch (e) {} }
+    }
+    function go() {
+      var base = (typeof window.SHELL === 'string' && window.SHELL) ? window.SHELL : '';
+      try {
+        fetch(base + '/api/apps/uninstall', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ app_id: id, platform: def.platform || '' })
+        }).then(function () { drop(); }, function () { drop(); });
+      } catch (e) { drop(); }
+    }
+    // Prefer the shell's themed confirm; fall back to the native one.
+    if (typeof window.dsConfirm === 'function') {
+      window.dsConfirm('Uninstall ' + name + '?',
+        'This removes ' + name + ' from this device.',
+        { okLabel: 'Uninstall', danger: true }).then(function (ok) { if (ok) go(); });
+    } else if (window.confirm('Uninstall ' + name + '?')) {
+      go();
+    }
+  }
   window.hartPinIcon = function (id) {
     if (!layer || !M()[id]) return;
     if (layer.querySelector('.desktop-icon[data-id="' + id + '"]')) return;
@@ -417,21 +559,34 @@
   };
   // Back-compat alias — existing callers (context menu, etc.) still work.
   window.hartAutoArrange = function () { window.hartArrange(null); };
-  window.hartAddAppPicker = function () {
-    var menu = document.getElementById('ctx-menu');
-    if (!menu || typeof window.ctxItem !== 'function') return;
+  // The list of apps not yet on the desktop, as HartCtxMenu items.
+  function _addAppItems() {
     var have = {}; readPositions().forEach(function (p) { have[p.id] = 1; });
     var M_ = M();
     var ids = Object.keys(M_).filter(function (id) { return !have[id]; }).slice(0, 40);
-    var html = ids.length
-      ? ids.map(function (id) {
-          return window.ctxItem(M_[id].icon || 'apps', M_[id].title || id,
-            "window.hartPinIcon&&hartPinIcon('" + id + "')");
-        }).join('')
-      : window.ctxItem('info', 'Everything is already on the desktop', '');
-    // Defer past THIS click's auto-close: ctxItem appends display='none' and the
-    // global click handler also closes the menu, so re-render the picker on the
-    // next tick to keep it open at the same position.
+    if (!ids.length) return [{ icon: 'info', label: 'Everything is already on the desktop', disabled: true }];
+    return ids.map(function (id) {
+      return { id: id, icon: (M_[id].icon || 'apps'), label: (M_[id].title || id),
+               onClick: function () { window.hartPinIcon && window.hartPinIcon(id); } };
+    });
+  }
+  // Add-app picker. Prefer the self-contained menu (works regardless of the
+  // shell's #ctx-menu); fall back to the shell renderer if HartCtxMenu hasn't
+  // loaded yet. Position near the pointer when invoked from a context menu.
+  window.hartAddAppPicker = function (x, y) {
+    var items = _addAppItems();
+    if (window.HartCtxMenu) {
+      var px = (typeof x === 'number') ? x : Math.round(window.innerWidth / 2);
+      var py = (typeof y === 'number') ? y : Math.round(window.innerHeight / 3);
+      setTimeout(function () { window.HartCtxMenu.open(items, px, py); }, 0);
+      return;
+    }
+    var menu = document.getElementById('ctx-menu');
+    if (!menu || typeof window.ctxItem !== 'function') return;
+    var html = items.map(function (it) {
+      return it.disabled ? window.ctxItem(it.icon, it.label, '')
+        : window.ctxItem(it.icon, it.label, "window.hartPinIcon&&hartPinIcon('" + it.id + "')");
+    }).join('');
     setTimeout(function () { menu.innerHTML = html; menu.style.display = 'block'; }, 0);
   };
 
@@ -504,10 +659,202 @@
     document.addEventListener('pointercancel', endMarquee);
   }
 
+  // ── Context menus for the DESKTOP background and a WINDOW titlebar ──
+  // A self-contained, glassy menu (HartCtxMenu) reused for all three surfaces
+  // (icon menu lives in openIconMenu). We attach the contextmenu listener in the
+  // CAPTURE phase and stopImmediatePropagation so the shell's own bubble-phase
+  // #ctx-menu handler does not ALSO fire — this cleanly supersedes it for the
+  // surfaces we own without editing the shell file. Touch gets a 500ms long
+  // press equivalent. Every action routes to an EXISTING shell/file helper
+  // (openPanel / minimizePanel / toggleMax / closePanel / hart*), no fork.
+
+  // Resolve the panel id for a window target, mirroring the shell's _pid().
+  function panelIdOf(t) {
+    var p = t && t.closest && t.closest('.panel[data-panel-id]');
+    return p ? p.getAttribute('data-panel-id') : null;
+  }
+  // Right-click happened on a window's titlebar (or its controls) — not the body.
+  function titlebarTarget(t) {
+    if (!t || !t.closest) return null;
+    if (!t.closest('.panel-titlebar')) return null;
+    return panelIdOf(t);
+  }
+  function isDesktopBg(t) {
+    return t && ((t.classList && t.classList.contains('wallpaper')) || t === document.body) &&
+      !(t.closest && t.closest('.desktop-icon,.panel,.start-menu,.ctx-menu,.taskbar,.top-bar,.hart-senses,.hart-hero,#hart-ws-switcher'));
+  }
+
+  function openWindowMenu(pid, x, y) {
+    if (!window.HartCtxMenu || !pid) return;
+    // Bring the window forward first so a right-click also focuses it (OS feel),
+    // reusing the shell's canonical raise (keeps every other window's state).
+    if (typeof window.bringToFront === 'function') { try { window.bringToFront(pid); } catch (e) {} }
+    // The shell adds a '.maximized' class to a panel element in applyMax (the
+    // 'panels{}' map is a lexical global not exposed on window, so we read the
+    // DOM class instead — robust + no cross-script coupling).
+    var pel = document.getElementById('panel-' + pid);
+    var maxed = !!(pel && pel.classList.contains('maximized'));
+    var items = [
+      { icon: 'minimize', label: 'Minimize', onClick: function () { window.minimizePanel && window.minimizePanel(pid); } },
+      { icon: maxed ? 'fullscreen_exit' : 'crop_square', label: maxed ? 'Restore' : 'Maximize',
+        onClick: function () { window.toggleMax && window.toggleMax(pid); } },
+      { sep: true },
+      { icon: 'close', label: 'Close', danger: true, onClick: function () { window.closePanel && window.closePanel(pid); } }
+    ];
+    window.HartCtxMenu.open(items, x, y);
+  }
+
+  function openDesktopMenu(x, y) {
+    if (!window.HartCtxMenu) return;
+    var items = [
+      { icon: 'palette', label: 'Personalize', onClick: function () { window.openPanel && window.openPanel('wallpaper_manager'); } },
+      { icon: 'wallpaper', label: 'Change wallpaper', onClick: function () { window.openPanel && window.openPanel('wallpaper_manager'); } },
+      { sep: true },
+      { icon: 'add_to_home_screen', label: 'Add app to desktop', onClick: function () { window.hartAddAppPicker && window.hartAddAppPicker(x, y); } },
+      { icon: 'create_new_folder', label: 'New folder', onClick: newDesktopFolder },
+      { icon: 'grid_view', label: 'Auto-arrange icons', onClick: function () { window.hartArrange && window.hartArrange(null); } },
+      { sep: true },
+      { icon: 'desktop_windows', label: 'Display settings', onClick: openDisplaySettings },
+      { icon: 'refresh', label: 'Refresh', onClick: function () { location.reload(); } }
+    ];
+    window.HartCtxMenu.open(items, x, y);
+  }
+
+  // "New folder" routes to the file manager, which OWNS folder creation (one
+  // creator, no fork). If neither the panel nor a direct creator exists we no-op
+  // gracefully rather than invent a second folder store.
+  function newDesktopFolder() {
+    if (typeof window.hartNewDesktopFolder === 'function') { window.hartNewDesktopFolder(); return; }
+    if (typeof window.openPanel === 'function') {
+      window.openPanel('file_manager');               // the Files app is the canonical folder creator
+    }
+  }
+  // "Display settings" opens the shell's existing Display system panel.
+  function openDisplaySettings() {
+    if (typeof window.openPanel === 'function') window.openPanel('display');
+  }
+
+  function initContextMenus() {
+    // CAPTURE phase: we win over the shell's document-level contextmenu handler.
+    document.addEventListener('contextmenu', function (e) {
+      var t = e.target;
+      // Icons own their own contextmenu handler (it stops propagation); leave them.
+      if (t && t.closest && t.closest('.desktop-icon')) return;
+      // Only SUPERSEDE the shell's right-click menu once our richer glass menu is
+      // actually loaded. The HartCtxMenu <script> is injected async, so until it
+      // resolves we must NOT swallow the event (preventDefault + stop) or an early
+      // right-click would be a dead no-op; let the shell's own #ctx-menu handle it.
+      if (!window.HartCtxMenu) return;
+      var pid = titlebarTarget(t);
+      if (pid) {
+        e.preventDefault(); e.stopImmediatePropagation();
+        openWindowMenu(pid, e.clientX, e.clientY);
+        return;
+      }
+      if (isDesktopBg(t)) {
+        e.preventDefault(); e.stopImmediatePropagation();
+        openDesktopMenu(e.clientX, e.clientY);
+        return;
+      }
+      // Anything else: let the shell decide (we don't take over panel bodies).
+    }, true);
+
+    // Touch long-press == right-click, for the desktop background and titlebars.
+    // Icons handle their own long-press inside bindIcon. Cancelled by movement
+    // past TAP_PX or an early release.
+    var lp = 0, lx = 0, ly = 0, lpid = null, lpKind = null;
+    function cancelLP() { if (lp) { clearTimeout(lp); lp = 0; } lpid = null; lpKind = null; }
+    document.addEventListener('pointerdown', function (e) {
+      if (e.pointerType !== 'touch' || e.button !== 0) return;
+      var t = e.target;
+      if (t && t.closest && t.closest('.desktop-icon')) return;   // icon owns it
+      var pid = titlebarTarget(t);
+      var kind = pid ? 'window' : (isDesktopBg(t) ? 'desktop' : null);
+      if (!kind) return;
+      lx = e.clientX; ly = e.clientY; lpid = pid; lpKind = kind;
+      cancelLP();                                                 // clear any stale timer (keeps coords)
+      lpid = pid; lpKind = kind;
+      lp = setTimeout(function () {
+        lp = 0;
+        if (lpKind === 'window') openWindowMenu(lpid, lx, ly);
+        else openDesktopMenu(lx, ly);
+      }, 500);
+    }, true);
+    document.addEventListener('pointermove', function (e) {
+      if (!lp) return;
+      if (Math.abs(e.clientX - lx) + Math.abs(e.clientY - ly) > TAP_PX) cancelLP();
+    }, true);
+    document.addEventListener('pointerup', cancelLP, true);
+    document.addEventListener('pointercancel', cancelLP, true);
+  }
+
+  // ── Touch dragging for WINDOW titlebars ──
+  // The shell drags panels via mouse-only handlers (titlebar onmousedown ->
+  // startDrag, document mousemove/mouseup). Those never fire continuously under
+  // touch, so a finger can't move a window. We add a TOUCH-ONLY pointer drag
+  // that moves the panel with a GPU transform and commits to left/top on
+  // release, raising the window first (focus) and clamping the titlebar on
+  // screen with the SAME margins the shell uses. Mouse keeps the shell's path
+  // (no duplication for mouse); we only fill the touch gap. We never touch the
+  // shell's 'panels{}' model (it re-reads offsetLeft/Top on its next drag).
+  function initWindowTouchDrag() {
+    var pid = null, pel = null, sx = 0, sy = 0, dx = 0, dy = 0, raf = 0, active = false;
+    var KEEP = 80, TOP = 40, TASK = 44;
+    function onDown(e) {
+      if (e.pointerType !== 'touch' || e.button !== 0) return;
+      var t = e.target;
+      if (!t || !t.closest) return;
+      // Don't start a drag from the titlebar control buttons (min/max/close).
+      if (t.closest('.panel-titlebar .ctrl')) return;
+      var bar = t.closest('.panel-titlebar');
+      if (!bar) return;
+      var panel = bar.closest('.panel[data-panel-id]');
+      if (!panel) return;
+      // Maximized windows don't drag (matches the shell's startDrag guard).
+      if (panel.classList.contains('maximized')) return;
+      pid = panel.getAttribute('data-panel-id');
+      pel = panel;
+      active = true; dx = 0; dy = 0;
+      sx = e.clientX; sy = e.clientY;
+      if (typeof window.bringToFront === 'function') { try { window.bringToFront(pid); } catch (_) {} }
+      pel.style.willChange = 'transform';
+      try { bar.setPointerCapture(e.pointerId); } catch (_) {}
+    }
+    function onMove(e) {
+      if (!active || !pel) return;
+      dx = e.clientX - sx; dy = e.clientY - sy;
+      if (raf) return;
+      raf = requestAnimationFrame(function () {
+        raf = 0;
+        pel.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
+      });
+    }
+    function onUp(e) {
+      if (!active || !pel) return;
+      active = false;
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      pel.style.transform = '';
+      pel.style.willChange = '';
+      // Commit, clamped on-screen (same rule as the shell's move handler).
+      var nx = (pel.offsetLeft || 0) + dx, ny = (pel.offsetTop || 0) + dy;
+      nx = Math.min(Math.max(nx, KEEP - pel.offsetWidth), window.innerWidth - KEEP);
+      ny = Math.min(Math.max(ny, TOP), window.innerHeight - TASK - 28);
+      pel.style.left = Math.round(nx) + 'px';
+      pel.style.top = Math.round(ny) + 'px';
+      pid = null; pel = null;
+    }
+    document.addEventListener('pointerdown', onDown, true);
+    document.addEventListener('pointermove', onMove, true);
+    document.addEventListener('pointerup', onUp, true);
+    document.addEventListener('pointercancel', onUp, true);
+  }
+
   function init() {
     layer = document.getElementById('hart-desktop');
     if (!layer || !window.MANIFEST || !window.HartSession) { return setTimeout(init, 300); }
     initMarquee();
+    initContextMenus();
+    initWindowTouchDrag();
     window.HartSession.ready(function () {
       var icons = window.HartSession.get('desktop_icons');
       render((icons && icons.length) ? icons : defaults());

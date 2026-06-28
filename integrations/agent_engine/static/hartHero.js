@@ -174,9 +174,13 @@
     }
     setInterval(function () {
       var l = listening(), think = !!window._hartThinking;
+      var speak = ttsPlaying();
       var st = think ? 'thinking'
-             : (ttsPlaying() ? 'speaking'
+             : (speak ? 'speaking'
              : (l ? 'listening' : 'idle'));
+      // Wake the orb to full presence whenever it is actually doing something
+      // (voice in, TTS out, or thinking) — merge is for idle-only.
+      if (l || speak || think) { try { wake(); } catch (e) {} }
       if (orb) {
         orb.setAttribute('data-orb-state', st);
         orb.classList.toggle('listening', l);   // legacy cue, superseded by data-orb-state CSS
@@ -198,53 +202,273 @@
       if (input && t) { input.value = t; setStatus('Heard: “' + t + '”', 'thinking'); }
     };
 
-    // The orb/command bar is the PRIMARY composition surface — never inert
-    // wallpaper. When a panel opens it gracefully DOCKS (shrinks + steps aside
-    // so foreground work has room) but stays fully visible, active, and
-    // reachable: the brain can still push composed UI to it and the user can
-    // still speak/type a command into the spine.
+    // ═══════════════════════════════════════════════════════════════════════
+    // ORB BEHAVIOUR — float / drag / minimize / merge / attach-to-chat.
     //
-    // We do NOT add the legacy 'dimmed' class — that set opacity:0 +
-    // pointer-events:none, turning the spine into dead wallpaper (the exact
-    // launcher-is-the-spine symptom this removes). Instead we toggle 'docked'
-    // for stylesheet hooks AND apply a self-contained dock transform inline so
-    // the behaviour holds even on a shell whose CSS predates this change:
-    //   - keeps opacity ~1 (visible) and pointer-events auto (clickable)
-    //   - scales down + parks the spine toward the screen edge (room for work)
-    // Restoring to '' on close hands the surface back to the stylesheet.
+    // The orb (the whole #hart-hero spine) is a LIVING desktop object: it floats
+    // above app windows, can be dragged anywhere, can shrink to a bubble, fades
+    // toward the background when idle and returns on wake, and docks beside the
+    // HART chat when chatting. All of this is BEST-EFFORT and never breaks the
+    // existing hero/command-bar wiring (toggleVoice / acSend / openPanel).
+    //
+    // Gate 4 (one writer): there is exactly ONE function that writes
+    // hero.style.transform / .top / .opacity — place(). It COMPOSES the four
+    // independent behaviour flags below into a single transform so the dock
+    // observer, the dragger, the minimiser and the idle-merge never fight over
+    // the style (the prior build had the dock writing transform directly; that
+    // would clobber a drag offset). Everyone else just flips a flag + calls
+    // place(). The drag idiom mirrors hartSenses.js / hartDesktop.js (pointer-
+    // capture, rAF-batched, drag-threshold) — no parallel drag implementation.
+    // ═══════════════════════════════════════════════════════════════════════
+    var B = {
+      dragX: 0, dragY: 0,   // px offset from the CSS anchor (drag)
+      placed: false,        // has the user dragged it (use absolute px) ?
+      panelOpen: false,     // a panel/window is open -> dock aside
+      chatOpen: false,      // the HART chat is open -> dock beside it
+      compact: false,       // minimised to a floating bubble
+      merged: false,        // faded toward the background (idle/unused)
+      raf: 0
+    };
+
+    // Single source of truth for the spine's transform/opacity. It reads B and
+    // paints once. translate(-50%,-50%) keeps the CSS centring contract; drag
+    // adds a px delta on top; dock/chat/compact compose a scale + a nudge.
+    function place() {
+      var s = hero.style;
+      var scale = 1, dx = B.dragX, dy = B.dragY;
+      // Park toward the lower screen when a panel/chat is open so foreground
+      // work has room — unless the user has dragged it somewhere on purpose.
+      if (B.compact) {
+        scale = 0.34;                       // small floating bubble
+      } else if (B.chatOpen) {
+        scale = 0.7;
+        if (!B.placed) { dx += -Math.min(360, window.innerWidth * 0.26); }
+      } else if (B.panelOpen) {
+        scale = 0.62;
+        if (!B.placed) { dy += Math.round(window.innerHeight * 0.32); }
+      }
+      s.transform = 'translate(-50%,-50%) translate(' + dx + 'px,' + dy + 'px) scale(' + scale + ')';
+      // Merge/demerge: fade toward the background when idle + nothing open, snap
+      // back to full presence on wake/interaction/voice. Never goes fully
+      // invisible or pointer-dead (the spine must stay reachable — no wallpaper).
+      var op = 1;
+      if (B.merged && !B.compact && !B.panelOpen && !B.chatOpen) op = 0.34;
+      s.opacity = String(op);
+      s.pointerEvents = 'auto';
+      // FLOAT OVER WINDOWS: the orb is the always-on-top brand centerpiece, so it
+      // rides ABOVE app windows. The shell CSS rests #hart-hero at z-index:40, which
+      // buries it BEHIND panels (they start at z 100 and a focused .panel reaches
+      // z 999). We override that here so the orb floats over every app window, yet
+      // stay BELOW the persistent system chrome that must remain reachable (assistant
+      // chat z 1600, context menus z 3000, taskbar z 8000, lock screen z 9999,
+      // onboarding z 12000) so the orb docks BESIDE the conversation, never on top of
+      // it. Written here because place() is the ONE writer of hero.style (Gate 4), so
+      // the float layer composes with drag/dock/merge instead of forking the style.
+      s.zIndex = '1450';
+      // Defensively strip the legacy inert state in case any prior build set it.
+      hero.classList.remove('dimmed');
+      hero.classList.toggle('docked', B.panelOpen || B.chatOpen);
+      hero.classList.toggle('hart-hero-compact', B.compact);
+      hero.classList.toggle('hart-hero-merged', op < 1);
+    }
+    function placeSoon() {
+      if (B.raf) return;
+      B.raf = requestAnimationFrame(function () { B.raf = 0; place(); });
+    }
+    // Expose so other shell modules / the brain can wake or reposition the orb
+    // without reaching into our internals (read path for A2UI nudges).
+    window.HartOrbWake = wake;     // hoisted below
+    window.HartOrbPlace = place;
+
+    // ── MERGE / DEMERGE: idle-fade after inactivity, full presence on wake ──
+    var idleTimer = null;
+    function wake() {
+      if (B.merged) { B.merged = false; place(); }
+      armIdle();
+    }
+    function armIdle() {
+      if (idleTimer) clearTimeout(idleTimer);
+      // Only fade when truly idle AND nothing is open AND not actively voicing.
+      idleTimer = setTimeout(function () {
+        if (B.panelOpen || B.chatOpen || B.compact) return;
+        if (listening() || window._hartThinking) return;
+        B.merged = true; place();
+      }, 14000);
+    }
+    // Any real interaction with the spine wakes it (capture so child clicks count).
+    hero.addEventListener('pointerdown', wake, true);
+    hero.addEventListener('focusin', wake);
+    ['mousemove', 'keydown', 'pointerdown'].forEach(function (ev) {
+      document.addEventListener(ev, function () { if (B.merged) wake(); }, true);
+    });
+
+    // ── DRAG: pick the spine up from the orb (or empty hero chrome) and move it
+    // anywhere. Buttons/inputs/chips still ACT (excluded from drag). A real drag
+    // suppresses the orb's click-to-talk so moving it never fires the mic. ──
+    var dg = { on: false, sx: 0, sy: 0, bx: 0, by: 0, moved: false, pid: null };
+    function draggableTarget(t) {
+      // Inputs, the send button, chips and the start chips must keep acting.
+      if (!t || !t.closest) return false;
+      if (t.closest('input,textarea,button,a,select,.hart-hero-chip,.hart-hero-go')) return false;
+      return true;
+    }
+    function onDown(e) {
+      if (e.button !== undefined && e.button !== 0) return;
+      if (!draggableTarget(e.target)) return;
+      dg.on = true; dg.moved = false;
+      dg.sx = e.clientX; dg.sy = e.clientY;
+      dg.bx = B.dragX; dg.by = B.dragY;
+      dg.pid = e.pointerId;
+      hero.classList.add('hart-hero-dragging');
+      // Suppress native selection rubber-banding across the desktop while dragging.
+      var de = document.documentElement;
+      de.style.userSelect = 'none'; de.style.webkitUserSelect = 'none';
+      try { hero.setPointerCapture(e.pointerId); } catch (_e) {}
+    }
+    function onMove(e) {
+      if (!dg.on) return;
+      var ddx = e.clientX - dg.sx, ddy = e.clientY - dg.sy;
+      if (!dg.moved && Math.abs(ddx) + Math.abs(ddy) > 4) { dg.moved = true; B.placed = true; }
+      if (!dg.moved) return;
+      B.dragX = dg.bx + ddx; B.dragY = dg.by + ddy;
+      clampDrag();
+      placeSoon();
+    }
+    function onUp(e) {
+      if (!dg.on) return;
+      dg.on = false;
+      hero.classList.remove('hart-hero-dragging');
+      var de = document.documentElement;
+      de.style.userSelect = ''; de.style.webkitUserSelect = '';
+      try { hero.releasePointerCapture(e.pointerId); } catch (_e) {}
+      if (dg.moved) {
+        // Swallow the click the browser will synthesise after a drag so the orb
+        // does NOT toggle voice when the user only meant to move it.
+        var swallow = function (ev) { ev.stopPropagation(); ev.preventDefault(); hero.removeEventListener('click', swallow, true); };
+        hero.addEventListener('click', swallow, true);
+        setTimeout(function () { hero.removeEventListener('click', swallow, true); }, 0);
+        if (window.HartSession) try { window.HartSession.set('orb_pos', { x: B.dragX, y: B.dragY }); } catch (_e2) {}
+      }
+      wake();
+    }
+    // Keep the spine on-screen (centre anchor: dragX/dragY are deltas from the
+    // viewport centre, so the half-extents bound how far it can travel).
+    function clampDrag() {
+      var r = hero.getBoundingClientRect();
+      var halfW = window.innerWidth / 2, halfH = window.innerHeight / 2;
+      var maxX = halfW - 40, maxY = halfH - 40;
+      // r.width already reflects the current scale; allow the centre to reach the
+      // edges but keep ~40px of the spine visible.
+      var slackX = Math.max(0, halfW - r.width / 2 + 80);
+      var slackY = Math.max(0, halfH - r.height / 2 + 80);
+      maxX = Math.min(maxX + 200, slackX); maxY = Math.min(maxY + 200, slackY);
+      if (B.dragX > maxX) B.dragX = maxX; if (B.dragX < -maxX) B.dragX = -maxX;
+      if (B.dragY > maxY) B.dragY = maxY; if (B.dragY < -maxY) B.dragY = -maxY;
+    }
+    hero.addEventListener('pointerdown', onDown);
+    hero.addEventListener('pointermove', onMove);
+    hero.addEventListener('pointerup', onUp);
+    hero.addEventListener('pointercancel', onUp);
+    window.addEventListener('resize', function () { clampDrag(); place(); });
+
+    // Restore a previously dragged position (single HartSession reader).
+    function restorePos() {
+      var p = window.HartSession && window.HartSession.get('orb_pos');
+      if (p && typeof p.x === 'number') { B.dragX = p.x; B.dragY = p.y; B.placed = true; clampDrag(); place(); }
+    }
+    if (window.HartSession && window.HartSession.ready) window.HartSession.ready(restorePos);
+    else restorePos();
+
+    // ── COMPACT / MINIMIZE / REAPPEAR: a tiny control that shrinks the spine to
+    // a floating bubble (orb only) and expands it back, with a smooth transition
+    // (CSS transition on transform is already on .hart-hero). Double-clicking the
+    // orb also toggles compact (a natural "tuck it away" gesture) without
+    // stealing the single-click voice toggle. ──
+    function setCompact(on) {
+      B.compact = !!on;
+      if (B.compact) { B.merged = false; }  // a bubble is small but present
+      // When compact, hide the bar/status/chips so the bubble is just the orb;
+      // the class drives that in CSS, but we also flip aria-hidden for AT.
+      var bar = hero.querySelector('.hart-hero-bar'),
+          st = $('hart-hero-status'), ch = $('hart-hero-chips'),
+          br = hero.querySelector('.hart-hero-brand');
+      [bar, st, ch, br].forEach(function (el) {
+        if (el) { el.style.display = B.compact ? 'none' : ''; }
+      });
+      if (minBtn) {
+        minBtn.setAttribute('aria-label', B.compact ? 'Expand HART orb' : 'Minimize HART orb');
+        var mi = minBtn.querySelector('.mi'); if (mi) mi.textContent = B.compact ? 'open_in_full' : 'close_fullscreen';
+      }
+      place();
+      armIdle();
+    }
+    // A small, self-contained minimize affordance pinned to the orb. Built in JS
+    // (we own only these files) so it works even on a shell whose CSS predates
+    // this; pointer-events auto so it is clickable, excluded from drag via its
+    // tag (button) in draggableTarget().
+    var minBtn = null;
+    if (orb) {
+      minBtn = document.createElement('button');
+      minBtn.type = 'button';
+      minBtn.className = 'hart-hero-min';
+      minBtn.setAttribute('aria-label', 'Minimize HART orb');
+      minBtn.innerHTML = '<span class="mi material-icons-round" aria-hidden="true">close_fullscreen</span>';
+      minBtn.style.cssText = 'position:absolute;top:6px;right:6px;width:28px;height:28px;border-radius:50%;' +
+        'border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;z-index:3;' +
+        'background:rgba(20,22,40,.55);color:#cfe;opacity:0;transition:opacity .2s,transform .15s;' +
+        '-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)';
+      var minIc = minBtn.querySelector('.mi'); if (minIc) minIc.style.fontSize = '17px';
+      minBtn.addEventListener('click', function (e) { e.stopPropagation(); setCompact(!B.compact); });
+      orb.appendChild(minBtn);
+      // Reveal the control on hover/focus of the orb (kept subtle).
+      var showMin = function () { minBtn.style.opacity = B.compact ? '1' : '0.85'; };
+      var hideMin = function () { if (!B.compact) minBtn.style.opacity = '0'; };
+      orb.addEventListener('pointerenter', showMin);
+      orb.addEventListener('pointerleave', hideMin);
+      orb.addEventListener('focusin', showMin);
+      orb.addEventListener('focusout', hideMin);
+      // Double-click the orb = tuck to a bubble / restore (single-click still talks).
+      orb.addEventListener('dblclick', function (e) { e.preventDefault(); e.stopPropagation(); setCompact(!B.compact); });
+    }
+
+    // ── ATTACH / DETACH TO THE HART CHAT: when the conversation is open the orb
+    // docks beside it (compose surface stays next to the thread); when the chat
+    // closes it detaches and free-floats. Subtle, and it never traps focus (we
+    // only read the chat's open state; we never focus() into it). ──
+    var chatEl = $('assistant-chat');
+    function syncChat() {
+      var open = !!(chatEl && chatEl.classList.contains('open'));
+      if (open !== B.chatOpen) { B.chatOpen = open; if (open) B.compact = false; place(); }
+    }
+    if (chatEl && typeof MutationObserver === 'function') {
+      new MutationObserver(syncChat).observe(chatEl, { attributes: true, attributeFilter: ['class'] });
+      syncChat();
+    }
+
+    // ── DOCK aside when ANY panel/window opens (the existing behaviour, now
+    // routed through the single place() writer instead of a parallel transform).
+    // The orb stays fully visible, active and reachable — never inert wallpaper.
     var pc = $('panels');
     if (pc && typeof MutationObserver === 'function') {
-      var apply = function () {
+      var applyDock = function () {
         var open = pc.children.length > 0;
-        // Defensively strip the inert state in case any prior build set it.
-        hero.classList.remove('dimmed');
-        hero.classList.toggle('docked', open);
-        // Self-contained dock — orb stays active + reachable, never wallpaper.
-        var s = hero.style;
-        if (open) {
-          s.opacity = '1';
-          s.pointerEvents = 'auto';
-          s.transform = 'translate(-50%,-50%) scale(.62)';
-          s.top = '82%';
-        } else {
-          s.opacity = '';
-          s.pointerEvents = '';
-          s.transform = '';
-          s.top = '';
-        }
+        if (open !== B.panelOpen) { B.panelOpen = open; if (open) B.merged = false; place(); }
       };
-      new MutationObserver(apply).observe(pc, { childList: true });
-      apply();
+      new MutationObserver(applyDock).observe(pc, { childList: true });
+      applyDock();
     }
 
     // Super/Win + Space = push-to-talk from anywhere on the desktop.
     document.addEventListener('keydown', function (e) {
       if ((e.code === 'Space' || e.key === ' ') && e.getModifierState && e.getModifierState('Meta')) {
         e.preventDefault();
+        wake();
         if (typeof window.toggleVoice === 'function') window.toggleVoice();
       }
     });
 
+    place();
+    armIdle();
     setStatus(DEFAULT_HINT, '');
   }
 
