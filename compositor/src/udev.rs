@@ -69,7 +69,17 @@ use smithay::desktop::{layer_map_for_output, Space, Window};
 use smithay::input::{Seat, SeatState};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
+// `Device as BasicDevice` is the base `drm::Device` trait — it provides
+// `acquire_master_lock()` / `release_master_lock()` (the `drmSetMaster` / `drmDropMaster`
+// ioctls). We call these DIRECTLY on the `DrmDeviceFd` to (re)take DRM master, which is
+// the ONLY way to recover master after smithay's one-shot construction-time grab loses
+// the boot-VT race: smithay freezes its private `privileged` flag at `DrmDeviceFd::new`
+// and `DrmDevice::activate()` only re-`acquire_master_lock`s when that frozen flag is
+// already true — so an unprivileged-at-startup device can NEVER recover via `activate()`.
+// `drmSetMaster` on the raw fd has no such gate; the kernel grants it once the prior
+// master (fbcon/simpledrm on the boot VT) has dropped and our logind session is active.
 use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice};
+use smithay::reexports::drm::Device as BasicDevice;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
@@ -99,6 +109,27 @@ use crate::{select_render_path, BootConfig, WindowRegistry, HART_SPLASH_RGBA};
 /// software floor + virtually all KMS drivers support Argb8888/Xrgb8888 — the never-
 /// fail floor formats (no 10-bit gamble on an unproven box).
 const COLOR_FORMATS: &[Fourcc] = &[Fourcc::Argb8888, Fourcc::Xrgb8888];
+
+/// The frame flags the pixman software floor renders with — DELIBERATELY `empty()`, i.e.
+/// no `ALLOW_*_PLANE_SCANOUT` bits. With no plane-offload flags, `DrmCompositor` composites
+/// EVERY element (windows, the layer-shell glass desktop, AND the baked software cursor that
+/// `comp_core::build_frame_elements` already puts in the list) into its own primary swapchain
+/// buffer with the PixmanRenderer and page-flips that single buffer — it never tries to assign
+/// the cursor to a hardware cursor plane or an element to an overlay/direct-scanout plane.
+///
+/// Two reasons this is the never-fail floor (correctness over fps), not `FrameFlags::DEFAULT`:
+///   1. The cursor is a COMPOSITED software cursor, so a driver whose hardware cursor plane is
+///      missing / unusable can never blank or abort the frame. This is what makes the real-HW
+///      "Failed to set cursor plane" log a NON-EVENT: with the cursor-plane bit off, smithay's
+///      `try_assign_cursor_plane` early-returns `None` (it never issues the cursor-plane atomic
+///      commit at all), so that ioctl — and the "Failed to destroy old node property" plane
+///      cleanup that follows it — simply never happen. The arrow still draws (it is in the
+///      element list); it is just painted by pixman onto the primary plane like everything else.
+///   2. While DRM master is still mid-handoff at boot, every per-element plane-assignment atomic
+///      TEST commit would fail EACCES and churn; emitting none of them keeps the floor quiet and
+///      deterministic. Once master is held (see `acquire_drm_master`) the composited path keeps
+///      working unchanged — there is no fast/slow divergence to drift.
+const SOFTWARE_FLOOR_FRAME_FLAGS: FrameFlags = FrameFlags::empty();
 
 /// The pixman-backed DRM scanout surface for one output. `DrmCompositor` walks the
 /// render elements, composites them on the primary plane with the PixmanRenderer, and
@@ -137,14 +168,32 @@ const VBLANK_STALL_TIMEOUT: Duration = Duration::from_millis(100);
 /// data so the VBlank handler can find the right surface to mark submitted + re-queue.
 struct DeviceData {
     /// The DRM device. Held to keep the modeset alive (dropping it tears it down) AND to
-    /// `activate()`/`pause()` it on libseat session changes — VT switch / suspend / resume
-    /// and the unprivileged-at-startup master recovery (see `apply_pending_session`).
+    /// `activate()`/`pause()` it on libseat session changes (VT switch / suspend / resume).
+    /// NOTE: `activate()` alone CANNOT re-take DRM master after an unprivileged-at-startup
+    /// grab — it only re-`acquire_master_lock`s when smithay's frozen `privileged` flag is
+    /// already true. The real master (re)acquire goes through `fd` below; see `acquire_drm_master`.
     drm: DrmDevice,
+    /// A clone of the device fd, kept SPECIFICALLY so we can call `acquire_master_lock()` /
+    /// `release_master_lock()` (the raw `drmSetMaster` / `drmDropMaster` ioctls) on it directly.
+    /// This is the ONLY path that can flip an unprivileged device to master on this smithay rev:
+    /// `DrmDeviceFd::new` grabs master exactly once at construction and freezes `privileged`, and
+    /// the kernel only grants master once the boot-VT's prior master (fbcon/simpledrm) has dropped
+    /// and our logind session is active — which on a fresh boot happens AFTER construction, so the
+    /// construction grab races and loses ("Unable to become drm master, assuming unprivileged
+    /// mode"). Re-issuing `drmSetMaster` on this fd from the render tick recovers it.
+    fd: DrmDeviceFd,
     /// GBM device — the buffer allocator backing both the scanout swapchain + the
     /// framebuffer exporter. Cloned into the allocator/exporter; held so it outlives them.
     _gbm: GbmDevice<DrmDeviceFd>,
     /// One scanout surface per active CRTC (one display). Keyed by CRTC handle.
     surfaces: HashMap<crtc::Handle, SurfaceData>,
+    /// Whether THIS device currently holds DRM master at the kernel level (a confirmed
+    /// `drmSetMaster` succeeded). Init FALSE and confirmed lazily: the render tick re-attempts
+    /// `acquire_drm_master` every frame while this is false (cheap ioctl) until the kernel grants
+    /// master, then leaves it alone. Reset to false on a libseat PauseSession (we drop master).
+    /// This is the per-device latch that turns the one-shot construction grab into a bounded,
+    /// self-healing retry — without it the unprivileged-at-startup device stays black forever.
+    master: bool,
 }
 
 /// What the render tick should do with one CRTC after attempting to present a frame.
@@ -425,20 +474,26 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     let _ = shm_formats; // pixman's mandatory Argb/Xrgb already advertised via ShmState::new
 
     // 11. Bind the calloop event sources.
-    //   (a) libinput → State::process_input_event (the shared input router). As each
-    //       device appears, enable touchpad TAP-TO-CLICK: libinput defaults it OFF, so a
-    //       light tap on a laptop touchpad registers NOTHING (only a physical button press
-    //       clicks) — the real-HW 2026-06-24 "touchpad taps not registering". A non-touchpad
-    //       reports finger_count 0 and is left untouched; a failed set is ignored (best-
-    //       effort, never fatal — the never-fail floor). Tier-2 sway sets the same via its
-    //       libinput config; the cage Tier-3 floor cannot configure libinput, so this is
-    //       hart-comp's own. `config_tap_set_enabled` takes &mut self, hence `mut event`.
+    //   (a) libinput → State::process_input_event (the shared input router). As each device
+    //       appears, enable touchpad TAP-TO-CLICK (fix (c)): libinput defaults tap OFF, so a light
+    //       tap on a laptop touchpad registers NOTHING (only a physical button press clicks) — the
+    //       real-HW "touchpad taps not registering". We enable BOTH tap-to-click (a 1/2/3-finger
+    //       tap synthesises a left/right/middle button) AND tap-and-drag (tap-then-slide drags, so
+    //       a tap behaves like a full click+hold for selecting / moving), the natural laptop UX. A
+    //       non-touchpad reports tap_finger_count 0 and is left untouched; every set is best-effort
+    //       (a device that does not support the knob returns Err, ignored — never fatal, the never-
+    //       fail floor). Tier-2 sway sets the same via its libinput config; the cage Tier-3 floor
+    //       cannot configure libinput, so this is hart-comp's own. The setters take &mut self,
+    //       hence `mut event`.
     event_loop
         .handle()
         .insert_source(libinput_backend, move |mut event, _, state: &mut State| {
             if let smithay::backend::input::InputEvent::DeviceAdded { device } = &mut event {
+                // Only a touchpad reports a non-zero tap finger count; gate on it so we never
+                // poke a mouse/keyboard with a touchpad-only knob.
                 if device.config_tap_finger_count() > 0 {
                     let _ = device.config_tap_set_enabled(true);
+                    let _ = device.config_tap_set_drag_enabled(true);
                 }
             }
             state.process_input_event(event);
@@ -520,17 +575,18 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     //     Kick off the first frame on every surface so the splash + glass shell paint
     //     immediately (the DRM page-flip cadence is then self-sustaining via VBlank).
     //
-    //     But first re-acquire DRM master: a device may have come up UNPRIVILEGED in a startup
-    //     VT race (the real-HW "Unable to become drm master, assuming unprivileged mode" log —
-    //     the master `privileged` flag stays false). Its session `active` flag is TRUE, so
-    //     `render_frame` proceeds, but every page-flip ioctl returns EACCES and #186 retries it
-    //     FOREVER (master is never re-acquired on its own) → the first kick and every frame
-    //     after paint NOTHING: a black, SETTLED Tier-1 the paint watchdog can't catch (the shell
-    //     page still loads, so the shell-ready marker still fires). Park + apply an activate now
-    //     so we re-take master before the first kick if the session is already active; if it
-    //     isn't yet, the EACCES retries bridge until the libseat ActivateSession in the loop
-    //     re-drives it. activate() is idempotent on a healthy boot (one extra repaint), so this
-    //     is always safe.
+    //     But first re-acquire DRM master: a device may have come up UNPRIVILEGED in a startup VT
+    //     race (the real-HW "Unable to become drm master, assuming unprivileged mode" log — smithay
+    //     grabs master ONCE inside DrmDevice::new and freezes its `privileged` flag false on
+    //     failure). Its session `active` flag is TRUE, so `render_frame` proceeds, but every
+    //     page-flip ioctl returns EACCES and #186 retries it FOREVER unless we re-take master — a
+    //     black, SETTLED Tier-1 the paint watchdog can't catch (the shell page still loads, so the
+    //     shell-ready marker still fires). We can't recover via `activate()` (it skips
+    //     acquire_master_lock on a frozen-unprivileged device); instead `apply_pending_session` ->
+    //     `acquire_drm_master` issues `drmSetMaster` DIRECTLY on the fd, which the kernel grants
+    //     once fbcon has dropped master. If it isn't grantable yet, the per-tick `acquire_drm_master`
+    //     retry inside `render_all` keeps trying every frame (no ActivateSession edge needed on a
+    //     fresh boot) until it lands — well inside the supervisor's 45s first-paint watchdog.
     state.pending_session_activate = Some(true);
     apply_pending_session(&mut state, &mut devices);
     render_all(&mut state, &mut devices);
@@ -632,6 +688,11 @@ fn device_added(
 
     let (mut drm, drm_notifier) = DrmDevice::new(fd.clone(), true)
         .map_err(|e| format!("DrmDevice::new failed: {e}"))?;
+    // Keep our OWN clone of the fd (a third Arc handle alongside the DrmDevice + GbmDevice)
+    // so `acquire_drm_master` can re-issue `drmSetMaster` on it directly — the construction
+    // grab inside `DrmDevice::new` above may have lost the boot-VT master race, and that is the
+    // only handle through which we can recover (smithay froze the device's `privileged` flag).
+    let master_fd = fd.clone();
     let gbm = GbmDevice::new(fd).map_err(|e| format!("GbmDevice::new failed: {e}"))?;
 
     // The scanout allocator (RENDERING|SCANOUT so the buffer can be both rendered into by
@@ -753,8 +814,13 @@ fn device_added(
         node,
         DeviceData {
             drm,
+            fd: master_fd,
             _gbm: gbm,
             surfaces,
+            // Master is confirmed lazily by the render tick's `acquire_drm_master` retry, not
+            // assumed here: even if the construction grab succeeded we re-confirm on the first
+            // tick (an idempotent `drmSetMaster`), so the latch reflects the kernel, not a guess.
+            master: false,
         },
     );
     Ok(())
@@ -798,33 +864,113 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
     }
 }
 
+/// What to do about DRM master for one device this attempt. PURE policy (no Smithay types),
+/// so the master-recovery state machine is unit-testable on the dev box with NO DRM hardware —
+/// the exact gap investigation 2 called out ("validate the retry state machine; WSL cannot do
+/// the live logind master grant"). The Smithay-touching adapter that feeds it is
+/// `acquire_drm_master` (it issues the real `drmSetMaster` and reads its `Ok`/`Err`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MasterStep {
+    /// We already hold confirmed master — do nothing (do NOT re-issue `drmSetMaster` every tick).
+    AlreadyHeld,
+    /// We just took master on this attempt — latch it, sync smithay's `active` flag, repaint.
+    Acquired,
+    /// `drmSetMaster` was refused (the boot-VT's prior master has not dropped yet, or our session
+    /// is not the seat's active master yet). Stay unmastered and retry on a later tick. This is
+    /// the never-fail floor's "keep trying", NOT an abort — there is intentionally no `Fail`
+    /// variant that could tear the compositor down.
+    NotYet,
+}
+
+/// PURE: decide the master step from (do-we-already-hold-it, did-this-acquire-succeed). Extracted
+/// so the recovery loop's branching is tested directly (a fake unprivileged-then-privileged device
+/// is modelled by feeding `held=false` with `acquire_succeeded=false` then `true`, asserting the
+/// loop goes `NotYet → Acquired` and NEVER aborts). The real `drmSetMaster` ioctl is the only part
+/// that needs hardware; this decision is not.
+fn master_step(held: bool, acquire_succeeded: bool) -> MasterStep {
+    if held {
+        MasterStep::AlreadyHeld
+    } else if acquire_succeeded {
+        MasterStep::Acquired
+    } else {
+        MasterStep::NotYet
+    }
+}
+
+/// (Re)acquire DRM master for one device by issuing `drmSetMaster` DIRECTLY on its fd, and on a
+/// fresh grab sync smithay's session `active` flag + force a clean repaint. Returns true once the
+/// device holds confirmed master.
+///
+/// THIS is the recovery the old `activate()`-only path could NEVER do. On the pinned Smithay rev
+/// (4784339) `DrmDeviceFd::new` calls `acquire_master_lock()` exactly once and freezes the private
+/// `privileged` flag (`device/fd.rs`); `DrmDevice::activate()` only re-`acquire_master_lock`s when
+/// that frozen flag is already true (`device/mod.rs`: `if self.device_fd().is_privileged()`). So a
+/// device that lost the construction-time grab ("Unable to become drm master, assuming
+/// unprivileged mode") has `privileged=false` FOREVER and `activate()` is a no-op for master —
+/// every page-flip then returns EACCES and #186 retries it forever → a black, settled Tier-1.
+/// `drmSetMaster` on the raw fd has no such gate: the kernel grants it the instant the boot-VT's
+/// prior master (fbcon/simpledrm) has dropped and our logind session is the seat's active master.
+/// Once the fd is the real kernel master, smithay's atomic commits succeed regardless of its
+/// frozen `privileged` belief (that flag only governs whether smithay itself drops/re-takes master
+/// on pause/activate/drop — which is why PAUSE below drops master explicitly).
+///
+/// Idempotent + cheap when already held (the `master` latch short-circuits BEFORE the ioctl). A
+/// refusal is not logged per-tick (it would spam at 60Hz during the brief handoff) and is retried
+/// next tick; it is NEVER fatal — a device that can truly never master simply never paints, and the
+/// supervisor drops a tier on the missing first paint (the never-fail posture).
+fn acquire_drm_master(device: &mut DeviceData) -> bool {
+    // Short-circuit the steady state so we do not re-issue drmSetMaster ~60x/s once mastered.
+    let acquired_now = if device.master {
+        false
+    } else {
+        device.fd.acquire_master_lock().is_ok()
+    };
+    match master_step(device.master, acquired_now) {
+        MasterStep::AlreadyHeld => true,
+        MasterStep::Acquired => {
+            device.master = true;
+            // The fd is now the real kernel master. Call activate(false) to set the SESSION
+            // `active` flag (so render_frame/queue_frame do not short-circuit on DeviceInactive)
+            // and reset connector/plane state for a clean first scanout. activate() may also try
+            // its own acquire_master_lock if smithay thinks it is privileged — harmless (a second
+            // drmSetMaster on an fd that already holds master is a no-op).
+            if let Err(err) = device.drm.activate(false) {
+                warn!(?err, "HART-comp DRM: activate() after taking master failed (active-flag/reset); frame retries next tick");
+            }
+            for surface in device.surfaces.values_mut() {
+                if let Err(err) = surface.compositor.reset_state() {
+                    warn!(?err, "HART-comp DRM: surface reset_state() after taking master failed; frame retries next tick");
+                }
+                surface.awaiting_vblank = false;
+                surface.flip_queued_at = None;
+            }
+            info!("HART-comp DRM: acquired DRM master via drmSetMaster (session active); scanning out");
+            true
+        }
+        MasterStep::NotYet => false,
+    }
+}
+
 /// Apply a libseat session activate/pause request the notifier parked in
 /// `state.pending_session_activate` (VT switch / suspend / resume, or the proactive startup
-/// activate). REQUIRED on the pinned Smithay rev because a DRM device tracks TWO independent
-/// states with NO auto-recovery for either:
+/// activate). A DRM device tracks TWO independent states with NO auto-recovery for either:
 ///   • the SESSION `active` flag (what `is_active()` reads) — init TRUE, set false by `pause()`
 ///     and true by `activate()`; `render_frame`/`queue_frame` return `DeviceInactive` while it
 ///     is false (a VT-switched-away device → hold, never paint a dark CRTC); and
-///   • the DRM-master `privileged` flag — init FALSE, set true ONLY by a successful
-///     `acquire_master_lock()` inside `DrmDevice::new` or `activate()`; while false every
-///     page-flip ioctl returns EACCES (`FrameError::Access` → our #186 Transient → retried).
-/// So a device that came up unprivileged in a startup VT race (the real-HW "Unable to become
-/// drm master, assuming unprivileged mode") has active=TRUE but privileged=FALSE → its flips
-/// retry EACCES FOREVER (master is never re-acquired on its own) → a BLACK, settled Tier-1; a
-/// paused device has active=FALSE → holds. BOTH are recovered ONLY by `activate()`, which
-/// re-acquires master AND sets active — the one required call.
+///   • the kernel DRM-master grant — held when a `drmSetMaster` has succeeded on the fd; while
+///     NOT held every page-flip ioctl returns EACCES (`FrameError::Access` → our #186 Transient).
 ///
-/// On ACTIVATE: `activate(false)` every device (re-take drmSetMaster + set active, keep
-/// connectors) then `reset_state()` every surface — the rev's documented "call after the session
-/// is re-activated / VT switched to" step, which forces a full repaint — and clear the in-flight-
-/// flip gate (a VT switch / the unprivileged startup may have swallowed the prior flip's vblank).
-/// We deliberately do NOT guard on is_active() (it reads the SESSION flag, TRUE at an unprivileged
-/// startup — a guard would skip exactly the device we must re-master; activate() is idempotent on
-/// a device that already holds master). On PAUSE: `pause()` every device (drop master + clear
-/// active) and clear the gate (a paused device delivers no vblank, so `awaiting_vblank` would
-/// otherwise wedge until the stall timeout). A failed activate is logged + skipped (master not
-/// grantable yet → flips keep retrying / holding → a later ActivateSession re-drives it) — never a
-/// panic (the never-fail floor).
+/// On ACTIVATE (resume / startup): force a fresh master re-confirm (`master=false`) then
+/// `acquire_drm_master`, which issues `drmSetMaster` on the fd directly — the ONLY recovery that
+/// works for a device that came up unprivileged (smithay's `activate()` cannot re-master a frozen-
+/// unprivileged device; see `acquire_drm_master`). The render tick ALSO retries `acquire_drm_master`
+/// every frame while unmastered, so a fresh boot (which has no ActivateSession edge) still recovers;
+/// this edge handler simply makes a real resume re-confirm master against the kernel immediately.
+/// On PAUSE: `pause()` the device (clears the SESSION active flag) AND `release_master_lock()` the
+/// fd ourselves (smithay only auto-drops master when ITS privileged flag is true, which is false on
+/// a device we mastered directly), then clear the in-flight-flip gate (a paused device delivers no
+/// vblank, so `awaiting_vblank` would otherwise wedge until the stall timeout). Nothing here panics
+/// (the never-fail floor); a refused grant just leaves the device unmastered for the next retry.
 fn apply_pending_session(state: &mut State, devices: &mut HashMap<DrmNode, DeviceData>) {
     let activate = match state.pending_session_activate.take() {
         Some(v) => v,
@@ -832,27 +978,19 @@ fn apply_pending_session(state: &mut State, devices: &mut HashMap<DrmNode, Devic
     };
     for device in devices.values_mut() {
         if activate {
-            // Do NOT guard on is_active() here: on this rev is_active() reads the SESSION
-            // `active` flag (initialised TRUE), NOT the DRM-master `privileged` flag
-            // (initialised FALSE — the unprivileged-startup case, where master must be
-            // re-acquired). A guard on is_active() would SKIP exactly the device we have to
-            // fix (active=true, privileged=false). activate() re-takes drmSetMaster and is
-            // idempotent on a device that already holds master (the only cost is one extra
-            // reset_state() repaint on a healthy boot).
-            if let Err(err) = device.drm.activate(false) {
-                warn!(?err, "HART-comp DRM: DRM master re-acquire failed — a later session-activate re-drives it");
-                continue;
-            }
-            info!("HART-comp DRM: (re)acquired DRM master (session active) — scanning out");
-            for surface in device.surfaces.values_mut() {
-                if let Err(err) = surface.compositor.reset_state() {
-                    warn!(?err, "HART-comp DRM: surface reset_state() after activate failed — frame retries next tick");
-                }
-                surface.awaiting_vblank = false;
-                surface.flip_queued_at = None;
-            }
+            // A real session-activate edge (or the startup proactive activate): drop the latch so
+            // we re-confirm master from the kernel via a fresh drmSetMaster, then re-acquire. This
+            // is the defensive resume path; the per-tick render retry covers the no-edge fresh boot.
+            device.master = false;
+            acquire_drm_master(device);
         } else {
+            // PAUSE (VT switch away / suspend): clear the active flag, then drop master so the
+            // incoming session's compositor can take it.
             device.drm.pause();
+            // A double-drop (smithay's pause already released it on a privileged device) just
+            // returns Err — ignore it; the goal state is simply "we no longer hold master".
+            let _ = device.fd.release_master_lock();
+            device.master = false;
             for surface in device.surfaces.values_mut() {
                 surface.awaiting_vblank = false;
                 surface.flip_queued_at = None;
@@ -907,6 +1045,18 @@ fn render_all(state: &mut State, devices: &mut HashMap<DrmNode, DeviceData>) {
 
     let now = std::time::Instant::now();
     for device in devices.values_mut() {
+        // Self-healing DRM master retry (THE fresh-boot recovery, fix (a)): the construction-time
+        // drmSetMaster inside DrmDevice::new may have lost the boot-VT master race ("Unable to
+        // become drm master, assuming unprivileged mode"), and a fresh boot has NO libseat
+        // ActivateSession edge to recover it. Re-attempt drmSetMaster DIRECTLY on the fd each tick
+        // until the kernel grants master (fbcon/simpledrm drops it once logind finishes the VT-7
+        // handoff); the `master` latch short-circuits this to a no-op the instant it succeeds, so
+        // there is no per-frame ioctl in steady state. Without this, an unprivileged-at-startup
+        // device returns EACCES on every flip forever -> a black, settled Tier-1 the paint watchdog
+        // turns into a tier-drop. acquire_drm_master never aborts (the never-fail floor).
+        if !device.master {
+            acquire_drm_master(device);
+        }
         for (crtc, surface) in device.surfaces.iter_mut() {
             // F1 (#166): never start a new flip while the prior one is still in flight to
             // this CRTC — wait for its vblank (which clears `awaiting_vblank` in
@@ -934,7 +1084,7 @@ fn render_all(state: &mut State, devices: &mut HashMap<DrmNode, DeviceData>) {
             // the sibling-field writes (`awaiting_vblank`/`flip_queued_at`) below.
             let render_outcome = surface
                 .compositor
-                .render_frame::<_, _>(&mut renderer, &elements, clear, FrameFlags::DEFAULT)
+                .render_frame::<_, _>(&mut renderer, &elements, clear, SOFTWARE_FLOOR_FRAME_FLAGS)
                 .map(|result| result.is_empty);
             match render_outcome {
                 Ok(true) => {
@@ -1210,5 +1360,114 @@ mod tests {
             VBLANK_STALL_TIMEOUT < Duration::from_millis(500),
             "stall timeout must recover well before a paint-watchdog freeze"
         );
+    }
+
+    // ── Fix (a): the DRM-master recovery state machine (`master_step`). The real `drmSetMaster`
+    // ioctl is the only part that needs hardware; the DECISION that drives the retry loop is pure
+    // and tested here. The model that matters: a device that came up unprivileged (held=false)
+    // keeps trying until the kernel grants master, then latches — and NO outcome aborts. This is
+    // exactly investigation 2's "validate the reconstruct/retry state machine in WSL without the
+    // live logind grant". ──
+
+    #[test]
+    fn master_step_unprivileged_then_granted_is_notyet_then_acquired() {
+        // The real-HW boot sequence: the construction grab lost the VT race (held=false) and the
+        // first few drmSetMaster retries are refused while fbcon still holds master
+        // (acquire_succeeded=false → NotYet), then the kernel grants it (true → Acquired).
+        assert_eq!(master_step(false, false), MasterStep::NotYet, "refused grab → keep retrying");
+        assert_eq!(master_step(false, true), MasterStep::Acquired, "granted grab → latch + repaint");
+    }
+
+    #[test]
+    fn master_step_already_held_never_reacquires() {
+        // Once master is latched, the step is AlreadyHeld REGARDLESS of a (not even attempted)
+        // acquire result — the render tick must NOT re-issue drmSetMaster ~60x/s in steady state.
+        assert_eq!(master_step(true, false), MasterStep::AlreadyHeld);
+        assert_eq!(master_step(true, true), MasterStep::AlreadyHeld);
+    }
+
+    #[test]
+    fn master_step_has_no_abort_outcome() {
+        // The never-fail invariant: across every (held, acquired) input there is NO outcome that
+        // tears the compositor down. A device that can truly never master just stays NotYet and
+        // never paints; the supervisor drops a tier on the missing first paint — the loop never
+        // aborts on the master race itself. (There is intentionally no `Fail`/`Abort` variant.)
+        for held in [false, true] {
+            for ok in [false, true] {
+                let step = master_step(held, ok);
+                assert!(
+                    matches!(step, MasterStep::AlreadyHeld | MasterStep::Acquired | MasterStep::NotYet),
+                    "master_step({held},{ok}) = {step:?} must be a non-fatal step"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn master_retry_converges_within_the_paint_watchdog_window() {
+        // Behavioural: simulate the per-tick render retry against a fake device that is refused
+        // for the first few 16ms ticks (fbcon still master) then granted. Drive the SAME decision
+        // the real loop drives (`master_step` on the latch) and assert it latches master well
+        // inside the supervisor's 45s first-paint watchdog — i.e. the retry actually terminates,
+        // it is not an unbounded spin that the watchdog turns into a tier-drop.
+        let grant_after_ms: u128 = 800; // fbcon-handoff settle on a slow box; comfortably < 45s
+        let tick = Duration::from_millis(16); // run_udev's dispatch cadence
+        let mut held = false;
+        let mut elapsed_ms: u128 = 0;
+        let mut latched_at_ms: Option<u128> = None;
+        for _ in 0..4000 {
+            // The fake kernel grants master once enough time has passed AND we are still asking.
+            let acquire_succeeded = !held && elapsed_ms >= grant_after_ms;
+            match master_step(held, acquire_succeeded) {
+                MasterStep::Acquired => {
+                    held = true;
+                    latched_at_ms = Some(elapsed_ms);
+                    break;
+                }
+                MasterStep::NotYet => {}
+                MasterStep::AlreadyHeld => break,
+            }
+            elapsed_ms += tick.as_millis();
+        }
+        assert!(held, "the retry must eventually latch master, not spin forever");
+        let at = latched_at_ms.expect("must record when master latched");
+        assert!(at >= grant_after_ms, "must not claim master before the kernel grants it");
+        assert!(
+            at < 45_000,
+            "master must latch ({at}ms) well inside the 45s paint watchdog so the supervisor does not drop to sway"
+        );
+    }
+
+    // ── Fix (b): the software-floor cursor. The render path passes `SOFTWARE_FLOOR_FRAME_FLAGS`,
+    // which DELIBERATELY omits the cursor-plane (and every other plane-scanout) bit so smithay
+    // never issues the hardware-cursor atomic commit that logs "Failed to set cursor plane" — the
+    // arrow is composited by pixman instead. This guards that the flag the render path actually
+    // uses keeps that property (a real `FrameFlags` value, not a string match). ──
+
+    #[test]
+    fn software_floor_flags_never_use_the_hardware_cursor_plane() {
+        // The whole point of fix (b): with the cursor-plane bit OFF, `try_assign_cursor_plane`
+        // early-returns None, so the cursor-plane atomic commit (and its "Failed to set cursor
+        // plane" / "Failed to destroy old node property" fallout) never happens — the baked cursor
+        // composites onto the primary plane as a software cursor.
+        assert!(
+            !SOFTWARE_FLOOR_FRAME_FLAGS.contains(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT),
+            "the software floor must NOT offload the cursor to a hardware plane"
+        );
+    }
+
+    #[test]
+    fn software_floor_flags_offload_nothing_to_planes() {
+        // The pixman floor composites EVERYTHING into one primary swapchain buffer and flips that:
+        // no overlay, no direct primary-element scanout, no cursor plane. This keeps the never-fail
+        // floor free of every per-element plane-assignment atomic TEST commit (each of which would
+        // fail EACCES while master is mid-handoff). `empty()` is that posture.
+        assert_eq!(
+            SOFTWARE_FLOOR_FRAME_FLAGS,
+            FrameFlags::empty(),
+            "the software floor renders with no plane-offload flags"
+        );
+        assert!(!SOFTWARE_FLOOR_FRAME_FLAGS.contains(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT));
+        assert!(!SOFTWARE_FLOOR_FRAME_FLAGS.contains(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT));
     }
 }

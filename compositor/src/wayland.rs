@@ -261,17 +261,19 @@ pub struct State {
 
     /// A libseat session activate/pause request parked by the session notifier (VT switch /
     /// suspend / resume), drained by the render loop's `apply_pending_session`. The notifier
-    /// calloop closure gets ONLY `&mut State` — never the per-device DRM table it must
-    /// `activate()`/`pause()` — so, exactly like `vblank_completed` hands a CRTC to the render
-    /// tick, it parks the request here: `Some(true)` = session ACTIVE → re-acquire DRM master on
-    /// every device + `reset_state()` every surface; `Some(false)` = session PAUSED → drop
-    /// master; `None` = nothing pending. REQUIRED, not cosmetic: the device tracks the SESSION
-    /// `active` flag (what `is_active()` reads; init TRUE) SEPARATELY from the DRM-master
-    /// `privileged` flag (init FALSE), with NO auto-recovery for either — so an unprivileged-at-
-    /// startup device (active TRUE, the real-HW "Unable to become drm master" race) retries every
-    /// page-flip EACCES forever, and a VT-paused device (active FALSE) returns DeviceInactive;
-    /// BOTH stay black until the caller calls `activate()`. See `apply_pending_session` for the
-    /// full dual-flag rationale.
+    /// calloop closure gets ONLY `&mut State` — never the per-device DRM table it must act on — so,
+    /// exactly like `vblank_completed` hands a CRTC to the render tick, it parks the request here:
+    /// `Some(true)` = session ACTIVE → (re)acquire DRM master on every device + repaint;
+    /// `Some(false)` = session PAUSED → drop master; `None` = nothing pending. REQUIRED, not
+    /// cosmetic: the device tracks the SESSION `active` flag (what `is_active()` reads; init TRUE)
+    /// SEPARATELY from the kernel DRM-master grant, with NO auto-recovery for either — so an
+    /// unprivileged-at-startup device (active TRUE, the real-HW "Unable to become drm master" race)
+    /// retries every page-flip EACCES forever, and a VT-paused device (active FALSE) returns
+    /// DeviceInactive; BOTH stay black until the caller re-takes master. Note: on the pinned smithay
+    /// rev `DrmDevice::activate()` CANNOT re-take master for a device that came up unprivileged (it
+    /// only re-`acquire_master_lock`s when smithay's frozen `privileged` flag is already true), so
+    /// the udev backend re-takes master by issuing `drmSetMaster` DIRECTLY on the fd — see
+    /// `udev::acquire_drm_master` for the full rationale.
     pub pending_session_activate: Option<bool>,
 }
 
