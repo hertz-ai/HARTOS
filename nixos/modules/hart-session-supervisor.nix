@@ -78,6 +78,13 @@ let
   stateDir   = "/var/lib/hart";
   latchFile  = "${stateDir}/session-tier";          # hart-comp | sway | cage
   windowFile = "${stateDir}/session-tier.window";   # crash timestamps (epoch, one per line)
+  # Set ONLY when a tier is dropped by a paint-HANG (vs a crash-loop). Its
+  # presence makes the persisted latch ELIGIBLE for ONE automatic fresh-boot
+  # re-promotion — a cold-boot slow first paint is transient, not a permanent
+  # break, so a one-off slow boot must not demote the machine forever (the only
+  # other way back up is a manual `hartctl session reset-tier`). Persistent
+  # (next to the latch) so it survives the reboot the re-promotion happens on.
+  hangMarkFile = "${stateDir}/session-tier.hang";
   # node_watchdog (in-process) may TOUCH this to signal "compositor unhealthy".
   # It is in /run (tmpfs) so it never survives a reboot — a fresh boot always
   # gets a clean slate. The supervisor consumes it; node_watchdog never writes
@@ -165,6 +172,17 @@ let
     WINDOW="${windowFile}"
     UNHEALTHY="${unhealthyFlag}"
     READY="${readyFlag}"
+    # ── Fresh-boot re-promotion state (transient-cold-boot self-heal) ──
+    #   HANGMARK (persistent, next to the latch): set ONLY by a paint-HANG drop;
+    #     a crash-loop drop clears it (a crash is sticky, never re-promoted).
+    #   BOOT_SENTINEL (/run tmpfs): absent at power-on; gates the re-promotion to
+    #     the FIRST selector run of a fresh boot so a logout/relaunch never re-tries.
+    #   REPROMOTED_FLAG (/run tmpfs): set when this boot already spent its one retry;
+    #     a re-hang then SETTLES (does not re-arm) so a confirmed-broken tier is
+    #     never re-walked every boot (preserves the latch's never-re-walk guarantee).
+    HANGMARK="${hangMarkFile}"
+    BOOT_SENTINEL="${sessionRunDir}/boot-repromote-checked"
+    REPROMOTED_FLAG="${sessionRunDir}/repromoted-this-boot"
     MAX_CRASHES=${toString sup.crashLoopCount}
     WINDOW_SECS=${toString sup.crashLoopWindowSeconds}
     PAINT_TIMEOUT=${toString sup.shellPaintTimeoutSeconds}
@@ -291,6 +309,45 @@ let
 
     clear_window() { : > "$WINDOW" 2>/dev/null || true; }
 
+    # ── Fresh-boot re-promotion of a transiently HANG-dropped tier ────────────
+    # A latch is lowered by either a fast-exit CRASH-LOOP (crashLoopCount fast
+    # exits — a strong "genuinely broken" signal that stays STICKY) or a single
+    # deterministic paint-HANG (one timeout). A COLD first boot (disk/GPU still
+    # warming) can trip the paint-watchdog ONCE and latch a lower tier — and the
+    # ONLY way back up today is a manual `hartctl session reset-tier`. So a one-off
+    # slow boot permanently demotes the machine (worst case all the way to cage).
+    # This self-heals that WITHOUT re-walking a confirmed-broken tier every boot:
+    #   - only a HANG drop arms re-promotion (it wrote $HANGMARK); a crash drop
+    #     cleared it and stays sticky;
+    #   - on the FIRST selector run of a FRESH boot (gated by $BOOT_SENTINEL, a
+    #     /run tmpfs flag absent at power-on) we re-arm a hang-latched tier to the
+    #     START tier for ONE retry. If the warm retry paints, the transient is
+    #     healed; if it HANGS again this boot the hang path sees $REPROMOTED_FLAG
+    #     and does NOT re-arm $HANGMARK, so the tier settles and later boots never
+    #     re-walk it.
+    # Every step is best-effort + fail-safe: any unwritable flag just leaves the
+    # persisted latch untouched (degrade, never brick).
+    maybe_repromote() {
+      [ -e "$BOOT_SENTINEL" ] && return 0          # only the first run of a boot
+      : > "$BOOT_SENTINEL" 2>/dev/null || true     # mark this boot's check done
+      [ -e "$HANGMARK" ] || return 0               # last drop was NOT a hang -> sticky
+      _cur=$(read_tier)
+      if [ "$_cur" = "$START" ]; then
+        rm -f "$HANGMARK" 2>/dev/null || true      # already at the top rung -> nothing to raise
+        return 0
+      fi
+      log "fresh-boot re-promotion: latch '$_cur' was a transient paint-HANG drop, re-arming to start tier '$START' for ONE retry"
+      rm -f "$HANGMARK" 2>/dev/null || true
+      : > "$REPROMOTED_FLAG" 2>/dev/null || true   # a re-hang this boot now settles (no re-arm)
+      write_tier "$START"
+    }
+
+    # Run the once-per-boot re-promotion check BEFORE selecting a tier, so a
+    # transient cold-boot paint-HANG that demoted the machine on a previous boot
+    # gets ONE automatic retry at the start tier this boot. No-op unless the last
+    # drop was a hang; crash-loop drops stay sticky.
+    maybe_repromote
+
     # ── If node_watchdog flagged the compositor unhealthy this boot, treat it
     #    as a crash for tier-drop accounting (signal-only; it never picks). ──
     #
@@ -312,6 +369,7 @@ let
           nxt=$(lower_tier "$cur")
           log "unhealthy-signal crash-loop: dropping $cur -> $nxt (latching + relaunching on the new tier)"
           write_tier "$nxt"
+          rm -f "$HANGMARK" 2>/dev/null || true   # crash-class drop is STICKY (never re-promoted)
           clear_window
         else
           log "unhealthy-signal crash-loop on the floor ('$FLOOR') — cannot drop further; relaunching the floor"
@@ -418,6 +476,17 @@ let
           nxt=$(lower_tier "$TIER")
           log "paint-watchdog: HUNG '$TIER' dropped to '$nxt' on the FIRST paint-timeout (deterministic hang) — latching"
           write_tier "$nxt"
+          # A paint-HANG MAY be a transient cold-boot slow first paint, not a
+          # permanent break — arm ONE fresh-boot re-promotion. BUT if this boot
+          # already spent its re-promotion retry on this tier (REPROMOTED_FLAG set),
+          # the hang is CONFIRMED: clear the arm so the latch settles and is never
+          # re-walked on later boots (the latch's never-re-walk guarantee holds for
+          # confirmed failures).
+          if [ -e "$REPROMOTED_FLAG" ]; then
+            rm -f "$HANGMARK" 2>/dev/null || true
+          else
+            : > "$HANGMARK" 2>/dev/null || true
+          fi
           clear_window
           # Return to greetd; it relaunches the selector, which now reads the
           # lowered latch.
@@ -454,6 +523,7 @@ let
           nxt=$(lower_tier "$TIER")
           log "crash-loop on '$TIER' ($MAX_CRASHES in ''${WINDOW_SECS}s) — dropping to '$nxt' and latching"
           write_tier "$nxt"
+          rm -f "$HANGMARK" 2>/dev/null || true   # crash-class drop is STICKY (never re-promoted)
           clear_window
         else
           log "crash-loop on the floor ('$FLOOR') — cannot drop further; staying on the floor (the screen still paints)"
@@ -648,6 +718,15 @@ in
       # Confirmed in the boot journal: "hart-session-selector: line 133:
       # /var/lib/hart/session-tier.window: Permission denied". (Mirrors the same
       # group-write reason /run/hart/session below is already 0770 for the shell host.)
+      #
+      # DETERMINISM: hart-base.nix declares the IDENTICAL `d /var/lib/hart 0770`
+      # rule (via its ${cfg.dataDir} default). Identical tmpfiles rules de-dupe
+      # cleanly, so the mode is deterministic. This RESOLVES the former conflict —
+      # hart-base used to set 0750 here while this module set 0770, and which mode
+      # won was decided by tmpfiles file/line ordering (nondeterministic); a 0750
+      # win silently reinstated the boot loop. We keep this rule (not removed) as a
+      # belt-and-suspenders so the latch dir still exists at 0770 even if dataDir is
+      # ever customized away from /var/lib/hart. Do NOT revert hart-base to 0750.
       "d /var/lib/hart 0770 hart hart -"
       "d /run/hart      0750 hart hart -"
       # Group-writable so the shell host (hart-admin, in the `hart` group) can

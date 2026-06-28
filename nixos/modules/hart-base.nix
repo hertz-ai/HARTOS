@@ -290,7 +290,20 @@ in
 
     # ── Directories ──
     systemd.tmpfiles.rules = [
-      "d ${cfg.dataDir} 0750 hart hart -"
+      # 0770 (group-writable), NOT 0750: the hart-session-supervisor selector runs
+      # as hart-admin (in the `hart` GROUP, not the `hart` OWNER) and MUST create +
+      # write the session-tier latch + crash-window files that live directly under
+      # this dir. At 0750 the group has only r-x, so every latch/window write fails
+      # "Permission denied" and a tier-drop can NEVER persist — the real-HW boot
+      # loop (the selector retries the same broken tier forever). hart-session-
+      # supervisor.nix declares the SAME `d /var/lib/hart 0770` rule; the two are
+      # now IDENTICAL, so tmpfiles de-dupes them and the mode is deterministic
+      # regardless of rule ordering. (Previously this was 0750 while the supervisor
+      # set 0770 — a same-path mode CONFLICT whose winner tmpfiles decided by file
+      # ordering = nondeterministic; a 0750 win silently reinstated the boot loop.)
+      # Do NOT revert this to 0750. The restrictive subdirs below keep their own
+      # 0750/0700 modes — a 0770 parent does not relax them.
+      "d ${cfg.dataDir} 0770 hart hart -"
       "d ${cfg.dataDir}/agent_data 0750 hart hart -"
       "d ${cfg.dataDir}/models 0750 hart hart -"
       "d ${cfg.logDir} 0750 hart hart -"
