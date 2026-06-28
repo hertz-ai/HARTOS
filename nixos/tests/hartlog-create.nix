@@ -203,6 +203,74 @@ in
           hfstype = hc.succeed("blkid -L HARTLOG | xargs blkid -o value -s TYPE").strip()
           assert "vfat" in hfstype, f"self-healed HARTLOG must be FAT32/vfat, got {hfstype!r}"
 
+      # ── 6d. The dd-written-isohybrid MID-DEVICE BACKUP GPT case (#128/#134). ──
+      # A REAL dd-flashed isohybrid GPT ISO places the BACKUP GPT header at the ISO
+      # IMAGE's last LBA (mid-stick), NOT at the physical end of the larger stick.
+      # The primary header therefore advertises LastUsableLBA = the ISO boundary, so
+      # the multi-GB trailing tail is INVISIBLE to `sgdisk -E`/`-f`: before the fix
+      # the carve no-op'd ("ISO filled the stick") and HARTLOG was NEVER created (so
+      # no journal ever landed on the stick — the #134 blind spot).
+      #
+      # The earlier subtests build the GPT DIRECTLY on the full spare disk, so their
+      # backup header is already at the device end and they CANNOT catch this. Here
+      # we reproduce the real failure: dd a SMALL GPT image (its backup header at the
+      # image's last LBA) onto the LARGER spare disk so the backup lands mid-device
+      # and the tail is hidden. The fill of the small image is sized so the visible
+      # (pre-relocation) free gap is BELOW the 16 MiB carve floor — so the ONLY way
+      # HARTLOG can be created is if the script relocated the backup header
+      # (sgdisk -e) first and thereby exposed the real tail. This is the behavioural
+      # guard for the sgdisk -e relocation (no grep on source).
+      with subtest("a dd-written mid-device-backup GPT exposes its hidden tail and carves HARTLOG"):
+          hc.succeed(f"sgdisk --zap-all {disk}")
+          hc.succeed(f"wipefs -a {disk} || true")
+          # 64 MiB GPT image: a 60 MiB "ISO" primary at the start, leaving < 4 MiB
+          # free INSIDE the image (below the 16 MiB floor). Its backup header sits at
+          # the image's last LBA (~64 MiB). dd it onto the 512 MiB spare with
+          # conv=notrunc so the spare keeps its real size but its backup header is now
+          # mid-device and the 64..512 MiB tail is hidden behind LastUsableLBA.
+          hc.succeed("rm -f /tmp/iso.img")
+          hc.succeed("truncate -s 64M /tmp/iso.img")
+          hc.succeed("sgdisk --new=1:2048:+60M --change-name=1:ISO /tmp/iso.img")
+          hc.succeed(f"dd if=/tmp/iso.img of={disk} conv=notrunc bs=1M")
+          hc.succeed(f"partprobe {disk} 2>/dev/null || partx -a {disk} 2>/dev/null || true")
+          hc.succeed("udevadm settle || true")
+          # PRECONDITION: the visible (pre-relocation) free tail is too small to
+          # carve. sgdisk -f (first aligned free) and -E (end of largest free block)
+          # both honour the primary header's LastUsableLBA (~the 64 MiB boundary), so
+          # the gap is < 32768 sectors (16 MiB). Without sgdisk -e the carve MUST
+          # no-op ("too small"/"ISO filled the stick") — so a later CREATED proves the
+          # relocation ran.
+          ff = int(hc.succeed(f"sgdisk -f {disk} 2>/dev/null | tr -dc '0-9'").strip() or "0")
+          lu = int(hc.succeed(f"sgdisk -E {disk} 2>/dev/null | tr -dc '0-9'").strip() or "0")
+          hidden_free = (lu - ff + 1) if lu >= ff else 0
+          assert 0 <= hidden_free < 32768, \
+              ("precondition: the pre-relocation free tail must be too small to carve "
+               f"(got {hidden_free} sectors, need < 32768) else the test can't prove the "
+               f"relocation (first_free={ff} last_usable={lu})")
+          # Run the REAL carve. It must relocate the backup header, see the now-exposed
+          # ~448 MiB tail, and CREATE HARTLOG.
+          out_mid = hc.succeed(f"HART_HARTLOG_TEST_DISK={disk} hart-hartlog-create 2>&1; echo RC=$?")
+          assert "RC=0" in out_mid, f"mid-device-backup carve must exit 0, got: {out_mid!r}"
+          assert "DECISION=CREATED" in out_mid, \
+              ("the carve must CREATE HARTLOG once the hidden tail is exposed — a NOOP here "
+               f"means sgdisk -e did not relocate the backup header, got: {out_mid!r}")
+          assert "relocated the backup GPT header" in out_mid, \
+              f"the carve must log the backup-GPT relocation, got: {out_mid!r}"
+          hc.succeed("blkid -L HARTLOG")
+          mid_fstype = hc.succeed("blkid -L HARTLOG | xargs blkid -o value -s TYPE").strip()
+          assert "vfat" in mid_fstype, f"mid-device-backup HARTLOG must be FAT32/vfat, got {mid_fstype!r}"
+          # And the HARTLOG partition spans the EXPOSED tail: its size is far larger
+          # than the tiny pre-relocation gap (parted reports the part size in sectors),
+          # which is only possible because the relocation grew the usable range.
+          hl_dev = hc.succeed("blkid -L HARTLOG").strip()
+          hl_sectors = int(hc.succeed(
+              f"lsblk -bndo SIZE {hl_dev}"
+          ).strip() or "0") // 512
+          assert hl_sectors > 100000, \
+              ("HARTLOG must span the relocated tail (much larger than the < 16 MiB "
+               f"pre-relocation gap), got {hl_sectors} sectors — relocation did not "
+               "expose the tail")
+
       # ── 7. The auto-detect path REFUSES the VM's non-removable boot disk ──
       # Run WITHOUT the test seam so the script walks the live root to the VM's
       # OWN boot disk (an internal, non-removable virtio disk — RM=0, TRAN!=usb).

@@ -411,17 +411,121 @@ def test_create_log_partition_diskpart_timeout_never_raises(monkeypatch):
     assert any("diskpart unavailable" in m or "timed out" in m for m in logs)
 
 
-def test_create_log_partition_non_windows_is_noop(monkeypatch):
-    """On Linux/macOS the carve is a logged no-op (diskpart is Windows-only)."""
+def test_create_log_partition_unix_no_tools_is_clean_skip(monkeypatch):
+    """On a host without sgdisk/mkfs.vfat (e.g. the Windows dev box, or a bare
+    macOS) the Linux/macOS carve is a clean, NON-destructive skip: returns False,
+    logs the reason, shells NOTHING, never raises. (The Live OS creates HARTLOG
+    itself on first boot.)"""
     monkeypatch.setattr(flasher, "IS_WIN", False)
+    monkeypatch.setattr(flasher.shutil, "which", lambda _name: None)   # no sgdisk/mkfs
+    monkeypatch.setattr(flasher.os.path, "exists", lambda _p: True)    # pretend dev present
     called = {"n": 0}
     monkeypatch.setattr(flasher.subprocess, "run",
                         lambda *a, **k: called.__setitem__("n", called["n"] + 1))
     logs = []
-    ok = flasher.create_log_partition({"number": 1}, logs.append)
+    ok = flasher.create_log_partition({"number": 1, "dev": "/dev/sdb"}, logs.append)
     assert ok is False
-    assert called["n"] == 0                       # never shells diskpart off-Windows
-    assert any("only created on Windows" in m for m in logs)
+    assert called["n"] == 0                       # never shells a partition tool
+    assert any("not on this host" in m for m in logs)
+
+
+def test_create_log_partition_unix_relocates_backup_then_carves(monkeypatch):
+    """THE #128 fix at flash time: the Linux/macOS carve must run `sgdisk -e`
+    (relocate the backup GPT to the TRUE device end) BEFORE measuring/carving the
+    free tail, then carve + FAT32-format HARTLOG. Without the relocate, the trailing
+    tail of a dd-written isohybrid is invisible and the carve no-ops. Proves the
+    ORDER (relocate precedes carve) + that HARTLOG is named, typed, and formatted."""
+    monkeypatch.setattr(flasher, "IS_WIN", False)
+    tools = {"sgdisk": "/usr/bin/sgdisk", "mkfs.vfat": "/usr/sbin/mkfs.vfat",
+             "partprobe": "/usr/sbin/partprobe", "partx": "/usr/sbin/partx"}
+    monkeypatch.setattr(flasher.shutil, "which", lambda name: tools.get(name))
+    monkeypatch.setattr(flasher.os.path, "exists", lambda _p: True)
+    monkeypatch.setattr(flasher.time, "sleep", lambda *_: None)
+
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        exe = cmd[0]
+        if exe.endswith("sgdisk"):
+            if "-f" in cmd:
+                return _CP("67584\n")                # first aligned free sector
+            if "-E" in cmd:
+                return _CP("60909534\n")             # last usable (tail now exposed)
+            return _CP("")                           # -e, --largest-new, ...
+        if exe == "lsblk":
+            if "PTTYPE" in cmd:
+                return _CP("gpt\n")
+            return _CP("/dev/sdb1 part\n/dev/sdb2 part\n")   # the new node is sdb2
+        return _CP("")                               # partprobe / partx / mkfs.vfat
+    monkeypatch.setattr(flasher.subprocess, "run", fake_run)
+
+    logs = []
+    ok = flasher.create_log_partition({"number": 1, "dev": "/dev/sdb"}, logs.append)
+    assert ok is True
+
+    sg = [c for c in calls if c[0].endswith("sgdisk")]
+    e_idx = next(i for i, c in enumerate(sg) if "-e" in c)
+    carve_idx = next(i for i, c in enumerate(sg)
+                     if any(a.startswith("--largest-new") for a in c))
+    assert e_idx < carve_idx, "sgdisk -e (relocate backup GPT) must run BEFORE the carve"
+    assert any("--change-name=0:HARTLOG" in c for c in sg)        # named HARTLOG
+    assert any(c[0].endswith("mkfs.vfat") and "HARTLOG" in c for c in calls)  # FAT32+label
+    assert any("created + FAT32-formatted" in m for m in logs)
+
+
+def test_create_log_partition_unix_no_free_after_relocate_is_skip(monkeypatch):
+    """If even after relocating the backup GPT there is no usable trailing tail (the
+    ISO truly filled the stick), the carve is a clean skip: it must NOT carve or
+    format, returns False, never raises."""
+    monkeypatch.setattr(flasher, "IS_WIN", False)
+    tools = {"sgdisk": "/usr/bin/sgdisk", "mkfs.vfat": "/usr/sbin/mkfs.vfat"}
+    monkeypatch.setattr(flasher.shutil, "which", lambda name: tools.get(name))
+    monkeypatch.setattr(flasher.os.path, "exists", lambda _p: True)
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[0].endswith("sgdisk"):
+            if "-f" in cmd:
+                return _CP("4000000\n")
+            if "-E" in cmd:
+                return _CP("4000000\n")              # first_free == last_usable: no tail
+            return _CP("")
+        if cmd[0] == "lsblk":
+            return _CP("gpt\n")
+        return _CP("")
+    monkeypatch.setattr(flasher.subprocess, "run", fake_run)
+    logs = []
+    ok = flasher.create_log_partition({"number": 1, "dev": "/dev/sdb"}, logs.append)
+    assert ok is False
+    assert not any(any(a.startswith("--largest-new") for a in c)
+                   for c in calls if c[0].endswith("sgdisk")), "must NOT carve with no tail"
+    assert not any(c[0].endswith("mkfs.vfat") for c in calls), "must NOT format with no tail"
+    assert any("no trailing free space" in m for m in logs)
+
+
+def test_create_log_partition_unix_mbr_is_skipped_not_converted(monkeypatch):
+    """A DOS/MBR isohybrid must be LEFT to the Live-OS parted path: running sgdisk on
+    it would convert the table + destroy the boot layout. The Unix carve detects
+    PTTYPE != gpt and skips WITHOUT ever touching sgdisk."""
+    monkeypatch.setattr(flasher, "IS_WIN", False)
+    tools = {"sgdisk": "/usr/bin/sgdisk", "mkfs.vfat": "/usr/sbin/mkfs.vfat"}
+    monkeypatch.setattr(flasher.shutil, "which", lambda name: tools.get(name))
+    monkeypatch.setattr(flasher.os.path, "exists", lambda _p: True)
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[0] == "lsblk" and "PTTYPE" in cmd:
+            return _CP("dos\n")
+        return _CP("")
+    monkeypatch.setattr(flasher.subprocess, "run", fake_run)
+    logs = []
+    ok = flasher.create_log_partition({"number": 1, "dev": "/dev/sdb"}, logs.append)
+    assert ok is False
+    assert not any(c[0].endswith("sgdisk") for c in calls), "must NEVER run sgdisk on MBR"
+    assert any("not GPT" in m for m in logs)
 
 
 def _stub_flash_machinery(monkeypatch, verify_result=True):

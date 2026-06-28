@@ -275,6 +275,38 @@ let
         decide NOOP "$DISK PTTYPE=gpt but sgdisk -p failed (won't risk the boot layout)"
         exit 0
       fi
+
+      # ── 4a-pre. RELOCATE the backup GPT header to the TRUE last LBA. ──
+      # THE #128/#134 blind-spot fix. A dd-written isohybrid GPT ISO places the
+      # BACKUP (secondary) GPT header at the ISO IMAGE's last LBA (e.g. ~6.6 GB),
+      # NOT at the physical end of the stick (e.g. ~29 GB). The PRIMARY header at
+      # LBA 1 therefore advertises LastUsableLBA = the ISO boundary, so the
+      # sgdisk -E / -f probes below honour that and STOP at the ISO end: the
+      # multi-GB trailing tail is INVISIBLE, FIRST_FREE >= LAST_USABLE fires the
+      # "ISO filled the stick" no-op (line ~286), and HARTLOG is NEVER carved. That
+      # is exactly why no journal ever lands on the stick (a painted-but-input-dead
+      # boot stays undebuggable, the #134 blind spot).
+      #
+      # `sgdisk -e` (--move-second-header) is the canonical "the underlying disk
+      # grew" operation: it relocates the backup GPT to the device's TRUE last LBA
+      # and rewrites the primary header's LastUsableLBA, so -E / -f then see the
+      # real tail. Properties that keep it within the never-touch / never-block
+      # contract:
+      #   - IDEMPOTENT: a no-op when the backup is already at the device end (the
+      #     nixosTest's direct-on-full-disk GPTs, and every second boot).
+      #   - BEST-EFFORT: on ANY failure we fall through to the SAME free-space gates
+      #     below (which then no-op), so it can never abort or block boot.
+      #   - NON-DESTRUCTIVE: it writes ONLY LBA 1 + the new last LBA. The in-use
+      #     ISO/EFI/boot partition DATA is never moved, resized, or rewritten.
+      # No partprobe here: the disk is BUSY (the ISO is mounted from it) so a full
+      # table re-read is refused; the sgdisk -f / -E reads below open the raw device
+      # fresh, and step 6's partx -a adds the new node.
+      if sgdisk -e "$DISK" >/dev/null 2>&1; then
+        cecho "relocated the backup GPT header to the true device end (reveals trailing free space a dd-written ISO hid behind a mid-device backup header)"
+      else
+        cecho "sgdisk -e (backup-GPT relocate) did not run cleanly on $DISK - continuing best-effort (the free-space gates below still apply)"
+      fi
+
       FIRST_FREE=$(sgdisk -f "$DISK" 2>/dev/null | tr -dc '0-9') || FIRST_FREE=""
       LAST_USABLE=$(sgdisk -E "$DISK" 2>/dev/null | tr -dc '0-9') || LAST_USABLE=""
       if [ -z "$FIRST_FREE" ] || [ -z "$LAST_USABLE" ]; then

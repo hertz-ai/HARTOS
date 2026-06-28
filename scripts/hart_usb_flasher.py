@@ -674,24 +674,43 @@ LOG_PART_LABEL = "HARTLOG"
 
 
 def create_log_partition(disk, log):
-    """Create a FAT32 partition labelled HARTLOG in the stick's FREE SPACE.
+    """Carve a FAT32 HARTLOG partition into the stick's FREE SPACE (host-side).
 
-    ROBUST BY CONTRACT: this runs AFTER a successful flash + boot-sig verify, and
-    it must NEVER fail/abort the (already-successful) flash. Every failure path —
-    no free space, diskpart missing/errored, non-Windows, any exception — is
-    caught and logged, and the function returns False without raising. The flash
-    is already done and bootable; the log partition is a debug convenience.
+    DISPATCHER: routes to the OS-appropriate backend. This is OFF by default in
+    flash() (the Live OS creates HARTLOG itself on first boot, Linux-side, which
+    can never corrupt the stick's EFI/GPT). It is the opt-in host-side pre-seed so
+    a host can read the boot log off the stick even BEFORE the first boot.
 
-    Mirrors the existing diskpart-fallback style (the flasher already shells
-    diskpart for enumeration + `clean`). Windows-only: only diskpart can carve a
-    partition into the post-isohybrid free space and FAT32-format + label it so
-    Windows mounts the drive natively. On Linux/macOS this is a logged no-op (the
-    user flashing from those hosts can read the ISO's own journal via other
-    means; the HARTLOG convenience targets the Windows-host debug loop).
+    ROBUST BY CONTRACT: it runs AFTER a successful flash + boot-sig verify and must
+    NEVER fail/abort the (already-successful) flash. Every failure path (no free
+    space, tool missing/errored, any exception) is caught and logged, and the
+    function returns False without raising. The flash is already bootable; the log
+    partition is a debug convenience.
+
+      Windows    -> _create_log_partition_windows (legacy diskpart carve)
+      Linux/macOS-> _create_log_partition_unix (sgdisk: relocate the backup GPT to
+                    the true device end, then carve the trailing free tail)
+
+    The canonical, OS-independent home for the carve is the Live-OS module
+    (nixos/modules/hart-hartlog-create.nix); a Windows-flashed stick is therefore
+    still covered on its first boot.
     """
-    if not IS_WIN:
-        log("  HARTLOG partition: skipped (only created on Windows; flash is complete)")
-        return False
+    if IS_WIN:
+        return _create_log_partition_windows(disk, log)
+    return _create_log_partition_unix(disk, log)
+
+
+def _create_log_partition_windows(disk, log):
+    """Legacy Windows HARTLOG carve via diskpart. Mirrors the existing diskpart-
+    fallback style (the flasher already shells diskpart for enumeration + `clean`).
+    Only diskpart can carve a partition into the post-isohybrid free space and
+    FAT32-format + label it so Windows mounts the drive natively. NEVER raises.
+
+    NOTE: this path is doubly fragile (it hung on a wedged VDS, and a half-completed
+    `create partition` corrupted a freshly-flashed stick's EFI/GPT), which is why it
+    is opt-in only and the Live-OS Linux carve is canonical. Kept for operators who
+    explicitly want the old behaviour via --windows-log-partition.
+    """
     import tempfile
     # Carve ALL remaining free space into one primary partition, format FAT32,
     # label HARTLOG. `create partition primary` with no size= uses the largest
@@ -747,6 +766,127 @@ def create_log_partition(disk, log):
             os.remove(path)
         except OSError:
             pass
+
+
+def _create_log_partition_unix(disk, log):
+    """Linux/macOS HARTLOG carve (the SAFE host-side path; no diskpart, no GPT
+    corruption). Two steps, both via sgdisk:
+
+      1. `sgdisk -e` relocates the BACKUP GPT header to the device's TRUE last LBA.
+         A dd-written isohybrid GPT ISO puts the backup header at the ISO image's
+         last LBA (mid-stick), so the primary header advertises LastUsableLBA = the
+         ISO boundary and the multi-GB trailing tail is invisible. -e rewrites it to
+         the real device end (idempotent; writes only LBA 1 + the new last LBA, so
+         the in-use ISO/EFI partitions are never touched). This is the same fix the
+         Live-OS module applies.
+      2. `--largest-new=0` carves the now-visible trailing free tail into one new
+         partition, named + typed HARTLOG, then mkfs.vfat FAT32-formats + labels it.
+
+    BEST-EFFORT + BOUNDED: every step has a subprocess timeout; any missing tool,
+    no-free-space, or error is a logged skip that returns False WITHOUT raising. The
+    flash is already complete + bootable, and the Live OS carves HARTLOG itself on
+    first boot, so this host-side carve is purely a pre-seed so the host can read the
+    log even before the first boot. GPT-only: an MBR/DOS isohybrid is left to the
+    Live-OS parted path (running sgdisk on it would convert the table).
+    """
+    dev = disk.get("dev") or disk.get("physdrive")
+    sgdisk = shutil.which("sgdisk")
+    mkvfat = shutil.which("mkfs.vfat") or shutil.which("mkfs.fat")
+    if not dev or not os.path.exists(dev):
+        log("  HARTLOG partition: no block-device path for the target - skipped "
+            "(flash is complete; the Live OS creates HARTLOG on first boot)")
+        return False
+    if not sgdisk or not mkvfat:
+        log("  HARTLOG partition: sgdisk/mkfs.vfat not on this host - skipped "
+            "(flash is complete; the Live OS creates HARTLOG on first boot)")
+        return False
+
+    def _digits(s):
+        return "".join(c for c in (s or "") if c.isdigit())
+
+    def _run_t(cmd, timeout=60):
+        """Run a tool with a hard timeout; return CompletedProcess or None on
+        timeout/OSError (never raises out of the carve)."""
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log("  HARTLOG partition: %s failed (%s)" % (cmd[0] if cmd else "?", e))
+            return None
+
+    try:
+        # GPT-only guard: never run sgdisk on an MBR/DOS stick (it would convert it).
+        rpt = _run_t(["lsblk", "-ndo", "PTTYPE", dev], timeout=20)
+        pttype = (rpt.stdout if rpt else "").strip()
+        if pttype and pttype != "gpt":
+            log("  HARTLOG partition: %s is %s, not GPT - skipped "
+                "(the Live OS handles the MBR/DOS carve)" % (dev, pttype))
+            return False
+
+        # 1. Relocate the backup GPT header to the true device end.
+        if _run_t([sgdisk, "-e", dev]) is None:
+            log("  HARTLOG partition: backup-GPT relocate failed - skipped "
+                "(flash is complete + bootable)")
+            return False
+
+        # 2. Measure the now-visible trailing free space.
+        rf = _run_t([sgdisk, "-f", dev])
+        re_ = _run_t([sgdisk, "-E", dev])
+        if rf is None or re_ is None:
+            return False
+        first_free = int(_digits(rf.stdout) or "0")
+        last_usable = int(_digits(re_.stdout) or "0")
+        if first_free <= 0 or last_usable <= 0 or first_free >= last_usable:
+            log("  HARTLOG partition: no trailing free space after relocate "
+                "(first_free=%s last_usable=%s) - skipped (ISO filled the stick)"
+                % (first_free, last_usable))
+            return False
+        free_sectors = last_usable - first_free + 1
+        if free_sectors < 32768:                      # < 16 MiB
+            log("  HARTLOG partition: trailing free space too small (%d sectors) - "
+                "skipped (flash is complete + bootable)" % free_sectors)
+            return False
+
+        # 3. Carve the largest free region into a new HARTLOG partition. --largest-new
+        #    cannot move/resize an existing partition; it only appends a GPT entry.
+        if _run_t([sgdisk, "--largest-new=0",
+                   "--change-name=0:%s" % LOG_PART_LABEL,
+                   "--typecode=0:0700", dev]) is None:
+            log("  HARTLOG partition: sgdisk carve failed - skipped "
+                "(flash is complete + bootable)")
+            return False
+
+        # 4. Re-read the table, resolve the new node, FAT32-format it.
+        for tool, args in (("partprobe", [dev]), ("partx", ["-a", dev])):
+            exe = shutil.which(tool)
+            if exe:
+                _run_t([exe] + args, timeout=30)
+        newpart = ""
+        for _ in range(10):
+            rl = _run_t(["lsblk", "-lnpo", "NAME,TYPE", dev], timeout=20)
+            if rl:
+                parts = [ln.split()[0] for ln in (rl.stdout or "").splitlines()
+                         if len(ln.split()) >= 2 and ln.split()[1] == "part"]
+                if parts:
+                    newpart = parts[-1]
+            if newpart and os.path.exists(newpart):
+                break
+            time.sleep(1)
+        if not newpart or not os.path.exists(newpart):
+            log("  HARTLOG partition: created the partition but its node did not "
+                "settle - the Live OS self-heal will format it on first boot")
+            return False
+        rm = _run_t([mkvfat, "-F", "32", "-n", LOG_PART_LABEL, newpart], timeout=90)
+        if rm is None or rm.returncode != 0:
+            log("  HARTLOG partition: mkfs.vfat did not complete - the Live OS will "
+                "format it on first boot")
+            return False
+        log("  HARTLOG partition: created + FAT32-formatted on %s (label=%s) - the "
+            "host can now read hart-boot-latest.log off it" % (newpart, LOG_PART_LABEL))
+        return True
+    except Exception as e:                       # belt-and-suspenders: never fail the flash
+        log("  HARTLOG partition: unexpected error (%s) - skipped "
+            "(flash is complete + bootable)" % e)
+        return False
 
 
 # ───────────────────────── orchestration ─────────────────────────
@@ -809,27 +949,29 @@ def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
     log("Verifying signatures...")
     ok = verify_iso(disk, dd, log)
     log("DONE - bootable OK" if ok else "DONE but signature check FAILED")
-    # HARTLOG partition creation now DEFAULTS OFF on Windows. The Live OS creates
-    # it itself on first boot (nixos/modules/hart-hartlog-create.nix), Linux-side,
-    # which is SAFE. The Windows diskpart carve was DOUBLY broken: it HUNG on a
-    # wedged Windows VDS, and a half-completed `diskpart create partition` CORRUPTED
-    # a freshly-flashed stick's EFI/GPT (boot failed with start_image returned
-    # 0x8000000000000001 = EFI_LOAD_ERROR). So we no longer touch the stick after a
-    # successful flash by default — never risk bricking the very stick we flashed.
-    # The legacy carve stays opt-in via --windows-log-partition (make_log_partition)
-    # for anyone who explicitly wants the old path; it is gated on the verify
-    # passing and NEVER raises / never fails the flash.
+    # HARTLOG partition creation DEFAULTS OFF. The Live OS creates it itself on
+    # first boot (nixos/modules/hart-hartlog-create.nix), Linux-side, which is SAFE
+    # (it relocates the backup GPT to the true device end, then carves only the
+    # trailing free tail). The Windows diskpart carve was DOUBLY broken: it HUNG on
+    # a wedged Windows VDS, and a half-completed `diskpart create partition`
+    # CORRUPTED a freshly-flashed stick's EFI/GPT (boot failed with start_image
+    # returned 0x8000000000000001 = EFI_LOAD_ERROR). So we no longer touch the stick
+    # after a successful flash by default - never risk bricking the very stick we
+    # flashed. The opt-in host-side carve (--windows-log-partition / make_log_partition)
+    # is a pre-seed so the host can read the log even BEFORE the first boot: on
+    # Windows it runs the legacy diskpart path; on Linux/macOS it runs the SAFE
+    # sgdisk relocate-then-carve. It is gated on the verify passing and NEVER raises.
     if ok and make_log_partition:
         log("Creating HARTLOG diagnostic-log partition in the free space "
-            "(--windows-log-partition; the Live OS normally creates it itself)...")
+            "(opt-in host-side pre-seed; the Live OS normally creates it itself)...")
         try:
             create_log_partition(disk, log)
         except Exception as e:                   # the carve can NEVER fail the flash
-            log("  HARTLOG partition: ignored error (%s) — flash is complete + bootable" % e)
+            log("  HARTLOG partition: ignored error (%s) - flash is complete + bootable" % e)
     else:
-        log("HARTLOG partition: not created on Windows (default) — the Live OS "
+        log("HARTLOG partition: not created host-side (default) - the Live OS "
             "creates it itself on first boot, which can't corrupt the stick's "
-            "EFI/GPT. Pass --windows-log-partition to force the legacy Windows path.")
+            "EFI/GPT. Pass --windows-log-partition for the opt-in host-side carve.")
     return ok
 
 
@@ -958,13 +1100,14 @@ def build_parser():
     p.add_argument("--allow-system", action="store_true",
                    help="DANGEROUS: also offer non-removable/system disks")
     p.add_argument("--windows-log-partition", action="store_true",
-                   help="OPT-IN to the LEGACY Windows diskpart carve of the HARTLOG "
-                        "diagnostic-log partition in the stick's free space. OFF by "
-                        "default: the Live OS now creates HARTLOG itself on first "
-                        "boot (Linux-side, safe). The Windows diskpart path hung on "
-                        "a wedged VDS AND corrupted a freshly-flashed stick's "
-                        "EFI/GPT — only use this if you specifically need the old "
-                        "path.")
+                   help="OPT-IN to the host-side carve of the HARTLOG diagnostic-log "
+                        "partition in the stick's free space, right after the flash. "
+                        "OFF by default: the Live OS creates HARTLOG itself on first "
+                        "boot (Linux-side, safe). On Linux/macOS this opt-in runs the "
+                        "SAFE sgdisk relocate-then-carve; on Windows it runs the "
+                        "LEGACY diskpart path, which hung on a wedged VDS AND "
+                        "corrupted a freshly-flashed stick's EFI/GPT (use it only if "
+                        "you specifically need a host-readable log before first boot).")
     return p
 
 
@@ -1038,12 +1181,12 @@ def launch_gui():
 
     row4 = ttk.Frame(frm); row4.pack(fill="x", pady=3)
     # Default OFF (matches the CLI default): the Live OS creates the HARTLOG
-    # partition itself on first boot (Linux-side, safe). The legacy Windows
-    # diskpart carve hung on a wedged VDS AND corrupted a freshly-flashed stick's
-    # EFI/GPT, so it is OPT-IN only now.
+    # partition itself on first boot (Linux-side, safe). The opt-in host-side carve
+    # is a pre-seed so the host can read the log before first boot; on Linux/macOS
+    # it is the safe sgdisk path, on Windows the legacy diskpart path.
     logpart_var = tk.BooleanVar(value=False)
     ttk.Checkbutton(row4,
-                    text="Legacy: create HARTLOG via Windows diskpart (OFF — the Live OS now does this safely)",
+                    text="Also create HARTLOG host-side now (OFF - the Live OS does this safely on first boot)",
                     variable=logpart_var).pack(side="left")
 
     pbar = ttk.Progressbar(frm, mode="determinate", maximum=1.0)
