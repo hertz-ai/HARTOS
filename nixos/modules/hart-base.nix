@@ -224,6 +224,46 @@ in
       hashedPassword = "$6$hartos00$4CRZoq04d/q2rp1.FAXAXMqZeUkDfh90FYFA2vpl4b/3JWAs1EvmjW7dgDf/wt.mjt6iIovSKaZmZtJkoj0dx1";
     };
 
+    # ── Power actions via logind (polkit grant) — #133 ──
+    # The Liquid-UI shell server (which serves /api/shell/power/action) runs as the
+    # `hart` SERVICE user, a system daemon with NO active graphical session. When
+    # the user taps a power button it asks logind (org.freedesktop.login1.Manager)
+    # to Reboot / PowerOff / Suspend / Hibernate / SetRebootToFirmwareSetup. polkit's
+    # default login1 policy returns `yes` only for an active LOCAL session; a system
+    # daemon falls through to allow_inactive/allow_any = auth_admin, so the call is
+    # DENIED non-interactively and the box silently never reboots (the #133 symptom).
+    #
+    # This rule grants the `hart` shell user (and, belt-and-suspenders, any active
+    # local seat such as hart-admin's graphical session) the login1 power actions
+    # outright, so shell_os_apis.shell_power_action's native D-Bus call is authorized
+    # and actually executes. Scope is the enumerated power verbs ONLY — no broader
+    # privilege is conferred. (The shell server still gates every call behind
+    # @_require_shell_auth + the action whitelist + the firmware-capability probe.)
+    security.polkit = {
+      enable = lib.mkDefault true;
+      extraConfig = ''
+        polkit.addRule(function(action, subject) {
+          var hartPowerActions = {
+            "org.freedesktop.login1.reboot": true,
+            "org.freedesktop.login1.reboot-multiple-sessions": true,
+            "org.freedesktop.login1.power-off": true,
+            "org.freedesktop.login1.power-off-multiple-sessions": true,
+            "org.freedesktop.login1.suspend": true,
+            "org.freedesktop.login1.suspend-multiple-sessions": true,
+            "org.freedesktop.login1.hibernate": true,
+            "org.freedesktop.login1.hibernate-multiple-sessions": true,
+            "org.freedesktop.login1.set-reboot-to-firmware-setup": true,
+            "org.freedesktop.login1.lock-sessions": true
+          };
+          if (hartPowerActions[action.id] === true) {
+            if (subject.user == "hart" || (subject.local && subject.active)) {
+              return polkit.Result.YES;
+            }
+          }
+        });
+      '';
+    };
+
     # ── Networking ──
     networking = {
       hostName = lib.mkDefault "hart-node";

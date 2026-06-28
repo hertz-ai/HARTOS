@@ -509,29 +509,55 @@ class TestFirmwareSetup(unittest.TestCase):
         popen.assert_not_called()
 
     def test_power_action_firmware_runs_reboot_firmware_setup(self):
-        """On a capable box the action spawns `systemctl reboot --firmware-setup`
-        via the SAME privileged path the other power actions use."""
+        """On a capable box the action arms the UEFI boot-to-firmware flag via the
+        native logind SetRebootToFirmwareSetup(true) D-Bus method, THEN reboots —
+        the two-step `boot into firmware` sequence (no plain `systemctl` spawn)."""
+        from unittest.mock import call
         client = _make_os_app()
         with patch(f'{self.MOD}._classify_destructive', return_value=True), \
                 patch(f'{self.MOD}.firmware_setup_supported', return_value=True), \
-                patch(f'{self.MOD}.subprocess.Popen') as popen:
+                patch(f'{self.MOD}._logind_call', return_value=(True, None)) as lc:
             r = client.post('/api/shell/power/action', json={'action': 'firmware'})
         self.assertEqual(r.status_code, 200)
-        popen.assert_called_once_with(
-            ['systemctl', 'reboot', '--firmware-setup'])
+        self.assertTrue(json.loads(r.data)['initiated'])
+        self.assertEqual(lc.call_args_list, [
+            call('SetRebootToFirmwareSetup', 'b', 'true'),
+            call('Reboot', 'b', 'true'),
+        ])
 
     def test_power_action_uefi_alias_runs_firmware_setup(self):
-        """The 'uefi' alias maps to the SAME `systemctl reboot --firmware-setup`
-        command + is gated by the SAME capability probe — so both labels the UI
-        might send behave identically (one command, no second code path)."""
+        """The 'uefi' alias maps to the SAME native firmware-arm + reboot sequence
+        + is gated by the SAME capability probe — so both labels the UI might send
+        behave identically (one canonical path, no second code path)."""
+        from unittest.mock import call
         client = _make_os_app()
         with patch(f'{self.MOD}._classify_destructive', return_value=True), \
                 patch(f'{self.MOD}.firmware_setup_supported', return_value=True), \
-                patch(f'{self.MOD}.subprocess.Popen') as popen:
+                patch(f'{self.MOD}._logind_call', return_value=(True, None)) as lc:
             r = client.post('/api/shell/power/action', json={'action': 'uefi'})
         self.assertEqual(r.status_code, 200)
-        popen.assert_called_once_with(
-            ['systemctl', 'reboot', '--firmware-setup'])
+        self.assertTrue(json.loads(r.data)['initiated'])
+        self.assertEqual(lc.call_args_list, [
+            call('SetRebootToFirmwareSetup', 'b', 'true'),
+            call('Reboot', 'b', 'true'),
+        ])
+
+    def test_power_action_firmware_arm_failure_does_not_reboot(self):
+        """If arming the firmware flag is DENIED/fails, the handler returns a real
+        error (500) and does NOT fall back to a plain reboot — a plain reboot is
+        the wrong action for the user's 'enter firmware setup' intent."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.firmware_setup_supported', return_value=True), \
+                patch(f'{self.MOD}._logind_call',
+                      return_value=(False, 'Access denied')) as lc:
+            r = client.post('/api/shell/power/action', json={'action': 'firmware'})
+        self.assertEqual(r.status_code, 500)
+        body = json.loads(r.data)
+        self.assertIn('error', body)
+        self.assertFalse(body.get('initiated', False))
+        # Only the arm call was attempted; Reboot was never issued.
+        self.assertEqual(lc.call_count, 1)
+        self.assertEqual(lc.call_args[0][0], 'SetRebootToFirmwareSetup')
 
     def test_power_action_uefi_alias_refused_when_unsupported(self):
         """The 'uefi' alias is refused (400) + never reboots on a non-capable box,
@@ -580,10 +606,11 @@ class TestFirmwareSetup(unittest.TestCase):
         capability-advertising box — it must NOT be refused as 'unknown'."""
         client = _make_os_app()
         with patch(f'{self.MOD}.firmware_setup_supported', return_value=True), \
-                patch(f'{self.MOD}.subprocess.Popen') as popen:
+                patch(f'{self.MOD}._logind_call', return_value=(True, None)) as lc:
             r = client.post('/api/shell/power/action', json={'action': 'firmware'})
         self.assertEqual(r.status_code, 200)
-        popen.assert_called_once_with(['systemctl', 'reboot', '--firmware-setup'])
+        self.assertTrue(json.loads(r.data)['initiated'])
+        self.assertEqual(lc.call_count, 2)  # arm firmware flag, then reboot
 
     def test_firmware_refused_with_real_classifier_on_incapable_box(self):
         """REAL _classify_destructive (NOT patched): on a legacy-BIOS / no-cap box
@@ -600,14 +627,116 @@ class TestFirmwareSetup(unittest.TestCase):
     def test_reboot_and_shutdown_permitted_with_real_classifier(self):
         """REAL classifier: 'reboot'/'shutdown' classify as 'destructive' yet are
         intentional, capability-free power verbs — they must still execute (the
-        old generic gate wrongly 403'd them)."""
-        for action, cmd in (('reboot', ['systemctl', 'reboot']),
-                            ('shutdown', ['systemctl', 'poweroff'])):
+        old generic gate wrongly 403'd them). Each maps to the native logind
+        Manager method (Reboot / PowerOff), not a systemctl spawn."""
+        for action, method in (('reboot', 'Reboot'), ('shutdown', 'PowerOff')):
             client = _make_os_app()
-            with patch(f'{self.MOD}.subprocess.Popen') as popen:
+            with patch(f'{self.MOD}._logind_call', return_value=(True, None)) as lc:
                 r = client.post('/api/shell/power/action', json={'action': action})
             self.assertEqual(r.status_code, 200, action)
-            popen.assert_called_once_with(cmd)
+            self.assertTrue(json.loads(r.data)['initiated'], action)
+            lc.assert_called_once_with(method, 'b', 'true')
+
+
+# ═══════════════════════════════════════════════════════════════
+# Power actions — native logind D-Bus + real result check (#133)
+# ═══════════════════════════════════════════════════════════════
+
+class TestPowerActionNativeLogind(unittest.TestCase):
+    """The power-action handler must invoke logind over D-Bus and CHECK the
+    result — a polkit denial / missing busctl / timeout must surface a real
+    error, NEVER the old masked {'initiated': True}."""
+
+    MOD = 'integrations.agent_engine.shell_os_apis'
+
+    def _fake_run(self, returncode=0, stderr='', stdout=''):
+        proc = MagicMock()
+        proc.returncode = returncode
+        proc.stderr = stderr
+        proc.stdout = stdout
+        return proc
+
+    def test_denied_action_returns_error_not_initiated(self):
+        """THE centerpiece: when logind/polkit DENIES the call (busctl exits
+        non-zero), the response is an error (500) and is NOT a masked success —
+        `initiated` must be False and an `error` must be present."""
+        client = _make_os_app()
+        denied = self._fake_run(
+            returncode=1,
+            stderr='Call failed: Access denied')
+        with patch(f'{self.MOD}.subprocess.run', return_value=denied) as run:
+            r = client.post('/api/shell/power/action', json={'action': 'reboot'})
+        self.assertEqual(r.status_code, 500)
+        body = json.loads(r.data)
+        self.assertIn('error', body)
+        self.assertIn('Access denied', body['error'])
+        self.assertFalse(body.get('initiated', False))
+        # It really tried the native login1 D-Bus call (not systemctl).
+        argv = run.call_args[0][0]
+        self.assertIn('busctl', argv)
+        self.assertIn('org.freedesktop.login1.Manager', argv)
+        self.assertIn('Reboot', argv)
+
+    def test_busctl_missing_returns_error(self):
+        """Degrade-not-die: if busctl is absent the handler reports a real error
+        (500), never a masked success."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run', side_effect=FileNotFoundError()):
+            r = client.post('/api/shell/power/action', json={'action': 'shutdown'})
+        self.assertEqual(r.status_code, 500)
+        body = json.loads(r.data)
+        self.assertIn('error', body)
+        self.assertFalse(body.get('initiated', False))
+
+    def test_timeout_returns_error(self):
+        """A hung D-Bus call (timeout) surfaces a real error, not initiated:true."""
+        import subprocess as _sp
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run',
+                   side_effect=_sp.TimeoutExpired(cmd='busctl', timeout=10)):
+            r = client.post('/api/shell/power/action', json={'action': 'suspend'})
+        self.assertEqual(r.status_code, 500)
+        body = json.loads(r.data)
+        self.assertIn('error', body)
+        self.assertFalse(body.get('initiated', False))
+
+    def test_success_uses_native_login1_dbus(self):
+        """On success (busctl exits 0) the handler reports initiated:true AND the
+        invoked argv is the native login1 Manager call, proving it is NOT the old
+        fire-and-forget `systemctl` spawn."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run',
+                   return_value=self._fake_run(returncode=0)) as run:
+            r = client.post('/api/shell/power/action', json={'action': 'suspend'})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(json.loads(r.data)['initiated'])
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:3], ['busctl', 'call', '--system'])
+        self.assertIn('org.freedesktop.login1', argv)
+        self.assertIn('Suspend', argv)
+        self.assertNotIn('systemctl', argv)
+
+    def test_logind_call_helper_maps_denial_to_false(self):
+        """Unit-level: _logind_call returns (False, <reason>) on a non-zero exit
+        so callers can never mistake a denial for success."""
+        from integrations.agent_engine.shell_os_apis import _logind_call
+        with patch(f'{self.MOD}.subprocess.run',
+                   return_value=self._fake_run(returncode=1, stderr='boom')):
+            ok, err = _logind_call('Reboot', 'b', 'true')
+        self.assertFalse(ok)
+        self.assertIn('boom', err)
+
+    def test_logind_call_helper_success(self):
+        """Unit-level: _logind_call returns (True, None) on a zero exit and passes
+        the signature+args through to busctl verbatim."""
+        from integrations.agent_engine.shell_os_apis import _logind_call
+        with patch(f'{self.MOD}.subprocess.run',
+                   return_value=self._fake_run(returncode=0)) as run:
+            ok, err = _logind_call('PowerOff', 'b', 'true')
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[-3:], ['PowerOff', 'b', 'true'])
 
 
 # ═══════════════════════════════════════════════════════════════

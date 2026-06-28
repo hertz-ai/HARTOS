@@ -222,6 +222,59 @@ def firmware_setup_supported():
         return False
 
 
+# ── Native logind (org.freedesktop.login1) power calls ──
+# CANONICAL home for "ask the OS to reboot / power off / suspend / hibernate /
+# arm firmware setup". The power-action handler talks to logind's D-Bus Manager
+# interface DIRECTLY and CHECKS the result, instead of the old
+# `subprocess.Popen(['systemctl', 'reboot'])` fire-and-forget.
+#
+# Why this matters (the bug #133 fixes): the shell server runs as the unprivileged
+# `hart` service user. `systemctl reboot` from there delegates to logind, but
+# polkit (no rule for a non-session system daemon) DENIES it — and `Popen` never
+# waits for or reads that denial, so EVERY reboot/shutdown/firmware request was
+# masked as `{'initiated': True}` while the box did nothing. We now invoke the
+# login1 Manager method over the system bus with `busctl call --system` (the same
+# native D-Bus mechanism the app-bridge already uses), read the real exit status
+# + stderr, and return a genuine error on failure. The matching grant lives in
+# nixos/modules/hart-base.nix `security.polkit` (the `hart` user is authorized for
+# these login1 actions), so the authorized call actually executes.
+_LOGIN1_DEST = 'org.freedesktop.login1'
+_LOGIN1_PATH = '/org/freedesktop/login1'
+_LOGIN1_IFACE = 'org.freedesktop.login1.Manager'
+
+
+def _logind_call(method, *busctl_args, timeout=10):
+    """Invoke an org.freedesktop.login1.Manager method over the system D-Bus.
+
+    `busctl_args` are passed verbatim as the method's busctl signature+values,
+    e.g. ('b', 'true') for the interactive-boolean methods (Reboot, PowerOff,
+    Suspend, Hibernate, SetRebootToFirmwareSetup); pass nothing for a no-arg
+    method (LockSessions).
+
+    Returns (ok: bool, error: Optional[str]). `ok` is True ONLY when busctl
+    exits 0 — i.e. logind accepted the method AND polkit authorized it. A polkit
+    denial, a missing busctl, or a timeout each return (False, <reason>) so the
+    caller can surface a REAL error instead of a masked success. Degrade-not-die:
+    every failure mode is caught and reported, never raised to the request thread.
+    """
+    cmd = ['busctl', 'call', '--system',
+           _LOGIN1_DEST, _LOGIN1_PATH, _LOGIN1_IFACE, method, *busctl_args]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return False, 'busctl not available (systemd D-Bus tooling missing)'
+    except subprocess.TimeoutExpired:
+        return False, f'logind {method} timed out after {timeout}s'
+    except Exception as e:  # pragma: no cover - defensive
+        return False, f'logind {method} failed: {e}'
+    if r.returncode != 0:
+        # busctl prints the D-Bus error (e.g. polkit "Access denied" /
+        # "Interactive authentication required") to stderr. Surface it.
+        detail = (r.stderr or r.stdout or '').strip() or f'exit code {r.returncode}'
+        return False, f'logind {method} denied or failed: {detail}'
+    return True, None
+
+
 def register_shell_os_routes(app):
     """Register all extended shell OS API routes on a Flask app."""
 
@@ -928,8 +981,8 @@ def register_shell_os_routes(app):
         data = request.get_json(force=True)
         action = data.get('action', '')
 
-        # These are an ENUMERATED, intentional set of power verbs — already
-        # behind the local-shell auth gate (@_require_shell_auth) and (for
+        # These are an ENUMERATED, intentional set of power verbs (the whitelist) —
+        # already behind the local-shell auth gate (@_require_shell_auth) and (for
         # firmware/uefi) the firmware-capability gate below. They must NOT be
         # routed through the FREE-FORM destructive classifier: that classifier
         # exists for arbitrary command/file text (terminal exec, file delete),
@@ -937,25 +990,29 @@ def register_shell_os_routes(app):
         # 'firmware'/'suspend'/'hibernate' as 'unknown' (fail-closed) — so on a
         # real box EVERY power action 403'd and the firmware feature was dead.
         # The canonical gate for a power verb is membership in this whitelist
-        # (and the capability probe for firmware/uefi) — the SAME decision the
-        # liquid_ui_service /api/shell/session/<action> route uses, so the two
-        # entry points for the identical `systemctl reboot --firmware-setup`
-        # command no longer gate differently (Gate-4: one canonical path).
-        actions = {
-            'suspend': ['systemctl', 'suspend'],
-            'hibernate': ['systemctl', 'hibernate'],
-            'reboot': ['systemctl', 'reboot'],
-            'shutdown': ['systemctl', 'poweroff'],
-            'lock': ['loginctl', 'lock-sessions'],
-            # 'firmware'/'uefi' = "Restart into Firmware (UEFI)": set the UEFI
-            # OsIndications boot-to-firmware-UI flag, then reboot — the next boot
-            # enters the BIOS/UEFI setup. Uses the SAME privileged path the other
-            # power actions use (no new password-less sudo hole).
-            'firmware': ['systemctl', 'reboot', '--firmware-setup'],
-            'uefi': ['systemctl', 'reboot', '--firmware-setup'],
+        # (and the capability probe for firmware/uefi).
+        #
+        # Each verb maps to a NATIVE logind (org.freedesktop.login1.Manager) D-Bus
+        # method, invoked + result-checked by `_logind_call` above. The interactive
+        # boolean is `true` so logind may consult polkit; the hart-base.nix
+        # security.polkit rule grants the `hart` shell user these login1 actions
+        # outright, so the call is authorized without a prompt. This replaces the
+        # old fire-and-forget `subprocess.Popen(['systemctl', ...])` that masked a
+        # polkit denial as `{'initiated': True}` while the box never powered down.
+        _SINGLE_METHOD = {
+            'suspend': 'Suspend',
+            'hibernate': 'Hibernate',
+            'reboot': 'Reboot',
+            'shutdown': 'PowerOff',
+            'lock': 'LockSessions',
         }
-        if action not in actions:
-            return jsonify({'error': f'Invalid action. Valid: {list(actions.keys())}'}), 400
+        # firmware/uefi = "Restart into Firmware (UEFI)": arm the UEFI boot-to-
+        # firmware-UI flag (SetRebootToFirmwareSetup true), THEN reboot — the next
+        # boot enters the BIOS/UEFI setup. Two-step; if arming fails we do NOT
+        # reboot (a plain reboot would be the wrong action for the user's intent).
+        valid_actions = list(_SINGLE_METHOD.keys()) + ['firmware', 'uefi']
+        if action not in valid_actions:
+            return jsonify({'error': f'Invalid action. Valid: {valid_actions}'}), 400
 
         # Gate firmware setup to UEFI boxes that advertise the capability — never
         # give the user a plain reboot when they asked to enter firmware setup.
@@ -965,11 +1022,23 @@ def register_shell_os_routes(app):
                                      'advertised)'}), 400
 
         _audit_shell_op('power_action', {'action': action})
-        try:
-            subprocess.Popen(actions[action])
-            return jsonify({'action': action, 'initiated': True})
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
+
+        if action in ('firmware', 'uefi'):
+            ok, err = _logind_call('SetRebootToFirmwareSetup', 'b', 'true')
+            if not ok:
+                return jsonify({'action': action, 'initiated': False,
+                                'error': f'Could not arm firmware setup: {err}'}), 500
+            ok, err = _logind_call('Reboot', 'b', 'true')
+        elif action == 'lock':
+            ok, err = _logind_call('LockSessions')
+        else:
+            ok, err = _logind_call(_SINGLE_METHOD[action], 'b', 'true')
+
+        if not ok:
+            # Real failure (polkit denied, busctl missing, timeout) — surface it
+            # as an error, never a masked {'initiated': True}.
+            return jsonify({'action': action, 'initiated': False, 'error': err}), 500
+        return jsonify({'action': action, 'initiated': True})
 
     @app.route('/api/shell/power/checkpoint', methods=['POST'])
     def shell_power_checkpoint():
