@@ -277,6 +277,30 @@ let
     # harmless. We inherit + re-export it so the glass-host child sees it.
     export HART_SHELL_READY_FLAG="''${HART_SHELL_READY_FLAG:-/run/hart/session/shell-ready}"
 
+    # ── ORPHAN-BRICK GUARD (FMEA #3, boot-hardening) ──────────────────────────
+    # hart-comp and the glass shell run in the BACKGROUND (below) while this
+    # wrapper blocks in `wait`. The session-supervisor launches this wrapper as
+    # `sh -c "$CMD"` (a single bare path, so sh execs it -> this process IS its
+    # sesspid) and, on a HUNG paint, sends it SIGTERM then SIGKILL. WITHOUT a
+    # trap the wrapper dies but the backgrounded hart-comp is ORPHANED
+    # (reparented to init), KEEPS the DRM master on card0, and EBUSY-blocks the
+    # next tier (sway/cage) from becoming master -> a black screen instead of a
+    # clean tier-drop. So forward the termination signal to the children and WAIT
+    # for the compositor to actually exit (drmDropMaster on its way out) before we
+    # leave, RELEASING the master so the lower tiers can take over. Registered
+    # before the launch (PIDs default empty + guarded) so the whole window is
+    # covered; the happy path (no signal) never runs the handler and is untouched.
+    HART_COMP_PID=""
+    HART_GLASS_PID=""
+    _hart_comp_term() {
+      trap - TERM INT          # one-shot: a second signal falls back to default
+      [ -n "$HART_GLASS_PID" ] && kill -TERM "$HART_GLASS_PID" 2>/dev/null || true
+      [ -n "$HART_COMP_PID" ]  && kill -TERM "$HART_COMP_PID"  2>/dev/null || true
+      [ -n "$HART_COMP_PID" ]  && wait "$HART_COMP_PID"        2>/dev/null || true
+      exit 0
+    }
+    trap _hart_comp_term TERM INT
+
     ${hartCompPkg}/bin/hart-comp --backend drm ${lib.optionalString (!(ui.preferHardwareGL or false)) "--force-software"} &
     HART_COMP_PID=$!
 
@@ -305,8 +329,10 @@ let
       # host is not in the closure — never a parallel renderer, just degrade.
       if command -v hart-glass-shell-gtk4 >/dev/null 2>&1; then
         hart-glass-shell-gtk4 &
+        HART_GLASS_PID=$!
       elif command -v hart-glass-shell >/dev/null 2>&1; then
         hart-glass-shell &
+        HART_GLASS_PID=$!
       else
         echo "hart-comp-session: no glass-shell host on PATH (enable hart.liquidUI / hart.layerShellHost)" >&2
       fi
