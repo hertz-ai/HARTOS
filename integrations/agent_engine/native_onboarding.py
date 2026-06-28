@@ -641,7 +641,13 @@ class HARTOnboardingWindow(Adw.ApplicationWindow):
     def _on_accept_name(self, btn):
         """Seal the name forever."""
         result = self.session.advance(action='accept_name')
-        if result.get('sealed'):
+        # A successful seal is signalled by 'name_sealed' (the name is now
+        # permanent). The web flow then opens a companion-download step, so the
+        # FSM no longer puts 'sealed' (the session-cleanup signal) on this
+        # response. The native ceremony has no companion step: any successful
+        # seal lands straight on the sealed page. We accept either flag so this
+        # stays correct against both the new and the legacy contract.
+        if result.get('name_sealed') or result.get('sealed'):
             self._build_sealed_page(result)
         else:
             # Error — show message and retry

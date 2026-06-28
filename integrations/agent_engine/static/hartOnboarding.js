@@ -7,7 +7,11 @@
  *   GET  /api/onboarding/status  -> skip if already lit
  *   POST /api/onboarding/start   -> language prompt
  *   POST /api/onboarding/advance -> narration + options ... -> sealed name
- * No separate GTK4 process => no software-GL paint risk on the cage kiosk. The
+ *   POST /api/onboarding/advance (companion_progress) -> Nunba download bar
+ * After the name seals, a final 'setup_companion' phase pre-fetches the Nunba
+ * desktop companion in the background and shows a determinate progress bar
+ * (skippable, retryable, graceful when offline). No separate GTK4 process => no
+ * software-GL paint risk on the cage kiosk. The
  * PA "speaks" via the shell's existing window.speakText when available. Esc skips
  * (never traps). Plain classic script; WebKitGTK-safe (HartTimeoutSignal).
  */
@@ -70,10 +74,111 @@
       .then(handle).catch(function () {});
   }
 
+  // ── Companion setup (final phase): a WebKit-safe progress bar that polls the
+  // backend's background Nunba download. Built lazily, never traps the user.
+  var compBar, compFill, compMsg, compPolls = 0;
+  var COMP_MAX_POLLS = 600;   // ~12 min ceiling at the 1.2s cadence; then close
+
+  function buildCompanion() {
+    if (compBar) return;
+    var wrap = document.createElement('div');
+    wrap.className = 'hob-companion';
+    wrap.style.cssText = 'width:min(420px,80vw);margin:18px auto 0;text-align:center';
+
+    var msg = document.createElement('div');
+    msg.className = 'hob-line in';
+    msg.style.cssText = 'font-size:15px;color:#cfc9ff;margin-bottom:10px';
+    msg.textContent = 'Setting up your companion...';
+
+    var track = document.createElement('div');
+    track.style.cssText = 'width:100%;height:8px;border-radius:999px;overflow:hidden;'
+      + 'background:rgba(160,150,255,.18);border:1px solid rgba(160,150,255,.28)';
+
+    var fill = document.createElement('div');
+    fill.style.cssText = 'height:100%;width:0%;border-radius:999px;'
+      + 'background:linear-gradient(90deg,#6c63ff,#a78bff);transition:width .4s ease';
+
+    track.appendChild(fill);
+    wrap.appendChild(msg);
+    wrap.appendChild(track);
+    // Sit above the options row so any Retry / Skip buttons render beneath.
+    if (opts && opts.parentNode) opts.parentNode.insertBefore(wrap, opts);
+    else if (overlay) overlay.appendChild(wrap);
+
+    compBar = wrap; compFill = fill; compMsg = msg;
+  }
+
+  function startCompanion() {
+    buildCompanion();
+    compPolls = 0;
+    clearOpts();
+    pollCompanion();
+  }
+
+  function pollCompanion() { advance('companion_progress', {}); }
+
+  function setFill(pct, indeterminate) {
+    if (!compFill) return;
+    if (indeterminate) {
+      compFill.style.width = '100%';
+      compFill.style.opacity = '0.45';
+      return;
+    }
+    compFill.style.opacity = '1';
+    var p = (typeof pct === 'number' && pct >= 0) ? pct : 0;
+    if (p > 100) p = 100;
+    compFill.style.width = p + '%';
+  }
+
+  function renderCompanion(c) {
+    buildCompanion();
+    var status = (c && c.status) || 'idle';
+    var pct = c ? c.percent : null;
+    var hasPct = (typeof pct === 'number');
+
+    if (status === 'downloading' || status === 'starting' || status === 'idle') {
+      if (compMsg) {
+        compMsg.textContent = hasPct
+          ? ('Setting up your companion... ' + pct + '%')
+          : 'Setting up your companion...';
+      }
+      setFill(hasPct ? pct : 0, !hasPct);
+      compPolls++;
+      if (compPolls < COMP_MAX_POLLS) setTimeout(pollCompanion, 1200);
+      else finish();          // safety: never poll forever
+      return;
+    }
+    if (status === 'done') {
+      if (compMsg) compMsg.textContent = (c && c.message) || 'Your companion is ready.';
+      setFill(100, false);
+      clearOpts();
+      setTimeout(finish, 2600);
+      return;
+    }
+    if (status === 'skipped') {
+      if (compMsg) compMsg.textContent = (c && c.message) || 'Companion will be ready when you open it.';
+      setFill(100, false);
+      clearOpts();
+      setTimeout(finish, 2200);
+      return;
+    }
+    // error / offline: stop polling, offer Retry + Skip (never trap the user).
+    if (compMsg) compMsg.textContent = (c && c.message) || 'Could not set up the companion right now.';
+    setFill(0, false);
+    clearOpts();
+    button('Retry', function () { clearOpts(); compPolls = 0; advance('retry_companion', {}); });
+    button('Skip for now', function () { clearOpts(); advance('skip_companion', {}); });
+  }
+
   function handle(resp) {
     if (!resp) return;
     if (resp.already_onboarded || resp.onboarded) { finish(); return; }
     if (resp.language) lang = resp.language;
+
+    // Companion setup phase (post-seal Nunba pre-fetch): a progress poll carries
+    // a companion object. Render the bar and keep/stop polling. Never re-run
+    // the ceremony narration for these.
+    if (resp.companion) { renderCompanion(resp.companion); return; }
 
     // Language phase (from /start): a button per language, shown in its own script.
     if (resp.phase === 'language' && resp.language_prompt) {
@@ -97,6 +202,9 @@
     }
     clearOpts();
     typeLines(lines, function () {
+      // Name just sealed: reveal it, then move into the companion setup step
+      // (download a progress bar drives, not the sealed auto-finish).
+      if (resp.begin_companion) { revealName(resp); startCompanion(); return; }
       if (resp.sealed) { revealName(resp); setTimeout(finish, 6000); return; }
       if (resp.phase === 'reveal') {
         revealName(resp);
