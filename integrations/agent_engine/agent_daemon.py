@@ -153,6 +153,15 @@ class AgentDaemon:
         # user-facing chat path; tune down if the flywheel is still slow.
         self._starvation_s = int(os.environ.get(
             'HEVOLVE_AGENT_STARVATION_S', '120'))
+        # ── Agentic-home re-compose cadence ──────────────────────────
+        # The home re-composes itself on a slow idle cadence (default 5 min)
+        # so the local LLM is only spent when there is something to refresh,
+        # never on every 30s tick.  ``0`` here means "compose on the first
+        # idle tick" so the surface upgrades from the offline skeleton soon
+        # after the boot grace ends.  Tunable via HART_HOME_COMPOSE_INTERVAL_S.
+        self._home_compose_interval_s = int(os.environ.get(
+            'HART_HOME_COMPOSE_INTERVAL_S', '300'))
+        self._next_home_compose_at = 0.0
 
     def start(self):
         with self._lock:
@@ -656,6 +665,17 @@ class AgentDaemon:
             # _loop continues immediately to _tick.
             self._spawn_proactive_hive_tick_async()
 
+            # Agentic HOME re-compose (the home composes itself live).  Same
+            # fire-and-forget pattern + yield gate as the proactive tick: when
+            # the user is actively at the box we yield the local LLM to them
+            # (the shell's own client-side refresh keeps the home fresh from the
+            # data endpoints meanwhile); when the box is idle the LLM composes a
+            # contextual {hero, rows} and pushes it through the EXISTING
+            # compose_home feed - so the home is alive whether the user is
+            # present or away.  The kill-switch + rate-cap are enforced inside
+            # agent_ui_update; this only PACES the producer.
+            self._spawn_home_compose_async()
+
             try:
                 self._tick()
                 self._consecutive_failures = 0
@@ -694,6 +714,52 @@ class AgentDaemon:
             target=_runner, daemon=True, name='proactive_hive_tick')
         t.start()
         self._proactive_thread = t
+
+    def _spawn_home_compose_async(self) -> None:
+        """Compose + push the agentic home in a daemon thread when the box is
+        idle, never blocking the goal-dispatch loop.
+
+        Reuses the autonomous daemon (no new loop) + the existing compose_home
+        feed (no new transport).  Three gates keep it cheap + polite:
+          1. cadence  - at most once per HART_HOME_COMPOSE_INTERVAL_S (5 min);
+          2. yield    - skip while the user is active (should_yield_to_user),
+             so the LLM compose never steals the slot from a live chat; the
+             shell's own client-side refresh keeps the home fresh meanwhile;
+          3. single-flight - skip if the prior compose thread is still running.
+        The kill-switch + per-agent rate cap are enforced authoritatively
+        inside agent_ui_update (run_home_compose -> compose_home), so this
+        method adds no new gate.  Fully guarded - a compose fault never touches
+        the daemon loop."""
+        now = time.time()
+        if now < self._next_home_compose_at:
+            return
+        prior = getattr(self, '_home_compose_thread', None)
+        if prior is not None and prior.is_alive():
+            return
+        # Yield to a live user: the home stays fresh client-side while busy;
+        # the LLM compose is reserved for idle.  Reuse the ONE canonical gate.
+        try:
+            from .dispatch import should_yield_to_user
+            if should_yield_to_user():
+                return
+        except Exception:
+            pass
+        # Schedule the next attempt now (even if this one fails) so a flapping
+        # compose can't busy-loop the LLM.
+        self._next_home_compose_at = now + max(60, self._home_compose_interval_s)
+
+        def _runner():
+            try:
+                from integrations.agent_engine.liquid_ui_service import (
+                    run_home_compose)
+                run_home_compose(reason='idle_tick')
+            except Exception as e:
+                logger.debug(f"Home compose tick error: {e}")
+
+        t = threading.Thread(
+            target=_runner, daemon=True, name='home_compose')
+        t.start()
+        self._home_compose_thread = t
 
     def _tick(self):
         """Find active goals, find idle agents, dispatch via /chat.

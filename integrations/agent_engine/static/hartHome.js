@@ -191,32 +191,36 @@
 
     var art = document.createElement('div');
     art.className = 'hh-card-art';
-    if (card.image) {
-      // Real photo: lazy-load (data-src + IntersectionObserver). Until it loads,
-      // the gradient shows through, so there is never an empty flash.
-      art.style.background = gradientArt(accent, seed);
-      var img = document.createElement('img');
-      img.alt = '';
-      img.setAttribute('loading', 'lazy');
-      img.setAttribute('data-src', card.image);
-      img.addEventListener('load', function () { img.classList.add('hh-loaded'); });
-      art.appendChild(img);
-      _lazyObserve(img);
-    } else {
-      art.style.background = gradientArt(accent, seed);
-    }
+    // The card photo, in priority order:
+    //   card.image     - a same-origin / data URL the producer already resolved
+    //   card.image_url - a remote web/news photo, routed through the same-origin
+    //                    fetch-once ImageCache (/api/media/image) so it is cached
+    //                    and never a mixed-content/CSP miss in the old cage WebKit
+    // The gradient ALWAYS paints first (no empty flash); the photo fades in over
+    // it. When no photo is supplied the local media index is asked for one below.
+    var imgSrc = card.image ? card.image
+      : (card.image_url ? webImageURL(card.image_url) : '');
+    var hasImage = !!imgSrc;
+    art.style.background = gradientArt(accent, seed);
+    if (hasImage) { attachLazyImage(art, imgSrc); }
     artWrap.appendChild(art);
 
     var scrim = document.createElement('div');
     scrim.className = 'hh-card-scrim';
     artWrap.appendChild(scrim);
 
-    if (card.icon && !card.image) {
-      var ic = document.createElement('div');
-      ic.className = 'hh-card-ic';
-      ic.innerHTML = BA().glyphHTML(card.icon);   // shared brand-art glyph renderer
-      artWrap.appendChild(ic);
+    var glyphEl = null;
+    if (card.icon && !hasImage) {
+      glyphEl = document.createElement('div');
+      glyphEl.className = 'hh-card-ic';
+      glyphEl.innerHTML = BA().glyphHTML(card.icon);   // shared brand-art glyph renderer
+      artWrap.appendChild(glyphEl);
     }
+    // No producer photo: hydrate one from the LOCAL semantic media index, keyed by
+    // the card's topic/title (cached, lazy, gradient-fallback on a miss). This is
+    // what makes every card load a real photo once the idle indexer has captioned
+    // the user's library - fully local, never egress.
+    if (!hasImage) { hydrateCardImage(card, art, glyphEl); }
     if (card.live) {
       var live = document.createElement('div');
       live.className = 'hh-card-live';
@@ -317,6 +321,77 @@
     if (io) { io.observe(img); return; }
     var src = img.getAttribute('data-src'); // no IO: load immediately
     if (src) { img.src = src; img.removeAttribute('data-src'); }
+  }
+
+  // ── Card photo hydration (real photos via the EXISTING media index) ──
+  // attachLazyImage builds the ONE lazy <img> the card art uses, shared by the
+  // producer-supplied photo path (card.image / card.image_url) and the local
+  // semantic-search hydration below - no parallel <img> construction. The
+  // _hhImaged guard makes a second call a no-op (gradient already replaced).
+  function attachLazyImage(art, src) {
+    if (!src || art._hhImaged) return;
+    art._hhImaged = true;
+    var img = document.createElement('img');
+    img.alt = '';
+    img.setAttribute('loading', 'lazy');
+    img.setAttribute('data-src', src);
+    img.addEventListener('load', function () { img.classList.add('hh-loaded'); });
+    art.appendChild(img);
+    _lazyObserve(img);
+  }
+
+  // Route a remote web/news image through the same-origin fetch-once ImageCache
+  // (/api/media/image). Same-origin keeps the old cage WebKit happy (no mixed
+  // content / CSP) and the bytes are cached + LRU-bounded server-side (<1ms
+  // re-serve). An already-relative / data URL is returned untouched.
+  function webImageURL(url) {
+    var u = String(url || '');
+    if (u.indexOf('http://') === 0 || u.indexOf('https://') === 0) {
+      return shell() + '/api/media/image?url=' + encodeURIComponent(u);
+    }
+    return u;
+  }
+
+  // Local-search hydration: at most ONE query per topic, memoised (a miss caches
+  // null so a re-render never re-queries). A hit serves the local file as a
+  // small, disk-cached PNG thumbnail through the EXISTING shell file route -
+  // never a new fetch path, never personal bytes off the device.
+  var _imgSearchCache = {};          // topic -> src | null (miss)
+  function thumbURL(path) {
+    return shell() + '/api/shell/files/thumbnail?path=' +
+      encodeURIComponent(path) + '&size=512';
+  }
+  function pickLocalImage(data) {
+    var results = (data && data.results) || [];
+    for (var i = 0; i < results.length; i++) {
+      var r = results[i];
+      // Skip videos (the thumbnail route serves images only) and pathless hits.
+      if (r && r.path && r.kind !== 'video') return thumbURL(r.path);
+    }
+    return null;
+  }
+  function applyHydratedImage(art, glyphEl, src) {
+    if (!src) return;
+    attachLazyImage(art, src);
+    // The photo carries the card now; drop the placeholder glyph (the card.image
+    // branch never draws a glyph over a photo, so match that).
+    if (glyphEl && glyphEl.parentNode) {
+      try { glyphEl.parentNode.removeChild(glyphEl); } catch (e) {}
+    }
+  }
+  function hydrateCardImage(card, art, glyphEl) {
+    var topic = String((card && (card.topic || card.title)) || '').trim();
+    if (!topic || card.empty) return;
+    if (Object.prototype.hasOwnProperty.call(_imgSearchCache, topic)) {
+      applyHydratedImage(art, glyphEl, _imgSearchCache[topic]);
+      return;
+    }
+    var url = shell() + '/api/media/search?q=' + encodeURIComponent(topic) + '&limit=3';
+    getJSON(url, 3500).then(function (d) {
+      var src = pickLocalImage(d);
+      _imgSearchCache[topic] = src;          // null on a miss -> never re-query
+      applyHydratedImage(art, glyphEl, src);
+    }).catch(function () { _imgSearchCache[topic] = null; });
   }
 
   // ───────────────────────────────────────────────────────────────────────

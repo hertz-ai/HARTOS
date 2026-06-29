@@ -183,6 +183,27 @@ COMPONENT_TYPES = {
     'home': {'props': ['hero', 'rows']},
 }
 
+# ── Agentic HOME composition — the producer's schema allow-sets ──────────────
+# compose_home pushes a {hero, rows} payload; hartHome.js (compose -> render) is
+# the renderer.  These sets are the SINGLE server-side source of truth the
+# producer validates a (deterministic OR LLM-authored) composition against, so a
+# hallucinated row can never inject an unknown accent, a non-existent click verb,
+# or a deep-link to a panel that does not exist.  They mirror hartHome.js's brand
+# spectrum + the NAV_MAP / PANEL ids exactly — keep them in lockstep, do NOT fork
+# a second palette.  cards hydrate their own imagery client-side (hartHome
+# makeCard: card.image | card.image_url -> the /api/media cache | else a local
+# media-index search by card.topic|title), so the producer only needs to supply
+# good titles/topics + an optional real web image_url; it never embeds bytes.
+HOME_ROW_ACCENTS = ('teal', 'cyan', 'blue', 'violet', 'magenta', 'amber')
+HOME_CARD_ACTIONS = ('ask', 'open', 'resume')
+# Panel ids a row "See all" / a card may deep-link to.  Subset of PANEL_MANIFEST
+# + NAV_MAP + SYSTEM_PANELS ids that already exist (an unknown target opens an
+# empty panel, so the producer is restricted to these).
+HOME_PANEL_TARGETS = (
+    'agents_browse', 'communities', 'recipes', 'app_store',
+    'resonance', 'user_accounts',
+)
+
 # ═══════════════════════════════════════════════════════════════
 # Context Engine
 # ═══════════════════════════════════════════════════════════════
@@ -661,6 +682,46 @@ class LiquidUIService:
         if rows is not None:
             component['rows'] = rows
         return self.agent_ui_update(agent_id, component)
+
+    def compose_home_now(self, reason: str = 'manual') -> bool:
+        """PRODUCER: compose the agentic home from live context + the local LLM,
+        then push it through the wired feed.
+
+        This is the producer half the agentic-home transport was missing (the
+        home had a renderer + a governed channel but nobody ever composed for
+        it).  It gathers the SAME surfaces hartHome.js reads (the agent
+        dashboard, recipes on disk, the earnings wallet, the hive, system),
+        composes a contextual ``{hero, rows}`` — the local LLM (the heart)
+        curates the narrative + emphasis over a deterministic backbone so the
+        home NEVER breaks when the on-device 4B can't emit clean JSON — and
+        hands it to ``compose_home`` -> ``agent_ui_update`` (the ONE governed
+        transport: the human kill-switch, the per-agent rate cap, the audit log
+        and the XSS reject all live there, so this method adds no new gate and
+        no new channel).
+
+        Driven by the autonomous agent daemon when the box is idle
+        (``agent_daemon._maybe_compose_home``) so the home stays alive whether
+        the user is at the machine or away — the existing daemon, the existing
+        feed, no new loop.  Returns True iff the push was accepted.  Never
+        raises (a compose fault must never take down the shell or the daemon)."""
+        try:
+            payload = build_home_payload(
+                backend_port=self.backend_port,
+                model_bus_port=self.model_bus_port)
+        except Exception as e:
+            logger.debug("compose_home_now(%s): build failed: %s", reason, e)
+            return False
+        if not payload:
+            return False
+        ok = self.compose_home(
+            hero=payload.get('hero'), rows=payload.get('rows'),
+            agent_id='home_composer')
+        if ok:
+            logger.info(
+                "compose_home_now(%s): pushed %d row(s)%s",
+                reason, len(payload.get('rows') or []),
+                ' + hero' if payload.get('hero') else '')
+        return ok
 
     # ─── Voice I/O — preserved ────────────────────────────────
 
@@ -6487,6 +6548,26 @@ function renderAgentOverlay(ev) {{
         except Exception as e:
             logger.warning("Onboarding APIs registration: %s", e)
 
+        # Register the local semantic media index routes (W10): media search +
+        # the fetch-once web-image cache that feed the agentic home's card art
+        # (GET /api/media/search, /api/media/image, /api/media/index/status, ...).
+        # These mount on the SAME origin that serves hartHome.js, so the in-WebView
+        # fetch is loopback and passes _require_system_auth with no token. Own
+        # try/except so a failure can NEVER cascade and drop the sibling shell
+        # routes above (the #18 route-drop class).
+        try:
+            from integrations.agent_engine.media_semantic_index import (
+                register_media_routes, register_idle_indexer)
+            register_media_routes(app)
+            # Start the idle captioner here too (idempotent) so the co-located
+            # Nunba desktop bundle — which builds the app via _create_flask_app
+            # but may not run serve_forever — still populates the local caption
+            # catalog the home cards search for photos.  Self-gating (yields to
+            # the user) + local-only, so it never competes with a live session.
+            register_idle_indexer()
+        except Exception as e:
+            logger.warning("Media index API registration: %s", e)
+
         return app
 
     # ─── Serve ────────────────────────────────────────────────
@@ -6535,6 +6616,18 @@ function renderAgentOverlay(ev) {{
 
         threading.Thread(target=_model_check_loop, daemon=True).start()
 
+        # Start the low-priority idle media indexer (W10): a self-contained daemon
+        # thread that captions Pictures/Videos ONLY while the user is idle (it
+        # yields on should_yield_to_user), populating the local catalog the home's
+        # cards search for real photos. Idempotent + its own try/except so an
+        # indexer fault never blocks the shell from serving.
+        try:
+            from integrations.agent_engine.media_semantic_index import (
+                register_idle_indexer)
+            register_idle_indexer()
+        except Exception as e:
+            logger.warning("Media idle indexer start: %s", e)
+
         app = self._create_flask_app()
         logger.info("LiquidUI Glass Shell starting on port %d", self.port)
 
@@ -6551,3 +6644,534 @@ function renderAgentOverlay(ev) {{
             serve(app, host='0.0.0.0', port=self.port, threads=threads)
         except ImportError:
             app.run(host='0.0.0.0', port=self.port, threaded=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# AGENTIC HOME PRODUCER (gap Q2 - "the home composes itself live")
+# ════════════════════════════════════════════════════════════════════════════
+# The agentic-home transport was wired end to end (compose_home ->
+# agent_ui_update -> SSE -> HartHome.compose -> render) but had NO producer: the
+# only callers of compose_home were the manual /api/home/compose route + tests,
+# so in practice the surface was hartHome.js's offline samplePayload upgraded by
+# direct client fetches - never an agent composition. These functions ARE that
+# producer. They:
+#   1. gather the live surfaces the home is composed FROM (the agent dashboard,
+#      recipes on disk, the earnings wallet) - the SAME truth hartHome.js reads,
+#      so producer and client never diverge (no parallel data path);
+#   2. compose a deterministic {hero, rows} BACKBONE from that real context;
+#   3. let the local LLM (the heart) CURATE the narrative + emphasis over the
+#      backbone - a small, reliable JSON so the on-device 4B succeeds; any
+#      failure leaves the deterministic backbone standing, so the home NEVER
+#      breaks when the model can't emit clean JSON;
+#   4. hand it to compose_home -> agent_ui_update - the ONE governed transport
+#      (the human kill-switch, the per-agent rate cap, the immutable audit and
+#      the XSS reject all live there). No new channel, no new gate.
+# The autonomous agent daemon drives run_home_compose() when the box is idle, so
+# the home stays alive whether the user is at the machine or away. Card imagery
+# is hydrated client-side by hartHome.js (card.image_url -> the /api/media cache
+# | else a local media-index search by card.topic|title), so the producer only
+# supplies good titles/topics + an optional real web image_url; it never embeds
+# bytes and reads no personal media.
+
+
+def _home_time_of_day() -> str:
+    """A natural time-of-day phrase for the contextual hero narrative."""
+    try:
+        h = time.localtime().tm_hour
+    except Exception:
+        return 'today'
+    if h < 5:
+        return 'overnight'
+    if h < 12:
+        return 'this morning'
+    if h < 17:
+        return 'this afternoon'
+    if h < 21:
+        return 'this evening'
+    return 'tonight'
+
+
+# keyword -> Material icon, so a card without an explicit icon still reads right.
+_HOME_ICON_MAP = (
+    ('research', 'travel_explore'), ('trade', 'candlestick_chart'),
+    ('market', 'campaign'), ('content', 'edit_note'), ('video', 'movie'),
+    ('coding', 'terminal'), ('code', 'terminal'), ('social', 'groups'),
+    ('tutor', 'school'), ('learn', 'school'), ('english', 'menu_book'),
+    ('speech', 'record_voice_over'), ('finance', 'payments'),
+    ('news', 'newspaper'), ('vision', 'visibility'), ('image', 'image'),
+    ('robot', 'smart_toy'), ('analytics', 'insights'),
+)
+
+
+def _home_icon_for(s) -> str:
+    sl = str(s or '').lower()
+    for needle, icon in _HOME_ICON_MAP:
+        if needle in sl:
+            return icon
+    return 'smart_toy'
+
+
+def _home_clean_text(v, n: int) -> str:
+    """Trim + de-em-dash + strip angle brackets (so the A2UI XSS reject in
+    agent_ui_update never has to drop the whole push) + clamp to n chars."""
+    if v is None:
+        return ''
+    s = str(v).replace('—', '-').replace('–', '-')
+    s = re.sub(r'[<>]', '', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s[:n]
+
+
+def _home_agent_card(a: dict, action: str, target: Optional[str] = None) -> dict:
+    """One Netflix card from a dashboard agent row (reuses the canonical
+    dashboard agent shape; no parallel agent model)."""
+    name = _home_clean_text(
+        a.get('name') or a.get('current_task') or 'Agent', 60) or 'Agent'
+    gtype = str(a.get('type') or '').replace('_goal', '')
+    card = {'title': name, 'topic': name,
+            'icon': _home_icon_for(gtype or name), 'action': action}
+    status = str(a.get('status') or '').lower()
+    if status in ('running', 'in_progress', 'active'):
+        card['live'] = 'running'
+    if target:
+        card['target'] = target
+    elif action == 'open':
+        card['target'] = 'agents_browse'
+    return card
+
+
+def _home_flagship_row() -> dict:
+    """The curated, always-present product agents (ready to run, fully local).
+    Mirrors hartHome.js samplePayload's Flagship row - the canonical HART OS
+    product agents - so a daemon push (which replaces the row set) never drops
+    them. Product/curation data, not a logic fork."""
+    return {
+        'title': 'Flagship agents', 'note': 'ready to run, fully local',
+        'accent': 'violet', 'see_all': 'agents_browse', 'flagship': True,
+        'cards': [
+            {'title': 'Auto Research', 'topic': 'research',
+             'icon': 'travel_explore', 'meta': 'scout the web, then synthesize',
+             'action': 'ask',
+             'prompt': 'Start the Auto Research agent on a topic I care about'},
+            {'title': 'Trading', 'topic': 'trading charts',
+             'icon': 'candlestick_chart', 'meta': 'paper-trade live signals',
+             'action': 'ask', 'prompt': 'Open the Trading agent'},
+            {'title': 'Tutor', 'topic': 'studying', 'icon': 'school',
+             'meta': 'learn anything, step by step', 'action': 'ask',
+             'prompt': 'Be my Tutor'},
+            {'title': 'English Learning', 'topic': 'books', 'icon': 'menu_book',
+             'meta': 'grammar and vocabulary', 'action': 'ask',
+             'prompt': 'Start English Learning'},
+            {'title': 'Spoken English', 'topic': 'conversation',
+             'icon': 'record_voice_over', 'meta': 'practice speaking out loud',
+             'action': 'ask', 'prompt': 'Practice Spoken English with me'},
+            {'title': 'Speech Therapy', 'topic': 'therapy',
+             'icon': 'spatial_audio', 'meta': 'guided exercises',
+             'action': 'ask', 'prompt': 'Start a Speech Therapy session'},
+        ],
+    }
+
+
+def _home_recipe_cards() -> List[dict]:
+    """Recipe cards from the flow-0 recipe artifacts on disk (the SAME files the
+    REUSE pipeline reads). Newest first, capped. Never raises."""
+    cards: List[dict] = []
+    try:
+        from core.platform_paths import get_recipe_prompts_dir
+        d = get_recipe_prompts_dir()
+    except Exception:
+        d = 'prompts'
+    try:
+        import glob as _glob
+        files = _glob.glob(os.path.join(d, '*_recipe.json'))
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    except Exception:
+        files = []
+    for fp in files[:10]:
+        title = os.path.basename(fp).replace('_recipe.json', '')
+        try:
+            with open(fp, 'r', encoding='utf-8') as f:
+                r = json.load(f)
+            if isinstance(r, dict):
+                title = (r.get('name') or r.get('title') or r.get('goal')
+                         or r.get('prompt') or title)
+        except Exception:
+            pass
+        title = _home_clean_text(title, 60) or 'Recipe'
+        cards.append({'title': title, 'topic': title, 'icon': 'auto_awesome',
+                      'badge': 'Replay', 'action': 'open', 'target': 'recipes'})
+    return cards
+
+
+def _home_resolve_owner_earnings():
+    """Best-effort (owner_uid, spark_balance) for the value-first hero.
+
+    Resolves the node owner from the most recent goal (the canonical
+    goal_owner_user_id helper) and reads their REAL Spark via the canonical
+    ResonanceService wallet - no shadow ledger, no invented figure. Returns
+    (None, None) on a fresh node so the hero stays honest-empty (the client's
+    own session-scoped earnings read then stands). Never raises."""
+    try:
+        from integrations.social.models import get_db, AgentGoal
+        from integrations.social.resonance_engine import ResonanceService
+    except Exception:
+        return (None, None)
+    db = None
+    try:
+        db = get_db()
+        goal = db.query(AgentGoal).order_by(AgentGoal.created_at.desc()).first()
+        uid = None
+        if goal is not None:
+            try:
+                from core.event_attribution import goal_owner_user_id
+                uid = goal_owner_user_id(goal)
+            except Exception:
+                uid = (getattr(goal, 'user_id', None)
+                       or getattr(goal, 'created_by', None))
+        spark = None
+        if uid:
+            wallet = ResonanceService.get_wallet(db, str(uid))
+            if wallet:
+                spark = wallet.get('spark')
+                if spark is None:
+                    spark = wallet.get('balance')
+        spark_i = int(spark) if isinstance(spark, (int, float)) else None
+        return (str(uid) if uid else None, spark_i)
+    except Exception as e:
+        logger.debug("home earnings resolve: %s", e)
+        return (None, None)
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _gather_home_context(backend_port: int = 6777,
+                         model_bus_port: int = 6790) -> dict:
+    """Read the live surfaces the home is composed FROM (best-effort; degrades
+    cleanly per-source so one dead surface never empties the home)."""
+    ctx = {
+        'time_of_day': _home_time_of_day(),
+        'agents_total': 0, 'agents_running': 0,
+        'continue': [], 'hive': [], 'recipes': [],
+        'owner_uid': None, 'spark': None,
+    }
+    # Agents - the canonical truth-grounded dashboard view (no parallel query).
+    try:
+        from integrations.social.models import get_db
+        from integrations.social.dashboard_service import DashboardService
+        db = get_db()
+        try:
+            dash = DashboardService.get_dashboard(db)
+        finally:
+            db.close()
+        agents = [a for a in (dash.get('agents') or []) if isinstance(a, dict)]
+        ctx['agents_total'] = len(agents)
+        running = [a for a in agents
+                   if str(a.get('status') or '').lower()
+                   in ('running', 'in_progress', 'active')]
+        ctx['agents_running'] = len(running)
+        ctx['continue'] = [_home_agent_card(a, 'resume')
+                           for a in (running or agents)[:8]]
+        hive = [a for a in agents
+                if any(k in str(a.get('type') or '').lower()
+                       for k in ('expert', 'trained', 'agent'))]
+        ctx['hive'] = [_home_agent_card(a, 'open', target='communities')
+                       for a in hive[:8]]
+    except Exception as e:
+        logger.debug("home ctx agents: %s", e)
+    # Recipes on disk (REUSE replay surface).
+    try:
+        ctx['recipes'] = _home_recipe_cards()
+    except Exception as e:
+        logger.debug("home ctx recipes: %s", e)
+    # Real earnings (value-first hero).
+    ctx['owner_uid'], ctx['spark'] = _home_resolve_owner_earnings()
+    return ctx
+
+
+def _deterministic_home_payload(ctx: dict) -> dict:
+    """The reliable backbone: a {hero, rows} built purely from real context.
+    Always valid (Flagship is always present), so the LLM curation only has to
+    colour it - never carry it."""
+    rows: List[dict] = []
+    cont = ctx.get('continue') or []
+    if cont:
+        rows.append({'title': 'Continue', 'accent': 'teal',
+                     'see_all': 'agents_browse', 'cards': cont})
+    rows.append(_home_flagship_row())
+    rec = ctx.get('recipes') or []
+    if rec:
+        rows.append({'title': 'Recipes', 'note': 'replay without re-thinking',
+                     'accent': 'amber', 'see_all': 'recipes', 'cards': rec})
+    hive = ctx.get('hive') or []
+    if hive:
+        rows.append({'title': 'Top agents in the hive', 'note': 'from the network',
+                     'accent': 'magenta', 'see_all': 'communities',
+                     'ranked': True, 'cards': hive})
+    # Hero ONLY when there is a REAL positive Spark balance to lead with. A 0 /
+    # unresolved balance pushes rows-only so the client's own session-scoped
+    # earnings hero is preserved (never clobber a real figure with an empty one).
+    hero = None
+    spark = ctx.get('spark')
+    if isinstance(spark, (int, float)) and spark > 0:
+        hero = {
+            'eyebrow': 'Earned on the hive',
+            'amount': int(spark), 'amount_unit': 'Spark',
+            'agents': int(ctx.get('agents_running') or 0),
+            'tasks': int(ctx.get('agents_total') or 0),
+            'local': True, 'payout_pending': True,
+            'primary': {'label': 'Resume', 'action': 'resume',
+                        'target': 'recipes'},
+            'secondary': {'label': 'Ask anything', 'action': 'ask'},
+        }
+    return {'hero': hero, 'rows': rows}
+
+
+def _home_sanitize_card(c) -> Optional[dict]:
+    if not isinstance(c, dict):
+        return None
+    title = _home_clean_text(c.get('title'), 60)
+    if not title:
+        return None
+    card = {'title': title}
+    action = c.get('action')
+    card['action'] = action if action in HOME_CARD_ACTIONS else 'open'
+    icon = _home_clean_text(c.get('icon'), 40)
+    if icon and re.match(r'^[a-z0-9_]+$', icon):
+        card['icon'] = icon
+    meta = _home_clean_text(c.get('meta'), 80)
+    if meta:
+        card['meta'] = meta
+    card['topic'] = _home_clean_text(c.get('topic'), 60) or title
+    tgt = c.get('target')
+    if tgt in HOME_PANEL_TARGETS:
+        card['target'] = tgt
+    badge = _home_clean_text(c.get('badge'), 16)
+    if badge:
+        card['badge'] = badge
+    live = _home_clean_text(c.get('live'), 16)
+    if live:
+        card['live'] = live
+    if card['action'] == 'ask':
+        prompt = _home_clean_text(c.get('prompt'), 200)
+        if prompt:
+            card['prompt'] = prompt
+    img = c.get('image_url')
+    if isinstance(img, str) and (img.startswith('http://')
+                                 or img.startswith('https://')):
+        card['image_url'] = img[:500]
+    p = c.get('progress')
+    if isinstance(p, (int, float)) and 0 <= p <= 1:
+        card['progress'] = round(float(p), 3)
+    return card
+
+
+def _home_sanitize_hero(h) -> Optional[dict]:
+    if not isinstance(h, dict):
+        return None
+    amount = h.get('amount')
+    if not isinstance(amount, (int, float)) or amount <= 0:
+        return None
+    hero = {
+        'eyebrow': _home_clean_text(h.get('eyebrow'), 40) or 'Earned on the hive',
+        'amount': int(amount),
+        'amount_unit': _home_clean_text(h.get('amount_unit'), 12) or 'Spark',
+        'local': True, 'payout_pending': True,
+        'primary': {'label': 'Resume', 'action': 'resume', 'target': 'recipes'},
+        'secondary': {'label': 'Ask anything', 'action': 'ask'},
+    }
+    a = h.get('agents')
+    t = h.get('tasks')
+    if isinstance(a, (int, float)):
+        hero['agents'] = int(a)
+    if isinstance(t, (int, float)):
+        hero['tasks'] = int(t)
+    return hero
+
+
+def _sanitize_home_payload(payload) -> Optional[dict]:
+    """Coerce a (possibly LLM-authored) {hero, rows} to the schema + allow-sets,
+    dropping anything unknown/unsafe. Returns a clean payload or None when there
+    is no usable row. This is the load-bearing guard that lets the LLM compose
+    freely without being able to inject a bad accent / verb / deep-link / markup."""
+    if not isinstance(payload, dict):
+        return None
+    rows_in = payload.get('rows')
+    if not isinstance(rows_in, list):
+        return None
+    rows: List[dict] = []
+    for r in rows_in[:8]:
+        if not isinstance(r, dict):
+            continue
+        cards_in = r.get('cards')
+        if not isinstance(cards_in, list):
+            continue
+        cards = []
+        for c in cards_in[:12]:
+            cc = _home_sanitize_card(c)
+            if cc:
+                cards.append(cc)
+        if not cards:
+            continue
+        accent = r.get('accent')
+        row = {
+            'title': _home_clean_text(r.get('title'), 60) or 'Agents',
+            'accent': accent if accent in HOME_ROW_ACCENTS else 'teal',
+            'cards': cards,
+        }
+        note = _home_clean_text(r.get('note'), 60)
+        if note:
+            row['note'] = note
+        sa = r.get('see_all')
+        if sa in HOME_PANEL_TARGETS:
+            row['see_all'] = sa
+        if r.get('ranked') is True:
+            row['ranked'] = True
+        if r.get('flagship') is True:
+            row['flagship'] = True
+        rows.append(row)
+    if not rows:
+        return None
+    return {'hero': _home_sanitize_hero(payload.get('hero')), 'rows': rows}
+
+
+def _home_extract_json_obj(text: str):
+    """Pull the first JSON object out of an LLM reply (tolerant of code fences
+    and surrounding prose - the on-device 4B rarely returns bare JSON)."""
+    if not text:
+        return None
+    s = text
+    if '```' in s:
+        for part in s.split('```'):
+            p = part.strip()
+            if p.lower().startswith('json'):
+                p = p[4:].strip()
+            if p.startswith('{'):
+                s = p
+                break
+    i = s.find('{')
+    j = s.rfind('}')
+    if i < 0 or j <= i:
+        return None
+    try:
+        return json.loads(s[i:j + 1])
+    except Exception:
+        return None
+
+
+def _llm_curate_home(ctx: dict, backbone: dict, model_bus_port: int):
+    """The local LLM (the heart) writes the contextual narrative + chooses which
+    row leads, given the REAL context. Deliberately a small, reliable JSON ask
+    so the on-device model succeeds; the data backbone is already real, so this
+    only colours emphasis. Returns a refined payload or None (-> backbone stands)."""
+    try:
+        from core.http_pool import pooled_post
+    except Exception:
+        return None
+    titles = [r.get('title') for r in (backbone.get('rows') or [])]
+    prompt = (
+        "Compose the HART OS desktop home. Real on-device context:\n"
+        + json.dumps({
+            'time_of_day': ctx.get('time_of_day'),
+            'agents_running': ctx.get('agents_running'),
+            'agents_total': ctx.get('agents_total'),
+            'spark_earned': ctx.get('spark'),
+            'rows': titles,
+        }, ensure_ascii=False)
+        + "\nReturn ONLY compact JSON: {\"eyebrow\": <label, max 5 words>, "
+          "\"feature\": <one row title from rows to show first>}. "
+          "No em dashes, no extra text."
+    )
+    try:
+        resp = pooled_post('http://localhost:%d/v1/chat' % model_bus_port,
+                           json={'prompt': prompt, 'max_tokens': 120},
+                           timeout=12)
+        if getattr(resp, 'status_code', 0) != 200:
+            return None
+        text = resp.json().get('response', '') or ''
+    except Exception as e:
+        logger.debug("home LLM curate failed: %s", e)
+        return None
+    data = _home_extract_json_obj(text)
+    if not isinstance(data, dict):
+        return None
+    out = {'hero': backbone.get('hero'),
+           'rows': list(backbone.get('rows') or [])}
+    eyebrow = _home_clean_text(data.get('eyebrow'), 40)
+    if eyebrow and out['hero']:
+        out['hero'] = dict(out['hero'])
+        out['hero']['eyebrow'] = eyebrow
+    feat = _home_clean_text(data.get('feature'), 60).lower()
+    if feat:
+        for i, r in enumerate(out['rows']):
+            if str(r.get('title') or '').lower() == feat and i > 0:
+                out['rows'] = ([out['rows'][i]] + out['rows'][:i]
+                               + out['rows'][i + 1:])
+                break
+    return out
+
+
+def build_home_payload(backend_port: int = 6777,
+                       model_bus_port: int = 6790) -> Optional[dict]:
+    """Compose the agentic home {hero, rows} from live context + the local LLM.
+    Deterministic backbone -> LLM curation -> strict sanitize, with the backbone
+    as the fallback at every step. Returns a clean payload or None. Never raises."""
+    try:
+        ctx = _gather_home_context(backend_port, model_bus_port)
+        backbone = _deterministic_home_payload(ctx)
+        if not backbone.get('rows'):
+            return None
+        curated = _llm_curate_home(ctx, backbone, model_bus_port)
+        clean = _sanitize_home_payload(curated) if curated else None
+        if not clean:
+            clean = _sanitize_home_payload(backbone)
+        return clean
+    except Exception as e:
+        logger.debug("build_home_payload failed: %s", e)
+        return None
+
+
+def run_home_compose(reason: str = 'idle') -> bool:
+    """Daemon entry point: compose the agentic home and push it through the
+    EXISTING feed. Prefers the live in-process shell (registry) so the push
+    rides compose_home -> agent_ui_update directly; falls back, cross-process
+    (e.g. NixOS where the agent daemon and the shell are separate units), to the
+    EXISTING /api/home/compose route which calls compose_home on the live shell.
+    No new loop, no new transport. Returns True iff a push was accepted."""
+    # Cheap kill-switch short-circuit so a halted hive doesn't even spend the
+    # LLM call. The AUTHORITATIVE gate is inside agent_ui_update.
+    try:
+        from security.hive_guardrails import HiveCircuitBreaker
+        if HiveCircuitBreaker.is_halted():
+            return False
+    except Exception:
+        pass
+    svc = None
+    try:
+        from core.platform.registry import get_registry
+        svc = get_registry().get_or_none('LiquidUIService')
+    except Exception:
+        svc = None
+    if svc is not None and hasattr(svc, 'compose_home_now'):
+        try:
+            return bool(svc.compose_home_now(reason=reason))
+        except Exception as e:
+            logger.debug("run_home_compose in-process failed: %s", e)
+            return False
+    # Cross-process: build here, POST to the existing compose route.
+    try:
+        payload = build_home_payload()
+        if not payload:
+            return False
+        from core.http_pool import pooled_post
+        port = int(os.environ.get('HART_SHELL_PORT', '6800'))
+        resp = pooled_post('http://127.0.0.1:%d/api/home/compose' % port,
+                           json={'payload': payload,
+                                 'agent_id': 'home_composer'}, timeout=10)
+        return getattr(resp, 'status_code', 0) == 200
+    except Exception as e:
+        logger.debug("run_home_compose cross-process failed: %s", e)
+        return False
