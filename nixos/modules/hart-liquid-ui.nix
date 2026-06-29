@@ -372,9 +372,21 @@ in
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
 
-        # curl is NOT on the unit's minimal PATH (the Model-Bus availability
-        # probe uses it).
-        path = with pkgs; [ curl coreutils ];
+        # Setting `.path` makes THIS the unit's ENTIRE PATH — /run/current-system/
+        # sw/bin is NOT on it. So every binary the shell server execs must be
+        # listed explicitly (the same minimal-unit-PATH bug class as the ISO boot
+        # services that were missing awk/lspci/xxd/curl).
+        #   - curl: the Model-Bus availability probe.
+        #   - networkmanager (nmcli): the glass shell's Wi-Fi UI. The connectivity
+        #     top-bar (/api/shell/connectivity/summary) and the Wi-Fi panel
+        #     (/api/shell/network/wifi*, /api/shell/wifi/*) all exec bare `nmcli`;
+        #     a returncode==0 is what flips wifi.available=True. Without nmcli on
+        #     PATH the exec raises FileNotFoundError (caught + ignored), leaving
+        #     available=False — which the UI renders as "Wi-Fi not available" even
+        #     though the radio + NetworkManager are up. nmcli talks to the NM
+        #     daemon over the system D-Bus (AF_UNIX is allowed; no PrivateNetwork),
+        #     so read-only status works here without extra group membership.
+        path = with pkgs; [ curl coreutils networkmanager ];
 
         environment = {
           HEVOLVE_DATA_DIR = cfg.dataDir;

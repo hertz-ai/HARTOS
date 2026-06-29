@@ -66,6 +66,8 @@ EXPECTED_MODULES = [
     "hart-boot-log.nix",
     "hart-hartlog-create.nix",
     "hart-boot-continuity.nix",
+    # External-USB journal export (field recovery onto a second, non-boot stick)
+    "hart-journal-export.nix",
 ]
 
 # Python backend services for the AI-Native modules
@@ -1782,6 +1784,7 @@ class TestBootNixosTestsRegistered:
         ("boot-log.nix", "bootLog"),
         ("hartlog-create.nix", "hartlogCreate"),
         ("boot-continuity.nix", "bootContinuity"),
+        ("journal-export.nix", "journalExport"),
     ]
 
     @pytest.fixture(autouse=True)

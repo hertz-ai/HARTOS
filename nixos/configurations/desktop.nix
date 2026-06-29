@@ -303,6 +303,19 @@ in
     # can never strand the user's Windows boot.
     bootContinuity.enable = true;
 
+    # ── External-USB journal export (field recovery for a wedged shell) ──
+    # The software-rendered glass shell can peg the CPU and wedge the in-shell
+    # terminal/compositor, leaving the user unable to copy anything out. With this
+    # ON, plugging in an ordinary FAT32 USB stick (NOT the boot medium) makes HART
+    # OS dump the full current-boot journal + the last 200 warning lines to
+    # hart-journal-<hostname>.txt on it, on a ~15s timer and at shutdown. It runs
+    # as a low-level systemd unit INDEPENDENT of the shell, so it keeps exporting
+    # through a hang (capturing the pre-hang state). NEVER writes to the live boot
+    # medium (the HART_OS ISO disk + the HARTLOG partition + the disks backing /
+    # and /nix/store are excluded); a pure NO-OP when no eligible external stick is
+    # present, so it can never clobber the boot stick or block boot/shutdown.
+    journalExport.enable = true;
+
     # ── Privacy-first networking + desktop apps (Category-4 LOCAL features) ──
     # Per the privacy-first principle every LOCAL capability ships ON by default
     # (no opt-in friction); nothing here leaves the device without consent.
@@ -773,6 +786,31 @@ in
     enable = true;
     powerOnBoot = true;
   };
+
+  # ─── Wi-Fi: NetworkManager + redistributable firmware (privacy-first) ───
+  # On real HW the glass shell's connectivity indicator showed "Wi-Fi not
+  # available" even though the Intel wifi was present. The PRIMARY cause was the
+  # shell server unit being unable to exec `nmcli` (fixed in hart-liquid-ui.nix's
+  # unit PATH). These two settings are the defense-in-depth half — both were only
+  # TRANSITIVELY satisfied before, and a desktop OS's core radio must not depend
+  # on a side effect:
+  #   1. NetworkManager OWNS wifi and provides the `nmcli` the shell calls. It was
+  #      enabled only as a side effect of the GNOME desktopManager default
+  #      (mkDefault true). greetd REPLACES gdm as the boot session, but NM is a
+  #      system service and keeps running regardless — still, enable it outright
+  #      so the wifi stack never rides on the GNOME fallback's default.
+  #   2. The Intel/Realtek wifi DRIVER needs redistributable firmware (iwlwifi,
+  #      rtw/rtl) to bring the radio up and clear soft-rfkill. It is in the closure
+  #      only because desktop.nix imports the all-hardware installation-CD profile;
+  #      make it explicit so a future profile change can't silently drop it.
+  # PRIVACY-FIRST: wifi is ON by default (a LOCAL capability, no opt-in friction),
+  # but NetworkManager NEVER auto-connects to an unknown SSID — it only activates a
+  # saved connection profile, and joining a new network is an explicit user action.
+  # No opportunistic / auto-join behaviour, so "wifi ON" does not mean "leaks onto
+  # any open network". (wifi.powersave is left at the NM default — unset — so the
+  # desktop/laptop radio is not throttled the way the phone variant chooses to.)
+  networking.networkmanager.enable = true;
+  hardware.enableRedistributableFirmware = true;
 
   # GPU: Vulkan + 32-bit (required for DXVK/Proton)
   hardware.graphics = {

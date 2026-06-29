@@ -88,37 +88,40 @@ let
     pango gdk-pixbuf graphene harfbuzz libsoup_3 cairo
   ]);
 
-  # ── Portal-free private D-Bus session (THE real-HW first-paint fix, 2026-06-28) ──
+  # ── Portal-less private D-Bus session — the DEGRADE FALLBACK (2026-06-29) ────────
   #
-  # ROOT CAUSE of the real-HW boot loop (hart-comp Tier-1 AND sway Tier-2 both
-  # "compositor up, no first paint in 45s -> killed + dropped to cage", even on the
-  # GSK=cairo software floor): GTK4's GtkSettings issues a SYNCHRONOUS
-  # org.freedesktop.portal.Settings.Read('org.freedesktop.appearance','color-scheme')
-  # on the GTK MAIN LOOP during window setup, with D-Bus auto-start allowed. In the
-  # greetd session no xdg-desktop-portal owns org.freedesktop.portal.Desktop, so that
-  # call tries to ACTIVATE the portal and BLOCKS for the full D-Bus activation TIMEOUT
-  # (~25s) because the portal never claims the name -> the GTK main loop is FROZEN ->
-  # the WebView never reaches LoadEvent.FINISHED -> /run/hart/session/shell-ready is
-  # never touched -> the 45s paint-watchdog declares the tier HUNG and drops it
-  # (journal: "Settings portal not found ... StartServiceByName ... Timeout was
-  # reached"). The GTK3 cage floor is structurally immune ONLY because GTK3 issues no
-  # appearance-portal read at all. This is why the hang persisted on cairo: the freeze
-  # is on D-Bus, NOT on GSK/GL or the layer-shell anchor.
+  # HISTORY: this bus was the PRIMARY first-paint fix (2026-06-28). It made the portal
+  # name NON-ACTIVATABLE so GTK4's startup GtkSettings.Read fast-failed instead of the
+  # ~25s freeze. But "portal absent" also breaks the things that NEED the portal:
+  # WebKit getUserMedia (mic/camera) needs xdg-desktop-portal + PipeWire, so on the
+  # real-HW boot the mic request wedged the GTK main loop ("Microphone access denied
+  # and then HANGS") and a stuck portal call on the main loop stalled seat servicing
+  # so even VT-switch looked dead. So "portal absent" is the wrong cut.
   #
-  # FIX (empirically proven in WSL 2026-06-28, GTK 4.6.9 + WebKit-6.0): run the GTK4
-  # host on a PRIVATE D-Bus session bus with NO activatable services (no <servicedir>
-  # / no <standard_session_servicedirs/>), so the portal name is non-activatable and
-  # GTK's Settings.Read returns ServiceUnknown in MILLISECONDS -> GTK falls back to its
-  # default color-scheme, exactly like the cage GTK3 floor that never reads the portal.
-  # Measured with the (hanging) portal .service STILL present: 27.06s freeze -> 0.51s
-  # first paint. GTK_USE_PORTAL=0 was measured and does NOT help (still 27s) -- the
-  # settings-portal read is not gated by it -- so the private bus is the reliable
-  # lever, not an env toggle. Because this lives in the SHARED hart-glass-shell-gtk4
-  # wrapper it DECOUPLES first-paint from xdg-desktop-portal on BOTH Tier-1 hart-comp
-  # (which starts no portal at all) and Tier-2 sway with one change (DRY). The host
-  # talks to the served shell over HTTP :6800, not D-Bus, so a private bus does not
-  # affect the UI; portal/theme integration for native apps that map ABOVE the desktop
-  # is a separate, deferred concern (they run on the real session bus under sway).
+  # PRIMARY (now, 2026-06-29, see the wrapper preamble + the NameHasOwner wait below):
+  # PROVIDE a portal that is AVAILABLE + RESPONSIVE instead of absent — start
+  # xdg-desktop-portal + the gtk backend, push the Wayland/desktop env into the D-Bus
+  # activation environment, then WAIT (bounded ~8s) until org.freedesktop.portal.
+  # Desktop OWNS its name before exec'ing python. With the name owned, GtkSettings.Read
+  # is a MILLISECOND method call (not a 25s activation), so first-paint stays FAST
+  # while mic/camera/screenshare/file-picker all work.
+  #
+  # ROOT CAUSE the wait fixes (kept for the record): GTK4's GtkSettings issues a
+  # SYNCHRONOUS org.freedesktop.portal.Settings.Read('org.freedesktop.appearance',
+  # 'color-scheme') on the GTK MAIN LOOP during window setup. If NOTHING owns
+  # org.freedesktop.portal.Desktop the call tries to ACTIVATE the portal and BLOCKS
+  # for the full D-Bus activation TIMEOUT (~25s) -> the main loop FREEZES -> the
+  # WebView never reaches LoadEvent.FINISHED -> /run/hart/session/shell-ready is never
+  # touched -> the 45s paint-watchdog declares the tier HUNG and drops to cage. The
+  # cure is to make the name OWNED before GTK asks, not to make it un-askable.
+  #
+  # THIS PRIVATE BUS is now the DEGRADE-NOT-DIE FALLBACK only: if the bounded portal
+  # wait times out (no session bus / portal failed to come up), the wrapper launches
+  # python under this portal-LESS bus so first-paint stays fast and the 25s freeze can
+  # NEVER recur (mic is unavailable on that fallback, but a painting mic-less desktop
+  # beats a black hung one). It is NOT deleted — it is the proven floor the primary
+  # path degrades to. The host talks to the served shell over HTTP :6800, not D-Bus,
+  # so the bus choice never affects the UI itself.
   noPortalBusConfig = pkgs.writeText "hart-glass-shell-noportal-bus.conf" ''
     <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
     <busconfig>
@@ -146,6 +149,43 @@ let
   layerShellHost = pkgs.writeShellScriptBin "hart-glass-shell-gtk4" ''
     set -euo pipefail
     URL="http://localhost:${liquidPort}"
+    # ── Bring up xdg-desktop-portal EARLY, in the BACKGROUND (the portal-AVAILABLE
+    #    first-paint fix, 2026-06-29) ───────────────────────────────────────────────
+    # PRIMARY path: make org.freedesktop.portal.Desktop ACTUALLY available + responsive
+    # before python launches, instead of making it non-activatable. Both ends of the
+    # real-HW symptom trace to a portal that was deliberately unreachable: (1) GTK4
+    # GtkSettings issues a synchronous appearance Settings.Read on the main loop at
+    # startup -- on an UNOWNED name that BLOCKS ~25s and never first-paints; and (2)
+    # WebKit getUserMedia (mic/camera) needs the SAME portal + PipeWire, so a non-
+    # activatable portal wedged the capture path and the main loop with it ("Microphone
+    # access denied and then HANGS"; a stuck portal call on the main loop also stalls
+    # seat servicing so VT-switch looks dead). The fix is a portal that RESPONDS: start
+    # it here, then WAIT (bounded, below) until it OWNS its name so Settings.Read is a
+    # millisecond call (NOT a 25s activation) and mic/camera/file-picker work. Kicked
+    # off at the TOP so it warms up IN PARALLEL with the :6800 health wait -- near-zero
+    # added latency in the common case.
+    export XDG_CURRENT_DESKTOP="''${XDG_CURRENT_DESKTOP:-sway}"
+    export XDG_SESSION_DESKTOP="''${XDG_SESSION_DESKTOP:-sway}"
+    export XDG_SESSION_TYPE="''${XDG_SESSION_TYPE:-wayland}"
+    # Push the Wayland/desktop identity into the D-Bus + systemd-user activation
+    # environment so a D-Bus-ACTIVATED portal backend inherits WAYLAND_DISPLAY and can
+    # talk to the compositor (Camera/ScreenCast). Best-effort: harmless where there is
+    # no session bus / systemd-user (we then fall back to the private bus below).
+    ${pkgs.dbus}/bin/dbus-update-activation-environment --systemd \
+      WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE XDG_RUNTIME_DIR \
+      >/dev/null 2>&1 || true
+    # Start the gtk backend + the portal frontend best-effort in the BACKGROUND. The
+    # frontend owns org.freedesktop.portal.Desktop; the gtk backend serves Settings/
+    # Access/FileChooser/Camera-frontend. XDG_DATA_DIRS is widened so the frontend finds
+    # the backend's .portal file in this bare-compositor (non-graphical-session) launch.
+    # Idempotent: if a portal is already up, these just fail to own the name and exit.
+    # This is the SINGLE place the portal is started, for BOTH Tier-1 hart-comp (no
+    # portal otherwise) and Tier-2 sway -- one starter, no parallel path.
+    _HART_PORTAL_DATA_DIRS="${pkgs.xdg-desktop-portal-gtk}/share:${pkgs.xdg-desktop-portal}/share"
+    XDG_DATA_DIRS="$_HART_PORTAL_DATA_DIRS''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}" \
+      ${pkgs.xdg-desktop-portal-gtk}/libexec/xdg-desktop-portal-gtk >/dev/null 2>&1 &
+    XDG_DATA_DIRS="$_HART_PORTAL_DATA_DIRS''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}" \
+      ${pkgs.xdg-desktop-portal}/libexec/xdg-desktop-portal >/dev/null 2>&1 &
     for i in $(seq 1 30); do
       if ${pkgs.curl}/bin/curl -sf "$URL/health" >/dev/null 2>&1; then break; fi
       sleep 1
@@ -225,24 +265,53 @@ let
     # stays up. The supervisor passes HART_SHELL_READY_FLAG; default to the pinned
     # /run/hart contract path so a bare (supervisor-less) launch is harmless.
     export HART_SHELL_READY_FLAG="''${HART_SHELL_READY_FLAG:-/run/hart/session/shell-ready}"
-    # ── DECOUPLE first-paint from xdg-desktop-portal + make RealtimeKit a no-op ──
-    # Run the GTK4 host on the portal-free PRIVATE session bus defined above
-    # (noPortalBusConfig). THIS is the fix for the 2026-06-28 real-HW "compositor up,
-    # no first paint in 45s -> drop to cage" on BOTH hart-comp Tier-1 and sway Tier-2:
-    # GtkSettings' synchronous appearance-portal Read can no longer block on the ~25s
-    # D-Bus activation timeout (it gets an instant ServiceUnknown and falls back to
-    # defaults, like the cage GTK3 floor), so the WebView reaches LoadEvent.FINISHED
-    # and touches shell-ready well within the 45s window (WSL-measured 0.51s vs
-    # 27.06s). --dbus-daemon is pinned to the closure binary so this never depends on
-    # PATH; dbus-run-session inherits ALL of the env exported above
-    # (GSK_RENDERER / GDK_GL / WEBKIT_* / LD_PRELOAD / GI_TYPELIB_PATH / HART_SHELL_*),
-    # so the cairo software floor + the gtk4-layer-shell LD_PRELOAD are unaffected.
-    # RealtimeKit: the "org.freedesktop.RealtimeKit1 was not provided by any .service
-    # file" journal line is a SYSTEM-bus name with no .service file, i.e. an instant
-    # ServiceUnknown fast-fail (WebKit/PipeWire just run at normal priority), NOT a
-    # block -- nothing here waits on it. (security.rtkit.enable, if ever wanted, is a
-    # system-wide desktop.nix concern, outside this host's scope.)
-    exec ${pkgs.dbus}/bin/dbus-run-session --dbus-daemon=${pkgs.dbus}/bin/dbus-daemon --config-file=${noPortalBusConfig} -- ${cfg.package.python}/bin/python -c "
+    # ── Wait (bounded) for the portal to OWN its name, then launch on the REAL bus ──
+    # Poll org.freedesktop.portal.Desktop NameHasOwner for up to ~8s. THIS is what
+    # makes the portal AVAILABLE + RESPONSIVE: once OWNED, the GTK4 GtkSettings
+    # Settings.Read at startup is a millisecond round-trip (NOT a 25s activation), so
+    # first-paint stays FAST, AND mic/camera/screenshare/file-picker work (they need
+    # the same portal). The wait OVERLAPS the :6800 health loop above (the portal was
+    # kicked off at the top of this wrapper), so in the common case it is already owned
+    # and this adds ~0 latency; worst case <=8s, well inside the 45s paint watchdog.
+    #
+    # DEGRADE-NOT-DIE: if the name is NOT owned in time (no session bus / the portal
+    # failed to come up), fall through to the portal-LESS PRIVATE bus (noPortalBusConfig
+    # above) for THIS launch -- the proven fast-but-mic-less paint path -- so first-paint
+    # stays fast and the 25s GtkSettings freeze can NEVER recur. --dbus-daemon is pinned
+    # to the closure binary so the fallback never depends on PATH. BOTH branches exec the
+    # SAME single `python -c` host below; only the bus prefix differs, so the first-paint
+    # marker path (LoadEvent.FINISHED -> shell-ready) is byte-identical either way.
+    LAUNCH_PREFIX=""
+    _PORTAL_OWNED=0
+    for _ in $(seq 1 8); do
+      # Capture the NameHasOwner reply to a VARIABLE (no pipe): piping into `grep -q`
+      # under `set -o pipefail` can SIGPIPE dbus-send when grep closes the pipe early,
+      # turning a TRUE match into a non-zero pipeline -- a false negative. `case` glob
+      # on the captured text avoids that and drops the extra grep dependency. `|| true`
+      # so a non-zero dbus-send (no session bus) never trips `set -e`.
+      _OWN="$(${pkgs.dbus}/bin/dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+                /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+                string:org.freedesktop.portal.Desktop 2>/dev/null || true)"
+      case "$_OWN" in
+        *"boolean true"*) _PORTAL_OWNED=1; break ;;
+        "") break ;;   # empty reply => no reachable session bus; stop waiting, fall back
+      esac
+      sleep 1
+    done
+    if [ "$_PORTAL_OWNED" = "1" ]; then
+      echo "[hart-glass-shell-gtk4] xdg-desktop-portal OWNED -> real session bus (Settings.Read is ms; mic/portal available)" >&2
+    else
+      # DEGRADE-NOT-DIE: portal never owned (timed out) OR no session bus at all ->
+      # launch under the portal-less PRIVATE bus so first-paint stays fast and the 25s
+      # GtkSettings freeze can never recur (mic unavailable on this fallback).
+      echo "[hart-glass-shell-gtk4] portal not owned -> FALLBACK to portal-less private bus (fast paint, mic unavailable)" >&2
+      LAUNCH_PREFIX="${pkgs.dbus}/bin/dbus-run-session --dbus-daemon=${pkgs.dbus}/bin/dbus-daemon --config-file=${noPortalBusConfig} --"
+    fi
+    # Single host launch. $LAUNCH_PREFIX is empty (real session bus, portal available)
+    # or the private-bus dbus-run-session prefix (degrade fallback). Word-splitting on
+    # the prefix is intentional (Nix store paths contain no spaces/globs). The embedded
+    # host program below is IDENTICAL on both branches -- one host, one first-paint marker.
+    exec $LAUNCH_PREFIX ${cfg.package.python}/bin/python -c "
 import gi, os
 gi.require_version('Gtk', '4.0')
 # WebKitGTK 6.0 is the GTK4 binding; the namespace is 'WebKit' (NOT 'WebKit2',
@@ -265,6 +334,32 @@ def _signal_painted():
             pass
     except OSError:
         pass
+
+
+def _sense_cut(sensor):
+    # Best-effort cross-process read of the human's AI-sensing kill-switch over the
+    # SAME Unix-socket authority core/ai_sensing.py:start_authority_server exposes
+    # (send the sensor name -> read b'1'=allowed / b'0'=cut). Returns True ONLY on a
+    # definitive b'0' from a REACHABLE authority; an unreachable authority or ANY
+    # error returns False (fail-OPEN), so a missing kill-switch never wrongly denies
+    # the first-party shell's own capture (the 'mic denied' bug we are fixing). The
+    # substantive enforcement is server-side at ingestion (/api/voice refuses a cut
+    # mic); this is defence-in-depth, not the primary gate. Socket path mirrors
+    # ai_sensing._authority_path: HART_AI_SENSING_SOCK env, else $XDG_RUNTIME_DIR.
+    import socket as _socket
+    sock_path = (os.environ.get('HART_AI_SENSING_SOCK')
+                 or os.path.join(os.environ.get('XDG_RUNTIME_DIR', '/run'),
+                                 'hart-ai-sensing.sock'))
+    try:
+        c = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        c.settimeout(0.5)
+        c.connect(sock_path)
+        c.sendall(sensor.encode('ascii'))
+        verdict = c.recv(8).strip()
+        c.close()
+        return verdict == b'0'
+    except Exception:
+        return False
 
 
 class GlassShellLayer:
@@ -320,6 +415,13 @@ class GlassShellLayer:
         # WebKit FMEA). A GOOD load leaves the guard False, so it still fires the
         # marker on FINISHED, byte-identical to before.
         webview.connect('load-failed', self._on_load_failed)
+        # Allow first-party getUserMedia (mic/camera) so click-to-talk voice + the
+        # vision sense work. WITHOUT a handler WebKit DEFAULT-DENIES (the 'Microphone
+        # access denied' half of the real-HW regression) and, on the portal-less bus,
+        # an un-handled request also wedged the GTK main loop (the HANG). The handler
+        # is gated best-effort on the human's AI-sensing kill-switch. Connected before
+        # load_uri so it is wired before any page script can call getUserMedia.
+        webview.connect('permission-request', self._on_permission_request)
         # False-healthy guard, cleared on every fresh load_uri (this initial
         # navigation), set in _on_load_failed. Initialised before load_uri runs so it
         # is always defined before the first load-changed / load-failed fires.
@@ -328,6 +430,16 @@ class GlassShellLayer:
         s = webview.get_settings()
         s.set_enable_javascript(True)
         s.set_enable_developer_extras(True)
+        # getUserMedia is OFF by default in WebKitGTK: navigator.mediaDevices is
+        # undefined unless enable-media-stream is set, so the permission-request above
+        # would never even FIRE without this (the mic path is dead before it starts).
+        # Enable media-stream (+ webrtc for live/peer voice); guarded per-setter so an
+        # older WebKit lacking one degrades instead of crashing the shell.
+        for _setter in ('set_enable_media_stream', 'set_enable_webrtc'):
+            try:
+                getattr(s, _setter)(True)
+            except Exception:
+                pass
         # NEVER (not ON_DEMAND): a fresh ISO / live-USB / VM often has only
         # software GL (llvmpipe). Forcing GPU accel there crashes WebKitGTK and
         # takes the shell session down. Correctness/robustness over a few fps —
@@ -417,6 +529,46 @@ class GlassShellLayer:
                   file=sys.stderr)
         except Exception:
             pass
+        return False
+
+    def _on_permission_request(self, _webview, request):
+        # The glass shell is the trusted first-party desktop. WebKitGTK DEFAULT-DENIES
+        # getUserMedia (mic/camera) unless a permission-request handler ALLOWs it --
+        # that default-deny is the 'Microphone access denied' half of the real-HW
+        # regression, and on the portal-less bus the un-handled request also wedged the
+        # GTK main loop (the HANG). Allow mic/camera so click-to-talk voice + the vision
+        # sense work, gated best-effort on the human's AI-sensing kill-switch: DENY only
+        # when the cross-process authority is REACHABLE and reports the sense CUT; else
+        # ALLOW (fail-OPEN). Returning True means WE handled it, so WebKit does NOT fall
+        # back to the portal Access dialog (one fewer main-loop portal round-trip).
+        # NEVER raises -- on ANY error we allow rather than crash/wedge the shell.
+        try:
+            if isinstance(request, WebKit.UserMediaPermissionRequest):
+                cut = False
+                try:
+                    if request.is_for_audio_device():
+                        cut = cut or _sense_cut('mic')
+                except Exception:
+                    pass
+                try:
+                    if request.is_for_video_device():
+                        cut = cut or _sense_cut('camera')
+                except Exception:
+                    pass
+                if cut:
+                    request.deny()
+                else:
+                    request.allow()
+                return True
+        except Exception:
+            # Degrade-not-die: on ANY error allow the first-party shell's request
+            # rather than crash or wedge the main loop (the exact hang we are fixing).
+            try:
+                request.allow()
+            except Exception:
+                pass
+            return True
+        # Non-media permission types: let WebKit apply its default (deny).
         return False
 
     def _on_realize(self, _widget):
@@ -532,15 +684,13 @@ app.run(None)
     output * {
       enable
     }
-    # Best-effort xdg-desktop-portal for native/Flatpak apps (file-chooser/screenshot)
-    # that map ABOVE the desktop on the real session bus. NOTE (2026-06-28): the GTK4
-    # glass host's OWN first-paint NO LONGER depends on this portal -- it runs on a
-    # portal-free private D-Bus session (noPortalBusConfig), so GtkSettings can no
-    # longer block on the portal activation timeout that was killing the tier. Kept
-    # best-effort for apps on the real session bus; if it cannot start, the desktop
-    # still paints. XDG_DATA_DIRS is widened so the frontend finds the gtk backend's
-    # .portal file in this bare-sway (non-graphical-session) launch.
-    exec XDG_DATA_DIRS="${pkgs.xdg-desktop-portal-gtk}/share:${pkgs.xdg-desktop-portal}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}" ${pkgs.xdg-desktop-portal}/libexec/xdg-desktop-portal -r
+    # xdg-desktop-portal is now started + WAITED-ON by the hart-glass-shell-gtk4 host
+    # wrapper itself (2026-06-29) -- the SINGLE, cross-tier portal starter that serves
+    # BOTH Tier-1 hart-comp and Tier-2 sway, and BLOCKS on org.freedesktop.portal.
+    # Desktop name-ownership so GtkSettings.Read is a millisecond call (NOT a 25s
+    # activation) AND mic/camera/file-picker work. Starting the portal HERE too would
+    # be a parallel starter racing the wrapper's, so it is intentionally NOT exec'd
+    # from this sway config (DRY: one portal starter, in the host wrapper).
     # Launch the GTK4 layer-shell host as sway's startup client. It anchors itself
     # as the BACKGROUND layer (exclusive zone 0) via gtk4-layer-shell so it is the
     # desktop, not a fullscreen app. Native toplevels (Phase 5) map above it.
