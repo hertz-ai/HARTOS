@@ -73,6 +73,17 @@ smithay = [
     "smithay/backend_udev",
     "smithay/backend_session_libseat",
     "smithay/renderer_pixman",
+    # PART 3 of the GPU lever — the GLES2 GPU renderer for the DRM/udev backend
+    # (src/udev.rs). `renderer_gl` compiles the `GlesRenderer`; `backend_egl` compiles
+    # the `EGLDisplay`/`EGLContext` it is built on (an EGL platform display from the GBM
+    # device of the primary render node). These are the SAME two Smithay features the
+    # `winit` backend already enables (lines below) — symmetric, so the smithay (DRM)
+    # build links the identical GL/EGL stack the winit build proved. The PixmanRenderer
+    # software floor stays the renderer of record; GLES is the opportunistic upgrade used
+    # only when `/run/hart/gpu-render` = hardware AND it initialises, with pixman the
+    # fallback on ANY GLES init/runtime fault (degrade-not-die — never a black screen).
+    "smithay/renderer_gl",
+    "smithay/backend_egl",
     "smithay/xwayland",
 ]
 # `winit` = the DEV/WSL backend (src/winit.rs): a real, running compositor that

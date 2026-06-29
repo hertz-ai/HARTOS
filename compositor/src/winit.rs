@@ -1135,6 +1135,15 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 8. THE LOOP. Pump winit events, render the desktop, dispatch + flush clients.
+    //
+    // Env-gated FPS / frame-time probe (mirrors the HART_COMP_DEBUG_RENDER convention):
+    // when `HART_COMP_FPS=1`, log a measured frame count + mean GLES frame time once a
+    // second. This is the live latency signal for the GPU-render lever (A1): it reports
+    // the ACTUAL paint cadence of the GlesRenderer path, not the 16ms loop target. Off by
+    // default (zero cost when the env var is unset), so it never touches the boot path.
+    let fps_probe = std::env::var_os("HART_COMP_FPS").is_some();
+    let mut fps_frames: u32 = 0;
+    let mut fps_since = Instant::now();
     while state.running {
         // â”€â”€ (a) Pump winit (host) events: resize / input / close / redraw. â”€â”€
         let status = winit.dispatch_new_events(|event| match event {
@@ -1193,6 +1202,29 @@ pub fn run_winit(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         // â”€â”€ (d) Submit the winit frame to the host compositor. â”€â”€
         if let Err(err) = backend.submit(Some(&damage)) {
             warn!(?err, "failed to submit winit frame");
+        }
+
+        // Env-gated frame-cadence probe (A1 GPU-render latency signal). Counts every
+        // submitted GlesRenderer frame and, once a second, logs the measured FPS + mean
+        // ms/frame so a live run reports its real paint cadence (e.g. "fps=60 frame_ms=2.1
+        // renderer=GlesRenderer"). Cheap: a counter + one Instant compare per frame.
+        if fps_probe {
+            fps_frames += 1;
+            let el = fps_since.elapsed();
+            if el.as_millis() >= 1000 {
+                let secs = el.as_secs_f64();
+                let fps = fps_frames as f64 / secs;
+                let frame_ms = (secs * 1000.0) / fps_frames as f64;
+                info!(
+                    fps = format!("{fps:.1}"),
+                    frame_ms = format!("{frame_ms:.2}"),
+                    frames = fps_frames,
+                    renderer = "GlesRenderer",
+                    "HART-comp winit: measured paint cadence"
+                );
+                fps_frames = 0;
+                fps_since = Instant::now();
+            }
         }
 
         // â”€â”€ (e) Dispatch the calloop socket source (accepts new clients), then the

@@ -54,14 +54,23 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::drm::compositor::{DrmCompositor, FrameError, FrameFlags};
+use smithay::backend::drm::compositor::{DrmCompositor, FrameError, FrameFlags, RenderFrameError};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, DrmSurface};
+// PART 3 of the GPU lever — the GLES2 GPU renderer + the EGL platform display it is
+// built on (an `EGLDisplay` from the GBM device of the primary render node). Compiled
+// by the `smithay/renderer_gl` + `smithay/backend_egl` passthroughs added to the
+// `smithay` cargo feature. The PixmanRenderer below stays the renderer of record (the
+// never-fail software floor); GLES is the opportunistic upgrade gated on the GPU probe.
+use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
+use smithay::backend::renderer::element::RenderElement;
+use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::pixman::PixmanRenderer;
-use smithay::backend::renderer::{Color32F, ImportDma};
+use smithay::backend::renderer::{Bind, Color32F, ImportDma, Renderer, Texture};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{primary_gpu, UdevBackend, UdevEvent};
@@ -103,7 +112,7 @@ use tracing::{error, info, warn};
 use crate::comp_core::{self, HartRenderElement};
 use crate::shared::send_frame_callbacks;
 use crate::wayland::{ClientState, State};
-use crate::{select_render_path, BootConfig, WindowRegistry, HART_SPLASH_RGBA};
+use crate::{select_render_path, BootConfig, RenderPath, WindowRegistry, HART_SPLASH_RGBA};
 
 /// Color formats DrmCompositor will try for the primary plane framebuffer. The pixman
 /// software floor + virtually all KMS drivers support Argb8888/Xrgb8888 — the never-
@@ -184,7 +193,9 @@ struct DeviceData {
     fd: DrmDeviceFd,
     /// GBM device — the buffer allocator backing both the scanout swapchain + the
     /// framebuffer exporter. Cloned into the allocator/exporter; held so it outlives them.
-    _gbm: GbmDevice<DrmDeviceFd>,
+    /// ALSO read by `build_gles_renderer` to create the EGL platform display for the GLES
+    /// GPU renderer (the `EGLDisplay::new(gbm.clone())` path) — hence no longer `_`-prefixed.
+    gbm: GbmDevice<DrmDeviceFd>,
     /// One scanout surface per active CRTC (one display). Keyed by CRTC handle.
     surfaces: HashMap<crtc::Handle, SurfaceData>,
     /// Whether THIS device currently holds DRM master at the kernel level (a confirmed
@@ -310,10 +321,13 @@ fn resolve_primary_node(seat: &str) -> Result<DrmNode, Box<dyn std::error::Error
 /// session that cannot be acquired) so the B4 supervisor drops to sway/cage — the
 /// screen is NEVER left blank waiting on an unbringable Tier-1.
 pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
-    // The render-path decision is shared with the skeleton + winit; on the DRM path the
-    // PixmanRenderer is the concrete renderer (the MANDATORY software floor — pixman is
-    // not a hardware path, so `--force-software` is implied/honoured by construction).
-    let _ = select_render_path(cfg);
+    // The render-path decision is shared with the skeleton + winit. The PixmanRenderer is
+    // ALWAYS the renderer of record (the MANDATORY never-fail software floor); when the
+    // boot-time GPU probe verdict (`/run/hart/gpu-render`) authorises Hardware AND the
+    // GLES renderer actually initialises below, the compositor GPU-composites through it
+    // and keeps pixman as the fallback on ANY GLES fault. `--force-software` forces the
+    // floor by construction (select_render_path returns Software → want_gles false).
+    let want_gles = matches!(select_render_path(cfg), RenderPath::Hardware);
 
     // 1. The calloop loop + our OWN server Display. The Display is owned here and
     //    dispatched DIRECTLY each iteration (NOT inserted as a calloop Generic source) —
@@ -473,6 +487,35 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     let shm_formats: Vec<_> = state.renderer.dmabuf_formats().iter().map(|f| f.code).collect();
     let _ = shm_formats; // pixman's mandatory Argb/Xrgb already advertised via ShmState::new
 
+    // PART 3 of the GPU lever — the GLES2 GPU renderer. When the boot-time GPU probe
+    // verdict authorised Hardware (`want_gles`), build ONE `GlesRenderer` on the PRIMARY
+    // node's GBM device (an EGL platform display from that GBM device + a configless GLES
+    // context). This is a single-GPU bring-up by design: the target laptop has exactly one
+    // usable iGPU (the Intel i915; the GeForce 940MX is nouveau-blacklisted), so there is
+    // no anvil-style GpuManager/MultiRenderer — one renderer, one EGL context, on the
+    // calloop thread. The PixmanRenderer software floor (`state.renderer`) is UNTOUCHED and
+    // stays the renderer of record: if the verdict is software, the primary node is somehow
+    // absent, OR GLES init fails for ANY reason, `gles` stays `None` and every frame paints
+    // via pixman exactly as before (degrade-not-die — a GLES failure is invisible, never a
+    // black screen). The DrmCompositors were all built with pixman/LINEAR formats, which a
+    // GLES renderer can also render into, so the SAME compositors scan out under either
+    // renderer and a runtime GLES→pixman demotion is always bind-safe.
+    let mut gles: Option<GlesRenderer> = None;
+    if want_gles {
+        match devices.get(&primary_node) {
+            Some(dev) => match build_gles_renderer(&dev.gbm) {
+                Ok(renderer) => {
+                    info!(node = %primary_node, "HART-comp DRM: GLES GPU renderer initialised on the primary node — GPU-compositing (pixman software floor kept as the fallback)");
+                    gles = Some(renderer);
+                }
+                Err(e) => warn!(node = %primary_node, ?e, "HART-comp DRM: GLES init failed — staying on the pixman software floor (never-blank)"),
+            },
+            None => warn!(node = %primary_node, "HART-comp DRM: primary node has no opened device — staying on the pixman software floor"),
+        }
+    } else {
+        info!("HART-comp DRM: GPU probe did not authorise hardware — rendering on the pixman software floor");
+    }
+
     // 11. Bind the calloop event sources.
     //   (a) libinput → State::process_input_event (the shared input router). As each device
     //       appears, enable touchpad TAP-TO-CLICK (fix (c)): libinput defaults tap OFF, so a light
@@ -607,7 +650,7 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     //     fresh boot) until it lands — well inside the supervisor's 45s first-paint watchdog.
     state.pending_session_activate = Some(true);
     apply_pending_session(&mut state, &mut devices);
-    render_all(&mut state, &mut devices);
+    render_all(&mut state, &mut devices, &mut gles);
 
     info!(socket = %socket_name, "HART-comp DRM compositor initialized — entering the loop (real-HW scanout on the pixman floor)");
 
@@ -631,8 +674,10 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         // Re-render every surface each tick (the pixman floor has no damage-driven
         // scheduling here; a 60Hz repaint is the simple never-fail cadence). On a real
         // box the VBlank source paces the actual flips; this tick just keeps the frame
-        // fresh + drains client frame callbacks so clients draw their next frame.
-        render_all(&mut state, &mut devices);
+        // fresh + drains client frame callbacks so clients draw their next frame. `gles`
+        // is the GPU renderer when the probe authorised it (else None = pixman floor);
+        // render_all picks GLES when present and self-demotes to pixman on a GLES fault.
+        render_all(&mut state, &mut devices, &mut gles);
 
         // M8 — settle finished effects: clear the workspace-switch crossfade clock once it
         // completes so it does not re-evaluate forever (the 60Hz tick PLAYS an in-flight
@@ -833,7 +878,7 @@ fn device_added(
         DeviceData {
             drm,
             fd: master_fd,
-            _gbm: gbm,
+            gbm,
             surfaces,
             // Master is confirmed lazily by the render tick's `acquire_drm_master` retry, not
             // assumed here: even if the construction grab succeeded we re-confirm on the first
@@ -1018,50 +1063,73 @@ fn apply_pending_session(state: &mut State, devices: &mut HashMap<DrmNode, Devic
     }
 }
 
-/// Render every active DRM surface that is NOT mid-flip: build the element list from the
-/// space + the layer-shell desktop, composite on the pixman floor, clear to HART_SPLASH,
-/// and queue the page-flip. The canonical `render_frame → queue_frame → (await vblank) →
-/// frame_submitted` sequence from the rev's DrmCompositor doc example — the
-/// `frame_submitted` half is driven by the vblank event (`reap_completed_vblanks`), NOT
-/// here, so frames are paced by real flips (F1, #166). EVERY render/flip error degrades
-/// (log + skip + retry next tick) and KEEPS THE COMPOSITOR ALIVE — a flip error is a
-/// logged warning and a re-tried frame, never a `panic!`/`.unwrap()` death (F2/F3, #186).
-fn render_all(state: &mut State, devices: &mut HashMap<DrmNode, DeviceData>) {
-    // Retire any flips whose vblank arrived since the last tick first, so a CRTC freed
-    // this tick can be re-queued immediately below (one-frame-latency, no stall).
-    reap_completed_vblanks(state, devices);
+/// Build a GLES2 GPU renderer on the GBM device of the primary render node (PART 3 of the
+/// GPU lever). An EGL platform display is created from the GBM device (which impls
+/// `EGLNativeDisplay`), a configless GLES context is made on it, and a `GlesRenderer` wraps
+/// that context. Single-GPU, single-context, created + used ONLY on the calloop thread (EGL
+/// contexts are thread-bound). Returns an error (NEVER panics) so `run_udev` stays on the
+/// pixman software floor on any failure — degrade-not-die.
+///
+/// This is the ONLY `unsafe` in `udev.rs` (the SAME audited-exception posture as
+/// `screencopy.rs::fill_one`; Cargo.toml lints `unsafe_code = "deny"`, not forbid). The
+/// EGL/GLES construction never crosses a thread boundary and is built from a live DRM
+/// render-node fd, so the audited blocks below are sound.
+fn build_gles_renderer(gbm: &GbmDevice<DrmDeviceFd>) -> Result<GlesRenderer, Box<dyn std::error::Error>> {
+    // SAFETY: `EGLDisplay::new` is `unsafe` because smithay cannot statically prove the
+    // native display handle is valid. The `GbmDevice` wraps a live DRM render-node fd
+    // (opened via the libseat session in `device_added`) and impls `EGLNativeDisplay`, so
+    // the platform display IS valid. The display/context/renderer are created on, and only
+    // ever used on, the single calloop thread (EGL contexts are thread-bound) and are never
+    // sent across threads.
+    #[allow(unsafe_code)]
+    let display = unsafe { EGLDisplay::new(gbm.clone()) }
+        .map_err(|e| format!("EGLDisplay::new(gbm) failed: {e}"))?;
+    // EGLContext::new is SAFE on this rev (it only queries/creates a context on the display
+    // above). A configless context is sufficient — HART-comp renders into the DrmCompositor
+    // swapchain dmabuf via `Bind<Dmabuf>`, never an EGLSurface (EGL_KHR_surfaceless implied).
+    let context = EGLContext::new(&display).map_err(|e| format!("EGLContext::new failed: {e}"))?;
+    // SAFETY: `GlesRenderer::new` is `unsafe` for the same context-validity reason. The
+    // context was just created on the display above and is used only on this thread.
+    #[allow(unsafe_code)]
+    let renderer = unsafe { GlesRenderer::new(context) }
+        .map_err(|e| format!("GlesRenderer::new failed: {e}"))?;
+    Ok(renderer)
+}
 
-    let clear = Color32F::new(
-        HART_SPLASH_RGBA[0],
-        HART_SPLASH_RGBA[1],
-        HART_SPLASH_RGBA[2],
-        HART_SPLASH_RGBA[3],
-    );
+/// PURE policy (no Smithay types): given whether a `render_frame` error was the
+/// `RenderFrame` variant (a renderer fault — a lost GL context / a failed import) versus
+/// the `PrepareFrame` variant (a DRM/swapchain/master hiccup that would hit pixman too),
+/// should the live renderer be demoted? Only a renderer fault demotes; a prepare fault is
+/// just retried next tick like every other transient. Split out so the demote decision is
+/// unit-tested on the dev box with NO Smithay types — the `matches!(err,
+/// RenderFrameError::RenderFrame(_))` adapter that feeds it is the only Smithay-touching,
+/// CI-compiled half (mirrors the `flip_action`/`master_step` pure-policy split).
+fn gles_should_demote(is_render_frame_variant: bool) -> bool {
+    is_render_frame_variant
+}
 
-    // M8 — the FULL z-order, built by the SHARED comp_core builder (killswitch → cursor
-    // → windows-faded → layer-shell desktop), the SAME element list the winit backend
-    // composites. PixmanRenderer satisfies the builder's `Renderer + ImportAll +
-    // ImportMem` bounds, so the DRM desktop gets the cursor, the screen kill-switch, and
-    // the map/workspace fades with ZERO parallel render code. The size is the output's
-    // current physical mode (the capturable framebuffer extent).
-    let size = comp_core::output_physical_size(state);
-    // The renderer lives ON `state`, but `build_frame_elements` needs BOTH `&mut state`
-    // (reads the space/cursor/effects, updates the killswitch buffer) AND `&mut renderer`
-    // (imports surface textures) — disjoint fields the borrow checker can't see through
-    // the `CompState` accessors. Swap the renderer OUT for the build (anvil's pattern),
-    // then restore it. The placeholder is a fresh PixmanRenderer; if it can't be made we
-    // skip this frame (the next tick retries) rather than panic — the never-fail posture.
-    let mut renderer = match PixmanRenderer::new() {
-        Ok(placeholder) => std::mem::replace(&mut state.renderer, placeholder),
-        Err(err) => {
-            warn!(?err, "HART-comp DRM: could not allocate a render scratch renderer; skipping frame");
-            return;
-        }
-    };
-    let elements: Vec<HartRenderElement<PixmanRenderer>> =
-        comp_core::build_frame_elements(state, &mut renderer, size);
-
-    let now = std::time::Instant::now();
+/// Present the built element list to every active DRM surface that is NOT mid-flip:
+/// `render_frame` (composite into the primary swapchain buffer) → `queue_frame` (page-flip)
+/// → gate on vblank (F1, #166; the `frame_submitted` half is driven by `reap_completed_
+/// vblanks`). GENERIC over the renderer `R`: the SAME body presents with EITHER the
+/// PixmanRenderer software floor OR the GlesRenderer GPU path — it never names a concrete
+/// renderer, so there is no parallel present path. EVERY render/flip error degrades (log +
+/// skip + retry next tick) and KEEPS THE COMPOSITOR ALIVE — never a `panic!`/`.unwrap()`
+/// death (F2/F3, #186). Returns `true` if a RENDERER fault (`RenderFrameError::RenderFrame`)
+/// was seen, so the caller can demote a GLES renderer to the pixman floor (degrade-not-die).
+fn present_surfaces<R>(
+    devices: &mut HashMap<DrmNode, DeviceData>,
+    renderer: &mut R,
+    elements: &[HartRenderElement<R>],
+    clear: Color32F,
+    now: std::time::Instant,
+) -> bool
+where
+    R: Renderer + Bind<Dmabuf>,
+    R::TextureId: Texture + Clone + Send + 'static,
+    HartRenderElement<R>: RenderElement<R>,
+{
+    let mut renderer_fault = false;
     for device in devices.values_mut() {
         // Self-healing DRM master retry (THE fresh-boot recovery, fix (a)): the construction-time
         // drmSetMaster inside DrmDevice::new may have lost the boot-VT master race ("Unable to
@@ -1097,12 +1165,13 @@ fn render_all(state: &mut State, devices: &mut HashMap<DrmNode, DeviceData>) {
                 surface.awaiting_vblank = false;
                 surface.flip_queued_at = None;
             }
-            // `render_frame` returns a result that BORROWS the compositor; reduce it to the
-            // Copy `is_empty` bool immediately so no borrow of `surface.compositor` spans
-            // the sibling-field writes (`awaiting_vblank`/`flip_queued_at`) below.
+            // `render_frame` returns a result whose Ok BORROWS the compositor; reduce it to
+            // the Copy `is_empty` bool immediately so no borrow of `surface.compositor` spans
+            // the sibling-field writes (`awaiting_vblank`/`flip_queued_at`) below. The Err
+            // (`RenderFrameError`) is owned, so it survives the reduction for classification.
             let render_outcome = surface
                 .compositor
-                .render_frame::<_, _>(&mut renderer, &elements, clear, SOFTWARE_FLOOR_FRAME_FLAGS)
+                .render_frame::<_, _>(renderer, elements, clear, SOFTWARE_FLOOR_FRAME_FLAGS)
                 .map(|result| result.is_empty);
             match render_outcome {
                 Ok(true) => {
@@ -1133,15 +1202,111 @@ fn render_all(state: &mut State, devices: &mut HashMap<DrmNode, DeviceData>) {
                         }
                     }
                 },
-                // render_frame failed (renderer import / no free slot / device inactive):
-                // skip THIS frame, retry next tick. Never a panic (#186).
-                Err(err) => warn!(?err, ?crtc, "HART-comp DRM: render_frame failed — degrading, retry next frame"),
+                // render_frame failed: a `RenderFrame`-class error is a RENDERER fault (a
+                // GLES path lost its GL context / an import failed) → flag it so the caller
+                // demotes a GLES renderer to the pixman floor. A `PrepareFrame`-class error
+                // is a DRM/swapchain/master hiccup that would hit pixman too → NOT a renderer
+                // fault, just retried next tick. EITHER way the compositor stays ALIVE (#186).
+                Err(err) => {
+                    if gles_should_demote(matches!(err, RenderFrameError::RenderFrame(_))) {
+                        renderer_fault = true;
+                        warn!(?err, ?crtc, "HART-comp DRM: render_frame RENDERER fault (RenderFrame) — degrading; caller may demote to the pixman floor");
+                    } else {
+                        warn!(?err, ?crtc, "HART-comp DRM: render_frame failed (PrepareFrame transient) — degrading, retry next frame");
+                    }
+                }
             }
         }
     }
-    // Restore the real renderer (it carries no per-frame state for pixman, but keeping the
-    // ORIGINAL instance avoids re-allocating its internal caches every tick).
-    state.renderer = renderer;
+    renderer_fault
+}
+
+/// Render every active DRM surface this tick: build the FULL z-order element list (the
+/// SHARED `comp_core` builder — killswitch → cursor → windows-faded → layer-shell desktop,
+/// the SAME list the winit backend composites) and present it. The renderer is the live
+/// GPU `GlesRenderer` when the boot GPU probe authorised it AND it initialised (`gles`),
+/// else the `PixmanRenderer` software floor of record (`state.renderer`). ONE present body
+/// (`present_surfaces`, generic over the renderer) drives both — no parallel render path.
+///
+/// THE NEVER-BLANK FLOOR IS SACRED: a GLES renderer fault (a lost GL context / a failed
+/// import) does NOT panic and does NOT black the screen — `present_surfaces` reports it,
+/// this fn drops the GLES renderer (`*gles = None`) + resets every surface, and the VERY
+/// NEXT tick paints through the untouched pixman renderer of record. The DrmCompositors
+/// were all built with pixman/LINEAR formats (which GLES can also render into), so the SAME
+/// compositors scan out under either renderer and the demotion is always bind-safe.
+fn render_all(
+    state: &mut State,
+    devices: &mut HashMap<DrmNode, DeviceData>,
+    gles: &mut Option<GlesRenderer>,
+) {
+    // Retire any flips whose vblank arrived since the last tick first, so a CRTC freed
+    // this tick can be re-queued immediately below (one-frame-latency, no stall).
+    reap_completed_vblanks(state, devices);
+
+    let clear = Color32F::new(
+        HART_SPLASH_RGBA[0],
+        HART_SPLASH_RGBA[1],
+        HART_SPLASH_RGBA[2],
+        HART_SPLASH_RGBA[3],
+    );
+    // The output's current physical mode (the capturable framebuffer extent).
+    let size = comp_core::output_physical_size(state);
+    let now = std::time::Instant::now();
+
+    // ── GLES GPU path ── The GlesRenderer is NOT a `State` field, so there is no
+    // borrow-checker mem::replace dance: `build_frame_elements` borrows `state` + `gles`
+    // disjointly. GlesRenderer satisfies the builder's `Renderer + ImportAll + ImportMem`
+    // bounds (proven by winit.rs) AND `present_surfaces`'s `Bind<Dmabuf>` bound, so the
+    // GPU desktop gets the SAME cursor / kill-switch / fades with ZERO parallel render code.
+    let mut demote_gles = false;
+    if let Some(renderer) = gles.as_mut() {
+        let elements: Vec<HartRenderElement<GlesRenderer>> =
+            comp_core::build_frame_elements(state, renderer, size);
+        demote_gles = present_surfaces(devices, renderer, &elements, clear, now);
+    } else {
+        // ── Pixman software-floor path (the never-fail renderer of record) ── The renderer
+        // lives ON `state`, but `build_frame_elements` needs BOTH `&mut state` (reads the
+        // space/cursor/effects, updates the killswitch buffer) AND `&mut renderer` (imports
+        // surface textures) — disjoint fields the borrow checker can't see through the
+        // `CompState` accessors. Swap the renderer OUT for the build (anvil's pattern), then
+        // restore it. The placeholder is a fresh PixmanRenderer; if it can't be made we skip
+        // this frame (the next tick retries) rather than panic — the never-fail posture.
+        let mut renderer = match PixmanRenderer::new() {
+            Ok(placeholder) => std::mem::replace(&mut state.renderer, placeholder),
+            Err(err) => {
+                warn!(?err, "HART-comp DRM: could not allocate a render scratch renderer; skipping frame");
+                return;
+            }
+        };
+        let elements: Vec<HartRenderElement<PixmanRenderer>> =
+            comp_core::build_frame_elements(state, &mut renderer, size);
+        // The pixman floor has NO lower renderer to demote to, so its renderer-fault return
+        // is ignored (a pixman RenderFrame fault is a transient retried next tick — there is
+        // no GL context to lose on the CPU path).
+        let _ = present_surfaces(devices, &mut renderer, &elements, clear, now);
+        // Restore the real renderer (keeping the ORIGINAL instance avoids re-allocating its
+        // internal caches every tick).
+        state.renderer = renderer;
+    }
+
+    // ── GLES → pixman demotion (degrade-not-die) ── A renderer fault was seen on the GPU
+    // path: drop the GLES renderer so EVERY subsequent tick paints via the pixman renderer
+    // of record, and reset each surface's swapchain/commit state + clear its in-flight-flip
+    // gate so the next pixman frame starts clean and flips immediately. Done OUTSIDE the
+    // `if let` above so `*gles = None` does not alias the `gles.as_mut()` borrow.
+    if demote_gles {
+        warn!("HART-comp DRM: GLES renderer fault — demoting to the pixman software floor (never-blank; the pixman renderer of record paints from the next tick)");
+        *gles = None;
+        for device in devices.values_mut() {
+            for surface in device.surfaces.values_mut() {
+                if let Err(err) = surface.compositor.reset_state() {
+                    warn!(?err, "HART-comp DRM: surface reset_state() after GLES demotion failed; retries next tick");
+                }
+                surface.awaiting_vblank = false;
+                surface.flip_queued_at = None;
+            }
+        }
+    }
 }
 
 /// Pick a connector's preferred mode (or the first available).
@@ -1487,5 +1652,45 @@ mod tests {
         );
         assert!(!SOFTWARE_FLOOR_FRAME_FLAGS.contains(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT));
         assert!(!SOFTWARE_FLOOR_FRAME_FLAGS.contains(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT));
+    }
+
+    // ── PART 3 (GPU lever): the GLES→pixman demotion policy (`gles_should_demote`). The
+    // real `RenderFrameError` (whether the failure was the `RenderFrame` renderer-fault
+    // variant or the `PrepareFrame` DRM/swapchain variant) is the only Smithay-touching
+    // part, exercised by the QEMU/HW scanout harness; the DECISION that drives the
+    // GLES→pixman fallback is pure and tested here. The invariant that matters: a renderer
+    // fault demotes (the GPU path falls back to the never-blank pixman floor), a prepare
+    // fault does NOT (it would hit pixman too — just retry). Mirrors `flip_action`/
+    // `master_step`'s pure-policy split. ──
+
+    #[test]
+    fn gles_demotes_only_on_a_render_frame_renderer_fault() {
+        // A `RenderFrameError::RenderFrame(_)` is a renderer fault (a lost GL context / a
+        // failed import) — the GPU path must fall back to the pixman software floor.
+        assert!(
+            gles_should_demote(true),
+            "a RenderFrame-class fault must demote GLES to the never-blank pixman floor"
+        );
+        // A `RenderFrameError::PrepareFrame(_)` (DRM/swapchain/master hiccup) is NOT a
+        // renderer fault — it would hit pixman too, so it does NOT demote (just retry).
+        assert!(
+            !gles_should_demote(false),
+            "a PrepareFrame-class fault must NOT demote (it is a transient, not a renderer fault)"
+        );
+    }
+
+    #[test]
+    fn gles_demotion_never_panics_and_is_a_total_decision() {
+        // Exhaustive guard: across BOTH variant classes the demote decision is a plain
+        // bool — there is no third outcome that could panic or black the screen. The
+        // never-blank floor is preserved because the ONLY effect of `true` is "drop the
+        // GLES renderer and paint via pixman next tick" (see render_all's demotion block).
+        for is_render_frame in [false, true] {
+            let demote = gles_should_demote(is_render_frame);
+            assert_eq!(
+                demote, is_render_frame,
+                "the demote decision tracks the RenderFrame variant exactly (no surprise outcome)"
+            );
+        }
     }
 }

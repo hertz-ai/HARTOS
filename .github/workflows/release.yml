@@ -620,6 +620,14 @@ jobs:
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [build-iso, build-installers]
     runs-on: ubuntu-latest
+    # Uploading ~6.5 GB of split ISO parts is comfortably under 90 min.
+    # Without its own budget this job inherits GitHub's 6h hard wall, so a
+    # slow build-iso run that pushed the pipeline long could get
+    # publish-nightly cancelled mid-upload, shipping a partial (e.g.
+    # 3/4-part) release. A dedicated budget fails loud instead, and the
+    # verify-before-publish guard below leaves an unpublished DRAFT rather
+    # than a broken "latest".
+    timeout-minutes: 90
     permissions:
       contents: write
     steps:
@@ -688,11 +696,111 @@ jobs:
           # scripts/hart_usb_flasher.py.
           cp "${GITHUB_WORKSPACE}/scripts/hart_usb_flasher.py" /tmp/all-artifacts/ 2>/dev/null || true
 
-          echo "=== Uploading artifacts ==="
-          find /tmp/all-artifacts -maxdepth 2 -type f | while read -r f; do
+          echo "=== Uploading artifacts (deterministic order, part-00 first) ==="
+          # `find` alone yields filesystem order; `sort` makes the upload
+          # sequence reproducible and ships the contiguous .part-00.. first.
+          # mapfile + an array loop (NOT `find | while read`) is deliberate:
+          # a `while` in a pipeline runs in a subshell, so an `exit 1` there
+          # would not abort this script and a partial upload could still get
+          # published. The array loop runs in the current shell, so a fatal
+          # upload aborts the whole job.
+          mapfile -t LOCAL_FILES < <(find /tmp/all-artifacts -maxdepth 2 -type f | sort)
+
+          # 3-attempt retry per file so one transient gh/network hiccup
+          # re-tries instead of aborting the whole set-eo-pipefail job.
+          # --clobber keeps every (re)upload idempotent.
+          upload_with_retry() {
+            local f="$1" name attempt
+            name="$(basename "$f")"
+            for attempt in 1 2 3; do
+              if gh release upload "$TAG" "$f" --repo "$REPO" --clobber; then
+                return 0
+              fi
+              echo "  !! upload attempt ${attempt}/3 failed for ${name}"
+              sleep $((attempt * 5))
+            done
+            return 1
+          }
+
+          for f in "${LOCAL_FILES[@]}"; do
             echo "  -> $(basename "$f")"
-            gh release upload "$TAG" "$f" --repo "$REPO" --clobber
+            upload_with_retry "$f" || { echo "FATAL: ${f} failed to upload after 3 attempts"; exit 1; }
           done
+
+          # --- VERIFY-BEFORE-PUBLISH guard --------------------------------
+          # Never flip the release out of draft on a partial upload. A 6h
+          # job-wall cancellation or a dropped chunk would otherwise ship a
+          # broken "latest" (e.g. a 3/4-part desktop ISO that cannot be
+          # reassembled). We assert (1) every split ISO downloaded here has a
+          # contiguous .part-00..part-NN set plus its .reassemble.sh and
+          # .sha256 companions, and (2) every local artifact is a published
+          # asset on the release. Any gap is re-uploaded once more and
+          # re-checked; if still missing we exit 1, leaving the unpublished
+          # DRAFT for the keep-newest-3 prune while /releases/latest keeps
+          # pointing at the previous COMPLETE release.
+          echo "=== Verifying all artifacts present before publish ==="
+
+          remote_asset_names() {
+            gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null
+          }
+
+          # (1) Local contiguity of any split ISO actually downloaded.
+          # split(1) -d -a 2 emits .part-00 .part-01 ...; a gap means
+          # download-artifact dropped a chunk, so fail loud before publish.
+          declare -A PART_MAX PART_CNT
+          for f in "${LOCAL_FILES[@]}"; do
+            name="$(basename "$f")"
+            case "$name" in
+              *.part-[0-9][0-9])
+                base="${name%.part-*}"
+                idx=$((10#${name##*.part-}))
+                PART_CNT["$base"]=$(( ${PART_CNT["$base"]:-0} + 1 ))
+                if [[ -z "${PART_MAX[$base]:-}" || "$idx" -gt "${PART_MAX[$base]}" ]]; then
+                  PART_MAX["$base"]=$idx
+                fi
+                ;;
+            esac
+          done
+          for base in "${!PART_MAX[@]}"; do
+            expected=$(( ${PART_MAX[$base]} + 1 ))   # parts are 0-indexed
+            if [[ "${PART_CNT[$base]}" -ne "$expected" ]]; then
+              echo "FATAL: ${base}: found ${PART_CNT[$base]} parts but highest index ${PART_MAX[$base]} implies ${expected} (a chunk is missing)"
+              exit 1
+            fi
+            for companion in "${base}.reassemble.sh" "${base}.sha256"; do
+              if ! printf '%s\n' "${LOCAL_FILES[@]##*/}" | grep -Fxq "$companion"; then
+                echo "FATAL: split ISO ${base} is missing companion ${companion} locally"
+                exit 1
+              fi
+            done
+            echo "  ok: ${base} has all ${expected} parts + .reassemble.sh + .sha256"
+          done
+
+          # (2) Remote presence: every local artifact must be a published
+          # asset. Re-upload any stragglers once more, then re-verify.
+          REMOTE="$(remote_asset_names || true)"
+          MISSING=()
+          for f in "${LOCAL_FILES[@]}"; do
+            grep -Fxq "$(basename "$f")" <<< "$REMOTE" || MISSING+=("$f")
+          done
+          if [[ "${#MISSING[@]}" -gt 0 ]]; then
+            echo "  ${#MISSING[@]} asset(s) not yet on the release, re-uploading:"
+            for f in "${MISSING[@]}"; do
+              echo "    -> $(basename "$f")"
+              upload_with_retry "$f" || echo "    (re-upload still failing for $(basename "$f"))"
+            done
+            REMOTE="$(remote_asset_names || true)"
+            STILL=()
+            for f in "${MISSING[@]}"; do
+              grep -Fxq "$(basename "$f")" <<< "$REMOTE" || STILL+=("$(basename "$f")")
+            done
+            if [[ "${#STILL[@]}" -gt 0 ]]; then
+              echo "FATAL: ${#STILL[@]} asset(s) could not be published: ${STILL[*]}"
+              echo "Leaving '$TAG' as an unpublished DRAFT; /releases/latest is unchanged."
+              exit 1
+            fi
+          fi
+          echo "Verified all ${#LOCAL_FILES[@]} artifact(s) present on '$TAG'."
 
           echo "=== Publishing as latest (immutable after publish) ==="
           gh release edit "$TAG" --repo "$REPO" --draft=false --latest=true --prerelease=false

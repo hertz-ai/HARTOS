@@ -255,25 +255,50 @@ impl BootConfig {
     }
 }
 
-/// Decide the render path. Software is MANDATORY: if `--force-software` is set, or
-/// hardware GL cannot be probed-good, we paint with pixman. A compositor MUST
-/// paint on any GPU — correctness/robustness over a few fps (the exact lesson the
-/// cage kiosk launcher comment encodes in hart-liquid-ui.nix).
+/// The boot-time GPU smoke-test's verdict file (hart-gpu-probe.nix runs `eglinfo`
+/// before greetd and writes `hardware` when a usable GL context was proven, else the
+/// fail-safe `software`). The DRM/udev backend reads this to decide whether to bring up
+/// the GLES GPU renderer (PART 3 of the GPU lever) or stay on the pixman software floor.
+const GPU_VERDICT_PATH: &str = "/run/hart/gpu-render";
+/// The one verdict token that upgrades to the hardware (GLES) render path.
+const GPU_VERDICT_HARDWARE: &str = "hardware";
+
+/// PURE: does the GPU probe verdict authorise the hardware (GLES) render path? `true`
+/// ONLY when the file read back exactly `hardware` (after trimming surrounding
+/// whitespace/newline). Any other value — `software`, an empty/garbled file, or `None`
+/// (the probe file is absent, e.g. the Windows dev box / an unprobed boot) — stays on
+/// the never-fail software floor. Split out of `select_render_path` so the verdict→path
+/// decision is unit-tested on the dev box with no `/run/hart` present.
+fn gpu_verdict_is_hardware(verdict: Option<&str>) -> bool {
+    verdict.map(str::trim) == Some(GPU_VERDICT_HARDWARE)
+}
+
+/// Decide the render path. Software is MANDATORY: if `--force-software` is set, or the
+/// boot-time GPU probe did not prove a usable GL context, we paint with pixman. A
+/// compositor MUST paint on any GPU — correctness/robustness over a few fps (the exact
+/// lesson the cage kiosk launcher comment encodes in hart-liquid-ui.nix). When the path
+/// IS `Hardware`, the DRM backend (src/udev.rs) brings up a `GlesRenderer` on the primary
+/// node and GPU-composites, keeping the PixmanRenderer as the fallback on ANY GLES fault.
 fn select_render_path(cfg: &BootConfig) -> RenderPath {
     if cfg.force_software {
         tracing::info!("render path: SOFTWARE (forced via --force-software / env)");
         return RenderPath::Software;
     }
-    // TODO[phase3-vm]: real GBM/EGL probe behind `smithay::backend::egl`. On the
-    // Windows dev box there is no DRM node to probe, so the probe is stubbed to
-    // FALSE (fail toward the always-safe software floor) until CI wires the real
-    // device walk. NEVER default to hardware on an unprobed box.
-    let hardware_gl_probed_good = false; // stub — see TODO above
-    if hardware_gl_probed_good {
-        tracing::info!("render path: HARDWARE (GBM/EGL probed good)");
+    // Read the boot-time GPU smoke-test verdict (hart-gpu-probe). The probe is the
+    // device walk that used to be a TODO here: it fail-safes to `software` and the file
+    // is simply absent on a box that never ran it (the Windows dev box, an unprobed
+    // boot) — both of which `gpu_verdict_is_hardware` maps to the software floor. We
+    // NEVER default to hardware on an unprobed box.
+    let verdict = std::fs::read_to_string(GPU_VERDICT_PATH).ok();
+    if gpu_verdict_is_hardware(verdict.as_deref()) {
+        tracing::info!(path = %GPU_VERDICT_PATH, "render path: HARDWARE (GPU probe verdict = hardware)");
         RenderPath::Hardware
     } else {
-        tracing::info!("render path: SOFTWARE (hardware GL not probed-good — never-fail floor)");
+        tracing::info!(
+            path = %GPU_VERDICT_PATH,
+            ?verdict,
+            "render path: SOFTWARE (GPU probe not 'hardware' — never-fail floor)"
+        );
         RenderPath::Software
     }
 }
@@ -894,6 +919,22 @@ mod tests {
     fn splash_clear_is_opaque_brand_color() {
         // Alpha MUST be 1.0 (opaque) so the pre-frame clear actually hides black.
         assert_eq!(HART_SPLASH_RGBA[3], 1.0);
+    }
+
+    #[test]
+    fn gpu_verdict_hardware_only_on_the_exact_trimmed_token() {
+        // The GLES GPU path is authorised ONLY by an exact `hardware` verdict (the
+        // hart-gpu-probe smoke-test output). A trailing newline / surrounding whitespace
+        // (how the probe writes the file) is tolerated; everything else — `software`, an
+        // empty/garbled file, a near-miss token, or `None` (the probe file absent, e.g.
+        // the Windows dev box) — stays on the never-fail software floor.
+        assert!(gpu_verdict_is_hardware(Some("hardware")));
+        assert!(gpu_verdict_is_hardware(Some("hardware\n")), "trailing newline tolerated");
+        assert!(gpu_verdict_is_hardware(Some("  hardware  ")), "surrounding whitespace tolerated");
+        assert!(!gpu_verdict_is_hardware(Some("software")), "fail-safe verdict stays software");
+        assert!(!gpu_verdict_is_hardware(Some("")), "empty verdict → software floor");
+        assert!(!gpu_verdict_is_hardware(Some("hardware-ish")), "only the exact token upgrades");
+        assert!(!gpu_verdict_is_hardware(None), "absent probe file → software floor (never-fail)");
     }
 
     // ── Phase 5: handle minting + manifest↔toplevel map ──

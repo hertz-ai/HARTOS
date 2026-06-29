@@ -29,6 +29,27 @@
     # Pinned to an exact rev (not the branch) for reproducibility.
     nixpkgs-rust.url = "github:NixOS/nixpkgs/ac62194c3917d5f474c1a844b6fd6da2db95077d";
 
+    # ── Crane: incremental Rust-in-Nix builder for hart-comp (deps-only cache) ──
+    # WHY: rustPlatform.buildRustPackage compiles ALL ~245 compositor crates in ONE
+    # derivation keyed on the whole `src`, so ANY compositor/src edit recompiles every
+    # crate from scratch (hours). Baked into the iso-desktop closure, that pushed the
+    # desktop ISO Release job past the GitHub Actions 6h job limit. crane splits the
+    # build into a CACHED deps-only `cargoArtifacts` derivation plus a thin app-crate
+    # `buildPackage`, so a compositor/src edit recompiles ONLY the app crate (minutes)
+    # and the 245 deps substitute from the store. hart-comp.nix is the ONLY consumer
+    # (threaded via mkSpecialArgs as hartCrane, the same pattern as nixpkgs-rust).
+    #
+    # NO `inputs.nixpkgs.follows` here, on purpose: crane is a pure LIBRARY with ZERO
+    # flake inputs (`nix flake metadata github:ipetkov/crane` -> root inputs []), so a
+    # `follows` line is a hard eval error ("input 'crane' has no input named
+    # 'nixpkgs'"). crane.mkLib takes whatever pkgs we hand it (hart-comp.nix hands it
+    # the 25.05 rust_1_88 toolchain), so it pulls NO second nixpkgs into the closure
+    # and there is nothing to dedupe. Pinned to an exact rev (verified live via
+    # `nix flake metadata github:ipetkov/crane`) for reproducibility, same as the
+    # nixpkgs-rust pin above; run `nix flake lock` on a nix-capable host to also
+    # commit the resolved narHash into flake.lock.
+    crane.url = "github:ipetkov/crane/469fd08d0bcf6926321fa973c6777fbc87785dd7";
+
     llama-cpp = {
       url = "github:ggml-org/llama.cpp";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -50,7 +71,7 @@
     };
   };
 
-  outputs = { self, nixpkgs, nixpkgs-rust, llama-cpp, nixos-generators, nixos-hardware, mobile-nixos }:
+  outputs = { self, nixpkgs, nixpkgs-rust, crane, llama-cpp, nixos-generators, nixos-hardware, mobile-nixos }:
   let
     # Shared module list for all variants
     hartModules = [
@@ -208,6 +229,20 @@
       # for every variant; desktop.nix turns it on. tests/boot-continuity.nix
       # gates the structural assertions.
       ./modules/hart-boot-continuity.nix
+      # Journal export to an EXTERNAL removable USB stick: a low-level systemd
+      # TIMER (+ a shutdown oneshot) that dumps the current-boot journal
+      # (journalctl -b, capped ~5 MB, + the last 200 warning lines) to
+      # hart-journal-<hostname>.txt on any plugged-in removable FAT/vfat stick that
+      # is NOT the live boot medium (the HART_OS ISO disk + the HARTLOG partition +
+      # the disks backing / and /nix/store are excluded). It rides journald + the
+      # block layer ONLY (NOT any graphical target), so it keeps exporting even
+      # when the software-rendered glass shell pegs the CPU and wedges — capturing
+      # the PRE-hang state on a stick the user can read on any host. Opt-in
+      # (hart.journalExport.enable=false default) -> pure no-op for every variant;
+      # ALSO a clean no-op at runtime when no eligible external stick is present.
+      # Imported so the option exists + tests/journal-export.nix can enable it; the
+      # live/desktop config turns it on (desktop.nix).
+      ./modules/hart-journal-export.nix
     ];
 
     # Single source of truth for nixpkgs config (allowUnfree etc.).  Kept OUT of
@@ -234,6 +269,13 @@
       # See the `nixpkgs-rust` input comment for WHY (24.11 Rust < 1.85 can't parse the
       # edition2024 Smithay manifest).
       hartRustNixpkgs = nixpkgs-rust;
+      # crane (incremental Rust builder) for hart-comp.nix's deps-only cargoArtifacts
+      # split, so a compositor/src edit recompiles only the app crate (keeps the
+      # iso-desktop Release build well under the GitHub 6h job limit). Only
+      # hart-comp.nix consumes it; every other module ignores it (same threading
+      # pattern as hartRustNixpkgs above). Passed as the raw flake input; the module
+      # calls crane.mkLib with its own instantiated 25.05 (rust_1_88) pkgs.
+      hartCrane = crane;
     };
 
     # Build a full NixOS system configuration
@@ -557,7 +599,15 @@
       # Windows invariant), and running it on a non-UEFI VM is a clean no-op
       # exit 0. The live BootNext write needs real UEFI HW. Distinct attr -> //.
       bootContinuity = import ./tests/boot-continuity.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity;
+      # External-USB journal export: a desktop node enables hart.journalExport +
+      # attaches a spare disk the test formats vfat (the stand-in for a user's
+      # SECOND FAT32 stick). It runs the REAL export script via the documented
+      # test seam and asserts hart-journal-<host>.txt lands with the journal
+      # sections, AND that a HART_OS/HARTLOG-labelled disk is REFUSED (the never-
+      # clobber-the-boot-medium invariant), AND that the no-stick path is a clean
+      # no-op. Distinct attr name -> clean //; desktop-variant node (mkNode).
+      journalExport = import ./tests/journal-export.nix desktopTestArgs;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // journalExport;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)

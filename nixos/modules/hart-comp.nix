@@ -1,4 +1,4 @@
-{ config, lib, pkgs, hartSrc ? /etc/hart, hartRustNixpkgs ? null, ... }:
+{ config, lib, pkgs, hartSrc ? /etc/hart, hartRustNixpkgs ? null, hartCrane ? null, ... }:
 
 # ════════════════════════════════════════════════════════════════════════════
 # HART OS — HART-comp: the AI-native Smithay/Rust compositor (Tier-1, OPT-IN)
@@ -97,7 +97,92 @@ let
     }
     else pkgs.rustPlatform;
 
-  # ── The HART-comp package (buildRustPackage of compositor/) ──
+  # ── DRY: the pinned git-Smithay checkout, referenced by BOTH build paths ──
+  # ONE source of truth for the rev-47843391 source NAR hash. Cross-checked (see the
+  # buildRustPackage block below): `builtins.fetchGit {url;rev;}` + `nix hash path` ==
+  # importCargoLock's fetchgit hash, and Smithay has no submodules/LFS so the bare-tree
+  # NAR is fetcher-independent (crane's fetchgit sets fetchSubmodules/fetchLFS = true,
+  # both no-ops here, so it yields the same NAR). The buildRustPackage fallback keys it
+  # by Cargo.lock "name-version" ("smithay-0.7.0"); crane's vendorGitDeps keys
+  # outputHashes by the full Cargo.lock `package.source` string (smithayGitSource).
+  # Same value, two keyings.
+  smithayGitHash = "sha256-44CNdBNGmGqBkCIVRVtJoQljZfn/JF682xAPX4m/2N8=";
+  # The EXACT `source = "..."` line for smithay 0.7.0 in compositor/Cargo.lock. crane
+  # indexes outputHashes by this string (NOT "smithay-0.7.0"). Split for readability;
+  # the concatenation must equal the lock line verbatim or crane warns + falls back to
+  # an eval-time builtins.fetchGit (non-fatal: it just loses offline eval).
+  smithayGitSource =
+    "git+https://github.com/Smithay/smithay"
+    + "?rev=47843391c3cd34a32e5ed1721878ca2279269185"
+    + "#47843391c3cd34a32e5ed1721878ca2279269185";
+
+  # ── DRY: package meta, shared by the buildRustPackage fallback + the crane build ──
+  compMeta = {
+    description =
+      "HART OS AI-native Wayland compositor (Smithay) - Tier-1, opt-in; "
+      + "real-HW DRM/KMS scanout on the pixman software-render floor + "
+      + "com.hart.Compositor IPC";
+    license = lib.licenses.mit;
+    platforms = lib.platforms.linux;
+    mainProgram = "hart-comp";
+  };
+
+  # ── Crane: incremental Rust build with a CACHED deps-only artifacts split ──
+  # WHY (the iso-desktop 6h-limit fix): buildRustPackage compiles all ~245 crates in ONE
+  # derivation keyed on the whole `src`, so ANY compositor/src edit recompiles every
+  # crate (hours). crane's `buildDepsOnly` builds a DUMMY crate from the real
+  # Cargo.toml/Cargo.lock (stubbed src), so its output (cargoArtifacts) is keyed on the
+  # manifest + lock + toolchain + buildInputs + features, NOT on src/*.rs. A
+  # compositor/src edit leaves cargoArtifacts UNCHANGED (substitutes from the store);
+  # only the minutes-long app-crate `buildPackage` re-runs, keeping the in-ISO Rust
+  # compile well under 6h.
+  #
+  # crane needs a SINGLE combined toolchain drv (nixpkgs ships cargo + rustc as separate
+  # derivations), so symlinkJoin them. SAME rust_1_88 (rustc 1.88.0) stable cargo + rustc
+  # the buildRustPackage path uses (>= 1.85 parses the edition2024 Smithay manifest;
+  # 24.11's 1.83 cannot). rustc's wrapper bundles matching rust-std, so cargo + rustc
+  # suffices (we never call cargoClippy/cargoFmt). Null off-flake (no specialArg) so the
+  # buildRustPackage fallback is selected and plain module eval never crashes.
+  rustToolchain =
+    if hartCrane != null
+    then rustNixpkgs.symlinkJoin {
+      name = "hart-comp-rust-1_88";
+      paths = with rustNixpkgs.rust_1_88.packages.stable; [ cargo rustc ];
+    }
+    else null;
+  # mkLib uses rustNixpkgs (25.05) for crane's own helpers (jq, dummy-src tooling);
+  # overrideToolchain points it at the rust_1_88 cargo + rustc above. The C buildInputs
+  # in craneCommonArgs stay on the 24.11 `pkgs` (libgbm-in-mesa): newer compiler, same
+  # libs, identical to the buildRustPackage cross-pin that is already M9-green.
+  craneLib =
+    if hartCrane != null
+    then (hartCrane.mkLib rustNixpkgs).overrideToolchain rustToolchain
+    else null;
+  # cleanCargoSource keeps Cargo.toml/Cargo.lock + *.rs only (drops target/, the
+  # m*_artifacts PNGs, *.md, *.sh) so the build's cache key is tight.
+  compCleanSrc =
+    if craneLib != null then craneLib.cleanCargoSource compositorSrc else null;
+  # Vendor the 245-crate dep set ONCE (shared by the deps-only + app builds). The git
+  # Smithay outputHash is provided EXPLICITLY so crane uses a fixed-output `fetchgit`
+  # (offline eval, the SAME property the buildRustPackage cargoLock path has, so
+  # `nix flake check --no-build` does NOT do an eval-time network fetch) keyed by the
+  # Cargo.lock source string. A key mismatch is non-fatal (crane warns + falls back to
+  # builtins.fetchGit); only a wrong VALUE fails, and this value is the cross-checked
+  # rev NAR. All 245 crates are vendored regardless of features; `--features smithay`
+  # only selects what COMPILES.
+  cargoVendorDir =
+    if craneLib != null
+    then craneLib.vendorCargoDeps {
+      src = compCleanSrc;
+      outputHashes = { "${smithayGitSource}" = smithayGitHash; };
+    }
+    else null;
+
+  # ── HART-comp package: the buildRustPackage FALLBACK (off-flake, no crane) ──
+  # Selected only when hartCrane is NOT threaded (a consumer that imports this module
+  # without the flake specialArgs); on the flake the crane path below is used. Kept so
+  # plain module eval never crashes + so the importCargoLock outputHashes contract is
+  # preserved for that path.
   #
   # NOTE: post the M1 forward-port the committed Cargo.lock is NO LONGER
   # registry-only — it now has 245 packages including the GIT Smithay dep pinned to
@@ -106,7 +191,7 @@ let
   # away — it is load-bearing for the smithay-feature resolution. This package uses
   # the reproducible cargoLock.lockFile model (the SAME idiom as
   # hart-rust-precedent.nix), PLUS an explicit `outputHashes` for the one git dep.
-  hartCompPkg = hartRustPlatform.buildRustPackage {
+  hartCompPkgBuildRust = hartRustPlatform.buildRustPackage {
     pname = "hart-comp";
     version = "0.1.0";
 
@@ -131,7 +216,7 @@ let
       # `nix build .#…config.hart.comp.package`) no longer fails the Smithay-hash
       # gate. Keyed by `${pname}-${version}` from Cargo.lock.
       outputHashes = {
-        "smithay-0.7.0" = "sha256-44CNdBNGmGqBkCIVRVtJoQljZfn/JF682xAPX4m/2N8=";
+        "smithay-0.7.0" = smithayGitHash;
       };
     };
 
@@ -206,16 +291,65 @@ let
     # by the nested-Wayland CI job with `-- --ignored`.
     doCheck = true;
 
-    meta = {
-      description =
-        "HART OS AI-native Wayland compositor (Smithay) — Tier-1, opt-in; "
-        + "real-HW DRM/KMS scanout on the pixman software-render floor + "
-        + "com.hart.Compositor IPC";
-      license = lib.licenses.mit;
-      platforms = lib.platforms.linux;
-      mainProgram = "hart-comp";
-    };
+    meta = compMeta;
   };
+
+  # ── Crane derivations: deps-only artifacts (cached) + the app crate ──
+  # ONE shared args set used by BOTH cargoArtifacts and the app build. A deps crate that
+  # links a C lib must see that lib at the deps stage too, so the SAME pkg-config +
+  # wayland/libinput/.../xorg C-dep set goes on both (identical to the buildRustPackage
+  # buildInputs above; `with pkgs` keeps them on the 24.11 pin -> libgbm-in-mesa).
+  # `--features smithay` == the old buildFeatures = ["smithay"], in the SHARED args so the
+  # deps build compiles the full smithay graph (incl. the git Smithay rev) into the
+  # artifacts. The explicit cargoVendorDir (git Smithay hashed above) is shared so the
+  # deps + app agree on the same vendored tree (a mismatch would defeat the cache reuse).
+  craneCommonArgs = {
+    src = compCleanSrc;
+    inherit cargoVendorDir;
+    strictDeps = true;
+    cargoExtraArgs = "--features smithay";
+    nativeBuildInputs = with pkgs; [ pkg-config ];
+    buildInputs = lib.optionals pkgs.stdenv.isLinux (with pkgs; [
+      wayland
+      wayland-protocols
+      libinput
+      libxkbcommon
+      pixman              # MANDATORY software-render path (never-fail floor)
+      libdrm
+      mesa                # GBM (libgbm ships in mesa) for the DRM scanout allocator
+      seatd               # libseat C lib + seatd daemon (do NOT add pkgs.libseat: it is
+                          # a throw-alias to seatd on this pin; listing both fails eval)
+      udev                # device hotplug (backend_udev)
+      xwayland            # link-time X11 client stack for smithay/xwayland
+      xorg.libX11
+      xorg.libxcb
+      xorg.xcbutilwm
+    ]);
+  };
+
+  # Deps-only (CACHED): a dummy crate from the real Cargo.toml/Cargo.lock. Keyed on the
+  # manifest + lock + toolchain + buildInputs + features, NOT on src/*.rs, so a compositor
+  # src edit reuses this from the store and only the app build below re-runs.
+  cargoArtifacts =
+    if craneLib != null then craneLib.buildDepsOnly craneCommonArgs else null;
+
+  # The app crate (the only thing a compositor/src edit recompiles). doCheck = true keeps
+  # the pure-logic test floor (main.rs/comp_core.rs/ipc.rs/udev.rs #[cfg(test)]) exactly
+  # as the buildRustPackage path did; cargo forces panic=unwind for the test harness even
+  # though [profile.release] panic="abort", so the tests stay green.
+  hartCompPkgCrane = craneLib.buildPackage (craneCommonArgs // {
+    pname = "hart-comp";
+    version = "0.1.0";
+    inherit cargoArtifacts;
+    doCheck = true;
+    meta = compMeta;
+  });
+
+  # Select crane (incremental, cached deps) when the flake threads it; fall back to the
+  # buildRustPackage path off-flake so plain module eval (no specialArgs) never crashes.
+  # Both install $out/bin/hart-comp, so config.hart.comp.package + the launcher's
+  # ${hartCompPkg}/bin/hart-comp resolve identically either way.
+  hartCompPkg = if hartCrane != null then hartCompPkgCrane else hartCompPkgBuildRust;
 
   # ── HART-comp session launcher ──
   # Forces the mandatory software path (paint on any GPU) and runs the glass shell
