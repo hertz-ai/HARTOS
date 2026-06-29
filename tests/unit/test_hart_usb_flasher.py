@@ -550,10 +550,16 @@ def _stub_flash_machinery(monkeypatch, verify_result=True):
         return verify_result
     monkeypatch.setattr(flasher, "verify_iso", fake_verify)
 
-    def fake_carve(disk, log):
+    def fake_carve(disk, log, iso_bytes=0):
         order.append("carve")
         return True
     monkeypatch.setattr(flasher, "create_log_partition", fake_carve)
+
+    # The post-carve re-verify reads the raw device; stub it CLEAN (intact sigs)
+    # so the ordering tests don't touch hardware. Dedicated tests below drive the
+    # real reverify_boot_sigs_after_carve + its abort-on-change behaviour.
+    monkeypatch.setattr(flasher, "reverify_boot_sigs_after_carve",
+                        lambda disk, dd, log, **k: True)
     return order
 
 
@@ -614,7 +620,7 @@ def test_flash_carve_exception_does_not_fail_the_flash(monkeypatch):
     successful flash into a failure."""
     order = _stub_flash_machinery(monkeypatch, verify_result=True)
 
-    def raising_carve(disk, log):
+    def raising_carve(disk, log, iso_bytes=0):
         order.append("carve")
         raise RuntimeError("diskpart exploded")
     monkeypatch.setattr(flasher, "create_log_partition", raising_carve)
@@ -643,6 +649,394 @@ def test_windows_log_partition_flag_parses(monkeypatch):
     args2 = flasher.build_parser().parse_args(
         ["--device", "1", "--yes", "--windows-log-partition"])
     assert args2.windows_log_partition is True           # explicit legacy opt-in
+
+
+# ─────────── #128: the Windows GPT relocate (sgdisk -e equivalent) ───────────
+# ROOT CAUSE of the failed Windows carve: a dd-written isohybrid GPT ISO leaves the
+# BACKUP GPT header at the ISO image's last LBA (mid-stick), so the PRIMARY header
+# caps LastUsableLBA at the ISO boundary and diskpart sees NO free tail ("not enough
+# usable free space") -> the carve no-ops ("partition 1 is the WHOLE 29 GB stick").
+# THE FIX: _grow_gpt_to_device_end relocates the backup GPT to the device's TRUE last
+# LBA (the std-lib equivalent of `sgdisk -e`) so diskpart then sees the revealed free
+# tail. It is pure-logic over a SEEKABLE handle, so these tests drive it against a
+# synthetic temp-file "device" with a valid mini-GPT — no real hardware, no ctypes.
+import struct as _struct
+import zlib as _zlib
+
+_GPT_NUM = 128
+_GPT_ESIZE = 128
+
+
+def _build_synthetic_gpt_device(path, device_sectors, iso_sectors, entry_ending_lba,
+                                valid_gpt=True):
+    """Write a synthetic 'device' image with a valid mini-GPT whose backup header is
+    MID-FILE (at iso_sectors-1) — the exact dd-written-isohybrid symptom. Also lays
+    down the protective-MBR 0x55AA boot sig @0x1FE and the ISO9660 'CD001' magic
+    @0x8001, so a test can prove _grow_gpt_to_device_end never touches them.
+
+    Returns the meta dict {array, array_crc, primary_hdr} the assertions compare
+    against. valid_gpt=False writes garbage at LBA1 (an MBR isohybrid stand-in)."""
+    SEC = flasher.SECTOR
+    first_usable = 34
+    part_entry_lba = 2
+    last_usable_old = iso_sectors - 34
+    alt_lba_old = iso_sectors - 1
+
+    # One USED partition entry (nonzero type GUID) + 127 empty slots.
+    array = bytearray(_GPT_NUM * _GPT_ESIZE)
+    _struct.pack_into("<16s", array, 0, bytes(range(1, 17)))     # type GUID (used)
+    _struct.pack_into("<16s", array, 16, bytes(range(17, 33)))   # unique GUID
+    _struct.pack_into("<Q", array, 32, 2048)                     # StartingLBA
+    _struct.pack_into("<Q", array, 40, entry_ending_lba)         # EndingLBA
+    nm = "HART_OS".encode("utf-16-le")
+    array[56:56 + len(nm)] = nm
+    array_crc = _zlib.crc32(bytes(array)) & 0xFFFFFFFF
+
+    def _mk_header(my_lba, alt_lba, part_lba):
+        h = bytearray(SEC)
+        h[0:8] = b"EFI PART"
+        _struct.pack_into("<I", h, 8, 0x00010000)                # revision 1.0
+        _struct.pack_into("<I", h, 12, 92)                       # header size
+        _struct.pack_into("<Q", h, 24, my_lba)                   # MyLBA
+        _struct.pack_into("<Q", h, 32, alt_lba)                  # AlternateLBA
+        _struct.pack_into("<Q", h, 40, first_usable)             # FirstUsableLBA
+        _struct.pack_into("<Q", h, 48, last_usable_old)          # LastUsableLBA
+        _struct.pack_into("<16s", h, 56, bytes(range(33, 49)))   # DiskGUID
+        _struct.pack_into("<Q", h, 72, part_lba)                 # PartitionEntryLBA
+        _struct.pack_into("<I", h, 80, _GPT_NUM)                 # NumberOfPartitionEntries
+        _struct.pack_into("<I", h, 84, _GPT_ESIZE)              # SizeOfPartitionEntry
+        _struct.pack_into("<I", h, 88, array_crc)               # PartitionEntryArrayCRC32
+        crc = _zlib.crc32(bytes(h[:92])) & 0xFFFFFFFF
+        _struct.pack_into("<I", h, 16, crc)                      # HeaderCRC32
+        return bytes(h)
+
+    primary = _mk_header(1, alt_lba_old, part_entry_lba)
+    mid_backup_array_lba = alt_lba_old - 32
+    mid_backup = _mk_header(alt_lba_old, 1, mid_backup_array_lba)
+
+    with open(path, "wb") as f:
+        f.truncate(device_sectors * SEC)
+        f.seek(0x1FE); f.write(b"\x55\xAA")                      # protective-MBR boot sig
+        if valid_gpt:
+            f.seek(1 * SEC); f.write(primary)                   # primary GPT header
+            f.seek(part_entry_lba * SEC); f.write(bytes(array))  # primary entry array
+            # the STALE mid-file backup (array + header) the dd write left behind
+            f.seek(mid_backup_array_lba * SEC); f.write(bytes(array))
+            f.seek(alt_lba_old * SEC); f.write(mid_backup)
+        else:
+            f.seek(1 * SEC); f.write(b"\xE9" + b"\x90" * 445)   # MBR-ish garbage, no sig
+        f.seek(0x8001); f.write(b"CD001")                       # ISO9660 magic @ LBA64+1
+    return {"array": bytes(array), "array_crc": array_crc, "primary_hdr": primary}
+
+
+def _validate_gpt_header(sector_bytes):
+    """Return (sig_ok, header_crc_ok) for a 512 B GPT-header sector."""
+    sig_ok = sector_bytes[0:8] == b"EFI PART"
+    stored = _struct.unpack_from("<I", sector_bytes, 16)[0]
+    chk = bytearray(sector_bytes[:92])
+    _struct.pack_into("<I", chk, 16, 0)
+    return sig_ok, (_zlib.crc32(bytes(chk)) & 0xFFFFFFFF) == stored
+
+
+def test_grow_gpt_relocates_backup_to_device_end_nondestructive(tmp_path):
+    """THE #128 fix: _grow_gpt_to_device_end moves the backup GPT from its mid-file
+    (ISO-boundary) location to the device's TRUE last LBA, rewriting LastUsableLBA so
+    diskpart later sees the trailing free tail — WITHOUT touching the boot sig, the
+    ISO9660 magic, or the existing partition entry (which is within the ISO bound)."""
+    SEC = flasher.SECTOR
+    device_sectors = 131072          # 64 MiB synthetic device
+    iso_sectors = 32768              # 16 MiB synthetic ISO
+    path = str(tmp_path / "dev.img")
+    meta = _build_synthetic_gpt_device(path, device_sectors, iso_sectors,
+                                       entry_ending_lba=32000)   # within the ISO bound
+    before = open(path, "rb").read()
+
+    with open(path, "rb+") as h:
+        ok = flasher._grow_gpt_to_device_end(h, device_sectors,
+                                             iso_sectors * SEC, log=lambda m: None)
+    assert ok is True
+    after = open(path, "rb").read()
+
+    # ── primary header relocated to the device end + CRC re-validates ──
+    prim = after[SEC:SEC + 512]
+    sig_ok, crc_ok = _validate_gpt_header(prim)
+    assert sig_ok and crc_ok
+    assert _struct.unpack_from("<Q", prim, 32)[0] == device_sectors - 1    # AlternateLBA
+    assert _struct.unpack_from("<Q", prim, 48)[0] == device_sectors - 34   # LastUsableLBA
+    assert _struct.unpack_from("<I", prim, 88)[0] == meta["array_crc"]     # array CRC unchanged
+
+    # ── the existing partition entry bytes are byte-for-byte unchanged ──
+    arr_after = after[2 * SEC: 2 * SEC + _GPT_NUM * _GPT_ESIZE]
+    assert arr_after == meta["array"]
+
+    # ── a VALID backup GPT now sits at device_sectors-1 ──
+    bh = after[(device_sectors - 1) * SEC:(device_sectors - 1) * SEC + 512]
+    sig_ok_b, crc_ok_b = _validate_gpt_header(bh)
+    assert sig_ok_b and crc_ok_b
+    assert _struct.unpack_from("<Q", bh, 24)[0] == device_sectors - 1      # MyLBA
+    assert _struct.unpack_from("<Q", bh, 32)[0] == 1                       # AlternateLBA -> primary
+    assert _struct.unpack_from("<Q", bh, 72)[0] == device_sectors - 33     # PartitionEntryLBA
+    barr = after[(device_sectors - 33) * SEC:(device_sectors - 33) * SEC + _GPT_NUM * _GPT_ESIZE]
+    assert barr == meta["array"]                                          # backup array == primary
+
+    # ── NON-DESTRUCTION proof: LBA0 (incl. 0x55AA) + the ISO9660 magic are identical ──
+    assert after[:SEC] == before[:SEC]
+    assert after[0x1FE:0x200] == before[0x1FE:0x200] == b"\x55\xAA"
+    assert after[0x8001:0x8006] == before[0x8001:0x8006] == b"CD001"
+
+
+def test_grow_gpt_mbr_isohybrid_is_skipped_not_converted(tmp_path):
+    """An MBR isohybrid (no 'EFI PART' at LBA1) must be LEFT to the Live-OS parted
+    path: the relocate detects the missing GPT signature and returns False WITHOUT
+    writing a single byte (it must never convert the table)."""
+    device_sectors = 131072
+    path = str(tmp_path / "mbr.img")
+    _build_synthetic_gpt_device(path, device_sectors, 32768, 32000, valid_gpt=False)
+    before = open(path, "rb").read()
+    with open(path, "rb+") as h:
+        ok = flasher._grow_gpt_to_device_end(h, device_sectors,
+                                             32768 * flasher.SECTOR, log=lambda m: None)
+    assert ok is False
+    assert open(path, "rb").read() == before                 # not one byte written
+
+
+def test_grow_gpt_idempotent_when_backup_already_at_device_end(tmp_path):
+    """If the backup GPT is ALREADY at the device end (a second flash, or a stick
+    written directly to the full disk), the relocate is a clean no-op that returns
+    True and changes nothing."""
+    SEC = flasher.SECTOR
+    device_sectors = 131072
+    path = str(tmp_path / "full.img")
+    # iso_sectors == device_sectors -> last_usable_old already == device_sectors-34.
+    _build_synthetic_gpt_device(path, device_sectors, device_sectors, 130000)
+    before = open(path, "rb").read()
+    with open(path, "rb+") as h:
+        ok = flasher._grow_gpt_to_device_end(h, device_sectors,
+                                             device_sectors * SEC, log=lambda m: None)
+    assert ok is True
+    assert open(path, "rb").read() == before                 # idempotent: nothing rewritten
+
+
+def test_grow_gpt_clamps_entry_past_iso_bound_and_fixes_array_crc(tmp_path):
+    """Defensive clamp: a USED entry whose EndingLBA runs PAST the ISO image bound is
+    capped to the ISO's last LBA, the array CRC is recomputed, and BOTH the primary
+    and the backup entry arrays on disk are rewritten so their CRCs stay consistent."""
+    SEC = flasher.SECTOR
+    device_sectors = 131072
+    iso_sectors = 32768
+    past = iso_sectors + 500                                  # EndingLBA beyond the ISO bound
+    path = str(tmp_path / "clamp.img")
+    _build_synthetic_gpt_device(path, device_sectors, iso_sectors, entry_ending_lba=past)
+    with open(path, "rb+") as h:
+        ok = flasher._grow_gpt_to_device_end(h, device_sectors,
+                                             iso_sectors * SEC, log=lambda m: None)
+    assert ok is True
+    after = open(path, "rb").read()
+
+    iso_last_lba = iso_sectors - 1
+    # primary entry EndingLBA clamped on disk
+    prim_arr = after[2 * SEC: 2 * SEC + _GPT_NUM * _GPT_ESIZE]
+    assert _struct.unpack_from("<Q", prim_arr, 40)[0] == iso_last_lba
+    # backup entry array (tail) clamped identically
+    barr = after[(device_sectors - 33) * SEC:(device_sectors - 33) * SEC + _GPT_NUM * _GPT_ESIZE]
+    assert _struct.unpack_from("<Q", barr, 40)[0] == iso_last_lba
+    assert barr == prim_arr
+    # the recomputed array CRC in the primary header matches the on-disk array
+    expect_crc = _zlib.crc32(prim_arr) & 0xFFFFFFFF
+    prim_hdr = after[SEC:SEC + 512]
+    assert _struct.unpack_from("<I", prim_hdr, 88)[0] == expect_crc
+    sig_ok, crc_ok = _validate_gpt_header(prim_hdr)
+    assert sig_ok and crc_ok                                 # header CRC still valid after the edit
+
+
+def test_windows_carve_relocates_gpt_before_diskpart(monkeypatch):
+    """The dispatcher must run the GPT relocate (the sgdisk -e equivalent) BEFORE the
+    diskpart carve when an exact ISO size is known — that ORDER is the whole fix: the
+    relocate reveals the tail, then diskpart carves it."""
+    monkeypatch.setattr(flasher, "IS_WIN", True)
+    order = []
+    monkeypatch.setattr(flasher, "_windows_grow_gpt_to_device_end",
+                        lambda disk, iso_bytes, log: order.append(("grow", iso_bytes)) or True)
+    monkeypatch.setattr(flasher, "_create_log_partition_windows",
+                        lambda disk, log: order.append(("diskpart",)) or True)
+    flasher.create_log_partition({"number": 1}, lambda m: None, iso_bytes=7030001664)
+    assert order == [("grow", 7030001664), ("diskpart",)], \
+        "the GPT relocate must run BEFORE the diskpart carve"
+
+
+def test_windows_carve_skips_grow_without_iso_size(monkeypatch):
+    """Legacy 2-arg callers (no iso_bytes) must NOT trigger the relocate — they fall
+    straight through to the diskpart carve, preserving the old behaviour."""
+    monkeypatch.setattr(flasher, "IS_WIN", True)
+    called = {"grow": 0}
+    monkeypatch.setattr(flasher, "_windows_grow_gpt_to_device_end",
+                        lambda *a, **k: called.__setitem__("grow", called["grow"] + 1) or True)
+    monkeypatch.setattr(flasher, "_create_log_partition_windows", lambda disk, log: True)
+    flasher.create_log_partition({"number": 1}, lambda m: None)   # no iso_bytes
+    assert called["grow"] == 0
+
+
+def test_windows_grow_skips_when_device_size_unknown(monkeypatch):
+    """If the exact device size can't be read (IOCTL failed), the relocate is a clean
+    skip — it must NOT open the raw device or rewrite any GPT (a rounded size would
+    place the backup header off the true end = an invalid GPT)."""
+    monkeypatch.setattr(flasher, "_windows_device_size_bytes", lambda num, log: 0)
+    opened = {"n": 0}
+    monkeypatch.setattr(flasher, "_open_seekable_raw",
+                        lambda *a, **k: opened.__setitem__("n", opened["n"] + 1))
+    logs = []
+    ok = flasher._windows_grow_gpt_to_device_end({"number": 1, "physdrive": r"\\.\PhysicalDrive1"},
+                                                 7030001664, logs.append)
+    assert ok is False
+    assert opened["n"] == 0                                   # never touched the raw device
+    assert any("no exact device size" in m for m in logs)
+
+
+# ─────────── #128: post-carve boot-signature re-verify (abort-on-change) ───────────
+# The carve rewrites the GPT (relocate) + runs diskpart (create/format) — the step
+# that historically corrupted a freshly-flashed stick's EFI/GPT. reverify_boot_sigs_
+# after_carve re-reads the ISO9660 'CD001' magic (@0x8001) + the 0x55AA boot sig
+# (@0x1FE) AFTER the carve and is TRI-STATE: True=intact, False=definitively changed
+# (abort), None=could-not-read (indeterminate, never a false brick). flash() flips
+# its result to FAILED only on a definitive False.
+
+
+def _reads(mapping):
+    """A read_at stand-in that answers by offset from a {offset: bytes} map."""
+    def fake_read_at(dev, offset, n, dd):
+        return mapping[offset][:n]
+    return fake_read_at
+
+
+def test_reverify_true_when_both_sigs_intact(monkeypatch):
+    """A clean read showing CD001 @0x8001 + 0x55AA @0x1FE returns True — the carve
+    left the boot image untouched."""
+    monkeypatch.setattr(flasher, "read_at",
+                        _reads({0x8001: b"CD001", 0x1FE: b"\x55\xAA"}))
+    v = flasher.reverify_boot_sigs_after_carve(
+        {"physdrive": r"\\.\PhysicalDrive1"}, None, lambda m: None)
+    assert v is True
+
+
+def test_reverify_false_when_boot_sig_changed(monkeypatch):
+    """A clean read where the 0x55AA boot sig was overwritten returns False — the
+    DEFINITIVE 'carve corrupted the boot image' verdict that must abort the flash."""
+    monkeypatch.setattr(flasher, "read_at",
+                        _reads({0x8001: b"CD001", 0x1FE: b"\x00\x00"}))
+    logs = []
+    v = flasher.reverify_boot_sigs_after_carve(
+        {"physdrive": r"\\.\PhysicalDrive1"}, None, logs.append)
+    assert v is False
+    assert any("CHANGED" in m for m in logs)
+
+
+def test_reverify_false_when_iso9660_magic_changed(monkeypatch):
+    """The ISO9660 'CD001' magic being clobbered is equally a definitive False."""
+    monkeypatch.setattr(flasher, "read_at",
+                        _reads({0x8001: b"XXXXX", 0x1FE: b"\x55\xAA"}))
+    v = flasher.reverify_boot_sigs_after_carve(
+        {"physdrive": r"\\.\PhysicalDrive1"}, None, lambda m: None)
+    assert v is False
+
+
+def test_reverify_indeterminate_on_busy_device_no_false_brick(monkeypatch):
+    """If the device can NEVER be read (a persistent post-format 'device not ready'
+    transient), the verdict is None — INDETERMINATE — so the caller does NOT claim a
+    brick on a read failure. Retries the winerror-32/21/5 transient with backoff."""
+    monkeypatch.setattr(flasher, "IS_WIN", True)
+    monkeypatch.setattr(flasher.time, "sleep", lambda *_: None)   # no real wait
+    busy = OSError("sharing violation")
+    busy.winerror = 32
+
+    def always_busy(dev, offset, n, dd):
+        raise busy
+    monkeypatch.setattr(flasher, "read_at", always_busy)
+    logs = []
+    v = flasher.reverify_boot_sigs_after_carve(
+        {"physdrive": r"\\.\PhysicalDrive1"}, None, logs.append, tries=3)
+    assert v is None                                             # never False on a read error
+    assert any("indeterminate" in m for m in logs)
+
+
+def test_reverify_retries_then_succeeds_after_transient(monkeypatch):
+    """A transient 'not ready' (winerror 21) on the first read, then a clean read,
+    must resolve to a real verdict (True) — proving the transient is handled, not
+    fatal."""
+    monkeypatch.setattr(flasher, "IS_WIN", True)
+    monkeypatch.setattr(flasher.time, "sleep", lambda *_: None)
+    state = {"n": 0}
+
+    def flaky(dev, offset, n, dd):
+        # First CALL of the first attempt raises NOT_READY; subsequent reads are clean.
+        state["n"] += 1
+        if state["n"] == 1:
+            e = OSError("not ready")
+            e.winerror = 21
+            raise e
+        return {0x8001: b"CD001", 0x1FE: b"\x55\xAA"}[offset][:n]
+    monkeypatch.setattr(flasher, "read_at", flaky)
+    v = flasher.reverify_boot_sigs_after_carve(
+        {"physdrive": r"\\.\PhysicalDrive1"}, None, lambda m: None)
+    assert v is True
+
+
+def test_reverify_short_read_is_indeterminate(monkeypatch):
+    """A short read (device not settled — fewer bytes than the signature) is treated
+    as indeterminate (None), never as a corrupted signature."""
+    monkeypatch.setattr(flasher, "IS_WIN", True)
+    monkeypatch.setattr(flasher.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(flasher, "read_at",
+                        _reads({0x8001: b"CD", 0x1FE: b""}))       # truncated
+    v = flasher.reverify_boot_sigs_after_carve(
+        {"physdrive": r"\\.\PhysicalDrive1"}, None, lambda m: None, tries=2)
+    assert v is None
+
+
+def test_flash_aborts_when_post_carve_reverify_fails(monkeypatch):
+    """END-TO-END abort: a successful verify + carve, but the POST-carve re-verify
+    finds a changed boot sig -> flash() must flip its result to FAILED so the user
+    re-flashes rather than booting a silently-corrupted stick."""
+    order = _stub_flash_machinery(monkeypatch, verify_result=True)
+    monkeypatch.setattr(flasher, "reverify_boot_sigs_after_carve",
+                        lambda disk, dd, log, **k: False)
+    logs = []
+    ok = flasher.flash("tag", "desktop",
+                       {"number": 1, "model": "USB", "dev": "/dev/sdb",
+                        "physdrive": "/dev/sdb"},
+                       "download", "/tmp", log=logs.append,
+                       make_log_partition=True)
+    assert ok is False, "a definitive post-carve boot-sig change must fail the flash"
+    assert order == ["verify", "carve"]
+    assert any("POST-CARVE CHECK FAILED" in m for m in logs)
+
+
+def test_flash_indeterminate_reverify_keeps_success(monkeypatch):
+    """An INDETERMINATE post-carve re-verify (None — device busy) must NOT turn a
+    successful flash into a failure (no false brick claim)."""
+    _stub_flash_machinery(monkeypatch, verify_result=True)
+    monkeypatch.setattr(flasher, "reverify_boot_sigs_after_carve",
+                        lambda disk, dd, log, **k: None)
+    ok = flasher.flash("tag", "desktop",
+                       {"number": 1, "model": "USB", "dev": "/dev/sdb",
+                        "physdrive": "/dev/sdb"},
+                       "download", "/tmp", log=lambda m: None,
+                       make_log_partition=True)
+    assert ok is True
+
+
+def test_flash_no_reverify_on_default_path(monkeypatch):
+    """The post-carve re-verify only runs on the opt-in carve path. A default flash
+    (no make_log_partition) must NOT call reverify_boot_sigs_after_carve at all."""
+    _stub_flash_machinery(monkeypatch, verify_result=True)
+    called = {"n": 0}
+    monkeypatch.setattr(flasher, "reverify_boot_sigs_after_carve",
+                        lambda *a, **k: called.__setitem__("n", called["n"] + 1) or True)
+    ok = flasher.flash("tag", "desktop",
+                       {"number": 1, "model": "USB", "dev": "/dev/sdb",
+                        "physdrive": "/dev/sdb"},
+                       "download", "/tmp", log=lambda m: None)
+    assert ok is True
+    assert called["n"] == 0, "no post-carve re-verify when the carve never ran"
 
 
 # ─────────── _WinExclusiveWriter.write_at byte-placement ───────────

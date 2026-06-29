@@ -635,6 +635,19 @@ def stream_producer(gh, asset_id):
 
 
 # ───────────────────────── verification ─────────────────────────
+# The on-disk boot-image contract — ONE source of truth shared by the pre-write
+# verify, the post-carve re-verify, and the GPT-relocate non-destruction proof.
+# A correctly written HART OS isohybrid carries the ISO9660 ``CD001`` magic at
+# 0x8001 (the primary volume descriptor, LBA 16 in 2048 B sectors) and the
+# protective-MBR ``0x55AA`` boot signature at 0x1FE (the last two bytes of LBA 0).
+# The #128 GPT relocate writes ONLY LBA 1 + the device tail, so BOTH of these
+# bytes must survive the carve byte-for-byte; the re-verify proves it.
+ISO9660_MAGIC_OFFSET = 0x8001
+ISO9660_MAGIC = b"CD001"
+BOOT_SIG_OFFSET = 0x1FE
+BOOT_SIG = b"\x55\xAA"
+
+
 def read_at(dev_or_phys, offset, n, dd):
     if dd:
         # Binary capture (no text decode) so the 0x55AA boot sig isn't mangled.
@@ -653,13 +666,58 @@ def read_at(dev_or_phys, offset, n, dd):
 
 def verify_iso(disk, dd, log):
     dev = disk["dev"] if dd else disk["physdrive"]
-    cd = read_at(dev, 0x8001, 5, dd)
-    boot = read_at(dev, 0x1FE, 2, dd)
-    ok_cd = cd == b"CD001"
-    ok_boot = boot == b"\x55\xAA"
+    cd = read_at(dev, ISO9660_MAGIC_OFFSET, len(ISO9660_MAGIC), dd)
+    boot = read_at(dev, BOOT_SIG_OFFSET, len(BOOT_SIG), dd)
+    ok_cd = cd == ISO9660_MAGIC
+    ok_boot = boot == BOOT_SIG
     log("  ISO9660 @0x8001: %r %s" % (cd, "OK" if ok_cd else "FAIL"))
     log("  boot sig @0x1FE: %r %s" % (boot, "OK" if ok_boot else "FAIL"))
     return ok_cd and ok_boot
+
+
+def reverify_boot_sigs_after_carve(disk, dd, log, tries=5):
+    """Re-read the boot signatures AFTER the HARTLOG carve to PROVE the carve did
+    not clobber the boot image. The carve (GPT relocate + diskpart create/format)
+    is non-destructive by construction — the relocate writes only LBA 1 + the
+    device tail, and diskpart only touches the freed tail — so this is the belt-
+    and-suspenders runtime proof of that invariant.
+
+    Tri-state so a transient read never gets mistaken for corruption:
+      True  — both signatures are present on a clean read (carve was safe).
+      False — a signature is DEFINITIVELY changed/absent on a clean read (the
+              carve corrupted the boot image; the stick is suspect → re-flash).
+      None  — the device could not be read (busy / "device not ready" right after
+              a diskpart format) → INDETERMINATE; the caller must NOT treat this
+              as corruption (no false brick claim).
+
+    Retries the post-format Windows transient (ERROR_SHARING_VIOLATION 32 /
+    ERROR_NOT_READY 21 / ERROR_ACCESS_DENIED 5) and a short read with the same
+    backoff the GPT-relocate open uses, so a slow stick settling after the format
+    resolves to a real verdict rather than a spurious failure."""
+    dev = disk["dev"] if dd else disk["physdrive"]
+    last = None
+    for attempt in range(tries):
+        try:
+            cd = read_at(dev, ISO9660_MAGIC_OFFSET, len(ISO9660_MAGIC), dd)
+            boot = read_at(dev, BOOT_SIG_OFFSET, len(BOOT_SIG), dd)
+        except OSError as e:
+            last = e
+            if getattr(e, "winerror", None) in (32, 21, 5) or not IS_WIN:
+                time.sleep(1 + attempt)
+                continue
+            break
+        if len(cd) < len(ISO9660_MAGIC) or len(boot) < len(BOOT_SIG):
+            last = "short read (device not settled)"
+            time.sleep(1 + attempt)
+            continue
+        ok_cd = cd == ISO9660_MAGIC
+        ok_boot = boot == BOOT_SIG
+        log("  post-carve ISO9660 @0x8001: %r %s" % (cd, "OK" if ok_cd else "CHANGED"))
+        log("  post-carve boot sig @0x1FE: %r %s" % (boot, "OK" if ok_boot else "CHANGED"))
+        return ok_cd and ok_boot
+    log("  post-carve re-verify: could not read the device to re-check (%s) - "
+        "indeterminate, NOT treating as corruption" % last)
+    return None
 
 
 # ───────────────────────── HARTLOG diagnostic-log partition ─────────────────────────
@@ -673,7 +731,7 @@ def verify_iso(disk, dd, log):
 LOG_PART_LABEL = "HARTLOG"
 
 
-def create_log_partition(disk, log):
+def create_log_partition(disk, log, iso_bytes=0):
     """Carve a FAT32 HARTLOG partition into the stick's FREE SPACE (host-side).
 
     DISPATCHER: routes to the OS-appropriate backend. This is OFF by default in
@@ -687,17 +745,331 @@ def create_log_partition(disk, log):
     function returns False without raising. The flash is already bootable; the log
     partition is a debug convenience.
 
-      Windows    -> _create_log_partition_windows (legacy diskpart carve)
+      Windows    -> _windows_grow_gpt_to_device_end (the sgdisk -e equivalent:
+                    relocate the backup GPT to the device's TRUE last LBA so the
+                    trailing free tail a dd-written isohybrid hid becomes visible)
+                    THEN _create_log_partition_windows (diskpart carves that tail)
       Linux/macOS-> _create_log_partition_unix (sgdisk: relocate the backup GPT to
                     the true device end, then carve the trailing free tail)
+
+    `iso_bytes` is the exact assembled ISO length (flash() passes `total`). The
+    Windows path needs it to relocate the backup GPT correctly; absent it (legacy
+    2-arg callers) the Windows relocate is skipped and diskpart runs as before.
 
     The canonical, OS-independent home for the carve is the Live-OS module
     (nixos/modules/hart-hartlog-create.nix); a Windows-flashed stick is therefore
     still covered on its first boot.
     """
     if IS_WIN:
+        # THE #128 fix. A dd-written isohybrid GPT ISO leaves the BACKUP GPT header
+        # at the ISO image's last LBA (mid-stick), so the PRIMARY header at LBA1
+        # caps LastUsableLBA at the ISO boundary and diskpart sees NO free tail
+        # ("not enough usable free space") -> the carve no-ops (the "partition 1 is
+        # the WHOLE 29 GB stick" symptom). Relocate the backup GPT to the device's
+        # TRUE last LBA first (std-lib, non-destructive: writes ONLY LBA1 + the
+        # device tail) so the diskpart carve below sees the revealed free tail.
+        if iso_bytes:
+            try:
+                _windows_grow_gpt_to_device_end(disk, iso_bytes, log)
+            except Exception as e:                # never let the relocate fail the flash
+                log("  HARTLOG grow: ignored error (%s) - continuing to the diskpart "
+                    "carve (flash is complete + bootable)" % e)
         return _create_log_partition_windows(disk, log)
     return _create_log_partition_unix(disk, log)
+
+
+# ── #128: the sgdisk -e equivalent on Windows (pure std-lib GPT relocate) ──
+# A dd-written isohybrid GPT ISO writes its BACKUP (secondary) GPT header at the
+# ISO image's last LBA (e.g. ~6.55 GB), NOT at the physical end of the stick (e.g.
+# ~29 GB). The PRIMARY header at LBA1 therefore advertises LastUsableLBA = the ISO
+# boundary, so diskpart sees no usable free space in the multi-GB trailing tail and
+# its `create partition` no-ops. The fix mirrors what the Linux/macOS path already
+# does with `sgdisk -e`: relocate the backup GPT to the device's TRUE last LBA
+# (which rewrites the primary header's LastUsableLBA), revealing the tail, then let
+# the existing diskpart carve run. This is a pure std-lib rewrite (struct + zlib)
+# so the flasher stays self-contained, and it is split into a pure-logic core
+# (_grow_gpt_to_device_end, driven by a seekable handle so a temp-file fixture can
+# test it) + the Windows IO wrapper (_windows_grow_gpt_to_device_end).
+GPT_SIGNATURE = b"EFI PART"
+
+
+def _windows_device_size_bytes(disk_number, log):
+    """Exact device byte length via IOCTL_DISK_GET_LENGTH_INFO (std-lib ctypes, the
+    _WinExclusiveWriter WinDLL pattern). Sector-EXACT — unlike the diskpart
+    `list disk` fallback which rounds to whole GB; a rounded size would place the
+    relocated backup header off the true device end = an INVALID GPT, so we trust
+    ONLY this IOCTL and skip the relocate if it fails. Returns int bytes, or 0 when
+    the size could not be determined."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception as e:
+        log("  HARTLOG grow: ctypes unavailable (%s)" % e)
+        return 0
+    try:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateFileW.restype = wintypes.HANDLE
+        k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.HANDLE]
+        k.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID,
+                                      wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                      ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+        k.DeviceIoControl.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        invalid = wintypes.HANDLE(-1).value
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_RW = 0x00000001 | 0x00000002        # READ | WRITE
+        OPEN_EXISTING = 3
+        IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
+        h = k.CreateFileW(r"\\.\PhysicalDrive%d" % disk_number, GENERIC_READ,
+                          FILE_SHARE_RW, None, OPEN_EXISTING, 0, None)
+        if h == invalid:
+            log("  HARTLOG grow: could not open PhysicalDrive%d for the size query "
+                "(err %d)" % (disk_number, ctypes.get_last_error()))
+            return 0
+        try:
+            length = ctypes.c_longlong(0)
+            returned = wintypes.DWORD(0)
+            ok = k.DeviceIoControl(h, IOCTL_DISK_GET_LENGTH_INFO, None, 0,
+                                   ctypes.byref(length), ctypes.sizeof(length),
+                                   ctypes.byref(returned), None)
+            if not ok:
+                log("  HARTLOG grow: IOCTL_DISK_GET_LENGTH_INFO failed (err %d)"
+                    % ctypes.get_last_error())
+                return 0
+            return int(length.value)
+        finally:
+            k.CloseHandle(h)
+    except Exception as e:
+        log("  HARTLOG grow: device-size query errored (%s)" % e)
+        return 0
+
+
+def _open_seekable_raw(physdrive, log):
+    """Open a raw block device as an UNBUFFERED seekable binary handle (rb+) for the
+    GPT relocate. Retries the Windows post-flash transient (the volume manager
+    briefly holds the drive: ERROR_SHARING_VIOLATION 32 / ERROR_NOT_READY 21 /
+    ERROR_ACCESS_DENIED 5) with the same backoff _WinExclusiveWriter uses. Returns
+    the handle, or None on failure (never raises)."""
+    flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+    last = None
+    for attempt in range(6):
+        try:
+            fd = os.open(physdrive, flags)
+            return os.fdopen(fd, "rb+", buffering=0)
+        except OSError as e:
+            last = e
+            if getattr(e, "winerror", None) not in (32, 21, 5):
+                break
+            time.sleep(2 + attempt)                    # 2,3,4,5,6s — let the VM release
+    log("  HARTLOG grow: could not open %s for the GPT relocate (%s) - skipped "
+        "(flash is complete + bootable)" % (physdrive, last))
+    return None
+
+
+def _read_exact(handle, n):
+    """Read exactly n bytes from a seekable handle (a raw-device read can return a
+    sector-multiple short of the request). Returns what it got at EOF."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = handle.read(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return bytes(buf)
+
+
+def _pad_to_sector(b):
+    """Zero-pad bytes up to the next 512 B boundary (raw block writes are sector-
+    aligned). A whole-sector input is returned unchanged."""
+    if len(b) % SECTOR:
+        return bytes(b) + b"\x00" * (SECTOR - len(b) % SECTOR)
+    return bytes(b)
+
+
+def _set_gpt_header_crc(hdr, header_size):
+    """Zero the HeaderCRC32 field, CRC32 the first header_size bytes, store it back
+    (the GPT header-checksum protocol). hdr is a mutable bytearray of >= one sector."""
+    import struct
+    import zlib
+    struct.pack_into("<I", hdr, 16, 0)
+    crc = zlib.crc32(bytes(hdr[:header_size])) & 0xFFFFFFFF
+    struct.pack_into("<I", hdr, 16, crc)
+
+
+def _grow_gpt_to_device_end(handle, device_sectors, iso_bytes, log):
+    """Relocate the backup GPT to the device's TRUE last LBA — the std-lib
+    equivalent of `sgdisk -e`. After a dd-written isohybrid GPT ISO the backup GPT
+    header sits at the ISO image's last LBA (mid-stick) and the primary header caps
+    LastUsableLBA at the ISO boundary, so a diskpart `create partition` sees NO
+    trailing free space. This rewrites the primary header's LastUsableLBA +
+    AlternateLBA to the real device end and writes a fresh backup GPT (entry array +
+    header) at the device tail, revealing the free tail.
+
+    Operates ONLY on a seekable binary `handle` (.seek/.read/.write) so a temp-file
+    fixture can drive it (the SRP/testability boundary). It writes ONLY LBA 1 (the
+    primary header), the backup entry array, and the backup header at the device
+    tail — NEVER LBA 0 (the protective-MBR 0x55AA boot sig) and NEVER the ISO9660
+    data (the GPT lives in the iso9660 system area, which ISO9660 ignores; CD001 at
+    0x8001 = LBA 64 is untouched). The stale mid-device backup GPT is left as
+    harmless data (a reader follows the primary's AlternateLBA to the real one).
+
+    Returns True on a clean relocate (or a no-op when the backup is already at the
+    device end), False on a clean skip (no/invalid GPT = an MBR isohybrid, which we
+    NEVER convert; the Live OS parted path then carves HARTLOG on first boot).
+    Best-effort; the caller also wraps it so it can never fail the already-bootable
+    flash.
+    """
+    import struct
+    import zlib
+
+    handle.seek(SECTOR)                              # LBA 1 = primary GPT header
+    hdr = bytearray(_read_exact(handle, SECTOR))
+    if len(hdr) < 92 or bytes(hdr[0:8]) != GPT_SIGNATURE:
+        log("  HARTLOG grow: no GPT signature at LBA1 (MBR isohybrid?) - skipped; "
+            "the Live OS parted path carves HARTLOG on first boot")
+        return False
+    header_size = struct.unpack_from("<I", hdr, 12)[0]
+    if header_size < 92 or header_size > SECTOR:
+        log("  HARTLOG grow: implausible GPT header size %d - skipped" % header_size)
+        return False
+    my_lba          = struct.unpack_from("<Q", hdr, 24)[0]
+    first_usable    = struct.unpack_from("<Q", hdr, 40)[0]
+    last_usable_old = struct.unpack_from("<Q", hdr, 48)[0]
+    part_entry_lba  = struct.unpack_from("<Q", hdr, 72)[0]
+    num_entries     = struct.unpack_from("<I", hdr, 80)[0]
+    entry_size      = struct.unpack_from("<I", hdr, 84)[0]
+    array_crc_old   = struct.unpack_from("<I", hdr, 88)[0]
+    if my_lba != 1:
+        log("  HARTLOG grow: primary MyLBA=%d (expected 1) - skipped" % my_lba)
+        return False
+    if num_entries == 0 or num_entries > 1024 or entry_size < 128 or entry_size % 8:
+        log("  HARTLOG grow: implausible entry array (%d x %d) - skipped"
+            % (num_entries, entry_size))
+        return False
+
+    array_bytes      = num_entries * entry_size
+    array_sectors    = (array_bytes + SECTOR - 1) // SECTOR
+    backup_hdr_lba   = device_sectors - 1
+    backup_array_lba = backup_hdr_lba - array_sectors
+    new_last_usable  = backup_array_lba - 1
+
+    if new_last_usable == last_usable_old:
+        log("  HARTLOG grow: backup GPT already at the device end "
+            "(last_usable=%d) - no relocate needed" % last_usable_old)
+        return True
+    if new_last_usable < last_usable_old:
+        log("  HARTLOG grow: device end (last_usable %d) is not beyond the current "
+            "GPT (%d) - skipped (nothing to reveal)"
+            % (new_last_usable, last_usable_old))
+        return False
+    if backup_array_lba <= first_usable:
+        log("  HARTLOG grow: device too small for a backup GPT past the data - skipped")
+        return False
+
+    # Read the primary partition entry array.
+    handle.seek(part_entry_lba * SECTOR)
+    array = bytearray(_read_exact(handle, array_bytes))
+    if len(array) < array_bytes:
+        log("  HARTLOG grow: short read of the GPT entry array - skipped")
+        return False
+
+    # Defensive clamp: cap any USED entry whose EndingLBA runs past the ISO image
+    # bound. The build-time GPT already sizes partition 1 to the ISO, so this is
+    # normally a no-op — it only guards a malformed table from describing space past
+    # the data we just wrote.
+    array_changed = False
+    iso_last_lba = (iso_bytes // SECTOR - 1) if iso_bytes else 0
+    if iso_last_lba > 0:
+        zero16 = b"\x00" * 16
+        for i in range(num_entries):
+            base = i * entry_size
+            if bytes(array[base:base + 16]) == zero16:
+                continue                              # unused slot
+            ending = struct.unpack_from("<Q", array, base + 40)[0]
+            if ending > iso_last_lba:
+                struct.pack_into("<Q", array, base + 40, iso_last_lba)
+                array_changed = True
+    array_crc = (zlib.crc32(bytes(array)) & 0xFFFFFFFF) if array_changed else array_crc_old
+
+    # New PRIMARY header (LBA 1): extend AlternateLBA + LastUsableLBA to the device end.
+    new_primary = bytearray(hdr)
+    struct.pack_into("<Q", new_primary, 32, backup_hdr_lba)     # AlternateLBA
+    struct.pack_into("<Q", new_primary, 48, new_last_usable)    # LastUsableLBA
+    struct.pack_into("<I", new_primary, 88, array_crc)
+    _set_gpt_header_crc(new_primary, header_size)
+
+    # New BACKUP header (LBA device_sectors-1): mirror, with MyLBA/AlternateLBA
+    # swapped + PartitionEntryLBA pointing at the tail array.
+    new_backup = bytearray(hdr)
+    struct.pack_into("<Q", new_backup, 24, backup_hdr_lba)      # MyLBA
+    struct.pack_into("<Q", new_backup, 32, 1)                   # AlternateLBA = primary
+    struct.pack_into("<Q", new_backup, 48, new_last_usable)     # LastUsableLBA
+    struct.pack_into("<Q", new_backup, 72, backup_array_lba)    # PartitionEntryLBA
+    struct.pack_into("<I", new_backup, 88, array_crc)
+    _set_gpt_header_crc(new_backup, header_size)
+
+    # WRITE: primary header @LBA1, backup entry array + backup header at the tail.
+    # If we clamped an entry, the primary array on disk is now stale vs the new CRC,
+    # so rewrite it too. Whole-sector writes at sector-aligned offsets ONLY.
+    handle.seek(1 * SECTOR)
+    handle.write(_pad_to_sector(new_primary))
+    handle.seek(backup_array_lba * SECTOR)
+    handle.write(_pad_to_sector(array))
+    if array_changed:
+        handle.seek(part_entry_lba * SECTOR)
+        handle.write(_pad_to_sector(array))
+    handle.seek(backup_hdr_lba * SECTOR)
+    handle.write(_pad_to_sector(new_backup))
+    try:
+        handle.flush()
+    except Exception:
+        pass
+    log("  HARTLOG grow: relocated the backup GPT to LBA %d (device end); "
+        "last_usable %d -> %d - the trailing free tail is now visible to the "
+        "diskpart carve" % (backup_hdr_lba, last_usable_old, new_last_usable))
+    return True
+
+
+def _windows_grow_gpt_to_device_end(disk, iso_bytes, log):
+    """Windows wrapper for the GPT relocate: get the sector-exact device size (IOCTL),
+    open a seekable raw handle (with the post-flash transient backoff), run
+    _grow_gpt_to_device_end, fsync + close. Best-effort; NEVER raises — any failure
+    is a logged skip (the diskpart carve then no-ops and the Live OS still carves
+    HARTLOG on first boot). Returns the relocate result (bool)."""
+    number = disk["number"]
+    physdrive = disk.get("physdrive") or (r"\\.\PhysicalDrive%d" % number)
+    dev_bytes = _windows_device_size_bytes(number, log)
+    if dev_bytes <= 0:
+        log("  HARTLOG grow: no exact device size - skipped (the diskpart carve will "
+            "no-op; the Live OS carves HARTLOG on first boot)")
+        return False
+    device_sectors = dev_bytes // SECTOR
+    iso_sectors = (iso_bytes // SECTOR) if iso_bytes else 0
+    if iso_sectors and device_sectors <= iso_sectors + 34:
+        log("  HARTLOG grow: device (%d sectors) is not larger than the ISO "
+            "(%d sectors) - skipped (no trailing tail to reveal)"
+            % (device_sectors, iso_sectors))
+        return False
+    handle = _open_seekable_raw(physdrive, log)
+    if handle is None:
+        return False
+    try:
+        return _grow_gpt_to_device_end(handle, device_sectors, iso_bytes, log)
+    finally:
+        try:
+            handle.flush()
+        except Exception:
+            pass
+        try:
+            os.fsync(handle.fileno())
+        except Exception:
+            pass
+        try:
+            handle.close()
+        except Exception:
+            pass
 
 
 def _create_log_partition_windows(disk, log):
@@ -718,6 +1090,10 @@ def _create_log_partition_windows(disk, log):
     # format so it's fast; `assign` lets Windows mount it now (a drive letter is
     # harmless and lets the user open it immediately after replug).
     script = "\n".join([
+        # rescan FIRST so diskpart re-reads the now-valid full-disk GPT the
+        # _windows_grow_gpt_to_device_end relocate exposed (the trailing free tail);
+        # without it diskpart may still hold the stale, ISO-capped view.
+        "rescan",
         "select disk %d" % disk["number"],
         "create partition primary",
         "format fs=fat32 label=%s quick" % LOG_PART_LABEL,
@@ -959,15 +1335,36 @@ def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
     # after a successful flash by default - never risk bricking the very stick we
     # flashed. The opt-in host-side carve (--windows-log-partition / make_log_partition)
     # is a pre-seed so the host can read the log even BEFORE the first boot: on
-    # Windows it runs the legacy diskpart path; on Linux/macOS it runs the SAFE
-    # sgdisk relocate-then-carve. It is gated on the verify passing and NEVER raises.
+    # Linux/macOS it runs the SAFE sgdisk relocate-then-carve; on Windows it now
+    # FIRST relocates the backup GPT to the device's true end (std-lib, non-
+    # destructive: writes only LBA1 + the device tail — the #128 fix) so diskpart
+    # sees the revealed free tail, THEN carves it. `total` is the exact ISO byte
+    # length the relocate needs. Gated on the verify passing; NEVER raises.
     if ok and make_log_partition:
         log("Creating HARTLOG diagnostic-log partition in the free space "
             "(opt-in host-side pre-seed; the Live OS normally creates it itself)...")
         try:
-            create_log_partition(disk, log)
+            create_log_partition(disk, log, total)
         except Exception as e:                   # the carve can NEVER fail the flash
             log("  HARTLOG partition: ignored error (%s) - flash is complete + bootable" % e)
+        # POST-CARVE SAFETY RE-VERIFY (#128). The carve rewrote the GPT (relocate)
+        # and ran diskpart (create/format) — the exact step that historically
+        # corrupted a freshly-flashed stick's EFI/GPT. Re-read the boot signatures
+        # to PROVE the boot image is intact: a DEFINITIVE change ABORTS (flips the
+        # flash result to FAILED) so the user re-flashes rather than booting a
+        # silently-bricked stick; an indeterminate read (device still settling after
+        # the format) leaves the result untouched (never a false brick claim).
+        log("Re-verifying boot signatures after the HARTLOG carve...")
+        verdict = reverify_boot_sigs_after_carve(disk, dd, log)
+        if verdict is False:
+            log("!! POST-CARVE CHECK FAILED: a boot signature CHANGED after the "
+                "HARTLOG carve - the stick may NOT boot. RE-FLASH it (the host-side "
+                "carve is opt-in + best-effort; the Live OS creating HARTLOG on first "
+                "boot is the safe default).")
+            ok = False
+        elif verdict is True:
+            log("Post-carve re-verify OK - boot signatures intact; the HARTLOG carve "
+                "did not disturb the ISO image.")
     else:
         log("HARTLOG partition: not created host-side (default) - the Live OS "
             "creates it itself on first boot, which can't corrupt the stick's "
@@ -1104,10 +1501,12 @@ def build_parser():
                         "partition in the stick's free space, right after the flash. "
                         "OFF by default: the Live OS creates HARTLOG itself on first "
                         "boot (Linux-side, safe). On Linux/macOS this opt-in runs the "
-                        "SAFE sgdisk relocate-then-carve; on Windows it runs the "
-                        "LEGACY diskpart path, which hung on a wedged VDS AND "
-                        "corrupted a freshly-flashed stick's EFI/GPT (use it only if "
-                        "you specifically need a host-readable log before first boot).")
+                        "SAFE sgdisk relocate-then-carve; on Windows it FIRST relocates "
+                        "the backup GPT to the device's true end (std-lib, non-"
+                        "destructive: writes only LBA1 + the device tail) so the "
+                        "trailing free tail a dd-written isohybrid hid becomes visible, "
+                        "THEN diskpart carves it. Best-effort + real-HW-gated: it can "
+                        "never fail the (already-bootable) flash.")
     return p
 
 
