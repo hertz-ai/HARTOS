@@ -1,6 +1,6 @@
 <h1 align="center">HART OS</h1>
 <p align="center"><strong>Hevolve Hive Agentic Runtime</strong></p>
-<p align="center">Self-improving Python agent runtime. Local-first, federated, OpenAI-compatible.</p>
+<p align="center">The AI-native operating system for every device — from computers to embodied AI. Local-first, federated, OpenAI-compatible.</p>
 
 <p align="center">
   <a href="https://hevolve.ai"><img src="https://img.shields.io/badge/Live%20demo-hevolve.ai-FFD700?style=flat-square" alt="Live demo"></a>
@@ -10,11 +10,13 @@
   <a href="https://github.com/hertz-ai/Nunba"><img src="https://img.shields.io/badge/Frontend-Nunba-5865F2?style=flat-square" alt="Nunba"></a>
 </p>
 
-> **HART** = bare engine (`pip install hart-backend`, listens on `:6777`).
-> **HART OS** = HART + admin desktop (model catalog, channel pairing, agent dashboard, hive view, settings).
-> **[Nunba](https://github.com/hertz-ai/Nunba)** = consumer companion app, signed Windows / macOS / Linux installers.
+> **HART** = the bare engine (`pip install hart-backend`, listens on `:6777`).
+> **HART OS** = the full AI-native OS — boots on a laptop, server, or edge node, runs on phones, and extends to embodied AI — with the agentic Liquid Shell, Model Bus, model catalog, channel pairing, agent dashboard, and hive view.
+> **[Nunba](https://github.com/hertz-ai/Nunba)** = the consumer companion app, one signed client across Windows / macOS / Linux.
 
-One Python codebase, three deploy topologies (flat laptop / regional LAN / central cloud mesh). Speaks the OpenAI protocol on `:6777/v1/chat/completions`. Federates with peer nodes over PeerLink (direct P2P WebSocket, no broker). Boot-time guardrail hash + 300 s re-verification + Ed25519 release signing.
+**AI-native** means the OS adapts to the machine, not the reverse: on each device it probes the hardware's capability surface, serves LLM / vision / speech to every app over the Model Bus (socket · D-Bus · HTTP), and lets the on-device model compose the interface and learn each task once to replay it. The same runtime that drives a desktop drives an embodied agent — a robot's AI access is the same Model Bus call. One Python codebase, three deploy topologies (flat laptop / regional LAN / central cloud mesh). Speaks the OpenAI protocol on `:6777/v1/chat/completions`. Federates with peer nodes over PeerLink (direct P2P WebSocket, no broker). Boot-time guardrail hash + 300 s re-verification + Ed25519 release signing keep humans in control.
+
+You would notice it last, the way you notice anything alive: it improves on its own. Each node learns from what it does and gets quietly better, locally, on your own hardware, with nothing leaving the device. Calling an operating system alive should make you reach for the off switch, so that came first: the self-improvement is a toggle, every node is killable on its own, and it runs only as long as you let it.
 
 ---
 

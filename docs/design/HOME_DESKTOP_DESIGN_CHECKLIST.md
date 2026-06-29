@@ -201,6 +201,20 @@ This is the steward's most-repeated structural rule. Capture every nuance.
     semantic search results when possible... an image captioning agent to search
     semabtically... No personal data shd leave the network perimenter without
     explicit consent"* `[#1733]`
+- **d8. PER-SOURCE image sourcing, CONTINUOUS (not just first-boot).** Images refresh
+  over time, not loaded once at first boot. Source the RIGHT image by card TYPE:
+  - **App cards / icons** (Netflix-style app listing): the most appropriate app
+    poster/image from the app's OFFICIAL website, OR from the marketplace / app-store
+    listing image (per source) - real app artwork, not a generic tile.
+  - **Agent cards:** synthetically generated images (image generators), with a
+    dark-to-light TRANSPARENT gradient overlay + text on top (the text-over-art scrim).
+  - **News / web content:** sourced/inferred from news + web (per b2/d3).
+  - All cached locally via the W10 cache (d7); no personal data off-device w/o consent.
+  - *"images are not just loaded on first boot, App icons made into netflix style
+    listing shd get most appropriate app image poster from official website for each
+    app or from marketplace listing etc for each source, Agents we could source from
+    image generators and synthetically adding a dark to light transparent overlay with
+    text on top"* `[#1801, steward 2026-06-29]`
 
 ---
 
