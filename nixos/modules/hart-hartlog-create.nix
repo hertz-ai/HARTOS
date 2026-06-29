@@ -41,6 +41,14 @@
 #     assert that the free region we will consume starts AFTER the last existing
 #     partition's end sector. The EFI/GPT the boot depends on is never rewritten
 #     beyond appending one new GPT entry into already-free space.
+#   - It NEVER COMPLETES the live boot medium's GPT (the BOOT-DISK GUARD, step
+#     3.6). Relocating the backup GPT header to the device end + appending a
+#     partition makes BOTH the whole disk AND partition 1 answer to LABEL=HART_OS
+#     (the isohybrid carries that iso9660 label on both), arming a per-boot
+#     udev-order race that panics the root mount ("VFS: Unable to mount root fs on
+#     LABEL=HART_OS"). So the carve runs ONLY on a SEPARATE stick, never on the
+#     booted medium; a build-time HARTLOG on the boot stick is formatted in place
+#     without ever completing the GPT.
 #   - ANY error (tool missing, sgdisk/mkfs failure, ambiguous disk, unexpected
 #     output) is caught + logged, and the unit exits 0. It NEVER fails or blocks
 #     boot. The HARTLOG partition is a debug convenience; the OS must boot
@@ -125,7 +133,7 @@ let
       exit 0
     fi
 
-    # ── 2. Find the REAL USB disk the firmware booted (the ISO was written to). ──
+    # ── 2. Resolve the REAL boot medium (the USB the ISO was written to). ──
     # The live ISO is a hybrid ISO9660; the live root is a squashfs/overlay on a
     # loop/iso9660 mount, so naively walking `/`'s SOURCE to a parent disk fails
     # (it lands on the overlay/tmpfs, no backing block device). We resolve the
@@ -134,19 +142,13 @@ let
     # device back to the block device its backing file lives on (the isohybrid USB
     # is frequently surfaced to the ISO mount as a loop over /dev/sdX).
     #
-    # TEST SEAM (never set in production): HART_HARTLOG_TEST_DISK lets the
-    # nixosTest (tests/hartlog-create.nix) point the carve at a stand-in spare
-    # disk — the VM's boot disk is NOT the stick, so the live-root walk below
-    # wouldn't reach the test disk. When set to a block device, we still apply the
-    # SAME free-space/never-touch-existing gates below; it only bypasses the
-    # boot-disk auto-detection + the removable gate. Read ONLY here, documented as
-    # a test hook so production behaviour is unchanged (no unit/config sets it).
-    if [ -n "''${HART_HARTLOG_TEST_DISK:-}" ] && [ -b "''${HART_HARTLOG_TEST_DISK}" ]; then
-      DISK="''${HART_HARTLOG_TEST_DISK}"
-      cecho "TEST SEAM: HART_HARTLOG_TEST_DISK=$DISK (bypassing auto-detect; safety gates still apply)"
-      TEST_DISK=1
-    else
-      TEST_DISK=0
+    # We resolve it ONCE into BOOT_DISK, and use it for TWO purposes:
+    #   - in the auto-detect (production) path it is the target we inspect, AND
+    #   - it is the disk the BOOT-DISK GUARD (step 3.6) refuses to COMPLETE the GPT
+    #     of. Completing the live boot medium's GPT is exactly what arms the
+    #     duplicate-LABEL root race (see step 3.6), so the carve is NEVER allowed to
+    #     run on it. The carve only ever runs on a SEPARATE stick (the nixosTest
+    #     stand-in via the test seam), never on the booted medium.
 
     # resolve_disk_from_src SRC -> echoes the whole-disk device, following loops.
     # SRC may be: a partition (/dev/sdb1), a whole disk (/dev/sdb), a loop
@@ -187,54 +189,79 @@ let
       esac
     }
 
-    # Walk the live filesystems most-specific-first. The iso9660 / squashfs live
-    # mounts carry the REAL backing device; `/` (overlay) is the LAST resort.
-    SRC=""
-    RESOLVED=""
-    for mp in /iso /run/initramfs/live /run/rootfs /nix/.ro-store /; do
-      [ -d "$mp" ] || continue
-      s=$(findmnt -n -o SOURCE --target "$mp" 2>/dev/null | head -n1) || s=""
-      [ -n "$s" ] || continue
-      d=$(resolve_disk_from_src "$s") || d=""
-      if [ -n "$d" ] && [ -b "$d" ]; then
-        SRC="$s"; RESOLVED="$d"; break
+    # resolve_boot_disk -> echoes the whole disk the LIVE ROOT booted from (the ISO
+    # medium), or empty. Walks the live mounts most-specific-first (the iso9660 /
+    # squashfs live mounts carry the REAL backing device; `/` (overlay) is the LAST
+    # resort), then falls back to the device carrying the ISO's HART_OS volume label
+    # (desktop.nix sets isoImage.volumeID = "HART_OS").
+    #
+    # TEST SEAM (never set in production): HART_HARTLOG_TEST_BOOT_DISK lets the
+    # nixosTest stand a spare disk in for "the boot medium", so the BOOT-DISK GUARD
+    # below is EXERCISABLE in a VM (whose real boot disk is an internal virtio disk,
+    # never the stand-in spare). Read ONLY here; no unit/config sets it.
+    resolve_boot_disk() {
+      if [ -n "''${HART_HARTLOG_TEST_BOOT_DISK:-}" ] && [ -b "''${HART_HARTLOG_TEST_BOOT_DISK}" ]; then
+        printf '%s' "''${HART_HARTLOG_TEST_BOOT_DISK}"
+        return 0
       fi
-    done
-
-    # Fallback: match the disk that actually CARRIES the ISO by its volume label.
-    # desktop.nix sets isoImage.volumeID = "HART_OS", so the iso9660 filesystem is
-    # labelled HART_OS — find the block device with that label and take its parent
-    # disk. This catches firmwares/initrd shapes where the mount-source walk above
-    # lands on an overlay/loop we can't follow.
-    if [ -z "$RESOLVED" ]; then
-      isodev=$(blkid -L "HART_OS" 2>/dev/null | head -n1) || isodev=""
-      if [ -n "$isodev" ]; then
-        RESOLVED=$(resolve_disk_from_src "$isodev") || RESOLVED=""
-        [ -n "$RESOLVED" ] && SRC="$isodev (by HART_OS label)"
+      _bres=""
+      for mp in /iso /run/initramfs/live /run/rootfs /nix/.ro-store /; do
+        [ -d "$mp" ] || continue
+        _bs=$(findmnt -n -o SOURCE --target "$mp" 2>/dev/null | head -n1) || _bs=""
+        [ -n "$_bs" ] || continue
+        _bd=$(resolve_disk_from_src "$_bs") || _bd=""
+        if [ -n "$_bd" ] && [ -b "$_bd" ]; then _bres="$_bd"; break; fi
+      done
+      if [ -z "$_bres" ]; then
+        _iso=$(blkid -L "HART_OS" 2>/dev/null | head -n1) || _iso=""
+        if [ -n "$_iso" ]; then
+          _bres=$(resolve_disk_from_src "$_iso") || _bres=""
+        fi
       fi
-    fi
+      if [ -n "$_bres" ] && [ -b "$_bres" ]; then printf '%s' "$_bres"; fi
+      return 0
+    }
 
-    if [ -z "$RESOLVED" ] || [ ! -b "$RESOLVED" ]; then
-      decide NOOP "could not resolve the live-boot USB disk (overlay/loop unfollowable, no HART_OS label match)"
-      exit 0
-    fi
-    DISK="$RESOLVED"
-    cecho "live root backed by $SRC -> USB disk $DISK"
+    # Resolve the boot medium ONCE (the auto-detect target AND the guard subject).
+    BOOT_DISK=$(resolve_boot_disk)
+    [ -n "$BOOT_DISK" ] && [ -b "$BOOT_DISK" ] || BOOT_DISK=""
 
-    # ── 3. The disk MUST be removable/USB. NEVER touch an internal disk. ──
-    # RM=1 (removable) OR TRAN=usb. An internal NVMe/SATA disk is RM=0 + TRAN!=usb
-    # -> we refuse. This is the single most important safety gate.
-    RM=$(lsblk -ndo RM "$DISK" 2>/dev/null | head -n1 | tr -d ' ') || RM=""
-    TRAN=$(lsblk -ndo TRAN "$DISK" 2>/dev/null | head -n1 | tr -d ' ') || TRAN=""
-    if [ "$RM" != "1" ] && [ "$TRAN" != "usb" ]; then
-      decide NOOP "$DISK is not removable/USB (RM=$RM TRAN=$TRAN) — refusing an internal disk"
-      exit 0
-    fi
-    cecho "$DISK is removable/USB (RM=$RM TRAN=$TRAN) — eligible"
+    # ── 2a. Pick the TARGET disk. ──
+    # TEST SEAM (never set in production): HART_HARTLOG_TEST_DISK lets the nixosTest
+    # (tests/hartlog-create.nix) point the carve at a stand-in spare disk — the VM's
+    # boot disk is NOT the stick, so the live-root walk wouldn't reach the test disk.
+    # When set to a block device, we still apply the SAME free-space / never-touch /
+    # BOOT-DISK-GUARD gates below; it only bypasses the boot-disk auto-detection + the
+    # removable gate. Read ONLY here; no unit/config sets it.
+    if [ -n "''${HART_HARTLOG_TEST_DISK:-}" ] && [ -b "''${HART_HARTLOG_TEST_DISK}" ]; then
+      DISK="''${HART_HARTLOG_TEST_DISK}"
+      cecho "TEST SEAM: HART_HARTLOG_TEST_DISK=$DISK (bypassing auto-detect; safety gates still apply)"
+      TEST_DISK=1
+    else
+      TEST_DISK=0
+      if [ -z "$BOOT_DISK" ]; then
+        decide NOOP "could not resolve the live-boot USB disk (overlay/loop unfollowable, no HART_OS label match)"
+        exit 0
+      fi
+      DISK="$BOOT_DISK"
+      cecho "live root resolved to USB boot disk $DISK"
+
+      # ── 3. The disk MUST be removable/USB. NEVER touch an internal disk. ──
+      # RM=1 (removable) OR TRAN=usb. An internal NVMe/SATA disk is RM=0 + TRAN!=usb
+      # -> we refuse. One of the two most important safety gates (the other being the
+      # BOOT-DISK GUARD at step 3.6).
+      RM=$(lsblk -ndo RM "$DISK" 2>/dev/null | head -n1 | tr -d ' ') || RM=""
+      TRAN=$(lsblk -ndo TRAN "$DISK" 2>/dev/null | head -n1 | tr -d ' ') || TRAN=""
+      if [ "$RM" != "1" ] && [ "$TRAN" != "usb" ]; then
+        decide NOOP "$DISK is not removable/USB (RM=$RM TRAN=$TRAN) — refusing an internal disk"
+        exit 0
+      fi
+      cecho "$DISK is removable/USB (RM=$RM TRAN=$TRAN) — eligible"
     fi  # end of the auto-detect (non-test) branch; the test seam set DISK directly
     # and deliberately skips the removable/USB gate (the VM's spare disk is not
-    # flagged removable). $DISK is now set in both branches; safety gates below
-    # (free space + never-touch-existing) still apply to both.
+    # flagged removable). $DISK is now set in both branches; the safety gates below
+    # (self-heal-format, the BOOT-DISK GUARD, free space + never-touch-existing)
+    # still apply to both.
 
     # ── 3.5 Self-heal a created-but-UNFORMATTED HARTLOG (the busy-disk first-boot
     #    case). If a PRIOR boot carved the GPT partition (sgdisk named it $LABEL) but
@@ -254,6 +281,32 @@ let
         exit 0
       fi
       cecho "self-heal mkfs on $EXIST failed — falling through to a fresh carve attempt"
+    fi
+
+    # ── 3.6 BOOT-DISK GUARD: NEVER complete the live boot medium's GPT. ──
+    # THE definitive fix for the intermittent real-HW root-mount panic
+    # ("VFS: Unable to mount root fs on LABEL=HART_OS / unknown-block(0,0)", boots
+    # once then panics next boot): a DUPLICATE-LABEL race. The isohybrid carries the
+    # iso9660 LABEL=HART_OS on BOTH the whole disk AND GPT partition 1. While the GPT
+    # is intentionally INCOMPLETE (its backup header sits mid-stick), the kernel
+    # resolves /dev/disk/by-label/HART_OS deterministically and root always mounts.
+    # COMPLETING the GPT - relocating the backup header to the device end (sgdisk -e)
+    # and appending a partition (sgdisk --largest-new / parted mkpart) - makes BOTH
+    # the whole-disk and the partition-1 devices answer to LABEL=HART_OS, so the
+    # by-label root device is then decided by per-boot udev probe order: it boots
+    # once, then panics on the next boot. This module's own carve on first boot was
+    # one of the two things completing it (the Windows flasher's diskpart carve was
+    # the other), so even a plain flashed stick raced on its 2nd boot. We CLOSE that
+    # here: the carve below is permitted ONLY on a target that is NOT the live boot
+    # medium (a SEPARATE stick / the nixosTest stand-in). A build-time HARTLOG is
+    # handled WITHOUT completing the GPT - by the idempotent no-op (step 1, already
+    # formatted) or the in-place self-heal FORMAT (step 3.5, named-but-raw); neither
+    # moves the backup header nor adds a partition. (In production the auto-detect
+    # path already set DISK = BOOT_DISK, so this guard always fires there; the only
+    # path that reaches the carve is the test seam pointing at a separate spare.)
+    if [ -n "$BOOT_DISK" ] && [ "$DISK" = "$BOOT_DISK" ]; then
+      decide NOOP "$DISK IS the live boot medium - refusing to complete its GPT (sgdisk -e relocate + add-partition would make both the whole-disk and partition-1 devices answer to LABEL=HART_OS and race the by-label root mount). HARTLOG is created at BUILD time, or formatted in place by self-heal; the live OS never completes the boot-disk GPT."
+      exit 0
     fi
 
     # ── 4. Determine the partition-table TYPE (GPT vs isohybrid MBR/DOS). ──
@@ -431,22 +484,28 @@ in
   # ═══════════════════════════════════════════════════════════
   options.hart.hartlogCreate = {
     enable = lib.mkEnableOption ''
-      Live-OS self-creation of the HARTLOG diagnostic partition. On first boot
-      from a removable/USB stick that has trailing unpartitioned free space and
-      no existing HARTLOG partition, HART OS carves a FAT32 partition labelled
-      HARTLOG into ONLY that free space (Linux-side: sgdisk on a GPT isohybrid,
-      parted mkpart on a DOS/MBR isohybrid), so hart-boot-log can land the boot
-      journal on the stick. It resolves the REAL booted USB by following the
-      iso9660/overlay live mount source to its backing block device (and a loop
-      device back to the disk its backing file lives on), or by matching the disk
-      carrying the ISO's HART_OS volume label. Every decision (which disk it
-      picked, the free space found, and why it no-op'd) is logged LOUDLY to the
-      journal, the boot console, and /run/hart/hartlog-create.status — so a silent
-      no-op is never undebuggable. This REPLACES the Windows-flasher diskpart path,
-      which hung on a wedged VDS and corrupted a freshly-flashed stick's EFI/GPT. A
-      pure NO-OP when not USB-booted, when no free space exists, when HARTLOG
-      already exists, or on any error — it NEVER touches the in-use ISO/EFI/boot
-      partitions and NEVER blocks boot'';
+      Live-OS management of the HARTLOG diagnostic partition. On boot, HART OS
+      FORMATS an existing (build-time) HARTLOG partition if one is present but raw
+      (in-place self-heal), so hart-boot-log can land the boot journal on the stick.
+      It resolves the REAL booted USB by following the iso9660/overlay live mount
+      source to its backing block device (and a loop device back to the disk its
+      backing file lives on), or by matching the disk carrying the ISO's HART_OS
+      volume label. CRITICAL SAFETY INVARIANT (the BOOT-DISK GUARD): it NEVER
+      COMPLETES the live boot medium's GPT - it does not relocate the backup GPT
+      header to the device end (sgdisk -e) and never appends a partition to the
+      booted stick. Completing the boot-disk GPT makes BOTH the whole disk and
+      partition 1 answer to LABEL=HART_OS (the isohybrid carries that iso9660 label
+      on both), arming a per-boot udev-order race that panics the root mount ("VFS:
+      Unable to mount root fs on LABEL=HART_OS"). The free-space CARVE (sgdisk
+      --largest-new on GPT, parted mkpart on DOS/MBR) therefore runs ONLY on a
+      SEPARATE removable stick, NEVER on the booted medium. Every decision (which
+      disk it picked, the free space found, and why it no-op'd) is logged LOUDLY to
+      the journal, the boot console, and /run/hart/hartlog-create.status - so a
+      silent no-op is never undebuggable. This REPLACES the Windows-flasher diskpart
+      path, which hung on a wedged VDS and corrupted a freshly-flashed stick's
+      EFI/GPT. A pure NO-OP when not USB-booted, when the target IS the boot medium,
+      when no free space exists, when HARTLOG already exists, or on any error - it
+      NEVER touches the in-use ISO/EFI/boot partitions and NEVER blocks boot'';
 
     label = lib.mkOption {
       type = lib.types.str;

@@ -16,7 +16,11 @@
 #   - a second run is an idempotent no-op (HARTLOG already exists),
 #   - a FULL disk (no free space) is a clean no-op (+ a LOUD NOOP marker),
 #   - an isohybrid MBR/DOS disk is carved via the parted path (NOT sgdisk, which
-#     would convert the table) — a primary is appended, the table stays DOS.
+#     would convert the table) — a primary is appended, the table stays DOS,
+#   - the BOOT-DISK GUARD: when the target IS the live boot medium, the script
+#     NEVER completes its GPT (no sgdisk -e relocation, no appended partition, no
+#     HARTLOG) — closing the duplicate-LABEL root race ("VFS: Unable to mount root
+#     fs on LABEL=HART_OS").
 #
 # WHY [VM]-gated: it needs a real Linux block layer (sgdisk/mkfs.vfat on a real
 # GPT disk) — it cannot run on the Windows dev box. The "carves the REAL USB the
@@ -270,6 +274,65 @@ in
               ("HARTLOG must span the relocated tail (much larger than the < 16 MiB "
                f"pre-relocation gap), got {hl_sectors} sectors — relocation did not "
                "expose the tail")
+
+      # ── 6e. BOOT-DISK GUARD: the live boot medium's GPT is NEVER completed ──
+      # The intermittent real-HW panic ("VFS: Unable to mount root fs on
+      # LABEL=HART_OS", boots once then panics next boot) is a DUPLICATE-LABEL race
+      # armed by COMPLETING the boot medium's GPT — relocating the backup header to
+      # the device end (sgdisk -e) + appending a partition. Both make the whole disk
+      # AND partition 1 answer to LABEL=HART_OS, so /dev/disk/by-label/HART_OS races
+      # on per-boot udev order. This module's own first-boot carve was one of the two
+      # completers (the Windows diskpart carve was the other). We rebuild the
+      # mid-device-backup stick from 6d (backup header mid-device, the multi-GB tail
+      # hidden), but this time tell the script that THIS disk IS the boot medium
+      # (HART_HARTLOG_TEST_BOOT_DISK). The carve MUST refuse: NO relocation (the
+      # hidden tail stays hidden → last_usable unchanged), NO new partition, NO
+      # HARTLOG. This is the behavioural proof the boot-disk GPT is never completed on
+      # the live stick (no grep on source).
+      with subtest("the boot medium's GPT is never completed (duplicate-LABEL race guard)"):
+          hc.succeed(f"sgdisk --zap-all {disk}")
+          hc.succeed(f"wipefs -a {disk} || true")
+          # Same mid-device-backup construction as 6d: a 64 MiB GPT image with a
+          # 60 MiB ISO primary (< 16 MiB visible free), dd'd onto the larger spare so
+          # its backup header lands mid-device and the 64..512 MiB tail is hidden.
+          hc.succeed("rm -f /tmp/iso2.img")
+          hc.succeed("truncate -s 64M /tmp/iso2.img")
+          hc.succeed("sgdisk --new=1:2048:+60M --change-name=1:ISO /tmp/iso2.img")
+          hc.succeed(f"dd if=/tmp/iso2.img of={disk} conv=notrunc bs=1M")
+          hc.succeed(f"partprobe {disk} 2>/dev/null || partx -a {disk} 2>/dev/null || true")
+          hc.succeed("udevadm settle || true")
+          # Snapshot the pre-run table identity: partition count + the (small,
+          # pre-relocation) last-usable LBA. If the guard holds, BOTH stay unchanged.
+          n_guard_before = hc.succeed(f"sgdisk -p {disk} | grep -cE '^ +[0-9]+ ' || true").strip()
+          lu_before = int(hc.succeed(f"sgdisk -E {disk} 2>/dev/null | tr -dc '0-9'").strip() or "0")
+          # Drive BOTH the target AND the boot-disk override at this disk == "the
+          # target IS the live boot medium".
+          out_guard = hc.succeed(
+              f"HART_HARTLOG_TEST_DISK={disk} HART_HARTLOG_TEST_BOOT_DISK={disk} "
+              f"hart-hartlog-create 2>&1; echo RC=$?"
+          )
+          assert "RC=0" in out_guard, f"boot-disk guard must exit 0, got: {out_guard!r}"
+          assert "DECISION=NOOP" in out_guard, \
+              f"the boot medium must be a NOOP (never carved), got: {out_guard!r}"
+          assert "boot medium" in out_guard, \
+              f"the no-op must name the boot-medium guard reason, got: {out_guard!r}"
+          # No HARTLOG was created on the boot medium.
+          hc.fail("blkid -L HARTLOG")
+          # The backup header was NOT relocated (sgdisk -e never ran): last_usable is
+          # unchanged. Had the carve path run, sgdisk -e would have grown it to ~the
+          # device end (a large jump up).
+          lu_after = int(hc.succeed(f"sgdisk -E {disk} 2>/dev/null | tr -dc '0-9'").strip() or "0")
+          assert lu_after == lu_before, \
+              ("the boot medium's backup GPT header must NOT be relocated — last_usable "
+               f"changed {lu_before} -> {lu_after}, i.e. the GPT was completed (the race)")
+          # The partition count is unchanged (no partition appended to the boot medium).
+          n_guard_after = hc.succeed(f"sgdisk -p {disk} | grep -cE '^ +[0-9]+ ' || true").strip()
+          assert n_guard_after == n_guard_before, \
+              f"the boot medium must gain NO partition ({n_guard_before} -> {n_guard_after})"
+          # And the no-op is recorded LOUDLY in the status marker (never silent).
+          st_guard = hc.succeed("cat /run/hart/hartlog-create.status")
+          assert "DECISION=NOOP" in st_guard, \
+              f"the boot-medium no-op must be recorded LOUDLY, got: {st_guard!r}"
 
       # ── 7. The auto-detect path REFUSES the VM's non-removable boot disk ──
       # Run WITHOUT the test seam so the script walks the live root to the VM's
