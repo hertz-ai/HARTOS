@@ -77,8 +77,16 @@ in
     # nftables firewall (replaces iptables)
     # ─────────────────────────────────────────────────────────
     {
-      networking.firewall.enable = true;
-      networking.nftables.enable = true;
+      # mkDefault (priority 1000) so contexts that intentionally disable the
+      # in-image firewall win at normal priority. The docker-server target's
+      # image format sets `networking.firewall.enable = false`; a plain `= true`
+      # here collided with it ("The option `networking.firewall.enable' has
+      # conflicting definition values"), red-failing ONLY the docker-server
+      # build (ISO/host variants have no competing definition). With mkDefault,
+      # the ISO/host variants — which set nothing else — still resolve to `true`
+      # (zero behaviour change), while the container build lets its `false` win.
+      networking.firewall.enable = lib.mkDefault true;
+      networking.nftables.enable = lib.mkDefault true;
 
       # Base firewall rules — NixOS handles the nftables ruleset
       networking.firewall = {
