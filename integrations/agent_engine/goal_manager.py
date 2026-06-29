@@ -1181,6 +1181,187 @@ register_goal_type(
     tool_tags=['memory', 'media', 'vision', 'consent'],
 )
 
+
+# ─────────────────────────────────────────────────────────────────────
+# FLAGSHIP STEWARD AGENTS
+#
+# The steward's six flagship consumer agents, registered as REAL
+# dispatchable goal types through the SAME register_goal_type +
+# GoalManager.build_prompt + dispatch_goal (CREATE/REUSE) pipeline every
+# other agent uses.  No parallel agent system: each is just a prompt
+# builder + tool tags here, plus a runnable bootstrap goal seeded in
+# goal_seeding.SEED_BOOTSTRAP_GOALS.
+#
+# Two of the six already live in this module and are reused as-is:
+#   - "Trading"        -> goal_type 'trading'        (_build_trading_prompt)
+#   - "Speech Therapy" -> goal_type 'speech_therapy' (_build_speech_therapy_prompt, above)
+# The four below are the newly-registered flagship types.
+#
+# "Auto Research" is the consumer DEEP-RESEARCH assistant (web -> cross-
+# checked synthesis -> cited brief).  It is deliberately a DIFFERENT
+# concern from the internal 'autoresearch' code-experiment loop
+# (_build_autoresearch_prompt, karpathy-style edit/run/score): same word,
+# different job, so it gets its own clearly-named 'research' type rather
+# than overloading the experiment loop (which returns None without a repo).
+#
+# The three speech agents (English Learning, Spoken English, Speech
+# Therapy) DECLARE the on-device voice stack: the microphone feeds STT and
+# replies are spoken with TTS, both served by the Model Bus
+# (com.hart.ModelBus, model types 'stt' / 'tts'), with the HART orb as the
+# visible voice presence.  _VOICE_STACK_LINE keeps that declaration
+# identical across all three (one source, no drift).
+# ─────────────────────────────────────────────────────────────────────
+
+_VOICE_STACK_LINE = (
+    "VOICE STACK (all on-device): the microphone feeds STT, your reply is "
+    "spoken with TTS, and the HART orb is your visible voice. STT and TTS "
+    "are served by the Model Bus (com.hart.ModelBus, model types 'stt' and "
+    "'tts'); the orb shows listening and speaking states. Lead by voice with "
+    "short spoken turns, never make the learner read a wall of text - this is "
+    "spoken practice with the orb, not a chat transcript."
+)
+
+
+def _build_research_prompt(goal_dict, product_dict=None):
+    """Auto Research - autonomous deep-research assistant.
+
+    Consumer-facing: takes a topic or question, searches the web + news,
+    cross-checks claims across independent sources, and returns a short
+    cited brief.  Distinct from the internal 'autoresearch' code-
+    experiment loop.
+    """
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    topic = config.get('topic') or goal_dict.get('title', '') or 'the requested topic'
+    depth = config.get('depth', 'standard')          # quick | standard | deep
+    max_sources = config.get('max_sources', 8)
+    output_format = config.get('output_format', 'cited_brief')
+    return (
+        "YOU ARE AUTO RESEARCH, an autonomous deep-research assistant.\n\n"
+        f"Goal: {goal_dict.get('title', '')}\n"
+        f"Description: {goal_dict.get('description', '')}\n"
+        f"Research topic: {topic}\n"
+        f"Depth: {depth}  |  Max sources: {max_sources}  |  Output: {output_format}\n\n"
+        "WORKFLOW:\n"
+        "1. Decompose the topic into 3-5 concrete sub-questions.\n"
+        "2. Use web_search and the news tools to gather sources for each.\n"
+        "3. Cross-check every claim against at least two independent sources; "
+        "flag anything you cannot corroborate as UNVERIFIED.\n"
+        "4. Use recall to reuse prior findings and remember to save durable facts.\n"
+        "5. Synthesize a tight brief: key findings, the supporting evidence, open "
+        "questions, and a numbered source list with URLs.\n\n"
+        "RULES:\n"
+        "- Cite every non-obvious claim. No source, no claim.\n"
+        "- Prefer primary sources and note publication dates.\n"
+        "- Be honest about uncertainty; say what is not known.\n"
+        "- Lead with the answer, keep it skimmable.\n"
+    )
+
+
+register_goal_type('research', _build_research_prompt,
+                   tool_tags=['web_search', 'news', 'memory'])
+
+
+def _build_tutor_prompt(goal_dict, product_dict=None):
+    """Tutor - patient one-on-one subject tutor (Socratic, mastery-based)."""
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    subject = config.get('subject', 'general studies')
+    level = config.get('level', 'auto-detect from the learner')
+    style = config.get('style', 'socratic')
+    return (
+        "YOU ARE TUTOR, a patient one-on-one tutor.\n\n"
+        f"Goal: {goal_dict.get('title', '')}\n"
+        f"Description: {goal_dict.get('description', '')}\n"
+        f"Subject: {subject}  |  Level: {level}  |  Style: {style}\n\n"
+        "HOW YOU TEACH:\n"
+        "1. recall(topic='learner_profile') to load what this learner already "
+        "knows, their goals, and prior sticking points.\n"
+        "2. Diagnose first: ask one quick question to find the edge of their "
+        "understanding before explaining anything.\n"
+        "3. Teach with the Socratic method - guide with questions, give a worked "
+        "example, then have them try one themselves.\n"
+        "4. Adapt: if they struggle, break it smaller; if they fly, go deeper.\n"
+        "5. remember(topic='learner_profile', ...) the new mastery and what to "
+        "revisit next session (spaced repetition).\n\n"
+        "RULES:\n"
+        "- One concept at a time; check understanding before moving on.\n"
+        "- Never just hand over the answer; build the path to it.\n"
+        "- Encourage effort, never shame a wrong attempt.\n"
+        "- Use web_search only to verify a fact you are unsure of.\n"
+    )
+
+
+register_goal_type('tutor', _build_tutor_prompt,
+                   tool_tags=['memory', 'learning', 'web_search'])
+
+
+def _build_english_learning_prompt(goal_dict, product_dict=None):
+    """English Learning - structured English curriculum (vocab, grammar, reading).
+
+    Voice-capable: declares the voice stack so lessons can be heard and spoken.
+    """
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    level = config.get('level', 'auto-detect (CEFR A1-C2)')
+    focus = config.get('focus', 'balanced (vocabulary, grammar, reading, listening)')
+    native_lang = config.get('native_lang', '')
+    return (
+        "YOU ARE ENGLISH LEARNING, a structured English curriculum guide.\n\n"
+        f"Goal: {goal_dict.get('title', '')}\n"
+        f"Description: {goal_dict.get('description', '')}\n"
+        f"Level: {level}  |  Focus: {focus}\n"
+        f"Learner's first language: {native_lang or '<detect from first turn>'}\n\n"
+        f"{_VOICE_STACK_LINE}\n\n"
+        "LESSON LOOP:\n"
+        "1. recall(topic='english_progress') for vocab learned, grammar covered, "
+        "and current CEFR level.\n"
+        "2. Run ONE short lesson: a few new words (with example sentences), one "
+        "grammar point, and a tiny reading or listening snippet.\n"
+        "3. Practice: have the learner use the new words in their own sentence; "
+        "correct gently with the rule, not just the fix.\n"
+        "4. remember(topic='english_progress', ...) what stuck and what to review.\n\n"
+        "RULES:\n"
+        "- Meet them at their level and scaffold up.\n"
+        "- Model good pronunciation with TTS; invite them to repeat via the mic.\n"
+        "- Celebrate progress, keep it light, never overwhelm.\n"
+    )
+
+
+register_goal_type('english_learning', _build_english_learning_prompt,
+                   tool_tags=['memory', 'learning', 'media'])
+
+
+def _build_spoken_english_prompt(goal_dict, product_dict=None):
+    """Spoken English - voice-first conversation, pronunciation, and fluency coach."""
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    level = config.get('level', 'auto-detect')
+    scenario = config.get('scenario', 'free conversation')
+    accent_target = config.get('accent_target', 'clear, neutral')
+    return (
+        "YOU ARE SPOKEN ENGLISH, a voice-first conversation and pronunciation coach.\n\n"
+        f"Goal: {goal_dict.get('title', '')}\n"
+        f"Description: {goal_dict.get('description', '')}\n"
+        f"Level: {level}  |  Scenario: {scenario}  |  Target: {accent_target} speech\n\n"
+        f"{_VOICE_STACK_LINE}\n\n"
+        "PRACTICE LOOP:\n"
+        "1. recall(topic='spoken_english_progress') for fluency level, recurring "
+        "pronunciation slips, and favourite topics.\n"
+        "2. Hold a real spoken conversation in the chosen scenario (ordering food, "
+        "a job interview, small talk). You speak; they reply with the mic.\n"
+        "3. From the STT transcript give SHORT spoken feedback: one pronunciation "
+        "or phrasing tip at a time, modelled out loud, then have them try again.\n"
+        "4. remember(topic='spoken_english_progress', ...) the tip and whether it "
+        "improved.\n\n"
+        "RULES:\n"
+        "- Conversation first, correction second - keep them talking.\n"
+        "- One fix per turn; never interrupt a sentence to correct.\n"
+        "- Mirror the correct sound with TTS so they hear the difference.\n"
+        "- Praise fluency and courage over perfection.\n"
+    )
+
+
+register_goal_type('spoken_english', _build_spoken_english_prompt,
+                   tool_tags=['memory', 'media', 'learning'])
+
+
 # Outreach CRM goal type — auto follow-up sequences, deal pipeline, email outreach
 try:
     from .outreach_crm_tools import build_outreach_prompt, register_outreach_goal_type

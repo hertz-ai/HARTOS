@@ -1538,6 +1538,155 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 80,
         'use_product': True,
     },
+
+    # ─────────────────────────────────────────────────────────────
+    # FLAGSHIP STEWARD AGENTS (runnable goal templates)
+    #
+    # The steward's six flagship consumer agents, each a real
+    # AgentGoal dispatched through the same GoalManager.build_prompt
+    # -> dispatch_goal -> /chat CREATE/REUSE pipeline as every other
+    # goal.  "Speech Companion" (speech_therapy) is seeded just above;
+    # the five below are "Auto Research", "Trading", "Tutor", "English
+    # Learning", and "Spoken English".  Their goal types are registered
+    # in goal_manager.py.  The three speech agents declare the on-device
+    # voice stack (STT + TTS via com.hart.ModelBus + the HART orb) in
+    # both config (voice_stack/modality) and description.
+    # ─────────────────────────────────────────────────────────────
+    {
+        'slug': 'bootstrap_auto_research',
+        'goal_type': 'research',
+        'title': 'Auto Research',
+        'description': (
+            'Autonomous deep-research assistant. Give it a topic or '
+            'question and it decomposes the question, searches the web '
+            'and news, cross-checks every claim against independent '
+            'sources, and returns a short cited brief with an honest '
+            'account of what is known and what is still uncertain. '
+            'Reuses prior findings from memory so repeat research gets '
+            'faster.'
+        ),
+        'config': {
+            'autonomous': False,        # user-invoked from the home / omnibox
+            'continuous': True,         # resumes across sessions
+            'depth': 'standard',
+            'max_sources': 8,
+            'output_format': 'cited_brief',
+            'topic': 'What is HART OS and how does the hive earn for its users?',
+            'cadence': 'event',
+            'priority': 4,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_trading_companion',
+        'goal_type': 'trading',
+        'title': 'Trading',
+        'description': (
+            'Paper-trading companion. Analyses markets with technical '
+            'indicators and news sentiment, then places SIMULATED trades '
+            'with a mandatory stop-loss on every position. Paper trading '
+            'only by default: going live requires a constitutional vote. '
+            'Never trades on margin, halts on a 10 percent cumulative '
+            'loss, and logs every decision with its reasoning.'
+        ),
+        'config': {
+            'autonomous': False,
+            'continuous': True,
+            'paper_trading': True,
+            'strategy': 'long_term',
+            'market': 'crypto',
+            'max_budget': 10000,
+            'max_loss_pct': 10,
+            'cadence': 'event',
+            'priority': 4,
+        },
+        'spark_budget': 120,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_tutor',
+        'goal_type': 'tutor',
+        'title': 'Tutor',
+        'description': (
+            'A patient one-on-one tutor for any subject. Diagnoses the '
+            'edge of your understanding, teaches with the Socratic '
+            'method (guiding questions, a worked example, then your '
+            'turn), and adapts up or down to your pace. Remembers your '
+            'profile and uses spaced repetition so each session builds '
+            'on the last. Never shames a wrong attempt; builds the path '
+            'to the answer rather than just handing it over.'
+        ),
+        'config': {
+            'autonomous': False,
+            'continuous': True,
+            'subject': 'general studies',
+            'level': 'auto-detect',
+            'style': 'socratic',
+            'cadence': 'event',
+            'priority': 5,
+        },
+        'spark_budget': 120,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_english_learning',
+        'goal_type': 'english_learning',
+        'title': 'English Learning',
+        'description': (
+            'A structured English curriculum guide (CEFR A1 to C2) for '
+            'vocabulary, grammar, reading, and listening. Runs short '
+            'adaptive lessons, has you use new words in your own '
+            'sentences, and corrects gently with the rule behind the '
+            'fix. VOICE: lessons can be heard and spoken. The mic feeds '
+            'STT, replies are spoken with TTS via the Model Bus '
+            '(com.hart.ModelBus), and the HART orb is the on-screen '
+            'voice presence. Tracks progress in memory across sessions.'
+        ),
+        'config': {
+            'autonomous': False,
+            'continuous': True,
+            'level': 'auto-detect',
+            'focus': 'balanced',
+            'modality': 'voice',
+            'voice_stack': ['stt', 'tts', 'orb'],
+            'require_consent': True,        # microphone consent
+            'cadence': 'event',
+            'priority': 5,
+        },
+        'spark_budget': 120,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_spoken_english',
+        'goal_type': 'spoken_english',
+        'title': 'Spoken English',
+        'description': (
+            'A voice-first conversation and pronunciation coach. Holds a '
+            'real spoken conversation in a scenario you pick (ordering '
+            'food, a job interview, small talk), then gives short spoken '
+            'feedback: one pronunciation or phrasing tip at a time, '
+            'modelled out loud for you to repeat. VOICE: you speak into '
+            'the mic (STT), the coach speaks back (TTS via the Model Bus, '
+            'com.hart.ModelBus), and the HART orb shows listening and '
+            'speaking. Conversation first, correction second; praises '
+            'fluency and courage over perfection.'
+        ),
+        'config': {
+            'autonomous': False,
+            'continuous': True,
+            'level': 'auto-detect',
+            'scenario': 'free conversation',
+            'modality': 'voice',
+            'voice_stack': ['stt', 'tts', 'orb'],
+            'require_consent': True,        # microphone consent
+            'cadence': 'event',
+            'priority': 5,
+        },
+        'spark_budget': 120,
+        'use_product': False,
+    },
+
     {
         # ── Encounter Icebreaker Agent ──
         # Full design: Claude-memory/project_encounter_icebreaker.md
