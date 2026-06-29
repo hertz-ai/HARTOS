@@ -2,7 +2,8 @@ name: Deploy HARTOS Deepbox
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -17,10 +18,12 @@ jobs:
           username: ${{ secrets.DEPLOY_USER }}
           password: ${{ secrets.DEPLOY_PASSWORD }}
           port: ${{ secrets.DEPLOY_PORT }}
+          timeout: 60m
+          command_timeout: 90m
           script: |
             set -e
 
-            cd /opt/hzai-LLM-Langchain-Chatbot-Agent/repo/LLM-langchain_Chatbot-Agent
+            cd ${{ secrets.DEPLOY_REPO_PATH }}
 
             rm -f release_manifest.json
 
@@ -35,7 +38,7 @@ jobs:
 
             sudo docker run --name langchain_tmp -d \
               --env-file .env \
-              -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat /etc/hevolve/master_private_key.hex)" \
+              -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
               langchain_gpt:main sleep 3600
 
             docker exec langchain_tmp sh -lc '
@@ -66,13 +69,13 @@ jobs:
             sudo docker run -d --name langchain --restart unless-stopped \
               -p 6777:6777 \
               --env-file .env \
-              -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat /etc/hevolve/master_private_key.hex)" \
+              -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
               -v "$(pwd)/config.json:/app/config.json:ro" \
               -v "$(pwd)/release_manifest.json:/app/release_manifest.json:ro" \
-              -v /opt/hzai-LLM-Langchain-Chatbot-Agent/logs:/app/logs \
-              -v /opt/hzai-LLM-Langchain-Chatbot-Agent/mount/images:/app/output_images \
+              -v ${{ secrets.DEPLOY_LOGS_PATH }}:/app/logs \
+              -v ${{ secrets.DEPLOY_IMAGES_PATH }}:/app/output_images \
               langchain_gpt:main
 
-            sleep 10
+            sleep 20
             docker ps | grep langchain
             curl -sS http://127.0.0.1:6777/status
