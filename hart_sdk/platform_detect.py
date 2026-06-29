@@ -93,7 +93,10 @@ def get_capabilities() -> List[str]:
         from integrations.service_tools.vram_manager import vram_manager
         if vram_manager:
             gpu = vram_manager.detect_gpu()
-            if gpu and gpu.get('available', False):
+            # detect_gpu() returns the key `cuda_available` (vram_manager.py:216),
+            # NOT `available`; reading the wrong key meant a GPU node never
+            # advertised the `vision` capability (#135-residual).
+            if gpu and gpu.get('cuda_available', False):
                 if 'vision' not in caps:
                     caps.append('vision')
     except (ImportError, Exception):
