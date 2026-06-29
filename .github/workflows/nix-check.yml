@@ -43,18 +43,25 @@ jobs:
         run: |
           nix profile install nixpkgs#statix
           echo "::group::statix results"
-          statix check nixos/ 2>&1 || true
+          # --config statix.toml (repo root) mutes three pure-style lints that
+          # fire on HART's deliberate flat-attribute idiom; statix still gates
+          # on genuine antipatterns. See statix.toml for the rationale.
+          statix check --config statix.toml nixos/ 2>&1 || true
           echo "::endgroup::"
           # Fail on errors, warn on suggestions
-          statix check nixos/
+          statix check --config statix.toml nixos/
 
       - name: Run deadnix (unused code detection)
         run: |
           nix profile install nixpkgs#deadnix
           echo "::group::deadnix results"
-          deadnix nixos/ 2>&1 || true
+          # --no-lambda-arg / --no-lambda-pattern-names: ignore unused names in
+          # NixOS module signatures (`{ config, lib, pkgs, ... }:` where not all
+          # are referenced) — idiomatic, not dead code. Real dead `let`/binding
+          # findings still fail the job.
+          deadnix --no-lambda-arg --no-lambda-pattern-names nixos/ 2>&1 || true
           echo "::endgroup::"
-          deadnix nixos/
+          deadnix --no-lambda-arg --no-lambda-pattern-names nixos/
 
   # ─── Flake Evaluation (10-30 seconds) ──────────────────────
   flake-check:
