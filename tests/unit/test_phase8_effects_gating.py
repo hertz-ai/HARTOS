@@ -24,12 +24,20 @@ from integrations.agent_engine.liquid_ui_service import LiquidUIService
 
 
 def _render(potato: bool) -> str:
-    """Render the shell with the perf tier forced on/off via ThemeService."""
+    """Render the shell with the perf tier forced on/off via ThemeService.
+
+    The GPU verdict is pinned to 'hardware' (a CAPABLE GPU) so this file isolates
+    the THEME-tier gate (``disable_blur``). The orthogonal software-render gate —
+    potato also turns on when ``read_gpu_render_mode()`` is 'software' — is
+    covered behaviourally in test_shell_software_render_perf.py.
+    """
     theme = {'performance': {'disable_blur': potato}}
     with patch('integrations.agent_engine.theme_service.ThemeService'
                '.get_active_theme', return_value=theme), \
          patch('integrations.agent_engine.theme_service.ThemeService'
-               '.get_css_variables', return_value=':root{--hart-accent:#00D4AA}'):
+               '.get_css_variables', return_value=':root{--hart-accent:#00D4AA}'), \
+         patch('integrations.agent_engine.liquid_ui_service'
+               '.read_gpu_render_mode', return_value='hardware'):
         return LiquidUIService().render_desktop_shell()
 
 

@@ -8,6 +8,8 @@ bluetooth management, print manager, media indexer.
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -860,6 +862,91 @@ class TestWiFiManagement(unittest.TestCase):
                         data=json.dumps({'enable': False}),
                         content_type='application/json')
         self.assertEqual(r.status_code, 200)
+
+
+# ═══════════════════════════════════════════════════════════════
+# WiFi non-blocking contract (the click-to-freeze fix)
+# ═══════════════════════════════════════════════════════════════
+
+class TestWiFiNonBlocking(unittest.TestCase):
+    """The wifi routes must never pin the small (1-2 thread) shell pool — that is
+    what froze the UI when the user clicked Wi-Fi on a software-rendered box. The
+    scan path must NOT sleep on the request thread, and the connect must be bounded
+    so a slow nmcli cannot block; both still preserve their result behaviour.
+    """
+
+    @patch('integrations.agent_engine.shell_system_apis.time.sleep')
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_wifi_networks_rescan_never_sleeps(self, mock_run, mock_sleep):
+        # A rescan request used to time.sleep(2) on the request thread. It must not
+        # any longer — yet it still returns the cached networks (behaviour kept).
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout='HomeNet:85:WPA2:5 GHz\nCafe:42:WPA:2.4 GHz\n')
+        client = _make_system_app()
+        r = client.get('/api/shell/wifi/networks?rescan=true')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['count'], 2)                       # still returns networks
+        self.assertEqual(data['networks'][0]['ssid'], 'HomeNet')  # sorted by signal
+        mock_sleep.assert_not_called()                            # never blocks the thread
+
+    def test_run_async_bounded_returns_fast_result(self):
+        # When the command settles within the wait, the caller gets (True, result).
+        import integrations.agent_engine.shell_system_apis as mod
+        with patch.object(mod, '_run', return_value=MagicMock(returncode=0)):
+            finished, r = mod._run_async_bounded(['nmcli', 'x'], run_timeout=5, wait=2)
+        self.assertTrue(finished)
+        self.assertIsNotNone(r)
+        self.assertEqual(r.returncode, 0)
+
+    def test_run_async_bounded_bounds_a_slow_command(self):
+        # A command slower than the caller's wait returns (False, None) PROMPTLY
+        # (request thread freed) while the worker still runs to completion so the
+        # side-effect lands out-of-band.
+        import integrations.agent_engine.shell_system_apis as mod
+        ran_to_completion = threading.Event()
+
+        def slow_run(cmd, timeout=10, **kw):
+            time.sleep(0.4)            # exceeds the 0.1s caller bound below
+            ran_to_completion.set()
+            return MagicMock(returncode=0)
+
+        t0 = time.monotonic()
+        with patch.object(mod, '_run', side_effect=slow_run):
+            finished, r = mod._run_async_bounded(['nmcli', 'x'], run_timeout=5, wait=0.1)
+            elapsed = time.monotonic() - t0
+            self.assertFalse(finished)                # bounded out
+            self.assertIsNone(r)
+            self.assertLess(elapsed, 0.35)            # did NOT wait the full 0.4s
+            self.assertTrue(ran_to_completion.wait(2))  # worker finished out-of-band
+
+    @patch('integrations.agent_engine.shell_system_apis._run')
+    def test_wifi_connect_fast_join_returns_real_result(self, mock_run):
+        # A fast connect returns the REAL joined result (200), not a masked status.
+        mock_run.return_value = MagicMock(returncode=0, stdout='')
+        client = _make_system_app()
+        r = client.post('/api/shell/wifi/connect',
+                        data=json.dumps({'ssid': 'TestNet', 'password': 'pass123'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data['connected'])
+        self.assertEqual(data['ssid'], 'TestNet')
+
+    def test_wifi_connect_slow_returns_connecting_not_masked_success(self):
+        # When the connect outlives the bounded wait, the route returns a structured
+        # 'connecting' (202) — never a faked success — and the request thread is free.
+        import integrations.agent_engine.shell_system_apis as mod
+        with patch.object(mod, '_run_async_bounded', return_value=(False, None)):
+            client = _make_system_app()
+            r = client.post('/api/shell/wifi/connect',
+                            data=json.dumps({'ssid': 'SlowNet', 'password': 'x'}),
+                            content_type='application/json')
+        self.assertEqual(r.status_code, 202)
+        data = json.loads(r.data)
+        self.assertTrue(data['connecting'])
+        self.assertFalse(data['connected'])
+        self.assertEqual(data['ssid'], 'SlowNet')
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -108,6 +108,16 @@
   }
 
   var STATE = null, pollTimer = null, mounted = false;
+  // In-flight guards: at most ONE summary probe and ONE wifi scan outstanding at
+  // a time. Both endpoints shell out to nmcli/bluetoothctl/wpctl server-side and
+  // can take several seconds on a software-rendered box; the 8s poller, the
+  // popover-open, the toggle callbacks and every Rescan all re-trigger them, so
+  // without a guard a slow probe pile-up saturates the small shell thread pool and
+  // freezes every other shell fetch. Aborting the client fetch does NOT cancel the
+  // server subprocess, so the only safe lever here is: never stack a new request
+  // on a pending one.
+  var _refreshing = false;
+  var _loadingNetworks = false;
 
   function setGlyph(id, glyph) {
     var el = document.getElementById(id);
@@ -139,11 +149,14 @@
   }
 
   function refresh() {
+    if (_refreshing) return;   // coalesce onto the pending probe (never pile up)
+    _refreshing = true;
     getJSON(S() + '/api/shell/connectivity/summary', 5000)
       .then(function (d) { STATE = d || {}; paint(); })
       .catch(function () { /* keep last glyphs; degrade to neutral on first fail */
         if (!STATE) { STATE = {}; paint(); }
-      });
+      })
+      .then(function () { _refreshing = false; });   // release in BOTH outcomes
   }
 
   // ── Quick-settings popover ──
@@ -307,6 +320,12 @@
       return;
     }
     box.innerHTML = '<div class="hc-net-empty">Scanning…</div>';
+    // Coalesce onto a pending scan: the popover re-renders on every poll and on
+    // every Rescan, each calling loadNetworks. The spinner above still shows, but
+    // we do NOT stack a second /network/wifi fetch (which shells out to nmcli and
+    // can take seconds) on top of one already in flight.
+    if (_loadingNetworks) return;
+    _loadingNetworks = true;
     getJSON(S() + '/api/shell/network/wifi', rescan ? 9000 : 6000)
       .then(function (d) {
         var nets = (d && d.networks) || [];
@@ -339,7 +358,8 @@
       })
       .catch(function () {
         box.innerHTML = '<div class="hc-net-empty">Could not scan right now.</div>';
-      });
+      })
+      .then(function () { _loadingNetworks = false; });   // release in BOTH outcomes
   }
 
   function positionPopover() {

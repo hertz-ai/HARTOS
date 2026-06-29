@@ -77,6 +77,53 @@ def test_render_tags_body_gpu_hardware(svc, monkeypatch):
     assert 'gpu-software' not in body
 
 
+def _perf_potato_line(html):
+    """The rendered inline-script PERF.potato flag (the JS reduced-effects gate
+    hartEffects.js / hartDock.js read). Returns 'true' or 'false'."""
+    m = re.search(r'potato:\s*(true|false)', html)
+    assert m, 'no PERF.potato flag in rendered shell'
+    return m.group(1)
+
+
+def test_perf_potato_true_under_software_verdict(svc, monkeypatch):
+    """CAUSE 3: on a software-rendered box the JS reduced-effects gate must
+    engage — PERF.potato true — even when the THEME tier leaves blur ON. Wiring
+    the potato gate to the SAME verdict the CSS floor uses is what kills the
+    ~500ms keystroke lag without a GPU."""
+    monkeypatch.setattr(lus, 'read_gpu_render_mode', lambda: 'software')
+    # Theme tier explicitly NOT potato, so the only trigger is the GPU verdict.
+    monkeypatch.setattr(
+        'integrations.agent_engine.theme_service.ThemeService.get_active_theme',
+        lambda: {'performance': {'disable_blur': False}})
+    html = svc.render_desktop_shell()
+    assert _perf_potato_line(html) == 'true'
+    assert 'gpu-software' in _body_tag(html)
+
+
+def test_perf_potato_false_under_hardware_verdict_and_capable_theme(svc, monkeypatch):
+    """Converse: a capable GPU + a non-potato theme keeps the full cinematic
+    (PERF.potato false), so the GPU gate is the ONLY thing the software branch
+    flips — it does not strand a hardware box in reduced effects."""
+    monkeypatch.setattr(lus, 'read_gpu_render_mode', lambda: 'hardware')
+    monkeypatch.setattr(
+        'integrations.agent_engine.theme_service.ThemeService.get_active_theme',
+        lambda: {'performance': {'disable_blur': False}})
+    html = svc.render_desktop_shell()
+    assert _perf_potato_line(html) == 'false'
+    assert 'gpu-hardware' in _body_tag(html)
+
+
+def test_perf_potato_true_when_theme_disables_blur_on_capable_gpu(svc, monkeypatch):
+    """The theme tier still forces potato independently of the GPU: disable_blur
+    True on a HARDWARE box stays potato (the two gates OR together)."""
+    monkeypatch.setattr(lus, 'read_gpu_render_mode', lambda: 'hardware')
+    monkeypatch.setattr(
+        'integrations.agent_engine.theme_service.ThemeService.get_active_theme',
+        lambda: {'performance': {'disable_blur': True}})
+    html = svc.render_desktop_shell()
+    assert _perf_potato_line(html) == 'true'
+
+
 def test_software_render_css_floor_present(svc, monkeypatch):
     """The reduced-effects floor must exist in the served stylesheet, keyed off
     body.gpu-software, and kill the per-frame GPU cost (backdrop-filter)."""

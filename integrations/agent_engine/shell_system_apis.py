@@ -28,6 +28,37 @@ def _run(cmd, timeout=10, **kw):
         return None
 
 
+def _run_async_bounded(cmd, run_timeout=20, wait=6, name='hart-shell-op', **kw):
+    """Run a blocking subprocess on a daemon worker, waiting at most ``wait``
+    seconds for it on the CALLER.
+
+    Returns ``(finished, result)``:
+      * ``(True, CompletedProcess | None)`` — the command settled within ``wait``
+        (``result`` is ``None`` only if the tool was missing or it self-timed-out
+        at ``run_timeout``, mirroring :func:`_run`).
+      * ``(False, None)`` — still running: the worker keeps going to completion so
+        the side-effect still lands, but the request thread is freed instead of
+        being pinned for the whole ``run_timeout``.
+
+    Why this exists: the shell server runs on a 1-2 thread pool on a lite/embedded
+    box. A 30s synchronous connect would pin a pool thread and queue every other
+    shell fetch behind it (the click-to-freeze). Bounding the caller's wait keeps
+    the pool responsive while a slow op finishes out-of-band.
+    """
+    holder = {}
+    done = threading.Event()
+
+    def _worker():
+        try:
+            holder['result'] = _run(cmd, timeout=run_timeout, **kw)
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, name=name, daemon=True).start()
+    finished = done.wait(wait)
+    return finished, holder.get('result')
+
+
 def _load_json(path, default=None):
     try:
         with open(path) as f:
@@ -1243,14 +1274,23 @@ Hidden=false
 
     @app.route('/api/shell/wifi/networks', methods=['GET'])
     def shell_wifi_networks():
-        """Scan and list available WiFi networks."""
+        """Scan and list available WiFi networks.
+
+        Never sleeps on the request thread. A rescan only *triggers* a background
+        scan in NetworkManager; we immediately return whatever the scan cache holds
+        (NM keeps the last results), so the shell pool is never blocked. The list
+        self-freshens on the next poll once the scan lands. The old time.sleep(2)
+        here pinned the 1-2 thread pool and was a direct cause of the Wi-Fi click
+        freezing the UI.
+        """
         rescan = request.args.get('rescan', 'false').lower() == 'true'
         if rescan:
-            _run(['nmcli', 'device', 'wifi', 'rescan'], timeout=10)
-            time.sleep(2)  # Give scan time to populate
+            # Fire the rescan trigger but do NOT block waiting for it to populate
+            # (no time.sleep on the request path). NM scans asynchronously.
+            _run(['nmcli', 'device', 'wifi', 'rescan'], timeout=4)
 
         r = _run(['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY,FREQ,BSSID',
-                  'device', 'wifi', 'list'], timeout=10)
+                  'device', 'wifi', 'list'], timeout=6)
         networks = []
         seen = set()
         if r and r.returncode == 0:
@@ -1270,7 +1310,15 @@ Hidden=false
     @app.route('/api/shell/wifi/connect', methods=['POST'])
     @_require_system_auth
     def shell_wifi_connect():
-        """Connect to a WiFi network."""
+        """Connect to a WiFi network.
+
+        The association + DHCP handshake can take many seconds, so the nmcli
+        connect runs on a bounded background worker and never pins the request
+        thread for the full timeout. A fast join returns the REAL result; a slow
+        one returns a structured 'connecting' (202) — NOT a faked success — and the
+        next connectivity poll reports the true joined state. This keeps the small
+        shell pool free instead of queueing every other fetch behind a 30s connect.
+        """
         body = request.get_json(silent=True) or {}
         ssid = body.get('ssid')
         if not ssid:
@@ -1284,7 +1332,12 @@ Hidden=false
         if hidden:
             cmd += ['hidden', 'yes']
 
-        r = _run(cmd, timeout=30)
+        finished, r = _run_async_bounded(cmd, run_timeout=20, wait=6,
+                                         name='hart-wifi-connect')
+        if not finished:
+            # Still associating in the background; the request thread is freed.
+            # Honest 'connecting' rather than a masked success.
+            return jsonify({'connected': False, 'connecting': True, 'ssid': ssid}), 202
         if r and r.returncode == 0:
             _audit_system_op('wifi_connect', {'ssid': ssid})
             return jsonify({'connected': True, 'ssid': ssid})

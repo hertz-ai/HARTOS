@@ -27,6 +27,7 @@ Multi-modal output:
   Terminal -> Rich TUI (textual library)
   Haptic  -> Vibration patterns (phone, via Android bridge)
 """
+import copy
 import json
 import logging
 import os
@@ -90,6 +91,258 @@ def read_gpu_render_mode() -> str:
         return 'hardware' if verdict == 'hardware' else 'software'
     except (FileNotFoundError, PermissionError, OSError):
         return 'software'
+
+
+# ── Default-sink volume probe (wpctl-first, pactl fallback) ──────────────────
+# Module-level (NOT a route closure) so the background connectivity prober and
+# the volume write routes share ONE implementation — no parallel volume path.
+# Every call is subprocess.run with a bounded timeout and degrades to
+# {'available': False} when neither wpctl nor pactl is present (the live USB may
+# have neither); never crashes, never hangs.
+def _vol_run(cmd, timeout=4):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _volume_get(timeout=4):
+    # wpctl get-volume @DEFAULT_AUDIO_SINK@ -> "Volume: 0.55 [MUTED]"
+    r = _vol_run(['wpctl', 'get-volume', '@DEFAULT_AUDIO_SINK@'], timeout=timeout)
+    if r and r.returncode == 0 and 'Volume:' in r.stdout:
+        try:
+            frac = float(r.stdout.split('Volume:')[1].strip().split()[0])
+            return {'available': True, 'tool': 'wpctl',
+                    'volume': int(round(frac * 100)),
+                    'muted': 'MUTED' in r.stdout.upper()}
+        except (ValueError, IndexError):
+            pass
+    # pactl fallback
+    mr = _vol_run(['pactl', 'get-sink-mute', '@DEFAULT_SINK@'], timeout=timeout)
+    vr = _vol_run(['pactl', 'get-sink-volume', '@DEFAULT_SINK@'], timeout=timeout)
+    if vr and vr.returncode == 0 and '%' in vr.stdout:
+        try:
+            pct = int(vr.stdout.split('/')[1].strip().rstrip('%'))
+            muted = bool(mr and mr.returncode == 0 and
+                         'yes' in mr.stdout.lower())
+            return {'available': True, 'tool': 'pactl',
+                    'volume': max(0, min(150, pct)), 'muted': muted}
+        except (ValueError, IndexError):
+            pass
+    return {'available': False, 'volume': None, 'muted': None}
+
+
+# ── Background connectivity prober + snapshot cache (CAUSE 1) ─────────────────
+class _ConnectivityCache:
+    """One daemon thread keeps a connectivity snapshot fresh; the request
+    handlers read the cache INSTANTLY (no subprocess on the request path).
+
+    hartConnectivity.js polls /api/shell/connectivity/summary every ~8s (plus on
+    popover-open and on toggle) and /api/shell/network/wifi on open + every
+    Rescan. The old handlers ran up to SIX synchronous 4s subprocess.run calls
+    (nmcli x2, bluetoothctl x2, wpctl/pactl) in series ON the waitress request
+    thread. On a software-rendered lite box (threads=1-2) the pool saturated and
+    EVERY shell fetch queued behind it — the click-wifi / drag freeze. Aborting
+    the JS fetch never cancelled the server subprocess.
+
+    Fix: probe on ONE dedicated daemon thread on a ~9s cadence with SHORT (1.2s)
+    per-tool timeouts, skipping tools already found absent. A single thread means
+    probes are inherently debounced — they never overlap. Fail-safe: a probe
+    error keeps the previous good cache; an unprimed cache reads
+    'available': False everywhere, never a crash. The quick-settings WRITE
+    actions (scan/connect/toggle/set-volume) still hit the per-domain endpoints
+    inline; this is read-only aggregation, NOT a parallel control path.
+    """
+
+    REFRESH_INTERVAL_S = 9.0
+    PROBE_TIMEOUT_S = 1.2
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._summary = self._empty_summary()
+        self._wifi = {'networks': [], 'connected': {}}
+        self._absent = set()  # tool names that raised FileNotFoundError once
+        self._running = False
+
+    @staticmethod
+    def _empty_summary():
+        return {
+            'wifi': {'available': False, 'enabled': False, 'connected': False,
+                     'ssid': None, 'signal': None},
+            'bluetooth': {'available': False, 'powered': False,
+                          'connected_count': 0},
+            'battery': {'available': False, 'percent': None,
+                        'plugged_in': False, 'state': 'unknown'},
+            'volume': {'available': False, 'volume': None, 'muted': None},
+        }
+
+    def _run(self, cmd):
+        """subprocess.run with the SHORT probe timeout. Records a tool the moment
+        it raises FileNotFoundError and skips it forever after, so a known-absent
+        tool never costs a spawn again. Returns None on any failure."""
+        tool = cmd[0]
+        if tool in self._absent:
+            return None
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=self.PROBE_TIMEOUT_S)
+        except FileNotFoundError:
+            self._absent.add(tool)
+            return None
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+
+    def _probe_wifi(self):
+        wifi = {'available': False, 'enabled': False, 'connected': False,
+                'ssid': None, 'signal': None}
+        r = self._run(['nmcli', 'radio', 'wifi'])
+        if r and r.returncode == 0:
+            wifi['available'] = True
+            wifi['enabled'] = r.stdout.strip().lower() == 'enabled'
+        r = self._run(['nmcli', '-t', '-f', 'ACTIVE,SSID,SIGNAL',
+                       'device', 'wifi'])
+        if r and r.returncode == 0:
+            wifi['available'] = True
+            for line in r.stdout.strip().split('\n'):
+                parts = line.split(':')
+                if len(parts) >= 2 and parts[0] == 'yes':
+                    wifi['connected'] = True
+                    wifi['ssid'] = parts[1] or None
+                    if len(parts) >= 3 and parts[2].isdigit():
+                        wifi['signal'] = int(parts[2])
+                    break
+        return wifi
+
+    def _probe_bluetooth(self):
+        bt = {'available': False, 'powered': False, 'connected_count': 0}
+        r = self._run(['bluetoothctl', 'show'])
+        if r and r.returncode == 0:
+            bt['available'] = True
+            for line in r.stdout.split('\n'):
+                if 'Powered:' in line:
+                    bt['powered'] = 'yes' in line.lower()
+                    break
+        if bt['powered']:
+            r = self._run(['bluetoothctl', 'devices', 'Connected'])
+            if r and r.returncode == 0:
+                bt['connected_count'] = len(
+                    [ln for ln in r.stdout.strip().split('\n')
+                     if ln.strip().startswith('Device')])
+        return bt
+
+    def _probe_battery(self):
+        # psutil + sysfs (the canonical cross-platform path). No subprocess.
+        battery = {'available': False, 'percent': None,
+                   'plugged_in': False, 'state': 'unknown'}
+        try:
+            import psutil
+            b = psutil.sensors_battery()
+            if b is not None:
+                battery['available'] = True
+                battery['percent'] = int(round(b.percent))
+                battery['plugged_in'] = bool(b.power_plugged)
+                battery['state'] = ('charging' if b.power_plugged
+                                    else 'discharging')
+        except (ImportError, RuntimeError, OSError):
+            pass
+        if not battery['available']:
+            try:
+                import glob as _g
+                bats = sorted(_g.glob('/sys/class/power_supply/BAT*'))
+                if bats:
+                    d = bats[0]
+                    try:
+                        with open(d + '/capacity') as f:
+                            cap = f.read().strip()
+                        if cap.isdigit():
+                            battery['available'] = True
+                            battery['percent'] = int(cap)
+                    except (OSError, ValueError):
+                        pass
+                    try:
+                        with open(d + '/status') as f:
+                            st = f.read().strip().lower()
+                        if st:
+                            battery['state'] = st
+                            battery['plugged_in'] = st in ('charging', 'full')
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+        return battery
+
+    def _probe_wifi_list(self):
+        networks = []
+        connected = {}
+        r = self._run(['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY,ACTIVE',
+                       'device', 'wifi', 'list'])
+        if r and r.returncode == 0:
+            for line in r.stdout.strip().split('\n'):
+                parts = line.split(':')
+                if len(parts) >= 4 and parts[0]:
+                    try:
+                        net = {'ssid': parts[0], 'signal': int(parts[1] or 0),
+                               'security': parts[2], 'active': parts[3] == 'yes'}
+                    except ValueError:
+                        continue
+                    networks.append(net)
+                    if net['active']:
+                        connected = net
+        r = self._run(['hostname', '-I'])
+        if r and r.returncode == 0 and r.stdout.strip():
+            connected['ip'] = r.stdout.strip().split()[0]
+        return {'networks': networks[:20], 'connected': connected}
+
+    def refresh(self):
+        """Probe every domain once and atomically swap the cached snapshots.
+        Safe to call from the daemon loop OR directly (tests). Builds fresh dicts
+        and replaces the references under the lock — never mutates a dict a reader
+        may be holding."""
+        summary = {
+            'wifi': self._probe_wifi(),
+            'bluetooth': self._probe_bluetooth(),
+            'battery': self._probe_battery(),
+            'volume': _volume_get(timeout=self.PROBE_TIMEOUT_S),
+        }
+        wifi_list = self._probe_wifi_list()
+        with self._lock:
+            self._summary = summary
+            self._wifi = wifi_list
+
+    def summary(self):
+        with self._lock:
+            return copy.deepcopy(self._summary)
+
+    def wifi_networks(self):
+        with self._lock:
+            return copy.deepcopy(self._wifi)
+
+    def start(self):
+        """Start the background prober once (idempotent). Spawns a daemon thread
+        only — it never probes on the calling thread."""
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+        threading.Thread(target=self._loop, name='hart-connectivity-cache',
+                         daemon=True).start()
+
+    def _loop(self):
+        while self._running:
+            try:
+                self.refresh()
+            except Exception:
+                pass
+            time.sleep(self.REFRESH_INTERVAL_S)
+
+
+# One process-wide prober, lazy-started (idempotently) by the connectivity
+# request handlers on the first poll — so a process that builds the app but never
+# polls (and unrelated tests) never spawns the daemon, and the start works in
+# BOTH serve_forever() and the co-located Nunba bundle (the WebView polls either
+# way).
+_connectivity_cache = _ConnectivityCache()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -779,16 +1032,25 @@ class LiquidUIService:
 
         # Performance tier detection
         perf = theme.get('performance', {})
-        is_potato = perf.get('disable_blur', False)
 
-        # GPU render verdict (#137): the hardware signal, orthogonal to the
-        # theme `is_potato` tier. When the shell is software-composited
-        # (GSK=cairo/llvmpipe) the cinematic glass re-rasterises on the CPU on
-        # every frame, so we tag <body> with `gpu-software` and hartResponsive.css
-        # strips the GPU-only effects from the hot surfaces (keystroke-to-glyph
-        # < 1 frame). Full cinematic stays on `gpu-hardware`. Reuses the SAME
-        # /run/hart/gpu-render verdict the GTK4 host reads for its GSK choice.
-        gpu_body_class = 'gpu-' + read_gpu_render_mode()  # gpu-software|gpu-hardware
+        # GPU render verdict (#137) — the hardware signal. Read ONCE here so the
+        # JS reduced-effects gate (PERF.potato) and the CSS floor (body.gpu-*)
+        # both derive from the SAME probe verdict (no second read, no parallel
+        # path). When the shell is software-composited (GSK=cairo/llvmpipe) the
+        # cinematic glass re-rasterises on the CPU every frame, so we tag <body>
+        # `gpu-software` (hartResponsive.css strips the GPU-only effects from the
+        # hot surfaces) AND force the potato tier below.
+        gpu_mode = read_gpu_render_mode()  # 'hardware' | 'software'
+        gpu_body_class = 'gpu-' + gpu_mode  # gpu-software | gpu-hardware
+
+        # Potato (reduced-effects) tier: TRUE when the theme disables blur OR the
+        # box is software-rendered. The GPU-only cinematic (backdrop blur, layered
+        # shadows, continuous animation, ambient/grain) is exactly what pegs a core
+        # and lags a keystroke ~500ms on a software-composited box, so software
+        # render must shed it — the same verdict the CSS floor uses, wired so the
+        # inline-script PERF.potato + window.HART_PERF.potato engage on real
+        # software-render hardware, not just on the theme tier.
+        is_potato = perf.get('disable_blur', False) or gpu_mode == 'software'
 
         # Accessibility state — the SAME live dict the /api/shell/accessibility
         # routes mutate (same process). High-contrast + reduced-motion apply as
@@ -3000,12 +3262,24 @@ function taskbarClick(id) {{
 }}
 
 // ═══ Drag & Resize ═══
+// rAF-batched + GPU transform (matches hartDesktop.js icon + touch-titlebar
+// drag). The old handler wrote p.el.style.left/top on EVERY mousemove (layout-
+// inducing) AND read window.innerWidth/innerHeight right after dirtying layout
+// (a forced reflow) 60-125x/sec — on a software-composited box cairo re-raster-
+// ised the whole glass per event and pinned the UI thread (the drag freeze).
+// Now a MOVE only sets transform:translate (no layout) and commits left/top once
+// on drop; innerWidth/innerHeight are cached at dragstart so the commit never
+// reads layout it just wrote. Resize is rAF-coalesced so width/height change at
+// most once per frame instead of per event.
 let dragState = null;
 function startDrag(e, id) {{
   if(e.button!==0) return;
   const p = panels[id];
   if(!p||p.max) return;
-  dragState = {{id, mode:'move', sx:e.clientX, sy:e.clientY, ox:p.el.offsetLeft, oy:p.el.offsetTop}};
+  dragState = {{id, mode:'move', sx:e.clientX, sy:e.clientY,
+    ox:p.el.offsetLeft, oy:p.el.offsetTop,
+    vw:window.innerWidth, vh:window.innerHeight, dx:0, dy:0, raf:0}};
+  p.el.style.willChange = 'transform';
   // Notify the effects module (snap-zones) of the canonical drag start so it
   // reuses THIS drag lifecycle instead of forking its own mousedown detection.
   // No-op unless hartEffects.js is loaded + effects are enabled (not potato).
@@ -3016,39 +3290,60 @@ function startResize(e, id) {{
   if(e.button!==0) return;
   const p = panels[id];
   if(!p) return;
-  dragState = {{id, mode:'resize', sx:e.clientX, sy:e.clientY, ow:p.el.offsetWidth, oh:p.el.offsetHeight}};
+  dragState = {{id, mode:'resize', sx:e.clientX, sy:e.clientY,
+    ow:p.el.offsetWidth, oh:p.el.offsetHeight, dx:0, dy:0, raf:0}};
   e.preventDefault();
 }}
-document.addEventListener('mousemove', e=>{{
-  if(!dragState) return;
-  const dx = e.clientX - dragState.sx, dy = e.clientY - dragState.sy;
-  const p = panels[dragState.id];
+function _dragFrame() {{
+  const d = dragState;
+  if(!d) return;
+  d.raf = 0;
+  const p = panels[d.id];
   if(!p) return;
-  if(dragState.mode==='move') {{
-    // Clamp the titlebar on-screen — it could be dragged under the top bar,
-    // below the taskbar, or past a side until unreachable (window lost
-    // unrecoverably). Keep >=80px on each axis.
-    const KEEP=80, TOP=40, TASK=44;
-    let nx = dragState.ox+dx, ny = dragState.oy+dy;
-    nx = Math.min(Math.max(nx, KEEP - p.el.offsetWidth), window.innerWidth - KEEP);
-    ny = Math.min(Math.max(ny, TOP), window.innerHeight - TASK - 28);
-    p.el.style.left = nx+'px'; p.el.style.top = ny+'px';
-    p.x = nx; p.y = ny;
+  if(d.mode==='move') {{
+    // GPU-composited move — translate only, no layout. left/top commit on drop.
+    p.el.style.transform = 'translate('+d.dx+'px,'+d.dy+'px)';
   }} else {{
-    const nw = Math.max(320, dragState.ow+dx), nh = Math.max(240, dragState.oh+dy);
+    const nw = Math.max(320, d.ow+d.dx), nh = Math.max(240, d.oh+d.dy);
     p.el.style.width = nw+'px'; p.el.style.height = nh+'px';
     p.w = nw; p.h = nh;
   }}
+}}
+document.addEventListener('mousemove', e=>{{
+  const d = dragState;
+  if(!d) return;
+  d.dx = e.clientX - d.sx; d.dy = e.clientY - d.sy;
+  if(d.raf) return;                                  // already scheduled this frame
+  d.raf = requestAnimationFrame(_dragFrame);
 }});
 document.addEventListener('mouseup', e=>{{
+  const d = dragState;
+  dragState = null;
+  if(!d) return;
+  if(d.raf) {{ cancelAnimationFrame(d.raf); d.raf = 0; }}
+  const p = panels[d.id];
+  if(p) {{
+    p.el.style.willChange = '';
+    if(d.mode==='move') {{
+      // Commit the GPU transform back to left/top, clamped on-screen using the
+      // innerWidth/innerHeight cached at dragstart (no forced reflow). Keep the
+      // titlebar >=80px reachable so a window can't be lost under the bars.
+      p.el.style.transform = '';
+      const KEEP=80, TOP=40, TASK=44;
+      let nx = d.ox+d.dx, ny = d.oy+d.dy;
+      nx = Math.min(Math.max(nx, KEEP - p.el.offsetWidth), d.vw - KEEP);
+      ny = Math.min(Math.max(ny, TOP), d.vh - TASK - 28);
+      p.el.style.left = nx+'px'; p.el.style.top = ny+'px';
+      p.x = nx; p.y = ny;
+    }}
+  }}
   // Hand the effects module the final pointer position + the panel id so a
   // snap-zone it highlighted during the drag can commit via the canonical
-  // snapPanel. Fired BEFORE clearing dragState so the listener sees the id.
-  if(dragState && dragState.mode==='move'){{
+  // snapPanel. Uses the id captured before dragState was cleared.
+  if(d.mode==='move'){{
     try{{ window.dispatchEvent(new CustomEvent('hart:dragend',
-      {{detail:{{id:dragState.id, x:e.clientX, y:e.clientY}}}})); }}catch(_e){{}}
+      {{detail:{{id:d.id, x:e.clientX, y:e.clientY}}}})); }}catch(_e){{}}
   }}
-  dragState=null;
 }});
 
 // ═══ System Panels (design system) ═══
@@ -5674,39 +5969,15 @@ function renderAgentOverlay(ev) {{
                     pass
             return jsonify({'devices': devices[:50]})
 
-        # ── Shell APIs: WiFi ──
+        # ── Shell APIs: WiFi (CACHED) ──
+        # Returns the wifi network list the background _connectivity_cache prober
+        # keeps fresh — INSTANT, no nmcli/hostname subprocess on the request
+        # thread (CAUSE 1). loadNetworks() fires this on popover-open + every
+        # Rescan; serving the cache means a Rescan can never freeze the shell.
         @app.route('/api/shell/network/wifi', methods=['GET'])
         def shell_wifi():
-            networks = []
-            connected = {}
-            try:
-                r = subprocess.run(
-                    ['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY,ACTIVE',
-                     'device', 'wifi', 'list'],
-                    capture_output=True, text=True, timeout=5)
-                for line in r.stdout.strip().split('\n'):
-                    parts = line.split(':')
-                    if len(parts) >= 4 and parts[0]:
-                        net = {
-                            'ssid': parts[0],
-                            'signal': int(parts[1] or 0),
-                            'security': parts[2],
-                            'active': parts[3] == 'yes',
-                        }
-                        networks.append(net)
-                        if net['active']:
-                            connected = net
-            except Exception:
-                pass
-            try:
-                r = subprocess.run(
-                    ['hostname', '-I'],
-                    capture_output=True, text=True, timeout=3)
-                if r.stdout.strip():
-                    connected['ip'] = r.stdout.strip().split()[0]
-            except Exception:
-                pass
-            return jsonify({'networks': networks[:20], 'connected': connected})
+            _connectivity_cache.start()  # idempotent — lazy-start the prober
+            return jsonify(_connectivity_cache.wifi_networks())
 
         # NOTE: distinct view-function name (shell_network_wifi_connect, NOT
         # shell_wifi_connect) + explicit endpoint=. The canonical hardware-control
@@ -5968,45 +6239,12 @@ function renderAgentOverlay(ev) {{
             return jsonify(info)
 
         # ── Shell APIs: Volume (wpctl-first, pactl fallback) ──
-        # The top-bar connectivity cluster needs a SIMPLE default-sink volume
-        # get/set/mute that does not require the caller to know a sink_id (the
-        # existing /api/shell/audio/* endpoints are per-sink + pactl-only). wpctl
-        # (WirePlumber, the PipeWire session manager shipped on the desktop) is
-        # preferred; pactl is the fallback. EVERY call is subprocess.run with a
-        # timeout and degrades to {available:false} when neither tool is present
-        # (the live USB may have neither) — never crashes, never hangs.
-        def _vol_run(cmd, timeout=4):
-            try:
-                return subprocess.run(cmd, capture_output=True, text=True,
-                                      timeout=timeout)
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                return None
-
-        def _volume_get():
-            # wpctl get-volume @DEFAULT_AUDIO_SINK@ -> "Volume: 0.55 [MUTED]"
-            r = _vol_run(['wpctl', 'get-volume', '@DEFAULT_AUDIO_SINK@'])
-            if r and r.returncode == 0 and 'Volume:' in r.stdout:
-                try:
-                    frac = float(r.stdout.split('Volume:')[1].strip().split()[0])
-                    return {'available': True, 'tool': 'wpctl',
-                            'volume': int(round(frac * 100)),
-                            'muted': 'MUTED' in r.stdout.upper()}
-                except (ValueError, IndexError):
-                    pass
-            # pactl fallback
-            mr = _vol_run(['pactl', 'get-sink-mute', '@DEFAULT_SINK@'])
-            vr = _vol_run(['pactl', 'get-sink-volume', '@DEFAULT_SINK@'])
-            if vr and vr.returncode == 0 and '%' in vr.stdout:
-                try:
-                    pct = int(vr.stdout.split('/')[1].strip().rstrip('%'))
-                    muted = bool(mr and mr.returncode == 0 and
-                                 'yes' in mr.stdout.lower())
-                    return {'available': True, 'tool': 'pactl',
-                            'volume': max(0, min(150, pct)), 'muted': muted}
-                except (ValueError, IndexError):
-                    pass
-            return {'available': False, 'volume': None, 'muted': None}
-
+        # The default-sink volume get/set/mute helpers (_vol_run / _volume_get)
+        # are module-level (defined next to read_gpu_render_mode) so the
+        # background connectivity prober and these WRITE routes share ONE
+        # implementation — no parallel volume path. The GET below reads the
+        # default sink directly (a user action, not the 8s poll); the poll's
+        # volume rides the cached connectivity snapshot instead.
         @app.route('/api/shell/volume', methods=['GET'],
                    endpoint='shell_volume_get')
         def shell_volume_get():
@@ -6056,115 +6294,27 @@ function renderAgentOverlay(ev) {{
                             'error': 'no volume tool (wpctl/pactl)'}), 200
 
         # ── Shell APIs: Connectivity summary (ONE poll for the top-bar) ──
-        # The top-bar indicator cluster (hartConnectivity.js) polls THIS single
-        # endpoint so it makes one request per tick instead of four. Each block is
-        # independently guarded (subprocess timeout + FileNotFoundError/OSError
-        # caught) so a missing tool only blanks its own indicator ('available':
-        # false), never the whole summary, and never crashes/hangs. The quick-
-        # settings ACTIONS (scan, connect, toggle, set-volume) hit the existing
-        # per-domain endpoints — this is read-only aggregation, NOT a parallel
-        # control path.
-        #
-        # DRY DEBT (Gate 4, tracked): the wifi-radio / bt-power / battery PROBES
-        # below duplicate the canonical probes in shell_system_apis.py
-        # (shell_wifi_status, shell_bt_status, _battery_info). They are NOT reused
-        # because those are nested closures inside register_shell_system_routes,
-        # not importable without restructuring route registration (a higher
-        # iso-build risk than warranted for this fix). TODO: when those probes are
-        # promoted to module-level pure functions in shell_system_apis.py, call
-        # them here so there is ONE probe implementation per domain and the shapes
-        # cannot drift (the canonical wifi also reads FREQ/IP; battery reads
-        # health/AC/voltage).
+        # hartConnectivity.js polls THIS single endpoint every ~8s (plus on
+        # popover-open + toggle). It returns the snapshot the background
+        # _connectivity_cache prober keeps fresh — INSTANT, no nmcli/bluetoothctl/
+        # wpctl subprocess on the waitress request thread (CAUSE 1: the synchronous
+        # six-subprocess probe here saturated the 1-2 thread pool on a software-
+        # rendered box and froze every shell fetch). The quick-settings WRITE
+        # actions (scan/connect/toggle/set-volume) still hit the per-domain
+        # endpoints inline; this is read-only aggregation, NOT a parallel control
+        # path. The prober's wifi-radio / bt-power / battery probes still mirror
+        # the canonical ones in shell_system_apis.py (those remain nested closures
+        # inside register_shell_system_routes; promoting them to module-level pure
+        # functions would let both call ONE implementation — tracked TODO).
         @app.route('/api/shell/connectivity/summary', methods=['GET'],
                    endpoint='shell_connectivity_summary')
         def shell_connectivity_summary():
-            wifi = {'available': False, 'enabled': False, 'connected': False,
-                    'ssid': None, 'signal': None}
-            try:
-                r = subprocess.run(['nmcli', 'radio', 'wifi'],
-                                   capture_output=True, text=True, timeout=4)
-                if r.returncode == 0:
-                    wifi['available'] = True
-                    wifi['enabled'] = r.stdout.strip().lower() == 'enabled'
-                r = subprocess.run(
-                    ['nmcli', '-t', '-f', 'ACTIVE,SSID,SIGNAL',
-                     'device', 'wifi'],
-                    capture_output=True, text=True, timeout=4)
-                if r.returncode == 0:
-                    wifi['available'] = True
-                    for line in r.stdout.strip().split('\n'):
-                        parts = line.split(':')
-                        if len(parts) >= 2 and parts[0] == 'yes':
-                            wifi['connected'] = True
-                            wifi['ssid'] = parts[1] or None
-                            if len(parts) >= 3 and parts[2].isdigit():
-                                wifi['signal'] = int(parts[2])
-                            break
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                pass
-
-            bt = {'available': False, 'powered': False, 'connected_count': 0}
-            try:
-                r = subprocess.run(['bluetoothctl', 'show'],
-                                   capture_output=True, text=True, timeout=4)
-                if r.returncode == 0:
-                    bt['available'] = True
-                    for line in r.stdout.split('\n'):
-                        if 'Powered:' in line:
-                            bt['powered'] = 'yes' in line.lower()
-                            break
-                if bt['powered']:
-                    r = subprocess.run(['bluetoothctl', 'devices', 'Connected'],
-                                       capture_output=True, text=True, timeout=4)
-                    if r.returncode == 0:
-                        bt['connected_count'] = len(
-                            [ln for ln in r.stdout.strip().split('\n')
-                             if ln.strip().startswith('Device')])
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                pass
-
-            # Battery: reuse psutil + sysfs (the canonical cross-platform path).
-            battery = {'available': False, 'percent': None,
-                       'plugged_in': False, 'state': 'unknown'}
-            try:
-                import psutil
-                b = psutil.sensors_battery()
-                if b is not None:
-                    battery['available'] = True
-                    battery['percent'] = int(round(b.percent))
-                    battery['plugged_in'] = bool(b.power_plugged)
-                    battery['state'] = ('charging' if b.power_plugged
-                                        else 'discharging')
-            except (ImportError, RuntimeError, OSError):
-                pass
-            if not battery['available']:
-                try:
-                    import glob as _g
-                    bats = sorted(_g.glob('/sys/class/power_supply/BAT*'))
-                    if bats:
-                        d = bats[0]
-                        try:
-                            with open(d + '/capacity') as f:
-                                cap = f.read().strip()
-                            if cap.isdigit():
-                                battery['available'] = True
-                                battery['percent'] = int(cap)
-                        except (OSError, ValueError):
-                            pass
-                        try:
-                            with open(d + '/status') as f:
-                                st = f.read().strip().lower()
-                            if st:
-                                battery['state'] = st
-                                battery['plugged_in'] = st in (
-                                    'charging', 'full')
-                        except OSError:
-                            pass
-                except OSError:
-                    pass
-
-            return jsonify({'wifi': wifi, 'bluetooth': bt,
-                            'battery': battery, 'volume': _volume_get()})
+            # Lazy-start the background prober on the first poll (idempotent — it
+            # only spawns a daemon thread, never probes on this request thread).
+            # Started here, not at app build, so a process that builds the app but
+            # never polls (and unrelated tests) never spawns the prober.
+            _connectivity_cache.start()
+            return jsonify(_connectivity_cache.summary())
 
         # ── Shell APIs: Display ──
         @app.route('/api/shell/display', methods=['GET'])
