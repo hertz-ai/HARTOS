@@ -7,6 +7,10 @@
 > `memory/hartos_full_os_spec_app_integration_and_system_mgmt_2026-06-28.md`.
 > Every workstream below is tracked to: implement -> self-review -> adversarial verify ->
 > ~100% behavioral test coverage -> render proof -> real-hardware proof.
+>
+> **Home / desktop LOOK + LAYOUT + FEEL instructions live in the recovered checklist:**
+> `docs/design/HOME_DESKTOP_DESIGN_CHECKLIST.md` (the anti-lost-instruction artifact -
+> every desktop/home design ask, grouped + verbatim + message-numbered, plus the W1 audit).
 
 ## 0. THE RULES (binding — every task obeys ALL of these)
 

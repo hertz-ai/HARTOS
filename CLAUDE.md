@@ -297,6 +297,41 @@ Critical pinned versions (post Apr/May 2026 split-package migration):
 
 ---
 
+## Desktop & Home Design — Consult the Checklist FIRST (BINDING)
+
+**Before changing ANY desktop / home / shell UI design — layout, canvas,
+the orb, cards/rows, top bar, taskbar, omnibox, interaction, onboarding,
+the agentic Liquid-UI surface — you MUST read and honor
+`docs/design/HOME_DESKTOP_DESIGN_CHECKLIST.md` FIRST.**
+
+It is the consolidated, durable record of the steward's design
+instructions, recovered from the FULL session history (1,797 of the
+steward's own typed messages; 11 groups a–k, ~55 rules, each with a
+verbatim quote + the source message number). It is the SOURCE OF TRUTH
+for desktop look/feel. The steward set this rule (2026-06-29): *"this
+doc shd be consulted whenever we are changing the design of desktop."*
+
+1. **Consult before you change.** Any edit to `hartHome.*`, `hartHero.*`,
+   `voiceOrbViz.js`, `hartDesktop.js`, `hartResponsive.css`, the shell
+   render in `liquid_ui_service.py`, or the compositor's visual surface →
+   read the checklist first; confirm the change does not regress an
+   APPLIED item.
+2. **Update it when intent changes.** A new design instruction from the
+   steward gets added to the checklist (with the quote) in the SAME
+   change — never let an instruction live only in chat again.
+3. **Audit after you build.** A desktop-design change isn't done until
+   it's scored against the relevant items (APPLIED / PARTIAL / MISSING),
+   like the W1 audit at the bottom of the doc.
+4. **Never contradict an EMPHATIC rule** (group (a): "NOT a webpage / no
+   vertical page scroll / fixed canvas", and the like). If a change would,
+   STOP and surface it to the steward.
+
+Why: the steward's instructions kept scattering across sessions and felt
+"lost." This checklist + this rule make them structurally un-loseable.
+See `memory/feedback_desktop_design_checklist_binding.md`.
+
+---
+
 ## Change Protocol — Standing Rules for EVERY Edit
 
 **Applies to every change: bug fix, feature, refactor, test, doc, build
