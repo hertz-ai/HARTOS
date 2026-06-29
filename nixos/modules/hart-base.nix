@@ -268,7 +268,14 @@ in
     networking = {
       hostName = lib.mkDefault "hart-node";
       firewall = {
-        enable = true;
+        # mkDefault: the docker-server image format (nixpkgs docker-image.nix)
+        # sets networking.firewall.enable = false at normal priority for the OCI
+        # container; a plain `true` here (this base module is included by EVERY
+        # variant) collided with it ("conflicting definition values"), eval-
+        # failing only the docker-server target. mkDefault yields to the
+        # container's false, while ISO/host variants — which have no competing
+        # definition — still resolve to true (unchanged firewall behaviour).
+        enable = lib.mkDefault true;
         allowedTCPPorts = [ cfg.ports.backend 22 ];
         allowedUDPPorts = [ cfg.ports.discovery ];
       };
