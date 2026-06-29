@@ -149,5 +149,68 @@ class TestThreadLocalTaskSource(unittest.TestCase):
         thread_local_data.clear_task_source()
 
 
+class TestGLMRegistration(unittest.TestCase):
+    """Behavioural test for the GLM 5.2 (Zhipu) backend registration.
+
+    Drives the real _register_defaults() with the env boundary monkeypatched,
+    then asserts the observable registry state (the registered ModelBackend's
+    config_list_entry) — not a source-string grep.
+    """
+
+    _GLM_ENV = ('GLM_API_KEY', 'ZHIPUAI_API_KEY', 'GLM_BASE_URL', 'GLM_MODEL')
+
+    def setUp(self):
+        # Snapshot + clear GLM env so each case is deterministic regardless of
+        # what the CI/host environment has set.
+        self._saved = {k: os.environ.get(k) for k in self._GLM_ENV}
+        for k in self._GLM_ENV:
+            os.environ.pop(k, None)
+        from integrations.agent_engine import model_registry as mr
+        self.mr = mr
+        mr.model_registry.unregister('glm-5.2')
+
+    def tearDown(self):
+        self.mr.model_registry.unregister('glm-5.2')
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_registered_when_key_set(self):
+        os.environ['GLM_API_KEY'] = 'test-glm-key'
+        self.mr._register_defaults()
+        b = self.mr.model_registry.get_model('glm-5.2')
+        self.assertIsNotNone(b, 'GLM backend must register when GLM_API_KEY is set')
+        self.assertEqual(b.tier, self.mr.ModelTier.EXPERT)
+        self.assertFalse(b.is_local)
+        entry = b.config_list_entry
+        self.assertEqual(entry['api_key'], 'test-glm-key')
+        self.assertEqual(entry['model'], 'glm-5.2')
+        # OpenAI-compatible Zhipu endpoint (z.ai gateway by default)
+        self.assertEqual(entry['base_url'], 'https://api.z.ai/api/paas/v4')
+
+    def test_not_registered_without_key(self):
+        # setUp cleared every GLM/ZHIPUAI env var.
+        self.mr._register_defaults()
+        self.assertIsNone(
+            self.mr.model_registry.get_model('glm-5.2'),
+            'GLM backend must NOT register without a key',
+        )
+
+    def test_zhipuai_key_fallback_and_overrides(self):
+        os.environ['ZHIPUAI_API_KEY'] = 'zp-key'
+        os.environ['GLM_BASE_URL'] = 'https://open.bigmodel.cn/api/paas/v4'
+        os.environ['GLM_MODEL'] = 'glm-4.6'
+        self.mr._register_defaults()
+        b = self.mr.model_registry.get_model('glm-5.2')
+        self.assertIsNotNone(b)
+        entry = b.config_list_entry
+        self.assertEqual(entry['api_key'], 'zp-key')          # ZHIPUAI fallback
+        self.assertEqual(entry['model'], 'glm-4.6')           # GLM_MODEL override
+        self.assertEqual(entry['base_url'],
+                         'https://open.bigmodel.cn/api/paas/v4')  # GLM_BASE_URL override
+
+
 if __name__ == '__main__':
     unittest.main()

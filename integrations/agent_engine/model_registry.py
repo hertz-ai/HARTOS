@@ -429,6 +429,31 @@ def _register_defaults():
             cost_per_1k_tokens=1.5,
         ))
 
+    # 5b. GLM 5.2 (Zhipu / Z.ai — expert tier, OpenAI-compatible API — if key set)
+    #     Zhipu exposes an OpenAI-compatible endpoint, so this registers exactly
+    #     like Groq/DeepSeek/Claude above (no special client). GLM_API_KEY is the
+    #     primary env var; ZHIPUAI_API_KEY (Zhipu's own convention) is accepted as
+    #     a fallback. base_url defaults to the international z.ai gateway — set
+    #     GLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4 for the mainland-China
+    #     endpoint. GLM_MODEL overrides the model string if the served version
+    #     differs (e.g. glm-4.6).
+    _glm_key = os.environ.get('GLM_API_KEY') or os.environ.get('ZHIPUAI_API_KEY')
+    if _glm_key:
+        model_registry.register(ModelBackend(
+            model_id='glm-5.2',
+            display_name='GLM 5.2 (Zhipu)',
+            tier=ModelTier.EXPERT,
+            config_list_entry={
+                'model': os.environ.get('GLM_MODEL', 'glm-5.2'),
+                'api_key': _glm_key,
+                'base_url': os.environ.get('GLM_BASE_URL', 'https://api.z.ai/api/paas/v4'),
+                'price': [0.0006, 0.0022],
+            },
+            avg_latency_ms=2000.0,
+            accuracy_score=0.90,
+            cost_per_1k_tokens=0.5,
+        ))
+
     # 6. HevolveAI-Core Learning LLM (balanced — local world model, improves over time)
     hevolveai_url = os.environ.get('HEVOLVEAI_API_URL')
     if hevolveai_url:
