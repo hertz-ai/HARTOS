@@ -29,6 +29,72 @@
     catch (e) { return false; }
   }
 
+  // PERF gate (#137): the perf pass stamps <body> with gpu-hardware|gpu-software
+  // from /run/hart/gpu-render. Heavy continuous animation / blur runs ONLY when
+  // the GPU made a real GL context; otherwise the orb stays calm + static so the
+  // software-render path doesn't pay for compositing it can't afford. Default
+  // (no class) = calm, mirroring hartHome.css's "hardware is opt-in" convention.
+  function gpuHardware() {
+    try { return !!(document.body && document.body.classList && document.body.classList.contains('gpu-hardware')); }
+    catch (e) { return false; }
+  }
+
+  // ── Breathing brand aura: the always-on idle presence rings + halo that frame
+  // the orb as the live CENTERPIECE (the steward-mockup look the canvas alone
+  // lacks at idle). The voice canvas (voiceOrbViz.js) stays the single iridescent
+  // body; this only adds concentric brand rings + a soft halo AROUND it (the halo
+  // is transparent over the core, so it never washes the orb regardless of paint
+  // order, no z-index/stacking fragility). Animations are gated to .gpu-hardware;
+  // on software/reduced-motion it is flat + static. Injected once (own scoped
+  // <style>, id-guarded) since this module owns only the JS. Old-WebKit-safe:
+  // string concat, no template literals / optional chaining / nullish coalescing.
+  function injectOrbAuraStyle() {
+    if (document.getElementById('hart-hero-aura-style')) return;
+    var css = '' +
+      '.hart-hero-aura{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}' +
+      '.hart-hero-aura .hha-ring,.hart-hero-aura .hha-halo{position:absolute;left:50%;top:50%;' +
+        'border-radius:50%;transform:translate(-50%,-50%);box-sizing:border-box}' +
+      '.hart-hero-aura .hha-r1{width:330px;height:330px;border:1px solid rgba(0,230,195,.22)}' +
+      '.hart-hero-aura .hha-r2{width:398px;height:398px;border:1px solid rgba(155,92,255,.16)}' +
+      '.hart-hero-aura .hha-halo{width:362px;height:362px;' +
+        'background:radial-gradient(circle, transparent 44%, rgba(41,197,255,.13) 56%, rgba(155,92,255,.09) 66%, transparent 78%)}' +
+      // Hardware: the rings + halo BREATHE in sync with the orb (~5s period).
+      'body.gpu-hardware .hart-hero-aura .hha-r1{animation:hha-breathe 5s ease-in-out infinite}' +
+      'body.gpu-hardware .hart-hero-aura .hha-r2{animation:hha-breathe 5s ease-in-out infinite .6s}' +
+      'body.gpu-hardware .hart-hero-aura .hha-halo{filter:blur(7px);animation:hha-halo 5s ease-in-out infinite}' +
+      '@keyframes hha-breathe{0%,100%{transform:translate(-50%,-50%) scale(1);opacity:.5}' +
+        '50%{transform:translate(-50%,-50%) scale(1.07);opacity:.95}}' +
+      '@keyframes hha-halo{0%,100%{transform:translate(-50%,-50%) scale(1);opacity:.6}' +
+        '50%{transform:translate(-50%,-50%) scale(1.05);opacity:1}}' +
+      // Live state tints (centerpiece reacts to listening / speaking / thinking).
+      '.hart-hero-orbwrap[data-orb-state="listening"] .hart-hero-aura .hha-halo{' +
+        'background:radial-gradient(circle, transparent 42%, rgba(0,230,195,.20) 56%, transparent 78%)}' +
+      '.hart-hero-orbwrap[data-orb-state="speaking"] .hart-hero-aura .hha-halo{' +
+        'background:radial-gradient(circle, transparent 42%, rgba(41,197,255,.20) 56%, transparent 78%)}' +
+      '.hart-hero-orbwrap[data-orb-state="thinking"] .hart-hero-aura .hha-halo{' +
+        'background:radial-gradient(circle, transparent 42%, rgba(255,46,154,.18) 56%, rgba(155,92,255,.12) 70%, transparent 80%)}' +
+      // Software / reduced-motion: calm + static (no animation, no blur).
+      'body:not(.gpu-hardware) .hart-hero-aura .hha-halo{filter:none}' +
+      'html.a11y-rmotion .hart-hero-aura .hha-r1,html.a11y-rmotion .hart-hero-aura .hha-r2,' +
+        'html.a11y-rmotion .hart-hero-aura .hha-halo{animation:none}';
+    var st = document.createElement('style');
+    st.id = 'hart-hero-aura-style';
+    st.textContent = css;
+    (document.head || document.documentElement).appendChild(st);
+  }
+  function buildOrbAura(orb) {
+    if (!orb || orb.querySelector('.hart-hero-aura')) return;   // build once
+    injectOrbAuraStyle();
+    var aura = document.createElement('div');
+    aura.className = 'hart-hero-aura';
+    aura.setAttribute('aria-hidden', 'true');
+    var halo = document.createElement('div'); halo.className = 'hha-halo';
+    var r1 = document.createElement('div'); r1.className = 'hha-ring hha-r1';
+    var r2 = document.createElement('div'); r2.className = 'hha-ring hha-r2';
+    aura.appendChild(halo); aura.appendChild(r1); aura.appendChild(r2);
+    orb.appendChild(aura);
+  }
+
   function start() {
     // The ORB ITSELF is the click-to-talk control (there is no centre mic glyph).
     // We hang the voice toggle + listening reflection on the orbwrap; the
@@ -122,14 +188,18 @@
     // voice interface. role="button" + tabindex make it keyboard-reachable.
     function speak() { if (typeof window.toggleVoice === 'function') window.toggleVoice(); }
     if (orb) {
+      // The always-on breathing brand aura that frames the orb as the centerpiece.
+      buildOrbAura(orb);
       orb.addEventListener('click', speak);
       orb.addEventListener('keydown', function (e) {
         if (e.key === 'Enter' || e.key === ' ' || e.code === 'Space') { e.preventDefault(); speak(); }
       });
       // Press ripple from the click point — a tactile "you touched the orb" pulse.
       // Purely visual (pointer-events:none span removed after the animation); the
-      // canvas + toggleVoice are untouched.
+      // canvas + toggleVoice are untouched. Gated to hardware render so the
+      // software path stays calm/static (#137): no per-press composite there.
       orb.addEventListener('pointerdown', function (e) {
+        if (!gpuHardware()) return;
         var r = document.createElement('span'); r.className = 'lg-orb-ripple';
         var b = orb.getBoundingClientRect(), s = 120;
         r.style.cssText = 'left:' + (e.clientX - b.left - s / 2) + 'px;top:' + (e.clientY - b.top - s / 2) +
@@ -227,6 +297,7 @@
       chatOpen: false,      // the HART chat is open -> dock beside it
       compact: false,       // minimised to a floating bubble
       merged: false,        // faded toward the background (idle/unused)
+      homeMode: false,      // assembled HOME is showing -> dock to the right hero zone
       raf: 0
     };
 
@@ -246,6 +317,12 @@
       } else if (B.panelOpen) {
         scale = 0.62;
         if (!B.placed) { dy += Math.round(window.innerHeight * 0.32); }
+      } else if (B.homeMode && !B.placed) {
+        // Assembled HOME: dock the orb to the right hero zone so the value-first
+        // earnings copy reads on the LEFT (matches the home layout). A user drag
+        // (B.placed) overrides this; nothing/chat/panel/compact takes priority.
+        dx += Math.round(window.innerWidth * 0.24);
+        dy += -Math.round(window.innerHeight * 0.12);
       }
       s.transform = 'translate(-50%,-50%) translate(' + dx + 'px,' + dy + 'px) scale(' + scale + ')';
       // Merge/demerge: fade toward the background when idle + nothing open, snap
@@ -279,6 +356,15 @@
     // without reaching into our internals (read path for A2UI nudges).
     window.HartOrbWake = wake;     // hoisted below
     window.HartOrbPlace = place;
+    // Assembled HOME (hartHome.js) toggles this so the orb docks to the right
+    // hero zone while the value-first earnings copy reads on the left. Composes
+    // through the single place() writer (Gate 4) - just a flag + a repaint.
+    window.HartOrbHomeMode = function (on) {
+      if (B.homeMode === !!on) return;
+      B.homeMode = !!on;
+      if (on) B.merged = false;
+      place();
+    };
 
     // ── MERGE / DEMERGE: idle-fade after inactivity, full presence on wake ──
     var idleTimer = null;

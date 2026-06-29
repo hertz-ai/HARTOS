@@ -33,6 +33,7 @@ import vm from 'node:vm';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const STATIC = join(HERE, '..', '..', 'integrations', 'agent_engine', 'static');
 const SRC_CTX = join(STATIC, 'hartContextMenu.js');
+const SRC_BRAND = join(STATIC, 'hartBrandArt.js');   // shared brand-art (glyph + gradient)
 const SRC_DESK = join(STATIC, 'hartDesktop.js');
 
 let failures = 0;
@@ -165,8 +166,11 @@ const sandbox = {
 sandbox.window = sandbox;
 vm.createContext(sandbox);
 // Load order matters: the ctx-menu module must define window.HartCtxMenu BEFORE
-// hartDesktop init() runs injectCtxMenu (which then skips the <script> inject).
+// hartDesktop init() runs injectCtxMenu (which then skips the <script> inject);
+// and the shared brand-art (glyph + gradient renderers hartDesktop paints with)
+// must be defined before the module runs.
 vm.runInContext(readFileSync(SRC_CTX, 'utf8'), sandbox, { filename: 'hartContextMenu.js' });
+vm.runInContext(readFileSync(SRC_BRAND, 'utf8'), sandbox, { filename: 'hartBrandArt.js' });
 vm.runInContext(readFileSync(SRC_DESK, 'utf8'), sandbox, { filename: 'hartDesktop.js' });
 
 const W = sandbox.window;

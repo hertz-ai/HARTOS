@@ -64,6 +64,34 @@ def _a2ui_has_xss(value) -> bool:
     return False
 
 
+# ── GPU render verdict (#137 — reduced effects on software render) ───────────
+# hart-gpu-probe (nixos/modules/hart-gpu-probe.nix) runs a boot-time GL smoke
+# test BEFORE the display manager and writes a one-line verdict to
+# /run/hart/gpu-render: `hardware` (the GPU created a real GL context) or
+# `software` (forced llvmpipe/cairo — probe failed / disabled / timed out).
+# The GTK4 layer-shell host already reads this SAME file to pick its GSK
+# renderer; the desktop-shell render reads it too so the CSS can SHED the
+# GPU-only cinematic (backdrop blur, layered shadows, continuous animations)
+# when the shell is CPU-composited — that compositing is exactly what makes a
+# keystroke lag ~500ms and pegs a core on real software-rendered hardware.
+# REUSE the probe's verdict; do NOT invent a second probe.
+_GPU_RENDER_VERDICT_FILE = '/run/hart/gpu-render'
+
+
+def read_gpu_render_mode() -> str:
+    """Return 'hardware' or 'software' from the hart-gpu-probe verdict file.
+
+    Best-effort + fail-SOFTWARE: a missing/unreadable file or any value that is
+    not exactly `hardware` yields 'software' (the safe floor = reduced effects),
+    mirroring the probe's own fail-safe contract. Never raises."""
+    try:
+        with open(_GPU_RENDER_VERDICT_FILE, 'r') as f:
+            verdict = (f.read() or '').strip().lower()
+        return 'hardware' if verdict == 'hardware' else 'software'
+    except (FileNotFoundError, PermissionError, OSError):
+        return 'software'
+
+
 # ═══════════════════════════════════════════════════════════════
 # UI Component Schema (A2UI protocol)
 # ═══════════════════════════════════════════════════════════════
@@ -142,6 +170,17 @@ COMPONENT_TYPES = {
     # app's icon shows up live without a refresh.
     'app_installed': {'props': ['id', 'title', 'icon', 'exec', 'group',
                                 'platform']},
+    # ── Agentic HOME composition (the local LLM paints the Netflix home) ──
+    # The ONE agentic home feed: `compose_home` pushes a {hero, rows} payload
+    # through this type; the SSE consumer routes it to HartHome.compose ->
+    # render (hartHome.js).  Without this allowlist entry agent_ui_update would
+    # reject the push (unknown type) and the SSE consumer branch stays a dead
+    # consumer with no feed.  `home_compose` is the canonical type; `home` is a
+    # back-compat alias the consumer also accepts (so neither is silently
+    # dropped).  hartHome's samplePayload() stays the offline skeleton; an
+    # accepted push overrides it live.
+    'home_compose': {'props': ['hero', 'rows']},
+    'home': {'props': ['hero', 'rows']},
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -599,6 +638,30 @@ class LiquidUIService:
         self.agent_ui_update(agent_id, component)
         return {'status': 'approval_requested', 'component': component}
 
+    def compose_home(self, hero=None, rows=None, agent_id='home_composer'):
+        """Push a composed HOME surface through the ONE wired A2UI channel.
+
+        This is the single SERVER-SIDE producer of the agentic home feed: the
+        local LLM (or any agent) hands a ``{hero, rows}`` composition and it
+        flows agent_ui_update -> SSE -> HartHome.compose -> render (hartHome.js),
+        the SAME governed transport every other agent UI push uses (no parallel
+        path).  hartHome's ``samplePayload()`` is only the offline skeleton; an
+        accepted push overrides it live.
+
+        Single responsibility: build the ``home_compose`` component and delegate
+        to ``agent_ui_update`` (which owns the kill-switch / rate-cap / audit /
+        XSS gating).  Returns True iff the push was accepted (False when the hive
+        is halted, rate-capped, a2ui is disabled, or both fields are empty).
+        """
+        if hero is None and rows is None:
+            return False
+        component = {'type': 'home_compose'}
+        if hero is not None:
+            component['hero'] = hero
+        if rows is not None:
+            component['rows'] = rows
+        return self.agent_ui_update(agent_id, component)
+
     # ─── Voice I/O — preserved ────────────────────────────────
 
     def handle_voice_input(self, audio_path: str) -> dict:
@@ -656,6 +719,15 @@ class LiquidUIService:
         # Performance tier detection
         perf = theme.get('performance', {})
         is_potato = perf.get('disable_blur', False)
+
+        # GPU render verdict (#137): the hardware signal, orthogonal to the
+        # theme `is_potato` tier. When the shell is software-composited
+        # (GSK=cairo/llvmpipe) the cinematic glass re-rasterises on the CPU on
+        # every frame, so we tag <body> with `gpu-software` and hartResponsive.css
+        # strips the GPU-only effects from the hot surfaces (keystroke-to-glyph
+        # < 1 frame). Full cinematic stays on `gpu-hardware`. Reuses the SAME
+        # /run/hart/gpu-render verdict the GTK4 host reads for its GSK choice.
+        gpu_body_class = 'gpu-' + read_gpu_render_mode()  # gpu-software|gpu-hardware
 
         # Accessibility state — the SAME live dict the /api/shell/accessibility
         # routes mutate (same process). High-contrast + reduced-motion apply as
@@ -1887,7 +1959,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 {_CSS_POTATO_OVERRIDE if is_potato else ''}
 </style>
 </head>
-<body>
+<body class="{gpu_body_class}">
 <!-- Hevolve brand boot splash (Lottie). Inline styles: this HTML is inside an
      f-string, so a CSS block would need brace-escaping; the overlay is a single
      element + hartBootSplash.js drives the fade, so inline is cleaner here. -->
@@ -1917,13 +1989,30 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   <div class="hart-hero-chips" id="hart-hero-chips"></div>
 </div>
 
-<!-- Top Bar -->
+<!-- Top Bar - restructured (e1): brand | nav tabs | agent-status | omnibox |
+     orb-sm | avatar | tray. #agent-status and .top-bar-right are KEPT verbatim
+     (hartVisibility reads #agent-status chips; hartConnectivity mounts into
+     .top-bar-right) - the restructure only ADDS the nav/omnibox/orb-sm/avatar. -->
 <div class="top-bar glass" role="banner">
   <div class="start-btn" role="button" tabindex="0" aria-haspopup="menu" aria-label="Start menu" onclick="toggleStartMenu()" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Start Menu (Super)">
     <img src="/shell/static/hevolve-logo.png" class="start-logo" alt="" aria-hidden="true" draggable="false">
-    <span>HART</span>
+    <span>HART OS</span>
   </div>
+  <nav class="top-bar-nav" role="navigation" aria-label="Primary">
+    <button class="tb-tab tb-active" type="button" data-tab="home" onclick="if(window.HartHomeNav)HartHomeNav('home')">Home</button>
+    <button class="tb-tab" type="button" data-tab="agents" onclick="if(window.HartHomeNav)HartHomeNav('agents')">Agents</button>
+    <button class="tb-tab" type="button" data-tab="apps" onclick="if(window.HartHomeNav)HartHomeNav('apps')">Apps</button>
+    <button class="tb-tab" type="button" data-tab="hive" onclick="if(window.HartHomeNav)HartHomeNav('hive')">Hive</button>
+    <button class="tb-tab" type="button" data-tab="earn" onclick="if(window.HartHomeNav)HartHomeNav('earn')">Earn</button>
+  </nav>
   <div class="top-bar-center" id="agent-status" role="status" aria-live="polite" aria-label="Agent status"></div>
+  <button class="top-bar-omni" type="button" aria-label="Ask or search anything" onclick="if(window.HartHome)HartHome.ask('')">
+    <span class="mi material-icons-round" aria-hidden="true">search</span>
+    <span>Ask or search anything</span>
+    <span class="tbo-kbd" aria-hidden="true">Super K</span>
+  </button>
+  <button class="top-bar-orb" id="top-bar-orb" type="button" aria-label="Talk to HART" title="Talk to HART (Super+Space)" onclick="if(window.toggleVoice)toggleVoice()"></button>
+  <button class="top-bar-avatar" id="top-bar-avatar" type="button" aria-label="Your account" title="Your account" onclick="if(window.HartHomeNav)HartHomeNav('account')">H</button>
   <div class="top-bar-right">
     <div class="tray-btn" role="button" tabindex="0" aria-label="Notifications" onclick="openPanel('notifications')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Notifications">
       <span class="mi material-icons-round" aria-hidden="true">notifications</span>
@@ -1959,6 +2048,16 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script defer src="/shell/static/hartSession.js"></script>
 <script defer src="/shell/static/voiceOrbViz.js"></script>
 <script defer src="/shell/static/hartHero.js"></script>
+<!-- Assembled Netflix HOME (W1): the value-first cinematic canvas. Loaded after
+     hartHero.js (it docks the orb via HartOrbHomeMode) and reuses openPanel /
+     acSend / speakText / the resonance+compute-earnings endpoints. The agent
+     re-composes it live via the SSE 'home_compose' branch below. -->
+<link rel="stylesheet" href="/shell/static/hartHome.css">
+<!-- ONE source of the brand-spectrum art language (gradients + glyph rendering),
+     shared by hartHome.js (card art) and hartDesktop.js (icon art tiles). Loaded
+     BEFORE both so window.HartBrandArt is defined when they paint. -->
+<script defer src="/shell/static/hartBrandArt.js"></script>
+<script defer src="/shell/static/hartHome.js"></script>
 <script defer src="/shell/static/hartDesktop.js"></script>
 <script defer src="/shell/static/hartWorkspaces.js"></script>
 <script defer src="/shell/static/hartEffects.js"></script>
@@ -2109,7 +2208,15 @@ const MANIFEST = {manifest_json};
 window.MANIFEST = MANIFEST;
 const SYSTEM_PANELS = {system_json};
 const GROUPS = {groups_json};
-const NUNBA_BASE = '/app/#';
+// The Nunba React dist is a no-basename BrowserRouter (history) SPA served at
+// the ORIGIN ROOT of this shell (see _create_flask_app: /static passthrough +
+// the SPA history fallback). The manifest routes already carry a leading slash
+// ('/social', '/agents', ...), so NUNBA_BASE must be '' (empty): the iframe src
+// becomes a real root-relative HISTORY path the router matches. It must NOT be
+// '/' (that would make '/'+'/social' => '//social', a protocol-relative URL),
+// and must NOT be the old hash-fragment mount: a history router ignores the
+// '#' fragment, so the hashed src resolved to the SPA root => a blank panel.
+const NUNBA_BASE = '';
 
 // De-monochrome: every manifest/system entry carries a resolved per-app `color`
 // (stamped server-side from shell_manifest.with_icon_colors — the single source
@@ -3364,6 +3471,12 @@ function browseDir(path) {{
 
 // ═══ Terminal ═══
 function loadTerminalPanel(el) {{
+  // #138 — IDEMPOTENT mount. A periodic panel re-render (or a re-open) must NOT
+  // wipe a terminal that is mid-command: re-rendering replaces #term-output, so
+  // the running fetch's output node detaches and the session scrollback is lost.
+  // If a terminal is already live in this body, leave it (and any in-flight exec)
+  // untouched instead of recreating it.
+  if(el.querySelector && el.querySelector('#term-output')) return;
   el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Terminal</div>'+
     '<div style="background:#0d0d0d;border-radius:8px;padding:12px;font-family:monospace;min-height:200px;position:relative">'+
     '<div id="term-output" style="color:#a0ffa0;white-space:pre-wrap;max-height:280px;overflow-y:auto;font-size:13px;line-height:1.5"></div>'+
@@ -3374,19 +3487,35 @@ function loadTerminalPanel(el) {{
     '</div></div></div>';
 }}
 function termExec() {{
-  const inp = document.getElementById('term-input');
-  const out = document.getElementById('term-output');
+  // #138 — never launch a second command while one is in flight. A re-entrant
+  // call (Enter mashed, or the panel re-rendering its input) would spin up a
+  // SECOND AbortController/fetch on the same budget and make the CPU-pegged
+  // software-rendered shell feel hung. One command at a time; the busy flag
+  // lives on window so it survives any panel re-render and is never recreated.
+  if(window._hartTermBusy) return;
+  var inp = document.getElementById('term-input');
+  var out = document.getElementById('term-output');
   if(!inp||!out) return;
-  const cmd = inp.value.trim();
+  var cmd = inp.value.trim();
   if(!cmd) return;
   inp.value = '';
   out.textContent += '$ '+cmd+'\\n';
+  window._hartTermBusy = true;
+  // Longer budget than the old 30s: a real command (build, large dir scan) on a
+  // CPU-pegged shell can exceed 30s, and a premature abort surfaced the cryptic
+  // "Fetch is aborted". 120s + a friendly timeout message on AbortError.
   fetch(SHELL+'/api/shell/terminal/exec',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{command:cmd}}),signal:_sig(30000)}}
-  ).then(r=>r.json()).then(d=>{{
+    body:JSON.stringify({{command:cmd}}),signal:_sig(120000)}}
+  ).then(function(r){{ return r.json(); }}).then(function(d){{
     out.textContent += (d.stdout||'')+(d.stderr?'\\n'+d.stderr:'')+'\\n';
     out.scrollTop = out.scrollHeight;
-  }}).catch(e=>{{ out.textContent += 'Error: '+e.message+'\\n'; }});
+    window._hartTermBusy = false;
+  }}).catch(function(e){{
+    var aborted = e && (e.name==='AbortError' || e.name==='TimeoutError');
+    out.textContent += (aborted ? 'Command timed out after 120s.' : ('Error: '+((e&&e.message)||e)))+'\\n';
+    out.scrollTop = out.scrollHeight;
+    window._hartTermBusy = false;
+  }});
 }}
 
 // ═══ User Accounts ═══
@@ -4193,45 +4322,14 @@ function loadRemoteDesktopPanel(el, apis) {{
 }}
 
 // ═══ Agent Pill ═══
+// focusAgent() (Super+A) focuses the pill input; the pill's onkeydown opens the
+// assistant chat and copies the text into #ac-input, where acSend() is the SOLE
+// intent dispatcher (theme/open fast-paths + the default /api/agent/ask compose).
+// The old askAgent() was a DEAD parallel copy of that same M1 block - no handler
+// invoked it - so it was removed (acSend is the one live path).
 function focusAgent() {{
   document.getElementById('agent-input').focus();
   document.getElementById('agent-pill').classList.add('expanded');
-}}
-function askAgent() {{
-  const input = document.getElementById('agent-input');
-  const text = input.value.trim();
-  if(!text) return;
-  input.value = '';
-  const resp = document.getElementById('agent-resp');
-  resp.textContent = 'Thinking...';
-  resp.classList.add('visible');
-
-  // M1 — intent is the default surface (mirrors acSend).  Theme words and
-  // 'open <named app>' are demoted FALLBACK fast-paths; everything else routes
-  // through the brain decompose (/chat) and is COMPOSED onto the desktop via
-  // agent_ui_update (painted by the SSE overlay stream).
-  const lower = text.toLowerCase();
-  if(lower.includes('theme')||lower.includes('font')||lower.includes('bigger')||
-     lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
-    handleThemeCommand(lower, resp);
-    return;
-  }}
-  // Fallback fast-path: launch a NAMED app directly (no brain round-trip).
-  if(lower.startsWith('open ')) {{
-    const target = lower.replace('open ','').trim();
-    const match = Object.entries(MANIFEST).find(([k,v])=>
-      v.title.toLowerCase().includes(target)||k.includes(target));
-    if(match) {{ openPanel(match[0]); resp.textContent='Opened '+match[1].title; return; }}
-  }}
-
-  // Default: route the intent through the brain and COMPOSE the desktop.
-  fetch(SHELL+'/api/agent/ask',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{text}})}})
-    .then(r=>r.json()).then(data=>{{
-      const txt = data.response || data.error || 'No response';
-      resp.textContent = data.composed ? ('✦ ' + txt) : txt;
-      speakText(txt, 'chat_response');
-    }}).catch(()=>{{ resp.textContent='Assistant unavailable. It may still be starting - try again in a moment.'; }});
 }}
 
 // ═══ Floating Assistant Chat ═══
@@ -4712,6 +4810,12 @@ if(!PERF.potato) {{
             // merge + hartPinIcon (no fork); icon appears without a refresh.
             if(window.hartInstallIcon) window.hartInstallIcon(ev);
             showToast('Installed', (ev.title||ev.id||'App')+' added to your desktop', 'info');
+          }} else if(type === 'home' || type === 'home_compose') {{
+            // The local LLM re-composes the assembled HOME live (i1, agentic
+            // Liquid UI): route the A2UI payload to HartHome.compose instead of a
+            // floating overlay. ev.payload is the {{hero,rows}} composition; we
+            // pass ev itself as the fallback so a flat payload also works.
+            if(window.HartHome) window.HartHome.compose(ev.payload || ev);
           }} else {{
             // Render as floating overlay fragment
             renderAgentOverlay(ev);
@@ -5126,15 +5230,43 @@ function renderAgentOverlay(ev) {{
         def favicon():
             return Response(status=204)
 
+        # ── build/index.html's 12s liveness probe ──
+        # The Nunba dist falls back to a `fetch('/cors/test')` to decide whether
+        # the server is up; without this route it 404s and the loader shows a
+        # misleading "Server is starting up… Reload to retry." Stub it 200 so the
+        # probe reports the shell is alive. Harmless + unconditional (it answers
+        # even when no Nunba dist is mounted).
+        @app.route('/cors/test')
+        def cors_test():
+            return Response('ok', mimetype='text/plain')
+
         # ── Nunba SPA embedding (React pages inside panel iframes) ──
+        # The dist is a no-basename BrowserRouter (history) SPA whose bundle refs
+        # are origin-root absolute ('/static/js/main.*.js', '/static/css/…'), so
+        # it can ONLY be served at the origin root, exactly how Nunba's own
+        # app.py:4033-4040 serves it (file-or-index catch-all from the build
+        # dir). We mirror that single pattern here (no parallel path): a /static
+        # passthrough for the hashed bundles plus one SPA history fallback that
+        # serves a real file when it exists, else index.html so the in-browser
+        # router resolves '/social', '/agents', '/admin', … itself. Both are
+        # gated on NUNBA_STATIC_DIR: when it is unset, /static stays a 404
+        # (the shell's own assets live at the distinct /shell/static prefix, so
+        # the floor-lock is preserved). Werkzeug matches by rule specificity, so
+        # the '/<path:path>' catch-all is tried LAST: every explicit route ('/',
+        # '/favicon.ico', '/health', '/cors/test', all '/api/*', '/api/shell/*',
+        # '/shell/static/*') still wins.
         nunba_dir = os.environ.get('NUNBA_STATIC_DIR', '')
         if nunba_dir and os.path.isdir(nunba_dir):
-            @app.route('/app/<path:path>')
-            def nunba_static(path):
-                return send_from_directory(nunba_dir, path)
+            @app.route('/static/<path:path>')
+            def nunba_bundle(path):
+                return send_from_directory(
+                    os.path.join(nunba_dir, 'static'), path)
 
-            @app.route('/app/')
-            def nunba_index():
+            @app.route('/<path:path>')
+            def nunba_spa(path):
+                file_path = os.path.join(nunba_dir, path)
+                if os.path.isfile(file_path):
+                    return send_from_directory(nunba_dir, path)
                 return send_from_directory(nunba_dir, 'index.html')
 
         # ── Legacy API: UI components (for terminal/Conky fallback) ──
@@ -5164,6 +5296,22 @@ function renderAgentOverlay(ev) {{
             success = self.agent_ui_update(
                 data.get('agent_id', 'unknown'), comp)
             return jsonify({'success': success})
+
+        # ── Agentic HOME compose (the local LLM paints the Netflix home) ──
+        # The single producer entry point for the agentic home feed: a {hero,
+        # rows} composition flows through compose_home -> agent_ui_update (the
+        # governed A2UI channel) -> SSE -> HartHome.compose -> render. Accepts
+        # either a top-level {hero, rows} body or a wrapped {payload:{...}} one.
+        @app.route('/api/home/compose', methods=['POST'])
+        def api_home_compose():
+            data = request.get_json(force=True, silent=True) or {}
+            payload = data.get('payload')
+            if not isinstance(payload, dict):
+                payload = data
+            ok = self.compose_home(
+                hero=payload.get('hero'), rows=payload.get('rows'),
+                agent_id=str(data.get('agent_id', 'home_composer')))
+            return jsonify({'success': ok})
 
         @app.route('/api/approval', methods=['POST'])
         def api_approval():
@@ -5343,37 +5491,61 @@ function renderAgentOverlay(ev) {{
         # ── Shell APIs: Session ──
         @app.route('/api/shell/session/<action>', methods=['POST'])
         def shell_session(action):
-            import re
+            # #133 — NATIVE logind power actions, result-checked. The shell server
+            # runs as the unprivileged `hart` service user; the old fire-and-forget
+            # subprocess.Popen(['systemctl', ...]) delegated to logind but never
+            # read the polkit verdict, so a DENIED reboot/shutdown/firmware was
+            # masked as {'status': action} while the box did nothing. We now invoke
+            # the org.freedesktop.login1.Manager method DIRECTLY via the SHARED
+            # `_logind_call` helper (busctl, exit-status + stderr checked) — the
+            # SAME canonical home /api/shell/power/action uses, so there is one
+            # busctl implementation, not two. Failure surfaces a real 500 + error.
+            from integrations.agent_engine.shell_os_apis import (
+                _logind_call, firmware_setup_supported)
             if action not in ('lock', 'logout', 'suspend', 'shutdown', 'restart',
                               'firmware'):
                 return jsonify({'error': 'Invalid action'}), 400
-            # 'firmware' = "Restart into Firmware (UEFI)": ask systemd to set the
-            # UEFI OsIndications boot-to-firmware-UI flag, then reboot — the next
-            # boot enters the BIOS/UEFI setup. Only meaningful on a UEFI box whose
+            # 'firmware' = "Restart into Firmware (UEFI)": arm the UEFI boot-to-
+            # firmware-UI flag (SetRebootToFirmwareSetup true), THEN reboot — the
+            # next boot enters BIOS/UEFI setup. Only meaningful on a UEFI box whose
             # firmware advertises the boot-to-fw capability; refuse on legacy BIOS
             # so the user never gets a plain reboot when they asked for firmware.
             # Single source of truth for the capability probe (shell_os_apis).
-            from integrations.agent_engine.shell_os_apis import (
-                firmware_setup_supported)
             if action == 'firmware' and not firmware_setup_supported():
                 return jsonify({
                     'error': 'Reboot to firmware setup is not supported on this '
                              'system (legacy BIOS or capability not advertised)'}), 400
-            cmds = {
-                'lock': ['loginctl', 'lock-session'],
-                'logout': ['loginctl', 'terminate-session', ''],
-                'suspend': ['systemctl', 'suspend'],
-                'shutdown': ['systemctl', 'poweroff'],
-                'restart': ['systemctl', 'reboot'],
-                'firmware': ['systemctl', 'reboot', '--firmware-setup'],
-            }
-            try:
-                subprocess.Popen(
-                    cmds[action],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return jsonify({'status': action})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
+            # The interactive boolean is `true` so logind may consult polkit; the
+            # hart-base.nix security.polkit rule grants the `hart` user these
+            # login1 actions outright, so the authorized call executes.
+            if action == 'lock':
+                ok, err = _logind_call('LockSessions')
+            elif action == 'logout':
+                # Terminate THIS seat session (the shell runs inside the user's
+                # session). login1 needs the session id; refuse honestly if it is
+                # not in the environment rather than mask a no-op as success.
+                sid = os.environ.get('XDG_SESSION_ID', '')
+                if not sid:
+                    return jsonify({'action': action,
+                                    'error': 'No active session id to terminate '
+                                             '(XDG_SESSION_ID unset)'}), 500
+                ok, err = _logind_call('TerminateSession', 's', sid)
+            elif action == 'firmware':
+                # Two-step; if arming fails we do NOT reboot (a plain reboot would
+                # be the wrong action for the user's 'enter firmware setup' intent).
+                ok, err = _logind_call('SetRebootToFirmwareSetup', 'b', 'true')
+                if ok:
+                    ok, err = _logind_call('Reboot', 'b', 'true')
+            else:
+                method = {'suspend': 'Suspend', 'shutdown': 'PowerOff',
+                          'restart': 'Reboot'}[action]
+                ok, err = _logind_call(method, 'b', 'true')
+            if not ok:
+                # Real failure (polkit denied, busctl missing, timeout) — surface
+                # it, never a masked success.
+                return jsonify({'action': action,
+                                'error': err or 'power action failed'}), 500
+            return jsonify({'status': action})
 
         @app.route('/api/shell/session/firmware-capable', methods=['GET'])
         def shell_session_firmware_capable():

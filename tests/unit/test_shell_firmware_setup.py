@@ -20,7 +20,6 @@ import pytest
 
 from integrations.agent_engine.liquid_ui_service import LiquidUIService
 
-_LUS = 'integrations.agent_engine.liquid_ui_service'
 _OS_APIS = 'integrations.agent_engine.shell_os_apis'
 
 
@@ -61,27 +60,82 @@ def test_firmware_capable_endpoint_reflects_capability(shell):
         assert r.get_json()['supported'] is False
 
 
-def test_session_firmware_runs_reboot_firmware_setup_when_capable(shell):
-    """POST /api/shell/session/firmware -> `systemctl reboot --firmware-setup`
-    on a capable box, via the same privileged path the other power actions use."""
+def test_session_firmware_arms_then_reboots_via_native_logind_when_capable(shell):
+    """POST /api/shell/session/firmware on a capable box arms the UEFI boot-to-
+    firmware flag via the native logind SetRebootToFirmwareSetup(true) D-Bus
+    method, THEN Reboot(true) — the two-step sequence through the SHARED
+    `_logind_call` helper (#133, no plain `systemctl` spawn that masks a polkit
+    denial)."""
     _svc, client = shell
     with patch(f'{_OS_APIS}.firmware_setup_supported', return_value=True), \
-            patch(f'{_LUS}.subprocess.Popen') as popen:
+            patch(f'{_OS_APIS}._logind_call', return_value=(True, None)) as lc:
         r = client.post('/api/shell/session/firmware')
     assert r.status_code == 200
-    popen.assert_called_once()
-    assert popen.call_args[0][0] == ['systemctl', 'reboot', '--firmware-setup']
+    methods = [c.args[0] for c in lc.call_args_list]
+    assert methods == ['SetRebootToFirmwareSetup', 'Reboot']
 
 
 def test_session_firmware_refused_when_not_capable(shell):
-    """On legacy BIOS the firmware action is refused (400) and NEVER reboots — the
-    user must not get a plain reboot when they asked for firmware setup."""
+    """On legacy BIOS the firmware action is refused (400) and NEVER touches
+    logind — the user must not get a plain reboot when they asked for firmware
+    setup."""
     _svc, client = shell
     with patch(f'{_OS_APIS}.firmware_setup_supported', return_value=False), \
-            patch(f'{_LUS}.subprocess.Popen') as popen:
+            patch(f'{_OS_APIS}._logind_call', return_value=(True, None)) as lc:
         r = client.post('/api/shell/session/firmware')
     assert r.status_code == 400
-    popen.assert_not_called()
+    lc.assert_not_called()
+
+
+def test_session_firmware_arm_failure_does_not_reboot(shell):
+    """If arming the firmware flag is DENIED/fails, the handler surfaces a real
+    500 + error and does NOT reboot (a plain reboot is the wrong action for the
+    user's 'enter firmware setup' intent)."""
+    _svc, client = shell
+    with patch(f'{_OS_APIS}.firmware_setup_supported', return_value=True), \
+            patch(f'{_OS_APIS}._logind_call',
+                  return_value=(False, 'denied')) as lc:
+        r = client.post('/api/shell/session/firmware')
+    assert r.status_code == 500
+    assert 'denied' in (r.get_json() or {}).get('error', '')
+    # Only the arm was attempted; Reboot must NOT be called after a failed arm.
+    methods = [c.args[0] for c in lc.call_args_list]
+    assert methods == ['SetRebootToFirmwareSetup']
+
+
+def test_session_restart_shutdown_suspend_map_to_native_logind(shell):
+    """restart/shutdown/suspend each invoke the matching login1 Manager method
+    via `_logind_call` (Reboot / PowerOff / Suspend), result-checked — never the
+    old fire-and-forget systemctl Popen (#133)."""
+    _svc, client = shell
+    expected = {'restart': 'Reboot', 'shutdown': 'PowerOff', 'suspend': 'Suspend'}
+    for action, method in expected.items():
+        with patch(f'{_OS_APIS}._logind_call', return_value=(True, None)) as lc:
+            r = client.post('/api/shell/session/' + action)
+        assert r.status_code == 200, action
+        assert lc.call_args.args[0] == method, action
+        # interactive boolean so logind may consult polkit
+        assert lc.call_args.args[1:] == ('b', 'true'), action
+
+
+def test_session_power_failure_surfaces_real_error(shell):
+    """A polkit denial / busctl failure returns a REAL 500 + error, never a
+    masked {'status': action} (the bug #133 fixes)."""
+    _svc, client = shell
+    with patch(f'{_OS_APIS}._logind_call',
+               return_value=(False, 'Access denied')):
+        r = client.post('/api/shell/session/restart')
+    assert r.status_code == 500
+    assert 'Access denied' in (r.get_json() or {}).get('error', '')
+
+
+def test_session_lock_uses_native_logind_locksessions(shell):
+    """Server-side lock maps to login1 LockSessions (no-arg)."""
+    _svc, client = shell
+    with patch(f'{_OS_APIS}._logind_call', return_value=(True, None)) as lc:
+        r = client.post('/api/shell/session/lock')
+    assert r.status_code == 200
+    assert lc.call_args.args == ('LockSessions',)
 
 
 def test_session_rejects_unknown_action(shell):

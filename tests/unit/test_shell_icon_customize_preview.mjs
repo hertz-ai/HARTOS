@@ -29,6 +29,7 @@ import vm from 'node:vm';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const STATIC = join(HERE, '..', '..', 'integrations', 'agent_engine', 'static');
+const SRC_BRAND = join(STATIC, 'hartBrandArt.js');   // shared brand-art (glyph + gradient)
 const SRC_DESK = join(STATIC, 'hartDesktop.js');
 
 let failures = 0;
@@ -130,6 +131,9 @@ function makeWorld() {
   };
   sandbox.window = sandbox;
   vm.createContext(sandbox);
+  // hartDesktop renders icon glyphs/art tiles through the shared window.HartBrandArt
+  // (loaded first in the real shell); define it before the module runs.
+  vm.runInContext(readFileSync(SRC_BRAND, 'utf8'), sandbox, { filename: 'hartBrandArt.js' });
   vm.runInContext(readFileSync(SRC_DESK, 'utf8'), sandbox, { filename: 'hartDesktop.js' });
   return { sandbox, document, layer, saved };
 }

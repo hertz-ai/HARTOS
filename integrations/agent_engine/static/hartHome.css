@@ -1,0 +1,645 @@
+/*
+ * hartHome.css - HART OS assembled Netflix HOME (W1).
+ *
+ * The cinematic, value-first desktop home: a FIXED canvas (no vertical page
+ * scroll) with a top earnings hero, the breathing orb (owned by hartHero.js),
+ * and 2-3 horizontally-scrolling image-card rows over a fixed taskbar. This is
+ * the surface the local LLM COMPOSES live via agent_ui_update; hartHome.js
+ * paints it from a composition payload (rows/cards/hero as data). This file is
+ * the static visual vocabulary the agent paints with - it is NOT a hardcoded
+ * page (the data lives in the payload).
+ *
+ * Brand spectrum (the mockup leans green-only; the OS is full-spectrum):
+ *   teal #00E6C3 - cyan #29C5FF - blue #3B82F6 - violet #9B5CFF
+ *   magenta #FF2E9A - amber #FFC83D
+ *
+ * PERF (#137): software render is the SAFE DEFAULT. Every rule here is flat
+ * (solid brand colors + static gradients, NO blur, NO continuous animation).
+ * The rich layer (backdrop-filter blur, breathing glow, hover-scale) is gated
+ * behind body.gpu-hardware ONLY - the server stamps body.gpu-software /
+ * body.gpu-hardware from /run/hart/gpu-render (liquid_ui_service.py:1927), the
+ * same verdict the GTK4 host reads for its GSK choice. So on a software box the
+ * home is calm and instant; on a GPU box it breathes. Images lazy-load.
+ */
+
+:root {
+  --hh-teal: #00E6C3;
+  --hh-cyan: #29C5FF;
+  --hh-blue: #3B82F6;
+  --hh-violet: #9B5CFF;
+  --hh-magenta: #FF2E9A;
+  --hh-amber: #FFC83D;
+  --hh-ink: #F3F6FB;
+  --hh-dim: #9AA7B6;
+  --hh-bord: rgba(255, 255, 255, 0.09);
+  /* fixed safe areas: leave room for the (orchestrator-restructured) top bar
+     and the taskbar so the home never collides with system chrome. */
+  --hh-top-safe: 70px;
+  --hh-bottom-safe: 56px;
+  --hh-gutter: 60px;
+}
+
+/* ============================ FIXED CANVAS ============================ */
+/* One screen, never page-scrolls (it is a desktop, not a web page). Sits ABOVE
+   the wallpaper/desktop-icon layer and BELOW the floating orb (z 1450) and app
+   windows (z 100+), so a real window covers the home and the orb floats over
+   the hero. The container is pointer-events:none so empty areas still reach the
+   wallpaper context menu + desktop icons; only interactive children opt back in. */
+.hart-home {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  padding: var(--hh-top-safe) 0 var(--hh-bottom-safe) 0;
+  color: var(--hh-ink);
+  font-family: "Segoe UI", Inter, Roboto, system-ui, Helvetica, Arial, sans-serif;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 360ms ease;
+}
+.hart-home.hh-ready { opacity: 1; }
+/* Hidden when a fullscreen app / different workspace takes over (orchestrator
+   toggles .hh-hidden; default home is shown). */
+.hart-home.hh-hidden { display: none; }
+.hart-home > * { pointer-events: none; }
+.hart-home button,
+.hart-home a,
+.hart-home .hh-cards,
+.hart-home .hh-card,
+.hart-home .hh-see-all { pointer-events: auto; }
+
+/* ============================ EARNINGS HERO ============================ */
+/* Value-first: the flywheel/earnings story, personal, left-aligned. The orb
+   floats to the right of this copy (hartHero.js home-mode). */
+.hh-hero {
+  flex: 0 0 auto;
+  padding: 6px var(--hh-gutter) 0;
+  max-width: 980px;
+}
+.hh-eyebrow {
+  color: var(--hh-teal);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+}
+/* THE BIG NUMBER (b8 visual-first): the real earned figure that animates up,
+   painted in the brand spectrum. The unit ("Spark") is a calm sibling so only
+   the value counts up. This REPLACES the old "Your hive earned X while you
+   slept" sentence + the paragraph subtitle (the text-wall regression). */
+.hh-amount-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin: 10px 0 2px;
+}
+.hh-amount {
+  font-size: 88px;
+  line-height: 0.98;
+  font-weight: 800;
+  letter-spacing: -2px;
+  font-variant-numeric: tabular-nums;
+  background: linear-gradient(90deg, var(--hh-teal), var(--hh-cyan) 52%, var(--hh-blue));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.hh-amount-unit {
+  font-size: 26px;
+  font-weight: 700;
+  color: var(--hh-dim);
+  letter-spacing: 0.5px;
+}
+
+/* Settlement sparkline - the small earnings data-viz beside the number. */
+.hh-spark {
+  margin: 2px 0 4px;
+  height: 44px;
+  width: 232px;
+  opacity: 0.95;
+}
+.hh-spark svg { display: block; width: 100%; height: 100%; }
+
+/* Honest meta strip (minimal text): payout-pending pill (d1.1), the canonical
+   hive-rate equivalent, and a compact agents/tasks stat - no paragraph. */
+.hh-hero-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin-top: 12px;
+  font-size: 15px;
+  color: #C3CDD9;
+}
+.hh-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  border-radius: 30px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--hh-amber);
+  background: rgba(255, 200, 61, 0.12);
+  border: 1px solid rgba(255, 200, 61, 0.30);
+}
+.hh-pill-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--hh-amber);
+}
+.hh-usd { color: var(--hh-dim); font-weight: 600; }
+.hh-stat { color: #C3CDD9; }
+.hh-stat b { color: var(--hh-ink); font-weight: 800; }
+.hh-local-mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--hh-teal);
+  font-weight: 700;
+}
+.hh-local-mini .hh-shield {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--hh-teal);
+}
+
+/* CTA row */
+.hh-cta {
+  display: flex;
+  gap: 14px;
+  margin-top: 26px;
+}
+.hh-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 15px 26px;
+  border-radius: 14px;
+  font-size: 18px;
+  font-weight: 700;
+  border: none;
+  cursor: pointer;
+  color: var(--hh-ink);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--hh-bord);
+}
+.hh-btn .mi { font-size: 20px; }
+.hh-btn-primary {
+  color: #04140F;
+  /* flat spectrum gradient (no blur, software-safe) */
+  background: linear-gradient(135deg, var(--hh-teal), var(--hh-cyan));
+}
+
+/* ============================ ROWS REGION ============================ */
+/* Fills the remaining height; rows scroll HORIZONTALLY only. The region itself
+   never vertically scrolls - the agent composes the 2-3 rows that fit; deeper
+   categories open as panels via "See all". */
+.hh-rows {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 18px;
+  padding: 18px 0 4px var(--hh-gutter);
+  overflow: hidden;
+}
+.hh-row { flex: 0 0 auto; }
+.hh-row-head {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  margin-bottom: 12px;
+  padding-right: var(--hh-gutter);
+}
+.hh-row-title {
+  font-size: 23px;
+  font-weight: 700;
+}
+.hh-row-note {
+  font-size: 15px;
+  color: var(--hh-teal);
+  font-weight: 600;
+}
+.hh-see-all {
+  margin-left: auto;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--hh-dim);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+.hh-see-all:hover { color: var(--hh-ink); }
+
+/* The horizontal scroller. Scrollbar hidden; scroll-snap for a native feel. */
+.hh-cards {
+  display: flex;
+  gap: 18px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 6px 60px 8px 0;
+  scroll-snap-type: x proximity;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.hh-cards::-webkit-scrollbar { display: none; }
+
+/* ============================ IMAGE CARDS ============================ */
+/* Photo (or brand-gradient art) with text-over-art + a gradient scrim. Varied
+   formats: landscape (default), wide, portrait, square. */
+.hh-card {
+  position: relative;
+  flex: 0 0 auto;
+  width: 258px;
+  height: 150px;
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid var(--hh-bord);
+  background: #0E1320;
+  scroll-snap-align: start;
+  cursor: pointer;
+}
+.hh-card.hh-wide { width: 360px; }
+.hh-card.hh-portrait { width: 180px; height: 252px; }
+.hh-card.hh-square { width: 180px; height: 180px; }
+
+/* The art layer: a real photo when the payload supplies one (lazy-loaded), else
+   a brand-spectrum static gradient seeded per card. */
+.hh-card-art {
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+.hh-card-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0;
+  transition: opacity 300ms ease;
+}
+.hh-card-art img.hh-loaded { opacity: 1; }
+
+/* Scrim so text-over-art always reads. Static gradient, no blur (software-safe). */
+.hh-card-scrim {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(transparent 32%, rgba(4, 7, 13, 0.78) 100%);
+}
+
+/* Card body sits over the art at the bottom. */
+.hh-card-body {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.hh-card-title {
+  font-size: 18px;
+  font-weight: 700;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.55);
+}
+.hh-card-meta {
+  font-size: 13px;
+  color: #CFE;
+  opacity: 0.85;
+}
+
+/* Glyph chip top-left (when no photo it labels the card). */
+.hh-card-ic {
+  position: absolute;
+  top: 12px;
+  left: 14px;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  background: rgba(8, 12, 20, 0.55);
+  border: 1px solid var(--hh-bord);
+  color: var(--hh-ink);
+}
+.hh-card-ic .mi { font-size: 20px; }
+
+/* Top-right badge (e.g. "Replay", rank, "New"). */
+.hh-card-badge {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #04140F;
+  background: var(--hh-teal);
+  padding: 3px 8px;
+  border-radius: 8px;
+}
+
+/* Continue-row progress bar (Netflix Continue-Watching). */
+.hh-card-prog {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 5px;
+  background: var(--hh-teal);
+  border-radius: 0 3px 0 0;
+}
+
+/* Live tag (a running agent). */
+.hh-card-live {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--hh-ink);
+  background: rgba(8, 12, 20, 0.72);
+  border: 1px solid var(--hh-bord);
+  padding: 4px 9px;
+  border-radius: 30px;
+}
+.hh-card-live .hh-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--hh-magenta);
+}
+
+/* Numbered "Top N" cards (the hive leaderboard). */
+.hh-card.hh-ranked { background: transparent; border: none; overflow: visible; }
+.hh-rank-num {
+  position: absolute;
+  left: -6px;
+  bottom: -14px;
+  font-size: 116px;
+  font-weight: 900;
+  line-height: 0.8;
+  color: transparent;
+  -webkit-text-stroke: 3px rgba(255, 255, 255, 0.30);
+  pointer-events: none;
+}
+.hh-card.hh-ranked .hh-rank-inner {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 174px;
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid var(--hh-bord);
+}
+
+/* Empty-state placeholder card (graceful fallback when a row has no data). */
+.hh-card-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--hh-dim);
+  font-size: 14px;
+  text-align: center;
+  padding: 0 16px;
+  background: rgba(255, 255, 255, 0.03);
+  cursor: default;
+}
+
+/* Per-category accent tints applied via .hh-accent-* on the row (brand spectrum,
+   so the home is never green-only). Used by the gradient art fallback + chips. */
+.hh-accent-teal { --hh-acc: var(--hh-teal); }
+.hh-accent-cyan { --hh-acc: var(--hh-cyan); }
+.hh-accent-blue { --hh-acc: var(--hh-blue); }
+.hh-accent-violet { --hh-acc: var(--hh-violet); }
+.hh-accent-magenta { --hh-acc: var(--hh-magenta); }
+.hh-accent-amber { --hh-acc: var(--hh-amber); }
+.hh-row-note { color: var(--hh-acc, var(--hh-teal)); }
+.hh-card-prog { background: var(--hh-acc, var(--hh-teal)); }
+
+/* ===================================================================== */
+/* GPU-HARDWARE ENHANCEMENT LAYER                                          */
+/* Everything below only applies on a GPU box. Software stays flat + calm. */
+/* ===================================================================== */
+body.gpu-hardware .hh-btn {
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  transition: transform 160ms ease, box-shadow 160ms ease;
+}
+body.gpu-hardware .hh-btn-primary {
+  box-shadow: 0 12px 36px rgba(0, 230, 195, 0.32);
+}
+body.gpu-hardware .hh-btn:hover { transform: translateY(-2px); }
+
+body.gpu-hardware .hh-card {
+  transition: transform 200ms ease, box-shadow 200ms ease;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+  will-change: transform;
+}
+/* Netflix hover-expand (only where the GPU can afford the composite). */
+body.gpu-hardware .hh-card:hover {
+  transform: scale(1.07);
+  box-shadow: 0 30px 70px rgba(0, 0, 0, 0.6),
+              0 0 0 2px var(--hh-acc, rgba(0, 230, 195, 0.7)),
+              0 0 46px rgba(0, 230, 195, 0.32);
+  z-index: 5;
+}
+body.gpu-hardware .hh-card-scrim {
+  background: linear-gradient(transparent 28%, rgba(4, 7, 13, 0.72) 100%);
+}
+/* Soft brand glow under the earned number, breathing - GPU only. */
+body.gpu-hardware .hh-amount {
+  filter: drop-shadow(0 0 26px rgba(0, 230, 195, 0.38));
+}
+@keyframes hhLiveDot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+body.gpu-hardware .hh-card-live .hh-dot {
+  animation: hhLiveDot 1.6s ease-in-out infinite;
+}
+/* The payout-pending dot breathes amber so the honest state reads as live. */
+body.gpu-hardware .hh-pill-dot {
+  animation: hhLiveDot 1.8s ease-in-out infinite;
+}
+
+/* Reduced-motion users: never animate regardless of GPU. */
+@media (prefers-reduced-motion: reduce) {
+  .hart-home,
+  body.gpu-hardware .hh-card,
+  body.gpu-hardware .hh-btn,
+  body.gpu-hardware .hh-card-live .hh-dot,
+  body.gpu-hardware .hh-pill-dot,
+  body.gpu-hardware .top-bar-orb {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+/* ===================== TOP BAR RESTRUCTURE (e1) ===================== */
+/* brand | nav tabs | (flexible agent-status) | omnibox pill | orb-sm | avatar |
+   trays. The existing .top-bar / #agent-status / .top-bar-right are KEPT - their
+   JS consumers depend on them (hartVisibility reads #agent-status, hartConnectivity
+   mounts into .top-bar-right). These rules only style the NEW elements the shell
+   adds in the restructured bar. Old-WebKit-safe (no conic-gradient). */
+.top-bar-nav { display: flex; align-items: center; gap: 2px; }
+.tb-tab {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 13px;
+  border: none;
+  background: transparent;
+  color: var(--hh-dim);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  border-radius: 9px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tb-tab:hover { color: var(--hh-ink); background: rgba(255, 255, 255, 0.06); }
+.tb-tab.tb-active {
+  color: var(--hh-ink);
+  background: rgba(0, 230, 195, 0.14);
+  box-shadow: inset 0 0 0 1px rgba(0, 230, 195, 0.34);
+}
+
+/* The OMNIBOX pill - "Ask or search anything". A button, NOT a second input: it
+   focuses the canonical hero command bar (e2 - one omnibox, no parallel search). */
+.top-bar-omni {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  height: 34px;
+  min-width: 220px;
+  max-width: 360px;
+  padding: 0 14px;
+  border-radius: 30px;
+  border: 1px solid var(--hh-bord);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--hh-dim);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: text;
+}
+.top-bar-omni:hover { background: rgba(255, 255, 255, 0.08); color: var(--hh-ink); }
+.top-bar-omni .mi { font-size: 18px; }
+.top-bar-omni .tbo-kbd {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--hh-dim);
+  border: 1px solid var(--hh-bord);
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+
+/* orb-sm - the small brand orb docked in the bar (c7), always accessible.
+   Clicking it toggles voice (the SAME control as the big orb). Calm by default;
+   breathes only on GPU. NO mic glyph inside (c5). Spectrum, not monochrome. */
+.top-bar-orb {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  background:
+    radial-gradient(circle at 34% 30%, rgba(255, 255, 255, 0.60), transparent 45%),
+    linear-gradient(135deg, var(--hh-teal), var(--hh-cyan) 40%, var(--hh-violet) 76%, var(--hh-magenta));
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.10), 0 2px 10px rgba(0, 230, 195, 0.30);
+}
+.top-bar-orb:hover { transform: scale(1.08); }
+
+/* avatar - the user presence (initial over a brand gradient). */
+.top-bar-avatar {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 1px solid var(--hh-bord);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--hh-ink);
+  font-size: 13px;
+  font-weight: 800;
+  background: linear-gradient(150deg, rgba(155, 92, 255, 0.55), rgba(41, 197, 255, 0.45));
+}
+.top-bar-avatar:hover { box-shadow: 0 0 0 2px rgba(41, 197, 255, 0.4); }
+
+@keyframes tbOrbBreathe {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.10), 0 2px 10px rgba(0, 230, 195, 0.30); }
+  50% { box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16), 0 3px 16px rgba(41, 197, 255, 0.50); }
+}
+body.gpu-hardware .top-bar-orb { animation: tbOrbBreathe 4s ease-in-out infinite; }
+body.gpu-hardware .top-bar-orb,
+body.gpu-hardware .tb-tab,
+body.gpu-hardware .top-bar-avatar {
+  transition: transform 140ms ease, box-shadow 140ms ease, background 140ms ease, color 140ms ease;
+}
+
+/* Keep the bar one line on narrow widths. */
+@media (max-width: 1100px) {
+  .top-bar-omni { min-width: 120px; }
+  .top-bar-omni .tbo-kbd { display: none; }
+  .tb-tab { padding: 0 9px; }
+}
+@media (max-width: 880px) {
+  .top-bar-nav .tb-tab[data-tab="earn"],
+  .top-bar-nav .tb-tab[data-tab="hive"] { display: none; }
+}
+
+/* ===================== IMAGE-CARD DESKTOP ICONS ===================== */
+/* hartDesktop.js renders .desktop-icon > .di-glyph as an image plate (.di-image
+   with a .di-photo <img>) when the manifest entry carries an `image` - a real
+   photo/representation instead of a flat glyph, paired with the app NAME below
+   (.di-label, untouched). Falls back to the glyph automatically on load error.
+   These rules live here (W1-owned) since hartResponsive.css is owned elsewhere. */
+.desktop-icon .di-glyph.di-image {
+  padding: 0;
+  overflow: hidden;
+  background: #0E1320;
+}
+.desktop-icon .di-glyph.di-image .di-photo {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  border-radius: inherit;
+}
+body.gpu-hardware .desktop-icon .di-glyph.di-image {
+  transition: transform 160ms ease, box-shadow 160ms ease;
+}
+body.gpu-hardware .desktop-icon:hover .di-glyph.di-image {
+  transform: translateY(-2px) scale(1.04);
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.5);
+}
+
+/* Smaller screens: shrink the hero number so the rows still fit one screen. */
+@media (max-width: 1400px) {
+  .hh-amount { font-size: 70px; }
+  .hh-amount-unit { font-size: 22px; }
+  :root { --hh-gutter: 40px; }
+}
+@media (max-height: 820px) {
+  .hh-amount { font-size: 58px; }
+  .hh-spark { height: 34px; }
+  .hh-cta { margin-top: 16px; }
+  .hh-card { height: 132px; }
+}

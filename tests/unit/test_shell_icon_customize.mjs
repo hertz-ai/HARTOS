@@ -21,7 +21,9 @@ import { dirname, join } from 'node:path';
 import vm from 'node:vm';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = join(HERE, '..', '..', 'integrations', 'agent_engine', 'static', 'hartDesktop.js');
+const STATIC = join(HERE, '..', '..', 'integrations', 'agent_engine', 'static');
+const SRC_BRAND = join(STATIC, 'hartBrandArt.js');   // shared brand-art (glyph + gradient)
+const SRC = join(STATIC, 'hartDesktop.js');
 
 let failures = 0;
 function ok(cond, msg) { if (cond) { console.log('  OK   ' + msg); } else { failures++; console.log(' FAIL  ' + msg); } }
@@ -119,6 +121,9 @@ const sandbox = {
 };
 sandbox.window = sandbox;            // classic-script `window` is the global
 vm.createContext(sandbox);
+// hartDesktop renders glyphs/art tiles through the shared window.HartBrandArt
+// (loaded first in the real shell), so define it here before the module runs.
+vm.runInContext(readFileSync(SRC_BRAND, 'utf8'), sandbox, { filename: 'hartBrandArt.js' });
 vm.runInContext(readFileSync(SRC, 'utf8'), sandbox, { filename: 'hartDesktop.js' });
 
 // ── 0. defaults rendered (feed present) ──

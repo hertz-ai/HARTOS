@@ -43,24 +43,10 @@
 
   function M() { return window.MANIFEST || {}; }
 
-  // A glyph is rendered with the Material Symbols icon font ONLY when it looks
-  // like a ligature name (lowercase snake_case ASCII, e.g. "open_in_new").
-  // Anything else (emoji, unicode) is rendered as plain text — putting an emoji
-  // inside .material-icons-round makes the icon font mangle it. Single source
-  // of "is this a Material name" so makeIcon + the dialog agree.
-  function isMaterialName(g) { return /^[a-z0-9_]+$/.test(g || ''); }
-
-  // Inner HTML for an icon's glyph. color (optional) is applied inline so it
-  // overrides the stylesheet's '.di-glyph .mi{color:var(--hart-accent)}'.
-  function glyphSpan(glyph, color) {
-    var g = glyph || 'apps';
-    var style = color ? ' style="color:' + color + '"' : '';
-    if (isMaterialName(g)) {
-      return '<span class="mi material-icons-round"' + style + ' aria-hidden="true"></span>';
-    }
-    // Emoji / unicode: plain span (no icon font). textContent set by caller.
-    return '<span class="mi di-emoji"' + style + ' aria-hidden="true"></span>';
-  }
+  // Glyph rendering ("is this a Material ligature name", the icon-vs-emoji span)
+  // lives in the SHARED window.HartBrandArt (hartBrandArt.js), so the desktop
+  // icons and the home cards agree on exactly one renderer. renderGlyphTile (the
+  // single icon-tile writer below) calls HartBrandArt.glyphHTML.
 
   // The effective override for an icon = explicit override fields, falling back
   // to the MANIFEST default. Used to seed the dialog and to render.
@@ -70,7 +56,13 @@
     return {
       glyph: (ov.glyph != null && ov.glyph !== '') ? ov.glyph : (def.icon || 'apps'),
       label: (ov.label != null && ov.label !== '') ? ov.label : (def.title || id),
-      color: ov.color || ''   // '' = no user override (manifest default applied at render)
+      color: ov.color || '',   // '' = no user override (manifest default applied at render)
+      // Image-card icon: a real photo/representation for the app (Netflix-grade,
+      // not a flat glyph). Sourced from the MANIFEST default (def.image), set by
+      // the installer / agent composition; renders an <img> plate + the app name.
+      // Not a persisted per-icon override (keeps the desktop blob lean); falls
+      // back to the glyph if absent or if the image fails to load.
+      image: def.image || ''
     };
   }
 
@@ -91,14 +83,26 @@
     var renderColor = eff.color || ((M()[id] || {}).color) || '';
 
     var glyphBox = el.querySelector('.di-glyph');
-    glyphBox.innerHTML = glyphSpan(eff.glyph, renderColor);
-    var span = glyphBox.querySelector('.mi');
-    if (!isMaterialName(eff.glyph)) span.textContent = eff.glyph;   // emoji -> text
-    else span.textContent = eff.glyph;                              // ligature name
-    // Tint the glyph plate to match (lighter when it's the manifest default so a
-    // user-chosen colour still reads as "customized" vs the default vibrancy).
-    glyphBox.style.background = renderColor ? _tint(renderColor, eff.color ? 0.22 : 0.15) : '';
-    glyphBox.style.borderColor = renderColor ? _tint(renderColor, eff.color ? 0.55 : 0.40) : '';
+    if (eff.image) {
+      // Image-card icon (Netflix-grade): a real photo/representation fills the
+      // tile and the app NAME reads below (.di-label). Lazy-loaded; if the image
+      // fails it falls straight back to the glyph so the icon is never blank.
+      // CSS for .di-image / .di-photo lives in hartHome.css (owned by W1).
+      glyphBox.classList.add('di-image');
+      glyphBox.innerHTML = '<img class="di-photo" alt="" loading="lazy" src="' + eff.image + '">';
+      var _photo = glyphBox.querySelector('.di-photo');
+      // A failed photo falls straight back to the SAME art-tile card the glyph
+      // path uses (one writer), so the icon is never a blank plate.
+      if (_photo) _photo.addEventListener('error', function () {
+        renderGlyphTile(glyphBox, eff, renderColor);
+      });
+      glyphBox.style.background = '';
+      glyphBox.style.borderColor = renderColor ? _tint(renderColor, 0.40) : '';
+    } else {
+      // No real image -> the glyph rides a cinematic brand art tile (the single
+      // renderGlyphTile writer), turning a flat glyph into an image-rich card.
+      renderGlyphTile(glyphBox, eff, renderColor);
+    }
 
     // The customize-dialog PREVIEW (.hic-prev) is a glyph plate with NO .di-label
     // node, so guard it — an unconditional el.querySelector('.di-label').textContent
@@ -131,6 +135,45 @@
     if (!m) return '';
     var n = parseInt(m[1], 16);
     return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + (a == null ? 0.22 : a) + ')';
+  }
+
+  // ── Image-card / art-tile rendering (Netflix-grade, brand spectrum) ───────
+  // A desktop icon is a CARD, not a flat glyph: a real manifest image renders
+  // a photo plate (.di-image, above); with no image the glyph sits on a
+  // cinematic DARK brand-spectrum ART tile (deterministic per app) so the
+  // desktop reads image-rich and on-brand, never a single monochrome wash.
+  // STATIC gradients only (no animation, no blur) so it stays fast on the
+  // software-render path (#137); the photo-plate hover lift is gated to
+  // body.gpu-hardware in hartHome.css.
+  //
+  // The brand spectrum + the gradient math + the glyph renderer live in the
+  // SHARED window.HartBrandArt (hartBrandArt.js) - ONE source the home cards use
+  // too (no parallel palette). Only the desktop-specific seed + border tint stay
+  // local.
+  // Stable per-icon seed (same id -> same hue/angle across every render).
+  function _hashId(s) {
+    s = String(s || ''); var h = 0, i;
+    for (i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; }
+    return Math.abs(h);
+  }
+  // Single writer of the glyph-on-art-tile visual, shared by makeIcon's glyph
+  // branch AND the photo-load-error fallback, so a missing/failed image still
+  // becomes a proper card (never a blank plate). The glyph keeps the EXACT
+  // per-app/user colour when set (the de-monochrome contract); with no colour
+  // it takes a bright brand tint matched to the tile.
+  function renderGlyphTile(glyphBox, eff, renderColor) {
+    glyphBox.classList.remove('di-image');
+    var ba = window.HartBrandArt;
+    var seed = _hashId(eff.label || eff.glyph || '');
+    var glyphColor = renderColor || ba.glyphTint(seed);
+    glyphBox.innerHTML = ba.glyphHTML(eff.glyph, glyphColor);
+    // HartBrandArt.glyphHTML already embeds the (escaped) glyph text; we also set
+    // it via the DOM so the value is written in exactly one place (and so the
+    // dependency-free test shim, which does not parse innerHTML, can observe it).
+    var span = glyphBox.querySelector('.mi');
+    if (span) span.textContent = eff.glyph;                 // ligature name OR emoji text
+    glyphBox.style.background = ba.gradient(renderColor, seed);
+    glyphBox.style.borderColor = renderColor ? _tint(renderColor, 0.55) : 'rgba(255,255,255,0.12)';
   }
 
   function readPositions() {

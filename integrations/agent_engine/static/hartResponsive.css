@@ -406,3 +406,112 @@ html.a11y-rmotion .hart-tile:hover, html.a11y-rmotion .hart-tile:focus-within,
 html.a11y-rmotion .hv-art:hover, html.a11y-rmotion .hv-art:focus-within { transform: none; }
 html.a11y-rmotion .hart-tile:hover .htc-prev > img, html.a11y-rmotion .hart-tile:focus-within .htc-prev > img,
 html.a11y-rmotion .hv-art:hover > img, html.a11y-rmotion .hv-art:focus-within > img { transform: none; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SOFTWARE-RENDER PERFORMANCE FLOOR (#137) — reduced effects, no GPU.
+ * hart-gpu-probe writes `software` to /run/hart/gpu-render when the box is
+ * CPU-compositing (GSK=cairo / llvmpipe). render_desktop_shell() tags
+ * <body class="gpu-software"> from that SAME verdict (no second probe). On the
+ * CPU the cinematic glass — backdrop blur, big layered shadows, the continuous
+ * accent breathe + entrance reveals, hover scale transitions — re-rasterises the
+ * frame on EVERY keystroke, so typing lags ~500ms and a core pegs (which also
+ * starves the in-shell terminal fetch). This block STRIPS those GPU-only effects
+ * from the HOT surfaces (glass panels, top bar, omnibox, start menu, cards) and
+ * falls back to FLAT brand-spectrum fills — the Hevolve spectrum stays on
+ * borders/accents (rule 2: never a monochrome wash). Target: keystroke-to-glyph
+ * < 1 frame. Full cinematic stays on body.gpu-hardware (no rules here = unchanged).
+ *
+ * Higher specificity (body.gpu-software …) + !important on the two genuinely
+ * GPU-bound props (backdrop-filter, animation) guarantees the kill beats every
+ * inline glass rule, the base .glass mixin, and the cinematic rules above. A
+ * user's saved wallpaper (inline element style) still wins — this only re-skins
+ * the DEFAULT look on a software-rendered box.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* 1) Kill backdrop blur + heavy shadow on every frosted chrome surface — the
+   single biggest per-frame CPU cost. Raise the fill opacity so the chrome stays
+   legible without blur; keep a hairline brand border (from the base rule). */
+body.gpu-software .glass,
+body.gpu-software .panel,
+body.gpu-software .top-bar,
+body.gpu-software .hart-hero-bar,
+body.gpu-software .start-menu,
+body.gpu-software .ctx-menu,
+body.gpu-software .agent-pill {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  background: rgba(18,19,28,0.94);
+  box-shadow: 0 2px 10px rgba(0,0,0,0.34);
+}
+
+/* The omnibox / command bar is the keystroke hot path: a blurred backdrop here
+   re-composites under the caret on every character. Flat fill + a static brand
+   ring on focus (no glow blur, no animation). */
+body.gpu-software .hart-hero-bar { box-shadow: none; }
+body.gpu-software .hart-hero-bar:focus-within {
+  border-color: rgba(var(--hart-accent-rgb),0.55);
+  box-shadow: 0 0 0 1px rgba(var(--hart-accent-rgb),0.45);
+}
+
+/* 2) Stop every continuous / non-essential animation. The accent breathe pulse,
+   the staggered entrance reveals, and the ambient/grain layers repaint forever
+   on the CPU. (The voice orb itself is canvas-driven, not CSS — untouched.) */
+body.gpu-software .hart-hero-go,
+body.gpu-software .hart-desktop .desktop-icon,
+body.gpu-software .start-menu .start-item {
+  animation: none !important;
+}
+body.gpu-software .hart-ambient,
+body.gpu-software .hart-grain { display: none; }
+
+/* 3) Collapse hover/focus SCALE lifts to instant flat highlights. The transition
+   interpolates transform/box-shadow every frame while hovering — pure CPU burn.
+   Keep a static brand-tinted highlight so focus is still legible (spectrum, not
+   monochrome), just without the animated lift + glow. */
+body.gpu-software .desktop-icon,
+body.gpu-software .desktop-icon .di-glyph,
+body.gpu-software .hart-app-card,
+body.gpu-software .start-item,
+body.gpu-software .hart-tile,
+body.gpu-software .hart-tile .htc-prev > img,
+body.gpu-software .hv-art,
+body.gpu-software .hv-art > img {
+  transition: none !important;
+  will-change: auto;
+}
+body.gpu-software .desktop-icon:hover .di-glyph,
+body.gpu-software .desktop-icon:focus-within .di-glyph,
+body.gpu-software .hart-app-card:hover,
+body.gpu-software .hart-app-card:focus-within,
+body.gpu-software .start-item:hover,
+body.gpu-software .start-item:focus-within,
+body.gpu-software .hart-tile:hover,
+body.gpu-software .hart-tile:focus-within,
+body.gpu-software .hv-art:hover,
+body.gpu-software .hv-art:focus-within {
+  transform: none !important;
+}
+body.gpu-software .hart-tile:hover .htc-prev > img,
+body.gpu-software .hart-tile:focus-within .htc-prev > img,
+body.gpu-software .hv-art:hover > img,
+body.gpu-software .hv-art:focus-within > img { transform: none !important; }
+
+/* Per-tile glyph drop-shadow is a cheap-looking but real per-element filter; drop it. */
+body.gpu-software .desktop-icon .di-glyph .mi { filter: none; }
+
+/* 4) Simplify the wallpaper: a five-stop radial spectrum bloom is a costly full-
+   frame raster on every repaint. Collapse to a cheap two-hue brand gradient
+   (still spectrum, not flat black) + drop the vignette pseudo. */
+body.gpu-software .wallpaper {
+  background:
+    radial-gradient(60% 50% at 14% 4%, rgba(0,230,195,0.10), transparent 60%),
+    radial-gradient(60% 55% at 92% 96%, rgba(155,92,255,0.12), transparent 62%),
+    linear-gradient(158deg, #0A0A11 0%, #07070B 60%, #0B0912 100%);
+}
+body.gpu-software .wallpaper::after { display: none; }
+
+/* 5) Open-window focus glow uses a big blurred shadow; flatten to a brand ring. */
+body.gpu-software .panel:focus-within {
+  border-color: rgba(var(--hv-cyan-rgb),0.34);
+  box-shadow: 0 2px 12px rgba(0,0,0,0.40);
+}

@@ -157,7 +157,9 @@ def test_source_guard_open_app_fallback_fastpath_preserved():
     import inspect
     from integrations.agent_engine import liquid_ui_service as m
     src = inspect.getsource(m)
-    # Both intent entry points keep the launch-a-named-app fast-path.
-    assert src.count("Fallback fast-path: launch a NAMED app directly") == 2
+    # acSend() is the ONE live intent dispatcher and keeps the launch-a-named-app
+    # fast-path.  The old askAgent() was a DEAD parallel copy of the same M1 block
+    # (no handler invoked it) and was removed, so the fast-path now appears once.
+    assert src.count("Fallback fast-path: launch a NAMED app directly") == 1
     # And the default still posts to the brain compose route.
     assert "/api/agent/ask" in src
