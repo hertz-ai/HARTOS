@@ -580,6 +580,18 @@
     }
   }
 
+  // Hide the legacy desktop-icon layer while the home is the active view. The home
+  // (z-index 30, transparent in its gaps) sits over .hart-desktop (z-index 20), so the
+  // old launcher icons (Appearance/Feed/Agents/Recipes/Notifications) bled through and
+  // overlapped the hero. The home supersedes them (top-bar nav + the agent rows).
+  // Restored when the home deactivates (setActive(false)) so a non-home view keeps icons.
+  function setDesktopLayer(hidden) {
+    try {
+      var dl = document.querySelector('.hart-desktop');
+      if (dl) dl.style.display = hidden ? 'none' : '';
+    } catch (e) {}
+  }
+
   function render(payload) {
     _payload = payload || samplePayload();
     var root = mountRoot();
@@ -593,6 +605,7 @@
     appendRowsToFit(rows, _payload.rows || []);
     // Reveal (opacity transition) on the next frame.
     requestAnimationFrame(function () { root.classList.add('hh-ready'); });
+    setDesktopLayer(true);
     // Ask the orb to dock to the right hero zone (best-effort; hartHero owns it).
     try { if (typeof window.HartOrbHomeMode === 'function') window.HartOrbHomeMode(true); } catch (e) {}
   }
@@ -832,7 +845,7 @@
       // here re-measures against the real visible height. render() also re-docks
       // the orb to home mode, so the trailing call only matters for the off path.
       if (on) render(_payload || samplePayload());
-      else { try { if (typeof window.HartOrbHomeMode === 'function') window.HartOrbHomeMode(false); } catch (e) {} }
+      else { setDesktopLayer(false); try { if (typeof window.HartOrbHomeMode === 'function') window.HartOrbHomeMode(false); } catch (e) {} }
     }
   };
 
