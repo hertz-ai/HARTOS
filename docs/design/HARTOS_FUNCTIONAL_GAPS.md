@@ -165,17 +165,54 @@
 | Q65 | Compositor Rust rebuild exceeds the 6h CI limit on every input/compositor change | MISSING | `#1777`/memory / infra | Rust build caching so nightlies complete `(NEW 2d)` | high / build |
 | Q66 | Deploy-docs: download FIRST in Quick links, minimal text, intuitive | MISSING | `#1274`,`#1631` / k3 | reorder the deploy-docs quick links `(NEW 2d)` | low / wire |
 
+### J. PRE-DESKTOP PLATFORM ASKS (recovered from the 1797 messages, in NO doc - all `(NEW 2d)`)
+
+> These are actionable steward asks from the platform layer (channels, sync,
+> mobile push/consent, meeting bridge, search, TTS/STT, agent model, memory,
+> economy federation, CI) that predate the desktop program and were tracked in
+> NEITHER the three docs NOR a MEMORY topic file. Kept here so the queue is the
+> single backlog. Some overlap the desktop rows (noted); close once.
+
+| ID | Item | Status | Sources | To close | Impact / Effort |
+|---|---|---|---|---|---|
+| Q67 | Omni-channel bridge: auto-associate browser-logged-in channels; ingest posts/meets/events into Nunba; cross-post out; join Discord/etc meets as a Nunba user via bridge | PARTIAL | `#193`,`#309`,`#314` | finish the inbound ingest + outbound cross-post + meet-join bridge | high / build |
+| Q68 | Unified sync hub: colocate ALL social-entity sync, P2P-first then central fallback (assets from peer first, central when peer gone), consent-gate, idempotent | PARTIAL | `#1121`,`#785`,`#787` | one colocated sync path, peer-then-central | high / build |
+| Q69 | Tagged-public local content (posts/communities/agents) flows to central + async regularly | PARTIAL | `#785` | wire the public-tagged async flow to central | med / build |
+| Q70 | Truecaller-style mobile system overlay for an incoming agent interaction / consent (over-other-apps) | MISSING / STUB | `#1105`,`#1103` | a mobile over-other-apps incoming overlay | high / build |
+| Q71 | public_exposure consent toggle on mobile RN clients (web/desktop have it) | PARTIAL | `#1103` | add the toggle to the RN clients | med / wire |
+| Q72 | FCM central -> local PUSH trust flow over WAMP (central pushes its token, node does not pull) | PARTIAL / STUB | `#1117`,`#1118` | implement the central-push-over-WAMP trust flow | med / build |
+| Q73 | Meeting reply-audio + video/audio sensor-track ingest bridge (#64): livekit-rtc frame I/O, `_consume_video_track` / `_maybe_ingest_audio_sensor` (lost/reverted) | STUB / PARTIAL | `#1069`,`#777`,`#781` | restore the audio publish + video/audio ingest wiring | med / build |
+| Q74 | Keyless, zero-rate-limit web search with citations (SearXNG/meta or DDGS tier-1, crawl fallback, open-meteo weather), fix GOOGLE_CSE failure | PARTIAL | `#602`,`#603`,`#604`,`#607` | bundle a keyless search + crawl fallback | med / build |
+| Q75 | TTS: run the existing WAV-based verifier BEFORE selecting the F5 model (uplift autoheal regressed it) | STUB / PARTIAL | `#618`,`#616` | reuse the built WAV TTS verifier in the selection path | med / wire |
+| Q76 | Streaming STT/ASR + speaker diarization + voice-activity/noise gate (no all-language text when no speech) | PARTIAL | `#637`,`#636`,`#4078` | fix faster-whisper streaming + diarization + VAD (pairs with Q19) | high / build |
+| Q77 | Autonomous capability-upgrade actuator + setup cards: Tier-1 global llama.cpp upgrade via `/api/llm/upgrade` (no restart), Tier-2 per-agent capability re-hydrate cards | PARTIAL | `#669`,`#677`,`#701` | the self-heal upgrade actuator (Claude Code cannot run on users' machines) | high / build |
+| Q78 | Polymorphic agents: an agent can morph into / talk to other agents; agent-id-less cards | UNKNOWN / PARTIAL | `#684`,`#683`,`#685` | the polymorphic agent model | med / build |
+| Q79 | History-aware chat + natural-time date recall (retrieve AROUND a date, attach timestamps; shared casual memory across langchain+autogen, agent memory isolated) | PARTIAL | `#546`,`#349`,`#548`,`#561` | un-hide the date window + broader memory wiring | high / build |
+| Q80 | Casual/factual queries mis-routed into the autogen CREATE pipeline instead of a langchain tool-call; gather_info should plan with the full tool catalog | PARTIAL | `#558`,`#590`,`#596` | route simple queries to tool-call; plan with all tools | high / build |
+| Q81 | Programmatic build recovery: python-embed corruption auto-repair (NULL-byte .py, missing METADATA Name header) in `_autorepair` | STUB | `#698`,`#699` | make `_autorepair` reinstall siblings + drop dist-info | med / build |
+| Q82 | Real-LLM-in-the-loop E2E tests (A2A, A2P, channel onboarding, consent, LiquidUI) without daemon flooding | MISSING / PARTIAL | `#1150`,`#1148`,`#1160` | real-LLM E2E suite; no grep tests | high / build |
+| Q83 | CI release-gating gaps (#163): publish-nightly `needs: test`, pre-merge PR gate, stop ignoring test_social_models / VLM | PARTIAL | `#936` | tighten the release gates | med / wire |
+| Q84 | Collective earning federation: every box HARTOS runs earns collectively for the user; gossip earning deltas via federated_aggregator | MISSING / PARTIAL | `#732`,`#737` | wire the L3 earning aggregation across nodes (pairs with Q20) | high / build |
+| Q85 | Auto-evolve should also use the hive to auto-evolve | UNKNOWN | `#1159` | route the auto-evolve loop through the hive | med / build |
+| Q86 | Common parent channel class to wire metrics + dashboard for ALL channels (not per-adapter) | STUB / UNKNOWN | `#156`,`#154` | wire metrics/dashboard from one parent channel class | low / wire |
+| Q87 | Open-source remote-desktop (TeamViewer/RustDesk-equivalent) bundled in HART OS | PARTIAL | `#539`,`#2288` | bundle an OSS remote-desktop (folds into Q29/Q42 baked-in apps) | low / build |
+
+> Also left UNANSWERED by the steward (flag, not yet a task): the parallel-path
+> architecture decisions from the repo audit `#435` (delete vs keep the
+> cloud-provider media stack; collapse the 5 agent registries; restructure JWT
+> secret discovery). Resolve direction before queuing.
+
 ### Unified-queue totals
 
-**66 desktop/OS items queued** across 9 areas (A home-soul 8 - B netflix-everywhere
-6 - C orb+voice 5 - D agents+economy 5 - E system+sounds 12 - F interaction 10 - G
-nunba-parity 5 - H perf+boot/HW 12 - I infra/CI 3). By source: **10** from this gap
-doc's MISSING/STUB/PARTIAL rows; **W2-W11** all represented (W1 partial); the
-**checklist groups f / g / h / j / k** (not previously folded into this doc) now
-fully tracked; and **~20 newly surfaced `(NEW 2d)` asks** recovered from the 1797
-messages that were in NO doc before. Plus the pre-desktop standing asks in Area J
-below. Status rollup (best estimate, verify-as-you-close): MISSING ~25 - PARTIAL ~30
-- STUB ~4 - bug ~5.
+**87 items queued** across 10 areas: A home-soul 8 - B netflix-everywhere 6 - C
+orb+voice 5 - D agents+economy 5 - E system+sounds 12 - F interaction 10 - G
+nunba-parity 5 - H perf+boot/HW 12 - I infra/CI 3 - J pre-desktop platform 21.
+By source: **10** from this gap doc's MISSING/STUB/PARTIAL rows; **W2-W11** all
+represented (W1 partial); the **checklist groups f / g / h / j / k** (not
+previously folded into this doc) now fully tracked; and **41 newly surfaced
+`(NEW 2d)` asks** recovered from the 1797 messages that were in NO doc before (20
+desktop + 21 platform). Status rollup (best estimate, verify-as-you-close):
+MISSING ~31 - PARTIAL ~43 - STUB ~7 - bug ~4 - unknown ~2.
 
 ---
 

@@ -1,5 +1,18 @@
 # HART OS - Home / Desktop Design Checklist
 
+> ## WORK QUEUE = THESE THREE DOCS TOGETHER
+> Drive all desktop / OS work from three companion docs, read together:
+> - **DESIGN (intent):** `HOME_DESKTOP_DESIGN_CHECKLIST.md` (THIS DOC) - groups
+>   a-k, ~55 rules, verbatim steward quotes + message numbers.
+> - **MASTER SPEC (workstreams):** `../../HART_OS_FULL_DESKTOP_SPEC.md` - the
+>   W1-W11 workstreams + the binding rules.
+> - **GAPS / TODO (reality + the queue):** `HARTOS_FUNCTIONAL_GAPS.md` - the
+>   EXISTS / PARTIAL / STUB / MISSING audit AND the unified "TO BE DONE" work
+>   queue (every unimplemented item, single backlog).
+>
+> When you CLOSE an item: update the gap-doc row + the W-stream status + this
+> checklist's audit. The single unified queue lives in the GAPS doc.
+
 > **Steward's consolidated desktop / home design instructions (recovered from the
 > full session history).** Source of truth. Update HERE; never let it scatter again.
 >

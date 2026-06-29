@@ -1,5 +1,18 @@
 # HART OS — Full Desktop & OS Program: Master Spec + Tracker
 
+> ## WORK QUEUE = THESE THREE DOCS TOGETHER
+> Drive all desktop / OS work from three companion docs, read together:
+> - **DESIGN (intent):** `docs/design/HOME_DESKTOP_DESIGN_CHECKLIST.md` - groups
+>   a-k, ~55 rules, verbatim steward quotes + message numbers.
+> - **MASTER SPEC (workstreams):** `HART_OS_FULL_DESKTOP_SPEC.md` (THIS DOC) - the
+>   W1-W11 workstreams + the binding rules below.
+> - **GAPS / TODO (reality + the queue):** `docs/design/HARTOS_FUNCTIONAL_GAPS.md`
+>   - the EXISTS / PARTIAL / STUB / MISSING audit AND the unified "TO BE DONE"
+>   work queue (every unimplemented item, single backlog, Q1-Q87).
+>
+> When you CLOSE an item: update the gap-doc row + the W-stream status here + the
+> checklist audit. The single unified queue lives in the GAPS doc.
+
 > Single source of truth consolidating EVERY rule and ask the steward gave the week of
 > 2026-06-23 to 2026-06-28. Nothing here is lost. Companion memory:
 > `memory/hartos_desktop_polish_program_remaining_2026-06-27.md`,
