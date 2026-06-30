@@ -22,92 +22,44 @@ permissions:
 
 jobs:
   # ═══════════════════════════════════════════════════════════
-  # 1. Test Gate
+  # 1. Comprehensive gate — the release-blocking checks (PARALLEL to build-iso)
   # ═══════════════════════════════════════════════════════════
-  test:
-    runs-on: ubuntu-latest
-    # Hard ceiling so a single hung test can never burn the 6h GitHub job cap
-    # again — a no-timeout pytest step ran 6h05m before auto-cancel (2026-06-03,
-    # run 26870369540). The per-test --timeout below is the targeted guard that
-    # names the culprit; this job-level cap is the backstop if a C-level block
-    # escapes the thread-method timeout.
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -e . --no-deps
-          python -c "from core.platform.events import EventBus; print(f'EventBus import OK: {EventBus}')"
-          pip install pytest pytest-asyncio pytest-timeout
-          pip install grep-ast tree-sitter tree-sitter-language-pack 2>/dev/null || true
-          python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True)" 2>/dev/null || true
-
-      - name: Run unit + functional tests
-        env:
-          HEVOLVE_DB_PATH: ':memory:'
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          cd ${{ github.workspace }}
-          # test_vlm_qwen3vl.py::TestFullActionLoop and
-          # ::TestVLMDeterministicActions::test_vlm_action_list_shared...
-          # patch attributes on a module (qwen3vl_backend) whose
-          # dependency chain isn't fully available on stock CI without
-          # torch/transformers GPU wheels — patches resolve to
-          # MagicMock objects and raise RuntimeError("fail") /
-          # TypeError from inspect. Deselect until the VLM patch
-          # targets are refactored to not require the heavy module
-          # imported at patch-time. Tracked non-blocking, ISOs unblocked.
-          python -m pytest \
-            tests/unit/ \
-            tests/functional/ \
-            --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
-            --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
-            --timeout=120 \
-            -q --tb=line
-
-      # Integration tests — cross-module flows (channels, social, federation).
-      # Best-effort: don't block release on integration regressions, but surface them.
-      - name: Run integration tests (best-effort)
-        if: always()
-        env:
-          HEVOLVE_DB_PATH: ':memory:'
-          PYTHONPATH: ${{ github.workspace }}
-        continue-on-error: true
-        run: |
-          cd ${{ github.workspace }}
-          python -m pytest \
-            tests/integration/ \
-            --timeout=120 \
-            -q --tb=line || echo "Integration tests had failures (non-blocking)"
-
-      # E2E tests — full-stack scenarios. Best-effort.
-      - name: Run e2e tests (best-effort)
-        if: always()
-        env:
-          HEVOLVE_DB_PATH: ':memory:'
-          PYTHONPATH: ${{ github.workspace }}
-        continue-on-error: true
-        run: |
-          cd ${{ github.workspace }}
-          python -m pytest \
-            tests/e2e/ \
-            --ignore=tests/e2e/runtime_tests \
-            --timeout=120 \
-            -q --tb=line || echo "E2E tests had failures (non-blocking)"
+  # Runs the FULL gate via the reusable flake-checks workflow:
+  #   * pytest tests/unit + tests/functional (the Python runtime),
+  #   * the compositor cargo test (default pure-logic floor),
+  #   * `nix build .#hart-comp` (the smithay feature: compile + cargo test via
+  #     doCheck) + the Rust precedent,
+  #   * EVERY nixosTest in checks.x86_64-linux, actually RUN (sharded), enumerated
+  #     dynamically so a new test gates the build automatically.
+  #
+  # It is a DEDICATED job on its OWN runners/budgets, NOT serial inside build-iso's
+  # 6h wall-clock — the heavy VM suite runs in parallel with the ISO build. Both
+  # `tag-and-sign` (signed release) and `publish-nightly` (nightly .iso) NEED this:
+  # nothing ships unless every check here is GREEN. The same workflow runs
+  # standalone on PRs, so the gate is defined exactly ONCE (DRY).
+  #
+  # Scoped to the events whose downstream job actually CONSUMES it — a manual
+  # dispatch (gates tag-and-sign) or a push to main (gates publish-nightly). On a
+  # push to a non-main branch nothing depends on it (publish-nightly is main-only,
+  # tag-and-sign is dispatch-only), so running the multi-hour VM suite there would
+  # be pure waste. PRs are still fully gated by flake-checks.yml's own
+  # pull_request trigger. A skipped gate-checks here correctly skips its
+  # main-only/dispatch-only dependents too (no always() anywhere downstream).
+  gate-checks:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    uses: ./.github/workflows/flake-checks.yml
 
   # ═══════════════════════════════════════════════════════════
   # 2. Tag + Sign (only on manual dispatch with version)
   # ═══════════════════════════════════════════════════════════
   tag-and-sign:
     if: github.event_name == 'workflow_dispatch'
-    needs: test
+    # GATED on the FULL check suite (was: only the unit `test` job). No tag is
+    # pushed — and therefore release-sign.yml never master-key-signs a manifest —
+    # unless every unit/cargo/nix/compositor check is green.
+    needs: gate-checks
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -556,6 +508,11 @@ jobs:
         with:
           tag_name: "v${{ github.event.inputs.version }}"
           files: /tmp/release-artifacts/*
+          # DRAFT, never auto-published. build-iso runs PARALLEL to gate-checks
+          # (no needs:), so a manual-dispatch ISO must NOT ship untested. It
+          # uploads as a draft; a human publishes it only after the gate-checks
+          # run for this commit is GREEN (the "test everything that gets built" rule).
+          draft: true
 
       # NOTE: Push-to-main publishing of these ISOs is handled by the
       # `publish-nightly` job below — it uploads the matrix artifacts
@@ -612,13 +569,24 @@ jobs:
   # create as draft (mutable), upload, then publish.
   #
   # We pull this up to a single post-build job so the 3 matrix workers
-  # don't race each other creating/publishing the same release. Uses
-  # `if: always()` so even partial matrix success (e.g. iso-desktop
-  # OOMs but iso-server/iso-edge complete) still ships the two ISOs
-  # that did build.
+  # don't race each other creating/publishing the same release.
+  #
+  # GATED, ALL-OR-NOTHING (the false-green fix):
+  #   `if: always()` is DELIBERATELY GONE. It used to publish on PARTIAL matrix
+  #   success — when iso-desktop FAILED but iso-server/iso-edge built, it shipped
+  #   a 2/3-variant "latest" and reported the run GREEN (the documented false-green
+  #   trap: memory hartos_iso_size_ceiling_and_variant_verify_2026-06-26). Now the
+  #   needs list (gate-checks + ALL three ISO variants via the build-iso matrix +
+  #   the installers) must ALL succeed; a matrix job is `failure` if ANY leg fails
+  #   (fail-fast:false only lets the others finish), so one failed variant SKIPS
+  #   this publish. /releases/latest then keeps pointing at the last COMPLETE,
+  #   TESTED release instead of a broken/untested partial. `gate-checks` adds the
+  #   "never publish untested" half — no nightly unless every unit/cargo/nix/
+  #   compositor/nixosTest check is green. (build-iso stays PARALLEL to gate-checks
+  #   so the heavy VM suite never serialises into the 6h ISO build.)
   publish-nightly:
-    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [build-iso, build-installers]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [gate-checks, build-iso, build-installers]
     runs-on: ubuntu-latest
     # Uploading ~6.5 GB of split ISO parts is comfortably under 90 min.
     # Without its own budget this job inherits GitHub's 6h hard wall, so a

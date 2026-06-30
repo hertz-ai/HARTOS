@@ -45,7 +45,15 @@ jobs:
           node-version: '20'
 
       - name: Install test deps
-        run: python -m pip install --upgrade pip pytest
+        # `requests` is REQUIRED, not optional: tests/conftest.py's autouse
+        # reset_state_machine fixture imports lifecycle_hooks -> core.session_cache
+        # -> core.http_pool -> requests. Without it the whole job died at first-test
+        # setup with `ModuleNotFoundError: No module named 'requests'` (#129) — a
+        # chronically-red gate that gets ignored. The orb/shell RENDER tests still
+        # self-skip when the heavy shell module can't import (this stays a fast,
+        # deps-light gate); requests just lets the fixture chain + the node/source
+        # guards run green.
+        run: python -m pip install --upgrade pip pytest requests
 
       # The node + source tests always run (no heavy deps). The render tests
       # self-skip if the shell module can't import in a minimal runner.

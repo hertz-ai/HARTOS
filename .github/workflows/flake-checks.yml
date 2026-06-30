@@ -1,0 +1,299 @@
+name: Flake Checks (release gate)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# THE COMPREHENSIVE GATE — "test everything that gets built, gate the release".
+# (binding rule: memory/feedback_test_everything_that_gets_built)
+#
+# This workflow is the single, reusable home for the checks that must be GREEN
+# before HART OS publishes anything (a nightly .iso, a signed release). It runs:
+#
+#   * unit-tests    — pytest tests/unit + tests/functional (the Python runtime).
+#   * cargo-test    — the compositor's DEFAULT-feature pure-logic floor via the
+#                     real `cargo test` (the dev-box build path).
+#   * compositor-nix— `nix build .#hart-comp` (the SMITHAY feature set: compiles
+#                     the DRM/Wayland moat crate AND runs `cargo test --features
+#                     smithay` via doCheck) + `.#hart-rust-precedent`. Crane-cached
+#                     (#136) so a compositor/src edit only recompiles the app crate.
+#                     -> the two compositor feature sets are BOTH gated: default
+#                     (pure logic, here) + smithay (DRM/real-HW, the shipped one).
+#   * nixos-tests   — ACTUALLY RUNS every nixosTest in `checks.x86_64-linux`
+#                     (boots a software-GL VM per check + runs its testScript),
+#                     enumerated DYNAMICALLY so a newly-added test gates the build
+#                     automatically — never a hand-picked subset that silently
+#                     drifts out of date (the gap the old nixos-vm-tests.yml left).
+#
+# WHY A REUSABLE WORKFLOW (on: workflow_call):
+#   release.yml calls this as its `gate-checks` job and makes `publish-nightly` +
+#   `tag-and-sign` depend on it (needs:), so NOTHING ships unless every check here
+#   is GREEN. It runs IN PARALLEL with the heavy ISO build (its own runners +
+#   budgets), so the long VM suite never serialises into build-iso's 6h job
+#   wall-clock (#136). The SAME workflow also runs standalone on PRs (below), so
+#   contributors get the full gate before merge — one definition, no duplication.
+#
+# WHY NOT `nix flake check`:
+#   `nix flake check` evaluates the WHOLE flake, and that has been broken for
+#   months on an upstream mobile-nixos module-option drift in the aarch64
+#   `sd-phone` image (unrelated to x86_64 checks). So we enumerate
+#   `checks.x86_64-linux` by NAME (which never touches sd-phone) and `nix build`
+#   each — the same "build the checks explicitly" approach the e2e + vm-test
+#   workflows already use, but COMPLETE (all of them) instead of a fixed list.
+# ═══════════════════════════════════════════════════════════════════════════
+
+on:
+  # Called by release.yml (the gate). When called, ALL jobs run regardless of the
+  # pull_request paths filter below.
+  workflow_call:
+  # Manual full run (e.g. to validate a tricky branch before opening a PR).
+  workflow_dispatch:
+  # Standalone PR gate. Path-scoped to the trees these heavy checks validate so a
+  # docs-only PR doesn't boot 30+ VMs. The release push always runs the full set
+  # via the workflow_call above.
+  pull_request:
+    paths:
+      - 'nixos/**'
+      - 'compositor/**'
+      - 'claw_native/rust/**'
+      - 'tests/**'
+      - 'integrations/agent_engine/**'
+      - 'requirements.txt'
+      - 'pyproject.toml'
+      - 'setup.py'
+      - '.github/workflows/flake-checks.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  # ─── Python: unit + functional (the runtime gate) ──────────────────────────
+  unit-tests:
+    name: Python unit + functional tests
+    runs-on: ubuntu-latest
+    # Hard ceiling so one hung test can never burn the 6h job cap — the per-test
+    # --timeout below names the culprit; this is the backstop for a C-level block.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e . --no-deps
+          python -c "from core.platform.events import EventBus; print(f'EventBus import OK: {EventBus}')"
+          pip install pytest pytest-asyncio pytest-timeout
+          pip install grep-ast tree-sitter tree-sitter-language-pack 2>/dev/null || true
+          python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True)" 2>/dev/null || true
+
+      - name: Run unit + functional tests
+        env:
+          HEVOLVE_DB_PATH: ':memory:'
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          cd ${{ github.workspace }}
+          # test_vlm_qwen3vl.py::TestFullActionLoop and
+          # ::TestVLMDeterministicActions::test_vlm_action_list_shared... patch
+          # attributes on a module (qwen3vl_backend) whose dependency chain isn't
+          # fully available on stock CI without torch/transformers GPU wheels —
+          # patches resolve to MagicMock objects and raise. Deselect until the VLM
+          # patch targets are refactored to not require the heavy module at
+          # patch-time. Tracked non-blocking.
+          python -m pytest \
+            tests/unit/ \
+            tests/functional/ \
+            --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
+            --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
+            --timeout=120 \
+            -q --tb=line
+
+      # Integration + e2e — cross-module flows. Best-effort: surfaced but
+      # non-blocking (they exercise live-ish paths a hermetic runner can't fully
+      # stand up), exactly as the previous release.yml `test` job had them.
+      - name: Run integration tests (best-effort)
+        if: always()
+        env:
+          HEVOLVE_DB_PATH: ':memory:'
+          PYTHONPATH: ${{ github.workspace }}
+        continue-on-error: true
+        run: |
+          cd ${{ github.workspace }}
+          python -m pytest \
+            tests/integration/ \
+            --timeout=120 \
+            -q --tb=line || echo "Integration tests had failures (non-blocking)"
+
+      - name: Run e2e tests (best-effort)
+        if: always()
+        env:
+          HEVOLVE_DB_PATH: ':memory:'
+          PYTHONPATH: ${{ github.workspace }}
+        continue-on-error: true
+        run: |
+          cd ${{ github.workspace }}
+          python -m pytest \
+            tests/e2e/ \
+            --ignore=tests/e2e/runtime_tests \
+            --timeout=120 \
+            -q --tb=line || echo "E2E tests had failures (non-blocking)"
+
+  # ─── Compositor: default-feature pure-logic floor (the dev-box build path) ──
+  cargo-test:
+    name: Compositor cargo test (default / pure-logic floor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          cargo --version && rustc --version
+
+      # The DEFAULT (no-feature) build is PURE LOGIC (tracing only — no Smithay /
+      # Wayland / DRM), so it compiles + unit-tests on a stock runner with NO
+      # system deps and no git-Smithay fetch (the optional dep is pruned when its
+      # feature is off). This is the floor the Windows dev box also runs; the
+      # SMITHAY feature set is gated by the compositor-nix job below (which runs
+      # `cargo test --features smithay` via the nix doCheck on the pinned
+      # toolchain). Together they gate BOTH compositor feature sets that ship.
+      - name: cargo test (default features)
+        working-directory: compositor
+        run: cargo test --verbose
+
+  # ─── Compositor: the SMITHAY (DRM) feature set, built + tested in Nix ───────
+  compositor-nix:
+    name: Compositor nix build (smithay feature + cargo test via doCheck)
+    runs-on: ubuntu-latest
+    # Cold full-core Rust compile of the 245-crate moat closure; crane (#136)
+    # caches the deps-only artifacts so a compositor/src-only edit recompiles just
+    # the app crate. Generous budget for the cold path; well under the 6h cap.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            substituters = https://cache.nixos.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+            narinfo-cache-negative-ttl = 0
+            # fallback: build hart-comp from source on a genuine cache miss (it is
+            # a HART-local Rust derivation, never in cache.nixos.org).
+            fallback = true
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get autoremove -y && sudo apt-get clean
+          df -h /
+
+      - name: Build hart-rust-precedent then hart-comp (full cores)
+        working-directory: nixos
+        run: |
+          # pipefail is MANDATORY: `nix build … | tee` otherwise reports tee's
+          # exit (0) and the job goes green even when nix FAILED.
+          set -o pipefail
+          # precedent FIRST (claw-cli) so a toolchain-resolution failure is
+          # isolated before hart-comp depends on it. --cores 0 = ALL runner cores
+          # per derivation (the CPU-bound rustc/LLVM compile; the iso-desktop
+          # 4h-hang lesson: NEVER throttle this Rust build to 2 cores).
+          for tgt in hart-rust-precedent hart-comp; do
+            echo "=== nix build .#$tgt ==="
+            time nix build ".#$tgt" \
+              --no-link --print-out-paths --print-build-logs \
+              --cores 0 --max-jobs 2 \
+              --option narinfo-cache-negative-ttl 0
+          done
+          echo "Compositor build + cargo-test (doCheck, --features smithay) GREEN."
+
+  # ─── EVERY nixosTest in checks.x86_64-linux — actually RUN (not eval) ───────
+  # Sharded across runners so the full suite finishes comfortably under the job
+  # cap (a single mega-job risks timing out -> a chronically-red gate that gets
+  # ignored). The shard set is enumerated DYNAMICALLY from the flake, so a new
+  # nixosTest is gated the moment it lands in `checks` — no hand-maintained list.
+  nixos-tests:
+    name: nixosTests shard ${{ matrix.shard }}/4
+    runs-on: ubuntu-latest
+    # Each shard runs ~1/4 of the checks (+ the shared closure build once). 5h
+    # budget leaves wide headroom under the 6h cap even on a cold cache.
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      SHARD_TOTAL: '4'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            substituters = https://cache.nixos.org
+            trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+            narinfo-cache-negative-ttl = 0
+            max-jobs = 2
+            cores = 2
+            fallback = true
+
+      - name: Enable KVM (the nixosTest driver uses /dev/kvm when present)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | \
+            sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger
+          ls -l /dev/kvm || echo "no /dev/kvm — the test driver falls back to TCG (slower, still runs)"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL \
+                      /usr/local/.ghcup /usr/share/swift || true
+          sudo docker image prune -a -f 2>/dev/null || true
+          sudo apt-get autoremove -y && sudo apt-get clean
+          df -h /
+
+      - name: Build + run this shard's nixosTests
+        working-directory: nixos
+        run: |
+          set -eo pipefail
+          # Enumerate EVERY check by NAME. `--apply builtins.attrNames` forces only
+          # the attrset spine of checks.x86_64-linux, so it never evaluates
+          # packages.*.sd-phone (the upstream mobile-nixos drift that breaks a whole
+          # `nix flake check`). Sorted for a STABLE shard assignment.
+          mapfile -t ALL < <(nix eval .#checks.x86_64-linux --apply builtins.attrNames --json | jq -r '.[]' | sort)
+          TOTAL=${#ALL[@]}
+          echo "Discovered ${TOTAL} nixosTest checks in checks.x86_64-linux"
+          if [[ "$TOTAL" -eq 0 ]]; then
+            echo "ERROR: enumerated 0 checks — flake eval problem, failing loud"
+            exit 1
+          fi
+
+          # Deterministic round-robin: check i runs in shard (i mod SHARD_TOTAL).
+          SEL=()
+          for i in "${!ALL[@]}"; do
+            if (( i % SHARD_TOTAL == ${{ matrix.shard }} )); then
+              SEL+=( ".#checks.x86_64-linux.${ALL[$i]}" )
+              echo "  shard ${{ matrix.shard }} <- ${ALL[$i]}"
+            fi
+          done
+          if [[ "${#SEL[@]}" -eq 0 ]]; then
+            echo "No checks fell into shard ${{ matrix.shard }} (fewer checks than shards) — nothing to do."
+            exit 0
+          fi
+
+          # --keep-going builds ALL selected checks even if one fails, so every
+          # test's result is visible per run (a failure must not mask the others);
+          # nix still exits non-zero if ANY failed -> the shard (and thus the gate)
+          # goes red. Building a check RUNS its VM testScript.
+          echo "=== Building ${#SEL[@]} checks in shard ${{ matrix.shard }} ==="
+          nix build --keep-going --print-build-logs --max-jobs 2 --cores 2 "${SEL[@]}"
+          echo "Shard ${{ matrix.shard }} nixosTests PASSED."
