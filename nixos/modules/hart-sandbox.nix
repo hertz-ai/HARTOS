@@ -225,11 +225,24 @@ let
             check "Wine prefix creation" 2
         fi
 
-        # Test 4: NTFS kernel support
-        if grep -q ntfs3 /proc/filesystems 2>/dev/null; then
+        # Test 4: Cross-OS filesystem drivers (#145 interop — read/write a disk
+        # formatted on ANY OS: Windows NTFS, camera/phone exFAT, FAT, Linux
+        # ext4/btrfs). Reuses the shared hart-storage-fsprobe readout (installed by
+        # hart-storage.nix) so the "is this driver available on this kernel"
+        # decision lives in ONE place; falls back to a direct ntfs3 probe when the
+        # storage interop set is not enabled on this build.
+        if command -v hart-storage-fsprobe >/dev/null 2>&1; then
+            for fs in ntfs exfat vfat ext4 btrfs; do
+                if [[ "$(hart-storage-fsprobe --query "$fs")" == "ok" ]]; then
+                    check "$fs filesystem (cross-OS interop)" 0 "Driver available to the kernel"
+                else
+                    check "$fs filesystem (cross-OS interop)" 2 "No $fs driver on this kernel"
+                fi
+            done
+        elif grep -q ntfs3 /proc/filesystems 2>/dev/null; then
             check "NTFS filesystem (kernel native)" 0
         else
-            check "NTFS filesystem (kernel native)" 2 "ntfs3 module not loaded"
+            check "NTFS filesystem (kernel native)" 2 "ntfs3 not loaded; enable hart.storage for full cross-OS interop"
         fi
 
         # Test 5: Vulkan (DXVK requires this)

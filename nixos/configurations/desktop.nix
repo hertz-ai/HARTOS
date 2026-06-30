@@ -303,6 +303,19 @@ in
     # can never strand the user's Windows boot.
     bootContinuity.enable = true;
 
+    # ── Boot / root-mount / initrd hardening (USB-root enumeration) ──
+    # HART OS boots from a USB stick, so the initrd MUST carry the modules that
+    # enumerate a USB block device before the root pivot (usb_storage/uas/sd_mod +
+    # the xhci/ehci host controllers). The installer-CD profile this config imports
+    # already ships them, but a future profile/override change must NOT be able to
+    # silently drop them and brick the real-HW USB boot with "VFS: Unable to mount
+    # root fs on LABEL=HART_OS". This guard re-ENSURES the USB-root module set is in
+    # the initrd AND ASSERTS (at eval time) the critical subset survived the merge —
+    # so a stripped module set is a loud BUILD failure, never a silent black-hang on
+    # the stick. A pure eval/closure guard: it adds initrd modules + an assertion and
+    # does NOTHING at runtime, so it can never block, slow, or fail a boot.
+    bootRootInitrd.enable = true;
+
     # ── External-USB journal export (field recovery for a wedged shell) ──
     # The software-rendered glass shell can peg the CPU and wedge the in-shell
     # terminal/compositor, leaving the user unable to copy anything out. With this
@@ -315,6 +328,51 @@ in
     # and /nix/store are excluded); a pure NO-OP when no eligible external stick is
     # present, so it can never clobber the boot stick or block boot/shutdown.
     journalExport.enable = true;
+
+    # ── LAN-path diagnostics + network-up (the steward's "log to the network") ──
+    # The dev box and the live-OS box sit on the SAME home LAN, so the journal
+    # should be reachable OVER THE NETWORK - no stick to yank. With this ON, the
+    # dev box reads the live-OS box's journal with ONE curl over the LAN:
+    #   curl "http://<liveos-ip>:6699/diag?t=hart-lan-diag"
+    # returning journalctl -b + dmesg + lspci + lsusb + rfkill + wpctl + ip -br a +
+    # the boot-log. The endpoint is READ-ONLY (runs no actions), token-gated
+    # (constant-time, FAIL-CLOSED without a token), and LAN-scoped via the firewall.
+    # netconsole (kernel ring over UDP, survives a userspace wedge) + the periodic
+    # PUSH stay OFF here because each needs a dev-box target IP - the operator turns
+    # them on with hart.netDiag.netconsole.{enable,target} / .push.{enable,target}.
+    # Network-up (so the diag is reachable): a boot rfkill-unblock clears soft-block
+    # on the radio, and the USB-NIC drivers load so plugging a USB-ethernet dongle
+    # DHCP-auto-connects instantly (the "debug wifi without wifi" shortcut).
+    # NOTE: "hart-lan-diag" is a LOW-SENSITIVITY LAN diagnostics token (NOT a
+    # credential to anything) - a known default so the dev box can curl during a
+    # freeze without first reading it off the frozen box. Override it
+    # (hart.netDiag.http.token) on an untrusted network.
+    netDiag = {
+      enable = true;
+      http = {
+        enable = true;
+        port = 6699;
+        token = "hart-lan-diag";
+      };
+      wifiUnblock.enable = true;
+      usbEthernet.enable = true;
+    };
+
+    # ── Cross-OS storage interop (#145): read/write ALL filesystems ──
+    # A user plugs in a disk formatted on another OS — a Windows NTFS drive, a
+    # camera/phone exFAT card, a Linux ext4/btrfs disk, a FAT32 stick — and HART
+    # OS reads AND writes it, like macOS or Windows would. This turns on
+    # boot.supportedFilesystems for ntfs/exfat/vfat/ext4/btrfs (kernel drivers +
+    # userspace mount helpers), the udisks2 on-demand mount authority the file
+    # manager + glass shell call to mount removable media (under /run/media), and
+    # the per-filesystem format/repair tooling. PRIVACY-FIRST: reading a plugged
+    # disk is a LOCAL capability, so it ships ON (no opt-in friction); nothing
+    # here leaves the device. DEGRADE-NOT-DIE: it adds only AVAILABLE drivers +
+    # an ON-DEMAND mount path (NEVER an fstab/.mount unit), so a disconnected or
+    # corrupt disk is simply never mounted and can never stall local-fs.target or
+    # wedge boot — an unmountable disk fails fast and clean. (Proven by
+    # tests/storage-filesystems.nix.)
+    storage.enable = true;
 
     # ── Privacy-first networking + desktop apps (Category-4 LOCAL features) ──
     # Per the privacy-first principle every LOCAL capability ships ON by default
@@ -458,6 +516,35 @@ in
     # flashes faster. Bumped from the default 19 because the desktop variant is the
     # only one near the ceiling (server/edge build fine at 19).
     squashfsCompression = "zstd -Xcompression-level 22";
+
+    # ─── Build-time on-stick HARTLOG partition: assessed NOT safely shippable ───
+    # A build-time step to append a 64 MB FAT32 HARTLOG partition as the LAST
+    # partition of this .iso (backup GPT at the IMAGE end, partition 1 + ESP
+    # byte-identical, isohybrid MBR/El-Torito/GPT coherent) was evaluated and is
+    # deliberately NOT shipped. Empirically tested 2026-06-30 on a synthetic
+    # nixpkgs-equivalent isohybrid ISO (same flags as lib/make-iso9660-image.sh:
+    # -isohybrid-mbr isohdpfx.bin / -eltorito-alt-boot -e boot/efi.img
+    # -isohybrid-gpt-basdat):
+    #   * The only post-build tool reachable from a wrapper derivation, xorriso
+    #     -indev/-outdev -append_partition, is DESTRUCTIVE on re-commit: it DROPS
+    #     the EFI System Partition (the 0xEF MBR + GPT entry vanished), flips
+    #     partition 1 from the 0x00 isohybrid-basdat type to 0x83, and rewrites the
+    #     System Area + iso9660 volume descriptors. That breaks UEFI boot - the
+    #     opposite of a byte-identical append.
+    #   * The only CORRECT route is -append_partition inside the ORIGINAL
+    #     `xorriso -as mkisofs` call (the grub-mkrescue pattern: ESP preserved,
+    #     partition 1 type preserved, HARTLOG added as partition 3 in MBR + GPT,
+    #     backup GPT placed at the image end - all verified on the synthetic ISO).
+    #     But nixpkgs' lib/make-iso9660-image.sh exposes NO hook to inject extra
+    #     xorriso flags, so reaching it means forking that internal upstream script
+    #     (unstable across nixpkgs bumps) and it still could not be validated
+    #     without a full ISO build + real-HW UEFI boot (where the duplicate-label
+    #     boot race also hides). Risking the boot layout for a diagnostic
+    #     convenience is the wrong trade.
+    # The on-stick HARTLOG is instead provided by hart.hartlogCreate (Live-OS,
+    # guarded to never complete the boot-disk GPT) and hart.journalExport (to a
+    # SEPARATE FAT32 stick). Revisit only if nixpkgs gains an xorriso-extra-args
+    # hook, with a real-HW UEFI boot as the gate.
   };
 
   # ═══════════════════════════════════════════════════════════════
@@ -779,6 +866,20 @@ in
     alsa.enable = true;
     pulse.enable = true;
     jack.enable = true;
+  };
+
+  # ── Boot-time audio rescue (never boot silent) ──
+  # A real-HW "no audio out" the steward hit: the default sink existed but was
+  # MUTED / at volume 0 on boot (WirePlumber persists per-user mute/volume state
+  # across reboots, so a once-muted sink stays silent forever). hart.audio runs a
+  # graphical-session USER oneshot that UNMUTES the default sink and rescues its
+  # level to 60% ONLY when it reads 0 (a deliberate non-zero level is left as-is).
+  # Best-effort + a pure no-op when there is no sink / no wpctl/pactl, so it can
+  # never block or fail the session. Default-ON wherever PipeWire is on; set
+  # explicit here for clarity. Privacy-first LOCAL capability (nothing leaves).
+  hart.audio.bootUnmute = {
+    enable = true;
+    bootVolumePercent = 60;
   };
 
   # Bluetooth

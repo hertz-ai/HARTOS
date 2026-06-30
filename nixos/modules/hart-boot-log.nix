@@ -66,18 +66,56 @@ let
   latchFile  = "/var/lib/hart/session-tier";
   windowFile = "/var/lib/hart/session-tier.window";
   readyFlag  = "/run/hart/session/shell-ready";
+  # The INPUT twin of the paint marker: hart-comp's note_input_alive (#134) touches
+  # this on the FIRST real seat event, proving the libinput -> Seat delivery path is
+  # live. Surfacing its presence/absence here is what tells a "pointer frozen at 0,0,
+  # nothing types" boot (painted, dead seat) apart from a working desktop.
+  inputAliveFlag = "/run/hart/session/input-alive";
 
   # Every tool referenced by absolute store path — the unit PATH is minimal and
   # several of these (lsblk, dmesg, drm_info, loginctl) are NOT on it (the
   # iso_real_usb_boot lesson: awk/lspci/xxd/curl were off the minimal unit PATH).
   binPath = lib.makeBinPath (with pkgs; [
     coreutils util-linux systemd kmod gnugrep gawk
+    # pciutils -> lspci (network-class device enumeration); iproute2 -> ip (link
+    # state). rfkill ships in util-linux (above). These power the NETWORK / WiFi /
+    # rfkill section so "wifi chip not enumerated" vs "soft-blocked" is answerable
+    # OFFLINE from the stick (the network-wifi degrade dimension's real-HW probe).
+    pciutils iproute2
   ]);
 
   # drm_info is its own package; attr-guarded so a nixpkgs rev lacking it cannot
   # break evaluation (the rustdesk attr-guard pattern from desktop.nix).
   drmInfoBin =
     if pkgs ? drm_info then "${pkgs.drm_info}/bin/drm_info"
+    else "";
+
+  # `libinput list-devices` enumerates exactly what the compositor's seat sees:
+  # every keyboard / pointer / touch / touchpad device + its capabilities (the
+  # "Capabilities:" line) and tap/scroll config. It is THE real-HW probe for the
+  # input-seat-pointer dimension — a "pointer frozen at 0,0 / nothing types / taps
+  # don't register" boot is diagnosed by whether this lists a pointer/keyboard/touch
+  # at all (seat saw no device) vs lists them but the cursor never moved (routing
+  # bug). Attr-guarded like drm_info so a rev lacking the attr cannot break eval; the
+  # `list-devices` subcommand needs CAP to open /dev/input/event*, so it is run as
+  # root (the unit is root) and `|| true`-guarded (a seat with zero devices exits
+  # non-zero, which is itself the signal).
+  libinputBin =
+    if pkgs ? libinput then "${pkgs.libinput}/bin/libinput"
+    else "";
+
+  # Audio probe tools, attr-guarded the same way. wpctl ships with WirePlumber,
+  # pactl with the pulseaudio package (present on a PipeWire-pulse system). They
+  # talk to the PER-USER PipeWire socket, so the capture runs them via `runuser`
+  # against each active user session's XDG_RUNTIME_DIR (a root unit cannot see the
+  # user's PipeWire instance). "Is the default sink muted / at volume 0?" is
+  # exactly the real-HW "no audio out" failure the steward hit; the kernel-level
+  # /proc/asound/cards + /dev/snd answer the prior "is there a sound card at all?".
+  wpctlBin =
+    if pkgs ? wireplumber then "${pkgs.wireplumber}/bin/wpctl"
+    else "";
+  pactlBin =
+    if pkgs ? pulseaudio then "${pkgs.pulseaudio}/bin/pactl"
     else "";
 
   # ── The diagnostic-bundle capture script ──────────────────────────────────
@@ -101,7 +139,11 @@ let
     LATCH="${latchFile}"
     WINDOW="${windowFile}"
     READY="${readyFlag}"
+    INPUT_ALIVE="${inputAliveFlag}"
     DRM_INFO="${drmInfoBin}"
+    LIBINPUT="${libinputBin}"
+    WPCTL="${wpctlBin}"
+    PACTL="${pactlBin}"
 
     log() { echo "[hart-boot-log] $*" >&2 ; }
 
@@ -182,6 +224,50 @@ let
       fi
       echo ""
 
+      echo "───────────── root / boot device + kernel cmdline (boot-root-initrd) ─────────────"
+      # THE real-HW probe for the boot-root-initrd dimension: record that root
+      # actually MOUNTED, from WHERE, and that the USB-enumeration modules loaded —
+      # so "did the USB root come up, and did it race the duplicate LABEL=HART_OS?"
+      # is answerable OFFLINE from the stick (the failure modes a real USB boot hits
+      # that a virtio-root VM never does). Every probe is best-effort (|| true).
+      echo "── kernel cmdline (the root= the kernel was told to mount) ──"
+      cat /proc/cmdline 2>/dev/null || echo "(/proc/cmdline unavailable)"
+      echo ""
+      echo "── root (/) mount — ROOT-MOUNT SUCCESS if a SOURCE+FSTYPE is shown ──"
+      if findmnt -n -o SOURCE,FSTYPE,OPTIONS / 2>/dev/null; then
+        ROOT_SRC=$(findmnt -n -o SOURCE / 2>/dev/null | head -n1) || ROOT_SRC=""
+        echo "root-mount: SUCCESS (/ is mounted from $ROOT_SRC)"
+        # The disk the root device lives on + whether it is removable/USB — so a
+        # field reader can tell the live USB root from an internal install.
+        ROOT_PK=$(lsblk -ndo pkname "$ROOT_SRC" 2>/dev/null | head -n1) || ROOT_PK=""
+        if [ -n "$ROOT_PK" ]; then
+          echo "root parent disk: /dev/$ROOT_PK  (RM=$(lsblk -ndo RM /dev/$ROOT_PK 2>/dev/null | tr -d ' ') TRAN=$(lsblk -ndo TRAN /dev/$ROOT_PK 2>/dev/null | tr -d ' '))"
+        fi
+      else
+        echo "root-mount: UNKNOWN — findmnt could not report / (this should never"
+        echo "  print from a booted system; if it does, the root pivot is suspect)"
+      fi
+      echo ""
+      echo "── full block topology (lsblk) ──"
+      lsblk -o NAME,TYPE,SIZE,FSTYPE,LABEL,PARTLABEL,RM,TRAN,MOUNTPOINT 2>/dev/null || echo "(lsblk unavailable)"
+      echo ""
+      echo "── duplicate-LABEL=HART_OS race check (devices answering to the ISO label) ──"
+      # The intermittent real-HW root-mount panic is a DUPLICATE-LABEL race: if MORE
+      # THAN ONE device answers to LABEL=HART_OS (the whole disk AND partition 1),
+      # the by-label root device is decided by per-boot udev order — boots once,
+      # panics next boot. Counting the matches here surfaces it from the stick.
+      HARTOS_HITS=$(blkid -L HART_OS 2>/dev/null | wc -l 2>/dev/null) || HARTOS_HITS="?"
+      echo "devices with LABEL=HART_OS: $HARTOS_HITS (EXPECT 1; >1 = the duplicate-LABEL root race is armed)"
+      blkid 2>/dev/null | grep -i 'HART_OS' || echo "(no HART_OS-labelled devices reported by blkid)"
+      echo ""
+      echo "── USB-root enumeration modules loaded (proves the initrd modules took on real HW) ──"
+      # If usb_storage / an xhci controller / sd_mod are loaded, the USB stick
+      # actually enumerated — the initrd carried + udev loaded the right modules.
+      # On a non-USB (internal) boot these may be absent; that is fine, this is a
+      # diagnostic, not a gate.
+      lsmod 2>/dev/null | grep -iE 'usb_storage|uas|xhci|ehci|^sd_mod|sd_mod ' || echo "(none of usb_storage/uas/xhci/ehci/sd_mod currently loaded)"
+      echo ""
+
       echo "───────────── systemctl --failed ─────────────"
       systemctl --failed --no-pager --no-legend 2>/dev/null || echo "(systemctl --failed unavailable)"
       echo ""
@@ -228,6 +314,173 @@ let
       fi
       echo "── /dev/dri ──"
       ls -l /dev/dri 2>/dev/null || echo "(no /dev/dri — no DRM/KMS node)"
+      echo ""
+
+      echo "───────────── NETWORK / WiFi / rfkill ─────────────"
+      # THE diagnostic for "Wi-Fi hardware not detected" / "wifi shows off but the
+      # chip is fine". Four layers, top-down, so a reader can tell apart:
+      #   (1) lspci network-class devices — is the wifi/ethernet CHIP even on the
+      #       bus? (missing here == no driver bound / no hardware, NOT a soft issue)
+      #   (2) rfkill — is a present radio SOFT- or HARD-blocked? (a soft-block reads
+      #       as "off"; a hard-block needs a physical switch; both PROVE the chip is
+      #       enumerated, so they are distinct from "no hardware")
+      #   (3) ip link — which net interfaces the kernel actually created + their
+      #       UP/DOWN state.
+      #   (4) the kernel's wifi firmware/driver lines (iwlwifi/ath/rtw/brcm load OR
+      #       a "firmware: failed to load" — the redistributable-firmware gap).
+      echo "── lspci (network class) ──"
+      if command -v lspci >/dev/null 2>&1; then
+        lspci -nn 2>/dev/null | grep -iE 'network|ethernet|wireless|wi-?fi' \
+          || echo "(no network-class PCI device — wifi/eth chip not enumerated)"
+      else
+        echo "(lspci unavailable)"
+      fi
+      echo "── rfkill (soft/hard block state — distinguishes a block from no-hw) ──"
+      if command -v rfkill >/dev/null 2>&1; then
+        rfkill list 2>/dev/null || echo "(rfkill produced no output)"
+      else
+        # Fall back to sysfs (the same source the shell's wifi probe reads), so the
+        # block state is captured even on a build without the rfkill CLI.
+        echo "(rfkill CLI unavailable — sysfs /sys/class/rfkill follows)"
+        for r in /sys/class/rfkill/rfkill*; do
+          [ -d "$r" ] || continue
+          echo "== $r ==  type=$(cat "$r/type" 2>/dev/null)  soft=$(cat "$r/soft" 2>/dev/null)  hard=$(cat "$r/hard" 2>/dev/null)"
+        done
+      fi
+      echo "── ip link (interface up/down) ──"
+      if command -v ip >/dev/null 2>&1; then
+        ip -br link 2>/dev/null || ip link 2>/dev/null || echo "(ip produced no output)"
+      else
+        echo "(ip unavailable — /sys/class/net follows)"
+        ls /sys/class/net 2>/dev/null || echo "(no /sys/class/net)"
+      fi
+      echo "── kernel wifi firmware/driver lines (iwlwifi/ath/rtw/brcm) ──"
+      journalctl -b --no-pager 2>/dev/null \
+        | grep -iE 'iwlwifi|iwlmvm|ath[0-9]|ath1[0-9]k|rtw[0-9]|rtl[0-9]|brcm|cfg80211|firmware: (failed|direct)' \
+        | tail -n 80 || echo "(no wifi driver/firmware lines)"
+      echo ""
+
+      echo "───────────── INPUT / SEAT / POINTER (#134) ─────────────"
+      # THE diagnostic for "pointer frozen at 0,0 / nothing types / taps don't
+      # register". Four layers, top-down, so a reader can localise the break:
+      #   (1) the compositor's input-alive beacon (did the libinput->Seat path ever
+      #       deliver a real event this boot),
+      #   (2) libinput list-devices (what the seat actually enumerated: pointer /
+      #       keyboard / touch / touchpad + capabilities),
+      #   (3) the raw kernel evdev table + the /dev/input node permissions (did the
+      #       devices exist + were they openable by the seat's user/group),
+      #   (4) loginctl seat-status (did logind assign the input devices to seat0).
+      echo "── input-alive beacon ($INPUT_ALIVE) — the #134 liveness signal ──"
+      if [ -e "$INPUT_ALIVE" ]; then
+        echo "PRESENT — the compositor delivered a real seat event (libinput/Seat path LIVE)"
+        echo "  mtime: $(date -r "$INPUT_ALIVE" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || stat -c '%y' "$INPUT_ALIVE" 2>/dev/null || echo '?')"
+      else
+        echo "ABSENT — NO pointer/keyboard event was ever delivered into the seat this boot."
+        echo "  If the shell-ready paint marker above is PRESENT, this is the painted-but-"
+        echo "  input-starved seat (#134 'pointer frozen at 0,0, nothing types'). Cross-check"
+        echo "  the device enumeration below: a seat with no pointer/keyboard means the"
+        echo "  devices never opened; devices present + no beacon means an input-routing bug."
+      fi
+      echo ""
+      echo "── libinput list-devices (what the seat enumerated) ──"
+      if [ -n "$LIBINPUT" ] && [ -x "$LIBINPUT" ]; then
+        # Needs root to open /dev/input/event*; the unit is root. Non-zero exit (a
+        # seat with zero devices) is itself the signal — never abort the bundle.
+        "$LIBINPUT" list-devices 2>/dev/null || echo "(libinput list-devices found NO devices / exited non-zero — seat granted no input)"
+      else
+        echo "(libinput not in closure — falling back to the raw evdev table below)"
+      fi
+      echo ""
+      echo "── seat capability summary (does the seat expose pointer / keyboard / touch?) ──"
+      # A one-line verdict so a Windows-host reader answers "does this boot's seat
+      # expose pointer+keyboard+touch?" at a glance instead of eyeballing the raw
+      # enumeration above. Derived from libinput's authoritative `Capabilities:`
+      # lines when available, else the kernel evdev handlers (mouseN=pointer,
+      # kbd=keyboard; the raw table carries no ID_INPUT_TOUCHSCREEN tag, so touch is
+      # `unknown` on the fallback). pointer=no AND keyboard=no with a PRESENT
+      # shell-ready marker IS the "pointer frozen at 0,0, nothing types" seat.
+      _isp_caps=""
+      if [ -n "$LIBINPUT" ] && [ -x "$LIBINPUT" ]; then
+        _isp_caps="$("$LIBINPUT" list-devices 2>/dev/null | grep -i 'Capabilities:' 2>/dev/null)" || _isp_caps=""
+      fi
+      _isp_ptr=no; _isp_kbd=no; _isp_tch=no
+      if [ -n "$_isp_caps" ]; then
+        printf '%s\n' "$_isp_caps" | grep -qi 'pointer'  && _isp_ptr=yes
+        printf '%s\n' "$_isp_caps" | grep -qi 'keyboard' && _isp_kbd=yes
+        printf '%s\n' "$_isp_caps" | grep -qi 'touch'    && _isp_tch=yes
+      elif [ -r /proc/bus/input/devices ]; then
+        grep -qiE '^H: Handlers=.*mouse[0-9]' /proc/bus/input/devices && _isp_ptr=yes
+        grep -qiE '^H: Handlers=.*kbd'        /proc/bus/input/devices && _isp_kbd=yes
+        _isp_tch=unknown
+      fi
+      echo "seat capabilities: pointer=$_isp_ptr keyboard=$_isp_kbd touch=$_isp_tch"
+      if [ "$_isp_ptr" = no ] && [ "$_isp_kbd" = no ]; then
+        echo "  (NO pointer AND NO keyboard enumerated -> if the shell-ready marker is"
+        echo "   PRESENT above, this is the painted-but-input-starved seat: pointer frozen"
+        echo "   at 0,0 / nothing types. If ABSENT, the devices never opened at all.)"
+      fi
+      echo ""
+      echo "── kernel evdev table (/proc/bus/input/devices) ──"
+      # Always present (no extra package): lists every input device the KERNEL sees
+      # with its EV= capability bitmask (EV=120013 keyboard, EV=17 mouse, EV=b touch),
+      # so a pointer/keyboard/touch can be confirmed even when libinput is absent.
+      cat /proc/bus/input/devices 2>/dev/null || echo "(no /proc/bus/input/devices)"
+      echo ""
+      echo "── /dev/input node permissions (seat must be able to open these) ──"
+      ls -l /dev/input 2>/dev/null || echo "(no /dev/input — kernel saw no input devices at all)"
+      echo ""
+      echo "── loginctl seat-status seat0 (logind's device assignment) ──"
+      # The seat (logind) must ATTACH the input devices to seat0 and grant the
+      # active session a device lease. A seat0 with no input devices == the seat
+      # never granted them (the 'seat not granting input' failure).
+      loginctl seat-status seat0 2>/dev/null || echo "(loginctl seat-status unavailable)"
+      echo ""
+
+      echo "───────────── AUDIO / SINK / VOLUME ─────────────"
+      # THE diagnostic for "no audio out": a sink that EXISTS but is MUTED or at
+      # volume 0 on boot (the steward's real-HW bug), distinguished from "no sound
+      # card at all". Three layers, bottom-up:
+      #   (1) the KERNEL sound cards + /dev/snd nodes — is there hardware at all?
+      #   (2) the PER-USER PipeWire/WirePlumber state via wpctl/pactl, run as the
+      #       session user (a root unit cannot see the user's PipeWire socket) —
+      #       the default sink, its MUTE flag + VOLUME level.
+      #   (3) the hart-audio-unmute rescue's own decision lines from the journal —
+      #       did the boot-time unmute run + what did it do.
+      echo "── kernel sound cards (/proc/asound/cards) — is there audio HW at all ──"
+      cat /proc/asound/cards 2>/dev/null || echo "(no /proc/asound/cards — kernel saw no sound card)"
+      echo "── /dev/snd nodes ──"
+      ls -l /dev/snd 2>/dev/null || echo "(no /dev/snd — no ALSA device nodes)"
+      echo ""
+      echo "── per-user PipeWire default-sink state (wpctl/pactl as each session user) ──"
+      # wpctl/pactl connect to the per-user PipeWire socket under each session's
+      # XDG_RUNTIME_DIR. Iterate /run/user/<uid>, resolve the owner with stat, and
+      # runuser into that user. All best-effort (|| true): a headless boot with no
+      # user session simply prints the no-session note and the bundle continues.
+      _did_user=0
+      for RUNDIR in /run/user/*; do
+        [ -d "$RUNDIR" ] || continue
+        UID_N=$(basename "$RUNDIR")
+        UNAME=$(stat -c %U "$RUNDIR" 2>/dev/null) || UNAME=""
+        [ -n "$UNAME" ] || continue
+        _did_user=1
+        echo "== session $UNAME (uid $UID_N) =="
+        if [ -n "$WPCTL" ] && [ -x "$WPCTL" ]; then
+          runuser -u "$UNAME" -- env XDG_RUNTIME_DIR="$RUNDIR" "$WPCTL" status 2>/dev/null \
+            || echo "(wpctl status unavailable for $UNAME — no PipeWire session?)"
+          runuser -u "$UNAME" -- env XDG_RUNTIME_DIR="$RUNDIR" "$WPCTL" get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null \
+            || echo "(wpctl get-volume: no default sink for $UNAME)"
+        fi
+        if [ -n "$PACTL" ] && [ -x "$PACTL" ]; then
+          echo "default-sink: $(runuser -u "$UNAME" -- env XDG_RUNTIME_DIR="$RUNDIR" "$PACTL" get-default-sink 2>/dev/null || echo '(none)')"
+          runuser -u "$UNAME" -- env XDG_RUNTIME_DIR="$RUNDIR" "$PACTL" list short sinks 2>/dev/null \
+            || echo "(pactl list sinks unavailable for $UNAME)"
+        fi
+      done
+      [ "$_did_user" = "1" ] || echo "(no /run/user/* session — headless/no graphical login; no per-user audio state)"
+      echo ""
+      echo "── hart-audio-unmute rescue decisions (from the boot journal) ──"
+      journalctl -b --no-pager 2>/dev/null | grep -i 'hart-audio-unmute\|pipewire\|wireplumber\|PipeWire\|default sink\|MUTED' | tail -n 120 \
+        || echo "(no audio-rescue / PipeWire lines this boot)"
       echo ""
 
       echo "───────────── dmesg (tail) ─────────────"
@@ -401,6 +654,10 @@ in
         ln -s ${captureScript} $out/bin/hart-boot-log-capture
       '')
     ]
-    ++ lib.optional (pkgs ? drm_info) pkgs.drm_info;
+    ++ lib.optional (pkgs ? drm_info) pkgs.drm_info
+    # libinput ships the `libinput list-devices` CLI the input-seat-pointer probe
+    # (and a recovery-TTY operator) calls to enumerate the seat's pointer/keyboard/
+    # touch devices. Attr-guarded so a rev lacking it cannot break eval.
+    ++ lib.optional (pkgs ? libinput) pkgs.libinput;
   };
 }

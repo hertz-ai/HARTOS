@@ -126,6 +126,15 @@
       # any error/timeout/missing-tool writes `software`; the unit always succeeds
       # so it can never block or fail the boot.
       ./modules/hart-gpu-probe.nix
+      # Post-boot DISPLAY-HEALTH snapshot: the real-HW observability for the
+      # never-black tier ladder. A oneshot ordered AFTER greetd (never before it,
+      # so it can never delay first paint) records an honest per-dimension verdict
+      # (tier/gpu/painted/input/scanout/screen) to /run/hart/display-health, with
+      # `unknown` for the unbuilt #131 scanout + #134 input markers (never a faked
+      # positive). Gated on hart.sessionSupervisor.enable so it ships ONLY where
+      # the ladder exists (adds nothing to server/edge). FAIL-SAFE: missing markers
+      # record their fail-safe value, the unit always succeeds (oneshot, exit 0).
+      ./modules/hart-display-health.nix
       # sway-as-Tier-1: the proven-in-WSL OS-native windowing session (canonical
       # glass shell under sway) + the hart-swaymsg-shim the brain's HartWmClient
       # drives at Tier-2. Opt-in (hart.swayTier1.enable=false default) -> no-op
@@ -168,6 +177,14 @@
       ./modules/hart-dns.nix
       ./modules/hart-power.nix
       ./modules/hart-accessibility.nix
+      # Boot-time audio rescue: a graphical-session USER oneshot that UNMUTES the
+      # default sink + rescues its level to a sane floor (60%) when it reads 0, so
+      # the desktop never boots silent because of a persisted mute / volume-0 state
+      # (a real-HW "no audio out" the steward hit). Gated on cfg.enable AND
+      # services.pipewire.enable -> a PURE no-op on server/edge (no PipeWire) and
+      # active on desktop/phone. Also a clean no-op at runtime when no default sink
+      # or no wpctl/pactl. Imported so the option exists + tests/audio.nix gates it.
+      ./modules/hart-audio.nix
       # Desktop management
       ./modules/hart-cups.nix
       # Thunderbird email client + default mailto handler + GNOME-keyring creds.
@@ -229,6 +246,20 @@
       # for every variant; desktop.nix turns it on. tests/boot-continuity.nix
       # gates the structural assertions.
       ./modules/hart-boot-continuity.nix
+      # Boot / root-mount / initrd hardening (USB-root enumeration): ENSURES the
+      # initrd carries the usb_storage/uas/sd_mod + xhci/ehci host-controller module
+      # set a USB root needs to enumerate before the pivot, and ASSERTS the critical
+      # subset survived into boot.initrd.availableKernelModules — so a profile/mkForce
+      # change that stripped them is a BUILD failure, never a silent real-HW "VFS:
+      # Unable to mount root fs" brick. A pure eval/closure guard (adds initrd modules
+      # + an assertion, nothing at runtime — it can never block/slow/fail a boot, only
+      # fail the build loudly). Opt-in (hart.bootRootInitrd.enable=false default) ->
+      # pure no-op for every variant + every minimal test node (which boot a virtio
+      # root and must NOT inherit a USB-root assertion); desktop.nix turns it on for
+      # the USB-boot ISO. tests/boot-root-initrd.nix is the behavioural proof (boots,
+      # confirms root mounted, extracts the built initrd to prove the modules were
+      # really PACKED, re-proves the hartlog-create boot-disk-GPT guard).
+      ./modules/hart-boot-root-initrd.nix
       # Journal export to an EXTERNAL removable USB stick: a low-level systemd
       # TIMER (+ a shutdown oneshot) that dumps the current-boot journal
       # (journalctl -b, capped ~5 MB, + the last 200 warning lines) to
@@ -243,6 +274,27 @@
       # Imported so the option exists + tests/journal-export.nix can enable it; the
       # live/desktop config turns it on (desktop.nix).
       ./modules/hart-journal-export.nix
+      # Cross-OS storage interop (#145): read/write NTFS, exFAT, FAT32/vfat,
+      # ext4, and btrfs disks from any operating system, with on-demand udisks
+      # auto-mount + the per-filesystem format/repair tooling. It adds only
+      # AVAILABLE drivers + an on-demand mount authority (NEVER an fstab/.mount
+      # unit), so a missing or corrupt plugged disk can never block or fail boot.
+      # Opt-in (hart.storage.enable=false default) -> pure no-op for every
+      # variant; desktop.nix turns it on. Imported so the option exists +
+      # tests/storage-filesystems.nix can enable it.
+      ./modules/hart-storage.nix
+      # LAN-path diagnostics + network-up (the steward's "log to the network path
+      # journalctl instead of in pendrive, or periodically sync to local network"):
+      # netconsole (kernel ring over UDP), a token-gated read-only HTTP diag
+      # endpoint (GET /diag?t=TOKEN -> journalctl/dmesg/lspci/lsusb/rfkill/wpctl/ip
+      # + the boot-log), and an optional periodic PUSH to a LAN target - so the dev
+      # box reads the live-OS box's journal over the shared network instead of
+      # yanking a USB stick. Plus network-up: a boot rfkill-unblock + the USB-NIC
+      # drivers so a plugged USB-ethernet DHCP-auto-connects (the "debug wifi
+      # without wifi" shortcut). READ-ONLY, token-gated + LAN-scoped, OFF unless
+      # hart.netDiag.enable -> pure no-op for every variant; desktop.nix turns it
+      # on. Imported so the option exists + tests/net-diag.nix can enable it.
+      ./modules/hart-net-diag.nix
     ];
 
     # Single source of truth for nixpkgs config (allowUnfree etc.).  Kept OUT of
@@ -607,7 +659,109 @@
       # clobber-the-boot-medium invariant), AND that the no-stick path is a clean
       # no-op. Distinct attr name -> clean //; desktop-variant node (mkNode).
       journalExport = import ./tests/journal-export.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // journalExport;
+      # Boot / root-mount / initrd (USB-root enumeration): a desktop node enables
+      # hart.bootRootInitrd + hart.hartlogCreate, BOOTS, confirms the root actually
+      # mounted (findmnt /), then EXTRACTS the built initrd and proves usb_storage /
+      # xhci / sd_mod were really PACKED (not just listed) — the link a virtio-root VM
+      # otherwise never exercises (the "boots in CI, bricks on the real USB stick"
+      # gap). It also re-proves the hartlog-create boot-disk-GPT guard two ways: the
+      # boot-time auto-detect run NEVER carved the VM's internal root disk (status =
+      # NOOP, root still mounted, partition count unchanged), and the test-seam guard
+      # refuses to complete a (stand-in) boot medium's GPT (the duplicate-LABEL root
+      # race). Distinct attr name -> clean //; desktop-variant node (mkNode).
+      bootRootInitrd = import ./tests/boot-root-initrd.nix desktopTestArgs;
+      # Power-action polkit grant (#133): a desktop node asserts the hart-base
+      # security.polkit rule actually AUTHORIZES the `hart` service user for the
+      # login1 power actions — the half the Python unit tests cannot cover (they
+      # mock _logind_call). Uses logind's Can* probes (non-destructive: never
+      # reboots) to prove hart gets "yes" (not the #133 "challenge" denial) and
+      # that the grant is scoped (a plain sessionless user is NOT authorized).
+      # Distinct attr name -> clean //; desktop-variant node (mkNode).
+      powerActions = import ./tests/power-actions.nix desktopTestArgs;
+      # Suspend/resume agent-state + backend-reconnect (#6, the dormant hart-power
+      # module): a desktop node turns `hart.power.enable = true` ON (which only
+      # EVALUATES because of the ppd/TLP mutual-exclusion fix) and stands up a mock
+      # backend that RECORDS the request path of each POST. It proves BEHAVIOURALLY
+      # that the checkpoint hook reaches the REAL /api/shell/power/checkpoint route
+      # (not the old /api/power 404), the resume hook reaches /api/shell/power/resume
+      # + reconfigures the network, the hook still exits 0 with the backend DOWN
+      # (never blocks suspend), and the unit/lid wiring is correct. Distinct attr
+      # name -> clean //; desktop-variant node (mkNode).
+      powerSuspendResume = import ./tests/power-suspend-resume.nix desktopTestArgs;
+      # DISPLAY tier-ladder never-black: the degrade-not-die proof for the display
+      # dimension. TWO nodes (distinct attrs -> clean //):
+      #  (a) display-tiers-neverblack-paint-ladder — hart-comp (Tier-1) AND sway
+      #      (Tier-2) both come up but NEVER first-paint; the paint-watchdog walks
+      #      the FULL ladder hart-comp -> sway -> cage ONE rung at a time and never
+      #      below the cage floor (the gap session-supervisor.nix's paint test leaves
+      #      open by setting compCommand = null, so it only ever drops one rung).
+      #  (b) display-tiers-neverblack-gpu-failsafe — a VM with no hardware GL boots,
+      #      hart-gpu-probe RUNS + SUCCEEDS + writes the `software` floor verdict to
+      #      /run/hart/gpu-render (re-derived per boot), is bounded (oneshot + finite
+      #      TimeoutStartSec) so a wedged GPU can't wedge boot, and greetd (the
+      #      never-black supervisor it is ordered BEFORE) still comes up.
+      # desktop-variant nodes (mkNode); specialArgs carries hartSrc.
+      displayTiersNeverBlack = import ./tests/display-tiers-neverblack.nix desktopTestArgs;
+      # Cross-OS storage interop (#145): a desktop node enables hart.storage +
+      # hart.hartlogCreate + attaches a spare disk. It proves, BEHAVIOURALLY (real
+      # mkfs + mount + read/write, not grep): boot.supportedFilesystems covers
+      # ntfs/exfat/vfat/ext4/btrfs (each round-trips a file r/w), the udisks2
+      # auto-mount authority mounts a removable disk on demand, an UNMOUNTABLE
+      # (corrupt) disk fails CLEANLY + FAST and the system stays up (degrade-not-
+      # die, never wedges boot), NO boot-blocking external mount exists, AND the
+      # HARTLOG persistence guard never completes the boot-disk GPT (the cross-link
+      # to the boot dimension — the full proof lives in hartlogCreate 6e). Distinct
+      # attr name -> clean //; desktop-variant node (mkNode).
+      storageFilesystems = import ./tests/storage-filesystems.nix desktopTestArgs;
+      # Boot-time audio rescue (never boot silent): a desktop node enables
+      # services.pipewire + hart.audio.bootUnmute, brings up a real PipeWire for a
+      # lingering user, loads a null sink, MUTES + zeroes it, runs the REAL rescue
+      # script, and asserts it came back UNMUTED + at the 60% floor (the steward's
+      # "no audio out" bug). Also proves the degrade contract on the artifact (no
+      # sink -> exit 0) + that a deliberate non-zero level is NOT clobbered. The
+      # rescue's decision logic is additionally covered by a portable unit test
+      # (tests/unit/test_hart_audio_unmute.py). Distinct attr -> clean //; desktop node.
+      audio = import ./tests/audio.nix desktopTestArgs;
+      # network-wifi degrade-not-die: a desktop node turns NetworkManager +
+      # redistributable firmware ON, then drives the REAL _ConnectivityCache wifi
+      # probe against the LIVE kernel rfkill subsystem + LIVE nmcli inside the VM
+      # (which has no wifi chip). It proves the integration the mocked unit tests
+      # cannot: rfkill 'absent' beats nmcli's `radio wifi: enabled` so a chipless
+      # box reads available=False (the honest "hardware not detected", never a
+      # false-on), a soft-block stays available=True + blocked='soft' (distinct
+      # from no-hardware), the rfkill parser reads soft/hard/none/absent/unknown
+      # off a REAL on-disk sysfs tree, and the probe never crashes/hangs. Plus the
+      # preemptive HW levers: the iwlwifi/ath/brcm/rtw firmware blobs are shipped
+      # and the driver modules are in the kernel set (udev auto-loads, never
+      # force-loaded). The parser logic is also unit-tested on the dev box
+      # (tests/unit/test_wifi_probe_degrade.py). Distinct attr -> clean //; desktop node.
+      networkWifi = import ./tests/network-wifi.nix desktopTestArgs;
+      # LAN-path diagnostics (the steward's "log to the network path / periodically
+      # sync"): a desktop node enables hart.netDiag with a token, BOOTS, and proves
+      # the read-only HTTP diag contract BEHAVIOURALLY over a real loopback curl - a
+      # valid token returns 200 + the diagnostic sections (journalctl/ip/rfkill/
+      # lspci), a wrong token AND a missing token return 403 (fail-closed), the
+      # firewall opens the port, the boot rfkill-unblock oneshot ran, and the diag
+      # CLI is on PATH + runs read-only. The "the dev box curls the live-OS box
+      # across the home LAN" end still needs two physical machines; this proves
+      # every link short of the second box. Distinct attr -> clean //; desktop node.
+      netDiag = import ./tests/net-diag.nix desktopTestArgs;
+      # Input / seat / pointer (#134): a desktop node attaches a USB HID keyboard +
+      # a RELATIVE-motion mouse (the #134 cursor device) and proves, BEHAVIOURALLY,
+      # that the OS seat the compositor rides EXPOSES + GRANTS input: the session
+      # user is in input/seat/video/render, /dev/input evdev nodes are group-`input`
+      # and the unprivileged user can OPEN them (no EACCES dead-input, FM4), the
+      # `libinput list-devices` real-HW probe enumerates a keyboard + a pointer, a
+      # RELATIVE pointer exists (the input the #134 cursor-not-pinned fix applies),
+      # a virtual touchscreen is enumerated + classified `touch` (best-effort
+      # uinput/evemu), and the seat is a non-blocking EVENT SOURCE so a removed
+      # input device never wedges the box (FM5). The compositor's own wl_seat
+      # advertisement + the relative-motion clamp math are proven by its Rust unit
+      # tests; this proves the OS seat layer beneath. The armed-watchdog touch-only
+      # mis-flap guard + the offline real-HW probe are covered in session-supervisor
+      # .nix + boot-log.nix. Distinct attr -> clean //; desktop-variant node (mkNode).
+      inputSeatPointer = import ./tests/input-seat-pointer.nix desktopTestArgs;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // journalExport // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)

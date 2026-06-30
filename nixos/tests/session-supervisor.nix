@@ -966,4 +966,96 @@ in
                 f"the painting tier must be KEPT (latch sway / un-dropped) when input watchdog is off, got {tier!r}"
       '';
     };
+
+  # ─────────────────────────────────────────────────────────────
+  # INPUT-ALIVE WATCHDOG TOUCH-ONLY / DEVICE-LESS GUARD (FM3b / FM5): even with the
+  # input watchdog ARMED (inputAliveTimeoutSeconds > 0), a painted tier on a
+  # touchSCREEN-only seat (or a seat with no input device at all) must NOT be
+  # dropped. The compositor emits the input-alive beacon on a KEYBOARD or POINTER
+  # event only — NOT on touch — so on a touch-only box the marker legitimately
+  # never appears, and dropping would flap a healthy painting surface to the floor.
+  # The selector's seat_has_beacon_input_device guard consults the seat device
+  # enumerator (inputDeviceProbeCommand) and SUPPRESSES the drop when the seat
+  # exposes only touch. We inject a fake probe reporting a touch-only seat (the VM
+  # really has a keyboard, so injection is the only deterministic way to simulate a
+  # touch-only box) and prove the armed watchdog keeps the tier. This is the twin of
+  # the -input-watchdog FIRE test: that proves a keyboard/pointer seat IS dropped on
+  # input death; this proves a touch-only seat is NOT.
+  # ─────────────────────────────────────────────────────────────
+  hart-session-supervisor-input-watchdog-touch-only =
+    let
+      # Paints (passes the paint watchdog) but NEVER signals input, then stays alive.
+      paintNoInput = pkgs.writeShellScript "fake-paint-no-input-touch" ''
+        touch "$HART_SHELL_READY_FLAG"
+        exec ${pkgs.coreutils}/bin/sleep infinity
+      '';
+      # A fake seat-device enumerator that reports a TOUCHSCREEN-ONLY seat (a `touch`
+      # capability, NO keyboard / pointer) — the FM3b case the compositor cannot
+      # beacon on. Mimics the libinput `list-devices` Capabilities line the guard
+      # scans for, so the guard takes its authoritative-classification path.
+      touchOnlyProbe = pkgs.writeShellScript "fake-touch-only-probe" ''
+        ${pkgs.coreutils}/bin/printf '%s\n' "Device:           HART Test Touchscreen"
+        ${pkgs.coreutils}/bin/printf '%s\n' "Capabilities:     touch"
+      '';
+    in
+    pkgs.testers.runNixOSTest {
+      name = "hart-session-supervisor-input-watchdog-touch-only";
+      skipTypeCheck = true;
+      skipLint = true;
+      node.specialArgs = specialArgs;
+
+      nodes.sup = mkNode "desktop" {
+        virtualisation = { memorySize = 3072; cores = 2; };
+        hart.sessionSupervisor = {
+          enable = true;
+          compCommand = null;                       # Tier-1 unavailable -> sway
+          swayCommand = "${paintNoInput}";          # PAINTS, never signals input
+          crashLoopCount = 3;
+          crashLoopWindowSeconds = 300;
+          shellPaintTimeoutSeconds = 5;
+          inputAliveTimeoutSeconds = 3;             # ARMED — but the seat is touch-only
+          # Inject the touch-only seat enumeration (the VM really has a keyboard, so
+          # this is the only deterministic way to exercise the touch-only branch).
+          inputDeviceProbeCommand = "${touchOnlyProbe}";
+          drmMasterSettleSeconds = 0;
+        };
+      };
+
+      testScript = ''
+        sup = machines[0]
+        sup.start()
+        sup.wait_for_unit("multi-user.target")
+        sup.wait_for_unit("greetd.service", timeout=120)
+
+        LATCH = "/var/lib/hart/session-tier"
+        READY = "/run/hart/session/shell-ready"
+        INPUT_ALIVE = "/run/hart/session/input-alive"
+
+        selector = sup.succeed(
+            "find /nix/store -maxdepth 3 -name '*-hart-session-selector' -type f -print -quit"
+        ).strip()
+        assert selector, "selector wrapper not found in the store"
+
+        with subtest("an ARMED input watchdog does NOT drop a painting tier on a touch-only seat (FM3b guard)"):
+            sup.succeed("hartctl session reset-tier")   # arm Tier-1; comp null -> sway
+            # The fake paints but never signals input. The watchdog IS armed, but the
+            # injected probe reports a touch-ONLY seat, so the guard must SUPPRESS the
+            # drop. Run the selector in the background (the painting fake stays alive,
+            # so the selector blocks in `wait` after the watchdog poll).
+            sup.succeed(f"runuser -u hart -- {selector} >/tmp/sel.log 2>&1 & echo started")
+            sup.wait_until_succeeds(f"test -e {READY}", timeout=30)
+            # The input marker NEVER appears (the fake never writes it) — proving the
+            # KEEP is the touch-only guard, not an input signal.
+            sup.fail(f"test -e {INPUT_ALIVE}")
+            # The guard logs the suppression once the armed input budget elapses.
+            sup.wait_until_succeeds(
+                "grep -q 'touch-only / device-less' /tmp/sel.log", timeout=30)
+            sup.succeed("pkill -TERM -f sleep || true")
+            tier = sup.succeed(f"cat {LATCH} 2>/dev/null || echo sway").strip()
+            assert tier != "cage", \
+                "the input watchdog dropped a painting tier on a TOUCH-ONLY seat — the FM3b guard failed (flap)"
+            assert tier in ("sway", "hart-comp"), \
+                f"the painting touch-only tier must be KEPT (latch un-dropped), got {tier!r}"
+      '';
+    };
 }

@@ -229,6 +229,11 @@ let
     WINDOW_SECS=${toString sup.crashLoopWindowSeconds}
     PAINT_TIMEOUT=${toString sup.shellPaintTimeoutSeconds}
     INPUT_TIMEOUT=${toString sup.inputAliveTimeoutSeconds}
+    # The seat input-device enumerator the input-alive watchdog consults before it
+    # drops a painted-but-input-starved tier (the touch-only / device-less guard).
+    # An operator-set, trusted command (same trust level as the tier launch commands
+    # run via `sh -c "$CMD"`), so it is run word-split-unquoted as a command + args.
+    INPUT_DEVICE_PROBE="${sup.inputDeviceProbeCommand}"
     LADDER="${lib.concatStringsSep " " tierLadder}"
     FLOOR="cage"
     # The HIGHEST tier a FRESH (un-latched) boot starts at — so the ladder tries
@@ -405,6 +410,54 @@ let
       # Return to greetd; it relaunches the selector, which now reads the lowered
       # latch.
       exit 0
+    }
+
+    # ── Touch-only / device-less guard for the input-alive drop (FM3b / FM5) ──
+    # The compositor emits the input-alive beacon (HART_INPUT_ALIVE_FLAG) on a
+    # KEYBOARD or POINTER event only — NOT on touch (hart-comp does not yet route
+    # wl_touch). So on a touchSCREEN-only box (or a box with no input device at all)
+    # a missing beacon is EXPECTED, not input-death, and dropping the tier would flap
+    # a healthy painting surface to the floor. This returns SUCCESS (a drop is
+    # justified) UNLESS it can POSITIVELY confirm the seat exposes ONLY touch / no
+    # beacon-eligible device. It is CONSERVATIVE toward the existing drop behaviour:
+    # an empty or inconclusive probe still allows the drop (so a normal keyboard/mouse
+    # box and every CI VM are unaffected) — it can ONLY ever SUPPRESS a wrong drop,
+    # never cause one. Two sources, in order:
+    #   1. $INPUT_DEVICE_PROBE (libinput list-devices): authoritative `Capabilities:`
+    #      classification — `keyboard`/`pointer` => drop justified; only `touch` =>
+    #      suppress.
+    #   2. the always-present kernel evdev table (/proc/bus/input/devices): a `mouseN`
+    #      handler is a pointer (mouse/touchpad), a `kbd`+`leds` handler is a real
+    #      keyboard (the `leds` handler excludes power/lid pseudo-keyboards); a pure
+    #      touchscreen registers neither (only `event`). No pointer/keyboard handler
+    #      AND at least one device present => provably touch-only => suppress.
+    seat_has_beacon_input_device() {
+      _caps=""
+      if [ -n "$INPUT_DEVICE_PROBE" ]; then
+        # Unquoted on purpose: this is an operator-trusted "command + args" string.
+        _caps=$($INPUT_DEVICE_PROBE 2>/dev/null | grep -i 'Capabilities:' 2>/dev/null) || _caps=""
+      fi
+      if [ -n "$_caps" ]; then
+        # libinput classified the seat — trust it.
+        if printf '%s\n' "$_caps" | grep -qiE 'keyboard|pointer'; then
+          return 0    # a beacon-eligible device exists -> a missing beacon is real death
+        fi
+        if printf '%s\n' "$_caps" | grep -qi 'touch'; then
+          return 1    # seat lists ONLY touch -> compositor cannot beacon it -> suppress
+        fi
+        return 0      # classified but neither -> inconclusive -> allow the drop
+      fi
+      # No libinput output: fall back to the kernel evdev table.
+      if [ -r /proc/bus/input/devices ]; then
+        if grep -qiE '^H: Handlers=.*(mouse[0-9]|kbd[^=]*leds|leds[^=]*kbd)' /proc/bus/input/devices; then
+          return 0    # a pointer or a real (LED-bearing) keyboard exists -> drop justified
+        fi
+        if grep -qE '^B: EV=' /proc/bus/input/devices; then
+          return 1    # devices exist but NONE are pointer/keyboard -> touch-only -> suppress
+        fi
+        return 0      # empty/unreadable table -> inconclusive -> allow the drop
+      fi
+      return 0        # no evdev table at all -> inconclusive -> allow the drop
     }
 
     # ── Fresh-boot re-promotion of a transiently HANG-dropped tier ────────────
@@ -589,7 +642,15 @@ let
 
       if [ "$input_alive" -eq 0 ] && kill -0 "$sesspid" 2>/dev/null; then
         if [ "$TIER" != "$FLOOR" ]; then
-          drop_hung_tier "painted but no input-alive signal in ''${INPUT_TIMEOUT}s (input-starved seat)"
+          # Only treat a missing beacon as input-death if the seat actually exposes a
+          # keyboard/pointer (a device the compositor WOULD beacon on). On a touch-
+          # only / device-less seat the beacon legitimately never fires (FM3b/FM5), so
+          # suppress the drop and keep the painting tier — never flap it to the floor.
+          if seat_has_beacon_input_device; then
+            drop_hung_tier "painted but no input-alive signal in ''${INPUT_TIMEOUT}s (input-starved seat)"
+          else
+            log "tier '$TIER' painted but no input-alive signal in ''${INPUT_TIMEOUT}s — seat exposes no pointer/keyboard (touch-only / device-less); NOT dropping (the compositor does not beacon on touch yet, so a missing beacon here is not input-death)"
+          fi
         else
           # The floor painted but never signalled input — never drop below it. cage
           # is the audited never-fail surface; a missing input marker here only
@@ -743,6 +804,43 @@ in
         dimension). The cage FLOOR is never dropped by this watchdog (nothing below
         it). Assessed only AFTER a confirmed first paint, so the paint watchdog
         (shellPaintTimeoutSeconds) must be enabled for this to run.
+      '';
+    };
+
+    inputDeviceProbeCommand = lib.mkOption {
+      type = lib.types.str;
+      default =
+        if pkgs ? libinput
+        then "${pkgs.libinput}/bin/libinput list-devices"
+        else "";
+      defaultText = lib.literalExpression ''
+        if pkgs ? libinput then "''${pkgs.libinput}/bin/libinput list-devices" else ""'';
+      description = ''
+        The command the input-alive watchdog runs to enumerate the seat's input
+        device CAPABILITIES before it drops a painted-but-input-starved tier. It
+        exists for ONE reason: to tell a GENUINE input-death (a keyboard or pointer
+        is attached, so a missing input-alive beacon means the seat is wedged) apart
+        from an EXPECTED missing beacon (the box is touchSCREEN-only or has no input
+        device at all — the compositor does not emit the beacon on Touch events, so
+        the marker's absence is normal, not death). Without this gate, arming the
+        watchdog (inputAliveTimeoutSeconds > 0) on a touch-only device would flap a
+        perfectly healthy painting tier down to the floor on every boot (FM3b).
+
+        It is invoked WITHOUT arguments and its stdout is scanned for libinput-style
+        `Capabilities:` lines: a `keyboard`/`pointer` capability proves a
+        beacon-eligible device exists (the drop is justified); a seat that lists ONLY
+        `touch` suppresses the drop. The decision is CONSERVATIVE toward the existing
+        drop behaviour — an empty/inconclusive probe still allows the drop and falls
+        back to the always-present kernel evdev table (/proc/bus/input/devices), so a
+        normal keyboard/mouse box (and every CI VM) is never affected; ONLY a
+        provably touch-only / device-less seat is spared. This is a pure
+        SUPPRESS-the-drop guard: it can never CAUSE a drop, only prevent a wrong one.
+
+        Defaults to `libinput list-devices` (the same enumerator the boot-log
+        real-HW probe uses). Empty string -> rely solely on the evdev-table fallback
+        (no libinput in the closure). Overridable for an unusual seat or for testing.
+        Inert unless inputAliveTimeoutSeconds > 0 (the watchdog itself is off by
+        default), and the cage FLOOR is never dropped regardless.
       '';
     };
 
@@ -919,7 +1017,18 @@ in
     # logind-less topology); with the env forcing logind, NO client ever connects to
     # seatd, so the idle daemon never touches the seat. (See the command comment.)
     services.seatd.enable = true;
-    users.users.hart-admin.extraGroups = [ "seat" ];
+    # ── The selector USER must be able to PERSIST a tier drop (never-black guard) ──
+    # greetd runs the selector as hart-admin (below). The latch dir /var/lib/hart is
+    # 0770 hart:hart (group-writable, declared above), so the selector can WRITE the
+    # session-tier latch on a drop ONLY if hart-admin is in the `hart` GROUP (a group
+    # member, not the owner). hart-base.nix already grants it, but the supervisor
+    # declares EVERY access ITS selector needs so a future drift in hart-base's group
+    # list can never silently re-introduce the real-HW BOOT LOOP: a drop that cannot
+    # persist (EPERM on the latch) leaves the selector re-attempting the SAME top tier
+    # forever — the exact 0750-vs-0770 / missing-group failure the latch-dir comment
+    # above documents. `seat` (libseat/seatd) + `hart` (latch write) are both required;
+    # identical supplementary-group entries de-dupe cleanly with hart-base's list.
+    users.users.hart-admin.extraGroups = [ "hart" "seat" ];
 
     # ── Plymouth / fbcon must RELEASE DRM master before the compositor claims it ──
     # The boot splash (boot.plymouth, desktop.nix) holds DRM master on card0; if it

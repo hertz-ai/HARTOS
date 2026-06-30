@@ -23,6 +23,8 @@
 #     linux=ok            ← native (always)
 #     flatpak=ok          ← `flatpak --version` ran
 #     appimage=skip       ← appimage-run not on PATH (subsystem disabled)
+#     fs_ntfs=ok          ← the running kernel can mount NTFS (#145 storage interop)
+#     fs_exfat=missing    ← no exFAT driver on THIS kernel (honest real-HW readout)
 #   Each line is also echoed to the journal:
 #     [hart-compat-smoketest] windows = ok
 #   so `journalctl -b -u hart-compat-smoketest` shows the verdicts on a real boot.
@@ -182,6 +184,21 @@ let
       record appimage ok
     else
       record appimage skip
+    fi
+
+    # ── Cross-OS filesystem interop (#145) — real-HW driver readout ──────────────
+    # The storage module (hart-storage.nix) installs hart-storage-fsprobe ONLY when
+    # hart.storage.enable is on, and `command -v` gates it here so a build WITHOUT
+    # the interop set simply records nothing (an honest skip, never a false verdict).
+    # The probe is read-only (modinfo / /proc/filesystems — it never LOADS a module
+    # and never mounts a disk), so it is safe on every boot; it appends one honest
+    # `fs_<name>=ok|missing` line per filesystem to the SAME status file + the
+    # journal, so a real-HW boot shows whether THIS kernel can actually mount a
+    # plugged NTFS / exFAT / FAT / ext4 / btrfs disk. The list is the canonical
+    # hart.storage.filesystems set (single source of truth). Bounded + best-effort:
+    # `timeout` + `|| true` so it can never delay or fail this oneshot.
+    if command -v hart-storage-fsprobe >/dev/null 2>&1; then
+      timeout 30 hart-storage-fsprobe "$STATUS" ${lib.concatStringsSep " " config.hart.storage.filesystems} || true
     fi
 
     # Always succeed — this is a measurement, never a gate.

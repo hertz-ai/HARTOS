@@ -51,11 +51,16 @@ def _fake_run(cmd, *a, **k):
 def test_refresh_populates_summary_from_probes(monkeypatch):
     monkeypatch.setattr(lus.subprocess, 'run', _fake_run)
     cache = lus._ConnectivityCache()
+    # Pin the rfkill verdict so the test is deterministic regardless of the host's
+    # real /sys/class/rfkill (CI may or may not have a wlan radio). 'none' == chip
+    # present + unblocked, matching the nmcli fixture's "wifi on" world.
+    monkeypatch.setattr(cache, '_probe_rfkill_wifi', lambda *a, **k: 'none')
     cache.refresh()
     snap = cache.summary()
 
     assert snap['wifi'] == {'available': True, 'enabled': True,
-                            'connected': True, 'ssid': 'HomeNet', 'signal': 71}
+                            'connected': True, 'ssid': 'HomeNet', 'signal': 71,
+                            'blocked': None}
     assert snap['bluetooth'] == {'available': True, 'powered': True,
                                  'connected_count': 2}
     # Volume tools absent in the fixture -> degrades cleanly, never crashes.

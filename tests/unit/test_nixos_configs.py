@@ -66,6 +66,8 @@ EXPECTED_MODULES = [
     "hart-boot-log.nix",
     "hart-hartlog-create.nix",
     "hart-boot-continuity.nix",
+    # Boot / root-mount / initrd hardening (USB-root enumeration guard)
+    "hart-boot-root-initrd.nix",
     # External-USB journal export (field recovery onto a second, non-boot stick)
     "hart-journal-export.nix",
 ]
@@ -1770,6 +1772,72 @@ class TestBootLogModule:
 
 
 # ═══════════════════════════════════════════════════════════════
+# Boot / root-mount / initrd hardening (USB-root enumeration)
+# ═══════════════════════════════════════════════════════════════
+
+class TestBootRootInitrdModule:
+    """hart-boot-root-initrd.nix: ENSURE + ASSERT the USB-root initrd module set
+    (usb_storage/uas/sd_mod + the xhci/ehci host controllers) so a USB boot can
+    enumerate the stick before the root pivot — never a silent real-HW "VFS: Unable
+    to mount root fs" brick.
+
+    The BEHAVIOUR (boot, confirm root mounted, EXTRACT the built initrd to prove the
+    modules were really PACKED, and the boot-disk-GPT guard never completes the boot
+    medium's GPT) is proven by the wired-in nixosTest nixos/tests/boot-root-initrd.nix.
+    Per feedback_no_grep_tests.md these structural checks keep ONLY the opt-in SAFETY
+    invariant (the guard MUST default OFF so the #70-minimal virtio-root test nodes
+    never inherit a USB-root assertion that would fail their build) plus the
+    flake/desktop wiring. The module's correctness — that the modules actually land
+    in the initrd — is the nixosTest's job, not a grep."""
+
+    @pytest.fixture(autouse=True)
+    def load_module(self):
+        self.content = read_nix(os.path.join(MODULES_DIR, "hart-boot-root-initrd.nix"))
+
+    def test_has_enable_option(self):
+        assert "mkEnableOption" in self.content
+        assert "bootRootInitrd" in self.content
+
+    def test_default_off_mkif_guard(self):
+        """GENUINE opt-in SAFETY guard (a VM is wasteful to prove a DEFAULT): the
+        guard must be gated `mkIf (... && bri.enable)` and mkEnableOption (default
+        FALSE) so every #70-minimal nixosTest node (which boots a virtio root) does
+        NOT inherit the USB-root assertion and fail its build. mkEnableOption is
+        false-by-default, so the presence of the mkIf guard + the enable option is
+        the contract."""
+        assert "mkIf" in self.content
+        assert "bri.enable" in self.content or "bootRootInitrd.enable" in self.content
+
+    def test_adds_usb_root_modules_to_initrd(self):
+        """The guard's whole point: it contributes the USB-enumeration module set to
+        boot.initrd.availableKernelModules (so a USB boot can see the stick). The
+        nixosTest proves they actually PACK; this is the cheap "the contribution is
+        even present" belt."""
+        assert "boot.initrd.availableKernelModules" in self.content
+        for mod in ["usb_storage", "xhci", "sd_mod"]:
+            assert mod in self.content, f"USB-root module {mod} missing from the guard"
+
+    def test_asserts_critical_subset_survived(self):
+        """The eval-time tripwire: the module must `assertions` that the critical
+        USB-root modules survived the merge — so a mkForce that wiped the list is a
+        BUILD failure, not a silent real-HW brick."""
+        assert "assertions" in self.content
+        # The assertion references the merged config value (defense vs an override).
+        assert "config.boot.initrd.availableKernelModules" in self.content
+
+    def test_in_flake_modules(self):
+        """Gate-5 wiring guard: imported in flake.nix or the option/test can't run."""
+        flake = read_nix(os.path.join(NIXOS_DIR, "flake.nix"))
+        assert "hart-boot-root-initrd.nix" in flake
+
+    def test_desktop_enables_it(self):
+        """Cross-config wiring the nixosTest (mkNode enable) does not cover: the real
+        USB-boot ISO config turns the guard ON."""
+        desktop = read_nix(os.path.join(CONFIGS_DIR, "desktop.nix"))
+        assert "bootRootInitrd.enable = true" in desktop
+
+
+# ═══════════════════════════════════════════════════════════════
 # Boot-experience: the behavioural nixosTests are WIRED INTO `checks`
 # ═══════════════════════════════════════════════════════════════
 
@@ -1785,6 +1853,7 @@ class TestBootNixosTestsRegistered:
         ("hartlog-create.nix", "hartlogCreate"),
         ("boot-continuity.nix", "bootContinuity"),
         ("journal-export.nix", "journalExport"),
+        ("boot-root-initrd.nix", "bootRootInitrd"),
     ]
 
     @pytest.fixture(autouse=True)
@@ -1849,6 +1918,40 @@ class TestBootNixosTestsRegistered:
         content = read_nix(os.path.join(TESTS_DIR, "boot-continuity.nix"))
         assert "BootOrder" in content
         assert "--bootnext" in content
+
+    def test_boot_root_initrd_test_proves_initrd_packs_usb_modules(self):
+        """The boot-root-initrd nixosTest must EXTRACT the built initrd and prove the
+        USB-root modules are really PACKED (the link a virtio-root VM never sees) AND
+        re-prove the hartlog-create boot-disk-GPT guard never completes the boot
+        medium's GPT (the duplicate-LABEL root race)."""
+        content = read_nix(os.path.join(TESTS_DIR, "boot-root-initrd.nix"))
+        # It cracks open the actual initrd (not a config value) to prove packing.
+        assert "/run/current-system/initrd" in content
+        assert "usb.storage" in content and "xhci" in content and "sd_mod" in content
+        # It confirms root actually mounted (the dimension's baseline).
+        assert "findmnt" in content
+        # It re-proves the boot-disk-GPT guard via the documented test seam.
+        assert "HART_HARTLOG_TEST_BOOT_DISK" in content
+        assert "DECISION=NOOP" in content and "boot medium" in content
+
+    def test_boot_root_initrd_test_proves_guard_FIRES_when_stripped(self):
+        """The degrade-not-die TRIPWIRE (the negative case the VM boot can't show):
+        the boot-root-initrd test file must ALSO carry the eval-time proof that the
+        guard's assertion FIRES (the build fails loudly) when usb_storage/xhci/sd_mod
+        are stripped (mkForce []). The VM boot only proves the POSITIVE packing case;
+        without this, a future override that wipes boot.initrd.availableKernelModules
+        would ship a silent real-HW "VFS: Unable to mount root fs" brick. Source-shape
+        guard only — the BEHAVIOUR is the `hart-boot-root-initrd-guard-eval` runCommand
+        the flake actually builds (evalModules with + without the modules); this guard
+        just prevents that negative proof from being silently deleted."""
+        content = read_nix(os.path.join(TESTS_DIR, "boot-root-initrd.nix"))
+        # The isolated eval of the REAL module under two scenarios.
+        assert "evalModules" in content, "the eval-time tripwire proof is missing"
+        assert "mkForce" in content, "the stripped scenario (mkForce []) is missing"
+        # The build-time check the flake composes (auto-wired via `// bootRootInitrd`).
+        assert "hart-boot-root-initrd-guard-eval" in content
+        # It asserts the guard stays QUIET when present and FIRES when stripped.
+        assert "EXPECT 0" in content and "EXPECT >= 1" in content
 
     def test_boot_continuity_test_has_uefi_poweroff_gate_node(self):
         """#187/F4: a dedicated UEFI (OVMF) nixosTest node must prove the poweroff

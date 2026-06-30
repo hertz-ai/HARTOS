@@ -315,6 +315,16 @@
       box.innerHTML = '<div class="hc-net-empty">Wi-Fi hardware not detected.</div>';
       return;
     }
+    // rfkill state: distinguish a BLOCK (chip present, radio off) from no-hardware
+    // above, so a soft/hard block is never mis-read as a missing chip.
+    if (w.blocked === 'hard') {
+      box.innerHTML = '<div class="hc-net-empty">Wi-Fi is blocked by a hardware switch. Use the physical Wi-Fi / airplane switch (or Fn key) to enable the radio.</div>';
+      return;
+    }
+    if (w.blocked === 'soft') {
+      box.innerHTML = '<div class="hc-net-empty">Wi-Fi is soft-blocked (airplane mode). Turn it on to see networks.</div>';
+      return;
+    }
     if (!w.enabled) {
       box.innerHTML = '<div class="hc-net-empty">Wi-Fi is off. Turn it on to see networks.</div>';
       return;

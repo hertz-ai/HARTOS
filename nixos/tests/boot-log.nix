@@ -128,9 +128,125 @@ in
               "hart-* unit status",
               "GTK4 host / GSK / GDK / EGL / GBM / WebKit GL",
               "GPU / DRM",
+              "INPUT / SEAT / POINTER (#134)",
+              # network-wifi degrade dimension: the lspci/rfkill summary that tells
+              # "wifi chip not enumerated" apart from "soft-blocked" offline.
+              "NETWORK / WiFi / rfkill",
+              # boot-root-initrd dimension: root mounted + from where + the root=
+              # cmdline + the duplicate-LABEL=HART_OS race count.
+              "root / boot device + kernel cmdline (boot-root-initrd)",
+              # audio degrade dimension: the per-user wpctl/pactl + kernel
+              # /proc/asound probe that tells "sink muted / at volume 0 on boot"
+              # (the steward's "no audio out") apart from "no sound card" offline.
+              "AUDIO / SINK / VOLUME",
               "FULL current-boot journal",
           ]:
               assert needle in latest, f"bundle missing section: {needle!r}"
+
+          # ── ROOT-MOUNT SUCCESS probe (boot-root-initrd real-HW diagnostic) ──
+          # The dimension's real-HW probe: the bundle must record that root actually
+          # MOUNTED (so a field reader knows the USB root came up), the kernel root=
+          # param (root= mismatch debug), and the duplicate-LABEL=HART_OS race count
+          # (the "boots once, panics next boot" failure mode) — the surface needed to
+          # debug a "VFS: Unable to mount root fs" from the Windows host. Behavioural:
+          # we read what the REAL capture wrote, not the source.
+          assert "root-mount: SUCCESS" in latest, \
+              "bundle must record root-mount SUCCESS (findmnt / resolved a source)"
+          assert "root=" in latest, \
+              "bundle must record the kernel root= cmdline param (root= mismatch debug)"
+          assert "devices with LABEL=HART_OS" in latest, \
+              "bundle must record the duplicate-LABEL=HART_OS race count"
+
+          # ── NETWORK / WiFi / rfkill probe (network-wifi real-HW diagnostic) ──
+          # The dimension's real-HW probe: the bundle must carry all the network
+          # diagnostic layers (lspci + rfkill + ip link) so "Wi-Fi hardware not
+          # detected" can be told apart from a soft/hard rfkill block offline. The
+          # tooling (pciutils/iproute2/rfkill) must be in the closure — these run
+          # in the headless VM (no real wifi) and still land their labelled blocks.
+          for net_needle in [
+              "lspci (network class)",
+              "rfkill (",
+              "ip link (",
+              "kernel wifi firmware/driver lines",
+          ]:
+              assert net_needle in latest, \
+                  f"network section missing probe: {net_needle!r}"
+
+          # ── INPUT / SEAT / POINTER probe (#134 real-HW diagnostic) ──
+          # The dimension's real-HW probe: the bundle must carry all FOUR input
+          # diagnostic layers so a "pointer frozen at 0,0 / nothing types / taps
+          # don't register" boot can be localised from the Windows host. This is
+          # behavioural: we read what the REAL capture wrote, not the source.
+          for needle in [
+              # (1) the #134 input-alive beacon report — it must state PRESENT or
+              #     ABSENT, never be silently missing (in this headless VM no real
+              #     seat event fires, so ABSENT is the expected, correct reading).
+              "input-alive beacon",
+              # (2) the libinput enumeration subsection.
+              "libinput list-devices",
+              # (3) the always-present kernel evdev table (no extra package needed).
+              "kernel evdev table (/proc/bus/input/devices)",
+              # (4) the /dev/input node permission listing + the seat assignment.
+              "/dev/input node permissions",
+              "loginctl seat-status seat0",
+          ]:
+              assert needle in latest, f"input/seat/pointer bundle missing: {needle!r}"
+          # The kernel evdev table is ALWAYS populated (the VM has a virtio
+          # keyboard); prove the probe captured a real device line, not an empty
+          # placeholder — i.e. the enumeration actually ran and produced data.
+          assert ("input-alive beacon ABSENT" in latest
+                  or "PRESENT — the compositor delivered" in latest
+                  or "ABSENT — NO pointer/keyboard" in latest), \
+              "input-alive beacon section did not report a PRESENT/ABSENT verdict"
+          assert ("Name=" in latest or "no /proc/bus/input/devices" in latest), \
+              "evdev table section captured no device name lines (probe did not run)"
+          # (5) the one-line seat-capability verdict — the offline real-HW answer to
+          #     "does the seat expose pointer / keyboard / touch?". Assert the line +
+          #     all three verdict tokens are present (the exact yes/no depends on what
+          #     THIS VM enumerated, so we assert the FORMAT not the values — robust).
+          assert "seat capabilities:" in latest, \
+              "input probe missing the one-line seat-capability summary verdict"
+          for tok in ("pointer=", "keyboard=", "touch="):
+              assert tok in latest, \
+                  f"seat-capability summary missing the {tok!r} verdict token"
+
+          # ── AUDIO / SINK / VOLUME probe (audio "no audio out" real-HW diagnostic) ──
+          # The dimension's real-HW probe: the bundle must carry every audio
+          # diagnostic layer so the steward's "sink EXISTS but is MUTED / at
+          # volume 0 on boot -> no audio out" can be told apart from "no sound card
+          # at all" from the Windows host, offline. The per-user `wpctl status` /
+          # `wpctl get-volume @DEFAULT_AUDIO_SINK@` (run as each session user, since
+          # a root unit cannot see the user's PipeWire socket) report the default
+          # sink + its mute/level; the kernel /proc/asound/cards + /dev/snd answer
+          # "is there audio HW at all". Behavioural: we read what the REAL capture
+          # wrote, not the source. (A real PipeWire + a muted null sink getting
+          # rescued is covered behaviourally by tests/audio.nix; here we prove the
+          # probe is WIRED into the on-stick bundle.)
+          for audio_needle in [
+              "kernel sound cards (/proc/asound/cards)",
+              "/dev/snd nodes",
+              "per-user PipeWire default-sink state (wpctl/pactl as each session user)",
+              "hart-audio-unmute rescue decisions",
+          ]:
+              assert audio_needle in latest, \
+                  f"audio section missing probe: {audio_needle!r}"
+          # The per-user wpctl/pactl probe must have produced a verdict - either a
+          # real session block, or the honest "no graphical session" note (the
+          # expected reading in this headless VM) - proving the probe path ran and
+          # was not a silently-empty section.
+          assert ("== session" in latest or "no /run/user/* session" in latest), \
+              "per-user audio (wpctl/pactl) probe produced no session verdict"
+          # The kernel sound-card probe must have produced a verdict - either the
+          # honest "no sound card" / "no /dev/snd" placeholders (the expected
+          # reading on this node, which configures NO sound device, the same way
+          # the input-alive beacon reads ABSENT here) OR a real ALSA control node
+          # if a card is present - proving /proc/asound/cards + /dev/snd were
+          # actually read, not silently skipped. (Real-or-placeholder, mirroring
+          # the evdev "Name=" / "no /proc/bus/input/devices" assertion above.)
+          assert ("no /proc/asound/cards" in latest
+                  or "no /dev/snd" in latest
+                  or "controlC" in latest), \
+              "kernel sound-card probe produced no HW verdict (probe did not run)"
 
           # A per-boot file ALSO landed (history within this boot).
           bl.succeed("ls /tmp/hl/hart-boot-*.log | grep -v latest | grep -q .")
