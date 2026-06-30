@@ -333,26 +333,41 @@ in
     # The dev box and the live-OS box sit on the SAME home LAN, so the journal
     # should be reachable OVER THE NETWORK - no stick to yank. With this ON, the
     # dev box reads the live-OS box's journal with ONE curl over the LAN:
-    #   curl "http://<liveos-ip>:6699/diag?t=hart-lan-diag"
+    #   curl "http://<liveos-ip>:6699/diag?t=<TOKEN>"
     # returning journalctl -b + dmesg + lspci + lsusb + rfkill + wpctl + ip -br a +
-    # the boot-log. The endpoint is READ-ONLY (runs no actions), token-gated
-    # (constant-time, FAIL-CLOSED without a token), and LAN-scoped via the firewall.
-    # netconsole (kernel ring over UDP, survives a userspace wedge) + the periodic
-    # PUSH stay OFF here because each needs a dev-box target IP - the operator turns
-    # them on with hart.netDiag.netconsole.{enable,target} / .push.{enable,target}.
+    # the boot-log - all run through a SECRET-REDACTION filter. The endpoint is
+    # READ-ONLY (runs no actions), token-gated (constant-time, FAIL-CLOSED), and
+    # LAN-scoped via the firewall.
+    #
+    # #148 HARDENING (security advisory closed):
+    #   - TOKEN: NOT a hardcoded "hart-lan-diag" default any more. With token=""
+    #     (omitted) the module GENERATES a random token at first boot, writes it
+    #     0600 to /run/hart/netdiag-token (tmpfs, never the store, never in
+    #     `systemctl show`), and SURFACES it to the boot-log/journal + the login
+    #     MOTD so the operator reads it out-of-band. Find it on the box with:
+    #       cat /run/hart/netdiag-token        (or read it off the login MOTD)
+    #   - BIND LAN-ONLY: bindAddress = "auto" binds the detected private LAN IP (not
+    #     all interfaces); the firewall opens the port ONLY from RFC1918 + link-local
+    #     SOURCE ranges (nftables) - never a global/WAN-reachable accept.
+    #   - READ-ONLY + SECRET-EXCLUDING: execs only the fixed diag bundle; the bundle
+    #     redacts PEM keys / *_PRIVATE_KEY|SECRET|TOKEN|PASSWORD / Authorization /
+    #     the diag token itself, and never cats /var/lib/hart key material or
+    #     security/*.pem.
+    #
+    # netconsole (kernel ring over UDP) + the periodic PUSH stay OFF here: each
+    # needs a dev-box target IP, and netconsole would pull network-online.target into
+    # the boot path (a known boot-stall risk) for a no-op without a target. Arm them
+    # per-incident with hart.netDiag.netconsole.{enable,target} / .push.{enable,target}.
     # Network-up (so the diag is reachable): a boot rfkill-unblock clears soft-block
     # on the radio, and the USB-NIC drivers load so plugging a USB-ethernet dongle
     # DHCP-auto-connects instantly (the "debug wifi without wifi" shortcut).
-    # NOTE: "hart-lan-diag" is a LOW-SENSITIVITY LAN diagnostics token (NOT a
-    # credential to anything) - a known default so the dev box can curl during a
-    # freeze without first reading it off the frozen box. Override it
-    # (hart.netDiag.http.token) on an untrusted network.
     netDiag = {
       enable = true;
       http = {
         enable = true;
         port = 6699;
-        token = "hart-lan-diag";
+        # token = ""  -> generated at first boot (see #148 hardening above).
+        # bindAddress = "auto" + RFC1918 firewall scoping = LAN-only (module default).
       };
       wifiUnblock.enable = true;
       usbEthernet.enable = true;

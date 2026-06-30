@@ -62,12 +62,37 @@
 #   exclusion): the whole module is OFF unless hart.netDiag.enable. It is READ-ONLY
 #   (serves/streams diagnostics, runs NO actions). The HTTP endpoint is token-gated
 #   (fail-closed without a token) and LAN-scoped (the port is opened only on the
-#   firewall, optionally only on named LAN interfaces - never the external zone).
+#   firewall - on named LAN interfaces when given, else restricted to RFC1918 +
+#   link-local SOURCE ranges via an nftables rule - never the external/WAN zone).
 #   The bundle is plain system diagnostics (journalctl/dmesg/lspci/lsusb/rfkill/
-#   ip/wpctl); it carries NO key material - `journalctl` redaction is the operator's
-#   responsibility, and the token + LAN scope keep it off the open internet. It
-#   needs NO central authority (pure peer-to-peer on the shared LAN), matching the
-#   decentralization-first lens.
+#   ip/wpctl) run through a REDACTION filter that strips key material before it ever
+#   leaves the box (see `redact` below). It needs NO central authority (pure
+#   peer-to-peer on the shared LAN), matching the decentralization-first lens.
+#
+# TASK #148 (harden hart-net-diag - generate token at first boot + bind LAN-only)
+#   - the understanding that drives the hardening below:
+#   (a) TOKEN: NOT a hardcoded source/config default. A random token is generated
+#       at FIRST BOOT (head -c 16 /dev/urandom | base64url) by the one-shot
+#       hart-net-diag-token.service and written 0600 to /run/hart/netdiag-token
+#       (tmpfs - never the Nix store, never persisted, never in `systemctl show`).
+#       The HTTP service READS it from that file (per request, fail-closed) instead
+#       of carrying it in its unit Environment. It is surfaced OUT-OF-BAND so the
+#       dev box knows what to curl: echoed to the boot-log/journal + shown in the
+#       login MOTD. (A static hart.netDiag.http.token still overrides, written to
+#       the SAME file - so there is ONE read path, never an Environment leak.)
+#   (b) BIND LAN-ONLY: the firewall NEVER opens the port globally. With named
+#       interfaces -> opened only on those (networking.firewall.interfaces.<if>).
+#       With none -> an nftables rule accepts the port only from RFC1918 +
+#       link-local SOURCES, so it is reachable on the LAN but never from a WAN/
+#       public source. The HTTP server also prefers to BIND the detected LAN IP
+#       (bindAddress = "auto") rather than all interfaces, failing safe.
+#   (c) READ-ONLY: the endpoint execs ONLY the fixed diagScript (no action, no
+#       write, no path/command is ever interpolated from the request).
+#   (d) SECRET EXCLUSION: `redact` strips PEM private keys, *_PRIVATE_KEY /
+#       MASTER_KEY / *_SECRET / *_TOKEN / *_PASSWORD / API-key assignments,
+#       Authorization/Cookie headers, and the diag token itself from every captured
+#       stream. The bundle NEVER cats /var/lib/hart *key* / security/*.pem / any
+#       master-key material - it only emits diagnostics, now redacted.
 #
 # VM/HW-gated: tests/net-diag.nix BOOTS a desktop node, enables the module, and
 #   proves the HTTP contract BEHAVIOURALLY (a real curl over loopback): a valid
@@ -90,11 +115,16 @@ let
   # several of these (lspci/lsusb/rfkill/ip/wpctl) are NOT on it (the
   # iso_real_usb_boot lesson: awk/lspci/xxd/curl were off the minimal unit PATH).
   binPath = lib.makeBinPath (with pkgs; [
-    coreutils util-linux systemd gnugrep gawk kmod
+    coreutils util-linux systemd gnugrep gnused gawk kmod
     pciutils   # lspci  (network-class device enumeration)
     usbutils   # lsusb  (USB device enumeration - the USB-NIC / dongle surface)
     iproute2   # ip     (interface up/down + addresses)
   ]);
+
+  # The first-boot-generated token lives here (tmpfs, 0600). The HTTP service
+  # reads it; the diag bundle reads it to REDACT itself; the MOTD reads it to
+  # surface it. ONE known runtime path - never the Nix store, never persisted.
+  tokenFile = "/run/hart/netdiag-token";
 
   # wpctl ships with WirePlumber; attr-guarded so a nixpkgs rev lacking it cannot
   # break evaluation (the drm_info attr-guard pattern from hart-boot-log.nix).
@@ -121,6 +151,29 @@ let
     WPCTL="${wpctlBin}"
     JOURNAL_CAP_BYTES=4000000
     BOOTLOG_NAME="${bootLogLatest}"
+    TOKEN_FILE="${tokenFile}"
+
+    # ── SECRET EXCLUSION (#148d) ────────────────────────────────────────────────
+    # Every stream that could carry a leaked secret (journalctl/dmesg/boot-log) is
+    # piped through `redact` BEFORE it leaves the box. It strips, line by line:
+    #   - PEM private-key blocks ("-----BEGIN ... PRIVATE KEY-----")
+    #   - any *_PRIVATE_KEY / *_MASTER_KEY / *_SECRET / *_TOKEN / *_PASSWORD /
+    #     *_API_KEY / *_ACCESS_KEY  KEY=VALUE / KEY: VALUE assignment
+    #   - Authorization / X-Api-Key / Cookie / Set-Cookie header values
+    #   - the LAN diag TOKEN itself (so the served journal never re-leaks it)
+    # The bundle NEVER cats master-key material directly: it does not read the
+    # /var/lib/hart node keys, security/*.pem, or any *.key - it only emits
+    # diagnostics, now redacted. (A static token with sed-special chars is escaped.)
+    TOKEN_VAL=$(cat "$TOKEN_FILE" 2>/dev/null) || TOKEN_VAL=""
+    # Escape sed-metacharacters in the token so the final s||| can never misfire.
+    TOKEN_ESC=$(printf '%s' "$TOKEN_VAL" | sed -e 's/[\\&|]/\\&/g')
+    redact() {
+      sed -E \
+        -e 's/-----BEGIN[A-Za-z ]*PRIVATE KEY-----.*/<redacted: private key removed>/g' \
+        -e 's/([A-Za-z0-9_]*(PRIVATE_KEY|MASTER_KEY|SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|ACCESS_KEY))[[:space:]]*[:=][[:space:]]*[^[:space:]]+/\1=<redacted>/gI' \
+        -e 's/((Authorization|X-Api-Key|Cookie|Set-Cookie)[[:space:]]*:[[:space:]]*)[^[:space:]]+/\1<redacted>/gI' \
+      | { if [ -n "$TOKEN_ESC" ]; then sed -e "s|$TOKEN_ESC|<redacted: diag token>|g"; else cat; fi ; }
+    }
 
     BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '-' | cut -c1-12) || BOOT_ID="unknown"
     STAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) || STAMP="?"
@@ -191,18 +244,18 @@ let
     done
     if [ -n "$_bl" ]; then
       echo "(from $_bl)"
-      head -c 200000 "$_bl" 2>/dev/null || true
+      head -c 200000 "$_bl" 2>/dev/null | redact || true
     else
       echo "(HARTLOG partition not mounted - the full journal below carries the same data)"
     fi
     echo ""
 
     echo "───────────── dmesg (tail) ─────────────"
-    dmesg 2>/dev/null | tail -n 300 || echo "(dmesg unavailable - kernel.dmesg_restrict? run as root)"
+    { dmesg 2>/dev/null | tail -n 300 | redact ; } || echo "(dmesg unavailable - kernel.dmesg_restrict? run as root)"
     echo ""
 
-    echo "───────────── FULL current-boot journal (journalctl -b, capped) ─────────────"
-    journalctl -b --no-pager 2>/dev/null | head -c "$JOURNAL_CAP_BYTES" \
+    echo "───────────── FULL current-boot journal (journalctl -b, capped, redacted) ─────────────"
+    { journalctl -b --no-pager 2>/dev/null | head -c "$JOURNAL_CAP_BYTES" | redact ; } \
       || echo "(journalctl -b unavailable)"
     echo ""
     echo "═══════════════════ end of bundle ═══════════════════"
@@ -215,12 +268,48 @@ let
   # ever interpolated into a shell). The token check is constant-time and FAILS
   # CLOSED: an empty configured token (or any mismatch / missing token) -> 403.
   httpHandler = pkgs.writeText "hart-net-diag-http.py" ''
-    import http.server, socketserver, subprocess, hmac, os, urllib.parse
+    import http.server, socketserver, subprocess, hmac, os, socket, urllib.parse
 
-    TOKEN  = os.environ.get("HART_NETDIAG_TOKEN", "")
+    # #148a: the token is NOT in the environment (would leak via `systemctl show`).
+    # It is read fresh from the 0600 tmpfs file on EVERY request, so token rotation
+    # takes effect without a restart and a not-yet-generated token fails closed.
+    TOKEN_FILE = os.environ.get("HART_NETDIAG_TOKEN_FILE", "")
     PORT   = int(os.environ.get("HART_NETDIAG_PORT", "6699"))
-    BIND   = os.environ.get("HART_NETDIAG_BIND", "0.0.0.0")
+    BIND   = os.environ.get("HART_NETDIAG_BIND", "auto")
     SCRIPT = os.environ.get("HART_NETDIAG_SCRIPT", "")
+
+    def _read_token():
+        try:
+            with open(TOKEN_FILE, "r") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+
+    def _is_private(ip):
+        return (ip.startswith("10.") or ip.startswith("192.168.")
+                or ip.startswith("169.254.")
+                or any(ip.startswith("172.%d." % o) for o in range(16, 32)))
+
+    def _resolve_bind(want):
+        # #148b: prefer the detected LAN IP over all-interfaces. "auto" -> the
+        # source IP the kernel would use to reach the LAN; bind it only if it is a
+        # private (RFC1918/link-local) address. Fail SAFE: if no LAN IP is up yet,
+        # fall back to 0.0.0.0 (the firewall still scopes the port to LAN sources),
+        # never silently dead on loopback.
+        if want != "auto":
+            return want
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(("10.255.255.255", 1))  # no packet leaves; picks egress
+                ip = s.getsockname()[0]
+            finally:
+                s.close()
+            if ip and _is_private(ip):
+                return ip
+        except Exception:
+            pass
+        return "0.0.0.0"
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -245,9 +334,12 @@ let
                 self._deny(); return
             q = urllib.parse.parse_qs(u.query)
             t = (q.get("t") or [""])[0]
-            # FAIL-CLOSED: no configured token -> never serve. Constant-time compare.
-            if not TOKEN or not hmac.compare_digest(t, TOKEN):
+            token = _read_token()
+            # FAIL-CLOSED: no generated token yet -> never serve. Constant-time compare.
+            if not token or not hmac.compare_digest(t, token):
                 self._deny(); return
+            # READ-ONLY (#148c): exec ONLY the fixed diag bundle - no request value
+            # is ever interpolated into a command, path, or shell.
             try:
                 out = subprocess.run(
                     [SCRIPT], capture_output=True, timeout=30).stdout
@@ -263,8 +355,47 @@ let
         allow_reuse_address = True
 
     if __name__ == "__main__":
-        with Server((BIND, PORT), Handler) as httpd:
+        bind = _resolve_bind(BIND)
+        with Server((bind, PORT), Handler) as httpd:
             httpd.serve_forever()
+  '';
+
+  # ── (b) the first-boot token generator (#148a) ───────────────────────────────
+  # Generates a RANDOM token at first boot (idempotent: regenerates only when the
+  # tmpfs file is absent/empty) and writes it 0600 to ${tokenFile}. A static
+  # hart.netDiag.http.token, if set, is written to the SAME file instead - so the
+  # HTTP service always has exactly ONE read path and the token is never carried in
+  # the unit Environment (no `systemctl show` leak). Surfaced out-of-band to the
+  # boot-log/journal so the operator can read it to curl from the dev box.
+  tokenScript = pkgs.writeShellScript "hart-net-diag-token" ''
+    set -u
+    export PATH=${binPath}''${PATH:+:$PATH}
+    umask 077
+    TOKEN_FILE="${tokenFile}"
+    STATIC="${nd.http.token}"
+
+    if [ -n "$STATIC" ]; then
+      printf '%s' "$STATIC" > "$TOKEN_FILE"
+    elif [ ! -s "$TOKEN_FILE" ]; then
+      # head -c 16 /dev/urandom | base64 -> URL-safe (base64url, no +/=), so it
+      # drops straight into ?t=... with no escaping.
+      head -c 16 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' > "$TOKEN_FILE"
+    fi
+
+    # Lock it down: 0600, owned by the interactive desktop user (hart-admin) so the
+    # login MOTD + desktop can read it out-of-band, while root (the HTTP service)
+    # reads it via the root override. NOT world/group readable, NOT in the store,
+    # NOT persisted (tmpfs /run). Best-effort chown so a variant without hart-admin
+    # simply leaves it root-owned (HTTP still works; MOTD just won't show it there).
+    chown hart-admin:hart "$TOKEN_FILE" 2>/dev/null || true
+    chmod 0600 "$TOKEN_FILE"
+
+    TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null) || TOKEN=""
+    IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1) || IP=""
+    # Boot-log/journal surface (#148a): so the dev box knows what to curl. This
+    # line rides the journal, which the LAN endpoint itself redacts before serving.
+    echo "[hart-net-diag] LAN diag token ready -> curl \"http://''${IP:-<lan-ip>}:${toString nd.http.port}/diag?t=$TOKEN\"" >&2
+    exit 0
   '';
 
   # ── The periodic-push script (the steward's "periodically sync" path) ────────
@@ -409,21 +540,28 @@ in
         type = lib.types.str;
         default = "";
         description = ''
-          The shared token the dev box must present (?t=TOKEN). FAIL-CLOSED: with no
-          token set the endpoint never serves (always 403). This is a LOW-SENSITIVITY
-          LAN diagnostics token, NOT a credential to any service - do not reuse a real
-          secret here. It appears in the unit Environment (systemctl show), so treat
-          it as a rotatable shared diag password, not a key.
+          The shared token the dev box must present (?t=TOKEN). #148a: LEAVE EMPTY
+          (the default) to auto-GENERATE a random token at first boot - it is written
+          0600 to ${tokenFile} (tmpfs), read by the HTTP service from that file (never
+          carried in the unit Environment, so it never appears in `systemctl show`),
+          and surfaced to the boot-log/journal + login MOTD so the operator can read
+          it out-of-band. Set a NON-EMPTY value only to pin a STATIC token (it is then
+          written to the same file - still never in the Environment). FAIL-CLOSED:
+          until a token exists the endpoint always returns 403. LOW-SENSITIVITY LAN
+          diagnostics token, NOT a credential to any service.
         '';
       };
       bindAddress = lib.mkOption {
         type = lib.types.str;
-        default = "0.0.0.0";
+        default = "auto";
         description = ''
-          The bind address. Defaults to 0.0.0.0 so the endpoint is reachable on
-          whatever interface received the LAN's DHCP lease (a pinned IP is fragile
-          under DHCP). The LAN scoping is enforced by the firewall (openFirewall +
-          interfaces), not the bind - so the port is never on the external zone.
+          The bind address. #148b: "auto" (the default) BINDS the detected LAN IP
+          (the source the kernel would use to reach the LAN, accepted only when it is
+          a private RFC1918/link-local address), so the socket is not on all
+          interfaces; it fails SAFE to 0.0.0.0 when no LAN IP is up yet (the firewall
+          still scopes the port to LAN sources), never silently dead on loopback. Set
+          a literal address to pin one. LAN scoping is ALSO enforced by the firewall
+          (interfaces when named, else RFC1918 source ranges) - never the WAN zone.
         '';
       };
       openFirewall = lib.mkOption {
@@ -580,24 +718,59 @@ in
 
     # ── (b) the token-gated read-only HTTP diag endpoint ──
     (lib.mkIf nd.http.enable {
-      # FAIL-CLOSED reminder at eval time when no token is set (the handler also
-      # refuses to serve, but a build-time warning catches the misconfig early).
-      warnings = lib.optional (nd.http.token == "")
-        ''hart.netDiag.http is enabled but hart.netDiag.http.token is empty - the diag endpoint will FAIL CLOSED (always 403) until a token is set.'';
+      # #148a: the first-boot token GENERATOR. Writes a random (or the pinned
+      # static) token 0600 to ${tokenFile} BEFORE the HTTP service starts, so the
+      # endpoint never serves with no token. Idempotent + boot-safe (exit 0 always).
+      systemd.services.hart-net-diag-token = {
+        description = "HART OS - generate the LAN diag token at first boot (0600, surfaced to the boot-log/MOTD)";
+        wantedBy = [ "multi-user.target" ];
+        before = [ "hart-net-diag-http.service" ];
+        after = [ "local-fs.target" ];
+        restartIfChanged = false;
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = "${tokenScript}";
+          TimeoutStartSec = "10s";
+        };
+      };
+
+      # #148a: surface the token in the login MOTD so the operator can read it
+      # out-of-band (to curl from the dev box). Reads the 0600 file only if the
+      # login user can (hart-admin owns it); a no-op line otherwise. The desktop
+      # shell can read the same ${tokenFile} to show it on-screen.
+      environment.etc."profile.d/hart-netdiag-motd.sh" = {
+        mode = "0755";
+        text = ''
+          #!/bin/sh
+          if [ -r ${tokenFile} ]; then
+            _ndt=$(cat ${tokenFile} 2>/dev/null)
+            _ndip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+            if [ -n "$_ndt" ]; then
+              echo "  LAN diag:   curl \"http://''${_ndip:-<lan-ip>}:${toString nd.http.port}/diag?t=$_ndt\"   (read-only, LAN-only)"
+            fi
+          fi
+        '';
+      };
 
       systemd.services.hart-net-diag-http = {
         description = "HART OS - token-gated read-only LAN HTTP diagnostic endpoint";
         wantedBy = [ "multi-user.target" ];
-        after = [ "network.target" ];
+        # Order AFTER the token generator so a token file exists before we serve.
+        after = [ "network.target" "hart-net-diag-token.service" ];
+        wants = [ "hart-net-diag-token.service" ];
         # Runs as root: a complete bundle needs dmesg (kernel.dmesg_restrict=1) +
         # the full system journal + runuser into user sessions for wpctl. The
-        # attack surface is the token (constant-time, fail-closed) + the fixed
-        # diagScript (no arbitrary command is ever execed). Read-only by design.
+        # attack surface is the token (constant-time, fail-closed, read from a 0600
+        # file - never the Environment) + the fixed diagScript (no arbitrary command
+        # is ever execed) + the redaction filter. Read-only by design.
         serviceConfig = {
           Type = "simple";
           ExecStart = "${pkgs.python3}/bin/python3 ${httpHandler}";
+          # #148a: the token is NOT here (no `systemctl show` leak) - the handler
+          # reads it from the 0600 file each request.
           Environment = [
-            "HART_NETDIAG_TOKEN=${nd.http.token}"
+            "HART_NETDIAG_TOKEN_FILE=${tokenFile}"
             "HART_NETDIAG_PORT=${toString nd.http.port}"
             "HART_NETDIAG_BIND=${nd.http.bindAddress}"
             "HART_NETDIAG_SCRIPT=${diagScript}"
@@ -613,16 +786,30 @@ in
         };
       };
 
-      # Open the port: ONLY on named LAN interfaces when given (strict), else
-      # globally (still token-gated + read-only). Lists merge with hart-base's
-      # allowedTCPPorts - no conflict.
-      networking.firewall = lib.mkIf nd.http.openFirewall (
-        if nd.http.interfaces == [] then {
-          allowedTCPPorts = [ nd.http.port ];
-        } else {
+      # #148b: open the port LAN-ONLY - NEVER a global/WAN-reachable accept.
+      #   - named interfaces  -> opened ONLY on those (networking.firewall.interfaces)
+      #   - else (nftables)   -> accepted ONLY from RFC1918 + link-local SOURCE ranges
+      #                          (the hart.firewall backend is nftables), so it is
+      #                          reachable on the LAN but never from a public source
+      #   - else (iptables, no iface) -> global accept + a warning to name the iface
+      # Lists/lines merge with hart-base + hart-firewall - no conflict.
+      networking.firewall =
+        if nd.http.openFirewall && nd.http.interfaces != [] then {
           interfaces = lib.genAttrs nd.http.interfaces
             (_: { allowedTCPPorts = [ nd.http.port ]; });
-        });
+        } else if nd.http.openFirewall && config.networking.nftables.enable then {
+          extraInputRules = ''
+            ip saddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 127.0.0.0/8 } tcp dport ${toString nd.http.port} accept comment "hart-netdiag LAN-only"
+            ip6 saddr { ::1, fc00::/7, fe80::/10 } tcp dport ${toString nd.http.port} accept comment "hart-netdiag LAN-only"
+          '';
+        } else if nd.http.openFirewall then {
+          allowedTCPPorts = [ nd.http.port ];
+        } else { };
+
+      # #148b: warn when the iptables-no-interface fallback opens the port globally.
+      warnings = lib.optional
+        (nd.http.openFirewall && nd.http.interfaces == [] && !config.networking.nftables.enable)
+        ''hart.netDiag.http opens port ${toString nd.http.port} GLOBALLY on this iptables node (no nftables, no hart.netDiag.http.interfaces named). It is still token-gated + read-only, but name the LAN interface(s) to keep it off any external zone.'';
     })
 
     # ── (a) netconsole setup oneshot ──
