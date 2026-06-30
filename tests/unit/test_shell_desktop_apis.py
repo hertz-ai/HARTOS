@@ -624,6 +624,48 @@ class TestWorkspaces(unittest.TestCase):
         self.assertTrue(data['switched'])
 
     @patch('integrations.agent_engine.shell_desktop_apis._run')
+    @patch('integrations.agent_engine.shell_desktop_apis._is_wayland', return_value=True)
+    @patch.dict(os.environ, {}, clear=False)
+    def test_switch_workspace_hartcomp_no_500(self, _wl, mock_run):
+        # hart-comp = Wayland with NO SWAYSOCK -> _detect_compositor() == 'wayland'.
+        # The switch route must route the native switch through HartWmClient and
+        # degrade to a 200 no-op, NEVER 500 (the deeper com.hart.Compositor IPC
+        # backend lands later; until then it is an honest no-op). The shell's own
+        # client-side panel show/hide already switched the glass UI.
+        os.environ.pop('SWAYSOCK', None)
+        os.environ.pop('HYPRLAND_INSTANCE_SIGNATURE', None)
+        mock_run.return_value = None  # swaymsg shim absent -> HartWmClient ok:False
+        client = _make_desktop_app()
+        r = client.post('/api/shell/workspaces/switch',
+                        data=json.dumps({'id': 2, 'name': '2'}),
+                        content_type='application/json')
+        self.assertNotEqual(r.status_code, 500)
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertEqual(data['compositor'], 'wayland')
+        # No live WM behind the shim -> honest no-op (switched False), but a 200.
+        self.assertIn('switched', data)
+        self.assertFalse(data['switched'])
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    @patch('integrations.agent_engine.shell_desktop_apis._is_wayland', return_value=True)
+    @patch.dict(os.environ, {}, clear=False)
+    def test_switch_workspace_hartcomp_bad_id_no_500(self, _wl, mock_run):
+        # A malformed/empty id under hart-comp must still 200 (never 500): the
+        # int() coercion failure is swallowed into the no-op path.
+        os.environ.pop('SWAYSOCK', None)
+        os.environ.pop('HYPRLAND_INSTANCE_SIGNATURE', None)
+        mock_run.return_value = None
+        client = _make_desktop_app()
+        r = client.post('/api/shell/workspaces/switch',
+                        data=json.dumps({'name': 'Main'}),  # no 'id'
+                        content_type='application/json')
+        self.assertNotEqual(r.status_code, 500)
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertFalse(data['switched'])
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
     @patch.dict(os.environ, {'SWAYSOCK': '/run/user/1000/sway-ipc.sock'})
     def test_snap_left(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0)

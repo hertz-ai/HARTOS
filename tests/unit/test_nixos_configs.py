@@ -2318,8 +2318,15 @@ class TestSeatDrmBringUp:
     def test_hart_admin_in_seat_group(self):
         """seatd brokers /dev/dri + /dev/input only to seat-group members — the
         supervisor adds hart-admin to `seat` (the group exists only once seatd is
-        enabled, so it is added HERE, not in hart-base)."""
-        assert 'users.users.hart-admin.extraGroups = [ "seat" ]' in self.sup
+        enabled, so it is added HERE, not in hart-base). The `seat` entry may share
+        the extraGroups line with the `hart` latch-write group, so assert the seat
+        MEMBERSHIP (regex + membership, same robust pattern as the video/render/input
+        sibling below), not a brittle exact-list string."""
+        m = re.search(r"users\.users\.hart-admin\.extraGroups\s*=\s*\[(.*?)\];",
+                      self.sup, re.S)
+        assert m, "hart-admin extraGroups not set in the session supervisor"
+        assert '"seat"' in m.group(1), \
+            "hart-admin not added to the seat group (seatd brokers /dev/dri + /dev/input)"
 
     def test_hart_admin_has_video_render_input_groups(self):
         """hart-base puts hart-admin in video (KMS /dev/dri/card*), render (GPU
