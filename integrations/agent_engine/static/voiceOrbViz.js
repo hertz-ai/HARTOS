@@ -23,10 +23,10 @@
   function createVoiceOrbViz(canvas, opts) {
     opts = opts || {};
     var ctx = canvas.getContext('2d');
-    if (!ctx) return { connectAudioElement: function () {}, connectStream: function () {}, disconnect: function () {}, setActive: function () {}, destroy: function () {} };
+    if (!ctx) return { connectAudioElement: function () {}, connectStream: function () {}, disconnect: function () {}, setActive: function () {}, setBreathing: function () {}, destroy: function () {} };
 
     var audioCtx = null, analyser = null, source = null, lastKey = null;
-    var active = false, rafId = null;
+    var active = false, rafId = null, breathing = (opts.breathing !== false);
     var s = { bass: 0, mid: 0, treble: 0, bassCur: 0, midCur: 0, trebleCur: 0, time: 0, dir: 1, wasQuiet: false };
     var oR = new Float32Array(PTS + 1);
     var freqData = new Uint8Array(256);
@@ -78,6 +78,10 @@
       active = !!v;
       if (active && audioCtx && audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
     }
+    // FIX B: the persisted orb-breathing pref (hartHero owns the localStorage key)
+    // gates the slow idle "breathe" modulation of the glow + core. When OFF the orb
+    // is a calm, static presence; voice ENERGY still reacts (that is not breathing).
+    function setBreathing(v) { breathing = !!v; }
 
     function drawRing(color, lw) {
       ctx.beginPath();
@@ -173,8 +177,8 @@
       drawRing('rgba(140,252,228,' + (0.5 + energy * 0.5).toFixed(3) + ')', 1.8);
       ctx.globalCompositeOperation = 'source-over';
 
-      var breathe1 = Math.sin(t * 1.2) * 0.3 + Math.sin(t * 1.9) * 0.15;
-      var breathe2 = Math.sin(t * 0.8) * 0.2 + Math.cos(t * 1.4) * 0.1;
+      var breathe1 = breathing ? (Math.sin(t * 1.2) * 0.3 + Math.sin(t * 1.9) * 0.15) : 0;
+      var breathe2 = breathing ? (Math.sin(t * 0.8) * 0.2 + Math.cos(t * 1.4) * 0.1) : 0;
       var glowR = (8 + energy * 12 + breathe1 * 4) * 3;
       var cg = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowR);
       cg.addColorStop(0, 'rgba(185,253,238,' + (0.15 + energy * 0.5 + breathe1 * 0.08).toFixed(3) + ')');
@@ -210,6 +214,7 @@
       connectStream: connectStream,
       disconnect: disconnect,
       setActive: setActive,
+      setBreathing: setBreathing,
       destroy: destroy,
     };
   }

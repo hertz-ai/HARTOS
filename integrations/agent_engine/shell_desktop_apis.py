@@ -947,7 +947,30 @@ def register_shell_desktop_routes(app):
         elif comp == 'x11':
             _run(['wmctrl', '-s', str(ws_id)])
             return jsonify({'switched': True, 'workspace': ws_id})
-        return jsonify({'switched': False}), 500
+        # hart-comp (Wayland with no SWAYSOCK) + any other compositor: route the
+        # native-window switch through the brain's ONE window-manager client
+        # (workspace.switch == com.hart.Compositor IPC §4.8). NEVER 500 — the
+        # shell's own client-side panel show/hide (hartWorkspaces.js) is
+        # authoritative for the glass UI on every tier; this only moves real
+        # toplevels where a WM is present, and degrades to a 200 no-op otherwise.
+        #
+        # FOLLOW-UP (swaymsg-shim gap): HartWmClient is still a swaymsg shim, so on
+        # the real hart-comp desktop this is an HONEST no-op (swaymsg absent ->
+        # ok:False) until the com.hart.Compositor IPC backend
+        # (compositor/IPC_PROTOCOL.md §4.8) replaces the shim. We do NOT fake a
+        # switch — switched reflects whether a real WM acted.
+        switched = False
+        try:
+            from integrations.agent_engine.hart_wm_client import get_wm_client
+            res = get_wm_client().dispatch_verb(
+                'workspace.switch', {'workspace': int(ws_id)}, agent_id='shell')
+            switched = bool(res.get('ok'))
+        except Exception:
+            # Bad/empty id, unimportable client, or a transport error: still a
+            # 200 no-op, never a 500 (the shell already switched its panels).
+            switched = False
+        return jsonify({'switched': switched, 'workspace': name,
+                        'compositor': comp})
 
     @app.route('/api/shell/workspaces/close', methods=['POST'])
     def shell_workspaces_close():

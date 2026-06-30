@@ -169,7 +169,7 @@ class _ConnectivityCache:
     def _empty_summary():
         return {
             'wifi': {'available': False, 'enabled': False, 'connected': False,
-                     'ssid': None, 'signal': None},
+                     'ssid': None, 'signal': None, 'blocked': None},
             'bluetooth': {'available': False, 'powered': False,
                           'connected_count': 0},
             'battery': {'available': False, 'percent': None,
@@ -193,17 +193,97 @@ class _ConnectivityCache:
         except (subprocess.TimeoutExpired, OSError):
             return None
 
+    @staticmethod
+    def _read_rfkill_flag(path):
+        """Read a 0/1 rfkill sysfs flag. Returns 1/0, or None if unreadable."""
+        try:
+            with open(path) as f:
+                v = f.read().strip()
+            return 1 if v == '1' else 0
+        except (OSError, ValueError):
+            return None
+
+    def _probe_rfkill_wifi(self, rfkill_dir='/sys/class/rfkill'):
+        """Read the kernel rfkill state for the wifi radio from sysfs — a pure
+        file read (NO subprocess, so it can never hang and never needs a tool on
+        PATH). This is what lets a SOFT-BLOCK be told apart from "no hardware":
+
+            'hard'    - a physical/BIOS kill switch is engaged. The CHIP IS
+                        PRESENT but the radio is off in hardware (a software
+                        toggle cannot turn it back on).
+            'soft'    - a software block (airplane mode / `nmcli radio wifi off`).
+                        The CHIP IS PRESENT and re-enableable in software.
+            'none'    - a wlan rfkill entry exists and is unblocked (radio on).
+            'absent'  - the rfkill subsystem is present but there is NO wlan
+                        entry => the wifi chip is NOT enumerated (missing driver/
+                        firmware, or simply no wifi hardware). THE honest
+                        "hardware not detected" signal.
+            'unknown' - /sys/class/rfkill is missing/unreadable (e.g. a container
+                        or a VM without the rfkill subsystem) => cannot tell from
+                        rfkill; the caller falls back to NetworkManager signals.
+
+        'hard'/'soft'/'none' all PROVE the radio hardware is enumerated, so the
+        UI can say "blocked" instead of mis-reporting "no hardware".
+        """
+        if not os.path.isdir(rfkill_dir):
+            return 'unknown'
+        try:
+            entries = os.listdir(rfkill_dir)
+        except OSError:
+            return 'unknown'
+        state = 'absent'   # subsystem present; a wlan entry downgrades this below
+        for name in entries:
+            base = os.path.join(rfkill_dir, name)
+            try:
+                with open(os.path.join(base, 'type')) as f:
+                    if f.read().strip() != 'wlan':
+                        continue
+            except OSError:
+                continue
+            # A wlan rfkill entry exists => the wifi chip IS present.
+            if self._read_rfkill_flag(os.path.join(base, 'hard')) == 1:
+                return 'hard'          # hard block is the most restrictive — wins
+            if self._read_rfkill_flag(os.path.join(base, 'soft')) == 1:
+                state = 'soft'
+            elif state != 'soft':
+                state = 'none'
+        return state
+
     def _probe_wifi(self):
         wifi = {'available': False, 'enabled': False, 'connected': False,
-                'ssid': None, 'signal': None}
+                'ssid': None, 'signal': None, 'blocked': None}
+
+        # rfkill (sysfs) is the AUTHORITATIVE presence + block signal. NM's
+        # `radio wifi` reports the SOFTWARE toggle and stays "enabled" even with
+        # ZERO wifi devices, so on its own it falsely claims "available" on a box
+        # with no wifi chip. rfkill tells present-vs-absent and soft-vs-hard block.
+        rf = self._probe_rfkill_wifi()
+        if rf in ('hard', 'soft', 'none'):
+            wifi['available'] = True            # a wlan rfkill entry == chip present
+            if rf in ('hard', 'soft'):
+                wifi['blocked'] = rf            # distinct from "no hardware"
+        # rf == 'absent' => rfkill present, no wlan entry => NO wifi chip. Leave
+        # available False so the UI honestly says "hardware not detected", and
+        # never let the NM fallbacks below flip it back to True.
+
         r = self._run(['nmcli', 'radio', 'wifi'])
         if r and r.returncode == 0:
-            wifi['available'] = True
             wifi['enabled'] = r.stdout.strip().lower() == 'enabled'
+            # Fallback presence ONLY when rfkill could not tell us (no
+            # /sys/class/rfkill, e.g. a container/VM) — never override a definitive
+            # 'absent'. NM-down (rc != 0 / nmcli missing) is NOT "no hardware":
+            # rfkill above already decides presence in that case.
+            if rf == 'unknown':
+                wifi['available'] = True
+
         r = self._run(['nmcli', '-t', '-f', 'ACTIVE,SSID,SIGNAL',
                        'device', 'wifi'])
         if r and r.returncode == 0:
-            wifi['available'] = True
+            # nmcli returns rc 0 here only when a wifi device exists (it errors
+            # "No Wi-Fi device found" otherwise), so rc 0 corroborates presence —
+            # but never override a definitive rfkill 'absent'.
+            if rf != 'absent':
+                wifi['available'] = True
             for line in r.stdout.strip().split('\n'):
                 parts = line.split(':')
                 if len(parts) >= 2 and parts[0] == 'yes':
@@ -574,6 +654,36 @@ class ContextEngine:
         except Exception:
             pass
         return context
+
+
+def _resolve_shell_pool_threads(tier):
+    """How many waitress worker threads the glass shell serves on, by HW tier.
+
+    Why this is a FLOOR and not 1-2 (mid-session freeze RCA): waitress is a
+    thread-PER-connection server. The shell holds at least one LONG-LIVED
+    connection for the session — the ``/api/notifications/stream`` SSE
+    (EventSource opened on load when not in potato mode) runs ``while True``
+    and never returns, so it permanently OWNS one worker thread. The log-viewer
+    SSE takes another whenever that panel is open. On top of that, several
+    request handlers BLOCK for seconds and cannot be made non-blocking: the
+    ``/api/agent/ask`` chat proxy waits up to 30s on the brain's ``/chat`` (it
+    is gated on the single local-LLM slot), and the panel-open routes shell out
+    to nmcli / pactl / journalctl for several seconds each.
+
+    With a 1-2 thread pool, a SINGLE persistent SSE plus one blocking request
+    leaves zero threads to serve the polls (connectivity 8s, metrics 4s,
+    senses 4s) and every other interaction — the whole desktop freezes mid
+    session. Idle waitress threads are nearly free (a parked thread blocked in
+    recv), so the fix is to size the pool to absorb: persistent SSE(s) + one
+    long chat + the steady poll cadence + a panel-open subprocess, with
+    headroom. This complements (does not replace) the connectivity-cache fix
+    that already took subprocess work OFF the polled request paths.
+    """
+    if tier in ('embedded', 'observer'):
+        return 6
+    if tier == 'lite':
+        return 8
+    return 12
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1743,10 +1853,12 @@ html.a11y-rmotion .panel{animation:none}
   backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
   box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.08),0 6px 22px rgba(0,0,0,.4);
   transition:box-shadow .2s,transform .2s cubic-bezier(.175,.885,.32,1.275)}
-/* Drag affordance — grab the dots (or anywhere on the widget) to move it. */
+/* Drag affordance - the whole widget body is draggable; the grip is VISUAL ONLY
+   and stays hidden (opacity:0) until a drag is in progress. Width + pointer-events
+   are preserved so the grip remains part of the drag hit-area (hide via opacity,
+   not display). The reveal-on-drag rule lives with the Dimension-2 grip block. */
 .hart-senses-grip{display:flex;align-items:center;justify-content:center;width:22px;height:40px;flex-shrink:0;
-  cursor:grab;color:var(--hart-muted);border-radius:8px;touch-action:none}
-.hart-senses-grip:hover{color:var(--hart-text);background:rgba(255,255,255,0.06)}
+  cursor:grab;color:var(--hart-muted);border-radius:8px;touch-action:none;opacity:0;transition:opacity .18s}
 .hart-senses.dragging .hart-senses-grip{cursor:grabbing}
 .hart-senses-grip .mi{font-size:20px;opacity:.85}
 .hart-senses-mic .mi{color:var(--hart-accent)}
@@ -1903,8 +2015,11 @@ html.a11y-rmotion .hart-hero-orbwrap[data-orb-state="listening"]::after{animatio
 .hart-senses.dragging .hart-senses-cluster{transform:scale(1.04);box-shadow:var(--lg-spec),var(--lg-sh-3)}
 .hart-senses.settle .hart-senses-cluster{animation:lg-settle .34s var(--lg-spring)}
 @keyframes lg-settle{0%{transform:scale(1.06)}100%{transform:scale(1)}}
+/* FIX A (drag-affordance discipline): the grip appears ONLY while dragging (hidden
+   at rest AND on hover) - the cluster body stays the drag hit-area, grip is visual
+   only. opacity (not display) hides it, so width + pointer-events are preserved. */
 .hart-senses-grip{cursor:grab}
-.hart-senses.dragging .hart-senses-grip{cursor:grabbing}
+.hart-senses.dragging .hart-senses-grip{cursor:grabbing;opacity:1;color:var(--hart-text);background:rgba(255,255,255,0.06)}
 /* EYE — deterministic 3-state (was only .off red) */
 .hart-senses-btn.is-sensing{background:rgba(var(--lg-vision-rgb),.16);border-color:rgb(var(--lg-vision-rgb));box-shadow:var(--lg-ring-vision)}
 .hart-senses-btn.is-sensing .mi{color:rgb(var(--lg-vision-rgb));animation:lg-pulse 2.4s var(--lg-breathe) infinite}
@@ -4835,8 +4950,11 @@ function acSend() {{
   }}
 
   // Default: route the intent through the brain and COMPOSE the desktop.
+  // Bound the client wait (server /chat caps at 30s): without a signal a wedged
+  // brain or a saturated shell pool left this fetch — and the 'Thinking...'
+  // bubble — hung forever. _sig aborts at 32s into the friendly catch below.
   fetch(SHELL+'/api/agent/ask',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{text:text,capability:acActiveCap}})}})
+    body:JSON.stringify({{text:text,capability:acActiveCap}}),signal:_sig(32000)}})
     .then(function(r){{return r.json()}}).then(function(data){{
       const reply = data.response || data.error || 'No response';
       // The composed card is painted on the desktop by the SSE overlay stream;
@@ -5139,6 +5257,12 @@ function speakText(text, source) {{
   // (connectStream) for true listening reactivity. The mic is NOT routed to the
   // speakers inside voiceOrbViz.js (analyser only), so this can't echo/feedback.
   window._hartVoiceOrb = orb;
+  // FIX B: sync the canvas breathe glow to the persisted orb-breathing pref. hartHero
+  // OWNS the pref + the 'hart_orb_breathing' key; we read it back through
+  // HartOrbBreathing.get() (no parallel localStorage parse). If hartHero has not
+  // loaded yet the orb stays default-ON and hartHero's own sync damps it on load -
+  // race-free either way.
+  try {{ if (window.HartOrbBreathing && orb.setBreathing) orb.setBreathing(window.HartOrbBreathing.get()); }} catch(e) {{}}
   c.style.opacity = '0.9';
   setInterval(function() {{
     var speaking = _acAudio && !_acAudio.paused && !_acAudio.ended;
@@ -6420,7 +6544,14 @@ function renderAgentOverlay(ev) {{
             metrics = {}
             try:
                 import psutil
-                metrics['cpu_percent'] = psutil.cpu_percent(interval=0.5)
+                # NON-BLOCKING sample (interval=None): return CPU% since the last
+                # call instead of sleeping 0.5s on the request thread. This route
+                # is POLLED every 4s by hartSessionUI; a blocking 0.5s here pinned
+                # a waitress worker for 0.5s out of every 4s forever (12.5% of a
+                # 1-thread pool) — a recurring mid-session micro-freeze. The 4s
+                # poll cadence is a fine sampling window; the first call after boot
+                # reads 0.0 and every subsequent poll is an accurate delta.
+                metrics['cpu_percent'] = psutil.cpu_percent(interval=None)
                 metrics['cpu_count'] = psutil.cpu_count()
                 mem = psutil.virtual_memory()
                 metrics['ram'] = {
@@ -6781,13 +6912,17 @@ function renderAgentOverlay(ev) {{
         app = self._create_flask_app()
         logger.info("LiquidUI Glass Shell starting on port %d", self.port)
 
-        # Auto-scale threads by hardware tier
+        # Auto-scale threads by hardware tier. The FLOOR is sized so the always-on
+        # notifications SSE (a per-connection waitress thread held for the whole
+        # session) plus one inherently-blocking request (the 30s chat proxy, a
+        # multi-second nmcli/pactl/journalctl panel route) can never starve the
+        # steady UI polls — the mid-session freeze. See _resolve_shell_pool_threads.
         try:
             from security.system_requirements import get_tier_name
             tier = get_tier_name()
         except Exception:
             tier = 'standard'
-        threads = 1 if tier in ('embedded', 'observer') else 2 if tier == 'lite' else 4
+        threads = _resolve_shell_pool_threads(tier)
 
         try:
             from waitress import serve

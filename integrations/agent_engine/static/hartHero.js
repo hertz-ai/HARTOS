@@ -39,6 +39,25 @@
     catch (e) { return false; }
   }
 
+  // ── FIX B: orb-breathing pref (persisted, DEFAULT ON). ONE flag gates BOTH the
+  // concentric brand rings (buildOrbAura, below) AND the voice-canvas breathe glow
+  // (voiceOrbViz). Default ON keeps today's living look; OFF leaves a calm, static
+  // orb (voice ENERGY still reacts - that is not breathing). hartHero is the SOLE
+  // writer of the 'hart_orb_breathing' localStorage key (Gate 4: one writer); the
+  // inline orb-init + any control read it back through window.HartOrbBreathing, so
+  // there is no parallel localStorage parse. Old-WebKit-safe: try/catch, no
+  // optional chaining / nullish coalescing.
+  function breathingPrefOn() {
+    try {
+      var v = window.localStorage && window.localStorage.getItem('hart_orb_breathing');
+      return v !== '0';   // unset/null => ON (default); '0' => OFF
+    } catch (e) { return true; }
+  }
+  function setBreathingPref(on) {
+    try { if (window.localStorage) window.localStorage.setItem('hart_orb_breathing', on ? '1' : '0'); }
+    catch (e) {}
+  }
+
   // ── Breathing brand aura: the always-on idle presence rings + halo that frame
   // the orb as the live CENTERPIECE (the steward-mockup look the canvas alone
   // lacks at idle). The voice canvas (voiceOrbViz.js) stays the single iridescent
@@ -84,6 +103,7 @@
   }
   function buildOrbAura(orb) {
     if (!orb || orb.querySelector('.hart-hero-aura')) return;   // build once
+    if (!breathingPrefOn()) return;            // FIX B: no rings when breathing is OFF
     injectOrbAuraStyle();
     var aura = document.createElement('div');
     aura.className = 'hart-hero-aura';
@@ -187,9 +207,44 @@
     // Clicking (or keyboard-activating) the orb toggles voice — the orb IS the
     // voice interface. role="button" + tabindex make it keyboard-reachable.
     function speak() { if (typeof window.toggleVoice === 'function') window.toggleVoice(); }
+
+    // ── FIX B: breathing on/off. applyBreathing is the single MUTATOR (persist +
+    // apply); syncBreathing applies the CURRENT pref WITHOUT persisting (used at init
+    // so an untouched default stays "unset"). Both gate the concentric brand rings
+    // (build / teardown) AND dampen the voice-canvas breathe glow through the one orb
+    // instance (window._hartVoiceOrb) - no parallel path, no second writer.
+    function syncBreathing() {
+      var on = breathingPrefOn();
+      if (orb) {
+        if (on) { buildOrbAura(orb); }
+        else { var a = orb.querySelector('.hart-hero-aura'); if (a && a.parentNode) a.parentNode.removeChild(a); }
+      }
+      try {
+        if (window._hartVoiceOrb && typeof window._hartVoiceOrb.setBreathing === 'function') {
+          window._hartVoiceOrb.setBreathing(on);
+        }
+      } catch (e) {}
+    }
+    function applyBreathing(on) { setBreathingPref(!!on); syncBreathing(); }
+
     if (orb) {
-      // The always-on breathing brand aura that frames the orb as the centerpiece.
-      buildOrbAura(orb);
+      // The breathing brand aura that frames the orb as the centerpiece - built only
+      // when the orb-breathing pref is ON (FIX B); syncBreathing also dampens the
+      // voice-canvas glow to match.
+      syncBreathing();
+      // Read/write surface for the breathing pref (single owner). The inline orb-init
+      // syncs the canvas glow through .get(); a control flips it via .set / .toggle.
+      window.HartOrbBreathing = { get: breathingPrefOn, set: applyBreathing,
+        toggle: function () { applyBreathing(!breathingPrefOn()); } };
+      // Right-click the orb = quiet / restore its breathing. Reuses the right-click
+      // context affordance + the existing toast surface (no second settings panel);
+      // the full orb-varieties picker is #140-pending. Default ON keeps today's look.
+      orb.addEventListener('contextmenu', function (e) {
+        e.preventDefault(); e.stopPropagation();
+        var on = !breathingPrefOn();
+        applyBreathing(on);
+        if (typeof window.showToast === 'function') window.showToast('Orb breathing', on ? 'On' : 'Off', 'info');
+      });
       orb.addEventListener('click', speak);
       orb.addEventListener('keydown', function (e) {
         if (e.key === 'Enter' || e.key === ' ' || e.code === 'Space') { e.preventDefault(); speak(); }
@@ -406,6 +461,7 @@
       dg.bx = B.dragX; dg.by = B.dragY;
       dg.pid = e.pointerId;
       hero.classList.add('hart-hero-dragging');
+      if (showMin) showMin();        // FIX A: reveal the minimise control while dragging (not on hover)
       // Suppress native selection rubber-banding across the desktop while dragging.
       var de = document.documentElement;
       de.style.userSelect = 'none'; de.style.webkitUserSelect = 'none';
@@ -424,6 +480,7 @@
       if (!dg.on) return;
       dg.on = false;
       hero.classList.remove('hart-hero-dragging');
+      if (hideMin) hideMin();        // FIX A: hide it again on drop (stays visible while compact)
       var de = document.documentElement;
       de.style.userSelect = ''; de.style.webkitUserSelect = '';
       try { hero.releasePointerCapture(e.pointerId); } catch (_e) {}
@@ -484,6 +541,9 @@
       if (minBtn) {
         minBtn.setAttribute('aria-label', B.compact ? 'Expand HART orb' : 'Minimize HART orb');
         var mi = minBtn.querySelector('.mi'); if (mi) mi.textContent = B.compact ? 'open_in_full' : 'close_fullscreen';
+        // FIX A: keep the restore affordance visible while compact; hide it once
+        // expanded (the drag handlers reveal it during a move). No hover dependency.
+        if (B.compact) { if (showMin) showMin(); } else { if (hideMin) hideMin(); }
       }
       place();
       armIdle();
@@ -506,13 +566,13 @@
       var minIc = minBtn.querySelector('.mi'); if (minIc) minIc.style.fontSize = '17px';
       minBtn.addEventListener('click', function (e) { e.stopPropagation(); setCompact(!B.compact); });
       orb.appendChild(minBtn);
-      // Reveal the control on hover/focus of the orb (kept subtle).
+      // FIX A (drag-affordance discipline): the minimise control shows ONLY while the
+      // orb/spine is being DRAGGED (onDown -> showMin, onUp -> hideMin) - never on a
+      // passive hover - and stays revealed while compact so the restore affordance is
+      // always reachable (setCompact drives that). showMin/hideMin are the single
+      // writers of minBtn.style.opacity; nothing reveals it on hover.
       var showMin = function () { minBtn.style.opacity = B.compact ? '1' : '0.85'; };
       var hideMin = function () { if (!B.compact) minBtn.style.opacity = '0'; };
-      orb.addEventListener('pointerenter', showMin);
-      orb.addEventListener('pointerleave', hideMin);
-      orb.addEventListener('focusin', showMin);
-      orb.addEventListener('focusout', hideMin);
       // Double-click the orb = tuck to a bubble / restore (single-click still talks).
       orb.addEventListener('dblclick', function (e) { e.preventDefault(); e.stopPropagation(); setCompact(!B.compact); });
     }

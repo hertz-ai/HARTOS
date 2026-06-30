@@ -85,11 +85,38 @@
     });
   }
 
+  // Mirror the shell-local switch to the REAL compositor (workspace.switch /
+  // com.hart.Compositor IPC §4.8) so a desktop change ALSO moves native windows
+  // where a window manager is present. Fire-and-forget: the client-side panel
+  // show/hide in apply() above is authoritative for the glass UI on EVERY tier,
+  // and the backend degrades to a 200 no-op under a compositor with no live WM
+  // (cage / hart-comp before its IPC backend lands), so a failure here must never
+  // disturb the shell.
+  //
+  // FOLLOW-UP (swaymsg-shim gap): the backend routes this through HartWmClient,
+  // which is still a swaymsg shim, so on the real hart-comp desktop native-window
+  // switching stays an HONEST no-op until the com.hart.Compositor IPC backend
+  // (compositor/IPC_PROTOCOL.md) replaces the shim. We do NOT fake the switch.
+  function pushCompositorSwitch(n) {
+    try {
+      if (typeof window.fetch !== 'function') return;
+      window.fetch('/api/shell/workspaces/switch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: n, name: String(n) })
+      }).catch(function () { /* degrade silently */ });
+    } catch (e) { /* degrade silently */ }
+  }
+
   window.hartSwitchWorkspace = function (n) {
     n = Math.max(1, Math.min(COUNT, n | 0));
     if (n === current) return;
     current = n;
     apply();
+    // Both the pager segments (buildBar) and the Workspaces-settings squares
+    // (liquid_ui_service.py) call this ONE fn — one source of truth — so wiring
+    // the real-compositor switch HERE covers both with no parallel path.
+    pushCompositorSwitch(n);
   };
   window.hartWorkspaceInfo = function () { return { count: COUNT, current: current }; };
 

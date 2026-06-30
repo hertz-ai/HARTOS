@@ -28,7 +28,9 @@
  *   D. hartWorkspaces.js — the pager reveals (data-multiws='1') as soon as the
  *      feature is USABLE (any window open OR navigated off desktop 1), breaking
  *      the old ">1 occupied" discoverability deadlock; stays hidden on a pristine
- *      empty desktop.
+ *      empty desktop. AND a real switch fires the /api/shell/workspaces/switch
+ *      POST (so the pager segs + the settings squares — same fn — move native
+ *      windows where a WM is present), fire-and-forget, only on a real change.
  *
  * Run:  node tests/unit/test_shell_overhaul_behaviors.mjs
  * (A Python wrapper, test_shell_overhaul_behaviors.py, shells out so pytest/CI
@@ -385,6 +387,44 @@ function makeRealm(opts) {
   R.sandbox.window.hartSwitchWorkspace(2);
   R.sandbox.window.hartSwitchWorkspace(1);
   eq(MW(), '0', 'no windows + back on desktop 1 -> data-multiws=0 (clean again)');
+})();
+
+// ════════════════════════════════════════════════════════════════════════════
+// D2. hartWorkspaces.js — a real switch POSTs the compositor switch (Fix C)
+// ════════════════════════════════════════════════════════════════════════════
+(function testWorkspacesCompositorPost() {
+  console.log('\n[D2] hartWorkspaces.js  hartSwitchWorkspace POSTs /api/shell/workspaces/switch');
+  const R = makeRealm();
+  R.el('panels');
+  R.el('hart-ws-switcher');
+
+  // Capture every fetch the module makes (the realm has no fetch by default).
+  const posts = [];
+  R.sandbox.fetch = function (url, opts) {
+    posts.push({ url: url, opts: opts || {} });
+    return { catch: function () {} };   // thenable enough for the module's .catch()
+  };
+
+  vm.runInContext(read('hartWorkspaces.js'), R.sandbox, { filename: 'hartWorkspaces.js' });
+
+  // A real switch (1 -> 3) fires exactly one POST to the switch route carrying the
+  // {id,name} body — the single fn both the pager segments and the settings
+  // squares call, so wiring it here covers both with no parallel path.
+  R.sandbox.window.hartSwitchWorkspace(3);
+  eq(posts.length, 1, 'switching desktops issues exactly one /api/shell/workspaces/switch POST');
+  eq(posts[0].url, '/api/shell/workspaces/switch', 'POST targets the workspace switch route');
+  eq((posts[0].opts.method || '').toUpperCase(), 'POST', 'switch request uses POST');
+  const body = JSON.parse(posts[0].opts.body || '{}');
+  eq(body.id, 3, 'switch POST body carries id=3');
+  eq(body.name, '3', 'switch POST body carries name="3" (string)');
+
+  // A no-op switch (already on 3) must NOT re-POST — fire only on a real change.
+  R.sandbox.window.hartSwitchWorkspace(3);
+  eq(posts.length, 1, 'a no-op switch to the current desktop issues no extra POST');
+
+  // The wheel/keyboard paths route through the SAME fn, so they POST too (4 != 3).
+  R.sandbox.window.hartSwitchWorkspace(4);
+  eq(posts.length, 2, 'a further real switch issues another POST (covers wheel/keyboard paths)');
 })();
 
 console.log(failures ? ('\nRESULT: ' + failures + ' FAILED') : '\nRESULT: ALL PASS');

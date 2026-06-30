@@ -167,6 +167,16 @@ This is the steward's most-repeated structural rule. Capture every nuance.
   to a SMALL orb (orb-sm) docked in the top bar (always accessible). On the live
   desktop the orb (not a bare mic button) is the center presence.
   - *"it should have been the HART OS Orb"* (not a mic button) `[#1365]`
+- **c8. Breathing is TOGGLEABLE (a transparency / quiet control), DEFAULT ON.** The
+  user can quiet the orb's breathing to a calm, static presence and restore it; the
+  default stays ON so the living look is unchanged. ONE persisted flag
+  (`hart_orb_breathing`) gates BOTH the concentric brand rings (buildOrbAura) AND
+  the voice-canvas breathe glow (voiceOrbViz) - voice ENERGY still reacts when OFF
+  (that is not breathing). Exposed via the orb right-click (reuse the context
+  affordance + toast; no second settings panel) until the full orb-varieties picker
+  (#140 / c3) lands. A refinement of c1 ("transparency control") + c2 ("breathing").
+  - *[steward 2026-06-30]* the orb breathing should be switchable on/off (default
+    on); part of the same 2026-06-30 batch as the drag-affordance + pager fixes.
 
 ---
 
@@ -316,6 +326,25 @@ This is the steward's most-repeated structural rule. Capture every nuance.
   - *"hy do we show 1, 2m, 3 and 4at the botoom they look naive with no design
     element"* `[#1675]`; *"clicking 2, 3,, 4 just selects it but nothing else
     happens"* `[#1682]`
+- **f7.1 Pager click actually switches workspaces (Fix C, 2026-06-30). APPLIED.**
+  The segmented glass rail (sliding accent thumb + per-desktop occupancy dots)
+  already retired the "looks naive" look; this closes the *"nothing else happens"*
+  half `[#1682]`. `window.hartSwitchWorkspace(n)` (hartWorkspaces.js) now fires a
+  fire-and-forget `POST /api/shell/workspaces/switch {id,name}` AFTER its
+  shell-local panel show/hide, so BOTH the pager segments and the Workspaces-
+  settings squares (the SAME one fn -> no parallel path) drive a real compositor
+  switch. The backend routes hart-comp through HartWmClient (workspace.switch /
+  com.hart.Compositor IPC §4.8) and degrades to a 200 no-op, NEVER 500. The
+  client-side panel show/hide stays authoritative for the glass UI on every tier,
+  so this does NOT regress the f7 rail redesign or the F4 reveal/discoverability
+  fix (data-multiws).
+  - *"clicking 2, 3,, 4 just selects it but nothing else happens"* `[#1682,
+    steward 2026-06-30]`
+  - FOLLOW-UP (open gap, NOT faked): HartWmClient is still a swaymsg shim, so
+    native-window switching on the real hart-comp desktop stays a no-op until the
+    com.hart.Compositor IPC backend (`compositor/IPC_PROTOCOL.md` §4.8) replaces
+    the shim. The route reflects this honestly (`switched:false` under the shim),
+    rather than reporting a phantom switch.
 - **f8. Floating "disable all AI" button** (shut eyes/ears/sensory) with proof it
   has shut its real-world sensory signals, minimalist, AI-native.
   - *"a floating button which disables all AI (shut eyes ears and all things it can
@@ -341,6 +370,15 @@ This is the steward's most-repeated structural rule. Capture every nuance.
   - *"any and all elemnts shd be appearing diappearing contextually determisnitically
     based on what's needed at the time when it gets used like when mic used mic
     lights up and ewhen Ai sees eye lights up"* `[#1675]`
+  - **g2.1 Drag affordances appear ONLY during an active drag** (the corollary of
+    contextual-by-use). The sensory-pod GRIP and the orb's minimise control stay
+    hidden at rest AND on a passive hover, and reveal only while a drag is in
+    progress (the orb minimise control additionally STAYS revealed while the orb is
+    compact, so the restore affordance is always reachable). The whole widget body
+    remains draggable - the grip is visual only (hidden via opacity, so its width +
+    pointer-events stay part of the drag hit-area).
+    - *[steward 2026-06-30]* drag affordances should show only when dragging, not at
+      rest / on hover.
 - **g3. The clustered sensory panel is retained** across HARTOS installs (embodied).
   - *"The clustered grouped sensory panel we had for mic and vision and other
     sensory signals for embodied HARTOS installations?"* `[#1751]`
@@ -531,3 +569,22 @@ Net: the desktop is now a genuine fixed canvas (the core webpage complaint is
 addressed); the remaining gaps are the missing top-bar orb-sm, the money-figure
 hero wording, discoverability of dropped rows, the orb voice-viz restoration, and
 real-hardware polish proof.
+
+---
+
+## 2026-06-30 refinements - drag affordances + breathing toggle + pager switch
+
+Three steward instructions from 2026-06-30, captured here so they cannot scatter
+(consult-first / update-on-new-intent / audit-after). None contradict an EMPHATIC
+rule; each REFINES an existing item.
+
+| # | Steward 2026-06-30 (captured intent) | Checklist item | Status | Evidence |
+|---|---|---|---|---|
+| FIX A | Drag affordances should show only WHILE DRAGGING, not at rest / on hover. | g2.1 (new) + c4 (orb compact) + f4 | **APPLIED** | Sensory-pod grip default `opacity:0`, revealed only under `.hart-senses.dragging` (no `:hover` reveal) in `liquid_ui_service.py`; `hartSenses.js` adds/removes `.dragging` on drag start/end. Orb minimise control (`hartHero.js`) revealed by the drag handlers (onDown -> showMin / onUp -> hideMin), the hover/focus reveal removed, kept visible while compact (restore affordance). Body stays draggable; grip is visual only (hidden via opacity, width + pointer-events preserved). Behavioural `.mjs` + CSS source-guard in `tests/unit/test_orb_drag_affordances_breathing.mjs`. |
+| FIX B | The orb's breathing should be switchable on/off (default ON). | c8 (new) - refines c1 transparency control + c2 breathing | **APPLIED** | One persisted flag `hart_orb_breathing` (hartHero is the sole writer) gates BOTH the `buildOrbAura` brand rings AND `voiceOrbViz`'s breathe glow (`setBreathing`); default ON keeps today's look; flipped via the orb right-click (reuses the context affordance + toast, no second settings panel). Behavioural `.mjs` proves rings build/tear + glow damps. |
+| FIX C | Clicking the pager should actually SWITCH workspaces, not just select. | f7 | **APPLIED (client + honest backend no-op)** | `hartWorkspaces.js` `hartSwitchWorkspace` now also fire-and-forgets `POST /api/shell/workspaces/switch {id,name}` (covers BOTH the pager segments and the settings squares - one fn, DRY); the backend degrades hart-comp/Wayland to a 200 no-op (never 500). FOLLOW-UP (not faked): native-window workspace switching on the real hart-comp desktop stays a no-op until the `com.hart.Compositor` IPC backend replaces the `HartWmClient` swaymsg shim. (Implemented under a sibling task; recorded here for the audit trail.) |
+
+Audit note: FIX A + FIX B were implemented on the orb/hero side (`hartHero.js`,
+`voiceOrbViz.js`, `liquid_ui_service.py` CSS); they do not regress any APPLIED W1
+item (c1/c2 preserved by the default-ON breathing; f4 "everything draggable"
+preserved - the affordance is hidden, the drag is not).
