@@ -93,7 +93,7 @@ jobs:
             required = ["version", "git_sha", "code_hash", "guardrail_hash", "master_signature"]
             missing = [k for k in required if not m.get(k)]
             if missing:
-                raise SystemExit(f"Missing manifest fields: {missing}")
+                raise SystemExit("Missing manifest fields: %s" % missing)
             for k in required:
                 print(k, "=", str(m.get(k))[:120])
             PY
@@ -126,6 +126,10 @@ jobs:
                 "OPENAI_API_KEY",
                 "LANGCHAIN_API_KEY",
                 "GROQ_API_KEY",
+                "LLM_BACKEND",
+                "GLM_MODEL",
+                "GLM_API_KEY",
+                "GLM_API_BASE",
                 "HEVOLVE_NODE_TIER",
                 "HEVOLVE_ENFORCEMENT_MODE",
                 "ALLOWED_HOSTS",
@@ -148,15 +152,7 @@ jobs:
             STATUS_JSON="$(curl -fsS http://127.0.0.1:6777/status)"
             echo "$STATUS_JSON"
 
-            echo "$STATUS_JSON" | python3 - <<'PY'
-            import sys, json
-            data = json.load(sys.stdin)
-            if data.get("status") != "running":
-                raise SystemExit("status endpoint did not return running")
-            if data.get("node_tier") != "central":
-                raise SystemExit("node_tier is not central")
-            print("status endpoint OK")
-            PY
+            echo "$STATUS_JSON" | python3 -c 'import sys,json; data=json.load(sys.stdin); assert data.get("status")=="running"; assert data.get("node_tier")=="central"; print("status endpoint OK")'
 
             echo "=== HART hash verification ==="
             if curl -fsS http://127.0.0.1:6777/harthash -o /tmp/harthash.json; then
@@ -172,7 +168,7 @@ jobs:
 
             echo "=== Compare manifest commit with deployed commit ==="
             python3 - <<PY
-            import json, os
+            import json
 
             deploy_commit = "$DEPLOY_COMMIT"
 
@@ -183,7 +179,7 @@ jobs:
 
             if manifest_commit != deploy_commit:
                 raise SystemExit(
-                    f"Manifest commit mismatch: manifest={manifest_commit}, deployed={deploy_commit}"
+                    "Manifest commit mismatch: manifest=%s, deployed=%s" % (manifest_commit, deploy_commit)
                 )
 
             print("Manifest commit matches deployed commit:", deploy_commit)
