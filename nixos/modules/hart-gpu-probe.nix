@@ -11,10 +11,20 @@
 #   common case: a machine with a known-good GPU is pinned to llvmpipe forever.
 #
 #   This module is a BOOT-TIME smoke test that runs BEFORE the display manager,
-#   probes whether the GPU can actually create a GL context + report a HARDWARE
-#   renderer, and writes a one-line verdict to /run/hart/gpu-render:
-#     `hardware`  → the GPU passed the smoke test; upper tiers may use GL.
-#     `software`  → probe failed / errored / timed out / disabled → FORCE software.
+#   binds eglinfo to the INTEL iGPU render node (driver i915), checks that node
+#   can create a GL context + reports an INTEL hardware renderer (not the dGPU,
+#   not a software rasterizer), and writes a one-line verdict to /run/hart/gpu-render:
+#     `hardware`  → the iGPU passed the smoke test; upper tiers may use GL.
+#     `software`  → probe failed / errored / timed out / disabled / non-Intel /
+#                   no i915 node → FORCE software.
+#
+#   WHY THE iGPU SPECIFICALLY (target Optimus laptop, Intel iGPU + GeForce dGPU):
+#   the discrete GeForce (nouveau) FAULTS (MMIO PRIVRING) and is blacklisted +
+#   KMS-off, so the iGPU is the one render path proven healthy. The probe binds to
+#   the i915 render node AND requires an Intel renderer (iris/crocus/i965/Intel),
+#   so a dGPU/NVIDIA/AMD hardware-renderer line can NEVER flip the verdict. The
+#   compositor pins the SAME iGPU (it is the only DRM node once nouveau is out), so
+#   the verdict provably reflects the GPU that will actually composite.
 #   A safe consumer (Tier-2 sway, hart-layer-shell-host.nix) reads that file at
 #   session launch and only forces software GL when the verdict is NOT `hardware`.
 #
@@ -51,8 +61,10 @@ let
 
   # Tools referenced by absolute store path — the unit PATH is minimal (the
   # iso_real_usb_boot lesson: coreutils/grep/eglinfo are not on the bare unit
-  # PATH). `timeout` + `cat`/`mkdir`/`echo` come from coreutils.
-  binPath = lib.makeBinPath (with pkgs; [ coreutils gnugrep ]);
+  # PATH). `timeout` + `cat`/`mkdir`/`echo`/`readlink`/`basename` come from
+  # coreutils; gnused for the renderer-line trim (sed is NOT in coreutils, so the
+  # journal RENDERER display was silently empty without it).
+  binPath = lib.makeBinPath (with pkgs; [ coreutils gnugrep gnused ]);
 
   # ── The GPU smoke-test probe ───────────────────────────────────────────────
   # `set -u` only (NOT -e): a probe failing must NEVER abort — it must FALL BACK
@@ -66,38 +78,75 @@ let
     VERDICT="${verdictFile}"
     mkdir -p /run/hart 2>/dev/null || true
 
-    # Fail-safe default: the FLOOR. Only a positive hardware match flips this.
+    # Fail-safe default: the FLOOR. Only a positive INTEL iGPU match flips this.
     RESULT=software
 
     # Operator override: hart.gpu.accelerate = false forces the software floor
     # regardless of what the GPU can do (an explicit "pin me to llvmpipe" knob).
     ACCELERATE="${if gpu.accelerate then "1" else "0"}"
 
+    # Journal context (filled below): which render node + which renderer drove the
+    # verdict, so a real-HW boot shows exactly what was detected + chosen.
+    IGPU_NODE=""
+    RENDERER=""
+
     if [ "$ACCELERATE" = "1" ]; then
-      # eglinfo creates a real EGL/GL context and prints the GL renderer string.
-      # `timeout 12` catches a driver that HANGS on context creation (the real-HW
-      # pointer-only failure). Capture stdout+stderr; never let it fail the unit.
-      OUT="$(timeout 12 ${pkgs.mesa-demos}/bin/eglinfo 2>&1 || true)"
+      # ── Resolve the Intel iGPU render node (driver == i915) ──────────────────
+      # Scan /sys/class/drm/renderD*/device/driver and pick the node whose driver
+      # symlink basename is `i915` — the Intel integrated GPU that drives the panel.
+      # The DISCRETE GPU is deliberately NOT matched: on the target Optimus laptop
+      # the GeForce dGPU (nouveau) FAULTS (MMIO PRIVRING) and is blacklisted +
+      # KMS-off, so binding the probe to the iGPU node — together with the Intel
+      # allow-list below — means a dGPU / NVIDIA / AMD renderer line can NEVER flip
+      # the verdict to hardware. No i915 node => stay `software`: a non-Intel box
+      # keeps the PROVEN software floor (conservative by design; the arm is gated on
+      # the one render path proven healthy on the target hardware). readlink/basename
+      # come from coreutils (on PATH above).
+      for _rd in /sys/class/drm/renderD*; do
+        [ -e "$_rd/device/driver" ] || continue
+        _drv="$(basename "$(readlink -f "$_rd/device/driver" 2>/dev/null)" 2>/dev/null || true)"
+        if [ "$_drv" = "i915" ]; then
+          IGPU_NODE="/dev/dri/$(basename "$_rd")"
+          break
+        fi
+      done
 
-      # The renderer line eglinfo reported — captured for the journal so a real-HW
-      # boot shows WHICH GPU (or which software rasterizer) drove the verdict.
-      RENDERER="$(printf '%s' "$OUT" | grep -iE 'renderer' | head -1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)"
+      if [ -n "$IGPU_NODE" ] && [ -e "$IGPU_NODE" ]; then
+        # eglinfo creates a real EGL/GL context and prints the GL renderer string.
+        # Force the SURFACELESS platform: the probe runs BEFORE greetd with NO
+        # X/Wayland display, and the surfaceless platform reaches the DRM render
+        # node headlessly (without it eglinfo may find no display and report
+        # nothing => software, never detecting the good iGPU). `timeout 12` catches
+        # a driver that HANGS on context creation (the real-HW pointer-only
+        # failure). Capture stdout+stderr; never let it fail the unit (|| true).
+        OUT="$(EGL_PLATFORM=surfaceless timeout 12 ${pkgs.mesa-demos}/bin/eglinfo 2>&1 || true)"
 
-      # A HARDWARE renderer = a line mentioning "renderer" (case-insensitive) that
-      # is NOT one of the software rasterizers. llvmpipe / softpipe / swrast and
-      # the "software rasterizer" / "Software" strings are Mesa's software paths;
-      # if the renderer is one of those the GPU is NOT doing hardware GL → floor.
-      if printf '%s' "$OUT" | grep -iqE 'renderer' \
-         && printf '%s' "$OUT" | grep -iE 'renderer' \
-            | grep -ivqE 'llvmpipe|softpipe|swrast|software rasterizer|software'; then
-        RESULT=hardware
+        # The renderer line eglinfo reported — captured for the journal so a real-HW
+        # boot shows WHICH renderer (Intel iGPU or which software rasterizer) drove
+        # the verdict.
+        RENDERER="$(printf '%s' "$OUT" | grep -iE 'renderer' | head -1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true)"
+
+        # A HARDWARE verdict requires BOTH: (1) the renderer is an INTEL iGPU
+        # renderer (iris / crocus / i965 / "Intel" — the Mesa Intel driver family),
+        # which is the POSITIVE proof it is the iGPU (defense-in-depth atop the
+        # i915-node bind so a non-Intel hardware renderer can never flip it), AND
+        # (2) it is NOT a software rasterizer (llvmpipe / softpipe / swrast /
+        # "software"). Either condition failing keeps the fail-safe `software` floor.
+        if printf '%s' "$OUT" | grep -iqE 'renderer' \
+           && printf '%s' "$OUT" | grep -iE 'renderer' | grep -iqE 'iris|crocus|i965|intel' \
+           && printf '%s' "$OUT" | grep -iE 'renderer' \
+              | grep -ivqE 'llvmpipe|softpipe|swrast|software rasterizer|software'; then
+          RESULT=hardware
+        fi
+      else
+        echo "[hart-gpu-probe] no Intel i915 render node found - staying on the software floor" >&2
       fi
     fi
 
     # Publish the verdict (single line) + announce the decision to the journal so a
     # real-HW boot shows exactly what was detected + chosen (journalctl -b -u hart-gpu-probe).
     printf '%s\n' "$RESULT" > "$VERDICT" 2>/dev/null || true
-    echo "[hart-gpu-probe] GPU render verdict: $RESULT (accelerate=$ACCELERATE; renderer: ''${RENDERER:-none reported}) -> $VERDICT" >&2
+    echo "[hart-gpu-probe] GPU render verdict: $RESULT (accelerate=$ACCELERATE; igpu_node: ''${IGPU_NODE:-none}; renderer: ''${RENDERER:-none reported}) -> $VERDICT" >&2
     exit 0
   '';
 in

@@ -244,17 +244,34 @@ let
     export GSK_RENDERER=vulkan
     echo "[hart-glass-shell-gtk4] GSK = VULKAN (operator preferHardwareGL=true; GL disabled)" >&2
     '' else ''
-    # AUTO path = ALWAYS cairo (software). The on-HW journal (2026-06-25, NVIDIA-Optimus Lenovo:
-    # Intel iGPU + GeForce 940MX) PROVED the old "probe=hardware -> vulkan" decision fails BOTH
-    # tiers: on Tier-1's pixman SOFTWARE floor a hardware-Vulkan client gets VK_ERROR_SURFACE_
-    # LOST_KHR (GPU client vs software compositor = no shared dmabuf to present to), and on
-    # Tier-2 sway it never first-painted in the 45s watchdog window. Cairo is the PROVEN paint
-    # path (75ba78d). The Intel iGPU is the healthy render path; the dGPU (940MX via nouveau) is
-    # what FAULTS (MMIO PRIVRING in the journal) -- the blocker is the render PATH + the dGPU
-    # driver, not the iGPU -- so hardware accel returns via preferHardwareGL once the compositor's
-    # GPU buffer-sharing + the portal are proven on real HW (and nouveau is bypassed/blacklisted).
-    export GSK_RENDERER=cairo
-    echo "[hart-glass-shell-gtk4] GSK = CAIRO (software floor; auto path -- vulkan regressed on real HW 2026-06-25)" >&2
+    # AUTO: co-arm GSK with the compositor via the SAME boot probe verdict
+    # (/run/hart/gpu-render, written by hart-gpu-probe which binds eglinfo to the
+    # Intel iGPU). VULKAN only when the probe proved the iGPU good -- which is ALSO
+    # exactly when hart-comp drops --force-software and GPU-composites via GLES (the
+    # force-software gotcha fix in hart-comp.nix), so a hardware-Vulkan client now
+    # has a HARDWARE compositor to present its dmabuf to. THAT was the missing half
+    # of the 2026-06-25 "probe=hardware -> vulkan" attempt: it armed vulkan while the
+    # compositor was STILL pinned to the pixman SOFTWARE floor by that gotcha, so the
+    # client got VK_ERROR_SURFACE_LOST_KHR and never first-painted on either tier.
+    # Co-arming BOTH on the one Intel-iGPU verdict is what makes vulkan safe this
+    # time. Else CAIRO, the proven software floor. Re-probed every boot; fail-safe
+    # cairo (absent/garbled verdict => cairo).
+    #
+    # SAFE-BY-FLOOR (the HARD fallback, unchanged): GL stays DISABLED above, so a
+    # Vulkan-init failure falls back to CAIRO (never the hanging GL); and if GSK-
+    # vulkan first-paint fails on the layer-shell surface (e.g. a residual dmabuf
+    # mismatch) the marker /run/hart/session/shell-ready is never touched, so the
+    # session-supervisor paint watchdog drops the tier to the cage GTK3 floor in
+    # <=45s -- never a wedged black screen. REAL-HW PENDING: the steward's flash
+    # proves vulkan-on-GLES presents on the iGPU; the watchdog is the backstop.
+    HART_GPU_VERDICT="$(cat /run/hart/gpu-render 2>/dev/null || echo software)"
+    if [ "$HART_GPU_VERDICT" = "hardware" ]; then
+      export GSK_RENDERER=vulkan
+      echo "[hart-glass-shell-gtk4] GSK = VULKAN (auto; gpu-render verdict: hardware -- co-armed with the GLES compositor)" >&2
+    else
+      export GSK_RENDERER=cairo
+      echo "[hart-glass-shell-gtk4] GSK = CAIRO (auto; gpu-render verdict: $HART_GPU_VERDICT -- proven software floor)" >&2
+    fi
     ''}
     export HART_SHELL_URL="$URL"
     # Shell-paint readiness marker (the session-supervisor's HUNG-tier guard): the

@@ -374,14 +374,49 @@ let
     # unaffected — XWayland is best-effort — but the moat wants legacy/Wine windows too.
     PATH=${lib.makeBinPath (with pkgs; [ coreutils xwayland ])}:$PATH
 
-    # Mandatory software-render floor — same contract as cage Tier-3 + sway Tier-2.
-    # HART-comp's pixman path is type-checked (not an env prayer), but we ALSO pass
-    # --force-software + set the shared env so the decision is unambiguous and a
-    # half-finished hardware path can never brick the box.
-    export WLR_RENDERER_ALLOW_SOFTWARE=1
+    # ── GPU ARM DECISION — co-armed with the GSK shell renderer + the shell's
+    #    effects via the SAME boot probe verdict (/run/hart/gpu-render) ──────────
+    # preferHardwareGL = the operator override (force the hardware path). DEFAULT
+    # false = AUTO: arm hardware ONLY when the boot probe (hart-gpu-probe, which
+    # binds eglinfo to the Intel iGPU's i915 node and requires an Intel renderer)
+    # wrote `hardware`. Re-probed every boot; fail-safe software (absent/garbled
+    # verdict => software floor). The verdict file is written by hart-gpu-probe,
+    # which runs BEFORE greetd, so it is on disk before this greetd session reads it.
+    ${if (ui.preferHardwareGL or false) then ''
+    _HART_ARMED=1   # operator override: hart.liquidUI.preferHardwareGL = true
+    '' else ''
+    _HART_GPU_VERDICT="$(cat /run/hart/gpu-render 2>/dev/null || echo software)"
+    if [ "$_HART_GPU_VERDICT" = "hardware" ]; then _HART_ARMED=1; else _HART_ARMED=0; fi
+    ''}
+
+    # Software cursors are always safe (NOT a force-software signal) — unconditional.
     export WLR_NO_HARDWARE_CURSORS=1
-    ${lib.optionalString (!(ui.preferHardwareGL or false)) "export LIBGL_ALWAYS_SOFTWARE=1"}
-    export HART_COMP_FORCE_SOFTWARE=${if (ui.preferHardwareGL or false) then "0" else "1"}
+
+    # ── THE FORCE-SOFTWARE GOTCHA FIX ──────────────────────────────────────────
+    # main.rs::BootConfig::from_args treats WLR_RENDERER_ALLOW_SOFTWARE (AND
+    # LIBGL_ALWAYS_SOFTWARE / HART_COMP_FORCE_SOFTWARE) as a FORCE-software signal,
+    # so exporting WLR_RENDERER_ALLOW_SOFTWARE UNCONDITIONALLY pinned the compositor
+    # to the pixman floor REGARDLESS of the probe verdict — making "drop
+    # --force-software" a silent no-op so the GLES path could never build (the exact
+    # gotcha this fix removes). Gate ALL of them — and the --force-software flag on
+    # the launch below — on the SAME !armed condition, so an armed boot lets
+    # select_render_path read the verdict and bring up GLES on the iGPU, while an
+    # unarmed boot is byte-identical to the proven software floor. The pixman
+    # renderer stays the renderer of record + the degrade-not-die fallback under
+    # either path (udev.rs keeps it on ANY GLES fault), and a GLES/first-paint
+    # failure still drops to cage via the session-supervisor paint watchdog — so a
+    # half-finished hardware path can never brick the box (degrade chain + watchdog,
+    # not an unconditional env pin).
+    HART_COMP_FORCE_SW_FLAG=""
+    if [ "$_HART_ARMED" != "1" ]; then
+      export WLR_RENDERER_ALLOW_SOFTWARE=1
+      export LIBGL_ALWAYS_SOFTWARE=1
+      export HART_COMP_FORCE_SOFTWARE=1
+      HART_COMP_FORCE_SW_FLAG="--force-software"
+      echo "[hart-comp-session] render = SOFTWARE floor (pixman; not armed)" >&2
+    else
+      echo "[hart-comp-session] render = HARDWARE armed (GLES on the verified iGPU; pixman kept as the degrade-not-die fallback)" >&2
+    fi
 
     # ── M7: Tier-1 is the REAL-HARDWARE DRM backend (`--backend drm`) — NOT the winit
     # dev backend (which needs a host Wayland socket that does not exist on a bare TTY).
@@ -435,7 +470,12 @@ let
     }
     trap _hart_comp_term TERM INT
 
-    ${hartCompPkg}/bin/hart-comp --backend drm ${lib.optionalString (!(ui.preferHardwareGL or false)) "--force-software"} &
+    # --force-software is passed ONLY when NOT armed (HART_COMP_FORCE_SW_FLAG, set
+    # above on the SAME !armed condition as the force-software env). Armed => the
+    # flag is empty => select_render_path reads the verdict and brings up GLES on the
+    # iGPU. Unquoted expansion is intentional (the flag is "" or "--force-software",
+    # no spaces/globs) and safe under set -u (always assigned above).
+    ${hartCompPkg}/bin/hart-comp --backend drm $HART_COMP_FORCE_SW_FLAG &
     HART_COMP_PID=$!
 
     # Wait (bounded) for hart-comp to create its wayland socket, then point the glass

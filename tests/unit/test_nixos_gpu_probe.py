@@ -12,10 +12,17 @@ under test:
   * The Tier-2 sway launcher (hart-layer-shell-host.nix) must gate
     ``LIBGL_ALWAYS_SOFTWARE`` on ``/run/hart/gpu-render == hardware`` — i.e. it
     only stops forcing software when the probe proved the GPU good.
+  * The GTK4 GSK renderer + the hart-comp compositor CO-ARM on the SAME verdict:
+    GSK is ``vulkan`` (else ``cairo``) and hart-comp drops its force-software
+    signals (so ``select_render_path`` reaches the GLES path) only when the probe
+    proved the Intel iGPU good — both reading ``/run/hart/gpu-render``, so a
+    hardware-Vulkan client is never paired with a software compositor.
   * The FLOOR must NOT depend on the probe: the cage Tier-3 floor
-    (hart-liquid-ui.nix) keeps forcing software GL, the GTK4 host keeps
-    ``GSK_RENDERER=cairo`` + the WebKit software forces, and hart-comp keeps its
-    pixman renderer — none of these may be gated on ``/run/hart/gpu-render``.
+    (hart-liquid-ui.nix) keeps forcing software GL unconditionally, and the GTK4
+    host's WebKit software forces stay on the build-time ``!preferHardwareGL`` gate
+    (WebKit GPU is a separate, more conservative step). The pixman/cairo software
+    paths remain the never-fail fallback under the armed tiers (degrade chain +
+    the supervisor paint watchdog), so an armed boot that fails still lands on cage.
 
 The renderer-classification half is a BEHAVIOURAL test, not a string-survival
 grep: it extracts the actual ``grep`` pipeline the module uses and runs it
@@ -142,17 +149,29 @@ def test_accelerate_false_forces_software():
 #    Extract the real pipeline from the module and run it against fixtures.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# eglinfo-style renderer lines: the first three are HARDWARE, the rest SOFTWARE.
+# eglinfo-style renderer lines. ONLY a verified INTEL iGPU renderer (Mesa Intel
+# driver family: iris / crocus / i965 / "Intel") classifies as HARDWARE — the
+# probe binds to the i915 render node and requires the Intel signature so a
+# faulting/foreign GPU can never flip the verdict.
 _HARDWARE_FIXTURES = [
     "OpenGL renderer string: Mesa Intel(R) UHD Graphics 620 (KBL GT2)",
-    "OpenGL renderer string: AMD Radeon RX 6600 (radeonsi, navi23, LLVM 17)",
-    "OpenGL renderer string: NVIDIA GeForce RTX 3060/PCIe/SSE2",
+    "OpenGL renderer string: Mesa Intel(R) Arc(tm) Graphics (MTL)",
+    "OpenGL renderer string: Mesa Intel(R) Iris(R) Xe Graphics (iris)",
+    "OpenGL renderer string: Mesa DRI Intel(R) HD Graphics 530 (crocus)",
 ]
+# Everything else stays on the fail-safe SOFTWARE floor: software rasterizers
+# (llvmpipe/softpipe/swrast), empty/missing eglinfo output, AND — by design — a
+# NON-Intel hardware renderer (AMD/NVIDIA). The target Optimus laptop's dGPU is the
+# GeForce that FAULTS (nouveau MMIO PRIVRING) and is blacklisted, so a non-Intel
+# renderer line must NEVER arm hardware; a pure-AMD/NVIDIA box stays conservatively
+# on the proven software floor until that vendor's path is itself proven.
 _SOFTWARE_FIXTURES = [
     "OpenGL renderer string: llvmpipe (LLVM 17.0.6, 256 bits)",
     "OpenGL renderer string: softpipe",
     "OpenGL renderer string: Software Rasterizer",
     "Device: swrast",
+    "OpenGL renderer string: AMD Radeon RX 6600 (radeonsi, navi23, LLVM 17)",
+    "OpenGL renderer string: NVIDIA GeForce RTX 3060/PCIe/SSE2",
     "",  # empty output (eglinfo missing / failed / timed out)
     "/bin/sh: eglinfo: command not found",
 ]
@@ -205,22 +224,23 @@ def _shell():
 
 
 @pytest.mark.parametrize("egl", _HARDWARE_FIXTURES)
-def test_classifier_accepts_hardware_renderers(egl):
+def test_classifier_accepts_intel_igpu_renderers(egl):
     shell = _shell()
     if not shell:
         pytest.skip("no POSIX shell available to exercise the classifier")
     assert _classify(shell, egl) == "hardware", (
-        f"a hardware renderer line must classify as hardware: {egl!r}")
+        f"a verified Intel iGPU renderer line must classify as hardware: {egl!r}")
 
 
 @pytest.mark.parametrize("egl", _SOFTWARE_FIXTURES)
-def test_classifier_rejects_software_and_empty(egl):
+def test_classifier_rejects_software_empty_and_non_intel(egl):
     shell = _shell()
     if not shell:
         pytest.skip("no POSIX shell available to exercise the classifier")
     assert _classify(shell, egl) == "software", (
-        f"a software / empty / missing-tool eglinfo output must classify as "
-        f"software (the fail-safe floor): {egl!r}")
+        f"a software / empty / missing-tool / NON-Intel eglinfo output must "
+        f"classify as software (the fail-safe floor — only the verified Intel "
+        f"iGPU arms hardware): {egl!r}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -279,7 +299,10 @@ def test_sway_launcher_preserves_preferHardwareGL_optin():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. FLOOR INVARIANT: cage + GTK4 GSK cairo + hart-comp pixman are NOT gated.
+# 5. FLOOR INVARIANT: the cage Tier-3 floor stays software UNCONDITIONALLY (never
+#    gated on the probe). hart-comp + the GTK4 GSK renderer now CO-ARM on the SAME
+#    verdict (the GLES/vulkan path is THIS task), but the pixman/cairo software
+#    paths remain the never-fail fallback under both (degrade chain + watchdog).
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_cage_floor_still_forces_software_unconditionally():
@@ -347,9 +370,47 @@ def test_gtk4_host_gsk_gates_vulkan_but_never_uses_gl():
         "(WebKit GPU is a separate later step, not part of the GSK fix).")
 
 
-def test_hart_comp_pixman_renderer_not_gated_on_probe():
+def test_hart_comp_arms_gles_on_probe_verdict_with_gated_force_software():
+    """hart-comp now ARMS its GLES path from the probe verdict (the GLES path is
+    THIS task, no longer 'separate'), co-armed with the GSK shell on the SAME
+    /run/hart/gpu-render. THE FORCE-SOFTWARE GOTCHA FIX is the load-bearing part:
+    main.rs::BootConfig::from_args treats WLR_RENDERER_ALLOW_SOFTWARE /
+    LIBGL_ALWAYS_SOFTWARE / HART_COMP_FORCE_SOFTWARE as FORCE-software signals, so
+    they MUST be gated on the runtime !armed decision (else exporting them
+    unconditionally re-pins the compositor to pixman regardless of the verdict and
+    the GLES path can never build). pixman stays the never-fail fallback (udev.rs
+    keeps it on any GLES fault; the supervisor watchdog drops to cage on a
+    first-paint failure)."""
     comp = _read(_COMP)
-    assert "/run/hart/gpu-render" not in comp, (
-        "hart-comp.nix must NOT be gated on the GPU probe verdict — hart-comp "
-        "uses the mandatory pixman software renderer (a GLES path is a separate "
-        "task); the probe must not touch it.")
+    # The AUTO arm reads the SAME verdict file the GSK shell + the shell effects read.
+    assert "/run/hart/gpu-render" in comp, (
+        "hart-comp.nix must read /run/hart/gpu-render to AUTO-arm the GLES path "
+        "(co-armed with the GSK shell renderer on the same verdict).")
+    assert "_HART_ARMED" in comp, (
+        "hart-comp.nix must compute a runtime arm decision (_HART_ARMED).")
+    # preferHardwareGL stays the operator override (the launcher branches on it).
+    assert re.search(r"if \(ui\.preferHardwareGL or false\) then", comp), (
+        "preferHardwareGL must remain the operator-override branch of the arm decision.")
+    # THE GOTCHA FIX: every force-software signal is INSIDE the !armed gate, never
+    # exported unconditionally before it.
+    gate = comp.find('if [ "$_HART_ARMED" != "1" ]; then')
+    assert gate != -1, (
+        "hart-comp.nix must gate the force-software signals on `if "
+        '[ "$_HART_ARMED" != "1" ]` (the not-armed branch).')
+    for sig in ("export WLR_RENDERER_ALLOW_SOFTWARE=1",
+                "export LIBGL_ALWAYS_SOFTWARE=1",
+                "export HART_COMP_FORCE_SOFTWARE=1",
+                'HART_COMP_FORCE_SW_FLAG="--force-software"'):
+        idx = comp.find(sig)
+        assert idx > gate, (
+            f"{sig!r} must be INSIDE the not-armed gate — main.rs treats it as a "
+            "force-software signal, so exporting it unconditionally re-pins the "
+            "compositor to pixman regardless of the probe verdict (the gotcha).")
+    # WLR_NO_HARDWARE_CURSORS stays unconditional (software cursors are always safe;
+    # it is NOT a force-software signal).
+    assert "export WLR_NO_HARDWARE_CURSORS=1" in comp
+    # And the launch passes the GATED flag (empty when armed), not an unconditional
+    # --force-software.
+    assert "--backend drm $HART_COMP_FORCE_SW_FLAG" in comp, (
+        "the hart-comp launch must pass the gated $HART_COMP_FORCE_SW_FLAG "
+        "(empty when armed) instead of an unconditional --force-software.")
