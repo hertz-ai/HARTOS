@@ -19,23 +19,37 @@ jobs:
           password: ${{ secrets.DEPLOY_PASSWORD }}
           port: ${{ secrets.DEPLOY_PORT }}
           timeout: 60m
-          command_timeout: 90m
+          command_timeout: 120m
           script: |
             set -e
 
+            echo "=== Go to repo ==="
             cd ${{ secrets.DEPLOY_REPO_PATH }}
 
+            echo "=== Sync latest main ==="
             rm -f release_manifest.json
-
             git fetch origin --prune
             git checkout main
             git reset --hard origin/main
 
+            DEPLOY_COMMIT="$(git rev-parse HEAD)"
+            DEPLOY_COMMIT_SHORT="$(git rev-parse --short HEAD)"
+
+            echo "Deploy commit: $DEPLOY_COMMIT"
+            git log -1 --oneline
+
+            echo "=== Clean old containers/images ==="
             docker rm -f langchain langchain_tmp 2>/dev/null || true
             docker rmi -f langchain_gpt:main 2>/dev/null || true
 
-            docker build --no-cache -t langchain_gpt:main .
+            echo "=== Build Docker image ==="
+            docker build --no-cache \
+              --build-arg GIT_SHA="$DEPLOY_COMMIT" \
+              -t langchain_gpt:main \
+              -t langchain_gpt:"$DEPLOY_COMMIT_SHORT" \
+              .
 
+            echo "=== Generate signed release manifest ==="
             sudo docker run --name langchain_tmp -d \
               --env-file .env \
               -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
@@ -45,8 +59,8 @@ jobs:
             cd /app
             export MASTER_PRIVATE_KEY_HEX="$HEVOLVE_MASTER_PRIVATE_KEY"
             python scripts/sign_release.py \
-              --version v1.0.0 \
-              --git-sha "$(git rev-parse HEAD 2>/dev/null || echo no-git)" \
+              --version "'"$DEPLOY_COMMIT_SHORT"'" \
+              --git-sha "'"$DEPLOY_COMMIT"'" \
               --code-hash "$(python - <<PY
             import sys; sys.path.insert(0,".")
             from security.node_integrity import compute_code_hash
@@ -66,16 +80,114 @@ jobs:
             sudo docker cp langchain_tmp:/tmp/release_manifest.json ./release_manifest.json
             docker rm -f langchain_tmp
 
+            echo "=== Validate release manifest on Deepbox ==="
+            ls -l release_manifest.json
+            file release_manifest.json
+            python3 -m json.tool release_manifest.json >/dev/null
+            echo "release_manifest.json valid JSON"
+
+            echo "=== Manifest fields ==="
+            python3 - <<'PY'
+            import json
+            m = json.load(open("release_manifest.json"))
+            required = ["version", "git_sha", "code_hash", "guardrail_hash", "master_signature"]
+            missing = [k for k in required if not m.get(k)]
+            if missing:
+                raise SystemExit(f"Missing manifest fields: {missing}")
+            for k in required:
+                print(k, "=", str(m.get(k))[:120])
+            PY
+
+            echo "=== Run central container ==="
             sudo docker run -d --name langchain --restart unless-stopped \
               -p 6777:6777 \
               --env-file .env \
               -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
+              -e HARTOS_GIT_SHA="$DEPLOY_COMMIT" \
+              -e HARTOS_IMAGE_TAG="$DEPLOY_COMMIT_SHORT" \
               -v "$(pwd)/config.json:/app/config.json:ro" \
               -v "$(pwd)/release_manifest.json:/app/release_manifest.json:ro" \
               -v ${{ secrets.DEPLOY_LOGS_PATH }}:/app/logs \
               -v ${{ secrets.DEPLOY_IMAGES_PATH }}:/app/output_images \
               langchain_gpt:main
 
+            echo "=== Wait for service ==="
             sleep 20
+
+            echo "=== Verify container is running ==="
             docker ps | grep langchain
-            curl -sS http://127.0.0.1:6777/status
+            docker inspect langchain --format 'Image={{.Config.Image}} ContainerID={{.Id}} RestartCount={{.RestartCount}}'
+
+            echo "=== Verify env inside container ==="
+            docker exec langchain sh -lc '
+            python - <<PY
+            import os
+            keys = [
+                "OPENAI_API_KEY",
+                "LANGCHAIN_API_KEY",
+                "GROQ_API_KEY",
+                "HEVOLVE_NODE_TIER",
+                "HEVOLVE_ENFORCEMENT_MODE",
+                "ALLOWED_HOSTS",
+                "CBURL",
+                "HARTOS_GIT_SHA",
+                "HARTOS_IMAGE_TAG",
+            ]
+            missing = []
+            for k in keys:
+                v = os.getenv(k)
+                print(k, "=", "set" if v else "missing")
+                if not v:
+                    missing.append(k)
+            if missing:
+                raise SystemExit("Missing env vars: " + ",".join(missing))
+            PY
+            '
+
+            echo "=== Status check ==="
+            STATUS_JSON="$(curl -fsS http://127.0.0.1:6777/status)"
+            echo "$STATUS_JSON"
+
+            echo "$STATUS_JSON" | python3 - <<'PY'
+            import sys, json
+            data = json.load(sys.stdin)
+            if data.get("status") != "running":
+                raise SystemExit("status endpoint did not return running")
+            if data.get("node_tier") != "central":
+                raise SystemExit("node_tier is not central")
+            print("status endpoint OK")
+            PY
+
+            echo "=== HART hash verification ==="
+            if curl -fsS http://127.0.0.1:6777/harthash -o /tmp/harthash.json; then
+              echo "harthash endpoint found: /harthash"
+            elif curl -fsS http://127.0.0.1:6777/.well-known/hart-challenge -o /tmp/harthash.json; then
+              echo "harthash endpoint found: /.well-known/hart-challenge"
+            else
+              echo "ERROR: no harthash endpoint responded"
+              exit 1
+            fi
+
+            cat /tmp/harthash.json
+
+            echo "=== Compare manifest commit with deployed commit ==="
+            python3 - <<PY
+            import json, os
+
+            deploy_commit = "$DEPLOY_COMMIT"
+
+            with open("release_manifest.json") as f:
+                manifest = json.load(f)
+
+            manifest_commit = manifest.get("git_sha") or manifest.get("commit") or manifest.get("version")
+
+            if manifest_commit != deploy_commit:
+                raise SystemExit(
+                    f"Manifest commit mismatch: manifest={manifest_commit}, deployed={deploy_commit}"
+                )
+
+            print("Manifest commit matches deployed commit:", deploy_commit)
+            PY
+
+            echo "=== Final verification complete ==="
+            echo "HARTOS central deployment verified for commit $DEPLOY_COMMIT"
