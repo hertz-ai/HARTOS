@@ -4,7 +4,7 @@
  * A framework-agnostic (vanilla, no React) canvas renderer so the OS liquid-ui
  * shell can draw the floating voice orb itself — no React bundle, no iframe.
  * The look matches Nunba's React VoiceVisualizer (3 energy bands -> sine
- * harmonics, neon #6C63FF glow, breathing core); this is the deliberate native
+ * harmonics, neon teal glow, breathing core); this is the deliberate native
  * twin for the lean OS shell, kept separate from the React component on purpose
  * (forcing React into the shell would pull an unnecessary dependency).
  *
@@ -123,7 +123,7 @@
       ctx.clearRect(0, 0, W, H);
 
       var bg = ctx.createRadialGradient(cx, cy, baseR - 10, cx, cy, baseR + 70);
-      bg.addColorStop(0, 'rgba(108,99,255,' + (0.02 + energy * 0.06).toFixed(3) + ')');
+      bg.addColorStop(0, 'rgba(0,230,195,' + (0.02 + energy * 0.06).toFixed(3) + ')');
       bg.addColorStop(1, 'rgba(10,9,20,0)');
       ctx.fillStyle = bg;
       ctx.beginPath(); ctx.arc(cx, cy, baseR + 70, 0, Math.PI * 2); ctx.fill();
@@ -158,37 +158,37 @@
       if (maxPeakR > baseR + 1) {
         var fg = ctx.createRadialGradient(cx, cy, baseR, cx, cy, maxPeakR);
         fg.addColorStop(0, 'rgba(10,9,20,0)');
-        fg.addColorStop(0.3, 'rgba(80,60,220,' + (0.08 + energy * 0.15).toFixed(3) + ')');
-        fg.addColorStop(0.7, 'rgba(108,99,255,' + (0.15 + energy * 0.25).toFixed(3) + ')');
-        fg.addColorStop(1, 'rgba(150,140,255,' + (0.25 + energy * 0.4).toFixed(3) + ')');
+        fg.addColorStop(0.3, 'rgba(0,170,150,' + (0.08 + energy * 0.15).toFixed(3) + ')');
+        fg.addColorStop(0.7, 'rgba(0,230,195,' + (0.15 + energy * 0.25).toFixed(3) + ')');
+        fg.addColorStop(1, 'rgba(120,250,225,' + (0.25 + energy * 0.4).toFixed(3) + ')');
         ctx.fillStyle = fg;
       } else {
-        ctx.fillStyle = 'rgba(108,99,255,0.05)';
+        ctx.fillStyle = 'rgba(0,230,195,0.05)';
       }
       ctx.fill();
 
       ctx.globalCompositeOperation = 'lighter';
-      drawRing('rgba(108,99,255,' + (0.04 + energy * 0.05).toFixed(3) + ')', 14);
-      drawRing('rgba(108,99,255,' + (0.08 + energy * 0.1).toFixed(3) + ')', 6);
-      drawRing('rgba(170,165,255,' + (0.5 + energy * 0.5).toFixed(3) + ')', 1.8);
+      drawRing('rgba(0,230,195,' + (0.04 + energy * 0.05).toFixed(3) + ')', 14);
+      drawRing('rgba(0,230,195,' + (0.08 + energy * 0.1).toFixed(3) + ')', 6);
+      drawRing('rgba(140,252,228,' + (0.5 + energy * 0.5).toFixed(3) + ')', 1.8);
       ctx.globalCompositeOperation = 'source-over';
 
       var breathe1 = Math.sin(t * 1.2) * 0.3 + Math.sin(t * 1.9) * 0.15;
       var breathe2 = Math.sin(t * 0.8) * 0.2 + Math.cos(t * 1.4) * 0.1;
       var glowR = (8 + energy * 12 + breathe1 * 4) * 3;
       var cg = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowR);
-      cg.addColorStop(0, 'rgba(200,195,255,' + (0.15 + energy * 0.5 + breathe1 * 0.08).toFixed(3) + ')');
-      cg.addColorStop(0.3, 'rgba(108,99,255,' + (0.08 + energy * 0.2 + breathe2 * 0.04).toFixed(3) + ')');
-      cg.addColorStop(0.6, 'rgba(80,60,200,' + (0.03 + energy * 0.08 + breathe1 * 0.02).toFixed(3) + ')');
-      cg.addColorStop(1, 'rgba(108,99,255,0)');
+      cg.addColorStop(0, 'rgba(185,253,238,' + (0.15 + energy * 0.5 + breathe1 * 0.08).toFixed(3) + ')');
+      cg.addColorStop(0.3, 'rgba(0,230,195,' + (0.08 + energy * 0.2 + breathe2 * 0.04).toFixed(3) + ')');
+      cg.addColorStop(0.6, 'rgba(0,160,140,' + (0.03 + energy * 0.08 + breathe1 * 0.02).toFixed(3) + ')');
+      cg.addColorStop(1, 'rgba(0,230,195,0)');
       ctx.fillStyle = cg;
       ctx.beginPath(); ctx.arc(cx, cy, glowR, 0, Math.PI * 2); ctx.fill();
 
       var coreR = 3 + energy * 6 + breathe1 * 1.5;
       var cg2 = ctx.createRadialGradient(cx, cy, 0, cx, cy, coreR);
-      cg2.addColorStop(0, 'rgba(220,215,255,' + (0.3 + energy * 0.5 + breathe2 * 0.1).toFixed(3) + ')');
-      cg2.addColorStop(0.5, 'rgba(108,99,255,' + (0.1 + energy * 0.3 + breathe1 * 0.05).toFixed(3) + ')');
-      cg2.addColorStop(1, 'rgba(108,99,255,0)');
+      cg2.addColorStop(0, 'rgba(212,254,245,' + (0.3 + energy * 0.5 + breathe2 * 0.1).toFixed(3) + ')');
+      cg2.addColorStop(0.5, 'rgba(0,230,195,' + (0.1 + energy * 0.3 + breathe1 * 0.05).toFixed(3) + ')');
+      cg2.addColorStop(1, 'rgba(0,230,195,0)');
       ctx.fillStyle = cg2;
       ctx.beginPath(); ctx.arc(cx, cy, coreR, 0, Math.PI * 2); ctx.fill();
 

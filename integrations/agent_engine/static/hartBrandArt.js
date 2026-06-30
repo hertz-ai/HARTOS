@@ -38,7 +38,7 @@
     violet: '#9B5CFF', magenta: '#FF2E9A', amber: '#FFC83D'
   };
   // The canonical deep ink the tiles darken toward (keeps glyph/text legible).
-  var INK = [9, 13, 22];
+  var INK = [14, 14, 17];   // neutral near-black; NOT navy, so blending toward it does not blue-shift the hue
 
   function mod(n, m) { return ((n % m) + m) % m; }
   function hexAt(i) { return SPECTRUM_HEX[SPECTRUM[mod(i | 0, SPECTRUM.length)]]; }
@@ -77,8 +77,8 @@
     seed = seed | 0;
     var base = baseRgb(baseHex, seed);
     var second = baseHex ? base : (rgbOf(hexAt(seed + 2)) || base);
-    var dark = blend(base, INK, 0.72);     // primary (darker) stop
-    var light = blend(second, INK, 0.52);  // neighbour (lighter) stop
+    var dark = blend(base, INK, 0.60);     // primary (darker) stop - keep enough base hue that teal/cyan/blue/violet/magenta/amber stay DISTINCT (was 0.72, which crushed every hue to navy)
+    var light = blend(second, INK, 0.34);  // neighbour (lighter) stop - the hue clearly reads here
     var ang = [135, 150, 165][mod(seed, 3)];
     return 'linear-gradient(' + ang + 'deg,' + rgbCss(light) + ',' + rgbCss(dark) + ')';
   }

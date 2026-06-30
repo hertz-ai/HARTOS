@@ -73,6 +73,16 @@ This is the steward's most-repeated structural rule. Capture every nuance.
   not "palette slapped".
   - *"WHY MONOCHROMATIC?"* `[#1720]`
   - *"NOT PALLETE IT SHD BE LIKE A REAL DESKTOP WHICH OUR ORIGINA VERSIO N HAD"* `[#1721]`
+- **b1.1 Teal/violet brand ANCHORS over spectrum cards (reconciliation, 2026-06-30). APPLIED.**
+  Real-HW regression: the home rendered a single-hue BLUE wash (orb, cards, earnings, CTA, logo all
+  blue) - neither the mockup brand NOR the spectrum. Roots: the orb hardcoded `#6C63FF` indigo;
+  `hartBrandArt.gradient` crushed every hue toward navy INK `[9,13,22]`; the amount/CTA leaned
+  cyan/blue; the wordmark was plain. FIX: orb -> teal `#00E6C3` (render-confirmed); INK neutralised
+  to `[14,14,17]` + less crush (0.72->0.60, 0.52->0.34) so each hue reads distinct; earnings -> solid
+  teal + glow; CTA -> bright-teal; `"HART"`(teal)+`"OS"`(violet `#9B5CFF`) wordmark split. Does NOT
+  regress b1: brand ANCHORS are teal/violet (logo, eyebrow, earnings, CTA, orb); CARDS keep the full
+  SPECTRUM (now visible per card, no navy crush) - exactly how the steward mockup is built.
+  - *steward 2026-06-30: "HARTOS color in this html is not used?" + "this is how it looks now" (blue-wash screenshots)*
 - **b2. Netflix-Home aesthetic, image-RICH ("lots of images").** Image cards,
   text-over-art with gradient scrims, varied formats (landscape / portrait /
   square / wide / live), content sourced/inferred from news + web, dynamic-website

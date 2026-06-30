@@ -101,10 +101,11 @@
   font-weight: 800;
   letter-spacing: -2px;
   font-variant-numeric: tabular-nums;
-  background: linear-gradient(90deg, var(--hh-teal), var(--hh-cyan) 52%, var(--hh-blue));
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  /* Solid brand TEAL (matches the mockup) + a teal glow. NOT a teal->cyan->blue
+     gradient-clip: the glyphs sat in the cyan/blue half and read "blue", and
+     -webkit-background-clip:text is fragile in the old cage WebKit (transparent => invisible). */
+  color: var(--hh-teal);
+  text-shadow: 0 0 24px rgba(0, 230, 195, 0.35);
 }
 .hh-amount-unit {
   font-size: 26px;
@@ -191,8 +192,9 @@
 .hh-btn .mi { font-size: 20px; }
 .hh-btn-primary {
   color: #04140F;
-  /* flat spectrum gradient (no blur, software-safe) */
-  background: linear-gradient(135deg, var(--hh-teal), var(--hh-cyan));
+  /* bright teal -> brand teal (the mockup CTA). NOT teal->cyan: cyan #29C5FF dominated the
+     small button and read "blue". Stays software-safe (flat gradient, no blur). */
+  background: linear-gradient(135deg, #5CFFD9, var(--hh-teal));
 }
 
 /* ============================ ROWS REGION ============================ */

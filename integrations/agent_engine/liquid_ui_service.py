@@ -2319,7 +2319,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <div class="top-bar glass" role="banner">
   <div class="start-btn" role="button" tabindex="0" aria-haspopup="menu" aria-label="Start menu" onclick="toggleStartMenu()" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Start Menu (Super)">
     <img src="/shell/static/hevolve-logo.png" class="start-logo" alt="" aria-hidden="true" draggable="false">
-    <span>HART OS</span>
+    <span class="hart-wordmark"><b style="color:#00E6C3;font-weight:800">HART</b> <span style="color:#9B5CFF;font-weight:700">OS</span></span>
   </div>
   <nav class="top-bar-nav" role="navigation" aria-label="Primary">
     <button class="tb-tab tb-active" type="button" data-tab="home" onclick="if(window.HartHomeNav)HartHomeNav('home')">Home</button>
