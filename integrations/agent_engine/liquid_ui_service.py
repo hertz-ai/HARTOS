@@ -2534,6 +2534,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script defer src="/shell/static/lottie.min.js"></script>
 <script defer src="/shell/static/hartBootSplash.js"></script>
 <script defer src="/shell/static/hartSession.js"></script>
+<script defer src="/shell/static/hartOSBridge.js"></script>
 <script defer src="/shell/static/voiceOrbViz.js"></script>
 <script defer src="/shell/static/hartHero.js"></script>
 <!-- Assembled Netflix HOME (W1): the value-first cinematic canvas. Loaded after
@@ -6855,10 +6856,18 @@ function renderAgentOverlay(ev) {{
                 register_shell_system_routes)
             from integrations.agent_engine.app_installer import (
                 register_app_install_routes)
+            # Typed native OS-bridge (#133/W3): POST /api/os/invoke + /api/os/contract
+            # + /api/os/power/capabilities. The forward path for the WebView SDK
+            # (hartOSBridge.js); it reuses shell_os_apis auth/audit + os_bridge.power
+            # (one dispatch, no parallel path). The old /api/shell/power/action stays
+            # as the backward-compat surface.
+            from integrations.agent_engine.os_bridge.routes import (
+                register_os_bridge_routes)
             register_shell_os_routes(app)
             register_shell_desktop_routes(app)
             register_shell_system_routes(app)
             register_app_install_routes(app)
+            register_os_bridge_routes(app)
         except Exception as e:
             logger.warning("Shell APIs registration: %s", e)
 
