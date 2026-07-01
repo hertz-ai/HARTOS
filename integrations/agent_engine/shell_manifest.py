@@ -335,6 +335,18 @@ DYNAMIC_PANELS = {
 # ═══════════════════════════════════════════════════════════════
 
 SYSTEM_PANELS = {
+    # Settings — NOT a new settings app. This is the aggregator surface: its
+    # native renderer (liquid_ui_service.loadSettingsPanel) draws a categorized
+    # index whose every tile OPENS AN EXISTING panel via openPanel (single-
+    # instance reuse). The section->ids composition lives in SETTINGS_SECTIONS
+    # (below), so there is no parallel settings implementation - just a composed
+    # view of the registry. 'preferences'/'control panel' intuitive names surface
+    # via the title token 'Settings'.
+    'settings': {
+        'title': 'Settings', 'icon': 'settings',
+        'group': 'System', 'default_size': [860, 640],
+        'apis': [],
+    },
     'hw_monitor': {
         'title': 'Hardware Monitor', 'icon': 'monitor_heart',
         'group': 'System', 'default_size': [700, 500],
@@ -866,6 +878,68 @@ def get_all_panels():
     combined = dict(PANEL_MANIFEST)
     combined.update(SYSTEM_PANELS)
     return combined
+
+
+# ═══════════════════════════════════════════════════════════════
+# Settings aggregator — compose the registry, do NOT re-declare panels
+# ═══════════════════════════════════════════════════════════════
+# The Settings panel is a categorized INDEX over panels that already exist in
+# SYSTEM_PANELS / PANEL_MANIFEST. Each id below MUST resolve in get_all_panels()
+# (get_settings_sections filters out any that don't, so a section never links a
+# dead surface) and the Settings renderer opens each via openPanel (single-
+# instance reuse). This is the ONE source for the settings composition; the shell
+# JS resolves each id's title/icon/colour from the live manifest, never a copy.
+SETTINGS_SECTIONS = [
+    ('Personalization', ['appearance', 'wallpaper_manager', 'sound_manager',
+                         'nightlight', 'font_manager', 'workspaces']),
+    ('Network & Internet', ['network', 'wifi_manager', 'vpn_manager',
+                            'bluetooth_manager', 'hotspot', 'dns_settings']),
+    ('Devices', ['display', 'audio', 'power', 'storage_manager', 'devices',
+                 'drivers', 'print_manager', 'screen_rotation']),
+    ('Privacy & Security', ['security', 'firewall', 'privacy', 'app_permissions',
+                            'accessibility']),
+    ('Accounts', ['user_accounts', 'hart_identity']),
+    ('Apps', ['app_store', 'default_apps', 'startup_apps']),
+    ('Time & Language', ['datetime', 'i18n', 'input_methods',
+                         'keyboard_shortcuts']),
+    ('Update & Backup', ['updates', 'auto_update', 'backup_restore',
+                         'cloud_sync', 'self_build']),
+]
+
+
+def get_settings_sections():
+    """Composition only: ``[{'title': str, 'ids': [existing panel id, ...]}]``.
+
+    Filters each section's ids to those actually present in get_all_panels() so
+    the Settings index never references a panel that does not exist, and drops a
+    whole section if it ends up empty. Returns ONLY the id composition — the
+    panel metadata (title/icon/colour) is resolved by the caller from the live
+    manifest, so there is no duplicated panel definition here.
+    """
+    known = get_all_panels()
+    out = []
+    for title, ids in SETTINGS_SECTIONS:
+        present = [i for i in ids if i in known]
+        if present:
+            out.append({'title': title, 'ids': present})
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════
+# Start-menu PINNED row (Windows-style curated pins at the top)
+# ═══════════════════════════════════════════════════════════════
+# A small curated set surfaced above the grouped app list. Each id MUST exist in
+# the combined manifest; get_pinned_panels filters to present ids so a pin never
+# dangles. Single source for the pin order; the start menu resolves each id's
+# metadata from the live manifest.
+PINNED_PANEL_IDS = ['feed', 'agents_browse', 'assistant', 'app_store',
+                    'file_manager', 'terminal', 'settings']
+
+
+def get_pinned_panels():
+    """Ordered list of pinned panel ids that actually exist in get_all_panels()."""
+    known = get_all_panels()
+    return [i for i in PINNED_PANEL_IDS if i in known]
 
 
 def resolve_dynamic_panel(panel_type, **params):

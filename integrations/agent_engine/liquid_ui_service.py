@@ -1243,7 +1243,7 @@ class LiquidUIService:
         try:
             from integrations.agent_engine.shell_manifest import (
                 PANEL_MANIFEST, DYNAMIC_PANELS, SYSTEM_PANELS, PANEL_GROUPS,
-                with_icon_colors)
+                with_icon_colors, get_settings_sections, get_pinned_panels)
             # Merge in installed apps (DESKTOP_APP/EXTENSION the app-installer
             # auto-registered) so their desktop icons survive a page refresh:
             # hartDesktop.render() only shows ids present in window.MANIFEST.
@@ -1267,10 +1267,18 @@ class LiquidUIService:
             manifest_json = json.dumps(with_icon_colors(panels)).replace('</', '<\\/')
             system_json = json.dumps(with_icon_colors(SYSTEM_PANELS)).replace('</', '<\\/')
             groups_json = json.dumps(PANEL_GROUPS).replace('</', '<\\/')
+            # W4 Start-menu pins + Settings aggregator — composition only (lists
+            # of EXISTING panel ids). The shell JS resolves each id's metadata
+            # from the live MANIFEST/SYSTEM_PANELS above, so no panel is redefined
+            # here (single source = shell_manifest).
+            settings_sections_json = json.dumps(get_settings_sections()).replace('</', '<\\/')
+            pinned_json = json.dumps(get_pinned_panels()).replace('</', '<\\/')
         except Exception:
             manifest_json = '{}'
             system_json = '{}'
             groups_json = '[]'
+            settings_sections_json = '[]'
+            pinned_json = '[]'
 
         # CSS animations — defined outside f-string to avoid brace conflicts
         _CSS_SLIDE_IN = '@keyframes slideInRight{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}'
@@ -2732,6 +2740,12 @@ const MANIFEST = {manifest_json};
 window.MANIFEST = MANIFEST;
 const SYSTEM_PANELS = {system_json};
 const GROUPS = {groups_json};
+// W4 Start-menu PINNED ids + Settings aggregator sections (composition only —
+// each is a list of EXISTING panel ids from shell_manifest). buildStartMenu and
+// loadSettingsPanel resolve each id's metadata from MANIFEST/SYSTEM_PANELS above,
+// so there is no second copy of any panel definition (single source).
+const PINNED = {pinned_json};
+const SETTINGS_SECTIONS = {settings_sections_json};
 // The Nunba React dist is a no-basename BrowserRouter (history) SPA served at
 // the ORIGIN ROOT of this shell (see _create_flask_app: /static passthrough +
 // the SPA history fallback). The manifest routes already carry a leading slash
@@ -3177,6 +3191,21 @@ try {{ refreshAgentStatus(); }} catch(e) {{ console.error('[HART] refreshAgentSt
 function buildStartMenu() {{
   const scroll = document.getElementById('start-scroll');
   let html = '';
+  // Pinned (curated, top) — resolves each id from the live manifest and opens
+  // via openPanel (single-instance reuse), same as every other start item.
+  const pins = (PINNED||[]).map(function(id){{
+    return [id, MANIFEST[id] || SYSTEM_PANELS[id]];
+  }}).filter(function(pair){{ return !!pair[1]; }});
+  if(pins.length) {{
+    html += '<div class="start-group" data-group="Pinned"><div class="start-group-label">Pinned</div><div class="start-grid">';
+    pins.forEach(function(pair){{
+      const id = pair[0], p = pair[1];
+      html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(this.dataset.id)">';
+      html += '<span class="mi material-icons-round"'+miStyle(p)+'>'+(p.icon||'apps')+'</span>';
+      html += '<span class="label">'+p.title+'</span></div>';
+    }});
+    html += '</div></div>';
+  }}
   GROUPS.forEach(group => {{
     const items = Object.entries(MANIFEST).filter(([_,v])=>v.group===group);
     if(!items.length) return;
@@ -3588,7 +3617,8 @@ function loadSystemPanel(id, body) {{
   body.innerHTML = '<div class="native-content" id="sys-'+id+'">'+dsSkeleton('panel',3)+'</div>';
   const container = document.getElementById('sys-'+id);
 
-  if(id==='hw_monitor') loadHardwareMonitor(container, apis);
+  if(id==='settings') loadSettingsPanel(container);
+  else if(id==='hw_monitor') loadHardwareMonitor(container, apis);
   else if(id==='security') loadSecurityCenter(container, apis);
   else if(id==='network') loadNetworkPanel(container, apis);
   else if(id==='event_log') loadEventLog(container, apis);
@@ -3642,6 +3672,58 @@ function loadSystemPanel(id, body) {{
   else if(id==='keyboard_shortcuts') loadKeyboardShortcutsPanel(container);
   else if(id==='credits') loadCreditsPanel(container);
   else container.innerHTML = '<div class="ds-body-md ds-text-muted">Panel: '+id+'</div>';
+}}
+
+// ═══ Settings (aggregator) ═══
+// NOT a new settings app: a categorized INDEX whose every tile OPENS AN EXISTING
+// panel via openPanel (single-instance reuse). SETTINGS_SECTIONS is composition
+// only (section -> existing panel ids, from shell_manifest); each id's title /
+// icon / colour is resolved here from the live MANIFEST/SYSTEM_PANELS, so no
+// panel definition is duplicated. A search box filters the tiles in place, the
+// same data-title convention the start menu uses.
+function loadSettingsPanel(el) {{
+  const sections = SETTINGS_SECTIONS || [];
+  let html = '<div class="ds-panel-grid ds-fade-in settings-root">'+
+    '<div class="ds-panel-title">Settings</div>'+
+    '<input class="start-search settings-search" id="settings-search" placeholder="Search settings..." '+
+      'oninput="filterSettings(this.value)" aria-label="Search settings">';
+  sections.forEach(function(sec){{
+    const ids = (sec.ids||[]).filter(function(id){{ return !!(MANIFEST[id]||SYSTEM_PANELS[id]); }});
+    if(!ids.length) return;
+    html += '<div class="settings-section" data-section="'+sec.title+'">'+
+      '<div class="ds-section-label">'+sec.title+'</div><div class="start-grid">';
+    ids.forEach(function(id){{
+      const p = MANIFEST[id] || SYSTEM_PANELS[id] || {{}};
+      const t = p.title || id;
+      html += '<div class="start-item settings-tile" data-id="'+id+'" data-title="'+t+'" '+
+        'onclick="openPanel(this.dataset.id)">';
+      html += '<span class="mi material-icons-round"'+miStyle(p)+'>'+(p.icon||'settings')+'</span>';
+      html += '<span class="label">'+t+'</span></div>';
+    }});
+    html += '</div></div>';
+  }});
+  if(!sections.length) {{
+    html += '<div class="ds-body-md ds-text-muted">No settings available.</div>';
+  }}
+  html += '</div>';
+  el.innerHTML = html;
+}}
+
+// Filter Settings tiles in place (hides empty sections) — mirrors filterStart.
+function filterSettings(q) {{
+  const root = document.querySelector('.settings-root');
+  if(!root) return;
+  const lq = (q||'').toLowerCase();
+  root.querySelectorAll('.settings-section').forEach(function(sec){{
+    let anyVisible = false;
+    sec.querySelectorAll('.settings-tile').forEach(function(el){{
+      const title = (el.dataset.title||'').toLowerCase();
+      const show = title.includes(lq);
+      el.style.display = show ? '' : 'none';
+      if(show) anyVisible = true;
+    }});
+    sec.style.display = anyVisible ? '' : 'none';
+  }});
 }}
 
 // Backward compat wrappers (used in old code references)
