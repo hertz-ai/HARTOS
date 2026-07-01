@@ -51,15 +51,50 @@ def register_onboarding_routes(app):
     @app.route('/api/onboarding/advance', methods=['POST'])
     def _onboarding_advance():
         from flask import request, jsonify
-        from hart_onboarding import get_or_create_session, remove_session
+        from hart_onboarding import (
+            get_or_create_session, remove_session,
+            has_hart_name, get_hart_profile,
+        )
 
         data = request.get_json(silent=True) or {}
         user_id = data.get('user_id', '1')
         action = data.get('action')
         action_data = data.get('data', {})
 
+        # #167 — "accept the name" must never be a dead no-op. Accepting the
+        # generated name seals it into the profile and sends the shell to the
+        # desktop. If this user is already sealed (a completed session was
+        # cleaned up, or the accept was re-sent / double-clicked), there is no
+        # live reveal-phase session to walk — a fresh session would sit at the
+        # 'language' phase and swallow the accept. Short-circuit to an
+        # idempotent success read straight from the canonical seal readers, so
+        # a re-accept resolves to the sealed identity and advances to the
+        # desktop instead of silently doing nothing.
+        if action == 'accept_name' and has_hart_name(user_id):
+            profile = get_hart_profile(user_id)
+            remove_session(user_id)
+            return jsonify({
+                'success': True,
+                'phase': 'sealed',
+                'name_sealed': True,
+                'sealed': True,
+                'goto_desktop': True,
+                'profile': profile,
+                'hart_name': (profile or {}).get('name'),
+            })
+
         session = get_or_create_session(user_id)
         result = session.advance(action=action, data=action_data)
+
+        # A fresh accept that just sealed the name: surface the sealed profile
+        # and tell the shell to advance to the desktop. The companion pre-fetch
+        # (kicked off by the FSM) keeps running in the background and never
+        # blocks the ceremony — so the reveal resolves straight to the desktop.
+        if action == 'accept_name' and result.get('name_sealed'):
+            profile = get_hart_profile(user_id)
+            if profile:
+                result['profile'] = profile
+            result['goto_desktop'] = True
 
         # Clean up completed sessions
         if result.get('sealed'):
