@@ -206,24 +206,7 @@
     if (go) go.addEventListener('click', function () { dispatch(input.value); });
     // Clicking (or keyboard-activating) the orb toggles voice — the orb IS the
     // voice interface. role="button" + tabindex make it keyboard-reachable.
-    //
-    // #123 (W9 realtime voice): the orb click-to-talk is the FRONT of the voice
-    // turn — it starts/stops the mic through the shell's canonical window.toggleVoice
-    // (MediaRecorder -> POST /api/voice -> model_bus _route_stt -> the agent -> the
-    // reply is spoken via speakText -> model_bus _route_tts). talk() is the single
-    // entry the orb click, the keyboard activation AND window.HartHeroTalk all funnel
-    // through, so a brain/A2UI nudge can begin a voice turn without a second mic path
-    // (mirrors HartOrbWake's read-surface convention). It NEVER reimplements STT/TTS —
-    // it only kicks the existing pipeline. Old-WebKit-safe: no template literals.
-    function talk() {
-      wake();  // full presence the instant we start a turn
-      if (typeof window.toggleVoice === 'function') { window.toggleVoice(); return true; }
-      return false;
-    }
-    var speak = talk;   // keep the local name the orb handlers already use
-    // Read surface so other shell modules / the brain can start a voice turn
-    // without reaching into our internals (single entry, no parallel mic path).
-    window.HartHeroTalk = talk;
+    function speak() { if (typeof window.toggleVoice === 'function') window.toggleVoice(); }
 
     // ── FIX B: breathing on/off. applyBreathing is the single MUTATOR (persist +
     // apply); syncBreathing applies the CURRENT pref WITHOUT persisting (used at init

@@ -759,96 +759,6 @@ class ModelBusService:
             'backend': 'stub',
         }
 
-    # ─── Realtime Voice Turn (recognition -> agent -> spoken reply) ──
-    # #123 (W9): the ONE bus-level primitive that composes a full spoken turn
-    # from the SAME three routes any single-mode caller already uses — STT
-    # (_route_stt), the agent (LLM route, which reaches the agent_engine /chat
-    # backend), then TTS (_route_tts). It reimplements NONE of them: it chains
-    # the existing public infer() path so guardrails, the concurrency semaphore
-    # and the inference.completed events all still fire per stage. This is what a
-    # native/socket/robot client (no browser, no acSend) calls to "talk" to the
-    # OS; the web shell composes the same three primitives itself.
-
-    def voice_turn(
-        self,
-        audio_path: str = '',
-        options: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Run a full spoken turn: audio -> transcript -> reply -> spoken audio.
-
-        Args:
-            audio_path: Path to the recorded utterance (WAV/webm/…). Required.
-            options: Shared options forwarded to each stage — ``language`` (STT +
-                TTS), ``voice``/``voice_audio`` (TTS), ``user_id``/``request_id``
-                (routing status), ``max_tokens`` (agent), ``speak`` (default True
-                — set False for a text-only turn, no TTS synthesis).
-
-        Returns:
-            ``{'transcript', 'response', 'audio_path', 'stt_model', 'agent_model',
-            'tts_model', 'backend'}`` on success, or ``{'error', 'stage', …}`` if a
-            stage failed (stage ∈ {'stt','agent','tts'}). Never raises.
-        """
-        options = dict(options or {})
-        uid = options.get('user_id', '')
-        rid = options.get('request_id', '')
-        if not audio_path:
-            return {'error': 'audio_path required for a voice turn', 'stage': 'stt'}
-
-        # 1) RECOGNITION — reuse the STT route (whisper) via the public infer path.
-        stt_opts = dict(options)
-        stt_opts['audio_path'] = audio_path
-        _publish_routing_status(uid, 'Listening…', rid)
-        stt = self.infer(model_type=ModelType.STT, prompt='', options=stt_opts)
-        transcript = (stt.get('response') or '').strip()
-        if stt.get('error') or not transcript:
-            return {
-                'error': stt.get('error') or 'No speech recognized',
-                'stage': 'stt',
-                'transcript': transcript,
-            }
-
-        # 2) AGENT — route the transcript through the LLM path (local llama, mesh,
-        # or the HART /chat agent_engine backend — the bus picks the live one).
-        _publish_routing_status(uid, 'Thinking…', rid)
-        agent = self.infer(model_type=ModelType.LLM, prompt=transcript,
-                           options=options)
-        reply = (agent.get('response') or '').strip()
-        if agent.get('error') or not reply:
-            return {
-                'error': agent.get('error') or 'Agent produced no reply',
-                'stage': 'agent',
-                'transcript': transcript,
-            }
-
-        result: Dict[str, Any] = {
-            'transcript': transcript,
-            'response': reply,
-            'audio_path': '',
-            'stt_model': stt.get('model', ''),
-            'agent_model': agent.get('model', ''),
-            'tts_model': '',
-            'backend': agent.get('backend', ''),
-        }
-
-        # 3) RESPONSE (spoken) — reuse the TTS route. Optional: a text-only turn
-        # (speak=False) still returns the transcript + reply, just no audio.
-        if options.get('speak', True):
-            _publish_routing_status(uid, 'Speaking…', rid)
-            tts_opts = dict(options)
-            tts_opts.pop('audio_path', None)  # never leak the input path into TTS
-            tts_opts.setdefault('source', 'chat_response')
-            tts = self.infer(model_type=ModelType.TTS, prompt=reply,
-                             options=tts_opts)
-            if not tts.get('error'):
-                result['audio_path'] = tts.get('response', '')
-                result['tts_model'] = tts.get('model', '')
-            else:
-                # A failed voice-out never fails the turn — the caller still has
-                # the transcript + text reply to render/read aloud client-side.
-                result['tts_error'] = tts.get('error')
-
-        return result
-
     # ─── Guardrail Gate ──────────────────────────────────────
 
     def _check_guardrails(self, prompt: str, model_type: str) -> bool:
@@ -998,11 +908,6 @@ class ModelBusService:
                 return self.infer(
                     model_type=payload.get('model_type', ModelType.LLM),
                     prompt=payload.get('prompt', ''),
-                    options=payload.get('options') or {},
-                )
-            if op in ('voice_turn', 'voice'):
-                return self.voice_turn(
-                    audio_path=payload.get('audio_path', ''),
                     options=payload.get('options') or {},
                 )
             return {'error': f'unknown op: {op}'}
@@ -1179,27 +1084,6 @@ class ModelBusService:
                     result = self.infer(ModelType.STT, '', {'audio_path': f.name})
             else:
                 result = {'error': 'No audio provided'}
-            return jsonify(result)
-
-        @app.route('/v1/voice_turn', methods=['POST'])
-        def voice_turn():
-            # Full spoken turn for native/socket/robot clients: recognition ->
-            # agent -> spoken reply, all through the shared routes (#123). Accepts
-            # either a multipart 'audio' upload or a JSON {'audio_path': ...}.
-            audio = request.files.get('audio')
-            if audio:
-                import tempfile
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as f:
-                    audio.save(f)
-                    audio_path = f.name
-                opts = {k: v for k, v in request.form.items()}
-                result = self.voice_turn(audio_path=audio_path, options=opts)
-            else:
-                data = request.get_json(force=True, silent=True) or {}
-                result = self.voice_turn(
-                    audio_path=data.get('audio_path', ''),
-                    options={k: v for k, v in data.items() if k != 'audio_path'},
-                )
             return jsonify(result)
 
         @app.route('/v1/models', methods=['GET'])
