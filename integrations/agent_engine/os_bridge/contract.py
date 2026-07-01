@@ -85,12 +85,56 @@ _POWER_OPS = {
         capability='firmware_setup'),
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# IMPLEMENTED domain: apps (cross-subsystem app-integration bridge, #117 / W3)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The typed surface for the app-integration SDK. ``launch`` routes to the EXISTING
+# cross-subsystem dispatch in app_bridge_service (gtk-launch for linux, Wine for
+# windows, Android ``am`` for android) — declarative OpSpecs only, NO new IPC.
+# ``list`` / ``focus`` / ``close`` reuse the canonical window-manager client
+# (hart_wm_client) so there is ONE window-op path (``close`` stays the fail-closed
+# constitutional gate). Every op is result-checked — a non-zero launcher exit or a
+# refused close surfaces ``ok:false``, never a masked success.
+
+_APPS_OPS = {
+    'launch': OpSpec(
+        'launch',
+        'Launch an installed app by id (cross-subsystem).',
+        params=(
+            OpParam('app_id', 'string', required=True,
+                    summary='Desktop/app id: a gtk .desktop id (linux), a Wine exe '
+                            '(windows), or an Android activity/package (android).'),
+            OpParam('subsystem', 'string', required=False,
+                    choices=('linux', 'windows', 'android'),
+                    summary='Which subsystem launcher to use (default: linux).'),
+        )),
+    'list': OpSpec('list', 'List the currently open app windows.'),
+    'focus': OpSpec(
+        'focus',
+        'Focus/raise an open window by its compositor window id.',
+        params=(OpParam('window_id', 'int', required=True,
+                        summary='Compositor con_id of the window to focus.'),)),
+    'close': OpSpec(
+        'close',
+        'Close an open window by its compositor window id.',
+        params=(OpParam('window_id', 'int', required=True,
+                        summary='Compositor con_id of the window to close.'),),
+        destructive=True),
+}
+
+
 # The one registry of IMPLEMENTED domains -> {op_name: OpSpec}. The router in
 # routes.py dispatches only these; anything else is unknown (400) or planned (501).
 _DOMAINS = {
     'power': {
         'native_backend': 'org.freedesktop.login1 (logind D-Bus)',
         'ops': _POWER_OPS,
+    },
+    'apps': {
+        'native_backend': 'app_bridge_service (gtk-launch / Wine / Android am) + '
+                          'hart_wm_client (com.hart.Compositor window ops)',
+        'ops': _APPS_OPS,
     },
 }
 

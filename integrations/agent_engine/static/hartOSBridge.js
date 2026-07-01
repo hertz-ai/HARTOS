@@ -80,10 +80,41 @@
     }
   };
 
+  /* ── apps domain (cross-subsystem launch via app_bridge; window ops via the WM) ── */
+  var apps = {
+    /**
+     * Launch an installed app by id. Resolves on the OS accepting the launch,
+     * REJECTS on a launcher failure (never a masked success).
+     * @param {string} appId      gtk .desktop id / Wine exe / Android activity
+     * @param {string} [subsystem] 'linux' (default) | 'windows' | 'android'
+     * @returns {Promise<object>}
+     */
+    launch: function (appId, subsystem) {
+      var params = { app_id: appId };
+      if (subsystem) { params.subsystem = subsystem; }
+      return invoke('apps', 'launch', params);
+    },
+    /** List the currently open app windows. @returns {Promise<object>} */
+    list: function () { return invoke('apps', 'list'); },
+    /**
+     * Focus/raise an open window by its compositor window id.
+     * @param {number} windowId  compositor con_id
+     * @returns {Promise<object>}
+     */
+    focus: function (windowId) { return invoke('apps', 'focus', { window_id: windowId }); },
+    /**
+     * Close an open window by its compositor window id (fail-closed gated OS-side).
+     * @param {number} windowId  compositor con_id
+     * @returns {Promise<object>}
+     */
+    close: function (windowId) { return invoke('apps', 'close', { window_id: windowId }); }
+  };
+
   var hartOS = {
     /** Low-level typed dispatcher (domain, op, params) -> Promise. */
     invoke: invoke,
     power: power,
+    apps: apps,
     /**
      * The self-describing op manifest (implemented + planned domains). Lets the UI
      * render only the ops the OS actually implements + an honest "not yet" for the

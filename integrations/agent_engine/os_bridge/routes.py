@@ -30,6 +30,7 @@ def register_os_bridge_routes(app):
     from integrations.agent_engine.os_bridge import contract as _contract
     from integrations.agent_engine.os_bridge.power import (
         invoke_power, power_capabilities)
+    from integrations.agent_engine.os_bridge.apps import invoke_apps
     # Reuse the shell's local-only auth + audit (DRY — one auth path, one log).
     from integrations.agent_engine.shell_os_apis import (
         _require_shell_auth, _audit_shell_op)
@@ -82,9 +83,14 @@ def register_os_bridge_routes(app):
             status, payload = invoke_power(op, cleaned_or_err)
             return jsonify(payload), status
 
-        # Unreachable: get_op only returns specs for implemented domains, and the
-        # only implemented domain is 'power'. Kept as a fail-closed guard.
+        if domain == 'apps':
+            status, payload = invoke_apps(op, cleaned_or_err)
+            return jsonify(payload), status
+
+        # Unreachable: get_op only returns specs for implemented domains (power,
+        # apps). Kept as a fail-closed guard against a future domain wired into the
+        # contract without a handler branch here.
         return jsonify({'ok': False, 'domain': domain, 'op': op,
                         'error': 'no native handler for domain'}), 500
 
-    logger.info("Registered os_bridge routes (typed Shell<->OS bridge: power)")
+    logger.info("Registered os_bridge routes (typed Shell<->OS bridge: power, apps)")
