@@ -161,6 +161,15 @@
   function start() {
     tick(); setInterval(tick, 1000);
     mountWidgets();
+    // #166: the SERVER seeds #lock-screen.active at first paint when a lock
+    // password exists, so the opaque overlay covers the desktop from frame 1
+    // (no FOUC). If we booted into that locked state, focus the field so the
+    // user can type their password immediately — same overlay, same unlock path.
+    var bootLock = $('lock-screen');
+    if (bootLock && bootLock.classList.contains('active')) {
+      var bootPw = $('lock-pw');
+      if (bootPw) setTimeout(function () { try { bootPw.focus(); } catch (e) {} }, 60);
+    }
     // First-run: if onboarding is already done but no lock password exists yet,
     // offer to set one. hartOnboarding.js removes .onboarding-active when it
     // finishes; we wait for that, then prompt once.

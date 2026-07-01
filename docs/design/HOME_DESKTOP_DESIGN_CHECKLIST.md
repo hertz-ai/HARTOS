@@ -315,6 +315,17 @@ This is the steward's most-repeated structural rule. Capture every nuance.
 - **f3. Right-click CONTEXT MENUS like Windows** (on desktop, icons, app store
   entries), canonical (retire any duplicate `#ctx-menu`).
   - *"context menu like windows?"* `[#1368]`
+- **f3a. UNIFIED IN-PLACE NAVIGATION (hartNav) — one surface, navigated; not many
+  windows stacked.** HARTOS-native surfaces (explorer, Settings, utilities, panels)
+  navigate in place with back / forward / up / breadcrumb over the ONE `openPanel`
+  single-instance registry; reuse-by-default, explicit `openPanel(id,{newInstance:true})`
+  for a deliberate 2nd instance; real EXTERNAL apps stay compositor windows (f5). The
+  `#hart-nav` chrome is UNOBTRUSIVE — hidden until a panel opens, its own fixed layer,
+  never alters the home/fixed-canvas layout (must not regress group (a)). APPLIED
+  2026-07-01 via `static/hartNav.js` (generalises `hartFiles.js` history); absorbs the
+  W8/#122 context-menu canonicalization (f3) as a tracked follow-up.
+  - *"everything open newly shd NOT be a new window ... sensible way to navigate (go
+    back etc) ... ONE unified framework ... simplify the clutter"* `[2026-07-01]`
 - **f4. Everything draggable / movable / rearrangeable; snap to grid; sortable.**
   All shell UI elements (sensory icons, widgets) float and drag like Android
   widgets with transparent bg, in a grid style.

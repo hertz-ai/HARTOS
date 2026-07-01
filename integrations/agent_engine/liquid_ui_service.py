@@ -2184,6 +2184,31 @@ html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
                 '.lg-senses-ghost,.hart-desktop::before{display:none}'
             )
 
+        # ── Boot lock overlay (#166: FOUC + security) ─────────────────────────
+        # The lock is a per-user SHELL lock (hartSessionUI.js / window.HartLock),
+        # persisted in the SAME server-backed session blob the JS reads
+        # (shell_session.json -> key `lock_pw_hash`). When a password IS set the
+        # shell must boot LOCKED, and the overlay has to COVER the desktop from
+        # the very FIRST paint — otherwise the desktop paints for a frame before
+        # hartSessionUI's deferred JS can add `.active` (the reported FOUC / an
+        # information leak of the desktop behind the lock). So we seed `.active`
+        # into the served #lock-screen markup HERE (frame 1), reading the exact
+        # same blob + key the JS lock owns — one source of truth, no parallel
+        # lock state. hartSessionUI.js then focuses the field and drives unlock,
+        # which removes `.active` and reveals the desktop. No password set (fresh
+        # install) => not seeded => normal boot (the first-run setup prompt in
+        # hartSessionUI still offers to create one).
+        boot_locked = False
+        try:
+            _ss_path = os.path.join(self._data_dir, 'shell_session.json')
+            if os.path.isfile(_ss_path):
+                with open(_ss_path, 'r') as _sf:
+                    _ss_blob = json.load(_sf)
+                boot_locked = bool(isinstance(_ss_blob, dict) and _ss_blob.get('lock_pw_hash'))
+        except Exception:
+            boot_locked = False
+        lock_boot_class = ' active' if boot_locked else ''
+
         return f'''<!DOCTYPE html>
 <html lang="en" class="{a11y_cls}" data-multiws="0"><head>
 <meta charset="utf-8">
@@ -2564,6 +2589,13 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script defer src="/shell/static/hartSessionUI.js"></script>
 <link rel="stylesheet" href="/shell/static/hartResponsive.css">
 <script defer src="/shell/static/hartFiles.js"></script>
+<!-- Unified navigation framework (#169): a shell-wide back/forward/breadcrumb
+     history over the openPanel single-instance registry (panel id == location),
+     generalising hartFiles.js's proven navigate/back/forward primitive. Loaded
+     after the inline shell script (which defines openPanel/panels/bringToFront)
+     and after hartFiles.js. Exposes window.HartNav + window.HartNavCore (the
+     pure history/reuse-vs-new core, unit-tested by test_hart_nav.mjs). -->
+<script defer src="/shell/static/hartNav.js"></script>
 <!-- OS connectivity cluster (wifi/bluetooth/battery/volume indicators +
      quick-settings) in the top-bar tray. Loaded after hartStates.js (it reuses
      the designed-state helpers) and hartSession.js (HartTimeoutSignal). Polls
@@ -2614,8 +2646,10 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   </div>
 </div>
 
-<!-- Lock Screen -->
-<div class="lock-screen" id="lock-screen" role="dialog" aria-modal="true" aria-label="Screen locked">
+<!-- Lock Screen. #166: `lock_boot_class` is ' active' when a lock password is
+     already set, so this opaque overlay COVERS the desktop from the first paint
+     (no FOUC / no desktop leak); hartSessionUI.js drives unlock + reveal. -->
+<div class="lock-screen{lock_boot_class}" id="lock-screen" role="dialog" aria-modal="true" aria-label="Screen locked">
   <div class="lock-brand"><img src="/shell/static/hevolve-logo.png" alt="HART OS" draggable="false"><span>HART OS</span></div>
   <div class="lock-clock" id="lock-clock"></div>
   <div class="lock-date" id="lock-date"></div>
@@ -3072,10 +3106,13 @@ function updateTaskbar() {{
   const bar = document.getElementById('taskbar');
   if(!bar) return;
   bar.innerHTML = Object.entries(panels).map(function([id,p]) {{
-    const info = MANIFEST[id] || SYSTEM_PANELS[id] || {{}};
+    // Instance ids ('x#2') have no direct manifest entry — fall back to the base
+    // panel definition for the icon, and prefer the stored per-instance title.
+    const base = (p&&p.base) || (''+id).split('#')[0];
+    const info = MANIFEST[id] || SYSTEM_PANELS[id] || MANIFEST[base] || SYSTEM_PANELS[base] || {{}};
     const active = id===focusedPanel ? 'active' : '';
     const icon = info.icon || 'web_asset';
-    const title = info.title || id;
+    const title = (p&&p.title) || info.title || id;
     return '<div class="taskbar-chip glass '+active+'" data-panel-id="'+id+'" onclick="taskbarClick(this.dataset.panelId)" title="'+title+'">' +
       '<span class="mi material-icons-round"'+miStyle(info)+'>'+icon+'</span>' +
       '<span class="chip-label">'+title+'</span></div>';
@@ -3192,9 +3229,20 @@ function startSearchEnter() {{
 // ═══ Panel Manager ═══
 function openPanel(id, opts) {{
   opts = opts || {{}};
-  // If panel already open, bring to front
+  // Unified navigation (#169): the panels registry is single-instance by
+  // DEFAULT — opening an already-open panel just brings it to front (reuse).
+  // An explicit openPanel(id,{{newInstance:true}}) opts INTO a second instance:
+  // hartNav mints a distinct instance id (base#N) so both coexist, while the
+  // panel definition is still looked up by the BASE id. hartNav also owns the
+  // shell-wide back/forward history keyed by panel id (static/hartNav.js).
+  const baseId = (''+id).split('#')[0];
+  if(opts.newInstance) {{
+    id = (window.HartNav && HartNav.nextInstance) ? HartNav.nextInstance(baseId) : baseId+'#'+Date.now();
+  }}
+  // If panel already open, bring to front (the default reuse policy).
   if(panels[id]) {{
     bringToFront(id);
+    if(window.HartNav) HartNav.onOpen(id, (panels[id]&&panels[id].title)||baseId);
     return;
   }}
   // Potato mode: limit open panels to save memory
@@ -3206,18 +3254,20 @@ function openPanel(id, opts) {{
       if(oldest) closePanel(oldest);
     }}
   }}
-  const def = MANIFEST[id] || SYSTEM_PANELS[id] || {{}};
+  // The panel DEFINITION is keyed by the BASE id (so a second instance 'x#2'
+  // renders the same 'x' panel); the DOM element ids below use the instance id.
+  const def = MANIFEST[baseId] || SYSTEM_PANELS[baseId] || {{}};
   // Installed native app (from the app-installer): no in-shell panel to draw —
   // hand off to the EXISTING launch path (gtk-launch via /api/shell/launch).
   // These entries carry an `exec` and no `route`; everything else falls through
   // to the normal panel render below.
-  if(def.exec && !def.route && !SYSTEM_PANELS[id]) {{
+  if(def.exec && !def.route && !SYSTEM_PANELS[baseId]) {{
     launchApp(def.exec);
     if(startOpen) toggleStartMenu();
     return;
   }}
   const sz = def.default_size || [700,500];
-  const isSystem = !!SYSTEM_PANELS[id];
+  const isSystem = !!SYSTEM_PANELS[baseId];
 
   // Position: cascade from center
   const cx = window.innerWidth/2, cy = window.innerHeight/2;
@@ -3231,7 +3281,7 @@ function openPanel(id, opts) {{
   panel.dataset.panelId = id;
   panel.style.cssText = 'left:'+x+'px;top:'+y+'px;width:'+sz[0]+'px;height:'+sz[1]+'px;z-index:'+(++panelZ);
 
-  const title = opts.title || def.title || id;
+  const title = opts.title || def.title || baseId;
   const icon = def.icon || 'web_asset';
 
   panel.innerHTML = '<div class="panel-titlebar" onmousedown="startDrag(event,_pid(this))"'+
@@ -3252,7 +3302,9 @@ function openPanel(id, opts) {{
   // Load content (potato: defer iframes until visible)
   const body = document.getElementById('panel-body-'+id);
   if(isSystem) {{
-    loadSystemPanel(id, body);
+    // System loader dispatches on the panel TYPE (base id); the body element it
+    // fills is the instance's own (passed directly), so instances stay distinct.
+    loadSystemPanel(baseId, body);
   }} else if(def.route) {{
     if(PERF.lazyIframes) {{
       // Potato: tap-to-load placeholder until focused (keeps memory low), but it
@@ -3269,13 +3321,17 @@ function openPanel(id, opts) {{
     body.innerHTML = '<div class="native-content">Panel: '+id+'</div>';
   }}
 
-  panels[id] = {{el:panel, x, y, w:sz[0], h:sz[1], max:false, min:false}};
+  panels[id] = {{el:panel, x, y, w:sz[0], h:sz[1], max:false, min:false, title:title, base:baseId}};
   // Open MAXIMIZED by default — the glass shell is a full desktop, so panels
   // should fill the workspace (Win/macOS "open large") rather than a tiny
   // cascade window. Floating bubbles (assistant) keep their compact size.
   if(!def.floating && !opts.noMax) applyMax(id);
   bringToFront(id);
   updateTaskbar();
+  // #169: record this location on the shell-wide nav history (panel id == the
+  // location). hartNav loads deferred; openPanel is only called post-load, so
+  // window.HartNav is defined by the time a user opens anything.
+  if(window.HartNav) HartNav.onOpen(id, title);
   if(startOpen) toggleStartMenu();
 }}
 
@@ -3289,6 +3345,9 @@ function closePanel(id) {{
     p.el.remove(); delete panels[id]; updateTaskbar();
   }}
   if(focusedPanel===id) focusedPanel=null;
+  // #169: drop the closed panel from nav history so back/forward never target a
+  // window that no longer exists.
+  if(window.HartNav) HartNav.onClose(id);
 }}
 
 function minimizePanel(id) {{
