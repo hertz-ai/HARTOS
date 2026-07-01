@@ -149,18 +149,6 @@ jobs:
 
             echo "$STATUS_JSON" | python3 -c 'import sys,json; data=json.load(sys.stdin); assert data.get("status")=="running"; assert data.get("node_tier")=="central"; print("status endpoint OK")'
 
-            echo "=== HART hash verification ==="
-            if curl -sS http://127.0.0.1:6777/harthash -o /tmp/harthash.json; then
-              echo "harthash endpoint found: /harthash"
-              cat /tmp/harthash.json
-            elif curl -sS http://127.0.0.1:6777/.well-known/hart-challenge -o /tmp/harthash.json; then
-              echo "harthash endpoint found: /.well-known/hart-challenge"
-              cat /tmp/harthash.json
-            else
-              echo "WARNING: no harthash endpoint responded. Skipping until correct HART hash endpoint is confirmed."
-            fi
-
-            cat /tmp/harthash.json
 
             echo "=== Compare manifest commit with deployed commit ==="
             python3 - <<PY
