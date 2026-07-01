@@ -94,7 +94,7 @@ in
       # ── 0. The interop config + the per-filesystem tooling are in the closure ──
       with subtest("the #145 interop config installed the mkfs tooling + udisks"):
           for tool in ["mkfs.ntfs", "mkfs.exfat", "mkfs.btrfs", "mkfs.ext4",
-                       "mkfs.vfat", "mount", "udisksctl"]:
+                       "mkfs.vfat", "mkfs.xfs", "mkfs.f2fs", "mount", "udisksctl"]:
               fs.succeed(f"command -v {tool}")
           # udisks2 is the on-demand mount authority — activate it via udisksctl
           # (the same D-Bus call the file manager / glass shell make).
@@ -108,14 +108,19 @@ in
           fs.succeed("modprobe ntfs3 2>/dev/null || true")
           fs.succeed("modprobe exfat 2>/dev/null || true")
           fs.succeed("modprobe btrfs 2>/dev/null || true")
+          fs.succeed("modprobe xfs 2>/dev/null || true")
+          fs.succeed("modprobe f2fs 2>/dev/null || true")
           # (fsname, mkfs command, mount type-preference). ntfs prefers the in-kernel
           # ntfs3 RW driver, falling back to the ntfs-3g FUSE helper — both do RW.
+          # xfs + f2fs are the #157 additions (RHEL/Fedora default + flash/Android).
           cases = [
               ("ext4",  "mkfs.ext4 -F -q",   "ext4"),
               ("btrfs", "mkfs.btrfs -f -q",  "btrfs"),
               ("vfat",  "mkfs.vfat -F 32",   "vfat"),
               ("exfat", "mkfs.exfat",        "exfat"),
               ("ntfs",  "mkfs.ntfs -Q -F",   "ntfs3"),
+              ("xfs",   "mkfs.xfs -f -q",    "xfs"),
+              ("f2fs",  "mkfs.f2fs -f",      "f2fs"),
           ]
           for fsname, mkfs, mtype in cases:
               img = f"/tmp/{fsname}.img"
@@ -239,16 +244,16 @@ in
           # cannot go). It must agree with subtest 1 (which actually MOUNTED all 5),
           # i.e. every interop filesystem reports `ok` on this live kernel.
           fs.succeed("command -v hart-storage-fsprobe")
-          for fsname in ["ntfs", "exfat", "vfat", "ext4", "btrfs"]:
+          for fsname in ["ntfs", "exfat", "vfat", "ext4", "btrfs", "xfs", "f2fs"]:
               v = fs.succeed(f"hart-storage-fsprobe --query {fsname}").strip()
               assert v == "ok", \
                   f"{fsname}: probe must report the driver available (subtest 1 mounted it), got {v!r}"
           # The status-file mode (what hart-compat-smoketest calls) appends one
           # honest fs_<name>=<verdict> line per filesystem.
           fs.succeed("rm -f /tmp/compat-status")
-          fs.succeed("hart-storage-fsprobe /tmp/compat-status ntfs exfat vfat ext4 btrfs")
+          fs.succeed("hart-storage-fsprobe /tmp/compat-status ntfs exfat vfat ext4 btrfs xfs f2fs")
           status = fs.succeed("cat /tmp/compat-status")
-          for fsname in ["ntfs", "exfat", "vfat", "ext4", "btrfs"]:
+          for fsname in ["ntfs", "exfat", "vfat", "ext4", "btrfs", "xfs", "f2fs"]:
               assert f"fs_{fsname}=ok" in status, \
                   f"status-file mode must record fs_{fsname}=ok on this kernel: {status!r}"
           # DEGRADE-NOT-DIE: an unknown filesystem is honestly `missing`, never a
@@ -258,6 +263,24 @@ in
               f"an unknown fs must read 'missing' and the probe must exit 0, got {out!r}"
           # And a status-file run with NO filesystem args is a clean no-op (exit 0).
           fs.succeed("hart-storage-fsprobe /tmp/empty-status; echo ok")
+
+      # ── 7. #157 Disk Utility tooling + the boot-time disk-health snapshot ──
+      with subtest("the #157 Disk Utility tooling is on PATH + the disk-health probe writes an honest verdict"):
+          # The format/repair/resize/health tooling hart-storage.nix (#157) adds.
+          for tool in ["mkfs.xfs", "xfs_repair", "xfs_growfs", "mkfs.f2fs",
+                       "fsck.f2fs", "resize.f2fs", "e4defrag", "resize2fs",
+                       "parted", "sgdisk", "smartctl", "nvme", "hdparm", "fstrim"]:
+              fs.succeed(f"command -v {tool}")
+          # The boot-time disk-health snapshot oneshot runs read-only + always exits
+          # 0 + writes an honest per-device verdict to /run/hart/disk-health. Start
+          # it directly (deterministic, independent of greetd ordering) and assert
+          # it produced the ok= header without mounting/writing any disk.
+          fs.succeed("systemctl start hart-disk-health.service")
+          fs.succeed("test -f /run/hart/disk-health")
+          health = fs.succeed("cat /run/hart/disk-health")
+          assert "ok=" in health, \
+              f"disk-health probe must write an ok= verdict line: {health!r}"
+          fs.require_unit_state("multi-user.target", "active")
     '';
   };
 }

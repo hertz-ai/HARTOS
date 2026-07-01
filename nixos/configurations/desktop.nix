@@ -389,6 +389,20 @@ in
     # tests/storage-filesystems.nix.)
     storage.enable = true;
 
+    # ── Memory sanity (#157): compressed-RAM zram swap + graceful systemd-oomd ──
+    # zram is RAM-only (never blocks boot); oomd kills a runaway cgroup not the seat;
+    # swappiness is coordinated up for the zram desktop. LOCAL feature -> ON.
+    memory.enable = true;
+
+    # ── Automatic GPU allocation (#156): hybrid PRIME render-offload ──
+    # Intel iGPU drives the display AND the shell's software floor (unchanged, so the
+    # cairo WebView never flips into the expensive effects tier / reintroduces lag);
+    # the NVIDIA 940MX is armed for heavy-app render-offload (hart-gpu-offload /
+    # prime-run) ONLY when the boot probe proves it present (#132-safe). Degrades to
+    # pure Intel, then the software floor. The native force-load arm
+    # (gpu.offload.specialisation.enable) stays OFF for the portable ISO.
+    gpu.offload.enable = true;
+
     # ── Privacy-first networking + desktop apps (Category-4 LOCAL features) ──
     # Per the privacy-first principle every LOCAL capability ships ON by default
     # (no opt-in friction); nothing here leaves the device without consent.
@@ -408,6 +422,24 @@ in
     firewall.enable = true;
     dns.enable = true;
     email.enable = true;
+
+    # ── Endpoint security (#155; Category-4 LOCAL feature, privacy-first ON) ──
+    #   - ClamAV: clamd LOCAL scanning + freshclam signature updates (the pull is the
+    #     ONLY egress, gated like the fwupd check + the OTA pull).
+    #   - firewall hardening: defense-in-depth kernel sysctls that COMPLEMENT the
+    #     nftables firewall above; purely additive (the shell 6777 / SSH 22 / netdiag
+    #     6699 ports all stay open, asserted at eval + tests/security.nix).
+    #   - OS + application security fixes are delivered over-the-air via hart-ota.
+    security.enable = true;
+
+    # ── Preinstall the curated FOSS gap-fillers (#154) ──
+    # Bake the catalog's preinstall set (VLC, Inkscape, Audacity + the GNOME core,
+    # de-duped against systemPackages) so the App Store shows Open, not a network
+    # Install. The offline catalog route + the Appearance wallpaper fix are already
+    # live in the backend. NOTE: the desktop ISO size ceiling is CI-gated (iso-desktop)
+    # - if the bake overflows ISO9660, flip bakeMissing off; zstd-22 gives headroom.
+    apps.bakeMissing = true;
+    apps.wallpapers = true;
   };
 
   # HART application package

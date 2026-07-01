@@ -135,6 +135,12 @@
       # the ladder exists (adds nothing to server/edge). FAIL-SAFE: missing markers
       # record their fail-safe value, the unit always succeeds (oneshot, exit 0).
       ./modules/hart-display-health.nix
+      # Display management (#158): resolution / per-output scale / font scaling
+      # (GDK_DPI_SCALE + fontconfig dpi from hart.display.fontScale, mkDefault so the
+      # a11y magnifier wins) + multi-monitor via wlr-randr + a never-fail kanshi USER
+      # daemon. Boot-safe, degrade-not-die, no-op on a tier without wlr-output-manager.
+      # hart.display.enable defaults true; the shell_desktop_apis.py backend drives it.
+      ./modules/hart-display.nix
       # sway-as-Tier-1: the proven-in-WSL OS-native windowing session (canonical
       # glass shell under sway) + the hart-swaymsg-shim the brain's HartWmClient
       # drives at Tier-2. Opt-in (hart.swayTier1.enable=false default) -> no-op
@@ -295,6 +301,28 @@
       # hart.netDiag.enable -> pure no-op for every variant; desktop.nix turns it
       # on. Imported so the option exists + tests/net-diag.nix can enable it.
       ./modules/hart-net-diag.nix
+      # Curated FOSS app registry + offline-first App Store / Appearance (#154). Reads
+      # the ONE canonical catalog (modules/hart-app-catalog.json) shared with the Python
+      # backend (app_catalog.py). Default import adds ZERO closure (inert HART_APP_CATALOG
+      # pointer); the preinstall-bake + wallpaper bundle are opt-in (desktop.nix). Every
+      # package is attr-guarded so a renamed nixpkgs attr can never fail eval.
+      ./modules/hart-apps.nix
+      # Endpoint security (#155): ClamAV (clamd + freshclam; signature updates are the
+      # only egress, gated like the fwupd check + OTA pull) + defense-in-depth firewall/
+      # kernel hardening that is purely ADDITIVE to hart-firewall (never strips the shell/
+      # SSH/netdiag ports; an eval assertion enforces it). OFF unless hart.security.enable.
+      ./modules/hart-security.nix
+      # Automatic GPU allocation (#156): hybrid PRIME render-offload. Intel iGPU drives the
+      # display (+ the shell's software floor, unchanged); the NVIDIA dGPU is armed for
+      # heavy-app offload ONLY when a boot probe proves it present (#132-safe; the native
+      # force-load arm stays in an opt-in specialisation). Writes its OWN /run/hart/gpu-
+      # offload verdict, DECOUPLED from the shell's gpu-render, so it can never flip the
+      # WebView shell into the expensive effects tier (no lag regression).
+      ./modules/hart-gpu-offload.nix
+      # Memory sanity (#157): compressed-RAM zram swap (priority 100, never blocks boot) +
+      # graceful systemd-oomd + coordinated swappiness + a boot memory-health snapshot.
+      # Pure no-op unless hart.memory.enable. Companion to the hart-storage disk utilities.
+      ./modules/hart-memory.nix
     ];
 
     # Single source of truth for nixpkgs config (allowUnfree etc.).  Kept OUT of
@@ -761,7 +789,20 @@
       # mis-flap guard + the offline real-HW probe are covered in session-supervisor
       # .nix + boot-log.nix. Distinct attr -> clean //; desktop-variant node (mkNode).
       inputSeatPointer = import ./tests/input-seat-pointer.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // journalExport // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer;
+      # Endpoint security (#155): a desktop node enables hart.security, BOOTS, and proves
+      # the clamd + freshclam units generate, the hardening sysctls took effect, and the
+      # shell (6777) / SSH (22) / netdiag (6699) ports SURVIVE the hardening. Distinct attr.
+      security = import ./tests/security.nix desktopTestArgs;
+      # Automatic GPU offload (#156): the boot probe's armed/intel/software decision + the
+      # prime-offload wrapper env-apply/passthrough, degrade-not-die. Distinct attr.
+      gpuOffload = import ./tests/gpu-offload.nix desktopTestArgs;
+      # Memory sanity (#157): zram active (priority 100), swappiness coordinated to 100,
+      # systemd-oomd active, the boot memory-health snapshot ok=1/zram_present=1. Distinct.
+      memory = import ./tests/memory.nix desktopTestArgs;
+      # Display management (#158): wlr-randr + kanshi ship, the font lever materialises from
+      # hart.display.fontScale, kanshi is a never-fail USER unit, the seed is safe/idempotent.
+      displayManagement = import ./tests/display-management.nix desktopTestArgs;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // journalExport // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)

@@ -11,6 +11,8 @@ import configparser
 import json
 import logging
 import os
+import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -71,6 +73,325 @@ def _save_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Disk Utility (#157) — module-level pure helpers
+#
+# These build/parse the tool surface for format / fsck / defrag / resize / trim /
+# health, kept at module level (not nested in the route fn) so the unit test can
+# import + exercise them directly with a mocked subprocess boundary (Gate 5: no
+# grep tests). Every helper is degrade-safe: a missing tool / unparseable output
+# returns an HONEST empty/false, never raises. The matching NixOS tooling is
+# shipped by hart-storage.nix (#157); these only INVOKE it, and the destructive
+# ops (format/resize) are confirm + auth gated in the routes below.
+# ═══════════════════════════════════════════════════════════════
+
+# Where hart-disk-health.sh (the boot snapshot) writes its per-device SMART
+# verdict. Env-overridable so the test points it at a fixture.
+_DISK_HEALTH_FILE = os.environ.get('HART_DISK_HEALTH_FILE', '/run/hart/disk-health')
+
+# mkfs argv per filesystem (the FORMAT op, DESTRUCTIVE). The 7-FS set matches
+# hart.storage.filesystems. Device is appended at call time; label is optional.
+_FS_FORMAT = {
+    'ext4':  ['mkfs.ext4', '-F'],
+    'btrfs': ['mkfs.btrfs', '-f'],
+    'xfs':   ['mkfs.xfs', '-f'],
+    'vfat':  ['mkfs.vfat', '-F', '32'],
+    'exfat': ['mkfs.exfat'],
+    'ntfs':  ['mkfs.ntfs', '-Q', '-F'],
+    'f2fs':  ['mkfs.f2fs', '-f'],
+}
+
+# The label flag each mkfs uses (None where this simple path skips labelling).
+_FS_LABEL_FLAG = {
+    'ext4': '-L', 'btrfs': '-L', 'xfs': '-L', 'vfat': '-n',
+    'exfat': '-n', 'ntfs': '-L', 'f2fs': '-l',
+}
+
+# The PRIMARY tool name per FS for each op (used by the capabilities catalog to
+# report which ops this closure can actually perform via shutil.which).
+_FS_FSCK_TOOL = {
+    'ext4': 'e2fsck', 'btrfs': 'btrfs', 'xfs': 'xfs_repair',
+    'vfat': 'fsck.fat', 'exfat': 'fsck.exfat', 'ntfs': 'ntfsfix', 'f2fs': 'fsck.f2fs',
+}
+_FS_DEFRAG_TOOL = {'ext4': 'e4defrag', 'btrfs': 'btrfs', 'xfs': 'xfs_fsr'}
+_FS_RESIZE_TOOL = {
+    'ext4': 'resize2fs', 'btrfs': 'btrfs', 'xfs': 'xfs_growfs',
+    'ntfs': 'ntfsresize', 'f2fs': 'resize.f2fs',
+}
+
+# A /dev path with only safe characters. argv (not shell) already blocks shell
+# injection; this rejects an obviously-bogus target before any op.
+_DEV_RE = re.compile(r'^/dev/[A-Za-z0-9/_-]+$')
+
+
+def _valid_device(device):
+    """True iff ``device`` is a well-formed /dev path (regex only, no I/O)."""
+    return bool(device) and bool(_DEV_RE.match(device))
+
+
+def _parent_disk(device):
+    """Resolve a partition's whole-disk parent (/dev/sda3 -> /dev/sda,
+    /dev/nvme0n1p2 -> /dev/nvme0n1, /dev/mmcblk0p1 -> /dev/mmcblk0)."""
+    m = re.match(r'^(/dev/(?:nvme\d+n\d+|mmcblk\d+))p\d+$', device or '')
+    if m:
+        return m.group(1)
+    m = re.match(r'^(/dev/[a-zA-Z]+)\d+$', device or '')
+    if m:
+        return m.group(1)
+    return device
+
+
+def _is_mounted(device):
+    """True iff ``device`` is currently mounted anywhere (via findmnt -S)."""
+    r = _run(['findmnt', '-nro', 'TARGET', '-S', device], timeout=5)
+    return bool(r and r.returncode == 0 and r.stdout.strip())
+
+
+def _protected_devices():
+    """The devices that back /, /boot, /nix (and their whole-disk parents) — the
+    set the destructive ops refuse to touch so the running OS can never be wiped."""
+    devs = set()
+    for mp in ('/', '/boot', '/boot/efi', '/nix', '/nix/store'):
+        r = _run(['findmnt', '-nro', 'SOURCE', mp], timeout=5)
+        if r and r.returncode == 0 and r.stdout.strip():
+            src = r.stdout.strip().split('\n')[0].strip()
+            # findmnt may suffix a btrfs subvol: /dev/sda2[/@] -> /dev/sda2
+            src = src.split('[')[0]
+            if src.startswith('/dev/'):
+                devs.add(src)
+                devs.add(_parent_disk(src))
+    return devs
+
+
+def _is_protected_device(device):
+    """True iff ``device`` (or its whole-disk parent) backs the running OS."""
+    if not device:
+        return False
+    prot = _protected_devices()
+    return device in prot or _parent_disk(device) in prot
+
+
+def _device_fstype(device):
+    """The on-disk filesystem of ``device`` (lsblk FSTYPE), '' if unknown."""
+    r = _run(['lsblk', '-nro', 'FSTYPE', device], timeout=5)
+    if r and r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip().split('\n')[0].strip()
+    return ''
+
+
+def _path_fstype(path):
+    """The filesystem mounted at (or containing) ``path`` (findmnt -T), '' if unknown."""
+    if not path:
+        return ''
+    r = _run(['findmnt', '-nro', 'FSTYPE', '-T', path], timeout=5)
+    if r and r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip().split('\n')[0].strip()
+    return ''
+
+
+def _fsck_cmd(fstype, device, repair):
+    """argv for a check (read-only) or repair fsck, or None if unsupported."""
+    f = (fstype or '').lower()
+    if f in ('ext4', 'ext3', 'ext2'):
+        return ['e2fsck', '-f', ('-y' if repair else '-n'), device]
+    if f == 'btrfs':
+        return ['btrfs', 'check'] + (['--repair'] if repair else ['--readonly']) + [device]
+    if f == 'xfs':
+        # xfs_repair -n = no-modify check; without -n = repair (needs unmounted).
+        return ['xfs_repair'] + ([] if repair else ['-n']) + [device]
+    if f in ('vfat', 'fat', 'fat32'):
+        return ['fsck.fat', ('-a' if repair else '-n'), device]
+    if f == 'exfat':
+        return ['fsck.exfat'] + (['-y'] if repair else ['-n']) + [device]
+    if f == 'ntfs':
+        # ntfsfix clears common errors; -n = no-action (check only).
+        return ['ntfsfix'] + ([] if repair else ['-n']) + [device]
+    if f == 'f2fs':
+        return ['fsck.f2fs'] + (['-f'] if repair else ['--dry-run']) + [device]
+    return None
+
+
+def _defrag_cmd(fstype, target):
+    """argv to defrag the filesystem at mount ``target``, or None if the FS has no
+    online defrag (f2fs/ntfs/vfat/exfat are log-structured or flash-native)."""
+    f = (fstype or '').lower()
+    if f in ('ext4', 'ext3', 'ext2'):
+        return ['e4defrag', target]
+    if f == 'btrfs':
+        return ['btrfs', 'filesystem', 'defragment', '-r', target]
+    if f == 'xfs':
+        return ['xfs_fsr', target]
+    return None
+
+
+def _resize_cmd(fstype, device, mount, size, grow):
+    """argv to shrink/grow a filesystem, or None if unsupported. ``size`` is a
+    target like '10G' (empty -> grow to the whole device). xfs can only grow."""
+    f = (fstype or '').lower()
+    if f in ('ext4', 'ext3', 'ext2'):
+        return ['resize2fs', device] + ([size] if size else [])
+    if f == 'btrfs':
+        return ['btrfs', 'filesystem', 'resize', (size or 'max'), mount or device]
+    if f == 'xfs':
+        if not grow:
+            return None  # xfs cannot shrink, only grow
+        return ['xfs_growfs', mount or device]
+    if f == 'ntfs':
+        return (['ntfsresize', '-s', size, device] if size else ['ntfsresize', device])
+    if f == 'f2fs':
+        return ['resize.f2fs', device] + ([size] if size else [])
+    return None
+
+
+def _fs_capabilities():
+    """Per-filesystem map of which ops this closure can perform (tool present)."""
+    caps = {}
+    for fs in _FS_FORMAT:
+        fmt_tool = _FS_FORMAT[fs][0]
+        fsck_tool = _FS_FSCK_TOOL.get(fs)
+        defrag_tool = _FS_DEFRAG_TOOL.get(fs)
+        resize_tool = _FS_RESIZE_TOOL.get(fs)
+        caps[fs] = {
+            'format': bool(fmt_tool and shutil.which(fmt_tool)),
+            'fsck': bool(fsck_tool and shutil.which(fsck_tool)),
+            'defrag': bool(defrag_tool and shutil.which(defrag_tool)),
+            'resize': bool(resize_tool and shutil.which(resize_tool)),
+        }
+    return caps
+
+
+def _lsblk_devices():
+    """Flat list of block devices (disks + partitions) via lsblk -J, [] on any
+    failure. Each entry: name/path/type/size/rota/model/mountpoint/fstype."""
+    r = _run(['lsblk', '-J', '-b', '-o',
+              'NAME,PATH,TYPE,SIZE,ROTA,MODEL,MOUNTPOINT,FSTYPE'], timeout=8)
+    if not r or r.returncode != 0 or not r.stdout:
+        return []
+    try:
+        data = json.loads(r.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    out = []
+
+    def _walk(nodes):
+        for n in nodes:
+            name = n.get('name')
+            out.append({
+                'name': name,
+                'path': n.get('path') or (f'/dev/{name}' if name else ''),
+                'type': n.get('type'),
+                'size': n.get('size'),
+                'rota': n.get('rota'),
+                'model': (n.get('model') or '').strip(),
+                'mountpoint': n.get('mountpoint'),
+                'fstype': n.get('fstype'),
+            })
+            if n.get('children'):
+                _walk(n['children'])
+
+    _walk(data.get('blockdevices', []) or [])
+    return out
+
+
+def _read_disk_health_snapshot(path=None):
+    """Parse the hart-disk-health.sh boot snapshot into {'ok', 'devices': [...]},
+    or None if the file is absent/unreadable (degrade to the live probe)."""
+    path = path or _DISK_HEALTH_FILE
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+    ok = False
+    devs = {}
+    for line in lines:
+        if '=' not in line:
+            continue
+        k, v = line.split('=', 1)
+        if k == 'ok':
+            ok = v.strip() == '1'
+        elif k.startswith('dev') and '.' in k:
+            idx, field = k[3:].split('.', 1)
+            devs.setdefault(idx, {})[field] = v
+    ordered = [devs[i] for i in sorted(devs, key=lambda x: int(x) if x.isdigit() else 0)]
+    return {'ok': ok, 'devices': ordered}
+
+
+def _disk_health_live():
+    """Live per-disk SMART/NVMe health via lsblk + smartctl -j, [] if no disks /
+    no smartctl. Coarse 'smart' verdict plus temperature_c + power_on_hours."""
+    devices = []
+    for d in _lsblk_devices():
+        if d.get('type') != 'disk':
+            continue
+        entry = {
+            'name': d.get('name'), 'path': d.get('path'),
+            'size': d.get('size'), 'rota': d.get('rota'),
+            'model': d.get('model'), 'smart': 'unknown',
+        }
+        path = d.get('path')
+        if path:
+            # smartctl -j returns a bitmask exit code; parse stdout regardless of it.
+            r = _run(['smartctl', '-j', '-H', '-A', path], timeout=12)
+            if r and r.stdout:
+                try:
+                    data = json.loads(r.stdout)
+                    passed = data.get('smart_status', {}).get('passed')
+                    if passed is True:
+                        entry['smart'] = 'passed'
+                    elif passed is False:
+                        entry['smart'] = 'failed'
+                    temp = (data.get('temperature') or {}).get('current')
+                    if temp is not None:
+                        entry['temperature_c'] = temp
+                    poh = (data.get('power_on_time') or {}).get('hours')
+                    if poh is not None:
+                        entry['power_on_hours'] = poh
+                except (json.JSONDecodeError, ValueError, AttributeError):
+                    pass
+        devices.append(entry)
+    return devices
+
+
+def _memory_status():
+    """RAM + swap totals (psutil) plus zram device detail (zramctl) and
+    systemd-oomd liveness. Every section degrades independently to empty."""
+    info = {'ram': {}, 'swap': {}, 'zram': [], 'oomd': {'active': None}}
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        sw = psutil.swap_memory()
+        info['ram'] = {
+            'total_mb': round(vm.total / 1048576),
+            'available_mb': round(vm.available / 1048576),
+            'used_mb': round(vm.used / 1048576),
+            'percent': vm.percent,
+        }
+        info['swap'] = {
+            'total_mb': round(sw.total / 1048576),
+            'used_mb': round(sw.used / 1048576),
+            'free_mb': round(sw.free / 1048576),
+            'percent': sw.percent,
+        }
+    except Exception:
+        pass
+    r = _run(['zramctl', '--output', 'NAME,ALGORITHM,DISKSIZE,DATA',
+              '--noheadings'], timeout=5)
+    if r and r.returncode == 0:
+        for line in r.stdout.strip().split('\n'):
+            parts = line.split()
+            if len(parts) >= 2:
+                info['zram'].append({
+                    'name': parts[0], 'algorithm': parts[1],
+                    'disksize': parts[2] if len(parts) > 2 else '',
+                    'data': parts[3] if len(parts) > 3 else '',
+                })
+    r2 = _run(['systemctl', 'is-active', 'systemd-oomd'], timeout=5)
+    if r2 is not None:
+        info['oomd']['active'] = (r2.stdout.strip() == 'active')
+    return info
 
 
 # ─── Bluetooth discovered devices (in-memory) ──────────────────
@@ -415,6 +736,215 @@ def register_shell_system_routes(app):
             })
         except (json.JSONDecodeError, KeyError):
             return jsonify({'error': 'Failed to parse smartctl output'}), 500
+
+    # ─── 11b. Disk Utility (#157): devices / health / capabilities / ops ──────
+    # The defrag / shrink-grow / format-ALL-FS / fsck-repair / trim surface. The
+    # tooling is shipped by hart-storage.nix; these routes INVOKE it. Read-only
+    # ops are open; mutating ops are auth-gated (@_require_system_auth) and the two
+    # DESTRUCTIVE ops (format, resize) ALSO require an explicit confirm=true AND
+    # refuse a mounted or system (root/boot/nix) disk, so the running OS can never
+    # be wiped by a stray click. A slow op returns 202 'running' (out-of-band) so
+    # the small shell thread pool is never pinned (the same _run_async_bounded
+    # discipline as wifi-connect).
+
+    @app.route('/api/shell/storage/devices', methods=['GET'])
+    def shell_storage_devices():
+        """List block devices (disks + partitions) with size/rota/model/mount/fs."""
+        return jsonify({'devices': _lsblk_devices()})
+
+    @app.route('/api/shell/storage/health', methods=['GET'])
+    def shell_storage_health():
+        """Per-disk SMART/NVMe health. Prefers the live smartctl readout; falls
+        back to the hart-disk-health boot snapshot (/run/hart/disk-health)."""
+        live = _disk_health_live()
+        if live:
+            return jsonify({'source': 'live', 'devices': live})
+        snap = _read_disk_health_snapshot()
+        if snap and snap.get('devices'):
+            return jsonify({'source': 'snapshot', 'devices': snap['devices']})
+        return jsonify({'source': 'none', 'devices': []})
+
+    @app.route('/api/shell/storage/capabilities', methods=['GET'])
+    def shell_storage_capabilities():
+        """Which disk ops this build can actually perform, per filesystem."""
+        return jsonify({
+            'supported_filesystems': list(_FS_FORMAT.keys()),
+            'filesystems': _fs_capabilities(),
+        })
+
+    @app.route('/api/shell/storage/fsck', methods=['POST'])
+    @_require_system_auth
+    def shell_storage_fsck():
+        """Check (read-only, default) or repair a filesystem. Repair is refused on
+        a mounted or system disk (must be unmounted first)."""
+        data = request.get_json(force=True, silent=True) or {}
+        device = data.get('device', '')
+        fstype = data.get('fstype', '')
+        repair = bool(data.get('repair', False))
+        if not _valid_device(device):
+            return jsonify({'error': 'valid /dev device required'}), 400
+        if repair and _is_mounted(device):
+            return jsonify({'error': 'cannot repair a mounted filesystem, unmount it first'}), 409
+        if repair and _is_protected_device(device):
+            return jsonify({'error': 'refusing to repair a system disk (root/boot/nix)'}), 403
+        if not fstype:
+            fstype = _device_fstype(device)
+        cmd = _fsck_cmd(fstype, device, repair)
+        if not cmd:
+            return jsonify({'error': f'fsck not supported for fstype: {fstype or "unknown"}'}), 400
+        if not shutil.which(cmd[0]):
+            return jsonify({'error': f'{cmd[0]} not available'}), 500
+        finished, r = _run_async_bounded(cmd, run_timeout=120, wait=8, name='hart-fsck')
+        if not finished:
+            return jsonify({'running': True, 'device': device,
+                            'mode': 'repair' if repair else 'check'}), 202
+        _audit_system_op('storage_fsck', {'device': device, 'repair': repair})
+        # 0 = clean; 1 = errors corrected (fsck convention) -> both are a success.
+        ok = bool(r and r.returncode in (0, 1))
+        return jsonify({
+            'ok': ok, 'device': device, 'mode': 'repair' if repair else 'check',
+            'returncode': r.returncode if r else None,
+            'output': (r.stdout or r.stderr or '')[-4000:] if r else '',
+        })
+
+    @app.route('/api/shell/storage/defrag', methods=['POST'])
+    @_require_system_auth
+    def shell_storage_defrag():
+        """Defragment a mounted filesystem (ext4 / btrfs / xfs). Non-destructive."""
+        data = request.get_json(force=True, silent=True) or {}
+        target = data.get('mount', '') or data.get('path', '')
+        fstype = data.get('fstype', '')
+        if not target or not os.path.isdir(target):
+            return jsonify({'error': 'valid mount path required'}), 400
+        if not fstype:
+            fstype = _path_fstype(target)
+        cmd = _defrag_cmd(fstype, target)
+        if not cmd:
+            return jsonify({'error': f'defrag not supported for fstype: {fstype or "unknown"} '
+                                     '(log-structured / flash filesystems do not defragment)'}), 400
+        if not shutil.which(cmd[0]):
+            return jsonify({'error': f'{cmd[0]} not available'}), 500
+        finished, r = _run_async_bounded(cmd, run_timeout=300, wait=8, name='hart-defrag')
+        if not finished:
+            return jsonify({'running': True, 'mount': target, 'fstype': fstype}), 202
+        _audit_system_op('storage_defrag', {'mount': target, 'fstype': fstype})
+        return jsonify({
+            'ok': bool(r and r.returncode == 0), 'mount': target, 'fstype': fstype,
+            'output': (r.stdout or r.stderr or '')[-4000:] if r else '',
+        })
+
+    @app.route('/api/shell/storage/trim', methods=['POST'])
+    @_require_system_auth
+    def shell_storage_trim():
+        """Discard unused blocks on an SSD mount (fstrim). Safe, non-destructive."""
+        data = request.get_json(force=True, silent=True) or {}
+        target = data.get('mount', '') or '/'
+        if not os.path.isdir(target):
+            return jsonify({'error': 'valid mount path required'}), 400
+        r = _run(['fstrim', '-v', target], timeout=60)
+        if r is None:
+            return jsonify({'error': 'fstrim not available'}), 500
+        _audit_system_op('storage_trim', {'mount': target})
+        return jsonify({'ok': r.returncode == 0, 'mount': target,
+                        'output': (r.stdout or r.stderr or '').strip()})
+
+    @app.route('/api/shell/storage/format', methods=['POST'])
+    @_require_system_auth
+    def shell_storage_format():
+        """Format a device to any of the 7 supported filesystems. DESTRUCTIVE:
+        requires confirm=true AND refuses a mounted or system (root/boot/nix) disk."""
+        data = request.get_json(force=True, silent=True) or {}
+        device = data.get('device', '')
+        fstype = (data.get('fstype', '') or '').lower()
+        label = data.get('label', '')
+        confirm = bool(data.get('confirm', False))
+        if not _valid_device(device):
+            return jsonify({'error': 'valid /dev device required'}), 400
+        if fstype not in _FS_FORMAT:
+            return jsonify({'error': f'unsupported fstype: {fstype or "(none)"}. '
+                                     f'Supported: {list(_FS_FORMAT.keys())}'}), 400
+        if not confirm:
+            return jsonify({'error': 'format is destructive: pass confirm=true to proceed',
+                            'requires_confirm': True}), 400
+        if _is_protected_device(device):
+            return jsonify({'error': 'refusing to format a system disk (root/boot/nix)'}), 403
+        if _is_mounted(device):
+            return jsonify({'error': 'device is mounted, unmount it before formatting'}), 409
+        cmd = list(_FS_FORMAT[fstype])
+        if label and _FS_LABEL_FLAG.get(fstype):
+            cmd += [_FS_LABEL_FLAG[fstype], str(label)]
+        cmd.append(device)
+        if not shutil.which(cmd[0]):
+            return jsonify({'error': f'{cmd[0]} not available'}), 500
+        finished, r = _run_async_bounded(cmd, run_timeout=120, wait=8, name='hart-format')
+        if not finished:
+            return jsonify({'running': True, 'device': device, 'fstype': fstype}), 202
+        _audit_system_op('storage_format', {'device': device, 'fstype': fstype, 'label': label})
+        return jsonify({
+            'ok': bool(r and r.returncode == 0), 'device': device, 'fstype': fstype,
+            'output': (r.stdout or r.stderr or '')[-4000:] if r else '',
+        })
+
+    @app.route('/api/shell/storage/resize', methods=['POST'])
+    @_require_system_auth
+    def shell_storage_resize():
+        """Shrink or grow a filesystem. DESTRUCTIVE (shrink risks data): requires
+        confirm=true, refuses a system disk, and refuses shrinking a mounted FS."""
+        data = request.get_json(force=True, silent=True) or {}
+        device = data.get('device', '')
+        mount = data.get('mount', '')
+        fstype = (data.get('fstype', '') or '').lower()
+        size = data.get('size', '')  # e.g. '10G'; empty = grow to the whole device
+        grow = bool(data.get('grow', True))
+        confirm = bool(data.get('confirm', False))
+        if not mount and not _valid_device(device):
+            return jsonify({'error': 'device or mount required'}), 400
+        if not confirm:
+            return jsonify({'error': 'resize is destructive: pass confirm=true to proceed',
+                            'requires_confirm': True}), 400
+        if device and _is_protected_device(device):
+            return jsonify({'error': 'refusing to resize a system disk (root/boot/nix)'}), 403
+        if not fstype:
+            fstype = _device_fstype(device) or _path_fstype(mount)
+        cmd = _resize_cmd(fstype, device, mount, size, grow)
+        if not cmd:
+            return jsonify({'error': f'{"grow" if grow else "shrink"} not supported '
+                                     f'for fstype: {fstype or "unknown"}'}), 400
+        if not grow and device and _is_mounted(device):
+            return jsonify({'error': 'shrink requires the filesystem unmounted'}), 409
+        if not shutil.which(cmd[0]):
+            return jsonify({'error': f'{cmd[0]} not available'}), 500
+        finished, r = _run_async_bounded(cmd, run_timeout=180, wait=8, name='hart-resize')
+        if not finished:
+            return jsonify({'running': True, 'fstype': fstype}), 202
+        _audit_system_op('storage_resize',
+                         {'device': device, 'mount': mount, 'fstype': fstype,
+                          'size': size, 'grow': grow})
+        return jsonify({
+            'ok': bool(r and r.returncode == 0), 'fstype': fstype,
+            'output': (r.stdout or r.stderr or '')[-4000:] if r else '',
+        })
+
+    # ─── 11c. Memory (#157): zram/swap status + cache reclaim ─────────────────
+
+    @app.route('/api/shell/memory', methods=['GET'])
+    def shell_memory():
+        """RAM + swap totals, zram device detail, and systemd-oomd liveness."""
+        return jsonify(_memory_status())
+
+    @app.route('/api/shell/memory/drop-caches', methods=['POST'])
+    @_require_system_auth
+    def shell_memory_drop_caches():
+        """Reclaim clean pagecache/dentries/inodes (sync first, then drop). Never
+        loses dirty data; the kernel re-reads on demand. Linux-only."""
+        try:
+            _run(['sync'], timeout=15)
+            with open('/proc/sys/vm/drop_caches', 'w') as f:
+                f.write('3\n')
+            _audit_system_op('memory_drop_caches', {})
+            return jsonify({'ok': True})
+        except (FileNotFoundError, PermissionError, OSError) as e:
+            return jsonify({'ok': False, 'error': str(e)}), 500
 
     # ─── 12. Startup Apps Manager ──────────────────────────
 
