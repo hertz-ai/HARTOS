@@ -12,12 +12,15 @@
 #
 # WHAT this module ships:
 #   A graphical-session USER oneshot (`hart-audio-unmute`) that, once
-#   PipeWire/WirePlumber are up, UNMUTES the default sink and RESCUES its level
-#   to a sane floor (default 60%) ONLY when it currently reads 0. It runs in the
-#   user session (where wpctl/pactl can reach the per-user PipeWire socket), NOT
-#   as a root system unit (a root unit cannot see the user's PipeWire instance).
-#   The decision logic lives in ../modules/hart-audio-unmute.sh so a portable
-#   behavioural test can exercise the REAL script against stub wpctl/pactl.
+#   PipeWire/WirePlumber are up, UNMUTES the default sink and, ON FIRST BOOT,
+#   sets it to the full default (100%) so a fresh OS is audible out of the box;
+#   on every LATER boot it only rescues a SILENT (level-0) sink. It also does a
+#   hotplug-safe default-sink RESELECTION (promote a sink to default when none is
+#   assigned). It runs in the user session (where wpctl/pactl can reach the
+#   per-user PipeWire socket), NOT as a root system unit (a root unit cannot see
+#   the user's PipeWire instance). The decision logic lives in
+#   ../modules/hart-audio-unmute.sh so a portable behavioural test can exercise
+#   the REAL script against stub wpctl/pactl.
 #
 # DEGRADE-NOT-DIE (the never-brick contract):
 #   The script is `set -u` (NOT -e), every probe is guarded, and it ALWAYS exits
@@ -28,9 +31,11 @@
 #   sink), so a headless / no-audio machine is simply unaffected.
 #
 # NEVER CLOBBER A DELIBERATE LEVEL:
-#   It only rescues a SILENT default (muted, or level 0). A user who set 30% on
-#   purpose keeps 30% across logins - the unmute is unconditional (a muted sink
-#   IS the bug), but the level set is conditional on the sink reading 0.
+#   The full-volume set is a FIRST-BOOT-only, once-per-user action (gated on a
+#   per-user stamp). On every later boot it only rescues a SILENT default (muted,
+#   or level 0). A user who set 30% on purpose keeps 30% across logins - the
+#   unmute is unconditional (a muted sink IS the bug), but the level set is
+#   conditional on first boot OR the sink reading 0.
 #
 # SCOPE / no-op rule: gated on `cfg.enable` AND `services.pipewire.enable`, so it
 #   is a PURE no-op on the server/edge variants (no PipeWire) and active only on
@@ -65,21 +70,26 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        Run a graphical-session oneshot that UNMUTES the default audio sink and
-        rescues its level to bootVolumePercent when it reads 0, so the desktop
-        never boots silent because of a persisted mute / volume-0 state. A pure
-        no-op when there is no default sink or no wpctl/pactl. Active only where
-        services.pipewire.enable is true (desktop/phone); a no-op on server/edge.
+        Run a graphical-session oneshot that UNMUTES the default audio sink, sets
+        it to bootVolumePercent on FIRST boot (so a fresh OS is audible), and on
+        later boots rescues the level only when it reads 0 - so the desktop never
+        boots silent because of a persisted mute / volume-0 state. Also does a
+        hotplug-safe default-sink reselection. A pure no-op when there is no
+        default sink or no wpctl/pactl. Active only where services.pipewire.enable
+        is true (desktop/phone); a no-op on server/edge.
       '';
     };
 
     bootVolumePercent = lib.mkOption {
       type = lib.types.ints.between 0 150;
-      default = 60;
+      default = 100;
       description = ''
-        The sane floor (percent) the rescue sets on the default sink WHEN it
-        currently reads 0. A deliberate non-zero user level is left untouched, so
-        this only rescues a silent default, it never clobbers a chosen volume.
+        The default level (percent) the rescue sets on the default sink. On FIRST
+        boot it is applied unconditionally so a brand-new install is audible out
+        of the box (steward: default sink at 100%). On later boots it is applied
+        only WHEN the sink reads 0 (a silent-default rescue); a deliberate
+        non-zero user level is then left untouched - it never clobbers a chosen
+        volume after the first boot.
       '';
     };
   };

@@ -154,6 +154,100 @@ def build_svg(label, prim, sec, emblem_key):
     return TEMPLATE.format(label=label, prim=prim, sec=sec, rings=rings, emblem=emblem)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Bundled app LOGO tiles (#143 offline-art) -> app_art/apps/<flathub_id>.svg
+# ═══════════════════════════════════════════════════════════════════════════
+# The offline, no-network default LOGO for every marketplace/catalog app, served
+# at /shell/static/app_art/apps/<flathub_id>.svg. The marketplace appCard + the
+# Netflix Apps row prefer this bundled logo over the network poster, and the
+# Material glyph stays the client onerror fallback (a missing tile degrades
+# cleanly). These are FIRST-PARTY on-brand letter tiles (our own art, no
+# trademark, redistributable, no credit owed).
+#
+# SEAM for the real official logos: a redistributable official/Flathub logo can
+# be dropped into this same dir by the SAME filename (<flathub_id>.svg or .png)
+# to override the generated tile - zero code change, the resolver
+# (shell_manifest.bundled_app_logo) just serves whichever file is present, and
+# the licence for each such asset is recorded in docs/THIRD_PARTY_ART.md.
+
+APPS_OUT_DIR = os.path.join(OUT_DIR, 'apps')
+
+# Brand-spectrum gradient pairs (prim -> sec); one is picked deterministically
+# per app id so the marketplace grid reads as a spectrum, never one flat wash.
+_LOGO_PAIRS = (
+    ('#29C5FF', '#3B82F6'), ('#00E6C3', '#29C5FF'), ('#9B5CFF', '#3B82F6'),
+    ('#FFC83D', '#FF2E9A'), ('#34C759', '#00E6C3'), ('#FF2E9A', '#9B5CFF'),
+    ('#3B82F6', '#9B5CFF'), ('#FF7043', '#FFC83D'),
+)
+
+_LOGO_TEMPLATE = (
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96' width='96' height='96' "
+    "role='img' aria-label='{label}'>"
+    "<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>"
+    "<stop offset='0' stop-color='{prim}'/><stop offset='1' stop-color='{sec}'/>"
+    "</linearGradient></defs>"
+    "<rect x='6' y='6' width='84' height='84' rx='22' fill='#0b0d16'/>"
+    "<rect x='6' y='6' width='84' height='84' rx='22' fill='url(#g)' fill-opacity='.92'/>"
+    "<text x='48' y='48' text-anchor='middle' dominant-baseline='central' "
+    "font-family='Segoe UI, Roboto, Helvetica, Arial, sans-serif' font-size='46' "
+    "font-weight='700' fill='#F5FAFF' fill-opacity='.96'>{letter}</text>"
+    "</svg>"
+)
+
+# Marketplace-only ids (hartMarketplace.js CATALOG) that are NOT in the canonical
+# hart-app-catalog.json, so the FEATURED store grid is fully covered offline too.
+_EXTRA_LOGO_APPS = {
+    'com.brave.Browser': 'Brave',
+    'com.discordapp.Discord': 'Discord',
+    'com.valvesoftware.Steam': 'Steam',
+    'com.visualstudio.code': 'VS Code',
+    'io.github.shiftey.Desktop': 'GitHub Desktop',
+    'rest.insomnia.Insomnia': 'Insomnia',
+    'org.mozilla.Thunderbird': 'Thunderbird',
+}
+
+
+def _logo_letter(name):
+    for ch in str(name or ''):
+        if ch.isalnum():
+            return ch.upper()
+    return '?'
+
+
+def _catalog_apps():
+    """(id, name) for every catalog app: the canonical JSON union the
+    marketplace-only extras. Read-only, degrades to just the extras if the
+    JSON is unreadable (never raises)."""
+    apps = dict(_EXTRA_LOGO_APPS)
+    # OUT_DIR = <repo>/integrations/agent_engine/static/app_art -> repo root is 4 up.
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(OUT_DIR))))
+    catalog = os.path.join(repo_root, 'nixos', 'modules', 'hart-app-catalog.json')
+    try:
+        import json
+        with open(catalog, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        for a in (data.get('apps') or []):
+            aid, nm = a.get('id'), a.get('name')
+            if aid and nm:
+                apps[str(aid)] = str(nm)
+    except Exception as e:                       # generator is best-effort
+        print('  (catalog read skipped: %s)' % e)
+    return sorted(apps.items())
+
+
+def _stable_hue_index(app_id):
+    """Deterministic gradient-pair index for an id (byte sum, so re-runs across
+    processes are identical - Python's builtin hash() is salted per process)."""
+    return sum(bytearray(str(app_id).encode('utf-8'))) % len(_LOGO_PAIRS)
+
+
+def build_logo(app_id, name):
+    prim, sec = _LOGO_PAIRS[_stable_hue_index(app_id)]
+    return _LOGO_TEMPLATE.format(label=name, prim=prim, sec=sec,
+                                 letter=_logo_letter(name))
+
+
 def main():
     for name, (label, prim, sec, emblem_key) in POSTERS.items():
         svg = build_svg(label, prim, sec, emblem_key)
@@ -162,6 +256,18 @@ def main():
             f.write(svg + '\n')
         print('wrote', path, '(%d bytes)' % len(svg))
     print('done:', len(POSTERS), 'posters')
+
+    # Per-app bundled logo tiles (deterministic per id -> byte-identical re-emit
+    # across processes and machines, so a committed tile never spuriously churns).
+    os.makedirs(APPS_OUT_DIR, exist_ok=True)
+    n = 0
+    for app_id, name in _catalog_apps():
+        svg = build_logo(app_id, name)
+        path = os.path.join(APPS_OUT_DIR, app_id + '.svg')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(svg + '\n')
+        n += 1
+    print('done:', n, 'app logos ->', APPS_OUT_DIR)
 
 
 if __name__ == '__main__':

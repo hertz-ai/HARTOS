@@ -126,42 +126,92 @@ class ThemeService:
         }
 
     @staticmethod
-    def apply_theme(theme_id: str) -> dict:
-        """Apply a theme OS-wide. Returns the applied theme or error."""
-        preset = ThemeService.get_preset(theme_id)
-        if not preset:
-            return {'error': f'Unknown theme: {theme_id}'}
+    def apply_theme(theme_id: str,
+                    secondary_accent: Optional[str] = None,
+                    custom: Optional[dict] = None) -> dict:
+        """Apply a theme OS-wide. Returns the applied theme or error.
 
-        # 1. Persist active theme file (read by Conky Lua every 5s)
-        try:
-            os.makedirs(os.path.dirname(_ACTIVE_THEME_PATH), exist_ok=True)
-            with open(_ACTIVE_THEME_PATH, 'w', encoding='utf-8') as f:
-                json.dump(preset, f, indent=2)
-        except OSError as e:
-            logger.error("Failed to write active theme: %s", e)
-            return {'error': str(e)}
+        The Personalize palette picker (#161) also carries a ``secondary_accent``
+        (a2) and/or ``custom`` colours (accent / secondary / background). These are
+        an EXTENSION of this same route (not a fork): they are persisted through the
+        canonical custom-overrides path (update_custom), so get_css_variables() and
+        the active-theme file both pick them up on the next hard reload. A palette
+        may switch a preset AND overlay colours, overlay colours onto the current
+        theme with no preset switch, or just carry a2 - all through one entry point.
+        """
+        preset = None
+        if theme_id:
+            preset = ThemeService.get_preset(theme_id)
+            if not preset:
+                return {'error': f'Unknown theme: {theme_id}'}
 
-        # 2. Clear custom overrides (new preset = fresh start)
-        if os.path.isfile(_CUSTOM_OVERRIDES_PATH):
+            # 1. Persist active theme file (read by Conky Lua every 5s)
             try:
-                os.remove(_CUSTOM_OVERRIDES_PATH)
-            except OSError:
+                os.makedirs(os.path.dirname(_ACTIVE_THEME_PATH), exist_ok=True)
+                with open(_ACTIVE_THEME_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(preset, f, indent=2)
+            except OSError as e:
+                logger.error("Failed to write active theme: %s", e)
+                return {'error': str(e)}
+
+            # 2. Clear custom overrides (new preset = fresh start). The palette
+            #    overlay below re-applies on top, so a "preset + palette" apply
+            #    keeps the palette accents.
+            if os.path.isfile(_CUSTOM_OVERRIDES_PATH):
+                try:
+                    os.remove(_CUSTOM_OVERRIDES_PATH)
+                except OSError:
+                    pass
+
+            # 3. Apply GTK theme via gsettings (Linux only, non-blocking)
+            ThemeService._apply_gtk(preset)
+
+            logger.info("Theme applied: %s", theme_id)
+
+            # Single notification path: EventBus → WAMP → all subsystems
+            # LiquidUI subscribes to 'theme.changed' on the EventBus
+            try:
+                from core.platform.events import emit_event
+                emit_event('theme.changed', {'theme_id': theme_id, 'preset': preset})
+            except Exception:
                 pass
 
-        # 3. Apply GTK theme via gsettings (Linux only, non-blocking)
-        ThemeService._apply_gtk(preset)
+        # Palette overlay: secondary accent (a2) + custom colours -> persisted via
+        # the SAME custom-overrides mechanism (reuse, not fork).
+        overlay = ThemeService._palette_overrides(secondary_accent, custom)
+        if overlay:
+            ThemeService.update_custom(overlay)
 
-        logger.info("Theme applied: %s", theme_id)
+        if preset:
+            return {'status': 'applied', 'theme_id': theme_id, 'theme': preset,
+                    'custom': overlay or None}
+        if overlay:
+            return {'status': 'customized', 'overrides': overlay}
+        return {'error': 'theme_id required'}
 
-        # Single notification path: EventBus → WAMP → all subsystems
-        # LiquidUI subscribes to 'theme.changed' on the EventBus
-        try:
-            from core.platform.events import emit_event
-            emit_event('theme.changed', {'theme_id': theme_id, 'preset': preset})
-        except Exception:
-            pass
+    @staticmethod
+    def _palette_overrides(secondary_accent: Optional[str],
+                           custom: Optional[dict]) -> dict:
+        """Build a colour override dict from a palette apply (accent / secondary /
+        background + a2). Normalizes '#rrggbb' or 'rrggbb' consistently (stored WITH
+        the leading '#', which get_css_variables detects). Returns {} when empty."""
+        colors: Dict[str, str] = {}
+        if isinstance(custom, dict):
+            for key in ('accent', 'secondary', 'background'):
+                val = custom.get(key)
+                if isinstance(val, str) and val.strip():
+                    colors[key] = ThemeService._norm_hex(val)
+        if isinstance(secondary_accent, str) and secondary_accent.strip():
+            colors.setdefault('secondary', ThemeService._norm_hex(secondary_accent))
+        return {'colors': colors} if colors else {}
 
-        return {'status': 'applied', 'theme_id': theme_id, 'theme': preset}
+    @staticmethod
+    def _norm_hex(val: str) -> str:
+        """Normalize a colour to '#rrggbb' (leave rgba()/named values untouched)."""
+        val = val.strip()
+        if val.startswith('#') or val.startswith('rgb'):
+            return val
+        return '#' + val
 
     # ── Agent-Driven Customization ───────────────────────────────
 
@@ -313,6 +363,20 @@ class ThemeService:
         except (ValueError, IndexError):
             on_accent = '#ffffff'
         lines.append(f'  --hart-on-accent: {on_accent};')
+        # Secondary brand accent (a2) — the shell reads --hart-a2 / --hart-a2-rgb
+        # (the Vibrant duotone). A palette apply persists colors.secondary; emit it
+        # under the canonical var name (NOT --hart-secondary, which nothing reads),
+        # plus its rgb triple so glows/rings can tint. Only when set (else the
+        # hartResponsive.css :root default violet stands).
+        secondary = (colors.get('secondary') or '').lstrip('#')
+        if secondary:
+            lines.append(f'  --hart-a2: #{secondary};')
+            try:
+                sr, sg, sb = (int(secondary[0:2], 16), int(secondary[2:4], 16),
+                              int(secondary[4:6], 16))
+                lines.append(f'  --hart-a2-rgb: {sr},{sg},{sb};')
+            except (ValueError, IndexError):
+                pass
         # Font
         lines.append(f'  --hart-font-family: "{font.get("family", "JetBrains Mono")}";')
         lines.append(f'  --hart-font-size: {font.get("size", 13)}px;')

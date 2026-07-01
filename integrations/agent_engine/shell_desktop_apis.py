@@ -72,6 +72,97 @@ def _run(cmd, timeout=10, **kw):
         return None
 
 
+# ─── About > Credits: third-party art licence ledger (#143 offline-art) ──────
+# The OS "About & Credits" surface renders docs/THIRD_PARTY_ART.md - the single
+# source of truth for every bundled third-party asset's source + licence + the
+# credit line that must ship in the OS (the doc's own binding rule). Parsed here
+# into structured sections so the credits panel (hartCredits.js via
+# /api/shell/credits) can render the ledger. OFFLINE: reads a bundled doc file,
+# no network, never raises.
+
+def _credits_doc_path():
+    """Ordered candidates for the ledger doc: HART_CREDITS_DOC override, else the
+    repo-relative docs/THIRD_PARTY_ART.md (this file is at
+    integrations/agent_engine/, so the repo root is two dirs up)."""
+    env = (os.environ.get('HART_CREDITS_DOC') or '').strip()
+    if env:
+        yield env
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(os.path.dirname(here))
+    yield os.path.join(repo_root, 'docs', 'THIRD_PARTY_ART.md')
+
+
+def _is_md_separator(line):
+    """A markdown table separator row: only '|', '-', ':', spaces (e.g. |---|:-:|)."""
+    body = line.strip().replace('|', '').replace(' ', '')
+    return bool(body) and set(body) <= set('-:')
+
+
+def _parse_markdown_ledger(md):
+    """Parse every markdown table in ``md`` into
+    [{'heading': str, 'columns': [str], 'rows': [{col: val}]}], each table tagged
+    with the nearest preceding heading. Placeholder rows (all-empty or a leading
+    italic '_(none...') are dropped. Generic (no hard-coded columns) so the doc
+    can evolve without touching this parser."""
+    sections = []
+    heading = ''
+    lines = md.splitlines()
+    i, n = 0, len(lines)
+    while i < n:
+        st = lines[i].strip()
+        if st.startswith('#'):
+            heading = st.lstrip('#').strip()
+            i += 1
+            continue
+        if (st.startswith('|') and i + 1 < n and _is_md_separator(lines[i + 1])):
+            headers = [c.strip() for c in st.strip('|').split('|')]
+            rows = []
+            i += 2
+            while i < n and lines[i].strip().startswith('|'):
+                cells = [c.strip() for c in lines[i].strip().strip('|').split('|')]
+                joined = ' '.join(cells).strip()
+                if joined and not joined.lstrip('_').startswith('(none'):
+                    rows.append(dict(zip(headers, cells)))
+                i += 1
+            sections.append({'heading': heading, 'columns': headers, 'rows': rows})
+            continue
+        i += 1
+    return sections
+
+
+def get_credits_ledger(doc_path=None):
+    """The OS About > Credits payload parsed from the art-licence ledger. Offline,
+    never raises. Shape: {'title', 'binding_rule', 'sections': [...], 'source'}.
+    A missing/unreadable doc degrades to empty sections (the panel still paints).
+    """
+    paths = [doc_path] if doc_path else list(_credits_doc_path())
+    md, used = '', ''
+    for p in paths:
+        try:
+            if p and os.path.isfile(p):
+                with open(p, 'r', encoding='utf-8') as f:
+                    md = f.read()
+                used = p
+                break
+        except OSError as e:
+            logger.debug('credits doc read failed at %s: %s', p, e)
+            continue
+    # The binding rule is the first blockquote/bold line under the H1; surface it
+    # so the About screen states WHY the ledger ships (steward's binding rule).
+    binding = ''
+    for line in md.splitlines():
+        s = line.strip()
+        if s.startswith('**Binding rule'):
+            binding = s.strip('*').strip()
+            break
+    return {
+        'title': 'HART OS - Third-Party Art Credits',
+        'binding_rule': binding,
+        'sections': _parse_markdown_ledger(md),
+        'source': used,
+    }
+
+
 # ─── Display profile persistence (multi-monitor + font scale) ──────────────
 # ONE writer for the saved display arrangement. profile.json is the UI source of
 # truth; the kanshi config is the daemon input regenerated FROM it, so a saved
@@ -396,6 +487,14 @@ def register_shell_desktop_routes(app):
         if action in ('on', 'enable', 'wake'):
             return jsonify(enable_all())
         return jsonify(status())
+
+    # ─── About > Credits: third-party art licence ledger (#143) ──────────────
+    # Renders docs/THIRD_PARTY_ART.md (source + licence + credit lines) into the
+    # OS About screen (Settings > About > Credits, hartCredits.js). Offline,
+    # read-only, no auth gate (like /apps/catalog); never 500s.
+    @app.route('/api/shell/credits', methods=['GET'])
+    def shell_credits():
+        return jsonify(get_credits_ledger())
 
     # ─── App Store catalog (OFFLINE source of truth) ─────────────────────────
     # The curated FOSS catalog served from the canonical JSON

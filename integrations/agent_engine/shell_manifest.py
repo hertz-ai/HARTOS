@@ -42,6 +42,9 @@ so a native surface is registered by REUSING an existing system panel + its
 working renderer, never by inventing a new id with no JS.
 """
 
+import os
+import re
+
 # ═══════════════════════════════════════════════════════════════
 # Static Panels — Nunba SPA pages shown in Start Menu
 # ═══════════════════════════════════════════════════════════════
@@ -696,6 +699,16 @@ SYSTEM_PANELS = {
             '/api/system/rollback',
         ],
     },
+    # Settings > About > Credits: the OS "About & Credits" surface. Renders the
+    # third-party art licence ledger (docs/THIRD_PARTY_ART.md) served by
+    # /api/shell/credits, so every bundled attribution-required asset shows its
+    # credit line in the OS itself (the binding rule in THIRD_PARTY_ART.md).
+    # 'about' + 'license' in the title so both intuitive names surface it.
+    'credits': {
+        'title': 'About & Credits (License)', 'icon': 'copyright',
+        'group': 'System', 'default_size': [640, 640],
+        'apis': ['/api/shell/credits'],
+    },
 }
 
 
@@ -792,6 +805,51 @@ def with_icon_colors(panels):
         e['color'] = color_for(e.get('icon'), e.get('group'), e.get('color'))
         out[pid] = e
     return out
+
+
+# ═══════════════════════════════════════════════════════════════
+# Bundled offline app LOGOS (#143 offline-art)
+# ═══════════════════════════════════════════════════════════════
+# The no-network default logo for a marketplace/catalog app, served at
+# /shell/static/app_art/apps/<flathub_id>.svg (Flask static_folder). Both the
+# marketplace appCard AND the Netflix Apps producer prefer this bundled logo over
+# the network poster so a known app shows real art OFFLINE; the Material glyph
+# stays the client onerror fallback. Real official / Flathub logos
+# (redistributable per docs/THIRD_PARTY_ART.md) drop into the SAME dir by
+# <flathub_id>.svg|png|webp to OVERRIDE the first-party generated tile
+# (generate_posters.py) - one filename convention, zero code change. This is the
+# single source of truth for the app-id -> bundled-logo mapping; the marketplace
+# JS mirrors the SAME URL convention and lets onerror do the runtime miss check.
+
+APPS_ART_URL_BASE = '/shell/static/app_art/apps'
+_APPS_ART_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'static', 'app_art', 'apps')
+# A Flathub id is reverse-DNS (org.mozilla.firefox); validate so a search hit
+# with a junk / undotted id skips straight to the glyph and no odd path is built.
+_FLATHUB_ID_RE = re.compile(
+    r'^[A-Za-z0-9][A-Za-z0-9_-]*(\.[A-Za-z0-9][A-Za-z0-9_-]*)+$')
+# Bundled tiles ship as .svg; .png/.webp let a dropped-in raster official logo
+# win without changing the convention.
+_APP_LOGO_EXTS = ('.svg', '.png', '.webp')
+
+
+def bundled_app_logo(app_id):
+    """Served URL of the BUNDLED offline logo for a Flathub app id, or None.
+
+    No network, never raises: checks the shipped static/app_art/apps/ dir on
+    disk and returns the same-origin /shell/static URL when a tile is present.
+    The caller prefers this over the network poster (offline-first); a miss lets
+    the Material glyph render as the fallback."""
+    try:
+        aid = (app_id or '').strip()
+        if not aid or not _FLATHUB_ID_RE.match(aid):
+            return None
+        for ext in _APP_LOGO_EXTS:
+            if os.path.isfile(os.path.join(_APPS_ART_DIR, aid + ext)):
+                return APPS_ART_URL_BASE + '/' + aid + ext
+        return None
+    except OSError:
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════

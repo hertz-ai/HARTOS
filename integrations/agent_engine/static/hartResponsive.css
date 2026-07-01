@@ -114,6 +114,11 @@
   --hart-saturation: 165%;
   --hart-radius: 20px;
   --hart-accent-rgb: 0,230,195;
+  /* Secondary brand accent (a2) — the VIBRANT duotone default (b1.2): teal LEADS,
+     violet ACCENTS. This makes "Vibrant" the shell brand default without JS; the
+     Personalize palette picker (hartPersonalize.js #161) overrides both live. */
+  --hart-a2: #9B5CFF;
+  --hart-a2-rgb: 155,92,255;
   /* ── HEVOLVE BRAND SPECTRUM (single source; the steward's 6 hues) ── */
   --hv-teal:    #00E6C3;  --hv-teal-rgb:    0,230,195;
   --hv-cyan:    #29C5FF;  --hv-cyan-rgb:    41,197,255;

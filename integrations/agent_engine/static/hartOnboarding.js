@@ -113,7 +113,25 @@
     if (overlay) overlay.classList.remove('open');
     document.documentElement.classList.remove('onboarding-active');
   }
-  function speak(t) { try { if (window.speakText && t) window.speakText(t, 'onboarding'); } catch (e) {} }
+  // Respect the human's AI-sensing kill-switch. hartSenses.js paints the
+  // canonical '.ai-blind' flag on #hart-hero when the human shuts the AI's senses
+  // (that file is the ONE writer; we only READ the flag - no parallel state).
+  // While senses are cut the ceremony still SHOWS and stays skippable, but the PA
+  // stays SILENT (the AI must not speak when the human has shut it). Guarded so a
+  // DOM without the node (or the dependency-free test shim) is a no-op, never a throw.
+  function sensesCut() {
+    try {
+      var hero = document.getElementById('hart-hero');
+      return !!(hero && hero.classList && hero.classList.contains('ai-blind'));
+    } catch (e) { return false; }
+  }
+  // TTS the ceremony line through the shell's canonical voice path (window.speakText
+  // -> POST /api/voice/speak -> the Model Bus TTS router). No second TTS path: this
+  // is the same helper chat replies + the greeting use. No-op when TTS is
+  // unreachable (potato / not yet loaded) or the senses are cut.
+  function speak(t) {
+    try { if (window.speakText && t && !sensesCut()) window.speakText(t, 'onboarding'); } catch (e) {}
+  }
   function clearOpts() { if (opts) opts.innerHTML = ''; }
 
   function button(label, cb) {
@@ -169,16 +187,19 @@
 
     var msg = document.createElement('div');
     msg.className = 'hob-line in';
-    msg.style.cssText = 'font-size:15px;color:#cfc9ff;margin-bottom:10px';
+    msg.style.cssText = 'font-size:15px;color:#c9f5ee;margin-bottom:10px';
     msg.textContent = 'Setting up your companion...';
 
     var track = document.createElement('div');
     track.style.cssText = 'width:100%;height:8px;border-radius:999px;overflow:hidden;'
-      + 'background:rgba(160,150,255,.18);border:1px solid rgba(160,150,255,.28)';
+      + 'background:rgba(0,230,195,.16);border:1px solid rgba(0,230,195,.30)';
 
+    // Brand duotone: teal LEADS, violet ACCENTS (b1.2). Replaces the old
+    // indigo-to-light-indigo fill so the onboarding matches the OS brand, not the
+    // deprecated indigo.
     var fill = document.createElement('div');
     fill.style.cssText = 'height:100%;width:0%;border-radius:999px;'
-      + 'background:linear-gradient(90deg,#6c63ff,#a78bff);transition:width .4s ease';
+      + 'background:linear-gradient(90deg,#00E6C3,#9B5CFF);transition:width .4s ease';
 
     track.appendChild(fill);
     wrap.appendChild(msg);

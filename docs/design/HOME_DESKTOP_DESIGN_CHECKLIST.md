@@ -412,8 +412,48 @@ This is the steward's most-repeated structural rule. Capture every nuance.
   - *"LIGHT YOUR hart FOR UNDERSTANDING USER'S LANGUAGEG, PREFERENCE ON OINTIAL
     ONBOARDOING"* `[#1721]`
   - *"it shd be part of HART onboarding light your heart we have"* `[#1729]`
+- **h2. The ceremony SPEAKS its lines by voice (TTS), respecting the kill-switch.
+  APPLIED.** Communicate by VOICE, not text walls (b8): the "Light Your HART"
+  narration is spoken aloud through the shell's ONE canonical TTS path
+  (`window.speakText` -> `POST /api/voice/speak` -> the Model Bus TTS router - no
+  second voice path), so a fresh install greets the user out loud. It stays SILENT
+  when the human has shut the AI's senses: `speak()` reads the canonical
+  `#hart-hero.ai-blind` flag (hartSenses.js is the ONE writer) and does not speak
+  while cut - the ceremony still SHOWS and stays Esc/Skip-able. Behavioural test:
+  `tests/unit/test_onboarding_speak.mjs` (speaks on show; silent when blind).
+  - Reinforces b8 (voice, not text walls) + c (the orb/voice) + k7 (privacy: the
+    human's cut is honored). Workstream #159.
+- **h3. The onboarding palette is the OS brand (teal LEAD + violet ACCENT), not the
+  deprecated indigo. APPLIED.** The onboarding carried the old `#6C63FF` indigo
+  (orb halo, name glow, option chips, the companion progress bar). Rebranded to the
+  same duotone the rest of the shell uses (b1.2 / GF3): the `.hob-orb` reads a teal
+  core with a teal-inner + VIOLET-outer halo; `.hob-name`/`.hob-opt` lead teal; the
+  option-hover glow + the companion bar accent carry violet (`.hob-opt` +
+  `hartOnboarding.js` fill gradient `#00E6C3 -> #9B5CFF`). Guards:
+  `tests/unit/test_onboarding_palette_guard.py` (no indigo, has the brand teal) +
+  the behavioural companion-gradient assertion in `test_onboarding_companion.mjs`.
+  Workstream #159.
 
 ---
+
+## 2026-07-01 - onboarding voice + first-boot audio (#159 / #160)
+
+Voice & polish follow-up (workstream #159/#160): the onboarding should SPEAK, a
+fresh OS should be AUDIBLE at first boot, and the onboarding should carry the OS
+brand, not the old indigo. None contradict an EMPHATIC rule; each REFINES an
+existing item.
+
+| # | Captured intent (#159/#160) | Item | Status | Evidence |
+|---|---|---|---|---|
+| V1 | The "Light Your HART" onboarding SPEAKS its ceremony lines when shown (TTS), respecting the audio / AI-sensing kill-switch. | h2 (new) + b8 (voice) | **APPLIED** | `hartOnboarding.js` `speak()` -> `window.speakText(text,'onboarding')` (the canonical shell TTS -> `/api/voice/speak` -> Model Bus TTS router; no second path), gated on `#hart-hero.ai-blind` (hartSenses.js the ONE writer). `tests/unit/test_onboarding_speak.mjs`. |
+| V2 | A fresh OS is audible: the default sink is set to 100% at FIRST boot; later boots never clobber a chosen level. | k8 (parity/feedback) + degrade-not-die | **APPLIED** | `hart-audio-unmute.sh` first-boot (per-user stamp) sets the full floor once; `hart-audio.nix` `bootVolumePercent` default 60 -> **100**. Also a hotplug-safe default-sink RESELECTION (promote a sink when none is default). Tests: `tests/unit/test_hart_audio_unmute.py` (first-boot/never-clobber/reselect) + the `hart-audio` nixosTest (`nixos/tests/audio.nix`, live PipeWire -> unmuted + 100%). Degrade-not-die preserved (always exit 0; no device -> clean no-op). |
+| V3 | The onboarding uses the OS brand duotone (teal LEAD, violet ACCENT), not the deprecated `#6C63FF` indigo. | h3 (new) + b1.2 / GF3 | **APPLIED** | `.hob-orb`/`.hob-name`/`.hob-opt` (liquid_ui_service.py) + the `hartOnboarding.js` companion gradient rebranded to teal `#00E6C3` core + violet `#9B5CFF` accent. `tests/unit/test_onboarding_palette_guard.py` + `test_onboarding_companion.mjs`. |
+
+Audit note: V1-V3 do not regress any APPLIED item. V1 reuses the EXISTING voice
+path (k1 no parallel path) and honors the human's kill-switch (k7). V2 keeps the
+never-brick audio contract (degrade-not-die; the first-boot set is once-per-user,
+so a chosen level is never stomped on later logins). V3 extends the b1.2 duotone
+weighting (teal ~70% lead / violet ~30% accent) into the onboarding surface.
 
 ## (i) AGENTIC LIQUID UI + LLM-AS-HEART + 100x PERF (the soul)
 
@@ -647,3 +687,54 @@ transforms) are still shed on software; only the FREE static depth is kept.
 FOLLOW-UP (not faked): the richer Nunba landing-page "Light your HART" React tree
 is a separate W2/onboarding workstream (no `lightyourhart.js` exists in the OS
 shell static dir - only `hartOnboarding.js`); this pass did not pull it cross-repo.
+
+---
+
+## 2026-07-01 - the Customization hub (palette + orb varieties + media backgrounds)
+
+The Personalize panel becomes the ONE customization hub (#140 / #161 / #162),
+EXTENDING the existing system (`hartPersonalize.js` PRESETS/WALLPAPERS/applyPreset
++ the `/api/shell/wallpaper` + `/api/social/theme/apply` flow) - no second path.
+None contradict an EMPHATIC rule; each REFINES an existing item.
+
+| # | Captured intent (verbatim quote) | Item | Status | Evidence |
+|---|---|---|---|---|
+| CH1 | A brand PALETTE picker: "Vibrant" (teal + violet duotone, the b1.2 default), "Monotone Teal" (original single-hue), and a CUSTOM colour picker (accent + secondary + bg). Reconciles b1 ("full brand SPECTRUM, never monochrome" / *"WHY MONOCHROMATIC?"* `[#1720]`) with the b1.2 duotone weighting - the user chooses. | b1 / b1.2 (new: user-selectable) | **APPLIED** | `hartPersonalize.js` `PALETTES` (vibrant/monotone-teal) + custom picker -> `applyPalette` sets `--hart-accent` / `--hart-a2` / `--hart-background` (+ rgb) on documentElement INSTANTLY, persists via `HartSession.palette`, and EXTENDS `/api/social/theme/apply` (secondary_accent + custom) - `theme_service.apply_theme` persists via the canonical custom-overrides path (reuse, not fork) and `get_css_variables` emits `--hart-a2`. Vibrant is the brand default via the `--hart-a2` CSS default (hartResponsive.css). Tests: `test_customization_hub.mjs` [P]/[C] + `test_customization_hub.py`. |
+| CH2 | Orb VARIETIES are switchable via a picker. *"why do we have different orb and are the orb switchable?"* `[#1791]` (closes the c3 / #140 open regression, previously only right-click breathing). | c3 (orb switchable) / c8 | **APPLIED** | `voiceOrbViz.js` gains a `STYLES` registry (vibrant/ring-orb/nebula/minimal/pulse) + `setStyle()`; the DEFAULT 'vibrant' holds the EXACT legacy teal numbers so the out-of-box canvas is pixel-identical (baseline preserved). `hartPersonalize.js` owns the persisted pref (`HartSession.orb_style`, single writer) + the picker, drives the ONE live orb (`_hartVoiceOrb.setStyle`); `initHartOrb` applies it on boot. Tests: `test_customization_hub.mjs` [O] (persist + live re-tint). |
+| CH3 | Backgrounds extend to video / lottie / gif. *"wallpaper could be video image or solids? theme explorer like Windows with transparent transculent menus"* `[#249]`; the customization surface: *"change background , theme selections... change system font"* `[#1403]`. | f6 (customizability) / GF1 (degrade-not-die) | **APPLIED (best-effort)** | `hartPersonalize.js` `hartSetWallpaperMedia(type,url,poster)` renders a `<video>`/lottie element INTO the `.wallpaper` host; BEST-EFFORT: on `body.gpu-software` / potato, video + lottie DEGRADE to a static poster frame or the gradient (NEVER play on a potato - preserves the hang-free cairo baseline); gif is cheap and always renders. Persisted via `HartSession.wallpaper_bg`; the bundled Hevolve lottie makes a live media bg work OFFLINE. Tests: `test_customization_hub.mjs` [B] (degrade on software, live on hardware, gif ok, no stale media). |
+
+Audit note: CH1-CH3 do not regress any APPLIED item. CH1 keeps b1 (spectrum) as a
+SELECTABLE palette AND the b1.2 duotone as the default (teal LEADS via `--hart-accent`,
+violet ACCENTS via `--hart-a2`); nothing functional is forced to one hue. CH2 preserves
+the exact legacy orb look as the default variety (zero regression on c/GF3), only adds
+switchable skins (c3). CH3 preserves #137's keystroke-lag kill + GF1's graceful floor:
+the genuinely per-frame-expensive media (video playback, lottie ticking) is shed on the
+software floor to a static frame, so a heavy background can never reintroduce the 500ms
+lag. All three EXTEND the one Personalize path (k1 no parallel path).
+
+---
+
+## 2026-07-01 - Offline-art (#143): bundled app logos, central agent art, OS credits
+
+Extends d8 (per-source card image sourcing) + GF4 (statically pack apps/agents)
+so real app + agent art shows OFFLINE, and adds the licence-ledger surface the
+steward's art-licensing rule requires. None contradicts an EMPHATIC rule; each
+REFINES an existing item and reuses an existing path.
+
+| # | Captured intent (verbatim quote) | Item | Status | Evidence |
+|---|---|---|---|---|
+| GA1 | Bundle the OFFICIAL app logos for the marketplace/catalog + preinstalled apps so a known app shows real art with the network OFF; the Material glyph stays the fallback. *"App icons made into netflix style listing shd get most appropriate app image poster from official website for each app or from marketplace listing etc for each source"* `[#1801, steward 2026-06-29]` | d8 (app cards) / GF4 | **APPLIED (offline pack + seam)** | `generate_posters.py` now also emits first-party on-brand LOGO tiles into `static/app_art/apps/<flathub_id>.svg` (39 catalog+marketplace apps). `shell_manifest.bundled_app_logo` is the ONE resolver (served `/shell/static/app_art/apps/...`, disk-checked, offline). `_home_app_card` PREFERS the bundled logo on `card.image` (which makeCard prefers over the network `card.image_url`) and skips the network poster when present. `hartMarketplace.appCard` renders the logo `<img>` with the Material glyph as the `onerror` fallback. SEAM: a redistributable official/Flathub logo drops in by `<flathub_id>.svg\|png\|webp` to override, zero code change. |
+| GA2 | CENTRAL-instance owned agent images resolved by NAME, consulted BEFORE the generated art, so agents show real owned art offline; a documented drop-by-name seam. *"Agents we could source from image generators and synthetically adding a dark to light transparent overlay with text on top"* `[#1801]` (the owned-art path is the offline floor UNDER the generator) | d8 (agent cards) | **APPLIED (central hook + seam)** | `app_poster.central_agent_art(name)` checks `$HART_AGENT_ART_DIR` (the central drop location) then the bundled `static/app_art/agents/`, matched by a name-slug, served same-origin via the `/shell/agent-art/<slug>` route (traversal-safe: slug is `[a-z0-9-]` only). `_home_agent_card` consults it BEFORE `agent_art_url` and stamps `card.image`; the dark-to-light scrim is preserved (makeCard always lays the scrim over `card.image`). |
+| GA3 | Wire `docs/THIRD_PARTY_ART.md` into an OS credits view so every bundled attribution-required asset shows its credit line in the OS. *"every third-party image bundled into the shipped OS is recorded here with its source + license, and where a license requires attribution, the credit line ships in the OS 'About / Credits' surface"* `[THIRD_PARTY_ART.md binding rule, steward 2026-07-01]` | new (About > Credits) | **APPLIED** | `GET /api/shell/credits` (`shell_desktop_apis.get_credits_ledger`) parses the ledger markdown into structured sections offline; the `credits` system panel ("About & Credits (License)") renders it via `hartCredits.js`. The ledger doc now states the table is LIVE in the OS. |
+
+Audit note: GA1-GA3 do not regress any APPLIED item and honour the hang-free
+baseline. The bundled logo/central art is same-origin STATIC (an `<img src>`, free
+per frame - no backdrop-blur / drift / video), so it can never reintroduce the
+500ms software-floor lag (GF1/#137 preserved); a missing asset degrades to the
+Material glyph / brand-art scrim (degrade-not-die). Offline-first + decentralised:
+every resolver works with the network OFF and central OFF - the bundled tiles ship
+in the image, `$HART_AGENT_ART_DIR` is a local drop, and the network poster stays
+an OPTIONAL enhancement layered ON TOP only where no bundled art exists (d8). No
+parallel path: ONE app-logo resolver (`shell_manifest.bundled_app_logo`) + ONE
+agent-art resolver (`app_poster.central_agent_art`), both reused by the producer
+and the marketplace via a single URL convention.

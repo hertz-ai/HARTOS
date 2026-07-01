@@ -1,0 +1,182 @@
+"""Customization hub — server-side (ThemeService palette extension) + the JS shim.
+
+Two halves:
+
+1. The behavioural JS coverage lives in ``test_customization_hub.mjs`` (drives the
+   real hartPersonalize.js / voiceOrbViz.js on a DOM shim: palette applies + persists
+   the brand vars, the custom picker, orb-variety switch persists + re-tints, and the
+   media backgrounds DEGRADE on the software floor). This wrapper shells out to node
+   so pytest/CI runs it too; it skips cleanly when node is absent.
+
+2. Direct Python tests for the ``/api/social/theme/apply`` EXTENSION (#161): a
+   palette apply carries ``secondary_accent`` + ``custom`` colours; ThemeService
+   persists them through the canonical custom-overrides path (reuse, not fork), and
+   ``get_css_variables`` emits ``--hart-a2`` (+ its rgb triple) from the persisted
+   secondary. A palette-only apply (no preset switch) is accepted, and a truly-empty
+   body is still a 400.
+"""
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+
+import pytest
+
+MJS = os.path.join(os.path.dirname(__file__), 'test_customization_hub.mjs')
+
+
+# ── 1) JS behavioural harness (shelled out) ────────────────────────────────────
+def test_customization_hub_js():
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('node not available to run the JS behavioural harness')
+    r = subprocess.run([node, MJS], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, 'customization hub behaviour harness failed:\n' + r.stdout + r.stderr
+    assert 'RESULT: ALL PASS' in r.stdout, r.stdout
+
+
+# ── 2) ThemeService palette extension (server persistence) ─────────────────────
+_tmp = tempfile.mkdtemp(prefix='hart_customhub_')
+_theme_dir = os.path.join(_tmp, 'themes')
+_data_dir = os.path.join(_tmp, 'data')
+os.makedirs(_theme_dir, exist_ok=True)
+os.makedirs(_data_dir, exist_ok=True)
+
+_BASE_PRESET = {
+    'id': 'hart-default', 'name': 'HART Default', 'category': 'dark',
+    'colors': {'background': '0F0E17', 'accent': '00D4AA', 'text': 'e0e0e0',
+               'heading': '00D4AA', 'muted': '78909c', 'surface': '1a1a2e'},
+    'font': {'family': 'JetBrains Mono', 'size': 13, 'heading_size': 18,
+             'weight': 400, 'heading_weight': 600},
+    'shell': {'blur_radius': 20, 'saturation': 180, 'border_radius': 16, 'panel_opacity': 0.65},
+    'gtk_prefer_dark': True,
+}
+with open(os.path.join(_theme_dir, 'hart-default.json'), 'w', encoding='utf-8') as _f:
+    json.dump(_BASE_PRESET, _f)
+
+
+@pytest.fixture(autouse=True)
+def _patch_paths():
+    import integrations.agent_engine.theme_service as ts
+    orig = (ts._THEME_DIR, ts._ACTIVE_THEME_PATH, ts._CUSTOM_OVERRIDES_PATH)
+    ts._THEME_DIR = _theme_dir
+    ts._ACTIVE_THEME_PATH = os.path.join(_data_dir, 'active_theme.json')
+    ts._CUSTOM_OVERRIDES_PATH = os.path.join(_data_dir, 'theme_custom.json')
+    for f in ('active_theme.json', 'theme_custom.json'):
+        p = os.path.join(_data_dir, f)
+        if os.path.exists(p):
+            os.remove(p)
+    yield
+    ts._THEME_DIR, ts._ACTIVE_THEME_PATH, ts._CUSTOM_OVERRIDES_PATH = orig
+
+
+def _svc():
+    from integrations.agent_engine.theme_service import ThemeService
+    return ThemeService
+
+
+def test_palette_only_apply_persists_custom_overrides():
+    """A palette apply with NO preset switch (secondary_accent + custom) persists
+    the colours through the custom-overrides path and reports 'customized'."""
+    svc = _svc()
+    res = svc.apply_theme('', secondary_accent='#9B5CFF',
+                          custom={'accent': '#00E6C3', 'secondary': '#9B5CFF', 'background': '#05060C'})
+    assert res.get('status') == 'customized', res
+    colors = res['overrides']['colors']
+    assert colors['accent'] == '#00E6C3'
+    assert colors['secondary'] == '#9B5CFF'
+    assert colors['background'] == '#05060C'
+    # It went through the real overrides file (reuse of update_custom).
+    import integrations.agent_engine.theme_service as ts
+    with open(ts._CUSTOM_OVERRIDES_PATH, encoding='utf-8') as f:
+        saved = json.load(f)
+    assert saved['colors']['secondary'] == '#9B5CFF'
+
+
+def test_get_css_variables_emits_hart_a2_from_secondary():
+    """The shell reads --hart-a2 / --hart-a2-rgb; a persisted secondary must emit
+    them under the canonical var name so a hard reload keeps the duotone."""
+    svc = _svc()
+    svc.apply_theme('hart-default', secondary_accent='#9B5CFF',
+                    custom={'accent': '#00E6C3', 'secondary': '#9B5CFF', 'background': '#05060C'})
+    css = svc.get_css_variables()
+    assert '--hart-a2: #9B5CFF;' in css, css
+    assert '--hart-a2-rgb: 155,92,255;' in css, css
+    # The lead accent + background overrides also land.
+    assert '--hart-accent: #00E6C3;' in css
+    assert '--hart-background: #05060C;' in css
+
+
+def test_preset_plus_palette_overlay_keeps_both():
+    """A preset switch WITH a palette overlay applies the preset as the base AND
+    keeps the palette accents on top (the overlay re-applies after the reset)."""
+    svc = _svc()
+    res = svc.apply_theme('hart-default', secondary_accent='#FF2E9A',
+                          custom={'accent': '#3B82F6'})
+    assert res.get('status') == 'applied', res
+    assert res['theme_id'] == 'hart-default'
+    css = svc.get_css_variables()
+    assert '--hart-accent: #3B82F6;' in css       # palette accent overlaid the preset
+    assert '--hart-a2: #FF2E9A;' in css           # secondary overlaid too
+
+
+def test_norm_hex_tolerates_missing_hash():
+    svc = _svc()
+    res = svc.apply_theme('', custom={'accent': '00E6C3'})   # no leading '#'
+    assert res['overrides']['colors']['accent'] == '#00E6C3'
+
+
+def test_route_accepts_palette_only_and_rejects_empty():
+    """The /api/social/theme/apply route (theme_bp) accepts a palette-only body and
+    still rejects a truly-empty one (extend, do not fork the contract)."""
+    from flask import Flask
+    from integrations.social.api_theme import theme_bp
+    app = Flask(__name__)
+    app.register_blueprint(theme_bp)
+    app.config['TESTING'] = True
+    with app.test_client() as c:
+        good = c.post('/api/social/theme/apply',
+                      json={'secondary_accent': '#9B5CFF',
+                            'custom': {'accent': '#00E6C3', 'secondary': '#9B5CFF', 'background': '#05060C'}})
+        assert good.status_code == 200, good.get_data(as_text=True)
+        assert good.get_json().get('status') == 'customized'
+
+        empty = c.post('/api/social/theme/apply', json={})
+        assert empty.status_code == 400
+
+
+def test_legacy_preset_apply_still_works():
+    """Zero-regression: the original single-arg apply_theme(theme_id) still works."""
+    svc = _svc()
+    res = svc.apply_theme('hart-default')
+    assert res.get('status') == 'applied'
+    assert res['theme_id'] == 'hart-default'
+
+
+if __name__ == '__main__':
+    import sys
+    fns = [v for k, v in sorted(globals().items()) if k.startswith('test_') and callable(v)]
+    failed = 0
+
+    # Minimal manual runner honoring the autouse fixture.
+    import integrations.agent_engine.theme_service as ts
+    for fn in fns:
+        orig = (ts._THEME_DIR, ts._ACTIVE_THEME_PATH, ts._CUSTOM_OVERRIDES_PATH)
+        ts._THEME_DIR = _theme_dir
+        ts._ACTIVE_THEME_PATH = os.path.join(_data_dir, 'active_theme.json')
+        ts._CUSTOM_OVERRIDES_PATH = os.path.join(_data_dir, 'theme_custom.json')
+        for f in ('active_theme.json', 'theme_custom.json'):
+            p = os.path.join(_data_dir, f)
+            if os.path.exists(p):
+                os.remove(p)
+        try:
+            fn(); print('  OK  ', fn.__name__)
+        except pytest.skip.Exception as e:
+            print(' SKIP ', fn.__name__, '->', e)
+        except Exception as e:
+            failed += 1; print(' FAIL ', fn.__name__, '->', repr(e))
+        finally:
+            ts._THEME_DIR, ts._ACTIVE_THEME_PATH, ts._CUSTOM_OVERRIDES_PATH = orig
+    print('RESULT:', 'ALL PASS' if not failed else (str(failed) + ' FAILED'))
+    sys.exit(1 if failed else 0)

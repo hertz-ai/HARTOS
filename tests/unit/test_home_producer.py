@@ -298,25 +298,47 @@ def test_daemon_respects_the_compose_cadence():
 
 # ── 6. per-type card image sourcing (#143 / steward d8) ──────────────────────
 
+def test_home_app_card_prefers_bundled_logo_over_network():
+    # OFFLINE-FIRST (#143 offline-art): a known app with a BUNDLED logo uses
+    # card.image (same-origin, no network) and NEVER resolves the network poster,
+    # so the marketplace/home shows real art with the internet OFF. The client
+    # (makeCard) prefers card.image over card.image_url.
+    with patch('integrations.agent_engine.shell_manifest.bundled_app_logo',
+               return_value='/shell/static/app_art/apps/org.mozilla.firefox.svg') as bl, \
+         patch('integrations.agent_engine.app_poster.resolve_app_poster') as rp:
+        card = _home_app_card('org.mozilla.firefox', 'Firefox')
+    bl.assert_called_once_with('org.mozilla.firefox')
+    assert card['image'] == '/shell/static/app_art/apps/org.mozilla.firefox.svg'
+    assert 'image_url' not in card
+    rp.assert_not_called()                              # bundled logo wins
+    assert card['action'] in HOME_CARD_ACTIONS
+    assert card['target'] in HOME_PANEL_TARGETS         # opens the app store
+
+
 def test_home_app_card_stamps_the_marketplace_poster():
-    # The producer sets card.image_url PER APP from the resolved poster; the
-    # client (W10 ImageCache) fetches the bytes once. Action/target are on the
-    # allow-sets so the sanitizer keeps the card.
-    with patch('integrations.agent_engine.app_poster.resolve_app_poster',
+    # With NO bundled logo, the producer sets card.image_url from the resolved
+    # network poster; the client (W10 ImageCache) fetches the bytes once.
+    with patch('integrations.agent_engine.shell_manifest.bundled_app_logo',
+               return_value=None), \
+         patch('integrations.agent_engine.app_poster.resolve_app_poster',
                return_value='https://dl.flathub.org/media/ff/poster.png') as r:
         card = _home_app_card('org.mozilla.firefox', 'Firefox')
     r.assert_called_once_with('org.mozilla.firefox', prefer='poster')
     assert card['image_url'] == 'https://dl.flathub.org/media/ff/poster.png'
+    assert 'image' not in card
     assert card['action'] in HOME_CARD_ACTIONS
     assert card['target'] in HOME_PANEL_TARGETS         # opens the app store
 
 
 def test_home_app_card_without_a_poster_falls_back_to_brand_art():
-    # A miss leaves image_url unset, so the client paints the brand-art tile.
-    with patch('integrations.agent_engine.app_poster.resolve_app_poster',
+    # No bundled logo AND no network poster -> neither field set, so the client
+    # paints the deterministic brand-art tile.
+    with patch('integrations.agent_engine.shell_manifest.bundled_app_logo',
+               return_value=None), \
+         patch('integrations.agent_engine.app_poster.resolve_app_poster',
                return_value=None):
         card = _home_app_card('com.example.NoArt', 'No Art')
-    assert 'image_url' not in card
+    assert 'image_url' not in card and 'image' not in card
     assert card['title'] == 'No Art' and card['icon'] == 'apps'
 
 
@@ -348,22 +370,62 @@ def test_apps_row_appears_in_the_deterministic_payload():
     assert crow['cards'][0]['image_url'] == 'https://dl.flathub.org/x.png'
 
 
+def test_home_agent_card_prefers_central_art():
+    # OFFLINE-FIRST (#143): the CENTRAL-owned agent image (resolved by name) is
+    # consulted BEFORE the generated art and stamped on card.image (which the
+    # client prefers), so an agent shows its real owned art with the net OFF and
+    # the local generator is never even probed.
+    with patch('integrations.agent_engine.app_poster.central_agent_art',
+               return_value='/shell/agent-art/auto-research') as ca, \
+         patch('integrations.agent_engine.app_poster.agent_art_url') as gen:
+        card = _home_agent_card({'name': 'Auto Research', 'type': 'research_goal',
+                                 'status': 'running'}, 'resume')
+    ca.assert_called_once_with('Auto Research')
+    assert card['image'] == '/shell/agent-art/auto-research'
+    assert 'image_url' not in card
+    gen.assert_not_called()                            # central art wins
+    assert card['live'] == 'running'
+
+
 def test_agent_card_uses_generated_art_when_a_generator_is_reachable():
-    with patch('integrations.agent_engine.app_poster.agent_art_url',
+    # No central image -> fall to the LOCAL generated art on card.image_url.
+    with patch('integrations.agent_engine.app_poster.central_agent_art',
+               return_value=None), \
+         patch('integrations.agent_engine.app_poster.agent_art_url',
                return_value='https://gen.local/art/abc.png'):
         card = _home_agent_card({'name': 'Auto Research', 'type': 'research_goal',
                                  'status': 'running'}, 'resume')
     assert card['image_url'] == 'https://gen.local/art/abc.png'
+    assert 'image' not in card
     assert card['live'] == 'running'
 
 
 def test_agent_card_falls_back_to_brand_art_when_no_generator():
-    # The HONEST default today: no on-device generator -> no image_url -> the
-    # client composites HartBrandArt + the dark-to-light scrim + the name.
-    with patch('integrations.agent_engine.app_poster.agent_art_url',
+    # The HONEST default today: no central image AND no on-device generator ->
+    # neither field -> the client composites HartBrandArt + the scrim + the name.
+    with patch('integrations.agent_engine.app_poster.central_agent_art',
+               return_value=None), \
+         patch('integrations.agent_engine.app_poster.agent_art_url',
                return_value=None):
         card = _home_agent_card({'name': 'Tutor', 'type': 'tutor_goal'}, 'ask')
-    assert 'image_url' not in card
+    assert 'image_url' not in card and 'image' not in card
+
+
+def test_sanitizer_keeps_same_origin_card_image_but_drops_hostile():
+    # card.image survives ONLY for the scoped served prefixes; a scheme-smuggling
+    # or off-origin string is dropped (the client loads card.image directly).
+    keep = L._home_sanitize_card({
+        'title': 'Firefox', 'action': 'open', 'target': 'app_store',
+        'image': '/shell/static/app_art/apps/org.mozilla.firefox.svg'})
+    assert keep['image'] == '/shell/static/app_art/apps/org.mozilla.firefox.svg'
+    agent = L._home_sanitize_card({
+        'title': 'Auto Research', 'action': 'ask',
+        'image': '/shell/agent-art/auto-research'})
+    assert agent['image'] == '/shell/agent-art/auto-research'
+    for bad in ('javascript:alert(1)', 'data:image/svg+xml,x',
+                'https://evil.example/x.png', '/etc/passwd', '../secret'):
+        c = L._home_sanitize_card({'title': 'X', 'action': 'open', 'image': bad})
+        assert 'image' not in c
 
 
 if __name__ == '__main__':

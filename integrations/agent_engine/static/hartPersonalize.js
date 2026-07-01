@@ -1,30 +1,65 @@
 /*
- * hartPersonalize.js — Themes & Wallpaper gallery (Phase B).
+ * hartPersonalize.js — Customization hub (Personalize panel).
  *
- * Renders the Personalize panel (preset theme cards + wallpaper chooser) and
- * applies wallpaper live. Reuses the shell's own primitives — window.applyPreset
- * (POST /api/social/theme/apply), the /api/shell/wallpaper collection+set routes,
- * and window.HartSession for persistence (so it shares the one session blob).
- * The .wallpaper div IS the visible desktop background on the cage kiosk, so
- * CSS wallpapers paint it directly for instant, no-rebuild feedback.
+ * The ONE customization surface. It renders (and applies live) five sections,
+ * all EXTENDING the shell's own primitives so there is a single path per concern:
  *
- * The panel HTML is built here (plain JS) rather than in the shell f-string, so
- * loadWallpaperPanel() stays a one-line delegate (no brace-escaping risk).
+ *   1. Palette   — brand accent DUOTONE (lead accent + secondary + bg). Applying a
+ *                  palette sets the brand CSS vars CLIENT-SIDE instantly (no reload),
+ *                  persists via HartSession, and best-effort extends
+ *                  /api/social/theme/apply (secondary_accent + custom) so the choice
+ *                  survives a hard reload / propagates to other surfaces. Ships
+ *                  "Vibrant" (teal + violet, the b1.2 default), "Monotone Teal"
+ *                  (original single-hue), and a CUSTOM colour picker.  (#161)
+ *   2. Orb       — switchable orb VARIETY, wired to voiceOrbViz.js's style registry
+ *                  (window.HartVoiceOrbViz.STYLES). Applies live + persists.  (#140)
+ *   3. Theme     — the 8 server-side theme presets (window.applyPreset, unchanged).
+ *   4. Wallpaper — the built-in CSS gradients / solids (live, persisted).
+ *   5. Backgrounds — video / lottie / gif wallpapers. BEST-EFFORT: on the software
+ *                  floor (body.gpu-software / potato) video + lottie DEGRADE to a
+ *                  static poster frame or the gradient (never play on a potato);
+ *                  gif is cheap and always renders.  (#162)
+ *   6. Images    — image wallpapers from the local Pictures collection.
+ *
+ * Reuses window.applyPreset (POST /api/social/theme/apply), the /api/shell/wallpaper
+ * routes, and window.HartSession for persistence (one shared session blob). The
+ * .wallpaper div IS the visible desktop background on the cage kiosk, so CSS +
+ * media paint it directly for instant, no-rebuild feedback.
+ *
+ * Consult docs/design/HOME_DESKTOP_DESIGN_CHECKLIST.md before changing this file
+ * (BINDING desktop-design rule). Old-WebKit-safe: string concat, try/catch, no
+ * optional chaining / template literals / nullish coalescing.
  */
 (function () {
   'use strict';
 
-  // Swatch palettes for the 8 server-side presets (applyPreset applies by id;
-  // these are only the gallery card colours: accent a, bg b, deep c).
+  // Same base-resolution convention hartHome.js uses (same-origin fallback when
+  // window.BACKEND is not exposed). One place, no parallel guess.
+  function backendBase() {
+    return (typeof window.BACKEND === 'string' && window.BACKEND) ? window.BACKEND : '';
+  }
+
+  // ── Brand PALETTES (#161). id/name + the duotone: lead accent (a), secondary
+  // accent (a2), canvas background (b). 'vibrant' = the b1.2 teal+violet default;
+  // 'monotone-teal' = the original single-hue. The CUSTOM picker builds an ad-hoc
+  // palette from three colour inputs. Exposed for reuse/tests (no parallel table).
+  var PALETTES = window.HART_PALETTES = [
+    { id: 'vibrant',       name: 'Vibrant',       a: '#00E6C3', a2: '#9B5CFF', b: '#05060C' },
+    { id: 'monotone-teal', name: 'Monotone Teal', a: '#00D4AA', a2: '#00D4AA', b: '#0F0E17' }
+  ];
+
+  // Swatch palettes for the 8 server-side presets (applyPreset applies by id; these
+  // are only the gallery card colours). `a2` (secondary accent) added to the preset
+  // schema so a swatch reads its duotone and stays consistent with the palette layer.
   var PRESETS = window.HART_THEME_PRESETS = [
-    { id: 'hart-default', name: 'Aurora',    a: '#00D4AA', b: '#0F0E17', c: '#16213e' },
-    { id: 'midnight',     name: 'Midnight',  a: '#5B8CFF', b: '#0a0e1f', c: '#10204a' },
-    { id: 'cyberpunk',    name: 'Cyberpunk', a: '#FF2E97', b: '#0d0221', c: '#241734' },
-    { id: 'forest',       name: 'Forest',    a: '#3FBF7F', b: '#0c160f', c: '#143024' },
-    { id: 'sunset',       name: 'Sunset',    a: '#FF8A4C', b: '#1a0f14', c: '#3a1726' },
-    { id: 'arctic',       name: 'Arctic',    a: '#3AA6FF', b: '#0c1622', c: '#16324a' },
-    { id: 'minimal',      name: 'Minimal',   a: '#9aa3ad', b: '#121214', c: '#222226' },
-    { id: 'potato',       name: 'Potato',    a: '#00D4AA', b: '#0c0c0c', c: '#161616' }
+    { id: 'hart-default', name: 'Aurora',    a: '#00D4AA', a2: '#29C5FF', b: '#0F0E17', c: '#16213e' },
+    { id: 'midnight',     name: 'Midnight',  a: '#5B8CFF', a2: '#9B5CFF', b: '#0a0e1f', c: '#10204a' },
+    { id: 'cyberpunk',    name: 'Cyberpunk', a: '#FF2E97', a2: '#29C5FF', b: '#0d0221', c: '#241734' },
+    { id: 'forest',       name: 'Forest',    a: '#3FBF7F', a2: '#00E6C3', b: '#0c160f', c: '#143024' },
+    { id: 'sunset',       name: 'Sunset',    a: '#FF8A4C', a2: '#FF2E9A', b: '#1a0f14', c: '#3a1726' },
+    { id: 'arctic',       name: 'Arctic',    a: '#3AA6FF', a2: '#29C5FF', b: '#0c1622', c: '#16324a' },
+    { id: 'minimal',      name: 'Minimal',   a: '#9aa3ad', a2: '#c8ced6', b: '#121214', c: '#222226' },
+    { id: 'potato',       name: 'Potato',    a: '#00D4AA', a2: '#00D4AA', b: '#0c0c0c', c: '#161616' }
   ];
 
   // Built-in CSS wallpapers — animated multi-hue gradients + solids, theme
@@ -39,26 +74,185 @@
     { id: 'plum',   name: 'Plum',   live: false, css: '#1a1024' },
     { id: 'pine',   name: 'Pine',   live: false, css: '#0c1a14' }
   ];
+  var DEFAULT_GRADIENT = WALLPAPERS[0].css;
 
+  // Bundled, offline media backgrounds (#162). The Hevolve lottie ships with the
+  // ISO (used by the boot splash), so a live lottie background works with NO
+  // network. type is one of 'video' | 'lottie' | 'gif'.
+  var MEDIA_BGS = window.HART_MEDIA_BGS = [
+    { id: 'hevolve-lottie', name: 'Hevolve', type: 'lottie', url: '/shell/static/hevolve-anim.json' }
+  ];
+
+  // Presentational swatch hues for each orb style (the authoritative render palette
+  // lives in voiceOrbViz.js STYLES; this is only the picker preview).
+  var ORB_PREVIEW = {
+    'vibrant':  'radial-gradient(circle at 50% 45%,#00E6C3,#0b1b2a 62%),radial-gradient(circle at 72% 72%,rgba(155,92,255,.55),transparent 55%)',
+    'ring-orb': 'radial-gradient(circle at 50% 50%,transparent 40%,#29C5FF 47%,transparent 54%),radial-gradient(circle at 50% 50%,transparent 60%,rgba(41,197,255,.5) 66%,transparent 72%),#0a1622',
+    'nebula':   'radial-gradient(circle at 42% 42%,#FF2E9A,transparent 55%),radial-gradient(circle at 66% 62%,#9B5CFF,transparent 55%),radial-gradient(circle at 55% 55%,rgba(41,197,255,.5),transparent 62%),#0b0a1a',
+    'minimal':  'radial-gradient(circle at 50% 48%,#ECF1F4,#20222c 40%)',
+    'pulse':    'radial-gradient(circle at 50% 48%,#8CFCE4,#00E6C3 24%,#06201b 70%)'
+  };
+
+  // ── DOM helpers ──────────────────────────────────────────────────────────────
+  function wpHost() { return document.querySelector('.wallpaper'); }
   function applyCss(css) {
-    var wp = document.querySelector('.wallpaper');
+    var wp = wpHost();
     if (wp && css) wp.style.background = css;
+  }
+  function hexToRgb(hex) {
+    hex = (hex || '').replace('#', '');
+    if (hex.length === 3) hex = hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2];
+    var r = parseInt(hex.slice(0, 2), 16), g = parseInt(hex.slice(2, 4), 16), b = parseInt(hex.slice(4, 6), 16);
+    if (isNaN(r) || isNaN(g) || isNaN(b)) return null;
+    return r + ',' + g + ',' + b;
+  }
+  function toast(t, m) { if (typeof window.showToast === 'function') window.showToast(t, m, 'success'); }
+
+  // ── PALETTE: paint brand vars client-side (instant), persist, extend the server
+  // theme route. paintPalette is the pure client apply (no persistence) used on
+  // restore; applyPalette is the full mutator (paint + HartSession + server). ─────
+  function paintPalette(p) {
+    var root = document.documentElement;
+    if (!root || !root.style || !root.style.setProperty) return;
+    if (p.a) {
+      root.style.setProperty('--hart-accent', p.a);
+      var rgb = hexToRgb(p.a); if (rgb) root.style.setProperty('--hart-accent-rgb', rgb);
+    }
+    if (p.a2) {
+      root.style.setProperty('--hart-a2', p.a2);
+      var rgb2 = hexToRgb(p.a2); if (rgb2) root.style.setProperty('--hart-a2-rgb', rgb2);
+    }
+    if (p.b) root.style.setProperty('--hart-background', p.b);
+  }
+  function applyPalette(p, opts) {
+    paintPalette(p);
+    if (window.HartSession) window.HartSession.set('palette', { a: p.a, a2: p.a2, b: p.b });
+    if (!(opts && opts.noServer)) {
+      // Extend /api/social/theme/apply (do NOT fork): carry the secondary accent +
+      // the custom colours so the server persists them as overrides. Best-effort —
+      // the client apply + HartSession are already the source of truth for instant
+      // + restore; a failed post is non-fatal (offline-first).
+      try {
+        fetch(backendBase() + '/api/social/theme/apply', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ secondary_accent: p.a2, custom: { accent: p.a, secondary: p.a2, background: p.b } }),
+          signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null
+        }).catch(function () {});
+      } catch (e) {}
+    }
+  }
+  window.HartPalette = { apply: applyPalette, paint: paintPalette, list: PALETTES };
+
+  // ── ORB VARIETY (#140): the customization hub owns the persisted pref
+  // (HartSession.orb_style) and drives the ONE live orb instance
+  // (window._hartVoiceOrb.setStyle). Single writer, no parallel persistence. ──────
+  function orbStyleList() {
+    return (window.HartVoiceOrbViz && window.HartVoiceOrbViz.STYLES) ||
+      [{ id: 'vibrant', name: 'Vibrant' }, { id: 'ring-orb', name: 'Ring Orb' },
+       { id: 'nebula', name: 'Nebula' }, { id: 'minimal', name: 'Minimal' }, { id: 'pulse', name: 'Pulse' }];
+  }
+  function defaultOrbStyle() {
+    return (window.HartVoiceOrbViz && window.HartVoiceOrbViz.DEFAULT_STYLE) || 'vibrant';
+  }
+  function getOrbStyle() {
+    var v = window.HartSession && window.HartSession.get('orb_style');
+    return v || defaultOrbStyle();
+  }
+  function applyOrbToCanvas(id) {
+    try { if (window._hartVoiceOrb && window._hartVoiceOrb.setStyle) window._hartVoiceOrb.setStyle(id); } catch (e) {}
+  }
+  function setOrbStyle(id) {
+    if (window.HartSession) window.HartSession.set('orb_style', id);
+    applyOrbToCanvas(id);
+  }
+  window.HartOrbStyle = { get: getOrbStyle, set: setOrbStyle,
+    apply: applyOrbToCanvas, restore: function () { applyOrbToCanvas(getOrbStyle()); } };
+
+  // ── WALLPAPER media host: manage a single #hart-wp-media child in .wallpaper so
+  // switching background types never leaves a stale <video>/lottie behind. ────────
+  function clearWpMedia() {
+    var wp = wpHost(); if (!wp) return;
+    if (wp._lottieAnim) { try { wp._lottieAnim.destroy(); } catch (e) {} wp._lottieAnim = null; }
+    var m = wp.querySelector('#hart-wp-media');
+    if (m && m.parentNode) m.parentNode.removeChild(m);
+  }
+  // The genuinely per-frame-expensive floor: software render / potato. On it, video
+  // + lottie must DEGRADE to a static frame so the hang-free baseline is preserved.
+  function isSoftwareFloor() {
+    try {
+      if (window.HART_PERF && window.HART_PERF.potato) return true;
+      if (document.body && document.body.classList && document.body.classList.contains('gpu-software')) return true;
+    } catch (e) {}
+    return false;
   }
 
   window.hartSetWallpaper = function (css) {
+    clearWpMedia();
     applyCss(css);
-    if (window.HartSession) window.HartSession.set('wallpaper_css', css);
+    if (window.HartSession) { window.HartSession.set('wallpaper_css', css); window.HartSession.set('wallpaper_bg', null); }
   };
   window.hartSetWallpaperImage = function (url, path) {
+    clearWpMedia();
     var css = "center/cover no-repeat url('" + url + "')";
     applyCss(css);
-    if (window.HartSession) window.HartSession.set('wallpaper_css', css);
+    if (window.HartSession) { window.HartSession.set('wallpaper_css', css); window.HartSession.set('wallpaper_bg', null); }
     if (path) {
       fetch('/api/shell/wallpaper/set', { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: path }) }).catch(function () {});
     }
   };
+  // video / lottie / gif backgrounds (#162). Returns true when it DEGRADED to a
+  // static frame (used by tests + callers). Never throws; degrade-not-die.
+  window.hartSetWallpaperMedia = function (type, url, poster) {
+    var wp = wpHost();
+    if (!wp || !url) return false;
+    clearWpMedia();
+    var degraded = false;
+    var posterCss = poster ? ("center/cover no-repeat url('" + poster + "')") : DEFAULT_GRADIENT;
+    if (type === 'gif') {
+      // GIF animates natively + cheaply -> always renders, even on a potato.
+      applyCss("center/cover no-repeat url('" + url + "')");
+    } else if (type === 'video') {
+      if (isSoftwareFloor()) { applyCss(posterCss); degraded = true; }
+      else {
+        applyCss(posterCss);   // shows under the video / if it fails to load
+        var v = document.createElement('video');
+        v.id = 'hart-wp-media'; v.src = url;
+        v.autoplay = true; v.loop = true; v.muted = true;
+        v.setAttribute('playsinline', ''); v.setAttribute('aria-hidden', 'true');
+        v.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:cover;pointer-events:none';
+        wp.appendChild(v);
+        try { var pr = v.play(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {}
+      }
+    } else if (type === 'lottie') {
+      if (isSoftwareFloor() || !(window.lottie && typeof window.lottie.loadAnimation === 'function')) {
+        applyCss(posterCss); degraded = true;
+      } else {
+        applyCss(posterCss);
+        var box = document.createElement('div');
+        box.id = 'hart-wp-media'; box.setAttribute('aria-hidden', 'true');
+        box.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:none';
+        wp.appendChild(box);
+        try { wp._lottieAnim = window.lottie.loadAnimation({ container: box, renderer: 'svg', loop: true, autoplay: true, path: url }); }
+        catch (e) { clearWpMedia(); applyCss(posterCss); degraded = true; }
+      }
+    } else {
+      applyCss("center/cover no-repeat url('" + url + "')");   // unknown -> treat as image
+    }
+    if (window.HartSession) {
+      window.HartSession.set('wallpaper_bg', { type: type, url: url, poster: poster || '' });
+      window.HartSession.set('wallpaper_css', '');
+    }
+    return degraded;
+  };
 
+  // ── Card builders ────────────────────────────────────────────────────────────
+  function activate(el, fn) {
+    el.addEventListener('click', fn);
+    el.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ' || e.code === 'Space') { e.preventDefault(); fn(); }
+    });
+  }
   function card(extraClass, previewStyle, name, dotColor) {
     var el = document.createElement('div');
     el.className = 'hart-tile ' + extraClass;
@@ -73,8 +267,6 @@
     return el;
   }
 
-  function toast(t, m) { if (typeof window.showToast === 'function') window.showToast(t, m, 'success'); }
-
   // Build the Personalize panel into el. Called by loadWallpaperPanel.
   window.hartRenderPersonalize = function (el) {
     if (!el) return;
@@ -88,31 +280,67 @@
       var g = document.createElement('div'); g.className = 'hart-gallery'; grid.appendChild(g); return g;
     }
 
-    // Themes
+    // 1) PALETTE — brand accent duotone (instant, persisted). Cards + custom picker.
+    var pg = section('Palette');
+    PALETTES.forEach(function (p) {
+      var c = card('hart-palette-card', 'background:linear-gradient(135deg,' + p.a + ' 0%,' + p.a2 + ' 100%)', p.name, null);
+      activate(c, function () { applyPalette(p); toast('Palette', p.name); });
+      pg.appendChild(c);
+    });
+    grid.appendChild(buildCustomPicker());
+
+    // 2) ORB — switchable variety, applied live + persisted (#140).
+    var og = section('Orb');
+    var curOrb = getOrbStyle();
+    orbStyleList().forEach(function (o) {
+      var prev = 'background:' + (ORB_PREVIEW[o.id] || ORB_PREVIEW.vibrant);
+      var c = card('hart-orb-card', prev, o.name, null);
+      if (o.id === curOrb) c.classList.add('active');
+      activate(c, function () {
+        setOrbStyle(o.id); toast('Orb', o.name);
+        var sibs = og.querySelectorAll('.hart-orb-card');
+        for (var i = 0; i < sibs.length; i++) sibs[i].classList.remove('active');
+        c.classList.add('active');
+      });
+      og.appendChild(c);
+    });
+
+    // 3) THEME — the server-side presets (unchanged; full OS theme + reload).
     var tg = section('Theme');
     PRESETS.forEach(function (p) {
       var c = card('hart-theme-card', 'background:linear-gradient(135deg,' + p.b + ',' + p.c + ')', p.name, p.a);
-      c.addEventListener('click', function () {
+      activate(c, function () {
         if (typeof window.applyPreset === 'function')
           window.applyPreset(p.id, { set textContent(v) { toast('Theme', p.name); } });
       });
       tg.appendChild(c);
     });
 
-    // CSS wallpapers
+    // 4) WALLPAPER — built-in CSS gradients / solids.
     var wg = section('Wallpaper');
     WALLPAPERS.forEach(function (w) {
       var c = card('hart-wall-card', 'background:' + w.css, w.name + (w.live ? ' · live' : ''), null);
-      c.addEventListener('click', function () { window.hartSetWallpaper(w.css); toast('Wallpaper', w.name); });
+      activate(c, function () { window.hartSetWallpaper(w.css); toast('Wallpaper', w.name); });
       wg.appendChild(c);
     });
 
-    // Image wallpapers from the existing collection. Routed through the shared
-    // designed-state loader (hartStates.js): loading skeleton -> grid on success,
-    // breathing "offline" card + one-click retry + silent auto-recover on failure
-    // — no naive 'Loading…'/'Images unavailable' strings, no stack traces. Falls
-    // back to the original inline flow if hartStates.js isn't loaded yet (the
-    // <script> include is wired brain-side), so this never breaks unwired.
+    // 5) BACKGROUNDS — video / lottie / gif (best-effort; degrade on the floor).
+    var bg = section('Backgrounds');
+    MEDIA_BGS.forEach(function (m) {
+      var c = card('hart-media-card', 'background:radial-gradient(circle at 50% 45%,rgba(0,230,195,.35),transparent 60%),#0b1220', m.name + ' · ' + m.type, null);
+      activate(c, function () {
+        var deg = window.hartSetWallpaperMedia(m.type, m.url, m.poster);
+        toast('Background', m.name + (deg ? ' (static)' : ''));
+      });
+      bg.appendChild(c);
+    });
+    grid.appendChild(buildMediaUrl());
+
+    // 6) IMAGES — image wallpapers from the local Pictures collection. Routed
+    // through the shared designed-state loader (hartStates.js): loading skeleton
+    // -> grid on success, breathing "offline" card + one-click retry + silent
+    // auto-recover on failure. Falls back to the original inline flow if
+    // hartStates.js isn't loaded yet, so this never breaks unwired.
     var ig = section('Images');
     function renderImages(host, col) {
       var imgs = (col.wallpapers || []).slice(0, 12);
@@ -133,14 +361,14 @@
         img.src = url; img.setAttribute('style', 'width:100%;height:100%;object-fit:cover');
         img.onerror = function () { img.style.display = 'none'; };
         c.querySelector('.htc-prev').appendChild(img);
-        c.addEventListener('click', function () { window.hartSetWallpaperImage(url, w.path); toast('Wallpaper', w.name || 'Image'); });
+        activate(c, function () { window.hartSetWallpaperImage(url, w.path); toast('Wallpaper', w.name || 'Image'); });
         host.appendChild(c);
       });
     }
     if (typeof window.hartLoadInto === 'function') {
       window.hartLoadInto(ig, '/api/shell/wallpaper/collection', renderImages, {
         title: 'Photo wallpapers unavailable',
-        msg: 'Your photo wallpapers could not load yet (they come from your local Pictures). The themes and gradient wallpapers above work offline; photos appear when the file service is back.'
+        msg: 'Your photo wallpapers could not load yet (they come from your local Pictures). The palette, orb, themes and gradient wallpapers above work offline; photos appear when the file service is back.'
       });
     } else {
       var loading = document.createElement('div'); loading.className = 'ds-body-sm ds-text-muted';
@@ -155,12 +383,68 @@
     el.appendChild(grid);
   };
 
-  // Restore the saved wallpaper on boot.
+  // Custom colour palette: accent + secondary + background -> applyPalette.
+  function buildCustomPicker() {
+    var wrap = document.createElement('div'); wrap.className = 'hart-custom-palette';
+    function field(label, val) {
+      var row = document.createElement('label'); row.className = 'hart-cp-field';
+      var span = document.createElement('span'); span.textContent = label;
+      var inp = document.createElement('input'); inp.type = 'color'; inp.value = val;
+      inp.setAttribute('aria-label', label + ' colour');
+      row.appendChild(span); row.appendChild(inp); wrap.appendChild(row);
+      return inp;
+    }
+    var a = field('Accent', '#00E6C3'), a2 = field('Secondary', '#9B5CFF'), b = field('Background', '#05060C');
+    var btn = document.createElement('button'); btn.type = 'button'; btn.className = 'hart-cp-apply ds-btn ds-btn-primary ds-btn-sm';
+    btn.textContent = 'Apply custom';
+    btn.addEventListener('click', function () {
+      applyPalette({ id: 'custom', a: a.value, a2: a2.value, b: b.value }); toast('Palette', 'Custom');
+    });
+    wrap.appendChild(btn);
+    return wrap;
+  }
+
+  // Add a video / gif / lottie background by URL (offline-first: any local path or
+  // remote URL). Same degrade contract as the bundled media cards.
+  function buildMediaUrl() {
+    var wrap = document.createElement('div'); wrap.className = 'hart-media-url';
+    var sel = document.createElement('select'); sel.className = 'ds-select';
+    ['video', 'gif', 'lottie'].forEach(function (t) {
+      var o = document.createElement('option'); o.value = t; o.textContent = t; sel.appendChild(o);
+    });
+    var inp = document.createElement('input'); inp.type = 'text'; inp.className = 'ds-input';
+    inp.placeholder = 'Video / GIF / Lottie URL or path'; inp.setAttribute('aria-label', 'Background media URL');
+    var btn = document.createElement('button'); btn.type = 'button'; btn.className = 'ds-btn ds-btn-primary ds-btn-sm';
+    btn.textContent = 'Set';
+    btn.addEventListener('click', function () {
+      var u = (inp.value || '').trim(); if (!u) return;
+      var deg = window.hartSetWallpaperMedia(sel.value, u);
+      toast('Background', sel.value + (deg ? ' (static)' : ''));
+    });
+    wrap.appendChild(sel); wrap.appendChild(inp); wrap.appendChild(btn);
+    return wrap;
+  }
+
+  // ── Restore persisted choices on boot ───────────────────────────────────────
   function restore() {
     if (!window.HartSession) { return setTimeout(restore, 300); }
     window.HartSession.ready(function () {
-      var css = window.HartSession.get('wallpaper_css');
-      if (css) applyCss(css);
+      // Palette (only if the user explicitly picked one; else the CSS defaults —
+      // Vibrant teal accent + violet a2 — stand as the brand default).
+      var p = window.HartSession.get('palette');
+      if (p && (p.a || p.a2 || p.b)) paintPalette(p);
+
+      // Wallpaper: a media background wins; else the legacy single-css key.
+      var mbg = window.HartSession.get('wallpaper_bg');
+      if (mbg && mbg.type && mbg.url) { window.hartSetWallpaperMedia(mbg.type, mbg.url, mbg.poster); }
+      else { var css = window.HartSession.get('wallpaper_css'); if (css) applyCss(css); }
+
+      // Orb variety — apply once the canvas instance exists (init may race us).
+      var tries = 0;
+      (function applyOrb() {
+        if (window._hartVoiceOrb && window._hartVoiceOrb.setStyle) { applyOrbToCanvas(getOrbStyle()); return; }
+        if (tries++ < 40) setTimeout(applyOrb, 300);
+      })();
     });
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', restore);

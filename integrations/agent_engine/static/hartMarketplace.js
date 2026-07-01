@@ -47,6 +47,21 @@
 
   function toast(t, m, sev) { if (window.showToast) window.showToast(t, m, sev || 'info'); }
 
+  // Reverse-DNS Flathub id (org.mozilla.firefox). A search hit without a dotted
+  // id (or a junk id) has no bundled tile, so it skips straight to the glyph.
+  var FLATHUB_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*(\.[A-Za-z0-9][A-Za-z0-9_-]*)+$/;
+
+  // Bundled, no-network app LOGO URL (offline-first). MUST match the ONE
+  // convention owned by shell_manifest.bundled_app_logo:
+  // /shell/static/app_art/apps/<flathub_id>.svg. The <img> loads it directly
+  // same-origin; if the tile is missing the onerror handler swaps in the Material
+  // glyph (the documented fallback), so a miss degrades cleanly with the net OFF.
+  function appLogoURL(app) {
+    var id = (app && app.id) || '';
+    if (!FLATHUB_ID.test(id)) return '';
+    return '/shell/static/app_art/apps/' + id + '.svg';
+  }
+
   // Determinate install progress bar. The backend now runs the install as a
   // one-at-a-time background job (POST /api/apps/install/start) and publishes
   // real phase checkpoints (downloading -> installing -> verifying -> done) plus
@@ -192,7 +207,22 @@
     var el = document.createElement('div'); el.className = 'hart-app-card';
     var top = document.createElement('div'); top.className = 'hac-top';
     var ic = document.createElement('div'); ic.className = 'hac-ic';
-    ic.innerHTML = '<span class="mi material-icons-round" aria-hidden="true">' + (app.i || 'apps') + '</span>';
+    // Material glyph is the fallback (built once, reused on an image miss).
+    var glyphHTML = '<span class="mi material-icons-round" aria-hidden="true">' + (app.i || 'apps') + '</span>';
+    var logo = appLogoURL(app);
+    if (logo) {
+      // Bundled official/brand logo, offline-first. object-fit:contain keeps a
+      // real logo un-cropped inside the 52px .hac-ic plate; a missing tile fires
+      // onerror -> the Material glyph (never a broken-image icon).
+      var img = document.createElement('img');
+      img.alt = ''; img.setAttribute('aria-hidden', 'true'); img.loading = 'lazy';
+      img.setAttribute('style', 'width:100%;height:100%;object-fit:contain;border-radius:inherit;display:block');
+      img.onerror = function () { ic.innerHTML = glyphHTML; };
+      img.src = logo;
+      ic.appendChild(img);
+    } else {
+      ic.innerHTML = glyphHTML;
+    }
     var body = document.createElement('div'); body.className = 'hac-body';
     if (app.c) { var cat = document.createElement('div'); cat.className = 'hac-cat'; cat.textContent = app.c; body.appendChild(cat); }
     var nm = document.createElement('div'); nm.className = 'hac-name'; nm.textContent = app.n; nm.title = app.n;

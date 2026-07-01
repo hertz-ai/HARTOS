@@ -1825,6 +1825,18 @@ html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot{animat
   box-shadow:0 0 8px currentColor,inset 0 0 0 2px rgba(255,255,255,0.25)}
 .hart-tile .htc-name{font-size:11px;color:var(--hart-text);text-align:center;margin-top:5px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Customization hub (#140/#161/#162): orb-variety selection ring + the custom
+   colour picker + the media-by-URL row. Palette/orb cards reuse .hart-tile. */
+.hart-orb-card.active .htc-prev{border-color:var(--hart-accent);
+  box-shadow:0 0 0 2px var(--hart-accent),0 4px 12px rgba(0,0,0,.3)}
+.hart-custom-palette{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px;padding:2px 0 12px}
+.hart-cp-field{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--hart-muted)}
+.hart-cp-field input[type=color]{width:52px;height:34px;padding:0;border:1px solid var(--hart-glass-border);
+  border-radius:8px;background:transparent;cursor:pointer}
+.hart-cp-apply{align-self:flex-end}
+.hart-media-url{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:2px 0 12px}
+.hart-media-url .ds-input{flex:1;min-width:160px}
+.hart-media-url .ds-select{width:96px;flex:0 0 auto}
 /* ── Marketplace (App Store) — premium liquid-glass cards ── */
 .hart-mkt{padding:var(--ds-space-2) var(--ds-space-1) var(--ds-space-6)}
 .hart-mkt-head{margin-bottom:var(--ds-space-5)}
@@ -1929,22 +1941,26 @@ html.a11y-rmotion .panel{animation:none}
 .hart-onboarding{position:fixed;inset:0;z-index:12000;display:none;flex-direction:column;align-items:center;justify-content:center;
   gap:26px;text-align:center;padding:48px;background:radial-gradient(circle at 50% 38%,#16142e,#07060f 72%)}
 .hart-onboarding.open{display:flex}
+/* Brand duotone (b1.2 / GF3): the orb reads TEAL core with a teal-inner +
+   VIOLET-outer layered halo (the mockup look), NOT the deprecated indigo
+   #6C63FF. Teal LEADS the functional surfaces (orb core, name reveal, option
+   chips); violet ACCENTS (the outer halo + the option hover glow). */
 .hart-onboarding .hob-orb{width:150px;height:150px;border-radius:50%;flex-shrink:0;
-  background:radial-gradient(circle at 50% 40%,rgba(160,150,255,.95),rgba(108,99,255,.35) 45%,transparent 70%);
-  box-shadow:0 0 70px rgba(108,99,255,.5),0 0 150px rgba(108,99,255,.22);animation:hob-breathe 3.2s ease-in-out infinite}
+  background:radial-gradient(circle at 50% 40%,rgba(0,230,195,.95),rgba(0,230,195,.34) 45%,transparent 70%);
+  box-shadow:0 0 70px rgba(0,230,195,.5),0 0 150px rgba(155,92,255,.24);animation:hob-breathe 3.2s ease-in-out infinite}
 @keyframes hob-breathe{0%,100%{transform:scale(1);opacity:.85}50%{transform:scale(1.08);opacity:1}}
 .hart-onboarding .hob-name{font-size:34px;font-weight:600;letter-spacing:1px;color:#fff;min-height:0;opacity:0;
   transform:translateY(8px);transition:opacity .6s,transform .6s}
-.hart-onboarding .hob-name.show{opacity:1;transform:none;text-shadow:0 0 30px rgba(108,99,255,.6)}
+.hart-onboarding .hob-name.show{opacity:1;transform:none;text-shadow:0 0 30px rgba(0,230,195,.55)}
 .hart-onboarding .hob-narr{max-width:640px;min-height:84px;display:flex;flex-direction:column;gap:10px}
-.hart-onboarding .hob-line{font-size:20px;line-height:1.5;color:#e9e7ff;font-family:var(--ds-font-body);
+.hart-onboarding .hob-line{font-size:20px;line-height:1.5;color:#e9f7f3;font-family:var(--ds-font-body);
   opacity:0;transform:translateY(6px);transition:opacity .6s,transform .6s}
 .hart-onboarding .hob-line.in{opacity:1;transform:none}
 .hart-onboarding .hob-opts{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;max-width:700px}
-.hart-onboarding .hob-opt{padding:12px 22px;border-radius:999px;border:1px solid rgba(160,150,255,.4);
-  background:rgba(108,99,255,.12);color:#fff;font-size:15px;font-family:var(--ds-font-body);cursor:pointer;
+.hart-onboarding .hob-opt{padding:12px 22px;border-radius:999px;border:1px solid rgba(0,230,195,.4);
+  background:rgba(0,230,195,.12);color:#fff;font-size:15px;font-family:var(--ds-font-body);cursor:pointer;
   transition:background .18s,transform .18s cubic-bezier(.175,.885,.32,1.275),box-shadow .18s}
-.hart-onboarding .hob-opt:hover{background:rgba(108,99,255,.28);transform:translateY(-2px);box-shadow:0 8px 24px rgba(108,99,255,.35)}
+.hart-onboarding .hob-opt:hover{background:rgba(0,230,195,.22);transform:translateY(-2px);box-shadow:0 8px 24px rgba(155,92,255,.35)}
 .hart-onboarding .hob-skip{position:fixed;bottom:20px;font-size:12px;color:rgba(255,255,255,.4)}
 '''
 
@@ -2468,7 +2484,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <div class="top-bar glass" role="banner">
   <div class="start-btn" role="button" tabindex="0" aria-haspopup="menu" aria-label="Start menu" onclick="toggleStartMenu()" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Start Menu (Super)">
     <img src="/shell/static/hevolve-logo.png" class="start-logo" alt="" aria-hidden="true" draggable="false">
-    <span class="hart-wordmark"><b style="color:#00E6C3;font-weight:800">HART</b> <span style="color:#9B5CFF;font-weight:700">OS</span></span>
+    <span class="hart-wordmark"><b style="color:var(--hart-accent,#00E6C3);font-weight:800">HART</b> <span style="color:var(--hart-a2,#9B5CFF);font-weight:700">OS</span></span>
   </div>
   <nav class="top-bar-nav" role="navigation" aria-label="Primary">
     <button class="tb-tab tb-active" type="button" data-tab="home" onclick="if(window.HartHomeNav)HartHomeNav('home')">Home</button>
@@ -2535,6 +2551,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script defer src="/shell/static/hartEffects.js"></script>
 <script defer src="/shell/static/hartPersonalize.js"></script>
 <script defer src="/shell/static/hartMarketplace.js"></script>
+<script defer src="/shell/static/hartCredits.js"></script>
 <script defer src="/shell/static/hartDock.js"></script>
 <script defer src="/shell/static/hartSenses.js"></script>
 <!-- Living-Glass: deterministic visibility engine (sole writer of <html data-*>)
@@ -3554,6 +3571,7 @@ function loadSystemPanel(id, body) {{
   else if(id==='scanner') loadScannerPanel(container);
   else if(id==='weather_widget') loadWeatherPanel(container);
   else if(id==='keyboard_shortcuts') loadKeyboardShortcutsPanel(container);
+  else if(id==='credits') loadCreditsPanel(container);
   else container.innerHTML = '<div class="ds-body-md ds-text-muted">Panel: '+id+'</div>';
 }}
 
@@ -4422,6 +4440,13 @@ function loadAppStorePanel(el) {{
   // stays a brace-safe delegate; it reuses /api/apps/search + /api/apps/install.
   if(window.hartRenderMarketplace) {{ window.hartRenderMarketplace(el); }}
   else {{ el.innerHTML = '<div class="ds-body-md ds-text-muted">Marketplace loading&hellip;</div>'; setTimeout(function(){{loadAppStorePanel(el)}}, 400); }}
+}}
+function loadCreditsPanel(el) {{
+  // About > Credits (#143): the third-party art licence ledger. Heavy DOM lives
+  // in hartCredits.js (window.hartRenderCredits) so this stays a brace-safe
+  // delegate; it reads /api/shell/credits (offline, bundled doc).
+  if(window.hartRenderCredits) {{ window.hartRenderCredits(el); }}
+  else {{ el.innerHTML = '<div class="ds-body-md ds-text-muted">Credits loading&hellip;</div>'; setTimeout(function(){{loadCreditsPanel(el)}}, 400); }}
 }}
 function appStoreSearch() {{
   const q = document.getElementById('appstore-search');
@@ -5297,6 +5322,12 @@ function speakText(text, source) {{
   // loaded yet the orb stays default-ON and hartHero's own sync damps it on load -
   // race-free either way.
   try {{ if (window.HartOrbBreathing && orb.setBreathing) orb.setBreathing(window.HartOrbBreathing.get()); }} catch(e) {{}}
+  // #140: apply the persisted orb VARIETY. hartPersonalize owns the pref (the
+  // customization hub) via HartSession.orb_style; we read it back through
+  // window.HartOrbStyle (no parallel persistence). If hartPersonalize hasn't
+  // loaded yet the orb stays default 'vibrant' and HartOrbStyle.restore() applies
+  // it once ready - idempotent either way.
+  try {{ if (window.HartOrbStyle && orb.setStyle) orb.setStyle(window.HartOrbStyle.get()); }} catch(e) {{}}
   c.style.opacity = '0.9';
   setInterval(function() {{
     var speaking = _acAudio && !_acAudio.paused && !_acAudio.ended;
@@ -5753,6 +5784,25 @@ function renderAgentOverlay(ev) {{
         @app.route('/cors/test')
         def cors_test():
             return Response('ok', mimetype='text/plain')
+
+        # ── Central-owned agent art (offline, by name-slug) ──
+        # Serves the real owned agent image the central instance drops into
+        # HART_AGENT_ART_DIR (or the bundled static/app_art/agents/ dir), resolved
+        # by app_poster.find_central_agent_file. That resolver re-slugs the id
+        # ([a-z0-9-] only) and only ever builds paths INSIDE the known drop dirs,
+        # so an arbitrary <slug> can never traverse out. A miss returns 404 and the
+        # agent card falls back to the generated art / brand-art scrim. No network.
+        @app.route('/shell/agent-art/<slug>')
+        def shell_agent_art(slug):
+            try:
+                from integrations.agent_engine import app_poster
+                path = app_poster.find_central_agent_file(slug)
+            except Exception:
+                path = None
+            if not path or not os.path.isfile(path):
+                return Response(status=404)
+            return send_from_directory(os.path.dirname(path),
+                                       os.path.basename(path))
 
         # ── Nunba SPA embedding (React pages inside panel iframes) ──
         # The dist is a no-basename BrowserRouter (history) SPA whose bundle refs
@@ -7049,18 +7099,29 @@ def _home_agent_card(a: dict, action: str, target: Optional[str] = None) -> dict
     gtype = str(a.get('type') or '').replace('_goal', '')
     card = {'title': name, 'topic': name,
             'icon': _home_icon_for(gtype or name), 'action': action}
-    # Per-agent GENERATED art (#143): only when a LOCAL image generator is
-    # reachable via the Model Bus. A miss leaves image_url unset so the client
-    # composites HartBrandArt + the dark-to-light scrim + the name (the honest
-    # default today). The SAME ImageCache/scrim path lights up if a generator
-    # ever registers; zero client change.
+    # Per-agent art (#143), OFFLINE-FIRST resolution order:
+    #   1. CENTRAL-owned image by name (app_poster.central_agent_art) - real owned
+    #      art the central instance drops/bundles, served same-origin with NO
+    #      network. Stamped on card.image (which the client prefers), so it wins.
+    #   2. LOCAL generated art (app_poster.agent_art_url) - only when an on-device
+    #      image generator is reachable via the Model Bus; stamped on image_url.
+    #   3. neither -> the client composites HartBrandArt + the dark-to-light scrim
+    #      + the name (the honest default). The scrim/text-over-art is preserved
+    #      in every case (makeCard always lays the scrim over card.image).
     try:
         from integrations.agent_engine import app_poster
-        art = app_poster.agent_art_url(name)
+        central = app_poster.central_agent_art(name)
     except Exception:
-        art = None
-    if art:
-        card['image_url'] = art
+        central = None
+    if central:
+        card['image'] = central
+    else:
+        try:
+            art = app_poster.agent_art_url(name)
+        except Exception:
+            art = None
+        if art:
+            card['image_url'] = art
     status = str(a.get('status') or '').lower()
     if status in ('running', 'in_progress', 'active'):
         card['live'] = 'running'
@@ -7117,20 +7178,31 @@ _HOME_FLAGSHIP_APPS = (
 
 
 def _home_app_card(app_id: str, name: str) -> dict:
-    """One Netflix card for an app (#143). The producer stamps card.image_url
-    from the resolved marketplace/official poster (fetched + cached ONCE by the
-    W10 ImageCache); a miss leaves image_url unset so the client paints the
-    deterministic brand-art tile. The card opens the App Store."""
-    from integrations.agent_engine import app_poster
+    """One Netflix card for an app (#143). OFFLINE-FIRST: a BUNDLED official/brand
+    logo (shell_manifest.bundled_app_logo, served same-origin, no network) is
+    PREFERRED and stamped on card.image, which the client (makeCard) prefers over
+    the network card.image_url - so a known app shows real art with the network
+    OFF. Only when no bundled logo exists do we resolve the marketplace/official
+    poster (fetched + cached ONCE by the W10 ImageCache) onto card.image_url; a
+    miss there leaves both unset so the client paints the deterministic brand-art
+    tile. The card opens the App Store."""
+    from integrations.agent_engine import app_poster, shell_manifest
     disp = _home_clean_text(name, 60) or 'App'
     card = {'title': disp, 'topic': disp, 'icon': 'apps',
             'action': 'open', 'target': 'app_store'}
+    try:
+        logo = shell_manifest.bundled_app_logo(app_id)
+    except Exception:
+        logo = None
+    if logo:
+        card['image'] = logo                     # bundled, offline, wins
+        return card
     try:
         poster = app_poster.resolve_app_poster(app_id, prefer='poster')
     except Exception:
         poster = None
     if poster:
-        card['image_url'] = poster
+        card['image_url'] = poster               # network enhancement only
     return card
 
 
@@ -7356,6 +7428,16 @@ def _home_sanitize_card(c) -> Optional[dict]:
     if isinstance(img, str) and (img.startswith('http://')
                                  or img.startswith('https://')):
         card['image_url'] = img[:500]
+    # card.image is the OFFLINE-preferred, same-origin art (bundled app logo /
+    # central agent image, #143). Allow ONLY the tightly-scoped served prefixes so
+    # a hallucinated/hostile string can never smuggle a scheme (javascript:, data:)
+    # or an off-origin URL onto the surface - it is not routed through the media
+    # cache, the browser loads it directly.
+    local_img = c.get('image')
+    if (isinstance(local_img, str)
+            and (local_img.startswith('/shell/static/app_art/')
+                 or local_img.startswith('/shell/agent-art/'))):
+        card['image'] = local_img[:200]
     p = c.get('progress')
     if isinstance(p, (int, float)) and 0 <= p <= 1:
         card['progress'] = round(float(p), 3)

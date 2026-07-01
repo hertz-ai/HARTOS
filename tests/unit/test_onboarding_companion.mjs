@@ -163,6 +163,12 @@ function fillOf(overlay) {
   ok(!!bar, 'progress bar (.hob-companion) built after the name seals');
   const fill = fillOf(E.overlay);
   ok(!!fill, 'progress fill element exists');
+  // Brand duotone (b1.2): the fill is the teal->violet gradient the module wrote,
+  // NOT the deprecated indigo #6c63ff. Assert the ACTUAL inline style it applied.
+  const grad = (fill.style.cssText || '').toLowerCase();
+  ok(grad.indexOf('#00e6c3') >= 0, 'companion fill leads with brand teal #00E6C3');
+  ok(grad.indexOf('#9b5cff') >= 0, 'companion fill accents with brand violet #9B5CFF');
+  ok(grad.indexOf('#6c63ff') < 0, 'companion fill carries NO deprecated indigo #6c63ff');
   eq(fill.style.width, '42%', 'determinate fill reflects percent=42');
   eq(E.seen[0], 'companion_progress', 'first post-seal advance is a companion_progress poll');
   E.R.step();   // poll #1 -> advance(done)

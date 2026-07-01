@@ -38,13 +38,21 @@ def get_active():
 
 @theme_bp.route('/api/social/theme/apply', methods=['POST'])
 def apply_theme():
+    """Apply a preset OS-wide, and/or overlay a Personalize palette (#161).
+
+    Body: {theme_id?, secondary_accent?, custom?:{accent,secondary,background}}.
+    The palette picker posts just secondary_accent + custom (no preset switch);
+    this route EXTENDS the same endpoint to carry them (no fork).
+    """
     data = request.get_json(force=True, silent=True) or {}
     theme_id = data.get('theme_id', '')
-    if not theme_id:
-        return jsonify({'error': 'theme_id required'}), 400
+    secondary_accent = data.get('secondary_accent')
+    custom = data.get('custom')
+    if not theme_id and not (secondary_accent or custom):
+        return jsonify({'error': 'theme_id or palette (secondary_accent/custom) required'}), 400
 
     svc = _get_service()
-    result = svc.apply_theme(theme_id)
+    result = svc.apply_theme(theme_id, secondary_accent=secondary_accent, custom=custom)
     if 'error' in result:
         return jsonify(result), 404
     return jsonify(result)

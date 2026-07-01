@@ -376,3 +376,73 @@ def agent_art_url(name: str, model_bus_port: Optional[int] = None) -> Optional[s
     except Exception as e:
         logger.debug('agent_art_url failed %s: %s', name, e)
         return None
+
+
+# ─── central-instance owned agent art (offline, by NAME) ──────────────────────
+# Real owned agent images the CENTRAL instance ships/drops for its product agents
+# (Auto Research, Trading, Tutor, ...). Consulted BEFORE the generated
+# agent_art_url so an agent shows its real owned art with the network OFF. Central
+# drops images by AGENT NAME into HART_AGENT_ART_DIR (the documented seam, e.g.
+# /var/lib/hart/agent-art), or they ship in the bundled static/app_art/agents/
+# dir; a file is matched by a slug of the agent name and served same-origin via
+# /shell/agent-art/<slug> (the liquid_ui_service route). No network, never raises.
+#
+# SEAM: `export HART_AGENT_ART_DIR=/var/lib/hart/agent-art` and drop
+# `<slug>.png|webp|jpg|svg` files there, slug = the agent name lowercased with
+# every run of non-alphanumerics collapsed to a single '-' (see _art_slug). This
+# is the ONE naming contract the resolver and the serving route share.
+
+_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
+_AGENTS_ART_DIR = os.path.join(_STATIC_DIR, 'app_art', 'agents')
+_AGENT_ART_EXTS = ('.png', '.webp', '.jpg', '.jpeg', '.svg')
+_SLUG_RE = re.compile(r'[^a-z0-9]+')
+
+
+def _art_slug(name: str) -> str:
+    """Filesystem/URL-safe slug for an agent name: lowercase, runs of non-alnum
+    collapsed to a single '-', trimmed. Only [a-z0-9-] survives, so it can never
+    encode a path traversal ('..', '/')."""
+    return _SLUG_RE.sub('-', str(name or '').lower()).strip('-')
+
+
+def _central_agent_art_dirs():
+    """Ordered dirs central agent images are looked up in: the HART_AGENT_ART_DIR
+    drop location first (the documented central seam), then the bundled dir."""
+    env = (os.environ.get('HART_AGENT_ART_DIR') or '').strip()
+    if env:
+        yield env
+    yield _AGENTS_ART_DIR
+
+
+def find_central_agent_file(name: str) -> Optional[str]:
+    """Absolute path of the central-owned image for an agent NAME, or None.
+
+    Shared by central_agent_art (URL) and the /shell/agent-art route (bytes) so
+    both agree on the ONE naming contract. Never raises."""
+    slug = _art_slug(name)
+    if not slug:
+        return None
+    for d in _central_agent_art_dirs():
+        for ext in _AGENT_ART_EXTS:
+            p = os.path.join(d, slug + ext)
+            try:
+                if os.path.isfile(p):
+                    return p
+            except OSError:
+                continue
+    return None
+
+
+def central_agent_art(name: str) -> Optional[str]:
+    """Same-origin served URL of the CENTRAL-owned image for an agent NAME, or
+    None when none is dropped/bundled. Consulted BEFORE agent_art_url so real
+    owned art wins offline; the producer stamps it on card['image'] (which the
+    client prefers over the network card['image_url']). Never raises."""
+    try:
+        slug = _art_slug(name)
+        if not slug or not find_central_agent_file(name):
+            return None
+        return '/shell/agent-art/' + slug
+    except Exception as e:
+        logger.debug('central_agent_art failed %s: %s', name, e)
+        return None
