@@ -130,7 +130,6 @@ jobs:
                 "HEVOLVE_NODE_TIER",
                 "HEVOLVE_ENFORCEMENT_MODE",
                 "ALLOWED_HOSTS",
-                "CBURL",
                 "HARTOS_GIT_SHA",
                 "HARTOS_IMAGE_TAG",
             ]
