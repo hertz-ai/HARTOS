@@ -8,7 +8,7 @@ Two halves:
    media backgrounds DEGRADE on the software floor). This wrapper shells out to node
    so pytest/CI runs it too; it skips cleanly when node is absent.
 
-2. Direct Python tests for the ``/api/social/theme/apply`` EXTENSION (#161): a
+2. Direct Python tests for the ``/api/appearance/apply`` EXTENSION (#161): a
    palette apply carries ``secondary_accent`` + ``custom`` colours; ThemeService
    persists them through the canonical custom-overrides path (reuse, not fork), and
    ``get_css_variables`` emits ``--hart-a2`` (+ its rgb triple) from the persisted
@@ -128,7 +128,7 @@ def test_norm_hex_tolerates_missing_hash():
 
 
 def test_route_accepts_palette_only_and_rejects_empty():
-    """The /api/social/theme/apply route (theme_bp) accepts a palette-only body and
+    """The /api/appearance/apply route (theme_bp) accepts a palette-only body and
     still rejects a truly-empty one (extend, do not fork the contract)."""
     from flask import Flask
     from integrations.social.api_theme import theme_bp
@@ -136,14 +136,30 @@ def test_route_accepts_palette_only_and_rejects_empty():
     app.register_blueprint(theme_bp)
     app.config['TESTING'] = True
     with app.test_client() as c:
-        good = c.post('/api/social/theme/apply',
+        good = c.post('/api/appearance/apply',
                       json={'secondary_accent': '#9B5CFF',
                             'custom': {'accent': '#00E6C3', 'secondary': '#9B5CFF', 'background': '#05060C'}})
         assert good.status_code == 200, good.get_data(as_text=True)
         assert good.get_json().get('status') == 'customized'
 
-        empty = c.post('/api/social/theme/apply', json={})
+        empty = c.post('/api/appearance/apply', json={})
         assert empty.status_code == 400
+
+
+def test_theme_bp_uses_appearance_namespace_no_social_collision():
+    """Regression (audit HIGH#1, the shadowed-palette bug): the OS appearance routes
+    (theme_bp/ThemeService) live under /api/appearance/* so they can NEVER be shadowed by
+    the social per-user theme routes (/api/social/theme/*, social_bp, @require_auth). The
+    palette went dead because both registered /api/social/theme/apply and social_bp won.
+    If theme_bp ever re-registers a /api/social/theme/* rule, this fails loudly."""
+    from flask import Flask
+    from integrations.social.api_theme import theme_bp
+    app = Flask(__name__)
+    app.register_blueprint(theme_bp)
+    rules = {str(r) for r in app.url_map.iter_rules()}
+    assert any(r.startswith('/api/appearance/') for r in rules), rules
+    assert not any('/api/social/theme/' in r for r in rules), \
+        f'theme_bp must NOT register /api/social/theme/* (collides with social_bp): {rules}'
 
 
 def test_legacy_preset_apply_still_works():

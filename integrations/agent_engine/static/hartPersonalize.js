@@ -7,7 +7,7 @@
  *   1. Palette   — brand accent DUOTONE (lead accent + secondary + bg). Applying a
  *                  palette sets the brand CSS vars CLIENT-SIDE instantly (no reload),
  *                  persists via HartSession, and best-effort extends
- *                  /api/social/theme/apply (secondary_accent + custom) so the choice
+ *                  /api/appearance/apply (secondary_accent + custom) so the choice
  *                  survives a hard reload / propagates to other surfaces. Ships
  *                  "Vibrant" (teal + violet, the b1.2 default), "Monotone Teal"
  *                  (original single-hue), and a CUSTOM colour picker.  (#161)
@@ -21,7 +21,7 @@
  *                  gif is cheap and always renders.  (#162)
  *   6. Images    — image wallpapers from the local Pictures collection.
  *
- * Reuses window.applyPreset (POST /api/social/theme/apply), the /api/shell/wallpaper
+ * Reuses window.applyPreset (POST /api/appearance/apply), the /api/shell/wallpaper
  * routes, and window.HartSession for persistence (one shared session blob). The
  * .wallpaper div IS the visible desktop background on the cage kiosk, so CSS +
  * media paint it directly for instant, no-rebuild feedback.
@@ -128,12 +128,12 @@
     paintPalette(p);
     if (window.HartSession) window.HartSession.set('palette', { a: p.a, a2: p.a2, b: p.b });
     if (!(opts && opts.noServer)) {
-      // Extend /api/social/theme/apply (do NOT fork): carry the secondary accent +
+      // Extend /api/appearance/apply (do NOT fork): carry the secondary accent +
       // the custom colours so the server persists them as overrides. Best-effort —
       // the client apply + HartSession are already the source of truth for instant
       // + restore; a failed post is non-fatal (offline-first).
       try {
-        fetch(backendBase() + '/api/social/theme/apply', {
+        fetch(backendBase() + '/api/appearance/apply', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ secondary_accent: p.a2, custom: { accent: p.a, secondary: p.a2, background: p.b } }),
           signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null

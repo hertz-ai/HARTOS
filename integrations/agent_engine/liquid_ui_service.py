@@ -5201,7 +5201,7 @@ function handleThemeCommand(text, resp) {{
   else if(text.includes('potato')||text.includes('ultra')||text.includes('lite')||text.includes('performance')||text.includes('fast')) {{ applyPreset('potato',resp); return; }}
   else {{ resp.textContent='Try: dark, light, cyberpunk, midnight, forest, sunset, potato, bigger, smaller'; return; }}
 
-  fetch(BACKEND+'/api/social/theme/customize',{{method:'POST',
+  fetch(BACKEND+'/api/appearance/customize',{{method:'POST',
     headers:{{'Content-Type':'application/json'}},body:JSON.stringify(customization)}})
     .then(r=>r.json()).then(()=>{{
       resp.textContent='Done! Refreshing...';
@@ -5210,7 +5210,7 @@ function handleThemeCommand(text, resp) {{
 }}
 
 function applyPreset(id, resp) {{
-  fetch(BACKEND+'/api/social/theme/apply',{{method:'POST',
+  fetch(BACKEND+'/api/appearance/apply',{{method:'POST',
     headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{theme_id:id}})}})
     .then(r=>r.json()).then(()=>{{
       resp.textContent='Applied '+id+'! Refreshing...';

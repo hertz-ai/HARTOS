@@ -10,7 +10,7 @@
  *  [P] PALETTE — window.HartPalette.apply(palette): paints --hart-accent / --hart-a2
  *      / --hart-background (+ their rgb triples) on documentElement INSTANTLY,
  *      persists {a,a2,b} under HartSession.palette, and extends
- *      /api/social/theme/apply with secondary_accent + custom (best-effort POST).
+ *      /api/appearance/apply with secondary_accent + custom (best-effort POST).
  *  [C] CUSTOM PALETTE — the rendered custom colour picker (accent/secondary/bg
  *      inputs + Apply) applies + persists the ad-hoc palette.
  *  [O] ORB VARIETY — window.HartOrbStyle.set()/restore() persists HartSession.orb_style
@@ -182,8 +182,8 @@ function runModules(realm, files) {
   ok(persisted && persisted.a === '#00E6C3' && persisted.a2 === '#9B5CFF' && persisted.b === '#05060C',
      'palette persisted {a,a2,b} under HartSession.palette');
 
-  const post = R.fetchCalls.filter(c => String(c.url).indexOf('/api/social/theme/apply') >= 0);
-  ok(post.length === 1, 'exactly one POST to /api/social/theme/apply (extend, not fork)');
+  const post = R.fetchCalls.filter(c => String(c.url).indexOf('/api/appearance/apply') >= 0);
+  ok(post.length === 1, 'exactly one POST to /api/appearance/apply (extend, not fork)');
   const body = JSON.parse(post[0].opts.body);
   eq(body.secondary_accent, '#9B5CFF', 'the theme/apply body carries secondary_accent (a2)');
   ok(body.custom && body.custom.accent === '#00E6C3' && body.custom.secondary === '#9B5CFF' && body.custom.background === '#05060C',
