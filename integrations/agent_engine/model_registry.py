@@ -454,6 +454,39 @@ def _register_defaults():
             cost_per_1k_tokens=0.5,
         ))
 
+    # 5c. Distributed shard cluster (WAN pipeline-parallel inference) — feature-flagged.
+    #     A model too big for one node is served by K peers, each holding a
+    #     contiguous LAYER range; only the hidden-state activation crosses the
+    #     wire (never weights). HARTOS owns the mesh/relay/trust/economics; the
+    #     per-shard forward pass lives behind hevolveai's Model Bus /v1/shard/*
+    #     verbs (frozen boundary: hevolveai/docs/SHARD_RUNTIME_CONTRACT.md,
+    #     mirrored in docs/architecture/SHARD_RUNTIME_HARTOS_SIDE.md).
+    #
+    #     This entry only ADVERTISES the capability so routing can see it. Actual
+    #     dispatch is intercepted by the shard-orchestrator on model_id match
+    #     BEFORE any OpenAI-style client is built (the 'shard://cluster' base_url
+    #     is a deliberate non-endpoint — it must never be dialled directly). Off
+    #     by default; set HART_SHARD_RUNTIME=1 on a node that has joined a shard
+    #     cluster. Until the orchestrator lands, the dispatcher must skip this
+    #     model_id (see the side doc §"Selection guard").
+    if os.environ.get('HART_SHARD_RUNTIME', '').lower() in ('1', 'true', 'yes'):
+        model_registry.register(ModelBackend(
+            model_id='distributed-shard',
+            display_name='Distributed Shard Cluster (WAN pipeline)',
+            tier=ModelTier.EXPERT,
+            config_list_entry={
+                'model': os.environ.get('HART_SHARD_MODEL', 'distributed-shard'),
+                'api_key': 'local',
+                'base_url': 'shard://cluster',  # non-endpoint: orchestrator intercepts by model_id
+                'price': [0, 0],
+            },
+            avg_latency_ms=6000.0,   # WAN pipeline hops — slow but unlocks models no single node can host
+            accuracy_score=0.92,     # runs the full big model, so quality tracks the model, not the split
+            cost_per_1k_tokens=0.0,  # peer compute, not a paid API
+            is_local=False,          # distributed across peers, not this box
+            hardware_dependent=True,
+        ))
+
     # 6. HevolveAI-Core Learning LLM (balanced — local world model, improves over time)
     hevolveai_url = os.environ.get('HEVOLVEAI_API_URL')
     if hevolveai_url:

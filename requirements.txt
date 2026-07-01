@@ -71,6 +71,16 @@ imageio==2.37.3
 imageio-ffmpeg==0.6.0
 importlib-metadata==6.7.0
 itsdangerous==2.1.2
+# jeepney — pure-Python D-Bus for the TYPED + NATIVE Shell<->OS bridge (#133 / W3,
+# integrations/agent_engine/os_bridge/logind.py).  Lets the power ops
+# (hartOS.power.reboot/shutdown/firmwareSetup) talk to logind
+# (org.freedesktop.login1) over the system bus DIRECTLY — no busctl/systemctl
+# subprocess.  The import is GUARDED: on a box with no jeepney or no system bus
+# (the Windows dev box) it falls back to the bounded, result-checked `busctl call`
+# path, so this dependency is purely an upgrade to the native transport — never a
+# hard requirement.  Pure-Python (no C ext), so it bundles cleanly under cx_Freeze
+# and packages trivially in Nix.
+jeepney>=0.8.0
 Jinja2==3.1.2
 joblib==1.2.0
 jsonpatch==1.33

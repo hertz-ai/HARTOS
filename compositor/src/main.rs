@@ -217,6 +217,17 @@ struct BootConfig {
     /// supervisor / the hart-comp.nix unit pass this on broken-GPU boxes so a
     /// half-finished hardware path can never brick the box.
     force_software: bool,
+    /// `--prefer-hardware` / `HART_COMP_PREFER_HARDWARE`: the OPERATOR OVERRIDE that
+    /// forces the GLES hardware path WITHOUT re-reading the boot GPU-probe verdict.
+    /// The hart-comp.nix launcher's `preferHardwareGL` arm sets this so the compositor
+    /// HONORS the operator's force-hardware intent (before this field the launcher
+    /// only dropped the `--force-software` pin, but `select_render_path` still re-read
+    /// `/run/hart/gpu-render` and stayed on pixman when the probe fail-safed to
+    /// `software` — the override never actually reached GLES). `force_software` ALWAYS
+    /// wins over this (the never-fail floor is not overridable), and a GLES init/runtime
+    /// fault still degrades to the pixman renderer of record (degrade-not-die), so
+    /// forcing hardware can upgrade the path but can never brick the box.
+    prefer_hardware: bool,
     /// `--backend winit|drm`. Defaults to `Winit` (the runnable dev/WSL path) so
     /// `cargo run --features winit` Just Works under WSLg; a real-HW deploy passes
     /// `--backend drm` (and is built with `--features smithay`).
@@ -232,6 +243,14 @@ impl BootConfig {
             || std::env::var("WLR_RENDERER_ALLOW_SOFTWARE").is_ok()
             || std::env::var("LIBGL_ALWAYS_SOFTWARE").is_ok()
             || std::env::var("HART_COMP_FORCE_SOFTWARE").is_ok();
+
+        // The operator force-hardware override (hart.liquidUI.preferHardwareGL): the
+        // launcher passes `--prefer-hardware` / exports `HART_COMP_PREFER_HARDWARE=1`
+        // when it armed the hardware path, so `select_render_path` upgrades to GLES on
+        // the launcher's verdict instead of independently re-reading the probe file (a
+        // second, drift-prone read of the SAME decision). `force_software` still wins.
+        let prefer_hardware = std::env::args().any(|a| a == "--prefer-hardware")
+            || std::env::var("HART_COMP_PREFER_HARDWARE").is_ok();
 
         // `--backend winit|drm` (default winit). Parsed positionally: the token
         // AFTER `--backend` is the value.
@@ -250,6 +269,7 @@ impl BootConfig {
 
         BootConfig {
             force_software,
+            prefer_hardware,
             backend,
         }
     }
@@ -284,6 +304,17 @@ fn select_render_path(cfg: &BootConfig) -> RenderPath {
         tracing::info!("render path: SOFTWARE (forced via --force-software / env)");
         return RenderPath::Software;
     }
+    // The operator force-hardware override (preferHardwareGL). This is the SECOND check
+    // on purpose: the never-fail software floor (`force_software`) is not overridable, but
+    // once the floor is not forced, an explicit operator arm upgrades to GLES WITHOUT
+    // re-reading the probe file — closing the gap where the launcher armed hardware yet the
+    // compositor stayed on pixman because the probe had fail-safed to `software`. A GLES
+    // init/runtime fault still falls back to the pixman renderer of record (udev.rs), so
+    // this can raise the path but never brick the box.
+    if cfg.prefer_hardware {
+        tracing::info!("render path: HARDWARE (operator override — --prefer-hardware / HART_COMP_PREFER_HARDWARE)");
+        return RenderPath::Hardware;
+    }
     // Read the boot-time GPU smoke-test verdict (hart-gpu-probe). The probe is the
     // device walk that used to be a TODO here: it fail-safes to `software` and the file
     // is simply absent on a box that never ran it (the Windows dev box, an unprobed
@@ -300,6 +331,195 @@ fn select_render_path(cfg: &BootConfig) -> RenderPath {
             "render path: SOFTWARE (GPU probe not 'hardware' — never-fail floor)"
         );
         RenderPath::Software
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// #131 — FIRST-SCANOUT beacon (kill the "black-but-healthy" Tier-1)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The session supervisor's paint watchdog reads HEALTHY off the shell-ready marker,
+// which the glass-shell WebView host touches when IT renders its first frame. But the
+// WebView renders CLIENT-SIDE into its own wl_buffer and fires shell-ready regardless
+// of whether that buffer ever reached the physical display — so a compositor that lost
+// DRM master (EACCES page-flips forever) or never completed a page-flip is BLACK yet
+// still passes the paint watchdog (the exact "black, SETTLED Tier-1 the paint watchdog
+// can't catch" the udev.rs master-recovery comment names).
+//
+// The first-scanout beacon is the COMPOSITOR-side proof the shell-ready marker cannot
+// give: it is written EXACTLY ONCE, on the first REAL page-flip vblank (a frame that
+// actually scanned out to the CRTC — a kernel page-flip completion event only fires
+// after a real scanout). The supervisor's scanout watchdog (fail-safe OFF until armed,
+// exactly like the input-alive twin) can then require this marker to declare Tier-1
+// truly painted, distinguishing a live desktop from a black one.
+//
+// The DECISION + PATH + WRITE are split into PURE helpers (unit-tested on the dev box
+// with no DRM), mirroring the `master_step`/`flip_action`/`gpu_verdict_is_hardware`
+// pure-policy split; only the udev.rs call site (reap_completed_vblanks) is Smithay-
+// gated / CI-compiled. All three markers (shell-ready, input-alive, first-scanout) share
+// the same /run/hart/session dir + the same "env override, else pinned default" contract.
+
+/// Default path of the first-scanout marker (the compositor-scanout twin of the shell-ready
+/// and input-alive markers). Overridable via `HART_SCANOUT_ALIVE_FLAG` so the compositor
+/// writer and the supervisor reader share ONE path with no hardcoded divergence.
+#[allow(dead_code)] // consumed by the smithay udev backend (reap_completed_vblanks) + tests
+const SCANOUT_MARKER_DEFAULT: &str = "/run/hart/session/first-scanout";
+
+/// PURE: resolve where the first-scanout marker is written — the `HART_SCANOUT_ALIVE_FLAG`
+/// env override when set + non-empty, else the pinned default. Split out so the path
+/// contract is unit-tested on the dev box (mirrors the GPU_VERDICT_PATH read).
+#[allow(dead_code)] // consumed by note_first_scanout_once (smithay udev) + tests
+fn scanout_marker_path() -> String {
+    match std::env::var("HART_SCANOUT_ALIVE_FLAG") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => SCANOUT_MARKER_DEFAULT.to_string(),
+    }
+}
+
+/// PURE: should the first-scanout marker be emitted on THIS vblank? `true` EXACTLY when
+/// the marker has not been emitted yet AND a real scanout (page-flip vblank) just
+/// completed. Mirrors `master_step`'s pure-policy split so the one-shot decision is tested
+/// with NO DRM hardware.
+#[allow(dead_code)] // consumed by note_first_scanout_once (smithay udev) + tests
+fn first_scanout_step(already_marked: bool, scanned_out: bool) -> bool {
+    !already_marked && scanned_out
+}
+
+/// Best-effort write of the first-scanout marker to `path`. Returns `true` iff the write
+/// succeeded. NEVER blocks / NEVER aborts: the marker is advisory (a read-only FS or a
+/// missing `/run/hart/session` dir just leaves the journal line as the signal), exactly
+/// like the input-alive beacon.
+#[allow(dead_code)] // consumed by note_first_scanout_once (smithay udev) + tests
+fn write_scanout_marker(path: &str) -> bool {
+    std::fs::write(path, b"1\n").is_ok()
+}
+
+/// Emit the first-scanout beacon EXACTLY ONCE. `latch` is a caller-owned one-shot flag
+/// (a module `static AtomicBool` on the udev backend); the first call with `scanned_out`
+/// true flips it and writes the marker, every later call is a single atomic load. Passing
+/// the latch in (rather than a hidden module static) keeps the "exactly once" behaviour
+/// unit-testable on the dev box. Best-effort + non-blocking — the never-fail posture.
+#[allow(dead_code)] // called from the smithay udev backend's reap_completed_vblanks
+fn note_first_scanout_once(latch: &std::sync::atomic::AtomicBool, scanned_out: bool) {
+    // Only a real scanout arms the beacon, and only the first one writes: the pure
+    // `first_scanout_step` decides, the atomic swap enforces once-only across ticks.
+    if !first_scanout_step(latch.load(Ordering::Relaxed), scanned_out) {
+        return;
+    }
+    if latch.swap(true, Ordering::Relaxed) {
+        return; // lost the race to a concurrent caller — someone else already wrote it
+    }
+    let path = scanout_marker_path();
+    if write_scanout_marker(&path) {
+        tracing::info!(marker = %path, "hart-comp: first real scanout (page-flip vblank) completed — the physical display is LIVE (#131 first-scanout beacon)");
+    } else {
+        tracing::info!("hart-comp: first real scanout completed (marker write skipped — advisory only)");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// #137 — FRAME-BUDGET repaint scheduler (on-demand rendering; stop the idle 60Hz burn)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Through M8 the DRM render loop (udev.rs) rebuilt the element list + ran the pixman
+// damage pass + attempted a page-flip on EVERY 16ms tick, even for a perfectly static
+// desktop — "the pixman floor has no damage-driven scheduling here; a 60Hz repaint is
+// the simple never-fail cadence" (udev.rs run_udev). That is CPU + power the never-fail
+// floor does not need to spend: when nothing changed there is nothing to composite and
+// nothing to flip. The DrmCompositor already tracks damage at the REGION level inside
+// `render_frame` (it returns `is_empty`, and the tick already skips the flip on that) —
+// what was missing is the TICK-level gate that avoids rebuilding + re-importing the
+// whole element list when the scene is provably idle.
+//
+// `RepaintScheduler` is that pure, damage-driven decision. It tracks a single `dirty`
+// latch the compositor sets on any real change (a client committed a new buffer, an
+// input moved the cursor/focus, a window mapped/unmapped, a workspace switched, the
+// kill-switch toggled, a session/master edge). The render tick asks `should_paint(...)`;
+// when it returns false the tick skips the whole build+render+flip and the loop idles
+// until the next real edge — the compositor's OWN on-demand rendering, the architecture
+// every mature compositor has.
+//
+// THE NEVER-FAIL FLOOR IS PRESERVED, two independent ways:
+//   1. It starts DIRTY (the first frame ALWAYS paints — the splash / glass shell come
+//      up exactly as before), and ANY doubt marks dirty, so the scheduler can only ever
+//      skip a provably-idle frame — it can never black or freeze a live scene.
+//   2. A HEARTBEAT backstop: even with ZERO observed damage the tick force-repaints at
+//      least every `IDLE_HEARTBEAT`, so a MISSED damage edge self-corrects within one
+//      heartbeat (a brief stutter — exactly the #186 degrade-not-die posture) rather
+//      than wedging the screen. It is impossible for a forgotten `mark_damaged()` to
+//      permanently freeze the display.
+//
+// PURE (no Smithay types) so the decision is unit-tested on the dev box with no DRM,
+// mirroring the master_step / flip_action / first_scanout_step split; only the udev.rs
+// call sites (the render tick + the damage edges) are Smithay-gated / CI-compiled.
+
+/// The idle-repaint backstop. Even with no observed damage the render tick paints at
+/// least this often, so a missed `mark_damaged()` edge self-heals within one interval
+/// instead of wedging the screen. 200ms = a 5 Hz idle floor: ~12× fewer idle repaints
+/// than the old unconditional 60 Hz burn, yet well under a human-perceptible stall and
+/// FAR under the session supervisor's 45s first-paint watchdog. Interactive latency is
+/// UNAFFECTED — a real edge marks dirty and paints on the very next 16ms tick.
+#[allow(dead_code)] // consumed by the smithay udev render tick (udev.rs) + tests
+const IDLE_HEARTBEAT: Duration = Duration::from_millis(200);
+
+/// PURE damage-driven repaint scheduler (#137). See the section header. The udev render
+/// tick owns exactly one instance (a field on the DRM `State`); every damage edge calls
+/// `mark_damaged`, the tick gates on `should_paint`, and `note_painted` closes the loop.
+#[allow(dead_code)] // one instance lives on the smithay DRM State; unit-tested here
+#[derive(Debug)]
+struct RepaintScheduler {
+    /// A real change is pending composite. Starts TRUE (the first frame always paints).
+    dirty: bool,
+    /// When the last real paint happened, for the idle heartbeat. `None` until the first.
+    last_paint: Option<Instant>,
+}
+
+#[allow(dead_code)] // methods are called from the smithay udev backend + the tests below
+impl RepaintScheduler {
+    /// Dirty at boot: the splash + glass-shell first frame must always paint.
+    fn new() -> Self {
+        Self { dirty: true, last_paint: None }
+    }
+
+    /// Mark the scene changed — the next tick will composite. Cheap + idempotent; call
+    /// from EVERY damage edge (commit, input, map/unmap, workspace, kill-switch,
+    /// session/master). Over-calling only costs one extra repaint; under-calling is
+    /// caught by the heartbeat, so this is safe to sprinkle liberally.
+    fn mark_damaged(&mut self) {
+        self.dirty = true;
+    }
+
+    /// PURE: should this tick composite + flip, given whether an effect is mid-animation
+    /// and how long since the last real paint? True when damage is pending, an effect is
+    /// animating (fades must play frame-by-frame), we have never painted, or the idle
+    /// heartbeat elapsed. Split from `should_paint` so the branch is tested with a
+    /// synthetic clock (no `Instant::now()` in the test).
+    fn wants_paint(&self, effects_animating: bool, since_last_paint: Option<Duration>) -> bool {
+        if self.dirty || effects_animating {
+            return true;
+        }
+        match since_last_paint {
+            None => true,                    // never painted → must paint
+            Some(d) => d >= IDLE_HEARTBEAT,  // idle backstop (self-heals a missed edge)
+        }
+    }
+
+    /// The live wrapper: derive the elapsed-since-last-paint from `now` and decide.
+    /// `saturating_duration_since` clamps a non-monotonic clock hiccup to zero (never a
+    /// panic) — the never-fail posture even on the wall-clock edge cases.
+    fn should_paint(&self, now: Instant, effects_animating: bool) -> bool {
+        let since = self.last_paint.map(|t| now.saturating_duration_since(t));
+        self.wants_paint(effects_animating, since)
+    }
+
+    /// Call AFTER a tick actually composited. Records the paint time for the heartbeat
+    /// and clears the dirty latch — UNLESS an effect is still animating, which must keep
+    /// painting next tick (so a fade is never frozen mid-way). Keeping `dirty` in lockstep
+    /// with `effects_animating` here is what lets an in-flight crossfade play frame-by-
+    /// frame with no separate scheduling, exactly as the old unconditional loop did.
+    fn note_painted(&mut self, now: Instant, effects_animating: bool) {
+        self.last_paint = Some(now);
+        self.dirty = effects_animating;
     }
 }
 
@@ -902,7 +1122,7 @@ mod tests {
 
     #[test]
     fn force_software_pins_software_path() {
-        let cfg = BootConfig { force_software: true, backend: Backend::Winit };
+        let cfg = BootConfig { force_software: true, prefer_hardware: false, backend: Backend::Winit };
         assert_eq!(select_render_path(&cfg), RenderPath::Software);
     }
 
@@ -911,7 +1131,27 @@ mod tests {
         // With the hardware probe stubbed FALSE (the safe Windows-dev default),
         // even a non-forced boot MUST select the software floor — never a blank
         // screen waiting on an unproven hardware path.
-        let cfg = BootConfig { force_software: false, backend: Backend::Winit };
+        let cfg = BootConfig { force_software: false, prefer_hardware: false, backend: Backend::Winit };
+        assert_eq!(select_render_path(&cfg), RenderPath::Software);
+    }
+
+    #[test]
+    fn prefer_hardware_override_upgrades_to_gles_without_the_probe_file() {
+        // The operator override (preferHardwareGL) forces the GLES path EVEN when the
+        // boot GPU-probe file is absent/`software` (the exact case the override exists
+        // for). Before the `prefer_hardware` field the launcher armed hardware yet the
+        // compositor re-read `/run/hart/gpu-render`, saw no `hardware`, and stayed on
+        // pixman — the override never reached GLES. This proves it now does.
+        let cfg = BootConfig { force_software: false, prefer_hardware: true, backend: Backend::Drm };
+        assert_eq!(select_render_path(&cfg), RenderPath::Hardware);
+    }
+
+    #[test]
+    fn force_software_always_wins_over_prefer_hardware_the_floor_is_not_overridable() {
+        // The never-fail software floor is NOT overridable: if BOTH are set (a broken-GPU
+        // box that also carries an operator hardware arm), force_software wins so a
+        // half-finished hardware path can never brick the box.
+        let cfg = BootConfig { force_software: true, prefer_hardware: true, backend: Backend::Drm };
         assert_eq!(select_render_path(&cfg), RenderPath::Software);
     }
 
@@ -935,6 +1175,172 @@ mod tests {
         assert!(!gpu_verdict_is_hardware(Some("")), "empty verdict → software floor");
         assert!(!gpu_verdict_is_hardware(Some("hardware-ish")), "only the exact token upgrades");
         assert!(!gpu_verdict_is_hardware(None), "absent probe file → software floor (never-fail)");
+    }
+
+    // ── #131: the first-scanout beacon (kill the black-but-healthy Tier-1) ──
+
+    #[test]
+    fn first_scanout_step_emits_once_on_the_first_real_scanout() {
+        // Emit ONLY when not-yet-marked AND a real scanout just completed. The truth
+        // table IS the one-shot contract the udev backend relies on.
+        assert!(first_scanout_step(false, true), "unmarked + scanned out => emit");
+        assert!(!first_scanout_step(true, true), "already marked => never re-emit");
+        assert!(!first_scanout_step(false, false), "no scanout => nothing to mark");
+        assert!(!first_scanout_step(true, false), "marked + no scanout => no-op");
+    }
+
+    #[test]
+    fn write_scanout_marker_writes_the_advisory_byte_and_reports_success() {
+        // The writer creates the marker file with the sentinel byte and reports true; a
+        // path under a missing dir just reports false (best-effort — never a panic).
+        let mut ok_path = std::env::temp_dir();
+        ok_path.push(format!("hart-scanout-writer-{}.marker", std::process::id()));
+        let _ = std::fs::remove_file(&ok_path);
+        assert!(write_scanout_marker(&ok_path.to_string_lossy()), "write to a real temp dir succeeds");
+        assert_eq!(std::fs::read(&ok_path).unwrap(), b"1\n", "marker carries the sentinel byte");
+        let _ = std::fs::remove_file(&ok_path);
+
+        let missing = std::env::temp_dir().join("hart-no-such-dir-xyz").join("m");
+        assert!(!write_scanout_marker(&missing.to_string_lossy()), "unwritable path degrades to false, never panics");
+    }
+
+    #[test]
+    fn first_scanout_beacon_writes_exactly_once_to_the_resolved_path() {
+        // The FULL behavioural path: HART_SCANOUT_ALIVE_FLAG resolves the marker location,
+        // a caller-owned latch enforces once-only, and no scanout writes nothing. This is
+        // the ONLY test that touches HART_SCANOUT_ALIVE_FLAG, so its process-global env set
+        // never races another case.
+        use std::sync::atomic::AtomicBool;
+        // Default resolution first (this test is the ONLY toucher of the env var, so the
+        // default read here cannot race another case).
+        std::env::remove_var("HART_SCANOUT_ALIVE_FLAG");
+        assert_eq!(scanout_marker_path(), SCANOUT_MARKER_DEFAULT, "no override => the pinned /run/hart/session default");
+
+        let mut marker = std::env::temp_dir();
+        marker.push(format!("hart-scanout-beacon-{}.marker", std::process::id()));
+        let marker_s = marker.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&marker);
+        std::env::set_var("HART_SCANOUT_ALIVE_FLAG", &marker_s);
+
+        assert_eq!(scanout_marker_path(), marker_s, "env override resolves the marker path");
+
+        let latch = AtomicBool::new(false);
+        // No real scanout yet → no marker, latch stays clear.
+        note_first_scanout_once(&latch, false);
+        assert!(!latch.load(Ordering::Relaxed), "no scanout leaves the latch clear");
+        assert!(!marker.exists(), "no scanout writes no marker");
+
+        // First real scanout → marker written, latch set.
+        note_first_scanout_once(&latch, true);
+        assert!(latch.load(Ordering::Relaxed), "first scanout sets the latch");
+        assert_eq!(std::fs::read(&marker).unwrap(), b"1\n", "first scanout writes the marker");
+
+        // A later scanout must NOT re-write (one-shot): delete the file, call again, and
+        // confirm it was not recreated.
+        let _ = std::fs::remove_file(&marker);
+        note_first_scanout_once(&latch, true);
+        assert!(!marker.exists(), "the beacon is one-shot — a later scanout never re-writes");
+
+        std::env::remove_var("HART_SCANOUT_ALIVE_FLAG");
+    }
+
+    // ── #137: the frame-budget repaint scheduler. The pure decision that turns the DRM
+    // loop from an unconditional 60Hz burn into on-demand rendering, WITHOUT ever being
+    // able to freeze the never-fail floor. The `mark_damaged`/`should_paint`/`note_painted`
+    // trio is the only Smithay-touching part's policy; the real `Instant::now()` clock +
+    // the udev call sites are the CI-compiled half. These assert the invariants that
+    // matter: a live scene always paints, an idle scene is skipped, and NO state can wedge
+    // the display (the heartbeat always breaks a skip streak). ──
+
+    #[test]
+    fn repaint_scheduler_first_frame_always_paints() {
+        // Boot posture: dirty, never painted. The splash + glass shell MUST come up, so
+        // the very first tick paints regardless of animation or clock.
+        let s = RepaintScheduler::new();
+        assert!(s.wants_paint(false, None), "a fresh scheduler is dirty → first frame paints");
+        assert!(s.wants_paint(false, Some(Duration::from_millis(0))), "even at t=0 the first frame paints (dirty)");
+    }
+
+    #[test]
+    fn repaint_scheduler_skips_a_provably_idle_frame() {
+        // A clean (already-painted, not-dirtied) scheduler with no animation and the last
+        // paint well within the heartbeat MUST skip — this is the whole frame-budget win.
+        let mut s = RepaintScheduler::new();
+        s.note_painted(Instant::now(), false); // clears dirty, records the paint
+        assert!(!s.wants_paint(false, Some(Duration::from_millis(16))), "clean + static + fresh paint → skip");
+        assert!(!s.wants_paint(false, Some(IDLE_HEARTBEAT - Duration::from_millis(1))), "just under the heartbeat → still skip");
+    }
+
+    #[test]
+    fn repaint_scheduler_any_damage_forces_a_paint() {
+        // A commit / input / map / kill-switch edge marks dirty → the next tick paints even
+        // when the clock says "idle" (last paint 1ms ago). This is interactive latency = 0.
+        let mut s = RepaintScheduler::new();
+        s.note_painted(Instant::now(), false);
+        assert!(!s.wants_paint(false, Some(Duration::from_millis(1))), "clean → would skip");
+        s.mark_damaged();
+        assert!(s.wants_paint(false, Some(Duration::from_millis(1))), "a damage edge forces a paint on the very next tick");
+    }
+
+    #[test]
+    fn repaint_scheduler_effects_animate_frame_by_frame() {
+        // An in-flight fade must play every tick: even clean + fresh-paint, `effects_animating`
+        // keeps painting; and `note_painted(animating=true)` re-arms dirty so the NEXT tick also
+        // paints (the crossfade is never frozen mid-way).
+        let mut s = RepaintScheduler::new();
+        s.note_painted(Instant::now(), true); // painted a fade frame; still animating
+        assert!(s.dirty, "note_painted keeps dirty while an effect animates");
+        assert!(s.wants_paint(true, Some(Duration::from_millis(1))), "an animating effect paints every tick");
+    }
+
+    #[test]
+    fn repaint_scheduler_heartbeat_self_heals_a_missed_edge() {
+        // THE never-wedge invariant: even if a damage edge was FORGOTTEN (clean + not
+        // animating), once the heartbeat elapses the tick force-repaints — so a missed
+        // mark_damaged() is at worst a ≤200ms stutter, never a frozen screen.
+        let mut s = RepaintScheduler::new();
+        s.note_painted(Instant::now(), false);
+        assert!(!s.wants_paint(false, Some(IDLE_HEARTBEAT - Duration::from_millis(1))), "under heartbeat → skip");
+        assert!(s.wants_paint(false, Some(IDLE_HEARTBEAT)), "at the heartbeat → force a repaint (self-heal)");
+        assert!(s.wants_paint(false, Some(IDLE_HEARTBEAT + Duration::from_secs(5))), "long past the heartbeat → always paint");
+    }
+
+    #[test]
+    fn repaint_scheduler_note_painted_clears_dirty_when_static() {
+        // After painting a static frame the dirty latch clears, so the FOLLOWING static tick
+        // can be skipped. This is the transition from "just showed a change" back to idle.
+        let mut s = RepaintScheduler::new();
+        s.mark_damaged();
+        assert!(s.dirty);
+        s.note_painted(Instant::now(), false);
+        assert!(!s.dirty, "painting a static frame clears the dirty latch → next static tick is skippable");
+    }
+
+    #[test]
+    fn repaint_scheduler_can_never_wedge_the_display() {
+        // Exhaustive guard mirroring `no_flip_outcome_maps_to_a_compositor_death`: across
+        // every (dirty, animating) combination, a scheduler whose heartbeat has elapsed
+        // ALWAYS paints. There is no reachable state in which an elapsed heartbeat skips —
+        // so a forgotten damage edge can never permanently freeze the never-fail floor.
+        for dirty in [false, true] {
+            for animating in [false, true] {
+                let s = RepaintScheduler { dirty, last_paint: Some(Instant::now()) };
+                assert!(
+                    s.wants_paint(animating, Some(IDLE_HEARTBEAT)),
+                    "dirty={dirty} animating={animating}: an elapsed heartbeat must always repaint (never wedge)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repaint_heartbeat_is_a_sane_idle_floor() {
+        // The idle backstop must be LONGER than one 60Hz tick (so idle actually saves work)
+        // yet FAR under the supervisor's 45s first-paint watchdog (so a self-heal is a
+        // stutter, never a tier-drop) — the same "sits in the safe window" shape as
+        // VBLANK_STALL_TIMEOUT.
+        assert!(IDLE_HEARTBEAT > Duration::from_millis(16), "heartbeat must exceed one 60Hz tick to save idle work");
+        assert!(IDLE_HEARTBEAT < Duration::from_secs(45), "heartbeat must be far under the 45s paint watchdog");
     }
 
     // ── Phase 5: handle minting + manifest↔toplevel map ──
@@ -1169,7 +1575,7 @@ mod tests {
     fn drm_backend_still_selects_the_software_floor_when_unprobed() {
         // The DRM backend (pixman) is a software floor by construction; the path
         // decision is still Software for an unprobed/non-forced DRM boot.
-        let cfg = BootConfig { force_software: false, backend: Backend::Drm };
+        let cfg = BootConfig { force_software: false, prefer_hardware: false, backend: Backend::Drm };
         assert_eq!(select_render_path(&cfg), RenderPath::Software);
     }
 

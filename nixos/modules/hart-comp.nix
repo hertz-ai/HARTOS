@@ -415,6 +415,22 @@ let
       HART_COMP_FORCE_SW_FLAG="--force-software"
       echo "[hart-comp-session] render = SOFTWARE floor (pixman; not armed)" >&2
     else
+      # ── THE OPERATOR-OVERRIDE SEAM (GLES-when-armed) ───────────────────────
+      # Tell the compositor DIRECTLY that hardware is armed, so main.rs
+      # select_render_path returns Hardware via its `prefer_hardware` check
+      # WITHOUT independently re-reading /run/hart/gpu-render. This closes the
+      # operator-override gap: when preferHardwareGL=true forces _HART_ARMED=1
+      # but the boot probe fail-safed to `software`, dropping only the
+      # --force-software pin was a silent no-op (select_render_path re-read the
+      # verdict and stayed on pixman — the GLES path never came up). Exporting
+      # HART_COMP_PREFER_HARDWARE=1 makes the LAUNCHER's arm decision the single
+      # source of truth (no second, drift-prone read of the same decision). It
+      # is also correct on the AUTO arm (verdict=hardware): prefer_hardware and
+      # the verdict both resolve to Hardware. force_software is never set here,
+      # so it can never win; and a GLES init/runtime fault still degrades to the
+      # pixman renderer of record (udev.rs) + the paint watchdog drops a tier, so
+      # this can raise the render path but never brick the box (#132 never-brick).
+      export HART_COMP_PREFER_HARDWARE=1
       echo "[hart-comp-session] render = HARDWARE armed (GLES on the verified iGPU; pixman kept as the degrade-not-die fallback)" >&2
     fi
 

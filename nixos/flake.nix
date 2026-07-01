@@ -101,6 +101,16 @@
       ./modules/hart-sandbox.nix
       # AI-Native Everything OS modules
       ./modules/hart-model-bus.nix
+      # Robot Model-Bus capability probe (embodied twin of hart-compat-smoketest):
+      # a post-boot oneshot that REACHES the Model Bus for each core intelligence a
+      # robot needs (LLM / vision / VLA / on-node /think fusion) and writes an honest
+      # per-capability verdict to /run/hart/robot-capability-status. Auto-enables
+      # wherever the Model Bus runs (hart.robotics.probe.enable defaults to
+      # hart.modelBus.enable); adds NOTHING to a node with no Model Bus (server/edge).
+      # Never-fail (oneshot + RemainAfterExit + the python probe always exits 0,
+      # bounded TimeoutStartSec) and runs IN PARALLEL with the desktop (NOT before
+      # greetd), so it can never delay first paint, block, or fail the boot.
+      ./modules/hart-robot-probe.nix
       ./modules/hart-compute-mesh.nix
       ./modules/hart-liquid-ui.nix
       ./modules/hart-app-bridge.nix
@@ -802,7 +812,22 @@
       # Display management (#158): wlr-randr + kanshi ship, the font lever materialises from
       # hart.display.fontScale, kanshi is a never-fail USER unit, the seed is safe/idempotent.
       displayManagement = import ./tests/display-management.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // journalExport // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement;
+      # Robot Model-Bus capability probe (embodied): a desktop node enables
+      # hart.modelBus + hart.robotics.probe, BOOTS, and asserts the post-boot probe
+      # oneshot RAN + SUCCEEDED (never-fail measurement), wrote HONEST per-capability
+      # verdicts to /run/hart/robot-capability-status (one key=value per line, each an
+      # honest value from the documented vocabulary), degrades honestly with a dead
+      # backend, and reads model_bus=ok once the bus port is up (best-effort positive,
+      # proving a REAL bus not a stub). Distinct attr -> clean //; desktop-variant node.
+      robotProbe = import ./tests/robot-probe.nix desktopTestArgs;
+      # Native notification daemon (mako) + privacy gate (#113): a desktop node proves
+      # mako + makoctl + BOTH clients (notify-send, the AI's hart-notify-send) are on
+      # PATH, the daemon is a graphical-session USER service (never boot-critical) with
+      # the pinned glass config, and hart-notify-send fail-CLOSES (exit 77) when the
+      # 'screen' kill-switch is cut OR the authority is down, and ALLOWS when on.
+      # Distinct attr -> clean //; desktop-variant node (mkNode).
+      notify = import ./tests/notify.nix desktopTestArgs;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // journalExport // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)

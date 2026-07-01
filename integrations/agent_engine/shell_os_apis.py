@@ -223,56 +223,39 @@ def firmware_setup_supported():
 
 
 # ── Native logind (org.freedesktop.login1) power calls ──
-# CANONICAL home for "ask the OS to reboot / power off / suspend / hibernate /
-# arm firmware setup". The power-action handler talks to logind's D-Bus Manager
-# interface DIRECTLY and CHECKS the result, instead of the old
-# `subprocess.Popen(['systemctl', 'reboot'])` fire-and-forget.
+# `_logind_call` is the SHARED entry point the power-action route AND the
+# liquid_ui_service session routes use to "ask the OS to reboot / power off /
+# suspend / hibernate / arm firmware setup / lock / terminate a session". The
+# implementation now lives in the canonical TYPED + NATIVE OS bridge
+# (integrations.agent_engine.os_bridge.logind) — #133 / W3: it tries a NATIVE
+# D-Bus call (jeepney, no subprocess) FIRST and falls back to a bounded, result-
+# checked `busctl call --system` only when the native transport is unavailable
+# (e.g. the Windows dev box). Both transports CHECK the result, so a polkit denial
+# surfaces as a REAL error instead of the old `subprocess.Popen(['systemctl',
+# 'reboot'])` fire-and-forget that masked failures as `{'initiated': True}` while
+# the box did nothing. The matching polkit grant lives in nixos/modules/
+# hart-base.nix `security.polkit` (the `hart` user is authorized for these login1
+# actions).
 #
-# Why this matters (the bug #133 fixes): the shell server runs as the unprivileged
-# `hart` service user. `systemctl reboot` from there delegates to logind, but
-# polkit (no rule for a non-session system daemon) DENIES it — and `Popen` never
-# waits for or reads that denial, so EVERY reboot/shutdown/firmware request was
-# masked as `{'initiated': True}` while the box did nothing. We now invoke the
-# login1 Manager method over the system bus with `busctl call --system` (the same
-# native D-Bus mechanism the app-bridge already uses), read the real exit status
-# + stderr, and return a genuine error on failure. The matching grant lives in
-# nixos/modules/hart-base.nix `security.polkit` (the `hart` user is authorized for
-# these login1 actions), so the authorized call actually executes.
-_LOGIN1_DEST = 'org.freedesktop.login1'
-_LOGIN1_PATH = '/org/freedesktop/login1'
-_LOGIN1_IFACE = 'org.freedesktop.login1.Manager'
-
-
+# This function keeps its `(method, *busctl_args)` signature UNCHANGED — it is
+# imported by liquid_ui_service.py's session routes and mocked by the shell power
+# tests + nixos/tests/power-actions.nix — and simply delegates to the ONE native
+# implementation (no parallel path).
 def _logind_call(method, *busctl_args, timeout=10):
-    """Invoke an org.freedesktop.login1.Manager method over the system D-Bus.
+    """Invoke an org.freedesktop.login1.Manager method, RESULT-CHECKED.
 
-    `busctl_args` are passed verbatim as the method's busctl signature+values,
-    e.g. ('b', 'true') for the interactive-boolean methods (Reboot, PowerOff,
-    Suspend, Hibernate, SetRebootToFirmwareSetup); pass nothing for a no-arg
-    method (LockSessions).
+    `busctl_args` are the (signature, *string_values) the method takes, e.g.
+    ('b', 'true') for the interactive-boolean methods (Reboot, PowerOff, Suspend,
+    Hibernate, SetRebootToFirmwareSetup), ('s', sid) for TerminateSession, or
+    nothing for a no-arg method (LockSessions).
 
-    Returns (ok: bool, error: Optional[str]). `ok` is True ONLY when busctl
-    exits 0 — i.e. logind accepted the method AND polkit authorized it. A polkit
-    denial, a missing busctl, or a timeout each return (False, <reason>) so the
-    caller can surface a REAL error instead of a masked success. Degrade-not-die:
-    every failure mode is caught and reported, never raised to the request thread.
+    Returns (ok: bool, error: Optional[str]); `ok` is True ONLY when logind
+    accepted the method AND polkit authorized it. Delegates to the canonical
+    native client (os_bridge.logind), which tries native D-Bus first and falls
+    back to bounded busctl — degrade-not-die, never raised to the request thread.
     """
-    cmd = ['busctl', 'call', '--system',
-           _LOGIN1_DEST, _LOGIN1_PATH, _LOGIN1_IFACE, method, *busctl_args]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except FileNotFoundError:
-        return False, 'busctl not available (systemd D-Bus tooling missing)'
-    except subprocess.TimeoutExpired:
-        return False, f'logind {method} timed out after {timeout}s'
-    except Exception as e:  # pragma: no cover - defensive
-        return False, f'logind {method} failed: {e}'
-    if r.returncode != 0:
-        # busctl prints the D-Bus error (e.g. polkit "Access denied" /
-        # "Interactive authentication required") to stderr. Surface it.
-        detail = (r.stderr or r.stdout or '').strip() or f'exit code {r.returncode}'
-        return False, f'logind {method} denied or failed: {detail}'
-    return True, None
+    from integrations.agent_engine.os_bridge.logind import logind_call
+    return logind_call(method, busctl_args, timeout=timeout)
 
 
 def register_shell_os_routes(app):
@@ -999,18 +982,19 @@ def register_shell_os_routes(app):
         # outright, so the call is authorized without a prompt. This replaces the
         # old fire-and-forget `subprocess.Popen(['systemctl', ...])` that masked a
         # polkit denial as `{'initiated': True}` while the box never powered down.
-        _SINGLE_METHOD = {
-            'suspend': 'Suspend',
-            'hibernate': 'Hibernate',
-            'reboot': 'Reboot',
-            'shutdown': 'PowerOff',
-            'lock': 'LockSessions',
-        }
+        # DRY (#165): the verb -> login1-method map is the ONE canonical copy in
+        # os_bridge.power._POWER_METHOD (reboot/shutdown/suspend/hibernate); reuse
+        # it, do NOT redefine. `lock` is handled by its own no-arg branch below.
+        # This route is the BACKWARD-COMPAT surface (keeps the {action,initiated}
+        # shape + the _logind_call path existing callers/mocks depend on); the
+        # typed forward path new callers should use is POST /api/os/invoke
+        # (os_bridge.routes -> os_bridge.power.invoke_power, same logind_call).
+        from integrations.agent_engine.os_bridge.power import _POWER_METHOD
         # firmware/uefi = "Restart into Firmware (UEFI)": arm the UEFI boot-to-
         # firmware-UI flag (SetRebootToFirmwareSetup true), THEN reboot — the next
         # boot enters the BIOS/UEFI setup. Two-step; if arming fails we do NOT
         # reboot (a plain reboot would be the wrong action for the user's intent).
-        valid_actions = list(_SINGLE_METHOD.keys()) + ['firmware', 'uefi']
+        valid_actions = list(_POWER_METHOD.keys()) + ['lock', 'firmware', 'uefi']
         if action not in valid_actions:
             return jsonify({'error': f'Invalid action. Valid: {valid_actions}'}), 400
 
@@ -1032,7 +1016,7 @@ def register_shell_os_routes(app):
         elif action == 'lock':
             ok, err = _logind_call('LockSessions')
         else:
-            ok, err = _logind_call(_SINGLE_METHOD[action], 'b', 'true')
+            ok, err = _logind_call(_POWER_METHOD[action], 'b', 'true')
 
         if not ok:
             # Real failure (polkit denied, busctl missing, timeout) — surface it

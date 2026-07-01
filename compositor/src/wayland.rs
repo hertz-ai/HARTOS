@@ -275,6 +275,16 @@ pub struct State {
     /// the udev backend re-takes master by issuing `drmSetMaster` DIRECTLY on the fd — see
     /// `udev::acquire_drm_master` for the full rationale.
     pub pending_session_activate: Option<bool>,
+
+    /// #137 — the frame-budget repaint scheduler. The render tick (udev.rs `render_all`)
+    /// gates its build+composite+flip on `repaint.should_paint(...)`, so a static desktop
+    /// stops re-importing textures + re-running the pixman damage pass + attempting a
+    /// page-flip on EVERY 16ms tick. Every damage edge marks it: a client `commit` (here),
+    /// an input event, a session/master change (udev.rs). It starts DIRTY and has a
+    /// heartbeat backstop, so it can only ever skip a provably-idle frame — never black or
+    /// freeze the never-fail floor. The pure logic + its unit tests live in main.rs
+    /// (`RepaintScheduler`); this holds the single live instance for the DRM backend.
+    pub repaint: crate::RepaintScheduler,
 }
 
 // ── Per-client state. Carries the compositor-side client bookkeeping Smithay needs
@@ -959,6 +969,13 @@ impl CompositorHandler for State {
     fn commit(&mut self, surface: &WlSurface) {
         // Latch the newly-committed buffer into Smithay's surface state.
         on_commit_buffer_handler::<Self>(surface);
+        // #137 — a client committed: the canonical damage edge. Schedule a repaint on the
+        // next render tick (the frame-budget scheduler is otherwise idle). Marking on every
+        // commit is intentional + cheap: over-marking costs at most one extra repaint, and
+        // it is what keeps an animating client (the breathing orb) painting at full rate
+        // while a static desktop skips idle frames. Sync-subsurface commits mark too — their
+        // parent's commit follows, and an extra repaint is harmless (never a missed frame).
+        self.repaint.mark_damaged();
         if is_sync_subsurface(surface) {
             return;
         }

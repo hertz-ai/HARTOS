@@ -112,6 +112,8 @@ class ModelBusService:
         self._semaphore = threading.Semaphore(max_concurrent)
         self._lock = threading.Lock()
         self._running = False
+        self._unix_sock = None            # the AF_UNIX listener (bound in serve)
+        self._unix_thread = None          # its accept-loop daemon thread
 
         logger.info(
             f"ModelBusService initialized: socket={socket_path}, "
@@ -868,6 +870,173 @@ class ModelBusService:
             'routing_strategy': self.routing_strategy,
         }
 
+    # ─── Unix Socket Transport ───────────────────────────────
+    # The nix module (hart-model-bus.nix) ADVERTISES /run/hart/model-bus.sock
+    # for "native Linux apps" + "AI Agents → Unix socket (direct, zero-copy)",
+    # and its ExecStartPost waits for the socket to appear. Historically only
+    # the HTTP (:6790) transport was served, so that socket never existed and
+    # the unit logged "Socket did not appear within 15s" every boot. This binds
+    # the advertised socket for real, routing every request through the SAME
+    # self.infer() / self.list_models() / self.get_status() the HTTP app uses
+    # (one routing path, no parallel logic). Line-delimited JSON:
+    #   {"op":"infer","model_type":"llm","prompt":"...","options":{...}}\n
+    #   {"op":"list_models"}\n   {"op":"status"}\n   {"op":"ping"}\n
+    # -> one JSON object + newline per request.
+
+    _SOCK_MAX_LINE = 1 << 20   # 1 MiB cap per request line — never unbounded read
+    _SOCK_ACCEPT_TIMEOUT = 1.0  # accept() wakes each 1s to observe _running
+    _SOCK_CONN_TIMEOUT = 60.0   # a stalled client can never pin a handler thread
+
+    def _handle_socket_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Route ONE decoded request dict to the shared inference paths.
+
+        Pure dispatch (no socket I/O) so it is unit-testable cross-platform
+        (AF_UNIX is Linux-only). Never raises — every failure becomes an
+        ``{'error': ...}`` object so the transport can always answer a client.
+        """
+        if not isinstance(payload, dict):
+            return {'error': 'request must be a JSON object'}
+        op = payload.get('op', 'infer')
+        try:
+            if op == 'ping':
+                return {'ok': True, 'service': 'model-bus'}
+            if op in ('list_models', 'models'):
+                return {'models': self.list_models()}
+            if op in ('status', 'get_status'):
+                return self.get_status()
+            if op == 'infer':
+                return self.infer(
+                    model_type=payload.get('model_type', ModelType.LLM),
+                    prompt=payload.get('prompt', ''),
+                    options=payload.get('options') or {},
+                )
+            return {'error': f'unknown op: {op}'}
+        except Exception as e:  # degrade-not-die: a bad request never kills the loop
+            logger.debug("Model Bus socket op %r failed: %s", op, e)
+            return {'error': f'{op} failed: {e}'}
+
+    def _handle_socket_line(self, line: str) -> str:
+        """Decode one JSON line, dispatch it, and encode the JSON reply.
+
+        Returns a single-line JSON string (no trailing newline — the caller
+        frames it). Malformed JSON degrades to an error object, never a crash.
+        """
+        try:
+            payload = json.loads(line)
+        except (ValueError, TypeError) as e:
+            return json.dumps({'error': f'invalid JSON: {e}'})
+        result = self._handle_socket_request(payload)
+        try:
+            return json.dumps(result)
+        except (TypeError, ValueError):
+            # A backend returned something non-serialisable — stringify safely.
+            return json.dumps({'error': 'unserialisable result',
+                               'repr': str(result)[:500]})
+
+    def _serve_one_conn(self, conn) -> None:
+        """Serve line-delimited requests on one accepted connection.
+
+        Bounded on every axis (recv timeout, 1 MiB line cap) so a slow or
+        hostile client can never hang the bus. Runs in its own daemon thread;
+        the real inference concurrency is still bounded by self._semaphore
+        inside infer().
+        """
+        conn.settimeout(self._SOCK_CONN_TIMEOUT)
+        buf = b''
+        try:
+            while self._running:
+                try:
+                    chunk = conn.recv(4096)
+                except socket.timeout:
+                    break  # idle client — free the thread
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > self._SOCK_MAX_LINE:
+                    try:
+                        conn.sendall(
+                            json.dumps({'error': 'request too large'}).encode()
+                            + b'\n')
+                    except OSError:
+                        pass
+                    break
+                while b'\n' in buf:
+                    line, buf = buf.split(b'\n', 1)
+                    if not line.strip():
+                        continue
+                    reply = self._handle_socket_line(
+                        line.decode('utf-8', 'replace'))
+                    try:
+                        conn.sendall(reply.encode('utf-8') + b'\n')
+                    except OSError:
+                        return
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _serve_unix_socket(self) -> None:
+        """Bind + accept on the advertised AF_UNIX socket (Linux only).
+
+        No-op (logged) where AF_UNIX is unavailable (e.g. the Windows dev box)
+        so the HTTP transport still serves everywhere. Never raises out of the
+        thread — a bind failure just means "no socket transport", never a
+        crashed bus.
+        """
+        if not hasattr(socket, 'AF_UNIX'):
+            logger.info(
+                "Model Bus Unix socket transport unavailable on this platform "
+                "(no AF_UNIX) — HTTP transport still serves.")
+            return
+        path = self.socket_path
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            # Remove a stale socket from a prior run so bind() can succeed.
+            if os.path.exists(path):
+                os.unlink(path)
+        except OSError as e:
+            logger.warning("Model Bus socket path prep failed (%s): %s", path, e)
+            return
+        try:
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(path)
+            srv.listen(64)
+            srv.settimeout(self._SOCK_ACCEPT_TIMEOUT)
+        except OSError as e:
+            logger.warning("Model Bus Unix socket bind failed (%s): %s", path, e)
+            return
+        # Group-accessible (the nix ExecStartPost also chmod/chgrp's it; setting
+        # it here means the socket is usable the instant it appears).
+        try:
+            os.chmod(path, 0o660)
+        except OSError:
+            pass
+        self._unix_sock = srv
+        logger.info("Model Bus Unix socket transport listening: %s", path)
+        while self._running:
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue  # loop back, re-check _running
+            except OSError:
+                break     # socket closed on shutdown
+            t = threading.Thread(
+                target=self._serve_one_conn, args=(conn,), daemon=True,
+                name='model-bus-conn')
+            t.start()
+        try:
+            srv.close()
+            if os.path.exists(path):
+                os.unlink(path)
+        except OSError:
+            pass
+
     # ─── HTTP Server ─────────────────────────────────────────
 
     def _create_flask_app(self):
@@ -959,6 +1128,15 @@ class ModelBusService:
 
         discovery_thread = threading.Thread(target=_rediscover_loop, daemon=True)
         discovery_thread.start()
+
+        # Bind the advertised Unix socket transport BEFORE the (blocking) HTTP
+        # serve so /run/hart/model-bus.sock exists for the nix ExecStartPost
+        # readiness check and native apps can connect immediately. Daemon
+        # thread — a socket failure never blocks the HTTP transport.
+        self._unix_thread = threading.Thread(
+            target=self._serve_unix_socket, daemon=True,
+            name='model-bus-unix')
+        self._unix_thread.start()
 
         # Start Flask HTTP server
         app = self._create_flask_app()

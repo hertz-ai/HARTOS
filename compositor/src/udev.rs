@@ -51,6 +51,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -112,7 +113,18 @@ use tracing::{error, info, warn};
 use crate::comp_core::{self, HartRenderElement};
 use crate::shared::send_frame_callbacks;
 use crate::wayland::{ClientState, State};
-use crate::{select_render_path, BootConfig, RenderPath, WindowRegistry, HART_SPLASH_RGBA};
+use crate::{
+    note_first_scanout_once, select_render_path, BootConfig, RenderPath, WindowRegistry,
+    HART_SPLASH_RGBA,
+};
+
+/// #131 — one-shot latch for the first-scanout beacon. Flipped by `reap_completed_vblanks`
+/// on the FIRST reaped page-flip vblank (a frame that ACTUALLY scanned out to the CRTC),
+/// which writes `/run/hart/session/first-scanout` so the supervisor's scanout watchdog can
+/// tell a live desktop from a black-but-healthy Tier-1 (the shell-ready marker cannot — the
+/// WebView fires it from its own client buffer even if nothing reached the display). The
+/// pure decision + path + write live in main.rs (unit-tested); this owns only the latch.
+static FIRST_SCANOUT: AtomicBool = AtomicBool::new(false);
 
 /// Color formats DrmCompositor will try for the primary plane framebuffer. The pixman
 /// software floor + virtually all KMS drivers support Argb8888/Xrgb8888 — the never-
@@ -450,6 +462,9 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
         // No libseat session activate/pause pending at boot; the notifier parks them here and
         // the proactive activate before the loop primes the unprivileged-startup recovery.
         pending_session_activate: None,
+        // #137 — the frame-budget repaint scheduler starts DIRTY, so the splash + glass-shell
+        // first frame always paints; thereafter the render tick paints on damage + a heartbeat.
+        repaint: crate::RepaintScheduler::new(),
     };
 
     // 7. The per-device backend table (one entry per opened GPU). Held OUTSIDE State so
@@ -540,6 +555,11 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             state.process_input_event(event);
+            // #137 — an input event moved the cursor / changed focus / clicked: the pointer
+            // (a composited software cursor) and any focus/raise must re-paint. Mark the
+            // frame-budget scheduler damaged so the next render tick composites, keeping the
+            // cursor responsive even when the desktop is otherwise idle.
+            state.repaint.mark_damaged();
         })
         .map_err(|e| format!("insert libinput source failed: {e}"))?;
 
@@ -925,6 +945,13 @@ fn reap_completed_vblanks(state: &mut State, devices: &mut HashMap<DrmNode, Devi
             }
         }
     }
+    // #131 — a vblank was reaped, so a page-flip COMPLETED: a frame actually scanned out to
+    // a CRTC. Emit the first-scanout beacon exactly once (best-effort, one atomic load in the
+    // steady state). This is the compositor-side proof of paint the shell-ready marker cannot
+    // give — it fires from the DISPLAY side, not a client buffer, so a black-but-healthy
+    // Tier-1 (master lost / never flipped) never writes it and the supervisor can catch it.
+    // `completed` is guaranteed non-empty here (the early return above), so a reap == a scanout.
+    note_first_scanout_once(&FIRST_SCANOUT, true);
 }
 
 /// What to do about DRM master for one device this attempt. PURE policy (no Smithay types),
@@ -1039,6 +1066,11 @@ fn apply_pending_session(state: &mut State, devices: &mut HashMap<DrmNode, Devic
         Some(v) => v,
         None => return,
     };
+    // #137 — a session activate/pause (VT switch / suspend / resume / the startup activate)
+    // must re-paint: on resume the reactivated CRTC needs a fresh frame, on pause the gate
+    // must not skip the tick that drops master. Mark the frame-budget scheduler damaged so
+    // the render tick composites this session transition instead of idling through it.
+    state.repaint.mark_damaged();
     for device in devices.values_mut() {
         if activate {
             // A real session-activate edge (or the startup proactive activate): drop the latch so
@@ -1240,8 +1272,33 @@ fn render_all(
     gles: &mut Option<GlesRenderer>,
 ) {
     // Retire any flips whose vblank arrived since the last tick first, so a CRTC freed
-    // this tick can be re-queued immediately below (one-frame-latency, no stall).
+    // this tick can be re-queued immediately below (one-frame-latency, no stall). This runs
+    // BEFORE the frame-budget gate below, so even a skipped (idle) tick still reaps vblanks —
+    // the in-flight-flip gate (#166) and the first-scanout beacon (#131) stay live regardless.
     reap_completed_vblanks(state, devices);
+
+    // ── #137 FRAME-BUDGET GATE ── Skip the whole build+composite+flip when the scene is
+    // provably idle, so a static desktop stops re-importing textures + re-running the pixman
+    // damage pass + attempting a page-flip on every 16ms tick (the "no damage-driven
+    // scheduling here" cost the run_udev loop comment names). The DrmCompositor still tracks
+    // damage at the REGION level inside render_frame; this is the TICK-level gate on top.
+    let now = std::time::Instant::now();
+    // While any device is still UNMASTERED (the boot master-handoff race — see
+    // acquire_drm_master), keep painting at full rate: the per-tick drmSetMaster retry lives
+    // inside present_surfaces, so throttling it would slow first-paint / delay the never-blank
+    // recovery. A dead GPU that can never master just paints every tick (correctness over the
+    // idle saving in the degraded case; the supervisor drops a tier on the missing first paint).
+    if devices.values().any(|d| !d.master) {
+        state.repaint.mark_damaged();
+    }
+    let effects_animating = comp_core::effects_animating(state);
+    if !state.repaint.should_paint(now, effects_animating) {
+        // Nothing changed, nothing animating, still within the heartbeat: skip this tick's
+        // paint. Vblanks were already reaped above; the loop still dispatches clients + sends
+        // frame callbacks, so a fresh commit/input marks the scheduler damaged and repaints on
+        // the very next tick — never a missed frame, just a saved idle composite (the win).
+        return;
+    }
 
     let clear = Color32F::new(
         HART_SPLASH_RGBA[0],
@@ -1251,7 +1308,6 @@ fn render_all(
     );
     // The output's current physical mode (the capturable framebuffer extent).
     let size = comp_core::output_physical_size(state);
-    let now = std::time::Instant::now();
 
     // ── GLES GPU path ── The GlesRenderer is NOT a `State` field, so there is no
     // borrow-checker mem::replace dance: `build_frame_elements` borrows `state` + `gles`
@@ -1289,6 +1345,12 @@ fn render_all(
         state.renderer = renderer;
     }
 
+    // #137 — this tick composited: record the paint so the idle heartbeat is measured from
+    // now, and clear the dirty latch (so the NEXT static tick can be skipped) UNLESS an effect
+    // is still animating, in which case dirty is re-armed to keep the fade playing frame-by-
+    // frame. This is the single place the frame-budget scheduler is told "a frame went out".
+    state.repaint.note_painted(now, effects_animating);
+
     // ── GLES → pixman demotion (degrade-not-die) ── A renderer fault was seen on the GPU
     // path: drop the GLES renderer so EVERY subsequent tick paints via the pixman renderer
     // of record, and reset each surface's swapchain/commit state + clear its in-flight-flip
@@ -1306,6 +1368,11 @@ fn render_all(
                 surface.flip_queued_at = None;
             }
         }
+        // The demotion reset the surfaces; the pixman renderer of record must paint them
+        // NEXT tick, so re-arm the frame-budget scheduler (note_painted above just cleared
+        // it) — a GLES fault becomes an imperceptible one-frame pixman repaint, not a
+        // ≤heartbeat-stale hold.
+        state.repaint.mark_damaged();
     }
 }
 
