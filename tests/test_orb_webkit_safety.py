@@ -176,7 +176,12 @@ def test_referenced_static_assets_exist():
     missing file means the shell serves a 404 and that feature silently dies
     (the bundling end-to-end gap)."""
     src = _shell_source()
-    refs = set(re.findall(r'/shell/static/([A-Za-z0-9_.\-]+)', src))
+    # Capture the FULL path after /shell/static/ (incl. nested dirs like app_art/x.svg);
+    # `/` is in the class so nested asset references resolve to the real file, not just
+    # the first path segment. A trailing-slash reference (a startswith dir prefix, e.g.
+    # '/shell/static/app_art/') resolves to the directory.
+    refs = set(re.findall(r'/shell/static/([A-Za-z0-9_.\-/]+)', src))
     assert refs, 'no /shell/static refs found — wiring regression'
     for asset in sorted(refs):
-        assert os.path.isfile(os.path.join(STATIC_DIR, asset)), 'referenced but missing on disk: ' + asset
+        assert os.path.exists(os.path.join(STATIC_DIR, asset.rstrip('/'))), \
+            'referenced but missing on disk: ' + asset

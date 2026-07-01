@@ -49,7 +49,7 @@
   ];
 
   // Swatch palettes for the 8 server-side presets (applyPreset applies by id; these
-  // are only the gallery card colours). `a2` (secondary accent) added to the preset
+  // are only the gallery card colours). 'a2' (secondary accent) added to the preset
   // schema so a swatch reads its duotone and stays consistent with the palette layer.
   var PRESETS = window.HART_THEME_PRESETS = [
     { id: 'hart-default', name: 'Aurora',    a: '#00D4AA', a2: '#29C5FF', b: '#0F0E17', c: '#16213e' },

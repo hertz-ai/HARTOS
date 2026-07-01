@@ -24,7 +24,7 @@
  * — switching is purely additive. Only the hue triples + a couple of booleans
  * (rings / filled waveform / wave amplitude / breathe pulse gain) vary per style,
  * so no geometry changes and the hang-free software floor is untouched (the whole
- * canvas is already gated by `active` — it costs nothing when idle).
+ * canvas is already gated by the active flag — it costs nothing when idle).
  */
 (function (global) {
   'use strict';
@@ -158,7 +158,7 @@
     function setBreathing(v) { breathing = !!v; }
     // #140: switch the orb VARIETY live. Unknown ids are ignored (keeps the current
     // style), so a stale persisted value can never blank the orb. Re-tints on the
-    // very next frame (render reads `pal` through the closure).
+    // very next frame (render reads pal through the closure).
     function setStyle(name) {
       if (name && STYLES[name]) { styleId = name; pal = STYLES[name]; }
     }
