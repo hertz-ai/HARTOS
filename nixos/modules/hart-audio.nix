@@ -97,37 +97,60 @@ in
   # ═══════════════════════════════════════════════════════════
   # Config  (no-op unless hart is enabled AND PipeWire is configured)
   # ═══════════════════════════════════════════════════════════
-  config = lib.mkIf (cfg.enable && config.services.pipewire.enable
-                     && audio.bootUnmute.enable) {
+  config = lib.mkMerge [
 
-    # A USER oneshot in the graphical session. Ordered AFTER PipeWire +
-    # WirePlumber so a default sink can exist; wantedBy default.target so it runs
-    # on every session start. It NEVER blocks the system boot (a user unit) and
-    # the script self-bounds, but cap it anyway so even a pathological wpctl hang
-    # cannot hold the user session's startup transaction.
-    systemd.user.services.hart-audio-unmute = {
-      description = "HART OS - unmute + sane default volume on the default audio sink";
-      after = [ "pipewire.service" "wireplumber.service" "pipewire-pulse.service" ];
-      wants = [ "pipewire.service" "wireplumber.service" ];
-      wantedBy = [ "default.target" ];
-      # A nixos-rebuild switch must not re-stomp the user's live volume mid-session.
-      restartIfChanged = false;
-      path = audioBins;
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        ExecStart = "${rescueScript} ${toString audio.bootUnmute.bootVolumePercent}";
-        TimeoutStartSec = "30s";
+    # ── Boot-time unmute rescue (gated additionally on bootUnmute.enable) ──────
+    (lib.mkIf (cfg.enable && config.services.pipewire.enable
+               && audio.bootUnmute.enable) {
+
+      # A USER oneshot in the graphical session. Ordered AFTER PipeWire +
+      # WirePlumber so a default sink can exist; wantedBy default.target so it runs
+      # on every session start. It NEVER blocks the system boot (a user unit) and
+      # the script self-bounds, but cap it anyway so even a pathological wpctl hang
+      # cannot hold the user session's startup transaction.
+      systemd.user.services.hart-audio-unmute = {
+        description = "HART OS - unmute + sane default volume on the default audio sink";
+        after = [ "pipewire.service" "wireplumber.service" "pipewire-pulse.service" ];
+        wants = [ "pipewire.service" "wireplumber.service" ];
+        wantedBy = [ "default.target" ];
+        # A nixos-rebuild switch must not re-stomp the user's live volume mid-session.
+        restartIfChanged = false;
+        path = audioBins;
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = "${rescueScript} ${toString audio.bootUnmute.bootVolumePercent}";
+          TimeoutStartSec = "30s";
+        };
       };
-    };
 
-    # Make the rescue runnable by hand from a recovery context too:
-    #   hart-audio-unmute 60
-    environment.systemPackages = [
-      (pkgs.runCommand "hart-audio-unmute-cli" { } ''
-        mkdir -p $out/bin
-        ln -s ${rescueScript} $out/bin/hart-audio-unmute
-      '')
-    ];
-  };
+      # Make the rescue runnable by hand from a recovery context too:
+      #   hart-audio-unmute 60
+      environment.systemPackages = [
+        (pkgs.runCommand "hart-audio-unmute-cli" { } ''
+          mkdir -p $out/bin
+          ln -s ${rescueScript} $out/bin/hart-audio-unmute
+        '')
+      ];
+    })
+
+    # ── Freedesktop system-sound layer (#142) ─────────────────────────────────
+    # Present whenever HART + audio are enabled, INDEPENDENT of the boot-unmute
+    # rescue (the two are orthogonal concerns — one keeps the sink audible, this
+    # supplies the event-sound vocabulary). The shell sound API
+    # (/api/shell/sounds/play in shell_desktop_apis.py) shells out to
+    # `canberra-gtk-play -i <event>`, which maps a NAMED freedesktop event (bell,
+    # dialog-error, device-added/removed, message-new-instant, …) to a sound
+    # through libcanberra honouring the active sound theme. libcanberra ships that
+    # player; sound-theme-freedesktop supplies the default named-event sounds under
+    # …/share/sounds/freedesktop. Attr-guarded (the drm_info pattern) so a nixpkgs
+    # rev lacking any of them cannot break evaluation — the API degrades on its own
+    # (falls back to a raw player, or 500s cleanly) when the tool is absent.
+    (lib.mkIf (cfg.enable && config.services.pipewire.enable) {
+      environment.systemPackages =
+        lib.optional (pkgs ? libcanberra-gtk3) pkgs.libcanberra-gtk3
+        ++ lib.optional (pkgs ? libcanberra) pkgs.libcanberra
+        ++ lib.optional (pkgs ? sound-theme-freedesktop) pkgs.sound-theme-freedesktop;
+    })
+  ];
 }

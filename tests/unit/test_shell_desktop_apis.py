@@ -226,6 +226,67 @@ class TestSoundManager(unittest.TestCase):
         # May be 200 or 404 depending on file existence — test it doesn't crash
         self.assertIn(r.status_code, (200, 404))
 
+    @patch('shutil.which', return_value='/usr/bin/canberra-gtk-play')
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    @patch('integrations.agent_engine.shell_desktop_apis._load_json')
+    def test_play_named_event_via_canberra(self, mock_load, mock_run, _which):
+        """A named event with no override plays the freedesktop way:
+        canberra-gtk-play -i <event>, bounded (timeout=5), NOT a raw file player."""
+        # sound-theme.json → enabled; sound-overrides.json → empty.
+        mock_load.side_effect = lambda p, d=None: (
+            {'active': 'freedesktop', 'enabled': True} if 'sound-theme' in p else {})
+        mock_run.return_value = MagicMock(returncode=0)
+        client = _make_desktop_app()
+        r = client.post('/api/shell/sounds/play',
+                        data=json.dumps({'event': 'device-added'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertTrue(data['played'])
+        self.assertEqual(data.get('via'), 'canberra')
+        # The mapped event was played by the canberra player, bounded.
+        args, kwargs = mock_run.call_args
+        cmd = args[0]
+        self.assertEqual(cmd[0], '/usr/bin/canberra-gtk-play')
+        self.assertIn('-i', cmd)
+        self.assertIn('device-added', cmd)
+        self.assertEqual(kwargs.get('timeout'), 5)
+
+    @patch('shutil.which', return_value='/usr/bin/canberra-gtk-play')
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    @patch('integrations.agent_engine.shell_desktop_apis._load_json')
+    def test_play_passes_active_theme_to_canberra(self, mock_load, mock_run, _which):
+        """A non-default active theme is honoured via libcanberra's documented
+        canberra.xdg-theme.name property (wires event→theme→sound)."""
+        mock_load.side_effect = lambda p, d=None: (
+            {'active': 'Yaru', 'enabled': True} if 'sound-theme' in p else {})
+        mock_run.return_value = MagicMock(returncode=0)
+        client = _make_desktop_app()
+        r = client.post('/api/shell/sounds/play',
+                        data=json.dumps({'event': 'bell'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        cmd = mock_run.call_args.args[0]
+        self.assertIn('-P', cmd)
+        self.assertIn('canberra.xdg-theme.name=Yaru', cmd)
+
+    @patch('integrations.agent_engine.shell_desktop_apis._run')
+    @patch('integrations.agent_engine.shell_desktop_apis._load_json')
+    def test_play_no_sound_when_muted(self, mock_load, mock_run):
+        """When the sound layer is toggled OFF, play makes NO sound (no
+        subprocess) and reports muted."""
+        mock_load.side_effect = lambda p, d=None: (
+            {'active': 'freedesktop', 'enabled': False} if 'sound-theme' in p else {})
+        client = _make_desktop_app()
+        r = client.post('/api/shell/sounds/play',
+                        data=json.dumps({'event': 'bell'}),
+                        content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        data = json.loads(r.data)
+        self.assertFalse(data['played'])
+        self.assertTrue(data['muted'])
+        mock_run.assert_not_called()
+
 
 # ═══════════════════════════════════════════════════════════════
 # Clipboard Manager

@@ -776,12 +776,34 @@ def register_shell_desktop_routes(app):
         event = data.get('event', '')
         if not file and not event:
             return jsonify({'error': 'file or event required'}), 400
+        # Respect the sound-enabled toggle (same cfg the events route reads); a
+        # muted OS makes NO sound rather than shelling a player out for nothing.
+        cfg = _load_json(_config_path('sound-theme.json'),
+                         {'active': 'freedesktop', 'enabled': True})
+        if not cfg.get('enabled', True):
+            return jsonify({'played': False, 'muted': True})
+        # A NAMED event (no explicit file / user override) plays the freedesktop
+        # way: canberra-gtk-play -i <event> maps the event id to the active sound
+        # theme's sound through libcanberra — no manual file resolution, honouring
+        # the selected theme via libcanberra's canberra.xdg-theme.name property.
+        # Bounded via _run (short notification sounds; the timeout can never wedge
+        # the request thread). Falls back to file-resolution + a raw player below.
         if event and not file:
             overrides = _load_json(_config_path('sound-overrides.json'), {})
             if event in overrides:
                 file = overrides[event]
             else:
-                cfg = _load_json(_config_path('sound-theme.json'), {'active': 'freedesktop'})
+                canberra = shutil.which('canberra-gtk-play')
+                if canberra:
+                    cmd = [canberra, '-i', event]
+                    theme = cfg.get('active', '')
+                    if theme and theme != 'freedesktop':
+                        cmd += ['-P', 'canberra.xdg-theme.name=' + theme]
+                    r = _run(cmd, timeout=5)
+                    if r and r.returncode == 0:
+                        return jsonify({'played': True, 'event': event,
+                                        'via': 'canberra'})
+                # canberra absent or it rejected the event → resolve a theme file.
                 theme = cfg.get('active', 'freedesktop')
                 for ext in ('oga', 'ogg', 'wav'):
                     for base in ['/usr/share/sounds', '/run/current-system/sw/share/sounds']:
