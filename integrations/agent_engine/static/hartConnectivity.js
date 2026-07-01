@@ -270,7 +270,7 @@
       '<span class="mi material-icons-round">' + volGlyph(vol) + '</span></button>' +
       '<input type="range" min="0" max="100" value="' + vpct + '" id="hc-vol-slider" ' +
       'class="hc-slider" aria-label="Volume"' + (vol.available ? '' : ' disabled') + '>' +
-      '<span class="hc-vol-pct">' + (vol.available ? (vpct + '%') : '—') + '</span>' +
+      '<span class="hc-vol-pct">' + (vol.available ? (vpct + '%') : '--') + '</span>' +
       '</div>';
 
     // Battery line

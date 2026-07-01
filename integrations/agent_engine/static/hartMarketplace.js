@@ -76,7 +76,8 @@
       'background:rgba(255,255,255,0.12)');
     var fill = document.createElement('div');
     fill.setAttribute('style', 'height:100%;width:0%;border-radius:3px;' +
-      'background:linear-gradient(90deg,#00D4AA,#7C5CFF);transition:width 0.45s ease');
+      'background:linear-gradient(90deg,var(--hart-accent,#00E6C3),var(--hart-a2,#9B5CFF));' +
+      'transition:width 0.45s ease');
     track.appendChild(fill);
     btn.parentNode.appendChild(track);
     return {

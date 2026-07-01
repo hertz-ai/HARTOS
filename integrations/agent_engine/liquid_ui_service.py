@@ -3035,15 +3035,24 @@ function showToast(title, message, severity) {{
   const color = colors[severity]||colors.info;
   const toast = document.createElement('div');
   toast.className = PERF.potato ? 'toast glass' : 'ds-toast';
+  // XSS-safe: build the fixed structure via innerHTML (NO untrusted interpolation),
+  // then set the caller-supplied title/message (and the icon ligature) via
+  // textContent so a hostile notification body can never inject markup.
   if(PERF.potato) {{
     toast.style.borderLeft = '3px solid '+color;
-    toast.innerHTML = '<div style="font-weight:600;margin-bottom:2px;color:'+color+'">'+title+'</div>'+
-      '<div style="color:var(--hart-text)">'+message+'</div>';
+    toast.innerHTML = '<div class="ds-tt" style="font-weight:600;margin-bottom:2px"></div>'+
+      '<div class="ds-tm" style="color:var(--hart-text)"></div>';
+    var _tt = toast.querySelector('.ds-tt'); _tt.style.color = color; _tt.textContent = title;
+    toast.querySelector('.ds-tm').textContent = message;
   }} else {{
-    toast.innerHTML = '<span class="mi material-icons-round ds-toast-icon" style="color:'+color+'">'+icon+'</span>'+
-      '<div class="ds-toast-content"><div class="ds-toast-title">'+title+'</div>'+
-      '<div class="ds-toast-message">'+message+'</div></div>'+
-      '<div class="ds-toast-progress" style="background:'+color+'"></div>';
+    toast.innerHTML = '<span class="mi material-icons-round ds-toast-icon"></span>'+
+      '<div class="ds-toast-content"><div class="ds-toast-title"></div>'+
+      '<div class="ds-toast-message"></div></div>'+
+      '<div class="ds-toast-progress"></div>';
+    var _ic = toast.querySelector('.ds-toast-icon'); _ic.style.color = color; _ic.textContent = icon;
+    toast.querySelector('.ds-toast-title').textContent = title;
+    toast.querySelector('.ds-toast-message').textContent = message;
+    toast.querySelector('.ds-toast-progress').style.background = color;
   }}
   toast.onclick = function(){{
     if(!PERF.potato) toast.classList.add('ds-toast-exit');
@@ -6102,8 +6111,11 @@ function renderAgentOverlay(ev) {{
                 if ok:
                     ok, err = _logind_call('Reboot', 'b', 'true')
             else:
-                method = {'suspend': 'Suspend', 'shutdown': 'PowerOff',
-                          'restart': 'Reboot'}[action]
+                # DRY (#165): reuse the ONE canonical verb->login1 method map
+                # (os_bridge.power._POWER_METHOD) instead of a second inline dict.
+                # 'restart' is this session route's public verb for a reboot.
+                from integrations.agent_engine.os_bridge.power import _POWER_METHOD
+                method = _POWER_METHOD['reboot' if action == 'restart' else action]
                 ok, err = _logind_call(method, 'b', 'true')
             if not ok:
                 # Real failure (polkit denied, busctl missing, timeout) — surface
