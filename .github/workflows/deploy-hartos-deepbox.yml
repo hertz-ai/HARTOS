@@ -126,7 +126,6 @@ jobs:
                 "OPENAI_API_KEY",
                 "LANGCHAIN_API_KEY",
                 "GROQ_API_KEY",
-                "LLM_BACKEND",
                 "HEVOLVE_NODE_TIER",
                 "HEVOLVE_ENFORCEMENT_MODE",
                 "ALLOWED_HOSTS",
