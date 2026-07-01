@@ -120,17 +120,27 @@
           title: 'Flagship agents', note: 'ready to run, fully local',
           accent: 'violet', see_all: 'agents_browse', flagship: true,
           cards: [
+            // image = the BUNDLED no-network brand poster (the offline default).
+            // The continuous network art (app_poster.agent_art_url -> card.image_url)
+            // layers ON TOP only when no static image is set, so a fresh offline
+            // boot already shows rich agent art (#143/d8 + GF4).
             { title: 'Auto Research', icon: 'travel_explore', meta: 'scout the web, then synthesize',
+              image: '/shell/static/app_art/agent-auto-research.svg',
               action: 'ask', prompt: 'Start the Auto Research agent on a topic I care about' },
             { title: 'Trading', icon: 'candlestick_chart', meta: 'paper-trade live signals',
+              image: '/shell/static/app_art/agent-trading.svg',
               action: 'ask', prompt: 'Open the Trading agent' },
             { title: 'Tutor', icon: 'school', meta: 'learn anything, step by step',
+              image: '/shell/static/app_art/agent-tutor.svg',
               action: 'ask', prompt: 'Be my Tutor' },
             { title: 'English Learning', icon: 'menu_book', meta: 'grammar and vocabulary',
+              image: '/shell/static/app_art/agent-english-learning.svg',
               action: 'ask', prompt: 'Start English Learning' },
             { title: 'Spoken English', icon: 'record_voice_over', meta: 'practice speaking out loud',
+              image: '/shell/static/app_art/agent-spoken-english.svg',
               action: 'ask', prompt: 'Practice Spoken English with me' },
             { title: 'Speech Therapy', icon: 'spatial_audio', meta: 'guided exercises',
+              image: '/shell/static/app_art/agent-speech-therapy.svg',
               action: 'ask', prompt: 'Start a Speech Therapy session' }
           ]
         },

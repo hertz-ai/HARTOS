@@ -9,6 +9,37 @@ Defines all panels available in the glass desktop shell:
 Each panel can float as a draggable/resizable frosted glass window.
 Nunba panels render via iframe to /app/#/<route>.
 System panels render natively from backend API data.
+
+Launchable-microfrontend entry schema (the SAME shape consumed by
+liquid_ui_service.buildStartMenu / openPanel / filterStart — do NOT invent a
+second registry):
+
+    PANEL_MANIFEST[id] = {
+        'title':        str,   # human label; the searched field (filterStart
+                               #   matches data-title; omnibox 'open X' matches
+                               #   title OR the id key). Put the intuitive name
+                               #   here so the page is DISCOVERABLE.
+        'icon':         str,   # Material Symbols glyph name (colour resolved by
+                               #   with_icon_colors -> color_for, single source).
+        'route':        str,   # Nunba BrowserRouter path; opened in an iframe
+                               #   panel at NUNBA_BASE + route. MUST be a real
+                               #   /app route (a wrong route lands on NotFound).
+        'group':        str,   # one of PANEL_GROUPS -> start-menu section.
+        'default_size': [w, h],# 2-element float geometry (invariant-checked).
+        'floating':     bool,  # optional; render as a floating bubble.
+    }
+
+Discoverability (the intuitive rule): a page is findable when an intuitive
+name a user would type is a substring of its 'title' (start search) or its id
+(omnibox 'open <name>'). When a real route already exists under a different
+brand label (e.g. Resonance is the karma/reputation surface, /social/resonance),
+DO NOT add a second entry for the same route (that is a parallel path) - widen
+the existing entry's 'title' so both intuitive names resolve to the one route.
+
+System panels (SYSTEM_PANELS) carry 'apis' instead of 'route' and render via a
+bespoke loader in liquid_ui_service (an id with no loader renders a placeholder),
+so a native surface is registered by REUSING an existing system panel + its
+working renderer, never by inventing a new id with no JS.
 """
 
 # ═══════════════════════════════════════════════════════════════
@@ -61,8 +92,13 @@ PANEL_MANIFEST = {
     },
 
     # ─── You ───
+    # Resonance IS the karma / reputation / standing surface in Nunba (the
+    # AccountBalanceWallet 'You' page). There is no separate /social/karma route,
+    # so we widen this title instead of adding a duplicate 'karma' entry (which
+    # would be a parallel path to the same route) - now both "resonance" and
+    # "karma" resolve, in start search and the omnibox, to this one page.
     'resonance': {
-        'title': 'Resonance', 'icon': 'auto_awesome',
+        'title': 'Resonance & Karma', 'icon': 'auto_awesome',
         'route': '/social/resonance', 'group': 'You',
         'default_size': [700, 500],
     },
@@ -86,14 +122,24 @@ PANEL_MANIFEST = {
         'route': '/social/notifications', 'group': 'You',
         'default_size': [500, 600],
     },
+    # ── Settings family (/social/settings/*) ──
+    # Nunba has no settings index route, only these three sub-pages. The shared
+    # "Settings" token in each title makes the whole family surface when a user
+    # types "settings" (filterStart matches title), while each stays findable by
+    # its own word - no umbrella entry needed, no duplicate route.
     'backup': {
-        'title': 'Backup & Sync', 'icon': 'cloud_sync',
+        'title': 'Backup & Sync Settings', 'icon': 'cloud_sync',
         'route': '/social/settings/backup', 'group': 'You',
         'default_size': [600, 500],
     },
     'appearance': {
-        'title': 'Appearance', 'icon': 'palette',
+        'title': 'Appearance Settings', 'icon': 'palette',
         'route': '/social/settings/appearance', 'group': 'You',
+        'default_size': [700, 600],
+    },
+    'privacy': {
+        'title': 'Privacy Settings', 'icon': 'privacy_tip',
+        'route': '/social/settings/privacy', 'group': 'You',
         'default_size': [700, 600],
     },
 
@@ -297,6 +343,9 @@ SYSTEM_PANELS = {
     'security': {
         'title': 'Security Center', 'icon': 'shield',
         'group': 'System', 'default_size': [700, 500],
+        # image = the BUNDLED no-network brand poster (the offline default for the
+        # desktop icon image-plate, hartDesktop.renderGlyphTile def.image; #153/GF4).
+        'image': '/shell/static/app_art/app-security.svg',
         'apis': [
             '/api/social/dashboard/health',
             '/api/social/integrity/guardrail-hash',
@@ -357,11 +406,13 @@ SYSTEM_PANELS = {
     'file_manager': {
         'title': 'Files', 'icon': 'folder',
         'group': 'System', 'default_size': [800, 600],
+        'image': '/shell/static/app_art/app-files.svg',
         'apis': ['/api/shell/files/browse', '/api/shell/files/recent'],
     },
     'terminal': {
         'title': 'Terminal', 'icon': 'terminal',
         'group': 'System', 'default_size': [800, 500],
+        'image': '/shell/static/app_art/app-terminal.svg',
         'apis': ['/api/shell/terminal/exec', '/api/shell/terminal/sessions'],
     },
     'user_accounts': {
@@ -516,6 +567,7 @@ SYSTEM_PANELS = {
     'app_store': {
         'title': 'App Store', 'icon': 'storefront',
         'group': 'System', 'default_size': [900, 700],
+        'image': '/shell/static/app_art/app-store.svg',
         'apis': ['/api/apps/search', '/api/apps/installed',
                  '/api/apps/install', '/api/apps/uninstall'],
     },
@@ -566,6 +618,7 @@ SYSTEM_PANELS = {
     'weather_widget': {
         'title': 'Weather', 'icon': 'cloud',
         'group': 'System', 'default_size': [400, 350],
+        'image': '/shell/static/app_art/app-weather.svg',
         'apis': ['/api/shell/weather'],
     },
     'file_tags': {
@@ -616,9 +669,18 @@ SYSTEM_PANELS = {
         'group': 'System', 'default_size': [700, 600],
         'apis': ['/api/shell/shortcuts'],
     },
+    # The AI-setup-wizard. This is the existing "Light Your HART" onboarding
+    # surface (loadHartIdentityPanel: when not onboarded it POSTs
+    # /api/onboarding/start to run the wizard; once onboarded it shows the HART
+    # identity card). It already has a working native renderer, so we make the
+    # wizard DISCOVERABLE by widening this title ("setup") rather than inventing
+    # a new system-panel id (which would render a dead placeholder - no JS
+    # loader) or reimplementing the wizard.
     'hart_identity': {
-        'title': 'My HART', 'icon': 'badge',
+        'title': 'My HART Setup', 'icon': 'badge',
         'group': 'You', 'default_size': [500, 450],
+        # The "Light your HART" onboarding surface gets its own heart-spark poster.
+        'image': '/shell/static/app_art/app-hart-setup.svg',
         'apis': ['/api/onboarding/profile', '/api/onboarding/status'],
     },
     'self_build': {

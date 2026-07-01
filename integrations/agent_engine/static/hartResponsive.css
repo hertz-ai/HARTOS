@@ -103,7 +103,7 @@
      mono kept ONLY for metrics/code via --hart-font-mono. (kept from v2) */
   --hart-font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
   --hart-font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
-  --hart-background: #07070B;
+  --hart-background: #05060C;   /* deep blue-black, matches the mockup canvas #05070d (was #07070B, read lighter/purpler) */
   --hart-text: #ECF1F4;
   --hart-muted: #8A93A6;
   --hart-surface: #14141F;
@@ -137,7 +137,7 @@
     radial-gradient(44% 42% at 8%  92%, rgba(255,46,154,0.10), transparent 66%),
     radial-gradient(34% 30% at 50% 40%, rgba(59,130,246,0.07), transparent 70%),
     radial-gradient(130% 100% at 50% 128%, rgba(10,12,26,0.62), transparent 72%),
-    linear-gradient(158deg, #0A0A11 0%, #07070B 52%, #0B0912 100%);
+    linear-gradient(158deg, #06070D 0%, #04050A 52%, #070610 100%);  /* deep blue-black, mockup #05070d (was lighter/purpler) */
 }
 /* Cinematic vignette — frames the screen, content-forward (purely additive,
    pointer-events:none so it never blocks the desktop; sits above wallpaper). */
@@ -430,14 +430,33 @@ html.a11y-rmotion .hv-art:hover > img, html.a11y-rmotion .hv-art:focus-within > 
 
 /* 1) Kill backdrop blur + heavy shadow on every frosted chrome surface — the
    single biggest per-frame CPU cost. Raise the fill opacity so the chrome stays
-   legible without blur; keep a hairline brand border (from the base rule). */
+   legible without blur; keep a hairline brand border (from the base rule).
+
+   body.webkit-flat (#151 transparent-windows): the SAME opaque fill must also
+   apply whenever WebKit accelerated COMPOSITING is OFF — even on a box whose
+   gpu-probe says `hardware`. The glass-shell host disables WebKit compositing
+   (WEBKIT_DISABLE_COMPOSITING_MODE + HardwareAccelerationPolicy.NEVER) unless
+   hart.liquidUI.preferHardwareGL is set, and with compositing off backdrop-filter
+   :blur paints NOTHING — so the translucent .glass / .panel base reads SEE-THROUGH
+   (the steward's "windows have a transparent background"). render_desktop_shell()
+   tags <body webkit-flat> from LIQUID_UI_PREFER_HW_GL, decoupled from the gpu
+   verdict. ONE rule, two triggers (software-render OR compositing-off) — no
+   parallel opaque path. The glassy translucent look is kept ONLY on the
+   hardware-composited path (preferHardwareGL=true → neither class present). */
 body.gpu-software .glass,
 body.gpu-software .panel,
 body.gpu-software .top-bar,
 body.gpu-software .hart-hero-bar,
 body.gpu-software .start-menu,
 body.gpu-software .ctx-menu,
-body.gpu-software .agent-pill {
+body.gpu-software .agent-pill,
+body.webkit-flat .glass,
+body.webkit-flat .panel,
+body.webkit-flat .top-bar,
+body.webkit-flat .hart-hero-bar,
+body.webkit-flat .start-menu,
+body.webkit-flat .ctx-menu,
+body.webkit-flat .agent-pill {
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
   background: rgba(18,19,28,0.94);
@@ -453,15 +472,26 @@ body.gpu-software .hart-hero-bar:focus-within {
   box-shadow: 0 0 0 1px rgba(var(--hart-accent-rgb),0.45);
 }
 
-/* 2) Stop every continuous / non-essential animation. The accent breathe pulse,
-   the staggered entrance reveals, and the ambient/grain layers repaint forever
-   on the CPU. (The voice orb itself is canvas-driven, not CSS — untouched.) */
+/* 2) Stop every continuous / non-essential animation. The accent breathe pulse
+   + the staggered entrance reveals repaint forever on the CPU. (The voice orb
+   itself is canvas-driven, not CSS — untouched.) */
 body.gpu-software .hart-hero-go,
 body.gpu-software .hart-desktop .desktop-icon,
 body.gpu-software .start-menu .start-item {
   animation: none !important;
 }
-body.gpu-software .hart-ambient,
+/* DEGRADE GRACEFULLY (2026-07-01): the 3 ambient cinematic glows are the single
+   biggest "looks rich vs looks cheap" lever (the mockup paints them). Their ONLY
+   per-frame cost on the CPU is the drift ANIMATION + the 64px live blur; the
+   multi-hue radial gradients themselves raster ONCE and composite cheaply. So
+   the software floor KEEPS the ambient — static (no drift) + a far smaller,
+   one-time blur — instead of gutting depth for no per-frame saving. The grain
+   overlay (mix-blend-mode:overlay = a per-frame composite) stays dropped. */
+body.gpu-software .hart-ambient {
+  animation: none !important;
+  filter: blur(28px) saturate(135%);
+  opacity: 0.42;
+}
 body.gpu-software .hart-grain { display: none; }
 
 /* 3) Collapse hover/focus SCALE lifts to instant flat highlights. The transition
@@ -506,7 +536,7 @@ body.gpu-software .wallpaper {
   background:
     radial-gradient(60% 50% at 14% 4%, rgba(0,230,195,0.10), transparent 60%),
     radial-gradient(60% 55% at 92% 96%, rgba(155,92,255,0.12), transparent 62%),
-    linear-gradient(158deg, #0A0A11 0%, #07070B 60%, #0B0912 100%);
+    linear-gradient(158deg, #06070D 0%, #04050A 60%, #070610 100%);  /* deep blue-black, mockup #05070d */
 }
 body.gpu-software .wallpaper::after { display: none; }
 

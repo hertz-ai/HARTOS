@@ -1153,6 +1153,26 @@ class LiquidUIService:
         gpu_mode = read_gpu_render_mode()  # 'hardware' | 'software'
         gpu_body_class = 'gpu-' + gpu_mode  # gpu-software | gpu-hardware
 
+        # ── Glass-opaque fallback signal (#151 transparent-windows) ───────────────
+        # The frosted .glass / .panel surfaces lean on backdrop-filter:blur over a
+        # translucent fill. backdrop-filter ONLY paints when WebKit accelerated
+        # COMPOSITING is on — which the glass-shell host enables ONLY when
+        # hart.liquidUI.preferHardwareGL=true. With it false (the default), the host
+        # exports WEBKIT_DISABLE_COMPOSITING_MODE=1 + HardwareAccelerationPolicy.NEVER,
+        # so the blur renders NOTHING and a translucent panel reads SEE-THROUGH — the
+        # steward's real-HW "windows have a transparent background". This is DECOUPLED
+        # from the gpu-probe verdict above: a box whose probe says 'hardware' still has
+        # WebKit compositing OFF unless preferHardwareGL is set, so gpu-hardware alone
+        # never triggered the opaque fallback. Surface the host's compositing state via
+        # LIQUID_UI_PREFER_HW_GL (set from ui.preferHardwareGL in hart-liquid-ui.nix)
+        # and tag <body> `webkit-flat` whenever blur will NOT composite, so the CSS
+        # floor solidifies the glass. Default '0' = the safe, legible opaque floor
+        # (matches preferHardwareGL's default-false), so a bare/dev render is opaque
+        # too, never see-through.
+        webkit_compositing = os.environ.get('LIQUID_UI_PREFER_HW_GL', '0') == '1'
+        # webkit-flat == "backdrop-filter blur won't paint" == solidify the glass.
+        flat_body_class = '' if webkit_compositing else ' webkit-flat'
+
         # Potato (reduced-effects) tier: TRUE when the theme disables blur OR the
         # box is software-rendered. The GPU-only cinematic (backdrop blur, layered
         # shadows, continuous animation, ambient/grain) is exactly what pegs a core
@@ -1161,6 +1181,16 @@ class LiquidUIService:
         # inline-script PERF.potato + window.HART_PERF.potato engage on real
         # software-render hardware, not just on the theme tier.
         is_potato = perf.get('disable_blur', False) or gpu_mode == 'software'
+
+        # Ambient cinematic glow emission (2026-07-01, degrade-gracefully): the 3
+        # drifting brand blooms are the single biggest "looks rich" lever (the
+        # mockup paints them). On a SOFTWARE-rendered box we now STILL emit them —
+        # hartResponsive.css renders them STATIC (no drift) + low-blur, a one-time
+        # raster, so depth survives at ~zero per-frame cost (the floor only sheds
+        # the per-FRAME drift/blur/grain). We keep them OFF only for an explicit
+        # theme disable_blur on a CAPABLE GPU (the user asked for no blur and the
+        # box can otherwise afford the full cinematic, so honour that choice).
+        emit_ambient = (not is_potato) or (gpu_mode == 'software')
 
         # Accessibility state — the SAME live dict the /api/shell/accessibility
         # routes mutate (same process). High-contrast + reduced-motion apply as
@@ -1672,8 +1702,12 @@ img{-webkit-user-drag:none;user-select:none}
 .hart-hero-orbwrap:hover{transform:scale(1.03)}
 .hart-hero-orbwrap:active{transform:scale(.985)}
 .hart-hero-orbwrap:focus-visible{outline:none;box-shadow:0 0 0 3px var(--hart-accent)}
+/* The orb's bloom = the mockup's layered "0 0 90px teal + 0 0 160px violet": a
+   teal INNER glow + a brand-violet OUTER halo. Replaces the leftover indigo
+   #6C63FF drop-shadow b1.1 flagged (which read flat/blue); core+body stay teal,
+   so this adds a violet HALO without washing the orb blue. */
 #hart-voice-orb{width:300px;height:300px;background:transparent;pointer-events:none;
-  filter:drop-shadow(0 12px 44px rgba(108,99,255,.25))}
+  filter:drop-shadow(0 0 46px rgba(0,230,195,.34)) drop-shadow(0 8px 64px rgba(155,92,255,.26))}
 .hart-hero-orbwrap.listening{box-shadow:0 0 0 5px rgba(255,107,107,.22),0 10px 44px rgba(255,107,107,.35)}
 .hart-hero-orbwrap.listening #hart-voice-orb{filter:drop-shadow(0 12px 44px rgba(255,107,107,.4))}
 .hart-hero-status{font-size:13px;font-weight:500;letter-spacing:.3px;color:var(--hart-muted);min-height:18px;
@@ -2397,13 +2431,13 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 {_CSS_POTATO_OVERRIDE if is_potato else ''}
 </style>
 </head>
-<body class="{gpu_body_class}">
+<body class="{gpu_body_class}{flat_body_class}">
 <!-- Hevolve brand boot splash (Lottie). Inline styles: this HTML is inside an
      f-string, so a CSS block would need brace-escaping; the overlay is a single
      element + hartBootSplash.js drives the fade, so inline is cleaner here. -->
 <div id="hart-boot" aria-hidden="true" style="position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:#0F0E17;transition:opacity .6s ease"><div id="hart-boot-lottie" style="width:min(46vw,360px);height:min(64vw,497px)"></div></div>
 <div class="wallpaper"></div>
-{'<div class="hart-ambient" aria-hidden="true"></div><div class="hart-grain" aria-hidden="true"></div>' if not is_potato else ''}
+{'<div class="hart-ambient" aria-hidden="true"></div>' if emit_ambient else ''}{'<div class="hart-grain" aria-hidden="true"></div>' if not is_potato else ''}
 <div class="hart-vignette" aria-hidden="true"></div>
 <!-- Desktop icon layer (drag-drop apps); populated by hartDesktop.js -->
 <div class="hart-desktop" id="hart-desktop" aria-label="Desktop icons"></div>
@@ -7015,6 +7049,18 @@ def _home_agent_card(a: dict, action: str, target: Optional[str] = None) -> dict
     gtype = str(a.get('type') or '').replace('_goal', '')
     card = {'title': name, 'topic': name,
             'icon': _home_icon_for(gtype or name), 'action': action}
+    # Per-agent GENERATED art (#143): only when a LOCAL image generator is
+    # reachable via the Model Bus. A miss leaves image_url unset so the client
+    # composites HartBrandArt + the dark-to-light scrim + the name (the honest
+    # default today). The SAME ImageCache/scrim path lights up if a generator
+    # ever registers; zero client change.
+    try:
+        from integrations.agent_engine import app_poster
+        art = app_poster.agent_art_url(name)
+    except Exception:
+        art = None
+    if art:
+        card['image_url'] = art
     status = str(a.get('status') or '').lower()
     if status in ('running', 'in_progress', 'active'):
         card['live'] = 'running'
@@ -7055,6 +7101,64 @@ def _home_flagship_row() -> dict:
              'action': 'ask', 'prompt': 'Start a Speech Therapy session'},
         ],
     }
+
+
+# Curated App Store fill for the Apps row (reverse-DNS Flathub id + display
+# name). High-recognition picks mirroring hart-app-catalog.json; product
+# curation, not a logic fork (same rationale as _home_flagship_row).
+_HOME_FLAGSHIP_APPS = (
+    ('org.mozilla.firefox', 'Firefox'),
+    ('org.videolan.VLC', 'VLC'),
+    ('org.libreoffice.LibreOffice', 'LibreOffice'),
+    ('org.gimp.GIMP', 'GIMP'),
+    ('com.obsproject.Studio', 'OBS Studio'),
+    ('org.blender.Blender', 'Blender'),
+)
+
+
+def _home_app_card(app_id: str, name: str) -> dict:
+    """One Netflix card for an app (#143). The producer stamps card.image_url
+    from the resolved marketplace/official poster (fetched + cached ONCE by the
+    W10 ImageCache); a miss leaves image_url unset so the client paints the
+    deterministic brand-art tile. The card opens the App Store."""
+    from integrations.agent_engine import app_poster
+    disp = _home_clean_text(name, 60) or 'App'
+    card = {'title': disp, 'topic': disp, 'icon': 'apps',
+            'action': 'open', 'target': 'app_store'}
+    try:
+        poster = app_poster.resolve_app_poster(app_id, prefer='poster')
+    except Exception:
+        poster = None
+    if poster:
+        card['image_url'] = poster
+    return card
+
+
+def _home_app_cards(installed: List[dict]) -> List[dict]:
+    """The Apps row: the user's INSTALLED apps first, then curated flagship
+    fill, capped at 8, de-duped by app id / title."""
+    cards: List[dict] = []
+    seen = set()
+    for app in (installed or []):
+        aid = str((app or {}).get('app_id') or '').strip()
+        nm = _home_clean_text((app or {}).get('name'), 60)
+        if not nm:
+            continue
+        key = aid.lower() or nm.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cards.append(_home_app_card(aid, nm))
+        if len(cards) >= 8:
+            return cards
+    for aid, nm in _HOME_FLAGSHIP_APPS:
+        if aid.lower() in seen:
+            continue
+        seen.add(aid.lower())
+        cards.append(_home_app_card(aid, nm))
+        if len(cards) >= 8:
+            break
+    return cards
 
 
 def _home_recipe_cards() -> List[dict]:
@@ -7187,6 +7291,10 @@ def _deterministic_home_payload(ctx: dict) -> dict:
         rows.append({'title': 'Continue', 'accent': 'teal',
                      'see_all': 'agents_browse', 'cards': cont})
     rows.append(_home_flagship_row())
+    apps = ctx.get('apps') or []
+    if apps:
+        rows.append({'title': 'Apps', 'note': 'installed + from the store',
+                     'accent': 'cyan', 'see_all': 'app_store', 'cards': apps})
     rec = ctx.get('recipes') or []
     if rec:
         rows.append({'title': 'Recipes', 'note': 'replay without re-thinking',

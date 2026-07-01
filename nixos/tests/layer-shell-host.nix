@@ -82,6 +82,11 @@ in
       # the floor (the never-break gate).
       hart.liquidUI = { enable = true; renderer = "webkit"; voiceEnabled = false; };
       hart.layerShellHost.enable = true;
+      # gst-inspect-1.0 on PATH so the #150 mic subtest can resolve a real capture
+      # element against the host's exported GST_PLUGIN_SYSTEM_PATH_1_0. Test-only —
+      # production discovers the plugins via the host's exported search path, not a
+      # system tool. (gst_all_1.gstreamer ships gst-inspect-1.0.)
+      environment.systemPackages = [ pkgs.gst_all_1.gstreamer ];
     };
 
     testScript = ''
@@ -168,6 +173,34 @@ in
           # GTK3 'WebKit2-4.1.typelib'. This is the toolkit port made concrete.
           host.succeed("find /nix/store -name 'WebKit-6.0.typelib' -print -quit | grep -q .")
           host.succeed("find /nix/store -name 'Gtk4LayerShell-1.0.typelib' -print -quit | grep -q .")
+
+      # ── 3b. #150 MIC: the host wires a GStreamer capture path with a real source ──
+      # WebKitGTK 6.0 does getUserMedia capture via GStreamer. The host's minimal
+      # env never set GST_PLUGIN_SYSTEM_PATH_1_0, so WebKit found NO audio source
+      # element and the mic was DENIED on real HW despite the permission handler
+      # allowing it + PipeWire being up. Prove BEHAVIOURALLY that (1) the host now
+      # exports the GStreamer plugin search path and (2) a real capture element
+      # actually RESOLVES on it — i.e. WebKit has a mic source to bind. This is the
+      # un-fakeable half: a path that points at nothing would pass a grep but fail
+      # gst-inspect.
+      with subtest("GTK4 host exports GST_PLUGIN_SYSTEM_PATH_1_0 (mic capture plugin path)"):
+          assert "GST_PLUGIN_SYSTEM_PATH_1_0" in host_src, \
+              "GTK4 host missing GST_PLUGIN_SYSTEM_PATH_1_0 — WebKit getUserMedia has no capture source"
+
+      with subtest("a real GStreamer audio capture element resolves on the host's plugin path (#150)"):
+          # Parse the exported value straight out of the host script we already
+          # cat'd (host_src) — no shell-quoting games. The export line is
+          # GST_PLUGIN_SYSTEM_PATH_1_0="<path>".
+          assert 'GST_PLUGIN_SYSTEM_PATH_1_0="' in host_src
+          gst_path = host_src.split('GST_PLUGIN_SYSTEM_PATH_1_0="', 1)[1].split('"', 1)[0]
+          assert gst_path, "could not extract the host's GST_PLUGIN_SYSTEM_PATH_1_0 value"
+          # gst-inspect-1.0 LOADS the element off that path — proves the capture
+          # source is really there (pulsesrc via PipeWire-pulse, else native
+          # pipewiresrc), not just a path string. Either capture element satisfies
+          # WebKit's getUserMedia audio source requirement.
+          host.succeed(
+              "GST_PLUGIN_SYSTEM_PATH_1_0='" + gst_path + "' gst-inspect-1.0 pulsesrc >/dev/null 2>&1 "
+              "|| GST_PLUGIN_SYSTEM_PATH_1_0='" + gst_path + "' gst-inspect-1.0 pipewiresrc >/dev/null")
 
       # ── 4. LiquidUI server is active and serves /shell/static (DEAD-HUSK CHECK) ──
       # The GTK4 host re-hosts THIS served shell (:6800). The same dead-husk guard

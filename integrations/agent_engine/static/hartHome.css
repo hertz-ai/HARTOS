@@ -195,6 +195,10 @@
   /* bright teal -> brand teal (the mockup CTA). NOT teal->cyan: cyan #29C5FF dominated the
      small button and read "blue". Stays software-safe (flat gradient, no blur). */
   background: linear-gradient(135deg, #5CFFD9, var(--hh-teal));
+  /* STATIC teal glow = the mockup CTA's box-shadow:0 12px 36px rgba(0,230,184,.35).
+     A one-time raster, so software keeps the lit "Resume" button; only the hover
+     lift stays GPU-gated below. */
+  box-shadow: 0 12px 30px rgba(0, 230, 195, 0.30);
 }
 
 /* ============================ ROWS REGION ============================ */
@@ -266,6 +270,11 @@
   background: #0E1320;
   scroll-snap-align: start;
   cursor: pointer;
+  /* STATIC drop-shadow = the mockup's card depth (0 18px 40px rgba(0,0,0,.45)).
+     It rasters ONCE and composites cheaply forever, so the software floor KEEPS
+     it (degrade gracefully, not gut): only the per-frame hover-scale + transition
+     are GPU-gated below. Without this the software home read as flat rectangles. */
+  box-shadow: 0 16px 38px rgba(0, 0, 0, 0.46);
 }
 .hh-card.hh-wide { width: 360px; }
 .hh-card.hh-portrait { width: 180px; height: 252px; }
@@ -440,14 +449,12 @@ body.gpu-hardware .hh-btn {
   backdrop-filter: blur(10px);
   transition: transform 160ms ease, box-shadow 160ms ease;
 }
-body.gpu-hardware .hh-btn-primary {
-  box-shadow: 0 12px 36px rgba(0, 230, 195, 0.32);
-}
 body.gpu-hardware .hh-btn:hover { transform: translateY(-2px); }
 
+/* The base .hh-card already carries the static drop-shadow (kept on software);
+   the GPU layer only adds the per-frame hover-scale machinery. */
 body.gpu-hardware .hh-card {
   transition: transform 200ms ease, box-shadow 200ms ease;
-  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
   will-change: transform;
 }
 /* Netflix hover-expand (only where the GPU can afford the composite). */

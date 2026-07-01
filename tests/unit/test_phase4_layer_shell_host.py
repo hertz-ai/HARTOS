@@ -283,6 +283,51 @@ class TestPackageSet:
 
 
 # ═══════════════════════════════════════════════════════════════
+# 5b. #150 MIC: WebKit getUserMedia capture needs a GStreamer plugin path
+# ═══════════════════════════════════════════════════════════════
+# Clearly-labelled SOURCE GUARD (per feedback_no_grep_tests.md): the BEHAVIOURAL
+# proof — that a real GStreamer capture element resolves on the host's exported
+# path so WebKit getUserMedia has a mic source — is the VM nixosTest's #150 subtest
+# (it runs gst-inspect against the path); that cannot run on the Windows dev box.
+# These dev-box guards assert the structural wiring the VM proof depends on: the
+# host must EXPORT GST_PLUGIN_SYSTEM_PATH_1_0 built from the capture plugin set.
+
+class TestMicCaptureGStreamerWiring:
+    @pytest.fixture(scope="class")
+    def src(self):
+        return _read(MODULE)
+
+    def test_host_exports_gst_plugin_system_path(self, src):
+        # Without this export the host's minimal env hides every GStreamer plugin,
+        # so WebKitGTK 6.0 finds NO audio source element and getUserMedia fails
+        # "microphone access denied" despite the permission handler allowing it.
+        assert "GST_PLUGIN_SYSTEM_PATH_1_0" in src
+        # It must be a real export inside the host wrapper, derived from the plugin
+        # search path binding (not only named in the explanatory comment).
+        assert 'export GST_PLUGIN_SYSTEM_PATH_1_0="${gstPluginPath}"' in src
+
+    def test_plugin_path_is_built_from_the_gstreamer_plugin_dir(self, src):
+        # makeSearchPath over lib/gstreamer-1.0 is what makes the capture elements
+        # discoverable (and pins them into the host closure).
+        assert 'makeSearchPath "lib/gstreamer-1.0"' in src
+
+    def test_capture_plugin_set_includes_an_audio_source(self, src):
+        # gst-plugins-good ships pulsesrc (capture via PipeWire's pulse compat) and
+        # pipewire ships pipewiresrc (native capture) — at least the proven pulse
+        # path + the native one must be in the plugin set the path is built from.
+        assert "gst-plugins-good" in src   # pulsesrc — the proven capture element
+        assert "gst_all_1" in src          # the GStreamer plugin family
+        assert "pipewire" in src           # pipewiresrc — native PipeWire capture
+
+    def test_permission_handler_still_allows_first_party_capture(self, src):
+        # The capture path is only useful if the WebView still ALLOWs the mic
+        # request (the other half of #150) — guard the existing permission wiring
+        # so a refactor cannot silently drop it and re-deny the mic.
+        assert "permission-request" in src
+        assert "set_enable_media_stream" in src
+
+
+# ═══════════════════════════════════════════════════════════════
 # 6. Opt-in, does NOT flip defaultSession, registers a session, VM-pending
 # ═══════════════════════════════════════════════════════════════
 

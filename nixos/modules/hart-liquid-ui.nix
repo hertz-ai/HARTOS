@@ -396,6 +396,15 @@ in
           LIQUID_UI_THEME = ui.theme;
           LIQUID_UI_VOICE = if ui.voiceEnabled then "1" else "0";
           LIQUID_UI_HAPTIC = if ui.hapticEnabled then "1" else "0";
+          # #151 transparent-windows: tell the shell renderer whether WebKit
+          # accelerated COMPOSITING is on. The glass-shell host enables it ONLY when
+          # preferHardwareGL=true; otherwise it forces WEBKIT_DISABLE_COMPOSITING_MODE
+          # + HardwareAccelerationPolicy.NEVER and backdrop-filter:blur paints NOTHING,
+          # so a translucent .glass/.panel reads SEE-THROUGH. render_desktop_shell()
+          # reads this to tag <body webkit-flat> and solidify the glass when blur will
+          # not composite. SAME value the host derives preferHardwareGL from -> one
+          # source of truth, no drift between the renderer and the host.
+          LIQUID_UI_PREFER_HW_GL = if ui.preferHardwareGL then "1" else "0";
           LIQUID_UI_CONTEXT_MS = toString ui.contextRefreshMs;
           LIQUID_UI_A2UI = if ui.enableA2UI then "1" else "0";
           MODEL_BUS_HTTP_PORT = toString (config.hart.modelBus.ports.http or 6790);

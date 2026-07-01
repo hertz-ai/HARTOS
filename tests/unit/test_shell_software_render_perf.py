@@ -138,6 +138,60 @@ def test_software_render_css_floor_present(svc, monkeypatch):
     assert re.search(r'body\.gpu-software[^{]*\{[^}]*backdrop-filter:\s*none', css)
 
 
+# ── #151 transparent-windows: solidify the glass when WebKit compositing is OFF ──
+# The frosted .glass/.panel lean on backdrop-filter:blur, which paints ONLY with
+# WebKit accelerated compositing (preferHardwareGL=true). With it off (the default)
+# the blur paints nothing and a translucent panel reads SEE-THROUGH. The fix tags
+# <body webkit-flat> from LIQUID_UI_PREFER_HW_GL — decoupled from the gpu verdict —
+# and the CSS floor solidifies the glass on that class. Behavioural (real render +
+# real served stylesheet), the env boundary set explicitly.
+
+def test_body_webkit_flat_when_compositing_off_even_on_hardware_probe(svc, monkeypatch):
+    """The #151 regression case: a box whose gpu-probe says `hardware` but whose
+    WebKit compositing is OFF (preferHardwareGL unset/false) must STILL tag
+    webkit-flat so the panels are opaque, not see-through. This is the decoupling
+    the old probe-only body class missed."""
+    monkeypatch.delenv('LIQUID_UI_PREFER_HW_GL', raising=False)
+    monkeypatch.setattr(lus, 'read_gpu_render_mode', lambda: 'hardware')
+    body = _body_tag(svc.render_desktop_shell())
+    assert 'webkit-flat' in body, (
+        "compositing-off render must tag <body webkit-flat> to solidify the glass; "
+        "without it translucent panels render see-through (#151)")
+    # The gpu verdict tag is independent and unchanged (it stays the probe value).
+    assert 'gpu-hardware' in body
+
+
+def test_body_not_webkit_flat_when_hardware_gl_opted_in(svc, monkeypatch):
+    """Converse: preferHardwareGL=true (LIQUID_UI_PREFER_HW_GL='1') composites the
+    blur, so the glassy translucent look is KEPT — no webkit-flat, no opaque
+    override. The GPU path stays glassy; only the compositing-off path is flattened."""
+    monkeypatch.setenv('LIQUID_UI_PREFER_HW_GL', '1')
+    monkeypatch.setattr(lus, 'read_gpu_render_mode', lambda: 'hardware')
+    body = _body_tag(svc.render_desktop_shell())
+    assert 'webkit-flat' not in body, (
+        "preferHardwareGL=true composites backdrop-filter — must NOT flatten the glass")
+
+
+def test_css_floor_solidifies_glass_and_panels_on_webkit_flat(svc):
+    """The opaque fallback must fire on body.webkit-flat too (not only
+    body.gpu-software): a hardware-probe box with compositing off must still get a
+    near-opaque .glass/.panel fill with blur killed, or the floating windows are
+    see-through. ONE rule, two triggers — proven on the live served stylesheet."""
+    app = svc._create_flask_app()
+    app.testing = True
+    client = app.test_client()
+    css = client.get('/shell/static/hartResponsive.css').get_data(as_text=True)
+    # The glass + the floating panel window are both covered on the flat path.
+    assert 'body.webkit-flat .glass' in css
+    assert 'body.webkit-flat .panel' in css
+    # The webkit-flat selector leads into a block that BOTH kills the (uncomposited)
+    # blur AND sets a near-opaque fill — that pairing is what makes the panel solid.
+    assert re.search(r'body\.webkit-flat[^{]*\{[^}]*backdrop-filter:\s*none', css), \
+        "webkit-flat glass must disable backdrop-filter (it paints nothing uncomposited)"
+    assert re.search(r'body\.webkit-flat[^{]*\{[^}]*background:\s*rgba', css), \
+        "webkit-flat glass must set a near-opaque rgba fill (else still see-through)"
+
+
 # ── #138 terminal exec re-render guard (inline JS — source guard) ──────────────
 
 def test_source_guard_terminal_exec_rerender_safe(svc):

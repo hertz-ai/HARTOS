@@ -239,6 +239,26 @@ in
     # and actually executes. Scope is the enumerated power verbs ONLY — no broader
     # privilege is conferred. (The shell server still gates every call behind
     # @_require_shell_auth + the action whitelist + the firmware-capability probe.)
+    #
+    # ── Wi-Fi / network settings via NetworkManager (polkit grant) — #149 ──
+    # SAME class as the power-action grant above: the Liquid-UI shell SERVER (which
+    # serves /api/shell/network/wifi* + /api/shell/wifi/* and execs bare `nmcli`)
+    # runs as the `hart` SERVICE user — a system daemon with NO active graphical
+    # session. READ-ONLY nmcli status (`nmcli radio`, `nmcli device`) works to anyone
+    # over the system D-Bus, which is why the connectivity indicator could come up;
+    # but ACTIVATING a connection / saving a new Wi-Fi profile with a password needs
+    # polkit auth for org.freedesktop.NetworkManager.settings.modify.system (+
+    # .modify.own, .network-control, .wifi.scan, .enable-disable-*). polkit's default
+    # NetworkManager policy returns `yes` only for an ACTIVE LOCAL session
+    # (allow_active); a sessionless system daemon falls through to auth_admin, so the
+    # call is DENIED non-interactively and the shell surfaces "Not authorised to
+    # change network settings" (the #149 symptom). NixOS only auto-grants users in the
+    # `networkmanager` GROUP, and `hart` is not (and need not be) a session user — so
+    # grant it the NetworkManager actions outright here, the same shape as the login1
+    # grant. Belt-and-suspenders: any active local seat (e.g. hart-admin's graphical
+    # session) is granted too, so a future in-session caller works without a second
+    # rule. Scope is the NetworkManager action namespace ONLY — no broader privilege.
+    # The shell server still gates every call behind @_require_shell_auth.
     security.polkit = {
       enable = lib.mkDefault true;
       extraConfig = ''
@@ -256,6 +276,17 @@ in
             "org.freedesktop.login1.lock-sessions": true
           };
           if (hartPowerActions[action.id] === true) {
+            if (subject.user == "hart" || (subject.local && subject.active)) {
+              return polkit.Result.YES;
+            }
+          }
+          // Wi-Fi / network settings (#149): grant the WHOLE NetworkManager action
+          // namespace to the hart shell user (and any active local seat). Matching
+          // the action-id PREFIX (not an enumerated whitelist) so a NetworkManager
+          // rev that adds/renames a settings action can never silently re-break
+          // "connect to Wi-Fi" — the same robustness the networkmanager-group rule
+          // NixOS ships relies on, scoped to the sessionless hart daemon.
+          if (action.id.indexOf("org.freedesktop.NetworkManager.") === 0) {
             if (subject.user == "hart" || (subject.local && subject.active)) {
               return polkit.Result.YES;
             }

@@ -28,7 +28,8 @@ from integrations.agent_engine import liquid_ui_service as L
 from integrations.agent_engine.liquid_ui_service import (
     HOME_ROW_ACCENTS, HOME_CARD_ACTIONS, HOME_PANEL_TARGETS,
     LiquidUIService, build_home_payload, run_home_compose,
-    _deterministic_home_payload, _sanitize_home_payload, _llm_curate_home)
+    _deterministic_home_payload, _sanitize_home_payload, _llm_curate_home,
+    _home_app_card, _home_app_cards, _home_agent_card)
 
 
 def _ctx(spark=None):
@@ -293,6 +294,76 @@ def test_daemon_respects_the_compose_cadence():
          patch.object(L, 'run_home_compose') as run:
         d._spawn_home_compose_async()
     run.assert_not_called()                          # within the interval -> skip
+
+
+# ── 6. per-type card image sourcing (#143 / steward d8) ──────────────────────
+
+def test_home_app_card_stamps_the_marketplace_poster():
+    # The producer sets card.image_url PER APP from the resolved poster; the
+    # client (W10 ImageCache) fetches the bytes once. Action/target are on the
+    # allow-sets so the sanitizer keeps the card.
+    with patch('integrations.agent_engine.app_poster.resolve_app_poster',
+               return_value='https://dl.flathub.org/media/ff/poster.png') as r:
+        card = _home_app_card('org.mozilla.firefox', 'Firefox')
+    r.assert_called_once_with('org.mozilla.firefox', prefer='poster')
+    assert card['image_url'] == 'https://dl.flathub.org/media/ff/poster.png'
+    assert card['action'] in HOME_CARD_ACTIONS
+    assert card['target'] in HOME_PANEL_TARGETS         # opens the app store
+
+
+def test_home_app_card_without_a_poster_falls_back_to_brand_art():
+    # A miss leaves image_url unset, so the client paints the brand-art tile.
+    with patch('integrations.agent_engine.app_poster.resolve_app_poster',
+               return_value=None):
+        card = _home_app_card('com.example.NoArt', 'No Art')
+    assert 'image_url' not in card
+    assert card['title'] == 'No Art' and card['icon'] == 'apps'
+
+
+def test_apps_row_lists_installed_first_then_flagship_fill():
+    installed = [{'name': 'My Editor', 'app_id': 'com.example.Editor',
+                  'platform': 'flatpak'}]
+    with patch('integrations.agent_engine.app_poster.resolve_app_poster',
+               side_effect=lambda aid, prefer='poster':
+                   ('https://art/' + aid) if aid else None):
+        cards = _home_app_cards(installed)
+    titles = [c['title'] for c in cards]
+    assert titles[0] == 'My Editor'                     # the user's app leads
+    assert 'Firefox' in titles                          # flagship fill follows
+    assert len(cards) <= 8
+
+
+def test_apps_row_appears_in_the_deterministic_payload():
+    ctx = _ctx(spark=None)
+    ctx['apps'] = [{'title': 'Firefox', 'topic': 'Firefox', 'icon': 'apps',
+                    'action': 'open', 'target': 'app_store',
+                    'image_url': 'https://dl.flathub.org/x.png'}]
+    p = _deterministic_home_payload(ctx)
+    apps = [r for r in p['rows'] if r['title'] == 'Apps']
+    assert len(apps) == 1
+    assert apps[0]['see_all'] == 'app_store'
+    # The poster survives the sanitizer (http(s) allow-list).
+    clean = _sanitize_home_payload(p)
+    crow = [r for r in clean['rows'] if r['title'] == 'Apps'][0]
+    assert crow['cards'][0]['image_url'] == 'https://dl.flathub.org/x.png'
+
+
+def test_agent_card_uses_generated_art_when_a_generator_is_reachable():
+    with patch('integrations.agent_engine.app_poster.agent_art_url',
+               return_value='https://gen.local/art/abc.png'):
+        card = _home_agent_card({'name': 'Auto Research', 'type': 'research_goal',
+                                 'status': 'running'}, 'resume')
+    assert card['image_url'] == 'https://gen.local/art/abc.png'
+    assert card['live'] == 'running'
+
+
+def test_agent_card_falls_back_to_brand_art_when_no_generator():
+    # The HONEST default today: no on-device generator -> no image_url -> the
+    # client composites HartBrandArt + the dark-to-light scrim + the name.
+    with patch('integrations.agent_engine.app_poster.agent_art_url',
+               return_value=None):
+        card = _home_agent_card({'name': 'Tutor', 'type': 'tutor_goal'}, 'ask')
+    assert 'image_url' not in card
 
 
 if __name__ == '__main__':

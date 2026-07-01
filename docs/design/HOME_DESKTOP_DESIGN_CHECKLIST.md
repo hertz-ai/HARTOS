@@ -83,6 +83,24 @@ This is the steward's most-repeated structural rule. Capture every nuance.
   regress b1: brand ANCHORS are teal/violet (logo, eyebrow, earnings, CTA, orb); CARDS keep the full
   SPECTRUM (now visible per card, no navy crush) - exactly how the steward mockup is built.
   - *steward 2026-06-30: "HARTOS color in this html is not used?" + "this is how it looks now" (blue-wash screenshots)*
+- **b1.2 Teal LEADS, violet ACCENTS with intent - the duotone-weighting rule (2026-07-01). APPLIED in the mockup.**
+  The steward re-audited `hartos_home_mockup.html`: the teal->violet brand gradient was used in exactly ONE
+  place (the `.brand` wordmark); everything that draws the eye was teal-only, so it "still looks majority teal".
+  The fix is NOT "spread violet everywhere" (that clutters); violet must carry a CONSISTENT MEANING.
+  - **Weighting: teal ~70% (lead), violet ~30% (accent).** *steward: "need the best of all worlds without
+    losing functionality" + "without looking cluttered"* `[2026-07-01]`.
+  - **STAYS TEAL (steward-confirmed CORRECT, do NOT recolor to violet):** the earnings headline number
+    (`.h1 b` = white->teal, NOT violet), the PRIMARY CTA (`#5cffd9`->teal), the eyebrow, progress bars,
+    badges, the orb CORE. These are the "you / local / your earnings / primary action" surfaces + every
+    FUNCTIONAL signifier (recoloring them loses readability/function). *steward marked both the teal headline
+    and the teal primary CTA "this is correct" against the OS render `hartos_home_software.png`.*
+  - **CARRIES VIOLET (the "hive / collective / cosmic aura" meaning):** the wordmark `OS` half, the orb's
+    OUTER AURA/halo + the `.ring.b` outer ring, the SECONDARY CTA's identity (subtle violet bg/border, which
+    also sharpens primary-vs-secondary hierarchy), and the "from the hive" / Top-10 collective sections
+    (subtitle + the big `.num` numerals violet-stroked).
+  - Net: teal stays dominant, violet pulls real visual weight on ~4 meaningful surfaces, nothing functional
+    changes color. Mirror this exact weighting into the OS shell (held #159, after the design pass clears
+    `hartBrandArt`/`hartHome.css`/`voiceOrbViz`). Render-verified in the mockup at `?v=3`.
 - **b2. Netflix-Home aesthetic, image-RICH ("lots of images").** Image cards,
   text-over-art with gradient scrims, varied formats (landscape / portrait /
   square / wide / live), content sourced/inferred from news + web, dynamic-website
@@ -588,3 +606,44 @@ Audit note: FIX A + FIX B were implemented on the orb/hero side (`hartHero.js`,
 `voiceOrbViz.js`, `liquid_ui_service.py` CSS); they do not regress any APPLIED W1
 item (c1/c2 preserved by the default-ON breathing; f4 "everything draggable"
 preserved - the affordance is hidden, the drag is not).
+
+---
+
+## 2026-07-01 - software floor must DEGRADE GRACEFULLY + mockup fidelity + packed art
+
+Steward (real HW d8c1567): *"the lightyourhart.js we have in js is lot better than
+what I see in the OS, same for voice viz and same for the mock.html I gave many
+design are deviating"* + *"bring the mockup and check for yourself on design
+deviations for a netflix style, also all the prebundled apps and agents we can
+statically pack with awesome icons and images"* + *"look at the html styling"*.
+
+Root cause (audit, NOT a guess): the served shell DOES load the latest JS in the
+right order. The home looked cheaper than the `hartos_home_mockup.html` because
+the software-render floor (`body.gpu-software` + `is_potato`) OVER-SHED. It
+discarded STATIC depth (card drop-shadows, the 3 ambient cinematic glows, the
+earnings/CTA glow) along with the genuinely per-frame-expensive effects
+(backdrop-filter blur, continuous drift animation, hover transforms). A static
+box-shadow or a static radial glow rasters ONCE and composites cheaply forever,
+so dropping them bought no per-frame saving and gutted the look. On the steward's
+Intel-iGPU box the gpu-probe verdict is `software`, so the home was permanently
+locked to the flat floor. Compounding: the wallpaper sat lighter/purpler than the
+mockup's `#05070d`, and the orb kept a leftover indigo `#6C63FF` drop-shadow
+(the same indigo b1.1 flagged) instead of the mockup's teal-inner + violet-outer
+halo.
+
+| # | Steward 2026-07-01 (captured intent) | Item | Status | Evidence |
+|---|---|---|---|---|
+| GF1 | The reduced-effects / software floor must DEGRADE GRACEFULLY, not GUT the look. Keep the richness (gradients, glow, the brand spectrum, the orb depth) on software; only drop the genuinely expensive live-blur / backdrop-filter / continuous animation / hover-transform. | i3 + i4 + b2/b4 (refines #137) | **APPLIED** | (1) The 3 ambient cinematic glows are now EMITTED on software (`liquid_ui_service.py` `emit_ambient = (not is_potato) or gpu_mode=='software'`) and rendered STATIC + low-blur via `body.gpu-software .hart-ambient` (animation:none, blur reduced, NOT display:none) - depth restored for ~zero per-frame cost. (2) `hartHome.css` moves the STATIC card drop-shadow + the primary-CTA teal glow to the BASE rule (software gets them); only hover-scale + transitions stay gated to `body.gpu-hardware`. The grain overlay (a per-frame blend) stays dropped on software. |
+| GF2 | Match the mockup palette: the deep blue-black `#05070d` canvas, not a lighter purple wash. | b1.1 (background half) | **APPLIED** | `hartResponsive.css` `.wallpaper`, `body.gpu-software .wallpaper`, and `--hart-background` deepened toward `#05070d` (was `#0A0A11`/`#07070B`/`#0F0E17`); the brand-hue blooms are unchanged (still spectrum, never flat black). Teal/violet anchor hues stay per b1.1 (intentional, not reverted). |
+| GF3 | The big orb should read like the mockup: teal core with a teal + VIOLET layered halo, not a flat indigo bloom. | c (orb) + b1.1 | **APPLIED** | `#hart-voice-orb` drop-shadow: the leftover indigo `rgba(108,99,255,.25)` (the #6C63FF b1.1 flagged) -> a teal-inner + brand-violet-outer pair (`drop-shadow(... rgba(0,230,195,.34)) drop-shadow(... rgba(155,92,255,.26))`), matching the mockup's `0 0 90px teal + 0 0 160px violet`. Core/body stay teal (no blue wash); the hero aura already frames it with a violet ring. |
+| GF4 | Statically pack the prebundled apps + agents with awesome on-brand icons + images (bundled, no-network). | d6 + d8 | **APPLIED (offline pack)** | Bundled brand-art SVG posters in `integrations/agent_engine/static/app_art/` (one source generator + emitted files), referenced as the OFFLINE-default `image` on the Flagship agent cards (`hartHome.js`) and on high-recognition app manifest entries (`shell_manifest.py`). The network per-source sourcing (`app_poster.py` -> `card.image_url`, #143/d8) stays the CONTINUOUS enhancement layered ON TOP - the static pack is the no-network floor, the network poster wins only where no static `image` is set. |
+
+Audit note: GF1-GF4 do not contradict any EMPHATIC rule. They REINFORCE i3
+(buttery, no jank - static raster is free per frame), i4 (GPU is the snappy lever,
+software is the safe floor that now degrades gracefully), b2/b4 (Netflix image-rich,
+Behance-grade), d6/d8 (image-rich app/agent art). #137's keystroke-lag kill is
+preserved: the per-FRAME costs (backdrop blur, drift animation, grain blend, hover
+transforms) are still shed on software; only the FREE static depth is kept.
+FOLLOW-UP (not faked): the richer Nunba landing-page "Light your HART" React tree
+is a separate W2/onboarding workstream (no `lightyourhart.js` exists in the OS
+shell static dir - only `hartOnboarding.js`); this pass did not pull it cross-repo.

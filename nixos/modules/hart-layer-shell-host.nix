@@ -88,6 +88,31 @@ let
     pango gdk-pixbuf graphene harfbuzz libsoup_3 cairo
   ]);
 
+  # ── GStreamer capture plugins for WebKit getUserMedia (mic/camera) — #150 ──────
+  # WebKitGTK 6.0 routes ALL getUserMedia capture through GStreamer: the orb's
+  # click-to-talk mic request resolves to a GStreamer audio SOURCE element. With NO
+  # GStreamer plugins DISCOVERABLE, WebKit has no capture element and getUserMedia
+  # fails "microphone access denied" — even though the permission-request handler
+  # ALLOWed it (hart-layer-shell-host's _on_permission_request) and PipeWire is up
+  # (desktop.nix services.pipewire). The host launches from a minimal Nix-store env
+  # that sets GI_TYPELIB_PATH/LD_PRELOAD/WEBKIT_DISABLE_*/GDK_GL/GSK_RENDERER but
+  # NEVER GST_PLUGIN_SYSTEM_PATH_1_0, so the plugins are invisible. Point at them
+  # explicitly (the search-path reference also pins them into the host closure).
+  #   - gst-plugins-good: pulsesrc + the pulse device provider — the proven capture
+  #     path against PipeWire's pulse compat (desktop.nix pipewire.pulse.enable).
+  #   - gst-plugins-base: audioconvert/audioresample the capture pipeline needs.
+  #   - gst-plugins-bad: opus + webrtc DSP for the live/peer voice the WebRTC path
+  #     negotiates (enable-webrtc is set on the WebView).
+  #   - pipewire: pipewiresrc — the NATIVE PipeWire capture element (best path on
+  #     this PipeWire desktop; harmless if a nixpkgs rev ships it in another output).
+  # Privacy-first (memory): the mic is a LOCAL capability wired ON for the trusted
+  # first-party shell, but real capture stays user-initiated via the click-to-talk
+  # orb + defence-in-depth gated on the AI-sensing kill-switch (_sense_cut).
+  gstCapturePlugins = (with pkgs.gst_all_1; [
+    gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad
+  ]) ++ [ pkgs.pipewire ];
+  gstPluginPath = lib.makeSearchPath "lib/gstreamer-1.0" gstCapturePlugins;
+
   # ── Portal-less private D-Bus session — the DEGRADE FALLBACK (2026-06-29) ────────
   #
   # HISTORY: this bus was the PRIMARY first-paint fix (2026-06-28). It made the portal
@@ -199,6 +224,13 @@ let
     fi
     # GI typelibs for the GTK4 / WebKit-6.0 / gtk4-layer-shell python below.
     export GI_TYPELIB_PATH="${giTypelibPath}"
+    # ── GStreamer capture plugins so WebKit getUserMedia (mic) has a source (#150) ──
+    # WebKitGTK 6.0 captures via GStreamer; without this path it finds NO audio
+    # source element and getUserMedia fails "microphone access denied" (the real-HW
+    # bug) despite the permission handler allowing it. Point at the capture/codec
+    # plugins (pulsesrc/pipewiresrc + opus/webrtc) so the click-to-talk orb can
+    # actually capture the mic. Inherited by the WebKitWebProcess capture child.
+    export GST_PLUGIN_SYSTEM_PATH_1_0="${gstPluginPath}"
     # ── gtk4-layer-shell LOAD ORDER (the real-HW "not a layer surface" fix) ──
     # gtk4-layer-shell works by INTERPOSING libwayland-client's wl_proxy_* symbols, so
     # it MUST be loaded BEFORE libwayland-client. Pulled in lazily via the GI typelib

@@ -147,6 +147,16 @@ in
       #   - redistributable firmware ships the iwlwifi/ath/brcm/rtw blobs.
       networking.networkmanager.enable = true;
       hardware.enableRedistributableFirmware = true;
+      # A plain unprivileged user with NO session — the negative control for the
+      # #149 polkit grant below. A sessionless non-hart caller MUST hit the
+      # NetworkManager polkit default (auth_admin -> denied non-interactively), so
+      # `nmcli connection add` fails as netprobe but SUCCEEDS as the hart shell user.
+      # Pinning a uid keeps it deterministic. (Same shape as power-actions.nix's
+      # powerprobe control.)
+      users.users.netprobe = {
+        isNormalUser = true;
+        uid = 4322;
+      };
     };
 
     testScript = ''
@@ -244,6 +254,46 @@ in
               res = wifi.succeed("( " + cmd + " ) ; true")
               assert "FOUND-" in res, \
                   label + ": none of " + str(mods) + " resolved via modinfo"
+
+      # ── 5. #149 polkit grant: the hart shell user CAN change network settings ──
+      # The steward's real-HW bug: "entering a wifi password -> Not authorised to
+      # change network settings". The shell SERVER execs `nmcli` as the sessionless
+      # `hart` service user; saving a Wi-Fi profile needs polkit auth for
+      # org.freedesktop.NetworkManager.settings.modify.system, which the polkit
+      # default DENIES for a sessionless daemon. The hart-base polkit rule (#149)
+      # must flip that to YES. We prove it BEHAVIOURALLY + NON-DESTRUCTIVELY: adding
+      # a saved Wi-Fi connection profile (NOT activating it — no device needed)
+      # exercises settings.modify.system end-to-end through real polkit. This is the
+      # nmcli VM twin of the mocked shell-route tests; a regression here (drop the
+      # rule, break the subject.user check, mis-name the action prefix) passes 100%
+      # of the Python suite while the real box says "Not authorised" again.
+      with subtest("the hart shell user is GRANTED network settings (nmcli con add succeeds, not 'Not authorised')"):
+          # runuser -u hart runs nmcli AS the sessionless shell-server uid. The add
+          # creates a saved profile only (no ifname bind / no activation), so it is
+          # non-destructive on this chipless VM yet still hits settings.modify.system.
+          wifi.succeed(
+              "runuser -u hart -- nmcli connection add type wifi "
+              "con-name hart-polkit-probe ssid HARTTESTSSID "
+              "wifi-sec.key-mgmt wpa-psk wifi-sec.psk 'hartpolkitpw123'")
+          # Clean up the probe profile so the node state is unchanged.
+          wifi.succeed("runuser -u hart -- nmcli connection delete hart-polkit-probe")
+
+      with subtest("the grant is SCOPED: a plain sessionless user is NOT authorised (rule did not widen authority)"):
+          # The same add as a sessionless non-hart user MUST be denied (the polkit
+          # default for settings.modify.system), proving the #149 rule grants ONLY
+          # the hart daemon (and active local seats), not everyone. nmcli exits
+          # non-zero with a "not authorized" error -> fail() asserts the denial.
+          out = wifi.fail(
+              "runuser -u netprobe -- nmcli connection add type wifi "
+              "con-name netprobe-denied ssid NOPE "
+              "wifi-sec.key-mgmt wpa-psk wifi-sec.psk 'nopenopenope12' 2>&1")
+          assert "not authorized" in out.lower() or "not authorised" in out.lower(), \
+              ("sessionless netprobe nmcli add failed for a NON-polkit reason; "
+               "expected a polkit 'not authorized' denial, got:\n" + out)
+          # Defensive: if NM somehow created it despite the expected denial, remove it.
+          wifi.succeed(
+              "runuser -u hart -- nmcli connection delete netprobe-denied "
+              "2>/dev/null || true")
     '';
   };
 }
