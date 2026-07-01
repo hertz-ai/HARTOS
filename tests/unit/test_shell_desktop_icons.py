@@ -217,7 +217,7 @@ def test_shell_routes_app_installed_to_desktop_and_openpanel_launches_exec():
     html = _render()
     assert "type === 'app_installed'" in html
     assert 'window.hartInstallIcon(ev)' in html
-    assert 'if(def.exec && !def.route && !SYSTEM_PANELS[id])' in html
+    assert 'if(def.exec && !def.route && !SYSTEM_PANELS[baseId])' in html
     assert 'launchApp(def.exec);' in html
 
 
