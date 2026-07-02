@@ -392,6 +392,13 @@ class ThemeService:
         lines.append(f'  --hart-icon-size: {shell.get("icon_size", 20)}px;')
         lines.append(f'  --hart-titlebar-height: {shell.get("panel_titlebar_height", 32)}px;')
         lines.append(f'  --hart-anim-speed: {shell.get("animation_speed_ms", 200)}ms;')
+        # Glow intensity (accent glow / ring bloom, 0-100) + density (spacing scale
+        # multiplier: 0.85 compact / 1.0 cozy / 1.15 comfy). Both default sensibly so a
+        # preset that omits them is unaffected. The shell reads --hart-glow to scale
+        # accent glows (and MUST drop the expensive bloom on the software-render floor)
+        # and --hart-density to scale spacing.
+        lines.append(f'  --hart-glow: {shell.get("glow", 40)};')
+        lines.append(f'  --hart-density: {shell.get("density", 1)};')
         lines.append('}')
         return '\n'.join(lines)
 

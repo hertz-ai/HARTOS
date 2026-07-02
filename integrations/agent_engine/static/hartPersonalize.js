@@ -297,6 +297,10 @@
     });
     grid.appendChild(buildCustomPicker());
 
+    // 1b) FEEL — live Glow (accent bloom) + Density (spacing) sliders (#170).
+    section('Feel');
+    grid.appendChild(buildFeelControls());
+
     // 2) ORB — switchable variety, applied live + persisted (#140).
     var og = section('Orb');
     var curOrb = getOrbStyle();
@@ -429,6 +433,51 @@
       applyPalette({ id: 'custom', a: a.value, a2: a2.value, b: b.value }); toast('Palette', 'Custom');
     });
     wrap.appendChild(prev); wrap.appendChild(btn);
+    return wrap;
+  }
+
+  // FEEL controls (#170): live Glow (accent bloom) + Density (spacing scale). They set
+  // --hart-glow / --hart-density on :root (1-frame CSS-var swap) + persist via HartSession.
+  // ONE injected <style> is the sole consumer (no parallel path). The glow bloom is GATED
+  // OFF on body.gpu-software/.potato so the cairo software floor stays hang-free (d8c1567).
+  var _feelStyleInjected = false;
+  function ensureFeelStyle() {
+    if (_feelStyleInjected || !document.head) return; _feelStyleInjected = true;
+    var st = document.createElement('style'); st.id = 'hart-feel-style';
+    st.textContent = [
+      'body:not(.gpu-software):not(.potato) .hart-hero-orb,',
+      'body:not(.gpu-software):not(.potato) .ds-btn-primary {',
+      '  box-shadow: 0 0 calc(var(--hart-glow,40) * 0.5px) rgba(var(--hart-accent-rgb,0,230,195), calc(var(--hart-glow,40)/150));',
+      '}',
+      '.hart-gallery { gap: calc(10px * var(--hart-density,1)); }',
+      '.hart-personalize .ds-section-label { margin-top: calc(14px * var(--hart-density,1)); }'
+    ].join('\n');
+    document.head.appendChild(st);
+  }
+  function buildFeelControls() {
+    ensureFeelStyle();
+    var root = document.documentElement;
+    var wrap = document.createElement('div'); wrap.className = 'hart-feel';
+    var S = window.HartSession;
+    function slider(label, key, min, max, def, scale) {
+      var row = document.createElement('label'); row.className = 'hart-cp-field';
+      var span = document.createElement('span'); span.textContent = label;
+      var inp = document.createElement('input'); inp.type = 'range'; inp.min = String(min); inp.max = String(max);
+      var saved = S ? S.get(key) : null;
+      inp.value = String((saved === null || saved === undefined) ? def : saved);
+      inp.setAttribute('aria-label', label);
+      function apply() {
+        var val = scale ? (Number(inp.value) / 100) : inp.value;
+        if (root && root.style && root.style.setProperty) root.style.setProperty('--hart-' + key, String(val));
+        if (S) S.set(key, inp.value);
+      }
+      inp.addEventListener('input', apply);
+      apply();  // apply the persisted/default value now (restore on load)
+      row.appendChild(span); row.appendChild(inp); wrap.appendChild(row);
+      return inp;
+    }
+    slider('Glow', 'glow', 0, 100, 40, false);
+    slider('Density', 'density', 85, 115, 100, true);
     return wrap;
   }
 

@@ -170,6 +170,16 @@ def test_legacy_preset_apply_still_works():
     assert res['theme_id'] == 'hart-default'
 
 
+def test_css_variables_emit_glow_and_density():
+    """#170 token engine: get_css_variables emits --hart-glow + --hart-density (with
+    sensible defaults so presets that omit them are unaffected) — the shell drives accent
+    glow + spacing scale live via these CSS vars. Existing tokens must still emit."""
+    css = _svc().get_css_variables()
+    assert '--hart-glow:' in css, css[-400:]
+    assert '--hart-density:' in css, css[-400:]
+    assert '--hart-accent' in css and '--hart-radius:' in css  # existing tokens intact
+
+
 if __name__ == '__main__':
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith('test_') and callable(v)]
