@@ -45,7 +45,15 @@
   // palette from three colour inputs. Exposed for reuse/tests (no parallel table).
   var PALETTES = window.HART_PALETTES = [
     { id: 'vibrant',       name: 'Vibrant',       a: '#00E6C3', a2: '#9B5CFF', b: '#05060C' },
-    { id: 'monotone-teal', name: 'Monotone Teal', a: '#00D4AA', a2: '#00D4AA', b: '#0F0E17' }
+    { id: 'monotone-teal', name: 'Monotone Teal', a: '#00D4AA', a2: '#00D4AA', b: '#0F0E17' },
+    { id: 'aurora',        name: 'Aurora',        a: '#00E6A8', a2: '#29C5FF', b: '#04070E' },
+    { id: 'neon',          name: 'Neon',          a: '#39FF14', a2: '#FF00E5', b: '#08010A' },
+    { id: 'sunset',        name: 'Sunset',        a: '#FF8A4C', a2: '#FF2E9A', b: '#16090F' },
+    { id: 'electric',      name: 'Electric',      a: '#00D9FF', a2: '#7C3AED', b: '#060814' },
+    { id: 'ember',         name: 'Ember',         a: '#FF6B35', a2: '#FFC53F', b: '#140803' },
+    { id: 'vapor',         name: 'Vapor',         a: '#FF71CE', a2: '#01CDFE', b: '#0A0618' },
+    { id: 'ocean',         name: 'Ocean',         a: '#00C6FF', a2: '#0066FF', b: '#041018' },
+    { id: 'coral',         name: 'Coral',         a: '#FF5E7E', a2: '#FFB84C', b: '#170A0D' }
   ];
 
   // Swatch palettes for the 8 server-side presets (applyPreset applies by id; these
