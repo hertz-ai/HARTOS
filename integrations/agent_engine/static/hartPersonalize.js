@@ -392,23 +392,43 @@
   };
 
   // Custom colour palette: accent + secondary + background -> applyPalette.
+  // Each field is a native swatch picker PAIRED with a synced hex text box, so the
+  // user can pick visually OR type an exact hex (both stay in lock-step); a live
+  // preview strip shows the chosen trio before applying. "As customisable as possible".
   function buildCustomPicker() {
     var wrap = document.createElement('div'); wrap.className = 'hart-custom-palette';
+    var prev;
+    function paint() {
+      if (!prev) return;
+      prev.style.background = 'linear-gradient(90deg,' + a.value + ' 0%,' + a2.value + ' 100%)';
+      prev.style.borderColor = b.value;
+    }
     function field(label, val) {
       var row = document.createElement('label'); row.className = 'hart-cp-field';
       var span = document.createElement('span'); span.textContent = label;
       var inp = document.createElement('input'); inp.type = 'color'; inp.value = val;
       inp.setAttribute('aria-label', label + ' colour');
-      row.appendChild(span); row.appendChild(inp); wrap.appendChild(row);
+      var hex = document.createElement('input'); hex.type = 'text'; hex.className = 'hart-cp-hex ds-input';
+      hex.value = val; hex.maxLength = 7; hex.spellcheck = false;
+      hex.setAttribute('aria-label', label + ' hex'); hex.setAttribute('style', 'width:80px');
+      inp.addEventListener('input', function () { hex.value = inp.value; paint(); });
+      hex.addEventListener('input', function () {
+        var v = hex.value.trim(); if (v && v.charAt(0) !== '#') v = '#' + v;
+        if (/^#[0-9a-fA-F]{6}$/.test(v)) { inp.value = v; paint(); }
+      });
+      row.appendChild(span); row.appendChild(inp); row.appendChild(hex); wrap.appendChild(row);
       return inp;
     }
     var a = field('Accent', '#00E6C3'), a2 = field('Secondary', '#9B5CFF'), b = field('Background', '#05060C');
+    prev = document.createElement('div'); prev.className = 'hart-cp-preview';
+    prev.setAttribute('style', 'height:26px;border-radius:8px;border:2px solid #05060C;margin:8px 0');
+    paint();
     var btn = document.createElement('button'); btn.type = 'button'; btn.className = 'hart-cp-apply ds-btn ds-btn-primary ds-btn-sm';
     btn.textContent = 'Apply custom';
     btn.addEventListener('click', function () {
       applyPalette({ id: 'custom', a: a.value, a2: a2.value, b: b.value }); toast('Palette', 'Custom');
     });
-    wrap.appendChild(btn);
+    wrap.appendChild(prev); wrap.appendChild(btn);
     return wrap;
   }
 
