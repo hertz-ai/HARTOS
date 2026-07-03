@@ -125,7 +125,7 @@ in
           assert status == verdict, f"--status {status!r} must mirror the verdict {verdict!r}"
           # Not armed -> the NVIDIA offload env is NOT set; the app runs unchanged.
           env = off.succeed(
-              "hart-gpu-offload sh -c 'echo \"${__GLX_VENDOR_LIBRARY_NAME:-}|${__NV_PRIME_RENDER_OFFLOAD:-}\"'").strip()
+              "hart-gpu-offload sh -c 'echo \"''${__GLX_VENDOR_LIBRARY_NAME:-}|''${__NV_PRIME_RENDER_OFFLOAD:-}\"'").strip()
           assert env == "|", \
               f"not-armed wrapper must NOT export the offload env (passthrough), got {env!r}"
           # The familiar prime-run alias resolves to the same wrapper.
