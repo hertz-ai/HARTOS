@@ -94,7 +94,12 @@ in
 
     # Desktop UI
     conky.enable = true;
-    nunba.enable = true;
+    # TEMP off (#135): the nunba-static build (nixos/packages/nunba.nix) still pins
+    # lib.fakeHash for nunbaHash + npmDepsHash, so its fetch fails a hash check and
+    # takes the whole desktop ISO down with it (it becomes a dep of hart-liquid-ui via
+    # embedNunba). The shell + theming don't need the Nunba microfrontends. Re-enable
+    # once #135 pins the real hashes (src = sha256-gerMQEekVDBaHPFMwv6K8KMqg7V+WbqU4YR+9bzvSc8=).
+    nunba.enable = false;
 
     # ── Unified Kernel Extensions ──
     kernel = {
