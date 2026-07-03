@@ -2593,9 +2593,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                                and len(_recipe_list) > 0
                                                and not _recipe_is_placebo(json_obj))
                                 if not _has_recipe:
-                                    if current_state == ActionState.TERMINATED:
-                                        # Action already TERMINATED — don't retry recipe, let while loop advance
-                                        current_app.logger.warning(f'Late save: recipe empty but action already TERMINATED — not retrying')
+                                    if current_state in (ActionState.TERMINATED, ActionState.GAVE_UP):
+                                        # Action already terminal — don't retry recipe, let while loop advance
+                                        current_app.logger.warning(f'Late save: recipe empty but action already terminal ({current_state.value}) — not retrying')
                                         return None  # End conversation turn, while loop will detect and advance
                                     current_app.logger.warning(f'Late save: recipe empty or missing — rejecting, will retry. Got: {_recipe_list}')
                                     return chat_instructor  # Route back to request recipe again
@@ -4526,7 +4526,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     if _ca_task:
                         from agent_ledger import TaskStatus as _TS
                         _ca_ledger_done = _ca_task.status in (_TS.COMPLETED, _TS.TERMINATED)
-                if _ca_state in (ActionState.COMPLETED, ActionState.TERMINATED) or _ca_ledger_done:
+                if _ca_state in (ActionState.COMPLETED, ActionState.TERMINATED, ActionState.GAVE_UP) or _ca_ledger_done:
                     # Check if recipe file exists before advancing
                     _flow = get_current_flow(user_prompt)
                     _recipe_path = helper_fun.safe_prompt_path(prompt_id, _flow, _ca)
@@ -4595,9 +4595,17 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             current_app.logger.info(f'[FLOW-COMPLETE] All {_ca} actions done in flow, ensuring termination')
                             for _aid in range(1, _ca + 1):
                                 _astate = get_action_state(user_prompt, _aid)
-                                if _astate not in (ActionState.TERMINATED,):
-                                    current_app.logger.info(f'[FLOW-COMPLETE] Forcing action {_aid} from {_astate.value} to TERMINATED')
-                                    force_state_through_valid_path(user_prompt, _aid, ActionState.TERMINATED, "flow complete")
+                                if _astate in (ActionState.TERMINATED, ActionState.GAVE_UP):
+                                    continue  # already terminal
+                                # #139: a VERIFIED action (COMPLETED/RECIPE_RECEIVED) becomes
+                                # TERMINATED (ledger COMPLETED); a stalled/unverified action
+                                # force-abandoned at flow-complete is an HONEST give-up ->
+                                # GAVE_UP (ledger FAILED), re-openable so the daemon can retry
+                                # it via a hive peer. This is the fix for the fake-success bug.
+                                _verified = _astate in (ActionState.COMPLETED, ActionState.RECIPE_RECEIVED)
+                                _target = ActionState.TERMINATED if _verified else ActionState.GAVE_UP
+                                current_app.logger.info(f'[FLOW-COMPLETE] Forcing action {_aid} from {_astate.value} to {_target.value}')
+                                force_state_through_valid_path(user_prompt, _aid, _target, "flow complete")
 
                             # All actions terminated — create flow recipe and advance
                             current_app.logger.info(f'[FLOW-COMPLETE] All actions terminated, creating flow recipe')
@@ -4839,9 +4847,9 @@ def all_flows_completed(prompt_id, total_personas, user_prompt):
         if not os.path.exists(flow_recipe_file):
             return False
 
-        # Check all actions in flow are TERMINATED
+        # Check all actions in flow are terminal (TERMINATED, or a give-up GAVE_UP)
         for action_id in range(1, len(flow['actions']) + 1):
-            if get_action_state(user_prompt, action_id) != ActionState.TERMINATED:
+            if get_action_state(user_prompt, action_id) not in (ActionState.TERMINATED, ActionState.GAVE_UP):
                 return False
 
     return True
@@ -4994,9 +5002,9 @@ def publish_to_crossbar_new_action_start(message, user_id):
 # Use lifecycle-aware increment:
 def safe_increment_action(user_prompt):
     current_action_id = user_tasks[user_prompt].current_action
-    # Ensure current action is TERMINATED before moving to next
-    if get_action_state(user_prompt, current_action_id) != ActionState.TERMINATED:
-        raise StateTransitionError(f"Action {current_action_id} must be TERMINATED before incrementing")
+    # Ensure current action is terminal (TERMINATED or a give-up GAVE_UP) before moving to next
+    if get_action_state(user_prompt, current_action_id) not in (ActionState.TERMINATED, ActionState.GAVE_UP):
+        raise StateTransitionError(f"Action {current_action_id} must be terminal before incrementing")
 
     user_tasks[user_prompt].current_action += 1
     safe_set_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.ASSIGNED, "action incremented")
@@ -5703,8 +5711,8 @@ def safe_increment_flow(user_prompt, prompt_id):
     current_flow_actions = config['flows'][current_flow]['actions']
 
     for action_id in range(1, len(current_flow_actions) + 1):
-        if get_action_state(user_prompt, action_id) != ActionState.TERMINATED:
-            raise StateTransitionError(f"Cannot increment flow: Action {action_id} not terminated")
+        if get_action_state(user_prompt, action_id) not in (ActionState.TERMINATED, ActionState.GAVE_UP):
+            raise StateTransitionError(f"Cannot increment flow: Action {action_id} not terminal")
 
     increment_current_flow(user_prompt, prompt_id)
 

@@ -38,6 +38,34 @@ in
         HART_LLM_PORT = toString cfg.ports.llm;
         HART_VISION_PORT = toString cfg.ports.vision;
         HART_VERSION = cfg.version;
+
+        # ── Local-only inference (P0b: "never a remote proxy") ──
+        # The agent_engine + /chat run IN this backend process; their LLM endpoint
+        # comes from core.port_registry.get_local_llm_url(). Pin it to the LOCAL
+        # llama-server (hart-llm, cfg.ports.llm) so a chat / agent dispatch from the
+        # Nunba UI ALWAYS resolves to on-device inference, never a stale
+        # ~/.nunba/llama_config.json external endpoint or a cloud fallback. This is
+        # the resolver's TOP probe candidate: on cold boot (llama not up yet) it
+        # falls through to the others and finally back to this URL as a stable
+        # placeholder, so pinning it is safe and makes local-only the default
+        # OS-mode posture (port_registry.is_os_mode is already true via os-release).
+        HEVOLVE_LOCAL_LLM_URL = "http://127.0.0.1:${toString cfg.ports.llm}/v1";
+
+        # ── Realtime origin (P0a: SSE/WAMP reaches the Nunba UI) ──
+        # This backend is the ORIGIN of HARTOS realtime: it serves REST /api/social
+        # + root /chat and emits push events via core.platform.events
+        # .broadcast_sse_safe (SSE) and the crossbarhttp3 publisher (WAMP). The
+        # transport TARGETS are already correct here with no extra env: is_os_mode
+        # is true via /etc/os-release (ID=hart-os) so core.port_registry resolves
+        # OS-mode ports, and the WAMP publish + the Nunba UI both default to
+        # localhost:8088 (port_registry crossbar=8088 in both modes; apiBase.js
+        # WAMP_LOCAL_URL ws://localhost:8088/ws) — so nothing is "moved" to pin.
+        # The SSE event-stream broker route + the :8088 WAMP ROUTER themselves are
+        # served by the UI-server layer (the React SPA's same-origin Flask host),
+        # NOT duplicated here — a second SSE broker / router in this module would be
+        # a parallel path. The UI is SSE-primary / WAMP-fallback, so SSE is the
+        # OS-mode realtime path.
+
         PYTHONDONTWRITEBYTECODE = "1";
         PYTHONUNBUFFERED = "1";
       };

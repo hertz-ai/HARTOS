@@ -64,6 +64,18 @@ class ModelBackend:
     def to_config_list(self) -> list:
         return [self.config_list_entry]
 
+    def is_dispatchable(self) -> bool:
+        """False for placeholder backends the router must not dial yet.
+
+        'distributed-shard' advertises the WAN shard cluster with a NON-endpoint
+        base_url ('shard://cluster'); it becomes selectable only once the
+        shard-orchestrator lands to intercept it by model_id. Until then the
+        selectors skip it so nothing dials the placeholder (the "Selection guard"
+        promised in docs/architecture/SHARD_RUNTIME_HARTOS_SIDE.md). One check,
+        used by every selector, keeps this a single source of truth.
+        """
+        return not str(self.config_list_entry.get('base_url', '')).startswith('shard://')
+
     def to_dict(self) -> dict:
         return {
             'model_id': self.model_id,
@@ -158,6 +170,7 @@ class ModelRegistry:
                 m for m in self._models.values()
                 if m.accuracy_score >= min_accuracy
                 and m.tier != ModelTier.DRAFT
+                and m.is_dispatchable()
             ]
         if not candidates:
             return None
@@ -172,6 +185,7 @@ class ModelRegistry:
                 m for m in self._models.values()
                 if m.cost_per_1k_tokens <= max_cost
                 and m.tier != ModelTier.DRAFT
+                and m.is_dispatchable()
             ]
         if not candidates:
             return None

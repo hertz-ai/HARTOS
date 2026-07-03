@@ -1,70 +1,47 @@
-{ config, lib, pkgs, hartSrc, ... }:
+{ config, lib, ... }:
 
-# HART OS Nunba Module
-# Headless OS component — Flask API daemon serving management APIs.
-# React SPA is rendered inside LiquidUI glass panels (no separate PyWebView window).
-# Provides: chat, communities, agent goals, settings, intelligence API
+# HART OS Nunba Module — options only (no separate daemon, no AppImage)
+#
+# The Nunba React UI is NOT a separate app/daemon any more. It is compiled to a
+# native static dist by nixos/packages/nunba.nix ($out/lib/nunba/static) and
+# served from inside the LiquidUI glass shell via hart-liquid-ui.nix's
+# NUNBA_STATIC_DIR (hart.liquidUI.embedNunba). The previous
+# `nunba --server-only` user service ran a runtime-downloaded ~200 MB AppImage
+# on :5000 — a redundant SECOND copy of the UI outside the OS closure. It is
+# REMOVED: one UI path (the native dist served by LiquidUIService), no AppImage.
+#
+# This module now only carries the `hart.nunba.*` options, which other modules
+# still read — hart-liquid-ui.nix uses `config.hart.nunba.port` (glass-shell
+# fallback URL) and `config.hart.nunba.enable` (the embedNunba default). Keeping
+# the options here keeps those references resolvable without a parallel path.
 
-let
-  cfg = config.hart;
-  nunbaCfg = config.hart.nunba;
-
-  nunbaPackage = pkgs.callPackage ../packages/nunba.nix { inherit hartSrc; };
-in
 {
   # ─── Options ──────────────────────────────────────────────
   options.hart.nunba = {
-    enable = lib.mkEnableOption "Nunba headless management daemon";
+    enable = lib.mkEnableOption "Nunba React UI (served natively via LiquidUI embedNunba)";
 
     port = lib.mkOption {
       type = lib.types.port;
       default = 5000;
-      description = "Nunba Flask API server port";
-    };
-
-    autostart = lib.mkOption {
-      type = lib.types.bool;
-      default = true;
-      description = "Auto-start Nunba Flask server on boot";
+      description = ''
+        Legacy Nunba port. Retained as the value hart-liquid-ui.nix reads for the
+        glass-shell fallback URL. No daemon listens here any more — the UI is
+        served by LiquidUIService from the static dist (hart.liquidUI.embedNunba).
+      '';
     };
 
     addToFavorites = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Add Nunba shortcut to GNOME dock (not needed — LiquidUI IS the shell)";
+      description = "Add a Nunba shortcut to the GNOME dock (not needed — LiquidUI IS the shell)";
     };
   };
 
   # ─── Configuration ────────────────────────────────────────
-  config = lib.mkIf (cfg.enable && nunbaCfg.enable) {
-
-    # Install Nunba package (no PyWebView GUI deps — LiquidUI handles rendering)
-    environment.systemPackages = [
-      nunbaPackage
-    ];
-
-    # Systemd user service: Nunba Flask API (headless, no GUI)
-    systemd.user.services.hart-nunba = lib.mkIf nunbaCfg.autostart {
-      description = "Nunba Flask API Daemon";
-      after = [ "graphical-session.target" ];
-      partOf = [ "graphical-session.target" ];
-      wantedBy = [ "graphical-session.target" ];
-
-      serviceConfig = {
-        ExecStart = "${nunbaPackage}/bin/nunba --server-only";
-        Restart = "on-failure";
-        RestartSec = 3;
-      };
-
-      environment = {
-        NUNBA_PORT = toString nunbaCfg.port;
-        NUNBA_BACKEND_URL = "http://localhost:${toString cfg.ports.backend}";
-        PYTHONDONTWRITEBYTECODE = "1";
-      };
-    };
-
-    # GNOME/Phosh dock favorites (LiquidUI is the primary interface now)
-    programs.dconf = lib.mkIf nunbaCfg.addToFavorites {
+  # Only the optional GNOME-dock favorites remain (off by default). The AppImage
+  # package install + the `nunba --server-only` systemd service are gone.
+  config = lib.mkIf (config.hart.enable && config.hart.nunba.enable && config.hart.nunba.addToFavorites) {
+    programs.dconf = {
       enable = true;
       profiles.user.databases = [{
         settings = {

@@ -84,6 +84,32 @@ in
         + "(llama.cpp clamps to the model's real layer count). The launcher only passes "
         + "this when a Vulkan device actually exists, else it runs pure-CPU.";
     };
+
+    autoProvision = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description =
+        "On first boot, download the default GGUF to `modelPath` if no model is present, "
+        + "so the local LLM is usable out of the box (an agent call from the Nunba UI hits "
+        + "the LOCAL llama, never a remote proxy). This REUSES the legacy first-boot model "
+        + "mechanism (deploy/distro/first-boot/hart-first-boot.sh: curl the default GGUF via "
+        + "`HART_DEFAULT_MODEL_URL`) — it does NOT reinvent the download. Best-effort + "
+        + "network-gated + non-boot-critical: on an offline live USB the fetch fails fast and "
+        + "the LLM simply stays gated (the shell degrades to a static UI), it never stalls "
+        + "boot. Set false for offline / bring-your-own-model nodes.";
+    };
+
+    modelUrl = lib.mkOption {
+      type = lib.types.str;
+      default =
+        "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/"
+        + "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf";
+      description =
+        "Default GGUF URL the first-boot provisioner fetches when `autoProvision` is on and no "
+        + "model exists. Same model + same contract as the legacy hart-first-boot.sh; override "
+        + "per-node with the `HART_DEFAULT_MODEL_URL` env in /etc/hart/hart.env (the env wins, "
+        + "matching the legacy script) so a steward can point at any OpenAI-compatible GGUF.";
+    };
   };
 
   config = lib.mkIf (cfg.enable && config.hart.llm.enable) {
@@ -93,10 +119,125 @@ in
       open = true;  # Use open-source kernel modules (Turing+)
     };
 
+    # ── First-boot model provisioner ──
+    # Closes the "no model -> hart-llm never starts (ConditionPathExists)" gap so
+    # the local LLM is usable out of the box. REUSES the legacy first-boot model
+    # mechanism (deploy/distro/first-boot/hart-first-boot.sh fetched the default
+    # GGUF via `HART_DEFAULT_MODEL_URL`); the NixOS first-boot port had dropped
+    # that step. This is NOT a new downloader — same model, same env contract,
+    # same curl-with-retry shape the nunba launcher + first-boot script use.
+    #
+    # Boot-safety: it is `before` hart-llm (so the model has landed before
+    # llama-server's condition is checked) but it is NOT ordered before anything
+    # the shell needs — hart.target only Wants= it, so a slow download delays only
+    # hart-llm, never the desktop. Offline live-USB: curl fails fast (bounded by
+    # --connect-timeout / --speed-limit), the unit exits 0 (offline is not a
+    # fault), and hart-llm stays gracefully gated until a model is provided.
+    systemd.services.hart-llm-provision = lib.mkIf config.hart.llm.autoProvision {
+      description = "HART OS Local LLM model provisioner (first boot)";
+      documentation = [ "https://github.com/hertz-ai/HARTOS" ];
+      # Needs the network for the fetch — declare the network-online wait LOCALLY
+      # (per hart-base's rule) so it never leaks into the boot-critical path.
+      wants = [ "network-online.target" ];
+      after = [ "network-online.target" "hart-first-boot.service" ];
+      before = [ "hart-llm.service" ];
+      wantedBy = [ "hart.target" ];
+
+      # Idempotent across reboots: only run when the model is absent. Once it has
+      # landed, this is skipped (condition = success) and hart-llm starts normally.
+      unitConfig = {
+        ConditionPathExists = "!${config.hart.llm.modelPath}";
+      };
+
+      # curl is NOT on the unit's minimal PATH.
+      path = with pkgs; [ curl coreutils ];
+
+      environment = {
+        # Default URL; the EnvironmentFile below can override HART_DEFAULT_MODEL_URL
+        # (legacy contract: the env wins over the baked default).
+        HART_DEFAULT_MODEL_URL = config.hart.llm.modelUrl;
+      };
+
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        User = "hart";
+        Group = "hart";
+
+        EnvironmentFile = lib.mkIf (builtins.pathExists "/etc/hart/hart.env") "/etc/hart/hart.env";
+
+        ExecStart = pkgs.writeShellScript "hart-llm-provision" ''
+          set -euo pipefail
+          MODEL_PATH="${config.hart.llm.modelPath}"
+          MODEL_DIR="$(dirname "$MODEL_PATH")"
+          URL="''${HART_DEFAULT_MODEL_URL:-${config.hart.llm.modelUrl}}"
+
+          mkdir -p "$MODEL_DIR"
+
+          # Belt-and-suspenders with ConditionPathExists: never clobber an existing
+          # (user- or previously-provisioned) model.
+          if [ -s "$MODEL_PATH" ]; then
+            echo "[HART OS LLM] Model already present: $MODEL_PATH"
+            exit 0
+          fi
+
+          echo "[HART OS LLM] Provisioning default model from $URL"
+          TMP="$MODEL_PATH.part"
+          rm -f "$TMP"
+
+          # Same curl contract as the legacy first-boot script + the nunba launcher:
+          # follow redirects, retry, bounded connect, and abort a stalled transfer
+          # (< 1 KiB/s for 60s) so a dead link never hangs the unit.
+          if curl -fL --retry 3 --connect-timeout 30 --speed-time 60 --speed-limit 1024 \
+                 -o "$TMP" "$URL"; then
+            mv -f "$TMP" "$MODEL_PATH"   # atomic publish — hart-llm never sees a partial file
+            echo "[HART OS LLM] Model provisioned: $MODEL_PATH"
+          else
+            rm -f "$TMP"
+            # Offline / fetch failure is NOT a unit failure — the LLM stays gated and
+            # the next boot re-attempts (ConditionPathExists is re-evaluated). Exit 0
+            # so the journal does not show a spurious failed unit on every offline boot.
+            echo "[HART OS LLM] Model download failed (offline?) — LLM stays gated until a model is provided." >&2
+            exit 0
+          fi
+        '';
+
+        # A large model on a slow link can take minutes; the curl speed-limit
+        # guards a wedged transfer, so cap generously rather than the 90s default.
+        TimeoutStartSec = "30min";
+
+        # Security hardening (mirrors hart-llm's posture; writes ONLY the model dir).
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        ReadWritePaths = [ "${cfg.dataDir}/models" ];
+        PrivateTmp = true;
+        ProtectClock = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+        SystemCallFilter = [ "@system-service" ];
+        LockPersonality = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+
+        StandardOutput = "journal";
+        StandardError = "journal";
+        SyslogIdentifier = "hart-llm-provision";
+      };
+    };
+
     systemd.services.hart-llm = {
       description = "HART OS Local LLM (llama.cpp)";
       documentation = [ "https://github.com/hertz-ai/HARTOS" ];
-      after = [ "network.target" "hart-first-boot.service" ];
+      # `after` the provisioner so that, on the very first boot, llama-server only
+      # starts once the default model has landed (its ConditionPathExists below
+      # gates it on the model file). The provisioner is gated on autoProvision —
+      # when it is off (or already a no-op because the model exists) this After=
+      # is satisfied immediately, so hart-llm starts normally. Referencing a unit
+      # that may not exist is harmless: systemd ignores an absent After= dep.
+      after = [ "network.target" "hart-first-boot.service" "hart-llm-provision.service" ];
       partOf = [ "hart.target" ];
       wantedBy = [ "hart.target" ];
 
@@ -126,6 +267,19 @@ in
 
         # GPU access
         SupplementaryGroups = [ "video" "render" ];
+
+        # Bind the local LLM port. In OS mode cfg.ports.llm is 808 — a PRIVILEGED
+        # port (<1024) — but llama-server runs as the unprivileged `hart` user, so
+        # without this it dies "bind: permission denied" and crash-loops under
+        # Restart=on-failure (the local LLM is then never reachable, every agent
+        # call from the Nunba UI fails). Grant exactly CAP_NET_BIND_SERVICE so it
+        # can bind <1024 and nothing else; the bounding set tightens hardening
+        # (the unit had none before, inheriting all caps). Harmless when a variant
+        # sets a >=1024 port — llama needs no cap there and never uses this one.
+        # Same pattern as hart-discovery.nix / hart-compute-mesh.nix. Ambient caps
+        # coexist with NoNewPrivileges=true (systemd raises them for the exec).
+        AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
+        CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
 
         # Security hardening
         NoNewPrivileges = true;
