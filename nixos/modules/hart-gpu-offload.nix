@@ -335,7 +335,7 @@ in
     # #132-safe); only this specialisation force-loads nvidia. For an installed
     # machine known to carry the dGPU — kept off the portable ISO by default.
     (lib.mkIf offload.specialisation.enable {
-      boot.specialisation."nvidia-offload".configuration = {
+      specialisation."nvidia-offload".configuration = {
         system.nixos.tags = [ "nvidia-offload" ];
         # THE force-load arm — ONLY here, NEVER in the base generation.
         services.xserver.videoDrivers = lib.mkForce [ "nvidia" ];
