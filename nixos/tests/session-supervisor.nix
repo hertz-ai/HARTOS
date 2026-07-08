@@ -166,6 +166,18 @@ in
           assert tier == "cage", \
               f"after crash-loop the latch must be the cage floor, got {tier!r}"
 
+      # ── 3b. A downward drop ARMS the HARTLOG boot-log capture (regression) ──
+      # write_tier touches /run/hart/session/tier-degraded on every fall-back so
+      # hart-boot-log captures "why it fell to cage" at the moment it happens
+      # (hart-session-supervisor.nix write_tier + hart-boot-log.nix path unit). The
+      # crash-loop above dropped hart-comp -> sway -> cage, so the trigger must exist
+      # and record the final drop to the floor.
+      with subtest("a tier degrade arms the HARTLOG boot-log capture trigger"):
+          sup.succeed("test -f /run/hart/session/tier-degraded")
+          rec = sup.succeed("cat /run/hart/session/tier-degraded").strip()
+          assert rec.startswith("from=") and "to=cage" in rec, \
+              f"degrade trigger should record the drop to the cage floor, got {rec!r}"
+
       # ── 4. The latch persists on the data partition (latched across boot) ──
       with subtest("the latch file persists under /var/lib/hart (survives reboot by construction)"):
           sup.succeed(f"test -f {LATCH}")

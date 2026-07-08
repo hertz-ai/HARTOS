@@ -66,6 +66,10 @@ let
   latchFile  = "/var/lib/hart/session-tier";
   windowFile = "/var/lib/hart/session-tier.window";
   readyFlag  = "/run/hart/session/shell-ready";
+  # Written by the session-supervisor's write_tier on a DOWNWARD drop (from=X to=Y
+  # ts=…); it both triggers this capture (the path unit below) and names the exact
+  # fall-back in the bundle, so "why did it fall to cage" is answerable offline.
+  degradeFlag = "/run/hart/session/tier-degraded";
   # The INPUT twin of the paint marker: hart-comp's note_input_alive (#134) touches
   # this on the FIRST real seat event, proving the libinput -> Seat delivery path is
   # live. Surfacing its presence/absence here is what tells a "pointer frozen at 0,0,
@@ -140,6 +144,7 @@ let
     WINDOW="${windowFile}"
     READY="${readyFlag}"
     INPUT_ALIVE="${inputAliveFlag}"
+    DEGRADE="${degradeFlag}"
     DRM_INFO="${drmInfoBin}"
     LIBINPUT="${libinputBin}"
     WPCTL="${wpctlBin}"
@@ -211,6 +216,16 @@ let
         cat "$WINDOW" 2>/dev/null || true
       else
         echo "crash window: <absent> (no recent crash-loop accounting)"
+      fi
+      echo ""
+      echo "── last tier-degrade (WHY the ladder fell back toward cage) ──"
+      if [ -e "$DEGRADE" ]; then
+        echo "DROP: $(cat "$DEGRADE" 2>/dev/null || echo '?')"
+        echo "  mtime: $(date -r "$DEGRADE" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || stat -c '%y' "$DEGRADE" 2>/dev/null || echo '?')"
+        echo "  (armed by the session-supervisor's write_tier on this downward drop;"
+        echo "   the drop REASON is in the supervisor journal captured below.)"
+      else
+        echo "<absent> — no tier fell back this boot (the ladder held its rung)"
       fi
       echo ""
       echo "── shell-ready paint marker ($READY) ──"
@@ -643,6 +658,39 @@ in
         ExecStart = "${pkgs.coreutils}/bin/true";
         ExecStop = "${captureScript} shutdown";
         TimeoutStopSec = "60s";
+      };
+    };
+
+    # ── DEGRADE-triggered capture (a session tier fell back toward cage) ──────
+    # The session-supervisor touches /run/hart/session/tier-degraded when write_tier
+    # LOWERS the tier (the 1->2 / 2->3 fall-backs — hart-session-supervisor.nix).
+    # Capture the bundle RIGHT THEN: the volatile live-USB journal still holds the
+    # failed tier's output + the supervisor's drop-REASON log, so this pins down
+    # "why did it fall to cage" at the exact moment — beating a wait of up to one
+    # periodic interval, and grabbing it before the next tier floods/rolls the
+    # journal. Reuses the ONE captureScript (mode label "degrade") — no parallel
+    # journalctl. Runs as a root system service (the capture mounts HARTLOG, which
+    # the greetd-session supervisor cannot do itself). Best-effort like every other
+    # capture unit: a no-HARTLOG stick is a clean no-op.
+    systemd.paths.hart-boot-log-degrade = {
+      description = "HART OS — watch for a session tier-degrade to trigger a capture";
+      wantedBy = [ "multi-user.target" ];
+      pathConfig = {
+        # The supervisor writes this file only on a real downward drop. systemd
+        # watches the (tmpfiles-created) parent dir until the file appears.
+        PathModified = "/run/hart/session/tier-degraded";
+        Unit = "hart-boot-log-degrade.service";
+      };
+    };
+    systemd.services.hart-boot-log-degrade = {
+      description = "HART OS — capture diagnostics on a session tier-degrade (to HARTLOG)";
+      restartIfChanged = false;
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = false;
+        ExecStart = "${captureScript} degrade";
+        # A slow USB stick must not wedge the capture; match the other units.
+        TimeoutStartSec = "90s";
       };
     };
 

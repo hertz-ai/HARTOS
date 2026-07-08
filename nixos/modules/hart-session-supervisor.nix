@@ -288,11 +288,51 @@ let
       printf '%s' "$START"
     }
 
+    # ── Ladder position of a tier (0 = top .. N = floor); -1 if not a member ──
+    # Lets write_tier tell a DEGRADE (a downward drop toward the cage floor) apart
+    # from a promote / initial latch, so ONLY a real fall-back arms the boot-log
+    # capture below.
+    ladder_index() {
+      _li=0
+      for _lt in $LADDER; do
+        [ "$_lt" = "$1" ] && { printf '%s' "$_li"; return 0; }
+        _li=$((_li + 1))
+      done
+      printf '%s' "-1"
+    }
+
     # ── Atomically write the latch (latches across boot) ──
     write_tier() {
       umask 022
+      _prev_tier=""
+      [ -r "$LATCH" ] && _prev_tier="$(tr -d '[:space:]' < "$LATCH" 2>/dev/null || true)"
+      # No latch yet ⇒ the supervisor was running the START (top) tier — read_tier's
+      # default when the latch is absent — so a first drop below it is STILL a
+      # degrade. Infer START as the prior so the very first fall-back (1->2) is
+      # captured, not just a later 2->3 (e.g. when Tier-2 then stabilizes and Tier-1's
+      # failure would otherwise never be captured). Does NOT write the latch here, so
+      # the "latch absent = fail-safe" contract is untouched.
+      [ -z "$_prev_tier" ] && _prev_tier="$START"
       printf '%s\n' "$1" > "$LATCH.tmp" && mv -f "$LATCH.tmp" "$LATCH"
       log "latched session tier = $1"
+      # DEGRADE capture hook (the "why did it fall back to cage" evidence): when this
+      # write LOWERS the tier (a 1->2 / 2->3 drop toward the floor), touch the boot-
+      # log trigger so the canonical hart-boot-log capture writes a FRESH journalctl
+      # bundle to the persistent HARTLOG partition AT THE MOMENT of the drop. The
+      # live-USB journal is volatile (tmpfs), so this grabs the failed tier's output +
+      # this supervisor's drop-REASON log before the next tier floods/rolls it, and
+      # beats waiting up to one periodic interval. NO journalctl here — the reason is
+      # already in this supervisor's journal, which the capture collects (DRY: one
+      # capture path, hart-boot-log-capture, never a second parallel one). Best-effort
+      # (|| true): arming the capture must never wedge the drop itself.
+      if [ -n "$_prev_tier" ] && [ "$_prev_tier" != "$1" ]; then
+        _pi=$(ladder_index "$_prev_tier"); _ni=$(ladder_index "$1")
+        if [ "$_pi" -ge 0 ] && [ "$_ni" -gt "$_pi" ]; then
+          printf 'from=%s to=%s ts=%s\n' "$_prev_tier" "$1" "$(date +%s)" \
+            > "${sessionRunDir}/tier-degraded" 2>/dev/null || true
+          log "tier degrade $_prev_tier -> $1: armed HARTLOG boot-log capture"
+        fi
+      fi
     }
 
     # ── Is a tier launchable on this build? (command non-empty) ──
@@ -396,6 +436,13 @@ let
       nxt=$(lower_tier "$TIER")
       log "watchdog: HUNG '$TIER' dropped to '$nxt' on the FIRST timeout (deterministic hang) — latching"
       write_tier "$nxt"
+      # Self-documenting fall-to-cage: write_tier ALREADY armed the HARTLOG boot-log
+      # capture on this downward drop (see write_tier + hart-boot-log.nix's path unit)
+      # — the ONE capture path, covering EVERY drop (hang here, crash-loop, and the
+      # reconciliation drop), PATH-independent, and run by a root service that
+      # survives this session's teardown. No second inline capture here (no parallel
+      # mechanism); the bundle records the exact from→to via /run/hart/session/
+      # tier-degraded + this supervisor's journal.
       # A HANG MAY be a transient cold-boot slow start, not a permanent break — arm
       # ONE fresh-boot re-promotion. BUT if this boot already spent its re-promotion
       # retry on this tier (REPROMOTED_FLAG set), the hang is CONFIRMED: clear the
