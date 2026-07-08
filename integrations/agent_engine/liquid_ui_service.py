@@ -3453,9 +3453,18 @@ function renderRoutePanel(id, body, route, title) {{
           'onclick="retryRoutePanel(\\''+id+'\\')">Retry</button>'+
       '</div>';
   }}
-  // iframe onload fires for both real content AND error pages; treat a successful
-  // load as "reveal". A never-loading frame falls to the timeout → reconnecting.
-  frame.addEventListener('load', reveal);
+  // iframe onload fires for both real content AND error pages (e.g. a 404 when the
+  // Nunba SPA bundle isn't served — the W2/#116 gap). The frame is opacity:0 until
+  // reveal(), so VERIFY the route actually serves 2xx before revealing; a non-2xx
+  // routes to the graceful empty state instead of unveiling a raw "Not Found" page
+  // (the "url not working" the steward saw on real HW). NUNBA_BASE is same-origin
+  // (:6800), so this status check costs no CORS round-trip. A never-loading frame
+  // still falls to the 8s timeout → reconnecting.
+  frame.addEventListener('load', function(){{
+    fetch(NUNBA_BASE+route, {{method:'GET', cache:'no-store'}})
+      .then(function(r){{ if(r.ok) reveal(); else reconnecting(); }})
+      .catch(function(){{ reveal(); }});
+  }});
   frame.addEventListener('error', reconnecting);
   setTimeout(function(){{ if(!settled) reconnecting(); }}, 8000);
 }}
