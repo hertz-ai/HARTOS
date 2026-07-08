@@ -276,34 +276,30 @@ let
     export GSK_RENDERER=vulkan
     echo "[hart-glass-shell-gtk4] GSK = VULKAN (operator preferHardwareGL=true; GL disabled)" >&2
     '' else ''
-    # AUTO: co-arm GSK with the compositor via the SAME boot probe verdict
-    # (/run/hart/gpu-render, written by hart-gpu-probe which binds eglinfo to the
-    # Intel iGPU). VULKAN only when the probe proved the iGPU good -- which is ALSO
-    # exactly when hart-comp drops --force-software and GPU-composites via GLES (the
-    # force-software gotcha fix in hart-comp.nix), so a hardware-Vulkan client now
-    # has a HARDWARE compositor to present its dmabuf to. THAT was the missing half
-    # of the 2026-06-25 "probe=hardware -> vulkan" attempt: it armed vulkan while the
-    # compositor was STILL pinned to the pixman SOFTWARE floor by that gotcha, so the
-    # client got VK_ERROR_SURFACE_LOST_KHR and never first-painted on either tier.
-    # Co-arming BOTH on the one Intel-iGPU verdict is what makes vulkan safe this
-    # time. Else CAIRO, the proven software floor. Re-probed every boot; fail-safe
-    # cairo (absent/garbled verdict => cairo).
+    # AUTO default = CAIRO, the proven software floor — UNCONDITIONALLY.
     #
-    # SAFE-BY-FLOOR (the HARD fallback, unchanged): GL stays DISABLED above, so a
-    # Vulkan-init failure falls back to CAIRO (never the hanging GL); and if GSK-
-    # vulkan first-paint fails on the layer-shell surface (e.g. a residual dmabuf
-    # mismatch) the marker /run/hart/session/shell-ready is never touched, so the
-    # session-supervisor paint watchdog drops the tier to the cage GTK3 floor in
-    # <=45s -- never a wedged black screen. REAL-HW PENDING: the steward's flash
-    # proves vulkan-on-GLES presents on the iGPU; the watchdog is the backstop.
+    # The 2026-06-25 "probe=hardware -> GSK_RENDERER=vulkan" candidate was REAL-HW
+    # DISPROVEN on 2026-07-08 (steward's flash, Intel iGPU + NVIDIA 940MX laptop):
+    # a HEALTHY Intel iGPU makes hart-gpu-probe write verdict `hardware`, which armed
+    # GSK-vulkan on the layer-shell surface; vulkan first-paint HUNG, the marker
+    # /run/hart/session/shell-ready never fired, and the supervisor's 45s paint
+    # watchdog dropped BOTH Tier-1 (hart-comp) AND Tier-2 (sway — the SAME GTK4 host)
+    # to the cage GTK3 cairo floor. That is exactly the "not native / no GPU / not
+    # vibrant" the steward saw: the GPU being GOOD is what armed the failing path.
+    #
+    # So the SHELL host now always uses cairo here regardless of the GPU verdict. The
+    # shell is a WebView-hosting layer surface, not a 3D app; its render path must
+    # stay on the floor (this is also the d8c1567 stability guard — flipping the
+    # CPU-composited WebView shell to gpu-hardware re-enables per-frame blur = the old
+    # ~500ms keystroke lag). GPU acceleration for ACTUAL apps is UNAFFECTED — that is
+    # prime-run / hart-gpu-offload, a separate path — and hart-comp's own GLES
+    # compositing (hart-comp.nix) is likewise untouched (it degrades to pixman on a
+    # fault, it never hangs the tier). The operator escape hatch ui.preferHardwareGL=
+    # true (above) still forces vulkan for a future HW-PROVEN opt-in. GL stays DISABLED
+    # (GDK_GL=disable) so nothing can reach the GL context-creation hang either.
     HART_GPU_VERDICT="$(cat /run/hart/gpu-render 2>/dev/null || echo software)"
-    if [ "$HART_GPU_VERDICT" = "hardware" ]; then
-      export GSK_RENDERER=vulkan
-      echo "[hart-glass-shell-gtk4] GSK = VULKAN (auto; gpu-render verdict: hardware -- co-armed with the GLES compositor)" >&2
-    else
-      export GSK_RENDERER=cairo
-      echo "[hart-glass-shell-gtk4] GSK = CAIRO (auto; gpu-render verdict: $HART_GPU_VERDICT -- proven software floor)" >&2
-    fi
+    export GSK_RENDERER=cairo
+    echo "[hart-glass-shell-gtk4] GSK = CAIRO (auto; proven software floor; gpu-render verdict: $HART_GPU_VERDICT -- vulkan-on-iGPU-layer-shell was real-HW-disproven 2026-07-08, cairo is the floor that keeps Tier-1 native)" >&2
     ''}
     export HART_SHELL_URL="$URL"
     # Shell-paint readiness marker (the session-supervisor's HUNG-tier guard): the
