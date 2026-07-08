@@ -6998,31 +6998,54 @@ function renderAgentOverlay(ev) {{
                 'renderer': self.renderer,
             })
 
-        # Register OS management APIs (shell file manager, terminal,
-        # desktop settings, system monitoring, app installer)
+        # Register OS management APIs (shell file manager, terminal, desktop
+        # settings, system monitoring, app installer).
+        #
+        # #18 route-drop hardening: EACH module registers inside its OWN
+        # try/except. A duplicate-endpoint AssertionError (or an import failure)
+        # in one module must NEVER abort a shared block and silently drop the
+        # siblings — most visibly the app store (register_app_install_routes) and
+        # the OS bridge. The previous single bundled try/except let ONE collision
+        # (see the /api/shell/display/scale + /api/shell/wifi/connect notes above)
+        # cascade into "next registrations never ran → /api/apps/* dropped → app
+        # store dead". Per-module isolation makes that class of drop impossible by
+        # construction, and mirrors what flash/media/openclaw/onboarding already do
+        # below. Order is unchanged (os → desktop → system → app-install → bridge).
         try:
             from integrations.agent_engine.shell_os_apis import (
                 register_shell_os_routes)
+            register_shell_os_routes(app)
+        except Exception as e:
+            logger.warning("Shell OS APIs registration: %s", e)
+        try:
             from integrations.agent_engine.shell_desktop_apis import (
                 register_shell_desktop_routes)
+            register_shell_desktop_routes(app)
+        except Exception as e:
+            logger.warning("Shell desktop APIs registration: %s", e)
+        try:
             from integrations.agent_engine.shell_system_apis import (
                 register_shell_system_routes)
+            register_shell_system_routes(app)
+        except Exception as e:
+            logger.warning("Shell system APIs registration: %s", e)
+        try:
             from integrations.agent_engine.app_installer import (
                 register_app_install_routes)
-            # Typed native OS-bridge (#133/W3): POST /api/os/invoke + /api/os/contract
-            # + /api/os/power/capabilities. The forward path for the WebView SDK
-            # (hartOSBridge.js); it reuses shell_os_apis auth/audit + os_bridge.power
-            # (one dispatch, no parallel path). The old /api/shell/power/action stays
-            # as the backward-compat surface.
+            register_app_install_routes(app)
+        except Exception as e:
+            logger.warning("App-install (store) APIs registration: %s", e)
+        try:
+            # Typed native OS-bridge (#133/W3): POST /api/os/invoke +
+            # /api/os/contract + /api/os/power/capabilities. The forward path for
+            # the WebView SDK (hartOSBridge.js); it reuses shell_os_apis auth/audit
+            # + os_bridge.power (one dispatch, no parallel path). The old
+            # /api/shell/power/action stays as the backward-compat surface.
             from integrations.agent_engine.os_bridge.routes import (
                 register_os_bridge_routes)
-            register_shell_os_routes(app)
-            register_shell_desktop_routes(app)
-            register_shell_system_routes(app)
-            register_app_install_routes(app)
             register_os_bridge_routes(app)
         except Exception as e:
-            logger.warning("Shell APIs registration: %s", e)
+            logger.warning("OS-bridge APIs registration: %s", e)
 
         # Flash-to-USB routes registered SEPARATELY so a failure in this newer,
         # optional module (e.g. the flasher import) can NEVER cascade and drop the
