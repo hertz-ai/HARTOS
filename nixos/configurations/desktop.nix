@@ -426,6 +426,15 @@ in
     #     gnome-keyring/PAM-login settings agree with GNOME's own (both true).
     firewall.enable = true;
     dns.enable = true;
+    # A roaming desktop lives on hotel / café / captive / corporate Wi-Fi that
+    # routinely blocks or MITMs DNS-over-TLS (port 853). Strict DoT (the default)
+    # then fails ALL name resolution with no fallback — the "I connected to the
+    # internet and flatpak STILL couldn't reach dl.flathub.org" symptom. Opportunistic
+    # DoT (fallbackToPlaintext = true) keeps encrypted resolution when the network
+    # allows it and degrades to plaintext when it doesn't, so the box stays usable on
+    # any network. dnssec stays ON (unchanged) — this only relaxes the transport, not
+    # validation. On the server/edge variants (fixed, trusted egress) strict DoT stays.
+    dns.fallbackToPlaintext = true;
     email.enable = true;
 
     # ── Endpoint security (#155; Category-4 LOCAL feature, privacy-first ON) ──
