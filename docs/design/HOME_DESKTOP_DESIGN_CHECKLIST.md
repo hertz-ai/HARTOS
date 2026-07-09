@@ -101,6 +101,20 @@ This is the steward's most-repeated structural rule. Capture every nuance.
   - Net: teal stays dominant, violet pulls real visual weight on ~4 meaningful surfaces, nothing functional
     changes color. Mirror this exact weighting into the OS shell (held #159, after the design pass clears
     `hartBrandArt`/`hartHome.css`/`voiceOrbViz`). Render-verified in the mockup at `?v=3`.
+- **b1.3 "vibrant = all places that don't look colourful enough" (steward, real-HW 2026-07-09).**
+  On the flashed OS the shell read blue/monochrome. Roots + fixes:
+  - The palette HUES were already correct in the runtime (teal `#00E6C3` orb default, spectrum vars, neutral
+    INK `[14,14,17]`); the flatness came from `hartBrandArt.gradient` still blending every card **0.60 toward
+    near-black** (dark stop) + 0.34 (light stop) - so each card read as a dark-navy version of its hue. FIX:
+    lift the hue out of the crush -> **0.46 / 0.20** so cards read as their actual colour (`hartBrandArt.js`).
+    The `.hh-card-scrim` keeps title text legible. *Camera photos also shift teal->blue; tune from a real
+    screenshot, not a phone photo.*
+  - *"WHY MONOCHROMATIC?"* `[real-HW 2026-07-09]` - do NOT re-crush card hues toward INK past ~0.5.
+- **b1.4 Window controls (close/min/max) must be SOLID, never transparent glyphs (steward 2026-07-09).**
+  The Explorer / app-listing window close `✕` had no rest background and inherited the low-contrast teal accent
+  -> read as a transparent, clumsy floating glyph. RULE: `.panel-titlebar .ctrl span` gets a solid rest
+  background (`rgba(255,255,255,.06)`) + a crisp NEUTRAL glyph (`--hart-text`, not `--hart-accent`); close hover
+  = red bg + white `✕` (`liquid_ui_service.py`). Applies to every OS window's title-bar controls.
 - **b2. Netflix-Home aesthetic, image-RICH ("lots of images").** Image cards,
   text-over-art with gradient scrims, varied formats (landscape / portrait /
   square / wide / live), content sourced/inferred from news + web, dynamic-website

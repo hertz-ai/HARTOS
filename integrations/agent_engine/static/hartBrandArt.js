@@ -77,8 +77,13 @@
     seed = seed | 0;
     var base = baseRgb(baseHex, seed);
     var second = baseHex ? base : (rgbOf(hexAt(seed + 2)) || base);
-    var dark = blend(base, INK, 0.60);     // primary (darker) stop - keep enough base hue that teal/cyan/blue/violet/magenta/amber stay DISTINCT (was 0.72, which crushed every hue to navy)
-    var light = blend(second, INK, 0.34);  // neighbour (lighter) stop - the hue clearly reads here
+    // VIBRANCY (steward real-HW 2026-07-09 "vibrant = all places that don't look
+    // colourful enough"): lift the hue OUT of the near-black blend so each card reads
+    // as its actual colour, not a dark-navy monochrome. Was 0.60/0.34 (still crushed
+    // most of every card toward INK -> the "flat / monochromatic" look); now the hue
+    // leads. The .hh-card-scrim keeps title text legible over the brighter art.
+    var dark = blend(base, INK, 0.46);     // primary (darker) stop - hue leads, stays distinct
+    var light = blend(second, INK, 0.20);  // neighbour (lighter) stop - the hue reads VIVIDLY here
     var ang = [135, 150, 165][mod(seed, 3)];
     return 'linear-gradient(' + ang + 'deg,' + rgbCss(light) + ',' + rgbCss(dark) + ')';
   }
