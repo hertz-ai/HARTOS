@@ -191,6 +191,18 @@ Then wire LiquidUI to set the socket env (`hart-liquid-ui.nix`: `HART_NUNBA_SOCK
 the dist stays the floor), and keep `hart.nunba.enable = false` until `nix build .#packages.nunba`
 is green — flipping it on before the closure builds would fail the ISO.
 
+**Two binding gates (steward: "no parallel paths and zero regression"):**
+1. **No parallel path.** EXTEND the existing `nunba.nix`/`hart-nunba.nix` in place — never a second
+   `nunba-daemon.nix` or a forked module. And `NUNBA_STATIC_DIR` MUST point at the daemon package's
+   OWN `${nunbaPkg}/lib/nunba/static` (i.e. the same `nunbaStatic` store path the daemon serves), so
+   there is exactly ONE React artifact served two ways (socket primary, static floor) — it cannot
+   drift, because both are the same `/nix/store` path. The floor is graceful degradation of the same
+   build, not a second UI source.
+2. **Zero regression.** `hart.nunba.enable` stays `false` until the closure builds green; A+D are
+   additive (activate only when `HART_NUNBA_SOCKET` is set), so the current React-static nightly is
+   byte-for-byte unchanged until the daemon is proven. `main.py`'s host:port path and LiquidUI's
+   `elif nunba_dir` static path are untouched when the socket is unset.
+
 ### D. `integrations/agent_engine/liquid_ui_service.py` — reverse-proxy ✅ DONE (`8c1be533`)
 Replaced the `NUNBA_STATIC_DIR`-gated static block with a socket-first reverse-proxy: when
 `HART_NUNBA_SOCKET` is set, a last-place `@app.route('/<path:path>')` streams (httpx UDS +
