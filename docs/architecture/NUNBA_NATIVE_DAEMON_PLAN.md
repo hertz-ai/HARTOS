@@ -1,5 +1,18 @@
 # Nunba as a native HART OS daemon (full Python + React, socket-based, HARTOS-excluded)
 
+## Status (2026-07-09)
+
+| Part | What | State |
+|------|------|-------|
+| **A** | Nunba `main.py` binds `unix:$HART_NUNBA_SOCKET` (native-daemon mode) | ✅ **DONE + committed** — Nunba `cb849ba9`. Reused main.py's existing headless Hypercorn/Waitress block (no `--server-only`, no app.py GUI change). Zero desktop regression (unset → host:port unchanged). |
+| **D** | LiquidUI reverse-proxies unclaimed paths → the socket (same-origin, graceful static floor) | ✅ **DONE + committed** — HARTOS `8c1be533`. Traced compatible with the concurrent session's `tests/unit/test_liquid_ui_nunba_serving.py` (socket-unset → `elif nunba_dir` reproduces the old two-route structure; both-unset → 404 floor-lock holds). |
+| **B** | `nunba.nix` builds full Nunba (Python + React) minus HARTOS/GUI/ML | ⛔ **CI/coordination** — concrete skeleton below. Needs a Nix build loop (import-domino discovery) + FOD pinning. `nunba.nix` is the **concurrent inference session's file** (rewritten in `0a338951`). |
+| **C** | `hart-nunba.nix` hardened socket daemon | ⛔ **CI/coordination** — concrete skeleton below. Same contended-file caveat. |
+| **E** | Retire `hartOnboarding.js` + `native_onboarding.py` | ⏸ **DEFERRED** — only after the daemon is proven serving Nunba's `LightYourHART` on real HW. Retiring the fallback before the replacement is verified = onboarding regression. |
+| **F** | CI: pin `nunbaHash`/`npmDepsHash`, build `.#packages.nunba`, flip `hart.nunba.enable` | ⛔ **CI** — needs a Nix machine. |
+
+**Why B/C are not blind-edited here.** hart-app.nix proves the Python env is a **hand-curated minimal nixpkgs set** (Flask+waitress+boot-critical), NOT `requirements.txt` — and it deliberately omits langchain/autogen/torch/chromadb (absent from the nixpkgs pin; guarded by try/except in the code). Getting Nunba's curated set right is an **import-domino discovery** (hart-app.nix's own comment: "bs4 was the FIRST crash … pytz/redis/python-dotenv are the next dominoes") that **requires an actual Nix build+boot to iterate** — impossible on this box (no Nix) and reckless to guess into the concurrent session's contended file. So A+D (the runtime seams, my files, validated) ship now; B/C/F are the CI/coordination step, authored concretely below.
+
 ## Context
 
 The steward's directive (2026-07-09): **"all existing Nunba + HARTOS functionalities should
@@ -52,50 +65,143 @@ glass shell (WebView, same-origin :6800) ──> LiquidUIService (:6800)
 - Gate it on a `--server-only`/`HART_NUNBA_HEADLESS=1` flag (the old removed AppImage used
   `--server-only`; restore the flag name).
 
-### B. `nixos/packages/nunba.nix` — build the FULL Nunba minus HARTOS
-Mirror `nixos/packages/hart-app.nix` (`pythonEnv = python310.withPackages(...)` + copied source
-+ `passthru.python`) and the removed `6b46061e:nixos/packages/nunba.nix` (its direct precedent):
-- `pythonEnv` from Nunba's `requirements.txt` **minus** the GUI drop-list (`pywebview`, `pystray`,
-  `pyautogui`, `win10toast`, `pywin32`, `rumps`, `pyobjc*`) **and the entire ML/TTS/LLM stack**
-  (`torch`, `transformers`, `sentence_transformers`, `chromadb`, `faiss`, `piper`/`vibevoice`,
-  `onnxruntime`, `llama`).
-- **Why drop TTS/models too (corrected 2026-07-09, steward):** HART OS owns a **unified,
-  server-managed model + VRAM stack natively** — `integrations/service_tools/model_catalog.py`
-  (`ModelCatalog`, the single source of truth for **all** model types incl. **TTS**/STT/VLM,
-  JSON-backed, admin-CRUD via `POST /api/admin/models`), `vram_manager.py` (GPU tracking +
-  gpu/cpu_offload/cpu_only strategy), and `model_onboarding.py` (name → VRAM-pick quant →
-  download → start server → register). *Which* model/voice runs is orchestrated **server-side**;
-  the device runs it locally. So the Nunba daemon must NOT carry its own torch/piper/transformers
-  — it calls HART OS's native model/TTS services through the backend. (`hartos_speech.py`'s
-  `edge_tts` is a pre-synth build utility for onboarding audio, not the runtime TTS.) This keeps
-  the daemon lean and one authoritative model manager.
-- Keep building the React dist (existing `buildNpmPackage` → `landing-page/build`).
-- **Exclude HARTOS**: do NOT run the four sibling-HARTOS bundling mechanisms
-  (`setup_freeze_nunba.py`: `_sibling_editable_deps` pip installs; `find_hevolve_modules()`
-  include_files; `_hartos_packages` + `agent_ledger` dir copies; the python-embed re-install).
-  The Nix build copies only Nunba's own `app.py/main.py/wamp_router.py/routes/desktop/api/…`.
-- `passthru.python = pythonEnv`; output `$out/bin/nunba` (headless launcher) + `$out/lib/nunba`
-  (Python) + `$out/lib/nunba/static` (React), keeping the static path contract for fallback.
+### B. `nixos/packages/nunba.nix` — build the FULL Nunba minus HARTOS ⛔ CI/coordination
+The current file is a **React-only** `buildNpmPackage` (`nunba-static`, `$out/lib/nunba/static`).
+Extend it to ALSO carry Nunba's Python + a headless launcher, keeping the existing React
+derivation as a sub-build. **`pythonEnv` follows hart-app.nix's CURATED-minimal pattern (NOT
+`requirements.txt`)** — the heavy/absent deps (langchain, autogen, torch, transformers, chromadb,
+piper/vibevoice, onnxruntime, faiss) are OMITTED and Nunba's imports of them must be
+try/except-guarded, discovered by the **import-domino build loop** (mirror hart-app.nix's own
+"bs4 → pytz → redis" history). GUI deps (`pywebview`, `pystray`, `pyautogui`, `win10toast`,
+`pywin32`, `rumps`, `pyobjc*`) are dropped (main.py is the headless path). **Why no ML/TTS:**
+HART OS owns the unified server-managed model+VRAM stack natively — `model_catalog.py`
+(`ModelCatalog`, single source of truth for ALL model types incl. TTS/STT/VLM), `vram_manager.py`,
+`model_onboarding.py`; *which* model/voice runs is orchestrated server-side, so the daemon calls
+HART OS's model/TTS through the backend (`hartos_speech.py`'s `edge_tts` is a build-time
+onboarding-audio utility, not runtime TTS).
 
-### C. `nixos/modules/hart-nunba.nix` — a hardened system daemon
-Mirror `nixos/modules/hart-backend.nix` (system service, `@hart.target`, full hardening block):
-- `ExecStart = "${nunbaPkg.python}/bin/python ${nunbaPkg}/lib/nunba/app.py --server-only"`,
-  `WorkingDirectory = "${nunbaPkg}/lib/nunba"`.
-- Environment: `HARTOS_BACKEND_URL = "http://127.0.0.1:${toString cfg.ports.backend}"` (native
-  6777), `HART_NUNBA_SOCKET = /run/hart/nunba.sock`, `NUNBA_BUNDLED` **unset** (so the adapter
-  takes the explicit-URL Tier-2 HTTP path to native HARTOS), `PYTHONDONTWRITEBYTECODE=1`.
-- `RuntimeDirectory=hart` (for the socket), `ReadWritePaths`, `User/Group=hart`, `after =
-  [ "hart-backend.service" ]`, `wantedBy = [ "hart.target" ]`.
+```nix
+# nixos/packages/nunba.nix — full daemon package (skeleton; pin FODs + walk dominoes in CI)
+{ lib, pkgs, hartSrc ? null
+, nunbaRev ? "72780cd43fd274057251e5e594f7d949a29e2237"   # == Nunba HEAD (cb849ba9's parent line)
+, nunbaHash ? lib.fakeHash          # nix-prefetch-github hertz-ai Nunba --rev ${nunbaRev}
+, npmDepsHash ? lib.fakeHash        # prefetch-npm-deps landing-page/package-lock.json
+, backendUrl ? "http://127.0.0.1:6777"
+}:
+let
+  python = pkgs.python310;
+  nunbaSrc = pkgs.fetchFromGitHub { owner = "hertz-ai"; repo = "Nunba"; rev = nunbaRev; hash = nunbaHash; };
 
-### D. `integrations/agent_engine/liquid_ui_service.py` — reverse-proxy, retire static-serve
-- Replace the `NUNBA_STATIC_DIR`-gated static block (`:5987-5999`) with a **reverse-proxy** of
-  the Nunba SPA + API sub-paths to `unix:/run/hart/nunba.sock` (via `httpx`/`requests-unixsocket`
-  — a small `@app.route('/<path:path>')` last-place handler streaming from the socket). Same
-  origin, so `NUNBA_BASE` stays `''` and route panels are unchanged.
-- Keep `/`, `/shell/static/*`, `/api/*`, `/cors/test` exactly as they are (LiquidUI wins by rule
-  specificity).
+  # React dist — the EXISTING buildNpmPackage, unchanged (kept as a sub-build).
+  nunbaStatic = pkgs.buildNpmPackage {
+    pname = "nunba-static"; version = "1.0.0"; src = nunbaSrc;
+    sourceRoot = "${nunbaSrc.name}/landing-page";
+    inherit npmDepsHash;
+    npm_config_omit = "optional"; npmInstallFlags = [ "--omit=optional" ];
+    nativeBuildInputs = [ pkgs.python3 ];
+    PUBLIC_URL = "/"; REACT_APP_API_BASE_URL = backendUrl;
+    DISABLE_ESLINT_PLUGIN = "true"; ESLINT_NO_DEV_ERRORS = "true"; CI = "false";
+    CYPRESS_INSTALL_BINARY = "0"; CYPRESS_SKIP_BINARY_INSTALL = "1";
+    GENERATE_SOURCEMAP = "false"; NODE_OPTIONS = "--max-old-space-size=4096";
+    dontFixup = true;
+    installPhase = "runHook preInstall; mkdir -p $out; cp -r build/. $out/; runHook postInstall";
+  };
 
-### E. Retire the frontend reimplementations (backend stays)
+  # CURATED minimal boot set (extend via the domino loop — do NOT paste requirements.txt).
+  # Start from hart-app.nix's proven set; add Nunba-boot deps as `nix build` surfaces them.
+  pythonEnv = python.withPackages (ps: with ps; [
+    flask waitress requests httpx            # server + the reverse-proxy client contract
+    hypercorn h11 h2 wsproto                 # ASGI primary (main.py:5860)
+    beautifulsoup4 pytz redis python-dotenv pydantic sqlalchemy cryptography
+    psutil python-dateutil pyyaml jinja2 aiohttp websockets pillow numpy
+    # + Nunba-specific boot imports discovered by the build loop (autobahn?, txaio?, …)
+  ]);
+in
+pkgs.stdenv.mkDerivation {
+  pname = "nunba"; version = "1.0.0"; src = nunbaSrc;
+  # EXCLUDE HARTOS: copy ONLY Nunba's own tree — never run setup_freeze_nunba.py's four
+  # sibling-HARTOS mechanisms (_sibling_editable_deps pip installs, find_hevolve_modules()
+  # include_files, _hartos_packages + agent_ledger dir copies, python-embed re-install).
+  installPhase = ''
+    runHook preInstall
+    mkdir -p $out/lib/nunba $out/bin
+    cp -r landing-page/../. $out/lib/nunba/   # Nunba repo root (app.py/main.py/wamp_router.py/routes/desktop/api/…)
+    rm -rf $out/lib/nunba/.git $out/lib/nunba/landing-page/node_modules
+    ln -sfn ${nunbaStatic} $out/lib/nunba/static      # React dist at the byte-for-byte contract path
+    cat > $out/bin/nunba <<EOF
+    #!${pkgs.runtimeShell}
+    exec ${pythonEnv}/bin/python $out/lib/nunba/main.py "\$@"
+    EOF
+    chmod +x $out/bin/nunba
+    runHook postInstall
+  '';
+  dontFixup = true;
+  passthru = { python = pythonEnv; inherit pythonEnv nunbaStatic; };
+  meta = with lib; { description = "Nunba — full HART OS native daemon (Python + React, HARTOS-excluded)";
+                     license = licenses.asl20; platforms = platforms.linux; };
+}
+```
+**Verify (CI):** `nix build .#packages.<sys>.nunba`; then `ls $out/lib/nunba` shows Nunba's Python
++ `static` symlink + `$out/bin/nunba`; `grep -rL` confirms **no** `core/ integrations/ security/
+hart_intelligence*` in the closure (HARTOS excluded). Walk the import dominoes: run
+`$out/bin/nunba` with `HART_NUNBA_SOCKET=/tmp/n.sock`, read the first `ModuleNotFoundError`, add
+that nixpkgs pkg (or guard the import in Nunba), repeat until it binds the socket.
+
+### C. `nixos/modules/hart-nunba.nix` — a hardened system daemon ⛔ CI/coordination
+The current file is **options-only** (documents the removed AppImage). Replace its `config` block
+(keep the `options.hart.nunba.*`) with a real socket daemon mirroring hart-backend.nix. **Runs
+`main.py` directly** (it IS the headless server; no `--server-only`, no app.py).
+
+```nix
+# hart-nunba.nix config block (mirror hart-backend.nix hardening; add to the existing options)
+config = lib.mkIf (config.hart.enable && config.hart.nunba.enable) {
+  systemd.services.hart-nunba = {
+    description = "Nunba native daemon (full Python + React, unix socket)";
+    after = [ "hart-backend.service" ];
+    partOf = [ "hart.target" ]; wantedBy = [ "hart.target" ];
+    environment = {
+      HART_NUNBA_SOCKET = "/run/hart/nunba.sock";                 # inbound: unix socket, NO host port
+      HARTOS_BACKEND_URL = "http://127.0.0.1:${toString config.hart.ports.backend}";  # outbound → native 6777
+      # NUNBA_BUNDLED intentionally UNSET → hartos_backend_adapter takes the explicit-URL HTTP path
+      PYTHONDONTWRITEBYTECODE = "1"; PYTHONUNBUFFERED = "1";
+    };
+    serviceConfig = {
+      Type = "simple"; User = "hart"; Group = "hart";
+      WorkingDirectory = "${nunbaPkg}/lib/nunba";
+      ExecStart = "${nunbaPkg.python}/bin/python ${nunbaPkg}/lib/nunba/main.py";
+      RuntimeDirectory = "hart"; RuntimeDirectoryMode = "0750";   # creates+owns /run/hart for the socket
+      Restart = "on-failure"; RestartSec = 5; TimeoutStartSec = 45;
+      # ── hardening (copy hart-backend.nix) ──
+      NoNewPrivileges = true; ProtectSystem = "strict"; ProtectHome = true;
+      ReadWritePaths = [ config.hart.dataDir config.hart.logDir ];
+      PrivateTmp = true; ProtectKernelTunables = true; ProtectKernelModules = true;
+      RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];   # AF_UNIX for the socket; AF_INET for → 6777
+      SystemCallFilter = [ "@system-service" ]; LockPersonality = true;
+      RestrictRealtime = true; RestrictSUIDSGID = true;
+      MemoryMax = if config.hart.variant == "edge" then "512M" else "2G";
+      StandardOutput = "journal"; StandardError = "journal"; SyslogIdentifier = "hart-nunba";
+    };
+  };
+};
+# NOTE: `nunbaPkg = pkgs.callPackage ../packages/nunba.nix { inherit hartSrc; };` at the module let-binding.
+# DO NOT set PrivateNetwork=true — the daemon must reach 127.0.0.1:6777 (native HARTOS) on the host loopback.
+```
+Then wire LiquidUI to set the socket env (`hart-liquid-ui.nix`: `HART_NUNBA_SOCKET =
+"/run/hart/nunba.sock"` alongside the existing `NUNBA_STATIC_DIR`, so the proxy is preferred and
+the dist stays the floor), and keep `hart.nunba.enable = false` until `nix build .#packages.nunba`
+is green — flipping it on before the closure builds would fail the ISO.
+
+### D. `integrations/agent_engine/liquid_ui_service.py` — reverse-proxy ✅ DONE (`8c1be533`)
+Replaced the `NUNBA_STATIC_DIR`-gated static block with a socket-first reverse-proxy: when
+`HART_NUNBA_SOCKET` is set, a last-place `@app.route('/<path:path>')` streams (httpx UDS +
+`iter_raw`, `read=None` for SSE) from `unix:/run/hart/nunba.sock`; on socket failure it falls back
+to `_serve_nunba_static` (the old `NUNBA_STATIC_DIR` dist) — never a 404. Same origin, `NUNBA_BASE`
+stays `''`. Explicit routes (`/`, `/shell/static/*`, `/api/*`, `/cors/test`, `/health`,
+`/favicon.ico`) still win by rule specificity. **Verified compatible** with the concurrent
+session's `tests/unit/test_liquid_ui_nunba_serving.py` (socket unset → the `elif nunba_dir` branch
+reproduces the old two-route structure; both env unset → the 404 floor-lock holds).
+
+### E. Retire the frontend reimplementations (backend stays) ⏸ DEFERRED until real-HW proof
 - **Retire** `integrations/agent_engine/static/hartOnboarding.js` (web overlay) and
   `integrations/agent_engine/native_onboarding.py` (GTK4) — both are thin re-draws of the same
   FSM that Nunba's `LightYourHART.js` renders richly. Remove the overlay `<script>`/DOM
@@ -131,8 +237,19 @@ Mirror `nixos/modules/hart-backend.nix` (system service, `@hart.target`, full ha
    `pgrep` shows exactly ONE HARTOS backend process.
 
 ## Risks / coordination
-- `nunba.nix` + `hart-nunba.nix` are the **concurrent inference session's files** — coordinate
-  before editing; this change is additive to their sharded-inference work but shares the files.
+- **CONFIRMED: `nunba.nix` + `hart-nunba.nix` are the concurrent sharded-inference session's
+  files** — `0a338951` ("bulk landing of the sharded-model inference session's in-flight tree")
+  rewrote `nunba.nix` (±199 lines), `hart-nunba.nix` (±77), and added
+  `tests/unit/test_liquid_ui_nunba_serving.py`. So B/C MUST be applied in coordination with that
+  session (not blind-overwritten). The A+D seams touch only MY files (Nunba `main.py`, HARTOS
+  `liquid_ui_service.py`) and are verified compatible with their serving test — no collision.
+- **Import-domino discovery needs a real Nix build+boot** (hart-app.nix's curated-set history
+  proves it) → B's `pythonEnv` cannot be finalized on a box without Nix. The skeleton above is the
+  starting point; CI walks the dominoes.
 - No Node/Nix on the current box → the build + hash pinning must run in **CI** (or a machine with
   the toolchain + private-repo access). This plan is authored to be executed there.
-- The Nunba headless entrypoint (A) is a change in the **Nunba repo** — a cross-repo commit.
+- **Safe-by-default staging:** A+D are additive (activate only when `HART_NUNBA_SOCKET` is set) and
+  are committed now. `hart.nunba.enable` STAYS `false` until `nix build .#packages.nunba` is green,
+  so the current working nightly (React-static floor) is never broken by an in-progress daemon
+  closure.
+- The Nunba socket-bind (A) is a change in the **Nunba repo** — cross-repo commit `cb849ba9`.
