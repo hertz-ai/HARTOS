@@ -461,7 +461,10 @@
       dg.bx = B.dragX; dg.by = B.dragY;
       dg.pid = e.pointerId;
       hero.classList.add('hart-hero-dragging');
-      if (showMin) showMin();        // FIX A: reveal the minimise control while dragging (not on hover)
+      // The minimise control is revealed on the FIRST real drag-MOVE (in onMove),
+      // NOT here on pointerdown: a plain click/tap-to-talk must never flash the
+      // close_fullscreen glyph (which reads as a "resize icon" on the orb). Revealing
+      // it in onDown made every click show + hide it.
       // Suppress native selection rubber-banding across the desktop while dragging.
       var de = document.documentElement;
       de.style.userSelect = 'none'; de.style.webkitUserSelect = 'none';
@@ -470,7 +473,10 @@
     function onMove(e) {
       if (!dg.on) return;
       var ddx = e.clientX - dg.sx, ddy = e.clientY - dg.sy;
-      if (!dg.moved && Math.abs(ddx) + Math.abs(ddy) > 4) { dg.moved = true; B.placed = true; }
+      if (!dg.moved && Math.abs(ddx) + Math.abs(ddy) > 4) {
+        dg.moved = true; B.placed = true;
+        if (showMin) showMin();   // reveal the minimise control ONLY once a REAL drag starts (never on a plain click/tap)
+      }
       if (!dg.moved) return;
       B.dragX = dg.bx + ddx; B.dragY = dg.by + ddy;
       clampDrag();
