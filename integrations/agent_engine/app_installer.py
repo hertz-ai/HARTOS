@@ -209,6 +209,16 @@ class AppInstaller:
     def __init__(self):
         self._install_dir = os.environ.get(
             'HART_APP_DIR', '/var/lib/hart/apps')
+        # Flatpak runs at --USER scope in a backend-writable installation dir, NOT
+        # the system /var/lib/flatpak. The app-store install runs as the sandboxed,
+        # non-root `hart` service (ProtectSystem=strict, NoNewPrivileges, no polkit
+        # grant for org.freedesktop.Flatpak.app-install), so a SYSTEM-scope
+        # `flatpak install` failed with a permission error even WITH internet
+        # (real-HW 2026-07-09). A --user installation under our own writable dir
+        # needs no root/polkit. (Caveat: on a LIVE USB this dir is on the tmpfs
+        # overlay, so a large app can still hit ENOSPC — a live-boot storage limit,
+        # not a permission error; an installed system has real disk.)
+        self._flatpak_dir = os.path.join(self._install_dir, 'flatpak')
         self._history: List[dict] = []
         # ── Background install-job state (one at a time) ──
         # A single lock guards the live progress dict so the worker thread and
@@ -494,8 +504,8 @@ class AppInstaller:
         # Flatpak
         try:
             result = subprocess.run(
-                ['flatpak', 'list', '--app', '--columns=name,application,version'],
-                capture_output=True, text=True, timeout=10)
+                ['flatpak', '--user', 'list', '--app', '--columns=name,application,version'],
+                capture_output=True, text=True, timeout=10, env=self._flatpak_env())
             if result.returncode == 0:
                 for line in result.stdout.strip().split('\n'):
                     parts = line.split('\t')
@@ -556,9 +566,10 @@ class AppInstaller:
 
         if not platforms or 'flatpak' in platforms:
             try:
+                self._ensure_flathub()
                 result = subprocess.run(
-                    ['flatpak', 'search', query, '--columns=name,application,version,description'],
-                    capture_output=True, text=True, timeout=15)
+                    ['flatpak', '--user', 'search', query, '--columns=name,application,version,description'],
+                    capture_output=True, text=True, timeout=15, env=self._flatpak_env())
                 if result.returncode == 0:
                     for line in result.stdout.strip().split('\n')[:20]:
                         parts = line.split('\t')
@@ -754,14 +765,36 @@ class AppInstaller:
                 success=False, platform='nix', name=name,
                 error='Installation timed out')
 
+    def _flatpak_env(self) -> dict:
+        """Env pinning flatpak to the --user installation dir this service can write."""
+        env = dict(os.environ)
+        env['FLATPAK_USER_DIR'] = self._flatpak_dir
+        return env
+
+    def _ensure_flathub(self) -> None:
+        """Idempotently add the Flathub remote at --user scope. `remote-add` needs NO
+        network (only the later install does), so this is offline-safe and also fixes
+        the 'remote missing after I connected to the internet' case where the
+        system-scope, network-online-gated hart-flathub-init never ran. Best-effort —
+        never raises."""
+        try:
+            os.makedirs(self._flatpak_dir, exist_ok=True)
+            subprocess.run(
+                ['flatpak', '--user', 'remote-add', '--if-not-exists', 'flathub',
+                 'https://dl.flathub.org/repo/flathub.flatpakrepo'],
+                capture_output=True, text=True, timeout=30, env=self._flatpak_env())
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+
     def _install_flatpak(self, req: InstallRequest) -> InstallResult:
-        """Install a Flatpak package."""
+        """Install a Flatpak package (--user scope + writable dir; see __init__)."""
         ref = req.source.replace('flathub:', '').replace('flatpak:', '')
         name = req.name or ref
+        self._ensure_flathub()
         try:
             result = subprocess.run(
-                ['flatpak', 'install', '-y', 'flathub', ref],
-                capture_output=True, text=True, timeout=300)
+                ['flatpak', '--user', 'install', '-y', 'flathub', ref],
+                capture_output=True, text=True, timeout=300, env=self._flatpak_env())
             if result.returncode == 0:
                 return InstallResult(
                     success=True, platform='flatpak', name=name,
@@ -1336,8 +1369,8 @@ class AppInstaller:
     def _uninstall_flatpak(self, app_id: str) -> InstallResult:
         try:
             result = subprocess.run(
-                ['flatpak', 'uninstall', '-y', app_id],
-                capture_output=True, text=True, timeout=60)
+                ['flatpak', '--user', 'uninstall', '-y', app_id],
+                capture_output=True, text=True, timeout=60, env=self._flatpak_env())
             return InstallResult(
                 success=result.returncode == 0, platform='flatpak',
                 name=app_id, error=result.stderr.strip()[:500])
