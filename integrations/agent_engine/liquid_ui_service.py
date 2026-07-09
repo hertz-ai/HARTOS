@@ -2280,11 +2280,16 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 .panel-titlebar .mi{{font-size:16px;color:var(--hart-accent);flex-shrink:0}}
 .panel-titlebar .title{{flex:1;font-size:12px;font-weight:500;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}}
-.panel-titlebar .ctrl{{display:flex;gap:2px}}
+.panel-titlebar .ctrl{{display:flex;gap:4px}}
 .panel-titlebar .ctrl span{{width:24px;height:24px;display:flex;align-items:center;justify-content:center;
-  border-radius:6px;cursor:pointer;font-size:14px;transition:background var(--hart-anim-speed)}}
-.panel-titlebar .ctrl span:hover{{background:rgba(255,255,255,0.1)}}
-.panel-titlebar .ctrl .close:hover{{background:var(--hart-error)}}
+  border-radius:6px;cursor:pointer;font-size:14px;color:var(--hart-text);background:rgba(255,255,255,0.06);
+  transition:background var(--hart-anim-speed),color var(--hart-anim-speed)}}
+/* Window controls (close/min/max) get a SOLID rest background + a crisp NEUTRAL glyph
+   instead of the low-contrast teal accent — otherwise they read as transparent/clumsy
+   floating icons on the glass (steward, real-HW). Close hover = red with a white X. */
+.panel-titlebar .ctrl span .mi{{color:inherit}}
+.panel-titlebar .ctrl span:hover{{background:rgba(255,255,255,0.16)}}
+.panel-titlebar .ctrl .close:hover{{background:var(--hart-error);color:#fff}}
 .panel-body{{flex:1;overflow:hidden;position:relative}}
 .panel-body iframe{{width:100%;height:100%;border:none;background:transparent}}
 .panel-body .native-content{{padding:16px;overflow-y:auto;height:100%;font-size:13px}}
