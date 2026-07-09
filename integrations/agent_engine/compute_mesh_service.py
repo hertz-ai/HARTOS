@@ -720,7 +720,34 @@ class ComputeMeshService:
             return self._json_response(self.pair_device(data['peer_address']))
         return self._json_response({'error': 'Invalid pairing request'}, 400)
 
+    def _compute_contribute_consented(self) -> bool:
+        """Fail-CLOSED gate for serving HIVE compute (the compute_contribute consent).
+
+        Contributing THIS device's compute to the hive is EXPLICIT OPT-IN (privacy-
+        first): a peer's inference/shard work is served ONLY if a compute_contribute
+        consent has been granted. Reuses the canonical UserConsent table — NO new
+        store. Device-level: any granted row authorises the device. ANY failure (no
+        consent system / cold table / no db) returns False, so the device NEVER
+        contributes compute the human did not authorise (humans-always-in-control).
+        Closes the audited gap: compute_contribute was DEFINED but enforced NOWHERE."""
+        try:
+            from integrations.social.models import db_session, UserConsent
+            with db_session(commit=False) as db:
+                return db.query(UserConsent).filter(
+                    UserConsent.consent_type == 'compute_contribute',
+                    UserConsent.granted == True,
+                ).first() is not None
+        except Exception:
+            return False
+
     def _route_infer(self, body: bytes):
+        # compute_contribute gate (opt-in, fail-closed): never run a PEER's inference
+        # on this device without the owner's explicit consent.
+        if not self._compute_contribute_consented():
+            return self._json_response(
+                {'error': 'compute_contribute consent not granted — this device does '
+                          'not serve hive compute (opt-in required)',
+                 'code': 'consent_required'}, 403)
         try:
             data = json.loads(body.decode('utf-8')) if body else {}
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -748,6 +775,12 @@ class ComputeMeshService:
 
     def _route_shard(self, body: bytes):
         """Relay one shard-runtime frame. Fail-closed to HTTP 400 on a bad frame."""
+        # compute_contribute gate: serving a sharded-model frame contributes this
+        # device's compute to the hive, so it is opt-in + fail-closed, same as
+        # _route_infer (one gate, no parallel consent path).
+        if not self._compute_contribute_consented():
+            return self._json_response(
+                {'error': 'compute_contribute consent not granted', 'code': 'consent_required'}, 403)
         from core.shard_runtime.envelope import EnvelopeError
         try:
             out = self._handle_shard_frame(body)
