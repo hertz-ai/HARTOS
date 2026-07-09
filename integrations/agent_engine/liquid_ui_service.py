@@ -5914,7 +5914,8 @@ function renderAgentOverlay(ev) {{
         # in-process A2UI emitter reaches the LIVE shell via
         # get_registry().get_or_none('LiquidUIService').  Idempotent.
         self._register_self()
-        from flask import Flask, request, jsonify, Response, send_from_directory
+        from flask import (Flask, request, jsonify, Response,
+                           send_from_directory, stream_with_context)
 
         # The shell HTML loads its logo + every external script from
         # the ``/shell/static/`` prefix (see render_desktop_shell: hart-logo.svg,
@@ -5969,23 +5970,96 @@ function renderAgentOverlay(ev) {{
             return send_from_directory(os.path.dirname(path),
                                        os.path.basename(path))
 
-        # ── Nunba SPA embedding (React pages inside panel iframes) ──
-        # The dist is a no-basename BrowserRouter (history) SPA whose bundle refs
-        # are origin-root absolute ('/static/js/main.*.js', '/static/css/…'), so
-        # it can ONLY be served at the origin root, exactly how Nunba's own
-        # app.py:4033-4040 serves it (file-or-index catch-all from the build
-        # dir). We mirror that single pattern here (no parallel path): a /static
-        # passthrough for the hashed bundles plus one SPA history fallback that
-        # serves a real file when it exists, else index.html so the in-browser
-        # router resolves '/social', '/agents', '/admin', … itself. Both are
-        # gated on NUNBA_STATIC_DIR: when it is unset, /static stays a 404
-        # (the shell's own assets live at the distinct /shell/static prefix, so
-        # the floor-lock is preserved). Werkzeug matches by rule specificity, so
-        # the '/<path:path>' catch-all is tried LAST: every explicit route ('/',
-        # '/favicon.ico', '/health', '/cors/test', all '/api/*', '/api/shell/*',
-        # '/shell/static/*') still wins.
+        # ── Nunba native-daemon embedding (reverse-proxy, same-origin) ──
+        # HART OS runs the FULL Nunba (Python + React) as a native OS daemon
+        # bound to a UNIX SOCKET — no host TCP port (steward 2026-07-09:
+        # "why shd we occupy host port if we can pack it within OS as a
+        # daemon process?").  LiquidUI reverse-proxies the Nunba SPA + its
+        # own APIs to that socket so the panel iframes stay SAME-ORIGIN
+        # (NUNBA_BASE='') and every 'route' panel (/social, /agents,
+        # /admin, …) resolves — no more "url not working".  Werkzeug matches
+        # by rule specificity, so every explicit LiquidUI route ('/',
+        # '/favicon.ico', '/health', '/cors/test', all '/api/*',
+        # '/shell/static/*') still WINS; only unclaimed paths (the Nunba SPA
+        # bundle + Nunba's own /api/social, /api/nunba, … that HARTOS does
+        # NOT define) fall to this LAST-place catch-all and get proxied to
+        # the daemon.  One HARTOS: the daemon's own backend calls proxy to
+        # native :6777 via HARTOS_BACKEND_URL — no re-bundled copy.
+        #
+        # Graceful floor (faster AND richer, never a hard drop): when the
+        # socket is unreachable (daemon still booting, or a desktop/CI build
+        # without the daemon) we fall back to serving the bundled React dist
+        # from NUNBA_STATIC_DIR exactly as before — React-only, but never a
+        # 404.  This preserves the old static-path contract as the floor.
+        hart_nunba_socket = os.environ.get('HART_NUNBA_SOCKET', '').strip()
         nunba_dir = os.environ.get('NUNBA_STATIC_DIR', '')
-        if nunba_dir and os.path.isdir(nunba_dir):
+
+        def _serve_nunba_static(path):
+            # React-dist fallback: real file if present, else SPA index so
+            # the in-browser router resolves '/social', '/agents', … itself.
+            if nunba_dir and os.path.isdir(nunba_dir):
+                file_path = os.path.join(nunba_dir, path)
+                if os.path.isfile(file_path):
+                    return send_from_directory(nunba_dir, path)
+                return send_from_directory(nunba_dir, 'index.html')
+            return Response('Nunba UI unavailable', status=503,
+                            mimetype='text/plain')
+
+        if hart_nunba_socket:
+            import httpx as _httpx
+
+            # One pooled UDS client for the whole proxy — connection reuse,
+            # no per-request socket setup.  read=None so Nunba SSE streams
+            # never time out; a short connect timeout lets us fail fast to
+            # the static floor while the daemon is still coming up.
+            _nunba_proxy = {'client': None}
+
+            def _nunba_client():
+                if _nunba_proxy['client'] is None:
+                    _nunba_proxy['client'] = _httpx.Client(
+                        transport=_httpx.HTTPTransport(uds=hart_nunba_socket),
+                        timeout=_httpx.Timeout(3.0, read=None,
+                                               write=30.0, pool=5.0))
+                return _nunba_proxy['client']
+
+            # Hop-by-hop headers must not be forwarded (RFC 7230 §6.1).
+            _HOP = {'host', 'connection', 'keep-alive', 'proxy-authenticate',
+                    'proxy-authorization', 'te', 'trailer',
+                    'transfer-encoding', 'upgrade', 'content-length'}
+
+            @app.route('/<path:path>',
+                       methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH',
+                                'OPTIONS', 'HEAD'])
+            def nunba_proxy(path):
+                url = 'http://nunba/' + path
+                if request.query_string:
+                    url += '?' + request.query_string.decode('latin-1')
+                fwd = {k: v for k, v in request.headers
+                       if k.lower() not in _HOP}
+                try:
+                    client = _nunba_client()
+                    upstream = client.build_request(
+                        request.method, url, headers=fwd,
+                        content=request.get_data())
+                    resp = client.send(upstream, stream=True)
+                except Exception as _pe:
+                    # Socket down / daemon booting → graceful static floor.
+                    logger.debug("Nunba proxy failed (%s) — static floor", _pe)
+                    return _serve_nunba_static(path)
+
+                resp_headers = [(k, v) for k, v in resp.headers.items()
+                                if k.lower() not in _HOP]
+
+                def _stream():
+                    try:
+                        for chunk in resp.iter_raw():
+                            yield chunk
+                    finally:
+                        resp.close()
+
+                return Response(stream_with_context(_stream()),
+                                status=resp.status_code, headers=resp_headers)
+        elif nunba_dir and os.path.isdir(nunba_dir):
             @app.route('/static/<path:path>')
             def nunba_bundle(path):
                 return send_from_directory(
@@ -5993,10 +6067,7 @@ function renderAgentOverlay(ev) {{
 
             @app.route('/<path:path>')
             def nunba_spa(path):
-                file_path = os.path.join(nunba_dir, path)
-                if os.path.isfile(file_path):
-                    return send_from_directory(nunba_dir, path)
-                return send_from_directory(nunba_dir, 'index.html')
+                return _serve_nunba_static(path)
 
         # ── Legacy API: UI components (for terminal/Conky fallback) ──
         @app.route('/api/ui', methods=['GET'])
