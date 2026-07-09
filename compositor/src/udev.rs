@@ -518,12 +518,28 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut gles: Option<GlesRenderer> = None;
     if want_gles {
         match devices.get(&primary_node) {
-            Some(dev) => match build_gles_renderer(&dev.gbm) {
-                Ok(renderer) => {
+            // build_gles_renderer can PANIC, not just return Err: smithay loads
+            // libEGL.so.1 / libGLESv2.so.2 via `libloading …expect(…)`, which PANICS
+            // when the lib is absent from the runtime search path (real-HW 2026-07-09:
+            // rc=134 abort → the supervisor dropped to sway, because the plain
+            // `match … Err(e)` below can only catch a Result, never a panic). Under
+            // panic="unwind" (Cargo.toml) catch_unwind converts that panic into an
+            // Err, so ANY EGL/GLES init failure — Result OR third-party panic —
+            // degrades to the pixman software floor IN-PROCESS instead of crashing to
+            // a lower tier. This is the true degrade-not-die (the LD_LIBRARY_PATH fix
+            // in hart-comp.nix makes the native path SUCCEED on a good GPU; this makes
+            // a still-broken EGL fall back silently rather than abort). AssertUnwindSafe
+            // is sound: on a caught panic we discard the renderer and keep the pixman
+            // renderer of record, mutating no shared state across the boundary.
+            Some(dev) => match std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| build_gles_renderer(&dev.gbm))
+            ) {
+                Ok(Ok(renderer)) => {
                     info!(node = %primary_node, "HART-comp DRM: GLES GPU renderer initialised on the primary node — GPU-compositing (pixman software floor kept as the fallback)");
                     gles = Some(renderer);
                 }
-                Err(e) => warn!(node = %primary_node, ?e, "HART-comp DRM: GLES init failed — staying on the pixman software floor (never-blank)"),
+                Ok(Err(e)) => warn!(node = %primary_node, ?e, "HART-comp DRM: GLES init failed — staying on the pixman software floor (never-blank)"),
+                Err(_panic) => warn!(node = %primary_node, "HART-comp DRM: GLES init PANICKED (e.g. libEGL/libGLESv2 not loadable) — caught, staying on the pixman software floor (degrade-not-die, never a lower-tier drop)"),
             },
             None => warn!(node = %primary_node, "HART-comp DRM: primary node has no opened device — staying on the pixman software floor"),
         }
