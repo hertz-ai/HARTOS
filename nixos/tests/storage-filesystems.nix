@@ -88,6 +88,11 @@ in
     };
 
     testScript = ''
+      # mkNode forces the VM hostname to the variant ("desktop"), so the driver keys
+      # the machine global by that hostname, NOT the nodes.fs key — the bare `fs` name
+      # is undefined at runtime (NameError). Bind it from the machines list (identical
+      # fix to session-supervisor.nix's `sup = machines[0]`).
+      fs = machines[0]
       fs.start()
       fs.wait_for_unit("multi-user.target")
 

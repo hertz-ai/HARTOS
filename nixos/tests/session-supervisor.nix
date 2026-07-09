@@ -368,7 +368,7 @@ in
             # The compositor stayed up AND painted -> the watchdog kept it. Tear it
             # down so the selector exits cleanly (a long-lived run is a normal
             # logout, not a crash).
-            sup.succeed("pkill -TERM -f sleep || true")
+            sup.succeed("pkill -TERM -x sleep || true")  # -x (exact comm), NOT -f: `-f sleep` matches the word "sleep" in pkill's OWN command line → SIGTERMs its shell → exit 143 before `|| true`
             # The latch was NEVER lowered: a painting tier is kept on sway.
             tier = sup.succeed(f"cat {LATCH} 2>/dev/null || echo sway").strip()
             assert tier in ("sway", "hart-comp"), \
@@ -906,7 +906,7 @@ in
             sup.wait_until_succeeds(f"test -e {INPUT_ALIVE}", timeout=30)
             # The tier painted AND signalled input -> the watchdog kept it. Tear it
             # down so the selector exits (a long-lived run is a normal logout).
-            sup.succeed("pkill -TERM -f sleep || true")
+            sup.succeed("pkill -TERM -x sleep || true")  # -x (exact comm), NOT -f: `-f sleep` matches the word "sleep" in pkill's OWN command line → SIGTERMs its shell → exit 143 before `|| true`
             tier = sup.succeed(f"cat {LATCH} 2>/dev/null || echo sway").strip()
             assert tier in ("sway", "hart-comp"), \
                 f"an input-alive Tier-2 must be KEPT (latch sway / un-dropped), got {tier!r}"
@@ -970,7 +970,7 @@ in
             # wait on / drop for the missing input marker — it just `wait`s the
             # healthy long-lived session.
             sup.wait_until_succeeds(f"test -e {READY}", timeout=30)
-            sup.succeed("pkill -TERM -f sleep || true")
+            sup.succeed("pkill -TERM -x sleep || true")  # -x (exact comm), NOT -f: `-f sleep` matches the word "sleep" in pkill's OWN command line → SIGTERMs its shell → exit 143 before `|| true`
             tier = sup.succeed(f"cat {LATCH} 2>/dev/null || echo sway").strip()
             assert tier != "cage", \
                 "with the input watchdog disabled, a painting tier was flapped to cage — the fail-safe default is broken"
@@ -1062,7 +1062,7 @@ in
             # The guard logs the suppression once the armed input budget elapses.
             sup.wait_until_succeeds(
                 "grep -q 'touch-only / device-less' /tmp/sel.log", timeout=30)
-            sup.succeed("pkill -TERM -f sleep || true")
+            sup.succeed("pkill -TERM -x sleep || true")  # -x (exact comm), NOT -f: `-f sleep` matches the word "sleep" in pkill's OWN command line → SIGTERMs its shell → exit 143 before `|| true`
             tier = sup.succeed(f"cat {LATCH} 2>/dev/null || echo sway").strip()
             assert tier != "cage", \
                 "the input watchdog dropped a painting tier on a TOUCH-ONLY seat — the FM3b guard failed (flap)"
