@@ -6577,14 +6577,16 @@ def parse_visual_context(inp: str):
                         ),
                     )
             except Exception as _consent_err:
-                # Consent system unavailable — fail OPEN per the
-                # "nothing fails in name of privacy" principle.  Audit
-                # log captures the bypass so it's not silent.
+                # Consent system unavailable — fail CLOSED for CLOUD EGRESS of the
+                # user's screen: never send the image to the cloud without a verifiable
+                # grant (humans-always-in-control). This is egress of SENSITIVE data, so
+                # the "nothing fails in name of privacy" principle — which protects LOCAL
+                # UX from privacy theatre — does NOT apply here; the on-device model path
+                # stays available. Audit-logged so the refusal is not silent.
                 app.logger.warning(
-                    "Visual QA: consent system unavailable (%s) — "
-                    "proceeding with cloud fallback (auto-grant fail "
-                    "open).", _consent_err)
-                _consent_ok = True
+                    "Visual QA: consent system unavailable (%s) — refusing cloud "
+                    "fallback (fail-closed; on-device path unaffected).", _consent_err)
+                _consent_ok = False
             if not _consent_ok:
                 # ONLY path that refuses: user explicitly revoked the
                 # cloud_egress[vision] consent earlier.  Re-grant

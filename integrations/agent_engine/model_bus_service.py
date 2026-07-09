@@ -769,8 +769,17 @@ class ModelBusService:
             if not approved:
                 logger.warning(f"Guardrail blocked {model_type} request: {reason}")
                 return False
-        except ImportError:
-            pass  # Guardrails not available — allow request
+        except ImportError as _e:
+            # FAIL-CLOSED: the constitutional guardrail is the CORE safety mechanism —
+            # a prompt that cannot be checked against the constitution must NOT run
+            # (humans-in-control + the "structurally immutable, always-enforced"
+            # guarantee). In a healthy HARTOS security/hive_guardrails is always present,
+            # so this only fires on a BROKEN install — refuse loudly (the log names the
+            # cause) rather than silently run unconstitutioned AI.
+            logger.critical(
+                "Constitutional guardrail unavailable (%s) — REFUSING %s request "
+                "(fail-closed; the constitution could not be enforced).", _e, model_type)
+            return False
         return True
 
     # ─── Model Listing ───────────────────────────────────────
