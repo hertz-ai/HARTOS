@@ -1991,6 +1991,13 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
 
                 # Create an enhanced instruction that includes all the recipe steps
 
+                # The recipe is an LLM *GUIDE*, NOT a deterministic macro: the proven
+                # steps are injected as a hint the agent ADAPTS to the live screen (see
+                # the "Adapt these steps..." line below). Do NOT "optimize" REUSE into a
+                # code-only executor that skips the LLM — that trades intelligence for a
+                # brittle screen-recorder that breaks the instant the world differs
+                # (steward 2026-07-09). REUSE is cheaper because it skips
+                # re-decomposition/exploration/re-verification, not because it drops the LLM.
                 enhanced_instruction = f"{instructions}\n\n"
                 enhanced_instruction += "Follow these steps from a previous successful execution:\n\n"
 

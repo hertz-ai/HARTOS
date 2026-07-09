@@ -194,7 +194,7 @@ See `memory/reference_ota_delivery_model.md`.
 ### Core Flow
 ```
 CREATE Mode: User Input → Decompose → Execute Actions → Save Recipe
-REUSE Mode:  User Input → Load Recipe → Execute Steps → Output (90% faster)
+REUSE Mode:  User Input → Load Recipe → LLM-GUIDED replay of proven steps (adapts to live context) → Output (~90% cheaper: skips re-decomposition/exploration, NOT the LLM — never a deterministic macro)
 ```
 
 ### Key Files
