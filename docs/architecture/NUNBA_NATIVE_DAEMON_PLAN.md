@@ -13,6 +13,29 @@
 
 **What the authoring box cannot do.** This box has **no Nix, no Node, no Docker, no WSL distro** — so it cannot *realise* the Nix build, compute the FOD hashes, or run the webpack/pytest. Everything else is done here: all edits (A–D + wiring + F) are written into the real files, Nunba's import surface was static-analyzed to seed the curated python env, and the eval-level zero-regression is verified by inspection (the `mkIf` gates keep the fakeHash build unforced while `hart.nunba.enable=false`). The Python env is still a **starting** curated set (hart-app.nix's proven pattern, NOT `requirements.txt`; langchain/autogen/torch/chromadb omitted, guarded by try/except); the remaining **import-domino discovery** ("bs4 → pytz → redis …") genuinely needs a real `nix build`+boot to finalize — that is the CI step, with pinning the two FOD hashes and flipping `hart.nunba.enable`. B/C were edited **in place** (not a parallel file) under the steward's explicit "finish end to end" direction, building on the concurrent session's landed `0a338951` (its React-static build + serving test both preserved).
 
+## Nix-free import-domino walk (2026-07-10, de-risking the CI build)
+
+A static transitive module-load import walk of Nunba's `main.py` (following its
+first-party packages; `scratchpad/import_domino_walk.py`) — the nix-free way to advance
+the same work with no build:
+- ✅ **The drop-ML decision HOLDS.** ZERO ML/TTS/LLM packages (torch, transformers,
+  langchain, autogen, chromadb, faiss, onnxruntime, piper…) are imported *unguarded* at
+  module load — all lazy. Only `pyautogui` (GUI) appears and it is *guarded*. So the daemon
+  boots without the dropped stack; those imports only fire on code paths HART OS serves
+  server-side.
+- ⚠️ **Fixed a real boot blocker (`3635ef77`):** Nunba's `models/catalog.py` +
+  `models/orchestrator.py` do an unguarded `import integrations.service_tools.model_catalog`
+  (→ `integrations/__init__` → `core/__init__`). Nunba has **no** `core/`/`integrations/` of
+  its own — those are **HARTOS** packages (why desktop cx_Freeze bundles HARTOS). The
+  HARTOS-excluded daemon would crash on import. Fix = `PYTHONPATH=${config.hart.package}` on
+  the service → resolves to the **native** HARTOS tree (the same one the backend runs), no
+  copy. Delegated path is dependency-light (`model_catalog` is stdlib-only; `core/__init__`
+  pulls requests/httpx, already in the env). One name overlap (`desktop/` exists in both
+  repos) — Nunba's wins via `sys.path[0]` (WorkingDirectory).
+- **Still a CI domino walk:** the walk is static + Windows-side, so it proves the *big*
+  dominoes but not every transitive dep of `core/__init__`'s util chain. The final pythonEnv
+  completeness is confirmed by the first real `nix build`+boot (CI).
+
 ## Context
 
 The steward's directive (2026-07-09): **"all existing Nunba + HARTOS functionalities should
