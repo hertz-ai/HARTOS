@@ -553,15 +553,6 @@
           name = "hart-pxe-server-go";
           src = ../deploy/distro/pxe/hart-pxe-server-go;
         };
-
-        # ─── Nunba native daemon (dedicated CI build target) ───
-        # `nix build .#packages.<sys>.nunba` builds the full Nunba (Python + React)
-        # closure ONCE so CI can (a) surface the FOD hashes (nunbaHash / npmDepsHash
-        # — seeded lib.fakeHash) and (b) walk the import-domino boot loop, WITHOUT the
-        # desktop ISO closure pulling this heavy build (hart.nunba.enable stays false
-        # until it is green). SAME expression the modules callPackage — one path, no
-        # second definition (mirrors the hart-comp / hart-rust-precedent CI aliases).
-        nunba = pkgs.callPackage ./packages/nunba.nix { };
       }
       # ── Rust-in-Nix BUILD gates (compile the crates in CI, not just eval) ──
       # These re-expose the SAME read-only options the modules already promise in
@@ -585,6 +576,18 @@
       // pkgs.lib.optionalAttrs isX86 {
         hart-rust-precedent = self.nixosConfigurations.hart-desktop.config.hart.rustPrecedent.package;
         hart-comp           = self.nixosConfigurations.hart-desktop.config.hart.comp.package;
+
+        # ─── Nunba native daemon (dedicated CI build target) ───
+        # `nix build .#packages.x86_64-linux.nunba` builds the full Nunba (Python +
+        # React) closure ONCE so CI can (a) surface the FOD hashes (nunbaHash /
+        # npmDepsHash — seeded lib.fakeHash) and (b) walk the import-domino boot loop,
+        # WITHOUT the desktop ISO closure pulling this heavy build (hart.nunba.enable
+        # stays false until it is green). SAME expression the modules callPackage — one
+        # path, no second definition. x86_64-ONLY, exactly like the hart-comp /
+        # hart-rust-precedent aliases above: the CI build runs on x86_64, and guarding
+        # it here keeps `nix flake check --no-build` from cross-eval'ing the Python
+        # closure on riscv64/aarch64 legacyPackages (the desktop is the target).
+        nunba = pkgs.callPackage ./packages/nunba.nix { };
       }
       // {
         # Default: server ISO
