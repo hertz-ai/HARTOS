@@ -29,6 +29,16 @@ let
   # ONE package expression (the same file hart-liquid-ui.nix callPackages for the
   # NUNBA_STATIC_DIR floor) → the daemon and the floor share the SAME store path.
   nunbaPkg = pkgs.callPackage ../packages/nunba.nix { inherit hartSrc; };
+  # The NATIVE HARTOS tree (the SAME derivation the backend runs). Nunba's own code
+  # imports HARTOS packages directly — models/catalog.py does an unguarded
+  # `import integrations.service_tools.model_catalog` (→ integrations/__init__ →
+  # core/__init__), because HART OS OWNS the server-managed model stack. On desktop
+  # cx_Freeze bundles HARTOS into Nunba; on HART OS we instead put HARTOS's native
+  # tree on the daemon's PYTHONPATH so `import core`/`import integrations` resolve to
+  # the ONE native HARTOS — no re-bundled copy (steward: "HARTOS shd not be
+  # transitively bundled again into Nunba"). hartApp is already in the closure (the
+  # backend uses it), so this adds no build.
+  hartApp = config.hart.package;
 in
 {
   # ─── Options ──────────────────────────────────────────────
@@ -90,6 +100,14 @@ in
           # path to native HARTOS (not an in-bundle import).
           # OS mode is SSE-primary; the WAMP router stays deferred (main.py's
           # _wamp_is_needed() gate) so no :8088 host port either.
+          #
+          # Native HARTOS on the path (NOT a copy): Nunba's models.catalog /
+          # models.orchestrator delegate to HARTOS's integrations.service_tools.*
+          # (which pull core/*). Nunba's own tree is sys.path[0] (WorkingDirectory)
+          # so Nunba's modules win any name overlap (e.g. the desktop/ package both
+          # repos have); HARTOS's core/integrations resolve from here. This is the
+          # single authoritative HARTOS the backend also runs — no double-bundle.
+          PYTHONPATH = "${hartApp}";
           PYTHONDONTWRITEBYTECODE = "1";
           PYTHONUNBUFFERED = "1";
         };

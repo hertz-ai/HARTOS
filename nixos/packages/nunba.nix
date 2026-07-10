@@ -50,11 +50,15 @@
 #           model stack.  (hartos_speech.py's edge_tts is a BUILD-time onboarding-
 #           audio utility, not the runtime TTS.)
 #
-# HARTOS EXCLUSION is automatic: this fetches ONLY hertz-ai/Nunba, so the four
-# cx_Freeze sibling-HARTOS bundling mechanisms (setup_freeze_nunba.py's
+# HARTOS EXCLUSION (no COPY) is automatic: this fetches ONLY hertz-ai/Nunba, so the
+# four cx_Freeze sibling-HARTOS bundling mechanisms (setup_freeze_nunba.py's
 # _sibling_editable_deps pip installs, find_hevolve_modules() include_files,
 # _hartos_packages + agent_ledger dir copies, python-embed re-install) NEVER run —
-# there is no HART tree in the sandbox to copy.  One HARTOS, reached over :6777.
+# there is no HART tree in the sandbox to copy.  BUT Nunba's own code imports HARTOS
+# packages directly (models/catalog.py → `import integrations.service_tools.
+# model_catalog`, → core/*), so the DAEMON reaches the ONE NATIVE HARTOS via
+# PYTHONPATH=${config.hart.package} (set in hart-nunba.nix) — the same tree the
+# backend runs, never a second copy.  Backend calls also go over :6777.  "One HARTOS."
 
 let
   python = pkgs.python310;
