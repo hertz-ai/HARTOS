@@ -249,7 +249,20 @@ let
     TIER_TERM_GRACE=${toString sup.tierTermGraceSeconds}
     DRM_SETTLE=${toString sup.drmMasterSettleSeconds}
 
-    log() { echo "[hart-session-supervisor] $*" >&2; }
+    # Emit each decision to stderr (greetd's tty, for a console operator) AND —
+    # best-effort — to the journal under `hart-session-supervisor`, because the
+    # greetd SESSION's stderr does NOT reach journald on its own (real-HW 2026-07-10:
+    # a full HARTJRNL journal export had ZERO supervisor/compositor lines, so every
+    # tier-drop diagnosis was a guess). systemd-cat reads stdin line-by-line here;
+    # guarded on the binary + `|| true` so a missing/broken systemd-cat can never
+    # turn a log call into a script-fatal error on the never-brick path.
+    log() {
+      echo "[hart-session-supervisor] $*" >&2
+      [ -x "${pkgs.systemd}/bin/systemd-cat" ] \
+        && printf '%s\n' "[hart-session-supervisor] $*" \
+             | "${pkgs.systemd}/bin/systemd-cat" -t hart-session-supervisor 2>/dev/null \
+        || true
+    }
 
     # ── Let the kernel reclaim the DRM master a just-exited compositor held ──
     # After a tier's process is GONE (crashed, hung-killed, or logged out), the
@@ -615,7 +628,22 @@ let
     # this selector for the next session attempt. On a crash OR a paint-timeout we
     # drop a tier and latch BEFORE returning.
     start=$(date +%s)
-    sh -c "$CMD" &
+    # Route this tier's stdout+stderr — AND the shell host it launches, which inherits
+    # these fds — into the journal under a per-tier identifier (`hart-tier-hart-comp`,
+    # `hart-tier-sway`, `hart-tier-cage`), so a real-HW tier crash/hang is finally
+    # diagnosable via `journalctl -t hart-tier-<tier>` (captured by the HARTJRNL
+    # journal-export). This is the missing half of the self-logging chain: the
+    # compositor + shell run inside the greetd session, whose stderr never reaches
+    # journald otherwise. systemd-cat EXECs the command (it does not fork), so the pid
+    # `sesspid` captures + the `kill`/`wait` the paint-watchdog and crash-accounting
+    # below rely on are preserved unchanged. Guarded + fallback: if systemd-cat is
+    # somehow unavailable the tier launches plain — the never-black floor must NEVER
+    # depend on the logger being present.
+    if [ -x "${pkgs.systemd}/bin/systemd-cat" ]; then
+      "${pkgs.systemd}/bin/systemd-cat" -t "hart-tier-$TIER" sh -c "$CMD" &
+    else
+      sh -c "$CMD" &
+    fi
     sesspid=$!
 
     # ── Shell-paint watchdog ──────────────────────────────────────────────────

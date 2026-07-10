@@ -1070,4 +1070,88 @@ in
                 f"the painting touch-only tier must be KEPT (latch un-dropped), got {tier!r}"
       '';
     };
+
+  # ─────────────────────────────────────────────────────────────
+  # JOURNALD CAPTURE (real-HW diagnosability): the selector must route BOTH its own
+  # decisions AND each launched tier's stdout/stderr into the system journal, so a
+  # bare-metal tier crash is finally diagnosable via `journalctl` (captured by the
+  # HARTJRNL journal-export). BEFORE this, the compositor + supervisor ran inside the
+  # greetd session whose stderr never reached journald — a full real-HW export had
+  # ZERO supervisor/compositor lines, so every tier-drop was a guess (2026-07-10).
+  # A fake Tier-1 that PRINTS unique markers (stdout + stderr) then crashes must
+  # appear under `journalctl -t hart-tier-hart-comp`, and the supervisor's own
+  # "launching tier" decision under `journalctl -t hart-session-supervisor`. This is
+  # the behavioural proof of the systemd-cat wrap (real fn, real journal, asserted
+  # side-effect) — NOT a grep-of-source guard.
+  # ─────────────────────────────────────────────────────────────
+  hart-session-supervisor-journald-capture =
+    let
+      # Prints a marker to BOTH streams, then crashes (rc=1) — exercises the tier's
+      # stdout AND stderr flowing through the systemd-cat wrap into the journal.
+      echoingCrash = pkgs.writeShellScript "fake-echoing-comp" ''
+        echo "HART_TIER_STDOUT_MARKER launched-and-about-to-crash"
+        echo "HART_TIER_STDERR_MARKER on stderr" >&2
+        exit 1
+      '';
+    in
+    pkgs.testers.runNixOSTest {
+      name = "hart-session-supervisor-journald-capture";
+      skipTypeCheck = true;
+      skipLint = true;
+      node.specialArgs = specialArgs;
+
+      nodes.sup = mkNode "desktop" {
+        virtualisation = { memorySize = 3072; cores = 2; };
+        hart.sessionSupervisor = {
+          enable = true;
+          compCommand = "${echoingCrash}";               # Tier-1 prints then crashes
+          swayCommand = "${pkgs.coreutils}/bin/false";   # Tier-2 fake crash
+          crashLoopCount = 3;              # ONE run records 1 crash (< 3) → no drop
+          crashLoopWindowSeconds = 300;
+          shellPaintTimeoutSeconds = 0;    # crash-only path — no paint wait
+          drmMasterSettleSeconds = 0;      # no real DRM master in the VM — stay fast
+          tierTermGraceSeconds = 0;
+        };
+      };
+
+      testScript = ''
+        sup = machines[0]
+        sup.start()
+        sup.wait_for_unit("multi-user.target")
+        sup.wait_for_unit("greetd.service", timeout=120)
+
+        selector = sup.succeed(
+            "find /nix/store -maxdepth 3 -name '*-hart-session-selector' -type f -print -quit"
+        ).strip()
+        assert selector, "hart-session-selector wrapper not found in the store"
+
+        with subtest("the launched tier's stdout+stderr are captured under journalctl -t hart-tier-hart-comp"):
+            sup.succeed("hartctl session reset-tier")  # arm Tier-1 (hart-comp)
+            sup.succeed(f"runuser -u hart -- {selector} || true")
+            # The tier's OWN output (BOTH streams) reached the journal under the
+            # per-tier identifier — the exact diagnosability the real-HW boot lacked.
+            sup.wait_until_succeeds(
+                "journalctl -t hart-tier-hart-comp --no-pager | grep -q HART_TIER_STDOUT_MARKER",
+                timeout=30)
+            sup.wait_until_succeeds(
+                "journalctl -t hart-tier-hart-comp --no-pager | grep -q HART_TIER_STDERR_MARKER",
+                timeout=30)
+
+        with subtest("the supervisor's own tier decision is captured under journalctl -t hart-session-supervisor"):
+            # The `launching tier '<TIER>'` line (log()) must ALSO reach the journal,
+            # not just greetd's tty — so the export shows WHICH tier ran (and, on a
+            # drop, why). This is the supervisor half of the self-logging chain.
+            sup.wait_until_succeeds(
+                "journalctl -t hart-session-supervisor --no-pager | "
+                "grep -q \"launching tier 'hart-comp'\"",
+                timeout=30)
+
+        with subtest("the crash was recorded but stayed below the drop threshold (behaviour unchanged by the wrap)"):
+            # The systemd-cat wrap must NOT alter crash accounting: one crashing run
+            # records exactly one crash (< crashLoopCount) so the latch stays hart-comp
+            # — proving the exec-preserved rc still reaches the crash path.
+            assert sup.succeed("cat /var/lib/hart/session-tier").strip() == "hart-comp", \
+                "the wrap changed crash accounting — a single sub-threshold crash must not drop the tier"
+      '';
+    };
 }
