@@ -94,11 +94,22 @@ in
 
     # Desktop UI
     conky.enable = true;
-    # TEMP off (#135): the nunba-static build (nixos/packages/nunba.nix) still pins
-    # lib.fakeHash for nunbaHash + npmDepsHash, so its fetch fails a hash check and
-    # takes the whole desktop ISO down with it (it becomes a dep of hart-liquid-ui via
-    # embedNunba). The shell + theming don't need the Nunba microfrontends. Re-enable
-    # once #135 pins the real hashes (src = sha256-gerMQEekVDBaHPFMwv6K8KMqg7V+WbqU4YR+9bzvSc8=).
+    # NATIVE NUNBA DAEMON — the single flip that wires the FULL Nunba (Python +
+    # React) into HART OS: `nunba.enable = true` starts hart-nunba.service (binds
+    # unix:/run/hart/nunba.sock, no host port) AND auto-enables liquidUI.embedNunba
+    # (its default == nunba.enable), so LiquidUI reverse-proxies the daemon same-
+    # origin with the SAME React store-path as the graceful static floor.
+    #
+    # STAYS OFF until CI is green — flipping it before that would fail the desktop
+    # ISO. Two CI prerequisites (nixos/packages/nunba.nix):
+    #   1. Pin the FOD hashes: nunbaRev (current Nunba HEAD, has HART_NUNBA_SOCKET) +
+    #      nunbaHash (nix-prefetch-github hertz-ai Nunba --rev <rev>) + npmDepsHash
+    #      (prefetch-npm-deps landing-page/package-lock.json) — all in ONE commit.
+    #   2. `nix build .#packages.x86_64-linux.nunba` green — walk the import-domino
+    #      boot loop (add curated nixpkgs pkgs / guard Nunba ML imports until main.py
+    #      binds the socket), per hart-app.nix's method.
+    # Then set this to true (embedNunba follows automatically). Until then the
+    # React-static floor path is byte-for-byte the current behaviour.
     nunba.enable = false;
 
     # ── Unified Kernel Extensions ──

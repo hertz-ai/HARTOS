@@ -553,6 +553,15 @@
           name = "hart-pxe-server-go";
           src = ../deploy/distro/pxe/hart-pxe-server-go;
         };
+
+        # ─── Nunba native daemon (dedicated CI build target) ───
+        # `nix build .#packages.<sys>.nunba` builds the full Nunba (Python + React)
+        # closure ONCE so CI can (a) surface the FOD hashes (nunbaHash / npmDepsHash
+        # — seeded lib.fakeHash) and (b) walk the import-domino boot loop, WITHOUT the
+        # desktop ISO closure pulling this heavy build (hart.nunba.enable stays false
+        # until it is green). SAME expression the modules callPackage — one path, no
+        # second definition (mirrors the hart-comp / hart-rust-precedent CI aliases).
+        nunba = pkgs.callPackage ./packages/nunba.nix { };
       }
       # ── Rust-in-Nix BUILD gates (compile the crates in CI, not just eval) ──
       # These re-expose the SAME read-only options the modules already promise in

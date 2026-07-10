@@ -3,140 +3,189 @@
                    # and hart-nunba.nix both `callPackage` this file with
                    # `{ inherit hartSrc; }`, and callPackage passes the override
                    # through verbatim, so the formal MUST exist or eval fails with
-                   # "called with unexpected argument 'hartSrc'". The native static
-                   # dist no longer needs the HART repo tree.
-, nunbaRev ? "72780cd43fd274057251e5e594f7d949a29e2237"
-, nunbaHash ? lib.fakeHash
-, npmDepsHash ? lib.fakeHash
-, backendUrl ? "http://localhost:6777"
+                   # "called with unexpected argument 'hartSrc'". The Nunba daemon
+                   # is HARTOS-EXCLUDED — it fetches ONLY the Nunba repo, never the
+                   # HART tree — so hartSrc is intentionally unused here.
+, nunbaRev ? "cb849ba96a6d103be3eb1c25f09d14a7324d3165"  # Nunba HEAD carrying the
+                   # HART_NUNBA_SOCKET bind (main.py, commit cb849ba9). CI must pin
+                   # nunbaHash + npmDepsHash for THIS rev (both seeded lib.fakeHash);
+                   # bump all three in ONE commit (npm ci fails the lock-vs-deps
+                   # integrity check if the rev and the lock drift apart).
+, nunbaHash ? lib.fakeHash    # nix-prefetch-github hertz-ai Nunba --rev ${nunbaRev}
+, npmDepsHash ? lib.fakeHash  # prefetch-npm-deps landing-page/package-lock.json
+, backendUrl ? "http://127.0.0.1:6777"
 }:
 
 # ═══════════════════════════════════════════════════════════════
-# Nunba — HART OS desktop React UI, built NATIVELY into a static dist
+# Nunba — the FULL desktop companion (Python + React) as a NATIVE
+# HART OS daemon.  HARTOS-EXCLUDED, GUI-less, ML/TTS/LLM-less.
 # ═══════════════════════════════════════════════════════════════
 #
-# This derivation REPLACES the old runtime-AppImage-download launcher stub.
-# That stub shipped `$out/bin/nunba` which, on first run, pulled a ~200 MB
-# `Nunba-x86_64.AppImage` from GitHub releases and ran `nunba --server-only`
-# on :5000 — a SECOND, redundant copy of the UI living outside the OS closure,
-# fetched over the network, that drifted from the React source and from the
-# HART backend it was supposed to talk to. The native-dist path
-# (hart-liquid-ui.nix `NUNBA_STATIC_DIR`) was already wired but DEAD because
-# this file never actually produced `$out/lib/nunba/static`.
+# Steward directive (2026-07-09): "all existing Nunba + HARTOS functionalities
+# should be natively wired to the HART OS" — package the EXACT Nunba desktop
+# build (Python AND React) as an in-process OS daemon on a UNIX SOCKET (no host
+# TCP port), calling the native HARTOS backend (:6777), with no runtime download.
 #
-# Now there is ONE path: the React SPA (the landing-page CRA tree in the
-# hertz-ai/Nunba repo) is compiled here into `$out/lib/nunba/static`, and
-# LiquidUIService (integrations/agent_engine/liquid_ui_service.py) serves it
-# from inside the glass shell via `NUNBA_STATIC_DIR`. No AppImage, no
-# :5000 daemon, no runtime download.
+# This derivation REPLACES the earlier React-only `nunba-static` stub.  That stub
+# built ONLY `landing-page/build` and served it via LiquidUI's NUNBA_STATIC_DIR —
+# which LOST all of Nunba's Python (app.py/main.py/wamp_router.py + the whole
+# desktop/* service layer: chat_sync, memory_sync, file_sync, media_classification,
+# guest_identity, ai_key_vault, chat_settings, …), for which there is NO HARTOS
+# parallel.  Now the FULL Nunba runs as `hart-nunba.service` (hart-nunba.nix)
+# binding `unix:/run/hart/nunba.sock`, and LiquidUI reverse-proxies it same-origin.
 #
-# Source: hertz-ai/Nunba @ ${nunbaRev}, subdir `landing-page/`
-#   - CRA via react-app-rewired (config-overrides.js) -> ./build (NOT ./dist)
-#   - package-lock.json is committed, lockfileVersion 3 -> deterministic
-#     fetchNpmDeps (buildNpmPackage). The committed lock + the pinned rev are
-#     bumped together; `npmDepsHash` is re-pinned in the SAME commit that bumps
-#     `nunbaRev` (otherwise `npm ci` fails the lock-vs-deps integrity check).
+# What is DROPPED and WHY (Gate 4 — one authoritative owner per concern):
+#   • GUI:  pywebview, pyautogui, pyperclip, cx_Freeze — main.py IS the headless
+#           server; app.py (the pywebview window) is never launched in daemon mode.
+#   • ML / TTS / LLM:  torch, torchaudio, transformers, sentence-transformers,
+#           tokenizers, safetensors, huggingface_hub, accelerate, sentencepiece,
+#           chromadb, faiss-cpu, opencv-python, scikit-learn, tiktoken, onnxruntime,
+#           piper-tts, soundfile, langchain*, langgraph, autogen-agentchat — because
+#           HART OS owns the UNIFIED, SERVER-MANAGED model+VRAM stack NATIVELY:
+#           integrations/service_tools/model_catalog.py (ModelCatalog — single source
+#           of truth for ALL model types incl. TTS/STT/VLM, admin-CRUD via
+#           POST /api/admin/models), vram_manager.py, model_onboarding.py.  *Which*
+#           model/voice runs is orchestrated server-side; the daemon calls HART OS's
+#           model/TTS services through the backend, so it must NOT carry a second
+#           model stack.  (hartos_speech.py's edge_tts is a BUILD-time onboarding-
+#           audio utility, not the runtime TTS.)
 #
-# ── Pinning the two fixed-output hashes (steward / CI, once per source bump) ──
-#   nunbaHash   (the repo tree):
-#     nix run nixpkgs#nix-prefetch-github -- hertz-ai Nunba --rev ${nunbaRev}
-#     (or seed lib.fakeHash and copy the "got: sha256-..." from the first build)
-#   npmDepsHash (the npm dependency closure):
-#     nix run nixpkgs#prefetch-npm-deps -- path/to/landing-page/package-lock.json
-#   Both default to lib.fakeHash so the flake still EVALUATES (FOD hashes are
-#   only checked at realise time); the first real `nix build .#iso-desktop` is
-#   what surfaces the correct values. NOTE: the desktop ISO closure already sits
-#   at the size/build-time ceiling (see desktop.nix isoImage + the hart.comp
-#   build-hang history) and this is a heavy webpack build (MUI, phaser, pdfjs,
-#   livekit, leaflet, chart.js). RECOMMENDED follow-up for the flake.nix owner:
-#   expose this as `packages.nunba-static` so a dedicated CI job builds + caches
-#   it ONCE (full cores) and the ISO closure substitutes the cached store path,
-#   the same mitigation used for the hart.comp Rust crate.
+# HARTOS EXCLUSION is automatic: this fetches ONLY hertz-ai/Nunba, so the four
+# cx_Freeze sibling-HARTOS bundling mechanisms (setup_freeze_nunba.py's
+# _sibling_editable_deps pip installs, find_hevolve_modules() include_files,
+# _hartos_packages + agent_ledger dir copies, python-embed re-install) NEVER run —
+# there is no HART tree in the sandbox to copy.  One HARTOS, reached over :6777.
 
 let
+  python = pkgs.python310;
+
   nunbaSrc = pkgs.fetchFromGitHub {
     owner = "hertz-ai";
     repo = "Nunba";
     rev = nunbaRev;
     hash = nunbaHash;
   };
+
+  # ── React dist — the SAME buildNpmPackage as before, kept as a sub-build ──
+  # Output is the CRA build/ tree at $out (root), symlinked into the daemon
+  # package below at BOTH the path main.py serves it from AND the legacy
+  # NUNBA_STATIC_DIR floor path — one /nix/store artifact, served two ways, so
+  # the floor CANNOT drift from what the daemon serves (steward: no parallel paths).
+  nunbaStatic = pkgs.buildNpmPackage {
+    pname = "nunba-static";
+    version = "1.0.0";
+    src = nunbaSrc;
+    sourceRoot = "${nunbaSrc.name}/landing-page";
+
+    inherit npmDepsHash;
+
+    # `canvas` is an OPTIONAL dep (needs cairo/pango + node-gyp); react-pdf renders
+    # without it. Omit optional native deps so the sandbox needs NO C toolchain.
+    npm_config_omit = "optional";
+    npmInstallFlags = [ "--omit=optional" ];
+    nativeBuildInputs = [ pkgs.python3 ];
+
+    PUBLIC_URL = "/";                     # root-absolute assets (/static/...) — the
+                                          # no-basename <BrowserRouter> contract.
+    REACT_APP_API_BASE_URL = backendUrl;  # bake the API base onto the HART backend.
+    DISABLE_ESLINT_PLUGIN = "true";
+    ESLINT_NO_DEV_ERRORS = "true";
+    CI = "false";                         # CRA: CI=true makes warnings fatal.
+    CYPRESS_INSTALL_BINARY = "0";
+    CYPRESS_SKIP_BINARY_INSTALL = "1";
+    GENERATE_SOURCEMAP = "false";
+    NODE_OPTIONS = "--max-old-space-size=4096";
+
+    dontFixup = true;
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out
+      cp -r build/. $out/
+      runHook postInstall
+    '';
+  };
+
+  # ── Python env — CURATED minimal boot set (NOT requirements.txt) ──
+  # Follows the PROVEN hart-app.nix pattern: a hand-picked set of high-confidence
+  # nixpkgs packages that lets main.py IMPORT and bind the socket; the heavy/absent
+  # deps (torch, transformers, chromadb, langchain, autogen, …) are OMITTED (see the
+  # DROP list above) and their imports must be try/except-guarded in Nunba — exactly
+  # like HARTOS guards langchain (hart-app.nix's #99).  This is a STARTING set: CI
+  # walks the import dominoes on the first real `nix build` (hart-app.nix's own
+  # history: "bs4 was the FIRST crash → pytz → redis → python-dotenv …"), adding a
+  # nixpkgs pkg or guarding the import until the daemon boots.  Deliberately
+  # CONSERVATIVE — a missing pkg is a fast CI domino; a WRONG nixpkgs attr fails eval.
+  pythonEnv = python.withPackages (ps: with ps; [
+    # ── server + the reverse-proxy contract (main.py:5806+ boot path) ──
+    flask flask-cors werkzeug waitress
+    hypercorn h11 h2 wsproto      # ASGI primary (main.py:5860); h2/wsproto = HTTP2/WS
+    requests httpx certifi urllib3
+    # ── boot-critical (module-load / start_background_services) ──
+    beautifulsoup4 pytz redis python-dotenv pydantic sqlalchemy alembic greenlet
+    cryptography pyjwt cachetools apscheduler
+    psutil python-dateutil pyyaml jinja2 aiohttp websockets pillow numpy regex tqdm
+    packaging
+    # ── systemd Type=notify (if the service ever notifies) + gi (NOT needed headless) ──
+    systemd
+    # NOTE (CI dominoes to resolve on first build): pydantic in the 24.11 pin is the
+    # 1.10 series — Nunba pins pydantic 2.x; if a v2-only import crashes, bump the pin
+    # or add python310Packages.pydantic2. autobahn/crossbarhttp3 (WAMP) are LAZY —
+    # main.py only imports them inside _wamp_is_needed()/publish helpers, and OS mode
+    # is SSE-primary, so they are NOT boot-critical (left out on purpose).
+  ]);
 in
-pkgs.buildNpmPackage {
-  pname = "nunba-static";
+pkgs.stdenv.mkDerivation {
+  pname = "nunba";
   version = "1.0.0";
-
   src = nunbaSrc;
-  # package.json + package-lock.json live in the `landing-page/` subdir of the
-  # repo. fetchFromGitHub unpacks the tree under `${name}` (default "source"),
-  # so point the npm build at the CRA root inside it.
-  sourceRoot = "${nunbaSrc.name}/landing-page";
 
-  inherit npmDepsHash;
-
-  # `canvas` is an OPTIONAL dependency (lockfile `optional: true`) that needs
-  # cairo/pango + node-gyp to compile; react-pdf renders fine without it (the
-  # repo's own committed build proves the SPA builds without canvas). Omit
-  # optional native deps so the sandboxed build needs NO C toolchain and never
-  # tries (and fails) to gyp-build canvas — including the buildNpmPackage rebuild
-  # hook, which would otherwise hard-fail on canvas. `npm_config_omit` is honored
-  # by EVERY npm invocation (ci + rebuild) regardless of the wrapper's flag attr,
-  # so it is the actual guarantee; npmInstallFlags states the same intent.
-  # Both only affect install/rebuild — fetchNpmDeps still prefetches the FULL
-  # lock (it is a separate derivation), so npmDepsHash is unaffected.
-  npm_config_omit = "optional";
-  npmInstallFlags = [ "--omit=optional" ];
-
-  # Defensive: covers any non-optional dep whose install script shells out to
-  # node-gyp/python. The standard CRA toolchain (react-scripts 5.0.1, webpack 5,
-  # Terser, dart-sass) is pure-JS and needs none of this on its own.
-  nativeBuildInputs = [ pkgs.python3 ];
-
-  # buildNpmPackage default npmBuildScript = "build" -> `npm run build`:
-  #   prebuild (scripts/setup-env.sh) -> with .env.local/.env.production.enc
-  #     gitignored + absent, hits the copy-.env.example branch and exits 0
-  #     (harmless; needs no network, no openssl, no NUNBA_ENV_KEY), then
-  #   react-app-rewired build -> ./build
-  PUBLIC_URL = "/";                       # Keep assets root-absolute (/static/...)
-                                          # to match Nunba's no-basename
-                                          # <BrowserRouter>; the dist is served at
-                                          # an origin root (the mount shim is the
-                                          # sibling workstream — not built here).
-  REACT_APP_API_BASE_URL = backendUrl;    # Re-point the baked API base off the dev
-                                          # :5000 onto the HART backend (:6777).
-                                          # process-env wins: CRA's dotenv never
-                                          # overrides an already-set key.
-  DISABLE_ESLINT_PLUGIN = "true";         # .env (which set this for prod builds) is
-  ESLINT_NO_DEV_ERRORS = "true";          # gitignored, and .env.development is NOT
-                                          # loaded when NODE_ENV=production, so the
-                                          # ESLint-disable MUST come from the build
-                                          # env or a lint error would fail the build.
-  CI = "false";                           # CRA: CI=true makes warnings fatal.
-  CYPRESS_INSTALL_BINARY = "0";           # Block the cypress postinstall net-fetch
-  CYPRESS_SKIP_BINARY_INSTALL = "1";      # (no network in the sandbox).
-  GENERATE_SOURCEMAP = "false";           # Smaller/faster build.
-  NODE_OPTIONS = "--max-old-space-size=4096";
-
-  # The output is a static HTML/JS/CSS tree — no shebangs/ELF to patch, and the
-  # fixup phase would needlessly walk the whole bundle.
+  # Pure copy — no compile. The React dist is the separate nunbaStatic derivation.
+  dontConfigure = true;
+  dontBuild = true;
   dontFixup = true;
 
-  # CRA emits ./build relative to sourceRoot. Land it at $out/lib/nunba/static —
-  # exactly where hart-liquid-ui.nix points NUNBA_STATIC_DIR. The path suffix
-  # is the byte-for-byte contract; do not change it.
   installPhase = ''
     runHook preInstall
-    mkdir -p $out/lib/nunba/static
-    cp -r build/. $out/lib/nunba/static/
+    mkdir -p $out/lib/nunba
+
+    # Copy ONLY Nunba's own tree (HARTOS is not in the sandbox → auto-excluded).
+    cp -r ./. $out/lib/nunba/
+    chmod -R u+w $out/lib/nunba
+    rm -rf $out/lib/nunba/.git \
+           $out/lib/nunba/landing-page/node_modules \
+           $out/lib/nunba/landing-page/build
+
+    # ONE React artifact (nunbaStatic), reachable at BOTH:
+    #   • where main.py serves the SPA:  APP_DIR/landing-page/build  (main.py:390), and
+    #   • the legacy NUNBA_STATIC_DIR floor path: $out/lib/nunba/static.
+    # Both are symlinks to the SAME /nix/store path — cannot drift.
+    mkdir -p $out/lib/nunba/landing-page
+    ln -sfn ${nunbaStatic} $out/lib/nunba/landing-page/build
+    ln -sfn ${nunbaStatic} $out/lib/nunba/static
+
     runHook postInstall
   '';
+  # No $out/bin launcher: main.py IS the headless server (app.py's pywebview never
+  # runs in daemon mode). hart-nunba.nix's ExecStart calls
+  # `${passthru.python}/bin/python ${out}/lib/nunba/main.py` directly — the same
+  # pattern hart-backend.nix uses for hart_intelligence_entry (no launcher shim).
+
+  # Expose the Python env for the systemd unit (mirror hart-app.nix passthru.python).
+  passthru = {
+    python = pythonEnv;
+    inherit pythonEnv nunbaStatic;
+  };
 
   meta = with lib; {
-    description = "Nunba — HART OS desktop React UI (native static dist)";
+    description = "Nunba — full HART OS native daemon (Python + React, HARTOS/GUI/ML-excluded)";
     longDescription = ''
-      The Nunba landing-page React SPA, compiled to a static asset tree and
-      served from inside the HART OS glass shell by LiquidUIService via
-      NUNBA_STATIC_DIR. Replaces the previous runtime-AppImage-download
-      launcher: one native UI path, no second copy, no network fetch on boot.
+      The complete Nunba desktop companion (app.py's Flask app via main.py's
+      headless server + the whole desktop/* Python service layer + the React SPA),
+      packaged as a native HART OS daemon that binds a unix socket (no host TCP
+      port) and calls the native HARTOS backend on :6777. HARTOS is EXCLUDED (no
+      second copy); the GUI and the model/TTS stack are dropped (HART OS owns the
+      server-managed model+VRAM stack natively). LiquidUIService reverse-proxies
+      the socket same-origin inside the glass shell.
     '';
     homepage = "https://hevolve.ai";
     license = licenses.asl20;

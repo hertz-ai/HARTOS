@@ -413,6 +413,13 @@ in
           HART_LIQUID_UI_PORT = toString ui.port;
           NUNBA_STATIC_DIR = lib.mkIf ui.embedNunba
             "${pkgs.callPackage ../packages/nunba.nix { inherit hartSrc; }}/lib/nunba/static";
+          # When the native Nunba daemon runs (hart.nunba.enable), LiquidUI reverse-
+          # proxies the FULL Nunba (Python + React) over its unix socket instead of
+          # only serving the static React dist — same origin, no host port. The
+          # static dir above stays the graceful FLOOR (same /nix/store artifact the
+          # daemon serves, so it can't drift). Unset when the daemon is off → the
+          # existing static-only path is byte-for-byte unchanged (zero regression).
+          HART_NUNBA_SOCKET = lib.mkIf config.hart.nunba.enable config.hart.nunba.socket;
           PYTHONDONTWRITEBYTECODE = "1";
           PYTHONUNBUFFERED = "1";
         };
