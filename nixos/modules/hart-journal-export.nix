@@ -77,6 +77,10 @@ let
   #                 import it so the exclusion can never drift from the writer).
   isoLabel     = jx.isoLabel;
   bootLogLabel = config.hart.bootLog.label;
+  # A vfat partition with THIS label is a valid target even on an INTERNAL disk (the
+  # opt-in "no spare USB stick" path: shrink a partition, make a small FAT32 labelled
+  # HARTJRNL). Matched by blkid -L; the boot-medium + OS-disk exclusions still apply.
+  dedicatedLabel = jx.dedicatedLabel;
 
   # The GPU render verdict hart-gpu-probe writes (hardware|software). REUSED here
   # as pure CONTEXT in the dump header - we read the existing signal, we never run
@@ -101,6 +105,7 @@ let
     PHASE="''${1:-periodic}"
     ISO_LABEL="${isoLabel}"
     BOOTLOG_LABEL="${bootLogLabel}"
+    DEDICATED_LABEL="${dedicatedLabel}"
     MNT="${mnt}"
     GPU_FILE="${gpuRenderFile}"
     JOURNAL_CAP_BYTES=5000000
@@ -185,6 +190,21 @@ $_x"
       lsblk -lnpo NAME,TYPE,FSTYPE,PKNAME 2>/dev/null \
         | gawk '$2=="part" && $3=="vfat"{ pk=($4==""?"-":$4); print $1" "pk" 0" }' \
         > "$LISTF" 2>/dev/null || true
+      # ALSO accept a DELIBERATELY-created dedicated-label vfat partition (HARTJRNL by
+      # default) even on an INTERNAL disk: force=1 bypasses ONLY the removable gate —
+      # the is_excluded check below STILL refuses the boot medium + OS disks, so this
+      # can only ever land on the small partition the operator made on purpose (the
+      # "no spare USB stick, shrink D: and carve a 50 MB FAT32" case), never a data
+      # partition. Space-free label; resolved once via blkid -L.
+      if [ -n "$DEDICATED_LABEL" ]; then
+        _dl=$(blkid -L "$DEDICATED_LABEL" 2>/dev/null | head -n1) || _dl=""
+        if [ -n "$_dl" ] && [ -b "$_dl" ]; then
+          _dpk=$(lsblk -ndo pkname "$_dl" 2>/dev/null | head -n1) || _dpk=""
+          [ -n "$_dpk" ] || _dpk="-"
+          printf '%s %s 1\n' "$_dl" "$_dpk" >> "$LISTF" 2>/dev/null || true
+          log "dedicated-label target: $_dl (LABEL=$DEDICATED_LABEL; removable gate bypassed, exclude check still applies)"
+        fi
+      fi
     fi
 
     WROTE=0
@@ -308,6 +328,21 @@ in
         (frequent enough to catch the slide into a hang, infrequent enough not to
         thrash a slow USB stick). The capture always unmounts after each tick, so
         the stick is safe to remove between ticks.
+      '';
+    };
+
+    dedicatedLabel = lib.mkOption {
+      type = lib.types.str;
+      default = "HARTJRNL";
+      description = ''
+        A vfat partition with THIS label is ALSO a valid export target even on an
+        INTERNAL (non-removable) disk — the opt-in path for a fixed machine with no
+        spare USB stick: shrink an existing partition, create a small FAT32 partition
+        labelled HARTJRNL, and HART OS lands hart-journal-<host>.txt on it (readable
+        on Windows). SAFE: it can only ever target the dedicated partition you create
+        on purpose; the boot-medium (HART_OS) + HARTLOG + running-system-disk
+        exclusions still apply, so your real data partitions are never touched. Set to
+        "" to disable this internal-disk path (removable USB sticks still work).
       '';
     };
 
