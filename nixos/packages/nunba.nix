@@ -109,13 +109,26 @@ let
     GENERATE_SOURCEMAP = "false";
     NODE_OPTIONS = "--max-old-space-size=4096";
 
-    # autobahn/lib does `require('when/monitor/console')` for OPTIONAL debug
-    # monitoring; the resolved `when` version ships without monitor/console, so
-    # CRA's webpack-4 static resolver fails the production build with
-    # "Can't resolve 'when/monitor/console' in .../autobahn/lib" (R3 round-4
-    # build). Stub it to an empty module (autobahn only touches it for debug
-    # logging, never in production) at BOTH the hoisted and the nested `when`
-    # location — the standard no-eject workaround, no Nunba-repo change.
+    # autobahn/lib does `require('when/monitor/console')`. when@3.7.8 DOES ship
+    # monitor/console.js (verified) yet CRA's webpack-4 still fails "Can't resolve
+    # 'when/monitor/console' in .../autobahn/lib" (R3 round-4/5) — so the earlier
+    # preBuild stub either did not run (hook not honored) or landed off the resolve
+    # path. `postConfigure` runs AFTER `npm ci` (node_modules populated) and is
+    # reliably honored by buildNpmPackage; the loud markers make round-6 definitive.
+    postConfigure = ''
+      echo "=== HART preConfigure-stub: cwd=$(pwd) ==="
+      ls -la node_modules/when 2>&1 | head -4 || echo "(no node_modules/when)"
+      ls -la node_modules/when/monitor 2>&1 | head -8 || echo "(no when/monitor)"
+      find node_modules -maxdepth 4 -path '*when/monitor/console.js' 2>/dev/null || true
+      for d in node_modules/when node_modules/autobahn/node_modules/when; do
+        if [ -d "$d" ]; then
+          mkdir -p "$d/monitor"
+          [ -f "$d/monitor/console.js" ] || printf 'module.exports = {};\n' > "$d/monitor/console.js"
+          echo "HART stub ensured: $d/monitor/console.js -> $(ls -l "$d/monitor/console.js" 2>&1)"
+        fi
+      done
+      echo "=== HART preConfigure-stub done ==="
+    '';
     preBuild = ''
       for d in node_modules/when node_modules/autobahn/node_modules/when; do
         if [ -d "$d" ]; then
