@@ -924,7 +924,7 @@
       // Filter the PERSISTED icon set to ids that still exist in MANIFEST before
       // deciding whether to fall back to defaults(). Real-HW 2026-07-12: a
       // shell_session.json saved under an earlier build held desktop_icons whose ids
-      // are no longer in MANIFEST; the old `icons.length ? icons : defaults()` chose
+      // are no longer in MANIFEST; the old "icons.length ? icons : defaults()" chose
       // that non-empty-but-stale list, render() then silently dropped every id (it
       // only mounts ids present in MANIFEST), and defaults() was NEVER consulted ->
       // a completely EMPTY desktop. Resolving the persisted list against MANIFEST
