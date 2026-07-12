@@ -71,10 +71,32 @@ def test_render_tags_body_gpu_software(svc, monkeypatch):
 
 
 def test_render_tags_body_gpu_hardware(svc, monkeypatch):
+    # gpu-hardware now requires BOTH a hardware probe AND WebKit compositing on
+    # (preferHardwareGL), because the shell's per-frame effects run in the WebView
+    # (cairo unless compositing is on). A hardware probe with compositing OFF is a
+    # cairo box → gpu-software (see test_render_hardware_probe_but_cairo_is_software).
+    monkeypatch.setenv('LIQUID_UI_PREFER_HW_GL', '1')
     monkeypatch.setattr(lus, 'read_gpu_render_mode', lambda: 'hardware')
     body = _body_tag(svc.render_desktop_shell())
     assert 'gpu-hardware' in body
     assert 'gpu-software' not in body
+
+
+def test_render_hardware_probe_but_cairo_is_software(svc, monkeypatch):
+    """The real-HW 2026-07-12 fix: a box whose gpu-probe says 'hardware' but whose
+    WebView paints on cairo (preferHardwareGL unset → compositing OFF) must tag
+    <body gpu-software>, NOT gpu-hardware. Arming the GPU-only cinematic (hover
+    transforms, animated filter:blur) on a CPU renderer pegged the single WebKit
+    thread and HUNG the whole shell on orb hover, and left the static-colour floor
+    disengaged so the desktop read flat/monochromatic. The effect tier must track
+    the ACTUAL paint path, not just the compositor probe."""
+    monkeypatch.delenv('LIQUID_UI_PREFER_HW_GL', raising=False)
+    monkeypatch.setattr(lus, 'read_gpu_render_mode', lambda: 'hardware')
+    body = _body_tag(svc.render_desktop_shell())
+    assert 'gpu-software' in body, (
+        'a hardware-probe box with WebKit compositing OFF is a cairo renderer → the '
+        'shell effect tier must be gpu-software (else the orb-hover hang + flat floor)')
+    assert 'gpu-hardware' not in body
 
 
 def _perf_potato_line(html):
@@ -101,9 +123,11 @@ def test_perf_potato_true_under_software_verdict(svc, monkeypatch):
 
 
 def test_perf_potato_false_under_hardware_verdict_and_capable_theme(svc, monkeypatch):
-    """Converse: a capable GPU + a non-potato theme keeps the full cinematic
-    (PERF.potato false), so the GPU gate is the ONLY thing the software branch
-    flips — it does not strand a hardware box in reduced effects."""
+    """Converse: a capable GPU + WebKit compositing on + a non-potato theme keeps
+    the full cinematic (PERF.potato false). Compositing must be opted in
+    (preferHardwareGL) for the hardware effect tier — a hardware probe alone on a
+    cairo WebView is gpu-software (the real-HW hover-hang fix)."""
+    monkeypatch.setenv('LIQUID_UI_PREFER_HW_GL', '1')
     monkeypatch.setattr(lus, 'read_gpu_render_mode', lambda: 'hardware')
     monkeypatch.setattr(
         'integrations.agent_engine.theme_service.ThemeService.get_active_theme',
@@ -157,8 +181,11 @@ def test_body_webkit_flat_when_compositing_off_even_on_hardware_probe(svc, monke
     assert 'webkit-flat' in body, (
         "compositing-off render must tag <body webkit-flat> to solidify the glass; "
         "without it translucent panels render see-through (#151)")
-    # The gpu verdict tag is independent and unchanged (it stays the probe value).
-    assert 'gpu-hardware' in body
+    # The effect tier now also reflects the cairo reality (2026-07-12): a hardware
+    # probe with compositing OFF is gpu-software, so the GPU-only per-frame effects
+    # shed (fixes the orb-hover hang) AND the glass solidifies via BOTH triggers.
+    assert 'gpu-software' in body
+    assert 'gpu-hardware' not in body
 
 
 def test_body_not_webkit_flat_when_hardware_gl_opted_in(svc, monkeypatch):

@@ -464,8 +464,14 @@ body.webkit-flat .ctx-menu,
 body.webkit-flat .agent-pill {
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
-  background: rgba(18,19,28,0.94);
-  box-shadow: 0 2px 10px rgba(0,0,0,0.34);
+  /* Static brand-tinted glass (GF1: keep COLOUR depth on the software floor at ZERO
+     per-frame cost - a gradient is free, backdrop-filter is not). Teal LEADS, violet
+     ACCENTS (b1.2); the opaque dark core keeps text legible. Replaces the flat
+     colourless grey rgba(18,19,28,.94) that read MONOCHROMATIC on real HW (2026-07-12,
+     the mockup gap): cairo cannot paint backdrop-filter, so the frosted brand colour
+     collapsed to grey. This restores it with a one-time raster. */
+  background: linear-gradient(155deg, rgba(0,230,195,0.07), rgba(20,22,32,0.95) 46%, rgba(155,92,255,0.08));
+  box-shadow: 0 2px 10px rgba(0,0,0,0.34), inset 0 0 0 1px rgba(0,230,195,0.10);
 }
 
 /* The omnibox / command bar is the keystroke hot path: a blurred backdrop here

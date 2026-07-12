@@ -1150,7 +1150,21 @@ class LiquidUIService:
         # cinematic glass re-rasterises on the CPU every frame, so we tag <body>
         # `gpu-software` (hartResponsive.css strips the GPU-only effects from the
         # hot surfaces) AND force the potato tier below.
-        gpu_mode = read_gpu_render_mode()  # 'hardware' | 'software'
+        # The shell's per-frame effects (hover transforms, filter:blur, continuous
+        # animation) run in the WebView, which paints on CAIRO (CPU) unless WebKit
+        # accelerated compositing is on (hart.liquidUI.preferHardwareGL). The gpu-render
+        # probe only reflects the COMPOSITOR's GLES capability, NOT the WebView paint
+        # path — so a box whose probe says 'hardware' but whose WebView is cairo (the
+        # default) ARMED GPU-only effects on a CPU renderer: hovering the orb then
+        # re-rasterised a 60fps canvas + an animated software blur on the ONE WebKit
+        # thread and HUNG the whole shell, and the static-glow software floor (below)
+        # never engaged so the cinematic looked FLAT (real-HW 2026-07-12, the mockup
+        # gap). Gate the effect tier on the ACTUAL paint path: 'hardware' ONLY when the
+        # probe says hardware AND WebKit compositing is actually on. webkit_compositing
+        # is the truthful renderer signal (also drives the glass floor below).
+        webkit_compositing = os.environ.get('LIQUID_UI_PREFER_HW_GL', '0') == '1'
+        gpu_render_verdict = read_gpu_render_mode()  # compositor GLES capability probe
+        gpu_mode = 'hardware' if (gpu_render_verdict == 'hardware' and webkit_compositing) else 'software'
         gpu_body_class = 'gpu-' + gpu_mode  # gpu-software | gpu-hardware
 
         # ── Glass-opaque fallback signal (#151 transparent-windows) ───────────────
@@ -1678,10 +1692,10 @@ img{-webkit-user-drag:none;user-select:none}
 .hart-ambient{position:fixed;inset:-12%;z-index:1;pointer-events:none;opacity:0.5;
   filter:blur(64px) saturate(140%);
   background:
-    radial-gradient(38% 42% at 22% 26%, rgba(0,212,170,0.42), transparent 70%),
-    radial-gradient(34% 40% at 80% 30%, rgba(108,99,255,0.40), transparent 70%),
-    radial-gradient(42% 46% at 60% 80%, rgba(34,176,255,0.30), transparent 72%),
-    radial-gradient(30% 36% at 28% 82%, rgba(255,120,180,0.24), transparent 72%);
+    radial-gradient(38% 42% at 22% 26%, rgba(0,230,195,0.44), transparent 70%),
+    radial-gradient(34% 40% at 80% 30%, rgba(155,92,255,0.44), transparent 70%),
+    radial-gradient(42% 46% at 60% 80%, rgba(41,197,255,0.32), transparent 72%),
+    radial-gradient(30% 36% at 28% 82%, rgba(255,46,154,0.32), transparent 72%);
   animation:hart-ambient-drift 30s ease-in-out infinite alternate}
 @keyframes hart-ambient-drift{0%{transform:translate3d(0,0,0) scale(1)}
   50%{transform:translate3d(2.4%,-2.2%,0) scale(1.08)}100%{transform:translate3d(-2.4%,2.2%,0) scale(1.05)}}

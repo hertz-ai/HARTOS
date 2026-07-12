@@ -16,6 +16,7 @@ source-shape test — it drives ``render_desktop_shell`` and the live static rou
 """
 from __future__ import annotations
 
+import os
 from unittest.mock import patch
 
 import pytest
@@ -26,13 +27,16 @@ from integrations.agent_engine.liquid_ui_service import LiquidUIService
 def _render(potato: bool) -> str:
     """Render the shell with the perf tier forced on/off via ThemeService.
 
-    The GPU verdict is pinned to 'hardware' (a CAPABLE GPU) so this file isolates
-    the THEME-tier gate (``disable_blur``). The orthogonal software-render gate —
-    potato also turns on when ``read_gpu_render_mode()`` is 'software' — is
-    covered behaviourally in test_shell_software_render_perf.py.
+    The GPU verdict is pinned to 'hardware' AND WebKit compositing is opted in
+    (LIQUID_UI_PREFER_HW_GL=1) so this file isolates the THEME-tier gate
+    (``disable_blur``) on a genuine hardware effect tier. Without compositing on, a
+    hardware probe is a cairo box → gpu-software (the real-HW hover-hang fix), which
+    is covered in test_shell_software_render_perf.py. The two orthogonal
+    software-render gates (probe='software' AND compositing-off) live there too.
     """
     theme = {'performance': {'disable_blur': potato}}
-    with patch('integrations.agent_engine.theme_service.ThemeService'
+    with patch.dict(os.environ, {'LIQUID_UI_PREFER_HW_GL': '1'}), \
+         patch('integrations.agent_engine.theme_service.ThemeService'
                '.get_active_theme', return_value=theme), \
          patch('integrations.agent_engine.theme_service.ThemeService'
                '.get_css_variables', return_value=':root{--hart-accent:#00D4AA}'), \

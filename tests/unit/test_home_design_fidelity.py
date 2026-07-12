@@ -79,9 +79,12 @@ def test_ambient_div_emitted_on_capable_gpu_default(svc, monkeypatch):
 
 def test_ambient_div_suppressed_for_disable_blur_on_capable_gpu(svc, monkeypatch):
     """The one case the ambient stays OFF: an explicit theme disable_blur on a
-    capable GPU. The user asked for no blur and the box can otherwise afford the
-    full cinematic, so honour that (the software floor is the only thing that
-    re-enables the static ambient)."""
+    genuinely GPU-composited box (hardware probe AND WebKit compositing on). The
+    user asked for no blur and the box can otherwise afford the full cinematic, so
+    honour that. (On a cairo box - compositing off - the box is gpu-software and the
+    software floor keeps the STATIC ambient regardless, since static colour is free
+    per GF1; that path is covered by the software-verdict test above.)"""
+    monkeypatch.setenv('LIQUID_UI_PREFER_HW_GL', '1')
     monkeypatch.setattr(lus, 'read_gpu_render_mode', lambda: 'hardware')
     _set_theme(monkeypatch, disable_blur=True)
     html = svc.render_desktop_shell()
