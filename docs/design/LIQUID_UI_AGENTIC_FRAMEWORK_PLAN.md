@@ -74,3 +74,54 @@ second palette, no second transport. Behavioural test per step (render + assert 
 component reaches the DOM). Design-checklist: this REALISES i1/i2 (LLM composes the surface)
 and keeps b1.2 teal on functional signifiers as the DEFAULT while making the ambient/mood
 fully reskinnable. Real-HW verify each design renders + all components work.
+
+---
+
+## Audit 2026-07-13 — PENDING gaps (erected ≠ load-bearing)
+
+Two parallel read-only audits (impl + tests) against these requirements. Server spine is
+solid + governed (one allowlist gate: kill-switch/rate-cap/XSS/audit, reused by
+agent_ui_update + register_component_type + compose_home; HART-agents-only; both presets
+shipped; theme-var quad load-bearing on CSS; compose_home hero/rows works end-to-end via
+`/api/home/compose`). But the AGENTIC promise is only half-wired to the client:
+
+### P0 — a steward ask that is presently dead end-to-end
+- **G1 LLM `mood` handle dies before the DOM.** Produced by `_llm_curate_home`
+  (liquid_ui_service.py:8235), carried by `compose_home(mood=)` (:1246) + `compose_home_now`
+  (:1282), then DROPPED: `/api/home/compose` omits the mood kwarg (:6438); `HartHome.compose`
+  merges only hero+rows (hartHome.js:909); the SSE consumer never calls `applyPalette`
+  (:5850); NO mood-id→palette resolver on the client. P1 probe asserts mood is STORED, not
+  rendered. → wire route→compose→SSE→applyPalette + add a mood→palette resolver.
+- **G2 `register_component_type` has no caller + custom types can't render.** Registry works
+  (:1098) but only tests invoke it; no agent tool/route; client falls back to JSON.stringify
+  for unknown types (:6129); stored `template` (:1151) has no renderer. → add an agent
+  entry point + a client renderer that honours the registered spec/template.
+- **G3 Aura not live-switchable from the desktop.** Presets ship, but the picker `PRESETS`
+  (hartPersonalize.js:79) + keyword router (:5531) have no `aura`, the shell never fetches
+  `/api/appearance/presets` (which includes it), and `applyPreset` force-reloads (:5553)
+  vs the plan's flip-live. Only Aura MOODS are live. → surface server presets in the picker +
+  make preset apply live (no reload).
+
+### P1
+- **G4 SSE store→client round-trip is NOT integration-tested.** `/api/notifications/stream`
+  is never fetched by any test; every "SSE" assertion stops at the in-process
+  `_agent_components` dict. → a Flask test_client SSE-drain integration test.
+- **G5 component `events`/`behaviors` are declarative-only.** `metric` declares emits:['click']
+  (:452) but its render branch has no click emitter. → wire declared events on the client.
+- **G6 agent-readable spec catalogue has no consumer.** `list/get_component_spec` called only
+  by tests; the local intelligence has no wired accessor. → expose to the composer.
+
+### P2 (minor erected-not-load-bearing)
+- mood dock `window.hartRenderMoodDock` defined + unit-tested but never mounted, no CSS.
+- `--hart-density` only scopes the Personalize panel, not the desktop.
+- glow bloom applies only after the Personalize hub is opened once (ensureFeelStyle at boot).
+- plain `--hart-amb-1..4` hex vars unread (only the `-rgb` triples consumed); `--hart-a2`
+  consumed by one marketplace gradient only.
+
+### Test-coverage truth
+Integration-covered: compose_home + agent_ui_update WRITE path (route→store), shell
+render/serve path, ThemeService apply routes. Unit/probe only: component registry,
+_llm_curate_home/mood, hartPersonalize JS, hhCardRow, quad palette vars. NO behavioural
+coverage: the SSE store→client leg. CI-only (node) + vacuous-pass risk:
+test_shell_hhcardrow.mjs / test_liquid_ui_shell_panels.mjs print ALL-PASS+exit0 if neither
+node nor a rendering python is present.
