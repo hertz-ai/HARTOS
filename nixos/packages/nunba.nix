@@ -98,6 +98,12 @@ let
     # fix; neither flag changes npmDepsHash (prefetched from package-lock.json alone).
     npmFlags = [ "--legacy-peer-deps" ];
     npmInstallFlags = [ "--legacy-peer-deps" "--ignore-scripts" ];
+    # buildNpmPackage runs a SEPARATE `npm rebuild` after `npm ci` that re-invokes
+    # node-gyp on native modules — so install-time --ignore-scripts is not enough:
+    # round-8 failed with `gyp ERR! ... node-gyp rebuild` on `canvas`. Ignore scripts
+    # in the rebuild too; canvas ends up installed-but-unbuilt (never imported at
+    # build — react-pdf guards it), while pure-JS deps (autobahn's `when`) are intact.
+    npmRebuildFlags = [ "--ignore-scripts" ];
     nativeBuildInputs = [ pkgs.python3 ];
 
     PUBLIC_URL = "/";                     # root-absolute assets (/static/...) — the
