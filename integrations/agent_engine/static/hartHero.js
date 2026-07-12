@@ -152,27 +152,54 @@
       var q = (text || '').toLowerCase().trim();
       if (q.length < 2) return false;
       var allowSub = q.length >= 3;
-      function hit(id, title) {
+      // subsequence: every char of q appears in s IN ORDER — tolerates typos/gaps
+      // ('setings'->'Settings', 'notifcations'->'Notifications', 'trmnl'->'Terminal').
+      // Fuzzy, so gated on allowSub AND ranked LAST, so any exact/prefix/substring
+      // always wins and a long real question never resolves to a stray app.
+      function subseq(s) {
+        var i = 0; for (var j = 0; j < s.length && i < q.length; j++) { if (s.charAt(j) === q.charAt(i)) i++; } return i === q.length;
+      }
+      // rank(id,title) -> match quality (0=best) or -1 = no match.
+      function rank(id, title) {
         id = (id || '').toLowerCase(); title = (title || '').toLowerCase();
-        if (id === q || title === q) return true;            // exact
-        if (id.indexOf(q) === 0 || title.indexOf(q) === 0) return true;  // prefix
-        return allowSub && (id.indexOf(q) >= 0 || title.indexOf(q) >= 0); // substring
+        if (id === q || title === q) return 0;                                  // exact
+        if (id.indexOf(q) === 0 || title.indexOf(q) === 0) return 1;            // prefix
+        if (allowSub && (id.indexOf(q) >= 0 || title.indexOf(q) >= 0)) return 2; // substring
+        if (allowSub && (subseq(id) || subseq(title))) return 3;                // fuzzy subsequence
+        return -1;
+      }
+      // Collect the BEST-ranked candidate across the MANIFEST + start-menu items
+      // (shortest title breaks a rank tie) and launch THAT — so a typo resolves to
+      // the closest real app, not the first stray subsequence hit. Single match path
+      // (the one rank() fn over both sources); launch still via the canonical
+      // openPanel(id) / .start-item click.
+      var best = null;  // { rank, len, launch }
+      function consider(r, title, launch) {
+        if (r < 0) return;
+        var len = (title || '').length;
+        if (!best || r < best.rank || (r === best.rank && len < best.len)) best = { rank: r, len: len, launch: launch };
       }
       // 1) Canonical MANIFEST (the real registry) — launch via openPanel(id).
       var M = window.MANIFEST;
       if (M && typeof window.openPanel === 'function') {
         for (var id in M) {
           if (!Object.prototype.hasOwnProperty.call(M, id)) continue;
-          if (hit(id, (M[id] && M[id].title) || '')) { window.openPanel(id); return true; }
+          (function (pid) {
+            var t = (M[pid] && M[pid].title) || '';
+            consider(rank(pid, t), t, function () { window.openPanel(pid); });
+          })(id);
         }
       }
       // 2) System panels (+ anything else in the start menu) — click the rendered
       //    .start-item, which invokes the same canonical openPanel(this.dataset.id).
       var items = document.querySelectorAll('.start-item');
       for (var i = 0; i < items.length; i++) {
-        var el = items[i];
-        if (hit(el.dataset && el.dataset.id, el.dataset && el.dataset.title)) { el.click(); return true; }
+        (function (node) {
+          var eid = node.dataset && node.dataset.id, et = node.dataset && node.dataset.title;
+          consider(rank(eid, et), et, function () { node.click(); });
+        })(items[i]);
       }
+      if (best) { best.launch(); return true; }
       return false;
     }
 
