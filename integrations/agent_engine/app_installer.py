@@ -787,18 +787,39 @@ class AppInstaller:
             pass
 
     def _install_flatpak(self, req: InstallRequest) -> InstallResult:
-        """Install a Flatpak package (--user scope + writable dir; see __init__)."""
-        ref = req.source.replace('flathub:', '').replace('flatpak:', '')
-        name = req.name or ref
+        """Install a Flatpak package (--user scope + writable dir; see __init__).
+
+        Two source shapes, one handler (no parallel path):
+          - a bare ref (``flathub:org.gimp.GIMP`` / ``org.gimp.GIMP``) →
+            ``flatpak --user install -y flathub <ref>``;
+          - a ``.flatpakref`` FILE on disk → ``flatpak --user install -y
+            <file>``. The file self-describes its remote + ref, so passing a
+            ``flathub`` positional would make flatpak look for a ref literally
+            NAMED after the file path inside the flathub remote (which never
+            exists) and fail. detect_platform() maps ``.flatpakref`` to FLATPAK,
+            so this handler MUST accept the file form or the advertised
+            ``.flatpakref`` support is dead on arrival.
+        """
         self._ensure_flathub()
+        src = req.source
+        is_ref_file = src.lower().endswith('.flatpakref') and os.path.isfile(src)
+        if is_ref_file:
+            name = req.name or os.path.splitext(os.path.basename(src))[0]
+            app_id = name
+            cmd = ['flatpak', '--user', 'install', '-y', src]
+        else:
+            ref = src.replace('flathub:', '').replace('flatpak:', '')
+            name = req.name or ref
+            app_id = ref
+            cmd = ['flatpak', '--user', 'install', '-y', 'flathub', ref]
         try:
             result = subprocess.run(
-                ['flatpak', '--user', 'install', '-y', 'flathub', ref],
-                capture_output=True, text=True, timeout=300, env=self._flatpak_env())
+                cmd, capture_output=True, text=True, timeout=300,
+                env=self._flatpak_env())
             if result.returncode == 0:
                 return InstallResult(
                     success=True, platform='flatpak', name=name,
-                    app_id=ref)
+                    app_id=app_id)
             return InstallResult(
                 success=False, platform='flatpak', name=name,
                 error=result.stderr.strip()[:500])

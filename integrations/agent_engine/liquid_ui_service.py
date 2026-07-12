@@ -2959,6 +2959,11 @@ const MANIFEST = {manifest_json};
 // (hartDesktop.js gates on window.MANIFEST). Expose it explicitly.
 window.MANIFEST = MANIFEST;
 const SYSTEM_PANELS = {system_json};
+// Expose to window so the external desktop layer (hartDesktop.js) can place
+// NATIVE system panels (Files, App Store, This PC …) as desktop icons too — it
+// resolves an icon id against window.MANIFEST OR window.SYSTEM_PANELS (one
+// resolver, no parallel registry). openPanel already dispatches system ids.
+window.SYSTEM_PANELS = SYSTEM_PANELS;
 const GROUPS = {groups_json};
 // W4 Start-menu PINNED ids + Settings aggregator sections (composition only —
 // each is a list of EXISTING panel ids from shell_manifest). buildStartMenu and
@@ -3867,6 +3872,7 @@ function loadSystemPanel(id, body) {{
   else if(id==='print_manager') loadPrintManagerPanel(container);
   else if(id==='media_library') loadMediaLibraryPanel(container);
   else if(id==='file_manager') loadFileManagerPanel(container);
+  else if(id==='my_computer') loadMyComputerPanel(container);
   else if(id==='terminal') loadTerminalPanel(container);
   else if(id==='user_accounts') loadUserAccountsPanel(container);
   else if(id==='notification_center') loadNotificationCenterPanel(container);
@@ -4371,6 +4377,51 @@ function browseDir(path) {{
   // Legacy entry kept for any stray caller — routes into the canonical module.
   if (window.HartFiles && window.HartFiles.navigate) window.HartFiles.navigate(path);
 }}
+// Open the canonical File Explorer AT a given path (used by This PC drive rows).
+// Reuses the SAME file_manager panel + HartFiles singleton — no second browser.
+// If Files is already open, just navigate; otherwise open it and navigate once
+// its own initial (home) load has settled so the drive view is the final state.
+function openFilesAt(path) {{
+  const already = !!panels['file_manager'];
+  openPanel('file_manager');
+  const nav = function(){{ if (window.HartFiles && window.HartFiles.navigate) window.HartFiles.navigate(path); }};
+  if (already) {{ nav(); bringToFront('file_manager'); }}
+  else setTimeout(nav, 240);
+}}
+
+// ═══ This PC / My Computer ═══
+function loadMyComputerPanel(el) {{
+  // Drives + partitions launcher. Reuses the EXISTING /api/shell/storage read-op
+  // (psutil partitions) and hands browsing off to the canonical File Explorer via
+  // openFilesAt — there is no parallel file browser here, just a drive index.
+  fetch(SHELL+'/api/shell/storage',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
+    const parts = data.partitions||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">This PC</div>';
+    if(parts.length===0) html += '<div class="ds-body-md ds-text-muted">No drives detected</div>';
+    else {{
+      html += '<div class="ds-section-label">Drives &amp; Partitions</div><div class="ds-stagger">';
+      parts.forEach(p=>{{
+        const esc = s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+        const pct = p.percent||0;
+        const label = esc(p.device||p.mount||'Drive');
+        const sub = esc((p.fstype||'')+' \\u00b7 '+(p.free_gb||0).toFixed(1)+' GB free of '+(p.total_gb||0).toFixed(1)+' GB');
+        html += '<div class="ds-list-item ds-list-item-interactive" data-mount="'+esc(p.mount||'')+'"'+
+          ' onclick="openFilesAt(this.dataset.mount)" title="Open '+esc(p.mount||'')+'">'+
+          '<span class="mi material-icons-round ds-list-item-icon" style="color:var(--hart-accent)">'+(pct>=90?'sd_card_alert':'storage')+'</span>'+
+          '<div class="ds-list-item-content">'+
+          '<div class="ds-list-item-primary">'+label+' <span class="ds-text-muted" style="font-weight:400">'+esc(p.mount||'')+'</span></div>'+
+          '<div class="ds-list-item-secondary">'+sub+'</div>'+
+          dsMetricBar('', pct, '%')+
+          '</div><span class="mi material-icons-round ds-text-muted">chevron_right</span></div>';
+      }});
+      html += '</div>';
+      html += '<div class="ds-body-sm ds-text-muted" style="margin-top:10px">'+
+        (data.used_gb||0).toFixed(1)+' GB used of '+(data.total_gb||0).toFixed(1)+' GB across all drives</div>';
+    }}
+    html += '</div>';
+    el.innerHTML = html;
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Drives unavailable</div>'; }});
+}}
 
 // ═══ Terminal ═══
 function loadTerminalPanel(el) {{
@@ -4845,19 +4896,36 @@ function appStoreSearch() {{
   }}).catch(()=>{{ r.innerHTML='<div class="ds-body-md ds-text-muted">Search failed</div>'; }});
 }}
 
-// ═══ App Permissions ═══
+// ═══ App Permissions & Uninstall (installed-apps registry) ═══
 function loadAppPermissionsPanel(el) {{
   fetch(SHELL+'/api/apps/installed',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const apps = data.apps||[];
-    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">App Permissions</div><div class="ds-stagger">';
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Installed Apps</div><div class="ds-stagger">';
     if(apps.length===0) html += '<div class="ds-body-md ds-text-muted">No apps installed</div>';
-    else apps.slice(0,20).forEach(a=>{{
-      html += dsStatusRow('admin_panel_settings', a.name||a.id, a.platform||'system',
-        'var(--hart-muted)',{{sublabel:(a.permissions||[]).join(', ')||'No special permissions'}});
+    else apps.slice(0,40).forEach(a=>{{
+      // data-* attributes carry id/platform/name safely (backslashes, quotes) to
+      // the shared uninstall flow (window.hartUninstallApp) — the EXACT same
+      // confirm + POST /api/apps/uninstall the desktop-icon right-click uses.
+      const esc = s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+      const aid = esc(a.app_id||a.id||a.name||'');
+      const plat = esc(a.platform||'');
+      const nm = esc(a.name||a.app_id||a.id||'');
+      const rm = '<button class="ds-btn ds-btn-secondary ds-btn-sm" data-aid="'+aid+'" data-plat="'+plat+'"'+
+        ' data-nm="'+nm+'" onclick="appRegistryUninstall(this)">Uninstall</button>';
+      html += dsStatusRow('admin_panel_settings', a.name||a.app_id||a.id, a.platform||'system',
+        'var(--hart-muted)',{{sublabel:(a.permissions||[]).join(', ')||'No special permissions', trailing:rm}});
     }});
     html += '</div></div>';
     el.innerHTML = html;
   }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">App permissions unavailable</div>'; }});
+}}
+// Uninstall from the installed-apps registry: delegates to the SHARED flow
+// (hartDesktop.js window.hartUninstallApp) so there is one confirm + one endpoint
+// (/api/apps/uninstall -> app_installer.uninstall), then refreshes the list.
+function appRegistryUninstall(btn) {{
+  if(!btn) return;
+  const refresh = function(){{ const host=document.getElementById('sys-app_permissions'); if(host) loadAppPermissionsPanel(host); }};
+  if(window.hartUninstallApp) window.hartUninstallApp(btn.dataset.aid, btn.dataset.plat, btn.dataset.nm, refresh);
 }}
 
 // ═══ Battery Monitor ═══

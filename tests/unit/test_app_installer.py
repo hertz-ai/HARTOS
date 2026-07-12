@@ -345,6 +345,60 @@ class TestFlatpakHandler(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn('not available', result.error)
 
+    @patch('subprocess.run')
+    def test_flatpak_nonzero_exit_fails(self, mock_run):
+        """A non-zero flatpak exit must be reported as failure with the stderr
+        surfaced — not swallowed into a silent success."""
+        mock_run.return_value = MagicMock(
+            returncode=1, stderr='error: nothing matches org.bad.App')
+        result = self.installer._install_flatpak(
+            InstallRequest(source='flathub:org.bad.App'))
+        self.assertFalse(result.success)
+        self.assertIn('nothing matches', result.error)
+
+    @patch('subprocess.run')
+    def test_flatpak_uses_user_scope_and_writable_dir(self, mock_run):
+        """Regression guard for the 98a307af --user fix: the INSTALL invocation
+        must carry --user and run with FLATPAK_USER_DIR pointed at the writable
+        per-user dir (system scope is denied to the sandboxed hart service)."""
+        mock_run.return_value = MagicMock(returncode=0)
+        self.installer._install_flatpak(
+            InstallRequest(source='flathub:org.gimp.GIMP'))
+        # Last call is the actual install (an earlier call is _ensure_flathub's
+        # remote-add). Find the install invocation among the recorded calls.
+        install_calls = [
+            c for c in mock_run.call_args_list if 'install' in c[0][0]]
+        self.assertTrue(install_calls, 'no flatpak install call was made')
+        cmd = install_calls[-1][0][0]
+        self.assertIn('--user', cmd)
+        env = install_calls[-1].kwargs.get('env') or {}
+        self.assertEqual(
+            env.get('FLATPAK_USER_DIR'), self.installer._flatpak_dir)
+
+    @patch('subprocess.run')
+    def test_flatpakref_file_installed_by_path(self, mock_run):
+        """A .flatpakref FILE must install by path (the file self-describes its
+        remote+ref) — NOT via a 'flathub' positional, which would make flatpak
+        hunt for a ref named after the file path and fail. Guards the advertised
+        .flatpakref support (detect_platform maps it to FLATPAK)."""
+        mock_run.return_value = MagicMock(returncode=0)
+        with tempfile.NamedTemporaryFile(
+                suffix='.flatpakref', delete=False) as f:
+            f.write(b'[Flatpak Ref]\nName=org.gimp.GIMP\n')
+            src = f.name
+        try:
+            result = self.installer._install_flatpak(
+                InstallRequest(source=src))
+            self.assertTrue(result.success)
+            install_calls = [
+                c for c in mock_run.call_args_list if 'install' in c[0][0]]
+            cmd = install_calls[-1][0][0]
+            # The file path is passed directly; NO 'flathub' remote positional.
+            self.assertIn(src, cmd)
+            self.assertNotIn('flathub', cmd)
+        finally:
+            os.unlink(src)
+
 
 class TestAppImageHandler(unittest.TestCase):
     """Tests for _install_appimage."""
@@ -432,6 +486,25 @@ class TestWindowsHandler(unittest.TestCase):
             # Verify msiexec used for .msi
             cmd = mock_run.call_args[0][0]
             self.assertIn('msiexec', cmd)
+        finally:
+            os.unlink(path)
+
+    @patch('subprocess.run')
+    @patch('shutil.which', return_value='/usr/bin/wine64')
+    def test_windows_nonzero_exit_fails(self, _which, mock_run):
+        """Regression guard: wine's non-zero exit is a reliable FAILURE and must
+        report success=False (this used to return success=True unconditionally,
+        pinning a desktop icon that launched nothing)."""
+        mock_run.return_value = MagicMock(
+            returncode=1, stderr='wine: cannot find installer.exe')
+        with tempfile.NamedTemporaryFile(suffix='.exe', delete=False) as f:
+            f.write(b'MZ' + b'\x00' * 100)
+            path = f.name
+        try:
+            result = self.installer._install_windows(
+                InstallRequest(source=path))
+            self.assertFalse(result.success)
+            self.assertIn('wine exited 1', result.error)
         finally:
             os.unlink(path)
 

@@ -424,6 +424,16 @@ SYSTEM_PANELS = {
         'image': '/shell/static/app_art/app-files.svg',
         'apis': ['/api/shell/files/browse', '/api/shell/files/recent'],
     },
+    # This PC / My Computer — the drives + partitions launcher. NOT a second file
+    # browser: its native renderer (liquid_ui_service.loadMyComputerPanel) lists
+    # the partitions from the EXISTING /api/shell/storage read-op and hands each
+    # drive off to the canonical File Explorer (openFilesAt -> file_manager) for
+    # actual browsing. 'my computer' resolves via the id, 'this pc' via the title.
+    'my_computer': {
+        'title': 'This PC', 'icon': 'computer',
+        'group': 'System', 'default_size': [640, 520],
+        'apis': ['/api/shell/storage'],
+    },
     'terminal': {
         'title': 'Terminal', 'icon': 'terminal',
         'group': 'System', 'default_size': [800, 500],
@@ -587,7 +597,11 @@ SYSTEM_PANELS = {
                  '/api/apps/install', '/api/apps/uninstall'],
     },
     'app_permissions': {
-        'title': 'App Permissions', 'icon': 'admin_panel_settings',
+        # Also the installed-apps REGISTRY: the native renderer lists every
+        # installed app with an Uninstall control wired to app_installer.uninstall
+        # (via /api/apps/uninstall). 'uninstall' + 'remove' in the title so both
+        # intuitive names surface this one panel (no separate uninstall app).
+        'title': 'App Permissions & Uninstall', 'icon': 'admin_panel_settings',
         'group': 'System', 'default_size': [700, 500],
         'apis': ['/api/apps/installed',
                  '/api/apps/{app_id}/permissions',
@@ -784,6 +798,7 @@ ICON_COLOR_OVERRIDES = {
     'wifi': '#42A5F5', 'bluetooth': '#2979FF', 'battery_full': '#66BB6A',
     'volume_up': '#26A69A', 'monitor_heart': '#EF5350', 'monitoring': '#FF7043',
     'devices': '#78909C', 'print': '#90A4AE', 'language': '#42A5F5',
+    'computer': '#42A5F5',
     'schedule': '#5C6BC0', 'delete': '#FF7043', 'system_update': '#66BB6A',
     # money / rewards
     'payments': '#66BB6A', 'emoji_events': '#FFD54F', 'leaderboard': '#FFA726',
@@ -894,8 +909,8 @@ SETTINGS_SECTIONS = [
                          'nightlight', 'font_manager', 'workspaces']),
     ('Network & Internet', ['network', 'wifi_manager', 'vpn_manager',
                             'bluetooth_manager', 'hotspot', 'dns_settings']),
-    ('Devices', ['display', 'audio', 'power', 'storage_manager', 'devices',
-                 'drivers', 'print_manager', 'screen_rotation']),
+    ('Devices', ['display', 'audio', 'power', 'my_computer', 'storage_manager',
+                 'devices', 'drivers', 'print_manager', 'screen_rotation']),
     ('Privacy & Security', ['security', 'firewall', 'privacy', 'app_permissions',
                             'accessibility']),
     ('Accounts', ['user_accounts', 'hart_identity']),

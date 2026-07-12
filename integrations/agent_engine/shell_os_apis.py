@@ -58,6 +58,19 @@ def _get_allowed_roots():
             rp = os.path.realpath(p.strip())
             if os.path.isdir(rp):
                 roots.append(rp)
+    # This PC / partition browsing: admit every real disk mountpoint reported by
+    # psutil (the SAME read-only source the Storage + This-PC panels use), so a
+    # drive root like C:\ or /mnt/data opens in the file manager instead of 403.
+    # Read paths only, and every shell route is _require_shell_auth (local-only)
+    # gated — this widens what the local desktop session can browse, nothing more.
+    try:
+        import psutil
+        for part in psutil.disk_partitions(all=False):
+            mp = os.path.realpath(part.mountpoint)
+            if os.path.isdir(mp) and mp not in roots:
+                roots.append(mp)
+    except Exception:
+        pass
     _ALLOWED_ROOTS = roots
     return roots
 

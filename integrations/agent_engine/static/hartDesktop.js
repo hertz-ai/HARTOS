@@ -42,6 +42,13 @@
   })();
 
   function M() { return window.MANIFEST || {}; }
+  // Native system panels (Files, App Store, This PC …) live in window.SYSTEM_PANELS,
+  // NOT the Nunba MANIFEST. The desktop layer must place them as icons too, so an
+  // id resolves against BOTH registries through this ONE resolver — no parallel
+  // lookup. openPanel() already dispatches system ids natively, so launch just
+  // works. window.SYSTEM_PANELS is stamped by liquid_ui_service (single source).
+  function SP() { return window.SYSTEM_PANELS || {}; }
+  function DEF(id) { return M()[id] || SP()[id] || null; }
 
   // Glyph rendering ("is this a Material ligature name", the icon-vs-emoji span)
   // lives in the SHARED window.HartBrandArt (hartBrandArt.js), so the desktop
@@ -51,7 +58,7 @@
   // The effective override for an icon = explicit override fields, falling back
   // to the MANIFEST default. Used to seed the dialog and to render.
   function effective(id, ov) {
-    var def = M()[id] || {};
+    var def = DEF(id) || {};
     ov = ov || {};
     return {
       glyph: (ov.glyph != null && ov.glyph !== '') ? ov.glyph : (def.icon || 'apps'),
@@ -80,7 +87,7 @@
     // override (eff.color) still wins; this default is render-only and is NOT
     // persisted (readPositions serializes data-ov-color, untouched below), so
     // the desktop blob stays lean and the dialog's "Theme default" stays honest.
-    var renderColor = eff.color || ((M()[id] || {}).color) || '';
+    var renderColor = eff.color || ((DEF(id) || {}).color) || '';
 
     var glyphBox = el.querySelector('.di-glyph');
     if (eff.image) {
@@ -323,7 +330,7 @@
   // (HartCtxMenu) wired to the file's existing helpers — no parallel renderer.
   function openIconMenu(id, x, y) {
     if (!window.HartCtxMenu) return;
-    var def = M()[id] || {};
+    var def = DEF(id) || {};
     var items = [
       { icon: 'open_in_new', label: 'Open', onClick: function () { launch(id); } },
       { icon: 'drive_file_rename_outline', label: 'Rename', onClick: function () { renameIcon(id); } },
@@ -341,7 +348,7 @@
   }
 
   function makeIcon(item) {
-    var def = M()[item.id] || {};
+    var def = DEF(item.id) || {};
     var el = document.createElement('div');
     el.className = 'desktop-icon';
     el.setAttribute('data-id', item.id);
@@ -507,28 +514,24 @@
     inp.addEventListener('blur', function () { finish(true); });
     inp.focus(); inp.select();
   }
-  // Uninstall a real installed app, then drop its desktop icon. Reuses the
-  // shell's installer route family (/api/apps/install has a sibling uninstall);
-  // if that endpoint is unavailable we still unpin the icon (always-correct
-  // local action) so the menu item is never a dead end. Confirms first.
-  function uninstallApp(id) {
-    var def = M()[id] || {};
-    var name = def.title || id;
-    function drop() {
-      window.hartRemoveIcon && window.hartRemoveIcon(id);
-      if (window.MANIFEST && window.MANIFEST[id]) { try { delete window.MANIFEST[id]; } catch (e) {} }
-    }
+  // Shared uninstall flow (confirm -> POST /api/apps/uninstall -> app_installer.
+  // uninstall). Exposed on window so the installed-apps registry (the App
+  // Permissions & Uninstall panel) reuses the EXACT same confirm + endpoint as
+  // the desktop-icon right-click — one path, no duplicate. onDone(ok) fires on
+  // both success and failure (network unreachable) so callers can always refresh.
+  window.hartUninstallApp = function (id, platform, name, onDone) {
+    name = name || (DEF(id) || {}).title || id;
+    var done = function (ok) { try { onDone && onDone(ok); } catch (e) {} };
     function go() {
       var base = (typeof window.SHELL === 'string' && window.SHELL) ? window.SHELL : '';
       try {
         fetch(base + '/api/apps/uninstall', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ app_id: id, platform: def.platform || '' })
-        }).then(function () { drop(); }, function () { drop(); });
-      } catch (e) { drop(); }
+          body: JSON.stringify({ app_id: id, platform: platform || (DEF(id) || {}).platform || '' })
+        }).then(function () { done(true); }, function () { done(false); });
+      } catch (e) { done(false); }
     }
-    // Prefer the shell's themed confirm; fall back to the native one.
     if (typeof window.dsConfirm === 'function') {
       window.dsConfirm('Uninstall ' + name + '?',
         'This removes ' + name + ' from this device.',
@@ -536,9 +539,19 @@
     } else if (window.confirm('Uninstall ' + name + '?')) {
       go();
     }
+  };
+  // Desktop-icon uninstall: run the shared flow, then drop the icon + manifest
+  // entry regardless of the endpoint result (unpinning is an always-correct local
+  // action, so the menu item is never a dead end).
+  function uninstallApp(id) {
+    var def = M()[id] || {};
+    window.hartUninstallApp(id, def.platform || '', def.title || id, function () {
+      window.hartRemoveIcon && window.hartRemoveIcon(id);
+      if (window.MANIFEST && window.MANIFEST[id]) { try { delete window.MANIFEST[id]; } catch (e) {} }
+    });
   }
   window.hartPinIcon = function (id) {
-    if (!layer || !M()[id]) return;
+    if (!layer || !DEF(id)) return;
     if (layer.querySelector('.desktop-icon[data-id="' + id + '"]')) return;
     layer.appendChild(makeIcon({ id: id, x: PAD, y: PAD + firstFreeRow() * GRID }));
     persist();
@@ -634,19 +647,21 @@
   };
 
   function defaults() {
-    // Default desktop icons. render() only shows ids present in window.MANIFEST
-    // (the panel manifest), so these MUST be real manifest keys — the old list
-    // ('files'/'weather'/'terminal'/'app_store'/'security') were system-app ids
-    // absent from the manifest, so only 'appearance' ever rendered.
-    var want = ['appearance', 'feed', 'agents_browse', 'recipes', 'notifications', 'communities'];
-    var M_ = M(), out = [], row = 0;
-    want.forEach(function (id) { if (M_[id]) { out.push({ id: id, x: PAD, y: PAD + row * GRID }); row++; } });
+    // Default desktop icons. render() only shows ids the resolver knows, so these
+    // MUST resolve in window.MANIFEST (Nunba pages) OR window.SYSTEM_PANELS (native
+    // apps). The old bug used system-app ids that were absent from window.MANIFEST
+    // and got silently dropped; DEF() now resolves both, so Files, App Store and
+    // This PC seed as first-class desktop apps (icons visible, not search-only).
+    var want = ['my_computer', 'file_manager', 'app_store', 'appearance',
+                'feed', 'agents_browse', 'recipes', 'notifications', 'communities'];
+    var out = [], row = 0;
+    want.forEach(function (id) { if (DEF(id)) { out.push({ id: id, x: PAD, y: PAD + row * GRID }); row++; } });
     return out;
   }
 
   function render(list) {
     layer.innerHTML = '';
-    list.forEach(function (it) { if (M()[it.id]) layer.appendChild(makeIcon(it)); });
+    list.forEach(function (it) { if (DEF(it.id)) layer.appendChild(makeIcon(it)); });
   }
 
   // ── Marquee (rubber-band) multi-select over the empty desktop ──
@@ -908,7 +923,7 @@
       // a completely EMPTY desktop. Resolving the persisted list against MANIFEST
       // first keeps defaults() as the guaranteed floor whenever nothing survives.
       var saved = window.HartSession.get('desktop_icons') || [];
-      var icons = saved.filter(function (it) { return it && M()[it.id]; });
+      var icons = saved.filter(function (it) { return it && DEF(it.id); });
       render(icons.length ? icons : defaults());
     });
   }
