@@ -109,6 +109,22 @@ let
     GENERATE_SOURCEMAP = "false";
     NODE_OPTIONS = "--max-old-space-size=4096";
 
+    # autobahn/lib does `require('when/monitor/console')` for OPTIONAL debug
+    # monitoring; the resolved `when` version ships without monitor/console, so
+    # CRA's webpack-4 static resolver fails the production build with
+    # "Can't resolve 'when/monitor/console' in .../autobahn/lib" (R3 round-4
+    # build). Stub it to an empty module (autobahn only touches it for debug
+    # logging, never in production) at BOTH the hoisted and the nested `when`
+    # location — the standard no-eject workaround, no Nunba-repo change.
+    preBuild = ''
+      for d in node_modules/when node_modules/autobahn/node_modules/when; do
+        if [ -d "$d" ]; then
+          mkdir -p "$d/monitor"
+          printf 'module.exports = {};\n' > "$d/monitor/console.js"
+        fi
+      done
+    '';
+
     dontFixup = true;
     installPhase = ''
       runHook preInstall
