@@ -440,7 +440,27 @@ COMPONENT_TYPES = {
     'code': {'props': ['language', 'content', 'filename']},
     'markdown': {'props': ['content']},
     'media': {'props': ['type', 'src', 'alt', 'controls']},
-    'metric': {'props': ['label', 'value', 'unit', 'trend', 'explanation']},
+    # ``metric`` is the worked example of the ENRICHED interface shape (§6b): the
+    # flat ``props`` stays (the attribute schema every consumer already reads), and
+    # the entry additionally DECLARES the events it emits, its behaviours, and an
+    # AGENT-READABLE ``spec`` so the local HART intelligence can introspect + drive
+    # it from the spec alone.  Every other builtin keeps ``props``-only and its spec
+    # is SYNTHESIZED by ``_component_spec_for`` — the enrichment is OPTIONAL, never a
+    # second registry.
+    'metric': {
+        'props': ['label', 'value', 'unit', 'trend', 'explanation'],
+        'events': ['click'],
+        'behaviors': ['live_update'],
+        'spec': {
+            'name': 'metric',
+            'attributes': {'label': 'str', 'value': 'number', 'unit': 'str',
+                           'trend': 'up|down|flat', 'explanation': 'str'},
+            'emits': ['click'],
+            'behaviors': ['live_update'],
+            'mount': 'a2ui',
+            'compose': 'agent_ui_update(agent_id, {"type": "metric", ...attrs})',
+        },
+    },
     'layout': {'props': ['type', 'children', 'gap']},
     # ── Ecommerce / Agent Action Live Fragments ──
     'product_card': {'props': ['name', 'price', 'image', 'rating', 'description',
@@ -512,9 +532,39 @@ COMPONENT_TYPES = {
     # back-compat alias the consumer also accepts (so neither is silently
     # dropped).  hartHome's samplePayload() stays the offline skeleton; an
     # accepted push overrides it live.
-    'home_compose': {'props': ['hero', 'rows']},
-    'home': {'props': ['hero', 'rows']},
+    # ``mood`` (a HART_PALETTES id, §6a) rides the SAME home push: the local LLM
+    # now composes the ambient palette too, forwarded verbatim to the client which
+    # is the single owner of the palette-id vocabulary (calls applyPalette).  It is
+    # an OPTIONAL prop — an unset mood leaves the shell palette untouched.
+    'home_compose': {'props': ['hero', 'rows', 'mood']},
+    'home': {'props': ['hero', 'rows', 'mood']},
 }
+
+
+def _component_spec_for(name: str, entry: dict) -> dict:
+    """Build the AGENT-READABLE machine spec for one registered component from its
+    interface entry (§6b — the COMPONENT_TYPES-as-registry contract).
+
+    If the entry ships an explicit ``spec`` it wins (a runtime-registered component,
+    or an enriched builtin like ``metric``, declares its own).  Otherwise the spec is
+    SYNTHESIZED from the entry's ``props`` (the attribute schema) plus any optional
+    ``events``/``behaviors`` — so EVERY builtin is introspectable without hand-writing
+    30 specs, and adding a builtin needs no spec boilerplate.  The local HART
+    intelligence composes a component from this spec ALONE: ``name`` + attribute
+    schema + emitted events + how to mount/compose it (via the one A2UI transport).
+    """
+    if isinstance(entry.get('spec'), dict):
+        return entry['spec']
+    props = entry.get('props') or []
+    return {
+        'name': name,
+        'attributes': {p: 'any' for p in props},
+        'emits': list(entry.get('events') or []),
+        'behaviors': list(entry.get('behaviors') or []),
+        'mount': 'a2ui',
+        'compose': ('agent_ui_update(agent_id, {"type": "%s", ...attributes})'
+                    % name),
+    }
 
 # ── Agentic HOME composition — the producer's schema allow-sets ──────────────
 # compose_home pushes a {hero, rows} payload; hartHome.js (compose -> render) is
@@ -731,6 +781,16 @@ class LiquidUIService:
                     os.path.dirname(os.path.abspath(__file__)))),
                     'agent_data')))
 
+        # Runtime component REGISTRY (§6b): HART agents register NEW self-sufficient,
+        # interface-declared, agent-spec'd components at runtime.  Builtins live in the
+        # module-level COMPONENT_TYPES (protected); agent-registered ones persist to
+        # ``component_types_custom.json`` and load here — mirroring skin_registry's
+        # starter-in-code + persisted-custom pattern.  The ONE allowlist gate in
+        # agent_ui_update checks builtin OR this map, so it is runtime-extensible
+        # without a second transport or spec format.
+        self._custom_component_types: Dict[str, dict] = \
+            self._load_custom_component_types()
+
         logger.info(
             "LiquidUIService initialized: port=%d, renderer=%s, "
             "voice=%s, haptic=%s", port, renderer, voice_enabled, haptic_enabled)
@@ -866,7 +926,10 @@ class LiquidUIService:
         if not self.a2ui_enabled:
             return False
         comp_type = component.get('type', '')
-        if comp_type not in COMPONENT_TYPES:
+        # The ONE allowlist gate, now runtime-extensible (§6b): a builtin type OR a
+        # component a HART agent registered at runtime.  No second gate, no fork.
+        if (comp_type not in COMPONENT_TYPES
+                and comp_type not in self._custom_component_types):
             logger.warning("Invalid A2UI component type: %s", comp_type)
             return False
 
@@ -975,6 +1038,138 @@ class LiquidUIService:
                          "verb: %s", e)
             return False
 
+    # ─── Runtime component REGISTRY (§6b) — HART agents compose/extend the
+    #     interface-declared, agent-spec'd component set at runtime ─────────
+
+    def _component_types_path(self) -> str:
+        """On-disk home for agent-registered component specs (one writer)."""
+        return os.path.join(self._data_dir, 'component_types_custom.json')
+
+    def _load_custom_component_types(self) -> Dict[str, dict]:
+        """Load persisted runtime-registered component specs. Best-effort: a
+        missing/corrupt file yields an empty map (builtins always stand)."""
+        try:
+            with open(self._component_types_path(), 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+    def _write_custom_component_types(self, types: Dict[str, dict]) -> bool:
+        """Atomic write of the custom component map (one writer, os.replace) —
+        mirrors skin_registry._write_custom.  Never raises."""
+        try:
+            with self._lock:
+                os.makedirs(self._data_dir, exist_ok=True)
+                path = self._component_types_path()
+                tmp = path + '.tmp'
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump(types, f, indent=2)
+                os.replace(tmp, path)
+            return True
+        except OSError as e:
+            logger.warning("component_types write failed: %s", e)
+            return False
+
+    def list_component_specs(self) -> List[dict]:
+        """The AGENT-READABLE catalogue: the machine spec for every component
+        (builtin + runtime-registered) the local HART intelligence can compose.
+
+        Builtins' specs are synthesized from their interface entry (or their own
+        declared ``spec``); custom entries carry their spec verbatim.  This is the
+        one introspection surface an agent reads to drive/compose any component from
+        the spec alone."""
+        specs: List[dict] = []
+        for name, entry in COMPONENT_TYPES.items():
+            specs.append(_component_spec_for(name, entry))
+        for name, entry in self._custom_component_types.items():
+            specs.append(_component_spec_for(name, entry))
+        return specs
+
+    def get_component_spec(self, type_name: str) -> Optional[dict]:
+        """The machine spec for one component type (builtin or registered), or None."""
+        if type_name in COMPONENT_TYPES:
+            return _component_spec_for(type_name, COMPONENT_TYPES[type_name])
+        if type_name in self._custom_component_types:
+            return _component_spec_for(type_name,
+                                       self._custom_component_types[type_name])
+        return None
+
+    def register_component_type(self, agent_id: str, type_name: str,
+                                spec: dict) -> dict:
+        """A HART agent registers a NEW self-sufficient, interface-declared,
+        agent-spec'd component at runtime (§6b).
+
+        Routes through the SAME governance agent_ui_update owns — a2ui-enabled,
+        the human HiveCircuitBreaker kill-switch, the per-agent rate cap, the XSS
+        reject, and the immutable audit log — so extending the component set is
+        governed exactly like pushing one.  Builtins are protected (cannot be
+        overwritten), exactly like starter skins.  Persists to the SAME custom map
+        the allowlist gate reads, so the new type is immediately composable through
+        the ONE transport.  Composer = HART agents only (this is in-process; no
+        external/cloud path exists or is added).
+
+        Returns {'status':'registered','type':...} or {'error':...}.
+        """
+        if not self.a2ui_enabled:
+            return {'error': 'a2ui disabled'}
+        name = str(type_name or '').strip().lower()
+        if not re.match(r'^[a-z][a-z0-9_]{1,39}$', name):
+            return {'error': 'type name must be a lowercase slug '
+                             '[a-z][a-z0-9_]{1,39}'}
+        if name in COMPONENT_TYPES:
+            return {'error': f'"{name}" is a builtin component and is protected'}
+        if not isinstance(spec, dict):
+            return {'error': 'spec must be an object'}
+        # Kill-switch: registering a component is an agent painting the screen —
+        # governed like a dispatch.  Fail-OPEN only on guardrail import error.
+        try:
+            from security.hive_guardrails import HiveCircuitBreaker
+            if HiveCircuitBreaker.is_halted():
+                return {'error': 'hive halted'}
+        except Exception:
+            pass
+        if not self._a2ui_rate_ok(agent_id):
+            return {'error': 'rate-capped'}
+        if _a2ui_has_xss(spec) or _a2ui_has_xss(name):
+            logger.warning("component register rejected (unsafe): %s from %s",
+                           name, agent_id)
+            return {'error': 'unsafe content in spec'}
+        # Normalize into the SAME interface-entry shape builtins use, so the entry
+        # is a self-sufficient component: props (attribute schema) + declared
+        # events/behaviors + the agent-readable spec (synthesized if not supplied).
+        props = spec.get('props')
+        if not isinstance(props, list):
+            attrs = spec.get('attributes')
+            props = list(attrs.keys()) if isinstance(attrs, dict) else []
+        entry = {
+            'props': [str(p) for p in props][:40],
+            'events': [str(e) for e in (spec.get('events')
+                                        or spec.get('emits') or [])][:20],
+            'behaviors': [str(b) for b in (spec.get('behaviors') or [])][:20],
+        }
+        if isinstance(spec.get('template'), str):
+            entry['template'] = spec['template']
+        entry['spec'] = _component_spec_for(name, {**entry,
+                                                   'spec': spec.get('spec')})
+        with self._lock:
+            merged = dict(self._custom_component_types)
+            merged[name] = entry
+        if not self._write_custom_component_types(merged):
+            return {'error': 'failed to persist component spec'}
+        self._custom_component_types = merged
+        try:
+            from security.immutable_audit_log import get_audit_log
+            get_audit_log().log_event(
+                'a2ui_register_component', actor_id=str(agent_id),
+                action=f'register {name} component',
+                detail={'type': name}, target_id=str(agent_id))
+        except Exception:
+            pass
+        logger.info("A2UI: agent %s registered component type %s",
+                    agent_id, name)
+        return {'status': 'registered', 'type': name}
+
     def _compose_intent_result(self, intent_text: str, chat_result: dict) -> bool:
         """M1 — turn a brain /chat decomposition into COMPOSED desktop UI.
 
@@ -1022,7 +1217,8 @@ class LiquidUIService:
         self.agent_ui_update(agent_id, component)
         return {'status': 'approval_requested', 'component': component}
 
-    def compose_home(self, hero=None, rows=None, agent_id='home_composer'):
+    def compose_home(self, hero=None, rows=None, agent_id='home_composer',
+                     mood=None):
         """Push a composed HOME surface through the ONE wired A2UI channel.
 
         This is the single SERVER-SIDE producer of the agentic home feed: the
@@ -1044,6 +1240,11 @@ class LiquidUIService:
             component['hero'] = hero
         if rows is not None:
             component['rows'] = rows
+        # The LLM-composed ambient mood/palette id (§6a) rides the SAME push; the
+        # client applies it via applyPalette. Optional — omitted leaves the palette
+        # untouched. The XSS gate + slug sanitize already vetted it upstream.
+        if mood:
+            component['mood'] = mood
         return self.agent_ui_update(agent_id, component)
 
     def compose_home_now(self, reason: str = 'manual') -> bool:
@@ -1078,7 +1279,7 @@ class LiquidUIService:
             return False
         ok = self.compose_home(
             hero=payload.get('hero'), rows=payload.get('rows'),
-            agent_id='home_composer')
+            agent_id='home_composer', mood=payload.get('mood'))
         if ok:
             logger.info(
                 "compose_home_now(%s): pushed %d row(s)%s",
@@ -1692,10 +1893,10 @@ img{-webkit-user-drag:none;user-select:none}
 .hart-ambient{position:fixed;inset:-12%;z-index:1;pointer-events:none;opacity:0.5;
   filter:blur(64px) saturate(140%);
   background:
-    radial-gradient(38% 42% at 22% 26%, rgba(0,230,195,0.44), transparent 70%),
-    radial-gradient(34% 40% at 80% 30%, rgba(155,92,255,0.44), transparent 70%),
-    radial-gradient(42% 46% at 60% 80%, rgba(41,197,255,0.32), transparent 72%),
-    radial-gradient(30% 36% at 28% 82%, rgba(255,46,154,0.32), transparent 72%);
+    radial-gradient(38% 42% at 22% 26%, rgba(var(--hart-amb-1-rgb, 0,230,195),0.44), transparent 70%),
+    radial-gradient(34% 40% at 80% 30%, rgba(var(--hart-amb-2-rgb, 155,92,255),0.44), transparent 70%),
+    radial-gradient(42% 46% at 60% 80%, rgba(var(--hart-amb-3-rgb, 41,197,255),0.32), transparent 72%),
+    radial-gradient(30% 36% at 28% 82%, rgba(var(--hart-amb-4-rgb, 255,46,154),0.32), transparent 72%);
   animation:hart-ambient-drift 30s ease-in-out infinite alternate}
 @keyframes hart-ambient-drift{0%{transform:translate3d(0,0,0) scale(1)}
   50%{transform:translate3d(2.4%,-2.2%,0) scale(1.08)}100%{transform:translate3d(-2.4%,2.2%,0) scale(1.05)}}
@@ -7794,7 +7995,17 @@ def _sanitize_home_payload(payload) -> Optional[dict]:
         rows.append(row)
     if not rows:
         return None
-    return {'hero': _home_sanitize_hero(payload.get('hero')), 'rows': rows}
+    out = {'hero': _home_sanitize_hero(payload.get('hero')), 'rows': rows}
+    # Ambient mood/palette (§6a) — the LLM may name a HART_PALETTES id for the
+    # shell's ambient feel.  Coerced to a safe slug HERE (the load-bearing guard);
+    # the CLIENT is the single owner of the palette-id vocabulary and validates
+    # membership before calling applyPalette, so the server never forks that list.
+    mood = payload.get('mood')
+    if isinstance(mood, str):
+        slug = re.sub(r'[^a-z0-9_-]', '', mood.strip().lower())[:24]
+        if slug:
+            out['mood'] = slug
+    return out
 
 
 def _home_extract_json_obj(text: str):
@@ -7822,10 +8033,17 @@ def _home_extract_json_obj(text: str):
 
 
 def _llm_curate_home(ctx: dict, backbone: dict, model_bus_port: int):
-    """The local LLM (the heart) writes the contextual narrative + chooses which
-    row leads, given the REAL context. Deliberately a small, reliable JSON ask
-    so the on-device model succeeds; the data backbone is already real, so this
-    only colours emphasis. Returns a refined payload or None (-> backbone stands)."""
+    """The local LLM (the heart) is the home's COMPOSITIONAL authority: given the
+    REAL context it writes the narrative, chooses which row leads, AND now drives
+    the feel — each row's accent + emphasis and the ambient mood/palette (§6a).
+
+    Still a small, reliable JSON ask so the on-device model succeeds; the data
+    backbone (rows + cards) is already real, so the LLM only COLOURS it and can
+    never inject a row/card. Every value it returns is re-validated downstream by
+    _sanitize_home_payload against the SAME allow-sets — accent ∈ HOME_ROW_ACCENTS,
+    emphasis -> the existing flagship/ranked flags, mood -> a slug the client checks
+    against HART_PALETTES — so a hallucinated accent/mood can never reach the DOM.
+    Returns a refined payload or None (-> backbone stands)."""
     try:
         from core.http_pool import pooled_post
     except Exception:
@@ -7840,13 +8058,21 @@ def _llm_curate_home(ctx: dict, backbone: dict, model_bus_port: int):
             'spark_earned': ctx.get('spark'),
             'rows': titles,
         }, ensure_ascii=False)
-        + "\nReturn ONLY compact JSON: {\"eyebrow\": <label, max 5 words>, "
-          "\"feature\": <one row title from rows to show first>}. "
-          "No em dashes, no extra text."
+        + "\nYou choose the feel. Return ONLY compact JSON: {"
+          "\"eyebrow\": <label, max 5 words>, "
+          "\"feature\": <one row title from rows to lead with>, "
+          "\"mood\": <one HART palette id for the ambient feel, e.g. vibrant "
+          "or aurora>, "
+          "\"rows\": [{\"title\": <one row title from rows>, "
+          "\"accent\": <one of "
+        + "|".join(HOME_ROW_ACCENTS)
+        + ">, \"emphasis\": <flagship|ranked|normal>}]}. "
+          "Keep functional signifiers teal; accent themes each row, mood sets the "
+          "ambient palette. No em dashes, no extra text."
     )
     try:
         resp = pooled_post('http://localhost:%d/v1/chat' % model_bus_port,
-                           json={'prompt': prompt, 'max_tokens': 120},
+                           json={'prompt': prompt, 'max_tokens': 220},
                            timeout=12)
         if getattr(resp, 'status_code', 0) != 200:
             return None
@@ -7857,12 +8083,47 @@ def _llm_curate_home(ctx: dict, backbone: dict, model_bus_port: int):
     data = _home_extract_json_obj(text)
     if not isinstance(data, dict):
         return None
+    # Copy every row so per-row accent/emphasis edits (and the reorder) never mutate
+    # the backbone — it is the fallback at every step in build_home_payload.
     out = {'hero': backbone.get('hero'),
-           'rows': list(backbone.get('rows') or [])}
+           'rows': [dict(r) for r in (backbone.get('rows') or [])]}
     eyebrow = _home_clean_text(data.get('eyebrow'), 40)
     if eyebrow and out['hero']:
         out['hero'] = dict(out['hero'])
         out['hero']['eyebrow'] = eyebrow
+    # Per-row accent + emphasis, applied onto the matching backbone row BY TITLE
+    # (the LLM never adds a row/card). _sanitize_home_payload re-validates accent
+    # ∈ HOME_ROW_ACCENTS and the flagship/ranked flags, so a bad value just falls
+    # back to the row's own default. Cards stay deterministic.
+    llm_rows = data.get('rows')
+    if isinstance(llm_rows, list):
+        by_title = {}
+        for lr in llm_rows:
+            if isinstance(lr, dict):
+                key = str(lr.get('title') or '').strip().lower()
+                if key:
+                    by_title[key] = lr
+        for r in out['rows']:
+            lr = by_title.get(str(r.get('title') or '').strip().lower())
+            if not lr:
+                continue
+            acc = lr.get('accent')
+            if acc in HOME_ROW_ACCENTS:
+                r['accent'] = acc
+            emph = str(lr.get('emphasis') or '').strip().lower()
+            if emph == 'flagship':
+                r['flagship'] = True
+            elif emph == 'ranked':
+                r['ranked'] = True
+    # Ambient mood/palette id — forwarded to the client (the single owner of the
+    # HART_PALETTES id list, which calls applyPalette). Sanitized to a slug in
+    # _sanitize_home_payload; a non-member is ignored client-side. This closes the
+    # "keyword router bypasses the LLM" gap: the LLM can now set the mood by
+    # composing, not only via handleThemeCommand.
+    mood = data.get('mood')
+    if isinstance(mood, str) and mood.strip():
+        out['mood'] = mood
+    # Reorder so the LLM-chosen feature row leads.
     feat = _home_clean_text(data.get('feature'), 60).lower()
     if feat:
         for i, r in enumerate(out['rows']):

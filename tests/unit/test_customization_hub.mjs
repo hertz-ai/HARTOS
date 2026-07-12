@@ -199,6 +199,65 @@ function runModules(realm, files) {
 })();
 
 // ════════════════════════════════════════════════════════════════════════════
+// [M] MOOD DOCK + AMBIENT QUAD — applyPalette retints --hart-amb-1..4 (the mood),
+//     PINS the functional --hart-accent to the palette's accent (steward hybrid:
+//     teal on function even when the ambient goes violet-lead), persists the full
+//     quad, and the on-desktop mood dock's swatch CLICK drives the SAME applyPalette.
+// ════════════════════════════════════════════════════════════════════════════
+(function testMoodQuadAndDock() {
+  console.log('\n[M] hartPersonalize.js  applyPalette retints the ambient quad + the mood dock drives it');
+  const R = makeRealm();
+  R.sandbox.window.HartSession = makeSession({});
+  R.sandbox.window.hartLoadInto = function () {};
+  runModules(R, ['voiceOrbViz.js', 'hartPersonalize.js']);
+
+  // The Aura "aurora" mood: functional accent pinned teal, ambient QUAD violet-lead.
+  const list = R.sandbox.window.HART_PALETTES;
+  const aurora = list.filter(p => p.id === 'aurora')[0];
+  ok(aurora && aurora.accent === '#00E6C3' && aurora.a === '#B182FF',
+     'HART_PALETTES carries the Aura "aurora" mood (accent teal, ambient violet-lead)');
+
+  R.sandbox.window.HartPalette.apply(aurora);
+  const st = R.docEl.style;
+  // Ambient quad retinted (the MOOD) — all four hues reach the DOM.
+  eq(st.getPropertyValue('--hart-amb-1'), '#B182FF', 'applyPalette set --hart-amb-1 (mood hue #1 = violet)');
+  eq(st.getPropertyValue('--hart-amb-2'), '#00DDF9', 'applyPalette set --hart-amb-2');
+  eq(st.getPropertyValue('--hart-amb-3'), '#FB66B6', 'applyPalette set --hart-amb-3');
+  eq(st.getPropertyValue('--hart-amb-4'), '#FFB330', 'applyPalette set --hart-amb-4');
+  eq(st.getPropertyValue('--hart-amb-1-rgb'), '177,130,255', 'applyPalette set --hart-amb-1-rgb (parsed triple)');
+  // FUNCTIONAL signifier stays teal (accent override wins over the lead ambient hue).
+  eq(st.getPropertyValue('--hart-accent'), '#00E6C3', 'functional --hart-accent pinned teal (NOT the violet lead) — steward hybrid');
+  // Persisted so restore() re-paints the full quad, not just the duotone.
+  const persisted = R.sandbox.window.HartSession.get('palette');
+  ok(persisted && persisted.a3 === '#FB66B6' && persisted.a4 === '#FFB330' && persisted.accent === '#00E6C3',
+     'the full quad + functional accent persisted under HartSession.palette');
+
+  // The theme/apply POST carries the ambient quad as custom overrides (server round-trip).
+  const post = R.fetchCalls.filter(c => String(c.url).indexOf('/api/appearance/apply') >= 0);
+  ok(post.length >= 1, 'applyPalette posted to /api/appearance/apply');
+  const cbody = JSON.parse(post[post.length - 1].opts.body);
+  ok(cbody.custom && cbody.custom.ambient_1 === '#B182FF' && cbody.custom.ambient_4 === '#FFB330',
+     'the apply body carries the ambient quad (ambient_1..4) for server persistence');
+  eq(cbody.custom.accent, '#00E6C3', 'the apply body pins the functional accent teal');
+
+  // On-desktop MOOD DOCK: renders swatches; a swatch CLICK drives the same applyPalette.
+  const R2 = makeRealm();
+  R2.sandbox.window.HartSession = makeSession({});
+  R2.sandbox.window.hartLoadInto = function () {};
+  runModules(R2, ['voiceOrbViz.js', 'hartPersonalize.js']);
+  ok(typeof R2.sandbox.window.hartRenderMoodDock === 'function', 'window.hartRenderMoodDock is exposed');
+  const dock = makeEl('div');
+  R2.sandbox.window.hartRenderMoodDock(dock);
+  const swatches = dock.querySelectorAll('.hart-mood-sw');
+  eq(swatches.length, R2.sandbox.window.HART_PALETTES.length, 'the dock rendered one swatch per palette');
+  const auroraSw = swatches.filter(s => s.title === 'Aurora')[0];
+  ok(auroraSw, 'the Aurora mood swatch rendered (title)');
+  auroraSw.dispatch('click', mkEv(auroraSw));
+  eq(R2.docEl.style.getPropertyValue('--hart-amb-1'), '#B182FF', 'clicking the dock swatch retints --hart-amb-1 via applyPalette');
+  eq(R2.docEl.style.getPropertyValue('--hart-accent'), '#00E6C3', 'dock swatch keeps the functional accent teal');
+})();
+
+// ════════════════════════════════════════════════════════════════════════════
 // [C] CUSTOM PALETTE — the rendered picker applies + persists an ad-hoc palette
 // ════════════════════════════════════════════════════════════════════════════
 (function testCustomPalette() {

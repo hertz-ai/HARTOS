@@ -162,6 +162,67 @@ def test_theme_bp_uses_appearance_namespace_no_social_collision():
         f'theme_bp must NOT register /api/social/theme/* (collides with social_bp): {rules}'
 
 
+# ── 3) Ambient quad + the two ready-made designs (LIQUID_UI_AGENTIC_FRAMEWORK) ──
+# get_css_variables is the keystone that var-drives the ambient field: it must emit
+# --hart-amb-1..4 (+ rgb triples), the display font, and the themable glass base so
+# the widened liquid surface (hartResponsive.css / .hart-ambient / hartHero) has live
+# consumers. The two SHIPPED presets (hart-default + aura) must render DISTINCT, valid
+# CSS: HART ambient teal-lead, Aura ambient violet-lead, teal pinned on the functional
+# --hart-accent in BOTH (the steward hybrid). These render the REAL shipped preset
+# json (decoupled from the fixture theme dir) so the test tracks what actually ships.
+from unittest.mock import patch as _patch
+
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REAL_THEME_DIR = os.path.join(_REPO, 'nixos', 'assets', 'conky-themes')
+
+
+def _css_for_shipped_preset(preset_id):
+    from integrations.agent_engine.theme_service import ThemeService
+    with open(os.path.join(_REAL_THEME_DIR, preset_id + '.json'),
+              encoding='utf-8') as f:
+        preset = json.load(f)
+    with _patch.object(ThemeService, 'get_active_theme', return_value=preset):
+        return ThemeService.get_css_variables()
+
+
+def test_css_emits_full_ambient_contract_vars():
+    """Every var the widened liquid surface consumes is emitted: the ambient quad
+    (--hart-amb-1..4 + rgb triples), the display font, the themable glass base, and
+    radius/opacity/glow/density. A missing var = a dead consumer in the shell CSS."""
+    css = _css_for_shipped_preset('hart-default')
+    for i in range(1, 5):
+        assert '--hart-amb-%d:' % i in css, css
+        assert '--hart-amb-%d-rgb:' % i in css, css
+    assert '--hart-font-display:' in css
+    assert '--hart-glass-rgb:' in css          # themable glass base (Opacity slider)
+    assert '--hart-radius:' in css
+    assert '--hart-panel-opacity:' in css
+    assert '--hart-glow:' in css and '--hart-density:' in css
+
+
+def test_hart_and_aura_presets_are_distinct_and_valid():
+    """The two ready-made designs each produce valid CSS and a DISTINCT skin, while
+    keeping teal on the functional signifier (steward hybrid)."""
+    hart = _css_for_shipped_preset('hart-default')
+    aura = _css_for_shipped_preset('aura')
+    # Valid: a :root block, balanced braces, every declaration terminated.
+    for css in (hart, aura):
+        assert css.startswith(':root {') and css.rstrip().endswith('}')
+        body = [ln.strip() for ln in css.splitlines()[1:-1] if ln.strip()]
+        assert body and all(ln.endswith(';') for ln in body), css
+    assert hart != aura                                   # distinct skins
+    # HART ambient is TEAL-lead; Aura ambient is VIOLET-lead (--hart-amb-1).
+    assert '--hart-amb-1: #00E6C3;' in hart               # teal
+    assert '--hart-amb-1: #B182FF;' in aura               # violet
+    # BUT --hart-accent (orb core / primary CTA / earnings) stays teal in BOTH.
+    assert '--hart-accent: #00E6C3;' in hart
+    assert '--hart-accent: #00E6C3;' in aura
+    # Aura carries its own display face + a lighter (white) glass base vs HART's dark.
+    assert '--hart-font-display: "Space Grotesk";' in aura
+    assert '--hart-glass-rgb: 255,255,255;' in aura
+    assert '--hart-glass-rgb: 18,19,28;' in hart
+
+
 def test_legacy_preset_apply_still_works():
     """Zero-regression: the original single-arg apply_theme(theme_id) still works."""
     svc = _svc()

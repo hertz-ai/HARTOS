@@ -108,7 +108,13 @@
   --hart-muted: #8A93A6;
   --hart-surface: #14141F;
   --hart-surface-hover: #20212F;
-  --hart-glass-bg: rgba(18,19,28,0.56);
+  /* Glass fill is ONE value with ONE writer: the base RGB triple (--hart-glass-rgb)
+     times the theme opacity (--hart-panel-opacity, emitted by theme_service). This makes
+     the Opacity slider real without a parallel literal. Inline defaults reproduce the
+     old rgba(18,19,28,0.56) look 1:1 when unset (0.56, not the emitter's 0.65 default,
+     so an UN-themed shell is pixel-identical to before). */
+  --hart-glass-rgb: 18,19,28;
+  --hart-glass-bg: rgba(var(--hart-glass-rgb,18,19,28), var(--hart-panel-opacity,0.56));
   --hart-glass-border: rgba(255,255,255,0.09);
   --hart-blur: 30px;
   --hart-saturation: 165%;
@@ -136,11 +142,11 @@
    Multi-hue, never one teal wash — a faint ambient bloom anchored to corners. */
 .wallpaper {
   background:
-    radial-gradient(46% 40% at 12% 6%,  rgba(0,230,195,0.13),  transparent 62%),
-    radial-gradient(40% 38% at 88% 10%, rgba(41,197,255,0.11), transparent 64%),
-    radial-gradient(52% 50% at 94% 94%, rgba(155,92,255,0.15), transparent 64%),
-    radial-gradient(44% 42% at 8%  92%, rgba(255,46,154,0.10), transparent 66%),
-    radial-gradient(34% 30% at 50% 40%, rgba(59,130,246,0.07), transparent 70%),
+    radial-gradient(46% 40% at 12% 6%,  rgba(var(--hart-amb-1-rgb, 0,230,195),0.13),  transparent 62%),
+    radial-gradient(40% 38% at 88% 10%, rgba(var(--hart-amb-3-rgb, 41,197,255),0.11), transparent 64%),
+    radial-gradient(52% 50% at 94% 94%, rgba(var(--hart-amb-2-rgb, 155,92,255),0.15), transparent 64%),
+    radial-gradient(44% 42% at 8%  92%, rgba(var(--hart-amb-4-rgb, 255,46,154),0.10), transparent 66%),
+    radial-gradient(34% 30% at 50% 40%, rgba(var(--hv-blue-rgb, 59,130,246),0.07), transparent 70%),
     radial-gradient(130% 100% at 50% 128%, rgba(10,12,26,0.62), transparent 72%),
     linear-gradient(158deg, #06070D 0%, #04050A 52%, #070610 100%);  /* deep blue-black, mockup #05070d (was lighter/purpler) */
 }
@@ -159,6 +165,15 @@
   box-shadow: 0 26px 76px rgba(0,0,0,0.52), inset 0 1px 0 rgba(255,255,255,0.06);
   backdrop-filter: blur(var(--hart-blur)) saturate(var(--hart-saturation));
   -webkit-backdrop-filter: blur(var(--hart-blur)) saturate(var(--hart-saturation));
+}
+/* Radius wiring: --hart-radius was emitted (theme_service :408) but NO panel consumed
+   it — the Radius slider was dead. Bind it on the rounded glass surfaces so the slider
+   is real. Default 20px == today's card look → unset shell is unchanged. Deliberately
+   EXCLUDES .top-bar (a position:fixed full-width banner that sets its own border-radius:0
+   in the shell inline <style>, which loads BEFORE this file — rounding it would notch the
+   screen corners) and .hart-hero-bar (keeps its own 32px pill at :329). */
+.glass, .panel, .start-menu, .ctx-menu, .agent-pill {
+  border-radius: var(--hart-radius, 20px);
 }
 
 /* ════════ NETFLIX HOVER-EXPAND — the signature card-focus feel ════════
@@ -347,6 +362,14 @@
 
 /* Tabular mono for the clock + metric numbers (the one place mono belongs). */
 .clock, .metric-value, .sys-value, [class*="-pct"], .hc-vol-pct { font-family: var(--hart-font-mono); font-variant-numeric: tabular-nums; }
+/* --hart-font-display: the DISPLAY/heading typeface (Space Grotesk in the Aura
+   design). It was emitted by theme_service + set by the Font picker but had NO
+   consumer, so the picker's display role was a silent no-op (reuse-hunter finding
+   2026-07-12). Wire it to the titles/headings; fall back to the UI family + system-ui
+   so an un-themed shell is pixel-identical. REUSE the emitted var - no new var. */
+.hh-row-title, .ds-panel-title, .hart-hero-title, h1, h2, h3 {
+  font-family: var(--hart-font-display), var(--hart-font-family), system-ui, sans-serif;
+}
 /* Start-menu logo keeps its accent glow; brand text in the UI font. */
 .start-btn span { font-weight: 600; letter-spacing: .02em; }
 
@@ -544,9 +567,13 @@ body.gpu-software .desktop-icon .di-glyph .mi { filter: none; }
    frame raster on every repaint. Collapse to a cheap two-hue brand gradient
    (still spectrum, not flat black) + drop the vignette pseudo. */
 body.gpu-software .wallpaper {
+  /* GF1: still a cheap 2-hue static bloom (rasters ONCE, no drift/live-blur), but the
+     hues read from the SAME --hart-amb vars as the hardware floor — so a mood retints
+     the WHOLE field, not just the GPU path (no parallel hardcoded hue). Inline defaults
+     == the old teal/violet literals → the software floor is pixel-identical when unset. */
   background:
-    radial-gradient(60% 50% at 14% 4%, rgba(0,230,195,0.10), transparent 60%),
-    radial-gradient(60% 55% at 92% 96%, rgba(155,92,255,0.12), transparent 62%),
+    radial-gradient(60% 50% at 14% 4%, rgba(var(--hart-amb-1-rgb, 0,230,195),0.10), transparent 60%),
+    radial-gradient(60% 55% at 92% 96%, rgba(var(--hart-amb-2-rgb, 155,92,255),0.12), transparent 62%),
     linear-gradient(158deg, #06070D 0%, #04050A 60%, #070610 100%);  /* deep blue-black, mockup #05070d */
 }
 body.gpu-software .wallpaper::after { display: none; }

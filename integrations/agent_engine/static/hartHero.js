@@ -73,10 +73,13 @@
       '.hart-hero-aura{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}' +
       '.hart-hero-aura .hha-ring,.hart-hero-aura .hha-halo{position:absolute;left:50%;top:50%;' +
         'border-radius:50%;transform:translate(-50%,-50%);box-sizing:border-box}' +
-      '.hart-hero-aura .hha-r1{width:330px;height:330px;border:1px solid rgba(0,230,195,.22)}' +
-      '.hart-hero-aura .hha-r2{width:398px;height:398px;border:1px solid rgba(155,92,255,.16)}' +
+      // Ring/halo hues read the ambient quad (--hart-amb-N-rgb) so a preset/mood retints
+      // the orb's brand aura in lockstep with the wallpaper. Inline defaults == the old
+      // teal/violet/cyan literals so an un-themed shell is pixel-identical.
+      '.hart-hero-aura .hha-r1{width:330px;height:330px;border:1px solid rgba(var(--hart-amb-1-rgb, 0,230,195),.22)}' +
+      '.hart-hero-aura .hha-r2{width:398px;height:398px;border:1px solid rgba(var(--hart-amb-2-rgb, 155,92,255),.16)}' +
       '.hart-hero-aura .hha-halo{width:362px;height:362px;' +
-        'background:radial-gradient(circle, transparent 44%, rgba(41,197,255,.13) 56%, rgba(155,92,255,.09) 66%, transparent 78%)}' +
+        'background:radial-gradient(circle, transparent 44%, rgba(var(--hart-amb-3-rgb, 41,197,255),.13) 56%, rgba(var(--hart-amb-2-rgb, 155,92,255),.09) 66%, transparent 78%)}' +
       // Hardware: the rings + halo BREATHE in sync with the orb (~5s period).
       'body.gpu-hardware .hart-hero-aura .hha-r1{animation:hha-breathe 5s ease-in-out infinite}' +
       'body.gpu-hardware .hart-hero-aura .hha-r2{animation:hha-breathe 5s ease-in-out infinite .6s}' +

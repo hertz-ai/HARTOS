@@ -1,0 +1,49 @@
+{
+  "id": "aura",
+  "name": "Aura",
+  "description": "Violet-forward cosmic — teal on function.",
+  "category": "dark",
+  "gtk_prefer_dark": true,
+  "colors": {
+    "background": "04050B",
+    "accent": "00E6C3",
+    "heading": "00E6C3",
+    "secondary": "9B5CFF",
+    "ambient_1": "B182FF",
+    "ambient_2": "00DDF9",
+    "ambient_3": "FB66B6",
+    "ambient_4": "FFB330",
+    "active": "00e676",
+    "text": "F2F4FF",
+    "muted": "9AA0C6",
+    "surface": "0A0C18",
+    "glass_bg": "rgba(255,255,255,0.05)",
+    "glass_border": "rgba(255,255,255,0.10)"
+  },
+  "font": {
+    "family": "Space Grotesk",
+    "display": "Space Grotesk",
+    "mono": "JetBrains Mono",
+    "size": 14,
+    "heading_size": 26,
+    "weight": 400,
+    "heading_weight": 600
+  },
+  "shell": {
+    "blur_radius": 26,
+    "saturation": 150,
+    "border_radius": 22,
+    "panel_opacity": 0.07,
+    "glass_rgb": "255,255,255",
+    "glow": 85,
+    "density": 1,
+    "topbar_height": 40,
+    "icon_size": 20,
+    "panel_titlebar_height": 32,
+    "animation_speed_ms": 200
+  },
+  "wallpaper": {
+    "type": "gradient",
+    "value": "linear-gradient(158deg,#06070D,#04050A 52%,#070610)"
+  }
+}

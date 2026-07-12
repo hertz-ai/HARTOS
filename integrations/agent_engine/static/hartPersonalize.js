@@ -39,21 +39,38 @@
     return (typeof window.BACKEND === 'string' && window.BACKEND) ? window.BACKEND : '';
   }
 
-  // ── Brand PALETTES (#161). id/name + the duotone: lead accent (a), secondary
-  // accent (a2), canvas background (b). 'vibrant' = the b1.2 teal+violet default;
-  // 'monotone-teal' = the original single-hue. The CUSTOM picker builds an ad-hoc
-  // palette from three colour inputs. Exposed for reuse/tests (no parallel table).
+  // ── Brand PALETTES (#161). id/name + the ambient hue QUAD: lead accent / mood
+  // hue #1 (a), secondary accent + ambient #2 (a2), ambient hues #3/#4 (a3/a4,
+  // OPTIONAL), canvas background (b). An OPTIONAL `accent` pins the FUNCTIONAL
+  // signifier (orb core / primary CTA / earnings) to a fixed hue while a..a4 drive
+  // the AMBIENT/mood field (the steward hybrid: b1.2 teal stays on function even
+  // when the mood goes violet-lead). 'vibrant' = the b1.2 teal+violet default;
+  // 'monotone-teal' = the original single-hue. a3/a4 omitted -> --hart-amb-3/4 stay
+  // at the theme default (existing entries render pixel-identical). The 6 Aura moods
+  // (aura_template_full.html:625-632) carry the full quad + accent pinned teal.
+  // The CUSTOM picker builds an ad-hoc palette from three colour inputs. Exposed for
+  // reuse/tests (no parallel table).
   var PALETTES = window.HART_PALETTES = [
     { id: 'vibrant',       name: 'Vibrant',       a: '#00E6C3', a2: '#9B5CFF', b: '#05060C' },
     { id: 'monotone-teal', name: 'Monotone Teal', a: '#00D4AA', a2: '#00D4AA', b: '#0F0E17' },
-    { id: 'aurora',        name: 'Aurora',        a: '#00E6A8', a2: '#29C5FF', b: '#04070E' },
+    { id: 'aqua',          name: 'Aqua',          a: '#00E6A8', a2: '#29C5FF', b: '#04070E' },
     { id: 'neon',          name: 'Neon',          a: '#39FF14', a2: '#FF00E5', b: '#08010A' },
     { id: 'sunset',        name: 'Sunset',        a: '#FF8A4C', a2: '#FF2E9A', b: '#16090F' },
     { id: 'electric',      name: 'Electric',      a: '#00D9FF', a2: '#7C3AED', b: '#060814' },
     { id: 'ember',         name: 'Ember',         a: '#FF6B35', a2: '#FFC53F', b: '#140803' },
     { id: 'vapor',         name: 'Vapor',         a: '#FF71CE', a2: '#01CDFE', b: '#0A0618' },
     { id: 'ocean',         name: 'Ocean',         a: '#00C6FF', a2: '#0066FF', b: '#041018' },
-    { id: 'coral',         name: 'Coral',         a: '#FF5E7E', a2: '#FFB84C', b: '#170A0D' }
+    { id: 'coral',         name: 'Coral',         a: '#FF5E7E', a2: '#FFB84C', b: '#170A0D' },
+    // ── Aura moods (aura_template_full.html:625-632). accent pinned teal = steward
+    // hybrid (functional signifier stays teal; a..a4 = the mood quad drive ONLY the
+    // ambient field). Quads = oklch_hex(SLOTS, hue table) — Aurora hand-verified, the
+    // other five are the deterministic converter output; shared cosmic canvas bg.
+    { id: 'aurora',  name: 'Aurora',  accent: '#00E6C3', a: '#B182FF', a2: '#00DDF9', a3: '#FB66B6', a4: '#FFB330', b: '#04050B' },
+    { id: 'solar',   name: 'Solar',   accent: '#00E6C3', a: '#FF7600', a2: '#FF9B92', a3: '#DA74F1', a4: '#E5C226', b: '#04050B' },
+    { id: 'oceanic', name: 'Oceanic', accent: '#00E6C3', a: '#00B7FF', a2: '#00E1E2', a3: '#00C877', a4: '#9CBDFF', b: '#04050B' },
+    { id: 'nebula',  name: 'Nebula',  accent: '#00E6C3', a: '#EA6AE2', a2: '#B2B8FF', a3: '#00B0FF', a4: '#FF9699', b: '#04050B' },
+    { id: 'verdant', name: 'Verdant', accent: '#00E6C3', a: '#00C756', a2: '#CACC4A', a3: '#00C6D5', a4: '#F3BA25', b: '#04050B' },
+    { id: 'ember-aura', name: 'Ember Aura', accent: '#00E6C3', a: '#FF605D', a2: '#FFA85D', a3: '#F269CB', a4: '#D4AAFF', b: '#04050B' }
   ];
 
   // Swatch palettes for the 8 server-side presets (applyPreset applies by id; these
@@ -122,34 +139,78 @@
   function paintPalette(p) {
     var root = document.documentElement;
     if (!root || !root.style || !root.style.setProperty) return;
-    if (p.a) {
-      root.style.setProperty('--hart-accent', p.a);
-      var rgb = hexToRgb(p.a); if (rgb) root.style.setProperty('--hart-accent-rgb', rgb);
+    // Functional accent = the OPTIONAL override when present (teal on moods), else the
+    // lead hue. Drives --hart-accent (orb core / primary CTA / earnings / live status).
+    var acc = p.accent || p.a;
+    if (acc) {
+      root.style.setProperty('--hart-accent', acc);
+      var rgb = hexToRgb(acc); if (rgb) root.style.setProperty('--hart-accent-rgb', rgb);
     }
     if (p.a2) {
       root.style.setProperty('--hart-a2', p.a2);
       var rgb2 = hexToRgb(p.a2); if (rgb2) root.style.setProperty('--hart-a2-rgb', rgb2);
     }
+    // Ambient quad — the MOOD. amb-1 = p.a (NOT acc), so a mood is violet-lead while
+    // the functional accent stays teal. amb-3/4 OPTIONAL: when a palette omits them the
+    // theme default stands (existing duotone palettes render pixel-identical). Reuses the
+    // keystone --hart-amb-1..4 (+ -rgb) consumed by .hart-ambient / .wallpaper.
+    var amb = [p.a, p.a2, p.a3, p.a4];
+    for (var i = 0; i < 4; i++) {
+      var h = amb[i]; if (!h) continue;
+      var rg = hexToRgb(h);
+      root.style.setProperty('--hart-amb-' + (i + 1), h);
+      if (rg) root.style.setProperty('--hart-amb-' + (i + 1) + '-rgb', rg);
+    }
     if (p.b) root.style.setProperty('--hart-background', p.b);
   }
   function applyPalette(p, opts) {
     paintPalette(p);
-    if (window.HartSession) window.HartSession.set('palette', { a: p.a, a2: p.a2, b: p.b });
+    // Persist the full quad + functional-accent override so restore() re-paints the
+    // ambient mood (not just the duotone). One session blob, no parallel store.
+    if (window.HartSession) window.HartSession.set('palette',
+      { a: p.a, a2: p.a2, a3: p.a3, a4: p.a4, b: p.b, accent: p.accent });
     if (!(opts && opts.noServer)) {
-      // Extend /api/appearance/apply (do NOT fork): carry the secondary accent +
-      // the custom colours so the server persists them as overrides. Best-effort —
-      // the client apply + HartSession are already the source of truth for instant
-      // + restore; a failed post is non-fatal (offline-first).
+      // Extend /api/appearance/apply (do NOT fork): carry the secondary accent + the
+      // custom colours INCLUDING the ambient quad so the server persists them as
+      // overrides (they flow through the SAME custom-overrides path into
+      // get_css_variables -> --hart-amb-1..4). accent = the FUNCTIONAL accent (teal on
+      // moods) so the persisted --hart-accent matches the client. Best-effort — the
+      // client apply + HartSession are already the source of truth for instant +
+      // restore; a failed post is non-fatal (offline-first).
       try {
         fetch(backendBase() + '/api/appearance/apply', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ secondary_accent: p.a2, custom: { accent: p.a, secondary: p.a2, background: p.b } }),
+          body: JSON.stringify({ secondary_accent: p.a2, custom: {
+            accent: p.accent || p.a, secondary: p.a2, background: p.b,
+            ambient_1: p.a, ambient_2: p.a2, ambient_3: p.a3, ambient_4: p.a4
+          } }),
           signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null
         }).catch(function () {});
       } catch (e) {}
     }
   }
   window.HartPalette = { apply: applyPalette, paint: paintPalette, list: PALETTES };
+
+  // ── On-desktop MOOD DOCK (plan step 3). Renders HART_PALETTES as named swatches
+  // that call the reload-free applyPalette — the SAME palette store + apply path as
+  // the hub (no second palette table, no reload). The swatch is the QUAD
+  // conic-gradient (a..a4), mirroring aura_template_full.html:407-414. Mounted by the
+  // shell into a fixed-canvas glass dock (liquid_ui_service) — chrome placement per
+  // the BINDING HOME_DESKTOP_DESIGN_CHECKLIST (inside the fixed canvas, no scroll).
+  window.hartRenderMoodDock = function (host) {
+    if (!host) return;
+    host.innerHTML = '';
+    var lbl = document.createElement('span'); lbl.className = 'hart-mood-label'; lbl.textContent = 'MOOD';
+    host.appendChild(lbl);
+    PALETTES.forEach(function (p) {
+      var sw = document.createElement('div'); sw.className = 'hart-mood-sw';
+      sw.setAttribute('role', 'button'); sw.setAttribute('tabindex', '0'); sw.title = p.name;
+      sw.style.background = 'conic-gradient(from 40deg,' + p.a + ',' + (p.a2 || p.a) + ',' +
+        (p.a3 || p.a2 || p.a) + ',' + (p.a4 || p.a) + ',' + p.a + ')';
+      activate(sw, function () { applyPalette(p); toast('Mood', p.name); });
+      host.appendChild(sw);
+    });
+  };
 
   // ── ORB VARIETY (#140): the customization hub owns the persisted pref
   // (HartSession.orb_style) and drives the ONE live orb instance
@@ -297,9 +358,41 @@
     });
     grid.appendChild(buildCustomPicker());
 
-    // 1b) FEEL — live Glow (accent bloom) + Density (spacing) sliders (#170).
+    // 1b) FEEL — live Glow (accent bloom) + Density + Blur / Opacity / Radius sliders (#170).
     section('Feel');
     grid.appendChild(buildFeelControls());
+
+    // 1c) FONT — display/heading typeface from the server font catalogue. Sets
+    // --hart-font-display live (heading/title consumer in hartResponsive.css), persists
+    // via HartSession, and rides the SAME /api/appearance/apply custom-overrides path
+    // (custom.font.display). Body text stays system-ui (offline-safe). Best-effort: an
+    // unreachable /api/appearance/fonts leaves the section empty, never throws.
+    var fg = section('Font');
+    fetch(backendBase() + '/api/appearance/fonts',
+      { signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null })
+      .then(function (r) { return r.json(); }).then(function (d) {
+        (d && d.fonts || []).forEach(function (f) {
+          if (!f || !f.family) return;
+          var c = card('hart-font-card',
+            'background:#12131c;font-family:\'' + f.family + '\',system-ui;display:flex;align-items:center;justify-content:center;font-size:22px;color:#ECF1F4',
+            'Aa · ' + f.family, null);
+          activate(c, function () {
+            var root = document.documentElement;
+            if (root && root.style && root.style.setProperty)
+              root.style.setProperty('--hart-font-display', '"' + f.family + '"');
+            if (window.HartSession) window.HartSession.set('font_display', f.family);
+            try {
+              fetch(backendBase() + '/api/appearance/apply', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ custom: { font: { display: f.family } } }),
+                signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null
+              }).catch(function () {});
+            } catch (e) {}
+            toast('Font', f.family);
+          });
+          fg.appendChild(c);
+        });
+      }).catch(function () {});
 
     // 2) ORB — switchable variety, applied live + persisted (#140).
     var og = section('Orb');
@@ -436,17 +529,40 @@
     return wrap;
   }
 
-  // FEEL controls (#170): live Glow (accent bloom) + Density (spacing scale). They set
-  // --hart-glow / --hart-density on :root (1-frame CSS-var swap) + persist via HartSession.
-  // ONE injected <style> is the sole consumer (no parallel path). The glow bloom is GATED
-  // OFF on body.gpu-software/.potato so the cairo software floor stays hang-free (d8c1567).
+  // FEEL controls (#170): live Glow (accent bloom) + Density (spacing) + Blur / Opacity
+  // / Radius sliders. Each sets --hart-<key> on :root (1-frame CSS-var swap) + persists
+  // via HartSession. ONE spec table (FEEL_SLIDERS) + ONE transform (applyFeelVar) is the
+  // single source shared by the hub builder AND the boot restore — no parallel path.
+  //   scale:true  -> raw/100 (density=1, panel-opacity=0.65)
+  //   blur/radius -> a 'px' unit is appended (they feed length CSS vars)
+  // Glow/Density consume the injected <style> below; Blur/Opacity/Radius consume the
+  // shell's own CSS (hartResponsive.css --hart-blur/--hart-panel-opacity/--hart-radius).
+  var FEEL_SLIDERS = [
+    { label: 'Glow',    key: 'glow',          min: 0,  max: 100, def: 40,  scale: false },
+    { label: 'Density', key: 'density',       min: 85, max: 115, def: 100, scale: true  },
+    { label: 'Blur',    key: 'blur',          min: 8,  max: 40,  def: 30,  scale: false },
+    { label: 'Opacity', key: 'panel-opacity', min: 30, max: 90,  def: 65,  scale: true  },
+    { label: 'Radius',  key: 'radius',        min: 8,  max: 28,  def: 20,  scale: false }
+  ];
+  function feelHasUnit(key) { return key === 'blur' || key === 'radius'; }
+  function applyFeelVar(root, key, rawValue, scale) {
+    var val = scale ? (Number(rawValue) / 100) : rawValue;
+    if (feelHasUnit(key)) val = String(val) + 'px';
+    if (root && root.style && root.style.setProperty) root.style.setProperty('--hart-' + key, String(val));
+  }
+  // The glow bloom is GATED OFF on body.gpu-software/.potato so the cairo software floor
+  // stays hang-free (d8c1567). Consumer set widened beyond the orb/primary CTA to the
+  // tiles-on-hover, panels and agent pills so the accent bloom reads across the shell.
   var _feelStyleInjected = false;
   function ensureFeelStyle() {
     if (_feelStyleInjected || !document.head) return; _feelStyleInjected = true;
     var st = document.createElement('style'); st.id = 'hart-feel-style';
     st.textContent = [
       'body:not(.gpu-software):not(.potato) .hart-hero-orb,',
-      'body:not(.gpu-software):not(.potato) .ds-btn-primary {',
+      'body:not(.gpu-software):not(.potato) .ds-btn-primary,',
+      'body:not(.gpu-software):not(.potato) .hart-tile:hover,',
+      'body:not(.gpu-software):not(.potato) .panel,',
+      'body:not(.gpu-software):not(.potato) .agent-pill {',
       '  box-shadow: 0 0 calc(var(--hart-glow,40) * 0.5px) rgba(var(--hart-accent-rgb,0,230,195), calc(var(--hart-glow,40)/150));',
       '}',
       '.hart-gallery { gap: calc(10px * var(--hart-density,1)); }',
@@ -459,25 +575,24 @@
     var root = document.documentElement;
     var wrap = document.createElement('div'); wrap.className = 'hart-feel';
     var S = window.HartSession;
-    function slider(label, key, min, max, def, scale) {
+    FEEL_SLIDERS.forEach(function (fs) {
       var row = document.createElement('label'); row.className = 'hart-cp-field';
-      var span = document.createElement('span'); span.textContent = label;
-      var inp = document.createElement('input'); inp.type = 'range'; inp.min = String(min); inp.max = String(max);
-      var saved = S ? S.get(key) : null;
-      inp.value = String((saved === null || saved === undefined) ? def : saved);
-      inp.setAttribute('aria-label', label);
-      function apply() {
-        var val = scale ? (Number(inp.value) / 100) : inp.value;
-        if (root && root.style && root.style.setProperty) root.style.setProperty('--hart-' + key, String(val));
-        if (S) S.set(key, inp.value);
-      }
-      inp.addEventListener('input', apply);
-      apply();  // apply the persisted/default value now (restore on load)
+      var span = document.createElement('span'); span.textContent = fs.label;
+      var inp = document.createElement('input'); inp.type = 'range';
+      inp.min = String(fs.min); inp.max = String(fs.max);
+      var saved = S ? S.get(fs.key) : null;
+      var hasSaved = (saved !== null && saved !== undefined && saved !== '');
+      inp.value = String(hasSaved ? saved : fs.def);
+      inp.setAttribute('aria-label', fs.label);
+      inp.addEventListener('input', function () {
+        applyFeelVar(root, fs.key, inp.value, fs.scale);
+        if (S) S.set(fs.key, inp.value);
+      });
+      // Reflect a persisted choice live; DON'T write the default (an untouched control
+      // stays pixel-identical to the theme_service-emitted default — regression-safe).
+      if (hasSaved) applyFeelVar(root, fs.key, saved, fs.scale);
       row.appendChild(span); row.appendChild(inp); wrap.appendChild(row);
-      return inp;
-    }
-    slider('Glow', 'glow', 0, 100, 40, false);
-    slider('Density', 'density', 85, 115, 100, true);
+    });
     return wrap;
   }
 
@@ -522,6 +637,18 @@
         if (window._hartVoiceOrb && window._hartVoiceOrb.setStyle) { applyOrbToCanvas(getOrbStyle()); return; }
         if (tries++ < 40) setTimeout(applyOrb, 300);
       })();
+
+      // Feel sliders + display font: re-apply the persisted choice on boot so it
+      // survives reload even before the Personalize hub is opened. Only EXPLICIT picks
+      // are re-applied (unset -> the theme_service default stands, pixel-identical).
+      // Same spec + transform the hub uses (FEEL_SLIDERS / applyFeelVar) — one path.
+      var froot = document.documentElement;
+      FEEL_SLIDERS.forEach(function (fs) {
+        var sv = window.HartSession.get(fs.key);
+        if (sv !== null && sv !== undefined && sv !== '') applyFeelVar(froot, fs.key, sv, fs.scale);
+      });
+      var fd = window.HartSession.get('font_display');
+      if (fd && froot.style && froot.style.setProperty) froot.style.setProperty('--hart-font-display', '"' + fd + '"');
     });
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', restore);

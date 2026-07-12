@@ -193,11 +193,19 @@ class ThemeService:
     def _palette_overrides(secondary_accent: Optional[str],
                            custom: Optional[dict]) -> dict:
         """Build a colour override dict from a palette apply (accent / secondary /
-        background + a2). Normalizes '#rrggbb' or 'rrggbb' consistently (stored WITH
-        the leading '#', which get_css_variables detects). Returns {} when empty."""
+        background + a2 + the ambient quad ambient_1..4). Normalizes '#rrggbb' or
+        'rrggbb' consistently (stored WITH the leading '#', which get_css_variables
+        detects). Returns {} when empty.
+
+        The ambient quad is a MOOD (hartPersonalize paintPalette writes --hart-amb-1..4
+        live; this carries the same four hues server-side so the mood survives a hard
+        reload). It rides the SAME custom-overrides path as accent/secondary — no fork:
+        update_custom deep-merges these color keys and get_css_variables re-emits them
+        as --hart-amb-N(-rgb) on next load."""
         colors: Dict[str, str] = {}
         if isinstance(custom, dict):
-            for key in ('accent', 'secondary', 'background'):
+            for key in ('accent', 'secondary', 'background',
+                        'ambient_1', 'ambient_2', 'ambient_3', 'ambient_4'):
                 val = custom.get(key)
                 if isinstance(val, str) and val.strip():
                     colors[key] = ThemeService._norm_hex(val)
@@ -258,6 +266,7 @@ class ThemeService:
         """Available font families for customization."""
         return [
             {'family': 'JetBrains Mono', 'category': 'monospace'},
+            {'family': 'Space Grotesk', 'category': 'sans-serif', 'role': 'display'},
             {'family': 'Inter', 'category': 'sans-serif'},
             {'family': 'Fira Code', 'category': 'monospace'},
             {'family': 'IBM Plex Sans', 'category': 'sans-serif'},
@@ -377,8 +386,31 @@ class ThemeService:
                 lines.append(f'  --hart-a2-rgb: {sr},{sg},{sb};')
             except (ValueError, IndexError):
                 pass
+        # Ambient aurora field hue roles (--hart-amb-1..4 + their rgb triples). The
+        # drifting brand blooms that carry the desktop's "cosmic richness" were HARDCODED
+        # rgba in the CSS, so a palette/mood change never retinted them (the "not liquid
+        # enough" gap, 2026-07-12). Emitting them as theme vars makes the WHOLE ambient
+        # field reskinnable: a preset/mood (e.g. the Aura design = violet-lead) retints it
+        # by setting colors.ambient_1..4; the .hart-ambient blobs read rgba(var(--hart-amb-
+        # N-rgb), a). Defaults are the HART brand ambient, so an unset theme is visually
+        # UNCHANGED. This is step 1 of the design-agnostic runtime (LIQUID_UI_AGENTIC_
+        # FRAMEWORK_PLAN.md); the steward hybrid points these at violet/cyan/rose/amber
+        # while --hart-accent stays teal on functional signifiers.
+        _amb_defaults = ('00E6C3', '9B5CFF', '29C5FF', 'FF2E9A')
+        for i, dflt in enumerate(_amb_defaults, start=1):
+            hexv = (colors.get(f'ambient_{i}') or dflt).lstrip('#')
+            lines.append(f'  --hart-amb-{i}: #{hexv};')
+            try:
+                ar, ag, ab = int(hexv[0:2], 16), int(hexv[2:4], 16), int(hexv[4:6], 16)
+                lines.append(f'  --hart-amb-{i}-rgb: {ar},{ag},{ab};')
+            except (ValueError, IndexError):
+                pass
         # Font
         lines.append(f'  --hart-font-family: "{font.get("family", "JetBrains Mono")}";')
+        # Display/heading face (Aura = Space Grotesk). Falls back to the family stack
+        # when a theme omits it, so an unset theme keeps today's look. The mono face is
+        # the css --hart-font-mono (hartResponsive.css) — do NOT emit a second mono var.
+        lines.append(f'  --hart-font-display: "{font.get("display", font.get("family", "JetBrains Mono"))}";')
         lines.append(f'  --hart-font-size: {font.get("size", 13)}px;')
         lines.append(f'  --hart-heading-size: {font.get("heading_size", 18)}px;')
         lines.append(f'  --hart-font-weight: {font.get("weight", 400)};')
@@ -388,6 +420,14 @@ class ThemeService:
         lines.append(f'  --hart-saturation: {shell.get("saturation", 180)}%;')
         lines.append(f'  --hart-radius: {shell.get("border_radius", 16)}px;')
         lines.append(f'  --hart-panel-opacity: {shell.get("panel_opacity", 0.65)};')
+        # Themable glass BASE rgb (the Opacity slider + Aura's lighter glass): the CSS
+        # --hart-glass-bg is rgba(var(--hart-glass-rgb), var(--hart-panel-opacity)).
+        # A preset carrying shell.glass_rgb (Aura = "255,255,255" white glass) must
+        # reach the DOM to override the hartResponsive.css :root fallback; without this
+        # emit the base was frozen at the CSS default and glass_rgb was a dead field.
+        # Default == that same fallback (18,19,28), so a preset that omits it is
+        # pixel-identical. One writer, extends the shell-var emitter (no parallel path).
+        lines.append(f'  --hart-glass-rgb: {shell.get("glass_rgb", "18,19,28")};')
         lines.append(f'  --hart-topbar-height: {shell.get("topbar_height", 40)}px;')
         lines.append(f'  --hart-icon-size: {shell.get("icon_size", 20)}px;')
         lines.append(f'  --hart-titlebar-height: {shell.get("panel_titlebar_height", 32)}px;')

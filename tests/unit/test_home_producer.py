@@ -22,6 +22,7 @@ registry/HTTP), call the REAL producer functions, assert observable output.
 Run isolated (this box OOMs the full suite):
     python tests/unit/test_home_producer.py
 """
+import json
 from unittest.mock import MagicMock, patch
 
 from integrations.agent_engine import liquid_ui_service as L
@@ -167,6 +168,61 @@ def test_llm_curation_applies_eyebrow_and_features_a_row():
     assert out is not None
     assert out['hero']['eyebrow'] == 'Up while you slept'
     assert out['rows'][0]['title'] == 'Recipes'      # featured row leads now
+
+
+def test_llm_curation_drives_per_row_accent_emphasis_and_mood():
+    """The WIDENED compositional contract (§6a): the local LLM now colours EACH row
+    (accent + emphasis) and names the ambient mood, not just {eyebrow, feature}. The
+    richer JSON is accepted, applied onto the matching backbone row BY TITLE, and the
+    whole thing survives the downstream sanitize guard unchanged."""
+    backbone = _deterministic_home_payload(_ctx(spark=2140))
+    titles = [r['title'] for r in backbone['rows']]
+    target = 'Recipes' if 'Recipes' in titles else titles[-1]
+    reply = json.dumps({
+        'eyebrow': 'Up while you slept',
+        'feature': target,
+        'mood': 'aurora',                                  # ambient palette id
+        'rows': [{'title': target, 'accent': 'violet', 'emphasis': 'flagship'}],
+    })
+    with patch('core.http_pool.pooled_post',
+               return_value=_fake_resp(200, reply)):
+        out = _llm_curate_home(_ctx(spark=2140), backbone, 6790)
+    assert out is not None
+    assert out['mood'] == 'aurora'                         # ambient mood forwarded
+    lead = out['rows'][0]
+    assert lead['title'] == target                         # feature row leads
+    assert lead['accent'] == 'violet'                      # per-row accent applied
+    assert lead.get('flagship') is True                    # emphasis applied
+    # It passes the load-bearing guard intact (accent in-spectrum, mood -> slug).
+    clean = _sanitize_home_payload(out)
+    assert clean['rows'][0]['accent'] == 'violet'
+    assert clean['mood'] == 'aurora'
+
+
+def test_llm_curation_rejects_out_of_allowlist_accent_and_slugs_mood():
+    """The widened authority is still bounded: a hallucinated accent outside
+    HOME_ROW_ACCENTS is NOT applied (the backbone row's own accent stands, and the
+    sanitizer would coerce any stray to 'teal'), and a dirty mood string is reduced
+    to a safe slug the client checks against HART_PALETTES."""
+    backbone = _deterministic_home_payload(_ctx(spark=2140))
+    titles = [r['title'] for r in backbone['rows']]
+    target = titles[0]                                     # already leads (no reorder)
+    orig_accent = backbone['rows'][0]['accent']
+    assert 'chartreuse' not in HOME_ROW_ACCENTS            # guard the fixture premise
+    reply = json.dumps({
+        'feature': target,
+        'mood': 'Aurora Glow!!',                           # non-slug chars
+        'rows': [{'title': target, 'accent': 'chartreuse'}],   # out of spectrum
+    })
+    with patch('core.http_pool.pooled_post',
+               return_value=_fake_resp(200, reply)):
+        out = _llm_curate_home(_ctx(spark=2140), backbone, 6790)
+    # out-of-allowlist accent NOT applied — the backbone's own accent survives.
+    assert out['rows'][0]['accent'] == orig_accent
+    assert out['rows'][0]['accent'] in HOME_ROW_ACCENTS
+    # dirty mood -> safe slug at the load-bearing sanitize guard.
+    clean = _sanitize_home_payload(out)
+    assert clean['mood'] == 'auroraglow'
 
 
 def test_build_falls_back_to_deterministic_on_llm_junk():

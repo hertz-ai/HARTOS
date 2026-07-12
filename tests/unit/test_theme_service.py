@@ -308,9 +308,10 @@ class TestThemeServiceMisc:
     def test_get_font_options(self):
         from integrations.agent_engine.theme_service import ThemeService
         fonts = ThemeService.get_font_options()
-        assert len(fonts) == 8
+        assert len(fonts) == 9
         families = {f['family'] for f in fonts}
         assert 'JetBrains Mono' in families
+        assert 'Space Grotesk' in families  # display face (Aura); Edit §5C
         assert 'Inter' in families
         for f in fonts:
             assert 'category' in f
@@ -334,6 +335,8 @@ class TestThemeServiceMisc:
         assert ':root {' in css
         assert '--hart-accent: #6C63FF;' in css
         assert '--hart-font-family: "JetBrains Mono";' in css
+        # --hart-font-display emitted; falls back to the family when unset (Edit §5D)
+        assert '--hart-font-display: "JetBrains Mono";' in css
         assert '--hart-blur: 20px;' in css
         assert '--hart-panel-opacity: 0.65;' in css
 
