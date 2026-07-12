@@ -374,20 +374,30 @@ let
     # unaffected — XWayland is best-effort — but the moat wants legacy/Wine windows too.
     PATH=${lib.makeBinPath (with pkgs; [ coreutils xwayland ])}:$PATH
 
-    # ── NATIVE GPU RUNTIME PATH — the libEGL.so.1 dlopen fix (real-HW 2026-07-09) ──
+    # ── NATIVE GPU RUNTIME PATH — the libEGL.so.1 dlopen fix (real-HW 2026-07-09,
+    #    CORRECTED 2026-07-12 with the journald-captured hart-comp panic) ──
     # hart-comp's smithay EGL/GLES DRM backend dlopens libEGL.so.1 BY BARE SONAME at
-    # runtime (and behind it libGLESv2 / libGLdispatch / libEGL_mesa / the runtime
-    # libgbm + the iris DRI driver). Those live ONLY in /run/opengl-driver/lib
-    # (populated by hardware.graphics.enable = true, desktop.nix), NEVER in the
-    # binary's RUNPATH — Nix does not capture a dlopen'd soname, and the build-time
-    # `mesa` buildInput is link-time libgbm only. Without this, the first EGL symbol
-    # deref inside EGLDisplay::new PANICS ("Failed to load LibEGL: libEGL.so.1:
-    # cannot open shared object file") → rc=134 → the supervisor dropped to sway
-    # (observed on the steward's flash). This ONE directory resolves EVERY runtime
-    # GL/GBM/DRI library at once so the NATIVE GLES path (build_gles_renderer)
-    # completes. Harmless on the unarmed software floor (llvmpipe/swrast_dri.so live
-    # in the same aggregated tree). Set BEFORE the arm decision so both paths inherit.
-    export LD_LIBRARY_PATH=/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+    # runtime (and behind it libGLESv2.so.2 / libGLdispatch), then GLVND loads the
+    # Mesa VENDOR (libEGL_mesa) + the runtime libgbm + the iris DRI driver.
+    #
+    # SPLIT (the real-HW 2026-07-12 finding — hart-comp still panicked
+    # "Failed to load LibEGL: libEGL.so.1: cannot open shared object file" WITH the
+    # /run/opengl-driver/lib path already exported, and catch_unwind kept Tier-1 up on
+    # the pixman software floor — GPU never engaged, the "not vibrant" look):
+    #   - the GLVND DISPATCHER (libEGL.so.1, libGLESv2.so.2, libGLdispatch) that is
+    #     dlopen'd FIRST lives in ${pkgs.libglvnd}/lib, NOT in /run/opengl-driver/lib.
+    #     /run/opengl-driver/lib holds only the Mesa VENDOR (libEGL_mesa.so.0), the DRI
+    #     driver + libgbm — so the earlier one-dir fix resolved the vendor but never the
+    #     dispatcher, and the very first dlopen("libEGL.so.1") still failed.
+    # The fix is BOTH dirs: libglvnd FIRST (the soname hart-comp dlopens) THEN
+    # /run/opengl-driver/lib (the vendor + DRI + libgbm GLVND then loads via the
+    # egl_vendor.d in /run/opengl-driver/share, which NixOS's libglvnd searches). Nix
+    # never captures a dlopen'd soname in RUNPATH, and the build-time `mesa` buildInput
+    # is link-time libgbm only, so this launcher env is the only place to resolve them.
+    # Harmless on the unarmed software floor (llvmpipe/swrast_dri.so live in the same
+    # aggregated tree). Set BEFORE the arm decision so both paths inherit. A still-
+    # missing lib degrades to pixman via catch_unwind (never a lower-tier drop).
+    export LD_LIBRARY_PATH=${pkgs.libglvnd}/lib:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
     # ── GPU ARM DECISION — co-armed with the GSK shell renderer + the shell's
     #    effects via the SAME boot probe verdict (/run/hart/gpu-render) ──────────
