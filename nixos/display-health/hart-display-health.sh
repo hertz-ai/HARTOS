@@ -53,6 +53,11 @@ set -u
 # ── Paths (env-overridable so the unit test runs THIS script against fixtures) ──
 STATUS="${HART_DISPLAY_HEALTH_FILE:-/run/hart/display-health}"
 LATCH="${HART_LATCH_FILE:-/var/lib/hart/session-tier}"
+# The ACTUALLY-RUNNING tier the supervisor publishes at launch (one writer). The
+# LATCH is only written on a downward DROP, so a clean hart-comp start leaves it
+# absent — reading the latch then defaulted to 'cage' and misreported a fully
+# working Tier-1 as cage (real-HW 2026-07-12). Prefer this live marker.
+CURRENT_TIER="${HART_CURRENT_TIER_FILE:-/run/hart/session/current-tier}"
 READY="${HART_SHELL_READY_FLAG:-/run/hart/session/shell-ready}"
 INPUT="${HART_INPUT_ALIVE_FLAG:-/run/hart/session/input-alive}"
 SCANOUT="${HART_FIRST_SCANOUT_FLAG:-/run/hart/session/first-scanout}"
@@ -82,11 +87,18 @@ while [ "$WAIT" -gt 0 ] 2>/dev/null && [ "$waited" -lt "$WAIT" ]; do
   waited=$((waited + 1))
 done
 
-# ── tier: the latched session tier (the rung that won). Fail-safe = the cage
-#    FLOOR: a missing / unreadable / garbage latch means we are on the never-fail
-#    floor by contract (read_tier's own default), never an unproven higher tier. ──
+# ── tier: the tier that is actually RUNNING now. Prefer the supervisor's live
+#    `current-tier` marker (written at each launch); fall back to the drop-LATCH
+#    (only written on a downward drop), then to the cage FLOOR. This is the fix for
+#    the weeks-long misreport where a clean hart-comp start left the latch absent so
+#    this defaulted to 'cage' and hid a working Tier-1. Order: live > latch > floor. ──
 tier=cage
-if [ -r "$LATCH" ]; then
+if [ -r "$CURRENT_TIER" ]; then
+  _t=$(cat "$CURRENT_TIER" 2>/dev/null | tr -d '[:space:]')
+  case "$_t" in
+    hart-comp|sway|cage) tier="$_t" ;;
+  esac
+elif [ -r "$LATCH" ]; then
   _t=$(cat "$LATCH" 2>/dev/null | tr -d '[:space:]')
   case "$_t" in
     hart-comp|sway|cage) tier="$_t" ;;

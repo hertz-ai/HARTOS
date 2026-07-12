@@ -606,6 +606,15 @@ let
     fi
 
     log "launching tier '$TIER': $CMD"
+    # Publish the ACTUALLY-RUNNING tier (the rung we are launching NOW) so
+    # hart-display-health + any observer report the LIVE tier, NOT the drop-LATCH.
+    # The latch is written ONLY on a downward drop, so a clean hart-comp start never
+    # wrote it → hart-display-health defaulted to 'cage' and misreported a fully
+    # working Tier-1 as cage for weeks (real-HW 2026-07-12: hart-comp ran + scanned
+    # out + painted while display-health said tier=cage, sending every diagnosis down
+    # the wrong path). One writer, /run tmpfs, rewritten on every (re)launch so it
+    # always reflects the rung that is actually up. Best-effort; never fatal.
+    printf '%s\n' "$TIER" > "${sessionRunDir}/current-tier" 2>/dev/null || true
     # Clear any stale paint + input markers from a previous tier/boot BEFORE launch
     # so they can never mask this tier's hang (they live in /run tmpfs but a same-
     # boot re-launch could leave a marker behind). The shell host re-touches the
