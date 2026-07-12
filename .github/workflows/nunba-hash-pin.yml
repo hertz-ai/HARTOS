@@ -1,0 +1,41 @@
+name: Nunba Hash Pin
+
+# Dispatch-ONLY driver for R3 (the Nunba native daemon that serves the canonical
+# LightYourHART). Builds packages.x86_64-linux.nunba; on a FOD hash mismatch (the
+# nunbaHash / npmDepsHash seeded lib.fakeHash) the real hash is printed in the log,
+# which we read to pin it. Never fires on push/nightly, so it can NEVER redden the
+# release build. Iterate: dispatch -> read got: -> pin in nixos/packages/nunba.nix
+# -> repeat until nunbaHash + npmDepsHash pinned, then walk the python import-domino.
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: nunba-hash-pin
+  cancel-in-progress: true
+
+jobs:
+  build-nunba:
+    name: Build packages.nunba (surface FOD hash)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            fallback = true
+      - name: Build packages.nunba (tolerate failure; we read the hash)
+        working-directory: nixos
+        run: |
+          set +e
+          nix build .#packages.x86_64-linux.nunba --no-link --print-build-logs 2>&1 | tee /tmp/nunba-build.log
+          echo "NIX_EXIT=${PIPESTATUS[0]}"
+      - name: Surface FOD hash mismatch (nunbaHash / npmDepsHash)
+        if: always()
+        run: |
+          echo "===== hash / FOD lines ====="
+          grep -iE "hash mismatch|specified:|got:|sha256-|npmDepsHash|prefetch-npm-deps|error:" /tmp/nunba-build.log | head -40 || echo "(no hash/error lines)"
+          echo "===== last 60 log lines ====="
+          tail -n 60 /tmp/nunba-build.log || true
