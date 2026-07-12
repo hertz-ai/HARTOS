@@ -87,7 +87,15 @@ let
     # `canvas` is an OPTIONAL dep (needs cairo/pango + node-gyp); react-pdf renders
     # without it. Omit optional native deps so the sandbox needs NO C toolchain.
     npm_config_omit = "optional";
-    npmInstallFlags = [ "--omit=optional" ];
+    # --legacy-peer-deps: react-konva declares `konva >=2.6` as an UNMET peer (it is
+    # not a resolved lock entry — only a peerDependencies spec), so npm 7+ tries to
+    # AUTO-FETCH konva during `npm ci` → offline cache miss `ENOTCACHED ... only-if-
+    # cached` (R3 round-3 build). Skipping peer auto-install (npm-6 behaviour) is the
+    # canonical buildNpmPackage fix npm itself suggests, and does NOT change
+    # npmDepsHash (that is prefetched from package-lock.json alone). Also silences the
+    # mochawesome/mocha ERESOLVE peer conflicts from the cypress test tooling.
+    npmFlags = [ "--legacy-peer-deps" ];
+    npmInstallFlags = [ "--omit=optional" "--legacy-peer-deps" ];
     nativeBuildInputs = [ pkgs.python3 ];
 
     PUBLIC_URL = "/";                     # root-absolute assets (/static/...) — the
