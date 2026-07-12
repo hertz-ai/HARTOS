@@ -109,33 +109,20 @@ let
     GENERATE_SOURCEMAP = "false";
     NODE_OPTIONS = "--max-old-space-size=4096";
 
-    # autobahn/lib does `require('when/monitor/console')`. when@3.7.8 DOES ship
-    # monitor/console.js (verified) yet CRA's webpack-4 still fails "Can't resolve
-    # 'when/monitor/console' in .../autobahn/lib" (R3 round-4/5) — so the earlier
-    # preBuild stub either did not run (hook not honored) or landed off the resolve
-    # path. `postConfigure` runs AFTER `npm ci` (node_modules populated) and is
-    # reliably honored by buildNpmPackage; the loud markers make round-6 definitive.
+    # autobahn/lib does `require('when/monitor/console')`, which CRA's webpack traces
+    # at BUILD time. autobahn declares `when` as an OPTIONAL dependency
+    # (optionalDependencies: { "when": ">= 3.7.7" }; lock marks it "optional": true),
+    # so --omit=optional (kept above to skip the `canvas` node-gyp C build) DROPS it —
+    # round-6's postConfigure diagnostic proved node_modules/when did not exist, which
+    # is why the stub's `[ -d ]` guard never fired. `when@3.7.8` is pure-JS and IS a
+    # resolved package-lock entry (so it is in the prefetched OFFLINE cache), so install
+    # JUST it from the cache after `npm ci` — surgical: it does not re-trigger the
+    # canvas build the way dropping --omit=optional would, and does not touch the lock.
     postConfigure = ''
-      echo "=== HART preConfigure-stub: cwd=$(pwd) ==="
-      ls -la node_modules/when 2>&1 | head -4 || echo "(no node_modules/when)"
-      ls -la node_modules/when/monitor 2>&1 | head -8 || echo "(no when/monitor)"
-      find node_modules -maxdepth 4 -path '*when/monitor/console.js' 2>/dev/null || true
-      for d in node_modules/when node_modules/autobahn/node_modules/when; do
-        if [ -d "$d" ]; then
-          mkdir -p "$d/monitor"
-          [ -f "$d/monitor/console.js" ] || printf 'module.exports = {};\n' > "$d/monitor/console.js"
-          echo "HART stub ensured: $d/monitor/console.js -> $(ls -l "$d/monitor/console.js" 2>&1)"
-        fi
-      done
-      echo "=== HART preConfigure-stub done ==="
-    '';
-    preBuild = ''
-      for d in node_modules/when node_modules/autobahn/node_modules/when; do
-        if [ -d "$d" ]; then
-          mkdir -p "$d/monitor"
-          printf 'module.exports = {};\n' > "$d/monitor/console.js"
-        fi
-      done
+      echo "=== HART: install autobahn's optional dep `when` (dropped by --omit=optional) ==="
+      npm install when@3.7.8 --offline --no-save --no-audit --no-fund --legacy-peer-deps
+      ls -l node_modules/when/monitor/console.js 2>&1 \
+        || echo "WARN: when/monitor/console.js still missing after install"
     '';
 
     dontFixup = true;
