@@ -11,7 +11,7 @@
                    # nunbaHash + npmDepsHash for THIS rev (both seeded lib.fakeHash);
                    # bump all three in ONE commit (npm ci fails the lock-vs-deps
                    # integrity check if the rev and the lock drift apart).
-, nunbaHash ? lib.fakeHash    # nix-prefetch-github hertz-ai Nunba --rev ${nunbaRev}
+, nunbaHash ? "sha256-vEVEuk8kTSKqc5zlCTj9MBjxP9/XLZp63zxeF0K91U4="  # pinned 2026-07-12 for nunbaRev cb849ba9 (CI hash-pin, R3)
 , npmDepsHash ? lib.fakeHash  # prefetch-npm-deps landing-page/package-lock.json
 , backendUrl ? "http://127.0.0.1:6777"
 }:
