@@ -59,7 +59,12 @@ in
         User = "hart";
         Group = "hart";
         WorkingDirectory = hartApp;
-        ExecStart = "${hartApp.python}/bin/python integrations/vision/minicpm_server.py --model_dir ${config.hart.vision.modelDir} --port ${toString cfg.ports.vision} --device ${config.hart.vision.device}";
+        # --log_file MUST be absolute + writable: minicpm_server.py defaults it to
+        # the RELATIVE `minicpm_sidecar.log`, which resolves against WorkingDirectory
+        # (= hartApp, the RO nix store) → `OSError: Read-only file system` crashed
+        # the sidecar on the ISO (real-HW bdd849 journal). cfg.dataDir is already in
+        # ReadWritePaths (writable under ProtectSystem=strict), so log there.
+        ExecStart = "${hartApp.python}/bin/python integrations/vision/minicpm_server.py --model_dir ${config.hart.vision.modelDir} --port ${toString cfg.ports.vision} --device ${config.hart.vision.device} --log_file ${cfg.dataDir}/minicpm_sidecar.log";
 
         EnvironmentFile = lib.mkIf (builtins.pathExists "/etc/hart/hart.env") "/etc/hart/hart.env";
 

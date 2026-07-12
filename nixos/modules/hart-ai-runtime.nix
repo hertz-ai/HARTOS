@@ -445,21 +445,32 @@ in
           Group = "hart";
           Slice = "hart-agents.slice";
 
-          ExecStart = "${cfg.package.python}/bin/python -c '${''
-            import sys, os
-            sys.path.insert(0, "${cfg.package}")
-            os.environ["HEVOLVE_DATA_DIR"] = "${cfg.dataDir}"
-            from integrations.agent_engine.world_model_bridge import WorldModelBridge
-            bridge = WorldModelBridge()
-            if bridge.check_health():
-                print("[HART OS] World model connected")
-            else:
-                print("[HART OS] World model unavailable (will retry)")
-            import time
-            while True:
-                time.sleep(60)
-                bridge.check_health()
-          ''}'";
+          # The health-loop is delivered as a SCRIPT FILE, not an inline
+          # `python -c '<multiline>'`.  A multi-line ExecStart value (the Nix
+          # ''…'' block expands to literal newlines) is written VERBATIM into the
+          # unit file, and systemd continues a directive across lines only with a
+          # trailing '\'; the raw newlines closed the directive on its first line
+          # with an unterminated quote → "Unbalanced quoting, ignoring" → the
+          # service had NO valid ExecStart and never started (real-HW bdd849 boot
+          # journal).  A writeText file makes ExecStart a trivial two-token
+          # command with zero systemd quoting — same fix shape as this module's
+          # writeShellScript units, and the code is byte-for-byte the original.
+          ExecStart =
+            let worldModelDaemon = pkgs.writeText "hart-world-model.py" ''
+              import sys, os, time
+              sys.path.insert(0, "${cfg.package}")
+              os.environ["HEVOLVE_DATA_DIR"] = "${cfg.dataDir}"
+              from integrations.agent_engine.world_model_bridge import WorldModelBridge
+              bridge = WorldModelBridge()
+              if bridge.check_health():
+                  print("[HART OS] World model connected")
+              else:
+                  print("[HART OS] World model unavailable (will retry)")
+              while True:
+                  time.sleep(60)
+                  bridge.check_health()
+            '';
+            in "${cfg.package.python}/bin/python ${worldModelDaemon}";
 
           Restart = "on-failure";
           RestartSec = 30;

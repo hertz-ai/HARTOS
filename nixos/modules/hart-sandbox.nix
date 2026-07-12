@@ -516,6 +516,13 @@ in
       ];
       wantedBy = [ "multi-user.target" ];
 
+      # The diagnostic script (writeShellScriptBin, no baked PATH) calls awk,
+      # find, grep, cat, curl, systemctl, lsmod on the BARE unit PATH — gawk is
+      # not there, so `awk: command not found` fired on the ISO (real-HW bdd849
+      # journal). Same fix shape as hart-service-intelligence (hart-ai-runtime.nix).
+      # nvidia-smi stays optional (guarded by `command -v`).
+      path = with pkgs; [ gawk gnugrep findutils coreutils curl systemd kmod util-linux ];
+
       unitConfig = {
         ConditionPathExists = "!/var/lib/hart/.sandbox-validated";
       };
