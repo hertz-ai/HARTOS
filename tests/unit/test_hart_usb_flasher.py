@@ -1160,3 +1160,58 @@ def test_write_at_chunks_larger_than_chunk_size_are_all_written():
     n = w.write_at(0, io.BytesIO(payload))
     assert n == len(payload)                         # already sector-aligned
     assert k.buf.getvalue() == payload
+
+
+# ── --start-part RESUME (salvages a reaped / timed-out flash) ────────────────
+# The write is slow (~6.6 MB/s on a Cruzer Blade => ~17 min for the 6.7 GB
+# desktop ISO), longer than a single uninterrupted window on some hosts. When a
+# prior run already wrote the first N parts, `--start-part N` resumes: it writes
+# ONLY parts >= N at their ABSOLUTE offsets and SKIPS the destructive diskpart
+# clean (which would wipe the already-written parts). Validated end-to-end by a
+# real flash whose sha256 read-back matched byte-for-byte.
+
+def _resume_env(monkeypatch, parts):
+    sizes = {p["name"]: p["size"] for p in parts}
+    dl, writes = [], []
+    monkeypatch.setattr(flasher, "IS_WIN", False)   # exercise the portable write path
+    monkeypatch.setattr(flasher, "find_gh", lambda: "gh")
+    monkeypatch.setattr(flasher, "find_dd", lambda: "dd")
+    monkeypatch.setattr(flasher, "list_parts", lambda gh, tag, variant: [dict(p) for p in parts])
+    monkeypatch.setattr(flasher, "verify_iso", lambda disk, dd, log: True)
+    monkeypatch.setattr(flasher, "_run", lambda *a, **k: None)
+    monkeypatch.setattr(flasher, "download_part",
+                        lambda gh, tag, name, tmp, want, log, tries=4: dl.append(name) or ("src:" + name))
+
+    def _fake_write(disk, src, off, dd, log, writer):
+        name = src.split(":", 1)[1]
+        writes.append((name, off))
+        return sizes[name]
+    monkeypatch.setattr(flasher, "write_source_to_device", _fake_write)
+    return dl, writes
+
+
+def test_start_part_resume_writes_only_remaining_parts_at_absolute_offsets(monkeypatch, tmp_path):
+    parts = [{"name": "p0", "size": 100, "id": 0, "state": "uploaded"},
+             {"name": "p1", "size": 200, "id": 1, "state": "uploaded"},
+             {"name": "p2", "size": 300, "id": 2, "state": "uploaded"},
+             {"name": "p3", "size": 400, "id": 3, "state": "uploaded"}]
+    dl, writes = _resume_env(monkeypatch, parts)
+    disk = {"number": 2, "model": "T", "physdrive": r"\.\PhysicalDrive2", "dev": "/dev/sdx"}
+    ok = flasher.flash("tag", "desktop", disk, "download", str(tmp_path), start_part=2)
+    assert ok is True
+    # only parts >= 2 are downloaded + written; 0 and 1 are already on the device
+    assert dl == ["p2", "p3"]
+    assert [n for n, _ in writes] == ["p2", "p3"]
+    # ABSOLUTE cumulative offsets survive the skip: p2 @ 100+200, p3 @ 100+200+300
+    assert dict(writes) == {"p2": 300, "p3": 600}
+
+
+def test_start_part_zero_is_a_full_flash_no_skip(monkeypatch, tmp_path):
+    parts = [{"name": "p%d" % i, "size": (i + 1) * 10, "id": i, "state": "uploaded"}
+             for i in range(3)]
+    _dl, writes = _resume_env(monkeypatch, parts)
+    disk = {"number": 2, "model": "T", "physdrive": r"\.\x", "dev": "/dev/sdx"}
+    ok = flasher.flash("tag", "desktop", disk, "download", str(tmp_path))  # default start_part=0
+    assert ok is True
+    assert [n for n, _ in writes] == ["p0", "p1", "p2"]      # every part written
+    assert dict(writes) == {"p0": 0, "p1": 10, "p2": 30}     # unchanged normal path

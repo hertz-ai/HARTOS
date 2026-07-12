@@ -429,16 +429,22 @@ def _win_diskpart_clean(disk_number, log):
             pass
 
 
-def _prepare_windows_device(disk, dd, log):
+def _prepare_windows_device(disk, dd, log, clean=True):
     """Release Windows' raw-write protection before flashing: disable automount
     (so the freshly-written ISO isn't re-mounted + re-protected mid-write), drop
     any drive-letter mounts, and wipe the partition table with diskpart `clean`
     so there is no protected partition/volume. Without this, raw writes fail with
-    'Invalid request code' / 'Permission denied' at ~12 MB."""
+    'Invalid request code' / 'Permission denied' at ~12 MB.
+
+    ``clean=False`` (a --start-part RESUME) keeps automount-off + dismount but
+    SKIPS diskpart `clean` — the disk already holds the earlier parts, and a
+    successful clean would wipe them. The exclusive-handle write still proceeds
+    (the earlier parts already broke the ~12 MB wall)."""
     def _do_prepare():
         _win_automount(False)
         _dismount_windows(disk)
-        _win_diskpart_clean(disk["number"], log)
+        if clean:
+            _win_diskpart_clean(disk["number"], log)
 
     try:
         _do_prepare()
@@ -1267,7 +1273,7 @@ def _create_log_partition_unix(disk, log):
 
 # ───────────────────────── orchestration ─────────────────────────
 def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
-          make_log_partition=False):
+          make_log_partition=False, start_part=0):
     log = log or (lambda m: None)
     progress = progress or (lambda f: None)
     gh = find_gh()
@@ -1287,10 +1293,18 @@ def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
     done = 0
     writer = None
     if IS_WIN:
-        _prepare_windows_device(disk, dd, log)
+        # RESUME (start_part>0): keep the disk's already-written parts — skip the
+        # destructive diskpart clean, only automount-off + dismount.
+        _prepare_windows_device(disk, dd, log, clean=(start_part <= 0))
         writer = _WinExclusiveWriter(disk["number"])   # held exclusive for all parts
     try:
-        for p, off in zip(parts, offs):
+        for idx, (p, off) in enumerate(zip(parts, offs)):
+            if idx < start_part:
+                log("* %s @ %d — SKIP (already written; --start-part %d resume)"
+                    % (p["name"], off, start_part))
+                done += p["size"]
+                progress(done / total)
+                continue
             log("* %s @ %d (%s)" % (p["name"], off, human(p["size"])))
             if mode == "download":
                 src = download_part(gh, tag, p["name"], tmp, p["size"], log)
@@ -1470,7 +1484,8 @@ def cmd_flash(args):
            warn or "removable/blank"))
     try:
         ok = flash(tag, args.variant, disk, args.mode, args.tmp, log=log,
-                   make_log_partition=args.windows_log_partition)
+                   make_log_partition=args.windows_log_partition,
+                   start_part=args.start_part)
     except Exception as e:
         log("FLASH FAILED: %s" % e)
         sys.stderr.write("FLASH FAILED: %s\n  (debug log: %s)\n" % (e, log_path))
@@ -1492,6 +1507,11 @@ def build_parser():
                         "or download (download each part fully, then write)")
     p.add_argument("--tmp", default=default_tmp(), help="scratch dir (download mode)")
     p.add_argument("--yes", action="store_true", help="confirm the destructive write")
+    p.add_argument("--start-part", type=int, default=0,
+                   help="RESUME: skip writing parts before this index (already on "
+                        "the device) and skip the destructive diskpart clean. Use "
+                        "when a prior run wrote the first N parts (e.g. --start-part 2 "
+                        "after part-00/01 completed). Offsets stay absolute.")
     p.add_argument("--quiet", action="store_true", help="silent CLI (errors to stderr)")
     p.add_argument("--log", help="debug log file (default: <tmp>/hart_flash.log)")
     p.add_argument("--allow-system", action="store_true",
