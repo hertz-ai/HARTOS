@@ -84,18 +84,20 @@ let
 
     inherit npmDepsHash;
 
-    # `canvas` is an OPTIONAL dep (needs cairo/pango + node-gyp); react-pdf renders
-    # without it. Omit optional native deps so the sandbox needs NO C toolchain.
-    npm_config_omit = "optional";
-    # --legacy-peer-deps: react-konva declares `konva >=2.6` as an UNMET peer (it is
-    # not a resolved lock entry — only a peerDependencies spec), so npm 7+ tries to
-    # AUTO-FETCH konva during `npm ci` → offline cache miss `ENOTCACHED ... only-if-
-    # cached` (R3 round-3 build). Skipping peer auto-install (npm-6 behaviour) is the
-    # canonical buildNpmPackage fix npm itself suggests, and does NOT change
-    # npmDepsHash (that is prefetched from package-lock.json alone). Also silences the
-    # mochawesome/mocha ERESOLVE peer conflicts from the cypress test tooling.
+    # We must INSTALL optional deps (so autobahn's optional `when` — needed by its
+    # build-time `require('when/monitor/console')` — lands in node_modules; R3
+    # round-6 proved --omit=optional dropped it), but must NOT run the `canvas`
+    # node-gyp C build (no cairo/pango toolchain in the sandbox). `--ignore-scripts`
+    # gives both: every dep's FILES are extracted from the prefetched cache (pure-JS
+    # `when` included), while NO install/build script runs (canvas's node-gyp is
+    # never invoked — canvas is not imported at build; react-pdf renders without it).
+    # --legacy-peer-deps: react-konva declares `konva >=2.6` as an UNMET peer (not a
+    # resolved lock entry — only a peerDependencies spec), so npm 7+ tries to
+    # AUTO-FETCH konva during `npm ci` → offline cache miss `ENOTCACHED` (R3 round-3).
+    # Skipping peer auto-install (npm-6 behaviour) is the canonical buildNpmPackage
+    # fix; neither flag changes npmDepsHash (prefetched from package-lock.json alone).
     npmFlags = [ "--legacy-peer-deps" ];
-    npmInstallFlags = [ "--omit=optional" "--legacy-peer-deps" ];
+    npmInstallFlags = [ "--legacy-peer-deps" "--ignore-scripts" ];
     nativeBuildInputs = [ pkgs.python3 ];
 
     PUBLIC_URL = "/";                     # root-absolute assets (/static/...) — the
@@ -109,21 +111,10 @@ let
     GENERATE_SOURCEMAP = "false";
     NODE_OPTIONS = "--max-old-space-size=4096";
 
-    # autobahn/lib does `require('when/monitor/console')`, which CRA's webpack traces
-    # at BUILD time. autobahn declares `when` as an OPTIONAL dependency
-    # (optionalDependencies: { "when": ">= 3.7.7" }; lock marks it "optional": true),
-    # so --omit=optional (kept above to skip the `canvas` node-gyp C build) DROPS it —
-    # round-6's postConfigure diagnostic proved node_modules/when did not exist, which
-    # is why the stub's `[ -d ]` guard never fired. `when@3.7.8` is pure-JS and IS a
-    # resolved package-lock entry (so it is in the prefetched OFFLINE cache), so install
-    # JUST it from the cache after `npm ci` — surgical: it does not re-trigger the
-    # canvas build the way dropping --omit=optional would, and does not touch the lock.
-    postConfigure = ''
-      echo "=== HART: install autobahn's optional dep `when` (dropped by --omit=optional) ==="
-      npm install when@3.7.8 --offline --no-save --no-audit --no-fund --legacy-peer-deps
-      ls -l node_modules/when/monitor/console.js 2>&1 \
-        || echo "WARN: when/monitor/console.js still missing after install"
-    '';
+    # (autobahn's optional `when` now installs via --ignore-scripts above — round-7
+    # proved a post-ci `npm install when --offline` fails ENOTCACHED because `npm
+    # install` does a REGISTRY METADATA lookup that the npm-ci offline cache lacks;
+    # `npm ci` installs straight from the lock, so including optional deps is the fix.)
 
     dontFixup = true;
     installPhase = ''
