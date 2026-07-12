@@ -2,17 +2,19 @@
 
 The live bug: desktop icons launched only on a `dblclick`, which never fires on a
 touchscreen tap, so a real device could not open anything. The fix wires a real
-TAP (a quick, near-stationary pointerup) to launch on touch AND mouse, adds
-right-click / long-press context menus for the icon, the desktop background, and
-a window titlebar, and keeps everything draggable with a window raise on focus.
+TAP to the correct activation PER SURFACE (f2, steward #1466/#1467): a TOUCH tap
+OPENS (a touchscreen has no hover/dblclick), a MOUSE single click only SELECTS,
+and the existing dblclick OPENS. It also adds right-click / long-press context
+menus for the icon, the desktop background, and a window titlebar, and keeps
+everything draggable with a window raise on focus.
 
 `test_desktop_tap_menus_behaviour` runs the REAL static modules
 (hartContextMenu.js + hartDesktop.js) through their public surface on a tiny DOM
 shim (test_shell_desktop_tap_menus.mjs) and asserts OBSERVABLE behaviour:
 
-  * a quick press+release LAUNCHES (mouse and touch) -> openPanel(id);
+  * a TOUCH tap OPENS -> openPanel(id); a MOUSE single click only SELECTS (f2);
   * a drag does NOT launch, it rearranges + persists (HartSession.set);
-  * dblclick still launches (back-compat);
+  * dblclick still opens (the mouse open path, back-compat);
   * the icon / desktop / window menus offer the right actions and each routes to
     the existing helper (openPanel / closePanel / launch); the window menu raises
     the window first (multi-window focus);

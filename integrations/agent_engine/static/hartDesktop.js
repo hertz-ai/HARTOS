@@ -217,15 +217,20 @@
   function bindIcon(el) {
     var id = el.getAttribute('data-id');
     var dragging = false, moved = false, sx = 0, sy = 0, ox = 0, oy = 0, dx = 0, dy = 0, raf = 0;
+    var ptrType = 'mouse';                    // pointer kind of the in-flight press (f2: touch opens, mouse selects)
     var downAt = 0, lpTimer = 0;
 
     // A real tap on a touchscreen is a quick, near-stationary press+release. The
     // old code only opened on touch via the 'moved' flag (a 3px jitter would
     // flip it to a no-op move) and the mouse needed a DOUBLE click — so a single
-    // tap on the device never launched. We now treat ANY pointer (touch OR
-    // mouse) as single-activate: a press that ends within TAP_MS and < TAP_PX
-    // LAUNCHES. Mouse dblclick is kept harmless (re-launch is idempotent: an
-    // already-open panel just gets raised by openPanel).
+    // tap on the device never launched. Correct semantics per surface (f2):
+    //   TOUCH  — a single tap (< TAP_MS, < TAP_PX) OPENS (the hover-finger cursor
+    //            promises tap-to-open); Enter opens too.
+    //   MOUSE/PEN — a single click only SELECTS (visual + clears siblings); the
+    //            existing dblclick handler (below) OPENS. Enter still opens.
+    // We capture e.pointerType on pointerdown and branch the tap arm in endDrag.
+    // Mouse dblclick stays harmless (re-launch is idempotent: an already-open
+    // panel just gets raised by openPanel).
     el.style.touchAction = 'none';            // a drag must not scroll/select on touch
     el.style.webkitUserSelect = 'none';
     el.style.userSelect = 'none';
@@ -240,6 +245,7 @@
     el.addEventListener('pointerdown', function (e) {
       if (e.button !== 0) return;
       dragging = true; moved = false;
+      ptrType = e.pointerType || 'mouse';            // 'touch' => tap opens; 'mouse'/'pen' => click selects (f2)
       downAt = (e.timeStamp || Date.now());
       sx = e.clientX; sy = e.clientY; dx = 0; dy = 0;
       ox = parseInt(el.style.left, 10) || 0; oy = parseInt(el.style.top, 10) || 0;
@@ -308,10 +314,11 @@
           el.style.top = snap(oy + dy) + 'px';
         }
         persist();
-      } else if (isTap) {                             // touch OR mouse: a single tap opens
-        selectIcon(el);                               // reflect selection too (visual feedback)
+      } else if (isTap) {                             // a quick, stationary press
+        selectIcon(el);                               // always reflect selection (clears siblings)
         try { el.focus(); } catch (_) {}              // pointerdown.preventDefault() suppressed focus; restore it for keyboard
-        launch(id);
+        // f2: touch tap OPENS; mouse/pen single click only SELECTS (dblclick handler opens).
+        if (ptrType === 'touch') launch(id);
       } else {                                        // a slow press that didn't move: just select
         selectIcon(el);
         try { el.focus(); } catch (_) {}

@@ -21,6 +21,41 @@
 
   function $(id) { return document.getElementById(id); }
 
+  // ── Shell fetch idiom (mirrors hartHome.js:46 / hartFiles.js:19 — each static
+  // module carries this tiny same-origin helper; NOT a parallel API layer, just
+  // the established per-file convention). window.SHELL is the base; window._sig
+  // is the shell's own abort-signal helper so a hung endpoint never stalls us.
+  function shell() {
+    return (typeof window.SHELL === 'string' && window.SHELL) ? window.SHELL : '';
+  }
+  function sig(ms) {
+    try { if (typeof window._sig === 'function') return window._sig(ms); } catch (e) {}
+    try {
+      if (typeof AbortController === 'function') {
+        var ac = new AbortController();
+        setTimeout(function () { try { ac.abort(); } catch (e2) {} }, ms || 4000);
+        return ac.signal;
+      }
+    } catch (e3) {}
+    return undefined;
+  }
+  function getJSON(url, ms) {
+    var opt = {}; var s = sig(ms || 4000); if (s) opt.signal = s;
+    return fetch(url, opt).then(function (r) {
+      if (!r.ok) throw new Error('http ' + r.status);
+      return r.json();
+    });
+  }
+  function postJSON(url, body, ms) {
+    var opt = { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body || {}) };
+    var s = sig(ms || 4000); if (s) opt.signal = s;
+    return fetch(url, opt).then(function (r) {
+      if (!r.ok) throw new Error('http ' + r.status);
+      return r.json().catch(function () { return {}; });
+    });
+  }
+
   // Live listening flag. isRecording is a top-level let in the inline shell
   // script (shared global lexical scope); guard against the temporal-dead-zone
   // ReferenceError on the off-chance this runs before that script evaluated.
@@ -206,15 +241,10 @@
       return false;
     }
 
-    // Dispatch into the EXISTING assistant pipeline (open chat -> fill #ac-input
-    // -> acSend). Mirrors how a typed command and a spoken command converge.
-    // App names launch instantly (tryLaunch); only real questions/commands fall
-    // through to the slow brain.
-    function dispatch(text) {
-      text = (text || '').trim();
-      if (!text) return;
-      // Deterministic fast-path: a known app/panel name launches now, no "Thinking…".
-      if (tryLaunch(text)) { input.value = ''; setStatus(DEFAULT_HINT, ''); return; }
+    // The slow brain: open chat -> fill #ac-input -> acSend. This is the EXISTING
+    // assistant pipeline (one dispatch path). Only reached once the deterministic
+    // app-launch AND the local media index have both missed.
+    function brainDispatch(text) {
       var chat = $('assistant-chat'), aci = $('ac-input');
       if (chat && !chat.classList.contains('open') && typeof window.toggleAssistantChat === 'function') {
         window.toggleAssistantChat();
@@ -228,6 +258,63 @@
       if (aci) { aci.value = text; if (typeof window.acSend === 'function') window.acSend(); }
       input.value = '';
       setStatus('Hevolve AI is thinking…', 'thinking');
+    }
+
+    // Pick the best surfaceable media hit from /api/media/search's response
+    // ({query,count,results:[{path,name,kind,caption,match,score}]}). Deterministic
+    // filename/path hits (match 'exact'/'prefix', score 1.0) surface outright; a
+    // 'semantic' caption match must clear a modest score so a weak nearest neighbour
+    // never hijacks a genuine question that belongs to the brain.
+    function pickMediaHit(d) {
+      var rows = (d && d.results) || [];
+      for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        if (!r || !r.path) continue;
+        if (r.match !== 'semantic') return r;
+        if (typeof r.score === 'number' && r.score >= 0.3) return r;
+      }
+      return null;
+    }
+
+    // Surface a media hit: open it in the system default viewer via the EXISTING
+    // /api/shell/open-with route (shell_os_apis.py:1464). If that path is
+    // unavailable (non-Linux dev box / no xdg-open) fall back to REVEALING the file
+    // in the canonical File Explorer via the existing openFilesAt() global — no
+    // parallel viewer, no second file browser.
+    function surfaceMedia(hit) {
+      var path = hit && hit.path;
+      if (!path) return false;
+      var name = hit.name || path;
+      postJSON(shell() + '/api/shell/open-with', { path: path }, 4000)
+        .catch(function () {
+          var dir = String(path).replace(/[\/\\][^\/\\]*$/, '') || path;
+          if (typeof window.openFilesAt === 'function') window.openFilesAt(dir);
+          else if (window.HartFiles && typeof window.HartFiles.navigate === 'function') window.HartFiles.navigate(dir);
+        });
+      setStatus('Opening “' + name + '”', '');
+      return true;
+    }
+
+    // Dispatch: app name -> local media -> brain. A typed/spoken query resolves in
+    // order of cost. App/panel names launch instantly (tryLaunch). Then — checklist
+    // e2 — an app-name miss asks the EXISTING local media index (/api/media/search,
+    // the SAME route hartHome.js:399 uses for card-image hydration) so "photo of
+    // the beach" opens the photo instead of crawling the slow brain. Only a true
+    // miss (or a cold/absent index) falls through to acSend. Short 2.5s timeout so
+    // a warming index never stalls the command bar.
+    function dispatch(text) {
+      text = (text || '').trim();
+      if (!text) return;
+      // Deterministic fast-path: a known app/panel name launches now, no "Thinking…".
+      if (tryLaunch(text)) { input.value = ''; setStatus(DEFAULT_HINT, ''); return; }
+      setStatus('Searching your media…', 'thinking');
+      getJSON(shell() + '/api/media/search?q=' + encodeURIComponent(text) + '&limit=8', 2500)
+        .then(function (d) {
+          var hit = pickMediaHit(d);
+          if (hit && surfaceMedia(hit)) { input.value = ''; return; }
+          brainDispatch(text);
+        })
+        .catch(function () { brainDispatch(text); });
     }
 
     input.addEventListener('keydown', function (e) {

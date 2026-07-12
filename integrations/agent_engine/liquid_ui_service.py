@@ -3154,6 +3154,52 @@ function dsStatusRow(icon, label, value, color, opts) {{
     '</div>';
 }}
 
+// ── Netflix image-card ROW (design system) ──
+// d4: content listings (installed-apps registry, drives, agent lists) render as the
+// SAME cinematic rows the home paints - NOT a second card system. The vocabulary
+// (.hh-row/.hh-cards/.hh-card + gradient art + scrim) is the shared design language
+// from hartHome.css (loaded on this same origin); the brand gradient + glyph come
+// from window.HartBrandArt - the ONE palette shared with the desktop icons and the
+// home cards, so there is no parallel palette/renderer. Item fields:
+//   {{title, meta, icon, badge, accent, format, progress, onclick, action, attrs}}
+// onclick = an inline JS expression string (the panel idiom); action = trailing HTML
+// (e.g. an Uninstall button) that MUST stopPropagation itself; attrs = extra raw
+// attributes (e.g. data-mount) so paths never need inline-string quoting.
+function hhCardRow(title, items, opts) {{
+  opts = opts || {{}};
+  var BA = window.HartBrandArt;
+  var spec = (BA && BA.spectrum) || ['teal'];
+  function e(s) {{ return (BA && BA.esc) ? BA.esc(s) : String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }}
+  var list = (items && items.length) ? items : [{{empty:1, title:(opts.emptyText||'Nothing here yet')}}];
+  var cards = list.map(function(it, i) {{
+    if (it.empty) return '<div class="hh-card hh-card-empty">'+e(it.title||'Nothing here yet')+'</div>';
+    var accent = it.accent || spec[i % spec.length];
+    var grad = BA ? BA.gradient(BA.spectrumHex[accent], i) : '';
+    var fmt = it.format ? (' hh-'+e(it.format)) : '';
+    var attrs = it.onclick
+      ? (' role="button" tabindex="0" onclick="'+String(it.onclick).replace(/"/g,'&quot;')+'"')
+      : ' style="cursor:default"';
+    if (it.attrs) attrs += ' '+it.attrs;
+    var glyph = it.icon ? ('<div class="hh-card-ic">'+(BA?BA.glyphHTML(it.icon):e(it.icon))+'</div>') : '';
+    var corner = it.action
+      ? ('<div style="position:absolute;top:10px;right:10px;z-index:3">'+it.action+'</div>')
+      : (it.badge ? ('<div class="hh-card-badge">'+e(it.badge)+'</div>') : '');
+    var meta = it.meta ? ('<div class="hh-card-meta">'+e(it.meta)+'</div>') : '';
+    var prog = (typeof it.progress==='number' && it.progress>=0)
+      ? ('<div class="hh-card-prog" style="width:'+(Math.max(0,Math.min(1,it.progress))*100)+'%"></div>') : '';
+    return '<div class="hh-card'+fmt+'"'+attrs+' aria-label="'+e(it.title||'card')+'">'+
+      '<div class="hh-card-art" style="background:'+grad+'"></div>'+
+      '<div class="hh-card-scrim"></div>'+glyph+corner+
+      '<div class="hh-card-body"><div class="hh-card-title">'+e(it.title||'')+'</div>'+meta+'</div>'+
+      prog+'</div>';
+  }}).join('');
+  var accentCls = 'hh-accent-'+((BA && BA.spectrum) ? BA.spectrum[0] : 'teal');
+  var head = title ? ('<div class="hh-row-head"><div class="hh-row-title">'+e(title)+'</div>'+
+    (opts.note ? ('<div class="hh-row-note">'+e(opts.note)+'</div>') : '')+'</div>') : '';
+  return '<div class="hh-row '+accentCls+'" style="padding:'+(opts.pad||'2px 0 6px')+'">'+
+    head+'<div class="hh-cards" style="padding:6px 12px 8px 0">'+cards+'</div></div>';
+}}
+
 // ── Metric Bar (design system) ──
 function dsMetricBar(label, pct, unit, sub) {{
   const color = pct>80?'var(--hart-error)':pct>60?'var(--hart-caution)':'var(--hart-active)';
@@ -4399,22 +4445,19 @@ function loadMyComputerPanel(el) {{
     let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">This PC</div>';
     if(parts.length===0) html += '<div class="ds-body-md ds-text-muted">No drives detected</div>';
     else {{
-      html += '<div class="ds-section-label">Drives &amp; Partitions</div><div class="ds-stagger">';
-      parts.forEach(p=>{{
-        const esc = s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+      // d4: drives render as a cinematic .hh-card row (real usage progress bar per
+      // card) that still hands browsing to the canonical File Explorer via
+      // openFilesAt — mount path travels safely on data-mount, no inline quoting.
+      const esc = s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+      const items = parts.map(p=>{{
         const pct = p.percent||0;
-        const label = esc(p.device||p.mount||'Drive');
-        const sub = esc((p.fstype||'')+' \\u00b7 '+(p.free_gb||0).toFixed(1)+' GB free of '+(p.total_gb||0).toFixed(1)+' GB');
-        html += '<div class="ds-list-item ds-list-item-interactive" data-mount="'+esc(p.mount||'')+'"'+
-          ' onclick="openFilesAt(this.dataset.mount)" title="Open '+esc(p.mount||'')+'">'+
-          '<span class="mi material-icons-round ds-list-item-icon" style="color:var(--hart-accent)">'+(pct>=90?'sd_card_alert':'storage')+'</span>'+
-          '<div class="ds-list-item-content">'+
-          '<div class="ds-list-item-primary">'+label+' <span class="ds-text-muted" style="font-weight:400">'+esc(p.mount||'')+'</span></div>'+
-          '<div class="ds-list-item-secondary">'+sub+'</div>'+
-          dsMetricBar('', pct, '%')+
-          '</div><span class="mi material-icons-round ds-text-muted">chevron_right</span></div>';
+        const label = (p.device||p.mount||'Drive')+' '+(p.mount||'');
+        const sub = (p.fstype||'')+' \\u00b7 '+(p.free_gb||0).toFixed(1)+' GB free of '+(p.total_gb||0).toFixed(1)+' GB';
+        return {{ title:label, meta:sub, icon:(pct>=90?'sd_card_alert':'storage'),
+          progress:(pct/100), badge:Math.round(pct)+'%',
+          attrs:'data-mount="'+esc(p.mount||'')+'"', onclick:'openFilesAt(this.dataset.mount)' }};
       }});
-      html += '</div>';
+      html += hhCardRow('Drives & Partitions', items, {{}});
       html += '<div class="ds-body-sm ds-text-muted" style="margin-top:10px">'+
         (data.used_gb||0).toFixed(1)+' GB used of '+(data.total_gb||0).toFixed(1)+' GB across all drives</div>';
     }}
@@ -4900,23 +4943,24 @@ function appStoreSearch() {{
 function loadAppPermissionsPanel(el) {{
   fetch(SHELL+'/api/apps/installed',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const apps = data.apps||[];
-    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Installed Apps</div><div class="ds-stagger">';
-    if(apps.length===0) html += '<div class="ds-body-md ds-text-muted">No apps installed</div>';
-    else apps.slice(0,40).forEach(a=>{{
-      // data-* attributes carry id/platform/name safely (backslashes, quotes) to
-      // the shared uninstall flow (window.hartUninstallApp) — the EXACT same
-      // confirm + POST /api/apps/uninstall the desktop-icon right-click uses.
-      const esc = s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+    // data-* attributes carry id/platform/name safely (backslashes, quotes) to
+    // the shared uninstall flow (window.hartUninstallApp) — the EXACT same
+    // confirm + POST /api/apps/uninstall the desktop-icon right-click uses.
+    const esc = s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+    // d4: the install/registry/uninstall surface is a DESIGNED Netflix row, not a
+    // plain list — image-card per app + the same Uninstall action.
+    const items = apps.slice(0,40).map(a=>{{
       const aid = esc(a.app_id||a.id||a.name||'');
       const plat = esc(a.platform||'');
       const nm = esc(a.name||a.app_id||a.id||'');
+      const perms = (a.permissions||[]).join(', ')||'No special permissions';
       const rm = '<button class="ds-btn ds-btn-secondary ds-btn-sm" data-aid="'+aid+'" data-plat="'+plat+'"'+
-        ' data-nm="'+nm+'" onclick="appRegistryUninstall(this)">Uninstall</button>';
-      html += dsStatusRow('admin_panel_settings', a.name||a.app_id||a.id, a.platform||'system',
-        'var(--hart-muted)',{{sublabel:(a.permissions||[]).join(', ')||'No special permissions', trailing:rm}});
+        ' data-nm="'+nm+'" onclick="event.stopPropagation();appRegistryUninstall(this)">Uninstall</button>';
+      return {{ title:(a.name||a.app_id||a.id), meta:(a.platform||'system')+' \\u00b7 '+perms,
+        icon:'apps', action:rm }};
     }});
-    html += '</div></div>';
-    el.innerHTML = html;
+    el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Installed Apps</div>'+
+      hhCardRow('', items, {{emptyText:'No apps installed'}})+'</div>';
   }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">App permissions unavailable</div>'; }});
 }}
 // Uninstall from the installed-apps registry: delegates to the SHARED flow

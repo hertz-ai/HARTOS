@@ -31,6 +31,10 @@
  *      empty desktop. AND a real switch fires the /api/shell/workspaces/switch
  *      POST (so the pager segs + the settings squares — same fn — move native
  *      windows where a WM is present), fire-and-forget, only on a real change.
+ *   E. hartHero.js — the omnibox dispatch order (e2): app-launch -> LOCAL media
+ *      index (/api/media/search) -> brain. A filename or strong-semantic hit OPENS
+ *      the file via /api/shell/open-with and never wakes the brain; a weak semantic
+ *      nearest-neighbour or a cold/empty index falls through to acSend.
  *
  * Run:  node tests/unit/test_shell_overhaul_behaviors.mjs
  * (A Python wrapper, test_shell_overhaul_behaviors.py, shells out so pytest/CI
@@ -251,12 +255,22 @@ function makeRealm(opts) {
   R.sandbox.toggleAssistantChat = function () { chat.classList.add('open'); };
   R.sandbox.toggleVoice = function () {};
 
+  // R1 (e2): dispatch now asks the LOCAL media index (/api/media/search) BETWEEN the
+  // app-launch fast-path and the brain. Mock fetch as a SYNCHRONOUS thenable (like
+  // section C/D) returning NO media hit, so pickMediaHit misses and dispatch falls
+  // through to brainDispatch -> acSend INLINE — keeping the acSend-delegation + the
+  // no-timer-race assertions below deterministic.
+  function isThenable(x) { return x && typeof x.then === 'function'; }
+  function sync(v) { return { then(cb) { var r = cb ? cb(v) : v; return isThenable(r) ? r : sync(r); }, catch() { return this; } }; }
+  R.sandbox.fetch = function () { return sync({ ok: true, json: function () { return sync({ query: '', count: 0, results: [] }); } }); };
+
   vm.runInContext(read('hartHero.js'), R.sandbox, { filename: 'hartHero.js' });
 
-  // A real question (not an app name) -> delegates to acSend, which sets the flag.
-  // CRITICAL: the hero must NOT have armed a 4.5s clear. Our shim runs setTimeout
-  // INLINE, so if the hero still owned `setTimeout(()=>thinking(false),4500)` the
-  // flag would be FALSE right after dispatch. We assert it stays TRUE.
+  // A real question (not an app name) -> the media index misses -> delegates to
+  // acSend, which sets the flag. CRITICAL: the hero must NOT have armed a 4.5s
+  // clear. Our shim runs setTimeout INLINE, so if the hero still owned
+  // `setTimeout(()=>thinking(false),4500)` the flag would be FALSE right after
+  // dispatch. We assert it stays TRUE.
   input.value = 'what is the weather like on mars';
   input.dispatch('keydown', mkEv(input, { key: 'Enter' }));
   ok(acSendCalls === 1, 'a real question delegates to acSend exactly once');
@@ -425,6 +439,84 @@ function makeRealm(opts) {
   // The wheel/keyboard paths route through the SAME fn, so they POST too (4 != 3).
   R.sandbox.window.hartSwitchWorkspace(4);
   eq(posts.length, 2, 'a further real switch issues another POST (covers wheel/keyboard paths)');
+})();
+
+// ════════════════════════════════════════════════════════════════════════════
+// E. hartHero.js — the omnibox asks the LOCAL media index before the brain (e2)
+// ════════════════════════════════════════════════════════════════════════════
+(function testHeroMediaDispatch() {
+  console.log('\n[E] hartHero.js  a non-app query surfaces a media hit; only a miss reaches the brain');
+
+  // A synchronous thenable (real Promises defer to a microtask R.tick can't drain).
+  function isThenable(x) { return x && typeof x.then === 'function'; }
+  function sync(v) { return { then(cb) { var r = cb ? cb(v) : v; return isThenable(r) ? r : sync(r); }, catch() { return this; } }; }
+  function okResp(body) { return sync({ ok: true, json: function () { return sync(body); } }); }
+
+  // A hero realm whose fetch answers BOTH shell routes dispatch touches — the media
+  // search (GET /api/media/search) and open-with (POST /api/shell/open-with) — and
+  // records each call so we can assert the routing. MANIFEST holds only 'files', so
+  // none of the natural-language queries below is an app name (tryLaunch misses).
+  function makeHero(mediaResults) {
+    const R = makeRealm();
+    R.el('hart-hero'); const input = R.el('hart-hero-input'); R.el('hart-hero-go');
+    R.el('hart-hero-orbwrap'); R.el('hart-hero-status'); R.el('hart-hero-chips'); R.el('hart-hero-hevolve');
+    R.el('ac-input'); const chat = R.el('assistant-chat');
+    R.sandbox.isRecording = false;
+    R.sandbox._acAudio = { paused: true, ended: true };
+    R.sandbox.MANIFEST = { files: { title: 'Files' } };
+    const calls = { search: [], openWith: [], acSend: 0, openFiles: [] };
+    R.sandbox.acSend = function () { calls.acSend++; R.sandbox.window._hartThinking = true; };
+    R.sandbox.toggleAssistantChat = function () { chat.classList.add('open'); };
+    R.sandbox.toggleVoice = function () {};
+    R.sandbox.window.openFilesAt = function (d) { calls.openFiles.push(d); };
+    R.sandbox.fetch = function (url, opts) {
+      const u = String(url);
+      if (u.indexOf('/api/media/search') >= 0) { calls.search.push(u); return okResp({ query: 'x', count: mediaResults.length, results: mediaResults }); }
+      if (u.indexOf('/api/shell/open-with') >= 0) { calls.openWith.push(JSON.parse((opts || {}).body || '{}')); return okResp({}); }
+      return okResp({});
+    };
+    vm.runInContext(read('hartHero.js'), R.sandbox, { filename: 'hartHero.js' });
+    return { R, input, calls };
+  }
+
+  // 1. A deterministic filename hit OPENS the media via /api/shell/open-with; the
+  //    brain is NEVER consulted (this is the e2 win: "sunset.jpg" opens the photo).
+  {
+    const h = makeHero([{ path: '/home/u/Pictures/sunset.jpg', name: 'sunset.jpg', kind: 'image', match: 'exact', score: 1.0 }]);
+    h.input.value = 'sunset.jpg';
+    h.input.dispatch('keydown', mkEv(h.input, { key: 'Enter' }));
+    ok(h.calls.search.length === 1, 'a non-app query asks the local media index exactly once');
+    ok(h.calls.openWith.length === 1, 'a media hit is opened via /api/shell/open-with');
+    ok(h.calls.openWith[0] && h.calls.openWith[0].path === '/home/u/Pictures/sunset.jpg', 'open-with carries the hit path');
+    ok(h.calls.acSend === 0, 'a media hit does NOT wake the slow brain');
+  }
+
+  // 2. A STRONG semantic caption match (score >= 0.3) also surfaces the media.
+  {
+    const h = makeHero([{ path: '/home/u/Pictures/beach.png', name: 'IMG_4021.png', kind: 'image', caption: 'a sunny beach at sunset', match: 'semantic', score: 0.72 }]);
+    h.input.value = 'photo of the beach';
+    h.input.dispatch('keydown', mkEv(h.input, { key: 'Enter' }));
+    ok(h.calls.openWith.length === 1, 'a strong semantic caption match surfaces the media');
+    ok(h.calls.acSend === 0, 'a strong semantic hit skips the brain');
+  }
+
+  // 3. A WEAK semantic nearest-neighbour (score < 0.3) must NOT hijack a real
+  //    question — it belongs to the brain.
+  {
+    const h = makeHero([{ path: '/x.png', name: 'x.png', kind: 'image', match: 'semantic', score: 0.12 }]);
+    h.input.value = 'what is the capital of france';
+    h.input.dispatch('keydown', mkEv(h.input, { key: 'Enter' }));
+    ok(h.calls.openWith.length === 0, 'a weak semantic match does NOT open a file');
+    ok(h.calls.acSend === 1, 'a genuine question with only a weak media match reaches the brain');
+  }
+
+  // 4. A cold/empty index still falls through to the brain (never a dead end).
+  {
+    const h = makeHero([]);
+    h.input.value = 'summarize my day';
+    h.input.dispatch('keydown', mkEv(h.input, { key: 'Enter' }));
+    ok(h.calls.openWith.length === 0 && h.calls.acSend === 1, 'an empty index falls through to the brain');
+  }
 })();
 
 console.log(failures ? ('\nRESULT: ' + failures + ' FAILED') : '\nRESULT: ALL PASS');

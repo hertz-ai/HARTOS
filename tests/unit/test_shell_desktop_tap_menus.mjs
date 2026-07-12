@@ -7,9 +7,9 @@
  *   integrations/agent_engine/static/hartDesktop.js       (tap/drag + menus)
  *
  * It asserts OBSERVABLE behaviour, never source strings:
- *   1. TAP regression — a quick press+release on an icon LAUNCHES (the bug was:
- *      icons opened only on dblclick, which never fires on a touchscreen tap).
- *      Covered for MOUSE and TOUCH; a touch long-press opens the icon menu.
+ *   1. Activation per surface (f2 — steward #1466/#1467): a TOUCH tap OPENS (a
+ *      touchscreen has no hover/dblclick), while a MOUSE single click only
+ *      SELECTS and the existing dblclick OPENS. A touch long-press opens the menu.
  *   2. DRAG does NOT launch — a press that moves past threshold rearranges +
  *      persists (HartSession.set) and must NOT call openPanel.
  *   3. dblclick still launches (kept harmless / back-compat).
@@ -194,13 +194,13 @@ console.log('# 0. default icons rendered');
 ok(W.HartCtxMenu && typeof W.HartCtxMenu.open === 'function', 'HartCtxMenu module loaded');
 ok(iconOf('feed') && iconOf('recipes'), 'default icons rendered (feed + recipes present)');
 
-console.log('# 1. TAP launches — MOUSE');
+console.log('# 1. MOUSE single click SELECTS, does NOT open (f2: desktop click=select, dblclick=open)');
 opened.length = 0;
 let feed = iconOf('feed');
 feed.dispatch('pointerdown', pe('pointerdown', 100, 100, 'mouse', 1000));
-feed.dispatch('pointerup', pe('pointerup', 101, 101, 'mouse', 1120));   // 120ms, 2px -> tap
-eq(opened.length, 1, 'a quick mouse press+release launches exactly once');
-eq(opened[0], 'feed', 'launch reused openPanel with the icon id');
+feed.dispatch('pointerup', pe('pointerup', 101, 101, 'mouse', 1120));   // 120ms, 2px -> a single click
+eq(opened.length, 0, 'a single mouse click does NOT launch (desktop single-click = select)');
+ok(feed.classList.contains('selected'), 'a single mouse click selects the icon (deselecting siblings)');
 
 console.log('# 2. TAP launches — TOUCH (the real regression)');
 opened.length = 0;

@@ -2,9 +2,11 @@
  * tests/shell/test_interaction.mjs
  *
  * Behavioural coverage for the HART OS desktop INTERACTION stream:
- *   - a TAP synthesizes a launch (mouse AND touch single-tap), which is the
- *     regression this stream fixes: icons used to open only on dblclick, so a
- *     touchscreen tap never launched anything.
+ *   - ACTIVATION PER SURFACE (f2, steward #1466/#1467): a TOUCH single tap OPENS
+ *     (a touchscreen has no hover/dblclick), a MOUSE single click only SELECTS,
+ *     and the existing dblclick OPENS. The original regression this stream fixed
+ *     was touch: icons used to open only on dblclick, so a touchscreen tap never
+ *     launched anything.
  *   - a context menu builds the RIGHT items per target (icon / desktop / window)
  *     and dismisses on Escape, outside-click, and offline (dependency missing).
  *   - edge-flip / clamp keeps the menu fully ON-SCREEN at every viewport edge.
@@ -202,14 +204,14 @@ console.log('# 0. boot — modules wired, default icons rendered');
 ok(W.HartCtxMenu && typeof W.HartCtxMenu.open === 'function', 'HartCtxMenu module loaded');
 ok(iconOf('feed') && iconOf('recipes') && iconOf('appearance'), 'default desktop icons rendered');
 
-// ── A. A TAP SYNTHESIZES A LAUNCH ───────────────────────────────────────────
-console.log('# A1. mouse single tap launches exactly once');
+// ── A. ACTIVATION PER SURFACE (f2: touch opens, mouse selects) ──────────────
+console.log('# A1. mouse single click SELECTS, does NOT open (desktop: click=select, dblclick=open)');
 opened.length = 0;
 let feed = iconOf('feed');
 feed.dispatch('pointerdown', pe('pointerdown', 100, 100, 'mouse', 1000));
-feed.dispatch('pointerup', pe('pointerup', 101, 101, 'mouse', 1120));        // 120ms / 2px -> tap
-eq(opened.length, 1, 'a quick mouse press+release launches once');
-eq(opened[0], 'feed', 'launch synthesized via openPanel(icon id)');
+feed.dispatch('pointerup', pe('pointerup', 101, 101, 'mouse', 1120));        // 120ms / 2px -> a single click
+eq(opened.length, 0, 'a single mouse click does NOT launch (desktop single-click = select)');
+ok(feed.classList.contains('selected'), 'a single mouse click selects the icon');
 
 console.log('# A2. touch single tap launches (THE regression — was dblclick-only)');
 opened.length = 0;
@@ -244,17 +246,18 @@ opened.length = 0;
 iconOf('feed').dispatch('dblclick', baseEvent(iconOf('feed')));
 eq(opened[0], 'feed', 'dblclick remains a launch path');
 
-console.log('# A6. boundary — tap is graceful when openPanel is missing (no crash)');
+console.log('# A6. boundary — a TOUCH tap is graceful when openPanel is missing (no crash)');
 opened.length = 0;
 const savedOpen = sandbox.openPanel;
 sandbox.openPanel = undefined;                                              // host helper absent
 let threw = false;
 try {
   feed = iconOf('feed');
-  feed.dispatch('pointerdown', pe('pointerdown', 110, 110, 'mouse', 6000));
-  feed.dispatch('pointerup', pe('pointerup', 111, 111, 'mouse', 6100));
+  feed.dispatch('pointerdown', pe('pointerdown', 110, 110, 'touch', 6000)); // touch = the OPEN path
+  feed.dispatch('pointerup', pe('pointerup', 111, 111, 'touch', 6100));
+  flushTimers();                                                            // clear the long-press timer
 } catch (e) { threw = true; }
-ok(!threw, 'a tap with no openPanel helper does not throw');
+ok(!threw, 'a touch tap with no openPanel helper does not throw');
 eq(opened.length, 0, 'nothing launched when the helper is gone');
 sandbox.openPanel = savedOpen;
 
