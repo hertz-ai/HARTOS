@@ -284,6 +284,19 @@ def test_p1_builtin_push_carries_no_render_spec(tmp_path):
     assert '_spec' not in svc._agent_components['a'][-1]
 
 
+def test_p1_custom_type_declared_events_ride_the_render_spec(tmp_path):
+    """(G5) A custom type's DECLARED events (its interface) ride the stamped render
+    spec, so the client can wire them -- the component emits the declared event back
+    to the agent through /api/a2ui ('components interact via interfaces')."""
+    svc = _bare_liquid_ui(data_dir=str(tmp_path))
+    svc.register_component_type('composer', 'tap_tile',
+                                {'props': ['label'], 'events': ['click']})
+    assert svc.agent_ui_update('composer', {'type': 'tap_tile', 'label': 'Go'}) is True
+    comp = svc._agent_components['composer'][-1]
+    assert 'click' in comp['_spec'].get('events', []), \
+        'declared events did not ride the render spec (G5)'
+
+
 # ════════════════════════════════════════════════════════════════════
 # P5 — Learns you, you own it: the per-user model persists LOCALLY and
 # round-trips (the data is a file on YOUR disk, not a cloud account).

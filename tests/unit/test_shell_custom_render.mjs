@@ -121,5 +121,27 @@ sandbox.renderAgentOverlay({
 h = lastOverlayHTML();
 ok(h.indexOf('<img src=x') < 0, 'a malicious prop value is escaped, not injected as markup');
 
+// ── 3d. G5: a custom type that DECLARES a click event emits it back to the agent ──
+sandbox.renderAgentOverlay({
+  type: 'tap_tile', label: 'Go', _ts: 4, _agent_id: 'ag1',
+  _spec: { props: ['label'], events: ['click'], template: '<span>{{label}}</span>' },
+});
+h = lastOverlayHTML();
+ok(h.indexOf('onclick="shellA2UIEmit(this)"') >= 0, 'G5: a click-declaring custom type wires the emitter');
+ok(h.indexOf('data-event="click"') >= 0 && h.indexOf('data-ctype="tap_tile"') >= 0, 'G5: the emit carries the declared event + component type');
+
+// ── 3e. G5: a custom type WITHOUT declared events is NOT wrapped with an emitter ──
+sandbox.renderAgentOverlay({
+  type: 'plain_tile', label: 'x', _ts: 5, _spec: { props: ['label'], events: [] },
+});
+h = lastOverlayHTML();
+ok(h.indexOf('shellA2UIEmit') < 0, 'G5: a custom type with no declared events wires no emitter (no bloat)');
+
+// ── 3f. G5: the builtin `metric` emits its declared click (COMPONENT_TYPES metric) ──
+sandbox.renderAgentOverlay({ type: 'metric', value: 42, unit: '%', label: 'CPU', _ts: 6 });
+h = lastOverlayHTML();
+ok(h.indexOf('onclick="shellA2UIEmit(this)"') >= 0 && h.indexOf('data-ctype="metric"') >= 0,
+   'G5: the metric builtin emits its declared click on tap');
+
 console.log('\nRESULT: ' + (failures ? 'FAIL' : 'ALL PASS'));
 process.exit(failures ? 1 : 0);

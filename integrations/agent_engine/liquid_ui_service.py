@@ -989,7 +989,8 @@ class LiquidUIService:
         # and never carry _spec. The template was XSS-vetted at register_component_type.
         if comp_type in self._custom_component_types and '_spec' not in component:
             _entry = self._custom_component_types[comp_type]
-            _rspec = {'props': _entry.get('props') or []}
+            _rspec = {'props': _entry.get('props') or [],
+                      'events': _entry.get('events') or []}   # G5: declared events
             if isinstance(_entry.get('template'), str):
                 _rspec['template'] = _entry['template']
             component['_spec'] = _rspec
@@ -5938,6 +5939,14 @@ function shellA2UIListSelect(el) {{
     fetch(SHELL+(el.dataset.action||'/api/a2ui'),{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{selected:parseInt(el.dataset.idx||0),item:el.dataset.item||''}})}}).catch(function(){{}});
   }} catch(e) {{}}
 }}
+// G5: a component EMITS a declared event (COMPONENT_TYPES/{{spec}}.events, e.g. metric
+// emits:['click']) back to the agent through the SAME /api/a2ui ingest -> agent_ui_update.
+// Generic: reads data-event/data-ctype/data-agent off the element. No new endpoint.
+function shellA2UIEmit(el) {{
+  try {{
+    fetch(SHELL+(el.dataset.action||'/api/a2ui'),{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{event:el.dataset.event||'click',type:el.dataset.ctype||'',agent_id:el.dataset.agent||''}})}}).catch(function(){{}});
+  }} catch(e) {{}}
+}}
 function _doApproval(btn, verdict) {{
   var div = btn.closest('[data-agent-id]');
   if(div) {{ _postApproval(div.dataset.agentId||'', div.dataset.action||'', verdict); }}
@@ -6105,7 +6114,9 @@ function renderAgentOverlay(ev) {{
     var trend = ev.trend||'flat';
     var arrow = trend==='up'?'\\u2191':trend==='down'?'\\u2193':'\\u2192';
     var tColor = trend==='up'?'var(--hart-success)':trend==='down'?'var(--hart-error)':'var(--hart-muted)';
-    html += '<div style="text-align:center;padding:8px 0">';
+    // G5: metric declares emits:['click'] -> make it emit that declared event back to
+    // the agent on tap (reuses shellA2UIEmit -> /api/a2ui; no new channel).
+    html += '<div style="text-align:center;padding:8px 0;cursor:pointer" data-event="click" data-ctype="metric" data-action="'+(ev.action||'/api/a2ui')+'" data-agent="'+(ev._agent_id||ev.agent_id||'')+'" onclick="shellA2UIEmit(this)">';
     html += '<div style="font-size:32px;font-weight:700;color:var(--hart-text)">'+(ev.value||0)+'<span class="ds-label-sm" style="font-size:14px;margin-left:4px;color:var(--hart-muted)">'+(ev.unit||'')+'</span></div>';
     html += '<div class="ds-body-sm" style="margin-top:2px">'+(ev.label||'Metric')+' <span style="color:'+tColor+';font-weight:600">'+arrow+'</span></div>';
     if(ev.explanation) html += '<div class="ds-label-sm ds-text-muted" style="margin-top:4px">'+(ev.explanation)+'</div>';
@@ -6179,18 +6190,27 @@ function renderAgentOverlay(ev) {{
     // real UI. Prop STRING values are already _esc'd at the top of this function; the
     // template STRUCTURE was XSS-vetted at register_component_type. Reuses _esc for the
     // (un-pre-escaped) prop-name labels.
+    var _cc = '';
     if(typeof ev._spec.template === 'string' && ev._spec.template) {{
-      html += String(ev._spec.template).replace(/\{{\{{(\w+)\}}\}}/g, function(_m, _k) {{
+      _cc += String(ev._spec.template).replace(/\{{\{{(\w+)\}}\}}/g, function(_m, _k) {{
         return String(ev[_k] != null ? ev[_k] : '');
       }});
     }} else {{
-      html += '<div class="ds-body-md" style="font-weight:600">'+(ev.title||type)+'</div>';
+      _cc += '<div class="ds-body-md" style="font-weight:600">'+(ev.title||type)+'</div>';
       var _props = ev._spec.props || [];
       for(var _pi=0; _pi<_props.length; _pi++) {{
         var _pk = _props[_pi];
         if(ev[_pk] == null) continue;
-        html += '<div class="ds-list-item" style="padding:3px 0"><span class="ds-label-sm ds-text-muted">'+_esc(_pk)+'</span><span class="ds-body-sm" style="margin-left:auto">'+String(ev[_pk])+'</span></div>';
+        _cc += '<div class="ds-list-item" style="padding:3px 0"><span class="ds-label-sm ds-text-muted">'+_esc(_pk)+'</span><span class="ds-body-sm" style="margin-left:auto">'+String(ev[_pk])+'</span></div>';
       }}
+    }}
+    // G5: if the custom type declares a click event, wrap it so it EMITS that declared
+    // event back to the agent on tap (reuses shellA2UIEmit -> /api/a2ui; no new channel).
+    var _cev = ev._spec.events || [];
+    if(_cev.indexOf && _cev.indexOf('click') >= 0) {{
+      html += '<div style="cursor:pointer" data-event="click" data-ctype="'+_esc(type)+'" data-action="'+(ev.action||'/api/a2ui')+'" data-agent="'+(ev._agent_id||ev.agent_id||'')+'" onclick="shellA2UIEmit(this)">'+_cc+'</div>';
+    }} else {{
+      html += _cc;
     }}
   }} else {{
     // Generic fallback
@@ -6489,6 +6509,16 @@ function renderAgentOverlay(ev) {{
             success = self.agent_ui_update(
                 data.get('agent_id', 'unknown'), comp)
             return jsonify({'success': success})
+
+        @app.route('/api/a2ui/specs', methods=['GET'])
+        def api_a2ui_specs():
+            # G6: the agent-readable component CATALOGUE (builtins + agent-registered
+            # custom types) as a discovery ingress -- the ONE surface an agent / the
+            # local intelligence reads to know what components exist and how to compose
+            # each from its spec alone. Reuses list_component_specs (the existing
+            # accessor); no second registry, no parallel path. Mirrors how
+            # /api/appearance/presets exposes list_presets.
+            return jsonify({'specs': self.list_component_specs()})
 
         # ── Agentic HOME compose (the local LLM paints the Netflix home) ──
         # The single producer entry point for the agentic home feed: a {hero,

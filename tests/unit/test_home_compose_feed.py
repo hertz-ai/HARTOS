@@ -17,6 +17,7 @@ Run isolated (this box OOMs the full suite):
     python -m pytest tests/unit/test_home_compose_feed.py --noconftest -p no:capture -q
 """
 import json
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -156,6 +157,55 @@ def test_sse_home_branch_wires_the_mood_to_the_dom(svc):
     assert 'HartPalette.paint' in html, 'SSE branch does not paint the resolved mood'
     # reuses the existing home_compose event (no new field/channel): reads .mood off it
     assert 'ev.mood' in html or '.mood' in html
+
+
+# ── G4: the SSE store->CLIENT round-trip (the read leg, never integration-tested) ──
+
+def test_sse_stream_delivers_a_pushed_component_to_the_client(svc, client):
+    """G4: the full agent -> transport -> store -> CLIENT round-trip. A component
+    pushed via agent_ui_update is DRAINED by /api/notifications/stream and delivered
+    as an SSE 'data:' frame. Every prior 'SSE store' assertion stopped at the
+    in-process _agent_components dict; this exercises the read leg the shell's
+    EventSource actually consumes."""
+    with patch('security.immutable_audit_log.get_audit_log', return_value=MagicMock()), \
+         patch('security.hive_guardrails.HiveCircuitBreaker.is_halted',
+               return_value=False):
+        assert svc.agent_ui_update('agent_x',
+                                   {'type': 'card', 'title': 'Hello G4'}) is True
+    # Beat the stream's last_check (set when the generator starts) deterministically,
+    # so there is no 2s thread race: stamp the stored component's _ts far in the future.
+    svc._agent_components['agent_x'][-1]['_ts'] = time.time() + 3600
+    with client.get('/api/notifications/stream',
+                    headers={'Accept': 'text/event-stream'}, buffered=False) as r:
+        first = next(iter(r.response), b'')
+    if isinstance(first, str):
+        first = first.encode()
+    assert first.startswith(b'data: '), 'stream did not emit an SSE data frame: %r' % first
+    assert b'Hello G4' in first, 'the pushed component never reached the SSE client leg'
+    assert b'"type": "card"' in first or b'"type":"card"' in first
+
+
+# ── G6: the agent-readable spec catalogue has a real consumer (a discovery route) ──
+
+def test_a2ui_specs_route_exposes_the_component_catalogue(svc, client, tmp_path):
+    """G6: GET /api/a2ui/specs returns list_component_specs() -- the ONE catalogue an
+    agent / the local intelligence reads to know what components exist (builtins +
+    agent-registered customs) and how to compose each from its spec. Was: the accessor
+    had no route/consumer (called only by tests)."""
+    svc._data_dir = str(tmp_path)   # keep the registered type out of the real data dir
+    with patch('security.hive_guardrails.HiveCircuitBreaker.is_halted',
+               return_value=False):
+        svc.register_component_type('composer', 'aura_ring',
+                                    {'props': ['radius', 'hue']})
+    r = client.get('/api/a2ui/specs')
+    assert r.status_code == 200
+    by_name = {s.get('name'): s for s in json.loads(r.data)['specs']}
+    # builtins are catalogued with the agent-readable contract (mount + compose)
+    assert 'card' in by_name and by_name['card'].get('mount') == 'a2ui'
+    assert 'agent_ui_update' in by_name['card'].get('compose', '')
+    assert 'metric' in by_name
+    # the agent-registered custom type is catalogued too (runtime-extensible)
+    assert 'aura_ring' in by_name
 
 
 if __name__ == '__main__':
