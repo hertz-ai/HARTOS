@@ -135,8 +135,15 @@ jobs:
           sed -i -E "s|pinned [0-9]{4}-[0-9]{2}-[0-9]{2} for nunbaRev [0-9a-f]{8}|pinned ${TODAY} for nunbaRev ${SHORT}|g" nixos/packages/nunba.nix
           git diff --stat
 
+      # `inputs` (typed) not `github.event.inputs` (stringly): a `type: boolean`
+      # input compared against the STRING 'true' can coerce wrong in the
+      # expression engine. On repository_dispatch `inputs` is empty -> null != true
+      # -> the commit step runs, which is the desired auto-pin behavior.
+      # NOTE: a push made with the default GITHUB_TOKEN does NOT trigger downstream
+      # workflows (loop protection) -- set HEVOLVE_REPO_TOKEN in this repo's secrets
+      # if the ISO release build should fire automatically from the pin bump.
       - name: Commit + push the re-pin (skipped on dry_run)
-        if: env.NOOP != '1' && github.event.inputs.dry_run != 'true'
+        if: env.NOOP != '1' && inputs.dry_run != true
         run: |
           set -euo pipefail
           SHORT="$(echo "${{ steps.resolve.outputs.target }}" | cut -c1-8)"
@@ -144,11 +151,14 @@ jobs:
           git config user.email "ci@hertz-ai"
           git add nixos/packages/nunba.nix
           git commit -m "ci(nixos): auto re-pin nunba to ${SHORT} (hash-pin driver; canonical main tracking)"
+          # main may have moved during the (long) build rounds -- rebase our single
+          # pin commit onto current origin/main instead of failing non-FF.
+          git pull --rebase origin main
           git push origin HEAD:main
           echo "Pinned nunba @ ${SHORT} and pushed."
 
       - name: Dry-run summary
-        if: env.NOOP != '1' && github.event.inputs.dry_run == 'true'
+        if: env.NOOP != '1' && inputs.dry_run == true
         run: |
           echo "DRY RUN -- resulting pins (not committed):"
           grep -nE ', (nunbaRev|nunbaHash|npmDepsHash) \? ' nixos/packages/nunba.nix
