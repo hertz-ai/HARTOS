@@ -1215,3 +1215,56 @@ def test_start_part_zero_is_a_full_flash_no_skip(monkeypatch, tmp_path):
     assert ok is True
     assert [n for n, _ in writes] == ["p0", "p1", "p2"]      # every part written
     assert dict(writes) == {"p0": 0, "p1": 10, "p2": 30}     # unchanged normal path
+
+
+# ── Built-in full sha256 read-back verify (replaces the bespoke verify script) ──
+# The flasher records each part's source sha256 at write time, then reads those regions
+# back off the device and compares. A regular file stands in for the raw device
+# (sha256_device_region uses builtin open(), so a file path works). Validated end-to-end
+# against a real USB stick; these pin the logic + the resume-safe sidecar.
+import hashlib as _hl
+
+
+def test_verify_reads_back_and_matches(tmp_path):
+    p0 = b'A' * 4096
+    p1 = b'B' * 8192
+    parts = [{'name': 'part-00', 'size': len(p0)}, {'name': 'part-01', 'size': len(p1)}]
+    dev = tmp_path / 'device.img'
+    dev.write_bytes(p0 + p1)                       # the "written" device
+    work = str(tmp_path / 'work')
+    os.makedirs(work)
+    # what the flasher records at write time (per part), surviving --start-part passes
+    flasher.record_part_hash(work, 'part-00', 0, len(p0), _hl.sha256(p0).hexdigest())
+    flasher.record_part_hash(work, 'part-01', len(p0), len(p1), _hl.sha256(p1).hexdigest())
+    disk = {'physdrive': str(dev), 'dev': None}
+    assert flasher.full_verify(disk, parts, work, None, lambda m: None) is True
+
+
+def test_verify_detects_a_corrupted_device(tmp_path):
+    p0 = b'A' * 4096
+    parts = [{'name': 'part-00', 'size': 4096}]
+    dev = tmp_path / 'device.img'
+    dev.write_bytes(b'X' + p0[1:])                 # one byte flipped
+    work = str(tmp_path / 'w')
+    os.makedirs(work)
+    flasher.record_part_hash(work, 'part-00', 0, 4096, _hl.sha256(p0).hexdigest())
+    disk = {'physdrive': str(dev), 'dev': None}
+    assert flasher.full_verify(disk, parts, work, None, lambda m: None) is False
+
+
+def test_verify_returns_none_when_record_incomplete(tmp_path):
+    # A partial flash (not every part hashed yet) -> cannot verify -> None (not a fail).
+    parts = [{'name': 'part-00', 'size': 10}, {'name': 'part-01', 'size': 10}]
+    work = str(tmp_path / 'w')
+    os.makedirs(work)
+    flasher.record_part_hash(work, 'part-00', 0, 10, 'x' * 64)   # only 1 of 2 recorded
+    disk = {'physdrive': str(tmp_path / 'nope'), 'dev': None}
+    assert flasher.full_verify(disk, parts, work, None, lambda m: None) is None
+
+
+def test_sha256_device_region_reads_the_right_slice(tmp_path):
+    blob = bytes(range(256)) * 40
+    dev = tmp_path / 'd.img'
+    dev.write_bytes(blob)
+    got = flasher.sha256_device_region(str(dev), 512, 1024, None)
+    assert got == _hl.sha256(blob[512:512 + 1024]).hexdigest()

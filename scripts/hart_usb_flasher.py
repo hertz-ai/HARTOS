@@ -34,6 +34,7 @@ written at the cumulative byte offset of the parts before it.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -681,6 +682,101 @@ def verify_iso(disk, dd, log):
     return ok_cd and ok_boot
 
 
+# ── Full sha256 read-back verify (BUILT-IN, resume-safe, no side scripts) ──
+# verify_iso only checks the two boot-signature bytes. This proves EVERY byte on the
+# device matches the source: each part's sha256 is recorded (from the file we write)
+# to a sidecar in the work dir, then after the write each part's region is read back
+# off the raw device and compared. The sidecar survives --start-part resume passes
+# (which delete each part after a good write), so a multi-pass flash still verifies
+# end-to-end with no bespoke script and no reference-dir edits.
+def sha256_file(path, chunk=4 * 1024 * 1024):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(chunk), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def sha256_device_region(dev_or_phys, offset, size, dd, chunk=4 * 1024 * 1024):
+    """sha256 of `size` bytes read back off the raw device at `offset`. Offsets are
+    MiB-aligned and sizes are 512 B multiples, so raw sector-aligned reads are valid."""
+    h = hashlib.sha256()
+    if dd:
+        p = subprocess.Popen(
+            [dd, "if=%s" % dev_or_phys, "bs=%d" % chunk, "iflag=skip_bytes,count_bytes",
+             "skip=%d" % offset, "count=%d" % size, "status=none"], stdout=subprocess.PIPE)
+        for b in iter(lambda: p.stdout.read(chunk), b""):
+            h.update(b)
+        p.wait()
+        return h.hexdigest()
+    # Builtin open() (not os.open) -- it handles Windows \\.\PhysicalDriveN device
+    # namespaces; reads are sector-aligned (MiB-aligned offset, 512 B-multiple sizes).
+    with open(dev_or_phys, "rb") as fh:
+        fh.seek(offset)
+        remaining = size
+        while remaining > 0:
+            b = fh.read(min(chunk, remaining))
+            if not b:
+                break
+            h.update(b)
+            remaining -= len(b)
+    return h.hexdigest()
+
+
+def _verify_sidecar(tmp):
+    return os.path.join(tmp, ".hart-flash-verify.json")
+
+
+def record_part_hash(tmp, name, offset, size, sha, log=None):
+    """Persist a written part's {offset,size,sha256} so the post-write full verify can
+    read that region back and compare -- survives --start-part resume (parts are
+    deleted after a good write). Best-effort: a sidecar hiccup never fails the flash."""
+    path = _verify_sidecar(tmp)
+    try:
+        recs = {}
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                recs = json.load(f)
+        recs[name] = {"offset": offset, "size": size, "sha256": sha}
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(recs, f)
+        os.replace(path + ".tmp", path)
+    except (OSError, ValueError) as e:
+        if log:
+            log("  (verify record skipped: %s)" % e)
+
+
+def full_verify(disk, parts, tmp, dd, log):
+    """Read every written part's region back off the device and sha256-compare it to
+    the hash recorded at write time. Returns True (all match), False (a mismatch), or
+    None (incomplete record -> could not verify; e.g. stream mode or a partial flash)."""
+    path = _verify_sidecar(tmp)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            recs = json.load(f)
+    except (OSError, ValueError):
+        return None
+    names = [p["name"] for p in parts]
+    if not all(n in recs for n in names):
+        return None
+    dev = disk["dev"] if dd else disk["physdrive"]
+    allok = True
+    for n in names:
+        r = recs[n]
+        got = sha256_device_region(dev, r["offset"], r["size"], dd)
+        ok = (got == r["sha256"])
+        log("  verify %-45s @ %d: %s" % (n, r["offset"], "OK" if ok else "MISMATCH"))
+        allok = allok and ok
+    if allok:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return allok
+
+
 def reverify_boot_sigs_after_carve(disk, dd, log, tries=5):
     """Re-read the boot signatures AFTER the HARTLOG carve to PROVE the carve did
     not clobber the boot image. The carve (GPT relocate + diskpart create/format)
@@ -1273,7 +1369,7 @@ def _create_log_partition_unix(disk, log):
 
 # ───────────────────────── orchestration ─────────────────────────
 def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
-          make_log_partition=False, start_part=0):
+          make_log_partition=False, start_part=0, verify=True):
     log = log or (lambda m: None)
     progress = progress or (lambda f: None)
     gh = find_gh()
@@ -1310,6 +1406,12 @@ def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
                 src = download_part(gh, tag, p["name"], tmp, p["size"], log)
                 w = write_source_to_device(disk, src, off, dd, log, writer)
                 if w == p["size"]:                 # keep the file if the write failed
+                    if verify:                     # record the source hash for read-back
+                        try:                       # best-effort: never fail a good flash
+                            record_part_hash(tmp, p["name"], off, p["size"],
+                                             sha256_file(src), log)
+                        except OSError as e:
+                            log("  (verify record skipped: %s)" % e)
                     try:
                         os.remove(src)
                     except OSError:
@@ -1339,6 +1441,19 @@ def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
     log("Verifying signatures...")
     ok = verify_iso(disk, dd, log)
     log("DONE - bootable OK" if ok else "DONE but signature check FAILED")
+    # BUILT-IN full sha256 read-back verify (default on; --no-verify to skip). Proves
+    # every byte on the device matches the source, so no bespoke verify script is needed.
+    if verify:
+        log("Verifying full image (sha256 read-back of every part)...")
+        fv = full_verify(disk, parts, tmp, dd, log)
+        if fv is True:
+            log("  FULL VERIFY: OK - every byte on the device matches the source (sha256)")
+        elif fv is False:
+            log("  FULL VERIFY: MISMATCH - the device does NOT match the source; re-flash")
+            ok = False
+        else:
+            log("  FULL VERIFY: skipped (incomplete per-part hash record; e.g. stream mode "
+                "or a partial write) - the boot signatures above still passed")
     # HARTLOG partition creation DEFAULTS OFF. The Live OS creates it itself on
     # first boot (nixos/modules/hart-hartlog-create.nix), Linux-side, which is SAFE
     # (it relocates the backup GPT to the true device end, then carves only the
@@ -1485,7 +1600,7 @@ def cmd_flash(args):
     try:
         ok = flash(tag, args.variant, disk, args.mode, args.tmp, log=log,
                    make_log_partition=args.windows_log_partition,
-                   start_part=args.start_part)
+                   start_part=args.start_part, verify=args.verify)
     except Exception as e:
         log("FLASH FAILED: %s" % e)
         sys.stderr.write("FLASH FAILED: %s\n  (debug log: %s)\n" % (e, log_path))
@@ -1512,6 +1627,11 @@ def build_parser():
                         "the device) and skip the destructive diskpart clean. Use "
                         "when a prior run wrote the first N parts (e.g. --start-part 2 "
                         "after part-00/01 completed). Offsets stay absolute.")
+    p.add_argument("--no-verify", dest="verify", action="store_false",
+                   help="skip the built-in full sha256 read-back verify (on by default; "
+                        "the verify reads every part back off the device and compares it "
+                        "to the source hash, resume-safe -- no bespoke script needed).")
+    p.set_defaults(verify=True)
     p.add_argument("--quiet", action="store_true", help="silent CLI (errors to stderr)")
     p.add_argument("--log", help="debug log file (default: <tmp>/hart_flash.log)")
     p.add_argument("--allow-system", action="store_true",
