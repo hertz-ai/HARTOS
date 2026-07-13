@@ -601,7 +601,18 @@
       '  box-shadow: 0 0 calc(var(--hart-glow,40) * 0.5px) rgba(var(--hart-accent-rgb,0,230,195), calc(var(--hart-glow,40)/150));',
       '}',
       '.hart-gallery { gap: calc(10px * var(--hart-density,1)); }',
-      '.hart-personalize .ds-section-label { margin-top: calc(14px * var(--hart-density,1)); }'
+      '.hart-personalize .ds-section-label { margin-top: calc(14px * var(--hart-density,1)); }',
+      // G8: the density slider now scales the DESKTOP home row spacing too (was
+      // panel-only, so the slider was nearly invisible). At density=1 this is the base
+      // 18px -> pixel-identical (zero regression); the injected <style> is later in the
+      // <head> than hartHome.css, so it overrides at equal specificity. Same var, no fork.
+      '.hh-rows { gap: calc(18px * var(--hart-density,1)); }',
+      // G7: the on-desktop MOOD DOCK swatches (hartRenderMoodDock). CSS co-located with
+      // the personalize feel-style it belongs to; injected at boot via restore() (G9),
+      // so the dock renders styled wherever it is mounted (an A2UI-mountable utility).
+      '.hart-mood-label { font-size: 10px; font-weight: 600; letter-spacing: .12em; color: var(--hart-muted,#8a90a0); margin-right: 4px; align-self: center; }',
+      '.hart-mood-sw { display: inline-block; width: 22px; height: 22px; border-radius: 50%; cursor: pointer; border: 1.5px solid rgba(255,255,255,.14); box-shadow: 0 1px 4px rgba(0,0,0,.35); transition: transform .12s ease, box-shadow .12s ease; }',
+      '.hart-mood-sw:hover, .hart-mood-sw:focus { transform: scale(1.12); box-shadow: 0 0 0 2px rgba(var(--hart-accent-rgb,0,230,195),.5); outline: none; }'
     ].join('\n');
     document.head.appendChild(st);
   }
@@ -684,6 +695,11 @@
       });
       var fd = window.HartSession.get('font_display');
       if (fd && froot.style && froot.style.setProperty) froot.style.setProperty('--hart-font-display', '"' + fd + '"');
+
+      // G9: inject the feel <style> at BOOT (idempotent) so the persisted --hart-glow
+      // bloom (and density) apply immediately -- before, it was injected only when the
+      // Personalize hub was first opened, so a saved glow produced no bloom until then.
+      ensureFeelStyle();
     });
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', restore);

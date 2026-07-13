@@ -315,6 +315,29 @@ function runModules(realm, files) {
 })();
 
 // ════════════════════════════════════════════════════════════════════════════
+// [G9] GLOW AT BOOT — the feel <style> that CONSUMES --hart-glow (bloom) + --hart-
+//      density is injected at boot via restore(), so a persisted glow blooms
+//      immediately — before, it only appeared after the Personalize hub was opened once.
+// ════════════════════════════════════════════════════════════════════════════
+(function testGlowAtBoot() {
+  console.log('\n[G9] hartPersonalize.js  the feel/glow <style> is injected at BOOT (not only on hub open)');
+  const R = makeRealm();
+  R.sandbox.window.HartSession = makeSession({ glow: 85 });   // a persisted glow
+  R.sandbox.window.hartLoadInto = function () {};
+  runModules(R, ['voiceOrbViz.js', 'hartPersonalize.js']);    // restore() runs on load
+  const styles = R.sandbox.document.head._kids.filter(function (k) {
+    return String(k.textContent || '').indexOf('--hart-glow') >= 0;
+  });
+  ok(styles.length >= 1, 'the feel <style> consuming --hart-glow is injected at boot (glow blooms without opening the hub)');
+  const feel = styles.length ? String(styles[0].textContent || '') : '';
+  // G8: the density slider now scales the DESKTOP home rows (was panel-only).
+  ok(feel.indexOf('.hh-rows') >= 0 && /\.hh-rows[^}]*var\(--hart-density/.test(feel),
+     'G8: the injected feel style scales the desktop home rows with --hart-density');
+  // G7: the mood-dock swatch CSS is present (co-located, injected at boot).
+  ok(feel.indexOf('.hart-mood-sw') >= 0, 'G7: the mood-dock .hart-mood-sw CSS is defined (dock renders styled)');
+})();
+
+// ════════════════════════════════════════════════════════════════════════════
 // [C] CUSTOM PALETTE — the rendered picker applies + persists an ad-hoc palette
 // ════════════════════════════════════════════════════════════════════════════
 (function testCustomPalette() {
