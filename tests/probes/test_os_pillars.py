@@ -256,6 +256,34 @@ def test_p1_runtime_registration_obeys_kill_switch_and_xss_gate(tmp_path):
     assert 'evil_x' not in svc._custom_component_types
 
 
+def test_p1_registered_custom_type_push_carries_its_render_spec(tmp_path):
+    """(G2) A push of an agent-REGISTERED custom type carries its render spec (props +
+    optional template) so the client renders REAL UI (not the generic JSON dump).
+    Stamped by agent_ui_update onto the push itself, so a type registered at runtime
+    renders on its FIRST push -- 'agents bake new UI on the fly', live."""
+    svc = _bare_liquid_ui(data_dir=str(tmp_path))
+    tpl = '<div class="aura-ring" data-r="{{radius}}" data-h="{{hue}}"></div>'
+    res = svc.register_component_type('composer', 'aura_ring',
+                                      {'props': ['radius', 'hue'], 'template': tpl})
+    assert res.get('status') == 'registered'
+    assert svc.agent_ui_update('composer',
+                               {'type': 'aura_ring', 'radius': 80, 'hue': 280}) is True
+    comp = svc._agent_components['composer'][-1]
+    assert comp['type'] == 'aura_ring'
+    assert '_spec' in comp, 'custom-type push did not carry its render spec (G2)'
+    assert comp['_spec'].get('template') == tpl
+    assert 'radius' in comp['_spec'].get('props', []) and 'hue' in comp['_spec']['props']
+
+
+def test_p1_builtin_push_carries_no_render_spec(tmp_path):
+    """A builtin push renders via its own overlay branch and must NOT carry _spec --
+    only agent-registered custom types get the stamped render spec (no bloat / no
+    behaviour change for builtins)."""
+    svc = _bare_liquid_ui(data_dir=str(tmp_path))
+    assert svc.agent_ui_update('a', {'type': 'card', 'title': 'Hi'}) is True
+    assert '_spec' not in svc._agent_components['a'][-1]
+
+
 # ════════════════════════════════════════════════════════════════════
 # P5 — Learns you, you own it: the per-user model persists LOCALLY and
 # round-trips (the data is a file on YOUR disk, not a cloud account).

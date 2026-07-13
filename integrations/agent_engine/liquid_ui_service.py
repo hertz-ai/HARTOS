@@ -981,6 +981,19 @@ class LiquidUIService:
         component['_ts'] = _time.time()
         component['_agent_id'] = agent_id
 
+        # G2: a push of an agent-REGISTERED custom type carries its render spec so the
+        # client can render it (props to iterate, or a template to fill) instead of the
+        # generic JSON fallback. Stamped on the push itself (not a render-time HART_SPECS
+        # blob) so a type registered at runtime renders IMMEDIATELY on its first push --
+        # "agents bake new UI on the fly", live. Builtins render via their own branches
+        # and never carry _spec. The template was XSS-vetted at register_component_type.
+        if comp_type in self._custom_component_types and '_spec' not in component:
+            _entry = self._custom_component_types[comp_type]
+            _rspec = {'props': _entry.get('props') or []}
+            if isinstance(_entry.get('template'), str):
+                _rspec['template'] = _entry['template']
+            component['_spec'] = _rspec
+
         # Provable audit trail — every accepted push is recorded exactly like
         # a goal dispatch (dispatch.py:680).  Best-effort: an audit hiccup
         # must not drop a user's card.  Type + agent only (no user payload).
@@ -6159,6 +6172,26 @@ function renderAgentOverlay(ev) {{
     // Minimal overlay confirmation
     html += '<div style="text-align:center;padding:8px"><span class="mi material-icons-round" style="font-size:24px;color:var(--hart-accent)">open_in_new</span><div class="ds-body-sm" style="margin-top:4px">Navigating to '+(ev.title||target||'...')+'</div></div>';
 
+  }} else if(ev._spec) {{
+    // G2: an agent-REGISTERED custom component -> render from its stamped render spec
+    // (the template filled with the component's props, else the props as label/value
+    // rows) instead of the generic JSON dump, so a type an agent baked at runtime shows
+    // real UI. Prop STRING values are already _esc'd at the top of this function; the
+    // template STRUCTURE was XSS-vetted at register_component_type. Reuses _esc for the
+    // (un-pre-escaped) prop-name labels.
+    if(typeof ev._spec.template === 'string' && ev._spec.template) {{
+      html += String(ev._spec.template).replace(/\{{\{{(\w+)\}}\}}/g, function(_m, _k) {{
+        return String(ev[_k] != null ? ev[_k] : '');
+      }});
+    }} else {{
+      html += '<div class="ds-body-md" style="font-weight:600">'+(ev.title||type)+'</div>';
+      var _props = ev._spec.props || [];
+      for(var _pi=0; _pi<_props.length; _pi++) {{
+        var _pk = _props[_pi];
+        if(ev[_pk] == null) continue;
+        html += '<div class="ds-list-item" style="padding:3px 0"><span class="ds-label-sm ds-text-muted">'+_esc(_pk)+'</span><span class="ds-body-sm" style="margin-left:auto">'+String(ev[_pk])+'</span></div>';
+      }}
+    }}
   }} else {{
     // Generic fallback
     html += '<div class="ds-body-md" style="font-weight:600">'+(ev.title||type)+'</div>';
