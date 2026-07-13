@@ -402,8 +402,13 @@ jobs:
             } >> "$GITHUB_ENV"
           fi
 
-          # SHA-256 checksum (always computed against the uncut ISO)
-          sha256sum "$FILE" | sed "s|.*/||" > "/tmp/release-artifacts/${BASENAME}.sha256"
+          # SHA-256 checksum (always computed against the uncut ISO). Run sha256sum
+          # from the ISO's own dir on its BASENAME so the file is a real
+          # "<hash>  <basename>" digest that `sha256sum -c` resolves. (The old
+          # `sed "s|.*/||"` was GREEDY -- ".*/" ate the hash too, leaving ONLY the
+          # bare filename with no digest, so the .sha256 companion was unusable.)
+          ( cd "$(dirname "$FILE")" && sha256sum "$(basename "$FILE")" ) \
+            > "/tmp/release-artifacts/${BASENAME}.sha256"
 
           # Create .torrent with web seed.  workflow_dispatch ships a
           # pinned tag (v1.0.0 etc) so the seed points at that exact
