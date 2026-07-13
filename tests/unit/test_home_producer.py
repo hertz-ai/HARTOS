@@ -170,6 +170,45 @@ def test_llm_curation_applies_eyebrow_and_features_a_row():
     assert out['rows'][0]['title'] == 'Recipes'      # featured row leads now
 
 
+def test_llm_prompt_enumerates_the_client_palette_vocabulary():
+    """G1 wire (d): the prompt must enumerate the EXACT palette ids the client can
+    resolve (HartPalette.byId over HART_PALETTES) so the model never emits an
+    unresolvable mood (the dead-handle risk the audit flagged). Was 2 examples only."""
+    from integrations.agent_engine.liquid_ui_service import HART_MOOD_PALETTE_IDS
+    backbone = _deterministic_home_payload(_ctx(spark=2140))
+    with patch('core.http_pool.pooled_post',
+               return_value=_fake_resp(200, '{"eyebrow": "x"}')) as post:
+        _llm_curate_home(_ctx(spark=2140), backbone, 6790)
+    prompt = post.call_args.kwargs['json']['prompt']
+    for pid in HART_MOOD_PALETTE_IDS:
+        assert pid in prompt, 'mood id %r missing from the LLM prompt' % pid
+    # the whole enumerated set is present as one alternation (not just 2 examples)
+    assert '|'.join(HART_MOOD_PALETTE_IDS) in prompt
+    assert len(HART_MOOD_PALETTE_IDS) == 16
+
+
+def test_source_guard_mood_ids_mirror_the_client_palettes():
+    """Source-shape guard (DRY lockstep across two files, no single behavioural test
+    spans both): the server HART_MOOD_PALETTE_IDS (enumerated in the LLM prompt) MUST
+    equal the PALETTES ids in static/hartPersonalize.js (the authoritative client
+    vocabulary HartPalette.byId resolves against). Drift => the LLM can emit an id the
+    client cannot resolve = a dead handle (the exact G1 failure mode)."""
+    import os
+    import re
+    from integrations.agent_engine.liquid_ui_service import HART_MOOD_PALETTE_IDS
+    js = os.path.join(os.path.dirname(__file__), '..', '..', 'integrations',
+                      'agent_engine', 'static', 'hartPersonalize.js')
+    with open(js, 'r', encoding='utf-8') as f:
+        src = f.read()
+    m = re.search(r'var PALETTES\s*=\s*window\.HART_PALETTES\s*=\s*\[(.*?)\];',
+                  src, re.S)
+    assert m, 'PALETTES array not found in hartPersonalize.js'
+    client_ids = re.findall(r"id:\s*'([^']+)'", m.group(1))
+    assert set(client_ids) == set(HART_MOOD_PALETTE_IDS), (
+        'mood-id drift: client=%s server=%s'
+        % (sorted(client_ids), sorted(HART_MOOD_PALETTE_IDS)))
+
+
 def test_llm_curation_drives_per_row_accent_emphasis_and_mood():
     """The WIDENED compositional contract (§6a): the local LLM now colours EACH row
     (accent + emphasis) and names the ambient mood, not just {eyebrow, feature}. The

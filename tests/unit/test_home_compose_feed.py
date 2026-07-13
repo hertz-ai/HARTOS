@@ -123,6 +123,41 @@ def test_kill_switch_blocks_the_home_feed(svc, client):
     assert svc._agent_components == {}      # nothing composed while halted
 
 
+# ── G1: the LLM-composed ambient MOOD rides the SAME home push (was dropped) ──
+
+def test_route_carries_the_llm_mood_into_the_store(svc, client):
+    # The /api/home/compose route used to drop `mood`; now it flows
+    # compose_home(mood=) -> agent_ui_update -> store, so the SSE consumer can
+    # resolve it (HartPalette.byId) and paint it live. Wire (c) of mood->DOM.
+    r, data = _compose(client, {'hero': _HERO, 'rows': _ROWS, 'mood': 'aurora'})
+    assert data['success'] is True
+    comp = svc._agent_components['home_composer'][-1]
+    assert comp['type'] == 'home_compose'
+    assert comp.get('mood') == 'aurora', 'the route dropped the mood (G1 regression)'
+
+
+def test_route_wrapped_payload_carries_mood(svc, client):
+    # mood on a wrapped {payload:{...,mood}} composition survives too.
+    r, data = _compose(
+        client, {'payload': {'hero': _HERO, 'rows': _ROWS, 'mood': 'solar'}})
+    assert data['success'] is True
+    assert svc._agent_components['home_composer'][-1].get('mood') == 'solar'
+
+
+def test_sse_home_branch_wires_the_mood_to_the_dom(svc):
+    """G1 wire (b): the served shell's SSE home_compose branch resolves the mood id
+    (HartPalette.byId) and paints it LIVE (HartPalette.paint) — the LLM-composed mood
+    reaches the DOM. The byId->paint PRIMITIVES are behaviourally tested in
+    test_customization_hub.mjs ([G1] block); this asserts the 4-line glue is wired
+    into the actual served shell (HartPalette.byId is introduced ONLY by this wire, so
+    its presence in the render is unambiguous)."""
+    html = svc.render_desktop_shell()
+    assert 'HartPalette.byId' in html, 'SSE branch does not resolve the LLM mood id'
+    assert 'HartPalette.paint' in html, 'SSE branch does not paint the resolved mood'
+    # reuses the existing home_compose event (no new field/channel): reads .mood off it
+    assert 'ev.mood' in html or '.mood' in html
+
+
 if __name__ == '__main__':
     # Inline runner (pytest OOMs on this box): execute every test_* and report.
     import sys

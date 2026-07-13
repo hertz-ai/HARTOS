@@ -258,6 +258,36 @@ function runModules(realm, files) {
 })();
 
 // ════════════════════════════════════════════════════════════════════════════
+// [G1] MOOD-BY-ID — the LLM emits a mood ID (compose_home mood=); HartPalette.byId
+//      resolves it to the PALETTES entry that paint() applies live. This is the EXACT
+//      chain the SSE home_compose branch runs (byId -> paint), so the LLM-composed
+//      mood reaches the DOM; an unknown id is a graceful no-op (never a broken paint).
+// ════════════════════════════════════════════════════════════════════════════
+(function testMoodById() {
+  console.log('\n[G1] hartPersonalize.js  HartPalette.byId resolves a mood id -> paint applies it live');
+  const R = makeRealm();
+  R.sandbox.window.HartSession = makeSession({});
+  R.sandbox.window.hartLoadInto = function () {};
+  runModules(R, ['voiceOrbViz.js', 'hartPersonalize.js']);
+
+  const HP = R.sandbox.window.HartPalette;
+  ok(typeof HP.byId === 'function', 'HartPalette.byId is exposed');
+
+  const solar = HP.byId('solar');
+  ok(solar && solar.id === 'solar' && solar.a === '#FF7600', 'byId("solar") resolves to the solar quad');
+  ok(HP.byId('AURORA') && HP.byId('AURORA').id === 'aurora', 'byId is case-insensitive');
+  eq(HP.byId('no-such-mood'), null, 'byId returns null for an unknown id (graceful)');
+  eq(HP.byId(''), null, 'byId returns null for empty');
+  eq(HP.byId(undefined), null, 'byId returns null for undefined');
+
+  // The SSE-branch chain: resolve an id, then paint -> the ambient quad reaches the DOM.
+  HP.paint(HP.byId('solar'));
+  const st = R.docEl.style;
+  eq(st.getPropertyValue('--hart-amb-1'), '#FF7600', 'byId->paint set --hart-amb-1 to the solar lead (the LLM mood reaches the DOM)');
+  eq(st.getPropertyValue('--hart-amb-2'), '#FF9B92', 'byId->paint set --hart-amb-2');
+})();
+
+// ════════════════════════════════════════════════════════════════════════════
 // [C] CUSTOM PALETTE — the rendered picker applies + persists an ad-hoc palette
 // ════════════════════════════════════════════════════════════════════════════
 (function testCustomPalette() {

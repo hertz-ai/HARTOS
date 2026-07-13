@@ -579,6 +579,16 @@ def _component_spec_for(name: str, entry: dict) -> dict:
 # good titles/topics + an optional real web image_url; it never embeds bytes.
 HOME_ROW_ACCENTS = ('teal', 'cyan', 'blue', 'violet', 'magenta', 'amber')
 HOME_CARD_ACTIONS = ('ask', 'open', 'resume')
+# The ambient MOOD vocabulary the LLM may emit (compose_home mood=). MIRRORS the
+# authoritative client list `PALETTES`/`window.HART_PALETTES` in static/hartPersonalize.js
+# (:53-74) — keep in LOCKSTEP (a source-shape guard test asserts they match). Enumerated
+# in the _llm_curate_home prompt so the model only emits ids the client can resolve via
+# HartPalette.byId (an id outside this set is a graceful client no-op, never a broken paint).
+HART_MOOD_PALETTE_IDS = (
+    'vibrant', 'monotone-teal', 'aqua', 'neon', 'sunset', 'electric', 'ember',
+    'vapor', 'ocean', 'coral',
+    'aurora', 'solar', 'oceanic', 'nebula', 'verdant', 'ember-aura',
+)
 # Panel ids a row "See all" / a card may deep-link to.  Subset of PANEL_MANIFEST
 # + NAV_MAP + SYSTEM_PANELS ids that already exist (an unknown target opens an
 # empty panel, so the producer is restricted to these).
@@ -5853,6 +5863,15 @@ if(!PERF.potato) {{
             // floating overlay. ev.payload is the {{hero,rows}} composition; we
             // pass ev itself as the fallback so a flat payload also works.
             if(window.HartHome) window.HartHome.compose(ev.payload || ev);
+            // Agentic MOOD: the LLM-composed ambient palette rides the SAME home push
+            // (compose_home mood=). Resolve the id against the client palette vocabulary
+            // and paint LIVE via the existing primitive; an unknown id is a graceful
+            // no-op (never a broken paint). No new channel -- mood already arrives here.
+            try {{
+              var __mood = (ev.payload && ev.payload.mood) || ev.mood;
+              var __mp = (window.HartPalette && __mood) ? window.HartPalette.byId(__mood) : null;
+              if(__mp && window.HartPalette.paint) window.HartPalette.paint(__mp);
+            }} catch(e) {{}}
           }} else {{
             // Render as floating overlay fragment
             renderAgentOverlay(ev);
@@ -6437,7 +6456,8 @@ function renderAgentOverlay(ev) {{
                 payload = data
             ok = self.compose_home(
                 hero=payload.get('hero'), rows=payload.get('rows'),
-                agent_id=str(data.get('agent_id', 'home_composer')))
+                agent_id=str(data.get('agent_id', 'home_composer')),
+                mood=payload.get('mood'))   # carry the LLM-composed ambient mood through
             return jsonify({'success': ok})
 
         @app.route('/api/approval', methods=['POST'])
@@ -8173,8 +8193,9 @@ def _llm_curate_home(ctx: dict, backbone: dict, model_bus_port: int):
         + "\nYou choose the feel. Return ONLY compact JSON: {"
           "\"eyebrow\": <label, max 5 words>, "
           "\"feature\": <one row title from rows to lead with>, "
-          "\"mood\": <one HART palette id for the ambient feel, e.g. vibrant "
-          "or aurora>, "
+          "\"mood\": <one of "
+        + "|".join(HART_MOOD_PALETTE_IDS)
+        + " for the ambient feel>, "
           "\"rows\": [{\"title\": <one row title from rows>, "
           "\"accent\": <one of "
         + "|".join(HOME_ROW_ACCENTS)

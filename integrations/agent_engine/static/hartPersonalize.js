@@ -189,7 +189,19 @@
       } catch (e) {}
     }
   }
-  window.HartPalette = { apply: applyPalette, paint: paintPalette, list: PALETTES };
+  // Resolve a mood/palette ID -> the PALETTES entry (or null on a miss). The
+  // authoritative client-side vocabulary owner: the LLM-composed `mood` id from the
+  // agentic home push (compose_home) is resolved HERE before paintPalette, so an
+  // unknown id is a graceful no-op (never a broken paint). One lookup, no parallel list.
+  function paletteById(id) {
+    if (!id) return null;
+    var want = String(id).toLowerCase();
+    for (var i = 0; i < PALETTES.length; i++) {
+      if (PALETTES[i] && String(PALETTES[i].id).toLowerCase() === want) return PALETTES[i];
+    }
+    return null;
+  }
+  window.HartPalette = { apply: applyPalette, paint: paintPalette, list: PALETTES, byId: paletteById };
 
   // ── On-desktop MOOD DOCK (plan step 3). Renders HART_PALETTES as named swatches
   // that call the reload-free applyPalette — the SAME palette store + apply path as
