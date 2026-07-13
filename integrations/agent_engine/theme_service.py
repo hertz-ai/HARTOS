@@ -51,13 +51,20 @@ class ThemeService:
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     preset = json.load(f)
+                colors = preset.get('colors', {})
                 presets.append({
                     'id': preset.get('id', fname.replace('.json', '')),
                     'name': preset.get('name', ''),
                     'description': preset.get('description', ''),
                     'category': preset.get('category', 'dark'),
-                    'accent': preset.get('colors', {}).get('accent', ''),
-                    'background': preset.get('colors', {}).get('background', ''),
+                    'accent': colors.get('accent', ''),
+                    # secondary + surface let the desktop theme picker render the SAME
+                    # 4-colour swatch it built from the (now-retired) hardcoded client
+                    # list, so it can render the gallery from THIS one source (G3, no
+                    # parallel preset list). Additive keys — existing consumers ignore them.
+                    'secondary': colors.get('secondary', colors.get('accent', '')),
+                    'background': colors.get('background', ''),
+                    'surface': colors.get('surface', colors.get('background', '')),
                 })
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning("Failed to load theme %s: %s", fname, e)

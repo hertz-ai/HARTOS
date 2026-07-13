@@ -288,6 +288,33 @@ function runModules(realm, files) {
 })();
 
 // ════════════════════════════════════════════════════════════════════════════
+// [G3] THEME GALLERY — renders from the SERVER preset source (/api/appearance/presets,
+//      which includes Aura + high-contrast), with the built-in PRESETS as the instant
+//      offline fallback so the picker never empties (zero regression). Kills the
+//      hardcoded parallel preset list that had drifted (no Aura).
+// ════════════════════════════════════════════════════════════════════════════
+(function testThemeGalleryFromServer() {
+  console.log('\n[G3] hartPersonalize.js  theme gallery renders the offline fallback + fetches the server preset list');
+  const R = makeRealm();
+  R.sandbox.window.HartSession = makeSession({});
+  R.sandbox.window.hartLoadInto = function () {};
+  runModules(R, ['voiceOrbViz.js', 'hartPersonalize.js']);
+
+  const host = makeEl('div');
+  R.sandbox.window.hartRenderPersonalize(host);
+
+  // Offline floor: the built-in PRESETS render synchronously (the picker never empties).
+  const cards = host.querySelectorAll('.hart-theme-card');
+  ok(cards.length === R.sandbox.window.HART_THEME_PRESETS.length,
+     'theme gallery renders the built-in PRESETS as the instant offline fallback (zero regression)');
+
+  // Server source: it fetches the ONE preset list (/api/appearance/presets) to surface
+  // Aura + high-contrast — the DRY fix, no hardcoded parallel list.
+  const pf = R.fetchCalls.filter(c => String(c.url).indexOf('/api/appearance/presets') >= 0);
+  ok(pf.length === 1, 'theme gallery fetches /api/appearance/presets (the ONE preset source)');
+})();
+
+// ════════════════════════════════════════════════════════════════════════════
 // [C] CUSTOM PALETTE — the rendered picker applies + persists an ad-hoc palette
 // ════════════════════════════════════════════════════════════════════════════
 (function testCustomPalette() {

@@ -5550,7 +5550,9 @@ function handleThemeCommand(text, resp) {{
   else if(text.includes('sunset')||text.includes('warm')) {{ applyPreset('sunset',resp); return; }}
   else if(text.includes('minimal')) {{ applyPreset('minimal',resp); return; }}
   else if(text.includes('potato')||text.includes('ultra')||text.includes('lite')||text.includes('performance')||text.includes('fast')) {{ applyPreset('potato',resp); return; }}
-  else {{ resp.textContent='Try: dark, light, cyberpunk, midnight, forest, sunset, potato, bigger, smaller'; return; }}
+  else if(text.includes('aura')) {{ applyPreset('aura',resp); return; }}
+  else if(text.includes('high contrast')||text.includes('high-contrast')||text.includes('accessib')) {{ applyPreset('high-contrast',resp); return; }}
+  else {{ resp.textContent='Try: dark, light, aura, cyberpunk, midnight, forest, sunset, potato, high-contrast, bigger, smaller'; return; }}
 
   fetch(BACKEND+'/api/appearance/customize',{{method:'POST',
     headers:{{'Content-Type':'application/json'}},body:JSON.stringify(customization)}})
@@ -5561,12 +5563,24 @@ function handleThemeCommand(text, resp) {{
 }}
 
 function applyPreset(id, resp) {{
+  // Apply server-side (persist), then LIVE-swap the theme :root vars from
+  // /api/appearance/css into a single managed <style> -- NO reload (G3). Mirrors
+  // paintPalette / Nunba injectCSSVars: only the CSS custom props (accent, ambient
+  // quad, font, glass, glow) retint, so every component keeps working. Reload stays
+  // ONLY as the css-fetch fallback so a broken fetch still lands the theme.
   fetch(BACKEND+'/api/appearance/apply',{{method:'POST',
     headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{theme_id:id}})}})
     .then(r=>r.json()).then(()=>{{
-      resp.textContent='Applied '+id+'! Refreshing...';
-      setTimeout(()=>location.reload(), 500);
-    }}).catch(()=>{{ resp.textContent='Failed to apply theme'; }});
+      return fetch(BACKEND+'/api/appearance/css').then(r=>r.text()).then(css=>{{
+        var el = document.getElementById('hart-theme-live');
+        if(!el){{ el=document.createElement('style'); el.id='hart-theme-live'; document.head.appendChild(el); }}
+        el.textContent = css;
+        if(resp) resp.textContent = 'Applied '+id;
+      }}).catch(()=>{{
+        if(resp) resp.textContent='Applied '+id+'! Refreshing...';
+        setTimeout(()=>location.reload(), 500);
+      }});
+    }}).catch(()=>{{ if(resp) resp.textContent='Failed to apply theme'; }});
 }}
 
 // Focus trap: keep Tab within the active modal surface (lock screen / start menu

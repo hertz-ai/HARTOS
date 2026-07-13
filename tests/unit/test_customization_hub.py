@@ -223,6 +223,36 @@ def test_hart_and_aura_presets_are_distinct_and_valid():
     assert '--hart-glass-rgb: 18,19,28;' in hart
 
 
+def test_list_presets_surfaces_aura_and_high_contrast_with_swatch_colours():
+    """G3(a): the desktop theme picker now renders from THIS one source
+    (/api/appearance/presets -> list_presets), so Aura + high-contrast must appear with
+    the 4 swatch colours a card needs (accent/secondary/background/surface). Was: the
+    client hardcoded 8 presets and Aura was unreachable from the desktop."""
+    import integrations.agent_engine.theme_service as ts
+    ts._THEME_DIR = _REAL_THEME_DIR                 # read the REAL shipped presets
+    by_id = {p['id']: p for p in ts.ThemeService.list_presets()}
+    assert 'aura' in by_id, 'Aura preset not surfaced by list_presets (G3 gap)'
+    assert 'high-contrast' in by_id
+    for pid in ('aura', 'hart-default'):
+        p = by_id[pid]
+        for k in ('accent', 'secondary', 'background', 'surface'):
+            assert p.get(k), '%s preset missing %r for the swatch' % (pid, k)
+
+
+def test_shell_applyPreset_live_swaps_the_theme_with_no_reload():
+    """G3(b): the served shell's applyPreset LIVE-swaps the theme :root vars from
+    /api/appearance/css into a managed <style> (no reload on the success path); reload
+    survives ONLY as the css-fetch fallback. The css it fetches carries the target
+    quad (proven by test_hart_and_aura_presets_are_distinct_and_valid)."""
+    from integrations.agent_engine.liquid_ui_service import LiquidUIService
+    html = LiquidUIService(a2ui_enabled=True).render_desktop_shell()
+    assert '/api/appearance/css' in html, 'applyPreset does not fetch the live css'
+    assert 'hart-theme-live' in html, 'applyPreset does not swap a managed <style>'
+    # the keyword router can switch to Aura + high-contrast now (was neither)
+    assert "applyPreset('aura'" in html
+    assert "applyPreset('high-contrast'" in html
+
+
 def test_legacy_preset_apply_still_works():
     """Zero-regression: the original single-arg apply_theme(theme_id) still works."""
     svc = _svc()

@@ -422,16 +422,39 @@
       og.appendChild(c);
     });
 
-    // 3) THEME — the server-side presets (unchanged; full OS theme + reload).
+    // 3) THEME — render from the SERVER preset list (/api/appearance/presets = the ONE
+    // source, incl. Aura + high-contrast), falling back to the built-in PRESETS offline
+    // so the picker never empties (zero regression). Kills the drifted parallel list.
+    // applyPreset now LIVE-swaps (no reload). One lookup, one source.
     var tg = section('Theme');
-    PRESETS.forEach(function (p) {
-      var c = card('hart-theme-card', 'background:linear-gradient(135deg,' + p.b + ',' + p.c + ')', p.name, p.a);
+    function _hx(v) { v = String(v || ''); return (!v || v.charAt(0) === '#') ? v : '#' + v; }
+    function themeCard(p) {
+      var c = card('hart-theme-card',
+        'background:linear-gradient(135deg,' + (p.b || '#0F0E17') + ',' + (p.c || p.b || '#16213e') + ')',
+        p.name || p.id, p.a);
       activate(c, function () {
         if (typeof window.applyPreset === 'function')
-          window.applyPreset(p.id, { set textContent(v) { toast('Theme', p.name); } });
+          window.applyPreset(p.id, { set textContent(v) { toast('Theme', p.name || p.id); } });
       });
-      tg.appendChild(c);
-    });
+      return c;
+    }
+    function renderThemes(list) {
+      while (tg.firstChild) tg.removeChild(tg.firstChild);
+      list.forEach(function (p) { tg.appendChild(themeCard(p)); });
+    }
+    renderThemes(PRESETS);            // instant offline floor (the built-in fallback)
+    try {
+      fetch(backendBase() + '/api/appearance/presets', {
+        signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(4000) : null
+      }).then(function (r) { return r.json(); }).then(function (data) {
+        var arr = (data && data.presets) || [];
+        if (!Array.isArray(arr) || !arr.length) return;   // keep the fallback
+        renderThemes(arr.map(function (s) {
+          return { id: s.id, name: s.name, a: _hx(s.accent), a2: _hx(s.secondary),
+                   b: _hx(s.background), c: _hx(s.surface) };
+        }));
+      }).catch(function () {});       // offline -> keep the fallback (zero regression)
+    } catch (e) {}
 
     // 4) WALLPAPER — built-in CSS gradients / solids.
     var wg = section('Wallpaper');
