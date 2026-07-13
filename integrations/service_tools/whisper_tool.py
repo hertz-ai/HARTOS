@@ -634,7 +634,15 @@ def populate_stt_catalog(catalog) -> int:
             vram_gb=vram, ram_gb=ram, disk_gb=disk,
             min_capability_tier=min_tier,
             backend='onnx' if 'sherpa' in mid else 'torch',
-            supports_gpu=(vram > 0), supports_cpu=True,
+            supports_gpu=(vram > 0),
+            # faster-whisper medium/large (CTranslate2, >=1 GB VRAM) are
+            # GPU-oriented: on CPU int8 they're too slow for interactive STT,
+            # so exclude them from AUTO compute-fit selection on CPU-only boxes
+            # (matches this module's documented ladder: CPU->tiny/base,
+            # GPU->medium/large).  sherpa-onnx (ONNX, vram 0) and the light
+            # faster-whisper sizes stay CPU-capable.  Manual admin selection
+            # still works (load() bypasses matches_compute).
+            supports_cpu=not ('faster-whisper' in tags and vram >= 1.0),
             supports_cpu_offload=False,
             idle_timeout_s=300,
             capabilities={

@@ -6460,7 +6460,10 @@ function renderAgentOverlay(ev) {{
                     logger.debug("Nunba proxy failed (%s) — static floor", _pe)
                     return _serve_nunba_static(path)
 
-                resp_headers = [(k, v) for k, v in resp.headers.items()
+                # multi_items() (not items()) keeps duplicate Set-Cookie headers
+                # separate — items() comma-merges them, corrupting session cookies
+                # (RFC 6265 Expires dates contain commas) through the OS-shell proxy.
+                resp_headers = [(k, v) for k, v in resp.headers.multi_items()
                                 if k.lower() not in _HOP]
 
                 def _stream():

@@ -54,6 +54,33 @@ VRAM_BUDGETS: Dict[str, Tuple[float, float]] = {
 }
 
 
+# NVIDIA driver floors for the CUDA-12.0 runtime that our llama.cpp (cu12) and
+# torch (cu12) TTS/STT builds require.  A GPU on an OLDER driver is real but
+# cannot load a CUDA-12 build, so detect_gpu() reports it as CPU-only — this is
+# the SINGLE runtime GPU-usability signal read by LLM/TTS/STT selection.
+# (Mirrors desktop/ai_installer.py::_CUDA12_MIN_DRIVER_WIN — see the audit FLAG:
+# ai_installer.detect_gpu should REUSE detect_gpu()['driver_cuda_ok'] so there is
+# one implementation; HARTOS cannot import Nunba, so the canonical home is here.)
+_CUDA12_MIN_DRIVER_WIN = 527.41    # Windows
+_CUDA12_MIN_DRIVER_LINUX = 525.60  # Linux
+
+
+def _nvidia_driver_supports_cuda12(driver_version: Optional[str]) -> bool:
+    """True when an nvidia-smi driver_version is new enough for CUDA 12.
+
+    Unparseable / None -> True (fail-safe: never demote a GPU we can't measure).
+    """
+    if not driver_version:
+        return True
+    try:
+        parts = str(driver_version).strip().split(".")
+        num = float(f"{parts[0]}.{parts[1]}") if len(parts) >= 2 else float(parts[0])
+    except (ValueError, IndexError):
+        return True
+    floor = _CUDA12_MIN_DRIVER_WIN if sys.platform == "win32" else _CUDA12_MIN_DRIVER_LINUX
+    return num >= floor
+
+
 class VRAMManager:
     """GPU memory tracking and allocation decisions."""
 
@@ -244,7 +271,8 @@ class VRAMManager:
         # 1) nvidia-smi — zero-dependency, works on any NVIDIA GPU system
         try:
             result = run_bounded(
-                ["nvidia-smi", "--query-gpu=name,memory.total,memory.free",
+                ["nvidia-smi",
+                 "--query-gpu=name,memory.total,memory.free,driver_version",
                  "--format=csv,noheader,nounits"],
                 timeout=_nvsmi_timeout,
             )
@@ -254,16 +282,32 @@ class VRAMManager:
                 if len(parts) >= 3:
                     total_mb = float(parts[1])
                     free_mb = float(parts[2])
+                    # A real NVIDIA GPU on a driver too old for the CUDA-12
+                    # runtime (llama.cpp cu12 + torch cu12 TTS/STT) can't load
+                    # ANY CUDA build — report it CPU-only so LLM/TTS/STT never
+                    # pick a GPU engine that will fail to load (940MX / 2018
+                    # driver).  Keep name/total/free for display + guidance.
+                    driver_str = parts[3] if len(parts) >= 4 else None
+                    driver_ok = _nvidia_driver_supports_cuda12(driver_str)
                     info.update({
                         "name": parts[0],
                         "total_gb": round(total_mb / 1024, 2),
                         "free_gb": round(free_mb / 1024, 2),
-                        "cuda_available": True,
+                        "cuda_available": driver_ok,
+                        "driver_version": driver_str,
+                        "driver_cuda_ok": driver_ok,
                     })
-                    logger.info(
-                        f"GPU (nvidia-smi): {info['name']} — "
-                        f"{info['total_gb']} GB total, {info['free_gb']} GB free"
-                    )
+                    if driver_ok:
+                        logger.info(
+                            f"GPU (nvidia-smi): {info['name']} — "
+                            f"{info['total_gb']} GB total, {info['free_gb']} GB free"
+                        )
+                    else:
+                        logger.warning(
+                            f"GPU {info['name']} present (driver {driver_str}) but "
+                            f"too old for the CUDA-12 runtime — inference stays on "
+                            f"CPU. Update the NVIDIA driver to enable GPU."
+                        )
                     self._gpu_info = info
                     return info
         except FileNotFoundError:
