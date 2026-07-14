@@ -1270,6 +1270,37 @@ def test_sha256_device_region_reads_the_right_slice(tmp_path):
     assert got == _hl.sha256(blob[512:512 + 1024]).hexdigest()
 
 
+def test_latest_nightly_tag_skips_drafts_and_picks_newest_published(monkeypatch):
+    """GitHub's /releases lists DRAFT releases first; latest_nightly_tag must skip
+    drafts and return the newest PUBLISHED nightly (by created_at), not the draft."""
+    import json
+    releases = [
+        {"tag_name": "nightly-draft-1", "draft": True,  "created_at": "2026-07-13T08:56:15Z"},
+        {"tag_name": "nightly-newer-2", "draft": False, "created_at": "2026-07-13T11:57:02Z"},
+        {"tag_name": "nightly-older-3", "draft": False, "created_at": "2026-07-13T07:49:50Z"},
+        {"tag_name": "v1.0.0",          "draft": False, "created_at": "2026-04-13T18:24:16Z"},
+    ]
+
+    class _R:
+        stdout = json.dumps(releases)
+    monkeypatch.setattr(flasher, "_run", lambda *a, **k: _R())
+    assert flasher.latest_nightly_tag("gh") == "nightly-newer-2"
+
+
+def test_latest_nightly_tag_none_for_only_drafts_or_bad_json(monkeypatch):
+    import json
+
+    class _OnlyDraft:
+        stdout = json.dumps([{"tag_name": "nightly-d", "draft": True, "created_at": "z"}])
+    monkeypatch.setattr(flasher, "_run", lambda *a, **k: _OnlyDraft())
+    assert flasher.latest_nightly_tag("gh") is None
+
+    class _Bad:
+        stdout = "not json at all"
+    monkeypatch.setattr(flasher, "_run", lambda *a, **k: _Bad())
+    assert flasher.latest_nightly_tag("gh") is None
+
+
 def _mock_flash_boundaries(monkeypatch, parts):
     """Stub every side-effecting boundary flash() touches so only its
     download/write orchestration runs (no gh, no device, no PowerShell)."""

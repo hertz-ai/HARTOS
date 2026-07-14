@@ -371,10 +371,21 @@ def list_parts(gh, tag, variant):
 
 
 def latest_nightly_tag(gh):
-    r = _run([gh, "api", "repos/%s/releases?per_page=10" % REPO,
-              "--jq", ".[] | select(.tag_name|startswith(\"nightly-\")) | .tag_name"])
-    tags = [t.strip() for t in (r.stdout or "").splitlines() if t.strip()]
-    return tags[0] if tags else None
+    """Newest PUBLISHED nightly tag, or None. GitHub's /releases lists DRAFT
+    releases FIRST, so a half-uploaded draft (whose ISO parts may not be
+    downloadable yet) would otherwise be picked — drafts are excluded here and
+    the remaining published nightlies are sorted newest-first by created_at so
+    the result never depends on GitHub's draft-ordering quirk."""
+    r = _run([gh, "api", "repos/%s/releases?per_page=20" % REPO])
+    try:
+        rels = json.loads(r.stdout or "[]")
+    except (ValueError, TypeError):
+        return None
+    nightlies = [x for x in rels
+                 if str(x.get("tag_name", "")).startswith("nightly-")
+                 and not x.get("draft", False)]
+    nightlies.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return nightlies[0].get("tag_name") if nightlies else None
 
 
 def offsets(parts):
