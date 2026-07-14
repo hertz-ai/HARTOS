@@ -1369,7 +1369,7 @@ def _create_log_partition_unix(disk, log):
 
 # ───────────────────────── orchestration ─────────────────────────
 def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
-          make_log_partition=False, start_part=0, verify=True):
+          make_log_partition=False, start_part=0, verify=True, jobs=1):
     log = log or (lambda m: None)
     progress = progress or (lambda f: None)
     gh = find_gh()
@@ -1388,6 +1388,28 @@ def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
          disk["model"], len(parts), human(total), mode))
     done = 0
     writer = None
+    # --jobs N (download mode): prefetch up to N parts CONCURRENTLY into `tmp` while
+    # the write loop below still consumes them strictly in offset order. Only the
+    # downloads overlap — writes to the raw device stay serial (concurrent raw writes
+    # to one disk are unsafe). Reuses download_part (its size-check makes an
+    # already-present part a no-op) so there is exactly one download path.
+    jobs = max(1, int(jobs or 1))
+    _pool, _prefetch = None, {}
+    if mode == "download" and jobs > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        _pool = ThreadPoolExecutor(max_workers=jobs)
+
+        def _submit(i):
+            pp = parts[i]
+            _prefetch[i] = _pool.submit(
+                download_part, gh, tag, pp["name"], tmp, pp["size"], log)
+        for i in range(start_part, min(start_part + jobs, len(parts))):
+            _submit(i)
+        log("Parallel download: prefetching up to %d parts concurrently into %s "
+            "(writes stay serial + in-order)" % (jobs, tmp))
+    elif jobs > 1:
+        log("Note: --jobs %d applies to download mode only; stream mode writes "
+            "each part serially. Proceeding single-stream." % jobs)
     if IS_WIN:
         # RESUME (start_part>0): keep the disk's already-written parts — skip the
         # destructive diskpart clean, only automount-off + dismount.
@@ -1403,7 +1425,13 @@ def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
                 continue
             log("* %s @ %d (%s)" % (p["name"], off, human(p["size"])))
             if mode == "download":
-                src = download_part(gh, tag, p["name"], tmp, p["size"], log)
+                if _pool is not None:
+                    src = _prefetch.pop(idx).result()   # block on THIS part's prefetch
+                    nxt = idx + jobs                     # keep the sliding window full
+                    if nxt < len(parts):
+                        _submit(nxt)
+                else:
+                    src = download_part(gh, tag, p["name"], tmp, p["size"], log)
                 w = write_source_to_device(disk, src, off, dd, log, writer)
                 if w == p["size"]:                 # keep the file if the write failed
                     if verify:                     # record the source hash for read-back
@@ -1430,6 +1458,8 @@ def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
             done += p["size"]
             progress(done / total)
     finally:
+        if _pool is not None:
+            _pool.shutdown(wait=False)
         if writer is not None:
             writer.close()
         if IS_WIN:
@@ -1600,7 +1630,7 @@ def cmd_flash(args):
     try:
         ok = flash(tag, args.variant, disk, args.mode, args.tmp, log=log,
                    make_log_partition=args.windows_log_partition,
-                   start_part=args.start_part, verify=args.verify)
+                   start_part=args.start_part, verify=args.verify, jobs=args.jobs)
     except Exception as e:
         log("FLASH FAILED: %s" % e)
         sys.stderr.write("FLASH FAILED: %s\n  (debug log: %s)\n" % (e, log_path))
@@ -1621,6 +1651,13 @@ def build_parser():
                    help="stream (default, ~40%% faster: overlaps download+write) "
                         "or download (download each part fully, then write)")
     p.add_argument("--tmp", default=default_tmp(), help="scratch dir (download mode)")
+    p.add_argument("--jobs", type=int, default=1, metavar="N",
+                   help="download mode only: prefetch up to N parts CONCURRENTLY "
+                        "(default 1 = serial). Only the downloads overlap; writes to "
+                        "the device stay serial + in-order (concurrent raw writes to a "
+                        "single disk are unsafe). Trades scratch for speed: needs about "
+                        "N x part-size free in --tmp (each desktop part is ~1.9 GiB, so "
+                        "--jobs 4 wants ~7.6 GiB). Ignored in stream mode.")
     p.add_argument("--yes", action="store_true", help="confirm the destructive write")
     p.add_argument("--start-part", type=int, default=0,
                    help="RESUME: skip writing parts before this index (already on "

@@ -1268,3 +1268,90 @@ def test_sha256_device_region_reads_the_right_slice(tmp_path):
     dev.write_bytes(blob)
     got = flasher.sha256_device_region(str(dev), 512, 1024, None)
     assert got == _hl.sha256(blob[512:512 + 1024]).hexdigest()
+
+
+def _mock_flash_boundaries(monkeypatch, parts):
+    """Stub every side-effecting boundary flash() touches so only its
+    download/write orchestration runs (no gh, no device, no PowerShell)."""
+    monkeypatch.setattr(flasher, "IS_WIN", False)
+    monkeypatch.setattr(flasher, "find_gh", lambda: "gh")
+    monkeypatch.setattr(flasher, "find_dd", lambda: None)
+    monkeypatch.setattr(flasher, "list_parts", lambda *a, **k: parts)
+    monkeypatch.setattr(flasher, "verify_iso", lambda *a, **k: True)
+    monkeypatch.setattr(flasher, "full_verify", lambda *a, **k: True)
+    monkeypatch.setattr(flasher, "record_part_hash", lambda *a, **k: None)
+    monkeypatch.setattr(flasher, "sha256_file", lambda *a, **k: "d" * 64)
+
+
+def test_jobs_parallel_prefetch_is_concurrent_and_writes_in_order(monkeypatch, tmp_path):
+    """--jobs N (download mode) fetches parts CONCURRENTLY, yet writes them to the
+    device strictly in ascending offset order (concurrent raw writes are unsafe)."""
+    import threading
+    import time
+    parts = [{"name": "iso.part-0%d" % i, "id": i, "size": 100} for i in range(4)]
+    _mock_flash_boundaries(monkeypatch, parts)
+
+    lock = threading.Lock()
+    live = {"now": 0, "max": 0}
+    downloaded = []
+
+    def fake_download(gh, tag, name, tmp, size, log, tries=4):
+        with lock:
+            live["now"] += 1
+            live["max"] = max(live["max"], live["now"])
+        time.sleep(0.05)                       # widen the overlap window
+        with lock:
+            live["now"] -= 1
+            downloaded.append(name)
+        pth = os.path.join(str(tmp_path), name)
+        with open(pth, "wb") as f:
+            f.write(b"\0" * size)
+        return pth
+    monkeypatch.setattr(flasher, "download_part", fake_download)
+
+    writes = []
+    monkeypatch.setattr(flasher, "write_source_to_device",
+                        lambda disk, src, off, dd, log, writer=None: (
+                            writes.append(off) or os.path.getsize(src)))
+
+    disk = {"number": 2, "dev": "/dev/sdx", "physdrive": r"\\.\PhysicalDrive2",
+            "model": "SanDisk", "size": 1 << 30}
+    ok = flasher.flash("tag", "desktop", disk, "download", str(tmp_path),
+                       jobs=3, log=lambda m: None)
+    assert ok is True
+    assert sorted(downloaded) == sorted(p["name"] for p in parts)  # every part fetched
+    assert writes == [0, 100, 200, 300]                            # serial + in order
+    assert live["max"] >= 2                                        # downloads overlapped
+
+
+def test_jobs_default_is_strictly_serial(monkeypatch, tmp_path):
+    """--jobs 1 (the default) keeps the plain serial path: never more than one
+    download in flight, no thread pool."""
+    import threading
+    import time
+    parts = [{"name": "iso.part-0%d" % i, "id": i, "size": 100} for i in range(3)]
+    _mock_flash_boundaries(monkeypatch, parts)
+
+    lock = threading.Lock()
+    live = {"now": 0, "max": 0}
+
+    def fake_download(gh, tag, name, tmp, size, log, tries=4):
+        with lock:
+            live["now"] += 1
+            live["max"] = max(live["max"], live["now"])
+        time.sleep(0.02)
+        with lock:
+            live["now"] -= 1
+        pth = os.path.join(str(tmp_path), name)
+        with open(pth, "wb") as f:
+            f.write(b"\0" * size)
+        return pth
+    monkeypatch.setattr(flasher, "download_part", fake_download)
+    monkeypatch.setattr(flasher, "write_source_to_device",
+                        lambda disk, src, off, dd, log, writer=None: os.path.getsize(src))
+
+    disk = {"number": 2, "dev": "/dev/sdx", "physdrive": "x", "model": "X", "size": 1 << 30}
+    ok = flasher.flash("tag", "desktop", disk, "download", str(tmp_path),
+                       jobs=1, log=lambda m: None)
+    assert ok is True
+    assert live["max"] == 1                                        # strictly serial
