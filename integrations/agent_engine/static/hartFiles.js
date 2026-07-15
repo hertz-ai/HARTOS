@@ -18,7 +18,7 @@
 
   function S() { return (typeof SHELL !== 'undefined' && SHELL) || window.SHELL || ''; }
   function sig(ms) {
-    try { if (window._sig) return window._sig(ms); } catch (e) {}
+    try { if (window._sig) return window._sig(ms); } catch (e) { console.debug('hartFiles: window._sig probe failed', e); }
     var c = new AbortController(); setTimeout(function () { c.abort(); }, ms || 8000); return c.signal;
   }
   function esc(s) {
@@ -65,7 +65,7 @@
   function joinp(a, b) { return String(a).replace(/[\\/]+$/, '') + '/' + b; }
 
   function toast(title, msg, type) {
-    try { if (window.showToast) return window.showToast(title, msg, type || 'info'); } catch (e) {}
+    try { if (window.showToast) return window.showToast(title, msg, type || 'info'); } catch (e) { console.debug('hartFiles: showToast failed', e); }
   }
 
   // ── API layer (canonical backend only) ───────────────────────────────────
@@ -230,7 +230,7 @@
     try {
       ST.ro = new ResizeObserver(function (es) { apply(es[0].contentRect.width); });
       ST.ro.observe(root);
-    } catch (e) { apply(root.clientWidth || 800); }
+    } catch (e) { console.debug('hartFiles: ResizeObserver unavailable, using static width', e); apply(root.clientWidth || 800); }
   }
 
   // ── navigation ───────────────────────────────────────────────────────────
@@ -250,7 +250,7 @@
       }
       ST.entries = (d.entries || []).slice();
       applySort(); render(false);
-    }).catch(function () { renderError('File browser unavailable'); });
+    }).catch(function (e) { console.error('hartFiles: browse failed', e); renderError('File browser unavailable'); });
   }
   function back() { if (ST.back.length) { ST.fwd.push(ST.cwd); navigate(ST.back.pop(), false); } }
   function forward() { if (ST.fwd.length) { ST.back.push(ST.cwd); navigate(ST.fwd.pop(), false); } }
@@ -289,7 +289,8 @@
       else { ST.searchResults = (d.entries || []).slice(); ST.searchTrunc = !!d.truncated; }
       ST.sel = []; ST.anchor = -1;
       render(false);
-    }).catch(function () {
+    }).catch(function (e) {
+      console.debug('hartFiles: search failed', e);
       if (seq !== ST.searchSeq) return;
       ST.searchResults = []; ST.searchTrunc = false; render(false);
     });
@@ -539,7 +540,7 @@
       if (!dragging) {
         if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) <= 4) return;
         dragging = true; it._dragged = true;
-        try { it.setPointerCapture(pid); } catch (_) {}
+        try { it.setPointerCapture(pid); } catch (_) { console.debug('hartFiles: drag setPointerCapture failed', _); }
         it.classList.add('dragsrc');
         ghost = document.createElement('div'); ghost.className = 'hf-drag-ghost';
         var n = ST.sel.length;
@@ -557,8 +558,8 @@
       if (!armed) return; armed = false;
       if (!dragging) return;             // a plain click — onclick handles it
       dragging = false;
-      try { it.releasePointerCapture(pid); } catch (_) {}
-      if (ghost) { try { ghost.remove(); } catch (_) {} ghost = null; }
+      try { it.releasePointerCapture(pid); } catch (_) { console.debug('hartFiles: drag releasePointerCapture failed', _); }
+      if (ghost) { try { ghost.remove(); } catch (_) { console.debug('hartFiles: drag ghost remove failed', _); } ghost = null; }
       it.classList.remove('dragsrc'); clearDrop();
       if (cur && cur.path) {
         var copy = e && (e.ctrlKey || e.metaKey);
@@ -588,7 +589,7 @@
     work.forEach(function (src) {
       var dst = joinp(dest, basename(src));
       var op = copy ? API.copy(src, dst) : API.move(src, dst);
-      op.then(function (d) { if (d && d.error) errs++; }).catch(function () { errs++; }).then(function () {
+      op.then(function (d) { if (d && d.error) errs++; }).catch(function (e) { console.debug('hartFiles: batch file op item failed', e); errs++; }).then(function () {
         if (++done === n) finishDrop(copy, errs);
       });
     });
@@ -602,7 +603,7 @@
     var pos = prevSearch ? prevSearch.selectionStart : null;
     render(false);
     var s = ST.root.querySelector('.hf-search');
-    if (s) { s.focus(); if (pos != null) try { s.setSelectionRange(pos, pos); } catch (e) {} }
+    if (s) { s.focus(); if (pos != null) try { s.setSelectionRange(pos, pos); } catch (e) { console.debug('hartFiles: search setSelectionRange failed', e); } }
   }
 
   // ── selection ────────────────────────────────────────────────────────────
@@ -633,7 +634,7 @@
   // ── open ─────────────────────────────────────────────────────────────────
   function openItem(path, isDir) {
     if (isDir) navigate(path, true);
-    else API.openWith(path).then(function (d) { if (d && d.error) toast('Open', d.error, 'warn'); }).catch(function () { toast('Open', 'Could not open file', 'warn'); });
+    else API.openWith(path).then(function (d) { if (d && d.error) toast('Open', d.error, 'warn'); }).catch(function (e) { console.error('hartFiles: openWith failed', e); toast('Open', 'Could not open file', 'warn'); });
   }
 
   // ── file operations (canonical backend) ──────────────────────────────────
@@ -644,13 +645,13 @@
     API.mkdir(target).then(function (d) {
       if (d && d.error) { toast('New Folder', d.error, 'warn'); return; }
       refreshThen(function () { startRename(target); });
-    }).catch(function () { toast('New Folder', 'Failed', 'warn'); });
+    }).catch(function (e) { console.error('hartFiles: mkdir failed', e); toast('New Folder', 'Failed', 'warn'); });
   }
   function refreshThen(cb) {
     API.browse(ST.cwd, ST.hidden).then(function (d) {
       if (d && !d.error) { ST.entries = (d.entries || []).slice(); applySort(); }
       render(false); if (cb) cb();
-    });
+    }).catch(function (e) { console.error('hartFiles: refreshThen browse failed', e); });
   }
   function startRename(path) {
     var row = ST.root.querySelector('.hf-row[data-path="' + cssEsc(path) + '"] .hf-name, .hf-tile[data-path="' + cssEsc(path) + '"] .hf-name');
@@ -658,7 +659,7 @@
     var old = basename(path);
     row.innerHTML = '<input class="hf-rename" value="' + esc(old) + '">';
     var inp = row.querySelector('.hf-rename'); inp.focus();
-    var dot = old.lastIndexOf('.'); try { inp.setSelectionRange(0, dot > 0 ? dot : old.length); } catch (e) {}
+    var dot = old.lastIndexOf('.'); try { inp.setSelectionRange(0, dot > 0 ? dot : old.length); } catch (e) { console.debug('hartFiles: rename setSelectionRange failed', e); }
     var done = false;
     function commit(save) {
       if (done) return; done = true;
@@ -666,7 +667,7 @@
       if (save && nv && nv !== old) {
         API.move(path, joinp(dirname(path), nv)).then(function (d) {
           if (d && d.error) toast('Rename', d.error, 'warn'); refresh();
-        }).catch(function () { toast('Rename', 'Failed', 'warn'); refresh(); });
+        }).catch(function (e) { console.error('hartFiles: rename/move failed', e); toast('Rename', 'Failed', 'warn'); refresh(); });
       } else { refresh(); }
     }
     inp.onkeydown = function (e) { if (e.key === 'Enter') { e.preventDefault(); commit(true); } else if (e.key === 'Escape') { e.preventDefault(); commit(false); } };
@@ -680,7 +681,7 @@
     confirmAct('Delete ' + paths.length + ' item' + (paths.length > 1 ? 's' : '') + '?', 'Moved to Trash where supported.', function () {
       var done = 0, errs = 0;
       paths.forEach(function (p) {
-        API.del(p).then(function (d) { if (d && d.error) errs++; }).catch(function () { errs++; }).then(function () {
+        API.del(p).then(function (d) { if (d && d.error) errs++; }).catch(function (e) { console.debug('hartFiles: batch file op item failed', e); errs++; }).then(function () {
           if (++done === paths.length) { if (errs) toast('Delete', errs + ' failed', 'warn'); refresh(); }
         });
       });
@@ -693,7 +694,7 @@
     c.paths.forEach(function (src) {
       var dst = joinp(ST.cwd, basename(src));
       var op = c.mode === 'cut' ? API.move(src, dst) : API.copy(src, dst);
-      op.then(function (d) { if (d && d.error) errs++; }).catch(function () { errs++; }).then(function () {
+      op.then(function (d) { if (d && d.error) errs++; }).catch(function (e) { console.debug('hartFiles: batch file op item failed', e); errs++; }).then(function () {
         if (++done === n) { if (c.mode === 'cut') ST.clip = null; if (errs) toast('Paste', errs + ' failed (name may exist)', 'warn'); refresh(); }
       });
     });
@@ -746,7 +747,7 @@
         '</div></div>';
       var wrap = document.createElement('div'); wrap.innerHTML = card; var node = wrap.firstChild;
       ST.root.appendChild(node);
-      function close() { try { ST.root.removeChild(node); } catch (e) {} }
+      function close() { try { ST.root.removeChild(node); } catch (e) { console.debug('hartFiles: properties card removeChild failed', e); } }
       node.onclick = function (e) { if (e.target === node || e.target.getAttribute('data-close')) close(); };
 
       // Permissions editor wiring (only present when we have an octal mode).
@@ -776,13 +777,13 @@
                 cb.checked = !!(digit & mask);
               });
             }
-          }).catch(function () { toast('Permissions', 'Failed', 'warn'); saveBtn.removeAttribute('disabled'); });
+          }).catch(function (e) { console.error('hartFiles: chmod failed', e); toast('Permissions', 'Failed', 'warn'); saveBtn.removeAttribute('disabled'); });
         };
       }
-    }).catch(function () { toast('Properties', 'Unavailable', 'warn'); });
+    }).catch(function (e) { console.error('hartFiles: properties info fetch failed', e); toast('Properties', 'Unavailable', 'warn'); });
   }
   function confirmAct(title, body, onYes) {
-    if (window.dsConfirm) { try { window.dsConfirm(title, body, onYes); return; } catch (e) {} }
+    if (window.dsConfirm) { try { window.dsConfirm(title, body, onYes); return; } catch (e) { console.error('hartFiles: dsConfirm failed, falling back to window.confirm', e); } }
     if (window.confirm(title + (body ? '\n' + body : ''))) onYes();
   }
 

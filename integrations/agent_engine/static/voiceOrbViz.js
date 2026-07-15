@@ -121,7 +121,7 @@
       return audioCtx;
     }
     function dropSource() {
-      if (source) { try { source.disconnect(); } catch (e) {} source = null; }
+      if (source) { try { source.disconnect(); } catch (e) { console.debug('voiceOrbViz: audio source disconnect failed', e); } source = null; }
       lastKey = null;
     }
     function connectAudioElement(el) {
@@ -134,7 +134,7 @@
         source.connect(analyser);
         analyser.connect(audioCtx.destination); // element audio stays audible
         lastKey = el;
-      } catch (e) {}
+      } catch (e) { console.error('voiceOrbViz: connectAudioElement failed', e); }
     }
     function connectStream(stream) {
       if (!stream) return;
@@ -145,12 +145,12 @@
         source = audioCtx.createMediaStreamSource(stream);
         source.connect(analyser); // mic NOT routed to destination (no echo)
         lastKey = stream;
-      } catch (e) {}
+      } catch (e) { console.error('voiceOrbViz: connectStream failed', e); }
     }
     function disconnect() { dropSource(); }
     function setActive(v) {
       active = !!v;
-      if (active && audioCtx && audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
+      if (active && audioCtx && audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) { console.debug('voiceOrbViz: audioCtx resume failed', e); } }
     }
     // FIX B: the persisted orb-breathing pref (hartHero owns the localStorage key)
     // gates the slow idle "breathe" modulation of the glow + core. When OFF the orb
@@ -296,7 +296,7 @@
     function destroy() {
       if (rafId) { global.cancelAnimationFrame(rafId); rafId = null; }
       dropSource();
-      if (audioCtx && audioCtx.state !== 'closed') { try { audioCtx.close(); } catch (e) {} }
+      if (audioCtx && audioCtx.state !== 'closed') { try { audioCtx.close(); } catch (e) { console.debug('voiceOrbViz: audioCtx close failed', e); } }
       audioCtx = null; analyser = null;
     }
 

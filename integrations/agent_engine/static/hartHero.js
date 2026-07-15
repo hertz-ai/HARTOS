@@ -29,14 +29,14 @@
     return (typeof window.SHELL === 'string' && window.SHELL) ? window.SHELL : '';
   }
   function sig(ms) {
-    try { if (typeof window._sig === 'function') return window._sig(ms); } catch (e) {}
+    try { if (typeof window._sig === 'function') return window._sig(ms); } catch (e) { console.debug('hartHero: window._sig probe failed', e); }
     try {
       if (typeof AbortController === 'function') {
         var ac = new AbortController();
-        setTimeout(function () { try { ac.abort(); } catch (e2) {} }, ms || 4000);
+        setTimeout(function () { try { ac.abort(); } catch (e2) { console.debug('hartHero: abort on timeout failed', e2); } }, ms || 4000);
         return ac.signal;
       }
-    } catch (e3) {}
+    } catch (e3) { console.debug('hartHero: AbortController unavailable', e3); }
     return undefined;
   }
   function getJSON(url, ms) {
@@ -90,7 +90,7 @@
   }
   function setBreathingPref(on) {
     try { if (window.localStorage) window.localStorage.setItem('hart_orb_breathing', on ? '1' : '0'); }
-    catch (e) {}
+    catch (e) { console.debug('hartHero: persist breathing pref failed', e); }
   }
 
   // ── Breathing brand aura: the always-on idle presence rings + halo that frame
@@ -296,7 +296,8 @@
       if (!path) return false;
       var name = hit.name || path;
       postJSON(shell() + '/api/shell/open-with', { path: path }, 4000)
-        .catch(function () {
+        .catch(function (e) {
+          console.debug('hartHero: open-with failed, falling back to file browser', e);
           var dir = String(path).replace(/[\/\\][^\/\\]*$/, '') || path;
           if (typeof window.openFilesAt === 'function') window.openFilesAt(dir);
           else if (window.HartFiles && typeof window.HartFiles.navigate === 'function') window.HartFiles.navigate(dir);
@@ -324,7 +325,7 @@
           if (hit && surfaceMedia(hit)) { input.value = ''; return; }
           brainDispatch(text);
         })
-        .catch(function () { brainDispatch(text); });
+        .catch(function (e) { console.debug('hartHero: media search failed, dispatching to brain', e); brainDispatch(text); });
     }
 
     input.addEventListener('keydown', function (e) {
@@ -350,7 +351,7 @@
         if (window._hartVoiceOrb && typeof window._hartVoiceOrb.setBreathing === 'function') {
           window._hartVoiceOrb.setBreathing(on);
         }
-      } catch (e) {}
+      } catch (e) { console.debug('hartHero: voiceOrb setBreathing failed', e); }
     }
     function applyBreathing(on) { setBreathingPref(!!on); syncBreathing(); }
 
@@ -432,7 +433,7 @@
              : (l ? 'listening' : 'idle'));
       // Wake the orb to full presence whenever it is actually doing something
       // (voice in, TTS out, or thinking) — merge is for idle-only.
-      if (l || speak || think) { try { wake(); } catch (e) {} }
+      if (l || speak || think) { try { wake(); } catch (e) { console.debug('hartHero: orb wake failed', e); } }
       if (orb) {
         orb.setAttribute('data-orb-state', st);
         orb.classList.toggle('listening', l);   // legacy cue, superseded by data-orb-state CSS
@@ -595,7 +596,7 @@
       // Suppress native selection rubber-banding across the desktop while dragging.
       var de = document.documentElement;
       de.style.userSelect = 'none'; de.style.webkitUserSelect = 'none';
-      try { hero.setPointerCapture(e.pointerId); } catch (_e) {}
+      try { hero.setPointerCapture(e.pointerId); } catch (_e) { console.debug('hartHero: orb setPointerCapture failed', _e); }
     }
     function onMove(e) {
       if (!dg.on) return;
@@ -616,14 +617,14 @@
       if (hideMin) hideMin();        // FIX A: hide it again on drop (stays visible while compact)
       var de = document.documentElement;
       de.style.userSelect = ''; de.style.webkitUserSelect = '';
-      try { hero.releasePointerCapture(e.pointerId); } catch (_e) {}
+      try { hero.releasePointerCapture(e.pointerId); } catch (_e) { console.debug('hartHero: orb releasePointerCapture failed', _e); }
       if (dg.moved) {
         // Swallow the click the browser will synthesise after a drag so the orb
         // does NOT toggle voice when the user only meant to move it.
         var swallow = function (ev) { ev.stopPropagation(); ev.preventDefault(); hero.removeEventListener('click', swallow, true); };
         hero.addEventListener('click', swallow, true);
         setTimeout(function () { hero.removeEventListener('click', swallow, true); }, 0);
-        if (window.HartSession) try { window.HartSession.set('orb_pos', { x: B.dragX, y: B.dragY }); } catch (_e2) {}
+        if (window.HartSession) try { window.HartSession.set('orb_pos', { x: B.dragX, y: B.dragY }); } catch (_e2) { console.debug('hartHero: persist orb_pos failed', _e2); }
       }
       wake();
     }

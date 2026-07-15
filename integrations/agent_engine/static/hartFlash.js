@@ -16,16 +16,16 @@
   'use strict';
 
   function S() {
-    try { if (typeof SHELL !== 'undefined' && SHELL) return SHELL; } catch (e) {}
+    try { if (typeof SHELL !== 'undefined' && SHELL) return SHELL; } catch (e) { console.debug('hartFlash: SHELL global probe failed', e); }
     return (window.SHELL || '');
   }
   function sig(ms) {
-    try { if (window._sig) return window._sig(ms); } catch (e) {}
+    try { if (window._sig) return window._sig(ms); } catch (e) { console.debug('hartFlash: window._sig probe failed', e); }
     if (window.HartTimeoutSignal) return window.HartTimeoutSignal(ms);
     return null;
   }
   function toast(t, m, sev) {
-    try { if (window.showToast) window.showToast(t, m, sev || 'info'); } catch (e) {}
+    try { if (window.showToast) window.showToast(t, m, sev || 'info'); } catch (e) { console.debug('hartFlash: showToast failed', e); }
   }
   function esc(s) {
     var d = document.createElement('div');
@@ -178,7 +178,7 @@
         toast('Flashing', 'Writing ' + variant + ' to USB...', 'info');
         startPolling();
       })
-      .catch(function () { renderFinal(false, 'Could not start the flash.'); });
+      .catch(function (e) { console.error('hartFlash: flash start POST failed', e); renderFinal(false, 'Could not start the flash.'); });
   }
 
   function startPolling() {
@@ -197,7 +197,7 @@
           if (j.state === 'done') { stopPolling(); renderFinal(true, j.message || 'Flash complete.'); }
           else if (j.state === 'error') { stopPolling(); renderFinal(false, j.message || 'Flash failed.'); }
         })
-        .catch(function () {});
+        .catch(function (e) { console.debug('hartFlash: progress poll fetch failed (transient, will retry)', e); });
     }, 1200);
   }
   function stopPolling() { if (poll) { clearInterval(poll); poll = null; } }
@@ -234,7 +234,8 @@
         GH = (j.gh !== false);
         pickScreen();
       })
-      .catch(function () {
+      .catch(function (e) {
+        console.error('hartFlash: flasher disks fetch failed', e);
         ROOT.innerHTML = '<div class="hf-err">Could not reach the flasher service.</div>';
       });
   };

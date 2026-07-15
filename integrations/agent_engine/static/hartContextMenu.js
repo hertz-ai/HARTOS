@@ -35,7 +35,7 @@
   var reduce = false;
   try {
     reduce = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
-  } catch (e) {}
+  } catch (e) { console.debug('hartContextMenu: matchMedia reduced-motion probe failed', e); }
 
   // One-time injected glass styling. Tokens fall back to literals so the menu
   // still reads correctly even before the shell's CSS custom-props resolve.
@@ -102,7 +102,7 @@
     for (var i = 0; i < r.length; i++) r[i].classList.remove('active');
     r[idx].classList.add('active');
     r[idx].setAttribute('data-active', '1');
-    try { r[idx].focus(); } catch (e) {}
+    try { r[idx].focus(); } catch (e) { console.debug('hartContextMenu: row focus failed', e); }
     // Track the active index on the element for keyboard stepping.
     EL.setAttribute('data-active-idx', String(idx));
   }
@@ -158,7 +158,7 @@
           e.stopPropagation();
           var fn = it.onClick;
           close();
-          try { fn(); } catch (err) {}
+          try { fn(); } catch (err) { console.error('hartContextMenu: menu item onClick handler threw', err); }
         });
         // Hovering a row makes it the active (roving) item for keyboard parity.
         row.addEventListener('mousemove', function () {
@@ -252,7 +252,7 @@
     EL.setAttribute('data-active-idx', '-1');
     // Focus the menu container so keyboard nav works immediately; the first
     // ArrowDown then lands on the first item (no pre-highlight, macOS-style).
-    try { EL.focus(); } catch (e) {}
+    try { EL.focus(); } catch (e) { console.debug('hartContextMenu: menu container focus failed', e); }
   }
 
   window.HartCtxMenu = {

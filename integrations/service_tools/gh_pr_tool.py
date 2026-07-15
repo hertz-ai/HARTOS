@@ -427,7 +427,7 @@ def gh_pr_open(params_json: str) -> str:
         try:
             shutil.rmtree(workdir, ignore_errors=True)
         except Exception:  # pragma: no cover — defensive
-            pass
+            logger.exception("gh_pr_open: swallowed Exception")
 
 
 # ── registration ────────────────────────────────────────────────────

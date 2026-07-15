@@ -38,7 +38,7 @@
       // Honour the live a11y reduced-motion class too (same source the shell
       // render uses) so a runtime toggle disables effects without reload.
       if (document.documentElement.classList.contains('a11y-rmotion')) return false;
-    } catch (_e) { /* matchMedia unavailable → allow */ }
+    } catch (_e) { console.debug('hartEffects: matchMedia unavailable, allowing effects', _e); }
     return true;
   }
 
@@ -65,7 +65,7 @@
     try {
       gpu = !!(document.body && document.body.classList &&
         document.body.classList.contains('gpu-hardware'));
-    } catch (_e) { /* default: software floor -> opacity-only */ }
+    } catch (_e) { console.debug('hartEffects: gpu-hardware probe failed, defaulting to software floor', _e); }
     var trans = gpu
       ? 'opacity .12s ease, left .12s ease, top .12s ease, width .12s ease, height .12s ease'
       : 'opacity .12s ease';
@@ -141,7 +141,7 @@
       } else if (window.snapPanel) {
         window.snapPanel(id, kind);   // CANONICAL snap — no parallel geometry
       }
-    } catch (_e) { /* never break the drag */ }
+    } catch (_e) { console.error('hartEffects: snap on drag-end failed', _e); }
   }
 
   function init() {

@@ -271,7 +271,7 @@ def pocket_tts_list_voices() -> str:
             if r.returncode == 0:
                 engine = "espeak-ng"
         except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+            logger.warning("pocket_tts_list_voices: swallowed FileNotFoundError, subprocess.TimeoutExpired", exc_info=True)
 
     return json.dumps({
         "voices": voices,

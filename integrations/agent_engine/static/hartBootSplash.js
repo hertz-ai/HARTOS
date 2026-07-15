@@ -24,10 +24,10 @@
   try {
     if (sessionStorage.getItem('hart_booted')) { remove(); return; }
     sessionStorage.setItem('hart_booted', '1');
-  } catch (e) { /* sessionStorage may be unavailable; fall through and splash */ }
+  } catch (e) { console.debug('hartBootSplash: sessionStorage unavailable, showing splash', e); }
 
   var reduce = false;
-  try { reduce = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) {}
+  try { reduce = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) { console.debug('hartBootSplash: matchMedia reduced-motion probe failed', e); }
   var MIN_MS = reduce ? 600 : 2600;
   var t0 = Date.now();
 
@@ -49,7 +49,7 @@
         path: '/shell/static/hevolve-anim.json'
       });
     }
-  } catch (e) { /* a player failure is non-fatal: the overlay still fades below */ }
+  } catch (e) { console.debug('hartBootSplash: lottie player failed to load (non-fatal)', e); }
 
   if (document.readyState === 'complete') finishWhenReady();
   else window.addEventListener('load', finishWhenReady);

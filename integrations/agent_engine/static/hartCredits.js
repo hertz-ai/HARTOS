@@ -91,7 +91,8 @@
             'No third-party art is bundled - all OS art is first-party generated.'));
         }
       })
-      .catch(function () {
+      .catch(function (e) {
+        console.debug('hartCredits: credits fetch failed', e);
         wrap.appendChild(el('div', 'ds-body-md ds-text-muted',
           'Credits are unavailable right now.'));
       });

@@ -35,7 +35,7 @@ except ImportError:
             if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 torch.mps.empty_cache()
         except Exception:
-            pass
+            logger.exception("clear_cuda_cache: swallowed Exception")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('tts_audio_suite_server')
@@ -106,7 +106,7 @@ def health():
             status['vram_total_gb'] = round(torch.cuda.get_device_properties(0).total_memory / 1e9, 2)
             status['vram_used_gb'] = round(torch.cuda.memory_allocated(0) / 1e9, 2)
     except ImportError:
-        pass
+        logger.debug("health: swallowed ImportError")
     return jsonify(status)
 
 

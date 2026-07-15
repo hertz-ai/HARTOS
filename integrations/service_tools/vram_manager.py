@@ -311,7 +311,7 @@ class VRAMManager:
                     self._gpu_info = info
                     return info
         except FileNotFoundError:
-            pass  # nvidia-smi not on PATH — no NVIDIA GPU or drivers
+            logger.warning("detect_gpu: swallowed FileNotFoundError", exc_info=True)  # nvidia-smi not on PATH — no NVIDIA GPU or drivers
         except Exception as e:
             logger.debug(f"nvidia-smi failed: {e}")
 
@@ -349,7 +349,7 @@ class VRAMManager:
                         except (ValueError, IndexError):
                             continue
         except FileNotFoundError:
-            pass  # rocm-smi not on PATH — no AMD GPU or ROCm drivers
+            logger.warning("detect_gpu: swallowed FileNotFoundError", exc_info=True)  # rocm-smi not on PATH — no AMD GPU or ROCm drivers
         except Exception as e:
             logger.debug(f"rocm-smi failed: {e}")
 
@@ -398,7 +398,7 @@ class VRAMManager:
                     "metal_available": True,
                 })
             except Exception:
-                pass
+                logger.exception("detect_gpu: swallowed Exception")
 
         if not info["cuda_available"]:
             logger.info("No NVIDIA GPU detected (nvidia-smi not found or no CUDA device)")
@@ -603,7 +603,7 @@ class VRAMManager:
                     torch.mps.empty_cache()
                     return True
             except Exception:
-                pass
+                logger.exception("clear_cuda_cache: swallowed Exception")
         return False
 
     # ── Allocation drift detection ───────────────────────────────

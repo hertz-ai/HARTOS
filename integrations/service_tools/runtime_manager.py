@@ -480,7 +480,7 @@ class RuntimeToolManager:
                     try:
                         return int(line.split('=', 1)[1])
                     except ValueError:
-                        pass
+                        logger.debug("_read_port_from_stdout: swallowed ValueError", exc_info=True)
             else:
                 time.sleep(0.1)
 

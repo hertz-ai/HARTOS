@@ -117,7 +117,7 @@ def _volume_get(timeout=4):
                     'volume': int(round(frac * 100)),
                     'muted': 'MUTED' in r.stdout.upper()}
         except (ValueError, IndexError):
-            pass
+            logger.debug("_volume_get: swallowed ValueError, IndexError", exc_info=True)
     # pactl fallback
     mr = _vol_run(['pactl', 'get-sink-mute', '@DEFAULT_SINK@'], timeout=timeout)
     vr = _vol_run(['pactl', 'get-sink-volume', '@DEFAULT_SINK@'], timeout=timeout)
@@ -129,7 +129,7 @@ def _volume_get(timeout=4):
             return {'available': True, 'tool': 'pactl',
                     'volume': max(0, min(150, pct)), 'muted': muted}
         except (ValueError, IndexError):
-            pass
+            logger.debug("_volume_get: swallowed ValueError, IndexError", exc_info=True)
     return {'available': False, 'volume': None, 'muted': None}
 
 
@@ -325,7 +325,7 @@ class _ConnectivityCache:
                 battery['state'] = ('charging' if b.power_plugged
                                     else 'discharging')
         except (ImportError, RuntimeError, OSError):
-            pass
+            logger.warning("_probe_battery: swallowed ImportError, RuntimeError, OSError", exc_info=True)
         if not battery['available']:
             try:
                 import glob as _g
@@ -339,7 +339,7 @@ class _ConnectivityCache:
                             battery['available'] = True
                             battery['percent'] = int(cap)
                     except (OSError, ValueError):
-                        pass
+                        logger.warning("_probe_battery: swallowed OSError, ValueError", exc_info=True)
                     try:
                         with open(d + '/status') as f:
                             st = f.read().strip().lower()
@@ -347,9 +347,9 @@ class _ConnectivityCache:
                             battery['state'] = st
                             battery['plugged_in'] = st in ('charging', 'full')
                     except OSError:
-                        pass
+                        logger.warning("_probe_battery: swallowed OSError", exc_info=True)
             except OSError:
-                pass
+                logger.warning("_probe_battery: swallowed OSError", exc_info=True)
         return battery
 
     def _probe_wifi_list(self):
@@ -421,7 +421,7 @@ class _ConnectivityCache:
             try:
                 self.refresh()
             except Exception:
-                pass
+                logger.exception("_loop: swallowed Exception")
             time.sleep(self.REFRESH_INTERVAL_S)
 
 
@@ -645,14 +645,14 @@ class ContextEngine:
                 with open(variant_file) as f:
                     context['variant'] = f.read().strip()
         except Exception:
-            pass
+            logger.exception("_get_device_context: swallowed Exception")
         try:
             tier_file = os.path.join(data_dir, 'capability_tier')
             if os.path.exists(tier_file):
                 with open(tier_file) as f:
                     context['tier'] = f.read().strip()
         except Exception:
-            pass
+            logger.exception("_get_device_context: swallowed Exception")
         import datetime
         now = datetime.datetime.now()
         context['hour'] = now.hour
@@ -674,7 +674,7 @@ class ContextEngine:
                 return {'available': True, 'models': data.get('models', []),
                         'count': len(data.get('models', []))}
         except Exception:
-            pass
+            logger.exception("_get_model_context: swallowed Exception")
         return {'available': False, 'models': [], 'count': 0}
 
     def _get_agent_context(self) -> dict:
@@ -691,7 +691,7 @@ class ContextEngine:
                     'total': len(agents), 'agents': agents[:5],
                 }
         except Exception:
-            pass
+            logger.exception("_get_agent_context: swallowed Exception")
         return {'running': 0, 'total': 0, 'agents': []}
 
     def _get_system_context(self) -> dict:
@@ -702,7 +702,7 @@ class ContextEngine:
                 context['load_1m'] = float(parts[0])
                 context['load_5m'] = float(parts[1])
         except Exception:
-            pass
+            logger.exception("_get_system_context: swallowed Exception")
         try:
             with open('/proc/meminfo') as f:
                 mem = {}
@@ -714,13 +714,13 @@ class ContextEngine:
                 context['memory_used_percent'] = round(
                     (1 - available / total) * 100, 1)
         except Exception:
-            pass
+            logger.exception("_get_system_context: swallowed Exception")
         try:
             with open('/proc/uptime') as f:
                 context['uptime_hours'] = round(
                     float(f.read().split()[0]) / 3600, 1)
         except Exception:
-            pass
+            logger.exception("_get_system_context: swallowed Exception")
         return context
 
 
@@ -964,7 +964,7 @@ class LiquidUIService:
                     comp_type, agent_id)
                 return False
         except Exception:
-            pass
+            logger.exception("agent_ui_update: swallowed Exception")
 
         # Per-agent rate cap (token bucket) — a runaway agent can't flood the
         # desktop with UI pushes.
@@ -1013,7 +1013,7 @@ class LiquidUIService:
                 action=f'push {comp_type} component',
                 detail={'type': comp_type}, target_id=str(agent_id))
         except Exception:
-            pass
+            logger.exception("agent_ui_update: swallowed Exception")
 
         # 1. Store for SSE polling (Nunba web LiquidUI)
         with self._lock:
@@ -1036,7 +1036,7 @@ class LiquidUIService:
                 'component': component,
             })
         except Exception:
-            pass  # EventBus emission is best-effort
+            logger.exception("agent_ui_update: swallowed Exception")  # EventBus emission is best-effort
 
         logger.info("A2UI: agent %s pushed %s component", agent_id, comp_type)
         return True
@@ -1160,7 +1160,7 @@ class LiquidUIService:
             if HiveCircuitBreaker.is_halted():
                 return {'error': 'hive halted'}
         except Exception:
-            pass
+            logger.exception("register_component_type: swallowed Exception")
         if not self._a2ui_rate_ok(agent_id):
             return {'error': 'rate-capped'}
         if _a2ui_has_xss(spec) or _a2ui_has_xss(name):
@@ -1197,7 +1197,7 @@ class LiquidUIService:
                 action=f'register {name} component',
                 detail={'type': name}, target_id=str(agent_id))
         except Exception:
-            pass
+            logger.exception("register_component_type: swallowed Exception")
         logger.info("A2UI: agent %s registered component type %s",
                     agent_id, name)
         return {'status': 'registered', 'type': name}
@@ -1352,7 +1352,7 @@ class LiquidUIService:
                 return {'text': text, 'response': resp.json().get('response', ''),
                         'source': 'voice'}
         except Exception:
-            pass
+            logger.exception("_process_voice_command: swallowed Exception")
         return {'text': text, 'response': 'Could not process', 'source': 'voice'}
 
     # ─── Glass Desktop Shell Render ───────────────────────────
@@ -1504,7 +1504,7 @@ class LiquidUIService:
                 if _reg.has('apps'):
                     panels.update(_reg.get('apps').installed_app_manifest())
             except Exception:
-                pass
+                logger.exception("render_desktop_shell: swallowed Exception")
             # De-monochrome: stamp a resolved per-app 'color' on every entry from
             # the single-source palette so the JS render paths (start menu, dock,
             # desktop icons, titlebars) all tint with one agreed colour instead
@@ -6642,7 +6642,7 @@ function renderAgentOverlay(ev) {{
                     'decision': decision,
                 })
             except Exception:
-                pass
+                logger.exception("handle_agent_approval: swallowed Exception")
             logger.info("Approval decision: agent=%s action=%s decision=%s resolved=%s",
                         agent_id, action, decision, resolved)
             return jsonify({
@@ -6664,7 +6664,7 @@ function renderAgentOverlay(ev) {{
                     return jsonify({'error': 'AI hearing is disabled by the user',
                                     'sensing_disabled': True}), 403
             except Exception:
-                pass
+                logger.exception("api_voice: swallowed Exception")
             audio = request.files.get('audio')
             if audio:
                 import tempfile
@@ -6773,7 +6773,7 @@ function renderAgentOverlay(ev) {{
                 else:
                     logger.error(text)
             except Exception:
-                pass
+                logger.exception("shell_clientlog: swallowed Exception")
             return jsonify({'ok': True})
 
         # ── Shell APIs: Apps ──
@@ -6796,7 +6796,7 @@ function renderAgentOverlay(ev) {{
                             'subsystem': 'linux',
                         })
                 except OSError:
-                    pass
+                    logger.warning("shell_apps: swallowed OSError", exc_info=True)
             return jsonify({'apps': apps[:100]})
 
         # ── Shell APIs: Launch ──
@@ -6901,7 +6901,7 @@ function renderAgentOverlay(ev) {{
                         capture_output=True, text=True, timeout=3)
                     status = result.stdout.strip()
                 except Exception:
-                    pass
+                    logger.exception("shell_services: swallowed Exception")
                 services.append({'name': name, 'status': status})
             return jsonify({'services': services})
 
@@ -6914,7 +6914,7 @@ function renderAgentOverlay(ev) {{
                     with open(path, 'r') as f:
                         return jsonify(json.load(f))
                 except Exception:
-                    pass
+                    logger.exception("get_session_state: swallowed Exception")
             return jsonify({})
 
         @app.route('/api/shell/session-state', methods=['POST'])
@@ -6940,7 +6940,7 @@ function renderAgentOverlay(ev) {{
                         if line.strip():
                             devices.append({'type': dev_type, 'info': line.strip()})
                 except Exception:
-                    pass
+                    logger.exception("shell_drivers: swallowed Exception")
             return jsonify({'devices': devices[:50]})
 
         # ── Shell APIs: WiFi (CACHED) ──
@@ -7021,7 +7021,7 @@ function renderAgentOverlay(ev) {{
                             'state': parts[2], 'connection': parts[3],
                         })
             except Exception:
-                pass
+                logger.exception("shell_network_status: swallowed Exception")
             try:
                 r = subprocess.run(
                     ['ip', 'route', 'show', 'default'],
@@ -7030,7 +7030,7 @@ function renderAgentOverlay(ev) {{
                 if 'via' in parts:
                     status['gateway'] = parts[parts.index('via') + 1]
             except Exception:
-                pass
+                logger.exception("shell_network_status: swallowed Exception")
             try:
                 r = subprocess.run(
                     ['resolvectl', 'status', '--no-pager'],
@@ -7040,7 +7040,7 @@ function renderAgentOverlay(ev) {{
                         status['dns'] = line.split(':',1)[1].strip().split()
                         break
             except Exception:
-                pass
+                logger.exception("shell_network_status: swallowed Exception")
             return jsonify(status)
 
         # ── Shell APIs: Audio ──
@@ -7066,7 +7066,7 @@ function renderAgentOverlay(ev) {{
                     capture_output=True, text=True, timeout=3)
                 default_sink = r.stdout.strip()
             except Exception:
-                pass
+                logger.exception("shell_audio: swallowed Exception")
             try:
                 r = subprocess.run(
                     ['pactl', '--format=json', 'list', 'sinks'],
@@ -7081,7 +7081,7 @@ function renderAgentOverlay(ev) {{
                         'default': s.get('name', '') == default_sink,
                     } for s in raw]
             except Exception:
-                pass
+                logger.exception("shell_audio: swallowed Exception")
             try:
                 r = subprocess.run(
                     ['pactl', '--format=json', 'list', 'sources'],
@@ -7094,7 +7094,7 @@ function renderAgentOverlay(ev) {{
                         'volume': _parse_volume(s.get('volume', {})),
                     } for s in raw]
             except Exception:
-                pass
+                logger.exception("shell_audio: swallowed Exception")
             return jsonify({'sinks': sinks, 'sources': sources})
 
         @app.route('/api/shell/audio/volume', methods=['POST'])
@@ -7183,7 +7183,7 @@ function renderAgentOverlay(ev) {{
                     if len(parts) == 3:
                         devices.append({'mac': parts[1], 'name': parts[2]})
             except Exception:
-                pass
+                logger.exception("shell_bluetooth: swallowed Exception")
             return jsonify({'devices': devices})
 
         # ── Shell APIs: Power/Battery ──
@@ -7209,7 +7209,7 @@ function renderAgentOverlay(ev) {{
                     elif 'time to empty:' in line:
                         info['time_remaining'] = line.split(':', 1)[1].strip()
             except Exception:
-                pass
+                logger.exception("shell_power: swallowed Exception")
             return jsonify(info)
 
         # ── Shell APIs: Volume (wpctl-first, pactl fallback) ──
@@ -7328,7 +7328,7 @@ function renderAgentOverlay(ev) {{
                                 try:
                                     rates.append(float(clean))
                                 except ValueError:
-                                    pass
+                                    logger.debug("shell_display: swallowed ValueError", exc_info=True)
                             current_display['modes'].append({
                                 'resolution': mode,
                                 'rates': rates,
@@ -7337,7 +7337,7 @@ function renderAgentOverlay(ev) {{
                     elif not line.startswith(' '):
                         current_display = None
             except Exception:
-                pass
+                logger.exception("shell_display: swallowed Exception")
             return jsonify({'displays': displays})
 
         @app.route('/api/shell/display/resolution', methods=['POST'])
@@ -7421,7 +7421,7 @@ function renderAgentOverlay(ev) {{
                             'percent': usage.percent,
                         })
                     except (PermissionError, OSError):
-                        pass
+                        logger.warning("shell_system_metrics: swallowed PermissionError, OSError", exc_info=True)
                 metrics['disks'] = disks
                 net = psutil.net_io_counters()
                 metrics['network'] = {
@@ -7441,7 +7441,7 @@ function renderAgentOverlay(ev) {{
                             for name, sensors in temps.items()
                         }
                 except (AttributeError, Exception):
-                    pass
+                    logger.exception("shell_system_metrics: swallowed AttributeError, Exception")
             except ImportError:
                 metrics['error'] = 'psutil not installed'
             # GPU via VRAMManager
@@ -7451,7 +7451,7 @@ function renderAgentOverlay(ev) {{
                 if gpu and gpu.get('name'):
                     metrics['gpu'] = gpu
             except Exception:
-                pass
+                logger.exception("shell_system_metrics: swallowed Exception")
             return jsonify(metrics)
 
         @app.route('/api/shell/system/processes', methods=['GET'])
@@ -7473,10 +7473,10 @@ function renderAgentOverlay(ev) {{
                                 'mem': round(info.get('memory_percent', 0), 1),
                             })
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
+                        logger.warning("shell_system_processes: swallowed psutil.NoSuchProcess, psutil.AccessDenied", exc_info=True)
                 procs.sort(key=lambda p: p['cpu'], reverse=True)
             except ImportError:
-                pass
+                logger.debug("shell_system_processes: swallowed ImportError")
             return jsonify({'processes': procs[:30]})
 
         # ── Shell APIs: Log Viewer ──
@@ -7511,7 +7511,7 @@ function renderAgentOverlay(ev) {{
                             'message': entry.get('MESSAGE', ''),
                         })
                     except json.JSONDecodeError:
-                        pass
+                        logger.debug("shell_system_logs: swallowed json.JSONDecodeError", exc_info=True)
                 return jsonify({'entries': entries, 'count': len(entries)})
             except FileNotFoundError:
                 return jsonify({'entries': [], 'count': 0,
@@ -7542,7 +7542,7 @@ function renderAgentOverlay(ev) {{
                             })
                             yield f'data: {data}\n\n'
                         except json.JSONDecodeError:
-                            pass
+                            logger.debug("generate: swallowed json.JSONDecodeError", exc_info=True)
                 except Exception:
                     yield 'data: {"error": "stream unavailable"}\n\n'
             return Response(generate(), mimetype='text/event-stream',
@@ -7570,7 +7570,7 @@ function renderAgentOverlay(ev) {{
                                 'modified': modified,
                             })
                 except Exception:
-                    pass
+                    logger.exception("shell_recent_files: swallowed Exception")
             return jsonify({'files': files[-10:]})
 
         # ── Agent Action SSE Stream (ALL component types, not just notifications) ──
@@ -8054,7 +8054,7 @@ def _home_recipe_cards() -> List[dict]:
                 title = (r.get('name') or r.get('title') or r.get('goal')
                          or r.get('prompt') or title)
         except Exception:
-            pass
+            logger.exception("_home_recipe_cards: swallowed Exception")
         title = _home_clean_text(title, 60) or 'Recipe'
         cards.append({'title': title, 'topic': title, 'icon': 'auto_awesome',
                       'badge': 'Replay', 'action': 'open', 'target': 'recipes'})
@@ -8103,7 +8103,7 @@ def _home_resolve_owner_earnings():
             try:
                 db.close()
             except Exception:
-                pass
+                logger.exception("_home_resolve_owner_earnings: swallowed Exception")
 
 
 def _gather_home_context(backend_port: int = 6777,
@@ -8481,7 +8481,7 @@ def run_home_compose(reason: str = 'idle') -> bool:
         if HiveCircuitBreaker.is_halted():
             return False
     except Exception:
-        pass
+        logger.exception("run_home_compose: swallowed Exception")
     svc = None
     try:
         from core.platform.registry import get_registry

@@ -281,7 +281,7 @@ class GPUWorker:
                     # Send shutdown request. Worker exits on its own.
                     self._write_line(json.dumps({'op': 'shutdown'}))
                 except Exception:
-                    pass
+                    logger.exception("stop: swallowed Exception")
                 try:
                     self._proc.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
@@ -290,7 +290,7 @@ class GPUWorker:
                     try:
                         self._proc.wait(timeout=2)
                     except subprocess.TimeoutExpired:
-                        pass
+                        logger.warning("stop: swallowed subprocess.TimeoutExpired", exc_info=True)
             self._proc = None
             self._ready = False
 
@@ -471,7 +471,7 @@ class GPUWorker:
                     logger.info(f"[{self.name}] {line}")
                     self._maybe_self_heal_from_line(line)
         except Exception:
-            pass  # pipe closed, process dead
+            logger.exception("_drain_stderr: swallowed Exception")  # pipe closed, process dead
 
     def _maybe_self_heal_from_line(self, line: str) -> None:
         """Pattern-match worker stderr for ``ModuleNotFoundError`` and
@@ -630,7 +630,7 @@ class GPUWorker:
             for line in self._proc.stdout:
                 self._stdout_queue.put(line.rstrip('\n'))
         except Exception:
-            pass  # pipe closed
+            logger.exception("_drain_stdout: swallowed Exception")  # pipe closed
         finally:
             self._stdout_queue.put(None)  # EOF sentinel
 
@@ -770,7 +770,7 @@ def run_worker(
     try:
         os.dup2(2, 1)  # fd 1 -> fd 2 (stderr) — catches C-level writes too
     except OSError:
-        pass  # unusual platforms / closed stderr
+        logger.warning("run_worker: swallowed OSError", exc_info=True)  # unusual platforms / closed stderr
     sys.stdout = sys.stderr  # catches Python-level print()
 
     def _emit(obj) -> None:
@@ -811,7 +811,7 @@ def run_worker(
         )
     except Exception:
         # Never let a logging blunder block model load
-        pass
+        logger.exception("run_worker: swallowed Exception")
 
     # ── Phase 1: load model ────────────────────────────────────────
     try:
@@ -884,7 +884,7 @@ def run_worker(
                 _emit({'error': f'response serialization failed: {e}'})
 
     except KeyboardInterrupt:
-        pass
+        logger.warning("run_worker: swallowed KeyboardInterrupt", exc_info=True)
     except Exception as e:
         worker_log.exception(f'fatal: {e}')
         sys.exit(3)
@@ -1090,7 +1090,7 @@ class ToolWorker:
         try:
             self._observers.remove(callback)
         except ValueError:
-            pass
+            logger.debug("remove_observer: swallowed ValueError", exc_info=True)
 
     def _notify(self, event: str) -> None:
         """Fire a state-change event to every registered observer."""
@@ -1220,7 +1220,7 @@ class ToolWorker:
                 try:
                     self._worker.stop()
                 except Exception:
-                    pass
+                    logger.exception("stop: swallowed Exception")
                 self._worker = None
         self._release_vram()
         logger.info(f"{self.tool_name}: worker stopped")
@@ -1266,7 +1266,7 @@ class ToolWorker:
                 try:
                     self._worker.stop()
                 except Exception:
-                    pass
+                    logger.exception("_on_idle: swallowed Exception")
                 self._worker = None
                 self._release_vram()
         # Notify OUTSIDE the lock (observers may call back into us)
@@ -1388,7 +1388,7 @@ class ToolWorker:
             from integrations.service_tools.vram_manager import get_vram_manager
             get_vram_manager().release(self.vram_budget)
         except (ImportError, Exception):
-            pass
+            logger.exception("_release_vram: swallowed ImportError, Exception")
 
 
 # ═══════════════════════════════════════════════════════════════════

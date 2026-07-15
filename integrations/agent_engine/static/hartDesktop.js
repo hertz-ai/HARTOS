@@ -251,7 +251,7 @@
       ox = parseInt(el.style.left, 10) || 0; oy = parseInt(el.style.top, 10) || 0;
       el.classList.add('dragging');
       if (layer) layer.classList.add('arranging');   // show the snap-grid overlay while dragging
-      try { el.setPointerCapture(e.pointerId); } catch (_) {}
+      try { el.setPointerCapture(e.pointerId); } catch (_) { console.debug('hartDesktop: icon setPointerCapture failed', _); }
       e.preventDefault();                            // stop native text/image selection on the press
       // Touch long-press == right-click: open the icon menu after 500ms if the
       // finger has not moved (cancelled by move past threshold / up / cancel).
@@ -263,7 +263,7 @@
           if (dragging && !moved) {
             dragging = false; el.classList.remove('dragging');
             if (layer) layer.classList.remove('arranging');
-            try { el.releasePointerCapture(e.pointerId); } catch (_) {}
+            try { el.releasePointerCapture(e.pointerId); } catch (_) { console.debug('hartDesktop: icon releasePointerCapture failed', _); }
             el.style.transform = '';
             openIconMenu(id, lx, ly);
           }
@@ -293,7 +293,7 @@
       clearLongPress();
       if (layer) layer.classList.remove('arranging');
       if (raf) { cancelAnimationFrame(raf); raf = 0; }
-      try { el.releasePointerCapture(e.pointerId); } catch (_) {}
+      try { el.releasePointerCapture(e.pointerId); } catch (_) { console.debug('hartDesktop: endDrag releasePointerCapture failed', _); }
       el.style.transform = '';
       var dt = (e && e.timeStamp ? e.timeStamp : Date.now()) - downAt;
       var isTap = !moved && (Math.abs(dx) + Math.abs(dy) <= TAP_PX) && dt <= TAP_MS;
@@ -316,12 +316,12 @@
         persist();
       } else if (isTap) {                             // a quick, stationary press
         selectIcon(el);                               // always reflect selection (clears siblings)
-        try { el.focus(); } catch (_) {}              // pointerdown.preventDefault() suppressed focus; restore it for keyboard
+        try { el.focus(); } catch (_) { console.debug('hartDesktop: icon focus (tap) failed', _); }              // pointerdown.preventDefault() suppressed focus; restore it for keyboard
         // f2: touch tap OPENS; mouse/pen single click only SELECTS (dblclick handler opens).
         if (ptrType === 'touch') launch(id);
       } else {                                        // a slow press that didn't move: just select
         selectIcon(el);
-        try { el.focus(); } catch (_) {}
+        try { el.focus(); } catch (_) { console.debug('hartDesktop: icon focus (select) failed', _); }
       }
     }
     el.addEventListener('pointerup', endDrag);
@@ -485,7 +485,7 @@
       var c = getComputedStyle(document.documentElement).getPropertyValue('--hart-accent').trim();
       var m = /^#?([0-9a-f]{6})$/i.exec(c);
       if (m) return '#' + m[1];
-    } catch (_) {}
+    } catch (_) { console.debug('hartDesktop: accent hex read failed', _); }
     return '#6c63ff';
   }
 
@@ -544,7 +544,7 @@
   // both success and failure (network unreachable) so callers can always refresh.
   window.hartUninstallApp = function (id, platform, name, onDone) {
     name = name || (DEF(id) || {}).title || id;
-    var done = function (ok) { try { onDone && onDone(ok); } catch (e) {} };
+    var done = function (ok) { try { onDone && onDone(ok); } catch (e) { console.error('hartDesktop: uninstall onDone callback threw', e); } };
     function go() {
       var base = (typeof window.SHELL === 'string' && window.SHELL) ? window.SHELL : '';
       try {
@@ -553,7 +553,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ app_id: id, platform: platform || (DEF(id) || {}).platform || '' })
         }).then(function () { done(true); }, function () { done(false); });
-      } catch (e) { done(false); }
+      } catch (e) { console.error('hartDesktop: uninstall fetch dispatch threw', e); done(false); }
     }
     if (typeof window.dsConfirm === 'function') {
       window.dsConfirm('Uninstall ' + name + '?',
@@ -570,7 +570,7 @@
     var def = M()[id] || {};
     window.hartUninstallApp(id, def.platform || '', def.title || id, function () {
       window.hartRemoveIcon && window.hartRemoveIcon(id);
-      if (window.MANIFEST && window.MANIFEST[id]) { try { delete window.MANIFEST[id]; } catch (e) {} }
+      if (window.MANIFEST && window.MANIFEST[id]) { try { delete window.MANIFEST[id]; } catch (e) { console.debug('hartDesktop: MANIFEST entry delete failed', e); } }
     });
   }
   window.hartPinIcon = function (id) {
@@ -608,7 +608,7 @@
     try {
       var v = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--hart-topbar-height'), 10);
       if (v) top = v;
-    } catch (_) {}
+    } catch (_) { console.debug('hartDesktop: topbar-height read failed', _); }
     return Math.max(1, Math.floor((window.innerHeight - top - 2 * PAD) / GRID));
   }
 
@@ -778,7 +778,7 @@
     if (!window.HartCtxMenu || !pid) return;
     // Bring the window forward first so a right-click also focuses it (OS feel),
     // reusing the shell's canonical raise (keeps every other window's state).
-    if (typeof window.bringToFront === 'function') { try { window.bringToFront(pid); } catch (e) {} }
+    if (typeof window.bringToFront === 'function') { try { window.bringToFront(pid); } catch (e) { console.debug('hartDesktop: bringToFront (window menu) failed', e); } }
     // The shell adds a '.maximized' class to a panel element in applyMax (the
     // 'panels{}' map is a lexical global not exposed on window, so we read the
     // DOM class instead — robust + no cross-script coupling).
@@ -906,9 +906,9 @@
       pel = panel;
       active = true; dx = 0; dy = 0;
       sx = e.clientX; sy = e.clientY;
-      if (typeof window.bringToFront === 'function') { try { window.bringToFront(pid); } catch (_) {} }
+      if (typeof window.bringToFront === 'function') { try { window.bringToFront(pid); } catch (_) { console.debug('hartDesktop: bringToFront (title drag) failed', _); } }
       pel.style.willChange = 'transform';
-      try { bar.setPointerCapture(e.pointerId); } catch (_) {}
+      try { bar.setPointerCapture(e.pointerId); } catch (_) { console.debug('hartDesktop: title-bar setPointerCapture failed', _); }
     }
     function onMove(e) {
       if (!active || !pel) return;

@@ -144,9 +144,10 @@
           if (phase === 'done' || phase === 'error') { finishInstall(app, btn, bar, res); return; }
           setTimeout(tick, 700);
         })
-        .catch(function () {
+        .catch(function (e) {
           // Transient poll failure: retry a bounded number of times before giving
           // up (covers a brief shell hiccup without spinning forever).
+          console.debug('hartMarketplace: install progress poll failed (will retry)', e);
           if (tries < 80) { setTimeout(tick, 1000); return; }
           finishInstall(app, btn, bar, { error: 'Lost contact with the installer' });
         });
@@ -191,7 +192,8 @@
         if (btn) btn.textContent = phaseLabel(prog.phase || 'installing');
         pollProgress(app, btn, bar, res.token);
       })
-      .catch(function () {
+      .catch(function (e) {
+        console.error('hartMarketplace: install start POST failed', e);
         if (bar) bar.remove();
         if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
         toast('Install failed', app.n + ' - no response from the installer', 'error');
@@ -309,7 +311,7 @@
           });
           installedSec.appendChild(g);
           installedSec.style.display = '';
-        }).catch(function () { /* installed list is best-effort; never block the store */ });
+        }).catch(function (e) { console.debug('hartMarketplace: installed-apps list fetch failed (best-effort)', e); });
     }
 
     function renderFeatured() {
@@ -354,7 +356,8 @@
               i: 'inventory_2', d: p.description || ((p.platform || '') + ' ' + (p.version || '')) }));
           });
           if (g.children.length) { results.innerHTML = ''; results.appendChild(g); } else noResults();
-        }).catch(function () {
+        }).catch(function (e) {
+          console.debug('hartMarketplace: app search fetch failed (showing local results)', e);
           if (g.children.length) { results.innerHTML = ''; results.appendChild(g); } else noResults();
         });
     }

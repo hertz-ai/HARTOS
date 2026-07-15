@@ -29,21 +29,21 @@
 
   // ── Defensive access to function-scoped shell globals (NOT on window) ──
   function S() {
-    try { if (typeof SHELL !== 'undefined' && SHELL) return SHELL; } catch (e) {}
+    try { if (typeof SHELL !== 'undefined' && SHELL) return SHELL; } catch (e) { console.debug('hartConnectivity: SHELL global probe failed', e); }
     return (window.SHELL || '');
   }
   function sig(ms) {
-    try { if (window._sig) return window._sig(ms); } catch (e) {}
+    try { if (window._sig) return window._sig(ms); } catch (e) { console.debug('hartConnectivity: window._sig probe failed', e); }
     if (window.HartTimeoutSignal) return window.HartTimeoutSignal(ms);
     try {
       if (typeof AbortController === 'undefined') return null;
       var c = new AbortController();
-      setTimeout(function () { try { c.abort(); } catch (x) {} }, ms);
+      setTimeout(function () { try { c.abort(); } catch (x) { console.debug('hartConnectivity: abort on timeout failed', x); } }, ms);
       return c.signal;
-    } catch (e) { return null; }
+    } catch (e) { console.debug('hartConnectivity: AbortController unavailable', e); return null; }
   }
   function toast(title, msg, sev) {
-    try { if (window.showToast) window.showToast(title, msg, sev || 'info'); } catch (e) {}
+    try { if (window.showToast) window.showToast(title, msg, sev || 'info'); } catch (e) { console.debug('hartConnectivity: showToast failed', e); }
   }
   function esc(s) {
     var d = document.createElement('div');
@@ -153,7 +153,8 @@
     _refreshing = true;
     getJSON(S() + '/api/shell/connectivity/summary', 5000)
       .then(function (d) { STATE = d || {}; paint(); })
-      .catch(function () { /* keep last glyphs; degrade to neutral on first fail */
+      .catch(function (e) { /* keep last glyphs; degrade to neutral on first fail */
+        console.debug('hartConnectivity: connectivity summary probe failed', e);
         if (!STATE) { STATE = {}; paint(); }
       })
       .then(function () { _refreshing = false; });   // release in BOTH outcomes
@@ -181,29 +182,29 @@
     var next = !(w && w.enabled);
     postJSON(S() + '/api/shell/wifi/toggle', { enable: next })
       .then(function () { toast('Wi-Fi', next ? 'On' : 'Off', 'success'); setTimeout(refresh, 600); })
-      .catch(function () { toast('Wi-Fi', 'Not available', 'warning'); });
+      .catch(function (e) { console.error('hartConnectivity: wifi toggle POST failed', e); toast('Wi-Fi', 'Not available', 'warning'); });
   }
   function toggleBt() {
     var b = STATE && STATE.bluetooth;
     var next = !(b && b.powered);
     postJSON(S() + '/api/shell/bluetooth/power', { powered: next })
       .then(function () { toast('Bluetooth', next ? 'On' : 'Off', 'success'); setTimeout(refresh, 600); })
-      .catch(function () { toast('Bluetooth', 'Not available', 'warning'); });
+      .catch(function (e) { console.error('hartConnectivity: bluetooth power POST failed', e); toast('Bluetooth', 'Not available', 'warning'); });
   }
   function setVol(v) {
     postJSON(S() + '/api/shell/volume', { volume: v })
       .then(function () { if (STATE && STATE.volume) { STATE.volume.volume = v; STATE.volume.muted = (v === 0); } paint(); })
-      .catch(function () {});
+      .catch(function (e) { console.error('hartConnectivity: set volume POST failed', e); });
   }
   function toggleVolMute() {
     postJSON(S() + '/api/shell/volume/mute', {})
       .then(function (d) { if (d && d.available) STATE.volume = d; paint(); })
-      .catch(function () {});
+      .catch(function (e) { console.error('hartConnectivity: volume mute toggle POST failed', e); });
   }
   // Resolve the shell's in-glass prompt modal (defined in the inline shell script).
   // Same defensive pattern as S()/sig(): it may be a global function decl OR on window.
   function getPrompt() {
-    try { if (typeof dsPrompt !== 'undefined' && dsPrompt) return dsPrompt; } catch (e) {}
+    try { if (typeof dsPrompt !== 'undefined' && dsPrompt) return dsPrompt; } catch (e) { console.debug('hartConnectivity: dsPrompt global probe failed', e); }
     if (window.dsPrompt) return window.dsPrompt;
     return null;
   }
@@ -215,7 +216,7 @@
         else { toast('Wi-Fi', (d && d.error) ? d.error : 'Could not connect', 'warning'); }
         setTimeout(refresh, 800);
       })
-      .catch(function () { toast('Wi-Fi', 'Could not connect', 'warning'); });
+      .catch(function (e) { console.error('hartConnectivity: wifi connect POST failed', e); toast('Wi-Fi', 'Could not connect', 'warning'); });
   }
   function connectWifi(ssid, secured) {
     if (!secured) { doConnect(ssid, ''); return; }
@@ -366,7 +367,8 @@
           });
         }
       })
-      .catch(function () {
+      .catch(function (e) {
+        console.debug('hartConnectivity: wifi scan failed', e);
         box.innerHTML = '<div class="hc-net-empty">Could not scan right now.</div>';
       })
       .then(function () { _loadingNetworks = false; });   // release in BOTH outcomes

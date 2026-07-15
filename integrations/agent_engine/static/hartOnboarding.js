@@ -35,7 +35,7 @@
   // always-visible Skip control + the Esc hatch both finish. Every focus call is
   // guarded so the dependency-free test DOM (no .focus) is a no-op, never a throw. ──
   function focusEl(el) {
-    if (el && typeof el.focus === 'function') { try { el.focus(); } catch (e) {} }
+    if (el && typeof el.focus === 'function') { try { el.focus(); } catch (e) { console.debug('hartOnboarding: focusEl failed', e); } }
   }
 
   // The focusable controls currently in the overlay, in Tab order: the rendered
@@ -73,7 +73,7 @@
         var legacy = overlay.querySelector('.hob-skip');
         if (legacy && legacy.tagName !== 'BUTTON' && legacy.style) legacy.style.display = 'none';
       }
-    } catch (e) {}
+    } catch (e) { console.debug('hartOnboarding: legacy skip hide failed', e); }
 
     var wrap = document.createElement('div');
     wrap.className = 'hob-skip-wrap';
@@ -130,7 +130,7 @@
   // is the same helper chat replies + the greeting use. No-op when TTS is
   // unreachable (potato / not yet loaded) or the senses are cut.
   function speak(t) {
-    try { if (window.speakText && t && !sensesCut()) window.speakText(t, 'onboarding'); } catch (e) {}
+    try { if (window.speakText && t && !sensesCut()) window.speakText(t, 'onboarding'); } catch (e) { console.debug('hartOnboarding: speakText failed', e); }
   }
   function clearOpts() { if (opts) opts.innerHTML = ''; }
 
@@ -171,7 +171,7 @@
 
   function advance(action, data) {
     api('/api/onboarding/advance', 'POST', { user_id: USER, action: action, data: data || {} })
-      .then(handle).catch(function () {});
+      .then(handle).catch(function (e) { console.error('hartOnboarding: advance POST failed', e); });
   }
 
   // ── Companion setup (final phase): a WebKit-safe progress bar that polls the
@@ -360,8 +360,8 @@
         if (!resp || resp.already_onboarded || resp.onboarded) return;
         show();
         handle(resp);
-      }).catch(function () { /* start failed -> never block the desktop */ });
-    }).catch(function () { /* status unreachable -> never block the desktop */ });
+      }).catch(function (e) { console.debug('hartOnboarding: /start failed (never block desktop)', e); });
+    }).catch(function (e) { console.debug('hartOnboarding: /status unreachable (never block desktop)', e); });
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);

@@ -300,7 +300,7 @@ def _get_faster_whisper_model(model_size: str = "base"):
         get_orchestrator().notify_loaded('stt', f'whisper-{model_size}',
                                          device=device, vram_gb=3.0 if device == 'cuda' else 0)
     except Exception:
-        pass
+        logger.exception("_get_faster_whisper_model: swallowed Exception")
 
     return _faster_whisper_model
 
@@ -577,7 +577,7 @@ def _select_legacy_model() -> str:
         elif free >= 2:
             return "small"
     except Exception:
-        pass
+        logger.exception("_select_legacy_model: swallowed Exception")
     return "base"
 
 
@@ -700,13 +700,13 @@ def select_whisper_model() -> str:
                     import sherpa_onnx  # noqa: F401
                     return sherpa_key
                 except ImportError:
-                    pass
+                    logger.debug("select_whisper_model: swallowed ImportError")
             # faster-whisper size
             fw_size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(entry.id)
             if fw_size:
                 return fw_size
     except Exception:
-        pass
+        logger.exception("select_whisper_model: swallowed Exception")
 
     # ── Fallback: direct VRAM query (no catalog dependency) ─────────────────
     try:
@@ -770,7 +770,7 @@ def _transcribe_impl(audio_path: str, language: str = None) -> str:
         if result:
             return result
     except ImportError:
-        pass
+        logger.debug("_transcribe_impl: swallowed ImportError")
     except Exception as e:
         logger.warning(f"faster-whisper failed, trying fallback: {e}")
 
@@ -790,7 +790,7 @@ def _transcribe_impl(audio_path: str, language: str = None) -> str:
         if result:
             return result
     except ImportError:
-        pass
+        logger.debug("_transcribe_impl: swallowed ImportError")
     except Exception as e:
         logger.warning(f"sherpa-onnx failed, trying openai-whisper: {e}")
 
@@ -841,7 +841,7 @@ def _detect_language_impl(audio_path: str) -> str:
             "probability": round(info.language_probability, 4) if info.language_probability else 0.0,
         })
     except ImportError:
-        pass
+        logger.debug("_detect_language_impl: swallowed ImportError")
     except Exception as e:
         logger.debug(f"faster-whisper language detection failed: {e}")
 
@@ -869,7 +869,7 @@ def _detect_language_impl(audio_path: str) -> str:
                     "probability": 0.8,
                 })
         except Exception:
-            pass
+            logger.exception("_detect_language_impl: swallowed Exception")
         return json.dumps({"error": "Language detection unavailable"})
     except Exception as e:
         return json.dumps({"error": f"Language detection failed: {e}"})
@@ -1279,7 +1279,7 @@ async def _stt_stream_handler(websocket):
                             stt_lang = _cfg_lang
                         continue
                 except (json.JSONDecodeError, ValueError):
-                    pass
+                    logger.debug("_stt_stream_handler: swallowed json.JSONDecodeError, ValueError", exc_info=True)
                 continue
 
             # Binary audio data
@@ -1406,7 +1406,7 @@ def _container_to_pcm(data: bytes) -> Optional[bytes]:
                 try:
                     os.unlink(p.name)
                 except Exception:
-                    pass
+                    logger.exception("_container_to_pcm: swallowed Exception")
     return None
 
 
@@ -1495,7 +1495,7 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False,
             try:
                 os.unlink(tmp.name)
             except Exception:
-                pass
+                logger.exception("_transcribe_buffer: swallowed Exception")
 
 
 def start_stt_stream_server(port: int = 0) -> Optional[int]:
@@ -1538,7 +1538,7 @@ def start_stt_stream_server(port: int = 0) -> Optional[int]:
                 "" if _legacy_ok else
                 " AND the openai-whisper fallback is also missing")
     except Exception:
-        pass
+        logger.exception("start_stt_stream_server: swallowed Exception")
 
     import asyncio
     import threading

@@ -185,8 +185,8 @@
             ambient_1: p.a, ambient_2: p.a2, ambient_3: p.a3, ambient_4: p.a4
           } }),
           signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null
-        }).catch(function () {});
-      } catch (e) {}
+        }).catch(function (e) { console.error('hartPersonalize: appearance/apply POST failed', e); });
+      } catch (e) { console.error('hartPersonalize: appearance/apply dispatch threw', e); }
     }
   }
   // Resolve a mood/palette ID -> the PALETTES entry (or null on a miss). The
@@ -240,7 +240,7 @@
     return v || defaultOrbStyle();
   }
   function applyOrbToCanvas(id) {
-    try { if (window._hartVoiceOrb && window._hartVoiceOrb.setStyle) window._hartVoiceOrb.setStyle(id); } catch (e) {}
+    try { if (window._hartVoiceOrb && window._hartVoiceOrb.setStyle) window._hartVoiceOrb.setStyle(id); } catch (e) { console.debug('hartPersonalize: voiceOrb setStyle failed', e); }
   }
   function setOrbStyle(id) {
     if (window.HartSession) window.HartSession.set('orb_style', id);
@@ -253,7 +253,7 @@
   // switching background types never leaves a stale <video>/lottie behind. ────────
   function clearWpMedia() {
     var wp = wpHost(); if (!wp) return;
-    if (wp._lottieAnim) { try { wp._lottieAnim.destroy(); } catch (e) {} wp._lottieAnim = null; }
+    if (wp._lottieAnim) { try { wp._lottieAnim.destroy(); } catch (e) { console.debug('hartPersonalize: lottie destroy failed', e); } wp._lottieAnim = null; }
     var m = wp.querySelector('#hart-wp-media');
     if (m && m.parentNode) m.parentNode.removeChild(m);
   }
@@ -263,7 +263,7 @@
     try {
       if (window.HART_PERF && window.HART_PERF.potato) return true;
       if (document.body && document.body.classList && document.body.classList.contains('gpu-software')) return true;
-    } catch (e) {}
+    } catch (e) { console.debug('hartPersonalize: software-floor probe failed', e); }
     return false;
   }
 
@@ -279,7 +279,7 @@
     if (window.HartSession) { window.HartSession.set('wallpaper_css', css); window.HartSession.set('wallpaper_bg', null); }
     if (path) {
       fetch('/api/shell/wallpaper/set', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: path }) }).catch(function () {});
+        body: JSON.stringify({ path: path }) }).catch(function (e) { console.error('hartPersonalize: wallpaper/set POST failed', e); });
     }
   };
   // video / lottie / gif backgrounds (#162). Returns true when it DEGRADED to a
@@ -303,7 +303,7 @@
         v.setAttribute('playsinline', ''); v.setAttribute('aria-hidden', 'true');
         v.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:cover;pointer-events:none';
         wp.appendChild(v);
-        try { var pr = v.play(); if (pr && pr.catch) pr.catch(function () {}); } catch (e) {}
+        try { var pr = v.play(); if (pr && pr.catch) pr.catch(function (e2) { console.debug('hartPersonalize: wallpaper video autoplay rejected', e2); }); } catch (e) { console.debug('hartPersonalize: wallpaper video play() threw', e); }
       }
     } else if (type === 'lottie') {
       if (isSoftwareFloor() || !(window.lottie && typeof window.lottie.loadAnimation === 'function')) {
@@ -315,7 +315,7 @@
         box.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:none';
         wp.appendChild(box);
         try { wp._lottieAnim = window.lottie.loadAnimation({ container: box, renderer: 'svg', loop: true, autoplay: true, path: url }); }
-        catch (e) { clearWpMedia(); applyCss(posterCss); degraded = true; }
+        catch (e) { console.debug('hartPersonalize: lottie wallpaper load failed, degrading to static', e); clearWpMedia(); applyCss(posterCss); degraded = true; }
       }
     } else {
       applyCss("center/cover no-repeat url('" + url + "')");   // unknown -> treat as image
@@ -416,13 +416,13 @@
                   method: 'POST', headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ custom: { font: { display: f.family } } }),
                   signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null
-                }).catch(function () {});
-              } catch (e) {}
+                }).catch(function (e) { console.error('hartPersonalize: font appearance/apply POST failed', e); });
+              } catch (e) { console.error('hartPersonalize: font appearance/apply dispatch threw', e); }
               toast('Font', f.family);
             });
             fg.appendChild(c);
           });
-        }).catch(function () {});
+        }).catch(function (e) { console.debug('hartPersonalize: font list fetch failed (keeping defaults)', e); });
     });
 
     // 2) ORB — switchable variety, applied live + persisted (#140).
@@ -475,8 +475,8 @@
             return { id: s.id, name: s.name, a: _hx(s.accent), a2: _hx(s.secondary),
                      b: _hx(s.background), c: _hx(s.surface) };
           }));
-        }).catch(function () {});       // offline -> keep the fallback (zero regression)
-      } catch (e) {}
+        }).catch(function (e) { console.debug('hartPersonalize: theme presets fetch failed (keeping fallback)', e); });       // offline -> keep the fallback (zero regression)
+      } catch (e) { console.debug('hartPersonalize: theme presets dispatch threw', e); }
     });
 
     // 4) WALLPAPER — built-in CSS gradients / solids.
@@ -544,7 +544,7 @@
         fetch('/api/shell/wallpaper/collection',
           { signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null })
           .then(function (r) { return r.json(); }).then(function (col) { ig.innerHTML = ''; renderImages(ig, col); })
-          .catch(function () { ig.innerHTML = ''; var d = document.createElement('div');
+          .catch(function (e) { console.debug('hartPersonalize: wallpaper collection fetch failed', e); ig.innerHTML = ''; var d = document.createElement('div');
             d.className = 'ds-body-sm ds-text-muted'; d.textContent = 'Images unavailable'; ig.appendChild(d); });
       }
     });

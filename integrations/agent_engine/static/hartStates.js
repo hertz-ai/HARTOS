@@ -64,7 +64,8 @@
       fetch(url, { signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(6000) : null })
         .then(function (r) { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
         .then(function (d) { container.innerHTML = ''; render(container, d); })
-        .catch(function () {
+        .catch(function (e) {
+          console.debug('hartStates: state list load failed (showing offline, will retry)', e);
           container.innerHTML = '';
           container.appendChild(window.hartEmptyState({
             kind: 'offline',

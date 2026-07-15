@@ -145,9 +145,9 @@
     if (!id) return;
     if (openSet[id] && typeof global.bringToFront === 'function') {
       // bringToFront already un-minimises (p.min) before raising — canonical.
-      try { global.bringToFront(id); } catch (e) {}
+      try { global.bringToFront(id); } catch (e) { console.error('hartNav: bringToFront failed for ' + id, e); }
     } else if (typeof global.openPanel === 'function') {
-      try { global.openPanel(id); } catch (e) {}
+      try { global.openPanel(id); } catch (e) { console.error('hartNav: openPanel failed for ' + id, e); }
     }
   }
 
@@ -199,7 +199,7 @@
     up: function () {
       var e = core.current();
       if (e && openSet[e.id] && typeof global.minimizePanel === 'function') {
-        try { global.minimizePanel(e.id); } catch (x) {}
+        try { global.minimizePanel(e.id); } catch (x) { console.error('hartNav: minimizePanel failed for ' + e.id, x); }
       }
     }
   };
@@ -271,6 +271,6 @@
       var trail = st.slice(0, core.index()).map(function (e) { return e.title; });
       var crumb = trail.length ? '· ' + trail.slice(-3).reverse().join(' · ') : '';
       c.querySelector('#hn-crumb').textContent = crumb;
-    } catch (e) { /* chrome is best-effort; never let it break navigation */ }
+    } catch (e) { console.debug('hartNav: breadcrumb chrome update failed (best-effort)', e); }
   }
 })(typeof window !== 'undefined' ? window : this);

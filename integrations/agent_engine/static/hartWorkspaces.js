@@ -104,8 +104,8 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: n, name: String(n) })
-      }).catch(function () { /* degrade silently */ });
-    } catch (e) { /* degrade silently */ }
+      }).catch(function (e) { console.debug('hartWorkspaces: compositor switch POST failed (honest no-op)', e); });
+    } catch (e) { console.debug('hartWorkspaces: compositor switch dispatch threw', e); }
   }
 
   window.hartSwitchWorkspace = function (n) {

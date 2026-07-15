@@ -76,7 +76,7 @@
 
   function refresh() {
     fetch(API, { signal: ts(4000) }).then(function (r) { return r.json(); })
-      .then(apply).catch(function () {});
+      .then(apply).catch(function (e) { console.debug('hartSenses: status refresh fetch failed', e); });
   }
 
   function toggle() {
@@ -88,7 +88,7 @@
           cut ? 'Shut - eyes & ears closed' : 'Awake', cut ? 'warning' : 'success');
         var panel = document.getElementById('hart-senses-panel');
         if (panel) panel.classList.toggle('open', cut);   // reveal the proof when cut
-      }).catch(function () {});
+      }).catch(function (e) { console.error('hartSenses: senses toggle POST failed', e); });
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -139,7 +139,7 @@
     var de = document.documentElement;
     de.style.userSelect = 'none'; de.style.webkitUserSelect = 'none';
     (ghost = ghost || mkGhost()).classList.add('show');
-    try { POD.setPointerCapture(e.pointerId); } catch (_) {}
+    try { POD.setPointerCapture(e.pointerId); } catch (_) { console.debug('hartSenses: pod setPointerCapture failed', _); }
   }
   function onMove(e) {
     if (!drag) return;
@@ -160,7 +160,7 @@
     if (moved && window.HartSession) window.HartSession.set('senses_pos', s);
     POD.classList.add('settle');
     setTimeout(function () { POD.classList.remove('settle'); }, 340);
-    try { POD.releasePointerCapture(e.pointerId); } catch (_) {}
+    try { POD.releasePointerCapture(e.pointerId); } catch (_) { console.debug('hartSenses: pod releasePointerCapture failed', _); }
   }
   function restore() {
     var p = window.HartSession && window.HartSession.get('senses_pos');

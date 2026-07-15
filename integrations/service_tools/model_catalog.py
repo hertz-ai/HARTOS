@@ -908,7 +908,7 @@ class ModelCatalog:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
-                    pass
+                    logger.warning("_save: swallowed OSError", exc_info=True)
                 raise
             self._dirty = False
         except Exception as e:

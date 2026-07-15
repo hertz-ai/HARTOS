@@ -49,14 +49,14 @@
   // Reuse the shell's own abort-signal helper when present (short timeouts so a
   // hung endpoint never stalls the home).
   function sig(ms) {
-    try { if (typeof window._sig === 'function') return window._sig(ms); } catch (e) {}
+    try { if (typeof window._sig === 'function') return window._sig(ms); } catch (e) { console.debug('hartHome: window._sig probe failed', e); }
     try {
       if (typeof AbortController === 'function') {
         var ac = new AbortController();
-        setTimeout(function () { try { ac.abort(); } catch (e2) {} }, ms || 4000);
+        setTimeout(function () { try { ac.abort(); } catch (e2) { console.debug('hartHome: abort on timeout failed', e2); } }, ms || 4000);
         return ac.signal;
       }
-    } catch (e3) {}
+    } catch (e3) { console.debug('hartHome: AbortController unavailable', e3); }
     return undefined;
   }
   function getJSON(url, ms) {
@@ -386,7 +386,7 @@
     // The photo carries the card now; drop the placeholder glyph (the card.image
     // branch never draws a glyph over a photo, so match that).
     if (glyphEl && glyphEl.parentNode) {
-      try { glyphEl.parentNode.removeChild(glyphEl); } catch (e) {}
+      try { glyphEl.parentNode.removeChild(glyphEl); } catch (e) { console.debug('hartHome: placeholder glyph removeChild failed', e); }
     }
   }
   function hydrateCardImage(card, art, glyphEl) {
@@ -401,7 +401,7 @@
       var src = pickLocalImage(d);
       _imgSearchCache[topic] = src;          // null on a miss -> never re-query
       applyHydratedImage(art, glyphEl, src);
-    }).catch(function () { _imgSearchCache[topic] = null; });
+    }).catch(function (e) { console.debug('hartHome: card image search failed', e); _imgSearchCache[topic] = null; });
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -456,7 +456,7 @@
     var reduce = false;
     try {
       reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    } catch (e) {}
+    } catch (e) { console.debug('hartHome: matchMedia reduced-motion probe failed', e); }
     if (reduce || typeof window.requestAnimationFrame !== 'function' || target <= 0 ||
         target === _animatedAmt) {
       el.textContent = _fmt(target);
@@ -674,7 +674,7 @@
     try {
       var dl = document.querySelector('.hart-desktop');
       if (dl) dl.style.display = hidden ? 'none' : '';
-    } catch (e) {}
+    } catch (e) { console.debug('hartHome: toggle desktop layer failed', e); }
   }
 
   function render(payload) {
@@ -692,7 +692,7 @@
     requestAnimationFrame(function () { root.classList.add('hh-ready'); });
     setDesktopLayer(true);
     // Ask the orb to dock to the right hero zone (best-effort; hartHero owns it).
-    try { if (typeof window.HartOrbHomeMode === 'function') window.HartOrbHomeMode(true); } catch (e) {}
+    try { if (typeof window.HartOrbHomeMode === 'function') window.HartOrbHomeMode(true); } catch (e) { console.debug('hartHome: HartOrbHomeMode(true) failed', e); }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -731,10 +731,11 @@
         if (rows.length) {
           hero.spark_series = rows.map(function (r) { return r.amount_spark || 0; }).reverse();
         }
-      }).catch(function () {
+      }).catch(function (e) {
+        console.debug('hartHome: earnings window fetch failed (using balance)', e);
         if (typeof hero.spark_balance === 'number') hero.amount = hero.spark_balance;
       });
-    }).catch(function () {});
+    }).catch(function (e) { console.debug('hartHome: earnings balance fetch failed (keeping sample)', e); });
   }
   // The canonical Spark<->USD rate (SPARK_PER_USD) surfaced by the PUBLIC
   // estimate endpoint - so the honest "~ $X at the hive rate" line uses the one
@@ -745,7 +746,7 @@
       if (data && typeof data.spark_per_usd === 'number' && data.spark_per_usd > 0) {
         hero.spark_per_usd = data.spark_per_usd;
       }
-    }).catch(function () {});
+    }).catch(function (e) { console.debug('hartHome: spark rate estimate fetch failed', e); });
   }
   // The orb SPEAKS the earnings narrative ONCE per session (rule b8: voice, not
   // a text wall) - only when the data is REAL and there is a story (earned > 0),
@@ -766,8 +767,8 @@
       }
       line += ', fully local. Payout pending.';
       // small delay so it follows the boot greeting rather than racing it.
-      setTimeout(function () { try { window.speakText(line, 'home_earnings'); } catch (e) {} }, 1600);
-    } catch (e) {}
+      setTimeout(function () { try { window.speakText(line, 'home_earnings'); } catch (e) { console.debug('hartHome: speakText earnings narrative failed', e); } }, 1600);
+    } catch (e) { console.debug('hartHome: narrateOnce failed', e); }
   }
   function fetchAgents(payload) {
     return getJSON(backend() + '/api/social/dashboard/agents', 3500).then(function (d) {
@@ -797,7 +798,7 @@
       // Continue row only - the "Flagship agents" row is curated (always the
       // real product agents), so live dashboard agents feed Continue, not it.
       _replaceRow(payload, 'Continue', { title: 'Continue', accent: 'teal', see_all: 'agents_browse', cards: cont });
-    }).catch(function () {});
+    }).catch(function (e) { console.debug('hartHome: agents dashboard fetch failed (keeping sample)', e); });
   }
   function fetchRecipes(payload) {
     // Try the two known recipe routes; first that answers wins, else keep sample.
@@ -819,7 +820,7 @@
       _replaceRow(payload, 'Recipes',
         { title: 'Recipes', note: 'replay without re-thinking', accent: 'amber', see_all: 'recipes', cards: cards },
         true);
-    }).catch(function () {});
+    }).catch(function (e) { console.debug('hartHome: recipes fetch failed (keeping sample)', e); });
   }
 
   function _replaceRow(payload, title, newRow, appendIfMissing) {
@@ -865,7 +866,7 @@
       render(payload);
       narrateOnce(payload.hero);     // the orb speaks the story (once, real-only)
       _refreshing = false;
-    }, function () { _refreshing = false; });
+    }, function (e) { console.debug('hartHome: refresh Promise.all rejected', e); _refreshing = false; });
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -887,7 +888,7 @@
       for (var i = 0; i < tabs.length; i++) {
         tabs[i].classList.toggle('tb-active', (tabs[i].getAttribute('data-tab') || '') === tab);
       }
-    } catch (e) {}
+    } catch (e) { console.debug('hartHome: setActiveTab failed', e); }
   }
   function navTo(tab) {
     tab = (tab || 'home').toLowerCase();
@@ -930,7 +931,7 @@
       // here re-measures against the real visible height. render() also re-docks
       // the orb to home mode, so the trailing call only matters for the off path.
       if (on) render(_payload || samplePayload());
-      else { setDesktopLayer(false); try { if (typeof window.HartOrbHomeMode === 'function') window.HartOrbHomeMode(false); } catch (e) {} }
+      else { setDesktopLayer(false); try { if (typeof window.HartOrbHomeMode === 'function') window.HartOrbHomeMode(false); } catch (e) { console.debug('hartHome: HartOrbHomeMode(false) failed', e); } }
     }
   };
 
@@ -946,7 +947,7 @@
           ask('');
         }
       });
-    } catch (e) {}
+    } catch (e) { console.debug('hartHome: omnibox keydown bind failed', e); }
     refresh();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
