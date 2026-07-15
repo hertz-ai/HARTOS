@@ -108,7 +108,7 @@ use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::{X11Wm, XWayland, XWaylandEvent};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::comp_core::{self, HartRenderElement};
 use crate::shared::send_frame_callbacks;
@@ -572,8 +572,12 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // Only a touchpad reports a non-zero tap finger count; gate on it so we never
                 // poke a mouse/keyboard with a touchpad-only knob.
                 if device.config_tap_finger_count() > 0 {
-                    let _ = device.config_tap_set_enabled(true);
-                    let _ = device.config_tap_set_drag_enabled(true);
+                    if let Err(err) = device.config_tap_set_enabled(true) {
+                        debug!(?err, "libinput: touchpad tap-to-click enable refused (best-effort; taps may not click)");
+                    }
+                    if let Err(err) = device.config_tap_set_drag_enabled(true) {
+                        debug!(?err, "libinput: touchpad tap-and-drag enable refused (best-effort)");
+                    }
                 }
             }
             state.process_input_event(event);
@@ -699,10 +703,10 @@ pub fn run_udev(cfg: &BootConfig) -> Result<(), Box<dyn std::error::Error>> {
     while state.running {
         // Dispatch calloop sources (libinput, session, udev, the client socket, and the
         // per-device DRM VBlank sources) + a 16ms housekeeping tick, then the Display.
-        if event_loop
+        if let Err(err) = event_loop
             .dispatch(Some(Duration::from_millis(16)), &mut state)
-            .is_err()
         {
+            error!(?err, "HART-comp DRM: event loop dispatch failed; exiting the loop");
             state.running = false;
             continue;
         }
@@ -817,7 +821,10 @@ fn device_added(
     for conn_handle in res.connectors() {
         let conn = match drm.get_connector(*conn_handle, false) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(err) => {
+                warn!(?err, "HART-comp DRM: get_connector failed; skipping this connector");
+                continue;
+            }
         };
         if conn.state() != connector::State::Connected {
             continue;
@@ -1120,7 +1127,9 @@ fn apply_pending_session(state: &mut State, devices: &mut HashMap<DrmNode, Devic
             device.drm.pause();
             // A double-drop (smithay's pause already released it on a privileged device) just
             // returns Err — ignore it; the goal state is simply "we no longer hold master".
-            let _ = device.fd.release_master_lock();
+            if let Err(err) = device.fd.release_master_lock() {
+                debug!(?err, "HART-comp DRM: release_master_lock on pause returned Err (expected on a double-drop; master already released)");
+            }
             device.master = false;
             for surface in device.surfaces.values_mut() {
                 surface.awaiting_vblank = false;

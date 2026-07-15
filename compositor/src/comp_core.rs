@@ -92,7 +92,7 @@ use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 // `Window::wl_surface()` / `X11Surface`-focus come from `WaylandFocus` on this rev.
 use smithay::wayland::seat::WaylandFocus;
 use smithay::xwayland::X11Wm;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::WindowHandle;
 use crate::shared::{toplevel_app_id, toplevel_title, x11_app_id, x11_title};
@@ -399,7 +399,10 @@ pub fn now_secs_nsecs() -> (u64, u32) {
     use std::time::{SystemTime, UNIX_EPOCH};
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => (d.as_secs(), d.subsec_nanos()),
-        Err(_) => (0, 0),
+        Err(err) => {
+            debug!(?err, "now_secs_nsecs: system clock is before UNIX_EPOCH; using (0, 0)");
+            (0, 0)
+        }
     }
 }
 
@@ -479,7 +482,9 @@ pub fn update_keyboard_focus<S: CompState>(state: &mut S, pos: Point<f64, Logica
         state.space_mut().raise_element(&window, true);
         if let Some(x11) = window.x11_surface() {
             if let Some(xwm) = state.xwm_mut().as_mut() {
-                let _ = xwm.raise_window(x11);
+                if let Err(err) = xwm.raise_window(x11) {
+                    warn!(?err, "focus: X11Wm::raise_window failed");
+                }
             }
         }
         let surface = window.wl_surface().map(|s| s.into_owned());
@@ -622,7 +627,9 @@ fn note_input_alive() {
         return;
     }
     info!("hart-comp: first seat input delivered — libinput/Seat path is LIVE (#134 liveness beacon)");
-    let _ = std::fs::write("/run/hart/session/input-alive", b"1\n");
+    if let Err(err) = std::fs::write("/run/hart/session/input-alive", b"1\n") {
+        debug!(?err, "note_input_alive: could not write the input-alive marker (the journal line above is the primary signal)");
+    }
 }
 
 /// Intercept compositor keyboard shortcuts BEFORE forwarding to the focused client;
@@ -720,7 +727,9 @@ pub fn cycle_focus<S: CompState>(state: &mut S, forward: bool, serial: Serial) {
     state.space_mut().raise_element(&target, true);
     if let Some(x11) = target.x11_surface() {
         if let Some(xwm) = state.xwm_mut().as_mut() {
-            let _ = xwm.raise_window(x11);
+            if let Err(err) = xwm.raise_window(x11) {
+                warn!(?err, "focus cycle: X11Wm::raise_window failed");
+            }
         }
     }
     let surface = target.wl_surface().map(|s| s.into_owned());
@@ -1209,7 +1218,9 @@ pub fn ipc_focus_window<S: CompState>(state: &mut S, handle: &str) -> bool {
     state.space_mut().raise_element(&window, true);
     if let Some(x11) = window.x11_surface() {
         if let Some(xwm) = state.xwm_mut().as_mut() {
-            let _ = xwm.raise_window(x11);
+            if let Err(err) = xwm.raise_window(x11) {
+                warn!(?err, "window.focus: X11Wm::raise_window failed");
+            }
         }
     }
     let serial = SERIAL_COUNTER.next_serial();
@@ -1228,7 +1239,9 @@ pub fn ipc_move_window<S: CompState>(state: &mut S, handle: &str, x: i32, y: i32
     state.space_mut().map_element(window.clone(), (x, y), true);
     if let Some(x11) = window.x11_surface() {
         if let Some(bbox) = state.space().element_bbox(&window) {
-            let _ = x11.configure(Some(bbox));
+            if let Err(err) = x11.configure(Some(bbox)) {
+                warn!(?err, "window.move: X11Surface::configure failed");
+            }
         }
     }
     true
@@ -1249,7 +1262,9 @@ pub fn ipc_resize_window<S: CompState>(state: &mut S, handle: &str, w: i32, h: i
     }
     if let Some(x11) = window.x11_surface() {
         let rect = Rectangle::new((loc.x, loc.y).into(), (w, h).into());
-        let _ = x11.configure(Some(rect));
+        if let Err(err) = x11.configure(Some(rect)) {
+            warn!(?err, "window.resize: X11Surface::configure failed");
+        }
     }
     true
 }
@@ -1269,7 +1284,9 @@ pub fn ipc_place_window<S: CompState>(state: &mut S, handle: &str, x: i32, y: i3
     state.space_mut().map_element(window.clone(), (x, y), true);
     if let Some(x11) = window.x11_surface() {
         let rect = Rectangle::new((x, y).into(), (w, h).into());
-        let _ = x11.configure(Some(rect));
+        if let Err(err) = x11.configure(Some(rect)) {
+            warn!(?err, "window.place: X11Surface::configure failed");
+        }
     }
     true
 }
@@ -1410,7 +1427,9 @@ pub fn ipc_close_window<S: CompState>(state: &mut S, handle: &str) -> bool {
         return true;
     }
     if let Some(x11) = window.x11_surface() {
-        let _ = x11.set_mapped(false);
+        if let Err(err) = x11.set_mapped(false) {
+            warn!(?err, "window.close: X11Surface::set_mapped(false) failed");
+        }
         return true;
     }
     false
@@ -1493,7 +1512,13 @@ pub fn build_cursor_elements<S, R>(
                     // (the never-fail render floor, #186): fall back to a zero hotspot and
                     // keep painting. `.lock()` poisons only if a prior holder panicked — at
                     // which point dropping the cursor offset is strictly better than dying.
-                    .and_then(|d| d.lock().ok().map(|g| g.hotspot))
+                    .and_then(|d| match d.lock() {
+                        Ok(g) => Some(g.hotspot),
+                        Err(err) => {
+                            debug!(?err, "cursor: CursorImageSurfaceData mutex poisoned; using a zero hotspot");
+                            None
+                        }
+                    })
                     .unwrap_or_default()
             });
             let cpos = (pos - hotspot.to_f64()).to_physical_precise_round(1.0);
@@ -1516,7 +1541,7 @@ pub fn build_cursor_elements<S, R>(
                 Kind::Cursor,
             ) {
                 Ok(e) => elements.insert(0, HartRenderElement::Memory(e)),
-                Err(_) => warn!("cursor: failed to build the default-arrow element"),
+                Err(err) => warn!(?err, "cursor: failed to build the default-arrow element"),
             }
         }
     }

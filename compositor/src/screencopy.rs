@@ -67,7 +67,7 @@ use smithay::reexports::wayland_server::{
 };
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 use smithay::wayland::shm::{shm_format_to_fourcc, with_buffer_contents_mut, BufferData};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::comp_core;
 use crate::winit::State;
@@ -257,7 +257,10 @@ fn queue_copy(
         );
         fmt_ok && bd.width == expected_w && bd.height == expected_h
     })
-    .unwrap_or(false);
+    .unwrap_or_else(|err| {
+        debug!(?err, "screencopy: with_buffer_contents_mut could not read the client shm buffer");
+        false
+    });
 
     if !ok {
         warn!(

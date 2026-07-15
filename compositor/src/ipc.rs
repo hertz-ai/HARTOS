@@ -63,7 +63,7 @@ use smithay::reexports::calloop::{
 // `Window::wl_surface()` comes from the `WaylandFocus` trait on this Smithay rev (not an
 // inherent method) â€” it MUST be in scope for `ipc_list_windows`'s focus check.
 use smithay::wayland::seat::WaylandFocus;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::comp_core::{self, CompState};
 
@@ -103,9 +103,18 @@ impl IpcState {
         });
         let bytes = match serde_json::to_vec(&frame) {
             Ok(b) => b,
-            Err(_) => return,
+            Err(err) => {
+                warn!(?err, "IPC: failed to serialize an event frame; dropping it");
+                return;
+            }
         };
-        self.subscribers.retain_mut(|s| write_frame(s, &bytes).is_ok());
+        self.subscribers.retain_mut(|s| match write_frame(s, &bytes) {
+            Ok(()) => true,
+            Err(err) => {
+                debug!(?err, "IPC: dropping a subscriber whose event write failed (peer likely gone)");
+                false
+            }
+        });
     }
 }
 
@@ -320,7 +329,10 @@ fn register_connection<S: CompState>(state: &mut S, stream: UnixStream) {
         // Dispatch every fully-buffered request, writing one response each.
         while let Some(body) = conn.next_frame() {
             let resp = handle_frame(state, &body, &mut conn.stream);
-            let bytes = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{}".to_vec());
+            let bytes = serde_json::to_vec(&resp).unwrap_or_else(|err| {
+                warn!(?err, "IPC: failed to serialize a response frame; sending an empty object");
+                b"{}".to_vec()
+            });
             if let Err(err) = write_frame(&mut conn.stream, &bytes) {
                 warn!(?err, "IPC: failed to write response; closing connection");
                 return Ok(PostAction::Remove);
