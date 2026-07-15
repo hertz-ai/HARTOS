@@ -41,7 +41,7 @@
 
   // ── Brand PALETTES (#161). id/name + the ambient hue QUAD: lead accent / mood
   // hue #1 (a), secondary accent + ambient #2 (a2), ambient hues #3/#4 (a3/a4,
-  // OPTIONAL), canvas background (b). An OPTIONAL `accent` pins the FUNCTIONAL
+  // OPTIONAL), canvas background (b). An OPTIONAL 'accent' pins the FUNCTIONAL
   // signifier (orb core / primary CTA / earnings) to a fixed hue while a..a4 drive
   // the AMBIENT/mood field (the steward hybrid: b1.2 teal stays on function even
   // when the mood goes violet-lead). 'vibrant' = the b1.2 teal+violet default;
@@ -190,7 +190,7 @@
     }
   }
   // Resolve a mood/palette ID -> the PALETTES entry (or null on a miss). The
-  // authoritative client-side vocabulary owner: the LLM-composed `mood` id from the
+  // authoritative client-side vocabulary owner: the LLM-composed 'mood' id from the
   // agentic home push (compose_home) is resolved HERE before paintPalette, so an
   // unknown id is a graceful no-op (never a broken paint). One lookup, no parallel list.
   function paletteById(id) {
