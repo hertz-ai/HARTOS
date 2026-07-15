@@ -309,6 +309,25 @@ in
     # so the create-side and read-side stay in lockstep.
     hartlogCreate.enable = true;
 
+    # ── Stateful across boots: persist onto the HARTSTATE partition ──
+    # The live ISO is stateless (tmpfs), so the box re-asks for Wi-Fi EVERY boot,
+    # forgets the theme/skins/onboarding, and wipes the user's home. With this ON,
+    # IF the flasher carved a HARTSTATE-labelled partition on the USB, a boot
+    # oneshot mounts it (by-label, the same lookup hart-boot-log uses) BEFORE
+    # NetworkManager + the session and bind-persists the stateful paths so they
+    # SURVIVE reboot: /etc/NetworkManager/system-connections (Wi-Fi creds — THE
+    # "asks for wifi every boot" fix; NM auto-connects next boot), the HART state
+    # dir (active theme, custom skins, HartSession, the onboarding/identity seal so
+    # first-boot setup is NOT re-asked), and /home/hart-admin. The Wi-Fi keyfiles
+    # persist SECURELY (0700 dir / 0600 files, root:root) and ONLY on a POSIX fs
+    # (fail-secure: never world-readable on FAT/NTFS; format HARTSTATE ext4).
+    # TPM-sealed LUKS on HARTSTATE is the stronger follow-up (needs a key
+    # mechanism) — not attempted yet. A pure NO-OP when no HARTSTATE partition is
+    # present (the OS still boots stateless, exactly as today); nothing requires
+    # the unit, so it can NEVER block or fail boot. [Real-HW-gated — verify on the
+    # node via the loop that Wi-Fi + theme + onboarding actually survive a reboot.]
+    statePersist.enable = true;
+
     # ── Boot continuity (return to HART OS on a Live-OS-initiated restart) ──
     # When the user restarts FROM the Live OS, set a ONE-SHOT efibootmgr BootNext
     # to the USB's OWN EFI boot entry so the next boot returns to HART OS without

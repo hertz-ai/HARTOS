@@ -290,6 +290,20 @@
       # Imported so the option exists + tests/journal-export.nix can enable it; the
       # live/desktop config turns it on (desktop.nix).
       ./modules/hart-journal-export.nix
+      # Stateful-across-boots persistence onto the HARTSTATE partition: IF a
+      # partition labelled HARTSTATE (carved on the USB by the flasher) is present,
+      # a boot oneshot mounts it (by-label, the same lookup hart-boot-log uses) and
+      # bind-persists the Wi-Fi credentials (/etc/NetworkManager/system-connections
+      # — the "every boot asks for wifi" fix), the HART state (cfg.dataDir: active
+      # theme, custom skins, HartSession, the onboarding/identity seal), and
+      # /home/hart-admin, so they SURVIVE reboot. The Wi-Fi keyfiles are persisted
+      # SECURELY (0700/0600 root:root) and ONLY on a POSIX fs (fail-secure). Ordered
+      # BEFORE NetworkManager + the session; nothing REQUIRES it, so a missing/
+      # unreadable HARTSTATE is a pure NO-OP that NEVER blocks boot (the OS stays
+      # stateless, exactly as today). Opt-in (hart.statePersist.enable=false default)
+      # -> pure no-op for every variant; desktop.nix turns it on. Imported so the
+      # option exists + tests/state-persist.nix can enable it.
+      ./modules/hart-state-persist.nix
       # Cross-OS storage interop (#145): read/write NTFS, exFAT, FAT32/vfat,
       # ext4, and btrfs disks from any operating system, with on-demand udisks
       # auto-mount + the per-filesystem format/repair tooling. It adds only
@@ -709,6 +723,15 @@
       # clobber-the-boot-medium invariant), AND that the no-stick path is a clean
       # no-op. Distinct attr name -> clean //; desktop-variant node (mkNode).
       journalExport = import ./tests/journal-export.nix desktopTestArgs;
+      # Stateful-across-boots persistence: a desktop node enables hart.statePersist +
+      # NetworkManager + attaches a spare disk. It asserts the unit exists + is
+      # ordered Before NetworkManager and nothing REQUIRES it (never boot-blocking),
+      # a no-HARTSTATE boot is a clean DECISION=NOOP that still reaches multi-user,
+      # persisting onto a real ext4 HARTSTATE stand-in bind-mounts the paths with the
+      # SECURE 0700/root:root Wi-Fi perms and lands written data on the partition, and
+      # a non-POSIX (vfat) HARTSTATE FAIL-SECURE skips the Wi-Fi bind. The "survives a
+      # real reboot off the USB" end still needs real HW. Distinct attr -> clean //.
+      statePersist = import ./tests/state-persist.nix desktopTestArgs;
       # Boot / root-mount / initrd (USB-root enumeration): a desktop node enables
       # hart.bootRootInitrd + hart.hartlogCreate, BOOTS, confirms the root actually
       # mounted (findmnt /), then EXTRACTS the built initrd and proves usb_storage /
@@ -839,7 +862,7 @@
       # 'screen' kill-switch is cut OR the authority is down, and ALLOWS when on.
       # Distinct attr -> clean //; desktop-variant node (mkNode).
       notify = import ./tests/notify.nix desktopTestArgs;
-    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // journalExport // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify;
+    in vmTests // floorLock // supervisor // desktopShellBoot // layerShellHost // portalScreencast // otaCentral // nativeSubsystems // bootLog // hartlogCreate // bootContinuity // journalExport // statePersist // bootRootInitrd // powerActions // powerSuspendResume // displayTiersNeverBlack // storageFilesystems // audio // networkWifi // netDiag // inputSeatPointer // security // gpuOffload // memory // displayManagement // robotProbe // notify;
 
     # ═════════════════════════════════════════════════════════════
     # VM apps (fast dev/test cycle: nix run .#vm-server)

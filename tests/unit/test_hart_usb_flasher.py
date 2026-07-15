@@ -550,7 +550,9 @@ def _stub_flash_machinery(monkeypatch, verify_result=True):
         return verify_result
     monkeypatch.setattr(flasher, "verify_iso", fake_verify)
 
-    def fake_carve(disk, log, iso_bytes=0):
+    def fake_carve(disk, log, iso_bytes=0, **kw):
+        # **kw so the HARTSTATE carve (create_log_partition(..., label=, fs=)) is
+        # captured by the same stub — one carve path, two labels.
         order.append("carve")
         return True
     monkeypatch.setattr(flasher, "create_log_partition", fake_carve)
@@ -649,6 +651,144 @@ def test_windows_log_partition_flag_parses(monkeypatch):
     args2 = flasher.build_parser().parse_args(
         ["--device", "1", "--yes", "--windows-log-partition"])
     assert args2.windows_log_partition is True           # explicit legacy opt-in
+
+
+# ─────────── HARTSTATE persistence partition (opt-in stateful live USB) ───────────
+# HARTSTATE reuses the EXACT HARTLOG carve mechanism + safety (GPT relocate, no-free
+# skip, never-raises, post-carve boot re-verify) — the only knobs that differ are the
+# label (HARTSTATE) and the fs (ext4, so a bind-persisted home has Unix permissions +
+# symlinks). Windows diskpart can't create ext4, so there it FAT32-formats a labelled
+# placeholder the live OS reformats to ext4 on first boot. These mirror the HARTLOG
+# create_log_partition tests + run on the Windows dev box (mocked runner, no device).
+
+
+def test_create_state_partition_runs_correct_diskpart_script(monkeypatch):
+    """The HARTSTATE carve drives the SAME diskpart script as HARTLOG but with the
+    HARTSTATE label. diskpart can't make ext4, so the host-side pre-seed is FAT32
+    (what the carve has always used) + the HARTSTATE label the live OS detects to
+    bind persistence; on a confirmed format it returns True."""
+    monkeypatch.setattr(flasher, "IS_WIN", True)
+    captured = {}
+    monkeypatch.setattr(flasher.subprocess, "run", _fake_log_partition_diskpart(captured))
+    logs = []
+    ok = flasher.create_log_partition({"number": 1}, logs.append,
+                                      label=flasher.STATE_PART_LABEL, fs="ext4")
+    assert ok is True
+    s = captured["script"]
+    assert "select disk 1" in s
+    assert "create partition primary" in s
+    assert "format fs=fat32 label=HARTSTATE quick" in s
+    assert flasher.STATE_PART_LABEL == "HARTSTATE"
+    assert any("HARTSTATE partition: created" in m for m in logs)
+
+
+def test_create_state_partition_unix_carves_ext4_with_label(monkeypatch):
+    """On Linux/macOS the HARTSTATE carve relocates the backup GPT (sgdisk -e) BEFORE
+    carving, names the new partition HARTSTATE, types it Linux-fs (8300), and formats
+    it EXT4 (mkfs.ext4) — the persistence-ready fs. Proves the relocate-before-carve
+    order + the HARTSTATE label/typecode/ext4 argv."""
+    monkeypatch.setattr(flasher, "IS_WIN", False)
+    tools = {"sgdisk": "/usr/bin/sgdisk", "mkfs.ext4": "/usr/sbin/mkfs.ext4",
+             "partprobe": "/usr/sbin/partprobe", "partx": "/usr/sbin/partx"}
+    monkeypatch.setattr(flasher.shutil, "which", lambda name: tools.get(name))
+    monkeypatch.setattr(flasher.os.path, "exists", lambda _p: True)
+    monkeypatch.setattr(flasher.time, "sleep", lambda *_: None)
+
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        exe = cmd[0]
+        if exe.endswith("sgdisk"):
+            if "-f" in cmd:
+                return _CP("67584\n")                # first aligned free sector
+            if "-E" in cmd:
+                return _CP("60909534\n")             # last usable (tail now exposed)
+            return _CP("")                           # -e, --largest-new, ...
+        if exe == "lsblk":
+            if "PTTYPE" in cmd:
+                return _CP("gpt\n")
+            return _CP("/dev/sdb1 part\n/dev/sdb2 part\n")   # the new node is sdb2
+        return _CP("")                               # partprobe / partx / mkfs.ext4
+    monkeypatch.setattr(flasher.subprocess, "run", fake_run)
+
+    logs = []
+    ok = flasher.create_log_partition({"number": 1, "dev": "/dev/sdb"}, logs.append,
+                                      label=flasher.STATE_PART_LABEL, fs="ext4")
+    assert ok is True
+
+    sg = [c for c in calls if c[0].endswith("sgdisk")]
+    e_idx = next(i for i, c in enumerate(sg) if "-e" in c)
+    carve_idx = next(i for i, c in enumerate(sg)
+                     if any(a.startswith("--largest-new") for a in c))
+    assert e_idx < carve_idx, "sgdisk -e (relocate backup GPT) must run BEFORE the carve"
+    assert any("--change-name=0:HARTSTATE" in c for c in sg)      # named HARTSTATE
+    assert any("--typecode=0:8300" in c for c in sg)             # Linux-filesystem typecode
+    assert any(c[0].endswith("mkfs.ext4") and "HARTSTATE" in c for c in calls)  # ext4+label
+    assert not any(c[0].endswith("mkfs.vfat") for c in calls), "HARTSTATE must not be FAT32 on Unix"
+    assert any("created + ext4-formatted" in m for m in logs)
+
+
+def test_create_state_partition_carve_failure_is_swallowed(monkeypatch):
+    """A carve failure (diskpart timeout/OSError) is SWALLOWED — the HARTSTATE carve
+    can never raise nor fail the already-successful flash (identical to HARTLOG)."""
+    monkeypatch.setattr(flasher, "IS_WIN", True)
+
+    def boom(cmd, **kw):
+        raise flasher.subprocess.TimeoutExpired(cmd, kw.get("timeout", 120))
+
+    monkeypatch.setattr(flasher.subprocess, "run", boom)
+    logs = []
+    ok = flasher.create_log_partition({"number": 1}, logs.append,      # must NOT raise
+                                      label=flasher.STATE_PART_LABEL, fs="ext4")
+    assert ok is False
+    assert any("HARTSTATE partition" in m and ("unavailable" in m or "timed out" in m)
+               for m in logs)
+
+
+def test_state_partition_flag_parses():
+    """--state-partition is OFF by default and the explicit opt-in to the stateful
+    live-USB carve."""
+    args = flasher.build_parser().parse_args(["--device", "1", "--yes"])
+    assert args.state_partition is False
+    args2 = flasher.build_parser().parse_args(
+        ["--device", "1", "--yes", "--state-partition"])
+    assert args2.state_partition is True
+
+
+def test_flash_creates_state_partition_after_successful_verify(monkeypatch):
+    """make_state_partition=True (--state-partition) must carve HARTSTATE AFTER a
+    successful verify, through the same create_log_partition path as HARTLOG."""
+    order = _stub_flash_machinery(monkeypatch, verify_result=True)
+    ok = flasher.flash("tag", "desktop", {"number": 1, "model": "USB", "dev": "/dev/sdb",
+                                          "physdrive": "/dev/sdb"},
+                       "download", "/tmp", log=lambda m: None,
+                       make_state_partition=True)
+    assert ok is True
+    assert order == ["verify", "carve"], \
+        "the HARTSTATE carve must run AFTER verify_iso, only on success"
+
+
+def test_flash_state_carve_exception_does_not_fail_the_flash(monkeypatch):
+    """If the HARTSTATE carve RAISES (it shouldn't), flash() swallows it — the carve
+    can never turn a successful flash into a failure."""
+    order = _stub_flash_machinery(monkeypatch, verify_result=True)
+
+    def raising_carve(disk, log, iso_bytes=0, **kw):
+        order.append("carve")
+        raise RuntimeError("carve exploded")
+    monkeypatch.setattr(flasher, "create_log_partition", raising_carve)
+
+    try:
+        ok = flasher.flash("tag", "desktop",
+                           {"number": 1, "model": "USB", "dev": "/dev/sdb",
+                            "physdrive": "/dev/sdb"},
+                           "download", "/tmp", log=lambda m: None,
+                           make_state_partition=True)
+    except RuntimeError:
+        pytest.fail("a state-carve exception must not propagate out of flash()")
+    assert ok is True
+    assert order == ["verify", "carve"]
 
 
 # ─────────── #128: the Windows GPT relocate (sgdisk -e equivalent) ───────────
@@ -858,7 +998,7 @@ def test_windows_carve_relocates_gpt_before_diskpart(monkeypatch):
     monkeypatch.setattr(flasher, "_windows_grow_gpt_to_device_end",
                         lambda disk, iso_bytes, log: order.append(("grow", iso_bytes)) or True)
     monkeypatch.setattr(flasher, "_create_log_partition_windows",
-                        lambda disk, log: order.append(("diskpart",)) or True)
+                        lambda disk, log, **kw: order.append(("diskpart",)) or True)
     flasher.create_log_partition({"number": 1}, lambda m: None, iso_bytes=7030001664)
     assert order == [("grow", 7030001664), ("diskpart",)], \
         "the GPT relocate must run BEFORE the diskpart carve"
@@ -871,7 +1011,7 @@ def test_windows_carve_skips_grow_without_iso_size(monkeypatch):
     called = {"grow": 0}
     monkeypatch.setattr(flasher, "_windows_grow_gpt_to_device_end",
                         lambda *a, **k: called.__setitem__("grow", called["grow"] + 1) or True)
-    monkeypatch.setattr(flasher, "_create_log_partition_windows", lambda disk, log: True)
+    monkeypatch.setattr(flasher, "_create_log_partition_windows", lambda disk, log, **kw: True)
     flasher.create_log_partition({"number": 1}, lambda m: None)   # no iso_bytes
     assert called["grow"] == 0
 
