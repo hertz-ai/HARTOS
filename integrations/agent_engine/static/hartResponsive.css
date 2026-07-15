@@ -493,7 +493,12 @@ body.webkit-flat .agent-pill {
      colourless grey rgba(18,19,28,.94) that read MONOCHROMATIC on real HW (2026-07-12,
      the mockup gap): cairo cannot paint backdrop-filter, so the frosted brand colour
      collapsed to grey. This restores it with a one-time raster. */
-  background: linear-gradient(155deg, rgba(0,230,195,0.07), rgba(20,22,32,0.95) 46%, rgba(155,92,255,0.08));
+  /* OPAQUE at EVERY stop (was 0.07/0.08 alpha at the edges -> panel corners read
+     ~92% see-through and the home bled through -> the "cluttered/overlap" real-HW
+     bug, 2026-07-15). Keep the teal-LEADS / violet-ACCENTS brand tint, but bake it
+     into a dark ~0.985 base so the panel is a solid, legible surface on the software
+     floor (no backdrop-filter to frost it) instead of a transparent overlay. */
+  background: linear-gradient(155deg, rgba(7,29,26,0.985), rgba(20,22,32,0.985) 46%, rgba(25,16,37,0.985));
   box-shadow: 0 2px 10px rgba(0,0,0,0.34), inset 0 0 0 1px rgba(0,230,195,0.10);
 }
 
