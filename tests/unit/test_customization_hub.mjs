@@ -509,5 +509,46 @@ function runModules(realm, files) {
   ok(HW.sandbox.window.HartSession.get('wallpaper_bg') === null, 'a CSS wallpaper clears the persisted media background');
 })();
 
+// ════════════════════════════════════════════════════════════════════════════
+// [R] SECTION RESILIENCE - one broken section (a throwing dependency) is LOGGED
+//     via console.error (the shell's observability hook forwards it to journald)
+//     and SKIPPED; the panel still attaches its grid and renders every OTHER
+//     section, before AND after the broken one. Before this fix, any section throw
+//     aborted hartRenderPersonalize before the grid was attached, so the whole
+//     panel went blank (a root-cause candidate for "the panel never opens").
+// ════════════════════════════════════════════════════════════════════════════
+(function testSectionResilience() {
+  console.log('\n[R] hartPersonalize.js  a broken section is logged + skipped; the rest still render');
+  const R = makeRealm();
+  R.sandbox.window.HartSession = makeSession({});
+  R.sandbox.window.hartLoadInto = function () {};          // Images loader = no-op
+  // Spy the sandbox console.error the way the observability hook wraps it, so we can
+  // assert the broken section's failure is actually logged (forwarded to journald).
+  const errs = [];
+  R.sandbox.console = { log() {}, warn() {}, error() { errs.push(Array.prototype.slice.call(arguments)); } };
+  runModules(R, ['voiceOrbViz.js', 'hartPersonalize.js']);   // restore() runs with the REAL orb registry
+
+  // Break the MIDDLE (Orb) section: orbStyleList() reads HartVoiceOrbViz.STYLES.
+  // A throwing getter mimics a corrupt/undefined global surfacing mid-build.
+  R.sandbox.window.HartVoiceOrbViz = { get STYLES() { throw new Error('orb registry boom'); } };
+
+  const host = makeEl('div');
+  R.sandbox.window.hartRenderPersonalize(host);            // must NOT throw (pre-fix: it did)
+
+  // The panel attached its grid despite the broken section (the anti-blank contract).
+  ok(host.querySelector('.ds-panel-grid') !== null,
+     'the panel grid is attached even though a section threw (the panel opens)');
+  // A section BEFORE the broken one rendered in full.
+  eq(host.querySelectorAll('.hart-palette-card').length, R.sandbox.window.HART_PALETTES.length,
+     'the Palette section (before the broken one) rendered fully');
+  // A section AFTER the broken one rendered in full (the throw did not stop the loop).
+  eq(host.querySelectorAll('.hart-wall-card').length, R.sandbox.window.HART_WALLPAPERS.length,
+     'the Wallpaper section (after the broken one) still rendered');
+  ok(host.querySelectorAll('.hart-theme-card').length >= 1, 'the Theme section still rendered too');
+  // The broken section was logged via console.error (forwarded to journald by the hook).
+  ok(errs.some(function (a) { return String(a[0]).indexOf('Orb') >= 0; }),
+     'the broken Orb section logged its failure via console.error (observability forwarded)');
+})();
+
 console.log(failures ? ('\nRESULT: ' + failures + ' FAILED') : '\nRESULT: ALL PASS');
 process.exit(failures ? 1 : 0);

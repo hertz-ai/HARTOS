@@ -355,8 +355,16 @@ class _ConnectivityCache:
     def _probe_wifi_list(self):
         networks = []
         connected = {}
+        # `--rescan no` reads the CACHED scan (instant, non-blocking). Without it
+        # nmcli may kick off a fresh radio scan that blocks for many seconds; on
+        # the daemon prober that just burned the 1.2s PROBE_TIMEOUT_S budget and
+        # returned an empty list (popover shows no networks), and a scan must only
+        # happen on an EXPLICIT user rescan action, never on popover-open. The
+        # request path (shell_wifi) already reads the cache only, so no blocking
+        # scan sits on the waitress thread; the explicit rescan endpoint owns the
+        # fresh scan.
         r = self._run(['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY,ACTIVE',
-                       'device', 'wifi', 'list'])
+                       'device', 'wifi', 'list', '--rescan', 'no'])
         if r and r.returncode == 0:
             for line in r.stdout.strip().split('\n'):
                 parts = line.split(':')
@@ -2808,6 +2816,48 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      contract each module already documents ("loaded after the inline shell
      JS") and self-enforces via its `document.readyState==='loading'` init
      gate.  So deferring is strictly safer ordering, not a behaviour change. -->
+<!-- Client-error observability (FIX B): forward WebView JS errors to the shell
+     server so they reach journald (the WebView console is otherwise a blind
+     spot). Installed EARLY (before the deferred modules run) so it captures their
+     throws too. Tiny, dependency-free, best-effort, throttled, never throws. -->
+<script>
+(function(){{
+  var _n=0, _max=20;
+  function _post(o){{
+    if(_n>=_max) return; _n++;
+    try {{
+      fetch('/api/shell/clientlog', {{method:'POST',
+        headers:{{'Content-Type':'application/json'}},
+        body:JSON.stringify(o), keepalive:true}}).catch(function(){{}});
+    }} catch(e) {{}}
+  }}
+  window.onerror = function(message, source, lineno, colno, error){{
+    try {{ _post({{level:'error', message:String(message||''),
+      stack:String((error&&error.stack)||''), url:String(source||location.href),
+      line:lineno||0, col:colno||0}}); }} catch(e) {{}}
+    return false;
+  }};
+  window.addEventListener('unhandledrejection', function(ev){{
+    try {{
+      var r = ev.reason || {{}};
+      _post({{level:'error', message:'unhandledrejection: '+String(r.message||r),
+        stack:String(r.stack||''), url:location.href, line:0, col:0}});
+    }} catch(e) {{}}
+  }});
+  var _ce = window.console && console.error;
+  if(_ce) {{
+    console.error = function(){{
+      try {{
+        var a = Array.prototype.slice.call(arguments).map(function(x){{
+          return (x && x.stack) ? x.stack : String(x); }}).join(' ');
+        _post({{level:'warning', message:a.slice(0,2000), stack:'',
+          url:location.href, line:0, col:0}});
+      }} catch(e) {{}}
+      try {{ return _ce.apply(console, arguments); }} catch(e) {{}}
+    }};
+  }}
+}})();
+</script>
 <script defer src="/shell/static/lottie.min.js"></script>
 <script defer src="/shell/static/hartBootSplash.js"></script>
 <script defer src="/shell/static/hartSession.js"></script>
@@ -4825,7 +4875,21 @@ function loadWallpaperPanel(el) {{
   // Personalize = themes gallery + wallpaper chooser (Phase B). The heavy HTML
   // lives in hartPersonalize.js (window.hartRenderPersonalize) so this stays a
   // brace-escape-free delegate; it reuses applyPreset + the wallpaper routes.
-  if(window.hartRenderPersonalize) {{ window.hartRenderPersonalize(el); }}
+  if(window.hartRenderPersonalize) {{
+    // A runtime throw inside hartRenderPersonalize used to leave the panel blank
+    // (it "never opens"). Catch it, render a visible error card so the panel
+    // ALWAYS opens, and console.error it so FIX B forwards it to journald.
+    try {{ window.hartRenderPersonalize(el); }}
+    catch(e) {{
+      var _m = (e && e.message) ? e.message : String(e);
+      var _s = (e && e.stack) ? e.stack : '';
+      el.innerHTML = '<div class="ds-card" style="padding:16px">'
+        + '<div class="ds-title-sm" style="color:#ff6b6b">Personalize failed to render</div>'
+        + '<div class="ds-body-md" style="margin-top:6px">' + _esc(_m) + '</div>'
+        + '<pre style="white-space:pre-wrap;font-size:11px;opacity:.7;margin-top:8px;overflow:auto">' + _esc(_s) + '</pre></div>';
+      if(window.console && console.error) console.error('hartRenderPersonalize threw', e);
+    }}
+  }}
   else {{ el.innerHTML = '<div class="ds-body-md ds-text-muted">Personalize loading&hellip;</div>'; setTimeout(function(){{loadWallpaperPanel(el)}}, 400); }}
 }}
 
@@ -6675,6 +6739,42 @@ function renderAgentOverlay(ev) {{
                 events.append({
                     'time': '', 'message': 'Event log not available'})
             return jsonify({'events': events})
+
+        # ── Shell APIs: Client-error sink (FIX B) ──
+        # The shell WebView's JS console never reaches journald, so a runtime
+        # throw (e.g. hartRenderPersonalize) or an unhandled rejection was an
+        # invisible blind spot. The inline head script (window.onerror /
+        # unhandledrejection / console.error wrapper) POSTs here; we forward each
+        # record to the module logger so it lands in the node journal. Best-effort
+        # and bounded: oversized bodies are ignored and the handler NEVER 500s
+        # (always 200 {'ok': True}), so a logging failure can't break the shell.
+        @app.route('/api/shell/clientlog', methods=['POST'],
+                   endpoint='shell_clientlog')
+        def shell_clientlog():
+            try:
+                raw = request.get_data(cache=True) or b''
+                if len(raw) > 8192:
+                    return jsonify({'ok': True})
+                # cache=True above so get_json can re-parse the SAME buffered body
+                # (get_data(cache=False) would drain the stream -> get_json None).
+                data = request.get_json(silent=True) or {}
+                level = str(data.get('level', 'error')).lower()
+                message = str(data.get('message', ''))[:2000]
+                stack = str(data.get('stack', ''))[:4000]
+                url = str(data.get('url', ''))[:500]
+                line = data.get('line', 0)
+                col = data.get('col', 0)
+                loc = f' ({url}:{line}:{col})' if url else ''
+                text = f'[shell-client]{loc} {message}'
+                if stack:
+                    text += f'\n{stack}'
+                if level in ('warn', 'warning'):
+                    logger.warning(text)
+                else:
+                    logger.error(text)
+            except Exception:
+                pass
+            return jsonify({'ok': True})
 
         # ── Shell APIs: Apps ──
         @app.route('/api/shell/apps', methods=['GET'])

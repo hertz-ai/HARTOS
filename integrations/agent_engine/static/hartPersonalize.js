@@ -361,164 +361,193 @@
       var g = document.createElement('div'); g.className = 'hart-gallery'; grid.appendChild(g); return g;
     }
 
+    // Build each section in ISOLATION: one broken section (an undefined global, bad
+    // server data) is logged + skipped instead of aborting the whole render and leaving
+    // the panel blank (a root cause of "the panel never opens" -- a throw before the
+    // final grid attach used to blank everything). console.error is forwarded to
+    // journald by the shell's observability hook. One helper; every section below runs
+    // through it, so the panel always renders every section that works.
+    function safeSection(name, build) {
+      try { build(); }
+      catch (e) {
+        try { if (window.console && console.error) console.error('hartRenderPersonalize: section "' + name + '" failed', e); } catch (_e) {}
+      }
+    }
+
     // 1) PALETTE — brand accent duotone (instant, persisted). Cards + custom picker.
-    var pg = section('Palette');
-    PALETTES.forEach(function (p) {
-      var c = card('hart-palette-card', 'background:linear-gradient(135deg,' + p.a + ' 0%,' + p.a2 + ' 100%)', p.name, null);
-      activate(c, function () { applyPalette(p); toast('Palette', p.name); });
-      pg.appendChild(c);
+    safeSection('Palette', function () {
+      var pg = section('Palette');
+      PALETTES.forEach(function (p) {
+        var c = card('hart-palette-card', 'background:linear-gradient(135deg,' + p.a + ' 0%,' + p.a2 + ' 100%)', p.name, null);
+        activate(c, function () { applyPalette(p); toast('Palette', p.name); });
+        pg.appendChild(c);
+      });
+      grid.appendChild(buildCustomPicker());
     });
-    grid.appendChild(buildCustomPicker());
 
     // 1b) FEEL — live Glow (accent bloom) + Density + Blur / Opacity / Radius sliders (#170).
-    section('Feel');
-    grid.appendChild(buildFeelControls());
+    safeSection('Feel', function () {
+      section('Feel');
+      grid.appendChild(buildFeelControls());
+    });
 
     // 1c) FONT — display/heading typeface from the server font catalogue. Sets
     // --hart-font-display live (heading/title consumer in hartResponsive.css), persists
     // via HartSession, and rides the SAME /api/appearance/apply custom-overrides path
     // (custom.font.display). Body text stays system-ui (offline-safe). Best-effort: an
     // unreachable /api/appearance/fonts leaves the section empty, never throws.
-    var fg = section('Font');
-    fetch(backendBase() + '/api/appearance/fonts',
-      { signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null })
-      .then(function (r) { return r.json(); }).then(function (d) {
-        (d && d.fonts || []).forEach(function (f) {
-          if (!f || !f.family) return;
-          var c = card('hart-font-card',
-            'background:#12131c;font-family:\'' + f.family + '\',system-ui;display:flex;align-items:center;justify-content:center;font-size:22px;color:#ECF1F4',
-            'Aa · ' + f.family, null);
-          activate(c, function () {
-            var root = document.documentElement;
-            if (root && root.style && root.style.setProperty)
-              root.style.setProperty('--hart-font-display', '"' + f.family + '"');
-            if (window.HartSession) window.HartSession.set('font_display', f.family);
-            try {
-              fetch(backendBase() + '/api/appearance/apply', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ custom: { font: { display: f.family } } }),
-                signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null
-              }).catch(function () {});
-            } catch (e) {}
-            toast('Font', f.family);
+    safeSection('Font', function () {
+      var fg = section('Font');
+      fetch(backendBase() + '/api/appearance/fonts',
+        { signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null })
+        .then(function (r) { return r.json(); }).then(function (d) {
+          (d && d.fonts || []).forEach(function (f) {
+            if (!f || !f.family) return;
+            var c = card('hart-font-card',
+              'background:#12131c;font-family:\'' + f.family + '\',system-ui;display:flex;align-items:center;justify-content:center;font-size:22px;color:#ECF1F4',
+              'Aa · ' + f.family, null);
+            activate(c, function () {
+              var root = document.documentElement;
+              if (root && root.style && root.style.setProperty)
+                root.style.setProperty('--hart-font-display', '"' + f.family + '"');
+              if (window.HartSession) window.HartSession.set('font_display', f.family);
+              try {
+                fetch(backendBase() + '/api/appearance/apply', {
+                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ custom: { font: { display: f.family } } }),
+                  signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null
+                }).catch(function () {});
+              } catch (e) {}
+              toast('Font', f.family);
+            });
+            fg.appendChild(c);
           });
-          fg.appendChild(c);
-        });
-      }).catch(function () {});
+        }).catch(function () {});
+    });
 
     // 2) ORB — switchable variety, applied live + persisted (#140).
-    var og = section('Orb');
-    var curOrb = getOrbStyle();
-    orbStyleList().forEach(function (o) {
-      var prev = 'background:' + (ORB_PREVIEW[o.id] || ORB_PREVIEW.vibrant);
-      var c = card('hart-orb-card', prev, o.name, null);
-      if (o.id === curOrb) c.classList.add('active');
-      activate(c, function () {
-        setOrbStyle(o.id); toast('Orb', o.name);
-        var sibs = og.querySelectorAll('.hart-orb-card');
-        for (var i = 0; i < sibs.length; i++) sibs[i].classList.remove('active');
-        c.classList.add('active');
+    safeSection('Orb', function () {
+      var og = section('Orb');
+      var curOrb = getOrbStyle();
+      orbStyleList().forEach(function (o) {
+        var prev = 'background:' + (ORB_PREVIEW[o.id] || ORB_PREVIEW.vibrant);
+        var c = card('hart-orb-card', prev, o.name, null);
+        if (o.id === curOrb) c.classList.add('active');
+        activate(c, function () {
+          setOrbStyle(o.id); toast('Orb', o.name);
+          var sibs = og.querySelectorAll('.hart-orb-card');
+          for (var i = 0; i < sibs.length; i++) sibs[i].classList.remove('active');
+          c.classList.add('active');
+        });
+        og.appendChild(c);
       });
-      og.appendChild(c);
     });
 
     // 3) THEME — render from the SERVER preset list (/api/appearance/presets = the ONE
     // source, incl. Aura + high-contrast), falling back to the built-in PRESETS offline
     // so the picker never empties (zero regression). Kills the drifted parallel list.
     // applyPreset now LIVE-swaps (no reload). One lookup, one source.
-    var tg = section('Theme');
-    function _hx(v) { v = String(v || ''); return (!v || v.charAt(0) === '#') ? v : '#' + v; }
-    function themeCard(p) {
-      var c = card('hart-theme-card',
-        'background:linear-gradient(135deg,' + (p.b || '#0F0E17') + ',' + (p.c || p.b || '#16213e') + ')',
-        p.name || p.id, p.a);
-      activate(c, function () {
-        if (typeof window.applyPreset === 'function')
-          window.applyPreset(p.id, { set textContent(v) { toast('Theme', p.name || p.id); } });
-      });
-      return c;
-    }
-    function renderThemes(list) {
-      while (tg.firstChild) tg.removeChild(tg.firstChild);
-      list.forEach(function (p) { tg.appendChild(themeCard(p)); });
-    }
-    renderThemes(PRESETS);            // instant offline floor (the built-in fallback)
-    try {
-      fetch(backendBase() + '/api/appearance/presets', {
-        signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(4000) : null
-      }).then(function (r) { return r.json(); }).then(function (data) {
-        var arr = (data && data.presets) || [];
-        if (!Array.isArray(arr) || !arr.length) return;   // keep the fallback
-        renderThemes(arr.map(function (s) {
-          return { id: s.id, name: s.name, a: _hx(s.accent), a2: _hx(s.secondary),
-                   b: _hx(s.background), c: _hx(s.surface) };
-        }));
-      }).catch(function () {});       // offline -> keep the fallback (zero regression)
-    } catch (e) {}
+    safeSection('Theme', function () {
+      var tg = section('Theme');
+      function _hx(v) { v = String(v || ''); return (!v || v.charAt(0) === '#') ? v : '#' + v; }
+      function themeCard(p) {
+        var c = card('hart-theme-card',
+          'background:linear-gradient(135deg,' + (p.b || '#0F0E17') + ',' + (p.c || p.b || '#16213e') + ')',
+          p.name || p.id, p.a);
+        activate(c, function () {
+          if (typeof window.applyPreset === 'function')
+            window.applyPreset(p.id, { set textContent(v) { toast('Theme', p.name || p.id); } });
+        });
+        return c;
+      }
+      function renderThemes(list) {
+        while (tg.firstChild) tg.removeChild(tg.firstChild);
+        list.forEach(function (p) { tg.appendChild(themeCard(p)); });
+      }
+      renderThemes(PRESETS);            // instant offline floor (the built-in fallback)
+      try {
+        fetch(backendBase() + '/api/appearance/presets', {
+          signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(4000) : null
+        }).then(function (r) { return r.json(); }).then(function (data) {
+          var arr = (data && data.presets) || [];
+          if (!Array.isArray(arr) || !arr.length) return;   // keep the fallback
+          renderThemes(arr.map(function (s) {
+            return { id: s.id, name: s.name, a: _hx(s.accent), a2: _hx(s.secondary),
+                     b: _hx(s.background), c: _hx(s.surface) };
+          }));
+        }).catch(function () {});       // offline -> keep the fallback (zero regression)
+      } catch (e) {}
+    });
 
     // 4) WALLPAPER — built-in CSS gradients / solids.
-    var wg = section('Wallpaper');
-    WALLPAPERS.forEach(function (w) {
-      var c = card('hart-wall-card', 'background:' + w.css, w.name + (w.live ? ' · live' : ''), null);
-      activate(c, function () { window.hartSetWallpaper(w.css); toast('Wallpaper', w.name); });
-      wg.appendChild(c);
+    safeSection('Wallpaper', function () {
+      var wg = section('Wallpaper');
+      WALLPAPERS.forEach(function (w) {
+        var c = card('hart-wall-card', 'background:' + w.css, w.name + (w.live ? ' · live' : ''), null);
+        activate(c, function () { window.hartSetWallpaper(w.css); toast('Wallpaper', w.name); });
+        wg.appendChild(c);
+      });
     });
 
     // 5) BACKGROUNDS — video / lottie / gif (best-effort; degrade on the floor).
-    var bg = section('Backgrounds');
-    MEDIA_BGS.forEach(function (m) {
-      var c = card('hart-media-card', 'background:radial-gradient(circle at 50% 45%,rgba(0,230,195,.35),transparent 60%),#0b1220', m.name + ' · ' + m.type, null);
-      activate(c, function () {
-        var deg = window.hartSetWallpaperMedia(m.type, m.url, m.poster);
-        toast('Background', m.name + (deg ? ' (static)' : ''));
+    safeSection('Backgrounds', function () {
+      var bg = section('Backgrounds');
+      MEDIA_BGS.forEach(function (m) {
+        var c = card('hart-media-card', 'background:radial-gradient(circle at 50% 45%,rgba(0,230,195,.35),transparent 60%),#0b1220', m.name + ' · ' + m.type, null);
+        activate(c, function () {
+          var deg = window.hartSetWallpaperMedia(m.type, m.url, m.poster);
+          toast('Background', m.name + (deg ? ' (static)' : ''));
+        });
+        bg.appendChild(c);
       });
-      bg.appendChild(c);
+      grid.appendChild(buildMediaUrl());
     });
-    grid.appendChild(buildMediaUrl());
 
     // 6) IMAGES — image wallpapers from the local Pictures collection. Routed
     // through the shared designed-state loader (hartStates.js): loading skeleton
     // -> grid on success, breathing "offline" card + one-click retry + silent
     // auto-recover on failure. Falls back to the original inline flow if
     // hartStates.js isn't loaded yet, so this never breaks unwired.
-    var ig = section('Images');
-    function renderImages(host, col) {
-      var imgs = (col.wallpapers || []).slice(0, 12);
-      if (!imgs.length) {
-        if (typeof window.hartEmptyState === 'function') {
-          host.appendChild(window.hartEmptyState({ kind: 'empty', icon: 'wallpaper',
-            title: 'No image wallpapers', msg: 'Add images to your Pictures folder to see them here.' }));
-        } else {
-          var e = document.createElement('div'); e.className = 'ds-body-sm ds-text-muted';
-          e.textContent = 'No image wallpapers found'; host.appendChild(e);
+    safeSection('Images', function () {
+      var ig = section('Images');
+      function renderImages(host, col) {
+        var imgs = (col.wallpapers || []).slice(0, 12);
+        if (!imgs.length) {
+          if (typeof window.hartEmptyState === 'function') {
+            host.appendChild(window.hartEmptyState({ kind: 'empty', icon: 'wallpaper',
+              title: 'No image wallpapers', msg: 'Add images to your Pictures folder to see them here.' }));
+          } else {
+            var e = document.createElement('div'); e.className = 'ds-body-sm ds-text-muted';
+            e.textContent = 'No image wallpapers found'; host.appendChild(e);
+          }
+          return;
         }
-        return;
+        imgs.forEach(function (w) {
+          var url = '/api/shell/files/thumb?path=' + encodeURIComponent(w.path);
+          var c = card('hart-wall-card', 'background:#1a1a1a;overflow:hidden', w.name || 'Image', null);
+          var img = document.createElement('img');
+          img.src = url; img.setAttribute('style', 'width:100%;height:100%;object-fit:cover');
+          img.onerror = function () { img.style.display = 'none'; };
+          c.querySelector('.htc-prev').appendChild(img);
+          activate(c, function () { window.hartSetWallpaperImage(url, w.path); toast('Wallpaper', w.name || 'Image'); });
+          host.appendChild(c);
+        });
       }
-      imgs.forEach(function (w) {
-        var url = '/api/shell/files/thumb?path=' + encodeURIComponent(w.path);
-        var c = card('hart-wall-card', 'background:#1a1a1a;overflow:hidden', w.name || 'Image', null);
-        var img = document.createElement('img');
-        img.src = url; img.setAttribute('style', 'width:100%;height:100%;object-fit:cover');
-        img.onerror = function () { img.style.display = 'none'; };
-        c.querySelector('.htc-prev').appendChild(img);
-        activate(c, function () { window.hartSetWallpaperImage(url, w.path); toast('Wallpaper', w.name || 'Image'); });
-        host.appendChild(c);
-      });
-    }
-    if (typeof window.hartLoadInto === 'function') {
-      window.hartLoadInto(ig, '/api/shell/wallpaper/collection', renderImages, {
-        title: 'Photo wallpapers unavailable',
-        msg: 'Your photo wallpapers could not load yet (they come from your local Pictures). The palette, orb, themes and gradient wallpapers above work offline; photos appear when the file service is back.'
-      });
-    } else {
-      var loading = document.createElement('div'); loading.className = 'ds-body-sm ds-text-muted';
-      loading.textContent = 'Loading…'; ig.appendChild(loading);
-      fetch('/api/shell/wallpaper/collection',
-        { signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null })
-        .then(function (r) { return r.json(); }).then(function (col) { ig.innerHTML = ''; renderImages(ig, col); })
-        .catch(function () { ig.innerHTML = ''; var d = document.createElement('div');
-          d.className = 'ds-body-sm ds-text-muted'; d.textContent = 'Images unavailable'; ig.appendChild(d); });
-    }
+      if (typeof window.hartLoadInto === 'function') {
+        window.hartLoadInto(ig, '/api/shell/wallpaper/collection', renderImages, {
+          title: 'Photo wallpapers unavailable',
+          msg: 'Your photo wallpapers could not load yet (they come from your local Pictures). The palette, orb, themes and gradient wallpapers above work offline; photos appear when the file service is back.'
+        });
+      } else {
+        var loading = document.createElement('div'); loading.className = 'ds-body-sm ds-text-muted';
+        loading.textContent = 'Loading…'; ig.appendChild(loading);
+        fetch('/api/shell/wallpaper/collection',
+          { signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(5000) : null })
+          .then(function (r) { return r.json(); }).then(function (col) { ig.innerHTML = ''; renderImages(ig, col); })
+          .catch(function () { ig.innerHTML = ''; var d = document.createElement('div');
+            d.className = 'ds-body-sm ds-text-muted'; d.textContent = 'Images unavailable'; ig.appendChild(d); });
+      }
+    });
 
     el.appendChild(grid);
   };

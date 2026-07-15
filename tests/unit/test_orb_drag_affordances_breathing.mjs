@@ -27,6 +27,12 @@
  *        the generated shell CSS hides the grip by default (opacity:0) and reveals
  *        it ONLY under .hart-senses.dragging, with no :hover reveal.
  *
+ *  Software-floor breathing (orb breathes without a GPU):
+ *    [F] source-guard (labelled, paired with the behavioural [B]): the stylesheet
+ *        injectOrbAuraStyle EMITS at runtime applies the breathe/halo keyframes
+ *        UNGATED (they run on the cairo/pixman software floor, checklist c2), while
+ *        the one genuinely expensive frosted halo filter:blur stays GPU-gated.
+ *
  * Run:  node tests/unit/test_orb_drag_affordances_breathing.mjs
  * (test_orb_drag_affordances_breathing.py shells out so pytest/CI picks it up.)
  */
@@ -345,6 +351,45 @@ function runHero(realm) {
 
   // No :hover reveal remains (the affordance must not appear on a passive hover).
   ok(!/\.hart-senses-grip:hover/.test(css), 'no .hart-senses-grip:hover reveal remains (drag-only affordance)');
+})();
+
+// ════════════════════════════════════════════════════════════════════════════
+// [F] source-guard (labelled) — the breathe animation runs on the SOFTWARE floor;
+//     only the expensive halo BLUR stays GPU-gated. Paired with the behavioural
+//     [B] (which already proves the rings BUILD when no gpu-hardware class is set,
+//     i.e. on the software floor). This asserts the stylesheet the REAL
+//     injectOrbAuraStyle EMITS at runtime (its observable output), not the .js
+//     source text: the cheap breathe keyframes must NOT be gated behind
+//     body.gpu-hardware, while the frosted filter:blur must be.
+// ════════════════════════════════════════════════════════════════════════════
+(function testAuraBreatheUngatedOnSoftware() {
+  console.log('\n[F] source-guard  breathe animation ungated on software; only halo blur GPU-gated');
+  const R = makeRealm();               // shim sets NO gpu-hardware class => software floor
+  runHero(R);                          // buildOrbAura -> injectOrbAuraStyle runs for real
+  const st = R.document.head.querySelector('style');
+  ok(st !== null, 'injectOrbAuraStyle emitted the scoped <style> (the aura stylesheet)');
+  const css = (st && st.textContent) || '';
+
+  // The breathe animation on the rings is applied UNGATED (no body.gpu-hardware
+  // prefix) so it runs on the cairo/pixman floor => the orb breathes without a GPU.
+  ok(/(^|})\s*\.hart-hero-aura \.hha-r1\{animation:hha-breathe/.test(css),
+     'the ring breathe animation is applied UNGATED (runs on the software floor)');
+  ok(!/body\.gpu-hardware \.hart-hero-aura \.hha-r1\{animation/.test(css),
+     'the ring breathe animation is NOT gated behind body.gpu-hardware anymore');
+  ok(/(^|})\s*\.hart-hero-aura \.hha-halo\{animation:hha-halo/.test(css),
+     'the halo pulse animation is applied UNGATED too');
+
+  // The one genuinely expensive layer — the frosted halo BLUR — stays GPU-gated.
+  ok(/body\.gpu-hardware \.hart-hero-aura \.hha-halo\{filter:blur\(7px\)\}/.test(css),
+     'the halo filter:blur is STILL gated behind body.gpu-hardware (waits for real GPU)');
+  // The ONLY filter:blur in the aura CSS is that one GPU-gated halo rule => there is
+  // no ungated blur, so the software floor pays no live-blur cost.
+  const blurCount = (css.match(/filter:blur/g) || []).length;
+  ok(blurCount === 1, 'exactly one filter:blur in the aura CSS (the GPU-gated halo, no ungated blur)  (got ' + blurCount + ')');
+
+  // Reduced-motion still stills the breathe animation (accessibility unbroken).
+  ok(/html\.a11y-rmotion \.hart-hero-aura[^{]*\{animation:none\}/.test(css),
+     'reduced-motion still stills the breathe animation (a11y preserved)');
 })();
 
 console.log(failures ? ('\nRESULT: ' + failures + ' FAILED') : '\nRESULT: ALL PASS');

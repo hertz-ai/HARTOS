@@ -106,8 +106,10 @@ class ThemeService:
             if preset:
                 return preset
 
-        # Fallback: hart-default
-        default = ThemeService.get_preset('hart-default')
+        # Fallback: aura is the shipped OS boot theme for standard+ hardware.
+        # (The hardcoded DEFAULT_THEME_CONFIG below is the ultimate safety net if
+        # aura.json is ever missing/corrupt, so the shell can never be themeless.)
+        default = ThemeService.get_preset('aura')
         if default:
             return default
 
@@ -338,8 +340,8 @@ class ThemeService:
             logger.info("Auto-selecting theme '%s' for hardware", recommended)
             return ThemeService.apply_theme(recommended)
 
-        # Default to hart-default for capable hardware
-        return ThemeService.apply_theme('hart-default')
+        # Default to aura for capable hardware (the shipped OS boot theme)
+        return ThemeService.apply_theme('aura')
 
     # ── Conky Integration ────────────────────────────────────────
 

@@ -98,10 +98,14 @@
   // lacks at idle). The voice canvas (voiceOrbViz.js) stays the single iridescent
   // body; this only adds concentric brand rings + a soft halo AROUND it (the halo
   // is transparent over the core, so it never washes the orb regardless of paint
-  // order, no z-index/stacking fragility). Animations are gated to .gpu-hardware;
-  // on software/reduced-motion it is flat + static. Injected once (own scoped
-  // <style>, id-guarded) since this module owns only the JS. Old-WebKit-safe:
-  // string concat, no template literals / optional chaining / nullish coalescing.
+  // order, no z-index/stacking fragility). The CHEAP layers - the breathe keyframes
+  // (transform+opacity), the colored ring borders + the radial-gradient halo glow -
+  // run REGARDLESS of the GPU verdict, so the orb breathes + Aura's spectrum glows
+  // on the cairo/pixman SOFTWARE floor too (checklist c2, the feel-alive pillar).
+  // Only the genuinely expensive frosted halo BLUR waits for a real GL context.
+  // Reduced-motion still stills the animation. Injected once (own scoped <style>,
+  // id-guarded) since this module owns only the JS. Old-WebKit-safe: string concat,
+  // no template literals / optional chaining / nullish coalescing.
   function injectOrbAuraStyle() {
     if (document.getElementById('hart-hero-aura-style')) return;
     var css = '' +
@@ -115,10 +119,16 @@
       '.hart-hero-aura .hha-r2{width:398px;height:398px;border:1px solid rgba(var(--hart-amb-2-rgb, 155,92,255),.16)}' +
       '.hart-hero-aura .hha-halo{width:362px;height:362px;' +
         'background:radial-gradient(circle, transparent 44%, rgba(var(--hart-amb-3-rgb, 41,197,255),.13) 56%, rgba(var(--hart-amb-2-rgb, 155,92,255),.09) 66%, transparent 78%)}' +
-      // Hardware: the rings + halo BREATHE in sync with the orb (~5s period).
-      'body.gpu-hardware .hart-hero-aura .hha-r1{animation:hha-breathe 5s ease-in-out infinite}' +
-      'body.gpu-hardware .hart-hero-aura .hha-r2{animation:hha-breathe 5s ease-in-out infinite .6s}' +
-      'body.gpu-hardware .hart-hero-aura .hha-halo{filter:blur(7px);animation:hha-halo 5s ease-in-out infinite}' +
+      // CHEAP + UNGATED: the rings + halo BREATHE in sync with the orb (~5s period)
+      // on EVERY render path. transform+opacity keyframes re-raster cheaply on
+      // cairo/pixman, so the orb is alive without a GPU (checklist c2).
+      '.hart-hero-aura .hha-r1{animation:hha-breathe 5s ease-in-out infinite}' +
+      '.hart-hero-aura .hha-r2{animation:hha-breathe 5s ease-in-out infinite .6s}' +
+      '.hart-hero-aura .hha-halo{animation:hha-halo 5s ease-in-out infinite}' +
+      // GPU-ONLY: the frosted halo BLUR is the one genuinely expensive layer (cairo
+      // cannot afford a live filter blur), so it alone waits for a real GL context.
+      // On software the halo still shows its spectrum glow, just crisp not frosted.
+      'body.gpu-hardware .hart-hero-aura .hha-halo{filter:blur(7px)}' +
       '@keyframes hha-breathe{0%,100%{transform:translate(-50%,-50%) scale(1);opacity:.5}' +
         '50%{transform:translate(-50%,-50%) scale(1.07);opacity:.95}}' +
       '@keyframes hha-halo{0%,100%{transform:translate(-50%,-50%) scale(1);opacity:.6}' +
@@ -130,8 +140,8 @@
         'background:radial-gradient(circle, transparent 42%, rgba(41,197,255,.20) 56%, transparent 78%)}' +
       '.hart-hero-orbwrap[data-orb-state="thinking"] .hart-hero-aura .hha-halo{' +
         'background:radial-gradient(circle, transparent 42%, rgba(255,46,154,.18) 56%, rgba(155,92,255,.12) 70%, transparent 80%)}' +
-      // Software / reduced-motion: calm + static (no animation, no blur).
-      'body:not(.gpu-hardware) .hart-hero-aura .hha-halo{filter:none}' +
+      // Reduced-motion: still the breathe animation (accessibility). The blur is
+      // already GPU-gated above, so no separate software un-blur rule is needed.
       'html.a11y-rmotion .hart-hero-aura .hha-r1,html.a11y-rmotion .hart-hero-aura .hha-r2,' +
         'html.a11y-rmotion .hart-hero-aura .hha-halo{animation:none}';
     var st = document.createElement('style');

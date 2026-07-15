@@ -512,13 +512,29 @@ class TestPerformanceAutoDetect:
         assert result['theme_id'] == 'potato'
 
     def test_auto_select_default_for_capable(self):
+        """First-boot default on capable hardware seeds Aura (the shipped OS theme).
+
+        Points the theme dir at the REAL nixos/assets/conky-themes so the actual
+        shipped aura.json is loaded end-to-end, then asserts auto_select_theme both
+        reports 'aura' AND persists it as the active theme.
+        """
+        import integrations.agent_engine.theme_service as ts
         from integrations.agent_engine.theme_service import ThemeService
-        with patch.object(ThemeService, 'detect_performance_tier', return_value=None), \
+        # Resolve the real shipped theme dir exactly as the module's _THEME_DIR does.
+        real_theme_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(ts.__file__)))),
+            'nixos', 'assets', 'conky-themes')
+        with patch('integrations.agent_engine.theme_service._THEME_DIR', real_theme_dir), \
+             patch.object(ThemeService, 'detect_performance_tier', return_value=None), \
              patch.object(ThemeService, '_apply_gtk'), \
              patch.object(ThemeService, '_notify_liquid_ui'):
             result = ThemeService.auto_select_theme()
-        assert result is not None
-        assert result['theme_id'] == 'hart-default'
+            assert result is not None
+            assert result['theme_id'] == 'aura'
+            # Genuinely seeded as the active theme (active_theme.json written)
+            active = ThemeService.get_active_theme()
+        assert active['id'] == 'aura'
 
     def test_fallback_hardware_check_low_core(self):
         """When system_requirements unavailable, fall back to os.cpu_count."""
