@@ -217,6 +217,12 @@ struct DeviceData {
     /// This is the per-device latch that turns the one-shot construction grab into a bounded,
     /// self-healing retry — without it the unprivileged-at-startup device stays black forever.
     master: bool,
+    /// One-shot throttle for the drmSetMaster-failure errno log (the retry runs ~60x/s so it
+    /// must never spam). Reset to false when master is acquired so a later loss re-logs. This
+    /// surfaces WHY the kernel refuses master (EACCES = not the seat's active session / another
+    /// holder; EBUSY = a pending master; EPERM = capability) -- the datum the bare "Unable to
+    /// become drm master" warning omits, needed to actually diagnose the real-HW block.
+    master_err_logged: bool,
 }
 
 /// What the render tick should do with one CRTC after attempting to present a frame.
@@ -920,6 +926,7 @@ fn device_added(
             // assumed here: even if the construction grab succeeded we re-confirm on the first
             // tick (an idempotent `drmSetMaster`), so the latch reflects the kernel, not a guess.
             master: false,
+            master_err_logged: false,
         },
     );
     Ok(())
@@ -1029,12 +1036,25 @@ fn acquire_drm_master(device: &mut DeviceData) -> bool {
     let acquired_now = if device.master {
         false
     } else {
-        device.fd.acquire_master_lock().is_ok()
+        match device.fd.acquire_master_lock() {
+            Ok(()) => true,
+            Err(err) => {
+                // Log the errno EXACTLY ONCE per unprivileged episode (this runs ~60x/s). This
+                // names WHY the kernel refuses master on this hardware -- the missing datum behind
+                // the bare "Unable to become drm master" warning. Re-armed on a later master loss.
+                if !device.master_err_logged {
+                    warn!(?err, "HART-comp DRM: drmSetMaster STILL refused (unprivileged) -- errno names the reason/holder; retrying every tick");
+                    device.master_err_logged = true;
+                }
+                false
+            }
+        }
     };
     match master_step(device.master, acquired_now) {
         MasterStep::AlreadyHeld => true,
         MasterStep::Acquired => {
             device.master = true;
+            device.master_err_logged = false; // re-arm the one-shot errno log for a future loss
             // The fd is now the real kernel master. Call activate(false) to set the SESSION
             // `active` flag (so render_frame/queue_frame do not short-circuit on DeviceInactive)
             // and reset connector/plane state for a clean first scanout. activate() may also try
