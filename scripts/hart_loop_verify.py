@@ -52,10 +52,10 @@ _RE = {
 }
 
 
-def fetch_diag(peer: str, token: str, timeout: float = 20.0) -> str:
-    """GET the token-gated diag bundle from a peer's :6699 endpoint."""
+def fetch_diag(peer: str, token: str, timeout: float = 20.0, port: int = DIAG_PORT) -> str:
+    """GET the token-gated diag bundle from a peer's :<port>/diag endpoint."""
     import urllib.parse
-    url = 'http://%s:%d/diag?t=%s' % (peer, DIAG_PORT, urllib.parse.quote(token, safe=''))
+    url = 'http://%s:%d/diag?t=%s' % (peer, port, urllib.parse.quote(token, safe=''))
     req = urllib.request.Request(url, headers={'User-Agent': 'hart-loop-verify'})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode('utf-8', 'replace')
@@ -186,7 +186,7 @@ def run_once(args) -> int:
             sys.stderr.write('live mode needs --peer <ip> and --token <tok> (or use --file)\n')
             return 2
         try:
-            text = fetch_diag(args.peer, args.token, args.timeout)
+            text = fetch_diag(args.peer, args.token, args.timeout, args.port)
         except (urllib.error.URLError, OSError) as e:
             sys.stderr.write('diag fetch failed: %s\n' % e)
             return 2
@@ -205,6 +205,8 @@ def main(argv=None) -> int:
     p.add_argument('--file', help='parse a captured journal/diag bundle instead of fetching')
     p.add_argument('--snapshot', default=DEFAULT_SNAPSHOT, help='JSON snapshot for cross-cycle diff')
     p.add_argument('--timeout', type=float, default=20.0)
+    p.add_argument('--port', type=int, default=int(os.environ.get('HART_DIAG_PORT', DIAG_PORT)),
+                   help='diag port (default 6699; override for a relayed/tunnelled peer)')
     p.add_argument('--watch', type=int, default=0,
                    help='live loop: re-fetch + report every N seconds (Ctrl-C to stop)')
     args = p.parse_args(argv)

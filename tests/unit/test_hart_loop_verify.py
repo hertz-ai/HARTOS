@@ -61,6 +61,51 @@ def test_regression_when_a_new_failure_appears():
     assert mod.report(cur, d) == 1      # a new failure = regression
 
 
+def test_live_fetch_over_http_token_gated():
+    """The verify leg fetches over REAL HTTP from the peer's diag contract:
+    correct token -> 200 bundle (parses); wrong token -> fail-closed (raises)."""
+    import http.server
+    import threading
+    import urllib.error
+    import urllib.request
+
+    token = 'tkn-xyz'
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            import urllib.parse
+            q = urllib.parse.urlparse(self.path)
+            ok = q.path == '/diag' and urllib.parse.parse_qs(q.query).get('t', [None])[0] == token
+            body = _SAMPLE.encode() if ok else b'forbidden'
+            self.send_response(200 if ok else 403)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = http.server.HTTPServer(('127.0.0.1', 0), _H)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        # correct token -> real bundle, parseable
+        text = mod.fetch_diag('127.0.0.1', token, timeout=5, port=port)
+        parsed = mod.parse_bundle(text)
+        assert 'hart-vision.service' in parsed['failed_units']
+        assert parsed['active_theme'] == 'aura'
+        # wrong token -> fail-closed (HTTP 403 raises)
+        raised = False
+        try:
+            mod.fetch_diag('127.0.0.1', 'WRONG', timeout=5, port=port)
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+            raised = True
+        assert raised, 'wrong token must fail-closed, not return data'
+    finally:
+        srv.shutdown()
+
+
 def test_resolved_failure_is_not_a_regression():
     prev = {'failed_units': ['hart-vision.service', 'clamav-daemon.service'],
             'client_errors': [], 'active_theme': 'aura'}
