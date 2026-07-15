@@ -35,6 +35,21 @@ def test_parse_extracts_failed_units_and_boot_signals():
     assert p['active_theme'] == 'aura'
 
 
+def test_parse_strips_ansi_from_serial_console_journals():
+    """A serial/VM boot-console journal carries inline ANSI SGR colour codes
+    (systemd colourizes [ OK ]/[FAILED]). The parser must strip them so a unit
+    name extracts cleanly, not as a coloured blob. Real bug: verifying a VM
+    boot.log surfaced 'hart-net-diag-token.service' wrapped in escape codes."""
+    ansi = (
+        "\x1b[0;1;39mhart-net-diag-token.service: Main process exited, "
+        "code=exited, status=1/FAILURE\x1b[0m\n"
+        "\x1b[0;1;31mhart-net-diag-token.service: Failed with result 'timeout'.\x1b[0m\n"
+    )
+    p = mod.parse_bundle(ansi)
+    assert 'hart-net-diag-token.service' in p['failed_units']
+    assert not any('\x1b' in u for u in p['failed_units']), 'raw ANSI leaked into a unit name'
+
+
 def test_parse_extracts_shell_client_js_errors():
     p = mod.parse_bundle(_SAMPLE)
     assert any('TypeError' in e for e in p['client_errors'])

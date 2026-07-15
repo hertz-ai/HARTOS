@@ -61,8 +61,16 @@ def fetch_diag(peer: str, token: str, timeout: float = 20.0, port: int = DIAG_PO
         return r.read().decode('utf-8', 'replace')
 
 
+# Console/serial journals carry inline ANSI SGR colour codes (the boot-console
+# capture from a VM or a serial cable does -- systemd colourizes [ OK ]/[FAILED]).
+# Strip them before matching so a unit name like "\x1b[0;1;39mfoo.service" parses
+# as "foo.service" and not a coloured blob (real bug seen verifying a VM boot.log).
+_ANSI = re.compile(r'\x1b\[[0-9;:]*m')
+
+
 def parse_bundle(text: str) -> dict:
     """Extract the loop-relevant signals from a journal/diag bundle."""
+    text = _ANSI.sub('', text)
     failed, client_errors, targets = set(), [], 0
     first_scanout = False
     llm_gated = False
