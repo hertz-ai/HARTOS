@@ -308,6 +308,17 @@ function runModules(realm, files) {
   ok(cards.length === R.sandbox.window.HART_THEME_PRESETS.length,
      'theme gallery renders the built-in PRESETS as the instant offline fallback (zero regression)');
 
+  // The steward saw "aura is not even listed under theme": the offline fallback had
+  // DRIFTED (omitted aura, mislabeled hart-default "Aurora"), so when the server
+  // /api/appearance/presets fetch fails, the picker rendered a list WITHOUT Aura. The
+  // fallback must always list Aura (the default theme) and must NOT mislabel a theme
+  // "Aurora" (Aurora is a MOOD palette, id 'aurora', not a theme).
+  const P = R.sandbox.window.HART_THEME_PRESETS;
+  ok(P.some(function (p) { return p.id === 'aura'; }),
+     'the offline fallback lists Aura (always listed, even when the presets fetch fails)');
+  ok(!P.some(function (p) { return p.name === 'Aurora'; }),
+     'no THEME is mislabeled "Aurora" (hart-default is "HART Default"; Aurora is a mood)');
+
   // Server source: it fetches the ONE preset list (/api/appearance/presets) to surface
   // Aura + high-contrast — the DRY fix, no hardcoded parallel list.
   const pf = R.fetchCalls.filter(c => String(c.url).indexOf('/api/appearance/presets') >= 0);

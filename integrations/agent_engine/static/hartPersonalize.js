@@ -77,7 +77,8 @@
   // are only the gallery card colours). 'a2' (secondary accent) added to the preset
   // schema so a swatch reads its duotone and stays consistent with the palette layer.
   var PRESETS = window.HART_THEME_PRESETS = [
-    { id: 'hart-default', name: 'Aurora',    a: '#00D4AA', a2: '#29C5FF', b: '#0F0E17', c: '#16213e' },
+    { id: 'aura',         name: 'Aura',        a: '#00E6C3', a2: '#9B5CFF', b: '#04050B', c: '#0A0C18' },
+    { id: 'hart-default', name: 'HART Default', a: '#00D4AA', a2: '#29C5FF', b: '#0F0E17', c: '#16213e' },
     { id: 'midnight',     name: 'Midnight',  a: '#5B8CFF', a2: '#9B5CFF', b: '#0a0e1f', c: '#10204a' },
     { id: 'cyberpunk',    name: 'Cyberpunk', a: '#FF2E97', a2: '#29C5FF', b: '#0d0221', c: '#241734' },
     { id: 'forest',       name: 'Forest',    a: '#3FBF7F', a2: '#00E6C3', b: '#0c160f', c: '#143024' },
