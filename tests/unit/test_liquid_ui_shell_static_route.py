@@ -79,6 +79,33 @@ def test_critical_shell_asset_is_fetchable(shell, asset):
     assert r.data, f"{asset} served empty"
 
 
+@pytest.mark.parametrize("asset,needles,fix", [
+    # overlap/clutter fix (16ce15e5): the webkit-flat solidify gradient is opaque
+    # (~0.985 at every stop) so panels do not read see-through on the software floor.
+    ("hartResponsive.css", ["0.985", "webkit-flat"],
+     "opaque webkit-flat panel (overlap/clutter fix)"),
+    # Aura microanimations (b3cf15b2): the composable motion vars + a keyframe.
+    ("hartHome.css", ["vBreathe", "--hart-motion-ambient"],
+     "Aura microanimations (composable motion layers)"),
+    # aura-listing (2cd78f23) + Motion controls (b3cf15b2) in the personalize hub.
+    ("hartPersonalize.js", ["id: 'aura'", "HartMotion"],
+     "Aura listed in the theme picker + Motion controls"),
+])
+def test_shell_fix_is_actually_served(shell, asset, needles, fix):
+    """The loop's VERIFY leg: a committed shell fix must actually REACH the served
+    /shell/static asset, not just return 200. A fix that is on disk but never
+    served (wrong path, stale bundle, static route regressed) is a silent
+    regression the 200-only guards above cannot catch -- this is the whole reason
+    the fix->serve->verify loop fetches the real body. Behavioural: real app +
+    real fetch, assert the fix content is in the SERVED response."""
+    _svc, client = shell
+    r = client.get("/shell/static/{}".format(asset))
+    assert r.status_code == 200, "{} -> {} ({} never served)".format(asset, r.status_code, fix)
+    body = r.get_data(as_text=True)
+    missing = [n for n in needles if n not in body]
+    assert not missing, "{} served but MISSING {} -- {} did not reach the shell".format(asset, missing, fix)
+
+
 def test_static_handler_is_repointed_not_duplicated(shell):
     """The fix REPOINTS Flask's single static handler to /shell/static — it does
     not add a parallel route. Flask's old default ``/static`` prefix must no
