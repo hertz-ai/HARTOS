@@ -440,6 +440,22 @@
       preview.setAttribute('data-id', id);
       applyIconVisual(preview, current());
     }
+    // Per-keystroke coalescing: the typed character paints on THIS frame (the
+    // <input> updates itself); the heavier preview tile rebuild (innerHTML +
+    // gradient) is batched to at most once per animation frame so fast typing
+    // never does redundant work on the software-render path. Final state is
+    // identical (current() is read at flush time). Cancels itself if the dialog
+    // closes before the frame runs.
+    var _prevRaf = 0;
+    var _raf = (typeof requestAnimationFrame === 'function')
+      ? requestAnimationFrame : function (f) { return setTimeout(f, 16); };
+    function schedulePreview() {
+      if (_prevRaf) return;
+      _prevRaf = _raf(function () {
+        _prevRaf = 0;
+        if (ov.parentNode) refreshPreview();
+      });
+    }
     // Seed the swatch "on" only from a real per-icon override — NOT from a
     // manifest-default colour. The preview still shows the manifest colour
     // (current().color='' -> effective() falls back to def.color) while a plain
@@ -447,9 +463,9 @@
     ov._colorOn = !!_getOv(el).color;
     refreshPreview();
 
-    inGlyph.addEventListener('input', refreshPreview);
-    inLabel.addEventListener('input', refreshPreview);
-    inColor.addEventListener('input', function () { ov._colorOn = true; refreshPreview(); });
+    inGlyph.addEventListener('input', schedulePreview);
+    inLabel.addEventListener('input', schedulePreview);
+    inColor.addEventListener('input', function () { ov._colorOn = true; schedulePreview(); });
     $('#hic-color-clear').addEventListener('click', function () { ov._colorOn = false; refreshPreview(); });
 
     function commit(o) { applyIconVisual(el, o); persist(); closeDialog(); }
@@ -680,7 +696,7 @@
   // plain empty click (no drag) clears the selection. Group-move of the selection
   // is handled in endDrag (the shared delta path).
   function initMarquee() {
-    var mq = null, mx = 0, my = 0, marquing = false;
+    var mq = null, mx = 0, my = 0, marquing = false, rects = null;
     function onEmpty(t) {
       // Empty desktop = the wallpaper or the body, and NOT inside any icon/panel/menu.
       return t && (t.classList && t.classList.contains('wallpaper') || t === document.body) &&
@@ -692,23 +708,32 @@
       mq = document.createElement('div'); mq.className = 'lg-marquee';
       mq.style.cssText = 'left:' + mx + 'px;top:' + my + 'px;width:0;height:0';
       document.body.appendChild(mq);
+      // Icons are static for the life of a marquee (the canvas is fixed and never
+      // scrolls), so read every icon's rect ONCE here and reuse it on every move.
+      // That keeps pointermove a pure style WRITE with no getBoundingClientRect
+      // read AFTER it -> no forced reflow per move, so the rubber-band + live
+      // highlight stay instant even with a full desktop of icons.
+      rects = [];
+      if (layer) Array.prototype.forEach.call(layer.querySelectorAll('.desktop-icon'), function (el) {
+        rects.push({ el: el, r: el.getBoundingClientRect() });
+      });
     });
     document.addEventListener('pointermove', function (e) {
       if (!marquing || !mq) return;
       var x = Math.min(e.clientX, mx), y = Math.min(e.clientY, my),
           w = Math.abs(e.clientX - mx), h = Math.abs(e.clientY - my);
       mq.style.left = x + 'px'; mq.style.top = y + 'px'; mq.style.width = w + 'px'; mq.style.height = h + 'px';
-      if (!layer) return;
+      if (!rects) return;
       var bx = x, by = y, bw = w, bh = h;
-      Array.prototype.forEach.call(layer.querySelectorAll('.desktop-icon'), function (el) {
-        var r = el.getBoundingClientRect();
+      for (var i = 0; i < rects.length; i++) {
+        var r = rects[i].r;
         var hits = !(r.right < bx || r.left > bx + bw || r.bottom < by || r.top > by + bh);
-        el.classList.toggle('selected', hits);
-      });
+        rects[i].el.classList.toggle('selected', hits);
+      }
     });
     function endMarquee() {
       if (!marquing) return;
-      marquing = false;
+      marquing = false; rects = null;
       if (mq && mq.parentNode) mq.parentNode.removeChild(mq);
       mq = null;
     }

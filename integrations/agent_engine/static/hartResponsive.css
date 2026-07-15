@@ -528,40 +528,50 @@ body.gpu-software .hart-ambient {
 }
 body.gpu-software .hart-grain { display: none; }
 
-/* 3) Collapse hover/focus SCALE lifts to instant flat highlights. The transition
-   interpolates transform/box-shadow every frame while hovering — pure CPU burn.
-   Keep a static brand-tinted highlight so focus is still legible (spectrum, not
-   monochrome), just without the animated lift + glow. */
-body.gpu-software .desktop-icon,
+/* 3) INTERACTION FEEDBACK STAYS ALIVE ON THE SOFTWARE FLOOR (2026-07-15).
+   Previously this block killed EVERY hover/focus lift on the CPU (transition:none
+   + transform:none), so the desktop felt DEAD on cairo/pixman: no card lift, no
+   icon lift, no poster-zoom. But a transform+opacity change is compositor-friendly
+   and rasters cheaply even without a GPU (the SAME class of effect the orb aura
+   already runs ungated in hartHero.js). So the software floor now KEEPS those
+   lifts, just SHORT (140ms) and transform/opacity ONLY, never the 380ms --hv-lift
+   and never a box-shadow transition (animating a big blurred shadow per-frame is
+   the real per-frame CPU cost; the glow instead SNAPS on in a single raster on
+   hover-enter). Focus rings are pure border/box-shadow swaps: instant + cheap,
+   already legible. This decouples the CHEAP feedback from the GPU gate; only the
+   backdrop blur (block 1) and the continuous animations (block 2) stay gated off.
+   Applies wherever compositing is off (gpu-software OR webkit-flat), mirroring
+   block 1's two triggers: no parallel path. */
 body.gpu-software .desktop-icon .di-glyph,
+body.gpu-software .desktop-icon .di-glyph::after,
 body.gpu-software .hart-app-card,
 body.gpu-software .start-item,
 body.gpu-software .hart-tile,
 body.gpu-software .hart-tile .htc-prev > img,
 body.gpu-software .hv-art,
-body.gpu-software .hv-art > img {
-  transition: none !important;
+body.gpu-software .hv-art > img,
+body.webkit-flat .desktop-icon .di-glyph,
+body.webkit-flat .desktop-icon .di-glyph::after,
+body.webkit-flat .hart-app-card,
+body.webkit-flat .start-item,
+body.webkit-flat .hart-tile,
+body.webkit-flat .hart-tile .htc-prev > img,
+body.webkit-flat .hv-art,
+body.webkit-flat .hv-art > img {
+  transition: transform 140ms var(--hv-focus), opacity 140ms var(--hv-focus) !important;
   will-change: auto;
 }
-body.gpu-software .desktop-icon:hover .di-glyph,
-body.gpu-software .desktop-icon:focus-within .di-glyph,
-body.gpu-software .hart-app-card:hover,
-body.gpu-software .hart-app-card:focus-within,
-body.gpu-software .start-item:hover,
-body.gpu-software .start-item:focus-within,
-body.gpu-software .hart-tile:hover,
-body.gpu-software .hart-tile:focus-within,
-body.gpu-software .hv-art:hover,
-body.gpu-software .hv-art:focus-within {
-  transform: none !important;
+/* The .desktop-icon WRAPPER transform channel is owned by the drag handler (an
+   inline per-frame translate), so it must NOT carry a transition (would lag the
+   drag) and must NOT stay layer-promoted on the CPU: reset will-change only. */
+body.gpu-software .desktop-icon,
+body.webkit-flat .desktop-icon {
+  will-change: auto;
 }
-body.gpu-software .hart-tile:hover .htc-prev > img,
-body.gpu-software .hart-tile:focus-within .htc-prev > img,
-body.gpu-software .hv-art:hover > img,
-body.gpu-software .hv-art:focus-within > img { transform: none !important; }
-
-/* Per-tile glyph drop-shadow is a cheap-looking but real per-element filter; drop it. */
-body.gpu-software .desktop-icon .di-glyph .mi { filter: none; }
+/* Per-tile glyph drop-shadow is a real per-element filter (per-frame cost); drop
+   it so the icon lift stays cheap. */
+body.gpu-software .desktop-icon .di-glyph .mi,
+body.webkit-flat .desktop-icon .di-glyph .mi { filter: none; }
 
 /* 4) Simplify the wallpaper: a five-stop radial spectrum bloom is a costly full-
    frame raster on every repaint. Collapse to a cheap two-hue brand gradient

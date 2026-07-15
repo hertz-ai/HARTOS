@@ -2,11 +2,13 @@
  * hartEffects.js — HART OS shell effects (Phase 8): snap-zones + animated
  * ambient lift + transition polish.
  *
- * EVERY effect here is GATED behind the SAME software-render fallback the rest of
- * the shell uses (window.HART_PERF.potato — set true when the hardware tier
- * disables blur, i.e. broken / software-GL GPUs) AND prefers-reduced-motion.
- * When either is on, this module installs NOTHING — the desktop degrades to FLAT,
- * never black (the never-fail floor: effects must never block paint).
+ * The snap-zone REVEAL + snap COMMIT are CHEAP (opacity fade + one snap geometry
+ * write), so they run on the SOFTWARE (cairo/pixman) floor too - only the zone's
+ * left/top/width/height SLIDE (a layout-prop animation) stays GPU-only, degrading
+ * to an instant re-position + opacity fade on software (see ensureZoneEl). The one
+ * hard gate is prefers-reduced-motion / html.a11y-rmotion: when set, this module
+ * installs NOTHING - the desktop degrades to FLAT, never black (the never-fail
+ * floor: effects must never block paint).
  *
  * It does NOT fork the drag or the snap. It LISTENS to the shell's canonical
  * drag lifecycle (hart:dragstart / hart:dragend, dispatched by startDrag /
@@ -18,14 +20,16 @@
 (function () {
   'use strict';
 
-  // ── The single effects gate (reuse the shell's perf flag; no new flag) ──
+  // ── The single effects gate (motion-only) ──
+  // The snap-zone REVEAL (opacity fade) + the snap COMMIT (one snapPanel geometry
+  // write) are CHEAP, so they run on the software (cairo/pixman) floor too - the
+  // potato/gpu verdict no longer gates them (mirrors the orb-aura fix that runs its
+  // transform+opacity breathe ungated in hartHero.js). The only genuinely costly
+  // bit - the zone SLIDING its left/top/width/height between arm positions - is a
+  // layout-prop animation, so that alone stays GPU-only (ensureZoneEl builds an
+  // opacity-only transition on the software floor). Reduced-motion still stills the
+  // whole affordance (accessibility), same as before.
   function effectsAllowed() {
-    try {
-      // PERF is the inline-script global; HART_PERF is its window mirror if set.
-      var perf = (typeof PERF !== 'undefined') ? PERF
-        : (window.HART_PERF || {});
-      if (perf && perf.potato) return false;
-    } catch (_e) { /* PERF not defined yet → fall through to motion check */ }
     try {
       if (window.matchMedia &&
           window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
@@ -51,16 +55,26 @@
     zoneEl = document.createElement('div');
     zoneEl.id = 'hart-snapzone';
     zoneEl.setAttribute('aria-hidden', 'true');
-    // Inline styles so this needs no shell CSS edit; transition is short and
-    // GPU-cheap (opacity/transform only — safe on software GL since it is gated
-    // OFF on potato anyway).
+    // Inline styles so this needs no shell CSS edit. Transition: OPACITY always
+    // (cheap - rasters fine on cairo/pixman). The left/top/width/height SLIDE
+    // between arm positions is a layout-prop animation (costly on the CPU), so it
+    // is added ONLY on a real GPU context; on the software floor the zone
+    // re-positions instantly (one raster) and only its opacity fades -
+    // compositor-friendly, no per-frame layout churn.
+    var gpu = false;
+    try {
+      gpu = !!(document.body && document.body.classList &&
+        document.body.classList.contains('gpu-hardware'));
+    } catch (_e) { /* default: software floor -> opacity-only */ }
+    var trans = gpu
+      ? 'opacity .12s ease, left .12s ease, top .12s ease, width .12s ease, height .12s ease'
+      : 'opacity .12s ease';
     zoneEl.style.cssText = [
       'position:fixed', 'z-index:998', 'pointer-events:none',
       'border:2px solid var(--hart-accent,#00D4AA)',
       'background:rgba(0,212,170,0.12)', 'border-radius:12px',
       'box-shadow:0 0 0 1px rgba(0,0,0,0.25) inset',
-      'opacity:0', 'transition:opacity .12s ease, left .12s ease, ' +
-        'top .12s ease, width .12s ease, height .12s ease',
+      'opacity:0', 'transition:' + trans,
       'display:none'
     ].join(';');
     document.body.appendChild(zoneEl);

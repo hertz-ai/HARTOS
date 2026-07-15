@@ -553,6 +553,55 @@ class TestPerformanceAutoDetect:
                 assert result in ('potato', 'minimal')
 
 
+class TestAuraTokensDriveTheHome:
+    """The Aura preset must EMIT the exact CSS custom properties that the Netflix
+    home (hartHome.css) now consumes var-driven, so applying Aura is pixel-faithful
+    to the shared mock. Loads the REAL shipped aura.json end-to-end (not a fixture)
+    and asserts get_css_variables() carries every token the home binds to. Guards
+    against aura.json drifting away from the home's contract.
+    """
+
+    def _aura_css(self):
+        import integrations.agent_engine.theme_service as ts
+        from integrations.agent_engine.theme_service import ThemeService
+        real_theme_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(ts.__file__)))),
+            'nixos', 'assets', 'conky-themes')
+        with patch('integrations.agent_engine.theme_service._THEME_DIR', real_theme_dir), \
+             patch.object(ThemeService, '_apply_gtk'), \
+             patch.object(ThemeService, '_notify_liquid_ui'):
+            applied = ThemeService.apply_theme('aura')
+            assert applied.get('status') == 'applied', applied
+            return ThemeService.get_css_variables()
+
+    def test_aura_spectrum_matches_mock_p1_p4(self):
+        """--hh-cyan/--hh-magenta ride amb-3/amb-4 -> the mock's pink/amber p3/p4;
+        --hh-teal = accent (teal on function); --hh-violet = a2 secondary."""
+        css = self._aura_css()
+        assert '--hart-accent: #00E6C3;' in css      # --hh-teal (functional)
+        assert '--hart-a2: #9B5CFF;' in css          # --hh-violet (secondary)
+        assert '--hart-amb-3: #FB66B6;' in css       # --hh-cyan -> mock p3 (pink)
+        assert '--hart-amb-4: #FFB330;' in css       # --hh-magenta -> mock p4 (amber)
+
+    def test_aura_ink_and_muted_match_mock(self):
+        css = self._aura_css()
+        assert '--hart-text: #F2F4FF;' in css         # --hh-ink
+        assert '--hart-muted: #9AA0C6;' in css        # --hh-dim
+
+    def test_aura_glass_and_radius_match_mock(self):
+        """Glass blur/saturation + the panel radius the home card now binds to."""
+        css = self._aura_css()
+        assert '--hart-blur: 26px;' in css
+        assert '--hart-saturation: 150%;' in css
+        assert '--hart-radius: 22px;' in css
+
+    def test_aura_display_font_is_space_grotesk(self):
+        """The home font-family binds to --hart-font-display; Aura = Space Grotesk."""
+        css = self._aura_css()
+        assert '--hart-font-display: "Space Grotesk";' in css
+
+
 # ═══════════════════════════════════════════════════════════════
 # Theme API Tests
 # ═══════════════════════════════════════════════════════════════

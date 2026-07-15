@@ -1,11 +1,11 @@
 { config, lib, pkgs, ... }:
 
 # ═══════════════════════════════════════════════════════════════
-# HART OS Unified Kernel — Multi-Platform Native Binary Support
+# HART OS Unified Kernel -- Multi-Platform Native Binary Support
 # ═══════════════════════════════════════════════════════════════
 #
 # The HART OS kernel is a Linux kernel with native extensions
-# for running binaries from ALL major platforms — not through
+# for running binaries from ALL major platforms -- not through
 # emulators, containers, or translation layers, but through
 # kernel-level subsystems that make each binary format a
 # first-class citizen.
@@ -104,7 +104,7 @@ in
       ];
 
       # Kernel sysctl: multi-platform workload tuning
-      # mkForce — kernel module is the most specialized layer
+      # mkForce -- kernel module is the most specialized layer
       boot.kernel.sysctl = {
         # IPC: support high-throughput binder + agent communication
         "kernel.shmmax" = lib.mkForce 68719476736;
@@ -143,8 +143,8 @@ in
 
       # Load Android IPC kernel modules at boot
       boot.kernelModules = [
-        "binder_linux"    # Android Binder IPC — native kernel module
-        "ashmem_linux"    # Android shared memory — native kernel module
+        "binder_linux"    # Android Binder IPC -- native kernel module
+        "ashmem_linux"    # Android shared memory -- native kernel module
       ];
 
       # Extra kernel config options needed for Android support
@@ -189,7 +189,7 @@ in
     # It implements the Windows API (ntdll.dll, kernel32.dll,
     # user32.dll, etc.) as native Linux shared libraries.
     # A .exe runs at the SAME privilege level as a Linux
-    # binary — same kernel, same scheduler, same memory
+    # binary -- same kernel, same scheduler, same memory
     # manager. The only "translation" is API call routing.
     #
     (lib.mkIf kernelCfg.windowsNative.enable {
@@ -277,9 +277,42 @@ in
         "hugepages=${toString kernelCfg.aiCompute.hugePagesCount}"
         "transparent_hugepage=always"
       ] ++ [
-        # NVIDIA: enable kernel modesetting for better GPU management
+        # ── NVIDIA DRM: modeset ON (render node), fbdev OFF (never the display) ──
+        # modeset=1 STAYS: it enables KMS on the nvidia DRM node so the dGPU can act
+        # as a GBM/GL render provider for PRIME render-offload (the hart-gpu-offload /
+        # prime-run path). It does NOT make nvidia drive the panel -- it only lets the
+        # nvidia node be a RENDER target. Never force-loaded (#132): this param is
+        # inert on a box whose nvidia module never loads (no dGPU present).
+        #
+        # fbdev=0 (flipped from 1) -- THE DRM-MASTER-CONTENTION FIX. `nvidia-drm.fbdev=1`
+        # makes the nvidia DRM driver register as the FRAMEBUFFER-CONSOLE (fbcon)
+        # provider and claim the boot/console framebuffer. On this Optimus laptop the
+        # Intel iGPU (i915) drives the eDP-1 panel and NVIDIA (940MX) is offload-only,
+        # so letting nvidia own the console FB makes the nvidia node contend to be the
+        # seat's primary DRM device: plymouth/logind grab DRM master on nvidia's node
+        # while the compositor opens the Intel card (card1) and then CANNOT become
+        # master -- the exact real-HW symptom (hart-comp: "Unable to become drm master,
+        # assuming unprivileged mode" → falls to the pixman software floor → the slow,
+        # software-rendered desktop). With fbdev=0 the nvidia driver does NOT provide
+        # fbcon, so the Intel i915 (via the simpledrm/efifb → i915 boot-FB handoff) is
+        # the unambiguous console-FB owner + seat-primary and hands DRM master cleanly
+        # to hart-comp on the iGPU -- letting it keep the GLES (GPU) scanout it already
+        # arms instead of dropping to pixman. NVIDIA stays a pure render node (modeset),
+        # never the display. This REINFORCES the #99-103 Intel-panel path (nouveau
+        # blacklisted, i915 force-loaded, desktop drawn on the iGPU) -- it does not
+        # regress it.
+        #
+        # NEVER-BRICK: (1) the param is inert without a loaded nvidia module (#132
+        # preserved -- no force-load, live-USB / no-dGPU boxes unaffected). (2) fbdev=0
+        # only changes WHO provides fbcon; the early TTY/console still comes up on
+        # simpledrm/efifb, and the GUI still comes up via modeset=1 -- no display path is
+        # removed. (3) If hart-comp STILL cannot take master or GLES init faults, the
+        # existing degrade chain is untouched: pixman renderer of record (udev.rs) +
+        # the supervisor paint watchdog drop Tier-1 → sway → cage. Worst case is exactly
+        # today's software desktop, never a black/bricked screen. REAL-HW-GATED: verify
+        # on the node via the dev loop (canary + rollback protect the OTA push).
         "nvidia-drm.modeset=1"
-        "nvidia-drm.fbdev=1"
+        "nvidia-drm.fbdev=0"
       ];
 
       # GPU device permissions

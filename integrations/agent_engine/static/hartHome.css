@@ -23,15 +23,27 @@
  */
 
 :root {
-  --hh-teal: #00E6C3;
-  --hh-cyan: #29C5FF;
+  /* Var-driven: the home tracks the ACTIVE theme (the ONE theme path, same vars
+     theme_service emits + hartResponsive.css consumes - no parallel palette).
+     Every fallback is the exact HART-brand value theme_service emits by DEFAULT,
+     so hart-default and every other preset render pixel-identically; only a theme
+     that actually sets these tokens retints the home. Aura (violet-lead cosmic)
+     does: its ambient quad = the mock's p1-p4, its text/muted = the mock ink, so
+     applying Aura reskins the home to the mock with no component-level hardcoding.
+     --hh-teal = the FUNCTIONAL accent (Aura keeps teal on function); --hh-violet =
+     the a2 secondary brand; --hh-cyan/--hh-magenta ride the themable ambient MOOD
+     quad (amb-3/amb-4 - defaults ARE cyan/magenta, so unset themes are unchanged;
+     Aura shifts them to its pink/amber p3/p4). All fallbacks keep an un-themed
+     static preview identical. */
+  --hh-teal: var(--hart-accent, #00E6C3);
+  --hh-cyan: var(--hart-amb-3, #29C5FF);
   --hh-blue: #3B82F6;
-  --hh-violet: #9B5CFF;
-  --hh-magenta: #FF2E9A;
+  --hh-violet: var(--hart-a2, #9B5CFF);
+  --hh-magenta: var(--hart-amb-4, #FF2E9A);
   --hh-amber: #FFC83D;
-  --hh-ink: #F3F6FB;
-  --hh-dim: #9AA7B6;
-  --hh-bord: rgba(255, 255, 255, 0.09);
+  --hh-ink: var(--hart-text, #F3F6FB);
+  --hh-dim: var(--hart-muted, #9AA7B6);
+  --hh-bord: var(--hart-glass-border, rgba(255, 255, 255, 0.09));
   /* fixed safe areas: leave room for the (orchestrator-restructured) top bar
      and the taskbar so the home never collides with system chrome. */
   --hh-top-safe: 70px;
@@ -53,7 +65,11 @@
   flex-direction: column;
   padding: var(--hh-top-safe) 0 var(--hh-bottom-safe) 0;
   color: var(--hh-ink);
-  font-family: "Segoe UI", Inter, Roboto, system-ui, Helvetica, Arial, sans-serif;
+  /* The home renders in the theme DISPLAY face (Aura = Space Grotesk, the mock's
+     typeface) then the theme UI family, falling back to the sans stack so an
+     un-themed shell is unchanged. Same var hartResponsive.css already binds to the
+     row titles + headings - one typography source, no fork. */
+  font-family: var(--hart-font-display), var(--hart-font-family), "Segoe UI", Inter, Roboto, system-ui, Helvetica, Arial, sans-serif;
   overflow: hidden;
   pointer-events: none;
   opacity: 0;
@@ -264,7 +280,9 @@
   flex: 0 0 auto;
   width: 258px;
   height: 150px;
-  border-radius: 16px;
+  /* Card corner follows the theme radius (Aura = 22px, the mock's panel radius);
+     fallback 16px == today's look, so unset/other presets are unchanged. */
+  border-radius: var(--hart-radius, 16px);
   overflow: hidden;
   border: 1px solid var(--hh-bord);
   background: #0E1320;

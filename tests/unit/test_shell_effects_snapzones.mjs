@@ -10,9 +10,12 @@
  *   2. mousemove near a screen edge -> it reveals the (single, reused) snap zone
  *   3. fire hart:dragend at that edge -> it commits via the CANONICAL
  *      window.snapPanel(id, side) — never a forked snap geometry
- *   4. the gate: with window.HART_PERF.potato = true (software-GL floor) OR
- *      prefers-reduced-motion, the same gesture installs NOTHING and calls
- *      snapPanel ZERO times -> the desktop degrades FLAT, never janky.
+ *   4. software floor (gpu-hardware class ABSENT): the snap-zone is CHEAP
+ *      (opacity-only reveal + one snap), so it STILL arms + commits — only the
+ *      zone's left/top/width/height SLIDE (a layout-prop animation) is gated to a
+ *      real GPU, so the zone's transition is opacity-only on the software floor.
+ *   5. the ONE hard gate is prefers-reduced-motion / html.a11y-rmotion: the same
+ *      gesture installs NOTHING and calls snapPanel ZERO times (flat, never janky).
  *
  * Run:  node tests/unit/test_shell_effects_snapzones.mjs
  * (A Python wrapper, test_shell_effects_snapzones.py, shells out so pytest/CI
@@ -50,13 +53,17 @@ function makeEl(tag) {
 
 // Build a shim factory so each scenario gets a clean realm (the module installs
 // its listeners once per load; we re-run it per scenario for isolation).
-function makeSandbox({ potato = false, reducedMotion = false, rmotionClass = false } = {}) {
+function makeSandbox({ potato = false, reducedMotion = false, rmotionClass = false, gpuHardware = false } = {}) {
   const docEl = makeEl('html');
   if (rmotionClass) docEl.classList.add('a11y-rmotion');
+  const bodyEl = makeEl('body');
+  // The zone builds a position-SLIDE transition only when <body> carries the GPU
+  // verdict class; absent = software floor = opacity-only transition.
+  if (gpuHardware) bodyEl.classList.add('gpu-hardware');
   const document = {
     readyState: 'complete',
     documentElement: docEl,
-    body: makeEl('body'),
+    body: bodyEl,
     _listeners: {},
     createElement: (t) => makeEl(t),
     addEventListener(t, fn) { (this._listeners[t] = this._listeners[t] || []).push(fn); },
@@ -128,13 +135,30 @@ function dragToLeftEdge(s) {
   eq(s.snapCalls.length, 0, 'a centre release does not snap (no zone was armed)');
 }
 
-// ── 4. THE gate — potato (software-GL floor): the gesture installs nothing ──
+// ── 4. Software floor (no gpu-hardware class): the CHEAP snap-zone STILL runs ──
+// The reveal is opacity-only + one snapPanel commit, both cheap on cairo/pixman,
+// so a software box gets the snap affordance too (2026-07-15). Only the layout-
+// prop SLIDE is gated to a GPU: the zone's transition is opacity-only here.
 {
-  const s = makeSandbox({ potato: true });
+  const s = makeSandbox({ potato: true, gpuHardware: false });
   dragToLeftEdge(s);
   const zone = s.document.body._kids.find(k => k._attrs.id === 'hart-snapzone');
-  ok(!zone, 'potato: no snap-zone overlay is ever created (degrades FLAT)');
-  eq(s.snapCalls.length, 0, 'potato: a near-edge release commits NO snap (effects gated off)');
+  ok(zone, 'software floor: the snap-zone overlay IS created (cheap opacity reveal)');
+  eq(s.snapCalls.length, 1, 'software floor: a near-edge release DOES commit one snap');
+  const t = String(zone && zone.style && zone.style.cssText || '');
+  ok(/transition:opacity/.test(t) && !/left \.12s/.test(t),
+    'software floor: the zone transition is opacity-only (no left/top/width/height slide)');
+}
+
+// ── 4b. Real GPU (gpu-hardware class): the position SLIDE transition is added ──
+{
+  const s = makeSandbox({ potato: false, gpuHardware: true });
+  dragToLeftEdge(s);
+  const zone = s.document.body._kids.find(k => k._attrs.id === 'hart-snapzone');
+  ok(zone, 'gpu-hardware: the snap-zone overlay is created');
+  const t = String(zone && zone.style && zone.style.cssText || '');
+  ok(/left \.12s/.test(t) && /width \.12s/.test(t),
+    'gpu-hardware: the zone slides its left/top/width/height between arm positions');
 }
 
 // ── 5. THE gate — prefers-reduced-motion: same flat degrade ──
