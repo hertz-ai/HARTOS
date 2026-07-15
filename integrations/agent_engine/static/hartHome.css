@@ -49,6 +49,40 @@
   --hh-top-safe: 70px;
   --hh-bottom-safe: 56px;
   --hh-gutter: 60px;
+
+  /* ─────────────── AURA MOTION SYSTEM (composable + user-derivable) ───────────
+     The 15 keyframes of the steward mock (Aura OS Desktop.html) are ported below
+     as ONE var-driven motion vocabulary, grouped into 4 composable LAYERS that
+     Personalize > Aura Motion toggles, plus a master SPEED. Defaults MATCH the
+     mock; because Aura is the default theme these ARE the out-of-box look. Every
+     applied animation is gpu-hardware-gated (the software / webkit-flat floor
+     sheds them in hartResponsive.css) and reduced-motion aware. A layer is a
+     single play-state var (running | paused), so one Personalize write toggles
+     the whole group; the master speed is a unitless multiplier on every duration.
+     No parallel path: the SAME :root-var + HartSession mechanism the palette /
+     feel controls already use. Other themes can quiet a layer by setting its var
+     to paused (via Personalize or a theme override). */
+  --hart-motion-speed: 1;          /* master duration multiplier (100% = mock timing) */
+  --hart-motion-ambient: running;  /* layer 1: ambient blobs + hue cycle */
+  --hart-motion-orb: running;      /* layer 2: orb breathe + float */
+  --hart-motion-rings: running;    /* layer 3: orbital ring spin trio */
+  --hart-motion-detail: running;   /* layer 4: status detail (blink/wave/dash/joint) */
+  /* Per-animation timing + amplitude (mock defaults). Durations feed the
+     animation shorthand; amplitudes are read INSIDE the keyframes via var(). */
+  --hart-anim-blob-speed: 18s;
+  --hart-anim-hue-speed: 22s;
+  --hart-anim-hue-amt: 28deg;
+  --hart-anim-breathe-speed: 4s;
+  --hart-anim-breathe-amt: 1.08;
+  --hart-anim-float-speed: 9s;
+  --hart-anim-float-amt: -10px;
+  --hart-anim-spin-speed: 60s;
+  --hart-anim-spin-rev-speed: 90s;
+  --hart-anim-spinc-speed: 26s;
+  --hart-anim-blink-speed: 1.05s;
+  --hart-anim-wave-speed: 1.1s;
+  --hart-anim-dash-speed: 4s;
+  --hart-anim-joint-speed: 2.4s;
 }
 
 /* ============================ FIXED CANVAS ============================ */
@@ -494,12 +528,18 @@ body.gpu-hardware .hh-amount {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
 }
+/* The live/pending status dots ARE the shell's "detail" motion surface (layer 4).
+   They keep the calm hhLiveDot pulse by default (zero regression) but are gated by
+   --hart-motion-detail, so the Aura Motion "Detail" toggle pauses/plays them; the
+   master speed scales them like every other layer. */
 body.gpu-hardware .hh-card-live .hh-dot {
-  animation: hhLiveDot 1.6s ease-in-out infinite;
+  animation: hhLiveDot calc(1.6s * var(--hart-motion-speed, 1)) ease-in-out infinite;
+  animation-play-state: var(--hart-motion-detail, running);
 }
 /* The payout-pending dot breathes amber so the honest state reads as live. */
 body.gpu-hardware .hh-pill-dot {
-  animation: hhLiveDot 1.8s ease-in-out infinite;
+  animation: hhLiveDot calc(1.8s * var(--hart-motion-speed, 1)) ease-in-out infinite;
+  animation-play-state: var(--hart-motion-detail, running);
 }
 
 /* Reduced-motion users: never animate regardless of GPU. */
@@ -509,10 +549,86 @@ body.gpu-hardware .hh-pill-dot {
   body.gpu-hardware .hh-btn,
   body.gpu-hardware .hh-card-live .hh-dot,
   body.gpu-hardware .hh-pill-dot,
-  body.gpu-hardware .top-bar-orb {
+  body.gpu-hardware .top-bar-orb,
+  body.gpu-hardware .hart-ambient,
+  body.gpu-hardware .hart-ambient::after,
+  body.gpu-hardware #hart-voice-orb,
+  body.gpu-hardware .hart-hero-aura {
     transition: none !important;
     animation: none !important;
   }
+}
+
+/* ===================================================================== */
+/* AURA MOTION SYSTEM - the 15 mock keyframes, var-driven + composable    */
+/* Ported verbatim from the steward mock (Aura OS Desktop.html): three     */
+/* ambient blooms (vBlob1-3), a hue cycle (vHue), the orb set (vBreathe /  */
+/* vFloat / vRing / vScan), the orbital spin trio (vSpin / vSpinRev /       */
+/* vSpinC), and the detail set (vBlink / vWave / vDash / vJoint). The       */
+/* amplitudes the mock itself parameterises (breathe scale, float distance, */
+/* hue amount) read from vars so the whole system tunes from Personalize;   */
+/* the rest keep the mock's exact frames. These keyframes are the brand     */
+/* motion vocabulary the agentic Liquid UI can also compose with (vRing /   */
+/* vScan / vWave / vDash / vJoint are exposed for orb-character surfaces     */
+/* that mount those elements; the four LAYER vars gate whichever are used).  */
+/* ===================================================================== */
+@keyframes vBlob1 { 0%, 100% { transform: translate(0, 0) scale(1); } 50% { transform: translate(60px, -40px) scale(1.15); } }
+@keyframes vBlob2 { 0%, 100% { transform: translate(0, 0) scale(1); } 50% { transform: translate(-70px, 50px) scale(1.1); } }
+@keyframes vBlob3 { 0%, 100% { transform: translate(0, 0) scale(1); } 50% { transform: translate(40px, 60px) scale(1.2); } }
+@keyframes vHue { 0%, 100% { filter: hue-rotate(0deg); } 50% { filter: hue-rotate(var(--hart-anim-hue-amt, 28deg)); } }
+@keyframes vBreathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(var(--hart-anim-breathe-amt, 1.08)); } }
+@keyframes vFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(var(--hart-anim-float-amt, -10px)); } }
+@keyframes vRing { 0% { transform: translate(-50%, -50%) scale(.55); opacity: .8; } 100% { transform: translate(-50%, -50%) scale(1.7); opacity: 0; } }
+@keyframes vScan { 0% { transform: translateY(-20%); opacity: 0; } 12% { opacity: .9; } 88% { opacity: .9; } 100% { transform: translateY(430%); opacity: 0; } }
+@keyframes vSpin { to { transform: rotate(360deg); } }
+@keyframes vSpinRev { to { transform: rotate(-360deg); } }
+@keyframes vSpinC { to { transform: translate(-50%, -50%) rotate(360deg); } }
+@keyframes vBlink { 0%, 48% { opacity: 1; } 50%, 100% { opacity: 0; } }
+@keyframes vWave { 0%, 100% { transform: scaleY(.25); } 50% { transform: scaleY(1); } }
+@keyframes vDash { to { stroke-dashoffset: -72; } }
+@keyframes vJoint { 0%, 100% { opacity: .5; } 50% { opacity: 1; } }
+
+/* ── APPLICATION (gpu-hardware only; the software / webkit-flat floor sheds
+   these in hartResponsive.css). Each layer is gated by its own play-state var,
+   so ONE Personalize write toggles the whole group; the master
+   --hart-motion-speed scales every duration (calc(base * speed)). ── */
+
+/* Layer 1 - AMBIENT. The field BLOBS drift via a transform animation on
+   .hart-ambient (its blur + saturate stay static, so the thinking / voice /
+   speaking filter feedback that hue-shifts the field is untouched). The HUE
+   cycle rides a conflict-free ::after that inherits the field's own blob
+   gradients and hue-rotates them; the field's own filter blurs the ::after, so
+   the ghost stays soft. This is the mock's "aurora field" (blobs + hue) faithfully. */
+body.gpu-hardware .hart-ambient {
+  animation: vBlob1 calc(var(--hart-anim-blob-speed, 18s) * var(--hart-motion-speed, 1)) ease-in-out infinite;
+  animation-play-state: var(--hart-motion-ambient, running);
+}
+body.gpu-hardware .hart-ambient::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: inherit;
+  opacity: 0.55;
+  pointer-events: none;
+  animation: vHue calc(var(--hart-anim-hue-speed, 22s) * var(--hart-motion-speed, 1)) ease-in-out infinite;
+  animation-play-state: var(--hart-motion-ambient, running);
+}
+
+/* Layer 2 - ORB. The voice-orb canvas breathes + floats (transform only, so its
+   drop-shadow bloom + the listening filter state are untouched). This is the
+   "living, breathing orb" pillar as a calm CSS float on top of the canvas viz. */
+body.gpu-hardware #hart-voice-orb {
+  animation: vFloat calc(var(--hart-anim-float-speed, 9s) * var(--hart-motion-speed, 1)) ease-in-out infinite,
+             vBreathe calc(var(--hart-anim-breathe-speed, 4s) * var(--hart-motion-speed, 1)) ease-in-out infinite;
+  animation-play-state: var(--hart-motion-orb, running);
+}
+
+/* Layer 3 - RINGS. The orb aura CONTAINER (built by hartHero.js, which animates
+   only its ring CHILDREN, never the container) slowly rotates the whole ring
+   assembly - the mock's orbital spin. Additive + conflict-free. */
+body.gpu-hardware .hart-hero-aura {
+  animation: vSpin calc(var(--hart-anim-spin-speed, 60s) * var(--hart-motion-speed, 1)) linear infinite;
+  animation-play-state: var(--hart-motion-rings, running);
 }
 
 /* ===================== TOP BAR RESTRUCTURE (e1) ===================== */

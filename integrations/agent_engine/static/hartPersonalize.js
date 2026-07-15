@@ -392,6 +392,14 @@
       grid.appendChild(buildFeelControls());
     });
 
+    // 1d) AURA MOTION — the 4 composable microanimation layers (ambient / orb /
+    // rings / detail) + a master speed. Toggles write the play-state CSS vars live +
+    // persist (same path as Feel); the software floor sheds them (hartResponsive.css).
+    safeSection('Aura Motion', function () {
+      section('Aura Motion');
+      grid.appendChild(buildMotionControls());
+    });
+
     // 1c) FONT — display/heading typeface from the server font catalogue. Sets
     // --hart-font-display live (heading/title consumer in hartResponsive.css), persists
     // via HartSession, and rides the SAME /api/appearance/apply custom-overrides path
@@ -642,7 +650,11 @@
       // so the dock renders styled wherever it is mounted (an A2UI-mountable utility).
       '.hart-mood-label { font-size: 10px; font-weight: 600; letter-spacing: .12em; color: var(--hart-muted,#8a90a0); margin-right: 4px; align-self: center; }',
       '.hart-mood-sw { display: inline-block; width: 22px; height: 22px; border-radius: 50%; cursor: pointer; border: 1.5px solid rgba(255,255,255,.14); box-shadow: 0 1px 4px rgba(0,0,0,.35); transition: transform .12s ease, box-shadow .12s ease; }',
-      '.hart-mood-sw:hover, .hart-mood-sw:focus { transform: scale(1.12); box-shadow: 0 0 0 2px rgba(var(--hart-accent-rgb,0,230,195),.5); outline: none; }'
+      '.hart-mood-sw:hover, .hart-mood-sw:focus { transform: scale(1.12); box-shadow: 0 0 0 2px rgba(var(--hart-accent-rgb,0,230,195),.5); outline: none; }',
+      // Aura Motion rows: reuse the .hart-cp-field label/input row; the toggle sits to
+      // the right, brand-accented. Co-located with the feel style it belongs to (G7).
+      '.hart-motion .hart-cp-field { justify-content: space-between; }',
+      '.hart-motion-toggle { width: 16px; height: 16px; cursor: pointer; accent-color: var(--hart-accent,#00E6C3); }'
     ].join('\n');
     document.head.appendChild(st);
   }
@@ -668,6 +680,101 @@
       // stays pixel-identical to the theme_service-emitted default — regression-safe).
       if (hasSaved) applyFeelVar(root, fs.key, saved, fs.scale);
       row.appendChild(span); row.appendChild(inp); wrap.appendChild(row);
+    });
+    return wrap;
+  }
+
+  // ── AURA MOTION (composable microanimations, #Aura). The 15 keyframes of the
+  // steward mock are ported into hartHome.css as ONE var-driven vocabulary grouped
+  // into 4 composable LAYERS (ambient / orb / rings / detail). This section toggles
+  // each layer LIVE (a play-state CSS var on :root) + tunes a master SPEED, and
+  // PERSISTS via HartSession -- the SAME :root-var + session path the palette / feel
+  // controls use (no parallel store, no reload). ONE spec table (MOTION_LAYERS) + ONE
+  // pair of transforms (applyMotionLayer / applyMotionSpeed) is the single source
+  // shared by the hub builder AND the boot restore. Exposed for tests / the agentic
+  // Liquid UI (window.HartMotion). A layer defaults ON (the Aura look out of the box,
+  // == the CSS var default); only an explicit user OFF writes 'paused'.
+  var MOTION_LAYERS = window.HART_MOTION_LAYERS = [
+    { label: 'Ambient', key: 'ambient' },
+    { label: 'Orb',     key: 'orb' },
+    { label: 'Rings',   key: 'rings' },
+    { label: 'Detail',  key: 'detail' }
+  ];
+  function applyMotionLayer(root, key, on) {
+    if (root && root.style && root.style.setProperty)
+      root.style.setProperty('--hart-motion-' + key, on ? 'running' : 'paused');
+  }
+  function applyMotionSpeed(root, rawValue) {
+    // Slider 50..150 -> a 0.5..1.5 multiplier (100 = mock timing, pixel-identical).
+    var mult = Number(rawValue) / 100;
+    if (!(mult > 0)) mult = 1;
+    if (root && root.style && root.style.setProperty)
+      root.style.setProperty('--hart-motion-speed', String(mult));
+  }
+  // A persisted value is a boolean (false = off) or a legacy string; anything not a
+  // recognised OFF is treated as ON (default-on). One resolver, no parallel truthiness.
+  function motionValueOn(v) { return !(v === false || v === 'paused' || v === 'off' || v === '0'); }
+  function motionLayerOn(key) {
+    return motionValueOn(window.HartSession && window.HartSession.get('motion_' + key));
+  }
+  window.HartMotion = {
+    layers: MOTION_LAYERS,
+    setLayer: function (key, on) {
+      applyMotionLayer(document.documentElement, key, !!on);
+      if (window.HartSession) window.HartSession.set('motion_' + key, !!on);
+    },
+    setSpeed: function (raw) {
+      applyMotionSpeed(document.documentElement, raw);
+      if (window.HartSession) window.HartSession.set('motion_speed', raw);
+    },
+    // Re-apply the persisted layers + speed (only EXPLICIT picks; unset -> the CSS
+    // var defaults stand). Called by restore(); safe to call again.
+    restore: function () {
+      var root = document.documentElement;
+      MOTION_LAYERS.forEach(function (ml) {
+        var mv = window.HartSession && window.HartSession.get('motion_' + ml.key);
+        if (mv !== null && mv !== undefined && mv !== '') applyMotionLayer(root, ml.key, motionValueOn(mv));
+      });
+      var ms = window.HartSession && window.HartSession.get('motion_speed');
+      if (ms !== null && ms !== undefined && ms !== '') applyMotionSpeed(root, ms);
+    }
+  };
+  function buildMotionControls() {
+    var root = document.documentElement;
+    var wrap = document.createElement('div'); wrap.className = 'hart-motion';
+    var S = window.HartSession;
+    // Master SPEED (50..150 -> 0.5x..1.5x). Untouched => the mock 100% default stands.
+    var srow = document.createElement('label'); srow.className = 'hart-cp-field';
+    var sspan = document.createElement('span'); sspan.textContent = 'Speed';
+    var sinp = document.createElement('input'); sinp.type = 'range'; sinp.min = '50'; sinp.max = '150';
+    var savedSpeed = S ? S.get('motion_speed') : null;
+    var hasSpeed = (savedSpeed !== null && savedSpeed !== undefined && savedSpeed !== '');
+    sinp.value = String(hasSpeed ? savedSpeed : 100);
+    sinp.setAttribute('aria-label', 'Aura motion speed');
+    sinp.addEventListener('input', function () {
+      applyMotionSpeed(root, sinp.value);
+      if (S) S.set('motion_speed', sinp.value);
+    });
+    if (hasSpeed) applyMotionSpeed(root, savedSpeed);
+    srow.appendChild(sspan); srow.appendChild(sinp); wrap.appendChild(srow);
+    // Per-LAYER toggles. Each write flips ONE play-state var -> the whole group.
+    MOTION_LAYERS.forEach(function (ml) {
+      var row = document.createElement('label'); row.className = 'hart-cp-field hart-motion-row';
+      var span = document.createElement('span'); span.textContent = ml.label;
+      var cb = document.createElement('input'); cb.type = 'checkbox'; cb.className = 'hart-motion-toggle';
+      cb.setAttribute('data-layer', ml.key);
+      cb.setAttribute('aria-label', ml.label + ' motion');
+      var on = motionLayerOn(ml.key);
+      cb.checked = on;
+      cb.addEventListener('change', function () {
+        applyMotionLayer(root, ml.key, cb.checked);
+        if (S) S.set('motion_' + ml.key, cb.checked);
+        toast('Aura Motion', ml.label + (cb.checked ? ' on' : ' off'));
+      });
+      // Reflect a persisted OFF live (default ON == the CSS var default -> a fresh
+      // shell is pixel-identical; only an explicit OFF paints 'paused').
+      if (!on) applyMotionLayer(root, ml.key, false);
+      row.appendChild(span); row.appendChild(cb); wrap.appendChild(row);
     });
     return wrap;
   }
@@ -725,6 +832,12 @@
       });
       var fd = window.HartSession.get('font_display');
       if (fd && froot.style && froot.style.setProperty) froot.style.setProperty('--hart-font-display', '"' + fd + '"');
+
+      // Aura motion: re-apply persisted layer toggles + master speed on boot so a
+      // quieted layer / chosen speed survives reload even before the hub is opened.
+      // Only EXPLICIT picks are re-applied (unset -> the CSS var defaults stand,
+      // pixel-identical). Same spec + transforms the hub uses (one path).
+      if (window.HartMotion && window.HartMotion.restore) window.HartMotion.restore();
 
       // G9: inject the feel <style> at BOOT (idempotent) so the persisted --hart-glow
       // bloom (and density) apply immediately -- before, it was injected only when the

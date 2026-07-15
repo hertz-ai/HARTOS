@@ -561,5 +561,84 @@ function runModules(realm, files) {
      'the broken Orb section logged its failure via console.error (observability forwarded)');
 })();
 
+// ════════════════════════════════════════════════════════════════════════════
+// [G-motion] AURA MOTION — the composable microanimation layers (#Aura). The 15
+//   mock keyframes are ported into hartHome.css as ONE var-driven vocabulary grouped
+//   into 4 composable LAYERS; the Personalize "Aura Motion" section renders a toggle
+//   per layer + a master speed. Behavioural: toggling a layer WRITES its play-state
+//   var (--hart-motion-<layer>) to documentElement + persists HartSession.motion_<layer>;
+//   the master speed writes --hart-motion-speed; restore() re-applies a persisted OFF /
+//   speed on boot. Assert the DOM/var mutation + the session write, never a substring.
+// ════════════════════════════════════════════════════════════════════════════
+(function testAuraMotionComposable() {
+  console.log('\n[G-motion] hartPersonalize.js  Aura Motion layers toggle + persist the play-state vars');
+  const R = makeRealm();
+  R.sandbox.window.HartSession = makeSession({});     // nothing persisted => defaults (ON)
+  R.sandbox.window.hartLoadInto = function () {};
+  runModules(R, ['voiceOrbViz.js', 'hartPersonalize.js']);
+
+  // The exposed composable API is the single source for the section + the agentic Liquid UI.
+  ok(R.sandbox.window.HartMotion && typeof R.sandbox.window.HartMotion.setLayer === 'function',
+     'window.HartMotion.setLayer is exposed');
+  const layers = R.sandbox.window.HART_MOTION_LAYERS;
+  ok(Array.isArray(layers) && layers.length === 4,
+     'HART_MOTION_LAYERS exposes the 4 composable layers  (got ' + (layers && layers.length) + ')');
+
+  const host = makeEl('div');
+  R.sandbox.window.hartRenderPersonalize(host);
+
+  // One toggle per layer + a master speed slider rendered.
+  const toggles = host.querySelectorAll('.hart-motion-toggle');
+  eq(toggles.length, 4, 'the Aura Motion section rendered one toggle per layer');
+  const ambient = toggles.filter(function (t) { return t.getAttribute('data-layer') === 'ambient'; })[0];
+  ok(ambient, 'the Ambient layer toggle rendered (data-layer=ambient)');
+  eq(ambient.checked, true, 'a layer defaults ON (checked) when nothing persisted (the Aura look out of the box)');
+
+  const st = R.docEl.style;
+  // Default-ON paints NO var (the hartHome.css :root running default stands -> pixel-identical).
+  eq(st.getPropertyValue('--hart-motion-ambient'), '',
+     'a default-ON layer paints no var (the CSS running default stands, a fresh shell is unchanged)');
+
+  // Toggle Ambient OFF -> writes the play-state var live + persists false.
+  ambient.checked = false;
+  ambient.dispatch('change', mkEv(ambient));
+  eq(st.getPropertyValue('--hart-motion-ambient'), 'paused',
+     'toggling Ambient OFF writes --hart-motion-ambient:paused to documentElement (live)');
+  eq(R.sandbox.window.HartSession.get('motion_ambient'), false,
+     'toggling Ambient OFF persists HartSession.motion_ambient=false');
+
+  // Toggle it back ON -> running + persisted true.
+  ambient.checked = true;
+  ambient.dispatch('change', mkEv(ambient));
+  eq(st.getPropertyValue('--hart-motion-ambient'), 'running',
+     'toggling Ambient back ON writes --hart-motion-ambient:running');
+  eq(R.sandbox.window.HartSession.get('motion_ambient'), true,
+     'toggling back ON persists HartSession.motion_ambient=true');
+
+  // Master SPEED slider writes the unitless multiplier var (150 -> 1.5x).
+  const mwrap = host.querySelector('.hart-motion');
+  ok(mwrap, 'the Aura Motion wrap rendered');
+  const speed = mwrap.querySelectorAll('input').filter(function (i) { return i.type === 'range'; })[0];
+  ok(speed, 'the master speed slider rendered');
+  speed.value = '150';
+  speed.dispatch('input', mkEv(speed));
+  eq(st.getPropertyValue('--hart-motion-speed'), '1.5',
+     'the speed slider writes --hart-motion-speed (150 -> 1.5x multiplier)');
+  eq(R.sandbox.window.HartSession.get('motion_speed'), '150',
+     'the speed slider persists HartSession.motion_speed');
+
+  // Restore: a persisted OFF layer + a chosen speed re-apply on boot (before the hub opens).
+  const R2 = makeRealm();
+  R2.sandbox.window.HartSession = makeSession({ motion_orb: false, motion_speed: '75' });
+  R2.sandbox.window.hartLoadInto = function () {};
+  runModules(R2, ['voiceOrbViz.js', 'hartPersonalize.js']);   // restore() runs on load
+  eq(R2.docEl.style.getPropertyValue('--hart-motion-orb'), 'paused',
+     'restore() re-paints a persisted OFF layer (orb) on boot');
+  eq(R2.docEl.style.getPropertyValue('--hart-motion-speed'), '0.75',
+     'restore() re-applies the persisted master speed on boot (75 -> 0.75x)');
+  eq(R2.docEl.style.getPropertyValue('--hart-motion-ambient'), '',
+     'an unset layer is left to the CSS default on boot (no var painted, pixel-identical)');
+})();
+
 console.log(failures ? ('\nRESULT: ' + failures + ' FAILED') : '\nRESULT: ALL PASS');
 process.exit(failures ? 1 : 0);

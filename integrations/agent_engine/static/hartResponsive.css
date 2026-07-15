@@ -533,6 +533,30 @@ body.gpu-software .hart-ambient {
 }
 body.gpu-software .hart-grain { display: none; }
 
+/* AURA MOTION SYSTEM floor (hartHome.css): the 4 composable microanimation layers
+   (ambient blob drift + hue ghost, orb breathe/float, orbital ring spin, and any
+   detail keyframes) are CONTINUOUS per-frame transform/filter drift -- exactly the
+   class of effect that pegs a core on the CPU-composited cairo/pixman floor. SHED
+   them (static, not gone: the colour + depth already rastered once and stay). The
+   COLOUR/depth is kept above (the ambient gradients, the orb bloom); only the
+   per-frame drift/spin/breathe is dropped, mirroring block 2. Applies wherever
+   compositing is off -- gpu-software OR webkit-flat (a hardware-probe box whose
+   WebKit compositing is disabled) -- so a heavy motion layer can never reintroduce
+   the 500ms keystroke lag (#137 / GF1). The hue ghost pseudo is removed outright. */
+body.gpu-software .hart-ambient,
+body.gpu-software #hart-voice-orb,
+body.gpu-software .hart-hero-aura,
+body.webkit-flat .hart-ambient,
+body.webkit-flat #hart-voice-orb,
+body.webkit-flat .hart-hero-aura {
+  animation: none !important;
+}
+body.gpu-software .hart-ambient::after,
+body.webkit-flat .hart-ambient::after {
+  animation: none !important;
+  display: none;
+}
+
 /* 3) INTERACTION FEEDBACK STAYS ALIVE ON THE SOFTWARE FLOOR (2026-07-15).
    Previously this block killed EVERY hover/focus lift on the CPU (transition:none
    + transform:none), so the desktop felt DEAD on cairo/pixman: no card lift, no
