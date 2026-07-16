@@ -397,7 +397,12 @@
     mkImage = { system, variant, format, extraModules ? [] }:
       nixos-generators.nixosGenerate {
         inherit system format;
-        specialArgs = mkSpecialArgs variant;
+        # hartImageKind = "raw": these formats are INSTALLED systems (writable
+        # root disk image), not live media. The variant config drops the CD
+        # profile + isoImage branding on this signal and adds first-boot root
+        # growth. mkSystem deliberately does NOT pass it, so every ISO eval
+        # keeps the default "iso" and stays byte-identical (no regression).
+        specialArgs = mkSpecialArgs variant // { hartImageKind = "raw"; };
         modules = hartModules ++ [
           { nixpkgs.config = nixpkgsConfig; }  # single source — #70
           ./configurations/${variant}.nix
