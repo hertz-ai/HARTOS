@@ -386,7 +386,13 @@
     mkSystem = { system, variant, extraModules ? [] }:
       nixpkgs.lib.nixosSystem {
         inherit system;
-        specialArgs = mkSpecialArgs variant;
+        # hartImageKind MUST be a specialArg (not left to the desktop.nix
+        # destructuring default): a module argument absent from specialArgs is
+        # resolved through the config fixpoint (_module.args), and desktop.nix
+        # uses it in `imports` -- which shape that same fixpoint -> "infinite
+        # recursion encountered" (run 29508017463). specialArgs are
+        # fixpoint-free, so imports may branch on them.
+        specialArgs = mkSpecialArgs variant // { hartImageKind = "iso"; };
         modules = hartModules ++ [
           { nixpkgs.config = nixpkgsConfig; }  # single source — #70
           ./configurations/${variant}.nix

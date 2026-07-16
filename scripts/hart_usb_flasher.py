@@ -345,13 +345,20 @@ def human(n):
 
 
 # ───────────────────────── release parts ─────────────────────────
-def list_parts(gh, tag, variant):
-    """Return sorted [{name, id, size}] for <variant> ISO parts of <tag>.
+def list_parts(gh, tag, variant, image="iso"):
+    """Return sorted [{name, id, size}] for <variant> parts of <tag>.
+
+    image='iso' (default) selects the live ISO parts (.iso.part-NN); image='raw'
+    selects the INSTALLED raw disk image's compressed parts (.raw.xz.part-NN).
+    The suffix match must be EXACT: releases carry both image kinds side by
+    side, and the old `".part-" in name` filter would interleave raw parts into
+    the ISO list -- mixed offsets writing both images onto one device.
 
     A missing/unpublished tag makes `gh api` 404 and emit an error object
     ({"message":"Not Found",...}) on stdout instead of asset lines. Guard the
     dict access so that case yields an empty list (=> a clean "no parts" error
     in flash()) rather than a KeyError, and so a malformed line never aborts."""
+    part_token = {"iso": ".iso.part-", "raw": ".raw.xz.part-"}[image]
     r = _run([gh, "api", "repos/%s/releases/tags/%s" % (REPO, tag),
               "--jq", ".assets[] | {name:.name, id:.id, size:.size, state:.state}"])
     parts = []
@@ -364,7 +371,7 @@ def list_parts(gh, tag, variant):
         except json.JSONDecodeError:
             continue
         name = a.get("name") if isinstance(a, dict) else None
-        if name and variant in name and ".part-" in name:
+        if name and variant in name and part_token in name:
             parts.append(a)
     parts.sort(key=lambda a: a["name"])
     return parts

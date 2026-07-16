@@ -323,6 +323,27 @@ def test_list_parts_parses_real_assets(monkeypatch):
     assert all("desktop" in p["name"] for p in parts)
 
 
+def test_list_parts_excludes_raw_image_assets_from_iso_flow(monkeypatch):
+    """Releases now ALSO carry the installed raw image (.raw.xz.part-*). The old
+    filter (`variant in name and ".part-" in name`) would interleave those into
+    the ISO part list -- mixed offsets, corrupted write. The iso flow must keep
+    ONLY .iso.part-* assets; the raw flow (image='raw') only .raw.xz.part-*."""
+    lines = "\n".join([
+        '{"name":"hart-os-1.0.0-desktop-x86_64-linux.iso.part-00","id":1,"size":10,"state":"uploaded"}',
+        '{"name":"hart-os-1.0.0-desktop-x86_64-linux.iso.part-01","id":2,"size":20,"state":"uploaded"}',
+        '{"name":"hart-os-1.0.0-desktop-x86_64-linux.raw.xz.part-00","id":3,"size":30,"state":"uploaded"}',
+        '{"name":"hart-os-1.0.0-desktop-x86_64-linux.raw.xz.part-01","id":4,"size":40,"state":"uploaded"}',
+        '{"name":"hart-os-1.0.0-desktop-x86_64-linux.raw.sha256","id":5,"size":64,"state":"uploaded"}',
+    ])
+    monkeypatch.setattr(flasher, "_run", lambda cmd, **kw: _CP(lines))
+    iso_parts = flasher.list_parts("gh", "nightly-x", "desktop")
+    assert [p["id"] for p in iso_parts] == [1, 2], \
+        "iso flow must EXCLUDE .raw.xz parts (mixed offsets would corrupt the write)"
+    raw_parts = flasher.list_parts("gh", "nightly-x", "desktop", image="raw")
+    assert [p["id"] for p in raw_parts] == [3, 4], \
+        "raw flow must pick ONLY .raw.xz parts"
+
+
 # ─────────── HARTLOG diagnostic-log partition (Part B) ───────────
 # The Windows diskpart carve of the HARTLOG partition is now OPT-IN (DEFAULT OFF):
 # the Live OS creates it itself on first boot (Linux-side, safe). The Windows
