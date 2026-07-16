@@ -182,7 +182,13 @@ jobs:
     # ~30 min to the baseline. iso-server/iso-edge stay well under
     # 15 min so bumping the shared cap doesn't waste any runner time
     # on the fast variants.
-    timeout-minutes: 180
+    # 300 (was 180): raw-desktop needs more than iso-desktop — make-disk-image
+    # copies the whole ~20 GB closure into an ext4 inside a VM (slow I/O) on
+    # top of the same closure build; the 2026-07-16 first attempt (run
+    # 29509018080) was CANCELLED at the 180-min wall. The fast variants finish
+    # in ~15 min regardless, so the higher shared cap costs nothing there and
+    # only pays out on hangs.
+    timeout-minutes: 300
     # raw-desktop (the INSTALLED writable-root image, 2026-07-16) must NEVER
     # block the nightly: publish-nightly `needs: build-iso`, and a failed matrix
     # leg fails the whole job for `needs` purposes. Per-leg continue-on-error
@@ -220,11 +226,18 @@ jobs:
           # blows past the default 14GB runner disk. iso-desktop failed in
           # run 24625067423 with glibc-locales-2.40-66.drv builder exit 1
           # — classic ENOSPC symptom. Strip everything we don't need.
+          # 2026-07-16 (run 29509018080): iso-desktop ENOSPC'd at "42 MB free"
+          # mid-mksquashfs — the runner image had accreted enough bloat that the
+          # borderline fit tipped over. /opt/hostedtoolcache is the single
+          # biggest remaining chunk (~12 GB of Python/Node/Go toolcaches this
+          # workflow never touches: its only actions are checkout + the nix
+          # installer); JVM + miniconda add ~3 GB more.
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /opt/hostedtoolcache \
                       /usr/local/.ghcup /usr/share/swift \
                       /usr/local/share/powershell /usr/local/share/chromium \
                       /usr/local/share/chrome /opt/microsoft \
+                      /usr/lib/jvm /usr/share/miniconda \
                       /imagegeneration || true
           sudo docker image prune -a -f 2>/dev/null || true
           sudo apt-get remove -y --purge '^dotnet-.*' '^llvm-.*' \
