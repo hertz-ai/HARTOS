@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import lzma
 import os
 import platform
 import shutil
@@ -1419,6 +1420,222 @@ def _create_log_partition_unix(disk, log, label=LOG_PART_LABEL, fs="fat32"):
         return False
 
 
+# ─────────────────── raw image (the INSTALLED system) ───────────────────
+# The raw-desktop artifact (2026-07-16) is the INSTALLED writable-root disk
+# image: GPT with an ESP + an ext4 root that first boot grows to fill the
+# stick. State persists because the root IS a real disk -- so this path has
+# NO HARTSTATE/HARTLOG carve at all (the whole carve lineage exists only for
+# the read-only live ISO). CI ships it as ONE xz stream (xz -T0 = a single
+# multi-block stream, so one LZMADecompressor handles it -- split(1) only
+# slices bytes) in .raw.xz.part-NN chunks, plus a .raw.sha256 companion
+# holding the sha256 of the UNCOMPRESSED image for device verification.
+GPT_SIG_OFFSET = 512          # LBA 1: the GPT header magic
+GPT_SIG = b"EFI PART"
+
+
+class _XZPartsReader:
+    """File-like over sequential .raw.xz.part-NN files: read(n) hands out the
+    DECOMPRESSED image bytes and tracks their sha256 + count.
+
+    EXACT-FILL is the load-bearing contract: read(n) returns exactly n bytes
+    unless the stream is exhausted. Both device writers (_WinExclusiveWriter.
+    write_at and _py_write) pad any short buffer to the sector boundary, so a
+    short MID-STREAM read would inject zero bytes INTO the image and corrupt
+    it silently. The buffer loop below only returns early at true EOF."""
+
+    def __init__(self, paths, log, progress=None, total_compressed=0):
+        self._paths = list(paths)
+        self._log = log
+        self._progress = progress or (lambda f: None)
+        self._total_comp = max(1, total_compressed)
+        self._read_comp = 0
+        self._fh = None
+        self._d = lzma.LZMADecompressor(format=lzma.FORMAT_XZ)
+        self._buf = bytearray()
+        self._exhausted = False
+        self._hash = hashlib.sha256()
+        self.count = 0            # decompressed bytes handed out so far
+
+    def _next_compressed(self):
+        """The next compressed chunk across the part files, or None at the end."""
+        while True:
+            if self._fh is None:
+                if not self._paths:
+                    return None
+                path = self._paths.pop(0)
+                self._log("  decompressing %s" % os.path.basename(path))
+                self._fh = open(path, "rb")
+            chunk = self._fh.read(CHUNK)
+            if chunk:
+                self._read_comp += len(chunk)
+                self._progress(self._read_comp / self._total_comp)
+                return chunk
+            self._fh.close()
+            self._fh = None
+
+    def read(self, n):
+        while len(self._buf) < n and not self._exhausted:
+            chunk = self._next_compressed()
+            if chunk is None:
+                self._exhausted = True
+                break
+            self._buf += self._d.decompress(chunk)
+            if self._d.eof:
+                # xz -T0 emits ONE stream; anything non-zero after it means the
+                # parts were assembled wrong (e.g. a foreign file slipped into
+                # the sequence) -- corrupt loudly, never write it to the device.
+                tail = self._d.unused_data.lstrip(b"\x00")
+                if tail:
+                    raise RuntimeError("trailing data after the xz stream "
+                                       "(%d bytes) - part sequence is wrong" % len(tail))
+                self._exhausted = True
+                break
+        ret = bytes(self._buf[:n])
+        del self._buf[:n]
+        self._hash.update(ret)
+        self.count += len(ret)
+        return ret
+
+    def hexdigest(self):
+        return self._hash.hexdigest()
+
+    def close(self):
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError as e:
+                self._log("  (part close failed: %s)" % e)
+            self._fh = None
+
+
+def fetch_release_asset_text(gh, tag, name, tmp, log):
+    """Download a small text asset (the .raw.sha256 companion) and return its
+    content, or None. A missing companion degrades verification (logged loudly
+    upstream) -- it never crashes the flash."""
+    try:
+        _run([gh, "release", "download", tag, "--repo", REPO,
+              "--pattern", name, "--dir", tmp, "--clobber"])
+        p = os.path.join(tmp, name)
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        log("  %s: not present on the release" % name)
+    except (OSError, RuntimeError) as e:
+        log("  %s: fetch failed (%s)" % (name, e))
+    return None
+
+
+def verify_raw_sigs(disk, dd, log):
+    """The raw image's on-disk boot contract: the protective-MBR 0x55AA boot
+    signature at 0x1FE plus the GPT header magic 'EFI PART' at LBA 1 (byte 512).
+    A raw-efi image is NOT an ISO -- there is no CD001 to check."""
+    dev = disk["dev"] if dd else disk["physdrive"]
+    boot = read_at(dev, BOOT_SIG_OFFSET, len(BOOT_SIG), dd)
+    gpt = read_at(dev, GPT_SIG_OFFSET, len(GPT_SIG), dd)
+    ok_boot = boot == BOOT_SIG
+    ok_gpt = gpt == GPT_SIG
+    log("  boot sig @0x1FE: %r %s" % (boot, "OK" if ok_boot else "FAIL"))
+    log("  GPT sig @LBA1  : %r %s" % (gpt, "OK" if ok_gpt else "FAIL"))
+    return ok_boot and ok_gpt
+
+
+def flash_raw(tag, variant, disk, tmp, progress=None, log=None, verify=True):
+    """Flash the INSTALLED raw image: download the .raw.xz.part-NN set, stream
+    the single xz through decompression straight onto the device from byte 0,
+    then verify the decompressed stream sha256 against the published
+    .raw.sha256 companion AND read the device back to prove what landed.
+
+    No per-part offsets exist here (offsets live in compressed space), so
+    there is no --start-part resume and no per-part verify -- the stream hash
+    covers every byte end to end."""
+    log = log or (lambda m: None)
+    progress = progress or (lambda f: None)
+    gh = find_gh()
+    if not gh:
+        raise RuntimeError("GitHub CLI `gh` not found")
+    dd = find_dd()
+    parts = list_parts(gh, tag, variant, image="raw")
+    if not parts:
+        raise RuntimeError("no %s raw image parts in %s (the raw artifact ships "
+                           "from 2026-07-16 nightlies onward; older tags are ISO-only)"
+                           % (variant, tag))
+    bad = [p["name"] for p in parts if p.get("state") and p["state"] != "uploaded"]
+    if bad:
+        raise RuntimeError("assets still uploading: %s" % ", ".join(bad))
+    total_comp = sum(p["size"] for p in parts)
+    base = parts[0]["name"].rsplit(".xz.part-", 1)[0]      # hart-os-...-linux.raw
+    log("Flashing RAW image %s (%s) -> %s [%s], %d xz parts, %s compressed"
+        % (tag, variant, disk["dev"] if dd else disk["physdrive"],
+           disk["model"], len(parts), human(total_comp)))
+
+    expected = None
+    txt = fetch_release_asset_text(gh, tag, base + ".sha256", tmp, log)
+    if txt and txt.split():
+        expected = txt.split()[0].lower()
+        log("  companion %s.sha256: %s" % (base, expected))
+    else:
+        log("  WARNING: no %s.sha256 companion - the device read-back will verify "
+            "against the streamed hash only (device==stream, stream==source unproven)"
+            % base)
+
+    srcs = [download_part(gh, tag, p["name"], tmp, p["size"], log) for p in parts]
+
+    writer = None
+    if IS_WIN:
+        _prepare_windows_device(disk, dd, log, clean=True)
+        writer = _WinExclusiveWriter(disk["number"])
+    reader = _XZPartsReader(srcs, log, progress=progress, total_compressed=total_comp)
+    try:
+        if writer is not None:
+            written = writer.write_at(0, reader)
+        else:
+            written = _py_write(disk.get("physdrive") or disk["dev"], 0, reader, log)
+    finally:
+        reader.close()
+        if writer is not None:
+            writer.close()
+        if IS_WIN:
+            _win_automount(True)
+    stream_sha = reader.hexdigest()
+    log("  wrote %s (%s decompressed image bytes; stream sha256=%s)"
+        % (human(written), human(reader.count), stream_sha))
+    if reader.count % SECTOR:
+        # A GPT disk image is sector-addressed, so a non-sector-multiple length
+        # means the artifact itself is malformed -- say so, loudly.
+        log("  WARNING: image length %d is not a 512-byte multiple - artifact malformed?"
+            % reader.count)
+    if expected and stream_sha != expected:
+        raise RuntimeError("decompressed stream sha256 %s does not match the "
+                           "published %s.sha256 (%s) - the download is corrupt; "
+                           "delete %s and re-run" % (stream_sha, base, expected, tmp))
+    try:
+        _run(["sync"])
+    except Exception as e:
+        log("  (sync skipped: %s)" % e)
+
+    log("Verifying raw boot signatures...")
+    ok = verify_raw_sigs(disk, dd, log)
+    log("DONE - raw image bootable OK" if ok else "DONE but signature check FAILED")
+    if verify and reader.count and reader.count % SECTOR == 0:
+        log("Verifying full image (sha256 read-back of the device region)...")
+        dev = disk["dev"] if dd else disk["physdrive"]
+        back = sha256_device_region(dev, 0, reader.count, dd)
+        if back == stream_sha:
+            log("  FULL VERIFY: OK - every byte on the device matches the stream (sha256)")
+            for s in srcs:                      # only drop the cache once proven
+                try:
+                    os.remove(s)
+                except OSError as e:
+                    log("  (part cleanup skipped: %s)" % e)
+        else:
+            log("  FULL VERIFY: MISMATCH - device %s vs stream %s; re-flash" % (back, stream_sha))
+            ok = False
+    log("No HARTSTATE/HARTLOG carve for the raw image: the root filesystem is "
+        "WRITABLE, so wifi/theme/home persist natively and the journal is "
+        "persistent on disk - the carve lineage exists only for the live ISO.")
+    return ok
+
+
 # ───────────────────────── orchestration ─────────────────────────
 def flash(tag, variant, disk, mode, tmp, progress=None, log=None,
           make_log_partition=False, start_part=0, verify=True, jobs=1,
@@ -1692,14 +1909,35 @@ def cmd_flash(args):
     log_path = args.log or os.path.join(args.tmp, "hart_flash.log")
     console = (lambda m: None) if args.quiet else (lambda m: print(m, flush=True))
     log = _tee_logger(log_path, console)
-    log("=== flash %s (%s) -> disk #%s %s mode=%s [%s] ==="
-        % (tag, args.variant, disk["number"], disk["model"], args.mode,
+    log("=== flash %s (%s/%s) -> disk #%s %s mode=%s [%s] ==="
+        % (tag, args.variant, args.image, disk["number"], disk["model"], args.mode,
            warn or "removable/blank"))
+    # The raw image has no per-part device offsets (they live in compressed
+    # space) and no carve story (its root is WRITABLE -- state persists
+    # natively). Reject the ISO-only flags loudly instead of half-honoring them.
+    if args.image == "raw":
+        blocked = [f for f, on in (("--start-part", args.start_part > 0),
+                                   ("--state-partition", args.state_partition),
+                                   ("--windows-log-partition", args.windows_log_partition)) if on]
+        if blocked:
+            sys.stderr.write("%s do(es) not apply to --image raw: the raw image "
+                             "streams sequentially (no part offsets to resume) and "
+                             "its root is WRITABLE (state persists natively - no "
+                             "HARTSTATE/HARTLOG carve exists or is needed).\n"
+                             % ", ".join(blocked))
+            return 2
+        if args.mode == "stream" or args.jobs > 1:
+            log("note: --image raw always downloads then streams the single xz "
+                "sequentially; --mode/--jobs are ignored")
     try:
-        ok = flash(tag, args.variant, disk, args.mode, args.tmp, log=log,
-                   make_log_partition=args.windows_log_partition,
-                   make_state_partition=args.state_partition,
-                   start_part=args.start_part, verify=args.verify, jobs=args.jobs)
+        if args.image == "raw":
+            ok = flash_raw(tag, args.variant, disk, args.tmp, log=log,
+                           verify=args.verify)
+        else:
+            ok = flash(tag, args.variant, disk, args.mode, args.tmp, log=log,
+                       make_log_partition=args.windows_log_partition,
+                       make_state_partition=args.state_partition,
+                       start_part=args.start_part, verify=args.verify, jobs=args.jobs)
     except Exception as e:
         log("FLASH FAILED: %s" % e)
         sys.stderr.write("FLASH FAILED: %s\n  (debug log: %s)\n" % (e, log_path))
@@ -1715,6 +1953,12 @@ def build_parser():
     p.add_argument("--list", action="store_true", help="list candidate disks and exit")
     p.add_argument("--tag", help="release tag (default: latest nightly-*)")
     p.add_argument("--variant", default="desktop", choices=["desktop", "server", "edge"])
+    p.add_argument("--image", default="iso", choices=["iso", "raw"],
+                   help="iso (default): the live/rescue medium (read-only root, "
+                        "stateless). raw: the INSTALLED system image (writable "
+                        "root; wifi/theme/home persist natively, first boot grows "
+                        "the root to fill the stick; UEFI boot). raw ships from "
+                        "2026-07-16 nightlies onward.")
     p.add_argument("--device", help="disk number/name from --list")
     p.add_argument("--mode", default="stream", choices=["download", "stream"],
                    help="stream (default, ~40%% faster: overlaps download+write) "

@@ -183,10 +183,16 @@ jobs:
     # 15 min so bumping the shared cap doesn't waste any runner time
     # on the fast variants.
     timeout-minutes: 180
+    # raw-desktop (the INSTALLED writable-root image, 2026-07-16) must NEVER
+    # block the nightly: publish-nightly `needs: build-iso`, and a failed matrix
+    # leg fails the whole job for `needs` purposes. Per-leg continue-on-error
+    # keeps a red raw build from holding back the ISO nightlies while the raw
+    # pipeline matures.
+    continue-on-error: ${{ matrix.target == 'raw-desktop' }}
     strategy:
       fail-fast: false
       matrix:
-        target: [iso-server, iso-desktop, iso-edge]
+        target: [iso-server, iso-desktop, iso-edge, raw-desktop]
     steps:
       - uses: actions/checkout@v4
 
@@ -270,7 +276,9 @@ jobs:
       # even pull hart.comp) still runs. The Nix Build Matrix job is the hard gate
       # that red-fails a broken hart-comp; this is purely a store-warming optimiser.
       - name: Warm Rust closure (hart-rust-precedent, hart-comp) at full cores
-        if: matrix.target == 'iso-desktop'
+        # raw-desktop folds the SAME desktop closure (hart-comp included), so it
+        # needs the same warm-up to dodge the throttled-cores Rust build hang.
+        if: matrix.target == 'iso-desktop' || matrix.target == 'raw-desktop'
         working-directory: nixos
         shell: bash
         run: |
@@ -355,6 +363,35 @@ jobs:
           if [[ -z "${FILE:-}" ]] || [[ ! -f "$FILE" ]]; then
             echo "ERROR: No .iso/.qcow2/.raw/.img found in $BUILD_PATH"
             exit 1
+          fi
+
+          # ── raw-* targets: name, checksum, compress (2026-07-16) ─────────
+          # nixos-generators emits a bare `nixos.img` (same name for every
+          # variant), and a ~20 GB raw disk image is unshippable uncompressed.
+          # (a) derive the versioned name from the SAME config.hart.version the
+          #     ISO branding uses (no second version source);
+          # (b) sha256 the UNCOMPRESSED raw under the FINAL name — the flasher
+          #     verifies the decompressed device bytes against this;
+          # (c) xz -T0 -1 (fast, ~2.5x on a nix store) so the shipped parts are
+          #     ISO-sized; the generic split/sha/torrent flow below then treats
+          #     the .raw.xz exactly like an ISO (its own .sha256 for reassembly,
+          #     .part-NN + reassemble.sh companions the publish guard expects);
+          # (d) delete the 20 GB store image before splitting — the runner disk
+          #     can't hold closure + raw + xz + parts at once.
+          if [[ "${{ matrix.target }}" == raw-* ]]; then
+            VARIANT="${{ matrix.target }}"; VARIANT="${VARIANT#raw-}"
+            VER=$(cd "${GITHUB_WORKSPACE}/nixos" && nix eval --raw ".#nixosConfigurations.hart-${VARIANT}.config.hart.version")
+            RAWNAME="hart-os-${VER}-${VARIANT}-x86_64-linux.raw"
+            mkdir -p /tmp/release-artifacts
+            RAW_SHA=$(sha256sum "$FILE" | cut -d' ' -f1)
+            echo "${RAW_SHA}  ${RAWNAME}" > "/tmp/release-artifacts/${RAWNAME}.sha256"
+            echo "raw image: $(du -h "$FILE" | cut -f1), sha256=${RAW_SHA} — compressing"
+            xz -T0 -1 -c "$FILE" > "/tmp/${RAWNAME}.xz"
+            echo "compressed: $(du -h "/tmp/${RAWNAME}.xz" | cut -f1)"
+            sudo nix store delete "$BUILD_PATH" 2>/dev/null \
+              || echo "::warning::nix store delete failed — disk stays tighter for the split"
+            FILE="/tmp/${RAWNAME}.xz"
+            df -h / | tail -1
           fi
 
           BASENAME=$(basename "$FILE")
@@ -621,6 +658,17 @@ jobs:
         with:
           path: /tmp/all-artifacts
           pattern: iso-*
+          merge-multiple: true
+
+      # Best-effort: the raw-desktop leg is continue-on-error (it must never
+      # block the ISO nightly), so its artifact may not exist. This download
+      # mirrors that — a miss is a warning, not a failed publish.
+      - name: Download raw image artifacts (best-effort)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/all-artifacts
+          pattern: raw-*
           merge-multiple: true
 
       - name: Download hevolve-install binaries

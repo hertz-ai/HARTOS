@@ -344,6 +344,143 @@ def test_list_parts_excludes_raw_image_assets_from_iso_flow(monkeypatch):
         "raw flow must pick ONLY .raw.xz parts"
 
 
+# ─────────── raw image (the INSTALLED system) ───────────
+# The raw path streams ONE xz (CI's `xz -T0` emits a single multi-block stream;
+# split(1) only slices bytes) through decompression straight onto the device.
+# These drive the REAL reader/orchestration with real lzma and a fake device.
+
+def _mk_raw_image(size=1024 * 1024):
+    """Deterministic pseudo-random image with the raw boot contract baked in:
+    protective-MBR 0x55AA at 0x1FE + the GPT 'EFI PART' magic at LBA 1."""
+    import hashlib as _h
+    blocks, seed = [], b"hart-raw-test-seed"
+    while sum(len(b) for b in blocks) < size:
+        seed = _h.sha512(seed).digest()
+        blocks.append(seed)
+    data = bytearray(b"".join(blocks)[:size])
+    data[0x1FE:0x200] = b"\x55\xAA"
+    data[512:520] = b"EFI PART"
+    return bytes(data)
+
+
+def _mk_xz_parts(tmp_path, data, n_parts=3, base="hart-os-1.0.0-desktop-x86_64-linux.raw"):
+    import lzma as _lzma
+    comp = _lzma.compress(data, format=_lzma.FORMAT_XZ)
+    step = (len(comp) + n_parts - 1) // n_parts
+    paths = []
+    for i in range(n_parts):
+        p = tmp_path / ("%s.xz.part-%02d" % (base, i))
+        p.write_bytes(comp[i * step:(i + 1) * step])
+        paths.append(str(p))
+    return paths
+
+
+def test_xz_parts_reader_reconstructs_image_exactly(tmp_path):
+    """read(n) must be EXACT-FILL: both device writers pad a short buffer to the
+    sector boundary, so a short mid-stream read would inject zeros INTO the
+    image. Reconstruct through an odd read size and prove byte equality + the
+    tracked hash/count."""
+    import hashlib as _h
+    data = _mk_raw_image()
+    paths = _mk_xz_parts(tmp_path, data)
+    r = flasher._XZPartsReader(paths, lambda m: None)
+    out, reads = b"", []
+    while True:
+        b = r.read(777_777)                    # odd size -> exact-fill is visible
+        out += b
+        reads.append(len(b))
+        if len(b) < 777_777:
+            break
+    r.close()
+    assert out == data, "decompressed stream must equal the original image"
+    assert all(n == 777_777 for n in reads[:-1]), \
+        "every read but the last must be EXACT-FILL (short mid-stream read pads zeros into the image)"
+    assert r.count == len(data)
+    assert r.hexdigest() == _h.sha256(data).hexdigest()
+
+
+def test_xz_parts_reader_rejects_trailing_garbage(tmp_path):
+    """Non-zero bytes after the xz stream mean the part sequence is wrong (a
+    foreign file slipped in) -- the reader must corrupt LOUDLY, never hand the
+    garbage onward to the device."""
+    data = _mk_raw_image(64 * 1024)
+    paths = _mk_xz_parts(tmp_path, data, n_parts=2)
+    with open(paths[-1], "ab") as f:
+        f.write(b"GARBAGE-AFTER-STREAM")
+    r = flasher._XZPartsReader(paths, lambda m: None)
+    with pytest.raises(RuntimeError, match="trailing data"):
+        while r.read(flasher.CHUNK):
+            pass
+
+
+def _wire_fake_raw_release(monkeypatch, tmp_path, data, sha_line):
+    """Wire flash_raw's collaborators to a fake release + fake device: real
+    reader, real verify_raw_sigs logic, device = an in-memory buffer."""
+    import hashlib as _h
+    base = "hart-os-1.0.0-desktop-x86_64-linux.raw"
+    paths = _mk_xz_parts(tmp_path, data, base=base)
+    parts = [{"name": os.path.basename(p), "id": i + 1,
+              "size": os.path.getsize(p), "state": "uploaded"}
+             for i, p in enumerate(paths)]
+    dev = {}
+    monkeypatch.setattr(flasher, "find_gh", lambda: "gh")
+    monkeypatch.setattr(flasher, "find_dd", lambda: None)
+    monkeypatch.setattr(flasher, "IS_WIN", False)
+    monkeypatch.setattr(flasher, "list_parts", lambda gh, tag, variant, image="iso": parts)
+    monkeypatch.setattr(flasher, "download_part",
+                        lambda gh, tag, name, tmp, size, log: str(tmp_path / name))
+    monkeypatch.setattr(flasher, "fetch_release_asset_text",
+                        lambda gh, tag, name, tmp, log: sha_line)
+    monkeypatch.setattr(flasher, "_run", lambda cmd, **kw: _CP(""))
+
+    def fake_py_write(devpath, off, fobj, log):
+        buf = bytearray()
+        while True:
+            b = fobj.read(flasher.CHUNK)
+            if not b:
+                break
+            buf += b
+        dev["bytes"] = bytes(buf)
+        return len(buf)
+    monkeypatch.setattr(flasher, "_py_write", fake_py_write)
+    monkeypatch.setattr(flasher, "read_at",
+                        lambda d, off, n, dd: dev.get("bytes", b"")[off:off + n])
+    monkeypatch.setattr(flasher, "sha256_device_region",
+                        lambda d, off, size, dd, chunk=0:
+                        _h.sha256(dev.get("bytes", b"")[off:off + size]).hexdigest())
+    return dev
+
+
+def test_flash_raw_writes_verifies_and_passes(monkeypatch, tmp_path):
+    """End to end on a fake device: the image lands byte-identical from offset 0,
+    the boot contract (55AA + EFI PART) checks out via the REAL verify_raw_sigs,
+    and the stream hash matches the published companion."""
+    import hashlib as _h
+    data = _mk_raw_image()
+    sha = _h.sha256(data).hexdigest()
+    dev = _wire_fake_raw_release(monkeypatch, tmp_path, data,
+                                 "%s  hart-os-1.0.0-desktop-x86_64-linux.raw\n" % sha)
+    disk = {"number": 9, "model": "FakeStick", "dev": None,
+            "physdrive": "/dev/fake9", "size": len(data) * 4}
+    ok = flasher.flash_raw("nightly-x", "desktop", disk, str(tmp_path),
+                           log=lambda m: None)
+    assert ok is True
+    assert dev["bytes"] == data, "device must hold the exact decompressed image from byte 0"
+
+
+def test_flash_raw_rejects_companion_sha_mismatch(monkeypatch, tmp_path):
+    """A corrupt download must FAIL LOUDLY against the published .raw.sha256 --
+    never report a bootable flash from bytes that don't match the source."""
+    data = _mk_raw_image(256 * 1024)
+    _wire_fake_raw_release(monkeypatch, tmp_path, data,
+                           "0" * 64 + "  hart-os-1.0.0-desktop-x86_64-linux.raw\n")
+    disk = {"number": 9, "model": "FakeStick", "dev": None,
+            "physdrive": "/dev/fake9", "size": len(data) * 4}
+    with pytest.raises(RuntimeError, match="does not match the published"):
+        flasher.flash_raw("nightly-x", "desktop", disk, str(tmp_path),
+                          log=lambda m: None)
+
+
 # ─────────── HARTLOG diagnostic-log partition (Part B) ───────────
 # The Windows diskpart carve of the HARTLOG partition is now OPT-IN (DEFAULT OFF):
 # the Live OS creates it itself on first boot (Linux-side, safe). The Windows
