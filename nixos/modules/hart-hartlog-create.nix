@@ -72,6 +72,16 @@ let
   # always agree; an operator overriding one must override both.
   label = hlog.label;
 
+  # The DEDICATED journal-export target label (HARTJRNL). Imported from the
+  # journal-export module so it can never drift -- the SAME single-source-of-truth
+  # discipline hart-journal-export.nix already applies in REVERSE (it imports
+  # config.hart.bootLog.label so its never-clobber-the-boot-stick exclusion cannot
+  # drift from the writer). That coordination only existed one way: journal-export
+  # knew about HARTLOG, but the HARTLOG carve knew nothing about HARTJRNL, so it
+  # carved a SECOND journal sink even when one already existed. `or ""` keeps this
+  # a clean no-op if the journal-export module is not imported at all.
+  jrnlLabel = config.hart.journalExport.dedicatedLabel or "";
+
   # Minimal-PATH discipline (the iso_real_usb_boot lesson: awk/lspci/xxd/curl were
   # OFF the minimal unit PATH). Every tool the script uses by name is here.
   #   gptfdisk  -> sgdisk (GPT partition add, by largest free block)
@@ -88,6 +98,7 @@ let
     export PATH=${binPath}''${PATH:+:$PATH}
 
     LABEL="${label}"
+    JRNL_LABEL="${jrnlLabel}"
     # LOUD decision marker (the never-silent-no-op contract). A tmpfs file the
     # operator/host can read to see EXACTLY which disk was picked, the free space
     # found, and WHY a no-op happened — so a silent no-op is never undebuggable
@@ -130,6 +141,22 @@ let
     # on the first and exits cleanly. blkid -L resolves by filesystem label.
     if blkid -L "$LABEL" >/dev/null 2>&1; then
       decide NOOP "a '$LABEL' partition already exists (idempotent)"
+      exit 0
+    fi
+
+    # ── 1b. A dedicated journal-export target already present? Then DO NOT carve. ──
+    # If a partition labelled $JRNL_LABEL (HARTJRNL) exists, the boot journal ALREADY
+    # has a sink: hart-journal-export.nix dumps the FULL journal there (early, before
+    # any graphical target, and it keeps dumping even when the shell wedges -- the
+    # exact failure HARTLOG exists to debug). Carving a SECOND sink into the boot
+    # stick would be redundant work AND an avoidable partition op on the medium we
+    # just flashed -- and a partition op on the boot stick is precisely what this
+    # module was created to move OFF the Windows host because it "risks bricking the
+    # very stick we just flashed". One journal sink is enough; prefer the one that
+    # already exists over cutting a new one.
+    # (Steward, 2026-07-16: "when it sees HARTJRNL it shd not create or carve one".)
+    if [ -n "$JRNL_LABEL" ] && blkid -L "$JRNL_LABEL" >/dev/null 2>&1; then
+      decide NOOP "a '$JRNL_LABEL' journal-export target already exists - the boot journal already has a sink, no carve needed"
       exit 0
     fi
 

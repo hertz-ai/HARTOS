@@ -122,6 +122,36 @@ in
           assert "already exists" in out2 or "idempotent" in out2, \
               f"second run must be an idempotent no-op, got: {out2!r}"
 
+      # ── 5b. An existing HARTJRNL journal-export target -> the carve is SKIPPED ──
+      # (Steward, 2026-07-16: "when it sees HARTJRNL it shd not create or carve one".)
+      # If a dedicated journal sink already exists, the boot journal is ALREADY
+      # covered (hart-journal-export dumps the full journal there and keeps dumping
+      # even when the shell wedges), so carving a SECOND sink into the boot stick is
+      # redundant work AND an avoidable partition op on the medium we just flashed.
+      # DECISIVE: we DELETE the HARTLOG partition first so the trailing free space
+      # RETURNS -- without guard 1b the script would happily carve again, and guard 1
+      # (already-exists) / guard 3 (no-free-space) cannot mask the verdict.
+      with subtest("an existing HARTJRNL target makes the carve a clean no-op"):
+          hc.succeed(f"sgdisk --delete=2 {disk}")
+          hc.succeed(f"partx -u {disk} || udevadm settle || true")
+          hc.fail("blkid -L HARTLOG")
+
+          # Stand up the dedicated journal sink (the opt-in "no spare USB stick" path).
+          hc.succeed("truncate -s 24M /tmp/jrnl.img")
+          hc.succeed("mkfs.vfat -n HARTJRNL /tmp/jrnl.img")
+          hc.succeed("losetup -f /tmp/jrnl.img")
+          hc.succeed("udevadm settle || true")
+          hc.succeed("blkid -L HARTJRNL")
+
+          out_j = hc.succeed(f"HART_HARTLOG_TEST_DISK={disk} hart-hartlog-create 2>&1; echo RC=$?")
+          assert "RC=0" in out_j, f"the HARTJRNL no-op must exit 0, got: {out_j!r}"
+          assert "HARTJRNL" in out_j, f"the no-op must NAME the HARTJRNL sink, got: {out_j!r}"
+          # The decisive assertion: free space WAS available, yet no second sink appeared.
+          hc.fail("blkid -L HARTLOG")
+          status_j = hc.succeed("cat /run/hart/hartlog-create.status")
+          assert "DECISION=NOOP" in status_j, \
+              f"the skip must be recorded LOUDLY as a NOOP verdict, got: {status_j!r}"
+
       # ── 6. A FULL disk (no trailing free space) is a clean no-op ──
       # Wipe the stand-in + fill it with a single partition that consumes ALL the
       # usable space, then DELETE the HARTLOG label-resolution so the idempotent
