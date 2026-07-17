@@ -6687,7 +6687,9 @@ function renderAgentOverlay(ev) {{
                 result = ThemeService.apply_theme(theme_id)
                 if 'error' in result:
                     return jsonify(result), 404
-                return jsonify({'status': 'updated', 'theme': result.get('id')})
+                # apply_theme returns 'theme_id' (never 'id') -- .get('id') made this
+                # reply permanently {'theme': None} (deployed-surface suite wart #1).
+                return jsonify({'status': 'updated', 'theme': result.get('theme_id')})
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
 
@@ -7159,7 +7161,12 @@ function renderAgentOverlay(ev) {{
             volume = data.get('volume')
             if not source_id or volume is None:
                 return jsonify({'success': False, 'error': 'source_id and volume required'}), 400
-            volume = max(0, min(150, int(volume)))
+            try:
+                volume = max(0, min(150, int(volume)))
+            except (TypeError, ValueError):
+                # non-numeric volume crashed 500 pre-guard (deployed-surface
+                # suite finding); the sink-volume twin already coerces -- match it.
+                return jsonify({'success': False, 'error': 'volume must be a number'}), 400
             try:
                 r = subprocess.run(
                     ['pactl', 'set-source-volume', source_id, f'{volume}%'],
@@ -7366,7 +7373,10 @@ function renderAgentOverlay(ev) {{
             brightness = data.get('brightness')
             if not output or brightness is None:
                 return jsonify({'success': False, 'error': 'output and brightness required'}), 400
-            brightness = max(0.1, min(1.0, float(brightness)))
+            try:
+                brightness = max(0.1, min(1.0, float(brightness)))
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'brightness must be a number'}), 400
             try:
                 r = subprocess.run(
                     ['xrandr', '--output', output, '--brightness', str(brightness)],

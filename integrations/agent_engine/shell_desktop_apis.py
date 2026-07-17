@@ -973,11 +973,17 @@ def register_shell_desktop_routes(app):
 
     @app.route('/api/shell/wallpaper', methods=['GET'])
     def shell_wallpaper():
-        cfg = _load_json(_WALL_CFG, {
+        # Merge defaults PER-KEY: _load_json's default is whole-file, so a
+        # partial cfg (e.g. only {'slideshow':...} written by the slideshow
+        # route) used to drop 'current'/'mode' from the reply entirely
+        # (deployed-surface suite wart #2).
+        defaults = {
             'current': '', 'lock_screen': '',
             'mode': 'fill',
             'slideshow': {'enabled': False, 'interval_minutes': 30, 'directory': ''},
-        })
+        }
+        cfg = dict(defaults)
+        cfg.update(_load_json(_WALL_CFG, {}))
         return jsonify(cfg)
 
     @app.route('/api/shell/wallpaper/collection', methods=['GET'])
@@ -1183,8 +1189,11 @@ def register_shell_desktop_routes(app):
                 subprocess.Popen([tool, '-O', str(temp)],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return jsonify({'enabled': True, 'active': True, 'temperature': temp})
+            # 503: no gamma tool on this build = the nightlight SERVICE is
+            # unavailable (controlled; the config change above still persisted),
+            # not a server crash. Found by the deployed-surface suite.
             return jsonify({'enabled': True, 'active': False,
-                            'error': 'Neither gammastep nor redshift available'}), 500
+                            'error': 'Neither gammastep nor redshift available'}), 503
         for proc in ('gammastep', 'redshift'):
             _run(['pkill', '-x', proc])
         return jsonify({'enabled': False, 'active': False})
@@ -1321,7 +1330,9 @@ def register_shell_desktop_routes(app):
             ws_name = name or str(int(time.time()) % 100)
             _run(['swaymsg', f'workspace {ws_name}'])
             return jsonify({'created': True, 'name': ws_name})
-        return jsonify({'created': False, 'error': f'{comp}: workspace creation not supported'}), 500
+        # 501: this compositor has no create verb -- an honest not-implemented,
+        # mirroring the sibling switch handler's explicit NEVER-500 contract.
+        return jsonify({'created': False, 'error': f'{comp}: workspace creation not supported'}), 501
 
     @app.route('/api/shell/workspaces/switch', methods=['POST'])
     def shell_workspaces_switch():

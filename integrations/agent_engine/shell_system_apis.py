@@ -30,6 +30,18 @@ def _run(cmd, timeout=10, **kw):
         return None
 
 
+def _first_int(r, default=0):
+    """First stdout token of a _run result as int, else default. The bare
+    `int(r.stdout.split()[0])` idiom crashed 500 (IndexError) whenever a tool
+    exited 0 with EMPTY stdout (du on a vanished path, minimal builds) -- found
+    by the deployed-surface suite. Empty/malformed output is an expected
+    degrade, so default quietly; the caller's rc-check already gates rc!=0."""
+    try:
+        return int(r.stdout.split()[0])
+    except (AttributeError, IndexError, ValueError, TypeError):
+        return default
+
+
 def _run_async_bounded(cmd, run_timeout=20, wait=6, name='hart-shell-op', **kw):
     """Run a blocking subprocess on a daemon worker, waiting at most ``wait``
     seconds for it on the CALLER.
@@ -634,7 +646,7 @@ def register_shell_system_routes(app):
                 try:
                     if entry.is_dir(follow_symlinks=False):
                         r = _run(['du', '-sm', entry.path], timeout=5)
-                        size_mb = int(r.stdout.split()[0]) if r and r.returncode == 0 else 0
+                        size_mb = _first_int(r) if r and r.returncode == 0 else 0
                     else:
                         size_mb = round(entry.stat().st_size / 1048576, 1)
                     children.append({
@@ -662,7 +674,7 @@ def register_shell_system_routes(app):
         ]:
             if os.path.isdir(path):
                 r = _run(['du', '-sm', path], timeout=10)
-                size = int(r.stdout.split()[0]) if r and r.returncode == 0 else 0
+                size = _first_int(r) if r and r.returncode == 0 else 0
                 reclaimable.append({
                     'category': cat, 'path': path,
                     'size_mb': size, 'description': desc,
@@ -690,19 +702,19 @@ def register_shell_system_routes(app):
             if cat == 'cache':
                 cache_dir = os.path.join(home, '.cache')
                 r = _run(['du', '-sm', cache_dir], timeout=5)
-                size = int(r.stdout.split()[0]) if r and r.returncode == 0 else 0
+                size = _first_int(r) if r and r.returncode == 0 else 0
                 _run(['find', cache_dir, '-type', 'f', '-atime', '+7', '-delete'], timeout=30)
                 freed['cache'] = size
             elif cat == 'temp':
                 r = _run(['du', '-sm', '/tmp'], timeout=5)
-                size = int(r.stdout.split()[0]) if r and r.returncode == 0 else 0
+                size = _first_int(r) if r and r.returncode == 0 else 0
                 _run(['find', '/tmp', '-user', os.environ.get('USER', 'hart'),
                       '-type', 'f', '-mtime', '+1', '-delete'], timeout=30)
                 freed['temp'] = size
             elif cat == 'trash':
                 trash = os.path.join(home, '.local/share/Trash')
                 r = _run(['du', '-sm', trash], timeout=5)
-                size = int(r.stdout.split()[0]) if r and r.returncode == 0 else 0
+                size = _first_int(r) if r and r.returncode == 0 else 0
                 _run(['gio', 'trash', '--empty'], timeout=15)
                 freed['trash'] = size
             elif cat == 'nix_old':
@@ -944,7 +956,9 @@ def register_shell_system_routes(app):
             _audit_system_op('memory_drop_caches', {})
             return jsonify({'ok': True})
         except (FileNotFoundError, PermissionError, OSError) as e:
-            return jsonify({'ok': False, 'error': str(e)}), 500
+            # 503: /proc/sys/vm is a Linux facility; absent/denied = unavailable,
+            # a controlled degrade -- not a crash.
+            return jsonify({'ok': False, 'error': str(e)}), 503
 
     # ─── 12. Startup Apps Manager ──────────────────────────
 
@@ -1605,8 +1619,11 @@ Hidden=false
                    '-y', out_path], timeout=10)
         if r and r.returncode == 0 and os.path.isfile(out_path):
             return jsonify({'status': 'ok', 'path': out_path})
+        # 503, not 500: a missing/failed capture tool is an UNAVAILABLE peripheral
+        # (a controlled degrade the shell shows), never a server crash. Found by
+        # the deployed-surface suite (500 = unhandled-crash class there).
         return jsonify({'status': 'error',
-                       'error': r.stderr if r else 'ffmpeg not available'}), 500
+                       'error': r.stderr if r else 'ffmpeg not available'}), 503
 
     # ─── 17. Scanner ──────────────────────────────────────────
 
@@ -1633,7 +1650,7 @@ Hidden=false
         if r and r.returncode == 0 and os.path.isfile(out_path):
             return jsonify({'status': 'ok', 'path': out_path})
         return jsonify({'status': 'error',
-                       'error': r.stderr if r else 'scanimage not available'}), 500
+                       'error': r.stderr if r else 'scanimage not available'}), 503
 
     # ─── 18. Battery / Power Monitoring ──────────────────────
 
