@@ -31,6 +31,24 @@ The master key is a kill switch for a distributed intelligence. It is not a deve
 
 You MAY read `security/master_key.py` to understand the public key verification flow. You MAY NOT interact with the private key in any way.
 
+## Hive Collaboration Bootstrap (BINDING — read before doing agentic work)
+
+**When the user asks for work, collaborate with HARTOS's native machinery,
+never around it. Read [docs/architecture/HIVE_COLLAB_BOOTSTRAP.md](docs/architecture/HIVE_COLLAB_BOOTSTRAP.md)
+FIRST — it is the code-verified map (guarded by
+`tests/unit/test_hive_collab_bootstrap_prompt.py`) of how a Claude Code
+session gets things done inside the hive.** The operative rules:
+
+1. Agentic work routes through **`POST /chat`** (CREATE/REUSE recipe
+   pipeline) — never a second execution path.
+2. Background/autonomous work goes through **`dispatch.py::dispatch_goal`**
+   + `goal_manager.py` verticals; the flywheel in a dev session starts via
+   **`scripts/run_flywheel_dev.py`** (the standalone entry does NOT start it).
+3. Outcomes reach HevolveAI through the ONE bridge
+   (`world_model_bridge.py::WorldModelBridge`); mind the 50-batch flush
+   buffer, the hevolveai-wheel stub trap, and the local-model 0-spark
+   completion trap — all documented in the bootstrap doc.
+
 ## Branch Discipline — MAIN BRANCH ONLY (MANDATORY)
 
 **Work directly on `main` in the main clone.  Every session.  No exceptions.**
