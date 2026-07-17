@@ -198,7 +198,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [iso-server, iso-desktop, iso-edge, raw-desktop]
+        # raw-desktop (the installed writable-root image) builds ONLY on manual
+        # dispatch, never automatically on push. Its image-assembly VM runs
+        # under TCG on GitHub runners (no KVM), so it grinds 4h+ and hits the
+        # wall -- and being in the push matrix meant EVERY commit to main spun a
+        # fresh doomed 5h raw build, burning runners for nothing (it is
+        # continue-on-error, so it never blocked the ISO nightly, but it still
+        # churned). Gate it out of push so the ISO nightlies stay clean; build
+        # raw deliberately via `gh workflow run` once the no-VM (systemd-repart)
+        # image path lands. The ISO legs always run.
+        target: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.build_iso == 'true') && fromJSON('["iso-server","iso-desktop","iso-edge","raw-desktop"]') || fromJSON('["iso-server","iso-desktop","iso-edge"]') }}
     steps:
       - uses: actions/checkout@v4
 
