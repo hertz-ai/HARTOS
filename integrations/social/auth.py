@@ -352,6 +352,33 @@ def require_auth(f):
     """
     @wraps(f)
     def decorated(*args, **kwargs):
+        # DEV bypass: skip auth entirely when HEVOLVE_DEV_NO_AUTH=true
+        if os.environ.get('HEVOLVE_DEV_NO_AUTH', '').lower() == 'true':
+            from .models import get_db, User
+            db = get_db()
+            user = db.query(User).first()
+            if not user:
+                user = User(id=1, username='dev', email='dev@local')
+                db.add(user)
+                db.flush()
+            g.user = user
+            g.user_id = str(user.id)
+            g.db = db
+            g.token_scope = 'dev'
+            g.token_node_id = ''
+            g.token_tenant_id = None
+            g.feature_flags = {}
+            try:
+                result = f(*args, **kwargs)
+                db.commit()
+                return result
+            except Exception:
+                if db.is_active:
+                    db.rollback()
+                raise
+            finally:
+                db.close()
+
         auth_header = request.headers.get('Authorization', '')
         # 2026-06-20: when Kong strips the upstream Authorization header
         # after its own pre-auth, HARTOS sees no Bearer but still gets
