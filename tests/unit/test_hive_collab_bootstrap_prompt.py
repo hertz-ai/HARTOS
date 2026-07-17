@@ -115,6 +115,30 @@ def test_cluster_gaps_the_prompt_documents_still_hold():
         'distributed dispatch surface renamed -- update the prompt'
 
 
+def test_cluster_recipe_reuse_over_a2a_matches_prompt():
+    """The prompt's POSITIVE claim (flipped 2026-07-17 from 'NEVER as
+    coded'): cross-node recipe REUSE works over the A2A surface. The
+    outbound client exists with the exact surface the doc names, the
+    daemon wires it before the CREATE-vs-REUSE split, and banking rides
+    the ONE recipe_sync envelope writer."""
+    p = _mod('integrations.google_a2a.peer_reuse')
+    for fn in ('discover_peer_agent', 'pull_recipe', 'invoke_peer_agent',
+               'try_peer_recipe_reuse', 'build_agent_directory',
+               'export_allowed', 'peer_reuse_enabled'):
+        assert callable(getattr(p, fn)), \
+            'peer_reuse surface drifted from the prompt: ' + fn
+    assert p.PEER_REUSE_ENV == 'HEVOLVE_A2A_PEER_REUSE', \
+        'the gate knob the prompt documents was renamed -- update the prompt'
+    a = _mod('integrations.agent_engine.agent_daemon')
+    assert callable(getattr(a, '_try_peer_recipe_reuse')), \
+        'daemon peer-reuse hook gone -- update the cluster section'
+    rs = _mod('core.recipe_sync')
+    assert callable(getattr(rs, 'write_envelope_files')), \
+        'the ONE envelope writer moved -- update the prompt'
+    assert callable(getattr(rs, 'envelope_checksum')), \
+        'peer pull integrity helper moved -- update the prompt'
+
+
 def test_standalone_entry_gap_still_holds():
     """The prompt's 'know who starts the daemon' claim: init_agent_engine must
     NOT be called from hart_intelligence_entry's own source (only Nunba

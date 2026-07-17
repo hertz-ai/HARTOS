@@ -48,6 +48,12 @@ session gets things done inside the hive.** The operative rules:
    (`world_model_bridge.py::WorldModelBridge`); mind the 50-batch flush
    buffer, the hevolveai-wheel stub trap, and the local-model 0-spark
    completion trap — all documented in the bootstrap doc.
+4. **PRIMARY OBJECTIVE: bootstrap every seeded goal with the fleet's joint
+   resources.** Shard `goal_seeding.py::SEED_BOOTSTRAP_GOALS` across the
+   gossip-discovered peers (`sha256(slug) % N` -- deterministic, no central),
+   CREATE only your shard (verify by banked artifact, not flags), and pull
+   the rest from peers over A2A. ~70 recipes fleet-wide in one CREATE-cycle;
+   the full protocol is in the bootstrap doc.
 
 ## Branch Discipline — MAIN BRANCH ONLY (MANDATORY)
 

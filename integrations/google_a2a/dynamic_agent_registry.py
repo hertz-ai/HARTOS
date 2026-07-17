@@ -49,7 +49,21 @@ class TrainedAgent:
 class DynamicAgentDiscovery:
     """Discovers trained agents from prompts directory"""
 
-    def __init__(self, prompts_dir: str = "prompts"):
+    def __init__(self, prompts_dir: Optional[str] = None):
+        if prompts_dir is None:
+            # Deployment-aware default: the SAME resolver recipe SAVE
+            # (helper.PROMPTS_DIR), REUSE read (cache_loaders), and the
+            # daemon classifier (agent_daemon._flow_recipe_exists) share,
+            # so the A2A surface advertises the recipes that actually
+            # exist in every deployment mode (bundled/Docker/dev).
+            try:
+                from core.platform_paths import get_recipe_prompts_dir
+                prompts_dir = get_recipe_prompts_dir()
+            except Exception as e:
+                logger.warning(
+                    f"DynamicAgentDiscovery: canonical prompts-dir resolver "
+                    f"unavailable ({e}); falling back to relative 'prompts'")
+                prompts_dir = "prompts"
         self.prompts_dir = prompts_dir
         self.discovered_agents: Dict[str, TrainedAgent] = {}
         self.prompt_definitions: Dict[int, Dict[str, Any]] = {}

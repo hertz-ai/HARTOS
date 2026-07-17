@@ -292,6 +292,74 @@ class A2AProtocolServer:
     def setup_routes(self):
         """Setup Flask routes for A2A protocol"""
 
+        @self.app.route('/a2a/agents', methods=['GET'])
+        def list_a2a_agents():
+            """Directory of this node's exportable trained agents.
+
+            Serves the same dynamic-registry data as the per-agent
+            cards, LIVE-rescanned (recipes banked after boot appear
+            without a restart) and joined with the local goal identity
+            (bootstrap_slug / goal_type / title) so peers can match
+            agents across the md5-local prompt_id boundary. Used by
+            peer_reuse.discover_peer_agent on other nodes.
+            """
+            try:
+                from .peer_reuse import build_agent_directory, \
+                    peer_reuse_enabled
+                if not peer_reuse_enabled():
+                    return jsonify({'agents': [], 'count': 0,
+                                    'disabled': True})
+                agents = build_agent_directory()
+            except Exception as e:
+                logger.warning(f'A2A agent directory failed: {e}')
+                return jsonify({'agents': [], 'count': 0,
+                                'error': str(e)}), 500
+            return jsonify({'agents': agents, 'count': len(agents)})
+
+        @self.app.route('/a2a/<agent_id>/recipe', methods=['GET'])
+        def export_agent_recipe(agent_id):
+            """Serve the recipe BUNDLE behind an advertised agent.
+
+            Mirrors the skill-packet export/pull pattern: the peer
+            pulls bytes and banks them locally so its own REUSE path
+            replays the proven recipe. Payload is the canonical
+            core.recipe_sync envelope (schema_version 1), built from
+            the live prompts dir. Fail-closed gates: feature knob +
+            export_allowed (goal-linked or broadcast_agent opt-in),
+            plus the same basename hardening the /prompts/sync routes
+            use (Flask permits '..' after URL-decode).
+            """
+            try:
+                from core.recipe_sync import build_envelope, _safe_filename
+                from core.platform_paths import get_recipe_prompts_dir
+                from .peer_reuse import export_allowed
+            except Exception as e:
+                logger.warning(f'A2A recipe export imports failed: {e}')
+                return jsonify({'error': 'recipe export unavailable'}), 503
+
+            # agent_id is {prompt_id}_{flow_id}; the bundle covers the
+            # whole prompt (all flows), which is what REUSE loads.
+            prompt_id = agent_id.rsplit('_', 1)[0] if '_' in agent_id \
+                else agent_id
+            if not _safe_filename(f'{prompt_id}.json'):
+                return jsonify({'error': 'unsafe agent_id'}), 400
+            if not export_allowed(prompt_id):
+                logger.info(f'A2A recipe export refused for '
+                            f'prompt_id={prompt_id} (not a hive goal '
+                            f'recipe / no broadcast opt-in / disabled)')
+                return jsonify({'error': 'recipe not exportable',
+                                'code': 'export_refused'}), 403
+            try:
+                envelope = build_envelope(
+                    get_recipe_prompts_dir(), prompt_id)
+            except Exception as e:
+                logger.warning(f'A2A recipe export build failed for '
+                               f'{prompt_id}: {e}')
+                return jsonify({'error': f'export failed: {e}'}), 500
+            if envelope is None:
+                return jsonify({'error': 'not_found'}), 404
+            return jsonify(envelope)
+
         @self.app.route('/a2a/<agent_id>/.well-known/agent.json', methods=['GET'])
         def get_agent_card(agent_id):
             """Agent Card discovery endpoint"""

@@ -54,6 +54,36 @@ def _flow_recipe_exists(prompt_id) -> bool:
         return False
 
 
+def _try_peer_recipe_reuse(goal, local_prompt_id, deadline):
+    """Bounded A2A peer-reuse attempt for a goal with no LOCAL recipe.
+
+    Maps the AgentGoal row to the cross-node identity dict and delegates
+    to the canonical outbound client (integrations.google_a2a.peer_reuse).
+    Returns 'pulled' (recipe banked locally, classify as REUSE),
+    'invoked' (executed remotely this tick, outcome recorded), or None
+    (fall through to CREATE exactly as before). Never raises: any
+    failure is logged and degrades to None so the tick cannot crash.
+    """
+    try:
+        from integrations.google_a2a.peer_reuse import try_peer_recipe_reuse
+        cfg = goal.config_json or {}
+        identity = {
+            'goal_id': str(goal.id),
+            'goal_slug': cfg.get('bootstrap_slug') or '',
+            'goal_type': goal.goal_type or '',
+            'goal_title': goal.title or '',
+            'goal_description': goal.description or '',
+            'owner_id': str(goal.owner_id or goal.created_by or ''),
+        }
+        return try_peer_recipe_reuse(
+            identity, local_prompt_id, deadline=deadline)
+    except Exception as e:
+        logger.info(
+            f"Peer-reuse attempt failed for goal "
+            f"{getattr(goal, 'id', '?')}: {e}")
+        return None
+
+
 def _get_blocked_hitl_tasks(ledger, goal_id):
     """Get tasks blocked with APPROVAL_REQUIRED under a goal."""
     try:
@@ -913,12 +943,40 @@ class AgentDaemon:
             from .dispatch import prompt_id_for_goal
             _create_queue = []
             _reuse_pool = []
+            # A2A peer-reuse leg: ONE shared monotonic deadline caps the
+            # whole peer sweep this tick (peer_leg_budget_s, default 10s),
+            # so a large CREATE backlog can never stall the tick on
+            # network I/O. Lazily armed on the first recipe-less goal.
+            _peer_deadline = None
             for goal in goals:
                 # Shared recipe-existence check (_flow_recipe_exists) — the
                 # SAME signal the completion gate uses, so classifier and
                 # gate can never drift apart.
-                if _flow_recipe_exists(prompt_id_for_goal(str(goal.id))):
+                _pid = prompt_id_for_goal(str(goal.id))
+                if _flow_recipe_exists(_pid):
                     _reuse_pool.append(goal)
+                    continue
+                # No LOCAL recipe: before falling into CREATE, ask the
+                # hive over the A2A surface. A peer that already banked
+                # this goal's recipe ships the bytes (pull -> local
+                # REUSE), or executes it remotely as a fallback. All
+                # failure modes degrade to CREATE exactly as before.
+                if _peer_deadline is None:
+                    try:
+                        from integrations.google_a2a.peer_reuse import (
+                            peer_leg_budget_s)
+                        _peer_deadline = time.monotonic() + peer_leg_budget_s()
+                    except Exception as e:
+                        logger.debug(f"peer_reuse budget unavailable: {e}")
+                        _peer_deadline = time.monotonic() + 10.0
+                _peer = _try_peer_recipe_reuse(goal, _pid, _peer_deadline)
+                if _peer == 'pulled':
+                    _reuse_pool.append(goal)
+                elif _peer == 'invoked':
+                    # Work happened remotely this tick; outcome already
+                    # recorded through the WorldModelBridge. Skip local
+                    # dispatch for this goal until the next tick.
+                    continue
                 else:
                     _create_queue.append(goal)
 

@@ -7,6 +7,54 @@ reinventing any of it. Every reference below is verified by
 `tests/unit/test_hive_collab_bootstrap_prompt.py`; if that test is green, this
 map matches the code.**
 
+## Operating protocol -- drive the work THROUGH HARTOS
+
+A Claude Code session in this repo is HARTOS's primary user and the
+intelligence driving its flywheel. When the user requests work that HARTOS
+can execute, do not only do it by hand: submit it through the CREATE pipeline
+(`POST /chat` with `create_agent: true`) so a recipe is banked, spark is
+charged, and the outcome feeds HevolveAI; replay it via REUSE thereafter.
+Hand-edit only what the pipeline itself cannot do (building or fixing the
+pipeline). Every task routed through `/chat` compounds the hive; every task
+done around it is a lost lesson. On a box without the full stack (no
+autogen or hevolveai wheel), state that plainly and fall back to direct
+work; never simulate a pipeline run.
+
+**PRIMARY OBJECTIVE: bootstrap every seeded goal, using the fleet's JOINT
+resources.** The `SEED_BOOTSTRAP_GOALS` in
+`integrations/agent_engine/goal_seeding.py` are the hive's curriculum (~70
+goals); left to one idle flywheel they cost days of 1-wide grind with a
+historically low completion rate, and left to N naive nodes they get CREATEd
+N times over. The fleet bootstrap protocol a session executes. The primitive is CODE:
+`peer_reuse.try_peer_recipe_reuse` (called by the daemon before every CREATE)
+discovers whether any admitted peer already has this goal's recipe and pulls
+it. The session layers a SHARD STRATEGY on top so N nodes divide the CREATE
+labour instead of racing it:
+
+1. **Partition, no coordinator needed (strategy):** take the guardrail-
+   admitted peer set from the gossip store (`peer_reuse.admitted_peers`),
+   sort node_ids, find this node's index k of N. Prioritise the seeds where
+   `sha256(bootstrap_slug) % N == k` -- your ~70/N shard (~3-4 on a 20-node
+   fleet). Nothing enforces this; it is how a cooperative session picks WHAT
+   to CREATE first so peers do not duplicate.
+2. **CREATE your shard:** for each owned seed without a banked recipe,
+   submit its prompt through the CREATE pipeline and verify the banked
+   artifact (`prompts/{prompt_id}_{flow_id}_recipe.json` + ledger entry),
+   never a completion flag (the 0-spark trap). Banking a recipe makes it
+   exportable to peers (opt-in via the goal's export flag / `export_allowed`).
+3. **Converge via agent-to-agent pull (the working primitive):** for seeds
+   OUTSIDE your shard, do not CREATE -- the daemon's pre-CREATE
+   `try_peer_recipe_reuse` (gated `HEVOLVE_A2A_PEER_REUSE`, default on)
+   already discovers the owning peer's trained agent over the A2A surface,
+   pulls the recipe, and banks it where the loader looks, so the next tick
+   REUSEs from disk. Re-check unfilled seeds each pass; CREATE a peer's seed
+   yourself only after a fleet pass leaves it orphaned (peer offline).
+
+Endgame: every node holds all ~70 recipes after roughly ONE CREATE-cycle of
+wall-clock instead of days -- 20 machines behaving as one bootstrap engine.
+Progress on this list IS progress on the hive; report shard, banked count,
+and pulled count explicitly.
+
 ## When the user asks for work, route it natively
 
 1. **The ONE work entry point is `POST /chat`** on the :6777 app
@@ -83,9 +131,12 @@ banked, user idle, many-core box. Other pacing knobs:
 
 ## The 20-node cluster: what is REAL today (code-verified 2026-07-17)
 
-A fleet of N installed HART OS nodes is today **N solo flywheels + a working
-discovery/gossip/metrics/skill-packet overlay** — not yet a compounding hive.
-Collaborate accordingly; extend the hooks below, never invent transports.
+A fleet of N installed HART OS nodes is today **N flywheels + a working
+discovery/gossip/metrics/skill-packet/recipe-REUSE overlay**: one node's
+banked recipe now flips the same seeded goal to REUSE fleet-wide via the
+A2A surface, but goal execution itself is still per-node without shared
+Redis. Collaborate accordingly; extend the hooks below, never invent
+transports.
 
 **Forms automatically on a LAN, zero config (REAL):**
 - Discovery: signed UDP beacon (`HEVOLVE_DISCO_V1`, port 6780; Ed25519 +
@@ -93,12 +144,31 @@ Collaborate accordingly; extend the hooks below, never invent transports.
 - Gossip: 60s rounds, fanout 3, over HTTP `:6777`
   (`/api/social/peers/exchange`); carries tier/hardware/idle-compute.
 - Federated METRIC deltas (FedAvg, log1p weights) between peers.
-- RALT skill packets — the cluster's ONE working knowledge multiplier:
+- RALT skill packets -- a working knowledge multiplier:
   `distribute_skill_packet` announces via gossip/WAMP, the receiver
   HTTP-pulls the packet and `ingest_skill_packet` -> `import_skill`. Gated:
   CCT `skill_distribution` consent on both ends, 10 packets/hr, needs
   hevolveai loaded; triggered only when an LLM invokes the
   `distribute_learning_skill` tool.
+- Cross-node recipe REUSE over A2A (peer-to-peer, no central, no Redis):
+  the daemon's CREATE-vs-REUSE classifier asks admitted peers BEFORE
+  falling into CREATE (`agent_daemon._try_peer_recipe_reuse` ->
+  `integrations/google_a2a/peer_reuse.py::try_peer_recipe_reuse`). Nodes
+  advertise exportable recipes at `GET /a2a/agents` carrying the goal
+  linkage (`bootstrap_slug`/`goal_type`/title), which is how discovery
+  matches across the md5-local prompt_id boundary (agent_ids never match
+  between nodes); bytes ship via `GET /a2a/<agent_id>/recipe` as the
+  canonical `core.recipe_sync` envelope and land through the ONE atomic
+  writer (`write_envelope_files`), banked verbatim under the peer's
+  naming PLUS aliased under the local goal's prompt_id so
+  `_flow_recipe_exists` flips the goal to REUSE. Remote invoke over the
+  existing `/a2a/<id>/jsonrpc` contract is the fallback when bytes are
+  not exportable. Bounded: ~10s peer leg per tick + 600s per-goal
+  cooldown; every failure falls through to CREATE exactly as before.
+  Gated by `HEVOLVE_A2A_PEER_REUSE` (default on); privacy fail-closed:
+  only goal-linked recipes or `broadcast_agent` opt-ins are listed or
+  served, never personal agents. Verified by
+  `tests/unit/test_a2a_peer_reuse.py` (two-node in-process harness).
 
 **Does NOT work today (do not assume it):**
 - PeerLink is DIAL-ONLY: no `/peer_link` listener and no
@@ -110,10 +180,6 @@ Collaborate accordingly; extend the hooks below, never invent transports.
   `integrations/distributed_agent/worker_loop.py` claim/execute).
   Default backend is process-local -> 20 isolated dispatchers, the same seed
   goals CREATEd 20x under 20 different md5-local prompt_ids.
-- Recipe REUSE across nodes: NEVER as coded. Recipe bytes do not travel
-  (the federation recipe channel is metadata-only with no subscriber); the
-  daemon never pulls from `core/recipe_sync.py`; push/pull disagree on
-  user_id; md5-local keys make node B's query a structural 404.
 - Pooled inference: the mesh transport exists (`:6796`, WireGuard,
   `/mesh/infer`) but the flywheel's LLM path is hardwired to the local
   llama-server; only VIDEO_GEN offloads today.
@@ -124,10 +190,13 @@ Collaborate accordingly; extend the hooks below, never invent transports.
    fleet-wide claim/execute of dispatched goals.
 2. Key `prompt_id` by `bootstrap_slug` (not md5 of the node-local goal id) in
    `dispatch.py` — dedups CREATE fleet-wide AND repairs the recipe-sync key.
-3. Pull recipes in the daemon BEFORE its CREATE-vs-REUSE split (and push with
-   a matching user_id key) — flips peers to REUSE.
-4. Ship recipe BYTES peer-to-peer by mirroring the skill-packet export/pull
-   into `prompts/{prompt_id}_{flow_id}_recipe.json` where the loader already
+3. SHIPPED (2026-07-17): pull recipes in the daemon BEFORE its
+   CREATE-vs-REUSE split, landed as `_try_peer_recipe_reuse` in
+   `agent_daemon.py`; flips peers to REUSE (see the REAL list above).
+4. SHIPPED (2026-07-17): ship recipe BYTES peer-to-peer by mirroring the
+   skill-packet export/pull, landed as `GET /a2a/agents` +
+   `GET /a2a/<agent_id>/recipe` + `peer_reuse.pull_recipe`, banking into
+   `prompts/{prompt_id}_{flow_id}_recipe.json` where the loader already
    looks (`agent_baseline_service.py`).
 5. Add the inbound PeerLink listener on `:6777` feeding the existing
    `ChannelDispatcher` (`core/peer_link/channels.py`) per the fallback
