@@ -257,6 +257,19 @@ jobs:
       # the build aborts, and `nix build` fails. cache.nixos.org is
       # CDN-backed and has no such quota, so we rely on it exclusively.
 
+      # raw-* only, AFTER the installer: turn the sandbox off at the DAEMON
+      # level. The client-side `--option sandbox false` (attempt 5) is a
+      # RESTRICTED setting -- nix silently ignores it from a non-trusted user,
+      # so the image VM stayed sandboxed away from /dev/kvm and ground on TCG.
+      # A daemon-level nix.conf line cannot be ignored. Applied only on raw
+      # legs; ISO legs keep the sandbox.
+      - name: Disable nix sandbox daemon-wide (raw only)
+        if: startsWith(matrix.target, 'raw-')
+        run: |
+          echo 'sandbox = false' | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl restart nix-daemon || sudo systemctl restart determinate-nixd || true
+          nix config show 2>/dev/null | grep -E '^sandbox' || nix show-config 2>/dev/null | grep -E '^sandbox'
+
       - name: Free disk space (aggressive)
         run: |
           # Full NixOS desktop ISO with glibc-locales + GNOME + wine fonts
