@@ -219,6 +219,22 @@ jobs:
           sudo mount --bind /mnt/nix /nix
           df -h / /mnt
 
+      # raw-* only: make /dev/kvm usable by the nix build sandbox BEFORE the
+      # installer runs (it detects kvm at install time). Without it,
+      # make-disk-image's qemu assembles the ~20 GB ext4 under TCG software
+      # emulation: run 29551668370 spent 4h15m inside nixos-disk-image.drv
+      # (closure done in 30 min) and STILL hit the 5h wall. This is the
+      # GitHub-documented KVM enable recipe (same one Android-emulator jobs
+      # use); with -enable-kvm the image step is minutes, not hours.
+      - name: Enable KVM for the image-assembly VM (raw only)
+        if: startsWith(matrix.target, 'raw-')
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
       - uses: DeterminateSystems/nix-installer-action@v12
         with:
           extra-conf: |
@@ -228,6 +244,10 @@ jobs:
             narinfo-cache-negative-ttl = 0
             max-jobs = 2
             cores = 2
+            # kvm: lets make-disk-image's qemu use -enable-kvm (the raw leg's
+            # udev step above guarantees /dev/kvm perms there; harmless on the
+            # ISO legs, which build no VM derivations).
+            system-features = nixos-test benchmark big-parallel kvm
 
       # magic-nix-cache disabled: under heavy load (full NixOS ISO
       # derivation graph) the GitHub Actions Cache quota trips the
