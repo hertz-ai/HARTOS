@@ -364,11 +364,25 @@ jobs:
           # pipefail + set -e: `tee` no longer hides a failed `nix build`.
           # Retry once: the magic-nix-cache GitHub API is rate-limited
           # and transient 429s shouldn't break a 90-minute OS build.
+          # raw-*: build with the sandbox OFF. make-disk-image assembles the
+          # image inside a qemu VM, and the nix sandbox only passes /dev/kvm
+          # through when the derivation itself demands the kvm feature -- on
+          # this pin it evidently does not, so the VM ran under TCG software
+          # emulation even with host /dev/kvm at 0666 + the kvm system-feature
+          # advertised (runs 29551668370 and 29565871234: 4h+ inside
+          # nixos-disk-image.drv). sandbox=false lets the builder see the
+          # host's /dev/kvm directly, so qemu engages KVM. CI-only, raw-only;
+          # the ISO legs keep the sandbox.
+          SANDBOX_OPT=""
+          if [[ "${{ matrix.target }}" == raw-* ]]; then
+            SANDBOX_OPT="--option sandbox false"
+          fi
           for attempt in 1 2; do
             echo "=== nix build attempt $attempt ==="
             if time nix build .#${{ matrix.target }} \
                 --no-link --print-out-paths --show-trace \
                 --option narinfo-cache-negative-ttl 0 \
+                $SANDBOX_OPT \
                 | tee /tmp/build-output.txt; then
               break
             fi
