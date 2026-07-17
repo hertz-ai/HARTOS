@@ -81,6 +81,40 @@ def test_pacing_knobs_the_prompt_documents_exist():
     assert 'HEVOLVE_LOCAL_LLM_MAX_CONCURRENT' in dsrc
 
 
+def test_cluster_fabric_references_exist():
+    """The prompt's 20-node section names the real fabric files -- discovery,
+    gossip, PeerLink, coordinator backends, recipe sync, aggregator. A rename
+    breaks the prompt's instructions, so it breaks here first."""
+    for rel in (
+        'integrations/social/peer_discovery.py',
+        'core/peer_link/link_manager.py',
+        'core/peer_link/channels.py',
+        'core/recipe_sync.py',
+        'integrations/distributed_agent/coordinator_backends.py',
+        'integrations/distributed_agent/worker_loop.py',
+    ):
+        assert os.path.exists(os.path.join(ROOT, rel)), 'cluster prompt names missing file: ' + rel
+
+
+def test_cluster_gaps_the_prompt_documents_still_hold():
+    """SOURCE-SHAPE GUARDS (labelled per feedback_no_grep_tests: these check
+    the prompt's NEGATIVE claims -- things the code must NOT yet contain.
+    When someone lands the missing link, this fails, pointing at the exact
+    prompt line to update rather than letting the doc go stale)."""
+    entry = open(os.path.join(ROOT, 'hart_intelligence_entry.py'), encoding='utf-8').read()
+    lm = open(os.path.join(ROOT, 'core/peer_link/link_manager.py'), encoding='utf-8').read()
+    assert '/api/peer-link/message' not in entry, \
+        'the inbound PeerLink route now EXISTS -- update the cluster section (dial-only claim is stale)'
+    assert '/api/peer-link/message' in lm, \
+        'link_manager fallback contract moved -- update hook 5 in the prompt'
+    guard = open(os.path.join(ROOT, 'security/hive_guardrails.py'), encoding='utf-8').read()
+    assert 'MAX_SKILL_PACKETS_PER_HOUR' in guard and 'MIN_WITNESS_COUNT_FOR_RALT' in guard, \
+        'skill-packet gate constants renamed -- update the prompt'
+    disp = open(os.path.join(ROOT, 'integrations/agent_engine/dispatch.py'), encoding='utf-8').read()
+    assert 'dispatch_goal_distributed' in disp and '_has_hive_peers' in disp, \
+        'distributed dispatch surface renamed -- update the prompt'
+
+
 def test_standalone_entry_gap_still_holds():
     """The prompt's 'know who starts the daemon' claim: init_agent_engine must
     NOT be called from hart_intelligence_entry's own source (only Nunba
