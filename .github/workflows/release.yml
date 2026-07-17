@@ -202,6 +202,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # raw-* only: put the ENTIRE nix store on the runner's second, nearly
+      # empty ~65 GB data disk (/mnt). The raw build's peak — the ~20 GB
+      # closure PLUS the ~20 GB disk-image output, both in the store — cannot
+      # fit the root disk no matter how much preinstalled bloat is stripped
+      # (2026-07-16 run 29522446118: ENOSPC crashed the nix daemon itself at
+      # 50 min, AFTER the hostedtoolcache purge). Bind-mounting /nix onto /mnt
+      # BEFORE the installer splits the load: store+image on /mnt (~65 GB),
+      # while build tmp, the xz and the split parts keep the root disk's
+      # ~45 GB. The ISO legs stay on the root disk unchanged (their squashfs
+      # peak fits and their cache behaviour is proven).
+      - name: Move /nix to the /mnt data disk (raw only)
+        if: startsWith(matrix.target, 'raw-')
+        run: |
+          sudo mkdir -p /mnt/nix /nix
+          sudo mount --bind /mnt/nix /nix
+          df -h / /mnt
+
       - uses: DeterminateSystems/nix-installer-action@v12
         with:
           extra-conf: |
