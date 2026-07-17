@@ -5249,6 +5249,32 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         return False
 
 
+def _announce_flow_recipe(prompt_id, flow):
+    """Announce a freshly banked flow recipe to the hive capability mesh.
+
+    PROACTIVE half of the recipe capability mesh: gossip-broadcast a
+    'recipe_available' advert so admitted peers can pull the bytes
+    directly (skipping the O(peers) discovery sweep) instead of only
+    finding it reactively per-goal. GATED by peer_reuse.export_allowed so
+    a PRIVATE recipe is NEVER advertised. Fully best-effort: a broadcast
+    failure must NEVER fail the bank (wrap, log, continue). Returns True
+    only when an advert was actually broadcast.
+    """
+    try:
+        from integrations.google_a2a.peer_reuse import (
+            export_allowed, announce_recipe_available)
+        if not export_allowed(prompt_id):
+            return False
+        return bool(announce_recipe_available(prompt_id, flow))
+    except Exception as e:
+        try:
+            current_app.logger.info(
+                f'recipe advert skipped for {prompt_id}_{flow}: {e}')
+        except Exception:
+            pass
+        return False
+
+
 def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
     """Save the aggregated flow recipe to disk.
 
@@ -5287,6 +5313,11 @@ def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
             prompt_id, len(_flow_recipe_data.get('actions') or []) or 1)
     except Exception as _spark_err:
         current_app.logger.debug(f'completed-work spark charge skipped: {_spark_err}')
+    # PROACTIVE capability mesh: recipe is durably banked above, so
+    # gossip-announce it to admitted peers (gated by export_allowed,
+    # best-effort, never fails the bank). Reactive per-goal pull stays
+    # the floor.
+    _announce_flow_recipe(prompt_id, flow)
 
 
 def set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt):

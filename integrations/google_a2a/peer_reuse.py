@@ -54,6 +54,7 @@ agent_baseline_service) finds it where it already looks.
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -61,7 +62,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.http_pool import pooled_get, pooled_post
 from core.recipe_sync import (
-    SCHEMA_VERSION, envelope_checksum, write_envelope_files)
+    SCHEMA_VERSION, build_envelope, envelope_checksum, write_envelope_files)
 
 logger = logging.getLogger('hevolve_social')
 
@@ -83,6 +84,15 @@ _attempt_cooldown: Dict[str, float] = {}
 #: from per-request rescans when peers poll the directory).
 _GOAL_MAP_TTL_S = 30.0
 _goal_map_cache: Tuple[float, Dict[str, Dict[str, str]]] = (0.0, {})
+
+#: PROACTIVE advert layer (recipe capability mesh). A peer that BANKS an
+#: exportable recipe gossip-broadcasts a 'recipe_available' advert; this
+#: node caches admitted-peer adverts keyed by '{semantic_class}/{slug}'
+#: with a TTL, and the daemon consults the cache BEFORE the O(peers)
+#: discovery sweep. Guarded by _lock (shared with _attempt_cooldown).
+#: Mirrors the RALT skill ANNOUNCE-then-PULL pattern
+#: (world_model_bridge.distribute_skill_packet -> discovery.py receiver).
+_advert_cache: Dict[str, Dict[str, Any]] = {}
 
 
 def peer_reuse_enabled() -> bool:
@@ -111,6 +121,18 @@ def _cooldown_s() -> float:
         logger.warning(f'peer_reuse: bad HEVOLVE_A2A_PEER_COOLDOWN_S ({e}); '
                        f'using 600s')
         return 600.0
+
+
+def _advert_ttl_s() -> float:
+    """Freshness window for a cached recipe advert. A hit older than this
+    is evicted and treated as a miss so the daemon falls through to the
+    reactive discovery sweep rather than pulling from a stale peer."""
+    try:
+        return float(os.environ.get('HEVOLVE_A2A_ADVERT_TTL_S', '900'))
+    except ValueError as e:
+        logger.warning(f'peer_reuse: bad HEVOLVE_A2A_ADVERT_TTL_S ({e}); '
+                       f'using 900s')
+        return 900.0
 
 
 # ─── Local identity (also consumed by the /a2a/agents route) ─────────
@@ -266,6 +288,35 @@ def admitted_peers(limit: int = 8) -> List[Dict[str, str]]:
 
 def _norm(text: str) -> str:
     return ' '.join(str(text or '').split()).casefold()
+
+
+# ─── Capability identity (advert keys, reuses discovery's identity) ──
+
+def _slugify(text: str) -> str:
+    """Stable, rule-based slug (NOT ML): casefold, collapse every run of
+    non-[a-z0-9] to a single dash, trim, cap length. Applied to the SAME
+    goal identity peer_reuse discovery already matches on (goal_slug /
+    normalized goal_title), so producer and consumer key the advert cache
+    identically."""
+    s = re.sub(r'[^a-z0-9]+', '-', _norm(text)).strip('-')
+    return s[:64]
+
+
+def _semantic_class_for(goal_type: str) -> str:
+    """Rule/hash-based semantic class from the goal_type / goal category
+    (NOT ML). Normalizes the goal_type token; falls back to 'general' so
+    the topic namespace stays partitioned even without a goal_type."""
+    return _slugify(goal_type) or 'general'
+
+
+def _semantic_identity(identity: Dict[str, str]) -> Tuple[str, str]:
+    """(semantic_class, slug) for an advert, derived from the goal
+    identity dict discovery uses. slug prefers goal_slug (bootstrap_slug),
+    else a normalized goal_title; an empty slug means the recipe is not
+    addressable on the mesh and the caller skips it."""
+    slug = _slugify(
+        identity.get('goal_slug') or identity.get('goal_title') or '')
+    return _semantic_class_for(identity.get('goal_type') or ''), slug
 
 
 def _match_entry(identity: Dict[str, str],
@@ -521,6 +572,208 @@ def pull_recipe(peer_url: str, agent_id: str,
             f'{local_prompt_id} ({alias_written} file(s)); goal flips '
             f'to REUSE next classification')
     return True
+
+
+# ─── Capability mesh: proactive advert layer (announce → cache → consume)
+
+def announce_recipe_available(
+        prompt_id, flow_id,
+        identity: Optional[Dict[str, str]] = None) -> bool:
+    """Gossip-broadcast a 'recipe_available' advert after an exportable
+    recipe is banked (the PROACTIVE half of the capability mesh).
+
+    Mirrors world_model_bridge.distribute_skill_packet EXACTLY: same
+    gossip handle, bounded (gossip.broadcast carries its own per-peer
+    timeout), every except logged, best-effort. A broadcast failure NEVER
+    fails the caller. The receiver (discovery.py 'recipe_available' branch
+    -> on_recipe_available_advert) caches the advert so an admitted peer
+    can pull the bytes directly, skipping the O(peers) discovery sweep.
+
+    GATE: the CALLER must check export_allowed(prompt_id) first; this
+    function does not re-gate (single gate at the bank site, no parallel
+    path). Returns True when a broadcast was attempted, False when the
+    advert was skipped (disabled / no addressable slug) or failed."""
+    if not peer_reuse_enabled():
+        return False
+    pid = str(prompt_id)
+    if identity is None:
+        identity = local_goal_identity_by_prompt_id().get(pid) or {}
+    semantic_class, slug = _semantic_identity(identity)
+    if not slug:
+        logger.info(f'peer_reuse: no addressable slug for prompt_id={pid}; '
+                    f'skipping recipe advert')
+        return False
+
+    # Local node identity (source_node / source_api_url): mirror of the
+    # RALT advert. gossip holds the canonical node_id + advertised URL.
+    source_node, source_api_url = '', ''
+    try:
+        from integrations.social.peer_discovery import gossip
+        source_node = getattr(gossip, 'node_id', '') or ''
+        source_api_url = (getattr(gossip, 'base_url', '') or '').rstrip('/')
+    except Exception as e:
+        logger.info(f'peer_reuse: gossip identity for advert unavailable: {e}')
+
+    # Checksum over the banked bundle (canonical recipe_sync envelope) so a
+    # receiver can dedup / verify. Best-effort: absence must not block the
+    # advert.
+    checksum = ''
+    try:
+        from core.platform_paths import get_recipe_prompts_dir
+        envelope = build_envelope(get_recipe_prompts_dir(), pid)
+        if envelope:
+            checksum = envelope.get('checksum', '')
+    except Exception as e:
+        logger.info(f'peer_reuse: advert checksum for {pid} unavailable: {e}')
+
+    advert = {
+        'type': 'recipe_available',
+        'capability': {
+            'semantic_class': semantic_class,
+            'slug': slug,
+            'goal_type': identity.get('goal_type') or '',
+            'title': identity.get('goal_title') or '',
+            'agent_id': f'{pid}_{flow_id}',
+            'prompt_id': pid,
+            'flow_id': flow_id,
+        },
+        'source_node': source_node,
+        'source_api_url': source_api_url,
+        'checksum': checksum,
+        'timestamp': time.time(),
+    }
+    try:
+        from integrations.social.peer_discovery import gossip
+        sent = gossip.broadcast(advert)
+        logger.info(
+            f'peer_reuse: announced recipe {semantic_class}/{slug} '
+            f'(agent {pid}_{flow_id}) to {sent} peer(s)')
+        return True
+    except Exception as e:
+        logger.info(f'peer_reuse: recipe advert broadcast failed for '
+                    f'{pid}_{flow_id}: {e}')
+        return False
+
+
+def on_recipe_available_advert(message: dict) -> dict:
+    """Receive a peer's 'recipe_available' gossip advert (INBOUND half of
+    the capability mesh). Invoked by the discovery.py
+    '/api/social/peers/broadcast' dispatcher.
+
+    Trust: the sender MUST be an admitted hive peer; presence in the
+    gossip-admitted PeerNode store IS the trust rail, the SAME admission
+    the reactive pull path relies on. Echo-skips our own adverts. On
+    success caches the advert keyed by '{semantic_class}/{slug}' with a
+    TTL so the daemon can pull directly. Rate limiting is enforced
+    upstream by the endpoint (_check_announce_rate), same as the RALT
+    branch. Returns a structured dict; never raises."""
+    if not peer_reuse_enabled():
+        return {'success': False, 'reason': 'peer_reuse_disabled'}
+    cap = (message or {}).get('capability') or {}
+    source_node = (message or {}).get('source_node', '') or ''
+    source_api_url = (
+        (message or {}).get('source_api_url', '') or '').rstrip('/')
+    semantic_class = cap.get('semantic_class') or ''
+    slug = cap.get('slug') or ''
+    agent_id = cap.get('agent_id') or ''
+    if not slug or not source_api_url or not agent_id:
+        return {'success': False, 'reason': 'incomplete_advert'}
+
+    # Echo prevention: never cache our own advert.
+    local_node = None
+    try:
+        from integrations.social.peer_discovery import gossip
+        local_node = getattr(gossip, 'node_id', None)
+    except Exception as e:
+        logger.info(f'peer_reuse: gossip node_id for advert ingest '
+                    f'unavailable: {e}')
+    if local_node and source_node == local_node:
+        return {'success': False, 'reason': 'echo_skip'}
+
+    # Trust gate: sender must be an admitted peer (match on node_id first,
+    # then advertised URL). Same rail the reactive pull path uses.
+    peers = admitted_peers()
+    trusted = any(
+        (source_node and p.get('node_id') == source_node)
+        or (p.get('url') or '').rstrip('/') == source_api_url
+        for p in peers)
+    if not trusted:
+        logger.info(
+            f'peer_reuse: rejected recipe advert from non-admitted peer '
+            f'(node={source_node or "?"}, url={source_api_url or "?"})')
+        return {'success': False, 'reason': 'peer_not_admitted'}
+
+    key = f'{semantic_class}/{slug}'
+    entry = {
+        'peer_url': source_api_url,
+        'agent_id': agent_id,
+        'prompt_id': cap.get('prompt_id') or '',
+        'flow_id': cap.get('flow_id'),
+        'checksum': (message or {}).get('checksum', ''),
+        'ts': time.time(),
+    }
+    with _lock:
+        _advert_cache[key] = entry
+    logger.info(
+        f'peer_reuse: cached recipe advert {key} from {source_api_url} '
+        f'(agent {agent_id})')
+    return {'success': True, 'cached': key}
+
+
+def advert_for(identity: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """Fresh cached advert for a goal identity, or None on miss/stale.
+
+    Derives the SAME '{semantic_class}/{slug}' key announce/ingest use.
+    Entries older than the TTL are evicted and treated as a miss so the
+    caller falls through to the reactive path."""
+    semantic_class, slug = _semantic_identity(identity)
+    if not slug:
+        return None
+    key = f'{semantic_class}/{slug}'
+    now = time.time()
+    with _lock:
+        entry = _advert_cache.get(key)
+        if not entry:
+            return None
+        if now - entry.get('ts', 0.0) > _advert_ttl_s():
+            _advert_cache.pop(key, None)
+            logger.info(f'peer_reuse: recipe advert {key} stale; evicted')
+            return None
+        return dict(entry)
+
+
+def consume_advert(identity: Dict[str, str], local_prompt_id,
+                   timeout: float = _PULL_TIMEOUT_S) -> Optional[str]:
+    """Proactive consume: if an admitted peer has advertised a recipe for
+    this goal identity, pull it DIRECTLY from the advertised peer, skipping
+    the O(peers) discover_peer_agent sweep.
+
+    Returns 'pulled' when the local REUSE precondition was established,
+    else None so the caller falls through to the reactive
+    try_peer_recipe_reuse floor (UNCHANGED). Never raises."""
+    if not peer_reuse_enabled():
+        return None
+    advert = advert_for(identity)
+    if not advert:
+        return None
+    peer_url = (advert.get('peer_url') or '').rstrip('/')
+    agent_id = advert.get('agent_id') or ''
+    if not peer_url or not agent_id:
+        logger.info('peer_reuse: cached advert missing peer_url/agent_id; '
+                    'falling through to reactive path')
+        return None
+    try:
+        if pull_recipe(peer_url, agent_id,
+                       local_prompt_id=str(local_prompt_id),
+                       timeout=timeout):
+            logger.info(
+                f'peer_reuse: advert hit -> pulled {agent_id} from '
+                f'{peer_url} (skipped discovery sweep)')
+            return 'pulled'
+    except Exception as e:
+        logger.info(f'peer_reuse: advert-driven pull from {peer_url} '
+                    f'failed: {e}')
+    return None
 
 
 # ─── Daemon orchestration ────────────────────────────────────────────

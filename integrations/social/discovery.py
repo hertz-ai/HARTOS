@@ -406,6 +406,22 @@ def peer_broadcast():
             logger.debug(f"peer_broadcast ralt dispatch failed: {e}")
             return jsonify({'success': False, 'reason': str(e)}), 500
 
+    elif msg_type == 'recipe_available':
+        # PROACTIVE recipe capability mesh: an admitted peer banked an
+        # exportable recipe and advertised it (peer_reuse
+        # .announce_recipe_available). Cache it so the daemon can pull
+        # directly, skipping the O(peers) discovery sweep. Trust +
+        # echo-skip live in on_recipe_available_advert.
+        try:
+            from integrations.google_a2a.peer_reuse import (
+                on_recipe_available_advert)
+            result = on_recipe_available_advert(msg)
+            status = 200 if result.get('success') else 202
+            return jsonify(result), status
+        except Exception as e:
+            logger.debug(f"peer_broadcast recipe advert dispatch failed: {e}")
+            return jsonify({'success': False, 'reason': str(e)}), 500
+
     # Forward-compatible: ack unknown types without error so older
     # peers don't see 5xx from newer payloads, but mark dispatched=False
     # so the sender knows nothing happened.

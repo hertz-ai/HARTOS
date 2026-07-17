@@ -139,6 +139,24 @@ def test_cluster_recipe_reuse_over_a2a_matches_prompt():
         'peer pull integrity helper moved -- update the prompt'
 
 
+def test_capability_mesh_surface_matches_prompt():
+    """The proactive advert layer the cluster section now claims: the recipe
+    topic const lives in the canonical registry, is aliased into TOPIC_MAP for
+    WAMP-readiness, and peer_reuse exposes the four mesh functions. A rename
+    breaks the prompt's 'publish on bank -> cache advert -> consult before
+    sweep' story, so it breaks here first."""
+    c = _mod('core.constants')
+    assert getattr(c, 'RECIPE_AVAILABLE_TOPIC', '') == 'com.hertzai.hevolve.recipe.available'
+    assert hasattr(c, 'RECIPE_SEMANTIC_TOPIC')
+    mb = open(os.path.join(ROOT, 'core/peer_link/message_bus.py'), encoding='utf-8').read()
+    assert "'recipe.available'" in mb and 'RECIPE_AVAILABLE_TOPIC' in mb, \
+        'the recipe topic is no longer aliased into TOPIC_MAP (WAMP-readiness lost)'
+    pr = _mod('integrations.google_a2a.peer_reuse')
+    for fn in ('announce_recipe_available', 'on_recipe_available_advert',
+               'advert_for', 'consume_advert'):
+        assert callable(getattr(pr, fn, None)), 'peer_reuse.%s (mesh function) is gone' % fn
+
+
 def test_standalone_entry_gap_still_holds():
     """The prompt's 'know who starts the daemon' claim: init_agent_engine must
     NOT be called from hart_intelligence_entry's own source (only Nunba

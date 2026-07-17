@@ -169,6 +169,26 @@ transports.
   only goal-linked recipes or `broadcast_agent` opt-ins are listed or
   served, never personal agents. Verified by
   `tests/unit/test_a2a_peer_reuse.py` (two-node in-process harness).
+- Recipe CAPABILITY MESH (proactive layer over the reactive pull above,
+  the semantic-subscription architecture): banking an exportable recipe
+  PUBLISHES a capability advert -- `peer_reuse.announce_recipe_available`
+  from the `_save_flow_recipe` hook gossip-broadcasts
+  `{type:'recipe_available', capability:{semantic_class, slug, agent_id,
+  ...}, source_api_url, checksum}` on the canonical topic
+  `RECIPE_AVAILABLE_TOPIC` (`core/constants.py`), mirroring the
+  skill-packet ANNOUNCE-then-PULL pattern exactly. Admitted peers cache
+  the advert (`on_recipe_available_advert`, TTL `HEVOLVE_A2A_ADVERT_TTL_S`
+  900s), so the union of caches is a live decentralized index of
+  who-can-do-what -- no central registry. The daemon consults that cache
+  BEFORE the O(peers) discovery sweep (`consume_advert` -> direct
+  `pull_recipe`), falling through to the reactive path on a miss. Rides
+  GOSSIP HTTP so it works central-off and Nunba-off TODAY; the
+  `TOPIC_MAP['recipe.available']` alias means the same publish rides WAMP
+  prefix-subscription (`com.hertzai.hevolve.recipe.*`) the day a
+  node-local router ships -- no code change. This is capability routing +
+  instant curriculum spread; per-action compositional routing and
+  reputation-ranked specialization (5%-cap-guarded) are the next
+  increments. Verified by `tests/unit/test_recipe_capability_mesh.py`.
 
 **Does NOT work today (do not assume it):**
 - PeerLink is DIAL-ONLY: no `/peer_link` listener and no

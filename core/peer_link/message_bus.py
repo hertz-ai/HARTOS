@@ -41,6 +41,8 @@ import uuid
 from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional
 
+from core.constants import RECIPE_AVAILABLE_TOPIC
+
 logger = logging.getLogger('hevolve.peer_link')
 
 
@@ -109,6 +111,11 @@ TOPIC_MAP = {
     'compute.response': 'com.hertzai.hevolve.compute.response.{user_id}',
     # Remote desktop
     'remote_desktop.signal': 'com.hartos.remote_desktop.signal.{device_id}',
+    # Recipe capability mesh: the PROACTIVE advert layer (peer_reuse
+    # announce/consume). Dot-alias so the SAME gossip publish rides the
+    # WAMP bus the day a node-local recipe router ships. Value imported
+    # from core.constants (never inline a topic literal).
+    'recipe.available': RECIPE_AVAILABLE_TOPIC,
 }
 
 # Reverse lookup: legacy topic prefix → new topic

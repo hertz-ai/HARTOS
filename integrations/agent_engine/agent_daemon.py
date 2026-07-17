@@ -54,6 +54,43 @@ def _flow_recipe_exists(prompt_id) -> bool:
         return False
 
 
+def _goal_identity(goal):
+    """Map an AgentGoal row to the cross-node identity dict the peer-reuse
+    client keys on. SINGLE source for both the reactive discovery sweep
+    (_try_peer_recipe_reuse) and the proactive advert consult
+    (_consult_recipe_advert), so the two legs can never key differently.
+    """
+    cfg = goal.config_json or {}
+    return {
+        'goal_id': str(goal.id),
+        'goal_slug': cfg.get('bootstrap_slug') or '',
+        'goal_type': goal.goal_type or '',
+        'goal_title': goal.title or '',
+        'goal_description': goal.description or '',
+        'owner_id': str(goal.owner_id or goal.created_by or ''),
+    }
+
+
+def _consult_recipe_advert(goal, local_prompt_id):
+    """PROACTIVE advert-layer consult for a goal with no LOCAL recipe.
+
+    If an admitted peer already gossip-announced that it banked this
+    goal's recipe, pull it DIRECTLY from the advertised peer, skipping
+    the O(peers) discovery sweep. Returns 'pulled' (recipe banked, classify
+    as REUSE) on a fresh advert hit, or None on miss/stale so the caller
+    falls through to the reactive _try_peer_recipe_reuse floor (UNCHANGED).
+    Never raises: any failure is logged and degrades to None.
+    """
+    try:
+        from integrations.google_a2a.peer_reuse import consume_advert
+        return consume_advert(_goal_identity(goal), local_prompt_id)
+    except Exception as e:
+        logger.info(
+            f"Recipe-advert consult failed for goal "
+            f"{getattr(goal, 'id', '?')}: {e}")
+        return None
+
+
 def _try_peer_recipe_reuse(goal, local_prompt_id, deadline):
     """Bounded A2A peer-reuse attempt for a goal with no LOCAL recipe.
 
@@ -66,17 +103,8 @@ def _try_peer_recipe_reuse(goal, local_prompt_id, deadline):
     """
     try:
         from integrations.google_a2a.peer_reuse import try_peer_recipe_reuse
-        cfg = goal.config_json or {}
-        identity = {
-            'goal_id': str(goal.id),
-            'goal_slug': cfg.get('bootstrap_slug') or '',
-            'goal_type': goal.goal_type or '',
-            'goal_title': goal.title or '',
-            'goal_description': goal.description or '',
-            'owner_id': str(goal.owner_id or goal.created_by or ''),
-        }
         return try_peer_recipe_reuse(
-            identity, local_prompt_id, deadline=deadline)
+            _goal_identity(goal), local_prompt_id, deadline=deadline)
     except Exception as e:
         logger.info(
             f"Peer-reuse attempt failed for goal "
@@ -969,7 +997,14 @@ class AgentDaemon:
                     except Exception as e:
                         logger.debug(f"peer_reuse budget unavailable: {e}")
                         _peer_deadline = time.monotonic() + 10.0
-                _peer = _try_peer_recipe_reuse(goal, _pid, _peer_deadline)
+                # PROACTIVE advert layer first: a peer already gossip-
+                # announced that it banked this goal's recipe, so pull from
+                # the advertised peer DIRECTLY (one bounded pull, skips the
+                # O(peers) discovery sweep). Miss/stale -> reactive floor
+                # below, UNCHANGED, still capped by the shared deadline.
+                _peer = _consult_recipe_advert(goal, _pid)
+                if _peer is None:
+                    _peer = _try_peer_recipe_reuse(goal, _pid, _peer_deadline)
                 if _peer == 'pulled':
                     _reuse_pool.append(goal)
                 elif _peer == 'invoked':
