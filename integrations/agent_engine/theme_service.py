@@ -288,12 +288,35 @@ class ThemeService:
     # ── Performance Auto-Detection ──────────────────────────────
 
     @staticmethod
-    def detect_performance_tier() -> str:
-        """Detect hardware tier and return recommended theme.
+    def _gpu_render_verdict() -> str:
+        """The GPU render verdict hart-gpu-probe wrote to /run/hart/gpu-render
+        ('hardware' | 'software' | ''). This is the SAME file contract
+        liquid_ui_service.read_gpu_render_mode reads; theme_service reads the
+        file DIRECTLY (not via that function) to avoid importing the higher
+        shell layer (circular). Absent/unreadable -> '' (unknown)."""
+        try:
+            with open('/run/hart/gpu-render', 'r', encoding='utf-8') as f:
+                return f.read().strip().lower()
+        except (OSError, ValueError):
+            return ''
 
-        Returns theme ID: 'potato' for OBSERVER/EMBEDDED,
-        'minimal' for LITE, None for STANDARD+.
+    @staticmethod
+    def detect_performance_tier() -> str:
+        """Detect hardware tier and return the recommended theme ID, or None for
+        aura (the shipped default) on graphics-capable hardware.
+
+        The theme is a GRAPHICS choice, so the GPU render verdict is its ground
+        truth: a node whose GPU created a real GL context (hardware) can run the
+        aura cinematic regardless of its NETWORK/RAM tier. Real-HW 2026-07-18:
+        an i915-KabyLake Lenovo with `gpu: hardware` (display live, snappy) was
+        wrongly getting potato because get_tier() classed it OBSERVER (a
+        RAM/network tier, orthogonal to graphics). Honour the GPU verdict FIRST.
+        Only fall to the conservative tier/CPU heuristics when the GPU is NOT
+        confirmed hardware (software floor or no probe).
         """
+        if ThemeService._gpu_render_verdict() == 'hardware':
+            return None  # capable GPU -> aura, whatever the network tier says
+
         try:
             from security.system_requirements import get_tier, NodeTierLevel
             tier = get_tier()

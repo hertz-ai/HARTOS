@@ -954,6 +954,37 @@ class TestPremiumShellAPIs:
 # Cleanup
 # ═══════════════════════════════════════════════════════════════
 
+class TestThemeTierIsGraphicsNotNetwork:
+    """Real-HW 2026-07-18: an i915-KabyLake Lenovo with a LIVE GPU (display up,
+    snappy) booted into POTATO instead of the aura default, because
+    detect_performance_tier() keyed the theme off get_tier() -- a RAM/network
+    tier that classed the node OBSERVER. The theme is a GRAPHICS choice, so the
+    GPU render verdict is its ground truth."""
+
+    def test_hardware_gpu_verdict_yields_aura_default(self, monkeypatch):
+        from integrations.agent_engine.theme_service import ThemeService
+        monkeypatch.setattr(ThemeService, '_gpu_render_verdict', staticmethod(lambda: 'hardware'))
+        # None is the signal that both get_active_theme() and auto_select_theme()
+        # read as "use the aura default" (their fallback branch). Asserting None
+        # here is env-independent; the aura preset itself is proven present by
+        # test_list_presets_* against the real theme dir.
+        assert ThemeService.detect_performance_tier() is None
+        # And a hardware verdict must NOT be overridden into potato even when the
+        # network tier is the lowest (the exact real-HW regression).
+        import security.system_requirements as sr
+        monkeypatch.setattr(sr, 'get_tier', lambda: sr.NodeTierLevel.OBSERVER)
+        assert ThemeService.detect_performance_tier() is None
+
+    def test_software_or_absent_gpu_still_downgrades_low_hw(self, monkeypatch):
+        from integrations.agent_engine.theme_service import ThemeService
+        monkeypatch.setattr(ThemeService, '_gpu_render_verdict', staticmethod(lambda: 'software'))
+        # Force the OBSERVER network tier: on a genuinely weak/software box the
+        # conservative downgrade still applies (potato), unchanged by this fix.
+        import security.system_requirements as sr
+        monkeypatch.setattr(sr, 'get_tier', lambda: sr.NodeTierLevel.OBSERVER)
+        assert ThemeService.detect_performance_tier() == 'potato'
+
+
 def teardown_module():
     """Clean up temp files."""
     import shutil
