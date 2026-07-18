@@ -106,6 +106,22 @@ def test_shell_fix_is_actually_served(shell, asset, needles, fix):
     assert not missing, "{} served but MISSING {} -- {} did not reach the shell".format(asset, missing, fix)
 
 
+def test_voice_orb_getusermedia_cannot_hang(shell):
+    """Orb-click FREEZE (real-HW 2026-07-18, nightly-6ef436c): clicking the voice
+    orb calls navigator.mediaDevices.getUserMedia, which in the cage/WebKitGTK
+    kiosk raises a permission-request that -- with no host handler -- hangs the
+    promise FOREVER, freezing the shell with no error. The served shell must race
+    getUserMedia against a timeout so the orb can NEVER hang; assert the guard is
+    in the RENDERED HTML (the served output), not merely on disk. The host-side
+    auto-grant that makes the mic actually work lives in hart-liquid-ui.nix and
+    is exercised by the real-HW boot, not this unit."""
+    svc, _client = shell
+    html = svc.render_desktop_shell()
+    assert 'getUserMedia' in html, 'the voice mic path vanished from the shell'
+    assert 'Promise.race' in html and 'mic-timeout' in html, \
+        'the getUserMedia timeout guard is missing from the served shell -- the orb can hang'
+
+
 def test_static_handler_is_repointed_not_duplicated(shell):
     """The fix REPOINTS Flask's single static handler to /shell/static — it does
     not add a parallel route. Flask's old default ``/static`` prefix must no

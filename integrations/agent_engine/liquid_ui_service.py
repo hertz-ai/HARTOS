@@ -5808,7 +5808,15 @@ function toggleVoice() {{
 
 async function startRecording() {{
   try {{
-    const stream = await navigator.mediaDevices.getUserMedia({{audio:true}});
+    // Race the mic open against an 8s timeout. In a kiosk WebView a missing
+    // permission-request handler makes getUserMedia hang FOREVER -- clicking the
+    // orb froze the shell with no error (real-HW 2026-07-18). The host now
+    // auto-grants the media permission, but this guarantees the orb can NEVER
+    // hang: a stuck/denied mic degrades to a toast + state reset in <=8s.
+    const stream = await Promise.race([
+      navigator.mediaDevices.getUserMedia({{audio:true}}),
+      new Promise(function(_r, rej){{ setTimeout(function(){{ rej(new Error('mic-timeout')); }}, 8000); }})
+    ]);
     // Feed the live mic into the voice orb for REAL listening reactivity (the
     // orb analyses, never plays it back — no echo). Safe no-op if not ready yet.
     try {{ if(window._hartVoiceOrb) window._hartVoiceOrb.connectStream(stream); }} catch(e) {{}}
@@ -5848,7 +5856,13 @@ async function startRecording() {{
     if(_sm) _sm.classList.add('listening');
     showToast('Voice','Recording... click mic again to stop','info');
   }} catch(err) {{
-    showToast('Voice','Microphone access denied','warning');
+    var _msg = (err && err.message === 'mic-timeout') ? 'Microphone did not respond' : 'Microphone access denied';
+    showToast('Voice', _msg, 'warning');
+    // Never leave the orb/senses-mic stuck in a listening state on failure.
+    isRecording = false;
+    var _sm = document.getElementById('hart-senses-mic'); if(_sm) _sm.classList.remove('listening');
+    var _mb = document.querySelector('.mic-btn'); if(_mb) _mb.classList.remove('recording');
+    try {{ if(window._hartVoiceOrb) window._hartVoiceOrb.disconnect(); }} catch(e) {{}}
   }}
 }}
 

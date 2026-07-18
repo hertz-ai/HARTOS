@@ -140,10 +140,24 @@ class GlassShell(Gtk.Window):
         # (the WebView is realized + content presented). This is what tells the
         # paint-watchdog this tier is HEALTHY so it is NOT dropped as a hang.
         webview.connect('load-changed', self._on_load_changed)
+        # getUserMedia (the voice orb / mic) raises a WebKit permission-request;
+        # with NO handler the promise hangs FOREVER, so clicking the orb froze
+        # the shell with no error (real-HW 2026-07-18). This is the trusted
+        # local kiosk shell (its own served origin, no third-party content), and
+        # tapping the orb IS the user's intent to talk, so auto-grant the media
+        # (mic/camera) request; any other permission class is denied by default.
+        webview.connect('permission-request', self._on_permission_request)
         webview.load_uri(os.environ.get('HART_SHELL_URL', 'http://localhost:${toString ui.port}'))
         s = webview.get_settings()
         s.set_enable_javascript(True)
         s.set_enable_developer_extras(True)
+        # Enable the MediaStream API so navigator.mediaDevices.getUserMedia even
+        # EXISTS in the kiosk WebView (off by default in WebKitGTK) -- the voice
+        # orb needs it to open the mic.
+        try:
+            s.set_enable_media_stream(True)
+        except Exception as _e:
+            print('hart-liquid-ui: enable_media_stream unavailable: %s' % _e, flush=True)
         # NEVER (not ALWAYS): a fresh ISO / live-USB / VM often has only
         # software GL (llvmpipe). Forcing GPU accel there crashes WebKitGTK and
         # takes down the shell session. Correctness/robustness over a few fps.
@@ -163,6 +177,26 @@ class GlassShell(Gtk.Window):
     def _on_load_changed(self, _webview, event):
         if event == WebKit2.LoadEvent.FINISHED:
             _signal_painted()
+
+    def _on_permission_request(self, _webview, request):
+        # Auto-grant mic/camera for the trusted local shell so getUserMedia does
+        # not hang (the orb-freeze bug); deny everything else. Return True to say
+        # the request was handled. Never raise -- an unhandled exception here
+        # would drop the signal back to WebKit's default (hang) and could crash
+        # the shell.
+        try:
+            if isinstance(request, WebKit2.UserMediaPermissionRequest):
+                request.allow()
+                return True
+            request.deny()
+            return True
+        except Exception as _e:
+            print('hart-liquid-ui: permission-request handling failed: %s' % _e, flush=True)
+            try:
+                request.deny()
+            except Exception:
+                pass
+            return True
 
     def _on_key(self, widget, event):
         from gi.repository import Gdk
