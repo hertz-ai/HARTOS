@@ -347,7 +347,13 @@ class ServiceToolRegistry:
                 return json.dumps({"success": False, "error": str(e)})
 
         # Set function metadata (same as MCPToolRegistry.create_tool_function)
-        func_name = f"{tool_name}_{endpoint_name}"
+        # Single-function tools that name their one endpoint after the tool
+        # itself (seo_audit_score, gh_pr_open) keep the flat name — the
+        # doubled "seo_audit_score_seo_audit_score" would break the
+        # prompt↔tool-name contract goal prompts rely on.  Every other
+        # tool (crawl4ai_crawl, whisper_transcribe, …) is unchanged.
+        func_name = (tool_name if endpoint_name == tool_name
+                     else f"{tool_name}_{endpoint_name}")
         endpoint_executor.__name__ = func_name
         endpoint_executor.__doc__ = description
 
@@ -410,7 +416,10 @@ class ServiceToolRegistry:
         for tool_name, tool in self._tools.items():
             for ep_name, ep in tool.endpoints.items():
                 defs.append({
-                    "name": f"{tool_name}_{ep_name}",
+                    # Mirror create_endpoint_function's flat-name rule for
+                    # single-function tools (endpoint named after the tool).
+                    "name": (tool_name if ep_name == tool_name
+                             else f"{tool_name}_{ep_name}"),
                     "description": ep.get("description", f"{tool_name} {ep_name}"),
                     "parameters": ep.get("params_schema", {}),
                     "service_tool": tool_name,

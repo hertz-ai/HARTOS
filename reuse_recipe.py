@@ -2480,10 +2480,14 @@ def create_agents_for_user(user_id: str, prompt_id) -> Tuple[autogen.AssistantAg
     # Service Tools: Register HTTP microservice tools (Crawl4AI, AceStep, etc.)
     # Follows same pattern as MCP block above — register tools, get functions, wire to agents
     try:
-        from integrations.service_tools import service_tool_registry, Crawl4AITool, AceStepTool
+        from integrations.service_tools import (
+            service_tool_registry, Crawl4AITool, AceStepTool,
+            SeoAuditTool, GhPrTool)
 
         Crawl4AITool.register()   # port 11235
         AceStepTool.register()    # port 8001
+        SeoAuditTool.register()   # native in-process (no port)
+        GhPrTool.register()       # native in-process (no port)
         service_tool_registry.load_config()  # load any user-added tools from service_tools.json
 
         svc_tools = service_tool_registry.get_all_tool_functions()

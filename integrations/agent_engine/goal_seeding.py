@@ -428,6 +428,45 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 200,
         'use_product': False,
     },
+    # ─── SEO Web Publisher (news → hevolve.ai via consent-gated PRs) ───
+    {
+        'slug': 'bootstrap_seo_publisher',
+        'goal_type': 'seo',
+        'title': 'SEO Web Publisher — News to hevolve.ai via Consent-Gated PRs',
+        'description': (
+            'Publish curated news to the hevolve.ai website through '
+            'consent-gated GitHub pull requests — never a direct push: '
+            '1) Use list_news_for_web to load news items flagged publish_web '
+            '(news agents flag items with mark_news_for_web during curation), '
+            '2) Format each item for the website repo: a registry entry '
+            'following the src/pages/News/newsData.js pattern, keeping the '
+            'manual mirrors in sync — public/sitemap.xml and the '
+            'scripts/prerender.js route list (scripts/verify-mirrors.js in '
+            'the website repo fails the build when they drift), '
+            '3) Run seo_audit_score on the drafted markdown BEFORE publishing, '
+            '4) Only when the score is >= 90 (verdict SHIP), open a pull '
+            'request with gh_pr_open; below 90, fix the reported sections and '
+            're-score — queue REWORK, never publish a failing draft, '
+            '5) NEVER push directly — every publish is a pull request and the '
+            'human merge IS the consent gate; never auto-publish externally '
+            'without operator approval. '
+            'Aggregator etiquette: headline + snippet + attribution + link '
+            'out to the original source; no full-article republication.'
+        ),
+        'config': {
+            'repo': 'hertz-ai/Hevolve',
+            'base_branch': 'main',
+            'min_seo_score': 90,
+            # Disabled by default: _build_seo_prompt returns None (daemon
+            # skips dispatch) until the operator flips enabled=True — the
+            # same config-gate pattern as the autoresearch goal type.
+            'enabled': False,
+            'requires_consent': True,
+            'continuous': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
     # ─── Continual Learning Coordination ───
     {
         'slug': 'bootstrap_learning_coordinator',

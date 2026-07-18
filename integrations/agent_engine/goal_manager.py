@@ -1109,6 +1109,80 @@ def _build_news_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> 
     )
 
 
+# ─── SEO Web Publisher Prompt ───
+_seo_disabled_warned: set = set()  # Goal IDs already warned about disabled state
+
+
+def _build_seo_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    """Build prompt for the SEO web-publishing agent (news → hevolve.ai PRs).
+
+    Wires the previously-dormant pair of service tools:
+      * seo_audit_score (service_tools/seo_audit_tool.py) — publish gate
+      * gh_pr_open      (service_tools/gh_pr_tool.py)     — PR-only publish
+
+    Disabled by default: mirrors _build_autoresearch_prompt's config gate —
+    returns None (daemon skips the dispatch) until the operator sets
+    ``config.enabled=True`` and a target ``config.repo``.  The human PR
+    merge is the consent gate for everything this agent publishes, matching
+    the marketing goals' "never auto-publish externally without operator
+    approval" rule.
+    """
+    title = _sanitize_goal_input(goal_dict.get('title', ''))
+    desc = _sanitize_goal_input(goal_dict.get('description', ''))
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    repo = config.get('repo', '')
+    base_branch = config.get('base_branch', 'main')
+    min_score = config.get('min_seo_score', 90)
+
+    if not config.get('enabled', False) or not repo:
+        # Log once per goal, not every tick (same pattern as autoresearch).
+        _goal_id = goal_dict.get('id', '')
+        if _goal_id not in _seo_disabled_warned:
+            _seo_disabled_warned.add(_goal_id)
+            logger.info(f"SEO goal '{goal_dict.get('title', '')}': "
+                        f"needs enabled=True + repo in config — paused until configured")
+        return None
+
+    return (
+        f"YOU ARE AN SEO WEB-PUBLISHING AGENT for the hevolve.ai website.\n\n"
+        f"Target repo: {repo} (base branch: {base_branch})\n"
+        f"Publish gate: seo_audit_score >= {min_score} (verdict SHIP)\n\n"
+        f"Goal: {title}\n"
+        f"Description: {desc}\n\n"
+        f"YOUR RESPONSIBILITIES:\n"
+        f"1. Use list_news_for_web to load news items flagged publish_web "
+        f"(news curation agents flag items with mark_news_for_web)\n"
+        f"2. For each item, format the web content for the website repo:\n"
+        f"   - a registry entry following the src/pages/News/newsData.js pattern\n"
+        f"   - keep the manual mirrors in sync: public/sitemap.xml AND the "
+        f"scripts/prerender.js route list must include every new article path "
+        f"(scripts/verify-mirrors.js in the website repo fails the build when "
+        f"registry, sitemap, and prerender routes drift)\n"
+        f"3. Draft the article page as markdown with frontmatter and run "
+        f"seo_audit_score on it BEFORE publishing\n"
+        f"4. Only when the score is >= {min_score} (verdict SHIP), open a pull "
+        f"request with gh_pr_open (repo={repo}, base={base_branch}) containing "
+        f"ALL changed files (registry + sitemap + prerender routes together, "
+        f"so the mirrors never drift)\n"
+        f"5. If the score is below {min_score}: fix the specific failing "
+        f"sections reported by seo_audit_score and re-score — queue REWORK, "
+        f"never publish a failing draft\n"
+        f"6. After a PR is opened, clear the item's flag with "
+        f"mark_news_for_web(post_id, publishable=False) so it is not "
+        f"re-published, and report the PR URL\n\n"
+        f"PUBLISHING RULES:\n"
+        f"- NEVER push directly to {repo} — every publish goes through "
+        f"gh_pr_open as a pull request, without exception\n"
+        f"- CONSENT: the human merge of the pull request IS the consent gate. "
+        f"Never auto-publish externally without operator approval — you open "
+        f"the PR, a human reviews and merges it. Never merge, never bypass\n"
+        f"- Aggregator etiquette: headline + snippet + attribution + link out "
+        f"to the original source; no full-article republication\n"
+        f"- Quality over quantity — only publish genuinely newsworthy items\n\n"
+        f"{HUMAN_VOICE_GUIDE}"
+    )
+
+
 def _build_provision_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
     """Build prompt for HART OS network provisioning goals."""
     title = goal_dict.get('title', 'Network Provisioning')
@@ -1146,6 +1220,9 @@ register_goal_type('upgrade', _build_upgrade_prompt, tool_tags=['upgrade'])
 register_goal_type('thought_experiment', _build_thought_experiment_prompt,
                    tool_tags=['thought_experiment', 'web_search', 'code_analysis'])
 register_goal_type('news', _build_news_prompt, tool_tags=['news', 'feed_management'])
+# 'seo' tags load seo_audit_score (tags: seo/blog/audit/gate) + gh_pr_open
+# (tags: github/publish/pr/blog); 'news' loads the publish_web flag tools.
+register_goal_type('seo', _build_seo_prompt, tool_tags=['seo', 'github', 'publish', 'news'])
 register_goal_type('provision', _build_provision_prompt, tool_tags=['provision'])
 
 
