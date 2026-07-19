@@ -93,7 +93,14 @@ def read_gpu_render_mode() -> str:
         return 'software'
 
 
-_SHELL_RENDER_FILE = '/run/hart/shell-render'
+# /run/hart/session (0770, group-writable) NOT /run/hart (0750, owner-only): the
+# session HOST runs as hart-admin (in the `hart` group, not the `hart` OWNER), so it
+# can only write the group-writable session dir -- the SAME dir + reason shell-ready /
+# current-tier live in (hart-session-supervisor.nix). Writing /run/hart/shell-render
+# directly would silently fail (Permission denied, guarded) -> backend defaults to
+# 'software' -> the whole ladder defeated by a perms bug. The backend (hart / hart-
+# admin) can still traverse /run/hart (0750 gives group r-x) and read the 0770 file.
+_SHELL_RENDER_FILE = '/run/hart/session/shell-render'
 
 
 def read_shell_render_mode() -> str:
@@ -1423,7 +1430,7 @@ class LiquidUIService:
         # is the truthful renderer signal (also drives the glass floor below).
         #
         # The auto-fallback ladder (2026-07-19) sources the compositing signal from the
-        # RUNTIME rung the session tier actually landed on (/run/hart/shell-render:
+        # RUNTIME rung the session tier actually landed on (/run/hart/session/shell-render:
         # vulkan | webkit-cairo | software) -- BOTH GPU rungs enable WebKit compositing,
         # so both light up the micro-animations + live glass; the software floor stays
         # flat. This tracks the paint-watchdog's real landing (a hung vulkan Tier-1 that
@@ -1457,7 +1464,7 @@ class LiquidUIService:
         # floor solidifies the glass. Default '0' = the safe, legible opaque floor
         # (matches preferHardwareGL's default-false), so a bare/dev render is opaque
         # too, never see-through. webkit_compositing was already resolved above from the
-        # runtime rung (/run/hart/shell-render) with the LIQUID_UI_PREFER_HW_GL override;
+        # runtime rung (/run/hart/session/shell-render) with the LIQUID_UI_PREFER_HW_GL override;
         # reuse it here (ONE derivation, no second read path).
         # webkit-flat == "backdrop-filter blur won't paint" == solidify the glass.
         flat_body_class = '' if webkit_compositing else ' webkit-flat'

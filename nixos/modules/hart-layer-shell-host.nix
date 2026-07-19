@@ -182,7 +182,7 @@ let
     # Default from the build flag hart.liquidUI.preferHardwareGL so it still works when
     # no tier set the env. This decides GSK_RENDERER, WebKit compositing, and the
     # WEBKIT_DISABLE_* gates below (one source, no scattered flags). Publish it to
-    # /run/hart/shell-render so the backend body-class (liquid_ui_service.
+    # /run/hart/session/shell-render so the backend body-class (liquid_ui_service.
     # read_shell_render_mode) tracks the ACTUAL painted rung: when the paint-watchdog
     # drops a hung vulkan Tier-1 to webkit-cairo Tier-2, the relaunched shell load
     # re-renders as gpu-hardware (animations + glass), not stuck flat.
@@ -192,8 +192,12 @@ let
       *) HART_SHELL_RENDER=software ;;
     esac
     export HART_SHELL_RENDER
-    mkdir -p /run/hart 2>/dev/null || true
-    printf '%s' "$HART_SHELL_RENDER" > /run/hart/shell-render 2>/dev/null || true
+    # Publish under /run/hart/SESSION (0770, group-writable) -- the session host runs
+    # as hart-admin (hart GROUP, not OWNER), so /run/hart (0750, owner-only) is NOT
+    # writable to it; the session dir is (same dir + reason as the shell-ready marker).
+    # tmpfiles (hart-session-supervisor) creates it before greetd; mkdir is insurance.
+    mkdir -p /run/hart/session 2>/dev/null || true
+    printf '%s' "$HART_SHELL_RENDER" > /run/hart/session/shell-render 2>/dev/null || true
     echo "[hart-glass-shell-gtk4] render rung = $HART_SHELL_RENDER" >&2
     # ── Bring up xdg-desktop-portal EARLY, in the BACKGROUND (the portal-AVAILABLE
     #    first-paint fix, 2026-06-29) ───────────────────────────────────────────────
