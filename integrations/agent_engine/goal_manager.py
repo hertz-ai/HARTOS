@@ -1183,6 +1183,104 @@ def _build_seo_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> s
     )
 
 
+# ─── Paper Explanation Publisher Prompt (AI/BCI research → hevolve.ai) ───
+_paper_explanation_disabled_warned: set = set()  # Goal IDs already warned about disabled state
+
+
+def _build_paper_explanation_prompt(goal_dict: Dict,
+                                    product_dict: Optional[Dict] = None) -> str:
+    """Build prompt for the paper-explanation agent (AI/BCI research →
+    plain-language explanations on the hevolve.ai research pages).
+
+    IDLE-TIME ONLY: the daemon enforces this — the goal's config carries
+    ``idle_only=True`` and agent_daemon skips it unless the
+    ResourceGovernor reports MODE_IDLE (``_idle_only_blocked``), on top of
+    the canonical ``should_yield_to_user()`` gate every dispatch already
+    passes.  The prompt states it so the agent never schedules work that
+    competes with a live user.
+
+    Disabled by default: mirrors _build_seo_prompt's config gate — returns
+    None (daemon skips the dispatch) until the operator sets
+    ``config.enabled=True`` and a target ``config.repo``.  The human PR
+    merge is the consent gate for everything this agent publishes, matching
+    the seo/marketing goals' "never auto-publish externally without
+    operator approval" rule.
+    """
+    title = _sanitize_goal_input(goal_dict.get('title', ''))
+    desc = _sanitize_goal_input(goal_dict.get('description', ''))
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    repo = config.get('repo', '')
+    base_branch = config.get('base_branch', 'main')
+    target_file = config.get('target_file', 'src/data/researchExplanations.json')
+    papers_source = config.get('papers_source', 'src/data/researchPapers.json')
+    topics = config.get('topics', ['ai', 'bci'])
+    source = config.get('source', 'Nature + arXiv')
+    max_per_cycle = config.get('max_per_cycle', 1)
+
+    if not config.get('enabled', False) or not repo:
+        # Log once per goal, not every tick (same pattern as seo/autoresearch).
+        _goal_id = goal_dict.get('id', '')
+        if _goal_id not in _paper_explanation_disabled_warned:
+            _paper_explanation_disabled_warned.add(_goal_id)
+            logger.info(f"Paper-explanation goal '{goal_dict.get('title', '')}': "
+                        f"needs enabled=True + repo in config — paused until configured")
+        return None
+
+    return (
+        f"YOU ARE A RESEARCH PAPER EXPLANATION AGENT for the hevolve.ai "
+        f"website.\n\n"
+        f"Target repo: {repo} (base branch: {base_branch})\n"
+        f"Explanations file: {target_file}\n"
+        f"Paper registry: {papers_source}\n"
+        f"Topics: {', '.join(topics)}  |  Paper sources: {source}\n"
+        f"Max papers per cycle: {max_per_cycle}\n\n"
+        f"Goal: {title}\n"
+        f"Description: {desc}\n\n"
+        f"WHEN YOU RUN — IDLE TIME ONLY:\n"
+        f"You run ONLY while the user's machine is idle: the daemon "
+        f"dispatches this goal only when the ResourceGovernor reports "
+        f"MODE_IDLE and the canonical should_yield_to_user() gate is clear "
+        f"(both are enforced for you — idle_only=True in this goal's "
+        f"config). If the user becomes active mid-run, finish the current "
+        f"step and stop cleanly — never compete with the user for the "
+        f"machine.\n\n"
+        f"YOUR RESPONSIBILITIES:\n"
+        f"1. Read {papers_source} from the website repo — each paper has "
+        f"slug, title, authors, journal, topic ({'|'.join(topics)}), url, "
+        f"doi, abstract, explanation\n"
+        f"2. Pick ONE paper with no explanation yet (empty explanation "
+        f"field and no entry in the 'explanations' map of {target_file}) — "
+        f"at most {max_per_cycle} paper(s) per idle cycle\n"
+        f"3. Fetch and read the paper with data_extraction_from_url on its "
+        f"url (the abstract page on {source})\n"
+        f"4. Write a grounded plain-language explanation: 2-3 short "
+        f"paragraphs separated by blank lines, explaining what the "
+        f"abstract says for a general reader. State that it is based on "
+        f"the paper's abstract. NEVER invent results, numbers, or findings "
+        f"that are not in the fetched text — no fabricated findings, ever. "
+        f"If the fetch fails, skip the paper and report why; never write "
+        f"from memory alone\n"
+        f"5. Publish by adding a {{\"<paper_url>\": \"<explanation>\"}} "
+        f"entry to the 'explanations' map in {target_file} — preserve "
+        f"every existing entry — and open a pull request with gh_pr_open "
+        f"(repo={repo}, base={base_branch}) containing the updated file\n"
+        f"6. Report the PR URL when done\n\n"
+        f"PUBLISHING RULES:\n"
+        f"- NEVER push directly to {repo} — every publish goes through "
+        f"gh_pr_open as a pull request, without exception\n"
+        f"- CONSENT: the human merge of the pull request IS the consent "
+        f"gate. Never auto-publish externally without operator approval — "
+        f"you open the PR, a human reviews and merges it. Never merge, "
+        f"never bypass\n"
+        f"- Grounded only: every sentence must trace to the paper's "
+        f"abstract or fetched text; name the paper by title and link its "
+        f"url\n"
+        f"- Quality over quantity — one well-grounded explanation beats "
+        f"many shallow ones\n\n"
+        f"{HUMAN_VOICE_GUIDE}"
+    )
+
+
 def _build_provision_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
     """Build prompt for HART OS network provisioning goals."""
     title = goal_dict.get('title', 'Network Provisioning')
@@ -1223,6 +1321,11 @@ register_goal_type('news', _build_news_prompt, tool_tags=['news', 'feed_manageme
 # 'seo' tags load seo_audit_score (tags: seo/blog/audit/gate) + gh_pr_open
 # (tags: github/publish/pr/blog); 'news' loads the publish_web flag tools.
 register_goal_type('seo', _build_seo_prompt, tool_tags=['seo', 'github', 'publish', 'news'])
+# 'paper_explanation' tags load the canonical URL-fetch tool Crawl4AI
+# (tags: web/scraping/markdown/crawling — backs data_extraction_from_url)
+# + gh_pr_open (tags: github/publish/pr/blog) for consent-gated PR publish.
+register_goal_type('paper_explanation', _build_paper_explanation_prompt,
+                   tool_tags=['web', 'crawling', 'github', 'publish'])
 register_goal_type('provision', _build_provision_prompt, tool_tags=['provision'])
 
 

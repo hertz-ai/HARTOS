@@ -112,6 +112,31 @@ def _try_peer_recipe_reuse(goal, local_prompt_id, deadline):
         return None
 
 
+def _idle_only_blocked(cfg) -> bool:
+    """True when a goal flagged ``config.idle_only=True`` must be skipped
+    because the machine is not idle right now.
+
+    Reuses the ONE existing idle detector — ``ResourceGovernor.get_mode()``
+    (core/resource_governor.py, MODE_IDLE = user away past
+    IDLE_THRESHOLD_SECONDS and no external load) — no parallel scheduler.
+    The daemon-wide ``should_yield_to_user()`` gate already backs the whole
+    tick off while the user is active, but its STARVATION OVERRIDE forces a
+    tick through after sustained yielding; this per-goal check keeps
+    idle_only goals (e.g. paper_explanation) out of those forced ticks too.
+
+    Fail-CLOSED on any error: idle_only means PROVEN idle — if the governor
+    can't be consulted, the goal waits for the next tick.  Goals without
+    the flag are never blocked here.
+    """
+    if not (cfg or {}).get('idle_only', False):
+        return False
+    try:
+        from core.resource_governor import get_governor, MODE_IDLE
+        return get_governor().get_mode() != MODE_IDLE
+    except Exception:
+        return True
+
+
 def _get_blocked_hitl_tasks(ledger, goal_id):
     """Get tasks blocked with APPROVAL_REQUIRED under a goal."""
     try:
@@ -1034,9 +1059,18 @@ class AgentDaemon:
                 if dispatched >= len(idle_agents) or dispatched >= max_concurrent:
                     break
 
+                cfg = goal.config_json or {}
+
+                # IDLE-ONLY gate: goals flagged idle_only run ONLY while the
+                # ResourceGovernor reports MODE_IDLE (see _idle_only_blocked).
+                if _idle_only_blocked(cfg):
+                    logger.debug(
+                        f"Goal {goal.id}: idle_only and machine not idle, "
+                        f"skipping")
+                    continue
+
                 # Skip continuous goals dispatched recently — let the previous
                 # dispatch complete before re-dispatching.
-                cfg = goal.config_json or {}
                 if cfg.get('continuous', False) and goal.last_dispatched_at:
                     elapsed = (datetime.utcnow() - goal.last_dispatched_at).total_seconds()
                     if elapsed < _CONTINUOUS_COOLDOWN_S:

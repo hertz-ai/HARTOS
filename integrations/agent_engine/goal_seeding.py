@@ -467,6 +467,64 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 200,
         'use_product': False,
     },
+    # ─── Paper Explainer (AI/BCI research → hevolve.ai research pages
+    #     via consent-gated PRs, IDLE TIME ONLY) ───
+    {
+        'slug': 'bootstrap_paper_explainer',
+        'goal_type': 'paper_explanation',
+        'title': 'Paper Explainer — Plain-Language Research for hevolve.ai',
+        'description': (
+            'During machine IDLE time only, read the latest AI/BCI research '
+            'papers and publish plain-language explanations to the '
+            'hevolve.ai research pages through consent-gated GitHub pull '
+            'requests — never a direct push: '
+            '1) Read the paper registry src/data/researchPapers.json in the '
+            'website repo (fields: slug, title, authors, journal, topic '
+            'ai|bci, url, doi, abstract, explanation) and pick ONE paper '
+            'that has no explanation yet — no entry in the "explanations" '
+            'map of src/data/researchExplanations.json, '
+            '2) Fetch the paper source with data_extraction_from_url (the '
+            'url field — its abstract page on Nature / arXiv) and read what '
+            'the abstract actually says, '
+            '3) Write a grounded plain-language explanation: 2-3 short '
+            'paragraphs separated by blank lines, based ONLY on the '
+            'abstract and fetched text — state that it is based on the '
+            'abstract and NEVER invent results, numbers, or findings the '
+            'source does not contain, '
+            '4) Add a {"<paper_url>": "<explanation>"} entry to the '
+            '"explanations" map in src/data/researchExplanations.json '
+            '(preserve every existing entry) and open a pull request with '
+            'gh_pr_open — the website merges it into '
+            'hevolve.ai/research/<slug> via npm run research:pull, '
+            '5) NEVER push directly — every publish is a pull request and '
+            'the human merge IS the consent gate; never auto-publish '
+            'externally without operator approval. '
+            'One paper per idle cycle, maximum.'
+        ),
+        'config': {
+            'repo': 'hertz-ai/Hevolve',
+            'base_branch': 'main',
+            'target_file': 'src/data/researchExplanations.json',
+            'papers_source': 'src/data/researchPapers.json',
+            'topics': ['ai', 'bci'],
+            'source': 'Nature + arXiv',
+            'max_per_cycle': 1,
+            # Disabled by default: _build_paper_explanation_prompt returns
+            # None (daemon skips dispatch) until the operator flips
+            # enabled=True — the same config-gate pattern as the seo /
+            # autoresearch goal types.
+            'enabled': False,
+            # idle_only: the agent_daemon skips this goal unless the
+            # ResourceGovernor reports MODE_IDLE (see agent_daemon
+            # ._idle_only_blocked) — reuses the ONE existing idle detector,
+            # no parallel scheduler.
+            'idle_only': True,
+            'requires_consent': True,
+            'continuous': True,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
     # ─── Continual Learning Coordination ───
     {
         'slug': 'bootstrap_learning_coordinator',
