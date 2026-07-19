@@ -915,6 +915,13 @@
         rows: payload.rows || base.rows
       };
       render(merged);
+      // Re-compose the pre-blurred cosmic bloom to the palette the agent just
+      // composed (the mood may have retinted --hart-amb-*-rgb). ONE compose-time
+      // blur pass, reused per frame -- never a live/per-frame blur. Guarded: the
+      // bloom is optional (potato skips the canvas), so a missing fn is a no-op.
+      if (typeof window !== 'undefined' && window.composeHartBloom) {
+        try { window.composeHartBloom(); } catch (e) { /* backdrop never breaks compose */ }
+      }
     },
     render: render,
     refresh: refresh,

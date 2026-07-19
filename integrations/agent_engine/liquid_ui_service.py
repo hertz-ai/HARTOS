@@ -1922,14 +1922,28 @@ img{-webkit-user-drag:none;user-select:none}
 
 /* ── Ambient colour wash (de-monochrome): slow drifting multi-hue blobs above
    the wallpaper, theme-independent, so the desktop has living colour. ── */
-.hart-ambient{position:fixed;inset:-12%;z-index:1;pointer-events:none;opacity:0.5;
-  filter:blur(64px) saturate(140%);
+/* Cosmic bloom -- COMPOSED + PRE-BLURRED AT RUNTIME, NOT live, NOT baked at build
+   (steward 2026-07-19). The rich aurora is drawn by #hart-bloom-canvas below: the
+   shell composes it ONCE (Gaussian-blurred in a single canvas pass) when the desktop
+   is composed, and re-composes only when the agentic Liquid-UI changes the mood/
+   palette (HartHome.compose) -- so the blur is paid once per compose, reused every
+   frame, and it tracks whatever palette the local LLM composes (not a frozen image
+   shipped in the ISO). THESE radial-gradient layers are only the pre-JS / canvas-
+   unavailable FALLBACK so the desktop is never a flat void before the compose runs;
+   they are inherently soft (no blur filter) and cost one paint. The live
+   filter:blur(64px) that used to sit here (re-rasterising the whole backdrop every
+   frame on the cairo floor) is GONE. */
+.hart-ambient{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:0.9;
   background:
-    radial-gradient(38% 42% at 22% 26%, rgba(var(--hart-amb-1-rgb, 0,230,195),0.44), transparent 70%),
-    radial-gradient(34% 40% at 80% 30%, rgba(var(--hart-amb-2-rgb, 155,92,255),0.44), transparent 70%),
-    radial-gradient(42% 46% at 60% 80%, rgba(var(--hart-amb-3-rgb, 41,197,255),0.32), transparent 72%),
-    radial-gradient(30% 36% at 28% 82%, rgba(var(--hart-amb-4-rgb, 255,46,154),0.32), transparent 72%);
-  animation:hart-ambient-drift 30s ease-in-out infinite alternate}
+    radial-gradient(46% 52% at 30% 30%, rgba(var(--hart-amb-1-rgb, 177,130,255),0.20), transparent 66%),
+    radial-gradient(40% 46% at 82% 26%, rgba(var(--hart-amb-2-rgb, 0,221,249),0.16), transparent 66%),
+    radial-gradient(42% 48% at 24% 84%, rgba(var(--hart-amb-3-rgb, 251,102,182),0.12), transparent 70%),
+    radial-gradient(30% 36% at 82% 82%, rgba(var(--hart-amb-4-rgb, 255,179,48),0.10), transparent 72%)}
+/* The runtime-composed bloom surface. Empty until composeHartBloom() paints it once
+   (on load + on mood re-compose); a pointer-transparent backdrop above the gradient
+   fallback, below all content (z1 < content z20+). */
+.hart-bloom-canvas{position:fixed;inset:0;z-index:1;pointer-events:none;
+  width:100%;height:100%;display:block}
 @keyframes hart-ambient-drift{0%{transform:translate3d(0,0,0) scale(1)}
   50%{transform:translate3d(2.4%,-2.2%,0) scale(1.08)}100%{transform:translate3d(-2.4%,2.2%,0) scale(1.05)}}
 .hart-grain{position:fixed;inset:0;z-index:2;pointer-events:none;opacity:0.045;mix-blend-mode:overlay;
@@ -1963,6 +1977,22 @@ img{-webkit-user-drag:none;user-select:none}
    so this adds a violet HALO without washing the orb blue. */
 #hart-voice-orb{width:300px;height:300px;background:transparent;pointer-events:none;
   filter:drop-shadow(0 0 46px rgba(0,230,195,.34)) drop-shadow(0 8px 64px rgba(155,92,255,.26))}
+/* Cyan dashed ORBITAL RING (the Aura mock's signature, steward 2026-07-19): a
+   slow-rotating dashed cyan ring around the orb -- the mock's "stroke-dasharray 6
+   16 + vSpin". A dashed BORDER on a circle rotated by transform gives the orbiting
+   dashes; it is a SMALL element (~300px), so the per-frame repaint is tiny (unlike a
+   full-screen animated layer) -- affordable motion on the software floor. Behind the
+   canvas (first child) so it rings the orb body. A second, thinner, counter-rotating
+   ring adds depth (the mock layers rings). Both stop under reduced-motion. */
+.hart-orb-orbit,.hart-orb-orbit2{position:absolute;border-radius:50%;pointer-events:none;
+  left:50%;top:50%;will-change:transform}
+.hart-orb-orbit{width:300px;height:300px;margin:-150px 0 0 -150px;
+  border:1.5px dashed rgba(var(--hart-amb-2-rgb,0,221,249),0.42);
+  animation:hart-orbit-spin 26s linear infinite}
+.hart-orb-orbit2{width:236px;height:236px;margin:-118px 0 0 -118px;
+  border:1px dashed rgba(var(--hart-amb-1-rgb,177,130,255),0.28);
+  animation:hart-orbit-spin 38s linear infinite reverse}
+@keyframes hart-orbit-spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
 .hart-hero-orbwrap.listening{box-shadow:0 0 0 5px rgba(255,107,107,.22),0 10px 44px rgba(255,107,107,.35)}
 .hart-hero-orbwrap.listening #hart-voice-orb{filter:drop-shadow(0 12px 44px rgba(255,107,107,.4))}
 .hart-hero-status{font-size:13px;font-weight:500;letter-spacing:.3px;color:var(--hart-muted);min-height:18px;
@@ -2003,8 +2033,8 @@ img{-webkit-user-drag:none;user-select:none}
 .tray-btn:hover{transform:translateY(-1px) scale(1.05)}
 .start-logo{width:20px;height:20px;flex-shrink:0}
 .top-bar .start-btn:hover .start-logo{filter:drop-shadow(0 0 8px var(--hart-accent))}
-@media(prefers-reduced-motion:reduce){.hart-ambient,.hart-hero-hevolve .dot{animation:none}}
-html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot{animation:none}
+@media(prefers-reduced-motion:reduce){.hart-ambient,.hart-hero-hevolve .dot,.hart-orb-orbit,.hart-orb-orbit2{animation:none}}
+html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot,html.a11y-rmotion .hart-orb-orbit,html.a11y-rmotion .hart-orb-orbit2{animation:none}
 '''
 
         # ═══ Desktop icon layer (drag-drop, grid-snapped, persisted) ═══
@@ -2364,9 +2394,14 @@ html[data-multiws="0"] .hart-ws-switcher{opacity:0;transform:translate(-50%,8px)
    thinking / voice / speaking each tint the room so the active state is felt
    peripherally — speaking gets parity with the other two (it previously had no
    <html>-level consumer, so the "AI is talking" signal lit nothing). */
-html[data-thinking="1"] .hart-ambient{filter:blur(64px) saturate(150%) hue-rotate(16deg);transition:filter var(--t-reveal)}
-html[data-voice="1"] .hart-ambient{filter:blur(64px) saturate(160%) hue-rotate(-10deg);transition:filter var(--t-reveal)}
-html[data-speaking="1"] .hart-ambient{filter:blur(64px) saturate(155%) hue-rotate(-26deg);transition:filter var(--t-reveal)}
+/* Voice/thinking reactivity WITHOUT live blur (steward 2026-07-19): the bloom is
+   already pre-blurred, so a state change lifts saturation/brightness only -- a brief
+   ONE-SHOT transition (not an infinite loop), so it costs a single repaint, never a
+   per-frame blur. The aurora "comes alive" when HART listens/speaks; it never
+   re-rasterises a 64px blur on the cairo floor. */
+html[data-thinking="1"] .hart-ambient{filter:saturate(150%) brightness(1.06);transition:filter var(--t-reveal)}
+html[data-voice="1"] .hart-ambient{filter:saturate(162%) brightness(1.09);transition:filter var(--t-reveal)}
+html[data-speaking="1"] .hart-ambient{filter:saturate(156%) brightness(1.05);transition:filter var(--t-reveal)}
 /* While HART speaks, the hevolve "live" pip in the spine glows the TTS-out green so
    the speaking state has a deterministic on-screen cue (not just the orb canvas). */
 html[data-speaking="1"] .hart-hero-hevolve{opacity:.9}
@@ -2738,7 +2773,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      element + hartBootSplash.js drives the fade, so inline is cleaner here. -->
 <div id="hart-boot" aria-hidden="true" style="position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:#0F0E17;transition:opacity .6s ease"><div id="hart-boot-lottie" style="width:min(46vw,360px);height:min(64vw,497px)"></div></div>
 <div class="wallpaper"></div>
-{'<div class="hart-ambient" aria-hidden="true"></div>' if emit_ambient else ''}{'<div class="hart-grain" aria-hidden="true"></div>' if not is_potato else ''}
+{'<div class="hart-ambient" aria-hidden="true"></div>' if emit_ambient else ''}{'<canvas class="hart-bloom-canvas" id="hart-bloom-canvas" aria-hidden="true"></canvas>' if emit_ambient else ''}{'<div class="hart-grain" aria-hidden="true"></div>' if not is_potato else ''}
 <div class="hart-vignette" aria-hidden="true"></div>
 <!-- Desktop icon layer (drag-drop apps); populated by hartDesktop.js -->
 <div class="hart-desktop" id="hart-desktop" aria-label="Desktop icons"></div>
@@ -2750,6 +2785,8 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      fuses search + agent dispatch + the voice transcript sink. -->
 <div class="hart-hero" id="hart-hero" role="search" aria-label="HART command center">
   <div class="hart-hero-orbwrap" id="hart-hero-orbwrap" data-orb-state="idle" role="button" tabindex="0" aria-label="Speak to HART (Super+Space)" title="Click or press Super+Space to speak">
+    <div class="hart-orb-orbit" aria-hidden="true"></div>
+    <div class="hart-orb-orbit2" aria-hidden="true"></div>
     <canvas id="hart-voice-orb" width="360" height="360" aria-hidden="true"></canvas>
   </div>
   <div class="hart-hero-status" id="hart-hero-status" role="status" aria-live="polite">Ask HART anything - say it or type it</div>
@@ -2874,6 +2911,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      BEFORE both so window.HartBrandArt is defined when they paint. -->
 <script defer src="/shell/static/hartBrandArt.js"></script>
 <script defer src="/shell/static/hartHome.js"></script>
+<script defer src="/shell/static/hartBloom.js"></script>
 <script defer src="/shell/static/hartDesktop.js"></script>
 <script defer src="/shell/static/hartWorkspaces.js"></script>
 <script defer src="/shell/static/hartEffects.js"></script>

@@ -128,3 +128,43 @@ def test_static_handler_is_repointed_not_duplicated(shell):
     longer serve these (one source of truth for shell assets)."""
     _svc, client = shell
     assert client.get("/static/hartHero.js").status_code == 404
+
+
+def test_cosmic_bloom_is_runtime_composed_not_live_blur(shell):
+    """The Aura cosmic bloom must be COMPOSED + PRE-BLURRED AT RUNTIME, never a
+    per-frame live blur and never a build-time baked image (steward 2026-07-19:
+    "pre blur not at build time, at compose time during OS runtime").
+
+    Behavioural: render the real shell + fetch the real served bloom module, and
+    prove (a) the shell mounts the compose surface + loads the module, (b) the old
+    live ``filter:blur(64px)`` ambient re-rasteriser is GONE, and (c) the served
+    module composes with a single canvas blur pass (``ctx.filter``) driven by the
+    live palette vars — i.e. once-per-compose, not per-frame, not a shipped asset."""
+    svc, client = shell
+    html = svc.render_desktop_shell()
+    # (a) the compose surface + the module the shell actually loads
+    assert 'hart-bloom-canvas' in html, "the runtime-compose bloom canvas is not mounted"
+    assert '/shell/static/hartBloom.js' in html, "hartBloom.js is not loaded by the shell"
+    # (b) the per-frame live blur is gone from the ambient (only the comment naming
+    # it may remain); assert no ACTIVE filter:blur(64px) rule survives.
+    assert 'filter:blur(64px) saturate' not in html, \
+        "the live per-frame ambient blur(64px) is still active — must be pre-composed"
+    # (c) the served module: compose-time blur, palette-driven, no shipped image
+    r = client.get('/shell/static/hartBloom.js')
+    assert r.status_code == 200, 'hartBloom.js is not served'
+    body = r.get_data(as_text=True)
+    for needle in ('composeHartBloom', 'ctx.filter', '--hart-amb-'):
+        assert needle in body, f'hartBloom.js missing {needle!r} (not compose-time/palette-driven)'
+    # a baked build-time asset must NOT exist (the rejected approach)
+    assert client.get('/shell/static/aura_bloom.webp').status_code == 404, \
+        'a build-time baked bloom asset is shipped — must compose at runtime instead'
+
+
+def test_orb_orbital_rings_present(shell):
+    """The Aura mock's signature spinning cyan dashed orbital ring must render
+    around the orb. Behavioural: the rendered shell mounts the ring elements and
+    defines the spin keyframe (the small-region motion the software floor affords)."""
+    svc, _client = shell
+    html = svc.render_desktop_shell()
+    assert 'hart-orb-orbit' in html, 'the orbital ring element is missing from the orb'
+    assert '@keyframes hart-orbit-spin' in html, 'the orbital spin keyframe is not defined'
