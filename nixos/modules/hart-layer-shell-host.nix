@@ -174,6 +174,27 @@ let
   layerShellHost = pkgs.writeShellScriptBin "hart-glass-shell-gtk4" ''
     set -euo pipefail
     URL="http://localhost:${liquidPort}"
+    # ── Shell render RUNG (the auto-fallback ladder, 2026-07-19) ───────────────────
+    # HART_SHELL_RENDER is set by THIS tier's session launcher:
+    #   vulkan       (Tier-1 hart-comp)  GSK vulkan + WebKit accel  -- best, riskiest
+    #   webkit-cairo (Tier-2 sway)       GSK cairo  + WebKit accel  -- animations, safe
+    #   software     (fallback/default)  GSK cairo  + WebKit OFF    -- the calm floor
+    # Default from the build flag hart.liquidUI.preferHardwareGL so it still works when
+    # no tier set the env. This decides GSK_RENDERER, WebKit compositing, and the
+    # WEBKIT_DISABLE_* gates below (one source, no scattered flags). Publish it to
+    # /run/hart/shell-render so the backend body-class (liquid_ui_service.
+    # read_shell_render_mode) tracks the ACTUAL painted rung: when the paint-watchdog
+    # drops a hung vulkan Tier-1 to webkit-cairo Tier-2, the relaunched shell load
+    # re-renders as gpu-hardware (animations + glass), not stuck flat.
+    HART_SHELL_RENDER="''${HART_SHELL_RENDER:-${if ui.preferHardwareGL then "vulkan" else "software"}}"
+    case "$HART_SHELL_RENDER" in
+      vulkan|webkit-cairo) : ;;
+      *) HART_SHELL_RENDER=software ;;
+    esac
+    export HART_SHELL_RENDER
+    mkdir -p /run/hart 2>/dev/null || true
+    printf '%s' "$HART_SHELL_RENDER" > /run/hart/shell-render 2>/dev/null || true
+    echo "[hart-glass-shell-gtk4] render rung = $HART_SHELL_RENDER" >&2
     # ── Bring up xdg-desktop-portal EARLY, in the BACKGROUND (the portal-AVAILABLE
     #    first-paint fix, 2026-06-29) ───────────────────────────────────────────────
     # PRIMARY path: make org.freedesktop.portal.Desktop ACTUALLY available + responsive
@@ -250,7 +271,14 @@ let
     # first-boot / live-USB / llvmpipe case. Disable both so a GTK4 host that
     # cannot paint never takes the session down. SAME contract as the cage floor;
     # this is the GTK4 path's OWN broken-GPU proof, not an inherited assumption.
-    ${lib.optionalString (!ui.preferHardwareGL) "export WEBKIT_DISABLE_DMABUF_RENDERER=1\nexport WEBKIT_DISABLE_COMPOSITING_MODE=1"}
+    # WebKit accelerated compositing is what paints backdrop-filter glass + promotes
+    # the shell's CSS animations to the GPU (the whole point of the GPU rungs). Keep
+    # it ON for vulkan + webkit-cairo; disable it ONLY on the software floor rung
+    # (where the WebView paints on cairo and a live blur would peg a core).
+    if [ "$HART_SHELL_RENDER" = "software" ]; then
+      export WEBKIT_DISABLE_DMABUF_RENDERER=1
+      export WEBKIT_DISABLE_COMPOSITING_MODE=1
+    fi
     # ── GTK4/GSK SOFTWARE RENDERER (the real-HW paint-hang fix) ──────────────────
     # THE difference between this GTK4 host and the GTK3 cage floor: GTK4 draws via
     # GSK, whose DEFAULT renderer is GL (gl/ngl) — it spins up its OWN GL context on
@@ -272,35 +300,26 @@ let
     # the supervisor drops to the cage GTK3 floor (no GSK at all). CANDIDATE — real-HW
     # unverified; the next boot's journal proves vulkan vs the hang.
     export GDK_GL=disable
-    ${if ui.preferHardwareGL then ''
-    export GSK_RENDERER=vulkan
-    echo "[hart-glass-shell-gtk4] GSK = VULKAN (operator preferHardwareGL=true; GL disabled)" >&2
-    '' else ''
-    # AUTO default = CAIRO, the proven software floor — UNCONDITIONALLY.
-    #
-    # The 2026-06-25 "probe=hardware -> GSK_RENDERER=vulkan" candidate was REAL-HW
-    # DISPROVEN on 2026-07-08 (steward's flash, Intel iGPU + NVIDIA 940MX laptop):
-    # a HEALTHY Intel iGPU makes hart-gpu-probe write verdict `hardware`, which armed
-    # GSK-vulkan on the layer-shell surface; vulkan first-paint HUNG, the marker
-    # /run/hart/session/shell-ready never fired, and the supervisor's 45s paint
-    # watchdog dropped BOTH Tier-1 (hart-comp) AND Tier-2 (sway — the SAME GTK4 host)
-    # to the cage GTK3 cairo floor. That is exactly the "not native / no GPU / not
-    # vibrant" the steward saw: the GPU being GOOD is what armed the failing path.
-    #
-    # So the SHELL host now always uses cairo here regardless of the GPU verdict. The
-    # shell is a WebView-hosting layer surface, not a 3D app; its render path must
-    # stay on the floor (this is also the d8c1567 stability guard — flipping the
-    # CPU-composited WebView shell to gpu-hardware re-enables per-frame blur = the old
-    # ~500ms keystroke lag). GPU acceleration for ACTUAL apps is UNAFFECTED — that is
-    # prime-run / hart-gpu-offload, a separate path — and hart-comp's own GLES
-    # compositing (hart-comp.nix) is likewise untouched (it degrades to pixman on a
-    # fault, it never hangs the tier). The operator escape hatch ui.preferHardwareGL=
-    # true (above) still forces vulkan for a future HW-PROVEN opt-in. GL stays DISABLED
-    # (GDK_GL=disable) so nothing can reach the GL context-creation hang either.
-    HART_GPU_VERDICT="$(cat /run/hart/gpu-render 2>/dev/null || echo software)"
-    export GSK_RENDERER=cairo
-    echo "[hart-glass-shell-gtk4] GSK = CAIRO (auto; proven software floor; gpu-render verdict: $HART_GPU_VERDICT -- vulkan-on-iGPU-layer-shell was real-HW-disproven 2026-07-08, cairo is the floor that keeps Tier-1 native)" >&2
-    ''}
+    # ── GSK renderer PER RUNG (the auto-fallback ladder) ──────────────────────────
+    # vulkan rung -> GSK vulkan (a SEPARATE path from GL; GDK_GL stays disabled so the
+    #   GL/EGL/GBM context-creation hang can never recur). This is the 2026-07-08
+    #   real-HW-DISPROVEN path -- it HUNG first-paint on the layer-shell surface and
+    #   the 45s watchdog dropped the tier. It is attempted ONLY as Tier-1 hart-comp on
+    #   purpose: if it hangs again, the watchdog drops to Tier-2 sway (webkit-cairo,
+    #   below), which paints. So the known hang is now a self-healing rung, not a dead
+    #   end -- the whole reason the ladder exists.
+    # webkit-cairo / software rung -> GSK cairo, the proven software floor GTK4 host
+    #   paint path (the d8c1567 stability guard: the WebView shell's GTK4 window paints
+    #   via cairo; WebKit's OWN compositing -- governed by the WEBKIT_DISABLE_* gate
+    #   above, ON for webkit-cairo -- is what accelerates the shell CONTENT). hart-comp's
+    #   GLES compositing + prime-run app GPU are separate paths, untouched.
+    if [ "$HART_SHELL_RENDER" = "vulkan" ]; then
+      export GSK_RENDERER=vulkan
+      echo "[hart-glass-shell-gtk4] GSK = VULKAN (rung=vulkan; GL disabled; watchdog drops to webkit-cairo if it hangs)" >&2
+    else
+      export GSK_RENDERER=cairo
+      echo "[hart-glass-shell-gtk4] GSK = CAIRO (rung=$HART_SHELL_RENDER; proven GTK4 host floor; WebKit compositing carries the shell content)" >&2
+    fi
     export HART_SHELL_URL="$URL"
     # Shell-paint readiness marker (the session-supervisor's HUNG-tier guard): the
     # GTK4 host touches this once the WebView finishes its first load, telling the
@@ -485,13 +504,18 @@ class GlassShellLayer:
                 getattr(s, _setter)(True)
             except Exception:
                 pass
-        # NEVER (not ON_DEMAND): a fresh ISO / live-USB / VM often has only
-        # software GL (llvmpipe). Forcing GPU accel there crashes WebKitGTK and
-        # takes the shell session down. Correctness/robustness over a few fps —
-        # the EXACT lesson the cage GTK3 floor encodes, re-applied on GTK4. The
-        # WEBKIT_DISABLE_* env above is the belt; this is the suspenders.
+        # HW-accel policy PER RUNG (the auto-fallback ladder): ON_DEMAND for the GPU
+        # rungs (vulkan + webkit-cairo) so WebKit composites the shell content on the
+        # GPU (backdrop-filter glass + GPU-promoted CSS animations); NEVER on the
+        # software floor rung, where forcing GPU accel on a llvmpipe / GL-less display
+        # crashes WebKitGTK and takes the session down (the cage GTK3 floor lesson,
+        # re-applied on GTK4). Read the rung from the env the wrapper exported (the
+        # WEBKIT_DISABLE_* env above is the belt; this is the suspenders).
+        _rung = os.environ.get('HART_SHELL_RENDER', 'software')
         s.set_hardware_acceleration_policy(
-            WebKit.HardwareAccelerationPolicy.${if ui.preferHardwareGL then "ON_DEMAND" else "NEVER"})
+            WebKit.HardwareAccelerationPolicy.ON_DEMAND
+            if _rung in ('vulkan', 'webkit-cairo')
+            else WebKit.HardwareAccelerationPolicy.NEVER)
         self._webview = webview
 
         # GTK4: set_child (the GTK3 container .add() is gone); key events via an
@@ -674,6 +698,15 @@ app.run(None)
     # session bus, not for the host's paint path.
     export XDG_CURRENT_DESKTOP=sway
     export XDG_SESSION_DESKTOP=sway
+    # ── Shell render RUNG (the auto-fallback ladder, 2026-07-19) ──────────────────
+    # Tier-2 is the SAFE decoupled rung: webkit-cairo (GSK cairo + WebKit accel). It
+    # lights up the SAME shell micro-animations + live glass as vulkan but keeps
+    # GTK4's own renderer on the proven cairo floor, so it never touches the
+    # GSK-vulkan layer-shell path that hung 2026-07-08. This is where Tier-1
+    # hart-comp's vulkan attempt lands if it cannot first-paint; if webkit-cairo also
+    # cannot paint (WebKit's own GL on the layer surface), the watchdog drops to the
+    # cage software floor. sway passes this env to the host it exec's.
+    export HART_SHELL_RENDER="''${HART_SHELL_RENDER:-webkit-cairo}"
     ${if ui.preferHardwareGL then ''
     # Operator opted into hardware GL (hart.liquidUI.preferHardwareGL = true) — do
     # NOT force software; honour the explicit opt-in unconditionally.

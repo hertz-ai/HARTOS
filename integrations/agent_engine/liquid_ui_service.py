@@ -93,6 +93,32 @@ def read_gpu_render_mode() -> str:
         return 'software'
 
 
+_SHELL_RENDER_FILE = '/run/hart/shell-render'
+
+
+def read_shell_render_mode() -> str:
+    """Return the active shell RENDER RUNG the session tier is running:
+    'vulkan' | 'webkit-cairo' | 'software'.
+
+    The auto-fallback ladder (steward 2026-07-19 "both, one shd auto fallback to
+    other") maps renderer rungs onto the existing session-supervisor tier ladder:
+    Tier-1 hart-comp = vulkan, Tier-2 sway = webkit-cairo (GSK cairo + WebKit
+    accel), Tier-3 cage = software. Each tier's session launcher writes this file
+    so the backend body-class (gpu-hardware vs gpu-software webkit-flat) tracks the
+    ACTUAL painted rung -- when the paint-watchdog drops a hung GPU rung to a lower
+    one, the relaunched shell load re-renders in the rung that actually paints, with
+    no second read path. Both GPU rungs (vulkan + webkit-cairo) enable WebKit
+    compositing, so both light up the micro-animations + live glass; only the plain
+    'software' floor stays static/opaque. Best-effort + fail-SOFTWARE: missing /
+    unreadable / unknown value -> 'software' (the safe floor). Never raises."""
+    try:
+        with open(_SHELL_RENDER_FILE, 'r') as f:
+            mode = (f.read() or '').strip().lower()
+        return mode if mode in ('vulkan', 'webkit-cairo') else 'software'
+    except (FileNotFoundError, PermissionError, OSError):
+        return 'software'
+
+
 # ── Default-sink volume probe (wpctl-first, pactl fallback) ──────────────────
 # Module-level (NOT a route closure) so the background connectivity prober and
 # the volume write routes share ONE implementation — no parallel volume path.
@@ -1395,7 +1421,22 @@ class LiquidUIService:
         # gap). Gate the effect tier on the ACTUAL paint path: 'hardware' ONLY when the
         # probe says hardware AND WebKit compositing is actually on. webkit_compositing
         # is the truthful renderer signal (also drives the glass floor below).
-        webkit_compositing = os.environ.get('LIQUID_UI_PREFER_HW_GL', '0') == '1'
+        #
+        # The auto-fallback ladder (2026-07-19) sources the compositing signal from the
+        # RUNTIME rung the session tier actually landed on (/run/hart/shell-render:
+        # vulkan | webkit-cairo | software) -- BOTH GPU rungs enable WebKit compositing,
+        # so both light up the micro-animations + live glass; the software floor stays
+        # flat. This tracks the paint-watchdog's real landing (a hung vulkan Tier-1 that
+        # drops to webkit-cairo Tier-2 re-renders as gpu-hardware, not stuck flat). The
+        # LIQUID_UI_PREFER_HW_GL == '1' is an explicit FORCE-ON (dev preview / an
+        # operator opting into the hardware path); ANY other value (including the node's
+        # default '0' from hart-liquid-ui.nix) is NOT a force-off -- it falls through to
+        # the runtime rung file so the ladder still governs. A hard '0' override would
+        # peg the backend flat and defeat the ladder.
+        if os.environ.get('LIQUID_UI_PREFER_HW_GL') == '1':
+            webkit_compositing = True
+        else:
+            webkit_compositing = read_shell_render_mode() in ('vulkan', 'webkit-cairo')
         gpu_render_verdict = read_gpu_render_mode()  # compositor GLES capability probe
         gpu_mode = 'hardware' if (gpu_render_verdict == 'hardware' and webkit_compositing) else 'software'
         gpu_body_class = 'gpu-' + gpu_mode  # gpu-software | gpu-hardware
@@ -1415,8 +1456,9 @@ class LiquidUIService:
         # and tag <body> `webkit-flat` whenever blur will NOT composite, so the CSS
         # floor solidifies the glass. Default '0' = the safe, legible opaque floor
         # (matches preferHardwareGL's default-false), so a bare/dev render is opaque
-        # too, never see-through.
-        webkit_compositing = os.environ.get('LIQUID_UI_PREFER_HW_GL', '0') == '1'
+        # too, never see-through. webkit_compositing was already resolved above from the
+        # runtime rung (/run/hart/shell-render) with the LIQUID_UI_PREFER_HW_GL override;
+        # reuse it here (ONE derivation, no second read path).
         # webkit-flat == "backdrop-filter blur won't paint" == solidify the glass.
         flat_body_class = '' if webkit_compositing else ' webkit-flat'
 

@@ -593,24 +593,25 @@ body.gpu-hardware .hh-pill-dot {
    so ONE Personalize write toggles the whole group; the master
    --hart-motion-speed scales every duration (calc(base * speed)). ── */
 
-/* Layer 1 - AMBIENT. The field BLOBS drift via a transform animation on
-   .hart-ambient (its blur + saturate stay static, so the thinking / voice /
-   speaking filter feedback that hue-shifts the field is untouched). The HUE
-   cycle rides a conflict-free ::after that inherits the field's own blob
-   gradients and hue-rotates them; the field's own filter blurs the ::after, so
-   the ghost stays soft. This is the mock's "aurora field" (blobs + hue) faithfully. */
-body.gpu-hardware .hart-ambient {
-  animation: vBlob1 calc(var(--hart-anim-blob-speed, 18s) * var(--hart-motion-speed, 1)) ease-in-out infinite;
+/* Layer 1 - AMBIENT. The aurora is the RUNTIME-COMPOSED bloom canvas
+   (.hart-bloom-canvas, hartBloom.js). On gpu-hardware it DRIFTS (vBlob1 transform)
+   + HUE-CYCLES (vHue filter) as ONE composited bitmap -- the pre-blurred bloom is
+   already painted, so animating it is a cheap transform/filter on the GPU, never a
+   per-frame re-blur. Applied to the CANVAS (not .hart-ambient): hartBloom.js hides
+   the .hart-ambient gradient fallback once the canvas composes, so the canvas is the
+   real aurora and must be the animated one. vBlob1 keeps scale >= translate so the
+   full-bleed canvas never reveals an edge. Software floor (not gpu-hardware) never
+   matches -> the bloom stays static, the calm floor. This is the mock's "aurora
+   field" (blobs + hue) faithfully. */
+body.gpu-hardware .hart-bloom-canvas {
+  animation: vBlob1 calc(var(--hart-anim-blob-speed, 18s) * var(--hart-motion-speed, 1)) ease-in-out infinite,
+             vHue calc(var(--hart-anim-hue-speed, 22s) * var(--hart-motion-speed, 1)) ease-in-out infinite;
   animation-play-state: var(--hart-motion-ambient, running);
 }
-body.gpu-hardware .hart-ambient::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: inherit;
-  opacity: 0.55;
-  pointer-events: none;
-  animation: vHue calc(var(--hart-anim-hue-speed, 22s) * var(--hart-motion-speed, 1)) ease-in-out infinite;
+/* Fallback: if the canvas never composed (no JS), the .hart-ambient gradient still
+   drifts on gpu-hardware so the field is not dead. */
+body.gpu-hardware .hart-ambient {
+  animation: vBlob1 calc(var(--hart-anim-blob-speed, 18s) * var(--hart-motion-speed, 1)) ease-in-out infinite;
   animation-play-state: var(--hart-motion-ambient, running);
 }
 

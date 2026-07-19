@@ -542,6 +542,16 @@ let
       # first frame within the budget => HUNG => drop to sway then cage). Fall back
       # to the GTK3 cage `hart-glass-shell` (also touches the marker) if the GTK4
       # host is not in the closure — never a parallel renderer, just degrade.
+      # ── Shell render RUNG (the auto-fallback ladder, 2026-07-19) ──────────────
+      # Tier-1 hart-comp attempts the BEST rung: vulkan (GSK vulkan + WebKit accel),
+      # which lights up ALL the shell micro-animations + live glass. If GSK-vulkan
+      # cannot first-paint on the layer-shell surface (the 2026-07-08 hang class),
+      # the session-supervisor paint-watchdog drops to Tier-2 sway, which sets the
+      # SAFER webkit-cairo rung (GSK cairo + WebKit accel -- same animations, no
+      # vulkan), then to the cage software floor. The host binary reads
+      # HART_SHELL_RENDER to pick GSK/WebKit and publishes it to
+      # /run/hart/shell-render so the backend body-class tracks the painted rung.
+      export HART_SHELL_RENDER="''${HART_SHELL_RENDER:-vulkan}"
       if command -v hart-glass-shell-gtk4 >/dev/null 2>&1; then
         hart-glass-shell-gtk4 &
         HART_GLASS_PID=$!

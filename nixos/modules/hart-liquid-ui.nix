@@ -105,6 +105,15 @@ let
     fi
 ''}
     export HART_SHELL_URL="$URL"
+    # ── Publish the SOFTWARE render rung (the auto-fallback ladder floor) ──────────
+    # cage Tier-3 is the GTK3 software floor: no GSK, WebKit compositing off. If a
+    # higher GPU rung (vulkan Tier-1 / webkit-cairo Tier-2) wrote /run/hart/shell-render
+    # and then the paint-watchdog dropped to cage, the file would still name the GPU
+    # rung -> the backend would emit body.gpu-hardware while cage cannot animate/blur,
+    # re-arming the ~500ms-lag class. Reassert `software` here so the backend renders
+    # the calm opaque floor (gpu-software + webkit-flat) that matches this host.
+    mkdir -p /run/hart 2>/dev/null || true
+    printf '%s' software > /run/hart/shell-render 2>/dev/null || true
     # Shell-paint readiness marker (the session-supervisor's HUNG-tier guard
     # consumes it): the host touches this once the WebView finishes loading its
     # first frame. The supervisor passes HART_SHELL_READY_FLAG; default to the
