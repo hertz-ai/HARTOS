@@ -471,6 +471,19 @@ class GlassShellLayer:
 
         # ── The WebView: same served shell, GTK4/WebKit-6.0 host ──
         webview = WebKit.WebView()
+        # Assign the attribute IMMEDIATELY after creation, before any connect/load:
+        # signal handlers reference self._webview, and on the real-HW 2026-07-19 boot
+        # a later __init__ crash left the object half-built -- the headless WebView
+        # kept loading, FINISHED fired, and the handler died on the missing attribute.
+        self._webview = webview
+        # Honest-paint state: shell-ready must mean the surface is MAPPED and the
+        # page load FINISHED, not merely load-finished. On 2026-07-19 the host
+        # crashed before present(), the WINDOWLESS WebView still finished loading,
+        # and the marker fired -> the watchdog read a black screen as HEALTHY and
+        # never dropped the tier (the false-healthy black-screen). Both flags must
+        # be true before _signal_painted runs (_maybe_signal_painted below).
+        self._mapped = False
+        self._load_finished = False
         # Signal first paint to the session-supervisor when the page finishes
         # loading — the GTK4/WebKit-6.0 load-changed signal mirrors the GTK3 cage
         # floor's. This marks Tier-2 HEALTHY so the paint-watchdog does NOT drop it.
@@ -508,19 +521,30 @@ class GlassShellLayer:
                 getattr(s, _setter)(True)
             except Exception:
                 pass
-        # HW-accel policy PER RUNG (the auto-fallback ladder): ON_DEMAND for the GPU
+        # HW-accel policy PER RUNG (the auto-fallback ladder): ALWAYS for the GPU
         # rungs (vulkan + webkit-cairo) so WebKit composites the shell content on the
         # GPU (backdrop-filter glass + GPU-promoted CSS animations); NEVER on the
         # software floor rung, where forcing GPU accel on a llvmpipe / GL-less display
         # crashes WebKitGTK and takes the session down (the cage GTK3 floor lesson,
-        # re-applied on GTK4). Read the rung from the env the wrapper exported (the
-        # WEBKIT_DISABLE_* env above is the belt; this is the suspenders).
+        # re-applied on GTK4).
+        # ALWAYS, NOT ON_DEMAND -- the real-HW 2026-07-19 black-screen RCA: the
+        # WebKitGTK 6.0 (GTK4) API REMOVED HardwareAccelerationPolicy.ON_DEMAND (the
+        # enum is ALWAYS|NEVER only; ON_DEMAND exists only in the GTK3 WebKit2-4.x
+        # binding), so referencing it raised AttributeError mid-__init__, the window
+        # was never presented, and the desktop was a black screen with a live cursor.
+        # ALWAYS is valid in BOTH APIs. Guarded + logged: a policy failure degrades to
+        # WebKit's default rather than aborting the constructor (never crash the host
+        # over a hint; the WEBKIT_DISABLE_* env above is the belt, this the suspenders).
         _rung = os.environ.get('HART_SHELL_RENDER', 'software')
-        s.set_hardware_acceleration_policy(
-            WebKit.HardwareAccelerationPolicy.ON_DEMAND
-            if _rung in ('vulkan', 'webkit-cairo')
-            else WebKit.HardwareAccelerationPolicy.NEVER)
-        self._webview = webview
+        try:
+            s.set_hardware_acceleration_policy(
+                WebKit.HardwareAccelerationPolicy.ALWAYS
+                if _rung in ('vulkan', 'webkit-cairo')
+                else WebKit.HardwareAccelerationPolicy.NEVER)
+        except Exception as _pe:
+            import sys as _sys
+            print('[hart-glass-shell-gtk4] hw-accel policy set failed (%s); WebKit default kept'
+                  % _pe, file=_sys.stderr)
 
         # GTK4: set_child (the GTK3 container .add() is gone); key events via an
         # EventControllerKey emitting 'key-pressed' (the GTK3 window key-press
@@ -577,9 +601,21 @@ class GlassShellLayer:
         # has run (mirrors the cage floor + the m2 WSL reference host); only the
         # shell-ready marker is gated on the load actually succeeding.
         if event == WebKit.LoadEvent.FINISHED:
-            if not self._last_load_failed:
-                _signal_painted()
+            self._load_finished = True
+            self._maybe_signal_painted()
             self._webview.grab_focus()
+
+    def _maybe_signal_painted(self):
+        # HONEST first-paint: the marker fires only when the load FINISHED cleanly
+        # AND the layer surface is actually MAPPED (visible). Load-finished alone is
+        # a lie: on the real-HW 2026-07-19 boot the constructor crashed before
+        # present(), the WINDOWLESS WebView still finished its load, the marker
+        # fired, and the watchdog kept a black screen up as healthy forever. A
+        # mapped surface with a finished load is the closest truthful proxy for
+        # the-desktop-is-on-the-glass. Called from BOTH _on_map and
+        # _on_load_changed, so whichever completes second fires the marker.
+        if self._mapped and self._load_finished and not self._last_load_failed:
+            _signal_painted()
 
     def _on_load_failed(self, _webview, _event, failing_uri, error):
         # Mark this load as FAILED so the LoadEvent.FINISHED that WebKit STILL emits
@@ -654,7 +690,11 @@ class GlassShellLayer:
         # The surface is now mapped (visible). grab_focus() on an unmapped widget
         # is a no-op, so this map-time re-grab is what actually makes the first
         # keystrokes land: THE reliable focus point for the layer surface.
+        # Also the surface-is-actually-visible half of the honest first-paint
+        # signal (see _maybe_signal_painted).
+        self._mapped = True
         self._webview.grab_focus()
+        self._maybe_signal_painted()
 
     def _on_pointer_press(self, _gesture, _n_press, _x, _y):
         # Any pointer press re-asserts keyboard focus into the WebView so a click
@@ -671,7 +711,22 @@ class GlassShellLayer:
 
 
 def _on_activate(app):
-    app.__hart_shell = GlassShellLayer(app)
+    try:
+        app.__hart_shell = GlassShellLayer(app)
+    except Exception:
+        # CRASH HARD, never linger windowless. GTK swallows handler exceptions, so a
+        # constructor failure here (e.g. the 2026-07-19 ON_DEMAND AttributeError)
+        # would otherwise leave app.run() spinning with NO window while the headless
+        # WebView load kept the process alive -- a black screen the supervisor reads
+        # as a running tier. Print the traceback to the journal, then exit non-zero
+        # so the supervisor counts a CRASH and drops a tier (the never-fail ladder is
+        # the recovery path; a broken host must never impersonate a live one).
+        import traceback, os as _os, sys as _sys
+        traceback.print_exc()
+        print('[hart-glass-shell-gtk4] window construction FAILED -- exiting so the '
+              'supervisor drops a tier', file=_sys.stderr)
+        _sys.stderr.flush()
+        _os._exit(1)
 
 
 # GTK4 uses GtkApplication.run as the loop — the GTK3 bare main loop is gone.

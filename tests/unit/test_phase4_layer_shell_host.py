@@ -165,6 +165,48 @@ class TestGtk4SoftwareGLFloor:
         # a few fps, the exact lesson the GTK3 floor encodes, re-applied on GTK4.
         assert "HardwareAccelerationPolicy.NEVER" in src
 
+    def test_no_on_demand_policy_in_the_webkit6_host(self, src):
+        # Real-HW 2026-07-19 black-screen RCA: the WebKitGTK 6.0 (GTK4) API REMOVED
+        # HardwareAccelerationPolicy.ON_DEMAND -- the enum is ALWAYS|NEVER only
+        # (ON_DEMAND survives only in the GTK3 WebKit2-4.x binding the cage floor
+        # uses). Referencing it raised AttributeError mid-__init__, the window was
+        # never presented, and the desktop was a black screen with a live cursor.
+        # py_compile CANNOT catch this (it is an attribute lookup on the gi binding
+        # at runtime, not a syntax error), so this cross-API-drift guard pins the
+        # 6.0-legal members. Source-guard justified: only a Linux boot with the real
+        # WebKit-6.0 typelib could catch it behaviourally. Checked on the CODE lines
+        # of the embedded python only (comments may legitimately narrate the RCA).
+        py_body = _extract_python_c_body(src)
+        code_lines = "\n".join(
+            ln for ln in py_body.split("\n") if not ln.lstrip().startswith("#")
+        )
+        assert "HardwareAccelerationPolicy.ON_DEMAND" not in code_lines, (
+            "the GTK4/WebKit-6.0 host references HardwareAccelerationPolicy."
+            "ON_DEMAND, which the 6.0 API removed -- this AttributeError black-"
+            "screened real HW on 2026-07-19; use ALWAYS (valid in both APIs)."
+        )
+        assert "HardwareAccelerationPolicy.ALWAYS" in code_lines, (
+            "the GPU rungs must set HardwareAccelerationPolicy.ALWAYS -- without it "
+            "WebKit never composites and the micro-animations/glass stay dead."
+        )
+
+    def test_shell_ready_requires_mapped_surface_not_just_load(self, src):
+        # The false-healthy half of the 2026-07-19 black screen: the constructor
+        # crashed before present(), the WINDOWLESS WebView still finished its load,
+        # _signal_painted() fired, and the watchdog kept the black tier up forever.
+        # The marker must therefore require the layer surface to be MAPPED as well
+        # as the load FINISHED -- and a constructor failure must CRASH the process
+        # (supervisor counts it, drops a tier) instead of lingering windowless.
+        assert "def _maybe_signal_painted" in src, (
+            "the honest-paint gate (_maybe_signal_painted) is missing -- a windowless"
+            " load-finish would touch shell-ready and freeze a black tier as healthy."
+        )
+        assert "self._mapped" in src and "self._load_finished" in src
+        assert "_os._exit(1)" in src, (
+            "a GlassShellLayer construction failure must exit non-zero so the "
+            "supervisor drops a tier -- GTK swallows handler exceptions otherwise."
+        )
+
     def test_forces_gsk_software_renderer_the_real_hw_paint_fix(self, src):
         # THE real-HW paint-hang fix. GTK4 draws via GSK, whose DEFAULT renderer is
         # GL — a SEPARATE GL context from WebKit's, NOT covered by WEBKIT_DISABLE_*.
