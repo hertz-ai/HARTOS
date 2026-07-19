@@ -191,6 +191,36 @@ class TestBuildPaperExplanationPrompt:
         assert 'My Paper Goal' in prompt
         assert 'My Desc' in prompt
 
+    # — human-voice guide + paper-specific closing caveat —
+
+    def test_human_voice_no_em_dash_rule(self):
+        """The shared voice guide states the hard no-em-dash rule, and the
+        returned prompt is itself em-dash-free (the one place the glyph may
+        appear is where the rule names the banned character)."""
+        prompt = self._build()
+        assert 'never use an em dash' in prompt
+        assert '—' not in prompt.replace(
+            "never use an em dash (the '—' character)", '')
+
+    def test_human_voice_grounds_and_bans_tells(self):
+        prompt = self._build()
+        assert 'Ground every claim' in prompt
+        for tell in ('delve', 'leverage', 'cutting-edge'):
+            assert tell in prompt
+
+    def test_explanation_ends_with_varied_caveat(self):
+        """Paper explanations must close with a freshly-worded caveat that
+        the summary is abstract-based and to read the full paper."""
+        prompt = self._build()
+        assert 'read the full paper' in prompt
+        assert 'freshly-worded caveat' in prompt
+
+    def test_explanation_json_value_is_plain_text_with_blank_lines(self):
+        """The researchExplanations.json value is plain text, paragraphs
+        joined by \\n\\n (the shape the website consumes)."""
+        prompt = self._build()
+        assert '\\n\\n' in prompt
+
 
 # ─── Seed Goal Tests ───
 

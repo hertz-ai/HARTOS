@@ -164,6 +164,24 @@ class TestBuildSeoPrompt:
         assert 'My SEO Goal' in prompt
         assert 'My Desc' in prompt
 
+    # — human-voice guide: the anti-AI-detection rules the prompt carries —
+
+    def test_human_voice_no_em_dash_rule(self):
+        """The shared voice guide must state the hard no-em-dash rule, and
+        the returned prompt itself must be free of em dashes (a published
+        page that reads like AI does not rank)."""
+        prompt = self._build()
+        assert 'never use an em dash' in prompt
+        assert '—' not in prompt.replace(
+            "never use an em dash (the '—' character)", '')
+
+    def test_human_voice_grounds_and_bans_tells(self):
+        prompt = self._build()
+        assert 'Ground every claim' in prompt
+        # a representative sample of the banned AI tells
+        for tell in ('delve', 'leverage', 'cutting-edge', 'game-changer'):
+            assert tell in prompt
+
 
 # ─── Seed Goal Tests ───
 
