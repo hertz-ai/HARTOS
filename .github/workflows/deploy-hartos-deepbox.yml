@@ -40,12 +40,12 @@ jobs:
 
             echo "=== Clean old containers/images ==="
             docker rm -f langchain langchain_tmp 2>/dev/null || true
-            docker rmi -f langchain_gpt:main 2>/dev/null || true
+            docker rmi -f langchain_gpt:main 2>/dev/null || true   # drop legacy :main (now using :latest; build re-tags :latest itself)
 
             echo "=== Build Docker image ==="
             docker build --no-cache \
               --build-arg GIT_SHA="$DEPLOY_COMMIT" \
-              -t langchain_gpt:main \
+              -t langchain_gpt:latest \
               -t langchain_gpt:"$DEPLOY_COMMIT_SHORT" \
               .
 
@@ -53,7 +53,7 @@ jobs:
             sudo docker run --name langchain_tmp -d \
               --env-file .env \
               -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
-              langchain_gpt:main sleep 3600
+              langchain_gpt:latest sleep 3600
 
             docker exec langchain_tmp sh -lc '
             cd /app
@@ -109,7 +109,7 @@ jobs:
               -v "$(pwd)/release_manifest.json:/app/release_manifest.json:ro" \
               -v ${{ secrets.DEPLOY_LOGS_PATH }}:/app/logs \
               -v ${{ secrets.DEPLOY_IMAGES_PATH }}:/app/output_images \
-              langchain_gpt:main
+              langchain_gpt:latest
 
             echo "=== Wait for service ==="
             sleep 20
@@ -171,3 +171,24 @@ jobs:
 
             echo "=== Final verification complete ==="
             echo "HARTOS central deployment verified for commit $DEPLOY_COMMIT"
+
+            echo "=== Prune old images (stop the Deepbox disk bloat) ==="
+            # The new container (langchain_gpt:latest) is up + verified above, so it
+            # is now safe to reclaim what this workflow used to leave behind on
+            # every deploy (each langchain_gpt image is ~8GB; they were never
+            # removed, which filled Deepbox with 8.33GB tagged + <none> images):
+            #   1) every stale langchain_gpt tag — keep ONLY :latest and the
+            #      short-sha we just deployed.  This deletes the old commit-id
+            #      tags (a3de3484, 716fe33b, ...) and the legacy :main, reclaiming
+            #      ~8GB each; the running image (:latest) is untouched.
+            docker images 'langchain_gpt' --format '{{.Repository}}:{{.Tag}}' \
+              | grep -vE ":(latest|${DEPLOY_COMMIT_SHORT})$" \
+              | xargs -r docker rmi -f 2>/dev/null || true
+            #   2) dangling <none> layers left by the --no-cache rebuild.
+            #      prune only removes images not used by any container, so the
+            #      running langchain_gpt:latest is safe.
+            docker image prune -f || true
+            #   3) build cache.
+            docker builder prune -f || true
+            echo "=== Disk after prune ==="
+            docker system df || true
