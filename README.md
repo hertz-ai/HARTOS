@@ -85,7 +85,7 @@ curl -X POST http://localhost:6777/v1/chat/completions \
 | **Per-agent baselines** | Per-agent snapshots at `agent_data/baselines/<agent_id>.json`, used as the regression floor | `agent_baseline_service.py` |
 | **Coding benchmark tracker** | SQLite-backed coding benchmarks (`coding_benchmarks.db`), HumanEval / MBPP / custom suites | `integrations/coding_agent/benchmark_tracker.py` |
 | **Hive benchmark prover** | Cryptographic proof that a benchmark was run on the claimed model + dataset (resists fake-score federation) | `hive_benchmark_prover.py` |
-| **Continual learner gate** | Blocks model swap if learner forgets prior tasks (catastrophic-forgetting guard) | `continual_learner_gate.py` |
+| **Continual learner gate** | Gates access to hive learning by verified compute contribution (Compute Contribution Tokens): no contribution, no learning | `continual_learner_gate.py` |
 | **PR review service** | Auto-rejects PRs on baseline regression or guardrail mismatch | `pr_review_service.py` |
 | **Upgrade orchestrator** | 7-stage pipeline: BUILD -> TEST -> AUDIT -> BENCHMARK -> SIGN -> CANARY -> DEPLOY | `upgrade_orchestrator.py` |
 | **OTA service** | systemd service does daily check + cryptographically-verified upgrade | `hart-update-service.py` |
@@ -98,7 +98,7 @@ curl -X POST http://localhost:6777/v1/chat/completions \
 | **NAT traversal** | UDP hole-punching, STUN-style fallbacks for residential NATs | `core/peer_link/nat.py` |
 | **Hivemind handler** | Tier-aware routing (flat / regional / central), connection budget per tier (10 / 50 / 200) | `core/peer_link/hivemind_handler.py` |
 | **FederatedAggregator** | Equal-weighted delta merging (log1p-floor, not hardware tier). Channels: model deltas, resonance, recipes, event counters | `federated_aggregator.py` |
-| **Federated gradient protocol** | Cross-node gradient sharing with provenance tags, no raw data leaves the node | `federated_gradient_protocol.py` |
+| **Federated gradient protocol** | Optional weight-level sync interface (Phase 2, not active); the hive shares derived, signed, privacy-scoped learning, never raw data or model weights | `federated_gradient_protocol.py` |
 | **Federation handshake** | Peer presents guardrail hash; mismatch = connection refused; re-verified every 300 s | `integrations/social/federation.py` |
 | **Gossip + verification** | Tier-aware gossip with cert verification, peer-verified task results | `integrity_service.py`, gossip layer |
 | **EventBus + WAMP bridge** | In-process EventBus auto-publishes to Crossbar WAMP when `CBURL` env set; remote nodes subscribe to `com.hartos.event.*` topics | `core/platform/events.py` |
