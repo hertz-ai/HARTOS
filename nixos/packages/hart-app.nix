@@ -78,6 +78,13 @@ let
     aiohttp
     websockets
 
+    # LLM-output JSON repair -- helper.py / create_recipe.py / core/agent_tools.py
+    # import json_repair to salvage malformed model JSON. Real-HW 2026-07-19:
+    # POST /chat 500'd on the node with ModuleNotFoundError 'json_repair' -- and
+    # /chat is the ONE agentic pipeline (CREATE/REUSE), so the hive bootstrap was
+    # dead on the node. Pure-python, tiny; present in this nixpkgs pin.
+    json-repair
+
     # AutoGen (multi-agent framework)
     # autogen  # May need overlay or fetchPypi
   ]);
