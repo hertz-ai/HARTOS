@@ -74,6 +74,55 @@ P9 ONBOARDING -- the first-run "Light Your HART" ceremony. PARITY SOURCE IS
    It is also the first thing a new user ever sees, so it carries the same
    perf bar as the desktop (no lag, no jank on the ceremony).
 
+## AGENTIC COMPONENT GENESIS -- the agent CREATES native components at runtime
+Steward, 2026-07-20: "composable steerable drivable by agent and create native
+components on the fly for new ui fragments and new views and new user
+experience." This is strictly stronger than "the LLM sets uniforms on fixed
+widgets": the agent must INVENT a component that did not exist at build time and
+have it render NATIVELY at full speed. That requirement decides the stack.
+
+**Why a widget toolkit cannot do this and shaders can.** A retained widget tree
+(iced/slint/egui/GPUI) only composes what was compiled in; a new component means
+a new Rust build. A shader/SDF pipeline can be CODEGENERATED and hot-compiled at
+runtime, so a new component is DATA the agent authors. "Liquid" is also
+literally an SDF look (merging blobs, refraction, glow), so the medium and the
+requirement agree.
+
+Four layers, each independently agent-addressable:
+- **L1 SCENE (data).** Declarative node tree: what exists, where, z-order,
+  bindings. This IS the A2UI payload. Hot-swappable, no compile.
+- **L2 FORM (SDF expression tree -> WGSL codegen).** The agent composes
+  primitives (circle/box/field/noise) with operators (smooth-union, subtract,
+  displace, refract, glow). We codegen WGSL from the tree, VALIDATE it (naga),
+  compile OFF the render thread, and atomically swap the pipeline. A genuinely
+  new visual component with zero OS recompile.
+- **L3 MOTION (declarative bindings).** Parameters bound to clocks + live signals
+  (breathe 0.3Hz, energy from mic RMS, hover -> displace). Curves are data, so
+  motion is steerable mid-flight.
+- **L4 BEHAVIOR (sandboxed WASM).** When a fragment needs real logic beyond
+  bindings, the agent ships a small WASM module against a TYPED capability
+  surface (scene + IPC only; no raw syscalls).
+
+**THE RECIPE PATTERN, APPLIED TO UI.** This is HART OS's own CREATE/REUSE
+innovation at the interface layer: the agent CREATEs a component once (compose ->
+codegen -> validate -> compile -> cache, keyed by tree hash), then REUSEs it for
+free forever. The OS accumulates a UI vocabulary it invented, exactly as it
+accumulates task recipes -- and peers can share components over the same hive
+channels recipes already use.
+
+**NEVER-FAIL RULES (non-negotiable -- this is the OS shell, not an app):**
+- Validate + budget BEFORE compile: naga validation plus a static complexity
+  budget (bounded loops, instruction ceiling). Unbounded work is rejected.
+- Compile and first-draw happen OFF the render thread; the live frame never
+  blocks on agent authoring.
+- Per-component GPU time budget. A component that overruns is demoted to a
+  static fallback and journaled -- never a frozen desktop (the exact class we
+  just spent three boots escaping).
+- Any agent-component failure degrades to the last good scene; the never-fail
+  shell floor is untouched.
+- Agent-authored components are user-visible, inspectable and REVOCABLE (the
+  human stays in control -- the constitutional rule).
+
 ## THE SPLIT RULE -- what goes native vs what stays Nunba-canonical
 Nunba is not a handful of pages: the landing-page tree carries ~36 Social
 surfaces (Feed, Communities, Chat, Inbox, Profile, Marketplace, Recipes,
@@ -108,9 +157,14 @@ natively as microfrontends.**
   surface is a parallel path to RETIRE during this program, not to port.
 
 ## Milestones (each = shippable, OTA-able, tier-guarded)
-M0 scene plumbing: SceneNode enum + A2UI->Scene decoder in hart-comp; render
-   via existing element pipeline (comp_core render elements). Feature-flagged
-   `hart.comp.nativeShell` default OFF; cage/webkit tiers untouched.
+M0 STACK SPIKE + scene plumbing: decide the renderer stack on EVIDENCE, not
+   preference -- spike a wgpu+SDF aurora + breathing orb in hart-comp and MEASURE
+   on the HD 620 (fps, frame time, input-to-photon), evaluating makepad + vello/
+   cosmic-text for the typography leg. Then land the SceneNode enum + A2UI->Scene
+   decoder. Feature-flagged `hart.comp.nativeShell` default OFF; cage/webkit tiers
+   untouched. NOTE: with a shader field the bloom is ~free PER FRAME, so the
+   compose-once CPU texture (bloom.rs, written 2026-07-20) is superseded by a
+   live-animated shader field -- keep bloom.rs only as the pixman-floor fallback.
 M1 NATIVE BLOOM (first pixel): replace the solid splash clear
    (udev.rs ~line 422 SolidColorBuffer) with a bloom TEXTURE composed at
    runtime from the active theme's ambient palette (CPU gaussian once ->
