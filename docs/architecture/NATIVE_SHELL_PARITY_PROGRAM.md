@@ -74,6 +74,39 @@ P9 ONBOARDING -- the first-run "Light Your HART" ceremony. PARITY SOURCE IS
    It is also the first thing a new user ever sees, so it carries the same
    perf bar as the desktop (no lag, no jank on the ceremony).
 
+## THE SPLIT RULE -- what goes native vs what stays Nunba-canonical
+Nunba is not a handful of pages: the landing-page tree carries ~36 Social
+surfaces (Feed, Communities, Chat, Inbox, Profile, Marketplace, Recipes,
+Wallet/Compute, Agents, Notifications, Settings, Onboarding, KidsLearning,
+Mindstory, ...) plus Admin/Channels/Agent/payments. Porting that to Rust would
+be insane and would fork the product. So the rule, once, for all of it:
+
+**SHELL CHROME goes NATIVE. APPLICATION SURFACES stay NUNBA-CANONICAL, served
+natively as microfrontends.**
+
+- **Native (hart-comp scene, this program):** the things that must feel like the
+  OS and are hit every second -- wallpaper/bloom field, orb + rings + voice
+  states, top bar, taskbar/dock, window chrome + placement, workspaces, start
+  menu, notifications/toasts, context menus, lock screen, and the FIRST-RUN
+  ceremony (P9, from Nunba's canonical source, retiring the shell's copy).
+  These are the surfaces where a frame of lag is felt.
+- **Nunba-canonical (NOT ported, served as the app layer):** every product
+  surface -- Social/*, Admin, Channels, payments, docs. HARTOS must NEVER
+  reimplement one (the standing rule
+  [[native_wiring_all_nunba_hartos_functionality_2026-07-09]]; onboarding was
+  the template violation). They render as app CONTENT inside native windows the
+  compositor owns and animates.
+- **Consequence:** the WebView is never deleted. It stops being THE DESKTOP and
+  becomes the app-content renderer for Nunba surfaces -- which is exactly what a
+  browser is good at. Native chrome + web app content is the same split every
+  real OS makes.
+- **The seam:** native window chrome, motion, focus, and the orb overlay are
+  compositor-side; the Nunba microfrontend paints only inside the content rect.
+  A2UI can compose EITHER (native scene node OR a Nunba surface to open), so the
+  agentic heart drives both halves through one contract.
+- **Parity audit obligation:** any HARTOS-local page that duplicates a Nunba
+  surface is a parallel path to RETIRE during this program, not to port.
+
 ## Milestones (each = shippable, OTA-able, tier-guarded)
 M0 scene plumbing: SceneNode enum + A2UI->Scene decoder in hart-comp; render
    via existing element pipeline (comp_core render elements). Feature-flagged
