@@ -644,9 +644,16 @@ in
                             json={'prompt': f'Describe this file in 10 words: {os.path.basename(path)} ({stat.st_size} bytes)'},
                             timeout=10
                         )
-                        description = resp.json().get('response', '''')
+                    # Nix-escape note ('''-collapse, the 09e07e95 class): ''' in a
+                    # Nix indented string emits a literal '' (the Python empty
+                    # string). The previous \'\'\'\' (FOUR quotes) emitted THREE
+                    # quotes -- an unterminated Python triple-quote that swallowed
+                    # the code below it, so the shipped indexer failed to parse:
+                    # "SyntaxError: '(' was never closed" every boot (real-HW
+                    # 2026-07-19/20 journals, hart-smart-index.service dead).
+                        description = resp.json().get('response', ''')
                     except Exception:
-                        description = ''''
+                        description = '''
 
                     entry = {
                         'path': path,
@@ -668,7 +675,9 @@ in
                     dirs[:] = [d for d in dirs if not d.startswith('.')]
                     for f in files[:100]:  # Cap per-directory to avoid overload
                         fpath = os.path.join(root, f)
-                        if os.path.getsize(fpath) < 10_000_000:  # Skip files > 10MB
+                        # exists() first: a broken symlink makes getsize raise and
+                        # would kill the whole indexer loop.
+                        if os.path.exists(fpath) and os.path.getsize(fpath) < 10_000_000:
                             index_file(fpath)
 
                 print(f'[HART OS SmartFS] Index updated: {len(os.listdir(INDEX_DIR))} entries')
