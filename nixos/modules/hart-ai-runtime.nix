@@ -637,20 +637,24 @@ in
                         if existing.get('mtime') == stat.st_mtime:
                             return
 
-                    # Get AI description via Model Bus
+                    # Get AI description via Model Bus.
+                    # NIX-ESCAPE RULE for this embedded script (09e07e95 class):
+                    # the empty-string defaults below are written as a 3-quote
+                    # escape, which Nix collapses to the 2-quote Python empty
+                    # string. Writing 4 quotes emitted 3 -- an unterminated Python
+                    # triple-quote that swallowed the rest of the function, so the
+                    # shipped indexer died with SyntaxError: ( was never closed on
+                    # every boot (real-HW 2026-07-19/20 journals). And NEVER write a
+                    # bare 2-quote pair anywhere in this block, not even in prose:
+                    # inside a Nix indented string it TERMINATES the string and the
+                    # remaining Python is parsed as Nix (that mistake broke the
+                    # iso-desktop build on 2026-07-20).
                     try:
                         resp = requests.post(
                             f'{MODEL_BUS}/v1/chat',
                             json={'prompt': f'Describe this file in 10 words: {os.path.basename(path)} ({stat.st_size} bytes)'},
                             timeout=10
                         )
-                    # Nix-escape note ('''-collapse, the 09e07e95 class): ''' in a
-                    # Nix indented string emits a literal '' (the Python empty
-                    # string). The previous \'\'\'\' (FOUR quotes) emitted THREE
-                    # quotes -- an unterminated Python triple-quote that swallowed
-                    # the code below it, so the shipped indexer failed to parse:
-                    # "SyntaxError: '(' was never closed" every boot (real-HW
-                    # 2026-07-19/20 journals, hart-smart-index.service dead).
                         description = resp.json().get('response', ''')
                     except Exception:
                         description = '''
