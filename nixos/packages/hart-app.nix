@@ -99,8 +99,19 @@ pkgs.stdenv.mkDerivation {
       let
         baseName = baseNameOf path;
         relPath = lib.removePrefix (toString hartSrc + "/") (toString path);
+        # The latency-budget DATA lives under docs/architecture (a reviewed design
+        # artifact, versioned beside LATENCY_HARNESS.md) but it is ALSO an input to
+        # the checkPhase build gate below. Excluding the whole docs/ tree would
+        # leave that gate unable to read its budgets and would fail EVERY ISO
+        # build, so keep the directory chain plus the file itself. Everything else
+        # under docs/ stays excluded.
+        keepForBuildGate =
+          relPath == "docs"
+          || relPath == "docs/architecture"
+          || relPath == "docs/architecture/latency_budgets.json";
       in
       # Exclude dev artifacts, tests, build outputs
+      if keepForBuildGate then true else
       !(
         baseName == ".git" ||
         baseName == "__pycache__" ||
@@ -120,6 +131,27 @@ pkgs.stdenv.mkDerivation {
   };
 
   buildInputs = [ pythonEnv ];
+
+  # ── BUILD GATE: latency-budget coverage ────────────────────────────────────
+  # Steward asked the decisive question (2026-07-20): "fails in tests or at
+  # compile or build time?" A pytest-only guard was too weak HERE, because
+  # `publish-nightly` needs only [build-iso, build-installers] and `build-iso`
+  # does NOT need `gate-checks` -- proven on run 29725400559, where gate-checks
+  # was cancelled while iso-desktop shipped. So a failing coverage test could not
+  # stop a nightly; only `tag-and-sign` is gated on the full suite.
+  # Running the SAME checker (scripts/check_latency_budgets.py -- one
+  # implementation, also called by tests/unit/test_latency_budget_coverage.py)
+  # in checkPhase makes the ISO itself unbuildable when a component ships with no
+  # input-to-photon budget, or when a continuous-interaction budget is raised
+  # above one frame to hide an easing layer. Pure-python, no network, no extra
+  # closure input: it only reads the repo + renders the served shell.
+  doCheck = true;
+  checkPhase = ''
+    runHook preCheck
+    echo "=== latency-budget coverage (build gate) ==="
+    ${pythonEnv}/bin/python scripts/check_latency_budgets.py
+    runHook postCheck
+  '';
 
   installPhase = ''
     mkdir -p $out

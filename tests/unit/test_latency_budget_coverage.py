@@ -156,3 +156,28 @@ def test_ledger_components_are_reflected_in_the_budget_surface_families():
     assert len(comps) >= 20, (
         f"the parity ledger documents a full desktop but only {len(comps)} "
         "components carry latency budgets -- full-spectrum coverage is the mandate")
+
+
+# ── The BUILD gate shares this exact logic (Gate 4: one implementation) ──────
+def test_standalone_checker_is_the_same_logic_and_passes():
+    """scripts/check_latency_budgets.py is what the nix derivation's checkPhase
+    runs, so the ISO cannot BUILD when coverage regresses.
+
+    Why that matters (steward, 2026-07-20 "fails in tests or at compile or build
+    time?"): in this repo publish-nightly needs only [build-iso,
+    build-installers], and build-iso does NOT need gate-checks -- proven on run
+    29725400559 where gate-checks was cancelled while iso-desktop shipped. A
+    pytest-only guard could therefore fail while a nightly still published. The
+    build gate closes that. This test keeps the two callers honest: the same
+    module the build runs must also pass here."""
+    import importlib.util, os
+    # tests/unit/<file> -> repo root is THREE levels up (module-level REPO already
+    # computes this correctly; recomputing it here got it wrong by one level).
+    repo = REPO
+    spec = importlib.util.spec_from_file_location(
+        "check_latency_budgets", os.path.join(repo, "scripts", "check_latency_budgets.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    budgets = mod.load_budgets()
+    errs = mod.check_static(budgets)
+    assert not errs, "static budget invariants failed: " + "; ".join(errs)
