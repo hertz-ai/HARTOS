@@ -125,6 +125,17 @@ pkgs.stdenv.mkDerivation {
     mkdir -p $out
     cp -r . $out/
 
+    # Theme presets MUST ship (real-HW 2026-07-20 'fully bluish, no aura'): the
+    # source filter above drops the whole nixos/ tree (build infra), but the
+    # RUNTIME theme JSONs (ThemeService._THEME_DIR) live under
+    # nixos/assets/conky-themes -- so on the node get_preset('aura') found
+    # nothing, get_active_theme fell to the inline hart-default (no wallpaper
+    # key), and the shell painted the legacy BLUISH navy gradient instead of the
+    # aura cosmic field. Re-install the theme dir at the exact path the code
+    # resolves ($out/nixos/assets/conky-themes); hartSrc is the unfiltered repo.
+    mkdir -p $out/nixos/assets
+    cp -r ${hartSrc}/nixos/assets/conky-themes $out/nixos/assets/conky-themes
+
     # Make the Python environment accessible
     mkdir -p $out/bin
     ln -s ${pythonEnv}/bin/python $out/bin/python

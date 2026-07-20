@@ -990,3 +990,45 @@ def teardown_module():
     import shutil
     if os.path.exists(_tmp_dir):
         shutil.rmtree(_tmp_dir, ignore_errors=True)
+
+
+class TestThemePresetsShipInTheNodePackage:
+    """test_source_guard_*: labeled SOURCE-GUARD (packaging invariant, not
+    behaviourally testable on the Windows dev box -- the regression only exists
+    inside the built nix store package).
+
+    Real-HW 2026-07-20 'fully bluish, no aura': hart-app.nix's cleanSource filter
+    drops the whole nixos/ tree, which silently dropped the RUNTIME theme JSONs
+    (ThemeService._THEME_DIR = <repo>/nixos/assets/conky-themes). On the node
+    get_preset('aura') returned None, get_active_theme fell to the inline
+    hart-default (which has NO wallpaper key), and render_desktop_shell painted
+    the legacy bluish navy gradient. The installPhase must re-install the theme
+    dir at the exact path the code resolves.
+    """
+
+    def test_source_guard_hart_app_nix_installs_conky_themes(self):
+        import io, os
+        nix = io.open(os.path.join(
+            os.path.dirname(__file__), '..', '..', 'nixos', 'packages',
+            'hart-app.nix'), encoding='utf-8').read()
+        assert 'conky-themes' in nix and 'nixos/assets' in nix, (
+            'hart-app.nix no longer installs nixos/assets/conky-themes -- the '
+            'node loses every theme preset and the shell falls back to the '
+            'legacy bluish wallpaper (real-HW 2026-07-20).')
+
+    def test_aura_preset_has_the_wallpaper_that_prevents_the_bluish_fallback(self):
+        # The module fixture redirects _THEME_DIR to a temp dir; point at the REAL
+        # shipped dir (same pattern as the shipped-preset tests above) so this
+        # verifies the actual aura.json the node package installs.
+        import os
+        from unittest.mock import patch
+        from integrations.agent_engine import theme_service as ts
+        real_dir = os.path.join(os.path.dirname(os.path.abspath(ts.__file__)),
+                                '..', '..', 'nixos', 'assets', 'conky-themes')
+        real_dir = os.path.normpath(real_dir)
+        with patch('integrations.agent_engine.theme_service._THEME_DIR', real_dir):
+            aura = ts.ThemeService.get_preset('aura')
+        assert aura, 'aura.json missing from the shipped theme dir'
+        assert aura.get('wallpaper', {}).get('value'), (
+            'aura has no wallpaper.value -- render_desktop_shell would fall back '
+            'to the legacy bluish gradient even with the preset present.')
