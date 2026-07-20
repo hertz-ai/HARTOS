@@ -307,6 +307,13 @@ in
     # job warms the hart.comp Rust closure at full cores BEFORE the throttled ISO
     # step, so it is reused, not recompiled under the cores=2 cap). The shell-paint
     # watchdog still falls back to sway then cage if Tier-1 fails on real HW.
+    # Leak attribution: sample shell/compositor RSS + FDs into the journal every
+    # 20s. The steward's desktop went 'fast snappy' then hung after a sustained
+    # orb drag; the JS/DOM layer was measured clean on the dev box, so the
+    # accumulation is below JS (WebKit compositing / GPU memory or hart-comp
+    # buffers) and only the node can see it. Cheap + read-only.
+    shellMemWatch.enable = true;
+
     comp.enable = true;
     rustPrecedent.enable = true;
 

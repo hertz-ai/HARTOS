@@ -1402,7 +1402,30 @@ class LiquidUIService:
             from integrations.agent_engine.theme_service import ThemeService
             css_vars = ThemeService.get_css_variables()
             theme = ThemeService.get_active_theme()
+            # Say WHICH theme actually resolved, ONCE per process. Real-HW
+            # 2026-07-19/20: the steward reported the desktop was "fully bluish"
+            # (the #0F0E17 fallback below) on a build that DID ship the theme
+            # presets, and the journal could not settle it -- the only theme line
+            # was hart-liquid-ui's "Theme: auto", which reports the CONFIG, not
+            # the RESOLUTION. This makes the next boot self-diagnosing: theme id
+            # + whether a wallpaper came with it (its absence is what makes the
+            # shell fall back to the legacy navy gradient).
+            if not getattr(LiquidUIService, '_theme_logged', False):
+                LiquidUIService._theme_logged = True
+                _wp = (theme.get('wallpaper', {}) or {}).get('value', '')
+                logger.info(
+                    "[shell] theme RESOLVED id=%s name=%s wallpaper=%s",
+                    theme.get('id', '?'), theme.get('name', '?'),
+                    (_wp[:60] + '...') if _wp else 'NONE (legacy gradient fallback)')
         except Exception:
+            # NEVER silent (Gate: no silent exception gulping). This except is the
+            # exact path that paints the bluish #0F0E17 fallback, so a swallowed
+            # error here looks like a DESIGN choice on a real boot instead of the
+            # failure it is. Log it loudly with the traceback.
+            logger.exception(
+                "[shell] THEME LOAD FAILED -- falling back to the legacy navy "
+                "gradient (#0F0E17). The desktop will NOT look like the active "
+                "theme; this is a fault, not a style.")
             css_vars = ':root { --hart-background: #0F0E17; --hart-accent: #00E6C3; --hart-on-accent: #0F0E17; --hart-active: #00e676; --hart-text: #e0e0e0; --hart-glass-bg: rgba(15,14,23,0.65); --hart-glass-border: rgba(0,230,195,0.18); --hart-muted: #78909c; --hart-surface: #1a1a2e; --hart-blur: 20px; --hart-saturation: 180%; --hart-radius: 16px; --hart-panel-opacity: 0.65; --hart-topbar-height: 40px; --hart-icon-size: 20px; --hart-titlebar-height: 32px; --hart-font-family: "JetBrains Mono"; --hart-font-size: 13px; --hart-heading-size: 18px; --hart-font-weight: 400; --hart-heading-weight: 600; --hart-anim-speed: 200ms; --hart-error: #FF6B6B; --hart-caution: #ffab40; --hart-heading: #00E6C3; --hart-surface-hover: #252540; }'
             theme = {}
 
