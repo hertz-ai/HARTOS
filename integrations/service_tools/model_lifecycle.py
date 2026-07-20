@@ -1327,10 +1327,24 @@ class ModelLifecycleManager:
             # this as a log line so when Nunba is bundled-without-supervisor
             # we can see the LlamaConfig path is unavailable and the G3
             # direct-launch path below is being used by design.
-            logger.info(
-                f"[LLM-WATCHDOG] LlamaConfig import unavailable "
-                f"({e!s}) — falling through to G3 direct-launch supervision"
-            )
+            # LOG ONCE, then debug. A module either imports or it does not: this
+            # verdict cannot change for the life of the process, so re-logging it
+            # on every watchdog tick was ~240 journal lines/hour of pure noise
+            # (real-HW 2026-07-19/20 journals are wallpapered with it, which is
+            # exactly what makes a real fault hard to spot). Still LOGGED, never
+            # silently gulped -- the first occurrence is INFO with the reason, and
+            # subsequent ticks stay visible at debug level.
+            if not getattr(self, '_llm_import_warned', False):
+                self._llm_import_warned = True
+                logger.info(
+                    f"[LLM-WATCHDOG] LlamaConfig import unavailable "
+                    f"({e!s}) - falling through to G3 direct-launch supervision "
+                    f"(logged once; further occurrences at debug)"
+                )
+            else:
+                logger.debug(
+                    f"[LLM-WATCHDOG] LlamaConfig still unavailable ({e!s})"
+                )
         except Exception as e:
             # Previous code only caught ImportError — a real LlamaConfig()
             # instantiation error (e.g. corrupted llama_config.json,

@@ -41,6 +41,11 @@ in
 
       unitConfig = {
         ConditionPathIsDirectory = config.hart.vision.modelDir;
+        # Any crash class still cannot loop forever: after 3 failures in 5 min the
+        # unit gives up until a manual/boot restart (belt for the ExecCondition
+        # suspenders below).
+        StartLimitIntervalSec = 300;
+        StartLimitBurst = 3;
       };
 
       environment = {
@@ -64,6 +69,19 @@ in
         # (= hartApp, the RO nix store) → `OSError: Read-only file system` crashed
         # the sidecar on the ISO (real-HW bdd849 journal). cfg.dataDir is already in
         # ReadWritePaths (writable under ProtectSystem=strict), so log there.
+        # ── The vision sidecar needs TORCH, which hart-app.nix deliberately does
+        #    NOT ship (it would add gigabytes to a live-USB ISO). Without this
+        #    gate the unit passed ConditionPathIsDirectory (the MODEL dir exists),
+        #    then died on `ModuleNotFoundError: No module named 'torch'` and was
+        #    restarted every 15s FOREVER -- real-HW 2026-07-19/20 journals are
+        #    thick with it, burning CPU on a live USB and drowning the log that
+        #    real diagnosis depends on.
+        #    ExecCondition is the right primitive: a non-zero exit marks the unit
+        #    CONDITION-FAILED (cleanly skipped, no restart, no failure spam)
+        #    rather than failed. So on a node without torch, vision is simply
+        #    "not provisioned"; the moment a torch-bearing env is present it
+        #    starts normally with zero config change.
+        ExecCondition = "${hartApp.python}/bin/python -c 'import torch'";
         ExecStart = "${hartApp.python}/bin/python integrations/vision/minicpm_server.py --model_dir ${config.hart.vision.modelDir} --port ${toString cfg.ports.vision} --device ${config.hart.vision.device} --log_file ${cfg.dataDir}/minicpm_sidecar.log";
 
         EnvironmentFile = lib.mkIf (builtins.pathExists "/etc/hart/hart.env") "/etc/hart/hart.env";
