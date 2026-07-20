@@ -793,8 +793,14 @@ jobs:
 
           # Clean up the tag-less draft from the prior refactor (has
           # tag_name=nightly but tag never got created). Idempotent.
-          echo "=== Cleaning up any tag-less nightly drafts ==="
-          gh api "repos/${REPO}/releases" --jq '.[] | select(.draft==true and .tag_name=="nightly") | .id' \
+          echo "=== Cleaning up any tag-less nightly drafts (best-effort) ==="
+          # The LIST call is guarded too: under the repo's immutable-releases
+          # policy (and GH permission-service wobbles) `gh api /releases` can 403
+          # for the Actions integration token, and with pipefail an unguarded list
+          # kills the WHOLE publish before the release is even created (real
+          # 2026-07-19: three consecutive publish-nightly failures; the nightly
+          # had to be hand-published). Cleanup is hygiene, never a gate.
+          { gh api "repos/${REPO}/releases" --jq '.[] | select(.draft==true and .tag_name=="nightly") | .id' 2>/dev/null || true; } \
             | while read -r RID; do
               [[ -n "$RID" ]] && gh api -X DELETE "repos/${REPO}/releases/${RID}" || true
             done
