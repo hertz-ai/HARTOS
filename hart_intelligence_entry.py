@@ -11830,6 +11830,34 @@ def main():
     skills_thread = threading.Thread(target=_init_skills, daemon=True)
     skills_thread.start()
 
+    # Agent engine: daemon supervisor, Phase-2 goal bootstrap, dispatch.
+    #
+    # `init_social` used to do this and deliberately stopped — see
+    # integrations/social/__init__.py ("agent engine init delegated to
+    # caller ... ONE caller, ONE call site").  Nunba's main.py picked the
+    # responsibility up; this standalone launcher never did.  So every
+    # Docker / OS deployment booted with no daemon supervisor and no
+    # Phase-2 bootstrap at all: seeded goals sat `active` forever, nothing
+    # was ever dispatched, and no bootstrap line appeared in the logs to
+    # say so.  (Verified on the central node: 72 goals, all `active`, zero
+    # dispatched, no engine log lines.)
+    #
+    # Called here at the tail of main() on purpose:
+    #   - the module is fully imported by now, so the deferred thread's
+    #     heavy imports cannot race top-level ones — that race is the
+    #     documented deadlock in integrations/agent_engine/__init__.py;
+    #   - Flask has not served a request yet, so Phase-1's
+    #     register_blueprint() calls are still legal.
+    # init_agent_engine is idempotent, so a launcher that already called it
+    # (Nunba) is unaffected.
+    try:
+        from integrations.agent_engine import init_agent_engine
+        init_agent_engine(app)
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            "Agent engine init failed — no seeded goal will ever execute on "
+            "this node: %s", e, exc_info=True)
+
     from core.port_registry import get_port
     _serve_app(app, host='0.0.0.0', port=get_port('backend'))
 

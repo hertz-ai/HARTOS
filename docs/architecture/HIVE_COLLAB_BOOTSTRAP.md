@@ -68,11 +68,20 @@ and pulled count explicitly.
    goal into the same `/chat` pipeline with `create_agent=True,
    autonomous=True`. Goals live in `goal_manager.py` (12 verticals);
    bootstrap goals seed from `goal_seeding.py::SEED_BOOTSTRAP_GOALS`.
-3. **Know who starts the daemon.** `python hart_intelligence_entry.py` starts
-   ONLY the coding daemon. The unified `AgentDaemon` starts from exactly three
-   places: Nunba's `hartos_bootstrap.py` (step 8), the NixOS unit
-   `nixos/modules/hart-agent.nix`, or **`scripts/run_flywheel_dev.py`** — use
-   that script when you need the flywheel in a dev session.
+3. **Know who starts the daemon.** The unified `AgentDaemon` starts from four
+   places: `hart_intelligence_entry.py::main()` (the standalone launcher — this
+   is what Docker and the OS images run), Nunba's `hartos_bootstrap.py`
+   (step 8), the NixOS unit `nixos/modules/hart-agent.nix`, or
+   **`scripts/run_flywheel_dev.py`** — use that script when you need the
+   flywheel in a dev session. All four call the same idempotent
+   `init_agent_engine(app)`; there is no second start path.
+
+   The standalone launcher was added on 2026-07-21. `init_social` had
+   delegated engine init to "the caller", Nunba's bootstrap picked it up, and
+   this launcher never did — so Docker/OS nodes booted with no daemon
+   supervisor and no goal bootstrap. Symptom: seeded goals sit `active`
+   forever, nothing dispatches, and no engine line appears in the logs at all
+   (the central node was found with 72 goals and zero dispatches).
 4. **Respect the yield contract.** The daemon yields to the foreground user
    (`dispatch.py::should_yield_to_user`: live request, user active in the
    last 600s, model/governor throttle). A Claude Code session IS foreground —
