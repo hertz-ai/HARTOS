@@ -38,9 +38,24 @@ jobs:
             echo "Deploy commit: $DEPLOY_COMMIT"
             git log -1 --oneline
 
-            echo "=== Clean old containers/images ==="
+            echo "=== Free disk BEFORE the build ==="
+            # Deepbox was filling up (dozens of ~8GB langchain_gpt:<sha> + <none>
+            # images from prior --no-cache builds), so the build itself failed
+            # with 'No space left on device' at apt-get — which meant the OLD
+            # end-of-run prune could never execute.  So reclaim FIRST, then build.
             docker rm -f langchain langchain_tmp 2>/dev/null || true
-            docker rmi -f langchain_gpt:main 2>/dev/null || true   # drop legacy :main (now using :latest; build re-tags :latest itself)
+            docker rmi -f langchain_gpt:main 2>/dev/null || true   # drop legacy :main (now using :latest)
+            # Delete every stale langchain_gpt tag except :latest/:main (the
+            # possible running image).  rmi -f only removes the TAG if the image
+            # backs a running container, so the live service stays up.
+            docker images 'langchain_gpt' --format '{{.Repository}}:{{.Tag}}' \
+              | grep -vE ":(latest|main)$" \
+              | xargs -r docker rmi -f 2>/dev/null || true
+            docker image prune -f || true      # dangling <none> layers
+            docker builder prune -af || true   # ALL build cache
+            echo "--- disk after pre-build prune ---"
+            docker system df || true
+            df -h / || true
 
             echo "=== Build Docker image ==="
             docker build --no-cache \
