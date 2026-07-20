@@ -155,6 +155,28 @@ jobs:
                     missing.append(k)
             if missing:
                 raise SystemExit("Missing env vars: " + ",".join(missing))
+
+            # Values arriving through docker --env-file keep any quotes the
+            # file wrote. OPENAI_API_KEY was stored as "sk-..." and every
+            # request went out with literal quote characters around the key,
+            # so the LLM answered 401 and every agent goal produced nothing
+            # while still reporting as dispatched. Catch it at deploy time.
+            for k in ("OPENAI_API_KEY", "AZURE_OPENAI_API_KEY", "GROQ_API_KEY",
+                      "LANGCHAIN_API_KEY", "AZURE_OPENAI_ENDPOINT"):
+                v = os.getenv(k) or ""
+                if v[:1] in ("\"", "'"'"'") or v[-1:] in ("\"", "'"'"'"):
+                    raise SystemExit(
+                        k + " is quote-wrapped in the env file; docker passes "
+                        "the quotes through and the credential will be rejected")
+
+            # Azure is optional, but half-configured Azure is not: the client
+            # silently falls back to api.openai.com, which is how this node
+            # ended up calling a public endpoint with a dead key.
+            az = [k for k in ("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY",
+                              "AZURE_OPENAI_DEPLOYMENT") if os.getenv(k)]
+            if az and len(az) < 3:
+                raise SystemExit("partial Azure config: " + ",".join(az))
+            print("azure openai:", "configured" if len(az) == 3 else "not used")
             PY
             '
 
