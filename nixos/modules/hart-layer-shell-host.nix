@@ -256,6 +256,10 @@ let
     # plugins (pulsesrc/pipewiresrc + opus/webrtc) so the click-to-talk orb can
     # actually capture the mic. Inherited by the WebKitWebProcess capture child.
     export GST_PLUGIN_SYSTEM_PATH_1_0="${gstPluginPath}"
+    # One-shot diagnostic for the 'GStreamer element valve not found' -> WebProcess
+    # SIGSEGV chain (real-HW 2026-07-20): journal the plugin path so the next boot
+    # shows exactly which store paths WebKit's capture pipeline searches.
+    echo "[hart-glass-shell-gtk4] GST_PLUGIN_SYSTEM_PATH_1_0=$GST_PLUGIN_SYSTEM_PATH_1_0" >&2
     # ── gtk4-layer-shell LOAD ORDER (the real-HW "not a layer surface" fix) ──
     # gtk4-layer-shell works by INTERPOSING libwayland-client's wl_proxy_* symbols, so
     # it MUST be loaded BEFORE libwayland-client. Pulled in lazily via the GI typelib
@@ -503,6 +507,14 @@ class GlassShellLayer:
         # is gated best-effort on the human's AI-sensing kill-switch. Connected before
         # load_uri so it is wired before any page script can call getUserMedia.
         webview.connect('permission-request', self._on_permission_request)
+        # A dead WebKitWebProcess leaves a MAPPED-but-blank surface the paint
+        # watchdog cannot see (shell-ready already fired honestly, the UI process
+        # is alive) -- the real-HW 2026-07-20 boot: clicking the mic hit the
+        # GStreamer capture path ('element valve not found') and SIGSEGV'd the web
+        # process in libwebkitgtk-6.0, freezing the desktop with no recovery.
+        # Exit hard instead: the supervisor relaunches the tier (fresh web process)
+        # in seconds, and a crash LOOP degrades down the ladder by design.
+        webview.connect('web-process-terminated', self._on_web_process_terminated)
         # False-healthy guard, cleared on every fresh load_uri (this initial
         # navigation), set in _on_load_failed. Initialised before load_uri runs so it
         # is always defined before the first load-changed / load-failed fires.
@@ -616,6 +628,19 @@ class GlassShellLayer:
         # _on_load_changed, so whichever completes second fires the marker.
         if self._mapped and self._load_finished and not self._last_load_failed:
             _signal_painted()
+
+    def _on_web_process_terminated(self, _webview, reason):
+        # The web process died (crash / exceeded limits / killed). The surface
+        # stays mapped but renders NOTHING from here on, and every recovery signal
+        # (shell-ready, watchdog) has already legitimately passed -- so the only
+        # honest move is to crash the HOST: the supervisor counts it and relaunches
+        # the tier with a fresh web process (seconds), and a repeat-crash loop
+        # walks down the ladder to a tier that holds. Never linger blank.
+        import sys as _sys, os as _os
+        print('[hart-glass-shell-gtk4] WebKitWebProcess TERMINATED (%s) -- exiting '
+              'so the supervisor relaunches the tier' % reason, file=_sys.stderr)
+        _sys.stderr.flush()
+        _os._exit(1)
 
     def _on_load_failed(self, _webview, _event, failing_uri, error):
         # Mark this load as FAILED so the LoadEvent.FINISHED that WebKit STILL emits

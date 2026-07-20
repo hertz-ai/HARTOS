@@ -207,6 +207,20 @@ class TestGtk4SoftwareGLFloor:
             "supervisor drops a tier -- GTK swallows handler exceptions otherwise."
         )
 
+    def test_web_process_death_crashes_the_host_for_relaunch(self, src):
+        # Real-HW 2026-07-20: clicking the mic hit the GStreamer capture path
+        # ('element valve not found') and SIGSEGV'd the WebKitWebProcess in
+        # libwebkitgtk-6.0. The UI process survives, the surface stays MAPPED but
+        # renders nothing, and shell-ready had already legitimately fired -- so no
+        # watchdog can see it. The host must connect web-process-terminated and
+        # exit non-zero so the supervisor relaunches the tier (fresh web process);
+        # a crash loop walks down the ladder by design. Never linger blank.
+        assert "webview.connect('web-process-terminated', self._on_web_process_terminated)" in src
+        assert "def _on_web_process_terminated" in src, (
+            "the web-process-terminated handler is missing -- a dead web process "
+            "freezes the desktop with no recovery (the 2026-07-20 mic-click hang)."
+        )
+
     def test_forces_gsk_software_renderer_the_real_hw_paint_fix(self, src):
         # THE real-HW paint-hang fix. GTK4 draws via GSK, whose DEFAULT renderer is
         # GL — a SEPARATE GL context from WebKit's, NOT covered by WEBKIT_DISABLE_*.
