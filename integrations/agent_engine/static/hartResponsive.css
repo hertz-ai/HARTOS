@@ -119,7 +119,15 @@
   --hart-blur: 30px;
   --hart-saturation: 165%;
   --hart-radius: 20px;
-  --hart-accent-rgb: 0,230,195;
+  /* --hart-accent-rgb is DELIBERATELY NOT declared here. It is emitted by the
+     server from the ACTIVE THEME's accent (liquid_ui_service accent_rgb_css,
+     always emitted -- theme value or the brand fallback). This stylesheet loads
+     LAST and would win on source order, so a static declaration here FROZE every
+     rgba(var(--hart-accent-rgb),A) glow at one hue and silently killed live
+     retinting for the palette picker (CH1) and every non-default theme -- the
+     accent surfaces below (.di-glyph glow, .desktop-icon.selected, focus rings,
+     the pulse keyframe) could never follow the theme. Found by the CSS parity
+     ledger audit, 2026-07-20. Do NOT re-add it: declare defaults server-side. */
   /* Secondary brand accent (a2) — the VIBRANT duotone default (b1.2): teal LEADS,
      violet ACCENTS. This makes "Vibrant" the shell brand default without JS; the
      Personalize palette picker (hartPersonalize.js #161) overrides both live. */

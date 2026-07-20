@@ -181,3 +181,45 @@ def test_orb_drag_kills_the_transform_transition(shell):
     html = svc.render_desktop_shell()
     assert '.hart-hero.hart-hero-dragging{transition:none}' in html, (
         'the dragging transition-kill rule is missing -- orb drag rubber-bands')
+
+
+def test_accent_rgb_is_theme_driven_not_frozen_by_the_stylesheet(shell):
+    """Live accent RETINT must reach every rgba(var(--hart-accent-rgb),A) glow.
+
+    Regression (CSS parity ledger audit, 2026-07-20): hartResponsive.css declared
+    a STATIC ``--hart-accent-rgb: 0,230,195`` in :root. That stylesheet loads LAST,
+    so it won on source order and OVERRODE the server's theme-derived value --
+    freezing every accent glow (desktop-icon glyph, .desktop-icon.selected, focus
+    rings, the pulse keyframe) at one hue. The palette picker (CH1) and every
+    non-default theme were silently dead for those surfaces.
+
+    Behavioural: fetch the REAL served stylesheet + render the REAL shell, and
+    prove (a) the stylesheet no longer redeclares the token, and (b) the server
+    still emits it, so the cascade resolves to the theme."""
+    svc, client = shell
+    css = client.get('/shell/static/hartResponsive.css')
+    assert css.status_code == 200
+    body = css.get_data(as_text=True)
+    import re
+    # No :root DECLARATION of the token (usages via var(...) are the point).
+    decls = re.findall(r'--hart-accent-rgb\s*:', body)
+    assert not decls, (
+        'hartResponsive.css redeclares --hart-accent-rgb; it loads last and would '
+        'freeze every accent glow, killing live theme retint')
+    # And the server must still define it, or those var() usages resolve to nothing.
+    html = svc.render_desktop_shell()
+    assert re.search(r'--hart-accent-rgb:\s*[0-9]+,[0-9]+,[0-9]+', html), (
+        'the server no longer emits --hart-accent-rgb -- accent glows would break')
+
+
+def test_brand_teal_hex_and_rgb_fallbacks_agree(shell):
+    """The compiled-in emergency fallbacks for the SAME token must not disagree.
+
+    Ledger audit b1.1/b1.2: the fallback table used the pre-brand #00D4AA while
+    the rgb fallback was the brand 0,230,195 (#00E6C3) -- so solid fills and
+    rgba() glows painted DIFFERENT teals whenever the theme import failed, the
+    monochrome-teal wash the steward rejected. Both must be the brand teal."""
+    svc, _client = shell
+    html = svc.render_desktop_shell()
+    assert '#00D4AA' not in html, 'pre-brand teal #00D4AA is still served (brand is #00E6C3)'
+    assert 'rgba(0,212,170' not in html, 'pre-brand teal rgb 0,212,170 is still served'

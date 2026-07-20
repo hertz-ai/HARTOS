@@ -1403,7 +1403,7 @@ class LiquidUIService:
             css_vars = ThemeService.get_css_variables()
             theme = ThemeService.get_active_theme()
         except Exception:
-            css_vars = ':root { --hart-background: #0F0E17; --hart-accent: #00D4AA; --hart-on-accent: #0F0E17; --hart-active: #00e676; --hart-text: #e0e0e0; --hart-glass-bg: rgba(15,14,23,0.65); --hart-glass-border: rgba(0,212,170,0.18); --hart-muted: #78909c; --hart-surface: #1a1a2e; --hart-blur: 20px; --hart-saturation: 180%; --hart-radius: 16px; --hart-panel-opacity: 0.65; --hart-topbar-height: 40px; --hart-icon-size: 20px; --hart-titlebar-height: 32px; --hart-font-family: "JetBrains Mono"; --hart-font-size: 13px; --hart-heading-size: 18px; --hart-font-weight: 400; --hart-heading-weight: 600; --hart-anim-speed: 200ms; --hart-error: #FF6B6B; --hart-caution: #ffab40; --hart-heading: #00D4AA; --hart-surface-hover: #252540; }'
+            css_vars = ':root { --hart-background: #0F0E17; --hart-accent: #00E6C3; --hart-on-accent: #0F0E17; --hart-active: #00e676; --hart-text: #e0e0e0; --hart-glass-bg: rgba(15,14,23,0.65); --hart-glass-border: rgba(0,230,195,0.18); --hart-muted: #78909c; --hart-surface: #1a1a2e; --hart-blur: 20px; --hart-saturation: 180%; --hart-radius: 16px; --hart-panel-opacity: 0.65; --hart-topbar-height: 40px; --hart-icon-size: 20px; --hart-titlebar-height: 32px; --hart-font-family: "JetBrains Mono"; --hart-font-size: 13px; --hart-heading-size: 18px; --hart-font-weight: 400; --hart-heading-weight: 600; --hart-anim-speed: 200ms; --hart-error: #FF6B6B; --hart-caution: #ffab40; --hart-heading: #00E6C3; --hart-surface-hover: #252540; }'
             theme = {}
 
         # Performance tier detection
@@ -1524,16 +1524,16 @@ class LiquidUIService:
         # ring / selection re-tints when the theme accent changes. Parsed from the
         # SAME accent ThemeService resolves (#308-310). Emitted right after
         # {css_vars} (later source wins) so it overrides any earlier definition.
-        # _CSS_LIVING_GLASS reads it via var(--hart-accent-rgb, 0,212,170); this
+        # _CSS_LIVING_GLASS reads it via var(--hart-accent-rgb, 0,230,195); this
         # makes the variable real rather than relying only on the teal fallback.
         try:
-            _ac = ((theme.get('colors', {}) or {}).get('accent', '00D4AA')
-                   or '00D4AA').lstrip('#')
+            _ac = ((theme.get('colors', {}) or {}).get('accent', '00E6C3')
+                   or '00E6C3').lstrip('#')
             _ar, _ag, _ab = (int(_ac[0:2], 16), int(_ac[2:4], 16), int(_ac[4:6], 16))
             accent_rgb_css = (':root{--hart-accent-rgb:'
                               + f'{_ar},{_ag},{_ab}' + '}')
         except (ValueError, IndexError, TypeError, AttributeError):
-            accent_rgb_css = ':root{--hart-accent-rgb:0,212,170}'
+            accent_rgb_css = ':root{--hart-accent-rgb:0,230,195}'
 
         # Import panel manifest
         try:
@@ -1723,7 +1723,7 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
   font-family:var(--ds-font-body);font-size:14px;line-height:20px;outline:none;
   transition:border-color var(--ds-duration-medium) var(--ds-ease-standard),
     box-shadow var(--ds-duration-medium) var(--ds-ease-standard)}
-.ds-input:focus{border-color:var(--hart-accent);box-shadow:0 0 0 2px rgba(0,212,170,0.25)}
+.ds-input:focus{border-color:var(--hart-accent);box-shadow:0 0 0 2px rgba(var(--hart-accent-rgb,0,230,195),0.25)}
 .ds-input::placeholder{color:var(--hart-muted)}
 .ds-input-label{font-size:12px;font-weight:500;letter-spacing:0.5px;
   color:var(--hart-muted);text-transform:uppercase}
@@ -2015,7 +2015,7 @@ img{-webkit-user-drag:none;user-select:none}
 .hart-hero.dimmed{opacity:0;transform:translate(-50%,-56%) scale(.96);filter:blur(6px)}
 .hart-hero.dimmed>*{pointer-events:none}
 .hart-hero-brand{display:flex;align-items:center;gap:9px;opacity:.92}
-.hart-hero-brand img{width:34px;height:34px;filter:drop-shadow(0 3px 12px rgba(0,212,170,.4))}
+.hart-hero-brand img{width:34px;height:34px;filter:drop-shadow(0 3px 12px rgba(var(--hart-accent-rgb,0,230,195),.4))}
 .hart-hero-brand span{font-size:14px;font-weight:600;letter-spacing:2.5px;opacity:.8}
 /* The ORB ITSELF is the click-to-talk control (no mic glyph inside it). The
    canvas keeps pointer-events:none; the orbwrap captures the click + carries
@@ -2318,7 +2318,7 @@ html.a11y-rmotion .panel{animation:none}
 :root{
   /* ── Accent triad (theme-driven; re-tints on theme change) ── */
   --lg-accent: var(--hart-accent);
-  --lg-accent-rgb: var(--hart-accent-rgb, 0,212,170);
+  --lg-accent-rgb: var(--hart-accent-rgb, 0,230,195);
   --lg-glow-0: rgba(var(--lg-accent-rgb),.55);
   --lg-glow-1: rgba(var(--lg-accent-rgb),.26);
   --lg-glow-2: rgba(var(--lg-accent-rgb),.12);
@@ -2749,7 +2749,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   font-family:var(--ds-font-body);outline:none;width:280px;text-align:center}}
 .lock-status{{font-size:12px;color:var(--hart-muted)}}
 .lock-brand{{display:flex;align-items:center;gap:10px;margin-bottom:8px;opacity:.92}}
-.lock-brand img{{width:30px;height:30px;filter:drop-shadow(0 2px 10px rgba(0,212,170,.4))}}
+.lock-brand img{{width:30px;height:30px;filter:drop-shadow(0 2px 10px rgba(var(--hart-accent-rgb,0,230,195),.4))}}
 .lock-brand span{{font-size:13px;letter-spacing:2.5px;font-weight:600;opacity:.8}}
 .lock-screen.setup .lock-clock,.lock-screen.setup .lock-date{{display:none}}
 /* ── Desktop widgets (live clock + system) ── */
