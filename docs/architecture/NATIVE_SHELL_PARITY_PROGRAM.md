@@ -244,6 +244,47 @@ M5 voice native: PipeWire capture + TTS playback in the backend, orb states
 M6 flip: nativeShell default ON on Tier-1; WebView demoted to app content +
    fallback tiers (never deleted -- it is the never-fail floor's renderer).
 
+## THE BAR: better than Windows 12 and macOS (steward 2026-07-20)
+Parity with our own HTML shell is the FLOOR, not the goal. The goal is a desktop
+that beats the incumbents. That requires being honest about which fights are
+winnable, because a small project that attacks their strengths loses.
+
+**Where we do NOT compete (accept and route around):** driver/hardware breadth,
+app-ecosystem size, decades of accumulated small-detail polish, enterprise
+management + certifications, localization breadth. We buy these where possible
+(Nix + Linux drivers, Flatpak/Wine/Waydroid for apps) rather than rebuild them.
+
+**Where they STRUCTURALLY cannot follow us:**
+1. **The agent IS the shell.** Windows bolts Copilot onto a 1995 shell; macOS
+   bolts Apple Intelligence onto a 1984 one. Both are assistants INSIDE a
+   compiled UI. Ours COMPOSES the UI. They cannot retrofit this without
+   rewriting their shell -- their UI is compiled, ours is codegen'd from data.
+2. **Runtime component genesis.** Neither can invent a new native component
+   while you work. We can (SDF tree -> WGSL/GLSL -> validate -> hot-compile).
+   This is a capability gap, not a polish gap.
+3. **Local-first + consent.** They trend cloud-tethered; we are local by default
+   with explicit opt-in. A privacy claim they cannot make credibly.
+4. **Ownership.** 90/9/1 to contributors, crowdsourced compute, no monopoly --
+   unmatched without cannibalising their own business model.
+5. **The hive.** Recipes AND agent-authored UI components shared peer-to-peer.
+   Nothing equivalent exists.
+
+**Where we WIN on feel (measurable, and the fastest visible win):**
+The single most "premium" quality of macOS is not looks, it is LATENCY and the
+absence of jank. That is winnable by us because we own the whole path.
+| Metric | Windows 11/12 typical | macOS typical | HART TARGET |
+|---|---|---|---|
+| input-to-photon (drag/hover) | 60-120ms, high variance | 50-80ms | **< 25ms, low variance** |
+| dropped frames under load | common | rare | **p99.9 zero on the shell** |
+| shell stutter during app launch | visible | slight | **none (shell never shares a thread with app work)** |
+| UI coherence | 3 eras of dialogs coexist | high | **one language, zero legacy surfaces** |
+Rationale: we have NO legacy surfaces to carry and NO compositor we do not own,
+so coherence and latency are ours to lose, not theirs to defend.
+
+**The rule this implies:** every milestone reports its measured input-to-photon
+and frame-time distribution in the journal. "Feels fine" is not evidence. A
+milestone that regresses latency fails even if it looks better.
+
 ## Performance bar (steward 2026-07-20: "ultrafast and snappy closely mirroring
 ## the mock natively and no lag whatsoever") -- BINDING NFRs, gated per milestone
 - 60fps sustained on the HD 620 GLES path; frame budget 16.6ms, p99 < 12ms
