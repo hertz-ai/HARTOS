@@ -14,6 +14,28 @@ on:
         default: true
   push:
     branches: [main, gpt4.1, develop, debug_1, fix/boot-issues-nouveau-firstboot]
+    # PROSE-ONLY pushes must NOT trigger a full ~3h ISO build.
+    # 2026-07-20: a run of doc/ledger commits queued NINE redundant Release runs
+    # and STARVED the one build that mattered (066cb5ed) of a runner -- its
+    # publish sat queued for hours until the redundant runs were hand-cancelled.
+    # Markdown cannot change a shipped artifact: docs/ is excluded from the
+    # hart-app source filter (nixos/packages/hart-app.nix).
+    #
+    # DELIBERATELY CONSERVATIVE -- what is NOT ignored, and why:
+    #   * docs/architecture/latency_budgets.json -- .json, not .md, so it still
+    #     triggers. It IS a build-gate input (hart-app checkPhase), so a budget
+    #     change must rebuild. This is also why no `!` negation is used here:
+    #     paths-ignore does not support negation reliably, and a silently
+    #     mis-parsed pattern would skip builds that must run.
+    #   * tests/** -- NOT ignored. gate-checks (the unit-test runner) lives in
+    #     THIS workflow, so ignoring tests would stop CI from checking test
+    #     changes. Trading CI coverage for queue time is the wrong trade.
+    # paths-ignore is push-only; workflow_dispatch above is unaffected, so a
+    # release can always be forced regardless of what changed.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/design/**'
+      - 'LICENSE'
 
 permissions:
   contents: write
