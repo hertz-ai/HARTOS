@@ -23,6 +23,25 @@ Field, Orb, Ring, Card, Row, Text, Glyph)`. ONE composer (the LLM), two
 renderers during the bridge, converging on one. No parallel A2UI dialect --
 the schema is the existing one served by liquid_ui_service/A2UI.
 
+## BINDING instruction sources (parity = these, not just the mock)
+The steward's instructions are already documented; the native shell is built TO
+them, milestone-audited against them exactly as the HTML shell is (CLAUDE.md
+binding rule):
+1. **docs/design/HOME_DESKTOP_DESIGN_CHECKLIST.md** -- THE instruction record
+   (~55 rules, 11 groups a-k, steward's verbatim quotes). EMPHATIC rules (fixed
+   one-screen canvas, no page scroll, breathing orb, no mic inside the orb,
+   spectrum-not-mono, NO em dashes) bind every milestone; consult BEFORE any
+   native design change, update it WITH any new instruction.
+2. **HART_OS_FULL_DESKTOP_SPEC.md** -- the 15 RULES + W1-W10 workstreams.
+3. **docs/architecture/HART_OS_NATIVE_ARCHITECTURE.md** -- the native
+   architecture this program executes (hart-comp = the moat, L2 host windows).
+4. **docs/design/LIQUID_UI_AGENTIC_FRAMEWORK_PLAN.md** -- the agentic A2UI
+   contract the native scene graph must keep serving.
+5. The Aura mock (steward's reference HTML) + the aura theme JSON -- the visual
+   target the checklist's rules govern.
+Every milestone closes with a checklist AUDIT (APPLIED/PARTIAL/MISSING), the
+same W1-audit pattern the checklist already carries.
+
 ## Parity inventory (what the HTML shell has == the checklist)
 P1 background: runtime-composed pre-blurred bloom field (hartBloom.js model:
    compose once, palette-driven --hart-amb-*, recompose on mood).
