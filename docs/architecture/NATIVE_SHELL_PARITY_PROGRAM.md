@@ -59,6 +59,20 @@ P7 states: listening/thinking/speaking tints, reduced-motion, a11y, themes
    (conky-themes JSON = the palette source for BOTH renderers).
 P8 voice: click-to-talk capture + TTS playback (native: PipeWire directly --
    no GStreamer-in-WebKit, the exact class that segfaulted).
+P9 ONBOARDING -- the first-run "Light Your HART" ceremony. PARITY SOURCE IS
+   **NUNBA'S CANONICAL MICROFRONTEND**, not the shell's copy: the HTML shell
+   serves its own vanilla `static/hartOnboarding.js`, a REIMPLEMENTATION of
+   `Nunba-HART-Companion/landing-page/src/components/HART/LightYourHART.js`
+   (steward flagged 2026-07-19; the standing native-wiring task
+   [[native_wiring_all_nunba_hartos_functionality_2026-07-09]] already names
+   onboarding "the template case" for parallel paths to retire).
+   Therefore: do NOT port the shell's copy. Inventory the CANONICAL Nunba
+   ceremony (narration beats, language pick, name seal, companion progress,
+   its motion + brand treatment) and build the NATIVE scene from THAT, so the
+   native shell RETIRES the duplicate instead of immortalising it in Rust.
+   Backend contract stays the ONE existing `/api/onboarding/*`.
+   It is also the first thing a new user ever sees, so it carries the same
+   perf bar as the desktop (no lag, no jank on the ceremony).
 
 ## Milestones (each = shippable, OTA-able, tier-guarded)
 M0 scene plumbing: SceneNode enum + A2UI->Scene decoder in hart-comp; render
