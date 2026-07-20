@@ -418,7 +418,7 @@ Rules that follow from that mandate:
 
 | CSS surface | effects | states | animations | native SceneNode mapping |
 |---|---|---|---|---|
-| `.mic-btn` / `.mic-btn.recording` | `cursor:pointer`; recording `color:var(--hart-error)!important` | recording; potato (**animation string EMPTY and `@keyframes pulse` not emitted at all**) | `pulse 1s infinite` | **Glyph** legacy mic -- M3/M6 |
+| `.mic-btn` / `.mic-btn.recording` | `cursor:pointer`; recording `color:var(--hart-error)!important` | recording; potato (**animation string EMPTY and `@keyframes pulse` not emitted at all**) | `pulse 1s infinite` | **DEAD -- do NOT port.** Verified still wired (liquid_ui_service.py l.2812-2813 style; l.5946/5957/5965 toggle `.recording`), but it is a SECOND mic control living OUTSIDE the grouped sensory cluster, which checklist **g1** forbids (all sensory grouped) and **c5** reinforces (the orb is the control; no stray mic). Its recording cue is `--hart-error` **RED**, precisely the cue this ledger's own supersession entries 2-3 ban in favour of cyan `--lg-listen-rgb`. Native parity target is the grouped `.hart-senses-mic` + the orb, NOT this. Retire it in the web shell too. |
 
 ## A43. Deterministic visibility engine -- `html[data-*]` contract
 
@@ -486,7 +486,7 @@ Rules that follow from that mandate:
 
 **Z-index ladder (complete):** wallpaper 0 / `.hart-ambient` 0 / bloom canvas 1 / grain 2 / vignette 2 / `.hart-desktop` 20 / `.hart-widgets` 30 / `.hart-hero` 40 / `.lg-marquee` 55 / `.desktop-icon.dragging` 60 / `.panel-container` 100 / `.panel.focused` 999 / `.top-bar` 1000 / `.agent-pill` 1500 / `.assistant-chat` 1600 / `.start-menu` 2000 / `.ctx-menu` 3000 / `.taskbar` 8000 / `.hart-ws-switcher` 8050 / `.lg-senses-ghost` 8090 / `.hart-senses` 8100 / `.hart-icustom-backdrop` 9000 / `.toast-container` 9500 / `.lock-screen` 9999 / `.ds-modal-overlay` 10000 / `.hart-onboarding` 12000 / `#hart-boot` + `#_js_err` 99999 / `.skip-link` 100000. **Note the inversion: `.taskbar` (8000) sits BELOW `.hart-ws-switcher` (8050) and `.hart-senses` (8100).**
 
-**Fixed-canvas invariant:** `html,body{width:100%;height:100%;overflow:hidden}` + `overscroll-behavior:none`. Only `.start-scroll`, `.ac-messages`, `.panel-body .native-content` and `.hart-mkt` scroll internally. Every top-level surface is `position:fixed`.
+**Fixed-canvas invariant:** `html,body{width:100%;height:100%;overflow:hidden}` + `overscroll-behavior:none`. Only `.start-scroll`, `.ac-messages`, `.panel-body .native-content` and `.hart-mkt` scroll internally, PLUS one kiosk-debug exception: `#_js_err` (`max-height:40vh;overflow-y:auto`, the on-screen JS error sink built by the shell's error handler, liquid_ui_service.py l.3101-3104). It is a DEBUG surface, not desktop furniture -- do NOT port it as a scrolling native view; the native shell reports errors to the journal + a toast. Recorded so the enumeration is exhaustive against the a1/a2 fixed-canvas rule it exists to enforce. Every top-level surface is `position:fixed`.
 
 ---
 
@@ -504,6 +504,7 @@ Rules that follow from that mandate:
 
 | CSS surface | effects | states | animations | native SceneNode mapping |
 |---|---|---|---|---|
+| `hart_orb_breathing` (localStorage) | **c8 BINDING CONTRACT, previously ABSENT from this ledger.** The persisted orb-breathing preference, **default ON**; `hartHero.js` l.81-92 is its SOLE writer (Gate 4: one writer). It gates BOTH `buildOrbAura`'s concentric brand rings AND `voiceOrbViz`'s breathe glow -- i.e. it is the user's off-switch for the FEEL-alive pillar, and it is INDEPENDENT of the `--hart-motion-*` CSS layer gates (those are GPU/Personalize gates; this is the user's own). Voice ENERGY still reacts when OFF (energy is not breathing). | on (default) / off; survives reload | gates canvas breathe modulation + the aura rings | **Orb** -- M2/M3: the native orb MUST honour this pref, and it must remain a real user-visible toggle (checklist c8), not be folded into the motion layers |
 | master + layer gates | `--hart-motion-speed:1` [**unitless multiplier applied to EVERY duration via `calc(base * speed)`**]; LAYER 1 `--hart-motion-ambient:running`; LAYER 2 `--hart-motion-orb:running`; LAYER 3 `--hart-motion-rings:running`; LAYER 4 `--hart-motion-detail:running`. Each layer var is an `animation-play-state` value -> **ONE Personalize write toggles a whole group** | running / paused | vocabulary declaration only | **Chrome** motion control plane -- **M3/M6 (expose all five as live-writable)** |
 | amplitude + duration tokens | `--hart-anim-blob-speed:18s`; `-hue-speed:22s`; `-hue-amt:28deg` (read INSIDE `@keyframes vHue`); `-breathe-speed:4s`; `-breathe-amt:1.08` (inside `vBreathe`); `-float-speed:9s`; `-float-amt:-10px` (inside `vFloat`); `-spin-speed:60s`; `-spin-rev-speed:90s` **[DEAD]**; `-spinc-speed:26s` **[DEAD]**; `-blink-speed:1.05s` **[DEAD]**; `-wave-speed:1.1s` **[DEAD]**; `-dash-speed:4s` **[DEAD]**; `-joint-speed:2.4s` **[DEAD]** | -- | -- | **Chrome** -- M3 (amplitude-inside-keyframe needs a parameterised native animation) |
 

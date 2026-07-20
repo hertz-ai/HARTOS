@@ -123,6 +123,39 @@ Four layers, each independently agent-addressable:
   displace, refract, glow). We codegen WGSL from the tree, VALIDATE it (naga),
   compile OFF the render thread, and atomically swap the pipeline. A genuinely
   new visual component with zero OS recompile.
+### THE SEMANTICS TRAP -- binding rule for `animated` and for user-driven motion
+Adopting Nunba's vocabulary costs nothing at runtime (it is parsed once per
+COMPOSE, never per frame) and nothing in nativeness (nativeness lives in the
+renderer, not the words). The REAL risk of a web-shaped vocabulary is web-shaped
+SEMANTICS smuggling web-shaped IMPLEMENTATIONS in. Concretely:
+
+**If `animated` is implemented as "declare a transition, interpolate toward a
+target", we will have re-imported the exact bug that made the orb drag
+rubber-band on 2026-07-20 -- only in Rust, where it is harder to see.** That bug
+was not a CSS defect; it was the MODEL: CSS animates TOWARD a value, but a drag
+must BE the value.
+
+Binding rules, non-negotiable:
+1. `animated` maps ONLY to the L3 binding/clock system: the value is COMPUTED
+   from (clock, energy, state) every frame. It never stores a "target" and eases
+   toward it.
+2. **User-driven motion NEVER routes through `animated`.** Drag, hover, scroll,
+   resize and window-move write the scene transform DIRECTLY from the input
+   event, applied the SAME frame (the <=1-frame input-to-photon NFR). No easing
+   layer may sit between the pointer and the pixel.
+3. Easing is legal ONLY for agent/system-initiated state changes the user is not
+   physically dragging (a panel opening, a mood shift, a fade) -- and even then
+   as a clock-driven binding, not a retained tween chasing a target.
+4. Any node whose motion is user-driven must be reviewable against rule 2 before
+   it lands; a milestone that adds a draggable/hoverable surface states in its
+   audit how input reaches the transform.
+
+Rule of thumb: implement each Nunba node the natively-optimal way (a `row` is a
+cheap flex solve ON CHANGE, not a reflow; `list` is natively virtualized;
+`scroll` is a transform on a retained subtree, not a per-frame relayout). Read
+`ServerDrivenUI.jsx`'s case for the node to learn WHAT it must do -- never to
+copy HOW the web does it.
+
 - **L3 MOTION (declarative bindings).** Parameters bound to clocks + live signals
   (breathe 0.3Hz, energy from mic RMS, hover -> displace). Curves are data, so
   motion is steerable mid-flight.
