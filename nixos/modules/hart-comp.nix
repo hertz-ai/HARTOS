@@ -551,7 +551,15 @@ let
       # vulkan), then to the cage software floor. The host binary reads
       # HART_SHELL_RENDER to pick GSK/WebKit and publishes it to
       # /run/hart/shell-render so the backend body-class tracks the painted rung.
-      export HART_SHELL_RENDER="''${HART_SHELL_RENDER:-vulkan}"
+      # webkit-cairo, NOT vulkan (real-HW 2026-07-20 11:58 verdict): GSK-vulkan
+      # PAINTS on the HD 620 but is UNSTABLE under re-render on the layer-shell
+      # surface -- hovering the orb (CSS scale -> GSK pass -> swapchain recreate)
+      # spammed VK_ERROR_SURFACE_LOST_KHR and froze the UI with no crash, so no
+      # self-heal could fire. And vulkan buys NOTHING here: the shell is one
+      # full-window WebView, so WebKit compositing (ON in webkit-cairo) carries
+      # ALL the animations + glass; GSK only paints the host window around it.
+      # An operator can still force vulkan by exporting HART_SHELL_RENDER=vulkan.
+      export HART_SHELL_RENDER="''${HART_SHELL_RENDER:-webkit-cairo}"
       if command -v hart-glass-shell-gtk4 >/dev/null 2>&1; then
         hart-glass-shell-gtk4 &
         HART_GLASS_PID=$!

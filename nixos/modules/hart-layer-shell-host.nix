@@ -111,7 +111,13 @@ let
   gstCapturePlugins = (with pkgs.gst_all_1; [
     gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad
   ]) ++ [ pkgs.pipewire ];
-  gstPluginPath = lib.makeSearchPath "lib/gstreamer-1.0" gstCapturePlugins;
+  # makeSearchPathOutput "out", NOT plain makeSearchPath: gstreamer core's DEFAULT
+  # output is `bin`, so the plain search path pointed at gstreamer-*-bin/lib/
+  # gstreamer-1.0 (empty) and the core elements -- including `valve`, which
+  # WebKit's capture pipeline requires -- were invisible. That is the real-HW
+  # 'GStreamer element valve not found' -> WebProcess SIGSEGV mic bug (2026-07-20
+  # journal printed the -bin path). Same output lesson as giTypelibPath above.
+  gstPluginPath = lib.makeSearchPathOutput "out" "lib/gstreamer-1.0" gstCapturePlugins;
 
   # ── Portal-less private D-Bus session — the DEGRADE FALLBACK (2026-06-29) ────────
   #

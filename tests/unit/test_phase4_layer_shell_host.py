@@ -363,9 +363,12 @@ class TestMicCaptureGStreamerWiring:
         assert 'export GST_PLUGIN_SYSTEM_PATH_1_0="${gstPluginPath}"' in src
 
     def test_plugin_path_is_built_from_the_gstreamer_plugin_dir(self, src):
-        # makeSearchPath over lib/gstreamer-1.0 is what makes the capture elements
-        # discoverable (and pins them into the host closure).
-        assert 'makeSearchPath "lib/gstreamer-1.0"' in src
+        # makeSearchPathOutput "out" over lib/gstreamer-1.0, NOT plain
+        # makeSearchPath: gstreamer core's DEFAULT output is `bin`, so the plain
+        # path pointed at gstreamer-*-bin/... (empty) and the core elements --
+        # incl. `valve`, required by WebKit's capture pipeline -- were invisible
+        # (real-HW 2026-07-20: 'valve not found' -> WebProcess SIGSEGV mic bug).
+        assert 'makeSearchPathOutput "out" "lib/gstreamer-1.0"' in src
 
     def test_capture_plugin_set_includes_an_audio_source(self, src):
         # gst-plugins-good ships pulsesrc (capture via PipeWire's pulse compat) and
