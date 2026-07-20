@@ -88,9 +88,36 @@ runtime, so a new component is DATA the agent authors. "Liquid" is also
 literally an SDF look (merging blobs, refraction, glow), so the medium and the
 requirement agree.
 
+**THE SCHEMA ALREADY EXISTS -- DO NOT INVENT A SECOND ONE.** Nunba ships the
+canonical server-driven Liquid UI at
+`Nunba-HART-Companion/landing-page/src/components/shared/LiquidUI/`
+(`ServerDrivenUI.jsx` ~1115 lines + `SocialLiquidUI.jsx`, exported via
+`index.js`: `ServerDrivenUI`, `LiquidUIProvider`, `LiquidUIContext`,
+`buildStylePresets`, `buildSocialTokens`). Its node vocabulary is the contract
+the native renderer MUST speak, verbatim:
+`view|box|column|row|grid|scroll|list|text|button|icon|image|input|spacer|
+divider|card|chip|progress|animated`, plus the control forms `loop`/`repeat`
+and `conditional`, plus the interaction contract (`node.action` + `onAction`,
+`navigate`, `setState`, `bind`, and `{{variable}}` template interpolation in
+both text AND style values).
+Consequences, binding:
+- The native SceneNode enum is a 1:1 mapping of THAT vocabulary -- not a new
+  dialect. Same node types, same bindings, same action names.
+- One agent payload renders on EITHER surface: Nunba's React renderer (app
+  surfaces, per the split rule) or hart-comp's native scene (shell chrome).
+  That is what makes the split invisible to the agent.
+- `buildStylePresets` / `buildSocialTokens` are the style-token source; the
+  native side consumes the SAME tokens (with the conky-themes palette) rather
+  than forking a second token table (Gate 4).
+- The SDF/L2 layer is an ADDITIVE node type for the liquid surfaces the web
+  vocabulary cannot express (field/orb/ring/glass), NOT a replacement.
+- Before implementing any node, READ ServerDrivenUI.jsx's case for it; parity is
+  measured against that behaviour.
+
 Four layers, each independently agent-addressable:
 - **L1 SCENE (data).** Declarative node tree: what exists, where, z-order,
-  bindings. This IS the A2UI payload. Hot-swappable, no compile.
+  bindings. This IS the A2UI payload, in Nunba's existing vocabulary above.
+  Hot-swappable, no compile.
 - **L2 FORM (SDF expression tree -> WGSL codegen).** The agent composes
   primitives (circle/box/field/noise) with operators (smooth-union, subtract,
   displace, refract, glow). We codegen WGSL from the tree, VALIDATE it (naga),
