@@ -159,7 +159,27 @@ jobs:
             '
 
             echo "=== Status check ==="
-            STATUS_JSON="$(curl -fsS http://127.0.0.1:6777/status)"
+            # Poll until ready instead of trusting the fixed sleep above.
+            # HARTOS boots a large app (heavy imports, then synchronous
+            # agent-engine blueprint registration before it serves), so a
+            # single curl after 20s raced the boot and reported
+            # "Recv failure: Connection reset by peer" on a deploy that had
+            # actually succeeded. A false failure is worse than a slow one:
+            # it hides the real ones.
+            STATUS_JSON=""
+            for _i in $(seq 1 60); do
+              if STATUS_JSON="$(curl -fsS --max-time 10 http://127.0.0.1:6777/status 2>/dev/null)"; then
+                echo "status endpoint responded after $(( _i * 5 ))s"
+                break
+              fi
+              STATUS_JSON=""
+              sleep 5
+            done
+            if [ -z "$STATUS_JSON" ]; then
+              echo "::error::status endpoint never came up (300s)"
+              docker logs --tail 80 langchain 2>&1 || true
+              exit 1
+            fi
             echo "$STATUS_JSON"
 
             echo "$STATUS_JSON" | python3 -c 'import sys,json; data=json.load(sys.stdin); assert data.get("status")=="running"; assert data.get("node_tier")=="central"; print("status endpoint OK")'
