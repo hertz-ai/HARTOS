@@ -253,10 +253,14 @@ class CentralConnection:
         try:
             from integrations.service_tools.vram_manager import detect_gpu
             gpu = detect_gpu()
+            # detect_gpu's contract is {name, total_gb, free_gb, cuda_available};
+            # the prior 'available'/'device_name'/'vram_free_mb' keys never
+            # existed, so a GPU node reported gpu_available=False / no name / 0
+            # free VRAM in its telemetry (same wrong-keys bug as PeerLink #152).
             telemetry['compute'] = {
-                'gpu_available': gpu.get('available', False),
-                'gpu_name': gpu.get('device_name', ''),
-                'vram_free_mb': gpu.get('vram_free_mb', 0),
+                'gpu_available': gpu.get('cuda_available', False),
+                'gpu_name': gpu.get('name') or '',
+                'vram_free_mb': int(round((gpu.get('free_gb') or 0) * 1024)),
             }
         except Exception:
             telemetry['compute'] = {}

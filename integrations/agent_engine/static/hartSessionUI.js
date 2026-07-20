@@ -39,7 +39,7 @@
             function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
         });
       }
-    } catch (e) {}
+    } catch (e) { console.debug('hartSessionUI: SubtleCrypto SHA-256 unavailable, using weak hash', e); }
     return Promise.resolve(_weakHash(salt + ':' + pw));
   }
   function _salt() {
@@ -88,7 +88,7 @@
     var st = $('lock-status');
     if (st) st.textContent = setup
       ? 'Create a password to lock your HART'
-      : (window.HartLock.hasPassword() ? '' : 'No password set — press Enter to enter');
+      : (window.HartLock.hasPassword() ? '' : 'No password set - press Enter to enter');
     var pw = $('lock-pw');
     if (pw) { pw.value = ''; pw.placeholder = setup ? 'New password' : 'Password'; }
     ls.classList.add('active');
@@ -105,15 +105,15 @@
       if (val.length < 4) { if (st) st.textContent = 'Use at least 4 characters'; return; }
       window.HartLock.setPassword(val).then(function () {
         ls.classList.remove('setup', 'active');
-      });
+      }).catch(function (e) { console.error('hartSessionUI: lock setPassword failed', e); });
       return;
     }
     window.HartLock.check(val).then(function (ok) {
       if (ok) { ls.classList.remove('active'); }
       else { if (st) st.textContent = 'Incorrect password'; pw.value = ''; pw.focus(); }
-    });
+    }).catch(function (e) { console.error('hartSessionUI: lock password check failed', e); });
   }
-  // Replace the inline stub `unlock()` (which accepted any password) with the
+  // Replace the inline stub 'unlock()' (which accepted any password) with the
   // real check — same function name, so the existing onkeydown keeps working.
   window.unlock = onEnter;
 
@@ -138,7 +138,7 @@
         if (disk == null && m.disks && m.disks.length) disk = m.disks[0].percent;
         var el = $('hw-sys-body');
         if (el) el.innerHTML = bar(cpu, 'CPU') + bar(mem, 'Memory') + bar(disk || 0, 'Disk');
-      }).catch(function () {});
+      }).catch(function (e) { console.debug('hartSessionUI: system metrics fetch failed', e); });
   }
 
   function mountWidgets() {
@@ -161,6 +161,15 @@
   function start() {
     tick(); setInterval(tick, 1000);
     mountWidgets();
+    // #166: the SERVER seeds #lock-screen.active at first paint when a lock
+    // password exists, so the opaque overlay covers the desktop from frame 1
+    // (no FOUC). If we booted into that locked state, focus the field so the
+    // user can type their password immediately — same overlay, same unlock path.
+    var bootLock = $('lock-screen');
+    if (bootLock && bootLock.classList.contains('active')) {
+      var bootPw = $('lock-pw');
+      if (bootPw) setTimeout(function () { try { bootPw.focus(); } catch (e) { console.debug('hartSessionUI: lock password focus failed', e); } }, 60);
+    }
     // First-run: if onboarding is already done but no lock password exists yet,
     // offer to set one. hartOnboarding.js removes .onboarding-active when it
     // finishes; we wait for that, then prompt once.

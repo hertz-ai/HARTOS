@@ -300,9 +300,41 @@ def _get_faster_whisper_model(model_size: str = "base"):
         get_orchestrator().notify_loaded('stt', f'whisper-{model_size}',
                                          device=device, vram_gb=3.0 if device == 'cuda' else 0)
     except Exception:
-        pass
+        logger.exception("_get_faster_whisper_model: swallowed Exception")
 
     return _faster_whisper_model
+
+
+# ── Anti-hallucination gate: "did a human actually speak, or is this noise?" ──
+# faster-whisper's vad_filter strips silent AUDIO regions before decoding, but a
+# short noise/music burst that VAD mis-reads as speech still decodes to a
+# hallucinated phrase (the classic "さて、さて、もみ" / "Thank you for watching" on
+# near-silence — submitted as a chat message, it makes the model reply in the
+# hallucinated language).  The reliable post-decode signals are the per-segment
+# no_speech_prob (P[this window is non-speech]) and avg_logprob (token
+# confidence).  These are Whisper's OWN thresholds, so the gate matches the
+# model's internal silence definition rather than inventing new numbers.
+NO_SPEECH_PROB_MAX = 0.6   # openai-whisper's default no_speech_threshold
+AVG_LOGPROB_MIN = -1.0     # openai-whisper's default logprob_threshold
+
+
+def _filter_speech_text(segments) -> str:
+    """Join only the segments that are real speech; drop silence/noise.
+
+    ``segments`` is an iterable of ``(text, no_speech_prob, avg_logprob)``.
+    Single source for the anti-hallucination gate shared by the faster-whisper
+    and openai-whisper (legacy) transcribe paths — no parallel filter.  A
+    segment is kept only when BOTH signals look like speech; a missing signal
+    (None) is treated as speech so we never over-drop when a backend doesn't
+    report it.
+    """
+    kept = []
+    for text, no_speech_prob, avg_logprob in segments:
+        nsp = no_speech_prob if no_speech_prob is not None else 0.0
+        alp = avg_logprob if avg_logprob is not None else 0.0
+        if nsp <= NO_SPEECH_PROB_MAX and alp >= AVG_LOGPROB_MIN:
+            kept.append((text or '').strip())
+    return " ".join(t for t in kept if t).strip()
 
 
 def _faster_whisper_transcribe(audio_path: str, language: str = None) -> Optional[str]:
@@ -345,11 +377,21 @@ def _faster_whisper_transcribe(audio_path: str, language: str = None) -> Optiona
         if language:
             kwargs["language"] = language
         segments, info = model.transcribe(audio_path, **kwargs)
-        text = " ".join(seg.text for seg in segments).strip()
+        # Speech-only join: drop silence/noise hallucinations via the shared
+        # no_speech_prob/avg_logprob gate (vad_filter alone still lets a short
+        # noise burst decode to a hallucinated phrase).
+        text = _filter_speech_text(
+            (seg.text, getattr(seg, 'no_speech_prob', None),
+             getattr(seg, 'avg_logprob', None))
+            for seg in segments
+        )
         _record_whisper_success()
         return json.dumps({
             "text": text,
-            "language": info.language if info.language else "unknown",
+            # Nothing survived the speech gate → the window was noise/silence.
+            # Report 'unknown', not the language Whisper hallucinated from the
+            # noise (fixes wrong-language replies to non-speech audio).
+            "language": (info.language if (text and info.language) else "unknown"),
         })
     except Exception as e:
         reason = f"transcribe({audio_path}) failed: {e}"
@@ -534,9 +576,20 @@ def _legacy_transcribe(audio_path: str, language: str = None) -> Optional[str]:
         if language:
             kwargs["language"] = language
         result = model.transcribe(audio_path, **kwargs)
+        # Same speech-only gate as the faster-whisper path (shared helper).
+        # openai-whisper exposes per-segment no_speech_prob/avg_logprob in
+        # result['segments']; if segments are absent, fall back to raw text.
+        segs = result.get("segments") or []
+        if segs:
+            text = _filter_speech_text(
+                (s.get("text", ""), s.get("no_speech_prob"), s.get("avg_logprob"))
+                for s in segs
+            )
+        else:
+            text = (result.get("text") or "").strip()
         return json.dumps({
-            "text": result["text"].strip(),
-            "language": result.get("language", "unknown"),
+            "text": text,
+            "language": (result.get("language", "unknown") if text else "unknown"),
         })
     except ImportError:
         return None
@@ -560,7 +613,7 @@ def _select_legacy_model() -> str:
         elif free >= 2:
             return "small"
     except Exception:
-        pass
+        logger.exception("_select_legacy_model: swallowed Exception")
     return "base"
 
 
@@ -617,7 +670,15 @@ def populate_stt_catalog(catalog) -> int:
             vram_gb=vram, ram_gb=ram, disk_gb=disk,
             min_capability_tier=min_tier,
             backend='onnx' if 'sherpa' in mid else 'torch',
-            supports_gpu=(vram > 0), supports_cpu=True,
+            supports_gpu=(vram > 0),
+            # faster-whisper medium/large (CTranslate2, >=1 GB VRAM) are
+            # GPU-oriented: on CPU int8 they're too slow for interactive STT,
+            # so exclude them from AUTO compute-fit selection on CPU-only boxes
+            # (matches this module's documented ladder: CPU->tiny/base,
+            # GPU->medium/large).  sherpa-onnx (ONNX, vram 0) and the light
+            # faster-whisper sizes stay CPU-capable.  Manual admin selection
+            # still works (load() bypasses matches_compute).
+            supports_cpu=not ('faster-whisper' in tags and vram >= 1.0),
             supports_cpu_offload=False,
             idle_timeout_s=300,
             capabilities={
@@ -675,13 +736,13 @@ def select_whisper_model() -> str:
                     import sherpa_onnx  # noqa: F401
                     return sherpa_key
                 except ImportError:
-                    pass
+                    logger.debug("select_whisper_model: swallowed ImportError")
             # faster-whisper size
             fw_size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(entry.id)
             if fw_size:
                 return fw_size
     except Exception:
-        pass
+        logger.exception("select_whisper_model: swallowed Exception")
 
     # ── Fallback: direct VRAM query (no catalog dependency) ─────────────────
     try:
@@ -745,7 +806,7 @@ def _transcribe_impl(audio_path: str, language: str = None) -> str:
         if result:
             return result
     except ImportError:
-        pass
+        logger.debug("_transcribe_impl: swallowed ImportError")
     except Exception as e:
         logger.warning(f"faster-whisper failed, trying fallback: {e}")
 
@@ -765,7 +826,7 @@ def _transcribe_impl(audio_path: str, language: str = None) -> str:
         if result:
             return result
     except ImportError:
-        pass
+        logger.debug("_transcribe_impl: swallowed ImportError")
     except Exception as e:
         logger.warning(f"sherpa-onnx failed, trying openai-whisper: {e}")
 
@@ -816,7 +877,7 @@ def _detect_language_impl(audio_path: str) -> str:
             "probability": round(info.language_probability, 4) if info.language_probability else 0.0,
         })
     except ImportError:
-        pass
+        logger.debug("_detect_language_impl: swallowed ImportError")
     except Exception as e:
         logger.debug(f"faster-whisper language detection failed: {e}")
 
@@ -844,7 +905,7 @@ def _detect_language_impl(audio_path: str) -> str:
                     "probability": 0.8,
                 })
         except Exception:
-            pass
+            logger.exception("_detect_language_impl: swallowed Exception")
         return json.dumps({"error": "Language detection unavailable"})
     except Exception as e:
         return json.dumps({"error": f"Language detection failed: {e}"})
@@ -946,6 +1007,9 @@ STREAM_INTERIM_WINDOW_BYTES = (
 STREAM_VAD_RMS_THRESHOLD = 400      # PCM16 RMS below this == silence (speech ~1-5k)
 STREAM_VAD_SILENCE_MS = 800         # trailing silence after speech that ends an utterance
 STREAM_VAD_MIN_SPEECH_MS = 300      # require this much speech first (ignore leading silence)
+# Cap the per-chunk RMS sum to a bounded tail so the GIL-held Python loop on
+# the async STT handler doesn't scale with chunk size (~100ms @ 16kHz).
+STREAM_RMS_MAX_SAMPLES = int(os.environ.get('HEVOLVE_STT_RMS_MAX_SAMPLES', '1600'))
 
 
 def _pcm_rms(pcm: bytes) -> float:
@@ -962,6 +1026,11 @@ def _pcm_rms(pcm: bytes) -> float:
     samples.frombytes(pcm[:n])
     if not samples:
         return 0.0
+    # Bound the GIL-held sum to a recent tail — end-of-utterance VAD only needs
+    # recent energy, and an unbounded per-chunk loop on the async handler would
+    # grow with chunk size.
+    if len(samples) > STREAM_RMS_MAX_SAMPLES:
+        samples = samples[-STREAM_RMS_MAX_SAMPLES:]
     acc = 0
     for s in samples:
         acc += s * s
@@ -1024,6 +1093,17 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
             'text': text, 'language': lang, 'is_final': True,
         }))
         _maybe_enqueue_call_segment(call_id, user_id, text, lang, True)
+        # Feed this finalized mic segment to HevolveAI's world model for
+        # continual learning. The bridge call does a SYNCHRONOUS HTTP POST, so
+        # run it on the default executor to avoid blocking the realtime STT
+        # event loop. Gated on call_id (voice-room streams) so the push-to-talk
+        # chat mic is untouched. Snapshot the PCM now -- the caller resets the
+        # buffer right after this returns.
+        if call_id:
+            import asyncio
+            asyncio.get_running_loop().run_in_executor(
+                None, _maybe_ingest_audio_sensor,
+                call_id, user_id, audio_buffer.getvalue(), text, lang)
     return bool(text)
 
 
@@ -1108,6 +1188,53 @@ def _maybe_enqueue_call_segment(
             "(call=%s): %s", call_id, e)
 
 
+def _maybe_ingest_audio_sensor(
+    call_id: Optional[str],
+    user_id: Optional[str],
+    pcm_bytes: bytes,
+    transcript: str,
+    lang: str,
+) -> None:
+    """Feed a finalized mic segment (raw PCM16 16kHz mono + its transcript) to
+    HevolveAI's world model for continual learning.
+
+    This is the MISSING producer for the audio sensor path: live mic PCM
+    otherwise lands only in the STT queue (_maybe_enqueue_call_segment) and
+    never reaches the embodied learner.  It rides the EXISTING
+    WorldModelBridge.ingest_sensor_batch -> /v1/sensor/ingest (audio) transport
+    using the unified SensorReading schema (sensor_model.py 'audio') -- no new
+    bridge method, no new endpoint, no parallel path.  Gated on call_id so the
+    push-to-talk chat mic (call_id=None) is completely unaffected.
+
+    Runs on a thread-pool executor (the bridge call does a blocking HTTP POST);
+    best-effort, never raises out of the WS handler hot path.
+    """
+    if not call_id or not pcm_bytes:
+        return
+    try:
+        import base64
+        from integrations.agent_engine.world_model_bridge import (
+            get_world_model_bridge)
+        from integrations.robotics.sensor_model import SensorReading
+        reading = SensorReading(
+            sensor_id=f'mic_{call_id}',
+            sensor_type='audio',
+            data={
+                'pcm_base64': base64.b64encode(pcm_bytes).decode('ascii'),
+                'sample_rate': STREAM_SAMPLE_RATE,
+                'channels': 1,
+                'stream_source': 'mic',
+                'transcript': transcript,
+                'lang': lang,
+            },
+        )
+        get_world_model_bridge().ingest_sensor_batch([reading.to_dict()])
+    except Exception as e:
+        logger.debug(
+            "whisper_tool._maybe_ingest_audio_sensor failed "
+            "(call=%s): %s", call_id, e)
+
+
 async def _stt_stream_handler(websocket):
     """Handle a single streaming STT WebSocket connection.
 
@@ -1188,7 +1315,7 @@ async def _stt_stream_handler(websocket):
                             stt_lang = _cfg_lang
                         continue
                 except (json.JSONDecodeError, ValueError):
-                    pass
+                    logger.debug("_stt_stream_handler: swallowed json.JSONDecodeError, ValueError", exc_info=True)
                 continue
 
             # Binary audio data
@@ -1315,7 +1442,7 @@ def _container_to_pcm(data: bytes) -> Optional[bytes]:
                 try:
                     os.unlink(p.name)
                 except Exception:
-                    pass
+                    logger.exception("_container_to_pcm: swallowed Exception")
     return None
 
 
@@ -1404,7 +1531,7 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False,
             try:
                 os.unlink(tmp.name)
             except Exception:
-                pass
+                logger.exception("_transcribe_buffer: swallowed Exception")
 
 
 def start_stt_stream_server(port: int = 0) -> Optional[int]:
@@ -1447,7 +1574,7 @@ def start_stt_stream_server(port: int = 0) -> Optional[int]:
                 "" if _legacy_ok else
                 " AND the openai-whisper fallback is also missing")
     except Exception:
-        pass
+        logger.exception("start_stt_stream_server: swallowed Exception")
 
     import asyncio
     import threading

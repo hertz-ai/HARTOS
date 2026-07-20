@@ -428,6 +428,103 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 200,
         'use_product': False,
     },
+    # ─── SEO Web Publisher (news → hevolve.ai via consent-gated PRs) ───
+    {
+        'slug': 'bootstrap_seo_publisher',
+        'goal_type': 'seo',
+        'title': 'SEO Web Publisher — News to hevolve.ai via Consent-Gated PRs',
+        'description': (
+            'Publish curated news to the hevolve.ai website through '
+            'consent-gated GitHub pull requests — never a direct push: '
+            '1) Use list_news_for_web to load news items flagged publish_web '
+            '(news agents flag items with mark_news_for_web during curation), '
+            '2) Format each item for the website repo: a registry entry '
+            'following the src/pages/News/newsData.js pattern, keeping the '
+            'manual mirrors in sync — public/sitemap.xml and the '
+            'scripts/prerender.js route list (scripts/verify-mirrors.js in '
+            'the website repo fails the build when they drift), '
+            '3) Run seo_audit_score on the drafted markdown BEFORE publishing, '
+            '4) Only when the score is >= 90 (verdict SHIP), open a pull '
+            'request with gh_pr_open; below 90, fix the reported sections and '
+            're-score — queue REWORK, never publish a failing draft, '
+            '5) NEVER push directly — every publish is a pull request and the '
+            'human merge IS the consent gate; never auto-publish externally '
+            'without operator approval. '
+            'Aggregator etiquette: headline + snippet + attribution + link '
+            'out to the original source; no full-article republication.'
+        ),
+        'config': {
+            'repo': 'hertz-ai/Hevolve',
+            'base_branch': 'main',
+            'min_seo_score': 90,
+            # Disabled by default: _build_seo_prompt returns None (daemon
+            # skips dispatch) until the operator flips enabled=True — the
+            # same config-gate pattern as the autoresearch goal type.
+            'enabled': False,
+            'requires_consent': True,
+            'continuous': True,
+        },
+        'spark_budget': 200,
+        'use_product': False,
+    },
+    # ─── Paper Explainer (AI/BCI research → hevolve.ai research pages
+    #     via consent-gated PRs, IDLE TIME ONLY) ───
+    {
+        'slug': 'bootstrap_paper_explainer',
+        'goal_type': 'paper_explanation',
+        'title': 'Paper Explainer — Plain-Language Research for hevolve.ai',
+        'description': (
+            'During machine IDLE time only, read the latest AI/BCI research '
+            'papers and publish plain-language explanations to the '
+            'hevolve.ai research pages through consent-gated GitHub pull '
+            'requests — never a direct push: '
+            '1) Read the paper registry src/data/researchPapers.json in the '
+            'website repo (fields: slug, title, authors, journal, topic '
+            'ai|bci, url, doi, abstract, explanation) and pick ONE paper '
+            'that has no explanation yet — no entry in the "explanations" '
+            'map of src/data/researchExplanations.json, '
+            '2) Fetch the paper source with data_extraction_from_url (the '
+            'url field — its abstract page on Nature / arXiv) and read what '
+            'the abstract actually says, '
+            '3) Write a grounded plain-language explanation: 2-3 short '
+            'paragraphs separated by blank lines, based ONLY on the '
+            'abstract and fetched text — state that it is based on the '
+            'abstract and NEVER invent results, numbers, or findings the '
+            'source does not contain, '
+            '4) Add a {"<paper_url>": "<explanation>"} entry to the '
+            '"explanations" map in src/data/researchExplanations.json '
+            '(preserve every existing entry) and open a pull request with '
+            'gh_pr_open — the website merges it into '
+            'hevolve.ai/research/<slug> via npm run research:pull, '
+            '5) NEVER push directly — every publish is a pull request and '
+            'the human merge IS the consent gate; never auto-publish '
+            'externally without operator approval. '
+            'One paper per idle cycle, maximum.'
+        ),
+        'config': {
+            'repo': 'hertz-ai/Hevolve',
+            'base_branch': 'main',
+            'target_file': 'src/data/researchExplanations.json',
+            'papers_source': 'src/data/researchPapers.json',
+            'topics': ['ai', 'bci'],
+            'source': 'Nature + arXiv',
+            'max_per_cycle': 1,
+            # Disabled by default: _build_paper_explanation_prompt returns
+            # None (daemon skips dispatch) until the operator flips
+            # enabled=True — the same config-gate pattern as the seo /
+            # autoresearch goal types.
+            'enabled': False,
+            # idle_only: the agent_daemon skips this goal unless the
+            # ResourceGovernor reports MODE_IDLE (see agent_daemon
+            # ._idle_only_blocked) — reuses the ONE existing idle detector,
+            # no parallel scheduler.
+            'idle_only': True,
+            'requires_consent': True,
+            'continuous': True,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
     # ─── Continual Learning Coordination ───
     {
         'slug': 'bootstrap_learning_coordinator',
@@ -1538,6 +1635,155 @@ SEED_BOOTSTRAP_GOALS = [
         'spark_budget': 80,
         'use_product': True,
     },
+
+    # ─────────────────────────────────────────────────────────────
+    # FLAGSHIP STEWARD AGENTS (runnable goal templates)
+    #
+    # The steward's six flagship consumer agents, each a real
+    # AgentGoal dispatched through the same GoalManager.build_prompt
+    # -> dispatch_goal -> /chat CREATE/REUSE pipeline as every other
+    # goal.  "Speech Companion" (speech_therapy) is seeded just above;
+    # the five below are "Auto Research", "Trading", "Tutor", "English
+    # Learning", and "Spoken English".  Their goal types are registered
+    # in goal_manager.py.  The three speech agents declare the on-device
+    # voice stack (STT + TTS via com.hart.ModelBus + the HART orb) in
+    # both config (voice_stack/modality) and description.
+    # ─────────────────────────────────────────────────────────────
+    {
+        'slug': 'bootstrap_auto_research',
+        'goal_type': 'research',
+        'title': 'Auto Research',
+        'description': (
+            'Autonomous deep-research assistant. Give it a topic or '
+            'question and it decomposes the question, searches the web '
+            'and news, cross-checks every claim against independent '
+            'sources, and returns a short cited brief with an honest '
+            'account of what is known and what is still uncertain. '
+            'Reuses prior findings from memory so repeat research gets '
+            'faster.'
+        ),
+        'config': {
+            'autonomous': False,        # user-invoked from the home / omnibox
+            'continuous': True,         # resumes across sessions
+            'depth': 'standard',
+            'max_sources': 8,
+            'output_format': 'cited_brief',
+            'topic': 'What is HART OS and how does the hive earn for its users?',
+            'cadence': 'event',
+            'priority': 4,
+        },
+        'spark_budget': 150,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_trading_companion',
+        'goal_type': 'trading',
+        'title': 'Trading',
+        'description': (
+            'Paper-trading companion. Analyses markets with technical '
+            'indicators and news sentiment, then places SIMULATED trades '
+            'with a mandatory stop-loss on every position. Paper trading '
+            'only by default: going live requires a constitutional vote. '
+            'Never trades on margin, halts on a 10 percent cumulative '
+            'loss, and logs every decision with its reasoning.'
+        ),
+        'config': {
+            'autonomous': False,
+            'continuous': True,
+            'paper_trading': True,
+            'strategy': 'long_term',
+            'market': 'crypto',
+            'max_budget': 10000,
+            'max_loss_pct': 10,
+            'cadence': 'event',
+            'priority': 4,
+        },
+        'spark_budget': 120,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_tutor',
+        'goal_type': 'tutor',
+        'title': 'Tutor',
+        'description': (
+            'A patient one-on-one tutor for any subject. Diagnoses the '
+            'edge of your understanding, teaches with the Socratic '
+            'method (guiding questions, a worked example, then your '
+            'turn), and adapts up or down to your pace. Remembers your '
+            'profile and uses spaced repetition so each session builds '
+            'on the last. Never shames a wrong attempt; builds the path '
+            'to the answer rather than just handing it over.'
+        ),
+        'config': {
+            'autonomous': False,
+            'continuous': True,
+            'subject': 'general studies',
+            'level': 'auto-detect',
+            'style': 'socratic',
+            'cadence': 'event',
+            'priority': 5,
+        },
+        'spark_budget': 120,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_english_learning',
+        'goal_type': 'english_learning',
+        'title': 'English Learning',
+        'description': (
+            'A structured English curriculum guide (CEFR A1 to C2) for '
+            'vocabulary, grammar, reading, and listening. Runs short '
+            'adaptive lessons, has you use new words in your own '
+            'sentences, and corrects gently with the rule behind the '
+            'fix. VOICE: lessons can be heard and spoken. The mic feeds '
+            'STT, replies are spoken with TTS via the Model Bus '
+            '(com.hart.ModelBus), and the HART orb is the on-screen '
+            'voice presence. Tracks progress in memory across sessions.'
+        ),
+        'config': {
+            'autonomous': False,
+            'continuous': True,
+            'level': 'auto-detect',
+            'focus': 'balanced',
+            'modality': 'voice',
+            'voice_stack': ['stt', 'tts', 'orb'],
+            'require_consent': True,        # microphone consent
+            'cadence': 'event',
+            'priority': 5,
+        },
+        'spark_budget': 120,
+        'use_product': False,
+    },
+    {
+        'slug': 'bootstrap_spoken_english',
+        'goal_type': 'spoken_english',
+        'title': 'Spoken English',
+        'description': (
+            'A voice-first conversation and pronunciation coach. Holds a '
+            'real spoken conversation in a scenario you pick (ordering '
+            'food, a job interview, small talk), then gives short spoken '
+            'feedback: one pronunciation or phrasing tip at a time, '
+            'modelled out loud for you to repeat. VOICE: you speak into '
+            'the mic (STT), the coach speaks back (TTS via the Model Bus, '
+            'com.hart.ModelBus), and the HART orb shows listening and '
+            'speaking. Conversation first, correction second; praises '
+            'fluency and courage over perfection.'
+        ),
+        'config': {
+            'autonomous': False,
+            'continuous': True,
+            'level': 'auto-detect',
+            'scenario': 'free conversation',
+            'modality': 'voice',
+            'voice_stack': ['stt', 'tts', 'orb'],
+            'require_consent': True,        # microphone consent
+            'cadence': 'event',
+            'priority': 5,
+        },
+        'spark_budget': 120,
+        'use_product': False,
+    },
+
     {
         # ── Encounter Icebreaker Agent ──
         # Full design: Claude-memory/project_encounter_icebreaker.md

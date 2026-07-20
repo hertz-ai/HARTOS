@@ -323,3 +323,19 @@ class TestRegistration:
         # the real registry; here we just check no exception.
         result = GhPrTool.register()
         assert isinstance(result, bool)
+
+    def test_importable_from_service_tools_package(self):
+        """P1 wiring: the tool must be exported by the package __init__
+        (same as Crawl4AITool) so create_recipe/reuse_recipe can register
+        it — otherwise the SEO publishing path stays dormant."""
+        import integrations.service_tools as pkg
+        assert pkg.GhPrTool is GhPrTool
+        assert 'GhPrTool' in pkg.__all__
+
+    def test_registered_in_global_service_tool_registry(self):
+        """After register(), the tool is discoverable by name in the
+        global registry (the surface create_recipe/reuse_recipe expose
+        to the agents)."""
+        from integrations.service_tools import service_tool_registry
+        GhPrTool.register()
+        assert GhPrTool.NAME in service_tool_registry._tools

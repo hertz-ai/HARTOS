@@ -90,7 +90,9 @@ except Exception:
     # If transformers isn't installed or moved the symbol, fall through.
     # Worker threads will hit the lazy path and pay the recursion once;
     # bad but not fatal (and surfaced via the hartos_init_error.log).
-    pass
+    import logging as _early_logging
+    _early_logging.getLogger(__name__).warning(
+        "transformers GPT2 tokenizer defang skipped (symbol absent/moved)", exc_info=True)
 
 # ── Defang transformers `_LazyModule.__getattr__` re-entry recursion ──
 #
@@ -211,7 +213,9 @@ except Exception:
     # other surprise — fall through.  We've still got the
     # GPT2TokenizerFast direct-bind above; recursion may resurface
     # but won't crash boot.
-    pass
+    import logging as _early_logging
+    _early_logging.getLogger(__name__).warning(
+        "transformers _LazyModule re-entry defang skipped (not installed/moved)", exc_info=True)
 
 from bs4 import BeautifulSoup
 from enum import Enum
@@ -478,17 +482,17 @@ try:
     from helper import retrieve_json, PROMPTS_DIR, safe_prompt_path, _is_terminate_msg
 except Exception:
     retrieve_json = None
-    # Frozen builds install to Program Files (read-only) — redirect to user data dir
-    if getattr(sys, 'frozen', False):
-        try:
-            from core.platform_paths import get_prompts_dir
-            PROMPTS_DIR = os.path.abspath(get_prompts_dir())
-        except ImportError:
-            PROMPTS_DIR = os.path.abspath(os.path.join(
-                os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
-    else:
-        PROMPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'prompts'))
     safe_prompt_path = None
+    # helper failed to import — resolve PROMPTS_DIR via the SAME canonical resolver
+    # helper uses, so we NEVER fall back to the read-only /nix/store package dir on
+    # the embedded OS (the boot crash this guards). get_recipe_prompts_dir handles
+    # frozen desktop + embedded HART OS (/nix/store or /etc/hartos-release) + dev.
+    try:
+        from core.platform_paths import get_recipe_prompts_dir
+        PROMPTS_DIR = os.path.abspath(get_recipe_prompts_dir())
+    except Exception:
+        PROMPTS_DIR = os.path.abspath(os.path.join(
+            os.path.expanduser('~'), 'Documents', 'Nunba', 'data', 'prompts'))
 
 # Ensure prompts directory exists (agent creation writes JSON here)
 os.makedirs(PROMPTS_DIR, exist_ok=True)
@@ -564,7 +568,7 @@ def _record_lifecycle(status, user_id, prompt_id, details=''):
                     details=details,
                 )
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("_bg: swallowed Exception")
     threading.Thread(target=_bg, daemon=True).start()
 
 
@@ -688,7 +692,7 @@ def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
                 max_tokens=max_tokens,
             )
         except ImportError:
-            pass
+            logging.getLogger(__name__).debug("get_llm: swallowed ImportError")
 
     if _active == 'google_gemini' and os.environ.get('GOOGLE_API_KEY'):
         try:
@@ -700,7 +704,7 @@ def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
                 max_output_tokens=max_tokens,
             )
         except ImportError:
-            pass
+            logging.getLogger(__name__).debug("get_llm: swallowed ImportError")
 
     if _active == 'groq' and os.environ.get('GROQ_API_KEY'):
         try:
@@ -712,7 +716,7 @@ def get_llm(model_name="gpt-3.5-turbo", temperature=0.7, max_tokens=1500):
                 max_tokens=max_tokens,
             )
         except ImportError:
-            pass
+            logging.getLogger(__name__).debug("get_llm: swallowed ImportError")
 
     if _active in ('openai', 'azure_openai', 'custom_openai') and os.environ.get('OPENAI_API_KEY'):
         _kwargs = dict(
@@ -768,7 +772,16 @@ if _is_bundled:
         os.makedirs(_nunba_log_dir, exist_ok=True)
     _langchain_log_path = os.path.join(_nunba_log_dir, 'langchain.log')
 else:
-    _langchain_log_path = 'langchain.log'
+    # Non-bundled: write to the canonical WRITABLE data dir, NEVER the CWD — on the
+    # embedded OS the CWD is the read-only /nix/store package dir, so a relative
+    # 'langchain.log' crashes boot with OSError [Errno 30] Read-only file system.
+    try:
+        from core.platform_paths import get_data_dir
+        _ld = os.path.join(get_data_dir(), 'logs')
+        os.makedirs(_ld, exist_ok=True)
+        _langchain_log_path = os.path.join(_ld, 'langchain.log')
+    except Exception:
+        _langchain_log_path = os.devnull  # last resort: a log path must never brick boot
 
 handler = RotatingFileHandler(_langchain_log_path, maxBytes=5_000_000, backupCount=2, encoding='utf-8')
 handler.setLevel(logging.INFO)
@@ -786,7 +799,7 @@ try:
     if sys.stderr is None or sys.stderr.closed:
         sys.stderr = open(os.devnull, 'w')
 except Exception:
-    pass
+    logging.getLogger(__name__).exception("<module>: swallowed Exception")
 stream_handler = logging.StreamHandler(sys.stdout)
 
 # Create a logging format.
@@ -870,7 +883,7 @@ def _spawn_tool_warmup_when_ready():
             try:
                 time.sleep(1)
             except Exception:
-                pass
+                logging.getLogger(__name__).exception("_deferred_spawn: swallowed Exception")
             warmer = globals().get('_warmup_tool_registries_in_background')
             if warmer:
                 try:
@@ -920,7 +933,7 @@ try:
     from security.audit_log import apply_sensitive_filter_to_all
     apply_sensitive_filter_to_all()
 except Exception:
-    pass  # Degrade gracefully — logs will still work, just unredacted
+    logging.getLogger(__name__).exception("<module>: swallowed Exception")  # Degrade gracefully — logs will still work, just unredacted
 
 # Test logging
 app.logger.info('Logger initialized')
@@ -955,7 +968,7 @@ try:
     from security.source_protection import install_source_guards
     install_source_guards()
 except Exception:
-    pass  # Non-fatal — source stripping is the primary defense
+    logging.getLogger(__name__).exception("<module>: swallowed Exception")  # Non-fatal — source stripping is the primary defense
 
 # ============================================================================
 # HevolveSocial - Agent Social Network
@@ -1053,6 +1066,15 @@ except ImportError:
 except Exception as e:
     app.logger.warning(f"Commercial API init skipped: {e}")
 
+# Central OTA control — GET /api/ota/latest (PUBLIC pointer nodes poll on their
+# hart-ota-check timer), POST /api/ota/publish (account-gated, kicks the upgrade
+# pipeline + fans a signed firmware_update fleet command), GET /api/ota/nodes
+# (live per-node rollout) — is served by the fleet_update blueprint, registered
+# inside integrations/social/__init__.py alongside the other social surfaces.
+# (There is ONE OTA backend; the former agent_engine/ota_api.py duplicate was
+# removed during integration — Flask routed to the social blueprint anyway, so
+# it was dead code; its pipeline-kick + audit folded into api_fleet_update.py.)
+
 # Hive Session API — Claude Code as hive worker node
 try:
     from integrations.coding_agent.claude_hive_session import get_blueprint as _get_hive_bp
@@ -1144,9 +1166,19 @@ try:
     except Exception as e:
         app.logger.debug(f"Governor watchdog registration skipped: {e}")
 except ImportError:
-    pass
+    logging.getLogger(__name__).debug("<module>: swallowed ImportError")
 except Exception as e:
     app.logger.warning(f"Resource Governor start skipped: {e}")
+
+# NOTE — the AI-senses cross-process authority server (Phase 7) is NOT started
+# here. core.ai_sensing._state is mutated ONLY by POST /api/shell/ai-sensing,
+# which is served by the LiquidUI shell process (liquid_ui_service.py), not this
+# :6777 backend. The authority socket must reflect the SAME _state the human
+# mutates, so start_authority_server() is called THERE (the canonical holder).
+# Starting it here too would bind a SECOND copy of _state that the kill-switch
+# never updates — reporting a stale "screen allowed" after the human cut it. One
+# writer, one authority. (Co-located bundles where both run in one process are
+# unaffected: a single start_authority_server() in the shared heap still wins.)
 
 # Central Orchestrator Client — heartbeat to hevolve.ai central + master
 # kill-switch polling.  Env-gated: no-op when HEVOLVE_CENTRAL_ORCHESTRATOR_URL
@@ -1183,7 +1215,7 @@ try:
                         "Central Orchestrator Client registered with watchdog"
                     )
             except ImportError:
-                pass
+                logging.getLogger(__name__).debug("<module>: swallowed ImportError")
             except Exception as e:
                 app.logger.debug(
                     f"Central Orchestrator watchdog registration skipped: {e}"
@@ -1371,7 +1403,7 @@ try:
 
     app.logger.info("Credential vault API routes registered (2 endpoints)")
 except ImportError:
-    pass
+    logging.getLogger(__name__).debug("<module>: swallowed ImportError")
 except Exception as e:
     app.logger.warning(f"Credential vault API init skipped: {e}")
 
@@ -1414,7 +1446,7 @@ try:
                     source=f'sdk:{consumer}'
                 )
             except Exception:
-                pass  # metering failure must not block response
+                logging.getLogger(__name__).exception("_completions_proxy: swallowed Exception")  # metering failure must not block response
 
         return jsonify(result)
 
@@ -1510,7 +1542,7 @@ for _cfg_name in ('langchain_config.json', 'config.json'):
         elif not config:
             config = _loaded  # fall through to try langchain_config.json first
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("<module>: swallowed Exception")
 
 # global variables
 # Token counting: single source — core.token_utils.count_tokens_for_text
@@ -1569,7 +1601,7 @@ def _resolve_llm_endpoint(registry_fn_name: str, env_var: str) -> str:
         if _base:
             url = _base.rstrip('/') + '/chat/completions'
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("_resolve_llm_endpoint: swallowed Exception")
     if not url:
         _env = os.environ.get(env_var, '')
         if _env:
@@ -1669,7 +1701,7 @@ def _wait_for_llm_server(url=None, timeout=15):
                     f"(waited {i}s)")
                 return True
         except (urllib.error.URLError, OSError):
-            pass
+            logging.getLogger(__name__).warning("_wait_for_llm_server: swallowed urllib.error.URLError, OSError", exc_info=True)
         time.sleep(1)
     _logger.info(
         f"[EmbodiedAI] No server on {url} after {timeout}s "
@@ -1715,7 +1747,7 @@ def _init_learning_pipeline():
             try_import_hevolveai('hevolveai')
         except ImportError:
             # security package missing — fall through to the raw import path
-            pass
+            logging.getLogger(__name__).debug("_init_learning_pipeline: swallowed ImportError")
 
         # Bypass rl_ef/__init__.py's graceful-degradation swallow
         # (which binds every symbol to None on any ImportError /
@@ -2096,7 +2128,7 @@ except Exception as _cb_err:
             f"Crossbar HTTP publisher init skipped: {type(_cb_err).__name__}: {_cb_err} — "
             f"MessageBus LOCAL+PEERLINK transports remain active.")
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("<module>: swallowed Exception")
 
 # Create thread pool executor for async Crossbar publishing
 crossbar_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='crossbar_publish')
@@ -2113,7 +2145,7 @@ def _http_crossbar_publish(topic: str, payload: str, timeout: float = 2.0):
         socket.setdefaulttimeout(timeout)
         client.publish(topic, payload)
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("_http_crossbar_publish: swallowed Exception")
     finally:
         if original_timeout is not None:
             socket.setdefaulttimeout(original_timeout)
@@ -2126,7 +2158,7 @@ def _inject_http_transport():
         bus = get_message_bus()
         bus.set_http_transport(lambda t, p: crossbar_executor.submit(_http_crossbar_publish, t, p))
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("_inject_http_transport: swallowed Exception")
 
 
 _inject_http_transport()
@@ -2301,7 +2333,7 @@ def _get_dynamic_capability_prompt() -> str:
             from tts.tts_engine import get_tts_engine
             _tts_ok = get_tts_engine() is not None
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("_get_dynamic_capability_prompt: swallowed Exception")
         if _tts_ok:
             parts.append(
                 'Your text output is auto-synthesized as audio. You can freely '
@@ -2317,7 +2349,7 @@ def _get_dynamic_capability_prompt() -> str:
         if cap_prompt:
             parts.append(cap_prompt)
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("_get_dynamic_capability_prompt: swallowed Exception")
 
     return '\n'.join(parts)
 
@@ -2511,7 +2543,7 @@ def _observe_user_experience(input_text: str) -> str:
                 )
                 return f"Observation recorded (id: {memory_id}): {observation}"
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("_observe_user_experience: swallowed Exception")
 
         return f"Observation noted: {observation}"
     except Exception:
@@ -2670,7 +2702,7 @@ def _handle_visual_watcher_tool(input_text):
                 'action': action_text, 'trigger_id': trigger_id,
             })
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("_on_trigger: swallowed Exception")
 
     # Register with VisionService for visual watchers
     if modality in ('visual', 'both'):
@@ -2686,7 +2718,7 @@ def _handle_visual_watcher_tool(input_text):
                     name=trigger_id,
                 )
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("_handle_visual_watcher_tool: swallowed Exception")
 
     watcher_entry = {
         'trigger_id': trigger_id, 'expires_at': expires_at,
@@ -2758,7 +2790,7 @@ def _push_workflow_flowchart(user_id, prompt_id, request_id=None):
         from core.peer_link.message_bus import chat_topic_for
         publish_async(chat_topic_for(user_id), json.dumps(crossbar_message))
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("_push_workflow_flowchart: swallowed Exception")
 
 
 def _request_consent(agent_id: str, action: str, label: str, input_text: str) -> str:
@@ -2773,7 +2805,7 @@ def _request_consent(agent_id: str, action: str, label: str, input_text: str) ->
             svc.agent_request_approval(agent_id=agent_id, action=action, description=description)
             return f"{label} access request sent to user. Waiting for approval."
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("_request_consent: swallowed Exception")
     # Fallback: SSE (Nunba desktop WebView2)
     from core.platform.events import broadcast_sse_safe
     if broadcast_sse_safe('agent.ui.update', {
@@ -2803,7 +2835,7 @@ def _handle_screenshot_tool(input_text: str) -> str:
         if not allowed('screen'):
             return "Screen access is turned off by the user (AI senses kill-switch)."
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("_handle_screenshot_tool: swallowed Exception")
     try:
         from PIL import ImageGrab
         import base64, io
@@ -3109,7 +3141,7 @@ def _handle_list_pending_actions_tool(input_text: str) -> str:
             else:
                 lines.append("No scheduled messages pending.")
         except ImportError:
-            pass
+            logging.getLogger(__name__).debug("_handle_list_pending_actions_tool: swallowed ImportError")
         except Exception as e:
             lines.append(f"(scheduled messages unavailable: {str(e)[:80]})")
 
@@ -3126,7 +3158,7 @@ def _handle_list_pending_actions_tool(input_text: str) -> str:
                         when = next_run.isoformat() if next_run else 'no next run'
                         lines.append(f"  • {when}  {j.id}  {j.name or ''}")
         except ImportError:
-            pass
+            logging.getLogger(__name__).debug("_handle_list_pending_actions_tool: swallowed ImportError")
         except Exception as e:
             lines.append(f"(scheduler jobs unavailable: {str(e)[:80]})")
 
@@ -3193,7 +3225,7 @@ def _wire_qr_pair_emitter(channel_type: str, meta: dict) -> None:
                 try:
                     loop.run_until_complete(adapter.disconnect())
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).exception("_wire_qr_pair_emitter: swallowed Exception")
                 loop.run_until_complete(adapter.connect())
             finally:
                 loop.close()
@@ -3278,7 +3310,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                 )
                 phone = ''.join(ch for ch in _p if ch.isdigit())
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("_start_gateway_qr_pair_push: swallowed Exception")
     if not phone:
         # Fall through to the existing form path — surface a one-field
         # form asking for the phone number.  Re-running connect with
@@ -3316,7 +3348,7 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                     },
                 )
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("_start_gateway_qr_pair_push: swallowed Exception")
         return
 
     base = (os.environ.get('WHATSAPP_GATEWAY_URL', '') or 'http://localhost:3000').rstrip('/')
@@ -3526,10 +3558,10 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                                 },
                             )
                     except Exception:
-                        pass
+                        logging.getLogger(__name__).exception("_poll: swallowed Exception")
                     return
             except Exception:
-                pass
+                logging.getLogger(__name__).exception("_poll: swallowed Exception")
             time.sleep(3)
     threading.Thread(
         target=_poll, daemon=True,
@@ -3593,7 +3625,7 @@ def _handle_connect_channel_tool(input_text: str) -> str:
                 cfg = parsed.get('config') or {}
                 config_json = _json.dumps(cfg) if isinstance(cfg, dict) else str(cfg)
             except _json.JSONDecodeError:
-                pass
+                logging.getLogger(__name__).debug("_handle_connect_channel_tool: swallowed _json.JSONDecodeError", exc_info=True)
 
         if not channel_type:
             parts = text.split(None, 1)
@@ -3908,7 +3940,7 @@ def _handle_join_external_room_tool(input_text: str) -> str:
                 room_id = str(parsed.get('room') or parsed.get('room_id') or '')
                 role = (parsed.get('role') or 'co_pilot').lower()
             except _json.JSONDecodeError:
-                pass
+                logging.getLogger(__name__).debug("_handle_join_external_room_tool: swallowed _json.JSONDecodeError", exc_info=True)
         if not platform or not room_id:
             parts = text.split(None, 2)
             if len(parts) >= 1:
@@ -4029,7 +4061,7 @@ def _handle_join_external_room_tool(input_text: str) -> str:
                 else:
                     asyncio.run(adapter.leave_room(room_id))
             except Exception:
-                pass
+                logging.getLogger(__name__).exception("_handle_join_external_room_tool: swallowed Exception")
             return (
                 f"Joined {platform}/{room_id} but could not post the "
                 f"required AI-presence announcement. Left the room to "
@@ -4155,7 +4187,7 @@ def _handle_request_resource(input_text: str) -> str:
             os.environ[key_name] = val  # Make available for current session
             return f"Resource '{key_name}' loaded from vault and is now available."
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("_handle_request_resource: swallowed Exception")
 
     # Key not found — return a structured request for the frontend
     # The backend will detect __SECRET_REQUEST__ and inject it into the response
@@ -4171,7 +4203,7 @@ def _handle_request_resource(input_text: str) -> str:
             used_by=req.get('used_by', 'Agent tool'),
         )
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("_handle_request_resource: swallowed Exception")
 
     secret_request = _json.dumps({
         '__SECRET_REQUEST__': True,
@@ -4404,17 +4436,17 @@ def _kick_heavy_tools_build_once():
         try:
             tools += list(_safe_load_google_search() or [])
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("_build: swallowed Exception")
         _t_google = _time.time() - _start
         try:
             tools += list(_cached_skill_tools())
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("_build: swallowed Exception")
         _t_skill = _time.time() - _start - _t_google
         try:
             tools += list(_cached_provider_tools())
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("_build: swallowed Exception")
         _t_provider = _time.time() - _start - _t_google - _t_skill
         with _HEAVY_TOOLS_LOCK:
             _HEAVY_TOOLS_CACHE = tools
@@ -4427,7 +4459,7 @@ def _kick_heavy_tools_build_once():
                 _time.time() - _start,
             )
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("_build: swallowed Exception")
 
     try:
         import threading as _t
@@ -4473,18 +4505,18 @@ def _warmup_tool_registries_in_background():
             try:
                 time.sleep(2)
             except Exception:
-                pass
+                logging.getLogger(__name__).exception("_warm: swallowed Exception")
             # Fast registries — these probe at register-time, not
             # iteration-time, so iterating them now is cheap.  Kept
             # synchronous in the warmer thread.
             try:
                 _cached_service_tools()
             except Exception:
-                pass
+                logging.getLogger(__name__).exception("_warm: swallowed Exception")
             try:
                 _cached_introspect_tools()
             except Exception:
-                pass
+                logging.getLogger(__name__).exception("_warm: swallowed Exception")
             # The 3 heavy ones (google-search cold imports + skill
             # registry GitHub/fs walk + provider gateway probes) — do
             # NOT load them.  Loading them eagerly burns the GIL for
@@ -4508,7 +4540,7 @@ def _warmup_tool_registries_in_background():
                         "[TOOL-WARMUP] heavy group kicked (opt-in via "
                         "HEVOLVE_LOAD_HEAVY_TOOLS)")
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).exception("_warm: swallowed Exception")
             try:
                 app.logger.info(
                     "[TOOL-WARMUP] fast tool registries ready "
@@ -4519,7 +4551,7 @@ def _warmup_tool_registries_in_background():
                     len(_INTROSPECT_TOOLS_CACHE or []),
                 )
             except Exception:
-                pass
+                logging.getLogger(__name__).exception("_warm: swallowed Exception")
 
         _t.Thread(target=_warm, daemon=True, name='tool-registry-warmup').start()
     except Exception as _w_err:
@@ -5008,7 +5040,7 @@ def get_tools(req_tool, is_first: bool = False):
                 "  ".join(_parts),
             )
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("get_tools: swallowed Exception")
 
         return tools
 
@@ -5282,42 +5314,57 @@ def _g12_kick_off_student(prompt: str):
 
 
 def _g12_finalize(prompt: str, teacher_response: str, student_future) -> None:
-    """Collect the student future (short-timeout) and enqueue distillation.
+    """Schedule distillation when the student future completes — NEVER block
+    the teacher return.
 
-    Fire-and-forget — we never hold up the teacher return.  Callers MUST
-    pass the teacher text they're about to return; distillation only fires
-    when both responses are available AND they differ.
+    PERF-3 (audit): this used to ``student_future.result(timeout=0.5)`` —
+    blocking the user-reply path up to 0.5s per LLM iteration waiting on the
+    SSM student's forward pass.  That work is distillation TRAINING DATA; it is
+    never needed to answer the user.  We now attach a completion callback
+    instead of joining, so the reply returns immediately (finally matching this
+    function's long-standing "fire-and-forget" contract) and the
+    teacher/student pair is recorded through the SAME canonical sink
+    (world_model_bridge.record_teacher_student_pair) the moment the student
+    finishes — even past 0.5s, so we record MORE pairs than the old
+    drop-on-timeout path, at zero reply-latency cost.
     """
     if student_future is None or not teacher_response:
         return
+
+    def _record_when_ready(fut) -> None:
+        # Runs on the student executor's thread when the SSM pass completes (or
+        # immediately, on the caller's thread, if already settled).  Either way
+        # this is the fast record only — never the 0.5s wait.  record_* is
+        # already reachable concurrently across chat turns, so no new
+        # thread-safety surface is introduced here.
+        try:
+            student = fut.result()
+        except Exception:
+            return
+        if not student or not isinstance(student, dict):
+            return
+        s_text = student.get('response')
+        if not s_text:
+            return
+        try:
+            from integrations.agent_engine.world_model_bridge import (
+                get_world_model_bridge,
+            )
+            bridge = get_world_model_bridge()
+            bridge.record_teacher_student_pair(
+                prompt=prompt,
+                teacher_response=teacher_response,
+                student_response=str(s_text),
+                student_action=student.get('action_tensor'),
+            )
+        except Exception:
+            logging.getLogger(__name__).exception("_record_when_ready: swallowed Exception")
+
     try:
-        # Budget: we're about to return to the user anyway.  If the student
-        # isn't done within 500ms, drop it for this turn — distillation
-        # can pick up the next request.
-        student = student_future.result(timeout=0.5)
-    except _g12_cf.TimeoutError:
-        # Let it finish in the background; we just don't use it this turn.
-        return
+        student_future.add_done_callback(_record_when_ready)
     except Exception:
-        return
-    if not student or not isinstance(student, dict):
-        return
-    s_text = student.get('response')
-    if not s_text:
-        return
-    try:
-        from integrations.agent_engine.world_model_bridge import (
-            get_world_model_bridge,
-        )
-        bridge = get_world_model_bridge()
-        bridge.record_teacher_student_pair(
-            prompt=prompt,
-            teacher_response=teacher_response,
-            student_response=str(s_text),
-            student_action=student.get('action_tensor'),
-        )
-    except Exception:
-        pass
+        # Future already settled / executor torn down — best-effort, never raise.
+        logging.getLogger(__name__).exception("_g12_finalize: swallowed Exception")
 
 
 def _pooled_post_with_refusal_check(api_url, json=None, app_logger=None, **kwargs):
@@ -5648,7 +5695,7 @@ class CustomGPT(LLM):
                 try:
                     text = text.strip('`').replace('json\n', '').strip()
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).exception("_call: swallowed Exception")
                 intents = json.loads(text)
                 app.logger.info(f"the intents are: {intents}")
 
@@ -5685,7 +5732,7 @@ class CustomGPT(LLM):
                 try:
                     text = text.strip('`').replace('json\n', '').strip()
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).exception("_call: swallowed Exception")
                 intents = json.loads(text)
 
                 curr_intent = intents["action"]
@@ -5771,10 +5818,10 @@ class CustomAgentExecutor(AgentExecutor):
                             g.register_conversation('user', ui, sk)
                             g.register_conversation('langchain', ao, sk)
                         except Exception:
-                            pass
+                            logging.getLogger(__name__).exception("_bg_register: swallowed Exception")
                     threading.Thread(target=_bg_register, daemon=True).start()
             except Exception:
-                pass  # Non-blocking
+                logging.getLogger(__name__).exception("prep_outputs: swallowed Exception")  # Non-blocking
         else:
             app.logger.info(
                 f"Memory object is None, skipping save")
@@ -6142,7 +6189,7 @@ def _parse_pdf_in_process(input_url, user_id, request_id):
                 json.dumps(payload),
             )
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("step: swallowed Exception")
 
     # Step 1: Download PDF
     step(f"Downloading PDF from {input_url}...")
@@ -6309,7 +6356,7 @@ def _parse_pdf_in_process(input_url, user_id, request_id):
         try:
             os.remove(pdf_save_path)
         except OSError:
-            pass
+            logging.getLogger(__name__).warning("_parse_pdf_in_process: swallowed OSError", exc_info=True)
 
 
 try:
@@ -6405,7 +6452,7 @@ def parse_visual_context(inp: str):
                     if frame is not None:
                         break
         except ImportError:
-            pass
+            logging.getLogger(__name__).debug("parse_visual_context: swallowed ImportError")
         except Exception as _e:
             app.logger.debug(f'parse_visual_context auto-start failed: {_e}')
     if frame is None:
@@ -6534,14 +6581,16 @@ def parse_visual_context(inp: str):
                         ),
                     )
             except Exception as _consent_err:
-                # Consent system unavailable — fail OPEN per the
-                # "nothing fails in name of privacy" principle.  Audit
-                # log captures the bypass so it's not silent.
+                # Consent system unavailable — fail CLOSED for CLOUD EGRESS of the
+                # user's screen: never send the image to the cloud without a verifiable
+                # grant (humans-always-in-control). This is egress of SENSITIVE data, so
+                # the "nothing fails in name of privacy" principle — which protects LOCAL
+                # UX from privacy theatre — does NOT apply here; the on-device model path
+                # stays available. Audit-logged so the refusal is not silent.
                 app.logger.warning(
-                    "Visual QA: consent system unavailable (%s) — "
-                    "proceeding with cloud fallback (auto-grant fail "
-                    "open).", _consent_err)
-                _consent_ok = True
+                    "Visual QA: consent system unavailable (%s) — refusing cloud "
+                    "fallback (fail-closed; on-device path unaffected).", _consent_err)
+                _consent_ok = False
             if not _consent_ok:
                 # ONLY path that refuses: user explicitly revoked the
                 # cloud_egress[vision] consent earlier.  Re-grant
@@ -6957,7 +7006,7 @@ if _LC_BaseCallbackHandler is not None:
                     time.time(),
                 )
             except Exception:
-                pass
+                logging.getLogger(__name__).exception("on_agent_action: swallowed Exception")
 
         def on_tool_end(self, output, *, run_id=None, **kwargs):
             try:
@@ -6987,7 +7036,7 @@ if _LC_BaseCallbackHandler is not None:
                 )
             except Exception:
                 # Never propagate — training ingestion must not break the agent.
-                pass
+                logging.getLogger(__name__).exception("on_tool_end: swallowed Exception")
 
         def on_tool_error(self, error, *, run_id=None, **kwargs):
             # Tool errors are ALSO training signal (negative observations).
@@ -7017,7 +7066,7 @@ if _LC_BaseCallbackHandler is not None:
                     node_id=self._node_id,
                 )
             except Exception:
-                pass
+                logging.getLogger(__name__).exception("on_tool_error: swallowed Exception")
 else:
     AgentInteractionIngestor = None  # noqa: N816
 
@@ -7098,7 +7147,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
         from core.agent_personality import get_regional_tone_prompt
         _tone_block = get_regional_tone_prompt(preferred_lang)
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("get_ans: swallowed Exception")
     _resonance_block = ''
     try:
         from core.resonance_profile import get_or_create_profile
@@ -7107,7 +7156,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
         _res_profile = pre_tune_from_input(_res_profile, prompt)
         _resonance_block = build_resonance_prompt(_res_profile) or ''
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("get_ans: swallowed Exception")
 
     # Strong language directive — Qwen3.5-4B (and many multilingual
     # models) will ignore a weak "respond in English" when the system
@@ -7321,7 +7370,7 @@ def get_ans(casual_conv, req_tool, user_id, query, custom_prompt, preferred_lang
                 )
             except Exception:
                 # Fire-and-forget — never let telemetry break the agent.
-                pass
+                logging.getLogger(__name__).exception("get_ans: swallowed Exception")
             ans = agent_chain.run({'input': query})
     except Exception as _agent_err:
         # G13: Report text-modality generation failures to the learner so
@@ -7853,7 +7902,7 @@ def _autonomous_gather_info(user_id, description, prompt_id):
                 }]},
                 timeout=5)
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("_autonomous_gather_info: swallowed Exception")
     except Exception as e:
         app.logger.error(f'Failed to save partial autonomous config: {e}')
     return 'Autonomous gathering completed with partial config. Moving to review.'
@@ -7883,9 +7932,9 @@ def _tune_resonance_after_chat(user_id, prompt_text, response_text):
                 'resonance_interactions': profile.total_interactions,
             }
     except ImportError:
-        pass
+        logging.getLogger(__name__).debug("_tune_resonance_after_chat: swallowed ImportError")
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("_tune_resonance_after_chat: swallowed Exception")
     return {}
 
 
@@ -8128,7 +8177,7 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
                 try:
                     audio_path = json.loads(_raw).get('path', '')
                 except (json.JSONDecodeError, AttributeError):
-                    pass
+                    logging.getLogger(__name__).debug("_bg: swallowed json.JSONDecodeError, AttributeError", exc_info=True)
             if audio_path and os.path.isfile(audio_path):
                 audio_filename = os.path.basename(audio_path)
                 # Use absolute URL if this node's external URL is known —
@@ -8164,7 +8213,7 @@ def _tts_synthesize_and_publish(text, user_id, request_id, language='en'):
             else:
                 app.logger.warning(f"TTS async: no audio file — path={audio_path}, exists={os.path.isfile(audio_path) if audio_path else False}")
         except ImportError:
-            pass  # TTS not available (cloud mode)
+            logging.getLogger(__name__).debug("_bg: swallowed ImportError")  # TTS not available (cloud mode)
         except Exception as e:
             app.logger.error(f"TTS async failed: {e}", exc_info=True)
 
@@ -8202,12 +8251,27 @@ except Exception:
 def _chat_request_is_genuine():
     try:
         from flask import request as _rq
-        _rid = _rq.headers.get('X-HARTOS-Request-ID')
-        if not _rid:
-            _rid = (_rq.get_json(silent=True) or {}).get('request_id')
+        # Read request_id from EVERY transport a HART client uses, in priority
+        # order.  The previous header+JSON-only read missed it whenever the
+        # client put it elsewhere: the Nunba desktop omitted it entirely (now
+        # sent in the JSON body) and the Android client sends it as a multipart
+        # FORM field (OkHttp MultipartBody.Part 'request_id'), which
+        # get_json(silent=True) returns None for → empty → the user turn was
+        # misclassified as BACKGROUND, so enter_foreground never fired and the
+        # daemon never yielded the llama slot (the "hi" starvation).
+        _rid = (_rq.headers.get('X-HARTOS-Request-ID')
+                or _rq.values.get('request_id')   # form (multipart/urlencoded) + query
+                or (_rq.get_json(silent=True) or {}).get('request_id'))
     except Exception:
         return True  # no request context / unparsable -> treat as a user turn
     try:
+        # Delegate ENTIRELY to the one canonical discriminator — no bespoke,
+        # caller-specific "is user" rule here.  is_genuine_user_request is the
+        # single source of truth for empty / 'daemon_' / real-id across every
+        # caller (this inbound mark_view AND the outbound abort gate), so they
+        # can never diverge.  Empty → background is safe inbound too: a real
+        # /chat always carries an id (the frontend sends one; the Nunba adapter
+        # defaults a timestamp when omitted), so an inbound turn is never empty.
         from integrations.agent_engine.dispatch import is_genuine_user_request
         return is_genuine_user_request(_rid)
     except Exception:
@@ -8216,7 +8280,7 @@ try:
     from core.foreground import set_genuine_check as _set_genuine_check
     _set_genuine_check(_chat_request_is_genuine)
 except Exception:
-    pass
+    logging.getLogger(__name__).exception("<module>: swallowed Exception")
 
 
 @app.route('/chat', methods=['POST'])
@@ -8281,7 +8345,7 @@ def chat():
         if not _limiter.check(str(rate_user), 'chat', max_tokens=30, refill_rate=30 / 60):
             return jsonify({'error': 'Rate limit exceeded (30/min). Please wait.', 'response': None}), 429
     except ImportError:
-        pass  # Rate limiter module not installed — allow (dev/flat mode)
+        logging.getLogger(__name__).debug("chat: swallowed ImportError")  # Rate limiter module not installed — allow (dev/flat mode)
     except Exception as e:
         # Rate limiter unavailable (Redis down, etc.) — fail closed on cloud
         if os.environ.get('HEVOLVE_NODE_TIER') == 'central':
@@ -8340,7 +8404,7 @@ def chat():
                 data['user_id'] = jwt_payload['user_id']
                 g.token_scope = jwt_payload.get('scope', 'local')
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("chat: swallowed Exception")
 
     # Reject unauthenticated requests on multi-user deployments.
     # Body-sourced user_id is only safe on flat tier (single-user desktop).
@@ -8407,7 +8471,10 @@ def chat():
     # so calling it every request is cheap (~10us stat call).
     if preferred_lang:
         _persist_language(preferred_lang)
-    request_id = data.get('request_id', None)
+    # request_id may arrive as a multipart/urlencoded FORM field (Android OkHttp)
+    # rather than in the JSON body — read both so the thread-local id (and every
+    # downstream foreground/yield + log correlation) is never silently empty.
+    request_id = data.get('request_id') or request.values.get('request_id') or None
     req_tool = data.get('tools', None)
     file_id = data.get('file_id', None)
     prompt_id = data.get('prompt_id', None)
@@ -8493,7 +8560,7 @@ def chat():
         if is_genuine_user_request(request_id):
             mark_user_chat_activity()
     except ImportError:
-        pass
+        logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
     app.logger.info(f"casual_conv type {casual_conv}")
 
@@ -8519,7 +8586,7 @@ def chat():
             if not allowed:
                 return jsonify({'error': f'Guardrail: {reason}', 'response': None}), 403
         except ImportError:
-            pass
+            logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
     # SECURITY: redact secrets (API keys, tokens, passwords) from user prompts
     if prompt:
@@ -8527,7 +8594,7 @@ def chat():
             from security.secret_redactor import redact_secrets
             prompt, _redacted_count = redact_secrets(prompt)
         except ImportError:
-            pass
+            logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
     # BUDGET GATE: estimate and log LLM cost before execution
     if prompt:
@@ -8536,7 +8603,7 @@ def chat():
             _est_cost = estimate_llm_cost_spark(prompt)
             app.logger.debug(f"Estimated LLM cost: {_est_cost} Spark for user={user_id}")
         except ImportError:
-            pass
+            logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
     # Speculative dispatch: fast response + background expert
     if speculative and prompt and user_id and prompt_id:
@@ -8555,7 +8622,7 @@ def chat():
                     'latency_ms': result.get('latency_ms'),
                 })
         except ImportError:
-            pass
+            logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
     # return ""
     thread_local_data.set_request_id(request_id=request_id)
@@ -8569,7 +8636,7 @@ def chat():
                 app.logger.warning(f"Prompt injection detected: {reason}")
                 return jsonify({'error': f'Input rejected: {reason}', 'response': None}), 400
         except Exception:
-            pass  # Degrade gracefully
+            logging.getLogger(__name__).exception("chat: swallowed Exception")  # Degrade gracefully
 
     # --- Agentic execution after user consent (Plan Mode → execute) ---
     agentic_execute = data.get('agentic_execute', False)
@@ -8647,7 +8714,7 @@ def chat():
                     prompt_id = None  # Skip CREATE/REUSE routing, fall through to get_ans()
                     app.logger.info(f"System agent '{_agent_meta.get('name')}' routed to casual chat")
             except Exception:
-                pass
+                logging.getLogger(__name__).exception("chat: swallowed Exception")
 
         # Per-user lock prevents concurrent requests from corrupting agent state.
         # Replaces the global _state_lock for better concurrency.
@@ -8876,7 +8943,7 @@ def chat():
                         preferred_lang=preferred_lang,
                     )
         except ImportError:
-            pass
+            logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
     if create_agent:
         # Generate prompt_id server-side if not provided
@@ -8954,7 +9021,7 @@ def chat():
                             try:
                                 _create_social_agent_from_prompt(user_id, prompt_id)
                             except Exception:
-                                pass
+                                logging.getLogger(__name__).exception("chat: swallowed Exception")
                             _record_lifecycle('completed', user_id, prompt_id,
                                              f'Autonomous full pipeline: gather + recipe in one shot')
                             _push_workflow_flowchart(user_id, prompt_id, request_id)
@@ -8976,7 +9043,7 @@ def chat():
                             from integrations.agent_engine.dispatch import mark_create_end
                             mark_create_end()
                         except ImportError:
-                            pass
+                            logging.getLogger(__name__).debug("chat: swallowed ImportError")
 
                 # Fallback: config saved but recipe failed — next dispatch will retry
                 with _user_lock:
@@ -9038,7 +9105,7 @@ def chat():
                         }]},
                         timeout=5)
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).exception("_save_and_enter_review: swallowed Exception")
                 with _user_lock:
                     review_agents[_ak] = True
                     _touch_agent_timestamp(_ak)
@@ -9178,7 +9245,7 @@ def chat():
                     from integrations.agent_engine.dispatch import mark_create_end as _mce
                     _mce()
                 except ImportError:
-                    pass
+                    logging.getLogger(__name__).debug("chat: swallowed ImportError")
             if response =='Agent Created Successfully':
                 with _user_lock:
                     conversation_agent[_ak] = True
@@ -9840,7 +9907,7 @@ def _create_social_agent_from_prompt(user_id, prompt_id):
             user.display_name = agent_display_name
             db.flush()
         except ValueError:
-            pass  # already exists
+            logging.getLogger(__name__).debug("_create_social_agent_from_prompt: swallowed ValueError", exc_info=True)  # already exists
 
         db.commit()
         app.logger.info(f"Social agent created: {agent_name} for prompt {prompt_id}")
@@ -9898,7 +9965,7 @@ def _merge_prompts_with_cloud(local_prompts: list, cloud_url: str) -> list:
                 item.setdefault('has_recipe', False)
                 local_prompts.append(item)
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("_merge_prompts_with_cloud: swallowed Exception")
     return local_prompts
 
 
@@ -10207,7 +10274,7 @@ def upload_recipe_bundle():
         try:
             os.remove(tmp_path)
         except OSError:
-            pass
+            logging.getLogger(__name__).warning("upload_recipe_bundle: swallowed OSError", exc_info=True)
         return jsonify({'error': f'blob write failed: {e}'}), 500
     return jsonify({
         'stored': True,
@@ -10850,7 +10917,7 @@ def coding_execute():
             if peer_pub:
                 return jsonify({'encrypted': encrypt_json_for_peer(result, peer_pub)})
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("coding_execute: swallowed Exception")
 
     return jsonify(result)
 
@@ -11227,7 +11294,7 @@ def settings_compute_get():
                     'cause_alignment': peer.cause_alignment,
                 }
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("settings_compute_get: swallowed Exception")
 
     return jsonify({**policy, **provider_info, 'node_id': node_id})
 
@@ -11475,7 +11542,7 @@ def remote_desktop_api_host():
                     result['rustdesk_id'] = rd_id
                 result['engine'] = 'rustdesk'
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("remote_desktop_api_host: swallowed Exception")
 
     # Start Sunshine
     if engine_pref in ('auto', 'sunshine'):
@@ -11488,7 +11555,7 @@ def remote_desktop_api_host():
                 if engine_pref == 'sunshine':
                     result['engine'] = 'sunshine'
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("remote_desktop_api_host: swallowed Exception")
 
     return jsonify(result)
 
@@ -11518,7 +11585,7 @@ def remote_desktop_api_connect():
                     return jsonify({'success': True, 'engine': 'rustdesk',
                                     'device_id': device_id, 'message': msg})
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("remote_desktop_api_connect: swallowed Exception")
 
     # Try Moonlight
     if engine in ('auto', 'moonlight'):
@@ -11531,7 +11598,7 @@ def remote_desktop_api_connect():
                     return jsonify({'success': True, 'engine': 'moonlight',
                                     'device_id': device_id, 'message': msg})
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("remote_desktop_api_connect: swallowed Exception")
 
     return jsonify({'success': False, 'error': 'No engine available'}), 503
 

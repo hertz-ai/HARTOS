@@ -54,6 +54,89 @@ def _flow_recipe_exists(prompt_id) -> bool:
         return False
 
 
+def _goal_identity(goal):
+    """Map an AgentGoal row to the cross-node identity dict the peer-reuse
+    client keys on. SINGLE source for both the reactive discovery sweep
+    (_try_peer_recipe_reuse) and the proactive advert consult
+    (_consult_recipe_advert), so the two legs can never key differently.
+    """
+    cfg = goal.config_json or {}
+    return {
+        'goal_id': str(goal.id),
+        'goal_slug': cfg.get('bootstrap_slug') or '',
+        'goal_type': goal.goal_type or '',
+        'goal_title': goal.title or '',
+        'goal_description': goal.description or '',
+        'owner_id': str(goal.owner_id or goal.created_by or ''),
+    }
+
+
+def _consult_recipe_advert(goal, local_prompt_id):
+    """PROACTIVE advert-layer consult for a goal with no LOCAL recipe.
+
+    If an admitted peer already gossip-announced that it banked this
+    goal's recipe, pull it DIRECTLY from the advertised peer, skipping
+    the O(peers) discovery sweep. Returns 'pulled' (recipe banked, classify
+    as REUSE) on a fresh advert hit, or None on miss/stale so the caller
+    falls through to the reactive _try_peer_recipe_reuse floor (UNCHANGED).
+    Never raises: any failure is logged and degrades to None.
+    """
+    try:
+        from integrations.google_a2a.peer_reuse import consume_advert
+        return consume_advert(_goal_identity(goal), local_prompt_id)
+    except Exception as e:
+        logger.info(
+            f"Recipe-advert consult failed for goal "
+            f"{getattr(goal, 'id', '?')}: {e}")
+        return None
+
+
+def _try_peer_recipe_reuse(goal, local_prompt_id, deadline):
+    """Bounded A2A peer-reuse attempt for a goal with no LOCAL recipe.
+
+    Maps the AgentGoal row to the cross-node identity dict and delegates
+    to the canonical outbound client (integrations.google_a2a.peer_reuse).
+    Returns 'pulled' (recipe banked locally, classify as REUSE),
+    'invoked' (executed remotely this tick, outcome recorded), or None
+    (fall through to CREATE exactly as before). Never raises: any
+    failure is logged and degrades to None so the tick cannot crash.
+    """
+    try:
+        from integrations.google_a2a.peer_reuse import try_peer_recipe_reuse
+        return try_peer_recipe_reuse(
+            _goal_identity(goal), local_prompt_id, deadline=deadline)
+    except Exception as e:
+        logger.info(
+            f"Peer-reuse attempt failed for goal "
+            f"{getattr(goal, 'id', '?')}: {e}")
+        return None
+
+
+def _idle_only_blocked(cfg) -> bool:
+    """True when a goal flagged ``config.idle_only=True`` must be skipped
+    because the machine is not idle right now.
+
+    Reuses the ONE existing idle detector — ``ResourceGovernor.get_mode()``
+    (core/resource_governor.py, MODE_IDLE = user away past
+    IDLE_THRESHOLD_SECONDS and no external load) — no parallel scheduler.
+    The daemon-wide ``should_yield_to_user()`` gate already backs the whole
+    tick off while the user is active, but its STARVATION OVERRIDE forces a
+    tick through after sustained yielding; this per-goal check keeps
+    idle_only goals (e.g. paper_explanation) out of those forced ticks too.
+
+    Fail-CLOSED on any error: idle_only means PROVEN idle — if the governor
+    can't be consulted, the goal waits for the next tick.  Goals without
+    the flag are never blocked here.
+    """
+    if not (cfg or {}).get('idle_only', False):
+        return False
+    try:
+        from core.resource_governor import get_governor, MODE_IDLE
+        return get_governor().get_mode() != MODE_IDLE
+    except Exception:
+        return True
+
+
 def _get_blocked_hitl_tasks(ledger, goal_id):
     """Get tasks blocked with APPROVAL_REQUIRED under a goal."""
     try:
@@ -153,6 +236,15 @@ class AgentDaemon:
         # user-facing chat path; tune down if the flywheel is still slow.
         self._starvation_s = int(os.environ.get(
             'HEVOLVE_AGENT_STARVATION_S', '120'))
+        # ── Agentic-home re-compose cadence ──────────────────────────
+        # The home re-composes itself on a slow idle cadence (default 5 min)
+        # so the local LLM is only spent when there is something to refresh,
+        # never on every 30s tick.  ``0`` here means "compose on the first
+        # idle tick" so the surface upgrades from the offline skeleton soon
+        # after the boot grace ends.  Tunable via HART_HOME_COMPOSE_INTERVAL_S.
+        self._home_compose_interval_s = int(os.environ.get(
+            'HART_HOME_COMPOSE_INTERVAL_S', '300'))
+        self._next_home_compose_at = 0.0
 
     def start(self):
         with self._lock:
@@ -164,6 +256,20 @@ class AgentDaemon:
                                         name='agent_daemon')
         self._thread.start()
         logger.info(f"Agent daemon started (interval={self._interval}s)")
+
+    def run_forever(self):
+        """Start the daemon and BLOCK — the foreground entrypoint for systemd.
+
+        start() spawns the worker thread and returns immediately; a systemd
+        ExecStart (nixos/modules/hart-agent.nix calls AgentDaemon().run_forever())
+        needs the process to stay alive, so we start then join the worker. If the
+        worker thread ever exits this returns and systemd's Restart=on-failure
+        relaunches the unit. Without this method the unit crashed on boot with
+        AttributeError: 'AgentDaemon' object has no attribute 'run_forever'.
+        """
+        self.start()
+        if self._thread is not None:
+            self._thread.join()
 
     def stop(self):
         with self._lock:
@@ -642,6 +748,17 @@ class AgentDaemon:
             # _loop continues immediately to _tick.
             self._spawn_proactive_hive_tick_async()
 
+            # Agentic HOME re-compose (the home composes itself live).  Same
+            # fire-and-forget pattern + yield gate as the proactive tick: when
+            # the user is actively at the box we yield the local LLM to them
+            # (the shell's own client-side refresh keeps the home fresh from the
+            # data endpoints meanwhile); when the box is idle the LLM composes a
+            # contextual {hero, rows} and pushes it through the EXISTING
+            # compose_home feed - so the home is alive whether the user is
+            # present or away.  The kill-switch + rate-cap are enforced inside
+            # agent_ui_update; this only PACES the producer.
+            self._spawn_home_compose_async()
+
             try:
                 self._tick()
                 self._consecutive_failures = 0
@@ -680,6 +797,52 @@ class AgentDaemon:
             target=_runner, daemon=True, name='proactive_hive_tick')
         t.start()
         self._proactive_thread = t
+
+    def _spawn_home_compose_async(self) -> None:
+        """Compose + push the agentic home in a daemon thread when the box is
+        idle, never blocking the goal-dispatch loop.
+
+        Reuses the autonomous daemon (no new loop) + the existing compose_home
+        feed (no new transport).  Three gates keep it cheap + polite:
+          1. cadence  - at most once per HART_HOME_COMPOSE_INTERVAL_S (5 min);
+          2. yield    - skip while the user is active (should_yield_to_user),
+             so the LLM compose never steals the slot from a live chat; the
+             shell's own client-side refresh keeps the home fresh meanwhile;
+          3. single-flight - skip if the prior compose thread is still running.
+        The kill-switch + per-agent rate cap are enforced authoritatively
+        inside agent_ui_update (run_home_compose -> compose_home), so this
+        method adds no new gate.  Fully guarded - a compose fault never touches
+        the daemon loop."""
+        now = time.time()
+        if now < self._next_home_compose_at:
+            return
+        prior = getattr(self, '_home_compose_thread', None)
+        if prior is not None and prior.is_alive():
+            return
+        # Yield to a live user: the home stays fresh client-side while busy;
+        # the LLM compose is reserved for idle.  Reuse the ONE canonical gate.
+        try:
+            from .dispatch import should_yield_to_user
+            if should_yield_to_user():
+                return
+        except Exception:
+            pass
+        # Schedule the next attempt now (even if this one fails) so a flapping
+        # compose can't busy-loop the LLM.
+        self._next_home_compose_at = now + max(60, self._home_compose_interval_s)
+
+        def _runner():
+            try:
+                from integrations.agent_engine.liquid_ui_service import (
+                    run_home_compose)
+                run_home_compose(reason='idle_tick')
+            except Exception as e:
+                logger.debug(f"Home compose tick error: {e}")
+
+        t = threading.Thread(
+            target=_runner, daemon=True, name='home_compose')
+        t.start()
+        self._home_compose_thread = t
 
     def _tick(self):
         """Find active goals, find idle agents, dispatch via /chat.
@@ -833,12 +996,47 @@ class AgentDaemon:
             from .dispatch import prompt_id_for_goal
             _create_queue = []
             _reuse_pool = []
+            # A2A peer-reuse leg: ONE shared monotonic deadline caps the
+            # whole peer sweep this tick (peer_leg_budget_s, default 10s),
+            # so a large CREATE backlog can never stall the tick on
+            # network I/O. Lazily armed on the first recipe-less goal.
+            _peer_deadline = None
             for goal in goals:
                 # Shared recipe-existence check (_flow_recipe_exists) — the
                 # SAME signal the completion gate uses, so classifier and
                 # gate can never drift apart.
-                if _flow_recipe_exists(prompt_id_for_goal(str(goal.id))):
+                _pid = prompt_id_for_goal(str(goal.id))
+                if _flow_recipe_exists(_pid):
                     _reuse_pool.append(goal)
+                    continue
+                # No LOCAL recipe: before falling into CREATE, ask the
+                # hive over the A2A surface. A peer that already banked
+                # this goal's recipe ships the bytes (pull -> local
+                # REUSE), or executes it remotely as a fallback. All
+                # failure modes degrade to CREATE exactly as before.
+                if _peer_deadline is None:
+                    try:
+                        from integrations.google_a2a.peer_reuse import (
+                            peer_leg_budget_s)
+                        _peer_deadline = time.monotonic() + peer_leg_budget_s()
+                    except Exception as e:
+                        logger.debug(f"peer_reuse budget unavailable: {e}")
+                        _peer_deadline = time.monotonic() + 10.0
+                # PROACTIVE advert layer first: a peer already gossip-
+                # announced that it banked this goal's recipe, so pull from
+                # the advertised peer DIRECTLY (one bounded pull, skips the
+                # O(peers) discovery sweep). Miss/stale -> reactive floor
+                # below, UNCHANGED, still capped by the shared deadline.
+                _peer = _consult_recipe_advert(goal, _pid)
+                if _peer is None:
+                    _peer = _try_peer_recipe_reuse(goal, _pid, _peer_deadline)
+                if _peer == 'pulled':
+                    _reuse_pool.append(goal)
+                elif _peer == 'invoked':
+                    # Work happened remotely this tick; outcome already
+                    # recorded through the WorldModelBridge. Skip local
+                    # dispatch for this goal until the next tick.
+                    continue
                 else:
                     _create_queue.append(goal)
 
@@ -861,9 +1059,18 @@ class AgentDaemon:
                 if dispatched >= len(idle_agents) or dispatched >= max_concurrent:
                     break
 
+                cfg = goal.config_json or {}
+
+                # IDLE-ONLY gate: goals flagged idle_only run ONLY while the
+                # ResourceGovernor reports MODE_IDLE (see _idle_only_blocked).
+                if _idle_only_blocked(cfg):
+                    logger.debug(
+                        f"Goal {goal.id}: idle_only and machine not idle, "
+                        f"skipping")
+                    continue
+
                 # Skip continuous goals dispatched recently — let the previous
                 # dispatch complete before re-dispatching.
-                cfg = goal.config_json or {}
                 if cfg.get('continuous', False) and goal.last_dispatched_at:
                     elapsed = (datetime.utcnow() - goal.last_dispatched_at).total_seconds()
                     if elapsed < _CONTINUOUS_COOLDOWN_S:

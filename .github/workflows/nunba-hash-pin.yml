@@ -1,0 +1,165 @@
+name: Nunba Hash Pin
+
+# AUTO RE-PIN driver for R3 (the Nunba native daemon serving the canonical
+# LightYourHART). The pin in nixos/packages/nunba.nix is a MATERIALIZED VIEW of
+# Nunba main under the one canonical build contract (main-of-each-repo ships;
+# see Nunba build.yml SIBLING_REF): this workflow resolves hertz-ai/Nunba@main
+# to a sha, substitutes nunbaRev, surfaces the two FOD hashes (nunbaHash via a
+# fake-hash round, npmDepsHash iff package-lock changed), verifies the build
+# GREEN with the new pins, and commits the bump -- replacing the old manual
+# "dispatch -> read got: -> hand-edit -> repeat" loop (kept via dry_run=true).
+#
+# Purity note: a pure Nix build CANNOT float on a branch ref (every fetch is
+# content-addressed), so "unpinned" is impossible -- automated re-pinning is
+# the Nix-idiomatic equivalent of the installer's `ref: main`.
+#
+# Triggers: manual dispatch, and repository_dispatch `nunba-main-push` (emit it
+# from Nunba's build on pushes to main to keep the ISO input tracking main).
+# Never fires on push/nightly of THIS repo, so it can never redden the release
+# build; the verification round must be GREEN before anything is committed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      nunba_ref:
+        description: 'hertz-ai/Nunba ref to pin (default: main, the canonical ship ref)'
+        type: string
+        default: 'main'
+      dry_run:
+        description: 'Only surface the resolved sha + FOD hashes; do not commit'
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [nunba-main-push]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nunba-hash-pin
+  cancel-in-progress: true
+
+jobs:
+  repin-nunba:
+    name: Re-pin packages.nunba to Nunba main
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.HEVOLVE_REPO_TOKEN || github.token }}
+
+      - uses: DeterminateSystems/nix-installer-action@v12
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            fallback = true
+
+      - name: Resolve target Nunba sha
+        id: resolve
+        env:
+          HEVOLVE_REPO_TOKEN: ${{ secrets.HEVOLVE_REPO_TOKEN }}
+          NUNBA_REF: ${{ github.event.inputs.nunba_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${HEVOLVE_REPO_TOKEN:-}" ]; then
+            URL="https://x-access-token:${HEVOLVE_REPO_TOKEN}@github.com/hertz-ai/Nunba.git"
+          else
+            URL="https://github.com/hertz-ai/Nunba.git"
+          fi
+          SHA=$(git ls-remote "$URL" "refs/heads/${NUNBA_REF}" | awk '{print $1}')
+          if [ -z "$SHA" ]; then
+            echo "::error::could not resolve hertz-ai/Nunba@${NUNBA_REF}"
+            exit 1
+          fi
+          CURRENT=$(grep -oE ', nunbaRev \? "[0-9a-f]{40}"' nixos/packages/nunba.nix | grep -oE '[0-9a-f]{40}')
+          echo "target=${SHA}"   >> "$GITHUB_OUTPUT"
+          echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${NUNBA_REF} -> ${SHA} (currently pinned: ${CURRENT})"
+
+      - name: No-op when already pinned to target
+        if: steps.resolve.outputs.target == steps.resolve.outputs.current
+        run: |
+          echo "nunbaRev already at ${{ steps.resolve.outputs.target }} -- nothing to re-pin."
+          echo "NOOP=1" >> "$GITHUB_ENV"
+
+      - name: Substitute rev + fake nunbaHash, surface real hash (round A)
+        if: env.NOOP != '1'
+        working-directory: nixos
+        run: |
+          set -euo pipefail
+          SHA="${{ steps.resolve.outputs.target }}"
+          FAKE="sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+          sed -i -E "s|(, nunbaRev \? \")[0-9a-f]{40}(\")|\1${SHA}\2|" packages/nunba.nix
+          sed -i -E "s|(, nunbaHash \? \")sha256-[A-Za-z0-9+/=]+(\")|\1${FAKE}\2|" packages/nunba.nix
+          set +e
+          nix build .#packages.x86_64-linux.nunba --no-link --print-build-logs 2>&1 | tee /tmp/round-a.log
+          set -e
+          GOT=$(grep -oE 'got: +sha256-[A-Za-z0-9+/=]+' /tmp/round-a.log | head -1 | awk '{print $2}')
+          if [ -z "$GOT" ]; then
+            echo "::error::round A produced no 'got:' hash (fetch/auth failure?) -- log tail:"
+            tail -n 60 /tmp/round-a.log
+            exit 1
+          fi
+          sed -i -E "s|(, nunbaHash \? \")sha256-[A-Za-z0-9+/=]+(\")|\1${GOT}\2|" packages/nunba.nix
+          echo "nunbaHash pinned: ${GOT}"
+
+      - name: Build round B (pin npmDepsHash iff the lock moved) + verify GREEN
+        if: env.NOOP != '1'
+        working-directory: nixos
+        run: |
+          set -euo pipefail
+          set +e
+          nix build .#packages.x86_64-linux.nunba --no-link --print-build-logs 2>&1 | tee /tmp/round-b.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            GOT=$(grep -oE 'got: +sha256-[A-Za-z0-9+/=]+' /tmp/round-b.log | head -1 | awk '{print $2}')
+            if [ -z "$GOT" ]; then
+              echo "::error::round B failed for a NON-hash reason (real build break) -- log tail:"
+              tail -n 80 /tmp/round-b.log
+              exit 1
+            fi
+            sed -i -E "s|(, npmDepsHash \? \")sha256-[A-Za-z0-9+/=]+(\")|\1${GOT}\2|" packages/nunba.nix
+            echo "npmDepsHash pinned: ${GOT}; verification build (round C)..."
+            nix build .#packages.x86_64-linux.nunba --no-link --print-build-logs 2>&1 | tee /tmp/round-c.log
+          fi
+          echo "packages.nunba builds GREEN with the new pins."
+
+      - name: Refresh pin provenance comments
+        if: env.NOOP != '1'
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ steps.resolve.outputs.target }}" | cut -c1-8)"
+          TODAY="$(date -u +%F)"
+          sed -i -E "s|pinned [0-9]{4}-[0-9]{2}-[0-9]{2} for nunbaRev [0-9a-f]{8}|pinned ${TODAY} for nunbaRev ${SHORT}|g" nixos/packages/nunba.nix
+          git diff --stat
+
+      # `inputs` (typed) not `github.event.inputs` (stringly): a `type: boolean`
+      # input compared against the STRING 'true' can coerce wrong in the
+      # expression engine. On repository_dispatch `inputs` is empty -> null != true
+      # -> the commit step runs, which is the desired auto-pin behavior.
+      # NOTE: a push made with the default GITHUB_TOKEN does NOT trigger downstream
+      # workflows (loop protection) -- set HEVOLVE_REPO_TOKEN in this repo's secrets
+      # if the ISO release build should fire automatically from the pin bump.
+      - name: Commit + push the re-pin (skipped on dry_run)
+        if: env.NOOP != '1' && inputs.dry_run != true
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ steps.resolve.outputs.target }}" | cut -c1-8)"
+          git config user.name  "hash-pin-driver"
+          git config user.email "ci@hertz-ai"
+          git add nixos/packages/nunba.nix
+          git commit -m "ci(nixos): auto re-pin nunba to ${SHORT} (hash-pin driver; canonical main tracking)"
+          # main may have moved during the (long) build rounds -- rebase our single
+          # pin commit onto current origin/main instead of failing non-FF.
+          git pull --rebase origin main
+          git push origin HEAD:main
+          echo "Pinned nunba @ ${SHORT} and pushed."
+
+      - name: Dry-run summary
+        if: env.NOOP != '1' && inputs.dry_run == true
+        run: |
+          echo "DRY RUN -- resulting pins (not committed):"
+          grep -nE ', (nunbaRev|nunbaHash|npmDepsHash) \? ' nixos/packages/nunba.nix
+          git diff -- nixos/packages/nunba.nix | head -60

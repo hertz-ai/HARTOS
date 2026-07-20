@@ -57,6 +57,31 @@ def test_xss_nested_javascript_uri_rejected(svc):
     assert ok is False
 
 
+def test_xss_img_onerror_rejected(svc):
+    # The classic <img onerror=> vector the prior regex (script/iframe/
+    # javascript:/data: only) MISSED — now caught via the tag + the inline
+    # event-handler pattern.
+    ok = svc.agent_ui_update('a', {'type': 'card',
+                                   'title': '<img src=x onerror=alert(1)>'})
+    assert ok is False
+    assert svc._agent_components == {}
+
+
+def test_xss_svg_onload_nested_field_rejected(svc):
+    # Nested field (the recursion + broadened pattern together close it).
+    ok = svc.agent_ui_update('a', {'type': 'product_card',
+                                   'items': [{'name': '<svg onload=evil()>'}]})
+    assert ok is False
+
+
+def test_benign_text_with_on_word_not_false_rejected(svc):
+    # The event-handler pattern is anchored to a tag context, so plain display
+    # text like 'online =' / 'donation=' (no '<...') must NOT be rejected.
+    ok = svc.agent_ui_update('a', {'type': 'card',
+                                   'title': 'Status: online = true, donation=5'})
+    assert ok is True
+
+
 def test_benign_card_passes(svc):
     assert svc.agent_ui_update('a', {'type': 'card',
                                      'title': 'Q3 numbers ready'}) is True

@@ -206,15 +206,107 @@ in
     users.users.hart-admin = {
       isNormalUser = true;
       description = "HART OS Administrator";
-      extraGroups = [ "wheel" "hart" "video" "render" ];
-      initialPassword = "hart";  # Change on first login
+      # video + render: open /dev/dri/card* (KMS/DRM) + /dev/dri/renderD* (GPU).
+      # input: open /dev/input/* (libinput keyboard/mouse/touch) — WITHOUT it a
+      # Wayland compositor (cage/sway/hart-comp) launched by greetd cannot read
+      # the seat's input devices (EACCES on /dev/input) and boots dead-input. The
+      # `seat` group (libseat/seatd backend) is added by hart-session-supervisor
+      # .nix ONLY when it enables services.seatd (the group exists only then), so
+      # referencing it here unconditionally cannot fail eval on a seatd-less node.
+      extraGroups = [ "wheel" "hart" "video" "render" "input" ];
+      # Baked SHA-512 hash of "hart" (login = hart-admin / hart). `initialPassword`
+      # is applied by a runtime activation step that does NOT reliably persist on a
+      # read-only / baked live-ISO squashfs — it left hart-admin with no usable
+      # password, so every GDM greeter login failed ("authentication didn't work").
+      # `hashedPassword` is baked into the image and works (server.nix uses it for
+      # the same reason). The INSTALLER should re-prompt for the user's own password
+      # on install; this baked default exists only to reach that first login.
+      hashedPassword = "$6$hartos00$4CRZoq04d/q2rp1.FAXAXMqZeUkDfh90FYFA2vpl4b/3JWAs1EvmjW7dgDf/wt.mjt6iIovSKaZmZtJkoj0dx1";
+    };
+
+    # ── Power actions via logind (polkit grant) — #133 ──
+    # The Liquid-UI shell server (which serves /api/shell/power/action) runs as the
+    # `hart` SERVICE user, a system daemon with NO active graphical session. When
+    # the user taps a power button it asks logind (org.freedesktop.login1.Manager)
+    # to Reboot / PowerOff / Suspend / Hibernate / SetRebootToFirmwareSetup. polkit's
+    # default login1 policy returns `yes` only for an active LOCAL session; a system
+    # daemon falls through to allow_inactive/allow_any = auth_admin, so the call is
+    # DENIED non-interactively and the box silently never reboots (the #133 symptom).
+    #
+    # This rule grants the `hart` shell user (and, belt-and-suspenders, any active
+    # local seat such as hart-admin's graphical session) the login1 power actions
+    # outright, so shell_os_apis.shell_power_action's native D-Bus call is authorized
+    # and actually executes. Scope is the enumerated power verbs ONLY — no broader
+    # privilege is conferred. (The shell server still gates every call behind
+    # @_require_shell_auth + the action whitelist + the firmware-capability probe.)
+    #
+    # ── Wi-Fi / network settings via NetworkManager (polkit grant) — #149 ──
+    # SAME class as the power-action grant above: the Liquid-UI shell SERVER (which
+    # serves /api/shell/network/wifi* + /api/shell/wifi/* and execs bare `nmcli`)
+    # runs as the `hart` SERVICE user — a system daemon with NO active graphical
+    # session. READ-ONLY nmcli status (`nmcli radio`, `nmcli device`) works to anyone
+    # over the system D-Bus, which is why the connectivity indicator could come up;
+    # but ACTIVATING a connection / saving a new Wi-Fi profile with a password needs
+    # polkit auth for org.freedesktop.NetworkManager.settings.modify.system (+
+    # .modify.own, .network-control, .wifi.scan, .enable-disable-*). polkit's default
+    # NetworkManager policy returns `yes` only for an ACTIVE LOCAL session
+    # (allow_active); a sessionless system daemon falls through to auth_admin, so the
+    # call is DENIED non-interactively and the shell surfaces "Not authorised to
+    # change network settings" (the #149 symptom). NixOS only auto-grants users in the
+    # `networkmanager` GROUP, and `hart` is not (and need not be) a session user — so
+    # grant it the NetworkManager actions outright here, the same shape as the login1
+    # grant. Belt-and-suspenders: any active local seat (e.g. hart-admin's graphical
+    # session) is granted too, so a future in-session caller works without a second
+    # rule. Scope is the NetworkManager action namespace ONLY — no broader privilege.
+    # The shell server still gates every call behind @_require_shell_auth.
+    security.polkit = {
+      enable = lib.mkDefault true;
+      extraConfig = ''
+        polkit.addRule(function(action, subject) {
+          var hartPowerActions = {
+            "org.freedesktop.login1.reboot": true,
+            "org.freedesktop.login1.reboot-multiple-sessions": true,
+            "org.freedesktop.login1.power-off": true,
+            "org.freedesktop.login1.power-off-multiple-sessions": true,
+            "org.freedesktop.login1.suspend": true,
+            "org.freedesktop.login1.suspend-multiple-sessions": true,
+            "org.freedesktop.login1.hibernate": true,
+            "org.freedesktop.login1.hibernate-multiple-sessions": true,
+            "org.freedesktop.login1.set-reboot-to-firmware-setup": true,
+            "org.freedesktop.login1.lock-sessions": true
+          };
+          if (hartPowerActions[action.id] === true) {
+            if (subject.user == "hart" || (subject.local && subject.active)) {
+              return polkit.Result.YES;
+            }
+          }
+          // Wi-Fi / network settings (#149): grant the WHOLE NetworkManager action
+          // namespace to the hart shell user (and any active local seat). Matching
+          // the action-id PREFIX (not an enumerated whitelist) so a NetworkManager
+          // rev that adds/renames a settings action can never silently re-break
+          // "connect to Wi-Fi" — the same robustness the networkmanager-group rule
+          // NixOS ships relies on, scoped to the sessionless hart daemon.
+          if (action.id.indexOf("org.freedesktop.NetworkManager.") === 0) {
+            if (subject.user == "hart" || (subject.local && subject.active)) {
+              return polkit.Result.YES;
+            }
+          }
+        });
+      '';
     };
 
     # ── Networking ──
     networking = {
       hostName = lib.mkDefault "hart-node";
       firewall = {
-        enable = true;
+        # mkDefault: the docker-server image format (nixpkgs docker-image.nix)
+        # sets networking.firewall.enable = false at normal priority for the OCI
+        # container; a plain `true` here (this base module is included by EVERY
+        # variant) collided with it ("conflicting definition values"), eval-
+        # failing only the docker-server target. mkDefault yields to the
+        # container's false, while ISO/host variants — which have no competing
+        # definition — still resolve to true (unchanged firewall behaviour).
+        enable = lib.mkDefault true;
         allowedTCPPorts = [ cfg.ports.backend 22 ];
         allowedUDPPorts = [ cfg.ports.discovery ];
       };
@@ -276,17 +368,37 @@ in
 
     # ── Directories ──
     systemd.tmpfiles.rules = [
-      "d ${cfg.dataDir} 0750 hart hart -"
+      # 0770 (group-writable), NOT 0750: the hart-session-supervisor selector runs
+      # as hart-admin (in the `hart` GROUP, not the `hart` OWNER) and MUST create +
+      # write the session-tier latch + crash-window files that live directly under
+      # this dir. At 0750 the group has only r-x, so every latch/window write fails
+      # "Permission denied" and a tier-drop can NEVER persist — the real-HW boot
+      # loop (the selector retries the same broken tier forever). hart-session-
+      # supervisor.nix declares the SAME `d /var/lib/hart 0770` rule; the two are
+      # now IDENTICAL, so tmpfiles de-dupes them and the mode is deterministic
+      # regardless of rule ordering. (Previously this was 0750 while the supervisor
+      # set 0770 — a same-path mode CONFLICT whose winner tmpfiles decided by file
+      # ordering = nondeterministic; a 0750 win silently reinstated the boot loop.)
+      # Do NOT revert this to 0750. The restrictive subdirs below keep their own
+      # 0750/0700 modes — a 0770 parent does not relax them.
+      "d ${cfg.dataDir} 0770 hart hart -"
       "d ${cfg.dataDir}/agent_data 0750 hart hart -"
       "d ${cfg.dataDir}/models 0750 hart hart -"
       "d ${cfg.logDir} 0750 hart hart -"
     ];
 
     # ── Systemd target: hart.target groups all HART services ──
+    # NO network-online.target: hart.target is a pure grouping target; hart-backend
+    # (the shell's local :6777 API) is partOf+wantedBy it, so ANY network-online wait
+    # here is inherited by the backend and stalls the boot-critical path ~90-120s on
+    # an offline live USB (NetworkManager-wait-online timeout) -> the glass shell's
+    # BACKEND-served panels connection-refuse to localhost:6777 ("Reconnecting").
+    # Net-needing HART services (dns/ota/firewall/sso/subsystems) each declare their
+    # OWN best-effort `wants=network-online` locally, so dropping it from the group
+    # changes nothing for them while freeing the offline boot path. multi-user.target
+    # already implies local-fs/sysinit ordering for the grouped services.
     systemd.targets.hart = {
       description = "HART OS Services";
-      after = [ "network-online.target" ];
-      wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
     };
 

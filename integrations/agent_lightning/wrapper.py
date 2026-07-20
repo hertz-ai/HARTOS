@@ -49,6 +49,12 @@ class AgentLightningWrapper:
             track_rewards: Enable reward tracking
             auto_trace: Enable automatic tracing
         """
+        # Ensure the autogen.Agent ABC registration is in place before this
+        # wrapper participates in any GroupChat isinstance() check (deferred
+        # off module-load to keep autogen out of the boot import — see the
+        # _ensure_autogen_agent_registration docstring below).
+        _ensure_autogen_agent_registration()
+
         self.agent = agent
         self.agent_id = agent_id
         self.track_rewards = track_rewards
@@ -364,11 +370,35 @@ class AgentLightningWrapper:
 # Register as virtual subclass of autogen.Agent so isinstance() checks pass
 # in GroupChat (speaker selection, transition validation, graph validity).
 # This is the ABC way to say "this class IS-A Agent" without inheriting.
-try:
-    import autogen
-    autogen.Agent.register(AgentLightningWrapper)
-except (ImportError, AttributeError):
-    pass  # autogen not installed or Agent doesn't support register()
+#
+# Deferred (was a module-level `import autogen; autogen.Agent.register(...)`):
+# importing autogen at module-load time drags google.api_core (~7.6s) +
+# the contrib->llmlingua->torch (~4.2s) chain onto the backend-boot path
+# (this module is imported transitively via hart_intelligence_entry ->
+# create_recipe).  The registration only needs to be in place BEFORE the
+# first `isinstance(wrapper, autogen.Agent)` check in GroupChat — and by
+# the time ANY wrapper is constructed autogen is already imported (the
+# agent being wrapped is itself an autogen agent).  So we register once,
+# lazily, from __init__.  IS-A semantics are byte-for-byte identical.
+_AUTOGEN_ABC_REGISTERED = False
+
+
+def _ensure_autogen_agent_registration() -> None:
+    """Idempotently register this class as a virtual subclass of
+    ``autogen.Agent``.  Safe no-op if autogen is missing or its Agent ABC
+    doesn't support ``register()``.  Called from __init__ (autogen is
+    guaranteed loaded by then)."""
+    global _AUTOGEN_ABC_REGISTERED
+    if _AUTOGEN_ABC_REGISTERED:
+        return
+    try:
+        import autogen
+        autogen.Agent.register(AgentLightningWrapper)
+        _AUTOGEN_ABC_REGISTERED = True
+    except (ImportError, AttributeError):
+        # autogen not installed or Agent doesn't support register().
+        # Mark done so we don't retry on every construction.
+        _AUTOGEN_ABC_REGISTERED = True
 
 
 def instrument_autogen_agent(

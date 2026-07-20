@@ -80,8 +80,18 @@ in
     {
       services.power-profiles-daemon.enable = true;
 
-      # TLP for advanced laptop battery optimization
-      services.tlp = lib.mkIf (cfg.variant == "desktop" || cfg.variant == "phone") {
+      # TLP for advanced laptop battery optimization.
+      # power-profiles-daemon (enabled above) and TLP are MUTUALLY EXCLUSIVE —
+      # nixpkgs hard-ASSERTS you cannot enable both, so the original unconditional
+      # co-enable made `hart.power.enable = true` FAIL EVAL on desktop/phone. That
+      # assertion failure is the real reason the whole module is dormant (never set
+      # in any configuration): turning it on bricked the build. The HART shell
+      # integrates with power-profiles-daemon (powerprofilesctl, /api/shell/power/set),
+      # so ppd wins and TLP must never co-enable. Gate TLP on ppd being OFF; since
+      # ppd is on here, TLP stays off (degrade-not-die: profiles still work via ppd,
+      # and the module is finally enableable instead of eval-bricking).
+      services.tlp = lib.mkIf ((cfg.variant == "desktop" || cfg.variant == "phone")
+                               && !config.services.power-profiles-daemon.enable) {
         enable = true;
         settings = {
           CPU_SCALING_GOVERNOR_ON_AC = if pwr.defaultProfile == "performance" || pwr.defaultProfile == "gaming"
@@ -125,8 +135,12 @@ in
             set -euo pipefail
             echo "[HART Power] Checkpointing agent state before suspend..."
 
-            # Signal backend to checkpoint
-            curl -sf -X POST "http://localhost:${toString cfg.ports.backend}/api/power/checkpoint" \
+            # Signal backend to checkpoint. The canonical route is
+            # /api/shell/power/checkpoint (register_shell_os_routes); the old
+            # /api/power/checkpoint here 404'd, so even an ENABLED module silently
+            # never checkpointed agent state (the curl's `|| echo` masked the 404
+            # as a benign skip). Path corrected so the hook reaches the real route.
+            ${pkgs.curl}/bin/curl -sf -X POST "http://localhost:${toString cfg.ports.backend}/api/shell/power/checkpoint" \
               -H "Content-Type: application/json" \
               -d '{"reason": "suspend"}' 2>/dev/null || \
               echo "[HART Power] Backend not reachable, skipping checkpoint"
@@ -154,8 +168,11 @@ in
             # Re-check network
             ${pkgs.systemd}/bin/networkctl reconfigure --no-pager 2>/dev/null || true
 
-            # Signal backend to reload state
-            curl -sf -X POST "http://localhost:${toString cfg.ports.backend}/api/power/resume" \
+            # Signal backend to reload state. Canonical route is
+            # /api/shell/power/resume (register_shell_os_routes); the old
+            # /api/power/resume 404'd, so the resume reconnect never reached the
+            # backend even when the module was enabled. Path corrected.
+            ${pkgs.curl}/bin/curl -sf -X POST "http://localhost:${toString cfg.ports.backend}/api/shell/power/resume" \
               -H "Content-Type: application/json" 2>/dev/null || \
               echo "[HART Power] Backend will reconnect on its own"
 

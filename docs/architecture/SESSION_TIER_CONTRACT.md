@@ -7,7 +7,7 @@
 > governs and VM-proves it via loop-kill fault injection.
 >
 > **Companions:** [`HART_OS_NATIVE_ARCHITECTURE.md`](HART_OS_NATIVE_ARCHITECTURE.md)
-> §6 (Never-Fail Tiering) and [`../../compositor/ROADMAP.md`](../../compositor/ROADMAP.md)
+> §6 (Never-Fail Tiering) and [`../../compositor/ROADMAP.md`](https://github.com/hertz-ai/HARTOS/blob/main/compositor/ROADMAP.md)
 > Phases 0–1. This contract is the load-bearing artifact that lets a half-finished
 > compositor **never** brick the box: the screen is never blank because the tier is
 > a latched, operator-clearable file, not a guess.

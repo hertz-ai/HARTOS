@@ -1,134 +1,103 @@
-# Downloads
+# Download
 
-All builds are automated, signed, and verified. Pick your platform.
-
-## What you're downloading
-
-There are two things, one name per role:
-
-- **Nunba** — the unified client. Same experience on Windows, macOS, Linux,
-  Android, web, watch, and inside HART OS itself. One identity, every device.
-- **HART OS** — the backend OS + agentic runtime.  The network backbone is a
-  Mixture-of-Experts (MoE) of open and closed models orchestrated by an
-  agentic hive mind that learns and infers simultaneously — not a static
-  inference endpoint.  Runs on your laptop (flat), your LAN (regional), or
-  in the cloud (central) and federates over PeerLink across deployments.
-
-You only need Nunba on each device you use; HART OS is the substrate Nunba
-talks to (locally bundled or remote).
-
-## Quick Install (Any Platform)
-
-Download the installer for your OS — it auto-detects your platform and installs the right thing.
-
-| Platform | Download | Size |
-|----------|----------|------|
-| **Windows** | [hevolve-install.exe](https://github.com/hertz-ai/HARTOS/releases/latest/download/hevolve-install.exe) | ~5 MB |
-| **macOS** | [hevolve-install-macos](https://github.com/hertz-ai/HARTOS/releases/latest/download/hevolve-install-macos) | ~5 MB |
-| **Linux** | [hevolve-install-linux](https://github.com/hertz-ai/HARTOS/releases/latest/download/hevolve-install-linux) | ~5 MB |
-
-Double-click (Windows) or `chmod +x && ./hevolve-install-*` (macOS/Linux). Choose: Nunba app, HART OS ISO, or pip install.
+Pick your device and grab it. Every build is automated, Ed25519-signed, and checksum-verified.
 
 ---
 
-## HART OS (Full Operating System)
+## Get the app — Nunba
 
-Boot from USB/SD card or run in a VM. Includes everything.
+The client you actually use. Same experience on every device, one identity. **Most people only need this.**
 
-### Rolling latest (rebuilt on every push to `main`)
+| Your device | Download |
+|----------|----------|
+| **Windows** | [**Nunba_Setup.exe**](https://github.com/hertz-ai/Nunba/releases/latest/download/Nunba_Setup.exe) |
+| **macOS** | [**Nunba_Setup.dmg**](https://github.com/hertz-ai/Nunba/releases/latest/download/Nunba_Setup.dmg) |
+| **Linux** | [**AppImage**](https://github.com/hertz-ai/Nunba/releases/latest/download/Nunba-x86_64.AppImage) · [.deb](https://github.com/hertz-ai/Nunba/releases/latest) |
+| **Android** | [**Google Play**](https://play.google.com/store/apps/details?id=com.hertzai.hevolve) |
+| **Web** | [**hevolve.ai**](https://hevolve.ai/) — no install |
+| **iOS** | [TestFlight / App Store](https://github.com/hertz-ai/nunba-ios) |
+
+!!! tip "Not sure which file? Use the universal installer"
+    It auto-detects your OS and installs the right thing:
+    [Windows](https://github.com/hertz-ai/HARTOS/releases/latest/download/hevolve-install.exe) ·
+    [macOS](https://github.com/hertz-ai/HARTOS/releases/latest/download/hevolve-install-macos) ·
+    [Linux](https://github.com/hertz-ai/HARTOS/releases/latest/download/hevolve-install-linux)
+
+---
+
+## Get the full OS — HART OS
+
+Boot from a USB stick, SD card, or VM. The complete agentic runtime + hive. Rebuilt on every push to `main`.
 
 | Variant | Best for | Download |
 |---------|----------|----------|
-| **Server** | Headless servers, Raspberry Pi, IoT hubs | [ISO](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-server-x86_64-linux.iso) · [torrent](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-server-x86_64-linux.iso.torrent) · [sha256](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-server-x86_64-linux.iso.sha256) |
-| **Desktop** | Workstations, dev machines (GNOME desktop) | [ISO](https://docs.hevolve.ai/binaries/hart-os-1.0.0-desktop-x86_64-linux.iso) · [torrent](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-desktop-x86_64-linux.iso.torrent) · [sha256](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-desktop-x86_64-linux.iso.sha256) · [parts on GitHub Releases](https://github.com/hertz-ai/HARTOS/releases/latest) (4 × 1.9 GiB + reassemble.sh, for users who can't reach docs.hevolve.ai) |
-| **Edge** | Minimal observer nodes, embedded | [ISO](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-edge-x86_64-linux.iso) · [torrent](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-edge-x86_64-linux.iso.torrent) · [sha256](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-edge-x86_64-linux.iso.sha256) |
+| **Desktop** | Workstations, dev machines | [**ISO**](https://docs.hevolve.ai/binaries/hart-os-1.0.0-desktop-x86_64-linux.iso) · [torrent](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-desktop-x86_64-linux.iso.torrent) · [sha256](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-desktop-x86_64-linux.iso.sha256) |
+| **Server** | Headless, Raspberry Pi, IoT hubs | [**ISO**](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-server-x86_64-linux.iso) · [torrent](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-server-x86_64-linux.iso.torrent) · [sha256](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-server-x86_64-linux.iso.sha256) |
+| **Edge** | Minimal observer / embedded nodes | [**ISO**](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-edge-x86_64-linux.iso) · [torrent](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-edge-x86_64-linux.iso.torrent) · [sha256](https://github.com/hertz-ai/HARTOS/releases/latest/download/hart-os-1.0.0-edge-x86_64-linux.iso.sha256) |
 
-Each push to `main` publishes a new `nightly-{SHA}` release tagged as "latest" — the links above always resolve to the newest build. Older nightlies are auto-pruned (most recent 3 kept). Verify with the companion `.sha256`. For signed stable ISOs browse the [release archive](https://github.com/hertz-ai/HARTOS/releases).
+!!! tip "Easiest way to flash"
+    `python scripts/hart_usb_flasher.py --gui` — fetches the ISO, writes it to the stick, and verifies the boot signature in one step.
 
-Torrents are web-seeded via GitHub CDN.
+---
 
-**Desktop ISO is larger than GitHub's 2 GB per-asset limit** and therefore ships split into `…iso.part-00`, `…iso.part-01`, … Download every `part-*` alongside the `.sha256` and a companion `…iso.reassemble.sh`, then run the script (or `cat *.part-* > …iso`) to stitch them and verify the checksum.
+??? question "Nunba vs HART OS — which do I need?"
+    - **Nunba** is the client you use — Windows, macOS, Linux, Android, web, and inside HART OS itself. One identity, every device. Most people only need this.
+    - **HART OS** is the backend OS + agentic runtime Nunba talks to: a Mixture-of-Experts hive mind that learns and infers at the same time. Runs on your laptop (flat), your LAN (regional), or the cloud (central), and federates over PeerLink.
 
-## Nunba — Unified Agentic Client (Desktop)
+    On HART OS itself, Nunba is pre-installed (systemd user service `hart-nunba`, port 5000, rendered in the LiquidUI Glass Shell). Everywhere else, Nunba bundles the runtime locally or points at a remote node via `NUNBA_BACKEND_URL`.
 
-Nunba is the unified HART client — Windows, macOS, Linux desktop builds
-here; Android + web + iOS sections below; on HART OS itself Nunba is
-pre-installed.  One client identity across every device, backed by the
-HART runtime (the MoE-of-models hive mind) running locally or remotely.
+??? note "Flash HART OS to a USB stick"
+    The desktop ISO is larger than GitHub's 2 GB per-asset limit, so it ships split into `…iso.part-00`, `…part-01`, … with a companion `…reassemble.sh`. The flasher handles all of that for you:
 
-| Target | Delivery | Notes |
-|--------|----------|-------|
-| **HART OS (native)** | Pre-installed | Systemd user service `hart-nunba` starts on boot (port 5000) and renders inside the LiquidUI Glass Shell. Enable via `hart.nunba.enable = true` in the desktop/phone configs (default). Registered in the HART AppRegistry (group: System) so launchers and the agentic runtime dispatch to it. |
-| **Windows** | [Nunba_Setup.exe](https://github.com/hertz-ai/Nunba/releases/latest/download/Nunba_Setup.exe) _(built by the [Nunba repo's `Build & Sign Installers`](https://github.com/hertz-ai/Nunba/actions) workflow)_ | Windows 10/11, x64. Azure Trusted Signing. |
-| **macOS** | [Nunba_Setup.dmg](https://github.com/hertz-ai/Nunba/releases/latest/download/Nunba_Setup.dmg) | macOS 13+ (Apple Silicon native). Notarized. |
-| **Linux (AppImage)** | [Nunba-x86_64.AppImage](https://github.com/hertz-ai/Nunba/releases/latest/download/Nunba-x86_64.AppImage) | Any distro, x86_64. `chmod +x` and run. |
-| **Linux (.deb)** | [.deb package (release page)](https://github.com/hertz-ai/Nunba/releases/latest) | Debian/Ubuntu. `sudo dpkg -i nunba_*.deb`. Filename is version-pinned (`nunba_<version>_amd64.deb`); browse the release page to grab the latest. |
+    ```bash
+    # 1. List removable disks to find your device id (e.g. #1)
+    python scripts/hart_usb_flasher.py --list
 
-On HART OS Nunba binds to the local `hart_intelligence_entry.py` runtime (port 6777). On other OSes it bundles the same runtime or points at a remote HART node via `NUNBA_BACKEND_URL`.
+    # 2. Flash the latest desktop ISO to disk #1  (DESTRUCTIVE — wipes the stick)
+    python scripts/hart_usb_flasher.py --tag <nightly-tag> --device 1 --mode download --yes
+    ```
 
-## Nunba (Android)
+    - `--tag` is the release tag (the newest is marked **Latest** on the [releases page](https://github.com/hertz-ai/HARTOS/releases)).
+    - Prefer a picker? `--gui`. Tight on scratch disk? `--mode stream`. Only removable disks are offered; a system disk needs `--allow-system --yes`.
+    - **Windows:** if you hit `exclusive open failed (err 32)`, eject/re-insert the stick so Windows releases the lock, then re-run.
 
-Same Nunba client, on your phone — your phone becomes a remote to your
-private AI mesh.
+    Can't reach `docs.hevolve.ai` for the desktop ISO? Grab the split `part-*` files + `.sha256` + `reassemble.sh` from [GitHub Releases](https://github.com/hertz-ai/HARTOS/releases) and run `bash …reassemble.sh` (or `cat *.part-* > …iso`), then verify the checksum.
 
-| Platform | Download |
-|----------|----------|
-| **Android (Play Store)** | [Google Play](https://play.google.com/store/apps/details?id=com.hertzai.hevolve) |
-| **Android (APK, team only)** | [Direct APK](https://github.com/hertz-ai/Hevolve_React_Native/releases/latest/download/Hevolve.apk) — _`hertz-ai/Hevolve_React_Native` is a private repo; the asset link requires a GitHub session. Public users should install via Play Store above._ |
+??? note "Backend only — pip or Docker"
+    ```bash
+    # pip
+    pip install -r requirements.txt
+    python hart_intelligence_entry.py
 
-> The underlying Play Store package ID (`com.hertzai.hevolve`), the GitHub
-> repo (`Hevolve_React_Native`), and the APK filename (`Hevolve.apk`) still
-> reflect the project's prior internal name.  User-facing branding is
-> "Nunba" everywhere; the asset-rename across Play Store metadata + repo +
-> CI artifacts is a coordinated rollout that lands separately so existing
-> install URLs don't break for current users.
+    # Docker
+    docker compose -f deploy/cloud/docker-compose.yml up
+    ```
 
-## Nunba (Web)
+??? note "Verify a download"
+    Every release is Ed25519-signed by the master key.
 
-Same Nunba client, in the browser — no install needed.
+    ```bash
+    # Check SHA-256
+    sha256sum -c hart-os-*.sha256
 
-| Platform | Link |
-|----------|------|
-| **Web App** | [hevolve.ai](https://hevolve.ai/) |
+    # Verify the release signature
+    python -c "
+    from security.master_key import verify_release_manifest
+    import json
+    m = json.load(open('release_manifest.json'))
+    print('VALID' if verify_release_manifest(m) else 'INVALID')
+    "
+    ```
 
-> The web client is hosted at `hevolve.ai` for legacy SEO continuity; the
-> in-app branding is "Nunba".
+---
 
-## pip install (Backend only)
-
-```bash
-pip install -r requirements.txt
-python hart_intelligence_entry.py
-```
-
-## Docker
-
-```bash
-docker compose -f deploy/cloud/docker-compose.yml up
-```
-
-## Verify Downloads
-
-Every release is Ed25519 signed by the master key.
-
-```bash
-# Check SHA-256
-sha256sum -c hart-os-*.sha256
-
-# Verify release signature
-python -c "
-from security.master_key import verify_release_manifest
-import json
-m = json.load(open('release_manifest.json'))
-print('VALID' if verify_release_manifest(m) else 'INVALID')
-"
-```
-
-## All Releases
+## All releases
 
 | Project | Releases |
 |---------|----------|
-| **HART OS** (backend) | [GitHub Releases](https://github.com/hertz-ai/HARTOS/releases) |
-| **Nunba** (desktop / web client) | [GitHub Releases](https://github.com/hertz-ai/Nunba/releases) |
-| **Nunba (Android)** | [GitHub Releases](https://github.com/hertz-ai/Hevolve_React_Native/releases) — repo name still reflects the prior internal name |
-| **Nunba (iOS)** | TestFlight / App Store ([source](https://github.com/hertz-ai/nunba-ios)) |
+| **HART OS** (backend / ISOs) | [GitHub Releases](https://github.com/hertz-ai/HARTOS/releases) |
+| **Nunba** (desktop / web) | [GitHub Releases](https://github.com/hertz-ai/Nunba/releases) |
+| **Nunba** (Android) | [GitHub Releases](https://github.com/hertz-ai/Hevolve_React_Native/releases) |
+| **Nunba** (iOS) | [TestFlight / App Store](https://github.com/hertz-ai/nunba-ios) |
+
+Each push to `main` publishes a `nightly-{SHA}` release tagged **latest** (the links above always resolve to the newest build; the most recent 3 nightlies are kept). For signed stable builds, browse the [release archive](https://github.com/hertz-ai/HARTOS/releases).

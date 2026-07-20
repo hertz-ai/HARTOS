@@ -47,6 +47,28 @@ async def on_event(msg):
         pass
 
 
+async def on_fleet_command(msg):
+    """Handle an inbound CENTRAL fleet command (incl. OTA firmware_update push).
+
+    Central fans an approved build out as a signed firmware_update FleetCommand
+    on com.hertzai.hevolve.fleet.{node_id} (or the .user.{user_id} fan-out).
+    Route it to the MessageBus, which maps the legacy fleet topic back to the
+    'fleet.command' bus topic so the in-process subscribers (the OTA push
+    receiver wired in local_subscribers.bootstrap_local_subscribers, and any
+    other fleet consumer) receive it.  Signature verification happens in those
+    handlers (FleetCommandService.verify_command_signature) — this leg is pure
+    transport, no new trust decision, no new socket.
+    """
+    try:
+        from core.peer_link.message_bus import get_message_bus
+        bus = get_message_bus()
+        data = msg if isinstance(msg, dict) else {'raw': str(msg)}
+        # Prefix that resolve_legacy_topic maps to the 'fleet.command' bus topic.
+        bus.receive_from_crossbar('com.hertzai.hevolve.fleet', data)
+    except Exception as e:
+        print(f"Fleet command route error: {e}")
+
+
 async def call_rpc(message_json):
     """Calls the registered RPC function asynchronously using Autobahn Asyncio."""
     global wamp_session
@@ -217,6 +239,24 @@ async def joined(session, details):
         print(f"Subscribed to remote desktop signaling: {signal_topic}")
     except Exception as e:
         print(f"Remote desktop signaling subscription skipped: {e}")
+
+    # Fleet command topics (incl. the CENTRAL OTA firmware_update push).
+    # Prefix match catches both com.hertzai.hevolve.fleet.{node_id} (per-device)
+    # and com.hertzai.hevolve.fleet.user.{user_id} (fan-out) in one subscription
+    # — the same prefix-subscribe shape used for multichat above.  Inbound fleet
+    # commands route to the MessageBus, where the in-process OTA push receiver
+    # (and other fleet consumers) pick them up and verify the signature.  This
+    # is what makes a CENTRAL push reach the node's apply path over the EXISTING
+    # WAMP fabric — no new transport.
+    try:
+        await session.subscribe(
+            on_fleet_command,
+            "com.hertzai.hevolve.fleet",
+            options=SubscribeOptions(match='prefix'),
+        )
+        print("Subscribed to fleet prefix com.hertzai.hevolve.fleet")
+    except Exception as e:
+        print(f"Fleet command subscription skipped: {e}")
 
 
 def main():

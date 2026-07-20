@@ -1,12 +1,12 @@
 """
 HART OS Theme API — OS-wide appearance management.
 
-GET  /api/social/theme/presets        — List all theme presets
-GET  /api/social/theme/active         — Get active theme (with CSS variables)
-POST /api/social/theme/apply          — Apply a preset OS-wide
-POST /api/social/theme/customize      — Agent-driven partial customization
-GET  /api/social/theme/fonts          — Available font families
-GET  /api/social/theme/css            — Active theme as CSS custom properties
+GET  /api/appearance/presets        — List all theme presets
+GET  /api/appearance/active         — Get active theme (with CSS variables)
+POST /api/appearance/apply          — Apply a preset OS-wide
+POST /api/appearance/customize      — Agent-driven partial customization
+GET  /api/appearance/fonts          — Available font families
+GET  /api/appearance/css            — Active theme as CSS custom properties
 """
 
 import logging
@@ -22,13 +22,13 @@ def _get_service():
     return ThemeService
 
 
-@theme_bp.route('/api/social/theme/presets', methods=['GET'])
+@theme_bp.route('/api/appearance/presets', methods=['GET'])
 def list_presets():
     svc = _get_service()
     return jsonify({'presets': svc.list_presets()})
 
 
-@theme_bp.route('/api/social/theme/active', methods=['GET'])
+@theme_bp.route('/api/appearance/active', methods=['GET'])
 def get_active():
     svc = _get_service()
     theme = svc.get_active_theme()
@@ -36,21 +36,29 @@ def get_active():
     return jsonify({'theme': theme, 'css': css})
 
 
-@theme_bp.route('/api/social/theme/apply', methods=['POST'])
+@theme_bp.route('/api/appearance/apply', methods=['POST'])
 def apply_theme():
+    """Apply a preset OS-wide, and/or overlay a Personalize palette (#161).
+
+    Body: {theme_id?, secondary_accent?, custom?:{accent,secondary,background}}.
+    The palette picker posts just secondary_accent + custom (no preset switch);
+    this route EXTENDS the same endpoint to carry them (no fork).
+    """
     data = request.get_json(force=True, silent=True) or {}
     theme_id = data.get('theme_id', '')
-    if not theme_id:
-        return jsonify({'error': 'theme_id required'}), 400
+    secondary_accent = data.get('secondary_accent')
+    custom = data.get('custom')
+    if not theme_id and not (secondary_accent or custom):
+        return jsonify({'error': 'theme_id or palette (secondary_accent/custom) required'}), 400
 
     svc = _get_service()
-    result = svc.apply_theme(theme_id)
+    result = svc.apply_theme(theme_id, secondary_accent=secondary_accent, custom=custom)
     if 'error' in result:
         return jsonify(result), 404
     return jsonify(result)
 
 
-@theme_bp.route('/api/social/theme/customize', methods=['POST'])
+@theme_bp.route('/api/appearance/customize', methods=['POST'])
 def customize_theme():
     """Agent-driven partial customization.
 
@@ -70,13 +78,13 @@ def customize_theme():
     return jsonify(result)
 
 
-@theme_bp.route('/api/social/theme/fonts', methods=['GET'])
+@theme_bp.route('/api/appearance/fonts', methods=['GET'])
 def list_fonts():
     svc = _get_service()
     return jsonify({'fonts': svc.get_font_options()})
 
 
-@theme_bp.route('/api/social/theme/css', methods=['GET'])
+@theme_bp.route('/api/appearance/css', methods=['GET'])
 def get_css():
     svc = _get_service()
     css = svc.get_css_variables()

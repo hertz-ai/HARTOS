@@ -14,7 +14,16 @@ from core.constants import (  # noqa: E402  (after io_guard, intentional)
 )
 
 import ast
-import autogen
+# autogen is imported lazily (core.optional_import.lazy_module): it drags
+# google.api_core (~7.6s) + flaml + the contrib capabilities chain ->
+# llmlingua -> torch (~4.2s) at import time, but every autogen.* use in
+# this module is INSIDE a function (AST-verified: zero module-level /
+# class-base uses).  The proxy keeps all ``autogen.X`` call sites
+# byte-for-byte unchanged and pays the cost only when the first agent is
+# actually constructed — saving ~11-24s off `import create_recipe` and
+# therefore off the backend boot.  See tests/unit/test_lazy_autogen_import.py.
+from core.optional_import import lazy_module
+autogen = lazy_module("autogen")
 
 # Qwen3.5's Jinja chat template rejects system messages mid-conversation:
 #   "System message must be at the beginning"
@@ -39,10 +48,8 @@ import asyncio
 import traceback
 from datetime import datetime
 import time
-from autogen.coding import DockerCommandLineCodeExecutor
 import re
 import json
-from autogen import ConversableAgent
 from flask import current_app
 try:
     from helper import topological_sort, fix_json, retrieve_json, fix_actions, Action, ToolMessageHandler, strip_json_values, apply_autogen_fix_on_startup, load_vlm_agent_files, PROMPTS_DIR, _is_terminate_msg
@@ -53,8 +60,15 @@ os.makedirs(PROMPTS_DIR, exist_ok=True)
 import helper as helper_fun
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from autogen.agentchat.contrib.capabilities import transform_messages, transforms
-from autogen.cache.in_memory_cache import InMemoryCache
+# transform_messages / transforms are autogen.agentchat.contrib.capabilities
+# submodules — importing them eagerly pulls the SAME heavy chain as autogen
+# (llmlingua -> torch via text_compressors).  They are used only inside the
+# agent-building functions, so proxy them lazily too (same rationale + test
+# as the `autogen` proxy above).
+transform_messages = lazy_module(
+    "autogen.agentchat.contrib.capabilities.transform_messages")
+transforms = lazy_module(
+    "autogen.agentchat.contrib.capabilities.transforms")
 from json_repair import repair_json
 
 # ─── State-transition stuck-loop detector (#485) ────────────────────
@@ -284,23 +298,21 @@ from core.platform_paths import get_coding_workspace_dir
 # Then manually add the 4 hooks to your get_response_group while loop
 # Set up a dedicated logger that doesn't depend on Flask context
 # Use writable log dir: ~/Documents/Nunba/logs in bundled mode, else relative 'logs'
-if os.environ.get('NUNBA_BUNDLED') or getattr(sys, 'frozen', False):
-    try:
-        from core.platform_paths import get_log_dir as _get_log_dir
-        log_dir = _get_log_dir()
-    except ImportError:
-        log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
-else:
-    log_dir = "logs"
+# Use the canonical WRITABLE data dir; NEVER a CWD-relative 'logs' — on the
+# embedded OS the CWD is the read-only /nix/store package, so makedirs('logs')
+# crashes boot with OSError [Errno 30] Read-only file system (EROFS, which the
+# old `except PermissionError` (EACCES) did NOT catch). Catch all OSError.
 try:
+    from core.platform_paths import get_data_dir
+    log_dir = os.path.join(get_data_dir(), 'logs')
     os.makedirs(log_dir, exist_ok=True)
-except PermissionError:
+except Exception:
     try:
-        from core.platform_paths import get_log_dir as _get_log_dir
-        log_dir = _get_log_dir()
-    except ImportError:
         log_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Nunba', 'logs')
-    os.makedirs(log_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
+    except Exception:
+        import tempfile
+        log_dir = tempfile.gettempdir()  # last resort: a log path must never brick boot
 
 # Single log file with rotation (no more timestamped files that accumulate forever)
 log_file = os.path.join(log_dir, "agent_system.log")
@@ -1826,10 +1838,14 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
     # gather LLM has no real tool to map "fetch a webpage" onto and invents
     # fake tool names (2026-05-12 IPL refusal forensic).
     try:
-        from integrations.service_tools import service_tool_registry, Crawl4AITool, AceStepTool
+        from integrations.service_tools import (
+            service_tool_registry, Crawl4AITool, AceStepTool,
+            SeoAuditTool, GhPrTool)
 
         Crawl4AITool.register()   # port 11235
         AceStepTool.register()    # port 8001
+        SeoAuditTool.register()   # native in-process (no port)
+        GhPrTool.register()       # native in-process (no port)
         service_tool_registry.load_config()  # load any user-added tools from service_tools.json
 
         svc_tools = service_tool_registry.get_all_tool_functions()
@@ -2581,9 +2597,9 @@ def create_agents(user_id: str,task,prompt_id) -> Tuple[Any, Any, Any, Any, Any,
                                                and len(_recipe_list) > 0
                                                and not _recipe_is_placebo(json_obj))
                                 if not _has_recipe:
-                                    if current_state == ActionState.TERMINATED:
-                                        # Action already TERMINATED — don't retry recipe, let while loop advance
-                                        current_app.logger.warning(f'Late save: recipe empty but action already TERMINATED — not retrying')
+                                    if current_state in (ActionState.TERMINATED, ActionState.GAVE_UP):
+                                        # Action already terminal — don't retry recipe, let while loop advance
+                                        current_app.logger.warning(f'Late save: recipe empty but action already terminal ({current_state.value}) — not retrying')
                                         return None  # End conversation turn, while loop will detect and advance
                                     current_app.logger.warning(f'Late save: recipe empty or missing — rejecting, will retry. Got: {_recipe_list}')
                                     return chat_instructor  # Route back to request recipe again
@@ -3162,6 +3178,7 @@ def instantiate_assistant_agent(list_of_persona, user_prompt, personality=None, 
                 - Perform the action with the help of @Helper and @Executor agents.
                 - Account for all the tools available with helper & whenever you are supposed to call a tool as part of current action ask @Helper.
                 - If the action requires calculation, code execution or API endpoint call, CREATE code(python preferred) and ask @Executor agent to execute the created code.
+                - RESPONSIBILITY ROUTING (CRITICAL — autonomous mode; boundaries are role responsibilities): No absent worker/scout/persona-agent will hand you inputs — the only agents here are you, @Helper, @Executor, @StatusVerifier, and you are already augmented with matched Expert Guidance (injected above). When an action assigns work that belongs to a DISTINCT role (e.g. "receive the list of supply gaps from the Demand Scout"), do NOT stall waiting for that role to appear and do NOT fake it with a "simulated" answer. Route it, in order: (1) DELEGATE — if the matched Expert Guidance or an existing @Helper tool already covers that responsibility, perform it yourself USING that guidance/tool (you are acting as the specialist for that step); (2) CREATE — otherwise request a breakdown via @StatusVerifier so the responsibility becomes its own role-bounded subtask, then execute it for real by gathering the inputs via @Helper (google_search, get_data_by_key, code via @Executor) — that executed subtask becomes the new specialist capability the hive learns and banks for reuse; (3) DO IT YOURSELF — only when the responsibility is already atomic enough that no separate specialist is warranted. Keep distinct roles as distinct subtasks — never collapse them into one fabricated guess, and never block on a role that is not present (that is the single most common cause of a stalled autonomous goal).
             4. After Completion:
                 - If action completed successful & there is no error, ask @Helper to save the information(which will be required in future) in memory using 'save_data_in_memory' tool.
                 - After save_data_in_memory has completed, ask the StatusVerifier to confirm completion and include the persona name.
@@ -4513,7 +4530,7 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                     if _ca_task:
                         from agent_ledger import TaskStatus as _TS
                         _ca_ledger_done = _ca_task.status in (_TS.COMPLETED, _TS.TERMINATED)
-                if _ca_state in (ActionState.COMPLETED, ActionState.TERMINATED) or _ca_ledger_done:
+                if _ca_state in (ActionState.COMPLETED, ActionState.TERMINATED, ActionState.GAVE_UP) or _ca_ledger_done:
                     # Check if recipe file exists before advancing
                     _flow = get_current_flow(user_prompt)
                     _recipe_path = helper_fun.safe_prompt_path(prompt_id, _flow, _ca)
@@ -4582,9 +4599,17 @@ def get_response_group(user_id,text,prompt_id,Failure=False,error=None):
                             current_app.logger.info(f'[FLOW-COMPLETE] All {_ca} actions done in flow, ensuring termination')
                             for _aid in range(1, _ca + 1):
                                 _astate = get_action_state(user_prompt, _aid)
-                                if _astate not in (ActionState.TERMINATED,):
-                                    current_app.logger.info(f'[FLOW-COMPLETE] Forcing action {_aid} from {_astate.value} to TERMINATED')
-                                    force_state_through_valid_path(user_prompt, _aid, ActionState.TERMINATED, "flow complete")
+                                if _astate in (ActionState.TERMINATED, ActionState.GAVE_UP):
+                                    continue  # already terminal
+                                # #139: a VERIFIED action (COMPLETED/RECIPE_RECEIVED) becomes
+                                # TERMINATED (ledger COMPLETED); a stalled/unverified action
+                                # force-abandoned at flow-complete is an HONEST give-up ->
+                                # GAVE_UP (ledger FAILED), re-openable so the daemon can retry
+                                # it via a hive peer. This is the fix for the fake-success bug.
+                                _verified = _astate in (ActionState.COMPLETED, ActionState.RECIPE_RECEIVED)
+                                _target = ActionState.TERMINATED if _verified else ActionState.GAVE_UP
+                                current_app.logger.info(f'[FLOW-COMPLETE] Forcing action {_aid} from {_astate.value} to {_target.value}')
+                                force_state_through_valid_path(user_prompt, _aid, _target, "flow complete")
 
                             # All actions terminated — create flow recipe and advance
                             current_app.logger.info(f'[FLOW-COMPLETE] All actions terminated, creating flow recipe')
@@ -4826,9 +4851,9 @@ def all_flows_completed(prompt_id, total_personas, user_prompt):
         if not os.path.exists(flow_recipe_file):
             return False
 
-        # Check all actions in flow are TERMINATED
+        # Check all actions in flow are terminal (TERMINATED, or a give-up GAVE_UP)
         for action_id in range(1, len(flow['actions']) + 1):
-            if get_action_state(user_prompt, action_id) != ActionState.TERMINATED:
+            if get_action_state(user_prompt, action_id) not in (ActionState.TERMINATED, ActionState.GAVE_UP):
                 return False
 
     return True
@@ -4981,9 +5006,9 @@ def publish_to_crossbar_new_action_start(message, user_id):
 # Use lifecycle-aware increment:
 def safe_increment_action(user_prompt):
     current_action_id = user_tasks[user_prompt].current_action
-    # Ensure current action is TERMINATED before moving to next
-    if get_action_state(user_prompt, current_action_id) != ActionState.TERMINATED:
-        raise StateTransitionError(f"Action {current_action_id} must be TERMINATED before incrementing")
+    # Ensure current action is terminal (TERMINATED or a give-up GAVE_UP) before moving to next
+    if get_action_state(user_prompt, current_action_id) not in (ActionState.TERMINATED, ActionState.GAVE_UP):
+        raise StateTransitionError(f"Action {current_action_id} must be terminal before incrementing")
 
     user_tasks[user_prompt].current_action += 1
     safe_set_state(user_prompt, user_tasks[user_prompt].current_action, ActionState.ASSIGNED, "action incremented")
@@ -5148,10 +5173,25 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         start = 0
         for i, m in enumerate(msgs):
             c = m.get('content') if isinstance(m, dict) else None
-            if isinstance(c, str) and f'Execute Action {action_id}' in c:
+            # Trailing ':' delimiter is required — dispatch markers are
+            # 'Execute Action N: ...', so without the colon 'Execute Action 2'
+            # also matches 'Execute Action 20:'..'29:' and banks the wrong
+            # action's tool calls for flows with >=10 actions (CREATE routinely
+            # decomposes into 11-23).
+            if isinstance(c, str) and f'Execute Action {action_id}:' in c:
                 start = i
+        # Window ENDS at the next action's dispatch so a later action's tool
+        # calls don't bleed into this one (the trace can hold later dispatches
+        # when banking runs at/after a flow boundary). start is THIS action's
+        # last dispatch, so the next 'Execute Action ' marker is a different one.
+        end = len(msgs)
+        for j in range(start + 1, len(msgs)):
+            cj = msgs[j].get('content') if isinstance(msgs[j], dict) else None
+            if isinstance(cj, str) and 'Execute Action ' in cj:
+                end = j
+                break
         steps = []
-        for m in msgs[start:]:
+        for m in msgs[start:end]:
             if not isinstance(m, dict):
                 continue
             for tc in (m.get('tool_calls') or []):
@@ -5213,6 +5253,32 @@ def _bank_action_recipe_from_trace(user_prompt, prompt_id, flow, action_id,
         return False
 
 
+def _announce_flow_recipe(prompt_id, flow):
+    """Announce a freshly banked flow recipe to the hive capability mesh.
+
+    PROACTIVE half of the recipe capability mesh: gossip-broadcast a
+    'recipe_available' advert so admitted peers can pull the bytes
+    directly (skipping the O(peers) discovery sweep) instead of only
+    finding it reactively per-goal. GATED by peer_reuse.export_allowed so
+    a PRIVATE recipe is NEVER advertised. Fully best-effort: a broadcast
+    failure must NEVER fail the bank (wrap, log, continue). Returns True
+    only when an advert was actually broadcast.
+    """
+    try:
+        from integrations.google_a2a.peer_reuse import (
+            export_allowed, announce_recipe_available)
+        if not export_allowed(prompt_id):
+            return False
+        return bool(announce_recipe_available(prompt_id, flow))
+    except Exception as e:
+        try:
+            current_app.logger.info(
+                f'recipe advert skipped for {prompt_id}_{flow}: {e}')
+        except Exception:
+            pass
+        return False
+
+
 def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
     """Save the aggregated flow recipe to disk.
 
@@ -5251,6 +5317,11 @@ def _save_flow_recipe(flow, prompt_id, user_prompt, user_id, group_chat):
             prompt_id, len(_flow_recipe_data.get('actions') or []) or 1)
     except Exception as _spark_err:
         current_app.logger.debug(f'completed-work spark charge skipped: {_spark_err}')
+    # PROACTIVE capability mesh: recipe is durably banked above, so
+    # gossip-announce it to admitted peers (gated by export_allowed,
+    # best-effort, never fails the bank). Reactive per-goal pull stays
+    # the floor.
+    _announce_flow_recipe(prompt_id, flow)
 
 
 def set_individual_recipes(flow, individual_recipe, prompt_id, user_prompt):
@@ -5675,8 +5746,8 @@ def safe_increment_flow(user_prompt, prompt_id):
     current_flow_actions = config['flows'][current_flow]['actions']
 
     for action_id in range(1, len(current_flow_actions) + 1):
-        if get_action_state(user_prompt, action_id) != ActionState.TERMINATED:
-            raise StateTransitionError(f"Cannot increment flow: Action {action_id} not terminated")
+        if get_action_state(user_prompt, action_id) not in (ActionState.TERMINATED, ActionState.GAVE_UP):
+            raise StateTransitionError(f"Cannot increment flow: Action {action_id} not terminal")
 
     increment_current_flow(user_prompt, prompt_id)
 

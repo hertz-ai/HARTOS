@@ -1,13 +1,18 @@
 # ═══════════════════════════════════════════════════════════════
-# HART-comp — the HART OS AI-native Wayland compositor (SKELETON)
+# HART-comp — the HART OS AI-native Wayland compositor (REAL — DRM/PIXMAN)
 # ═══════════════════════════════════════════════════════════════
 #
-# STATUS: COMPILE-PENDING SKELETON. This crate is a Phase-3 tinywl-class
-# scaffold. It is authored on a Windows dev box where NO Wayland/KMS/Smithay
-# build can run, so it is NOT yet compiled. Every paint / DRM scanout / libinput
-# / layer-shell mount claim is VM-pending (CI nixosTest on an llvmpipe software-GL
-# VM, or local QEMU-KVM). See ../docs/architecture/HART_OS_NATIVE_ARCHITECTURE.md
-# §L1 and ./ROADMAP.md Phase 3.
+# STATUS: REAL Smithay compositor — BUILDS IN NIX/CI (M9 green) + VM-PROVEN. The
+# smithay DRM/pixman path (src/wayland.rs + src/udev.rs, `--features smithay`) is a
+# real compositor that COMPILES under `nix build .#…hart.comp.package` and whose
+# pixman KMS scanout is VM-PROVEN (a real virgl-QEMU scanout PNG exists). The PURE
+# LOGIC (src/main.rs + its #[cfg(test)]) also compiles + unit-tests on the Windows
+# dev box with NO feature on — that feature-OFF fallback's Smithay handler shims are
+# the only todo!()/unwired bodies, kept so the dev box (no Wayland/KMS) stays green.
+# Real-HARDWARE paint on the target GPU is STILL BEING VERIFIED (the flash's job; the
+# dev box has no DRM device — VM scanout already proven). See
+# ../docs/architecture/HART_OS_NATIVE_ARCHITECTURE.md §L1 + §5.4 and ./ROADMAP.md
+# Phase 3 + Phase 5.
 #
 # Ordering invariant (ROADMAP §"Ordering principle"): Smithay HART-comp is a
 # LATER moat upgrade behind a sway-as-Tier-1 fast path. sway already ships
@@ -25,7 +30,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
-description = "HART OS AI-native Wayland compositor (Smithay) — Phase-3 skeleton, compile-pending"
+description = "HART OS AI-native Wayland compositor (Smithay) — real DRM/pixman, builds in Nix/CI, VM-scanout-proven"
 # rust-version pinned conservatively to what the June-2025 nixpkgs pin (50ab793)
 # ships, so the buildRustPackage in hart-comp.nix resolves on the SAME toolchain
 # the hart-rust-precedent.nix module proves first.
@@ -35,27 +40,123 @@ rust-version = "1.77"
 name = "hart-comp"
 path = "src/main.rs"
 
+# ── Features ──
+# `smithay` gates the REAL Wayland handler bodies (src/wayland.rs: the xdg-shell /
+# XWayland / xdg-decoration / wlr-foreign-toplevel-management trait impls + the
+# XWayland lifecycle + the live `State` summon orchestration). It is OFF by default
+# so the Windows dev box compiles + unit-tests ONLY the pure-logic floor
+# (src/main.rs + its #[cfg(test)] block). CI's Phase-5 bring-up enables it
+# (`cargo build --features smithay`, wired via hart-comp.nix `buildFeatures`) AT THE
+# SAME TIME it uncomments the git-Smithay dependency below — both flips are the one
+# CI step. Declared here so `#[cfg(feature = "smithay")]` is a KNOWN cfg (no
+# unexpected_cfgs warning) on the always-compiled build.
+#
+# When the dep is uncommented at CI bring-up, add `"dep:smithay"` (+ calloop) here:
+#   smithay = ["dep:smithay", "dep:calloop"]
+[features]
+default = []
+# `smithay` = the REAL-HARDWARE DRM/udev backend (src/wayland.rs handler bodies).
+# The DRM/gbm/udev/libseat/pixman/xwayland set lives HERE (as `smithay/<feat>`
+# passthroughs) rather than hardcoded on the base [dependencies.smithay] block, so
+# it is symmetric with the `winit` feature and a winit-only build never compiles it.
+smithay = [
+    "dep:smithay",
+    "dep:calloop",
+    # M8 — the com.hart.Compositor IPC server (src/ipc.rs) is now SHARED by both
+    # backends (re-gated to `any(winit, smithay)`), so the DRM build needs its
+    # framed-JSON deps too. Same two crates the winit feature pulls — symmetric.
+    "dep:serde",
+    "dep:serde_json",
+    "smithay/backend_drm",
+    "smithay/backend_gbm",
+    "smithay/backend_libinput",
+    "smithay/backend_udev",
+    "smithay/backend_session_libseat",
+    "smithay/renderer_pixman",
+    # PART 3 of the GPU lever — the GLES2 GPU renderer for the DRM/udev backend
+    # (src/udev.rs). `renderer_gl` compiles the `GlesRenderer`; `backend_egl` compiles
+    # the `EGLDisplay`/`EGLContext` it is built on (an EGL platform display from the GBM
+    # device of the primary render node). These are the SAME two Smithay features the
+    # `winit` backend already enables (lines below) — symmetric, so the smithay (DRM)
+    # build links the identical GL/EGL stack the winit build proved. The PixmanRenderer
+    # software floor stays the renderer of record; GLES is the opportunistic upgrade used
+    # only when `/run/hart/gpu-render` = hardware AND it initialises, with pixman the
+    # fallback on ANY GLES init/runtime fault (degrade-not-die — never a black screen).
+    "smithay/renderer_gl",
+    "smithay/backend_egl",
+    "smithay/xwayland",
+]
+# `winit` = the DEV/WSL backend (src/winit.rs): a real, running compositor that
+# NESTS in an existing Wayland host (WSLg's wayland-0) as a winit/wayland-client
+# window, creates its OWN wayland-N socket, and paints client surfaces with the
+# GlesRenderer. No DRM/KMS — testable on any box with a Wayland host + EGL. It
+# enables the Smithay winit + GLES features via passthrough (`smithay/<feat>`) so
+# the base optional dep keeps default-features=false; the renderer differs from
+# the DRM path (GlesRenderer here vs PixmanRenderer in wayland.rs) because
+# winit::init::<GlesRenderer>() requires renderer_gl + backend_egl (pixman is not
+# a winit renderer). Mirrors Smithay's own `backend_winit = ["backend_egl",
+# "renderer_gl", ...]` wiring at the pinned rev.
+winit = [
+    "dep:smithay",
+    "dep:calloop",
+    # M4 — the com.hart.Compositor IPC server (src/ipc.rs) speaks framed JSON over a
+    # Unix socket. `serde` is already in the tree (smithay pulls it); `serde_json` is
+    # the only direct add. Both keyed to the feature that compiles ipc.rs so the
+    # default dev-box build never resolves them.
+    "dep:serde",
+    "dep:serde_json",
+    "smithay/backend_winit",
+    "smithay/renderer_gl",
+    "smithay/backend_egl",
+    # M3 — XWayland (Wine / legacy X11) on the winit path. `xwayland` transitively
+    # enables `x11rb_event_source` (the calloop X11 source the XWayland event loop
+    # needs), so no separate passthrough is required. This pulls smithay's xwayland
+    # module + the `Window::new_x11_window`/`x11_surface` accessors into the build.
+    "smithay/xwayland",
+]
+
 [dependencies]
-# Phase-3 skeleton is PURE LOGIC (render-path decision + boot-config + the
-# never-fail-floor invariant). main.rs does NOT yet link Smithay/calloop — the
-# `use smithay::...` block there is a COMMENTED manifest of the shape the real
-# compositor needs. Declaring those deps before the code uses them only breaks
-# the build, because:
+# The DEFAULT (no-feature) build is PURE LOGIC: the Phase-3 render-path/boot-config
+# never-fail-floor decision AND the Phase-5 window bookkeeping (handle minting + the
+# manifest↔toplevel map + the no-phantom-window SummonApp state machine — all
+# Wayland-FREE, see the PHASE 5 block + #[cfg(test)] in main.rs). On THAT build main.rs
+# does NOT link Smithay/calloop — the `use smithay::...` block there is a COMMENTED
+# manifest of the shape the real compositor needs, and the feature-OFF Smithay HANDLER
+# shims (xdg-shell/XWayland/decoration/foreign-toplevel map, each marked `// ⚠️ CI-
+# COMPILE`) are todo!()/unwired. The REAL bodies are in src/wayland.rs + src/udev.rs and
+# compile under `--features smithay` (which DOES link git Smithay — see the optional dep
+# below; that build is M9-green in Nix/CI + VM-scanout-proven). Declaring the git dep
+# UNCONDITIONALLY (not feature-gated) would force every dev-box `cargo check` to resolve
+# it, because:
 #   * Smithay is NOT published to crates.io with the modern API — crates.io
 #     `smithay 0.3.0` (2022) lacks the `desktop` AND `renderer_pixman` features
 #     this compositor needs (VERIFIED live: `cargo build` fails to select 0.3.0
-#     with feature `desktop`). The real dep is GIT Smithay pinned to a rev:
+#     with feature `desktop`). The real dep is GIT Smithay pinned to a rev, declared
+#     as an OPTIONAL dep keyed to the `smithay` cargo feature above (so the default
+#     dev-box build never tries to resolve git Smithay; only `--features smithay` in
+#     CI does). Uncomment BOTH together at the Phase-5 CI bring-up step:
 #       smithay = { git = "https://github.com/Smithay/smithay", rev = "<pinned>",
+#         optional = true,
 #         default-features = false, features = [
 #           "backend_drm", "backend_gbm", "backend_libinput", "backend_udev",
 #           "backend_session_libseat", "renderer_pixman", "wayland_frontend",
-#           "desktop" ] }
-#       calloop = "0.13"
+#           "desktop",
+#           # Phase 5 native toplevels — Wine/X11 via XWayland. xdg-shell,
+#           # xdg-decoration, wlr-layer-shell, and wlr-foreign-toplevel-management
+#           # are part of "wayland_frontend"/"desktop"; XWayland is its own feature.
+#           "xwayland" ] }
+#       calloop = { version = "0.13", optional = true }
+#     …and flip the feature to `smithay = ["dep:smithay", "dep:calloop"]`. The real
+#     handler bodies that use these live in src/wayland.rs (`#![cfg(feature =
+#     "smithay")]`), so they compile ONLY on that CI flip — never on the dev box.
 #     + a committed Cargo.lock, vendored + hashed in hart-comp.nix, proven on the
-#     nixpkgs pin via hart-rust-precedent.nix FIRST (ROADMAP Phase 3). They come
-#     back when the integration lands in CI — where Smithay can actually compile.
-# Until then the skeleton keeps a minimal, COMPILING dep set + a behavioural
-# never-fail-floor test floor (see #[cfg(test)] in main.rs).
+#     nixpkgs pin via hart-rust-precedent.nix FIRST (ROADMAP Phase 3). This HAS
+#     landed: M9 is green — hart-comp.nix sets `buildFeatures = ["smithay"]` and
+#     declares the XWayland C dep surface (xorg/xwayland), so `nix build
+#     .#…hart.comp.package` compiles the smithay path (VM-scanout-proven).
+# The DEFAULT (no-feature) build keeps a minimal, COMPILING dep set + a behavioural
+# test floor: the never-fail-floor (Phase 3) AND the no-phantom-window invariants
+# (Phase 5) both assert via real types + calls in #[cfg(test)] in main.rs.
 
 # Structured logging — journal-friendly (the systemd unit captures stdout/stderr).
 tracing = "0.1"
@@ -66,9 +167,65 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opt-level = 2
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# panic = "unwind" (NOT "abort") is REQUIRED for the degrade-not-die guarantee: the
+# GLES arm in udev.rs wraps build_gles_renderer in std::panic::catch_unwind so a
+# THIRD-PARTY panic — smithay loads libEGL/libGLESv2 via `libloading …expect(…)`,
+# which panics (not Err) when the lib is missing — is caught and demoted to the
+# pixman software floor IN-PROCESS, instead of aborting (rc=134) and dropping the
+# whole tier to sway/cage (real-HW 2026-07-09). catch_unwind is a no-op under
+# "abort", so it must be "unwind". Our OWN code stays panic-free (the only panic!s
+# are intentional unreachable client-data arms); unwind exists to survive smithay's.
+panic = "unwind"
 
 [lints.rust]
-# Match the workspace discipline in claw_native/rust: forbid unsafe in our own
-# glue. Smithay's FFI lives behind its own crate boundary.
-unsafe_code = "forbid"
+# Match the workspace discipline in claw_native/rust: NO unsafe in our own glue.
+# Smithay's FFI lives behind its own crate boundary. This is `deny` (not `forbid`)
+# for exactly ONE reason: M6's zwlr_screencopy read-back must memcpy the framebuffer
+# bytes into the client's shm `wl_buffer`, whose mapping Smithay hands us as a raw
+# `*mut u8` (`with_buffer_contents_mut`) — there is no safe Smithay helper for the
+# wlr-screencopy copy at this pinned rev (it predates the upstreamed handler). That
+# single, bounds-checked memcpy carries a `#[allow(unsafe_code)]` + a SAFETY comment
+# in src/screencopy.rs::fill_one; `deny` keeps every OTHER line unsafe-free (a stray
+# unsafe block anywhere else is still a hard error) while permitting that one audited
+# exception. The DRM path (wayland.rs) and all pure logic remain unsafe-free.
+unsafe_code = "deny"
+
+# ── The real GIT Smithay dep, pinned to the EXACT rev in Cargo.lock
+# (47843391c3cd34a32e5ed1721878ca2279269185). Optional, so the default dev-box
+# build never resolves it; only `--features smithay` (DRM) or `--features winit`
+# (WSL) does.
+#
+# Base `features` = ONLY what BOTH backends share: `wayland_frontend` (the
+# protocol globals — wl_compositor/wl_shm/xdg_wm_base/wl_seat/wlr-layer-shell) and
+# `desktop` (Space/Window/PopupManager). Each backend then adds its OWN backend +
+# renderer set via `smithay/<feat>` passthrough on the cargo feature above:
+#   • `smithay` (DRM/real-HW) → backend_drm/gbm/udev/session_libseat + renderer_pixman + xwayland
+#   • `winit`   (WSL/dev)     → backend_winit + renderer_gl + backend_egl
+# Keeping the backend sets on the cargo features (not hardcoded here) means a
+# `--features winit` build does NOT drag in the DRM/libseat C deps, and vice
+# versa — one dep, two non-overlapping backend stacks, no parallel dep block.
+[dependencies.smithay]
+git = "https://github.com/Smithay/smithay"
+rev = "47843391c3cd34a32e5ed1721878ca2279269185"
+optional = true
+default-features = false
+features = ["wayland_frontend","desktop"]
+
+[dependencies.calloop]
+version = "0.13"
+optional = true
+
+# ── M4: the com.hart.Compositor IPC server's JSON framing (src/ipc.rs). Optional,
+# enabled by the `winit` feature (the only build that compiles ipc.rs). `serde` with
+# `derive` for the request/response envelope structs; `serde_json` for the framed
+# bodies. Both versions match what is already resolved in Cargo.lock via smithay's
+# tree, so no new transitive churn — `serde_json` was the only crate not already
+# extracted, and it is in the offline registry cache.
+[dependencies.serde]
+version = "1"
+optional = true
+features = ["derive"]
+
+[dependencies.serde_json]
+version = "1"
+optional = true

@@ -31,6 +31,30 @@ The master key is a kill switch for a distributed intelligence. It is not a deve
 
 You MAY read `security/master_key.py` to understand the public key verification flow. You MAY NOT interact with the private key in any way.
 
+## Hive Collaboration Bootstrap (BINDING — read before doing agentic work)
+
+**When the user asks for work, collaborate with HARTOS's native machinery,
+never around it. Read [docs/architecture/HIVE_COLLAB_BOOTSTRAP.md](docs/architecture/HIVE_COLLAB_BOOTSTRAP.md)
+FIRST — it is the code-verified map (guarded by
+`tests/unit/test_hive_collab_bootstrap_prompt.py`) of how a Claude Code
+session gets things done inside the hive.** The operative rules:
+
+1. Agentic work routes through **`POST /chat`** (CREATE/REUSE recipe
+   pipeline) — never a second execution path.
+2. Background/autonomous work goes through **`dispatch.py::dispatch_goal`**
+   + `goal_manager.py` verticals; the flywheel in a dev session starts via
+   **`scripts/run_flywheel_dev.py`** (the standalone entry does NOT start it).
+3. Outcomes reach HevolveAI through the ONE bridge
+   (`world_model_bridge.py::WorldModelBridge`); mind the 50-batch flush
+   buffer, the hevolveai-wheel stub trap, and the local-model 0-spark
+   completion trap — all documented in the bootstrap doc.
+4. **PRIMARY OBJECTIVE: bootstrap every seeded goal with the fleet's joint
+   resources.** Shard `goal_seeding.py::SEED_BOOTSTRAP_GOALS` across the
+   gossip-discovered peers (`sha256(slug) % N` -- deterministic, no central),
+   CREATE only your shard (verify by banked artifact, not flags), and pull
+   the rest from peers over A2A. ~70 recipes fleet-wide in one CREATE-cycle;
+   the full protocol is in the bootstrap doc.
+
 ## Branch Discipline — MAIN BRANCH ONLY (MANDATORY)
 
 **Work directly on `main` in the main clone.  Every session.  No exceptions.**
@@ -157,12 +181,44 @@ LANGCHAIN_API_KEY=your-key
 
 Create `config.json` with API keys for: OPENAI, GROQ, GOOGLE_CSE_ID, GOOGLE_API_KEY, NEWS_API_KEY, SERPAPI_API_KEY
 
+## Update Delivery — OTA, NOT manual flash
+
+**Updates ship over-the-air. The ISO/USB flash is FIRST-INSTALL only.** Do NOT
+ask the user to re-flash to deliver an update — line up an OTA push instead
+(and confirm before the outward central publish, since it deploys to their node).
+
+- **Config:** `nixos/configurations/desktop.nix` → `hart.ota = { enable = true;
+  channel = "stable"; autoApply = true; }` — its own comment: *"This replaces the
+  user's last manual flash."*
+- **Mechanism:** `nixos/modules/hart-ota.nix` — a 7-stage pipeline **BUILD → TEST
+  → AUDIT → BENCHMARK → SIGN → CANARY → DEPLOY**. Central publishes WHICH commit
+  (a pinned `github:hertz-ai/HARTOS/<sha>`); the node pulls (on boot / `hart-ota
+  check`) or receives a central push over the fleet/gossip fabric, builds the
+  closure, and **atomically switches the NixOS generation** (rollback =
+  `nixos-rebuild switch --rollback`; the canary auto-reverts on health
+  regression; the node never force-applies past canary).
+- **Mesh, NOT central-only:** a **regional-tier** node can also initiate (the node
+  accepts `required_tier='regional'`, central/regional Ed25519, master-anchored);
+  the **gossip/WAMP/PeerLink** fabric relays peer-to-peer (any same-network peer);
+  **regional hosts own + serve their sub-fleet** (discovery + staged rollout + the
+  pull source — `centralEndpoint` can be a regional host, not only etime). Trust is
+  still master-anchored (regional certs delegated from central; a relay can't forge
+  authority).
+- **SIGN is master-key-gated → steward-only, AI-EXCLUDED.** Claude preps + greens
+  the closure; the human signs the release.
+- **To ship a Nix-built component (e.g. the HART-comp compositor) via OTA:** its
+  package must actually BUILD in Nix (eval passing is NOT enough), then the
+  steward signs the publish. A failed BUILD stage simply doesn't deliver — it
+  never bricks the node.
+
+See `memory/reference_ota_delivery_model.md`.
+
 ## Architecture
 
 ### Core Flow
 ```
 CREATE Mode: User Input → Decompose → Execute Actions → Save Recipe
-REUSE Mode:  User Input → Load Recipe → Execute Steps → Output (90% faster)
+REUSE Mode:  User Input → Load Recipe → LLM-GUIDED replay of proven steps (adapts to live context) → Output (~90% cheaper: skips re-decomposition/exploration, NOT the LLM — never a deterministic macro)
 ```
 
 ### Key Files
@@ -262,6 +318,41 @@ Critical pinned versions (post Apr/May 2026 split-package migration):
 - `autogen` (multi-agent framework)
 - `chromadb==0.3.23` (vector store)
 - `hypercorn` (primary ASGI server) + `waitress==2.1.2` (WSGI fallback)
+
+---
+
+## Desktop & Home Design — Consult the Checklist FIRST (BINDING)
+
+**Before changing ANY desktop / home / shell UI design — layout, canvas,
+the orb, cards/rows, top bar, taskbar, omnibox, interaction, onboarding,
+the agentic Liquid-UI surface — you MUST read and honor
+`docs/design/HOME_DESKTOP_DESIGN_CHECKLIST.md` FIRST.**
+
+It is the consolidated, durable record of the steward's design
+instructions, recovered from the FULL session history (1,797 of the
+steward's own typed messages; 11 groups a–k, ~55 rules, each with a
+verbatim quote + the source message number). It is the SOURCE OF TRUTH
+for desktop look/feel. The steward set this rule (2026-06-29): *"this
+doc shd be consulted whenever we are changing the design of desktop."*
+
+1. **Consult before you change.** Any edit to `hartHome.*`, `hartHero.*`,
+   `voiceOrbViz.js`, `hartDesktop.js`, `hartResponsive.css`, the shell
+   render in `liquid_ui_service.py`, or the compositor's visual surface →
+   read the checklist first; confirm the change does not regress an
+   APPLIED item.
+2. **Update it when intent changes.** A new design instruction from the
+   steward gets added to the checklist (with the quote) in the SAME
+   change — never let an instruction live only in chat again.
+3. **Audit after you build.** A desktop-design change isn't done until
+   it's scored against the relevant items (APPLIED / PARTIAL / MISSING),
+   like the W1 audit at the bottom of the doc.
+4. **Never contradict an EMPHATIC rule** (group (a): "NOT a webpage / no
+   vertical page scroll / fixed canvas", and the like). If a change would,
+   STOP and surface it to the steward.
+
+Why: the steward's instructions kept scattering across sessions and felt
+"lost." This checklist + this rule make them structurally un-loseable.
+See `memory/feedback_desktop_design_checklist_binding.md`.
 
 ---
 

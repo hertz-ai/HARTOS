@@ -41,6 +41,17 @@ class AppRegistry:
         self._apps: Dict[str, AppManifest] = {}
         self._lock = threading.Lock()
         self._emit = event_emitter
+        # ── manifest ↔ native-window-handle map (Phase 5, ADDITIVE) ──
+        # The brain-side mirror of the compositor's WindowRegistry.by_manifest
+        # (compositor/src/main.rs). Populated when HART-comp emits `window.opened`
+        # with a manifest_id (IPC_PROTOCOL.md §4.1/§5), cleared on `window.closed`.
+        # Lets an agent answer "is app X open as a native window, and what's its
+        # compositor handle" WITHOUT iterating the iframe-panel catalog above. This
+        # is the "AppRegistry window-handle field" the Phase-5 deliverable names —
+        # the native-window path ALONGSIDE the existing iframe panels, not a
+        # replacement (panels stay in `_apps`). A handle here ALWAYS came from a
+        # real map event (the compositor mints it only on map — no phantom).
+        self._window_handles: Dict[str, str] = {}
 
     def register(self, manifest: AppManifest) -> None:
         """Register an app manifest.
@@ -181,6 +192,41 @@ class AppRegistry:
                 }
         return result
 
+    @staticmethod
+    def manifest_entry_for(manifest: 'AppManifest') -> Dict[str, Any]:
+        """Shell-manifest entry for ONE installed app (DESKTOP_APP/EXTENSION).
+
+        Single source of truth for how an installed app surfaces in the glass
+        shell's ``window.MANIFEST`` — used both by the cold-load render
+        (``installed_app_manifest``) and by the live A2UI push the installer
+        emits on success. The ``exec`` key is what makes the desktop icon
+        LAUNCH the native binary (openPanel routes entries with ``exec`` and no
+        ``route`` to the gtk-launch path) instead of trying to iframe it.
+        """
+        return {
+            'title': manifest.name,
+            'icon': manifest.icon or 'apps',
+            'exec': manifest.entry.get('exec', manifest.id),
+            'group': manifest.group or 'Installed',
+            'default_size': list(manifest.default_size),
+            'installed': True,
+        }
+
+    def installed_app_manifest(self) -> Dict[str, Dict[str, Any]]:
+        """Shell-manifest entries for every installed (launchable) app.
+
+        Complements ``to_shell_manifest`` (panels): returns the DESKTOP_APP /
+        EXTENSION entries the app-installer auto-registers, in the same
+        ``window.MANIFEST`` shape so the glass desktop can pin + launch them.
+        Merged into the rendered manifest so pinned installed-app icons
+        survive a page refresh (render() only shows ids present in MANIFEST).
+        """
+        return {
+            m.id: self.manifest_entry_for(m)
+            for m in self._apps.values()
+            if m.type in (AppType.DESKTOP_APP.value, AppType.EXTENSION.value)
+        }
+
     def load_panel_manifest(self, panels: Dict[str, dict]) -> int:
         """Bulk-import from shell_manifest.py PANEL_MANIFEST dict.
 
@@ -216,6 +262,49 @@ class AppRegistry:
                     self._apps[manifest.id] = manifest
                 count += 1
         return count
+
+    # ── Native-window handle map (Phase 5, ADDITIVE) ──────────
+    # Mirrors compositor/src/main.rs WindowRegistry on the brain side. These are
+    # fed by the HART-comp `window.opened`/`window.closed` events (Phase 6 IPC);
+    # a handle is recorded ONLY on a real map (the compositor never mints one for a
+    # launch that didn't map — the no-phantom-window guarantee, IPC §1.4/§4.6).
+
+    def bind_window_handle(self, manifest_id: str, handle: str) -> None:
+        """Record that ``manifest_id`` is open as native window ``handle``.
+
+        Called when HART-comp reports a real ``window.opened`` for a brain-summoned
+        toplevel (the map event, never the launcher exit code). A relaunch
+        re-points the manifest at the newest handle.
+        """
+        if not manifest_id or not handle:
+            return
+        with self._lock:
+            self._window_handles[str(manifest_id)] = str(handle)
+
+    def unbind_window_handle(self, handle: str) -> None:
+        """Drop a manifest→handle binding when ``handle``'s toplevel is destroyed
+        (``window.closed``). Only clears if the manifest still points at THIS
+        handle (a relaunch may have already re-pointed it) — mirrors the Rust
+        ``WindowRegistry::on_unmap`` relaunch-safety."""
+        if not handle:
+            return
+        handle = str(handle)
+        with self._lock:
+            for mid, h in list(self._window_handles.items()):
+                if h == handle:
+                    del self._window_handles[mid]
+
+    def window_handle_for(self, manifest_id: str) -> Optional[str]:
+        """The native-window handle ``manifest_id`` currently maps to (the agent's
+        "is app X open as a native window, and what's its handle" query), or None
+        if it is not open as a native window."""
+        return self._window_handles.get(str(manifest_id))
+
+    def native_windows(self) -> Dict[str, str]:
+        """Snapshot of the manifest↔handle map (all brain-summoned native
+        windows currently mapped)."""
+        with self._lock:
+            return dict(self._window_handles)
 
     # ── Lifecycle (for ServiceRegistry) ───────────────────────
 

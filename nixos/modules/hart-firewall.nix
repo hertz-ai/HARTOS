@@ -77,8 +77,16 @@ in
     # nftables firewall (replaces iptables)
     # ─────────────────────────────────────────────────────────
     {
-      networking.firewall.enable = true;
-      networking.nftables.enable = true;
+      # mkDefault (priority 1000) so contexts that intentionally disable the
+      # in-image firewall win at normal priority. The docker-server target's
+      # image format sets `networking.firewall.enable = false`; a plain `= true`
+      # here collided with it ("The option `networking.firewall.enable' has
+      # conflicting definition values"), red-failing ONLY the docker-server
+      # build (ISO/host variants have no competing definition). With mkDefault,
+      # the ISO/host variants — which set nothing else — still resolve to `true`
+      # (zero behaviour change), while the container build lets its `false` win.
+      networking.firewall.enable = lib.mkDefault true;
+      networking.nftables.enable = lib.mkDefault true;
 
       # Base firewall rules — NixOS handles the nftables ruleset
       networking.firewall = {
@@ -90,13 +98,21 @@ in
           cfg.ports.discovery   # Peer discovery
         ];
 
-        # Rate limiting via kernel
-        extraCommands = lib.optionalString fw.rateLimiting.enable ''
-          # Rate limit new TCP connections (SYN flood protection)
-          iptables -A INPUT -p tcp --syn -m limit \
-            --limit ${toString fw.rateLimiting.maxConnPerSecond}/second \
-            --limit-burst 50 -j ACCEPT 2>/dev/null || true
-          iptables -A INPUT -p tcp --syn -j DROP 2>/dev/null || true
+        # Rate limiting via the kernel, as NFTABLES rules (this firewall enables
+        # networking.nftables above, so the iptables-only `extraCommands` /
+        # `extraStopCommands` would trip the nftables-incompatibility assertion
+        # and fail the whole eval). `extraInputRules` is the nftables-native hook:
+        # its lines are appended to the firewall's inet input chain.
+        #
+        # SYN-flood mitigation: DROP new TCP connection attempts (pure SYN, not
+        # SYN/ACK) that EXCEED the configured rate, with a burst allowance of 50.
+        # `limit rate over ... drop` never touches under-rate traffic, and
+        # established/related connections are accepted earlier by the firewall's
+        # ct-state rule, so a legitimate client is never blocked (only a flood of
+        # NEW connections is throttled). Faithful to the old iptables intent
+        # (best-effort, appended after the standard accepts), now assertion-safe.
+        extraInputRules = lib.optionalString fw.rateLimiting.enable ''
+          tcp flags & (fin | syn | rst | ack) == syn limit rate over ${toString fw.rateLimiting.maxConnPerSecond}/second burst 50 packets drop
         '';
       };
 
@@ -209,7 +225,7 @@ in
               esac
               ;;
             help|--help|-h)
-              echo "hart-firewall — HART OS Firewall + Firmware Management"
+              echo "hart-firewall - HART OS Firewall + Firmware Management"
               echo ""
               echo "  hart-firewall status         Show firewall rules"
               echo "  hart-firewall ports           Show listening ports"

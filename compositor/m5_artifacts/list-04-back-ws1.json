@@ -1,0 +1,58 @@
+{
+  "v": 1,
+  "id": "1",
+  "ok": true,
+  "result": {
+    "windows": [
+      {
+        "app_id": "foot",
+        "focused": false,
+        "geometry": {
+          "h": 500,
+          "w": 700,
+          "x": 262,
+          "y": 182
+        },
+        "handle": "win_2",
+        "kind": "xdg",
+        "mapped": true,
+        "title": "xterm-sub",
+        "visible": true,
+        "workspace": 1
+      },
+      {
+        "app_id": "gnome-calculator",
+        "focused": true,
+        "geometry": {
+          "h": 1080,
+          "w": 960,
+          "x": 960,
+          "y": 0
+        },
+        "handle": "win_3",
+        "kind": "xdg",
+        "mapped": true,
+        "title": "Calculator",
+        "visible": true,
+        "workspace": 1
+      },
+      {
+        "app_id": "foot",
+        "focused": false,
+        "geometry": {
+          "h": 0,
+          "w": 0,
+          "x": 0,
+          "y": 0
+        },
+        "handle": "win_1",
+        "kind": "xdg",
+        "mapped": true,
+        "title": "foot",
+        "visible": false,
+        "workspace": 2
+      }
+    ]
+  },
+  "error": null
+}

@@ -246,6 +246,40 @@ def with_llm_context(source_name: str, request_id_arg: str = 'request_id'):
                     rid = bound.arguments.get(request_id_arg) or ''
                 except (TypeError, KeyError):
                     rid = ''
+            if not rid:
+                # #162 diagnostic — an LLM entry point (recipe / chat_agent) bound
+                # with NO request_id means every autogen call it issues will log
+                # request_id='' and (pre-385504a) bypass the foreground abort. Log
+                # WHO + whether the thread-local still has it, so the next build's
+                # frozen_debug disambiguates the loss point that static analysis
+                # cannot: a present thread_local_rid ⇒ the *caller* didn't thread
+                # the arg (fix upstream at the recipe()/chat_agent call site); an
+                # absent one ⇒ the daemon_/user tag was already gone before this
+                # frame (fix at /chat handler ↔ payload). Low-frequency (once per
+                # goal/turn, not per token), so INFO is safe.
+                _tl_rid = ''
+                try:
+                    import threading as _t
+                    from threadlocal import thread_local_data as _tl
+                    _tl_rid = _tl.get_request_id() or ''
+                    logger.info(
+                        "LLM-CONTEXT empty request_id at %s (source=%s, thread=%s, "
+                        "thread_local_rid=%r) — rid not threaded to this frame (#162)",
+                        getattr(fn, '__name__', '?'), source_name,
+                        _t.current_thread().name, _tl_rid)
+                except Exception:
+                    pass
+                # #162 fix: the decorated arg didn't carry a rid, but DON'T
+                # clobber an inherited one with ''.  The worker thread may hold
+                # the originating rid in the thread-local (re-bound at the
+                # speculative dispatcher's expert-task entry) or in a
+                # propagated contextvar.  Binding that keeps the user's own
+                # autogen turn FOREGROUND instead of background-and-preempted.
+                if not rid:
+                    try:
+                        rid = _tl_rid or _request_id_var.get() or ''
+                    except Exception:
+                        rid = _tl_rid or ''
             with source_context(source_name), request_id_context(rid):
                 return fn(*args, **kwargs)
         return _wrapper
@@ -274,12 +308,62 @@ def _get_log_path() -> str:
         )
 
 
+# PERF-2 (audit): this writer reached ~196MB — unbounded append + buffering=1
+# (a flush syscall per line).  Bound it through ONE canonical rotation point
+# (no parallel rotation path).  We deliberately KEEP the full request body — the
+# forensic value the live diagnosis flow relies on — and only (a) cap the file
+# and (b) drop the per-line flush.  Recent forensics survive in the live file +
+# one .old backup (~2x cap).  Override the cap with HEVOLVE_LLM_OUTBOUND_MAX_MB.
+def _max_outbound_log_bytes() -> int:
+    try:
+        mb = int(os.environ.get('HEVOLVE_LLM_OUTBOUND_MAX_MB', '') or 20)
+    except ValueError:
+        mb = 20
+    return max(1, mb) * 1024 * 1024
+
+
+def _rotate_if_oversized(path: str, max_bytes: int | None = None) -> bool:
+    """Rename ``path`` → ``path + '.old'`` when it exceeds ``max_bytes``.
+
+    Best-effort, never raises; one backup generation (prior .old overwritten).
+    Returns True iff a rotation happened.  SOLE rotation impl for this writer —
+    callers must not re-implement it (DRY / no parallel path)."""
+    if max_bytes is None:
+        max_bytes = _max_outbound_log_bytes()
+    try:
+        if os.path.getsize(path) <= max_bytes:
+            return False
+    except OSError:
+        return False  # missing / unstatable → nothing to rotate
+    try:
+        os.replace(path, path + '.old')
+        return True
+    except OSError:
+        return False
+
+
+def _close_handle() -> None:
+    """Close + drop the cached handle so the next ``_open_log_handle`` reopens
+    (and rotates via ``_rotate_if_oversized`` there if oversized)."""
+    global _file_handle
+    try:
+        if _file_handle is not None and not getattr(_file_handle, 'closed', True):
+            _file_handle.close()
+    except OSError:
+        pass
+    _file_handle = None
+
+
 def _open_log_handle():
     global _file_handle
     if _file_handle is None or getattr(_file_handle, 'closed', True):
         path = _get_log_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        _file_handle = open(path, 'a', encoding='utf-8', buffering=1)
+        _rotate_if_oversized(path)  # PERF-2: bound before (re)open
+        # Default buffering (was buffering=1 → flush per line).  A post-hoc
+        # forensic log has no live readers, so per-line durability is wasted
+        # syscalls; the process-exit close + OS flush preserve the tail.
+        _file_handle = open(path, 'a', encoding='utf-8')
     return _file_handle
 
 
@@ -581,6 +665,16 @@ def log_outbound(body: dict, *,
         with _file_lock:
             fh = _open_log_handle()
             fh.write(line)
+            # PERF-2: bound WITHIN a long session too (handle is opened once and
+            # reused, so a pre-open-only guard wouldn't help a multi-hour desktop
+            # run).  tell() is the cheap in-stream position (no extra stat).  At
+            # the cap, close so the NEXT call rotates + reopens — reusing the one
+            # _rotate_if_oversized in _open_log_handle (no parallel rotation).
+            try:
+                if fh.tell() >= _max_outbound_log_bytes():
+                    _close_handle()
+            except OSError:
+                pass
     except Exception as e:
         logger.debug("log_outbound failed: %s", e)
 
@@ -639,16 +733,26 @@ def _bg_yield_wait_s() -> float:
 
 
 def _is_background_call(request) -> bool:
-    """True iff this llama call belongs to an autonomous background daemon agent
-    (request_id ``daemon_*``) rather than a genuine user turn.
+    """True iff this llama call is autonomous background daemon work (request_id
+    ``daemon_*`` — or, per the accepted contract, ABSENT) rather than a genuine
+    user turn.
 
     Reads request_id from the ``X-HARTOS-Request-ID`` header stamped by
-    ``_annotate_request`` (so it travels with the request even across threads),
-    with a thread-local fallback, then applies the canonical
-    ``dispatch.is_genuine_user_request`` rule — single source of truth, no
-    duplicated prefix logic.  Conservative: ANY uncertainty returns False, so a
-    call is treated as cancellable background work only when we are sure; a user
-    turn is never cancelled."""
+    ``_annotate_request`` (so it travels with the request across the autogen
+    worker-thread boundary), with a thread-local fallback, then DELEGATES the
+    decision ENTIRELY to the one canonical ``dispatch.is_genuine_user_request``
+    — the SAME rule the inbound foreground gate (``_chat_request_is_genuine``)
+    applies, so the two can never diverge.  No bespoke, per-caller "is user"
+    logic here.
+
+    Empty / missing rid → ``is_genuine_user_request`` returns False → background
+    (abortable).  A real /chat always carries an id (the frontend sends one; the
+    adapter defaults a timestamp), so an UNtagged llama call is daemon work whose
+    ``daemon_`` tag was lost crossing into the autogen worker thread.  The prior
+    bespoke ``if not rid: return False`` here classified those as FOREGROUND,
+    which is exactly what left the daemon's empty-rid 4B calls on the
+    non-closable client so a user's "hi" could never preempt them (#162); it also
+    silently contradicted ``is_genuine_user_request``'s empty→background rule."""
     try:
         rid = None
         try:
@@ -657,8 +761,6 @@ def _is_background_call(request) -> bool:
             rid = None
         if not rid:
             rid = _get_request_id()
-        if not rid:
-            return False
         from integrations.agent_engine.dispatch import is_genuine_user_request
         return not is_genuine_user_request(rid)
     except Exception:
@@ -666,19 +768,18 @@ def _is_background_call(request) -> bool:
 
 
 def _select_send_client(self, request):
-    """Choose which httpx client executes this :8082 send.
+    """Choose which httpx client executes this send.
 
-    Autonomous daemon calls get the closable background client AFTER yielding to
-    any in-flight user turn; everything else gets the caller's own client,
-    unchanged.  Fully fenced — any failure falls back to the original client, so
-    the foreground path can never break."""
+    Autonomous daemon calls get the CLOSABLE background client so the scheduler's
+    preempt (``close_bg_llm_http_client``) can abort them; everything else gets
+    the caller's own client, unchanged.  The yield / priority / preempt is now
+    owned by ``core.llama_scheduler`` (acquired in ``_patched_send``) — the SAME
+    queue the requests/pooled_post path uses — NOT here; this only picks the
+    abortable transport for a daemon call.  Fully fenced — any failure falls back
+    to the original client, so the foreground path can never break."""
     try:
         if not _is_background_call(request):
             return self
-        from core.foreground import foreground_active, wait_until_clear
-        if foreground_active():
-            # A user is being served right now — yield the model to them first.
-            wait_until_clear(_bg_yield_wait_s())
         from core.http_pool import get_bg_llm_http_client
         return get_bg_llm_http_client() or self
     except Exception:
@@ -705,9 +806,25 @@ def _install_sync_patch(httpx_module) -> None:
         # _annotate_request ran above, so the X-HARTOS-Request-ID header the
         # discriminator reads is already set.
         send_client = _select_send_client(self, request)
+        # Admit through the slot-aware priority scheduler — the SAME queue the
+        # requests/pooled_post path uses — so this httpx (autogen/langchain/openai)
+        # call is slot-aware: a user turn arriving to a full server preempts an
+        # in-flight daemon; a daemon yields for a slot.  Fail-open to a no-op
+        # context if the scheduler is unavailable, so the send can never be
+        # blocked on a scheduler import error.
+        try:
+            from core.http_pool import close_bg_llm_http_client
+            from core.llama_scheduler import get_scheduler
+            _kind = 'daemon' if _is_background_call(request) else 'user'
+            _slot_cm = get_scheduler().slot(_get_request_id(), _kind,
+                                            cancel_fn=close_bg_llm_http_client,
+                                            timeout=120.0)
+        except Exception:
+            _slot_cm = contextlib.nullcontext()
         start = time.time()
         try:
-            response = _orig_send(send_client, request, **kwargs)
+            with _slot_cm:
+                response = _orig_send(send_client, request, **kwargs)
             elapsed = (time.time() - start) * 1000
             log_outbound(body or {},
                          response_status=getattr(response, 'status_code', None),

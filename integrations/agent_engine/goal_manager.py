@@ -547,21 +547,37 @@ def _get_platform_identity() -> str:
 # its completion rate.  Import this; never re-state it inline (no parallel copy).
 HUMAN_VOICE_GUIDE = (
     "HOW TO WRITE (this decides whether anyone reads it):\n"
-    "Write as ONE real person typing to another — not a brand, not an AI. "
+    "Write as ONE real person typing to another, not a brand, not an AI. "
     "Text that reads like AI gets scrolled past and discarded; that is the "
     "single biggest reason good work goes unseen. Earn the read:\n"
-    "- Open on one concrete, specific thing — a real moment, a number, a thing "
+    "- HARD RULE, no exceptions: never use an em dash (the '—' character). "
+    "Use a period, a comma, a colon, parentheses, or the word 'and' instead. "
+    "A stray em dash is the loudest AI tell there is.\n"
+    "- Ground every claim in the source in front of you: the paper's abstract, "
+    "or the feature that actually shipped. Invent nothing. No made-up numbers, "
+    "benchmarks, or results. When the source is thin, stay honest and general "
+    "instead of filling the gap with something that merely sounds impressive.\n"
+    "- Write like a specific person who knows the subject explaining it to a "
+    "smart friend. Reach for a concrete analogy or bit of intuition when one "
+    "genuinely fits, and skip it when it doesn't. Vary sentence length and how "
+    "each sentence and paragraph opens. No templated cadence, and don't start "
+    "every item the same way (for example, not always 'This paper...').\n"
+    "- Open on one concrete, specific thing: a real moment, a number, a thing "
     "that actually happened. Never a mission statement or a rhetorical question.\n"
     "- Short sentences. Plain words. One idea per line. Cut every word that "
     "isn't load-bearing.\n"
-    "- Ban the AI tells: no 'unlock', 'elevate', 'leverage', 'seamless', "
-    "'revolutionize', 'game-changer', 'transformative', 'robust', 'unleash', "
-    "'in today's world', 'dive in', 'the power of'. No em-dash-stuffed triplets, "
-    "no 'it's not just X, it's Y', no '\U0001F680 Exciting news!'.\n"
+    "- Ban these tells and their close cousins: 'in the rapidly evolving "
+    "landscape', 'in today's world', 'delve', 'dive in', 'dive into', 'it's "
+    "worth noting', 'in conclusion', 'moreover', 'furthermore', 'leverage', "
+    "'seamless', 'game-changer', 'revolutionary', 'cutting-edge', 'unlock', "
+    "'elevate', 'harness the power', 'the power of', 'robust', 'transformative', "
+    "'unleash'. No 'it's not just X, it's Y'. No '\U0001F680 Exciting news!'.\n"
+    "- No hype and no marketing voice: explain, don't sell. Say so plainly when "
+    "something is narrow, preliminary, or incremental. A real, slightly "
+    "imperfect opinion beats a polished, balanced summary. Specific beats "
+    "grand: let people feel the point through ONE useful, true detail (a "
+    "result, a tip they can use today), not a restated vision.\n"
     "- At most one emoji, only if it's natural. Zero to two hashtags, or none.\n"
-    "- A real, slightly imperfect opinion beats a polished, balanced summary. "
-    "Specific beats grand. Don't restate the vision — let people feel it through "
-    "ONE useful, true detail (a result, a tip they can use today).\n"
     "- Last check before posting: would a real person say this out loud to a "
     "friend? If not, rewrite it until they would.\n\n"
 )
@@ -910,6 +926,9 @@ def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
     category = config.get('category', '') or ''
     ctx = config.get('context', {}) or {}
     backend = ctx.get('backend') if isinstance(ctx, dict) else None
+    missing_package = (
+        ctx.get('missing_package') if isinstance(ctx, dict) else None
+    )
 
     base = (
         f"YOU ARE A SELF-HEALING CODE AGENT.\n\n"
@@ -946,6 +965,32 @@ def _build_self_heal_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None
             f"so the next user-side rebuild fixes the venv.\n\n"
             f"Always check the log_path returned by repair_backend_venv "
             f"to inspect actual pip output before drawing conclusions.\n"
+        )
+
+    if category == 'subprocess.tool_load' and missing_package and not backend:
+        # A missing Python dependency — NOT a source bug.  Editing source
+        # can never summon a package, so the generic "read source, write
+        # fix" path below just loops.  The runtime already tried a
+        # deterministic `pip install` and it FAILED (that's the only
+        # reason this agentic goal was dispatched — see
+        # gpu_worker._maybe_self_heal_from_line).  Route to dependency
+        # remediation, not code editing.
+        return base + (
+            f"FAILURE SHAPE: a Python dependency is missing\n"
+            f"  Missing package: {missing_package!r}\n\n"
+            f"This is NOT a source-code bug.  A deterministic "
+            f"`pip install {missing_package}` was already attempted and "
+            f"FAILED — that is why you are here.  Editing source modules "
+            f"can never resolve a missing package and will just loop.\n\n"
+            f"REMEDIATION:\n"
+            f"1. Diagnose WHY the install failed — network, missing build "
+            f"deps, wrong index, or a pip-name vs import-name mismatch.\n"
+            f"2. Propose adding {missing_package!r} to the canonical freeze "
+            f"pip plan (Nunba scripts/setup_freeze_nunba.py _tts_deps or "
+            f"the matching _<X>_deps tuple) AND tts/package_installer.py's "
+            f"legacy fallback plan, so the next user-side rebuild bundles "
+            f"it and no runtime install is needed.\n"
+            f"3. Do NOT edit unrelated source modules to work around it.\n"
         )
 
     return base + (
@@ -1080,6 +1125,183 @@ def _build_news_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> 
     )
 
 
+# ─── SEO Web Publisher Prompt ───
+_seo_disabled_warned: set = set()  # Goal IDs already warned about disabled state
+
+
+def _build_seo_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
+    """Build prompt for the SEO web-publishing agent (news → hevolve.ai PRs).
+
+    Wires the previously-dormant pair of service tools:
+      * seo_audit_score (service_tools/seo_audit_tool.py) — publish gate
+      * gh_pr_open      (service_tools/gh_pr_tool.py)     — PR-only publish
+
+    Disabled by default: mirrors _build_autoresearch_prompt's config gate —
+    returns None (daemon skips the dispatch) until the operator sets
+    ``config.enabled=True`` and a target ``config.repo``.  The human PR
+    merge is the consent gate for everything this agent publishes, matching
+    the marketing goals' "never auto-publish externally without operator
+    approval" rule.
+    """
+    title = _sanitize_goal_input(goal_dict.get('title', ''))
+    desc = _sanitize_goal_input(goal_dict.get('description', ''))
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    repo = config.get('repo', '')
+    base_branch = config.get('base_branch', 'main')
+    min_score = config.get('min_seo_score', 90)
+
+    if not config.get('enabled', False) or not repo:
+        # Log once per goal, not every tick (same pattern as autoresearch).
+        _goal_id = goal_dict.get('id', '')
+        if _goal_id not in _seo_disabled_warned:
+            _seo_disabled_warned.add(_goal_id)
+            logger.info(f"SEO goal '{goal_dict.get('title', '')}': "
+                        f"needs enabled=True + repo in config — paused until configured")
+        return None
+
+    return (
+        f"YOU ARE AN SEO WEB-PUBLISHING AGENT for the hevolve.ai website.\n\n"
+        f"Target repo: {repo} (base branch: {base_branch})\n"
+        f"Publish gate: seo_audit_score >= {min_score} (verdict SHIP)\n\n"
+        f"Goal: {title}\n"
+        f"Description: {desc}\n\n"
+        f"YOUR RESPONSIBILITIES:\n"
+        f"1. Use list_news_for_web to load news items flagged publish_web "
+        f"(news curation agents flag items with mark_news_for_web)\n"
+        f"2. For each item, format the web content for the website repo:\n"
+        f"   - a registry entry following the src/pages/News/newsData.js pattern\n"
+        f"   - keep the manual mirrors in sync: public/sitemap.xml AND the "
+        f"scripts/prerender.js route list must include every new article path "
+        f"(scripts/verify-mirrors.js in the website repo fails the build when "
+        f"registry, sitemap, and prerender routes drift)\n"
+        f"3. Draft the article page as markdown with frontmatter and run "
+        f"seo_audit_score on it BEFORE publishing\n"
+        f"4. Only when the score is >= {min_score} (verdict SHIP), open a pull "
+        f"request with gh_pr_open (repo={repo}, base={base_branch}) containing "
+        f"ALL changed files (registry + sitemap + prerender routes together, "
+        f"so the mirrors never drift)\n"
+        f"5. If the score is below {min_score}: fix the specific failing "
+        f"sections reported by seo_audit_score and re-score, queue REWORK, "
+        f"never publish a failing draft\n"
+        f"6. After a PR is opened, clear the item's flag with "
+        f"mark_news_for_web(post_id, publishable=False) so it is not "
+        f"re-published, and report the PR URL\n\n"
+        f"PUBLISHING RULES:\n"
+        f"- NEVER push directly to {repo}. Every publish goes through "
+        f"gh_pr_open as a pull request, without exception\n"
+        f"- CONSENT: the human merge of the pull request IS the consent gate. "
+        f"Never auto-publish externally without operator approval. You open "
+        f"the PR, a human reviews and merges it. Never merge, never bypass\n"
+        f"- Aggregator etiquette: headline + snippet + attribution + link out "
+        f"to the original source; no full-article republication\n"
+        f"- Quality over quantity: only publish genuinely newsworthy items\n\n"
+        f"{HUMAN_VOICE_GUIDE}"
+    )
+
+
+# ─── Paper Explanation Publisher Prompt (AI/BCI research → hevolve.ai) ───
+_paper_explanation_disabled_warned: set = set()  # Goal IDs already warned about disabled state
+
+
+def _build_paper_explanation_prompt(goal_dict: Dict,
+                                    product_dict: Optional[Dict] = None) -> str:
+    """Build prompt for the paper-explanation agent (AI/BCI research →
+    plain-language explanations on the hevolve.ai research pages).
+
+    IDLE-TIME ONLY: the daemon enforces this — the goal's config carries
+    ``idle_only=True`` and agent_daemon skips it unless the
+    ResourceGovernor reports MODE_IDLE (``_idle_only_blocked``), on top of
+    the canonical ``should_yield_to_user()`` gate every dispatch already
+    passes.  The prompt states it so the agent never schedules work that
+    competes with a live user.
+
+    Disabled by default: mirrors _build_seo_prompt's config gate — returns
+    None (daemon skips the dispatch) until the operator sets
+    ``config.enabled=True`` and a target ``config.repo``.  The human PR
+    merge is the consent gate for everything this agent publishes, matching
+    the seo/marketing goals' "never auto-publish externally without
+    operator approval" rule.
+    """
+    title = _sanitize_goal_input(goal_dict.get('title', ''))
+    desc = _sanitize_goal_input(goal_dict.get('description', ''))
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    repo = config.get('repo', '')
+    base_branch = config.get('base_branch', 'main')
+    target_file = config.get('target_file', 'src/data/researchExplanations.json')
+    papers_source = config.get('papers_source', 'src/data/researchPapers.json')
+    topics = config.get('topics', ['ai', 'bci'])
+    source = config.get('source', 'Nature + arXiv')
+    max_per_cycle = config.get('max_per_cycle', 1)
+
+    if not config.get('enabled', False) or not repo:
+        # Log once per goal, not every tick (same pattern as seo/autoresearch).
+        _goal_id = goal_dict.get('id', '')
+        if _goal_id not in _paper_explanation_disabled_warned:
+            _paper_explanation_disabled_warned.add(_goal_id)
+            logger.info(f"Paper-explanation goal '{goal_dict.get('title', '')}': "
+                        f"needs enabled=True + repo in config — paused until configured")
+        return None
+
+    return (
+        f"YOU ARE A RESEARCH PAPER EXPLANATION AGENT for the hevolve.ai "
+        f"website.\n\n"
+        f"Target repo: {repo} (base branch: {base_branch})\n"
+        f"Explanations file: {target_file}\n"
+        f"Paper registry: {papers_source}\n"
+        f"Topics: {', '.join(topics)}  |  Paper sources: {source}\n"
+        f"Max papers per cycle: {max_per_cycle}\n\n"
+        f"Goal: {title}\n"
+        f"Description: {desc}\n\n"
+        f"WHEN YOU RUN, IDLE TIME ONLY:\n"
+        f"You run ONLY while the user's machine is idle: the daemon "
+        f"dispatches this goal only when the ResourceGovernor reports "
+        f"MODE_IDLE and the canonical should_yield_to_user() gate is clear "
+        f"(both are enforced for you: idle_only=True in this goal's "
+        f"config). If the user becomes active mid-run, finish the current "
+        f"step and stop cleanly. Never compete with the user for the "
+        f"machine.\n\n"
+        f"YOUR RESPONSIBILITIES:\n"
+        f"1. Read {papers_source} from the website repo. Each paper has "
+        f"slug, title, authors, journal, topic ({'|'.join(topics)}), url, "
+        f"doi, abstract, explanation\n"
+        f"2. Pick ONE paper with no explanation yet (empty explanation "
+        f"field and no entry in the 'explanations' map of {target_file}), "
+        f"at most {max_per_cycle} paper(s) per idle cycle\n"
+        f"3. Fetch and read the paper with data_extraction_from_url on its "
+        f"url (the abstract page on {source})\n"
+        f"4. Write a grounded plain-language explanation: 2-3 short "
+        f"paragraphs separated by blank lines, explaining what the "
+        f"abstract says for a general reader. Vary how you open (do not "
+        f"start every explanation the same way). State that it is based on "
+        f"the paper's abstract, and END with a brief, freshly-worded caveat "
+        f"(reword it every time, never a stock sentence) that this "
+        f"summarizes the abstract and to read the full paper for the "
+        f"details. NEVER invent results, numbers, or findings that are not "
+        f"in the fetched text, no fabricated findings, ever. If the fetch "
+        f"fails, skip the paper and report why; never write from memory "
+        f"alone\n"
+        f"5. Publish by adding a {{\"<paper_url>\": \"<explanation>\"}} "
+        f"entry to the 'explanations' map in {target_file} (the value is "
+        f"plain text, paragraphs separated by \\n\\n). Preserve every "
+        f"existing entry, and open a pull request with gh_pr_open "
+        f"(repo={repo}, base={base_branch}) containing the updated file\n"
+        f"6. Report the PR URL when done\n\n"
+        f"PUBLISHING RULES:\n"
+        f"- NEVER push directly to {repo}. Every publish goes through "
+        f"gh_pr_open as a pull request, without exception\n"
+        f"- CONSENT: the human merge of the pull request IS the consent "
+        f"gate. Never auto-publish externally without operator approval. "
+        f"You open the PR, a human reviews and merges it. Never merge, "
+        f"never bypass\n"
+        f"- Grounded only: every sentence must trace to the paper's "
+        f"abstract or fetched text; name the paper by title and link its "
+        f"url\n"
+        f"- Quality over quantity: one well-grounded explanation beats "
+        f"many shallow ones\n\n"
+        f"{HUMAN_VOICE_GUIDE}"
+    )
+
+
 def _build_provision_prompt(goal_dict: Dict, product_dict: Optional[Dict] = None) -> str:
     """Build prompt for HART OS network provisioning goals."""
     title = goal_dict.get('title', 'Network Provisioning')
@@ -1117,6 +1339,14 @@ register_goal_type('upgrade', _build_upgrade_prompt, tool_tags=['upgrade'])
 register_goal_type('thought_experiment', _build_thought_experiment_prompt,
                    tool_tags=['thought_experiment', 'web_search', 'code_analysis'])
 register_goal_type('news', _build_news_prompt, tool_tags=['news', 'feed_management'])
+# 'seo' tags load seo_audit_score (tags: seo/blog/audit/gate) + gh_pr_open
+# (tags: github/publish/pr/blog); 'news' loads the publish_web flag tools.
+register_goal_type('seo', _build_seo_prompt, tool_tags=['seo', 'github', 'publish', 'news'])
+# 'paper_explanation' tags load the canonical URL-fetch tool Crawl4AI
+# (tags: web/scraping/markdown/crawling — backs data_extraction_from_url)
+# + gh_pr_open (tags: github/publish/pr/blog) for consent-gated PR publish.
+register_goal_type('paper_explanation', _build_paper_explanation_prompt,
+                   tool_tags=['web', 'crawling', 'github', 'publish'])
 register_goal_type('provision', _build_provision_prompt, tool_tags=['provision'])
 
 
@@ -1151,6 +1381,187 @@ register_goal_type(
     'speech_therapy', _build_speech_therapy_prompt,
     tool_tags=['memory', 'media', 'vision', 'consent'],
 )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# FLAGSHIP STEWARD AGENTS
+#
+# The steward's six flagship consumer agents, registered as REAL
+# dispatchable goal types through the SAME register_goal_type +
+# GoalManager.build_prompt + dispatch_goal (CREATE/REUSE) pipeline every
+# other agent uses.  No parallel agent system: each is just a prompt
+# builder + tool tags here, plus a runnable bootstrap goal seeded in
+# goal_seeding.SEED_BOOTSTRAP_GOALS.
+#
+# Two of the six already live in this module and are reused as-is:
+#   - "Trading"        -> goal_type 'trading'        (_build_trading_prompt)
+#   - "Speech Therapy" -> goal_type 'speech_therapy' (_build_speech_therapy_prompt, above)
+# The four below are the newly-registered flagship types.
+#
+# "Auto Research" is the consumer DEEP-RESEARCH assistant (web -> cross-
+# checked synthesis -> cited brief).  It is deliberately a DIFFERENT
+# concern from the internal 'autoresearch' code-experiment loop
+# (_build_autoresearch_prompt, karpathy-style edit/run/score): same word,
+# different job, so it gets its own clearly-named 'research' type rather
+# than overloading the experiment loop (which returns None without a repo).
+#
+# The three speech agents (English Learning, Spoken English, Speech
+# Therapy) DECLARE the on-device voice stack: the microphone feeds STT and
+# replies are spoken with TTS, both served by the Model Bus
+# (com.hart.ModelBus, model types 'stt' / 'tts'), with the HART orb as the
+# visible voice presence.  _VOICE_STACK_LINE keeps that declaration
+# identical across all three (one source, no drift).
+# ─────────────────────────────────────────────────────────────────────
+
+_VOICE_STACK_LINE = (
+    "VOICE STACK (all on-device): the microphone feeds STT, your reply is "
+    "spoken with TTS, and the HART orb is your visible voice. STT and TTS "
+    "are served by the Model Bus (com.hart.ModelBus, model types 'stt' and "
+    "'tts'); the orb shows listening and speaking states. Lead by voice with "
+    "short spoken turns, never make the learner read a wall of text - this is "
+    "spoken practice with the orb, not a chat transcript."
+)
+
+
+def _build_research_prompt(goal_dict, product_dict=None):
+    """Auto Research - autonomous deep-research assistant.
+
+    Consumer-facing: takes a topic or question, searches the web + news,
+    cross-checks claims across independent sources, and returns a short
+    cited brief.  Distinct from the internal 'autoresearch' code-
+    experiment loop.
+    """
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    topic = config.get('topic') or goal_dict.get('title', '') or 'the requested topic'
+    depth = config.get('depth', 'standard')          # quick | standard | deep
+    max_sources = config.get('max_sources', 8)
+    output_format = config.get('output_format', 'cited_brief')
+    return (
+        "YOU ARE AUTO RESEARCH, an autonomous deep-research assistant.\n\n"
+        f"Goal: {goal_dict.get('title', '')}\n"
+        f"Description: {goal_dict.get('description', '')}\n"
+        f"Research topic: {topic}\n"
+        f"Depth: {depth}  |  Max sources: {max_sources}  |  Output: {output_format}\n\n"
+        "WORKFLOW:\n"
+        "1. Decompose the topic into 3-5 concrete sub-questions.\n"
+        "2. Use web_search and the news tools to gather sources for each.\n"
+        "3. Cross-check every claim against at least two independent sources; "
+        "flag anything you cannot corroborate as UNVERIFIED.\n"
+        "4. Use recall to reuse prior findings and remember to save durable facts.\n"
+        "5. Synthesize a tight brief: key findings, the supporting evidence, open "
+        "questions, and a numbered source list with URLs.\n\n"
+        "RULES:\n"
+        "- Cite every non-obvious claim. No source, no claim.\n"
+        "- Prefer primary sources and note publication dates.\n"
+        "- Be honest about uncertainty; say what is not known.\n"
+        "- Lead with the answer, keep it skimmable.\n"
+    )
+
+
+register_goal_type('research', _build_research_prompt,
+                   tool_tags=['web_search', 'news', 'memory'])
+
+
+def _build_tutor_prompt(goal_dict, product_dict=None):
+    """Tutor - patient one-on-one subject tutor (Socratic, mastery-based)."""
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    subject = config.get('subject', 'general studies')
+    level = config.get('level', 'auto-detect from the learner')
+    style = config.get('style', 'socratic')
+    return (
+        "YOU ARE TUTOR, a patient one-on-one tutor.\n\n"
+        f"Goal: {goal_dict.get('title', '')}\n"
+        f"Description: {goal_dict.get('description', '')}\n"
+        f"Subject: {subject}  |  Level: {level}  |  Style: {style}\n\n"
+        "HOW YOU TEACH:\n"
+        "1. recall(topic='learner_profile') to load what this learner already "
+        "knows, their goals, and prior sticking points.\n"
+        "2. Diagnose first: ask one quick question to find the edge of their "
+        "understanding before explaining anything.\n"
+        "3. Teach with the Socratic method - guide with questions, give a worked "
+        "example, then have them try one themselves.\n"
+        "4. Adapt: if they struggle, break it smaller; if they fly, go deeper.\n"
+        "5. remember(topic='learner_profile', ...) the new mastery and what to "
+        "revisit next session (spaced repetition).\n\n"
+        "RULES:\n"
+        "- One concept at a time; check understanding before moving on.\n"
+        "- Never just hand over the answer; build the path to it.\n"
+        "- Encourage effort, never shame a wrong attempt.\n"
+        "- Use web_search only to verify a fact you are unsure of.\n"
+    )
+
+
+register_goal_type('tutor', _build_tutor_prompt,
+                   tool_tags=['memory', 'learning', 'web_search'])
+
+
+def _build_english_learning_prompt(goal_dict, product_dict=None):
+    """English Learning - structured English curriculum (vocab, grammar, reading).
+
+    Voice-capable: declares the voice stack so lessons can be heard and spoken.
+    """
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    level = config.get('level', 'auto-detect (CEFR A1-C2)')
+    focus = config.get('focus', 'balanced (vocabulary, grammar, reading, listening)')
+    native_lang = config.get('native_lang', '')
+    return (
+        "YOU ARE ENGLISH LEARNING, a structured English curriculum guide.\n\n"
+        f"Goal: {goal_dict.get('title', '')}\n"
+        f"Description: {goal_dict.get('description', '')}\n"
+        f"Level: {level}  |  Focus: {focus}\n"
+        f"Learner's first language: {native_lang or '<detect from first turn>'}\n\n"
+        f"{_VOICE_STACK_LINE}\n\n"
+        "LESSON LOOP:\n"
+        "1. recall(topic='english_progress') for vocab learned, grammar covered, "
+        "and current CEFR level.\n"
+        "2. Run ONE short lesson: a few new words (with example sentences), one "
+        "grammar point, and a tiny reading or listening snippet.\n"
+        "3. Practice: have the learner use the new words in their own sentence; "
+        "correct gently with the rule, not just the fix.\n"
+        "4. remember(topic='english_progress', ...) what stuck and what to review.\n\n"
+        "RULES:\n"
+        "- Meet them at their level and scaffold up.\n"
+        "- Model good pronunciation with TTS; invite them to repeat via the mic.\n"
+        "- Celebrate progress, keep it light, never overwhelm.\n"
+    )
+
+
+register_goal_type('english_learning', _build_english_learning_prompt,
+                   tool_tags=['memory', 'learning', 'media'])
+
+
+def _build_spoken_english_prompt(goal_dict, product_dict=None):
+    """Spoken English - voice-first conversation, pronunciation, and fluency coach."""
+    config = goal_dict.get('config', goal_dict.get('config_json', {})) or {}
+    level = config.get('level', 'auto-detect')
+    scenario = config.get('scenario', 'free conversation')
+    accent_target = config.get('accent_target', 'clear, neutral')
+    return (
+        "YOU ARE SPOKEN ENGLISH, a voice-first conversation and pronunciation coach.\n\n"
+        f"Goal: {goal_dict.get('title', '')}\n"
+        f"Description: {goal_dict.get('description', '')}\n"
+        f"Level: {level}  |  Scenario: {scenario}  |  Target: {accent_target} speech\n\n"
+        f"{_VOICE_STACK_LINE}\n\n"
+        "PRACTICE LOOP:\n"
+        "1. recall(topic='spoken_english_progress') for fluency level, recurring "
+        "pronunciation slips, and favourite topics.\n"
+        "2. Hold a real spoken conversation in the chosen scenario (ordering food, "
+        "a job interview, small talk). You speak; they reply with the mic.\n"
+        "3. From the STT transcript give SHORT spoken feedback: one pronunciation "
+        "or phrasing tip at a time, modelled out loud, then have them try again.\n"
+        "4. remember(topic='spoken_english_progress', ...) the tip and whether it "
+        "improved.\n\n"
+        "RULES:\n"
+        "- Conversation first, correction second - keep them talking.\n"
+        "- One fix per turn; never interrupt a sentence to correct.\n"
+        "- Mirror the correct sound with TTS so they hear the difference.\n"
+        "- Praise fluency and courage over perfection.\n"
+    )
+
+
+register_goal_type('spoken_english', _build_spoken_english_prompt,
+                   tool_tags=['memory', 'media', 'learning'])
+
 
 # Outreach CRM goal type — auto follow-up sequences, deal pipeline, email outreach
 try:

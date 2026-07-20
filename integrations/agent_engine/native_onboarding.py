@@ -639,9 +639,32 @@ class HARTOnboardingWindow(Adw.ApplicationWindow):
         self._build_reveal_page(result)
 
     def _on_accept_name(self, btn):
-        """Seal the name forever."""
+        """Seal the name forever, then advance the ceremony to the sealed page.
+
+        #167 — this must never be a dead no-op. The seal happens through the
+        shared FSM (accept_name -> HARTNameRegistry.seal_name). A successful
+        seal is signalled by 'name_sealed' (the name is now permanent); the web
+        flow then opens a companion-download step, so the FSM no longer puts
+        'sealed' (the session-cleanup signal) on this response. We treat the
+        accept as successful when the FSM signals it (name_sealed/sealed) OR
+        when the canonical seal reader confirms the name is now persisted — so
+        a benign re-entry (the FSM has already moved past 'reveal') still lands
+        on the sealed page and advances to the desktop instead of showing an
+        error.
+        """
         result = self.session.advance(action='accept_name')
-        if result.get('sealed'):
+        if (result.get('name_sealed') or result.get('sealed')
+                or has_hart_name(self.user_id)):
+            # Backfill the sealed identity from the persisted profile when the
+            # FSM response doesn't carry it (idempotent re-entry path), so the
+            # sealed page always renders the name/tag/emoji.
+            if not result.get('hart_name'):
+                profile = get_hart_profile(self.user_id) or {}
+                if profile.get('name'):
+                    result.setdefault('hart_name', profile['name'])
+                    result.setdefault('hart_tag', profile.get('hart_tag', ''))
+                    result.setdefault('emoji_combo',
+                                      profile.get('emoji_combo', ''))
             self._build_sealed_page(result)
         else:
             # Error — show message and retry

@@ -51,13 +51,20 @@ class ThemeService:
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     preset = json.load(f)
+                colors = preset.get('colors', {})
                 presets.append({
                     'id': preset.get('id', fname.replace('.json', '')),
                     'name': preset.get('name', ''),
                     'description': preset.get('description', ''),
                     'category': preset.get('category', 'dark'),
-                    'accent': preset.get('colors', {}).get('accent', ''),
-                    'background': preset.get('colors', {}).get('background', ''),
+                    'accent': colors.get('accent', ''),
+                    # secondary + surface let the desktop theme picker render the SAME
+                    # 4-colour swatch it built from the (now-retired) hardcoded client
+                    # list, so it can render the gallery from THIS one source (G3, no
+                    # parallel preset list). Additive keys — existing consumers ignore them.
+                    'secondary': colors.get('secondary', colors.get('accent', '')),
+                    'background': colors.get('background', ''),
+                    'surface': colors.get('surface', colors.get('background', '')),
                 })
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning("Failed to load theme %s: %s", fname, e)
@@ -99,8 +106,10 @@ class ThemeService:
             if preset:
                 return preset
 
-        # Fallback: hart-default
-        default = ThemeService.get_preset('hart-default')
+        # Fallback: aura is the shipped OS boot theme for standard+ hardware.
+        # (The hardcoded DEFAULT_THEME_CONFIG below is the ultimate safety net if
+        # aura.json is ever missing/corrupt, so the shell can never be themeless.)
+        default = ThemeService.get_preset('aura')
         if default:
             return default
 
@@ -126,42 +135,100 @@ class ThemeService:
         }
 
     @staticmethod
-    def apply_theme(theme_id: str) -> dict:
-        """Apply a theme OS-wide. Returns the applied theme or error."""
-        preset = ThemeService.get_preset(theme_id)
-        if not preset:
-            return {'error': f'Unknown theme: {theme_id}'}
+    def apply_theme(theme_id: str,
+                    secondary_accent: Optional[str] = None,
+                    custom: Optional[dict] = None) -> dict:
+        """Apply a theme OS-wide. Returns the applied theme or error.
 
-        # 1. Persist active theme file (read by Conky Lua every 5s)
-        try:
-            os.makedirs(os.path.dirname(_ACTIVE_THEME_PATH), exist_ok=True)
-            with open(_ACTIVE_THEME_PATH, 'w', encoding='utf-8') as f:
-                json.dump(preset, f, indent=2)
-        except OSError as e:
-            logger.error("Failed to write active theme: %s", e)
-            return {'error': str(e)}
+        The Personalize palette picker (#161) also carries a ``secondary_accent``
+        (a2) and/or ``custom`` colours (accent / secondary / background). These are
+        an EXTENSION of this same route (not a fork): they are persisted through the
+        canonical custom-overrides path (update_custom), so get_css_variables() and
+        the active-theme file both pick them up on the next hard reload. A palette
+        may switch a preset AND overlay colours, overlay colours onto the current
+        theme with no preset switch, or just carry a2 - all through one entry point.
+        """
+        preset = None
+        if theme_id:
+            preset = ThemeService.get_preset(theme_id)
+            if not preset:
+                return {'error': f'Unknown theme: {theme_id}'}
 
-        # 2. Clear custom overrides (new preset = fresh start)
-        if os.path.isfile(_CUSTOM_OVERRIDES_PATH):
+            # 1. Persist active theme file (read by Conky Lua every 5s)
             try:
-                os.remove(_CUSTOM_OVERRIDES_PATH)
-            except OSError:
+                os.makedirs(os.path.dirname(_ACTIVE_THEME_PATH), exist_ok=True)
+                with open(_ACTIVE_THEME_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(preset, f, indent=2)
+            except OSError as e:
+                logger.error("Failed to write active theme: %s", e)
+                return {'error': str(e)}
+
+            # 2. Clear custom overrides (new preset = fresh start). The palette
+            #    overlay below re-applies on top, so a "preset + palette" apply
+            #    keeps the palette accents.
+            if os.path.isfile(_CUSTOM_OVERRIDES_PATH):
+                try:
+                    os.remove(_CUSTOM_OVERRIDES_PATH)
+                except OSError:
+                    pass
+
+            # 3. Apply GTK theme via gsettings (Linux only, non-blocking)
+            ThemeService._apply_gtk(preset)
+
+            logger.info("Theme applied: %s", theme_id)
+
+            # Single notification path: EventBus → WAMP → all subsystems
+            # LiquidUI subscribes to 'theme.changed' on the EventBus
+            try:
+                from core.platform.events import emit_event
+                emit_event('theme.changed', {'theme_id': theme_id, 'preset': preset})
+            except Exception:
                 pass
 
-        # 3. Apply GTK theme via gsettings (Linux only, non-blocking)
-        ThemeService._apply_gtk(preset)
+        # Palette overlay: secondary accent (a2) + custom colours -> persisted via
+        # the SAME custom-overrides mechanism (reuse, not fork).
+        overlay = ThemeService._palette_overrides(secondary_accent, custom)
+        if overlay:
+            ThemeService.update_custom(overlay)
 
-        logger.info("Theme applied: %s", theme_id)
+        if preset:
+            return {'status': 'applied', 'theme_id': theme_id, 'theme': preset,
+                    'custom': overlay or None}
+        if overlay:
+            return {'status': 'customized', 'overrides': overlay}
+        return {'error': 'theme_id required'}
 
-        # Single notification path: EventBus → WAMP → all subsystems
-        # LiquidUI subscribes to 'theme.changed' on the EventBus
-        try:
-            from core.platform.events import emit_event
-            emit_event('theme.changed', {'theme_id': theme_id, 'preset': preset})
-        except Exception:
-            pass
+    @staticmethod
+    def _palette_overrides(secondary_accent: Optional[str],
+                           custom: Optional[dict]) -> dict:
+        """Build a colour override dict from a palette apply (accent / secondary /
+        background + a2 + the ambient quad ambient_1..4). Normalizes '#rrggbb' or
+        'rrggbb' consistently (stored WITH the leading '#', which get_css_variables
+        detects). Returns {} when empty.
 
-        return {'status': 'applied', 'theme_id': theme_id, 'theme': preset}
+        The ambient quad is a MOOD (hartPersonalize paintPalette writes --hart-amb-1..4
+        live; this carries the same four hues server-side so the mood survives a hard
+        reload). It rides the SAME custom-overrides path as accent/secondary — no fork:
+        update_custom deep-merges these color keys and get_css_variables re-emits them
+        as --hart-amb-N(-rgb) on next load."""
+        colors: Dict[str, str] = {}
+        if isinstance(custom, dict):
+            for key in ('accent', 'secondary', 'background',
+                        'ambient_1', 'ambient_2', 'ambient_3', 'ambient_4'):
+                val = custom.get(key)
+                if isinstance(val, str) and val.strip():
+                    colors[key] = ThemeService._norm_hex(val)
+        if isinstance(secondary_accent, str) and secondary_accent.strip():
+            colors.setdefault('secondary', ThemeService._norm_hex(secondary_accent))
+        return {'colors': colors} if colors else {}
+
+    @staticmethod
+    def _norm_hex(val: str) -> str:
+        """Normalize a colour to '#rrggbb' (leave rgba()/named values untouched)."""
+        val = val.strip()
+        if val.startswith('#') or val.startswith('rgb'):
+            return val
+        return '#' + val
 
     # ── Agent-Driven Customization ───────────────────────────────
 
@@ -208,6 +275,7 @@ class ThemeService:
         """Available font families for customization."""
         return [
             {'family': 'JetBrains Mono', 'category': 'monospace'},
+            {'family': 'Space Grotesk', 'category': 'sans-serif', 'role': 'display'},
             {'family': 'Inter', 'category': 'sans-serif'},
             {'family': 'Fira Code', 'category': 'monospace'},
             {'family': 'IBM Plex Sans', 'category': 'sans-serif'},
@@ -220,12 +288,35 @@ class ThemeService:
     # ── Performance Auto-Detection ──────────────────────────────
 
     @staticmethod
-    def detect_performance_tier() -> str:
-        """Detect hardware tier and return recommended theme.
+    def _gpu_render_verdict() -> str:
+        """The GPU render verdict hart-gpu-probe wrote to /run/hart/gpu-render
+        ('hardware' | 'software' | ''). This is the SAME file contract
+        liquid_ui_service.read_gpu_render_mode reads; theme_service reads the
+        file DIRECTLY (not via that function) to avoid importing the higher
+        shell layer (circular). Absent/unreadable -> '' (unknown)."""
+        try:
+            with open('/run/hart/gpu-render', 'r', encoding='utf-8') as f:
+                return f.read().strip().lower()
+        except (OSError, ValueError):
+            return ''
 
-        Returns theme ID: 'potato' for OBSERVER/EMBEDDED,
-        'minimal' for LITE, None for STANDARD+.
+    @staticmethod
+    def detect_performance_tier() -> str:
+        """Detect hardware tier and return the recommended theme ID, or None for
+        aura (the shipped default) on graphics-capable hardware.
+
+        The theme is a GRAPHICS choice, so the GPU render verdict is its ground
+        truth: a node whose GPU created a real GL context (hardware) can run the
+        aura cinematic regardless of its NETWORK/RAM tier. Real-HW 2026-07-18:
+        an i915-KabyLake Lenovo with `gpu: hardware` (display live, snappy) was
+        wrongly getting potato because get_tier() classed it OBSERVER (a
+        RAM/network tier, orthogonal to graphics). Honour the GPU verdict FIRST.
+        Only fall to the conservative tier/CPU heuristics when the GPU is NOT
+        confirmed hardware (software floor or no probe).
         """
+        if ThemeService._gpu_render_verdict() == 'hardware':
+            return None  # capable GPU -> aura, whatever the network tier says
+
         try:
             from security.system_requirements import get_tier, NodeTierLevel
             tier = get_tier()
@@ -272,8 +363,8 @@ class ThemeService:
             logger.info("Auto-selecting theme '%s' for hardware", recommended)
             return ThemeService.apply_theme(recommended)
 
-        # Default to hart-default for capable hardware
-        return ThemeService.apply_theme('hart-default')
+        # Default to aura for capable hardware (the shipped OS boot theme)
+        return ThemeService.apply_theme('aura')
 
     # ── Conky Integration ────────────────────────────────────────
 
@@ -313,8 +404,45 @@ class ThemeService:
         except (ValueError, IndexError):
             on_accent = '#ffffff'
         lines.append(f'  --hart-on-accent: {on_accent};')
+        # Secondary brand accent (a2) — the shell reads --hart-a2 / --hart-a2-rgb
+        # (the Vibrant duotone). A palette apply persists colors.secondary; emit it
+        # under the canonical var name (NOT --hart-secondary, which nothing reads),
+        # plus its rgb triple so glows/rings can tint. Only when set (else the
+        # hartResponsive.css :root default violet stands).
+        secondary = (colors.get('secondary') or '').lstrip('#')
+        if secondary:
+            lines.append(f'  --hart-a2: #{secondary};')
+            try:
+                sr, sg, sb = (int(secondary[0:2], 16), int(secondary[2:4], 16),
+                              int(secondary[4:6], 16))
+                lines.append(f'  --hart-a2-rgb: {sr},{sg},{sb};')
+            except (ValueError, IndexError):
+                pass
+        # Ambient aurora field hue roles (--hart-amb-1..4 + their rgb triples). The
+        # drifting brand blooms that carry the desktop's "cosmic richness" were HARDCODED
+        # rgba in the CSS, so a palette/mood change never retinted them (the "not liquid
+        # enough" gap, 2026-07-12). Emitting them as theme vars makes the WHOLE ambient
+        # field reskinnable: a preset/mood (e.g. the Aura design = violet-lead) retints it
+        # by setting colors.ambient_1..4; the .hart-ambient blobs read rgba(var(--hart-amb-
+        # N-rgb), a). Defaults are the HART brand ambient, so an unset theme is visually
+        # UNCHANGED. This is step 1 of the design-agnostic runtime (LIQUID_UI_AGENTIC_
+        # FRAMEWORK_PLAN.md); the steward hybrid points these at violet/cyan/rose/amber
+        # while --hart-accent stays teal on functional signifiers.
+        _amb_defaults = ('00E6C3', '9B5CFF', '29C5FF', 'FF2E9A')
+        for i, dflt in enumerate(_amb_defaults, start=1):
+            hexv = (colors.get(f'ambient_{i}') or dflt).lstrip('#')
+            lines.append(f'  --hart-amb-{i}: #{hexv};')
+            try:
+                ar, ag, ab = int(hexv[0:2], 16), int(hexv[2:4], 16), int(hexv[4:6], 16)
+                lines.append(f'  --hart-amb-{i}-rgb: {ar},{ag},{ab};')
+            except (ValueError, IndexError):
+                pass
         # Font
         lines.append(f'  --hart-font-family: "{font.get("family", "JetBrains Mono")}";')
+        # Display/heading face (Aura = Space Grotesk). Falls back to the family stack
+        # when a theme omits it, so an unset theme keeps today's look. The mono face is
+        # the css --hart-font-mono (hartResponsive.css) — do NOT emit a second mono var.
+        lines.append(f'  --hart-font-display: "{font.get("display", font.get("family", "JetBrains Mono"))}";')
         lines.append(f'  --hart-font-size: {font.get("size", 13)}px;')
         lines.append(f'  --hart-heading-size: {font.get("heading_size", 18)}px;')
         lines.append(f'  --hart-font-weight: {font.get("weight", 400)};')
@@ -324,10 +452,25 @@ class ThemeService:
         lines.append(f'  --hart-saturation: {shell.get("saturation", 180)}%;')
         lines.append(f'  --hart-radius: {shell.get("border_radius", 16)}px;')
         lines.append(f'  --hart-panel-opacity: {shell.get("panel_opacity", 0.65)};')
+        # Themable glass BASE rgb (the Opacity slider + Aura's lighter glass): the CSS
+        # --hart-glass-bg is rgba(var(--hart-glass-rgb), var(--hart-panel-opacity)).
+        # A preset carrying shell.glass_rgb (Aura = "255,255,255" white glass) must
+        # reach the DOM to override the hartResponsive.css :root fallback; without this
+        # emit the base was frozen at the CSS default and glass_rgb was a dead field.
+        # Default == that same fallback (18,19,28), so a preset that omits it is
+        # pixel-identical. One writer, extends the shell-var emitter (no parallel path).
+        lines.append(f'  --hart-glass-rgb: {shell.get("glass_rgb", "18,19,28")};')
         lines.append(f'  --hart-topbar-height: {shell.get("topbar_height", 40)}px;')
         lines.append(f'  --hart-icon-size: {shell.get("icon_size", 20)}px;')
         lines.append(f'  --hart-titlebar-height: {shell.get("panel_titlebar_height", 32)}px;')
         lines.append(f'  --hart-anim-speed: {shell.get("animation_speed_ms", 200)}ms;')
+        # Glow intensity (accent glow / ring bloom, 0-100) + density (spacing scale
+        # multiplier: 0.85 compact / 1.0 cozy / 1.15 comfy). Both default sensibly so a
+        # preset that omits them is unaffected. The shell reads --hart-glow to scale
+        # accent glows (and MUST drop the expensive bloom on the software-render floor)
+        # and --hart-density to scale spacing.
+        lines.append(f'  --hart-glow: {shell.get("glow", 40)};')
+        lines.append(f'  --hart-density: {shell.get("density", 1)};')
         lines.append('}')
         return '\n'.join(lines)
 

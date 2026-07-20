@@ -90,7 +90,7 @@ def _http_get(url: str, timeout: int = _HEALTH_CHECK_TIMEOUT) -> Any:
         resp.raise_for_status()
         return resp.json()
     except Exception:
-        pass
+        logger.exception("_http_get: swallowed Exception")
 
     # Fallback: stdlib urllib (zero dependencies)
     try:
@@ -516,7 +516,7 @@ class LlamaCppManager:
                 params['ctx_size'] = 2048
                 logger.info("Capping ctx_size to 2048 (only %.1fGB RAM available)", avail_gb)
         except ImportError:
-            pass
+            logger.debug("get_optimal_params: swallowed ImportError")
 
         return params
 
@@ -690,7 +690,7 @@ class LlamaCppManager:
                     if stderr:
                         logger.error(f"llama-server stderr: {stderr[:1000]}")
                 except Exception:
-                    pass
+                    logger.exception("_wait_for_health: swallowed Exception")
                 return False
 
             if self._check_health():

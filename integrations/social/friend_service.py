@@ -67,6 +67,28 @@ class FriendService:
     # ── Sending / responding ─────────────────────────────────────
 
     @staticmethod
+    def _sync_friendship(db, friendship_id: str):
+        """Up-sync a friendship edge (P3) — PII social graph; the registry gate
+        requires the initiator's cloud_egress consent. Best-effort, never blocks
+        the local write."""
+        try:
+            from sqlalchemy import text
+            from .sync_engine import SyncEngine
+            row = db.execute(text(
+                "SELECT id, user_a_id, user_b_id, status, initiator_id, "
+                "created_at, accepted_at FROM friendships WHERE id = :id"),
+                {'id': friendship_id}).fetchone()
+            if row is None:
+                return
+            SyncEngine.queue_entity(db, {
+                'id': row[0], 'user_a_id': row[1], 'user_b_id': row[2],
+                'status': row[3], 'initiator_id': row[4],
+                'created_at': str(row[5]) if row[5] is not None else None,
+                'accepted_at': str(row[6]) if row[6] is not None else None})
+        except Exception:
+            pass
+
+    @staticmethod
     def send_request(db, from_user_id: str, to_user_id: str,
                      tenant_id: Optional[str] = None) -> dict:
         """Create a pending Friendship row and notify the recipient.
@@ -129,6 +151,7 @@ class FriendService:
              'i': from_user_id})
         db.commit()
         FriendService._notify_request(db, fid, from_user_id, to_user_id)
+        FriendService._sync_friendship(db, fid)
         return {'id': fid, 'status': 'pending'}
 
     @staticmethod
@@ -162,6 +185,7 @@ class FriendService:
             "UPDATE friendships SET status='active', "
             "accepted_at=CURRENT_TIMESTAMP WHERE id = :id"),
             {'id': friendship_id})
+        FriendService._sync_friendship(db, friendship_id)
 
         # Auto-create reciprocal Follow rows so downstream code
         # reading the follow graph (feed ranking, recommendations)

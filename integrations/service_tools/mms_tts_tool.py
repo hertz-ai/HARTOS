@@ -28,6 +28,7 @@ Public API (parent side):
   unload_mms_tts() → None
 """
 
+import logging
 from typing import Optional
 
 import os
@@ -99,7 +100,7 @@ def _try_uromanize(text: str) -> Optional[str]:
         u = _uroman_pkg.Uroman()
         return u.romanize_string(text)
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("_try_uromanize: swallowed Exception")
 
     # Perl repo via UROMAN env var
     uroman_root = os.environ.get('UROMAN')
@@ -118,7 +119,7 @@ def _try_uromanize(text: str) -> Optional[str]:
                     out = proc.stdout.decode('utf-8', errors='replace')
                     return out.rstrip('\n')
             except Exception:
-                pass
+                logging.getLogger(__name__).exception("_try_uromanize: swallowed Exception")
 
     return None
 
@@ -187,7 +188,7 @@ def _synthesize(state, req: dict) -> dict:
                 try:
                     model = model.to('cuda')
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).exception("_synthesize: swallowed Exception")
             state.cache[iso3] = (tokenizer, model)
         except Exception as e:
             return {
@@ -221,7 +222,7 @@ def _synthesize(state, req: dict) -> dict:
         try:
             inputs = {k: v.to('cuda') for k, v in inputs.items()}
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("_synthesize: swallowed Exception")
 
     import torch
     with torch.no_grad():

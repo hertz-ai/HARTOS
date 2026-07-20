@@ -49,10 +49,21 @@ def test_marketplace_js_reuses_installer_and_agent():
     assert 'window.hartRenderMarketplace =' in src
     assert "'/api/apps/install'" in src            # reuse the real installer
     assert "'/api/apps/search?q='" in src          # reuse the real search
+    assert "'/api/apps/installed'" in src          # reuse the real installed-apps source (no parallel list)
     assert 'window.acSend' in src                  # AI-native fallback via agent
     # A real curated catalog (Flathub ids), not an empty store.
     assert "id: 'org.mozilla.firefox'" in src
     assert src.count("id: '") >= 15                # 15+ curated free apps
+
+
+def test_marketplace_install_gives_honest_feedback():
+    """Install must report off the REAL server response (not a fire-and-forget
+    'Installing' toast even on failure). Behaviour is exercised by the .mjs
+    harness; this guards that the response branches exist + stay wired."""
+    src = open(os.path.join(STATIC, 'hartMarketplace.js'), encoding='utf-8').read()
+    assert 'res.success' in src                    # success path read from response
+    assert 'res.staged' in src                     # staged (downloaded, not applied) path
+    assert "'success'" in src and "'error'" in src  # honest toast severities
 
 
 if __name__ == '__main__':

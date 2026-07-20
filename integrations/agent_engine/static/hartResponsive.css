@@ -1,0 +1,632 @@
+/* HART OS — Responsive shell layer (hartResponsive.css)
+ * ─────────────────────────────────────────────────────────────────────────
+ * Media-query-ONLY overrides that make the pixel-fixed glass shell adapt across
+ * phone / tablet / desktop / ultrawide. Loaded AFTER the inline <style> so it
+ * wins on source order. !important is used ONLY where a rule must beat an inline
+ * pixel style (openPanel writes .panel left/top/width/height inline).
+ *
+ * Desktop (>1024px) is intentionally UNTOUCHED — every rule lives inside a
+ * width media query, so the proven desktop baseline cannot regress.
+ */
+
+/* ── Tablet & below: keep windows from overflowing the viewport ──────────── */
+@media (max-width: 1024px) {
+  .panel { max-width: 100vw; }
+  .start-menu { width: min(720px, 94vw) !important; }
+}
+
+/* ── Phone / narrow (<=720px): fullscreen windows + reflow the chrome ─────── */
+@media (max-width: 720px) {
+  /* Windows become fullscreen sheets — same geometry toggleMax already uses.
+     This ALSO shrinks each panel's container to the phone width, which trips
+     the file-explorer's own ResizeObserver into its narrow (drawer) layout. */
+  .panel {
+    left: 0 !important;
+    top: var(--hart-topbar-height, 40px) !important;
+    width: 100vw !important;
+    height: calc(100vh - var(--hart-topbar-height, 40px) - 44px) !important;
+    min-width: 0 !important;
+    border-radius: 0 !important;
+  }
+  .panel-resize { display: none !important; }
+
+  /* Command center: smaller orb, lifted, full-width command bar. */
+  .hart-hero { top: 38%; width: 94vw; }
+  .hart-hero-orbwrap { width: 184px; height: 184px; }
+  .hart-hero-bar { width: 100%; }
+  .hart-hero-status { font-size: 13px; }
+
+  /* Secondary clock/system widgets would collide with the hero; the top bar
+     already carries the time, so collapse the rail on phones. */
+  .hart-widgets { display: none !important; }
+
+  /* Free-floating desktop icons -> a scrollable bottom app dock (no overlap). */
+  .hart-desktop {
+    pointer-events: auto;
+    top: auto !important;
+    bottom: 44px;
+    height: 90px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    z-index: 25;
+  }
+  .hart-desktop .desktop-icon {
+    position: static !important;
+    left: auto !important;
+    top: auto !important;
+    flex: 0 0 auto;
+    width: 66px;
+  }
+
+  /* Start menu becomes a near-fullscreen launcher. */
+  .start-menu {
+    width: 96vw !important;
+    left: 2vw !important;
+    max-height: calc(100vh - var(--hart-topbar-height, 40px) - 60px) !important;
+  }
+}
+
+/* ── Ultrawide: stop the command center from stranding dead-center ───────── */
+@media (min-width: 2200px) {
+  .hart-hero { top: 44%; }
+  .hart-hero-orbwrap { width: 340px; height: 340px; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * DESIGN OVERHAUL v3 CINEMATIC (2026-06-28) — "Netflix Home" for HART OS.
+ * Evolves the v2 futuristic-glass pass. The steward: make the whole desktop
+ * "look + move like NETFLIX HOME: cinematic, immersive, premium, 100x optimal
+ * and crazy to see" — and explicitly REJECTED single-hue teal: weave the full
+ * Hevolve brand SPECTRUM tastefully across cards/accents/gradients.
+ *
+ * This file loads LAST (after the inline <style>'s _CSS_LIVING_GLASS), so it
+ * wins on source order WITHOUT touching any markup / ID / class name. It
+ * REUSES the existing --lg-* glass/glow/motion tokens and --t-* durations
+ * rather than forking a second motion grammar; the only NEW tokens it adds are
+ * the brand spectrum (--hv-*), which had no single source before (the ambient
+ * used ad-hoc rgba). A user's saved wallpaper/theme (inline element style)
+ * still wins — this only re-skins the DEFAULT look.
+ *
+ * Motion law: GPU-only (transform / opacity / filter), 60fps, cubic-bezier
+ * ~(.2,.8,.2,1) for the signature Netflix card-focus lift. Every non-essential
+ * animation is disabled under prefers-reduced-motion / html.a11y-rmotion.
+ * The orb canvas is NOT animated here (Stream B owns it) — only its surrounding
+ * ambient/space is made cinematic, all on non-orb elements.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+:root {
+  /* UI text = humanist sans (system fonts, no network asset needed on the ISO);
+     mono kept ONLY for metrics/code via --hart-font-mono. (kept from v2) */
+  --hart-font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+  --hart-font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
+  --hart-background: #05060C;   /* deep blue-black, matches the mockup canvas #05070d (was #07070B, read lighter/purpler) */
+  --hart-text: #ECF1F4;
+  --hart-muted: #8A93A6;
+  --hart-surface: #14141F;
+  --hart-surface-hover: #20212F;
+  /* Glass fill is ONE value with ONE writer: the base RGB triple (--hart-glass-rgb)
+     times the theme opacity (--hart-panel-opacity, emitted by theme_service). This makes
+     the Opacity slider real without a parallel literal. Inline defaults reproduce the
+     old rgba(18,19,28,0.56) look 1:1 when unset (0.56, not the emitter's 0.65 default,
+     so an UN-themed shell is pixel-identical to before). */
+  --hart-glass-rgb: 18,19,28;
+  --hart-glass-bg: rgba(var(--hart-glass-rgb,18,19,28), var(--hart-panel-opacity,0.56));
+  --hart-glass-border: rgba(255,255,255,0.09);
+  --hart-blur: 30px;
+  --hart-saturation: 165%;
+  --hart-radius: 20px;
+  /* --hart-accent-rgb is DELIBERATELY NOT declared here. It is emitted by the
+     server from the ACTIVE THEME's accent (liquid_ui_service accent_rgb_css,
+     always emitted -- theme value or the brand fallback). This stylesheet loads
+     LAST and would win on source order, so a static declaration here FROZE every
+     rgba(var(--hart-accent-rgb),A) glow at one hue and silently killed live
+     retinting for the palette picker (CH1) and every non-default theme -- the
+     accent surfaces below (.di-glyph glow, .desktop-icon.selected, focus rings,
+     the pulse keyframe) could never follow the theme. Found by the CSS parity
+     ledger audit, 2026-07-20. Do NOT re-add it: declare defaults server-side. */
+  /* Secondary brand accent (a2) — the VIBRANT duotone default (b1.2): teal LEADS,
+     violet ACCENTS. This makes "Vibrant" the shell brand default without JS; the
+     Personalize palette picker (hartPersonalize.js #161) overrides both live. */
+  --hart-a2: #9B5CFF;
+  --hart-a2-rgb: 155,92,255;
+  /* ── HEVOLVE BRAND SPECTRUM (single source; the steward's 6 hues) ── */
+  --hv-teal:    #00E6C3;  --hv-teal-rgb:    0,230,195;
+  --hv-cyan:    #29C5FF;  --hv-cyan-rgb:    41,197,255;
+  --hv-blue:    #3B82F6;  --hv-blue-rgb:    59,130,246;
+  --hv-violet:  #9B5CFF;  --hv-violet-rgb:  155,92,255;
+  --hv-magenta: #FF2E9A;  --hv-magenta-rgb: 255,46,154;
+  --hv-amber:   #FFC83D;  --hv-amber-rgb:   255,200,61;
+  /* The signature Netflix focus easing + a slightly slower "cinematic" reveal. */
+  --hv-focus: cubic-bezier(.2,.8,.2,1);
+  --hv-lift: 380ms;
+}
+
+/* ── Cinematic base: near-black canvas + spectrum bloom + a soft vignette.
+   These layers paint UNDER the chrome (.wallpaper is z-index:0 in the shell).
+   Multi-hue, never one teal wash — a faint ambient bloom anchored to corners. */
+.wallpaper {
+  background:
+    radial-gradient(46% 40% at 12% 6%,  rgba(var(--hart-amb-1-rgb, 0,230,195),0.13),  transparent 62%),
+    radial-gradient(40% 38% at 88% 10%, rgba(var(--hart-amb-3-rgb, 41,197,255),0.11), transparent 64%),
+    radial-gradient(52% 50% at 94% 94%, rgba(var(--hart-amb-2-rgb, 155,92,255),0.15), transparent 64%),
+    radial-gradient(44% 42% at 8%  92%, rgba(var(--hart-amb-4-rgb, 255,46,154),0.10), transparent 66%),
+    radial-gradient(34% 30% at 50% 40%, rgba(var(--hv-blue-rgb, 59,130,246),0.07), transparent 70%),
+    radial-gradient(130% 100% at 50% 128%, rgba(10,12,26,0.62), transparent 72%),
+    linear-gradient(158deg, #06070D 0%, #04050A 52%, #070610 100%);  /* deep blue-black, mockup #05070d (was lighter/purpler) */
+}
+/* Cinematic vignette — frames the screen, content-forward (purely additive,
+   pointer-events:none so it never blocks the desktop; sits above wallpaper). */
+.wallpaper::after {
+  content: ''; position: fixed; inset: 0; z-index: 1; pointer-events: none;
+  background:
+    radial-gradient(135% 120% at 50% 34%, transparent 52%, rgba(0,0,0,0.22) 82%, rgba(0,0,0,0.46) 100%);
+}
+
+/* ── Frosted glass with real depth: inner top highlight + soft outer shadow +
+   hairline. Generous, cinematic. (chrome surfaces) ── */
+.glass, .panel, .top-bar, .hart-hero-bar, .start-menu, .ctx-menu, .agent-pill {
+  border: 1px solid var(--hart-glass-border);
+  box-shadow: 0 26px 76px rgba(0,0,0,0.52), inset 0 1px 0 rgba(255,255,255,0.06);
+  backdrop-filter: blur(var(--hart-blur)) saturate(var(--hart-saturation));
+  -webkit-backdrop-filter: blur(var(--hart-blur)) saturate(var(--hart-saturation));
+}
+/* Radius wiring: --hart-radius was emitted (theme_service :408) but NO panel consumed
+   it — the Radius slider was dead. Bind it on the rounded glass surfaces so the slider
+   is real. Default 20px == today's card look → unset shell is unchanged. Deliberately
+   EXCLUDES .top-bar (a position:fixed full-width banner that sets its own border-radius:0
+   in the shell inline <style>, which loads BEFORE this file — rounding it would notch the
+   screen corners) and .hart-hero-bar (keeps its own 32px pill at :329). */
+.glass, .panel, .start-menu, .ctx-menu, .agent-pill {
+  border-radius: var(--hart-radius, 20px);
+}
+
+/* ════════ NETFLIX HOVER-EXPAND — the signature card-focus feel ════════
+   Tiles / panels / cards SCALE UP + lift + glow + raise z on hover AND on
+   keyboard focus-within. GPU-only (transform), smooth --hv-focus easing.
+   Each surface keeps its own transition for its other props; we add the lift. */
+
+/* App-rail icon tiles: raise z + brighten on hover/focus. The visible LIFT is
+   animated on the inner .di-glyph (below), NOT on the .desktop-icon wrapper. The
+   wrapper's transform channel is owned by the drag handler (hartDesktop.js writes
+   el.style.transform = translate(dx,dy) every frame and clears it on drop), so a
+   `transition: transform` here would interpolate every drag frame (lag) and
+   overshoot on release. will-change:transform still promotes the wrapper for a
+   GPU-composited drag. */
+.desktop-icon {
+  transition: background .18s var(--hv-focus);
+  will-change: transform;
+}
+.desktop-icon:hover,
+.desktop-icon:focus-within { z-index: 40; }
+.desktop-icon.dragging { z-index: 60; }   /* drag still wins over hover lift */
+
+/* The glyph plate itself: depth + a spectrum sheen overlay (::after) that does
+   NOT fight the per-app inline style.background hartDesktop.js writes — the
+   pseudo layers a brand-hue wash ON TOP, so the rail reads colorful + alive. */
+.desktop-icon .di-glyph {
+  position: relative;
+  border: 1px solid var(--hart-glass-border);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.12), 0 10px 24px rgba(0,0,0,0.34);
+  border-radius: 16px; overflow: hidden;
+  transition: transform var(--hv-lift) var(--hv-focus), box-shadow var(--hv-lift) var(--hv-focus);
+}
+.desktop-icon .di-glyph::after {
+  content: ''; position: absolute; inset: 0; pointer-events: none; z-index: 0;
+  border-radius: inherit; mix-blend-mode: screen; opacity: .55;
+  transition: opacity var(--hv-lift) var(--hv-focus);
+}
+/* The glyph + label ride above the sheen. */
+.desktop-icon .di-glyph .mi,
+.desktop-icon .di-glyph .di-emoji { position: relative; z-index: 1; }
+.desktop-icon:hover .di-glyph,
+.desktop-icon:focus-within .di-glyph { transform: translateY(-5px) scale(1.05); }
+.desktop-icon:hover .di-glyph::after,
+.desktop-icon:focus-within .di-glyph::after { opacity: .85; }
+
+/* Per-nth-child BRAND-HUE gradient sheen + matching hover glow — cycles the 6
+   spectrum hues so a row of identical-looking tiles still feels like a spectrum,
+   not one teal. The glyph itself keeps the per-app manifest colour underneath. */
+.desktop-icon:nth-child(6n+1) .di-glyph::after { background: linear-gradient(150deg, rgba(var(--hv-teal-rgb),.40),    transparent 72%); }
+.desktop-icon:nth-child(6n+2) .di-glyph::after { background: linear-gradient(150deg, rgba(var(--hv-cyan-rgb),.40),    transparent 72%); }
+.desktop-icon:nth-child(6n+3) .di-glyph::after { background: linear-gradient(150deg, rgba(var(--hv-blue-rgb),.40),    transparent 72%); }
+.desktop-icon:nth-child(6n+4) .di-glyph::after { background: linear-gradient(150deg, rgba(var(--hv-violet-rgb),.42),  transparent 72%); }
+.desktop-icon:nth-child(6n+5) .di-glyph::after { background: linear-gradient(150deg, rgba(var(--hv-magenta-rgb),.40), transparent 72%); }
+.desktop-icon:nth-child(6n+6) .di-glyph::after { background: linear-gradient(150deg, rgba(var(--hv-amber-rgb),.40),   transparent 72%); }
+.desktop-icon:nth-child(6n+1):hover .di-glyph, .desktop-icon:nth-child(6n+1):focus-within .di-glyph { box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 14px 34px rgba(var(--hv-teal-rgb),.36); }
+.desktop-icon:nth-child(6n+2):hover .di-glyph, .desktop-icon:nth-child(6n+2):focus-within .di-glyph { box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 14px 34px rgba(var(--hv-cyan-rgb),.36); }
+.desktop-icon:nth-child(6n+3):hover .di-glyph, .desktop-icon:nth-child(6n+3):focus-within .di-glyph { box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 14px 34px rgba(var(--hv-blue-rgb),.36); }
+.desktop-icon:nth-child(6n+4):hover .di-glyph, .desktop-icon:nth-child(6n+4):focus-within .di-glyph { box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 14px 34px rgba(var(--hv-violet-rgb),.40); }
+.desktop-icon:nth-child(6n+5):hover .di-glyph, .desktop-icon:nth-child(6n+5):focus-within .di-glyph { box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 14px 34px rgba(var(--hv-magenta-rgb),.38); }
+.desktop-icon:nth-child(6n+6):hover .di-glyph, .desktop-icon:nth-child(6n+6):focus-within .di-glyph { box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 14px 34px rgba(var(--hv-amber-rgb),.36); }
+.desktop-icon .di-glyph .mi { filter: drop-shadow(0 0 9px rgba(var(--hart-accent-rgb),0.40)); }
+
+/* Marketplace app cards — Netflix-grade focus expand + colored lift. */
+.hart-app-card {
+  transition: transform var(--hv-lift) var(--hv-focus), box-shadow var(--hv-lift) var(--hv-focus), border-color .2s var(--hv-focus);
+  will-change: transform;
+}
+.hart-app-card:hover,
+.hart-app-card:focus-within {
+  transform: translateY(-8px) scale(1.025);
+  border-color: rgba(var(--hv-cyan-rgb),0.55);
+  box-shadow: inset 0 1px 0 0 rgba(255,255,255,0.12), 0 22px 54px rgba(0,0,0,0.46), 0 0 40px rgba(var(--hv-cyan-rgb),0.18);
+  z-index: 2;
+}
+
+/* Start-menu app tiles + wallpaper/theme gallery tiles: the same focus lift. */
+.start-item {
+  transition: background var(--t-fast, .18s) var(--hv-focus), transform var(--hv-lift) var(--hv-focus), box-shadow var(--hv-lift) var(--hv-focus);
+}
+.start-item:hover,
+.start-item:focus-within {
+  transform: translateY(-3px) scale(1.04);
+  box-shadow: 0 12px 30px rgba(0,0,0,0.40), 0 0 22px rgba(var(--hv-violet-rgb),0.20);
+}
+.hart-tile:hover,
+.hart-tile:focus-within { transform: translateY(-5px) scale(1.03); }
+.hart-tile:hover .htc-prev,
+.hart-tile:focus-within .htc-prev { box-shadow: 0 16px 38px rgba(0,0,0,0.42), 0 0 26px rgba(var(--hv-cyan-rgb),0.22); }
+
+/* ════════ IMAGE-CARD SCRIM + POSTER-ZOOM - text-over-art, cinematic ════════
+   .htc-prev is the real art surface (gradient swatch OR an appended <img>;
+   base sets position:relative + overflow:hidden, so a pseudo scrim + an image
+   zoom both clip cleanly). The scrim is a bottom-anchored gradient that darkens
+   the lower third: any label, status dot, or agent-composed caption laid OVER
+   the art stays readable, and the poster gains cinematic depth. Pure gradient,
+   no motion. No :has() (old WebKitGTK on the cage shell can't parse it), so the
+   scrim is gentle enough to flatter solid theme swatches too. */
+.hart-tile .htc-prev::after {
+  content: ''; position: absolute; inset: 0; z-index: 1; pointer-events: none;
+  border-radius: inherit;
+  background: linear-gradient(to top, rgba(5,6,12,0.52) 0%, rgba(5,6,12,0.14) 36%, transparent 62%);
+  opacity: .92; transition: opacity var(--t-fast, .18s) var(--hv-focus);
+}
+.hart-tile:hover .htc-prev::after,
+.hart-tile:focus-within .htc-prev::after { opacity: 1; }
+/* The status dot + any caption ride ABOVE the scrim; the image rides below it. */
+.hart-tile .htc-prev > .htc-dot { z-index: 2; }
+.hart-tile .htc-prev > img { z-index: 0; }
+/* Netflix poster-zoom: the art scales within its clipped frame on hover/focus.
+   <img> only (gradient/theme swatches have no child image, so they're untouched).
+   GPU-only transform; disabled under reduced motion below. */
+.hart-tile .htc-prev > img {
+  transition: transform var(--hv-lift) var(--hv-focus);
+  will-change: transform;
+}
+.hart-tile:hover .htc-prev > img,
+.hart-tile:focus-within .htc-prev > img { transform: scale(1.08); }
+
+/* Reusable TEXT-OVER-ART primitive - vocabulary the local LLM composes with via
+   agent_ui_update (Liquid UI is agentic; this is NOT a static page, just the
+   paint the agent reaches for). Wrap any image/gradient block in .hv-art and put
+   a caption in .hv-art-cap: the art clips + zooms on hover, the scrim guarantees
+   the caption reads, exactly like the .htc-prev poster above. Cascade-safe: only
+   activates on elements the agent explicitly tags .hv-art. */
+.hv-art {
+  position: relative; overflow: hidden; border-radius: var(--hart-radius, 18px);
+  transition: transform var(--hv-lift) var(--hv-focus), box-shadow var(--hv-lift) var(--hv-focus);
+  will-change: transform;
+}
+.hv-art > img { display: block; width: 100%; height: 100%; object-fit: cover; transition: transform var(--hv-lift) var(--hv-focus); }
+.hv-art::after {
+  content: ''; position: absolute; inset: 0; z-index: 1; pointer-events: none; border-radius: inherit;
+  background: linear-gradient(to top, rgba(4,5,11,0.74) 0%, rgba(4,5,11,0.30) 30%, transparent 58%);
+}
+.hv-art-cap {
+  position: absolute; left: 14px; right: 14px; bottom: 12px; z-index: 2;
+  color: #fff; text-shadow: 0 1px 12px rgba(0,0,0,0.66);
+}
+.hv-art:hover, .hv-art:focus-within {
+  transform: translateY(-6px) scale(1.02); z-index: 3;
+  box-shadow: 0 24px 58px rgba(0,0,0,0.50), 0 0 40px rgba(var(--hv-cyan-rgb),0.18);
+}
+.hv-art:hover > img, .hv-art:focus-within > img { transform: scale(1.07); }
+
+/* Open windows: a gentle focus glow when interacted with (does not move them —
+   panels are user-dragged, so only the shadow/border breathe, never transform). */
+.panel:focus-within {
+  border-color: rgba(var(--hv-cyan-rgb),0.30);
+  box-shadow: 0 30px 86px rgba(0,0,0,0.58), inset 0 1px 0 rgba(255,255,255,0.07), 0 0 36px rgba(var(--hv-cyan-rgb),0.12);
+}
+
+/* Fix the off-brand flat-purple selection -> spectrum teal (kept from v2). */
+.desktop-icon.selected {
+  background: rgba(var(--hart-accent-rgb),0.16) !important;
+  outline: 1px solid rgba(var(--hart-accent-rgb),0.50) !important;
+  box-shadow: 0 10px 32px rgba(var(--hart-accent-rgb),0.28) !important;
+}
+
+/* ════════ COMMAND BAR — premium frosted pill with a living accent ════════ */
+.hart-hero-bar {
+  border-radius: 32px;
+  box-shadow: 0 20px 56px rgba(0,0,0,0.46), inset 0 1px 0 rgba(255,255,255,0.07);
+}
+.hart-hero-bar:focus-within {
+  border-color: rgba(var(--hart-accent-rgb),0.55);
+  box-shadow: 0 0 0 1px rgba(var(--hart-accent-rgb),0.40), 0 0 30px rgba(var(--hart-accent-rgb),0.26), 0 20px 56px rgba(0,0,0,0.46);
+}
+/* The send button: spectrum sheen + a subtle LIVING glow pulse (filter/opacity
+   only — never the orb). Pulses gently so the accent feels alive, not static. */
+.hart-hero-go {
+  background: linear-gradient(135deg, var(--hv-teal), var(--hv-cyan)) !important;
+  box-shadow: 0 0 20px rgba(var(--hart-accent-rgb),0.48);
+  animation: hv-accent-breathe 3.6s var(--lg-breathe, ease-in-out) infinite;
+}
+.hart-hero-go:hover { filter: brightness(1.12) saturate(1.1); }
+@keyframes hv-accent-breathe {
+  0%, 100% { box-shadow: 0 0 18px rgba(var(--hart-accent-rgb),0.40); }
+  50%      { box-shadow: 0 0 30px rgba(var(--hart-accent-rgb),0.62); }
+}
+/* Brand wordmark logo keeps a spectrum-tinted glow. */
+.hart-hero-brand img { filter: drop-shadow(0 3px 14px rgba(var(--hv-cyan-rgb),0.42)); }
+
+/* Tray buttons: soft accent on hover/focus, lift handled by the inline base. */
+.tray-btn:hover, .tray-btn:focus-visible { background: rgba(255,255,255,0.07); }
+.tray-btn:hover .mi, .tray-btn:focus-visible .mi { color: var(--hart-text); }
+
+/* Tabular mono for the clock + metric numbers (the one place mono belongs). */
+.clock, .metric-value, .sys-value, [class*="-pct"], .hc-vol-pct { font-family: var(--hart-font-mono); font-variant-numeric: tabular-nums; }
+/* --hart-font-display: the DISPLAY/heading typeface (Space Grotesk in the Aura
+   design). It was emitted by theme_service + set by the Font picker but had NO
+   consumer, so the picker's display role was a silent no-op (reuse-hunter finding
+   2026-07-12). Wire it to the titles/headings; fall back to the UI family + system-ui
+   so an un-themed shell is pixel-identical. REUSE the emitted var - no new var. */
+.hh-row-title, .ds-panel-title, .hart-hero-title, h1, h2, h3 {
+  font-family: var(--hart-font-display), var(--hart-font-family), system-ui, sans-serif;
+}
+/* Start-menu logo keeps its accent glow; brand text in the UI font. */
+.start-btn span { font-weight: 600; letter-spacing: .02em; }
+
+/* ════════ CINEMATIC ENTRANCE — staggered reveal (fade + rise) ════════
+   The icon rail and panels rise into place on first paint, with a small
+   per-item delay (the Netflix "content settles in" feel). GPU-only, runs once.
+   Fill is `backwards` (NOT `both`): backwards holds the start frame during the
+   delay (no flash) but does NOT keep applying the end frame after the run. `both`
+   would pin transform/opacity at animation-priority forever, OVERRIDING the
+   inline drag transform on .desktop-icon and the :hover lift on .start-item.
+   It is NOT gated on .dragging either: toggling animation off/on per click
+   (every pointerdown adds .dragging, pointerup removes it) would RESTART the
+   entrance on every tap. */
+@keyframes hv-rise {
+  from { opacity: 0; transform: translateY(16px) scale(.985); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+.hart-desktop .desktop-icon { animation: hv-rise var(--t-reveal, 320ms) var(--hv-focus) backwards; }
+.hart-desktop .desktop-icon:nth-child(1) { animation-delay: 40ms; }
+.hart-desktop .desktop-icon:nth-child(2) { animation-delay: 80ms; }
+.hart-desktop .desktop-icon:nth-child(3) { animation-delay: 120ms; }
+.hart-desktop .desktop-icon:nth-child(4) { animation-delay: 160ms; }
+.hart-desktop .desktop-icon:nth-child(5) { animation-delay: 200ms; }
+.hart-desktop .desktop-icon:nth-child(6) { animation-delay: 240ms; }
+.hart-desktop .desktop-icon:nth-child(7) { animation-delay: 280ms; }
+.hart-desktop .desktop-icon:nth-child(8) { animation-delay: 320ms; }
+.hart-desktop .desktop-icon:nth-child(n+9) { animation-delay: 360ms; }
+/* (No `.dragging { animation: none }` guard: see the `backwards`-fill note above —
+   the entrance self-clears, so it never fights the drag transform, and removing
+   the guard avoids replaying the entrance on every tap.) */
+/* Panels already spring-open via inline hart-panel-in; layer a soft staggered
+   reveal on the start-menu items so the launcher cascades open. */
+.start-menu .start-item { animation: hv-rise var(--t-reveal, 320ms) var(--hv-focus) backwards; }
+.start-menu .start-item:nth-child(1) { animation-delay: 20ms; }
+.start-menu .start-item:nth-child(2) { animation-delay: 44ms; }
+.start-menu .start-item:nth-child(3) { animation-delay: 68ms; }
+.start-menu .start-item:nth-child(4) { animation-delay: 92ms; }
+.start-menu .start-item:nth-child(5) { animation-delay: 116ms; }
+.start-menu .start-item:nth-child(n+6) { animation-delay: 140ms; }
+
+/* ════════ REDUCED MOTION — disable the non-essential cinematic motion ════════
+   Honours both the OS pref and the live a11y toggle (<html class="a11y-rmotion">).
+   Hover lifts collapse to a still highlight; entrances + the accent pulse stop. */
+@media (prefers-reduced-motion: reduce) {
+  .hart-hero-go { animation: none; }
+  .hart-desktop .desktop-icon, .start-menu .start-item { animation: none; }
+  .desktop-icon:hover .di-glyph, .desktop-icon:focus-within .di-glyph,
+  .hart-app-card:hover, .hart-app-card:focus-within,
+  .start-item:hover, .start-item:focus-within,
+  .hart-tile:hover, .hart-tile:focus-within,
+  .hv-art:hover, .hv-art:focus-within { transform: none; }
+  .hart-tile:hover .htc-prev > img, .hart-tile:focus-within .htc-prev > img,
+  .hv-art:hover > img, .hv-art:focus-within > img { transform: none; }
+}
+html.a11y-rmotion .hart-hero-go { animation: none; }
+html.a11y-rmotion .hart-desktop .desktop-icon,
+html.a11y-rmotion .start-menu .start-item { animation: none; }
+html.a11y-rmotion .desktop-icon:hover .di-glyph, html.a11y-rmotion .desktop-icon:focus-within .di-glyph,
+html.a11y-rmotion .hart-app-card:hover, html.a11y-rmotion .hart-app-card:focus-within,
+html.a11y-rmotion .start-item:hover, html.a11y-rmotion .start-item:focus-within,
+html.a11y-rmotion .hart-tile:hover, html.a11y-rmotion .hart-tile:focus-within,
+html.a11y-rmotion .hv-art:hover, html.a11y-rmotion .hv-art:focus-within { transform: none; }
+html.a11y-rmotion .hart-tile:hover .htc-prev > img, html.a11y-rmotion .hart-tile:focus-within .htc-prev > img,
+html.a11y-rmotion .hv-art:hover > img, html.a11y-rmotion .hv-art:focus-within > img { transform: none; }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SOFTWARE-RENDER PERFORMANCE FLOOR (#137) — reduced effects, no GPU.
+ * hart-gpu-probe writes `software` to /run/hart/gpu-render when the box is
+ * CPU-compositing (GSK=cairo / llvmpipe). render_desktop_shell() tags
+ * <body class="gpu-software"> from that SAME verdict (no second probe). On the
+ * CPU the cinematic glass — backdrop blur, big layered shadows, the continuous
+ * accent breathe + entrance reveals, hover scale transitions — re-rasterises the
+ * frame on EVERY keystroke, so typing lags ~500ms and a core pegs (which also
+ * starves the in-shell terminal fetch). This block STRIPS those GPU-only effects
+ * from the HOT surfaces (glass panels, top bar, omnibox, start menu, cards) and
+ * falls back to FLAT brand-spectrum fills — the Hevolve spectrum stays on
+ * borders/accents (rule 2: never a monochrome wash). Target: keystroke-to-glyph
+ * < 1 frame. Full cinematic stays on body.gpu-hardware (no rules here = unchanged).
+ *
+ * Higher specificity (body.gpu-software …) + !important on the two genuinely
+ * GPU-bound props (backdrop-filter, animation) guarantees the kill beats every
+ * inline glass rule, the base .glass mixin, and the cinematic rules above. A
+ * user's saved wallpaper (inline element style) still wins — this only re-skins
+ * the DEFAULT look on a software-rendered box.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* 1) Kill backdrop blur + heavy shadow on every frosted chrome surface — the
+   single biggest per-frame CPU cost. Raise the fill opacity so the chrome stays
+   legible without blur; keep a hairline brand border (from the base rule).
+
+   body.webkit-flat (#151 transparent-windows): the SAME opaque fill must also
+   apply whenever WebKit accelerated COMPOSITING is OFF — even on a box whose
+   gpu-probe says `hardware`. The glass-shell host disables WebKit compositing
+   (WEBKIT_DISABLE_COMPOSITING_MODE + HardwareAccelerationPolicy.NEVER) unless
+   hart.liquidUI.preferHardwareGL is set, and with compositing off backdrop-filter
+   :blur paints NOTHING — so the translucent .glass / .panel base reads SEE-THROUGH
+   (the steward's "windows have a transparent background"). render_desktop_shell()
+   tags <body webkit-flat> from LIQUID_UI_PREFER_HW_GL, decoupled from the gpu
+   verdict. ONE rule, two triggers (software-render OR compositing-off) — no
+   parallel opaque path. The glassy translucent look is kept ONLY on the
+   hardware-composited path (preferHardwareGL=true → neither class present). */
+body.gpu-software .glass,
+body.gpu-software .panel,
+body.gpu-software .top-bar,
+body.gpu-software .hart-hero-bar,
+body.gpu-software .start-menu,
+body.gpu-software .ctx-menu,
+body.gpu-software .agent-pill,
+body.webkit-flat .glass,
+body.webkit-flat .panel,
+body.webkit-flat .top-bar,
+body.webkit-flat .hart-hero-bar,
+body.webkit-flat .start-menu,
+body.webkit-flat .ctx-menu,
+body.webkit-flat .agent-pill {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  /* Static brand-tinted glass (GF1: keep COLOUR depth on the software floor at ZERO
+     per-frame cost - a gradient is free, backdrop-filter is not). Teal LEADS, violet
+     ACCENTS (b1.2); the opaque dark core keeps text legible. Replaces the flat
+     colourless grey rgba(18,19,28,.94) that read MONOCHROMATIC on real HW (2026-07-12,
+     the mockup gap): cairo cannot paint backdrop-filter, so the frosted brand colour
+     collapsed to grey. This restores it with a one-time raster. */
+  /* OPAQUE at EVERY stop (was 0.07/0.08 alpha at the edges -> panel corners read
+     ~92% see-through and the home bled through -> the "cluttered/overlap" real-HW
+     bug, 2026-07-15). Keep the teal-LEADS / violet-ACCENTS brand tint, but bake it
+     into a dark ~0.985 base so the panel is a solid, legible surface on the software
+     floor (no backdrop-filter to frost it) instead of a transparent overlay. */
+  background: linear-gradient(155deg, rgba(7,29,26,0.985), rgba(20,22,32,0.985) 46%, rgba(25,16,37,0.985));
+  box-shadow: 0 2px 10px rgba(0,0,0,0.34), inset 0 0 0 1px rgba(0,230,195,0.10);
+}
+
+/* The omnibox / command bar is the keystroke hot path: a blurred backdrop here
+   re-composites under the caret on every character. Flat fill + a static brand
+   ring on focus (no glow blur, no animation). */
+body.gpu-software .hart-hero-bar { box-shadow: none; }
+body.gpu-software .hart-hero-bar:focus-within {
+  border-color: rgba(var(--hart-accent-rgb),0.55);
+  box-shadow: 0 0 0 1px rgba(var(--hart-accent-rgb),0.45);
+}
+
+/* 2) Stop every continuous / non-essential animation. The accent breathe pulse
+   + the staggered entrance reveals repaint forever on the CPU. (The voice orb
+   itself is canvas-driven, not CSS — untouched.) */
+body.gpu-software .hart-hero-go,
+body.gpu-software .hart-desktop .desktop-icon,
+body.gpu-software .start-menu .start-item {
+  animation: none !important;
+}
+/* DEGRADE GRACEFULLY (2026-07-01): the 3 ambient cinematic glows are the single
+   biggest "looks rich vs looks cheap" lever (the mockup paints them). Their ONLY
+   per-frame cost on the CPU is the drift ANIMATION + the 64px live blur; the
+   multi-hue radial gradients themselves raster ONCE and composite cheaply. So
+   the software floor KEEPS the ambient — static (no drift) + a far smaller,
+   one-time blur — instead of gutting depth for no per-frame saving. The grain
+   overlay (mix-blend-mode:overlay = a per-frame composite) stays dropped. */
+body.gpu-software .hart-ambient {
+  animation: none !important;
+  filter: blur(28px) saturate(135%);
+  opacity: 0.42;
+}
+body.gpu-software .hart-grain { display: none; }
+
+/* AURA MOTION SYSTEM floor (hartHome.css): the 4 composable microanimation layers
+   (ambient blob drift + hue ghost, orb breathe/float, orbital ring spin, and any
+   detail keyframes) are CONTINUOUS per-frame transform/filter drift -- exactly the
+   class of effect that pegs a core on the CPU-composited cairo/pixman floor. SHED
+   them (static, not gone: the colour + depth already rastered once and stay). The
+   COLOUR/depth is kept above (the ambient gradients, the orb bloom); only the
+   per-frame drift/spin/breathe is dropped, mirroring block 2. Applies wherever
+   compositing is off -- gpu-software OR webkit-flat (a hardware-probe box whose
+   WebKit compositing is disabled) -- so a heavy motion layer can never reintroduce
+   the 500ms keystroke lag (#137 / GF1). The hue ghost pseudo is removed outright. */
+body.gpu-software .hart-ambient,
+body.gpu-software #hart-voice-orb,
+body.gpu-software .hart-hero-aura,
+body.webkit-flat .hart-ambient,
+body.webkit-flat #hart-voice-orb,
+body.webkit-flat .hart-hero-aura {
+  animation: none !important;
+}
+body.gpu-software .hart-ambient::after,
+body.webkit-flat .hart-ambient::after {
+  animation: none !important;
+  display: none;
+}
+
+/* 3) INTERACTION FEEDBACK STAYS ALIVE ON THE SOFTWARE FLOOR (2026-07-15).
+   Previously this block killed EVERY hover/focus lift on the CPU (transition:none
+   + transform:none), so the desktop felt DEAD on cairo/pixman: no card lift, no
+   icon lift, no poster-zoom. But a transform+opacity change is compositor-friendly
+   and rasters cheaply even without a GPU (the SAME class of effect the orb aura
+   already runs ungated in hartHero.js). So the software floor now KEEPS those
+   lifts, just SHORT (140ms) and transform/opacity ONLY, never the 380ms --hv-lift
+   and never a box-shadow transition (animating a big blurred shadow per-frame is
+   the real per-frame CPU cost; the glow instead SNAPS on in a single raster on
+   hover-enter). Focus rings are pure border/box-shadow swaps: instant + cheap,
+   already legible. This decouples the CHEAP feedback from the GPU gate; only the
+   backdrop blur (block 1) and the continuous animations (block 2) stay gated off.
+   Applies wherever compositing is off (gpu-software OR webkit-flat), mirroring
+   block 1's two triggers: no parallel path. */
+body.gpu-software .desktop-icon .di-glyph,
+body.gpu-software .desktop-icon .di-glyph::after,
+body.gpu-software .hart-app-card,
+body.gpu-software .start-item,
+body.gpu-software .hart-tile,
+body.gpu-software .hart-tile .htc-prev > img,
+body.gpu-software .hv-art,
+body.gpu-software .hv-art > img,
+body.webkit-flat .desktop-icon .di-glyph,
+body.webkit-flat .desktop-icon .di-glyph::after,
+body.webkit-flat .hart-app-card,
+body.webkit-flat .start-item,
+body.webkit-flat .hart-tile,
+body.webkit-flat .hart-tile .htc-prev > img,
+body.webkit-flat .hv-art,
+body.webkit-flat .hv-art > img {
+  transition: transform 140ms var(--hv-focus), opacity 140ms var(--hv-focus) !important;
+  will-change: auto;
+}
+/* The .desktop-icon WRAPPER transform channel is owned by the drag handler (an
+   inline per-frame translate), so it must NOT carry a transition (would lag the
+   drag) and must NOT stay layer-promoted on the CPU: reset will-change only. */
+body.gpu-software .desktop-icon,
+body.webkit-flat .desktop-icon {
+  will-change: auto;
+}
+/* Per-tile glyph drop-shadow is a real per-element filter (per-frame cost); drop
+   it so the icon lift stays cheap. */
+body.gpu-software .desktop-icon .di-glyph .mi,
+body.webkit-flat .desktop-icon .di-glyph .mi { filter: none; }
+
+/* 4) Simplify the wallpaper: a five-stop radial spectrum bloom is a costly full-
+   frame raster on every repaint. Collapse to a cheap two-hue brand gradient
+   (still spectrum, not flat black) + drop the vignette pseudo. */
+body.gpu-software .wallpaper {
+  /* GF1: still a cheap 2-hue static bloom (rasters ONCE, no drift/live-blur), but the
+     hues read from the SAME --hart-amb vars as the hardware floor — so a mood retints
+     the WHOLE field, not just the GPU path (no parallel hardcoded hue). Inline defaults
+     == the old teal/violet literals → the software floor is pixel-identical when unset. */
+  background:
+    radial-gradient(60% 50% at 14% 4%, rgba(var(--hart-amb-1-rgb, 0,230,195),0.10), transparent 60%),
+    radial-gradient(60% 55% at 92% 96%, rgba(var(--hart-amb-2-rgb, 155,92,255),0.12), transparent 62%),
+    linear-gradient(158deg, #06070D 0%, #04050A 60%, #070610 100%);  /* deep blue-black, mockup #05070d */
+}
+body.gpu-software .wallpaper::after { display: none; }
+
+/* 5) Open-window focus glow uses a big blurred shadow; flatten to a brand ring. */
+body.gpu-software .panel:focus-within {
+  border-color: rgba(var(--hv-cyan-rgb),0.34);
+  box-shadow: 0 2px 12px rgba(0,0,0,0.40);
+}

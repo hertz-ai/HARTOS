@@ -72,10 +72,17 @@ def test_is_background_call_uses_daemon_request_id():
     assert _is_background_call(user) is False
 
 
-def test_is_background_call_is_conservative_without_an_id():
-    """No request_id anywhere → treat as foreground (never cancel an unknown)."""
+def test_is_background_call_treats_empty_id_as_background():
+    """No request_id anywhere → BACKGROUND (abortable), delegating to the
+    canonical is_genuine_user_request (empty→non-user) exactly like the inbound
+    gate. A real /chat always carries an id, so an untagged llama call is daemon
+    work whose 'daemon_' tag was lost crossing the autogen worker-thread boundary
+    — classifying it foreground (the old bespoke `if not rid: return False`) is
+    what left empty-rid daemon 4B calls un-preemptible (#162)."""
     from core.llm_outbound_logger import _is_background_call
-    assert _is_background_call(httpx.Request('POST', _URL)) is False
+    from threadlocal import thread_local_data
+    thread_local_data.set_request_id('')  # deterministic: no leftover from another test
+    assert _is_background_call(httpx.Request('POST', _URL)) is True
 
 
 def test_thread_local_request_id_is_the_fallback():

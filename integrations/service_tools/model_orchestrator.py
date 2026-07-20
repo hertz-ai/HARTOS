@@ -151,12 +151,12 @@ class ModelOrchestrator:
             state['vram_free_gb'] = vram_manager.get_free_vram()
             state['allocations'] = vram_manager.get_allocations_display()
         except ImportError:
-            pass
+            logger.debug("_get_compute_state: swallowed ImportError")
         try:
             import psutil
             state['ram_free_gb'] = round(psutil.virtual_memory().available / (1024**3), 2)
         except Exception:
-            pass
+            logger.exception("_get_compute_state: swallowed Exception")
         return state
 
     # ── Auto-selection ────────────────────────────────────────────
@@ -283,11 +283,11 @@ class ModelOrchestrator:
             try:
                 self._release_vram(entry)
             except Exception:
-                pass
+                logger.exception("load: swallowed Exception")
             try:
                 self._catalog.mark_unloaded(model_id)
             except Exception:
-                pass
+                logger.exception("load: swallowed Exception")
 
         cs = self._get_compute_state()
         fit = entry.matches_compute(
@@ -443,7 +443,7 @@ class ModelOrchestrator:
                     result[cat]['available'] = True
                     result[cat]['services'].append(name)
         except Exception:
-            pass
+            logger.exception("available_capabilities: swallowed Exception")
 
         # 3. Running services (RuntimeToolManager) — mark health status
         try:
@@ -456,7 +456,7 @@ class ModelOrchestrator:
                         if tool_name in info.get('services', []):
                             info['available'] = True
         except Exception:
-            pass
+            logger.exception("available_capabilities: swallowed Exception")
 
         return result
 
@@ -661,7 +661,7 @@ class ModelOrchestrator:
             if freed:
                 logger.info(f"VRAM released: {tool_key} = {freed}GB")
         except ImportError:
-            pass
+            logger.debug("_release_vram: swallowed ImportError")
 
     # ── Lifecycle integration ─────────────────────────────────────
 
@@ -776,7 +776,7 @@ class ModelOrchestrator:
                 f"(device={device}, policy={_policy})"
             )
         except ImportError:
-            pass
+            logger.debug("_register_lifecycle: swallowed ImportError")
         except Exception as e:
             logger.debug(f"Lifecycle registration failed for {entry.id}: {e}")
 
@@ -826,7 +826,7 @@ class ModelOrchestrator:
                         service_tool_registry._tools[tool_name].is_healthy = False
                         logger.info(f"Service tool deregistered: {tool_name}")
                 except Exception:
-                    pass
+                    logger.exception("_deregister_service_tool: swallowed Exception")
                 return
 
     # ── Model swapping ──────────────────────────────────────────────
@@ -848,10 +848,10 @@ class ModelOrchestrator:
                     from integrations.service_tools.vram_manager import vram_manager
                     vram_manager.refresh_gpu_info()
                 except Exception:
-                    pass
+                    logger.exception("_attempt_swap: swallowed Exception")
                 return True
         except ImportError:
-            pass
+            logger.debug("_attempt_swap: swallowed ImportError")
         return False
 
     # ── External sync — for bypass paths that load outside orchestrator ──
@@ -887,7 +887,7 @@ class ModelOrchestrator:
                     'severity': 'success',
                 })
         except Exception:
-            pass
+            logger.exception("notify_loaded: swallowed Exception")
 
     def notify_unloaded(self, model_type: str, model_name: str) -> None:
         """Called by subsystems that unloaded a model outside the orchestrator."""
@@ -931,7 +931,7 @@ class ModelOrchestrator:
                 try:
                     entry.downloaded = loader.is_downloaded(entry)
                 except Exception:
-                    pass
+                    logger.exception("_scan_downloaded: swallowed Exception")
             elif entry.source == 'pip':
                 pkg = entry.files.get('package') or entry.repo_id
                 if pkg:

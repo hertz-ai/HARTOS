@@ -1,0 +1,5 @@
+15:48:32 shell server ready=True at http://127.0.0.1:6800
+15:48:32 /shell/static/hartDesktop.js -> 200
+15:48:33 GTK4 window presented; is_layer_window=True (BACKGROUND, anchored 4 edges, exclusive-zone 0)
+15:48:34 WebView load FINISHED (glass shell HTML+JS executed)
+15:48:40 grim rc=0 out=/tmp/m2-glass-shell.png err=

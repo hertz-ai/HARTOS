@@ -114,6 +114,120 @@ def optional_import(
         return fallback
 
 
+class _LazyModule:
+    """A proxy that imports its target module on first attribute access.
+
+    WHY
+    ───
+    Some heavy modules (``autogen`` drags ``google.api_core`` 7.6s +
+    ``flaml`` + the contrib capabilities chain -> ``llmlingua`` ->
+    ``torch`` 4.2s) are imported at a module's TOP LEVEL but only USED
+    inside functions.  That cost lands on every ``import <module>`` —
+    and transitively on the whole backend boot — even when the agent-
+    building code path is never reached in a given process.
+
+    This proxy lets a module write::
+
+        autogen = lazy_module("autogen")
+
+    at top level, keep every existing ``autogen.AssistantAgent(...)``
+    call site BYTE-FOR-BYTE unchanged, and pay the import cost only on
+    the first real attribute access (i.e. when an agent is actually
+    constructed).
+
+    Unlike :func:`optional_import`, there is NO fallback sentinel — the
+    target is a REQUIRED dependency at use-time, so a missing module
+    must raise loudly (ImportError) at first access, exactly as an eager
+    ``import`` would have.  ``lazy_module`` is purely a *when*, not a
+    *whether*.
+
+    Thread-safety: the first-access import is guarded so concurrent
+    callers don't double-import; Python's import lock makes the actual
+    ``import_module`` idempotent, the local lock only avoids a redundant
+    second call and a torn ``_mod`` read.
+    """
+
+    # Slots keep the proxy lean and ensure __getattr__ is the ONLY way
+    # to reach module attributes (no accidental shadowing).
+    __slots__ = ("_name", "_mod", "_lock")
+
+    def __init__(self, name: str):
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_mod", None)
+        import threading
+        object.__setattr__(self, "_lock", threading.Lock())
+
+    def _resolve(self) -> Any:
+        mod = object.__getattribute__(self, "_mod")
+        if mod is not None:
+            return mod
+        lock = object.__getattribute__(self, "_lock")
+        with lock:
+            mod = object.__getattribute__(self, "_mod")
+            if mod is None:
+                name = object.__getattribute__(self, "_name")
+                mod = importlib.import_module(name)
+                object.__setattr__(self, "_mod", mod)
+            return mod
+
+    # The three private slot names — set/get/del of these stay LOCAL to the
+    # proxy; everything else forwards to the resolved module.  This makes the
+    # proxy transparent to attribute manipulation, including unittest.mock's
+    # ``patch('mod.autogen.SomeAttr')`` which does getattr/setattr/delattr on
+    # the proxy to install + restore the mock — those must land on the REAL
+    # module so call sites (and the patched code) see the mock.
+    __slot_names = ("_name", "_mod", "_lock")
+
+    def __getattr__(self, item: str) -> Any:
+        # __getattr__ only fires for names NOT found normally; with
+        # __slots__ that means everything except the private slots, so
+        # this is the module-attribute forwarding path.
+        return getattr(self._resolve(), item)
+
+    def __setattr__(self, key: str, value: Any) -> None:
+        if key in _LazyModule.__slot_names:
+            object.__setattr__(self, key, value)
+        else:
+            setattr(self._resolve(), key, value)
+
+    def __delattr__(self, key: str) -> None:
+        if key in _LazyModule.__slot_names:
+            object.__delattr__(self, key)
+        else:
+            delattr(self._resolve(), key)
+
+    def __dir__(self):
+        return dir(self._resolve())
+
+    def __repr__(self):
+        mod = object.__getattribute__(self, "_mod")
+        state = "loaded" if mod is not None else "deferred"
+        return "<lazy_module %r (%s)>" % (
+            object.__getattribute__(self, "_name"), state,
+        )
+
+
+def lazy_module(name: str) -> Any:
+    """Return a proxy that imports ``name`` on first attribute access.
+
+    Args:
+        name: Dotted import path of a REQUIRED-at-use-time module that is
+            expensive to import and only used inside functions, e.g.
+            ``"autogen"`` or
+            ``"autogen.agentchat.contrib.capabilities.transform_messages"``.
+
+    Returns:
+        A :class:`_LazyModule` proxy.  Accessing any attribute on it
+        triggers the real import (raising ImportError if truly missing,
+        same as an eager import) and forwards the attribute.
+
+    NOT for optional deps — use :func:`optional_import` when a missing
+    module should degrade gracefully with a fallback.  ``lazy_module``
+    only defers *when* a present module is imported, never *whether*.
+    """
+    return _LazyModule(name)
+
+
 def list_degradations() -> List[Dict[str, Any]]:
     """Return a snapshot of all registered degradations for the admin endpoint.
 
@@ -147,6 +261,7 @@ def reset_for_tests() -> None:
 
 __all__ = [
     'optional_import',
+    'lazy_module',
     'list_degradations',
     'is_available',
     'reset_for_tests',

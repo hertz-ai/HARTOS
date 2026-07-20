@@ -121,6 +121,119 @@ def test_hartworkspaces_js_exposes_api_and_tags_windows():
     assert "setAttribute('data-ws'" in src                 # per-window workspace tag
 
 
+# ─── Installed app -> desktop icon (NixOS-style: install, icon appears) ───
+
+def _registry_with_installed_app():
+    """A fresh AppRegistry holding one installed desktop app + one panel."""
+    from core.platform.app_registry import AppRegistry
+    from core.platform.app_manifest import AppManifest, AppType
+    reg = AppRegistry()
+    reg.register(AppManifest(id='firefox', name='Firefox', version='120.0.0',
+                             type=AppType.DESKTOP_APP.value, icon='public',
+                             entry={'exec': 'firefox'}, group='Installed',
+                             tags=['installed', 'flatpak']))
+    reg.register(AppManifest(id='feed', name='Feed', version='1.0.0',
+                             type=AppType.NUNBA_PANEL.value, icon='rss_feed',
+                             entry={'route': '/social'}, group='Discover'))
+    return reg
+
+
+def test_installed_app_manifest_returns_launchable_shape():
+    """AppRegistry.installed_app_manifest() yields the DESKTOP_APP/EXTENSION
+    entries in window.MANIFEST shape — carrying `exec` (the launch key) and NOT
+    panels — so the desktop can pin + launch them. One source of truth, shared
+    by the live install push and the cold-load render."""
+    reg = _registry_with_installed_app()
+    man = reg.installed_app_manifest()
+    assert 'firefox' in man and 'feed' not in man      # apps yes, panels no
+    e = man['firefox']
+    assert e['exec'] == 'firefox'                       # the launch key
+    assert e['title'] == 'Firefox' and e['icon'] == 'public'
+    assert e.get('installed') is True and 'route' not in e
+
+
+def test_render_includes_installed_apps_in_manifest():
+    """The rendered shell merges installed apps into window.MANIFEST so a pinned
+    installed-app icon survives a refresh (render() only shows ids in MANIFEST).
+    Drives the REAL render with the registry pre-seeded."""
+    from unittest.mock import patch
+    reg = _registry_with_installed_app()
+
+    class _Reg:
+        def has(self, n): return n == 'apps'
+        def get(self, n): return reg if n == 'apps' else None
+
+    with patch('core.platform.registry.get_registry', return_value=_Reg()):
+        html = _render()
+    # The installed app id + its exec land in the embedded window.MANIFEST JSON.
+    assert '"firefox"' in html and '"exec": "firefox"' in html
+
+
+def test_install_push_emits_app_installed_card():
+    """The installer's _push_desktop_icon routes an `app_installed` A2UI card
+    through the registered LiquidUIService (the governed push path) so the live
+    desktop pins an icon without a refresh. Mocks the shell + registry, calls the
+    REAL method, asserts the emitted component."""
+    from unittest.mock import MagicMock, patch
+    from integrations.agent_engine.app_installer import AppInstaller
+    reg = _registry_with_installed_app()
+    svc = MagicMock(); svc.agent_ui_update.return_value = True
+    fake_reg = MagicMock(); fake_reg.get_or_none.return_value = svc
+
+    with patch('core.platform.registry.get_registry', return_value=fake_reg):
+        AppInstaller()._push_desktop_icon('firefox', reg.get('firefox'))
+
+    assert svc.agent_ui_update.called
+    agent_id, comp = svc.agent_ui_update.call_args[0]
+    assert agent_id == 'app_installer'
+    assert comp['type'] == 'app_installed'
+    assert comp['id'] == 'firefox' and comp['exec'] == 'firefox'
+    assert comp['title'] == 'Firefox' and comp['icon'] == 'public'
+
+
+def test_install_push_noop_without_shell():
+    """No LiquidUIService registered -> the push is a silent no-op (never raises:
+    a headless/server install must not crash the installer)."""
+    from unittest.mock import MagicMock, patch
+    from integrations.agent_engine.app_installer import AppInstaller
+    reg = _registry_with_installed_app()
+    fake_reg = MagicMock(); fake_reg.get_or_none.return_value = None
+    with patch('core.platform.registry.get_registry', return_value=fake_reg):
+        AppInstaller()._push_desktop_icon('firefox', reg.get('firefox'))  # no raise
+
+
+def test_app_installed_is_an_allowed_a2ui_component():
+    """The `app_installed` component must be in the A2UI allowlist, else
+    agent_ui_update silently drops the push (unknown type -> False)."""
+    from integrations.agent_engine.liquid_ui_service import COMPONENT_TYPES
+    assert 'app_installed' in COMPONENT_TYPES
+    assert 'exec' in COMPONENT_TYPES['app_installed']['props']
+
+
+def test_shell_routes_app_installed_to_desktop_and_openpanel_launches_exec():
+    """Source-shape guard (labelled): the shell's SSE consumer routes an
+    `app_installed` event to hartInstallIcon (no fork), and openPanel hands an
+    installed app (entry with `exec`, no `route`) to the existing launchApp."""
+    html = _render()
+    assert "type === 'app_installed'" in html
+    assert 'window.hartInstallIcon(ev)' in html
+    assert 'if(def.exec && !def.route && !SYSTEM_PANELS[baseId])' in html
+    assert 'launchApp(def.exec);' in html
+
+
+def test_hartdesktop_js_exposes_install_icon_reusing_pin():
+    """Source-shape guard (labelled): hartDesktop defines window.hartInstallIcon,
+    which merges the entry into window.MANIFEST and REUSES hartPinIcon to place
+    the icon — it must not re-implement the pin/persist path."""
+    src = open(os.path.join(STATIC, 'hartDesktop.js'), encoding='utf-8').read()
+    assert 'window.hartInstallIcon =' in src
+    # Scope to the function body: from its definition to the start of the NEXT
+    # exposed action (so the object-literal's own `};` does not truncate us).
+    body = src.split('window.hartInstallIcon =', 1)[1].split('window.hartAutoArrange =', 1)[0]
+    assert 'window.MANIFEST[id] =' in body          # registers into the manifest
+    assert 'window.hartPinIcon(id)' in body          # reuses the existing pin path
+
+
 if __name__ == '__main__':
     # Inline runner (pytest OOMs on this box): execute every test_* and report.
     fns = [v for k, v in sorted(globals().items())

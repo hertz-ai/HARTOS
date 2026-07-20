@@ -445,21 +445,32 @@ in
           Group = "hart";
           Slice = "hart-agents.slice";
 
-          ExecStart = "${cfg.package.python}/bin/python -c '${''
-            import sys, os
-            sys.path.insert(0, "${cfg.package}")
-            os.environ["HEVOLVE_DATA_DIR"] = "${cfg.dataDir}"
-            from integrations.agent_engine.world_model_bridge import WorldModelBridge
-            bridge = WorldModelBridge()
-            if bridge.check_health():
-                print("[HART OS] World model connected")
-            else:
-                print("[HART OS] World model unavailable (will retry)")
-            import time
-            while True:
-                time.sleep(60)
-                bridge.check_health()
-          ''}'";
+          # The health-loop is delivered as a SCRIPT FILE, not an inline
+          # `python -c '<multiline>'`.  A multi-line ExecStart value (the Nix
+          # ''…'' block expands to literal newlines) is written VERBATIM into the
+          # unit file, and systemd continues a directive across lines only with a
+          # trailing '\'; the raw newlines closed the directive on its first line
+          # with an unterminated quote → "Unbalanced quoting, ignoring" → the
+          # service had NO valid ExecStart and never started (real-HW bdd849 boot
+          # journal).  A writeText file makes ExecStart a trivial two-token
+          # command with zero systemd quoting — same fix shape as this module's
+          # writeShellScript units, and the code is byte-for-byte the original.
+          ExecStart =
+            let worldModelDaemon = pkgs.writeText "hart-world-model.py" ''
+              import sys, os, time
+              sys.path.insert(0, "${cfg.package}")
+              os.environ["HEVOLVE_DATA_DIR"] = "${cfg.dataDir}"
+              from integrations.agent_engine.world_model_bridge import WorldModelBridge
+              bridge = WorldModelBridge()
+              if bridge.check_health():
+                  print("[HART OS] World model connected")
+              else:
+                  print("[HART OS] World model unavailable (will retry)")
+              while True:
+                  time.sleep(60)
+                  bridge.check_health()
+            '';
+            in "${cfg.package.python}/bin/python ${worldModelDaemon}";
 
           Restart = "on-failure";
           RestartSec = 30;
@@ -626,16 +637,27 @@ in
                         if existing.get('mtime') == stat.st_mtime:
                             return
 
-                    # Get AI description via Model Bus
+                    # Get AI description via Model Bus.
+                    # NIX-ESCAPE RULE for this embedded script (09e07e95 class):
+                    # the empty-string defaults below are written as a 3-quote
+                    # escape, which Nix collapses to the 2-quote Python empty
+                    # string. Writing 4 quotes emitted 3 -- an unterminated Python
+                    # triple-quote that swallowed the rest of the function, so the
+                    # shipped indexer died with SyntaxError: ( was never closed on
+                    # every boot (real-HW 2026-07-19/20 journals). And NEVER write a
+                    # bare 2-quote pair anywhere in this block, not even in prose:
+                    # inside a Nix indented string it TERMINATES the string and the
+                    # remaining Python is parsed as Nix (that mistake broke the
+                    # iso-desktop build on 2026-07-20).
                     try:
                         resp = requests.post(
                             f'{MODEL_BUS}/v1/chat',
                             json={'prompt': f'Describe this file in 10 words: {os.path.basename(path)} ({stat.st_size} bytes)'},
                             timeout=10
                         )
-                        description = resp.json().get('response', '''')
+                        description = resp.json().get('response', ''')
                     except Exception:
-                        description = ''''
+                        description = '''
 
                     entry = {
                         'path': path,
@@ -657,7 +679,9 @@ in
                     dirs[:] = [d for d in dirs if not d.startswith('.')]
                     for f in files[:100]:  # Cap per-directory to avoid overload
                         fpath = os.path.join(root, f)
-                        if os.path.getsize(fpath) < 10_000_000:  # Skip files > 10MB
+                        # exists() first: a broken symlink makes getsize raise and
+                        # would kill the whole indexer loop.
+                        if os.path.exists(fpath) and os.path.getsize(fpath) < 10_000_000:
                             index_file(fpath)
 
                 print(f'[HART OS SmartFS] Index updated: {len(os.listdir(INDEX_DIR))} entries')

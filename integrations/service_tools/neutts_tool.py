@@ -370,7 +370,7 @@ def neutts_list_voices() -> str:
                         "language": "en",
                     })
     except ImportError:
-        pass
+        logger.debug("neutts_list_voices: swallowed ImportError")
 
     # 2. User-cloned voices
     voices_dir = _get_voices_dir()

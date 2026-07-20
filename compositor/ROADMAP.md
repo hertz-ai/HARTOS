@@ -303,19 +303,63 @@ XWayland), with launch-success keyed on a **REAL** `window.opened` map event —
 installer/launcher exit code — so the agent and user never see a phantom window. Android stays
 explicitly inert.
 
+> **Phase-5 foundations landed (dev-box-authored, Smithay-wiring VM/CI-pending):** the
+> compositor's **pure window bookkeeping** is authored, compiles, and is unit-tested on the
+> dev box (`compositor/src/main.rs` "PHASE 5" block): handle minting (`WindowHandle`/
+> `mint_handle` — `win_<hex>`, the IPC `handle`), the manifest↔toplevel map (`WindowRegistry`
+> = the "AppRegistry window-handle field"), the no-phantom-window `SummonApp` state machine
+> (`PendingSummon`/`SummonOutcome` — keyed on a real map within `SUMMON_MAP_TIMEOUT`, with
+> `summon_precheck` short-circuiting inert subsystems to `Unsupported`), and the
+> launch→await-map **orchestration** (`SummonResolver` — `begin`/`resolve`/`expire`: Mapped
+> ONLY via a real map, TimedOut never a handle). **19 Rust unit tests green** on the dev box
+> (3 Phase-3 + 16 Phase-5).
+>
+> The Smithay HANDLER BODIES are now **authored** in `compositor/src/wayland.rs` — the real
+> `impl XdgShellHandler / XdgDecorationHandler / ForeignToplevelListHandler for State` + the
+> XWayland lifecycle (`handle_xwayland_event`, `on_xwayland_mapped`/`_unmapped`) + the live
+> `State::on_real_map`/`expire_summons` summon resolution against the Smithay API. **The ENTIRE
+> file is gated behind `#![cfg(feature = "smithay")]`, OFF by default** (`Cargo.toml`
+> `[features]`), so the dev box compiles + tests ONLY the pure floor (verified: `cargo build
+> --features smithay` fails cleanly with "unresolved crate `smithay`" — the git-Smithay dep is
+> still commented; that ONE flip is the CI bring-up step). The free-fn `// ⚠️ CI-COMPILE`
+> `todo!()` stubs stay in `main.rs` as the feature-OFF placeholders (each now naming its real
+> `wayland.rs` body), so a reader of the always-compiled crate still sees the honest "not wired
+> here". The `xwayland` Smithay feature + its X11 C deps are a commented manifest in
+> `Cargo.toml`/`hart-comp.nix`, and `hart-comp.nix` `buildFeatures` stays `[ ]` until the same
+> CI step sets `[ "smithay" ]`. The brain-side native-window path is wired ADDITIVELY (the
+> `AppRegistry` manifest↔handle map + `HartWmClient.summon_app` reuse path); the `SummonApp` IPC
+> verb's launch→await-map transport lands with Phase 6.
+
 **Deliverables**
-- `xdg-shell` + XWayland + `xdg-decoration` + `wlr-foreign-toplevel-management` in HART-comp;
-  the shell layer-shell surface floats per the Phase-4 model above placeable native toplevels.
-- `SummonApp`/launch path returns success ONLY on a `wlr-foreign-toplevel`/xdg-shell **MAP
-  event** within a timeout — NOT on `app_installer` return-True (Wine returns 0 even when
-  nothing mapped; Android `_install` just copies the apk). Honest failure the agent can react to.
-- `AppRegistry` gains a window-handle field mapping manifest ↔ toplevel; installed-app entries
-  gain a "launch as native window" path **ALONGSIDE** existing iframe panels (additive, panels
-  preserved).
+- **[AUTHORED, CI-compile-gated]** `xdg-shell` + XWayland + `xdg-decoration` +
+  `wlr-foreign-toplevel-management` in HART-comp; the shell layer-shell surface floats per the
+  Phase-4 model above placeable native toplevels. **The real handler BODIES are authored in
+  `compositor/src/wayland.rs`** (the `impl XdgShellHandler / XdgDecorationHandler /
+  ForeignToplevelListHandler for State` + the XWayland lifecycle + the `State::on_real_map`
+  summon resolution) **behind `#![cfg(feature = "smithay")]`, OFF by default** — they compile
+  only where Smithay links (the one CI flip: enable the feature + uncomment the git-Smithay dep
+  + the X11 C deps). The `// ⚠️ CI-COMPILE` `todo!()` free-fn stubs stay in `main.rs` as the
+  feature-OFF placeholders (`on_xdg_toplevel_mapped` / `on_xwayland_surface_mapped` /
+  `on_toplevel_destroyed` / `on_decoration_request` / `on_foreign_toplevel_sync`), each naming
+  its real `wayland.rs` body.
+- **[LANDED, dev-authored — pure logic]** `SummonApp`/launch path returns success ONLY on a
+  `wlr-foreign-toplevel`/xdg-shell **MAP event** within a timeout — NOT on `app_installer`
+  return-True (Wine returns 0 even when nothing mapped; Android `_install` just copies the apk).
+  Encoded as `SummonOutcome` (no handleless `Mapped` variant) + `PendingSummon::is_timed_out_at`
+  (→ `TimedOut`) + `summon_precheck` (→ `Unsupported` for inert subsystems). Honest failure the
+  agent can react to. **Smithay map-event resolution is the CI wiring.**
+- **[LANDED, dev-authored — pure logic]** the compositor gains a window-handle field mapping
+  manifest ↔ toplevel (`WindowRegistry.by_manifest`/`by_handle`, `on_map`/`on_unmap`/
+  `handle_for_manifest` — the Rust-side "AppRegistry window-handle field", mirroring
+  `IPC_PROTOCOL.md` §4.1 `manifest_id`). Installed-app entries gain a "launch as native window"
+  path **ALONGSIDE** existing iframe panels (additive, panels preserved) — the additive
+  native-window path is the `run_event_loop` wiring + the brain's launcher (Phase 6 transport).
 - Carry forward **VERBATIM as labeled openRisks:** Android = `exec sleep infinity` (no
-  ART/Waydroid — native Android windows are vaporware), Wine success unconditional at the
-  installer layer (now corrected at the WM layer), macOS/Darling default-off, no `.crx`/`.xpi`
-  installer.
+  ART/Waydroid — native Android windows are vaporware; `hart-subsystems.nix:288`), Wine success
+  unconditional at the installer layer (`app_installer.py:_install_windows` returns
+  `success=True` regardless of map — now corrected at the WM layer: a Wine launch proceeds to
+  AWAIT A MAP via `summon_precheck`→None, the handle is minted only by `on_xwayland_surface_
+  mapped`), macOS/Darling default-off (`_install_macos`), no `.crx`/`.xpi` installer.
 
 **Tests**
 - integration: launch a Flatpak/PWA toplevel, assert `window.opened` fires and a handle is

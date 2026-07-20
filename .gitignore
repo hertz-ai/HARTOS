@@ -18,6 +18,7 @@ logs/
 # may contain user data). Present since the 2026-05-30 run dirs.
 data/
 runs/
+.uitest_shots/
 log/
 # All log files — never commit logs
 *.log

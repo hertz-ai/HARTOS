@@ -31,6 +31,12 @@ import logging
 import uuid
 from typing import Any
 
+from core.constants import (
+    CHAT_ACTION_STATUS,
+    CHAT_ACTION_THINKING,
+    CHAT_BUBBLE_PRIORITY,
+)
+
 logger = logging.getLogger(__name__)
 
 # Zoom-box stub — autogen FULL shape ships this so the avatar /
@@ -52,6 +58,7 @@ def publish_thinking_trace(
     bot_type: str = 'Agent',
     full_schema: bool = False,
     preffered_language: str = 'en-US',
+    action: str = CHAT_ACTION_THINKING,
 ) -> bool:
     """Build a priority-49 'Thinking' bubble + publish to the user's chat topic.
 
@@ -92,8 +99,8 @@ def publish_thinking_trace(
     if full_schema:
         envelope = {
             'text': [text_str],
-            'priority': 49,
-            'action': 'Thinking',
+            'priority': CHAT_BUBBLE_PRIORITY,
+            'action': action,
             'historical_request_id': [],
             'preffered_language': preffered_language,
             'options': [],
@@ -108,8 +115,8 @@ def publish_thinking_trace(
     else:
         envelope = {
             'text': [text_str],
-            'priority': 49,
-            'action': 'Thinking',
+            'priority': CHAT_BUBBLE_PRIORITY,
+            'action': action,
             'bot_type': bot_type,
             'request_id': request_id,
             'msg_id': _msg_id,
@@ -136,10 +143,18 @@ def publish_thinking_trace(
 
 
 def publish_chat_stage(stage: str, *, user_id: str, request_id: str = '', text: str = None) -> bool:
-    """Emit a chat-hot-path milestone (#508) via the canonical thinking-trace
-    publisher.  When `text` is provided, use it directly (per-tool calls);
-    otherwise look up CHAT_STAGE_TEXTS[stage].  Returns False if user_id
-    missing or stage/text unresolvable."""
+    """Emit a chat-hot-path PROGRESS milestone (#508) on the chat topic with
+    action='Status' — NOT 'Thinking'.
+
+    These are canned pipeline stages ("Loading your context…", "Recalling…",
+    "Preparing tools…"), not the model's reasoning.  Routing them through
+    action='Thinking' made the frontend (Demopage: priority===49 &&
+    action==='Thinking') append them to thinkingSteps, so they rendered as the
+    "Thought process" Step 1..N — drowning out the actual LLM thoughts.  With
+    action='Status' the priority-49 'Thinking' container is reserved for real
+    autogen reasoning; a status consumer can drive the "analysing…" indicator
+    from these instead.  When `text` is provided, use it directly (per-tool
+    calls); otherwise look up CHAT_STAGE_TEXTS[stage]."""
     if not user_id:
         return False
     if text is None:
@@ -150,5 +165,5 @@ def publish_chat_stage(stage: str, *, user_id: str, request_id: str = '', text: 
         return False
     return publish_thinking_trace(
         text=text, user_id=str(user_id), request_id=str(request_id or ''),
-        bot_type='Agent', full_schema=False,
+        bot_type='Agent', full_schema=False, action=CHAT_ACTION_STATUS,
     )

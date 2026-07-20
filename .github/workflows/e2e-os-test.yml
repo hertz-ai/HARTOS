@@ -48,7 +48,11 @@ jobs:
         working-directory: nixos
         run: |
           set -eo pipefail
-          for t in iso-server iso-desktop; do
+          # raw-desktop = the INSTALLED (writable-root) image the desktop USB
+          # actually ships as of 2026-07-16; evaluating it here is the gate that
+          # proves the hartImageKind split evals BOTH ways (the iso targets in
+          # the same loop re-prove the ISO path did not regress).
+          for t in iso-server iso-desktop raw-desktop; do
             echo "=== Evaluating .#packages.x86_64-linux.$t ==="
             nix eval ".#packages.x86_64-linux.${t}.drvPath" --raw
             echo
@@ -111,7 +115,10 @@ jobs:
       - name: Boot ISO in QEMU
         run: |
           chmod +x tests/boot-qemu-for-test.sh
-          bash tests/boot-qemu-for-test.sh "$ISO_PATH"
+          # 8G headroom for the backend's raised MemoryMax (4G server) — the
+          # default 4096 would OOM the 4G cgroup + the OS and fail thread allocs.
+          QEMU_RAM=8192 QEMU_CPUS=4 \
+            bash tests/boot-qemu-for-test.sh "$ISO_PATH"
 
       - name: Run E2E smoke tests (15 checks)
         run: |
@@ -217,7 +224,9 @@ jobs:
       - name: Boot Desktop ISO in QEMU (with virtual GPU)
         run: |
           chmod +x tests/boot-qemu-for-test.sh
-          QEMU_RAM=6144 QEMU_CPUS=4 \
+          # 8G: the backend's raised MemoryMax (3G desktop) + the glass shell +
+          # the other hart services need headroom or thread-stack allocs fail.
+          QEMU_RAM=8192 QEMU_CPUS=4 \
             bash tests/boot-qemu-for-test.sh "$ISO_PATH"
 
       - name: Run E2E smoke tests (15 checks)

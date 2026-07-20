@@ -67,10 +67,14 @@ check() {
 
 # ─── Check 1: Backend health ─────────────────────────────────
 HEALTH=$(curl -sf "http://localhost:${BACKEND_PORT}/status" 2>/dev/null || echo "UNREACHABLE")
-if echo "$HEALTH" | grep -q '"success"'; then
-    check 1 "Backend health (GET /status)" "HTTP 200 + success" "HTTP 200 + success"
+# /status returns 200 + JSON like {"status":"running","response":"Working...",...}.
+# There is no "success" key — a healthy Flask backend is signalled by
+# "status":"running". (hevolve_core/ML may be down; that is expected and does
+# not mean the HTTP API is unhealthy.)
+if echo "$HEALTH" | grep -qE '"status"[[:space:]]*:[[:space:]]*"running"'; then
+    check 1 "Backend health (GET /status)" "status running" "status running"
 else
-    check 1 "Backend health (GET /status)" "$HEALTH" "HTTP 200 + success"
+    check 1 "Backend health (GET /status)" "$HEALTH" "status running"
 fi
 
 # ─── Check 2: First-boot completed ───────────────────────────
@@ -99,7 +103,7 @@ fi
 DB_SIZE=$(ssh_cmd "test -f /var/lib/hart/hevolve_database.db && wc -c < /var/lib/hart/hevolve_database.db || echo 0")
 DB_SIZE=$(echo "$DB_SIZE" | tr -d '[:space:]')
 if [[ "$DB_SIZE" -gt 0 ]] 2>/dev/null; then
-    check 5 "Database initialized (non-empty)" "${DB_SIZE} bytes" "non-empty"
+    check 5 "Database initialized (non-empty)" "non-empty (${DB_SIZE} bytes)" "non-empty"
 else
     check 5 "Database initialized (non-empty)" "empty or missing" "non-empty"
 fi
@@ -142,7 +146,9 @@ fi
 CLI_PATH=$(ssh_cmd "which hart 2>/dev/null || echo MISSING")
 CLI_PATH=$(echo "$CLI_PATH" | tr -d '[:space:]')
 if [[ "$CLI_PATH" != "MISSING" ]] && [[ -n "$CLI_PATH" ]]; then
-    check 9 "CLI tool available (hart command)" "$CLI_PATH" "/nix/"
+    # NixOS resolves system-profile binaries to /run/current-system/sw/bin/<x>
+    # (a symlink), never a raw /nix/store path — assert the bin name instead.
+    check 9 "CLI tool available (hart command)" "$CLI_PATH" "/bin/hart"
 else
     check 9 "CLI tool available (hart command)" "MISSING" "/nix/"
 fi
@@ -160,7 +166,7 @@ fi
 SANDBOX_PATH=$(ssh_cmd "which hart-sandbox 2>/dev/null || echo MISSING")
 SANDBOX_PATH=$(echo "$SANDBOX_PATH" | tr -d '[:space:]')
 if [[ "$SANDBOX_PATH" != "MISSING" ]] && [[ -n "$SANDBOX_PATH" ]]; then
-    check 11 "Sandbox tool available (hart-sandbox)" "$SANDBOX_PATH" "/nix/"
+    check 11 "Sandbox tool available (hart-sandbox)" "$SANDBOX_PATH" "/bin/hart-sandbox"
 else
     # Fallback: check via hart wrapper
     HART_SANDBOX=$(ssh_cmd "hart sandbox status 2>/dev/null && echo OK || echo MISSING")
@@ -205,7 +211,7 @@ if [[ "$KMOD_COUNT" -gt 0 ]] 2>/dev/null; then
     check 14 "Kernel subsystem modules loaded" "$KMOD_COUNT module(s)" "module"
 else
     # On minimal/edge, this is expected to be 0
-    VARIANT=$(ssh_cmd "cat /var/lib/hart/variant 2>/dev/null || echo unknown")
+    VARIANT=$(ssh_cmd "cat /etc/hart/variant 2>/dev/null || cat /var/lib/hart/variant 2>/dev/null || echo unknown")
     VARIANT=$(echo "$VARIANT" | tr -d '[:space:]')
     if [[ "$VARIANT" == "edge" ]]; then
         check 14 "Kernel subsystem modules loaded" "0 (edge — expected)" "expected"
@@ -221,7 +227,7 @@ if [[ "$CONKY_CFG" != "MISSING" ]] && [[ -n "$CONKY_CFG" ]]; then
     check 15 "Conky config deployed" "found" "found"
 else
     # On server/edge, Conky is not expected
-    VARIANT=$(ssh_cmd "cat /var/lib/hart/variant 2>/dev/null || echo unknown")
+    VARIANT=$(ssh_cmd "cat /etc/hart/variant 2>/dev/null || cat /var/lib/hart/variant 2>/dev/null || echo unknown")
     VARIANT=$(echo "$VARIANT" | tr -d '[:space:]')
     if [[ "$VARIANT" == "server" || "$VARIANT" == "edge" ]]; then
         check 15 "Conky config (not expected on $VARIANT)" "skipped" "skipped"
@@ -235,14 +241,18 @@ fi
 # AppRegistry.shutil.which('nunba') resolves on this system and the
 # agentic runtime can dispatch through it. Only expected on variants
 # that set `hart.nunba.enable = true` (desktop, phone).
-NUNBA_VAR=$(ssh_cmd "cat /var/lib/hart/variant 2>/dev/null || echo unknown")
+NUNBA_VAR=$(ssh_cmd "cat /etc/hart/variant 2>/dev/null || cat /var/lib/hart/variant 2>/dev/null || echo unknown")
 NUNBA_VAR=$(echo "$NUNBA_VAR" | tr -d '[:space:]')
 NUNBA_BIN=$(ssh_cmd "which nunba 2>/dev/null || echo MISSING")
 NUNBA_BIN=$(echo "$NUNBA_BIN" | tr -d '[:space:]')
 if [[ "$NUNBA_VAR" == "server" || "$NUNBA_VAR" == "edge" ]]; then
     check 16 "Nunba binary (not expected on $NUNBA_VAR)" "skipped" "skipped"
 elif [[ "$NUNBA_BIN" != "MISSING" ]] && [[ -n "$NUNBA_BIN" ]]; then
-    check 16 "Nunba native binary on PATH" "$NUNBA_BIN" "/nix/"
+    # LOCKSTEP: when the nunba static-dist refactor lands (bin/nunba removed,
+    # hart.nunba.enable=false on desktop), update #16/#17 in THAT SAME commit to
+    # assert the static dist instead of the launcher binary — do not let test
+    # and OS drift. As of the committed tree, nunba.nix still ships bin/nunba.
+    check 16 "Nunba native binary on PATH" "$NUNBA_BIN" "/bin/nunba"
 else
     check 16 "Nunba native binary on PATH" "MISSING" "/nix/"
 fi

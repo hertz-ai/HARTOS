@@ -742,9 +742,14 @@ class PeerLink:
         try:
             from integrations.service_tools.vram_manager import detect_gpu
             gpu = detect_gpu()
-            if gpu.get('available'):
-                caps['gpu'] = gpu.get('device_name', 'GPU')
-                caps['vram_mb'] = gpu.get('vram_total_mb', 0)
+            # detect_gpu's contract is {name, total_gb, free_gb, cuda_available}
+            # (vram_manager.detect_gpu).  The prior 'available'/'device_name'/
+            # 'vram_total_mb' keys NEVER existed in that dict, so this block
+            # never ran and a GPU node silently advertised NO gpu/vram to its
+            # peers (the #91 wrong-keys class; compute_mesh reads it correctly).
+            if gpu.get('cuda_available'):
+                caps['gpu'] = gpu.get('name') or 'GPU'
+                caps['vram_mb'] = int(round((gpu.get('total_gb') or 0) * 1024))
         except Exception:
             pass
         try:

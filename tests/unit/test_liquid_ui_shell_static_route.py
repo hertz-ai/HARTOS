@@ -65,6 +65,10 @@ def test_every_shell_static_asset_the_html_requests_is_served(shell):
     "lottie.min.js",      # bundled offline Lottie player (boot splash)
     "hartBootSplash.js",  # the Hevolve brand boot-splash driver
     "hevolve-anim.json",  # the Hevolve hourglass Lottie animation
+    # The bundled icon font — referenced by the CSS @font-face (NOT a src="…"),
+    # so _static_refs above can't see it. If this 404s, EVERY shell glyph
+    # vanishes offline (smart_toy/shield + all tray/dock icons go blank).
+    "MaterialSymbolsRounded.woff2",
 ])
 def test_critical_shell_asset_is_fetchable(shell, asset):
     """Each named asset maps 1:1 to a symptom the steward saw on the booted
@@ -75,9 +79,147 @@ def test_critical_shell_asset_is_fetchable(shell, asset):
     assert r.data, f"{asset} served empty"
 
 
+@pytest.mark.parametrize("asset,needles,fix", [
+    # overlap/clutter fix (16ce15e5): the webkit-flat solidify gradient is opaque
+    # (~0.985 at every stop) so panels do not read see-through on the software floor.
+    ("hartResponsive.css", ["0.985", "webkit-flat"],
+     "opaque webkit-flat panel (overlap/clutter fix)"),
+    # Aura microanimations (b3cf15b2): the composable motion vars + a keyframe.
+    ("hartHome.css", ["vBreathe", "--hart-motion-ambient"],
+     "Aura microanimations (composable motion layers)"),
+    # aura-listing (2cd78f23) + Motion controls (b3cf15b2) in the personalize hub.
+    ("hartPersonalize.js", ["id: 'aura'", "HartMotion"],
+     "Aura listed in the theme picker + Motion controls"),
+])
+def test_shell_fix_is_actually_served(shell, asset, needles, fix):
+    """The loop's VERIFY leg: a committed shell fix must actually REACH the served
+    /shell/static asset, not just return 200. A fix that is on disk but never
+    served (wrong path, stale bundle, static route regressed) is a silent
+    regression the 200-only guards above cannot catch -- this is the whole reason
+    the fix->serve->verify loop fetches the real body. Behavioural: real app +
+    real fetch, assert the fix content is in the SERVED response."""
+    _svc, client = shell
+    r = client.get("/shell/static/{}".format(asset))
+    assert r.status_code == 200, "{} -> {} ({} never served)".format(asset, r.status_code, fix)
+    body = r.get_data(as_text=True)
+    missing = [n for n in needles if n not in body]
+    assert not missing, "{} served but MISSING {} -- {} did not reach the shell".format(asset, missing, fix)
+
+
+def test_voice_orb_getusermedia_cannot_hang(shell):
+    """Orb-click FREEZE (real-HW 2026-07-18, nightly-6ef436c): clicking the voice
+    orb calls navigator.mediaDevices.getUserMedia, which in the cage/WebKitGTK
+    kiosk raises a permission-request that -- with no host handler -- hangs the
+    promise FOREVER, freezing the shell with no error. The served shell must race
+    getUserMedia against a timeout so the orb can NEVER hang; assert the guard is
+    in the RENDERED HTML (the served output), not merely on disk. The host-side
+    auto-grant that makes the mic actually work lives in hart-liquid-ui.nix and
+    is exercised by the real-HW boot, not this unit."""
+    svc, _client = shell
+    html = svc.render_desktop_shell()
+    assert 'getUserMedia' in html, 'the voice mic path vanished from the shell'
+    assert 'Promise.race' in html and 'mic-timeout' in html, \
+        'the getUserMedia timeout guard is missing from the served shell -- the orb can hang'
+
+
 def test_static_handler_is_repointed_not_duplicated(shell):
     """The fix REPOINTS Flask's single static handler to /shell/static — it does
     not add a parallel route. Flask's old default ``/static`` prefix must no
     longer serve these (one source of truth for shell assets)."""
     _svc, client = shell
     assert client.get("/static/hartHero.js").status_code == 404
+
+
+def test_cosmic_bloom_is_runtime_composed_not_live_blur(shell):
+    """The Aura cosmic bloom must be COMPOSED + PRE-BLURRED AT RUNTIME, never a
+    per-frame live blur and never a build-time baked image (steward 2026-07-19:
+    "pre blur not at build time, at compose time during OS runtime").
+
+    Behavioural: render the real shell + fetch the real served bloom module, and
+    prove (a) the shell mounts the compose surface + loads the module, (b) the old
+    live ``filter:blur(64px)`` ambient re-rasteriser is GONE, and (c) the served
+    module composes with a single canvas blur pass (``ctx.filter``) driven by the
+    live palette vars — i.e. once-per-compose, not per-frame, not a shipped asset."""
+    svc, client = shell
+    html = svc.render_desktop_shell()
+    # (a) the compose surface + the module the shell actually loads
+    assert 'hart-bloom-canvas' in html, "the runtime-compose bloom canvas is not mounted"
+    assert '/shell/static/hartBloom.js' in html, "hartBloom.js is not loaded by the shell"
+    # (b) the per-frame live blur is gone from the ambient (only the comment naming
+    # it may remain); assert no ACTIVE filter:blur(64px) rule survives.
+    assert 'filter:blur(64px) saturate' not in html, \
+        "the live per-frame ambient blur(64px) is still active — must be pre-composed"
+    # (c) the served module: compose-time blur, palette-driven, no shipped image
+    r = client.get('/shell/static/hartBloom.js')
+    assert r.status_code == 200, 'hartBloom.js is not served'
+    body = r.get_data(as_text=True)
+    for needle in ('composeHartBloom', 'ctx.filter', '--hart-amb-'):
+        assert needle in body, f'hartBloom.js missing {needle!r} (not compose-time/palette-driven)'
+    # a baked build-time asset must NOT exist (the rejected approach)
+    assert client.get('/shell/static/aura_bloom.webp').status_code == 404, \
+        'a build-time baked bloom asset is shipped — must compose at runtime instead'
+
+
+def test_orb_orbital_rings_present(shell):
+    """The Aura mock's signature spinning cyan dashed orbital ring must render
+    around the orb. Behavioural: the rendered shell mounts the ring elements and
+    defines the spin keyframe (the small-region motion the software floor affords)."""
+    svc, _client = shell
+    html = svc.render_desktop_shell()
+    assert 'hart-orb-orbit' in html, 'the orbital ring element is missing from the orb'
+    assert '@keyframes hart-orbit-spin' in html, 'the orbital spin keyframe is not defined'
+
+
+def test_orb_drag_kills_the_transform_transition(shell):
+    """Orb drag realtime (real-HW 2026-07-20 'drag not realtime / offset'):
+    .hart-hero carries a .55s transform transition, and the drag drives transform
+    per pointermove -- without a dragging override every move is ANIMATED ~550ms
+    behind the cursor. hartHero.js toggles .hart-hero-dragging around the drag;
+    the SERVED shell must carry the transition:none rule for it (the rule was
+    toggled but never defined -- the exact shipped bug)."""
+    svc, _client = shell
+    html = svc.render_desktop_shell()
+    assert '.hart-hero.hart-hero-dragging{transition:none}' in html, (
+        'the dragging transition-kill rule is missing -- orb drag rubber-bands')
+
+
+def test_accent_rgb_is_theme_driven_not_frozen_by_the_stylesheet(shell):
+    """Live accent RETINT must reach every rgba(var(--hart-accent-rgb),A) glow.
+
+    Regression (CSS parity ledger audit, 2026-07-20): hartResponsive.css declared
+    a STATIC ``--hart-accent-rgb: 0,230,195`` in :root. That stylesheet loads LAST,
+    so it won on source order and OVERRODE the server's theme-derived value --
+    freezing every accent glow (desktop-icon glyph, .desktop-icon.selected, focus
+    rings, the pulse keyframe) at one hue. The palette picker (CH1) and every
+    non-default theme were silently dead for those surfaces.
+
+    Behavioural: fetch the REAL served stylesheet + render the REAL shell, and
+    prove (a) the stylesheet no longer redeclares the token, and (b) the server
+    still emits it, so the cascade resolves to the theme."""
+    svc, client = shell
+    css = client.get('/shell/static/hartResponsive.css')
+    assert css.status_code == 200
+    body = css.get_data(as_text=True)
+    import re
+    # No :root DECLARATION of the token (usages via var(...) are the point).
+    decls = re.findall(r'--hart-accent-rgb\s*:', body)
+    assert not decls, (
+        'hartResponsive.css redeclares --hart-accent-rgb; it loads last and would '
+        'freeze every accent glow, killing live theme retint')
+    # And the server must still define it, or those var() usages resolve to nothing.
+    html = svc.render_desktop_shell()
+    assert re.search(r'--hart-accent-rgb:\s*[0-9]+,[0-9]+,[0-9]+', html), (
+        'the server no longer emits --hart-accent-rgb -- accent glows would break')
+
+
+def test_brand_teal_hex_and_rgb_fallbacks_agree(shell):
+    """The compiled-in emergency fallbacks for the SAME token must not disagree.
+
+    Ledger audit b1.1/b1.2: the fallback table used the pre-brand #00D4AA while
+    the rgb fallback was the brand 0,230,195 (#00E6C3) -- so solid fills and
+    rgba() glows painted DIFFERENT teals whenever the theme import failed, the
+    monochrome-teal wash the steward rejected. Both must be the brand teal."""
+    svc, _client = shell
+    html = svc.render_desktop_shell()
+    assert '#00D4AA' not in html, 'pre-brand teal #00D4AA is still served (brand is #00E6C3)'
+    assert 'rgba(0,212,170' not in html, 'pre-brand teal rgb 0,212,170 is still served'

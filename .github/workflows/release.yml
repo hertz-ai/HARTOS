@@ -14,6 +14,28 @@ on:
         default: true
   push:
     branches: [main, gpt4.1, develop, debug_1, fix/boot-issues-nouveau-firstboot]
+    # PROSE-ONLY pushes must NOT trigger a full ~3h ISO build.
+    # 2026-07-20: a run of doc/ledger commits queued NINE redundant Release runs
+    # and STARVED the one build that mattered (066cb5ed) of a runner -- its
+    # publish sat queued for hours until the redundant runs were hand-cancelled.
+    # Markdown cannot change a shipped artifact: docs/ is excluded from the
+    # hart-app source filter (nixos/packages/hart-app.nix).
+    #
+    # DELIBERATELY CONSERVATIVE -- what is NOT ignored, and why:
+    #   * docs/architecture/latency_budgets.json -- .json, not .md, so it still
+    #     triggers. It IS a build-gate input (hart-app checkPhase), so a budget
+    #     change must rebuild. This is also why no `!` negation is used here:
+    #     paths-ignore does not support negation reliably, and a silently
+    #     mis-parsed pattern would skip builds that must run.
+    #   * tests/** -- NOT ignored. gate-checks (the unit-test runner) lives in
+    #     THIS workflow, so ignoring tests would stop CI from checking test
+    #     changes. Trading CI coverage for queue time is the wrong trade.
+    # paths-ignore is push-only; workflow_dispatch above is unaffected, so a
+    # release can always be forced regardless of what changed.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/design/**'
+      - 'LICENSE'
 
 permissions:
   contents: write
@@ -22,96 +44,44 @@ permissions:
 
 jobs:
   # ═══════════════════════════════════════════════════════════
-  # 1. Test Gate
+  # 1. Comprehensive gate — the release-blocking checks (PARALLEL to build-iso)
   # ═══════════════════════════════════════════════════════════
-  test:
-    runs-on: ubuntu-latest
-    # Hard ceiling so a single hung test can never burn the 6h GitHub job cap
-    # again — a no-timeout pytest step ran 6h05m before auto-cancel (2026-06-03,
-    # run 26870369540). The per-test --timeout below is the targeted guard that
-    # names the culprit; this job-level cap is the backstop if a C-level block
-    # escapes the thread-method timeout.
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install -e . --no-deps
-          python -c "from core.platform.events import EventBus; print(f'EventBus import OK: {EventBus}')"
-          pip install pytest pytest-asyncio pytest-timeout
-          pip install grep-ast tree-sitter tree-sitter-language-pack 2>/dev/null || true
-          python -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True)" 2>/dev/null || true
-
-      - name: Run unit + functional tests
-        env:
-          HEVOLVE_DB_PATH: ':memory:'
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          cd ${{ github.workspace }}
-          # test_vlm_qwen3vl.py::TestFullActionLoop and
-          # ::TestVLMDeterministicActions::test_vlm_action_list_shared...
-          # patch attributes on a module (qwen3vl_backend) whose
-          # dependency chain isn't fully available on stock CI without
-          # torch/transformers GPU wheels — patches resolve to
-          # MagicMock objects and raise RuntimeError("fail") /
-          # TypeError from inspect. Deselect until the VLM patch
-          # targets are refactored to not require the heavy module
-          # imported at patch-time. Tracked non-blocking, ISOs unblocked.
-          python -m pytest \
-            tests/unit/ \
-            tests/functional/ \
-            --ignore=tests/unit/test_social_models.py \
-            --deselect tests/unit/test_vlm_qwen3vl.py::TestFullActionLoop \
-            --deselect tests/unit/test_vlm_qwen3vl.py::TestVLMDeterministicActions::test_vlm_action_list_shared_by_legacy_and_unified \
-            --noconftest \
-            --timeout=120 \
-            -q --tb=line
-
-      # Integration tests — cross-module flows (channels, social, federation).
-      # Best-effort: don't block release on integration regressions, but surface them.
-      - name: Run integration tests (best-effort)
-        if: always()
-        env:
-          HEVOLVE_DB_PATH: ':memory:'
-          PYTHONPATH: ${{ github.workspace }}
-        continue-on-error: true
-        run: |
-          cd ${{ github.workspace }}
-          python -m pytest \
-            tests/integration/ \
-            --noconftest \
-            --timeout=120 \
-            -q --tb=line || echo "Integration tests had failures (non-blocking)"
-
-      # E2E tests — full-stack scenarios. Best-effort.
-      - name: Run e2e tests (best-effort)
-        if: always()
-        env:
-          HEVOLVE_DB_PATH: ':memory:'
-          PYTHONPATH: ${{ github.workspace }}
-        continue-on-error: true
-        run: |
-          cd ${{ github.workspace }}
-          python -m pytest \
-            tests/e2e/ \
-            --ignore=tests/e2e/runtime_tests \
-            --noconftest \
-            --timeout=120 \
-            -q --tb=line || echo "E2E tests had failures (non-blocking)"
+  # Runs the FULL gate via the reusable flake-checks workflow:
+  #   * pytest tests/unit + tests/functional (the Python runtime),
+  #   * the compositor cargo test (default pure-logic floor),
+  #   * `nix build .#hart-comp` (the smithay feature: compile + cargo test via
+  #     doCheck) + the Rust precedent,
+  #   * EVERY nixosTest in checks.x86_64-linux, actually RUN (sharded), enumerated
+  #     dynamically so a new test gates the build automatically.
+  #
+  # It is a DEDICATED job on its OWN runners/budgets, NOT serial inside build-iso's
+  # 6h wall-clock — the heavy VM suite runs in parallel with the ISO build. Both
+  # `tag-and-sign` (signed release) and `publish-nightly` (nightly .iso) NEED this:
+  # nothing ships unless every check here is GREEN. The same workflow runs
+  # standalone on PRs, so the gate is defined exactly ONCE (DRY).
+  #
+  # Scoped to the events whose downstream job actually CONSUMES it — a manual
+  # dispatch (gates tag-and-sign) or a push to main (gates publish-nightly). On a
+  # push to a non-main branch nothing depends on it (publish-nightly is main-only,
+  # tag-and-sign is dispatch-only), so running the multi-hour VM suite there would
+  # be pure waste. PRs are still fully gated by flake-checks.yml's own
+  # pull_request trigger. A skipped gate-checks here correctly skips its
+  # main-only/dispatch-only dependents too (no always() anywhere downstream).
+  gate-checks:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    uses: ./.github/workflows/flake-checks.yml
 
   # ═══════════════════════════════════════════════════════════
   # 2. Tag + Sign (only on manual dispatch with version)
   # ═══════════════════════════════════════════════════════════
   tag-and-sign:
     if: github.event_name == 'workflow_dispatch'
-    needs: test
+    # GATED on the FULL check suite (was: only the unit `test` job). No tag is
+    # pushed — and therefore release-sign.yml never master-key-signs a manifest —
+    # unless every unit/cargo/nix/compositor check is green.
+    needs: gate-checks
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -234,13 +204,67 @@ jobs:
     # ~30 min to the baseline. iso-server/iso-edge stay well under
     # 15 min so bumping the shared cap doesn't waste any runner time
     # on the fast variants.
-    timeout-minutes: 180
+    # 300 (was 180): raw-desktop needs more than iso-desktop — make-disk-image
+    # copies the whole ~20 GB closure into an ext4 inside a VM (slow I/O) on
+    # top of the same closure build; the 2026-07-16 first attempt (run
+    # 29509018080) was CANCELLED at the 180-min wall. The fast variants finish
+    # in ~15 min regardless, so the higher shared cap costs nothing there and
+    # only pays out on hangs.
+    timeout-minutes: 300
+    # raw-desktop (the INSTALLED writable-root image, 2026-07-16) must NEVER
+    # block the nightly: publish-nightly `needs: build-iso`, and a failed matrix
+    # leg fails the whole job for `needs` purposes. Per-leg continue-on-error
+    # keeps a red raw build from holding back the ISO nightlies while the raw
+    # pipeline matures.
+    continue-on-error: ${{ matrix.target == 'raw-desktop' }}
     strategy:
       fail-fast: false
       matrix:
-        target: [iso-server, iso-desktop, iso-edge]
+        # raw-desktop (the installed writable-root image) builds ONLY on manual
+        # dispatch, never automatically on push. Its image-assembly VM runs
+        # under TCG on GitHub runners (no KVM), so it grinds 4h+ and hits the
+        # wall -- and being in the push matrix meant EVERY commit to main spun a
+        # fresh doomed 5h raw build, burning runners for nothing (it is
+        # continue-on-error, so it never blocked the ISO nightly, but it still
+        # churned). Gate it out of push so the ISO nightlies stay clean; build
+        # raw deliberately via `gh workflow run` once the no-VM (systemd-repart)
+        # image path lands. The ISO legs always run.
+        target: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.build_iso == 'true') && fromJSON('["iso-server","iso-desktop","iso-edge","raw-desktop"]') || fromJSON('["iso-server","iso-desktop","iso-edge"]') }}
     steps:
       - uses: actions/checkout@v4
+
+      # raw-* only: put the ENTIRE nix store on the runner's second, nearly
+      # empty ~65 GB data disk (/mnt). The raw build's peak — the ~20 GB
+      # closure PLUS the ~20 GB disk-image output, both in the store — cannot
+      # fit the root disk no matter how much preinstalled bloat is stripped
+      # (2026-07-16 run 29522446118: ENOSPC crashed the nix daemon itself at
+      # 50 min, AFTER the hostedtoolcache purge). Bind-mounting /nix onto /mnt
+      # BEFORE the installer splits the load: store+image on /mnt (~65 GB),
+      # while build tmp, the xz and the split parts keep the root disk's
+      # ~45 GB. The ISO legs stay on the root disk unchanged (their squashfs
+      # peak fits and their cache behaviour is proven).
+      - name: Move /nix to the /mnt data disk (raw only)
+        if: startsWith(matrix.target, 'raw-')
+        run: |
+          sudo mkdir -p /mnt/nix /nix
+          sudo mount --bind /mnt/nix /nix
+          df -h / /mnt
+
+      # raw-* only: make /dev/kvm usable by the nix build sandbox BEFORE the
+      # installer runs (it detects kvm at install time). Without it,
+      # make-disk-image's qemu assembles the ~20 GB ext4 under TCG software
+      # emulation: run 29551668370 spent 4h15m inside nixos-disk-image.drv
+      # (closure done in 30 min) and STILL hit the 5h wall. This is the
+      # GitHub-documented KVM enable recipe (same one Android-emulator jobs
+      # use); with -enable-kvm the image step is minutes, not hours.
+      - name: Enable KVM for the image-assembly VM (raw only)
+        if: startsWith(matrix.target, 'raw-')
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
 
       - uses: DeterminateSystems/nix-installer-action@v12
         with:
@@ -251,6 +275,10 @@ jobs:
             narinfo-cache-negative-ttl = 0
             max-jobs = 2
             cores = 2
+            # kvm: lets make-disk-image's qemu use -enable-kvm (the raw leg's
+            # udev step above guarantees /dev/kvm perms there; harmless on the
+            # ISO legs, which build no VM derivations).
+            system-features = nixos-test benchmark big-parallel kvm
 
       # magic-nix-cache disabled: under heavy load (full NixOS ISO
       # derivation graph) the GitHub Actions Cache quota trips the
@@ -260,17 +288,37 @@ jobs:
       # the build aborts, and `nix build` fails. cache.nixos.org is
       # CDN-backed and has no such quota, so we rely on it exclusively.
 
+      # raw-* only, AFTER the installer: turn the sandbox off at the DAEMON
+      # level. The client-side `--option sandbox false` (attempt 5) is a
+      # RESTRICTED setting -- nix silently ignores it from a non-trusted user,
+      # so the image VM stayed sandboxed away from /dev/kvm and ground on TCG.
+      # A daemon-level nix.conf line cannot be ignored. Applied only on raw
+      # legs; ISO legs keep the sandbox.
+      - name: Disable nix sandbox daemon-wide (raw only)
+        if: startsWith(matrix.target, 'raw-')
+        run: |
+          echo 'sandbox = false' | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl restart nix-daemon || sudo systemctl restart determinate-nixd || true
+          nix config show 2>/dev/null | grep -E '^sandbox' || nix show-config 2>/dev/null | grep -E '^sandbox'
+
       - name: Free disk space (aggressive)
         run: |
           # Full NixOS desktop ISO with glibc-locales + GNOME + wine fonts
           # blows past the default 14GB runner disk. iso-desktop failed in
           # run 24625067423 with glibc-locales-2.40-66.drv builder exit 1
           # — classic ENOSPC symptom. Strip everything we don't need.
+          # 2026-07-16 (run 29509018080): iso-desktop ENOSPC'd at "42 MB free"
+          # mid-mksquashfs — the runner image had accreted enough bloat that the
+          # borderline fit tipped over. /opt/hostedtoolcache is the single
+          # biggest remaining chunk (~12 GB of Python/Node/Go toolcaches this
+          # workflow never touches: its only actions are checkout + the nix
+          # installer); JVM + miniconda add ~3 GB more.
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /opt/hostedtoolcache \
                       /usr/local/.ghcup /usr/share/swift \
                       /usr/local/share/powershell /usr/local/share/chromium \
                       /usr/local/share/chrome /opt/microsoft \
+                      /usr/lib/jvm /usr/share/miniconda \
                       /imagegeneration || true
           sudo docker image prune -a -f 2>/dev/null || true
           sudo apt-get remove -y --purge '^dotnet-.*' '^llvm-.*' \
@@ -278,6 +326,79 @@ jobs:
             firefox powershell mono-devel 2>/dev/null || true
           sudo apt-get autoremove -y && sudo apt-get clean
           df -h /
+
+      # ── Warm the store with the Rust-in-Nix closure at FULL parallelism ──
+      # WHY THIS STEP EXISTS (the iso-desktop 4h+ hang, run that sat in_progress
+      # 4h23m): baking hart.comp (the Smithay/Rust Tier-1 compositor) into the
+      # iso-desktop closure folds a 245-crate Rust+LLVM compile into the ISO build.
+      # The standalone `nix build .#hart-comp` finishes GREEN in the Nix Build
+      # Matrix job because THAT job leaves `cores` at Nix's default (0 = use ALL
+      # runner cores). The ISO job, by contrast, pins `cores = 2` / `max-jobs = 2`
+      # (added in 8477368 to stop the desktop ISO's parallel C closure from
+      # saturating/OOM-ing the 7-core runner). A 2-core throttle is FINE for the
+      # cache-served C closure but CATASTROPHIC for a CPU-bound 245-crate Rust+LLVM
+      # compile — it stretched the desktop ISO build past 4h and it never settled,
+      # so no nightly could complete. hart.comp is NOT in cache.nixos.org (it is a
+      # HART-local Rust derivation), so the throttled ISO `nix build` had to compile
+      # it from source under the 2-core cap.
+      #
+      # FIX: realise the heavy Rust derivations (hart-rust-precedent FIRST, then
+      # hart-comp) into the LOCAL /nix/store HERE, at `--cores 0` (all cores) and
+      # higher `--max-jobs`, BEFORE the throttled ISO step. Once they are in the
+      # store, the ISO `nix build` finds them already built and never recompiles
+      # them — the 2-core cap then only governs the remaining (lighter, mostly
+      # cache-served) closure, exactly as it did before hart.comp existed.
+      #
+      # Scoped to iso-desktop: hart.comp + hart-rust-precedent are pulled in ONLY
+      # by the desktop closure (flake.nix exposes both via the hart-desktop config),
+      # so warming them is wasted work on server/edge. The flake's `.#hart-comp` /
+      # `.#hart-rust-precedent` package ALIASES are always present and build the
+      # package WITHOUT arming the session (they ride lib.mkDefault on every config,
+      # outside the `lib.mkIf comp.enable` block), so this warms the store whether
+      # or not the steward has re-armed `hart.comp.enable`.
+      #
+      # DELIBERATELY runs WHILE comp.enable is still deferred (false): it
+      # continuously PROVES the full-core in-ISO-runner Rust build settles in
+      # normal time, so the steward gets a standing green signal that re-arming
+      # `hart.comp.enable = true` is SAFE (the whole point — make the build viable
+      # so Tier-1 CAN ship). When they DO re-arm it, the hart-comp closure is
+      # already realised in this runner's store and the throttled ISO step reuses
+      # it instead of recompiling under the 2-core cap.
+      #
+      # Never blocks the release: `|| true` — if the precedent/comp build itself
+      # regresses, the ISO step (which, with comp.enable currently OFF, does not
+      # even pull hart.comp) still runs. The Nix Build Matrix job is the hard gate
+      # that red-fails a broken hart-comp; this is purely a store-warming optimiser.
+      - name: Warm Rust closure (hart-rust-precedent, hart-comp) at full cores
+        # raw-desktop folds the SAME desktop closure (hart-comp included), so it
+        # needs the same warm-up to dodge the throttled-cores Rust build hang.
+        if: matrix.target == 'iso-desktop' || matrix.target == 'raw-desktop'
+        working-directory: nixos
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "=== Pre-building the Rust-in-Nix closure at full parallelism ==="
+          echo "    (precedent first to isolate toolchain resolution, then hart-comp)"
+          # --cores 0 = ALL runner cores per derivation (this is the actual fix —
+          # the global cores=2 was strangling the CPU-bound rustc/LLVM compiles).
+          # --max-jobs 2 keeps the CONCURRENT-derivation count (and hence peak
+          # memory) at the SAME ceiling the ISO step already tolerates; we are not
+          # raising memory pressure, only un-throttling the per-build core count.
+          # These per-invocation flags OVERRIDE the global cores=2/max-jobs=2 from
+          # the installer conf for THIS warm-up only; the ISO step below keeps the
+          # 2-core safety cap for its (cache-served) C closure.
+          for tgt in hart-rust-precedent hart-comp; do
+            echo "--- nix build .#$tgt (warm) ---"
+            time nix build ".#$tgt" \
+              --no-link --print-out-paths --show-trace \
+              --cores 0 --max-jobs 2 \
+              --option narinfo-cache-negative-ttl 0 || {
+                echo "::warning title=Rust warm-up::nix build .#$tgt did not complete in the warm step — the ISO step will fall back to its own (throttled) build path. See the Nix Build Matrix job for the authoritative hart-comp gate."
+                # Do not fail the release on a warm-up miss.
+                continue
+              }
+          done
+          echo "=== Rust closure warm-up done ==="
 
       - name: Build ${{ matrix.target }}
         working-directory: nixos
@@ -287,11 +408,25 @@ jobs:
           # pipefail + set -e: `tee` no longer hides a failed `nix build`.
           # Retry once: the magic-nix-cache GitHub API is rate-limited
           # and transient 429s shouldn't break a 90-minute OS build.
+          # raw-*: build with the sandbox OFF. make-disk-image assembles the
+          # image inside a qemu VM, and the nix sandbox only passes /dev/kvm
+          # through when the derivation itself demands the kvm feature -- on
+          # this pin it evidently does not, so the VM ran under TCG software
+          # emulation even with host /dev/kvm at 0666 + the kvm system-feature
+          # advertised (runs 29551668370 and 29565871234: 4h+ inside
+          # nixos-disk-image.drv). sandbox=false lets the builder see the
+          # host's /dev/kvm directly, so qemu engages KVM. CI-only, raw-only;
+          # the ISO legs keep the sandbox.
+          SANDBOX_OPT=""
+          if [[ "${{ matrix.target }}" == raw-* ]]; then
+            SANDBOX_OPT="--option sandbox false"
+          fi
           for attempt in 1 2; do
             echo "=== nix build attempt $attempt ==="
             if time nix build .#${{ matrix.target }} \
                 --no-link --print-out-paths --show-trace \
                 --option narinfo-cache-negative-ttl 0 \
+                $SANDBOX_OPT \
                 | tee /tmp/build-output.txt; then
               break
             fi
@@ -336,6 +471,35 @@ jobs:
           if [[ -z "${FILE:-}" ]] || [[ ! -f "$FILE" ]]; then
             echo "ERROR: No .iso/.qcow2/.raw/.img found in $BUILD_PATH"
             exit 1
+          fi
+
+          # ── raw-* targets: name, checksum, compress (2026-07-16) ─────────
+          # nixos-generators emits a bare `nixos.img` (same name for every
+          # variant), and a ~20 GB raw disk image is unshippable uncompressed.
+          # (a) derive the versioned name from the SAME config.hart.version the
+          #     ISO branding uses (no second version source);
+          # (b) sha256 the UNCOMPRESSED raw under the FINAL name — the flasher
+          #     verifies the decompressed device bytes against this;
+          # (c) xz -T0 -1 (fast, ~2.5x on a nix store) so the shipped parts are
+          #     ISO-sized; the generic split/sha/torrent flow below then treats
+          #     the .raw.xz exactly like an ISO (its own .sha256 for reassembly,
+          #     .part-NN + reassemble.sh companions the publish guard expects);
+          # (d) delete the 20 GB store image before splitting — the runner disk
+          #     can't hold closure + raw + xz + parts at once.
+          if [[ "${{ matrix.target }}" == raw-* ]]; then
+            VARIANT="${{ matrix.target }}"; VARIANT="${VARIANT#raw-}"
+            VER=$(cd "${GITHUB_WORKSPACE}/nixos" && nix eval --raw ".#nixosConfigurations.hart-${VARIANT}.config.hart.version")
+            RAWNAME="hart-os-${VER}-${VARIANT}-x86_64-linux.raw"
+            mkdir -p /tmp/release-artifacts
+            RAW_SHA=$(sha256sum "$FILE" | cut -d' ' -f1)
+            echo "${RAW_SHA}  ${RAWNAME}" > "/tmp/release-artifacts/${RAWNAME}.sha256"
+            echo "raw image: $(du -h "$FILE" | cut -f1), sha256=${RAW_SHA} — compressing"
+            xz -T0 -1 -c "$FILE" > "/tmp/${RAWNAME}.xz"
+            echo "compressed: $(du -h "/tmp/${RAWNAME}.xz" | cut -f1)"
+            sudo nix store delete "$BUILD_PATH" 2>/dev/null \
+              || echo "::warning::nix store delete failed — disk stays tighter for the split"
+            FILE="/tmp/${RAWNAME}.xz"
+            df -h / | tail -1
           fi
 
           BASENAME=$(basename "$FILE")
@@ -383,8 +547,13 @@ jobs:
             } >> "$GITHUB_ENV"
           fi
 
-          # SHA-256 checksum (always computed against the uncut ISO)
-          sha256sum "$FILE" | sed "s|.*/||" > "/tmp/release-artifacts/${BASENAME}.sha256"
+          # SHA-256 checksum (always computed against the uncut ISO). Run sha256sum
+          # from the ISO's own dir on its BASENAME so the file is a real
+          # "<hash>  <basename>" digest that `sha256sum -c` resolves. (The old
+          # `sed "s|.*/||"` was GREEDY -- ".*/" ate the hash too, leaving ONLY the
+          # bare filename with no digest, so the .sha256 companion was unusable.)
+          ( cd "$(dirname "$FILE")" && sha256sum "$(basename "$FILE")" ) \
+            > "/tmp/release-artifacts/${BASENAME}.sha256"
 
           # Create .torrent with web seed.  workflow_dispatch ships a
           # pinned tag (v1.0.0 etc) so the seed points at that exact
@@ -489,6 +658,11 @@ jobs:
         with:
           tag_name: "v${{ github.event.inputs.version }}"
           files: /tmp/release-artifacts/*
+          # DRAFT, never auto-published. build-iso runs PARALLEL to gate-checks
+          # (no needs:), so a manual-dispatch ISO must NOT ship untested. It
+          # uploads as a draft; a human publishes it only after the gate-checks
+          # run for this commit is GREEN (the "test everything that gets built" rule).
+          draft: true
 
       # NOTE: Push-to-main publishing of these ISOs is handled by the
       # `publish-nightly` job below — it uploads the matrix artifacts
@@ -545,14 +719,43 @@ jobs:
   # create as draft (mutable), upload, then publish.
   #
   # We pull this up to a single post-build job so the 3 matrix workers
-  # don't race each other creating/publishing the same release. Uses
-  # `if: always()` so even partial matrix success (e.g. iso-desktop
-  # OOMs but iso-server/iso-edge complete) still ships the two ISOs
-  # that did build.
+  # don't race each other creating/publishing the same release.
+  #
+  # GATED, ALL-OR-NOTHING (the false-green fix):
+  #   `if: always()` is DELIBERATELY GONE. It used to publish on PARTIAL matrix
+  #   success — when iso-desktop FAILED but iso-server/iso-edge built, it shipped
+  #   a 2/3-variant "latest" and reported the run GREEN (the documented false-green
+  #   trap: memory hartos_iso_size_ceiling_and_variant_verify_2026-06-26). Now the
+  #   needs list (gate-checks + ALL three ISO variants via the build-iso matrix +
+  #   the installers) must ALL succeed; a matrix job is `failure` if ANY leg fails
+  #   (fail-fast:false only lets the others finish), so one failed variant SKIPS
+  #   this publish. /releases/latest then keeps pointing at the last COMPLETE,
+  #   TESTED release instead of a broken/untested partial. `gate-checks` adds the
+  #   "never publish untested" half — no nightly unless every unit/cargo/nix/
+  #   compositor/nixosTest check is green. (build-iso stays PARALLEL to gate-checks
+  #   so the heavy VM suite never serialises into the 6h ISO build.)
+  #
+  # NIGHTLY GATE SPLIT (2026-07-04): the nightly is a PREVIEW. It publishes when all THREE
+  # ISO variants + the installers BUILD — build-iso stays all-or-nothing per the matrix, so
+  # the 2/3-variant false-green is STILL fixed, and building the full OS closure is itself a
+  # strong correctness signal (a broken import / eval / dep fails the build). It NO LONGER
+  # hard-blocks on `gate-checks` (unit/cargo/nix/compositor/nixosTests): the heavy VM
+  # nixosTest suite carries pre-existing debt that was blocking EVERY nightly. gate-checks
+  # STILL runs in parallel (visible red) AND STILL fully gates the SIGNED release —
+  # `tag-and-sign` keeps `needs: gate-checks`, so nothing master-key-signed ever ships
+  # untested. Nightlies are previews; signed releases stay strict.
   publish-nightly:
-    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [build-iso, build-installers]
     runs-on: ubuntu-latest
+    # Uploading ~6.5 GB of split ISO parts is comfortably under 90 min.
+    # Without its own budget this job inherits GitHub's 6h hard wall, so a
+    # slow build-iso run that pushed the pipeline long could get
+    # publish-nightly cancelled mid-upload, shipping a partial (e.g.
+    # 3/4-part) release. A dedicated budget fails loud instead, and the
+    # verify-before-publish guard below leaves an unpublished DRAFT rather
+    # than a broken "latest".
+    timeout-minutes: 90
     permissions:
       contents: write
     steps:
@@ -563,6 +766,17 @@ jobs:
         with:
           path: /tmp/all-artifacts
           pattern: iso-*
+          merge-multiple: true
+
+      # Best-effort: the raw-desktop leg is continue-on-error (it must never
+      # block the ISO nightly), so its artifact may not exist. This download
+      # mirrors that — a miss is a warning, not a failed publish.
+      - name: Download raw image artifacts (best-effort)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/all-artifacts
+          pattern: raw-*
           merge-multiple: true
 
       - name: Download hevolve-install binaries
@@ -601,8 +815,14 @@ jobs:
 
           # Clean up the tag-less draft from the prior refactor (has
           # tag_name=nightly but tag never got created). Idempotent.
-          echo "=== Cleaning up any tag-less nightly drafts ==="
-          gh api "repos/${REPO}/releases" --jq '.[] | select(.draft==true and .tag_name=="nightly") | .id' \
+          echo "=== Cleaning up any tag-less nightly drafts (best-effort) ==="
+          # The LIST call is guarded too: under the repo's immutable-releases
+          # policy (and GH permission-service wobbles) `gh api /releases` can 403
+          # for the Actions integration token, and with pipefail an unguarded list
+          # kills the WHOLE publish before the release is even created (real
+          # 2026-07-19: three consecutive publish-nightly failures; the nightly
+          # had to be hand-published). Cleanup is hygiene, never a gate.
+          { gh api "repos/${REPO}/releases" --jq '.[] | select(.draft==true and .tag_name=="nightly") | .id' 2>/dev/null || true; } \
             | while read -r RID; do
               [[ -n "$RID" ]] && gh api -X DELETE "repos/${REPO}/releases/${RID}" || true
             done
@@ -621,11 +841,111 @@ jobs:
           # scripts/hart_usb_flasher.py.
           cp "${GITHUB_WORKSPACE}/scripts/hart_usb_flasher.py" /tmp/all-artifacts/ 2>/dev/null || true
 
-          echo "=== Uploading artifacts ==="
-          find /tmp/all-artifacts -maxdepth 2 -type f | while read -r f; do
+          echo "=== Uploading artifacts (deterministic order, part-00 first) ==="
+          # `find` alone yields filesystem order; `sort` makes the upload
+          # sequence reproducible and ships the contiguous .part-00.. first.
+          # mapfile + an array loop (NOT `find | while read`) is deliberate:
+          # a `while` in a pipeline runs in a subshell, so an `exit 1` there
+          # would not abort this script and a partial upload could still get
+          # published. The array loop runs in the current shell, so a fatal
+          # upload aborts the whole job.
+          mapfile -t LOCAL_FILES < <(find /tmp/all-artifacts -maxdepth 2 -type f | sort)
+
+          # 3-attempt retry per file so one transient gh/network hiccup
+          # re-tries instead of aborting the whole set-eo-pipefail job.
+          # --clobber keeps every (re)upload idempotent.
+          upload_with_retry() {
+            local f="$1" name attempt
+            name="$(basename "$f")"
+            for attempt in 1 2 3; do
+              if gh release upload "$TAG" "$f" --repo "$REPO" --clobber; then
+                return 0
+              fi
+              echo "  !! upload attempt ${attempt}/3 failed for ${name}"
+              sleep $((attempt * 5))
+            done
+            return 1
+          }
+
+          for f in "${LOCAL_FILES[@]}"; do
             echo "  -> $(basename "$f")"
-            gh release upload "$TAG" "$f" --repo "$REPO" --clobber
+            upload_with_retry "$f" || { echo "FATAL: ${f} failed to upload after 3 attempts"; exit 1; }
           done
+
+          # --- VERIFY-BEFORE-PUBLISH guard --------------------------------
+          # Never flip the release out of draft on a partial upload. A 6h
+          # job-wall cancellation or a dropped chunk would otherwise ship a
+          # broken "latest" (e.g. a 3/4-part desktop ISO that cannot be
+          # reassembled). We assert (1) every split ISO downloaded here has a
+          # contiguous .part-00..part-NN set plus its .reassemble.sh and
+          # .sha256 companions, and (2) every local artifact is a published
+          # asset on the release. Any gap is re-uploaded once more and
+          # re-checked; if still missing we exit 1, leaving the unpublished
+          # DRAFT for the keep-newest-3 prune while /releases/latest keeps
+          # pointing at the previous COMPLETE release.
+          echo "=== Verifying all artifacts present before publish ==="
+
+          remote_asset_names() {
+            gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null
+          }
+
+          # (1) Local contiguity of any split ISO actually downloaded.
+          # split(1) -d -a 2 emits .part-00 .part-01 ...; a gap means
+          # download-artifact dropped a chunk, so fail loud before publish.
+          declare -A PART_MAX PART_CNT
+          for f in "${LOCAL_FILES[@]}"; do
+            name="$(basename "$f")"
+            case "$name" in
+              *.part-[0-9][0-9])
+                base="${name%.part-*}"
+                idx=$((10#${name##*.part-}))
+                PART_CNT["$base"]=$(( ${PART_CNT["$base"]:-0} + 1 ))
+                if [[ -z "${PART_MAX[$base]:-}" || "$idx" -gt "${PART_MAX[$base]}" ]]; then
+                  PART_MAX["$base"]=$idx
+                fi
+                ;;
+            esac
+          done
+          for base in "${!PART_MAX[@]}"; do
+            expected=$(( ${PART_MAX[$base]} + 1 ))   # parts are 0-indexed
+            if [[ "${PART_CNT[$base]}" -ne "$expected" ]]; then
+              echo "FATAL: ${base}: found ${PART_CNT[$base]} parts but highest index ${PART_MAX[$base]} implies ${expected} (a chunk is missing)"
+              exit 1
+            fi
+            for companion in "${base}.reassemble.sh" "${base}.sha256"; do
+              if ! printf '%s\n' "${LOCAL_FILES[@]##*/}" | grep -Fxq "$companion"; then
+                echo "FATAL: split ISO ${base} is missing companion ${companion} locally"
+                exit 1
+              fi
+            done
+            echo "  ok: ${base} has all ${expected} parts + .reassemble.sh + .sha256"
+          done
+
+          # (2) Remote presence: every local artifact must be a published
+          # asset. Re-upload any stragglers once more, then re-verify.
+          REMOTE="$(remote_asset_names || true)"
+          MISSING=()
+          for f in "${LOCAL_FILES[@]}"; do
+            grep -Fxq "$(basename "$f")" <<< "$REMOTE" || MISSING+=("$f")
+          done
+          if [[ "${#MISSING[@]}" -gt 0 ]]; then
+            echo "  ${#MISSING[@]} asset(s) not yet on the release, re-uploading:"
+            for f in "${MISSING[@]}"; do
+              echo "    -> $(basename "$f")"
+              upload_with_retry "$f" || echo "    (re-upload still failing for $(basename "$f"))"
+            done
+            REMOTE="$(remote_asset_names || true)"
+            STILL=()
+            for f in "${MISSING[@]}"; do
+              grep -Fxq "$(basename "$f")" <<< "$REMOTE" || STILL+=("$(basename "$f")")
+            done
+            if [[ "${#STILL[@]}" -gt 0 ]]; then
+              echo "FATAL: ${#STILL[@]} asset(s) could not be published: ${STILL[*]}"
+              echo "Leaving '$TAG' as an unpublished DRAFT; /releases/latest is unchanged."
+              exit 1
+            fi
+          fi
+          echo "Verified all ${#LOCAL_FILES[@]} artifact(s) present on '$TAG'."
 
           echo "=== Publishing as latest (immutable after publish) ==="
           gh release edit "$TAG" --repo "$REPO" --draft=false --latest=true --prerelease=false
@@ -681,9 +1001,11 @@ jobs:
           mkdir -p _site/test-reports/junit _site/test-reports/coverage
           python -m pytest \
             tests/unit/ tests/functional/ \
-            --noconftest -v --tb=short \
+            -v --tb=short \
             --junitxml=_site/test-reports/junit/results.xml \
             --cov=integrations --cov=security --cov=core \
+            --cov=hart_intelligence_entry --cov=create_recipe --cov=reuse_recipe \
+            --cov=lifecycle_hooks --cov=helper --cov=helper_ledger \
             --cov-report=html:_site/test-reports/coverage \
             --cov-report=term-missing || true
 

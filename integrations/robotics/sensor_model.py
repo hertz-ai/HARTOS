@@ -11,7 +11,15 @@ sensor data is structured consistently for that unified space.
 
 Supported sensor types:
     imu, gps, encoder, force_torque, proximity, temperature,
-    camera, depth, lidar, contact, battery
+    camera, audio, depth, lidar, contact, battery
+
+Multimodal USER input (video + audio) rides this SAME schema — there is NO
+separate ingestion path.  A camera/audio reading carries a ``stream_source``
+('camera' | 'desktop' | 'peer_user' | 'meeting' | 'mic' | 'tts') so HevolveAI
+classifies the origin and applies the proper learning signal (the user's own
+stream = self-supervised; another user's stream = privacy-gated, weighted
+differently).  All of it flows SensorStore → WorldModelBridge
+.ingest_sensor_batch / .submit_sensor_frame → HevolveAI /v1/sensor/ingest.
 """
 import time
 from dataclasses import dataclass, field
@@ -51,7 +59,20 @@ SENSOR_SCHEMAS = {
     },
     'camera': {
         'required': [],
-        'optional': ['frame_base64', 'width', 'height', 'encoding', 'description'],
+        # stream_source classifies the video origin so HevolveAI weights the
+        # learning signal correctly: 'camera' (user's own camera, self-
+        # supervised) | 'desktop' (screen-grounded) | 'peer_user' | 'meeting'
+        # (another user's stream — privacy-gated, weighted differently).
+        'optional': ['frame_base64', 'width', 'height', 'encoding', 'description',
+                     'stream_source'],
+    },
+    'audio': {
+        'required': [],
+        # stream_source: 'mic' | 'desktop' | 'peer_user' | 'meeting' | 'tts'.
+        # Same unified latent space as text/vision/motor — no separate path.
+        'optional': ['pcm_base64', 'wav_base64', 'sample_rate', 'channels',
+                     'duration_ms', 'encoding', 'transcript', 'lang',
+                     'stream_source'],
     },
     'depth': {
         'required': [],
@@ -83,6 +104,7 @@ DEFAULT_TTL = {
     'proximity': 1.0,
     'temperature': 30.0,
     'camera': 2.0,
+    'audio': 2.0,
     'depth': 2.0,
     'lidar': 1.0,
     'contact': 0.5,

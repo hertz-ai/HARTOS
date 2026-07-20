@@ -13,8 +13,14 @@ The core innovation of HART OS: learn a task once, then replay it without repeat
 ### REUSE Mode
 
 1. A matching recipe is loaded from disk.
-2. Each step is replayed deterministically -- no LLM calls required.
-3. Achieves approximately **90% faster** execution compared to CREATE mode.
+2. The proven steps are replayed as an **LLM-GUIDED** path: the agent follows the recipe
+   and **adapts each step to the live screen/context** (`reuse_recipe.py` — "Adapt these
+   steps to the current screen state as needed"). It is **NOT** a deterministic macro.
+   Intelligence stays in the loop; a pure code replay would break the instant the world
+   differs and would not be intelligence at all.
+3. The speedup (~**90% fewer/cheaper LLM calls** vs CREATE) comes from **skipping
+   re-decomposition + exploration + re-verification** — the expensive reasoning CREATE
+   already paid for — **not** from removing the LLM.
 
 ## Hierarchical Task Decomposition
 

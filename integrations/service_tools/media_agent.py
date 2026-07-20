@@ -195,7 +195,7 @@ def _select_audio_tool(task: str = 'music') -> str:
             if tool:
                 return tool
     except Exception:
-        pass
+        logger.exception("_select_audio_tool: swallowed Exception")
     # Fallback defaults
     return 'diffrhythm' if task in ('sing', 'lyrics') else 'acestep'
 
@@ -222,7 +222,7 @@ def _select_video_tool() -> str:
             if tool:
                 return tool
     except Exception:
-        pass
+        logger.exception("_select_video_tool: swallowed Exception")
 
     # ── Fallback: direct VRAM query ──────────────────────────────────────────
     try:
@@ -232,7 +232,7 @@ def _select_video_tool() -> str:
         if free_gb >= 8.0:
             return 'wan2gp'
     except Exception:
-        pass
+        logger.exception("_select_video_tool: swallowed Exception")
     return 'ltx2'
 
 
@@ -244,7 +244,7 @@ def _get_tool_base_url(tool_name: str) -> Optional[str]:
         if tool:
             return tool.base_url.rstrip('/')
     except Exception:
-        pass
+        logger.exception("_get_tool_base_url: swallowed Exception")
     return None
 
 

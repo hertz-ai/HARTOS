@@ -190,8 +190,25 @@ def is_genuine_user_request(request_id) -> bool:
     re-stamped _last_user_chat_at, so should_yield_to_user() read
     'user active' forever (~24h of continuous yield, 1142 starvation
     overrides) and the flywheel daemon never ran its normal path.
+
+    EMPTY / None request_id is NOT a user — it is background (returns False).
+    Live evidence (llm_outbound.jsonl, 2026-06-17): ~88% of empty-rid 4B calls
+    are daemon autogen turns whose 'daemon_<goal>' tag was lost crossing
+    autogen's worker-thread boundary (threading.local() does not cross it; only
+    the _request_id_var contextvar does, and it binds '' when recipe() /
+    chat_agent() are invoked without the id).  Treating empty as a user let
+    those 1,926 calls masquerade as a live turn, so the foreground preempt
+    (_is_background_call -> not is_genuine_user_request) never saw them as
+    background, never aborted them, and a real "hi" queued behind them on the
+    single 4B.  Genuine user calls always carry an id (the Nunba adapter
+    defaults request_id to a timestamp when the client omits one, so an INBOUND
+    request is never empty), so empty == untagged == background here.  This is
+    the SOLE authority for "is this a user?" — the inbound mark_view gate
+    (_chat_request_is_genuine) and the outbound abort gate (_is_background_call)
+    both delegate here with NO bespoke, caller-specific rule, so they can never
+    give different answers for the same id.
     """
-    return not (bool(request_id) and str(request_id).startswith('daemon_'))
+    return bool(request_id) and not str(request_id).startswith('daemon_')
 
 
 def is_current_request_autonomous() -> bool:
@@ -264,7 +281,15 @@ def is_transient_deferral() -> bool:
     breaker-open), so the daemon's notion of "transient" never drifts from the
     dispatcher's."""
     try:
-        return is_user_recently_active() or _cb_is_open()
+        if is_user_recently_active() or _cb_is_open():
+            return True
+        # A goal whose in-flight LLM call was just PREEMPTED for a live user turn
+        # (foreground abort / llama_scheduler eviction) is a transient defer too —
+        # re-queue it next tick, never count it toward auto-pause.  The user may
+        # already be "inactive" by the time we re-check, so this explicit preempt
+        # signal catches the window is_user_recently_active() can miss.
+        from core.foreground import preempted_recently
+        return preempted_recently()
     except Exception:
         return False
 
@@ -741,7 +766,29 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
         try:
             from routes.hartos_backend_adapter import chat as hevolve_chat
         except ImportError:
-            from hartos_backend_adapter import chat as hevolve_chat
+            try:
+                from hartos_backend_adapter import chat as hevolve_chat
+            except ImportError:
+                # NATIVE HARTOS (no Nunba adapter — the module lives only in Nunba):
+                # call the in-process /chat via the app's OWN test client — the SAME
+                # canonical route Tier-2 uses, minus the loopback socket, exactly as
+                # routes.hartos_backend_adapter.chat does in Nunba. Reuses the /chat
+                # pipeline + _internal_auth_headers; no new dispatch path. Any error
+                # here still falls through to the Tier-2 HTTP proxy below (bounded-safe).
+                def hevolve_chat(text=None, user_id=None, agent_id=None,
+                                 create_agent=True, casual_conv=False,
+                                 autonomous=True, request_id=None, **_kw):
+                    from hart_intelligence_entry import app as _app
+                    _payload = {
+                        'prompt': text, 'user_id': user_id, 'prompt_id': agent_id,
+                        'create_agent': create_agent, 'casual_conv': casual_conv,
+                        'autonomous': autonomous, 'request_id': request_id,
+                        'task_source': 'own',
+                    }
+                    with _app.test_client() as _c:
+                        _r = _c.post('/chat', json=_payload,
+                                     headers=_internal_auth_headers())
+                        return _r.get_json() or {}
 
         # USER PRIORITY: if user chatted recently, skip this tick — let user have the LLM
         if is_user_recently_active():

@@ -189,9 +189,9 @@ class TestNewsSeedGoals:
 # ─── Tool Registration Tests ───
 
 class TestNewsToolRegistration:
-    """Verify register_news_tools registers all 5 tools."""
+    """Verify register_news_tools registers all 7 tools."""
 
-    def test_registers_five_tools(self):
+    def test_registers_seven_tools(self):
         from integrations.agent_engine.news_tools import register_news_tools
 
         helper = MagicMock()
@@ -202,8 +202,8 @@ class TestNewsToolRegistration:
 
         register_news_tools(helper, assistant, user_id='123')
 
-        assert helper.register_for_llm.call_count == 5
-        assert assistant.register_for_execution.call_count == 5
+        assert helper.register_for_llm.call_count == 7
+        assert assistant.register_for_execution.call_count == 7
 
     def test_tool_names(self):
         from integrations.agent_engine.news_tools import register_news_tools
@@ -224,6 +224,8 @@ class TestNewsToolRegistration:
         assert 'send_news_notification' in registered_names
         assert 'get_trending_news' in registered_names
         assert 'get_news_metrics' in registered_names
+        assert 'mark_news_for_web' in registered_names
+        assert 'list_news_for_web' in registered_names
 
 
 # ─── Individual Tool Tests ───
@@ -436,6 +438,139 @@ class TestGetNewsMetrics:
         metrics = self._get_tool()
         result = json.loads(metrics())
         assert 'error' in result or 'total_sent' in result
+
+
+class TestMarkNewsForWeb:
+    """Test the publish_web tagging hook (mark_news_for_web / list_news_for_web).
+
+    The marker mirrors feed_import.py's ``<!-- feed_hash:... -->`` content
+    convention — no schema change; flagged items are found via
+    ``Post.content.contains(PUBLISH_WEB_MARKER)`` exactly like feed dedup.
+    """
+
+    def _get_tools(self):
+        from integrations.agent_engine.news_tools import register_news_tools
+        helper = MagicMock()
+        assistant = MagicMock()
+        tools = {}
+
+        def capture_llm(name, description):
+            def decorator(fn):
+                tools[name] = fn
+                return fn
+            return decorator
+
+        helper.register_for_llm.side_effect = capture_llm
+        assistant.register_for_execution.return_value = lambda f: f
+
+        register_news_tools(helper, assistant, user_id='42')
+        return tools
+
+    def test_mark_appends_publish_web_marker(self):
+        from integrations.agent_engine.news_tools import PUBLISH_WEB_MARKER
+        mark = self._get_tools()['mark_news_for_web']
+
+        mock_post = MagicMock()
+        mock_post.id = 'post-1'
+        mock_post.title = 'Flag me'
+        mock_post.content = 'Body\n\n<!-- feed_hash:abc123 -->'
+
+        with patch('integrations.social.models.get_db') as mock_get_db:
+            mock_db = MagicMock()
+            mock_get_db.return_value = mock_db
+            mock_db.query.return_value.filter.return_value.first.return_value = mock_post
+
+            result = json.loads(mark(post_id='post-1'))
+
+            assert result['success'] is True
+            assert result['publish_web'] is True
+            assert PUBLISH_WEB_MARKER in mock_post.content
+            mock_db.commit.assert_called_once()
+
+    def test_mark_is_idempotent(self):
+        """Flagging an already-flagged post must not stack markers."""
+        from integrations.agent_engine.news_tools import PUBLISH_WEB_MARKER
+        mark = self._get_tools()['mark_news_for_web']
+
+        mock_post = MagicMock()
+        mock_post.id = 'post-1'
+        mock_post.title = 'Already flagged'
+        mock_post.content = f'Body\n\n{PUBLISH_WEB_MARKER}'
+
+        with patch('integrations.social.models.get_db') as mock_get_db:
+            mock_db = MagicMock()
+            mock_get_db.return_value = mock_db
+            mock_db.query.return_value.filter.return_value.first.return_value = mock_post
+
+            result = json.loads(mark(post_id='post-1'))
+
+            assert result['success'] is True
+            assert mock_post.content.count(PUBLISH_WEB_MARKER) == 1
+            mock_db.commit.assert_not_called()
+
+    def test_unmark_removes_marker(self):
+        from integrations.agent_engine.news_tools import PUBLISH_WEB_MARKER
+        mark = self._get_tools()['mark_news_for_web']
+
+        mock_post = MagicMock()
+        mock_post.id = 'post-1'
+        mock_post.title = 'Unflag me'
+        mock_post.content = f'Body\n\n{PUBLISH_WEB_MARKER}'
+
+        with patch('integrations.social.models.get_db') as mock_get_db:
+            mock_db = MagicMock()
+            mock_get_db.return_value = mock_db
+            mock_db.query.return_value.filter.return_value.first.return_value = mock_post
+
+            result = json.loads(mark(post_id='post-1', publishable=False))
+
+            assert result['success'] is True
+            assert result['publish_web'] is False
+            assert PUBLISH_WEB_MARKER not in mock_post.content
+            mock_db.commit.assert_called_once()
+
+    def test_mark_unknown_post_returns_error(self):
+        mark = self._get_tools()['mark_news_for_web']
+
+        with patch('integrations.social.models.get_db') as mock_get_db:
+            mock_db = MagicMock()
+            mock_get_db.return_value = mock_db
+            mock_db.query.return_value.filter.return_value.first.return_value = None
+
+            result = json.loads(mark(post_id='nope'))
+            assert 'error' in result
+
+    def test_list_returns_flagged_items_without_marker(self):
+        from integrations.agent_engine.news_tools import PUBLISH_WEB_MARKER
+        list_tool = self._get_tools()['list_news_for_web']
+
+        mock_post = MagicMock()
+        mock_post.id = 'post-1'
+        mock_post.title = 'Flagged story'
+        mock_post.content = f'Body text\n\n{PUBLISH_WEB_MARKER}'
+        mock_post.link_url = 'https://example.com/article'
+        mock_post.source_channel = 'feed:example.com'
+        mock_post.created_at = datetime(2026, 1, 15)
+
+        with patch('integrations.social.models.get_db') as mock_get_db:
+            mock_db = MagicMock()
+            mock_get_db.return_value = mock_db
+            (mock_db.query.return_value.filter.return_value
+             .order_by.return_value.limit.return_value.all.return_value) = [mock_post]
+
+            result = json.loads(list_tool())
+
+            assert result['count'] == 1
+            item = result['items'][0]
+            assert item['title'] == 'Flagged story'
+            assert item['link_url'] == 'https://example.com/article'
+            # Marker is internal bookkeeping — never leaks to the agent
+            assert PUBLISH_WEB_MARKER not in item['content']
+
+    def test_list_handles_error(self):
+        list_tool = self._get_tools()['list_news_for_web']
+        result = json.loads(list_tool())
+        assert 'error' in result or 'items' in result
 
 
 class TestSubscribeNewsFeed:

@@ -29,6 +29,9 @@ in
       wantedBy = [ "hart.target" ];
 
       environment = {
+        # Recipe/prompts data -> the writable StateDirectory (cfg.dataDir), not the
+        # read-only /nix/store package dir; get_data_dir()'s priority-2 signal.
+        HARTOS_DATA_DIR = cfg.dataDir;
         HEVOLVE_DB_PATH = "${cfg.dataDir}/hevolve_database.db";
         PYTHONDONTWRITEBYTECODE = "1";
         PYTHONUNBUFFERED = "1";

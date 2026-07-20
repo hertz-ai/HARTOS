@@ -22,6 +22,7 @@ Runtime compute settings can also be updated via the **Settings API** (`PUT /api
 |----------|-------------|---------|
 | `OPENAI_API_KEY` | OpenAI API key for GPT models | (required) |
 | `GROQ_API_KEY` | Groq API key for fast inference | (optional) |
+| `GLM_API_KEY` | GLM 5.2 (Zhipu/Z.ai) key, OpenAI-compatible (`ZHIPUAI_API_KEY` also accepted; `GLM_BASE_URL`/`GLM_MODEL` override endpoint/model) | (optional) |
 | `LANGCHAIN_API_KEY` | LangChain API key for tracing | (optional) |
 | `HEVOLVE_BASE_URL` | Base URL for this node's API | `https://hevolve.ai` |
 

@@ -345,6 +345,60 @@ class TestFlatpakHandler(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn('not available', result.error)
 
+    @patch('subprocess.run')
+    def test_flatpak_nonzero_exit_fails(self, mock_run):
+        """A non-zero flatpak exit must be reported as failure with the stderr
+        surfaced — not swallowed into a silent success."""
+        mock_run.return_value = MagicMock(
+            returncode=1, stderr='error: nothing matches org.bad.App')
+        result = self.installer._install_flatpak(
+            InstallRequest(source='flathub:org.bad.App'))
+        self.assertFalse(result.success)
+        self.assertIn('nothing matches', result.error)
+
+    @patch('subprocess.run')
+    def test_flatpak_uses_user_scope_and_writable_dir(self, mock_run):
+        """Regression guard for the 98a307af --user fix: the INSTALL invocation
+        must carry --user and run with FLATPAK_USER_DIR pointed at the writable
+        per-user dir (system scope is denied to the sandboxed hart service)."""
+        mock_run.return_value = MagicMock(returncode=0)
+        self.installer._install_flatpak(
+            InstallRequest(source='flathub:org.gimp.GIMP'))
+        # Last call is the actual install (an earlier call is _ensure_flathub's
+        # remote-add). Find the install invocation among the recorded calls.
+        install_calls = [
+            c for c in mock_run.call_args_list if 'install' in c[0][0]]
+        self.assertTrue(install_calls, 'no flatpak install call was made')
+        cmd = install_calls[-1][0][0]
+        self.assertIn('--user', cmd)
+        env = install_calls[-1].kwargs.get('env') or {}
+        self.assertEqual(
+            env.get('FLATPAK_USER_DIR'), self.installer._flatpak_dir)
+
+    @patch('subprocess.run')
+    def test_flatpakref_file_installed_by_path(self, mock_run):
+        """A .flatpakref FILE must install by path (the file self-describes its
+        remote+ref) — NOT via a 'flathub' positional, which would make flatpak
+        hunt for a ref named after the file path and fail. Guards the advertised
+        .flatpakref support (detect_platform maps it to FLATPAK)."""
+        mock_run.return_value = MagicMock(returncode=0)
+        with tempfile.NamedTemporaryFile(
+                suffix='.flatpakref', delete=False) as f:
+            f.write(b'[Flatpak Ref]\nName=org.gimp.GIMP\n')
+            src = f.name
+        try:
+            result = self.installer._install_flatpak(
+                InstallRequest(source=src))
+            self.assertTrue(result.success)
+            install_calls = [
+                c for c in mock_run.call_args_list if 'install' in c[0][0]]
+            cmd = install_calls[-1][0][0]
+            # The file path is passed directly; NO 'flathub' remote positional.
+            self.assertIn(src, cmd)
+            self.assertNotIn('flathub', cmd)
+        finally:
+            os.unlink(src)
+
 
 class TestAppImageHandler(unittest.TestCase):
     """Tests for _install_appimage."""
@@ -435,6 +489,25 @@ class TestWindowsHandler(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    @patch('subprocess.run')
+    @patch('shutil.which', return_value='/usr/bin/wine64')
+    def test_windows_nonzero_exit_fails(self, _which, mock_run):
+        """Regression guard: wine's non-zero exit is a reliable FAILURE and must
+        report success=False (this used to return success=True unconditionally,
+        pinning a desktop icon that launched nothing)."""
+        mock_run.return_value = MagicMock(
+            returncode=1, stderr='wine: cannot find installer.exe')
+        with tempfile.NamedTemporaryFile(suffix='.exe', delete=False) as f:
+            f.write(b'MZ' + b'\x00' * 100)
+            path = f.name
+        try:
+            result = self.installer._install_windows(
+                InstallRequest(source=path))
+            self.assertFalse(result.success)
+            self.assertIn('wine exited 1', result.error)
+        finally:
+            os.unlink(path)
+
     def test_windows_missing_file(self):
         result = self.installer._install_windows(
             InstallRequest(source='/no/such/app.exe'))
@@ -453,40 +526,41 @@ class TestAndroidHandler(unittest.TestCase):
         import shutil
         shutil.rmtree(self.installer._install_dir, ignore_errors=True)
 
-    def test_android_no_binder(self):
-        """No /dev/binder → error about Android subsystem."""
+    def test_android_no_waydroid(self):
+        """No waydroid runtime → honest 'not available' message + staged (NOT a
+        faked success). Updated for the Waydroid contract: the old copy-claims-
+        success fallback was removed."""
         with tempfile.NamedTemporaryFile(suffix='.apk', delete=False) as f:
             f.write(b'PK' + b'\x00' * 100)
             path = f.name
         try:
-            with patch('os.path.exists', return_value=False):
+            with patch('integrations.agent_engine.app_installer.shutil.which',
+                       return_value=None):
                 result = self.installer._install_android(
                     InstallRequest(source=path))
                 self.assertFalse(result.success)
-                self.assertIn('Android subsystem', result.error)
+                self.assertTrue(result.staged)
+                self.assertIn('hart.subsystems.android', result.error)
         finally:
             os.unlink(path)
 
-    @patch('shutil.which', return_value=None)
-    @patch('os.path.exists', side_effect=lambda p: p == '/dev/binder' or os.path.exists.__wrapped__(p) if hasattr(os.path.exists, '__wrapped__') else True)
-    def test_android_fallback_copy(self, mock_exists, _which):
-        """With binder but no adb → fallback to copy."""
+    def test_android_no_session_stages_not_installed(self):
+        """waydroid present but no live session → STAGED, not installed.
+        A copy is NOT an install; success must be False (the fixed fake-success
+        bug)."""
         with tempfile.NamedTemporaryFile(suffix='.apk', delete=False) as f:
             f.write(b'PK' + b'\x00' * 100)
             path = f.name
         try:
-            # Patch os.path.exists to return True for /dev/binder, pass-through for others
-            def side_effect(p):
-                if p == '/dev/binder':
-                    return True
-                return os.path.isfile(p)
-
-            with patch('integrations.agent_engine.app_installer.os.path.exists', side_effect=side_effect):
-                with patch('integrations.agent_engine.app_installer.shutil.which', return_value=None):
-                    result = self.installer._install_android(
-                        InstallRequest(source=path))
-                    self.assertTrue(result.success)
-                    self.assertEqual(result.platform, 'android')
+            with patch('integrations.agent_engine.app_installer.shutil.which',
+                       return_value='/usr/bin/waydroid'), \
+                 patch.object(self.installer, '_waydroid_session_live',
+                              return_value=False):
+                result = self.installer._install_android(
+                    InstallRequest(source=path))
+                self.assertFalse(result.success)
+                self.assertTrue(result.staged)
+                self.assertEqual(result.platform, 'android')
         finally:
             os.unlink(path)
 
@@ -510,12 +584,15 @@ class TestMacOSHandler(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn('Darling', result.error)
 
-    @patch('shutil.which', return_value='/usr/bin/darling')
-    def test_macos_with_darling_not_automated(self, _):
+    @patch('integrations.agent_engine.app_installer.shutil.which',
+           return_value='/usr/bin/darling')
+    def test_macos_dmg_refused_honestly(self, _):
+        """.dmg has no reliable headless install path under Darling → honest
+        failure (updated from the old 'not yet automated' stub)."""
         result = self.installer._install_macos(
             InstallRequest(source='app.dmg'))
         self.assertFalse(result.success)
-        self.assertIn('not yet automated', result.error)
+        self.assertIn('headless', result.error)
 
 
 class TestExtensionHandler(unittest.TestCase):
@@ -908,8 +985,9 @@ class TestPlatformsRoute(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         platforms = data['platforms']
-        # Should have 7 platforms (all except UNKNOWN)
-        self.assertEqual(len(platforms), 7)
+        # Should have 9 platforms (all except UNKNOWN): the original 7 plus the
+        # new snap (honest-unsupported) and browser_ext (.crx/.xpi) surfaces.
+        self.assertEqual(len(platforms), 9)
         names = [p['platform'] for p in platforms]
         self.assertIn('nix', names)
         self.assertIn('flatpak', names)
@@ -917,7 +995,12 @@ class TestPlatformsRoute(unittest.TestCase):
         self.assertIn('windows', names)
         self.assertIn('android', names)
         self.assertIn('macos', names)
+        self.assertIn('snap', names)
+        self.assertIn('browser_ext', names)
         self.assertIn('extension', names)
+        # snap is shown but honestly greyed out (unsupported on this image).
+        snap = [p for p in platforms if p['platform'] == 'snap'][0]
+        self.assertFalse(snap['available'])
 
     def test_appimage_always_available(self):
         client = _make_installer_app()

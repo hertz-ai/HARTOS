@@ -39,8 +39,8 @@ if ROOT not in sys.path:
     ('daemon_95dfbf02', False),            # daemon goal id
     ('c4b09d1f-1f09-40b3-9d39', True),     # genuine user request (uuid)
     ('req_user_123', True),                # genuine user request
-    ('', True),                            # missing id → treat as user (fail-safe to active)
-    (None, True),                          # None → treat as user
+    ('', False),                           # untagged → BACKGROUND/abortable (live 2026-06-17: empty is dominated by daemon calls that lost their tag, not users)
+    (None, False),                         # None → background (same); inbound /chat keeps its own fail-open in mark_view._chat_request_is_genuine
 ])
 def test_is_genuine_user_request(request_id, expected):
     from integrations.agent_engine.dispatch import is_genuine_user_request

@@ -482,6 +482,54 @@ CHAT_STAGE_TEXTS: dict = {
 CHAT_STAGES: frozenset = frozenset(CHAT_STAGE_TEXTS)
 
 
+# Chat-bubble wire contract (#508) — the `priority` + `action` values carried in
+# the com.hertzai.hevolve.chat.{user_id} envelope and keyed on by the frontend
+# (Demopage.handleDataReceived: priority===49 && action==='Thinking').
+# CANONICAL here so the publisher (core.peer_link.crossbar_publish) and every
+# consumer share ONE source — `49` / 'Thinking' / 'Status' were previously magic
+# literals duplicated across both envelope shapes.  The frontend mirrors these in
+# landing-page/src/constants/chatBubble.js (cross-language; keep in lockstep).
+CHAT_BUBBLE_PRIORITY: int = 49
+# The model's ACTUAL reasoning → rendered as Thought-process Steps (id-49 container).
+CHAT_ACTION_THINKING: str = 'Thinking'
+# Canned pipeline PROGRESS (publish_chat_stage / routing status) → drives the
+# "analysing…" spinner ONLY, never a Step.
+CHAT_ACTION_STATUS: str = 'Status'
+
+
+# ──────────────────────────────────────────────────────────────────────
+# RECIPE capability-mesh topics: the PROACTIVE advert layer over the
+# reactive per-goal peer recipe pull (integrations/google_a2a/peer_reuse).
+#
+# When a node BANKS an exportable recipe it gossip-broadcasts a
+# 'recipe_available' advert (peer_reuse.announce_recipe_available);
+# admitted peers cache it (peer_reuse.on_recipe_available_advert) and the
+# daemon consults the cache BEFORE the O(peers) discovery sweep
+# (peer_reuse.consume_advert). Mirrors the RALT skill ANNOUNCE-then-PULL
+# pattern (world_model_bridge.distribute_skill_packet).
+#
+# RECIPE_AVAILABLE_TOPIC is the flat announce topic. The dot-alias
+# 'recipe.available' in core.peer_link.message_bus.TOPIC_MAP points here
+# so the SAME gossip publish rides the WAMP bus the day a node-local
+# recipe router ships (WAMP-ready, no new transport today).
+#
+# RECIPE_SEMANTIC_TOPIC partitions adverts by capability so a future
+# node-local router can subscribe to just the classes it wants.
+#   {semantic_class} is derived from the goal_type / goal category by a
+#       RULE/HASH based normalizer (peer_reuse._semantic_class_for): it
+#       is NOT ML; it lowercases + slugifies the goal_type token and
+#       falls back to a stable bucket when no goal_type is known.
+#   {slug} is the goal's stable identity slug (bootstrap_slug, else a
+#       normalized goal_title): the SAME identity peer_reuse discovery
+#       already matches on, reused so producer and consumer key adverts
+#       identically (no second identity scheme).
+#
+# Do NOT inline duplicate topic strings; import from here.
+# ──────────────────────────────────────────────────────────────────────
+RECIPE_AVAILABLE_TOPIC: str = 'com.hertzai.hevolve.recipe.available'
+RECIPE_SEMANTIC_TOPIC: str = 'com.hertzai.hevolve.recipe.{semantic_class}.{slug}'
+
+
 # Per-tool human-readable labels for tool_call stage emits (#508).  Static
 # entries cover the hardcoded tools in get_tools(is_first=True) + canonical
 # provider/builtin tools.  Dynamic tool registries (skills, service_tools,

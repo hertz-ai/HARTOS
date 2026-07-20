@@ -57,9 +57,12 @@ def test_shell_os_and_system_coexist_without_trash_collision():
 
 
 def test_app_installer_registers_after_shell_routes():
-    """The real consequence: with the collision gone, register_app_install_routes
-    (called right after register_shell_system_routes in liquid_ui_service) runs
-    and contributes routes instead of being skipped by the swallowed exception."""
+    """The real consequence: with the collision gone, the app-installer routes are
+    contributed (not silently dropped by a swallowed exception) AND the Phase-8
+    consolidation holds — register_shell_os_routes now DELEGATES the app surface to
+    register_app_install_routes, so the canonical /api/shell/apps/* routes appear,
+    and the second direct register_app_install_routes call (as liquid_ui still
+    makes) is idempotent rather than a duplicate-endpoint collision."""
     try:
         from integrations.agent_engine.shell_os_apis import register_shell_os_routes
         from integrations.agent_engine.shell_system_apis import register_shell_system_routes
@@ -68,9 +71,21 @@ def test_app_installer_registers_after_shell_routes():
         pytest.skip(f"modules not importable: {e}")
 
     app = _flask_app()
-    register_shell_os_routes(app)
+    register_shell_os_routes(app)        # now also delegates the app surface
     register_shell_system_routes(app)
+
+    rules = {r.rule for r in app.url_map.iter_rules()}
+    # Canonical app surface present via the delegation (the installer routes
+    # survived — the original regression's real victim).
+    assert '/api/shell/apps/install' in rules, "canonical app install route missing"
+    assert '/api/shell/apps/search' in rules, "canonical app search route missing"
+    # Legacy alias preserved so the marketplace frontend keeps working.
+    assert '/api/apps/install' in rules, "legacy app install alias missing"
+
+    # liquid_ui_service calls register_app_install_routes a SECOND time directly;
+    # the idempotency latch must make that a no-op, never a collision (the bug the
+    # original test guarded against — a swallowed exception aborting registration).
     before = len(list(app.url_map.iter_rules()))
-    register_app_install_routes(app)  # must not raise; must add routes
+    register_app_install_routes(app)     # must not raise (idempotent)
     after = len(list(app.url_map.iter_rules()))
-    assert after > before, "app installer registered no routes"
+    assert after == before, "second register_app_install_routes must be idempotent"

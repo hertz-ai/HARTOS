@@ -20,6 +20,7 @@ from integrations.social.fleet_command import (
     FleetCommandService, VALID_COMMAND_TYPES,
     _execute_config_update, _execute_halt, _execute_restart,
     _execute_sensor_config, _execute_goal_assign, _execute_firmware_update,
+    _sign_command, _command_signing_message, _get_self_node_id,
 )
 
 
@@ -291,6 +292,144 @@ class TestExecuteCommand:
 # ══════════════════════════════════════════════════════════════════
 # Validation
 # ══════════════════════════════════════════════════════════════════
+
+class TestVerifyCommandSignature:
+    """The realtime/relay authority gate: Ed25519 over the canonical signing
+    message against the ISSUER's PeerNode.public_key + issuer tier ∈
+    {central, regional}.  Both checks must pass.  A relay only PROPAGATES a
+    command that verifies here — it cannot forge or re-sign one.
+    """
+
+    def _register_issuer(self, db, node_id, tier, pubkey_hex, status='active'):
+        db.add(PeerNode(node_id=node_id, url=f'http://{node_id}:6777',
+                        status=status, tier=tier, public_key=pubkey_hex))
+        db.flush()
+
+    def _signed(self, issued_by, cmd_type='firmware_update',
+                params=None, target='somenode'):
+        from security.node_integrity import sign_message
+        params = params or {'update_url': 'github:x/y/abc',
+                            'release_hash': 'abc', 'channel': 'stable'}
+        sig = sign_message(_command_signing_message(cmd_type, params, target)).hex()
+        return {'cmd_type': cmd_type, 'params': params, 'target_node_id': target,
+                'issued_by': issued_by, 'signature': sig}
+
+    def test_valid_central_signature_verifies(self, db):
+        """A genuinely-signed command from a known central node verifies."""
+        from security.node_integrity import get_public_key_hex
+        pub = get_public_key_hex()  # this node's key acts as the issuer's key
+        self._register_issuer(db, 'central_issuer_a', 'central', pub)
+        cmd = self._signed('central_issuer_a')
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is True
+
+    def _assign(self, db, regional_node_id, local_node_id):
+        """Make ``local_node_id`` a member of ``regional_node_id``'s sub-fleet
+        via the central-issued RegionAssignment table (the SAME source of truth
+        the region-scope guard reads)."""
+        from integrations.social.models import RegionAssignment
+        db.add(RegionAssignment(
+            local_node_id=local_node_id, regional_node_id=regional_node_id,
+            status='active', approved_by_central=True))
+        db.flush()
+
+    def test_valid_regional_signature_verifies(self, db):
+        """A regional signing a command for a node IN ITS OWN region verifies."""
+        from security.node_integrity import get_public_key_hex
+        pub = get_public_key_hex()
+        self._register_issuer(db, 'regional_issuer_a', 'regional', pub)
+        self._assign(db, 'regional_issuer_a', 'local_in_region_a')
+        cmd = self._signed('regional_issuer_a', target='local_in_region_a')
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is True
+
+    def test_regional_cross_region_target_rejected(self, db):
+        """PRIVILEGE-ESCALATION GUARD: a genuinely-signed regional command aimed
+        at a node OUTSIDE the issuer's region is rejected by the verifier itself
+        (not just the HTTP route).  This is the cross-region firmware_update
+        attack — a rogue regional crafting + Ed25519-signing a command for
+        another region's node — and it must fail at the trust layer."""
+        from security.node_integrity import get_public_key_hex
+        pub = get_public_key_hex()
+        self._register_issuer(db, 'regional_attacker', 'regional', pub)
+        # regional_attacker owns local_mine, but targets a node it does NOT own.
+        self._assign(db, 'regional_attacker', 'local_mine')
+        cmd = self._signed('regional_attacker', target='node_in_other_region')
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is False
+
+    def test_regional_targetless_broadcast_rejected(self, db):
+        """A regional may not issue a targetless (global) command — only a
+        materialised per-target command can be region-scoped, so an empty
+        target from a regional is refused."""
+        from security.node_integrity import get_public_key_hex
+        pub = get_public_key_hex()
+        self._register_issuer(db, 'regional_global', 'regional', pub)
+        cmd = self._signed('regional_global', target='')
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is False
+
+    def test_central_cross_region_target_allowed(self, db):
+        """A CENTRAL issuer may target globally — no region restriction applies
+        (central is the queen bee).  Verifies the guard is regional-only."""
+        from security.node_integrity import get_public_key_hex
+        pub = get_public_key_hex()
+        self._register_issuer(db, 'central_global', 'central', pub)
+        cmd = self._signed('central_global', target='any_node_anywhere')
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is True
+
+    def test_regional_self_target_allowed(self, db):
+        """A regional may command ITSELF even though it isn't its own region
+        member (it has no RegionAssignment row pointing to itself)."""
+        from security.node_integrity import get_public_key_hex
+        pub = get_public_key_hex()
+        self._register_issuer(db, 'regional_self', 'regional', pub)
+        cmd = self._signed('regional_self', target='regional_self')
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is True
+
+    def test_tampered_params_fail(self, db):
+        """Mutating any signed field breaks the signature — a relay cannot pass
+        off a tampered command as authentic."""
+        from security.node_integrity import get_public_key_hex
+        pub = get_public_key_hex()
+        self._register_issuer(db, 'central_issuer_b', 'central', pub)
+        cmd = self._signed('central_issuer_b')
+        cmd['params'] = {'update_url': 'github:EVIL/y/abc',
+                         'release_hash': 'abc', 'channel': 'stable'}
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is False
+
+    def test_flat_tier_issuer_rejected(self, db):
+        """Even with a valid signature, a flat-tier issuer is NOT authorized."""
+        from security.node_integrity import get_public_key_hex
+        pub = get_public_key_hex()
+        self._register_issuer(db, 'flat_issuer_a', 'flat', pub)
+        cmd = self._signed('flat_issuer_a')
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is False
+
+    def test_unknown_issuer_rejected(self, db):
+        cmd = self._signed('nobody_knows_me')
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is False
+
+    def test_banned_issuer_rejected(self, db):
+        from security.node_integrity import get_public_key_hex
+        pub = get_public_key_hex()
+        self._register_issuer(db, 'banned_central', 'central', pub, status='banned')
+        cmd = self._signed('banned_central')
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is False
+
+    def test_missing_signature_or_issuer_rejected(self, db):
+        assert FleetCommandService.verify_command_signature(
+            {'issued_by': 'x', 'signature': ''}, db=db) is False
+        assert FleetCommandService.verify_command_signature(
+            {'issued_by': '', 'signature': 'y'}, db=db) is False
+
+    def test_self_issued_command_verifies_without_peer_row(self, db):
+        """A node may command itself: its OWN signature is trusted without a
+        PeerNode lookup (a node is not its own peer), but the signature is still
+        required + checked."""
+        self_id = _get_self_node_id()
+        cmd = self._signed(self_id)
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is True
+        # A forged self-signature (wrong bytes) is still rejected.
+        cmd['signature'] = '00' * 64
+        assert FleetCommandService.verify_command_signature(cmd, db=db) is False
+
 
 class TestValidation:
 

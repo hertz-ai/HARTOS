@@ -686,6 +686,10 @@ def _load_tools():
 
     # Framework gateway — ALL writes go through Flask routes (guardrails, constitution, budget gate)
     _register_tool('call_endpoint', 'Call any HARTOS API endpoint through the framework', _tool_call_endpoint)
+    # Co-pilot steer: external Claude Code injects an instruction into a running
+    # goal's live GroupChat. Write-through-Flask (routes through the
+    # /dashboard/agents/<id>/inject route), so it honours the gateway rule.
+    _register_tool('steer_goal', 'Co-pilot a RUNNING goal: inject an instruction into its live GroupChat so external Claude Code drives the flywheel without an API key (dispatch_goal it first)', impls.steer_goal)
     _register_tool('list_routes', 'List all registered Flask routes', _tool_list_routes)
     _register_tool('list_channels', 'List all available channel adapters', _tool_list_channels)
 

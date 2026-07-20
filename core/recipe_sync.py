@@ -176,6 +176,72 @@ def _checksum(files: Dict[str, str]) -> str:
     return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
 
 
+def envelope_checksum(files: Dict[str, str]) -> str:
+    """Public checksum helper (same sha256 the envelope carries).
+
+    A2A peer pulls (integrations.google_a2a.peer_reuse) verify wire
+    integrity with this before banking a peer's recipe bundle.
+    """
+    return _checksum(files)
+
+
+def write_envelope_files(prompts_dir: str, envelope: dict) -> int:
+    """Write an envelope's ``files`` dict to *prompts_dir*.
+
+    SINGLE writer for envelope-to-disk: used by the central pull path
+    (``pull_recipe`` below) AND by the A2A peer pull
+    (``integrations.google_a2a.peer_reuse``), so both banks share ONE
+    hardening + atomicity implementation instead of drifting copies.
+
+    Per file: refuse unsafe filenames (``_safe_filename``, WARNING),
+    then atomic write (tmp + ``os.replace``) so concurrent readers
+    never observe partial content.  Returns files written (0 on total
+    failure); never raises.
+    """
+    files = envelope.get('files') or {}
+    if not files:
+        return 0
+    prompt_id = envelope.get('prompt_id', '?')
+    try:
+        os.makedirs(prompts_dir, exist_ok=True)
+    except OSError as e:
+        logger.warning(
+            f'recipe_sync: cannot create {prompts_dir} for '
+            f'prompt_id={prompt_id}: {e}')
+        return 0
+
+    written = 0
+    for fname, content in files.items():
+        # Defensive: refuse paths that escape the prompts dir, drive
+        # letters, NUL bytes, Windows reserved names.  See _safe_filename
+        # docstring + reviewer M2 for the full hardening rationale.
+        if not _safe_filename(fname):
+            logger.warning(
+                f'recipe_sync: refusing unsafe filename {fname!r} '
+                f'in envelope for prompt_id={prompt_id}')
+            continue
+        path = os.path.join(prompts_dir, fname)
+        # Atomic write (M3): write to a temp file in the same dir,
+        # then os.replace to the final name.  Prevents partial-content
+        # snapshots from concurrent prompts_backup.snapshot_prompts
+        # picking up a half-written {pid}.json.
+        tmp = path + '.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(content)
+            os.replace(tmp, path)
+            written += 1
+        except (IOError, OSError) as e:
+            logger.debug(f'recipe_sync: write {fname} failed: {e}')
+            # Clean up orphan temp on failure.
+            try:
+                os.remove(tmp)
+            except OSError as rm_err:
+                logger.debug(
+                    f'recipe_sync: temp cleanup for {fname} failed: {rm_err}')
+    return written
+
+
 def build_envelope(prompts_dir: str, prompt_id, user_id: str = '') -> Optional[dict]:
     """Read all {prompt_id}*.json files from disk + wrap in the
     canonical envelope.  Returns None if no files exist (caller
@@ -334,40 +400,7 @@ def pull_recipe(prompts_dir: str, prompt_id, user_id: str = '',
             f'skipping write')
         return True
 
-    try:
-        os.makedirs(prompts_dir, exist_ok=True)
-    except OSError as e:
-        logger.debug(f'recipe_sync: cannot create {prompts_dir}: {e}')
-        return False
-
-    written = 0
-    for fname, content in files.items():
-        # Defensive: refuse paths that escape the prompts dir, drive
-        # letters, NUL bytes, Windows reserved names.  See _safe_filename
-        # docstring + reviewer M2 for the full hardening rationale.
-        if not _safe_filename(fname):
-            logger.warning(
-                f'recipe_sync: refusing unsafe filename {fname!r} '
-                f'in pull payload for prompt_id={prompt_id}')
-            continue
-        path = os.path.join(prompts_dir, fname)
-        # Atomic write (M3): write to a temp file in the same dir,
-        # then os.replace to the final name.  Prevents partial-content
-        # snapshots from concurrent prompts_backup.snapshot_prompts
-        # picking up a half-written {pid}.json.
-        tmp = path + '.tmp'
-        try:
-            with open(tmp, 'w', encoding='utf-8') as f:
-                f.write(content)
-            os.replace(tmp, path)
-            written += 1
-        except (IOError, OSError) as e:
-            logger.debug(f'recipe_sync: write {fname} failed: {e}')
-            # Clean up orphan temp on failure.
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+    written = write_envelope_files(prompts_dir, envelope)
     if written:
         logger.info(
             f'recipe_sync: pulled prompt_id={prompt_id} '

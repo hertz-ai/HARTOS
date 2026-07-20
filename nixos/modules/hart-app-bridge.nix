@@ -138,7 +138,9 @@ in
         wantedBy = [ "hart.target" ];
 
         # curl is NOT on the unit's minimal PATH (the Model-Bus probe uses it).
-        path = with pkgs; [ curl coreutils ];
+        # waydroid + gnugrep are needed by the Android subsystem probe
+        # (`waydroid status | grep …`); they are not in the default unit PATH.
+        path = with pkgs; [ curl coreutils waydroid gnugrep ];
 
         environment = {
           HEVOLVE_DATA_DIR = cfg.dataDir;
@@ -171,8 +173,12 @@ in
             # ── Discover available subsystems ──
             SUBSYSTEMS="linux"  # Linux is always present
 
-            # Check Android
-            if systemctl is-active hart-android-runtime.service >/dev/null 2>&1; then
+            # Check Android — the REAL runtime is the stock Waydroid container
+            # (virtualisation.waydroid -> waydroid-container.service). The old
+            # inert hart-android-runtime stub was deleted; detect the container
+            # unit AND the session actually being up (waydroid status RUNNING).
+            if systemctl is-active waydroid-container.service >/dev/null 2>&1 \
+               && waydroid status 2>/dev/null | grep -qi 'Session:[[:space:]]*RUNNING'; then
               SUBSYSTEMS="$SUBSYSTEMS android"
               echo "[HART OS App Bridge] Subsystem: Android ✓"
             fi

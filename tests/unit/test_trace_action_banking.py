@@ -94,6 +94,26 @@ class TestTraceBanking:
         names = [s['tool_name'] for s in data['recipe']]
         assert 'right_tool' in names and 'earlier_tool' not in names
 
+    def test_double_digit_action_not_matched_by_substring(self, banked):
+        """For action_id=2, 'Execute Action 20:' is a LATER action, not part of
+        action 2's window. Without the ':' delimiter the substring 'Execute
+        Action 2' also matched 'Execute Action 20:' and (keeping the last match)
+        banked action 20's tools onto action 2 — wrong for any flow with >=10
+        actions (CREATE routinely decomposes into 11-23)."""
+        ok, data, _ = banked([
+            {'content': 'Execute Action 2: synthesize'},
+            {'tool_calls': [{'function': {'name': 'action2_tool',
+                                          'arguments': '{}'}}]},
+            {'content': 'Execute Action 20: a later, unrelated action'},
+            {'tool_calls': [{'function': {'name': 'action20_tool',
+                                          'arguments': '{}'}}]},
+        ], action_id=2)
+        assert ok is True
+        names = [s['tool_name'] for s in data['recipe']]
+        assert 'action2_tool' in names, f"action 2's own tool missing: {names}"
+        assert 'action20_tool' not in names, \
+            f"action 20's tool leaked into action 2's recipe: {names}"
+
     def test_workless_action_banks_noop_marker_not_fabrication(self, banked):
         ok, data, _ = banked([
             {'content': 'Execute Action 2: think about things'},

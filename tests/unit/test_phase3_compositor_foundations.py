@@ -167,8 +167,9 @@ class TestRustPrecedent:
         assert "inputs.rust-overlay" not in src
         assert "rustChannelOf" not in src  # rust-overlay's signature fn
         assert "fenix.packages" not in src
-        # And the toolchain comes from the stock pkgs.rustPlatform.
-        assert "pkgs.rustPlatform.buildRustPackage" in src
+        # And the toolchain comes from the stock rustPlatform.buildRustPackage
+        # (hartRustPlatform = the pinned-nixpkgs rustPlatform; no rust-overlay/fenix).
+        assert "buildRustPackage" in src
 
     def test_marked_not_built_on_windows(self, src):
         low = src.lower()
@@ -190,11 +191,14 @@ class TestHartComp:
         assert "buildRustPackage" in src
         assert 'hartSrc + "/compositor"' in src
 
-    def test_fixed_cargohash_placeholder(self, src):
-        # compositor/ has no committed lock yet → the placeholder model.
-        assert "cargoHash" in src
-        assert "sha256-AAAA" in src  # the length-correct all-A placeholder
-        assert "placeholder" in src.lower()
+    def test_uses_committed_cargo_lock(self, src):
+        # compositor/ now ships a committed Cargo.lock, so hart-comp uses the
+        # reproducible cargoLock.lockFile path (mirrors hart-rust-precedent), NOT
+        # the all-A cargoHash placeholder that would fail the first `nix build`.
+        assert "cargoLock" in src
+        assert "lockFile" in src
+        assert 'compositorSrc + "/Cargo.lock"' in src
+        assert "sha256-AAAA" not in src  # the broken placeholder is gone
 
     def test_mandatory_software_render_floor(self, src):
         assert "pixman" in src  # the mandatory software renderer C dep
@@ -233,7 +237,9 @@ class TestHartComp:
     def test_marked_compile_pending_not_built_on_windows(self, src):
         low = src.lower()
         assert "windows dev box" in low
-        assert "compile-pending" in low or "skeleton" in low
+        # Honest marking: the smithay path is real + Nix-built + VM-proven, with
+        # real-hardware paint still pending (no longer "the whole thing is a skeleton").
+        assert "vm-proven" in low or "real-hw" in low or "real-hardware" in low
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -253,12 +259,19 @@ class TestCompositorSkeleton:
         assert "smithay" in cargo
         assert "renderer_pixman" in cargo  # the mandatory software path feature
 
-    def test_cargo_pins_edition_and_forbids_unsafe(self, cargo):
+    def test_cargo_pins_edition_and_denies_unsafe(self, cargo):
         assert 'edition = "2021"' in cargo
-        assert 'unsafe_code = "forbid"' in cargo
+        # M6 narrowed `forbid` → `deny` for ONE audited screencopy memcpy exception
+        # (src/screencopy.rs::fill_one writes the framebuffer into the client's shm
+        # wl_buffer via a `*mut u8` the rev gives no safe helper for). `deny` keeps
+        # every OTHER line unsafe-free (a stray unsafe block is still a hard error);
+        # the DRM path (wayland.rs/udev.rs) + all pure logic remain unsafe-free.
+        assert 'unsafe_code = "deny"' in cargo
 
-    def test_main_forbids_unsafe(self, main_rs):
-        assert "#![forbid(unsafe_code)]" in main_rs
+    def test_main_denies_unsafe(self, main_rs):
+        # See test_cargo_pins_edition_and_denies_unsafe: deny (not forbid) for the one
+        # audited screencopy memcpy exception; every other line stays unsafe-free.
+        assert "#![deny(unsafe_code)]" in main_rs
 
     def test_software_path_is_first_class_decision_not_env_prayer(self, main_rs):
         # The never-fail floor is a typed decision (RenderPath enum), not just env.
@@ -285,9 +298,13 @@ class TestCompositorSkeleton:
 
     def test_honestly_marked_compile_pending_and_todo(self, main_rs):
         low = main_rs.lower()
-        assert "compile-pending" in low or "compile_pending" in low
-        assert "todo" in low  # real handler bodies are todo!()/stub
-        # The event loop is explicitly NOT started on the skeleton.
+        # The smithay DRM path is REAL + Nix-built + VM-proven; only the feature-off
+        # dev-box fallback is a stub. Assert the CURRENT honest markers (not the old
+        # "the whole thing is compile-pending" claim), plus the still-true fallback
+        # words (todo!() shims + an unstarted loop on the feature-off build).
+        assert "vm-proven" in low or "real-hardware" in low or "real hardware" in low
+        assert "todo" in low  # the feature-off fallback handler bodies are todo!()/stub
+        # The event loop is explicitly NOT started on the feature-off fallback.
         assert "not started" in low or "NOT started" in main_rs
 
     def test_has_rust_unit_test_floor(self, main_rs):

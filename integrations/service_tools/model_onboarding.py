@@ -64,7 +64,7 @@ def _onboard_via_nunba(model_name: str, quant: str, port: int) -> dict:
                         'Use Nunba settings to change models.',
             }
     except (urllib.error.URLError, OSError):
-        pass
+        logger.warning("_onboard_via_nunba: swallowed urllib.error.URLError, OSError", exc_info=True)
 
     # Nunba not running yet — tell the user
     return {
@@ -167,7 +167,7 @@ def _extract_quant_from_path(gguf_path: Path) -> str:
         if q:
             return q
     except ImportError:
-        pass
+        logger.debug("_extract_quant_from_path: swallowed ImportError")
     # Fallback regex
     m = re.search(r'((?:IQ|Q)\d+(?:_K)?(?:_[A-Z0-9]+)?)', gguf_path.name, re.IGNORECASE)
     return m.group(1).upper() if m else 'unknown'
@@ -466,7 +466,7 @@ def remove_model(model_id: str) -> bool:
                         if not any(gguf_file.parent.iterdir()):
                             gguf_file.parent.rmdir()
                     except OSError:
-                        pass
+                        logger.warning("remove_model: swallowed OSError", exc_info=True)
                 except OSError as e:
                     logger.error(f"Failed to delete {gguf_file}: {e}")
 
@@ -480,7 +480,7 @@ def remove_model(model_id: str) -> bool:
                 model_storage.remove_tool(tool_name)
                 removed = True
     except ImportError:
-        pass
+        logger.debug("remove_model: swallowed ImportError")
 
     if removed:
         logger.info(f"Removed model: {model_id}")
@@ -542,7 +542,7 @@ def status() -> Dict:
                 'cuda_available': gpu_info.get('cuda_available', False),
             }
         except Exception:
-            pass
+            logger.exception("status: swallowed Exception")
 
     # Downloaded models
     downloaded = list_downloaded()

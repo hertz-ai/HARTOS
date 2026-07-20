@@ -138,22 +138,28 @@ class PeerLinkManager:
         return self._http_fallback(peer_url, channel, data, timeout)
 
     def broadcast(self, channel: str, data: dict,
-                  trust_filter: Optional[TrustLevel] = None) -> int:
+                  trust_filter: Optional[TrustLevel] = None,
+                  exclude_peer: str = '') -> int:
         """Broadcast message to all connected peers.
 
         Args:
             channel: Channel name
             data: Message payload
             trust_filter: Only send to links with this trust level
+            exclude_peer: Skip this peer_id (e.g. the inbound sender on a
+                multi-hop relay re-broadcast, so a message never echoes back
+                the link it arrived on).
 
         Returns:
             Number of peers successfully sent to
         """
         sent = 0
         with self._lock:
-            links = list(self._links.values())
+            links = list(self._links.items())
 
-        for link in links:
+        for peer_id, link in links:
+            if exclude_peer and peer_id == exclude_peer:
+                continue
             if not link.is_connected:
                 continue
             if trust_filter and link.trust != trust_filter:

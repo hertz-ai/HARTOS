@@ -50,6 +50,7 @@ class ModelType(str, Enum):
     VIDEO_GEN = 'video_gen'
     AUDIO_GEN = 'audio_gen'
     EMBEDDING = 'embedding'
+    EMBODIED  = 'embodied'   # VLA / world-model robot policy (Qwen RobotSuite class)
 
     @property
     def label(self) -> str:
@@ -68,6 +69,7 @@ _MODEL_TYPE_LABELS = {
     ModelType.VIDEO_GEN: 'Video Generation',
     ModelType.AUDIO_GEN: 'Audio/Music Generation',
     ModelType.EMBEDDING: 'Embedding Model',
+    ModelType.EMBODIED:  'Embodied VLA / World Model',
 }
 
 # Backwards-compatible dict for code that iterates MODEL_TYPES
@@ -522,6 +524,7 @@ class ModelCatalog:
         added += self._populate_tts_models()
         added += self._populate_stt_models()
         added += self._populate_vlm_models()
+        added += self._populate_embodied_models()
         added += self._populate_videogen_models()
         added += self._populate_audiogen_models()
 
@@ -534,7 +537,7 @@ class ModelCatalog:
         # For entries that existed before AND still exist, populator.register()
         # would have overwritten them — so check timestamps on _entries that
         # weren't touched but have auto-populatable prefixes.
-        AUTO_PREFIXES = ('tts-', 'stt-', 'vlm-', 'video_gen-', 'audio_gen-')
+        AUTO_PREFIXES = ('tts-', 'stt-', 'vlm-', 'video_gen-', 'audio_gen-', 'embodied-')
         stale = []
         for eid, entry in list(self._entries.items()):
             if eid in touched_this_boot:
@@ -639,6 +642,92 @@ class ModelCatalog:
                 tags=['local', 'vision'],
             )
             self.register(entry, persist=False)
+            added += 1
+        return added
+
+    def _populate_embodied_models(self) -> int:
+        """Embodied model entries — Qwen-RobotSuite (THREE foundation models).
+
+        RobotSuite is three INDEPENDENT models that run inside HevolveAI (raw
+        native intelligence; HARTOS has no ML): RobotManip (VLA manipulation),
+        RobotWorld (language-conditioned video world model), and RobotNav
+        (navigation). This bootstraps their METADATA exactly like an LLM — the
+        catalog record that makes each discoverable to the admin UI + the
+        orchestrator: its action vocabulary (RobotAction factories), the sensor
+        modalities it consumes (SensorReading schema), and the shared
+        WorldModelBridge endpoints. Errors dispatching to any of them propagate
+        through the hive via WorldModelBridge._propagate_embodied_error.
+        """
+        # The bridge owns endpoint selection per-method — HevolveAI is
+        # sensor-ingest-centric (actions + sensors → /v1/sensor/ingest, feedback
+        # → /v1/stats), and that single source of truth lives in WorldModelBridge.
+        # The catalog must NOT hardcode endpoint URLs (a prior copy advertised
+        # /v1/actions, /v1/sensors/batch, /v1/feedback/latest that don't exist on
+        # HevolveAI → catalog↔bridge drift; removed).
+        bridge_caps = {
+            'bridge': 'integrations.agent_engine.world_model_bridge.WorldModelBridge',
+        }
+        common = dict(
+            model_type=ModelType.EMBODIED, source='pip', backend='in_process',
+            supports_gpu=True, supports_cpu=True, supports_cpu_offload=True,
+            cpu_offload_method='torch_to_cpu', idle_timeout_s=600,
+            min_capability_tier='standard', tags=['local', 'embodied', 'robotics'],
+        )
+        specs = [
+            dict(  # RobotManip — VLA manipulation: camera + language → low-level actions
+                id='embodied-qwen-robotmanip',
+                name='Qwen-RobotManip (VLA manipulation)',
+                repo_id='QwenLM/Qwen-VLA',
+                vram_gb=8.0, ram_gb=8.0, disk_gb=16.0,
+                quality_score=0.78, speed_score=0.6,
+                capabilities={
+                    'action_verbs': ['vla_instruct', 'manip_action',
+                                     'action_chunk', 'end_effector_delta'],
+                    'inputs': ['camera', 'language'],
+                    'sensor_modalities': ['camera', 'depth', 'force_torque', 'encoder'],
+                    'language_conditioned': True, 'closed_loop': True, 'control_hz': 10,
+                    # canonical 80-D masked state-action (2×29 per-arm + 22 reserved)
+                    'action_space': '80d_masked', 'action_dims': 80,
+                    'per_arm_dims': 29, 'reserved_dims': 22,
+                    'per_arm_blocks': ['joint_positions', 'end_effector_pose',
+                                       'gripper', 'dexterous_hand'],
+                },
+            ),
+            dict(  # RobotWorld — language-conditioned video world model
+                id='embodied-qwen-robotworld',
+                name='Qwen-RobotWorld (language-conditioned video world model)',
+                repo_id='Qwen/Qwen-RobotWorld',
+                vram_gb=12.0, ram_gb=12.0, disk_gb=24.0,
+                quality_score=0.75, speed_score=0.4,
+                capabilities={
+                    'action_verbs': ['world_model_rollout'],
+                    'inputs': ['language', 'camera'],
+                    'sensor_modalities': ['camera'],
+                    'language_conditioned': True, 'world_model': True,
+                    'output': 'predicted_video', 'default_horizon': 8,
+                },
+            ),
+            dict(  # RobotNav — navigation → 8 (x, y, theta) waypoints
+                id='embodied-qwen-robotnav',
+                name='Qwen-RobotNav (navigation)',
+                repo_id='QwenLM/Qwen-RobotNav',
+                vram_gb=6.0, ram_gb=6.0, disk_gb=12.0,
+                quality_score=0.74, speed_score=0.7,
+                capabilities={
+                    'action_verbs': ['navigate'],
+                    'inputs': ['camera', 'language'],
+                    'sensor_modalities': ['camera', 'depth', 'lidar', 'imu', 'gps'],
+                    'output': 'waypoints_xytheta', 'num_waypoints': 8,
+                },
+            ),
+        ]
+        added = 0
+        for spec in specs:
+            if spec['id'] in self._entries:
+                continue
+            caps = {**bridge_caps, **spec.pop('capabilities')}
+            self.register(ModelEntry(capabilities=caps, **common, **spec),
+                          persist=False)
             added += 1
         return added
 
@@ -819,7 +908,7 @@ class ModelCatalog:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
-                    pass
+                    logger.warning("_save: swallowed OSError", exc_info=True)
                 raise
             self._dirty = False
         except Exception as e:

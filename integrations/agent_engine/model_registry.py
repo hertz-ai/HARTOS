@@ -64,6 +64,18 @@ class ModelBackend:
     def to_config_list(self) -> list:
         return [self.config_list_entry]
 
+    def is_dispatchable(self) -> bool:
+        """False for placeholder backends the router must not dial yet.
+
+        'distributed-shard' advertises the WAN shard cluster with a NON-endpoint
+        base_url ('shard://cluster'); it becomes selectable only once the
+        shard-orchestrator lands to intercept it by model_id. Until then the
+        selectors skip it so nothing dials the placeholder (the "Selection guard"
+        promised in docs/architecture/SHARD_RUNTIME_HARTOS_SIDE.md). One check,
+        used by every selector, keeps this a single source of truth.
+        """
+        return not str(self.config_list_entry.get('base_url', '')).startswith('shard://')
+
     def to_dict(self) -> dict:
         return {
             'model_id': self.model_id,
@@ -158,6 +170,7 @@ class ModelRegistry:
                 m for m in self._models.values()
                 if m.accuracy_score >= min_accuracy
                 and m.tier != ModelTier.DRAFT
+                and m.is_dispatchable()
             ]
         if not candidates:
             return None
@@ -172,6 +185,7 @@ class ModelRegistry:
                 m for m in self._models.values()
                 if m.cost_per_1k_tokens <= max_cost
                 and m.tier != ModelTier.DRAFT
+                and m.is_dispatchable()
             ]
         if not candidates:
             return None
@@ -427,6 +441,64 @@ def _register_defaults():
             avg_latency_ms=2500.0,
             accuracy_score=0.93,
             cost_per_1k_tokens=1.5,
+        ))
+
+    # 5b. GLM 5.2 (Zhipu / Z.ai — expert tier, OpenAI-compatible API — if key set)
+    #     Zhipu exposes an OpenAI-compatible endpoint, so this registers exactly
+    #     like Groq/DeepSeek/Claude above (no special client). GLM_API_KEY is the
+    #     primary env var; ZHIPUAI_API_KEY (Zhipu's own convention) is accepted as
+    #     a fallback. base_url defaults to the international z.ai gateway — set
+    #     GLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4 for the mainland-China
+    #     endpoint. GLM_MODEL overrides the model string if the served version
+    #     differs (e.g. glm-4.6).
+    _glm_key = os.environ.get('GLM_API_KEY') or os.environ.get('ZHIPUAI_API_KEY')
+    if _glm_key:
+        model_registry.register(ModelBackend(
+            model_id='glm-5.2',
+            display_name='GLM 5.2 (Zhipu)',
+            tier=ModelTier.EXPERT,
+            config_list_entry={
+                'model': os.environ.get('GLM_MODEL', 'glm-5.2'),
+                'api_key': _glm_key,
+                'base_url': os.environ.get('GLM_BASE_URL', 'https://api.z.ai/api/paas/v4'),
+                'price': [0.0006, 0.0022],
+            },
+            avg_latency_ms=2000.0,
+            accuracy_score=0.90,
+            cost_per_1k_tokens=0.5,
+        ))
+
+    # 5c. Distributed shard cluster (WAN pipeline-parallel inference) — feature-flagged.
+    #     A model too big for one node is served by K peers, each holding a
+    #     contiguous LAYER range; only the hidden-state activation crosses the
+    #     wire (never weights). HARTOS owns the mesh/relay/trust/economics; the
+    #     per-shard forward pass lives behind hevolveai's Model Bus /v1/shard/*
+    #     verbs (frozen boundary: hevolveai/docs/SHARD_RUNTIME_CONTRACT.md,
+    #     mirrored in docs/architecture/SHARD_RUNTIME_HARTOS_SIDE.md).
+    #
+    #     This entry only ADVERTISES the capability so routing can see it. Actual
+    #     dispatch is intercepted by the shard-orchestrator on model_id match
+    #     BEFORE any OpenAI-style client is built (the 'shard://cluster' base_url
+    #     is a deliberate non-endpoint — it must never be dialled directly). Off
+    #     by default; set HART_SHARD_RUNTIME=1 on a node that has joined a shard
+    #     cluster. Until the orchestrator lands, the dispatcher must skip this
+    #     model_id (see the side doc §"Selection guard").
+    if os.environ.get('HART_SHARD_RUNTIME', '').lower() in ('1', 'true', 'yes'):
+        model_registry.register(ModelBackend(
+            model_id='distributed-shard',
+            display_name='Distributed Shard Cluster (WAN pipeline)',
+            tier=ModelTier.EXPERT,
+            config_list_entry={
+                'model': os.environ.get('HART_SHARD_MODEL', 'distributed-shard'),
+                'api_key': 'local',
+                'base_url': 'shard://cluster',  # non-endpoint: orchestrator intercepts by model_id
+                'price': [0, 0],
+            },
+            avg_latency_ms=6000.0,   # WAN pipeline hops — slow but unlocks models no single node can host
+            accuracy_score=0.92,     # runs the full big model, so quality tracks the model, not the split
+            cost_per_1k_tokens=0.0,  # peer compute, not a paid API
+            is_local=False,          # distributed across peers, not this box
+            hardware_dependent=True,
         ))
 
     # 6. HevolveAI-Core Learning LLM (balanced — local world model, improves over time)
