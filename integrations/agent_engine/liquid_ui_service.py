@@ -2006,6 +2006,12 @@ img{-webkit-user-drag:none;user-select:none}
   width:min(660px,86vw);pointer-events:none;
   transition:opacity .55s cubic-bezier(.2,0,0,1),transform .55s cubic-bezier(.2,0,0,1),filter .55s}
 .hart-hero>*{pointer-events:auto}
+/* While the user DRAGS the orb, the spine transform must track the pointer 1:1.
+   hartHero.js toggles this class around the drag, but the RULE was never written
+   (real-HW 2026-07-20: "drag was not realtime / an offset while dragging") -- so
+   .hart-hero's .55s transform transition kept ANIMATING toward each pointermove,
+   ~half a second behind the cursor. transition:none while dragging = realtime. */
+.hart-hero.hart-hero-dragging{transition:none}
 .hart-hero.dimmed{opacity:0;transform:translate(-50%,-56%) scale(.96);filter:blur(6px)}
 .hart-hero.dimmed>*{pointer-events:none}
 .hart-hero-brand{display:flex;align-items:center;gap:9px;opacity:.92}

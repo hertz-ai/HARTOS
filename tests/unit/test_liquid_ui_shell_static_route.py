@@ -168,3 +168,16 @@ def test_orb_orbital_rings_present(shell):
     html = svc.render_desktop_shell()
     assert 'hart-orb-orbit' in html, 'the orbital ring element is missing from the orb'
     assert '@keyframes hart-orbit-spin' in html, 'the orbital spin keyframe is not defined'
+
+
+def test_orb_drag_kills_the_transform_transition(shell):
+    """Orb drag realtime (real-HW 2026-07-20 'drag not realtime / offset'):
+    .hart-hero carries a .55s transform transition, and the drag drives transform
+    per pointermove -- without a dragging override every move is ANIMATED ~550ms
+    behind the cursor. hartHero.js toggles .hart-hero-dragging around the drag;
+    the SERVED shell must carry the transition:none rule for it (the rule was
+    toggled but never defined -- the exact shipped bug)."""
+    svc, _client = shell
+    html = svc.render_desktop_shell()
+    assert '.hart-hero.hart-hero-dragging{transition:none}' in html, (
+        'the dragging transition-kill rule is missing -- orb drag rubber-bands')
