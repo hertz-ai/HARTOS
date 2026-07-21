@@ -953,27 +953,41 @@ class HiveBenchmarkProver:
             round(total_shard_time / max(0.01, elapsed), 2)
             if total_shard_time > 0 else round(float(num_nodes), 2))
 
-        # Record in leaderboard
-        self._leaderboard.record_run(
-            run_id=run_id,
-            benchmark=benchmark_name,
-            score=aggregated['score'],
-            num_nodes=aggregated['num_nodes'],
-            time_seconds=elapsed,
-            per_node=aggregated.get('per_node', []),
-            speedup=aggregated['speedup'],
-        )
+        # Record in leaderboard — only a run that produced a real score.
+        # Recording a failed run would poison best_scores and the improvement
+        # history with a 0.0 that never happened.
+        if aggregated.get('valid', True):
+            self._leaderboard.record_run(
+                run_id=run_id,
+                benchmark=benchmark_name,
+                score=aggregated['score'],
+                num_nodes=aggregated['num_nodes'],
+                time_seconds=elapsed,
+                per_node=aggregated.get('per_node', []),
+                speedup=aggregated['speedup'],
+            )
+            aggregated['comparison'] = self._leaderboard.compare_to_baselines()
 
-        # Compare to baselines
-        aggregated['comparison'] = self._leaderboard.compare_to_baselines()
-
-        # Auto-publish results
+        # Auto-publish results.
+        #
+        # A run where no shard completed is not a result and must not be
+        # published as proof of anything. That is exactly what happened while
+        # the LLM credential was dead: every shard failed, the run scored 0.0,
+        # and a "HIVE BENCHMARK PROOF" post went out on schedule regardless.
         published = False
-        try:
-            self._publish_results(run_id, aggregated)
-            published = True
-        except Exception as exc:
-            logger.warning("Failed to publish benchmark results: %s", exc)
+        if not aggregated.get('valid', True):
+            logger.error(
+                "Benchmark [%s] run=%s produced NO valid score (%s; %d/%d shards "
+                "completed) — not recorded, not published. This usually means the "
+                "LLM endpoint is unreachable rather than that the hive scored zero.",
+                benchmark_name, run_id[:8], aggregated.get('failure_reason'),
+                aggregated.get('nodes_completed', 0), aggregated.get('num_nodes', 0))
+        else:
+            try:
+                self._publish_results(run_id, aggregated)
+                published = True
+            except Exception as exc:
+                logger.warning("Failed to publish benchmark results: %s", exc)
         aggregated['published'] = published
 
         # Mark run as complete and evict old completed runs (keep last 50)
@@ -991,9 +1005,11 @@ class HiveBenchmarkProver:
                     del self._active_runs[old_id]
 
         logger.info(
-            "Benchmark [%s] run=%s aggregated: score=%.3f, nodes=%d, "
+            "Benchmark [%s] run=%s aggregated: score=%s, nodes=%d, "
             "time=%.1fs, speedup=%.1fx",
-            benchmark_name, run_id[:8], aggregated['score'],
+            benchmark_name, run_id[:8],
+            ('%.3f' % aggregated['score']) if aggregated.get('score') is not None
+            else 'n/a (no shard completed)',
             aggregated['num_nodes'], elapsed, aggregated['speedup'])
 
         # Attribution: complete the benchmark run action with outcome
@@ -1086,30 +1102,41 @@ class HiveBenchmarkProver:
             round(total_shard_time / max(0.01, elapsed), 2)
             if total_shard_time > 0 else round(float(num_nodes), 2))
 
-        # 7. Record in leaderboard
-        self._leaderboard.record_run(
-            run_id=run_id,
-            benchmark=benchmark_name,
-            score=aggregated['score'],
-            num_nodes=aggregated['num_nodes'],
-            time_seconds=elapsed,
-            per_node=aggregated.get('per_node', []),
-            speedup=aggregated['speedup'],
-        )
+        # 7. Record in leaderboard — only when the run produced a real score
+        if aggregated.get('valid', True):
+            self._leaderboard.record_run(
+                run_id=run_id,
+                benchmark=benchmark_name,
+                score=aggregated['score'],
+                num_nodes=aggregated['num_nodes'],
+                time_seconds=elapsed,
+                per_node=aggregated.get('per_node', []),
+                speedup=aggregated['speedup'],
+            )
 
-        # 8. Publish results
+        # 8. Publish results — never publish a run where nothing completed
         published = False
-        try:
-            self._publish_results(run_id, aggregated)
-            published = True
-        except Exception as exc:
-            logger.warning("Failed to publish benchmark results: %s", exc)
+        if not aggregated.get('valid', True):
+            logger.error(
+                "Benchmark [%s] run=%s produced NO valid score (%s; %d/%d shards "
+                "completed) — not recorded, not published. Usually means the LLM "
+                "endpoint is unreachable, not that the hive scored zero.",
+                benchmark_name, run_id[:8], aggregated.get('failure_reason'),
+                aggregated.get('nodes_completed', 0), aggregated.get('num_nodes', 0))
+        else:
+            try:
+                self._publish_results(run_id, aggregated)
+                published = True
+            except Exception as exc:
+                logger.warning("Failed to publish benchmark results: %s", exc)
         aggregated['published'] = published
 
         logger.info(
-            "Benchmark [%s] run=%s completed: score=%.3f, nodes=%d, "
+            "Benchmark [%s] run=%s completed: score=%s, nodes=%d, "
             "time=%.1fs, speedup=%.1fx",
-            benchmark_name, run_id[:8], aggregated['score'],
+            benchmark_name, run_id[:8],
+            ('%.3f' % aggregated['score']) if aggregated.get('score') is not None
+            else 'n/a (no shard completed)',
             aggregated['num_nodes'], elapsed, aggregated['speedup'])
 
         return aggregated
@@ -2221,8 +2248,13 @@ class HiveBenchmarkProver:
         total problems, per-node breakdown, time stats.
         """
         if not shard_results:
+            # No shards at all is the same class of non-result as shards that
+            # all failed: there is no score, and reporting 0.0 would claim the
+            # hive answered.
             return {
-                'score': 0.0, 'num_nodes': 0, 'per_node': [],
+                'score': None, 'valid': False,
+                'failure_reason': 'no shards were dispatched',
+                'num_nodes': 0, 'nodes_completed': 0, 'per_node': [],
                 'problems_solved': 0, 'problems_total': 0,
             }
 
@@ -2236,16 +2268,22 @@ class HiveBenchmarkProver:
             solved = sr.get('problems_solved', 0)
             total = sr.get('problems_total', 0)
             score = sr.get('score', 0.0)
+            completed = sr.get('status') == 'completed'
 
-            total_solved += solved
-            total_problems += total
-
-            # Weight score by number of problems in this shard
-            weight = max(1, total)
-            weighted_score_sum += score * weight
-
-            if sr.get('status') == 'completed':
+            # Only a shard that actually finished contributes to the score.
+            #
+            # Previously every shard was folded into the weighted average at
+            # full weight, so a shard that never ran scored the same 0.0 as one
+            # that answered everything wrong. When the LLM credential expired,
+            # every shard failed, the run aggregated to 0.0, and the prover
+            # published it as a benchmark PROOF -- at the same cadence, with
+            # the same shape of output, for weeks. The only signal that
+            # anything had broken was the Azure bill going to nearly zero.
+            if completed:
                 completed_count += 1
+                total_solved += solved
+                total_problems += total
+                weighted_score_sum += score * max(1, total)
 
             per_node.append({
                 'node_id': sr.get('node_id', 'unknown'),
@@ -2257,13 +2295,22 @@ class HiveBenchmarkProver:
                 'status': sr.get('status', 'unknown'),
             })
 
-        # Weighted average score
+        # Weighted average over the shards that completed.
         combined_score = (
             weighted_score_sum / max(1, total_problems)
             if total_problems > 0 else 0.0)
 
+        # A run where nothing completed has no score. Saying "0.0" would claim
+        # the hive answered and got everything wrong, which is a different and
+        # much less alarming statement than "the hive never answered".
+        valid = completed_count > 0 and total_problems > 0
+
         return {
-            'score': round(combined_score, 4),
+            'score': round(combined_score, 4) if valid else None,
+            'valid': valid,
+            'failure_reason': None if valid else (
+                'no shard completed' if completed_count == 0
+                else 'completed shards reported no problems'),
             'num_nodes': len(shard_results),
             'nodes_completed': completed_count,
             'per_node': per_node,
