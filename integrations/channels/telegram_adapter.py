@@ -154,7 +154,7 @@ class TelegramAdapter(ChannelAdapter, RoomCapableAdapter):
             self._handle_message
         ))
         self._app.add_handler(MessageHandler(
-            filters.PHOTO | filters.VIDEO | filters.DOCUMENT | filters.AUDIO | filters.VOICE,
+            filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE,
             self._handle_media
         ))
 
