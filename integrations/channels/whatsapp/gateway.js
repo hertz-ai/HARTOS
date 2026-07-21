@@ -42,7 +42,7 @@ const os = require('os');
 // at the bottom of the file BEFORE app.listen() — every handler that
 // references them runs only after a session is started, which can't
 // happen until the server is listening.
-let makeWASocket, useMultiFileAuthState;
+let makeWASocket, useMultiFileAuthState, DisconnectReason;
 
 let express, expressWs;
 try {
@@ -72,13 +72,8 @@ async function ensureSession(accountId) {
   let ctx = sessions.get(accountId);
   if (ctx) return ctx;
 
-  const authPath = path.join(AUTH_BASE, accountId);
-  fs.mkdirSync(authPath, { recursive: true });
-  const { state, saveCreds } = await useMultiFileAuthState(authPath);
-  const sock = makeWASocket({ auth: state, printQRInTerminal: false });
-
   ctx = {
-    sock,
+    sock: null,
     qr: null,
     authenticated: false,
     state: 'connecting',
@@ -86,6 +81,23 @@ async function ensureSession(accountId) {
     accountId,
   };
   sessions.set(accountId, ctx);
+
+  await connectSocket(ctx);
+  return ctx;
+}
+
+// Build (or rebuild) the Baileys socket for a session and wire its
+// event handlers.  Called on first start and again on any non-logged-out
+// disconnect — Baileys closes the stream with statusCode 515
+// (restartRequired) right after a successful QR/pair-code login and
+// expects the client to reconnect with the now-saved creds.  Without
+// this reconnect the session dies the instant pairing succeeds.
+async function connectSocket(ctx) {
+  const authPath = path.join(AUTH_BASE, ctx.accountId);
+  fs.mkdirSync(authPath, { recursive: true });
+  const { state, saveCreds } = await useMultiFileAuthState(authPath);
+  const sock = makeWASocket({ auth: state, printQRInTerminal: false });
+  ctx.sock = sock;
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -103,9 +115,23 @@ async function ensureSession(accountId) {
     } else if (connection === 'close') {
       const code = lastDisconnect && lastDisconnect.error
         && lastDisconnect.error.output && lastDisconnect.error.output.statusCode;
-      ctx.authenticated = false;
-      ctx.state = 'disconnected';
-      broadcast(ctx, { type: 'disconnected', code });
+      const loggedOut = DisconnectReason && code === DisconnectReason.loggedOut;
+      if (!loggedOut) {
+        // restartRequired (515) after pairing, or any transient drop —
+        // reconnect with saved creds instead of leaving the session dead.
+        ctx.state = 'connecting';
+        broadcast(ctx, { type: 'reconnecting', code });
+        setTimeout(() => {
+          connectSocket(ctx).catch((e) => {
+            ctx.state = 'disconnected';
+            broadcast(ctx, { type: 'disconnected', code, error: String(e && e.message) });
+          });
+        }, 1000);
+      } else {
+        ctx.authenticated = false;
+        ctx.state = 'disconnected';
+        broadcast(ctx, { type: 'disconnected', code });
+      }
     }
   });
 
@@ -114,8 +140,6 @@ async function ensureSession(accountId) {
       broadcast(ctx, { type: 'message', message: m });
     }
   });
-
-  return ctx;
 }
 
 function broadcast(ctx, event) {
@@ -242,6 +266,7 @@ app.ws('/ws/:id', (ws, req) => {
     const baileys = await import('@whiskeysockets/baileys');
     makeWASocket = baileys.default || baileys.makeWASocket;
     useMultiFileAuthState = baileys.useMultiFileAuthState;
+    DisconnectReason = baileys.DisconnectReason;
   } catch (e) {
     console.error(JSON.stringify({
       event: 'startup_error',
