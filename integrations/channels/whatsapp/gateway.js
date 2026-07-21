@@ -137,9 +137,59 @@ async function connectSocket(ctx) {
 
   sock.ev.on('messages.upsert', ({ messages }) => {
     for (const m of messages || []) {
-      broadcast(ctx, { type: 'message', message: m });
+      // Skip our own outgoing messages (incl. the bot's auto-replies) so
+      // an inbound → agent → reply never re-triggers itself into a loop.
+      if (m.key && m.key.fromMe) continue;
+      // The adapter (whatsapp_adapter.py:_convert_message) speaks the
+      // WAHA field shape (chat/sender/body/...), and _handle_event reads
+      // the `data` key.  Baileys emits a different raw shape, so map it
+      // here — this is the single seam that keeps the gateway
+      // "WAHA-compatible" as its package.json claims.
+      broadcast(ctx, { type: 'message', data: baileysToWaha(m) });
     }
   });
+}
+
+// Map a raw Baileys message object to the WAHA-style shape the Python
+// whatsapp_adapter expects.  Only the fields _convert_message reads.
+function baileysToWaha(m) {
+  const msg = (m && m.message) || {};
+  const remoteJid = (m.key && m.key.remoteJid) || '';
+  const isGroup = remoteJid.endsWith('@g.us');
+  const senderJid = (m.key && m.key.participant) || remoteJid || '';
+
+  let body = '';
+  if (msg.conversation) body = msg.conversation;
+  else if (msg.extendedTextMessage && msg.extendedTextMessage.text) {
+    body = msg.extendedTextMessage.text;
+  } else if (msg.imageMessage && msg.imageMessage.caption) {
+    body = msg.imageMessage.caption;
+  } else if (msg.videoMessage && msg.videoMessage.caption) {
+    body = msg.videoMessage.caption;
+  }
+
+  const mediaKeys = {
+    imageMessage: 'image', videoMessage: 'video', audioMessage: 'audio',
+    documentMessage: 'document', stickerMessage: 'sticker',
+  };
+  const mk = Object.keys(mediaKeys).find((k) => msg[k]);
+  const ctxInfo = (msg.extendedTextMessage && msg.extendedTextMessage.contextInfo) || {};
+
+  return {
+    id: { _serialized: (m.key && m.key.id) || '' },
+    chat: { id: { _serialized: remoteJid } },
+    sender: {
+      id: { _serialized: senderJid },
+      pushname: m.pushName || '',
+      name: m.pushName || '',
+    },
+    body,
+    isGroup,
+    hasMedia: !!mk,
+    type: mk ? mediaKeys[mk] : 'chat',
+    mentionedIds: ctxInfo.mentionedJid || [],
+    timestamp: m.messageTimestamp,
+  };
 }
 
 function broadcast(ctx, event) {
@@ -185,7 +235,13 @@ app.post('/api/sessions/:id/messages/send', async (req, res) => {
   if (!ctx || !ctx.authenticated) {
     return res.status(409).json({ error: 'not_authenticated' });
   }
-  const { to, text } = req.body || {};
+  // Accept both the WAHA-style `chatId` (what the Python adapter sends)
+  // and the plain `to` alias — otherwise the adapter's replies arrive
+  // with to=undefined and silently 400, so inbound routing works but no
+  // reply ever goes back out.
+  const body = req.body || {};
+  const to = body.to || body.chatId;
+  const text = body.text;
   if (!to || !text) {
     return res.status(400).json({ error: 'to + text required' });
   }
