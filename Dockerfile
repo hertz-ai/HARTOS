@@ -62,7 +62,8 @@ RUN pip install --no-cache-dir --no-deps -r requirements.txt && \
         "autobahn[twisted]" \
         "autogen-agentchat[long-context]~=0.2" \
         json-repair \
-        bs4
+        bs4 \
+        youtube-transcript-api
 
 # ── Layer 3: Application code (rebuilds on any code change — fast, no pip) ──
 COPY . .

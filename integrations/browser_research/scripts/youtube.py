@@ -55,7 +55,17 @@ def transcript(url: str, language: str = 'en') -> dict:
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
         try:
-            entries = YouTubeTranscriptApi.get_transcript(video_id, languages=[language, 'en'])
+            # youtube-transcript-api changed shape at 1.0: the static
+            # `get_transcript` was replaced by an instance `.fetch()` returning
+            # objects with a `.text` attribute rather than dicts. Support both,
+            # because this code shipped against the old one and silently
+            # returned "failed" on any host that had a current version.
+            langs = [language, 'en']
+            if hasattr(YouTubeTranscriptApi, 'get_transcript'):
+                entries = YouTubeTranscriptApi.get_transcript(video_id, languages=langs)
+            else:
+                fetched = YouTubeTranscriptApi().fetch(video_id, languages=langs)
+                entries = getattr(fetched, 'snippets', fetched)
         except Exception as exc:
             return {
                 'success': False,
@@ -63,7 +73,13 @@ def transcript(url: str, language: str = 'en') -> dict:
                 'video_id': video_id,
                 'error': f'YouTubeTranscriptApi failed: {exc}',
             }
-        text = ' '.join(e.get('text', '') for e in entries if e.get('text'))
+
+        def _seg_text(e):
+            # 1.x yields snippet objects; 0.x yields plain dicts.
+            return (e.get('text', '') if isinstance(e, dict)
+                    else getattr(e, 'text', '') or '')
+
+        text = ' '.join(_seg_text(e) for e in entries if _seg_text(e))
         return {
             'success': True,
             'connection_mechanism': CONNECTION_MECHANISM,
