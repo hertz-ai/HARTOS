@@ -922,6 +922,85 @@ def build_channel_tool_closures(ctx):
         reconnect_channel,
     ))
 
+    # ------------------------------------------------------------------
+    # set_announcement_channel — where growth announcements get posted
+    # ------------------------------------------------------------------
+    #
+    # Setting a destination is deliberately NOT the same as authorising
+    # broadcast. With public_exposure consent absent, a configured
+    # destination still sends nothing, so exposing this as an agent tool
+    # cannot escalate anything: the worst case is an address written down
+    # that never gets used. Granting the consent itself is not a tool, and
+    # should not become one -- an autonomous goal able to grant its own
+    # permission to post publicly is the fail-closed gate flipping its own
+    # switch.
+    @log_tool_execution
+    def set_announcement_channel(
+        channel_type: Annotated[str, "Channel to announce on (telegram, discord, slack, whatsapp)"],
+        chat_id: Annotated[str, "Destination id. Telegram groups/channels are NEGATIVE ids; WhatsApp groups end in @g.us"],
+    ) -> str:
+        """Set where HARTOS posts growth announcements for a channel.
+
+        Refuses private one-to-one destinations: broadcasting into somebody's
+        DM is unsolicited messaging regardless of who configured it."""
+        try:
+            from integrations.channels.announcement_broadcaster import (
+                destination_shape, is_subscribed)
+            from integrations.channels.admin.api import get_api
+
+            channel_type = (channel_type or '').strip().lower()
+            chat_id = (chat_id or '').strip()
+            if not channel_type or not chat_id:
+                return "Both channel_type and chat_id are required."
+
+            shape = destination_shape(channel_type, chat_id)
+            if shape == 'one_to_one' and not is_subscribed(channel_type, chat_id):
+                return (f"Refused: {chat_id} is a private one-to-one chat on "
+                        f"{channel_type}. Announcements go to groups or channels "
+                        f"people joined, not to individuals who did not ask. "
+                        f"Use a group id (Telegram groups are negative; WhatsApp "
+                        f"groups end in @g.us).")
+
+            api = get_api()
+            cfg = api._channels.get(channel_type)
+            if cfg is None:
+                return (f"Channel '{channel_type}' is not registered. "
+                        f"Register it first, then set its announcement target.")
+            cfg['announce_chat_id'] = chat_id
+            api._channels[channel_type] = cfg
+            api._save_config()
+
+            # Say plainly whether this will actually broadcast yet. Reporting
+            # "configured" when nothing can send would be the same false
+            # success this system has been bitten by before.
+            try:
+                from integrations.agent_engine.marketing_tools import (
+                    _external_post_allowed)
+                consented = bool(_external_post_allowed(
+                    user_id or _get_user_id_from_threadlocal()))
+            except Exception:
+                consented = False
+
+            status = ("Announcements are ENABLED and will post here."
+                      if consented else
+                      "NOTE: public_exposure consent is not granted, so nothing "
+                      "will actually be sent yet. That grant is an operator "
+                      "action, deliberately not an agent tool.")
+            return f"Announcement target for {channel_type} set to {chat_id}. {status}"
+        except Exception as e:
+            logger.error("set_announcement_channel error: %s", e)
+            return f"Error setting announcement channel: {e}"
+
+    tools.append((
+        "set_announcement_channel",
+        "Set where HARTOS posts growth announcements for a messaging channel "
+        "(e.g. a Telegram group, a Discord channel, a WhatsApp group). Refuses "
+        "private one-to-one chats. Does NOT authorise posting on its own -- "
+        "public_exposure consent is a separate operator decision. "
+        "Example: set_announcement_channel('telegram', '-1001234567890')",
+        set_announcement_channel,
+    ))
+
     return tools
 
 
