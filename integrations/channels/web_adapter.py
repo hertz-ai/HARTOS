@@ -196,8 +196,18 @@ class WebAdapter(ChannelAdapter):
         self.status = ChannelStatus.DISCONNECTED
         logger.info("Web adapter stopped")
 
+    @web.middleware
     async def _cors_middleware(self, request, handler):
-        """CORS middleware for REST endpoints."""
+        """CORS middleware for REST endpoints.
+
+        Must be decorated with @web.middleware — aiohttp only recognizes
+        undecorated middleware callables as the legacy "factory" style
+        ((app, old_handler) -> new_handler), which is why this was being
+        invoked with the Application instance in place of `request`
+        (AttributeError: 'Application' object has no attribute 'method').
+        The decorator opts into the modern per-request signature this
+        function actually implements.
+        """
         if request.method == "OPTIONS":
             return web.Response(
                 headers={

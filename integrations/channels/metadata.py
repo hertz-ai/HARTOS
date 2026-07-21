@@ -157,10 +157,18 @@ CHANNEL_CATALOG = {
         'category': 'core',
         'auth_method': 'credentials',
         'setup_fields': [
-            {'key': 'signal_cli_path', 'label': 'signal-cli Path', 'type': 'text',
-             'help': 'Path to signal-cli binary on the server.'},
             {'key': 'phone_number', 'label': 'Registered Phone Number', 'type': 'text',
              'help': 'Phone number registered with Signal (e.g. +1234567890).'},
+            # Server-side deployment detail, not something an end user
+            # would know or should be asked to type on their phone — marked
+            # auto so it's skipped in the connect form (same pattern as
+            # WhatsApp's api_url/access_token auto fields) and never
+            # actually consumed by create_signal_adapter() anyway (its
+            # real params are phone_number/api_url — this key was dead,
+            # matched nothing the adapter reads).
+            {'key': 'signal_cli_path', 'label': 'signal-cli Path', 'type': 'text',
+             'auto': True, 'default': '',
+             'help': 'Path to signal-cli binary on the server.'},
         ],
         'capabilities': {
             'text': True, 'image': True, 'video': True, 'audio': True,
