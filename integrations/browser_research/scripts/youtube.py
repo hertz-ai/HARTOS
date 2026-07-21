@@ -165,12 +165,16 @@ def _whisper_fallback(video_id: str, language: str = 'en') -> Optional[dict]:
             logger.debug('yt-dlp produced no audio file for %s', video_id)
             return None
 
-        # Reuse the shipped STT dispatcher rather than picking an engine here,
-        # so this inherits the same hardware tiering and no-speech gating the
-        # voice stack already uses.
+        # whisper_transcribe, NOT _transcribe_impl. The public entry point runs
+        # the engine chain in a dedicated worker subprocess precisely so a CUDA
+        # OOM, a CTranslate2 crash or a PyTorch DLL segfault cannot kill the
+        # parent — and an hour of arbitrary internet video is a good way to
+        # find all three. _transcribe_impl is the in-process body that runs
+        # *inside* that worker; calling it directly here would put every other
+        # caller's stability at the mercy of one transcription.
         import json as _json
-        from integrations.service_tools import whisper_tool
-        raw = whisper_tool._transcribe_impl(audio, language)
+        from integrations.service_tools.whisper_tool import whisper_transcribe
+        raw = whisper_transcribe(audio, language)
         parsed = _json.loads(raw) if isinstance(raw, str) else (raw or {})
         text = (parsed.get('text') or '').strip()
         if not text:
