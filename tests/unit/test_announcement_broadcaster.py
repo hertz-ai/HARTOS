@@ -131,9 +131,9 @@ def test_collect_targets_filters_to_announce_chat_id_set(monkeypatch):
         'slack': {'announce_chat_id': '   ', 'enabled': True},
         'whatsapp': {'enabled': True},  # no announce_chat_id key
         # google_chat, not imessage: this test is about announce_chat_id
-        # being set. One-to-one channels need an explicit opt-in audience
-        # (see the dedicated test below), which would otherwise make the
-        # example channel do two jobs at once.
+        # being set. One-to-one channels need a subscription record (see the
+        # dedicated test below), which would otherwise make the example
+        # channel do two jobs at once.
         'google_chat': {'announce_chat_id': '999', 'enabled': True},
     })
     from integrations.channels.announcement_broadcaster import (
@@ -346,42 +346,88 @@ def test_consented_pass_sends_one_page_then_does_not_repeat_it(monkeypatch):
     assert second == ['https://hevolve.ai/b']
 
 
-def test_one_to_one_channels_need_an_explicit_opt_in_audience():
-    """Pushing an announcement at someone's private messenger is spam and a
-    TRAI UCC/DND problem. But people DO subscribe to WhatsApp Channels and
-    Signal groups, and refusing those blindly is just wrong -- so the test
-    is whether the operator affirmed the destination is opt-in, not which
-    app it is. Unset means refused; the accident is what we guard against."""
+def test_one_to_one_channels_need_a_real_subscription_record():
+    """People do subscribe to WhatsApp Channels and Signal groups, so
+    refusing by app name is naive. But an operator flag saying "they opted
+    in" is not evidence either -- it reports what it was told. The gate is a
+    subscription RECORD, which has a source and can be revoked."""
     import integrations.channels.announcement_broadcaster as ab
     fake_api = MagicMock()
     fake_api._channels = {
         'discord':  {'enabled': True, 'announce_chat_id': 'd1'},
-        'telegram': {'enabled': True, 'announce_chat_id': 't1'},
-        # no announce_audience -> refused (could be somebody's DM)
         'whatsapp': {'enabled': True, 'announce_chat_id': 'w1'},
         'imessage': {'enabled': True, 'announce_chat_id': 'i1'},
-        # operator confirmed this is a channel people subscribed to
-        'signal':   {'enabled': True, 'announce_chat_id': 's1',
-                     'announce_audience': 'opt_in'},
     }
+    subscribed = {('whatsapp', 'w1')}
     with patch('integrations.channels.admin.api.get_api', return_value=fake_api):
-        targets = dict(ab._collect_announcement_targets())
-    assert set(targets) == {'discord', 'telegram', 'signal'}
-    assert targets['signal'] == 's1'
-    for unconfirmed in ('whatsapp', 'imessage'):
-        assert unconfirmed not in targets
+        targets = dict(ab._collect_announcement_targets(
+            subscribed_check=lambda c, i: (c, i) in subscribed))
+    assert set(targets) == {'discord', 'whatsapp'}
+    assert 'imessage' not in targets   # nobody subscribed
 
 
-@pytest.mark.parametrize('value', ['opt_in', 'opt-in', 'subscribed', 'OPT_IN'])
-def test_opt_in_audience_accepts_the_documented_spellings(value):
+def test_subscription_check_is_fail_closed(monkeypatch):
+    """No consent service, no DB, an exception mid-query -- all mean NOT
+    subscribed. A check that could not run must never read as permission."""
+    import integrations.channels.announcement_broadcaster as ab
+    monkeypatch.setattr(ab, '_consent_session', lambda: (None, None))
+    assert ab.is_subscribed('whatsapp', 'w1') is False
+
+    class _Boom:
+        @staticmethod
+        def check_consent(*a, **k):
+            raise RuntimeError('db gone')
+    monkeypatch.setattr(ab, '_consent_session', lambda: (_Boom, MagicMock()))
+    assert ab.is_subscribed('whatsapp', 'w1') is False
+
+
+def test_subscription_key_identifies_the_destination_not_a_person():
+    import integrations.channels.announcement_broadcaster as ab
+    assert ab.subscription_key('telegram', ' -100123 ') == 'telegram:-100123'
+
+
+@pytest.mark.parametrize('text', [
+    'unsubscribe', 'STOP', ' stop ', '/stop', 'opt out', 'leave', 'unfollow'])
+def test_unsubscribe_words_are_recognised(text):
+    import integrations.channels.announcement_broadcaster as ab
+    assert ab.looks_like_unsubscribe(text) is True
+
+
+@pytest.mark.parametrize('text', [
+    'please stop the build', 'I want to leave a comment', '', None,
+    'can you stop by later'])
+def test_ordinary_prose_does_not_unsubscribe_someone_mid_conversation(text):
+    """Matched on the whole trimmed message, not a substring -- otherwise
+    'please stop the build' silently drops somebody from the list."""
+    import integrations.channels.announcement_broadcaster as ab
+    assert ab.looks_like_unsubscribe(text) is False
+
+
+def test_unsubscribe_revokes_and_reports_handled(monkeypatch):
+    import integrations.channels.announcement_broadcaster as ab
+    revoked = []
+    monkeypatch.setattr(ab, 'revoke_subscription',
+                        lambda c, i: revoked.append((c, i)) or True)
+    assert ab.handle_unsubscribe_command('whatsapp', 'w1', 'stop') is True
+    assert revoked == [('whatsapp', 'w1')]
+    assert ab.handle_unsubscribe_command('whatsapp', 'w1', 'hello there') is False
+    assert len(revoked) == 1
+
+
+def test_a_revoked_destination_stops_receiving(monkeypatch):
+    """The whole point of a record over a flag: it can be taken back."""
     import integrations.channels.announcement_broadcaster as ab
     fake_api = MagicMock()
-    fake_api._channels = {
-        'whatsapp': {'enabled': True, 'announce_chat_id': 'w1',
-                     'announce_audience': value},
-    }
+    fake_api._channels = {'whatsapp': {'enabled': True, 'announce_chat_id': 'w1'}}
+    live = {('whatsapp', 'w1')}
     with patch('integrations.channels.admin.api.get_api', return_value=fake_api):
-        assert dict(ab._collect_announcement_targets()) == {'whatsapp': 'w1'}
+        before = ab._collect_announcement_targets(
+            subscribed_check=lambda c, i: (c, i) in live)
+        live.clear()                      # they unsubscribed
+        after = ab._collect_announcement_targets(
+            subscribed_check=lambda c, i: (c, i) in live)
+    assert before == [('whatsapp', 'w1')]
+    assert after == []
 
 
 def test_ordinary_agent_to_human_messaging_is_not_gated_by_any_of_this(monkeypatch):

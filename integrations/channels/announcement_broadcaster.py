@@ -85,9 +85,9 @@ def _build_announcement_text(payload: Dict[str, Any]) -> str:
 # But the brand of the app is the wrong test, and a blanket ban is wrong
 # with it -- WhatsApp Channels and Signal groups people actually joined are
 # legitimate opt-in broadcast surfaces.  What matters is whether the
-# recipient asked.  So these require the operator to affirm it per
-# destination with `announce_audience: 'opt_in'`; unset means refused.
-# Fail-closed on the accident, open to the deliberate.
+# recipient asked.  So these require an actual subscription record for the
+# destination (see is_subscribed); no record means refused.  Fail-closed on
+# the accident, open to anyone who genuinely asked to be there.
 #
 # NOTE this gate applies ONLY to announcement broadcast.  Ordinary
 # agent-to-human messaging on these channels -- replies, notifications a
@@ -95,23 +95,21 @@ def _build_announcement_text(payload: Dict[str, Any]) -> str:
 # registry.send_to_channel (agent_tools, self_chat, flask_integration) and
 # is untouched by any of this.
 PERSON_TO_PERSON_CHANNELS = frozenset({'signal', 'whatsapp', 'imessage'})
-OPT_IN_AUDIENCE_VALUES = frozenset({'opt_in', 'opt-in', 'subscribed'})
 
 
 def destination_shape(channel: str, chat_id: str) -> Optional[str]:
     """Classify a destination as 'multi_person', 'one_to_one', or None.
 
-    This exists because announce_audience is only an operator ASSERTION.
-    There is no subscription surface in this system: nothing records who
-    subscribed, nothing offers an unsubscribe, and nothing checks either at
-    send time.  A flag that reports what it was told is not evidence, so
-    wherever the destination's shape is a checkable fact, use the fact.
+    Consent evidence comes in two grades and this is the stronger one.  A
+    subscription record says somebody asked; platform-enforced membership
+    says somebody other than us verified that they did.  Where the shape of
+    a destination is a checkable fact, prefer the fact -- it cannot be wrong
+    about which chat an id refers to, and a record can.
 
     Telegram is the case where it is free: private chats carry positive
-    ids, while groups, supergroups and channels carry negative ones.  That
-    is a property of the destination rather than a claim about it, so a
-    positive Telegram id is refused even when the operator marked the entry
-    opt-in — the operator can be mistaken about which chat an id refers to.
+    ids, while groups, supergroups and channels carry negative ones.  A
+    negative id therefore needs no record at all, and a positive one needs a
+    real subscription before anything is sent to it.
 
     None means "cannot determine here", NOT "safe".  Callers keep whatever
     other gate applies; None never grants anything on its own.
@@ -126,7 +124,129 @@ def destination_shape(channel: str, chat_id: str) -> Optional[str]:
     return None
 
 
-def _collect_announcement_targets() -> List[Tuple[str, str]]:
+SUBSCRIPTION_CONSENT = 'announcement_subscription'
+SUBSCRIPTION_SCOPE = 'announcements'
+# What a person sends to stop receiving broadcasts. Kept deliberately wide:
+# somebody trying to leave should not have to guess the magic word.
+UNSUBSCRIBE_WORDS = frozenset({
+    'unsubscribe', 'stop', 'stopall', 'quit', 'optout', 'opt-out', 'opt out',
+    'leave', 'no more', 'unfollow',
+})
+
+
+def subscription_key(channel: str, chat_id: str) -> str:
+    """Identity of a broadcast destination.
+
+    The subscriber is a Telegram group or a Discord channel, not a HARTOS
+    user, so the consent row is keyed by destination rather than person."""
+    return f"{channel}:{str(chat_id).strip()}"
+
+
+def _consent_session():
+    """(ConsentService, db) or (None, None). Never raises: every caller
+    treats an unavailable service as 'not subscribed'."""
+    try:
+        from integrations.social.consent_service import ConsentService
+        from integrations.social import get_session
+        return ConsentService, get_session()
+    except Exception as exc:
+        logger.debug("consent service unavailable: %s", exc)
+        return None, None
+
+
+def record_subscription(channel: str, chat_id: str, source: str = 'unknown') -> bool:
+    """Record that a destination asked to receive broadcasts.
+
+    `source` is how they asked -- a bot command, an admin action, an import.
+    It is stored so a subscription can be audited later rather than taken on
+    faith, which is the entire point of this table existing."""
+    svc, db = _consent_session()
+    if not svc:
+        return False
+    try:
+        svc.grant_consent(db, subscription_key(channel, chat_id),
+                          SUBSCRIPTION_CONSENT, scope=SUBSCRIPTION_SCOPE)
+        logger.info("announcement subscription recorded for %s/%s (source=%s)",
+                    channel, chat_id, source)
+        return True
+    except Exception as exc:
+        logger.warning("could not record subscription for %s/%s: %s",
+                       channel, chat_id, exc)
+        return False
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def revoke_subscription(channel: str, chat_id: str) -> bool:
+    """Stop broadcasting to a destination. Failing to revoke is the one
+    error here that must be loud: it means somebody asked to leave and we
+    may keep messaging them."""
+    svc, db = _consent_session()
+    if not svc:
+        logger.error("UNSUBSCRIBE NOT RECORDED for %s/%s: consent service "
+                     "unavailable. This destination may keep receiving "
+                     "broadcasts.", channel, chat_id)
+        return False
+    try:
+        svc.revoke_consent(db, subscription_key(channel, chat_id),
+                           SUBSCRIPTION_CONSENT, scope=SUBSCRIPTION_SCOPE)
+        logger.info("announcement subscription revoked for %s/%s", channel, chat_id)
+        return True
+    except Exception as exc:
+        logger.error("UNSUBSCRIBE FAILED for %s/%s: %s", channel, chat_id, exc)
+        return False
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def is_subscribed(channel: str, chat_id: str) -> bool:
+    """Fail-closed check for a real subscription record."""
+    svc, db = _consent_session()
+    if not svc:
+        return False
+    try:
+        return bool(svc.check_consent(db, subscription_key(channel, chat_id),
+                                      SUBSCRIPTION_CONSENT,
+                                      scope=SUBSCRIPTION_SCOPE))
+    except Exception as exc:
+        logger.warning("subscription check failed for %s/%s, treating as not "
+                       "subscribed: %s", channel, chat_id, exc)
+        return False
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def looks_like_unsubscribe(text: str) -> bool:
+    """Does an inbound message mean 'stop messaging me'?
+
+    Matched on the whole message, trimmed and case-folded, so ordinary prose
+    that happens to contain 'stop' does not silently unsubscribe somebody who
+    was mid-conversation."""
+    if not text:
+        return False
+    cleaned = str(text).strip().strip('/!.').lower()
+    return cleaned in UNSUBSCRIBE_WORDS
+
+
+def handle_unsubscribe_command(channel: str, chat_id: str, text: str) -> bool:
+    """Adapter hook: call on every inbound message. Returns True if the
+    message was an unsubscribe and has been handled."""
+    if not looks_like_unsubscribe(text):
+        return False
+    revoke_subscription(channel, chat_id)
+    return True
+
+
+def _collect_announcement_targets(subscribed_check=None) -> List[Tuple[str, str]]:
     """Walk AdminAPI._channels and return [(channel_type, chat_id), ...]
     for every entry that has a non-empty `announce_chat_id` AND is
     marked enabled.  No DB hit — _channels is the canonical in-memory
@@ -145,6 +265,7 @@ def _collect_announcement_targets() -> List[Tuple[str, str]]:
     except Exception as exc:
         logger.debug("AdminAPI singleton not ready: %s", exc)
         return []
+    subscribed = subscribed_check or is_subscribed
     targets: List[Tuple[str, str]] = []
     for channel_type, cfg in (getattr(api, '_channels', {}) or {}).items():
         if not isinstance(cfg, dict):
@@ -156,28 +277,32 @@ def _collect_announcement_targets() -> List[Tuple[str, str]]:
             continue
         # Where the destination's shape is a checkable fact, the fact wins
         # over the operator's claim about it.
+        # Two ways a destination can be legitimate, and neither is a flag.
+        #
+        #   1. The platform enforces membership. A Telegram group or channel
+        #      (negative id) is reachable only by people who joined it, so
+        #      somebody other than us verified the opt-in.
+        #   2. We hold a subscription record. Somebody asked, it was written
+        #      down with a source, and they can unsubscribe.
+        #
+        # announce_audience used to stand in for both. It was an assertion by
+        # the operator with nothing behind it: no subscriber list, no
+        # unsubscribe path, nothing checked at send time. A destination whose
+        # only credential is a claim that people opted in cannot be defended,
+        # so the flag is removed rather than kept as a fallback -- two sources
+        # of truth for consent is worse than one real one.
         shape = destination_shape(channel_type, chat_id)
-        if shape == 'one_to_one':
+        needs_record = (shape == 'one_to_one'
+                        or (channel_type in PERSON_TO_PERSON_CHANNELS
+                            and shape != 'multi_person'))
+        if needs_record and not subscribed(channel_type, chat_id):
             logger.warning(
-                "refusing announcement target %s/%s: the destination id is a "
-                "private one-to-one chat. announce_audience cannot override "
-                "this — it is a property of the destination, not a setting.",
-                channel_type, chat_id)
+                "refusing announcement target %s/%s: one-to-one destination "
+                "with no subscription record. It becomes eligible the moment "
+                "someone actually subscribes, and stops the moment they "
+                "unsubscribe.", channel_type, chat_id)
             continue
 
-        if channel_type in PERSON_TO_PERSON_CHANNELS and shape != 'multi_person':
-            audience = str(cfg.get('announce_audience') or '').strip().lower()
-            if audience not in OPT_IN_AUDIENCE_VALUES:
-                logger.warning(
-                    "refusing announcement target %s/%s: %s defaults to "
-                    "one-to-one messaging. If this destination is a channel "
-                    "or group people subscribed to, set announce_audience: "
-                    "'opt_in' on it to confirm that and enable broadcast.",
-                    channel_type, chat_id, channel_type)
-                continue
-            logger.info(
-                "announcement target %s/%s allowed: operator marked it as an "
-                "opt-in audience", channel_type, chat_id)
         targets.append((channel_type, chat_id))
     return targets
 
