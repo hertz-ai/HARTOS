@@ -146,11 +146,15 @@ def test_collect_targets_filters_to_announce_chat_id_set(monkeypatch):
 def test_collect_targets_skips_disabled_channels(monkeypatch):
     _patch_admin_channels(monkeypatch, {
         'discord': {'announce_chat_id': '123', 'enabled': False},
-        'telegram': {'announce_chat_id': '456', 'enabled': True},
+        # Negative id = a Telegram group/channel. The original fixture used
+        # '456', which is a *private chat* id and is now refused on that
+        # basis — this test is about `enabled`, so give it a destination
+        # that is actually broadcastable.
+        'telegram': {'announce_chat_id': '-456', 'enabled': True},
     })
     from integrations.channels.announcement_broadcaster import (
         _collect_announcement_targets)
-    assert _collect_announcement_targets() == [('telegram', '456')]
+    assert _collect_announcement_targets() == [('telegram', '-456')]
 
 
 def test_collect_targets_empty_when_no_admin_api(monkeypatch):
@@ -402,3 +406,49 @@ def test_ordinary_agent_to_human_messaging_is_not_gated_by_any_of_this(monkeypat
 def test_unreachable_feed_yields_no_posts_rather_than_a_guess():
     import integrations.channels.announcement_broadcaster as ab
     assert ab.fetch_own_pages('http://127.0.0.1:9/nope.json', timeout=2) == []
+
+
+# ── destination shape: fact beats assertion ─────────────────────────────
+
+def test_telegram_private_chat_ids_are_recognised_as_one_to_one():
+    """Telegram private chats have positive ids; groups, supergroups and
+    channels have negative ones. That is a property of the destination, not
+    a claim about it — which is the whole point, since announce_audience is
+    only ever an operator assertion."""
+    import integrations.channels.announcement_broadcaster as ab
+    assert ab.destination_shape('telegram', '123456') == 'one_to_one'
+    assert ab.destination_shape('telegram', '-1001234567890') == 'multi_person'
+    assert ab.destination_shape('telegram', ' -42 ') == 'multi_person'
+
+
+def test_undecidable_destinations_return_none_not_permission():
+    """None means 'cannot determine', never 'safe'. Discord/Slack channel
+    type needs an API call that is not wired yet; @channelname is not
+    decidable from the id."""
+    import integrations.channels.announcement_broadcaster as ab
+    assert ab.destination_shape('telegram', '@somechannel') is None
+    assert ab.destination_shape('discord', '123') is None
+    assert ab.destination_shape('slack', 'C123') is None
+
+
+def test_a_private_telegram_id_is_refused_even_when_marked_opt_in(monkeypatch):
+    """The operator can be wrong about which chat an id points at. Where a
+    fact contradicts the assertion, the fact wins."""
+    _patch_admin_channels(monkeypatch, {
+        'telegram': {'enabled': True, 'announce_chat_id': '987654',
+                     'announce_audience': 'opt_in'},
+    })
+    from integrations.channels.announcement_broadcaster import (
+        _collect_announcement_targets)
+    assert _collect_announcement_targets() == []
+
+
+def test_a_telegram_group_id_is_accepted_without_any_flag(monkeypatch):
+    """A negative id is structurally a group/channel: people had to join it,
+    and the platform enforces that. No operator claim required."""
+    _patch_admin_channels(monkeypatch, {
+        'telegram': {'enabled': True, 'announce_chat_id': '-1001234567890'},
+    })
+    from integrations.channels.announcement_broadcaster import (
+        _collect_announcement_targets)
+    assert _collect_announcement_targets() == [('telegram', '-1001234567890')]

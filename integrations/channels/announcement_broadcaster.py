@@ -98,6 +98,34 @@ PERSON_TO_PERSON_CHANNELS = frozenset({'signal', 'whatsapp', 'imessage'})
 OPT_IN_AUDIENCE_VALUES = frozenset({'opt_in', 'opt-in', 'subscribed'})
 
 
+def destination_shape(channel: str, chat_id: str) -> Optional[str]:
+    """Classify a destination as 'multi_person', 'one_to_one', or None.
+
+    This exists because announce_audience is only an operator ASSERTION.
+    There is no subscription surface in this system: nothing records who
+    subscribed, nothing offers an unsubscribe, and nothing checks either at
+    send time.  A flag that reports what it was told is not evidence, so
+    wherever the destination's shape is a checkable fact, use the fact.
+
+    Telegram is the case where it is free: private chats carry positive
+    ids, while groups, supergroups and channels carry negative ones.  That
+    is a property of the destination rather than a claim about it, so a
+    positive Telegram id is refused even when the operator marked the entry
+    opt-in — the operator can be mistaken about which chat an id refers to.
+
+    None means "cannot determine here", NOT "safe".  Callers keep whatever
+    other gate applies; None never grants anything on its own.
+    """
+    if channel == 'telegram':
+        try:
+            return 'one_to_one' if int(str(chat_id).strip()) > 0 else 'multi_person'
+        except (TypeError, ValueError):
+            return None  # @channelname and similar — not decidable from the id
+    # Discord/Slack channel-vs-DM is decidable, but only via an API call
+    # (channel type lookup). Until that is wired, say so rather than guess.
+    return None
+
+
 def _collect_announcement_targets() -> List[Tuple[str, str]]:
     """Walk AdminAPI._channels and return [(channel_type, chat_id), ...]
     for every entry that has a non-empty `announce_chat_id` AND is
@@ -126,7 +154,18 @@ def _collect_announcement_targets() -> List[Tuple[str, str]]:
         chat_id = (cfg.get('announce_chat_id') or '').strip()
         if not chat_id:
             continue
-        if channel_type in PERSON_TO_PERSON_CHANNELS:
+        # Where the destination's shape is a checkable fact, the fact wins
+        # over the operator's claim about it.
+        shape = destination_shape(channel_type, chat_id)
+        if shape == 'one_to_one':
+            logger.warning(
+                "refusing announcement target %s/%s: the destination id is a "
+                "private one-to-one chat. announce_audience cannot override "
+                "this — it is a property of the destination, not a setting.",
+                channel_type, chat_id)
+            continue
+
+        if channel_type in PERSON_TO_PERSON_CHANNELS and shape != 'multi_person':
             audience = str(cfg.get('announce_audience') or '').strip().lower()
             if audience not in OPT_IN_AUDIENCE_VALUES:
                 logger.warning(
