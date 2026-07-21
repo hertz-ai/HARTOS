@@ -177,6 +177,34 @@ jobs:
             if az and len(az) < 3:
                 raise SystemExit("partial Azure config: " + ",".join(az))
             print("azure openai:", "configured" if len(az) == 3 else "not used")
+
+            # Three independent consumers each read a DIFFERENT variable for
+            # the LLM endpoint. Setting only some of them produces a node that
+            # deploys green and half-works: recipes reach the endpoint while
+            # /chat quietly falls back to a local llama.cpp that is not
+            # running, with no error naming the cause. That exact split cost a
+            # night of debugging, so a partially-routed node now fails here
+            # rather than in production.
+            routes = {
+                "HEVOLVE_LLM_ENDPOINT_URL": "autogen / recipes",
+                "OPENAI_BASE_URL": "langchain ChatOpenAI",
+                "HEVOLVE_LOCAL_LLM_URL": "port_registry.get_local_llm_url",
+            }
+            have = {k: os.getenv(k) for k in routes if os.getenv(k)}
+            if have and len(have) < len(routes):
+                missing = [f"{k} ({routes[k]})" for k in routes if k not in have]
+                raise SystemExit(
+                    "LLM endpoint only partially routed; these consumers would "
+                    "fall back elsewhere: " + "; ".join(missing))
+            if have:
+                # Differing values are legitimate (deliberately splitting
+                # subsystems across models) but rare enough to be worth saying
+                # out loud in the deploy log.
+                distinct = set(have.values())
+                print("llm routing:", "all consumers ->", distinct.pop()
+                      if len(distinct) == 1 else f"SPLIT across {len(distinct)} endpoints")
+            else:
+                print("llm routing: none set (provider defaults apply)")
             PY
             '
 
