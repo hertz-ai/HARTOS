@@ -76,12 +76,26 @@ def _build_announcement_text(payload: Dict[str, Any]) -> str:
     )
 
 
+# Person-to-person messaging channels.  These carry conversations with
+# individuals, not broadcasts to a room somebody chose to join, so an
+# announcement pushed here is unsolicited commercial messaging: spam in
+# plain terms, a TRAI UCC/DND violation in India, and the fastest way to
+# get a number permanently banned by the provider.  Excluded structurally
+# rather than by convention, because the cost of one mistake is the
+# account.  An operator who sets announce_chat_id on one of these gets a
+# warning and no send.
+PERSON_TO_PERSON_CHANNELS = frozenset({'signal', 'whatsapp', 'imessage'})
+
+
 def _collect_announcement_targets() -> List[Tuple[str, str]]:
     """Walk AdminAPI._channels and return [(channel_type, chat_id), ...]
     for every entry that has a non-empty `announce_chat_id` AND is
     marked enabled.  No DB hit — _channels is the canonical in-memory
     config store (also persisted by AdminAPI._save_config / restored
-    by _load_config at startup)."""
+    by _load_config at startup).
+
+    Person-to-person channels are refused regardless of configuration
+    (see PERSON_TO_PERSON_CHANNELS)."""
     try:
         from integrations.channels.admin.api import get_api
     except Exception as exc:
@@ -100,6 +114,12 @@ def _collect_announcement_targets() -> List[Tuple[str, str]]:
             continue
         chat_id = (cfg.get('announce_chat_id') or '').strip()
         if not chat_id:
+            continue
+        if channel_type in PERSON_TO_PERSON_CHANNELS:
+            logger.warning(
+                "refusing announcement target %s/%s: %s is a person-to-person "
+                "channel, broadcasting to it is unsolicited messaging",
+                channel_type, chat_id, channel_type)
             continue
         targets.append((channel_type, chat_id))
     return targets
@@ -172,6 +192,149 @@ def broadcast_announcement(text: str) -> int:
     for channel, chat_id in targets:
         _dispatch_to_target(channel, chat_id, text)
     return len(targets)
+
+
+# ── new-content announcements ───────────────────────────────────────────
+#
+# The broadcaster originally fired on exactly one event, hive.benchmark.
+# published, so the only thing that ever reached an external channel was a
+# benchmark proof.  Every page hevolve.ai publishes -- the answers, the
+# incident write-ups -- was invisible to distribution.
+#
+# Source of truth is the published feed at /ai-news-feed.json rather than
+# the web repo's files: it is already generated deterministically by
+# scripts/fetch-ai-news.js, already carries the per-channel ?ref= URLs the
+# funnel counts via /marketing/track, and reading it over HTTP means HARTOS
+# needs no path into a sibling repository.
+
+CONTENT_FEED_URL = 'https://hevolve.ai/ai-news-feed.json'
+# How many pages may go out in a single pass.  One.  A community notices a
+# steady contributor and mutes a firehose, and a backlog of twenty pages
+# dumped at once reads as exactly the latter.
+CONTENT_ANNOUNCE_LIMIT = 1
+
+
+def fetch_own_pages(url: str = CONTENT_FEED_URL, timeout: int = 20) -> List[Dict[str, Any]]:
+    """Read own_pages from the published agent feed.  Returns [] on any
+    failure -- a distribution pass that cannot read the feed must be a
+    no-op, never a guess about what to post."""
+    import json
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            url, headers={'User-Agent': 'HARTOS-AnnouncementBroadcaster/1.0'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        pages = data.get('own_pages') or []
+        return [p for p in pages if isinstance(p, dict) and p.get('url')]
+    except Exception as exc:
+        logger.warning("could not read content feed %s: %s", url, exc)
+        return []
+
+
+def select_unannounced(pages: List[Dict[str, Any]],
+                       already: Any,
+                       limit: int = CONTENT_ANNOUNCE_LIMIT) -> List[Dict[str, Any]]:
+    """Pick up to `limit` pages that have not been announced before.
+
+    Deterministic: feed order is preserved, so the oldest unannounced page
+    goes first and a page cannot jump the queue between passes.  Pure, so
+    the selection rule is testable without a network or a channel."""
+    seen = set(already or ())
+    out = []
+    for page in pages:
+        if page.get('url') in seen:
+            continue
+        out.append(page)
+        if len(out) >= max(0, limit):
+            break
+    return out
+
+
+def format_content_announcement(page: Dict[str, Any], channel: str) -> str:
+    """Compose the outbound text for one page.
+
+    States who is posting.  This is not decoration: the account is
+    Hevolve's, the writing is Hevolve's, and a post that lets a reader
+    assume otherwise is the thing we do not do.  It is also what keeps the
+    post inside the self-promotion rules most communities publish."""
+    title = (page.get('title') or '').strip()
+    share = (page.get('share_urls') or {}).get(channel) or page.get('url')
+    return (
+        f"{title}\n"
+        f"{share}\n\n"
+        f"Posted by the Hevolve AI agent. We build HART OS and Nunba; "
+        f"this is our own write-up."
+    )
+
+
+def _public_exposure_granted() -> bool:
+    """Fail-closed check of the standing public_exposure consent.
+
+    Reuses ConsentService rather than reading user_consents directly, so
+    there is one definition of consent in the system.  Any error -- no DB,
+    no service, no session -- means NOT granted: an external post must
+    never happen because a check failed to run."""
+    try:
+        from integrations.social.consent_service import ConsentService
+        from integrations.social import get_session
+    except Exception as exc:
+        logger.debug("consent service unavailable, treating as denied: %s", exc)
+        return False
+    try:
+        db = get_session()
+    except Exception as exc:
+        logger.debug("no db session for consent check, denied: %s", exc)
+        return False
+    try:
+        import os
+        user_id = os.environ.get('HEVOLVE_SYSTEM_USER_ID', 'system')
+        return bool(ConsentService.check_consent(db, user_id, 'public_exposure'))
+    except Exception as exc:
+        logger.warning("consent check failed, refusing to post: %s", exc)
+        return False
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def announce_new_content(limit: int = CONTENT_ANNOUNCE_LIMIT,
+                         already_announced: Any = None,
+                         consent_check=None,
+                         pages=None) -> List[str]:
+    """Announce up to `limit` not-yet-announced pages to every configured
+    target.  Returns the URLs actually dispatched, for the caller to
+    persist so the next pass skips them.
+
+    consent_check / pages are injectable so the orchestration is testable
+    without a database or a network."""
+    check = consent_check or _public_exposure_granted
+    if not check():
+        logger.info(
+            "new-content announcement skipped: public_exposure consent not "
+            "granted (set HEVOLVE_AUTONOMOUS_MARKETING to grant it)")
+        return []
+
+    candidates = pages if pages is not None else fetch_own_pages()
+    chosen = select_unannounced(candidates, already_announced, limit)
+    if not chosen:
+        return []
+
+    targets = _collect_announcement_targets()
+    if not targets:
+        logger.debug("no announcement targets configured")
+        return []
+
+    sent = []
+    for page in chosen:
+        for channel, chat_id in targets:
+            _dispatch_to_target(
+                channel, chat_id, format_content_announcement(page, channel))
+        sent.append(page['url'])
+        logger.info("announced %s to %d target(s)", page['url'], len(targets))
+    return sent
 
 
 def _on_benchmark_published(_topic: str, data: Any) -> None:

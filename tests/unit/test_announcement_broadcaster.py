@@ -130,13 +130,17 @@ def test_collect_targets_filters_to_announce_chat_id_set(monkeypatch):
         'telegram': {'announce_chat_id': '', 'enabled': True},
         'slack': {'announce_chat_id': '   ', 'enabled': True},
         'whatsapp': {'enabled': True},  # no announce_chat_id key
-        'imessage': {'announce_chat_id': '999', 'enabled': True},
+        # google_chat, not imessage: this test is about announce_chat_id
+        # being set, and person-to-person channels are now refused outright
+        # regardless of config (see the dedicated test below), which would
+        # otherwise make the example channel do two jobs at once.
+        'google_chat': {'announce_chat_id': '999', 'enabled': True},
     })
     from integrations.channels.announcement_broadcaster import (
         _collect_announcement_targets)
     targets = _collect_announcement_targets()
-    # Only discord + imessage qualify.
-    assert sorted(targets) == [('discord', '123456'), ('imessage', '999')]
+    # Only discord + google_chat qualify.
+    assert sorted(targets) == [('discord', '123456'), ('google_chat', '999')]
 
 
 def test_collect_targets_skips_disabled_channels(monkeypatch):
@@ -276,3 +280,88 @@ def test_event_published_triggers_broadcast(monkeypatch):
     # Cleanup so we don't leak state to other tests.
     ab.reset_for_tests()
     inst.shutdown()
+
+
+# ── new-content announcements ───────────────────────────────────────────
+#
+# The broadcaster used to fire on exactly one event, so only benchmark
+# proofs ever left the building. These cover the content path and the
+# four ways it could do real damage: posting without consent, posting to
+# somebody's private messenger, posting the same page twice, and flooding.
+
+_PAGES = [
+    {'url': 'https://hevolve.ai/a', 'title': 'Page A',
+     'share_urls': {'discord': 'https://hevolve.ai/a?ref=discord'}},
+    {'url': 'https://hevolve.ai/b', 'title': 'Page B',
+     'share_urls': {'discord': 'https://hevolve.ai/b?ref=discord'}},
+]
+
+
+def test_selection_is_ordered_deduped_and_capped():
+    import integrations.channels.announcement_broadcaster as ab
+    assert [p['url'] for p in ab.select_unannounced(_PAGES, [], 1)] == \
+        ['https://hevolve.ai/a']
+    assert [p['url'] for p in ab.select_unannounced(
+        _PAGES, ['https://hevolve.ai/a'], 1)] == ['https://hevolve.ai/b']
+    assert ab.select_unannounced(_PAGES, [p['url'] for p in _PAGES], 5) == []
+    # One page per pass: a community notices a steady contributor and
+    # mutes a firehose.
+    assert ab.CONTENT_ANNOUNCE_LIMIT == 1
+
+
+def test_announcement_text_uses_ref_url_and_states_who_is_posting():
+    import integrations.channels.announcement_broadcaster as ab
+    text = ab.format_content_announcement(_PAGES[0], 'discord')
+    assert 'ref=discord' in text          # funnel attribution survives
+    assert 'Hevolve AI agent' in text     # not passing as a person
+    assert 'Page A' in text
+
+
+def test_no_post_without_public_exposure_consent():
+    import integrations.channels.announcement_broadcaster as ab
+    sent = ab.announce_new_content(
+        consent_check=lambda: False, pages=_PAGES, already_announced=[])
+    assert sent == []
+
+
+def test_consented_pass_sends_one_page_then_does_not_repeat_it(monkeypatch):
+    import integrations.channels.announcement_broadcaster as ab
+    calls = []
+    monkeypatch.setattr(ab, '_collect_announcement_targets',
+                        lambda: [('discord', '123')])
+    monkeypatch.setattr(ab, '_dispatch_to_target',
+                        lambda c, i, t: calls.append((c, i, t)))
+
+    first = ab.announce_new_content(
+        consent_check=lambda: True, pages=_PAGES, already_announced=[])
+    assert first == ['https://hevolve.ai/a']
+    assert len(calls) == 1
+
+    second = ab.announce_new_content(
+        consent_check=lambda: True, pages=_PAGES, already_announced=first)
+    assert second == ['https://hevolve.ai/b']
+
+
+def test_person_to_person_channels_are_refused_even_if_configured():
+    """Broadcasting into Signal/WhatsApp/iMessage is unsolicited messaging:
+    spam, a TRAI UCC/DND violation in India, and a fast route to a banned
+    number. Refused structurally, not by convention."""
+    import integrations.channels.announcement_broadcaster as ab
+    fake_api = MagicMock()
+    fake_api._channels = {
+        'discord':  {'enabled': True,  'announce_chat_id': 'd1'},
+        'telegram': {'enabled': True,  'announce_chat_id': 't1'},
+        'whatsapp': {'enabled': True,  'announce_chat_id': 'w1'},
+        'signal':   {'enabled': True,  'announce_chat_id': 's1'},
+        'imessage': {'enabled': True,  'announce_chat_id': 'i1'},
+    }
+    with patch('integrations.channels.admin.api.get_api', return_value=fake_api):
+        targets = dict(ab._collect_announcement_targets())
+    assert set(targets) == {'discord', 'telegram'}
+    for private in ('whatsapp', 'signal', 'imessage'):
+        assert private not in targets
+
+
+def test_unreachable_feed_yields_no_posts_rather_than_a_guess():
+    import integrations.channels.announcement_broadcaster as ab
+    assert ab.fetch_own_pages('http://127.0.0.1:9/nope.json', timeout=2) == []
