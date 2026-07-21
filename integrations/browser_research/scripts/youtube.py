@@ -67,11 +67,24 @@ def transcript(url: str, language: str = 'en') -> dict:
                 fetched = YouTubeTranscriptApi().fetch(video_id, languages=langs)
                 entries = getattr(fetched, 'snippets', fetched)
         except Exception as exc:
+            # Do NOT return here. "No caption track" is the common case, and
+            # it is precisely when the local-STT fallback below should run.
+            # Returning early made that fallback unreachable except when the
+            # package was missing entirely — the one case it could not help.
+            logger.debug('caption fetch failed for %s (%s); trying local STT',
+                         video_id, exc)
+            entries = None
+
+        if entries is None:
+            result = _whisper_fallback(video_id, language)
+            if result is not None:
+                return result
             return {
                 'success': False,
                 'connection_mechanism': CONNECTION_MECHANISM,
                 'video_id': video_id,
-                'error': f'YouTubeTranscriptApi failed: {exc}',
+                'error': ('no caption track for this video, and local STT '
+                          'could not produce one'),
             }
 
         def _seg_text(e):
@@ -92,9 +105,88 @@ def transcript(url: str, language: str = 'en') -> dict:
     except ImportError:
         pass
 
+    # Last resort: no captions published, so make our own.
+    #
+    # Most videos worth reading have no caption track — five of six on our own
+    # channel have none, which makes a captions-only tool useless exactly where
+    # it is most needed. HARTOS already ships local STT (faster-whisper ->
+    # sherpa-onnx -> openai-whisper, hardware-tiered, models cached under
+    # ~/.hevolve/models/stt). Pull the audio, transcribe it here. No cloud, no
+    # per-minute cost, and it works on any video regardless of what the
+    # uploader published.
+    result = _whisper_fallback(video_id, language)
+    if result is not None:
+        return result
+
     return {
         'success': False,
         'connection_mechanism': CONNECTION_MECHANISM,
         'video_id': video_id,
-        'error': 'youtube_transcript_api not installed; pip install youtube-transcript-api',
+        'error': ('no caption track, and local STT unavailable '
+                  '(need yt-dlp + faster-whisper)'),
     }
+
+
+def _whisper_fallback(video_id: str, language: str = 'en') -> Optional[dict]:
+    """Download the audio and transcribe it locally. None if unavailable.
+
+    Returns a dict shaped exactly like the caption path so callers cannot
+    tell the difference except by reading `tool` -- the agent asked for the
+    words, not for how we got them.
+    """
+    import os
+    import tempfile
+
+    try:
+        import yt_dlp
+    except ImportError:
+        logger.debug('yt-dlp not installed; cannot fall back to local STT')
+        return None
+
+    tmpdir = tempfile.mkdtemp(prefix='yt_stt_')
+    outtmpl = os.path.join(tmpdir, '%(id)s.%(ext)s')
+    try:
+        opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'format': 'bestaudio/best',
+            'outtmpl': outtmpl,
+            'noplaylist': True,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([f'https://www.youtube.com/watch?v={video_id}'])
+
+        audio = None
+        for name in os.listdir(tmpdir):
+            if name.startswith(video_id):
+                audio = os.path.join(tmpdir, name)
+                break
+        if not audio:
+            logger.debug('yt-dlp produced no audio file for %s', video_id)
+            return None
+
+        # Reuse the shipped STT dispatcher rather than picking an engine here,
+        # so this inherits the same hardware tiering and no-speech gating the
+        # voice stack already uses.
+        import json as _json
+        from integrations.service_tools import whisper_tool
+        raw = whisper_tool._transcribe_impl(audio, language)
+        parsed = _json.loads(raw) if isinstance(raw, str) else (raw or {})
+        text = (parsed.get('text') or '').strip()
+        if not text:
+            return None
+        return {
+            'success': True,
+            'connection_mechanism': CONNECTION_MECHANISM,
+            'tool': 'local_stt',
+            'video_id': video_id,
+            'language': parsed.get('language') or language,
+            'text': text,
+            'segment_count': None,
+        }
+    except Exception as exc:
+        logger.debug('local STT fallback failed for %s: %s', video_id, exc)
+        return None
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)

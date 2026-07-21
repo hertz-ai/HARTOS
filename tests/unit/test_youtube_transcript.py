@@ -68,3 +68,44 @@ def test_bad_url_fails_without_raising():
     r = transcript('https://example.com/not-a-video')
     assert r['success'] is False
     assert 'video id' in r['error']
+
+
+def test_falls_back_to_local_stt_when_no_captions(monkeypatch):
+    """Five of six videos on our own channel have no caption track, so a
+    captions-only tool is useless exactly where it matters. The fallback must
+    return the same shape as the caption path -- the caller asked for words,
+    not for how we got them."""
+    import integrations.browser_research.scripts.youtube as yt
+    import youtube_transcript_api as mod
+
+    class _NoCaptions:
+        def fetch(self, video_id, languages=None):
+            raise RuntimeError('Could not retrieve a transcript')
+
+    monkeypatch.setattr(mod, 'YouTubeTranscriptApi', _NoCaptions)
+    monkeypatch.setattr(yt, '_whisper_fallback',
+                        lambda vid, lang='en': {
+                            'success': True, 'tool': 'local_stt',
+                            'video_id': vid, 'language': 'en',
+                            'text': 'spoken words', 'segment_count': None,
+                            'connection_mechanism': yt.CONNECTION_MECHANISM})
+    r = yt.transcript('https://youtu.be/FYKHEHG02fk')
+    assert r['success'] is True
+    assert r['tool'] == 'local_stt'
+    assert r['text'] == 'spoken words'
+
+
+def test_no_captions_and_no_stt_reports_both(monkeypatch):
+    """The old message blamed a missing pip package even when the real cause
+    was a video with no captions. Say what is actually wrong."""
+    import integrations.browser_research.scripts.youtube as yt
+    import youtube_transcript_api as mod
+
+    class _NoCaptions:
+        def fetch(self, video_id, languages=None):
+            raise RuntimeError('Could not retrieve a transcript')
+
+    monkeypatch.setattr(mod, 'YouTubeTranscriptApi', _NoCaptions)
+    monkeypatch.setattr(yt, '_whisper_fallback', lambda vid, lang='en': None)
+    r = yt.transcript('https://youtu.be/FYKHEHG02fk')
+    assert r['success'] is False
