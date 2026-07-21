@@ -131,9 +131,9 @@ def test_collect_targets_filters_to_announce_chat_id_set(monkeypatch):
         'slack': {'announce_chat_id': '   ', 'enabled': True},
         'whatsapp': {'enabled': True},  # no announce_chat_id key
         # google_chat, not imessage: this test is about announce_chat_id
-        # being set, and person-to-person channels are now refused outright
-        # regardless of config (see the dedicated test below), which would
-        # otherwise make the example channel do two jobs at once.
+        # being set. One-to-one channels need an explicit opt-in audience
+        # (see the dedicated test below), which would otherwise make the
+        # example channel do two jobs at once.
         'google_chat': {'announce_chat_id': '999', 'enabled': True},
     })
     from integrations.channels.announcement_broadcaster import (
@@ -342,24 +342,61 @@ def test_consented_pass_sends_one_page_then_does_not_repeat_it(monkeypatch):
     assert second == ['https://hevolve.ai/b']
 
 
-def test_person_to_person_channels_are_refused_even_if_configured():
-    """Broadcasting into Signal/WhatsApp/iMessage is unsolicited messaging:
-    spam, a TRAI UCC/DND violation in India, and a fast route to a banned
-    number. Refused structurally, not by convention."""
+def test_one_to_one_channels_need_an_explicit_opt_in_audience():
+    """Pushing an announcement at someone's private messenger is spam and a
+    TRAI UCC/DND problem. But people DO subscribe to WhatsApp Channels and
+    Signal groups, and refusing those blindly is just wrong -- so the test
+    is whether the operator affirmed the destination is opt-in, not which
+    app it is. Unset means refused; the accident is what we guard against."""
     import integrations.channels.announcement_broadcaster as ab
     fake_api = MagicMock()
     fake_api._channels = {
-        'discord':  {'enabled': True,  'announce_chat_id': 'd1'},
-        'telegram': {'enabled': True,  'announce_chat_id': 't1'},
-        'whatsapp': {'enabled': True,  'announce_chat_id': 'w1'},
-        'signal':   {'enabled': True,  'announce_chat_id': 's1'},
-        'imessage': {'enabled': True,  'announce_chat_id': 'i1'},
+        'discord':  {'enabled': True, 'announce_chat_id': 'd1'},
+        'telegram': {'enabled': True, 'announce_chat_id': 't1'},
+        # no announce_audience -> refused (could be somebody's DM)
+        'whatsapp': {'enabled': True, 'announce_chat_id': 'w1'},
+        'imessage': {'enabled': True, 'announce_chat_id': 'i1'},
+        # operator confirmed this is a channel people subscribed to
+        'signal':   {'enabled': True, 'announce_chat_id': 's1',
+                     'announce_audience': 'opt_in'},
     }
     with patch('integrations.channels.admin.api.get_api', return_value=fake_api):
         targets = dict(ab._collect_announcement_targets())
-    assert set(targets) == {'discord', 'telegram'}
-    for private in ('whatsapp', 'signal', 'imessage'):
-        assert private not in targets
+    assert set(targets) == {'discord', 'telegram', 'signal'}
+    assert targets['signal'] == 's1'
+    for unconfirmed in ('whatsapp', 'imessage'):
+        assert unconfirmed not in targets
+
+
+@pytest.mark.parametrize('value', ['opt_in', 'opt-in', 'subscribed', 'OPT_IN'])
+def test_opt_in_audience_accepts_the_documented_spellings(value):
+    import integrations.channels.announcement_broadcaster as ab
+    fake_api = MagicMock()
+    fake_api._channels = {
+        'whatsapp': {'enabled': True, 'announce_chat_id': 'w1',
+                     'announce_audience': value},
+    }
+    with patch('integrations.channels.admin.api.get_api', return_value=fake_api):
+        assert dict(ab._collect_announcement_targets()) == {'whatsapp': 'w1'}
+
+
+def test_ordinary_agent_to_human_messaging_is_not_gated_by_any_of_this(monkeypatch):
+    """The opt-in gate exists on the BROADCAST path only. Replies,
+    notifications a user asked for, and an agent messaging its own owner go
+    through registry.send_to_channel and must stay untouched -- including
+    on WhatsApp, Signal and iMessage, which is what those adapters are for.
+
+    Asserted behaviourally: dispatching directly to a one-to-one channel
+    still sends. (An earlier version of this test counted occurrences of a
+    constant in the module source, which broke the moment a comment
+    mentioned it -- a check coupled to prose rather than behaviour.)"""
+    scheduled = []
+    inst = _patch_integration_loop(monkeypatch, scheduled)
+    from integrations.channels.announcement_broadcaster import (
+        _dispatch_to_target)
+    _dispatch_to_target('whatsapp', 'user-123', 'your build finished')
+    assert scheduled == [('whatsapp', 'user-123', 'your build finished')]
+    inst.shutdown()
 
 
 def test_unreachable_feed_yields_no_posts_rather_than_a_guess():

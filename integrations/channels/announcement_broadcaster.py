@@ -76,15 +76,26 @@ def _build_announcement_text(payload: Dict[str, Any]) -> str:
     )
 
 
-# Person-to-person messaging channels.  These carry conversations with
-# individuals, not broadcasts to a room somebody chose to join, so an
-# announcement pushed here is unsolicited commercial messaging: spam in
-# plain terms, a TRAI UCC/DND violation in India, and the fastest way to
-# get a number permanently banned by the provider.  Excluded structurally
-# rather than by convention, because the cost of one mistake is the
-# account.  An operator who sets announce_chat_id on one of these gets a
-# warning and no send.
+# Channels whose default surface is a conversation with one person rather
+# than a room somebody chose to join.  Pushing an announcement at those
+# recipients is unsolicited commercial messaging: spam plainly, a TRAI
+# UCC/DND problem in India, and a fast route to a permanently banned
+# number.
+#
+# But the brand of the app is the wrong test, and a blanket ban is wrong
+# with it -- WhatsApp Channels and Signal groups people actually joined are
+# legitimate opt-in broadcast surfaces.  What matters is whether the
+# recipient asked.  So these require the operator to affirm it per
+# destination with `announce_audience: 'opt_in'`; unset means refused.
+# Fail-closed on the accident, open to the deliberate.
+#
+# NOTE this gate applies ONLY to announcement broadcast.  Ordinary
+# agent-to-human messaging on these channels -- replies, notifications a
+# user asked for, an agent talking to its owner -- goes through
+# registry.send_to_channel (agent_tools, self_chat, flask_integration) and
+# is untouched by any of this.
 PERSON_TO_PERSON_CHANNELS = frozenset({'signal', 'whatsapp', 'imessage'})
+OPT_IN_AUDIENCE_VALUES = frozenset({'opt_in', 'opt-in', 'subscribed'})
 
 
 def _collect_announcement_targets() -> List[Tuple[str, str]]:
@@ -116,11 +127,18 @@ def _collect_announcement_targets() -> List[Tuple[str, str]]:
         if not chat_id:
             continue
         if channel_type in PERSON_TO_PERSON_CHANNELS:
-            logger.warning(
-                "refusing announcement target %s/%s: %s is a person-to-person "
-                "channel, broadcasting to it is unsolicited messaging",
-                channel_type, chat_id, channel_type)
-            continue
+            audience = str(cfg.get('announce_audience') or '').strip().lower()
+            if audience not in OPT_IN_AUDIENCE_VALUES:
+                logger.warning(
+                    "refusing announcement target %s/%s: %s defaults to "
+                    "one-to-one messaging. If this destination is a channel "
+                    "or group people subscribed to, set announce_audience: "
+                    "'opt_in' on it to confirm that and enable broadcast.",
+                    channel_type, chat_id, channel_type)
+                continue
+            logger.info(
+                "announcement target %s/%s allowed: operator marked it as an "
+                "opt-in audience", channel_type, chat_id)
         targets.append((channel_type, chat_id))
     return targets
 
