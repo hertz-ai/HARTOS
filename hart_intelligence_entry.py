@@ -1419,11 +1419,31 @@ try:
         """
         import requests as _req
         data = request.get_json(silent=True) or {}
-        hevolve_url = os.environ.get('HEVOLVE_API_URL', 'http://localhost:8000')
+        # Resolve the LLM the same way every other consumer does, instead of a
+        # private HEVOLVE_API_URL that defaulted to localhost:8000. That default
+        # is correct for an on-device install (llama.cpp on :8000 is the whole
+        # point of local Nunba), but on the central tier nothing runs there, so
+        # this proxy 502'd while Langchain/Autogen worked off the gateway. The
+        # resolver probes candidates and picks the first reachable one — the
+        # local model on a device, the gateway on central — so a single source
+        # of truth is correct in both topologies. Explicit HEVOLVE_API_URL still
+        # wins if set, for operators who want to pin it.
+        base = os.environ.get('HEVOLVE_API_URL')
+        if not base:
+            try:
+                from core.port_registry import get_local_llm_url
+                base = get_local_llm_url()
+            except Exception:
+                base = 'http://localhost:8000'
+        base = base.rstrip('/')
+        # The resolver returns a base already ending in /v1; a bare host does
+        # not. Build the completions path without doubling /v1.
+        target = base + ('/chat/completions' if base.endswith('/v1')
+                         else '/v1/chat/completions')
         headers = {'Content-Type': 'application/json'}
         try:
             resp = _req.post(
-                f'{hevolve_url}/v1/chat/completions',
+                target,
                 json=data,
                 headers=headers,
                 timeout=120
