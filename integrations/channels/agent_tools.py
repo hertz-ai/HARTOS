@@ -20,6 +20,7 @@ All tools reuse existing infrastructure:
 
 import json
 import logging
+import re
 from typing import Annotated, Optional
 
 logger = logging.getLogger(__name__)
@@ -999,6 +1000,71 @@ def build_channel_tool_closures(ctx):
         "public_exposure consent is a separate operator decision. "
         "Example: set_announcement_channel('telegram', '-1001234567890')",
         set_announcement_channel,
+    ))
+
+    # ------------------------------------------------------------------
+    # send_email_campaign — outbound email through our own mail server
+    # ------------------------------------------------------------------
+    #
+    # dry_run defaults True: the first call returns what WOULD be sent so the
+    # agent (and the human reading it) can see the blast radius before any
+    # mail leaves. Same preview-then-confirm shape as the other write-side
+    # tools here.
+    @log_tool_execution
+    def send_email_campaign(
+        recipients: Annotated[str, "Comma or newline separated email addresses"],
+        subject: Annotated[str, "Subject line"],
+        body_text: Annotated[str, "Plain-text body. Disclose who is writing."],
+        body_html: Annotated[Optional[str], "Optional HTML body; falls back to the text"] = None,
+        campaign: Annotated[str, "Campaign name — scopes the resume log so a rerun never double-sends"] = "default",
+        delay_seconds: Annotated[float, "Seconds between messages. Higher is safer for deliverability."] = 2.0,
+        limit: Annotated[Optional[int], "Cap this run (e.g. warm-up batch)"] = None,
+        dry_run: Annotated[bool, "True previews without sending. Set False to actually deliver."] = True,
+    ) -> str:
+        """Send an email campaign via our own mail server, paced and resumable.
+
+        Skips anyone already sent for this campaign or previously unsubscribed.
+        Every message carries List-Unsubscribe."""
+        try:
+            from integrations.channels.email_campaign import send_campaign
+            addrs = [a.strip() for a in re.split(r"[,\n;]+", recipients or "")
+                     if a.strip()]
+            if not addrs:
+                return "No recipients supplied."
+            html = body_html or (
+                '<div style="font-family:system-ui,Arial;max-width:560px;'
+                'line-height:1.6">'
+                + "".join("<p>%s</p>" % p for p in body_text.split("\n\n"))
+                + "</div>")
+            res = send_campaign(addrs, subject, html, body_text,
+                                campaign=campaign, dry_run=bool(dry_run),
+                                delay_seconds=float(delay_seconds), limit=limit)
+            if res.get("dry_run"):
+                return ("DRY RUN for campaign '%s': %d would be sent "
+                        "(%d already sent, %d opted out), ~%s min at %.1fs pacing. "
+                        "Re-run with dry_run=False to deliver."
+                        % (campaign, res["candidates"], res["already_sent"],
+                           res["opted_out"], res["estimated_minutes"], res["delay_seconds"]))
+            if res.get("error"):
+                return "Campaign '%s' failed: %s" % (campaign, res["error"])
+            out = ("Campaign '%s': sent=%d failed=%d of %d candidates."
+                   % (campaign, res["sent"], res["failed"], res["candidates"]))
+            if res.get("halted"):
+                out += " HALTED: " + res["halted"]
+            return out
+        except Exception as e:
+            logger.error("send_email_campaign error: %s", e)
+            return "Error running campaign: %s" % e
+
+    tools.append((
+        "send_email_campaign",
+        "Send an email campaign through our own mail server, paced and resumable. "
+        "ALWAYS previews first (dry_run=True by default) — call again with "
+        "dry_run=False to actually deliver. Skips already-sent and unsubscribed "
+        "addresses automatically. delay_seconds controls pacing (higher is safer "
+        "for deliverability). Example: send_email_campaign('a@x.com,b@y.com', "
+        "'Subject', 'Body text', campaign='welcome', delay_seconds=2.0)",
+        send_email_campaign,
     ))
 
     return tools
