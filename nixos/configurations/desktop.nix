@@ -314,6 +314,11 @@ in
     # buffers) and only the node can see it. Cheap + read-only.
     shellMemWatch.enable = true;
 
+    # Capture the local-2B agent baseline on this hardware (hourly, off the
+    # boot path). Modelless boot is a clean no-op; a model present records the
+    # baseline JSON + a journal PASS/FAIL line.
+    agentBaseline.enable = true;
+
     comp.enable = true;
     rustPrecedent.enable = true;
 

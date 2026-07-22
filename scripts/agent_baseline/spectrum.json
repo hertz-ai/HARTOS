@@ -1,0 +1,37 @@
+{
+  "_doc": "Local-2B AGENT/SURFACE BASELINE spectrum. Steward mandate 2026-07-22: profile the agents that are NOT yet profiled against the llama.cpp 2B running locally, so the potato machine (Intel HD 620, ~2B GGUF) has a recorded BASELINE. profile_local_2b.py enumerates the REAL agent tasks (goal_seeding.SEED_BOOTSTRAP_GOALS + the flagship catalog) -- this file holds only the per-CATEGORY probes + budgets, so there is no parallel list of agents (Gate 4: the goal list stays single-source). Budgets are for a ~2B GGUF on the HD 620; a bigger box beats them, so a FAIL is a real regression, not a machine excuse.",
+  "endpoint": {
+    "_note": "The canonical llama-server OpenAI endpoint the agents already use (port_registry 'llm'; env HART_LLM_PORT). NOT a parallel inference path -- we route to the shared server, never reimplement.",
+    "path": "/v1/chat/completions",
+    "connect_timeout_s": 3,
+    "request_timeout_s": 90
+  },
+  "budgets": {
+    "_note": "Per single-turn probe on the 2B. first_token_ms = responsiveness; total_ms = full short completion; min_chars = the model actually answered (not an empty/garbage reply).",
+    "default": { "first_token_ms": 2500, "total_ms": 30000, "min_chars": 8 },
+    "reasoning": { "first_token_ms": 3500, "total_ms": 45000, "min_chars": 40 },
+    "extraction": { "first_token_ms": 2500, "total_ms": 25000, "min_chars": 2 },
+    "creative": { "first_token_ms": 3000, "total_ms": 40000, "min_chars": 60 }
+  },
+  "categories": {
+    "_note": "Each agent task from the real goal list is mapped to ONE category by keyword (profiler does the mapping); the category names its probe style + budget class. The probe is a SHORT single-turn stand-in for the agent's LLM step, so the baseline measures the model's behaviour on that KIND of work.",
+    "marketing":     { "budget": "creative",   "probe": "Write a one-sentence launch tagline for an open, crowdsourced AI operating system." },
+    "referral":      { "budget": "creative",   "probe": "Write a one-line referral invite a user would send a friend." },
+    "video":         { "budget": "creative",   "probe": "Write a 2-line script hook for a 30-second product demo video." },
+    "intelligence":  { "budget": "reasoning",  "probe": "In 2 sentences, explain why decentralized compute resists monopoly." },
+    "monitor":       { "budget": "reasoning",  "probe": "Given metrics {cpu:12%, agents:3, errors:0}, state one health verdict in one line." },
+    "analytics":     { "budget": "reasoning",  "probe": "Given signups grew 10 to 82, state the growth multiple and one next action." },
+    "coding":        { "budget": "reasoning",  "probe": "In one line, what does a Python function that returns len(set(x)) compute?" },
+    "audit":         { "budget": "reasoning",  "probe": "List two things to check when auditing a repo for a missing dependency." },
+    "revenue":       { "budget": "extraction", "probe": "Extract the number: 'API revenue this week was 1240 dollars'. Reply with only the number." },
+    "finance":       { "budget": "reasoning",  "probe": "In one line, why keep 3 months of runway in a self-sustaining business?" },
+    "exception":     { "budget": "extraction", "probe": "From 'ERROR: No module named torch', reply with only the missing module name." },
+    "generic":       { "budget": "default",    "probe": "Reply with a single word: acknowledged." }
+  },
+  "surfaces": {
+    "_note": "UI-adjacent agent surfaces whose LLM turn should also have a baseline (the shell composes via A2UI = an LLM turn). Latency-to-photon is covered by latency_budgets.json; THIS measures the model turn behind them.",
+    "a2ui_compose":  { "budget": "reasoning",  "probe": "Return a JSON object {\"hero\":\"...\"} with a one-line greeting for a desktop home screen." },
+    "voice_reply":   { "budget": "default",    "probe": "Reply conversationally in one short sentence to: 'what's the weather like'." },
+    "recipe_step":   { "budget": "reasoning",  "probe": "Given the step 'search the web for X', state in one line what the agent should do." }
+  }
+}
