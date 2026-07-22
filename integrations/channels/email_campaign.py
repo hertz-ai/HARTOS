@@ -170,6 +170,42 @@ def record_optout(address: str) -> None:
                      'keep receiving mail', address, exc)
 
 
+def load_bounced() -> set:
+    """Addresses that hard-bounced. Never contacted again.
+
+    Kept separate from the opt-out list because they mean different things:
+    an opt-out is a person's decision and a bounce is a fact about a
+    mailbox. Both stop delivery, but conflating them would let a delivery
+    failure be reported as somebody having unsubscribed.
+    """
+    p = os.path.join(_STATE_DIR, 'bounced')
+    if not os.path.exists(p):
+        return set()
+    with open(p, 'r', encoding='utf-8') as f:
+        return {ln.split('\t')[-1].strip().lower() for ln in f if ln.strip()}
+
+
+def record_bounce(address: str, code: str = '', reason: str = '') -> None:
+    """Suppress an address that a receiving server refused permanently.
+
+    This is the protection that MX validation cannot provide. An MX record
+    proves a DOMAIN accepts mail; it says nothing about whether a mailbox
+    exists. On a list of historical addresses most of the dead ones are dead
+    mailboxes at live domains, so they are invisible until they bounce, and
+    a bounce rate above a few percent is what gets a sending domain
+    blocklisted.
+    """
+    try:
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        with open(os.path.join(_STATE_DIR, 'bounced'), 'a', encoding='utf-8') as f:
+            f.write('%s\t%s\t%s\t%s\n' % (_today(), code or '',
+                                          (reason or '').replace('\t', ' ')[:120],
+                                          address.strip().lower()))
+    except Exception as exc:
+        logger.error('BOUNCE NOT RECORDED for %s: %s -- this address will '
+                     'keep being mailed and keep bouncing', address, exc)
+
+
 def tracking_token(address: str, campaign: str) -> str:
     """Short opaque per-recipient token.
 
@@ -270,6 +306,7 @@ def send_campaign(recipients: Iterable[str],
 
     sent_before = load_sent(campaign)
     optouts = load_optouts()
+    bounced = load_bounced()
     todo: List[str] = []
     # `seen` is carried rather than recomputed. This loop used to test
     # membership against `{a.lower() for a in todo}`, which rebuilt the whole
@@ -282,7 +319,7 @@ def send_campaign(recipients: Iterable[str],
         low = addr.lower()
         if not addr or '@' not in addr:
             continue
-        if low in sent_before or low in optouts or low in seen:
+        if low in sent_before or low in optouts or low in bounced or low in seen:
             continue
         seen.add(low)
         todo.append(addr)
@@ -305,6 +342,7 @@ def send_campaign(recipients: Iterable[str],
 
     result = {'campaign': campaign, 'candidates': len(todo),
               'already_sent': len(sent_before), 'opted_out': len(optouts),
+              'suppressed_bounced': len(bounced),
               'sent': 0, 'failed': 0, 'dry_run': dry_run,
               'delay_seconds': delay,
               'estimated_minutes': round(len(todo) * delay / 60.0, 1)}

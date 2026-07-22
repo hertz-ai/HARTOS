@@ -209,3 +209,65 @@ def test_campaign_days_excludes_today(tmp_path, monkeypatch):
         f.write("2026-07-22\tc@x.com\n")
     assert ec.campaign_days("fresh") == 0
     assert ec.warmup_cap(ec.campaign_days("fresh")) == 500
+
+
+def _dsn(recipient, status="5.1.1"):
+    """A Postfix-shaped bounce: the delivery-status part is NOT text, its
+    payload is a list of header-only Message objects."""
+    import email
+    return email.message_from_string(
+        "From: MAILER-DAEMON@mail.hertzai.com\n"
+        "Subject: Undelivered Mail Returned to Sender\n"
+        "Content-Type: multipart/report; report-type=delivery-status;"
+        ' boundary="B"\n\n'
+        "--B\nContent-Type: text/plain\n\nThis is the mail system.\n\n"
+        "--B\nContent-Type: message/delivery-status\n\n"
+        "Reporting-MTA: dns; mail.hertzai.com\n\n"
+        "Final-Recipient: rfc822; %s\nAction: failed\nStatus: %s\n\n"
+        "--B--\n" % (recipient, status))
+
+
+def test_parses_postfix_delivery_status():
+    """get_payload(decode=True) returns None for message/delivery-status and
+    str() of its payload gives a Python repr, so a naive walk files every
+    real bounce as unreadable. 262 of 275 were missed exactly this way."""
+    from integrations.channels.bounce_handler import classify_message
+    kind, addr, code, _ = classify_message(_dsn("dead@example.com"))
+    assert (kind, addr, code) == ("hard", "dead@example.com", "5.1.1")
+
+
+def test_soft_bounce_is_not_suppressed():
+    """A full mailbox or a greylist is not a reason to drop someone forever."""
+    from integrations.channels.bounce_handler import classify_message
+    kind, addr, code, _ = classify_message(_dsn("busy@example.com", "4.2.2"))
+    assert kind == "soft" and code == "4.2.2"
+
+
+def test_ordinary_mail_is_not_treated_as_a_bounce():
+    import email
+    from integrations.channels.bounce_handler import classify_message
+    m = email.message_from_string(
+        "From: a-real-person@example.com\nSubject: thanks for this\n"
+        "Content-Type: text/plain\n\nLooks great, will try it.\n")
+    assert classify_message(m)[0] == "other"
+
+
+def test_unsubscribe_reply_is_recognised():
+    import email
+    from integrations.channels.bounce_handler import classify_message
+    m = email.message_from_string(
+        "From: Someone <someone@example.com>\nSubject: Re: your email\n"
+        "Content-Type: text/plain\n\nunsubscribe\n")
+    kind, addr, _, _ = classify_message(m)
+    assert kind == "unsubscribe" and addr == "someone@example.com"
+
+
+def test_bounced_addresses_are_excluded_from_sends(tmp_path, monkeypatch):
+    import integrations.channels.email_campaign as ec
+    monkeypatch.setattr(ec, "_STATE_DIR", str(tmp_path))
+    ec.record_bounce("dead@example.com", "5.1.1", "user unknown")
+    assert "dead@example.com" in ec.load_bounced()
+    r = ec.send_campaign(["dead@example.com", "live@example.com"],
+                         "s", "<p>h</p>", "t", campaign="supp", dry_run=True)
+    assert r["candidates"] == 1, r
+    assert r["suppressed_bounced"] == 1
