@@ -37,9 +37,11 @@ logger = logging.getLogger('hevolve_channels')
 # elsewhere without touching code.
 SMTP_HOST = os.environ.get('HEVOLVE_SMTP_HOST', 'mail.hertzai.com')
 SMTP_PORT = int(os.environ.get('HEVOLVE_SMTP_PORT', '587'))
-SMTP_USER = os.environ.get('HEVOLVE_SMTP_USER', 'evolve@mail.hertzai.com')
+# A person, not a role account. 'evolve@' reads as a system mailbox and
+# costs trust before the mail is even opened.
+SMTP_USER = os.environ.get('HEVOLVE_SMTP_USER', 'sathish@mail.hertzai.com')
 SMTP_PASS = os.environ.get('HEVOLVE_SMTP_PASS', '')
-FROM_NAME = os.environ.get('HEVOLVE_SMTP_FROM_NAME', 'Hevolve AI')
+FROM_NAME = os.environ.get('HEVOLVE_SMTP_FROM_NAME', 'Sathish at Hevolve')
 REPLY_TO = os.environ.get('HEVOLVE_SMTP_REPLY_TO', 'sathish@hertzai.com')
 
 # Pacing. The default is deliberately unhurried: a burst is what trips
