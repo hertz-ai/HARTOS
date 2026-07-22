@@ -315,3 +315,69 @@ def test_probe_maps_smtp_codes_correctly():
     assert ml.mailbox_exists("a@gmail.com", smtp=FakeSMTP(250))[0] is True
     assert ml.mailbox_exists("a@gmail.com", smtp=FakeSMTP(550))[0] is False
     assert ml.mailbox_exists("a@gmail.com", smtp=FakeSMTP(451))[0] is None
+
+
+def test_bounce_breaker_halts_a_bad_list(tmp_path, monkeypatch):
+    """MAX_CONSECUTIVE_FAILURES cannot catch this. Hotmail, Yahoo and AOL
+    accept every recipient at RCPT and reject asynchronously, so for ~52% of
+    a consumer list every send 'succeeds' and the consecutive counter never
+    moves however dead the addresses are."""
+    import integrations.channels.email_campaign as ec
+    monkeypatch.setattr(ec, "_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(ec, "_today", lambda: "2026-07-22")
+    with open(ec._state_path("c", "sent"), "w", encoding="utf-8") as f:
+        for i in range(200):
+            f.write("2026-07-22\tu%d@example.com\n" % i)
+    for i in range(60):                       # 30% bounce
+        ec.record_bounce("u%d@example.com" % i, "5.1.1", "user unknown")
+
+    b = ec.recent_bounce_rate("c")
+    assert b["sent"] == 200 and b["bounced"] == 60
+    assert abs(b["rate"] - 0.30) < 0.001
+
+    r = ec.send_campaign(["new%d@example.com" % i for i in range(10)],
+                         "s", "<p>h</p>", "t", campaign="c", dry_run=True)
+    assert "HALTED" in r.get("error", ""), r
+    assert r["candidates"] == 0
+
+
+def test_bounce_breaker_allows_a_healthy_list(tmp_path, monkeypatch):
+    import integrations.channels.email_campaign as ec
+    monkeypatch.setattr(ec, "_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(ec, "_today", lambda: "2026-07-22")
+    with open(ec._state_path("h", "sent"), "w", encoding="utf-8") as f:
+        for i in range(200):
+            f.write("2026-07-22\tu%d@example.com\n" % i)
+    for i in range(4):                        # 2%, under the 5% ceiling
+        ec.record_bounce("u%d@example.com" % i, "5.1.1", "user unknown")
+    r = ec.send_campaign(["new%d@example.com" % i for i in range(10)],
+                         "s", "<p>h</p>", "t", campaign="h", dry_run=True)
+    assert "error" not in r, r
+    assert r["candidates"] == 10
+
+
+def test_breaker_needs_a_sample_before_it_fires(tmp_path, monkeypatch):
+    """One bounce out of three is 33% and means nothing. Firing on tiny
+    samples would halt every campaign on its first bad address."""
+    import integrations.channels.email_campaign as ec
+    monkeypatch.setattr(ec, "_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(ec, "_today", lambda: "2026-07-22")
+    with open(ec._state_path("t", "sent"), "w", encoding="utf-8") as f:
+        for i in range(3):
+            f.write("2026-07-22\tu%d@example.com\n" % i)
+    ec.record_bounce("u0@example.com", "5.1.1", "x")
+    r = ec.send_campaign(["new@example.com"], "s", "<p>h</p>", "t",
+                         campaign="t", dry_run=True)
+    assert "error" not in r, r
+
+
+def test_old_sends_age_out_of_the_window(tmp_path, monkeypatch):
+    """The rate must reflect the current list, not a bad batch from a month
+    ago that was already dealt with."""
+    import integrations.channels.email_campaign as ec
+    monkeypatch.setattr(ec, "_STATE_DIR", str(tmp_path))
+    with open(ec._state_path("a", "sent"), "w", encoding="utf-8") as f:
+        f.write("2020-01-01\tancient@example.com\n")
+    ec.record_bounce("ancient@example.com", "5.1.1", "x")
+    b = ec.recent_bounce_rate("a", days=3)
+    assert b["sent"] == 0 and b["rate"] == 0.0

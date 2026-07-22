@@ -206,6 +206,54 @@ def record_bounce(address: str, code: str = '', reason: str = '') -> None:
                      'keep being mailed and keep bouncing', address, exc)
 
 
+def recent_bounce_rate(campaign: str, days: int = 3) -> dict:
+    """Bounce rate over the last `days` of this campaign.
+
+    Exists because MAX_CONSECUTIVE_FAILURES cannot protect against the
+    failure mode that actually matters here. It counts failures raised
+    during the SMTP conversation, and Microsoft, Yahoo and AOL accept every
+    recipient at RCPT and reject asynchronously afterwards. For the ~52% of
+    a consumer list behind those providers, every send "succeeds" and the
+    consecutive-failure counter never moves, however bad the list is.
+
+    So the signal has to come from the bounce log instead: of the addresses
+    mailed recently, how many have since come back permanently rejected.
+    That number lags by minutes to hours, which is why it is checked BEFORE
+    a batch rather than during one.
+    """
+    sent_path = _state_path(campaign, 'sent')
+    if not os.path.exists(sent_path):
+        return {'sent': 0, 'bounced': 0, 'rate': 0.0, 'window_days': days}
+
+    cutoff = time.time() - days * 86400
+    recent = set()
+    with open(sent_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or '\t' not in line:
+                continue
+            day, _, addr = line.partition('\t')
+            try:
+                ts = time.mktime(time.strptime(day, '%Y-%m-%d'))
+            except ValueError:
+                continue
+            if ts >= cutoff:
+                recent.add(addr.strip().lower())
+
+    bounced = load_bounced() & recent
+    n = len(recent)
+    return {'sent': n, 'bounced': len(bounced),
+            'rate': (len(bounced) / n) if n else 0.0,
+            'window_days': days}
+
+
+# Above this, stop. Receiving systems tolerate a few percent; sustained
+# double digits is what gets a domain filtered and then blocklisted, and the
+# damage is not confined to the campaign -- ordinary mail from the same
+# domain starts landing in spam too.
+MAX_BOUNCE_RATE = float(os.environ.get('HEVOLVE_MAX_BOUNCE_RATE', '0.05'))
+
+
 def tracking_token(address: str, campaign: str) -> str:
     """Short opaque per-recipient token.
 
@@ -292,6 +340,7 @@ def send_campaign(recipients: Iterable[str],
                   limit: Optional[int] = None,
                   daily_cap: Optional[int] = None,
                   warmup: bool = True,
+                  max_bounce_rate: Optional[float] = None,
                   password: Optional[str] = None) -> dict:
     """Send to `recipients`, skipping anyone already sent or opted out.
 
@@ -351,6 +400,23 @@ def send_campaign(recipients: Iterable[str],
         result['campaign_day'] = day_index + 1
         result['sent_today_before'] = already_today
         result['remaining_today'] = remaining_today
+
+    # Circuit breaker. Checked before the batch, because bounces for the
+    # previous one arrive asynchronously and there is no point learning the
+    # list is bad only after mailing another ten thousand people.
+    ceiling = MAX_BOUNCE_RATE if max_bounce_rate is None else float(max_bounce_rate)
+    bounce = recent_bounce_rate(campaign)
+    result['recent_bounce'] = bounce
+    if ceiling > 0 and bounce['sent'] >= 100 and bounce['rate'] > ceiling:
+        result['error'] = (
+            'HALTED: %d of the %d messages sent in the last %d days '
+            'hard-bounced (%.0f%%), over the %.0f%% ceiling. Sending more '
+            'would damage the domain rather than reach anyone. Verify the '
+            'list or raise max_bounce_rate deliberately.'
+            % (bounce['bounced'], bounce['sent'], bounce['window_days'],
+               bounce['rate'] * 100, ceiling * 100))
+        result['candidates'] = 0
+        return result
 
     if dry_run:
         result['note'] = ('DRY RUN -- nothing sent. Pass dry_run=False to '
