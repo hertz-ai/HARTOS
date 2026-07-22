@@ -9,6 +9,10 @@ built in rather than remembered each time:
     so an interrupted run never re-mails anyone
   * PACED -- delay_seconds is configurable; sending as fast as the socket
     allows is what gets a domain flagged, not the volume itself
+  * WARMED UP -- a daily cap that ramps over the first week. Per-message
+    pacing is not sufficient on its own: a domain with no sending history
+    that delivers seventeen thousand messages in a day is blocked on
+    reputation grounds no matter how evenly they were spaced
   * SELF-HALTING -- consecutive failures stop the run rather than burning
     reputation against a wall
   * UNSUBSCRIBE-AWARE -- List-Unsubscribe on every message, and addresses in
@@ -62,13 +66,75 @@ def _state_path(campaign: str, name: str) -> str:
     return os.path.join(_STATE_DIR, '%s.%s' % (safe or 'campaign', name))
 
 
+# Warm-up schedule: how many messages a day the domain may send, by day of
+# the campaign. A new sending domain has no reputation, and the receiving
+# side treats a sudden five-figure day from an unknown IP as exactly what it
+# looks like. Hotmail, Yahoo and AOL throttle first and ask questions later,
+# and 89% of this list sits behind those four providers.
+#
+# The point is not caution for its own sake. A flat 17,280/day run gets the
+# domain blocked in the first day, which means the remaining ~70,000 people
+# never receive anything AND ordinary mail from hertzai.com starts landing in
+# spam. The ramp is what makes sending to everyone actually possible.
+WARMUP_SCHEDULE = [500, 1000, 2500, 5000, 10000, 15000, 20000]
+
+
+def warmup_cap(day_index: int) -> int:
+    """Messages allowed on day `day_index` (0-based) of a campaign."""
+    if day_index < 0:
+        return 0
+    if day_index >= len(WARMUP_SCHEDULE):
+        return WARMUP_SCHEDULE[-1]
+    return WARMUP_SCHEDULE[day_index]
+
+
+def _today() -> str:
+    return time.strftime('%Y-%m-%d')
+
+
 def load_sent(campaign: str) -> set:
     """Addresses already delivered for this campaign."""
     p = _state_path(campaign, 'sent')
     if not os.path.exists(p):
         return set()
+    out = set()
     with open(p, 'r', encoding='utf-8') as f:
-        return {line.strip().lower() for line in f if line.strip()}
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            # Newer rows are 'YYYY-MM-DD<TAB>address'. Older rows are the bare
+            # address, so both are read rather than silently re-mailing
+            # everyone who was contacted before timestamps existed.
+            out.add(line.split('\t')[-1].strip().lower())
+    return out
+
+
+def sent_on(campaign: str, day: Optional[str] = None) -> int:
+    """How many went out on `day` (default today). Drives the daily cap."""
+    p = _state_path(campaign, 'sent')
+    if not os.path.exists(p):
+        return 0
+    day = day or _today()
+    n = 0
+    with open(p, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.startswith(day + '\t'):
+                n += 1
+    return n
+
+
+def campaign_days(campaign: str) -> int:
+    """Distinct days this campaign has sent on. Index into the warm-up ramp."""
+    p = _state_path(campaign, 'sent')
+    if not os.path.exists(p):
+        return 0
+    days = set()
+    with open(p, 'r', encoding='utf-8') as f:
+        for line in f:
+            if '\t' in line:
+                days.add(line.split('\t', 1)[0])
+    return len(days)
 
 
 def load_optouts() -> set:
@@ -177,6 +243,8 @@ def send_campaign(recipients: Iterable[str],
                   delay_seconds: Optional[float] = None,
                   per_connection: Optional[int] = None,
                   limit: Optional[int] = None,
+                  daily_cap: Optional[int] = None,
+                  warmup: bool = True,
                   password: Optional[str] = None) -> dict:
     """Send to `recipients`, skipping anyone already sent or opted out.
 
@@ -203,11 +271,30 @@ def send_campaign(recipients: Iterable[str],
     if limit:
         todo = todo[:int(limit)]
 
+    # Apply the daily cap before anything is sent, so an over-large run is
+    # trimmed rather than started and abandoned partway.
+    day_index = campaign_days(campaign)
+    already_today = sent_on(campaign)
+    cap = None
+    if daily_cap is not None:
+        cap = int(daily_cap)
+    elif warmup:
+        cap = warmup_cap(day_index)
+    remaining_today = None
+    if cap is not None:
+        remaining_today = max(0, cap - already_today)
+        todo = todo[:remaining_today]
+
     result = {'campaign': campaign, 'candidates': len(todo),
               'already_sent': len(sent_before), 'opted_out': len(optouts),
               'sent': 0, 'failed': 0, 'dry_run': dry_run,
               'delay_seconds': delay,
               'estimated_minutes': round(len(todo) * delay / 60.0, 1)}
+    if cap is not None:
+        result['daily_cap'] = cap
+        result['campaign_day'] = day_index + 1
+        result['sent_today_before'] = already_today
+        result['remaining_today'] = remaining_today
 
     if dry_run:
         result['note'] = ('DRY RUN -- nothing sent. Pass dry_run=False to '
@@ -287,7 +374,8 @@ def _run_sends(todo, subject, html, text, ctx, log_path, pw,
                                                campaign).as_string())
                     result['sent'] += 1
                     consecutive = 0
-                    log.write(addr + '\n')
+                    # Dated so the daily cap can be enforced across restarts.
+                    log.write('%s\t%s\n' % (_today(), addr))
                     log.flush()
                 except Exception as exc:
                     result['failed'] += 1

@@ -1019,12 +1019,19 @@ def build_channel_tool_closures(ctx):
         campaign: Annotated[str, "Campaign name — scopes the resume log so a rerun never double-sends"] = "default",
         delay_seconds: Annotated[float, "Seconds between messages. Higher is safer for deliverability."] = 2.0,
         limit: Annotated[Optional[int], "Cap this run (e.g. warm-up batch)"] = None,
+        daily_cap: Annotated[Optional[int], "Max messages today. Overrides the warm-up ramp."] = None,
+        warmup: Annotated[bool, "Ramp daily volume over the first week. Leave on for any list over a few thousand."] = True,
         dry_run: Annotated[bool, "True previews without sending. Set False to actually deliver."] = True,
     ) -> str:
         """Send an email campaign via our own mail server, paced and resumable.
 
         Skips anyone already sent for this campaign or previously unsubscribed.
-        Every message carries List-Unsubscribe."""
+        Every message carries List-Unsubscribe.
+
+        Volume is capped per day as well as paced per message. Spacing alone
+        does not protect a domain: a sender with no history that delivers
+        seventeen thousand messages in a day is blocked on reputation grounds
+        however evenly they were spread."""
         try:
             from integrations.channels.email_campaign import send_campaign
             addrs = [a.strip() for a in re.split(r"[,\n;]+", recipients or "")
@@ -1038,17 +1045,25 @@ def build_channel_tool_closures(ctx):
                 + "</div>")
             res = send_campaign(addrs, subject, html, body_text,
                                 campaign=campaign, dry_run=bool(dry_run),
-                                delay_seconds=float(delay_seconds), limit=limit)
+                                delay_seconds=float(delay_seconds), limit=limit,
+                                daily_cap=daily_cap, warmup=bool(warmup))
+            cap_note = ""
+            if res.get("daily_cap") is not None:
+                cap_note = (" Day %d of the ramp, cap %d, %d already sent today."
+                            % (res["campaign_day"], res["daily_cap"],
+                               res["sent_today_before"]))
             if res.get("dry_run"):
                 return ("DRY RUN for campaign '%s': %d would be sent "
-                        "(%d already sent, %d opted out), ~%s min at %.1fs pacing. "
+                        "(%d already sent, %d opted out), ~%s min at %.1fs pacing.%s "
                         "Re-run with dry_run=False to deliver."
                         % (campaign, res["candidates"], res["already_sent"],
-                           res["opted_out"], res["estimated_minutes"], res["delay_seconds"]))
+                           res["opted_out"], res["estimated_minutes"],
+                           res["delay_seconds"], cap_note))
             if res.get("error"):
                 return "Campaign '%s' failed: %s" % (campaign, res["error"])
-            out = ("Campaign '%s': sent=%d failed=%d of %d candidates."
-                   % (campaign, res["sent"], res["failed"], res["candidates"]))
+            out = ("Campaign '%s': sent=%d failed=%d of %d candidates.%s"
+                   % (campaign, res["sent"], res["failed"], res["candidates"],
+                      cap_note))
             if res.get("halted"):
                 out += " HALTED: " + res["halted"]
             return out

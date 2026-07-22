@@ -126,3 +126,38 @@ def test_tracking_leaves_third_party_links_alone():
     from integrations.channels.email_campaign import add_tracking
     url = "https://github.com/hertz-ai/Nunba"
     assert add_tracking(url, "c1", "a@b.com") == url
+
+
+def test_warmup_ramps_then_plateaus():
+    from integrations.channels.email_campaign import warmup_cap, WARMUP_SCHEDULE
+    assert warmup_cap(0) == 500
+    assert warmup_cap(1) == 1000
+    # Past the end of the schedule it holds at the plateau rather than
+    # falling back to unlimited, which is the failure that would matter.
+    assert warmup_cap(99) == WARMUP_SCHEDULE[-1]
+    assert warmup_cap(-1) == 0
+    assert WARMUP_SCHEDULE == sorted(WARMUP_SCHEDULE), "ramp must be monotonic"
+
+
+def test_sent_log_reads_both_formats(tmp_path, monkeypatch):
+    """Rows written before timestamps existed must still count as sent, or a
+    resumed campaign re-mails everyone contacted in the first batch."""
+    import integrations.channels.email_campaign as ec
+    monkeypatch.setattr(ec, "_STATE_DIR", str(tmp_path))
+    p = ec._state_path("c", "sent")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("old@example.com\n")               # legacy, undated
+        f.write("2026-07-22\tnew@example.com\n")   # dated
+    assert ec.load_sent("c") == {"old@example.com", "new@example.com"}
+    assert ec.sent_on("c", "2026-07-22") == 1
+    assert ec.campaign_days("c") == 1
+
+
+def test_daily_cap_trims_the_run(tmp_path, monkeypatch):
+    import integrations.channels.email_campaign as ec
+    monkeypatch.setattr(ec, "_STATE_DIR", str(tmp_path))
+    r = ec.send_campaign(["a%d@example.com" % i for i in range(50)],
+                         "s", "<p>h</p>", "t", campaign="capped",
+                         dry_run=True, daily_cap=10)
+    assert r["candidates"] == 10, r
+    assert r["daily_cap"] == 10
