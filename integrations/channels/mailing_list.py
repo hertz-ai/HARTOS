@@ -186,6 +186,51 @@ PROBE_HELO = 'mail.hertzai.com'
 PROBE_FROM = 'sathish@mail.hertzai.com'
 
 
+def domain_is_catchall(domain: str, *, timeout: int = 20,
+                       probe_local: str = 'zzq7x3-no-such-user-9f4b') -> Optional[bool]:
+    """Does this domain accept mail for addresses that cannot exist?
+
+    True  -> catch-all; RCPT TO tells you nothing and must not be trusted.
+    False -> honest; a 550 here means real addresses can be verified.
+    None  -> no answer (connection refused, deferral, timeout).
+
+    Generalises the hand-testing done against the four big providers. Those were
+    checked using mailboxes already known to be dead, which only works where
+    a bounce history exists. Probing a local part that could not plausibly
+    have been issued works on any domain and needs no prior knowledge, so a
+    long tail of small domains can be classified without guessing from the
+    provider's name -- hotmail.co.uk and comcast.net are both "not one of the
+    big four" and there is no reason to assume they behave alike.
+
+    Determine this ONCE per domain. It is a property of the server, and
+    re-probing per address multiplies the load for no extra information.
+    """
+    import smtplib
+
+    domain = (domain or '').lower().strip()
+    if not domain:
+        return None
+    host = _mx_host(domain)
+    if not host:
+        return None
+    try:
+        srv = smtplib.SMTP(host, 25, timeout=timeout)
+        srv.ehlo(PROBE_HELO)
+        srv.mail(PROBE_FROM)
+        code, _ = srv.rcpt('%s@%s' % (probe_local, domain))
+        try:
+            srv.quit()
+        except Exception:
+            pass
+        if 200 <= code < 300:
+            return True          # accepted an address that cannot exist
+        if 500 <= code < 600:
+            return False         # rejects unknown recipients: trustworthy
+        return None              # 4xx deferral
+    except Exception:
+        return None
+
+
 def mailbox_exists(address: str, *, timeout: int = 25,
                    smtp=None) -> Tuple[Optional[bool], str]:
     """(exists, detail). exists is None when the provider cannot be trusted.

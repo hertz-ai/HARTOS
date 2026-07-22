@@ -381,3 +381,48 @@ def test_old_sends_age_out_of_the_window(tmp_path, monkeypatch):
     ec.record_bounce("ancient@example.com", "5.1.1", "x")
     b = ec.recent_bounce_rate("a", days=3)
     assert b["sent"] == 0 and b["rate"] == 0.0
+
+
+def test_catchall_detection_maps_codes():
+    """One probe per DOMAIN settles whether RCPT TO means anything there.
+    Generalises the by-hand check done against the big four, which needed a
+    known-dead mailbox and so only worked where a bounce history existed."""
+    import integrations.channels.mailing_list as ml
+
+    class FakeSMTP:
+        def __init__(self, code):
+            self.code = code
+        def ehlo(self, *a): pass
+        def mail(self, *a): pass
+        def rcpt(self, addr):
+            assert 'no-such-user' in addr, "probe must be an impossible local part"
+            return self.code, b'x'
+        def quit(self): pass
+
+    def make(code):
+        return lambda host, port, timeout=0: FakeSMTP(code)
+
+    import smtplib
+    real = smtplib.SMTP
+    ml._mx_host_real = ml._mx_host
+    try:
+        ml._mx_host = lambda d: 'mx.test'
+        smtplib.SMTP = make(250)
+        assert ml.domain_is_catchall('x.com') is True     # accepts the impossible
+        smtplib.SMTP = make(550)
+        assert ml.domain_is_catchall('x.com') is False    # rejects it: trustworthy
+        smtplib.SMTP = make(451)
+        assert ml.domain_is_catchall('x.com') is None     # deferral, no answer
+    finally:
+        smtplib.SMTP = real
+        ml._mx_host = ml._mx_host_real
+
+
+def test_catchall_returns_none_without_mx():
+    import integrations.channels.mailing_list as ml
+    real = ml._mx_host
+    try:
+        ml._mx_host = lambda d: None
+        assert ml.domain_is_catchall('nowhere.invalid') is None
+    finally:
+        ml._mx_host = real
