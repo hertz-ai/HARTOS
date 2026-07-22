@@ -554,6 +554,52 @@ def status() -> Dict:
     return result
 
 
+# ── Setup-step helpers (native AI-setup + Nunba --setup-ai + the API share these) ──
+# Steward 2026-07-22 "leverage existing no rebuild": the first-boot AI setup step
+# does not need a new recommendation engine -- it needs to reuse get_active_model
+# (is one already running?) + vram_manager (what fits this box?). Both callers
+# (native_onboarding.py and the API) import these, so there is ONE decision.
+
+# Tiered defaults keyed on total VRAM. The potato node (Intel HD 620, no CUDA)
+# lands on the smallest tier: a small instruct GGUF that runs on CPU/iGPU -- the
+# "llama.cpp 2B running locally" baseline. Tunable data, not logic.
+MODEL_TIERS = [
+    (12.0, 'Qwen/Qwen2.5-7B-Instruct', 'Q4_K_M', '7B - capable, needs a real GPU'),
+    (6.0, 'Qwen/Qwen2.5-3B-Instruct', 'Q4_K_M', '3B - balanced'),
+    (0.0, 'Qwen/Qwen2.5-1.5B-Instruct', 'Q4_K_M', '1.5B - runs on this machine'),
+]
+
+
+def recommend_for_hardware() -> Dict:
+    """Pick a model sized to THIS box's VRAM, REUSING vram_manager (no second
+    hardware probe). Fail-safe: any detection error falls to the smallest tier,
+    so a potato is never recommended a model it cannot run."""
+    total = 0.0
+    vm = _get_vram_manager()
+    if vm:
+        try:
+            total = float(vm.detect_gpu().get('total_gb', 0.0) or 0.0)
+        except Exception:
+            logger.debug("recommend_for_hardware: VRAM probe failed; smallest tier")
+    for min_gb, name, quant, label in MODEL_TIERS:
+        if total >= min_gb:
+            return {'model_name': name, 'quant': quant, 'label': label,
+                    'total_vram_gb': total}
+    last = MODEL_TIERS[-1]
+    return {'model_name': last[1], 'quant': last[2], 'label': last[3],
+            'total_vram_gb': total}
+
+
+def needs_setup() -> bool:
+    """True when no local model is active yet -- the first-boot AI setup step
+    should then offer to provision one. REUSES get_active_model (no parallel
+    state). Fail-safe True: if the check errors, offer setup rather than skip it."""
+    try:
+        return get_active_model() is None
+    except Exception:
+        return True
+
+
 # ── Registration helpers ────────────────────────────────────────────
 
 def _register_in_catalog(catalog_id: str, model_name: str, quant: str,
