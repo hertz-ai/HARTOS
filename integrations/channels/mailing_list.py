@@ -176,6 +176,26 @@ def domain_has_mx(domain: str, timeout: int = 5) -> bool:
 # the bounce handler are for.
 VERIFIABLE_PROVIDERS = frozenset({
     'gmail.com', 'googlemail.com',
+    # Added only after being falsified against a mailbox that had genuinely
+    # hard-bounced, not merely after passing the synthetic probe. Each
+    # returned 550 for a real dead address:
+    'hotmail.co.uk',   # 550 -- note hotmail.com does NOT, see below
+    'live.com',
+    'comcast.net',
+    'bigpond.com',
+})
+
+# Domains the synthetic catch-all probe calls honest but which are NOT.
+# hotmail.com rejects an impossible local part with 550 and then accepts a
+# mailbox it has already hard-bounced with 250. It is the largest single
+# domain on the quarantined list, so believing the probe would have been the
+# most expensive possible way to be wrong.
+#
+# Kept as an explicit deny-list rather than a comment, because the next
+# person to run a catch-all sweep will otherwise reach the same wrong answer
+# by the same reasonable route.
+PROBE_LIARS = frozenset({
+    'hotmail.com',
 })
 
 # Probing must originate from the mail server. The same probe from a machine
@@ -191,8 +211,23 @@ def domain_is_catchall(domain: str, *, timeout: int = 20,
     """Does this domain accept mail for addresses that cannot exist?
 
     True  -> catch-all; RCPT TO tells you nothing and must not be trusted.
-    False -> honest; a 550 here means real addresses can be verified.
+    False -> honest, PROVISIONALLY. See the warning below.
     None  -> no answer (connection refused, deferral, timeout).
+
+    *** A 'False' here is not sufficient on its own. ***
+
+    Measured: hotmail.com answers 550 to this synthetic probe and 250 to a
+    mailbox it has actually hard-bounced. It rejects implausible local parts
+    -- an obvious harvesting signal -- while accepting plausible dead ones.
+    So the probe reports "honest" for the single largest catch-all domain on
+    the list, and acting on that would have marked 18,321 dead-ish Hotmail
+    addresses as verified live and mailed straight into a 25% bounce rate.
+
+    A 'True' can be trusted: a server that accepts an impossible address is
+    definitely not discriminating. A 'False' only proves the server rejects
+    OBVIOUS junk. Confirm it with a known-dead but plausible address before
+    treating the domain as verifiable -- see CONFIRMED_HONEST, every entry
+    of which was falsified against a real corpse rather than a synthetic one.
 
     Generalises the hand-testing done against the four big providers. Those were
     checked using mailboxes already known to be dead, which only works where
@@ -210,6 +245,8 @@ def domain_is_catchall(domain: str, *, timeout: int = 20,
     domain = (domain or '').lower().strip()
     if not domain:
         return None
+    if domain in PROBE_LIARS:
+        return True          # measured to defeat this probe; treat as catch-all
     host = _mx_host(domain)
     if not host:
         return None

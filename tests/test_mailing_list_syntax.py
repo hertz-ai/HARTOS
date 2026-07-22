@@ -426,3 +426,31 @@ def test_catchall_returns_none_without_mx():
         assert ml.domain_is_catchall('nowhere.invalid') is None
     finally:
         ml._mx_host = real
+
+
+def test_hotmail_com_is_not_trusted_despite_passing_the_probe():
+    """The most expensive possible way to be wrong.
+
+    hotmail.com answers 550 to an impossible local part and 250 to a mailbox
+    it has actually hard-bounced: it rejects obvious harvesting and accepts
+    plausible dead addresses. Believing the synthetic probe would have marked
+    18,321 Hotmail addresses verified-live and mailed into a 25% bounce rate.
+    """
+    from integrations.channels.mailing_list import (
+        domain_is_catchall, VERIFIABLE_PROVIDERS, PROBE_LIARS)
+    assert 'hotmail.com' in PROBE_LIARS
+    assert 'hotmail.com' not in VERIFIABLE_PROVIDERS
+    # Short-circuits to catch-all without probing at all.
+    assert domain_is_catchall('hotmail.com') is True
+
+
+def test_only_corpse_falsified_domains_are_verifiable():
+    """Every entry must have been checked against a real hard-bounced
+    mailbox, not merely have passed the synthetic probe."""
+    from integrations.channels.mailing_list import (
+        VERIFIABLE_PROVIDERS, mailbox_exists)
+    for d in ('hotmail.co.uk', 'live.com', 'comcast.net', 'bigpond.com'):
+        assert d in VERIFIABLE_PROVIDERS
+    # And the ones measured as accept-all stay unknown.
+    for d in ('hotmail.com', 'yahoo.com', 'aol.com'):
+        assert mailbox_exists('x@' + d)[0] is None
