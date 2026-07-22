@@ -144,13 +144,16 @@ def test_sent_log_reads_both_formats(tmp_path, monkeypatch):
     resumed campaign re-mails everyone contacted in the first batch."""
     import integrations.channels.email_campaign as ec
     monkeypatch.setattr(ec, "_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(ec, "_today", lambda: "2026-07-23")
     p = ec._state_path("c", "sent")
     with open(p, "w", encoding="utf-8") as f:
         f.write("old@example.com\n")               # legacy, undated
         f.write("2026-07-22\tnew@example.com\n")   # dated
     assert ec.load_sent("c") == {"old@example.com", "new@example.com"}
     assert ec.sent_on("c", "2026-07-22") == 1
+    # One prior day (the 22nd); today is the 23rd and has sent nothing yet.
     assert ec.campaign_days("c") == 1
+    assert ec.sent_on("c") == 0
 
 
 def test_daily_cap_trims_the_run(tmp_path, monkeypatch):
@@ -161,3 +164,48 @@ def test_daily_cap_trims_the_run(tmp_path, monkeypatch):
                          dry_run=True, daily_cap=10)
     assert r["candidates"] == 10, r
     assert r["daily_cap"] == 10
+
+
+def test_recipient_filtering_is_not_quadratic(tmp_path, monkeypatch):
+    """Membership was tested against a set rebuilt from `todo` on every
+    recipient. Correct, and quadratic. At 77k recipients the call never
+    reached the send loop and looked like a hang rather than a bug."""
+    import time
+    import integrations.channels.email_campaign as ec
+    monkeypatch.setattr(ec, "_STATE_DIR", str(tmp_path))
+    addrs = ["u%d@example.com" % i for i in range(60000)]
+    t0 = time.time()
+    r = ec.send_campaign(addrs, "s", "<p>h</p>", "t",
+                         campaign="perf", dry_run=True, daily_cap=10)
+    assert time.time() - t0 < 10, "filtering 60k recipients should be near-instant"
+    assert r["candidates"] == 10
+
+
+def test_duplicate_recipients_still_collapse(tmp_path, monkeypatch):
+    """The speedup must not lose the dedupe it replaced."""
+    import integrations.channels.email_campaign as ec
+    monkeypatch.setattr(ec, "_STATE_DIR", str(tmp_path))
+    r = ec.send_campaign(["a@x.com", "A@X.com", " a@x.com ", "b@x.com"],
+                         "s", "<p>h</p>", "t", campaign="dupes", dry_run=True)
+    assert r["candidates"] == 2, r
+
+
+def test_campaign_days_excludes_today(tmp_path, monkeypatch):
+    """A campaign that already sent this morning is still on the same day.
+    Counting today as elapsed steps the ramp up early on every resume."""
+    import integrations.channels.email_campaign as ec
+    monkeypatch.setattr(ec, "_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(ec, "_today", lambda: "2026-07-22")
+    p = ec._state_path("ramp", "sent")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("2026-07-20\ta@x.com\n")
+        f.write("2026-07-21\tb@x.com\n")
+        f.write("2026-07-22\tc@x.com\n")   # today, in progress
+    assert ec.campaign_days("ramp") == 2          # not 3
+    assert ec.warmup_cap(ec.campaign_days("ramp")) == 2500
+    # A campaign whose only activity is today is still on day one.
+    p2 = ec._state_path("fresh", "sent")
+    with open(p2, "w", encoding="utf-8") as f:
+        f.write("2026-07-22\tc@x.com\n")
+    assert ec.campaign_days("fresh") == 0
+    assert ec.warmup_cap(ec.campaign_days("fresh")) == 500

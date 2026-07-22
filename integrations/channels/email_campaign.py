@@ -125,15 +125,26 @@ def sent_on(campaign: str, day: Optional[str] = None) -> int:
 
 
 def campaign_days(campaign: str) -> int:
-    """Distinct days this campaign has sent on. Index into the warm-up ramp."""
+    """Index into the warm-up ramp: how many days this campaign sent on
+    BEFORE today.
+
+    Today is excluded deliberately. Counting it would make a campaign that
+    has already sent this morning read as being a day further along than it
+    is, so every resumed run would step the ramp up early -- and since the
+    ramp is what keeps the domain out of trouble, an off-by-one here spends
+    reputation rather than a few minutes.
+    """
     p = _state_path(campaign, 'sent')
     if not os.path.exists(p):
         return 0
+    today = _today()
     days = set()
     with open(p, 'r', encoding='utf-8') as f:
         for line in f:
             if '\t' in line:
-                days.add(line.split('\t', 1)[0])
+                d = line.split('\t', 1)[0]
+                if d != today:
+                    days.add(d)
     return len(days)
 
 
@@ -260,13 +271,20 @@ def send_campaign(recipients: Iterable[str],
     sent_before = load_sent(campaign)
     optouts = load_optouts()
     todo: List[str] = []
+    # `seen` is carried rather than recomputed. This loop used to test
+    # membership against `{a.lower() for a in todo}`, which rebuilt the whole
+    # set on every recipient: quadratic, and invisible at the few-hundred
+    # sizes it was written against. At 77,369 recipients it is ~3e9
+    # operations, and the run simply appeared to hang before sending anything.
+    seen: set = set()
     for raw in recipients:
         addr = (raw or '').strip()
         low = addr.lower()
         if not addr or '@' not in addr:
             continue
-        if low in sent_before or low in optouts or low in {a.lower() for a in todo}:
+        if low in sent_before or low in optouts or low in seen:
             continue
+        seen.add(low)
         todo.append(addr)
     if limit:
         todo = todo[:int(limit)]
