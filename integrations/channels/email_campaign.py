@@ -156,8 +156,54 @@ def send_campaign(recipients: Iterable[str],
         result['error'] = 'no SMTP password (HEVOLVE_SMTP_PASS unset)'
         return result
 
+    # A resume-log prevents re-sending across runs but NOT across CONCURRENT
+    # runs: two processes each read the log at start, so anything sent while
+    # both are alive is sent twice. That is not hypothetical -- it happened,
+    # and 36 people received this campaign twice before the second process was
+    # found. An agent that can call this tool can call it twice, so the guard
+    # has to be in here rather than in operator discipline.
+    lock_path = _state_path(campaign, 'lock')
+    try:
+        # O_EXCL is the atomic part: whoever creates the file wins, and a
+        # second caller cannot mistake "I just made it" for "it was already
+        # there".
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
+        holder = ''
+        try:
+            with open(lock_path, 'r', encoding='utf-8') as f:
+                holder = f.read().strip()
+        except Exception:
+            pass
+        result['error'] = (
+            "campaign '%s' is already running (lock held by pid %s at %s). "
+            "Refusing to start a second sender -- concurrent runs double-send. "
+            "Delete the lock file if that process is gone."
+            % (campaign, holder or 'unknown', lock_path))
+        return result
+
     ctx = ssl.create_default_context()   # full verification; our cert is valid
     log_path = _state_path(campaign, 'sent')
+    consecutive = 0
+    idx = 0
+    try:
+        return _run_sends(todo, subject, html, text, ctx, log_path, pw,
+                          per_conn, delay, result, campaign)
+    finally:
+        # Always release, including on an exception -- a stale lock that
+        # blocks every future run is its own outage.
+        try:
+            os.unlink(lock_path)
+        except Exception:
+            pass
+
+
+def _run_sends(todo, subject, html, text, ctx, log_path, pw,
+               per_conn, delay, result, campaign):
+    """The send loop itself. Split out so the lock in send_campaign() can be
+    released in a finally: without wrapping the whole body in a try:."""
     consecutive = 0
     idx = 0
     while idx < len(todo):
