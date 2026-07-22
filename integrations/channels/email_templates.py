@@ -13,6 +13,15 @@ What this version does:
   * It is a gift, and says so. Nunba is free forever, not a trial and not a
     freemium tier with the good parts locked. That is unusual enough to be
     worth leading with, and it is true, so we can say it plainly.
+  * It says WHY it is free. This matters more than the claim itself. "Free
+    forever" with no reason attached reads as bait, and the reader's next
+    thought is what the catch is: ads later, data sold, price after signup.
+    The answer is structural rather than generous, which is why it holds:
+    a cloud assistant must bill monthly because every answer burns GPU time
+    it pays for, and Nunba answers on hardware the reader already owns. It
+    costs us nothing when they use it, so there is no bill to pass on. An
+    unexplained promise depends on us keeping it; an explained one can be
+    checked against how the thing is built, and the source is public.
   * It is from a person. Sathish runs the company. A note from him is more
     honest than one from a role account, and more likely to get a reply.
   * It leads with the reader's problem: paid assistants cost real money every
@@ -49,6 +58,13 @@ is nowhere else for them to go. It runs on a laptop with 8GB of RAM.
 Most AI assistants now cost around 1,600 rupees every month, and every word
 you type into them lands on a company's servers. We thought people should
 have the other option.
+
+You are probably wondering where the catch is. It is fair to wonder, so here
+is the honest answer. Those services have to charge you every month because
+every reply you get costs them time on their own machines. Nunba replies on
+yours. It costs us nothing when you use it, so there is no bill for us to
+pass on to you. Free forever is not us being generous. It is just how the
+thing is built, and you can read the code and confirm that yourself.
 
 You do not have to take my word on the privacy part. The code is open, so you
 or anyone you trust can read exactly what it does:
@@ -91,6 +107,14 @@ max-width:520px;margin:0 auto;padding:8px">
   <p style="margin:0 0 18px">Most AI assistants now cost around
   <b>1,600 rupees every month</b>, and every word you type into them lands on
   a company's servers. We thought people should have the other option.</p>
+
+  <p style="margin:0 0 18px">You are probably wondering where the catch is. It
+  is fair to wonder, so here is the honest answer. Those services have to
+  charge you every month because every reply you get costs them time on their
+  own machines. <b>Nunba replies on yours.</b> It costs us nothing when you
+  use it, so there is no bill for us to pass on to you. Free forever is not us
+  being generous. It is just how the thing is built, and you can read the code
+  and confirm that yourself.</p>
 
   <p style="margin:0 0 18px">You do not have to take my word on the privacy
   part. The code is open, so you or anyone you trust can read exactly what it

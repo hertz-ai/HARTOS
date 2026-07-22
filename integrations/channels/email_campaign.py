@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import smtplib
 import ssl
 import time
@@ -92,7 +93,65 @@ def record_optout(address: str) -> None:
                      'keep receiving mail', address, exc)
 
 
-def build_message(to: str, subject: str, html: str, text: str) -> MIMEMultipart:
+def tracking_token(address: str, campaign: str) -> str:
+    """Short opaque per-recipient token.
+
+    An HMAC of the address rather than the address itself, so a click URL
+    never carries somebody's email in plain text where it lands in server
+    logs, Referer headers and analytics. It is one-way: we can confirm a
+    token belongs to a known recipient by recomputing it, but the URL alone
+    discloses nothing.
+    """
+    import hashlib
+    import hmac
+    secret = os.environ.get('HEVOLVE_TRACK_SECRET', 'hevolve-campaign')
+    mac = hmac.new(secret.encode(), ('%s|%s' % (campaign, address.lower())).encode(),
+                   hashlib.sha256)
+    return mac.hexdigest()[:12]
+
+
+def add_tracking(body: str, campaign: str, address: str,
+                 source: str = 'email') -> str:
+    """Tag our own links so a click can be attributed.
+
+    Adds ref (which channel), c (which campaign) and t (which recipient,
+    opaquely). Without c and t, '?ref=email' says traffic came from some
+    email at some point, which is not enough to tell whether a campaign
+    worked -- that ambiguity is why the first batch's clicks could not be
+    distinguished from a mail scanner's.
+
+    Only rewrites links to domains we own; a link to github.com is left
+    alone rather than decorated with our parameters.
+    """
+    token = tracking_token(address, campaign)
+
+    def _tag(match):
+        url = match.group(0)
+        if not any(d in url for d in ('hevolve.ai', 'hertzai.com')):
+            return url
+        # Strip any ref/c/t already on the URL before adding ours. The copy
+        # links to '/download?ref=email' by hand, and blindly appending
+        # produced '?ref=email&ref=email&c=...'. Duplicate keys are not an
+        # error to a query parser, they just make analytics read whichever
+        # one it happens to pick, which is worse than being wrong loudly.
+        base, sep, query = url.partition('?')
+        keep = [p for p in query.split('&')
+                if p and p.split('=', 1)[0] not in ('ref', 'c', 't')]
+        keep.extend(['ref=%s' % source, 'c=%s' % campaign, 't=%s' % token])
+        return base + '?' + '&'.join(keep)
+
+    return re.sub(r'https?://[^\s"\'<>)]+', _tag, body)
+
+
+def build_message(to: str, subject: str, html: str, text: str,
+                  campaign: str = 'default') -> MIMEMultipart:
+    # Tag our own links per recipient so a click is attributable to this
+    # campaign and this person. Done here rather than at the call site so no
+    # future caller can forget it and leave another batch of unattributable
+    # clicks behind.
+    html = add_tracking(html, campaign, to)
+    text = add_tracking(text, campaign, to)
+
     msg = MIMEMultipart('alternative')
     msg['Subject'] = subject
     msg['From'] = '%s <%s>' % (FROM_NAME, SMTP_USER)
@@ -224,7 +283,8 @@ def _run_sends(todo, subject, html, text, ctx, log_path, pw,
             for addr in chunk:
                 try:
                     srv.sendmail(SMTP_USER, [addr],
-                                 build_message(addr, subject, html, text).as_string())
+                                 build_message(addr, subject, html, text,
+                                               campaign).as_string())
                     result['sent'] += 1
                     consecutive = 0
                     log.write(addr + '\n')
