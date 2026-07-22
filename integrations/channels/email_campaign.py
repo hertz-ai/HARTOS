@@ -412,3 +412,70 @@ def _run_sends(todo, subject, html, text, ctx, log_path, pw,
             pass
         idx += per_conn
     return result
+
+
+def run_daily(list_path: str,
+              campaign: str,
+              subject: str,
+              html: str,
+              text: str,
+              *,
+              delay_seconds: float = 5.0,
+              shuffle_seed: int = 20260722,
+              dry_run: bool = True,
+              password: Optional[str] = None) -> dict:
+    """One day's worth of a large campaign. Safe to run from a scheduler.
+
+    Idempotent by construction: already-sent addresses are skipped, the
+    daily cap is enforced from the dated sent log, and the lock file means a
+    second invocation while the first is still going returns an error rather
+    than double-sending.
+
+    Recipients are shuffled with a fixed seed rather than read in file
+    order. File order groups each provider into a solid block, so a day's
+    batch would land entirely on one receiving system; a shuffle makes every
+    day representative of the list as a whole. The seed is fixed so the
+    order is reproducible when a run has to be examined after the fact.
+    """
+    import random
+
+    with open(list_path, 'r', encoding='utf-8') as f:
+        addrs = [ln.strip() for ln in f if ln.strip()]
+    random.Random(shuffle_seed).shuffle(addrs)
+    return send_campaign(addrs, subject, html, text, campaign=campaign,
+                         dry_run=dry_run, delay_seconds=delay_seconds,
+                         password=password)
+
+
+def _main(argv=None):
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        prog='email_campaign',
+        description='Send one day of a warmed-up email campaign.')
+    ap.add_argument('--list', required=True,
+                    help='file of recipient addresses, one per line')
+    ap.add_argument('--campaign', required=True,
+                    help='campaign name; scopes the resume log and daily cap')
+    ap.add_argument('--template', default='integrations.channels.email_templates',
+                    help='module exposing SUBJECT, HTML and TEXT')
+    ap.add_argument('--delay', type=float, default=5.0)
+    ap.add_argument('--live', action='store_true',
+                    help='actually deliver; omit for a dry run')
+    args = ap.parse_args(argv)
+
+    import importlib
+    tpl = importlib.import_module(args.template)
+    res = run_daily(args.list, args.campaign, tpl.SUBJECT, tpl.HTML, tpl.TEXT,
+                    delay_seconds=args.delay, dry_run=not args.live,
+                    password=os.environ.get('HEVOLVE_SMTP_PASS'))
+    for k, v in res.items():
+        print('%-20s %s' % (k, v))
+    # Non-zero on a systemic failure so a scheduler surfaces it rather than
+    # recording a silent success.
+    return 1 if res.get('error') else 0
+
+
+if __name__ == '__main__':
+    import sys as _sys
+    _sys.exit(_main())

@@ -70,6 +70,11 @@ You do not have to take my word on the privacy part. The code is open, so you
 or anyone you trust can read exactly what it does:
 https://github.com/hertz-ai/Nunba
 
+There is a longer argument behind all of this, about who actually decides
+things when you use an AI model, and why we think that question matters more
+than the price. I wrote it down here if you want it:
+https://hevolve.ai/answers/what-is-democratic-ai
+
 Download it here:
 https://hevolve.ai/download?ref=email
 
@@ -121,6 +126,13 @@ max-width:520px;margin:0 auto;padding:8px">
   does:<br>
   <a href="https://github.com/hertz-ai/Nunba"
      style="color:#0a5c3e">github.com/hertz-ai/Nunba</a></p>
+
+  <p style="margin:0 0 18px">There is a longer argument behind all of this,
+  about who actually decides things when you use an AI model, and why we think
+  that question matters more than the price. I wrote it down here if you want
+  it:<br>
+  <a href="https://hevolve.ai/answers/what-is-democratic-ai"
+     style="color:#0a5c3e">What democratic AI actually means</a></p>
 
   <p style="margin:0 0 18px">Download it here:<br>
   <a href="https://hevolve.ai/download?ref=email"
