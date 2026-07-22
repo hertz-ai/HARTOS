@@ -37,7 +37,7 @@ import logging
 import re
 import socket
 import subprocess
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger('hevolve_channels')
 
@@ -153,6 +153,106 @@ def domain_has_mx(domain: str, timeout: int = 5) -> bool:
 
     _mx_cache[domain] = bool(ok)
     return bool(ok)
+
+
+# Providers that answer truthfully at RCPT TO, measured rather than assumed.
+#
+# The test: probe a mailbox the provider has ALREADY hard-bounced with 5.1.1
+# and see whether it rejects it a second time. Results from the mail VM:
+#
+#   gmail.com     550 5.1.1 The email account ... does not exist   truthful
+#   hotmail.com   250 2.1.5 Recipient OK                           accepts all
+#   yahoo.com     250 recipient <...> ok                           accepts all
+#   aol.com       250 recipient <...> ok                           accepts all
+#
+# Microsoft, Yahoo and AOL accept every recipient at SMTP time and bounce
+# asynchronously afterwards. Verification against them does not merely fail,
+# it LIES: every dead mailbox comes back 250 and would be recorded as good.
+# That is worse than not checking, because it manufactures false confidence
+# in exactly the addresses that are about to bounce.
+#
+# So: verify Gmail, and for everyone else accept that dead mailboxes are only
+# discoverable by sending and reading the bounce. That is what the ramp and
+# the bounce handler are for.
+VERIFIABLE_PROVIDERS = frozenset({
+    'gmail.com', 'googlemail.com',
+})
+
+# Probing must originate from the mail server. The same probe from a machine
+# without a PTR record and sending history gets the connection closed by
+# Microsoft, Yahoo and AOL before RCPT is even reached, which reads as
+# 'inconclusive' and is easy to mistake for 'unverifiable'.
+PROBE_HELO = 'mail.hertzai.com'
+PROBE_FROM = 'sathish@mail.hertzai.com'
+
+
+def mailbox_exists(address: str, *, timeout: int = 25,
+                   smtp=None) -> Tuple[Optional[bool], str]:
+    """(exists, detail). exists is None when the provider cannot be trusted.
+
+    Sends RCPT TO and then disconnects. No DATA is transmitted, so no message
+    is ever delivered -- this is strictly less work for the receiving server
+    than the send it replaces, which makes probing before sending cheaper
+    than discovering the same fact by bouncing.
+
+    Returns None rather than True for accept-all providers. Reporting their
+    250 as 'exists' is the failure mode this function is written to avoid.
+    """
+    import smtplib
+
+    addr = (address or '').strip().lower()
+    domain = addr.rpartition('@')[2]
+    if not domain:
+        return False, 'no domain'
+    if domain not in VERIFIABLE_PROVIDERS:
+        return None, 'provider accepts all recipients at RCPT; not verifiable'
+
+    host = _mx_host(domain)
+    if not host:
+        return False, 'no MX'
+
+    srv = smtp
+    try:
+        if srv is None:
+            srv = smtplib.SMTP(host, 25, timeout=timeout)
+            srv.ehlo(PROBE_HELO)
+            srv.mail(PROBE_FROM)
+        code, msg = srv.rcpt(addr)
+        detail = (msg.decode('utf-8', 'replace') if isinstance(msg, bytes)
+                  else str(msg))[:120]
+        if 200 <= code < 300:
+            return True, detail
+        if 500 <= code < 600:
+            return False, detail
+        # 4xx is a deferral (greylisting, rate limit), not an answer.
+        return None, 'deferred: %s' % detail
+    except Exception as exc:
+        return None, 'probe failed: %s' % exc
+    finally:
+        if smtp is None and srv is not None:
+            try:
+                srv.quit()
+            except Exception:
+                pass
+
+
+def _mx_host(domain: str) -> Optional[str]:
+    """Lowest-preference MX for a domain, or None."""
+    try:
+        import dns.resolver  # type: ignore
+        rows = sorted((r.preference, str(r.exchange).rstrip('.'))
+                      for r in dns.resolver.resolve(domain, 'MX'))
+        return rows[0][1] if rows else None
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(['dig', '+short', 'MX', domain],
+                             capture_output=True, text=True, timeout=10).stdout
+        rows = sorted((int(l.split()[0]), l.split()[1].rstrip('.'))
+                      for l in out.strip().splitlines() if len(l.split()) == 2)
+        return rows[0][1] if rows else None
+    except Exception:
+        return None
 
 
 def classify(address: str, *, check_mx: bool = True) -> Tuple[bool, str]:

@@ -271,3 +271,47 @@ def test_bounced_addresses_are_excluded_from_sends(tmp_path, monkeypatch):
                          "s", "<p>h</p>", "t", campaign="supp", dry_run=True)
     assert r["candidates"] == 1, r
     assert r["suppressed_bounced"] == 1
+
+
+def test_accept_all_providers_return_none_not_true():
+    """The finding this encodes, measured against mailboxes those providers
+    had ALREADY hard-bounced:
+
+        gmail.com    550 5.1.1 does not exist   -> truthful
+        hotmail.com  250 Recipient OK           -> accepts all
+        yahoo.com    250 recipient ok           -> accepts all
+        aol.com      250 recipient ok           -> accepts all
+
+    Reporting Microsoft/Yahoo/AOL's 250 as 'exists' would mark every dead
+    address on 52% of the list as good. That is worse than not checking,
+    so those providers must return None (unknown), never True.
+    """
+    from integrations.channels.mailing_list import (
+        mailbox_exists, VERIFIABLE_PROVIDERS)
+    for dom in ("hotmail.com", "yahoo.com", "aol.com", "outlook.com"):
+        exists, why = mailbox_exists("someone@" + dom)
+        assert exists is None, "%s must be unknown, got %r" % (dom, exists)
+        assert "not verifiable" in why
+        assert dom not in VERIFIABLE_PROVIDERS
+
+
+def test_gmail_is_the_verifiable_one():
+    from integrations.channels.mailing_list import VERIFIABLE_PROVIDERS
+    assert "gmail.com" in VERIFIABLE_PROVIDERS
+    assert "googlemail.com" in VERIFIABLE_PROVIDERS
+
+
+def test_probe_maps_smtp_codes_correctly():
+    """4xx is a deferral, not an answer. Treating it as 'dead' would drop
+    real people because a server was busy."""
+    from integrations.channels import mailing_list as ml
+
+    class FakeSMTP:
+        def __init__(self, code):
+            self.code = code
+        def rcpt(self, addr):
+            return self.code, b"synthetic"
+
+    assert ml.mailbox_exists("a@gmail.com", smtp=FakeSMTP(250))[0] is True
+    assert ml.mailbox_exists("a@gmail.com", smtp=FakeSMTP(550))[0] is False
+    assert ml.mailbox_exists("a@gmail.com", smtp=FakeSMTP(451))[0] is None
