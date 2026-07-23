@@ -386,21 +386,33 @@ class VRAMManager:
             except Exception as e:
                 logger.debug(f"PyTorch GPU detection failed: {e}")
 
-        # 3) macOS Metal
+        # 3) macOS Metal — unified memory architecture, so there's no
+        # separate VRAM pool to query the way nvidia-smi/rocm-smi do.
+        # System RAM headroom (psutil) is the correct proxy: Metal draws
+        # from the same physical pool the CPU uses.  Previously hardcoded
+        # total_gb/free_gb to 0.0 ("hard to measure"), which made every
+        # downstream can_fit()/get_free_vram()/suggest_offload_mode() check
+        # reject EVERY GPU-gated model load on every Mac unconditionally,
+        # regardless of how much memory was actually free — surfaced as
+        # STT/TTS/LLM catalog entries all failing with "insufficient
+        # resources" even on machines with plenty of free RAM.
         if sys.platform == "darwin":
             try:
                 import platform
+
+                import psutil
+                vm = psutil.virtual_memory()
                 info.update({
                     "name": f"Apple Metal ({'Apple Silicon' if platform.machine() == 'arm64' else 'Intel'})",
-                    "total_gb": 0.0,  # shared memory — hard to measure
-                    "free_gb": 0.0,
+                    "total_gb": round(vm.total / (1024 ** 3), 2),
+                    "free_gb": round(vm.available / (1024 ** 3), 2),
                     "cuda_available": False,
                     "metal_available": True,
                 })
             except Exception:
                 logger.exception("detect_gpu: swallowed Exception")
 
-        if not info["cuda_available"]:
+        if not info["cuda_available"] and not info.get("metal_available"):
             logger.info("No NVIDIA GPU detected (nvidia-smi not found or no CUDA device)")
 
         self._gpu_info = info
@@ -420,14 +432,17 @@ class VRAMManager:
     # ── VRAM queries ─────────────────────────────────────────────
 
     def get_free_vram(self) -> float:
-        """Return free VRAM in GB — actual free from nvidia-smi.
+        """Return free VRAM in GB.
 
-        nvidia-smi already reports real free VRAM (total - all processes).
-        Do NOT subtract our allocations — that double-counts and reports
-        0GB when there's actually GB free, causing false OOM decisions.
+        NVIDIA: nvidia-smi already reports real free VRAM (total - all
+        processes) — do NOT subtract our allocations, that double-counts
+        and reports 0GB when there's actually GB free, causing false OOM
+        decisions.  macOS Metal: free_gb is real available system RAM
+        (psutil, see detect_gpu) since it's a unified memory pool — same
+        non-double-counting rule applies.
         """
         info = self.detect_gpu()
-        if not info["cuda_available"]:
+        if not (info["cuda_available"] or info.get("metal_available")):
             return 0.0
         return info["free_gb"]
 
@@ -450,7 +465,7 @@ class VRAMManager:
             return True  # unknown tool — assume it fits
         min_vram, _model_size = effective
         gpu = self.detect_gpu()
-        if not gpu["cuda_available"]:
+        if not (gpu["cuda_available"] or gpu.get("metal_available")):
             return False  # no GPU at all
         return self.get_free_vram() >= min_vram
 
@@ -546,7 +561,7 @@ class VRAMManager:
         Returns: 'gpu' | 'cpu_offload' | 'cpu_only'
         """
         gpu = self.detect_gpu()
-        if not gpu["cuda_available"]:
+        if not (gpu["cuda_available"] or gpu.get("metal_available")):
             return "cpu_only"
 
         budget = VRAM_BUDGETS.get(tool_name)

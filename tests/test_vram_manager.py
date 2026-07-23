@@ -132,6 +132,54 @@ class VRAMAllocationRefusalTests(unittest.TestCase):
                 self.mgr.get_allocations().get("_not_in_budget_table"), 0.0
             )
 
+    def _mock_metal_gpu(self, total_gb: float, free_gb: float):
+        """Return a detect_gpu patch shaped like macOS Metal detection
+        (cuda_available=False, metal_available=True) — the real return
+        shape from detect_gpu() on a Mac, distinct from _mock_gpu's
+        NVIDIA-shaped fake."""
+        fake_info = {
+            "name": "Apple Metal (Apple Silicon)",
+            "total_gb": total_gb,
+            "free_gb": free_gb,
+            "cuda_available": False,
+            "metal_available": True,
+        }
+        return patch.object(self.mgr, "detect_gpu", return_value=fake_info)
+
+    def test_metal_with_free_memory_can_fit(self):
+        """Regression: macOS Metal previously reported free_gb=0.0
+        unconditionally, so can_fit()/get_free_vram() rejected every
+        GPU-gated model on every Mac regardless of real available memory.
+        A Metal GPU with real free memory must fit a budget within it."""
+        VRAM_BUDGETS["_test_1gb_tool"] = (1.0, 0.5)
+        try:
+            with self._mock_metal_gpu(total_gb=16.0, free_gb=8.0):
+                self.assertEqual(self.mgr.get_free_vram(), 8.0)
+                self.assertTrue(self.mgr.can_fit("_test_1gb_tool"))
+                self.assertTrue(self.mgr.allocate("_test_1gb_tool"))
+        finally:
+            VRAM_BUDGETS.pop("_test_1gb_tool", None)
+
+    def test_metal_oversize_claim_still_refused(self):
+        """Metal GPU with genuinely insufficient free memory must still
+        refuse — the fix isn't a blanket allow, it's a real measurement."""
+        VRAM_BUDGETS["_test_10gb_tool"] = (10.0, 9.0)
+        try:
+            with self._mock_metal_gpu(total_gb=8.0, free_gb=1.0):
+                self.assertFalse(self.mgr.can_fit("_test_10gb_tool"))
+                self.assertFalse(self.mgr.allocate("_test_10gb_tool"))
+        finally:
+            VRAM_BUDGETS.pop("_test_10gb_tool", None)
+
+    def test_metal_offload_mode_not_forced_cpu_only_when_it_fits(self):
+        """suggest_offload_mode() had the same cuda_available-only gate —
+        must not force cpu_only on Metal when the model genuinely fits."""
+        with self._mock_metal_gpu(total_gb=16.0, free_gb=8.0):
+            self.assertNotEqual(
+                self.mgr.suggest_offload_mode("_not_in_budget_table"),
+                "cpu_only",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
