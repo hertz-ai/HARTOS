@@ -31,6 +31,12 @@ CONSENT_TYPES = frozenset({
     'public_exposure',   # Content made public
     'payment_setup',     # User provides UPI/payment ID for revenue payouts
     'compute_contribute', # User allows their device to process hive tasks
+    'announcement_subscription',  # A channel destination asked to receive
+                         # broadcasts. Keyed by '<channel>:<chat_id>' rather
+                         # than a HARTOS user, because the subscriber here is
+                         # a Telegram group or Discord channel. Exists so the
+                         # broadcaster can check a RECORD instead of an
+                         # operator's assertion that people opted in.
     'cloud_egress',      # User allows fallback to cloud (vision, social
                          # sync, third-party APIs) when local resources
                          # can't satisfy the request.  Scope-aware: e.g.

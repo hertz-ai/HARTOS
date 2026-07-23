@@ -227,8 +227,26 @@ def init_agent_engine(app):
         # ones that caused the original 2026-05-14 import-lock deadlock.
 
         # Bootstrap "HART Platform" product for self-marketing (idempotent)
+        #
+        # Retried, and loud on failure.  This block used to run exactly once
+        # and swallow any exception at debug level.  On deepbox that lost the
+        # race with SQLite table creation: the bootstrap threw, nobody saw the
+        # debug line, and the node ran for weeks with an EMPTY agent_goals
+        # table — daemon ticking every 30s over nothing, so no goal ever
+        # executed and no content was ever produced.  One transient failure at
+        # boot meant permanently dead automation on Docker, OS and Nunba
+        # bundled deployments alike.
+        #
+        # Three changes make it self-healing:
+        #   1. retry with backoff, so a not-yet-ready DB is survivable
+        #   2. verify goals actually landed AFTER the commit (the seeder can
+        #      return a count that a later rollback discards)
+        #   3. log failures at warning/error, never debug
         product_id = None
-        try:
+        _bootstrap_ok = False
+        _attempts = int(os.environ.get('HEVOLVE_BOOTSTRAP_ATTEMPTS', '5'))
+        for _attempt in range(1, max(1, _attempts) + 1):
+          try:
             from integrations.social.models import get_db, Product, User
             db = get_db()
             existing = db.query(Product).filter_by(is_platform_product=True).first()
@@ -288,9 +306,45 @@ def init_agent_engine(app):
                         "for %d system identit(ies)", n_consent)
 
             db.commit()
+
+            # Verify the goals are actually ON DISK.  seed_bootstrap_goals()
+            # returning >0 only means rows were added to the session; if the
+            # transaction is later rolled back the queue is still empty, which
+            # is exactly the failure that hid here before.
+            from integrations.social.models import AgentGoal
+            persisted = db.query(AgentGoal).count()
             db.close()
-        except Exception as e:
-            logger.debug(f"Platform product bootstrap skipped: {e}")
+
+            if persisted == 0:
+                raise RuntimeError(
+                    "bootstrap committed but agent_goals is still empty — "
+                    "seeding did not persist")
+
+            _bootstrap_ok = True
+            logger.info(
+                "Agent bootstrap complete on attempt %d: %d goal(s) queued",
+                _attempt, persisted)
+            break
+          except Exception as e:
+            try:
+                db.rollback(); db.close()
+            except Exception:
+                pass
+            if _attempt < _attempts:
+                _backoff = min(30, 2 ** _attempt)
+                logger.warning(
+                    "Agent bootstrap attempt %d/%d failed (%s); retrying in %ds",
+                    _attempt, _attempts, e, _backoff)
+                import time as _tb
+                _tb.sleep(_backoff)
+            else:
+                # Terminal: the node will tick forever over an empty queue, so
+                # this must be visible in the operator's logs, not swallowed.
+                logger.error(
+                    "Agent bootstrap FAILED after %d attempts: %s — agent_goals "
+                    "is empty, so NO seeded goal will ever execute on this node. "
+                    "Fix the cause and restart, or run seed_bootstrap_goals() "
+                    "manually.", _attempts, e, exc_info=True)
 
         # Register AgentBaselineAdapter with benchmark registry
         try:

@@ -482,6 +482,14 @@ def get_local_llm_url() -> str:
     candidates: list = []
 
     candidates.append(os.environ.get('HEVOLVE_LOCAL_LLM_URL', ''))
+    # HEVOLVE_LLM_ENDPOINT_URL is what the regional/central tier actually sets
+    # (see the deploy .env). It was missing here, so the resolver could not see
+    # the endpoint the cloud tier was configured with: helper.py read it raw
+    # while every resolver-based caller read HEVOLVE_LOCAL_LLM_URL instead. On
+    # deepbox that only worked because both were set to the same gateway --
+    # redundancy masking two sources of truth. Treated as a peer alias so the
+    # resolver is correct on a tier that has no local model at all.
+    candidates.append(os.environ.get('HEVOLVE_LLM_ENDPOINT_URL', ''))
     candidates.append(os.environ.get('CUSTOM_LLM_BASE_URL', ''))
 
     _port_env = os.environ.get('LLAMA_CPP_PORT', '')

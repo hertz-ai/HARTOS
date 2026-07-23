@@ -1,32 +1,47 @@
-name: Feature Request
-description: Suggest an idea
+name: Feature request
+description: Propose a capability or a change in behaviour
 labels: ["enhancement"]
 body:
   - type: textarea
     id: problem
     attributes:
-      label: What problem does this solve?
-      placeholder: I want to be able to...
+      label: What problem does this solve
+      description: >
+        Describe the situation you are in, not the solution you have in mind.
+        The best feature requests we get are the ones where the proposed fix
+        turns out to be the second-best idea in the issue.
     validations:
       required: true
+
   - type: textarea
-    id: solution
+    id: proposal
     attributes:
-      label: Proposed solution
-      placeholder: How would you like it to work?
-  - type: dropdown
-    id: area
+      label: What you would like it to do
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
     attributes:
-      label: Area
+      label: What you tried instead
+      description: Workarounds, other tools, or why the current behaviour blocks you.
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Compatible with the project's constraints
+      description: >
+        These are hard lines — a proposal that needs one of them will be
+        declined regardless of merit.
       options:
-        - Agent Engine
-        - Channels (Discord, Telegram, WhatsApp, etc.)
-        - PeerLink / P2P
-        - Security
-        - Vision / VLM
-        - TTS / STT
-        - CLI (hart command)
-        - SDK
-        - NixOS / ISO
-        - Documentation
-        - Other
+        - label: Does not require sending user data off-device
+          required: true
+        - label: Does not make a cloud provider mandatory
+          required: true
+
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Would you like to implement it
+      options:
+        - label: I am willing to open a PR for this

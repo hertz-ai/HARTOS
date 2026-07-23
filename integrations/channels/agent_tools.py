@@ -20,6 +20,7 @@ All tools reuse existing infrastructure:
 
 import json
 import logging
+import re
 from typing import Annotated, Optional
 
 logger = logging.getLogger(__name__)
@@ -920,6 +921,165 @@ def build_channel_tool_closures(ctx):
         "channel) to re-establish credentials.  Example: "
         "reconnect_channel('discord').",
         reconnect_channel,
+    ))
+
+    # ------------------------------------------------------------------
+    # set_announcement_channel — where growth announcements get posted
+    # ------------------------------------------------------------------
+    #
+    # Setting a destination is deliberately NOT the same as authorising
+    # broadcast. With public_exposure consent absent, a configured
+    # destination still sends nothing, so exposing this as an agent tool
+    # cannot escalate anything: the worst case is an address written down
+    # that never gets used. Granting the consent itself is not a tool, and
+    # should not become one -- an autonomous goal able to grant its own
+    # permission to post publicly is the fail-closed gate flipping its own
+    # switch.
+    @log_tool_execution
+    def set_announcement_channel(
+        channel_type: Annotated[str, "Channel to announce on (telegram, discord, slack, whatsapp)"],
+        chat_id: Annotated[str, "Destination id. Telegram groups/channels are NEGATIVE ids; WhatsApp groups end in @g.us"],
+    ) -> str:
+        """Set where HARTOS posts growth announcements for a channel.
+
+        Refuses private one-to-one destinations: broadcasting into somebody's
+        DM is unsolicited messaging regardless of who configured it."""
+        try:
+            from integrations.channels.announcement_broadcaster import (
+                destination_shape, is_subscribed)
+            from integrations.channels.admin.api import get_api
+
+            channel_type = (channel_type or '').strip().lower()
+            chat_id = (chat_id or '').strip()
+            if not channel_type or not chat_id:
+                return "Both channel_type and chat_id are required."
+
+            shape = destination_shape(channel_type, chat_id)
+            if shape == 'one_to_one' and not is_subscribed(channel_type, chat_id):
+                return (f"Refused: {chat_id} is a private one-to-one chat on "
+                        f"{channel_type}. Announcements go to groups or channels "
+                        f"people joined, not to individuals who did not ask. "
+                        f"Use a group id (Telegram groups are negative; WhatsApp "
+                        f"groups end in @g.us).")
+
+            api = get_api()
+            cfg = api._channels.get(channel_type)
+            if cfg is None:
+                return (f"Channel '{channel_type}' is not registered. "
+                        f"Register it first, then set its announcement target.")
+            cfg['announce_chat_id'] = chat_id
+            api._channels[channel_type] = cfg
+            api._save_config()
+
+            # Say plainly whether this will actually broadcast yet. Reporting
+            # "configured" when nothing can send would be the same false
+            # success this system has been bitten by before.
+            try:
+                from integrations.agent_engine.marketing_tools import (
+                    _external_post_allowed)
+                consented = bool(_external_post_allowed(
+                    user_id or _get_user_id_from_threadlocal()))
+            except Exception:
+                consented = False
+
+            status = ("Announcements are ENABLED and will post here."
+                      if consented else
+                      "NOTE: public_exposure consent is not granted, so nothing "
+                      "will actually be sent yet. That grant is an operator "
+                      "action, deliberately not an agent tool.")
+            return f"Announcement target for {channel_type} set to {chat_id}. {status}"
+        except Exception as e:
+            logger.error("set_announcement_channel error: %s", e)
+            return f"Error setting announcement channel: {e}"
+
+    tools.append((
+        "set_announcement_channel",
+        "Set where HARTOS posts growth announcements for a messaging channel "
+        "(e.g. a Telegram group, a Discord channel, a WhatsApp group). Refuses "
+        "private one-to-one chats. Does NOT authorise posting on its own -- "
+        "public_exposure consent is a separate operator decision. "
+        "Example: set_announcement_channel('telegram', '-1001234567890')",
+        set_announcement_channel,
+    ))
+
+    # ------------------------------------------------------------------
+    # send_email_campaign — outbound email through our own mail server
+    # ------------------------------------------------------------------
+    #
+    # dry_run defaults True: the first call returns what WOULD be sent so the
+    # agent (and the human reading it) can see the blast radius before any
+    # mail leaves. Same preview-then-confirm shape as the other write-side
+    # tools here.
+    @log_tool_execution
+    def send_email_campaign(
+        recipients: Annotated[str, "Comma or newline separated email addresses"],
+        subject: Annotated[str, "Subject line"],
+        body_text: Annotated[str, "Plain-text body. Disclose who is writing."],
+        body_html: Annotated[Optional[str], "Optional HTML body; falls back to the text"] = None,
+        campaign: Annotated[str, "Campaign name — scopes the resume log so a rerun never double-sends"] = "default",
+        delay_seconds: Annotated[float, "Seconds between messages. Higher is safer for deliverability."] = 2.0,
+        limit: Annotated[Optional[int], "Cap this run (e.g. warm-up batch)"] = None,
+        daily_cap: Annotated[Optional[int], "Max messages today. Overrides the warm-up ramp."] = None,
+        warmup: Annotated[bool, "Ramp daily volume over the first week. Leave on for any list over a few thousand."] = True,
+        dry_run: Annotated[bool, "True previews without sending. Set False to actually deliver."] = True,
+    ) -> str:
+        """Send an email campaign via our own mail server, paced and resumable.
+
+        Skips anyone already sent for this campaign or previously unsubscribed.
+        Every message carries List-Unsubscribe.
+
+        Volume is capped per day as well as paced per message. Spacing alone
+        does not protect a domain: a sender with no history that delivers
+        seventeen thousand messages in a day is blocked on reputation grounds
+        however evenly they were spread."""
+        try:
+            from integrations.channels.email_campaign import send_campaign
+            addrs = [a.strip() for a in re.split(r"[,\n;]+", recipients or "")
+                     if a.strip()]
+            if not addrs:
+                return "No recipients supplied."
+            html = body_html or (
+                '<div style="font-family:system-ui,Arial;max-width:560px;'
+                'line-height:1.6">'
+                + "".join("<p>%s</p>" % p for p in body_text.split("\n\n"))
+                + "</div>")
+            res = send_campaign(addrs, subject, html, body_text,
+                                campaign=campaign, dry_run=bool(dry_run),
+                                delay_seconds=float(delay_seconds), limit=limit,
+                                daily_cap=daily_cap, warmup=bool(warmup))
+            cap_note = ""
+            if res.get("daily_cap") is not None:
+                cap_note = (" Day %d of the ramp, cap %d, %d already sent today."
+                            % (res["campaign_day"], res["daily_cap"],
+                               res["sent_today_before"]))
+            if res.get("dry_run"):
+                return ("DRY RUN for campaign '%s': %d would be sent "
+                        "(%d already sent, %d opted out), ~%s min at %.1fs pacing.%s "
+                        "Re-run with dry_run=False to deliver."
+                        % (campaign, res["candidates"], res["already_sent"],
+                           res["opted_out"], res["estimated_minutes"],
+                           res["delay_seconds"], cap_note))
+            if res.get("error"):
+                return "Campaign '%s' failed: %s" % (campaign, res["error"])
+            out = ("Campaign '%s': sent=%d failed=%d of %d candidates.%s"
+                   % (campaign, res["sent"], res["failed"], res["candidates"],
+                      cap_note))
+            if res.get("halted"):
+                out += " HALTED: " + res["halted"]
+            return out
+        except Exception as e:
+            logger.error("send_email_campaign error: %s", e)
+            return "Error running campaign: %s" % e
+
+    tools.append((
+        "send_email_campaign",
+        "Send an email campaign through our own mail server, paced and resumable. "
+        "ALWAYS previews first (dry_run=True by default) — call again with "
+        "dry_run=False to actually deliver. Skips already-sent and unsubscribed "
+        "addresses automatically. delay_seconds controls pacing (higher is safer "
+        "for deliverability). Example: send_email_campaign('a@x.com,b@y.com', "
+        "'Subject', 'Body text', campaign='welcome', delay_seconds=2.0)",
+        send_email_campaign,
     ))
 
     return tools

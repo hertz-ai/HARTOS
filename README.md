@@ -22,6 +22,55 @@ This README is written to be read by people and by agents alike. Every capabilit
 
 ---
 
+> **Status: public alpha.** The runtime, the Model Bus and the channel
+> adapters are in daily use; APIs still move. Issues and PRs are genuinely
+> wanted — see [Contributing](CONTRIBUTING.md).
+
+---
+
+## Table of Contents
+
+- [Why HART OS?](#why-hart-os)
+- [60-second start](#60-second-start)
+- [How it compares](#how-it-compares)
+- [Capabilities](#capabilities)
+- [Hello, agent](#hello-agent)
+- [Architecture map](#architecture-map)
+- [API surface](#api-surface)
+- [How auto-evolve works](#how-auto-evolve-works)
+- [How hive connectivity works](#how-hive-connectivity-works)
+- [Topology](#topology)
+- [Build / extend](#build--extend)
+- [Economics (for node operators)](#economics-for-node-operators)
+- [Documentation index](#documentation-index)
+- [License](#license)
+
+---
+
+## Why HART OS?
+
+Most software described as AI-powered ships an assistant: a separate app,
+usually talking to somebody else's server, that can drive a few functions.
+Remove the assistant and everything underneath works exactly as before.
+
+HART OS inverts that. Inference becomes a service the system provides, the
+way it provides a filesystem or a network stack. An application does not
+bundle a model or hold an API key — it asks the OS, and the OS decides which
+model answers, running locally where it can. Ten apps on one machine do not
+each load their own copy or each pay their own bill.
+
+That has a practical consequence worth stating plainly: **every device
+becomes the same target.** The runtime driving a laptop is the runtime
+driving a robot, so a robot's AI access is just another Model Bus call, and
+code written against `:6777/v1/chat/completions` runs unchanged on both.
+
+**If you are here to contribute**, the parts that most need outside eyes are
+the auto-evolve loop (`autoresearch_loop.py`), the guardrails that gate every
+self-improvement (`hive_guardrails.py`), and the 31 channel adapters — the
+most self-contained place to start. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
 ## 60-second start
 
 ```bash
