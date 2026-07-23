@@ -337,11 +337,22 @@ def _proxy_gateway(method: str, path: str, **kwargs):
     """Thin HTTP proxy to the gateway.  Returns (json_or_none, status).
     Never raises — connection / timeout errors map to (None, 503)."""
     import json as _json
+    import os as _os
     import urllib.error
     import urllib.request
     url = _whatsapp_gateway_base().rstrip('/') + path
     body = None
     headers = {'Accept': 'application/json'}
+    # The central node talks to a REMOTE WAHA-style gateway (supervisor
+    # skips the embedded Baileys spawn on a central deploy), and that
+    # gateway requires an API key: without it every /api/sessions call
+    # 401s, so the status comes back state='unknown' and the QR never
+    # appears -- exactly what driving the flow with a real user showed.
+    # Sent as X-Api-Key (WAHA convention) only when WHATSAPP_API_KEY is
+    # set; a local embedded gateway needs none, so this stays inert there.
+    _gw_key = _os.environ.get('WHATSAPP_API_KEY')
+    if _gw_key:
+        headers['X-Api-Key'] = _gw_key
     if 'json' in kwargs and kwargs['json'] is not None:
         body = _json.dumps(kwargs['json']).encode('utf-8')
         headers['Content-Type'] = 'application/json'
