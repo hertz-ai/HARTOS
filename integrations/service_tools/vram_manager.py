@@ -81,6 +81,41 @@ def _nvidia_driver_supports_cuda12(driver_version: Optional[str]) -> bool:
     return num >= floor
 
 
+_NVIDIA_SMI_PATH: Optional[str] = None
+
+
+def _resolve_nvidia_smi() -> str:
+    """Return the nvidia-smi executable to run: PATH first, then (Windows) the
+    DriverStore + the classic NVSMI folder.
+
+    Some driver installs (seen on a 940MX) ship nvidia-smi ONLY inside the
+    DriverStore, NOT on PATH — without this fallback detect_gpu hits
+    FileNotFoundError and reports "no GPU", so the card is invisible and the UI
+    cannot surface a "driver too old — update it" suggestion.  Cached (module
+    global) so the DriverStore glob runs at most once.  Falls back to the bare
+    name so the FileNotFoundError branch still works when there is genuinely no
+    NVIDIA GPU.
+    """
+    global _NVIDIA_SMI_PATH
+    if _NVIDIA_SMI_PATH is not None:
+        return _NVIDIA_SMI_PATH
+    import shutil
+    found = shutil.which("nvidia-smi")
+    if not found and sys.platform == "win32":
+        import glob
+        for pattern in (
+            r"C:\Windows\System32\nvidia-smi.exe",
+            r"C:\Windows\System32\DriverStore\FileRepository\nv*\nvidia-smi.exe",
+            r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+        ):
+            hits = glob.glob(pattern)
+            if hits:
+                found = hits[0]
+                break
+    _NVIDIA_SMI_PATH = found or "nvidia-smi"
+    return _NVIDIA_SMI_PATH
+
+
 class VRAMManager:
     """GPU memory tracking and allocation decisions."""
 
@@ -268,10 +303,13 @@ class VRAMManager:
         _nvsmi_timeout = float(os.environ.get(
             'HEVOLVE_NVIDIA_SMI_TIMEOUT', '15'))
 
-        # 1) nvidia-smi — zero-dependency, works on any NVIDIA GPU system
+        # 1) nvidia-smi — zero-dependency, works on any NVIDIA GPU system.
+        # Resolve the binary (PATH, else DriverStore) so a card whose driver
+        # put nvidia-smi only in the DriverStore is still detected + its driver
+        # version read — which is what lets the UI say "update your driver".
         try:
             result = run_bounded(
-                ["nvidia-smi",
+                [_resolve_nvidia_smi(),
                  "--query-gpu=name,memory.total,memory.free,driver_version",
                  "--format=csv,noheader,nounits"],
                 timeout=_nvsmi_timeout,

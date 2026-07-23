@@ -535,11 +535,23 @@ def status() -> Dict:
     if vm:
         try:
             gpu_info = vm.detect_gpu()
+            _gpu_name = gpu_info.get('name')
+            _cuda_ok = gpu_info.get('cuda_available', False)
+            _drv_ok = gpu_info.get('driver_cuda_ok', _cuda_ok)
             result['vram'] = {
-                'gpu_name': gpu_info.get('name'),
+                'gpu_name': _gpu_name,
                 'total_gb': gpu_info.get('total_gb', 0.0),
                 'free_gb': gpu_info.get('free_gb', 0.0),
-                'cuda_available': gpu_info.get('cuda_available', False),
+                'cuda_available': _cuda_ok,
+                # Surface the driver state so the existing GPU-tier screen can
+                # tell "no GPU" apart from "GPU present but its driver is too old
+                # for the CUDA-12 runtime". detect_gpu already computes these;
+                # status() used to drop them. driver_update_suggested is the flag
+                # the UI reads to show a (non-forced) "update your GPU driver".
+                'gpu_present': bool(_gpu_name),
+                'driver_version': gpu_info.get('driver_version'),
+                'driver_cuda_ok': _drv_ok,
+                'driver_update_suggested': bool(_gpu_name) and not _drv_ok,
             }
         except Exception:
             logger.exception("status: swallowed Exception")
