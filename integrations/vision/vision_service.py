@@ -568,12 +568,15 @@ class VisionService:
         """Handle a single WebSocket connection (one per user).
 
         Protocol:
-            1. Client sends user_id (digit string)
+            1. Client sends user_id (any non-empty string — the SPA
+               clients all use UUIDs, not numeric IDs)
             2. Client sends "video_start" (camera, default) or "screen_start"
             3. Client sends binary JPEG frames
             4. Client sends "video_stop" to end
         """
         import cv2
+
+        _CONTROL_MESSAGES = {'screen_start', 'video_start', 'video_stop'}
 
         user_id = None
         channel = 'camera'  # default channel
@@ -594,7 +597,13 @@ class VisionService:
                         else:
                             self.store.put_frame(user_id, jpeg_bytes)
                 elif isinstance(message, str):
-                    if message.isdigit():
+                    # First string message is always the user_id, whatever
+                    # its format — SPA clients (Demopage.js,
+                    # useCameraFrameStream.js, AgentOverlay.jsx) send UUIDs,
+                    # which `.isdigit()` used to reject outright, silently
+                    # leaving user_id=None for the rest of the session and
+                    # dropping every frame at the `and user_id` check above.
+                    if user_id is None and message not in _CONTROL_MESSAGES:
                         user_id = message
                         logger.info(f"Frame session started for user {user_id}")
                     elif message == 'screen_start':
