@@ -6,6 +6,26 @@ on:
       - main
   workflow_dispatch:
 
+# Only one deploy to the box at a time.
+#
+# Without this, every push starts its own run and they build concurrently on
+# the SAME machine. Each is a --no-cache build of an ~8.7GB image, and three
+# pushes in half an hour on 23 July put two of them in the build phase
+# together: deepbox ran out of memory and the older build was SIGKILLed
+# mid-step, surfacing as the useless "Process exited with status 137". Two of
+# that day's three deploy failures look like this. It reads as a flaky build
+# and is really just two builds competing for one box.
+#
+# cancel-in-progress because an in-flight build for an older commit has no
+# value once a newer one exists -- it would only deploy code that is already
+# superseded. This is safe now that the container is not torn down until its
+# replacement is built and healthy: cancelling mid-build leaves the previous
+# release serving :6777, untouched. Under the old remove-first ordering the
+# same cancellation would have left the box with nothing running.
+concurrency:
+  group: deploy-hartos-deepbox
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
