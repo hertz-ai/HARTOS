@@ -118,7 +118,19 @@ jobs:
             # images from prior --no-cache builds), so the build itself failed
             # with 'No space left on device' at apt-get — which meant the OLD
             # end-of-run prune could never execute.  So reclaim FIRST, then build.
-            docker rm -f langchain langchain_tmp 2>/dev/null || true
+            #
+            # The running container is deliberately NOT removed here, though it
+            # used to be. Killing it first meant :6777 was dead for the whole
+            # ~18-minute build, and Kong's hartos-social route points straight
+            # at it, so every /api/social/* call 502'd for the duration --
+            # including /auth/register, i.e. nobody could sign up. Worse, the
+            # container was only recreated at the END, so any failed build left
+            # the box with no HARTOS at all until someone landed a green deploy.
+            # Three failed builds in one day is how the site sat unable to
+            # register users. Reclaiming images and build cache frees the disk
+            # that actually matters; the live container is a few hundred MB and
+            # is now swapped only once its replacement is built and healthy.
+            docker rm -f langchain_tmp 2>/dev/null || true
             docker rmi -f langchain_gpt:main 2>/dev/null || true   # drop legacy :main (now using :latest)
             # Delete every stale langchain_gpt tag except :latest/:main (the
             # possible running image).  rmi -f only removes the TAG if the image
@@ -133,9 +145,13 @@ jobs:
             df -h / || true
 
             echo "=== Build Docker image ==="
+            # Built under the commit tag ONLY. :latest is the rollback target
+            # and must keep pointing at the last image known to have served
+            # traffic, so it is moved (further down) after the new container
+            # answers /status -- not by the build. Tagging :latest here meant a
+            # broken build silently overwrote the one good image on the box.
             docker build --no-cache \
               --build-arg GIT_SHA="$DEPLOY_COMMIT" \
-              -t langchain_gpt:latest \
               -t langchain_gpt:"$DEPLOY_COMMIT_SHORT" \
               .
 
@@ -143,7 +159,7 @@ jobs:
             sudo docker run --name langchain_tmp -d \
               --env-file .env \
               -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
-              langchain_gpt:latest sleep 3600
+              langchain_gpt:"$DEPLOY_COMMIT_SHORT" sleep 3600
 
             docker exec langchain_tmp sh -lc '
             cd /app
@@ -189,6 +205,15 @@ jobs:
             PY
 
             echo "=== Run central container ==="
+            # Remember what was serving so a bad release can be put back. This
+            # is the last moment :6777 goes away, and the new container is
+            # started immediately after, so the outage window is a container
+            # restart rather than a full image build.
+            ROLLBACK_IMAGE="$(docker inspect langchain --format '{{.Config.Image}}' 2>/dev/null || true)"
+            [ -z "$ROLLBACK_IMAGE" ] && ROLLBACK_IMAGE="langchain_gpt:latest"
+            echo "rollback target: $ROLLBACK_IMAGE"
+            docker rm -f langchain 2>/dev/null || true
+
             sudo docker run -d --name langchain --restart unless-stopped \
               -p 6777:6777 \
               --env-file .env \
@@ -199,7 +224,7 @@ jobs:
               -v "$(pwd)/release_manifest.json:/app/release_manifest.json:ro" \
               -v ${{ secrets.DEPLOY_LOGS_PATH }}:/app/logs \
               -v ${{ secrets.DEPLOY_IMAGES_PATH }}:/app/output_images \
-              langchain_gpt:latest
+              langchain_gpt:"$DEPLOY_COMMIT_SHORT"
 
             echo "=== Wait for service ==="
             sleep 20
@@ -301,8 +326,24 @@ jobs:
               sleep 5
             done
             if [ -z "$STATUS_JSON" ]; then
-              echo "::error::status endpoint never came up (300s)"
+              echo "::error::status endpoint never came up (300s) -- rolling back"
               docker logs --tail 80 langchain 2>&1 || true
+              # Put the previous release back rather than leaving :6777 dead.
+              # Kong routes /api/social/* here, so an empty box is a site-wide
+              # signup outage; a slightly stale HARTOS is strictly better.
+              docker rm -f langchain 2>/dev/null || true
+              if sudo docker run -d --name langchain --restart unless-stopped \
+                   -p 6777:6777 \
+                   --env-file .env \
+                   -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
+                   -v "$(pwd)/config.json:/app/config.json:ro" \
+                   -v ${{ secrets.DEPLOY_LOGS_PATH }}:/app/logs \
+                   -v ${{ secrets.DEPLOY_IMAGES_PATH }}:/app/output_images \
+                   "$ROLLBACK_IMAGE"; then
+                echo "rolled back to $ROLLBACK_IMAGE"
+              else
+                echo "::error::rollback to $ROLLBACK_IMAGE also failed -- :6777 is DOWN"
+              fi
               exit 1
             fi
             echo "$STATUS_JSON"
@@ -328,6 +369,14 @@ jobs:
 
             print("Manifest commit matches deployed commit:", deploy_commit)
             PY
+
+            echo "=== Promote this image to :latest ==="
+            # Only now, with the container up and /status answering, does
+            # :latest move. That keeps :latest meaning "last image known to
+            # have actually served traffic", which is what makes it a safe
+            # rollback target on the next deploy.
+            docker tag langchain_gpt:"$DEPLOY_COMMIT_SHORT" langchain_gpt:latest
+            echo "langchain_gpt:latest -> $DEPLOY_COMMIT_SHORT"
 
             echo "=== Final verification complete ==="
             echo "HARTOS central deployment verified for commit $DEPLOY_COMMIT"
