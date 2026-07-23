@@ -24,6 +24,16 @@ in
       partOf = [ "hart.target" ];
       wantedBy = [ "hart.target" ];
 
+      # Crash-loop containment: Restart=on-failure/RestartSec=5 (below) would
+      # otherwise restart a persistently-failing backend every 5s forever,
+      # pinning a core at boot. Cap at 5 fast failures within 5 min, then let
+      # systemd mark the unit failed and move on — the shell still boots (it
+      # degrades to "backend unavailable") rather than the OS hanging on a
+      # doomed service. A legitimately slow start (see TimeoutStartSec below)
+      # is a single long attempt, so it never trips this fast-failure limit.
+      startLimitIntervalSec = 300;
+      startLimitBurst = 5;
+
       environment = {
         # Recipe/prompts data must land in the service's WRITABLE StateDirectory
         # (cfg.dataDir), not the /nix/store package dir (read-only) nor the
@@ -90,7 +100,13 @@ in
         # No WatchdogSec: waitress never sends sd_notify(WATCHDOG=1), so a watchdog
         # timer would SIGABRT the backend every 120s once it is actually serving.
         # Restart=on-failure still covers real crashes.
-        TimeoutStartSec = 30;
+        # 600s (not 30s): the backend imports langchain + chromadb + autogen at
+        # startup, which alone can take ~170s frozen and is far slower on USB /
+        # SD-card live media. A 30s start timeout SIGKILLs the process mid-import
+        # before it ever binds :6777, so the shell only ever sees "connection
+        # refused" and the crash-loop guard above burns through its attempts on a
+        # backend that was actually making progress. 600s covers cold USB boots.
+        TimeoutStartSec = 600;
         TimeoutStopSec = 15;
 
         # Security hardening
