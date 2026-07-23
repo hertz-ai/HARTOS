@@ -55,11 +55,25 @@ class _FakeUser:
     id = 42
 
 
+class _FakeQuery:
+    """Chainable no-op stand-in for the tiny query surface
+    whatsapp_get_qr() uses to upsert a UserChannelBinding once the
+    gateway reports authenticated=True — always reports "no existing
+    binding" so the route takes the insert branch instead of touching
+    real ORM state."""
+
+    def filter_by(self, **_):
+        return self
+
+    def first(self):
+        return None
+
+
 class _FakeDB:
     """Minimal duck-type matching what the require_auth wrapper +
-    proxy routes ever touch on g.db.  The proxy routes do not query
-    the DB at all, but the require_auth wrapper does commit() /
-    rollback() / close() / is_active around them."""
+    proxy routes ever touch on g.db: commit()/rollback()/close()/
+    is_active for the require_auth wrapper, plus query()/add()/flush()
+    for whatsapp_get_qr()'s binding upsert on authenticated=True."""
 
     is_active = True
 
@@ -70,6 +84,15 @@ class _FakeDB:
         return None
 
     def close(self):
+        return None
+
+    def query(self, *_a, **_kw):
+        return _FakeQuery()
+
+    def add(self, _obj):
+        return None
+
+    def flush(self):
         return None
 
 

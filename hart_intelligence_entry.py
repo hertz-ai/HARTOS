@@ -1946,14 +1946,28 @@ def get_vision_service():
     """Get the active VisionService instance.
 
     Checks module-level var first, then falls back to Nunba's
-    ``__main__._vision_service`` for bundled mode.
+    ``__main__._vision_service``; if that misses (cx_Freeze on macOS
+    mounts ``main.py`` under an opaque module name so neither ``__main__``
+    nor ``main`` matches), scans the live object graph for a
+    ``VisionService`` instance.  Safe because ``_start_vision_service``
+    only ever creates one.
     """
     if _vision_service is not None:
         return _vision_service
-    # Bundled mode: Nunba stores it on __main__
     main_mod = sys.modules.get('__main__')
     if main_mod:
-        return getattr(main_mod, '_vision_service', None)
+        _svc = getattr(main_mod, '_vision_service', None)
+        if _svc is not None:
+            return _svc
+    # cx_Freeze fallback: scan the heap.
+    try:
+        import gc
+        from integrations.vision.vision_service import VisionService
+        for _obj in gc.get_objects():
+            if isinstance(_obj, VisionService):
+                return _obj
+    except Exception:
+        pass
     return None
 
 
@@ -3558,6 +3572,17 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
                         _log.warning(
                             "gateway_qr: register_channel after pair "
                             "failed: %s", reg_err)
+                    # Live adapter: register_channel above only writes the
+                    # UserChannelBinding row (so the UI shows "connected")
+                    # — it never wires a real WhatsAppAdapter into the
+                    # running ChannelRegistry, so inbound messages never
+                    # reached the agent.  This is the actual transport.
+                    if channel_type == 'whatsapp':
+                        _adapter_out = _ensure_whatsapp_live_adapter(
+                            user_id, sid=sid, base=base)
+                        _log.info(
+                            "gateway_qr: live adapter registration: %s",
+                            _adapter_out)
                     # Chat success card.
                     try:
                         from core.platform.registry import get_registry
@@ -3589,15 +3614,91 @@ def _start_gateway_qr_pair_push(channel_type: str, meta: dict) -> None:
     ).start()
 
 
+def _ensure_whatsapp_live_adapter(
+    user_id, sid: str = None, base: str = None,
+) -> dict:
+    """Idempotently construct + register a live WhatsAppAdapter for an
+    already-authenticated gateway_qr session, wiring it into the
+    process-global ChannelRegistry so inbound WhatsApp messages reach
+    the agent (via FlaskChannelIntegration._handle_message) and
+    replies actually get sent back.
+
+    register_channel (agent_tools.py) only ever wrote the
+    UserChannelBinding DB row — it never did this.  Without a live
+    adapter subscribed to the gateway's WebSocket, "connected" in the
+    DB/UI was cosmetic: nothing was listening for real messages.
+
+    Known limitation (unchanged by this fix, not attempted here):
+    ChannelRegistry keys adapters by channel TYPE, not per user, so
+    only one live WhatsApp session can be registered process-wide at
+    a time.  Fine for a single-user desktop/local deployment; a real
+    multi-tenant cloud deployment needs a per-user registry — separate,
+    larger piece of work.
+    """
+    import asyncio as _aio
+    import os as _os
+
+    sid = sid or (
+        str(user_id) if str(user_id).startswith('user_')
+        else f"user_{user_id}"
+    )
+    log = logging.getLogger(__name__)
+    try:
+        from integrations.channels.flask_integration import (
+            get_channel_integration,
+        )
+        integration = get_channel_integration()
+
+        existing = integration.registry.get('whatsapp')
+        if existing is not None:
+            return {
+                'success': True,
+                'message': f'whatsapp adapter already registered '
+                           f'(account_id={getattr(existing, "_account_id", "?")})',
+            }
+
+        from integrations.channels.whatsapp_adapter import (
+            create_whatsapp_adapter,
+        )
+        gw_base = base or _os.environ.get(
+            'WHATSAPP_GATEWAY_URL',
+            f"http://127.0.0.1:"
+            f"{_os.environ.get('WHATSAPP_GATEWAY_PORT', '3000')}",
+        )
+        adapter = create_whatsapp_adapter(api_url=gw_base, account_id=sid)
+        integration.registry.register(adapter)
+
+        loop = integration._loop
+        if not (loop and loop.is_running()):
+            return {
+                'success': False,
+                'error': 'channel event loop not running '
+                         '(FlaskChannelIntegration.start() never called)',
+            }
+        _aio.run_coroutine_threadsafe(adapter.start(), loop)
+        log.info(
+            "whatsapp live adapter registration scheduled "
+            "(account_id=%s, base=%s)", sid, gw_base,
+        )
+        return {
+            'success': True,
+            'message': f'whatsapp adapter registration scheduled for {sid}',
+        }
+    except Exception as e:
+        log.warning("_ensure_whatsapp_live_adapter failed: %r", e)
+        return {'success': False, 'error': repr(e)[:300]}
+
+
 def _backfill_channel_binding_post_pair(
     channel_type: str, user_id: str,
 ) -> dict:
     """One-shot reconciliation: gateway says authenticated:true but
-    HARTOS has no UserChannelBinding for this channel/user.  Calls
-    register_channel('whatsapp', '{}') to close the gap.
-
-    Use this after any out-of-band pair (manual curl, prior session)
-    where the polling thread didn't get to run.  Idempotent.
+    HARTOS has no UserChannelBinding for this channel/user, OR the
+    binding exists but no live adapter is wired in (e.g. a pairing
+    done before _ensure_whatsapp_live_adapter existed, or an
+    out-of-band pair via manual curl / a prior session where the
+    polling thread never ran).  Calls register_channel('whatsapp', '{}')
+    to close the binding gap, then wires the live adapter. Idempotent.
     """
     try:
         from integrations.channels.agent_tools import (
@@ -3615,7 +3716,14 @@ def _backfill_channel_binding_post_pair(
         if reg is None:
             return {'success': False, 'error': 'register_channel unavailable'}
         out = reg(channel_type, '{}')
-        return {'success': True, 'message': str(out)[:400]}
+        adapter_out = None
+        if channel_type == 'whatsapp':
+            adapter_out = _ensure_whatsapp_live_adapter(user_id)
+        return {
+            'success': True,
+            'message': str(out)[:400],
+            'adapter': adapter_out,
+        }
     except Exception as e:
         return {'success': False, 'error': repr(e)[:300]}
 

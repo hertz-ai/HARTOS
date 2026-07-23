@@ -745,7 +745,7 @@ jobs:
   # `tag-and-sign` keeps `needs: gate-checks`, so nothing master-key-signed ever ships
   # untested. Nightlies are previews; signed releases stay strict.
   publish-nightly:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [build-iso, build-installers]
     runs-on: ubuntu-latest
     # Uploading ~6.5 GB of split ISO parts is comfortably under 90 min.

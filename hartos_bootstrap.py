@@ -429,12 +429,23 @@ def _init_channel_adapters(app, cfg: dict) -> None:
     in-process ``web`` adapter is always registered.
     """
     try:
-        from core.port_registry import get_port
+        from core.port_registry import get_local_backend_url
         from integrations.channels.flask_integration import init_channels
 
         backend_url = cfg.get('backend_chat_url')
         if not backend_url:
-            backend_url = f'http://localhost:{get_port("backend")}/chat'
+            # get_local_backend_url() probes which port is actually
+            # LISTENING (backend:6777 for a standalone server, flask:5000
+            # for the bundled desktop app serving HARTOS in-process) —
+            # the previous hardcoded get_port("backend") always pointed
+            # at :6777, which is dead in bundled mode. Every inbound
+            # channel message (web/Telegram/Discord/WhatsApp/...) posted
+            # to that dead port and silently fell back to "Sorry, an
+            # unexpected error occurred." — same resolver already used by
+            # FlaskChannelIntegration's own default + the dispatch Tier-2
+            # fallback (core/port_registry.py's docstring on that
+            # function), just not wired in here.
+            backend_url = get_local_backend_url() + '/chat'
 
         channels = init_channels(app, {
             'agent_api_url': backend_url,

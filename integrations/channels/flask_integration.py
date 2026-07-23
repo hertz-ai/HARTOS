@@ -333,7 +333,7 @@ class FlaskChannelIntegration:
             mod = importlib.import_module(module_path, package='integrations.channels')
             factory_fn = getattr(mod, factory_name)
             if token:
-                adapter = factory_fn(token=token, **kwargs)
+                adapter = factory_fn(**self._credential_kwarg(factory_fn, token), **kwargs)
             else:
                 adapter = factory_fn(**kwargs)
             self.registry.register(adapter)
@@ -342,6 +342,39 @@ class FlaskChannelIntegration:
         except Exception as e:
             logger.warning(f"{channel_type} adapter registration failed: {e}")
             return False
+
+    @staticmethod
+    def _credential_kwarg(factory_fn, token: str) -> Dict[str, str]:
+        """Map the caller's credential to the factory's OWN first parameter
+        name, instead of always assuming ``token=``.
+
+        Most adapter factories accept ``token``, but several don't:
+        ``create_whatsapp_adapter(api_url=...)`` and
+        ``create_signal_adapter(phone_number=..., api_url=...)`` both take
+        the credential under a different name.  Passing ``token=`` to
+        those either raised a TypeError (unexpected keyword argument) or —
+        worse, for factories with a stray **kwargs catch-all — silently
+        absorbed it into kwargs and left the real (required) parameter
+        None, so the factory raised its own "required" ValueError instead.
+        Either way, register_channel() failed for every credential-based
+        channel whose factory doesn't happen to name its parameter
+        ``token``. inspect the factory's actual signature instead of
+        guessing.
+        """
+        import inspect
+        try:
+            params = list(inspect.signature(factory_fn).parameters.values())
+        except (TypeError, ValueError):
+            return {'token': token}
+        names = [
+            p.name for p in params
+            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        ]
+        if 'token' in names:
+            return {'token': token}
+        if names:
+            return {names[0]: token}
+        return {'token': token}
 
     # Keep legacy methods as thin delegates for backward compat
     def register_telegram(self, token: str = None, **kwargs) -> None:

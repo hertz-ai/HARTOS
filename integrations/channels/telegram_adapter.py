@@ -99,11 +99,27 @@ class TelegramAdapter(ChannelAdapter, RoomCapableAdapter):
 
         try:
             # Build application
-            self._app = (
-                ApplicationBuilder()
-                .token(self.config.token)
-                .build()
-            )
+            builder = ApplicationBuilder().token(self.config.token)
+
+            # Optional self-hosted Bot API server override — Telegram's
+            # own documented "Local Bot API Server" feature
+            # (https://core.telegram.org/bots/api#using-a-local-bot-api-server),
+            # same override pattern as WhatsAppAdapter's webhook_url. Opt-in
+            # only (config.extra['api_base_url'] or TELEGRAM_API_BASE_URL
+            # env var) — when unset, behavior is byte-for-byte identical to
+            # before this change: real api.telegram.org, no override. Lets
+            # this adapter be pointed at a local/self-hosted server (or a
+            # test double implementing the same API) instead — useful for
+            # on-prem deployments and for testing the adapter without live
+            # Telegram credentials.
+            api_base_url = self.config.extra.get('api_base_url') or os.getenv('TELEGRAM_API_BASE_URL')
+            if api_base_url:
+                builder = builder.base_url(api_base_url.rstrip('/') + '/bot')
+                api_base_file_url = self.config.extra.get('api_base_file_url') or os.getenv('TELEGRAM_API_BASE_FILE_URL')
+                if api_base_file_url:
+                    builder = builder.base_file_url(api_base_file_url.rstrip('/') + '/file/bot')
+
+            self._app = builder.build()
             self._bot = self._app.bot
 
             # Get bot info
@@ -154,7 +170,15 @@ class TelegramAdapter(ChannelAdapter, RoomCapableAdapter):
             self._handle_message
         ))
         self._app.add_handler(MessageHandler(
-            filters.PHOTO | filters.VIDEO | filters.DOCUMENT | filters.AUDIO | filters.VOICE,
+            # filters.DOCUMENT doesn't exist in python-telegram-bot 21.x —
+            # renamed to the filters.Document class with an .ALL member.
+            # This crashed _register_handlers() unconditionally (every
+            # connect() call), which meant TelegramAdapter.connect() never
+            # got past handler registration to actually start polling —
+            # "Connected as @bot" logged, then a silent crash swallowed by
+            # base.py's channel-error sink, so the adapter LOOKED
+            # registered but never received a single message.
+            filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.VOICE,
             self._handle_media
         ))
 

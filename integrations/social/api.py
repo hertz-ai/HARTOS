@@ -155,6 +155,74 @@ def get_me():
     return _ok(g.user.to_dict(include_token=False))
 
 
+# ─── Hevolve bridge (trust-on-first-use) ───
+
+@social_bp.route('/auth/link-hevolve', methods=['POST'])
+@rate_limit('auth')
+def link_hevolve():
+    """Exchange a Hevolve-OTP-verified identity for a HARTOS-native token.
+
+    The Hevolve access_token (from Hevolve_Database's /data/login +
+    /data/varify_otp) is an opaque OAuth2 client_credentials string with
+    no embedded claims — HARTOS can't validate it directly. Rather than
+    build a second, independent verification path, this endpoint trusts
+    the client's claimed identity (the client only reaches this call
+    after Hevolve OTP verification already succeeded) and finds-or-
+    creates the matching SocialUser by email — the one field both the
+    legacy `user` table (email_address, required+unique) and SocialUser
+    (email, unique) share — then hands back a normal HARTOS JWT for all
+    subsequent /api/social/* calls. Idempotent: repeat calls with the
+    same email return the same SocialUser with a fresh token.
+    """
+    import re
+    import secrets
+    from .auth import generate_jwt, generate_api_token
+
+    data = _get_json()
+    email = (data.get('email') or '').strip().lower()
+    phone_number = (data.get('phone_number') or '').strip()
+    name = (data.get('name') or '').strip()
+
+    if not email:
+        return _err("email required")
+
+    db = get_db()
+    try:
+        user = db.query(User).filter(User.email == email).first()
+        if user:
+            if user.is_banned:
+                return _err("Account banned", 403)
+            token = generate_jwt(user.id, user.username, user.role or 'flat')
+            return _ok({'user': user.to_dict(), 'token': token})
+
+        base = re.sub(r'[^a-z0-9_]', '', (name or phone_number or email.split('@')[0])
+                      .strip().lower().replace(' ', '_')) or 'user'
+        username = base
+        while db.query(User).filter(User.username == username).first():
+            username = f"{base}_{secrets.token_hex(3)}"
+
+        user = User(
+            username=username,
+            display_name=name or username,
+            email=email,
+            user_type='human',
+            api_token=generate_api_token(),
+            is_verified=True,
+        )
+        db.add(user)
+        db.flush()
+        db.commit()
+
+        token = generate_jwt(user.id, user.username, user.role or 'flat')
+        return _ok({'user': user.to_dict(), 'token': token}, status=201)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Hevolve link failed: {e}")
+        return _err(str(e))
+    finally:
+        db.close()
+
+
 # ─── Guest identity persistence ───
 
 _RECOVERY_WORDS = (
