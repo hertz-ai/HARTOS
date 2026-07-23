@@ -212,19 +212,72 @@ def oauth_start(channel_type: str):
         return auth_err
 
     channel_type = (channel_type or '').lower().strip()
+    meta = get_channel_metadata(channel_type) or {}
+    nice = meta.get('display_name') or channel_type.title()
+
+    # Every error a tenant can trigger here has to read like a sentence, not
+    # a config note. This container is multitenant: the person hitting this
+    # is an end user connecting THEIR account, not the operator of the box.
+    # They cannot set an env var, do not know what one is, and may be reading
+    # in a second language. The operator-facing detail (which env var, which
+    # provider) goes to the log; the response carries a plain message plus a
+    # machine-readable `reason` so the app/agent can decide what to show or
+    # offer next (retry later, try a different channel, use paste-a-token).
     if not is_oauth_capable(channel_type):
+        # Not OAuth-capable can mean two very different things, and telling a
+        # layman the wrong one strands them: WhatsApp is not OAuth because it
+        # connects by scanning a QR from the phone, while an unknown name is
+        # just a typo. Point at the channel's REAL method (from its metadata)
+        # rather than blanket-suggesting "paste a token", which is wrong for
+        # WhatsApp and useless for a name that does not exist.
+        if not meta:
+            logger.info("oauth_start: unknown channel %r", channel_type)
+            return jsonify({
+                'success': False,
+                'reason': 'unknown_channel',
+                'channel': channel_type,
+                'error': f'We don\'t recognise a channel called "{channel_type}".',
+            }), 400
+
+        auth_method = meta.get('auth_method')
+        if auth_method == 'gateway_qr':
+            how = f"Connect {nice} by scanning a QR code from your phone."
+        else:
+            visible = [f for f in (meta.get('setup_fields') or [])
+                       if not f.get('auto')]
+            if visible:
+                how = (f"Add {nice} by pasting your "
+                       f"{visible[0].get('label') or 'token'}.")
+            else:
+                how = f"{nice} isn't ready to connect this way yet."
+        logger.info("oauth_start: %s is not OAuth-capable (auth_method=%s)",
+                    channel_type, auth_method)
         return jsonify({
             'success': False,
-            'error': f'Channel {channel_type!r} is not OAuth-capable.',
+            'reason': 'not_oauth',
+            'channel': channel_type,
+            'auth_method': auth_method,
+            'error': how,
         }), 400
     if not is_oauth_configured(channel_type):
+        # Not the tenant's fault and not the tenant's fix: the shared Hevolve
+        # app for this provider has not been switched on yet. Say exactly
+        # that, and keep the env-var names in the log for whoever runs the
+        # box.
+        logger.warning(
+            "oauth_start: %s requested but the shared OAuth app is not "
+            "configured (set HARTOS_OAUTH_CLIENT_%s and "
+            "HARTOS_OAUTH_SECRET_%s in the deploy env)",
+            channel_type, channel_type.upper(), channel_type.upper(),
+        )
         return jsonify({
             'success': False,
+            'reason': 'not_configured',
+            'channel': channel_type,
             'error': (
-                f'OAuth click-through is not configured for {channel_type}. '
-                f'Set HARTOS_OAUTH_CLIENT_{channel_type.upper()} and '
-                f'HARTOS_OAUTH_SECRET_{channel_type.upper()} env vars, or '
-                f'use the paste-token flow.'
+                f"Connecting {nice} isn't switched on yet. The Hevolve team "
+                f"still has to enable it. There's nothing you need to do, "
+                f"and it isn't a problem with your account."
             ),
         }), 400
 
