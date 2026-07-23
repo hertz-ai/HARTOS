@@ -224,6 +224,35 @@ jobs:
                 print(k, "=", str(m.get(k))[:120])
             PY
 
+            echo "=== Channel OAuth credentials (side env-file) ==="
+            # The "Connect a channel" click-through (Discord, Slack, etc.)
+            # reads HARTOS_OAUTH_CLIENT_<TYPE> / HARTOS_OAUTH_SECRET_<TYPE>.
+            # These cannot ride in the synthesised .env block above, because
+            # that block only runs when .env is ABSENT and on this box .env
+            # already exists and is deliberately left untouched. So they go in
+            # a separate file passed as a second --env-file, regenerated from
+            # one secret every deploy.
+            #
+            # ONE multi-line secret HARTOS_OAUTH_ENV holds the KEY=VALUE lines
+            # (HARTOS_OAUTH_CLIENT_DISCORD=..., HARTOS_OAUTH_SECRET_DISCORD=...,
+            # one per line) so the owner can enable ANY of the nine OAuth
+            # channels by editing one secret, without this workflow changing
+            # again. When the secret is unset the file is empty, no channel is
+            # configured, and the connect UI shows the layman "not switched on
+            # yet" message (6fad2576) instead of failing. Registering the
+            # provider app itself stays an owner action; this only carries the
+            # result so it survives redeploys.
+            umask 077
+            cat > oauth.env <<'OAUTH_EOF'
+            ${{ secrets.HARTOS_OAUTH_ENV }}
+            OAUTH_EOF
+            # Strip the leading indentation the YAML block adds to each line,
+            # so docker sees clean KEY=VALUE (leading spaces would make the
+            # key "   HARTOS_OAUTH_CLIENT_DISCORD" and silently never match).
+            sed -i 's/^[[:space:]]*//' oauth.env
+            _oauth_n="$(grep -cE '^HARTOS_OAUTH_(CLIENT|SECRET)_' oauth.env || true)"
+            echo "  oauth.env: $_oauth_n credential line(s) present"
+
             echo "=== Run central container ==="
             # Remember what was serving so a bad release can be put back. This
             # is the last moment :6777 goes away, and the new container is
@@ -237,6 +266,7 @@ jobs:
             sudo docker run -d --name langchain --restart unless-stopped \
               -p 6777:6777 \
               --env-file .env \
+              --env-file oauth.env \
               -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
               -e HARTOS_GIT_SHA="$DEPLOY_COMMIT" \
               -e HARTOS_IMAGE_TAG="$DEPLOY_COMMIT_SHORT" \
@@ -355,6 +385,7 @@ jobs:
               if sudo docker run -d --name langchain --restart unless-stopped \
                    -p 6777:6777 \
                    --env-file .env \
+                   --env-file oauth.env \
                    -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
                    -v "$(pwd)/config.json:/app/config.json:ro" \
                    -v ${{ secrets.DEPLOY_LOGS_PATH }}:/app/logs \
