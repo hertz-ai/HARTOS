@@ -72,6 +72,48 @@ TYPO_DOMAINS = {
     'outlok.com', 'rediffmai.com', 'gmail.con', 'yahoo.con',
 }
 
+# Addresses created while testing the product, not by people who want mail.
+#
+# These are why the first campaign bounced. The DB pull carried 10,095 of
+# them and a hand-written SQL filter caught those, but the filter lived in
+# the query rather than here -- so `classify()` never knew about test
+# accounts at all, and the 7,917 rows pulled separately went unfiltered.
+# Day 1's DB-sourced recipients bounced at 60%, worse than decade-old
+# archives, which is the signature of mailing accounts that were never real.
+# Putting the check here means every caller gets it: DB pulls, archive
+# imports, and any future source.
+#
+# Deliberately domain-based and deliberately short. `.test`, `.invalid`,
+# `.example` and `.localhost` are reserved by RFC 2606/6761 and can never be
+# real; `example.com/net/org` are reserved for documentation. `test.in` is
+# not reserved but is the one this account actually used
+# (`teacher1@test.in`, `client@test.in`, `test@test.in`).
+#
+# What is NOT here matters more. Test accounts at REAL providers -- the
+# `monismkjhjkhkkjc@gmail.com` kind -- are not detectable by pattern. A
+# keyboard-mash heuristic was tried against the live list and its first ten
+# hits included `bobbyjbryant@gmail.com` and `brandon.ml.scott@gmail.com`,
+# who are obviously people. Wrongly suppressing a real person is silent and
+# permanent, so no such rule is used. Those accounts are caught downstream
+# by bounces instead, which is slower but cannot delete a real reader.
+TEST_DOMAINS = {
+    'test.in', 'test.com', 'test.co', 'test.org', 'test.net',
+    'example.com', 'example.net', 'example.org',
+    'testing.com', 'demo.com', 'sample.com',
+}
+# RFC-reserved TLDs that resolve for nobody, ever.
+TEST_TLDS = ('.test', '.invalid', '.example', '.localhost', '.local')
+
+# Exact local parts only -- never a prefix match. `test` is a test account;
+# `tester@`, `testa@` or `testino@` could be somebody's name or handle, and
+# a startswith() rule would take them all. Checked against the 25,801-address
+# verified list before adding: zero matches, so this removes nobody who is
+# currently queued to receive anything.
+TEST_LOCALPARTS = {
+    'test', 'testing', 'testuser', 'test1', 'test123', 'testaccount',
+    'dummy', 'sample', 'asdf', 'qwerty', 'foo', 'bar', 'temp',
+}
+
 # Shared inboxes. Not invalid, but they belong to a function rather than a
 # person: lower engagement and a higher chance of being marked as spam.
 ROLE_LOCALPARTS = {
@@ -347,6 +389,10 @@ def classify(address: str, *, check_mx: bool = True) -> Tuple[bool, str]:
         return False, 'disposable_domain'
     if domain in TYPO_DOMAINS:
         return False, 'typo_domain'
+    if domain in TEST_DOMAINS or domain.endswith(TEST_TLDS):
+        return False, 'test_account'
+    if local in TEST_LOCALPARTS:
+        return False, 'test_account'
     if local in ROLE_LOCALPARTS:
         return False, 'role_account'
     if check_mx and not domain_has_mx(domain):

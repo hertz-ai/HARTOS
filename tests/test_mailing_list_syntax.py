@@ -454,3 +454,40 @@ def test_only_corpse_falsified_domains_are_verifiable():
     # And the ones measured as accept-all stay unknown.
     for d in ('hotmail.com', 'yahoo.com', 'aol.com'):
         assert mailbox_exists('x@' + d)[0] is None
+
+
+def test_classify_rejects_the_test_accounts_that_actually_bounced():
+    """The exact addresses behind day 1's 60% DB bounce rate.
+
+    These were caught by a filter written into a one-off SQL query rather
+    than into classify(), so a second pull of 7,917 rows went unfiltered and
+    mailed them. The rule belongs where every caller sees it.
+    """
+    for addr in ('teacher1@test.in', 'test@test.in', 'client@test.in'):
+        sendable, reason = classify(addr, check_mx=False)
+        assert not sendable
+        assert reason == 'test_account'
+
+
+def test_classify_rejects_rfc_reserved_test_domains():
+    for addr in ('someone@example.com', 'a@thing.localhost', 'b@host.invalid',
+                 'c@foo.test'):
+        sendable, reason = classify(addr, check_mx=False)
+        assert not sendable, addr
+        assert reason == 'test_account'
+
+
+def test_test_account_rule_does_not_take_real_people():
+    """The half of this that matters.
+
+    A prefix rule on 'test' would reject tester@, testino@ and contest@, and
+    a keyboard-mash heuristic tried against the live list flagged
+    bobbyjbryant@ and brandon.ml.scott@ in its first ten hits. Suppressing a
+    real reader is silent and permanent, so the rule matches exact local
+    parts only.
+    """
+    for addr in ('tester@gmail.com', 'testino@gmail.com', 'contest@gmail.com',
+                 'bobbyjbryant@gmail.com', 'brandon.ml.scott@gmail.com',
+                 'protest@gmail.com', 'latest@gmail.com'):
+        sendable, reason = classify(addr, check_mx=False)
+        assert sendable, '%s wrongly rejected as %s' % (addr, reason)
