@@ -424,6 +424,56 @@ class VRAMManager:
             except Exception as e:
                 logger.debug(f"PyTorch GPU detection failed: {e}")
 
+        # 2b) Windows WMI — last-resort NVIDIA detection. nvidia-smi needs
+        # nvml.dll, which is MISSING on partial/old driver installs (seen on a
+        # 940MX: nvidia-smi in the DriverStore but nvml.dll absent), so all the
+        # probes above fail even though the card is physically present. WMI
+        # (Get-CimInstance, via run_bounded — NOT wmic, which can hang for 27min)
+        # still reports the adapter name + driver version — enough to say "GPU
+        # present but its driver is too old, update it" instead of "no GPU".
+        if sys.platform == "win32" and not info.get("name"):
+            try:
+                result = run_bounded(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                     "$g = Get-CimInstance Win32_VideoController | "
+                     "Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1; "
+                     "if ($g) { \"$($g.Name)|$($g.DriverVersion)|$($g.AdapterRAM)\" }"],
+                    timeout=_nvsmi_timeout,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    parts = [p.strip() for p in result.stdout.strip().split("|")]
+                    if len(parts) >= 2 and parts[0]:
+                        driver_str = parts[1] or None
+                        driver_ok = _nvidia_driver_supports_cuda12(driver_str)
+                        total_gb = 0.0
+                        try:
+                            if len(parts) >= 3 and parts[2]:
+                                total_gb = round(float(parts[2]) / (1024 ** 3), 2)
+                        except (ValueError, TypeError):
+                            pass
+                        info.update({
+                            "name": parts[0],
+                            "total_gb": total_gb,
+                            "free_gb": 0.0,  # WMI can't report free VRAM
+                            "cuda_available": driver_ok,
+                            "driver_version": driver_str,
+                            "driver_cuda_ok": driver_ok,
+                            "detected_via": "wmi",
+                        })
+                        if not driver_ok:
+                            logger.warning(
+                                f"GPU {info['name']} present (driver {driver_str}, "
+                                f"via WMI) but too old for the CUDA-12 runtime — "
+                                f"inference stays on CPU. Update the NVIDIA driver "
+                                f"to enable GPU."
+                            )
+                        self._gpu_info = info
+                        return info
+            except FileNotFoundError:
+                logger.debug("WMI GPU detection: powershell not on PATH")
+            except Exception as e:
+                logger.debug(f"WMI GPU detection failed: {e}")
+
         # 3) macOS Metal
         if sys.platform == "darwin":
             try:
