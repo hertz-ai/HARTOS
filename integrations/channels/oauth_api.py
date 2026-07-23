@@ -107,7 +107,13 @@ def _require_user() -> Optional[Tuple[Response, int]]:
             db.close()
         return jsonify({'success': False, 'error': 'Invalid token'}), 401
     g.user = user
-    g.user_id = int(user.id)
+    # user.id is a UUID string, not an int. int(user.id) raised
+    # ValueError on every real user and 500'd the connect flow -- the
+    # exact bug that code review missed and only a live token exposed.
+    # Match the working @require_auth path (social/auth.py), which stores
+    # str(user.id). The value only has to round-trip through the OAuth
+    # state store and back, so a string is correct.
+    g.user_id = str(user.id)
     g.db = db
     return None
 
@@ -141,7 +147,7 @@ def _oauth_teardown(exc):
 # the client if they need correlation.
 
 def build_authorize_url(
-    user_id: int,
+    user_id: str,
     channel_type: str,
     return_to: str = '',
 ) -> Tuple[str, str]:

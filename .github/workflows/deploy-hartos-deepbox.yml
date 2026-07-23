@@ -270,6 +270,7 @@ jobs:
               -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
               -e HARTOS_GIT_SHA="$DEPLOY_COMMIT" \
               -e HARTOS_IMAGE_TAG="$DEPLOY_COMMIT_SHORT" \
+              -e WHATSAPP_API_URL="http://172.17.0.1:3000" \
               -v "$(pwd)/config.json:/app/config.json:ro" \
               -v "$(pwd)/release_manifest.json:/app/release_manifest.json:ro" \
               -v ${{ secrets.DEPLOY_LOGS_PATH }}:/app/logs \
@@ -387,6 +388,7 @@ jobs:
                    --env-file .env \
                    --env-file oauth.env \
                    -e HEVOLVE_MASTER_PRIVATE_KEY="$(sudo cat ${{ secrets.DEPLOY_MASTER_KEY_PATH }})" \
+                   -e WHATSAPP_API_URL="http://172.17.0.1:3000" \
                    -v "$(pwd)/config.json:/app/config.json:ro" \
                    -v ${{ secrets.DEPLOY_LOGS_PATH }}:/app/logs \
                    -v ${{ secrets.DEPLOY_IMAGES_PATH }}:/app/output_images \
