@@ -89,6 +89,10 @@ class NodeWatchdog:
         self._thread: Optional[threading.Thread] = None
         self._restart_log: List[Dict] = []
         self._started_at: Optional[float] = None
+        # Timestamp of the last COMPLETED check pass. get_health derives real
+        # liveness from this + the thread, not from the _running intent flag — a
+        # monitor whose loop died must not keep reporting 'healthy' (2026-07-24).
+        self._last_check_at: Optional[float] = None
         # Fleet-wide restart budget — timestamps (monotonic seconds) of every
         # restart across every thread. Rolling window pruned in _restart_thread.
         # Breach → self._fleet_halted = True; no further restarts until cleared.
@@ -264,7 +268,9 @@ class NodeWatchdog:
             fleet_recent = len(self._fleet_restart_times)
             fleet_halted = self._fleet_halted
         return {
-            'watchdog': 'healthy' if self._running else 'stopped',
+            'watchdog': self._watchdog_liveness(now),
+            'last_check_age_seconds': (round(now - self._last_check_at, 1)
+                                       if self._last_check_at is not None else None),
             'uptime_seconds': uptime,
             'threads': threads,
             'restart_log': list(self._restart_log[-20:]),  # last 20 events
@@ -273,6 +279,31 @@ class NodeWatchdog:
             'fleet_restart_ceiling': FLEET_RESTART_MAX,
             'fleet_halted': fleet_halted,
         }
+
+    def _watchdog_liveness(self, now: float) -> str:
+        """Real health of the monitor ITSELF, derived from the thread — not the
+        `_running` intent flag. 'healthy' used to be hardcoded to `self._running`,
+        so a monitor whose _check_loop thread died (an unguarded exception) reported
+        healthy forever while restarting nothing — the root of the whole recovery
+        tree, silently dead. Report the truth so callers/dashboards can escalate:
+          stopped  -> stop() was called (or never started)
+          dead     -> we still intend to run but the loop thread is not alive
+          stalled  -> thread alive but no check pass completed within 2x the interval
+                      (livelocked inside a check)
+          healthy  -> running, thread alive, a recent completed pass
+        """
+        if not self._running:
+            return 'stopped'
+        if self._thread is None or not self._thread.is_alive():
+            return 'dead'
+        stale_after = 2 * self._check_interval
+        if self._last_check_at is not None:
+            if (now - self._last_check_at) > stale_after:
+                return 'stalled'
+        elif self._started_at is not None and (now - self._started_at) > stale_after:
+            # Alive but never completed a first pass in time.
+            return 'stalled'
+        return 'healthy'
 
     def clear_fleet_halt(self) -> None:
         """Clear the fleet-wide restart halt flag (manual recovery).
@@ -287,12 +318,25 @@ class NodeWatchdog:
         logger.critical("Watchdog: fleet halt cleared — restarts re-enabled")
 
     def _check_loop(self) -> None:
-        """Background loop: check heartbeats, restart frozen threads."""
+        """Background loop: check heartbeats, restart frozen threads.
+
+        The _check_all() body is GUARDED: a single bad pass (an exception from a
+        thread's health probe, a transient registry mutation) must NEVER kill the
+        monitor thread and leave get_health() reporting 'healthy' from a dead loop
+        (the 2026-07-24 false-healthy bug — the root of the whole recovery tree,
+        itself unmonitored). We log and keep looping; get_health derives real
+        liveness from the thread + the last-completed-check age below.
+        """
         while self._running:
             time.sleep(self._check_interval)
             if not self._running:
                 break
-            self._check_all()
+            try:
+                self._check_all()
+                self._last_check_at = time.time()
+            except Exception:
+                logger.exception(
+                    "NodeWatchdog: check pass failed; loop continues (not fatal)")
 
     def _check_all(self) -> None:
         """Single check pass over all threads."""
