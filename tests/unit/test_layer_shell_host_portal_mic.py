@@ -340,6 +340,12 @@ class TestWebProcessCrashRecoveryParity:
             # plugin dir and the capture elements stay invisible.
             assert 'makeSearchPathOutput "out" "lib/gstreamer-1.0"' in src, (
                 f"{name} must resolve gstreamer plugins from the 'out' output")
+            # The plugins live under pkgs.gst_all_1, NOT top-level pkgs -- the bare
+            # `gstreamer` attribute is an UNDEFINED VARIABLE that broke iso-desktop
+            # (2026-07-24). Both hosts must scope them the same, correct way.
+            assert "gst_all_1" in src, (
+                f"{name} must scope GStreamer plugins under pkgs.gst_all_1 "
+                "(top-level `gstreamer` is undefined and fails the nix build)")
 
     def test_both_hosts_wire_web_process_terminated_to_exit(self, cage_src, host_src):
         for name, src in (("cage floor", cage_src), ("GTK4 host", host_src)):

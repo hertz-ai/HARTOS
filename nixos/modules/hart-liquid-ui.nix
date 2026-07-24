@@ -84,9 +84,13 @@ let
   # so the floor is safe on the same path. makeSearchPathOutput "out", NOT plain
   # makeSearchPath: gstreamer core's DEFAULT output is `bin`, so plain makeSearchPath
   # resolves an empty plugin dir and the elements stay invisible.
-  gstCapturePlugins = with pkgs; [
+  # The GStreamer packages live under pkgs.gst_all_1 (NOT top-level pkgs -- the
+  # bare `gstreamer` attr does not exist, which broke iso-desktop with "undefined
+  # variable 'gstreamer'"). Mirror the GTK4 host exactly, incl. pipewiresrc for the
+  # PipeWire desktop.
+  gstCapturePlugins = (with pkgs.gst_all_1; [
     gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad
-  ];
+  ]) ++ [ pkgs.pipewire ];
   gstPluginPath = lib.makeSearchPathOutput "out" "lib/gstreamer-1.0" gstCapturePlugins;
   glassShell = pkgs.writeShellScriptBin "hart-glass-shell" ''
     set -euo pipefail
