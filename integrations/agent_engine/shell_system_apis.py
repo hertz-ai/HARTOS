@@ -611,8 +611,19 @@ def register_shell_system_routes(app):
             import psutil
         except ImportError:
             return jsonify({'partitions': [], 'error': 'psutil not available'})
+        # Exclude read-only image mounts (squashfs / iso9660 on the live ISO, any ro
+        # loop image) and overlay/pseudo filesystems: the squashfs Nix store is ALWAYS
+        # 100% full by nature, so counting it made the Storage panel alarm at ~100% for
+        # no real reason (audit #0.4 -- the "Disk 100%" seen on the live ISO). psutil's
+        # all=False does NOT drop these (a squashfs has a real loop device + fstype), so
+        # filter explicitly; only writable, real storage is aggregated.
+        _SKIP_FSTYPES = {'squashfs', 'iso9660', 'overlay', 'ramfs'}
         partitions = []
         for part in psutil.disk_partitions(all=False):
+            if (part.fstype or '').lower() in _SKIP_FSTYPES:
+                continue
+            if 'ro' in (part.opts or '').split(','):
+                continue
             try:
                 usage = psutil.disk_usage(part.mountpoint)
                 partitions.append({
