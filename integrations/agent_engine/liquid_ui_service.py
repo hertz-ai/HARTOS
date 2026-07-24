@@ -1512,6 +1512,17 @@ class LiquidUIService:
         # software-render hardware, not just on the theme tier.
         is_potato = perf.get('disable_blur', False) or gpu_mode == 'software'
 
+        # Which product this shell is serving — HART OS (the OS itself) vs the Nunba
+        # desktop companion. Drives the right-click "Ask <Product>" menu label
+        # (hartAskMenu.js) so it names what the user actually installed. is_os_mode()
+        # is the ONE canonical signal (HART_OS_MODE env / OS-mode port scheme).
+        try:
+            from core.port_registry import is_os_mode
+            hart_product = 'HART' if is_os_mode() else 'Nunba'
+        except Exception:
+            logger.exception("render_desktop_shell: is_os_mode probe failed")
+            hart_product = 'HART'
+
         # Ambient cinematic glow emission (2026-07-01, degrade-gracefully): the 3
         # drifting brand blooms are the single biggest "looks rich" lever (the
         # mockup paints them). On a SOFTWARE-rendered box we now STILL emit them —
@@ -3002,6 +3013,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <script defer src="/shell/static/hartHome.js"></script>
 <script defer src="/shell/static/hartBloom.js"></script>
 <script defer src="/shell/static/hartDesktop.js"></script>
+<script defer src="/shell/static/hartAskMenu.js"></script>
 <script defer src="/shell/static/hartWorkspaces.js"></script>
 <script defer src="/shell/static/hartEffects.js"></script>
 <script defer src="/shell/static/hartPersonalize.js"></script>
@@ -3204,6 +3216,10 @@ const PERF = {{
 // can read the SAME software-render gate (potato) without depending on the
 // inline-script const being reachable across script tags. Single source: PERF.
 window.HART_PERF = PERF;
+
+// Which product the user installed (HART OS vs the Nunba desktop companion) — the
+// right-click "Ask <Product>" menu (hartAskMenu.js) brands to it.
+window.HART_PRODUCT = '{hart_product}';
 
 // ═══ State ═══
 let panels = {{}};
