@@ -821,6 +821,11 @@ class LiquidUIService:
         self._agent_components: Dict[str, List[dict]] = {}
         self._a2ui_buckets: Dict[str, tuple] = {}   # agent_id -> (tokens, ts)
         self._lock = threading.Lock()
+        # Wakes the /api/notifications/stream SSE producer the instant an agent
+        # pushes a component, instead of the old 2s server-side poll. Dedicated CV
+        # (NOT self._lock) so the producer never holds self._lock while waiting and
+        # cannot deadlock with the writer's lock order. agent_ui_update notifies it.
+        self._ui_event_cv = threading.Condition()
         self._running = False
         self._model_available = False
 
@@ -1048,7 +1053,7 @@ class LiquidUIService:
         except Exception:
             logger.exception("agent_ui_update: swallowed Exception")
 
-        # 1. Store for SSE polling (Nunba web LiquidUI)
+        # 1. Store for the SSE stream (Nunba web LiquidUI)
         with self._lock:
             if agent_id not in self._agent_components:
                 self._agent_components[agent_id] = []
@@ -1056,6 +1061,12 @@ class LiquidUIService:
             if len(self._agent_components[agent_id]) > 5:
                 self._agent_components[agent_id] = \
                     self._agent_components[agent_id][-5:]
+        # Wake the SSE producer NOW (event-driven) instead of letting it discover
+        # this on its next 2s poll — the component is already stored, so a woken
+        # stream re-scans and emits it immediately. notify_all covers every open
+        # stream; a missed wake still self-heals on the producer's safety timeout.
+        with self._ui_event_cv:
+            self._ui_event_cv.notify_all()
 
         # 2. Push to EventBus → WAMP → Android/iOS/Desktop
         # The WAMP bridge (core/platform/events.py) auto-publishes to
@@ -7718,23 +7729,41 @@ function renderAgentOverlay(ev) {{
         def notification_stream():
             import time as _time
 
+            def _collect(since):
+                # Lock-free snapshot (unchanged from the old poll): ALL component
+                # types newer than the caller's cursor, stamped with their agent.
+                out = []
+                for agent_id, comps in list(self._agent_components.items()):
+                    for c in comps:
+                        if c.get('_ts', 0) > since:
+                            event = dict(c)
+                            event['agent'] = agent_id
+                            out.append(event)
+                return out
+
             def generate():
                 last_check = _time.time()
+                # EVENT-DRIVEN (was a 2s server-side poll that capped the latency of
+                # every A2UI card / notification / desktop compose — the "Liquid UI
+                # is the heart" path). Block on the CV until agent_ui_update pushes a
+                # component (woken instantly); the 15s timeout is a safety net +
+                # SSE keep-alive that self-heals a missed wake. The check-then-wait
+                # is atomic under the CV so a push between them can't be lost. The
+                # producer holds ONLY the CV (never self._lock) -> no deadlock with
+                # the writer's lock order.
                 while True:
-                    _time.sleep(2)  # 2s for snappier live updates
-                    events = []
-                    for agent_id, comps in list(
-                            self._agent_components.items()):
-                        for c in comps:
-                            ts = c.get('_ts', 0)
-                            if ts > last_check:
-                                # Push ALL component types — not just notifications
-                                event = dict(c)
-                                event['agent'] = agent_id
-                                events.append(event)
-                    last_check = _time.time()
+                    with self._ui_event_cv:
+                        events = _collect(last_check)
+                        if not events:
+                            self._ui_event_cv.wait(timeout=15.0)
+                            events = _collect(last_check)
+                        last_check = _time.time()
                     if events:
                         yield f"data: {json.dumps(events)}\n\n"
+                    else:
+                        # SSE comment: keeps the stream warm through proxies,
+                        # ignored by the browser EventSource.
+                        yield ": hb\n\n"
             return Response(
                 generate(), mimetype='text/event-stream',
                 headers={
