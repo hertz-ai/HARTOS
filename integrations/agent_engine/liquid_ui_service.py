@@ -1501,7 +1501,21 @@ class LiquidUIService:
         # runtime rung (/run/hart/session/shell-render) with the LIQUID_UI_PREFER_HW_GL override;
         # reuse it here (ONE derivation, no second read path).
         # webkit-flat == "backdrop-filter blur won't paint" == solidify the glass.
-        flat_body_class = '' if webkit_compositing else ' webkit-flat'
+        #
+        # 2026-07-24 real-HW bug: the 2026-07-19 ladder change keyed this off the
+        # rung-based `webkit_compositing`, but backdrop-filter BLUR paints only when
+        # WebKit ACCELERATED COMPOSITING is on -- which the host enables ONLY under
+        # preferHardwareGL, NOT from the GSK rung. webkit-cairo composites transforms
+        # (so gpu-hardware/animations are right) but its WebView is cairo, so its blur
+        # NEVER paints -> the glass read see-through and the home bled THROUGH the App
+        # Store panel. Restore the CSS-documented signal (hartResponsive.css:478:
+        # "webkit-flat from LIQUID_UI_PREFER_HW_GL, decoupled from the gpu tier"):
+        # solidify the glass unless blur ACTUALLY composites. Decoupled from gpu_mode,
+        # so a GPU rung still lights the micro-animations while the glass is OPAQUE +
+        # legible -- alive AND readable, never bleeding-through. (Frosted glass returns
+        # once WebKit accelerated compositing is stable == the "chase blur next" work.)
+        blur_composites = os.environ.get('LIQUID_UI_PREFER_HW_GL') == '1'
+        flat_body_class = '' if blur_composites else ' webkit-flat'
 
         # Potato (reduced-effects) tier: TRUE when the theme disables blur OR the
         # box is software-rendered. The GPU-only cinematic (backdrop blur, layered

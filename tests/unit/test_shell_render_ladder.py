@@ -57,13 +57,29 @@ def test_read_shell_render_mode_fail_software(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize('rung', ['vulkan', 'webkit-cairo'])
-def test_gpu_rungs_light_up_gpu_hardware(monkeypatch, rung):
-    """Both GPU rungs (with the compositor GLES probe = hardware) emit
-    body.gpu-hardware and NOT webkit-flat -> the micro-animations + live glass turn
-    on. This is the whole point of the ladder."""
-    cls = _body_class(monkeypatch, rung, gpu='hardware')
-    assert 'gpu-hardware' in cls, f'{rung} did not light up gpu-hardware (got {cls!r})'
-    assert 'webkit-flat' not in cls, f'{rung} still solidifies glass (got {cls!r})'
+def test_gpu_rungs_light_animations_but_glass_opaque_without_blur(monkeypatch, rung):
+    """A GPU rung lights the micro-animations (body.gpu-hardware) so the desktop is
+    ALIVE -- but the glass stays OPAQUE (body.webkit-flat) because backdrop-blur
+    composites ONLY under WebKit accelerated compositing (preferHardwareGL), NOT from
+    the GSK rung. webkit-cairo composites transforms yet its WebView is cairo, so its
+    blur never paints; keying the glass off the rung left it see-through and the home
+    bled THROUGH the App Store panel (2026-07-24). Alive AND legible: the two signals
+    are decoupled."""
+    cls = _body_class(monkeypatch, rung, gpu='hardware')   # no force-on env (fixture)
+    assert 'gpu-hardware' in cls, f'{rung} did not light gpu-hardware/animations (got {cls!r})'
+    assert 'webkit-flat' in cls, (
+        f'{rung} glass is NOT solidified without blur -> it would read see-through '
+        f'(got {cls!r})')
+
+
+def test_force_hw_gl_gives_frosted_glass(monkeypatch):
+    """LIQUID_UI_PREFER_HW_GL == '1' is the ONE signal that backdrop-blur actually
+    composites (WebKit accelerated compositing on) -> frosted glass: gpu-hardware AND
+    NO webkit-flat. This is the 'chase blur next' path; the default node stays opaque."""
+    monkeypatch.setenv('LIQUID_UI_PREFER_HW_GL', '1')
+    cls = _body_class(monkeypatch, 'webkit-cairo', gpu='hardware')
+    assert 'gpu-hardware' in cls and 'webkit-flat' not in cls, (
+        f'force-on (blur composites) must give frosted glass, not opaque (got {cls!r})')
 
 
 def test_software_rung_stays_flat_floor(monkeypatch):
