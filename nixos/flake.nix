@@ -404,9 +404,37 @@
         ] ++ extraModules;
       };
 
-    # Build an image via nixos-generators (for non-ISO formats)
+    # Build a bootable UEFI raw disk image WITHOUT qemu, via systemd-repart.
+    # Assembles ESP + root OFFLINE in the Nix sandbox (fakeroot systemd-repart in
+    # stdenvNoCC) -> config.system.build.image. This is the no-VM replacement for
+    # nixos-generators' raw-efi (make-disk-image), whose qemu leg ran ~5h and blew
+    # the CI 300-min cap. Keeps hartImageKind = "raw" so the variant config drops
+    # the CD profile + adds first-boot growth exactly as the generators path did;
+    # the extra module (hart-repart-image) owns the fileSystems + bootloader the
+    # generators format used to provide.
+    mkRepartImage = { system, variant, extraModules ? [] }:
+      (nixpkgs.lib.nixosSystem {
+        inherit system;
+        specialArgs = mkSpecialArgs variant // { hartImageKind = "raw"; };
+        modules = hartModules ++ [
+          { nixpkgs.config = nixpkgsConfig; }  # single source — #70
+          ./configurations/${variant}.nix
+          ./modules/hart-repart-image.nix      # repart + systemd-boot/UKI + fs + growth
+        ] ++ extraModules;
+      }).config.system.build.image;
+
+    # Build an image via nixos-generators (for non-ISO formats).
+    #
+    # raw-efi for the DESKTOP now takes the no-VM systemd-repart path (mkRepartImage).
+    # Every other format (qcow/vmware/vbox/docker/cloud/sd) AND the not-yet-migrated
+    # raw-server / raw-edge keep nixos-generators unchanged (no regression) — those
+    # variants import the installation-CD profile + isoImage UNCONDITIONALLY, so
+    # routing them through repart would double-define fileSystems."/"; they migrate
+    # only after gaining desktop.nix's `hartImageKind == "iso"` import guard.
     mkImage = { system, variant, format, extraModules ? [] }:
-      nixos-generators.nixosGenerate {
+      if format == "raw-efi" && variant == "desktop"
+      then mkRepartImage { inherit system variant extraModules; }
+      else nixos-generators.nixosGenerate {
         inherit system format;
         # hartImageKind = "raw": these formats are INSTALLED systems (writable
         # root disk image), not live media. The variant config drops the CD

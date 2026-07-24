@@ -257,8 +257,11 @@ jobs:
       # (closure done in 30 min) and STILL hit the 5h wall. This is the
       # GitHub-documented KVM enable recipe (same one Android-emulator jobs
       # use); with -enable-kvm the image step is minutes, not hours.
-      - name: Enable KVM for the image-assembly VM (raw only)
-        if: startsWith(matrix.target, 'raw-')
+      # raw-desktop now builds via systemd-repart (no qemu VM) -> it needs neither
+      # KVM nor a disabled sandbox. This step stays only for the still-generators
+      # raw-server / raw-edge (not in the CI matrix today, kept correct for later).
+      - name: Enable KVM for the image-assembly VM (raw only, non-repart)
+        if: startsWith(matrix.target, 'raw-') && matrix.target != 'raw-desktop'
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -294,8 +297,8 @@ jobs:
       # so the image VM stayed sandboxed away from /dev/kvm and ground on TCG.
       # A daemon-level nix.conf line cannot be ignored. Applied only on raw
       # legs; ISO legs keep the sandbox.
-      - name: Disable nix sandbox daemon-wide (raw only)
-        if: startsWith(matrix.target, 'raw-')
+      - name: Disable nix sandbox daemon-wide (raw only, non-repart)
+        if: startsWith(matrix.target, 'raw-') && matrix.target != 'raw-desktop'
         run: |
           echo 'sandbox = false' | sudo tee -a /etc/nix/nix.conf
           sudo systemctl restart nix-daemon || sudo systemctl restart determinate-nixd || true
@@ -408,17 +411,15 @@ jobs:
           # pipefail + set -e: `tee` no longer hides a failed `nix build`.
           # Retry once: the magic-nix-cache GitHub API is rate-limited
           # and transient 429s shouldn't break a 90-minute OS build.
-          # raw-*: build with the sandbox OFF. make-disk-image assembles the
-          # image inside a qemu VM, and the nix sandbox only passes /dev/kvm
-          # through when the derivation itself demands the kvm feature -- on
-          # this pin it evidently does not, so the VM ran under TCG software
-          # emulation even with host /dev/kvm at 0666 + the kvm system-feature
-          # advertised (runs 29551668370 and 29565871234: 4h+ inside
-          # nixos-disk-image.drv). sandbox=false lets the builder see the
-          # host's /dev/kvm directly, so qemu engages KVM. CI-only, raw-only;
-          # the ISO legs keep the sandbox.
+          # sandbox OFF only for the still-generators raw-server/raw-edge:
+          # make-disk-image assembles the image inside a qemu VM and needs the
+          # builder to see the host's /dev/kvm directly (the nix sandbox hid it,
+          # so qemu ran under TCG -- runs 29551668370/29565871234: 4h+ inside
+          # nixos-disk-image.drv). raw-DESKTOP now builds via systemd-repart
+          # (fakeroot systemd-repart in stdenvNoCC, no qemu) and builds WITH the
+          # sandbox, exactly like the ISO legs -- so it is excluded here.
           SANDBOX_OPT=""
-          if [[ "${{ matrix.target }}" == raw-* ]]; then
+          if [[ "${{ matrix.target }}" == raw-* && "${{ matrix.target }}" != raw-desktop ]]; then
             SANDBOX_OPT="--option sandbox false"
           fi
           for attempt in 1 2; do
