@@ -191,23 +191,69 @@ in
 
       environment.systemPackages = [ pkgs.gnome-software ];
 
-      # Auto-add Flathub on first boot
+      # Auto-add Flathub — EVENT-DRIVEN, not polled.
+      #
+      # 2026-07-24 real-HW bug (nightly-0d7c84f journal): on the potato node,
+      # network-online.target fired ~5 min BEFORE DNS was actually reachable, so
+      # `remote-add` failed with "Could not resolve hostname". The old script then
+      # `touch`ed the success marker UNCONDITIONALLY, so ConditionPathExists
+      # permanently blocked any retry -> Flathub was never added and every App
+      # Store install failed ("flatpak not installed" / Retry) until the marker was
+      # cleared by hand.
+      #
+      # The unit makes ONE attempt and writes the marker ONLY on success. It does
+      # NOT poll: recovery is driven by the actual connectivity EVENT — a
+      # NetworkManager dispatcher (below) starts this oneshot each time an
+      # interface comes up / gets a lease / connectivity changes. ConditionPathExists
+      # makes a re-start a clean no-op once the remote is added, and re-runs
+      # remote-add if the boot-time attempt failed because DNS wasn't up yet. No
+      # timer, no sleep loop, no arbitrary give-up window.
       systemd.services.hart-flathub-init = {
         description = "Add Flathub Repository";
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
         wantedBy = [ "multi-user.target" ];
+        # Only skip once the remote is ACTUALLY added (marker written on success).
         unitConfig.ConditionPathExists = "!/var/lib/flatpak/.flathub-added";
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
           ExecStart = pkgs.writeShellScript "add-flathub" ''
-            ${pkgs.flatpak}/bin/flatpak remote-add --if-not-exists \
-              flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-            touch /var/lib/flatpak/.flathub-added
+            set -u
+            # remote-add fetches the .flatpakrepo (URL + GPG key), so it needs DNS.
+            # ONE attempt; the marker is written ONLY on success, so a transient
+            # DNS failure records nothing and the connectivity-event dispatcher
+            # re-runs this later (and next boot too, marker absent).
+            if ${pkgs.flatpak}/bin/flatpak remote-add --if-not-exists \
+                 flathub https://dl.flathub.org/repo/flathub.flatpakrepo; then
+              mkdir -p /var/lib/flatpak
+              touch /var/lib/flatpak/.flathub-added
+              echo "[hart-flathub-init] flathub remote added"
+              exit 0
+            fi
+            echo "[hart-flathub-init] remote-add failed: network/DNS not ready; the NetworkManager dispatcher will re-run this on the next connectivity event" >&2
+            exit 1
           '';
         };
       };
+
+      # The connectivity EVENT source. NetworkManager runs this on every
+      # interface up / DHCP lease / connectivity-state change ($1=iface, $2=action).
+      # When the network genuinely arrives (which on this node was ~5 min after
+      # network-online.target), it (re)starts hart-flathub-init exactly once per
+      # event — the missing "internet is here now" signal that a boot-time oneshot
+      # alone never gets. `--no-block` returns immediately; the oneshot's
+      # ConditionPathExists guarantees at-most-once real work.
+      networking.networkmanager.dispatcherScripts = [{
+        type = "basic";
+        source = pkgs.writeShellScript "flathub-on-connectivity" ''
+          case "$2" in
+            up|connectivity-change|dhcp4-change|dhcp6-change)
+              ${pkgs.systemd}/bin/systemctl start --no-block hart-flathub-init.service || true
+              ;;
+          esac
+        '';
+      }];
     })
 
     # ── AppImage ──
