@@ -59,6 +59,15 @@ class WorldModelBridge:
         atexit.register(lambda: self._flush_executor.shutdown(wait=False))
         self._flush_batch_size = int(os.environ.get(
             'HEVOLVE_WM_FLUSH_BATCH', '50'))
+        # Real-throughput signal for check_health: WHEN experiences last actually
+        # reached the world model (a completed flush), not just whether the provider
+        # object exists. learning_active is derived from this, so a bridge that is
+        # reachable but flushing nothing -- the 50-batch buffer filling into the void,
+        # the local-model 0-spark trap -- honestly reports learning_active=False
+        # instead of a hardcoded True (audit #1.3).
+        self._last_flush_at = None
+        self._active_window_s = float(os.environ.get(
+            'HEVOLVE_WM_ACTIVE_WINDOW', '300'))
         self._lock = threading.Lock()
         self._stats = {
             'total_recorded': 0,
@@ -798,6 +807,7 @@ class WorldModelBridge:
                     )
                     with self._lock:
                         self._stats['total_flushed'] += 1
+                        self._last_flush_at = time.time()
                 except Exception as e:
                     logger.debug(f"In-process flush error: {e}")
             return
@@ -854,6 +864,7 @@ class WorldModelBridge:
                 self._cb_record_success()
                 with self._lock:
                     self._stats['total_flushed'] += 1
+                    self._last_flush_at = time.time()
                     _first_flush = self._stats['total_flushed'] == 1
                 # One-time log on first successful HTTP flush so operators
                 # see Direction A go live without grepping for tensorboard
@@ -1707,18 +1718,45 @@ class WorldModelBridge:
 
     # ─── Health ──────────────────────────────────────────────────────
 
+    def _learning_active(self, now: float = None) -> bool:
+        """True ONLY when experiences have actually reached the world model recently
+        (a completed flush within the active window) — not because the provider object
+        exists or /health returned 200. A reachable bridge that is buffering into the
+        void reports False here, the honest signal (audit #1.3)."""
+        if self._last_flush_at is None:
+            return False
+        if now is None:
+            now = time.time()
+        return (now - self._last_flush_at) < self._active_window_s
+
+    def _throughput_fields(self) -> dict:
+        """Honest learning-throughput fields shared by every check_health branch:
+        whether experiences are actually FLOWING to the world model, plus the raw
+        counters + buffer depth so 'buffering into the void' (buffered > 0 while
+        flushed is stalled and learning_active is False) is visible, not hidden."""
+        now = time.time()
+        return {
+            'learning_active': self._learning_active(now),
+            'total_recorded': self._stats.get('total_recorded', 0),
+            'total_flushed': self._stats.get('total_flushed', 0),
+            'experiences_buffered': len(self._experience_queue),
+            'last_flush_age_seconds': (round(now - self._last_flush_at, 1)
+                                       if self._last_flush_at is not None else None),
+        }
+
     def check_health(self) -> dict:
         """Check learning pipeline health.
 
-        In-process: returns healthy if provider is available.
-        HTTP: GET /health on HevolveAI API.
+        `healthy` reflects REACHABILITY (provider present / API answering). Learning
+        activity is NOT asserted from that — `learning_active` (in _throughput_fields)
+        reflects whether experiences are actually reaching the world model.
         """
         if self._in_process and self._provider:
             return {
                 'healthy': True,
-                'learning_active': True,
                 'mode': 'in_process',
                 'node_tier': self._node_tier,
+                **self._throughput_fields(),
             }
 
         # HTTP fallback
@@ -1737,10 +1775,10 @@ class WorldModelBridge:
                     'content-type', '').startswith('application/json') else {}
                 return {
                     'healthy': True,
-                    'learning_active': True,
                     'mode': 'http',
                     'node_tier': self._node_tier,
                     'details': data,
+                    **self._throughput_fields(),
                 }
             return {
                 'healthy': False,
