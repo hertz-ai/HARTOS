@@ -75,6 +75,19 @@ let
     glib gobject-introspection gtk3 webkitgtk_4_1
     pango gdk-pixbuf atk harfbuzz libsoup_3 cairo
   ]);
+  # GStreamer capture plugins for the cage floor's mic/getUserMedia path. WebKit2
+  # (like the GTK4 host) routes MediaStream capture through GStreamer, and a bare
+  # cage session sets NO GST_PLUGIN_SYSTEM_PATH_1_0 -> the `valve`/`pulsesrc`
+  # elements are invisible -> a mic click SIGSEGVs WebKitWebProcess (the real-HW
+  # 2026-07-18 "clicking the mic hung the entire cage" incident). This back-ports
+  # the GTK4 host's fix (hart-layer-shell-host.nix:99-120) to the never-fail floor
+  # so the floor is safe on the same path. makeSearchPathOutput "out", NOT plain
+  # makeSearchPath: gstreamer core's DEFAULT output is `bin`, so plain makeSearchPath
+  # resolves an empty plugin dir and the elements stay invisible.
+  gstCapturePlugins = with pkgs; [
+    gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad
+  ];
+  gstPluginPath = lib.makeSearchPathOutput "out" "lib/gstreamer-1.0" gstCapturePlugins;
   glassShell = pkgs.writeShellScriptBin "hart-glass-shell" ''
     set -euo pipefail
     URL="http://localhost:${toString ui.port}"
@@ -90,6 +103,10 @@ let
     fi
     # GI typelibs for the GTK/WebKit2 python below (see giTypelibPath note).
     export GI_TYPELIB_PATH="${giTypelibPath}"
+    # GStreamer capture plugins so the mic/getUserMedia path finds pulsesrc/valve
+    # instead of SIGSEGV-ing WebKitWebProcess (see gstPluginPath note; back-port of
+    # the GTK4 host fix to the never-fail floor).
+    export GST_PLUGIN_SYSTEM_PATH_1_0="${gstPluginPath}"
     # WebKitGTK robustness on fresh-ISO boots (VM / software GL / no GPU): the
     # DMABUF renderer + GL compositing crash on a GL-less display, which is
     # exactly the first-boot / live-USB case. Disable both so a shell that
@@ -156,6 +173,12 @@ class GlassShell(Gtk.Window):
         # tapping the orb IS the user's intent to talk, so auto-grant the media
         # (mic/camera) request; any other permission class is denied by default.
         webview.connect('permission-request', self._on_permission_request)
+        # If the web process dies (mic-capture SIGSEGV, OOM, codec, GPU), the surface
+        # stays mapped but renders nothing and shell-ready has already passed -- so
+        # crash the HOST: the session-supervisor counts it and relaunches the tier
+        # with a fresh web process, and a repeat-crash walks the ladder. Without this
+        # the cage floor froze blank forever (back-port of hart-layer-shell-host.nix).
+        webview.connect('web-process-terminated', self._on_web_process_terminated)
         webview.load_uri(os.environ.get('HART_SHELL_URL', 'http://localhost:${toString ui.port}'))
         s = webview.get_settings()
         s.set_enable_javascript(True)
@@ -186,6 +209,17 @@ class GlassShell(Gtk.Window):
     def _on_load_changed(self, _webview, event):
         if event == WebKit2.LoadEvent.FINISHED:
             _signal_painted()
+
+    def _on_web_process_terminated(self, _webview, reason):
+        # The web process died (mic-capture SIGSEGV / OOM / codec / GPU). The surface
+        # stays mapped but renders NOTHING and shell-ready already passed, so the only
+        # honest move is to crash the HOST: the supervisor counts it and relaunches
+        # the tier with a fresh web process; a repeat-crash loop walks the ladder.
+        import sys as _sys, os as _os
+        print('[hart-glass-shell] WebKitWebProcess TERMINATED (%s) -- exiting so the '
+              'supervisor relaunches the tier' % reason, file=_sys.stderr)
+        _sys.stderr.flush()
+        _os._exit(1)
 
     def _on_permission_request(self, _webview, request):
         # Auto-grant mic/camera for the trusted local shell so getUserMedia does
