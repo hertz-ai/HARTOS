@@ -39,6 +39,40 @@
   ];
   var CATS = ['Web', 'Creative', 'Media', 'Productivity', 'Develop', 'Chat', 'Games'];
 
+  // ── The CANONICAL catalog (2026-07-24) ──────────────────────────────────────
+  // The list above is only the instant-first-paint SEED. The real source is
+  // /api/apps/catalog -> app_catalog.py -> nixos/modules/hart-app-catalog.json,
+  // the ONE list that also feeds hart-apps.nix's preinstall set, and it annotates
+  // each entry with a LOCAL `installed` flag decided by shutil.which(exec) -- no
+  // network. Without this the store showed a plain "Install" for apps that are
+  // BAKED INTO THE IMAGE (Firefox, VLC, GIMP...), so clicking it ran a Flathub
+  // install that failed offline and flipped to "Retry" -- the real-HW report.
+  // appCard already renders a non-interactive "Installed" state from app.installed;
+  // it just never received the flag. Fetch, map to the compact card shape, and
+  // re-render. Best-effort: on any failure the seed list stays (never a blank
+  // store), so this can only ever ADD truth.
+  function loadCatalog(done) {
+    fetch('/api/apps/catalog',
+      { signal: window.HartTimeoutSignal ? window.HartTimeoutSignal(6000) : null })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        var apps = (data && data.apps) || [];
+        if (!apps.length) return;
+        CATALOG = apps.map(function (a) {
+          return {
+            id: a.id, n: a.name, c: a.category, i: a.icon,
+            d: a.description, installed: !!a.installed
+          };
+        });
+        var cats = (data && data.categories) || [];
+        if (cats.length) { CATS = cats; }
+        if (typeof done === 'function') { done(); }
+      })
+      .catch(function (e) {
+        console.debug('hartMarketplace: canonical catalog fetch failed (keeping seed list)', e);
+      });
+  }
+
   // Single base for the EXISTING installer route surface (app_installer.py). The
   // determinate flow composes the background-job endpoints off it
   // ('/api/apps/install/start' + '/api/apps/install/progress'); the synchronous
@@ -269,7 +303,10 @@
     var title = document.createElement('div'); title.className = 'ds-panel-title'; title.textContent = 'App Store';
     head.appendChild(title);
     var sub = document.createElement('div'); sub.className = 'ds-body-sm ds-text-muted';
-    sub.textContent = 'Free, open-source software from Flathub - one click to install.';
+    // Honest subtitle: many of these ship IN the image (marked Installed); the
+    // rest come from Flathub and need the network. The old line promised
+    // "one click to install" for apps that were already installed.
+    sub.textContent = 'Free, open-source software. Some ships with HART OS; the rest installs from Flathub.';
     head.appendChild(sub);
     wrap.appendChild(head);
 
@@ -365,7 +402,11 @@
     go.addEventListener('click', doSearch);
     inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); doSearch(); } });
 
-    renderFeatured();
+    renderFeatured();         // instant first paint from the seed list
+    // ...then upgrade to the CANONICAL catalog, which carries the local
+    // `installed` flag, so a baked-in app (Firefox, VLC, GIMP...) renders
+    // "Installed" instead of an Install button that fails offline.
+    loadCatalog(renderFeatured);
     loadInstalled();          // surface already-installed / pre-bundled apps
     el.appendChild(wrap);
   };
