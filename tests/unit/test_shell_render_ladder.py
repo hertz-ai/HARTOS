@@ -56,30 +56,36 @@ def test_read_shell_render_mode_fail_software(monkeypatch, tmp_path):
     assert read_shell_render_mode() == 'software'           # unknown -> floor
 
 
-@pytest.mark.parametrize('rung', ['vulkan', 'webkit-cairo'])
-def test_gpu_rungs_light_animations_but_glass_opaque_without_blur(monkeypatch, rung):
-    """A GPU rung lights the micro-animations (body.gpu-hardware) so the desktop is
-    ALIVE -- but the glass stays OPAQUE (body.webkit-flat) because backdrop-blur
-    composites ONLY under WebKit accelerated compositing (preferHardwareGL), NOT from
-    the GSK rung. webkit-cairo composites transforms yet its WebView is cairo, so its
-    blur never paints; keying the glass off the rung left it see-through and the home
-    bled THROUGH the App Store panel (2026-07-24). Alive AND legible: the two signals
-    are decoupled."""
-    cls = _body_class(monkeypatch, rung, gpu='hardware')   # no force-on env (fixture)
-    assert 'gpu-hardware' in cls, f'{rung} did not light gpu-hardware/animations (got {cls!r})'
+def test_webkit_cairo_lights_animations_but_glass_stays_opaque(monkeypatch):
+    """webkit-cairo (the node's stable Tier-1 rung) lights the micro-animations
+    (gpu-hardware, ALIVE) but its GSK=cairo WebView cannot composite backdrop-blur, so
+    the glass MUST be solidified (webkit-flat) -- else it reads see-through and the
+    home bleeds THROUGH the App Store panel (2026-07-24). Alive AND legible."""
+    cls = _body_class(monkeypatch, 'webkit-cairo', gpu='hardware')
+    assert 'gpu-hardware' in cls, f'webkit-cairo did not light animations (got {cls!r})'
     assert 'webkit-flat' in cls, (
-        f'{rung} glass is NOT solidified without blur -> it would read see-through '
-        f'(got {cls!r})')
+        f'webkit-cairo glass is NOT solidified -> it would read see-through (got {cls!r})')
 
 
-def test_force_hw_gl_gives_frosted_glass(monkeypatch):
-    """LIQUID_UI_PREFER_HW_GL == '1' is the ONE signal that backdrop-blur actually
-    composites (WebKit accelerated compositing on) -> frosted glass: gpu-hardware AND
-    NO webkit-flat. This is the 'chase blur next' path; the default node stays opaque."""
+def test_only_vulkan_rung_frosts_the_glass(monkeypatch):
+    """ONLY the vulkan rung actually composites backdrop-blur (GSK=vulkan), so it is
+    the ONLY rung that frosts: gpu-hardware AND no webkit-flat."""
+    cls = _body_class(monkeypatch, 'vulkan', gpu='hardware')
+    assert 'gpu-hardware' in cls and 'webkit-flat' not in cls, (
+        f'vulkan (the blur-compositing rung) must frost, not solidify (got {cls!r})')
+
+
+def test_preferhwgl_flag_does_NOT_frost_a_cairo_rung(monkeypatch):
+    """The glass signal is the RUNG, not the preferHardwareGL flag. Forcing
+    LIQUID_UI_PREFER_HW_GL=1 while the rung is webkit-cairo must STILL solidify the
+    glass -- hart-comp forces webkit-cairo even with preferHardwareGL on (vulkan
+    demoted, hart-comp.nix:562), and cairo can't paint blur, so keying off the flag
+    would frost a cairo surface right back into see-through. This guards that exact
+    regression."""
     monkeypatch.setenv('LIQUID_UI_PREFER_HW_GL', '1')
     cls = _body_class(monkeypatch, 'webkit-cairo', gpu='hardware')
-    assert 'gpu-hardware' in cls and 'webkit-flat' not in cls, (
-        f'force-on (blur composites) must give frosted glass, not opaque (got {cls!r})')
+    assert 'webkit-flat' in cls, (
+        f'preferHardwareGL flag must NOT frost a cairo rung (got {cls!r})')
 
 
 def test_software_rung_stays_flat_floor(monkeypatch):
