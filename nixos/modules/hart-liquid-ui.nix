@@ -308,6 +308,10 @@ in
         pkgs.webkitgtk_4_1
         pkgs.gobject-introspection
       ];
+
+      # Open shell port for browser access (companion apps, remote LAN clients).
+      # Loopback kiosk works without this; only external access needed it opened.
+      networking.firewall.allowedTCPPorts = [ ui.port ];
     }
 
     # ─────────────────────────────────────────────────────────
