@@ -331,6 +331,17 @@ let
     echo "[hart-glass-shell-gtk4] GPU-DIAG vulkaninfo --summary:" >&2
     ${pkgs.vulkan-tools}/bin/vulkaninfo --summary 2>&1 | head -60 >&2 || echo "[hart-glass-shell-gtk4] GPU-DIAG: vulkaninfo failed" >&2
     ''}
+    # Runtime light diag (NO rebuild, works on ANY normal nightly): boot with
+    # `hart.gpudiag` on the kernel cmdline -> GSK/VK debug so the vulkan swapchain
+    # failure is logged to the journal (the build-time option above additionally
+    # ships vulkaninfo + validation layers). Skip if the option already set GSK_DEBUG.
+    if [ -z "''${GSK_DEBUG:-}" ] && ${pkgs.gnugrep}/bin/grep -qw hart.gpudiag /proc/cmdline 2>/dev/null; then
+      export GSK_DEBUG=vulkan
+      export GDK_DEBUG=vulkan
+      export VK_LOADER_DEBUG=warn
+      export WEBKIT_DEBUG=Compositing
+      echo "[hart-glass-shell-gtk4] GPU-DIAG (cmdline hart.gpudiag): GSK_DEBUG=vulkan + VK loader debug (hover the orb; validation layers only in iso-desktop-gpudiag)" >&2
+    fi
     # ── GSK renderer PER RUNG (the auto-fallback ladder) ──────────────────────────
     # vulkan rung -> GSK vulkan (a SEPARATE path from GL; GDK_GL stays disabled so the
     #   GL/EGL/GBM context-creation hang can never recur). This is the 2026-07-08

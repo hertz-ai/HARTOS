@@ -569,6 +569,15 @@ let
       export HART_SHELL_RENDER=vulkan
       echo "[hart-comp-session] GPU-DIAG: forcing HART_SHELL_RENDER=vulkan to capture the layer-shell hang" >&2
       ''}
+      # Runtime toggle (NO rebuild, works on ANY normal nightly): boot with
+      # `hart.gpudiag` on the kernel cmdline to force the vulkan rung + capture the
+      # hang from the pipeline you already flash. The build-time option above is the
+      # deeper variant that ALSO ships vulkaninfo + validation layers. Set BEFORE the
+      # webkit-cairo default so it wins; the paint-watchdog still self-heals to cage.
+      if ${pkgs.gnugrep}/bin/grep -qw hart.gpudiag /proc/cmdline 2>/dev/null; then
+        export HART_SHELL_RENDER=vulkan
+        echo "[hart-comp-session] GPU-DIAG (cmdline hart.gpudiag): forcing vulkan rung" >&2
+      fi
       export HART_SHELL_RENDER="''${HART_SHELL_RENDER:-webkit-cairo}"
       if command -v hart-glass-shell-gtk4 >/dev/null 2>&1; then
         hart-glass-shell-gtk4 &
