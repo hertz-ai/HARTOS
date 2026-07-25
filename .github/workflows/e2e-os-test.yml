@@ -52,7 +52,9 @@ jobs:
           # actually ships as of 2026-07-16; evaluating it here is the gate that
           # proves the hartImageKind split evals BOTH ways (the iso targets in
           # the same loop re-prove the ISO path did not regress).
-          for t in iso-server iso-desktop raw-desktop; do
+          # iso-desktop-gpudiag = the GPU-render diagnostic build (task #12); eval-only
+          # here so a typo in the gpuDiagnostic wiring is caught without a full build.
+          for t in iso-server iso-desktop raw-desktop iso-desktop-gpudiag; do
             echo "=== Evaluating .#packages.x86_64-linux.$t ==="
             nix eval ".#packages.x86_64-linux.${t}.drvPath" --raw
             echo

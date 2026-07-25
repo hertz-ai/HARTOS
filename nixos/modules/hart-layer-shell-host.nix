@@ -314,6 +314,23 @@ let
     # the supervisor drops to the cage GTK3 floor (no GSK at all). CANDIDATE — real-HW
     # unverified; the next boot's journal proves vulkan vs the hang.
     export GDK_GL=disable
+    ${lib.optionalString ui.gpuDiagnostic ''
+    # ── GPU-DIAG: capture the layer-shell vulkan hang (hart.liquidUI.gpuDiagnostic) ──
+    # hart-comp forced HART_SHELL_RENDER=vulkan; make the boot LOG the exact failure.
+    # GSK_DEBUG=vulkan traces GSK's vulkan renderer + swapchain; the Khronos validation
+    # layer prints the API misuse behind VK_ERROR_SURFACE_LOST_KHR; WEBKIT_DEBUG covers
+    # the blur/compositing side. Dump vulkaninfo so the journal has the device report.
+    # Reproduce: hover the orb (CSS scale -> GSK re-pass -> swapchain recreate).
+    export GSK_DEBUG=vulkan
+    export GDK_DEBUG=vulkan
+    export VK_LOADER_DEBUG=warn
+    export VK_LAYER_PATH="${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d"
+    export VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
+    export WEBKIT_DEBUG=Compositing
+    echo "[hart-glass-shell-gtk4] GPU-DIAG on: GSK_DEBUG=vulkan + Khronos validation + WEBKIT_DEBUG (hover the orb to trigger the swapchain hang)" >&2
+    echo "[hart-glass-shell-gtk4] GPU-DIAG vulkaninfo --summary:" >&2
+    ${pkgs.vulkan-tools}/bin/vulkaninfo --summary 2>&1 | head -60 >&2 || echo "[hart-glass-shell-gtk4] GPU-DIAG: vulkaninfo failed" >&2
+    ''}
     # ── GSK renderer PER RUNG (the auto-fallback ladder) ──────────────────────────
     # vulkan rung -> GSK vulkan (a SEPARATE path from GL; GDK_GL stays disabled so the
     #   GL/EGL/GBM context-creation hang can never recur). This is the 2026-07-08

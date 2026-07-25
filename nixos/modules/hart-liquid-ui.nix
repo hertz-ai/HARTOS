@@ -363,6 +363,29 @@ in
       '';
     };
 
+    gpuDiagnostic = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        GPU RENDER DIAGNOSTIC MODE — root-cause the layer-shell vulkan/GSK hang
+        (task #12) instead of avoiding it. DEFAULT FALSE (a normal build is
+        byte-identical + un-bloated). When true:
+          * the Tier-1 hart-comp session FORCES the vulkan rung
+            (HART_SHELL_RENDER=vulkan) instead of the safe webkit-cairo default, so
+            the hang is actually ATTEMPTED (every boot since 2026-07-20 silently
+            skipped it);
+          * the GTK4 host exports Vulkan validation layers + GSK/GDK/WebKit debug
+            and dumps `vulkaninfo --summary` to the journal, so a real-HW boot
+            CAPTURES the exact VK_ERROR_SURFACE_LOST_KHR / swapchain-recreate
+            failure (hover the orb to trigger it) instead of us guessing;
+          * ships vulkan-tools + vulkan-validation-layers.
+        SAFE: the paint-watchdog still self-heals — a vulkan hang drops to the cage
+        floor, so a diagnostic boot can NEVER brick. Workflow: flash a build with
+        this ON, boot, hover the orb, pull the HARTJRNL, read the VK trace. Turn
+        OFF for normal builds.
+      '';
+    };
+
     contextRefreshMs = lib.mkOption {
       type = lib.types.int;
       default = 2000;

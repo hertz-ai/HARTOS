@@ -477,6 +477,14 @@
       # ─── x86_64 (PC / Laptop / Server) ───
       hart-server  = mkSystem { system = "x86_64-linux"; variant = "server"; };
       hart-desktop = mkSystem { system = "x86_64-linux"; variant = "desktop"; };
+      # GPU-render diagnostic build (task #12): desktop with hart.liquidUI.gpuDiagnostic
+      # forced ON -> Tier-1 forces the vulkan rung + logs the VK swapchain failure to
+      # the journal, so a real-HW boot CAPTURES the layer-shell hang. Normal iso-desktop
+      # is untouched. Build/flash `.#iso-desktop-gpudiag`, boot, hover the orb, pull HARTJRNL.
+      hart-desktop-gpudiag = mkSystem {
+        system = "x86_64-linux"; variant = "desktop";
+        extraModules = [ { hart.liquidUI.gpuDiagnostic = true; } ];
+      };
       hart-edge    = mkSystem { system = "x86_64-linux"; variant = "edge"; };
 
       # ─── aarch64 (ARM: Raspberry Pi, edge, phones) ───
@@ -542,6 +550,9 @@
         # ─── ISO Images (bootable USB / optical) ───
         iso-server  = self.nixosConfigurations.hart-server.config.system.build.isoImage;
         iso-desktop = self.nixosConfigurations.hart-desktop.config.system.build.isoImage;
+        # GPU-render diagnostic ISO (task #12): forces the vulkan rung + captures the
+        # layer-shell VK hang. Not in the nightly matrix; build on demand.
+        iso-desktop-gpudiag = self.nixosConfigurations.hart-desktop-gpudiag.config.system.build.isoImage;
         iso-edge    = self.nixosConfigurations.hart-edge.config.system.build.isoImage;
 
         # ─── ISO + SHA256SUMS (flash-integrity verification for bare-metal) ───
