@@ -49,10 +49,24 @@ Back to the [README](README.md).
 | **Benchmark registry** | 7 built-in adapters (3 sourced from HevolveAI: QuantiPhy, Embodied, Qwen). Pluggable via `register_adapter()` | `benchmark_registry.py` |
 | **Per-agent baselines** | Per-agent snapshots at `agent_data/baselines/<agent_id>.json`, used as the regression floor | `agent_baseline_service.py` |
 | **Coding benchmark tracker** | SQLite-backed coding benchmarks (`coding_benchmarks.db`), HumanEval / MBPP / custom suites | `integrations/coding_agent/benchmark_tracker.py` |
-| **Hive benchmark prover** | Cryptographic proof that a benchmark was run on the claimed model + dataset (resists fake-score federation) | `hive_benchmark_prover.py` |
+| **Hive benchmark prover** | Splits a benchmark across hive nodes, tracks assignments in a ledger, and aggregates the scores. It does **not** verify them. See the note below. | `hive_benchmark_prover.py` |
 | **Continual learner gate** | Gates access to hive learning by verified compute contribution (Compute Contribution Tokens): no contribution, no learning | `continual_learner_gate.py` |
 | **PR review service** | Auto-rejects PRs on baseline regression or guardrail mismatch | `pr_review_service.py` |
 | **Upgrade orchestrator** | 7-stage pipeline: BUILD -> TEST -> AUDIT -> BENCHMARK -> SIGN -> CANARY -> DEPLOY | `upgrade_orchestrator.py` |
+
+> **Reported benchmark scores are not verified.** This page previously said the
+> hive benchmark prover gave "cryptographic proof that a benchmark was run on
+> the claimed model and dataset" and that it "resists fake-score federation".
+> That was false. `hive_benchmark_prover.py` imports no cryptography at all,
+> and every apparent match for "sign" in it is the word *assignment*. It
+> distributes benchmark problems across nodes and aggregates what comes back,
+> which is useful, and is not attestation.
+>
+> This matters because scores decide things elsewhere. The RSI-2 gate
+> rejects a release on benchmark regression, and `continual_learner_gate`
+> meters hive learning against contribution. A node that reports whatever
+> numbers suit it is not currently caught by anything in this file. Tracked as
+> [issue #90](https://github.com/hertz-ai/HARTOS/issues/90).
 | **OTA service** | systemd service does daily check + cryptographically-verified upgrade | `hart-update-service.py` |
 
 ### Hive connectivity + federation
