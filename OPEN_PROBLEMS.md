@@ -145,7 +145,62 @@ hosting someone else's work.
 
 ---
 
-## 8. Concrete and unclaimed
+## 8. The ladder auto-escalates capability, but not effort
+
+**Now:** a turn escalates itself. The 0.8B draft answers and emits
+`delegate: none | local | hive`; `speculative_dispatcher` overrides that on
+refusal patterns or low confidence, and `_pick_expert_for_delegate` climbs
+from the draft to the local fast model to a hive expert, with an optional MoE
+HiveMind fusion consult above that. No user asked for any of it. That part
+genuinely works and is the good half of this design.
+
+**Why that is unsatisfying:** every rung on that ladder is *a better model
+answering in one shot*. Some problems are not hard in a way a bigger model
+fixes — they are hard because they need decomposition, several attempts, a
+check that the answer is actually right, and more minutes than a request
+should ever hold open.
+
+HART OS has that machinery: `agent_daemon` runs goals over time,
+`hive_task_protocol` carries tasks with a `validate_result` quality score,
+`compute_mesh_service.offload_to_best_peer` recruits a peer's hardware.
+None of it is reachable from difficulty. The chat path enters sustained work
+only when the caller sets `create_agent` or `autonomous`
+(`hart_intelligence_entry.py:8609-8611`) — flags a person ticks, not a
+conclusion the system draws. So autopilot stops exactly where the problem
+stops being answerable in one breath, which is precisely where autonomy would
+be worth something.
+
+The asymmetry is stark. Ask something trivial and the system decides, on its
+own, to answer it cheaply. Ask something that genuinely needs an hour of work
+across three machines and it will hand you its best single paragraph, because
+nothing is watching for "this one deserves more than a turn."
+
+**What progress looks like:** a signal that distinguishes *needs a stronger
+model* from *needs sustained work*, and an escalation that can cross that
+line without being told to. Which raises the questions that make it hard:
+
+- What may a system commit on a user's behalf? Minutes of their battery,
+  their peers' compute, a budget under `budget_gate`? Where is consent — once
+  per goal, once per session, or a standing policy?
+- Interruption is a user-experience problem as much as a scheduling one. A
+  turn that returns in 400 ms and a turn that returns in 40 minutes cannot be
+  the same interaction, and pretending otherwise is how a good answer arrives
+  after everyone has left.
+- How does it know it is done? `validate_result` scores coding tasks against
+  a known scope. There is no equivalent for "was this reasoning any good,"
+  which is problem 6 wearing different clothes.
+- What is the failure mode of being wrong in the expensive direction —
+  spending twenty minutes on something a 4B model would have answered in two
+  seconds? Cheap escalation is safe; this one is not.
+
+`core/prompt_difficulty.py` is a first step at the signal, deliberately a
+narrow one: deterministic, no model call, and it only decides fast-vs-full
+routing when no draft model is loaded to decide it properly. It does not
+attempt the question above. Nobody has.
+
+---
+
+## 9. Concrete and unclaimed
 
 Smaller, well-specified, and genuinely open:
 

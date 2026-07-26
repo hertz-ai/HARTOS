@@ -27,12 +27,13 @@ This README is written to be read by people and by agents alike. Every capabilit
 > wanted — see [Contributing](CONTRIBUTING.md).
 >
 > **If you would rather argue than patch, start at
-> [Open problems](OPEN_PROBLEMS.md).** Eight things we have not solved, each
+> [Open problems](OPEN_PROBLEMS.md).** Nine things we have not solved, each
 > with the code that implements today's inadequate answer and what would count
 > as progress: what convergence can mean with no global view, whether a system
-> that rewrites itself can still be verified, how to evaluate an OS that is
-> deliberately different on every machine. Disagreeing with a framing there is
-> worth more to us than a patch.
+> that rewrites itself can still be verified, and why a turn escalates itself
+> to a better model automatically but can never decide on its own that a
+> problem deserves an hour and three machines. Disagreeing with a framing
+> there is worth more to us than a patch.
 
 ---
 
