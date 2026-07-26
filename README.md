@@ -153,7 +153,7 @@ on the live ISO, and one wire (`hart hive connect`) is still missing.
 
 **[Full capability map →](CAPABILITIES.md)** . Every subsystem with the file
 that implements it: agent runtime, auto-evolve, federation, 31 channel
-adapters, 15 providers, security, economics, the API surface, and how it
+adapters, 16 providers, security, economics, the API surface, and how it
 compares to the alternatives.
 
 > **HART** is the bare engine in this repo, listening on `:6777`. There is no

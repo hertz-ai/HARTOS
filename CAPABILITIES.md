@@ -102,7 +102,8 @@ Back to the [README](README.md).
 
 | | What it does | Where |
 |---|---|---|
-| **15 LLM providers** | Local llama.cpp, OpenAI, Anthropic, Google Gemini, Groq, Mistral, DeepSeek, OpenRouter, Together, Fireworks, Cohere, Perplexity, Hugging Face, Ollama, custom OpenAI-compatible | `integrations/providers/` |
+| **16 LLM providers** | Local llama.cpp and Ollama, plus OpenAI, Anthropic, Google Gemini, Groq, Mistral, DeepSeek, Cohere, OpenRouter, Together, Fireworks, DeepInfra, Cerebras, SambaNova and HuggingFace, plus any custom OpenAI-compatible endpoint | `integrations/providers/`, `integrations/agent_engine/model_bus_service.py` |
+| **Compute + media marketplace** | Separate catalog from the LLM list above: 10 API providers, 1 local, and 8 affiliate services (RunwayML, ElevenLabs, Midjourney, Pika, Kling, Luma, Seedance, Sora) with pricing, auth method and health per entry | `integrations/providers/registry.py` |
 | **Universal gateway** | One router, cost / latency / capability scoring, AES-256 keys at rest (PBKDF2 KDF) | `model_registry.py`, `model_bus_service.py` |
 | **Speculative decoding** | Qwen3-0.8B draft + Qwen3-4B main, ~300 ms TTFT on consumer hardware | `speculative_dispatcher.py` |
 | **Faster-Whisper STT** | Local STT, multi-lang, GPU-accelerated when available | `integrations/service_tools/whisper_tool.py` |
@@ -277,7 +278,7 @@ HART OS  (port 6777)
 |-- Baselining        agent_baseline_service . benchmark_registry . benchmark_tracker . hive_benchmark_prover
 |-- Memory            Shared LangChain + AutoGen buffer (zero parallel paths) . MemoryGraph . SimpleMem
 |-- Channels (31)     ResponseRouter fan-out + WAMP desktop mirror + per-channel agent binding
-|-- Providers (15)    Universal gateway . AES-256 keys . cost/latency/capability routing
+|-- Providers (16)    Universal gateway . AES-256 keys . cost/latency/capability routing
 |-- Multimodal        Whisper STT . 6 TTS engines . MiniCPM VLM . VRAM-tiered
 |-- Hive              PeerLink P2P (NAT-traversed) . FederatedAggregator (equal-weighted)
 |                     Gossip + verification . hash-gated handshake . EventBus + WAMP bridge
