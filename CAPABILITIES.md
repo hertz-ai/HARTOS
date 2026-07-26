@@ -112,14 +112,17 @@ Back to the [README](README.md).
 
 ### Channels (31 adapters)
 
+Straight from `CHANNEL_CATALOG` in `integrations/channels/metadata.py`, which
+is what `GET /api/social/channels/catalog` serves.
+
 | Surface | Adapters |
 |---|---|
-| **Core chat** | Telegram, Discord, Slack, WhatsApp, Signal, iMessage (BlueBubbles), Teams, Web SPA |
-| **Enterprise** | Mattermost, Matrix, Nextcloud, Rocket.Chat |
-| **Social** | Messenger, Instagram, Twitter / X, LINE, Viber, WeChat, Twitch |
-| **Decentralized** | Nostr, Tlon (Urbit), OpenProse |
-| **Bridge variants** | TelegramUser, DiscordUser, BlueBubbles, ZaloUser |
-| **Other** | Email (IMAP/SMTP), SMS (Twilio), Google Chat |
+| **Core chat** | `telegram`, `discord`, `slack`, `whatsapp`, `signal`, `imessage`, `teams`, `web` |
+| **Enterprise** | `mattermost`, `matrix`, `nextcloud`, `rocketchat`, `google_chat` |
+| **Social** | `messenger`, `instagram`, `twitter`, `line`, `viber`, `wechat`, `zalo`, `twitch` |
+| **Decentralized** | `nostr`, `tlon` (Urbit), `openprose` |
+| **User-account bridges** | `telegram_user`, `discord_user`, `zalo_user`, `bluebubbles` |
+| **Not chat surfaces** | `email` (IMAP/SMTP), `voice`, `hardware` |
 
 `ResponseRouter` fan-out + WAMP desktop mirror; per-channel agent + prompt assignment; AutoGen-side tools so agents can register/send via channels themselves. [Catalog endpoint](#api-surface): `GET /api/social/channels/catalog`.
 
