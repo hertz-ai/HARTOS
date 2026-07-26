@@ -29,6 +29,13 @@ Training needs tight interconnect, so training clusters are dense. That part
 is physics and a reader here was right to pull me up on wording that implied
 otherwise.
 
+Interconnect binds one kind of training: synchronous, large batch, everything
+in step. That is not the only kind. Learning here is incremental and gossiped,
+built up on consumer hardware as nodes use it, with `federated_aggregator.py`
+doing periodic aggregation rather than a tight all-reduce. A world model
+accumulated that way does not need everyone in one building, because nobody is
+waiting on anybody's gradient.
+
 Owning the weights, setting the refusal policy, pricing access and keeping the
 logs are not interconnect problems. Those are choices, and they are the ones
 worth arguing with.
