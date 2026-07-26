@@ -127,6 +127,13 @@ signing, keep humans in control. Nodes improve themselves from their own use,
 locally, and that is a toggle you can switch off, because an operating system
 that describes itself as alive should come with an off switch.
 
+If you think "OS" is doing more work in that name than the code earns, that is
+a reasonable suspicion and **[Is it an OS?](docs/IS_IT_AN_OS.md)** answers it
+with the CI checks rather than adjectives: an initrd boot test, a DRM/KMS
+Wayland compositor built under `--features smithay`, and ten session
+supervisor VM tests covering paint watchdogs, tier drops and the recovery TTY.
+It also lists what is not proven, which is hardware paint on a real GPU.
+
 **[Full capability map →](CAPABILITIES.md)** . Every subsystem with the file
 that implements it: agent runtime, auto-evolve, federation, 31 channel
 adapters, 15 providers, security, economics, the API surface, and how it
