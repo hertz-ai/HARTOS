@@ -10,6 +10,26 @@
   <a href="https://github.com/hertz-ai/Nunba"><img src="https://img.shields.io/badge/Frontend-Nunba-5865F2?style=flat-square" alt="Nunba"></a>
 </p>
 
+### What you get on an ordinary Tuesday
+
+Before the argument, the practical part. Install it and you have an assistant
+that runs on your own machine. No subscription and no monthly bill, because
+answering costs us nothing when the model runs on your hardware. It works with
+the wifi off, on a plane or in a building with bad signal. 8GB of RAM is
+enough. Whatever you type stays on the machine, not as a policy we promise but
+because there is nowhere else for it to go, and you can confirm that by
+watching the network.
+
+The honest limit in the same breath: on a genuinely hard question, a frontier
+lab's model will give you a better answer than a model that fits on your
+laptop. Most of what people actually ask an assistant in a day is not that
+question. This is built for the rest, where local is good enough, private by
+construction, and free.
+
+Ready to use today: [Nunba](https://github.com/hertz-ai/Nunba) for Windows,
+Linux and Android. HART OS is the runtime underneath it, and this repository
+is that runtime.
+
 ### Why this exists
 
 The most capable AI now lives inside a handful of organisations that can put
@@ -109,6 +129,7 @@ This README is written to be read by people and by agents alike. Every capabilit
 
 ## Table of Contents
 
+- [What you get on an ordinary Tuesday](#what-you-get-on-an-ordinary-tuesday)
 - [Why HART OS?](#why-hart-os)
 - [Open problems](OPEN_PROBLEMS.md) — what we have not solved
 - [Start it](#start-it)
