@@ -200,7 +200,52 @@ attempt the question above. Nobody has.
 
 ---
 
-## 9. Concrete and unclaimed
+## 9. The learning engine is closed, and the argument says it should not be
+
+**Now:** this runtime is Apache 2.0. The OS, the Model Bus, PeerLink, the
+agent engine, the escalation ladder, all of it. The learning is not. Hebbian,
+Bayesian, probabilistic and gradient work lives in HevolveAI, a sibling repo
+that is not public, loaded here at runtime as a signature-verified binary via
+`security/native_hive_loader.py`, with a stub fallback when it is missing.
+`core/resonance_tuner.py` and `core/resonance_identifier.py` say so in their
+own docstrings: no ML in HART OS.
+
+**Why that is unsatisfying:** the case this project makes is that
+concentration of intelligence is a choice rather than a necessity, and that
+the weights, the policy and the price should not belong to whoever paid for
+the cluster. A closed learning core sits awkwardly next to that. Open core is
+a normal and defensible business shape, and plenty of infrastructure is built
+this way. The difficulty is not the shape, it is the word democratic doing
+work the architecture does not yet support. Someone reading the top of the
+README and then reaching the native hive loader row in the capabilities table
+is entitled to feel the gap.
+
+The narrow claims survive intact and are checkable. Your hardware is not
+locked in, since inference runs on llama.cpp with GGUF across CUDA, ROCm,
+Metal, Vulkan and CPU. Your runtime is not locked in, since it is Apache 2.0
+and forkable today. What does not survive unqualified is "nobody owns the
+intelligence", because right now somebody owns part of it.
+
+**What progress looks like:** a defensible line for what must be open in a
+system making this argument, and an account of why. Some candidate answers,
+none of them obviously right:
+
+- The **protocol** is the thing that matters, not the implementation. If the
+  aggregation format and the peer contract are open, anyone can write a
+  competing engine and the network does not care which one you run. This is
+  the argument that email is open even though most clients are not.
+- The **weights and the deltas** are the thing. Whoever holds those holds the
+  intelligence, and an open runtime around a closed learner is a nicer cage.
+- **Nothing less than all of it.** If the claim is democratic, any closed link
+  in the chain is where the concentration reappears later.
+
+We do not have a settled answer. Stating the tension is the honest position
+while it is unresolved, and arguing us out of it is a genuinely useful
+contribution.
+
+---
+
+## 10. Concrete and unclaimed
 
 Smaller, well-specified, and genuinely open:
 

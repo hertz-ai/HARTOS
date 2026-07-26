@@ -25,27 +25,30 @@ Android. This repo is the runtime underneath it.
 
 ### Why it exists
 
-Training needs tight interconnect, so training clusters are dense. That part
-is physics and a reader here was right to pull me up on wording that implied
-otherwise.
+A handful of organisations own the most capable AI, and with it the refusal
+policy, the price, and the logs of everything you type. None of that follows
+from any law of nature. It follows from who paid for the cluster.
 
-Interconnect binds one kind of training: synchronous, large batch, everything
-in step. That is not the only kind. Learning here is incremental and gossiped,
-built up on consumer hardware as nodes use it, with `federated_aggregator.py`
-doing periodic aggregation rather than a tight all-reduce. A world model
-accumulated that way does not need everyone in one building, because nobody is
-waiting on anybody's gradient.
+Learning here is incremental and gossiped, accumulated on consumer hardware as
+nodes get used, with `federated_aggregator.py` doing periodic aggregation
+rather than a tight all-reduce. Nobody blocks on anybody else's gradient, so
+the machines do not need to sit in one building.
 
-Owning the weights, setting the refusal policy, pricing access and keeping the
-logs are not interconnect problems. Those are choices, and they are the ones
-worth arguing with.
-
-Inference runs on llama.cpp with GGUF weights, so CUDA, ROCm, Metal, Vulkan
-and plain CPU all work. Nothing in the delivery path needs one vendor's
+Inference runs on llama.cpp with GGUF weights. CUDA, ROCm, Metal, Vulkan and
+plain CPU are all real paths. Nothing in the delivery path needs one vendor's
 silicon.
 
+**What is open and what is not.** This runtime is Apache 2.0: the OS, the
+Model Bus, the federation, the agent engine. The learning itself is not. The
+Hebbian, Bayesian and gradient work lives in HevolveAI, a closed sibling
+loaded at runtime as a signature-verified binary, with a stub fallback when it
+is absent. So "zero lock-in" means your hardware and your runtime, and it does
+not yet mean the whole stack. Whether that is compatible with the rest of the
+argument is
+[open problem 9](OPEN_PROBLEMS.md), written up rather than buried.
+
 The aim, which is a bet and not a shipped feature: an internet of intelligence
-that nobody owns. Unsolved parts are in [OPEN_PROBLEMS.md](OPEN_PROBLEMS.md).
+that nobody owns.
 
 > **HART** = the bare engine (run from this repo, listens on `:6777`). There is
 > no published PyPI package yet, so install it from source as shown below.
@@ -73,7 +76,7 @@ This README is written to be read by people and by agents alike. Every capabilit
 > out so nobody spends a Saturday re-testing it.
 >
 > **If you would rather argue than patch, start at
-> [Open problems](OPEN_PROBLEMS.md).** Nine things we have not solved, each
+> [Open problems](OPEN_PROBLEMS.md).** Ten things we have not solved, each
 > with the code that implements today's inadequate answer and what would count
 > as progress: what convergence can mean with no global view, whether a system
 > that rewrites itself can still be verified, and why a turn escalates itself
