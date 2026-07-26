@@ -58,7 +58,7 @@ build-from-scratch. Verified this session:
 | Gap | Status |
 |---|---|
 | `claude-code` not packaged for the node | **CLOSED** by this work (see §3) |
-| `hart hive connect` CLI | **STILL OPEN**. `claude_hive_session.py`'s docstring advertises it; `hart_cli.py` has no `hive` command. This is the one wire between the co-pilot and its shard of the 71 goals. |
+| `hart hive connect` CLI | **CLOSED.** `hart_cli.py` now has a `hive` group: connect, status, tasks, scope, pause, resume, disconnect. Thin client over the routes `claude_hive_session.get_blueprint()` already served. Wired but not yet exercised against a live dispatcher. |
 | Persistent credential on the node | **BLOCKED on the installed image** (see §6) |
 
 ---
@@ -157,10 +157,10 @@ does to a human one.
 
 | # | Item | Why it matters |
 |---|---|---|
-| 1 | **`hart hive connect` CLI** | The single missing wire. Everything it would call (`ClaudeHiveSession`, the deterministic shard, `dispatch_goal`) already exists. This is what turns "Claude in the terminal" into "achieving the seeded goals as its own". |
+| 1 | ~~**`hart hive connect` CLI**~~ **DONE** | Built. `hart_cli.py` gained a `hive` group (connect, status, tasks, scope, pause, resume, disconnect) that calls the routes `claude_hive_session.get_blueprint()` already served. What remains is not code: run it against a live dispatcher and confirm a task actually arrives, executes and reports. |
 | 2 | **Installed writable-root image** | Makes the credential (and any state) persist. Prerequisite for unattended operation. |
 | 3 | **Full `iso-desktop` build green** | Confirms the closure fits. |
-| 4 | *(optional)* systemd daemon mode | Only after 1 to 3, and only with the branch-only boundary preserved. |
+| 4 | *(optional)* systemd daemon mode | Only after 2 and 3, and only with the branch-only boundary preserved. |
 
 ---
 
@@ -171,4 +171,9 @@ does to a human one.
 - `tests/unit/test_nix_embedded_python_parses.py`: 16 passed.
 - **CI flake evaluation: GREEN** (`03cd1cbb`), the authoritative structural gate,
   since local Nix cannot evaluate on the Windows dev box.
+- `hart hive` group: runs. `hart hive --help` lists all seven subcommands,
+  `hart hive status` against no server prints `Error: Cannot connect to
+  http://localhost:6777` and the `--json` form returns that as JSON, so the
+  failure path is a message rather than a traceback. Not yet exercised against
+  a live dispatcher, which is the real test.
 - Full `iso-desktop` build: **pending**.

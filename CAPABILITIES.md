@@ -224,7 +224,7 @@ does not exist.
 | **Theme service** | EventBus-driven theme distribution | `theme_service.py` |
 | **Native remote desktop** | RustDesk + Sunshine wrappers, 3-tier transport (DirectWS / WAMP / WireGuard), OTP session auth, DLP scan, peripheral bridge, DLNA casting | `integrations/remote_desktop/` |
 | **Shell panels** | 113 across three registries: `PANEL_MANIFEST` 35 start-menu panels, `DYNAMIC_PANELS` 14 context-opened, `SYSTEM_PANELS` 64 native system panels (model catalog, channel pairing, agent dashboard, hive view, ...) | `shell_manifest.py` |
-| **Unified hart CLI** | 24 subcommands: `a2a`, `agent`, `channel`, `chat`, `code`, `compute`, `desktop`, `expert`, `mcp`, `model`, `pay`, `recipe`, `remote`, `remote-desktop`, `repomap`, `schedule`, `screenshot`, `skill`, `social`, `status`, `tools`, `vision`, `voice`, `zeroshot` | `hart_cli.py` |
+| **Unified hart CLI** | 25 subcommands: `a2a`, `agent`, `channel`, `chat`, `code`, `compute`, `desktop`, `expert`, `hive`, `mcp`, `model`, `pay`, `recipe`, `remote`, `remote-desktop`, `repomap`, `schedule`, `screenshot`, `skill`, `social`, `status`, `tools`, `vision`, `voice`, `zeroshot` | `hart_cli.py` |
 
 ### Vision + robotics
 
@@ -299,7 +299,7 @@ HART OS  (port 6777)
 |-- HevolveArmor      AES-256-GCM modules . BCC compile-to-C . RFT AST renaming . anti-debug
 |-- Platform          ServiceRegistry . AppRegistry . AppManifest . Bootstrap . EnvironmentManager
 |-- Desktop           Shell APIs . app installer . NixOS modules . LiquidUI . themes . remote desktop
-|-- CLI               hart (24 subcommands) . OpenAI-compatible client . Aider in-process backend
+|-- CLI               hart (25 subcommands) . OpenAI-compatible client . Aider in-process backend
 `-- Other             AP2 . Google A2A . MCP . skills . marketing . trading . coding agent . vision
 ```
 
