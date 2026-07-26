@@ -113,6 +113,11 @@
       ./modules/hart-robot-probe.nix
       ./modules/hart-compute-mesh.nix
       ./modules/hart-liquid-ui.nix
+      # Claude Code as the resident co-pilot IN the node's terminal (hart.copilot,
+      # default OFF so a normal build carries none of its closure). Full autonomy
+      # inside the work; commits land on a BRANCH — merge / OTA / master-key signing
+      # stay human. Pulls claude-code from the 25.05 input already threaded for Rust.
+      ./modules/hart-copilot.nix
       ./modules/hart-app-bridge.nix
       # Native desktop notifications: mako (the wlroots-native org.freedesktop.
       # Notifications daemon) as a glass-styled graphical-session user service, so

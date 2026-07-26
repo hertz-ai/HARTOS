@@ -988,6 +988,21 @@ in
   # session once the GTK4 host's on-HW paint is fixed (needs the on-HW journal,
   # now reachable via the recovery TTY added in b97f1ae).
   hart.layerShellHost.enable = true;
+
+  # ── Claude Code as the resident co-pilot, in the node's OWN terminal ─────────
+  # The steward's ask (2026-07-26): the co-pilot should live INSIDE HART OS,
+  # debugging and bootstrapping the OS from within and working the 71 seeded goals
+  # as its own — through the guardrails the OS already has.
+  #
+  # Bounded by design ("trust is a boundary"): full autonomy INSIDE the work, zero
+  # authority AT the boundaries. `hart-copilot` opens it on a writable checkout on a
+  # FRESH BRANCH; merge, OTA publish and master-key signing stay human/democratic,
+  # so the worst case of an unattended run is a branch nobody merges.
+  #
+  # No API key ships in the image — authenticate interactively (`claude` -> /login).
+  # On the live ISO that login is tmpfs (lost on reboot); it persists only on the
+  # INSTALLED writable-root image.
+  hart.copilot.enable = true;
   # Tier-2 = the GTK4 layer-shell glass host UNDER sway (the `hart-glass-gtk4`
   # session), not bare sway. The layer-shell-host module repoints the supervisor's
   # swayCommand to its `hart-glass-shell-gtk4-session` launcher (mkOverride, so it
