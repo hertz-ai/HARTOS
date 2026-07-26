@@ -25,12 +25,21 @@ This README is written to be read by people and by agents alike. Every capabilit
 > **Status: public alpha.** The runtime, the Model Bus and the channel
 > adapters are in daily use; APIs still move. Issues and PRs are genuinely
 > wanted — see [Contributing](CONTRIBUTING.md).
+>
+> **If you would rather argue than patch, start at
+> [Open problems](OPEN_PROBLEMS.md).** Eight things we have not solved, each
+> with the code that implements today's inadequate answer and what would count
+> as progress: what convergence can mean with no global view, whether a system
+> that rewrites itself can still be verified, how to evaluate an OS that is
+> deliberately different on every machine. Disagreeing with a framing there is
+> worth more to us than a patch.
 
 ---
 
 ## Table of Contents
 
 - [Why HART OS?](#why-hart-os)
+- [Open problems](OPEN_PROBLEMS.md) — what we have not solved
 - [60-second start](#60-second-start)
 - [How it compares](#how-it-compares)
 - [Capabilities](#capabilities)

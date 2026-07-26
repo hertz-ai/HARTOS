@@ -1,0 +1,182 @@
+# Open problems
+
+Things we have not solved. Each one names what the code does today, why that
+answer is unsatisfying, and what would count as progress.
+
+This file exists because the interesting part of HART OS is not the parts that
+work. An AI-native OS that runs local-first, federates without a broker, and is
+allowed to modify itself raises questions that do not have settled answers
+anywhere, and we would rather state them plainly than let a README imply they
+are handled. If you disagree with a framing here, that is the most useful thing
+you can bring — open a discussion and argue with it.
+
+Everything below is grounded in real code, with the file that implements the
+current approach. Nothing here is a hypothetical.
+
+---
+
+## 1. What does convergence mean with no global view?
+
+**Now:** nodes federate over PeerLink — direct peer-to-peer WebSocket, no
+broker, no aggregator (`core/peer_link/`). A running central node reports
+`epoch=85, convergence=1.000`.
+
+**Why that is unsatisfying:** convergence is a claim about a population, and no
+node can see the population. Each one sees the peers it happens to be connected
+to, and that set changes as laptops sleep and phones move networks. A number
+that says 1.000 without a global view is measuring agreement among whoever
+showed up, which is not the same thing and can be trivially high precisely when
+participation is worst.
+
+**What progress looks like:** a convergence statistic that is honest about its
+own sample — something a node can compute locally that degrades visibly when
+its view of the network is partial, rather than looking perfect. Bonus if it
+survives an adversarial peer that reports whatever makes convergence look good.
+
+---
+
+## 2. Federated learning across wildly unequal hardware
+
+**Now:** the model tier a node runs is chosen from available VRAM, spanning
+roughly 0.8B to 27B parameters and MoE variants.
+
+**Why that is unsatisfying:** classical federated averaging assumes participants
+share an architecture. Here they emphatically do not. A phone running a 0.8B
+model and a workstation running 27B cannot exchange gradients, and averaging
+anything across them is not obviously meaningful. Today the honest description
+is that nodes share signals, not weights — which sidesteps the question rather
+than answering it.
+
+**What progress looks like:** a defensible account of what *should* flow between
+heterogeneous nodes. Distilled behaviour? Preference data? Task traces? And an
+experiment showing the small node actually gets better from the large one's
+participation, rather than just receiving traffic.
+
+---
+
+## 3. Can a system rewrite itself and still be verifiable?
+
+**Now:** a boot-time guardrail hash re-checked every 300 seconds, plus Ed25519
+release signing (`security/node_integrity.py`). The self-improvement path is a
+toggle, and every node is independently killable.
+
+**Why that is unsatisfying:** these two properties are in direct tension. A
+hash proves the code is what was signed; a system that improves itself
+necessarily stops being what was signed. Today the tension is resolved by
+keeping learned behaviour out of the hashed code path, which works but also
+means the interesting part is the part that is not verified.
+
+**What progress looks like:** an integrity model where adaptation is in scope
+rather than excluded — attestation over a policy the adaptation must satisfy,
+say, instead of over the bytes. The property worth preserving is not "the code
+is unchanged" but "the thing running is still the thing you agreed to run."
+
+---
+
+## 4. Choosing a model portfolio is currently a guess
+
+**Now:** tier thresholds are hand-picked constants (24 / 10 / 4 / 0 GB), and
+speculative decoding turns on around 10 GB to leave headroom for voice.
+
+**Why that is unsatisfying:** those numbers came from judgement, not
+measurement. The real decision is a portfolio problem — draft model, main
+model, vision, speech all competing for the same memory, with a latency budget
+and a workload mix that varies by user. A single threshold ladder cannot
+express that.
+
+**What progress looks like:** a policy that takes (hardware, workload mix,
+latency target) and returns an allocation, evaluated against the hand-picked
+ladder on real machines. Beating the constants would be a genuinely useful
+result; failing to beat them would be almost as interesting.
+
+---
+
+## 5. Evaluating an OS that is different on every machine
+
+**Now:** no benchmark exists for the adaptive behaviour. Individual components
+are tested; the composed system is not.
+
+**Why that is unsatisfying:** benchmarks assume a fixed configuration, and the
+entire premise here is that the configuration is derived per device. Reporting a
+score from one laptop says almost nothing, and averaging across machines hides
+exactly the adaptation being claimed.
+
+**What progress looks like:** an evaluation design where per-device variation is
+the measured quantity rather than noise to be averaged away. What is the right
+unit of comparison when every install is legitimately different?
+
+---
+
+## 6. Personality tuning with no ground truth
+
+**Now:** `core/resonance_tuner.py` extracts signals — warmth, formality, humour
+receptivity, technical depth, pace — from interaction text using pure
+heuristics, deliberately with no LLM in the loop.
+
+**Why that is unsatisfying:** there is no label. We adjust toward a profile
+without ever establishing that the adjustment helped, and the heuristics are
+keyword-shaped, which will mistake register for preference. Someone writing
+tersely because they are busy is not the same as someone who prefers terse
+answers.
+
+**What progress looks like:** an evaluation that does not require a
+questionnaire — a behavioural signal that distinguishes "the assistant matched
+me" from "the assistant changed." And an honest test of whether the heuristics
+beat doing nothing at all, which has never been checked.
+
+---
+
+## 7. Pricing local compute
+
+**Now:** `integrations/agent_engine/budget_gate.py` is fail-closed: an agent
+goal with insufficient budget is blocked before dispatch. Credits accrue for
+contributed compute.
+
+**Why that is unsatisfying:** the unit is arbitrary. Local inference has no
+marginal cash cost — the electricity is already being spent — so a credit
+denominated in tokens or seconds does not correspond to anything scarce except
+the user's own patience and battery. Fail-closed is the right default and also
+means an agent can be starved by an accounting artifact.
+
+**What progress looks like:** a cost model grounded in something genuinely
+scarce on the device (contended memory, thermal budget, foreground latency)
+rather than a synthetic unit, and a fairness argument for what a node earns by
+hosting someone else's work.
+
+---
+
+## 8. Concrete and unclaimed
+
+Smaller, well-specified, and genuinely open:
+
+- **NAT traversal falls back to nothing.** `core/peer_link/nat.py` tries LAN
+  direct, then STUN, then hole-punching; relay through a seed peer is a
+  placeholder. Peers behind symmetric NAT simply do not connect.
+- **Budget decisions rest on an approximation.** `core/token_utils.py` falls
+  back to `chars / 3.5` when a real tokenizer is unavailable, and spend gates
+  are enforced on that estimate. Nobody has measured the error, or which way it
+  is biased.
+- **Compute optimisation is explicitly heuristic.** `core/compute_optimizer.py`
+  states "no ML in HARTOS — heuristic only." Whether a learned policy would beat
+  it is unmeasured.
+
+---
+
+## Working here
+
+Disagreement is the point. If a framing above is wrong, saying so is worth more
+than a patch. Open a discussion, or an issue if it is concrete, and argue from
+evidence — a measurement beats an opinion, and a reproduction beats both.
+
+Two working rules that this project holds to, and that apply to contributions:
+
+- **Validation is not proof.** That a thing is present, returns 200, or passes
+  review does not establish that it works. Drive the real path and read what
+  comes back. Several bugs in this repo passed review and failed on first
+  contact with a real request.
+- **Prefer extending an existing implementation to adding a parallel one.** If
+  two callers need the same behaviour, they should share it, because a future
+  fix will otherwise reach one and miss the other. That has already happened
+  here more than once.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup.
