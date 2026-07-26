@@ -491,3 +491,58 @@ def test_test_account_rule_does_not_take_real_people():
                  'protest@gmail.com', 'latest@gmail.com'):
         sendable, reason = classify(addr, check_mx=False)
         assert sendable, '%s wrongly rejected as %s' % (addr, reason)
+
+
+def _dsn(status, diagnostic):
+    """Build a minimal RFC 3464 delivery-status notification."""
+    import email as _email
+    raw = (
+        "From: MAILER-DAEMON@mail.hertzai.com\r\n"
+        "Subject: Undelivered Mail Returned to Sender\r\n"
+        "Content-Type: multipart/report; report-type=delivery-status;"
+        ' boundary="B"\r\n\r\n'
+        "--B\r\nContent-Type: text/plain\r\n\r\nDelivery failed.\r\n\r\n"
+        "--B\r\nContent-Type: message/delivery-status\r\n\r\n"
+        "Final-Recipient: rfc822; someone@gmail.com\r\n"
+        "Status: %s\r\n"
+        "Diagnostic-Code: smtp; %s\r\n\r\n"
+        "--B--\r\n" % (status, diagnostic)
+    )
+    return _email.message_from_string(raw)
+
+
+def test_policy_block_is_not_a_dead_mailbox():
+    """5.7.x means the receiver refused US, not that the person is gone.
+
+    Every one of the 400 most recent bounces on 2026-07-26 was Gmail
+    blocking our sending IP as unsolicited, against addresses that had been
+    RCPT-verified live. Classifying those as hard bounces would have
+    permanently suppressed 400+ real readers and hidden the actual cause.
+    """
+    from integrations.channels.bounce_handler import classify_message
+    msg = _dsn('5.7.1', '550-5.7.1 [104.254.246.77] Gmail has detected that '
+                        'this message is likely unsolicited mail')
+    kind, addr, code, _reason = classify_message(msg)
+    assert kind == 'blocked', 'a policy block must never be suppressed'
+    assert addr == 'someone@gmail.com'
+    assert code == '5.7.1'
+
+
+def test_user_unknown_is_still_a_hard_bounce():
+    """The other direction: a genuinely dead mailbox must still suppress,
+    otherwise this 'fix' would quietly disable bounce handling entirely."""
+    from integrations.channels.bounce_handler import classify_message
+    msg = _dsn('5.1.1', "550 5.1.1 The email account that you tried to reach "
+                        "does not exist")
+    kind, addr, code, _reason = classify_message(msg)
+    assert kind == 'hard'
+    assert addr == 'someone@gmail.com'
+    assert code == '5.1.1'
+
+
+def test_mailbox_full_is_temporary():
+    from integrations.channels.bounce_handler import classify_message
+    kind, _addr, code, _r = classify_message(
+        _dsn('5.2.2', '552 5.2.2 The email account is over quota'))
+    assert kind == 'soft', 'a full mailbox is not a reason to drop somebody'
+    assert code == '5.2.2'

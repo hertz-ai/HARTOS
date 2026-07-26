@@ -151,7 +151,31 @@ def classify_message(msg: Message) -> Tuple[str, Optional[str], str, str]:
             addr = m2.group(1).lower() if m2 else None
         if addr is None:
             return 'other', None, code, 'bounce with no parsable recipient'
-        return ('hard' if cls == '5' else 'soft'), addr, code, subj[:100]
+        if cls != '5':
+            return 'soft', addr, code, subj[:100]
+
+        # A 5.x.x is permanent, but permanent about WHAT matters enormously.
+        #
+        # 5.7.x is a policy rejection: the receiver refused THIS MESSAGE or
+        # THIS SENDER. It says nothing about whether the mailbox exists. On
+        # 2026-07-26 every one of the 400 most recent bounces was
+        #   550-5.7.1 [<our mail IP>] Gmail has detected that this message is
+        #   likely unsolicited mail ... this message has been blocked
+        # against addresses that had been RCPT-verified live. Treating those
+        # as dead mailboxes would have permanently suppressed 400+ real
+        # readers -- the silent, unnoticed, irreversible error this module's
+        # own docstring warns about -- while hiding the actual problem, which
+        # is that our sending IP is blocked and no amount of list hygiene
+        # fixes it.
+        #
+        # 5.2.2 is over-quota: a full mailbox is a temporary condition and a
+        # person who clears it is still reachable, so it is treated as soft
+        # for the same reason 4.x.x is.
+        if a == '7':
+            return 'blocked', addr, code, subj[:100]
+        if code == '5.2.2':
+            return 'soft', addr, code, subj[:100]
+        return 'hard', addr, code, subj[:100]
 
     # No machine-readable status. Only act when the wording is unambiguous.
     m2 = _INLINE_FAIL.search(body)
@@ -174,9 +198,9 @@ def process_mailbox(*, host: str = IMAP_HOST,
     so it gets the same preview-then-confirm treatment as sending.
     """
     pw = password or SMTP_PASS
-    out = {'scanned': 0, 'hard': 0, 'soft': 0, 'unsubscribe': 0,
+    out = {'scanned': 0, 'hard': 0, 'soft': 0, 'blocked': 0, 'unsubscribe': 0,
            'unparsed': 0, 'already_suppressed': 0, 'dry_run': dry_run,
-           'suppressed': [], 'unparsed_subjects': []}
+           'suppressed': [], 'unparsed_subjects': [], 'blocked_samples': []}
     if not pw:
         out['error'] = 'no password (HEVOLVE_SMTP_PASS unset)'
         return out
@@ -214,6 +238,17 @@ def process_mailbox(*, host: str = IMAP_HOST,
                 if not dry_run:
                     record_bounce(addr, code, reason)
                     known.add(addr)
+            elif kind == 'blocked':
+                # The receiver refused us, not them. Never suppressed: the
+                # address is very likely fine and will be reachable again once
+                # sender reputation recovers. Counted separately and loudly,
+                # because a rising 'blocked' count is the only early warning
+                # that the domain or IP is being filtered -- and it is the one
+                # number that must never be read as "these people are gone".
+                out['blocked'] += 1
+                if len(out['blocked_samples']) < 5:
+                    out['blocked_samples'].append(
+                        '%s (%s)' % (addr, code or 'no code'))
             elif kind == 'soft':
                 # Temporary. Deliberately not suppressed: a full mailbox or a
                 # greylist is not a reason to drop somebody permanently.
@@ -241,6 +276,15 @@ def process_mailbox(*, host: str = IMAP_HOST,
     if dry_run and (out['hard'] or out['unsubscribe']):
         out['note'] = ('DRY RUN -- nothing suppressed. Call with '
                        'dry_run=False to apply.')
+    # Sending harder into a policy block deepens it. Say so where whoever ran
+    # this will actually see it, rather than leaving it to be inferred from a
+    # column of numbers.
+    if out['blocked'] and out['blocked'] >= max(out['hard'], 1):
+        out['ALERT'] = (
+            '%d policy rejections (5.7.x) -- the receiver is blocking THIS '
+            'SENDER, not these people. Do not suppress them and do not keep '
+            'sending: pause, fix reputation (auth, volume ramp, complaint '
+            'rate), then resume.' % out['blocked'])
     return out
 
 
