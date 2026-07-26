@@ -10,6 +10,31 @@
   <a href="https://github.com/hertz-ai/Nunba"><img src="https://img.shields.io/badge/Frontend-Nunba-5865F2?style=flat-square" alt="Nunba"></a>
 </p>
 
+### Why this exists
+
+The most capable AI now lives inside a handful of organisations that can put
+enough compute in one building. That concentration is an architectural choice
+rather than a law of physics, and it decides what the models will refuse, what
+they cost, and who gets to read what you type.
+
+To be precise, because this is the obvious thing to attack: you cannot train a
+frontier model without a datacenter, and we are not claiming you can. What we
+are claiming is that the intelligence people actually use does not have to be
+delivered from one. HART OS runs models on the device, and when a node cannot
+handle something it recruits a peer directly, with no broker and no company in
+the middle.
+
+We do not shard a model across the network either. Layer-level parallelism over
+consumer links is a bad idea and we do not attempt it. A peer serves a whole
+request instead, so a machine with a bigger model answers what a smaller one
+could not, which tolerates latency in a way tensor parallelism does not.
+
+The things we have not solved are written down in
+[OPEN_PROBLEMS.md](OPEN_PROBLEMS.md), each naming the file that implements
+today's inadequate answer.
+
+---
+
 > **HART** = the bare engine (`pip install hart-backend`, listens on `:6777`).
 > **HART OS** = the full AI-native OS. It boots on a laptop, server, or edge node, runs on phones, and reaches into embodied AI, and it ships the agentic Liquid Shell, Model Bus, model catalog, channel pairing, agent dashboard, and hive view.
 > **[Nunba](https://github.com/hertz-ai/Nunba)** = the consumer companion app, one signed client across Windows / macOS / Linux.
