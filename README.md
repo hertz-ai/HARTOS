@@ -15,17 +15,30 @@
 The most capable AI now lives inside a handful of organisations that can put
 enough compute in one building.
 
-Putting it in one building is physics. Training needs tight interconnect, the
-lane between two accelerators gets slower the further apart they are, and no
-amount of software argues with that. An earlier version of this paragraph
-claimed the concentration was "an architectural choice rather than a law of
-physics", which was wrong, and a reader on Hacker News was right to say so.
+Interconnect is the honest part of that. Training is tightly coupled, the lane
+between two accelerators degrades with distance, and colocation follows from
+physics rather than from anyone's preference. Say that plainly, because it is
+true.
 
-What is not physics is who ends up owning the result. Interconnect explains
-why the training cluster is dense. It does not explain why the weights, the
-refusal policy, the price and the logs of what you typed all have to stay with
-whoever paid for the cluster. Those are choices, and they are the ones this
-project is arguing with.
+It is a gradient, not a wall. Low-communication training exists precisely to
+relax the coupling, trading synchronisation rounds for local steps, and the
+whole point of that line of work is that the interconnect requirement is a
+variable rather than a constant. Networks improve on their own curve too. A
+constraint measured against today's bandwidth is not a permanent boundary, and
+treating it as one is how you mistake the current shape of an industry for a
+law.
+
+More to the point, interconnect explains the density of a training cluster and
+nothing else. It does not explain why the weights, the refusal policy, the
+price, and the logs of everything you typed have to stay with whoever paid for
+the cluster. Serving a request is not tightly coupled. Owning a model is not a
+physics problem. Those are decisions, and they are the ones worth arguing
+with.
+
+Where this goes, stated as an aim rather than a shipped feature: an internet
+made of intelligence, where a world model is built incrementally and in the
+open by the machines that participate in it, and no single party owns the
+result. The OS is the part we can build. The rest is a bet.
 
 Two different locks are usually treated as one. There is the capital lock, the
 compute it takes to pretrain a frontier model, and there is the silicon lock,
