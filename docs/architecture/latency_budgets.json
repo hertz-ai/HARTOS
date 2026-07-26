@@ -1,0 +1,51 @@
+{
+  "_doc": "Input-to-photon budgets in MILLISECONDS. See LATENCY_HARNESS.md. Continuous interactions (drag/hover/scroll/window-move) are ONE FRAME by construction: exceeding 16ms means an easing layer sits between the input and the transform, which is the exact model error behind the 2026-07-20 rubber-band drag. A budget may only be RAISED with a justification recorded in the same commit.",
+  "_defaults": {
+    "drag": 16,
+    "hover": 16,
+    "scroll": 16,
+    "window-move": 16,
+    "resize": 16,
+    "press": 25,
+    "key": 25,
+    "animate-start": 33
+  },
+  "components": {
+    "orb": {
+      "_note": "The centerpiece. Drag/hover are the interactions the steward personally hit as laggy; they are the program's headline number.",
+      "drag": 16,
+      "hover": 16,
+      "press": 25,
+      "animate-start": 33
+    },
+    "orb-rings": { "animate-start": 33 },
+    "bloom-field": {
+      "_note": "Never input-driven; measured for animate-start + sustained frame time only.",
+      "animate-start": 33
+    },
+    "top-bar": { "press": 25, "hover": 16 },
+    "omnibox": { "press": 25, "key": 25 },
+    "taskbar": { "press": 25, "hover": 16 },
+    "start-menu": { "press": 25, "scroll": 16, "animate-start": 33 },
+    "desktop-icon": { "press": 25, "drag": 16, "hover": 16 },
+    "home-card": { "press": 25, "hover": 16 },
+    "home-row": { "scroll": 16 },
+    "panel": { "press": 25, "drag": 16, "resize": 16, "animate-start": 33 },
+    "window-chrome": { "drag": 16, "window-move": 16, "resize": 16 },
+    "senses-mic": { "press": 25 },
+    "senses-eye": { "press": 25 },
+    "toast": { "animate-start": 33 },
+    "context-menu": { "press": 25, "animate-start": 33 },
+    "notification": { "press": 25, "animate-start": 33 },
+    "lock-screen": { "key": 25, "animate-start": 33 },
+    "onboarding": {
+      "_note": "First thing a user ever sees; carries the full desktop bar.",
+      "press": 25,
+      "animate-start": 33
+    },
+    "workspace-switch": { "animate-start": 33 },
+    "chat-input": { "key": 25, "scroll": 16 },
+    "personalize": { "press": 25, "scroll": 16 },
+    "marketplace": { "press": 25, "scroll": 16 }
+  }
+}

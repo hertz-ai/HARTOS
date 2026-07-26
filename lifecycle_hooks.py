@@ -143,6 +143,9 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
             ActionState.RECIPE_REQUESTED: LedgerTaskStatus.IN_PROGRESS,
             ActionState.RECIPE_RECEIVED: LedgerTaskStatus.COMPLETED,
             ActionState.TERMINATED: LedgerTaskStatus.COMPLETED,
+            # #139: a force-give-up is an HONEST failure, never COMPLETED (that was
+            # the fake-success bug). A distinct terminal, re-openable for a retry.
+            ActionState.GAVE_UP: LedgerTaskStatus.FAILED,
             # VLM / physical action states — still active execution
             ActionState.EXECUTING_MOTION: LedgerTaskStatus.IN_PROGRESS,
             ActionState.SENSOR_CONFIRM: LedgerTaskStatus.IN_PROGRESS,
@@ -209,10 +212,22 @@ def _auto_sync_to_ledger(user_prompt: str, action_id: int, state: 'ActionState')
                         "FSM is ActionState).", task_id, task.status, state.value)
                 else:
                     if _recover_failed:
-                        logger.info(
-                            "Reconciled stale ledger FAILED → COMPLETED for %s "
-                            "(ActionState %s authoritative — recovered work).",
-                            task_id, state.value)
+                        if _is_possible_masked_failure(_recover_failed, state):
+                            _MASKED_FAILURE_STATE['count'] += 1
+                            _n = _MASKED_FAILURE_STATE['count']
+                            # Warn ONCE per process, then debug — #56 de-spammed
+                            # this exact path; the counter is the aggregate signal.
+                            (logger.warning if _n == 1 else logger.debug)(
+                                "#139 possible MASKED FAILURE (#%d this run): ledger "
+                                "FAILED → COMPLETED for %s via TERMINATED (a forced/"
+                                "give-up terminal, NOT a verified success) — audit "
+                                "the completed count. Behaviour unchanged; preventing "
+                                "this is a policy call (#139).", _n, task_id)
+                        else:
+                            logger.info(
+                                "Reconciled stale ledger FAILED → COMPLETED for %s "
+                                "(ActionState %s authoritative — recovered work).",
+                                task_id, state.value)
                     ledger.update_task_status(task_id, ledger_status, reason=f"ActionState: {state.value}")
 
             # === BLOCKED REASON: set specific reason based on ActionState source ===
@@ -356,6 +371,7 @@ class ActionState(Enum):
     SENSOR_CONFIRM = "sensor_confirm"             # 13. Waiting for sensor confirmation of physical outcome
     PREVIEW_PENDING = "preview_pending"           # 14. Destructive action awaiting user approval
     PREVIEW_APPROVED = "preview_approved"         # 15. User approved destructive action, proceed
+    GAVE_UP = "gave_up"                            # 16. Force-abandoned terminal (stalled/unverified work): an HONEST failure (ledger FAILED), NOT a verified success like TERMINATED. Re-openable (→ASSIGNED/RECIPE_REQUESTED) so a hive peer can retry (#139).
 
 
 # ── No-progress stall guard for the CREATE loop ───────────────────────────
@@ -385,7 +401,36 @@ STALL_GUARD_MAX_ITERS = 30  # tight cap: action stuck in a "requested" state
 STALL_GUARD_INPROGRESS_ITERS = 120
 
 _STALL_STATES = (ActionState.RECIPE_REQUESTED, ActionState.FALLBACK_REQUESTED)
-_TERMINAL_STATES = (ActionState.COMPLETED, ActionState.TERMINATED, ActionState.ERROR)
+_TERMINAL_STATES = (ActionState.COMPLETED, ActionState.TERMINATED, ActionState.ERROR, ActionState.GAVE_UP)
+
+
+# #139 observability counter — bumped each time the FAILED→COMPLETED recovery
+# reconcile fires via the TERMINATED (forced) terminal (a possible masked
+# failure). Module-level so diag can quantify it without log-scraping; the
+# reconcile logs a WARNING only ONCE per process (then debug), because #56
+# deliberately de-spammed this path (it WARN-spammed ~100/run) — a per-event
+# warning here would re-introduce that.
+_MASKED_FAILURE_STATE = {'count': 0}
+
+
+def _is_possible_masked_failure(recover_failed, action_state):
+    """#139 — observability for the #128 FAILED→COMPLETED recovery reconcile.
+
+    That reconcile un-traps a stalled action whose ledger was reaped to FAILED
+    when the ActionState reaches a terminal that maps to ledger COMPLETED. That
+    is a GENUINE recovery when the terminal is a verified success (COMPLETED /
+    RECIPE_RECEIVED), but a POSSIBLE MASKED FAILURE when it is TERMINATED — the
+    forced/give-up terminal #128 routes a stalled-or-failed action through. A
+    force-terminated failure flipped to COMPLETED inflates the completed count
+    and hides a genuine failure.
+
+    Pure + side-effect-free so it is unit-testable. Observability ONLY: callers
+    still apply the reconcile (the flywheel must keep recovering). PREVENTING it
+    — i.e. NOT counting a force-terminated failure as COMPLETED — is a policy
+    call (#139), deliberately not made here. Returns True only for the
+    ambiguous TERMINATED case.
+    """
+    return bool(recover_failed) and action_state == ActionState.TERMINATED
 
 
 def stall_guard_step(prev_stuck_key, prev_iters, action_id, state,
@@ -542,18 +587,18 @@ retry_tracker = ActionRetryTracker()
 def enforce_action_termination(user_prompt, current_action_id):
     """Ensure current action is TERMINATED before proceeding"""
     state = get_action_state(user_prompt, current_action_id)
-    if state != ActionState.TERMINATED:
+    if state not in (ActionState.TERMINATED, ActionState.GAVE_UP):
         raise StateTransitionError(
-            f"Action {current_action_id} must be TERMINATED before proceeding (current: {state})")
+            f"Action {current_action_id} must be terminal (TERMINATED/GAVE_UP) before proceeding (current: {state})")
 
 
 def enforce_all_actions_terminated(user_prompt, total_actions):
     """Ensure all actions reached TERMINATED before flow completion"""
     for action_id in range(1, total_actions + 1):
         state = get_action_state(user_prompt, action_id)
-        if state != ActionState.TERMINATED:
-            return False, f"Action {action_id} not terminated (state: {state})"
-    return True, "All actions terminated"
+        if state not in (ActionState.TERMINATED, ActionState.GAVE_UP):
+            return False, f"Action {action_id} not terminal (state: {state})"
+    return True, "All actions terminal"
 
 class StateTransitionError(Exception):
     """Raised when an invalid state transition is attempted"""
@@ -602,7 +647,7 @@ def set_action_state(user_prompt: str, action_id: int, state: ActionState, reaso
         from recipe_experience import RecipeExperienceRecorder as RER
         if state == ActionState.IN_PROGRESS:
             RER.start_action_timer(user_prompt, action_id)
-        elif state in (ActionState.COMPLETED, ActionState.ERROR, ActionState.TERMINATED):
+        elif state in (ActionState.COMPLETED, ActionState.ERROR, ActionState.TERMINATED, ActionState.GAVE_UP):
             RER.stop_action_timer(user_prompt, action_id, state.value)
         if state == ActionState.FALLBACK_RECEIVED:
             RER.record_fallback_used(user_prompt, action_id, reason, True)
@@ -772,6 +817,15 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
     """Validate state transitions follow the exact sequence"""
     current_state = get_action_state(user_prompt, action_id)
 
+    # #139: GAVE_UP is the universal HONEST give-up terminal — reachable from any
+    # NON-verified, not-already-terminal state (the flow-complete force-abandon of a
+    # stalled action). A verified action (COMPLETED/RECIPE_RECEIVED) goes to
+    # TERMINATED instead, never GAVE_UP. Purely additive: nothing else targets it.
+    if new_state == ActionState.GAVE_UP and current_state not in (
+            ActionState.COMPLETED, ActionState.RECIPE_RECEIVED,
+            ActionState.TERMINATED, ActionState.GAVE_UP):
+        return True
+
     valid_transitions = {
         ActionState.ASSIGNED: [ActionState.IN_PROGRESS, ActionState.ASSIGNED, ActionState.PREVIEW_PENDING],
         ActionState.IN_PROGRESS: [ActionState.STATUS_VERIFICATION_REQUESTED, ActionState.IN_PROGRESS, ActionState.ERROR, ActionState.PENDING],
@@ -803,6 +857,9 @@ def validate_state_transition(user_prompt: str, action_id: int, new_state: Actio
         # the same action.  RECIPE_REQUESTED→RECIPE_RECEIVED→TERMINATED already
         # exists, so this just lets the capture flow complete instead of looping.
         ActionState.TERMINATED: [ActionState.ASSIGNED, ActionState.RECIPE_REQUESTED],
+        # #139: GAVE_UP re-opens for a retry (mirrors TERMINATED) so the daemon can
+        # re-attempt a gave-up action via a hive peer; never →IN_PROGRESS directly.
+        ActionState.GAVE_UP: [ActionState.ASSIGNED, ActionState.RECIPE_REQUESTED, ActionState.GAVE_UP],
         # Preview states (opt-in for destructive actions)
         ActionState.PREVIEW_PENDING: [ActionState.PREVIEW_APPROVED, ActionState.ERROR, ActionState.TERMINATED],
         ActionState.PREVIEW_APPROVED: [ActionState.IN_PROGRESS],

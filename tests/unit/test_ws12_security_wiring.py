@@ -499,18 +499,28 @@ class TestActionClassifierShellOps(unittest.TestCase):
     @patch('integrations.agent_engine.shell_os_apis._shell_auth_check',
            return_value=(True, None))
     @patch('integrations.agent_engine.shell_os_apis._audit_shell_op')
+    @patch('integrations.agent_engine.shell_os_apis._logind_call',
+           return_value=(True, None))
     @patch('security.action_classifier.classify_action',
            return_value='destructive')
-    def test_power_action_blocked_by_classifier(self, mock_classify,
-                                                 mock_audit, mock_auth):
-        """Power action should return 403 when classified as destructive."""
+    def test_power_action_NOT_routed_through_classifier(self, mock_classify,
+                                                        mock_logind, mock_audit,
+                                                        mock_auth):
+        """Power verbs are an ENUMERATED whitelist (suspend/reboot/shutdown/...),
+        gated by @_require_shell_auth + the action whitelist + (firmware) the
+        capability probe — NOT the free-form destructive classifier. The classifier
+        refuses 'reboot'/'shutdown' as 'destructive' and 'suspend'/'firmware' as
+        'unknown', so routing power through it would 403 EVERY power action on a real
+        box (the dead-feature bug #73 / #133 fixed). Even with the classifier saying
+        'destructive', the verb must proceed to the native logind path, not 403."""
         app = self._make_app()
         with app.test_client() as client:
             resp = client.post('/api/shell/power/action',
                                json={'action': 'shutdown'})
-            self.assertEqual(resp.status_code, 403)
-            data = resp.get_json()
-            self.assertIn('destructive', data['error'])
+            # NOT blocked: reaches the native logind call and reports initiated.
+            self.assertEqual(resp.status_code, 200)
+            self.assertTrue(resp.get_json()['initiated'])
+            mock_logind.assert_called_once_with('PowerOff', 'b', 'true')
 
 
 # ═══════════════════════════════════════════════════════════════

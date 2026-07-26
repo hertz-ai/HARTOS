@@ -21,12 +21,21 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger('hevolve.app_bridge')
+
+# Accepted app-id shape for a launch: a gtk .desktop id (org.mozilla.firefox), a
+# Wine exe basename/path, or an Android activity/package (com.foo/.Main). Validate
+# BEFORE ever building a launcher argv so a hostile id can never inject a flag or a
+# shell token (launches always run argv-lists, never a shell string, but the guard
+# is defence-in-depth). First char must be alphanumeric so "../" traversal cannot
+# lead the id. Mirrors the shell launcher's guard — one shape, checked once.
+_LAUNCH_APP_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]*$')
 
 # ═══════════════════════════════════════════════════════════════
 # Capability Registry
@@ -590,6 +599,41 @@ class AppBridgeService:
             preferred_subsystem=preferred_subsystem,
         )
 
+    # ─── App launch (typed os_bridge 'apps' domain — #117 / W3) ───
+
+    def launch_app(self, app_id: str, subsystem: str = 'linux') -> Dict[str, Any]:
+        """Launch an installed app by id via the EXISTING cross-subsystem dispatch.
+
+        This is the app-integration bridge's launch verb (os_bridge apps.launch): it
+        reuses the SAME ``SemanticRouter`` dispatch the :6810 /v1/route path uses —
+        ``gtk-launch`` (linux), Wine (windows), Android ``am`` (android) — so there
+        is no parallel launcher, and NO new IPC (in-process). Result-checked: a
+        non-zero launcher exit surfaces ``ok:False`` with the real error, never a
+        masked success (the #133 result-check discipline, applied to launches)."""
+        app_id = (app_id or '').strip()
+        if not app_id or not _LAUNCH_APP_ID_RE.match(app_id):
+            return {'ok': False, 'op': 'launch', 'error': 'invalid app_id'}
+        sub = (subsystem or 'linux').strip().lower() or 'linux'
+        if sub == 'linux':
+            # cli:gtk-launch + data=app_id -> subprocess.run(['gtk-launch', app_id]).
+            cap = Capability(name=app_id, subsystem='linux', handler='cli:gtk-launch')
+            res = self.router._dispatch(cap, 'launch', app_id)
+        elif sub == 'windows':
+            cap = Capability(name=app_id, subsystem='windows', handler='wine:' + app_id)
+            res = self.router._dispatch(cap, 'launch', '')
+        elif sub == 'android':
+            cap = Capability(name=app_id, subsystem='android',
+                             handler='activity:' + app_id)
+            res = self.router._dispatch(cap, 'launch', '')
+        else:
+            return {'ok': False, 'op': 'launch', 'app_id': app_id,
+                    'error': 'unknown subsystem: {}'.format(sub)}
+        ok = res.get('status') == 'success'
+        out = {'ok': ok, 'op': 'launch', 'app_id': app_id, 'subsystem': sub}
+        if not ok:
+            out['error'] = res.get('error') or res.get('output') or 'launch failed'
+        return out
+
     # ─── Status ───────────────────────────────────────────────
 
     def get_status(self) -> Dict[str, Any]:
@@ -738,3 +782,29 @@ class AppBridgeService:
             serve(app, host='0.0.0.0', port=self.http_port, threads=4)
         except ImportError:
             app.run(host='0.0.0.0', port=self.http_port, threaded=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Module singleton — the in-process handle the typed os_bridge 'apps' domain
+# (#117) routes launches through. The :6810 serve_forever() path and this
+# in-process path share the SAME AppBridgeService/CapabilityRegistry/SemanticRouter
+# code; the shell's /api/os/invoke calls it in-process (no new IPC, no HTTP hop).
+# ═══════════════════════════════════════════════════════════════
+
+_service: Optional[AppBridgeService] = None
+_service_lock = threading.Lock()
+
+
+def get_app_bridge() -> AppBridgeService:
+    """The in-process AppBridgeService singleton (lazy, thread-safe).
+
+    ``__init__`` does no network / subprocess / seeding work, so constructing it on
+    first use inside the shell process is cheap and side-effect-free — the launcher
+    dispatch (``launch_app``) builds its Capability ad hoc and never needs the
+    :6810 server's seeded registry."""
+    global _service
+    if _service is None:
+        with _service_lock:
+            if _service is None:
+                _service = AppBridgeService()
+    return _service

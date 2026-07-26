@@ -72,6 +72,344 @@ def _run(cmd, timeout=10, **kw):
         return None
 
 
+# ─── About > Credits: third-party art licence ledger (#143 offline-art) ──────
+# The OS "About & Credits" surface renders docs/THIRD_PARTY_ART.md - the single
+# source of truth for every bundled third-party asset's source + licence + the
+# credit line that must ship in the OS (the doc's own binding rule). Parsed here
+# into structured sections so the credits panel (hartCredits.js via
+# /api/shell/credits) can render the ledger. OFFLINE: reads a bundled doc file,
+# no network, never raises.
+
+def _credits_doc_path():
+    """Ordered candidates for the ledger doc: HART_CREDITS_DOC override, else the
+    repo-relative docs/THIRD_PARTY_ART.md (this file is at
+    integrations/agent_engine/, so the repo root is two dirs up)."""
+    env = (os.environ.get('HART_CREDITS_DOC') or '').strip()
+    if env:
+        yield env
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(os.path.dirname(here))
+    yield os.path.join(repo_root, 'docs', 'THIRD_PARTY_ART.md')
+
+
+def _is_md_separator(line):
+    """A markdown table separator row: only '|', '-', ':', spaces (e.g. |---|:-:|)."""
+    body = line.strip().replace('|', '').replace(' ', '')
+    return bool(body) and set(body) <= set('-:')
+
+
+def _parse_markdown_ledger(md):
+    """Parse every markdown table in ``md`` into
+    [{'heading': str, 'columns': [str], 'rows': [{col: val}]}], each table tagged
+    with the nearest preceding heading. Placeholder rows (all-empty or a leading
+    italic '_(none...') are dropped. Generic (no hard-coded columns) so the doc
+    can evolve without touching this parser."""
+    sections = []
+    heading = ''
+    lines = md.splitlines()
+    i, n = 0, len(lines)
+    while i < n:
+        st = lines[i].strip()
+        if st.startswith('#'):
+            heading = st.lstrip('#').strip()
+            i += 1
+            continue
+        if (st.startswith('|') and i + 1 < n and _is_md_separator(lines[i + 1])):
+            headers = [c.strip() for c in st.strip('|').split('|')]
+            rows = []
+            i += 2
+            while i < n and lines[i].strip().startswith('|'):
+                cells = [c.strip() for c in lines[i].strip().strip('|').split('|')]
+                joined = ' '.join(cells).strip()
+                if joined and not joined.lstrip('_').startswith('(none'):
+                    rows.append(dict(zip(headers, cells)))
+                i += 1
+            sections.append({'heading': heading, 'columns': headers, 'rows': rows})
+            continue
+        i += 1
+    return sections
+
+
+def get_credits_ledger(doc_path=None):
+    """The OS About > Credits payload parsed from the art-licence ledger. Offline,
+    never raises. Shape: {'title', 'binding_rule', 'sections': [...], 'source'}.
+    A missing/unreadable doc degrades to empty sections (the panel still paints).
+    """
+    paths = [doc_path] if doc_path else list(_credits_doc_path())
+    md, used = '', ''
+    for p in paths:
+        try:
+            if p and os.path.isfile(p):
+                with open(p, 'r', encoding='utf-8') as f:
+                    md = f.read()
+                used = p
+                break
+        except OSError as e:
+            logger.debug('credits doc read failed at %s: %s', p, e)
+            continue
+    # The binding rule is the first blockquote/bold line under the H1; surface it
+    # so the About screen states WHY the ledger ships (steward's binding rule).
+    binding = ''
+    for line in md.splitlines():
+        s = line.strip()
+        if s.startswith('**Binding rule'):
+            binding = s.strip('*').strip()
+            break
+    return {
+        'title': 'HART OS - Third-Party Art Credits',
+        'binding_rule': binding,
+        'sections': _parse_markdown_ledger(md),
+        'source': used,
+    }
+
+
+# ─── Display profile persistence (multi-monitor + font scale) ──────────────
+# ONE writer for the saved display arrangement. profile.json is the UI source of
+# truth; the kanshi config is the daemon input regenerated FROM it, so a saved
+# multi-monitor layout survives reboot + is re-applied on hotplug by the
+# hart-kanshi daemon (nixos/modules/hart-display.nix). Paths are read at call
+# time (not import time) so HART_DISPLAY_DIR / HART_KANSHI_CONFIG can be pointed
+# at a temp dir under test. Defaults follow XDG so the backend writes to the same
+# ~/.config/kanshi/config the daemon reads — one source, no parallel path.
+
+def _display_dir():
+    return os.path.expanduser(os.environ.get(
+        'HART_DISPLAY_DIR', '~/.config/hart/display'))
+
+
+def _kanshi_config_path():
+    return os.path.expanduser(os.environ.get(
+        'HART_KANSHI_CONFIG', '~/.config/kanshi/config'))
+
+
+def _display_profile_path():
+    return os.path.join(_display_dir(), 'profile.json')
+
+
+def _font_scale_path():
+    return os.path.join(_display_dir(), 'font-scale')
+
+
+def _render_kanshi_config(outputs):
+    """Render a kanshi profile from saved outputs. Degrade-not-die: an output with
+    no explicit mode falls back to `enable` (the compositor's preferred mode)."""
+    lines = [
+        '# HART OS multi-monitor profile (managed by the display settings backend).',
+        '# Regenerated from profile.json; re-applied on hotplug by hart-kanshi.',
+        'profile hart {',
+    ]
+    for o in (outputs or []):
+        name = (o or {}).get('name', '')
+        if not name:
+            continue
+        parts = ['\toutput', '"%s"' % name]
+        if o.get('enabled', True):
+            res = o.get('resolution')
+            if res:
+                parts += ['mode', str(res)]
+            else:
+                parts.append('enable')
+            pos = o.get('position')
+            if pos:
+                parts += ['position', str(pos)]
+            scale = o.get('scale')
+            if scale:
+                parts += ['scale', str(scale)]
+        else:
+            parts.append('disable')
+        lines.append(' '.join(parts))
+    lines.append('}')
+    return '\n'.join(lines) + '\n'
+
+
+def _load_display_profile():
+    return _load_json(_display_profile_path(), {}).get('outputs', [])
+
+
+def _save_display_profile(outputs):
+    """Persist the arrangement: profile.json (UI truth) + kanshi config (daemon
+    input) + a best-effort SIGHUP so a running kanshi reloads. Raises OSError only
+    on a write failure (the caller treats that as 'not persisted', never a crash)."""
+    _save_json(_display_profile_path(), {'outputs': outputs})
+    kpath = _kanshi_config_path()
+    os.makedirs(os.path.dirname(kpath), exist_ok=True)
+    with open(kpath, 'w') as f:
+        f.write(_render_kanshi_config(outputs))
+    # Tell a running kanshi to reload its config (best-effort; absent on a tier
+    # without wlr-output-management — never an error here).
+    _run(['pkill', '-HUP', 'kanshi'], timeout=3)
+
+
+def _wlr_randr_outputs():
+    """Parse `wlr-randr` text into per-output modes — the wlroots fallback for the
+    resolution picker when swaymsg is unavailable. Returns [] on any failure."""
+    import re
+    r = _run(['wlr-randr'], timeout=5)
+    if not (r and r.returncode == 0):
+        return []
+    outputs = []
+    cur = None
+    in_modes = False
+    for raw in r.stdout.split('\n'):
+        if raw and not raw[0].isspace():
+            cur = {'name': raw.split()[0], 'modes': [], 'current': None,
+                   'scale': 1.0, 'active': False}
+            outputs.append(cur)
+            in_modes = False
+        elif cur is not None:
+            s = raw.strip()
+            if s.startswith('Modes:'):
+                in_modes = True
+            elif s.startswith('Enabled:'):
+                cur['active'] = 'yes' in s.lower()
+                in_modes = False
+            elif s.startswith('Scale:'):
+                in_modes = False
+                try:
+                    cur['scale'] = float(s.split(':', 1)[1])
+                except ValueError:
+                    pass
+            elif in_modes:
+                m = re.match(r'(\d+)x(\d+)\s+px,\s+([\d.]+)\s*Hz(.*)', s)
+                if m:
+                    resn = '%sx%s' % (m.group(1), m.group(2))
+                    cur['modes'].append(
+                        {'resolution': resn, 'refresh': round(float(m.group(3)), 3)})
+                    if 'current' in m.group(4):
+                        cur['current'] = resn
+            else:
+                in_modes = False
+    return outputs
+
+
+def _apply_output(name, spec):
+    """Apply one output's settings live via swaymsg (wlr-randr fallback). Returns
+    (ok, degraded). Degrade-not-die: if the requested mode is rejected, retry with
+    `enable` at the preferred mode and report degraded=True instead of failing."""
+    spec = spec or {}
+    res = spec.get('resolution')
+    pos = spec.get('position')
+    scale = spec.get('scale')
+    enabled = spec.get('enabled', True)
+    if not _is_wayland():
+        return False, False
+    cmd = ['swaymsg', 'output', name]
+    if enabled:
+        cmd.append('enable')
+        if res:
+            cmd += ['mode', str(res)]
+        if pos:
+            cmd += ['position', str(pos)]
+        if scale:
+            cmd += ['scale', str(scale)]
+    else:
+        cmd.append('disable')
+    r = _run(cmd, timeout=5)
+    if r and r.returncode == 0:
+        return True, False
+    # swaymsg unavailable (None) or rejected the mode → wlr-randr fallback.
+    wcmd = ['wlr-randr', '--output', name]
+    if enabled:
+        if res:
+            wcmd += ['--mode', str(res)]
+        if pos:
+            wcmd += ['--pos', str(pos)]
+        if scale:
+            wcmd += ['--scale', str(scale)]
+    else:
+        wcmd.append('--off')
+    rw = _run(wcmd, timeout=5)
+    if rw and rw.returncode == 0:
+        return True, False
+    # Both rejected the explicit mode → degrade to the preferred mode (keep the
+    # output LIT rather than dark): retry with bare enable + scale only.
+    if enabled and res:
+        safe = ['swaymsg', 'output', name, 'enable']
+        if scale:
+            safe += ['scale', str(scale)]
+        rs = _run(safe, timeout=5)
+        if rs and rs.returncode == 0:
+            return True, True
+    return False, False
+
+
+# ─── Offline wallpaper sourcing ─────────────────────────────────
+# Appearance must work with the network OFF, so the wallpaper picker reads
+# BUNDLED assets only. On NixOS the FHS /usr/share/backgrounds does not exist;
+# system packages (gnome-backgrounds, bundled by hart-apps.nix) install under
+# /run/current-system/sw/share/backgrounds. We scan the real NixOS-valid dirs
+# plus the user dir, descending one subdir level (gnome ships under .../gnome).
+
+_WALLPAPER_SCAN_CAP = 240  # hard upper bound so a huge dir can never stall
+
+
+def _WALLPAPER_DIRS():
+    """Ordered candidate wallpaper dirs (NixOS-valid first, then user, then FHS
+    for non-NixOS hosts). A HART override via HART_WALLPAPER_DIR comes first."""
+    dirs = []
+    override = os.environ.get('HART_WALLPAPER_DIR', '').strip()
+    if override:
+        dirs.append(override)
+    dirs.extend([
+        '/run/current-system/sw/share/backgrounds',   # NixOS systemPackages
+        os.path.expanduser('~/.local/share/backgrounds'),
+        '/usr/share/backgrounds',                      # FHS (non-NixOS hosts)
+    ])
+    # De-dupe while preserving order.
+    seen, out = set(), []
+    for d in dirs:
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def _collect_wallpapers(dirs, exts):
+    """Collect image files from each dir and its immediate subdirs (offline,
+    bounded, dedup by path). Never raises on a missing/unreadable dir."""
+    images, seen = [], set()
+
+    def _scan_one(d):
+        try:
+            entries = sorted(os.listdir(d))
+        except OSError:
+            return
+        for f in entries:
+            if len(images) >= _WALLPAPER_SCAN_CAP:
+                return
+            if os.path.splitext(f)[1].lower() not in exts:
+                continue
+            fp = os.path.join(d, f)
+            if fp in seen:
+                continue
+            try:
+                stat = os.stat(fp)
+            except OSError:
+                continue
+            seen.add(fp)
+            images.append({'path': fp, 'name': os.path.splitext(f)[0],
+                           'size': stat.st_size})
+
+    for base in dirs:
+        if len(images) >= _WALLPAPER_SCAN_CAP:
+            break
+        if not os.path.isdir(base):
+            continue
+        _scan_one(base)
+        # One level of subdirs (e.g. backgrounds/gnome) — bounded.
+        try:
+            subs = sorted(os.listdir(base))
+        except OSError:
+            subs = []
+        for sub in subs:
+            if len(images) >= _WALLPAPER_SCAN_CAP:
+                break
+            subpath = os.path.join(base, sub)
+            if os.path.isdir(subpath):
+                _scan_one(subpath)
+    return images
+
+
 # ─── Clipboard state (in-memory) ───────────────────────────────
 
 _clipboard_history = collections.deque(maxlen=100)
@@ -149,6 +487,34 @@ def register_shell_desktop_routes(app):
         if action in ('on', 'enable', 'wake'):
             return jsonify(enable_all())
         return jsonify(status())
+
+    # ─── About > Credits: third-party art licence ledger (#143) ──────────────
+    # Renders docs/THIRD_PARTY_ART.md (source + licence + credit lines) into the
+    # OS About screen (Settings > About > Credits, hartCredits.js). Offline,
+    # read-only, no auth gate (like /apps/catalog); never 500s.
+    @app.route('/api/shell/credits', methods=['GET'])
+    def shell_credits():
+        return jsonify(get_credits_ledger())
+
+    # ─── App Store catalog (OFFLINE source of truth) ─────────────────────────
+    # The curated FOSS catalog served from the canonical JSON
+    # (nixos/modules/hart-app-catalog.json via app_catalog.py) — NO network, NO
+    # `nix search` / `flatpak search` shell-out. Each entry is annotated with a
+    # LOCAL installed flag (shutil.which) so the store honestly shows Open for a
+    # preinstalled app and Install for a catalog one with the internet OFF. The
+    # online /search route (app_installer.py) stays an OPTIONAL accelerant on top.
+    # Registered on BOTH prefixes (mirroring app_installer's dual-prefix surface)
+    # so the marketplace JS can adopt it without a parallel route. Read-only, no
+    # auth gate (like /installed + /search).
+    def _shell_apps_catalog():
+        from integrations.agent_engine import app_catalog
+        return jsonify(app_catalog.get_catalog_view(
+            query=request.args.get('q', '')))
+
+    app.add_url_rule('/api/shell/apps/catalog', 'shell_apps_catalog',
+                     _shell_apps_catalog, methods=['GET'])
+    app.add_url_rule('/api/apps/catalog', 'shell_apps_catalog__legacy',
+                     _shell_apps_catalog, methods=['GET'])
 
     @app.route('/api/shell/default-apps', methods=['GET'])
     def shell_default_apps():
@@ -410,12 +776,34 @@ def register_shell_desktop_routes(app):
         event = data.get('event', '')
         if not file and not event:
             return jsonify({'error': 'file or event required'}), 400
+        # Respect the sound-enabled toggle (same cfg the events route reads); a
+        # muted OS makes NO sound rather than shelling a player out for nothing.
+        cfg = _load_json(_config_path('sound-theme.json'),
+                         {'active': 'freedesktop', 'enabled': True})
+        if not cfg.get('enabled', True):
+            return jsonify({'played': False, 'muted': True})
+        # A NAMED event (no explicit file / user override) plays the freedesktop
+        # way: canberra-gtk-play -i <event> maps the event id to the active sound
+        # theme's sound through libcanberra — no manual file resolution, honouring
+        # the selected theme via libcanberra's canberra.xdg-theme.name property.
+        # Bounded via _run (short notification sounds; the timeout can never wedge
+        # the request thread). Falls back to file-resolution + a raw player below.
         if event and not file:
             overrides = _load_json(_config_path('sound-overrides.json'), {})
             if event in overrides:
                 file = overrides[event]
             else:
-                cfg = _load_json(_config_path('sound-theme.json'), {'active': 'freedesktop'})
+                canberra = shutil.which('canberra-gtk-play')
+                if canberra:
+                    cmd = [canberra, '-i', event]
+                    theme = cfg.get('active', '')
+                    if theme and theme != 'freedesktop':
+                        cmd += ['-P', 'canberra.xdg-theme.name=' + theme]
+                    r = _run(cmd, timeout=5)
+                    if r and r.returncode == 0:
+                        return jsonify({'played': True, 'event': event,
+                                        'via': 'canberra'})
+                # canberra absent or it rejected the event → resolve a theme file.
                 theme = cfg.get('active', 'freedesktop')
                 for ext in ('oga', 'ogg', 'wav'):
                     for base in ['/usr/share/sounds', '/run/current-system/sw/share/sounds']:
@@ -585,33 +973,39 @@ def register_shell_desktop_routes(app):
 
     @app.route('/api/shell/wallpaper', methods=['GET'])
     def shell_wallpaper():
-        cfg = _load_json(_WALL_CFG, {
+        # Merge defaults PER-KEY: _load_json's default is whole-file, so a
+        # partial cfg (e.g. only {'slideshow':...} written by the slideshow
+        # route) used to drop 'current'/'mode' from the reply entirely
+        # (deployed-surface suite wart #2).
+        defaults = {
             'current': '', 'lock_screen': '',
             'mode': 'fill',
             'slideshow': {'enabled': False, 'interval_minutes': 30, 'directory': ''},
-        })
+        }
+        cfg = dict(defaults)
+        cfg.update(_load_json(_WALL_CFG, {}))
         return jsonify(cfg)
 
     @app.route('/api/shell/wallpaper/collection', methods=['GET'])
     def shell_wallpaper_collection():
-        directory = request.args.get('directory', '/usr/share/backgrounds')
-        if not os.path.isdir(directory):
-            return jsonify({'images': [], 'count': 0})
-        images = []
-        for f in sorted(os.listdir(directory)):
-            ext = os.path.splitext(f)[1].lower()
-            if ext not in _WALL_EXTS:
-                continue
-            fp = os.path.join(directory, f)
-            try:
-                stat = os.stat(fp)
-                images.append({
-                    'path': fp, 'name': os.path.splitext(f)[0],
-                    'size': stat.st_size,
-                })
-            except OSError:
-                pass
-        return jsonify({'images': images, 'count': len(images)})
+        """List wallpapers OFFLINE (no network, bundled assets only).
+
+        Appearance must work with the internet OFF, so when no explicit
+        ``directory`` is given we scan a list of NixOS-VALID background dirs (plus
+        the user dir) rather than the FHS /usr/share/backgrounds that does not
+        exist on NixOS and left the picker empty. gnome-backgrounds (bundled by
+        hart-apps.nix) installs under /run/current-system/sw/share/backgrounds/
+        gnome, so we also descend one subdir level. Explicit ``directory`` keeps
+        the old single-dir behaviour for callers that pass one.
+        """
+        directory = request.args.get('directory', '').strip()
+        if directory:
+            dirs = [directory]
+        else:
+            dirs = _WALLPAPER_DIRS()
+        images = _collect_wallpapers(dirs, _WALL_EXTS)
+        return jsonify({'images': images, 'count': len(images),
+                        'directories': [d for d in dirs if os.path.isdir(d)]})
 
     @app.route('/api/shell/wallpaper/set', methods=['POST'])
     def shell_wallpaper_set():
@@ -795,8 +1189,11 @@ def register_shell_desktop_routes(app):
                 subprocess.Popen([tool, '-O', str(temp)],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return jsonify({'enabled': True, 'active': True, 'temperature': temp})
+            # 503: no gamma tool on this build = the nightlight SERVICE is
+            # unavailable (controlled; the config change above still persisted),
+            # not a server crash. Found by the deployed-surface suite.
             return jsonify({'enabled': True, 'active': False,
-                            'error': 'Neither gammastep nor redshift available'}), 500
+                            'error': 'Neither gammastep nor redshift available'}), 503
         for proc in ('gammastep', 'redshift'):
             _run(['pkill', '-x', proc])
         return jsonify({'enabled': False, 'active': False})
@@ -933,7 +1330,9 @@ def register_shell_desktop_routes(app):
             ws_name = name or str(int(time.time()) % 100)
             _run(['swaymsg', f'workspace {ws_name}'])
             return jsonify({'created': True, 'name': ws_name})
-        return jsonify({'created': False, 'error': f'{comp}: workspace creation not supported'}), 500
+        # 501: this compositor has no create verb -- an honest not-implemented,
+        # mirroring the sibling switch handler's explicit NEVER-500 contract.
+        return jsonify({'created': False, 'error': f'{comp}: workspace creation not supported'}), 501
 
     @app.route('/api/shell/workspaces/switch', methods=['POST'])
     def shell_workspaces_switch():
@@ -947,7 +1346,30 @@ def register_shell_desktop_routes(app):
         elif comp == 'x11':
             _run(['wmctrl', '-s', str(ws_id)])
             return jsonify({'switched': True, 'workspace': ws_id})
-        return jsonify({'switched': False}), 500
+        # hart-comp (Wayland with no SWAYSOCK) + any other compositor: route the
+        # native-window switch through the brain's ONE window-manager client
+        # (workspace.switch == com.hart.Compositor IPC §4.8). NEVER 500 — the
+        # shell's own client-side panel show/hide (hartWorkspaces.js) is
+        # authoritative for the glass UI on every tier; this only moves real
+        # toplevels where a WM is present, and degrades to a 200 no-op otherwise.
+        #
+        # FOLLOW-UP (swaymsg-shim gap): HartWmClient is still a swaymsg shim, so on
+        # the real hart-comp desktop this is an HONEST no-op (swaymsg absent ->
+        # ok:False) until the com.hart.Compositor IPC backend
+        # (compositor/IPC_PROTOCOL.md §4.8) replaces the shim. We do NOT fake a
+        # switch — switched reflects whether a real WM acted.
+        switched = False
+        try:
+            from integrations.agent_engine.hart_wm_client import get_wm_client
+            res = get_wm_client().dispatch_verb(
+                'workspace.switch', {'workspace': int(ws_id)}, agent_id='shell')
+            switched = bool(res.get('ok'))
+        except Exception:
+            # Bad/empty id, unimportable client, or a transport error: still a
+            # 200 no-op, never a 500 (the shell already switched its panels).
+            switched = False
+        return jsonify({'switched': switched, 'workspace': name,
+                        'compositor': comp})
 
     @app.route('/api/shell/workspaces/close', methods=['POST'])
     def shell_workspaces_close():
@@ -1090,6 +1512,118 @@ def register_shell_desktop_routes(app):
             os.environ['GDK_SCALE'] = str(int(scale))
             ok = True
         return jsonify({'status': 'ok' if ok else 'error', 'scale': scale})
+
+    # ─── Available modes (resolution picker data) ──────────
+
+    @app.route('/api/shell/displays/modes', methods=['GET'])
+    def shell_displays_modes():
+        """Enumerate AVAILABLE modes + current mode/scale per connected output —
+        the data a resolution/scale picker needs (the gap the bare /displays GET
+        leaves). swaymsg JSON primary, wlr-randr text fallback. Degrade-not-die:
+        a compositor without wlr-output-management (Tier-1 hart-comp today) yields
+        an empty list, never an error."""
+        outputs = []
+        if _is_wayland():
+            r = _run(['swaymsg', '-t', 'get_outputs', '-r'], timeout=5)
+            if r and r.returncode == 0:
+                try:
+                    for out in json.loads(r.stdout):
+                        modes, seen = [], set()
+                        for m in out.get('modes', []):
+                            w, h = m.get('width'), m.get('height')
+                            hz = round(m.get('refresh', 0) / 1000.0, 3)
+                            key = (w, h, hz)
+                            if w and h and key not in seen:
+                                seen.add(key)
+                                modes.append({'resolution': '%sx%s' % (w, h),
+                                              'refresh': hz})
+                        cm = out.get('current_mode') or {}
+                        current = ('%sx%s' % (cm.get('width'), cm.get('height'))
+                                   if cm.get('width') else None)
+                        outputs.append({
+                            'name': out.get('name', ''),
+                            'current': current,
+                            'scale': out.get('scale', 1.0),
+                            'active': out.get('active', False),
+                            'modes': modes,
+                        })
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    outputs = []
+            if not outputs:
+                outputs = _wlr_randr_outputs()
+        return jsonify({'outputs': outputs,
+                        'compositor': 'wayland' if _is_wayland() else 'x11'})
+
+    # ─── Multi-monitor profile (persist + apply; survives reboot/hotplug) ──
+
+    @app.route('/api/shell/displays/profile', methods=['GET', 'POST'])
+    def shell_displays_profile():
+        """GET the saved multi-monitor arrangement. POST applies it live (swaymsg/
+        wlr-randr) AND persists it (profile.json + kanshi config) so it survives a
+        reboot and is re-applied on hotplug by the hart-kanshi daemon — the
+        persistence gap the bare /displays/arrange PUT leaves. Degrade-not-die: a
+        rejected mode falls back to the output's preferred mode (reported degraded),
+        and a persistence failure never fails the apply."""
+        if request.method == 'GET':
+            return jsonify({'outputs': _load_display_profile()})
+        body = request.get_json(silent=True) or {}
+        outputs = body.get('outputs', [])
+        if not isinstance(outputs, list) or not outputs:
+            return jsonify({'error': 'outputs (non-empty list) required'}), 400
+        results, degraded_any = [], False
+        for spec in outputs:
+            name = (spec or {}).get('name', '')
+            if not name:
+                continue
+            ok, degraded = _apply_output(name, spec)
+            degraded_any = degraded_any or degraded
+            results.append({'name': name, 'applied': ok, 'degraded': degraded})
+        # Persist regardless of live-apply success so the saved layout is honored
+        # next session even when applied headless / on a tier without live IPC.
+        persisted = True
+        try:
+            _save_display_profile(outputs)
+        except OSError:
+            persisted = False
+        _audit_desktop_op('displays_profile_save',
+                          {'count': len(outputs), 'degraded': degraded_any})
+        return jsonify({'status': 'ok', 'persisted': persisted,
+                        'degraded': degraded_any, 'outputs': results})
+
+    # ─── Font scaling preference (the lever lives in nix; this persists the
+    #     user's choice for the next session) ────────────────
+
+    @app.route('/api/shell/display/font-scale', methods=['GET', 'POST'])
+    def shell_display_font_scale():
+        """GET the persisted font-scale preference + the GDK_DPI_SCALE in effect.
+        POST persists a new preference (clamped 0.5..3.0). The font-DPI lever itself
+        is the compositor-agnostic env + fontconfig set declaratively (hart.display.
+        fontScale); a live WebView cannot re-DPI its text without a re-login, so a
+        POST honestly reports applied_on='next-session' (never a silent no-op)."""
+        path = _font_scale_path()
+        if request.method == 'GET':
+            scale = 1.0
+            try:
+                with open(path) as f:
+                    scale = float(f.read().strip())
+            except (FileNotFoundError, ValueError):
+                pass
+            return jsonify({'scale': scale,
+                            'env_gdk_dpi_scale': os.environ.get('GDK_DPI_SCALE', '')})
+        body = request.get_json(silent=True) or {}
+        try:
+            scale = float(body.get('scale'))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'scale (number) required'}), 400
+        scale = max(0.5, min(3.0, scale))
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w') as f:
+                f.write(str(scale))
+        except OSError as e:
+            return jsonify({'error': 'persist failed: %s' % e}), 500
+        return jsonify({'status': 'ok', 'scale': scale,
+                        'applied_on': 'next-session'})
 
     # ─── Per-App Volume Control ────────────────────────────
 

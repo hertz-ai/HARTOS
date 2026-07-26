@@ -166,10 +166,37 @@ class FlaskChannelIntegration:
 
             logger.info(f"Routing message from {message.channel}:{message.sender_id} to agent")
 
+            # Authenticate the internal hop to /chat.
+            #
+            # This call had no headers at all. On central/regional tiers
+            # security/middleware.py Gate 2 rejects an unauthenticated
+            # internal /chat POST with 401 "Authentication required (Bearer
+            # token)", so EVERY inbound channel message -- Telegram, Discord,
+            # WhatsApp, Slack -- got back "Sorry, I encountered an error
+            # processing your request." A connected channel looked wired up
+            # and answered every message with an apology.
+            #
+            # Reusing agent_engine.dispatch._internal_auth_headers rather than
+            # minting a header here: it already solves exactly this (its
+            # docstring records the same 401 silently breaking the outreach
+            # dispatch path from 2026-03-14). One implementation, so a future
+            # change to internal auth cannot fix one caller and miss the
+            # other -- which is precisely how this bug survived. Imported
+            # lazily to keep channels -> agent_engine out of module import
+            # order. Returns None on flat tier, where no header is needed.
+            try:
+                from integrations.agent_engine.dispatch import (
+                    _internal_auth_headers)
+                _auth_headers = _internal_auth_headers()
+            except Exception as _auth_err:  # never block a message on this
+                logger.debug("internal auth header unavailable: %s", _auth_err)
+                _auth_headers = None
+
             # Call agent API
             response = pooled_post(
                 self.agent_api_url,
                 json=payload,
+                headers=_auth_headers,
                 timeout=120,  # 2 minute timeout for agent processing
             )
 
@@ -333,7 +360,7 @@ class FlaskChannelIntegration:
             mod = importlib.import_module(module_path, package='integrations.channels')
             factory_fn = getattr(mod, factory_name)
             if token:
-                adapter = factory_fn(token=token, **kwargs)
+                adapter = factory_fn(**self._credential_kwarg(factory_fn, token), **kwargs)
             else:
                 adapter = factory_fn(**kwargs)
             self.registry.register(adapter)
@@ -342,6 +369,39 @@ class FlaskChannelIntegration:
         except Exception as e:
             logger.warning(f"{channel_type} adapter registration failed: {e}")
             return False
+
+    @staticmethod
+    def _credential_kwarg(factory_fn, token: str) -> Dict[str, str]:
+        """Map the caller's credential to the factory's OWN first parameter
+        name, instead of always assuming ``token=``.
+
+        Most adapter factories accept ``token``, but several don't:
+        ``create_whatsapp_adapter(api_url=...)`` and
+        ``create_signal_adapter(phone_number=..., api_url=...)`` both take
+        the credential under a different name.  Passing ``token=`` to
+        those either raised a TypeError (unexpected keyword argument) or —
+        worse, for factories with a stray **kwargs catch-all — silently
+        absorbed it into kwargs and left the real (required) parameter
+        None, so the factory raised its own "required" ValueError instead.
+        Either way, register_channel() failed for every credential-based
+        channel whose factory doesn't happen to name its parameter
+        ``token``. inspect the factory's actual signature instead of
+        guessing.
+        """
+        import inspect
+        try:
+            params = list(inspect.signature(factory_fn).parameters.values())
+        except (TypeError, ValueError):
+            return {'token': token}
+        names = [
+            p.name for p in params
+            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        ]
+        if 'token' in names:
+            return {'token': token}
+        if names:
+            return {names[0]: token}
+        return {'token': token}
 
     # Keep legacy methods as thin delegates for backward compat
     def register_telegram(self, token: str = None, **kwargs) -> None:

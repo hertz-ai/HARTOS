@@ -40,15 +40,15 @@ collect_ignore_glob = [
     os.path.join(os.path.dirname(__file__), 'e2e', 'runtime_tests', '*.py'),
 ]
 
-from lifecycle_hooks import (
-    ActionState, FlowState,
-    action_states, flow_lifecycle,
-    initialize_deterministic_actions
-)
-try:
-    from helper import Action
-except ImportError:
-    Action = None  # autogen not installed — tests needing Action will skip
+# #163 — heavy imports are LAZY (done inside the fixtures that use them) so
+# importing this conftest is cheap and does NOT pull the full dependency chain
+# at collection time: lifecycle_hooks → core.session_cache → core.http_pool →
+# requests, and helper → langchain. That heavy module-level import is the ONLY
+# reason CI ran `--noconftest` (copied from the deps-light nix-check context) —
+# which then skipped these fixtures + the autouse FSM reset, so the recipe/
+# action-execution tests ERRORed instead of running. Lazy here = conftest loads
+# everywhere, and `--noconftest` can be dropped (proven: those tests go from 40
+# fixture-not-found errors to 48 passing).
 
 
 def pytest_configure(config):
@@ -65,13 +65,16 @@ def reset_state_machine():
     requires Flask app context, which not all test files set up.
     """
     try:
+        from lifecycle_hooks import (
+            action_states, flow_lifecycle, initialize_deterministic_actions)
         action_states.clear()
         flow_lifecycle.flows.clear()
         initialize_deterministic_actions()
     except (RuntimeError, Exception):
-        pass  # No Flask app context - test doesn't use lifecycle hooks
+        pass  # No Flask app context / deps absent - test doesn't use lifecycle
     yield
     try:
+        from lifecycle_hooks import action_states, flow_lifecycle
         action_states.clear()
         flow_lifecycle.flows.clear()
     except (RuntimeError, Exception):
@@ -109,6 +112,10 @@ def sample_actions():
 @pytest.fixture
 def mock_user_tasks(sample_actions):
     """Mock user tasks object"""
+    try:
+        from helper import Action
+    except ImportError:
+        pytest.skip("helper.Action unavailable (autogen not installed)")
     tasks = Action(sample_actions)
     tasks.current_action = 1
     tasks.fallback = False
@@ -294,6 +301,7 @@ def create_mock_message():
 @pytest.fixture
 def action_flow_scenarios():
     """Predefined action flow scenarios for testing"""
+    from lifecycle_hooks import ActionState
     return {
         'success_flow': [
             ActionState.ASSIGNED,

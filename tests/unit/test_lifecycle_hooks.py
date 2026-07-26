@@ -260,12 +260,13 @@ class TestActionStateEnum:
             "fallback_received", "recipe_requested", "recipe_received",
             "terminated", "executing_motion", "sensor_confirm",
             "preview_pending", "preview_approved",
+            "gave_up",  # #139: distinct HONEST give-up terminal (ledger FAILED), re-openable for a hive retry
         }
         actual = {s.value for s in ActionState}
         assert expected == actual
 
     def test_enum_count(self):
-        assert len(ActionState) == 15
+        assert len(ActionState) == 16
 
     def test_flow_state_enum(self):
         assert FlowState.FLOW_COMPLETED.value == "flow_completed"

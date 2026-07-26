@@ -306,6 +306,27 @@ class HierarchyService:
             'assignment_id': assignment.id,
         }
 
+    # ─── Region membership (sub-fleet scope) ───
+
+    @staticmethod
+    def region_member_node_ids(db: Session, regional_node_id: str) -> List[str]:
+        """Return the local node_ids a regional host owns — its sub-fleet.
+
+        SINGLE source of truth for "which nodes does this regional command".
+        The mapping is the central-issued RegionAssignment table (written only
+        by assign_to_region / register_local_node, which are central-authority
+        paths).  A regional READS this set; it cannot widen it.  Used to scope a
+        regional-initiated OTA publish so a regional can never reach beyond its
+        own region.  Returns active assignments only; empty list when the
+        regional hosts no locals (the caller must then fan out to nobody).
+        """
+        from .models import RegionAssignment
+        rows = db.query(RegionAssignment).filter(
+            RegionAssignment.regional_node_id == regional_node_id,
+            RegionAssignment.status == 'active',
+        ).all()
+        return [r.local_node_id for r in rows]
+
     # ─── Tier-Aware Gossip Targets ───
 
     @staticmethod

@@ -639,9 +639,32 @@ class HARTOnboardingWindow(Adw.ApplicationWindow):
         self._build_reveal_page(result)
 
     def _on_accept_name(self, btn):
-        """Seal the name forever."""
+        """Seal the name forever, then advance the ceremony to the sealed page.
+
+        #167 — this must never be a dead no-op. The seal happens through the
+        shared FSM (accept_name -> HARTNameRegistry.seal_name). A successful
+        seal is signalled by 'name_sealed' (the name is now permanent); the web
+        flow then opens a companion-download step, so the FSM no longer puts
+        'sealed' (the session-cleanup signal) on this response. We treat the
+        accept as successful when the FSM signals it (name_sealed/sealed) OR
+        when the canonical seal reader confirms the name is now persisted — so
+        a benign re-entry (the FSM has already moved past 'reveal') still lands
+        on the sealed page and advances to the desktop instead of showing an
+        error.
+        """
         result = self.session.advance(action='accept_name')
-        if result.get('sealed'):
+        if (result.get('name_sealed') or result.get('sealed')
+                or has_hart_name(self.user_id)):
+            # Backfill the sealed identity from the persisted profile when the
+            # FSM response doesn't carry it (idempotent re-entry path), so the
+            # sealed page always renders the name/tag/emoji.
+            if not result.get('hart_name'):
+                profile = get_hart_profile(self.user_id) or {}
+                if profile.get('name'):
+                    result.setdefault('hart_name', profile['name'])
+                    result.setdefault('hart_tag', profile.get('hart_tag', ''))
+                    result.setdefault('emoji_combo',
+                                      profile.get('emoji_combo', ''))
             self._build_sealed_page(result)
         else:
             # Error — show message and retry
@@ -663,8 +686,86 @@ class HARTOnboardingWindow(Adw.ApplicationWindow):
         self._build_reveal_page(result)
 
     def _on_begin(self, btn):
-        """Ceremony complete — close and start the desktop."""
+        """Identity sealed. Before closing, offer the local-AI setup step IF no
+        model is running yet -- the native post-install AI wizard (steward
+        2026-07-22). It WIRES the existing model_onboarding backend (needs_setup /
+        recommend_for_hardware / onboard); it is not a new provisioning path. Any
+        failure here degrades to closing the ceremony -- AI setup is optional and
+        must NEVER block the desktop from starting."""
+        try:
+            from integrations.service_tools.model_onboarding import (
+                needs_setup, recommend_for_hardware,
+            )
+            if needs_setup():
+                self._build_ai_model_page(recommend_for_hardware())
+                return
+        except Exception as e:
+            print('native_onboarding: AI setup step skipped (%s)' % e, file=sys.stderr)
         self.close()
+
+    def _build_ai_model_page(self, rec):
+        """The native local-AI setup step. Reuses the ceremony's own page idiom;
+        the two buttons drive the EXISTING onboard() backend on a worker thread."""
+        page = self._center_box()
+
+        title = Gtk.Label(label='Set up your local AI', wrap=True,
+                          justify=Gtk.Justification.CENTER)
+        title.add_css_class('sealed-name')
+        page.append(title)
+
+        sub = Gtk.Label(
+            label=('HART runs its intelligence ON THIS MACHINE, private by '
+                   'default. Recommended for your hardware:\n' + rec.get('label', '')),
+            wrap=True, wrap_mode=2, justify=Gtk.Justification.CENTER)
+        sub.add_css_class('post-text')
+        page.append(sub)
+
+        spacer = Gtk.Box(); spacer.set_size_request(-1, 40); page.append(spacer)
+
+        self._ai_status = Gtk.Label(label='', wrap=True,
+                                    justify=Gtk.Justification.CENTER)
+        self._ai_status.add_css_class('post-text')
+        page.append(self._ai_status)
+
+        setup_btn = Gtk.Button(label='Set up (' + rec.get('label', 'local model') + ')')
+        setup_btn.add_css_class('action-btn')
+        setup_btn.add_css_class('action-btn-primary')
+        setup_btn.connect('clicked', self._on_ai_setup, rec)
+        page.append(setup_btn)
+
+        skip_btn = Gtk.Button(label='Skip for now')
+        skip_btn.add_css_class('action-btn')
+        skip_btn.connect('clicked', lambda _b: self.close())
+        page.append(skip_btn)
+
+        self.stack.add_named(page, 'ai_model')
+        self.stack.set_visible_child_name('ai_model')
+
+    def _on_ai_setup(self, btn, rec):
+        """Download + start the recommended model on a worker thread (onboard()
+        blocks on the download + llama-server start), streaming progress to the
+        label. On completion or error, the ceremony closes."""
+        btn.set_sensitive(False)
+        self._ai_status.set_label('Downloading + starting ' + rec.get('label', 'the model')
+                                  + ' ... this can take a few minutes.')
+
+        def _work():
+            try:
+                from integrations.service_tools.model_onboarding import onboard
+                result = onboard(rec['model_name'], rec.get('quant', 'auto'))
+                ok = bool(result and result.get('success', result.get('status') == 'ok'))
+                msg = ('Local AI ready. HART is yours.' if ok
+                       else 'Setup did not finish; you can set it up later in Settings.')
+            except Exception as e:
+                msg = 'Setup unavailable (%s); you can set it up later in Settings.' % type(e).__name__
+            def _done():
+                self._ai_status.set_label(msg)
+                self._schedule(1800, lambda: self.close())
+                return False
+            GLib.idle_add(_done)
+
+        import threading
+        threading.Thread(target=_work, daemon=True).start()
 
     # ── Utilities ───────────────────────────────────────────────
 

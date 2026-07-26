@@ -91,6 +91,19 @@ def check_media_services() -> str:
 def force_regenerate(
     game_id: Annotated[str, "Game ID to regenerate content for"],
     asset_type: Annotated[str, "Asset type: image, tts, music, or video"],
+    # CONTENT STANDARD — this tool sets none of its own, which is why output
+    # quality tracks whatever prompt a caller happened to write. The standard
+    # lives in ONE place: the $comment in Hevolve's src/data/answers.json.
+    # Point a generation prompt at it rather than restating it here; two
+    # copies drift and nobody can tell which one produced a given page.
+    #
+    # The short version, for anything published under hevolve.ai:
+    #   * answer in the first paragraph, do not promise an answer
+    #   * carry numbers that were actually measured, and say where from
+    #   * a threshold or table beats a paragraph
+    #   * state what the page does NOT solve
+    #   * never invent a measurement — an unverifiable figure discredits the
+    #     verifiable ones next to it
     prompt: Annotated[str, "Generation prompt"] = None
 ) -> str:
     """Force regeneration of a specific asset type for a game.

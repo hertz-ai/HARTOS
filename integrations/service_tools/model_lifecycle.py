@@ -351,7 +351,7 @@ class ModelLifecycleManager:
                         f"Consider reducing pinned model count or using CPU inference."
                     )
         except Exception:
-            pass  # VRAM check is advisory, not blocking
+            logger.exception("start: swallowed Exception")  # VRAM check is advisory, not blocking
 
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -382,7 +382,7 @@ class ModelLifecycleManager:
             if wd:
                 wd.heartbeat('model_lifecycle')
         except Exception:
-            pass
+            logger.exception("_wd_heartbeat: swallowed Exception")
 
     def _wd_sleep(self, seconds: float) -> None:
         """Sleep while keeping the model_lifecycle heartbeat fresh.
@@ -406,7 +406,7 @@ class ModelLifecycleManager:
                 )
                 return
         except Exception:
-            pass
+            logger.exception("_wd_sleep: swallowed Exception")
         time.sleep(seconds)
 
     def _tick(self):
@@ -419,7 +419,7 @@ class ModelLifecycleManager:
             if HiveCircuitBreaker.is_halted():
                 return
         except (ImportError, AttributeError):
-            pass
+            logger.warning("_tick: swallowed ImportError, AttributeError", exc_info=True)
 
         # Phase 1: Refresh real GPU state (may call nvidia-smi subprocess)
         self._refresh_memory_state()
@@ -489,7 +489,7 @@ class ModelLifecycleManager:
         try:
             self._persist_state_to_disk()
         except Exception:
-            pass
+            logger.exception("_tick: swallowed Exception")
 
     # ── Hook callbacks (from RuntimeToolManager) ──────────────
 
@@ -516,7 +516,7 @@ class ModelLifecycleManager:
             try:
                 timeout = float(env_timeout)
             except ValueError:
-                pass
+                logger.debug("_on_tool_started: swallowed ValueError", exc_info=True)
 
         from .vram_manager import VRAM_BUDGETS
         budget = VRAM_BUDGETS.get(tool_name, (0, 0))
@@ -565,7 +565,7 @@ class ModelLifecycleManager:
                         state.pressure_evict_only = bool(
                             hint['pressure_evict_only'])
                 except Exception:
-                    pass
+                    logger.exception("_on_tool_started: swallowed Exception")
             self._models[tool_name] = state
 
         # Notify UI: model loaded — include capabilities from catalog
@@ -593,7 +593,7 @@ class ModelLifecycleManager:
         try:
             self._persist_state_to_disk(force=True)
         except Exception:
-            pass
+            logger.exception("_on_tool_stopped: swallowed Exception")
 
         # Notify UI: model unloaded — these capabilities are now unavailable
         self._emit_event('model.unloaded', {
@@ -752,7 +752,7 @@ class ModelLifecycleManager:
             from .vram_manager import vram_manager
             vram_manager.refresh_gpu_info()
         except Exception:
-            pass
+            logger.exception("_refresh_memory_state: swallowed Exception")
 
         # Sync with RTM's actual process state
         try:
@@ -767,7 +767,7 @@ class ModelLifecycleManager:
                         state.vram_gb = 0.0
                         state.ram_gb = 0.0
         except Exception:
-            pass
+            logger.exception("_refresh_memory_state: swallowed Exception")
 
     def _update_priorities(self):
         """Recalculate priority for every tracked model.
@@ -1018,7 +1018,7 @@ class ModelLifecycleManager:
                 from .vram_manager import vram_manager
                 vram_manager.release(tool_name)
             except Exception:
-                pass
+                logger.exception("_do_offload_to_cpu: swallowed Exception")
             logger.info(f"Lifecycle: offloaded '{tool_name}' to CPU")
 
         return success
@@ -1141,7 +1141,7 @@ class ModelLifecycleManager:
         with self._lock:
             state = self._models.get('llm')
             if state is None:
-                self._models['llm'] = ModelState(
+                state = ModelState(
                     name='llm',
                     device=ModelDevice.GPU,  # Best-effort default
                     priority=ModelPriority.ACTIVE,
@@ -1151,6 +1151,7 @@ class ModelLifecycleManager:
                     crash_count=0,
                     pressure_evict_only=True,
                 )
+                self._models['llm'] = state
             elif state.device == ModelDevice.UNLOADED:
                 # Adopted server is alive but state was stale (spawned outside
                 # RTM -> never marked loaded). Heal in place so the next tick
@@ -1159,6 +1160,17 @@ class ModelLifecycleManager:
                 state.priority = ModelPriority.ACTIVE
                 state.crash_count = 0
                 state.last_access_time = time.time()
+            # PIN the main engine.  It is an EXTERNAL adopted llama-server the
+            # lifecycle CANNOT actually unload, so any pressure eviction only
+            # stamps a FALSE device=UNLOADED — which bounces the user's
+            # foreground "hi" to the LangChain-local "Loading tools..." rung and
+            # evicts piper TTS in the same sweep (the both-symptom ladder
+            # demotion seen under daemon-driven CPU pressure).  Healing the state
+            # on the next tick (#125) only papered over the churn; pinning
+            # PREVENTS it — every eviction rung (VRAM/RAM/CPU/idle) guards on
+            # `not s.pinned`, vram_gb=0.0 ⇒ zero pinned-budget cost, and
+            # _check_llm_health still supervises a REAL death over HTTP.
+            state.pinned = True
 
     def _check_llm_health(self, dead_models: list):
         """Check llama.cpp server health (separate from RTM sidecar tools).
@@ -1315,10 +1327,24 @@ class ModelLifecycleManager:
             # this as a log line so when Nunba is bundled-without-supervisor
             # we can see the LlamaConfig path is unavailable and the G3
             # direct-launch path below is being used by design.
-            logger.info(
-                f"[LLM-WATCHDOG] LlamaConfig import unavailable "
-                f"({e!s}) — falling through to G3 direct-launch supervision"
-            )
+            # LOG ONCE, then debug. A module either imports or it does not: this
+            # verdict cannot change for the life of the process, so re-logging it
+            # on every watchdog tick was ~240 journal lines/hour of pure noise
+            # (real-HW 2026-07-19/20 journals are wallpapered with it, which is
+            # exactly what makes a real fault hard to spot). Still LOGGED, never
+            # silently gulped -- the first occurrence is INFO with the reason, and
+            # subsequent ticks stay visible at debug level.
+            if not getattr(self, '_llm_import_warned', False):
+                self._llm_import_warned = True
+                logger.info(
+                    f"[LLM-WATCHDOG] LlamaConfig import unavailable "
+                    f"({e!s}) - falling through to G3 direct-launch supervision "
+                    f"(logged once; further occurrences at debug)"
+                )
+            else:
+                logger.debug(
+                    f"[LLM-WATCHDOG] LlamaConfig still unavailable ({e!s})"
+                )
         except Exception as e:
             # Previous code only caught ImportError — a real LlamaConfig()
             # instantiation error (e.g. corrupted llama_config.json,
@@ -1349,7 +1375,7 @@ class ModelLifecycleManager:
                     if fh is not None and not fh.closed:
                         fh.close()
                 except Exception:
-                    pass
+                    logger.exception("_check_llm_health: swallowed Exception")
                 self._direct_llama_proc = None
                 self._direct_llama_log_fh = None
                 dead_models.append(('llm', exit_code, 'llm_server_direct'))
@@ -1436,7 +1462,7 @@ class ModelLifecycleManager:
             from .vram_manager import vram_manager
             vram_manager.release(tool_name)
         except Exception:
-            pass
+            logger.exception("_handle_dead_process: swallowed Exception")
 
         # Release from RTM process table
         try:
@@ -1444,7 +1470,7 @@ class ModelLifecycleManager:
             runtime_tool_manager._processes.pop(tool_name, None)
             runtime_tool_manager._ports.pop(tool_name, None)
         except Exception:
-            pass
+            logger.exception("_handle_dead_process: swallowed Exception")
 
         # Sync catalog state
         try:
@@ -1452,7 +1478,7 @@ class ModelLifecycleManager:
             get_orchestrator().notify_unloaded(
                 self._guess_model_type(tool_name), tool_name)
         except Exception:
-            pass
+            logger.exception("_handle_dead_process: swallowed Exception")
 
         # Emit crash event
         self._emit_event('model.crash', {
@@ -1586,7 +1612,7 @@ class ModelLifecycleManager:
                                 st.last_access_time = time.time()
                         continue
                 except Exception:
-                    pass  # Probe failed — proceed with spawn
+                    logger.exception("_process_restart_queue: swallowed Exception")  # Probe failed — proceed with spawn
             downgrade = info.get('downgrade', False)
             old_device = info.get('old_device', 'gpu')
 
@@ -2011,7 +2037,7 @@ class ModelLifecycleManager:
             try:
                 self._swap_queue.remove(entry)
             except ValueError:
-                pass
+                logger.debug("_process_swap_queue: swallowed ValueError", exc_info=True)
 
     # ── Pressure Alerts ──────────────────────────────────────────
 
@@ -2057,7 +2083,7 @@ class ModelLifecycleManager:
             if entry:
                 return entry.capabilities
         except Exception:
-            pass
+            logger.exception("_get_model_capabilities: swallowed Exception")
         return {}
 
     def _emit_event(self, event_type: str, data: dict):
@@ -2066,7 +2092,7 @@ class ModelLifecycleManager:
             from core.platform.events import emit_event
             emit_event(event_type, data)
         except Exception:
-            pass  # EventBus not bootstrapped — silent
+            logger.exception("_emit_event: swallowed Exception")  # EventBus not bootstrapped — silent
 
     def _guess_model_type(self, tool_name: str) -> str:
         """Map tool name to model_type for catalog sync."""
@@ -2116,7 +2142,7 @@ class ModelLifecycleManager:
                 from security.node_integrity import get_node_identity
                 node_id = get_node_identity().get('node_id', '')
             except Exception:
-                pass
+                logger.exception("_report_to_federation: swallowed Exception")
 
             models_stats = {}
             with self._lock:
@@ -2176,7 +2202,7 @@ class ModelLifecycleManager:
                 if runtime_tool_manager._is_server_alive(tool_name):
                     self._on_tool_started(tool_name, device='gpu')
         except Exception:
-            pass
+            logger.exception("_sync_from_rtm: swallowed Exception")
 
     def manual_offload(self, model_name: str) -> dict:
         """Manual GPU→CPU offload (admin API)."""
@@ -2305,7 +2331,7 @@ class ModelLifecycleManager:
             elif cpu_pct >= self._cpu_pressure_pct:
                 factor *= 0.5
         except ImportError:
-            pass
+            logger.debug("_calculate_throttle_factor: swallowed ImportError")
 
         # RAM pressure
         if ram_on if ram_on is not None else self._detect_ram_pressure():
@@ -2331,7 +2357,7 @@ class ModelLifecycleManager:
             from .vram_manager import vram_manager
             vram_status = vram_manager.get_status()
         except Exception:
-            pass
+            logger.exception("get_status: swallowed Exception")
 
         # Crash recovery state
         restart_queue = {}
@@ -2409,7 +2435,7 @@ def _evict_draft_on_non_latin_switch(old_lang, new_lang) -> None:
                 reason=f'language_switch_to_{_new_key}',
             )
     except Exception:
-        pass
+        logger.exception("_evict_draft_on_non_latin_switch: swallowed Exception")
 
 
 try:
@@ -2418,4 +2444,4 @@ try:
 except ImportError:
     # user_lang unavailable standalone (e.g., isolated test env);
     # callers may still invoke request_swap directly.
-    pass
+    logger.debug("<module>: swallowed ImportError")

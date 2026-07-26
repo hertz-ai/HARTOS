@@ -58,6 +58,19 @@ def _get_allowed_roots():
             rp = os.path.realpath(p.strip())
             if os.path.isdir(rp):
                 roots.append(rp)
+    # This PC / partition browsing: admit every real disk mountpoint reported by
+    # psutil (the SAME read-only source the Storage + This-PC panels use), so a
+    # drive root like C:\ or /mnt/data opens in the file manager instead of 403.
+    # Read paths only, and every shell route is _require_shell_auth (local-only)
+    # gated — this widens what the local desktop session can browse, nothing more.
+    try:
+        import psutil
+        for part in psutil.disk_partitions(all=False):
+            mp = os.path.realpath(part.mountpoint)
+            if os.path.isdir(mp) and mp not in roots:
+                roots.append(mp)
+    except Exception:
+        pass
     _ALLOWED_ROOTS = roots
     return roots
 
@@ -135,6 +148,22 @@ def _classify_destructive(action_desc):
         return False  # fail-closed: deny if classifier unavailable
 
 
+# Read-only diagnostic binaries that NEVER need the (LLM-backed) destructive
+# classifier: with shell=False (no pipes/redirects) they cannot mutate state, and
+# gating them on the classifier made the Terminal hang whenever the local LLM was
+# busy or down (every command returned "Fetch is aborted" on real hardware). The
+# classifier still guards every other command. One canonical allowlist; do not duplicate.
+_READONLY_SAFE_BINS = frozenset({
+    'journalctl', 'dmesg', 'ls', 'cat', 'head', 'tail', 'grep', 'egrep', 'fgrep',
+    'ps', 'free', 'df', 'du', 'lsblk', 'blkid', 'lsusb', 'lspci', 'lscpu', 'lsmod',
+    'lsof', 'uname', 'hostname', 'uptime', 'whoami', 'id', 'who', 'w',
+    'printenv', 'date', 'cal', 'pwd', 'echo', 'stat', 'file', 'wc', 'nproc',
+})
+# NOTE: 'env' is deliberately EXCLUDED - `env <program>` executes an arbitrary
+# program, which would bypass the destructive classifier. 'printenv' covers the
+# read-only environment-dump use case.
+
+
 # ── Live accessibility state ──
 # Module-level so the shell RENDER (liquid_ui_service.render_desktop_shell, same
 # process) reads the SAME dict the /api/shell/accessibility routes mutate. Seeded
@@ -158,6 +187,88 @@ except (FileNotFoundError, json.JSONDecodeError, OSError):
 def get_a11y_settings():
     """Live accessibility state — read by both the API and the shell render."""
     return dict(_A11Y_SETTINGS)
+
+
+# ── Firmware-setup (reboot-into-UEFI) capability ──
+# CANONICAL home for "can this box reboot straight into the UEFI/BIOS setup?".
+# ONE writer, imported by both the shell-OS power-action handler AND the
+# liquid_ui_service session route + power-menu gate, so the answer never drifts
+# (DRY: no second copy of this probe).
+#
+# `systemctl reboot --firmware-setup` works only on a UEFI system whose firmware
+# advertises the "boot to firmware UI" capability via the EFI global variable
+# OsIndicationsSupported (bit 0 = EFI_OS_INDICATIONS_BOOT_TO_FW_UI). On legacy
+# BIOS there is no /sys/firmware/efi and the flag is meaningless, so we hide the
+# action entirely. We read the efivar directly (no privileged call): its layout
+# is a 4-byte attributes prefix followed by the 8-byte little-endian value.
+_FW_BOOT_TO_FW_UI = 0x0000000000000001  # EFI_OS_INDICATIONS_BOOT_TO_FW_UI
+
+# efivarfs path for OsIndicationsSupported (EFI global variable namespace GUID
+# 8be4df61-93ca-11d2-aa0d-00e098032b8c).
+_OS_INDICATIONS_SUPPORTED = (
+    '/sys/firmware/efi/efivars/'
+    'OsIndicationsSupported-8be4df61-93ca-11d2-aa0d-00e098032b8c')
+
+
+def firmware_setup_supported():
+    """True iff the system is UEFI-booted AND its firmware advertises the
+    boot-to-firmware-UI capability (so `systemctl reboot --firmware-setup` will
+    actually enter setup). False on legacy BIOS or when the capability is absent
+    — the caller hides the action so the user never gets a plain reboot when they
+    asked for firmware setup."""
+    # 1. Must be UEFI-booted at all.
+    if not os.path.isdir('/sys/firmware/efi'):
+        return False
+    # 2. Read OsIndicationsSupported and test the boot-to-fw-UI bit.
+    try:
+        with open(_OS_INDICATIONS_SUPPORTED, 'rb') as f:
+            raw = f.read()
+        # 4-byte attributes prefix + the variable data (8-byte LE value).
+        if len(raw) < 12:
+            return False
+        value = int.from_bytes(raw[4:12], 'little')
+        return bool(value & _FW_BOOT_TO_FW_UI)
+    except (FileNotFoundError, PermissionError, OSError):
+        # The efivar is absent/unreadable. Be conservative: if we are UEFI-booted
+        # but cannot read the capability, do NOT claim support (hide the action)
+        # — a wrong "supported" would give the user a plain reboot.
+        return False
+
+
+# ── Native logind (org.freedesktop.login1) power calls ──
+# `_logind_call` is the SHARED entry point the power-action route AND the
+# liquid_ui_service session routes use to "ask the OS to reboot / power off /
+# suspend / hibernate / arm firmware setup / lock / terminate a session". The
+# implementation now lives in the canonical TYPED + NATIVE OS bridge
+# (integrations.agent_engine.os_bridge.logind) — #133 / W3: it tries a NATIVE
+# D-Bus call (jeepney, no subprocess) FIRST and falls back to a bounded, result-
+# checked `busctl call --system` only when the native transport is unavailable
+# (e.g. the Windows dev box). Both transports CHECK the result, so a polkit denial
+# surfaces as a REAL error instead of the old `subprocess.Popen(['systemctl',
+# 'reboot'])` fire-and-forget that masked failures as `{'initiated': True}` while
+# the box did nothing. The matching polkit grant lives in nixos/modules/
+# hart-base.nix `security.polkit` (the `hart` user is authorized for these login1
+# actions).
+#
+# This function keeps its `(method, *busctl_args)` signature UNCHANGED — it is
+# imported by liquid_ui_service.py's session routes and mocked by the shell power
+# tests + nixos/tests/power-actions.nix — and simply delegates to the ONE native
+# implementation (no parallel path).
+def _logind_call(method, *busctl_args, timeout=10):
+    """Invoke an org.freedesktop.login1.Manager method, RESULT-CHECKED.
+
+    `busctl_args` are the (signature, *string_values) the method takes, e.g.
+    ('b', 'true') for the interactive-boolean methods (Reboot, PowerOff, Suspend,
+    Hibernate, SetRebootToFirmwareSetup), ('s', sid) for TerminateSession, or
+    nothing for a no-arg method (LockSessions).
+
+    Returns (ok: bool, error: Optional[str]); `ok` is True ONLY when logind
+    accepted the method AND polkit authorized it. Delegates to the canonical
+    native client (os_bridge.logind), which tries native D-Bus first and falls
+    back to bounded busctl — degrade-not-die, never raised to the request thread.
+    """
+    from integrations.agent_engine.os_bridge.logind import logind_call
+    return logind_call(method, busctl_args, timeout=timeout)
 
 
 def register_shell_os_routes(app):
@@ -266,7 +377,10 @@ def register_shell_os_routes(app):
     @_require_shell_auth
     def shell_files_browse():
         """Browse directory contents."""
-        path = request.args.get('path', os.path.expanduser('~'))
+        # expanduser so '~' and '~/Documents' (the explorer's Places sidebar)
+        # resolve to the real home; realpath('~') alone would yield a literal
+        # './~'. Absolute and relative non-~ paths pass through unchanged.
+        path = os.path.expanduser(request.args.get('path', '~'))
         show_hidden = request.args.get('hidden', 'false').lower() == 'true'
 
         # Security: prevent traversal outside allowed paths
@@ -496,14 +610,24 @@ def register_shell_os_routes(app):
             if pattern in cmd_lower:
                 return jsonify({'error': 'Command blocked by safety filter'}), 403
 
-        if not _classify_destructive(f'terminal exec: {command[:200]}'):
-            return jsonify({'error': 'Action classified as destructive — requires approval'}), 403
+        # shell=False prevents command injection; shlex.split tokenizes safely.
+        try:
+            cmd_list = shlex.split(command)
+        except ValueError:
+            cmd_list = command.split()
+        base = os.path.basename(cmd_list[0]) if cmd_list else ''
+
+        # Fast-path obviously read-only diagnostic commands PAST the (LLM-backed)
+        # destructive classifier. Otherwise a busy/down local LLM hangs the classify
+        # call and the Terminal fetch aborts on EVERY command (the real-HW bug). With
+        # shell=False these binaries cannot pipe or redirect, so they stay read-only.
+        if base not in _READONLY_SAFE_BINS:
+            if not _classify_destructive(f'terminal exec: {command[:200]}'):
+                return jsonify({'error': 'Action classified as destructive - requires approval'}), 403
 
         _audit_shell_op('terminal_exec', {'command': command[:200]})
 
         try:
-            # shell=False prevents command injection; shlex.split tokenizes safely
-            cmd_list = shlex.split(command)
             result = subprocess.run(
                 cmd_list, shell=False, capture_output=True,
                 text=True, timeout=timeout, cwd=cwd)
@@ -848,29 +972,70 @@ def register_shell_os_routes(app):
     @app.route('/api/shell/power/action', methods=['POST'])
     @_require_shell_auth
     def shell_power_action():
-        """Execute power action (suspend, hibernate, reboot, shutdown)."""
+        """Execute power action (suspend, hibernate, reboot, shutdown, lock,
+        firmware/uefi)."""
         data = request.get_json(force=True)
         action = data.get('action', '')
 
-        if not _classify_destructive(f'power action: {action}'):
-            return jsonify({'error': 'Action classified as destructive — requires approval'}), 403
+        # These are an ENUMERATED, intentional set of power verbs (the whitelist) —
+        # already behind the local-shell auth gate (@_require_shell_auth) and (for
+        # firmware/uefi) the firmware-capability gate below. They must NOT be
+        # routed through the FREE-FORM destructive classifier: that classifier
+        # exists for arbitrary command/file text (terminal exec, file delete),
+        # and it (a) refuses 'reboot'/'shutdown' as destructive and (b) refuses
+        # 'firmware'/'suspend'/'hibernate' as 'unknown' (fail-closed) — so on a
+        # real box EVERY power action 403'd and the firmware feature was dead.
+        # The canonical gate for a power verb is membership in this whitelist
+        # (and the capability probe for firmware/uefi).
+        #
+        # Each verb maps to a NATIVE logind (org.freedesktop.login1.Manager) D-Bus
+        # method, invoked + result-checked by `_logind_call` above. The interactive
+        # boolean is `true` so logind may consult polkit; the hart-base.nix
+        # security.polkit rule grants the `hart` shell user these login1 actions
+        # outright, so the call is authorized without a prompt. This replaces the
+        # old fire-and-forget `subprocess.Popen(['systemctl', ...])` that masked a
+        # polkit denial as `{'initiated': True}` while the box never powered down.
+        # DRY (#165): the verb -> login1-method map is the ONE canonical copy in
+        # os_bridge.power._POWER_METHOD (reboot/shutdown/suspend/hibernate); reuse
+        # it, do NOT redefine. `lock` is handled by its own no-arg branch below.
+        # This route is the BACKWARD-COMPAT surface (keeps the {action,initiated}
+        # shape + the _logind_call path existing callers/mocks depend on); the
+        # typed forward path new callers should use is POST /api/os/invoke
+        # (os_bridge.routes -> os_bridge.power.invoke_power, same logind_call).
+        from integrations.agent_engine.os_bridge.power import _POWER_METHOD
+        # firmware/uefi = "Restart into Firmware (UEFI)": arm the UEFI boot-to-
+        # firmware-UI flag (SetRebootToFirmwareSetup true), THEN reboot — the next
+        # boot enters the BIOS/UEFI setup. Two-step; if arming fails we do NOT
+        # reboot (a plain reboot would be the wrong action for the user's intent).
+        valid_actions = list(_POWER_METHOD.keys()) + ['lock', 'firmware', 'uefi']
+        if action not in valid_actions:
+            return jsonify({'error': f'Invalid action. Valid: {valid_actions}'}), 400
+
+        # Gate firmware setup to UEFI boxes that advertise the capability — never
+        # give the user a plain reboot when they asked to enter firmware setup.
+        if action in ('firmware', 'uefi') and not firmware_setup_supported():
+            return jsonify({'error': 'Reboot to firmware setup is not supported on '
+                                     'this system (legacy BIOS or capability not '
+                                     'advertised)'}), 400
 
         _audit_shell_op('power_action', {'action': action})
-        actions = {
-            'suspend': ['systemctl', 'suspend'],
-            'hibernate': ['systemctl', 'hibernate'],
-            'reboot': ['systemctl', 'reboot'],
-            'shutdown': ['systemctl', 'poweroff'],
-            'lock': ['loginctl', 'lock-sessions'],
-        }
-        if action not in actions:
-            return jsonify({'error': f'Invalid action. Valid: {list(actions.keys())}'}), 400
 
-        try:
-            subprocess.Popen(actions[action])
-            return jsonify({'action': action, 'initiated': True})
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
+        if action in ('firmware', 'uefi'):
+            ok, err = _logind_call('SetRebootToFirmwareSetup', 'b', 'true')
+            if not ok:
+                return jsonify({'action': action, 'initiated': False,
+                                'error': f'Could not arm firmware setup: {err}'}), 500
+            ok, err = _logind_call('Reboot', 'b', 'true')
+        elif action == 'lock':
+            ok, err = _logind_call('LockSessions')
+        else:
+            ok, err = _logind_call(_POWER_METHOD[action], 'b', 'true')
+
+        if not ok:
+            # Real failure (polkit denied, busctl missing, timeout) — surface it
+            # as an error, never a masked {'initiated': True}.
+            return jsonify({'action': action, 'initiated': False, 'error': err}), 500
+        return jsonify({'action': action, 'initiated': True})
 
     @app.route('/api/shell/power/checkpoint', methods=['POST'])
     def shell_power_checkpoint():
@@ -1648,112 +1813,42 @@ def register_shell_os_routes(app):
             'total_pairs': len(cfg.get('sync_pairs', [])),
         })
 
-    # ─── App Store APIs ─────────────────────────────────────
-
-    @app.route('/api/apps/search', methods=['GET'])
-    def shell_app_search():
-        """Search for installable apps across all platforms."""
-        query = request.args.get('q', '')
-        platform = request.args.get('platform')
-        limit = int(request.args.get('limit', 20))
-        if not query:
-            return jsonify({'error': 'q parameter required'}), 400
-
-        results = []
-        try:
-            from integrations.agent_engine.app_installer import AppInstaller
-            installer = AppInstaller()
-            # AppInstaller.search(query, platforms: Optional[List[str]]) — there is
-            # no platform=/limit= kwarg (the old call raised TypeError, silently
-            # swallowed below, so search ALWAYS returned []). Pass a 1-list, slice.
-            results = installer.search(query, platforms=[platform] if platform else None)[:limit]
-        except (ImportError, Exception) as e:
-            logger.debug(f"App search error: {e}")
-
-        return jsonify({'query': query, 'results': results, 'count': len(results)})
-
-    @app.route('/api/apps/installed', methods=['GET'])
-    def shell_app_installed():
-        """List installed applications."""
-        platform = request.args.get('platform')
-        apps = []
-        try:
-            from integrations.agent_engine.app_installer import AppInstaller
-            installer = AppInstaller()
-            # list_installed() takes NO platform arg (old call raised TypeError);
-            # filter after.
-            apps = installer.list_installed()
-            if platform:
-                apps = [a for a in apps if a.get('platform') == platform]
-        except (ImportError, Exception) as e:
-            logger.debug(f"App list error: {e}")
-
-        # Also include AppRegistry entries. Canonical accessor is the platform
-        # ServiceRegistry's 'apps' component — get_app_registry() does not exist
-        # (the old import raised ImportError, so registry apps never showed).
-        try:
-            from core.platform.registry import get_registry
-            _reg = get_registry()
-            registry = _reg.get('apps') if _reg.has('apps') else None
-            for manifest in (registry.list_all() if registry else []):
-                if not any(a.get('name') == manifest.name for a in apps):
-                    apps.append({
-                        'name': manifest.name, 'id': manifest.id,
-                        'type': manifest.type, 'icon': manifest.icon,
-                        'group': manifest.group,
-                    })
-        except (ImportError, Exception):
-            pass
-
-        return jsonify({'apps': apps, 'count': len(apps)})
-
-    @app.route('/api/apps/install', methods=['POST'])
-    @_require_shell_auth
-    def shell_app_install():
-        """Install an application."""
-        body = request.get_json(silent=True) or {}
-        source = body.get('source')
-        platform = body.get('platform')
-        name = body.get('name')
-        if not source:
-            return jsonify({'error': 'source required'}), 400
-
-        try:
-            from integrations.agent_engine.app_installer import (
-                AppInstaller, InstallRequest, InstallerPlatform)
-            from dataclasses import asdict
-            installer = AppInstaller()
-            # install() takes an InstallRequest, not (source, platform=, name=).
-            try:
-                plat = InstallerPlatform(platform) if platform else InstallerPlatform.UNKNOWN
-            except ValueError:
-                plat = InstallerPlatform.UNKNOWN
-            result = installer.install(InstallRequest(source=source, platform=plat, name=name or ''))
-            _audit_shell_op('app_install', {'source': source, 'platform': platform})
-            return jsonify(asdict(result))   # InstallResult dataclass -> JSON
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-
-    @app.route('/api/apps/uninstall', methods=['POST'])
-    @_require_shell_auth
-    def shell_app_uninstall():
-        """Uninstall an application."""
-        body = request.get_json(silent=True) or {}
-        app_id = body.get('app_id')
-        platform = body.get('platform')
-        if not app_id:
-            return jsonify({'error': 'app_id required'}), 400
-
-        try:
-            from integrations.agent_engine.app_installer import AppInstaller
-            installer = AppInstaller()
-            result = installer.uninstall(app_id, platform=platform)
-            _audit_shell_op('app_uninstall', {'app_id': app_id})
-            return jsonify(result)
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
+    # ─── App Store APIs (consolidated) ──────────────────────
+    # Phase-8 route consolidation: search / installed / install / uninstall (and
+    # detect / history / platforms) used to be DEFINED here on /api/apps/* AND
+    # AGAIN in app_installer.register_app_install_routes on /api/shell/apps/* —
+    # two implementations of the SAME AppInstaller calls that drifted (this copy
+    # had the call-shape bug test_shell_app_routes.py was written to catch). They
+    # are now ONE surface owned by register_app_install_routes, registered on BOTH
+    # the /api/shell/apps/* and /api/apps/* prefixes with the install/uninstall
+    # gate. We delegate here so a caller that only registers shell_os_routes
+    # (tests, edge nodes) still gets the /api/apps/* store routes. Idempotent: the
+    # latch inside register_app_install_routes makes the liquid_ui double-call
+    # (shell_os_routes + its own direct call) a no-op.
+    try:
+        from integrations.agent_engine.app_installer import (
+            register_app_install_routes)
+        register_app_install_routes(app)
+    except Exception as e:  # pragma: no cover - non-shell node
+        logger.debug(f"app install route delegation skipped: {e}")
 
     # ─── App Permissions APIs ─────────────────────────────────
+    # Part of the ONE consolidated app surface: register each permission verb on
+    # BOTH the canonical /api/shell/apps/* prefix and the legacy /api/apps/*
+    # (one view, two URL rules) — same dual-prefix scheme app_installer uses for
+    # the store verbs. The impl + its file I/O stay HERE (heavily mocked by
+    # test_shell_os_apis.py via shell_os_apis.open / _PERMISSIONS_FILE) because
+    # they never touch AppInstaller, so they are not part of the store-route
+    # duplication that was consolidated above.
+
+    def _apps_route(suffix, **kwargs):
+        """Bind one permission view to both /api/shell/apps and /api/apps."""
+        def deco(fn):
+            for i, pfx in enumerate(('/api/shell/apps', '/api/apps')):
+                ep = fn.__name__ if i == 0 else f'{fn.__name__}__legacy'
+                app.add_url_rule(pfx + suffix, ep, fn, **kwargs)
+            return fn
+        return deco
 
     _PERMISSIONS_FILE = os.path.expanduser('~/.config/hart/app-permissions.json')
 
@@ -1769,7 +1864,7 @@ def register_shell_os_routes(app):
         with open(_PERMISSIONS_FILE, 'w') as f:
             json.dump(data, f, indent=2)
 
-    @app.route('/api/apps/<app_id>/permissions', methods=['GET'])
+    @_apps_route('/<app_id>/permissions', methods=['GET'])
     def shell_app_permissions(app_id):
         """Get permissions for an installed app."""
         perms = _load_permissions()
@@ -1801,7 +1896,7 @@ def register_shell_os_routes(app):
 
         return jsonify({'app_id': app_id, 'permissions': result})
 
-    @app.route('/api/apps/<app_id>/permission/<perm_type>', methods=['POST'])
+    @_apps_route('/<app_id>/permission/<perm_type>', methods=['POST'])
     @_require_shell_auth
     def shell_app_set_permission(app_id, perm_type):
         """Grant or revoke a permission for an app."""
@@ -1826,7 +1921,7 @@ def register_shell_os_routes(app):
             'type': perm_type, 'granted': granted,
         })
 
-    @app.route('/api/apps/<app_id>/permissions/reset', methods=['POST'])
+    @_apps_route('/<app_id>/permissions/reset', methods=['POST'])
     @_require_shell_auth
     def shell_app_reset_permissions(app_id):
         """Reset all permissions for an app to defaults."""
@@ -2231,5 +2326,230 @@ def register_shell_os_routes(app):
             return jsonify({'launched': True})
         except FileNotFoundError:
             return jsonify({'error': 'thunderbird not installed'}), 404
+
+    # ═══════════════════════════════════════════════════════════
+    # File Explorer P1 — recursive search, thumbnails, chmod
+    # (extends the SAME sandbox/auth/audit/destructive trio as the
+    #  browse/move/copy/delete file-op surface above — NO parallel path)
+    # ═══════════════════════════════════════════════════════════
+
+    @app.route('/api/shell/files/search', methods=['GET'])
+    @_require_shell_auth
+    def shell_files_search():
+        """Recursive filename search under a directory.
+
+        Mirrors the /browse entry shape (name/path/is_dir/size/modified/extension)
+        and adds a `rel` field (path relative to the search root) so the explorer
+        can show where each hit lives. GIL-safe: bounded by a depth cap and a
+        result cap, pruning dirs[] in place exactly like shell_file_search_by_tag
+        (#151) so a deep tree never walks unboundedly on the shared event loop.
+        """
+        path = os.path.expanduser(request.args.get('path', '~'))
+        query = (request.args.get('q', '') or '').strip()
+        recursive = request.args.get('recursive', 'true').lower() == 'true'
+        show_hidden = request.args.get('hidden', 'false').lower() == 'true'
+
+        real_path = os.path.realpath(path)
+        if not _is_path_allowed(real_path):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
+        if not os.path.isdir(real_path):
+            return jsonify({'error': 'Not a directory'}), 400
+        if not query:
+            return jsonify({'path': real_path, 'query': query,
+                            'entries': [], 'count': 0, 'truncated': False})
+
+        q = query.lower()
+        MAX_DEPTH = 8        # generous but bounded
+        MAX_RESULTS = 500    # hard cap on payload size
+        entries = []
+        truncated = False
+
+        def _entry(fp, is_dir):
+            try:
+                stat = os.stat(fp)
+            except (PermissionError, OSError):
+                return None
+            return {
+                'name': os.path.basename(fp),
+                'path': fp,
+                'rel': os.path.relpath(fp, real_path),
+                'is_dir': is_dir,
+                'size': stat.st_size if not is_dir else 0,
+                'modified': stat.st_mtime,
+                'extension': os.path.splitext(fp)[1].lower() if not is_dir else '',
+            }
+
+        try:
+            if recursive:
+                for root, dirs, files in os.walk(real_path):
+                    depth = root[len(real_path):].count(os.sep)
+                    if depth >= MAX_DEPTH:
+                        dirs[:] = []
+                    if not show_hidden:
+                        dirs[:] = [d for d in dirs if not d.startswith('.')]
+                    # match directory names too (folders are searchable targets)
+                    for dname in dirs:
+                        if q in dname.lower():
+                            e = _entry(os.path.join(root, dname), True)
+                            if e:
+                                entries.append(e)
+                                if len(entries) >= MAX_RESULTS:
+                                    truncated = True
+                                    break
+                    if truncated:
+                        break
+                    for fname in files:
+                        if not show_hidden and fname.startswith('.'):
+                            continue
+                        if q in fname.lower():
+                            e = _entry(os.path.join(root, fname), False)
+                            if e:
+                                entries.append(e)
+                                if len(entries) >= MAX_RESULTS:
+                                    truncated = True
+                                    break
+                    if truncated:
+                        break
+            else:
+                for entry in os.scandir(real_path):
+                    if not show_hidden and entry.name.startswith('.'):
+                        continue
+                    if q in entry.name.lower():
+                        e = _entry(entry.path, entry.is_dir())
+                        if e:
+                            entries.append(e)
+                            if len(entries) >= MAX_RESULTS:
+                                truncated = True
+                                break
+        except PermissionError:
+            return jsonify({'error': 'Permission denied'}), 403
+
+        entries.sort(key=lambda e: (not e['is_dir'], e['name'].lower()))
+        return jsonify({
+            'path': real_path,
+            'query': query,
+            'recursive': recursive,
+            'entries': entries,
+            'count': len(entries),
+            'truncated': truncated,
+        })
+
+    _THUMB_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff',
+                   '.ico'}
+
+    def _thumb_cache_dir():
+        try:
+            from core.platform_paths import get_db_dir
+            base = get_db_dir()
+        except Exception:
+            base = os.path.join(tempfile.gettempdir(), 'hart')
+        d = os.path.join(base, 'thumb_cache')
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @app.route('/api/shell/files/thumbnail', methods=['GET'])
+    @_require_shell_auth
+    def shell_files_thumbnail():
+        """Return a small thumbnail (PNG) for an image file.
+
+        Pillow if importable, else a graceful 204 (the explorer falls back to the
+        material glyph). Output dimension is capped; thumbnails are cached on disk
+        under get_db_dir()/thumb_cache keyed by (realpath, mtime, size) so repeat
+        views are cheap. Non-image / oversize / unreadable -> 204 (never 500),
+        so a bad file never breaks the grid render.
+        """
+        path = request.args.get('path', '')
+        try:
+            size = int(request.args.get('size', 96))
+        except (TypeError, ValueError):
+            size = 96
+        size = max(16, min(size, 512))  # clamp
+
+        if not path or not os.path.isfile(path):
+            return Response(status=204)
+        if not _is_path_allowed(path):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
+        if os.path.splitext(path)[1].lower() not in _THUMB_EXTS:
+            return Response(status=204)
+
+        try:
+            from PIL import Image
+        except Exception:
+            return Response(status=204)  # Pillow absent -> graceful glyph fallback
+
+        try:
+            st = os.stat(path)
+            real = os.path.realpath(path)
+            import hashlib
+            key = hashlib.sha1(
+                f'{real}|{int(st.st_mtime)}|{st.st_size}|{size}'.encode('utf-8')
+            ).hexdigest()
+            cache_path = os.path.join(_thumb_cache_dir(), key + '.png')
+            if os.path.isfile(cache_path):
+                with open(cache_path, 'rb') as fh:
+                    return Response(fh.read(), mimetype='image/png')
+
+            with Image.open(path) as im:
+                im.draft('RGB', (size, size))  # fast pre-scale on JPEG
+                im = im.convert('RGBA')
+                im.thumbnail((size, size))
+                im.save(cache_path, format='PNG', optimize=True)
+            with open(cache_path, 'rb') as fh:
+                return Response(fh.read(), mimetype='image/png')
+        except Exception:
+            return Response(status=204)  # unreadable/corrupt -> fallback, never 500
+
+    @app.route('/api/shell/files/chmod', methods=['POST'])
+    @_require_shell_auth
+    def shell_files_chmod():
+        """Change a file's POSIX mode (owner/group/other rwx).
+
+        chmod is a routine file op (like move/copy), NOT destructive like delete,
+        so it gates on sandbox + auth + immutable audit only (no action-classifier
+        gate, which 'unknown'-fail-closed-403'd every real change). On Windows
+        os.chmod only honours the read-only bit, so this is a safe no-op there —
+        we still return the requested mode for UI consistency. `mode` accepts an
+        octal string ('755', '0644') or an int.
+        """
+        data = request.get_json(force=True)
+        path = data.get('path', '')
+        raw_mode = data.get('mode', '')
+
+        if not path or not os.path.exists(path):
+            return jsonify({'error': 'path not found'}), 404
+        if not _is_path_allowed(path):
+            return jsonify({'error': 'Path outside allowed roots'}), 403
+
+        # Parse mode: octal string ('0755'/'755') or int -> 0..0o777
+        try:
+            if isinstance(raw_mode, int):
+                mode_int = raw_mode
+            else:
+                mode_int = int(str(raw_mode).strip(), 8)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'mode must be an octal string (e.g. "755")'}), 400
+        if not (0 <= mode_int <= 0o777):
+            return jsonify({'error': 'mode out of range (000-777)'}), 400
+
+        # chmod is a routine file op (like move/copy), NOT destructive like
+        # delete, so it is NOT routed through _classify_destructive:
+        # classify_action('chmod 750: ...') returns 'unknown' -> fail-closed 403,
+        # which broke every real permission change. Sandbox (_is_path_allowed) +
+        # auth (_require_shell_auth) + immutable audit are the gate, matching the
+        # working shell_files_move / shell_files_copy pattern.
+        _audit_shell_op('file_chmod', {'path': path, 'mode': oct(mode_int)[-3:]})
+
+        try:
+            os.chmod(path, mode_int)
+        except (PermissionError, OSError) as e:
+            return jsonify({'error': str(e)}), 400
+
+        # Re-read so the UI reflects the actual mode (Windows may clamp it).
+        try:
+            applied = oct(os.stat(path).st_mode)[-3:]
+        except OSError:
+            applied = oct(mode_int)[-3:]
+        return jsonify({'path': path, 'mode': applied,
+                        'requested': oct(mode_int)[-3:]})
 
     logger.info("Registered shell OS API routes (extended)")

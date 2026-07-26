@@ -1,0 +1,677 @@
+"""Outbound email campaigns through our own mail server.
+
+Exists because the growth pipeline kept reaching for one-off scripts. Sending
+to a real list is a capability the agent should own, with the safety rails
+built in rather than remembered each time:
+
+  * DRY RUN BY DEFAULT -- a caller must pass dry_run=False to deliver
+  * RESUMABLE -- every success is appended to a sent-log before the next send,
+    so an interrupted run never re-mails anyone
+  * PACED -- delay_seconds is configurable; sending as fast as the socket
+    allows is what gets a domain flagged, not the volume itself
+  * WARMED UP -- a daily cap that ramps over the first week. Per-message
+    pacing is not sufficient on its own: a domain with no sending history
+    that delivers seventeen thousand messages in a day is blocked on
+    reputation grounds no matter how evenly they were spaced
+  * SELF-HALTING -- consecutive failures stop the run rather than burning
+    reputation against a wall
+  * UNSUBSCRIBE-AWARE -- List-Unsubscribe on every message, and addresses in
+    the opt-out file are skipped
+
+Uses our own MTA (mail.hertzai.com) rather than a mailbox provider: the
+provider mailbox rate-limited at ~19 messages, ours does not. Deliverability
+comes from the domain being correctly authenticated (SPF via MX, DKIM
+published, valid TLS) rather than from renting somebody's IP reputation.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import smtplib
+import ssl
+import time
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
+from typing import Iterable, List, Optional
+
+logger = logging.getLogger('hevolve_channels')
+
+# Our own mail server. Overridable so a different deployment can point
+# elsewhere without touching code.
+SMTP_HOST = os.environ.get('HEVOLVE_SMTP_HOST', 'mail.hertzai.com')
+SMTP_PORT = int(os.environ.get('HEVOLVE_SMTP_PORT', '587'))
+# A person, not a role account. 'evolve@' reads as a system mailbox and
+# costs trust before the mail is even opened.
+SMTP_USER = os.environ.get('HEVOLVE_SMTP_USER', 'sathish@mail.hertzai.com')
+SMTP_PASS = os.environ.get('HEVOLVE_SMTP_PASS', '')
+FROM_NAME = os.environ.get('HEVOLVE_SMTP_FROM_NAME', 'Sathish at Hevolve')
+REPLY_TO = os.environ.get('HEVOLVE_SMTP_REPLY_TO', 'sathish@hertzai.com')
+
+# Where the one-click unsubscribe link points. Deliberately the public site
+# rather than the mail host: the reader recognises hevolve.ai, and the
+# endpoint has to answer a POST from the receiver's infrastructure without
+# any of the sending machinery being reachable.
+UNSUB_BASE = os.environ.get('HEVOLVE_UNSUB_BASE', 'https://hevolve.ai')
+
+# Pacing. The default is deliberately unhurried: a burst is what trips
+# receiving-side rate limits, and there is rarely a reason to rush a campaign.
+DEFAULT_DELAY_SECONDS = float(os.environ.get('HEVOLVE_EMAIL_DELAY', '2.0'))
+DEFAULT_PER_CONNECTION = int(os.environ.get('HEVOLVE_EMAIL_PER_CONN', '40'))
+MAX_CONSECUTIVE_FAILURES = 8
+
+_STATE_DIR = os.environ.get(
+    'HEVOLVE_EMAIL_STATE',
+    os.path.join(os.path.expanduser('~'), '.hevolve', 'email'))
+
+
+def _state_path(campaign: str, name: str) -> str:
+    os.makedirs(_STATE_DIR, exist_ok=True)
+    safe = ''.join(ch for ch in campaign if ch.isalnum() or ch in '-_')
+    return os.path.join(_STATE_DIR, '%s.%s' % (safe or 'campaign', name))
+
+
+# Warm-up schedule: how many messages a day the domain may send, by day of
+# the campaign. A new sending domain has no reputation, and the receiving
+# side treats a sudden five-figure day from an unknown IP as exactly what it
+# looks like. Hotmail, Yahoo and AOL throttle first and ask questions later,
+# and 89% of this list sits behind those four providers.
+#
+# The point is not caution for its own sake. A flat 17,280/day run gets the
+# domain blocked in the first day, which means the remaining ~70,000 people
+# never receive anything AND ordinary mail from hertzai.com starts landing in
+# spam. The ramp is what makes sending to everyone actually possible.
+WARMUP_SCHEDULE = [500, 1000, 2500, 5000, 10000, 15000, 20000]
+
+
+def warmup_cap(day_index: int) -> int:
+    """Messages allowed on day `day_index` (0-based) of a campaign."""
+    if day_index < 0:
+        return 0
+    if day_index >= len(WARMUP_SCHEDULE):
+        return WARMUP_SCHEDULE[-1]
+    return WARMUP_SCHEDULE[day_index]
+
+
+def _today() -> str:
+    return time.strftime('%Y-%m-%d')
+
+
+def load_sent(campaign: str) -> set:
+    """Addresses already delivered for this campaign."""
+    p = _state_path(campaign, 'sent')
+    if not os.path.exists(p):
+        return set()
+    out = set()
+    with open(p, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            # Newer rows are 'YYYY-MM-DD<TAB>address'. Older rows are the bare
+            # address, so both are read rather than silently re-mailing
+            # everyone who was contacted before timestamps existed.
+            out.add(line.split('\t')[-1].strip().lower())
+    return out
+
+
+def sent_on(campaign: str, day: Optional[str] = None) -> int:
+    """How many went out on `day` (default today). Drives the daily cap."""
+    p = _state_path(campaign, 'sent')
+    if not os.path.exists(p):
+        return 0
+    day = day or _today()
+    n = 0
+    with open(p, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.startswith(day + '\t'):
+                n += 1
+    return n
+
+
+def campaign_days(campaign: str) -> int:
+    """Index into the warm-up ramp: how many days this campaign sent on
+    BEFORE today.
+
+    Today is excluded deliberately. Counting it would make a campaign that
+    has already sent this morning read as being a day further along than it
+    is, so every resumed run would step the ramp up early -- and since the
+    ramp is what keeps the domain out of trouble, an off-by-one here spends
+    reputation rather than a few minutes.
+    """
+    p = _state_path(campaign, 'sent')
+    if not os.path.exists(p):
+        return 0
+    today = _today()
+    days = set()
+    with open(p, 'r', encoding='utf-8') as f:
+        for line in f:
+            if '\t' in line:
+                d = line.split('\t', 1)[0]
+                if d != today:
+                    days.add(d)
+    return len(days)
+
+
+def load_optouts() -> set:
+    """Addresses that asked not to be contacted. Checked on every send."""
+    p = os.path.join(_STATE_DIR, 'optout')
+    if not os.path.exists(p):
+        return set()
+    with open(p, 'r', encoding='utf-8') as f:
+        return {line.strip().lower() for line in f if line.strip()}
+
+
+def resolve_unsubscribe_tokens(token_lines: Iterable[str],
+                               recipients: Iterable[str],
+                               campaign: str,
+                               *, dry_run: bool = False) -> dict:
+    """Turn one-click unsubscribe tokens back into addresses, and opt them out.
+
+    The web endpoint that receives a one-click unsubscribe records only the
+    per-recipient HMAC: it has neither the list nor the signing secret, so it
+    cannot know whose token it just collected. That is deliberate -- it keeps
+    every address off the public web server. The cost is this step, which has
+    to run where the list and the secret already live.
+
+    Resolution is by recomputation rather than a stored map: for each address
+    we know, derive its token and see whether it was reported. That means no
+    token->address table exists anywhere to be leaked, and it is cheap even
+    for the full list (one HMAC per address).
+
+    An unmatched token is reported, never guessed at. It usually means a
+    different campaign's token, and silently dropping it would hide a real
+    opt-out.
+    """
+    wanted = set()
+    for line in token_lines:
+        line = (line or '').strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get('event') != 'unsubscribe':
+            continue
+        tok = (row.get('token') or '').strip().lower()
+        if tok:
+            wanted.add(tok)
+
+    out = {'reported': len(wanted), 'matched': 0, 'unmatched': 0,
+           'already_opted_out': 0, 'dry_run': dry_run, 'addresses': []}
+    if not wanted:
+        return out
+
+    existing = load_optouts()
+    seen_tokens = set()
+    for addr in recipients:
+        addr = (addr or '').strip()
+        if not addr:
+            continue
+        tok = tracking_token(addr, campaign)
+        if tok not in wanted:
+            continue
+        seen_tokens.add(tok)
+        low = addr.lower()
+        if low in existing:
+            out['already_opted_out'] += 1
+            continue
+        out['matched'] += 1
+        out['addresses'].append(low)
+        if not dry_run:
+            record_optout(low)
+            existing.add(low)
+
+    out['unmatched'] = len(wanted - seen_tokens)
+    return out
+
+
+def record_optout(address: str) -> None:
+    """Honour an unsubscribe. Failing to record one is the error that
+    actually matters here, so it is logged loudly."""
+    try:
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        with open(os.path.join(_STATE_DIR, 'optout'), 'a', encoding='utf-8') as f:
+            f.write(address.strip().lower() + '\n')
+        logger.info('email opt-out recorded: %s', address)
+    except Exception as exc:
+        logger.error('OPT-OUT NOT RECORDED for %s: %s -- this address may '
+                     'keep receiving mail', address, exc)
+
+
+def load_bounced() -> set:
+    """Addresses that hard-bounced. Never contacted again.
+
+    Kept separate from the opt-out list because they mean different things:
+    an opt-out is a person's decision and a bounce is a fact about a
+    mailbox. Both stop delivery, but conflating them would let a delivery
+    failure be reported as somebody having unsubscribed.
+    """
+    p = os.path.join(_STATE_DIR, 'bounced')
+    if not os.path.exists(p):
+        return set()
+    with open(p, 'r', encoding='utf-8') as f:
+        return {ln.split('\t')[-1].strip().lower() for ln in f if ln.strip()}
+
+
+def record_bounce(address: str, code: str = '', reason: str = '') -> None:
+    """Suppress an address that a receiving server refused permanently.
+
+    This is the protection that MX validation cannot provide. An MX record
+    proves a DOMAIN accepts mail; it says nothing about whether a mailbox
+    exists. On a list of historical addresses most of the dead ones are dead
+    mailboxes at live domains, so they are invisible until they bounce, and
+    a bounce rate above a few percent is what gets a sending domain
+    blocklisted.
+    """
+    try:
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        with open(os.path.join(_STATE_DIR, 'bounced'), 'a', encoding='utf-8') as f:
+            f.write('%s\t%s\t%s\t%s\n' % (_today(), code or '',
+                                          (reason or '').replace('\t', ' ')[:120],
+                                          address.strip().lower()))
+    except Exception as exc:
+        logger.error('BOUNCE NOT RECORDED for %s: %s -- this address will '
+                     'keep being mailed and keep bouncing', address, exc)
+
+
+def recent_bounce_rate(campaign: str, days: int = 3) -> dict:
+    """Bounce rate over the last `days` of this campaign.
+
+    Exists because MAX_CONSECUTIVE_FAILURES cannot protect against the
+    failure mode that actually matters here. It counts failures raised
+    during the SMTP conversation, and Microsoft, Yahoo and AOL accept every
+    recipient at RCPT and reject asynchronously afterwards. For the ~52% of
+    a consumer list behind those providers, every send "succeeds" and the
+    consecutive-failure counter never moves, however bad the list is.
+
+    So the signal has to come from the bounce log instead: of the addresses
+    mailed recently, how many have since come back permanently rejected.
+    That number lags by minutes to hours, which is why it is checked BEFORE
+    a batch rather than during one.
+    """
+    sent_path = _state_path(campaign, 'sent')
+    if not os.path.exists(sent_path):
+        return {'sent': 0, 'bounced': 0, 'rate': 0.0, 'window_days': days}
+
+    cutoff = time.time() - days * 86400
+    recent = set()
+    with open(sent_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or '\t' not in line:
+                continue
+            day, _, addr = line.partition('\t')
+            try:
+                ts = time.mktime(time.strptime(day, '%Y-%m-%d'))
+            except ValueError:
+                continue
+            if ts >= cutoff:
+                recent.add(addr.strip().lower())
+
+    bounced = load_bounced() & recent
+    n = len(recent)
+    return {'sent': n, 'bounced': len(bounced),
+            'rate': (len(bounced) / n) if n else 0.0,
+            'window_days': days}
+
+
+# Above this, stop. Receiving systems tolerate a few percent; sustained
+# double digits is what gets a domain filtered and then blocklisted, and the
+# damage is not confined to the campaign -- ordinary mail from the same
+# domain starts landing in spam too.
+MAX_BOUNCE_RATE = float(os.environ.get('HEVOLVE_MAX_BOUNCE_RATE', '0.05'))
+
+
+def tracking_token(address: str, campaign: str) -> str:
+    """Short opaque per-recipient token.
+
+    An HMAC of the address rather than the address itself, so a click URL
+    never carries somebody's email in plain text where it lands in server
+    logs, Referer headers and analytics. It is one-way: we can confirm a
+    token belongs to a known recipient by recomputing it, but the URL alone
+    discloses nothing.
+    """
+    import hashlib
+    import hmac
+    secret = os.environ.get('HEVOLVE_TRACK_SECRET', 'hevolve-campaign')
+    mac = hmac.new(secret.encode(), ('%s|%s' % (campaign, address.lower())).encode(),
+                   hashlib.sha256)
+    return mac.hexdigest()[:12]
+
+
+def add_tracking(body: str, campaign: str, address: str,
+                 source: str = 'email') -> str:
+    """Tag our own links so a click can be attributed.
+
+    Adds ref (which channel), c (which campaign) and t (which recipient,
+    opaquely). Without c and t, '?ref=email' says traffic came from some
+    email at some point, which is not enough to tell whether a campaign
+    worked -- that ambiguity is why the first batch's clicks could not be
+    distinguished from a mail scanner's.
+
+    Only rewrites links to domains we own; a link to github.com is left
+    alone rather than decorated with our parameters.
+    """
+    token = tracking_token(address, campaign)
+
+    def _tag(match):
+        url = match.group(0)
+        if not any(d in url for d in ('hevolve.ai', 'hertzai.com')):
+            return url
+        # Strip any ref/c/t already on the URL before adding ours. The copy
+        # links to '/download?ref=email' by hand, and blindly appending
+        # produced '?ref=email&ref=email&c=...'. Duplicate keys are not an
+        # error to a query parser, they just make analytics read whichever
+        # one it happens to pick, which is worse than being wrong loudly.
+        base, sep, query = url.partition('?')
+        keep = [p for p in query.split('&')
+                if p and p.split('=', 1)[0] not in ('ref', 'c', 't')]
+        keep.extend(['ref=%s' % source, 'c=%s' % campaign, 't=%s' % token])
+        return base + '?' + '&'.join(keep)
+
+    return re.sub(r'https?://[^\s"\'<>)]+', _tag, body)
+
+
+def build_message(to: str, subject: str, html: str, text: str,
+                  campaign: str = 'default') -> MIMEMultipart:
+    # Tag our own links per recipient so a click is attributable to this
+    # campaign and this person. Done here rather than at the call site so no
+    # future caller can forget it and leave another batch of unattributable
+    # clicks behind.
+    html = add_tracking(html, campaign, to)
+    text = add_tracking(text, campaign, to)
+
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject
+    msg['From'] = '%s <%s>' % (FROM_NAME, SMTP_USER)
+    msg['To'] = to
+    msg['Reply-To'] = REPLY_TO
+    msg['Date'] = formatdate(localtime=True)
+    msg['Message-ID'] = make_msgid(domain=SMTP_HOST)
+
+    # One-click unsubscribe (RFC 8058). This was a mailto: only, and that gap
+    # is not merely a missing feature -- it is a plausible cause of the
+    # 550-5.7.1 block Gmail applied to this sender on 2026-07-26.
+    #
+    # A mailto: unsubscribe asks the reader to compose an email. Most people
+    # will not; faced with mail they do not want, the one-tap control in front
+    # of them is "Report spam". So a weak unsubscribe path converts directly
+    # into the complaint rate that receivers block on. Giving an HTTPS link
+    # that unsubscribes in a single tap is the cheapest way to move those
+    # people out of the complaint bucket.
+    #
+    # It is also a hard requirement: Google and Yahoo require one-click for
+    # bulk senders, and this campaign's ramp reaches 5k/day and beyond.
+    #
+    # The URL carries only the per-recipient HMAC, never the address, so the
+    # link cannot be used to harvest anyone. Both forms are offered because
+    # some clients still use the mailto:.
+    token = tracking_token(to, campaign)
+    unsub_url = '%s/u/%s' % (UNSUB_BASE.rstrip('/'), token)
+    msg['List-Unsubscribe'] = '<%s>, <mailto:%s?subject=unsubscribe>' % (
+        unsub_url, REPLY_TO)
+    msg['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click'
+    msg.attach(MIMEText(text, 'plain'))
+    msg.attach(MIMEText(html, 'html'))
+    return msg
+
+
+def send_campaign(recipients: Iterable[str],
+                  subject: str,
+                  html: str,
+                  text: str,
+                  *,
+                  campaign: str = 'default',
+                  dry_run: bool = True,
+                  delay_seconds: Optional[float] = None,
+                  per_connection: Optional[int] = None,
+                  limit: Optional[int] = None,
+                  daily_cap: Optional[int] = None,
+                  warmup: bool = True,
+                  max_bounce_rate: Optional[float] = None,
+                  password: Optional[str] = None) -> dict:
+    """Send to `recipients`, skipping anyone already sent or opted out.
+
+    Returns a dict of counts. Never raises for a single bad recipient -- one
+    dead address must not abort a campaign -- but a run of consecutive
+    failures halts it, because that means something systemic is wrong and
+    continuing would damage the sending domain.
+    """
+    delay = DEFAULT_DELAY_SECONDS if delay_seconds is None else float(delay_seconds)
+    per_conn = DEFAULT_PER_CONNECTION if per_connection is None else int(per_connection)
+    pw = password or SMTP_PASS
+
+    sent_before = load_sent(campaign)
+    optouts = load_optouts()
+    bounced = load_bounced()
+    todo: List[str] = []
+    # `seen` is carried rather than recomputed. This loop used to test
+    # membership against `{a.lower() for a in todo}`, which rebuilt the whole
+    # set on every recipient: quadratic, and invisible at the few-hundred
+    # sizes it was written against. At 77,369 recipients it is ~3e9
+    # operations, and the run simply appeared to hang before sending anything.
+    seen: set = set()
+    for raw in recipients:
+        addr = (raw or '').strip()
+        low = addr.lower()
+        if not addr or '@' not in addr:
+            continue
+        if low in sent_before or low in optouts or low in bounced or low in seen:
+            continue
+        seen.add(low)
+        todo.append(addr)
+    if limit:
+        todo = todo[:int(limit)]
+
+    # Apply the daily cap before anything is sent, so an over-large run is
+    # trimmed rather than started and abandoned partway.
+    day_index = campaign_days(campaign)
+    already_today = sent_on(campaign)
+    cap = None
+    if daily_cap is not None:
+        cap = int(daily_cap)
+    elif warmup:
+        cap = warmup_cap(day_index)
+    remaining_today = None
+    if cap is not None:
+        remaining_today = max(0, cap - already_today)
+        todo = todo[:remaining_today]
+
+    result = {'campaign': campaign, 'candidates': len(todo),
+              'already_sent': len(sent_before), 'opted_out': len(optouts),
+              'suppressed_bounced': len(bounced),
+              'sent': 0, 'failed': 0, 'dry_run': dry_run,
+              'delay_seconds': delay,
+              'estimated_minutes': round(len(todo) * delay / 60.0, 1)}
+    if cap is not None:
+        result['daily_cap'] = cap
+        result['campaign_day'] = day_index + 1
+        result['sent_today_before'] = already_today
+        result['remaining_today'] = remaining_today
+
+    # Circuit breaker. Checked before the batch, because bounces for the
+    # previous one arrive asynchronously and there is no point learning the
+    # list is bad only after mailing another ten thousand people.
+    ceiling = MAX_BOUNCE_RATE if max_bounce_rate is None else float(max_bounce_rate)
+    bounce = recent_bounce_rate(campaign)
+    result['recent_bounce'] = bounce
+    if ceiling > 0 and bounce['sent'] >= 100 and bounce['rate'] > ceiling:
+        result['error'] = (
+            'HALTED: %d of the %d messages sent in the last %d days '
+            'hard-bounced (%.0f%%), over the %.0f%% ceiling. Sending more '
+            'would damage the domain rather than reach anyone. Verify the '
+            'list or raise max_bounce_rate deliberately.'
+            % (bounce['bounced'], bounce['sent'], bounce['window_days'],
+               bounce['rate'] * 100, ceiling * 100))
+        result['candidates'] = 0
+        return result
+
+    if dry_run:
+        result['note'] = ('DRY RUN -- nothing sent. Pass dry_run=False to '
+                          'deliver.')
+        return result
+    if not pw:
+        result['error'] = 'no SMTP password (HEVOLVE_SMTP_PASS unset)'
+        return result
+
+    # A resume-log prevents re-sending across runs but NOT across CONCURRENT
+    # runs: two processes each read the log at start, so anything sent while
+    # both are alive is sent twice. That is not hypothetical -- it happened,
+    # and 36 people received this campaign twice before the second process was
+    # found. An agent that can call this tool can call it twice, so the guard
+    # has to be in here rather than in operator discipline.
+    lock_path = _state_path(campaign, 'lock')
+    try:
+        # O_EXCL is the atomic part: whoever creates the file wins, and a
+        # second caller cannot mistake "I just made it" for "it was already
+        # there".
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
+        holder = ''
+        try:
+            with open(lock_path, 'r', encoding='utf-8') as f:
+                holder = f.read().strip()
+        except Exception:
+            pass
+        result['error'] = (
+            "campaign '%s' is already running (lock held by pid %s at %s). "
+            "Refusing to start a second sender -- concurrent runs double-send. "
+            "Delete the lock file if that process is gone."
+            % (campaign, holder or 'unknown', lock_path))
+        return result
+
+    ctx = ssl.create_default_context()   # full verification; our cert is valid
+    log_path = _state_path(campaign, 'sent')
+    consecutive = 0
+    idx = 0
+    try:
+        return _run_sends(todo, subject, html, text, ctx, log_path, pw,
+                          per_conn, delay, result, campaign)
+    finally:
+        # Always release, including on an exception -- a stale lock that
+        # blocks every future run is its own outage.
+        try:
+            os.unlink(lock_path)
+        except Exception:
+            pass
+
+
+def _run_sends(todo, subject, html, text, ctx, log_path, pw,
+               per_conn, delay, result, campaign):
+    """The send loop itself. Split out so the lock in send_campaign() can be
+    released in a finally: without wrapping the whole body in a try:."""
+    consecutive = 0
+    idx = 0
+    while idx < len(todo):
+        chunk = todo[idx:idx + per_conn]
+        try:
+            srv = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+            srv.ehlo()
+            srv.starttls(context=ctx)
+            srv.ehlo()
+            srv.login(SMTP_USER, pw)
+        except Exception as exc:
+            result['error'] = 'connect/auth failed: %s' % exc
+            logger.error('email campaign %s: %s', campaign, exc)
+            break
+        with open(log_path, 'a', encoding='utf-8') as log:
+            for addr in chunk:
+                try:
+                    srv.sendmail(SMTP_USER, [addr],
+                                 build_message(addr, subject, html, text,
+                                               campaign).as_string())
+                    result['sent'] += 1
+                    consecutive = 0
+                    # Dated so the daily cap can be enforced across restarts.
+                    log.write('%s\t%s\n' % (_today(), addr))
+                    log.flush()
+                except Exception as exc:
+                    result['failed'] += 1
+                    consecutive += 1
+                    logger.warning('email to %s failed: %s', addr, exc)
+                    if consecutive >= MAX_CONSECUTIVE_FAILURES:
+                        result['halted'] = ('%d consecutive failures -- halted '
+                                            'to protect sender reputation'
+                                            % consecutive)
+                        idx = len(todo)
+                        break
+                time.sleep(delay)
+        try:
+            srv.quit()
+        except Exception:
+            pass
+        idx += per_conn
+    return result
+
+
+def run_daily(list_path: str,
+              campaign: str,
+              subject: str,
+              html: str,
+              text: str,
+              *,
+              delay_seconds: float = 5.0,
+              shuffle_seed: int = 20260722,
+              dry_run: bool = True,
+              password: Optional[str] = None) -> dict:
+    """One day's worth of a large campaign. Safe to run from a scheduler.
+
+    Idempotent by construction: already-sent addresses are skipped, the
+    daily cap is enforced from the dated sent log, and the lock file means a
+    second invocation while the first is still going returns an error rather
+    than double-sending.
+
+    Recipients are shuffled with a fixed seed rather than read in file
+    order. File order groups each provider into a solid block, so a day's
+    batch would land entirely on one receiving system; a shuffle makes every
+    day representative of the list as a whole. The seed is fixed so the
+    order is reproducible when a run has to be examined after the fact.
+    """
+    import random
+
+    with open(list_path, 'r', encoding='utf-8') as f:
+        addrs = [ln.strip() for ln in f if ln.strip()]
+    random.Random(shuffle_seed).shuffle(addrs)
+    return send_campaign(addrs, subject, html, text, campaign=campaign,
+                         dry_run=dry_run, delay_seconds=delay_seconds,
+                         password=password)
+
+
+def _main(argv=None):
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        prog='email_campaign',
+        description='Send one day of a warmed-up email campaign.')
+    ap.add_argument('--list', required=True,
+                    help='file of recipient addresses, one per line')
+    ap.add_argument('--campaign', required=True,
+                    help='campaign name; scopes the resume log and daily cap')
+    ap.add_argument('--template', default='integrations.channels.email_templates',
+                    help='module exposing SUBJECT, HTML and TEXT')
+    ap.add_argument('--delay', type=float, default=5.0)
+    ap.add_argument('--live', action='store_true',
+                    help='actually deliver; omit for a dry run')
+    args = ap.parse_args(argv)
+
+    import importlib
+    tpl = importlib.import_module(args.template)
+    res = run_daily(args.list, args.campaign, tpl.SUBJECT, tpl.HTML, tpl.TEXT,
+                    delay_seconds=args.delay, dry_run=not args.live,
+                    password=os.environ.get('HEVOLVE_SMTP_PASS'))
+    for k, v in res.items():
+        print('%-20s %s' % (k, v))
+    # Non-zero on a systemic failure so a scheduler surfaces it rather than
+    # recording a silent success.
+    return 1 if res.get('error') else 0
+
+
+if __name__ == '__main__':
+    import sys as _sys
+    _sys.exit(_main())

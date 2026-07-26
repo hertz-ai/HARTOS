@@ -31,6 +31,12 @@ CONSENT_TYPES = frozenset({
     'public_exposure',   # Content made public
     'payment_setup',     # User provides UPI/payment ID for revenue payouts
     'compute_contribute', # User allows their device to process hive tasks
+    'announcement_subscription',  # A channel destination asked to receive
+                         # broadcasts. Keyed by '<channel>:<chat_id>' rather
+                         # than a HARTOS user, because the subscriber here is
+                         # a Telegram group or Discord channel. Exists so the
+                         # broadcaster can check a RECORD instead of an
+                         # operator's assertion that people opted in.
     'cloud_egress',      # User allows fallback to cloud (vision, social
                          # sync, third-party APIs) when local resources
                          # can't satisfy the request.  Scope-aware: e.g.
@@ -194,6 +200,24 @@ class ConsentService:
             'scope': scope,
             'agent_id': agent_id,
         })
+
+        # Up-sync the now-public agents (gap #4): agents are almost always
+        # created BEFORE the owner grants public_exposure, so the
+        # producer-on-create hook no-ops for them.  When public_exposure is
+        # granted, re-queue up-sync for this owner's agents so an agent created
+        # earlier RISES once its owner consents.  The receiver is idempotent
+        # (upsert-by-id) so a re-queue is harmless; best-effort — a sync hiccup
+        # never fails the consent grant.  No new state: consent stays the single
+        # public signal.
+        if consent_type == 'public_exposure':
+            try:
+                from .services import UserService
+                from .federation import federation
+                for _agent in UserService.get_owned_agents(db, user_id):
+                    federation.sync_agent_to_parent(db, _agent)
+            except Exception:
+                pass
+
         return consent
 
     @staticmethod

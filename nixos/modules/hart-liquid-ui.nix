@@ -75,6 +75,23 @@ let
     glib gobject-introspection gtk3 webkitgtk_4_1
     pango gdk-pixbuf atk harfbuzz libsoup_3 cairo
   ]);
+  # GStreamer capture plugins for the cage floor's mic/getUserMedia path. WebKit2
+  # (like the GTK4 host) routes MediaStream capture through GStreamer, and a bare
+  # cage session sets NO GST_PLUGIN_SYSTEM_PATH_1_0 -> the `valve`/`pulsesrc`
+  # elements are invisible -> a mic click SIGSEGVs WebKitWebProcess (the real-HW
+  # 2026-07-18 "clicking the mic hung the entire cage" incident). This back-ports
+  # the GTK4 host's fix (hart-layer-shell-host.nix:99-120) to the never-fail floor
+  # so the floor is safe on the same path. makeSearchPathOutput "out", NOT plain
+  # makeSearchPath: gstreamer core's DEFAULT output is `bin`, so plain makeSearchPath
+  # resolves an empty plugin dir and the elements stay invisible.
+  # The GStreamer packages live under pkgs.gst_all_1 (NOT top-level pkgs -- the
+  # bare `gstreamer` attr does not exist, which broke iso-desktop with "undefined
+  # variable 'gstreamer'"). Mirror the GTK4 host exactly, incl. pipewiresrc for the
+  # PipeWire desktop.
+  gstCapturePlugins = (with pkgs.gst_all_1; [
+    gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad
+  ]) ++ [ pkgs.pipewire ];
+  gstPluginPath = lib.makeSearchPathOutput "out" "lib/gstreamer-1.0" gstCapturePlugins;
   glassShell = pkgs.writeShellScriptBin "hart-glass-shell" ''
     set -euo pipefail
     URL="http://localhost:${toString ui.port}"
@@ -90,6 +107,10 @@ let
     fi
     # GI typelibs for the GTK/WebKit2 python below (see giTypelibPath note).
     export GI_TYPELIB_PATH="${giTypelibPath}"
+    # GStreamer capture plugins so the mic/getUserMedia path finds pulsesrc/valve
+    # instead of SIGSEGV-ing WebKitWebProcess (see gstPluginPath note; back-port of
+    # the GTK4 host fix to the never-fail floor).
+    export GST_PLUGIN_SYSTEM_PATH_1_0="${gstPluginPath}"
     # WebKitGTK robustness on fresh-ISO boots (VM / software GL / no GPU): the
     # DMABUF renderer + GL compositing crash on a GL-less display, which is
     # exactly the first-boot / live-USB case. Disable both so a shell that
@@ -105,21 +126,74 @@ let
     fi
 ''}
     export HART_SHELL_URL="$URL"
+    # ── Publish the SOFTWARE render rung (the auto-fallback ladder floor) ──────────
+    # cage Tier-3 is the GTK3 software floor: no GSK, WebKit compositing off. If a
+    # higher GPU rung (vulkan Tier-1 / webkit-cairo Tier-2) wrote /run/hart/session/shell-render
+    # and then the paint-watchdog dropped to cage, the file would still name the GPU
+    # rung -> the backend would emit body.gpu-hardware while cage cannot animate/blur,
+    # re-arming the ~500ms-lag class. Reassert `software` here so the backend renders
+    # the calm opaque floor (gpu-software + webkit-flat) that matches this host.
+    mkdir -p /run/hart/session 2>/dev/null || true
+    printf '%s' software > /run/hart/session/shell-render 2>/dev/null || true
+    # Shell-paint readiness marker (the session-supervisor's HUNG-tier guard
+    # consumes it): the host touches this once the WebView finishes loading its
+    # first frame. The supervisor passes HART_SHELL_READY_FLAG; default to the
+    # pinned /run/hart contract path so a bare launch (no supervisor) is harmless.
+    export HART_SHELL_READY_FLAG="''${HART_SHELL_READY_FLAG:-/run/hart/session/shell-ready}"
     exec ${cfg.package.python}/bin/python -c "
 import gi, os
 gi.require_version('Gtk', '3.0')
 gi.require_version('WebKit2', '4.1')
 from gi.repository import Gtk, WebKit2
 
+READY_FLAG = os.environ.get('HART_SHELL_READY_FLAG', '/run/hart/session/shell-ready')
+
+
+def _signal_painted():
+    # Touch the first-paint marker the session-supervisor watches. Best-effort:
+    # a missing /run/hart dir or a permission error must NEVER crash the shell -
+    # the supervisor degrades safely (it escalates DOWN on a missing marker).
+    try:
+        os.makedirs(os.path.dirname(READY_FLAG), exist_ok=True)
+        with open(READY_FLAG, 'w'):
+            pass
+    except OSError:
+        pass
+
+
 class GlassShell(Gtk.Window):
     def __init__(self):
         super().__init__(title='HART OS')
         self.set_default_size(1280, 800)
         webview = WebKit2.WebView()
+        # Signal first paint to the supervisor when the page finishes loading
+        # (the WebView is realized + content presented). This is what tells the
+        # paint-watchdog this tier is HEALTHY so it is NOT dropped as a hang.
+        webview.connect('load-changed', self._on_load_changed)
+        # getUserMedia (the voice orb / mic) raises a WebKit permission-request;
+        # with NO handler the promise hangs FOREVER, so clicking the orb froze
+        # the shell with no error (real-HW 2026-07-18). This is the trusted
+        # local kiosk shell (its own served origin, no third-party content), and
+        # tapping the orb IS the user's intent to talk, so auto-grant the media
+        # (mic/camera) request; any other permission class is denied by default.
+        webview.connect('permission-request', self._on_permission_request)
+        # If the web process dies (mic-capture SIGSEGV, OOM, codec, GPU), the surface
+        # stays mapped but renders nothing and shell-ready has already passed -- so
+        # crash the HOST: the session-supervisor counts it and relaunches the tier
+        # with a fresh web process, and a repeat-crash walks the ladder. Without this
+        # the cage floor froze blank forever (back-port of hart-layer-shell-host.nix).
+        webview.connect('web-process-terminated', self._on_web_process_terminated)
         webview.load_uri(os.environ.get('HART_SHELL_URL', 'http://localhost:${toString ui.port}'))
         s = webview.get_settings()
         s.set_enable_javascript(True)
         s.set_enable_developer_extras(True)
+        # Enable the MediaStream API so navigator.mediaDevices.getUserMedia even
+        # EXISTS in the kiosk WebView (off by default in WebKitGTK) -- the voice
+        # orb needs it to open the mic.
+        try:
+            s.set_enable_media_stream(True)
+        except Exception as _e:
+            print('hart-liquid-ui: enable_media_stream unavailable: %s' % _e, flush=True)
         # NEVER (not ALWAYS): a fresh ISO / live-USB / VM often has only
         # software GL (llvmpipe). Forcing GPU accel there crashes WebKitGTK and
         # takes down the shell session. Correctness/robustness over a few fps.
@@ -130,6 +204,46 @@ class GlassShell(Gtk.Window):
         self.connect('key-press-event', self._on_key)
         self.show_all()
         self.fullscreen()
+        # The cage WebView must explicitly grab keyboard focus after the window
+        # is shown/fullscreened — without this the WebView never receives focus,
+        # so left-clicks land on a focus-less surface and typing/caret never work
+        # (dead UI on the live USB). Focus the actual web content, not the window.
+        webview.grab_focus()
+
+    def _on_load_changed(self, _webview, event):
+        if event == WebKit2.LoadEvent.FINISHED:
+            _signal_painted()
+
+    def _on_web_process_terminated(self, _webview, reason):
+        # The web process died (mic-capture SIGSEGV / OOM / codec / GPU). The surface
+        # stays mapped but renders NOTHING and shell-ready already passed, so the only
+        # honest move is to crash the HOST: the supervisor counts it and relaunches
+        # the tier with a fresh web process; a repeat-crash loop walks the ladder.
+        import sys as _sys, os as _os
+        print('[hart-glass-shell] WebKitWebProcess TERMINATED (%s) -- exiting so the '
+              'supervisor relaunches the tier' % reason, file=_sys.stderr)
+        _sys.stderr.flush()
+        _os._exit(1)
+
+    def _on_permission_request(self, _webview, request):
+        # Auto-grant mic/camera for the trusted local shell so getUserMedia does
+        # not hang (the orb-freeze bug); deny everything else. Return True to say
+        # the request was handled. Never raise -- an unhandled exception here
+        # would drop the signal back to WebKit's default (hang) and could crash
+        # the shell.
+        try:
+            if isinstance(request, WebKit2.UserMediaPermissionRequest):
+                request.allow()
+                return True
+            request.deny()
+            return True
+        except Exception as _e:
+            print('hart-liquid-ui: permission-request handling failed: %s' % _e, flush=True)
+            try:
+                request.deny()
+            except Exception:
+                pass
+            return True
 
     def _on_key(self, widget, event):
         from gi.repository import Gdk
@@ -249,6 +363,29 @@ in
       '';
     };
 
+    gpuDiagnostic = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        GPU RENDER DIAGNOSTIC MODE — root-cause the layer-shell vulkan/GSK hang
+        (task #12) instead of avoiding it. DEFAULT FALSE (a normal build is
+        byte-identical + un-bloated). When true:
+          * the Tier-1 hart-comp session FORCES the vulkan rung
+            (HART_SHELL_RENDER=vulkan) instead of the safe webkit-cairo default, so
+            the hang is actually ATTEMPTED (every boot since 2026-07-20 silently
+            skipped it);
+          * the GTK4 host exports Vulkan validation layers + GSK/GDK/WebKit debug
+            and dumps `vulkaninfo --summary` to the journal, so a real-HW boot
+            CAPTURES the exact VK_ERROR_SURFACE_LOST_KHR / swapchain-recreate
+            failure (hover the orb to trigger it) instead of us guessing;
+          * ships vulkan-tools + vulkan-validation-layers.
+        SAFE: the paint-watchdog still self-heals — a vulkan hang drops to the cage
+        floor, so a diagnostic boot can NEVER brick. Workflow: flash a build with
+        this ON, boot, hover the orb, pull the HARTJRNL, read the VK trace. Turn
+        OFF for normal builds.
+      '';
+    };
+
     contextRefreshMs = lib.mkOption {
       type = lib.types.int;
       default = 2000;
@@ -312,6 +449,16 @@ in
       # Open shell port for browser access (companion apps, remote LAN clients).
       # Loopback kiosk works without this; only external access needed it opened.
       networking.firewall.allowedTCPPorts = [ ui.port ];
+
+      # The Phase-1 tier-drop supervisor's cage FLOOR launcher. Like hart-comp.nix
+      # (compCommand) and hart-layer-shell-host.nix (swayCommand), point the floor at
+      # the ABSOLUTE store path of the cage session launcher: the supervisor option
+      # default is the BARE "hart-shell-session", which is NOT on the greetd selector's
+      # PATH, so the floor died "command not found" (rc=127) and crash-looped on the
+      # floor — the never-fail guarantee itself broken (real-HW boot 2026-06-24).
+      # mkOverride 900 mirrors swayCommand; gated on the supervisor so it's a no-op off.
+      hart.sessionSupervisor.cageCommand = lib.mkIf config.hart.sessionSupervisor.enable
+        (lib.mkOverride 900 "${kioskLauncher}/bin/hart-shell-session");
     }
 
     # ─────────────────────────────────────────────────────────
@@ -321,13 +468,33 @@ in
       systemd.services.hart-liquid-ui = {
         description = "HART OS LiquidUI — AI-Generated Adaptive Interface";
         documentation = [ "https://github.com/hertz-ai/HARTOS" ];
-        after = [ "hart.target" "hart-model-bus.service" ];
+        # :PORT must come up FAST: the glass-shell host blocks on :PORT/health for up
+        # to 30s before it paints, and the session-supervisor's shell-paint watchdog
+        # drops a tier that hasn't painted — so a slow :PORT made Tier-1/2 get killed
+        # mid-wait and fall to cage (real-HW boot 2026-06-24). The shell server does
+        # NOT need the model bus to render: it degrades to a static UI without it (see
+        # the Model-Bus probe in ExecStart). `wants` STILL pulls the model bus in (the
+        # generative UI activates once it appears), but it is DROPPED from `after` so
+        # :PORT no longer waits behind model loading — they start concurrently.
+        after = [ "hart.target" ];
         wants = [ "hart-model-bus.service" ];
         wantedBy = [ "hart.target" ];
 
-        # curl is NOT on the unit's minimal PATH (the Model-Bus availability
-        # probe uses it).
-        path = with pkgs; [ curl coreutils ];
+        # Setting `.path` makes THIS the unit's ENTIRE PATH — /run/current-system/
+        # sw/bin is NOT on it. So every binary the shell server execs must be
+        # listed explicitly (the same minimal-unit-PATH bug class as the ISO boot
+        # services that were missing awk/lspci/xxd/curl).
+        #   - curl: the Model-Bus availability probe.
+        #   - networkmanager (nmcli): the glass shell's Wi-Fi UI. The connectivity
+        #     top-bar (/api/shell/connectivity/summary) and the Wi-Fi panel
+        #     (/api/shell/network/wifi*, /api/shell/wifi/*) all exec bare `nmcli`;
+        #     a returncode==0 is what flips wifi.available=True. Without nmcli on
+        #     PATH the exec raises FileNotFoundError (caught + ignored), leaving
+        #     available=False — which the UI renders as "Wi-Fi not available" even
+        #     though the radio + NetworkManager are up. nmcli talks to the NM
+        #     daemon over the system D-Bus (AF_UNIX is allowed; no PrivateNetwork),
+        #     so read-only status works here without extra group membership.
+        path = with pkgs; [ curl coreutils networkmanager ];
 
         environment = {
           HEVOLVE_DATA_DIR = cfg.dataDir;
@@ -337,6 +504,15 @@ in
           LIQUID_UI_THEME = ui.theme;
           LIQUID_UI_VOICE = if ui.voiceEnabled then "1" else "0";
           LIQUID_UI_HAPTIC = if ui.hapticEnabled then "1" else "0";
+          # #151 transparent-windows: tell the shell renderer whether WebKit
+          # accelerated COMPOSITING is on. The glass-shell host enables it ONLY when
+          # preferHardwareGL=true; otherwise it forces WEBKIT_DISABLE_COMPOSITING_MODE
+          # + HardwareAccelerationPolicy.NEVER and backdrop-filter:blur paints NOTHING,
+          # so a translucent .glass/.panel reads SEE-THROUGH. render_desktop_shell()
+          # reads this to tag <body webkit-flat> and solidify the glass when blur will
+          # not composite. SAME value the host derives preferHardwareGL from -> one
+          # source of truth, no drift between the renderer and the host.
+          LIQUID_UI_PREFER_HW_GL = if ui.preferHardwareGL then "1" else "0";
           LIQUID_UI_CONTEXT_MS = toString ui.contextRefreshMs;
           LIQUID_UI_A2UI = if ui.enableA2UI then "1" else "0";
           MODEL_BUS_HTTP_PORT = toString (config.hart.modelBus.ports.http or 6790);
@@ -345,6 +521,13 @@ in
           HART_LIQUID_UI_PORT = toString ui.port;
           NUNBA_STATIC_DIR = lib.mkIf ui.embedNunba
             "${pkgs.callPackage ../packages/nunba.nix { inherit hartSrc; }}/lib/nunba/static";
+          # When the native Nunba daemon runs (hart.nunba.enable), LiquidUI reverse-
+          # proxies the FULL Nunba (Python + React) over its unix socket instead of
+          # only serving the static React dist — same origin, no host port. The
+          # static dir above stays the graceful FLOOR (same /nix/store artifact the
+          # daemon serves, so it can't drift). Unset when the daemon is off → the
+          # existing static-only path is byte-for-byte unchanged (zero regression).
+          HART_NUNBA_SOCKET = lib.mkIf config.hart.nunba.enable config.hart.nunba.socket;
           PYTHONDONTWRITEBYTECODE = "1";
           PYTHONUNBUFFERED = "1";
         };

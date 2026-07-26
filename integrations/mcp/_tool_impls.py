@@ -162,6 +162,67 @@ def create_goal(goal_type: str, title: str, description: str = '', spark_budget:
         return json.dumps({"error": str(e)})
 
 
+def _loopback_bases() -> list:
+    """Candidate Flask-loopback base URLs, best first. The MCP server is a
+    SEPARATE process from the live app, so any MCP tool that needs process-local
+    state (the live GroupChat registry, the canonical ledger) must reach the app
+    over loopback. Single source for that candidate list — used by agent_status
+    AND steer_goal (no second copy to drift)."""
+    bases = []
+    try:
+        from core.port_registry import get_local_backend_url
+        bases.append(get_local_backend_url().rstrip('/'))
+    except Exception:
+        pass
+    for fb in ('http://127.0.0.1:5000', 'http://127.0.0.1:6777'):
+        if fb not in bases:
+            bases.append(fb)
+    return bases
+
+
+def steer_goal(goal_id: str, instruction: str) -> str:
+    """Co-pilot a RUNNING agent goal: inject an instruction into its live autogen
+    GroupChat so the next select_speaker turn consumes it. THIS is how an external
+    Claude Code session drives the HARTOS flywheel WITHOUT any Anthropic key —
+    watch goals with list_goals / agent_status, and when one stalls, steer it
+    (emit the recipe JSON, unstick a loop, redirect the plan, supply a missing
+    fact). Dispatch a goal first with dispatch_goal, then steer it.
+
+    Routes through the live app's ONE canonical inject route
+    (POST /api/social/dashboard/agents/<goal_id>/inject → the single
+    dashboard_service.inject_instruction bridge) over Flask loopback — the
+    GroupChat registry is process-local and this MCP server is a separate process
+    (same reason agent_status probes the loopback). Audit-logged
+    (actor=claude-code-copilot). ok=False means the goal isn't EXECUTING (no live
+    GroupChat) — dispatch_goal it first."""
+    if not (instruction or '').strip():
+        return json.dumps({"error": "instruction is required"})
+    try:
+        import requests as _r
+        last = None
+        for base in _loopback_bases():
+            try:
+                resp = _r.post(
+                    f"{base}/api/social/dashboard/agents/{goal_id}/inject",
+                    json={'instruction': instruction,
+                          'actor_id': 'claude-code-copilot'},
+                    timeout=10,
+                )
+                last = resp
+                if resp.status_code < 500:  # 200 ok / 400 no-live-groupchat are answers
+                    return json.dumps(
+                        resp.json() if resp.content else {'status': resp.status_code},
+                        indent=2, default=str)
+            except Exception:
+                continue
+        if last is not None:
+            return json.dumps({"error": f"HTTP {last.status_code}",
+                               "detail": (last.text or '')[:500]})
+        return json.dumps({"error": "no live HARTOS backend answered loopback"})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
 def agent_status() -> str:
     """Check agent daemon health, active dispatches, and system state.
 
@@ -211,15 +272,7 @@ def agent_status() -> str:
         # candidates and use the first that answers; live-witnessed: the
         # single-URL version reported ledger error HTTP 404 while the
         # bundled app served the stats fine on :5000.
-        from core.port_registry import get_local_backend_url
-        _bases = []
-        try:
-            _bases.append(get_local_backend_url().rstrip('/'))
-        except Exception:
-            pass
-        for _fallback in ('http://127.0.0.1:5000', 'http://127.0.0.1:6777'):
-            if _fallback not in _bases:
-                _bases.append(_fallback)
+        _bases = _loopback_bases()
         _resp = None
         for _base in _bases:
             try:

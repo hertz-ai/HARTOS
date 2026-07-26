@@ -27,6 +27,7 @@ Multi-modal output:
   Terminal -> Rich TUI (textual library)
   Haptic  -> Vibration patterns (phone, via Android bridge)
 """
+import copy
 import json
 import logging
 import os
@@ -64,6 +65,407 @@ def _a2ui_has_xss(value) -> bool:
     return False
 
 
+# ── GPU render verdict (#137 — reduced effects on software render) ───────────
+# hart-gpu-probe (nixos/modules/hart-gpu-probe.nix) runs a boot-time GL smoke
+# test BEFORE the display manager and writes a one-line verdict to
+# /run/hart/gpu-render: `hardware` (the GPU created a real GL context) or
+# `software` (forced llvmpipe/cairo — probe failed / disabled / timed out).
+# The GTK4 layer-shell host already reads this SAME file to pick its GSK
+# renderer; the desktop-shell render reads it too so the CSS can SHED the
+# GPU-only cinematic (backdrop blur, layered shadows, continuous animations)
+# when the shell is CPU-composited — that compositing is exactly what makes a
+# keystroke lag ~500ms and pegs a core on real software-rendered hardware.
+# REUSE the probe's verdict; do NOT invent a second probe.
+_GPU_RENDER_VERDICT_FILE = '/run/hart/gpu-render'
+
+
+def read_gpu_render_mode() -> str:
+    """Return 'hardware' or 'software' from the hart-gpu-probe verdict file.
+
+    Best-effort + fail-SOFTWARE: a missing/unreadable file or any value that is
+    not exactly `hardware` yields 'software' (the safe floor = reduced effects),
+    mirroring the probe's own fail-safe contract. Never raises."""
+    try:
+        with open(_GPU_RENDER_VERDICT_FILE, 'r') as f:
+            verdict = (f.read() or '').strip().lower()
+        return 'hardware' if verdict == 'hardware' else 'software'
+    except (FileNotFoundError, PermissionError, OSError):
+        return 'software'
+
+
+# /run/hart/session (0770, group-writable) NOT /run/hart (0750, owner-only): the
+# session HOST runs as hart-admin (in the `hart` group, not the `hart` OWNER), so it
+# can only write the group-writable session dir -- the SAME dir + reason shell-ready /
+# current-tier live in (hart-session-supervisor.nix). Writing /run/hart/shell-render
+# directly would silently fail (Permission denied, guarded) -> backend defaults to
+# 'software' -> the whole ladder defeated by a perms bug. The backend (hart / hart-
+# admin) can still traverse /run/hart (0750 gives group r-x) and read the 0770 file.
+_SHELL_RENDER_FILE = '/run/hart/session/shell-render'
+
+
+def read_shell_render_mode() -> str:
+    """Return the active shell RENDER RUNG the session tier is running:
+    'vulkan' | 'webkit-cairo' | 'software'.
+
+    The auto-fallback ladder (steward 2026-07-19 "both, one shd auto fallback to
+    other") maps renderer rungs onto the existing session-supervisor tier ladder:
+    Tier-1 hart-comp = vulkan, Tier-2 sway = webkit-cairo (GSK cairo + WebKit
+    accel), Tier-3 cage = software. Each tier's session launcher writes this file
+    so the backend body-class (gpu-hardware vs gpu-software webkit-flat) tracks the
+    ACTUAL painted rung -- when the paint-watchdog drops a hung GPU rung to a lower
+    one, the relaunched shell load re-renders in the rung that actually paints, with
+    no second read path. Both GPU rungs (vulkan + webkit-cairo) enable WebKit
+    compositing, so both light up the micro-animations + live glass; only the plain
+    'software' floor stays static/opaque. Best-effort + fail-SOFTWARE: missing /
+    unreadable / unknown value -> 'software' (the safe floor). Never raises."""
+    try:
+        with open(_SHELL_RENDER_FILE, 'r') as f:
+            mode = (f.read() or '').strip().lower()
+        return mode if mode in ('vulkan', 'webkit-cairo') else 'software'
+    except (FileNotFoundError, PermissionError, OSError):
+        return 'software'
+
+
+# ── Default-sink volume probe (wpctl-first, pactl fallback) ──────────────────
+# Module-level (NOT a route closure) so the background connectivity prober and
+# the volume write routes share ONE implementation — no parallel volume path.
+# Every call is subprocess.run with a bounded timeout and degrades to
+# {'available': False} when neither wpctl nor pactl is present (the live USB may
+# have neither); never crashes, never hangs.
+def _vol_run(cmd, timeout=4):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _volume_get(timeout=4):
+    # wpctl get-volume @DEFAULT_AUDIO_SINK@ -> "Volume: 0.55 [MUTED]"
+    r = _vol_run(['wpctl', 'get-volume', '@DEFAULT_AUDIO_SINK@'], timeout=timeout)
+    if r and r.returncode == 0 and 'Volume:' in r.stdout:
+        try:
+            frac = float(r.stdout.split('Volume:')[1].strip().split()[0])
+            return {'available': True, 'tool': 'wpctl',
+                    'volume': int(round(frac * 100)),
+                    'muted': 'MUTED' in r.stdout.upper()}
+        except (ValueError, IndexError):
+            logger.debug("_volume_get: swallowed ValueError, IndexError", exc_info=True)
+    # pactl fallback
+    mr = _vol_run(['pactl', 'get-sink-mute', '@DEFAULT_SINK@'], timeout=timeout)
+    vr = _vol_run(['pactl', 'get-sink-volume', '@DEFAULT_SINK@'], timeout=timeout)
+    if vr and vr.returncode == 0 and '%' in vr.stdout:
+        try:
+            pct = int(vr.stdout.split('/')[1].strip().rstrip('%'))
+            muted = bool(mr and mr.returncode == 0 and
+                         'yes' in mr.stdout.lower())
+            return {'available': True, 'tool': 'pactl',
+                    'volume': max(0, min(150, pct)), 'muted': muted}
+        except (ValueError, IndexError):
+            logger.debug("_volume_get: swallowed ValueError, IndexError", exc_info=True)
+    return {'available': False, 'volume': None, 'muted': None}
+
+
+# ── Background connectivity prober + snapshot cache (CAUSE 1) ─────────────────
+class _ConnectivityCache:
+    """One daemon thread keeps a connectivity snapshot fresh; the request
+    handlers read the cache INSTANTLY (no subprocess on the request path).
+
+    hartConnectivity.js polls /api/shell/connectivity/summary every ~8s (plus on
+    popover-open and on toggle) and /api/shell/network/wifi on open + every
+    Rescan. The old handlers ran up to SIX synchronous 4s subprocess.run calls
+    (nmcli x2, bluetoothctl x2, wpctl/pactl) in series ON the waitress request
+    thread. On a software-rendered lite box (threads=1-2) the pool saturated and
+    EVERY shell fetch queued behind it — the click-wifi / drag freeze. Aborting
+    the JS fetch never cancelled the server subprocess.
+
+    Fix: probe on ONE dedicated daemon thread on a ~9s cadence with SHORT (1.2s)
+    per-tool timeouts, skipping tools already found absent. A single thread means
+    probes are inherently debounced — they never overlap. Fail-safe: a probe
+    error keeps the previous good cache; an unprimed cache reads
+    'available': False everywhere, never a crash. The quick-settings WRITE
+    actions (scan/connect/toggle/set-volume) still hit the per-domain endpoints
+    inline; this is read-only aggregation, NOT a parallel control path.
+    """
+
+    REFRESH_INTERVAL_S = 9.0
+    PROBE_TIMEOUT_S = 1.2
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._summary = self._empty_summary()
+        self._wifi = {'networks': [], 'connected': {}}
+        self._absent = set()  # tool names that raised FileNotFoundError once
+        self._running = False
+
+    @staticmethod
+    def _empty_summary():
+        return {
+            'wifi': {'available': False, 'enabled': False, 'connected': False,
+                     'ssid': None, 'signal': None, 'blocked': None},
+            'bluetooth': {'available': False, 'powered': False,
+                          'connected_count': 0},
+            'battery': {'available': False, 'percent': None,
+                        'plugged_in': False, 'state': 'unknown'},
+            'volume': {'available': False, 'volume': None, 'muted': None},
+        }
+
+    def _run(self, cmd):
+        """subprocess.run with the SHORT probe timeout. Records a tool the moment
+        it raises FileNotFoundError and skips it forever after, so a known-absent
+        tool never costs a spawn again. Returns None on any failure."""
+        tool = cmd[0]
+        if tool in self._absent:
+            return None
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=self.PROBE_TIMEOUT_S)
+        except FileNotFoundError:
+            self._absent.add(tool)
+            return None
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+
+    @staticmethod
+    def _read_rfkill_flag(path):
+        """Read a 0/1 rfkill sysfs flag. Returns 1/0, or None if unreadable."""
+        try:
+            with open(path) as f:
+                v = f.read().strip()
+            return 1 if v == '1' else 0
+        except (OSError, ValueError):
+            return None
+
+    def _probe_rfkill_wifi(self, rfkill_dir='/sys/class/rfkill'):
+        """Read the kernel rfkill state for the wifi radio from sysfs — a pure
+        file read (NO subprocess, so it can never hang and never needs a tool on
+        PATH). This is what lets a SOFT-BLOCK be told apart from "no hardware":
+
+            'hard'    - a physical/BIOS kill switch is engaged. The CHIP IS
+                        PRESENT but the radio is off in hardware (a software
+                        toggle cannot turn it back on).
+            'soft'    - a software block (airplane mode / `nmcli radio wifi off`).
+                        The CHIP IS PRESENT and re-enableable in software.
+            'none'    - a wlan rfkill entry exists and is unblocked (radio on).
+            'absent'  - the rfkill subsystem is present but there is NO wlan
+                        entry => the wifi chip is NOT enumerated (missing driver/
+                        firmware, or simply no wifi hardware). THE honest
+                        "hardware not detected" signal.
+            'unknown' - /sys/class/rfkill is missing/unreadable (e.g. a container
+                        or a VM without the rfkill subsystem) => cannot tell from
+                        rfkill; the caller falls back to NetworkManager signals.
+
+        'hard'/'soft'/'none' all PROVE the radio hardware is enumerated, so the
+        UI can say "blocked" instead of mis-reporting "no hardware".
+        """
+        if not os.path.isdir(rfkill_dir):
+            return 'unknown'
+        try:
+            entries = os.listdir(rfkill_dir)
+        except OSError:
+            return 'unknown'
+        state = 'absent'   # subsystem present; a wlan entry downgrades this below
+        for name in entries:
+            base = os.path.join(rfkill_dir, name)
+            try:
+                with open(os.path.join(base, 'type')) as f:
+                    if f.read().strip() != 'wlan':
+                        continue
+            except OSError:
+                continue
+            # A wlan rfkill entry exists => the wifi chip IS present.
+            if self._read_rfkill_flag(os.path.join(base, 'hard')) == 1:
+                return 'hard'          # hard block is the most restrictive — wins
+            if self._read_rfkill_flag(os.path.join(base, 'soft')) == 1:
+                state = 'soft'
+            elif state != 'soft':
+                state = 'none'
+        return state
+
+    def _probe_wifi(self):
+        wifi = {'available': False, 'enabled': False, 'connected': False,
+                'ssid': None, 'signal': None, 'blocked': None}
+
+        # rfkill (sysfs) is the AUTHORITATIVE presence + block signal. NM's
+        # `radio wifi` reports the SOFTWARE toggle and stays "enabled" even with
+        # ZERO wifi devices, so on its own it falsely claims "available" on a box
+        # with no wifi chip. rfkill tells present-vs-absent and soft-vs-hard block.
+        rf = self._probe_rfkill_wifi()
+        if rf in ('hard', 'soft', 'none'):
+            wifi['available'] = True            # a wlan rfkill entry == chip present
+            if rf in ('hard', 'soft'):
+                wifi['blocked'] = rf            # distinct from "no hardware"
+        # rf == 'absent' => rfkill present, no wlan entry => NO wifi chip. Leave
+        # available False so the UI honestly says "hardware not detected", and
+        # never let the NM fallbacks below flip it back to True.
+
+        r = self._run(['nmcli', 'radio', 'wifi'])
+        if r and r.returncode == 0:
+            wifi['enabled'] = r.stdout.strip().lower() == 'enabled'
+            # Fallback presence ONLY when rfkill could not tell us (no
+            # /sys/class/rfkill, e.g. a container/VM) — never override a definitive
+            # 'absent'. NM-down (rc != 0 / nmcli missing) is NOT "no hardware":
+            # rfkill above already decides presence in that case.
+            if rf == 'unknown':
+                wifi['available'] = True
+
+        r = self._run(['nmcli', '-t', '-f', 'ACTIVE,SSID,SIGNAL',
+                       'device', 'wifi'])
+        if r and r.returncode == 0:
+            # nmcli returns rc 0 here only when a wifi device exists (it errors
+            # "No Wi-Fi device found" otherwise), so rc 0 corroborates presence —
+            # but never override a definitive rfkill 'absent'.
+            if rf != 'absent':
+                wifi['available'] = True
+            for line in r.stdout.strip().split('\n'):
+                parts = line.split(':')
+                if len(parts) >= 2 and parts[0] == 'yes':
+                    wifi['connected'] = True
+                    wifi['ssid'] = parts[1] or None
+                    if len(parts) >= 3 and parts[2].isdigit():
+                        wifi['signal'] = int(parts[2])
+                    break
+        return wifi
+
+    def _probe_bluetooth(self):
+        bt = {'available': False, 'powered': False, 'connected_count': 0}
+        r = self._run(['bluetoothctl', 'show'])
+        if r and r.returncode == 0:
+            bt['available'] = True
+            for line in r.stdout.split('\n'):
+                if 'Powered:' in line:
+                    bt['powered'] = 'yes' in line.lower()
+                    break
+        if bt['powered']:
+            r = self._run(['bluetoothctl', 'devices', 'Connected'])
+            if r and r.returncode == 0:
+                bt['connected_count'] = len(
+                    [ln for ln in r.stdout.strip().split('\n')
+                     if ln.strip().startswith('Device')])
+        return bt
+
+    def _probe_battery(self):
+        # psutil + sysfs (the canonical cross-platform path). No subprocess.
+        battery = {'available': False, 'percent': None,
+                   'plugged_in': False, 'state': 'unknown'}
+        try:
+            import psutil
+            b = psutil.sensors_battery()
+            if b is not None:
+                battery['available'] = True
+                battery['percent'] = int(round(b.percent))
+                battery['plugged_in'] = bool(b.power_plugged)
+                battery['state'] = ('charging' if b.power_plugged
+                                    else 'discharging')
+        except (ImportError, RuntimeError, OSError):
+            logger.warning("_probe_battery: swallowed ImportError, RuntimeError, OSError", exc_info=True)
+        if not battery['available']:
+            try:
+                import glob as _g
+                bats = sorted(_g.glob('/sys/class/power_supply/BAT*'))
+                if bats:
+                    d = bats[0]
+                    try:
+                        with open(d + '/capacity') as f:
+                            cap = f.read().strip()
+                        if cap.isdigit():
+                            battery['available'] = True
+                            battery['percent'] = int(cap)
+                    except (OSError, ValueError):
+                        logger.warning("_probe_battery: swallowed OSError, ValueError", exc_info=True)
+                    try:
+                        with open(d + '/status') as f:
+                            st = f.read().strip().lower()
+                        if st:
+                            battery['state'] = st
+                            battery['plugged_in'] = st in ('charging', 'full')
+                    except OSError:
+                        logger.warning("_probe_battery: swallowed OSError", exc_info=True)
+            except OSError:
+                logger.warning("_probe_battery: swallowed OSError", exc_info=True)
+        return battery
+
+    def _probe_wifi_list(self):
+        networks = []
+        connected = {}
+        # `--rescan no` reads the CACHED scan (instant, non-blocking). Without it
+        # nmcli may kick off a fresh radio scan that blocks for many seconds; on
+        # the daemon prober that just burned the 1.2s PROBE_TIMEOUT_S budget and
+        # returned an empty list (popover shows no networks), and a scan must only
+        # happen on an EXPLICIT user rescan action, never on popover-open. The
+        # request path (shell_wifi) already reads the cache only, so no blocking
+        # scan sits on the waitress thread; the explicit rescan endpoint owns the
+        # fresh scan.
+        r = self._run(['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY,ACTIVE',
+                       'device', 'wifi', 'list', '--rescan', 'no'])
+        if r and r.returncode == 0:
+            for line in r.stdout.strip().split('\n'):
+                parts = line.split(':')
+                if len(parts) >= 4 and parts[0]:
+                    try:
+                        net = {'ssid': parts[0], 'signal': int(parts[1] or 0),
+                               'security': parts[2], 'active': parts[3] == 'yes'}
+                    except ValueError:
+                        continue
+                    networks.append(net)
+                    if net['active']:
+                        connected = net
+        r = self._run(['hostname', '-I'])
+        if r and r.returncode == 0 and r.stdout.strip():
+            connected['ip'] = r.stdout.strip().split()[0]
+        return {'networks': networks[:20], 'connected': connected}
+
+    def refresh(self):
+        """Probe every domain once and atomically swap the cached snapshots.
+        Safe to call from the daemon loop OR directly (tests). Builds fresh dicts
+        and replaces the references under the lock — never mutates a dict a reader
+        may be holding."""
+        summary = {
+            'wifi': self._probe_wifi(),
+            'bluetooth': self._probe_bluetooth(),
+            'battery': self._probe_battery(),
+            'volume': _volume_get(timeout=self.PROBE_TIMEOUT_S),
+        }
+        wifi_list = self._probe_wifi_list()
+        with self._lock:
+            self._summary = summary
+            self._wifi = wifi_list
+
+    def summary(self):
+        with self._lock:
+            return copy.deepcopy(self._summary)
+
+    def wifi_networks(self):
+        with self._lock:
+            return copy.deepcopy(self._wifi)
+
+    def start(self):
+        """Start the background prober once (idempotent). Spawns a daemon thread
+        only — it never probes on the calling thread."""
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+        threading.Thread(target=self._loop, name='hart-connectivity-cache',
+                         daemon=True).start()
+
+    def _loop(self):
+        while self._running:
+            try:
+                self.refresh()
+            except Exception:
+                logger.exception("_loop: swallowed Exception")
+            time.sleep(self.REFRESH_INTERVAL_S)
+
+
+# One process-wide prober, lazy-started (idempotently) by the connectivity
+# request handlers on the first poll — so a process that builds the app but never
+# polls (and unrelated tests) never spawns the daemon, and the start works in
+# BOTH serve_forever() and the co-located Nunba bundle (the WebView polls either
+# way).
+_connectivity_cache = _ConnectivityCache()
+
+
 # ═══════════════════════════════════════════════════════════════
 # UI Component Schema (A2UI protocol)
 # ═══════════════════════════════════════════════════════════════
@@ -79,7 +481,27 @@ COMPONENT_TYPES = {
     'code': {'props': ['language', 'content', 'filename']},
     'markdown': {'props': ['content']},
     'media': {'props': ['type', 'src', 'alt', 'controls']},
-    'metric': {'props': ['label', 'value', 'unit', 'trend', 'explanation']},
+    # ``metric`` is the worked example of the ENRICHED interface shape (§6b): the
+    # flat ``props`` stays (the attribute schema every consumer already reads), and
+    # the entry additionally DECLARES the events it emits, its behaviours, and an
+    # AGENT-READABLE ``spec`` so the local HART intelligence can introspect + drive
+    # it from the spec alone.  Every other builtin keeps ``props``-only and its spec
+    # is SYNTHESIZED by ``_component_spec_for`` — the enrichment is OPTIONAL, never a
+    # second registry.
+    'metric': {
+        'props': ['label', 'value', 'unit', 'trend', 'explanation'],
+        'events': ['click'],
+        'behaviors': ['live_update'],
+        'spec': {
+            'name': 'metric',
+            'attributes': {'label': 'str', 'value': 'number', 'unit': 'str',
+                           'trend': 'up|down|flat', 'explanation': 'str'},
+            'emits': ['click'],
+            'behaviors': ['live_update'],
+            'mount': 'a2ui',
+            'compose': 'agent_ui_update(agent_id, {"type": "metric", ...attrs})',
+        },
+    },
     'layout': {'props': ['type', 'children', 'gap']},
     # ── Ecommerce / Agent Action Live Fragments ──
     'product_card': {'props': ['name', 'price', 'image', 'rating', 'description',
@@ -135,7 +557,86 @@ COMPONENT_TYPES = {
     # gateway confirms authentication.  Self-dismisses after 6s on web.
     'channel_connected': {'props': ['channel', 'display_name', 'color',
                                     'message']},
+    # ── App installed → desktop icon (NixOS-style: install an app, its icon
+    # appears) ── Emitted by app_installer._auto_register_app on a successful
+    # install.  The desktop (hartDesktop.js) merges {id,title,icon,exec} into
+    # window.MANIFEST and auto-pins via the EXISTING hartPinIcon, so the new
+    # app's icon shows up live without a refresh.
+    'app_installed': {'props': ['id', 'title', 'icon', 'exec', 'group',
+                                'platform']},
+    # ── Agentic HOME composition (the local LLM paints the Netflix home) ──
+    # The ONE agentic home feed: `compose_home` pushes a {hero, rows} payload
+    # through this type; the SSE consumer routes it to HartHome.compose ->
+    # render (hartHome.js).  Without this allowlist entry agent_ui_update would
+    # reject the push (unknown type) and the SSE consumer branch stays a dead
+    # consumer with no feed.  `home_compose` is the canonical type; `home` is a
+    # back-compat alias the consumer also accepts (so neither is silently
+    # dropped).  hartHome's samplePayload() stays the offline skeleton; an
+    # accepted push overrides it live.
+    # ``mood`` (a HART_PALETTES id, §6a) rides the SAME home push: the local LLM
+    # now composes the ambient palette too, forwarded verbatim to the client which
+    # is the single owner of the palette-id vocabulary (calls applyPalette).  It is
+    # an OPTIONAL prop — an unset mood leaves the shell palette untouched.
+    'home_compose': {'props': ['hero', 'rows', 'mood']},
+    'home': {'props': ['hero', 'rows', 'mood']},
 }
+
+
+def _component_spec_for(name: str, entry: dict) -> dict:
+    """Build the AGENT-READABLE machine spec for one registered component from its
+    interface entry (§6b — the COMPONENT_TYPES-as-registry contract).
+
+    If the entry ships an explicit ``spec`` it wins (a runtime-registered component,
+    or an enriched builtin like ``metric``, declares its own).  Otherwise the spec is
+    SYNTHESIZED from the entry's ``props`` (the attribute schema) plus any optional
+    ``events``/``behaviors`` — so EVERY builtin is introspectable without hand-writing
+    30 specs, and adding a builtin needs no spec boilerplate.  The local HART
+    intelligence composes a component from this spec ALONE: ``name`` + attribute
+    schema + emitted events + how to mount/compose it (via the one A2UI transport).
+    """
+    if isinstance(entry.get('spec'), dict):
+        return entry['spec']
+    props = entry.get('props') or []
+    return {
+        'name': name,
+        'attributes': {p: 'any' for p in props},
+        'emits': list(entry.get('events') or []),
+        'behaviors': list(entry.get('behaviors') or []),
+        'mount': 'a2ui',
+        'compose': ('agent_ui_update(agent_id, {"type": "%s", ...attributes})'
+                    % name),
+    }
+
+# ── Agentic HOME composition — the producer's schema allow-sets ──────────────
+# compose_home pushes a {hero, rows} payload; hartHome.js (compose -> render) is
+# the renderer.  These sets are the SINGLE server-side source of truth the
+# producer validates a (deterministic OR LLM-authored) composition against, so a
+# hallucinated row can never inject an unknown accent, a non-existent click verb,
+# or a deep-link to a panel that does not exist.  They mirror hartHome.js's brand
+# spectrum + the NAV_MAP / PANEL ids exactly — keep them in lockstep, do NOT fork
+# a second palette.  cards hydrate their own imagery client-side (hartHome
+# makeCard: card.image | card.image_url -> the /api/media cache | else a local
+# media-index search by card.topic|title), so the producer only needs to supply
+# good titles/topics + an optional real web image_url; it never embeds bytes.
+HOME_ROW_ACCENTS = ('teal', 'cyan', 'blue', 'violet', 'magenta', 'amber')
+HOME_CARD_ACTIONS = ('ask', 'open', 'resume')
+# The ambient MOOD vocabulary the LLM may emit (compose_home mood=). MIRRORS the
+# authoritative client list `PALETTES`/`window.HART_PALETTES` in static/hartPersonalize.js
+# (:53-74) — keep in LOCKSTEP (a source-shape guard test asserts they match). Enumerated
+# in the _llm_curate_home prompt so the model only emits ids the client can resolve via
+# HartPalette.byId (an id outside this set is a graceful client no-op, never a broken paint).
+HART_MOOD_PALETTE_IDS = (
+    'vibrant', 'monotone-teal', 'aqua', 'neon', 'sunset', 'electric', 'ember',
+    'vapor', 'ocean', 'coral',
+    'aurora', 'solar', 'oceanic', 'nebula', 'verdant', 'ember-aura',
+)
+# Panel ids a row "See all" / a card may deep-link to.  Subset of PANEL_MANIFEST
+# + NAV_MAP + SYSTEM_PANELS ids that already exist (an unknown target opens an
+# empty panel, so the producer is restricted to these).
+HOME_PANEL_TARGETS = (
+    'agents_browse', 'communities', 'recipes', 'app_store',
+    'resonance', 'user_accounts',
+)
 
 # ═══════════════════════════════════════════════════════════════
 # Context Engine
@@ -177,14 +678,14 @@ class ContextEngine:
                 with open(variant_file) as f:
                     context['variant'] = f.read().strip()
         except Exception:
-            pass
+            logger.exception("_get_device_context: swallowed Exception")
         try:
             tier_file = os.path.join(data_dir, 'capability_tier')
             if os.path.exists(tier_file):
                 with open(tier_file) as f:
                     context['tier'] = f.read().strip()
         except Exception:
-            pass
+            logger.exception("_get_device_context: swallowed Exception")
         import datetime
         now = datetime.datetime.now()
         context['hour'] = now.hour
@@ -206,7 +707,7 @@ class ContextEngine:
                 return {'available': True, 'models': data.get('models', []),
                         'count': len(data.get('models', []))}
         except Exception:
-            pass
+            logger.exception("_get_model_context: swallowed Exception")
         return {'available': False, 'models': [], 'count': 0}
 
     def _get_agent_context(self) -> dict:
@@ -223,7 +724,7 @@ class ContextEngine:
                     'total': len(agents), 'agents': agents[:5],
                 }
         except Exception:
-            pass
+            logger.exception("_get_agent_context: swallowed Exception")
         return {'running': 0, 'total': 0, 'agents': []}
 
     def _get_system_context(self) -> dict:
@@ -234,7 +735,7 @@ class ContextEngine:
                 context['load_1m'] = float(parts[0])
                 context['load_5m'] = float(parts[1])
         except Exception:
-            pass
+            logger.exception("_get_system_context: swallowed Exception")
         try:
             with open('/proc/meminfo') as f:
                 mem = {}
@@ -246,14 +747,44 @@ class ContextEngine:
                 context['memory_used_percent'] = round(
                     (1 - available / total) * 100, 1)
         except Exception:
-            pass
+            logger.exception("_get_system_context: swallowed Exception")
         try:
             with open('/proc/uptime') as f:
                 context['uptime_hours'] = round(
                     float(f.read().split()[0]) / 3600, 1)
         except Exception:
-            pass
+            logger.exception("_get_system_context: swallowed Exception")
         return context
+
+
+def _resolve_shell_pool_threads(tier):
+    """How many waitress worker threads the glass shell serves on, by HW tier.
+
+    Why this is a FLOOR and not 1-2 (mid-session freeze RCA): waitress is a
+    thread-PER-connection server. The shell holds at least one LONG-LIVED
+    connection for the session — the ``/api/notifications/stream`` SSE
+    (EventSource opened on load when not in potato mode) runs ``while True``
+    and never returns, so it permanently OWNS one worker thread. The log-viewer
+    SSE takes another whenever that panel is open. On top of that, several
+    request handlers BLOCK for seconds and cannot be made non-blocking: the
+    ``/api/agent/ask`` chat proxy waits up to 30s on the brain's ``/chat`` (it
+    is gated on the single local-LLM slot), and the panel-open routes shell out
+    to nmcli / pactl / journalctl for several seconds each.
+
+    With a 1-2 thread pool, a SINGLE persistent SSE plus one blocking request
+    leaves zero threads to serve the polls (connectivity 8s, metrics 4s,
+    senses 4s) and every other interaction — the whole desktop freezes mid
+    session. Idle waitress threads are nearly free (a parked thread blocked in
+    recv), so the fix is to size the pool to absorb: persistent SSE(s) + one
+    long chat + the steady poll cadence + a panel-open subprocess, with
+    headroom. This complements (does not replace) the connectivity-cache fix
+    that already took subprocess work OFF the polled request paths.
+    """
+    if tier in ('embedded', 'observer'):
+        return 6
+    if tier == 'lite':
+        return 8
+    return 12
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -290,6 +821,11 @@ class LiquidUIService:
         self._agent_components: Dict[str, List[dict]] = {}
         self._a2ui_buckets: Dict[str, tuple] = {}   # agent_id -> (tokens, ts)
         self._lock = threading.Lock()
+        # Wakes the /api/notifications/stream SSE producer the instant an agent
+        # pushes a component, instead of the old 2s server-side poll. Dedicated CV
+        # (NOT self._lock) so the producer never holds self._lock while waiting and
+        # cannot deadlock with the writer's lock order. agent_ui_update notifies it.
+        self._ui_event_cv = threading.Condition()
         self._running = False
         self._model_available = False
 
@@ -300,6 +836,16 @@ class LiquidUIService:
                 os.path.join(os.path.dirname(os.path.dirname(
                     os.path.dirname(os.path.abspath(__file__)))),
                     'agent_data')))
+
+        # Runtime component REGISTRY (§6b): HART agents register NEW self-sufficient,
+        # interface-declared, agent-spec'd components at runtime.  Builtins live in the
+        # module-level COMPONENT_TYPES (protected); agent-registered ones persist to
+        # ``component_types_custom.json`` and load here — mirroring skin_registry's
+        # starter-in-code + persisted-custom pattern.  The ONE allowlist gate in
+        # agent_ui_update checks builtin OR this map, so it is runtime-extensible
+        # without a second transport or spec format.
+        self._custom_component_types: Dict[str, dict] = \
+            self._load_custom_component_types()
 
         logger.info(
             "LiquidUIService initialized: port=%d, renderer=%s, "
@@ -436,7 +982,10 @@ class LiquidUIService:
         if not self.a2ui_enabled:
             return False
         comp_type = component.get('type', '')
-        if comp_type not in COMPONENT_TYPES:
+        # The ONE allowlist gate, now runtime-extensible (§6b): a builtin type OR a
+        # component a HART agent registered at runtime.  No second gate, no fork.
+        if (comp_type not in COMPONENT_TYPES
+                and comp_type not in self._custom_component_types):
             logger.warning("Invalid A2UI component type: %s", comp_type)
             return False
 
@@ -453,7 +1002,7 @@ class LiquidUIService:
                     comp_type, agent_id)
                 return False
         except Exception:
-            pass
+            logger.exception("agent_ui_update: swallowed Exception")
 
         # Per-agent rate cap (token bucket) — a runaway agent can't flood the
         # desktop with UI pushes.
@@ -478,6 +1027,20 @@ class LiquidUIService:
         component['_ts'] = _time.time()
         component['_agent_id'] = agent_id
 
+        # G2: a push of an agent-REGISTERED custom type carries its render spec so the
+        # client can render it (props to iterate, or a template to fill) instead of the
+        # generic JSON fallback. Stamped on the push itself (not a render-time HART_SPECS
+        # blob) so a type registered at runtime renders IMMEDIATELY on its first push --
+        # "agents bake new UI on the fly", live. Builtins render via their own branches
+        # and never carry _spec. The template was XSS-vetted at register_component_type.
+        if comp_type in self._custom_component_types and '_spec' not in component:
+            _entry = self._custom_component_types[comp_type]
+            _rspec = {'props': _entry.get('props') or [],
+                      'events': _entry.get('events') or []}   # G5: declared events
+            if isinstance(_entry.get('template'), str):
+                _rspec['template'] = _entry['template']
+            component['_spec'] = _rspec
+
         # Provable audit trail — every accepted push is recorded exactly like
         # a goal dispatch (dispatch.py:680).  Best-effort: an audit hiccup
         # must not drop a user's card.  Type + agent only (no user payload).
@@ -488,9 +1051,9 @@ class LiquidUIService:
                 action=f'push {comp_type} component',
                 detail={'type': comp_type}, target_id=str(agent_id))
         except Exception:
-            pass
+            logger.exception("agent_ui_update: swallowed Exception")
 
-        # 1. Store for SSE polling (Nunba web LiquidUI)
+        # 1. Store for the SSE stream (Nunba web LiquidUI)
         with self._lock:
             if agent_id not in self._agent_components:
                 self._agent_components[agent_id] = []
@@ -498,6 +1061,12 @@ class LiquidUIService:
             if len(self._agent_components[agent_id]) > 5:
                 self._agent_components[agent_id] = \
                     self._agent_components[agent_id][-5:]
+        # Wake the SSE producer NOW (event-driven) instead of letting it discover
+        # this on its next 2s poll — the component is already stored, so a woken
+        # stream re-scans and emits it immediately. notify_all covers every open
+        # stream; a missed wake still self-heals on the producer's safety timeout.
+        with self._ui_event_cv:
+            self._ui_event_cv.notify_all()
 
         # 2. Push to EventBus → WAMP → Android/iOS/Desktop
         # The WAMP bridge (core/platform/events.py) auto-publishes to
@@ -511,7 +1080,7 @@ class LiquidUIService:
                 'component': component,
             })
         except Exception:
-            pass  # EventBus emission is best-effort
+            logger.exception("agent_ui_update: swallowed Exception")  # EventBus emission is best-effort
 
         logger.info("A2UI: agent %s pushed %s component", agent_id, comp_type)
         return True
@@ -544,6 +1113,138 @@ class LiquidUIService:
             logger.error("A2UI guardrail unavailable — blocking destructive "
                          "verb: %s", e)
             return False
+
+    # ─── Runtime component REGISTRY (§6b) — HART agents compose/extend the
+    #     interface-declared, agent-spec'd component set at runtime ─────────
+
+    def _component_types_path(self) -> str:
+        """On-disk home for agent-registered component specs (one writer)."""
+        return os.path.join(self._data_dir, 'component_types_custom.json')
+
+    def _load_custom_component_types(self) -> Dict[str, dict]:
+        """Load persisted runtime-registered component specs. Best-effort: a
+        missing/corrupt file yields an empty map (builtins always stand)."""
+        try:
+            with open(self._component_types_path(), 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+    def _write_custom_component_types(self, types: Dict[str, dict]) -> bool:
+        """Atomic write of the custom component map (one writer, os.replace) —
+        mirrors skin_registry._write_custom.  Never raises."""
+        try:
+            with self._lock:
+                os.makedirs(self._data_dir, exist_ok=True)
+                path = self._component_types_path()
+                tmp = path + '.tmp'
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump(types, f, indent=2)
+                os.replace(tmp, path)
+            return True
+        except OSError as e:
+            logger.warning("component_types write failed: %s", e)
+            return False
+
+    def list_component_specs(self) -> List[dict]:
+        """The AGENT-READABLE catalogue: the machine spec for every component
+        (builtin + runtime-registered) the local HART intelligence can compose.
+
+        Builtins' specs are synthesized from their interface entry (or their own
+        declared ``spec``); custom entries carry their spec verbatim.  This is the
+        one introspection surface an agent reads to drive/compose any component from
+        the spec alone."""
+        specs: List[dict] = []
+        for name, entry in COMPONENT_TYPES.items():
+            specs.append(_component_spec_for(name, entry))
+        for name, entry in self._custom_component_types.items():
+            specs.append(_component_spec_for(name, entry))
+        return specs
+
+    def get_component_spec(self, type_name: str) -> Optional[dict]:
+        """The machine spec for one component type (builtin or registered), or None."""
+        if type_name in COMPONENT_TYPES:
+            return _component_spec_for(type_name, COMPONENT_TYPES[type_name])
+        if type_name in self._custom_component_types:
+            return _component_spec_for(type_name,
+                                       self._custom_component_types[type_name])
+        return None
+
+    def register_component_type(self, agent_id: str, type_name: str,
+                                spec: dict) -> dict:
+        """A HART agent registers a NEW self-sufficient, interface-declared,
+        agent-spec'd component at runtime (§6b).
+
+        Routes through the SAME governance agent_ui_update owns — a2ui-enabled,
+        the human HiveCircuitBreaker kill-switch, the per-agent rate cap, the XSS
+        reject, and the immutable audit log — so extending the component set is
+        governed exactly like pushing one.  Builtins are protected (cannot be
+        overwritten), exactly like starter skins.  Persists to the SAME custom map
+        the allowlist gate reads, so the new type is immediately composable through
+        the ONE transport.  Composer = HART agents only (this is in-process; no
+        external/cloud path exists or is added).
+
+        Returns {'status':'registered','type':...} or {'error':...}.
+        """
+        if not self.a2ui_enabled:
+            return {'error': 'a2ui disabled'}
+        name = str(type_name or '').strip().lower()
+        if not re.match(r'^[a-z][a-z0-9_]{1,39}$', name):
+            return {'error': 'type name must be a lowercase slug '
+                             '[a-z][a-z0-9_]{1,39}'}
+        if name in COMPONENT_TYPES:
+            return {'error': f'"{name}" is a builtin component and is protected'}
+        if not isinstance(spec, dict):
+            return {'error': 'spec must be an object'}
+        # Kill-switch: registering a component is an agent painting the screen —
+        # governed like a dispatch.  Fail-OPEN only on guardrail import error.
+        try:
+            from security.hive_guardrails import HiveCircuitBreaker
+            if HiveCircuitBreaker.is_halted():
+                return {'error': 'hive halted'}
+        except Exception:
+            logger.exception("register_component_type: swallowed Exception")
+        if not self._a2ui_rate_ok(agent_id):
+            return {'error': 'rate-capped'}
+        if _a2ui_has_xss(spec) or _a2ui_has_xss(name):
+            logger.warning("component register rejected (unsafe): %s from %s",
+                           name, agent_id)
+            return {'error': 'unsafe content in spec'}
+        # Normalize into the SAME interface-entry shape builtins use, so the entry
+        # is a self-sufficient component: props (attribute schema) + declared
+        # events/behaviors + the agent-readable spec (synthesized if not supplied).
+        props = spec.get('props')
+        if not isinstance(props, list):
+            attrs = spec.get('attributes')
+            props = list(attrs.keys()) if isinstance(attrs, dict) else []
+        entry = {
+            'props': [str(p) for p in props][:40],
+            'events': [str(e) for e in (spec.get('events')
+                                        or spec.get('emits') or [])][:20],
+            'behaviors': [str(b) for b in (spec.get('behaviors') or [])][:20],
+        }
+        if isinstance(spec.get('template'), str):
+            entry['template'] = spec['template']
+        entry['spec'] = _component_spec_for(name, {**entry,
+                                                   'spec': spec.get('spec')})
+        with self._lock:
+            merged = dict(self._custom_component_types)
+            merged[name] = entry
+        if not self._write_custom_component_types(merged):
+            return {'error': 'failed to persist component spec'}
+        self._custom_component_types = merged
+        try:
+            from security.immutable_audit_log import get_audit_log
+            get_audit_log().log_event(
+                'a2ui_register_component', actor_id=str(agent_id),
+                action=f'register {name} component',
+                detail={'type': name}, target_id=str(agent_id))
+        except Exception:
+            logger.exception("register_component_type: swallowed Exception")
+        logger.info("A2UI: agent %s registered component type %s",
+                    agent_id, name)
+        return {'status': 'registered', 'type': name}
 
     def _compose_intent_result(self, intent_text: str, chat_result: dict) -> bool:
         """M1 — turn a brain /chat decomposition into COMPOSED desktop UI.
@@ -592,6 +1293,76 @@ class LiquidUIService:
         self.agent_ui_update(agent_id, component)
         return {'status': 'approval_requested', 'component': component}
 
+    def compose_home(self, hero=None, rows=None, agent_id='home_composer',
+                     mood=None):
+        """Push a composed HOME surface through the ONE wired A2UI channel.
+
+        This is the single SERVER-SIDE producer of the agentic home feed: the
+        local LLM (or any agent) hands a ``{hero, rows}`` composition and it
+        flows agent_ui_update -> SSE -> HartHome.compose -> render (hartHome.js),
+        the SAME governed transport every other agent UI push uses (no parallel
+        path).  hartHome's ``samplePayload()`` is only the offline skeleton; an
+        accepted push overrides it live.
+
+        Single responsibility: build the ``home_compose`` component and delegate
+        to ``agent_ui_update`` (which owns the kill-switch / rate-cap / audit /
+        XSS gating).  Returns True iff the push was accepted (False when the hive
+        is halted, rate-capped, a2ui is disabled, or both fields are empty).
+        """
+        if hero is None and rows is None:
+            return False
+        component = {'type': 'home_compose'}
+        if hero is not None:
+            component['hero'] = hero
+        if rows is not None:
+            component['rows'] = rows
+        # The LLM-composed ambient mood/palette id (§6a) rides the SAME push; the
+        # client applies it via applyPalette. Optional — omitted leaves the palette
+        # untouched. The XSS gate + slug sanitize already vetted it upstream.
+        if mood:
+            component['mood'] = mood
+        return self.agent_ui_update(agent_id, component)
+
+    def compose_home_now(self, reason: str = 'manual') -> bool:
+        """PRODUCER: compose the agentic home from live context + the local LLM,
+        then push it through the wired feed.
+
+        This is the producer half the agentic-home transport was missing (the
+        home had a renderer + a governed channel but nobody ever composed for
+        it).  It gathers the SAME surfaces hartHome.js reads (the agent
+        dashboard, recipes on disk, the earnings wallet, the hive, system),
+        composes a contextual ``{hero, rows}`` — the local LLM (the heart)
+        curates the narrative + emphasis over a deterministic backbone so the
+        home NEVER breaks when the on-device 4B can't emit clean JSON — and
+        hands it to ``compose_home`` -> ``agent_ui_update`` (the ONE governed
+        transport: the human kill-switch, the per-agent rate cap, the audit log
+        and the XSS reject all live there, so this method adds no new gate and
+        no new channel).
+
+        Driven by the autonomous agent daemon when the box is idle
+        (``agent_daemon._maybe_compose_home``) so the home stays alive whether
+        the user is at the machine or away — the existing daemon, the existing
+        feed, no new loop.  Returns True iff the push was accepted.  Never
+        raises (a compose fault must never take down the shell or the daemon)."""
+        try:
+            payload = build_home_payload(
+                backend_port=self.backend_port,
+                model_bus_port=self.model_bus_port)
+        except Exception as e:
+            logger.debug("compose_home_now(%s): build failed: %s", reason, e)
+            return False
+        if not payload:
+            return False
+        ok = self.compose_home(
+            hero=payload.get('hero'), rows=payload.get('rows'),
+            agent_id='home_composer', mood=payload.get('mood'))
+        if ok:
+            logger.info(
+                "compose_home_now(%s): pushed %d row(s)%s",
+                reason, len(payload.get('rows') or []),
+                ' + hero' if payload.get('hero') else '')
+        return ok
+
     # ─── Voice I/O — preserved ────────────────────────────────
 
     def handle_voice_input(self, audio_path: str) -> dict:
@@ -625,7 +1396,7 @@ class LiquidUIService:
                 return {'text': text, 'response': resp.json().get('response', ''),
                         'source': 'voice'}
         except Exception:
-            pass
+            logger.exception("_process_voice_command: swallowed Exception")
         return {'text': text, 'response': 'Could not process', 'source': 'voice'}
 
     # ─── Glass Desktop Shell Render ───────────────────────────
@@ -642,13 +1413,140 @@ class LiquidUIService:
             from integrations.agent_engine.theme_service import ThemeService
             css_vars = ThemeService.get_css_variables()
             theme = ThemeService.get_active_theme()
+            # Say WHICH theme actually resolved, ONCE per process. Real-HW
+            # 2026-07-19/20: the steward reported the desktop was "fully bluish"
+            # (the #0F0E17 fallback below) on a build that DID ship the theme
+            # presets, and the journal could not settle it -- the only theme line
+            # was hart-liquid-ui's "Theme: auto", which reports the CONFIG, not
+            # the RESOLUTION. This makes the next boot self-diagnosing: theme id
+            # + whether a wallpaper came with it (its absence is what makes the
+            # shell fall back to the legacy navy gradient).
+            if not getattr(LiquidUIService, '_theme_logged', False):
+                LiquidUIService._theme_logged = True
+                _wp = (theme.get('wallpaper', {}) or {}).get('value', '')
+                logger.info(
+                    "[shell] theme RESOLVED id=%s name=%s wallpaper=%s",
+                    theme.get('id', '?'), theme.get('name', '?'),
+                    (_wp[:60] + '...') if _wp else 'NONE (legacy gradient fallback)')
         except Exception:
-            css_vars = ':root { --hart-background: #0F0E17; --hart-accent: #00D4AA; --hart-on-accent: #0F0E17; --hart-active: #00e676; --hart-text: #e0e0e0; --hart-glass-bg: rgba(15,14,23,0.65); --hart-glass-border: rgba(0,212,170,0.18); --hart-muted: #78909c; --hart-surface: #1a1a2e; --hart-blur: 20px; --hart-saturation: 180%; --hart-radius: 16px; --hart-panel-opacity: 0.65; --hart-topbar-height: 40px; --hart-icon-size: 20px; --hart-titlebar-height: 32px; --hart-font-family: "JetBrains Mono"; --hart-font-size: 13px; --hart-heading-size: 18px; --hart-font-weight: 400; --hart-heading-weight: 600; --hart-anim-speed: 200ms; --hart-error: #FF6B6B; --hart-caution: #ffab40; --hart-heading: #00D4AA; --hart-surface-hover: #252540; }'
+            # NEVER silent (Gate: no silent exception gulping). This except is the
+            # exact path that paints the bluish #0F0E17 fallback, so a swallowed
+            # error here looks like a DESIGN choice on a real boot instead of the
+            # failure it is. Log it loudly with the traceback.
+            logger.exception(
+                "[shell] THEME LOAD FAILED -- falling back to the legacy navy "
+                "gradient (#0F0E17). The desktop will NOT look like the active "
+                "theme; this is a fault, not a style.")
+            css_vars = ':root { --hart-background: #0F0E17; --hart-accent: #00E6C3; --hart-on-accent: #0F0E17; --hart-active: #00e676; --hart-text: #e0e0e0; --hart-glass-bg: rgba(15,14,23,0.65); --hart-glass-border: rgba(0,230,195,0.18); --hart-muted: #78909c; --hart-surface: #1a1a2e; --hart-blur: 20px; --hart-saturation: 180%; --hart-radius: 16px; --hart-panel-opacity: 0.65; --hart-topbar-height: 40px; --hart-icon-size: 20px; --hart-titlebar-height: 32px; --hart-font-family: "JetBrains Mono"; --hart-font-size: 13px; --hart-heading-size: 18px; --hart-font-weight: 400; --hart-heading-weight: 600; --hart-anim-speed: 200ms; --hart-error: #FF6B6B; --hart-caution: #ffab40; --hart-heading: #00E6C3; --hart-surface-hover: #252540; }'
             theme = {}
 
         # Performance tier detection
         perf = theme.get('performance', {})
-        is_potato = perf.get('disable_blur', False)
+
+        # GPU render verdict (#137) — the hardware signal. Read ONCE here so the
+        # JS reduced-effects gate (PERF.potato) and the CSS floor (body.gpu-*)
+        # both derive from the SAME probe verdict (no second read, no parallel
+        # path). When the shell is software-composited (GSK=cairo/llvmpipe) the
+        # cinematic glass re-rasterises on the CPU every frame, so we tag <body>
+        # `gpu-software` (hartResponsive.css strips the GPU-only effects from the
+        # hot surfaces) AND force the potato tier below.
+        # The shell's per-frame effects (hover transforms, filter:blur, continuous
+        # animation) run in the WebView, which paints on CAIRO (CPU) unless WebKit
+        # accelerated compositing is on (hart.liquidUI.preferHardwareGL). The gpu-render
+        # probe only reflects the COMPOSITOR's GLES capability, NOT the WebView paint
+        # path — so a box whose probe says 'hardware' but whose WebView is cairo (the
+        # default) ARMED GPU-only effects on a CPU renderer: hovering the orb then
+        # re-rasterised a 60fps canvas + an animated software blur on the ONE WebKit
+        # thread and HUNG the whole shell, and the static-glow software floor (below)
+        # never engaged so the cinematic looked FLAT (real-HW 2026-07-12, the mockup
+        # gap). Gate the effect tier on the ACTUAL paint path: 'hardware' ONLY when the
+        # probe says hardware AND WebKit compositing is actually on. webkit_compositing
+        # is the truthful renderer signal (also drives the glass floor below).
+        #
+        # The auto-fallback ladder (2026-07-19) sources the compositing signal from the
+        # RUNTIME rung the session tier actually landed on (/run/hart/session/shell-render:
+        # vulkan | webkit-cairo | software) -- BOTH GPU rungs enable WebKit compositing,
+        # so both light up the micro-animations + live glass; the software floor stays
+        # flat. This tracks the paint-watchdog's real landing (a hung vulkan Tier-1 that
+        # drops to webkit-cairo Tier-2 re-renders as gpu-hardware, not stuck flat). The
+        # LIQUID_UI_PREFER_HW_GL == '1' is an explicit FORCE-ON (dev preview / an
+        # operator opting into the hardware path); ANY other value (including the node's
+        # default '0' from hart-liquid-ui.nix) is NOT a force-off -- it falls through to
+        # the runtime rung file so the ladder still governs. A hard '0' override would
+        # peg the backend flat and defeat the ladder.
+        shell_rung = read_shell_render_mode()  # vulkan | webkit-cairo | software
+        if os.environ.get('LIQUID_UI_PREFER_HW_GL') == '1':
+            webkit_compositing = True
+        else:
+            webkit_compositing = shell_rung in ('vulkan', 'webkit-cairo')
+        gpu_render_verdict = read_gpu_render_mode()  # compositor GLES capability probe
+        gpu_mode = 'hardware' if (gpu_render_verdict == 'hardware' and webkit_compositing) else 'software'
+        gpu_body_class = 'gpu-' + gpu_mode  # gpu-software | gpu-hardware
+
+        # ── Glass-opaque fallback signal (#151 transparent-windows) ───────────────
+        # The frosted .glass / .panel surfaces lean on backdrop-filter:blur over a
+        # translucent fill. backdrop-filter ONLY paints when WebKit accelerated
+        # COMPOSITING is on — which the glass-shell host enables ONLY when
+        # hart.liquidUI.preferHardwareGL=true. With it false (the default), the host
+        # exports WEBKIT_DISABLE_COMPOSITING_MODE=1 + HardwareAccelerationPolicy.NEVER,
+        # so the blur renders NOTHING and a translucent panel reads SEE-THROUGH — the
+        # steward's real-HW "windows have a transparent background". This is DECOUPLED
+        # from the gpu-probe verdict above: a box whose probe says 'hardware' still has
+        # WebKit compositing OFF unless preferHardwareGL is set, so gpu-hardware alone
+        # never triggered the opaque fallback. Surface the host's compositing state via
+        # LIQUID_UI_PREFER_HW_GL (set from ui.preferHardwareGL in hart-liquid-ui.nix)
+        # and tag <body> `webkit-flat` whenever blur will NOT composite, so the CSS
+        # floor solidifies the glass. Default '0' = the safe, legible opaque floor
+        # (matches preferHardwareGL's default-false), so a bare/dev render is opaque
+        # too, never see-through. webkit_compositing was already resolved above from the
+        # runtime rung (/run/hart/session/shell-render) with the LIQUID_UI_PREFER_HW_GL override;
+        # reuse it here (ONE derivation, no second read path).
+        # webkit-flat == "backdrop-filter blur won't paint" == solidify the glass.
+        #
+        # 2026-07-24 real-HW bug: the home bled THROUGH the App Store panel. backdrop-
+        # filter BLUR composites ONLY on the VULKAN rung (GSK=vulkan actually paints it).
+        # webkit-cairo composites TRANSFORMS (so gpu-hardware/animations are right) but
+        # its WebView is cairo -> its blur NEVER paints, so a translucent panel reads
+        # see-through. Key the glass off the RUNTIME RUNG, not preferHardwareGL: hart-
+        # comp forces webkit-cairo even when preferHardwareGL is on (vulkan is demoted
+        # for the hover VK_ERROR_SURFACE_LOST_KHR; hart-comp.nix:562), so keying off the
+        # flag would frost a cairo surface right back into see-through. Only a real
+        # vulkan rung frosts; every other rung (webkit-cairo, software) is OPAQUE +
+        # legible. Decoupled from gpu_mode so a GPU rung still lights the micro-
+        # animations while the glass stays solid -- alive AND readable. (Frosted glass
+        # returns when vulkan is stable == the "chase blur next" work, task #12.)
+        blur_composites = shell_rung == 'vulkan'
+        flat_body_class = '' if blur_composites else ' webkit-flat'
+
+        # Potato (reduced-effects) tier: TRUE when the theme disables blur OR the
+        # box is software-rendered. The GPU-only cinematic (backdrop blur, layered
+        # shadows, continuous animation, ambient/grain) is exactly what pegs a core
+        # and lags a keystroke ~500ms on a software-composited box, so software
+        # render must shed it — the same verdict the CSS floor uses, wired so the
+        # inline-script PERF.potato + window.HART_PERF.potato engage on real
+        # software-render hardware, not just on the theme tier.
+        is_potato = perf.get('disable_blur', False) or gpu_mode == 'software'
+
+        # Which product this shell is serving — HART OS (the OS itself) vs the Nunba
+        # desktop companion. Drives the right-click "Ask <Product>" menu label
+        # (hartAskMenu.js) so it names what the user actually installed. is_os_mode()
+        # is the ONE canonical signal (HART_OS_MODE env / OS-mode port scheme).
+        try:
+            from core.port_registry import is_os_mode
+            hart_product = 'HART' if is_os_mode() else 'Nunba'
+        except Exception:
+            logger.exception("render_desktop_shell: is_os_mode probe failed")
+            hart_product = 'HART'
+
+        # Ambient cinematic glow emission (2026-07-01, degrade-gracefully): the 3
+        # drifting brand blooms are the single biggest "looks rich" lever (the
+        # mockup paints them). On a SOFTWARE-rendered box we now STILL emit them —
+        # hartResponsive.css renders them STATIC (no drift) + low-blur, a one-time
+        # raster, so depth survives at ~zero per-frame cost (the floor only sheds
+        # the per-FRAME drift/blur/grain). We keep them OFF only for an explicit
+        # theme disable_blur on a CAPABLE GPU (the user asked for no blur and the
+        # box can otherwise afford the full cinematic, so honour that choice).
+        emit_ambient = (not is_potato) or (gpu_mode == 'software')
 
         # Accessibility state — the SAME live dict the /api/shell/accessibility
         # routes mutate (same process). High-contrast + reduced-motion apply as
@@ -682,19 +1580,61 @@ class LiquidUIService:
         if wallpaper.get('type') == 'solid':
             wp_css = wallpaper['value']
 
+        # Living-Glass: emit the active accent as a comma-triple so every glow /
+        # ring / selection re-tints when the theme accent changes. Parsed from the
+        # SAME accent ThemeService resolves (#308-310). Emitted right after
+        # {css_vars} (later source wins) so it overrides any earlier definition.
+        # _CSS_LIVING_GLASS reads it via var(--hart-accent-rgb, 0,230,195); this
+        # makes the variable real rather than relying only on the teal fallback.
+        try:
+            _ac = ((theme.get('colors', {}) or {}).get('accent', '00E6C3')
+                   or '00E6C3').lstrip('#')
+            _ar, _ag, _ab = (int(_ac[0:2], 16), int(_ac[2:4], 16), int(_ac[4:6], 16))
+            accent_rgb_css = (':root{--hart-accent-rgb:'
+                              + f'{_ar},{_ag},{_ab}' + '}')
+        except (ValueError, IndexError, TypeError, AttributeError):
+            accent_rgb_css = ':root{--hart-accent-rgb:0,230,195}'
+
         # Import panel manifest
         try:
             from integrations.agent_engine.shell_manifest import (
-                PANEL_MANIFEST, DYNAMIC_PANELS, SYSTEM_PANELS, PANEL_GROUPS)
+                PANEL_MANIFEST, DYNAMIC_PANELS, SYSTEM_PANELS, PANEL_GROUPS,
+                with_icon_colors, get_settings_sections, get_pinned_panels)
+            # Merge in installed apps (DESKTOP_APP/EXTENSION the app-installer
+            # auto-registered) so their desktop icons survive a page refresh:
+            # hartDesktop.render() only shows ids present in window.MANIFEST.
+            # Same source of truth (AppRegistry.installed_app_manifest) the live
+            # install push uses - no parallel manifest - merged BEFORE
+            # with_icon_colors so installed apps get the same palette tint.
+            panels = dict(PANEL_MANIFEST)
+            try:
+                from core.platform.registry import get_registry
+                _reg = get_registry()
+                if _reg.has('apps'):
+                    panels.update(_reg.get('apps').installed_app_manifest())
+            except Exception:
+                logger.exception("render_desktop_shell: swallowed Exception")
+            # De-monochrome: stamp a resolved per-app 'color' on every entry from
+            # the single-source palette so the JS render paths (start menu, dock,
+            # desktop icons, titlebars) all tint with one agreed colour instead
+            # of the old single --hart-accent wash.
             # Replace </ with <\/ so the browser HTML parser never sees
             # </script> inside the JSON and prematurely closes the script tag.
-            manifest_json = json.dumps(PANEL_MANIFEST).replace('</', '<\\/')
-            system_json = json.dumps(SYSTEM_PANELS).replace('</', '<\\/')
+            manifest_json = json.dumps(with_icon_colors(panels)).replace('</', '<\\/')
+            system_json = json.dumps(with_icon_colors(SYSTEM_PANELS)).replace('</', '<\\/')
             groups_json = json.dumps(PANEL_GROUPS).replace('</', '<\\/')
+            # W4 Start-menu pins + Settings aggregator — composition only (lists
+            # of EXISTING panel ids). The shell JS resolves each id's metadata
+            # from the live MANIFEST/SYSTEM_PANELS above, so no panel is redefined
+            # here (single source = shell_manifest).
+            settings_sections_json = json.dumps(get_settings_sections()).replace('</', '<\\/')
+            pinned_json = json.dumps(get_pinned_panels()).replace('</', '<\\/')
         except Exception:
             manifest_json = '{}'
             system_json = '{}'
             groups_json = '[]'
+            settings_sections_json = '[]'
+            pinned_json = '[]'
 
         # CSS animations — defined outside f-string to avoid brace conflicts
         _CSS_SLIDE_IN = '@keyframes slideInRight{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}'
@@ -843,7 +1783,7 @@ html, body { font-family: var(--ds-font-body); line-height: 1.5 }
   font-family:var(--ds-font-body);font-size:14px;line-height:20px;outline:none;
   transition:border-color var(--ds-duration-medium) var(--ds-ease-standard),
     box-shadow var(--ds-duration-medium) var(--ds-ease-standard)}
-.ds-input:focus{border-color:var(--hart-accent);box-shadow:0 0 0 2px rgba(0,212,170,0.25)}
+.ds-input:focus{border-color:var(--hart-accent);box-shadow:0 0 0 2px rgba(var(--hart-accent-rgb,0,230,195),0.25)}
 .ds-input::placeholder{color:var(--hart-muted)}
 .ds-input-label{font-size:12px;font-weight:500;letter-spacing:0.5px;
   color:var(--hart-muted);text-transform:uppercase}
@@ -1034,18 +1974,25 @@ html.a11y-contrast .glass{background:#0a0a12;border-width:2px}
 html.a11y-rmotion *,html.a11y-rmotion *::before,html.a11y-rmotion *::after{
   animation-duration:0.01ms!important;animation-iteration-count:1!important;transition-duration:0.01ms!important}
 
-/* ── Material Icons: LOCAL + offline-safe ── */
-/* Every shell icon is <span class="mi material-icons-round">name</span>. The
-   Google <link> in <head> only defines this font family ONLINE, so a fresh
-   offline boot rendered literal ligature words ("lock","notifications"). Define
-   it locally with a fallback stack onto the BUNDLED fonts (material-icons →
-   "Material Icons", material-symbols → "Material Symbols *") plus the `liga`
-   feature that turns ligature names into glyphs. Ligature names are shared
-   across Material Icons/Symbols variants, so offline icons still render (filled
-   style) instead of text. Additive: "Material Icons Round" is still first, so
-   the online round render is unchanged. */
+/* ── Material Icons: BUNDLED woff2 — works fully offline, every glyph ── */
+/* Every shell icon is <span class="mi material-icons-round">name</span>.
+   The shell ships its OWN icon font (integrations/agent_engine/static/
+   MaterialSymbolsRounded.woff2 — a static, filled instance of Material Symbols
+   Rounded, ~440KB, 6.5k glyphs incl. smart_toy/shield). It is loaded via the
+   @font-face below from /shell/static, so EVERY glyph renders on a fresh
+   OFFLINE USB boot AND on the frozen Win/macOS desktop (which has no Material
+   font at all). The legacy 'Material Icons Round' lacked newer glyphs
+   (smart_toy, shield) — Material Symbols is a strict superset, so nothing
+   regresses. The Google <link> in <head> stays as a progressive-enhancement
+   only (online round variant); the bundled font is authoritative. The `liga`
+   feature turns the ligature names ("smart_toy") into glyphs. */
+@font-face {
+  font-family: 'Material Symbols Rounded';
+  font-style: normal; font-weight: 400; font-display: block;
+  src: url('/shell/static/MaterialSymbolsRounded.woff2') format('woff2');
+}
 .mi, .material-icons-round {
-  font-family: 'Material Icons Round', 'Material Icons', 'Material Symbols Rounded', 'Material Symbols Outlined';
+  font-family: 'Material Symbols Rounded', 'Material Icons Round', 'Material Icons', 'Material Symbols Outlined';
   font-weight: normal; font-style: normal; line-height: 1;
   letter-spacing: normal; text-transform: none; white-space: nowrap;
   word-wrap: normal; direction: ltr; display: inline-block;
@@ -1082,23 +2029,32 @@ html,body{overscroll-behavior:none;-webkit-font-smoothing:antialiased;
 .ds-btn,.hart-hero-chip,.hart-hero-status,.hart-hero-brand{cursor:default}
 img{-webkit-user-drag:none;user-select:none}
 
-/* ── Animated motion background: independent blobs each on their own path ── */
-/* Single blurred container (1 compositor layer) + 3 lightweight blobs */
-.hart-ambient{position:fixed;inset:-15%;z-index:1;pointer-events:none;overflow:hidden;
-  filter:blur(55px) saturate(140%)}
-.hart-blob{position:absolute;border-radius:50%;opacity:.65}
-.hart-blob-1{width:55vw;height:55vw;top:-5%;left:-10%;
-  background:radial-gradient(circle,rgba(0,212,170,.75),transparent 70%);
-  animation:blob1 32s ease-in-out infinite alternate}
-.hart-blob-2{width:50vw;height:50vw;top:10%;right:-5%;
-  background:radial-gradient(circle,rgba(108,99,255,.70),transparent 70%);
-  animation:blob2 40s ease-in-out infinite alternate}
-.hart-blob-3{width:45vw;height:45vw;bottom:-5%;left:28%;
-  background:radial-gradient(circle,rgba(34,176,255,.60),transparent 70%);
-  animation:blob3 48s ease-in-out infinite alternate}
-@keyframes blob1{0%{transform:translate(0,0)}100%{transform:translate(8vw,6vh)}}
-@keyframes blob2{0%{transform:translate(0,0)}100%{transform:translate(-7vw,9vh)}}
-@keyframes blob3{0%{transform:translate(0,0)}100%{transform:translate(-5vw,-7vh)}}
+/* ── Ambient colour wash (de-monochrome): slow drifting multi-hue blobs above
+   the wallpaper, theme-independent, so the desktop has living colour. ── */
+/* Cosmic bloom -- COMPOSED + PRE-BLURRED AT RUNTIME, NOT live, NOT baked at build
+   (steward 2026-07-19). The rich aurora is drawn by #hart-bloom-canvas below: the
+   shell composes it ONCE (Gaussian-blurred in a single canvas pass) when the desktop
+   is composed, and re-composes only when the agentic Liquid-UI changes the mood/
+   palette (HartHome.compose) -- so the blur is paid once per compose, reused every
+   frame, and it tracks whatever palette the local LLM composes (not a frozen image
+   shipped in the ISO). THESE radial-gradient layers are only the pre-JS / canvas-
+   unavailable FALLBACK so the desktop is never a flat void before the compose runs;
+   they are inherently soft (no blur filter) and cost one paint. The live
+   filter:blur(64px) that used to sit here (re-rasterising the whole backdrop every
+   frame on the cairo floor) is GONE. */
+.hart-ambient{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:0.9;
+  background:
+    radial-gradient(46% 52% at 30% 30%, rgba(var(--hart-amb-1-rgb, 177,130,255),0.20), transparent 66%),
+    radial-gradient(40% 46% at 82% 26%, rgba(var(--hart-amb-2-rgb, 0,221,249),0.16), transparent 66%),
+    radial-gradient(42% 48% at 24% 84%, rgba(var(--hart-amb-3-rgb, 251,102,182),0.12), transparent 70%),
+    radial-gradient(30% 36% at 82% 82%, rgba(var(--hart-amb-4-rgb, 255,179,48),0.10), transparent 72%)}
+/* The runtime-composed bloom surface. Empty until composeHartBloom() paints it once
+   (on load + on mood re-compose); a pointer-transparent backdrop above the gradient
+   fallback, below all content (z1 < content z20+). */
+.hart-bloom-canvas{position:fixed;inset:0;z-index:1;pointer-events:none;
+  width:100%;height:100%;display:block}
+@keyframes hart-ambient-drift{0%{transform:translate3d(0,0,0) scale(1)}
+  50%{transform:translate3d(2.4%,-2.2%,0) scale(1.08)}100%{transform:translate3d(-2.4%,2.2%,0) scale(1.05)}}
 .hart-grain{position:fixed;inset:0;z-index:2;pointer-events:none;opacity:0.045;mix-blend-mode:overlay;
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
 .hart-vignette{position:fixed;inset:0;z-index:2;pointer-events:none;
@@ -1110,24 +2066,50 @@ img{-webkit-user-drag:none;user-select:none}
   width:min(660px,86vw);pointer-events:none;
   transition:opacity .55s cubic-bezier(.2,0,0,1),transform .55s cubic-bezier(.2,0,0,1),filter .55s}
 .hart-hero>*{pointer-events:auto}
+/* While the user DRAGS the orb, the spine transform must track the pointer 1:1.
+   hartHero.js toggles this class around the drag, but the RULE was never written
+   (real-HW 2026-07-20: "drag was not realtime / an offset while dragging") -- so
+   .hart-hero's .55s transform transition kept ANIMATING toward each pointermove,
+   ~half a second behind the cursor. transition:none while dragging = realtime. */
+.hart-hero.hart-hero-dragging{transition:none}
 .hart-hero.dimmed{opacity:0;transform:translate(-50%,-56%) scale(.96);filter:blur(6px)}
 .hart-hero.dimmed>*{pointer-events:none}
 .hart-hero-brand{display:flex;align-items:center;gap:9px;opacity:.92}
-.hart-hero-brand img{width:34px;height:34px;filter:drop-shadow(0 3px 12px rgba(0,212,170,.4))}
+.hart-hero-brand img{width:34px;height:34px;filter:drop-shadow(0 3px 12px rgba(var(--hart-accent-rgb,0,230,195),.4))}
 .hart-hero-brand span{font-size:14px;font-weight:600;letter-spacing:2.5px;opacity:.8}
-.hart-hero-orbwrap{position:relative;width:300px;height:300px;display:flex;align-items:center;justify-content:center}
+/* The ORB ITSELF is the click-to-talk control (no mic glyph inside it). The
+   canvas keeps pointer-events:none; the orbwrap captures the click + carries
+   the listening glow that the old centre mic used to show. */
+.hart-hero-orbwrap{position:relative;width:300px;height:300px;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;border-radius:50%;
+  transition:transform .25s cubic-bezier(.175,.885,.32,1.275),box-shadow .25s}
+.hart-hero-orbwrap:hover{transform:scale(1.03)}
+.hart-hero-orbwrap:active{transform:scale(.985)}
+.hart-hero-orbwrap:focus-visible{outline:none;box-shadow:0 0 0 3px var(--hart-accent)}
+/* The orb's bloom = the mockup's layered "0 0 90px teal + 0 0 160px violet": a
+   teal INNER glow + a brand-violet OUTER halo. Replaces the leftover indigo
+   #6C63FF drop-shadow b1.1 flagged (which read flat/blue); core+body stay teal,
+   so this adds a violet HALO without washing the orb blue. */
 #hart-voice-orb{width:300px;height:300px;background:transparent;pointer-events:none;
-  filter:drop-shadow(0 12px 44px rgba(108,99,255,.25))}
-.hart-hero-mic{position:absolute;left:50%;top:50%;width:88px;height:88px;transform:translate(-50%,-50%);
-  border-radius:50%;cursor:pointer;border:1px solid var(--hart-glass-border);
-  background:radial-gradient(circle at 50% 34%,rgba(108,99,255,.30),rgba(15,14,23,.42));
-  backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;
-  transition:transform .25s cubic-bezier(.175,.885,.32,1.275),box-shadow .25s,background .25s}
-.hart-hero-mic .mi{font-size:36px;color:#fff;opacity:.92}
-.hart-hero-mic:hover{transform:translate(-50%,-50%) scale(1.07);box-shadow:0 10px 34px rgba(108,99,255,.45)}
-.hart-hero-mic:active{transform:translate(-50%,-50%) scale(.97)}
-.hart-hero-mic.listening{background:radial-gradient(circle at 50% 34%,rgba(255,107,107,.42),rgba(15,14,23,.42));
-  box-shadow:0 0 0 5px rgba(255,107,107,.22),0 10px 34px rgba(255,107,107,.35)}
+  filter:drop-shadow(0 0 46px rgba(0,230,195,.34)) drop-shadow(0 8px 64px rgba(155,92,255,.26))}
+/* Cyan dashed ORBITAL RING (the Aura mock's signature, steward 2026-07-19): a
+   slow-rotating dashed cyan ring around the orb -- the mock's "stroke-dasharray 6
+   16 + vSpin". A dashed BORDER on a circle rotated by transform gives the orbiting
+   dashes; it is a SMALL element (~300px), so the per-frame repaint is tiny (unlike a
+   full-screen animated layer) -- affordable motion on the software floor. Behind the
+   canvas (first child) so it rings the orb body. A second, thinner, counter-rotating
+   ring adds depth (the mock layers rings). Both stop under reduced-motion. */
+.hart-orb-orbit,.hart-orb-orbit2{position:absolute;border-radius:50%;pointer-events:none;
+  left:50%;top:50%;will-change:transform}
+.hart-orb-orbit{width:300px;height:300px;margin:-150px 0 0 -150px;
+  border:1.5px dashed rgba(var(--hart-amb-2-rgb,0,221,249),0.42);
+  animation:hart-orbit-spin 26s linear infinite}
+.hart-orb-orbit2{width:236px;height:236px;margin:-118px 0 0 -118px;
+  border:1px dashed rgba(var(--hart-amb-1-rgb,177,130,255),0.28);
+  animation:hart-orbit-spin 38s linear infinite reverse}
+@keyframes hart-orbit-spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+.hart-hero-orbwrap.listening{box-shadow:0 0 0 5px rgba(255,107,107,.22),0 10px 44px rgba(255,107,107,.35)}
+.hart-hero-orbwrap.listening #hart-voice-orb{filter:drop-shadow(0 12px 44px rgba(255,107,107,.4))}
 .hart-hero-status{font-size:13px;font-weight:500;letter-spacing:.3px;color:var(--hart-muted);min-height:18px;
   transition:color .3s;max-width:560px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hart-hero-status.thinking{color:var(--hart-accent)}
@@ -1166,8 +2148,8 @@ img{-webkit-user-drag:none;user-select:none}
 .tray-btn:hover{transform:translateY(-1px) scale(1.05)}
 .start-logo{width:20px;height:20px;flex-shrink:0}
 .top-bar .start-btn:hover .start-logo{filter:drop-shadow(0 0 8px var(--hart-accent))}
-@media(prefers-reduced-motion:reduce){.hart-blob,.hart-hero-hevolve .dot{animation:none}}
-html.a11y-rmotion .hart-blob,html.a11y-rmotion .hart-hero-hevolve .dot{animation:none}
+@media(prefers-reduced-motion:reduce){.hart-ambient,.hart-hero-hevolve .dot,.hart-orb-orbit,.hart-orb-orbit2{animation:none}}
+html.a11y-rmotion .hart-ambient,html.a11y-rmotion .hart-hero-hevolve .dot,html.a11y-rmotion .hart-orb-orbit,html.a11y-rmotion .hart-orb-orbit2{animation:none}
 '''
 
         # ═══ Desktop icon layer (drag-drop, grid-snapped, persisted) ═══
@@ -1177,9 +2159,10 @@ html.a11y-rmotion .hart-blob,html.a11y-rmotion .hart-hero-hevolve .dot{animation
         _CSS_DESKTOP = '''
 .hart-desktop{position:fixed;left:0;right:0;top:var(--hart-topbar-height);bottom:44px;z-index:20;pointer-events:none}
 .desktop-icon{position:absolute;width:84px;display:flex;flex-direction:column;align-items:center;gap:6px;
-  padding:8px 4px;border-radius:12px;cursor:pointer;pointer-events:auto;user-select:none;
+  padding:8px 4px;border-radius:12px;cursor:default;pointer-events:auto;user-select:none;
   transition:background .15s,transform .12s cubic-bezier(.175,.885,.32,1.275);will-change:transform}
 .desktop-icon:hover{background:rgba(255,255,255,0.08)}
+.desktop-icon.selected{background:rgba(108,99,255,0.28);outline:1px solid rgba(108,99,255,0.5)}
 .desktop-icon:focus-visible{outline:2px solid var(--hart-accent);outline-offset:2px}
 .desktop-icon.dragging{z-index:60;transition:none;opacity:.92;cursor:grabbing}
 .desktop-icon .di-glyph{width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;
@@ -1189,6 +2172,35 @@ html.a11y-rmotion .hart-blob,html.a11y-rmotion .hart-hero-hevolve .dot{animation
 .desktop-icon .di-glyph .mi{font-size:28px;color:#fff;text-shadow:0 1px 4px rgba(0,0,0,.4)}
 .desktop-icon .di-label{font-size:11px;line-height:1.25;text-align:center;max-width:80px;color:var(--hart-text);
   text-shadow:0 1px 3px rgba(0,0,0,.6);overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+/* Emoji/unicode glyph (not the Material icon font) — same size as .mi, normal family */
+.desktop-icon .di-glyph .di-emoji{font-family:"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",system-ui;font-size:30px;line-height:1}
+/* ── Per-icon Customize dialog (macOS-/Windows-style glyph/label/color) ── */
+.hart-icustom-backdrop{position:fixed;inset:0;z-index:9000;display:flex;align-items:center;justify-content:center;
+  background:rgba(0,0,0,0.42);backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px)}
+.hart-icustom{width:340px;max-width:92vw;padding:18px;border-radius:16px;display:flex;flex-direction:column;gap:12px;
+  color:var(--hart-text);font-family:var(--ds-font-body,system-ui);box-shadow:0 18px 50px rgba(0,0,0,.5)}
+.hart-icustom-head{display:flex;align-items:center;gap:14px}
+.hart-icustom .hic-prev{flex:none}
+.hart-icustom .hic-prev .di-glyph{width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;
+  background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border)}
+.hart-icustom .hic-prev .di-glyph .mi{font-size:28px;color:var(--hart-accent)}
+.hart-icustom .hic-prev .di-glyph .di-emoji{font-family:"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",system-ui;font-size:30px;line-height:1}
+.hart-icustom-title{font-size:15px;font-weight:600}
+.hart-icustom-row{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--hart-muted)}
+.hart-icustom-row input[type=text]{padding:8px 10px;border-radius:9px;border:1px solid var(--hart-glass-border);
+  background:var(--hart-surface,rgba(255,255,255,0.05));color:var(--hart-text);font:14px var(--ds-font-body,system-ui)}
+.hart-icustom-row input[type=text]:focus{outline:none;border-color:var(--hart-accent)}
+.hart-icustom .hic-color-wrap{display:flex;align-items:center;gap:10px}
+.hart-icustom .hic-color-wrap input[type=color]{width:40px;height:30px;padding:0;border:1px solid var(--hart-glass-border);
+  border-radius:8px;background:none;cursor:pointer}
+.hart-icustom-actions{display:flex;align-items:center;gap:8px;margin-top:4px}
+.hart-icustom-btn{padding:7px 14px;border-radius:9px;border:1px solid var(--hart-glass-border);cursor:pointer;
+  background:var(--hart-surface,rgba(255,255,255,0.06));color:var(--hart-text);font:13px var(--ds-font-body,system-ui);
+  transition:background .15s,transform .12s}
+.hart-icustom-btn:hover{background:var(--hart-surface-hover,rgba(255,255,255,0.12));transform:translateY(-1px)}
+.hart-icustom-btn.primary{background:var(--hart-accent);color:var(--hart-on-accent,#fff);border-color:transparent}
+.hart-icustom-btn.ghost{background:transparent}
+.hart-icustom-btn:focus-visible{outline:2px solid var(--hart-accent);outline-offset:2px}
 /* ── Virtual-desktop switcher (bottom-center) + settings squares ── */
 .hart-ws-switcher{position:fixed;bottom:6px;left:50%;transform:translateX(-50%);z-index:8050;display:flex;gap:4px;padding:4px 6px;border-radius:999px}
 .hart-ws-dot{width:26px;height:20px;border:none;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;
@@ -1213,26 +2225,92 @@ html.a11y-rmotion .hart-blob,html.a11y-rmotion .hart-hero-hevolve .dot{animation
   box-shadow:0 0 8px currentColor,inset 0 0 0 2px rgba(255,255,255,0.25)}
 .hart-tile .htc-name{font-size:11px;color:var(--hart-text);text-align:center;margin-top:5px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-/* ── Marketplace app cards ── */
-.hart-app-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-bottom:8px}
-.hart-app-card{display:flex;align-items:center;gap:10px;padding:10px;border-radius:12px;
+/* Customization hub (#140/#161/#162): orb-variety selection ring + the custom
+   colour picker + the media-by-URL row. Palette/orb cards reuse .hart-tile. */
+.hart-orb-card.active .htc-prev{border-color:var(--hart-accent);
+  box-shadow:0 0 0 2px var(--hart-accent),0 4px 12px rgba(0,0,0,.3)}
+.hart-custom-palette{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px;padding:2px 0 12px}
+.hart-cp-field{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--hart-muted)}
+.hart-cp-field input[type=color]{width:52px;height:34px;padding:0;border:1px solid var(--hart-glass-border);
+  border-radius:8px;background:transparent;cursor:pointer}
+.hart-cp-apply{align-self:flex-end}
+.hart-media-url{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:2px 0 12px}
+.hart-media-url .ds-input{flex:1;min-width:160px}
+.hart-media-url .ds-select{width:96px;flex:0 0 auto}
+/* ── Marketplace (App Store) — premium liquid-glass cards ── */
+.hart-mkt{padding:var(--ds-space-2) var(--ds-space-1) var(--ds-space-6)}
+.hart-mkt-head{margin-bottom:var(--ds-space-5)}
+.hart-mkt-search{display:flex;gap:var(--ds-space-2);margin:var(--ds-space-4) 0 var(--ds-space-2);
+  position:sticky;top:0;z-index:3;padding-bottom:var(--ds-space-2);
+  background:linear-gradient(to bottom,var(--hart-surface) 70%,transparent)}
+.hart-mkt-search .ds-input{flex:1}
+.hart-mkt-section{margin-top:var(--ds-space-5)}
+.hart-mkt-section:first-child{margin-top:var(--ds-space-2)}
+/* Already-installed / pre-bundled apps section (sits above the featured catalogue) */
+.hart-mkt-installed{margin-top:var(--ds-space-2);margin-bottom:var(--ds-space-2)}
+.hart-app-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(248px,1fr));
+  gap:var(--ds-space-3);margin-top:var(--ds-space-3)}
+.hart-app-card{position:relative;display:flex;flex-direction:column;gap:var(--ds-space-3);
+  padding:var(--ds-space-4);border-radius:var(--ds-radius-lg);overflow:hidden;
   background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);
-  transition:transform .15s cubic-bezier(.175,.885,.32,1.275),box-shadow .15s}
-.hart-app-card:hover{transform:translateY(-2px);box-shadow:0 8px 20px rgba(0,0,0,.3)}
-.hart-app-card .hac-ic{width:42px;height:42px;flex-shrink:0;border-radius:10px;display:flex;align-items:center;justify-content:center;
-  background:rgba(255,255,255,0.05);border:1px solid var(--hart-glass-border)}
-.hart-app-card .hac-ic .mi{font-size:24px;color:var(--hart-accent)}
-.hart-app-card .hac-body{flex:1;min-width:0}
-.hart-app-card .hac-name{font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.hart-app-card .hac-desc{font-size:11px;color:var(--hart-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  backdrop-filter:blur(12px) saturate(1.2);-webkit-backdrop-filter:blur(12px) saturate(1.2);
+  box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.06),0 2px 10px rgba(0,0,0,0.22);
+  transition:transform .18s cubic-bezier(.175,.885,.32,1.275),box-shadow .18s,border-color .18s}
+/* subtle top-light grain wash so cards feel like frosted glass, not flat tiles */
+.hart-app-card::before{content:'';position:absolute;inset:0;pointer-events:none;
+  background:radial-gradient(120% 90% at 0% 0%,rgba(255,255,255,0.06),transparent 60%);opacity:.9}
+.hart-app-card:hover{transform:translateY(-3px);border-color:var(--hart-accent);
+  box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.10),0 12px 30px rgba(0,0,0,0.34)}
+.hart-app-card .hac-top{display:flex;align-items:flex-start;gap:var(--ds-space-3);position:relative}
+.hart-app-card .hac-ic{width:52px;height:52px;flex-shrink:0;border-radius:var(--ds-radius-md);
+  display:flex;align-items:center;justify-content:center;
+  background:linear-gradient(150deg,rgba(255,255,255,0.10),rgba(255,255,255,0.03));
+  border:1px solid var(--hart-glass-border);box-shadow:inset 0 1px 0 rgba(255,255,255,0.10)}
+.hart-app-card .hac-ic .mi{font-size:28px;color:var(--hart-accent)}
+.hart-app-card .hac-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.hart-app-card .hac-name{font-size:14px;font-weight:600;line-height:18px;color:var(--hart-heading);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hart-app-card .hac-desc{font-size:12px;line-height:16px;color:var(--hart-muted);
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.hart-app-card .hac-cat{font-size:10px;font-weight:600;letter-spacing:.6px;text-transform:uppercase;
+  color:var(--hart-accent);opacity:.8}
+.hart-app-card .ds-btn{position:relative;align-self:stretch;justify-content:center}
+/* Already-installed action: a calm, non-interactive "done" state (not a CTA) */
+.hart-app-card .ds-btn.is-installed{background:rgba(0,230,118,.14);color:var(--hart-active);
+  border:1px solid rgba(0,230,118,.35);cursor:default;opacity:1}
+.hart-app-card .ds-btn.is-installed:hover{transform:none;filter:none}
 /* ── Buttery: window spring-open + dock perf hint (Phase D) ── */
 @keyframes hart-panel-in{from{opacity:0;transform:scale(.92) translateY(14px)}to{opacity:1;transform:scale(1) translateY(0)}}
 .panel{animation:hart-panel-in .3s cubic-bezier(.175,.885,.32,1.275)}
 .taskbar-chip{will-change:transform}
 @media(prefers-reduced-motion:reduce){.panel{animation:none}}
 html.a11y-rmotion .panel{animation:none}
-/* ── AI sensory kill-switch (always-accessible safety control) ── */
-.hart-senses{position:fixed;left:14px;bottom:54px;z-index:8100}
+/* ── AI sensory cluster — a FLOATING, DRAGGABLE widget (not rigid like cage).
+   The whole #hart-senses is picked up + dropped anywhere (pointer + touch),
+   constrained to the viewport, position persisted to localStorage. JS sets
+   left/top inline; this default is the bottom-left spot it falls back to.
+   `touch-action:none` so a drag doesn't scroll/zoom the page on touch. ── */
+.hart-senses{position:fixed;left:14px;top:auto;bottom:54px;z-index:8100;touch-action:none}
+.hart-senses.dragging{cursor:grabbing;user-select:none}
+.hart-senses.dragging .hart-senses-cluster{box-shadow:0 12px 36px rgba(0,0,0,.5);transform:scale(1.03)}
+/* Eye + mic grouped as one floating glass "sensory" pair (grip | vision | audio). */
+.hart-senses-cluster{display:flex;align-items:center;gap:8px;padding:6px;border-radius:999px;
+  background:var(--hart-glass-bg);border:1px solid var(--hart-glass-border);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  box-shadow:inset 0 1px 0 0 rgba(255,255,255,0.08),0 6px 22px rgba(0,0,0,.4);
+  transition:box-shadow .2s,transform .2s cubic-bezier(.175,.885,.32,1.275)}
+/* Drag affordance - the whole widget body is draggable; the grip is VISUAL ONLY
+   and stays hidden (opacity:0) until a drag is in progress. Width + pointer-events
+   are preserved so the grip remains part of the drag hit-area (hide via opacity,
+   not display). The reveal-on-drag rule lives with the Dimension-2 grip block. */
+.hart-senses-grip{display:flex;align-items:center;justify-content:center;width:22px;height:40px;flex-shrink:0;
+  cursor:grab;color:var(--hart-muted);border-radius:8px;touch-action:none;opacity:0;transition:opacity .18s}
+.hart-senses.dragging .hart-senses-grip{cursor:grabbing}
+.hart-senses-grip .mi{font-size:20px;opacity:.85}
+.hart-senses-mic .mi{color:var(--hart-accent)}
+.hart-senses-mic.listening{background:rgba(255,107,107,.18);border-color:var(--hart-error);
+  box-shadow:0 0 0 3px rgba(255,107,107,.18),0 4px 16px rgba(0,0,0,.4)}
+.hart-senses-mic.listening .mi{color:var(--hart-error)}
 .hart-senses-btn{width:46px;height:46px;border-radius:50%;border:1px solid var(--hart-glass-border);cursor:pointer;
   background:var(--hart-glass-bg);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
   display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,.35);
@@ -1258,39 +2336,294 @@ html.a11y-rmotion .panel{animation:none}
 .hsp-foot{font-size:10px;color:var(--hart-muted);margin-top:4px;line-height:1.3}
 /* Orb closes its eyes when the human cuts the AI's senses */
 .hart-hero.ai-blind #hart-voice-orb{opacity:.12;filter:grayscale(1) brightness(.4);transition:opacity .5s,filter .5s}
-.hart-hero.ai-blind .hart-hero-mic{background:rgba(40,40,48,.5);box-shadow:none}
+.hart-hero.ai-blind .hart-hero-orbwrap{cursor:default;box-shadow:none}
 /* ── First-run "Light Your HART" ceremony overlay ── */
 .hart-onboarding{position:fixed;inset:0;z-index:12000;display:none;flex-direction:column;align-items:center;justify-content:center;
   gap:26px;text-align:center;padding:48px;background:radial-gradient(circle at 50% 38%,#16142e,#07060f 72%)}
 .hart-onboarding.open{display:flex}
+/* Brand duotone (b1.2 / GF3): the orb reads TEAL core with a teal-inner +
+   VIOLET-outer layered halo (the mockup look), NOT the deprecated indigo
+   #6C63FF. Teal LEADS the functional surfaces (orb core, name reveal, option
+   chips); violet ACCENTS (the outer halo + the option hover glow). */
 .hart-onboarding .hob-orb{width:150px;height:150px;border-radius:50%;flex-shrink:0;
-  background:radial-gradient(circle at 50% 40%,rgba(160,150,255,.95),rgba(108,99,255,.35) 45%,transparent 70%);
-  box-shadow:0 0 70px rgba(108,99,255,.5),0 0 150px rgba(108,99,255,.22);animation:hob-breathe 3.2s ease-in-out infinite}
+  background:radial-gradient(circle at 50% 40%,rgba(0,230,195,.95),rgba(0,230,195,.34) 45%,transparent 70%);
+  box-shadow:0 0 70px rgba(0,230,195,.5),0 0 150px rgba(155,92,255,.24);animation:hob-breathe 3.2s ease-in-out infinite}
 @keyframes hob-breathe{0%,100%{transform:scale(1);opacity:.85}50%{transform:scale(1.08);opacity:1}}
 .hart-onboarding .hob-name{font-size:34px;font-weight:600;letter-spacing:1px;color:#fff;min-height:0;opacity:0;
   transform:translateY(8px);transition:opacity .6s,transform .6s}
-.hart-onboarding .hob-name.show{opacity:1;transform:none;text-shadow:0 0 30px rgba(108,99,255,.6)}
+.hart-onboarding .hob-name.show{opacity:1;transform:none;text-shadow:0 0 30px rgba(0,230,195,.55)}
 .hart-onboarding .hob-narr{max-width:640px;min-height:84px;display:flex;flex-direction:column;gap:10px}
-.hart-onboarding .hob-line{font-size:20px;line-height:1.5;color:#e9e7ff;font-family:var(--ds-font-body);
+.hart-onboarding .hob-line{font-size:20px;line-height:1.5;color:#e9f7f3;font-family:var(--ds-font-body);
   opacity:0;transform:translateY(6px);transition:opacity .6s,transform .6s}
 .hart-onboarding .hob-line.in{opacity:1;transform:none}
 .hart-onboarding .hob-opts{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;max-width:700px}
-.hart-onboarding .hob-opt{padding:12px 22px;border-radius:999px;border:1px solid rgba(160,150,255,.4);
-  background:rgba(108,99,255,.12);color:#fff;font-size:15px;font-family:var(--ds-font-body);cursor:pointer;
+.hart-onboarding .hob-opt{padding:12px 22px;border-radius:999px;border:1px solid rgba(0,230,195,.4);
+  background:rgba(0,230,195,.12);color:#fff;font-size:15px;font-family:var(--ds-font-body);cursor:pointer;
   transition:background .18s,transform .18s cubic-bezier(.175,.885,.32,1.275),box-shadow .18s}
-.hart-onboarding .hob-opt:hover{background:rgba(108,99,255,.28);transform:translateY(-2px);box-shadow:0 8px 24px rgba(108,99,255,.35)}
+.hart-onboarding .hob-opt:hover{background:rgba(0,230,195,.22);transform:translateY(-2px);box-shadow:0 8px 24px rgba(155,92,255,.35)}
 .hart-onboarding .hob-skip{position:fixed;bottom:20px;font-size:12px;color:rgba(255,255,255,.4)}
 '''
 
+        # ═══ "Living Glass" unified design system (overhaul) ═══
+        # Plain string (literal CSS braces) concatenated whole via
+        # {_CSS_LIVING_GLASS} in the <style> AFTER {_CSS_HERO} + {_CSS_DESKTOP}
+        # (later source wins — so it re-skins existing selectors without deleting
+        # them; a stale cached build still works). Defines ONLY new tokens + new
+        # component classes and IMPORTS --hart-accent / --ds-* / --ds-ease-* rather
+        # than redefining them. One accent light, one overhead source, one motion
+        # grammar; chrome lights only on DETERMINISTIC real-state hooks (the JS half
+        # writes #hart-hero-orbwrap[data-orb-state], <html data-*>, .is-sensing,
+        # senses .listening, the pager classes — see the implementation contract).
+        _CSS_LIVING_GLASS = '''
+:root{
+  /* ── Accent triad (theme-driven; re-tints on theme change) ── */
+  --lg-accent: var(--hart-accent);
+  --lg-accent-rgb: var(--hart-accent-rgb, 0,230,195);
+  --lg-glow-0: rgba(var(--lg-accent-rgb),.55);
+  --lg-glow-1: rgba(var(--lg-accent-rgb),.26);
+  --lg-glow-2: rgba(var(--lg-accent-rgb),.12);
+  /* ── Deterministic STATE lights — one hue per real machine signal ── */
+  --lg-listen-rgb: 0,224,194;     /* mic open / listening */
+  --lg-think-rgb:  108,99,255;    /* AI computing (the reclaimed purple) */
+  --lg-speak-rgb:  25,227,125;    /* TTS out */
+  --lg-vision-rgb: 52,176,255;    /* camera/screen being read */
+  --lg-blind-rgb:  120,120,132;   /* senses shut by the human */
+  --lg-alert-rgb:  255,92,122;    /* errors / hard danger */
+  /* ── Neutral ink ladder ── */
+  --lg-heading: #F4F6FF; --lg-text: #E4E7F2; --lg-muted: #9AA2B8; --lg-faint: #646B82;
+  /* ── Glass depth ladder — 4 honest elevations ── */
+  --lg-1-bg: rgba(20,19,33,.42);  --lg-1-blur:14px; --lg-1-bd: rgba(255,255,255,.07);
+  --lg-2-bg: rgba(18,17,30,.56);  --lg-2-blur:20px; --lg-2-bd: rgba(255,255,255,.10);
+  --lg-3-bg: rgba(15,14,26,.70);  --lg-3-blur:26px; --lg-3-bd: rgba(255,255,255,.13);
+  --lg-4-bg: rgba(12,11,22,.82);  --lg-4-blur:34px; --lg-4-bd: rgba(255,255,255,.16);
+  --lg-sat: 1.4;
+  --lg-spec: inset 0 1px 0 0 rgba(255,255,255,.14);
+  --lg-sh-1: 0 2px 10px rgba(0,0,0,.30);
+  --lg-sh-2: 0 8px 26px rgba(0,0,0,.42);
+  --lg-sh-3: 0 18px 50px rgba(0,0,0,.52);
+  --lg-sh-4: 0 30px 72px rgba(0,0,0,.58);
+  /* ── Signature lit "presence ring" — orb, mic, eye, focus reuse these ── */
+  --lg-ring-listen: 0 0 0 2px rgba(var(--lg-listen-rgb),.85), 0 0 0 7px rgba(var(--lg-listen-rgb),.20), 0 8px 30px rgba(var(--lg-listen-rgb),.38);
+  --lg-ring-think:  0 0 0 2px rgba(var(--lg-think-rgb),.85),  0 0 0 8px rgba(var(--lg-think-rgb),.18),  0 8px 30px rgba(var(--lg-think-rgb),.36);
+  --lg-ring-speak:  0 0 0 2px rgba(var(--lg-speak-rgb),.85),  0 0 0 7px rgba(var(--lg-speak-rgb),.18),  0 8px 28px rgba(var(--lg-speak-rgb),.34);
+  --lg-ring-vision: 0 0 0 2px rgba(var(--lg-vision-rgb),.80), 0 0 0 6px rgba(var(--lg-vision-rgb),.18), 0 8px 26px rgba(var(--lg-vision-rgb),.32);
+  /* ── Type ── */
+  --lg-num: "tnum" 1;
+  --lg-ls-display: -.4px; --lg-ls-title: -.1px; --lg-ls-micro: .6px;
+  /* ── Motion roles ── */
+  --lg-spring: var(--ds-ease-spring);
+  --lg-glide:  var(--ds-ease-standard);
+  --lg-enter:  cubic-bezier(.16,1,.3,1);
+  --lg-exit:   cubic-bezier(.4,0,1,1);
+  --lg-breathe:cubic-bezier(.37,0,.63,1);
+  --t-micro:140ms; --t-fast:180ms; --t-move:220ms; --t-reveal:320ms; --t-ceremony:560ms;
+  --lg-stagger:28ms;
+  /* ── Shared geometry (single source; matches hartDesktop.js GRID/PAD) ── */
+  --lg-grid: 92px; --lg-pad: 24px; --lg-snap-widget: 24px;
+}
+@media (prefers-reduced-motion: reduce){
+  :root{--t-micro:0ms;--t-fast:0ms;--t-move:0ms;--t-reveal:0ms;--t-ceremony:0ms}
+}
+/* ── Canonical glass mixin (4 rungs) ── */
+.lg-1,.lg-2,.lg-3,.lg-4{border:1px solid var(--lg-1-bd);box-shadow:var(--lg-spec),var(--lg-sh-1);
+  background:var(--lg-1-bg);-webkit-backdrop-filter:blur(var(--lg-1-blur)) saturate(var(--lg-sat));backdrop-filter:blur(var(--lg-1-blur)) saturate(var(--lg-sat))}
+.lg-2{background:var(--lg-2-bg);border-color:var(--lg-2-bd);box-shadow:var(--lg-spec),var(--lg-sh-2);-webkit-backdrop-filter:blur(var(--lg-2-blur)) saturate(var(--lg-sat));backdrop-filter:blur(var(--lg-2-blur)) saturate(var(--lg-sat))}
+.lg-3{background:var(--lg-3-bg);border-color:var(--lg-3-bd);box-shadow:var(--lg-spec),var(--lg-sh-3);-webkit-backdrop-filter:blur(var(--lg-3-blur)) saturate(var(--lg-sat));backdrop-filter:blur(var(--lg-3-blur)) saturate(var(--lg-sat))}
+.lg-4{background:var(--lg-4-bg);border-color:var(--lg-4-bd);box-shadow:var(--lg-spec),var(--lg-sh-4);-webkit-backdrop-filter:blur(var(--lg-4-blur)) saturate(var(--lg-sat));backdrop-filter:blur(var(--lg-4-blur)) saturate(var(--lg-sat))}
+.lg-num{font-variant-numeric:tabular-nums;font-feature-settings:var(--lg-num)}
+
+/* ═══ DIMENSION 1 — THE ORB (deterministic lit voice control) ═══
+   #hart-hero-orbwrap[data-orb-state] (hartHero.js writes it). Supersede the
+   legacy RED .listening glow (:1157) — later source wins, do NOT delete it. */
+.hart-hero-orbwrap{transition:transform .25s var(--lg-spring),box-shadow var(--t-move) var(--lg-breathe)}
+.hart-hero-orbwrap::after{content:'';position:absolute;inset:-6px;border-radius:50%;pointer-events:none;
+  opacity:0;transition:opacity var(--t-reveal) var(--lg-enter),box-shadow var(--t-move)}
+.hart-hero-orbwrap[data-orb-state="listening"]::after{opacity:1;box-shadow:var(--lg-ring-listen);animation:lg-breathe-ring 2.2s var(--lg-breathe) infinite}
+.hart-hero-orbwrap[data-orb-state="speaking"]::after {opacity:1;box-shadow:var(--lg-ring-speak)}
+.hart-hero-orbwrap[data-orb-state="thinking"]::after {opacity:1;box-shadow:var(--lg-ring-think)}
+@keyframes lg-breathe-ring{0%,100%{transform:scale(1);opacity:.85}50%{transform:scale(1.03);opacity:1}}
+/* Supersede the legacy RED listening glow so it never shows: */
+.hart-hero-orbwrap.listening{box-shadow:none}
+/* Thinking comet — conic sweep masked to the ring */
+.hart-hero-orbwrap[data-orb-state="thinking"]::before{content:'';position:absolute;inset:-6px;border-radius:50%;pointer-events:none;
+  background:conic-gradient(from 0deg,transparent 0 78%,rgba(var(--lg-think-rgb),.9) 90%,transparent 100%);
+  -webkit-mask:radial-gradient(closest-side,transparent calc(100% - 5px),#000 calc(100% - 4px));
+          mask:radial-gradient(closest-side,transparent calc(100% - 5px),#000 calc(100% - 4px));
+  animation:lg-comet 1.4s linear infinite}
+@keyframes lg-comet{to{transform:rotate(360deg)}}
+/* Press ripple from click point */
+.lg-orb-ripple{position:absolute;border-radius:50%;pointer-events:none;background:radial-gradient(circle,rgba(var(--lg-accent-rgb),.35),transparent 70%);animation:lg-ripple .45s var(--lg-exit) forwards}
+@keyframes lg-ripple{from{transform:scale(.2);opacity:.7}to{transform:scale(2.4);opacity:0}}
+html.a11y-rmotion .hart-hero-orbwrap[data-orb-state="thinking"]::before,
+html.a11y-rmotion .hart-hero-orbwrap[data-orb-state="listening"]::after{animation:none}
+
+/* ═══ DIMENSION 2 — THE SENSORY POD (floating, draggable, grid-snapping) ═══
+   Supersede the legacy senses block (:1327-1371). The cluster inherits .lg-1
+   (class added in markup). hartSenses.js writes .dragging/.settle/[data-edge]/
+   #hart-senses-btn.is-sensing; mic .listening already exists (restyle only). */
+.hart-senses-cluster{padding:6px;gap:6px}
+.hart-senses.dragging .hart-senses-cluster{transform:scale(1.04);box-shadow:var(--lg-spec),var(--lg-sh-3)}
+.hart-senses.settle .hart-senses-cluster{animation:lg-settle .34s var(--lg-spring)}
+@keyframes lg-settle{0%{transform:scale(1.06)}100%{transform:scale(1)}}
+/* FIX A (drag-affordance discipline): the grip appears ONLY while dragging (hidden
+   at rest AND on hover) - the cluster body stays the drag hit-area, grip is visual
+   only. opacity (not display) hides it, so width + pointer-events are preserved. */
+.hart-senses-grip{cursor:grab}
+.hart-senses.dragging .hart-senses-grip{cursor:grabbing;opacity:1;color:var(--hart-text);background:rgba(255,255,255,0.06)}
+/* EYE — deterministic 3-state (was only .off red) */
+.hart-senses-btn.is-sensing{background:rgba(var(--lg-vision-rgb),.16);border-color:rgb(var(--lg-vision-rgb));box-shadow:var(--lg-ring-vision)}
+.hart-senses-btn.is-sensing .mi{color:rgb(var(--lg-vision-rgb));animation:lg-pulse 2.4s var(--lg-breathe) infinite}
+.hart-senses-btn.off{background:rgba(var(--lg-blind-rgb),.20);border-color:rgb(var(--lg-blind-rgb))}
+.hart-senses-btn.off .mi{color:rgb(var(--lg-blind-rgb))}
+/* MIC — listening cyan (supersede the legacy red .hart-senses-mic.listening :1343) */
+.hart-senses-mic.listening{background:rgba(var(--lg-listen-rgb),.18);border-color:rgb(var(--lg-listen-rgb));box-shadow:var(--lg-ring-listen)}
+.hart-senses-mic.listening .mi{color:rgb(var(--lg-listen-rgb))}
+@keyframes lg-pulse{0%,100%{opacity:.7}50%{opacity:1}}
+/* Edge-aware proof popover: opens AWAY from the nearest screen edge */
+.hart-senses[data-edge~="b"] .hart-senses-panel{bottom:56px;top:auto}
+.hart-senses[data-edge~="t"] .hart-senses-panel{top:56px;bottom:auto}
+.hart-senses[data-edge~="r"] .hart-senses-panel{right:0;left:auto}
+.hart-senses[data-edge~="l"] .hart-senses-panel{left:0;right:auto}
+/* Snap-grid ghost while dragging */
+.lg-senses-ghost{position:fixed;inset:0;z-index:8090;pointer-events:none;opacity:0;transition:opacity var(--t-reveal);
+  background-image:radial-gradient(rgba(var(--lg-accent-rgb),.16) 1px,transparent 1px);background-size:24px 24px}
+.lg-senses-ghost.show{opacity:1}
+html.a11y-rmotion .hart-senses-btn.is-sensing .mi{animation:none}
+
+/* ═══ DIMENSION 3 — CONTEXTUAL / DETERMINISTIC VISIBILITY ENGINE ═══
+   hartVisibility.js is the sole writer of <html data-*> (data-multiws owned by
+   hartWorkspaces.js). All show/hide is declarative CSS on EXISTING markup. */
+.hart-hero-chips{transition:opacity var(--t-move) var(--lg-enter),transform var(--t-move) var(--lg-enter)}
+html[data-busy="1"] .hart-hero-chips,html[data-panels="1"] .hart-hero-chips,html[data-typing="1"] .hart-hero-chips{opacity:0;transform:translateY(6px) scale(.98);pointer-events:none}
+/* Sensory pod: SAFETY control — dims when idle, NEVER hides; full while sensing/voice */
+.hart-senses{transition:opacity var(--t-reveal) var(--lg-glide)}
+html[data-idle="1"] .hart-senses{opacity:.55}
+html[data-voice="1"] .hart-senses,html[data-blind="1"] .hart-senses{opacity:1}
+/* Pager: hidden only on a pristine, empty desktop; reveals as soon as the virtual-
+   desktop feature is USABLE — any window is open OR you've navigated off desktop 1
+   (data-multiws set by hartWorkspaces). Seeded data-multiws="0" in the <html> markup
+   so the rule matches at first paint (an ABSENT attr would not) — no reveal FOUC. */
+.hart-ws-switcher{transition:opacity var(--t-move) var(--lg-enter),transform var(--t-move) var(--lg-enter)}
+html[data-multiws="0"] .hart-ws-switcher{opacity:0;transform:translate(-50%,8px);pointer-events:none}
+/* Ambient wash subtly shifts toward the active state (the WHOLE room reacts).
+   thinking / voice / speaking each tint the room so the active state is felt
+   peripherally — speaking gets parity with the other two (it previously had no
+   <html>-level consumer, so the "AI is talking" signal lit nothing). */
+/* Voice/thinking reactivity WITHOUT live blur (steward 2026-07-19): the bloom is
+   already pre-blurred, so a state change lifts saturation/brightness only -- a brief
+   ONE-SHOT transition (not an infinite loop), so it costs a single repaint, never a
+   per-frame blur. The aurora "comes alive" when HART listens/speaks; it never
+   re-rasterises a 64px blur on the cairo floor. */
+html[data-thinking="1"] .hart-ambient{filter:saturate(150%) brightness(1.06);transition:filter var(--t-reveal)}
+html[data-voice="1"] .hart-ambient{filter:saturate(162%) brightness(1.09);transition:filter var(--t-reveal)}
+html[data-speaking="1"] .hart-ambient{filter:saturate(156%) brightness(1.05);transition:filter var(--t-reveal)}
+/* While HART speaks, the hevolve "live" pip in the spine glows the TTS-out green so
+   the speaking state has a deterministic on-screen cue (not just the orb canvas). */
+html[data-speaking="1"] .hart-hero-hevolve{opacity:.9}
+html[data-speaking="1"] .hart-hero-hevolve .dot{background:rgb(var(--lg-speak-rgb));box-shadow:0 0 0 3px rgba(var(--lg-speak-rgb),.22)}
+/* Agents-running signal: when >=1 agent is live, the top-bar agent cluster reads
+   as ACTIVE (chip dots gain a soft live-glow); with none, it stays muted. This
+   makes data-agents actionable (it had no consumer before). */
+html[data-agents="1"] .top-bar-center .agent-chip .dot{box-shadow:0 0 0 3px rgba(0,230,118,.22)}
+html[data-agents="0"] .top-bar-center{opacity:.72}
+/* Offline signal: when the network is down, fade + desaturate the agent-status
+   cluster (the live network surface) so "offline" is visible, not silent. */
+html[data-online="0"] .top-bar-center{opacity:.5;filter:grayscale(.7);transition:opacity var(--t-reveal),filter var(--t-reveal)}
+
+/* ═══ DIMENSION 4 — DESKTOP ICONS (sort + marquee + drop-cell) ═══
+   Re-skin .desktop-icon (:1207); supersede flat-purple .selected (:1211).
+   hartDesktop.js writes .arranging on #hart-desktop + .lg-drop-cell/.lg-marquee. */
+.desktop-icon.selected{background:rgba(var(--lg-accent-rgb),.22);outline:1px solid rgba(var(--lg-accent-rgb),.55);box-shadow:0 8px 30px rgba(var(--lg-accent-rgb),.30)}
+.desktop-icon.dragging{transform:scale(1.06);box-shadow:var(--lg-sh-3);z-index:60}
+.hart-desktop::before{content:'';position:absolute;inset:0;opacity:0;pointer-events:none;transition:opacity var(--t-fast);
+  background-image:radial-gradient(rgba(var(--lg-accent-rgb),.16) 1.5px,transparent 1.5px);background-size:var(--lg-grid) var(--lg-grid);background-position:var(--lg-pad) var(--lg-pad)}
+.hart-desktop.arranging::before{opacity:1}
+.lg-drop-cell{position:absolute;width:84px;height:84px;border-radius:14px;pointer-events:none;border:2px dashed rgba(var(--lg-accent-rgb),.6);background:rgba(var(--lg-accent-rgb),.08);transition:left var(--t-fast) var(--lg-glide),top var(--t-fast) var(--lg-glide)}
+.lg-marquee{position:fixed;z-index:55;pointer-events:none;border:1px solid rgba(var(--lg-accent-rgb),.7);background:rgba(var(--lg-accent-rgb),.10);border-radius:6px}
+
+/* ═══ DIMENSION 5 — THE WORKSPACE PAGER (segmented, occupancy-aware, thumb) ═══
+   Supersede the .hart-ws-dot block (:1251). .hart-ws-switcher inherits .lg-2
+   (class already on markup :1793). hartWorkspaces.js writes the pager DOM. */
+.hart-ws-switcher{padding:3px;gap:2px;height:30px;align-items:center}
+.hart-pager-thumb{position:absolute;top:3px;left:3px;height:24px;border-radius:var(--ds-radius-full);background:rgba(var(--lg-accent-rgb),.92);box-shadow:0 2px 10px rgba(var(--lg-accent-rgb),.4);transition:transform var(--t-move) var(--lg-spring),width var(--t-move) var(--lg-spring);z-index:0}
+.hart-pager-seg{position:relative;z-index:1;min-width:34px;height:24px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;border:none;background:transparent;cursor:pointer;color:var(--lg-muted);border-radius:var(--ds-radius-full);transition:color var(--t-fast)}
+.hart-pager-seg .hps-n{font-size:11px;font-weight:700;line-height:1}
+.hart-pager-seg .hps-occ{display:flex;gap:2px;height:3px}
+.hart-pager-seg .hps-occ i{width:3px;height:3px;border-radius:50%;background:currentColor;opacity:.7}
+.hart-pager-seg.empty .hps-occ{opacity:.35}
+.hart-pager-seg:hover{color:var(--lg-text)}
+.hart-pager-seg.active{color:var(--hart-on-accent)}
+@media(prefers-reduced-motion:reduce){.hart-pager-thumb{transition:none}}
+
+/* ═══ DIMENSION 7 — OFFLINE / EMPTY STATES (designed, never naive) ═══
+   hartStates.js builds .lg-empty / .lg-empty-{loading,offline,empty}. */
+.lg-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:var(--ds-space-3);padding:var(--ds-space-12) var(--ds-space-6);min-height:240px;animation:lg-empty-in var(--t-reveal) var(--lg-enter)}
+@keyframes lg-empty-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.lg-empty-disc{width:56px;height:56px;border-radius:var(--ds-radius-lg);display:flex;align-items:center;justify-content:center;background:var(--lg-1-bg);border:1px solid var(--lg-1-bd);box-shadow:var(--lg-spec)}
+.lg-empty-disc .mi{font-size:28px;color:var(--lg-muted)}
+.lg-empty-offline .lg-empty-disc .mi{color:rgb(var(--lg-blind-rgb));animation:lg-empty-breathe 3s var(--lg-breathe) infinite}
+@keyframes lg-empty-breathe{0%,100%{opacity:.6;transform:scale(1)}50%{opacity:1;transform:scale(1.06)}}
+.lg-empty-title{font-size:15px;font-weight:600;color:var(--lg-heading);letter-spacing:-.1px}
+.lg-empty-msg{font-size:13px;line-height:1.5;color:var(--lg-muted);max-width:340px}
+.lg-empty-retry{margin-top:var(--ds-space-1)}
+html.a11y-rmotion .lg-empty-offline .lg-empty-disc .mi{animation:none}
+
+/* ═══ DIMENSION 6 — VISUAL DESIGN LANGUAGE (cohesion pass) ═══
+   Chips spring + tabular numerals on clock/pager/counters. */
+.hart-hero-chip{transition:background .18s,transform .18s var(--lg-spring),box-shadow .18s}
+.hart-hero-chip:hover{transform:translateY(-2px);box-shadow:var(--lg-sh-2)}
+.hart-hero-chip:active{transform:scale(.97)}
+.top-bar-right .clock{font-variant-numeric:tabular-nums;font-feature-settings:var(--lg-num)}
+'''
+        # Potato (no-blur) variant of the .lg-1..4 mixin + state surfaces — mirrors
+        # the .glass branch (:1414) + _CSS_POTATO_OVERRIDE (:1097): drop the
+        # backdrop-filter and raise bg opacity so the chrome stays legible without
+        # the GPU-costly blur on low-end hardware.
+        if is_potato:
+            _CSS_LIVING_GLASS += (
+                '.lg-1,.lg-2,.lg-3,.lg-4{backdrop-filter:none;-webkit-backdrop-filter:none}'
+                '.lg-1{background:rgba(20,19,33,.92)}'
+                '.lg-2{background:rgba(18,17,30,.94)}'
+                '.lg-3{background:rgba(15,14,26,.95)}'
+                '.lg-4{background:rgba(12,11,22,.96)}'
+                '.lg-senses-ghost,.hart-desktop::before{display:none}'
+            )
+
+        # ── Boot lock overlay (#166: FOUC + security) ─────────────────────────
+        # The lock is a per-user SHELL lock (hartSessionUI.js / window.HartLock),
+        # persisted in the SAME server-backed session blob the JS reads
+        # (shell_session.json -> key `lock_pw_hash`). When a password IS set the
+        # shell must boot LOCKED, and the overlay has to COVER the desktop from
+        # the very FIRST paint — otherwise the desktop paints for a frame before
+        # hartSessionUI's deferred JS can add `.active` (the reported FOUC / an
+        # information leak of the desktop behind the lock). So we seed `.active`
+        # into the served #lock-screen markup HERE (frame 1), reading the exact
+        # same blob + key the JS lock owns — one source of truth, no parallel
+        # lock state. hartSessionUI.js then focuses the field and drives unlock,
+        # which removes `.active` and reveals the desktop. No password set (fresh
+        # install) => not seeded => normal boot (the first-run setup prompt in
+        # hartSessionUI still offers to create one).
+        boot_locked = False
+        try:
+            _ss_path = os.path.join(self._data_dir, 'shell_session.json')
+            if os.path.isfile(_ss_path):
+                with open(_ss_path, 'r') as _sf:
+                    _ss_blob = json.load(_sf)
+                boot_locked = bool(isinstance(_ss_blob, dict) and _ss_blob.get('lock_pw_hash'))
+        except Exception:
+            boot_locked = False
+        lock_boot_class = ' active' if boot_locked else ''
+
         return f'''<!DOCTYPE html>
-<html lang="en" class="{a11y_cls}"><head>
+<html lang="en" class="{a11y_cls}" data-multiws="0"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>HART OS</title>
 <script>if(navigator.onLine){{var _l=document.createElement('link');_l.rel='stylesheet';_l.href='https://fonts.googleapis.com/icon?family=Material+Icons+Round';document.head.appendChild(_l);}}</script>
-<style>/* Material Icons Round: CDN injected above only when online (testing); NixOS bundled font covers offline USB boot */</style>
+<style>/* Icons: the BUNDLED /shell/static/MaterialSymbolsRounded.woff2 @font-face below is authoritative (every glyph, fully offline). This CDN <link> is progressive-enhancement ONLY (online round variant). */</style>
 <style>
 {css_vars}
+{accent_rgb_css}
 {a11y_fontscale}
 *{{margin:0;padding:0;box-sizing:border-box}}
 ::selection{{background:var(--hart-accent);color:#fff}}
@@ -1344,11 +2677,16 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 .panel-titlebar .mi{{font-size:16px;color:var(--hart-accent);flex-shrink:0}}
 .panel-titlebar .title{{flex:1;font-size:12px;font-weight:500;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}}
-.panel-titlebar .ctrl{{display:flex;gap:2px}}
+.panel-titlebar .ctrl{{display:flex;gap:4px}}
 .panel-titlebar .ctrl span{{width:24px;height:24px;display:flex;align-items:center;justify-content:center;
-  border-radius:6px;cursor:pointer;font-size:14px;transition:background var(--hart-anim-speed)}}
-.panel-titlebar .ctrl span:hover{{background:rgba(255,255,255,0.1)}}
-.panel-titlebar .ctrl .close:hover{{background:var(--hart-error)}}
+  border-radius:6px;cursor:pointer;font-size:14px;color:var(--hart-text);background:rgba(255,255,255,0.06);
+  transition:background var(--hart-anim-speed),color var(--hart-anim-speed)}}
+/* Window controls (close/min/max) get a SOLID rest background + a crisp NEUTRAL glyph
+   instead of the low-contrast teal accent — otherwise they read as transparent/clumsy
+   floating icons on the glass (steward, real-HW). Close hover = red with a white X. */
+.panel-titlebar .ctrl span .mi{{color:inherit}}
+.panel-titlebar .ctrl span:hover{{background:rgba(255,255,255,0.16)}}
+.panel-titlebar .ctrl .close:hover{{background:var(--hart-error);color:#fff}}
 .panel-body{{flex:1;overflow:hidden;position:relative}}
 .panel-body iframe{{width:100%;height:100%;border:none;background:transparent}}
 .panel-body .native-content{{padding:16px;overflow-y:auto;height:100%;font-size:13px}}
@@ -1457,9 +2795,16 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 .ctx-menu-sep{{border-top:1px solid var(--hart-glass-border);margin:4px 0}}
 
 /* ── Lock Screen ── */
+/* OPAQUE base (--hart-background) UNDER the translucent tint: a lock / password
+   takeover must fully cover the desktop. backdrop-filter is unreliable on the
+   kiosk WebKitGTK, so relying on a 70% tint + blur let the hero search bar bleed
+   THROUGH — the "Create a password" card visually overlapped the search hint.
+   An opaque solid layer first guarantees nothing behind it shows, on every
+   renderer; the blur stays a progressive enhancement on top. */
 .lock-screen{{position:fixed;inset:0;z-index:9999;display:none;align-items:center;
   justify-content:center;flex-direction:column;gap:16px;
-  background:rgba(0,0,0,{'0.7);backdrop-filter:blur(24px)' if not is_potato else '0.9)'}}}
+  background:var(--hart-background,#0F0E17);
+  background:linear-gradient(rgba(7,6,15,{'0.82),rgba(7,6,15,0.82)),var(--hart-background,#0F0E17);backdrop-filter:blur(24px)' if not is_potato else '0.97),rgba(7,6,15,0.97)),var(--hart-background,#0F0E17)'}}}
 .lock-screen.active{{display:flex}}
 .lock-clock{{font-size:64px;font-weight:300}}
 .lock-date{{font-size:16px;color:var(--hart-muted)}}
@@ -1468,7 +2813,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   font-family:var(--ds-font-body);outline:none;width:280px;text-align:center}}
 .lock-status{{font-size:12px;color:var(--hart-muted)}}
 .lock-brand{{display:flex;align-items:center;gap:10px;margin-bottom:8px;opacity:.92}}
-.lock-brand img{{width:30px;height:30px;filter:drop-shadow(0 2px 10px rgba(0,212,170,.4))}}
+.lock-brand img{{width:30px;height:30px;filter:drop-shadow(0 2px 10px rgba(var(--hart-accent-rgb,0,230,195),.4))}}
 .lock-brand span{{font-size:13px;letter-spacing:2.5px;font-weight:600;opacity:.8}}
 .lock-screen.setup .lock-clock,.lock-screen.setup .lock-date{{display:none}}
 /* ── Desktop widgets (live clock + system) ── */
@@ -1537,16 +2882,17 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 {_CSS_DESIGN_SYSTEM}
 {_CSS_HERO}
 {_CSS_DESKTOP}
+{_CSS_LIVING_GLASS}
 {_CSS_POTATO_OVERRIDE if is_potato else ''}
 </style>
 </head>
-<body>
+<body class="{gpu_body_class}{flat_body_class}">
 <!-- Hevolve brand boot splash (Lottie). Inline styles: this HTML is inside an
      f-string, so a CSS block would need brace-escaping; the overlay is a single
      element + hartBootSplash.js drives the fade, so inline is cleaner here. -->
 <div id="hart-boot" aria-hidden="true" style="position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:#0F0E17;transition:opacity .6s ease"><div id="hart-boot-lottie" style="width:min(46vw,360px);height:min(64vw,497px)"></div></div>
 <div class="wallpaper"></div>
-{'<div class="hart-ambient" aria-hidden="true"><div class="hart-blob hart-blob-1"></div><div class="hart-blob hart-blob-2"></div><div class="hart-blob hart-blob-3"></div></div><div class="hart-grain" aria-hidden="true"></div>' if not is_potato else ''}
+{'<div class="hart-ambient" aria-hidden="true"></div>' if emit_ambient else ''}{'<canvas class="hart-bloom-canvas" id="hart-bloom-canvas" aria-hidden="true"></canvas>' if emit_ambient else ''}{'<div class="hart-grain" aria-hidden="true"></div>' if not is_potato else ''}
 <div class="hart-vignette" aria-hidden="true"></div>
 <!-- Desktop icon layer (drag-drop apps); populated by hartDesktop.js -->
 <div class="hart-desktop" id="hart-desktop" aria-label="Desktop icons"></div>
@@ -1557,12 +2903,12 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      orb canvas below is the SAME #hart-voice-orb driven by initHartOrb; the bar
      fuses search + agent dispatch + the voice transcript sink. -->
 <div class="hart-hero" id="hart-hero" role="search" aria-label="HART command center">
-  <div class="hart-hero-brand"><img src="/shell/static/hevolve-logo.png" alt="HART OS" draggable="false"><span>HART OS</span></div>
-  <div class="hart-hero-orbwrap">
+  <div class="hart-hero-orbwrap" id="hart-hero-orbwrap" data-orb-state="idle" role="button" tabindex="0" aria-label="Speak to HART (Super+Space)" title="Click or press Super+Space to speak">
+    <div class="hart-orb-orbit" aria-hidden="true"></div>
+    <div class="hart-orb-orbit2" aria-hidden="true"></div>
     <canvas id="hart-voice-orb" width="360" height="360" aria-hidden="true"></canvas>
-    <button class="hart-hero-mic" id="hart-hero-mic" type="button" aria-label="Speak to HART (Super+Space)" title="Click or press Super+Space to speak"><span class="mi material-icons-round" aria-hidden="true">mic</span></button>
   </div>
-  <div class="hart-hero-status" id="hart-hero-status" role="status" aria-live="polite">Ask HART anything — say it or type it</div>
+  <div class="hart-hero-status" id="hart-hero-status" role="status" aria-live="polite">Ask HART anything - say it or type it</div>
   <div class="hart-hero-bar glass">
     <span class="mi material-icons-round hart-hero-bar-ic" aria-hidden="true">search</span>
     <input id="hart-hero-input" class="hart-hero-input" type="text" autocomplete="off" spellcheck="false" placeholder="Search apps, ask the agent, or speak…" aria-label="Command and search">
@@ -1572,13 +2918,30 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   <div class="hart-hero-chips" id="hart-hero-chips"></div>
 </div>
 
-<!-- Top Bar -->
+<!-- Top Bar - restructured (e1): brand | nav tabs | agent-status | omnibox |
+     orb-sm | avatar | tray. #agent-status and .top-bar-right are KEPT verbatim
+     (hartVisibility reads #agent-status chips; hartConnectivity mounts into
+     .top-bar-right) - the restructure only ADDS the nav/omnibox/orb-sm/avatar. -->
 <div class="top-bar glass" role="banner">
   <div class="start-btn" role="button" tabindex="0" aria-haspopup="menu" aria-label="Start menu" onclick="toggleStartMenu()" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Start Menu (Super)">
     <img src="/shell/static/hevolve-logo.png" class="start-logo" alt="" aria-hidden="true" draggable="false">
-    <span>HART</span>
+    <span class="hart-wordmark"><b style="color:var(--hart-accent,#00E6C3);font-weight:800">HART</b> <span style="color:var(--hart-a2,#9B5CFF);font-weight:700">OS</span></span>
   </div>
+  <nav class="top-bar-nav" role="navigation" aria-label="Primary">
+    <button class="tb-tab tb-active" type="button" data-tab="home" onclick="if(window.HartHomeNav)HartHomeNav('home')">Home</button>
+    <button class="tb-tab" type="button" data-tab="agents" onclick="if(window.HartHomeNav)HartHomeNav('agents')">Agents</button>
+    <button class="tb-tab" type="button" data-tab="apps" onclick="if(window.HartHomeNav)HartHomeNav('apps')">Apps</button>
+    <button class="tb-tab" type="button" data-tab="hive" onclick="if(window.HartHomeNav)HartHomeNav('hive')">Hive</button>
+    <button class="tb-tab" type="button" data-tab="earn" onclick="if(window.HartHomeNav)HartHomeNav('earn')">Earn</button>
+  </nav>
   <div class="top-bar-center" id="agent-status" role="status" aria-live="polite" aria-label="Agent status"></div>
+  <button class="top-bar-omni" type="button" aria-label="Ask or search anything" onclick="if(window.HartHome)HartHome.ask('')">
+    <span class="mi material-icons-round" aria-hidden="true">search</span>
+    <span>Ask or search anything</span>
+    <span class="tbo-kbd" aria-hidden="true">Super K</span>
+  </button>
+  <button class="top-bar-orb" id="top-bar-orb" type="button" aria-label="Talk to HART" title="Talk to HART (Super+Space)" onclick="if(window.toggleVoice)toggleVoice()"></button>
+  <button class="top-bar-avatar" id="top-bar-avatar" type="button" aria-label="Your account" title="Your account" onclick="if(window.HartHomeNav)HartHomeNav('account')">H</button>
   <div class="top-bar-right">
     <div class="tray-btn" role="button" tabindex="0" aria-label="Notifications" onclick="openPanel('notifications')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}" title="Notifications">
       <span class="mi material-icons-round" aria-hidden="true">notifications</span>
@@ -1602,22 +2965,110 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
      #hart-hero (centerpiece); initHartOrb still finds #hart-voice-orb and drives
      it. hartHero.js fuses the orb with the command bar, reusing toggleVoice /
      acSend / openPanel — one pipeline, no fork. Loaded after the inline script. -->
-<script src="/shell/static/lottie.min.js"></script>
-<script src="/shell/static/hartBootSplash.js"></script>
-<script src="/shell/static/hartSession.js"></script>
-<script src="/shell/static/voiceOrbViz.js"></script>
-<script src="/shell/static/hartHero.js"></script>
-<script src="/shell/static/hartDesktop.js"></script>
-<script src="/shell/static/hartWorkspaces.js"></script>
-<script src="/shell/static/hartPersonalize.js"></script>
-<script src="/shell/static/hartMarketplace.js"></script>
-<script src="/shell/static/hartDock.js"></script>
-<script src="/shell/static/hartSenses.js"></script>
-<script src="/shell/static/hartOnboarding.js"></script>
-<script src="/shell/static/hartSessionUI.js"></script>
+<!-- All shell modules use `defer`: they must NOT block HTML parsing / first
+     paint (≈456KB total, lottie.min.js alone is 305KB).  `defer` keeps them
+     in document order AND guarantees they run AFTER the inline config script
+     below sets window.MANIFEST / BACKEND / GROUPS — which is exactly the
+     contract each module already documents ("loaded after the inline shell
+     JS") and self-enforces via its `document.readyState==='loading'` init
+     gate.  So deferring is strictly safer ordering, not a behaviour change. -->
+<!-- Client-error observability (FIX B): forward WebView JS errors to the shell
+     server so they reach journald (the WebView console is otherwise a blind
+     spot). Installed EARLY (before the deferred modules run) so it captures their
+     throws too. Tiny, dependency-free, best-effort, throttled, never throws. -->
+<script>
+(function(){{
+  var _n=0, _max=20;
+  function _post(o){{
+    if(_n>=_max) return; _n++;
+    try {{
+      fetch('/api/shell/clientlog', {{method:'POST',
+        headers:{{'Content-Type':'application/json'}},
+        body:JSON.stringify(o), keepalive:true}}).catch(function(){{}});
+    }} catch(e) {{}}
+  }}
+  window.onerror = function(message, source, lineno, colno, error){{
+    try {{ _post({{level:'error', message:String(message||''),
+      stack:String((error&&error.stack)||''), url:String(source||location.href),
+      line:lineno||0, col:colno||0}}); }} catch(e) {{}}
+    return false;
+  }};
+  window.addEventListener('unhandledrejection', function(ev){{
+    try {{
+      var r = ev.reason || {{}};
+      _post({{level:'error', message:'unhandledrejection: '+String(r.message||r),
+        stack:String(r.stack||''), url:location.href, line:0, col:0}});
+    }} catch(e) {{}}
+  }});
+  var _ce = window.console && console.error;
+  if(_ce) {{
+    console.error = function(){{
+      try {{
+        var a = Array.prototype.slice.call(arguments).map(function(x){{
+          return (x && x.stack) ? x.stack : String(x); }}).join(' ');
+        _post({{level:'warning', message:a.slice(0,2000), stack:'',
+          url:location.href, line:0, col:0}});
+      }} catch(e) {{}}
+      try {{ return _ce.apply(console, arguments); }} catch(e) {{}}
+    }};
+  }}
+}})();
+</script>
+<script defer src="/shell/static/lottie.min.js"></script>
+<script defer src="/shell/static/hartBootSplash.js"></script>
+<script defer src="/shell/static/hartSession.js"></script>
+<script defer src="/shell/static/hartOSBridge.js"></script>
+<script defer src="/shell/static/voiceOrbViz.js"></script>
+<script defer src="/shell/static/hartHero.js"></script>
+<!-- Assembled Netflix HOME (W1): the value-first cinematic canvas. Loaded after
+     hartHero.js (it docks the orb via HartOrbHomeMode) and reuses openPanel /
+     acSend / speakText / the resonance+compute-earnings endpoints. The agent
+     re-composes it live via the SSE 'home_compose' branch below. -->
+<link rel="stylesheet" href="/shell/static/hartHome.css">
+<!-- ONE source of the brand-spectrum art language (gradients + glyph rendering),
+     shared by hartHome.js (card art) and hartDesktop.js (icon art tiles). Loaded
+     BEFORE both so window.HartBrandArt is defined when they paint. -->
+<script defer src="/shell/static/hartBrandArt.js"></script>
+<script defer src="/shell/static/hartHome.js"></script>
+<script defer src="/shell/static/hartBloom.js"></script>
+<script defer src="/shell/static/hartDesktop.js"></script>
+<script defer src="/shell/static/hartAskMenu.js"></script>
+<script defer src="/shell/static/hartWorkspaces.js"></script>
+<script defer src="/shell/static/hartEffects.js"></script>
+<script defer src="/shell/static/hartPersonalize.js"></script>
+<script defer src="/shell/static/hartMarketplace.js"></script>
+<script defer src="/shell/static/hartCredits.js"></script>
+<script defer src="/shell/static/hartDock.js"></script>
+<script defer src="/shell/static/hartSenses.js"></script>
+<!-- Living-Glass: deterministic visibility engine (sole writer of <html data-*>)
+     + designed offline/empty-state component. Loaded after hartSenses.js (it reads
+     its #hart-hero / #panels / senses hooks) and before hartSessionUI.js. -->
+<script defer src="/shell/static/hartVisibility.js"></script>
+<script defer src="/shell/static/hartStates.js"></script>
+<script defer src="/shell/static/hartOnboarding.js"></script>
+<script defer src="/shell/static/hartSessionUI.js"></script>
+<link rel="stylesheet" href="/shell/static/hartResponsive.css">
+<script defer src="/shell/static/hartFiles.js"></script>
+<!-- Unified navigation framework (#169): a shell-wide back/forward/breadcrumb
+     history over the openPanel single-instance registry (panel id == location),
+     generalising hartFiles.js's proven navigate/back/forward primitive. Loaded
+     after the inline shell script (which defines openPanel/panels/bringToFront)
+     and after hartFiles.js. Exposes window.HartNav + window.HartNavCore (the
+     pure history/reuse-vs-new core, unit-tested by test_hart_nav.mjs). -->
+<script defer src="/shell/static/hartNav.js"></script>
+<!-- OS connectivity cluster (wifi/bluetooth/battery/volume indicators +
+     quick-settings) in the top-bar tray. Loaded after hartStates.js (it reuses
+     the designed-state helpers) and hartSession.js (HartTimeoutSignal). Polls
+     /api/shell/connectivity/summary on SHELL=:6800 (same-process) and degrades
+     to a neutral 'unknown' glyph when a tool/hardware is absent. -->
+<script defer src="/shell/static/hartConnectivity.js"></script>
+<!-- Flash HART OS to USB wizard (System panel 'flash'): drives the proven
+     scripts/hart_usb_flasher.py via /api/shell/flash/* so a running node can
+     create more install sticks. Exposes window.loadFlashWizard. -->
+<script defer src="/shell/static/hartFlash.js"></script>
 
 <!-- Agent Pill (click to expand floating chat) -->
-<div class="agent-pill glass" id="agent-pill" onclick="toggleAssistantChat()">
+<div class="agent-pill glass hidden" id="agent-pill" onclick="toggleAssistantChat()">
   <span class="mi material-icons-round" style="color:var(--hart-accent)">chat_bubble</span>
   <input id="agent-input" placeholder="Ask HART..." onclick="event.stopPropagation();toggleAssistantChat()" onkeydown="if(event.key==='Enter'){{event.stopPropagation();toggleAssistantChat();setTimeout(function(){{var i=document.getElementById('ac-input');if(i){{i.value=document.getElementById('agent-input').value;document.getElementById('agent-input').value=''}}}},100)}}">
   <div class="agent-response" id="agent-resp"></div>
@@ -1633,7 +3084,7 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
   </div>
   <div class="ac-caps" id="ac-caps"></div>
   <div class="ac-messages" id="ac-messages" role="log" aria-live="polite">
-    <div class="ac-msg assistant">Hi! I can help with anything — chat, code, agents, vision, voice, remote desktop, and 3,200+ OpenClaw skills. What would you like to do?</div>
+    <div class="ac-msg assistant">Hi! I can help with anything - chat, code, agents, vision, voice, remote desktop, and 3,200+ OpenClaw skills. What would you like to do?</div>
   </div>
   <div class="ac-input-row">
     <span class="mi material-icons-round ac-btn" onclick="acVoiceInput()" title="Voice input" style="font-size:20px">mic</span>
@@ -1650,12 +3101,15 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
     <div class="power-btn" role="button" tabindex="0" onclick="shellAction('lock')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">lock</span>Lock</div>
     <div class="power-btn" role="button" tabindex="0" onclick="shellAction('suspend')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">dark_mode</span>Sleep</div>
     <div class="power-btn" role="button" tabindex="0" onclick="shellAction('restart')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">refresh</span>Restart</div>
+    <div class="power-btn" id="power-btn-firmware" role="button" tabindex="0" style="display:none" onclick="shellAction('firmware')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">developer_board</span>Restart to Firmware (UEFI)</div>
     <div class="power-btn" role="button" tabindex="0" onclick="shellAction('shutdown')" onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();this.click()}}"><span class="mi material-icons-round" aria-hidden="true">power_settings_new</span>Shut Down</div>
   </div>
 </div>
 
-<!-- Lock Screen -->
-<div class="lock-screen" id="lock-screen" role="dialog" aria-modal="true" aria-label="Screen locked">
+<!-- Lock Screen. #166: `lock_boot_class` is ' active' when a lock password is
+     already set, so this opaque overlay COVERS the desktop from the first paint
+     (no FOUC / no desktop leak); hartSessionUI.js drives unlock + reveal. -->
+<div class="lock-screen{lock_boot_class}" id="lock-screen" role="dialog" aria-modal="true" aria-label="Screen locked">
   <div class="lock-brand"><img src="/shell/static/hevolve-logo.png" alt="HART OS" draggable="false"><span>HART OS</span></div>
   <div class="lock-clock" id="lock-clock"></div>
   <div class="lock-date" id="lock-date"></div>
@@ -1670,15 +3124,24 @@ html,body{{width:100%;height:100%;overflow:hidden;font-family:var(--hart-font-fa
 <!-- Virtual-desktop switcher (client-side; populated by hartWorkspaces.js) -->
 <div class="hart-ws-switcher glass" id="hart-ws-switcher" role="tablist" aria-label="Virtual desktops"></div>
 
-<!-- AI sensory kill-switch: human hard cut + live proof (orb "closes its eyes") -->
-<div class="hart-senses" id="hart-senses">
+<!-- AI sensory cluster (bottom-left): vision (eye kill-switch) + audio (mic) read
+     as one grouped "sensory" pair. The eye hard-cuts the AI's senses + shows live
+     proof (hartSenses.js); the mic toggles voice input (toggleVoice). This is the
+     SMALL bottom mic — NOT the central voice orb, which stays untouched. -->
+<div class="hart-senses" id="hart-senses" data-edge="b">
   <div class="hart-senses-panel" id="hart-senses-panel" role="status" aria-live="polite">
     <div class="hsp-title">AI sensory state</div>
     <div id="hart-senses-proof"></div>
   </div>
-  <button class="hart-senses-btn" id="hart-senses-btn" type="button" aria-pressed="false" aria-label="Shut or wake the AI's senses" title="Shut the AI's eyes &amp; ears (right-click for live proof)">
-    <span class="mi material-icons-round" aria-hidden="true">visibility</span>
-  </button>
+  <div class="hart-senses-cluster lg-1" role="group" aria-label="AI senses (vision &amp; audio)">
+    <span class="hart-senses-grip" aria-hidden="true"><span class="mi material-icons-round">drag_indicator</span></span>
+    <button class="hart-senses-btn" id="hart-senses-btn" type="button" aria-pressed="false" aria-label="Shut or wake the AI's senses" title="Shut the AI's eyes &amp; ears (right-click for live proof)">
+      <span class="mi material-icons-round" aria-hidden="true">visibility</span>
+    </button>
+    <button class="hart-senses-btn hart-senses-mic" id="hart-senses-mic" type="button" aria-label="Talk to HART (toggle voice)" title="Talk to HART - toggle voice input" onclick="window.toggleVoice&amp;&amp;toggleVoice()">
+      <span class="mi material-icons-round" aria-hidden="true">mic</span>
+    </button>
+  </div>
 </div>
 
 <!-- First-run "Light Your HART" ceremony (web, in-shell; auto-runs after OS install when not onboarded) -->
@@ -1728,8 +3191,36 @@ const MANIFEST = {manifest_json};
 // (hartDesktop.js gates on window.MANIFEST). Expose it explicitly.
 window.MANIFEST = MANIFEST;
 const SYSTEM_PANELS = {system_json};
+// Expose to window so the external desktop layer (hartDesktop.js) can place
+// NATIVE system panels (Files, App Store, This PC …) as desktop icons too — it
+// resolves an icon id against window.MANIFEST OR window.SYSTEM_PANELS (one
+// resolver, no parallel registry). openPanel already dispatches system ids.
+window.SYSTEM_PANELS = SYSTEM_PANELS;
 const GROUPS = {groups_json};
-const NUNBA_BASE = '/app/#';
+// W4 Start-menu PINNED ids + Settings aggregator sections (composition only —
+// each is a list of EXISTING panel ids from shell_manifest). buildStartMenu and
+// loadSettingsPanel resolve each id's metadata from MANIFEST/SYSTEM_PANELS above,
+// so there is no second copy of any panel definition (single source).
+const PINNED = {pinned_json};
+const SETTINGS_SECTIONS = {settings_sections_json};
+// The Nunba React dist is a no-basename BrowserRouter (history) SPA served at
+// the ORIGIN ROOT of this shell (see _create_flask_app: /static passthrough +
+// the SPA history fallback). The manifest routes already carry a leading slash
+// ('/social', '/agents', ...), so NUNBA_BASE must be '' (empty): the iframe src
+// becomes a real root-relative HISTORY path the router matches. It must NOT be
+// '/' (that would make '/'+'/social' => '//social', a protocol-relative URL),
+// and must NOT be the old hash-fragment mount: a history router ignores the
+// '#' fragment, so the hashed src resolved to the SPA root => a blank panel.
+const NUNBA_BASE = '';
+
+// De-monochrome: every manifest/system entry carries a resolved per-app `color`
+// (stamped server-side from shell_manifest.with_icon_colors — the single source
+// of truth). miStyle() turns it into an inline glyph tint so the start menu,
+// dock, desktop icons and titlebars all colour-agree instead of one accent
+// wash. Exposed on window so the /shell/static modules (hartDesktop.js) reuse
+// the SAME resolver — no parallel palette.
+function miStyle(def) {{ return (def && def.color) ? ' style="color:'+def.color+'"' : ''; }}
+window.miStyle = miStyle;
 
 // ═══ Performance Config (auto-detected from theme) ═══
 const PERF = {{
@@ -1740,6 +3231,14 @@ const PERF = {{
   destroyMinimized: {'true' if perf.get('destroy_minimized_iframes') else 'false'},
   lazyIframes: {'true' if perf.get('lazy_load_iframes') else 'false'},
 }};
+// Mirror PERF onto window so the /shell/static effects module (hartEffects.js)
+// can read the SAME software-render gate (potato) without depending on the
+// inline-script const being reachable across script tags. Single source: PERF.
+window.HART_PERF = PERF;
+
+// Which product the user installed (HART OS vs the Nunba desktop companion) — the
+// right-click "Ask <Product>" menu (hartAskMenu.js) brands to it.
+window.HART_PRODUCT = '{hart_product}';
 
 // ═══ State ═══
 let panels = {{}};
@@ -1889,6 +3388,52 @@ function dsStatusRow(icon, label, value, color, opts) {{
     '<span class="ds-list-item-trailing" style="color:'+color+'">'+value+'</span>'+
     (trailing?trailing:'')+
     '</div>';
+}}
+
+// ── Netflix image-card ROW (design system) ──
+// d4: content listings (installed-apps registry, drives, agent lists) render as the
+// SAME cinematic rows the home paints - NOT a second card system. The vocabulary
+// (.hh-row/.hh-cards/.hh-card + gradient art + scrim) is the shared design language
+// from hartHome.css (loaded on this same origin); the brand gradient + glyph come
+// from window.HartBrandArt - the ONE palette shared with the desktop icons and the
+// home cards, so there is no parallel palette/renderer. Item fields:
+//   {{title, meta, icon, badge, accent, format, progress, onclick, action, attrs}}
+// onclick = an inline JS expression string (the panel idiom); action = trailing HTML
+// (e.g. an Uninstall button) that MUST stopPropagation itself; attrs = extra raw
+// attributes (e.g. data-mount) so paths never need inline-string quoting.
+function hhCardRow(title, items, opts) {{
+  opts = opts || {{}};
+  var BA = window.HartBrandArt;
+  var spec = (BA && BA.spectrum) || ['teal'];
+  function e(s) {{ return (BA && BA.esc) ? BA.esc(s) : String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }}
+  var list = (items && items.length) ? items : [{{empty:1, title:(opts.emptyText||'Nothing here yet')}}];
+  var cards = list.map(function(it, i) {{
+    if (it.empty) return '<div class="hh-card hh-card-empty">'+e(it.title||'Nothing here yet')+'</div>';
+    var accent = it.accent || spec[i % spec.length];
+    var grad = BA ? BA.gradient(BA.spectrumHex[accent], i) : '';
+    var fmt = it.format ? (' hh-'+e(it.format)) : '';
+    var attrs = it.onclick
+      ? (' role="button" tabindex="0" onclick="'+String(it.onclick).replace(/"/g,'&quot;')+'"')
+      : ' style="cursor:default"';
+    if (it.attrs) attrs += ' '+it.attrs;
+    var glyph = it.icon ? ('<div class="hh-card-ic">'+(BA?BA.glyphHTML(it.icon):e(it.icon))+'</div>') : '';
+    var corner = it.action
+      ? ('<div style="position:absolute;top:10px;right:10px;z-index:3">'+it.action+'</div>')
+      : (it.badge ? ('<div class="hh-card-badge">'+e(it.badge)+'</div>') : '');
+    var meta = it.meta ? ('<div class="hh-card-meta">'+e(it.meta)+'</div>') : '';
+    var prog = (typeof it.progress==='number' && it.progress>=0)
+      ? ('<div class="hh-card-prog" style="width:'+(Math.max(0,Math.min(1,it.progress))*100)+'%"></div>') : '';
+    return '<div class="hh-card'+fmt+'"'+attrs+' aria-label="'+e(it.title||'card')+'">'+
+      '<div class="hh-card-art" style="background:'+grad+'"></div>'+
+      '<div class="hh-card-scrim"></div>'+glyph+corner+
+      '<div class="hh-card-body"><div class="hh-card-title">'+e(it.title||'')+'</div>'+meta+'</div>'+
+      prog+'</div>';
+  }}).join('');
+  var accentCls = 'hh-accent-'+((BA && BA.spectrum) ? BA.spectrum[0] : 'teal');
+  var head = title ? ('<div class="hh-row-head"><div class="hh-row-title">'+e(title)+'</div>'+
+    (opts.note ? ('<div class="hh-row-note">'+e(opts.note)+'</div>') : '')+'</div>') : '';
+  return '<div class="hh-row '+accentCls+'" style="padding:'+(opts.pad||'2px 0 6px')+'">'+
+    head+'<div class="hh-cards" style="padding:6px 12px 8px 0">'+cards+'</div></div>';
 }}
 
 // ── Metric Bar (design system) ──
@@ -2045,15 +3590,24 @@ function showToast(title, message, severity) {{
   const color = colors[severity]||colors.info;
   const toast = document.createElement('div');
   toast.className = PERF.potato ? 'toast glass' : 'ds-toast';
+  // XSS-safe: build the fixed structure via innerHTML (NO untrusted interpolation),
+  // then set the caller-supplied title/message (and the icon ligature) via
+  // textContent so a hostile notification body can never inject markup.
   if(PERF.potato) {{
     toast.style.borderLeft = '3px solid '+color;
-    toast.innerHTML = '<div style="font-weight:600;margin-bottom:2px;color:'+color+'">'+title+'</div>'+
-      '<div style="color:var(--hart-text)">'+message+'</div>';
+    toast.innerHTML = '<div class="ds-tt" style="font-weight:600;margin-bottom:2px"></div>'+
+      '<div class="ds-tm" style="color:var(--hart-text)"></div>';
+    var _tt = toast.querySelector('.ds-tt'); _tt.style.color = color; _tt.textContent = title;
+    toast.querySelector('.ds-tm').textContent = message;
   }} else {{
-    toast.innerHTML = '<span class="mi material-icons-round ds-toast-icon" style="color:'+color+'">'+icon+'</span>'+
-      '<div class="ds-toast-content"><div class="ds-toast-title">'+title+'</div>'+
-      '<div class="ds-toast-message">'+message+'</div></div>'+
-      '<div class="ds-toast-progress" style="background:'+color+'"></div>';
+    toast.innerHTML = '<span class="mi material-icons-round ds-toast-icon"></span>'+
+      '<div class="ds-toast-content"><div class="ds-toast-title"></div>'+
+      '<div class="ds-toast-message"></div></div>'+
+      '<div class="ds-toast-progress"></div>';
+    var _ic = toast.querySelector('.ds-toast-icon'); _ic.style.color = color; _ic.textContent = icon;
+    toast.querySelector('.ds-toast-title').textContent = title;
+    toast.querySelector('.ds-toast-message').textContent = message;
+    toast.querySelector('.ds-toast-progress').style.background = color;
   }}
   toast.onclick = function(){{
     if(!PERF.potato) toast.classList.add('ds-toast-exit');
@@ -2073,12 +3627,15 @@ function updateTaskbar() {{
   const bar = document.getElementById('taskbar');
   if(!bar) return;
   bar.innerHTML = Object.entries(panels).map(function([id,p]) {{
-    const info = MANIFEST[id] || SYSTEM_PANELS[id] || {{}};
+    // Instance ids ('x#2') have no direct manifest entry — fall back to the base
+    // panel definition for the icon, and prefer the stored per-instance title.
+    const base = (p&&p.base) || (''+id).split('#')[0];
+    const info = MANIFEST[id] || SYSTEM_PANELS[id] || MANIFEST[base] || SYSTEM_PANELS[base] || {{}};
     const active = id===focusedPanel ? 'active' : '';
     const icon = info.icon || 'web_asset';
-    const title = info.title || id;
+    const title = (p&&p.title) || info.title || id;
     return '<div class="taskbar-chip glass '+active+'" data-panel-id="'+id+'" onclick="taskbarClick(this.dataset.panelId)" title="'+title+'">' +
-      '<span class="mi material-icons-round">'+icon+'</span>' +
+      '<span class="mi material-icons-round"'+miStyle(info)+'>'+icon+'</span>' +
       '<span class="chip-label">'+title+'</span></div>';
   }}).join('');
 }}
@@ -2101,6 +3658,10 @@ function snapPanel(id, side) {{
   p.max=false;
   setTimeout(function(){{p.el.style.transition='';}},250);
 }}
+// Expose the CANONICAL snap so the /shell/static effects module (hartEffects.js
+// snap-zones) reuses it — no parallel snap geometry. Same pattern as miStyle /
+// hartSwitchWorkspace.
+window.snapPanel = snapPanel;
 
 // ═══ Clock ═══
 function tickClock() {{
@@ -2218,6 +3779,21 @@ function _iconBg(icon){{
 function buildStartMenu() {{
   const scroll = document.getElementById('start-scroll');
   let html = '';
+  // Pinned (curated, top) — resolves each id from the live manifest and opens
+  // via openPanel (single-instance reuse), same as every other start item.
+  const pins = (PINNED||[]).map(function(id){{
+    return [id, MANIFEST[id] || SYSTEM_PANELS[id]];
+  }}).filter(function(pair){{ return !!pair[1]; }});
+  if(pins.length) {{
+    html += '<div class="start-group" data-group="Pinned"><div class="start-group-label">Pinned</div><div class="start-grid">';
+    pins.forEach(function(pair){{
+      const id = pair[0], p = pair[1];
+      html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(this.dataset.id)">';
+      html += '<span class="mi material-icons-round"'+miStyle(p)+'>'+(p.icon||'apps')+'</span>';
+      html += '<span class="label">'+p.title+'</span></div>';
+    }});
+    html += '</div></div>';
+  }}
   GROUPS.forEach(group => {{
     const items = Object.entries(MANIFEST).filter(([_,v])=>v.group===group);
     if(!items.length) return;
@@ -2225,7 +3801,7 @@ function buildStartMenu() {{
     items.forEach(([id,p])=>{{
       const ic = p.icon||'apps';
       html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(this.dataset.id)">';
-      html += '<span class="si-icon" style="background:'+_iconBg(ic)+'"><span class="mi material-icons-round">'+ic+'</span></span>';
+      html += '<span class="mi material-icons-round"'+miStyle(p)+'>'+(p.icon||'apps')+'</span>';
       html += '<span class="label">'+p.title+'</span></div>';
     }});
     html += '</div></div>';
@@ -2237,7 +3813,7 @@ function buildStartMenu() {{
     sysItems.forEach(([id,p])=>{{
       const ic = p.icon||'settings';
       html += '<div class="start-item" data-id="'+id+'" data-title="'+p.title+'" onclick="openPanel(this.dataset.id)">';
-      html += '<span class="si-icon" style="background:'+_iconBg(ic)+'"><span class="mi material-icons-round">'+ic+'</span></span>';
+      html += '<span class="mi material-icons-round"'+miStyle(p)+'>'+(p.icon||'settings')+'</span>';
       html += '<span class="label">'+p.title+'</span></div>';
     }});
     html += '</div></div>';
@@ -2272,9 +3848,20 @@ function startSearchEnter() {{
 // ═══ Panel Manager ═══
 function openPanel(id, opts) {{
   opts = opts || {{}};
-  // If panel already open, bring to front
+  // Unified navigation (#169): the panels registry is single-instance by
+  // DEFAULT — opening an already-open panel just brings it to front (reuse).
+  // An explicit openPanel(id,{{newInstance:true}}) opts INTO a second instance:
+  // hartNav mints a distinct instance id (base#N) so both coexist, while the
+  // panel definition is still looked up by the BASE id. hartNav also owns the
+  // shell-wide back/forward history keyed by panel id (static/hartNav.js).
+  const baseId = (''+id).split('#')[0];
+  if(opts.newInstance) {{
+    id = (window.HartNav && HartNav.nextInstance) ? HartNav.nextInstance(baseId) : baseId+'#'+Date.now();
+  }}
+  // If panel already open, bring to front (the default reuse policy).
   if(panels[id]) {{
     bringToFront(id);
+    if(window.HartNav) HartNav.onOpen(id, (panels[id]&&panels[id].title)||baseId);
     return;
   }}
   // Potato mode: limit open panels to save memory
@@ -2286,9 +3873,20 @@ function openPanel(id, opts) {{
       if(oldest) closePanel(oldest);
     }}
   }}
-  const def = MANIFEST[id] || SYSTEM_PANELS[id] || {{}};
+  // The panel DEFINITION is keyed by the BASE id (so a second instance 'x#2'
+  // renders the same 'x' panel); the DOM element ids below use the instance id.
+  const def = MANIFEST[baseId] || SYSTEM_PANELS[baseId] || {{}};
+  // Installed native app (from the app-installer): no in-shell panel to draw —
+  // hand off to the EXISTING launch path (gtk-launch via /api/shell/launch).
+  // These entries carry an `exec` and no `route`; everything else falls through
+  // to the normal panel render below.
+  if(def.exec && !def.route && !SYSTEM_PANELS[baseId]) {{
+    launchApp(def.exec);
+    if(startOpen) toggleStartMenu();
+    return;
+  }}
   const sz = def.default_size || [700,500];
-  const isSystem = !!SYSTEM_PANELS[id];
+  const isSystem = !!SYSTEM_PANELS[baseId];
 
   // Position: cascade from center
   const cx = window.innerWidth/2, cy = window.innerHeight/2;
@@ -2302,12 +3900,12 @@ function openPanel(id, opts) {{
   panel.dataset.panelId = id;
   panel.style.cssText = 'left:'+x+'px;top:'+y+'px;width:'+sz[0]+'px;height:'+sz[1]+'px;z-index:'+(++panelZ);
 
-  const title = opts.title || def.title || id;
+  const title = opts.title || def.title || baseId;
   const icon = def.icon || 'web_asset';
 
   panel.innerHTML = '<div class="panel-titlebar" onmousedown="startDrag(event,_pid(this))"'+
     ' ondblclick="toggleMax(_pid(this))">'+
-    '<span class="mi material-icons-round">'+icon+'</span>'+
+    '<span class="mi material-icons-round"'+miStyle(def)+'>'+icon+'</span>'+
     '<span class="title">'+title+'</span>'+
     '<div class="ctrl">'+
     '<span title="Minimize" onclick="minimizePanel(_pid(this))"><span class="mi material-icons-round" style="font-size:14px">minimize</span></span>'+
@@ -2323,23 +3921,36 @@ function openPanel(id, opts) {{
   // Load content (potato: defer iframes until visible)
   const body = document.getElementById('panel-body-'+id);
   if(isSystem) {{
-    loadSystemPanel(id, body);
+    // System loader dispatches on the panel TYPE (base id); the body element it
+    // fills is the instance's own (passed directly), so instances stay distinct.
+    loadSystemPanel(baseId, body);
   }} else if(def.route) {{
     if(PERF.lazyIframes) {{
-      // Potato: placeholder until focused, then load iframe
-      body.innerHTML = '<div class="native-content" style="display:flex;align-items:center;justify-content:center;height:100%"><span class="mi material-icons-round" style="font-size:48px;color:var(--hart-muted);cursor:pointer" data-route="'+def.route+'" onclick="loadIframe(_pid(this),this.dataset.route)">touch_app</span></div>';
+      // Potato: tap-to-load placeholder until focused (keeps memory low), but it
+      // is itself a content container — never a blank body.
+      body.innerHTML = '<div class="panel-route-stage native-content" style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;height:100%;text-align:center">'+
+        '<span class="mi material-icons-round" style="font-size:48px;color:var(--hart-accent);cursor:pointer" data-route="'+def.route+'" onclick="loadIframe(_pid(this),this.dataset.route)">touch_app</span>'+
+        '<div class="ds-body-sm ds-text-muted">Tap to load '+(def.title||id)+'</div></div>';
       body.dataset.route = def.route;
       body.dataset.loaded = '0';
     }} else {{
-      body.innerHTML = '<iframe src="'+NUNBA_BASE+def.route+'" loading="lazy"></iframe>';
+      renderRoutePanel(id, body, def.route, def.title||id);
     }}
   }} else {{
     body.innerHTML = '<div class="native-content">Panel: '+id+'</div>';
   }}
 
-  panels[id] = {{el:panel, x, y, w:sz[0], h:sz[1], max:false, min:false}};
+  panels[id] = {{el:panel, x, y, w:sz[0], h:sz[1], max:false, min:false, title:title, base:baseId}};
+  // Open MAXIMIZED by default — the glass shell is a full desktop, so panels
+  // should fill the workspace (Win/macOS "open large") rather than a tiny
+  // cascade window. Floating bubbles (assistant) keep their compact size.
+  if(!def.floating && !opts.noMax) applyMax(id);
   bringToFront(id);
   updateTaskbar();
+  // #169: record this location on the shell-wide nav history (panel id == the
+  // location). hartNav loads deferred; openPanel is only called post-load, so
+  // window.HartNav is defined by the time a user opens anything.
+  if(window.HartNav) HartNav.onOpen(id, title);
   if(startOpen) toggleStartMenu();
 }}
 
@@ -2353,6 +3964,9 @@ function closePanel(id) {{
     p.el.remove(); delete panels[id]; updateTaskbar();
   }}
   if(focusedPanel===id) focusedPanel=null;
+  // #169: drop the closed panel from nav history so back/forward never target a
+  // window that no longer exists.
+  if(window.HartNav) HartNav.onClose(id);
 }}
 
 function minimizePanel(id) {{
@@ -2378,29 +3992,106 @@ function minimizePanel(id) {{
   }}
 }}
 
-// Lazy iframe loader (potato mode)
+// Lazy iframe loader (potato mode) — routes through the canonical staged loader
+// so even the deferred path gets a skeleton + graceful reconnecting fallback.
 function loadIframe(id, route) {{
   const body = document.getElementById('panel-body-'+id);
   if(body && body.dataset.loaded !== '1') {{
-    body.innerHTML = '<iframe src="'+NUNBA_BASE+route+'" loading="lazy"></iframe>';
+    const def = MANIFEST[id] || SYSTEM_PANELS[id] || {{}};
+    renderRoutePanel(id, body, route, def.title||id);
     body.dataset.loaded = '1';
   }}
 }}
 
+// ═══ Canonical route-panel loader ═══
+// Every iframe panel (agents/recipes/communities/…) ALWAYS gets a content
+// container: a loading skeleton first, then the SPA iframe once it loads. If the
+// backend never answers (SPA down / tier-dropped / offline) the iframe stays
+// blank — so we watch it and swap in a graceful "reconnecting" empty state with a
+// retry, never leaving the panel body blank.
+function renderRoutePanel(id, body, route, title) {{
+  if(!body) return;
+  // 1) Always-visible content container: skeleton + (hidden) iframe stacked.
+  body.innerHTML =
+    '<div class="route-skeleton native-content" style="position:absolute;inset:0;z-index:2;background:transparent">'+
+      dsSkeleton('list',5)+
+    '</div>'+
+    '<iframe class="route-frame" style="opacity:0;transition:opacity .25s" '+
+      'src="'+NUNBA_BASE+route+'" loading="lazy"></iframe>';
+  body.dataset.route = route;
+  const frame = body.querySelector('.route-frame');
+  const skel = body.querySelector('.route-skeleton');
+  if(!frame) return;
+  let settled = false;
+  function reveal() {{
+    if(settled) return; settled = true;
+    frame.style.opacity = '1';
+    if(skel) skel.remove();
+  }}
+  function reconnecting() {{
+    if(settled) return; settled = true;
+    if(frame) frame.remove();
+    body.innerHTML =
+      '<div class="route-empty native-content" style="display:flex;flex-direction:column;'+
+        'align-items:center;justify-content:center;gap:12px;height:100%;text-align:center;padding:24px">'+
+        '<span class="mi material-icons-round" style="font-size:46px;color:var(--hart-muted)">cloud_off</span>'+
+        '<div class="ds-title-sm">Reconnecting&hellip;</div>'+
+        '<div class="ds-body-sm ds-text-muted" style="max-width:280px">'+
+          (title||'This view')+" couldn't load yet. It will appear once the connection is restored."+
+        '</div>'+
+        '<button class="ds-btn ds-btn-tonal ds-btn-sm" type="button" '+
+          'onclick="retryRoutePanel(\\''+id+'\\')">Retry</button>'+
+      '</div>';
+  }}
+  // iframe onload fires for both real content AND error pages (e.g. a 404 when the
+  // Nunba SPA bundle isn't served — the W2/#116 gap). The frame is opacity:0 until
+  // reveal(), so VERIFY the route actually serves 2xx before revealing; a non-2xx
+  // routes to the graceful empty state instead of unveiling a raw "Not Found" page
+  // (the "url not working" the steward saw on real HW). NUNBA_BASE is same-origin
+  // (:6800), so this status check costs no CORS round-trip. A never-loading frame
+  // still falls to the 8s timeout → reconnecting.
+  frame.addEventListener('load', function(){{
+    fetch(NUNBA_BASE+route, {{method:'GET', cache:'no-store'}})
+      .then(function(r){{ if(r.ok) reveal(); else reconnecting(); }})
+      .catch(function(){{ reveal(); }});
+  }});
+  frame.addEventListener('error', reconnecting);
+  setTimeout(function(){{ if(!settled) reconnecting(); }}, 8000);
+}}
+
+// Retry handler for the reconnecting empty state — re-stage the same route.
+function retryRoutePanel(id) {{
+  const body = document.getElementById('panel-body-'+id);
+  if(!body) return;
+  const route = body.dataset.route;
+  const def = MANIFEST[id] || SYSTEM_PANELS[id] || {{}};
+  if(route) renderRoutePanel(id, body, route, def.title||id);
+}}
+
+// Canonical maximize: fill the workspace (below the top bar, above the taskbar).
+function applyMax(id) {{
+  const p = panels[id];
+  if(!p || p.max) return;
+  p.el.style.left = '0'; p.el.style.top = '0';
+  p.el.style.width = '100vw'; p.el.style.height = 'calc(100vh - var(--hart-topbar-height) - 44px)';
+  p.el.style.borderRadius = '0';
+  p.el.classList.add('maximized');
+  p.max = true;
+}}
+// Canonical restore: back to the remembered float geometry.
+function applyRestore(id) {{
+  const p = panels[id];
+  if(!p || !p.max) return;
+  p.el.style.left = p.x+'px'; p.el.style.top = p.y+'px';
+  p.el.style.width = p.w+'px'; p.el.style.height = p.h+'px';
+  p.el.style.borderRadius = '';
+  p.el.classList.remove('maximized');
+  p.max = false;
+}}
 function toggleMax(id) {{
   const p = panels[id];
   if(!p) return;
-  if(p.max) {{
-    p.el.style.left = p.x+'px'; p.el.style.top = p.y+'px';
-    p.el.style.width = p.w+'px'; p.el.style.height = p.h+'px';
-    p.el.style.borderRadius = '';
-    p.max = false;
-  }} else {{
-    p.el.style.left = '0'; p.el.style.top = '0';
-    p.el.style.width = '100vw'; p.el.style.height = 'calc(100vh - var(--hart-topbar-height) - 44px)';
-    p.el.style.borderRadius = '0';
-    p.max = true;
-  }}
+  if(p.max) applyRestore(id); else applyMax(id);
 }}
 
 function bringToFront(id) {{
@@ -2434,43 +4125,89 @@ function taskbarClick(id) {{
 }}
 
 // ═══ Drag & Resize ═══
+// rAF-batched + GPU transform (matches hartDesktop.js icon + touch-titlebar
+// drag). The old handler wrote p.el.style.left/top on EVERY mousemove (layout-
+// inducing) AND read window.innerWidth/innerHeight right after dirtying layout
+// (a forced reflow) 60-125x/sec — on a software-composited box cairo re-raster-
+// ised the whole glass per event and pinned the UI thread (the drag freeze).
+// Now a MOVE only sets transform:translate (no layout) and commits left/top once
+// on drop; innerWidth/innerHeight are cached at dragstart so the commit never
+// reads layout it just wrote. Resize is rAF-coalesced so width/height change at
+// most once per frame instead of per event.
 let dragState = null;
 function startDrag(e, id) {{
   if(e.button!==0) return;
   const p = panels[id];
   if(!p||p.max) return;
-  dragState = {{id, mode:'move', sx:e.clientX, sy:e.clientY, ox:p.el.offsetLeft, oy:p.el.offsetTop}};
+  dragState = {{id, mode:'move', sx:e.clientX, sy:e.clientY,
+    ox:p.el.offsetLeft, oy:p.el.offsetTop,
+    vw:window.innerWidth, vh:window.innerHeight, dx:0, dy:0, raf:0}};
+  p.el.style.willChange = 'transform';
+  // Notify the effects module (snap-zones) of the canonical drag start so it
+  // reuses THIS drag lifecycle instead of forking its own mousedown detection.
+  // No-op unless hartEffects.js is loaded + effects are enabled (not potato).
+  try{{ window.dispatchEvent(new CustomEvent('hart:dragstart',{{detail:{{id:id}}}})); }}catch(_e){{}}
   e.preventDefault();
 }}
 function startResize(e, id) {{
   if(e.button!==0) return;
   const p = panels[id];
   if(!p) return;
-  dragState = {{id, mode:'resize', sx:e.clientX, sy:e.clientY, ow:p.el.offsetWidth, oh:p.el.offsetHeight}};
+  dragState = {{id, mode:'resize', sx:e.clientX, sy:e.clientY,
+    ow:p.el.offsetWidth, oh:p.el.offsetHeight, dx:0, dy:0, raf:0}};
   e.preventDefault();
 }}
-document.addEventListener('mousemove', e=>{{
-  if(!dragState) return;
-  const dx = e.clientX - dragState.sx, dy = e.clientY - dragState.sy;
-  const p = panels[dragState.id];
+function _dragFrame() {{
+  const d = dragState;
+  if(!d) return;
+  d.raf = 0;
+  const p = panels[d.id];
   if(!p) return;
-  if(dragState.mode==='move') {{
-    // Clamp the titlebar on-screen — it could be dragged under the top bar,
-    // below the taskbar, or past a side until unreachable (window lost
-    // unrecoverably). Keep >=80px on each axis.
-    const KEEP=80, TOP=40, TASK=44;
-    let nx = dragState.ox+dx, ny = dragState.oy+dy;
-    nx = Math.min(Math.max(nx, KEEP - p.el.offsetWidth), window.innerWidth - KEEP);
-    ny = Math.min(Math.max(ny, TOP), window.innerHeight - TASK - 28);
-    p.el.style.left = nx+'px'; p.el.style.top = ny+'px';
-    p.x = nx; p.y = ny;
+  if(d.mode==='move') {{
+    // GPU-composited move — translate only, no layout. left/top commit on drop.
+    p.el.style.transform = 'translate('+d.dx+'px,'+d.dy+'px)';
   }} else {{
-    const nw = Math.max(320, dragState.ow+dx), nh = Math.max(240, dragState.oh+dy);
+    const nw = Math.max(320, d.ow+d.dx), nh = Math.max(240, d.oh+d.dy);
     p.el.style.width = nw+'px'; p.el.style.height = nh+'px';
     p.w = nw; p.h = nh;
   }}
+}}
+document.addEventListener('mousemove', e=>{{
+  const d = dragState;
+  if(!d) return;
+  d.dx = e.clientX - d.sx; d.dy = e.clientY - d.sy;
+  if(d.raf) return;                                  // already scheduled this frame
+  d.raf = requestAnimationFrame(_dragFrame);
 }});
-document.addEventListener('mouseup', ()=>{{ dragState=null; }});
+document.addEventListener('mouseup', e=>{{
+  const d = dragState;
+  dragState = null;
+  if(!d) return;
+  if(d.raf) {{ cancelAnimationFrame(d.raf); d.raf = 0; }}
+  const p = panels[d.id];
+  if(p) {{
+    p.el.style.willChange = '';
+    if(d.mode==='move') {{
+      // Commit the GPU transform back to left/top, clamped on-screen using the
+      // innerWidth/innerHeight cached at dragstart (no forced reflow). Keep the
+      // titlebar >=80px reachable so a window can't be lost under the bars.
+      p.el.style.transform = '';
+      const KEEP=80, TOP=40, TASK=44;
+      let nx = d.ox+d.dx, ny = d.oy+d.dy;
+      nx = Math.min(Math.max(nx, KEEP - p.el.offsetWidth), d.vw - KEEP);
+      ny = Math.min(Math.max(ny, TOP), d.vh - TASK - 28);
+      p.el.style.left = nx+'px'; p.el.style.top = ny+'px';
+      p.x = nx; p.y = ny;
+    }}
+  }}
+  // Hand the effects module the final pointer position + the panel id so a
+  // snap-zone it highlighted during the drag can commit via the canonical
+  // snapPanel. Uses the id captured before dragState was cleared.
+  if(d.mode==='move'){{
+    try{{ window.dispatchEvent(new CustomEvent('hart:dragend',
+      {{detail:{{id:d.id, x:e.clientX, y:e.clientY}}}})); }}catch(_e){{}}
+  }}
+}});
 
 // ═══ System Panels (design system) ═══
 function loadSystemPanel(id, body) {{
@@ -2479,7 +4216,8 @@ function loadSystemPanel(id, body) {{
   body.innerHTML = '<div class="native-content" id="sys-'+id+'">'+dsSkeleton('panel',3)+'</div>';
   const container = document.getElementById('sys-'+id);
 
-  if(id==='hw_monitor') loadHardwareMonitor(container, apis);
+  if(id==='settings') loadSettingsPanel(container);
+  else if(id==='hw_monitor') loadHardwareMonitor(container, apis);
   else if(id==='security') loadSecurityCenter(container, apis);
   else if(id==='network') loadNetworkPanel(container, apis);
   else if(id==='event_log') loadEventLog(container, apis);
@@ -2488,6 +4226,7 @@ function loadSystemPanel(id, body) {{
   else if(id==='bluetooth') loadBluetoothPanel(container);
   else if(id==='power') loadPowerPanel(container);
   else if(id==='display') loadDisplayPanel(container);
+  else if(id==='flash') {{ if(window.loadFlashWizard) window.loadFlashWizard(container); }}
   else if(id==='remote_desktop') loadRemoteDesktopPanel(container, apis);
   else if(id==='hart_identity') loadHartIdentityPanel(container, apis);
   else if(id==='self_build') loadSelfBuildPanel(container, apis);
@@ -2498,6 +4237,7 @@ function loadSystemPanel(id, body) {{
   else if(id==='print_manager') loadPrintManagerPanel(container);
   else if(id==='media_library') loadMediaLibraryPanel(container);
   else if(id==='file_manager') loadFileManagerPanel(container);
+  else if(id==='my_computer') loadMyComputerPanel(container);
   else if(id==='terminal') loadTerminalPanel(container);
   else if(id==='user_accounts') loadUserAccountsPanel(container);
   else if(id==='notification_center') loadNotificationCenterPanel(container);
@@ -2530,7 +4270,60 @@ function loadSystemPanel(id, body) {{
   else if(id==='scanner') loadScannerPanel(container);
   else if(id==='weather_widget') loadWeatherPanel(container);
   else if(id==='keyboard_shortcuts') loadKeyboardShortcutsPanel(container);
+  else if(id==='credits') loadCreditsPanel(container);
   else container.innerHTML = '<div class="ds-body-md ds-text-muted">Panel: '+id+'</div>';
+}}
+
+// ═══ Settings (aggregator) ═══
+// NOT a new settings app: a categorized INDEX whose every tile OPENS AN EXISTING
+// panel via openPanel (single-instance reuse). SETTINGS_SECTIONS is composition
+// only (section -> existing panel ids, from shell_manifest); each id's title /
+// icon / colour is resolved here from the live MANIFEST/SYSTEM_PANELS, so no
+// panel definition is duplicated. A search box filters the tiles in place, the
+// same data-title convention the start menu uses.
+function loadSettingsPanel(el) {{
+  const sections = SETTINGS_SECTIONS || [];
+  let html = '<div class="ds-panel-grid ds-fade-in settings-root">'+
+    '<div class="ds-panel-title">Settings</div>'+
+    '<input class="start-search settings-search" id="settings-search" placeholder="Search settings..." '+
+      'oninput="filterSettings(this.value)" aria-label="Search settings">';
+  sections.forEach(function(sec){{
+    const ids = (sec.ids||[]).filter(function(id){{ return !!(MANIFEST[id]||SYSTEM_PANELS[id]); }});
+    if(!ids.length) return;
+    html += '<div class="settings-section" data-section="'+sec.title+'">'+
+      '<div class="ds-section-label">'+sec.title+'</div><div class="start-grid">';
+    ids.forEach(function(id){{
+      const p = MANIFEST[id] || SYSTEM_PANELS[id] || {{}};
+      const t = p.title || id;
+      html += '<div class="start-item settings-tile" data-id="'+id+'" data-title="'+t+'" '+
+        'onclick="openPanel(this.dataset.id)">';
+      html += '<span class="mi material-icons-round"'+miStyle(p)+'>'+(p.icon||'settings')+'</span>';
+      html += '<span class="label">'+t+'</span></div>';
+    }});
+    html += '</div></div>';
+  }});
+  if(!sections.length) {{
+    html += '<div class="ds-body-md ds-text-muted">No settings available.</div>';
+  }}
+  html += '</div>';
+  el.innerHTML = html;
+}}
+
+// Filter Settings tiles in place (hides empty sections) — mirrors filterStart.
+function filterSettings(q) {{
+  const root = document.querySelector('.settings-root');
+  if(!root) return;
+  const lq = (q||'').toLowerCase();
+  root.querySelectorAll('.settings-section').forEach(function(sec){{
+    let anyVisible = false;
+    sec.querySelectorAll('.settings-tile').forEach(function(el){{
+      const title = (el.dataset.title||'').toLowerCase();
+      const show = title.includes(lq);
+      el.style.display = show ? '' : 'none';
+      if(show) anyVisible = true;
+    }});
+    sec.style.display = anyVisible ? '' : 'none';
+  }});
 }}
 
 // Backward compat wrappers (used in old code references)
@@ -2947,52 +4740,66 @@ function loadMediaLibraryPanel(el) {{
 
 // ═══ File Manager ═══
 function loadFileManagerPanel(el) {{
-  fetch(SHELL+'/api/shell/files/browse?path=~',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
-    const items = data.items||[];
-    const cwd = data.path||'~';
-    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Files</span>'+
-      '<span class="ds-label-sm ds-text-muted">'+cwd+'</span></div><div class="ds-stagger">';
-    items.slice(0,30).forEach(f=>{{
-      const icon = f.is_dir?'folder':'description';
-      const size = f.is_dir?'':' &middot; '+(f.size_human||'');
-      html += '<div class="ds-list-item'+(f.is_dir?' ds-list-item-interactive':'')+'"'+
-        (f.is_dir?' data-path="'+f.path+'" onclick="browseDir(this.dataset.path);"':'')+'>'+
-        '<span class="mi material-icons-round ds-list-item-icon '+(f.is_dir?'ds-text-accent':'ds-text-muted')+'">'+icon+'</span>'+
-        '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+f.name+'</div>'+
-        '<div class="ds-list-item-secondary">'+(f.modified||'')+size+'</div></div></div>';
-    }});
-    html += '</div></div>';
-    el.innerHTML = html;
-  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">File browser unavailable</div>'; }});
+  // Delegates to the canonical File Explorer module (static/hartFiles.js),
+  // which wires to the SAME /api/shell/files/* backend. No parallel browser.
+  if (window.HartFiles && window.HartFiles.mount) {{ window.HartFiles.mount(el); return; }}
+  el.innerHTML = '<div class="ds-body-md ds-text-muted">File manager loading…</div>';
 }}
 function browseDir(path) {{
-  const el = document.getElementById('sys-file_manager');
-  if(!el) return;
-  el.innerHTML = dsSkeleton('panel',3);
-  fetch(SHELL+'/api/shell/files/browse?path='+encodeURIComponent(path),{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
-    const items = data.items||[];
-    const cwd = data.path||path;
-    const parent = data.parent||'';
-    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-header"><span class="ds-panel-title">Files</span>'+
-      '<span class="ds-label-sm ds-text-muted">'+cwd+'</span></div>';
-    if(parent) html += '<div class="ds-list-item ds-list-item-interactive" data-path="'+parent+'" onclick="browseDir(this.dataset.path)">'+
-      '<span class="mi material-icons-round ds-list-item-icon ds-text-muted">arrow_back</span>'+
-      '<div class="ds-list-item-content"><div class="ds-list-item-primary">..</div></div></div>';
-    html += '<div class="ds-stagger">';
-    items.slice(0,30).forEach(f=>{{
-      const icon = f.is_dir?'folder':'description';
-      html += '<div class="ds-list-item'+(f.is_dir?' ds-list-item-interactive':'')+'"'+
-        (f.is_dir?' data-path="'+f.path+'" onclick="browseDir(this.dataset.path);"':'')+'>'+
-        '<span class="mi material-icons-round ds-list-item-icon '+(f.is_dir?'ds-text-accent':'ds-text-muted')+'">'+icon+'</span>'+
-        '<div class="ds-list-item-content"><div class="ds-list-item-primary">'+f.name+'</div></div></div>';
-    }});
-    html += '</div></div>';
+  // Legacy entry kept for any stray caller — routes into the canonical module.
+  if (window.HartFiles && window.HartFiles.navigate) window.HartFiles.navigate(path);
+}}
+// Open the canonical File Explorer AT a given path (used by This PC drive rows).
+// Reuses the SAME file_manager panel + HartFiles singleton — no second browser.
+// If Files is already open, just navigate; otherwise open it and navigate once
+// its own initial (home) load has settled so the drive view is the final state.
+function openFilesAt(path) {{
+  const already = !!panels['file_manager'];
+  openPanel('file_manager');
+  const nav = function(){{ if (window.HartFiles && window.HartFiles.navigate) window.HartFiles.navigate(path); }};
+  if (already) {{ nav(); bringToFront('file_manager'); }}
+  else setTimeout(nav, 240);
+}}
+
+// ═══ This PC / My Computer ═══
+function loadMyComputerPanel(el) {{
+  // Drives + partitions launcher. Reuses the EXISTING /api/shell/storage read-op
+  // (psutil partitions) and hands browsing off to the canonical File Explorer via
+  // openFilesAt — there is no parallel file browser here, just a drive index.
+  fetch(SHELL+'/api/shell/storage',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
+    const parts = data.partitions||[];
+    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">This PC</div>';
+    if(parts.length===0) html += '<div class="ds-body-md ds-text-muted">No drives detected</div>';
+    else {{
+      // d4: drives render as a cinematic .hh-card row (real usage progress bar per
+      // card) that still hands browsing to the canonical File Explorer via
+      // openFilesAt — mount path travels safely on data-mount, no inline quoting.
+      const esc = s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+      const items = parts.map(p=>{{
+        const pct = p.percent||0;
+        const label = (p.device||p.mount||'Drive')+' '+(p.mount||'');
+        const sub = (p.fstype||'')+' \\u00b7 '+(p.free_gb||0).toFixed(1)+' GB free of '+(p.total_gb||0).toFixed(1)+' GB';
+        return {{ title:label, meta:sub, icon:(pct>=90?'sd_card_alert':'storage'),
+          progress:(pct/100), badge:Math.round(pct)+'%',
+          attrs:'data-mount="'+esc(p.mount||'')+'"', onclick:'openFilesAt(this.dataset.mount)' }};
+      }});
+      html += hhCardRow('Drives & Partitions', items, {{}});
+      html += '<div class="ds-body-sm ds-text-muted" style="margin-top:10px">'+
+        (data.used_gb||0).toFixed(1)+' GB used of '+(data.total_gb||0).toFixed(1)+' GB across all drives</div>';
+    }}
+    html += '</div>';
     el.innerHTML = html;
-  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Cannot browse</div>'; }});
+  }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">Drives unavailable</div>'; }});
 }}
 
 // ═══ Terminal ═══
 function loadTerminalPanel(el) {{
+  // #138 — IDEMPOTENT mount. A periodic panel re-render (or a re-open) must NOT
+  // wipe a terminal that is mid-command: re-rendering replaces #term-output, so
+  // the running fetch's output node detaches and the session scrollback is lost.
+  // If a terminal is already live in this body, leave it (and any in-flight exec)
+  // untouched instead of recreating it.
+  if(el.querySelector && el.querySelector('#term-output')) return;
   el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Terminal</div>'+
     '<div style="background:#0d0d0d;border-radius:8px;padding:12px;font-family:monospace;min-height:200px;position:relative">'+
     '<div id="term-output" style="color:#a0ffa0;white-space:pre-wrap;max-height:280px;overflow-y:auto;font-size:13px;line-height:1.5"></div>'+
@@ -3003,19 +4810,35 @@ function loadTerminalPanel(el) {{
     '</div></div></div>';
 }}
 function termExec() {{
-  const inp = document.getElementById('term-input');
-  const out = document.getElementById('term-output');
+  // #138 — never launch a second command while one is in flight. A re-entrant
+  // call (Enter mashed, or the panel re-rendering its input) would spin up a
+  // SECOND AbortController/fetch on the same budget and make the CPU-pegged
+  // software-rendered shell feel hung. One command at a time; the busy flag
+  // lives on window so it survives any panel re-render and is never recreated.
+  if(window._hartTermBusy) return;
+  var inp = document.getElementById('term-input');
+  var out = document.getElementById('term-output');
   if(!inp||!out) return;
-  const cmd = inp.value.trim();
+  var cmd = inp.value.trim();
   if(!cmd) return;
   inp.value = '';
   out.textContent += '$ '+cmd+'\\n';
+  window._hartTermBusy = true;
+  // Longer budget than the old 30s: a real command (build, large dir scan) on a
+  // CPU-pegged shell can exceed 30s, and a premature abort surfaced the cryptic
+  // "Fetch is aborted". 120s + a friendly timeout message on AbortError.
   fetch(SHELL+'/api/shell/terminal/exec',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{command:cmd}}),signal:_sig(30000)}}
-  ).then(r=>r.json()).then(d=>{{
+    body:JSON.stringify({{command:cmd}}),signal:_sig(120000)}}
+  ).then(function(r){{ return r.json(); }}).then(function(d){{
     out.textContent += (d.stdout||'')+(d.stderr?'\\n'+d.stderr:'')+'\\n';
     out.scrollTop = out.scrollHeight;
-  }}).catch(e=>{{ out.textContent += 'Error: '+e.message+'\\n'; }});
+    window._hartTermBusy = false;
+  }}).catch(function(e){{
+    var aborted = e && (e.name==='AbortError' || e.name==='TimeoutError');
+    out.textContent += (aborted ? 'Command timed out after 120s.' : ('Error: '+((e&&e.message)||e)))+'\\n';
+    out.scrollTop = out.scrollHeight;
+    window._hartTermBusy = false;
+  }});
 }}
 
 // ═══ User Accounts ═══
@@ -3304,7 +5127,21 @@ function loadWallpaperPanel(el) {{
   // Personalize = themes gallery + wallpaper chooser (Phase B). The heavy HTML
   // lives in hartPersonalize.js (window.hartRenderPersonalize) so this stays a
   // brace-escape-free delegate; it reuses applyPreset + the wallpaper routes.
-  if(window.hartRenderPersonalize) {{ window.hartRenderPersonalize(el); }}
+  if(window.hartRenderPersonalize) {{
+    // A runtime throw inside hartRenderPersonalize used to leave the panel blank
+    // (it "never opens"). Catch it, render a visible error card so the panel
+    // ALWAYS opens, and console.error it so FIX B forwards it to journald.
+    try {{ window.hartRenderPersonalize(el); }}
+    catch(e) {{
+      var _m = (e && e.message) ? e.message : String(e);
+      var _s = (e && e.stack) ? e.stack : '';
+      el.innerHTML = '<div class="ds-card" style="padding:16px">'
+        + '<div class="ds-title-sm" style="color:#ff6b6b">Personalize failed to render</div>'
+        + '<div class="ds-body-md" style="margin-top:6px">' + _esc(_m) + '</div>'
+        + '<pre style="white-space:pre-wrap;font-size:11px;opacity:.7;margin-top:8px;overflow:auto">' + _esc(_s) + '</pre></div>';
+      if(window.console && console.error) console.error('hartRenderPersonalize threw', e);
+    }}
+  }}
   else {{ el.innerHTML = '<div class="ds-body-md ds-text-muted">Personalize loading&hellip;</div>'; setTimeout(function(){{loadWallpaperPanel(el)}}, 400); }}
 }}
 
@@ -3418,6 +5255,13 @@ function loadAppStorePanel(el) {{
   if(window.hartRenderMarketplace) {{ window.hartRenderMarketplace(el); }}
   else {{ el.innerHTML = '<div class="ds-body-md ds-text-muted">Marketplace loading&hellip;</div>'; setTimeout(function(){{loadAppStorePanel(el)}}, 400); }}
 }}
+function loadCreditsPanel(el) {{
+  // About > Credits (#143): the third-party art licence ledger. Heavy DOM lives
+  // in hartCredits.js (window.hartRenderCredits) so this stays a brace-safe
+  // delegate; it reads /api/shell/credits (offline, bundled doc).
+  if(window.hartRenderCredits) {{ window.hartRenderCredits(el); }}
+  else {{ el.innerHTML = '<div class="ds-body-md ds-text-muted">Credits loading&hellip;</div>'; setTimeout(function(){{loadCreditsPanel(el)}}, 400); }}
+}}
 function appStoreSearch() {{
   const q = document.getElementById('appstore-search');
   const r = document.getElementById('appstore-results');
@@ -3435,19 +5279,37 @@ function appStoreSearch() {{
   }}).catch(()=>{{ r.innerHTML='<div class="ds-body-md ds-text-muted">Search failed</div>'; }});
 }}
 
-// ═══ App Permissions ═══
+// ═══ App Permissions & Uninstall (installed-apps registry) ═══
 function loadAppPermissionsPanel(el) {{
   fetch(SHELL+'/api/apps/installed',{{signal:_sig(5000)}}).then(r=>r.json()).then(data=>{{
     const apps = data.apps||[];
-    let html = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">App Permissions</div><div class="ds-stagger">';
-    if(apps.length===0) html += '<div class="ds-body-md ds-text-muted">No apps installed</div>';
-    else apps.slice(0,20).forEach(a=>{{
-      html += dsStatusRow('admin_panel_settings', a.name||a.id, a.platform||'system',
-        'var(--hart-muted)',{{sublabel:(a.permissions||[]).join(', ')||'No special permissions'}});
+    // data-* attributes carry id/platform/name safely (backslashes, quotes) to
+    // the shared uninstall flow (window.hartUninstallApp) — the EXACT same
+    // confirm + POST /api/apps/uninstall the desktop-icon right-click uses.
+    const esc = s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+    // d4: the install/registry/uninstall surface is a DESIGNED Netflix row, not a
+    // plain list — image-card per app + the same Uninstall action.
+    const items = apps.slice(0,40).map(a=>{{
+      const aid = esc(a.app_id||a.id||a.name||'');
+      const plat = esc(a.platform||'');
+      const nm = esc(a.name||a.app_id||a.id||'');
+      const perms = (a.permissions||[]).join(', ')||'No special permissions';
+      const rm = '<button class="ds-btn ds-btn-secondary ds-btn-sm" data-aid="'+aid+'" data-plat="'+plat+'"'+
+        ' data-nm="'+nm+'" onclick="event.stopPropagation();appRegistryUninstall(this)">Uninstall</button>';
+      return {{ title:(a.name||a.app_id||a.id), meta:(a.platform||'system')+' \\u00b7 '+perms,
+        icon:'apps', action:rm }};
     }});
-    html += '</div></div>';
-    el.innerHTML = html;
+    el.innerHTML = '<div class="ds-panel-grid ds-fade-in"><div class="ds-panel-title">Installed Apps</div>'+
+      hhCardRow('', items, {{emptyText:'No apps installed'}})+'</div>';
   }}).catch(()=>{{ el.innerHTML='<div class="ds-body-md ds-text-muted">App permissions unavailable</div>'; }});
+}}
+// Uninstall from the installed-apps registry: delegates to the SHARED flow
+// (hartDesktop.js window.hartUninstallApp) so there is one confirm + one endpoint
+// (/api/apps/uninstall -> app_installer.uninstall), then refreshes the list.
+function appRegistryUninstall(btn) {{
+  if(!btn) return;
+  const refresh = function(){{ const host=document.getElementById('sys-app_permissions'); if(host) loadAppPermissionsPanel(host); }};
+  if(window.hartUninstallApp) window.hartUninstallApp(btn.dataset.aid, btn.dataset.plat, btn.dataset.nm, refresh);
 }}
 
 // ═══ Battery Monitor ═══
@@ -3822,45 +5684,14 @@ function loadRemoteDesktopPanel(el, apis) {{
 }}
 
 // ═══ Agent Pill ═══
+// focusAgent() (Super+A) focuses the pill input; the pill's onkeydown opens the
+// assistant chat and copies the text into #ac-input, where acSend() is the SOLE
+// intent dispatcher (theme/open fast-paths + the default /api/agent/ask compose).
+// The old askAgent() was a DEAD parallel copy of that same M1 block - no handler
+// invoked it - so it was removed (acSend is the one live path).
 function focusAgent() {{
   document.getElementById('agent-input').focus();
   document.getElementById('agent-pill').classList.add('expanded');
-}}
-function askAgent() {{
-  const input = document.getElementById('agent-input');
-  const text = input.value.trim();
-  if(!text) return;
-  input.value = '';
-  const resp = document.getElementById('agent-resp');
-  resp.textContent = 'Thinking...';
-  resp.classList.add('visible');
-
-  // M1 — intent is the default surface (mirrors acSend).  Theme words and
-  // 'open <named app>' are demoted FALLBACK fast-paths; everything else routes
-  // through the brain decompose (/chat) and is COMPOSED onto the desktop via
-  // agent_ui_update (painted by the SSE overlay stream).
-  const lower = text.toLowerCase();
-  if(lower.includes('theme')||lower.includes('font')||lower.includes('bigger')||
-     lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
-    handleThemeCommand(lower, resp);
-    return;
-  }}
-  // Fallback fast-path: launch a NAMED app directly (no brain round-trip).
-  if(lower.startsWith('open ')) {{
-    const target = lower.replace('open ','').trim();
-    const match = Object.entries(MANIFEST).find(([k,v])=>
-      v.title.toLowerCase().includes(target)||k.includes(target));
-    if(match) {{ openPanel(match[0]); resp.textContent='Opened '+match[1].title; return; }}
-  }}
-
-  // Default: route the intent through the brain and COMPOSE the desktop.
-  fetch(SHELL+'/api/agent/ask',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{text}})}})
-    .then(r=>r.json()).then(data=>{{
-      const txt = data.response || data.error || 'No response';
-      resp.textContent = data.composed ? ('✦ ' + txt) : txt;
-      speakText(txt, 'chat_response');
-    }}).catch(()=>{{ resp.textContent='Could not reach agent'; }});
 }}
 
 // ═══ Floating Assistant Chat ═══
@@ -3974,6 +5805,11 @@ function acSend() {{
   // Show typing indicator
   const typing = acAddMsg('assistant', 'Thinking...');
   typing.classList.add('typing');
+  // Drive the voice orb's energetic animation for the whole PROCESSING window
+  // (not just TTS/mic) so it never looks frozen while the brain is thinking.
+  // Cleared on EVERY terminal path below (theme/open fast-paths, success, error)
+  // so it can't get stuck true. The orb poll ORs this flag in.
+  window._hartThinking = true;
 
   // M1 — INTENT IS THE DEFAULT OPERATING SURFACE.
   // The orb/command bar composes the desktop from what the human wants: the
@@ -3987,6 +5823,7 @@ function acSend() {{
      lower.includes('smaller')||lower.includes('dark')||lower.includes('light')) {{
     const fakeResp = {{set textContent(v){{typing.textContent=v;typing.classList.remove('typing')}}}};
     handleThemeCommand(lower, fakeResp);
+    window._hartThinking = false;  // terminal: handled locally, no brain wait
     return;
   }}
   // Fallback fast-path: launch a NAMED app directly (no brain round-trip).
@@ -3998,23 +5835,29 @@ function acSend() {{
       openPanel(match[0]);
       typing.textContent = 'Opened ' + match[1].title;
       typing.classList.remove('typing');
+      window._hartThinking = false;  // terminal: launched locally, no brain wait
       return;
     }}
   }}
 
   // Default: route the intent through the brain and COMPOSE the desktop.
+  // Bound the client wait (server /chat caps at 30s): without a signal a wedged
+  // brain or a saturated shell pool left this fetch — and the 'Thinking...'
+  // bubble — hung forever. _sig aborts at 32s into the friendly catch below.
   fetch(SHELL+'/api/agent/ask',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{text:text,capability:acActiveCap}})}})
+    body:JSON.stringify({{text:text,capability:acActiveCap}}),signal:_sig(32000)}})
     .then(function(r){{return r.json()}}).then(function(data){{
       const reply = data.response || data.error || 'No response';
       // The composed card is painted on the desktop by the SSE overlay stream;
       // the bubble is the spoken acknowledgement (casual chat still replies).
       typing.textContent = data.composed ? ('✦ ' + reply) : reply;
       typing.classList.remove('typing');
+      window._hartThinking = false;  // terminal: response arrived
       speakText(reply, 'chat_response');
     }}).catch(function(){{
-      typing.textContent = 'Could not reach agent';
+      typing.textContent = 'Assistant unavailable. It may still be starting - try again in a moment.';
       typing.classList.remove('typing');
+      window._hartThinking = false;  // terminal: request failed
     }});
 }}
 
@@ -4037,9 +5880,11 @@ function handleThemeCommand(text, resp) {{
   else if(text.includes('sunset')||text.includes('warm')) {{ applyPreset('sunset',resp); return; }}
   else if(text.includes('minimal')) {{ applyPreset('minimal',resp); return; }}
   else if(text.includes('potato')||text.includes('ultra')||text.includes('lite')||text.includes('performance')||text.includes('fast')) {{ applyPreset('potato',resp); return; }}
-  else {{ resp.textContent='Try: dark, light, cyberpunk, midnight, forest, sunset, potato, bigger, smaller'; return; }}
+  else if(text.includes('aura')) {{ applyPreset('aura',resp); return; }}
+  else if(text.includes('high contrast')||text.includes('high-contrast')||text.includes('accessib')) {{ applyPreset('high-contrast',resp); return; }}
+  else {{ resp.textContent='Try: dark, light, aura, cyberpunk, midnight, forest, sunset, potato, high-contrast, bigger, smaller'; return; }}
 
-  fetch(BACKEND+'/api/social/theme/customize',{{method:'POST',
+  fetch(BACKEND+'/api/appearance/customize',{{method:'POST',
     headers:{{'Content-Type':'application/json'}},body:JSON.stringify(customization)}})
     .then(r=>r.json()).then(()=>{{
       resp.textContent='Done! Refreshing...';
@@ -4048,12 +5893,24 @@ function handleThemeCommand(text, resp) {{
 }}
 
 function applyPreset(id, resp) {{
-  fetch(BACKEND+'/api/social/theme/apply',{{method:'POST',
+  // Apply server-side (persist), then LIVE-swap the theme :root vars from
+  // /api/appearance/css into a single managed <style> -- NO reload (G3). Mirrors
+  // paintPalette / Nunba injectCSSVars: only the CSS custom props (accent, ambient
+  // quad, font, glass, glow) retint, so every component keeps working. Reload stays
+  // ONLY as the css-fetch fallback so a broken fetch still lands the theme.
+  fetch(BACKEND+'/api/appearance/apply',{{method:'POST',
     headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{theme_id:id}})}})
     .then(r=>r.json()).then(()=>{{
-      resp.textContent='Applied '+id+'! Refreshing...';
-      setTimeout(()=>location.reload(), 500);
-    }}).catch(()=>{{ resp.textContent='Failed to apply theme'; }});
+      return fetch(BACKEND+'/api/appearance/css').then(r=>r.text()).then(css=>{{
+        var el = document.getElementById('hart-theme-live');
+        if(!el){{ el=document.createElement('style'); el.id='hart-theme-live'; document.head.appendChild(el); }}
+        el.textContent = css;
+        if(resp) resp.textContent = 'Applied '+id;
+      }}).catch(()=>{{
+        if(resp) resp.textContent='Applied '+id+'! Refreshing...';
+        setTimeout(()=>location.reload(), 500);
+      }});
+    }}).catch(()=>{{ if(resp) resp.textContent='Failed to apply theme'; }});
 }}
 
 // Focus trap: keep Tab within the active modal surface (lock screen / start menu
@@ -4151,13 +6008,25 @@ function shellAction(action) {{
     document.getElementById('lock-pw').focus();
     return;
   }}
-  const labels = {{suspend:'put the system to sleep',restart:'restart the system',shutdown:'shut down the system'}};
-  dsConfirm(action.charAt(0).toUpperCase()+action.slice(1),
+  const labels = {{suspend:'put the system to sleep',restart:'restart the system',shutdown:'shut down the system',firmware:'restart into the Firmware (UEFI) setup'}};
+  const titles = {{firmware:'Restart to Firmware'}};
+  dsConfirm(titles[action]||action.charAt(0).toUpperCase()+action.slice(1),
     'Are you sure you want to '+(labels[action]||action)+'?',
-    {{okLabel:action.charAt(0).toUpperCase()+action.slice(1), danger:action==='shutdown'}}).then(function(ok){{
-    if(ok) fetch(SHELL+'/api/shell/session/'+action,{{method:'POST'}}).catch(()=>{{}});
+    {{okLabel:(titles[action]||action.charAt(0).toUpperCase()+action.slice(1)), danger:action==='shutdown'}}).then(function(ok){{
+    if(ok) fetch(SHELL+'/api/shell/session/'+action,{{method:'POST'}}).then(function(r){{
+      // The 'firmware' action is gated server-side too — surface a clean refusal
+      // if the box turns out not to support boot-to-firmware (legacy BIOS).
+      if(action==='firmware' && r && !r.ok) r.json().then(function(j){{
+        dsConfirm('Firmware setup unavailable', (j&&j.error)||'Not supported on this system.', {{okLabel:'OK'}});
+      }}).catch(()=>{{}});
+    }}).catch(()=>{{}});
   }});
 }}
+// Reveal the "Restart to Firmware (UEFI)" power button only on a UEFI box that
+// advertises the boot-to-firmware capability (hidden on legacy BIOS). Pure read.
+fetch(SHELL+'/api/shell/session/firmware-capable').then(function(r){{return r.json();}}).then(function(j){{
+  if(j && j.supported){{ var b=document.getElementById('power-btn-firmware'); if(b) b.style.display=''; }}
+}}).catch(()=>{{}});
 function unlock() {{
   // In production: PAM verification. Dev mode: any password works.
   document.getElementById('lock-screen').classList.remove('active');
@@ -4191,13 +6060,27 @@ function toggleVoice() {{
 
 async function startRecording() {{
   try {{
-    const stream = await navigator.mediaDevices.getUserMedia({{audio:true}});
+    // Race the mic open against an 8s timeout. In a kiosk WebView a missing
+    // permission-request handler makes getUserMedia hang FOREVER -- clicking the
+    // orb froze the shell with no error (real-HW 2026-07-18). The host now
+    // auto-grants the media permission, but this guarantees the orb can NEVER
+    // hang: a stuck/denied mic degrades to a toast + state reset in <=8s.
+    const stream = await Promise.race([
+      navigator.mediaDevices.getUserMedia({{audio:true}}),
+      new Promise(function(_r, rej){{ setTimeout(function(){{ rej(new Error('mic-timeout')); }}, 8000); }})
+    ]);
+    // Feed the live mic into the voice orb for REAL listening reactivity (the
+    // orb analyses, never plays it back — no echo). Safe no-op if not ready yet.
+    try {{ if(window._hartVoiceOrb) window._hartVoiceOrb.connectStream(stream); }} catch(e) {{}}
     const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '';
     mediaRecorder = mimeType ? new MediaRecorder(stream,{{mimeType}}) : new MediaRecorder(stream);
     audioChunks = [];
     mediaRecorder.ondataavailable = function(e) {{ audioChunks.push(e.data); }};
     mediaRecorder.onstop = async function() {{
       stream.getTracks().forEach(function(t){{t.stop();}});
+      // Release the mic from the orb so the stopped track doesn't linger on the
+      // analyser; the speaking/idle cases fall back to the synthetic sine.
+      try {{ if(window._hartVoiceOrb) window._hartVoiceOrb.disconnect(); }} catch(e) {{}}
       const blob = new Blob(audioChunks, {{type: mediaRecorder.mimeType || 'audio/webm'}});
       const formData = new FormData();
       formData.append('audio', blob, 'voice.webm');
@@ -4221,9 +6104,17 @@ async function startRecording() {{
     isRecording = true;
     var _mb = document.querySelector('.mic-btn');
     if(_mb) _mb.classList.add('recording');  // guarded: no such el when the mic lives in the chat (was an unguarded null-deref)
+    var _sm = document.getElementById('hart-senses-mic');  // bottom sensory-cluster mic mirrors listening state
+    if(_sm) _sm.classList.add('listening');
     showToast('Voice','Recording... click mic again to stop','info');
   }} catch(err) {{
-    showToast('Voice','Microphone access denied','warning');
+    var _msg = (err && err.message === 'mic-timeout') ? 'Microphone did not respond' : 'Microphone access denied';
+    showToast('Voice', _msg, 'warning');
+    // Never leave the orb/senses-mic stuck in a listening state on failure.
+    isRecording = false;
+    var _sm = document.getElementById('hart-senses-mic'); if(_sm) _sm.classList.remove('listening');
+    var _mb = document.querySelector('.mic-btn'); if(_mb) _mb.classList.remove('recording');
+    try {{ if(window._hartVoiceOrb) window._hartVoiceOrb.disconnect(); }} catch(e) {{}}
   }}
 }}
 
@@ -4232,6 +6123,8 @@ function stopRecording() {{
   isRecording = false;
   const btn = document.querySelector('.mic-btn');
   if(btn) btn.classList.remove('recording');
+  const _sm = document.getElementById('hart-senses-mic');  // clear the bottom mic's listening state
+  if(_sm) _sm.classList.remove('listening');
 }}
 
 // Stop any in-progress TTS — browser SpeechSynthesis + the server <audio>.
@@ -4268,19 +6161,41 @@ function speakText(text, source) {{
 
 // ── HART OS native voice orb: reflect the shell's EXISTING voice state ──
 // Reuses isRecording (listening) + _acAudio (speaking) by polling.
-// setActive drives the viz's built-in speech-energy animation. Skipped in potato mode.
-if(!PERF.potato) {{
-  (function initHartOrb() {{
-    var c = document.getElementById('hart-voice-orb');
-    if(!c || !window.HartVoiceOrbViz) {{ setTimeout(initHartOrb, 400); return; }}
-    var orb = window.HartVoiceOrbViz(c, {{}});
-    c.style.opacity = '0.9';
-    setInterval(function() {{
-      var speaking = _acAudio && !_acAudio.paused && !_acAudio.ended;
-      orb.setActive(!!(speaking || isRecording));
-    }}, 200);
-  }})();
-}}
+// setActive drives the viz's built-in speech-energy animation.
+// ALWAYS init (NOT potato-gated): the orb's idle breathing animation is cheap
+// (a single rAF loop + a 200ms two-boolean poll) and is the centerpiece of the
+// voice-first desktop — a frozen/absent orb on a live USB (which classifies as
+// "potato") makes the shell look dead. The EXPENSIVE audio-reactive path
+// (getByteFrequencyData) is already gated INSIDE voiceOrbViz.js by `active`, so
+// it only runs while actually speaking/listening — no cost when idle.
+(function initHartOrb() {{
+  var c = document.getElementById('hart-voice-orb');
+  if(!c || !window.HartVoiceOrbViz) {{ setTimeout(initHartOrb, 400); return; }}
+  var orb = window.HartVoiceOrbViz(c, {{}});
+  // Expose the orb so the record path can feed it the REAL mic stream
+  // (connectStream) for true listening reactivity. The mic is NOT routed to the
+  // speakers inside voiceOrbViz.js (analyser only), so this can't echo/feedback.
+  window._hartVoiceOrb = orb;
+  // FIX B: sync the canvas breathe glow to the persisted orb-breathing pref. hartHero
+  // OWNS the pref + the 'hart_orb_breathing' key; we read it back through
+  // HartOrbBreathing.get() (no parallel localStorage parse). If hartHero has not
+  // loaded yet the orb stays default-ON and hartHero's own sync damps it on load -
+  // race-free either way.
+  try {{ if (window.HartOrbBreathing && orb.setBreathing) orb.setBreathing(window.HartOrbBreathing.get()); }} catch(e) {{}}
+  // #140: apply the persisted orb VARIETY. hartPersonalize owns the pref (the
+  // customization hub) via HartSession.orb_style; we read it back through
+  // window.HartOrbStyle (no parallel persistence). If hartPersonalize hasn't
+  // loaded yet the orb stays default 'vibrant' and HartOrbStyle.restore() applies
+  // it once ready - idempotent either way.
+  try {{ if (window.HartOrbStyle && orb.setStyle) orb.setStyle(window.HartOrbStyle.get()); }} catch(e) {{}}
+  c.style.opacity = '0.9';
+  setInterval(function() {{
+    var speaking = _acAudio && !_acAudio.paused && !_acAudio.ended;
+    // Animate while SPEAKING (TTS), LISTENING (mic), or PROCESSING (the
+    // "Thinking…" window set by acSend) — so the orb is never frozen mid-thought.
+    orb.setActive(!!(speaking || isRecording || window._hartThinking));
+  }}, 200);
+}})();
 
 // ═══ SSE Live Agent Action Stream ═══
 // Renders ALL agent components as floating overlay fragments in real-time.
@@ -4295,6 +6210,26 @@ if(!PERF.potato) {{
           const type = ev.type || 'notification';
           if(type === 'notification') {{
             showToast(ev.title||ev.agent||'Notification', ev.message||'', ev.severity||'info');
+          }} else if(type === 'app_installed') {{
+            // Installed app -> live desktop icon. Reuse hartDesktop's manifest
+            // merge + hartPinIcon (no fork); icon appears without a refresh.
+            if(window.hartInstallIcon) window.hartInstallIcon(ev);
+            showToast('Installed', (ev.title||ev.id||'App')+' added to your desktop', 'info');
+          }} else if(type === 'home' || type === 'home_compose') {{
+            // The local LLM re-composes the assembled HOME live (i1, agentic
+            // Liquid UI): route the A2UI payload to HartHome.compose instead of a
+            // floating overlay. ev.payload is the {{hero,rows}} composition; we
+            // pass ev itself as the fallback so a flat payload also works.
+            if(window.HartHome) window.HartHome.compose(ev.payload || ev);
+            // Agentic MOOD: the LLM-composed ambient palette rides the SAME home push
+            // (compose_home mood=). Resolve the id against the client palette vocabulary
+            // and paint LIVE via the existing primitive; an unknown id is a graceful
+            // no-op (never a broken paint). No new channel -- mood already arrives here.
+            try {{
+              var __mood = (ev.payload && ev.payload.mood) || ev.mood;
+              var __mp = (window.HartPalette && __mood) ? window.HartPalette.byId(__mood) : null;
+              if(__mp && window.HartPalette.paint) window.HartPalette.paint(__mp);
+            }} catch(e) {{}}
           }} else {{
             // Render as floating overlay fragment
             renderAgentOverlay(ev);
@@ -4332,6 +6267,14 @@ function _submitA2UIForm(form) {{
 function shellA2UIListSelect(el) {{
   try {{
     fetch(SHELL+(el.dataset.action||'/api/a2ui'),{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{selected:parseInt(el.dataset.idx||0),item:el.dataset.item||''}})}}).catch(function(){{}});
+  }} catch(e) {{}}
+}}
+// G5: a component EMITS a declared event (COMPONENT_TYPES/{{spec}}.events, e.g. metric
+// emits:['click']) back to the agent through the SAME /api/a2ui ingest -> agent_ui_update.
+// Generic: reads data-event/data-ctype/data-agent off the element. No new endpoint.
+function shellA2UIEmit(el) {{
+  try {{
+    fetch(SHELL+(el.dataset.action||'/api/a2ui'),{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{event:el.dataset.event||'click',type:el.dataset.ctype||'',agent_id:el.dataset.agent||''}})}}).catch(function(){{}});
   }} catch(e) {{}}
 }}
 function _doApproval(btn, verdict) {{
@@ -4387,7 +6330,7 @@ function renderAgentOverlay(ev) {{
 
   }} else if(type === 'checkout') {{
     html += '<div class="ds-body-md" style="font-weight:600">Checkout</div>';
-    html += '<div class="ds-body-sm ds-text-muted">'+(ev.items||[]).length+' items — '+(ev.total||0)+' '+(ev.currency||'Spark')+'</div>';
+    html += '<div class="ds-body-sm ds-text-muted">'+(ev.items||[]).length+' items - '+(ev.total||0)+' '+(ev.currency||'Spark')+'</div>';
     if(ev.confirm_action) html += '<div style="margin-top:8px;text-align:right">'+dsBtn('Confirm Payment',{{variant:'primary',cls:'ds-btn-sm',onclick:"fetch(SHELL+'"+ev.confirm_action+"',{{method:'POST'}})"}})+'</div>';
 
   }} else if(type === 'payment_status') {{
@@ -4501,7 +6444,9 @@ function renderAgentOverlay(ev) {{
     var trend = ev.trend||'flat';
     var arrow = trend==='up'?'\\u2191':trend==='down'?'\\u2193':'\\u2192';
     var tColor = trend==='up'?'var(--hart-success)':trend==='down'?'var(--hart-error)':'var(--hart-muted)';
-    html += '<div style="text-align:center;padding:8px 0">';
+    // G5: metric declares emits:['click'] -> make it emit that declared event back to
+    // the agent on tap (reuses shellA2UIEmit -> /api/a2ui; no new channel).
+    html += '<div style="text-align:center;padding:8px 0;cursor:pointer" data-event="click" data-ctype="metric" data-action="'+(ev.action||'/api/a2ui')+'" data-agent="'+(ev._agent_id||ev.agent_id||'')+'" onclick="shellA2UIEmit(this)">';
     html += '<div style="font-size:32px;font-weight:700;color:var(--hart-text)">'+(ev.value||0)+'<span class="ds-label-sm" style="font-size:14px;margin-left:4px;color:var(--hart-muted)">'+(ev.unit||'')+'</span></div>';
     html += '<div class="ds-body-sm" style="margin-top:2px">'+(ev.label||'Metric')+' <span style="color:'+tColor+';font-weight:600">'+arrow+'</span></div>';
     if(ev.explanation) html += '<div class="ds-label-sm ds-text-muted" style="margin-top:4px">'+(ev.explanation)+'</div>';
@@ -4568,6 +6513,35 @@ function renderAgentOverlay(ev) {{
     // Minimal overlay confirmation
     html += '<div style="text-align:center;padding:8px"><span class="mi material-icons-round" style="font-size:24px;color:var(--hart-accent)">open_in_new</span><div class="ds-body-sm" style="margin-top:4px">Navigating to '+(ev.title||target||'...')+'</div></div>';
 
+  }} else if(ev._spec) {{
+    // G2: an agent-REGISTERED custom component -> render from its stamped render spec
+    // (the template filled with the component's props, else the props as label/value
+    // rows) instead of the generic JSON dump, so a type an agent baked at runtime shows
+    // real UI. Prop STRING values are already _esc'd at the top of this function; the
+    // template STRUCTURE was XSS-vetted at register_component_type. Reuses _esc for the
+    // (un-pre-escaped) prop-name labels.
+    var _cc = '';
+    if(typeof ev._spec.template === 'string' && ev._spec.template) {{
+      _cc += String(ev._spec.template).replace(/\{{\{{(\w+)\}}\}}/g, function(_m, _k) {{
+        return String(ev[_k] != null ? ev[_k] : '');
+      }});
+    }} else {{
+      _cc += '<div class="ds-body-md" style="font-weight:600">'+(ev.title||type)+'</div>';
+      var _props = ev._spec.props || [];
+      for(var _pi=0; _pi<_props.length; _pi++) {{
+        var _pk = _props[_pi];
+        if(ev[_pk] == null) continue;
+        _cc += '<div class="ds-list-item" style="padding:3px 0"><span class="ds-label-sm ds-text-muted">'+_esc(_pk)+'</span><span class="ds-body-sm" style="margin-left:auto">'+String(ev[_pk])+'</span></div>';
+      }}
+    }}
+    // G5: if the custom type declares a click event, wrap it so it EMITS that declared
+    // event back to the agent on tap (reuses shellA2UIEmit -> /api/a2ui; no new channel).
+    var _cev = ev._spec.events || [];
+    if(_cev.indexOf && _cev.indexOf('click') >= 0) {{
+      html += '<div style="cursor:pointer" data-event="click" data-ctype="'+_esc(type)+'" data-action="'+(ev.action||'/api/a2ui')+'" data-agent="'+(ev._agent_id||ev.agent_id||'')+'" onclick="shellA2UIEmit(this)">'+_cc+'</div>';
+    }} else {{
+      html += _cc;
+    }}
   }} else {{
     // Generic fallback
     html += '<div class="ds-body-md" style="font-weight:600">'+(ev.title||type)+'</div>';
@@ -4683,10 +6657,11 @@ function renderAgentOverlay(ev) {{
         # in-process A2UI emitter reaches the LIVE shell via
         # get_registry().get_or_none('LiquidUIService').  Idempotent.
         self._register_self()
-        from flask import Flask, request, jsonify, Response, send_from_directory
+        from flask import (Flask, request, jsonify, Response,
+                           send_from_directory, stream_with_context)
 
         # The shell HTML loads its logo + every external script from
-        # ``/shell/static/...`` (see render_desktop_shell: hart-logo.svg,
+        # the ``/shell/static/`` prefix (see render_desktop_shell: hart-logo.svg,
         # voiceOrbViz.js, hartHero.js, hartDesktop.js, hartOnboarding.js, ...).
         # Flask's DEFAULT static route is ``/static`` — so without this prefix
         # EVERY ``/shell/static/*`` request 404s on a real boot: the orb never
@@ -4709,16 +6684,136 @@ function renderAgentOverlay(ev) {{
         def favicon():
             return Response(status=204)
 
-        # ── Nunba SPA embedding (React pages inside panel iframes) ──
-        nunba_dir = os.environ.get('NUNBA_STATIC_DIR', '')
-        if nunba_dir and os.path.isdir(nunba_dir):
-            @app.route('/app/<path:path>')
-            def nunba_static(path):
-                return send_from_directory(nunba_dir, path)
+        # ── build/index.html's 12s liveness probe ──
+        # The Nunba dist falls back to a `fetch('/cors/test')` to decide whether
+        # the server is up; without this route it 404s and the loader shows a
+        # misleading "Server is starting up… Reload to retry." Stub it 200 so the
+        # probe reports the shell is alive. Harmless + unconditional (it answers
+        # even when no Nunba dist is mounted).
+        @app.route('/cors/test')
+        def cors_test():
+            return Response('ok', mimetype='text/plain')
 
-            @app.route('/app/')
-            def nunba_index():
+        # ── Central-owned agent art (offline, by name-slug) ──
+        # Serves the real owned agent image the central instance drops into
+        # HART_AGENT_ART_DIR (or the bundled static/app_art/agents/ dir), resolved
+        # by app_poster.find_central_agent_file. That resolver re-slugs the id
+        # ([a-z0-9-] only) and only ever builds paths INSIDE the known drop dirs,
+        # so an arbitrary <slug> can never traverse out. A miss returns 404 and the
+        # agent card falls back to the generated art / brand-art scrim. No network.
+        @app.route('/shell/agent-art/<slug>')
+        def shell_agent_art(slug):
+            try:
+                from integrations.agent_engine import app_poster
+                path = app_poster.find_central_agent_file(slug)
+            except Exception:
+                path = None
+            if not path or not os.path.isfile(path):
+                return Response(status=404)
+            return send_from_directory(os.path.dirname(path),
+                                       os.path.basename(path))
+
+        # ── Nunba native-daemon embedding (reverse-proxy, same-origin) ──
+        # HART OS runs the FULL Nunba (Python + React) as a native OS daemon
+        # bound to a UNIX SOCKET — no host TCP port (steward 2026-07-09:
+        # "why shd we occupy host port if we can pack it within OS as a
+        # daemon process?").  LiquidUI reverse-proxies the Nunba SPA + its
+        # own APIs to that socket so the panel iframes stay SAME-ORIGIN
+        # (NUNBA_BASE='') and every 'route' panel (/social, /agents,
+        # /admin, …) resolves — no more "url not working".  Werkzeug matches
+        # by rule specificity, so every explicit LiquidUI route ('/',
+        # '/favicon.ico', '/health', '/cors/test', all '/api/*',
+        # '/shell/static/*') still WINS; only unclaimed paths (the Nunba SPA
+        # bundle + Nunba's own /api/social, /api/nunba, … that HARTOS does
+        # NOT define) fall to this LAST-place catch-all and get proxied to
+        # the daemon.  One HARTOS: the daemon's own backend calls proxy to
+        # native :6777 via HARTOS_BACKEND_URL — no re-bundled copy.
+        #
+        # Graceful floor (faster AND richer, never a hard drop): when the
+        # socket is unreachable (daemon still booting, or a desktop/CI build
+        # without the daemon) we fall back to serving the bundled React dist
+        # from NUNBA_STATIC_DIR exactly as before — React-only, but never a
+        # 404.  This preserves the old static-path contract as the floor.
+        hart_nunba_socket = os.environ.get('HART_NUNBA_SOCKET', '').strip()
+        nunba_dir = os.environ.get('NUNBA_STATIC_DIR', '')
+
+        def _serve_nunba_static(path):
+            # React-dist fallback: real file if present, else SPA index so
+            # the in-browser router resolves '/social', '/agents', … itself.
+            if nunba_dir and os.path.isdir(nunba_dir):
+                file_path = os.path.join(nunba_dir, path)
+                if os.path.isfile(file_path):
+                    return send_from_directory(nunba_dir, path)
                 return send_from_directory(nunba_dir, 'index.html')
+            return Response('Nunba UI unavailable', status=503,
+                            mimetype='text/plain')
+
+        if hart_nunba_socket:
+            import httpx as _httpx
+
+            # One pooled UDS client for the whole proxy — connection reuse,
+            # no per-request socket setup.  read=None so Nunba SSE streams
+            # never time out; a short connect timeout lets us fail fast to
+            # the static floor while the daemon is still coming up.
+            _nunba_proxy = {'client': None}
+
+            def _nunba_client():
+                if _nunba_proxy['client'] is None:
+                    _nunba_proxy['client'] = _httpx.Client(
+                        transport=_httpx.HTTPTransport(uds=hart_nunba_socket),
+                        timeout=_httpx.Timeout(3.0, read=None,
+                                               write=30.0, pool=5.0))
+                return _nunba_proxy['client']
+
+            # Hop-by-hop headers must not be forwarded (RFC 7230 §6.1).
+            _HOP = {'host', 'connection', 'keep-alive', 'proxy-authenticate',
+                    'proxy-authorization', 'te', 'trailer',
+                    'transfer-encoding', 'upgrade', 'content-length'}
+
+            @app.route('/<path:path>',
+                       methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH',
+                                'OPTIONS', 'HEAD'])
+            def nunba_proxy(path):
+                url = 'http://nunba/' + path
+                if request.query_string:
+                    url += '?' + request.query_string.decode('latin-1')
+                fwd = {k: v for k, v in request.headers
+                       if k.lower() not in _HOP}
+                try:
+                    client = _nunba_client()
+                    upstream = client.build_request(
+                        request.method, url, headers=fwd,
+                        content=request.get_data())
+                    resp = client.send(upstream, stream=True)
+                except Exception as _pe:
+                    # Socket down / daemon booting → graceful static floor.
+                    logger.debug("Nunba proxy failed (%s) — static floor", _pe)
+                    return _serve_nunba_static(path)
+
+                # multi_items() (not items()) keeps duplicate Set-Cookie headers
+                # separate — items() comma-merges them, corrupting session cookies
+                # (RFC 6265 Expires dates contain commas) through the OS-shell proxy.
+                resp_headers = [(k, v) for k, v in resp.headers.multi_items()
+                                if k.lower() not in _HOP]
+
+                def _stream():
+                    try:
+                        for chunk in resp.iter_raw():
+                            yield chunk
+                    finally:
+                        resp.close()
+
+                return Response(stream_with_context(_stream()),
+                                status=resp.status_code, headers=resp_headers)
+        elif nunba_dir and os.path.isdir(nunba_dir):
+            @app.route('/static/<path:path>')
+            def nunba_bundle(path):
+                return send_from_directory(
+                    os.path.join(nunba_dir, 'static'), path)
+
+            @app.route('/<path:path>')
+            def nunba_spa(path):
+                return _serve_nunba_static(path)
 
         # ── Legacy API: UI components (for terminal/Conky fallback) ──
         @app.route('/api/ui', methods=['GET'])
@@ -4747,6 +6842,33 @@ function renderAgentOverlay(ev) {{
             success = self.agent_ui_update(
                 data.get('agent_id', 'unknown'), comp)
             return jsonify({'success': success})
+
+        @app.route('/api/a2ui/specs', methods=['GET'])
+        def api_a2ui_specs():
+            # G6: the agent-readable component CATALOGUE (builtins + agent-registered
+            # custom types) as a discovery ingress -- the ONE surface an agent / the
+            # local intelligence reads to know what components exist and how to compose
+            # each from its spec alone. Reuses list_component_specs (the existing
+            # accessor); no second registry, no parallel path. Mirrors how
+            # /api/appearance/presets exposes list_presets.
+            return jsonify({'specs': self.list_component_specs()})
+
+        # ── Agentic HOME compose (the local LLM paints the Netflix home) ──
+        # The single producer entry point for the agentic home feed: a {hero,
+        # rows} composition flows through compose_home -> agent_ui_update (the
+        # governed A2UI channel) -> SSE -> HartHome.compose -> render. Accepts
+        # either a top-level {hero, rows} body or a wrapped {payload:{...}} one.
+        @app.route('/api/home/compose', methods=['POST'])
+        def api_home_compose():
+            data = request.get_json(force=True, silent=True) or {}
+            payload = data.get('payload')
+            if not isinstance(payload, dict):
+                payload = data
+            ok = self.compose_home(
+                hero=payload.get('hero'), rows=payload.get('rows'),
+                agent_id=str(data.get('agent_id', 'home_composer')),
+                mood=payload.get('mood'))   # carry the LLM-composed ambient mood through
+            return jsonify({'success': ok})
 
         @app.route('/api/approval', methods=['POST'])
         def api_approval():
@@ -4786,7 +6908,7 @@ function renderAgentOverlay(ev) {{
                     'decision': decision,
                 })
             except Exception:
-                pass
+                logger.exception("handle_agent_approval: swallowed Exception")
             logger.info("Approval decision: agent=%s action=%s decision=%s resolved=%s",
                         agent_id, action, decision, resolved)
             return jsonify({
@@ -4808,7 +6930,7 @@ function renderAgentOverlay(ev) {{
                     return jsonify({'error': 'AI hearing is disabled by the user',
                                     'sensing_disabled': True}), 403
             except Exception:
-                pass
+                logger.exception("api_voice: swallowed Exception")
             audio = request.files.get('audio')
             if audio:
                 import tempfile
@@ -4831,7 +6953,9 @@ function renderAgentOverlay(ev) {{
                 result = ThemeService.apply_theme(theme_id)
                 if 'error' in result:
                     return jsonify(result), 404
-                return jsonify({'status': 'updated', 'theme': result.get('id')})
+                # apply_theme returns 'theme_id' (never 'id') -- .get('id') made this
+                # reply permanently {'theme': None} (deployed-surface suite wart #1).
+                return jsonify({'status': 'updated', 'theme': result.get('theme_id')})
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
 
@@ -4884,6 +7008,42 @@ function renderAgentOverlay(ev) {{
                     'time': '', 'message': 'Event log not available'})
             return jsonify({'events': events})
 
+        # ── Shell APIs: Client-error sink (FIX B) ──
+        # The shell WebView's JS console never reaches journald, so a runtime
+        # throw (e.g. hartRenderPersonalize) or an unhandled rejection was an
+        # invisible blind spot. The inline head script (window.onerror /
+        # unhandledrejection / console.error wrapper) POSTs here; we forward each
+        # record to the module logger so it lands in the node journal. Best-effort
+        # and bounded: oversized bodies are ignored and the handler NEVER 500s
+        # (always 200 {'ok': True}), so a logging failure can't break the shell.
+        @app.route('/api/shell/clientlog', methods=['POST'],
+                   endpoint='shell_clientlog')
+        def shell_clientlog():
+            try:
+                raw = request.get_data(cache=True) or b''
+                if len(raw) > 8192:
+                    return jsonify({'ok': True})
+                # cache=True above so get_json can re-parse the SAME buffered body
+                # (get_data(cache=False) would drain the stream -> get_json None).
+                data = request.get_json(silent=True) or {}
+                level = str(data.get('level', 'error')).lower()
+                message = str(data.get('message', ''))[:2000]
+                stack = str(data.get('stack', ''))[:4000]
+                url = str(data.get('url', ''))[:500]
+                line = data.get('line', 0)
+                col = data.get('col', 0)
+                loc = f' ({url}:{line}:{col})' if url else ''
+                text = f'[shell-client]{loc} {message}'
+                if stack:
+                    text += f'\n{stack}'
+                if level in ('warn', 'warning'):
+                    logger.warning(text)
+                else:
+                    logger.error(text)
+            except Exception:
+                logger.exception("shell_clientlog: swallowed Exception")
+            return jsonify({'ok': True})
+
         # ── Shell APIs: Apps ──
         @app.route('/api/shell/apps', methods=['GET'])
         def shell_apps():
@@ -4904,7 +7064,7 @@ function renderAgentOverlay(ev) {{
                             'subsystem': 'linux',
                         })
                 except OSError:
-                    pass
+                    logger.warning("shell_apps: swallowed OSError", exc_info=True)
             return jsonify({'apps': apps[:100]})
 
         # ── Shell APIs: Launch ──
@@ -4926,23 +7086,73 @@ function renderAgentOverlay(ev) {{
         # ── Shell APIs: Session ──
         @app.route('/api/shell/session/<action>', methods=['POST'])
         def shell_session(action):
-            import re
-            if action not in ('lock', 'logout', 'suspend', 'shutdown', 'restart'):
+            # #133 — NATIVE logind power actions, result-checked. The shell server
+            # runs as the unprivileged `hart` service user; the old fire-and-forget
+            # subprocess.Popen(['systemctl', ...]) delegated to logind but never
+            # read the polkit verdict, so a DENIED reboot/shutdown/firmware was
+            # masked as {'status': action} while the box did nothing. We now invoke
+            # the org.freedesktop.login1.Manager method DIRECTLY via the SHARED
+            # `_logind_call` helper (busctl, exit-status + stderr checked) — the
+            # SAME canonical home /api/shell/power/action uses, so there is one
+            # busctl implementation, not two. Failure surfaces a real 500 + error.
+            from integrations.agent_engine.shell_os_apis import (
+                _logind_call, firmware_setup_supported)
+            if action not in ('lock', 'logout', 'suspend', 'shutdown', 'restart',
+                              'firmware'):
                 return jsonify({'error': 'Invalid action'}), 400
-            cmds = {
-                'lock': ['loginctl', 'lock-session'],
-                'logout': ['loginctl', 'terminate-session', ''],
-                'suspend': ['systemctl', 'suspend'],
-                'shutdown': ['systemctl', 'poweroff'],
-                'restart': ['systemctl', 'reboot'],
-            }
-            try:
-                subprocess.Popen(
-                    cmds[action],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return jsonify({'status': action})
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
+            # 'firmware' = "Restart into Firmware (UEFI)": arm the UEFI boot-to-
+            # firmware-UI flag (SetRebootToFirmwareSetup true), THEN reboot — the
+            # next boot enters BIOS/UEFI setup. Only meaningful on a UEFI box whose
+            # firmware advertises the boot-to-fw capability; refuse on legacy BIOS
+            # so the user never gets a plain reboot when they asked for firmware.
+            # Single source of truth for the capability probe (shell_os_apis).
+            if action == 'firmware' and not firmware_setup_supported():
+                return jsonify({
+                    'error': 'Reboot to firmware setup is not supported on this '
+                             'system (legacy BIOS or capability not advertised)'}), 400
+            # The interactive boolean is `true` so logind may consult polkit; the
+            # hart-base.nix security.polkit rule grants the `hart` user these
+            # login1 actions outright, so the authorized call executes.
+            if action == 'lock':
+                ok, err = _logind_call('LockSessions')
+            elif action == 'logout':
+                # Terminate THIS seat session (the shell runs inside the user's
+                # session). login1 needs the session id; refuse honestly if it is
+                # not in the environment rather than mask a no-op as success.
+                sid = os.environ.get('XDG_SESSION_ID', '')
+                if not sid:
+                    return jsonify({'action': action,
+                                    'error': 'No active session id to terminate '
+                                             '(XDG_SESSION_ID unset)'}), 500
+                ok, err = _logind_call('TerminateSession', 's', sid)
+            elif action == 'firmware':
+                # Two-step; if arming fails we do NOT reboot (a plain reboot would
+                # be the wrong action for the user's 'enter firmware setup' intent).
+                ok, err = _logind_call('SetRebootToFirmwareSetup', 'b', 'true')
+                if ok:
+                    ok, err = _logind_call('Reboot', 'b', 'true')
+            else:
+                # DRY (#165): reuse the ONE canonical verb->login1 method map
+                # (os_bridge.power._POWER_METHOD) instead of a second inline dict.
+                # 'restart' is this session route's public verb for a reboot.
+                from integrations.agent_engine.os_bridge.power import _POWER_METHOD
+                method = _POWER_METHOD['reboot' if action == 'restart' else action]
+                ok, err = _logind_call(method, 'b', 'true')
+            if not ok:
+                # Real failure (polkit denied, busctl missing, timeout) — surface
+                # it, never a masked success.
+                return jsonify({'action': action,
+                                'error': err or 'power action failed'}), 500
+            return jsonify({'status': action})
+
+        @app.route('/api/shell/session/firmware-capable', methods=['GET'])
+        def shell_session_firmware_capable():
+            """Report whether 'Restart into Firmware (UEFI)' is available so the
+            power menu can SHOW the button only on a capable UEFI box (hidden on
+            legacy BIOS). Pure read; no privileged action."""
+            from integrations.agent_engine.shell_os_apis import (
+                firmware_setup_supported)
+            return jsonify({'supported': firmware_setup_supported()})
 
         # ── Shell APIs: Services ──
         @app.route('/api/shell/services', methods=['GET'])
@@ -4959,7 +7169,7 @@ function renderAgentOverlay(ev) {{
                         capture_output=True, text=True, timeout=3)
                     status = result.stdout.strip()
                 except Exception:
-                    pass
+                    logger.exception("shell_services: swallowed Exception")
                 services.append({'name': name, 'status': status})
             return jsonify({'services': services})
 
@@ -4972,7 +7182,7 @@ function renderAgentOverlay(ev) {{
                     with open(path, 'r') as f:
                         return jsonify(json.load(f))
                 except Exception:
-                    pass
+                    logger.exception("get_session_state: swallowed Exception")
             return jsonify({})
 
         @app.route('/api/shell/session-state', methods=['POST'])
@@ -4998,45 +7208,33 @@ function renderAgentOverlay(ev) {{
                         if line.strip():
                             devices.append({'type': dev_type, 'info': line.strip()})
                 except Exception:
-                    pass
+                    logger.exception("shell_drivers: swallowed Exception")
             return jsonify({'devices': devices[:50]})
 
-        # ── Shell APIs: WiFi ──
+        # ── Shell APIs: WiFi (CACHED) ──
+        # Returns the wifi network list the background _connectivity_cache prober
+        # keeps fresh — INSTANT, no nmcli/hostname subprocess on the request
+        # thread (CAUSE 1). loadNetworks() fires this on popover-open + every
+        # Rescan; serving the cache means a Rescan can never freeze the shell.
         @app.route('/api/shell/network/wifi', methods=['GET'])
         def shell_wifi():
-            networks = []
-            connected = {}
-            try:
-                r = subprocess.run(
-                    ['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY,ACTIVE',
-                     'device', 'wifi', 'list'],
-                    capture_output=True, text=True, timeout=5)
-                for line in r.stdout.strip().split('\n'):
-                    parts = line.split(':')
-                    if len(parts) >= 4 and parts[0]:
-                        net = {
-                            'ssid': parts[0],
-                            'signal': int(parts[1] or 0),
-                            'security': parts[2],
-                            'active': parts[3] == 'yes',
-                        }
-                        networks.append(net)
-                        if net['active']:
-                            connected = net
-            except Exception:
-                pass
-            try:
-                r = subprocess.run(
-                    ['hostname', '-I'],
-                    capture_output=True, text=True, timeout=3)
-                if r.stdout.strip():
-                    connected['ip'] = r.stdout.strip().split()[0]
-            except Exception:
-                pass
-            return jsonify({'networks': networks[:20], 'connected': connected})
+            _connectivity_cache.start()  # idempotent — lazy-start the prober
+            return jsonify(_connectivity_cache.wifi_networks())
 
-        @app.route('/api/shell/network/wifi/connect', methods=['POST'])
-        def shell_wifi_connect():
+        # NOTE: distinct view-function name (shell_network_wifi_connect, NOT
+        # shell_wifi_connect) + explicit endpoint=. The canonical hardware-control
+        # module shell_system_apis.register_shell_system_routes ALSO defines a
+        # view named shell_wifi_connect (rule /api/shell/wifi/connect). Flask
+        # derives the endpoint from the function name, so a name clash made
+        # register_shell_system_routes raise AssertionError ("overwriting an
+        # existing endpoint") — which aborted it mid-registration and silently
+        # dropped its remaining ~16 routes (all /api/shell/vpn/*, the rest of
+        # /api/shell/wifi/*, trash, display rotation). This rule (/network/wifi/*)
+        # is the one the shell's own JS calls (liquid_ui_service ~2596), so it
+        # stays — only the endpoint name is de-conflicted.
+        @app.route('/api/shell/network/wifi/connect', methods=['POST'],
+                   endpoint='shell_network_wifi_connect')
+        def shell_network_wifi_connect():
             data = request.get_json(silent=True) or {}
             ssid = data.get('ssid', '').strip()
             password = data.get('password', '')
@@ -5055,8 +7253,11 @@ function renderAgentOverlay(ev) {{
             except Exception as e:
                 return jsonify({'success': False, 'error': str(e)}), 500
 
-        @app.route('/api/shell/network/wifi/disconnect', methods=['POST'])
-        def shell_wifi_disconnect():
+        # Distinct endpoint name (see shell_network_wifi_connect above): the
+        # canonical shell_system_apis also defines shell_wifi_disconnect.
+        @app.route('/api/shell/network/wifi/disconnect', methods=['POST'],
+                   endpoint='shell_network_wifi_disconnect')
+        def shell_network_wifi_disconnect():
             try:
                 r = subprocess.run(
                     ['nmcli', 'device', 'disconnect', 'wlan0'],
@@ -5088,7 +7289,7 @@ function renderAgentOverlay(ev) {{
                             'state': parts[2], 'connection': parts[3],
                         })
             except Exception:
-                pass
+                logger.exception("shell_network_status: swallowed Exception")
             try:
                 r = subprocess.run(
                     ['ip', 'route', 'show', 'default'],
@@ -5097,7 +7298,7 @@ function renderAgentOverlay(ev) {{
                 if 'via' in parts:
                     status['gateway'] = parts[parts.index('via') + 1]
             except Exception:
-                pass
+                logger.exception("shell_network_status: swallowed Exception")
             try:
                 r = subprocess.run(
                     ['resolvectl', 'status', '--no-pager'],
@@ -5107,7 +7308,7 @@ function renderAgentOverlay(ev) {{
                         status['dns'] = line.split(':',1)[1].strip().split()
                         break
             except Exception:
-                pass
+                logger.exception("shell_network_status: swallowed Exception")
             return jsonify(status)
 
         # ── Shell APIs: Audio ──
@@ -5133,7 +7334,7 @@ function renderAgentOverlay(ev) {{
                     capture_output=True, text=True, timeout=3)
                 default_sink = r.stdout.strip()
             except Exception:
-                pass
+                logger.exception("shell_audio: swallowed Exception")
             try:
                 r = subprocess.run(
                     ['pactl', '--format=json', 'list', 'sinks'],
@@ -5148,7 +7349,7 @@ function renderAgentOverlay(ev) {{
                         'default': s.get('name', '') == default_sink,
                     } for s in raw]
             except Exception:
-                pass
+                logger.exception("shell_audio: swallowed Exception")
             try:
                 r = subprocess.run(
                     ['pactl', '--format=json', 'list', 'sources'],
@@ -5161,7 +7362,7 @@ function renderAgentOverlay(ev) {{
                         'volume': _parse_volume(s.get('volume', {})),
                     } for s in raw]
             except Exception:
-                pass
+                logger.exception("shell_audio: swallowed Exception")
             return jsonify({'sinks': sinks, 'sources': sources})
 
         @app.route('/api/shell/audio/volume', methods=['POST'])
@@ -5171,7 +7372,10 @@ function renderAgentOverlay(ev) {{
             volume = data.get('volume')
             if not sink_id or volume is None:
                 return jsonify({'success': False, 'error': 'sink_id and volume required'}), 400
-            volume = max(0, min(150, int(volume)))
+            try:
+                volume = max(0, min(150, int(volume)))
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'volume must be an integer'}), 400
             try:
                 r = subprocess.run(
                     ['pactl', 'set-sink-volume', sink_id, f'{volume}%'],
@@ -5223,7 +7427,12 @@ function renderAgentOverlay(ev) {{
             volume = data.get('volume')
             if not source_id or volume is None:
                 return jsonify({'success': False, 'error': 'source_id and volume required'}), 400
-            volume = max(0, min(150, int(volume)))
+            try:
+                volume = max(0, min(150, int(volume)))
+            except (TypeError, ValueError):
+                # non-numeric volume crashed 500 pre-guard (deployed-surface
+                # suite finding); the sink-volume twin already coerces -- match it.
+                return jsonify({'success': False, 'error': 'volume must be a number'}), 400
             try:
                 r = subprocess.run(
                     ['pactl', 'set-source-volume', source_id, f'{volume}%'],
@@ -5247,7 +7456,7 @@ function renderAgentOverlay(ev) {{
                     if len(parts) == 3:
                         devices.append({'mac': parts[1], 'name': parts[2]})
             except Exception:
-                pass
+                logger.exception("shell_bluetooth: swallowed Exception")
             return jsonify({'devices': devices})
 
         # ── Shell APIs: Power/Battery ──
@@ -5273,8 +7482,86 @@ function renderAgentOverlay(ev) {{
                     elif 'time to empty:' in line:
                         info['time_remaining'] = line.split(':', 1)[1].strip()
             except Exception:
-                pass
+                logger.exception("shell_power: swallowed Exception")
             return jsonify(info)
+
+        # ── Shell APIs: Volume (wpctl-first, pactl fallback) ──
+        # The default-sink volume get/set/mute helpers (_vol_run / _volume_get)
+        # are module-level (defined next to read_gpu_render_mode) so the
+        # background connectivity prober and these WRITE routes share ONE
+        # implementation — no parallel volume path. The GET below reads the
+        # default sink directly (a user action, not the 8s poll); the poll's
+        # volume rides the cached connectivity snapshot instead.
+        @app.route('/api/shell/volume', methods=['GET'],
+                   endpoint='shell_volume_get')
+        def shell_volume_get():
+            return jsonify(_volume_get())
+
+        @app.route('/api/shell/volume', methods=['POST'],
+                   endpoint='shell_volume_set')
+        def shell_volume_set():
+            data = request.get_json(silent=True) or {}
+            volume = data.get('volume')
+            if volume is None:
+                return jsonify({'available': False,
+                                'error': 'volume required'}), 400
+            try:
+                volume = max(0, min(150, int(volume)))
+            except (TypeError, ValueError):
+                return jsonify({'available': False,
+                                'error': 'volume must be an integer'}), 400
+            r = _vol_run(['wpctl', 'set-volume', '@DEFAULT_AUDIO_SINK@',
+                          str(volume / 100.0)])
+            if r and r.returncode == 0:
+                return jsonify({'available': True, 'volume': volume,
+                                'tool': 'wpctl'})
+            r = _vol_run(['pactl', 'set-sink-volume', '@DEFAULT_SINK@',
+                          str(volume) + '%'])
+            if r and r.returncode == 0:
+                return jsonify({'available': True, 'volume': volume,
+                                'tool': 'pactl'})
+            return jsonify({'available': False,
+                            'error': 'no volume tool (wpctl/pactl)'}), 200
+
+        @app.route('/api/shell/volume/mute', methods=['POST'],
+                   endpoint='shell_volume_mute')
+        def shell_volume_mute():
+            data = request.get_json(silent=True) or {}
+            muted = data.get('muted', None)
+            # wpctl uses toggle|1|0
+            arg = 'toggle' if muted is None else ('1' if muted else '0')
+            r = _vol_run(['wpctl', 'set-mute', '@DEFAULT_AUDIO_SINK@', arg])
+            if r and r.returncode == 0:
+                return jsonify(_volume_get())
+            parg = 'toggle' if muted is None else ('1' if muted else '0')
+            r = _vol_run(['pactl', 'set-sink-mute', '@DEFAULT_SINK@', parg])
+            if r and r.returncode == 0:
+                return jsonify(_volume_get())
+            return jsonify({'available': False,
+                            'error': 'no volume tool (wpctl/pactl)'}), 200
+
+        # ── Shell APIs: Connectivity summary (ONE poll for the top-bar) ──
+        # hartConnectivity.js polls THIS single endpoint every ~8s (plus on
+        # popover-open + toggle). It returns the snapshot the background
+        # _connectivity_cache prober keeps fresh — INSTANT, no nmcli/bluetoothctl/
+        # wpctl subprocess on the waitress request thread (CAUSE 1: the synchronous
+        # six-subprocess probe here saturated the 1-2 thread pool on a software-
+        # rendered box and froze every shell fetch). The quick-settings WRITE
+        # actions (scan/connect/toggle/set-volume) still hit the per-domain
+        # endpoints inline; this is read-only aggregation, NOT a parallel control
+        # path. The prober's wifi-radio / bt-power / battery probes still mirror
+        # the canonical ones in shell_system_apis.py (those remain nested closures
+        # inside register_shell_system_routes; promoting them to module-level pure
+        # functions would let both call ONE implementation — tracked TODO).
+        @app.route('/api/shell/connectivity/summary', methods=['GET'],
+                   endpoint='shell_connectivity_summary')
+        def shell_connectivity_summary():
+            # Lazy-start the background prober on the first poll (idempotent — it
+            # only spawns a daemon thread, never probes on this request thread).
+            # Started here, not at app build, so a process that builds the app but
+            # never polls (and unrelated tests) never spawns the prober.
+            _connectivity_cache.start()
+            return jsonify(_connectivity_cache.summary())
 
         # ── Shell APIs: Display ──
         @app.route('/api/shell/display', methods=['GET'])
@@ -5314,7 +7601,7 @@ function renderAgentOverlay(ev) {{
                                 try:
                                     rates.append(float(clean))
                                 except ValueError:
-                                    pass
+                                    logger.debug("shell_display: swallowed ValueError", exc_info=True)
                             current_display['modes'].append({
                                 'resolution': mode,
                                 'rates': rates,
@@ -5323,7 +7610,7 @@ function renderAgentOverlay(ev) {{
                     elif not line.startswith(' '):
                         current_display = None
             except Exception:
-                pass
+                logger.exception("shell_display: swallowed Exception")
             return jsonify({'displays': displays})
 
         @app.route('/api/shell/display/resolution', methods=['POST'])
@@ -5352,7 +7639,10 @@ function renderAgentOverlay(ev) {{
             brightness = data.get('brightness')
             if not output or brightness is None:
                 return jsonify({'success': False, 'error': 'output and brightness required'}), 400
-            brightness = max(0.1, min(1.0, float(brightness)))
+            try:
+                brightness = max(0.1, min(1.0, float(brightness)))
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'brightness must be a number'}), 400
             try:
                 r = subprocess.run(
                     ['xrandr', '--output', output, '--brightness', str(brightness)],
@@ -5363,25 +7653,16 @@ function renderAgentOverlay(ev) {{
             except Exception as e:
                 return jsonify({'success': False, 'error': str(e)}), 500
 
-        @app.route('/api/shell/display/scale', methods=['POST'])
-        def shell_display_scale():
-            data = request.get_json(silent=True) or {}
-            output = data.get('output', '')
-            scale = data.get('scale')
-            if not output or scale is None:
-                return jsonify({'success': False, 'error': 'output and scale required'}), 400
-            scale = max(0.5, min(3.0, float(scale)))
-            try:
-                # xrandr scale is inverse: scale 2.0 means 0.5x transform
-                transform = str(round(1.0 / scale, 4))
-                r = subprocess.run(
-                    ['xrandr', '--output', output, '--scale', f'{transform}x{transform}'],
-                    capture_output=True, text=True, timeout=5)
-                if r.returncode == 0:
-                    return jsonify({'success': True, 'scale': scale})
-                return jsonify({'success': False, 'error': r.stderr.strip()}), 400
-            except Exception as e:
-                return jsonify({'success': False, 'error': str(e)}), 500
+        # NOTE: /api/shell/display/scale is registered canonically by
+        # shell_desktop_apis.register_shell_desktop_routes (GET/PUT, with both
+        # Wayland swaymsg + X11 GDK_SCALE handling). A SECOND inline definition
+        # here used the SAME Flask view-function name 'shell_display_scale',
+        # which made Flask raise AssertionError ("overwriting an existing
+        # endpoint") inside register_shell_desktop_routes — swallowed by the
+        # broad except below, but the raise ABORTED the try block so the next
+        # registrations (register_shell_system_routes + register_app_install_
+        # routes) never ran, silently dropping all /api/shell/* + /api/apps/*
+        # (the app store). Removed the inline duplicate; the canonical one wins.
 
         # ── Shell APIs: System Metrics ──
         @app.route('/api/shell/system/metrics', methods=['GET'])
@@ -5389,7 +7670,14 @@ function renderAgentOverlay(ev) {{
             metrics = {}
             try:
                 import psutil
-                metrics['cpu_percent'] = psutil.cpu_percent(interval=0.5)
+                # NON-BLOCKING sample (interval=None): return CPU% since the last
+                # call instead of sleeping 0.5s on the request thread. This route
+                # is POLLED every 4s by hartSessionUI; a blocking 0.5s here pinned
+                # a waitress worker for 0.5s out of every 4s forever (12.5% of a
+                # 1-thread pool) — a recurring mid-session micro-freeze. The 4s
+                # poll cadence is a fine sampling window; the first call after boot
+                # reads 0.0 and every subsequent poll is an accurate delta.
+                metrics['cpu_percent'] = psutil.cpu_percent(interval=None)
                 metrics['cpu_count'] = psutil.cpu_count()
                 mem = psutil.virtual_memory()
                 metrics['ram'] = {
@@ -5409,7 +7697,7 @@ function renderAgentOverlay(ev) {{
                             'percent': usage.percent,
                         })
                     except (PermissionError, OSError):
-                        pass
+                        logger.warning("shell_system_metrics: swallowed PermissionError, OSError", exc_info=True)
                 metrics['disks'] = disks
                 net = psutil.net_io_counters()
                 metrics['network'] = {
@@ -5429,7 +7717,7 @@ function renderAgentOverlay(ev) {{
                             for name, sensors in temps.items()
                         }
                 except (AttributeError, Exception):
-                    pass
+                    logger.exception("shell_system_metrics: swallowed AttributeError, Exception")
             except ImportError:
                 metrics['error'] = 'psutil not installed'
             # GPU via VRAMManager
@@ -5439,7 +7727,7 @@ function renderAgentOverlay(ev) {{
                 if gpu and gpu.get('name'):
                     metrics['gpu'] = gpu
             except Exception:
-                pass
+                logger.exception("shell_system_metrics: swallowed Exception")
             return jsonify(metrics)
 
         @app.route('/api/shell/system/processes', methods=['GET'])
@@ -5461,10 +7749,10 @@ function renderAgentOverlay(ev) {{
                                 'mem': round(info.get('memory_percent', 0), 1),
                             })
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
+                        logger.warning("shell_system_processes: swallowed psutil.NoSuchProcess, psutil.AccessDenied", exc_info=True)
                 procs.sort(key=lambda p: p['cpu'], reverse=True)
             except ImportError:
-                pass
+                logger.debug("shell_system_processes: swallowed ImportError")
             return jsonify({'processes': procs[:30]})
 
         # ── Shell APIs: Log Viewer ──
@@ -5499,7 +7787,7 @@ function renderAgentOverlay(ev) {{
                             'message': entry.get('MESSAGE', ''),
                         })
                     except json.JSONDecodeError:
-                        pass
+                        logger.debug("shell_system_logs: swallowed json.JSONDecodeError", exc_info=True)
                 return jsonify({'entries': entries, 'count': len(entries)})
             except FileNotFoundError:
                 return jsonify({'entries': [], 'count': 0,
@@ -5530,7 +7818,7 @@ function renderAgentOverlay(ev) {{
                             })
                             yield f'data: {data}\n\n'
                         except json.JSONDecodeError:
-                            pass
+                            logger.debug("generate: swallowed json.JSONDecodeError", exc_info=True)
                 except Exception:
                     yield 'data: {"error": "stream unavailable"}\n\n'
             return Response(generate(), mimetype='text/event-stream',
@@ -5558,7 +7846,7 @@ function renderAgentOverlay(ev) {{
                                 'modified': modified,
                             })
                 except Exception:
-                    pass
+                    logger.exception("shell_recent_files: swallowed Exception")
             return jsonify({'files': files[-10:]})
 
         # ── Agent Action SSE Stream (ALL component types, not just notifications) ──
@@ -5566,23 +7854,41 @@ function renderAgentOverlay(ev) {{
         def notification_stream():
             import time as _time
 
+            def _collect(since):
+                # Lock-free snapshot (unchanged from the old poll): ALL component
+                # types newer than the caller's cursor, stamped with their agent.
+                out = []
+                for agent_id, comps in list(self._agent_components.items()):
+                    for c in comps:
+                        if c.get('_ts', 0) > since:
+                            event = dict(c)
+                            event['agent'] = agent_id
+                            out.append(event)
+                return out
+
             def generate():
                 last_check = _time.time()
+                # EVENT-DRIVEN (was a 2s server-side poll that capped the latency of
+                # every A2UI card / notification / desktop compose — the "Liquid UI
+                # is the heart" path). Block on the CV until agent_ui_update pushes a
+                # component (woken instantly); the 15s timeout is a safety net +
+                # SSE keep-alive that self-heals a missed wake. The check-then-wait
+                # is atomic under the CV so a push between them can't be lost. The
+                # producer holds ONLY the CV (never self._lock) -> no deadlock with
+                # the writer's lock order.
                 while True:
-                    _time.sleep(2)  # 2s for snappier live updates
-                    events = []
-                    for agent_id, comps in list(
-                            self._agent_components.items()):
-                        for c in comps:
-                            ts = c.get('_ts', 0)
-                            if ts > last_check:
-                                # Push ALL component types — not just notifications
-                                event = dict(c)
-                                event['agent'] = agent_id
-                                events.append(event)
-                    last_check = _time.time()
+                    with self._ui_event_cv:
+                        events = _collect(last_check)
+                        if not events:
+                            self._ui_event_cv.wait(timeout=15.0)
+                            events = _collect(last_check)
+                        last_check = _time.time()
                     if events:
                         yield f"data: {json.dumps(events)}\n\n"
+                    else:
+                        # SSE comment: keeps the stream warm through proxies,
+                        # ignored by the browser EventSource.
+                        yield ": hb\n\n"
             return Response(
                 generate(), mimetype='text/event-stream',
                 headers={
@@ -5598,23 +7904,89 @@ function renderAgentOverlay(ev) {{
                 'renderer': self.renderer,
             })
 
-        # Register OS management APIs (shell file manager, terminal,
-        # desktop settings, system monitoring, app installer)
+        # Register OS management APIs (shell file manager, terminal, desktop
+        # settings, system monitoring, app installer).
+        #
+        # #18 route-drop hardening: EACH module registers inside its OWN
+        # try/except. A duplicate-endpoint AssertionError (or an import failure)
+        # in one module must NEVER abort a shared block and silently drop the
+        # siblings — most visibly the app store (register_app_install_routes) and
+        # the OS bridge. The previous single bundled try/except let ONE collision
+        # (see the /api/shell/display/scale + /api/shell/wifi/connect notes above)
+        # cascade into "next registrations never ran → /api/apps/* dropped → app
+        # store dead". Per-module isolation makes that class of drop impossible by
+        # construction, and mirrors what flash/media/openclaw/onboarding already do
+        # below. Order is unchanged (os → desktop → system → app-install → bridge).
         try:
             from integrations.agent_engine.shell_os_apis import (
                 register_shell_os_routes)
+            register_shell_os_routes(app)
+        except Exception as e:
+            logger.warning("Shell OS APIs registration: %s", e)
+        try:
             from integrations.agent_engine.shell_desktop_apis import (
                 register_shell_desktop_routes)
+            register_shell_desktop_routes(app)
+        except Exception as e:
+            logger.warning("Shell desktop APIs registration: %s", e)
+        try:
             from integrations.agent_engine.shell_system_apis import (
                 register_shell_system_routes)
+            register_shell_system_routes(app)
+        except Exception as e:
+            logger.warning("Shell system APIs registration: %s", e)
+        try:
             from integrations.agent_engine.app_installer import (
                 register_app_install_routes)
-            register_shell_os_routes(app)
-            register_shell_desktop_routes(app)
-            register_shell_system_routes(app)
             register_app_install_routes(app)
         except Exception as e:
-            logger.warning("Shell APIs registration: %s", e)
+            logger.warning("App-install (store) APIs registration: %s", e)
+        try:
+            # Typed native OS-bridge (#133/W3): POST /api/os/invoke +
+            # /api/os/contract + /api/os/power/capabilities. The forward path for
+            # the WebView SDK (hartOSBridge.js); it reuses shell_os_apis auth/audit
+            # + os_bridge.power (one dispatch, no parallel path). The old
+            # /api/shell/power/action stays as the backward-compat surface.
+            from integrations.agent_engine.os_bridge.routes import (
+                register_os_bridge_routes)
+            register_os_bridge_routes(app)
+        except Exception as e:
+            logger.warning("OS-bridge APIs registration: %s", e)
+
+        # Flash-to-USB routes registered SEPARATELY so a failure in this newer,
+        # optional module (e.g. the flasher import) can NEVER cascade and drop the
+        # core shell APIs above (the #18 route-drop class). Best-effort: the Flash
+        # panel just won't work if this fails; everything else stays up.
+        try:
+            from integrations.agent_engine.shell_flash_apis import (
+                register_shell_flash_routes)
+            register_shell_flash_routes(app)
+        except Exception as e:
+            logger.warning("Flash-to-USB API registration: %s", e)
+
+        # AI-senses cross-process authority (Phase 7) — THIS process is the
+        # canonical holder of core.ai_sensing._state: register_shell_desktop_routes
+        # above mounts POST /api/shell/ai-sensing here, the ONE writer the human's
+        # floating-eye button hits. So the authority socket MUST be served from
+        # here (not the :6777 backend, whose _state is a different process's copy),
+        # so a SEPARATE process — the xdg-desktop-portal-hart ScreenCast handler,
+        # its own systemd unit — consults allowed('screen') fail-closed before any
+        # native capture. Without this server the portal's query_authority() denies
+        # (fail-closed): a missing server never OPENS a capture, it only keeps the
+        # portal shut. Best-effort + idempotent: no-op where AF_UNIX is unavailable
+        # (Windows dev) or the bind fails.
+        try:
+            from core import ai_sensing as _ai_sensing
+            if _ai_sensing.start_authority_server():
+                logger.info(
+                    "AI-senses authority server started (cross-process screen "
+                    "gate for the portal) on %s", _ai_sensing._authority_path())
+            else:
+                logger.debug(
+                    "AI-senses authority server not started (no AF_UNIX / bind "
+                    "failed) — portal screencast stays fail-closed")
+        except Exception as e:
+            logger.debug("AI-senses authority server start skipped: %s", e)
 
         # Register OpenClaw + floating assistant APIs
         try:
@@ -5666,6 +8038,26 @@ function renderAgentOverlay(ev) {{
                                 'hevolve_core_healthy': False,
                                 'learning_active': False}), 200
 
+        # Register the local semantic media index routes (W10): media search +
+        # the fetch-once web-image cache that feed the agentic home's card art
+        # (GET /api/media/search, /api/media/image, /api/media/index/status, ...).
+        # These mount on the SAME origin that serves hartHome.js, so the in-WebView
+        # fetch is loopback and passes _require_system_auth with no token. Own
+        # try/except so a failure can NEVER cascade and drop the sibling shell
+        # routes above (the #18 route-drop class).
+        try:
+            from integrations.agent_engine.media_semantic_index import (
+                register_media_routes, register_idle_indexer)
+            register_media_routes(app)
+            # Start the idle captioner here too (idempotent) so the co-located
+            # Nunba desktop bundle — which builds the app via _create_flask_app
+            # but may not run serve_forever — still populates the local caption
+            # catalog the home cards search for photos.  Self-gating (yields to
+            # the user) + local-only, so it never competes with a live session.
+            register_idle_indexer()
+        except Exception as e:
+            logger.warning("Media index API registration: %s", e)
+
         return app
 
     # ─── Serve ────────────────────────────────────────────────
@@ -5714,19 +8106,733 @@ function renderAgentOverlay(ev) {{
 
         threading.Thread(target=_model_check_loop, daemon=True).start()
 
+        # Start the low-priority idle media indexer (W10): a self-contained daemon
+        # thread that captions Pictures/Videos ONLY while the user is idle (it
+        # yields on should_yield_to_user), populating the local catalog the home's
+        # cards search for real photos. Idempotent + its own try/except so an
+        # indexer fault never blocks the shell from serving.
+        try:
+            from integrations.agent_engine.media_semantic_index import (
+                register_idle_indexer)
+            register_idle_indexer()
+        except Exception as e:
+            logger.warning("Media idle indexer start: %s", e)
+
         app = self._create_flask_app()
         logger.info("LiquidUI Glass Shell starting on port %d", self.port)
 
-        # Auto-scale threads by hardware tier
+        # Auto-scale threads by hardware tier. The FLOOR is sized so the always-on
+        # notifications SSE (a per-connection waitress thread held for the whole
+        # session) plus one inherently-blocking request (the 30s chat proxy, a
+        # multi-second nmcli/pactl/journalctl panel route) can never starve the
+        # steady UI polls — the mid-session freeze. See _resolve_shell_pool_threads.
         try:
             from security.system_requirements import get_tier_name
             tier = get_tier_name()
         except Exception:
             tier = 'standard'
-        threads = 1 if tier in ('embedded', 'observer') else 2 if tier == 'lite' else 4
+        threads = _resolve_shell_pool_threads(tier)
 
         try:
             from waitress import serve
             serve(app, host='0.0.0.0', port=self.port, threads=threads)
         except ImportError:
             app.run(host='0.0.0.0', port=self.port, threaded=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# AGENTIC HOME PRODUCER (gap Q2 - "the home composes itself live")
+# ════════════════════════════════════════════════════════════════════════════
+# The agentic-home transport was wired end to end (compose_home ->
+# agent_ui_update -> SSE -> HartHome.compose -> render) but had NO producer: the
+# only callers of compose_home were the manual /api/home/compose route + tests,
+# so in practice the surface was hartHome.js's offline samplePayload upgraded by
+# direct client fetches - never an agent composition. These functions ARE that
+# producer. They:
+#   1. gather the live surfaces the home is composed FROM (the agent dashboard,
+#      recipes on disk, the earnings wallet) - the SAME truth hartHome.js reads,
+#      so producer and client never diverge (no parallel data path);
+#   2. compose a deterministic {hero, rows} BACKBONE from that real context;
+#   3. let the local LLM (the heart) CURATE the narrative + emphasis over the
+#      backbone - a small, reliable JSON so the on-device 4B succeeds; any
+#      failure leaves the deterministic backbone standing, so the home NEVER
+#      breaks when the model can't emit clean JSON;
+#   4. hand it to compose_home -> agent_ui_update - the ONE governed transport
+#      (the human kill-switch, the per-agent rate cap, the immutable audit and
+#      the XSS reject all live there). No new channel, no new gate.
+# The autonomous agent daemon drives run_home_compose() when the box is idle, so
+# the home stays alive whether the user is at the machine or away. Card imagery
+# is hydrated client-side by hartHome.js (card.image_url -> the /api/media cache
+# | else a local media-index search by card.topic|title), so the producer only
+# supplies good titles/topics + an optional real web image_url; it never embeds
+# bytes and reads no personal media.
+
+
+def _home_time_of_day() -> str:
+    """A natural time-of-day phrase for the contextual hero narrative."""
+    try:
+        h = time.localtime().tm_hour
+    except Exception:
+        return 'today'
+    if h < 5:
+        return 'overnight'
+    if h < 12:
+        return 'this morning'
+    if h < 17:
+        return 'this afternoon'
+    if h < 21:
+        return 'this evening'
+    return 'tonight'
+
+
+# keyword -> Material icon, so a card without an explicit icon still reads right.
+_HOME_ICON_MAP = (
+    ('research', 'travel_explore'), ('trade', 'candlestick_chart'),
+    ('market', 'campaign'), ('content', 'edit_note'), ('video', 'movie'),
+    ('coding', 'terminal'), ('code', 'terminal'), ('social', 'groups'),
+    ('tutor', 'school'), ('learn', 'school'), ('english', 'menu_book'),
+    ('speech', 'record_voice_over'), ('finance', 'payments'),
+    ('news', 'newspaper'), ('vision', 'visibility'), ('image', 'image'),
+    ('robot', 'smart_toy'), ('analytics', 'insights'),
+)
+
+
+def _home_icon_for(s) -> str:
+    sl = str(s or '').lower()
+    for needle, icon in _HOME_ICON_MAP:
+        if needle in sl:
+            return icon
+    return 'smart_toy'
+
+
+def _home_clean_text(v, n: int) -> str:
+    """Trim + de-em-dash + strip angle brackets (so the A2UI XSS reject in
+    agent_ui_update never has to drop the whole push) + clamp to n chars."""
+    if v is None:
+        return ''
+    s = str(v).replace('—', '-').replace('–', '-')
+    s = re.sub(r'[<>]', '', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s[:n]
+
+
+def _home_agent_card(a: dict, action: str, target: Optional[str] = None) -> dict:
+    """One Netflix card from a dashboard agent row (reuses the canonical
+    dashboard agent shape; no parallel agent model)."""
+    name = _home_clean_text(
+        a.get('name') or a.get('current_task') or 'Agent', 60) or 'Agent'
+    gtype = str(a.get('type') or '').replace('_goal', '')
+    card = {'title': name, 'topic': name,
+            'icon': _home_icon_for(gtype or name), 'action': action}
+    # Per-agent art (#143), OFFLINE-FIRST resolution order:
+    #   1. CENTRAL-owned image by name (app_poster.central_agent_art) - real owned
+    #      art the central instance drops/bundles, served same-origin with NO
+    #      network. Stamped on card.image (which the client prefers), so it wins.
+    #   2. LOCAL generated art (app_poster.agent_art_url) - only when an on-device
+    #      image generator is reachable via the Model Bus; stamped on image_url.
+    #   3. neither -> the client composites HartBrandArt + the dark-to-light scrim
+    #      + the name (the honest default). The scrim/text-over-art is preserved
+    #      in every case (makeCard always lays the scrim over card.image).
+    try:
+        from integrations.agent_engine import app_poster
+        central = app_poster.central_agent_art(name)
+    except Exception:
+        central = None
+    if central:
+        card['image'] = central
+    else:
+        try:
+            art = app_poster.agent_art_url(name)
+        except Exception:
+            art = None
+        if art:
+            card['image_url'] = art
+    status = str(a.get('status') or '').lower()
+    if status in ('running', 'in_progress', 'active'):
+        card['live'] = 'running'
+    if target:
+        card['target'] = target
+    elif action == 'open':
+        card['target'] = 'agents_browse'
+    return card
+
+
+def _home_flagship_row() -> dict:
+    """The curated, always-present product agents (ready to run, fully local).
+    Mirrors hartHome.js samplePayload's Flagship row - the canonical HART OS
+    product agents - so a daemon push (which replaces the row set) never drops
+    them. Product/curation data, not a logic fork."""
+    return {
+        'title': 'Flagship agents', 'note': 'ready to run, fully local',
+        'accent': 'violet', 'see_all': 'agents_browse', 'flagship': True,
+        'cards': [
+            {'title': 'Auto Research', 'topic': 'research',
+             'icon': 'travel_explore', 'meta': 'scout the web, then synthesize',
+             'action': 'ask',
+             'prompt': 'Start the Auto Research agent on a topic I care about'},
+            {'title': 'Trading', 'topic': 'trading charts',
+             'icon': 'candlestick_chart', 'meta': 'paper-trade live signals',
+             'action': 'ask', 'prompt': 'Open the Trading agent'},
+            {'title': 'Tutor', 'topic': 'studying', 'icon': 'school',
+             'meta': 'learn anything, step by step', 'action': 'ask',
+             'prompt': 'Be my Tutor'},
+            {'title': 'English Learning', 'topic': 'books', 'icon': 'menu_book',
+             'meta': 'grammar and vocabulary', 'action': 'ask',
+             'prompt': 'Start English Learning'},
+            {'title': 'Spoken English', 'topic': 'conversation',
+             'icon': 'record_voice_over', 'meta': 'practice speaking out loud',
+             'action': 'ask', 'prompt': 'Practice Spoken English with me'},
+            {'title': 'Speech Therapy', 'topic': 'therapy',
+             'icon': 'spatial_audio', 'meta': 'guided exercises',
+             'action': 'ask', 'prompt': 'Start a Speech Therapy session'},
+        ],
+    }
+
+
+# Curated App Store fill for the Apps row (reverse-DNS Flathub id + display
+# name). High-recognition picks mirroring hart-app-catalog.json; product
+# curation, not a logic fork (same rationale as _home_flagship_row).
+_HOME_FLAGSHIP_APPS = (
+    ('org.mozilla.firefox', 'Firefox'),
+    ('org.videolan.VLC', 'VLC'),
+    ('org.libreoffice.LibreOffice', 'LibreOffice'),
+    ('org.gimp.GIMP', 'GIMP'),
+    ('com.obsproject.Studio', 'OBS Studio'),
+    ('org.blender.Blender', 'Blender'),
+)
+
+
+def _home_app_card(app_id: str, name: str) -> dict:
+    """One Netflix card for an app (#143). OFFLINE-FIRST: a BUNDLED official/brand
+    logo (shell_manifest.bundled_app_logo, served same-origin, no network) is
+    PREFERRED and stamped on card.image, which the client (makeCard) prefers over
+    the network card.image_url - so a known app shows real art with the network
+    OFF. Only when no bundled logo exists do we resolve the marketplace/official
+    poster (fetched + cached ONCE by the W10 ImageCache) onto card.image_url; a
+    miss there leaves both unset so the client paints the deterministic brand-art
+    tile. The card opens the App Store."""
+    from integrations.agent_engine import app_poster, shell_manifest
+    disp = _home_clean_text(name, 60) or 'App'
+    card = {'title': disp, 'topic': disp, 'icon': 'apps',
+            'action': 'open', 'target': 'app_store'}
+    try:
+        logo = shell_manifest.bundled_app_logo(app_id)
+    except Exception:
+        logo = None
+    if logo:
+        card['image'] = logo                     # bundled, offline, wins
+        return card
+    try:
+        poster = app_poster.resolve_app_poster(app_id, prefer='poster')
+    except Exception:
+        poster = None
+    if poster:
+        card['image_url'] = poster               # network enhancement only
+    return card
+
+
+def _home_app_cards(installed: List[dict]) -> List[dict]:
+    """The Apps row: the user's INSTALLED apps first, then curated flagship
+    fill, capped at 8, de-duped by app id / title."""
+    cards: List[dict] = []
+    seen = set()
+    for app in (installed or []):
+        aid = str((app or {}).get('app_id') or '').strip()
+        nm = _home_clean_text((app or {}).get('name'), 60)
+        if not nm:
+            continue
+        key = aid.lower() or nm.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cards.append(_home_app_card(aid, nm))
+        if len(cards) >= 8:
+            return cards
+    for aid, nm in _HOME_FLAGSHIP_APPS:
+        if aid.lower() in seen:
+            continue
+        seen.add(aid.lower())
+        cards.append(_home_app_card(aid, nm))
+        if len(cards) >= 8:
+            break
+    return cards
+
+
+def _home_recipe_cards() -> List[dict]:
+    """Recipe cards from the flow-0 recipe artifacts on disk (the SAME files the
+    REUSE pipeline reads). Newest first, capped. Never raises."""
+    cards: List[dict] = []
+    try:
+        from core.platform_paths import get_recipe_prompts_dir
+        d = get_recipe_prompts_dir()
+    except Exception:
+        d = 'prompts'
+    try:
+        import glob as _glob
+        files = _glob.glob(os.path.join(d, '*_recipe.json'))
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    except Exception:
+        files = []
+    for fp in files[:10]:
+        title = os.path.basename(fp).replace('_recipe.json', '')
+        try:
+            with open(fp, 'r', encoding='utf-8') as f:
+                r = json.load(f)
+            if isinstance(r, dict):
+                title = (r.get('name') or r.get('title') or r.get('goal')
+                         or r.get('prompt') or title)
+        except Exception:
+            logger.exception("_home_recipe_cards: swallowed Exception")
+        title = _home_clean_text(title, 60) or 'Recipe'
+        cards.append({'title': title, 'topic': title, 'icon': 'auto_awesome',
+                      'badge': 'Replay', 'action': 'open', 'target': 'recipes'})
+    return cards
+
+
+def _home_resolve_owner_earnings():
+    """Best-effort (owner_uid, spark_balance) for the value-first hero.
+
+    Resolves the node owner from the most recent goal (the canonical
+    goal_owner_user_id helper) and reads their REAL Spark via the canonical
+    ResonanceService wallet - no shadow ledger, no invented figure. Returns
+    (None, None) on a fresh node so the hero stays honest-empty (the client's
+    own session-scoped earnings read then stands). Never raises."""
+    try:
+        from integrations.social.models import get_db, AgentGoal
+        from integrations.social.resonance_engine import ResonanceService
+    except Exception:
+        return (None, None)
+    db = None
+    try:
+        db = get_db()
+        goal = db.query(AgentGoal).order_by(AgentGoal.created_at.desc()).first()
+        uid = None
+        if goal is not None:
+            try:
+                from core.event_attribution import goal_owner_user_id
+                uid = goal_owner_user_id(goal)
+            except Exception:
+                uid = (getattr(goal, 'user_id', None)
+                       or getattr(goal, 'created_by', None))
+        spark = None
+        if uid:
+            wallet = ResonanceService.get_wallet(db, str(uid))
+            if wallet:
+                spark = wallet.get('spark')
+                if spark is None:
+                    spark = wallet.get('balance')
+        spark_i = int(spark) if isinstance(spark, (int, float)) else None
+        return (str(uid) if uid else None, spark_i)
+    except Exception as e:
+        logger.debug("home earnings resolve: %s", e)
+        return (None, None)
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                logger.exception("_home_resolve_owner_earnings: swallowed Exception")
+
+
+def _gather_home_context(backend_port: int = 6777,
+                         model_bus_port: int = 6790) -> dict:
+    """Read the live surfaces the home is composed FROM (best-effort; degrades
+    cleanly per-source so one dead surface never empties the home)."""
+    ctx = {
+        'time_of_day': _home_time_of_day(),
+        'agents_total': 0, 'agents_running': 0,
+        'continue': [], 'hive': [], 'recipes': [],
+        'owner_uid': None, 'spark': None,
+    }
+    # Agents - the canonical truth-grounded dashboard view (no parallel query).
+    try:
+        from integrations.social.models import get_db
+        from integrations.social.dashboard_service import DashboardService
+        db = get_db()
+        try:
+            dash = DashboardService.get_dashboard(db)
+        finally:
+            db.close()
+        agents = [a for a in (dash.get('agents') or []) if isinstance(a, dict)]
+        ctx['agents_total'] = len(agents)
+        running = [a for a in agents
+                   if str(a.get('status') or '').lower()
+                   in ('running', 'in_progress', 'active')]
+        ctx['agents_running'] = len(running)
+        ctx['continue'] = [_home_agent_card(a, 'resume')
+                           for a in (running or agents)[:8]]
+        hive = [a for a in agents
+                if any(k in str(a.get('type') or '').lower()
+                       for k in ('expert', 'trained', 'agent'))]
+        ctx['hive'] = [_home_agent_card(a, 'open', target='communities')
+                       for a in hive[:8]]
+    except Exception as e:
+        logger.debug("home ctx agents: %s", e)
+    # Recipes on disk (REUSE replay surface).
+    try:
+        ctx['recipes'] = _home_recipe_cards()
+    except Exception as e:
+        logger.debug("home ctx recipes: %s", e)
+    # Real earnings (value-first hero).
+    ctx['owner_uid'], ctx['spark'] = _home_resolve_owner_earnings()
+    return ctx
+
+
+def _deterministic_home_payload(ctx: dict) -> dict:
+    """The reliable backbone: a {hero, rows} built purely from real context.
+    Always valid (Flagship is always present), so the LLM curation only has to
+    colour it - never carry it."""
+    rows: List[dict] = []
+    cont = ctx.get('continue') or []
+    if cont:
+        rows.append({'title': 'Continue', 'accent': 'teal',
+                     'see_all': 'agents_browse', 'cards': cont})
+    rows.append(_home_flagship_row())
+    apps = ctx.get('apps') or []
+    if apps:
+        rows.append({'title': 'Apps', 'note': 'installed + from the store',
+                     'accent': 'cyan', 'see_all': 'app_store', 'cards': apps})
+    rec = ctx.get('recipes') or []
+    if rec:
+        rows.append({'title': 'Recipes', 'note': 'replay without re-thinking',
+                     'accent': 'amber', 'see_all': 'recipes', 'cards': rec})
+    hive = ctx.get('hive') or []
+    if hive:
+        rows.append({'title': 'Top agents in the hive', 'note': 'from the network',
+                     'accent': 'magenta', 'see_all': 'communities',
+                     'ranked': True, 'cards': hive})
+    # Hero ONLY when there is a REAL positive Spark balance to lead with. A 0 /
+    # unresolved balance pushes rows-only so the client's own session-scoped
+    # earnings hero is preserved (never clobber a real figure with an empty one).
+    hero = None
+    spark = ctx.get('spark')
+    if isinstance(spark, (int, float)) and spark > 0:
+        hero = {
+            'eyebrow': 'Earned on the hive',
+            'amount': int(spark), 'amount_unit': 'Spark',
+            'agents': int(ctx.get('agents_running') or 0),
+            'tasks': int(ctx.get('agents_total') or 0),
+            'local': True, 'payout_pending': True,
+            'primary': {'label': 'Resume', 'action': 'resume',
+                        'target': 'recipes'},
+            'secondary': {'label': 'Ask anything', 'action': 'ask'},
+        }
+    return {'hero': hero, 'rows': rows}
+
+
+def _home_sanitize_card(c) -> Optional[dict]:
+    if not isinstance(c, dict):
+        return None
+    title = _home_clean_text(c.get('title'), 60)
+    if not title:
+        return None
+    card = {'title': title}
+    action = c.get('action')
+    card['action'] = action if action in HOME_CARD_ACTIONS else 'open'
+    icon = _home_clean_text(c.get('icon'), 40)
+    if icon and re.match(r'^[a-z0-9_]+$', icon):
+        card['icon'] = icon
+    meta = _home_clean_text(c.get('meta'), 80)
+    if meta:
+        card['meta'] = meta
+    card['topic'] = _home_clean_text(c.get('topic'), 60) or title
+    tgt = c.get('target')
+    if tgt in HOME_PANEL_TARGETS:
+        card['target'] = tgt
+    badge = _home_clean_text(c.get('badge'), 16)
+    if badge:
+        card['badge'] = badge
+    live = _home_clean_text(c.get('live'), 16)
+    if live:
+        card['live'] = live
+    if card['action'] == 'ask':
+        prompt = _home_clean_text(c.get('prompt'), 200)
+        if prompt:
+            card['prompt'] = prompt
+    img = c.get('image_url')
+    if isinstance(img, str) and (img.startswith('http://')
+                                 or img.startswith('https://')):
+        card['image_url'] = img[:500]
+    # card.image is the OFFLINE-preferred, same-origin art (bundled app logo /
+    # central agent image, #143). Allow ONLY the tightly-scoped served prefixes so
+    # a hallucinated/hostile string can never smuggle a scheme (javascript:, data:)
+    # or an off-origin URL onto the surface - it is not routed through the media
+    # cache, the browser loads it directly.
+    local_img = c.get('image')
+    if (isinstance(local_img, str)
+            and (local_img.startswith('/shell/static/app_art/')
+                 or local_img.startswith('/shell/agent-art/'))):
+        card['image'] = local_img[:200]
+    p = c.get('progress')
+    if isinstance(p, (int, float)) and 0 <= p <= 1:
+        card['progress'] = round(float(p), 3)
+    return card
+
+
+def _home_sanitize_hero(h) -> Optional[dict]:
+    if not isinstance(h, dict):
+        return None
+    amount = h.get('amount')
+    if not isinstance(amount, (int, float)) or amount <= 0:
+        return None
+    hero = {
+        'eyebrow': _home_clean_text(h.get('eyebrow'), 40) or 'Earned on the hive',
+        'amount': int(amount),
+        'amount_unit': _home_clean_text(h.get('amount_unit'), 12) or 'Spark',
+        'local': True, 'payout_pending': True,
+        'primary': {'label': 'Resume', 'action': 'resume', 'target': 'recipes'},
+        'secondary': {'label': 'Ask anything', 'action': 'ask'},
+    }
+    a = h.get('agents')
+    t = h.get('tasks')
+    if isinstance(a, (int, float)):
+        hero['agents'] = int(a)
+    if isinstance(t, (int, float)):
+        hero['tasks'] = int(t)
+    return hero
+
+
+def _sanitize_home_payload(payload) -> Optional[dict]:
+    """Coerce a (possibly LLM-authored) {hero, rows} to the schema + allow-sets,
+    dropping anything unknown/unsafe. Returns a clean payload or None when there
+    is no usable row. This is the load-bearing guard that lets the LLM compose
+    freely without being able to inject a bad accent / verb / deep-link / markup."""
+    if not isinstance(payload, dict):
+        return None
+    rows_in = payload.get('rows')
+    if not isinstance(rows_in, list):
+        return None
+    rows: List[dict] = []
+    for r in rows_in[:8]:
+        if not isinstance(r, dict):
+            continue
+        cards_in = r.get('cards')
+        if not isinstance(cards_in, list):
+            continue
+        cards = []
+        for c in cards_in[:12]:
+            cc = _home_sanitize_card(c)
+            if cc:
+                cards.append(cc)
+        if not cards:
+            continue
+        accent = r.get('accent')
+        row = {
+            'title': _home_clean_text(r.get('title'), 60) or 'Agents',
+            'accent': accent if accent in HOME_ROW_ACCENTS else 'teal',
+            'cards': cards,
+        }
+        note = _home_clean_text(r.get('note'), 60)
+        if note:
+            row['note'] = note
+        sa = r.get('see_all')
+        if sa in HOME_PANEL_TARGETS:
+            row['see_all'] = sa
+        if r.get('ranked') is True:
+            row['ranked'] = True
+        if r.get('flagship') is True:
+            row['flagship'] = True
+        rows.append(row)
+    if not rows:
+        return None
+    out = {'hero': _home_sanitize_hero(payload.get('hero')), 'rows': rows}
+    # Ambient mood/palette (§6a) — the LLM may name a HART_PALETTES id for the
+    # shell's ambient feel.  Coerced to a safe slug HERE (the load-bearing guard);
+    # the CLIENT is the single owner of the palette-id vocabulary and validates
+    # membership before calling applyPalette, so the server never forks that list.
+    mood = payload.get('mood')
+    if isinstance(mood, str):
+        slug = re.sub(r'[^a-z0-9_-]', '', mood.strip().lower())[:24]
+        if slug:
+            out['mood'] = slug
+    return out
+
+
+def _home_extract_json_obj(text: str):
+    """Pull the first JSON object out of an LLM reply (tolerant of code fences
+    and surrounding prose - the on-device 4B rarely returns bare JSON)."""
+    if not text:
+        return None
+    s = text
+    if '```' in s:
+        for part in s.split('```'):
+            p = part.strip()
+            if p.lower().startswith('json'):
+                p = p[4:].strip()
+            if p.startswith('{'):
+                s = p
+                break
+    i = s.find('{')
+    j = s.rfind('}')
+    if i < 0 or j <= i:
+        return None
+    try:
+        return json.loads(s[i:j + 1])
+    except Exception:
+        return None
+
+
+def _llm_curate_home(ctx: dict, backbone: dict, model_bus_port: int):
+    """The local LLM (the heart) is the home's COMPOSITIONAL authority: given the
+    REAL context it writes the narrative, chooses which row leads, AND now drives
+    the feel — each row's accent + emphasis and the ambient mood/palette (§6a).
+
+    Still a small, reliable JSON ask so the on-device model succeeds; the data
+    backbone (rows + cards) is already real, so the LLM only COLOURS it and can
+    never inject a row/card. Every value it returns is re-validated downstream by
+    _sanitize_home_payload against the SAME allow-sets — accent ∈ HOME_ROW_ACCENTS,
+    emphasis -> the existing flagship/ranked flags, mood -> a slug the client checks
+    against HART_PALETTES — so a hallucinated accent/mood can never reach the DOM.
+    Returns a refined payload or None (-> backbone stands)."""
+    try:
+        from core.http_pool import pooled_post
+    except Exception:
+        return None
+    titles = [r.get('title') for r in (backbone.get('rows') or [])]
+    prompt = (
+        "Compose the HART OS desktop home. Real on-device context:\n"
+        + json.dumps({
+            'time_of_day': ctx.get('time_of_day'),
+            'agents_running': ctx.get('agents_running'),
+            'agents_total': ctx.get('agents_total'),
+            'spark_earned': ctx.get('spark'),
+            'rows': titles,
+        }, ensure_ascii=False)
+        + "\nYou choose the feel. Return ONLY compact JSON: {"
+          "\"eyebrow\": <label, max 5 words>, "
+          "\"feature\": <one row title from rows to lead with>, "
+          "\"mood\": <one of "
+        + "|".join(HART_MOOD_PALETTE_IDS)
+        + " for the ambient feel>, "
+          "\"rows\": [{\"title\": <one row title from rows>, "
+          "\"accent\": <one of "
+        + "|".join(HOME_ROW_ACCENTS)
+        + ">, \"emphasis\": <flagship|ranked|normal>}]}. "
+          "Keep functional signifiers teal; accent themes each row, mood sets the "
+          "ambient palette. No em dashes, no extra text."
+    )
+    try:
+        resp = pooled_post('http://localhost:%d/v1/chat' % model_bus_port,
+                           json={'prompt': prompt, 'max_tokens': 220},
+                           timeout=12)
+        if getattr(resp, 'status_code', 0) != 200:
+            return None
+        text = resp.json().get('response', '') or ''
+    except Exception as e:
+        logger.debug("home LLM curate failed: %s", e)
+        return None
+    data = _home_extract_json_obj(text)
+    if not isinstance(data, dict):
+        return None
+    # Copy every row so per-row accent/emphasis edits (and the reorder) never mutate
+    # the backbone — it is the fallback at every step in build_home_payload.
+    out = {'hero': backbone.get('hero'),
+           'rows': [dict(r) for r in (backbone.get('rows') or [])]}
+    eyebrow = _home_clean_text(data.get('eyebrow'), 40)
+    if eyebrow and out['hero']:
+        out['hero'] = dict(out['hero'])
+        out['hero']['eyebrow'] = eyebrow
+    # Per-row accent + emphasis, applied onto the matching backbone row BY TITLE
+    # (the LLM never adds a row/card). _sanitize_home_payload re-validates accent
+    # ∈ HOME_ROW_ACCENTS and the flagship/ranked flags, so a bad value just falls
+    # back to the row's own default. Cards stay deterministic.
+    llm_rows = data.get('rows')
+    if isinstance(llm_rows, list):
+        by_title = {}
+        for lr in llm_rows:
+            if isinstance(lr, dict):
+                key = str(lr.get('title') or '').strip().lower()
+                if key:
+                    by_title[key] = lr
+        for r in out['rows']:
+            lr = by_title.get(str(r.get('title') or '').strip().lower())
+            if not lr:
+                continue
+            acc = lr.get('accent')
+            if acc in HOME_ROW_ACCENTS:
+                r['accent'] = acc
+            emph = str(lr.get('emphasis') or '').strip().lower()
+            if emph == 'flagship':
+                r['flagship'] = True
+            elif emph == 'ranked':
+                r['ranked'] = True
+    # Ambient mood/palette id — forwarded to the client (the single owner of the
+    # HART_PALETTES id list, which calls applyPalette). Sanitized to a slug in
+    # _sanitize_home_payload; a non-member is ignored client-side. This closes the
+    # "keyword router bypasses the LLM" gap: the LLM can now set the mood by
+    # composing, not only via handleThemeCommand.
+    mood = data.get('mood')
+    if isinstance(mood, str) and mood.strip():
+        out['mood'] = mood
+    # Reorder so the LLM-chosen feature row leads.
+    feat = _home_clean_text(data.get('feature'), 60).lower()
+    if feat:
+        for i, r in enumerate(out['rows']):
+            if str(r.get('title') or '').lower() == feat and i > 0:
+                out['rows'] = ([out['rows'][i]] + out['rows'][:i]
+                               + out['rows'][i + 1:])
+                break
+    return out
+
+
+def build_home_payload(backend_port: int = 6777,
+                       model_bus_port: int = 6790) -> Optional[dict]:
+    """Compose the agentic home {hero, rows} from live context + the local LLM.
+    Deterministic backbone -> LLM curation -> strict sanitize, with the backbone
+    as the fallback at every step. Returns a clean payload or None. Never raises."""
+    try:
+        ctx = _gather_home_context(backend_port, model_bus_port)
+        backbone = _deterministic_home_payload(ctx)
+        if not backbone.get('rows'):
+            return None
+        curated = _llm_curate_home(ctx, backbone, model_bus_port)
+        clean = _sanitize_home_payload(curated) if curated else None
+        if not clean:
+            clean = _sanitize_home_payload(backbone)
+        return clean
+    except Exception as e:
+        logger.debug("build_home_payload failed: %s", e)
+        return None
+
+
+def run_home_compose(reason: str = 'idle') -> bool:
+    """Daemon entry point: compose the agentic home and push it through the
+    EXISTING feed. Prefers the live in-process shell (registry) so the push
+    rides compose_home -> agent_ui_update directly; falls back, cross-process
+    (e.g. NixOS where the agent daemon and the shell are separate units), to the
+    EXISTING /api/home/compose route which calls compose_home on the live shell.
+    No new loop, no new transport. Returns True iff a push was accepted."""
+    # Cheap kill-switch short-circuit so a halted hive doesn't even spend the
+    # LLM call. The AUTHORITATIVE gate is inside agent_ui_update.
+    try:
+        from security.hive_guardrails import HiveCircuitBreaker
+        if HiveCircuitBreaker.is_halted():
+            return False
+    except Exception:
+        logger.exception("run_home_compose: swallowed Exception")
+    svc = None
+    try:
+        from core.platform.registry import get_registry
+        svc = get_registry().get_or_none('LiquidUIService')
+    except Exception:
+        svc = None
+    if svc is not None and hasattr(svc, 'compose_home_now'):
+        try:
+            return bool(svc.compose_home_now(reason=reason))
+        except Exception as e:
+            logger.debug("run_home_compose in-process failed: %s", e)
+            return False
+    # Cross-process: build here, POST to the existing compose route.
+    try:
+        payload = build_home_payload()
+        if not payload:
+            return False
+        from core.http_pool import pooled_post
+        port = int(os.environ.get('HART_SHELL_PORT', '6800'))
+        resp = pooled_post('http://127.0.0.1:%d/api/home/compose' % port,
+                           json={'payload': payload,
+                                 'agent_id': 'home_composer'}, timeout=10)
+        return getattr(resp, 'status_code', 0) == 200
+    except Exception as e:
+        logger.debug("run_home_compose cross-process failed: %s", e)
+        return False

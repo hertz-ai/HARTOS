@@ -610,15 +610,28 @@ class TestIngestSensorBatch(unittest.TestCase):
 
     @patch('integrations.agent_engine.world_model_bridge.pooled_post')
     def test_successful_ingest(self, mock_post):
-        """FT: Successful batch ingest returns count of readings."""
+        """FT: camera/audio readings ride /v1/sensor/ingest; returns accepted count.
+
+        Sensor types with no /v1/sensor/ingest modality (imu/gps/...) are
+        intentionally skipped (not posted as an unsupported modality), so the
+        return is the count of readings the endpoint can actually learn from.
+        """
         bridge = _make_bridge()
         bridge._http_disabled = False
         bridge._api_url = 'http://localhost:9999'
         mock_post.return_value = MagicMock(status_code=200)
 
-        readings = [{'sensor': 'temp', 'value': 25.0}] * 5
+        readings = [
+            {'sensor_id': 'cam_0', 'sensor_type': 'camera',
+             'data': {'frame_base64': 'QUJD', 'stream_source': 'camera'}},
+            {'sensor_id': 'mic_0', 'sensor_type': 'audio',
+             'data': {'pcm_base64': 'QUJD', 'stream_source': 'mic'}},
+            {'sensor_id': 'imu_0', 'sensor_type': 'imu', 'data': {'accel_x': 1.0}},
+        ]
         count = bridge.ingest_sensor_batch(readings)
-        self.assertEqual(count, 5)
+        # camera + audio accepted; imu skipped (no modality branch)
+        self.assertEqual(count, 2)
+        self.assertEqual(mock_post.call_count, 2)
 
 
 class TestEmergencyStop(unittest.TestCase):

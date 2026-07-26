@@ -1,6 +1,6 @@
 <h1 align="center">HART OS</h1>
 <p align="center"><strong>Hevolve Hive Agentic Runtime</strong></p>
-<p align="center">Self-improving Python agent runtime. Local-first, federated, OpenAI-compatible.</p>
+<p align="center">The AI-native operating system for every device, from your computer to embodied AI. Local-first, federated, OpenAI-compatible.</p>
 
 <p align="center">
   <a href="https://hevolve.ai"><img src="https://img.shields.io/badge/Live%20demo-hevolve.ai-FFD700?style=flat-square" alt="Live demo"></a>
@@ -10,11 +10,64 @@
   <a href="https://github.com/hertz-ai/Nunba"><img src="https://img.shields.io/badge/Frontend-Nunba-5865F2?style=flat-square" alt="Nunba"></a>
 </p>
 
-> **HART** = bare engine (`pip install hart-backend`, listens on `:6777`).
-> **HART OS** = HART + admin desktop (model catalog, channel pairing, agent dashboard, hive view, settings).
-> **[Nunba](https://github.com/hertz-ai/Nunba)** = consumer companion app, signed Windows / macOS / Linux installers.
+> **HART** = the bare engine (`pip install hart-backend`, listens on `:6777`).
+> **HART OS** = the full AI-native OS. It boots on a laptop, server, or edge node, runs on phones, and reaches into embodied AI, and it ships the agentic Liquid Shell, Model Bus, model catalog, channel pairing, agent dashboard, and hive view.
+> **[Nunba](https://github.com/hertz-ai/Nunba)** = the consumer companion app, one signed client across Windows / macOS / Linux.
 
-One Python codebase, three deploy topologies (flat laptop / regional LAN / central cloud mesh). Speaks the OpenAI protocol on `:6777/v1/chat/completions`. Federates with peer nodes over PeerLink (direct P2P WebSocket, no broker). Boot-time guardrail hash + 300 s re-verification + Ed25519 release signing.
+**AI-native** means the OS adapts to the machine, not the other way around. On each device it probes what the hardware can actually do, serves LLM, vision, and speech to every app over the Model Bus (socket, D-Bus, or HTTP), and lets the on-device model compose the interface and learn each task once so it can replay it later. The runtime that drives a desktop is the same one that drives a robot, so a robot's AI access is just another Model Bus call. It is one Python codebase that runs in three shapes (flat laptop, regional LAN, or central cloud mesh), speaks the OpenAI protocol on `:6777/v1/chat/completions`, and federates with peers over PeerLink (direct peer-to-peer WebSocket, no broker). A boot-time guardrail hash, re-checked every 300 seconds, plus Ed25519 release signing, keep humans in control.
+
+You would notice it last, the way you notice anything alive: it improves on its own. Each node learns from what it does and gets quietly better, locally, on your own hardware, with nothing leaving the device. Calling an operating system alive should make you reach for the off switch, so that came first: the self-improvement is a toggle, every node is killable on its own, and it runs only as long as you let it.
+
+This README is written to be read by people and by agents alike. Every capability below names the file it lives in, so whether you are a developer or an AI agent exploring the repo, you can go from a feature straight to its source.
+
+---
+
+> **Status: public alpha.** The runtime, the Model Bus and the channel
+> adapters are in daily use; APIs still move. Issues and PRs are genuinely
+> wanted — see [Contributing](CONTRIBUTING.md).
+
+---
+
+## Table of Contents
+
+- [Why HART OS?](#why-hart-os)
+- [60-second start](#60-second-start)
+- [How it compares](#how-it-compares)
+- [Capabilities](#capabilities)
+- [Hello, agent](#hello-agent)
+- [Architecture map](#architecture-map)
+- [API surface](#api-surface)
+- [How auto-evolve works](#how-auto-evolve-works)
+- [How hive connectivity works](#how-hive-connectivity-works)
+- [Topology](#topology)
+- [Build / extend](#build--extend)
+- [Economics (for node operators)](#economics-for-node-operators)
+- [Documentation index](#documentation-index)
+- [License](#license)
+
+---
+
+## Why HART OS?
+
+Most software described as AI-powered ships an assistant: a separate app,
+usually talking to somebody else's server, that can drive a few functions.
+Remove the assistant and everything underneath works exactly as before.
+
+HART OS inverts that. Inference becomes a service the system provides, the
+way it provides a filesystem or a network stack. An application does not
+bundle a model or hold an API key — it asks the OS, and the OS decides which
+model answers, running locally where it can. Ten apps on one machine do not
+each load their own copy or each pay their own bill.
+
+That has a practical consequence worth stating plainly: **every device
+becomes the same target.** The runtime driving a laptop is the runtime
+driving a robot, so a robot's AI access is just another Model Bus call, and
+code written against `:6777/v1/chat/completions` runs unchanged on both.
+
+**If you are here to contribute**, the parts that most need outside eyes are
+the auto-evolve loop (`autoresearch_loop.py`), the guardrails that gate every
+self-improvement (`hive_guardrails.py`), and the 31 channel adapters — the
+most self-contained place to start. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
@@ -81,7 +134,7 @@ curl -X POST http://localhost:6777/v1/chat/completions \
 | **Per-agent baselines** | Per-agent snapshots at `agent_data/baselines/<agent_id>.json`, used as the regression floor | `agent_baseline_service.py` |
 | **Coding benchmark tracker** | SQLite-backed coding benchmarks (`coding_benchmarks.db`), HumanEval / MBPP / custom suites | `integrations/coding_agent/benchmark_tracker.py` |
 | **Hive benchmark prover** | Cryptographic proof that a benchmark was run on the claimed model + dataset (resists fake-score federation) | `hive_benchmark_prover.py` |
-| **Continual learner gate** | Blocks model swap if learner forgets prior tasks (catastrophic-forgetting guard) | `continual_learner_gate.py` |
+| **Continual learner gate** | Gates access to hive learning by verified compute contribution (Compute Contribution Tokens): no contribution, no learning | `continual_learner_gate.py` |
 | **PR review service** | Auto-rejects PRs on baseline regression or guardrail mismatch | `pr_review_service.py` |
 | **Upgrade orchestrator** | 7-stage pipeline: BUILD -> TEST -> AUDIT -> BENCHMARK -> SIGN -> CANARY -> DEPLOY | `upgrade_orchestrator.py` |
 | **OTA service** | systemd service does daily check + cryptographically-verified upgrade | `hart-update-service.py` |
@@ -94,7 +147,7 @@ curl -X POST http://localhost:6777/v1/chat/completions \
 | **NAT traversal** | UDP hole-punching, STUN-style fallbacks for residential NATs | `core/peer_link/nat.py` |
 | **Hivemind handler** | Tier-aware routing (flat / regional / central), connection budget per tier (10 / 50 / 200) | `core/peer_link/hivemind_handler.py` |
 | **FederatedAggregator** | Equal-weighted delta merging (log1p-floor, not hardware tier). Channels: model deltas, resonance, recipes, event counters | `federated_aggregator.py` |
-| **Federated gradient protocol** | Cross-node gradient sharing with provenance tags, no raw data leaves the node | `federated_gradient_protocol.py` |
+| **Federated gradient protocol** | Optional weight-level sync interface (Phase 2, not active); the hive shares derived, signed, privacy-scoped learning, never raw data or model weights | `federated_gradient_protocol.py` |
 | **Federation handshake** | Peer presents guardrail hash; mismatch = connection refused; re-verified every 300 s | `integrations/social/federation.py` |
 | **Gossip + verification** | Tier-aware gossip with cert verification, peer-verified task results | `integrity_service.py`, gossip layer |
 | **EventBus + WAMP bridge** | In-process EventBus auto-publishes to Crossbar WAMP when `CBURL` env set; remote nodes subscribe to `com.hartos.event.*` topics | `core/platform/events.py` |

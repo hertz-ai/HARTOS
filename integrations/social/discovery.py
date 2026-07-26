@@ -406,6 +406,22 @@ def peer_broadcast():
             logger.debug(f"peer_broadcast ralt dispatch failed: {e}")
             return jsonify({'success': False, 'reason': str(e)}), 500
 
+    elif msg_type == 'recipe_available':
+        # PROACTIVE recipe capability mesh: an admitted peer banked an
+        # exportable recipe and advertised it (peer_reuse
+        # .announce_recipe_available). Cache it so the daemon can pull
+        # directly, skipping the O(peers) discovery sweep. Trust +
+        # echo-skip live in on_recipe_available_advert.
+        try:
+            from integrations.google_a2a.peer_reuse import (
+                on_recipe_available_advert)
+            result = on_recipe_available_advert(msg)
+            status = 200 if result.get('success') else 202
+            return jsonify(result), status
+        except Exception as e:
+            logger.debug(f"peer_broadcast recipe advert dispatch failed: {e}")
+            return jsonify({'success': False, 'reason': str(e)}), 500
+
     # Forward-compatible: ack unknown types without error so older
     # peers don't see 5xx from newer payloads, but mark dispatched=False
     # so the sender knows nothing happened.
@@ -1224,6 +1240,48 @@ def hierarchy_node_assignment(node_id):
         db.close()
 
 
+def _verify_sync_sender(db, data: dict) -> bool:
+    """P4 node-identity gate for hierarchy_sync — central must know WHICH node
+    sent a batch before applying it (closes the unauthenticated-ingress IDOR).
+
+    Returns True if the batch may be applied: a valid node signature (verified
+    against the node's registered PeerNode.public_key) always passes. An
+    unsigned/invalid batch passes ONLY when enforcement mode is not 'hard'
+    (a non-breaking migration path for un-upgraded nodes), logging a warning.
+    'hard' mode requires a valid signature — fail-closed."""
+    from .models import PeerNode
+    node_id = data.get('node_id')
+    sig = data.get('signature', '')
+    if node_id and sig:
+        try:
+            from security.node_integrity import verify_json_signature
+            # The signed/verified surface is EXACTLY {items, node_id}: the node
+            # signs it pre-E2E and decrypt_json_from_peer pops _provenance back
+            # off before we see `data`. Any key added to `data` before this
+            # verify would break every signature — keep the decrypted payload
+            # clean, or update _signed_send_payload in lockstep.
+            peer = db.query(PeerNode).filter_by(node_id=node_id).first()
+            pk = getattr(peer, 'public_key', None) if peer else None
+            if pk and verify_json_signature(pk, data, sig):
+                return True
+        except Exception:
+            pass
+    # No valid signature. Apply ONLY outside hard enforcement (migration path).
+    # If the mode can't be determined, fail closed — this module's whole job.
+    try:
+        from security.master_key import get_enforcement_mode
+        mode = get_enforcement_mode()
+    except Exception:
+        mode = 'hard'
+    if mode == 'hard':
+        logger.warning("hierarchy_sync: REJECTED unverified batch from "
+                       "node_id=%s (hard enforcement)", node_id)
+        return False
+    logger.warning("hierarchy_sync: applying unverified batch from node_id=%s "
+                   "(no/invalid signature; non-hard enforcement)", node_id)
+    return True
+
+
 @discovery_bp.route('/api/social/hierarchy/sync', methods=['POST'])
 def hierarchy_sync():
     """Receive sync batch from a child node. Supports E2E encrypted envelopes."""
@@ -1244,6 +1302,11 @@ def hierarchy_sync():
         return jsonify({'success': True, 'processed': [], 'errors': []})
     db = get_db()
     try:
+        # P4: verify the sender's node identity before applying (closes the
+        # unauthenticated-ingress IDOR). Fail-closed in hard enforcement.
+        if not _verify_sync_sender(db, data):
+            return jsonify({'success': False,
+                            'error': 'unverified node identity'}), 403
         result = SyncEngine.receive_sync_batch(db, items)
         db.commit()
         return jsonify({'success': True, **result})

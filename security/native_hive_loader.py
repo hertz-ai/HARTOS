@@ -531,7 +531,16 @@ def load_native_lib(force_reload: bool = False) -> Tuple[bool, str]:
 
     # Verify binary signature
     sig_ok, sig_msg = _verify_binary_signature(path)
-    enforcement = os.environ.get('HEVOLVE_ENFORCEMENT_MODE', 'warn').lower()
+    # Reuse the CANONICAL enforcement resolver (default 'hard' — the correct Sybil/
+    # supply-chain default). The prior inline os.environ default of 'warn' was a
+    # parallel path that let an UNSIGNED intelligence-layer binary load by default;
+    # get_enforcement_mode() makes the default fail-closed (refuse unsigned) consistent
+    # with the peer-handshake path. No new mechanism — same env var, one resolver.
+    try:
+        from security.master_key import get_enforcement_mode
+        enforcement = get_enforcement_mode()
+    except Exception:
+        enforcement = os.environ.get('HEVOLVE_ENFORCEMENT_MODE', 'hard').lower()
     if not sig_ok:
         if enforcement == 'hard':
             _stub_mode = True

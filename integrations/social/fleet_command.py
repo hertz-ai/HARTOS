@@ -120,15 +120,29 @@ class FleetCommandService:
     def push_broadcast(
         db, cmd_type: str, params: dict,
         tier_filter: str = '', issued_by: str = '',
+        node_ids: Optional[List[str]] = None,
     ) -> List[Dict]:
-        """Broadcast a command to all nodes (optionally filtered by tier).
+        """Broadcast a command to all active nodes (optionally scoped).
+
+        ONE fan-out path for every broadcast: it signs one FleetCommand per
+        target via push_command.  Two optional scopes (AND-combined):
+
+          * tier_filter — restrict to a capability tier (e.g. 'embedded').
+          * node_ids    — an explicit allowlist of target node_ids.  Used by a
+            REGIONAL OTA publish to scope fan-out to exactly the locals its
+            region hosts (the central-issued RegionAssignment set) so a regional
+            can never command nodes outside its region.  An EMPTY list means
+            "no targets" (returns []), NOT "all nodes" — a scoped caller that
+            resolves no members must fan out to nobody, never fall through to a
+            global broadcast.
 
         Args:
             db: SQLAlchemy session.
             cmd_type: One of VALID_COMMAND_TYPES.
             params: Command-specific parameters.
-            tier_filter: Optional tier to target (e.g. 'embedded', 'observer').
+            tier_filter: Optional capability tier to target.
             issued_by: Node ID of the issuer.
+            node_ids: Optional explicit node_id allowlist (None = unscoped).
 
         Returns:
             List of command dicts created.
@@ -139,10 +153,17 @@ class FleetCommandService:
             logger.warning(f"Fleet: rejected broadcast with invalid type '{cmd_type}'")
             return []
 
-        # Find target nodes
+        # An explicitly-empty allowlist scopes to nobody — never widen to all.
+        if node_ids is not None and len(node_ids) == 0:
+            logger.info("Fleet: scoped broadcast with empty allowlist — 0 targets")
+            return []
+
+        # Find target nodes (active only). Scopes are AND-combined.
         query = db.query(PeerNode).filter(PeerNode.status == 'active')
         if tier_filter:
             query = query.filter(PeerNode.capability_tier == tier_filter)
+        if node_ids is not None:
+            query = query.filter(PeerNode.node_id.in_(list(node_ids)))
 
         peers = query.all()
         results = []
@@ -158,6 +179,7 @@ class FleetCommandService:
         logger.info(
             f"Fleet: broadcast {cmd_type} to {len(results)} nodes"
             f"{f' (tier={tier_filter})' if tier_filter else ''}"
+            f"{f' (scoped to {len(node_ids)} ids)' if node_ids is not None else ''}"
         )
         return results
 
@@ -285,37 +307,151 @@ class FleetCommandService:
             return {'success': False, 'message': str(e)}
 
     @staticmethod
-    def verify_command_signature(cmd_dict: dict) -> bool:
+    def verify_command_signature(cmd_dict: dict, db=None) -> bool:
         """Verify a command was signed by an authorized node (central/regional).
 
+        TWO independent checks, BOTH must pass:
+
+          1. CRYPTOGRAPHIC — the command's Ed25519 ``signature`` verifies,
+             via ``security.node_integrity.verify_signature``, against the
+             ISSUER's ``PeerNode.public_key`` over the canonical signing
+             message (``_command_signing_message``).  A forged or tampered
+             command fails here — a relay can PROPAGATE a signed command but
+             has no key to forge or re-sign one.
+          2. AUTHORITY — the issuer is a known, non-dead/banned PeerNode whose
+             topology ``tier`` is central or regional (the same authority set
+             ``_verify_issuer`` enforces on the durable-queue path).
+
+        Self-issued commands (issued_by == this node) are trusted without the
+        PeerNode lookup — a node signs its own commands with its own key and is
+        not listed as its own peer.  The signature is still required.
+
         Args:
-            cmd_dict: Command dict with 'signature' and 'issued_by' fields.
+            cmd_dict: Command dict with ``signature``, ``issued_by``,
+                ``cmd_type``, ``params`` (or ``params_json``) and
+                ``target_node_id`` fields — i.e. a ``FleetCommand.to_dict()``
+                or the same shape published on the 'fleet.command' bus.
+            db: Optional SQLAlchemy session.  When omitted a short-lived one is
+                opened (the realtime bus/listener path has no request session).
 
         Returns:
-            True if signature is valid and issuer is authorized.
+            True iff the signature is cryptographically valid AND the issuer is
+            an authorized central/regional node.  Fail-closed on any error.
         """
         signature = cmd_dict.get('signature', '')
         issued_by = cmd_dict.get('issued_by', '')
-
         if not signature or not issued_by:
             return False
 
-        try:
-            from security.key_delegation import verify_tier_authorization
-            # Central and regional nodes are authorized to issue commands
-            return verify_tier_authorization(issued_by, required_tier='regional')
-        except ImportError:
-            # If key_delegation unavailable, verify via guardrail hash
+        cmd_type = cmd_dict.get('cmd_type', '')
+        target_node_id = cmd_dict.get('target_node_id', '')
+        params = cmd_dict.get('params')
+        if params is None:
+            raw = cmd_dict.get('params_json')
             try:
-                from security.hive_guardrails import verify_guardrail_integrity
-                return verify_guardrail_integrity()
-            except ImportError:
+                params = json.loads(raw) if raw else {}
+            except (ValueError, TypeError):
+                params = {}
+
+        # Resolve the issuer's verifying public key + authority tier.
+        # Self-issued: use this node's own key, tier is implicitly authorized
+        # (a node may always command itself; the bus/relay still requires a
+        # valid self-signature so a replayed-but-mutated command is rejected).
+        self_id = _get_self_node_id()
+        issuer_pubkey_hex = ''
+        if issued_by == self_id:
+            try:
+                from security.node_integrity import get_public_key_hex
+                issuer_pubkey_hex = get_public_key_hex()
+            except Exception:
                 return False
+        else:
+            owns_db = False
+            if db is None:
+                try:
+                    from .models import get_db
+                    db = get_db()
+                    owns_db = True
+                except Exception:
+                    return False  # no way to authorize a foreign issuer
+            try:
+                from .models import PeerNode
+                peer = db.query(PeerNode).filter_by(node_id=issued_by).first()
+                if not peer:
+                    return False
+                if peer.status in ('dead', 'banned'):
+                    return False
+                issuer_tier = peer.tier or 'flat'
+                if issuer_tier not in ('central', 'regional'):
+                    return False
+                # REGION SCOPE (cross-region privilege-escalation guard).
+                # The HTTP initiate routes scope a REGIONAL's fan-out to its own
+                # sub-fleet, but a compromised/rogue regional can bypass the
+                # route by directly Ed25519-signing a command aimed at a node in
+                # ANOTHER region and putting it on the bus.  The trust model the
+                # APPLY path enforces must therefore independently reject that:
+                # a regional issuer may only target nodes in its OWN region.
+                # Only a CENTRAL issuer may target globally.  A targetless
+                # broadcast envelope (target_node_id == '') is never honoured
+                # from a regional here — a regional broadcast is materialised as
+                # one per-target signed command (push_broadcast), each of which
+                # carries a concrete target this check can scope.
+                if issuer_tier == 'regional' and not _target_in_region(
+                        db, issued_by, target_node_id):
+                    return False
+                issuer_pubkey_hex = peer.public_key or ''
+            except Exception:
+                return False
+            finally:
+                if owns_db:
+                    db.close()
+
+        if not issuer_pubkey_hex:
+            return False
+
+        # Cryptographic verification over the canonical signing message.
+        try:
+            from security.node_integrity import verify_signature
+            sig_bytes = bytes.fromhex(signature) if isinstance(signature, str) \
+                else bytes(signature)
+            msg = _command_signing_message(cmd_type, params, target_node_id)
+            return verify_signature(issuer_pubkey_hex, msg, sig_bytes)
+        except (ValueError, TypeError):
+            return False
+        except Exception:
+            return False
 
 
 # ═══════════════════════════════════════════════════════════════
 # Issuer verification
 # ═══════════════════════════════════════════════════════════════
+
+def _target_in_region(db, regional_node_id: str, target_node_id: str) -> bool:
+    """Is ``target_node_id`` inside ``regional_node_id``'s own sub-fleet?
+
+    The cross-region authority guard for a REGIONAL-issued command.  REUSES the
+    SINGLE source of truth for region membership — HierarchyService
+    .region_member_node_ids (the central-issued RegionAssignment rows) — so a
+    regional can never target a node outside the region central assigned it.
+
+    A regional may also legitimately command ITSELF (its own node_id), which is
+    not listed as its own RegionAssignment member.  Everything else is rejected.
+
+    Fail-CLOSED: an empty target, a missing membership set, or any DB error
+    returns False — an unverifiable region scope must never widen a regional's
+    reach to another region.
+    """
+    if not target_node_id:
+        return False  # a regional may not issue a targetless/global command
+    if target_node_id == regional_node_id:
+        return True  # a regional may command itself
+    try:
+        from .hierarchy_service import HierarchyService
+        members = HierarchyService.region_member_node_ids(db, regional_node_id)
+        return target_node_id in members
+    except Exception:
+        return False  # fail-closed — can't prove scope ⇒ refuse
+
 
 def _verify_issuer(db, issued_by: str) -> bool:
     """Check that a fleet command issuer exists in PeerNode and has authority.
@@ -740,12 +876,31 @@ def _get_self_node_id() -> str:
         return 'unknown'
 
 
+def _command_signing_message(cmd_type: str, params: dict,
+                             target_node_id: str) -> bytes:
+    """Canonical bytes a fleet command's signature covers.
+
+    SINGLE source of truth for the signed payload so the signer
+    (``_sign_command``) and the verifier (``verify_command_signature``)
+    can never drift.  Sorted-key JSON makes the encoding deterministic
+    across nodes and Python versions.
+    """
+    message = f"{cmd_type}:{json.dumps(params, sort_keys=True)}:{target_node_id}"
+    return message.encode()
+
+
 def _sign_command(cmd_type: str, params: dict, target_node_id: str) -> str:
-    """Sign a command with this node's private key."""
+    """Sign a command with this node's private key.
+
+    Returns a HEX-encoded Ed25519 signature (stable, round-trippable text
+    for the FleetCommand.signature column and the 'fleet.command' wire
+    envelope).  Empty string when signing is unavailable — the durable DB
+    queue + issuer re-verification remain the trust fallback.
+    """
     try:
         from security.node_integrity import sign_message
-        message = f"{cmd_type}:{json.dumps(params, sort_keys=True)}:{target_node_id}"
-        return sign_message(message.encode())
+        sig = sign_message(_command_signing_message(cmd_type, params, target_node_id))
+        return sig.hex() if isinstance(sig, (bytes, bytearray)) else str(sig)
     except (ImportError, Exception) as e:
         logger.debug(f"Fleet: command signing unavailable: {e}")
         return ''

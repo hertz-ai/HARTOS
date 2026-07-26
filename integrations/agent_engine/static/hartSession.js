@@ -15,25 +15,25 @@
   var blob = null, loaded = false, waiters = [], saveTimer = null;
 
   function load() {
-    fetch(API).then(function (r) { return r.json(); }).then(finish).catch(function () { finish({}); });
+    fetch(API).then(function (r) { return r.json(); }).then(finish).catch(function (e) { console.error('hartSession: state load failed, starting with empty state', e); finish({}); });
   }
   function finish(d) {
     blob = (d && typeof d === 'object') ? d : {};
     loaded = true;
     var ws = waiters; waiters = [];
-    ws.forEach(function (cb) { try { cb(blob); } catch (e) {} });
+    ws.forEach(function (cb) { try { cb(blob); } catch (e) { console.error('hartSession: ready() waiter callback threw', e); } });
   }
   function save() {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(function () {
       fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-                   body: JSON.stringify(blob || {}) }).catch(function () {});
+                   body: JSON.stringify(blob || {}) }).catch(function (e) { console.error('hartSession: state persist POST failed', e); });
     }, 500);
   }
 
   window.HartSession = {
     // cb(blob) once the blob is loaded (immediately if already loaded).
-    ready: function (cb) { if (loaded) { try { cb(blob); } catch (e) {} } else if (cb) waiters.push(cb); },
+    ready: function (cb) { if (loaded) { try { cb(blob); } catch (e) { console.error('hartSession: ready() immediate callback threw', e); } } else if (cb) waiters.push(cb); },
     get: function (k, dflt) { return (blob && Object.prototype.hasOwnProperty.call(blob, k)) ? blob[k] : dflt; },
     set: function (k, v) { if (!blob) blob = {}; blob[k] = v; save(); }
   };
@@ -48,7 +48,7 @@
     catch (e) {
       if (typeof AbortController === 'undefined') return null;
       var ac = new AbortController();
-      setTimeout(function () { try { ac.abort(); } catch (x) {} }, ms);
+      setTimeout(function () { try { ac.abort(); } catch (x) { console.debug('hartSession: timeout abort failed', x); } }, ms);
       return ac.signal;
     }
   };

@@ -153,6 +153,13 @@ def test_static_js_is_webkitgtk_safe():
     else; no template literals / optional chaining / nullish coalescing either."""
     raw_total = 0
     for name in _static_js():
+        # Vendored, minified third-party bundles (e.g. lottie.min.js — the offline
+        # Hevolve boot-splash player) are NOT HART-authored: we cannot rewrite their ES
+        # syntax, and their browser-compat is the vendor's concern (they are still
+        # parse-checked by test_all_static_js_syntax_ok via `node --check`). These bans
+        # are a HART CODE-STYLE rule for the shell JS we OWN, so skip vendored *.min.js.
+        if name.endswith('.min.js'):
+            continue
         src = open(os.path.join(STATIC_DIR, name), encoding='utf-8').read()
         n = src.count('AbortSignal.timeout(')
         raw_total += n
@@ -169,7 +176,12 @@ def test_referenced_static_assets_exist():
     missing file means the shell serves a 404 and that feature silently dies
     (the bundling end-to-end gap)."""
     src = _shell_source()
-    refs = set(re.findall(r'/shell/static/([A-Za-z0-9_.\-]+)', src))
+    # Capture the FULL path after /shell/static/ (incl. nested dirs like app_art/x.svg);
+    # `/` is in the class so nested asset references resolve to the real file, not just
+    # the first path segment. A trailing-slash reference (a startswith dir prefix, e.g.
+    # '/shell/static/app_art/') resolves to the directory.
+    refs = set(re.findall(r'/shell/static/([A-Za-z0-9_.\-/]+)', src))
     assert refs, 'no /shell/static refs found — wiring regression'
     for asset in sorted(refs):
-        assert os.path.isfile(os.path.join(STATIC_DIR, asset)), 'referenced but missing on disk: ' + asset
+        assert os.path.exists(os.path.join(STATIC_DIR, asset.rstrip('/'))), \
+            'referenced but missing on disk: ' + asset

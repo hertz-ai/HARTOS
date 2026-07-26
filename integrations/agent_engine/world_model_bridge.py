@@ -59,6 +59,15 @@ class WorldModelBridge:
         atexit.register(lambda: self._flush_executor.shutdown(wait=False))
         self._flush_batch_size = int(os.environ.get(
             'HEVOLVE_WM_FLUSH_BATCH', '50'))
+        # Real-throughput signal for check_health: WHEN experiences last actually
+        # reached the world model (a completed flush), not just whether the provider
+        # object exists. learning_active is derived from this, so a bridge that is
+        # reachable but flushing nothing -- the 50-batch buffer filling into the void,
+        # the local-model 0-spark trap -- honestly reports learning_active=False
+        # instead of a hardcoded True (audit #1.3).
+        self._last_flush_at = None
+        self._active_window_s = float(os.environ.get(
+            'HEVOLVE_WM_ACTIVE_WINDOW', '300'))
         self._lock = threading.Lock()
         self._stats = {
             'total_recorded': 0,
@@ -798,6 +807,7 @@ class WorldModelBridge:
                     )
                     with self._lock:
                         self._stats['total_flushed'] += 1
+                        self._last_flush_at = time.time()
                 except Exception as e:
                     logger.debug(f"In-process flush error: {e}")
             return
@@ -854,6 +864,7 @@ class WorldModelBridge:
                 self._cb_record_success()
                 with self._lock:
                     self._stats['total_flushed'] += 1
+                    self._last_flush_at = time.time()
                     _first_flush = self._stats['total_flushed'] == 1
                 # One-time log on first successful HTTP flush so operators
                 # see Direction A go live without grepping for tensorboard
@@ -1707,18 +1718,45 @@ class WorldModelBridge:
 
     # ─── Health ──────────────────────────────────────────────────────
 
+    def _learning_active(self, now: float = None) -> bool:
+        """True ONLY when experiences have actually reached the world model recently
+        (a completed flush within the active window) — not because the provider object
+        exists or /health returned 200. A reachable bridge that is buffering into the
+        void reports False here, the honest signal (audit #1.3)."""
+        if self._last_flush_at is None:
+            return False
+        if now is None:
+            now = time.time()
+        return (now - self._last_flush_at) < self._active_window_s
+
+    def _throughput_fields(self) -> dict:
+        """Honest learning-throughput fields shared by every check_health branch:
+        whether experiences are actually FLOWING to the world model, plus the raw
+        counters + buffer depth so 'buffering into the void' (buffered > 0 while
+        flushed is stalled and learning_active is False) is visible, not hidden."""
+        now = time.time()
+        return {
+            'learning_active': self._learning_active(now),
+            'total_recorded': self._stats.get('total_recorded', 0),
+            'total_flushed': self._stats.get('total_flushed', 0),
+            'experiences_buffered': len(self._experience_queue),
+            'last_flush_age_seconds': (round(now - self._last_flush_at, 1)
+                                       if self._last_flush_at is not None else None),
+        }
+
     def check_health(self) -> dict:
         """Check learning pipeline health.
 
-        In-process: returns healthy if provider is available.
-        HTTP: GET /health on HevolveAI API.
+        `healthy` reflects REACHABILITY (provider present / API answering). Learning
+        activity is NOT asserted from that — `learning_active` (in _throughput_fields)
+        reflects whether experiences are actually reaching the world model.
         """
         if self._in_process and self._provider:
             return {
                 'healthy': True,
-                'learning_active': True,
                 'mode': 'in_process',
                 'node_tier': self._node_tier,
+                **self._throughput_fields(),
             }
 
         # HTTP fallback
@@ -1737,10 +1775,10 @@ class WorldModelBridge:
                     'content-type', '').startswith('application/json') else {}
                 return {
                     'healthy': True,
-                    'learning_active': True,
                     'mode': 'http',
                     'node_tier': self._node_tier,
                     'details': data,
+                    **self._throughput_fields(),
                 }
             return {
                 'healthy': False,
@@ -1769,6 +1807,38 @@ class WorldModelBridge:
             }
 
     # ─── Embodied interaction (same latent space) ────────────────
+
+    def _propagate_embodied_error(self, where: str, *, action: Optional[dict] = None,
+                                  exc: Optional[BaseException] = None,
+                                  status: Optional[int] = None) -> None:
+        """Route an embodied action/sensor/feedback failure into the hive's
+        CANONICAL error machinery — not just the local circuit breaker.
+
+        1. record the local breaker failure (fast-fail at threshold — fronts the
+           embodied backend so a dead HevolveAI isn't hammered);
+        2. record into the central ``ExceptionCollector`` so the hive's
+           SelfHealingDispatcher sees the embodied-error PATTERN and can raise a
+           fix goal — the SAME single error sink every other backend uses.
+
+        Node/subsystem reachability is deliberately NOT re-broadcast here: the
+        breaker state is already exposed by ``check_health`` (dashboard) and node
+        health by ``peer_discovery.get_health`` — one health source of truth, no
+        bespoke second channel (a prior ``embodied.backend_down`` gossip had no
+        consumer and duplicated that mechanism; removed).
+
+        Fire-and-forget: never raises into the embodied control path."""
+        self._cb_record_failure()
+        try:
+            from exception_collector import ExceptionCollector
+            _e = exc if exc is not None else RuntimeError(
+                f"embodied {where} failed (status={status}) at {self._api_url}")
+            ExceptionCollector.get_instance().record(
+                _e, module='world_model_bridge', function=where,
+                context={'api_url': self._api_url, 'status': status,
+                         'action_type': (action or {}).get('type'),
+                         'node_tier': self._node_tier})
+        except Exception:
+            pass
 
     def send_action(self, action: dict) -> bool:
         """Send a motor/actuator command to HevolveAI's world model.
@@ -1805,14 +1875,32 @@ class WorldModelBridge:
         # propagation when outcomes differ from predictions.  No separate
         # action_stream module — the correction path handles backprop.
 
-        # HTTP fallback
+        # HTTP fallback. There is NO /v1/actions motor endpoint on HevolveAI:
+        # the downstream is sensor-ingest-centric, not action-centric. An
+        # action is a generated PREDICTION the world model tests against
+        # reality (see the latent-space note above), so it rides the SAME
+        # /v1/sensor/ingest mouth as every other observation -- tagged
+        # reality_signature=0.0 (generated, not a physical sensor) and carried
+        # on the endpoint's existing text modality. No new endpoint, no
+        # parallel path.
         if self._http_disabled or self._cb_is_open():
             return False
 
+        import base64
+        action_json = json.dumps(action)
         try:
             resp = pooled_post(
-                f'{self._api_url}/v1/actions',
-                json=action,
+                f'{self._api_url}/v1/sensor/ingest',
+                json={
+                    'modality': 'text',
+                    'source': 'agent_response',
+                    'data': base64.b64encode(
+                        action_json.encode('utf-8')).decode('ascii'),
+                    'format': 'text',
+                    'text': action_json,
+                    'session_id': f"{action.get('target', '_')}_action",
+                    'reality_signature': 0.0,
+                },
                 timeout=self._timeout_default,
             )
             if resp.status_code in (200, 201):
@@ -1821,11 +1909,28 @@ class WorldModelBridge:
                     self._stats['total_actions_sent'] = self._stats.get(
                         'total_actions_sent', 0) + 1
                 return True
-            self._cb_record_failure()
+            self._propagate_embodied_error(
+                'send_action', action=action, status=resp.status_code)
             return False
-        except requests.RequestException:
-            self._cb_record_failure()
+        except requests.RequestException as e:
+            self._propagate_embodied_error('send_action', action=action, exc=e)
             return False
+
+    def instruct(self, instruction: str, observation: Optional[Dict] = None,
+                 horizon: int = 8, target: str = '*') -> bool:
+        """High-level embodied 'think + act': hand a natural-language goal + the
+        current observation to the VLA policy (Qwen-RobotSuite class) in ONE call
+        — the embodied analog of asking an LLM a question.
+
+        Builds the canonical ``RobotAction.vla_instruct`` (so the verb is
+        constructed one way, never an inline dict) and dispatches it through
+        ``send_action`` — inheriting the safety gate, the circuit breaker, and the
+        hive error propagation (``_propagate_embodied_error``).  Returns
+        ``send_action``'s success bool."""
+        from integrations.robotics.action_model import RobotAction
+        action = RobotAction.vla_instruct(
+            instruction, observation=observation, horizon=horizon, target=target)
+        return self.send_action(action.to_dict())
 
     def ingest_sensor_batch(self, readings: list) -> int:
         """Feed sensor data to HevolveAI's world model for learning.
@@ -1847,27 +1952,76 @@ class WorldModelBridge:
         # embodied.step(sensor, train=True).  SensorInput dataclass already
         # carries type/modality metadata.  No separate sensor_ingest module.
 
-        # HTTP fallback
+        # HTTP fallback. HevolveAI exposes NO /v1/sensors/batch route -- the
+        # one sensor mouth is /v1/sensor/ingest (vision/audio/text). Fan the
+        # batch onto that endpoint, one POST per reading, mapping the unified
+        # SensorReading schema (sensor_model.py) to the SensorIngestRequest
+        # body. Non-vision/non-audio sensor types (imu/gps/force_torque/
+        # lidar/...) have no modality branch there, so they are skipped rather
+        # than posted as an unsupported modality (which would 400). Returns the
+        # count actually accepted. No new endpoint, no parallel path.
         if self._http_disabled or self._cb_is_open():
             return 0
 
-        try:
-            resp = pooled_post(
-                f'{self._api_url}/v1/sensors/batch',
-                json={'readings': readings},
-                timeout=self._timeout_flush,
-            )
-            if resp.status_code in (200, 201):
-                self._cb_record_success()
-                with self._lock:
-                    self._stats['total_sensor_readings'] = self._stats.get(
-                        'total_sensor_readings', 0) + len(readings)
-                return len(readings)
-            self._cb_record_failure()
-            return 0
-        except requests.RequestException:
-            self._cb_record_failure()
-            return 0
+        accepted = 0
+        for reading in readings:
+            if not isinstance(reading, dict):
+                continue
+            stype = reading.get('sensor_type')
+            data = reading.get('data') or {}
+            stream_source = data.get('stream_source', '')
+            # reality_signature: physical mic/camera/peer = 1.0; screen-grab
+            # ('desktop') and generated tts = 0.0 (mirrors submit_sensor_frame's
+            # camera-vs-screen rule).
+            reality_signature = 0.0 if stream_source in ('desktop', 'tts') else 1.0
+            sid = reading.get('sensor_id', stype or 'sensor')
+            if stype == 'camera' and data.get('frame_base64'):
+                body = {
+                    'modality': 'vision',
+                    'source': stream_source or 'camera',
+                    'data': data['frame_base64'],
+                    'format': data.get('encoding', 'jpeg'),
+                    'session_id': f'{sid}_{stream_source or "camera"}',
+                    'reality_signature': reality_signature,
+                }
+            elif stype == 'audio' and (
+                    data.get('pcm_base64') or data.get('wav_base64')):
+                if data.get('pcm_base64'):
+                    audio_b64, fmt = data['pcm_base64'], 'pcm_16k'
+                else:
+                    audio_b64, fmt = data['wav_base64'], 'wav'
+                body = {
+                    'modality': 'audio',
+                    'source': stream_source or 'mic',
+                    'data': audio_b64,
+                    'format': fmt,
+                    'session_id': f'{sid}_{stream_source or "mic"}',
+                    'reality_signature': reality_signature,
+                }
+                if data.get('transcript'):
+                    body['text'] = str(data['transcript'])[:500]
+            else:
+                # No /v1/sensor/ingest modality for this sensor type -- skip.
+                continue
+            try:
+                resp = pooled_post(
+                    f'{self._api_url}/v1/sensor/ingest',
+                    json=body,
+                    timeout=self._timeout_flush,
+                )
+                if resp.status_code in (200, 201):
+                    self._cb_record_success()
+                    accepted += 1
+                else:
+                    self._propagate_embodied_error(
+                        'ingest_sensor_batch', status=resp.status_code)
+            except requests.RequestException as e:
+                self._propagate_embodied_error('ingest_sensor_batch', exc=e)
+        if accepted:
+            with self._lock:
+                self._stats['total_sensor_readings'] = self._stats.get(
+                    'total_sensor_readings', 0) + accepted
+        return accepted
 
     def get_learning_feedback(self) -> Optional[Dict]:
         """Poll HevolveAI for real-time learning feedback.
@@ -1889,22 +2043,30 @@ class WorldModelBridge:
             except Exception:
                 pass
 
-        # HTTP fallback
+        # HTTP fallback. There is NO /v1/feedback/latest route -- learning
+        # feedback is exposed by the SAME /v1/stats surface the in-process
+        # branch already reads (provider.get_stats()). Mirror that branch's
+        # shape (last_feedback, else the full stats dict) so HTTP and
+        # in-process return the same thing. No new endpoint.
         if self._http_disabled or self._cb_is_open():
             return None
 
         try:
             resp = pooled_get(
-                f'{self._api_url}/v1/feedback/latest',
+                f'{self._api_url}/v1/stats',
                 timeout=self._timeout_default,
             )
             if resp.status_code == 200:
                 self._cb_record_success()
-                return resp.json()
-            self._cb_record_failure()
+                stats = resp.json()
+                if isinstance(stats, dict):
+                    return stats.get('last_feedback') or stats
+                return stats
+            self._propagate_embodied_error(
+                'get_learning_feedback', status=resp.status_code)
             return None
-        except requests.RequestException:
-            self._cb_record_failure()
+        except requests.RequestException as e:
+            self._propagate_embodied_error('get_learning_feedback', exc=e)
             return None
 
     def record_embodied_interaction(

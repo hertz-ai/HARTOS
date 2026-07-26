@@ -46,9 +46,12 @@ _STATIC_DIR = os.path.join(
 # <script src="/shell/static/*.js">. The generative `/api/ui` path must reach
 # NONE of them — it is the terminal/Conky degraded surface only.
 _SHELL_JS_MODULES = [
-    "hartBootSplash.js", "hartDesktop.js", "hartDock.js", "hartHero.js",
-    "hartMarketplace.js", "hartOnboarding.js", "hartPersonalize.js",
-    "hartSenses.js", "hartSession.js", "hartSessionUI.js",
+    "hartAskMenu.js", "hartBloom.js", "hartBootSplash.js", "hartBrandArt.js",
+    "hartConnectivity.js", "hartCredits.js", "hartDesktop.js", "hartDock.js",
+    "hartEffects.js", "hartFiles.js", "hartFlash.js", "hartHero.js",
+    "hartHome.js", "hartMarketplace.js", "hartNav.js", "hartOnboarding.js",
+    "hartOSBridge.js", "hartPersonalize.js", "hartSenses.js", "hartSession.js",
+    "hartSessionUI.js", "hartStates.js", "hartVisibility.js",
     "hartWorkspaces.js", "voiceOrbViz.js",
 ]
 

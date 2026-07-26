@@ -278,6 +278,32 @@ class TestShellTerminal(unittest.TestCase):
                             json={'command': 'sleep 60', 'timeout': 1})
         self.assertEqual(r.status_code, 408)
 
+    def test_readonly_command_skips_the_llm_classifier(self):
+        """Real-HW fix: a read-only diagnostic command must NOT call the (LLM-backed)
+        destructive classifier, so the Terminal stays usable when the local LLM is busy
+        (every command was returning 'Fetch is aborted' because the classify call hung)."""
+        client = _make_os_app()
+        fake = type('R', (), {'stdout': 'log line', 'stderr': '', 'returncode': 0})()
+        with patch('integrations.agent_engine.shell_os_apis._classify_destructive') as clf, \
+             patch('integrations.agent_engine.shell_os_apis.subprocess.run',
+                   return_value=fake) as run:
+            clf.return_value = False  # would BLOCK the command if it were ever consulted
+            r = client.post('/api/shell/terminal/exec',
+                            json={'command': 'journalctl -b -p warning'})
+        self.assertEqual(r.status_code, 200)            # ran despite classifier=block
+        clf.assert_not_called()                          # the fast-path skipped the classifier
+        run.assert_called_once()
+        self.assertEqual(run.call_args[0][0][0], 'journalctl')  # the real binary ran
+
+    def test_non_readonly_command_still_classified(self):
+        """A command NOT on the read-only allowlist is still gated by the classifier."""
+        client = _make_os_app()
+        with patch('integrations.agent_engine.shell_os_apis._classify_destructive',
+                   return_value=False) as clf:
+            r = client.post('/api/shell/terminal/exec', json={'command': 'cp a b'})
+        self.assertEqual(r.status_code, 403)             # blocked as destructive
+        clf.assert_called_once()                          # the classifier WAS consulted
+
 
 # ═══════════════════════════════════════════════════════════════
 # User Accounts
@@ -421,6 +447,296 @@ class TestShellPower(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertTrue(data['resumed'])
+
+
+# ═══════════════════════════════════════════════════════════════
+# Firmware setup (Restart into Firmware / UEFI) — Feature 3
+# ═══════════════════════════════════════════════════════════════
+
+class TestFirmwareSetup(unittest.TestCase):
+    """firmware_setup_supported() capability probe + the gated power action.
+
+    `systemctl reboot --firmware-setup` only works on a UEFI box whose firmware
+    advertises EFI_OS_INDICATIONS_BOOT_TO_FW_UI in OsIndicationsSupported. The
+    probe + the gate must hide/refuse the action on legacy BIOS so the user never
+    gets a plain reboot when they asked to enter firmware setup."""
+
+    MOD = 'integrations.agent_engine.shell_os_apis'
+
+    def test_no_op_on_legacy_bios(self):
+        """No /sys/firmware/efi -> not UEFI-booted -> NOT supported."""
+        from integrations.agent_engine.shell_os_apis import firmware_setup_supported
+        with patch(f'{self.MOD}.os.path.isdir', return_value=False):
+            self.assertFalse(firmware_setup_supported())
+
+    def test_supported_when_capability_bit_set(self):
+        """UEFI-booted + OsIndicationsSupported has the boot-to-fw-UI bit -> True.
+        The efivar layout is a 4-byte attributes prefix + an 8-byte LE value."""
+        from integrations.agent_engine.shell_os_apis import firmware_setup_supported
+        # attributes (4B) + value with bit0 set (8B LE).
+        efivar = b'\x07\x00\x00\x00' + (0x01).to_bytes(8, 'little')
+        m = unittest.mock.mock_open(read_data=efivar)
+        with patch(f'{self.MOD}.os.path.isdir', return_value=True), \
+                patch(f'{self.MOD}.open', m, create=True):
+            self.assertTrue(firmware_setup_supported())
+
+    def test_not_supported_when_capability_bit_clear(self):
+        """UEFI-booted but the boot-to-fw-UI bit is CLEAR -> not supported."""
+        from integrations.agent_engine.shell_os_apis import firmware_setup_supported
+        efivar = b'\x07\x00\x00\x00' + (0x00).to_bytes(8, 'little')
+        m = unittest.mock.mock_open(read_data=efivar)
+        with patch(f'{self.MOD}.os.path.isdir', return_value=True), \
+                patch(f'{self.MOD}.open', m, create=True):
+            self.assertFalse(firmware_setup_supported())
+
+    def test_not_supported_when_efivar_unreadable(self):
+        """UEFI-booted but the efivar is absent/unreadable -> conservative False
+        (a wrong 'supported' would give the user a plain reboot)."""
+        from integrations.agent_engine.shell_os_apis import firmware_setup_supported
+        with patch(f'{self.MOD}.os.path.isdir', return_value=True), \
+                patch(f'{self.MOD}.open', side_effect=FileNotFoundError, create=True):
+            self.assertFalse(firmware_setup_supported())
+
+    def test_power_action_firmware_refused_when_unsupported(self):
+        """POST /api/shell/power/action {firmware} -> 400 on a non-capable box,
+        and it must NOT spawn a reboot."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}._classify_destructive', return_value=True), \
+                patch(f'{self.MOD}.firmware_setup_supported', return_value=False), \
+                patch(f'{self.MOD}.subprocess.Popen') as popen:
+            r = client.post('/api/shell/power/action', json={'action': 'firmware'})
+        self.assertEqual(r.status_code, 400)
+        popen.assert_not_called()
+
+    def test_power_action_firmware_runs_reboot_firmware_setup(self):
+        """On a capable box the action arms the UEFI boot-to-firmware flag via the
+        native logind SetRebootToFirmwareSetup(true) D-Bus method, THEN reboots —
+        the two-step `boot into firmware` sequence (no plain `systemctl` spawn)."""
+        from unittest.mock import call
+        client = _make_os_app()
+        with patch(f'{self.MOD}._classify_destructive', return_value=True), \
+                patch(f'{self.MOD}.firmware_setup_supported', return_value=True), \
+                patch(f'{self.MOD}._logind_call', return_value=(True, None)) as lc:
+            r = client.post('/api/shell/power/action', json={'action': 'firmware'})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(json.loads(r.data)['initiated'])
+        self.assertEqual(lc.call_args_list, [
+            call('SetRebootToFirmwareSetup', 'b', 'true'),
+            call('Reboot', 'b', 'true'),
+        ])
+
+    def test_power_action_uefi_alias_runs_firmware_setup(self):
+        """The 'uefi' alias maps to the SAME native firmware-arm + reboot sequence
+        + is gated by the SAME capability probe — so both labels the UI might send
+        behave identically (one canonical path, no second code path)."""
+        from unittest.mock import call
+        client = _make_os_app()
+        with patch(f'{self.MOD}._classify_destructive', return_value=True), \
+                patch(f'{self.MOD}.firmware_setup_supported', return_value=True), \
+                patch(f'{self.MOD}._logind_call', return_value=(True, None)) as lc:
+            r = client.post('/api/shell/power/action', json={'action': 'uefi'})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(json.loads(r.data)['initiated'])
+        self.assertEqual(lc.call_args_list, [
+            call('SetRebootToFirmwareSetup', 'b', 'true'),
+            call('Reboot', 'b', 'true'),
+        ])
+
+    def test_power_action_firmware_arm_failure_does_not_reboot(self):
+        """If arming the firmware flag is DENIED/fails, the handler returns a real
+        error (500) and does NOT fall back to a plain reboot — a plain reboot is
+        the wrong action for the user's 'enter firmware setup' intent."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.firmware_setup_supported', return_value=True), \
+                patch(f'{self.MOD}._logind_call',
+                      return_value=(False, 'Access denied')) as lc:
+            r = client.post('/api/shell/power/action', json={'action': 'firmware'})
+        self.assertEqual(r.status_code, 500)
+        body = json.loads(r.data)
+        self.assertIn('error', body)
+        self.assertFalse(body.get('initiated', False))
+        # Only the arm call was attempted; Reboot was never issued.
+        self.assertEqual(lc.call_count, 1)
+        self.assertEqual(lc.call_args[0][0], 'SetRebootToFirmwareSetup')
+
+    def test_power_action_uefi_alias_refused_when_unsupported(self):
+        """The 'uefi' alias is refused (400) + never reboots on a non-capable box,
+        exactly like 'firmware' — the gate covers BOTH aliases (no bypass)."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}._classify_destructive', return_value=True), \
+                patch(f'{self.MOD}.firmware_setup_supported', return_value=False), \
+                patch(f'{self.MOD}.subprocess.Popen') as popen:
+            r = client.post('/api/shell/power/action', json={'action': 'uefi'})
+        self.assertEqual(r.status_code, 400)
+        popen.assert_not_called()
+
+    def test_not_supported_when_efivar_truncated(self):
+        """A short/garbage OsIndicationsSupported read (< 12 bytes: the 4-byte
+        attribute prefix + 8-byte value can't be parsed) is conservatively NOT
+        supported — never claim a capability from a malformed efivar."""
+        from integrations.agent_engine.shell_os_apis import firmware_setup_supported
+        m = unittest.mock.mock_open(read_data=b'\x07\x00\x00\x00\x01')  # only 5 bytes
+        with patch(f'{self.MOD}.os.path.isdir', return_value=True), \
+                patch(f'{self.MOD}.open', m, create=True):
+            self.assertFalse(firmware_setup_supported())
+
+    def test_supported_reads_value_after_attribute_prefix(self):
+        """The boot-to-fw-UI bit must be read from the VALUE (bytes 4:12), NOT the
+        4-byte attribute prefix — a prefix that happens to have bit0 set while the
+        value bit is CLEAR must still report unsupported (correct field offset)."""
+        from integrations.agent_engine.shell_os_apis import firmware_setup_supported
+        # attributes prefix bit0=1, but the 8-byte VALUE has bit0=0.
+        efivar = (0x01).to_bytes(4, 'little') + (0x00).to_bytes(8, 'little')
+        m = unittest.mock.mock_open(read_data=efivar)
+        with patch(f'{self.MOD}.os.path.isdir', return_value=True), \
+                patch(f'{self.MOD}.open', m, create=True):
+            self.assertFalse(firmware_setup_supported())
+
+    # ── The REAL destructive-classifier gate (NOT patched) ──
+    # Regression guard for the dead-feature class: the power-action handler must
+    # NOT route the enumerated power verbs through the free-form destructive
+    # classifier. With the REAL classifier, 'firmware'/'uefi' classify as
+    # 'unknown' (and 'reboot'/'shutdown' as 'destructive'), so the old gate
+    # 403'd EVERY power action on a real box — the firmware feature was dead. The
+    # canonical gate for a power verb is the enumerated whitelist + the firmware
+    # capability probe, identical to the liquid_ui_service session route.
+
+    def test_firmware_permitted_with_real_classifier_on_capable_box(self):
+        """REAL _classify_destructive (NOT patched): firmware setup runs on a
+        capability-advertising box — it must NOT be refused as 'unknown'."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.firmware_setup_supported', return_value=True), \
+                patch(f'{self.MOD}._logind_call', return_value=(True, None)) as lc:
+            r = client.post('/api/shell/power/action', json={'action': 'firmware'})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(json.loads(r.data)['initiated'])
+        self.assertEqual(lc.call_count, 2)  # arm firmware flag, then reboot
+
+    def test_firmware_refused_with_real_classifier_on_incapable_box(self):
+        """REAL _classify_destructive (NOT patched): on a legacy-BIOS / no-cap box
+        the firmware action is refused (400) by the CAPABILITY gate and never
+        reboots — so the refusal reason is 'unsupported', not 'destructive'."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.firmware_setup_supported', return_value=False), \
+                patch(f'{self.MOD}.subprocess.Popen') as popen:
+            r = client.post('/api/shell/power/action', json={'action': 'firmware'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('not supported', json.loads(r.data)['error'])
+        popen.assert_not_called()
+
+    def test_reboot_and_shutdown_permitted_with_real_classifier(self):
+        """REAL classifier: 'reboot'/'shutdown' classify as 'destructive' yet are
+        intentional, capability-free power verbs — they must still execute (the
+        old generic gate wrongly 403'd them). Each maps to the native logind
+        Manager method (Reboot / PowerOff), not a systemctl spawn."""
+        for action, method in (('reboot', 'Reboot'), ('shutdown', 'PowerOff')):
+            client = _make_os_app()
+            with patch(f'{self.MOD}._logind_call', return_value=(True, None)) as lc:
+                r = client.post('/api/shell/power/action', json={'action': action})
+            self.assertEqual(r.status_code, 200, action)
+            self.assertTrue(json.loads(r.data)['initiated'], action)
+            lc.assert_called_once_with(method, 'b', 'true')
+
+
+# ═══════════════════════════════════════════════════════════════
+# Power actions — native logind D-Bus + real result check (#133)
+# ═══════════════════════════════════════════════════════════════
+
+class TestPowerActionNativeLogind(unittest.TestCase):
+    """The power-action handler must invoke logind over D-Bus and CHECK the
+    result — a polkit denial / missing busctl / timeout must surface a real
+    error, NEVER the old masked {'initiated': True}."""
+
+    MOD = 'integrations.agent_engine.shell_os_apis'
+
+    def _fake_run(self, returncode=0, stderr='', stdout=''):
+        proc = MagicMock()
+        proc.returncode = returncode
+        proc.stderr = stderr
+        proc.stdout = stdout
+        return proc
+
+    def test_denied_action_returns_error_not_initiated(self):
+        """THE centerpiece: when logind/polkit DENIES the call (busctl exits
+        non-zero), the response is an error (500) and is NOT a masked success —
+        `initiated` must be False and an `error` must be present."""
+        client = _make_os_app()
+        denied = self._fake_run(
+            returncode=1,
+            stderr='Call failed: Access denied')
+        with patch(f'{self.MOD}.subprocess.run', return_value=denied) as run:
+            r = client.post('/api/shell/power/action', json={'action': 'reboot'})
+        self.assertEqual(r.status_code, 500)
+        body = json.loads(r.data)
+        self.assertIn('error', body)
+        self.assertIn('Access denied', body['error'])
+        self.assertFalse(body.get('initiated', False))
+        # It really tried the native login1 D-Bus call (not systemctl).
+        argv = run.call_args[0][0]
+        self.assertIn('busctl', argv)
+        self.assertIn('org.freedesktop.login1.Manager', argv)
+        self.assertIn('Reboot', argv)
+
+    def test_busctl_missing_returns_error(self):
+        """Degrade-not-die: if busctl is absent the handler reports a real error
+        (500), never a masked success."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run', side_effect=FileNotFoundError()):
+            r = client.post('/api/shell/power/action', json={'action': 'shutdown'})
+        self.assertEqual(r.status_code, 500)
+        body = json.loads(r.data)
+        self.assertIn('error', body)
+        self.assertFalse(body.get('initiated', False))
+
+    def test_timeout_returns_error(self):
+        """A hung D-Bus call (timeout) surfaces a real error, not initiated:true."""
+        import subprocess as _sp
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run',
+                   side_effect=_sp.TimeoutExpired(cmd='busctl', timeout=10)):
+            r = client.post('/api/shell/power/action', json={'action': 'suspend'})
+        self.assertEqual(r.status_code, 500)
+        body = json.loads(r.data)
+        self.assertIn('error', body)
+        self.assertFalse(body.get('initiated', False))
+
+    def test_success_uses_native_login1_dbus(self):
+        """On success (busctl exits 0) the handler reports initiated:true AND the
+        invoked argv is the native login1 Manager call, proving it is NOT the old
+        fire-and-forget `systemctl` spawn."""
+        client = _make_os_app()
+        with patch(f'{self.MOD}.subprocess.run',
+                   return_value=self._fake_run(returncode=0)) as run:
+            r = client.post('/api/shell/power/action', json={'action': 'suspend'})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(json.loads(r.data)['initiated'])
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:3], ['busctl', 'call', '--system'])
+        self.assertIn('org.freedesktop.login1', argv)
+        self.assertIn('Suspend', argv)
+        self.assertNotIn('systemctl', argv)
+
+    def test_logind_call_helper_maps_denial_to_false(self):
+        """Unit-level: _logind_call returns (False, <reason>) on a non-zero exit
+        so callers can never mistake a denial for success."""
+        from integrations.agent_engine.shell_os_apis import _logind_call
+        with patch(f'{self.MOD}.subprocess.run',
+                   return_value=self._fake_run(returncode=1, stderr='boom')):
+            ok, err = _logind_call('Reboot', 'b', 'true')
+        self.assertFalse(ok)
+        self.assertIn('boom', err)
+
+    def test_logind_call_helper_success(self):
+        """Unit-level: _logind_call returns (True, None) on a zero exit and passes
+        the signature+args through to busctl verbatim."""
+        from integrations.agent_engine.shell_os_apis import _logind_call
+        with patch(f'{self.MOD}.subprocess.run',
+                   return_value=self._fake_run(returncode=0)) as run:
+            ok, err = _logind_call('PowerOff', 'b', 'true')
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[-3:], ['PowerOff', 'b', 'true'])
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -647,107 +963,60 @@ class TestShellBackup(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════
 
 class TestShellBattery(unittest.TestCase):
-    """Tests for /api/shell/battery and /api/shell/power/lid."""
+    """Tests for /api/shell/battery (shell_system_apis) and
+    /api/shell/power/lid (shell_os_apis).
 
-    @patch('integrations.agent_engine.shell_os_apis.os.path.isdir', return_value=False)
-    def test_battery_status_no_battery(self, _mock_isdir):
-        client = _make_os_app()
-        r = client.get('/api/shell/battery')
+    `/api/shell/battery` moved to shell_system_apis in 01e0b8e; it is served by
+    `_battery_info()`, which reads `psutil.sensors_battery()` then enriches from
+    Linux sysfs via `glob.glob('/sys/class/power_supply/...')`. Its canonical
+    response keys are `present`, `status`, `capacity`, `plugged_in`, `health`
+    (NOT the old `has_battery`/`level`/`charging`/`ac_power`). The lid route is
+    still in shell_os_apis, so those tests keep `_make_os_app()`.
+    """
+
+    def test_battery_status_no_battery(self):
+        """No psutil battery and no sysfs BAT* dirs → present is False."""
+        client = _make_system_app()
+        with patch('psutil.sensors_battery', return_value=None):
+            with patch('glob.glob', return_value=[]):
+                r = client.get('/api/shell/battery')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertFalse(data['has_battery'])
+        self.assertFalse(data['present'])
 
     def test_battery_status_with_battery(self):
-        """Battery endpoint returns level and charging state when battery present."""
-        client = _make_os_app()
-        bat_base = '/sys/class/power_supply'
-        # Use os.path.join so keys match Windows backslash convention
-        file_contents = {
-            os.path.join(bat_base, 'BAT0', 'type'): 'Battery\n',
-            os.path.join(bat_base, 'BAT0', 'capacity'): '75\n',
-            os.path.join(bat_base, 'BAT0', 'status'): 'Charging\n',
-        }
-        _real_isdir = os.path.isdir
-        _real_isfile = os.path.isfile
-        _real_listdir = os.listdir
-        _real_open = open
-
-        def mock_isdir(p):
-            if 'power_supply' in str(p):
-                return p == bat_base
-            return _real_isdir(p)
-
-        def mock_isfile(p):
-            if 'power_supply' in str(p):
-                return p in file_contents
-            return _real_isfile(p)
-
-        def mock_listdir(p):
-            if p == bat_base:
-                return ['BAT0']
-            return _real_listdir(p)
-
-        def smart_open(path, *args, **kwargs):
-            if path in file_contents:
-                from io import StringIO
-                return StringIO(file_contents[path])
-            return _real_open(path, *args, **kwargs)
-
-        with patch('os.path.isdir', side_effect=mock_isdir):
-            with patch('os.path.isfile', side_effect=mock_isfile):
-                with patch('os.listdir', side_effect=mock_listdir):
-                    with patch('builtins.open', side_effect=smart_open):
-                        r = client.get('/api/shell/battery')
+        """Battery endpoint reports capacity and charging status from psutil."""
+        client = _make_system_app()
+        fake_bat = MagicMock()
+        fake_bat.percent = 75
+        fake_bat.power_plugged = True
+        fake_bat.secsleft = -1
+        with patch('psutil.sensors_battery', return_value=fake_bat):
+            # No sysfs enrichment on the test host.
+            with patch('glob.glob', return_value=[]):
+                r = client.get('/api/shell/battery')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertTrue(data['has_battery'])
-        self.assertEqual(data['level'], 75)
-        self.assertEqual(data['charging'], 'Charging')
+        self.assertTrue(data['present'])
+        self.assertEqual(data['capacity'], 75)
+        # plugged_in + percent < 100 → 'charging'
+        self.assertEqual(data['status'], 'charging')
+        self.assertTrue(data['plugged_in'])
 
     def test_battery_ac_power(self):
-        """Battery endpoint returns ac_power field when AC adapter present."""
-        client = _make_os_app()
-        bat_base = '/sys/class/power_supply'
-        file_contents = {
-            os.path.join(bat_base, 'BAT0', 'type'): 'Battery\n',
-            os.path.join(bat_base, 'BAT0', 'capacity'): '90\n',
-            os.path.join(bat_base, 'BAT0', 'status'): 'Full\n',
-            os.path.join(bat_base, 'AC0', 'online'): '1\n',
-        }
-        _real_isdir = os.path.isdir
-        _real_isfile = os.path.isfile
-        _real_listdir = os.listdir
-        _real_open = open
-
-        def mock_isdir(p):
-            if 'power_supply' in str(p):
-                return p == bat_base
-            return _real_isdir(p)
-
-        def mock_isfile(p):
-            if 'power_supply' in str(p):
-                return p in file_contents
-            return _real_isfile(p)
-
-        def mock_listdir(p):
-            if p == bat_base:
-                return ['BAT0']
-            return _real_listdir(p)
-
-        def smart_open(path, *args, **kwargs):
-            if path in file_contents:
-                from io import StringIO
-                return StringIO(file_contents[path])
-            return _real_open(path, *args, **kwargs)
-
-        with patch('os.path.isdir', side_effect=mock_isdir):
-            with patch('os.path.isfile', side_effect=mock_isfile):
-                with patch('os.listdir', side_effect=mock_listdir):
-                    with patch('builtins.open', side_effect=smart_open):
-                        r = client.get('/api/shell/battery')
+        """Full battery on AC reports plugged_in True and status 'full'."""
+        client = _make_system_app()
+        fake_bat = MagicMock()
+        fake_bat.percent = 100
+        fake_bat.power_plugged = True
+        fake_bat.secsleft = -1
+        with patch('psutil.sensors_battery', return_value=fake_bat):
+            with patch('glob.glob', return_value=[]):
+                r = client.get('/api/shell/battery')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertTrue(data.get('ac_power'))
+        self.assertTrue(data['plugged_in'])
+        self.assertEqual(data['status'], 'full')
 
     def test_lid_get_default(self):
         client = _make_os_app()
@@ -778,53 +1047,69 @@ class TestShellBattery(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════
 
 class TestShellWiFi(unittest.TestCase):
-    """Tests for /api/shell/wifi/* routes."""
+    """Tests for the canonical /api/shell/wifi/* routes (shell_system_apis).
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    WiFi moved to shell_system_apis in 01e0b8e. The scan route is
+    GET /api/shell/wifi/networks (NOT .../scan); it shells out via the module's
+    `_run` (→ shell_system_apis.subprocess.run) with
+    `nmcli -t -f SSID,SIGNAL,SECURITY,FREQ,BSSID device wifi list` and returns
+    `{'networks': [{ssid, signal, security, frequency}], 'count': N}`. When nmcli
+    is absent `_run` returns None → an empty `networks` list with NO `error` key.
+    Connect returns `{'connected': True, 'ssid': ...}`; status returns
+    `{enabled, connected, ssid, signal, frequency, ip}`.
+    """
+
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_wifi_scan_returns_networks(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
-        proc.stdout = 'MyNet:85:WPA2:AA:BB:CC\nOpenNet:60::DD:EE:FF\n'
+        # nmcli -t -f SSID,SIGNAL,SECURITY,FREQ,BSSID ...
+        proc.stdout = ('MyNet:85:WPA2:5180 MHz:AA:BB:CC\n'
+                       'OpenNet:60::2412 MHz:DD:EE:FF\n')
         proc.stderr = ''
         mock_sub.run.return_value = proc
         mock_sub.TimeoutExpired = Exception
-        r = client.get('/api/shell/wifi/scan')
+        r = client.get('/api/shell/wifi/networks')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertEqual(len(data['networks']), 2)
+        self.assertEqual(data['count'], 2)
+        # Sorted by signal descending → MyNet (85) first.
         self.assertEqual(data['networks'][0]['ssid'], 'MyNet')
         self.assertEqual(data['networks'][0]['signal'], 85)
         self.assertEqual(data['networks'][0]['security'], 'WPA2')
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_wifi_scan_empty(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = ''
         proc.stderr = ''
         mock_sub.run.return_value = proc
         mock_sub.TimeoutExpired = Exception
-        r = client.get('/api/shell/wifi/scan')
+        r = client.get('/api/shell/wifi/networks')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertEqual(data['networks'], [])
+        self.assertEqual(data['count'], 0)
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_wifi_scan_nmcli_not_found(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
+        # _run swallows FileNotFoundError → None → empty network list.
         mock_sub.run.side_effect = FileNotFoundError
         mock_sub.TimeoutExpired = Exception
-        r = client.get('/api/shell/wifi/scan')
+        r = client.get('/api/shell/wifi/networks')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertEqual(data['networks'], [])
-        self.assertEqual(data['error'], 'nmcli not available')
+        self.assertEqual(data['count'], 0)
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_wifi_connect_success(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = 'successfully activated'
@@ -835,31 +1120,47 @@ class TestShellWiFi(unittest.TestCase):
                         json={'ssid': 'MyNet', 'password': '1234'})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['status'], 'connected')
+        self.assertTrue(data['connected'])
         self.assertEqual(data['ssid'], 'MyNet')
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_wifi_connect_missing_ssid(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         r = client.post('/api/shell/wifi/connect', json={})
         self.assertEqual(r.status_code, 400)
         data = json.loads(r.data)
         self.assertIn('error', data)
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_wifi_status(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
-        proc.stdout = 'MyNet:802-11-wireless:wlan0:activated\n'
+        # radio check then `nmcli -t -f ACTIVE,SSID,SIGNAL,FREQ device wifi`.
+        proc.stdout = 'enabled\n'
         proc.stderr = ''
-        mock_sub.run.return_value = proc
+
+        def run_side_effect(cmd, *a, **kw):
+            p = MagicMock()
+            p.returncode = 0
+            p.stderr = ''
+            if cmd[:3] == ['nmcli', 'radio', 'wifi']:
+                p.stdout = 'enabled\n'
+            elif 'ACTIVE,SSID,SIGNAL,FREQ' in cmd:
+                p.stdout = 'yes:MyNet:85:5180 MHz\n'
+            else:
+                p.stdout = 'IP4.ADDRESS[1]:192.168.1.5/24\n'
+            return p
+
+        mock_sub.run.side_effect = run_side_effect
+        mock_sub.TimeoutExpired = Exception
         r = client.get('/api/shell/wifi/status')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
+        self.assertTrue(data['enabled'])
         self.assertTrue(data['connected'])
-        self.assertEqual(data['connection']['name'], 'MyNet')
-        self.assertEqual(data['connection']['device'], 'wlan0')
+        self.assertEqual(data['ssid'], 'MyNet')
+        self.assertEqual(data['signal'], 85)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -867,25 +1168,37 @@ class TestShellWiFi(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════
 
 class TestShellVPN(unittest.TestCase):
-    """Tests for /api/shell/vpn/* routes."""
+    """Tests for the canonical /api/shell/vpn/* routes (shell_system_apis).
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    VPN moved to shell_system_apis in 01e0b8e. `list` parses
+    `nmcli -t -f NAME,TYPE,ACTIVE connection show` and returns
+    `{'connections': [{name, type, active}]}` (NOT `vpns`). `connect`/`disconnect`
+    both require a `name` body field and return `{'connected': True, 'name': ...}`
+    / `{'disconnected': True}`. `import` takes `config_path` (NOT `path`), checks
+    `os.path.isfile`, and returns `{'imported': True, 'name': ...}`.
+    """
+
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_vpn_list(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
-        proc.stdout = 'MyVPN:vpn:activated\nWork:vpn:deactivated\n'
+        # nmcli -t -f NAME,TYPE,ACTIVE connection show
+        proc.stdout = 'MyVPN:vpn:yes\nWork:vpn:no\nEth:ethernet:no\n'
         proc.stderr = ''
         mock_sub.run.return_value = proc
+        mock_sub.TimeoutExpired = Exception
         r = client.get('/api/shell/vpn/list')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(len(data['vpns']), 2)
-        self.assertEqual(data['vpns'][0]['name'], 'MyVPN')
+        # Only the two vpn-typed rows are returned.
+        self.assertEqual(len(data['connections']), 2)
+        self.assertEqual(data['connections'][0]['name'], 'MyVPN')
+        self.assertTrue(data['connections'][0]['active'])
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_vpn_connect_success(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = 'Connection successfully activated'
@@ -895,52 +1208,81 @@ class TestShellVPN(unittest.TestCase):
         r = client.post('/api/shell/vpn/connect', json={'name': 'MyVPN'})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['status'], 'connected')
+        self.assertTrue(data['connected'])
         self.assertEqual(data['name'], 'MyVPN')
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_vpn_connect_missing_name(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         r = client.post('/api/shell/vpn/connect', json={})
         self.assertEqual(r.status_code, 400)
         data = json.loads(r.data)
         self.assertIn('error', data)
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
     def test_vpn_disconnect(self, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
         proc.stdout = 'Connection successfully deactivated'
         proc.stderr = ''
         mock_sub.run.return_value = proc
+        mock_sub.TimeoutExpired = Exception
         r = client.post('/api/shell/vpn/disconnect', json={'name': 'MyVPN'})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['status'], 'disconnected')
+        self.assertTrue(data['disconnected'])
 
-    @patch('integrations.agent_engine.shell_os_apis.subprocess')
-    @patch('integrations.agent_engine.shell_os_apis.os.path.isfile', return_value=True)
+    @patch('integrations.agent_engine.shell_system_apis.subprocess')
+    @patch('integrations.agent_engine.shell_system_apis.os.path.isfile', return_value=True)
     def test_vpn_import_wireguard(self, _mock_isfile, mock_sub):
-        client = _make_os_app()
+        client = _make_system_app()
         proc = MagicMock()
         proc.returncode = 0
-        proc.stdout = 'Connection imported'
+        # nmcli echoes the new connection name in single quotes.
+        proc.stdout = "Connection 'test' (uuid) successfully added."
         proc.stderr = ''
         mock_sub.run.return_value = proc
+        mock_sub.TimeoutExpired = Exception
         r = client.post('/api/shell/vpn/import',
-                        json={'path': '/tmp/test.conf'})
+                        json={'config_path': '/tmp/test.conf', 'type': 'wireguard'})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['status'], 'imported')
+        self.assertTrue(data['imported'])
+        self.assertEqual(data['name'], 'test')
 
 
 # ═══════════════════════════════════════════════════════════════
 # Trash / Recycle Bin
 # ═══════════════════════════════════════════════════════════════
 
+def _make_system_app():
+    """Create a Flask test app with the canonical shell *system* routes.
+
+    Trash / recycle-bin lives in shell_system_apis.register_shell_system_routes
+    — NOT shell_os_apis. The duplicate trash routes were removed from
+    shell_os_apis in 01e0b8e (they collided on the Flask endpoint name
+    `shell_trash_list` and silently aborted system-route registration, which in
+    turn killed the app installer). The contract the shell's recycle-bin panel
+    actually calls is the manifest's `trash_bin` SYSTEM_PANEL:
+    GET /api/shell/trash, POST /api/shell/trash/move,
+    POST /api/shell/trash/restore, DELETE /api/shell/trash/empty.
+    """
+    from flask import Flask
+    app = Flask(__name__)
+    app.config['TESTING'] = True
+    from integrations.agent_engine.shell_system_apis import register_shell_system_routes
+    register_shell_system_routes(app)
+    return app.test_client()
+
+
 class TestShellTrash(unittest.TestCase):
-    """Tests for /api/shell/trash routes using real temp dirs."""
+    """Tests for the canonical /api/shell/trash routes (shell_system_apis).
+
+    These hit the REAL routes against a temp XDG trash dir, redirecting
+    `_trash_dir()`'s `expanduser('~')` to a tmp home. `gio` is absent on the
+    test host, so the manual ~/.local/share/Trash fallback path is exercised.
+    """
 
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp(prefix='hart_trash_test_')
@@ -953,41 +1295,47 @@ class TestShellTrash(unittest.TestCase):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def _patch_trash_dir(self):
-        """Return a patch that redirects _trash_dir() to our temp trash root."""
-        return patch('integrations.agent_engine.shell_os_apis.os.path.expanduser',
+        """Redirect shell_system_apis' expanduser('~') to our temp home.
+
+        `_trash_dir()` builds the trash root from `expanduser('~')`, so patching
+        it in the shell_system_apis module relocates the whole trash tree.
+        """
+        return patch('integrations.agent_engine.shell_system_apis.os.path.expanduser',
                      return_value=self._tmpdir)
 
     def test_trash_list_empty(self):
-        client = _make_os_app()
+        client = _make_system_app()
         with self._patch_trash_dir():
             r = client.get('/api/shell/trash')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
         self.assertEqual(data['items'], [])
-        self.assertEqual(data['total'], 0)
+        self.assertEqual(data['total_items'], 0)
 
     def test_trash_file(self):
-        client = _make_os_app()
+        client = _make_system_app()
         # Create a source file to trash
         src_file = os.path.join(self._tmpdir, 'myfile.txt')
         with open(src_file, 'w') as f:
             f.write('hello')
         with self._patch_trash_dir():
-            r = client.post('/api/shell/trash', json={'path': src_file})
+            r = client.post('/api/shell/trash/move', json={'path': src_file})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['status'], 'trashed')
+        self.assertTrue(data['trashed'])
+        # Source file was moved out of its original location
+        self.assertFalse(os.path.isfile(src_file))
         # Verify file moved to trash files dir
         self.assertTrue(os.path.isdir(self._files_dir))
         trashed_files = os.listdir(self._files_dir)
-        self.assertGreater(len(trashed_files), 0)
+        self.assertIn('myfile.txt', trashed_files)
         # Verify .trashinfo was created
         self.assertTrue(os.path.isdir(self._info_dir))
         info_files = [f for f in os.listdir(self._info_dir) if f.endswith('.trashinfo')]
-        self.assertGreater(len(info_files), 0)
+        self.assertIn('myfile.txt.trashinfo', info_files)
 
     def test_trash_restore(self):
-        client = _make_os_app()
+        client = _make_system_app()
         # Pre-populate trash
         os.makedirs(self._files_dir, exist_ok=True)
         os.makedirs(self._info_dir, exist_ok=True)
@@ -1001,15 +1349,21 @@ class TestShellTrash(unittest.TestCase):
         )
         with open(os.path.join(self._info_dir, 'restored.txt.trashinfo'), 'w') as f:
             f.write(info_content)
+        # Canonical restore keys off the trash item `id` (the filename in
+        # files/), not a free-form name.
         with self._patch_trash_dir():
-            r = client.post('/api/shell/trash/restore', json={'name': 'restored.txt'})
+            r = client.post('/api/shell/trash/restore', json={'id': 'restored.txt'})
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['status'], 'restored')
+        self.assertEqual(data['restored_count'], 1)
+        self.assertIn(restore_dest, data['restored_paths'])
         self.assertTrue(os.path.isfile(restore_dest))
+        # The .trashinfo for a restored item is cleaned up.
+        self.assertFalse(os.path.isfile(
+            os.path.join(self._info_dir, 'restored.txt.trashinfo')))
 
     def test_trash_empty(self):
-        client = _make_os_app()
+        client = _make_system_app()
         # Pre-populate trash with files
         os.makedirs(self._files_dir, exist_ok=True)
         os.makedirs(self._info_dir, exist_ok=True)
@@ -1019,24 +1373,34 @@ class TestShellTrash(unittest.TestCase):
             f.write('b')
         with open(os.path.join(self._info_dir, 'a.txt.trashinfo'), 'w') as f:
             f.write('[Trash Info]\nPath=/tmp/a.txt\n')
+        # Canonical empty is DELETE (matches manifest trash_bin api list).
         with self._patch_trash_dir():
-            r = client.post('/api/shell/trash/empty')
+            r = client.delete('/api/shell/trash/empty')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['status'], 'emptied')
-        self.assertGreater(data['removed'], 0)
+        self.assertTrue(data['emptied'])
         # Verify dirs are empty
         self.assertEqual(os.listdir(self._files_dir), [])
 
     def test_trash_missing_path(self):
-        client = _make_os_app()
-        r = client.post('/api/shell/trash', json={'path': '/nonexistent_xyz'})
+        client = _make_system_app()
+        # Move-to-trash of a path that does not exist returns 404.
+        r = client.post('/api/shell/trash/move',
+                        json={'path': '/nonexistent_xyz'})
+        self.assertEqual(r.status_code, 404)
+        data = json.loads(r.data)
+        self.assertIn('error', data)
+
+    def test_trash_no_path(self):
+        client = _make_system_app()
+        # Move-to-trash with no path returns 400.
+        r = client.post('/api/shell/trash/move', json={})
         self.assertEqual(r.status_code, 400)
         data = json.loads(r.data)
         self.assertIn('error', data)
 
     def test_trash_list_with_items(self):
-        client = _make_os_app()
+        client = _make_system_app()
         # Pre-populate info dir with .trashinfo files
         os.makedirs(self._info_dir, exist_ok=True)
         for name in ['doc.txt', 'pic.png']:
@@ -1051,7 +1415,7 @@ class TestShellTrash(unittest.TestCase):
             r = client.get('/api/shell/trash')
         self.assertEqual(r.status_code, 200)
         data = json.loads(r.data)
-        self.assertEqual(data['total'], 2)
+        self.assertEqual(data['total_items'], 2)
         names = [item['name'] for item in data['items']]
         self.assertIn('doc.txt', names)
         self.assertIn('pic.png', names)

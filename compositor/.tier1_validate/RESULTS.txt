@@ -1,0 +1,49 @@
+HART-comp Tier-1 first-paint MAX-VALIDATION in WSL Ubuntu-22.04 (WSLg) — 2026-06-28
+Validates the portal-free private-D-Bus fix already in nixos/modules/hart-layer-shell-host.nix.
+
+CONTRACT VALIDATED: the supervisor's first-paint = the GTK4 host touching
+HART_SHELL_READY_FLAG on WebKit LoadEvent.FINISHED, polled 45s (0.5s steps),
+mirroring hart-session-supervisor.nix shell-paint watchdog.
+
+BUILD: cargo build --features winit -> BUILD_EXIT=0 (147 crates).
+  NOTE: committed Cargo.lock pins smol_str@0.3.6 (needs rustc >=1.89); WSL's 1.86
+  failed -> used rustup stable 1.96. Binary: ~/hart-comp/target/debug/hart-comp.
+
+MATRIX (host = the EXACT python extracted from the patched hart-layer-shell-host.nix,
+GSK=cairo software floor, GDK_GL=disable, WebKit HW accel NEVER, gtk4-layer-shell
+LD_PRELOAD, NO working xdg-desktop-portal):
+
+  mode=hartcomp (Tier-1: hart-comp winit nested in headless sway)
+    A portal-free private bus (THE FIX)   -> MARKER FIRED 0.51s  PAINTED (within 45s: YES)
+        hart-comp: layer.mapped namespace=gtk4-layer-shell layer=Background; layers_painted=1
+        host log: "Failed to read portal settings: ServiceUnknown ... not provided by any .service files" (instant fast-fail)
+        screenshot: hartcomp_A_portalfree_fix.png (full shell painted, via M6 screencopy)
+    B hanging-portal bus (real-HW repro)  -> MARKER NEVER FIRED 49.13s  HUNG (watchdog DROPS tier)
+        dbus: "Failed to activate service 'org.freedesktop.portal.Desktop': timed out (service_start_timeout=25000ms)"
+        screenshot: hartcomp_B_hangingportal_repro.png (blank WebKit default page = the hung surface)
+
+  mode=sway (Tier-2)
+    A portal-free private bus (THE FIX)   -> MARKER FIRED 1.01s  PAINTED (within 45s: YES)
+        sway: new layer surface namespace gtk4-layer-shell layer 0 anchor 15
+        screenshot: sway_A_portalfree_fix.png (full shell painted)
+    B hanging-portal bus (real-HW repro)  -> MARKER NEVER FIRED 47.01s  HUNG (watchdog DROPS tier)
+        screenshot: sway_B_hangingportal_repro.png (blank)
+
+REFINEMENT of the root cause: the repro shows TWO serialized 25s portal activations
+(GtkSettings via python3, then xdg-dbus-proxy for WebKit) ~= 50s > 45s — explains why
+real HW hung PAST the 45s watchdog even on cairo. The fix's bus has NO activatable
+services, so BOTH paths fast-fail with ServiceUnknown -> sub-second first paint.
+
+FIDELITY LIMITS (honest):
+  - hart-comp winit GlesRenderer logged intermittent EGL BAD_SURFACE/BAD_ALLOC
+    (ContextLost) — a winit/EGL-on-WSLg-virtual-GPU artifact when nested in headless
+    pixman sway. It did NOT block first-paint (marker 0.51s, layers_painted=1, grim
+    captured the shell). Real-HW Tier-1 uses the smithay DRM/pixman backend (udev.rs),
+    already VM-proven via virgl-QEMU scanout.
+  - tiny static :6800 page used (marker fires on LoadEvent.FINISHED regardless of
+    content; the portal stall is during window setup regardless of content).
+  - GSK forced cairo (the real-HW auto path) so WSLg's Mesa-d3d12 vGPU vs the 940MX
+    does not affect this test.
+
+VERDICT: first_paint = PROVEN; tier1_oneshot = TRUE. The existing portal-free
+private-bus fix is the correct root-cause fix and needs no change.

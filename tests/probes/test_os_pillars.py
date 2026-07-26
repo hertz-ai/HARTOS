@@ -117,13 +117,23 @@ def test_p3_audit_redacts_secrets(monkeypatch):
 # that is validated, stamped, and stored for delivery to the frontend.
 # ════════════════════════════════════════════════════════════════════
 
-def _bare_liquid_ui():
-    import threading
+def _bare_liquid_ui(data_dir=None):
+    """A LiquidUIService carrying ONLY the state the A2UI transport + the runtime
+    component registry touch — no server boot, no sockets, no threads.  Sets
+    EXACTLY what __init__ sets for these paths (a2ui flag, component store, the
+    plain Lock, the per-agent rate bucket, the runtime-registered component map,
+    the on-disk data dir), so the probe drives the REAL governance — the ONE
+    allowlist gate, the human kill-switch, the token bucket, the XSS reject, and
+    the persisted registry — not a stub of it."""
+    import threading, tempfile
     from integrations.agent_engine.liquid_ui_service import LiquidUIService
     svc = LiquidUIService.__new__(LiquidUIService)   # no server boot
     svc.a2ui_enabled = True
     svc._agent_components = {}
-    svc._lock = threading.Lock()
+    svc._lock = threading.Lock()             # plain Lock — mirrors production (line 772)
+    svc._a2ui_buckets = {}                    # per-agent token bucket (_a2ui_rate_ok)
+    svc._custom_component_types = {}          # runtime-registered component specs
+    svc._data_dir = data_dir or tempfile.mkdtemp(prefix='hart_p1_')
     return svc
 
 
@@ -146,6 +156,145 @@ def test_p1_a2ui_respects_the_off_switch():
     svc = _bare_liquid_ui()
     svc.a2ui_enabled = False
     assert svc.agent_ui_update('a', {'type': 'card'}) is False
+
+
+# ── P1, load-bearing: the AGENTIC framework, not just one card ──────────────
+# The weak probe above proves the transport accepts a single builtin card.  The
+# real P1 claim (the steward's: "agents shd be able to extend the framework at
+# runtime … bake new UI on the fly … agent readable specs for each … all handles
+# controlled by the local intelligence") needs four more things to bear load:
+#   (a) an agent REGISTERS a brand-new component type at runtime, and the ONE
+#       allowlist gate immediately accepts a push of it (runtime-extensible, not
+#       forked);   (b) every component exposes an AGENT-READABLE spec so the local
+#       intelligence composes from the spec alone;   (c) an agent RECOMPOSES the
+#       whole desktop into a different design (Aura) at runtime through the SAME
+#       governed transport;   (d) all of it obeys the human kill-switch + XSS gate.
+
+def test_p1_agent_registers_new_component_type_at_runtime_and_can_push_it(tmp_path):
+    """(a) The runtime-extensible framework: a HART agent invents a component the
+    OS never shipped, and the SAME transport that gates builtins accepts it — one
+    allowlist, extended at runtime, no second gate."""
+    svc = _bare_liquid_ui(data_dir=str(tmp_path))
+    # Before registration the type is unknown → the ONE gate rejects it.
+    assert svc.agent_ui_update('composer', {'type': 'aura_ring'}) is False
+    res = svc.register_component_type('composer', 'aura_ring', {
+        'props': ['radius', 'hue', 'pulse'],
+        'events': ['tap'],
+        'behaviors': ['breathe'],
+    })
+    assert res.get('status') == 'registered' and res.get('type') == 'aura_ring'
+    # Now the very SAME gate accepts a push of the new type — proving the
+    # allowlist was extended at runtime, not that a parallel path was opened.
+    assert svc.agent_ui_update('composer',
+                               {'type': 'aura_ring', 'radius': 80, 'hue': 280}) is True
+    stored = svc._agent_components.get('composer', [])
+    assert stored and stored[-1]['type'] == 'aura_ring'
+    # And it persisted to the ONE custom-types map the gate reads (one writer).
+    assert 'aura_ring' in svc._custom_component_types
+
+
+def test_p1_builtin_component_type_is_protected_from_override(tmp_path):
+    """(a′) Runtime extension cannot overwrite a shipped builtin — the starter
+    component set (like the starter skins) is protected."""
+    svc = _bare_liquid_ui(data_dir=str(tmp_path))
+    res = svc.register_component_type('rogue', 'card', {'props': ['x']})
+    assert 'error' in res and 'builtin' in res['error'].lower()
+
+
+def test_p1_every_component_exposes_an_agent_readable_spec():
+    """(b) Each component (builtin + registered) publishes a machine spec — name +
+    attribute schema + how to mount/compose it — so the local HART intelligence can
+    drive ANY component from the spec alone (the "agent readable specs for each"
+    requirement).  A synthesized builtin and the hand-enriched `metric` both hold."""
+    svc = _bare_liquid_ui()
+    specs = svc.list_component_specs()
+    by_name = {s.get('name'): s for s in specs if isinstance(s, dict)}
+    # A plain builtin's spec is SYNTHESIZED from its props — still complete.
+    card = by_name.get('card')
+    assert card and 'title' in card['attributes'] and card['mount'] == 'a2ui'
+    assert 'agent_ui_update' in card['compose'], "spec must tell an agent how to compose it"
+    # The enriched builtin declares its own events/behaviours verbatim.
+    metric = svc.get_component_spec('metric')
+    assert metric and 'click' in metric['emits'] and 'live_update' in metric['behaviors']
+    assert svc.get_component_spec('no_such_component') is None
+
+
+def test_p1_agent_recomposes_whole_desktop_into_a_new_design_at_runtime(tmp_path):
+    """(c) THE liquid-UI proof: an agent recomposes the ENTIRE home surface —
+    hero + rows + ambient mood/palette (Aura) — at runtime, through the SAME
+    governed A2UI channel every other push uses.  This is "the user can have an
+    entirely new design while all components still work", driven by an agent."""
+    svc = _bare_liquid_ui(data_dir=str(tmp_path))
+    ok = svc.compose_home(
+        hero={'title': 'Good evening', 'subtitle': 'Aura'},
+        rows=[{'title': 'Continue', 'accent': 'violet', 'cards': []}],
+        agent_id='home_composer',
+        mood='aura',
+    )
+    assert ok is True, "P1: an agent must be able to recompose the home at runtime"
+    stored = svc._agent_components.get('home_composer', [])
+    assert stored, "the composed home must flow through the ONE A2UI store"
+    comp = stored[-1]
+    assert comp['type'] == 'home_compose'
+    assert comp.get('mood') == 'aura', "the new design's ambient palette must ride the same push"
+    assert comp['hero']['subtitle'] == 'Aura' and comp['rows'][0]['accent'] == 'violet'
+    # Empty composition is a no-op (nothing to paint).
+    assert svc.compose_home() is False
+
+
+def test_p1_runtime_registration_obeys_kill_switch_and_xss_gate(tmp_path):
+    """(d) Extending the framework is governed exactly like painting the screen:
+    the human off-switch stops it, and an XSS-bearing spec is refused — the same
+    constitutional controls agent_ui_update enforces (P3 crosses P1)."""
+    svc = _bare_liquid_ui(data_dir=str(tmp_path))
+    svc.a2ui_enabled = False
+    assert 'error' in svc.register_component_type('a', 'widget_x', {'props': ['q']})
+    svc.a2ui_enabled = True
+    bad = svc.register_component_type('a', 'evil_x',
+                                      {'props': ['q'], 'template': '<script>steal()</script>'})
+    assert 'error' in bad, "a spec carrying an XSS vector must be rejected"
+    assert 'evil_x' not in svc._custom_component_types
+
+
+def test_p1_registered_custom_type_push_carries_its_render_spec(tmp_path):
+    """(G2) A push of an agent-REGISTERED custom type carries its render spec (props +
+    optional template) so the client renders REAL UI (not the generic JSON dump).
+    Stamped by agent_ui_update onto the push itself, so a type registered at runtime
+    renders on its FIRST push -- 'agents bake new UI on the fly', live."""
+    svc = _bare_liquid_ui(data_dir=str(tmp_path))
+    tpl = '<div class="aura-ring" data-r="{{radius}}" data-h="{{hue}}"></div>'
+    res = svc.register_component_type('composer', 'aura_ring',
+                                      {'props': ['radius', 'hue'], 'template': tpl})
+    assert res.get('status') == 'registered'
+    assert svc.agent_ui_update('composer',
+                               {'type': 'aura_ring', 'radius': 80, 'hue': 280}) is True
+    comp = svc._agent_components['composer'][-1]
+    assert comp['type'] == 'aura_ring'
+    assert '_spec' in comp, 'custom-type push did not carry its render spec (G2)'
+    assert comp['_spec'].get('template') == tpl
+    assert 'radius' in comp['_spec'].get('props', []) and 'hue' in comp['_spec']['props']
+
+
+def test_p1_builtin_push_carries_no_render_spec(tmp_path):
+    """A builtin push renders via its own overlay branch and must NOT carry _spec --
+    only agent-registered custom types get the stamped render spec (no bloat / no
+    behaviour change for builtins)."""
+    svc = _bare_liquid_ui(data_dir=str(tmp_path))
+    assert svc.agent_ui_update('a', {'type': 'card', 'title': 'Hi'}) is True
+    assert '_spec' not in svc._agent_components['a'][-1]
+
+
+def test_p1_custom_type_declared_events_ride_the_render_spec(tmp_path):
+    """(G5) A custom type's DECLARED events (its interface) ride the stamped render
+    spec, so the client can wire them -- the component emits the declared event back
+    to the agent through /api/a2ui ('components interact via interfaces')."""
+    svc = _bare_liquid_ui(data_dir=str(tmp_path))
+    svc.register_component_type('composer', 'tap_tile',
+                                {'props': ['label'], 'events': ['click']})
+    assert svc.agent_ui_update('composer', {'type': 'tap_tile', 'label': 'Go'}) is True
+    comp = svc._agent_components['composer'][-1]
+    assert 'click' in comp['_spec'].get('events', []), \
+        'declared events did not ride the render spec (G5)'
 
 
 # ════════════════════════════════════════════════════════════════════

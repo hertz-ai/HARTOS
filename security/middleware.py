@@ -147,12 +147,22 @@ def _apply_host_validation(app: Flask):
         os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
         if h.strip()
     )
+    # '*' is the Django-style wildcard: the operator opted into allow-all. The
+    # deploy default is exactly this (deploy-hartos-deepbox.yml sets
+    # ALLOWED_HOSTS=`secrets.ALLOWED_HOSTS || '*'`), and it is load-bearing:
+    # /api/ota/latest is a PUBLIC pointer fleet nodes poll with
+    # Host: <central-host>. Without wildcard support a '*' config is treated as a
+    # literal host, so every real Host is rejected 400 and OTA delivery silently
+    # breaks fleet-wide. Precompute once — allowed_hosts is fixed at app init.
+    allow_all_hosts = '*' in allowed_hosts
 
     @app.before_request
     def validate_host():
         if os.environ.get('HEVOLVE_ENV') == 'development':
             return
         if os.environ.get('NUNBA_BUNDLED'):
+            return
+        if allow_all_hosts:
             return
 
         host = request.host.split(':')[0]

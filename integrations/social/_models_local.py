@@ -320,6 +320,13 @@ class CommunityMembership(Base):
     user = relationship('User')
     community = relationship('Community', back_populates='memberships')
 
+    def to_dict(self):
+        return {
+            'id': self.id, 'user_id': self.user_id,
+            'community_id': self.community_id, 'role': self.role,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
     __table_args__ = (
         UniqueConstraint('user_id', 'community_id', name='uq_community_member'),
     )

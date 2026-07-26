@@ -48,6 +48,11 @@ class EncounterService:
                 existing.bond_level = max(existing.bond_level, 3)
             elif existing.encounter_count >= 2:
                 existing.bond_level = max(existing.bond_level, 1)
+            try:
+                from .sync_engine import SyncEngine
+                SyncEngine.queue_entity(db, existing)
+            except Exception:
+                pass
             return existing.to_dict()
 
         enc = Encounter(
@@ -63,6 +68,13 @@ class EncounterService:
         )
         db.add(enc)
         db.flush()
+        # Up-sync the encounter (P3) — PII + location: gated on the user's
+        # cloud_egress consent; the producer's serialize drops lat/lng. Best-effort.
+        try:
+            from .sync_engine import SyncEngine
+            SyncEngine.queue_entity(db, enc)
+        except Exception:
+            pass
         return enc.to_dict()
 
     @staticmethod

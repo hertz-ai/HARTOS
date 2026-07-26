@@ -41,7 +41,27 @@ import uuid
 from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional
 
+from core.constants import RECIPE_AVAILABLE_TOPIC
+
 logger = logging.getLogger('hevolve.peer_link')
+
+
+# ─── Multi-hop fleet-command relay (gap #57) ──────────────────────────
+#
+# A signed ``fleet.command`` (e.g. an OTA firmware_update) published by
+# central/regional must reach nodes >1 hop away — a flat node linked only to
+# a regional, which is linked to central — WITHOUT direct connectivity or USB.
+# Only this ONE topic is relayed; every other topic keeps today's
+# deliver-local-only behaviour.  Loops/storms are made structurally impossible
+# by three independent guards:
+#   1. msg_id LRU dedup (primary) — a node delivers+relays each id exactly once.
+#   2. hop_ttl decrement, drop at 0 (caps blast radius even if dedup is evicted).
+#   3. relay_path membership — a node that sees its own id already in the path
+#      drops (independent of the LRU, which can evict under load).
+# A relay only PROPAGATES an already-signature-verified command; it holds no
+# signing key and cannot forge or re-sign one.
+RELAY_TOPIC = 'fleet.command'
+RELAY_DEFAULT_HOP_TTL = 4
 
 
 # Legacy topic mapping: new → old Crossbar topic template
@@ -91,6 +111,11 @@ TOPIC_MAP = {
     'compute.response': 'com.hertzai.hevolve.compute.response.{user_id}',
     # Remote desktop
     'remote_desktop.signal': 'com.hartos.remote_desktop.signal.{device_id}',
+    # Recipe capability mesh: the PROACTIVE advert layer (peer_reuse
+    # announce/consume). Dot-alias so the SAME gossip publish rides the
+    # WAMP bus the day a node-local recipe router ships. Value imported
+    # from core.constants (never inline a topic literal).
+    'recipe.available': RECIPE_AVAILABLE_TOPIC,
 }
 
 # Reverse lookup: legacy topic prefix → new topic
@@ -178,6 +203,11 @@ class MessageBus:
             'delivered_peerlink': 0,
             'delivered_crossbar': 0,
             'deduplicated': 0,
+            # Multi-hop fleet.command relay (gap #57)
+            'relay_rebroadcast': 0,
+            'relay_dropped_unverified': 0,
+            'relay_loop_blocked': 0,
+            'relay_ttl_expired': 0,
         }
 
     def set_http_transport(self, transport_fn: Callable) -> None:
@@ -252,6 +282,16 @@ class MessageBus:
             envelope['user_id'] = user_id
             data.setdefault('user_id', user_id)
 
+        # Seed multi-hop relay metadata for the one relayed topic so a fresh
+        # publish starts the chain at this node (gap #57).  Re-broadcasts from
+        # _relay_fleet_command carry their own decremented values via the
+        # transport envelope, not through publish(), so this only fires for the
+        # ORIGINATING publish.  origin is the issuer; relay_path starts empty.
+        if topic == RELAY_TOPIC:
+            envelope.setdefault('hop_ttl', RELAY_DEFAULT_HOP_TTL)
+            envelope.setdefault('origin', data.get('issued_by', '') if isinstance(data, dict) else '')
+            envelope.setdefault('relay_path', [])
+
         self._stats['published'] += 1
 
         # 1. LOCAL — always deliver (unredacted, same process)
@@ -278,9 +318,18 @@ class MessageBus:
             except (ImportError, Exception):
                 pass  # DLP not available — proceed unredacted
 
-        # 3. PEERLINK — if connected peers exist
+        # 3. PEERLINK — if connected peers exist.  For the relayed topic, carry
+        #    the seeded hop_ttl/origin/relay_path on the outbound envelope so a
+        #    downstream node can continue the multi-hop chain (gap #57).
         if not skip_peerlink:
-            self._route_peerlink(topic, outbound_data, msg_id)
+            relay_meta = None
+            if topic == RELAY_TOPIC:
+                relay_meta = {
+                    'hop_ttl': envelope.get('hop_ttl', RELAY_DEFAULT_HOP_TTL),
+                    'origin': envelope.get('origin', ''),
+                    'relay_path': envelope.get('relay_path', []),
+                }
+            self._route_peerlink(topic, outbound_data, msg_id, relay_meta)
 
         # 4. CROSSBAR — if internet available (and not skipped)
         if not skip_crossbar:
@@ -305,11 +354,16 @@ class MessageBus:
             if handler in handlers:
                 handlers.remove(handler)
 
-    def receive_from_peer(self, envelope: dict) -> bool:
+    def receive_from_peer(self, envelope: dict, sender_peer_id: str = '') -> bool:
         """Handle message received via PeerLink.
 
         Deduplicates and delivers to local subscribers.
         Called by ChannelDispatcher when 'events' channel message arrives.
+
+        ``sender_peer_id`` (optional — the ChannelDispatcher passes the source
+        peer's node_id) lets a multi-hop relay exclude the inbound link when it
+        re-broadcasts a fleet.command, so the command never echoes back the way
+        it came.
         """
         msg_id = envelope.get('msg_id', '')
         if not msg_id:
@@ -321,6 +375,15 @@ class MessageBus:
 
         topic = envelope.get('topic', '')
         data = envelope.get('data', {})
+
+        # MULTI-HOP RELAY (gap #57): only the one relayed topic, only AFTER the
+        # dedup gate above proved this message is NEW.  Deliver locally + (if the
+        # signed command verifies and the loop/ttl guards pass) re-broadcast to
+        # peers EXCEPT the inbound sender.  Every other topic is unaffected.
+        if topic == RELAY_TOPIC:
+            self._relay_fleet_command(envelope, exclude_peer=sender_peer_id,
+                                      from_crossbar=False)
+            return True
 
         self._deliver_to_subscribers(topic, data)
         return True
@@ -347,11 +410,177 @@ class MessageBus:
             self._stats['deduplicated'] += 1
             return False
 
+        # MULTI-HOP RELAY (gap #57): a fleet.command that arrived over the shared
+        # WAMP bus is delivered locally and then relayed onward to PeerLink peers
+        # ONLY (never re-published to Crossbar — WAMP fan-out already reached
+        # every subscriber once; re-publishing there is the storm).  PeerLink is
+        # point-to-point and is where multi-hop buys reach into NAT'd sub-trees.
+        if new_topic == RELAY_TOPIC:
+            envelope = {
+                'msg_id': msg_id,
+                'topic': new_topic,
+                'data': data,
+                'hop_ttl': data.get('hop_ttl', RELAY_DEFAULT_HOP_TTL),
+                'origin': data.get('origin', '') or data.get('issued_by', ''),
+                'relay_path': data.get('relay_path', []),
+            }
+            self._relay_fleet_command(envelope, exclude_peer='',
+                                      from_crossbar=True)
+            return True
+
         self._deliver_to_subscribers(new_topic, data)
+        return True
+
+    def bootstrap_peerlink_ingress(self) -> bool:
+        """Wire the inbound PeerLink 'events' channel → receive_from_peer.
+
+        THE missing wire that made the multi-hop fleet.command relay (gap #57)
+        dead code.  ``_route_peerlink`` SENDS every bus message — including the
+        relayed 'fleet.command' — on the PeerLink ``'events'`` channel
+        (``mgr.broadcast('events', envelope, …)``).  But nothing on the
+        RECEIVING side listened to inbound ``'events'`` frames, so a peer's
+        ``PeerLink._receive_loop`` found zero handlers for that channel and
+        dropped the frame on the floor.  ``receive_from_peer`` (and therefore
+        ``_relay_fleet_command``) was only ever reached over the WAMP/Crossbar
+        leg — which does NOT reach NAT'd sub-trees.  The PeerLink leg is exactly
+        the one that buys reach into a NAT'd node N hops from central, and its
+        inbound handler was absent.
+
+        This registers ONE handler on the link manager's ``'events'`` channel.
+        ``PeerLinkManager.register_channel_handler`` applies it to every current
+        and future link, and ``PeerLink._receive_loop`` invokes channel handlers
+        as ``handler(channel, data, peer_id)`` — so the handler takes that
+        3-arg link signature and forwards the received envelope into the EXISTING
+        ``receive_from_peer`` ingress (dedup + signature-verify + loop/TTL-safe
+        relay all live there; this method adds NO second relay path).  The
+        inbound peer is passed as ``sender_peer_id`` so the re-broadcast excludes
+        the link the command arrived on (no echo-back).
+
+        Idempotent: registers at most once per bus instance.  Best-effort — a
+        missing PeerLink layer (HTTP-only tier, tests) is a silent no-op, never
+        an error.  Returns True iff the handler was newly registered.
+        """
+        if getattr(self, '_peerlink_ingress_wired', False):
+            return False
+
+        try:
+            from core.peer_link.link_manager import get_link_manager
+            mgr = get_link_manager()
+        except Exception as e:
+            logger.debug("PeerLink ingress not wired (no link manager): %s", e)
+            return False
+
+        def _on_events_channel(channel, data, sender_peer_id):
+            # link.py dispatches as handler(channel, data, peer_id).  The wire
+            # envelope carries msg_id/topic/data (+ hop_ttl/origin/relay_path for
+            # the relayed topic); hand it straight to the single ingress.
+            try:
+                if isinstance(data, dict):
+                    self.receive_from_peer(data, sender_peer_id=sender_peer_id or '')
+            except Exception as e:
+                logger.debug("PeerLink 'events' ingress error: %s", e)
+            return None  # fire-and-forget; the relay has no synchronous reply
+
+        try:
+            mgr.register_channel_handler('events', _on_events_channel)
+        except Exception as e:
+            logger.debug("PeerLink ingress registration skipped: %s", e)
+            return False
+
+        self._peerlink_ingress_wired = True
+        logger.info(
+            "PeerLink 'events' ingress wired → receive_from_peer "
+            "(multi-hop fleet.command relay reachable over PeerLink)")
         return True
 
     def get_stats(self) -> dict:
         return dict(self._stats)
+
+    # ─── Multi-hop fleet-command relay (gap #57) ─────────
+
+    def _relay_fleet_command(self, envelope: dict, exclude_peer: str = '',
+                             from_crossbar: bool = False) -> bool:
+        """Deliver a NEW signed fleet.command locally, then (if it verifies and
+        the loop/TTL guards pass) re-broadcast it one hop further to peers.
+
+        Precondition: the caller has ALREADY passed the LRU dedup gate for this
+        message_id (so this fires at most once per id per node).  This method
+        adds the cryptographic + structural guards on top of dedup:
+
+          * SIGNATURE — FleetCommandService.verify_command_signature must pass.
+            A relay NEVER forwards an unverified/forged command; it holds no
+            signing key and cannot forge or re-sign one.  An unverified command
+            is dropped entirely (NOT delivered, NOT relayed).
+          * hop_ttl  — decremented each hop; at <= 0 the command is delivered
+            locally but NOT re-broadcast (drop-at-zero blast-radius cap).
+          * relay_path — this node's id is appended before re-broadcast; a node
+            that already appears in the path drops (loop guard independent of
+            the LRU, which can evict under load).
+
+        ``exclude_peer`` is the inbound PeerLink sender (skipped on re-broadcast
+        so a command never echoes back its arrival link).  ``from_crossbar``
+        re-broadcasts to PeerLink peers only (the shared WAMP bus already
+        reached every subscriber once — re-publishing there would be the storm).
+
+        Returns True iff the command was re-broadcast to at least one peer.
+        """
+        data = envelope.get('data', {}) or {}
+
+        # SIGNATURE GATE — single canonical authority check.  Drop on failure.
+        try:
+            from integrations.social.fleet_command import FleetCommandService
+            if not FleetCommandService.verify_command_signature(data):
+                logger.warning(
+                    "Fleet relay: dropped unverified fleet.command (origin=%s)",
+                    (envelope.get('origin', '') or '?')[:8])
+                self._stats['relay_dropped_unverified'] += 1
+                return False
+        except Exception as e:
+            # Fail-closed: an unavailable verifier must NOT let a command relay.
+            logger.warning("Fleet relay: verifier unavailable, not relaying: %s", e)
+            self._stats['relay_dropped_unverified'] += 1
+            return False
+
+        # Deliver locally FIRST — this node's own consumers (ota_push_listener
+        # .handle_push etc.) must fire regardless of whether we relay onward.
+        self._deliver_to_subscribers(envelope.get('topic', RELAY_TOPIC), data)
+
+        # Loop guard #2 (relay_path membership) — independent of the LRU dedup.
+        self_id = self._self_node_id()
+        relay_path = list(envelope.get('relay_path', []) or [])
+        if self_id and self_id in relay_path:
+            self._stats['relay_loop_blocked'] += 1
+            return False  # already relayed by us on another transport — drop
+
+        # TTL guard — drop-at-zero blast-radius cap.
+        hop_ttl = int(envelope.get('hop_ttl', RELAY_DEFAULT_HOP_TTL))
+        if hop_ttl <= 0:
+            self._stats['relay_ttl_expired'] += 1
+            return False  # delivered locally above, but no further re-broadcast
+
+        # Re-broadcast one hop further: decrement TTL, stamp our id on the path.
+        if self_id:
+            relay_path.append(self_id)
+        relay_meta = {
+            'hop_ttl': hop_ttl - 1,
+            'origin': envelope.get('origin', ''),
+            'relay_path': relay_path,
+        }
+        # msg_id stays IDENTICAL across hops so every downstream node's LRU
+        # dedup collapses duplicates arriving via multiple peers (primary
+        # anti-storm mechanism).
+        self._route_peerlink(RELAY_TOPIC, data, envelope.get('msg_id', ''),
+                             relay_meta=relay_meta, exclude_peer=exclude_peer)
+        self._stats['relay_rebroadcast'] += 1
+        return True
+
+    def _self_node_id(self) -> str:
+        """This node's id — REUSE the fleet bus helper (single source)."""
+        try:
+            from integrations.social.fleet_command import _get_self_node_id
+            return _get_self_node_id()
+        except Exception:
+            return ''
 
     # ─── Internal routing ────────────────────────────────
 
@@ -406,8 +635,16 @@ class MessageBus:
         if delivered:
             self._stats['delivered_sse'] += 1
 
-    def _route_peerlink(self, topic: str, data: dict, msg_id: str):
-        """Send to connected peers via PeerLink 'events' channel."""
+    def _route_peerlink(self, topic: str, data: dict, msg_id: str,
+                        relay_meta: dict = None, exclude_peer: str = ''):
+        """Send to connected peers via PeerLink 'events' channel.
+
+        ``relay_meta`` (when set, for the relayed fleet.command topic) adds the
+        hop_ttl/origin/relay_path fields to the wire envelope so a downstream
+        node can continue the multi-hop chain.  ``exclude_peer`` skips one peer
+        (the inbound sender) on a re-broadcast so a command never echoes back
+        the link it arrived on.
+        """
         try:
             from core.peer_link.link_manager import get_link_manager
             mgr = get_link_manager()
@@ -417,8 +654,25 @@ class MessageBus:
                 'topic': topic,
                 'data': data,
             }
+            if relay_meta:
+                envelope.update(relay_meta)
 
-            sent = mgr.broadcast('events', envelope)
+            # Regular bus messages reach the user's OWN devices only (SAME_USER
+            # multi-device sync).  The signed fleet.command relay reaches the
+            # whole fleet — multi-hop into NAT'd sub-trees is its entire purpose
+            # (and it is signature-gated in _relay_fleet_command).  Without this
+            # scope, wiring the inbound 'events' handler would deliver a per-user
+            # topic to a non-SAME_USER (fleet) peer.
+            trust_filter = None
+            if topic != RELAY_TOPIC:
+                try:
+                    from core.peer_link.link import TrustLevel
+                    trust_filter = TrustLevel.SAME_USER
+                except Exception:
+                    trust_filter = None
+
+            sent = mgr.broadcast('events', envelope, trust_filter=trust_filter,
+                                 exclude_peer=exclude_peer)
             if sent > 0:
                 self._stats['delivered_peerlink'] += sent
         except Exception:

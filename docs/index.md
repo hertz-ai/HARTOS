@@ -16,6 +16,7 @@ HART OS is a multi-agent platform built on AutoGen that creates, trains, and reu
 
 | Section | Description |
 |---------|-------------|
+| [**⬇ Download**](downloads.md) | Get HART OS + the Nunba app for your device |
 | [Quick Start](getting-started/quickstart.md) | Get running in 5 minutes |
 | [Features](features/overview.md) | Full feature overview |
 | [Provider Guide](provider/joining.md) | Join the network as a compute provider |

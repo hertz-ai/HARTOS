@@ -15,10 +15,16 @@ on:
     branches: [main]
     paths:
       - 'nixos/**'
+      # Rust-in-Nix crate sources: a compositor/ or claw_native/rust/ edit (not just
+      # a .nix edit) must re-trigger the hart-comp / hart-rust-precedent compile.
+      - 'compositor/**'
+      - 'claw_native/rust/**'
   pull_request:
     branches: [main]
     paths:
       - 'nixos/**'
+      - 'compositor/**'
+      - 'claw_native/rust/**'
 
 concurrency:
   group: nix-build-${{ github.ref }}
@@ -36,7 +42,10 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
-      - uses: DeterminateSystems/magic-nix-cache-action@v7
+            # See the build job for the rationale — keep cache.nixos.org as the only
+            # substituter and fall back to local realisation on a genuine miss.
+            fallback = true
+      # NOTE: magic-nix-cache-action intentionally REMOVED — see the build job.
 
       - name: Evaluate all outputs (no build)
         working-directory: nixos
@@ -47,11 +56,18 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: evaluate
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Bumped 90 -> 150: with the throttling magic-nix-cache removed (see the Install
+    # Nix step), HART's own derivations build from source each run instead of being
+    # served cross-run, so the heaviest target (iso-desktop, ~70 min before) has more
+    # cold-build headroom. cache.nixos.org still serves the upstream closure.
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
         target:
+          # ── Rust-in-Nix crate compiles (M9) — actually BUILD the crates, not eval ──
+          - hart-rust-precedent  # FIRST Rust-in-Nix compile (claw-cli) — isolate toolchain resolution
+          - hart-comp            # the Smithay compositor crate (buildFeatures=["smithay"]) — THE M9 gate
           - iso-server      # x86_64 headless — core variant
           - iso-desktop     # x86_64 GNOME + native subsystems
           - iso-edge        # x86_64 minimal observer
@@ -67,9 +83,23 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
+            # `fallback = true`: on a genuine substituter MISS (path not in
+            # cache.nixos.org), build from source instead of erroring.
+            fallback = true
 
-      - name: Cache Nix store
-        uses: DeterminateSystems/magic-nix-cache-action@v7
+      # magic-nix-cache-action was REMOVED here (it used to follow). In THIS org it
+      # is unauthenticated (logs "Cannot find netrc credentials for api.flakehub.com")
+      # and the GitHub Actions Cache THROTTLES its local narinfo proxy mid-build —
+      #   error: unable to download 'http://127.0.0.1:.../….narinfo': HTTP error 418
+      #          GitHub Actions Cache throttled Magic Nix Cache.
+      # A 418 from a configured substituter is a HARD transport error that aborts the
+      # build REGARDLESS of `fallback` (fallback only covers a clean miss, not a 418),
+      # so the throttle was randomly red-failing otherwise-fine jobs (hart-rust-
+      # precedent + docker-server died on it while hart-comp passed, purely by timing).
+      # Dropping the action leaves cache.nixos.org (configured by nix-installer-action)
+      # as the sole substituter + local source builds — slower on cold paths but
+      # RELIABLE, no throttling proxy to abort the Rust compiles. Re-add only once the
+      # org has working FlakeHub/cache auth.
 
       - name: Free disk space
         run: |
@@ -81,6 +111,12 @@ jobs:
       - name: Build ${{ matrix.target }}
         working-directory: nixos
         run: |
+          # pipefail is MANDATORY: `nix build … | tee` otherwise reports tee's exit
+          # (0) and the job goes green even when nix FAILED — this masked a real
+          # hart-comp buildInputs eval error ("'libseat' renamed to 'seatd'") as a
+          # passing build. With pipefail a nix failure red-fails the job (applies to
+          # every matrix target, not just the Rust crates).
+          set -o pipefail
           echo "Building: nix build .#${{ matrix.target }}"
           echo ""
           time nix build .#${{ matrix.target }} --no-link --print-out-paths | tee /tmp/build-output.txt

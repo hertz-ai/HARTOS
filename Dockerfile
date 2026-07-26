@@ -9,6 +9,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
+    ffmpeg \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -62,7 +63,8 @@ RUN pip install --no-cache-dir --no-deps -r requirements.txt && \
         "autobahn[twisted]" \
         "autogen-agentchat[long-context]~=0.2" \
         json-repair \
-        bs4
+        bs4 \
+        youtube-transcript-api
 
 # ── Layer 3: Application code (rebuilds on any code change — fast, no pip) ──
 COPY . .

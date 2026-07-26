@@ -19,6 +19,8 @@ from .wan2gp_tool import Wan2GPTool
 from .tts_audio_suite_tool import TTSAudioSuiteTool
 from .whisper_tool import WhisperTool
 from .omniparser_tool import OmniParserTool
+from .seo_audit_tool import SeoAuditTool
+from .gh_pr_tool import GhPrTool
 from .model_storage import ModelStorageManager, model_storage
 from .vram_manager import VRAMManager, vram_manager
 from .runtime_manager import RuntimeToolManager, runtime_tool_manager
@@ -36,6 +38,8 @@ __all__ = [
     "TTSAudioSuiteTool",
     "WhisperTool",
     "OmniParserTool",
+    "SeoAuditTool",
+    "GhPrTool",
     "ModelStorageManager",
     "model_storage",
     "VRAMManager",

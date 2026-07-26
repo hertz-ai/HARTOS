@@ -14,13 +14,21 @@ def _safe_log(level, msg):
 import requests
 import re
 import ast
-try:
-    import autogen
-    from autogen.agentchat.contrib.capabilities import transform_messages, transforms
-except ImportError:
-    autogen = None
-    transform_messages = None
-    transforms = None
+# autogen is imported lazily — it drags google.api_core (~7.6s) + flaml +
+# the contrib capabilities chain -> llmlingua -> torch (~4.2s) at import
+# time, but every autogen.* / transform_messages.* / transforms.* use in
+# this module is INSIDE a function (AST-verified: zero module-level /
+# class-base uses; used only in create_visual_agent + the agent builders).
+# `import helper` is on the backend-boot critical path (create_recipe /
+# reuse_recipe / gather_agentdetails all import it), so deferring autogen
+# here is what actually keeps it out of the boot.  Same proxy + test as
+# create_recipe.py.  See tests/unit/test_lazy_autogen_import.py.
+from core.optional_import import lazy_module
+autogen = lazy_module("autogen")
+transform_messages = lazy_module(
+    "autogen.agentchat.contrib.capabilities.transform_messages")
+transforms = lazy_module(
+    "autogen.agentchat.contrib.capabilities.transforms")
 import json
 from flask import current_app
 from typing import List, Dict, Tuple, Annotated, Set, FrozenSet, Any
@@ -2289,19 +2297,32 @@ def history(user_id,prompt_id,role,message):
 
 # Mode-aware config_list: cloud/regional use external LLM, flat uses local llama.cpp
 _node_tier = os.environ.get('HEVOLVE_NODE_TIER', 'flat')
+
+# The endpoint comes from ONE place regardless of tier. Previously the
+# regional/central branch read HEVOLVE_LLM_ENDPOINT_URL raw while every
+# resolver-based caller read HEVOLVE_LOCAL_LLM_URL, so the two paths could
+# disagree; on deepbox they only agreed because both vars were set to the same
+# gateway. get_local_llm_url() now includes HEVOLVE_LLM_ENDPOINT_URL among its
+# candidates, so it resolves correctly on a cloud tier with no local model AND
+# on a device where Nunba wrote ~/.nunba/llama_config.json.
+#
+# The tier branch remains, because model name and price genuinely differ: a
+# cloud model bills per token, the bundled local model does not. Only the
+# endpoint is unified.
+from core.port_registry import get_local_llm_url
+_llm_base = get_local_llm_url()
 if _node_tier in ('regional', 'central') and os.environ.get('HEVOLVE_LLM_ENDPOINT_URL'):
     config_list = [{
         "model": os.environ.get('HEVOLVE_LLM_MODEL_NAME', 'gpt-4.1-mini'),
         "api_key": os.environ.get('HEVOLVE_LLM_API_KEY', 'dummy'),
-        "base_url": os.environ['HEVOLVE_LLM_ENDPOINT_URL'],
+        "base_url": _llm_base,
         "price": [0.0025, 0.01]
     }]
 else:
-    from core.port_registry import get_local_llm_url
     config_list = [{
         "model": 'Qwen3-VL-4B-Instruct',
         "api_key": 'dummy',
-        "base_url": get_local_llm_url(),
+        "base_url": _llm_base,
         "price": [0, 0]
     }]
 

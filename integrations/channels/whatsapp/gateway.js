@@ -42,7 +42,7 @@ const os = require('os');
 // at the bottom of the file BEFORE app.listen() — every handler that
 // references them runs only after a session is started, which can't
 // happen until the server is listening.
-let makeWASocket, useMultiFileAuthState;
+let makeWASocket, useMultiFileAuthState, DisconnectReason, getContentType, Browsers;
 
 let express, expressWs;
 try {
@@ -72,20 +72,67 @@ async function ensureSession(accountId) {
   let ctx = sessions.get(accountId);
   if (ctx) return ctx;
 
-  const authPath = path.join(AUTH_BASE, accountId);
-  fs.mkdirSync(authPath, { recursive: true });
-  const { state, saveCreds } = await useMultiFileAuthState(authPath);
-  const sock = makeWASocket({ auth: state, printQRInTerminal: false });
-
   ctx = {
-    sock,
+    sock: null,
     qr: null,
     authenticated: false,
     state: 'connecting',
     wsClients: new Set(),
     accountId,
+    messages: [],
   };
   sessions.set(accountId, ctx);
+
+  await connectSocket(ctx);
+  return ctx;
+}
+
+// Newest-last, capped — the mobile app polls GET /messages instead of
+// holding a live WebSocket open, so the gateway keeps a short in-memory
+// history per session rather than requiring a persistent connection.
+const MAX_BUFFERED_MESSAGES = 50;
+function bufferMessage(ctx, wahaMessage) {
+  ctx.messages.push(wahaMessage);
+  if (ctx.messages.length > MAX_BUFFERED_MESSAGES) {
+    ctx.messages.splice(0, ctx.messages.length - MAX_BUFFERED_MESSAGES);
+  }
+}
+
+// (Re)creates the Baileys socket for an existing ctx and wires its
+// listeners.  Called on first connect AND after every disconnect that
+// isn't a real logout — WhatsApp's multi-device protocol always tears
+// the stream down once (DisconnectReason.restartRequired / code 515)
+// right after a pairing code or QR scan is accepted, and expects the
+// client to immediately reconnect with the now-saved creds.  Without
+// this, every successful pairing looked identical to a failure: creds
+// were written to disk (creds.update fires before the restart) but
+// ctx.state stayed 'disconnected' forever because nothing ever called
+// makeWASocket() again.
+async function connectSocket(ctx) {
+  const authPath = path.join(AUTH_BASE, ctx.accountId);
+  fs.mkdirSync(authPath, { recursive: true });
+  const { state, saveCreds } = await useMultiFileAuthState(authPath);
+  // Fixed, REAL browser identity — Browsers.macOS('Chrome') (a preset
+  // Baileys itself ships in Utils/browser-utils.js), not Baileys'
+  // unpinned default and NOT a hand-rolled tuple. Observed twice in
+  // testing: without ANY pinning, each (re)connect can present a
+  // different fingerprint for the same linked device (e.g.
+  // Ubuntu/Chrome, then Mac OS/Chrome on the very next reconnect) —
+  // WhatsApp's servers treat that as a hijacked/cloned session and kill
+  // the link (stream:error code 401, conflict=device_removed) within
+  // minutes of a fresh pairing succeeding. But a MADE-UP tuple (tried:
+  // ['Nunba','Chrome','120.0.0']) gets rejected outright during fresh
+  // pairing-code registration specifically ("Connection Failure" in the
+  // noise handshake, every time) — WhatsApp validates the identity
+  // during that sensitive step more strictly than on an established
+  // reconnect. A real Baileys preset is both stable (fixes device
+  // removal) and legitimate (fixes registration).
+  const sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
+    browser: Browsers.macOS('Chrome'),
+  });
+  ctx.sock = sock;
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -101,21 +148,124 @@ async function ensureSession(accountId) {
       ctx.qr = null;
       broadcast(ctx, { type: 'authenticated' });
     } else if (connection === 'close') {
+      // Intentional teardown (a newer request replaced this ctx with a
+      // fresh one — see request-pair-code) must NOT reconnect. Without
+      // this, calling sock.end() on the old socket still fires its own
+      // 'close' event through these same listeners, and the reconnect
+      // logic below would spin up a SECOND socket authenticating as the
+      // same device at the same moment as the deliberately-fresh one —
+      // WhatsApp's servers see two concurrent connections for one
+      // identity and kill the handshake (observed as "Connection
+      // Failure" on the new socket, seconds after a clean teardown).
+      if (ctx._torndown) return;
+
       const code = lastDisconnect && lastDisconnect.error
         && lastDisconnect.error.output && lastDisconnect.error.output.statusCode;
       ctx.authenticated = false;
       ctx.state = 'disconnected';
       broadcast(ctx, { type: 'disconnected', code });
+
+      const loggedOut = DisconnectReason && code === DisconnectReason.loggedOut;
+      if (!loggedOut) {
+        connectSocket(ctx).catch((e) => {
+          console.error(JSON.stringify({
+            event: 'reconnect_failed',
+            accountId: ctx.accountId,
+            error: String(e && e.message),
+          }));
+        });
+      } else {
+        // A real logout (the phone removed this linked device, or the
+        // user unlinked it) — the socket is permanently dead and the
+        // saved creds are invalid on WhatsApp's servers now. Without
+        // this, `sessions` keeps the dead ctx forever: ensureSession()
+        // short-circuits on "ctx exists" and every future /qr or
+        // /pair-code call reuses the same closed socket, always
+        // failing with "Connection Closed" until the whole gateway
+        // process is restarted. Drop both so the next request builds
+        // a genuinely fresh session + fresh creds.
+        sessions.delete(ctx.accountId);
+        fs.rm(path.join(AUTH_BASE, ctx.accountId), { recursive: true, force: true }, () => {});
+      }
     }
   });
 
   sock.ev.on('messages.upsert', ({ messages }) => {
     for (const m of messages || []) {
-      broadcast(ctx, { type: 'message', message: m });
+      const wahaMessage = toWahaShape(m);
+      if (wahaMessage) {
+        bufferMessage(ctx, wahaMessage);
+        broadcast(ctx, { type: 'message', data: wahaMessage });
+      }
     }
   });
 
   return ctx;
+}
+
+// Baileys' raw WAMessage (key.remoteJid / message.conversation / ...)
+// has nothing in common with the WAHA/whatsapp-web.js shape that
+// integrations/channels/whatsapp_adapter.py's _convert_message() was
+// written against (chat.id._serialized, sender.id._serialized, body,
+// hasMedia, ...).  Broadcasting the raw object silently produced an
+// all-empty Message on the Python side (every field defaulted) even
+// though a real message had arrived — this translates into the shape
+// the adapter already expects, so the "same WAHA API subset" promise
+// in this file's header comment is actually true for messages too.
+const MEDIA_TYPE_MAP = {
+  imageMessage: 'image',
+  videoMessage: 'video',
+  audioMessage: 'audio',
+  pttMessage: 'ptt',
+  documentMessage: 'document',
+  stickerMessage: 'sticker',
+};
+
+function toWahaShape(m) {
+  if (!m || !m.message || !m.key) return null;
+  const contentType = getContentType(m.message);
+  if (!contentType) return null;
+  // Baileys sends a handful of non-content protocol messages through
+  // the same upsert stream (e.g. protocolMessage for deletes/edits,
+  // reactionMessage) — nothing the adapter's Message model represents.
+  if (contentType === 'protocolMessage' || contentType === 'reactionMessage') return null;
+
+  const remoteJid = m.key.remoteJid || '';
+  const isGroup = remoteJid.endsWith('@g.us');
+  const senderId = m.key.participant || remoteJid;
+  const content = m.message[contentType] || {};
+
+  let body = '';
+  if (contentType === 'conversation') {
+    body = m.message.conversation || '';
+  } else if (contentType === 'extendedTextMessage') {
+    body = content.text || '';
+  } else {
+    body = content.caption || '';
+  }
+
+  const mediaType = MEDIA_TYPE_MAP[contentType];
+  const contextInfo = content.contextInfo || {};
+  const ts = typeof m.messageTimestamp === 'number'
+    ? m.messageTimestamp
+    : Number(m.messageTimestamp) || Math.floor(Date.now() / 1000);
+
+  return {
+    id: { _serialized: (m.key.id || '') },
+    chat: { id: { _serialized: remoteJid }, isGroup },
+    sender: { id: { _serialized: senderId }, pushname: m.pushName || null },
+    body,
+    hasMedia: Boolean(mediaType),
+    type: mediaType || 'chat',
+    mediaKey: content.mediaKey || null,
+    mimetype: content.mimetype || null,
+    filename: content.fileName || null,
+    caption: mediaType ? (content.caption || null) : null,
+    mentionedIds: contextInfo.mentionedJid || [],
+    quotedMsgId: contextInfo.stanzaId || null,
+    timestamp: ts,
+    fromMe: Boolean(m.key.fromMe),
+  };
 }
 
 function broadcast(ctx, event) {
@@ -148,12 +298,27 @@ app.get('/api/sessions/:id/status', (req, res) => {
     authenticated: !!(ctx && ctx.authenticated),
     state: ctx ? ctx.state : 'not_started',
     qr: (ctx && ctx.qr) || null,
+    // Lets the send route resolve "message myself" without duplicating
+    // Baileys' own-identity lookup — sock.user is populated once
+    // 'connection.update' has fired connection:'open'.
+    own_jid: (ctx && ctx.sock && ctx.sock.user && ctx.sock.user.id) || null,
   });
 });
 
 app.get('/api/sessions/:id/qr', (req, res) => {
   const ctx = getSession(req.params.id);
   res.json({ qr: (ctx && ctx.qr) || null });
+});
+
+// Newest messages only, via ?since_ts=<unix seconds> — the mobile app
+// polls this instead of holding a WebSocket open. Includes both
+// received AND our own sent messages (Baileys' messages.upsert fires
+// for both, fromMe distinguishes them), so a chat UI sees one thread.
+app.get('/api/sessions/:id/messages', (req, res) => {
+  const ctx = getSession(req.params.id);
+  const sinceTs = Number(req.query.since_ts) || 0;
+  const all = (ctx && ctx.messages) || [];
+  res.json({ messages: sinceTs ? all.filter((m) => m.timestamp > sinceTs) : all });
 });
 
 app.post('/api/sessions/:id/messages/send', async (req, res) => {
@@ -183,14 +348,40 @@ app.post('/api/sessions/:id/messages/send', async (req, res) => {
 // the same endpoint can be called again to mint a new one.
 app.post('/api/sessions/:id/request-pair-code', async (req, res) => {
   try {
-    const ctx = await ensureSession(req.params.id);
+    const accountId = req.params.id;
     const phone = String((req.body && req.body.phone) || '').replace(/\D/g, '');
     if (!phone) {
       return res.status(400).json({ error: 'phone (digits only, E.164 without +) required' });
     }
-    if (ctx.authenticated) {
+
+    let ctx = sessions.get(accountId);
+    if (ctx && ctx.authenticated) {
       return res.status(409).json({ error: 'already_authenticated' });
     }
+
+    // requestPairingCode() must be called on a freshly-created socket's
+    // very first connection attempt. Every other route (/qr, /start)
+    // defaults to QR-mode via ensureSession(), which is idempotent and
+    // reuses whatever ctx already exists — including one that's already
+    // cycled through one or more QR-refresh reconnects (Baileys expires
+    // and regenerates the QR every ~2.5 min while nobody scans it).
+    // Calling requestPairingCode() on that already-cycled socket
+    // produces a low-level noise-handshake "Connection Failure" instead
+    // of a real code (observed repeatedly in testing — only ever worked
+    // when the socket was brand new). Tear down whatever exists and
+    // build a clean one just for this request.
+    if (ctx) {
+      ctx._torndown = true;
+      try { ctx.sock && ctx.sock.end && ctx.sock.end(); } catch (_) { /* best-effort */ }
+      sessions.delete(accountId);
+    }
+    ctx = {
+      sock: null, qr: null, authenticated: false, state: 'connecting',
+      wsClients: new Set(), accountId, messages: [],
+    };
+    sessions.set(accountId, ctx);
+    await connectSocket(ctx);
+
     if (typeof ctx.sock.requestPairingCode !== 'function') {
       return res.status(501).json({ error: 'pair-code not supported by this Baileys version' });
     }
@@ -242,6 +433,9 @@ app.ws('/ws/:id', (ws, req) => {
     const baileys = await import('@whiskeysockets/baileys');
     makeWASocket = baileys.default || baileys.makeWASocket;
     useMultiFileAuthState = baileys.useMultiFileAuthState;
+    DisconnectReason = baileys.DisconnectReason;
+    getContentType = baileys.getContentType;
+    Browsers = baileys.Browsers;
   } catch (e) {
     console.error(JSON.stringify({
       event: 'startup_error',

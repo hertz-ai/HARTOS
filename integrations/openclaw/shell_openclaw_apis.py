@@ -210,8 +210,11 @@ def register_openclaw_routes(app):
                 'source': 'hart_pipeline',
             })
         except Exception as e:
+            # 502, not 500: the :6777 chat pipeline being down is an UPSTREAM
+            # unavailability (the sibling /api/agent/ask drains the same
+            # failure as a controlled envelope). Deployed-surface suite find.
             logger.error("Assistant chat error: %s", e)
-            return jsonify({'success': False, 'error': str(e)}), 500
+            return jsonify({'success': False, 'error': str(e)}), 502
 
     @app.route('/api/assistant/capabilities', methods=['GET'])
     def _assistant_capabilities():

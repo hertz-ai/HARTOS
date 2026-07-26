@@ -281,7 +281,15 @@ def is_transient_deferral() -> bool:
     breaker-open), so the daemon's notion of "transient" never drifts from the
     dispatcher's."""
     try:
-        return is_user_recently_active() or _cb_is_open()
+        if is_user_recently_active() or _cb_is_open():
+            return True
+        # A goal whose in-flight LLM call was just PREEMPTED for a live user turn
+        # (foreground abort / llama_scheduler eviction) is a transient defer too —
+        # re-queue it next tick, never count it toward auto-pause.  The user may
+        # already be "inactive" by the time we re-check, so this explicit preempt
+        # signal catches the window is_user_recently_active() can miss.
+        from core.foreground import preempted_recently
+        return preempted_recently()
     except Exception:
         return False
 
@@ -758,7 +766,29 @@ def dispatch_goal(prompt: str, user_id: str, goal_id: str,
         try:
             from routes.hartos_backend_adapter import chat as hevolve_chat
         except ImportError:
-            from hartos_backend_adapter import chat as hevolve_chat
+            try:
+                from hartos_backend_adapter import chat as hevolve_chat
+            except ImportError:
+                # NATIVE HARTOS (no Nunba adapter — the module lives only in Nunba):
+                # call the in-process /chat via the app's OWN test client — the SAME
+                # canonical route Tier-2 uses, minus the loopback socket, exactly as
+                # routes.hartos_backend_adapter.chat does in Nunba. Reuses the /chat
+                # pipeline + _internal_auth_headers; no new dispatch path. Any error
+                # here still falls through to the Tier-2 HTTP proxy below (bounded-safe).
+                def hevolve_chat(text=None, user_id=None, agent_id=None,
+                                 create_agent=True, casual_conv=False,
+                                 autonomous=True, request_id=None, **_kw):
+                    from hart_intelligence_entry import app as _app
+                    _payload = {
+                        'prompt': text, 'user_id': user_id, 'prompt_id': agent_id,
+                        'create_agent': create_agent, 'casual_conv': casual_conv,
+                        'autonomous': autonomous, 'request_id': request_id,
+                        'task_source': 'own',
+                    }
+                    with _app.test_client() as _c:
+                        _r = _c.post('/chat', json=_payload,
+                                     headers=_internal_auth_headers())
+                        return _r.get_json() or {}
 
         # USER PRIORITY: if user chatted recently, skip this tick — let user have the LLM
         if is_user_recently_active():

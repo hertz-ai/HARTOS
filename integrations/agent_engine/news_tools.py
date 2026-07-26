@@ -10,6 +10,14 @@ from typing import Annotated, Optional
 
 logger = logging.getLogger('hevolve_social')
 
+# Marker appended to an ingested news post's content to flag it for
+# hevolve.ai web publication.  Mirrors the existing
+# ``<!-- feed_hash:... -->`` marker convention in
+# integrations/social/feed_import.py (queried the same way, via
+# ``Post.content.contains(...)``) — no schema change, no parallel table.
+# Consumed by the 'seo' goal type (goal_manager._build_seo_prompt).
+PUBLISH_WEB_MARKER = '<!-- publish_web -->'
+
 
 def register_news_tools(helper, assistant, user_id: str):
     """Register news curation and push notification tools with an AutoGen agent."""
@@ -216,6 +224,75 @@ def register_news_tools(helper, assistant, user_id: str):
         except Exception as e:
             return json.dumps({'error': str(e)})
 
+    def mark_news_for_web(
+        post_id: Annotated[str, "Post ID of the ingested news item"],
+        publishable: Annotated[bool, "True to flag for web publication, False to clear the flag"] = True,
+    ) -> str:
+        """Flag an ingested news post for hevolve.ai web publication (publish_web)."""
+        try:
+            from integrations.social.models import get_db, Post
+
+            db = get_db()
+            try:
+                post = db.query(Post).filter(Post.id == str(post_id)).first()
+                if post is None:
+                    return json.dumps({'error': f'post not found: {post_id}'})
+
+                content = post.content or ''
+                marked = PUBLISH_WEB_MARKER in content
+                if publishable and not marked:
+                    post.content = f"{content}\n\n{PUBLISH_WEB_MARKER}"
+                    db.commit()
+                elif not publishable and marked:
+                    post.content = content.replace(
+                        f"\n\n{PUBLISH_WEB_MARKER}", '').replace(
+                        PUBLISH_WEB_MARKER, '')
+                    db.commit()
+
+                return json.dumps({
+                    'success': True,
+                    'post_id': str(post.id),
+                    'publish_web': bool(publishable),
+                    'title': post.title,
+                })
+            finally:
+                db.close()
+        except Exception as e:
+            return json.dumps({'error': str(e)})
+
+    def list_news_for_web(
+        limit: Annotated[int, "Maximum number of flagged items to return"] = 10,
+    ) -> str:
+        """List ingested news posts flagged publish_web (pending web publication)."""
+        try:
+            from integrations.social.models import get_db, Post
+
+            db = get_db()
+            try:
+                posts = (
+                    db.query(Post)
+                    .filter(Post.content.contains(PUBLISH_WEB_MARKER))
+                    .order_by(Post.created_at.desc())
+                    .limit(limit)
+                    .all()
+                )
+                items = []
+                for post in posts:
+                    items.append({
+                        'id': str(post.id),
+                        'title': post.title,
+                        'content': (post.content or '').replace(
+                            PUBLISH_WEB_MARKER, '').strip(),
+                        'link_url': post.link_url,
+                        'source_channel': post.source_channel,
+                        'created_at': post.created_at.isoformat() if post.created_at else None,
+                    })
+                return json.dumps({'items': items, 'count': len(items)})
+            finally:
+                db.close()
+        except Exception as e:
+            return json.dumps({'error': str(e)})
+
     tools = [
         ('fetch_news_feeds',
          'Fetch and parse RSS/Atom feeds, returning titles, links, and categories',
@@ -232,6 +309,12 @@ def register_news_tools(helper, assistant, user_id: str):
         ('get_news_metrics',
          'Get news notification delivery stats: sent count, read rate, by category',
          get_news_metrics),
+        ('mark_news_for_web',
+         'Flag (or unflag) an ingested news post for hevolve.ai web publication (publish_web)',
+         mark_news_for_web),
+        ('list_news_for_web',
+         'List ingested news posts flagged publish_web, pending hevolve.ai web publication',
+         list_news_for_web),
     ]
 
     for name, desc, func in tools:

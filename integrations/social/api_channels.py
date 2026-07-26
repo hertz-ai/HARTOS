@@ -12,6 +12,7 @@ Provides endpoints for:
 import base64
 import io
 import logging
+import re
 from datetime import datetime
 
 from flask import Blueprint, request, jsonify, g
@@ -58,6 +59,68 @@ def list_bindings():
     return jsonify({'success': True, 'data': [b.to_dict() for b in bindings]})
 
 
+def _extract_credential(data: dict, meta: dict):
+    """Pull the connect-form credential (bot_token, api_key, ...) out of
+    the raw request body.
+
+    ChannelSetupScreen.js sends each metadata.setup_fields key at the TOP
+    LEVEL of the body (e.g. {'channel_type':'telegram','bot_token':'123:ABC'}),
+    not nested under 'metadata' — so it must be looked up by the channel's
+    own declared field name, not a fixed key. Returns (cred_key, value) or
+    (None, None) if this channel has no non-auto setup field (e.g. 'web',
+    or gateway_qr channels like WhatsApp which use a separate pairing flow).
+    """
+    fields = [f for f in (meta.get('setup_fields') or []) if not f.get('auto')]
+    if not fields:
+        return None, None
+    cred_key = fields[0]['key']
+    value = data.get(cred_key) or (data.get('metadata') or {}).get(cred_key)
+    return cred_key, value
+
+
+def _wire_live_adapter(channel_type: str, credential) -> dict:
+    """Construct + register a live channel adapter so inbound messages
+    from a freshly-connected token-based channel (Telegram/Discord/Slack/
+    ...) actually reach the agent.
+
+    Same bug class as WhatsApp's gateway_qr flow (see
+    hart_intelligence_entry._ensure_whatsapp_live_adapter): this endpoint
+    used to only ever write the UserChannelBinding row — "connected" in
+    the UI, but nothing was ever registered into the running
+    ChannelRegistry, so FlaskChannelIntegration._handle_message (the
+    function that calls /chat and sends the agent's reply back) never
+    saw a single inbound message. FlaskChannelIntegration.register_channel()
+    adds the adapter to the registry and wires on_message, but — being a
+    plain sync call made long after the one-time boot-time start_all() —
+    never actually calls adapter.start(), so the adapter would sit
+    registered but never connect. This schedules that start explicitly,
+    same as the WhatsApp fix. Never raises — binding creation must
+    succeed even if live wiring fails.
+    """
+    if not credential:
+        return {'success': True, 'message': 'no credential to wire (binding-only channel)'}
+    try:
+        import asyncio as _aio
+        from integrations.channels.flask_integration import get_channel_integration
+        integration = get_channel_integration()
+
+        if integration.registry.get(channel_type) is not None:
+            return {'success': True, 'message': 'adapter already registered'}
+
+        if not integration.register_channel(channel_type, token=credential):
+            return {'success': False, 'error': 'register_channel returned False (see server log)'}
+
+        adapter = integration.registry.get(channel_type)
+        loop = integration._loop
+        if adapter is None or not (loop and loop.is_running()):
+            return {'success': False, 'error': 'registered but event loop not running'}
+        _aio.run_coroutine_threadsafe(adapter.start(), loop)
+        return {'success': True, 'message': f'{channel_type} adapter registration scheduled'}
+    except Exception as e:
+        logger.warning("live adapter wiring failed for %s: %s", channel_type, e)
+        return {'success': False, 'error': repr(e)[:300]}
+
+
 @channel_user_bp.route('/bindings', methods=['POST'])
 @require_auth
 def create_binding():
@@ -68,11 +131,22 @@ def create_binding():
         return jsonify({'success': False, 'error': 'channel_type is required'}), 400
 
     from integrations.channels.metadata import get_channel_metadata
-    if not get_channel_metadata(channel_type):
+    meta = get_channel_metadata(channel_type)
+    if not meta:
         return jsonify({'success': False, 'error': f'Unknown channel: {channel_type}'}), 400
 
     sender_id = data.get('channel_sender_id', '')
     chat_id = data.get('channel_chat_id', '')
+
+    # The connect form's credential (bot_token, api_key, ...) arrives at
+    # the top level of the body, not nested under 'metadata' — fold it
+    # into metadata_json here so it's actually persisted (previously
+    # silently dropped: only channel_sender_id/channel_chat_id/
+    # auth_method/metadata were ever read).
+    cred_key, credential = _extract_credential(data, meta)
+    metadata_payload = dict(data.get('metadata') or {})
+    if cred_key and credential:
+        metadata_payload[cred_key] = credential
 
     # Check for existing binding
     existing = g.db.query(UserChannelBinding).filter_by(
@@ -84,7 +158,7 @@ def create_binding():
     if existing:
         existing.is_active = True
         existing.channel_chat_id = chat_id or existing.channel_chat_id
-        existing.metadata_json = data.get('metadata', existing.metadata_json)
+        existing.metadata_json = metadata_payload or existing.metadata_json
         existing.auth_method = data.get('auth_method', existing.auth_method)
         binding = existing
     else:
@@ -94,13 +168,21 @@ def create_binding():
             channel_sender_id=sender_id,
             channel_chat_id=chat_id,
             auth_method=data.get('auth_method'),
-            metadata_json=data.get('metadata'),
+            metadata_json=metadata_payload or None,
             is_active=True,
             is_preferred=False,
         )
         g.db.add(binding)
 
     g.db.flush()
+
+    adapter_result = _wire_live_adapter(channel_type, credential)
+    if not adapter_result.get('success'):
+        logger.warning(
+            "create_binding: %s bound but live adapter not wired: %s",
+            channel_type, adapter_result.get('error'),
+        )
+
     return jsonify({'success': True, 'data': binding.to_dict()}), 201
 
 
@@ -189,16 +271,29 @@ def verify_pair_code():
         if result is None:
             return jsonify({'success': False, 'error': 'Invalid or expired pairing code'}), 400
 
-        # Create binding
-        binding = UserChannelBinding(
+        # Find-or-update: re-pairing an already-connected channel_type+sender_id
+        # (expired token, retry, device switch) must not 500 on the unique
+        # constraint (user_id, channel_type, channel_sender_id).
+        existing = g.db.query(UserChannelBinding).filter_by(
             user_id=g.user_id,
             channel_type=channel_type,
             channel_sender_id=sender_id,
-            auth_method='pairing',
-            is_active=True,
-            is_preferred=False,
-        )
-        g.db.add(binding)
+        ).first()
+
+        if existing:
+            existing.is_active = True
+            existing.auth_method = 'pairing'
+            binding = existing
+        else:
+            binding = UserChannelBinding(
+                user_id=g.user_id,
+                channel_type=channel_type,
+                channel_sender_id=sender_id,
+                auth_method='pairing',
+                is_active=True,
+                is_preferred=False,
+            )
+            g.db.add(binding)
         g.db.flush()
 
         return jsonify({'success': True, 'data': binding.to_dict()})
@@ -242,11 +337,22 @@ def _proxy_gateway(method: str, path: str, **kwargs):
     """Thin HTTP proxy to the gateway.  Returns (json_or_none, status).
     Never raises — connection / timeout errors map to (None, 503)."""
     import json as _json
+    import os as _os
     import urllib.error
     import urllib.request
     url = _whatsapp_gateway_base().rstrip('/') + path
     body = None
     headers = {'Accept': 'application/json'}
+    # The central node talks to a REMOTE WAHA-style gateway (supervisor
+    # skips the embedded Baileys spawn on a central deploy), and that
+    # gateway requires an API key: without it every /api/sessions call
+    # 401s, so the status comes back state='unknown' and the QR never
+    # appears -- exactly what driving the flow with a real user showed.
+    # Sent as X-Api-Key (WAHA convention) only when WHATSAPP_API_KEY is
+    # set; a local embedded gateway needs none, so this stays inert there.
+    _gw_key = _os.environ.get('WHATSAPP_API_KEY')
+    if _gw_key:
+        headers['X-Api-Key'] = _gw_key
     if 'json' in kwargs and kwargs['json'] is not None:
         body = _json.dumps(kwargs['json']).encode('utf-8')
         headers['Content-Type'] = 'application/json'
@@ -294,15 +400,123 @@ def whatsapp_get_qr():
                 'embedded Baileys gateway is still starting (first run '
                 'installs Node deps, ~30s).'),
         }), 503
+
+    # This flow (real Baileys gateway) never went through /pair/verify or
+    # /bindings, so nothing else ever wrote a UserChannelBinding for it —
+    # the app's own channel list would show WhatsApp as unconnected even
+    # though the gateway is genuinely authenticated. Upsert here, same
+    # find-or-update pattern as create_binding()/verify_pair_code().
+    if body.get('authenticated'):
+        existing = g.db.query(UserChannelBinding).filter_by(
+            user_id=g.user_id, channel_type='whatsapp', channel_sender_id='',
+        ).first()
+        if existing:
+            existing.is_active = True
+            existing.auth_method = 'gateway_qr'
+        else:
+            g.db.add(UserChannelBinding(
+                user_id=g.user_id,
+                channel_type='whatsapp',
+                channel_sender_id='',
+                auth_method='gateway_qr',
+                is_active=True,
+                is_preferred=False,
+            ))
+        g.db.flush()
+
+        # Binding above only makes the Channels list show "connected" —
+        # it does not wire a live WhatsAppAdapter into the running
+        # ChannelRegistry, so without this, no inbound message from this
+        # session ever reaches the agent (same gap that existed on the
+        # chat-based Connect_Channel path; see
+        # hart_intelligence_entry._ensure_whatsapp_live_adapter). This is
+        # the endpoint the mobile app's QRScannerScreen actually polls,
+        # so this is the real fix for the mobile connect flow.
+        try:
+            from hart_intelligence_entry import (
+                _ensure_whatsapp_live_adapter,
+            )
+            _ensure_whatsapp_live_adapter(
+                g.user_id, sid=account_id, base=_whatsapp_gateway_base(),
+            )
+        except Exception as _adapter_err:
+            logger.warning(
+                "whatsapp_get_qr: live adapter registration failed: %s",
+                _adapter_err,
+            )
+
+    qr = body.get('qr')
     return jsonify({
         'success': True,
         'data': {
-            'qr': body.get('qr'),
+            'qr': qr,
+            # Real scannable image, same helper /pair/generate already
+            'qr_data_url': _generate_qr_data_url(qr) if qr else None,
             'authenticated': bool(body.get('authenticated')),
             'state': body.get('state', 'unknown'),
             'account_id': account_id,
         },
     }), 200 if status < 400 else status
+
+
+@channel_user_bp.route('/whatsapp/messages', methods=['GET'])
+@require_auth
+def whatsapp_get_messages():
+    """Poll for messages on the current user's real WhatsApp session —
+    both received AND sent (the gateway's buffer includes our own
+    echoed sends, so the app renders one thread). ``?since_ts=<unix
+    seconds>`` returns only newer messages for incremental polling."""
+    account_id = _whatsapp_account_id()
+    since_ts = request.args.get('since_ts', '')
+    path = f'/api/sessions/{account_id}/messages'
+    if since_ts:
+        path += f'?since_ts={since_ts}'
+    body, status = _proxy_gateway('GET', path)
+    if body is None:
+        return jsonify({'success': False, 'error': 'WhatsApp gateway unreachable'}), 503
+    return jsonify({'success': True, 'data': {'messages': body.get('messages', [])}}), 200 if status < 400 else status
+
+
+@channel_user_bp.route('/whatsapp/send', methods=['POST'])
+@require_auth
+def whatsapp_send_message():
+    """Send a real WhatsApp message through the current user's session.
+
+    Body: ``{"to": "<phone digits>", "text": "..."}``. ``to`` accepts a
+    bare phone number (any format, digits extracted) — the JID suffix
+    is added server-side so the app never needs to know Baileys' JID
+    format. Pass ``to`` empty/omitted to send to yourself (self-chat)."""
+    data = request.get_json(silent=True) or {}
+    text = (data.get('text') or '').strip()
+    if not text:
+        return jsonify({'success': False, 'error': 'text is required'}), 400
+
+    to_raw = (data.get('to') or '').strip()
+    account_id = _whatsapp_account_id()
+    if to_raw:
+        digits = re.sub(r'\D', '', to_raw)
+        if not digits:
+            return jsonify({'success': False, 'error': 'to must contain a phone number'}), 400
+        jid = f'{digits}@s.whatsapp.net'
+    else:
+        # Self-chat: same account_id derivation used to start the
+        # session, so the accompanying own phone/JID is already known
+        # to the gateway from the authenticated socket — ask it for
+        # its own JID via /status rather than duplicating that lookup.
+        status_body, _ = _proxy_gateway('GET', f'/api/sessions/{account_id}/status')
+        own_jid = status_body.get('own_jid') if status_body else None
+        if not own_jid:
+            return jsonify({'success': False, 'error': 'not connected yet — cannot resolve self chat'}), 409
+        jid = own_jid
+
+    body, status = _proxy_gateway(
+        'POST', f'/api/sessions/{account_id}/messages/send', json={'to': jid, 'text': text},
+    )
+    if body is None:
+        return jsonify({'success': False, 'error': 'WhatsApp gateway unreachable'}), 503
+    if status >= 400:
+        return jsonify({'success': False, 'error': body.get('error', 'send failed')}), status
+    return jsonify({'success': True, 'data': body})
 
 
 @channel_user_bp.route('/whatsapp/pair-code', methods=['POST'])
@@ -321,6 +535,21 @@ def whatsapp_request_pair_code():
     account_id = _whatsapp_account_id()
     # Ensure session exists before requesting a pair code.
     _proxy_gateway('POST', f'/api/sessions/{account_id}/start')
+
+    # Requesting a NEW pairing code against an already-authenticated
+    # session re-triggers Baileys' login handshake mid-flight and can
+    # tear down the live connection (observed: a mistyped/wrong number
+    # submitted while already linked knocked out a working session,
+    # requiring a full gateway restart to recover from saved creds).
+    # If we're already connected, there is nothing to pair — say so
+    # instead of touching the socket.
+    status_body, _ = _proxy_gateway('GET', f'/api/sessions/{account_id}/status')
+    if status_body and status_body.get('authenticated'):
+        return jsonify({
+            'success': False,
+            'error': 'This WhatsApp account is already connected. Disconnect it first if you want to re-pair.',
+        }), 409
+
     body, status = _proxy_gateway(
         'POST',
         f'/api/sessions/{account_id}/request-pair-code',

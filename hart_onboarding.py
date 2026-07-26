@@ -1290,6 +1290,251 @@ class HARTNameRegistry:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# COMPANION INSTALL - post-seal Nunba desktop pre-fetch
+# ═══════════════════════════════════════════════════════════════════════
+#
+# After the HART name is sealed, the final onboarding step quietly pre-fetches
+# the Nunba desktop companion so it is ready the first time the user opens it.
+# We download the SAME AppImage, to the SAME cache path, that the `nunba`
+# launcher stub (nixos/packages/nunba.nix) expects, so the launcher finds it
+# already present and never re-downloads. This is a convenience pre-fetch, never
+# a blocker: it self-skips on non-Linux, degrades gracefully when offline or
+# when curl is missing, and is always skippable / retryable from the UI.
+
+_companion_state: Dict[str, Dict] = {}
+_companion_lock = __import__('threading').Lock()
+
+
+def _companion_url() -> str:
+    """The Nunba Linux AppImage URL.
+
+    Single source of truth is core.install_links (which also documents the
+    nunba.nix launcher's installerUrl and every other install surface). The
+    NUNBA_APPIMAGE_URL env var overrides for tests / mirrors. Falls back to the
+    literal only if install_links isn't importable (standalone HARTOS)."""
+    override = os.environ.get('NUNBA_APPIMAGE_URL')
+    if override:
+        return override
+    try:
+        from core.install_links import get_install_link
+        url = get_install_link('linux')
+        if url:
+            return url
+    except Exception:
+        pass
+    return ('https://github.com/hertz-ai/Nunba/releases/latest/'
+            'download/Nunba-x86_64.AppImage')
+
+
+def _companion_cache_dir() -> str:
+    """Cache dir for the Nunba AppImage. Matches nunba.nix exactly:
+    ${XDG_CACHE_HOME:-$HOME/.cache}/hart/nunba ."""
+    base = os.environ.get('XDG_CACHE_HOME') or os.path.join(
+        os.path.expanduser('~'), '.cache')
+    return os.path.join(base, 'hart', 'nunba')
+
+
+def _companion_target_path() -> str:
+    """Final AppImage path the nunba launcher stub execs (and checks for -x)."""
+    return os.path.join(_companion_cache_dir(), 'Nunba-x86_64.AppImage')
+
+
+def _companion_supported() -> bool:
+    """The AppImage is x86_64 Linux only. HART_COMPANION_FORCE=1 overrides
+    (used by tests and mirrors that mock the download boundary)."""
+    if os.environ.get('HART_COMPANION_FORCE') == '1':
+        return True
+    import sys as _sys
+    return _sys.platform.startswith('linux')
+
+
+def _safe_remove(path: str):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _set_companion_state(user_id: str, **kw) -> Dict:
+    """Merge keyword fields into a user's companion-download state. Returns a
+    shallow copy of the merged state (safe to mutate by the caller)."""
+    with _companion_lock:
+        st = _companion_state.get(user_id) or {}
+        st.update(kw)
+        _companion_state[user_id] = st
+        return dict(st)
+
+
+def _probe_total_size(url: str, timeout: int = 20) -> int:
+    """HEAD the (redirecting) release URL to learn the Content-Length. Returns
+    the size in bytes, or 0 if unknown / unreachable (=> indeterminate bar)."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, method='HEAD')
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return int(r.headers.get('Content-Length') or 0)
+    except Exception:
+        return 0
+
+
+def _run_companion_download(user_id: str, url: str = None,
+                            target: str = None, timeout: int = None):
+    """Worker body: probe size, curl to a .part file, atomically promote it.
+
+    Updates the module-level companion state as it goes. NEVER raises: every
+    failure (offline, missing curl, timeout, bad disk) becomes a status the UI
+    can render and offer retry/skip on. Determinate progress is read live by
+    companion_progress() from the growing .part file vs the probed total."""
+    import subprocess
+
+    url = url or _companion_url()
+    target = target or _companion_target_path()
+    if timeout is None:
+        try:
+            timeout = int(os.environ.get('HART_COMPANION_DL_TIMEOUT', '600'))
+        except (TypeError, ValueError):
+            timeout = 600
+    part = target + '.part'
+
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+    except Exception:
+        _set_companion_state(user_id, status='error', percent=None,
+                             message='Could not prepare the cache folder.')
+        return
+
+    total = _probe_total_size(url)
+    _safe_remove(part)
+    _set_companion_state(
+        user_id, status='downloading', percent=(0 if total else None),
+        total=total, bytes=0, part=part, target=target,
+        message='Downloading your companion...')
+
+    # Mirror the launcher stub's curl resilience flags (nunba.nix): fail on
+    # HTTP error, follow redirects, retry, and abort a stalled connection
+    # instead of hanging for the whole timeout.
+    cmd = ['curl', '-fL', '--retry', '3', '--connect-timeout', '30',
+           '--speed-time', '30', '--speed-limit', '2048', '-o', part, url]
+    try:
+        res = subprocess.run(cmd, timeout=timeout, capture_output=True)
+    except FileNotFoundError:
+        _set_companion_state(user_id, status='error', percent=None,
+                             message='Downloader unavailable on this system.')
+        _safe_remove(part)
+        return
+    except subprocess.TimeoutExpired:
+        _set_companion_state(user_id, status='error', percent=None,
+                             message='Download timed out. You can retry later.')
+        _safe_remove(part)
+        return
+    except Exception:
+        _set_companion_state(user_id, status='offline', percent=None,
+                             message='Network unavailable. You can retry later.')
+        _safe_remove(part)
+        return
+
+    if res.returncode != 0:
+        _set_companion_state(user_id, status='offline', percent=None,
+                             message='Could not reach the download. Retry later.')
+        _safe_remove(part)
+        return
+
+    # Promote .part -> final and make it executable (the launcher needs -x).
+    try:
+        size = os.path.getsize(part)
+        os.replace(part, target)
+        try:
+            os.chmod(target, 0o755)
+        except Exception:
+            pass
+        _set_companion_state(user_id, status='done', percent=100,
+                             total=(total or size), bytes=size,
+                             message='Your companion is ready.')
+    except Exception:
+        _set_companion_state(user_id, status='error', percent=None,
+                             message='Could not finalize the download.')
+        _safe_remove(part)
+
+
+def start_companion_download(user_id: str, force: bool = False) -> Dict:
+    """Kick off (or restart) the background companion download.
+
+    Idempotent: reports 'done' instantly if the AppImage is already cached, is a
+    no-op while a download is already in flight, and self-skips on unsupported
+    platforms. Returns the (wire-shaped) current state. NEVER raises."""
+    import threading
+
+    target = _companion_target_path()
+    try:
+        if (not force and os.path.isfile(target)
+                and os.path.getsize(target) > 0):
+            return _set_companion_state(
+                user_id, status='done', percent=100, target=target,
+                message='Your companion is ready.')
+    except Exception:
+        pass
+
+    if not _companion_supported():
+        return _set_companion_state(
+            user_id, status='skipped', percent=None,
+            message='Companion will be ready when you open it.')
+
+    with _companion_lock:
+        st = _companion_state.get(user_id)
+        if st and st.get('status') in ('downloading', 'starting') and not force:
+            return dict(st)
+        _companion_state[user_id] = {
+            'status': 'starting', 'percent': None,
+            'message': 'Preparing your companion...'}
+
+    def _worker():
+        try:
+            _run_companion_download(user_id)
+        except Exception:
+            _set_companion_state(user_id, status='error', percent=None,
+                                 message='Companion setup failed. Retry later.')
+
+    threading.Thread(target=_worker,
+                     name='hart-companion-dl-' + str(user_id),
+                     daemon=True).start()
+    return companion_progress(user_id)
+
+
+def companion_progress(user_id: str) -> Dict:
+    """Current companion-download state, wire-shaped for the onboarding UI.
+
+    While downloading, the percent is recomputed live from the partial file
+    size against the probed total (determinate when the total is known, else
+    None for an indeterminate bar)."""
+    with _companion_lock:
+        st = dict(_companion_state.get(user_id) or {})
+    if not st:
+        return {'status': 'idle', 'percent': None, 'message': '',
+                'bytes': 0, 'total': 0}
+    if st.get('status') == 'downloading':
+        part = st.get('part')
+        total = st.get('total') or 0
+        try:
+            if part and os.path.exists(part):
+                done = os.path.getsize(part)
+                st['bytes'] = done
+                if total > 0:
+                    pct = int(done * 100 / total)
+                    # 100 is reserved for the promoted-and-executable file.
+                    st['percent'] = pct if pct < 100 else 99
+        except Exception:
+            pass
+    return {
+        'status': st.get('status', 'idle'),
+        'percent': st.get('percent'),
+        'message': st.get('message', ''),
+        'bytes': st.get('bytes', 0),
+        'total': st.get('total', 0),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # CONVERSATION STATE MACHINE
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1305,12 +1550,14 @@ class HARTOnboardingSession:
       6. ack_escape  — PA acknowledges
       7. pre_reveal  — "I think I know you."
       8. reveal      — name generation + reveal
-      9. sealed      — done, name is permanent
+      9. sealed      — name is permanent
+      10. setup_companion - pre-fetch the Nunba desktop companion (skippable)
     """
 
     PHASES = [
         'language', 'greeting', 'passion', 'ack_passion',
         'escape', 'ack_escape', 'pre_reveal', 'reveal', 'sealed',
+        'setup_companion',
     ]
 
     def __init__(self, user_id: str):
@@ -1425,14 +1672,27 @@ class HARTOnboardingSession:
                     spirit=self.generated_name.get('spirit', ''),
                 )
                 if success:
-                    self.phase = 'sealed'
+                    # Name is now permanent. Move into the final onboarding
+                    # step: pre-fetch the Nunba desktop companion in the
+                    # background so it is ready on first launch. This is the
+                    # only place that kicks the download off; the UI then polls
+                    # the 'setup_companion' phase for determinate progress.
+                    # NOTE: we do NOT return sealed=True here, so the route
+                    # keeps the session alive for the companion polls. sealed
+                    # is returned only when the companion step terminates.
+                    self.phase = 'setup_companion'
+                    try:
+                        start_companion_download(self.user_id)
+                    except Exception:
+                        pass  # pre-fetch must never block the sealed ceremony
                     return self._response(
                         pa_lines=[
                             {'id': 'post_reveal', 'text': self._line('post_reveal'), 'pause_after_ms': 3000},
                         ],
                         hart_name=self.generated_name['name'],
                         emoji_combo=self.generated_name['emoji_combo'],
-                        sealed=True,
+                        name_sealed=True,
+                        begin_companion=True,
                         animation_hint='settled',
                     )
                 else:
@@ -1441,6 +1701,29 @@ class HARTOnboardingSession:
             elif action == 'try_another':
                 # Offer one more alternative (max 2 attempts per design doc)
                 return self._do_reveal(alternative=True)
+
+        elif self.phase == 'setup_companion':
+            # Post-seal companion pre-fetch. The name is already permanent; this
+            # phase only stages the Nunba AppImage and reports progress. It is
+            # always skippable and retryable, and never blocks completion.
+            if action == 'skip_companion':
+                self.phase = 'sealed'
+                prog = companion_progress(self.user_id)
+                prog['status'] = 'skipped'
+                if not prog.get('message'):
+                    prog['message'] = 'You can set up the companion later.'
+                return self._response(companion=prog, sealed=True)
+            if action == 'retry_companion':
+                start_companion_download(self.user_id, force=True)
+                return self._response(companion=companion_progress(self.user_id))
+            # Any other action (or a bare poll) just reports progress.
+            prog = companion_progress(self.user_id)
+            if prog.get('status') in ('done', 'skipped'):
+                # Terminal: the ceremony is complete. sealed=True tells the
+                # route to clean up the in-memory session.
+                self.phase = 'sealed'
+                return self._response(companion=prog, sealed=True)
+            return self._response(companion=prog)
 
         # Default: return current state
         return self._response()

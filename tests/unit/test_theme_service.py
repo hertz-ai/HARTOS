@@ -308,9 +308,10 @@ class TestThemeServiceMisc:
     def test_get_font_options(self):
         from integrations.agent_engine.theme_service import ThemeService
         fonts = ThemeService.get_font_options()
-        assert len(fonts) == 8
+        assert len(fonts) == 9
         families = {f['family'] for f in fonts}
         assert 'JetBrains Mono' in families
+        assert 'Space Grotesk' in families  # display face (Aura); Edit §5C
         assert 'Inter' in families
         for f in fonts:
             assert 'category' in f
@@ -334,6 +335,8 @@ class TestThemeServiceMisc:
         assert ':root {' in css
         assert '--hart-accent: #6C63FF;' in css
         assert '--hart-font-family: "JetBrains Mono";' in css
+        # --hart-font-display emitted; falls back to the family when unset (Edit §5D)
+        assert '--hart-font-display: "JetBrains Mono";' in css
         assert '--hart-blur: 20px;' in css
         assert '--hart-panel-opacity: 0.65;' in css
 
@@ -509,13 +512,29 @@ class TestPerformanceAutoDetect:
         assert result['theme_id'] == 'potato'
 
     def test_auto_select_default_for_capable(self):
+        """First-boot default on capable hardware seeds Aura (the shipped OS theme).
+
+        Points the theme dir at the REAL nixos/assets/conky-themes so the actual
+        shipped aura.json is loaded end-to-end, then asserts auto_select_theme both
+        reports 'aura' AND persists it as the active theme.
+        """
+        import integrations.agent_engine.theme_service as ts
         from integrations.agent_engine.theme_service import ThemeService
-        with patch.object(ThemeService, 'detect_performance_tier', return_value=None), \
+        # Resolve the real shipped theme dir exactly as the module's _THEME_DIR does.
+        real_theme_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(ts.__file__)))),
+            'nixos', 'assets', 'conky-themes')
+        with patch('integrations.agent_engine.theme_service._THEME_DIR', real_theme_dir), \
+             patch.object(ThemeService, 'detect_performance_tier', return_value=None), \
              patch.object(ThemeService, '_apply_gtk'), \
              patch.object(ThemeService, '_notify_liquid_ui'):
             result = ThemeService.auto_select_theme()
-        assert result is not None
-        assert result['theme_id'] == 'hart-default'
+            assert result is not None
+            assert result['theme_id'] == 'aura'
+            # Genuinely seeded as the active theme (active_theme.json written)
+            active = ThemeService.get_active_theme()
+        assert active['id'] == 'aura'
 
     def test_fallback_hardware_check_low_core(self):
         """When system_requirements unavailable, fall back to os.cpu_count."""
@@ -532,6 +551,55 @@ class TestPerformanceAutoDetect:
                 # No psutil: should still detect via cores only
                 result = ThemeService.detect_performance_tier()
                 assert result in ('potato', 'minimal')
+
+
+class TestAuraTokensDriveTheHome:
+    """The Aura preset must EMIT the exact CSS custom properties that the Netflix
+    home (hartHome.css) now consumes var-driven, so applying Aura is pixel-faithful
+    to the shared mock. Loads the REAL shipped aura.json end-to-end (not a fixture)
+    and asserts get_css_variables() carries every token the home binds to. Guards
+    against aura.json drifting away from the home's contract.
+    """
+
+    def _aura_css(self):
+        import integrations.agent_engine.theme_service as ts
+        from integrations.agent_engine.theme_service import ThemeService
+        real_theme_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(ts.__file__)))),
+            'nixos', 'assets', 'conky-themes')
+        with patch('integrations.agent_engine.theme_service._THEME_DIR', real_theme_dir), \
+             patch.object(ThemeService, '_apply_gtk'), \
+             patch.object(ThemeService, '_notify_liquid_ui'):
+            applied = ThemeService.apply_theme('aura')
+            assert applied.get('status') == 'applied', applied
+            return ThemeService.get_css_variables()
+
+    def test_aura_spectrum_matches_mock_p1_p4(self):
+        """--hh-cyan/--hh-magenta ride amb-3/amb-4 -> the mock's pink/amber p3/p4;
+        --hh-teal = accent (teal on function); --hh-violet = a2 secondary."""
+        css = self._aura_css()
+        assert '--hart-accent: #00E6C3;' in css      # --hh-teal (functional)
+        assert '--hart-a2: #9B5CFF;' in css          # --hh-violet (secondary)
+        assert '--hart-amb-3: #FB66B6;' in css       # --hh-cyan -> mock p3 (pink)
+        assert '--hart-amb-4: #FFB330;' in css       # --hh-magenta -> mock p4 (amber)
+
+    def test_aura_ink_and_muted_match_mock(self):
+        css = self._aura_css()
+        assert '--hart-text: #F2F4FF;' in css         # --hh-ink
+        assert '--hart-muted: #9AA0C6;' in css        # --hh-dim
+
+    def test_aura_glass_and_radius_match_mock(self):
+        """Glass blur/saturation + the panel radius the home card now binds to."""
+        css = self._aura_css()
+        assert '--hart-blur: 26px;' in css
+        assert '--hart-saturation: 150%;' in css
+        assert '--hart-radius: 22px;' in css
+
+    def test_aura_display_font_is_space_grotesk(self):
+        """The home font-family binds to --hart-font-display; Aura = Space Grotesk."""
+        css = self._aura_css()
+        assert '--hart-font-display: "Space Grotesk";' in css
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -886,8 +954,81 @@ class TestPremiumShellAPIs:
 # Cleanup
 # ═══════════════════════════════════════════════════════════════
 
+class TestThemeTierIsGraphicsNotNetwork:
+    """Real-HW 2026-07-18: an i915-KabyLake Lenovo with a LIVE GPU (display up,
+    snappy) booted into POTATO instead of the aura default, because
+    detect_performance_tier() keyed the theme off get_tier() -- a RAM/network
+    tier that classed the node OBSERVER. The theme is a GRAPHICS choice, so the
+    GPU render verdict is its ground truth."""
+
+    def test_hardware_gpu_verdict_yields_aura_default(self, monkeypatch):
+        from integrations.agent_engine.theme_service import ThemeService
+        monkeypatch.setattr(ThemeService, '_gpu_render_verdict', staticmethod(lambda: 'hardware'))
+        # None is the signal that both get_active_theme() and auto_select_theme()
+        # read as "use the aura default" (their fallback branch). Asserting None
+        # here is env-independent; the aura preset itself is proven present by
+        # test_list_presets_* against the real theme dir.
+        assert ThemeService.detect_performance_tier() is None
+        # And a hardware verdict must NOT be overridden into potato even when the
+        # network tier is the lowest (the exact real-HW regression).
+        import security.system_requirements as sr
+        monkeypatch.setattr(sr, 'get_tier', lambda: sr.NodeTierLevel.OBSERVER)
+        assert ThemeService.detect_performance_tier() is None
+
+    def test_software_or_absent_gpu_still_downgrades_low_hw(self, monkeypatch):
+        from integrations.agent_engine.theme_service import ThemeService
+        monkeypatch.setattr(ThemeService, '_gpu_render_verdict', staticmethod(lambda: 'software'))
+        # Force the OBSERVER network tier: on a genuinely weak/software box the
+        # conservative downgrade still applies (potato), unchanged by this fix.
+        import security.system_requirements as sr
+        monkeypatch.setattr(sr, 'get_tier', lambda: sr.NodeTierLevel.OBSERVER)
+        assert ThemeService.detect_performance_tier() == 'potato'
+
+
 def teardown_module():
     """Clean up temp files."""
     import shutil
     if os.path.exists(_tmp_dir):
         shutil.rmtree(_tmp_dir, ignore_errors=True)
+
+
+class TestThemePresetsShipInTheNodePackage:
+    """test_source_guard_*: labeled SOURCE-GUARD (packaging invariant, not
+    behaviourally testable on the Windows dev box -- the regression only exists
+    inside the built nix store package).
+
+    Real-HW 2026-07-20 'fully bluish, no aura': hart-app.nix's cleanSource filter
+    drops the whole nixos/ tree, which silently dropped the RUNTIME theme JSONs
+    (ThemeService._THEME_DIR = <repo>/nixos/assets/conky-themes). On the node
+    get_preset('aura') returned None, get_active_theme fell to the inline
+    hart-default (which has NO wallpaper key), and render_desktop_shell painted
+    the legacy bluish navy gradient. The installPhase must re-install the theme
+    dir at the exact path the code resolves.
+    """
+
+    def test_source_guard_hart_app_nix_installs_conky_themes(self):
+        import io, os
+        nix = io.open(os.path.join(
+            os.path.dirname(__file__), '..', '..', 'nixos', 'packages',
+            'hart-app.nix'), encoding='utf-8').read()
+        assert 'conky-themes' in nix and 'nixos/assets' in nix, (
+            'hart-app.nix no longer installs nixos/assets/conky-themes -- the '
+            'node loses every theme preset and the shell falls back to the '
+            'legacy bluish wallpaper (real-HW 2026-07-20).')
+
+    def test_aura_preset_has_the_wallpaper_that_prevents_the_bluish_fallback(self):
+        # The module fixture redirects _THEME_DIR to a temp dir; point at the REAL
+        # shipped dir (same pattern as the shipped-preset tests above) so this
+        # verifies the actual aura.json the node package installs.
+        import os
+        from unittest.mock import patch
+        from integrations.agent_engine import theme_service as ts
+        real_dir = os.path.join(os.path.dirname(os.path.abspath(ts.__file__)),
+                                '..', '..', 'nixos', 'assets', 'conky-themes')
+        real_dir = os.path.normpath(real_dir)
+        with patch('integrations.agent_engine.theme_service._THEME_DIR', real_dir):
+            aura = ts.ThemeService.get_preset('aura')
+        assert aura, 'aura.json missing from the shipped theme dir'
+        assert aura.get('wallpaper', {}).get('value'), (
+            'aura has no wallpaper.value -- render_desktop_shell would fall back '
+            'to the legacy bluish gradient even with the preset present.')

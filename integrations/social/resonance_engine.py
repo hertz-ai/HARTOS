@@ -107,6 +107,15 @@ class ResonanceService:
             description=description,
         )
         db.add(txn)
+        # Back up the wallet state to central (P3) — best-effort, gated on the
+        # user's cloud_egress consent; central is a BACKUP, never authoritative
+        # (LWW by updated_at keeps the node's live balance the source of truth).
+        try:
+            from .sync_engine import SyncEngine
+            SyncEngine.queue_entity(
+                db, ResonanceService.get_or_create_wallet(db, user_id))
+        except Exception:
+            pass
 
     @staticmethod
     def award_pulse(db: Session, user_id: str, amount: int,

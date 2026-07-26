@@ -306,6 +306,27 @@ class TestHostValidation:
         resp = client.get('/status', headers={'Host': 'localhost:6777'})
         assert resp.status_code == 200
 
+    def test_wildcard_allows_any_host(self, make_app):
+        # ALLOWED_HOSTS='*' is the deploy default (deploy-hartos-deepbox.yml:
+        # `secrets.ALLOWED_HOSTS || '*'`). It must mean "allow all" (Django
+        # ALLOWED_HOSTS semantics) — otherwise the PUBLIC /api/ota/latest poll
+        # that fleet nodes hit (Host: etime.hertzai.com) is rejected 400 and OTA
+        # delivery breaks.
+        client, _ = make_app({
+            'ALLOWED_HOSTS': '*',
+            'HEVOLVE_ENV': 'production',
+        })
+        resp = client.get('/status', headers={'Host': 'etime.hertzai.com'})
+        assert resp.status_code == 200
+
+    def test_wildcard_in_list_allows_any_host(self, make_app):
+        client, _ = make_app({
+            'ALLOWED_HOSTS': 'localhost,*',
+            'HEVOLVE_ENV': 'production',
+        })
+        resp = client.get('/status', headers={'Host': 'anything.hertzai.com'})
+        assert resp.status_code == 200
+
 
 # ── API Auth ─────────────────────────────────────────────────────
 

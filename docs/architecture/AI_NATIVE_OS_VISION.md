@@ -36,7 +36,7 @@ Run: `pytest tests/probes/test_os_pillars.py tests/unit/test_shell_route_no_coll
 
 | # | Pillar | Falsifiable probe | Verdict (2026-06-01) |
 |---|--------|-------------------|----------------------|
-| 1 | Liquid UI / A2UI | agent pushes a valid component → stored+stamped; invalid type rejected; off-switch honored | ✅ **load-bearing** |
+| 1 | Liquid UI / A2UI | agent pushes a valid component (stored+stamped); **REGISTERS a new component type at runtime → the ONE allowlist accepts a push of it**; **RECOMPOSES the whole home into a new design (Aura) + its ambient mood through the SAME transport**; every component exposes an **agent-readable spec**; invalid-type / builtin-override / off-switch / XSS all rejected | ✅ **load-bearing** (upgraded 2026-07-12: runtime framework-extension + whole-desktop recompose, not just one card) |
 | 2 | Sees you | voice + camera perceive-surfaces register as routes | 🟡 **contract proven**; STT/capture/VLM→action **runtime-gated** (mic/camera/model) |
 | 3 | Humans hold wheel | audit chain verifies on DB round-trip; tamper detected; secrets redacted | ✅ **load-bearing** (fixed #48: created_at now persisted) |
 | 4 | Composable | shell_os + shell_system register with no endpoint collision; app installer registers | ✅ **load-bearing** (fixed: dup routes silently killed the installer) |
@@ -49,6 +49,7 @@ Run: `pytest tests/probes/test_os_pillars.py tests/unit/test_shell_route_no_coll
 
 ## What "proven" does NOT yet mean (the honest last-mile)
 - **Runtime-gated (need the target, not this dev box):** P2 (real mic/camera + VLM action), P6 (actually installing a Win/Android app in the booted subsystems — needs the CI ISO + boot), P7 (a real robot + HevolveAI perceive→act loop).
+- **P1 nuance:** the probe now proves the AGENTIC framework contract is load-bearing — an agent extends the component set at runtime, recomposes the whole home into Aura, and every handle is spec-introspectable, all through the ONE governed transport. What is still **flash-gated** is the *rendered pixels* of that recompose on real HW (the shell actually painting Aura at speed) — verified by booting the ISO, not on this dev box.
 - **Broken wire — the one in-repo gap that fails a pillar outright:** **#66** — Direction-B cross-process skill relay. The data primitives exist (P8), but a skill learned on node A does not reach node B across processes. Until #66 is built, "hive learning compounds" is aspirational.
 - **Also pending the CI ISO boot:** glass-shell-as-session (#69), Plymouth/branding render, GIL fix (#68).
 

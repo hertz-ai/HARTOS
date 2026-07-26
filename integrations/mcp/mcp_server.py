@@ -44,6 +44,7 @@ from integrations.mcp._tool_impls import _get_registry, _get_db, _get_memory_gra
 mcp.tool()(impls.list_agents)
 mcp.tool()(impls.list_goals)
 mcp.tool()(impls.create_goal)
+mcp.tool()(impls.steer_goal)
 mcp.tool()(impls.agent_status)
 mcp.tool()(impls.recall)
 mcp.tool()(impls.list_recipes)

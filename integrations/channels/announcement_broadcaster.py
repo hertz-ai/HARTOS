@@ -76,12 +76,185 @@ def _build_announcement_text(payload: Dict[str, Any]) -> str:
     )
 
 
-def _collect_announcement_targets() -> List[Tuple[str, str]]:
+# Channels whose default surface is a conversation with one person rather
+# than a room somebody chose to join.  Pushing an announcement at those
+# recipients is unsolicited commercial messaging: spam plainly, a TRAI
+# UCC/DND problem in India, and a fast route to a permanently banned
+# number.
+#
+# But the brand of the app is the wrong test, and a blanket ban is wrong
+# with it -- WhatsApp Channels and Signal groups people actually joined are
+# legitimate opt-in broadcast surfaces.  What matters is whether the
+# recipient asked.  So these require an actual subscription record for the
+# destination (see is_subscribed); no record means refused.  Fail-closed on
+# the accident, open to anyone who genuinely asked to be there.
+#
+# NOTE this gate applies ONLY to announcement broadcast.  Ordinary
+# agent-to-human messaging on these channels -- replies, notifications a
+# user asked for, an agent talking to its owner -- goes through
+# registry.send_to_channel (agent_tools, self_chat, flask_integration) and
+# is untouched by any of this.
+PERSON_TO_PERSON_CHANNELS = frozenset({'signal', 'whatsapp', 'imessage'})
+
+
+def destination_shape(channel: str, chat_id: str) -> Optional[str]:
+    """Classify a destination as 'multi_person', 'one_to_one', or None.
+
+    Consent evidence comes in two grades and this is the stronger one.  A
+    subscription record says somebody asked; platform-enforced membership
+    says somebody other than us verified that they did.  Where the shape of
+    a destination is a checkable fact, prefer the fact -- it cannot be wrong
+    about which chat an id refers to, and a record can.
+
+    Telegram is the case where it is free: private chats carry positive
+    ids, while groups, supergroups and channels carry negative ones.  A
+    negative id therefore needs no record at all, and a positive one needs a
+    real subscription before anything is sent to it.
+
+    None means "cannot determine here", NOT "safe".  Callers keep whatever
+    other gate applies; None never grants anything on its own.
+    """
+    if channel == 'telegram':
+        try:
+            return 'one_to_one' if int(str(chat_id).strip()) > 0 else 'multi_person'
+        except (TypeError, ValueError):
+            return None  # @channelname and similar — not decidable from the id
+    # Discord/Slack channel-vs-DM is decidable, but only via an API call
+    # (channel type lookup). Until that is wired, say so rather than guess.
+    return None
+
+
+SUBSCRIPTION_CONSENT = 'announcement_subscription'
+SUBSCRIPTION_SCOPE = 'announcements'
+# What a person sends to stop receiving broadcasts. Kept deliberately wide:
+# somebody trying to leave should not have to guess the magic word.
+UNSUBSCRIBE_WORDS = frozenset({
+    'unsubscribe', 'stop', 'stopall', 'quit', 'optout', 'opt-out', 'opt out',
+    'leave', 'no more', 'unfollow',
+})
+
+
+def subscription_key(channel: str, chat_id: str) -> str:
+    """Identity of a broadcast destination.
+
+    The subscriber is a Telegram group or a Discord channel, not a HARTOS
+    user, so the consent row is keyed by destination rather than person."""
+    return f"{channel}:{str(chat_id).strip()}"
+
+
+def _consent_session():
+    """(ConsentService, db) or (None, None). Never raises: every caller
+    treats an unavailable service as 'not subscribed'."""
+    try:
+        from integrations.social.consent_service import ConsentService
+        from integrations.social import get_session
+        return ConsentService, get_session()
+    except Exception as exc:
+        logger.debug("consent service unavailable: %s", exc)
+        return None, None
+
+
+def record_subscription(channel: str, chat_id: str, source: str = 'unknown') -> bool:
+    """Record that a destination asked to receive broadcasts.
+
+    `source` is how they asked -- a bot command, an admin action, an import.
+    It is stored so a subscription can be audited later rather than taken on
+    faith, which is the entire point of this table existing."""
+    svc, db = _consent_session()
+    if not svc:
+        return False
+    try:
+        svc.grant_consent(db, subscription_key(channel, chat_id),
+                          SUBSCRIPTION_CONSENT, scope=SUBSCRIPTION_SCOPE)
+        logger.info("announcement subscription recorded for %s/%s (source=%s)",
+                    channel, chat_id, source)
+        return True
+    except Exception as exc:
+        logger.warning("could not record subscription for %s/%s: %s",
+                       channel, chat_id, exc)
+        return False
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def revoke_subscription(channel: str, chat_id: str) -> bool:
+    """Stop broadcasting to a destination. Failing to revoke is the one
+    error here that must be loud: it means somebody asked to leave and we
+    may keep messaging them."""
+    svc, db = _consent_session()
+    if not svc:
+        logger.error("UNSUBSCRIBE NOT RECORDED for %s/%s: consent service "
+                     "unavailable. This destination may keep receiving "
+                     "broadcasts.", channel, chat_id)
+        return False
+    try:
+        svc.revoke_consent(db, subscription_key(channel, chat_id),
+                           SUBSCRIPTION_CONSENT, scope=SUBSCRIPTION_SCOPE)
+        logger.info("announcement subscription revoked for %s/%s", channel, chat_id)
+        return True
+    except Exception as exc:
+        logger.error("UNSUBSCRIBE FAILED for %s/%s: %s", channel, chat_id, exc)
+        return False
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def is_subscribed(channel: str, chat_id: str) -> bool:
+    """Fail-closed check for a real subscription record."""
+    svc, db = _consent_session()
+    if not svc:
+        return False
+    try:
+        return bool(svc.check_consent(db, subscription_key(channel, chat_id),
+                                      SUBSCRIPTION_CONSENT,
+                                      scope=SUBSCRIPTION_SCOPE))
+    except Exception as exc:
+        logger.warning("subscription check failed for %s/%s, treating as not "
+                       "subscribed: %s", channel, chat_id, exc)
+        return False
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def looks_like_unsubscribe(text: str) -> bool:
+    """Does an inbound message mean 'stop messaging me'?
+
+    Matched on the whole message, trimmed and case-folded, so ordinary prose
+    that happens to contain 'stop' does not silently unsubscribe somebody who
+    was mid-conversation."""
+    if not text:
+        return False
+    cleaned = str(text).strip().strip('/!.').lower()
+    return cleaned in UNSUBSCRIBE_WORDS
+
+
+def handle_unsubscribe_command(channel: str, chat_id: str, text: str) -> bool:
+    """Adapter hook: call on every inbound message. Returns True if the
+    message was an unsubscribe and has been handled."""
+    if not looks_like_unsubscribe(text):
+        return False
+    revoke_subscription(channel, chat_id)
+    return True
+
+
+def _collect_announcement_targets(subscribed_check=None) -> List[Tuple[str, str]]:
     """Walk AdminAPI._channels and return [(channel_type, chat_id), ...]
     for every entry that has a non-empty `announce_chat_id` AND is
     marked enabled.  No DB hit — _channels is the canonical in-memory
     config store (also persisted by AdminAPI._save_config / restored
-    by _load_config at startup)."""
+    by _load_config at startup).
+
+    Person-to-person channels are refused regardless of configuration
+    (see PERSON_TO_PERSON_CHANNELS)."""
     try:
         from integrations.channels.admin.api import get_api
     except Exception as exc:
@@ -92,6 +265,7 @@ def _collect_announcement_targets() -> List[Tuple[str, str]]:
     except Exception as exc:
         logger.debug("AdminAPI singleton not ready: %s", exc)
         return []
+    subscribed = subscribed_check or is_subscribed
     targets: List[Tuple[str, str]] = []
     for channel_type, cfg in (getattr(api, '_channels', {}) or {}).items():
         if not isinstance(cfg, dict):
@@ -101,6 +275,34 @@ def _collect_announcement_targets() -> List[Tuple[str, str]]:
         chat_id = (cfg.get('announce_chat_id') or '').strip()
         if not chat_id:
             continue
+        # Where the destination's shape is a checkable fact, the fact wins
+        # over the operator's claim about it.
+        # Two ways a destination can be legitimate, and neither is a flag.
+        #
+        #   1. The platform enforces membership. A Telegram group or channel
+        #      (negative id) is reachable only by people who joined it, so
+        #      somebody other than us verified the opt-in.
+        #   2. We hold a subscription record. Somebody asked, it was written
+        #      down with a source, and they can unsubscribe.
+        #
+        # announce_audience used to stand in for both. It was an assertion by
+        # the operator with nothing behind it: no subscriber list, no
+        # unsubscribe path, nothing checked at send time. A destination whose
+        # only credential is a claim that people opted in cannot be defended,
+        # so the flag is removed rather than kept as a fallback -- two sources
+        # of truth for consent is worse than one real one.
+        shape = destination_shape(channel_type, chat_id)
+        needs_record = (shape == 'one_to_one'
+                        or (channel_type in PERSON_TO_PERSON_CHANNELS
+                            and shape != 'multi_person'))
+        if needs_record and not subscribed(channel_type, chat_id):
+            logger.warning(
+                "refusing announcement target %s/%s: one-to-one destination "
+                "with no subscription record. It becomes eligible the moment "
+                "someone actually subscribes, and stops the moment they "
+                "unsubscribe.", channel_type, chat_id)
+            continue
+
         targets.append((channel_type, chat_id))
     return targets
 
@@ -172,6 +374,149 @@ def broadcast_announcement(text: str) -> int:
     for channel, chat_id in targets:
         _dispatch_to_target(channel, chat_id, text)
     return len(targets)
+
+
+# ── new-content announcements ───────────────────────────────────────────
+#
+# The broadcaster originally fired on exactly one event, hive.benchmark.
+# published, so the only thing that ever reached an external channel was a
+# benchmark proof.  Every page hevolve.ai publishes -- the answers, the
+# incident write-ups -- was invisible to distribution.
+#
+# Source of truth is the published feed at /ai-news-feed.json rather than
+# the web repo's files: it is already generated deterministically by
+# scripts/fetch-ai-news.js, already carries the per-channel ?ref= URLs the
+# funnel counts via /marketing/track, and reading it over HTTP means HARTOS
+# needs no path into a sibling repository.
+
+CONTENT_FEED_URL = 'https://hevolve.ai/ai-news-feed.json'
+# How many pages may go out in a single pass.  One.  A community notices a
+# steady contributor and mutes a firehose, and a backlog of twenty pages
+# dumped at once reads as exactly the latter.
+CONTENT_ANNOUNCE_LIMIT = 1
+
+
+def fetch_own_pages(url: str = CONTENT_FEED_URL, timeout: int = 20) -> List[Dict[str, Any]]:
+    """Read own_pages from the published agent feed.  Returns [] on any
+    failure -- a distribution pass that cannot read the feed must be a
+    no-op, never a guess about what to post."""
+    import json
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            url, headers={'User-Agent': 'HARTOS-AnnouncementBroadcaster/1.0'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        pages = data.get('own_pages') or []
+        return [p for p in pages if isinstance(p, dict) and p.get('url')]
+    except Exception as exc:
+        logger.warning("could not read content feed %s: %s", url, exc)
+        return []
+
+
+def select_unannounced(pages: List[Dict[str, Any]],
+                       already: Any,
+                       limit: int = CONTENT_ANNOUNCE_LIMIT) -> List[Dict[str, Any]]:
+    """Pick up to `limit` pages that have not been announced before.
+
+    Deterministic: feed order is preserved, so the oldest unannounced page
+    goes first and a page cannot jump the queue between passes.  Pure, so
+    the selection rule is testable without a network or a channel."""
+    seen = set(already or ())
+    out = []
+    for page in pages:
+        if page.get('url') in seen:
+            continue
+        out.append(page)
+        if len(out) >= max(0, limit):
+            break
+    return out
+
+
+def format_content_announcement(page: Dict[str, Any], channel: str) -> str:
+    """Compose the outbound text for one page.
+
+    States who is posting.  This is not decoration: the account is
+    Hevolve's, the writing is Hevolve's, and a post that lets a reader
+    assume otherwise is the thing we do not do.  It is also what keeps the
+    post inside the self-promotion rules most communities publish."""
+    title = (page.get('title') or '').strip()
+    share = (page.get('share_urls') or {}).get(channel) or page.get('url')
+    return (
+        f"{title}\n"
+        f"{share}\n\n"
+        f"Posted by the Hevolve AI agent. We build HART OS and Nunba; "
+        f"this is our own write-up."
+    )
+
+
+def _public_exposure_granted() -> bool:
+    """Fail-closed check of the standing public_exposure consent.
+
+    Reuses ConsentService rather than reading user_consents directly, so
+    there is one definition of consent in the system.  Any error -- no DB,
+    no service, no session -- means NOT granted: an external post must
+    never happen because a check failed to run."""
+    try:
+        from integrations.social.consent_service import ConsentService
+        from integrations.social import get_session
+    except Exception as exc:
+        logger.debug("consent service unavailable, treating as denied: %s", exc)
+        return False
+    try:
+        db = get_session()
+    except Exception as exc:
+        logger.debug("no db session for consent check, denied: %s", exc)
+        return False
+    try:
+        import os
+        user_id = os.environ.get('HEVOLVE_SYSTEM_USER_ID', 'system')
+        return bool(ConsentService.check_consent(db, user_id, 'public_exposure'))
+    except Exception as exc:
+        logger.warning("consent check failed, refusing to post: %s", exc)
+        return False
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def announce_new_content(limit: int = CONTENT_ANNOUNCE_LIMIT,
+                         already_announced: Any = None,
+                         consent_check=None,
+                         pages=None) -> List[str]:
+    """Announce up to `limit` not-yet-announced pages to every configured
+    target.  Returns the URLs actually dispatched, for the caller to
+    persist so the next pass skips them.
+
+    consent_check / pages are injectable so the orchestration is testable
+    without a database or a network."""
+    check = consent_check or _public_exposure_granted
+    if not check():
+        logger.info(
+            "new-content announcement skipped: public_exposure consent not "
+            "granted (set HEVOLVE_AUTONOMOUS_MARKETING to grant it)")
+        return []
+
+    candidates = pages if pages is not None else fetch_own_pages()
+    chosen = select_unannounced(candidates, already_announced, limit)
+    if not chosen:
+        return []
+
+    targets = _collect_announcement_targets()
+    if not targets:
+        logger.debug("no announcement targets configured")
+        return []
+
+    sent = []
+    for page in chosen:
+        for channel, chat_id in targets:
+            _dispatch_to_target(
+                channel, chat_id, format_content_announcement(page, channel))
+        sent.append(page['url'])
+        logger.info("announced %s to %d target(s)", page['url'], len(targets))
+    return sent
 
 
 def _on_benchmark_published(_topic: str, data: Any) -> None:

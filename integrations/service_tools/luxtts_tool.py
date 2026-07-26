@@ -330,7 +330,7 @@ def luxtts_list_voices() -> str:
         import sherpa_onnx  # noqa: F401
         engine_available = True
     except ImportError:
-        pass
+        logger.debug("luxtts_list_voices: swallowed ImportError")
 
     return json.dumps({
         "voices": voices,

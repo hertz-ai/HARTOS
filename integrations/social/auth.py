@@ -266,7 +266,14 @@ def _get_user_from_token(token: str):
 
     # Fall back to raw API token lookup
     db = get_db()
-    user = db.query(User).filter(User.api_token == token).first()
+    # 2026-06-20: skip the api_token query when token is empty so a
+    # User row with NULL/empty api_token doesn't falsely match the
+    # Kong-stripped-header case (where we route through here with
+    # token='').  Empty-token requests should reach the Kong fallback
+    # below instead of accidentally authenticating as someone else.
+    user = None
+    if token:
+        user = db.query(User).filter(User.api_token == token).first()
     if user and not user.is_banned:
         try:
             g.token_scope = 'api_token'
@@ -275,6 +282,62 @@ def _get_user_from_token(token: str):
         except RuntimeError:
             pass
         return user, db
+
+    # ── Kong gateway fallback (2026-06-20) ────────────────────────────
+    # If both JWT decode + api_token lookup failed AND the request was
+    # pre-authenticated by Kong, trust Kong's identity headers as a
+    # last resort.  This unblocks the cloud central tier where Kong is
+    # the single source of truth for auth and HARTOS would otherwise
+    # reject every request because the JWT was signed by Kong's key
+    # (not HARTOS's SECRET_KEY).
+    #
+    # Standard Kong key-auth / jwt plugin sets:
+    #   X-Consumer-Custom-ID  : external user identifier (email/uuid)
+    #   X-Consumer-Username   : human-readable username
+    #   X-Anonymous-Consumer  : "true" if no credentials were provided
+    #
+    # Only honored when HEVOLVE_TRUST_KONG=true (off by default — flat
+    # deployments don't want the Kong header path enabled).  In cloud
+    # mode where Kong fronts every request, set HEVOLVE_TRUST_KONG=true
+    # in the HARTOS env.
+    if os.environ.get('HEVOLVE_TRUST_KONG', '').lower() == 'true':
+        try:
+            is_anon = (request.headers.get('X-Anonymous-Consumer', '')
+                       .lower() == 'true')
+            if not is_anon:
+                kong_custom_id = request.headers.get('X-Consumer-Custom-ID', '')
+                kong_username = request.headers.get('X-Consumer-Username', '')
+                kong_user = None
+                # Prefer custom_id (typically the user's stable external id).
+                if kong_custom_id:
+                    # custom_id may be the email, uuid, or username depending
+                    # on how the Kong consumer was provisioned — try all three.
+                    kong_user = (
+                        db.query(User).filter(User.email == kong_custom_id).first()
+                        or db.query(User).filter(User.id == kong_custom_id).first()
+                        or db.query(User).filter(User.username == kong_custom_id).first()
+                    )
+                if kong_user is None and kong_username:
+                    kong_user = (
+                        db.query(User).filter(User.username == kong_username).first()
+                        or db.query(User).filter(User.email == kong_username).first()
+                    )
+                if kong_user and not kong_user.is_banned:
+                    try:
+                        g.token_scope = 'kong'
+                        g.token_node_id = ''
+                        # Kong does not currently propagate tenant — flat for now.
+                        g.token_tenant_id = None
+                    except RuntimeError:
+                        pass
+                    logger.info(
+                        f"Kong fallback auth: user={kong_user.username} "
+                        f"custom_id={kong_custom_id} username={kong_username}"
+                    )
+                    return kong_user, db
+        except Exception as e:
+            # Kong fallback must never raise — auth still 401s the same way.
+            logger.warning(f"Kong fallback auth failed: {e}")
     return None, db
 
 
@@ -290,10 +353,19 @@ def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         auth_header = request.headers.get('Authorization', '')
-        if not auth_header.startswith('Bearer '):
+        # 2026-06-20: when Kong strips the upstream Authorization header
+        # after its own pre-auth, HARTOS sees no Bearer but still gets
+        # Kong's identity headers.  Route through _get_user_from_token
+        # with an empty token so the Kong fallback path inside it runs.
+        # The Kong fallback itself is gated on HEVOLVE_TRUST_KONG=true,
+        # so flat deployments without Kong continue to reject the
+        # missing-header case as before.
+        token = ''
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:]
+        elif os.environ.get('HEVOLVE_TRUST_KONG', '').lower() != 'true':
             return jsonify({'success': False, 'error': 'Missing or invalid Authorization header'}), 401
 
-        token = auth_header[7:]
         user, db = _get_user_from_token(token)
         if user is None:
             if db:

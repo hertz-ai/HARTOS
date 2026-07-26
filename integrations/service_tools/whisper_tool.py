@@ -300,7 +300,7 @@ def _get_faster_whisper_model(model_size: str = "base"):
         get_orchestrator().notify_loaded('stt', f'whisper-{model_size}',
                                          device=device, vram_gb=3.0 if device == 'cuda' else 0)
     except Exception:
-        pass
+        logger.exception("_get_faster_whisper_model: swallowed Exception")
 
     return _faster_whisper_model
 
@@ -485,12 +485,48 @@ def _get_sherpa_recognizer(model_name: str = "whisper-tiny"):
     return _sherpa_recognizer
 
 
+def _read_wav_f32(audio_path: str):
+    """Read a PCM WAV into ``(sample_rate, float32 mono samples in [-1, 1])``.
+
+    sherpa-onnx's ``OfflineStream.accept_waveform`` wants normalized float32
+    samples + the source sample rate.  The realtime STT pipeline writes 16-bit
+    PCM WAV (see the streaming writer ~L1229).  Uses ONLY stdlib ``wave`` +
+    numpy — no libsndfile / ffmpeg native dependency — so it behaves
+    identically in the frozen bundle on Windows, macOS and Linux.
+    """
+    import wave
+    import numpy as np
+    with wave.open(audio_path, 'rb') as wf:
+        sample_rate = wf.getframerate()
+        n_channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        raw = wf.readframes(wf.getnframes())
+    if sampwidth == 2:
+        data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sampwidth == 4:
+        data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+    elif sampwidth == 1:  # 8-bit PCM is unsigned, centred at 128
+        data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    else:
+        raise ValueError(f"unsupported WAV sample width: {sampwidth} bytes")
+    if n_channels > 1:  # down-mix to mono
+        data = data.reshape(-1, n_channels).mean(axis=1)
+    return sample_rate, data
+
+
 def _sherpa_transcribe(audio_path: str, model_name: str) -> Optional[str]:
     """Transcribe using sherpa-onnx. Returns JSON string or None on failure."""
     try:
         recognizer = _get_sherpa_recognizer(model_name)
+        # sherpa-onnx OfflineStream has NO ``accept_wave_file`` (verified
+        # sherpa_onnx 1.13.1 — methods are accept_waveform/result/…); the
+        # canonical API is ``accept_waveform(sample_rate, float_samples)``.
+        # The old call raised AttributeError on every utterance, so STT
+        # returned empty text — mic captured, nothing transcribed/sent/shown
+        # (incident 2026-06-17).
+        sample_rate, samples = _read_wav_f32(audio_path)
         stream = recognizer.create_stream()
-        stream.accept_wave_file(audio_path)
+        stream.accept_waveform(sample_rate, samples)
         recognizer.decode_stream(stream)
         text = stream.result.text.strip()
 
@@ -577,7 +613,7 @@ def _select_legacy_model() -> str:
         elif free >= 2:
             return "small"
     except Exception:
-        pass
+        logger.exception("_select_legacy_model: swallowed Exception")
     return "base"
 
 
@@ -634,7 +670,15 @@ def populate_stt_catalog(catalog) -> int:
             vram_gb=vram, ram_gb=ram, disk_gb=disk,
             min_capability_tier=min_tier,
             backend='onnx' if 'sherpa' in mid else 'torch',
-            supports_gpu=(vram > 0), supports_cpu=True,
+            supports_gpu=(vram > 0),
+            # faster-whisper medium/large (CTranslate2, >=1 GB VRAM) are
+            # GPU-oriented: on CPU int8 they're too slow for interactive STT,
+            # so exclude them from AUTO compute-fit selection on CPU-only boxes
+            # (matches this module's documented ladder: CPU->tiny/base,
+            # GPU->medium/large).  sherpa-onnx (ONNX, vram 0) and the light
+            # faster-whisper sizes stay CPU-capable.  Manual admin selection
+            # still works (load() bypasses matches_compute).
+            supports_cpu=not ('faster-whisper' in tags and vram >= 1.0),
             supports_cpu_offload=False,
             idle_timeout_s=300,
             capabilities={
@@ -692,13 +736,13 @@ def select_whisper_model() -> str:
                     import sherpa_onnx  # noqa: F401
                     return sherpa_key
                 except ImportError:
-                    pass
+                    logger.debug("select_whisper_model: swallowed ImportError")
             # faster-whisper size
             fw_size = _CATALOG_ID_TO_FASTER_WHISPER_SIZE.get(entry.id)
             if fw_size:
                 return fw_size
     except Exception:
-        pass
+        logger.exception("select_whisper_model: swallowed Exception")
 
     # ── Fallback: direct VRAM query (no catalog dependency) ─────────────────
     try:
@@ -762,7 +806,7 @@ def _transcribe_impl(audio_path: str, language: str = None) -> str:
         if result:
             return result
     except ImportError:
-        pass
+        logger.debug("_transcribe_impl: swallowed ImportError")
     except Exception as e:
         logger.warning(f"faster-whisper failed, trying fallback: {e}")
 
@@ -782,7 +826,7 @@ def _transcribe_impl(audio_path: str, language: str = None) -> str:
         if result:
             return result
     except ImportError:
-        pass
+        logger.debug("_transcribe_impl: swallowed ImportError")
     except Exception as e:
         logger.warning(f"sherpa-onnx failed, trying openai-whisper: {e}")
 
@@ -833,7 +877,7 @@ def _detect_language_impl(audio_path: str) -> str:
             "probability": round(info.language_probability, 4) if info.language_probability else 0.0,
         })
     except ImportError:
-        pass
+        logger.debug("_detect_language_impl: swallowed ImportError")
     except Exception as e:
         logger.debug(f"faster-whisper language detection failed: {e}")
 
@@ -861,7 +905,7 @@ def _detect_language_impl(audio_path: str) -> str:
                     "probability": 0.8,
                 })
         except Exception:
-            pass
+            logger.exception("_detect_language_impl: swallowed Exception")
         return json.dumps({"error": "Language detection unavailable"})
     except Exception as e:
         return json.dumps({"error": f"Language detection failed: {e}"})
@@ -1049,6 +1093,17 @@ async def _emit_final(websocket, audio_buffer, stt_lang, call_id, user_id) -> bo
             'text': text, 'language': lang, 'is_final': True,
         }))
         _maybe_enqueue_call_segment(call_id, user_id, text, lang, True)
+        # Feed this finalized mic segment to HevolveAI's world model for
+        # continual learning. The bridge call does a SYNCHRONOUS HTTP POST, so
+        # run it on the default executor to avoid blocking the realtime STT
+        # event loop. Gated on call_id (voice-room streams) so the push-to-talk
+        # chat mic is untouched. Snapshot the PCM now -- the caller resets the
+        # buffer right after this returns.
+        if call_id:
+            import asyncio
+            asyncio.get_running_loop().run_in_executor(
+                None, _maybe_ingest_audio_sensor,
+                call_id, user_id, audio_buffer.getvalue(), text, lang)
     return bool(text)
 
 
@@ -1133,6 +1188,53 @@ def _maybe_enqueue_call_segment(
             "(call=%s): %s", call_id, e)
 
 
+def _maybe_ingest_audio_sensor(
+    call_id: Optional[str],
+    user_id: Optional[str],
+    pcm_bytes: bytes,
+    transcript: str,
+    lang: str,
+) -> None:
+    """Feed a finalized mic segment (raw PCM16 16kHz mono + its transcript) to
+    HevolveAI's world model for continual learning.
+
+    This is the MISSING producer for the audio sensor path: live mic PCM
+    otherwise lands only in the STT queue (_maybe_enqueue_call_segment) and
+    never reaches the embodied learner.  It rides the EXISTING
+    WorldModelBridge.ingest_sensor_batch -> /v1/sensor/ingest (audio) transport
+    using the unified SensorReading schema (sensor_model.py 'audio') -- no new
+    bridge method, no new endpoint, no parallel path.  Gated on call_id so the
+    push-to-talk chat mic (call_id=None) is completely unaffected.
+
+    Runs on a thread-pool executor (the bridge call does a blocking HTTP POST);
+    best-effort, never raises out of the WS handler hot path.
+    """
+    if not call_id or not pcm_bytes:
+        return
+    try:
+        import base64
+        from integrations.agent_engine.world_model_bridge import (
+            get_world_model_bridge)
+        from integrations.robotics.sensor_model import SensorReading
+        reading = SensorReading(
+            sensor_id=f'mic_{call_id}',
+            sensor_type='audio',
+            data={
+                'pcm_base64': base64.b64encode(pcm_bytes).decode('ascii'),
+                'sample_rate': STREAM_SAMPLE_RATE,
+                'channels': 1,
+                'stream_source': 'mic',
+                'transcript': transcript,
+                'lang': lang,
+            },
+        )
+        get_world_model_bridge().ingest_sensor_batch([reading.to_dict()])
+    except Exception as e:
+        logger.debug(
+            "whisper_tool._maybe_ingest_audio_sensor failed "
+            "(call=%s): %s", call_id, e)
+
+
 async def _stt_stream_handler(websocket):
     """Handle a single streaming STT WebSocket connection.
 
@@ -1213,7 +1315,7 @@ async def _stt_stream_handler(websocket):
                             stt_lang = _cfg_lang
                         continue
                 except (json.JSONDecodeError, ValueError):
-                    pass
+                    logger.debug("_stt_stream_handler: swallowed json.JSONDecodeError, ValueError", exc_info=True)
                 continue
 
             # Binary audio data
@@ -1340,7 +1442,7 @@ def _container_to_pcm(data: bytes) -> Optional[bytes]:
                 try:
                     os.unlink(p.name)
                 except Exception:
-                    pass
+                    logger.exception("_container_to_pcm: swallowed Exception")
     return None
 
 
@@ -1429,7 +1531,7 @@ def _transcribe_buffer(audio_buffer, keep_buffer: bool = False,
             try:
                 os.unlink(tmp.name)
             except Exception:
-                pass
+                logger.exception("_transcribe_buffer: swallowed Exception")
 
 
 def start_stt_stream_server(port: int = 0) -> Optional[int]:
@@ -1472,7 +1574,7 @@ def start_stt_stream_server(port: int = 0) -> Optional[int]:
                 "" if _legacy_ok else
                 " AND the openai-whisper fallback is also missing")
     except Exception:
-        pass
+        logger.exception("start_stt_stream_server: swallowed Exception")
 
     import asyncio
     import threading

@@ -166,10 +166,14 @@ let
             check "Android data directory" 1 "/var/lib/hart/android missing"
         fi
 
-        # Test 5: Android runtime service
-        if systemctl is-active hart-android-runtime.service &>/dev/null; then
+        # Test 5: Android runtime service — stock Waydroid container
+        # (virtualisation.waydroid -> waydroid-container.service); the old inert
+        # hart-android-runtime stub was deleted. "Running" means the container is
+        # active AND the Waydroid session is up (waydroid status RUNNING).
+        if systemctl is-active waydroid-container.service &>/dev/null \
+           && waydroid status 2>/dev/null | grep -qi 'Session:[[:space:]]*RUNNING'; then
             check "Android runtime service" 0 "Running"
-        elif systemctl is-enabled hart-android-runtime.service &>/dev/null; then
+        elif systemctl is-enabled waydroid-container.service &>/dev/null; then
             check "Android runtime service" 2 "Enabled but not running"
         else
             check "Android runtime service" 2 "Not enabled"
@@ -221,11 +225,24 @@ let
             check "Wine prefix creation" 2
         fi
 
-        # Test 4: NTFS kernel support
-        if grep -q ntfs3 /proc/filesystems 2>/dev/null; then
+        # Test 4: Cross-OS filesystem drivers (#145 interop — read/write a disk
+        # formatted on ANY OS: Windows NTFS, camera/phone exFAT, FAT, Linux
+        # ext4/btrfs). Reuses the shared hart-storage-fsprobe readout (installed by
+        # hart-storage.nix) so the "is this driver available on this kernel"
+        # decision lives in ONE place; falls back to a direct ntfs3 probe when the
+        # storage interop set is not enabled on this build.
+        if command -v hart-storage-fsprobe >/dev/null 2>&1; then
+            for fs in ntfs exfat vfat ext4 btrfs; do
+                if [[ "$(hart-storage-fsprobe --query "$fs")" == "ok" ]]; then
+                    check "$fs filesystem (cross-OS interop)" 0 "Driver available to the kernel"
+                else
+                    check "$fs filesystem (cross-OS interop)" 2 "No $fs driver on this kernel"
+                fi
+            done
+        elif grep -q ntfs3 /proc/filesystems 2>/dev/null; then
             check "NTFS filesystem (kernel native)" 0
         else
-            check "NTFS filesystem (kernel native)" 2 "ntfs3 module not loaded"
+            check "NTFS filesystem (kernel native)" 2 "ntfs3 not loaded; enable hart.storage for full cross-OS interop"
         fi
 
         # Test 5: Vulkan (DXVK requires this)
@@ -368,9 +385,12 @@ let
         # Linux
         echo -e "  ''${GREEN}●''${NC} Linux Native     : Active (NixOS)"
 
-        # Android
+        # Android — stock Waydroid container (waydroid-container.service); binder
+        # in the kernel is the "ready" gate, an active container + RUNNING session
+        # is "active".
         if lsmod 2>/dev/null | grep -q binder_linux; then
-            if systemctl is-active hart-android-runtime.service &>/dev/null; then
+            if systemctl is-active waydroid-container.service &>/dev/null \
+               && waydroid status 2>/dev/null | grep -qi 'Session:[[:space:]]*RUNNING'; then
                 echo -e "  ''${GREEN}●''${NC} Android Native   : Active (ART + Binder)"
             else
                 echo -e "  ''${YELLOW}●''${NC} Android Native   : Kernel ready, runtime stopped"
@@ -486,11 +506,22 @@ in
       description = "HART OS Subsystem Validation (First Boot)";
       after = [
         "hart.target"
-        "hart-android-runtime.service"
+        # Stock Waydroid container (virtualisation.waydroid) replaced the deleted
+        # inert hart-android-runtime stub. `after` is a soft ordering hint (no
+        # `wants`/`requires`), so referencing a unit that may not exist on every
+        # variant is a no-op — never-fail ordering preserved.
+        "waydroid-container.service"
         "hart-gpu-scheduler.service"
         "multi-user.target"
       ];
       wantedBy = [ "multi-user.target" ];
+
+      # The diagnostic script (writeShellScriptBin, no baked PATH) calls awk,
+      # find, grep, cat, curl, systemctl, lsmod on the BARE unit PATH — gawk is
+      # not there, so `awk: command not found` fired on the ISO (real-HW bdd849
+      # journal). Same fix shape as hart-service-intelligence (hart-ai-runtime.nix).
+      # nvidia-smi stays optional (guarded by `command -v`).
+      path = with pkgs; [ gawk gnugrep findutils coreutils curl systemd kmod util-linux ];
 
       unitConfig = {
         ConditionPathExists = "!/var/lib/hart/.sandbox-validated";

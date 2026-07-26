@@ -283,8 +283,9 @@ class TestDeviceRoutingService:
         MockNotif.create.assert_called_once()
         MockFleet.push_command.assert_called_once()
 
+    @patch('core.fcm_sync.send_fcm_push')
     @patch('integrations.social.device_routing_service.NotificationService')
-    def test_request_consent_no_devices(self, MockNotif):
+    def test_request_consent_no_devices(self, MockNotif, mock_fcm):
         from integrations.social.device_routing_service import DeviceRoutingService
 
         db = MagicMock()
@@ -294,7 +295,11 @@ class TestDeviceRoutingService:
             db, 'user-1', 'send_email', 'agent-1',
         )
         assert result['success'] is True
-        assert result['method'] == 'notification_only'
+        # No bound device, but the consent_prompt FCM still fires the native
+        # Truecaller overlay (the over-other-apps reach when the user is away
+        # from the agent's device) — #169.
+        assert result['method'] == 'fcm_consent_prompt'
+        assert mock_fcm.call_args.kwargs['data']['type'] == 'consent_prompt'
         # Still creates a notification
         MockNotif.create.assert_called_once()
 

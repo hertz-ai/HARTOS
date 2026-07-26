@@ -12,9 +12,32 @@ import requests
 from datetime import datetime
 
 from core.http_pool import pooled_get, pooled_post
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict, Optional, Callable
 
 logger = logging.getLogger('hevolve_social')
+
+
+@dataclass(frozen=True)
+class SyncEntity:
+    """One registry entry per syncable thing — the single source of truth for
+    the unified sync layer (docs/architecture/UNIFIED_SYNC_ARCHITECTURE.md).
+
+    Adding a syncable entity = ONE registration here, with zero new dispatch /
+    producer / transport code.  ``apply`` is the idempotent upsert-by-id
+    receiver; ``gate``/``serialize``/``topic`` are consumed by the producer
+    (queue_entity) + real-time transport and are populated as each phase lands
+    (P2+).  Op names are the existing wire ops (backward-compatible)."""
+    op: str                       # wire op name (e.g. 'sync_post')
+    apply: Callable               # (db, payload) -> str|None — idempotent receiver
+    model: type = None
+    gate: Callable = None         # (db, obj, demander) -> bool — consent/privacy
+    serialize: Callable = None    # (db, obj) -> dict — provenance-stamped, no assets
+    match: Callable = None        # (obj) -> bool — resolve an obj to this entity (producer)
+    owner: Callable = None        # (obj) -> user_id — whose clients see the sync-status (P4); None = no emit
+    topic: str = ''               # WAMP topic template for P2P + down-push
+    p2p: bool = True
+    central: bool = True
 
 
 class SyncEngine:
@@ -61,6 +84,66 @@ class SyncEngine:
         return item.id
 
     @staticmethod
+    def queue_entity(db, obj, demander: str = 'user') -> Optional[str]:
+        """Single producer for the unified sync layer — the ONE entry point to
+        replicate any entity UP to central
+        (docs/architecture/UNIFIED_SYNC_ARCHITECTURE.md).  Resolves the entity
+        from the registry (SyncEntity.match), runs its gate (privacy/consent),
+        serializes (provenance-stamped, NO asset bytes), and queues it.  Reuses
+        the canonical gate/serialize helpers — no per-caller branch, no second
+        producer.  Best-effort: never blocks the caller's write.  Returns the
+        queue id, or None (no match / gated / failed)."""
+        try:
+            ent = next((e for e in SYNC_ENTITIES.values()
+                        if e.match and e.match(obj)), None)
+            if ent is None or ent.gate is None:
+                return None
+            if not ent.gate(db, obj, demander):
+                return None
+            payload = ent.serialize(db, obj)
+            qid = (SyncEngine.queue(db, 'central', ent.op, payload)
+                   if ent.central else None)
+            # P4 real-time: tell the owner's clients the entity synced — REUSE
+            # the existing on_notification fan-out (chat.social WAMP + SSE), not
+            # a new transport. Opt-in per entity (only those with an owner
+            # extractor; high-frequency/internal entities stay silent).
+            if qid and ent.owner:
+                SyncEngine._emit_sync_status(ent.owner(obj), ent.op)
+            return qid
+        except Exception as e:
+            logger.debug("SyncEngine.queue_entity: %s", e)
+            return None
+
+    @staticmethod
+    def _emit_sync_status(owner_id, op, status: str = 'synced'):
+        """P4: surface sync state to the owner's clients via the EXISTING
+        on_notification channel (chat.social WAMP + SSE that RN/web/desktop
+        already consume) — no new transport, no parallel fan-out path.
+        Best-effort; never blocks the producer."""
+        if not owner_id:
+            return
+        try:
+            from .realtime import on_notification
+            on_notification(str(owner_id), {'type': 'sync_status',
+                                            'entity': op, 'sync_status': status})
+        except Exception:
+            pass
+
+    @staticmethod
+    def _signed_send_payload(node_id, batch) -> dict:
+        """P4: the up-sync batch envelope, signed with the node's key so central
+        can verify WHICH node sent it (closes the hierarchy_sync ingress IDOR).
+        Signing is best-effort — an unsigned batch still applies outside 'hard'
+        enforcement (the central-side _verify_sync_sender gate decides)."""
+        payload = {'items': batch, 'node_id': node_id}
+        try:
+            from security.node_integrity import sign_json_payload
+            payload['signature'] = sign_json_payload(payload)
+        except Exception:
+            pass
+        return payload
+
+    @staticmethod
     def drain_queue(db, node_id: str, target_url: str, batch_size: int = 50) -> Dict:
         """Send queued operations to target. Returns counts."""
         from .models import SyncQueue
@@ -105,7 +188,10 @@ class SyncEngine:
         # Send batch — E2E encrypt if target has X25519 key
         sent = 0
         failed = 0
-        send_payload = {'items': batch, 'node_id': node_id}
+        # P4: sign the batch so central can verify WHICH node sent it (closes the
+        # unauthenticated hierarchy_sync ingress IDOR). Signed before any E2E wrap
+        # so the signature rides inside the envelope.
+        send_payload = SyncEngine._signed_send_payload(node_id, batch)
         try:
             target_x25519 = SyncEngine._get_target_x25519(db, target_url)
             if target_x25519:
@@ -200,25 +286,13 @@ class SyncEngine:
                     continue
 
             try:
-                if op == 'register_agent':
-                    # Agent data sync - store as metadata for now
-                    logger.info(f"Sync: received agent registration from child")
-                elif op == 'sync_post':
-                    SyncEngine._handle_sync_post(db, payload)
-                elif op == 'update_stats':
-                    logger.info(f"Sync: received stats update from child")
-                elif op == 'register_node':
-                    logger.info(f"Sync: received node registration from child")
-                elif op == 'coding_task_assign':
-                    logger.info(f"Sync: received coding task assignment from parent")
-                elif op == 'coding_submission':
-                    logger.info(f"Sync: received coding submission from child")
-                elif op == 'sync_user':
-                    SyncEngine._handle_sync_user(db, payload)
-                elif op == 'revoke_token':
-                    SyncEngine._handle_revoke_token(payload)
-                elif op == 'sync_blocklist':
-                    SyncEngine._handle_sync_blocklist(payload)
+                # Single dispatch: the registry (SYNC_ENTITIES) + the few non-
+                # entity ops collapsed into ONE op→handler map.  The if/elif
+                # ladder is gone — adding an entity is a registration, not a
+                # branch here (docs/architecture/UNIFIED_SYNC_ARCHITECTURE.md).
+                handler = OP_DISPATCH.get(op)
+                if handler is not None:
+                    handler(db, payload)
                 else:
                     logger.debug(f"Sync: unknown operation type: {op}")
 
@@ -248,6 +322,176 @@ class SyncEngine:
                 logger.info(f"Sync: landed federated post {fid} from child")
         except Exception as e:
             logger.warning(f"Sync: _handle_sync_post failed: {e}")
+
+    @staticmethod
+    def _handle_sync_agent(db, payload: dict):
+        """Land a hierarchically-synced PUBLIC agent (gap #4) as a central/
+        regional User row — the registry twin of _handle_sync_post (content).
+
+        Mirrors _handle_sync_user's persist contract: upsert the User BY ID
+        (preserves the central identity), create with the SAME field set
+        UserService.register_agent builds (user_type='agent' + generate_api_token
+        + is_verified), update only the sync-owned fields on an existing row
+        (never overwrite the local api_token / secrets).  Optionally upserts
+        skill badges from the envelope via the existing agent_bridge._sync_skills
+        helper so the recipe/skill metadata lands too.  Best-effort — never
+        raises out to the batch loop (receive_sync_batch's per-item try/except +
+        idempotency guard the retry/dead-letter)."""
+        from .models import User
+
+        if payload.get('type') != 'agent':
+            return  # defensive no-op for a non-agent shape (cf. _handle_sync_post)
+
+        agent = payload.get('agent') or {}
+        agent_pk = agent.get('id')
+        username = agent.get('username', '')
+        if not agent_pk or not username:
+            logger.warning("sync_agent: missing agent id or username")
+            return
+
+        existing = db.query(User).filter_by(id=agent_pk).first()
+        if existing:
+            # Update only the sync-owned fields (NEVER the local api_token).
+            for fld in ('display_name', 'bio', 'agent_id', 'handle',
+                        'local_name', 'owner_id'):
+                val = agent.get(fld)
+                if val is not None:
+                    setattr(existing, fld, val)
+            logger.info(f"Sync: updated agent {agent_pk} from sync")
+            row = existing
+        else:
+            # SECURITY: a hierarchically-synced agent is a DISCOVERABLE MIRROR,
+            # never an authenticatable identity.  We do NOT mint an api_token
+            # (the agent's credential lives only on its home node) and we do NOT
+            # set is_verified — verification is a trusted local act, not a claim
+            # an inbound sync payload may make.  Otherwise any writer to the sync
+            # ingress could forge a verified, credentialed identity on the most-
+            # trusted tier (review BLOCK: identity minting).
+            row = User(
+                id=agent_pk,
+                username=username,
+                display_name=agent.get('display_name', username),
+                bio=agent.get('bio', ''),
+                user_type='agent',
+                agent_id=agent.get('agent_id'),
+                owner_id=agent.get('owner_id'),
+                handle=agent.get('handle'),
+                local_name=agent.get('local_name'),
+                api_token=None,        # never credential a synced mirror
+                is_verified=False,     # never auto-verify from inbound sync
+            )
+            db.add(row)
+            db.flush()
+            logger.info(f"Sync: created agent {agent_pk} from sync")
+
+        # Skill/recipe metadata: reuse the existing badge-upsert helper (no
+        # parallel writer).  Best-effort — a skills hiccup must not undo the
+        # agent upsert above.
+        skills = payload.get('skills')
+        if skills:
+            try:
+                from .agent_bridge import _sync_skills
+                _sync_skills(db, row, skills)
+            except Exception as e:
+                logger.debug(f"Sync: agent skill upsert skipped for {agent_pk}: {e}")
+
+    @staticmethod
+    def _apply_synced_row(db, model, data: dict, fields: list, ts_field: str = None,
+                          key_field: str = 'id'):
+        """Generic idempotent upsert receiver for a simple synced entity — the
+        reusable twin of _handle_sync_user's create-or-update, parameterised by
+        model + sync-owned fields + the natural key (default 'id'; the resonance
+        wallet keys by 'user_id').  Dedup is inherent (upsert by the key);
+        optional LWW: when ts_field is given and the incoming row is OLDER than
+        the local one, the stale write is skipped — so a node's newer state
+        always wins (no data/earnings loss; central stays a backup, never
+        authoritative).  Best-effort; returns the key or None."""
+        row_key = (data or {}).get(key_field)
+        if not row_key:
+            return None
+        row = db.query(model).filter_by(**{key_field: row_key}).first()
+        if row is not None and ts_field:
+            inc = data.get(ts_field)
+            cur = getattr(row, ts_field, None)
+            cur = cur.isoformat() if hasattr(cur, 'isoformat') else cur
+            if inc and cur and str(inc) < str(cur):
+                return row_key  # stale write loses (LWW) — keep the newer local row
+        if row is None:
+            row = model(**{key_field: row_key})
+            db.add(row)
+        for f in fields:
+            if f in data and data[f] is not None:
+                setattr(row, f, data[f])
+        db.flush()
+        return row_key
+
+    @staticmethod
+    def _handle_sync_community(db, payload: dict):
+        """Land a synced community (P3) — public communities are a discoverable
+        mirror, reusing the generic upsert-by-id apply.  payload is the
+        _entity_message envelope; the row rides in payload['data']."""
+        return SyncEngine._apply_synced_row(
+            db, _community_model(), (payload or {}).get('data') or {},
+            ['name', 'display_name', 'description', 'rules', 'icon_url',
+             'banner_url', 'creator_id', 'is_default', 'is_private',
+             'member_count', 'post_count'])
+
+    @staticmethod
+    def _handle_sync_membership(db, payload: dict):
+        """Land a synced community membership (P3 join/leave) — generic upsert
+        by id, reusing _apply_synced_row.  Public-community membership only
+        (the producer gate enforces it)."""
+        return SyncEngine._apply_synced_row(
+            db, _membership_model(), (payload or {}).get('data') or {},
+            ['user_id', 'community_id', 'role'])
+
+    @staticmethod
+    def _handle_sync_encounter(db, payload: dict):
+        """Land a synced encounter (P3) — LOCATION-FREE (lat/lng/location never
+        travel), generic upsert by id."""
+        return SyncEngine._apply_synced_row(
+            db, _encounter_model(), (payload or {}).get('data') or {},
+            ['user_a_id', 'user_b_id', 'context_type', 'context_id',
+             'encounter_count', 'bond_level', 'is_mutual_aware'])
+
+    @staticmethod
+    def _handle_sync_resonance(db, payload: dict):
+        """Land a synced resonance wallet (P3) — central is a BACKUP, never
+        authoritative; LWW by updated_at means the node's newer balance always
+        wins (no earnings loss).  Keyed by user_id (the wallet's natural key)."""
+        return SyncEngine._apply_synced_row(
+            db, _resonance_model(), (payload or {}).get('data') or {},
+            ['pulse', 'spark', 'spark_lifetime', 'signal', 'level', 'level_title',
+             'xp', 'xp_next_level', 'streak_days', 'streak_best',
+             'last_active_date', 'season_pulse', 'season_spark'],
+            ts_field='updated_at', key_field='user_id')
+
+    @staticmethod
+    def _handle_sync_friendship(db, payload: dict):
+        """Land a synced friendship (P3) — friendships is a raw-SQL table (no
+        model), so a portable upsert by id: SELECT then INSERT/UPDATE (no
+        dialect-specific ON CONFLICT — works on SQLite node + MySQL central).
+        Best-effort; returns the id or None."""
+        from sqlalchemy import text
+        d = (payload or {}).get('data') or {}
+        fid = d.get('id')
+        if not fid:
+            return None
+        params = {'id': fid, 'a': d.get('user_a_id'), 'b': d.get('user_b_id'),
+                  's': d.get('status'), 'i': d.get('initiator_id'),
+                  'c': d.get('created_at'), 'ac': d.get('accepted_at')}
+        exists = db.execute(text("SELECT id FROM friendships WHERE id = :id"),
+                            {'id': fid}).fetchone()
+        if exists:
+            db.execute(text(
+                "UPDATE friendships SET status=:s, accepted_at=:ac WHERE id=:id"),
+                params)
+        else:
+            db.execute(text(
+                "INSERT INTO friendships (id, user_a_id, user_b_id, status, "
+                "initiator_id, created_at, accepted_at) VALUES "
+                "(:id, :a, :b, :s, :i, :c, :ac)"), params)
+        return fid
 
     @staticmethod
     def _handle_sync_user(db, payload: dict):
@@ -479,6 +723,197 @@ class SyncEngine:
             'failed': failed,
             'total_pending': queued + in_progress,
         }
+
+
+# ── Unified sync registry (the single source of truth) ───────────────────────
+# Each syncable entity is ONE SyncEntity.  The receiver dispatch + (later phases)
+# the producer + real-time transport all read from here — never an if/elif
+# ladder or a second producer.  P1: the 3 existing entities; gate/serialize/
+# topic land in P2+.  Op names are the existing wire ops (backward-compatible).
+# Producer-side gate/serialize/match per entity — REUSE the canonical helpers
+# (privacy.is_public, federation._outbox_message/_agent_message,
+# ConsentService.check_consent), lazy-imported so the registry has no import-time
+# cycle.  queue_entity drives off these; there is no second producer.
+def _post_gate(db, obj, demander):
+    from .privacy import is_public
+    return is_public((obj or {}).get('privacy'))
+
+
+def _post_serialize(db, obj):
+    from .federation import federation
+    return federation._outbox_message(obj)
+
+
+def _agent_gate(db, obj, demander):
+    from .consent_service import ConsentService
+    return ConsentService.check_consent(
+        db, getattr(obj, 'owner_id', None), 'public_exposure')
+
+
+def _agent_serialize(db, obj):
+    from .federation import federation
+    return federation._agent_message(db, obj)
+
+
+def _community_model():
+    from .models import Community
+    return Community
+
+
+def _community_gate(db, obj, demander):
+    # public communities replicate (discoverable); private stay local
+    return not getattr(obj, 'is_private', False)
+
+
+def _community_serialize(db, obj):
+    from .federation import federation
+    return federation._entity_message(db, 'community', obj.to_dict())
+
+
+def _membership_model():
+    from .models import CommunityMembership
+    return CommunityMembership
+
+
+def _membership_gate(db, obj, demander):
+    # sync membership of PUBLIC communities only (private membership is private)
+    from .models import Community
+    c = db.query(Community).filter_by(
+        id=getattr(obj, 'community_id', None)).first()
+    return bool(c) and not c.is_private
+
+
+def _membership_serialize(db, obj):
+    from .federation import federation
+    return federation._entity_message(db, 'community_membership', obj.to_dict())
+
+
+def _encounter_model():
+    from .models import Encounter
+    return Encounter
+
+
+# Encounters are PII (who met whom) AND carry precise location (lat/lng).
+# Central replication is OFF unless the user opts in via cloud_egress consent,
+# and the LOCATION fields (lat/lng/location_label) are NEVER synced.
+_ENCOUNTER_SYNC_FIELDS = ['user_a_id', 'user_b_id', 'context_type', 'context_id',
+                         'encounter_count', 'bond_level', 'is_mutual_aware']
+
+
+def _cloud_egress_ok(db, user_id) -> bool:
+    """Canonical PII-egress gate: True iff ``user_id`` opted into central /
+    off-node replication of their private social data.  ONE home for the
+    cloud_egress + 'social_sync' scope literal, reused by every PII entity
+    (encounter / resonance / friend).  Fail-closed for a missing/None user_id."""
+    from .consent_service import ConsentService
+    return ConsentService.check_consent(db, user_id, 'cloud_egress',
+                                        scope='social_sync')
+
+
+def _encounter_gate(db, obj, demander):
+    # An encounter reveals BOTH parties' social-graph participation, so it leaves
+    # the node ONLY if EACH party opted in via cloud_egress consent — fail-closed
+    # if either is absent or withheld. (Gating on user_a_id alone — the
+    # lexicographic-MIN of the pair, set by record_encounter's sorted() — leaked
+    # the OTHER party's participation whenever only the min-id user had consented.)
+    a = getattr(obj, 'user_a_id', None)
+    b = getattr(obj, 'user_b_id', None)
+    return bool(a) and bool(b) and _cloud_egress_ok(db, a) and _cloud_egress_ok(db, b)
+
+
+def _encounter_serialize(db, obj):
+    from .federation import federation
+    d = obj.to_dict()
+    data = {'id': d.get('id')}
+    for f in _ENCOUNTER_SYNC_FIELDS:
+        data[f] = d.get(f)          # location columns deliberately excluded
+    return federation._entity_message(db, 'encounter', data)
+
+
+def _resonance_model():
+    from .models import ResonanceWallet
+    return ResonanceWallet
+
+
+def _resonance_gate(db, obj, demander):
+    # the spark wallet is financial PII — central backup is OFF unless the user
+    # opts in via cloud_egress consent (fail-closed)
+    return _cloud_egress_ok(db, getattr(obj, 'user_id', None))
+
+
+def _resonance_serialize(db, obj):
+    from .federation import federation
+    data = obj.to_dict()            # keyed by user_id; balance fields
+    data['updated_at'] = (obj.updated_at.isoformat()
+                          if getattr(obj, 'updated_at', None) else None)
+    return federation._entity_message(db, 'resonance', data)
+
+
+def _friend_gate(db, obj, demander):
+    # friendships are PII (the social graph) — central backup only with the
+    # initiator's cloud_egress consent (fail-closed)
+    return _cloud_egress_ok(db, (obj or {}).get('initiator_id'))
+
+
+def _friend_serialize(db, obj):
+    # obj is already the friendship dict (raw-SQL row has no to_dict)
+    from .federation import federation
+    return federation._entity_message(db, 'friendship', obj)
+
+
+SYNC_ENTITIES: Dict[str, SyncEntity] = {
+    'sync_post': SyncEntity(
+        op='sync_post', apply=SyncEngine._handle_sync_post,
+        # Identify a post dict by STABLE fields, never 'privacy' — Post.to_dict
+        # OMITS that key when privacy is NULL (the default-public case), so a
+        # 'privacy' in o match silently dropped EVERY default-public post (all of
+        # them when the privacy flag is off). The gate (_post_gate→is_public,
+        # where is_public(None)=True) decides public-vs-private.
+        match=lambda o: isinstance(o, dict) and 'content_type' in o and 'author_id' in o,
+        gate=_post_gate, serialize=_post_serialize,
+        owner=lambda o: o.get('author_id')),
+    'register_agent': SyncEntity(
+        op='register_agent', apply=SyncEngine._handle_sync_agent,
+        match=lambda o: getattr(o, 'user_type', None) == 'agent',
+        gate=_agent_gate, serialize=_agent_serialize),
+    'sync_community': SyncEntity(
+        op='sync_community', apply=SyncEngine._handle_sync_community,
+        match=lambda o: getattr(o, '__tablename__', None) == 'communities',
+        gate=_community_gate, serialize=_community_serialize,
+        owner=lambda o: getattr(o, 'creator_id', None)),
+    'sync_membership': SyncEntity(
+        op='sync_membership', apply=SyncEngine._handle_sync_membership,
+        match=lambda o: getattr(o, '__tablename__', None) == 'community_memberships',
+        gate=_membership_gate, serialize=_membership_serialize),
+    'sync_encounter': SyncEntity(
+        op='sync_encounter', apply=SyncEngine._handle_sync_encounter,
+        match=lambda o: getattr(o, '__tablename__', None) == 'encounters',
+        gate=_encounter_gate, serialize=_encounter_serialize),
+    'sync_resonance': SyncEntity(
+        op='sync_resonance', apply=SyncEngine._handle_sync_resonance,
+        match=lambda o: getattr(o, '__tablename__', None) == 'resonance_wallets',
+        gate=_resonance_gate, serialize=_resonance_serialize),
+    'sync_friendship': SyncEntity(
+        op='sync_friendship', apply=SyncEngine._handle_sync_friendship,
+        match=lambda o: isinstance(o, dict) and 'user_a_id' in o and 'status' in o,
+        gate=_friend_gate, serialize=_friend_serialize,
+        owner=lambda o: o.get('initiator_id')),
+    'sync_user': SyncEntity(
+        op='sync_user', apply=SyncEngine._handle_sync_user),
+}
+
+# The ONE op→handler dispatch the receiver uses: every entity's apply, PLUS the
+# non-entity operations (token/blocklist mutations + log-only acks), all
+# normalised to a (db, payload) callable so receive_sync_batch stays branchless.
+OP_DISPATCH: Dict[str, Callable] = {op: e.apply for op, e in SYNC_ENTITIES.items()}
+OP_DISPATCH.update({
+    'revoke_token': lambda db, payload: SyncEngine._handle_revoke_token(payload),
+    'sync_blocklist': lambda db, payload: SyncEngine._handle_sync_blocklist(payload),
+    'update_stats': lambda db, payload: logger.info("Sync: received stats update from child"),
+    'register_node': lambda db, payload: logger.info("Sync: received node registration from child"),
+    'coding_task_assign': lambda db, payload: logger.info("Sync: received coding task assignment from parent"),
+    'coding_submission': lambda db, payload: logger.info("Sync: received coding submission from child"),
+})
 
 
 # Module-level singleton

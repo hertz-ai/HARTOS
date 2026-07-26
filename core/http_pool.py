@@ -271,9 +271,128 @@ def pooled_get(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Response
     return get_http_session().get(url, timeout=timeout, **kwargs)
 
 
+# ── Closable background requests.Session for daemon llama calls ───────────────
+# requests/urllib3 calls BYPASS the httpx.Client.send foreground-preempt patch
+# (core.llm_outbound_logger), so the MANY pooled_post() llama calls — the draft
+# classifier, the casual/main direct calls (hart_intelligence_entry:5531/5550),
+# helper._local_llm_complete — were invisible to yield/cancel/abort: a daemon
+# call could hold the single llama slot and a user "hi" on the same requests
+# path could never preempt it (#162).  This mirrors the bg httpx client: a
+# daemon (background-rid) llama POST yields to any live user turn and runs on a
+# CLOSABLE session a foreground turn aborts via core.foreground's cancel
+# registry; a genuine user turn uses the shared session and — because
+# enter_foreground already fired the registry — gets the freed slot.
+_bg_llm_requests_session = None
+_bg_llm_requests_lock = threading.Lock()
+_bg_requests_cancel_registered = False
+
+
+def _is_llama_completion_url(url) -> bool:
+    """True for a LOCAL llama-server chat-completion POST — the only calls that
+    contend for the single GPU slot and so need foreground priority."""
+    try:
+        u = str(url)
+        return '/chat/completions' in u and ('127.0.0.1' in u or 'localhost' in u)
+    except Exception:
+        return False
+
+
+def get_bg_llm_requests_session() -> requests.Session:
+    """Closable requests.Session for autonomous-daemon llama calls.  Closed
+    mid-flight by ``close_bg_llm_requests_session`` (wired to core.foreground's
+    cancel registry, fired when a user chat starts) so an in-flight daemon
+    generation releases the slot.  Thread-safe; rebuilt fresh after a close."""
+    global _bg_llm_requests_session, _bg_requests_cancel_registered
+    with _bg_llm_requests_lock:
+        if not _bg_requests_cancel_registered:
+            try:
+                from core.foreground import register_cancellable
+                register_cancellable(close_bg_llm_requests_session)
+                _bg_requests_cancel_registered = True
+            except Exception:
+                pass
+        s = _bg_llm_requests_session
+        if s is not None:
+            return s
+        s = requests.Session()
+        _local = HTTPAdapter(pool_connections=4, pool_maxsize=8,
+                             max_retries=Retry(total=0))
+        s.mount('http://localhost', _local)
+        s.mount('http://127.0.0.1', _local)
+        s.headers.update({'Content-Type': 'application/json'})
+        _bg_llm_requests_session = s
+        logger.info("Background LLM requests.Session initialized "
+                    "(closable for foreground preemption)")
+        return s
+
+
+def close_bg_llm_requests_session() -> None:
+    """Close the bg llama requests.Session, dropping its in-flight connections
+    so llama-server sees the disconnect, aborts those generations, and frees
+    the slot for the user.  Idempotent + best-effort; next bg call rebuilds."""
+    global _bg_llm_requests_session
+    with _bg_llm_requests_lock:
+        s = _bg_llm_requests_session
+        _bg_llm_requests_session = None
+    if s is not None:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+# Max seconds a llama POST blocks for a scheduler slot before failing OPEN
+# (proceeding unscheduled rather than erroring the call).  A user turn is
+# granted/preempts in ~0s; a daemon may wait this long for the user to finish.
+_SCHED_ACQUIRE_TIMEOUT_S = 120.0
+
+
+def _classify_llama_call():
+    """``(rid, kind)`` for a local-llama POST.  ``kind`` ∈ {'user','daemon'} via
+    the ONE canonical discriminator ``dispatch.is_genuine_user_request`` (same
+    rule as the httpx path).  Fail-open to 'user' so a classification glitch
+    NEVER makes a real user turn yield or preempt itself."""
+    try:
+        from core.llm_outbound_logger import _get_request_id
+        from integrations.agent_engine.dispatch import is_genuine_user_request
+        rid = _get_request_id()
+        return rid, ('user' if is_genuine_user_request(rid) else 'daemon')
+    except Exception:
+        return '', 'user'
+
+
+def _llama_session_for(kind):
+    """A daemon call runs on the CLOSABLE bg session so the scheduler's preempt
+    can abort it; a user turn (and anything else) uses the shared session."""
+    return get_bg_llm_requests_session() if kind == 'daemon' else get_http_session()
+
+
 def pooled_post(url: str, timeout=DEFAULT_TIMEOUT, **kwargs) -> requests.Response:
-    """Connection-pooled POST request."""
-    resp = get_http_session().post(url, timeout=timeout, **kwargs)
+    """Connection-pooled POST request.
+
+    A LOCAL llama chat-completion is admitted through the slot-aware PRIORITY
+    scheduler (core.llama_scheduler): it stamps its request_id on the wire,
+    identifies as user/daemon, blocks for one of the server's N slots, and — if
+    it is a user turn arriving to a full server — PREEMPTS an in-flight daemon
+    (closing the bg session aborts it) to take a slot immediately.  Any non-llama
+    POST is unchanged."""
+    if not _is_llama_completion_url(url):
+        return get_http_session().post(url, timeout=timeout, **kwargs)
+
+    rid, kind = _classify_llama_call()
+    _body = kwargs.get('json')
+    if rid and isinstance(_body, dict) and not _body.get('user'):
+        _body['user'] = rid                       # carry the rid on the wire
+    session = _llama_session_for(kind)
+    try:
+        from core.llama_scheduler import get_scheduler
+        with get_scheduler().slot(rid, kind,
+                                  cancel_fn=close_bg_llm_requests_session,
+                                  timeout=_SCHED_ACQUIRE_TIMEOUT_S):
+            resp = session.post(url, timeout=timeout, **kwargs)
+    except Exception:
+        # Scheduler import/error → fail-open: never block the call on the queue.
+        resp = session.post(url, timeout=timeout, **kwargs)
     # Log LLM input/output for observability
     if '/chat/completions' in url:
         try:

@@ -54,6 +54,68 @@ VRAM_BUDGETS: Dict[str, Tuple[float, float]] = {
 }
 
 
+# NVIDIA driver floors for the CUDA-12.0 runtime that our llama.cpp (cu12) and
+# torch (cu12) TTS/STT builds require.  A GPU on an OLDER driver is real but
+# cannot load a CUDA-12 build, so detect_gpu() reports it as CPU-only — this is
+# the SINGLE runtime GPU-usability signal read by LLM/TTS/STT selection.
+# (Mirrors desktop/ai_installer.py::_CUDA12_MIN_DRIVER_WIN — see the audit FLAG:
+# ai_installer.detect_gpu should REUSE detect_gpu()['driver_cuda_ok'] so there is
+# one implementation; HARTOS cannot import Nunba, so the canonical home is here.)
+_CUDA12_MIN_DRIVER_WIN = 527.41    # Windows
+_CUDA12_MIN_DRIVER_LINUX = 525.60  # Linux
+
+
+def _nvidia_driver_supports_cuda12(driver_version: Optional[str]) -> bool:
+    """True when an nvidia-smi driver_version is new enough for CUDA 12.
+
+    Unparseable / None -> True (fail-safe: never demote a GPU we can't measure).
+    """
+    if not driver_version:
+        return True
+    try:
+        parts = str(driver_version).strip().split(".")
+        num = float(f"{parts[0]}.{parts[1]}") if len(parts) >= 2 else float(parts[0])
+    except (ValueError, IndexError):
+        return True
+    floor = _CUDA12_MIN_DRIVER_WIN if sys.platform == "win32" else _CUDA12_MIN_DRIVER_LINUX
+    return num >= floor
+
+
+_NVIDIA_SMI_PATH: Optional[str] = None
+
+
+def _resolve_nvidia_smi() -> str:
+    """Return the nvidia-smi executable to run: PATH first, then (Windows) the
+    DriverStore + the classic NVSMI folder.
+
+    Some driver installs (seen on a 940MX) ship nvidia-smi ONLY inside the
+    DriverStore, NOT on PATH — without this fallback detect_gpu hits
+    FileNotFoundError and reports "no GPU", so the card is invisible and the UI
+    cannot surface a "driver too old — update it" suggestion.  Cached (module
+    global) so the DriverStore glob runs at most once.  Falls back to the bare
+    name so the FileNotFoundError branch still works when there is genuinely no
+    NVIDIA GPU.
+    """
+    global _NVIDIA_SMI_PATH
+    if _NVIDIA_SMI_PATH is not None:
+        return _NVIDIA_SMI_PATH
+    import shutil
+    found = shutil.which("nvidia-smi")
+    if not found and sys.platform == "win32":
+        import glob
+        for pattern in (
+            r"C:\Windows\System32\nvidia-smi.exe",
+            r"C:\Windows\System32\DriverStore\FileRepository\nv*\nvidia-smi.exe",
+            r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+        ):
+            hits = glob.glob(pattern)
+            if hits:
+                found = hits[0]
+                break
+    _NVIDIA_SMI_PATH = found or "nvidia-smi"
+    return _NVIDIA_SMI_PATH
+
+
 class VRAMManager:
     """GPU memory tracking and allocation decisions."""
 
@@ -241,10 +303,14 @@ class VRAMManager:
         _nvsmi_timeout = float(os.environ.get(
             'HEVOLVE_NVIDIA_SMI_TIMEOUT', '15'))
 
-        # 1) nvidia-smi — zero-dependency, works on any NVIDIA GPU system
+        # 1) nvidia-smi — zero-dependency, works on any NVIDIA GPU system.
+        # Resolve the binary (PATH, else DriverStore) so a card whose driver
+        # put nvidia-smi only in the DriverStore is still detected + its driver
+        # version read — which is what lets the UI say "update your driver".
         try:
             result = run_bounded(
-                ["nvidia-smi", "--query-gpu=name,memory.total,memory.free",
+                [_resolve_nvidia_smi(),
+                 "--query-gpu=name,memory.total,memory.free,driver_version",
                  "--format=csv,noheader,nounits"],
                 timeout=_nvsmi_timeout,
             )
@@ -254,20 +320,36 @@ class VRAMManager:
                 if len(parts) >= 3:
                     total_mb = float(parts[1])
                     free_mb = float(parts[2])
+                    # A real NVIDIA GPU on a driver too old for the CUDA-12
+                    # runtime (llama.cpp cu12 + torch cu12 TTS/STT) can't load
+                    # ANY CUDA build — report it CPU-only so LLM/TTS/STT never
+                    # pick a GPU engine that will fail to load (940MX / 2018
+                    # driver).  Keep name/total/free for display + guidance.
+                    driver_str = parts[3] if len(parts) >= 4 else None
+                    driver_ok = _nvidia_driver_supports_cuda12(driver_str)
                     info.update({
                         "name": parts[0],
                         "total_gb": round(total_mb / 1024, 2),
                         "free_gb": round(free_mb / 1024, 2),
-                        "cuda_available": True,
+                        "cuda_available": driver_ok,
+                        "driver_version": driver_str,
+                        "driver_cuda_ok": driver_ok,
                     })
-                    logger.info(
-                        f"GPU (nvidia-smi): {info['name']} — "
-                        f"{info['total_gb']} GB total, {info['free_gb']} GB free"
-                    )
+                    if driver_ok:
+                        logger.info(
+                            f"GPU (nvidia-smi): {info['name']} — "
+                            f"{info['total_gb']} GB total, {info['free_gb']} GB free"
+                        )
+                    else:
+                        logger.warning(
+                            f"GPU {info['name']} present (driver {driver_str}) but "
+                            f"too old for the CUDA-12 runtime — inference stays on "
+                            f"CPU. Update the NVIDIA driver to enable GPU."
+                        )
                     self._gpu_info = info
                     return info
         except FileNotFoundError:
-            pass  # nvidia-smi not on PATH — no NVIDIA GPU or drivers
+            logger.warning("detect_gpu: swallowed FileNotFoundError", exc_info=True)  # nvidia-smi not on PATH — no NVIDIA GPU or drivers
         except Exception as e:
             logger.debug(f"nvidia-smi failed: {e}")
 
@@ -305,7 +387,7 @@ class VRAMManager:
                         except (ValueError, IndexError):
                             continue
         except FileNotFoundError:
-            pass  # rocm-smi not on PATH — no AMD GPU or ROCm drivers
+            logger.warning("detect_gpu: swallowed FileNotFoundError", exc_info=True)  # rocm-smi not on PATH — no AMD GPU or ROCm drivers
         except Exception as e:
             logger.debug(f"rocm-smi failed: {e}")
 
@@ -342,21 +424,83 @@ class VRAMManager:
             except Exception as e:
                 logger.debug(f"PyTorch GPU detection failed: {e}")
 
-        # 3) macOS Metal
+        # 2b) Windows WMI — last-resort NVIDIA detection. nvidia-smi needs
+        # nvml.dll, which is MISSING on partial/old driver installs (seen on a
+        # 940MX: nvidia-smi in the DriverStore but nvml.dll absent), so all the
+        # probes above fail even though the card is physically present. WMI
+        # (Get-CimInstance, via run_bounded — NOT wmic, which can hang for 27min)
+        # still reports the adapter name + driver version — enough to say "GPU
+        # present but its driver is too old, update it" instead of "no GPU".
+        if sys.platform == "win32" and not info.get("name"):
+            try:
+                result = run_bounded(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                     "$g = Get-CimInstance Win32_VideoController | "
+                     "Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1; "
+                     "if ($g) { \"$($g.Name)|$($g.DriverVersion)|$($g.AdapterRAM)\" }"],
+                    timeout=_nvsmi_timeout,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    parts = [p.strip() for p in result.stdout.strip().split("|")]
+                    if len(parts) >= 2 and parts[0]:
+                        driver_str = parts[1] or None
+                        driver_ok = _nvidia_driver_supports_cuda12(driver_str)
+                        total_gb = 0.0
+                        try:
+                            if len(parts) >= 3 and parts[2]:
+                                total_gb = round(float(parts[2]) / (1024 ** 3), 2)
+                        except (ValueError, TypeError):
+                            pass
+                        info.update({
+                            "name": parts[0],
+                            "total_gb": total_gb,
+                            "free_gb": 0.0,  # WMI can't report free VRAM
+                            "cuda_available": driver_ok,
+                            "driver_version": driver_str,
+                            "driver_cuda_ok": driver_ok,
+                            "detected_via": "wmi",
+                        })
+                        if not driver_ok:
+                            logger.warning(
+                                f"GPU {info['name']} present (driver {driver_str}, "
+                                f"via WMI) but too old for the CUDA-12 runtime — "
+                                f"inference stays on CPU. Update the NVIDIA driver "
+                                f"to enable GPU."
+                            )
+                        self._gpu_info = info
+                        return info
+            except FileNotFoundError:
+                logger.debug("WMI GPU detection: powershell not on PATH")
+            except Exception as e:
+                logger.debug(f"WMI GPU detection failed: {e}")
+
+        # 3) macOS Metal — unified memory architecture, so there's no
+        # separate VRAM pool to query the way nvidia-smi/rocm-smi do.
+        # System RAM headroom (psutil) is the correct proxy: Metal draws
+        # from the same physical pool the CPU uses.  Previously hardcoded
+        # total_gb/free_gb to 0.0 ("hard to measure"), which made every
+        # downstream can_fit()/get_free_vram()/suggest_offload_mode() check
+        # reject EVERY GPU-gated model load on every Mac unconditionally,
+        # regardless of how much memory was actually free — surfaced as
+        # STT/TTS/LLM catalog entries all failing with "insufficient
+        # resources" even on machines with plenty of free RAM.
         if sys.platform == "darwin":
             try:
                 import platform
+
+                import psutil
+                vm = psutil.virtual_memory()
                 info.update({
                     "name": f"Apple Metal ({'Apple Silicon' if platform.machine() == 'arm64' else 'Intel'})",
-                    "total_gb": 0.0,  # shared memory — hard to measure
-                    "free_gb": 0.0,
+                    "total_gb": round(vm.total / (1024 ** 3), 2),
+                    "free_gb": round(vm.available / (1024 ** 3), 2),
                     "cuda_available": False,
                     "metal_available": True,
                 })
             except Exception:
-                pass
+                logger.exception("detect_gpu: swallowed Exception")
 
-        if not info["cuda_available"]:
+        if not info["cuda_available"] and not info.get("metal_available"):
             logger.info("No NVIDIA GPU detected (nvidia-smi not found or no CUDA device)")
 
         self._gpu_info = info
@@ -376,14 +520,17 @@ class VRAMManager:
     # ── VRAM queries ─────────────────────────────────────────────
 
     def get_free_vram(self) -> float:
-        """Return free VRAM in GB — actual free from nvidia-smi.
+        """Return free VRAM in GB.
 
-        nvidia-smi already reports real free VRAM (total - all processes).
-        Do NOT subtract our allocations — that double-counts and reports
-        0GB when there's actually GB free, causing false OOM decisions.
+        NVIDIA: nvidia-smi already reports real free VRAM (total - all
+        processes) — do NOT subtract our allocations, that double-counts
+        and reports 0GB when there's actually GB free, causing false OOM
+        decisions.  macOS Metal: free_gb is real available system RAM
+        (psutil, see detect_gpu) since it's a unified memory pool — same
+        non-double-counting rule applies.
         """
         info = self.detect_gpu()
-        if not info["cuda_available"]:
+        if not (info["cuda_available"] or info.get("metal_available")):
             return 0.0
         return info["free_gb"]
 
@@ -406,7 +553,7 @@ class VRAMManager:
             return True  # unknown tool — assume it fits
         min_vram, _model_size = effective
         gpu = self.detect_gpu()
-        if not gpu["cuda_available"]:
+        if not (gpu["cuda_available"] or gpu.get("metal_available")):
             return False  # no GPU at all
         return self.get_free_vram() >= min_vram
 
@@ -502,7 +649,7 @@ class VRAMManager:
         Returns: 'gpu' | 'cpu_offload' | 'cpu_only'
         """
         gpu = self.detect_gpu()
-        if not gpu["cuda_available"]:
+        if not (gpu["cuda_available"] or gpu.get("metal_available")):
             return "cpu_only"
 
         budget = VRAM_BUDGETS.get(tool_name)
@@ -559,7 +706,7 @@ class VRAMManager:
                     torch.mps.empty_cache()
                     return True
             except Exception:
-                pass
+                logger.exception("clear_cuda_cache: swallowed Exception")
         return False
 
     # ── Allocation drift detection ───────────────────────────────

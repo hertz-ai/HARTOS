@@ -75,15 +75,55 @@ in
       };
     };
 
-    # ─── Subsystem 4: Web/PWA ───
+    # ─── Subsystem 4: Web/PWA + browser extensions ───
     web = {
       enable = lib.mkEnableOption "Progressive Web App native support";
+
+      # Browser-extension (.crx / .xpi) FORCE-INSTALL via the bundled browser's
+      # own enterprise managed-policy engine. This is a REAL install into a real
+      # browser (Chromium ExtensionInstallForcelist / Firefox ExtensionSettings),
+      # DISTINCT from HART's in-process .hartpkg extension registry. Opt-in so the
+      # writable managed-policy dir + Firefox enterprise policy file only exist
+      # when the operator wants extension force-install (the AppInstaller's
+      # _install_browser_ext writes into them and verifies on disk).
+      allowExtensions = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Expose the bundled browser's managed-policy extension force-install
+          surface: a writable Chromium managed-policy dir
+          (/etc/chromium/policies/managed) and, if a Firefox is shipped, a
+          Firefox enterprise policy file (/etc/firefox/policies/policies.json).
+          The AppInstaller._install_browser_ext (InstallerPlatform.BROWSER_EXT)
+          writes the extension id+update_url into these and confirms by reading
+          the on-disk policy back. Default off.
+        '';
+      };
     };
 
     # ─── Subsystem 5: macOS (Darling — experimental) ───
     macos = {
       enable = lib.mkEnableOption "Experimental macOS app support (Darling — Mach-O/Darwin translation, the macOS analogue of Wine)";
     };
+
+    # ─── Subsystem 6: Snap — INTENTIONALLY ABSENT (see note) ───
+    # There is NO hart.subsystems.snap.enable option, on purpose.
+    #
+    # Native snapd is INFEASIBLE on this image: snapd hard-codes an FHS /snap +
+    # /var/lib/snapd tree, generates AppArmor profiles at runtime, and conflicts
+    # with the Nix store model. nixpkgs ships no first-class snapd; the only real
+    # path is the third-party `nix-snapd` flake (services.snap.enable + a /snap
+    # FHS bind mount), which this flake does NOT bundle — flake.nix pins nixpkgs
+    # to a fixed commit (50ab793) with no snapd input and no FHS /snap. Adding it
+    # would mean a new, unpinned, supply-chain-unvetted flake input — a steward
+    # decision, not a silent module (no-fork / no-fake-module rule).
+    #
+    # Honest contract: the AppInstaller routes .snap to InstallerPlatform.SNAP
+    # and returns success=False with "Snap is not supported on HART OS — install
+    # the Flatpak / AppImage / Nix equivalent". /platforms reports snap as
+    # available=False so the UI can grey it out honestly. We do NOT ship a fake
+    # module that pretends to install snaps. Most Snap apps have a Flathub or
+    # nixpkgs equivalent (linux.flatpak / the Nix repo), which is the fallback.
   };
 
   # ═══════════════════════════════════════════════════════════
@@ -151,23 +191,69 @@ in
 
       environment.systemPackages = [ pkgs.gnome-software ];
 
-      # Auto-add Flathub on first boot
+      # Auto-add Flathub — EVENT-DRIVEN, not polled.
+      #
+      # 2026-07-24 real-HW bug (nightly-0d7c84f journal): on the potato node,
+      # network-online.target fired ~5 min BEFORE DNS was actually reachable, so
+      # `remote-add` failed with "Could not resolve hostname". The old script then
+      # `touch`ed the success marker UNCONDITIONALLY, so ConditionPathExists
+      # permanently blocked any retry -> Flathub was never added and every App
+      # Store install failed ("flatpak not installed" / Retry) until the marker was
+      # cleared by hand.
+      #
+      # The unit makes ONE attempt and writes the marker ONLY on success. It does
+      # NOT poll: recovery is driven by the actual connectivity EVENT — a
+      # NetworkManager dispatcher (below) starts this oneshot each time an
+      # interface comes up / gets a lease / connectivity changes. ConditionPathExists
+      # makes a re-start a clean no-op once the remote is added, and re-runs
+      # remote-add if the boot-time attempt failed because DNS wasn't up yet. No
+      # timer, no sleep loop, no arbitrary give-up window.
       systemd.services.hart-flathub-init = {
         description = "Add Flathub Repository";
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
         wantedBy = [ "multi-user.target" ];
+        # Only skip once the remote is ACTUALLY added (marker written on success).
         unitConfig.ConditionPathExists = "!/var/lib/flatpak/.flathub-added";
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
           ExecStart = pkgs.writeShellScript "add-flathub" ''
-            ${pkgs.flatpak}/bin/flatpak remote-add --if-not-exists \
-              flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-            touch /var/lib/flatpak/.flathub-added
+            set -u
+            # remote-add fetches the .flatpakrepo (URL + GPG key), so it needs DNS.
+            # ONE attempt; the marker is written ONLY on success, so a transient
+            # DNS failure records nothing and the connectivity-event dispatcher
+            # re-runs this later (and next boot too, marker absent).
+            if ${pkgs.flatpak}/bin/flatpak remote-add --if-not-exists \
+                 flathub https://dl.flathub.org/repo/flathub.flatpakrepo; then
+              mkdir -p /var/lib/flatpak
+              touch /var/lib/flatpak/.flathub-added
+              echo "[hart-flathub-init] flathub remote added"
+              exit 0
+            fi
+            echo "[hart-flathub-init] remote-add failed: network/DNS not ready; the NetworkManager dispatcher will re-run this on the next connectivity event" >&2
+            exit 1
           '';
         };
       };
+
+      # The connectivity EVENT source. NetworkManager runs this on every
+      # interface up / DHCP lease / connectivity-state change ($1=iface, $2=action).
+      # When the network genuinely arrives (which on this node was ~5 min after
+      # network-online.target), it (re)starts hart-flathub-init exactly once per
+      # event — the missing "internet is here now" signal that a boot-time oneshot
+      # alone never gets. `--no-block` returns immediately; the oneshot's
+      # ConditionPathExists guarantees at-most-once real work.
+      networking.networkmanager.dispatcherScripts = [{
+        type = "basic";
+        source = pkgs.writeShellScript "flathub-on-connectivity" ''
+          case "$2" in
+            up|connectivity-change|dhcp4-change|dhcp6-change)
+              ${pkgs.systemd}/bin/systemctl start --no-block hart-flathub-init.service || true
+              ;;
+          esac
+        '';
+      }];
     })
 
     # ── AppImage ──
@@ -208,106 +294,96 @@ in
     #
     (lib.mkIf sub.android.enable {
 
-      # Enable kernel-level Android support
+      # ── Eval-LOUD prerequisite ─────────────────────────────────────────
+      # Waydroid runs a real AOSP container that needs Binder IPC, which lives
+      # in the kernel module (hart.kernel.androidNative -> binder_linux/ashmem/
+      # binderfs + the /dev/binder* udev rules GROUP=hart). Enabling Android
+      # without the kernel bits would produce an INERT runtime (the old lie).
+      # Assert it so a misconfig fails eval LOUDLY instead of booting dead.
+      assertions = [
+        {
+          assertion = cfg.kernel.enable && cfg.kernel.androidNative.enable;
+          message = ''
+            hart.subsystems.android.enable requires the kernel Binder bits:
+            set hart.kernel.enable = true AND
+            hart.kernel.androidNative.enable = true (binder_linux + ashmem +
+            binderfs + /dev/binder* udev rules). Waydroid cannot run without
+            Binder IPC. (This module enables androidNative for you when
+            hart.kernel.enable is already on; the assertion guards the case
+            where the kernel master toggle is off.)
+          '';
+        }
+      ];
+
+      # Enable kernel-level Android support (binder/ashmem/binderfs). Harmless
+      # if already set in the variant config; the assertion above still catches
+      # hart.kernel.enable = false (which gates the whole kernel module merge).
       hart.kernel.androidNative.enable = true;
 
-      # Android Runtime + Framework
-      environment.systemPackages = with pkgs; [
-        # Android Debug Bridge (manage installed apps)
-        android-tools          # adb, fastboot
+      # ── REAL Android runtime: Waydroid (LXC-based AOSP container) ────────
+      # NOT the old `exec sleep infinity` stub (which ran NO ART, NO Binder, NO
+      # PackageManager and installed nothing while reporting "ready"). Waydroid
+      # runs a genuine AOSP image with ART + Bionic + Binder on the HOST kernel;
+      # SurfaceFlinger -> Wayland, AudioFlinger -> PipeWire. We hand the
+      # container lifecycle to the STOCK nixpkgs `virtualisation.waydroid` module
+      # (its own waydroid-container.service owns the LXC) rather than keeping a
+      # parallel inert daemon — one runtime, no drift.
+      #
+      # IMPORTANT (eval-gate lesson #1): Waydroid raises inotify watch pressure,
+      # but we do NOT re-declare fs.inotify.max_user_watches here — hart-kernel
+      # already forces it to 1048576 with lib.mkForce. A second declaration would
+      # collide at eval ("defined multiple times"). Don't touch the sysctl.
+      virtualisation.waydroid.enable = true;
 
-        # APK management tools
+      # Android Runtime + Framework tooling (manage installed apps from the host)
+      environment.systemPackages = with pkgs; [
+        # Android Debug Bridge (inspect / manage the running session)
+        android-tools          # adb, fastboot
+        # APK management / inspection (the installer parses the package name from
+        # the APK manifest; aapt-style inspection is handy for operators too)
         apktool                # Decompile/recompile APK
       ];
 
-      # Android system directories (native, not containerized)
+      # Android runtime data dir (the installer's honest "where APKs land" note;
+      # Waydroid keeps its own state under /var/lib/waydroid). Kept for operator
+      # scratch + parity with the other subsystems' /var/lib/hart/<x> dirs.
       systemd.tmpfiles.rules = [
-        # Android runtime data
         "d /var/lib/hart/android 0750 hart hart -"
-        "d /var/lib/hart/android/data 0750 hart hart -"
-        "d /var/lib/hart/android/apps 0750 hart hart -"
-
-        # Android system image mount point
-        "d /var/lib/hart/android/system 0755 root root -"
       ];
 
-      # Android Runtime service (native daemon, not container)
-      systemd.services.hart-android-runtime = {
-        description = "HART OS Android Native Runtime";
-        # Was: after=[hart.target graphical.target], wantedBy=[multi-user.target].
-        # graphical.target is ordered AFTER multi-user.target, so being pulled in
-        # by multi-user.target while ordered after graphical.target formed an
-        # ordering cycle (multi-user -> android -> graphical -> multi-user) that
-        # systemd broke by SKIPPING the Android runtime (and the Wine bridge as
-        # collateral). The runtime only needs binder + hart.target, so make it a
-        # plain hart.target child like every other HART service.
-        after = [ "hart.target" ];
-        wants = [ "hart.target" ];
+      # ── First-boot Waydroid image init — NEVER-FAIL boot ordering ───────
+      # `waydroid init` downloads the system + vendor images (network-dependent).
+      # Per eval-gate lesson #3 (the graphical.target ordering-cycle the old
+      # Android runtime learned): this is a plain hart.target child, Type=oneshot
+      # + RemainAfterExit, ConditionPathExists guard for idempotency, and it MUST
+      # NOT block boot if there is no network / the download fails — every step
+      # is `|| true` (mirrors hart-flathub-init's tolerance). A dead init must
+      # never wedge the boot; the installer surfaces "session not started"
+      # honestly at install time instead.
+      systemd.services.hart-waydroid-init = {
+        description = "HART OS — Waydroid first-boot image init (non-blocking)";
+        # network-online is WANTED (best-effort) not REQUIRED — no-network boots
+        # must still complete; the init just no-ops and retries on a later boot.
+        after = [ "hart.target" "network-online.target" ];
+        wants = [ "network-online.target" ];
         wantedBy = [ "hart.target" ];
-
-        # Stop crash-looping when binder_linux or GPU is unavailable.
-        # 3 attempts in 60 s, then systemd marks it failed and moves on —
-        # the shell still boots; Android apps just won't work this session.
-        startLimitIntervalSec = 60;
-        startLimitBurst = 3;
-
+        # Idempotent: skip once the images are present.
+        unitConfig.ConditionPathExists = "!/var/lib/waydroid/images/system.img";
         serviceConfig = {
-          Type = "notify";
-          Restart = "on-failure";
-          RestartSec = 10;
-          ExecStart = pkgs.writeShellScript "hart-android-start" ''
-            set -euo pipefail
-
-            ANDROID_ROOT="/var/lib/hart/android"
-
-            # Verify kernel modules
-            if ! lsmod | grep -q binder_linux; then
-              echo "ERROR: binder_linux kernel module not loaded"
-              exit 1
-            fi
-
-            # Initialize Android system on first boot
-            if [[ ! -f "$ANDROID_ROOT/.initialized" ]]; then
-              echo "[HART OS] Initializing Android subsystem..."
-              mkdir -p "$ANDROID_ROOT"/{data,apps,system,cache}
-
-              # Set Android system properties
-              cat > "$ANDROID_ROOT/build.prop" << 'PROPS'
-            ro.build.display.id=HART OS-Android
-            ro.build.host=hart-node
-            ro.product.model=HART OS
-            ro.product.brand=hart
-            ro.product.name=hart
-            ro.product.device=generic
-            ro.build.type=userdebug
-            persist.sys.timezone=UTC
-            PROPS
-
-              touch "$ANDROID_ROOT/.initialized"
-              echo "[HART OS] Android subsystem initialized"
-            fi
-
-            # Start Android services bridge
-            # (Routes Android display → Wayland, audio → PipeWire)
-            echo "[HART OS] Android runtime ready"
-            systemd-notify --ready
-
-            # Keep running (services are managed as child processes)
-            exec sleep infinity
+          Type = "oneshot";
+          RemainAfterExit = true;
+          # Downloads can be slow; cap so a hung mirror can't pin the unit
+          # forever, and never let a failure fail the boot transaction.
+          TimeoutStartSec = "600";
+          ExecStart = pkgs.writeShellScript "hart-waydroid-init" ''
+            set -uo pipefail
+            echo "[HART OS] Waydroid first-boot init (best-effort, non-blocking)..."
+            # ${if sub.android.playStore then "GApps" else "vanilla"} system image.
+            ${pkgs.waydroid}/bin/waydroid init \
+              ${lib.optionalString sub.android.playStore "-s GAPPS"} || \
+              echo "[HART OS] waydroid init deferred (no network / mirror down) — will retry next boot"
+            exit 0
           '';
-
-          ExecStop = pkgs.writeShellScript "hart-android-stop" ''
-            echo "[HART OS] Stopping Android runtime..."
-          '';
-
-          # Run as root for binder access, but agents run as hart user
-          Restart = "on-failure";
-          RestartSec = 5;
-
-          # Resource limits for Android subsystem
-          Slice = "hart-agents.slice";
-          MemoryMax = "4G";
-          CPUWeight = 80;
         };
       };
 
@@ -408,6 +484,22 @@ in
     # ─────────────────────────────────────────────────────────
     (lib.mkIf sub.web.enable {
 
+      # Eval-LOUD prerequisite: the policy install surface needs a real browser
+      # pkg. chromium is the canonical force-install target (the PWA + extension
+      # engine); assert it exists on the chosen nixpkgs rev/arch so an unbuildable
+      # browser fails eval instead of producing an inert /platforms entry.
+      assertions = [
+        {
+          assertion = pkgs ? chromium;
+          message = ''
+            hart.subsystems.web.enable needs a browser package: pkgs.chromium is
+            absent on this nixpkgs rev/arch, so the PWA + extension force-install
+            surface cannot be built. Pin a rev where chromium builds, or disable
+            hart.subsystems.web.
+          '';
+        }
+      ];
+
       environment.systemPackages = [ pkgs.chromium ];
 
       programs.chromium = {
@@ -415,29 +507,71 @@ in
         extraOpts = {
           WebAppInstallForceList = [];
           DefaultBrowserSettingEnabled = false;
+          # Browser-extension FORCE-INSTALL list (Chromium enterprise policy).
+          # programs.chromium writes extraOpts to /etc/chromium/policies/managed
+          # as a managed JSON policy; the AppInstaller._install_browser_ext
+          # appends {id, update_url} entries to this list (or, when allowExtensions
+          # exposes a writable managed dir below, drops a sibling policy file) and
+          # CONFIRMS by reading the on-disk policy back. Default empty -> no forced
+          # extensions until something writes one. KEPT distinct from HART's own
+          # in-process .hartpkg EXTENSION registry (different InstallerPlatform).
+          ExtensionInstallForcelist = [];
         };
       };
 
-      # PWA installer helper
-      environment.etc."hart/bin/hart-pwa-install" = {
-        mode = "0755";
-        text = ''
-          #!/bin/bash
-          # Install web app as native-looking desktop app
-          APP_NAME="''${1:?Usage: hart-pwa-install <name> <url>}"
-          APP_URL="''${2:?Usage: hart-pwa-install <name> <url>}"
-          SAFE=$(echo "$APP_NAME" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
-          mkdir -p "$HOME/.local/share/applications"
-          cat > "$HOME/.local/share/applications/pwa-''${SAFE}.desktop" << EOF
-          [Desktop Entry]
-          Name=$APP_NAME
-          Exec=chromium --app=$APP_URL --class=$SAFE
-          Terminal=false
-          Type=Application
-          Categories=Network;
-          EOF
-          echo "Installed: $APP_NAME → $APP_URL"
-        '';
+      # ── /etc files: PWA helper (always) + writable managed-policy surface ──
+      # ONE environment.etc binding (two `environment.etc = …` in the same attrset
+      # would collide). The PWA helper is unconditional; the extension force-install
+      # policy files are added only when hart.subsystems.web.allowExtensions is on,
+      # via lib.optionalAttrs (so the disabled path ships no writable policy dir).
+      #
+      # programs.chromium's own managed policy file is in the read-only Nix store.
+      # The installer needs a WRITABLE file Chromium ALSO reads so it can drop a
+      # {id,update_url} force-install policy at runtime + verify it on disk:
+      # /etc/chromium/policies/managed merges every *.json there. For a bundled
+      # Firefox we expose /etc/firefox/policies/policies.json (the Firefox
+      # enterprise policy path, same pattern as hart-email.nix's thunderbird
+      # policy). Both stock surfaces — no fork.
+      environment.etc = {
+        # PWA installer helper (always present when web is enabled)
+        "hart/bin/hart-pwa-install" = {
+          mode = "0755";
+          text = ''
+            #!/bin/bash
+            # Install web app as native-looking desktop app
+            APP_NAME="''${1:?Usage: hart-pwa-install <name> <url>}"
+            APP_URL="''${2:?Usage: hart-pwa-install <name> <url>}"
+            SAFE=$(echo "$APP_NAME" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+            mkdir -p "$HOME/.local/share/applications"
+            cat > "$HOME/.local/share/applications/pwa-''${SAFE}.desktop" << EOF
+            [Desktop Entry]
+            Name=$APP_NAME
+            Exec=chromium --app=$APP_URL --class=$SAFE
+            Terminal=false
+            Type=Application
+            Categories=Network;
+            EOF
+            echo "Installed: $APP_NAME → $APP_URL"
+          '';
+        };
+      } // lib.optionalAttrs sub.web.allowExtensions {
+        # Chromium: a writable, installer-owned managed-policy file alongside the
+        # store-managed one. mode 0664 + group hart so the installer (running as
+        # hart) can rewrite the ExtensionInstallForcelist and read it back.
+        "chromium/policies/managed/hart-extensions.json" = {
+          mode = "0664";
+          group = "hart";
+          text = builtins.toJSON { ExtensionInstallForcelist = [ ]; };
+        };
+        # Firefox: enterprise policy file (Firefox reads /etc/firefox/policies/
+        # policies.json). ExtensionSettings is the .xpi force-install surface
+        # (installation_mode=force_installed + install_url). Seed empty; installer
+        # merges entries + verifies on disk. Mirrors hart-email.nix's TB policy.
+        "firefox/policies/policies.json" = {
+          mode = "0664";
+          group = "hart";
+          text = builtins.toJSON { policies = { ExtensionSettings = { }; }; };
+        };
       };
     })
 
@@ -452,6 +586,25 @@ in
     # `pkgs ? darling` guard keeps evaluation safe on a nixpkgs rev/arch where
     # darling is absent or unbuildable.
     (lib.mkIf sub.macos.enable {
+      # Eval-LOUD prerequisite (only when macos is explicitly enabled — it is
+      # default-OFF, so the common case never hits this). Darling is absent /
+      # unbuildable on many revs+arches (x86_64-only, heavy build); if an operator
+      # opts in on such a rev, fail eval with an actionable message rather than
+      # silently shipping no runtime. The `pkgs ? darling` optional below still
+      # keeps the DISABLED path eval-safe everywhere.
+      assertions = [
+        {
+          assertion = pkgs ? darling;
+          message = ''
+            hart.subsystems.macos.enable is on but pkgs.darling is absent on this
+            nixpkgs rev/arch (Darling is x86_64-only and not always packaged).
+            macOS app support (experimental, CLI-leaning) cannot be built here —
+            pin a rev/arch where darling builds, or leave hart.subsystems.macos
+            disabled (the default). GUI / .dmg / .pkg remain unsupported regardless
+            (the installer refuses them honestly via `darling shell`).
+          '';
+        }
+      ];
       environment.systemPackages = lib.optional (pkgs ? darling) pkgs.darling;
       systemd.tmpfiles.rules = [
         "d /var/lib/hart/darwin 0750 hart hart -"

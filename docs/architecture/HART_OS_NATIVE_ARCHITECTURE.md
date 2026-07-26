@@ -6,8 +6,8 @@
 > authored blind. This document is the persistent north star, the migration ledger,
 > and the phased, gated build plan.
 >
-> **Companions:** [`compositor/ROADMAP.md`](../../compositor/ROADMAP.md) (phase list +
-> deliverables + gates) and [`compositor/IPC_PROTOCOL.md`](../../compositor/IPC_PROTOCOL.md)
+> **Companions:** [`compositor/ROADMAP.md`](https://github.com/hertz-ai/HARTOS/blob/main/compositor/ROADMAP.md) (phase list +
+> deliverables + gates) and [`compositor/IPC_PROTOCOL.md`](https://github.com/hertz-ai/HARTOS/blob/main/compositor/IPC_PROTOCOL.md)
 > (the agent ↔ compositor contract).
 
 ---
@@ -396,7 +396,7 @@ behavior preserved) · **E** = enhanced (gains capability, never loses).
 ## 5. AI-Native WM IPC Design
 
 > Full message shapes and the security boundary live in
-> [`compositor/IPC_PROTOCOL.md`](../../compositor/IPC_PROTOCOL.md). This section is the
+> [`compositor/IPC_PROTOCOL.md`](https://github.com/hertz-ai/HARTOS/blob/main/compositor/IPC_PROTOCOL.md). This section is the
 > *design intent*.
 
 **`com.hart.Compositor`** — a D-Bus interface (with a Unix-socket twin for low-latency /
@@ -758,7 +758,7 @@ A2UI co-location fix.
 ## 10. Phased Build + Test Plan
 
 > The phase list, deliverables, per-phase tests, never-break gates, and `verifyVia` are the
-> canonical source in [`compositor/ROADMAP.md`](../../compositor/ROADMAP.md). This is the
+> canonical source in [`compositor/ROADMAP.md`](https://github.com/hertz-ai/HARTOS/blob/main/compositor/ROADMAP.md). This is the
 > summary + the invariant verification loop.
 
 **Ordering principle:** a never-fail floor exists from Phase 0; the tier-drop **supervisor** is

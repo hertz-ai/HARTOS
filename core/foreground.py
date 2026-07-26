@@ -19,6 +19,7 @@ the context manager; a stray exit can never drive the count negative.
 """
 import contextlib
 import threading
+import time
 
 _lock = threading.Lock()
 # Condition over the SAME lock so background callers can BLOCK until the
@@ -63,7 +64,36 @@ def unregister_cancellable(fn) -> None:
         _cancellables.discard(fn)
 
 
+# Monotonic timestamp of the last background-call abort (a "preempt").  Lets the
+# daemon (dispatch.is_transient_deferral) recognise a goal whose LLM call was
+# just aborted for a live user turn as a TRANSIENT defer — re-queue it next tick,
+# never count it toward the 5-strike auto-pause ("queue the canceled daemon
+# alone").  Initialised to -inf so it never reads "recent" before a real preempt.
+_last_preempt_at = float('-inf')
+
+
+def note_preempt() -> None:
+    """Record that a background LLM call was just aborted for a foreground turn.
+    Called by ``_fire_cancellables`` AND by the llama scheduler's per-slot
+    preempt, so both preemption paths feed the daemon's transient-defer signal."""
+    global _last_preempt_at
+    try:
+        _last_preempt_at = time.monotonic()
+    except Exception:
+        pass
+
+
+def preempted_recently(window: float = 30.0) -> bool:
+    """True if a foreground preempt fired within ``window`` seconds — the signal
+    that lets a preempted daemon goal re-queue instead of backing off."""
+    try:
+        return (time.monotonic() - _last_preempt_at) < window
+    except Exception:
+        return False
+
+
 def _fire_cancellables() -> None:
+    note_preempt()
     with _cancel_lock:
         fns = list(_cancellables)
     for fn in fns:
