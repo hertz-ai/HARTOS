@@ -25,6 +25,7 @@ published, valid TLS) rather than from renting somebody's IP reputation.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -48,6 +49,12 @@ SMTP_USER = os.environ.get('HEVOLVE_SMTP_USER', 'sathish@mail.hertzai.com')
 SMTP_PASS = os.environ.get('HEVOLVE_SMTP_PASS', '')
 FROM_NAME = os.environ.get('HEVOLVE_SMTP_FROM_NAME', 'Sathish at Hevolve')
 REPLY_TO = os.environ.get('HEVOLVE_SMTP_REPLY_TO', 'sathish@hertzai.com')
+
+# Where the one-click unsubscribe link points. Deliberately the public site
+# rather than the mail host: the reader recognises hevolve.ai, and the
+# endpoint has to answer a POST from the receiver's infrastructure without
+# any of the sending machinery being reachable.
+UNSUB_BASE = os.environ.get('HEVOLVE_UNSUB_BASE', 'https://hevolve.ai')
 
 # Pacing. The default is deliberately unhurried: a burst is what trips
 # receiving-side rate limits, and there is rarely a reason to rush a campaign.
@@ -155,6 +162,71 @@ def load_optouts() -> set:
         return set()
     with open(p, 'r', encoding='utf-8') as f:
         return {line.strip().lower() for line in f if line.strip()}
+
+
+def resolve_unsubscribe_tokens(token_lines: Iterable[str],
+                               recipients: Iterable[str],
+                               campaign: str,
+                               *, dry_run: bool = False) -> dict:
+    """Turn one-click unsubscribe tokens back into addresses, and opt them out.
+
+    The web endpoint that receives a one-click unsubscribe records only the
+    per-recipient HMAC: it has neither the list nor the signing secret, so it
+    cannot know whose token it just collected. That is deliberate -- it keeps
+    every address off the public web server. The cost is this step, which has
+    to run where the list and the secret already live.
+
+    Resolution is by recomputation rather than a stored map: for each address
+    we know, derive its token and see whether it was reported. That means no
+    token->address table exists anywhere to be leaked, and it is cheap even
+    for the full list (one HMAC per address).
+
+    An unmatched token is reported, never guessed at. It usually means a
+    different campaign's token, and silently dropping it would hide a real
+    opt-out.
+    """
+    wanted = set()
+    for line in token_lines:
+        line = (line or '').strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get('event') != 'unsubscribe':
+            continue
+        tok = (row.get('token') or '').strip().lower()
+        if tok:
+            wanted.add(tok)
+
+    out = {'reported': len(wanted), 'matched': 0, 'unmatched': 0,
+           'already_opted_out': 0, 'dry_run': dry_run, 'addresses': []}
+    if not wanted:
+        return out
+
+    existing = load_optouts()
+    seen_tokens = set()
+    for addr in recipients:
+        addr = (addr or '').strip()
+        if not addr:
+            continue
+        tok = tracking_token(addr, campaign)
+        if tok not in wanted:
+            continue
+        seen_tokens.add(tok)
+        low = addr.lower()
+        if low in existing:
+            out['already_opted_out'] += 1
+            continue
+        out['matched'] += 1
+        out['addresses'].append(low)
+        if not dry_run:
+            record_optout(low)
+            existing.add(low)
+
+    out['unmatched'] = len(wanted - seen_tokens)
+    return out
 
 
 def record_optout(address: str) -> None:
@@ -320,9 +392,29 @@ def build_message(to: str, subject: str, html: str, text: str,
     msg['Reply-To'] = REPLY_TO
     msg['Date'] = formatdate(localtime=True)
     msg['Message-ID'] = make_msgid(domain=SMTP_HOST)
-    # Machine-readable unsubscribe: mail clients surface this as a button,
-    # which is both courteous and a positive deliverability signal.
-    msg['List-Unsubscribe'] = '<mailto:%s?subject=unsubscribe>' % REPLY_TO
+
+    # One-click unsubscribe (RFC 8058). This was a mailto: only, and that gap
+    # is not merely a missing feature -- it is a plausible cause of the
+    # 550-5.7.1 block Gmail applied to this sender on 2026-07-26.
+    #
+    # A mailto: unsubscribe asks the reader to compose an email. Most people
+    # will not; faced with mail they do not want, the one-tap control in front
+    # of them is "Report spam". So a weak unsubscribe path converts directly
+    # into the complaint rate that receivers block on. Giving an HTTPS link
+    # that unsubscribes in a single tap is the cheapest way to move those
+    # people out of the complaint bucket.
+    #
+    # It is also a hard requirement: Google and Yahoo require one-click for
+    # bulk senders, and this campaign's ramp reaches 5k/day and beyond.
+    #
+    # The URL carries only the per-recipient HMAC, never the address, so the
+    # link cannot be used to harvest anyone. Both forms are offered because
+    # some clients still use the mailto:.
+    token = tracking_token(to, campaign)
+    unsub_url = '%s/u/%s' % (UNSUB_BASE.rstrip('/'), token)
+    msg['List-Unsubscribe'] = '<%s>, <mailto:%s?subject=unsubscribe>' % (
+        unsub_url, REPLY_TO)
+    msg['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click'
     msg.attach(MIMEText(text, 'plain'))
     msg.attach(MIMEText(html, 'html'))
     return msg
