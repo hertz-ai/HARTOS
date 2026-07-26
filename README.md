@@ -17,12 +17,25 @@ enough compute in one building. That concentration is an architectural choice
 rather than a law of physics, and it decides what the models will refuse, what
 they cost, and who gets to read what you type.
 
-To be precise, because this is the obvious thing to attack: you cannot train a
-frontier model without a datacenter, and we are not claiming you can. What we
-are claiming is that the intelligence people actually use does not have to be
-delivered from one. HART OS runs models on the device, and when a node cannot
-handle something it recruits a peer directly, with no broker and no company in
-the middle.
+Two different locks are usually treated as one. There is the capital lock, the
+compute it takes to pretrain a frontier model, and there is the silicon lock,
+the fact that most of the stack assumes one vendor's cards and one vendor's
+toolkit. The second is the one we refuse outright.
+
+Local inference here runs through llama.cpp on GGUF weights, so CUDA, ROCm,
+Metal, Vulkan and plain CPU are all first-class. `vram_manager` treats
+"CPU-only, Metal, broken nvidia-smi" as ordinary cases rather than failures,
+and probes `rocm-smi` next to `nvidia-smi`. An Apple laptop, an AMD card and a
+machine with no GPU at all are supported paths, not degraded ones. Nothing in
+the delivery path requires a particular company's silicon.
+
+On the capital lock, we are precise rather than loud: you cannot pretrain a
+frontier model without a datacenter, and we do not claim you can. What we
+claim is that the intelligence people actually use does not have to be
+delivered from one, and that the gap between open weights and closed ones has
+been closing faster than the compute gap has been widening. HART OS runs
+models on the device, and when a node cannot handle something it recruits a
+peer directly, with no broker and no company in the middle.
 
 We do not shard a model across the network either. Layer-level parallelism over
 consumer links is a bad idea and we do not attempt it. A peer serves a whole
