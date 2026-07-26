@@ -134,6 +134,23 @@ Wayland compositor built under `--features smithay`, and ten session
 supervisor VM tests covering paint watchdogs, tier drops and the recovery TTY.
 It also lists what is not proven, which is hardware paint on a real GPU.
 
+### Two things people miss
+
+**It can see and drive its own desktop.** A vision model takes a screenshot
+and the usual action vocabulary drives the real machine through pyautogui, so
+it can operate a browser or any other GUI. The seeing happens on the device
+(`integrations/vlm/local_computer_tool.py`).
+
+**Claude Code runs as the node's own copilot.** `hart-copilot` drops you into
+Claude Code inside a writable checkout on a fresh branch, with the boundary
+enforced by the filesystem rather than by a prompt: the nix store is read
+only, so it structurally cannot modify the running system in place, and
+nothing in that path touches `main`. Merging, OTA publishing and release
+signing stay human. Details and the current limits are in
+[the design note](docs/architecture/HART_COPILOT_RESIDENT_CLAUDE.md). The
+module is built and flake-eval green. The login does not yet survive a reboot
+on the live ISO, and one wire (`hart hive connect`) is still missing.
+
 **[Full capability map →](CAPABILITIES.md)** . Every subsystem with the file
 that implements it: agent runtime, auto-evolve, federation, 31 channel
 adapters, 15 providers, security, economics, the API surface, and how it
