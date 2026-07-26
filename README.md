@@ -68,7 +68,7 @@ we are wrong to ship it this way at all.
 ## Start it
 
 The server starts in seconds. The install does not. `requirements.txt` pins
-235 packages and pulls torch, torchvision, transformers, onnxruntime and
+192 packages and pulls torch, torchvision, transformers, onnxruntime and
 scipy, so budget a few minutes and a few GB on a first run.
 
 **Use Python 3.10 or 3.11, not a newer one.** `faiss-cpu==1.7.4` publishes
