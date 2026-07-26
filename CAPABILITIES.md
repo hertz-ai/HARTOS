@@ -140,7 +140,7 @@ is what `GET /api/social/channels/catalog` serves.
 
 | | What it does | Where |
 |---|---|---|
-| **MemoryGraph** | SQLite FTS5 + `memory_links` table, provenance-aware | `core/memory/` |
+| **MemoryGraph** | SQLite FTS5 + `memory_links` table, provenance-aware | `integrations/channels/memory/memory_graph.py` |
 | **SimpleMem** | Semantic vector search for long-term recall | (vector store) |
 | **PersistentChatHistory** | Single shared buffer for LangChain + AutoGen (zero parallel paths) | (conversation buffer) |
 | **ConversationEntry** | Cross-channel unified conversation log | `chat_messages.py` |
@@ -184,12 +184,20 @@ is what `GET /api/social/channels/catalog` serves.
 
 | | What it does | Where |
 |---|---|---|
-| **AES-256-GCM at rest** | Python modules encrypted at rest with derived key | `core/security/` (Rust-native) |
-| **Ed25519 key derivation** | node_identity -> HKDF -> AES key | (key derivation) |
-| **BCC mode** | Cython compile-to-C, irreversible | (build flag) |
-| **RFT mode** | AST symbol renaming | (build flag) |
-| **Anti-debug, anti-tamper** | Process introspection guards, license management | (Rust binary) |
-| **Test coverage** | 54 tests (unit + integration + stress + e2e + pen) | `tests/` |
+Lives in its own top-level package, Rust core plus a Python driver, not under
+`core/`. An earlier version of this table pointed at `core/security/`, which
+does not exist.
+
+| | What it does | Where |
+|---|---|---|
+| **AES-256-GCM at rest** | Python modules encrypted at rest with a derived key | `hevolvearmor/src/lib.rs` (Rust), `hevolvearmor/hevolvearmor/_loader.py` |
+| **Ed25519 key derivation** | node_identity -> HKDF -> AES key | `hevolvearmor/hevolvearmor/_keygen.py` |
+| **BCC mode** | Cython compile-to-C, irreversible | `hevolvearmor/hevolvearmor/_bcc.py` |
+| **RFT mode** | AST symbol renaming | `hevolvearmor/hevolvearmor/_transforms.py` |
+| **Build driver** | Packaging and the build flags above | `hevolvearmor/hevolvearmor/_builder.py`, `Cargo.toml` |
+| **Anti-debug, anti-tamper** | Process introspection guards, license management | `hevolvearmor/src/` |
+| **Test coverage** | 55 tests (unit + integration + stress + e2e + pen) | `hevolvearmor/tests/test_full_suite.py` |
+| **Armored artifact** | The shipped armored HevolveAI build the loader consumes | `vendor/hevolveai_armored`, `security/native_hive_loader.py` |
 
 ### Platform layer (HART OS specific)
 
@@ -210,12 +218,12 @@ is what `GET /api/social/channels/catalog` serves.
 | | What it does | Where |
 |---|---|---|
 | **Shell APIs** | 40+ OS routes (`shell_os_apis.py`), 9 desktop features (`shell_desktop_apis.py`), 6 system features (`shell_system_apis.py`) | `integrations/agent_engine/shell_*.py` |
-| **App installer** | Cross-platform: Nix, Flatpak, AppImage, Wine, Android, Darling. Magic-bytes detection | `integrations/social/app_installer.py` |
+| **App installer** | Cross-platform: Nix, Flatpak, AppImage, Wine, Android, Darling. Magic-bytes detection | `integrations/agent_engine/app_installer.py` |
 | **NixOS modules** | OTA, NVIDIA, LUKS, firewall, power, accessibility, CUPS, nightlight, IME | (nix flakes) |
 | **Liquid UI service** | MD3 design tokens, JS component lib (dsBtn, dsCard, dsModal) | `liquid_ui_service.py` |
 | **Theme service** | EventBus-driven theme distribution | `theme_service.py` |
 | **Native remote desktop** | RustDesk + Sunshine wrappers, 3-tier transport (DirectWS / WAMP / WireGuard), OTP session auth, DLP scan, peripheral bridge, DLNA casting | `integrations/remote_desktop/` |
-| **System panels** | 36 panels (model catalog, channel pairing, agent dashboard, hive view, ...) | `shell_manifest.py` |
+| **Shell panels** | 113 across three registries: `PANEL_MANIFEST` 35 start-menu panels, `DYNAMIC_PANELS` 14 context-opened, `SYSTEM_PANELS` 64 native system panels (model catalog, channel pairing, agent dashboard, hive view, ...) | `shell_manifest.py` |
 | **Unified hart CLI** | 24 subcommands: `a2a`, `agent`, `channel`, `chat`, `code`, `compute`, `desktop`, `expert`, `mcp`, `model`, `pay`, `recipe`, `remote`, `remote-desktop`, `repomap`, `schedule`, `screenshot`, `skill`, `social`, `status`, `tools`, `vision`, `voice`, `zeroshot` | `hart_cli.py` |
 
 ### Vision + robotics
