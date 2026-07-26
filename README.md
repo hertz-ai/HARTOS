@@ -115,6 +115,13 @@ pulls torch, torchvision, transformers, onnxruntime and scipy, so budget a few
 minutes and a few GB on a first run. This section used to be headed "60-second
 start", which was not true of anything except the last line.
 
+**Use Python 3.10 or 3.11, and not a newer one.** The `python3.10` in the first
+command is load-bearing rather than decorative. `faiss-cpu==1.7.4` publishes
+wheels for cp37 through cp311 only, so on 3.12 or later the install stops with
+"No matching distribution found for faiss-cpu==1.7.4", which reads like a
+broken repository rather than a version mismatch. If your system python is
+newer, install 3.10 alongside it and point the venv at that.
+
 ```bash
 git clone https://github.com/hertz-ai/HARTOS.git && cd HARTOS
 python3.10 -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate.bat
