@@ -1,6 +1,7 @@
 <h1 align="center">HART OS</h1>
 <p align="center"><strong>Hevolve Hive Agentic Runtime</strong></p>
-<p align="center">The AI-native operating system for every device, from your computer to embodied AI. Local-first, federated, OpenAI-compatible.</p>
+<p align="center"><strong>Democratic frontier intelligence with zero lock-in, fronted by an agentic OS.</strong></p>
+<p align="center">Runs on your hardware. No vendor silicon, no subscription, no broker. Local-first, federated, OpenAI-compatible.</p>
 
 <p align="center">
   <a href="https://hevolve.ai"><img src="https://img.shields.io/badge/Live%20demo-hevolve.ai-FFD700?style=flat-square" alt="Live demo"></a>
@@ -10,86 +11,34 @@
   <a href="https://github.com/hertz-ai/Nunba"><img src="https://img.shields.io/badge/Frontend-Nunba-5865F2?style=flat-square" alt="Nunba"></a>
 </p>
 
-### What you get on an ordinary Tuesday
+### What it is
 
-Before the argument, the practical part. Install it and you have an assistant
-that runs on your own machine. No subscription and no monthly bill, because
-answering costs us nothing when the model runs on your hardware. It works with
-the wifi off, on a plane or in a building with bad signal. 8GB of RAM is
-enough. Whatever you type stays on the machine, not as a policy we promise but
-because there is nowhere else for it to go, and you can confirm that by
-watching the network.
+An assistant that runs on your own machine. No subscription. Works with the
+wifi off. 8GB of RAM is enough. What you type stays on the device because
+there is nowhere else for it to go, and you can watch the network to check.
 
-The honest limit in the same breath: on a genuinely hard question, a frontier
-lab's model will give you a better answer than a model that fits on your
-laptop. Most of what people actually ask an assistant in a day is not that
-question. This is built for the rest, where local is good enough, private by
-construction, and free.
+On a hard question a frontier model beats anything that fits on a laptop. Most
+of what people ask in a day is not that. This is for the rest.
 
-Ready to use today: [Nunba](https://github.com/hertz-ai/Nunba) for Windows,
-Linux and Android. HART OS is the runtime underneath it, and this repository
-is that runtime.
+Ready today: [Nunba](https://github.com/hertz-ai/Nunba) for Windows, Linux and
+Android. This repo is the runtime underneath it.
 
-### Why this exists
+### Why it exists
 
-The most capable AI now lives inside a handful of organisations that can put
-enough compute in one building.
+Training needs tight interconnect, so training clusters are dense. That part
+is physics and a reader here was right to pull me up on wording that implied
+otherwise.
 
-Interconnect is the honest part of that. Training is tightly coupled, the lane
-between two accelerators degrades with distance, and colocation follows from
-physics rather than from anyone's preference. Say that plainly, because it is
-true.
+Owning the weights, setting the refusal policy, pricing access and keeping the
+logs are not interconnect problems. Those are choices, and they are the ones
+worth arguing with.
 
-It is a gradient, not a wall. Low-communication training exists precisely to
-relax the coupling, trading synchronisation rounds for local steps, and the
-whole point of that line of work is that the interconnect requirement is a
-variable rather than a constant. Networks improve on their own curve too. A
-constraint measured against today's bandwidth is not a permanent boundary, and
-treating it as one is how you mistake the current shape of an industry for a
-law.
+Inference runs on llama.cpp with GGUF weights, so CUDA, ROCm, Metal, Vulkan
+and plain CPU all work. Nothing in the delivery path needs one vendor's
+silicon.
 
-More to the point, interconnect explains the density of a training cluster and
-nothing else. It does not explain why the weights, the refusal policy, the
-price, and the logs of everything you typed have to stay with whoever paid for
-the cluster. Serving a request is not tightly coupled. Owning a model is not a
-physics problem. Those are decisions, and they are the ones worth arguing
-with.
-
-Where this goes, stated as an aim rather than a shipped feature: an internet
-made of intelligence, where a world model is built incrementally and in the
-open by the machines that participate in it, and no single party owns the
-result. The OS is the part we can build. The rest is a bet.
-
-Two different locks are usually treated as one. There is the capital lock, the
-compute it takes to pretrain a frontier model, and there is the silicon lock,
-the fact that most of the stack assumes one vendor's cards and one vendor's
-toolkit. The second is the one we refuse outright.
-
-Local inference here runs through llama.cpp on GGUF weights, so CUDA, ROCm,
-Metal, Vulkan and plain CPU are all first-class. `vram_manager` treats
-"CPU-only, Metal, broken nvidia-smi" as ordinary cases rather than failures,
-and probes `rocm-smi` next to `nvidia-smi`. An Apple laptop, an AMD card and a
-machine with no GPU at all are supported paths, not degraded ones. Nothing in
-the delivery path requires a particular company's silicon.
-
-On the capital lock, we are precise rather than loud: you cannot pretrain a
-frontier model without a datacenter, and we do not claim you can. What we
-claim is that the intelligence people actually use does not have to be
-delivered from one, and that the gap between open weights and closed ones has
-been closing faster than the compute gap has been widening. HART OS runs
-models on the device, and when a node cannot handle something it recruits a
-peer directly, with no broker and no company in the middle.
-
-We do not shard a model across the network either. Layer-level parallelism over
-consumer links is a bad idea and we do not attempt it. A peer serves a whole
-request instead, so a machine with a bigger model answers what a smaller one
-could not, which tolerates latency in a way tensor parallelism does not.
-
-The things we have not solved are written down in
-[OPEN_PROBLEMS.md](OPEN_PROBLEMS.md), each naming the file that implements
-today's inadequate answer.
-
----
+The aim, which is a bet and not a shipped feature: an internet of intelligence
+that nobody owns. Unsolved parts are in [OPEN_PROBLEMS.md](OPEN_PROBLEMS.md).
 
 > **HART** = the bare engine (run from this repo, listens on `:6777`). There is
 > no published PyPI package yet, so install it from source as shown below.
@@ -129,7 +78,7 @@ This README is written to be read by people and by agents alike. Every capabilit
 
 ## Table of Contents
 
-- [What you get on an ordinary Tuesday](#what-you-get-on-an-ordinary-tuesday)
+- [What it is](#what-it-is)
 - [Why HART OS?](#why-hart-os)
 - [Open problems](OPEN_PROBLEMS.md) — what we have not solved
 - [Start it](#start-it)
@@ -160,7 +109,7 @@ bundle a model or hold an API key — it asks the OS, and the OS decides which
 model answers, running locally where it can. Ten apps on one machine do not
 each load their own copy or each pay their own bill.
 
-That has a practical consequence worth stating plainly: **every device
+A practical consequence: **every device
 becomes the same target.** The runtime driving a laptop is the runtime
 driving a robot, so a robot's AI access is just another Model Bus call, and
 code written against `:6777/v1/chat/completions` runs unchanged on both.
@@ -174,14 +123,11 @@ most self-contained place to start. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Start it
 
-Honest about the clock: the server is up seconds after the install finishes,
-but the install itself is not quick. `requirements.txt` pins 235 packages and
+The server starts in seconds. The install does not. `requirements.txt` pins 235 packages and
 pulls torch, torchvision, transformers, onnxruntime and scipy, so budget a few
-minutes and a few GB on a first run. This section used to be headed "60-second
-start", which was not true of anything except the last line.
+minutes and a few GB on a first run. It used to say "60-second start", which was wrong.
 
-**Use Python 3.10 or 3.11, and not a newer one.** The `python3.10` in the first
-command is load-bearing rather than decorative. `faiss-cpu==1.7.4` publishes
+**Use Python 3.10 or 3.11, and not a newer one.** The `python3.10` matters. `faiss-cpu==1.7.4` publishes
 wheels for cp37 through cp311 only, so on 3.12 or later the install stops with
 "No matching distribution found for faiss-cpu==1.7.4", which reads like a
 broken repository rather than a version mismatch. If your system python is
