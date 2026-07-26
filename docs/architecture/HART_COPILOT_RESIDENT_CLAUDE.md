@@ -1,9 +1,9 @@
-# HART Co-Pilot — Claude Code resident inside HART OS
+# HART Co-Pilot: Claude Code resident inside HART OS
 
 **Status:** module built, flake-eval green (`03cd1cbb`), ISO build pending.
 **Date:** 2026-07-26/27.
 **Steward's ask:** *"claude code shd be the co-pilot of HARTOS fixing and
-bootstrapping it"* — living in the node's own Linux/Nix terminal, *"achieving all
+bootstrapping it"*, living in the node's own Linux/Nix terminal, *"achieving all
 the seeded goals as its own"*, *"via the guardrails HARTOS has"*.
 
 ---
@@ -27,7 +27,7 @@ Translated into architecture:
 | Principle | Implementation |
 |---|---|
 | Not a maximizer | The co-pilot does **not** choose its own objective. Its queue is the **seeded goals** the fleet already agreed on. |
-| Acts fluently as a person | It edits, tests, and **commits under the steward's identity** — the repo rule is already *no `Co-Authored-By: Claude`* (`feedback_no_coauthor.md`). Delegation, not deception. |
+| Acts fluently as a person | It edits, tests, and **commits under the steward's identity**. The repo rule is already *no `Co-Authored-By: Claude`* (`feedback_no_coauthor.md`). Delegation, not deception. |
 | Where important, the outcome is unchanged | **Merge, OTA publish, and master-key signing stay human/democratic.** The agent proposes; a human disposes. |
 | Value flows to people | Work is attributed through the existing Spark / 90-9-1 rails, not captured by the daemon. |
 
@@ -48,7 +48,7 @@ build-from-scratch. Verified this session:
 | Piece | Where | Note |
 |---|---|---|
 | **`ClaudeHiveSession`** | `integrations/coding_agent/claude_hive_session.py:81` | Claude Code joining the hive as a worker is **already a protocol**: connect → receive task → execute → report → earn Spark, over PeerLink, shard-engine privacy filtering, **master-key verification on task origin**. Its own docstring already states the boundary: *"All code changes require user approval before commit."* |
-| **The 71 seeded goals** | `integrations/agent_engine/goal_seeding.py:18` (consumed `:2169`) | `SEED_BOOTSTRAP_GOALS`, **71 entries** — matches the "~70 recipes fleet-wide" objective in `CLAUDE.md`. Already sharded deterministically across peers by `sha256(slug) % N`. |
+| **The 71 seeded goals** | `integrations/agent_engine/goal_seeding.py:18` (consumed `:2169`) | `SEED_BOOTSTRAP_GOALS`, **71 entries**, matching the "~70 recipes fleet-wide" objective in `CLAUDE.md`. Already sharded deterministically across peers by `sha256(slug) % N`. |
 | **The guardrails** | `security/hive_guardrails.py` | The constitutional layer every action passes. |
 | **The one pipeline** | `POST /chat`, `dispatch.py::dispatch_goal` | Per the Hive Collab Bootstrap: agentic work has exactly one execution path. |
 | **Idle-compute loop** | `integrations/coding_agent/coding_daemon.py` | Existing background worker. |
@@ -58,7 +58,7 @@ build-from-scratch. Verified this session:
 | Gap | Status |
 |---|---|
 | `claude-code` not packaged for the node | **CLOSED** by this work (see §3) |
-| `hart hive connect` CLI | **STILL OPEN** — `claude_hive_session.py`'s docstring advertises it; `hart_cli.py` has no `hive` command. This is the one wire between the co-pilot and its shard of the 71 goals. |
+| `hart hive connect` CLI | **STILL OPEN**. `claude_hive_session.py`'s docstring advertises it; `hart_cli.py` has no `hive` command. This is the one wire between the co-pilot and its shard of the 71 goals. |
 | Persistent credential on the node | **BLOCKED on the installed image** (see §6) |
 
 ---
@@ -74,8 +74,8 @@ claude          # the co-pilot itself, in the terminal
 hart-copilot    # opens it BOUNDED: writable checkout, fresh branch, boundary printed
 ```
 
-**Packaging — no packaging work was needed.** `claude-code` is absent from the
-pinned 24.11 nixpkgs but present in **25.05** — the input this flake *already*
+**Packaging: no packaging work was needed.** `claude-code` is absent from the
+pinned 24.11 nixpkgs but present in **25.05**, the input this flake *already*
 threads through for Rust:
 
 - flake inputs: `nixpkgs` = `50ab793` (24.11), `nixpkgs-rust` = `ac62194c…` (25.05)
@@ -83,15 +83,15 @@ threads through for Rust:
   (`buildNpmPackage`, `mainProgram = "claude"`, `license = unfree`)
 - the flake already sets `allowUnfree = true` (`flake.nix:363`)
 
-So it is instantiated with the **same pattern as `hart-comp`'s `rust_1_88`** — one
+So it is instantiated with the **same pattern as `hart-comp`'s `rust_1_88`**, one
 way this repo reaches the newer nixpkgs, no third nixpkgs, nothing vendored.
 
-**Boundary made mechanical, not advisory** — `hart-copilot`:
+**Boundary made mechanical, not advisory.** `hart-copilot`:
 
 1. clones/updates a **writable** checkout (`~/HARTOS`). The nix store is read-only,
    so the co-pilot *structurally cannot* mutate the running system's source in place;
    its output ships back the normal way (branch → human merge → OTA).
-2. **checks out a fresh branch** (`copilot/<timestamp>`) before handing over — it can
+2. **checks out a fresh branch** (`copilot/<timestamp>`) before handing over, so it can
    never be sitting on `main`.
 3. prints the boundary contract, then `exec`s `claude` in that directory.
 
@@ -99,7 +99,7 @@ way this repo reaches the newer nixpkgs, no third nixpkgs, nothing vendored.
 `configurations/desktop.nix`. Defaults **OFF**, so a normal build is byte-identical
 and carries none of the closure.
 
-**Robustness:** `claudePkg` is `lib.optionals`-guarded — if the upstream attribute
+**Robustness:** `claudePkg` is `lib.optionals`-guarded. If the upstream attribute
 ever disappears, the failure is a readable assertion instead of an eval crash on
 `lib.getExe null`.
 
@@ -114,7 +114,7 @@ ever disappears, the failure is a readable assertion instead of an eval crash on
 ```bash
 hart-copilot          # bounded: writable clone, fresh branch, boundary printed
 # first run only:
-claude                # then /login  (OAuth — NO API key is baked into the image)
+claude                # then /login  (OAuth, and NO API key is baked into the image)
 ```
 
 Then the co-pilot works normally: read the live journal, reproduce, fix, run tests,
@@ -139,7 +139,7 @@ does to a human one.
 ## 6. Known caveats (honest)
 
 1. **The login does not survive a reboot on the live ISO.** The ISO's home is
-   **tmpfs**. Persistence requires the **installed writable-root image** — which
+   **tmpfs**. Persistence requires the **installed writable-root image**, which
    makes the raw-desktop / systemd-repart work (already committed and eval-green) a
    hard prerequisite for an unattended resident co-pilot, not just a nicety.
 2. **Closure weight.** This adds node + `claude-code` to `iso-desktop`. The flake
@@ -148,7 +148,8 @@ does to a human one.
    iso-desktop ×4" lesson.
 3. **The node is an 8 GB potato.** A resident co-pilot competes with the OS for RAM.
    If that bites, the alternative topology is Claude Code on the steward's box
-   driving the node over OTA — same loop, no on-device credential, no RAM contention.
+   driving the node over OTA. Same loop, with no credential sitting on the
+   device and nothing competing for its RAM.
 
 ---
 
@@ -157,9 +158,9 @@ does to a human one.
 | # | Item | Why it matters |
 |---|---|---|
 | 1 | **`hart hive connect` CLI** | The single missing wire. Everything it would call (`ClaudeHiveSession`, the deterministic shard, `dispatch_goal`) already exists. This is what turns "Claude in the terminal" into "achieving the seeded goals as its own". |
-| 2 | **Installed writable-root image** | Makes the credential (and any state) persist — prerequisite for unattended operation. |
+| 2 | **Installed writable-root image** | Makes the credential (and any state) persist. Prerequisite for unattended operation. |
 | 3 | **Full `iso-desktop` build green** | Confirms the closure fits. |
-| 4 | *(optional)* systemd daemon mode | Only after 1–3, and only with the branch-only boundary preserved. |
+| 4 | *(optional)* systemd daemon mode | Only after 1 to 3, and only with the branch-only boundary preserved. |
 
 ---
 
@@ -168,6 +169,6 @@ does to a human one.
 - `hart-copilot` launcher body: `bash -n` clean.
 - Nix brace/paren balance checked on all three touched files.
 - `tests/unit/test_nix_embedded_python_parses.py`: 16 passed.
-- **CI flake evaluation: GREEN** (`03cd1cbb`) — the authoritative structural gate,
+- **CI flake evaluation: GREEN** (`03cd1cbb`), the authoritative structural gate,
   since local Nix cannot evaluate on the Windows dev box.
 - Full `iso-desktop` build: **pending**.
