@@ -166,7 +166,7 @@ is what `GET /api/social/channels/catalog` serves.
 
 | | What it does | Where |
 |---|---|---|
-| **HiveGuardrails** | 10-class guardrail network. Frozen Python (`__slots__=()`, blocked `__setattr__`), SHA-256 hash verified at boot + every 300 s. Gossip peers reject mismatched hashes. | `security/hive_guardrails.py` |
+| **HiveGuardrails** | 33 immutable constitutional rules across 9 guardrail classes, 8 of which vote in the `GuardrailNetwork` consensus (TrustQuarantine acts rather than scores, and is called from `integrity_service.py`). Frozen Python (`__slots__=()`, blocked `__setattr__`), SHA-256 hash verified at boot and every 300 s, enforcement toggled by `HEVOLVE_GUARDRAIL_HASH_ENFORCE`. Gossip peers reject mismatched hashes. | `security/hive_guardrails.py` |
 | **MasterKey** | Ed25519. Signs releases, triggers `HiveCircuitBreaker` (network-wide kill switch). `MASTER_PUBLIC_KEY_HEX` is the immutable trust anchor. | `security/master_key.py` |
 | **3-tier cert chain** | central -> regional -> local, short-TTL local certs | `security/key_delegation.py` |
 | **RuntimeMonitor** | Background tamper-detection daemon, frozen-thread detection, auto-restart | `security/runtime_monitor.py`, `security/node_watchdog.py` |
@@ -215,7 +215,7 @@ is what `GET /api/social/channels/catalog` serves.
 | **Theme service** | EventBus-driven theme distribution | `theme_service.py` |
 | **Native remote desktop** | RustDesk + Sunshine wrappers, 3-tier transport (DirectWS / WAMP / WireGuard), OTP session auth, DLP scan, peripheral bridge, DLNA casting | `integrations/remote_desktop/` |
 | **System panels** | 36 panels (model catalog, channel pairing, agent dashboard, hive view, ...) | `shell_manifest.py` |
-| **Unified hart CLI** | 21 subcommands: chat, code, social, agent, expert, pay, mcp, compute, channel, a2a, skill, voice, vision, desktop, remote, screenshot, tools, recipe, status, repomap, schedule, zeroshot | `hart_cli.py` |
+| **Unified hart CLI** | 24 subcommands: `a2a`, `agent`, `channel`, `chat`, `code`, `compute`, `desktop`, `expert`, `mcp`, `model`, `pay`, `recipe`, `remote`, `remote-desktop`, `repomap`, `schedule`, `screenshot`, `skill`, `social`, `status`, `tools`, `vision`, `voice`, `zeroshot` | `hart_cli.py` |
 
 ### Vision + robotics
 
