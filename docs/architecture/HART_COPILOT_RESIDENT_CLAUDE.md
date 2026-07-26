@@ -171,9 +171,22 @@ does to a human one.
 - `tests/unit/test_nix_embedded_python_parses.py`: 16 passed.
 - **CI flake evaluation: GREEN** (`03cd1cbb`), the authoritative structural gate,
   since local Nix cannot evaluate on the Windows dev box.
-- `hart hive` group: runs. `hart hive --help` lists all seven subcommands,
-  `hart hive status` against no server prints `Error: Cannot connect to
-  http://localhost:6777` and the `--json` form returns that as JSON, so the
-  failure path is a message rather than a traceback. Not yet exercised against
-  a live dispatcher, which is the real test.
+- `hart hive` group: driven end to end against a real server. A minimal Flask
+  app serving only `claude_hive_session.get_blueprint()` was stood up on
+  :6799, and every subcommand was run against it. connect returned a session
+  id, status reported `idle` with the scope that was asked for, scope changed
+  it, pause moved the session to `paused` and resume back to `idle`, tasks
+  reported none, disconnect returned it to `disconnected`, an invalid scope
+  was rejected by click before any request left the machine, and with the
+  server stopped the CLI printed `Cannot connect` and exited 1.
+
+  That run caught a real bug. The first version of `hive status` branched on a
+  `connected` boolean and read `tasks_completed` from the top level. The
+  payload has neither: `status` is one of disconnected / connecting / idle /
+  working / paused, and the counters are nested under `stats`. So status would
+  have printed "Not connected" immediately after a successful connect. It
+  parsed, it ran, it gave a clean error against no server, and it was wrong.
+
+  Still not done: a live dispatcher actually sending this session a task. That
+  is the test that matters and it has not been run.
 - Full `iso-desktop` build: **pending**.

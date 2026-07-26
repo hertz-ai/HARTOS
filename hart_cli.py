@@ -2543,14 +2543,22 @@ def hive_status(ctx):
     result = _api_get(f'{server}/api/hive/session/status', json_output)
     if result is None or json_output:
         return
-    if not result.get('connected'):
+    # get_status() reports `status` in disconnected/connecting/idle/working/
+    # paused. There is no `connected` boolean, and the counters live under
+    # `stats`, not at the top level.
+    state = result.get('status', 'unknown')
+    if state == 'disconnected':
         click.echo('Not connected. Run: hart hive connect')
         return
-    click.echo(f"Connected   {result.get('session_id', '')}")
-    for label, key in (('Scope', 'task_scope'), ('State', 'state'),
-                       ('Tasks done', 'tasks_completed'), ('Spark', 'spark_earned')):
-        if key in result:
-            click.echo(f"{label:11} {result[key]}")
+    stats = result.get('stats') or {}
+    click.echo(f"{state}  {result.get('session_id', '')}")
+    click.echo(f"Scope       {result.get('task_scope', '?')}")
+    click.echo(f"Pending     {result.get('pending_tasks', 0)}")
+    click.echo(f"Completed   {stats.get('tasks_completed', 0)}"
+               f"  (failed {stats.get('tasks_failed', 0)})")
+    click.echo(f"Spark       {stats.get('spark_earned', 0)}")
+    if result.get('current_task'):
+        click.echo(f"Working on  {result['current_task']}")
 
 
 @hive.command('tasks')
@@ -2561,13 +2569,19 @@ def hive_tasks(ctx):
     result = _api_get(f'{server}/api/hive/session/tasks', json_output)
     if result is None or json_output:
         return
-    tasks = result.get('tasks', [])
-    if not tasks:
+    # get_tasks() returns {'pending': [...], 'completed': [...]}
+    pending = result.get('pending') or []
+    completed = result.get('completed') or []
+    if not pending and not completed:
         click.echo('No tasks yet.')
         return
-    for t in tasks:
-        click.echo(f"{t.get('task_id', '?'):>12}  {t.get('status', '?'):<12} "
-                   f"{str(t.get('description', ''))[:56]}")
+    for t in pending:
+        click.echo(f"pending     {t.get('task_id', '?')}  "
+                   f"{str(t.get('description', ''))[:52]}")
+    for t in completed:
+        click.echo(f"{str(t.get('status', 'done')):<11} {t.get('task_id', '?')}  "
+                   f"quality {t.get('quality_score', '-')}  "
+                   f"spark {t.get('spark_reward', '-')}")
 
 
 @hive.command('scope')
