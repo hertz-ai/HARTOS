@@ -48,7 +48,7 @@ def init_social(app):
         _os_boot.environ['HEVOLVE_DEV_MODE'] = 'false'
         logger.critical("SECURITY: Dev mode FORCED OFF on central instance")
 
-    from .models import init_db, DB_PATH
+    from .models import init_db, DB_PATH, Base, get_engine
     try:
         init_db()
         # Apply pending schema migrations against the canonical DB so a
@@ -59,8 +59,39 @@ def init_social(app):
         from .migrations import run_migrations
         run_migrations()
         logger.info(f"HevolveSocial database initialized + migrated ({DB_PATH})")
-    except Exception as e:
-        logger.warning(f"HevolveSocial DB init failed (non-fatal): {e}")
+
+        # Schema drift diagnostic — surfaces the `no such table: agent_goals`
+        # class of runtime failures at boot instead of at first API call.
+        # ORM-registered tables vs actually-present DB tables. Any diff means
+        # a class didn't register with Base.metadata before create_all fired
+        # (usually a fallback-import path the try/except at models.py:231
+        # didn't take on this deploy) — logged so the journal names the
+        # missing tables next boot.
+        try:
+            from sqlalchemy import inspect as _sa_inspect
+            _eng = get_engine()
+            _expected = set(Base.metadata.tables.keys())
+            _actual = set(_sa_inspect(_eng).get_table_names())
+            _missing = _expected - _actual
+            _orphan = _actual - _expected
+            if _missing:
+                logger.error(
+                    "HevolveSocial schema drift: %d ORM tables NOT in DB: %s",
+                    len(_missing), sorted(_missing))
+            if _orphan:
+                logger.info(
+                    "HevolveSocial: %d DB tables not in ORM: %s",
+                    len(_orphan), sorted(_orphan))
+            logger.info(
+                "HevolveSocial schema check: %d ORM classes registered, %d DB tables present",
+                len(_expected), len(_actual))
+        except Exception as _diag_e:
+            logger.warning("HevolveSocial schema diagnostic failed: %s", _diag_e)
+    except Exception:
+        # Elevated from warning to exception: init_db / run_migrations failure
+        # was silently masking `no such table` runtime errors seen on the ISO
+        # (2026-07-25). Full traceback in the journal now.
+        logger.exception("HevolveSocial DB init failed (non-fatal but degrades /api/social/*)")
 
     # Phase 7a / Phase 8 — install global tenant filter on Session.
     # Migration v40 added `tenant_id` columns to ~34 social tables;

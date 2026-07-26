@@ -1,3 +1,12 @@
+# Defer annotation evaluation to string form so `autogen = None` (when the
+# package is absent from the Nix env — see nixos/packages/hart-app.nix:89) does
+# not blow up at module load when Python evaluates the type annotation on
+# `create_agents_for_user(...) -> Tuple[autogen.AssistantAgent, ...]`. Without
+# this, /chat 500s with `AttributeError: 'NoneType' object has no attribute
+# 'AssistantAgent'` because the annotation dereferences the None sentinel that
+# our own try/except above installs. PEP 563 stringifies all annotations here.
+from __future__ import annotations
+
 from typing import Any, Dict, Tuple
 import os
 from flask import current_app

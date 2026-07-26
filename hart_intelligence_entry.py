@@ -978,8 +978,12 @@ try:
     app.register_blueprint(social_bp)
     init_social(app)
     app.logger.info("HevolveSocial registered at /api/social")
-except Exception as e:
-    app.logger.warning(f"HevolveSocial init skipped (non-critical): {e}")
+except Exception:
+    # Elevated from warning to exception: the "non-critical" swallow masked
+    # the `no such table: agent_goals` cascade seen on the ISO (2026-07-25);
+    # the /api/social/dashboard/* 500s made the shell dashboard unusable.
+    # Full traceback in the journal makes the root cause visible next boot.
+    app.logger.exception("HevolveSocial init failed (blueprints may be partially wired)")
 
 try:
     from integrations.distributed_agent import distributed_agent_bp
