@@ -129,7 +129,7 @@ Back to the [README](README.md).
 
 | | What it does | Where |
 |---|---|---|
-| **3-tier topology** | flat (single device, SQLite WAL) -> regional (LAN/VPN, MySQL QueuePool) -> central (cloud, Docker mesh) | env-detected, single code path |
+| **Topology mode** | Where a node sits in the network: `flat` (default) / `regional` / `central`, plus `local`. Set by `HEVOLVE_NODE_TIER`. Independent of capability tier, and only `flat` is self-declarable. [Details](#topology) | `security/key_delegation.py` |
 | **SmartLedger** | 15-state task lifecycle, parallel + sequential dispatch, ledger persistence per user | `helper_ledger.py`, `lifecycle_hooks.py` |
 | **ComputeMesh** | Match compute supply (idle GPUs, Nunba desktops) to demand (inference, training, experiments) | `compute_mesh_service.py` |
 | **ComputeEscrow** | Persistent escrow for pledged compute, replaces in-memory `_compute_debts` | (DB table in `models.py`) |
@@ -262,7 +262,8 @@ HART OS  (port 6777)
 |-- Hive              PeerLink P2P (NAT-traversed) . FederatedAggregator (equal-weighted)
 |                     Gossip + verification . hash-gated handshake . EventBus + WAMP bridge
 |-- Idea Engine       Thought experiments . ComputePledge . type-aware agents . Hive View
-|-- Compute           3-tier topology (flat/regional/central) . SmartLedger . ComputeMesh . ComputeEscrow
+|-- Compute           Topology mode (flat default, regional/central cert-gated) . SmartLedger
+|                     ComputeMesh . ComputeEscrow
 |-- Economics         AdService (70/50) . RevenueAggregator (90/9/1) . log-scaled compute democracy
 |-- Security          33 guardrails . Ed25519 master key . 3-tier cert chain . RuntimeMonitor
 |                     ImmutableAuditLog . tool allowlist . ActionClassifier . DLP . rate limiter
@@ -372,13 +373,38 @@ PeerLink is wired into bootstrap, gossip, federation, compute_mesh, world_model_
 
 ## Topology
 
-| | Storage | Network | Use case |
-|---|---|---|---|
-| `flat` | SQLite WAL | localhost | Single device, laptop, Raspberry Pi, Nunba desktop |
-| `regional` | MySQL QueuePool | LAN / VPN | Office cluster, family hive, edge node |
-| `central` | MySQL + Docker | public mesh | Federated cloud workers |
+Topology mode is **where a node sits in the network**, and nothing else. It is
+set by `HEVOLVE_NODE_TIER` and defaults to `flat`
+(`security/key_delegation.py:103`).
 
-Same code path. Env-detected at boot via `HART_OS_MODE` or `/etc/os-release ID=hart-os`. Port resolution: override > env var > OS / app mode default.
+It is not the same axis as capability tier, which is read off the hardware, or
+model tier, which classifies backends. `security/system_requirements.py:67`
+carries the glossary for all three and says plainly not to mix them. An earlier
+version of this page mixed them anyway, describing topology in terms of machine
+size and storage engine, and cited `HART_OS_MODE`, which is a boolean that
+decides port defaults and has nothing to do with topology. Both were wrong.
+
+| Mode | What it means | How a node gets it | Link budget |
+|---|---|---|---|
+| `flat` | No position in a hierarchy. The default, and the fallback for everything else. | Self-declared. | 10 |
+| `regional` | Relays for the nodes below it. | Needs `HEVOLVE_REGIONAL_CERT` pointing at a real file, else falls back to `flat`. | 50 |
+| `central` | Holds the trust anchor. | Auto-promoted only when `HEVOLVE_MASTER_PRIVATE_KEY` matches `MASTER_PUBLIC_KEY_HEX`. Claiming it without the key logs critical and falls back to `flat`. | 200 |
+| `local` | Accepted by the code, absent from the glossary. See below. | Self-declared. | n/a |
+
+**Only `flat` is self-declarable.** The other two are cryptographically gated,
+so a node cannot promote itself by editing an env var. All modes participate
+equally in hive consensus, and the link budget is a connection cap rather than
+a vote weight.
+
+Two things here do not line up. Both are real and both want an issue rather
+than a quiet edit:
+
+- `get_node_tier()` accepts `local` at `key_delegation.py:156`, but the
+  glossary at `system_requirements.py:79` lists only flat, regional and
+  central.
+- The comment above the central branch says "reject and refuse to start" while
+  the code returns `'flat'` at `key_delegation.py:144`. The fallback is the
+  real behaviour and the comment is stale.
 
 ---
 

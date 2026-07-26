@@ -113,13 +113,19 @@ target. The runtime driving a laptop is the runtime driving a robot, so a
 robot's AI access is just another Model Bus call, and code written against
 `:6777/v1/chat/completions` runs unchanged on both.
 
-It is one Python codebase in three shapes (flat laptop, regional LAN, central
-cloud mesh) that federates over PeerLink, a direct peer-to-peer WebSocket with
-no broker in the middle. A boot-time guardrail hash re-checked every 300
-seconds, plus Ed25519 release signing, keep humans in control. Nodes improve
-themselves from their own use, locally, and that is a toggle you can switch
-off, because an operating system that describes itself as alive should come
-with an off switch.
+It is one Python codebase that federates over PeerLink, a direct peer-to-peer
+WebSocket with no broker in the middle. Two things vary per node and they are
+independent of each other. What a node **can** do is a capability tier read off
+its hardware. Where a node **sits** in the network is a topology mode set by
+`HEVOLVE_NODE_TIER`, and only `flat` is self-declared. `regional` needs a
+certificate issued by central, `central` needs the Ed25519 master private key,
+and a node claiming either without the proof falls back to `flat` and logs why
+(`security/key_delegation.py:103`).
+
+A boot-time guardrail hash re-checked every 300 seconds, plus Ed25519 release
+signing, keep humans in control. Nodes improve themselves from their own use,
+locally, and that is a toggle you can switch off, because an operating system
+that describes itself as alive should come with an off switch.
 
 **[Full capability map →](CAPABILITIES.md)** . Every subsystem with the file
 that implements it: agent runtime, auto-evolve, federation, 31 channel
