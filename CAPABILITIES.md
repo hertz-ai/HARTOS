@@ -290,7 +290,7 @@ HART OS  (port 6777)
 |-- HevolveArmor      AES-256-GCM modules . BCC compile-to-C . RFT AST renaming . anti-debug
 |-- Platform          ServiceRegistry . AppRegistry . AppManifest . Bootstrap . EnvironmentManager
 |-- Desktop           Shell APIs . app installer . NixOS modules . LiquidUI . themes . remote desktop
-|-- CLI               hart (21 subcommands) . OpenAI-compatible client . Aider in-process backend
+|-- CLI               hart (24 subcommands) . OpenAI-compatible client . Aider in-process backend
 `-- Other             AP2 . Google A2A . MCP . skills . marketing . trading . coding agent . vision
 ```
 
