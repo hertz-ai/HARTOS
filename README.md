@@ -13,9 +13,19 @@
 ### Why this exists
 
 The most capable AI now lives inside a handful of organisations that can put
-enough compute in one building. That concentration is an architectural choice
-rather than a law of physics, and it decides what the models will refuse, what
-they cost, and who gets to read what you type.
+enough compute in one building.
+
+Putting it in one building is physics. Training needs tight interconnect, the
+lane between two accelerators gets slower the further apart they are, and no
+amount of software argues with that. An earlier version of this paragraph
+claimed the concentration was "an architectural choice rather than a law of
+physics", which was wrong, and a reader on Hacker News was right to say so.
+
+What is not physics is who ends up owning the result. Interconnect explains
+why the training cluster is dense. It does not explain why the weights, the
+refusal policy, the price and the logs of what you typed all have to stay with
+whoever paid for the cluster. Those are choices, and they are the ones this
+project is arguing with.
 
 Two different locks are usually treated as one. There is the capital lock, the
 compute it takes to pretrain a frontier model, and there is the silicon lock,
