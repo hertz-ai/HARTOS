@@ -52,6 +52,14 @@ This README is written to be read by people and by agents alike. Every capabilit
 > adapters are in daily use; APIs still move. Issues and PRs are genuinely
 > wanted — see [Contributing](CONTRIBUTING.md).
 >
+> **Want something concrete to pick up?**
+> [good first issue](https://github.com/hertz-ai/HARTOS/labels/good%20first%20issue)
+> and [help wanted](https://github.com/hertz-ai/HARTOS/labels/help%20wanted)
+> are real gaps rather than manufactured onboarding tasks. Each says what is
+> wrong, why it matters, and what would count as done. A few of them carry the
+> measurement that found the bug, and one names a hypothesis we already ruled
+> out so nobody spends a Saturday re-testing it.
+>
 > **If you would rather argue than patch, start at
 > [Open problems](OPEN_PROBLEMS.md).** Nine things we have not solved, each
 > with the code that implements today's inadequate answer and what would count
