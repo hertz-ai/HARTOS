@@ -35,7 +35,8 @@ today's inadequate answer.
 
 ---
 
-> **HART** = the bare engine (`pip install hart-backend`, listens on `:6777`).
+> **HART** = the bare engine (run from this repo, listens on `:6777`). There is
+> no published PyPI package yet, so install it from source as shown below.
 > **HART OS** = the full AI-native OS. It boots on a laptop, server, or edge node, runs on phones, and reaches into embodied AI, and it ships the agentic Liquid Shell, Model Bus, model catalog, channel pairing, agent dashboard, and hive view.
 > **[Nunba](https://github.com/hertz-ai/Nunba)** = the consumer companion app, one signed client across Windows / macOS / Linux.
 
@@ -66,7 +67,7 @@ This README is written to be read by people and by agents alike. Every capabilit
 
 - [Why HART OS?](#why-hart-os)
 - [Open problems](OPEN_PROBLEMS.md) — what we have not solved
-- [60-second start](#60-second-start)
+- [Start it](#start-it)
 - [How it compares](#how-it-compares)
 - [Capabilities](#capabilities)
 - [Hello, agent](#hello-agent)
@@ -106,11 +107,17 @@ most self-contained place to start. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
-## 60-second start
+## Start it
+
+Honest about the clock: the server is up seconds after the install finishes,
+but the install itself is not quick. `requirements.txt` pins 235 packages and
+pulls torch, torchvision, transformers, onnxruntime and scipy, so budget a few
+minutes and a few GB on a first run. This section used to be headed "60-second
+start", which was not true of anything except the last line.
 
 ```bash
 git clone https://github.com/hertz-ai/HARTOS.git && cd HARTOS
-python3.10 -m venv venv && source venv/Scripts/activate   # Windows: venv\Scripts\activate.bat
+python3.10 -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate.bat
 pip install -r requirements.txt
 echo "OPENAI_API_KEY=sk-..." > .env       # or GROQ_API_KEY, or none for local llama.cpp
 python hart_intelligence_entry.py         # listens on :6777
