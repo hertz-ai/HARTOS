@@ -65,6 +65,7 @@ TASK_TIMEOUT_S = 1800          # hard wall-clock on one Claude run
 NIXOS_REBUILD_TIMEOUT_S = 2700 # hard wall-clock on one activation
 MAX_RUNS_PER_HOUR = 4          # it shares an 8 GB node with the OS it fixes
 REPO = '/var/lib/hart/copilot/HARTOS'   # the daemon's own writable clone
+ORIGIN = 'https://github.com/hertz-ai/HARTOS.git'
 CLAUDE_BIN = 'claude'
 STOP_FILE = '/run/hart/copilot-stop'    # drop this file to halt it, no systemd needed
 FLAKE_ATTR = 'hart-desktop'    # the system this node IS
@@ -217,14 +218,59 @@ def open_pr(branch, title, body):
         return {'ok': False, 'error': str(e)}
 
 
-def current_branch():
-    """The branch the clone is on, so a PR targets what was actually worked on."""
+def _git(*args, timeout=180, cwd=REPO):
+    """One place that shells git, so every call is bounded and its failure is
+    inspectable rather than swallowed."""
+    return subprocess.run(['git', *args], cwd=cwd, capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def ensure_workspace():
+    """Make the daemon's workspace real, because nothing else does.
+
+    The interactive `hart-copilot` launcher clones into the user's home; the daemon
+    runs headless as `hart` with its own StateDirectory and never touches that. On a
+    fresh node /var/lib/hart/copilot exists but is EMPTY, so without this the first
+    run fails on a working directory that is not there.
+
+    Returns (ok, reason). Failure is reported, never silently idled through.
+    """
     try:
-        r = subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-                           cwd=REPO, capture_output=True, text=True, timeout=30)
-        return (r.stdout or '').strip() or None
-    except Exception:
+        if not os.path.isdir(os.path.join(REPO, '.git')):
+            os.makedirs(os.path.dirname(REPO), exist_ok=True)
+            r = _git('clone', '--depth', '50', ORIGIN, REPO, cwd=None, timeout=900)
+            if r.returncode != 0:
+                return False, 'clone failed: ' + (r.stderr or '')[-300:]
+            return True, 'cloned'
+        r = _git('fetch', '--depth', '50', 'origin', PR_BASE)
+        if r.returncode != 0:
+            return False, 'fetch failed: ' + (r.stderr or '')[-300:]
+        return True, 'fetched'
+    except subprocess.TimeoutExpired:
+        return False, 'git timed out preparing the workspace'
+    except Exception as e:
+        return False, str(e)
+
+
+def start_branch(task):
+    """Put the clone on a FRESH branch cut from origin/main before any work.
+
+    This is what makes "never commit to main" true by construction instead of
+    something checked afterwards: the daemon creates the branch it is going to work
+    on, so the working branch is known rather than discovered, and a stale clone
+    left on some previous branch cannot leak work into the wrong place.
+
+    Returns the branch name, or None if git refused (reported by the caller).
+    """
+    ident = str(task.get('id') or task.get('title') or 'task')
+    slug = ''.join(c if c.isalnum() else '-' for c in ident).strip('-').lower()[:40]
+    branch = f'copilot/{slug or "task"}-{int(time.time())}'
+    r = _git('checkout', '-B', branch, f'origin/{PR_BASE}')
+    if r.returncode != 0:
+        logger.error('copilot: could not start branch %s: %s',
+                     branch, (r.stderr or '').strip()[-300:])
         return None
+    return branch
 
 
 def has_commits_ahead():
@@ -315,11 +361,25 @@ def tick(limiter, dry_run=False):
     if dry_run:
         return {'action': 'would-run', 'task': task.get('id') or task.get('title')}
 
+    # The workspace is the daemon's own responsibility. A failure here is reported,
+    # not idled through: "no clone" and "nothing to do" are different states.
+    ok, reason = ensure_workspace()
+    if not ok:
+        return {'action': 'workspace-error', 'reason': reason}
+
+    # Cut the working branch BEFORE any work. This is what makes "never commit to
+    # main" structural: the branch is created, so it is known, so nothing has to be
+    # checked afterwards.
+    branch = start_branch(task)
+    if not branch:
+        return {'action': 'branch-error', 'reason': 'could not create the working branch'}
+
     limiter.record()
     result = run_claude(build_prompt(task))
     out = {
         'action': 'ran',
         'task': task.get('id') or task.get('title'),
+        'branch': branch,
         'ok': result.get('ok'),
         'error': result.get('error'),
     }
@@ -329,19 +389,17 @@ def tick(limiter, dry_run=False):
     # it, so the next flashed image cannot be tested against it. Only opened when
     # the run succeeded AND there is actually something to review.
     if result.get('ok') and has_commits_ahead():
-        branch = current_branch()
-        if branch and branch != PR_BASE:
-            title = f"copilot: {task.get('title') or task.get('id') or 'node fix'}"
-            body = (
-                "Opened by the resident co-pilot daemon on a HART OS node.\n\n"
-                f"Task: {task.get('id') or ''} {task.get('title') or ''}\n\n"
-                "Verified on the node it was written on, to the extent stated in the "
-                "commits. Merge is a human decision; nothing here has changed what "
-                "any machine boots into.\n"
-            )
-            pr = open_pr(branch, title, body)
-            out['pr'] = pr.get('url') if pr.get('ok') else None
-            out['pr_error'] = pr.get('error')
+        title = f"copilot: {task.get('title') or task.get('id') or 'node fix'}"
+        body = (
+            "Opened by the resident co-pilot daemon on a HART OS node.\n\n"
+            f"Task: {task.get('id') or ''} {task.get('title') or ''}\n\n"
+            "Verified on the node it was written on, to the extent stated in the "
+            "commits. Merge is a human decision; nothing here has changed what "
+            "any machine boots into.\n"
+        )
+        pr = open_pr(branch, title, body)
+        out['pr'] = pr.get('url') if pr.get('ok') else None
+        out['pr_error'] = pr.get('error')
     return out
 
 

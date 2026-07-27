@@ -46,6 +46,11 @@ def _never_really_run_claude(monkeypatch):
     monkeypatch.setattr(d, 'yield_to_user', lambda: False)
     monkeypatch.setattr(d, 'next_task', lambda: None)
     monkeypatch.setattr(d.os.path, 'exists', lambda p: False)
+    # The workspace is real git on a real disk; stub it at its seam so these tests
+    # exercise the DECISION logic, not git.
+    monkeypatch.setattr(d, 'ensure_workspace', lambda: (True, 'stub'))
+    monkeypatch.setattr(d, 'start_branch', lambda task: 'copilot/stub-1')
+    monkeypatch.setattr(d, 'has_commits_ahead', lambda: False)
 
 
 def test_stop_file_halts_before_anything_else(monkeypatch, limiter):
@@ -171,7 +176,7 @@ def test_successful_verified_work_becomes_a_pr(monkeypatch, limiter):
     monkeypatch.setattr(d, 'next_task', lambda: {'id': 't1', 'title': 'fix the meter'})
     monkeypatch.setattr(d, 'run_claude', lambda *a, **k: {'ok': True})
     monkeypatch.setattr(d, 'has_commits_ahead', lambda: True)
-    monkeypatch.setattr(d, 'current_branch', lambda: 'copilot/20260727-010203')
+    monkeypatch.setattr(d, 'start_branch', lambda t: 'copilot/20260727-010203')
     monkeypatch.setattr(d, 'open_pr', fake_pr)
     out = d.tick(limiter)
     assert out['pr'] == 'https://github.com/x/y/pull/1'
@@ -179,13 +184,27 @@ def test_successful_verified_work_becomes_a_pr(monkeypatch, limiter):
     assert 'fix the meter' in seen['title']
 
 
-def test_never_opens_a_pr_from_main(monkeypatch, limiter):
-    """Defence in depth: if the clone somehow sits on main, do not open a PR from
-    it. main is the base, never the head."""
+def test_branch_is_created_from_main_not_discovered(monkeypatch, limiter):
+    """The daemon CUTS its working branch from origin/main before any work, so
+    "never commit to main" is true by construction rather than checked afterwards.
+    A clone left on some previous branch cannot leak work into the wrong place."""
+    seen = {}
     monkeypatch.setattr(d, 'next_task', lambda: {'id': 't1', 'title': 'x'})
     monkeypatch.setattr(d, 'run_claude', lambda *a, **k: {'ok': True})
-    monkeypatch.setattr(d, 'has_commits_ahead', lambda: True)
-    monkeypatch.setattr(d, 'current_branch', lambda: 'main')
-    monkeypatch.setattr(d, 'open_pr', lambda *a, **k: pytest.fail('opened a PR from main'))
+    def _start(task):
+        seen['called'] = True
+        return 'copilot/x-1'
+    monkeypatch.setattr(d, 'start_branch', _start)
     out = d.tick(limiter)
-    assert out['action'] == 'ran'
+    assert seen.get('called') is True
+    assert out['branch'] == 'copilot/x-1'
+
+
+def test_workspace_failure_is_reported_not_idled_through(monkeypatch, limiter):
+    """No clone and nothing to do are different states. A workspace failure says so
+    instead of looking like an idle tick."""
+    monkeypatch.setattr(d, 'next_task', lambda: {'id': 't1', 'title': 'x'})
+    monkeypatch.setattr(d, 'ensure_workspace', lambda: (False, 'clone failed: no network'))
+    out = d.tick(limiter)
+    assert out['action'] == 'workspace-error'
+    assert 'clone failed' in out['reason']
