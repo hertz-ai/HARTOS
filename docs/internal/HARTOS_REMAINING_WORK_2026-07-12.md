@@ -5,8 +5,8 @@ duplicate them). Discipline (binding): reuse-hungry / zero-reinvent / zero-paral
 prove-don't-assert (a pillar is real only when its probe is green AND load-bearing —
 `AI_NATIVE_OS_VISION.md`); every item = a behavioural test + real-HW verify where observable.
 
-Sub-plans this indexes: `LIQUID_UI_AGENTIC_FRAMEWORK_PLAN.md`, `AI_NATIVE_FIRSTBOOT_AND_TIER1_PLAN.md`,
-`NUNBA_NATIVE_DAEMON_PLAN.md`, `docs/design/HOME_DESKTOP_DESIGN_CHECKLIST.md` (item ids), the vision ledger.
+Sub-plans this indexes: `LIQUID_UI_AGENTIC_FRAMEWORK_PLAN.md`, `../architecture/AI_NATIVE_FIRSTBOOT_AND_TIER1_PLAN.md`,
+`../architecture/NUNBA_NATIVE_DAEMON_PLAN.md`, `docs/design/HOME_DESKTOP_DESIGN_CHECKLIST.md` (item ids), the vision ledger.
 
 Legend — **CODE-NOW** (buildable on the dev box) · **CI** (needs nix/node build → CI only) ·
 **HW** (needs a booted target) · **PROOF** (built, needs verification).
@@ -51,7 +51,7 @@ Home: `HOME_DESKTOP_DESIGN_CHECKLIST.md` item ids. Sequence by user-visibility.
 | Vibrant + snappy + hang-free + icons + search | next flash real-HW observation | HW (next flash) |
 
 ## PHASE R3 — CI-BLOCKED (Nunba native daemon; unblock = the nix build)
-Home: `NUNBA_NATIVE_DAEMON_PLAN.md` (A+D done; B/C/F written). Unblock ALL THREE below at once:
+Home: `../architecture/NUNBA_NATIVE_DAEMON_PLAN.md` (A+D done; B/C/F written). Unblock ALL THREE below at once:
 pin `nunbaHash`/`npmDepsHash` for the Nunba rev in ONE commit → green `nix build .#packages.x86_64-linux.nunba`
 via the import-domino loop → flip `desktop.nix nunba.enable=true`.
 | Item | Delivered by the daemon |
@@ -67,7 +67,7 @@ Why blocked: **no nix/node/docker on the dev box** — the FOD hashes can only b
 | Real macOS (Darling) / Android / Wine app INSTALL + run | needs the booted subsystems | boot the ISO with the subsystems armed |
 | 100x profiling (measured) | needs real-HW timing, not a dev-box guess | flash + profile on-device (chat 1.5s / draft 300ms / cache <1ms budgets) |
 | Flatpak end-to-end | code fixed; proof needs a real boot | next flash |
-| First-boot LLM up + online model download + first-connection WIZARD | `hart-llm-provision` exists; the same-boot re-trigger + `hart-gpu-scheduler` NotifyAccess fix + a LightYourHART-served wizard are CODE-NOW, but the LLM-actually-serving proof is HW | see `AI_NATIVE_FIRSTBOOT_AND_TIER1_PLAN.md` P2 |
+| First-boot LLM up + online model download + first-connection WIZARD | `hart-llm-provision` exists; the same-boot re-trigger + `hart-gpu-scheduler` NotifyAccess fix + a LightYourHART-served wizard are CODE-NOW, but the LLM-actually-serving proof is HW | see `../architecture/AI_NATIVE_FIRSTBOOT_AND_TIER1_PLAN.md` P2 |
 
 ## Cross-cutting fixes surfaced by the real-HW journal (CODE-NOW, fold into R1/R2)
 `hart-gpu-scheduler` NotifyAccess=main timeout (coordinate — AI-runtime) · `hart-vision` RO-FS log

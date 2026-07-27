@@ -1,6 +1,6 @@
 # HART OS — Native Architecture: Validation & Test Report (v2)
 
-> **Companion to** [`HART_OS_NATIVE_ARCHITECTURE.md`](HART_OS_NATIVE_ARCHITECTURE.md)
+> **Companion to** [`HART_OS_NATIVE_ARCHITECTURE.md`](../architecture/HART_OS_NATIVE_ARCHITECTURE.md)
 > (the intent-first v2 architecture + phased build plan) and
 > [`../../compositor/ROADMAP.md`](https://github.com/hertz-ai/HARTOS/blob/main/compositor/ROADMAP.md).
 >
