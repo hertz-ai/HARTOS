@@ -436,6 +436,23 @@
     # variants import the installation-CD profile + isoImage UNCONDITIONALLY, so
     # routing them through repart would double-define fileSystems."/"; they migrate
     # only after gaining desktop.nix's `hartImageKind == "iso"` import guard.
+    #
+    # ── THIS IS A PARALLEL PATH, AND IT IS TEMPORARY (Gate 4) ──────────────────
+    # Two ways to build one thing is exactly the drift this repo fights, so the
+    # exit condition is written down rather than left to memory:
+    #
+    #   DELETE the `else nixos-generators` branch below, and this whole `if`, when
+    #   BOTH hold:
+    #     1. repart raw-desktop has actually BUILT and BOOTED (eval green is not
+    #        enough; it has never been built or booted as of 2026-07-27), and
+    #     2. server.nix + edge.nix wrap their CD-profile import and `isoImage`
+    #        block in `lib.optionals (hartImageKind == "iso")`, mirroring
+    #        desktop.nix:65, so repart can own every raw-* variant.
+    #
+    # Until then the old path stays because it is the only PROVEN one, and the new
+    # one is scoped to the single variant that needs the speed. If (1) fails, the
+    # correct move is to delete mkRepartImage instead and keep generators: one
+    # path either way, never two forever.
     mkImage = { system, variant, format, extraModules ? [] }:
       if format == "raw-efi" && variant == "desktop"
       then mkRepartImage { inherit system variant extraModules; }
