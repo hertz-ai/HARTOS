@@ -37,16 +37,16 @@ installer, no Python, and a setup wizard that picks a model for your
 hardware. Everything below this line is for running the runtime itself from
 source.
 
-**What your machine gets you.** At 8GB with no discrete GPU you are on the CPU
-path, running a 0.8B draft alongside a 4B main with speculative decoding
-between them, plus TTS, Whisper and the agent runtime. That is roughly 6.1GB
-resident, and first-token latency lands near 700ms
-([the breakdown](https://hevolve.ai/blog/run-local-ai-on-8gb-ram)).
-
-If you have a CUDA card, `core/gpu_tier.py` is a separate VRAM ladder. Keeping
-draft, main and TTS all resident in VRAM wants about 10GB, and between 4 and
-10GB the GPU path runs the main model alone. A local 7B is what the code calls
-FULL tier, 16GB of RAM and a GPU (`security/system_requirements.py`).
+**What your machine gets you.** The ladder lives in `core/gpu_tier.py`, and
+the frontend badge quotes it rather than paraphrasing. A 10GB+ CUDA card
+unlocks speculative decoding, a 0.8B draft answering while the main model
+verifies, which the tier text puts at roughly 40% faster replies. Between 4
+and 10GB the GPU runs the main model alone. With no CUDA at all, chat runs on
+CPU with a compact model as the main, 0.8B or 2B class, and the model catalog
+treats `main` as a slot any GGUF can take
+(`integrations/service_tools/model_catalog.py`), so swapping the model is
+configuration rather than surgery. A local 7B wants 16GB of RAM and a GPU
+(`security/system_requirements.py`, FULL tier).
 
 The server starts in seconds. The install does not. `requirements.txt` pins
 192 packages and pulls torch, torchvision, transformers, onnxruntime and
