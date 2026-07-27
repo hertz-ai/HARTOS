@@ -168,6 +168,53 @@ compares to the alternatives.
 
 ---
 
+## Against the OS you are running now
+
+Windows and macOS both ship on-device AI now, so the honest comparison is not
+"they are cloud, we are local". Copilot+ runs models on the NPU and Apple
+Intelligence runs them on the Neural Engine. The difference is who the model
+belongs to and what an application is allowed to ask for.
+
+| | HART OS | Windows | macOS | Linux |
+|---|---|---|---|---|
+| Inference is a system service any app can call | yes, Model Bus on `:6777`, OpenAI-compatible | vendor assistant, no general app-facing local inference API | same, Apple Intelligence is Apple's | no, each app brings its own |
+| Model picked from the hardware, automatically | yes (`core/gpu_tier.py`, `vram_manager.py`) | fixed to the shipped model | fixed to the shipped model | manual |
+| Runs Windows, macOS, Linux and Android apps on one box | Wine, Darling, Flatpak/Snap/AppImage/Nix, Waydroid (`app_installer.py`) | Windows plus Linux via WSL, Android partial | macOS, others need a VM | Linux plus Windows via Wine |
+| Finds your other devices and hands a turn to the bigger one | yes (`compute_mesh_service.py`, LAN beacon `:6780`, WireGuard off-LAN) | no | Continuity relays tasks, not inference | no |
+| Federates with other people's nodes | yes, PeerLink, no broker | no | no | no |
+| Consent is a system primitive, not a per-app prompt | append-only, JWT-authed, fanned out to your devices (`consent_api.py`) | per-app permission prompts | per-app permission prompts | per-app |
+| Learns a task once, replays it without re-asking the model | yes (`create_recipe.py` / `reuse_recipe.py`) | no | no | no |
+| Improves itself from its own use, with an off switch | yes, auto-evolve plus `world_model_bridge.py` | no | no | no |
+| Whole thing still works with the network off | yes | assistant degrades | assistant degrades | depends on the app |
+
+Four of those want a caveat, because the table is the flattering version.
+
+**The mesh offloads requests, it does not shard a model.** Peer discovery and
+relay are real and shipped, but `POST /mesh/infer` hands over a whole turn to a
+device that can answer it better. It is not parallax-style layer sharding, and
+nothing here splits one model across machines. The unit of work is a request.
+
+**The hive is orchestration, not a bigger brain.** Many nodes coordinating on
+a goal is not the same as one larger model, and a hard question that needs
+frontier capability still wants a frontier model. What the hive buys you is
+throughput, redundancy and reach across devices you already own.
+
+**Human in the loop is load-bearing, not decoration.** A recipe is learned from
+a real run and replayed, so a wrong recipe replays wrongly until someone
+corrects it. Merging, OTA publishing and release signing stay human by design,
+and the master key is deliberately outside anything the AI can reach.
+
+**Cross-OS app support is per-runtime, not a guarantee.** Wine and Darling
+carry the usual compatibility caveats of Wine and Darling. Darling in
+particular is early, and a macOS app that leans on recent frameworks may not
+run at all.
+
+Every claim above names the file that implements it, and
+[CAPABILITIES.md](CAPABILITIES.md) compares against the agent frameworks
+(OpenAI Agents, LangChain, AutoGen) rather than against operating systems.
+
+---
+
 ### Why it exists
 
 A handful of organisations own the most capable AI, and with it the refusal
