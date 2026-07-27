@@ -68,12 +68,42 @@ line: "Phase 2 stubs for LoRA gradient sync". Byzantine-resilient aggregation,
 differential privacy, gradient compression, all interface definitions and
 placeholders.
 
-So: **the hive learns skills and routing, not weights.** "The hive trains its own
-model" is not a claim this repo can make yet. "The hive learns from every
-interaction and shares what it learns" is, and it is checkable in four channels.
+**Where the learning itself lives.** Not in this repo. Hebbian, Bayesian and
+gradient work is in HevolveAI, a private sibling, loaded at runtime as a
+signature-verified binary with a stub fallback. The seam is
+`security/native_hive_loader.py`, and the README says so under a heading that
+calls it the part we are not comfortable with.
 
-Anyone who reads `federated_gradient_protocol.py` after seeing the stronger claim
-will conclude the rest is inflated too, and they will be reasonable to.
+So the accurate split is: HevolveAI learns, this repo carries what it derives
+between nodes over four channels, and node-to-node weight sync is Phase 2.
+
+### How to describe the closed core in public
+
+A rule worth keeping, because getting it wrong costs more here than anywhere
+else in the project.
+
+HevolveAI is closed. Every property anyone claims about it is unverifiable by
+construction. So a sentence like "plastic, continual, grounded, encoder-free,
+Hebbian forward-pass learning with causal attribution and epistemic awareness"
+is a dozen assertions about a binary nobody can open. Every word can be true and
+it still reads as invented, because there is no way for a reader to find out.
+That is the shape people call slop, and it is what got parodied in the thread.
+
+The README already does the opposite and it is the better model:
+
+> "The learning is not open. Hebbian, Bayesian and gradient code lives in a
+> private repo called HevolveAI, and this runtime loads it as a signed binary
+> and falls back to a stub when it is missing. You can see the seam in
+> `security/native_hive_loader.py`."
+
+Name the mechanism, admit the discomfort, point at the one thing that IS
+checkable: the seam. A reader who opens `native_hive_loader.py` and finds a real
+signature check and a real stub fallback will extend more credit than any list
+of properties earns.
+
+**Describe open parts by what they do and where the file is. Describe the closed
+part by its boundary.** Reaching for "epistemic awareness" about a blob hands a
+thread its best line.
 
 ### Row 16 is the threshold
 
