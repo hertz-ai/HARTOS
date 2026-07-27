@@ -37,8 +37,12 @@ installer, no Python, and a setup wizard that picks a model for your
 hardware. Everything below this line is for running the runtime itself from
 source.
 
-**What your machine gets you.** The ladder lives in `core/gpu_tier.py`, and
-the frontend badge quotes it rather than paraphrasing. A 10GB+ CUDA card
+**What your machine gets you.** Two components decide. `core/gpu_tier.py`
+classifies the hardware into a tier, and the frontend badge quotes its words
+rather than paraphrasing. What actually loads, and onto which device, is the
+VRAM manager's call: it keeps a budget per model, checks fit before anything
+loads, and places each one gpu, cpu-offload or cpu-only
+(`integrations/service_tools/vram_manager.py`). A 10GB+ CUDA card
 unlocks speculative decoding, a 0.8B draft answering while the main model
 verifies, which the tier text puts at roughly 40% faster replies. Between 4
 and 10GB the GPU runs the main model alone. With no CUDA at all, chat runs on
