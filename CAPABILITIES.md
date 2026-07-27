@@ -48,7 +48,7 @@ Back to the [README](README.md).
 | **RSI-2 monotonic gate** | New release must beat prior baseline on every benchmark by configurable margin or PR is rejected | `rsi_trigger.py`, `pr_review_service.py` |
 | **Benchmark registry** | 7 built-in adapters (3 sourced from HevolveAI: QuantiPhy, Embodied, Qwen). Pluggable via `register_adapter()` | `benchmark_registry.py` |
 | **Per-agent baselines** | Per-agent snapshots at `agent_data/baselines/<agent_id>.json`, used as the regression floor | `agent_baseline_service.py` |
-| **Coding benchmark tracker** | SQLite-backed coding benchmarks (`coding_benchmarks.db`), HumanEval / MBPP / custom suites | `integrations/coding_agent/benchmark_tracker.py` |
+| **Coding benchmark tracker** | HumanEval / MBPP / custom suites, stored in SQLite at agent_data/coding_benchmarks.db, which is created on first run and is not in the repo | `integrations/coding_agent/benchmark_tracker.py` |
 | **Hive benchmark prover** | Splits a benchmark across hive nodes, tracks assignments in a ledger, aggregates the scores. Verification is a separate layer, below. | `hive_benchmark_prover.py` |
 | **Fake-score resistance** | Nonce challenge-response with Ed25519 verification (`verify_json_signature`), `stats_probe` and `agent_count_verify` challenge types, and fraud scoring that weights `score_jump` at 10.0 and `challenge_fail` at 15.0 | `integrations/social/integrity_service.py` |
 | **Peer attestation ledger** | `node_attestations` table records `code_hash_match`, `impression_witness`, `stats_verify`, `challenge_pass`, `challenge_fail`. Collusion check fires when >80% of a node's attestations come from one peer | `integrity_service.py`, `_models_local.py:1724` |

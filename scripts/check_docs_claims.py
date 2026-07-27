@@ -68,6 +68,11 @@ def resolve(token: str) -> bool:
     token = token.strip().rstrip(':.,').split(':')[0]
     if not token or '<' in token or '*' in token or token.startswith(('http', '/')):
         return True  # template, glob or URL, not a repo path
+    # Runtime state. agent_data/ is created on first run and is not committed,
+    # so it resolves on a developer's box and not on a clean checkout. That
+    # asymmetry is what let coding_benchmarks.db pass locally and fail in CI.
+    if token.startswith('agent_data/') or token.endswith('.db'):
+        return True
     if os.path.exists(os.path.join(REPO, token)):
         return True
     base = os.path.basename(token.rstrip('/'))
