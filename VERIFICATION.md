@@ -3,9 +3,8 @@
 Every claim this project makes is in one of two tables. The top table has
 evidence you can check today. The bottom table does not.
 
-Two ways to help here. Run an unverified row on hardware we do not have and move
-it up. Or, if you have built systems like this before, tell us where the design
-is wrong.
+Two ways to help. Run an unverified row on hardware we do not have and move it
+up. Or tell us where the design is wrong.
 
 Most of the unverified rows need one thing: hardware that is not a developer
 laptop. A Raspberry Pi, a board with no GPU, a machine with 4 GB. We do not have
@@ -16,23 +15,17 @@ steps, and paste the output. Pass or fail both help. A row that fails moves to
 the top table as a verified negative, with the failure recorded, which is worth
 as much as a pass.
 
-## If you have built an OS before
+## Design review
 
-Read the code as an engineer, not as an auditor. The scheduler, the model bus,
-the session supervisor, the peer transport, the tier ladder: these were built by
-people solving the problem in front of them, and an experienced eye will see
-better designs than the ones we reached for. Faster paths, simpler contracts,
-allocation and IPC choices we got wrong, a primitive that should exist and does
-not.
+Better designs exist for most of what is here. The scheduler, the model bus, the
+session supervisor, the peer transport, the tier ladder were all built by people
+solving the problem in front of them.
 
-Say so. Open an issue, argue for the design, point at the file. You do not need
-a benchmark to start the conversation and you do not need our agreement to
-disagree in public.
+If you see a better one, open an issue, name the file, make the argument. No
+benchmark required.
 
-Good design decisions compound in an OS the way they do nowhere else, because
-everything above them inherits the choice. That makes design review a pillar
-here rather than a courtesy, and it is worth more to this project than another
-feature.
+Design compounds in an OS because everything above a choice inherits it. That
+makes this worth more than another feature.
 
 ---
 
