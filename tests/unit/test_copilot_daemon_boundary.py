@@ -238,9 +238,15 @@ def test_verify_unit_activates_and_cannot_switch():
     """`test` leaves the boot generation alone. `switch` and `boot` do not appear,
     so no agent can reach them through this path however it is prompted."""
     nix = NIX_MODULE.read_text(encoding='utf-8')
-    assert 'hart-copilot-verify' in nix
-    start = nix.split('hart-copilot-verify')[1]
+    # Anchor on the UNIT DEFINITION, not on the first mention of the name: comments
+    # reference the unit before it is defined, so splitting on the bare name
+    # inspected the gap between two comments and passed or failed by accident.
+    marker = 'systemd.services.hart-copilot-verify'
+    assert marker in nix, 'the verify unit is not defined'
+    start = nix.split(marker, 1)[1]
     assert 'nixos-rebuild test' in start
+    # The whole point: the verb is fixed in the unit, so no prompt can reach the
+    # two that would change what the machine boots into.
     assert 'nixos-rebuild switch' not in start
     assert 'nixos-rebuild boot' not in start
 
