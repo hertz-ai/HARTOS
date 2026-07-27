@@ -48,13 +48,9 @@ Ordered by how much a contributor with modest hardware can settle in an evening.
 | 13 | A Reachy Mini runs an agent locally | Drive it through `gpio_adapter.py` / `serial_adapter.py` / `ros_bridge.py`, whichever its stack exposes | Reachy Mini |
 | 14 | **Intelligence compounds between two robots** | Robot A learns a skill by doing. Robot B performs it without having done it. Measure B before and after | 2 Reachy Minis |
 | 15 | A co-pilot's work on one node improves another | Seed a goal on node A only. Show node B starting ahead of where it was | 2 nodes |
-
 | 16 | **Three nodes beat one node** | Same benchmark, one node then three, same models. The crossover the whole design rests on | 3 machines |
 
 ### What "the hive learns" means today, precisely
-
-This matters more than any single row, because getting it wrong in public is
-unrecoverable. Someone will open the file and read the first line.
 
 **Active now (Phase 1).** `federated_aggregator.py` runs four channels: embedding
 deltas (`embedding_delta.py` + `gradient_service.py`), model lifecycle deltas,
@@ -79,15 +75,12 @@ between nodes over four channels, and node-to-node weight sync is Phase 2.
 
 ### How to describe the closed core in public
 
-A rule worth keeping, because getting it wrong costs more here than anywhere
-else in the project.
-
 HevolveAI is closed. Every property anyone claims about it is unverifiable by
 construction. So a sentence like "plastic, continual, grounded, encoder-free,
 Hebbian forward-pass learning with causal attribution and epistemic awareness"
 is a dozen assertions about a binary nobody can open. Every word can be true and
 it still reads as invented, because there is no way for a reader to find out.
-That is the shape people call slop, and it is what got parodied in the thread.
+The HN thread parodied exactly this.
 
 The README already does the opposite and it is the better model:
 
@@ -96,29 +89,23 @@ The README already does the opposite and it is the better model:
 > and falls back to a stub when it is missing. You can see the seam in
 > `security/native_hive_loader.py`."
 
-Name the mechanism, admit the discomfort, point at the one thing that IS
-checkable: the seam. A reader who opens `native_hive_loader.py` and finds a real
-signature check and a real stub fallback will extend more credit than any list
-of properties earns.
+It names the mechanism, states the discomfort, and points at the seam, which is
+the one checkable thing about a closed binary.
 
 **Describe open parts by what they do and where the file is. Describe the closed
-part by its boundary.** Reaching for "epistemic awareness" about a blob hands a
-thread its best line.
+part by its boundary.**
 
 ### Row 16 is the threshold
 
 `hive_benchmark_prover.py` carries a seven-stage convergence ladder, from one
 node at roughly 62% MMLU to a hundred thousand nodes past any single model.
 Stage 2, three nodes ensembling, is where it claims the sum first exceeds the
-single. That is the threshold: below it the hive is a nice idea, above it the
-approach works and the rest is scale.
+single. Below three nodes the effect is unproven; above it the rest is scale.
 
-**Every number in that ladder is a projection.** Not one has been measured. They
-are now marked as such in the source, because a percentage that looks like a
-result and is not is the fastest way to lose a reader who checks.
+**Every number in that ladder is a projection.** Not one has been measured, and
+the source now says so.
 
-Three laptops answer this. It does not need a robot, a Pi or a GPU rack, and it
-is the single cheapest experiment that could refute the project.
+Three laptops answer it. No robot, no Pi, no GPU rack.
 
 **How the node count gets there:** crowdsourced compute, from users and
 developers lending what is idle. `compute_borrowing.py` advertises and settles,
@@ -127,8 +114,7 @@ path, and it only starts paying for itself past this row.
 
 ### Rows 14 and 15 are the thesis
 
-Everything else here is plumbing. These two are the claim the project exists to
-make, and neither has been demonstrated.
+Rows 1 to 13 are plumbing. These two are the claim, and neither is demonstrated.
 
 The mechanism is written. `integrations/agent_engine/world_model_bridge.py`:
 "Every agent interaction becomes training data for continuous learning. Skills
