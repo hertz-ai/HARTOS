@@ -52,6 +52,17 @@ treats `main` as a slot any GGUF can take
 configuration rather than surgery. A local 7B wants 16GB of RAM and a GPU
 (`security/system_requirements.py`, FULL tier).
 
+None of that caps what a node can answer, which is the part worth
+understanding before judging it by its hardware. The agent daemon runs the
+same on any tier, and a turn the local model should not take can be handed
+whole to a peer whose model is bigger. Both halves of that are shipped and
+attached at boot, `hive_capability_advertiser` announcing and
+`hive_expert_discovery` registering what it hears, with the peer's model
+taking the turn directly rather than reviewing a draft. Advertising is opt-in
+per node (`HEVOLVE_HIVE_ADVERTISE=1` and a public endpoint), so on a network
+where nobody has opted in it falls through to local. A modest machine is a
+small model plus a route to a larger one, not a small model on its own.
+
 The server starts in seconds. The install does not. `requirements.txt` pins
 192 packages and pulls torch, torchvision, transformers, onnxruntime and
 scipy, so budget a few minutes and a few GB on a first run.

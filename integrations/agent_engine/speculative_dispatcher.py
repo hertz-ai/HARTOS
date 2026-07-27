@@ -61,15 +61,19 @@ Guardrails at every layer
 - Energy + latency tracking on every model call
 - Per-peer install-validation gate via ``_pass_validation_gate``
 
-Hive expert wiring (subscriber-side complete; producer pending)
----------------------------------------------------------------
+Hive expert wiring (both sides shipped, advertising is opt-in)
+--------------------------------------------------------------
 ``HiveExpertDiscovery`` listens for ``peer.capability.announce`` /
 ``peer.capability.revoke`` on the platform EventBus and auto-registers
 reachable, trust-verified peers as ``ModelTier.EXPERT`` backends.
-Until peers start emitting the announce gossip (producer daemon ships
-separately), ``_pick_expert_for_delegate('hive', ...)`` falls back to
-the local fast model and ``served_by`` in telemetry reads
-``local_langchain_bg`` 100% of the time.
+``hive_capability_advertiser`` is the producer, and
+``core/platform/bootstrap.py`` attaches both at boot.
+
+Advertising is opt-in per node (``HEVOLVE_HIVE_ADVERTISE=1`` plus
+``HEVOLVE_HIVE_PUBLIC_ENDPOINT``), so on a network where no peer has
+opted in, ``_pick_expert_for_delegate('hive', ...)`` falls back to the
+local fast model and ``served_by`` reads ``local_langchain_bg``.  That
+is the default-config path, not a missing feature.
 """
 import atexit
 import json
