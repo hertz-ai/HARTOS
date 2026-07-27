@@ -85,7 +85,22 @@
           Type = "root";          # x86-64 root discoverable-partition GUID
           Format = "ext4";
           Label = "nixos";
-          Minimize = "guess";     # size to the closure; growpart claims the rest on-device
+          # EXPLICIT size, deliberately NOT Minimize. `Minimize = "guess"` looked
+          # right (size the image to the closure) and is what killed two builds:
+          # with no upper bound, systemd-repart probes by creating a 1 TiB ext4
+          # FIRST (268435456 4k blocks, 67M inodes), copying the closure into it,
+          # measuring, then rebuilding minimized. The probe alone costs ~17GB of
+          # inode tables plus a 1GB journal plus the copied closure, on a CI runner
+          # with 103GB free and 42GB already used, and it dies without printing an
+          # error (runs 30263310599 and 30287421697, ~54 minutes each).
+          #
+          # 40G is repart's OWN measured answer for this closure (it minimized to
+          # 9627552 4k blocks = 39.4GB); the extra is slack for closure growth. One
+          # mkfs, no probe, deterministic size. The image ships xz-compressed and
+          # growPartition + autoResize expand the root to fill the real disk on
+          # first boot, so the on-disk size is the target's, not this number.
+          SizeMinBytes = "44G";
+          SizeMaxBytes = "44G";
         };
       };
     };
