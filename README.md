@@ -19,14 +19,9 @@ An assistant that runs on your own machine, with no subscription, that works
 with the wifi off. What you type stays on the device because there is nowhere
 else for it to go, and you can watch the network to check.
 
-**8GB of RAM is enough, and it is worth being exact about what that gets
-you.** At 8GB with no discrete GPU you are on the CPU fallback path with the
-small models, roughly 0.8B to 4B class, plus TTS, Whisper and the agent
-runtime (`security/system_requirements.py`, STANDARD tier). A local 7B wants
-16GB and a GPU, which the code calls FULL tier. Speculative decoding, where a
-draft model answers first, needs about 10GB of VRAM
-(`core/gpu_tier.py`). So it runs on a modest laptop, and on that laptop it is
-the modest version.
+8GB of RAM is enough, and on 8GB it is the modest version. Exactly what you
+get at which spec is in [Start it](#start-it), because that is where it
+matters.
 
 On a hard question a frontier model beats anything that fits on a laptop. Most
 of what people ask in a day is not that, and this is for the rest.
@@ -74,6 +69,13 @@ we are wrong to ship it this way at all.
 ---
 
 ## Start it
+
+**What your machine gets you.** At 8GB with no discrete GPU you are on the CPU
+fallback path with the small models, roughly 0.8B to 4B class, plus TTS,
+Whisper and the agent runtime (`security/system_requirements.py`, STANDARD
+tier). A local 7B wants 16GB and a GPU, which the code calls FULL tier.
+Speculative decoding, where a draft model answers first so replies start fast,
+needs about 10GB of VRAM (`core/gpu_tier.py`).
 
 The server starts in seconds. The install does not. `requirements.txt` pins
 192 packages and pulls torch, torchvision, transformers, onnxruntime and
@@ -136,11 +138,14 @@ locally, and that is a toggle you can switch off, because an operating system
 that describes itself as alive should come with an off switch.
 
 If you think "OS" is doing more work in that name than the code earns, that is
-a reasonable suspicion and **[Is it an OS?](docs/IS_IT_AN_OS.md)** answers it
-with the CI checks rather than adjectives: an initrd boot test, a DRM/KMS
-Wayland compositor built under `--features smithay`, and ten session
-supervisor VM tests covering paint watchdogs, tier drops and the recovery TTY.
-It also lists what is not proven, which is hardware paint on a real GPU.
+a reasonable suspicion and **[Is it an OS?](docs/IS_IT_AN_OS.md)** takes it
+seriously. The compositor does build with Smithay linked, green in CI on
+2026-07-26. There are nineteen nixosTest VM checks covering initrd, paint
+watchdogs, tier drops and the recovery TTY, and that page is blunt that they
+are **defined but not passing**: the suite is manual-dispatch only and has no
+green run. Writing an initrd test still tells you what kind of project this
+is. It does not tell you the boot works, and the page says so rather than
+letting you assume it.
 
 ### Two things people miss
 
@@ -156,11 +161,13 @@ only, so it structurally cannot modify the running system in place, and
 nothing in that path touches `main`. Merging, OTA publishing and release
 signing stay human. Details and the current limits are in
 [the design note](docs/architecture/HART_COPILOT_RESIDENT_CLAUDE.md). The
-module is built and flake-eval green. The login does not yet survive a reboot
-on the live ISO, and one wire (`hart hive connect`) is still missing.
+module is built and flake-eval green, and `hart hive connect` now exists, so
+the session can register with the hive dispatcher and take work. What is
+still missing: no live dispatcher has handed it a task yet, and the login
+does not survive a reboot on the live ISO.
 
-**[Full capability map →](CAPABILITIES.md)** . Every subsystem with the file
-that implements it: agent runtime, auto-evolve, federation, 31 channel
+**[Full capability map →](CAPABILITIES.md)** covers every subsystem with the
+file that implements it: agent runtime, auto-evolve, federation, 31 channel
 adapters, 16 providers, security, economics, the API surface, and how it
 compares to the alternatives.
 
