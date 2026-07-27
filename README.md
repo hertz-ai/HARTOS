@@ -32,11 +32,15 @@ Android. This repo is the runtime underneath it.
 ## Start it
 
 **What your machine gets you.** At 8GB with no discrete GPU you are on the CPU
-fallback path with the small models, roughly 0.8B to 4B class, plus TTS,
-Whisper and the agent runtime (`security/system_requirements.py`, STANDARD
-tier). A local 7B wants 16GB and a GPU, which the code calls FULL tier.
-Speculative decoding, where a draft model answers first so replies start fast,
-needs about 10GB of VRAM (`core/gpu_tier.py`).
+path, running a 0.8B draft alongside a 4B main with speculative decoding
+between them, plus TTS, Whisper and the agent runtime. That is roughly 6.1GB
+resident, and first-token latency lands near 700ms
+([the breakdown](https://hevolve.ai/blog/run-local-ai-on-8gb-ram)).
+
+If you have a CUDA card, `core/gpu_tier.py` is a separate VRAM ladder. Keeping
+draft, main and TTS all resident in VRAM wants about 10GB, and between 4 and
+10GB the GPU path runs the main model alone. A local 7B is what the code calls
+FULL tier, 16GB of RAM and a GPU (`security/system_requirements.py`).
 
 The server starts in seconds. The install does not. `requirements.txt` pins
 192 packages and pulls torch, torchvision, transformers, onnxruntime and
