@@ -185,6 +185,7 @@ belongs to and what an application is allowed to ask for.
 | Consent is a system primitive, not a per-app prompt | append-only, JWT-authed, fanned out to your devices (`consent_api.py`) | per-app permission prompts | per-app permission prompts | per-app |
 | Learns a task once, replays it without re-asking the model | yes (`create_recipe.py` / `reuse_recipe.py`) | no | no | no |
 | Improves itself from its own use, with an off switch | yes, auto-evolve plus `world_model_bridge.py` | no | no | no |
+| An update is a new generation you can roll back in one command | yes, NixOS underneath (`nixos/flake.nix`, 67 modules) | in-place servicing, System Restore is partial | sealed system volume, but no generation rollback | NixOS and Silverblue yes, most distros in-place |
 | Whole thing still works with the network off | yes | assistant degrades | assistant degrades | depends on the app |
 
 Four of those want a caveat, because the table is the flattering version.
@@ -208,6 +209,18 @@ and the master key is deliberately outside anything the AI can reach.
 carry the usual compatibility caveats of Wine and Darling. Darling in
 particular is early, and a macOS app that leans on recent frameworks may not
 run at all.
+
+**The atomic part is Nix's, not ours.** HART OS is built on NixOS, so
+generations, one-command rollback and a read-only store come from underneath
+rather than from anything in this repo. Plain NixOS gives you all three today
+and is the honest recommendation if that is the only thing you want. What sits
+on top here is the update pipeline: BUILD, TEST, AUDIT, BENCHMARK, SIGN,
+CANARY, DEPLOY, where the canary reverts the generation automatically on a
+health regression and the signing step needs the master key, which is held by a
+human and is not reachable by the AI (`nixos/modules/hart-ota.nix`). That
+inheritance is also what makes the copilot boundary above structural rather
+than a promise: the store is read only, so a coding agent cannot modify the
+running system in place even if it tries.
 
 Every claim above names the file that implements it, and
 [CAPABILITIES.md](CAPABILITIES.md) compares against the agent frameworks
