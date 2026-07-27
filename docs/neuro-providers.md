@@ -20,7 +20,7 @@ from integrations.providers.neuro_discovery import scan, known_providers_summary
 |---|---|
 | `neuro_providers.py` | Static `NEURO_REGISTRY` dict + `NeuroProvider` dataclass + filter helpers |
 | `neuro_adapter.py` | `NeuroAdapter` abstract base + `choose_adapter(provider)` factory + per-transport stub adapters |
-| `neuro_discovery.py` | `scan()` — unified fail-soft discovery across BLE, LSL, USB-serial |
+| `neuro_discovery.py` | `scan()`: unified fail-soft discovery across BLE, LSL, USB-serial |
 
 ## Transport decision matrix
 
@@ -46,7 +46,7 @@ from integrations.providers.neuro_discovery import scan, known_providers_summary
 
 ## Yneuro (https://www.yneuro.com/)
 
-Yneuro ships Neuro ID — brainwave-based personal authentication. As of 2026-04 they do not publish a public SDK or API, so the registry entry is `CONTACT_REQUIRED` and `choose_adapter()` returns a `ContactGatedAdapter` that raises `PermissionError` with the vendor's email rather than pretending a client exists. When Yneuro replies to `hello@yneuro.com`, fill in the transport, sample rate, and SDK fields on the registry entry and implement the adapter — the slot is already wired.
+Yneuro ships Neuro ID, brainwave-based personal authentication. As of 2026-04 they do not publish a public SDK or API, so the registry entry is `CONTACT_REQUIRED` and `choose_adapter()` returns a `ContactGatedAdapter` that raises `PermissionError` with the vendor's email rather than pretending a client exists. When Yneuro replies to `hello@yneuro.com`, fill in the transport, sample rate, and SDK fields on the registry entry and implement the adapter; the slot is already wired.
 
 ## Adding a provider in ~30 lines
 
@@ -56,7 +56,7 @@ Yneuro ships Neuro ID — brainwave-based personal authentication. As of 2026-04
 
 ## Auto-discovery
 
-`neuro_discovery.scan()` runs every enabled transport in parallel and returns `(provider_id_or_none, device_info)` tuples. Missing optional dependencies (`bleak`, `pylsl`, `pyserial`) degrade silently — no dep, no crash.
+`neuro_discovery.scan()` runs every enabled transport in parallel and returns `(provider_id_or_none, device_info)` tuples. Missing optional dependencies (`bleak`, `pylsl`, `pyserial`) degrade silently: a transport whose dependency is not installed is skipped instead of raising.
 
 ```python
 from integrations.providers.neuro_discovery import scan
@@ -70,8 +70,8 @@ for provider_id, info in scan():
 
 ## Cross-network reads
 
-Sensor data that crosses the network reuses PeerLink's existing `sensor` channel (`core/peer_link/channels.py`) — E2E-encrypted, already in place. No new wire protocol, no parallel security story.
+Sensor data that crosses the network reuses PeerLink's existing `sensor` channel (`core/peer_link/channels.py`), which is E2E-encrypted and already in place. Nothing here adds a wire protocol or a second security story.
 
 ## Humans-first
 
-Biometric data is the highest-trust data a person can share. Nothing in this stack reads a signal, caches a signal, or transmits a signal without the user's explicit consent flow — same gate the rest of HARTOS uses. The `ContactGatedAdapter` exists precisely because "ask before pretending to integrate" is the correct default when a vendor hasn't published how.
+Biometric data is the highest-trust data a person can share. Nothing in this stack reads, caches, or transmits a signal without the user's explicit consent flow, the same gate the rest of HARTOS uses. The `ContactGatedAdapter` exists because "ask before pretending to integrate" is the right default when a vendor hasn't published how.
