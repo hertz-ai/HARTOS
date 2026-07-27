@@ -1,8 +1,8 @@
 # What is in HART OS
 
 The reference map. Every capability names the file that implements it, so you
-can go from a line in this table to the code without grepping. If you are an
-agent reading this repo, this is the file to read.
+can go from a line in this table to the code without grepping. Start here
+rather than in the source tree.
 
 Back to the [README](README.md).
 
