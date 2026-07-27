@@ -70,6 +70,11 @@ CLAUDE_BIN = 'claude'
 STOP_FILE = '/run/hart/copilot-stop'    # drop this file to halt it, no systemd needed
 FLAKE_ATTR = 'hart-desktop'    # the system this node IS
 PR_BASE = 'main'               # CLAUDE.md: main branch only. Never a variable.
+# The root oneshot that activates a config. Defined in nixos/modules/hart-copilot.nix,
+# where REPO and FLAKE_ATTR above are written into its ExecStart. This daemon runs
+# with NoNewPrivileges and cannot escalate, so triggering that unit is the only way
+# it can activate anything, and it cannot choose the verb.
+VERIFY_UNIT = 'hart-copilot-verify.service'
 
 
 def backend():
@@ -171,10 +176,13 @@ def build_prompt(task):
         f"- This node's live backend is {backend()}; use it to observe real behaviour "
         "rather than guessing.\n"
         "- To test an OS-level change on THIS RUNNING MACHINE, use:\n"
-        f"      sudo nixos-rebuild test --flake {REPO}/nixos#{FLAKE_ATTR}\n"
-        "  `test` activates the change now but does NOT change what the machine\n"
-        "  boots into, so a power cycle undoes it. Never use `switch` or `boot`:\n"
-        "  changing the boot default is a human decision, not yours.\n"
+        f"      systemctl start --wait {VERIFY_UNIT}\n"
+        "  That runs `nixos-rebuild test` on this clone as root. It activates the\n"
+        "  change now but does NOT change what the machine boots into, so a power\n"
+        "  cycle undoes it. `sudo nixos-rebuild` will not work for you and is not\n"
+        "  the path: you have no sudo, and the verb is fixed in that unit, so\n"
+        "  `switch` and `boot` are not available to you at all. Changing the boot\n"
+        "  default is a human decision.\n"
         "- After activating, check the journal for what you changed and confirm the\n"
         "  behaviour actually differs. An unverified fix is not a fix.\n"
         "- If the task is unclear or unsafe, stop and say so instead of improvising.\n"
@@ -298,16 +306,29 @@ def nixos_rebuild_test(timeout_s=NIXOS_REBUILD_TIMEOUT_S):
     Requires the INSTALLED writable-root image. On the live ISO the store is a
     RAM-backed overlay on an 8GB box, so a rebuild will usually fail there; that is
     a real limitation and it is reported, not hidden.
+
+    It does NOT run `sudo nixos-rebuild`, which never worked. The unit runs as
+    `hart` with NoNewPrivileges=true, `sudo` is not on its path, and no sudoers rule
+    grants it anything, so escalation was blocked at the kernel and every call on a
+    real node returned "not a NixOS host?" while sitting on a NixOS host.
+
+    Loosening the daemon to fix that would trade the hardening for the feature. So
+    activation moved into a root oneshot (hart-copilot-verify.service) that accepts
+    NO arguments from here: the flake ref and the verb `test` are written into its
+    ExecStart. An agent that ignores every line of its prompt still cannot ask for
+    `switch` or `boot`, because this function has no argument in which to say it.
+    What the machine boots into stays a human decision by construction rather than
+    by instruction.
     """
-    cmd = ['sudo', '-n', 'nixos-rebuild', 'test', '--flake',
-           f'{REPO}/nixos#{FLAKE_ATTR}']
+    cmd = ['systemctl', 'start', '--wait', VERIFY_UNIT]
     try:
         p = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True,
                            timeout=timeout_s)
         return {'ok': p.returncode == 0, 'returncode': p.returncode,
-                'stderr': (p.stderr or '')[-2000:]}
+                'stderr': ((p.stderr or '').strip()[-2000:] or
+                           f'see: journalctl -u {VERIFY_UNIT}')}
     except FileNotFoundError:
-        return {'ok': False, 'error': 'nixos-rebuild not on PATH (not a NixOS host?)'}
+        return {'ok': False, 'error': 'systemctl not on PATH (not a systemd host?)'}
     except subprocess.TimeoutExpired:
         return {'ok': False, 'error': f'nixos-rebuild test timed out after {timeout_s}s'}
     except Exception as e:

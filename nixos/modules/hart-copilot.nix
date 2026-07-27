@@ -48,6 +48,13 @@ let
   # Guarded: if a future nixpkgs drops/renames the attr, eval must not explode.
   claudePkg = newPkgs.claude-code or null;
 
+  # These two must equal REPO and FLAKE_ATTR in scripts/hart_copilot_daemon.py.
+  # That file states the case for constants over knobs, so they are written twice
+  # rather than plumbed through an env var the daemon does not read.
+  # tests/unit/test_copilot_daemon_boundary.py asserts the two stay equal.
+  copilotRepo = "/var/lib/hart/copilot/HARTOS";
+  copilotFlakeAttr = "hart-desktop";
+
   # `hart-copilot` — the one command that opens the co-pilot on a WRITABLE checkout
   # with the trust boundary stated up front. The nix store is read-only, so the
   # co-pilot cannot edit the running system's source in place; it works a real git
@@ -170,7 +177,10 @@ in
         after = [ "hart-backend.service" "network-online.target" ];
         wants = [ "network-online.target" ];
         wantedBy = [ "multi-user.target" ];
-        path = [ claudePkg pkgs.git pkgs.gh pkgs.coreutils pkgs.openssh ];
+        # systemd is here for `systemctl start --wait hart-copilot-verify`, which is
+        # the daemon's only route to activating a config. There is deliberately no
+        # sudo: NoNewPrivileges below would block it anyway.
+        path = [ claudePkg pkgs.git pkgs.gh pkgs.coreutils pkgs.openssh pkgs.systemd ];
         serviceConfig = {
           Type = "simple";
           User = "hart";
@@ -204,6 +214,45 @@ in
           ReadWritePaths = [ "/var/lib/hart/copilot" "/run/hart" ];
         };
       };
+
+      # ── Verification, privilege-separated ────────────────────────────────
+      # The daemon's docstring says the agent verifies OS changes with
+      # `nixos-rebuild test`. It could not: the unit runs as `hart` with
+      # NoNewPrivileges, `sudo` is not on its path, and no sudoers rule grants
+      # it anything, so the call returned "not a NixOS host?" ON a NixOS host.
+      #
+      # The fix is not to loosen the daemon. It is to put activation in a root
+      # unit that takes NO arguments from the daemon. `test` is written into
+      # ExecStart, so an agent that ignores every instruction in its prompt
+      # still cannot express `switch` or `boot`: there is no argument to pass.
+      # What the machine comes up as stays a human decision because the
+      # daemon has no way to say otherwise, rather than because it was asked.
+      systemd.services.hart-copilot-verify = {
+        description = "HART OS - co-pilot verification (nixos-rebuild test, never switch)";
+        serviceConfig = {
+          Type = "oneshot";
+          # Absolute, and fixed. The flake ref is the daemon's own clone; the
+          # verb is `test`, which activates on the running system and does not
+          # touch the boot generation, so a power cycle undoes it.
+          ExecStart = ''
+            /run/current-system/sw/bin/nixos-rebuild test --flake ${copilotRepo}/nixos#${copilotFlakeAttr}
+          '';
+          TimeoutStartSec = "45min";
+        };
+        path = [ pkgs.nix pkgs.git pkgs.openssh pkgs.coreutils ];
+      };
+
+      # Let the daemon's user start that one unit and nothing else. Without
+      # this the separation above is just a unit nobody can reach.
+      security.polkit.extraConfig = ''
+        polkit.addRule(function(action, subject) {
+          if (action.id == "org.freedesktop.systemd1.manage-units" &&
+              action.lookup("unit") == "hart-copilot-verify.service" &&
+              subject.user == "hart") {
+            return polkit.Result.YES;
+          }
+        });
+      '';
     })
   ]);
 }

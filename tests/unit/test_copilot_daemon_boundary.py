@@ -20,6 +20,7 @@ Run:
         --noconftest -p no:cacheprovider
 """
 import os
+import pathlib
 import sys
 
 import pytest
@@ -137,8 +138,13 @@ def test_prompt_states_the_boundary_to_the_agent():
     assert 'a human merges' in low
     # It must be told how to verify on THIS machine, and told not to change what
     # the machine boots into: `test` activates now, `switch`/`boot` do not.
+    # The prompt now points at the root oneshot rather than at sudo, because sudo
+    # never worked from a NoNewPrivileges unit. Telling it the truth about its own
+    # privileges matters more than telling it a rule: an agent that believes it has
+    # sudo burns a run discovering it does not.
     assert 'nixos-rebuild test' in low
-    assert 'never use `switch` or `boot`' in low
+    assert d.VERIFY_UNIT in p
+    assert '`switch` and `boot` are not available to you' in low
     # And it must know a local branch is a dead end.
     assert 'open a pr' in low
 
@@ -208,3 +214,49 @@ def test_workspace_failure_is_reported_not_idled_through(monkeypatch, limiter):
     out = d.tick(limiter)
     assert out['action'] == 'workspace-error'
     assert 'clone failed' in out['reason']
+
+
+# ── The privilege boundary is in the system config, not in the prompt ────────
+#
+# The daemon unit runs as `hart` with NoNewPrivileges=true, so it cannot escalate
+# at all. Activation therefore goes through a root oneshot whose ExecStart names
+# the flake ref and the verb. These assert the daemon cannot express `switch` or
+# `boot`, and that the two files still agree about what gets activated.
+
+NIX_MODULE = pathlib.Path(__file__).resolve().parents[2] / 'nixos' / 'modules' / 'hart-copilot.nix'
+
+
+def test_daemon_never_builds_a_privileged_argv():
+    """It triggers a unit. It does not shell out to sudo, which NoNewPrivileges
+    blocks anyway, and which silently reported 'not a NixOS host?' on NixOS."""
+    src = pathlib.Path(d.__file__).read_text(encoding='utf-8')
+    assert "'sudo'" not in src and '"sudo"' not in src
+    assert d.VERIFY_UNIT == 'hart-copilot-verify.service'
+
+
+def test_verify_unit_activates_and_cannot_switch():
+    """`test` leaves the boot generation alone. `switch` and `boot` do not appear,
+    so no agent can reach them through this path however it is prompted."""
+    nix = NIX_MODULE.read_text(encoding='utf-8')
+    assert 'hart-copilot-verify' in nix
+    start = nix.split('hart-copilot-verify')[1]
+    assert 'nixos-rebuild test' in start
+    assert 'nixos-rebuild switch' not in start
+    assert 'nixos-rebuild boot' not in start
+
+
+def test_nix_and_daemon_agree_on_what_is_activated():
+    """Two files hold these constants because the daemon argues for constants over
+    knobs. That is fine only while something fails when they drift."""
+    nix = NIX_MODULE.read_text(encoding='utf-8')
+    assert f'copilotRepo = "{d.REPO}"' in nix
+    assert f'copilotFlakeAttr = "{d.FLAKE_ATTR}"' in nix
+
+
+def test_daemon_can_reach_the_unit_it_needs():
+    """A polkit rule is what makes the separation reachable rather than a unit the
+    daemon is not allowed to start."""
+    nix = NIX_MODULE.read_text(encoding='utf-8')
+    assert 'polkit.addRule' in nix
+    assert 'hart-copilot-verify.service' in nix
+    assert 'pkgs.systemd' in nix, 'systemctl must be on the daemon unit path'
