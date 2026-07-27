@@ -1002,8 +1002,9 @@ STREAM_INTERIM_WINDOW_BYTES = (
 # end-of-utterance silence.  The first relied entirely on the client being
 # smart enough to send {control:final}; a raw-PCM feeder (or a client that
 # never signals end-of-speech) would otherwise only ever finalize on the 30s
-# overflow.  Energy-based silence detection makes finalization robust for ANY
-# client without changing the client-driven path (both still fire).
+# overflow.  Energy-based silence detection lets a client that never sends
+# {control:final} still finalize on time, without changing the client-driven
+# path (both still fire).
 STREAM_VAD_RMS_THRESHOLD = 400      # PCM16 RMS below this == silence (speech ~1-5k)
 STREAM_VAD_SILENCE_MS = 800         # trailing silence after speech that ends an utterance
 STREAM_VAD_MIN_SPEECH_MS = 300      # require this much speech first (ignore leading silence)

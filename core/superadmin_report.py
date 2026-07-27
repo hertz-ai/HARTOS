@@ -283,7 +283,7 @@ def _loop_once(get_node_info_callable, last_report: float) -> float:
     inter-tick interval.  Returns the carried-forward ``last_report``.
 
     Single source of the per-iteration logic (shared by ``_loop`` and the
-    unit test).  Order is load-bearing:
+    unit test).  The step order matters:
 
     1. ``_heartbeat_safe()`` ALWAYS fires first — before the yield gate —
        so a busy box / live user turn that defers the report+drain work

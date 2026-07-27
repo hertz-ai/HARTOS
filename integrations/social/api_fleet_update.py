@@ -490,8 +490,9 @@ def ota_publish():
         # require_auth's wrapper commits g.db after the view returns.
 
         # Kick the central node's OWN 7-stage pipeline (reuse, never a second
-        # loop) and audit the account action. Both are best-effort side-effects
-        # — the fan-out above is the load-bearing step and has already happened.
+        # loop) and audit the account action. Both are best-effort side-effects:
+        # push_broadcast above is what actually ships the release, and it has
+        # already committed.
         pipeline_started = _kick_upgrade_pipeline(commit, commit)
         audited = _audit_publish(g.user_id, channel, commit, flake_ref,
                                  len(commands), pipeline_started)

@@ -39,9 +39,10 @@ Both failures are logged at WARNING so the degraded mode is visible.
 
 POSIX FALLBACK
 --------------
-Linux/macOS use ``start_new_session`` + an atexit terminate hook.  Less
-robust than Windows Job Object but the primary deployment target is
-Nunba on Windows, where Job Object semantics are exact.
+Linux/macOS use ``start_new_session`` + an atexit terminate hook.  That
+is a weaker guarantee than the Windows Job Object (atexit does not run
+on SIGKILL), but the primary deployment target is Nunba on Windows,
+where Job Object semantics are exact.
 
 RESOURCE GOVERNOR ACCOUNTING
 ----------------------------

@@ -409,9 +409,9 @@ def consolidate(sources: Dict[str, Iterable[str]],
     `sources` maps a source name to its addresses, so the result can say where
     each address came from. `suppress` is anything already opted out.
 
-    Returns the clean list plus a breakdown of what was rejected and why --
-    the rejections are the interesting part, since they are what would have
-    bounced.
+    Returns the clean list plus a breakdown of what was rejected and why.
+    Read the rejection breakdown before sending: those are the addresses that
+    would have bounced.
     """
     suppressed = {normalise(a) for a in suppress}
     seen: Dict[str, str] = {}          # normalised -> original

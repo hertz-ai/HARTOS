@@ -8467,8 +8467,9 @@ def _home_sanitize_hero(h) -> Optional[dict]:
 def _sanitize_home_payload(payload) -> Optional[dict]:
     """Coerce a (possibly LLM-authored) {hero, rows} to the schema + allow-sets,
     dropping anything unknown/unsafe. Returns a clean payload or None when there
-    is no usable row. This is the load-bearing guard that lets the LLM compose
-    freely without being able to inject a bad accent / verb / deep-link / markup."""
+    is no usable row. The LLM composes freely; this is the only thing standing
+    between its output and the client, so an unknown accent / verb / deep-link /
+    markup never reaches the shell."""
     if not isinstance(payload, dict):
         return None
     rows_in = payload.get('rows')
@@ -8509,9 +8510,10 @@ def _sanitize_home_payload(payload) -> Optional[dict]:
         return None
     out = {'hero': _home_sanitize_hero(payload.get('hero')), 'rows': rows}
     # Ambient mood/palette (§6a) — the LLM may name a HART_PALETTES id for the
-    # shell's ambient feel.  Coerced to a safe slug HERE (the load-bearing guard);
-    # the CLIENT is the single owner of the palette-id vocabulary and validates
-    # membership before calling applyPalette, so the server never forks that list.
+    # shell's ambient feel.  Coerced to a safe slug HERE, so a mood string can
+    # never carry markup or a path.  The CLIENT is the single owner of the
+    # palette-id vocabulary and validates membership before calling
+    # applyPalette, so the server never forks that list.
     mood = payload.get('mood')
     if isinstance(mood, str):
         slug = re.sub(r'[^a-z0-9_-]', '', mood.strip().lower())[:24]

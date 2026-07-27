@@ -61,8 +61,8 @@ class DragDropEvent:
 class DragDropBridge:
     """Cross-device drag-and-drop over HARTOS transport.
 
-    Orchestrates file transfer + input simulation for seamless drag-drop
-    across local and remote devices.
+    Orchestrates file transfer + input simulation for drag-drop across
+    local and remote devices.
     """
 
     def __init__(self, transport=None, input_handler=None):

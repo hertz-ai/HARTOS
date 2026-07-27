@@ -6,8 +6,8 @@ Wraps the SimpleMem library to provide advanced memory capabilities:
 - Structured Multi-View Indexing (LanceDB vectors)
 - Complexity-Aware Adaptive Retrieval
 
-Implements the MemorySource interface for seamless integration
-with the existing MemorySearch system.
+Implements the MemorySource interface so MemorySearch can query it
+alongside the other sources without special-casing.
 """
 
 from __future__ import annotations

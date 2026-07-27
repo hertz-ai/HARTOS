@@ -5,8 +5,8 @@ WHY THIS EXISTS
 ───────────────
 `subprocess.run(cmd, capture_output=True, text=True, timeout=N)` is the
 canonical way to read a child process' stdout with a time limit.  On
-Windows it has a latent failure mode that becomes load-bearing for
-nunba's pytest runs and first-boot probes: when the child is killed
+Windows it has a latent failure mode that bites nunba's pytest runs
+and first-boot probes: when the child is killed
 mid-initialization (e.g. nvidia-smi during driver probe, wmic on a
 cold WMI repository, sysctl on a locked macOS kernel), Python's two
 `_readerthread` daemons stay blocked in `fh.read()` because
@@ -175,10 +175,10 @@ def _safe_kill_and_close(
 ) -> None:
     """Kill proc, close pipes, bounded wait — no exception escapes.
 
-    The explicit close() on stdout/stderr is the load-bearing line:
-    without it, Python's _readerthread daemons stay blocked in
-    fh.read() after the child dies, and join() wedges.  Closing the
-    parent FD causes the read() to return EOF → thread exits cleanly.
+    Without the explicit close() on stdout/stderr, Python's
+    _readerthread daemons stay blocked in fh.read() after the child
+    dies, and join() wedges.  Closing the parent FD causes the read()
+    to return EOF → thread exits cleanly.
     """
     logger.warning(
         "subprocess %s exceeded timeout; killing + closing pipes "

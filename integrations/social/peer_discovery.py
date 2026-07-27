@@ -1090,9 +1090,10 @@ class GossipProtocol:
         )
         db.add(new_peer)
 
-        # ─── Seamless Mind Merge ───
-        # Valid peer accepted - auto-federate so minds merge without friction.
-        # Connection is a breeze; the audit layer handles trust continuously.
+        # ─── Auto-federation ───
+        # Peer passed verification, so follow it now rather than waiting for an
+        # operator to do it by hand. Trust is re-checked by the integrity round
+        # below, which can mark the peer dead later.
         threading.Thread(
             target=self._auto_federate_peer,
             args=(node_id, url),
@@ -1102,8 +1103,8 @@ class GossipProtocol:
         return True
 
     def _auto_federate_peer(self, peer_node_id: str, peer_url: str):
-        """Auto-follow a newly accepted peer for seamless mind merge.
-        Valid peers get instant bidirectional content sharing - no manual step."""
+        """Auto-follow a newly accepted peer so its content starts flowing.
+        Runs on its own thread; failures are logged and dropped."""
         try:
             from .models import get_db
             from .federation import federation

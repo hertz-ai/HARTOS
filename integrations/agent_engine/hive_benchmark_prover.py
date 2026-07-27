@@ -16,9 +16,9 @@ Benchmarks to target:
   - ARC (reasoning) — split by difficulty
   - Custom hive benchmarks (latency, throughput, cost vs cloud APIs)
 
-The key insight: distribute problems, not just compute.
-10 nodes solving 10 different MMLU subjects simultaneously = 10x faster.
-But also: nodes share context, so each answer benefits from collective knowledge.
+Distribute problems, not just compute: 10 nodes solving 10 different MMLU
+subjects simultaneously = 10x faster. Nodes also share context, so each answer
+can draw on what the others have already retrieved.
 
 Ledger persistence: agent_data/benchmark_ledger.json
 Leaderboard persistence: agent_data/benchmark_leaderboard.json
@@ -127,7 +127,7 @@ BUILTIN_BENCHMARKS = {
         'source': 'huggingface',
         'dataset': 'gaia-benchmark/GAIA',
     },
-    # ── Ensemble benchmarks — THIS is where sum > single is proven ──
+    # ── Ensemble benchmarks — where the sum > single claim is tested ──
     # Same questions sent to ALL nodes (different models), answers fused.
     # Fusion accuracy must beat every individual model.
     'ensemble_mmlu': {

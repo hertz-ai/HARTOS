@@ -210,8 +210,8 @@ class AutoResearchEngine:
             # incremental-tuning prompt stance for a radical-mutation
             # stance.  The LLM remains the code mutator (no parallel
             # code-generator path), but the instruction distribution
-            # shifts — this is the cheapest honest wiring of the
-            # stochastic arm without inventing a second mutation backend.
+            # shifts, which wires the stochastic arm without inventing
+            # a second mutation backend.
             # Safety: the candidate still passes RSI-1 + RSI-2 gates
             # inside commit_improvement before promotion.
             exploration_hint = ''

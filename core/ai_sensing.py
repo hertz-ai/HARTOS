@@ -6,8 +6,8 @@ button). Every real-world sensor ingestion the shell controls checks this gate:
   * camera— the vision service is stopped (real, observable),
   * screen— gated for any consumer that honours it.
 `status()` reports the LIVE state (e.g. the vision service really is stopped),
-so the proof shown to the user cannot be faked by the AI. Crucially, the AI has
-NO route to flip this — only the human UI (POST /api/shell/ai-sensing) does.
+so the proof shown to the user cannot be faked by the AI. The AI has NO route to
+flip this; only the human UI (POST /api/shell/ai-sensing) does.
 This is the desktop expression of HART's "humans are always in control".
 
 Single source of truth: import `allowed(sensor)` at every sensor ingestion point
@@ -122,13 +122,12 @@ def _authority_path(path: str = None) -> str:
     """Resolve the cross-process authority socket path.
 
     Priority: explicit arg > HART_AI_SENSING_SOCK env > $XDG_RUNTIME_DIR.
-    The env override is the load-bearing one: the brain (hart-backend) is a
-    SYSTEM service with no XDG_RUNTIME_DIR, and the portal is its OWN systemd
-    unit — both must agree on ONE path. hart-portal.nix pins both sides to
-    /run/hart/ai-sensing.sock via this env var so the gate genuinely spans the
-    two processes (a path mismatch would silently fail-open the portal? no —
-    query_authority fail-CLOSES on connect error, so a mismatch denies capture,
-    never grants it; the env just makes the happy path work)."""
+    In production only the env branch is reachable: the brain (hart-backend) is
+    a SYSTEM service with no XDG_RUNTIME_DIR, and the portal is its OWN systemd
+    unit, so the two would otherwise resolve different paths. hart-portal.nix
+    pins both sides to /run/hart/ai-sensing.sock via this env var. A path
+    mismatch does not fail-open: query_authority fail-CLOSES on connect error,
+    so a mismatch denies capture. The env var only makes the happy path work."""
     return (path
             or os.environ.get('HART_AI_SENSING_SOCK')
             or os.path.join(
@@ -185,7 +184,7 @@ def query_authority(sensor: str, path: str = None, timeout: float = 1.0) -> bool
     """Cross-process query of the sense gate. FAIL-CLOSED: returns False
     (denied) if the authority is unreachable or errors — a portal that cannot
     reach the gate must NOT capture. The portal consults THIS, never its own
-    flag, so the human's cut genuinely propagates across processes."""
+    flag, so the human's cut applies in the portal process too."""
     if not hasattr(socket, 'AF_UNIX'):
         return False
     try:
