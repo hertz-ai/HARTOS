@@ -62,7 +62,7 @@ Ordered by how much a contributor with modest hardware can settle in an evening.
 | 13 | A Reachy Mini runs an agent locally | Drive it through `gpio_adapter.py` / `serial_adapter.py` / `ros_bridge.py`, whichever its stack exposes | Reachy Mini |
 | 14 | **Intelligence compounds between two robots** | Robot A learns a skill by doing. Robot B performs it without having done it. Measure B before and after | 2 Reachy Minis |
 | 15 | A co-pilot's work on one node improves another | Seed a goal on node A only. Show node B starting ahead of where it was | 2 nodes |
-| 16 | **Three nodes beat one node** | Same benchmark, one node then three, same models. The crossover the whole design rests on | 3 machines |
+| 16 | Three nodes beat one node | Same benchmark, one node then three, same models. A floor test: error minimisation, not a capability claim | 3 machines |
 
 ### What "the hive learns" means today, precisely
 
@@ -87,12 +87,23 @@ calls it the part we are not comfortable with.
 So the accurate split is: HevolveAI learns, this repo carries what it derives
 between nodes over four channels, and node-to-node weight sync is Phase 2.
 
-### Row 16 is the threshold
+### Row 16 is a floor, not a threshold
 
 `hive_benchmark_prover.py` carries a seven-stage convergence ladder, from one
 node at roughly 62% MMLU to a hundred thousand nodes past any single model.
 Stage 2, three nodes ensembling, is where it claims the sum first exceeds the
-single. Below three nodes the effect is unproven; above it the rest is scale.
+single.
+
+That stage measures error minimisation. Three models voting reduce variance and
+catch each other on a given answer, which is well established and says nothing
+about capability. If three nodes do not beat one, something is broken. If they
+do, ensembling works, which nobody disputes.
+
+The capability claim lives in mechanisms stage 2 does not exercise: expert
+routing across models with different blind spots, generate-review-test where
+verification is separable from generation, and learning that compounds so the
+next node starts ahead. Rows 14 and 15 test those. Row 16 only shows the floor
+exists.
 
 **Every number in that ladder is a projection.** Not one has been measured, and
 the source now says so.
