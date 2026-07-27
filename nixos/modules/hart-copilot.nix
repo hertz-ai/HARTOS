@@ -131,8 +131,18 @@ let
       d="$WS/$r"
       if [ ! -d "$d/.git" ]; then
         echo "[hart-copilot-tabs] cloning $r …"
-        ${pkgs.git}/bin/git clone --depth 50 "https://github.com/hertz-ai/$r.git" "$d" \
-          || { echo "[hart-copilot-tabs] skip $r (clone failed: no access or no network)" >&2; continue; }
+        # PRIVATE repos (hevolveai is closed-source) cannot be cloned by anonymous
+        # https. Try `gh repo clone` FIRST: gh is already installed here and, once
+        # the node has run `gh auth login`, it carries the credential and clones
+        # private repos exactly like public ones. Plain git is the fallback for a
+        # node with no gh session, which still works for the public repos.
+        if ${pkgs.gh}/bin/gh repo clone "hertz-ai/$r" "$d" -- --depth 50 2>/dev/null \
+           || ${pkgs.git}/bin/git clone --depth 50 "https://github.com/hertz-ai/$r.git" "$d" 2>/dev/null; then
+          :
+        else
+          echo "[hart-copilot-tabs] skip $r (no access; for a private repo run: gh auth login)" >&2
+          continue
+        fi
       fi
       # --continue, never a pinned id: see the note above.
       {
