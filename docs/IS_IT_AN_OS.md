@@ -9,7 +9,7 @@ It is a fair question and it deserves evidence rather than adjectives. So
 this page is the receipts. Every claim below names the file or the CI check
 you can go read, and the last section is the part that is not proven yet.
 
-## The short answer
+## In one paragraph
 
 It is built to boot, it has its own compositor, and it has a session
 supervisor. Those are three things a wrapper does not have.
@@ -39,9 +39,8 @@ There are nixosTest definitions covering the boot path itself:
 | `hart-boot-continuity-poweroff-gate` | Power-off ordering holds. |
 | `hart-boot-log` | Boot logging is present and correct. |
 
-Nobody writes an initrd test for a Docker wrapper. That tells you what this
-is trying to be. It does not tell you the tests pass; they are defined and not
-currently run.
+A Docker wrapper has no initrd to test. These are defined and not currently
+run, so they show intent rather than a working boot.
 
 ## 2. It has its own Wayland compositor
 
@@ -87,16 +86,14 @@ hart-session-supervisor-recovery-tty
 hart-session-supervisor-unhealthy-flag
 ```
 
-Read what those names describe. A paint watchdog notices the screen has
-stopped updating. An input watchdog notices the machine has stopped
-responding. A tier drop falls back to a lesser session when the better one
-fails. A recovery TTY is what you get when the graphical session cannot be
-saved. A reboot latch stops a boot loop.
+A paint watchdog notices the screen has stopped updating. An input watchdog
+notices the machine has stopped responding. A tier drop falls back to a lesser
+session when the better one fails. A recovery TTY is what you get when the
+graphical session cannot be saved. A reboot latch stops a boot loop.
 
-That is a list of ways a desktop dies and what happens next in each case. It
-is the same problem set GNOME's session manager and systemd's logind exist to
-handle. Nobody needs any of it to orchestrate models, which is the point: the
-existence of this code says what kind of thing is being built here.
+Those are five ways a desktop dies and what happens next in each case, which is
+the problem set GNOME's session manager and systemd's logind exist to handle.
+Model orchestration needs none of it.
 
 Plus `hart-floor-lock`, `hart-desktop-shell-boot`, `hart-layer-shell-host`,
 `hart-layer-shell-host-paint` and `hart-hartlog-create`. Nineteen VM checks
@@ -121,13 +118,13 @@ wrong place.
 
 There is a benchmark for it at `tests/vlm_grounding_benchmark.py`.
 
-So the machine can operate its own GUI, including a browser, with the model
-doing the seeing locally. Nothing is sent anywhere to decide where to click.
+The machine operates its own GUI, browser included, with the model doing the
+seeing locally. Nothing is sent anywhere to decide where to click.
 
 ## 5. Inference is a system service
 
-The part that earns the "AI-native" half of the label rather than the "OS"
-half. An application does not bundle a model or hold an API key. It asks the
+This is the "AI-native" half of the label. An application does not bundle a
+model or hold an API key. It asks the
 Model Bus over socket, D-Bus or HTTP, the same way it would ask any other
 system service, and the OS decides which model answers.
 
@@ -135,26 +132,23 @@ The consequence is that ten applications on one machine do not load ten
 copies of a model, and code written against `:6777/v1/chat/completions` runs
 unchanged on a laptop and on a robot.
 
-That is the claim in the name. Not that it orchestrates models, but that
-inference is a system service instead of something every app carries itself.
+The name claims inference is a system service, not that the thing orchestrates
+models.
 
 ## 6. It runs a coding agent as a system service, and bounds it like one
 
-Everything above answers "this does what an OS does". This section is the one
-that is worth arguing about, because it is a thing an OS could do and none of
-them do, and it only works because this is a distribution.
+Sections 1 to 5 show HART OS doing what other operating systems do. This one
+does not have a counterpart elsewhere.
 
 `nixos/modules/hart-copilot.nix:173` defines `hart-copilot-daemon`, wanted by
 `multi-user.target`, running as the unprivileged `hart` user. It keeps a Claude
-Code session resident on the node and hands it bounded work from the hive. What
-makes that an OS feature rather than an app is what it is allowed to do: it can
-activate a new system configuration on the machine it is running on.
+Code session resident on the node and hands it bounded work from the hive. That
+session can activate a new system configuration on the machine it is running on.
 
-You cannot do that in a container. There is no system to rebuild.
+A container has no system to rebuild, so it cannot do this at all.
 
-The engineering worth reading is the bounding, not the autonomy. An agent with
-that reach needs a boundary, and the question is where you put it. The answer
-this repo arrived at, the second time:
+An agent with that reach needs a boundary somewhere. Here is where each part of
+it sits, after the second attempt:
 
 | Boundary | Where it lives |
 |---|---|
@@ -167,17 +161,15 @@ this repo arrived at, the second time:
 
 19 tests in `tests/unit/test_copilot_daemon_boundary.py`.
 
-The second time, because the first version put the important half in the prompt.
-It asked the agent not to run `nixos-rebuild switch`, and asking is the weakest
-place to put a boundary. Worse, the verification step had never once run: the
-daemon shelled out to `sudo`, which a `NoNewPrivileges` unit cannot use, so every
+The first attempt put half of that in the prompt: it asked the agent not to run
+`nixos-rebuild switch`. And the verification step had never once run. The daemon
+shelled out to `sudo`, which a `NoNewPrivileges` unit cannot use, so every
 attempt on a real node failed while reporting "not a NixOS host?" on a NixOS
 host. Fixed in `21acfecb` by moving activation into the root unit above.
 
-That is the argument for doing this in an OS rather than in an agent framework.
-Privilege separation for untrusted workers is a solved problem, and the solution
-is sudoers, polkit and systemd. An agent framework has to invent a worse version
-of it. Here it was already sitting in the system configuration.
+Privilege separation for untrusted workers was solved decades ago by sudoers,
+polkit and systemd. An agent framework running outside an OS has to reimplement
+it. Here it was already in the system configuration.
 
 ## CI status
 
