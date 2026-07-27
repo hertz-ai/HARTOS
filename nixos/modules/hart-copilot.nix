@@ -150,6 +150,13 @@ in
       ]) ++ [
         pkgs.git           # it commits its own work (to a branch)
         pkgs.gh            # branch push / PR — the human still merges
+        # `claude` -> /login is an OAuth flow: it hands the URL to the desktop's
+        # URL opener. Without xdg-open on PATH that call fails and claude falls
+        # back to PRINTING the URL, which on a TV-style desktop means retyping a
+        # long signed URL by hand. Firefox is already preinstalled and already the
+        # x-scheme-handler/https default (desktop.nix), so the only missing piece
+        # was the opener itself: one package turns login into one click.
+        pkgs.xdg-utils
       ];
 
       # Point the co-pilot at THIS node's own backend, so "debug the OS from within"
@@ -157,6 +164,12 @@ in
       # not a remote guess.
       environment.sessionVariables = {
         HART_COPILOT_BACKEND = "http://127.0.0.1:6777";
+        # Belt and braces for the OAuth login. xdg-open above is the general path,
+        # but tools differ in what they try first, and $BROWSER is the one every
+        # one of them honours. Firefox is preinstalled and is already the
+        # x-scheme-handler/https default, so this names the same browser the rest
+        # of the desktop opens rather than introducing a second answer.
+        BROWSER = "firefox";
       };
     }
 
