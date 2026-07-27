@@ -104,7 +104,7 @@ Back to the [README](README.md).
 |---|---|---|
 | **16 LLM providers** | Local llama.cpp and Ollama, plus OpenAI, Anthropic, Google Gemini, Groq, Mistral, DeepSeek, Cohere, OpenRouter, Together, Fireworks, DeepInfra, Cerebras, SambaNova and HuggingFace, plus any custom OpenAI-compatible endpoint | `integrations/providers/`, `integrations/agent_engine/model_bus_service.py` |
 | **Compute + media marketplace** | Separate catalog from the LLM list above: 10 API providers, 1 local, and 8 affiliate services (RunwayML, ElevenLabs, Midjourney, Pika, Kling, Luma, Seedance, Sora) with pricing, auth method and health per entry | `integrations/providers/registry.py` |
-| **Universal gateway** | One router, cost / latency / capability scoring, AES-256 keys at rest (PBKDF2 KDF) | `model_registry.py`, `model_bus_service.py` |
+| **Universal gateway** | One router, cost / latency / capability scoring. Key storage is not in this module: secrets live in a Fernet vault (AES-128-CBC + HMAC-SHA256) keyed by PBKDF2-HMAC-SHA256 at 480,000 iterations | `model_registry.py`, `model_bus_service.py`, vault at `security/secrets_manager.py` |
 | **Speculative decoding** | Qwen3-0.8B draft + Qwen3-4B main, ~300 ms TTFT on consumer hardware | `speculative_dispatcher.py` |
 | **Faster-Whisper STT** | Local STT, multi-lang, GPU-accelerated when available | `integrations/service_tools/whisper_tool.py` |
 | **MiniCPM VLM** | Vision-language model for camera + screenshot reasoning | `integrations/vision/minicpm_server.py` |
