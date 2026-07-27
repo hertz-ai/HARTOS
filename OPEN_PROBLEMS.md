@@ -60,6 +60,15 @@ participation, rather than just receiving traffic.
 release signing (`security/node_integrity.py`). The self-improvement path is a
 toggle, and every node is independently killable.
 
+This stopped being hypothetical. `scripts/hart_copilot_daemon.py` is a resident
+Claude Code session that rewrites the node it runs on, and what holds today is
+reviewability rather than attestation: it can activate a config with
+`nixos-rebuild test` but cannot change what the machine boots into, because the
+verb lives in a root unit's ExecStart and the daemon has no argument to pass
+(`nixos/modules/hart-copilot.nix`). Its output is a PR. So the answer to "is the
+thing running still the thing you agreed to run" is currently "a human read the
+diff", which is an answer, and it is not attestation.
+
 **Why that is unsatisfying:** these two properties are in direct tension. A
 hash proves the code is what was signed; a system that improves itself
 necessarily stops being what was signed. Today the tension is resolved by
