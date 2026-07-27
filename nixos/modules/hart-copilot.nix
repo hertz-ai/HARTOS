@@ -101,6 +101,23 @@ in
 
       DEFAULT OFF: a normal build carries none of this closure
     '';
+
+    daemon.enable = lib.mkEnableOption ''
+      run the co-pilot as a RESIDENT daemon (hart-copilot-daemon.service) instead of
+      only an interactive command.
+
+      It does not add a second work loop: `coding_daemon` already ticks, gates and
+      dispatches. This keeps a Claude Code session resident and hands it bounded
+      work, so the executor is a real coding agent rather than one /chat turn.
+
+      Boundary, enforced in order every tick: stop-file -> hive circuit breaker ->
+      should_yield_to_user() -> rate limit -> assigned task or idle. Work happens on
+      a copilot/* branch in a writable clone; merge, OTA and master-key signing stay
+      human. Resource-capped so it cannot starve the node it is fixing.
+
+      Requires an authenticated Claude (run `claude` once and /login). DEFAULT OFF:
+      an unattended agent is opt-in, never something a user gets by surprise
+    '';
   };
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
@@ -135,5 +152,58 @@ in
         HART_COPILOT_BACKEND = "http://127.0.0.1:6777";
       };
     }
+
+    # ── Resident daemon (opt-in, hart.copilot.daemon.enable) ──────────────────
+    # NOT a second work loop: coding_daemon already ticks/gates/dispatches. This
+    # keeps a Claude Code session resident and hands it bounded work, so the
+    # executor is a real coding agent rather than one /chat turn.
+    #
+    # WorkingDirectory is the hart-app store path so the daemon's gate imports
+    # (security.hive_guardrails, integrations.agent_engine.dispatch) resolve against
+    # the SAME code the node is running. Claude itself runs in the WRITABLE clone
+    # (HART_COPILOT_REPO), never in the read-only store.
+    (lib.mkIf (cfg.daemon.enable && claudePkg != null) {
+      systemd.services.hart-copilot-daemon = {
+        description = "HART OS - resident co-pilot (bounded Claude Code worker)";
+        # The gates it consults live behind the backend; start after it, and do not
+        # sit on the boot-critical path.
+        after = [ "hart-backend.service" "network-online.target" ];
+        wants = [ "network-online.target" ];
+        wantedBy = [ "multi-user.target" ];
+        path = [ claudePkg pkgs.git pkgs.gh pkgs.coreutils pkgs.openssh ];
+        serviceConfig = {
+          Type = "simple";
+          User = "hart";
+          Group = "hart";
+          WorkingDirectory = config.hart.package;
+          Environment = [
+            "HART_OS_MODE=1"
+            "HART_COPILOT_BACKEND=http://127.0.0.1:6777"
+            "HART_COPILOT_REPO=/var/lib/hart/copilot/HARTOS"
+            "HART_COPILOT_STOP=/run/hart/copilot-stop"
+          ];
+          ExecStart = "${config.hart.package.python}/bin/python scripts/hart_copilot_daemon.py";
+          # A crash must not take the node's co-pilot down permanently, but it must
+          # not hot-loop either: back off hard between restarts.
+          Restart = "on-failure";
+          RestartSec = 60;
+          # It shares an 8GB node with the OS it is fixing. Hard caps + the lowest
+          # scheduling priority mean a wedged agent degrades itself, never the
+          # desktop. (The daemon also yields to the user in software every tick.)
+          MemoryMax = "2G";
+          CPUWeight = 5;
+          Nice = 19;
+          IOWeight = 10;
+          # It edits a git clone under its own state dir and talks to localhost.
+          # It has no business anywhere else on the system.
+          StateDirectory = "hart/copilot";
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectSystem = "strict";
+          ProtectHome = true;
+          ReadWritePaths = [ "/var/lib/hart/copilot" "/run/hart" ];
+        };
+      };
+    })
   ]);
 }
