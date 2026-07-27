@@ -39,14 +39,22 @@ welcome contribution and needs no setup at all.
   they fail in findable ways: reconnect logic, message-type filters, ID
   mapping between a provider's format and ours. If you use a platform we
   support badly, that is the best possible reason to work on its adapter.
-- **The auto-evolve loop** (`autoresearch_loop.py`) turns usage into
-  candidate optimisations in runtime rather than in a nightly retrain. The
-  open question is exploration: escaping local minima without destabilising
-  a model somebody is mid-conversation with.
-- **The guardrails** (`hive_guardrails.py`, `cultural_wisdom.py`). Every
-  self-improvement passes them before commit. Adversarial test cases are
-  worth more here than new features; this is where "it got worse and nobody
-  noticed" is supposed to be caught.
+- **The auto-evolve loop**
+  (`integrations/agent_engine/auto_evolve.py`) turns usage into candidate
+  optimisations in runtime rather than in a nightly retrain. The open
+  question is exploration: escaping local minima without destabilising a
+  model somebody is mid-conversation with.
+
+  Its neighbour is worth knowing about before you start.
+  `integrations/coding_agent/autoevolve_code_tools.py` holds
+  `AutoResearchSession` and `AutoResearchEngine`, and that engine's docstring
+  is emphatic that it is **not** a loop: the agent's own conversation drives
+  iteration by calling tool functions in sequence. Two different things with
+  confusingly similar names.
+- **The guardrails** (`security/hive_guardrails.py`, `cultural_wisdom.py`).
+  Every self-improvement passes them before commit. Adversarial test cases
+  are worth more here than new features. This is where "it got worse and
+  nobody noticed" is supposed to be caught.
 - **Hardware tiering**. Engines are skipped on ≤6GB cards. The boundaries
   are educated guesses that would benefit from measurements on hardware we
   do not own.
