@@ -1,0 +1,88 @@
+# Human review of agent-authored PRs.
+#
+# The co-pilot daemon opens PRs from a node (scripts/hart_copilot_daemon.py). The
+# repo says merge stays human, and until this file that was enforced only inside
+# the daemon's own code path: it calls `gh pr create` and never `gh pr merge`.
+# The agent it hosts has `gh` on PATH and credentials, and its instruction not to
+# push to main is a line in a prompt. Prompts are the weakest place to put a
+# boundary, which the sudo bug in 21acfecb already demonstrated once.
+#
+# So the gate lives here instead, where the agent cannot reach it.
+#
+# This is also the governance mechanism rather than a CI nicety. An AI that
+# rewrites the OS it runs on is only as accountable as the people reading its
+# diffs, and open source review is what keeps that a distributed decision rather
+# than one held by whoever owns the weights.
+#
+# LIMIT, stated plainly: a failing check does not prevent a merge unless branch
+# protection makes it required. `main` is currently unprotected, so today this
+# reports rather than blocks. See VERIFICATION.md.
+name: Agent PR review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  pull-requests: read
+  contents: read
+
+jobs:
+  human-approval:
+    name: An agent PR needs a human approval
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide whether this PR was opened by an agent
+        id: origin
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_USER: ${{ github.event.pull_request.user.login }}
+        run: |
+          agent=false
+          # The daemon cuts copilot/<slug>-<epoch> from origin/main before any work.
+          case "$HEAD_REF" in
+            copilot/*) agent=true ;;
+          esac
+          # And states its origin in the body, so a branch renamed by hand is still caught.
+          case "$PR_BODY" in
+            *"resident co-pilot daemon"*) agent=true ;;
+          esac
+          echo "agent=$agent" >> "$GITHUB_OUTPUT"
+          echo "Head branch : $HEAD_REF"
+          echo "Opened by   : $PR_USER"
+          echo "Agent PR    : $agent"
+
+      - name: Require a human approval
+        if: steps.origin.outputs.agent == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          # A review counts only if it is APPROVED, and only from someone who is
+          # not the PR author. Self-approval is the hole this exists to close.
+          approvals=$(gh api "repos/$REPO/pulls/$PR/reviews" \
+            --jq "[.[] | select(.state==\"APPROVED\") | select(.user.login != \"$AUTHOR\")] | length")
+
+          echo "Approvals from someone other than $AUTHOR: $approvals"
+
+          if [ "$approvals" -lt 1 ]; then
+            echo
+            echo "This PR was opened by the co-pilot daemon and no human has approved it."
+            echo
+            echo "The rule: an agent proposes, a person decides. Read the diff and"
+            echo "approve it, or close it. Nothing here changes what any machine"
+            echo "boots into until someone merges."
+            exit 1
+          fi
+
+          echo "Approved by a human. Merging is a decision someone made."
+
+      - name: Human-authored PR, nothing to enforce
+        if: steps.origin.outputs.agent != 'true'
+        run: echo "Not an agent PR. Ordinary review applies."
