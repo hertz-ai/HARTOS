@@ -64,7 +64,7 @@ TELLS = ('load-bearing', 'load bearing')
 # were literally counted by name in our HN thread; the rest are the stock
 # vocabulary those same readers grep for. Reported, not build-failing, since a
 # quote or a technical use ("robust to noise") can be legitimate.
-FILLER = ('honest', 'genuine', 'earns its keep', 'earned its keep',
+FILLER = ('honest', 'genuine', 'load-bearing', 'earns its keep', 'earned its keep',
           'delve', 'seamless', 'leverage', 'empower', 'unleash', 'elevate',
           'revolutioniz', 'game-chang', 'cutting-edge', 'supercharge',
           'effortless', 'testament to', 'tapestry', 'dive into')

@@ -53,7 +53,7 @@ Back to the [README](README.md).
 | **Fake-score resistance** | Nonce challenge-response with Ed25519 verification (`verify_json_signature`), `stats_probe` and `agent_count_verify` challenge types, and fraud scoring that weights `score_jump` at 10.0 and `challenge_fail` at 15.0 | `integrations/social/integrity_service.py` |
 | **Peer attestation ledger** | `node_attestations` table records `code_hash_match`, `impression_witness`, `stats_verify`, `challenge_pass`, `challenge_fail`. Collusion check fires when >80% of a node's attestations come from one peer | `integrity_service.py`, `_models_local.py:1724` |
 | **Origin attestation** | SHA-256 identity fingerprint verified at boot, at federation handshake, and every 5 minutes. Nodes failing attestation are blacklisted | `security/origin_attestation.py` |
-| **Continual learner gate** | Gates access to hive learning by verified compute contribution (Compute Contribution Tokens): no contribution, no learning | `continual_learner_gate.py` |
+| **Continual learner gate** | Gates access to hive learning by verified compute contribution (Compute Contribution Tokens). A node that contributes nothing receives nothing | `continual_learner_gate.py` |
 | **PR review service** | Auto-rejects PRs on baseline regression or guardrail mismatch | `pr_review_service.py` |
 | **Upgrade orchestrator** | 7-stage pipeline: BUILD -> TEST -> AUDIT -> BENCHMARK -> SIGN -> CANARY -> DEPLOY | `upgrade_orchestrator.py` |
 | **OTA service** | systemd service does daily check + cryptographically-verified upgrade | `hart-update-service.py` |

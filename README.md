@@ -202,9 +202,9 @@ Three of those rows are more flattering than they should be. The mesh hands a
 peer a whole turn, it does not split one model across machines, so if you came
 here looking for parallax-style layer sharding it is not that. A hive of nodes
 coordinating on a goal is not the same thing as one larger model, and a
-question that genuinely needs frontier capability still wants a frontier model.
-And a recipe is learned from a real run, which means a wrong recipe replays
-wrongly until a person corrects it. The human in that loop is load-bearing.
+question that needs frontier capability still wants a frontier model. And a
+recipe is learned from a real run, which means a wrong recipe replays wrongly
+until a person corrects it, and nothing else in the loop will catch it.
 
 **[Full capability map →](CAPABILITIES.md)** covers every subsystem with the
 file that implements it: agent runtime, auto-evolve, federation, 31 channel
