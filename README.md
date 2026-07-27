@@ -29,45 +29,6 @@ of what people ask in a day is not that, and this is for the rest.
 Ready today: [Nunba](https://github.com/hertz-ai/Nunba) for Windows, Linux and
 Android. This repo is the runtime underneath it.
 
-### Why it exists
-
-A handful of organisations own the most capable AI, and with it the refusal
-policy, the price, and the logs of everything you type. None of that follows
-from any law of nature. It follows from who paid for the cluster.
-
-Learning here is incremental and gossiped, accumulated on consumer hardware as
-nodes get used, with `federated_aggregator.py` doing periodic aggregation
-rather than a tight all-reduce. Nobody blocks on anybody else's gradient, so
-the machines do not need to sit in one building. Inference runs on llama.cpp
-with GGUF weights, so CUDA, ROCm, Metal, Vulkan and plain CPU are all real
-paths and nothing in the delivery path needs one vendor's silicon.
-
-The aim, which is a bet and not a shipped feature: an internet of intelligence
-that nobody owns.
-
-### The part we are not comfortable with
-
-The learning is not open. Hebbian, Bayesian and gradient code lives in a
-private repo called HevolveAI, and this runtime loads it as a signed binary
-and falls back to a stub when it is missing. You can see the seam in
-`security/native_hive_loader.py`.
-
-The reason is the boring one. It is the piece a funded competitor would copy
-first, and it is how the rest of this gets paid for. That is a normal way to
-run a company and an awkward thing to put next to an argument about nobody
-owning the intelligence. Both are true and we would rather say so up here than
-have you work it out from a table row halfway down.
-
-The narrower claims hold and you can test them yourself. llama.cpp and GGUF
-run on CUDA, ROCm, Metal, Vulkan and bare CPU, so no vendor owns the silicon
-you need. Apache 2.0 means a fork costs you an afternoon. What we cannot say
-without a caveat is that nobody owns the intelligence, because today somebody
-owns a piece of it, and it is us.
-[Open problem 9](OPEN_PROBLEMS.md) is that argument, including the case that
-we are wrong to ship it this way at all.
-
----
-
 ## Start it
 
 **What your machine gets you.** At 8GB with no discrete GPU you are on the CPU
@@ -176,6 +137,45 @@ compares to the alternatives.
 > AI-native OS that boots on a laptop, server, phone or edge node.
 > **[Nunba](https://github.com/hertz-ai/Nunba)** is the consumer app, one
 > signed client across Windows, macOS and Linux.
+
+---
+
+### Why it exists
+
+A handful of organisations own the most capable AI, and with it the refusal
+policy, the price, and the logs of everything you type. None of that follows
+from any law of nature. It follows from who paid for the cluster.
+
+Learning here is incremental and gossiped, accumulated on consumer hardware as
+nodes get used, with `federated_aggregator.py` doing periodic aggregation
+rather than a tight all-reduce. Nobody blocks on anybody else's gradient, so
+the machines do not need to sit in one building. Inference runs on llama.cpp
+with GGUF weights, so CUDA, ROCm, Metal, Vulkan and plain CPU are all real
+paths and nothing in the delivery path needs one vendor's silicon.
+
+The aim, which is a bet and not a shipped feature: an internet of intelligence
+that nobody owns.
+
+### The part we are not comfortable with
+
+The learning is not open. Hebbian, Bayesian and gradient code lives in a
+private repo called HevolveAI, and this runtime loads it as a signed binary
+and falls back to a stub when it is missing. You can see the seam in
+`security/native_hive_loader.py`.
+
+The reason is the boring one. It is the piece a funded competitor would copy
+first, and it is how the rest of this gets paid for. That is a normal way to
+run a company and an awkward thing to put next to an argument about nobody
+owning the intelligence. Both are true and we would rather say so up here than
+have you work it out from a table row halfway down.
+
+The narrower claims hold and you can test them yourself. llama.cpp and GGUF
+run on CUDA, ROCm, Metal, Vulkan and bare CPU, so no vendor owns the silicon
+you need. Apache 2.0 means a fork costs you an afternoon. What we cannot say
+without a caveat is that nobody owns the intelligence, because today somebody
+owns a piece of it, and it is us.
+[Open problem 9](OPEN_PROBLEMS.md) is that argument, including the case that
+we are wrong to ship it this way at all.
 
 ---
 
