@@ -31,6 +31,12 @@ Android. This repo is the runtime underneath it.
 
 ## Start it
 
+**Just want to use it?** Download
+[Nunba](https://github.com/hertz-ai/Nunba/releases/latest): one signed
+installer, no Python, and a setup wizard that picks a model for your
+hardware. Everything below this line is for running the runtime itself from
+source.
+
 **What your machine gets you.** At 8GB with no discrete GPU you are on the CPU
 path, running a 0.8B draft alongside a 4B main with speculative decoding
 between them, plus TTS, Whisper and the agent runtime. That is roughly 6.1GB
