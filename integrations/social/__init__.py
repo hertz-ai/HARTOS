@@ -320,7 +320,7 @@ def init_social(app):
     try:
         from .api_pages import pages_bp
         app.register_blueprint(pages_bp)
-        logger.info("Site pages endpoints registered at /api/pages/")
+        logger.info("Site pages endpoints registered at /api/social/pages/")
     except Exception as e:
         logger.debug(f"Site pages blueprint skipped: {e}")
 

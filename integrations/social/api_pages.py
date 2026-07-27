@@ -5,12 +5,12 @@ a build. These endpoints make a page a row instead: an admin drafts it,
 moves it through review, and publishes it, and the SPA renders whatever is
 published at runtime. No rebuild anywhere in the loop.
 
-POST /api/pages                     — create or update a draft by slug (admin)
-GET  /api/pages                     — list pages (published for everyone,
+POST /api/social/pages                     — create or update a draft by slug (admin)
+GET  /api/social/pages                     — list pages (published for everyone,
                                       any status for admins via ?status=)
-GET  /api/pages/<slug>              — fetch one (published for everyone,
+GET  /api/social/pages/<slug>              — fetch one (published for everyone,
                                       drafts visible to admins only)
-POST /api/pages/<slug>/status       — move draft|in_review|published (admin)
+POST /api/social/pages/<slug>/status       — move draft|in_review|published (admin)
 
 Same shape as the sibling blueprints: thin routes over a service class, the
 service takes a db session so tests drive it against sqlite directly.
@@ -103,7 +103,7 @@ def _is_admin():
     return bool(user is not None and getattr(user, 'is_admin', False))
 
 
-@pages_bp.route('/api/pages', methods=['POST'])
+@pages_bp.route('/api/social/pages', methods=['POST'])
 @require_admin
 def upsert_page():
     from .models import get_db
@@ -129,7 +129,7 @@ def upsert_page():
         db.close()
 
 
-@pages_bp.route('/api/pages', methods=['GET'])
+@pages_bp.route('/api/social/pages', methods=['GET'])
 @optional_auth
 def list_pages():
     from .models import get_db
@@ -145,7 +145,7 @@ def list_pages():
         db.close()
 
 
-@pages_bp.route('/api/pages/<slug>', methods=['GET'])
+@pages_bp.route('/api/social/pages/<slug>', methods=['GET'])
 @optional_auth
 def get_page(slug):
     from .models import get_db
@@ -160,7 +160,7 @@ def get_page(slug):
         db.close()
 
 
-@pages_bp.route('/api/pages/<slug>/status', methods=['POST'])
+@pages_bp.route('/api/social/pages/<slug>/status', methods=['POST'])
 @require_admin
 def set_page_status(slug):
     from .models import get_db
