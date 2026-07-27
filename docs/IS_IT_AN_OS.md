@@ -11,8 +11,14 @@ you can go read, and the last section is the part that is not proven yet.
 
 ## The short answer
 
-It boots, it has its own compositor, and it supervises its own session. Those
-are the three things a wrapper does not do.
+It is built to boot, it has its own compositor, and it has a session
+supervisor. Those are three things a wrapper does not have.
+
+**Read the CI status section at the bottom before you take any of it as
+proven.** The compositor build is green as of 2026-07-26. The VM suite that
+would demonstrate the boot and session behaviour is manual-dispatch only and
+has no recorded passing run. That distinction matters and an earlier version
+of this page blurred it.
 
 ## 1. It is a distribution, not a container
 
@@ -23,17 +29,20 @@ desktop.nix   edge.nix   phone.nix   server.nix   server-minimal-test.nix
 ```
 
 These build bootable systems. Not images that run inside a host, and not a
-chroot. The boot path itself is under test, which is the part worth checking
-if you suspect otherwise:
+chroot.
 
-| CI check | What it asserts |
+There are nixosTest definitions covering the boot path itself:
+
+| Check | What it asserts |
 |---|---|
 | `hart-boot-root-initrd` | The initrd path. This is the earliest userspace there is. |
 | `hart-boot-continuity` | The system comes back the way it went down. |
 | `hart-boot-continuity-poweroff-gate` | Power-off ordering holds. |
 | `hart-boot-log` | Boot logging is present and correct. |
 
-You do not write an initrd test for a Docker wrapper.
+Nobody writes an initrd test for a Docker wrapper. That tells you what this
+is trying to be. It does not tell you the tests pass, and right now they are
+not being run. See CI status below.
 
 ## 2. It has its own Wayland compositor
 
@@ -51,9 +60,10 @@ reading `Cargo.toml` alone gives the wrong impression:
   and 245 crates vendored.
 
 That second build is what CI runs. `nixos/modules/hart-comp.nix` sets
-`buildFeatures = [ "smithay" ]`, `nix-build-matrix.yml` names `hart-comp` as
-the M9 gate, and `flake-checks.yml` reports `Compositor build + cargo-test
-(doCheck, --features smithay) GREEN`.
+`buildFeatures = [ "smithay" ]`, and `nix-build-matrix.yml` names `hart-comp`
+as the M9 gate. **That workflow last succeeded on 2026-07-26**, so the
+compositor building with Smithay linked is a current fact rather than an
+aspiration.
 
 DRM, GBM, libinput, udev, libseat, pixman, XWayland. That is a display
 server, not a wrapper around one.
@@ -86,11 +96,14 @@ saved. A reboot latch stops a boot loop.
 
 That is a list of ways a desktop dies and what happens next in each case. It
 is the same problem set GNOME's session manager and systemd's logind exist to
-handle. You do not need any of it to orchestrate models.
+handle. Nobody needs any of it to orchestrate models, which is the point: the
+existence of this code says what kind of thing is being built here.
 
 Plus `hart-floor-lock`, `hart-desktop-shell-boot`, `hart-layer-shell-host`,
-`hart-layer-shell-host-paint` and `hart-hartlog-create`. Nineteen booted VM
-checks in total, run under KVM by `nixos-vm-tests.yml`.
+`hart-layer-shell-host-paint` and `hart-hartlog-create`. Nineteen VM checks
+defined in total, wired to KVM by `nixos-vm-tests.yml`.
+
+**Defined is not passing.** See below.
 
 ## 4. It can see and drive its own desktop
 
@@ -125,6 +138,33 @@ unchanged on a laptop and on a robot.
 
 That is the claim in the name. Not that it orchestrates models, but that
 inference is a system service instead of something every app carries itself.
+
+## CI status, checked rather than assumed
+
+An earlier version of this page cited the VM suite as evidence without
+checking whether it runs. It does not, and saying so here is cheaper than
+having someone else find it.
+
+| Workflow | Trigger | Last result |
+|---|---|---|
+| `nix-build-matrix.yml` (builds `hart-comp` with Smithay) | push to `nixos/**`, compositor sources | **success, 2026-07-26** |
+| `nix-check.yml` (flake evaluation) | push / PR on `nixos/**` | **success, 2026-07-26** |
+| `flake-checks.yml` (heavy checks) | `workflow_call`, dispatch, PR on `nixos/**` | **failure, 2026-07-23** |
+| `nixos-vm-tests.yml` (the 19 VM checks) | **`workflow_dispatch` only** | **no passing run. Last five, all 2026-06-17, every one failed or cancelled** |
+
+So the compositor building with Smithay linked is current and verifiable. The
+boot and session-supervisor behaviour is **not** currently demonstrated. The
+tests exist, they describe the right things, and nobody has a green run of
+them to point at.
+
+That weakens the argument on this page and it is still the argument. Nineteen
+nixosTests covering initrd, paint watchdogs and recovery TTYs do not get
+written by someone wrapping Docker, whatever state CI is in. But "we wrote
+the tests" and "the tests pass" are different claims and only the first one
+is supported today.
+
+If you want to be useful, `nixos-vm-tests.yml` is manual-dispatch. Running it
+and reporting what breaks would be worth more than a star.
 
 ## What is not proven
 
