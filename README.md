@@ -16,9 +16,17 @@
 ### What it is
 
 An assistant that runs on your own machine, with no subscription, that works
-with the wifi off. 8GB of RAM is enough. What you type stays on the device
-because there is nowhere else for it to go, and you can watch the network to
-check.
+with the wifi off. What you type stays on the device because there is nowhere
+else for it to go, and you can watch the network to check.
+
+**8GB of RAM is enough, and it is worth being exact about what that gets
+you.** At 8GB with no discrete GPU you are on the CPU fallback path with the
+small models, roughly 0.8B to 4B class, plus TTS, Whisper and the agent
+runtime (`security/system_requirements.py`, STANDARD tier). A local 7B wants
+16GB and a GPU, which the code calls FULL tier. Speculative decoding, where a
+draft model answers first, needs about 10GB of VRAM
+(`core/gpu_tier.py`). So it runs on a modest laptop, and on that laptop it is
+the modest version.
 
 On a hard question a frontier model beats anything that fits on a laptop. Most
 of what people ask in a day is not that, and this is for the rest.
