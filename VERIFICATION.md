@@ -51,6 +51,30 @@ Ordered by how much a contributor with modest hardware can settle in an evening.
 
 | 16 | **Three nodes beat one node** | Same benchmark, one node then three, same models. The crossover the whole design rests on | 3 machines |
 
+### What "the hive learns" means today, precisely
+
+This matters more than any single row, because getting it wrong in public is
+unrecoverable. Someone will open the file and read the first line.
+
+**Active now (Phase 1).** `federated_aggregator.py` runs four channels: embedding
+deltas (`embedding_delta.py` + `gradient_service.py`), model lifecycle deltas,
+resonance tuning, and recipe sharing, which the code calls "trained task
+intelligence". `world_model_bridge.py` turns agent interactions into training
+data and distributes skills by gossip and RALT ingestion. This is real learning
+at the retrieval, skill and routing layer, and it is what compounds today.
+
+**Not active (Phase 2).** `federated_gradient_protocol.py` says so in its first
+line: "Phase 2 stubs for LoRA gradient sync". Byzantine-resilient aggregation,
+differential privacy, gradient compression, all interface definitions and
+placeholders.
+
+So: **the hive learns skills and routing, not weights.** "The hive trains its own
+model" is not a claim this repo can make yet. "The hive learns from every
+interaction and shares what it learns" is, and it is checkable in four channels.
+
+Anyone who reads `federated_gradient_protocol.py` after seeing the stronger claim
+will conclude the rest is inflated too, and they will be reasonable to.
+
 ### Row 16 is the threshold
 
 `hive_benchmark_prover.py` carries a seven-stage convergence ladder, from one
