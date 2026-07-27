@@ -46,7 +46,39 @@ Ordered by how much a contributor with modest hardware can settle in an evening.
 | 11 | PinePhone boots | `nixos/hardware/pinephone.nix` | PinePhone |
 | 12 | RISC-V boots | `nixos/hardware/riscv-generic.nix` | RISC-V board |
 | 13 | A Reachy Mini runs an agent locally | Drive it through `gpio_adapter.py` / `serial_adapter.py` / `ros_bridge.py`, whichever its stack exposes | Reachy Mini |
-| 14 | Two Reachy Minis share one hive | Both on `hart hive connect`, one asks a question the other's model answers | 2 Reachy Minis |
+| 14 | **Intelligence compounds between two robots** | Robot A learns a skill by doing. Robot B performs it without having done it. Measure B before and after | 2 Reachy Minis |
+| 15 | A co-pilot's work on one node improves another | Seed a goal on node A only. Show node B starting ahead of where it was | 2 nodes |
+
+### Rows 14 and 15 are the thesis
+
+Everything else here is plumbing. These two are the claim the project exists to
+make, and neither has been demonstrated.
+
+The mechanism is written. `integrations/agent_engine/world_model_bridge.py`:
+"Every agent interaction becomes training data for continuous learning. Skills
+distribute via gossip notification + local RALT ingestion." Experiences pass
+`ConstitutionalFilter` before storage, RALT export is rate-limited and witnessed
+by `WorldModelSafetyBounds`, and skill packets go through `ConstructiveFilter`.
+`federated_aggregator.extract_local_delta()` pulls learning stats from the bridge
+and signs them with the node identity.
+
+So the path from one robot's experience to another robot's competence exists as
+code, end to end. Nobody has watched it happen.
+
+**What would settle row 14.** Not two robots taking turns answering, which is
+only failover and proves nothing about learning. Robot A acquires something by
+doing it. Robot B, which never did it, is then measurably better at it than it
+was before. The before-and-after is the whole test: without a baseline it is a
+story.
+
+**What would settle row 15.** Same shape, one layer up. The co-pilot daemon works
+a seeded goal on node A. Node B, given a related goal, starts from a better place
+than it would have. This is what "the hive bootstraps itself" means, and it is
+either measurable or it is a slogan.
+
+A negative result here is worth more than any passing row above. If joint
+experience does not compound, the architecture needs to change and everyone
+should know.
 
 ### The honest state of these
 
